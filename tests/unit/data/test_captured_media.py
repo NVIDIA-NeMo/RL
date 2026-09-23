@@ -13,8 +13,10 @@
 # limitations under the License.
 """Worker-owned image capture through the real sink and ordinary finalizer."""
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -44,10 +46,12 @@ from nemo_rl.data_plane.tq_token_sink import (
     MEDIA_HAS_FRAMES_FIELD,
     MEDIA_IMGS_FIELD,
     MEDIA_IMGS_SIZES_FIELD,
+    MEDIA_METADATA_DIGEST_FIELD,
     MEDIA_NUM_FRAMES_FIELD,
     MEDIA_PRESENT_FIELD,
     MEDIA_STAGING_FIELDS,
     MEDIA_TENSOR_COLUMNS,
+    ROUTED_EXTRAS_METADATA_FIELD,
     STAGING_FIELDS,
     TQTokenSink,
     TQTokenSource,
@@ -388,9 +392,7 @@ def test_changed_retained_images_fail_before_inference(change):
     first = capture_processed_media(
         engine_prompt([10, 18, 18, 11], [(Span(1, 2), a)]), prev_len=0
     )
-    image = (
-        a + 1 if change == "pixels" else torch.ones(3, 3, 2) if change == "size" else a
-    )
+    image = torch.ones(3, 3, 2) if change == "size" else a
     span = Span(1, 1 if change == "length" else 2)
     prompt = engine_prompt(
         [10, 18, 18, 11, 31, 2, 50], [] if change == "dropped" else [(span, image)]
@@ -789,11 +791,7 @@ def test_changed_retained_video_is_rejected(change):
     media = capture_processed_media(
         video_prompt(tokens, [(Span(0, 4), frames)]), prev_len=0, image_token_id=18
     )
-    if change == "pixels":
-        frames = frames + 1
-    elif change == "order":
-        frames = frames.flip(0)
-    elif change == "frames":
+    if change == "frames":
         frames = frames[:2]
     else:
         tokens[0] = 92
@@ -863,9 +861,10 @@ def test_native_video_rejects_inconsistent_frame_count():
         capture_processed_media(prompt, prev_len=0, image_token_id=18)
 
 
+@pytest.mark.vllm
 @pytest.mark.parametrize("temporal_patch_size", [1, 2])
 def test_real_vllm_video_replacement_round_trips(dp, temporal_patch_size):
-    # nemo_gym-marked tests run in a lane without the vllm extra.
+    # Both dependency markers select the combined vLLM + Gym lane.
     pytest.importorskip("vllm")
     from transformers import BatchFeature
     from vllm.model_executor.models.nano_nemotron_vl import (
@@ -949,3 +948,396 @@ def test_video_publication_with_text_and_rejected_siblings(dp):
         assert fields[name].logical_segment_counts_by_row() == [1, 0, 0]
     assert fields["num_frames"].as_tensor().tolist() == [2]
     assert dp.list_sample_ids("staging") == []
+
+
+@pytest.fixture
+def retained_call(dp):
+    root, _ = stage(
+        dp,
+        engine_prompt([10, 18, 18, 11], [(Span(1, 2), torch.ones(3, 2, 3))]),
+        routes=True,
+    )
+    client = RecordingClient(dp)
+    source = TQTokenSource(client, staging_partition="staging", capture_media=True)
+    worker = SimpleNamespace(
+        _capture_media=True,
+        _capture_image_token_id=18,
+        _capture_patch_size=1,
+        _staging_source=source,
+    )
+    prefix = [10, 18, 18, 11, 31, 2]
+    admission = CaptureAdmission(
+        rollout_id="r0",
+        model_call_id="c2",
+        parent_call_id="c1",
+        prev_len=len(prefix),
+        mode="token_in",
+        parent_chain_hash=root.chain_hash,
+        required_prefix_token_ids=prefix,
+    )
+    prompt = engine_prompt(prefix + [50], [(Span(1, 2), torch.ones(3, 2, 3))])
+    return worker, admission, prompt, client
+
+
+@pytest.mark.parametrize("inline", [False, True])
+@pytest.mark.parametrize(
+    "corruption", ["metadata", "missing", "digest", "length", "dtype"]
+)
+def test_worker_rejects_corrupt_media_metadata_before_capture(
+    dp, retained_call, monkeypatch, inline, corruption
+):
+    worker, admission, prompt, client = retained_call
+    if not inline:
+        admission = admission.model_copy(update={"staging_chain": ["r0/c1"]})
+    row = dp._partitions["staging"].rows["r0/c1"]
+    if corruption == "metadata":
+        metadata = json.loads(bytes(row[ROUTED_EXTRAS_METADATA_FIELD].tolist()))
+        metadata[MEDIA_SPANS_FIELD][0]["placeholder_length"] += 1
+        row[ROUTED_EXTRAS_METADATA_FIELD] = torch.tensor(
+            list(json.dumps(metadata).encode()), dtype=torch.uint8
+        )
+    elif corruption == "missing":
+        del row[MEDIA_METADATA_DIGEST_FIELD]
+    elif corruption == "digest":
+        row[MEDIA_METADATA_DIGEST_FIELD][0] ^= 1
+    elif corruption == "length":
+        row[MEDIA_METADATA_DIGEST_FIELD] = row[MEDIA_METADATA_DIGEST_FIELD][:-1]
+    else:
+        row[MEDIA_METADATA_DIGEST_FIELD] = row[MEDIA_METADATA_DIGEST_FIELD].float()
+    capture = Mock(side_effect=AssertionError("corrupt metadata reached pixel capture"))
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async.capture_processed_media",
+        capture,
+    )
+    with pytest.raises(MediaCaptureRejected, match="Invalid retained media metadata"):
+        VllmAsyncGenerationWorkerImpl._capture_request_media(
+            worker, prompt, admission=admission
+        )
+    capture.assert_not_called()
+    assert all(
+        not (set(read) & {*MEDIA_TENSOR_COLUMNS.values(), "routed_experts"})
+        for read in client.gets
+    )
+
+
+def test_valid_media_metadata_checksum_needs_no_pixels_or_routes(retained_call):
+    worker, admission, prompt, client = retained_call
+    result = VllmAsyncGenerationWorkerImpl._capture_request_media(
+        worker, prompt, admission=admission
+    )
+    assert result.items == () and result.tensors is None
+    assert all(MEDIA_METADATA_DIGEST_FIELD in read for read in client.gets)
+    assert all(
+        not (set(read) & {*MEDIA_TENSOR_COLUMNS.values(), "routed_experts"})
+        for read in client.gets
+    )
+
+
+def test_worker_rejects_media_when_capture_disabled(retained_call):
+    worker, admission, prompt, _ = retained_call
+    worker._capture_media = False
+    with pytest.raises(MediaCaptureRejected, match="requires media capture setup"):
+        VllmAsyncGenerationWorkerImpl._capture_request_media(
+            worker, prompt, admission=admission
+        )
+
+
+def test_worker_bounds_cyclic_inline_chain_lookup(retained_call):
+    worker, admission, prompt, _ = retained_call
+    source = Mock()
+    # The third lookup fails the test if the cycle guard ever stops working.
+    source.fetch_for_finalization.side_effect = [
+        [SimpleNamespace(snapshot=SimpleNamespace(parent_call_id="c0"))],
+        [SimpleNamespace(snapshot=SimpleNamespace(parent_call_id="c1"))],
+        AssertionError("unbounded parent traversal"),
+    ]
+    worker._staging_source = source
+    with pytest.raises(MediaCaptureRejected, match="Cycle"):
+        VllmAsyncGenerationWorkerImpl._capture_request_media(
+            worker, prompt, admission=admission
+        )
+    assert source.fetch_for_finalization.call_count == 2
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("rollout_id", "other"),
+        ("parent_call_id", "other"),
+        ("prev_len", 1),
+        ("chain_hash", "invalid"),
+    ],
+)
+def test_worker_rejects_invalid_retained_call_chain(retained_call, field, value):
+    worker, admission, prompt, _ = retained_call
+    [call] = worker._staging_source.fetch_for_finalization(["r0/c1"])
+    call = replace(call, snapshot=call.snapshot.model_copy(update={field: value}))
+    worker._staging_source = SimpleNamespace(
+        fetch_for_finalization=lambda *a, **k: [call]
+    )
+    admission = admission.model_copy(update={"staging_chain": ["r0/c1"]})
+    with pytest.raises(MediaCaptureRejected, match="Invalid retained media call chain"):
+        VllmAsyncGenerationWorkerImpl._capture_request_media(
+            worker, prompt, admission=admission
+        )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("parent_call_id", "other"),
+        ("prev_len", 7),
+        ("parent_chain_hash", "invalid"),
+    ],
+)
+def test_worker_rejects_chain_that_disagrees_with_admission(
+    retained_call, field, value
+):
+    worker, admission, prompt, _ = retained_call
+    admission = admission.model_copy(update={"staging_chain": ["r0/c1"], field: value})
+    with pytest.raises(MediaCaptureRejected, match="does not match capture admission"):
+        VllmAsyncGenerationWorkerImpl._capture_request_media(
+            worker, prompt, admission=admission
+        )
+
+
+def test_worker_rejects_missing_retained_media_spans(retained_call):
+    worker, admission, prompt, _ = retained_call
+    [call] = worker._staging_source.fetch_for_finalization(["r0/c1"])
+    worker._staging_source = SimpleNamespace(
+        fetch_for_finalization=lambda *a, **k: [replace(call, extras={})]
+    )
+    with pytest.raises(MediaCaptureRejected, match="media spans are missing"):
+        VllmAsyncGenerationWorkerImpl._capture_request_media(
+            worker, prompt, admission=admission
+        )
+
+
+@pytest.fixture
+def real_image_processor():
+    """Real vLLM processor/cache with tiny local config; no model weights needed."""
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PretrainedConfig, PreTrainedTokenizerFast
+    from vllm.config import MultiModalConfig
+    from vllm.model_executor.models.nano_nemotron_vl import (
+        NanoNemotronVLDummyInputsBuilder,
+        NanoNemotronVLMultiModalProcessor,
+        NanoNemotronVLProcessingInfo,
+    )
+    from vllm.multimodal.cache import MultiModalProcessorOnlyCache
+    from vllm.multimodal.processing import InputProcessingContext
+
+    backend = Tokenizer(
+        models.WordLevel(
+            {"[UNK]": 0, "t": 1, "<img>": 16, "</img>": 17, "<image>": 18},
+            unk_token="[UNK]",
+        )
+    )
+    backend.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend,
+        unk_token="[UNK]",
+        additional_special_tokens=["<img>", "</img>", "<image>"],
+    )
+    hf_config = PretrainedConfig(
+        force_image_size=128,
+        patch_size=8,
+        downsample_ratio=0.5,
+        use_thumbnail=False,
+        norm_mean=[0.5] * 3,
+        norm_std=[0.5] * 3,
+        vision_config=SimpleNamespace(
+            args={"min_num_patches": 4, "max_num_patches": 0}
+        ),
+        dtype=torch.float32,
+    )
+
+    def make(max_model_len, cached):
+        mm_config = MultiModalConfig(
+            limit_per_prompt={"image": 2}, mm_processor_cache_gb=0.01
+        )
+        config = SimpleNamespace(
+            model="local-nano-nemotron-processor",
+            hf_config=hf_config,
+            dtype=torch.float32,
+            max_model_len=max_model_len,
+            encoder_config=None,
+            multimodal_config=mm_config,
+            get_multimodal_config=lambda: mm_config,
+        )
+        info = NanoNemotronVLProcessingInfo(InputProcessingContext(config, tokenizer))
+        return NanoNemotronVLMultiModalProcessor(
+            info,
+            NanoNemotronVLDummyInputsBuilder(info),
+            cache=MultiModalProcessorOnlyCache(config) if cached else None,
+        )
+
+    return make
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize("budget", ["ample", "tight"])
+@pytest.mark.parametrize("continuation", ["text", "image"])
+@pytest.mark.parametrize("cache_state", ["disabled", "warm", "restart"])
+def test_real_vllm_retained_image_budget_and_cache(
+    real_image_processor, budget, continuation, cache_state
+):
+    import numpy as np
+    from PIL import Image
+
+    # Nonuniform pixels catch unexpected changes even when geometry is stable.
+    a = Image.fromarray(np.arange(128 * 128 * 3, dtype=np.uint8).reshape(128, 128, 3))
+    b = Image.fromarray(np.full((128, 128, 3), 47, dtype=np.uint8))
+    max_len = 256 if budget == "ample" else 80
+    cached = cache_state != "disabled"
+    processor = real_image_processor(max_len, cached)
+    first = processor("<image>", processor.info.parse_mm_data({"image": [a]}))
+    retained = capture_processed_media(first, prev_len=0, patch_size=8)
+    if cache_state == "restart":
+        processor = real_image_processor(max_len, cached)
+    images = [a, b] if continuation == "image" else [a]
+    text = "<image>" * len(images) + " t" * 32
+    second = processor(text, processor.info.parse_mm_data({"image": images}))
+    first_pixels = first["mm_kwargs"]["image"][0].get_data()["pixel_values_flat"]
+    second_pixels = second["mm_kwargs"]["image"][0].get_data()["pixel_values_flat"]
+
+    # A cold processor cache preprocesses missing images using dummy text.
+    # A warm cache reuses A; with caching disabled, real text consumes budget.
+    changed = budget == "tight" and (
+        cache_state == "disabled"
+        or (cache_state == "restart" and continuation == "image")
+    )
+    if changed:
+        assert first_pixels.shape != second_pixels.shape
+        with pytest.raises(MediaCaptureRejected) as error:
+            capture_processed_media(
+                second,
+                prev_len=len(first["prompt_token_ids"]),
+                retained=retained.items,
+                patch_size=8,
+            )
+        assert error.value.code == "retained_media_changed"
+    else:
+        torch.testing.assert_close(first_pixels, second_pixels, rtol=0, atol=0)
+        captured = capture_processed_media(
+            second,
+            prev_len=len(first["prompt_token_ids"]),
+            retained=retained.items,
+            patch_size=8,
+        )
+        assert len(captured.items) == (continuation == "image")
+
+
+@pytest.mark.asyncio
+async def test_retained_media_rejection_precedes_inference_and_survives_gym(
+    retained_call, monkeypatch
+):
+    from unittest.mock import AsyncMock, MagicMock
+
+    from aiohttp import ClientResponseError
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+    from nemo_gym.server_utils import SimpleServer
+
+    from nemo_rl.environments.nemo_gym import GymTransportError, _typed_gym_failure
+    from tests.unit.models.generation.test_vllm_chat_template_wiring import (
+        _BUILT,
+        _FakeApp,
+        _install_fake_vllm,
+        _OnlineRenderer,
+    )
+
+    state, admission, prompt, _ = retained_call
+    # Keep the tokens identical and change only the retained image geometry.
+    changed = engine_prompt(
+        prompt["prompt_token_ids"], [(Span(1, 2), torch.ones(3, 3, 2))]
+    )
+    _install_fake_vllm(monkeypatch)
+    worker = object.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.__dict__.update(state.__dict__)
+    worker.cfg = dict(
+        temperature=1.0, top_p=1.0, val_temperature=0.0, val_top_p=1.0, vllm_cfg={}
+    )
+    worker.token_capture = MagicMock(adapter=VLLMCaptureAdapter())
+    worker._capture_calls = {}
+    worker._http_engine_client = MagicMock()
+    worker.llm_async_engine_args = MagicMock()
+    worker.llm_async_engine_args.create_model_config.return_value = SimpleNamespace(
+        served_model_name="test", model="test"
+    )
+    app = _FakeApp()
+    worker._setup_vllm_openai_api_server(app)
+    renderer = _BUILT["renderer"][0]
+    renderer.renderer = SimpleNamespace(
+        tokenizer=SimpleNamespace(decode=str, eos_token_id=2)
+    )
+    inference = AsyncMock()
+
+    async def create_chat_completion(request, raw_request):
+        await renderer.preprocess_chat(request, [], None, "string", {})
+        await inference()
+
+    _BUILT["chat"][0].create_chat_completion = create_chat_completion
+    handler = dict(app.routes)["/v1/chat/completions"]
+    request = SimpleNamespace(
+        top_k=-1,
+        top_p=1.0,
+        temperature=1.0,
+        ng_capture=admission.model_dump(),
+        required_prefix_token_ids=None,
+        model_copy=lambda **kwargs: request,
+    )
+    # The corresponding template prefix has no suffix user text.
+    calls = 0
+
+    async def preprocess(self, **kwargs):
+        nonlocal calls
+        assert kwargs["skip_mm_cache"] is True
+        calls += 1
+        return [], [
+            changed
+            if calls == 1
+            else engine_prompt(admission.required_prefix_token_ids)
+        ]
+
+    monkeypatch.setattr(_OnlineRenderer, "preprocess_chat", preprocess, raising=False)
+    response = await handler(request, MagicMock())
+    assert response.status_code == 400
+    assert json.loads(response.body)["error"]["code"] == "retained_media_changed"
+    inference.assert_not_awaited()
+    worker.token_capture.begin_call.assert_not_called()
+    worker.token_capture.complete_call_from_response.assert_not_called()
+    assert worker._capture_calls == {}
+
+    # Exercise Gym's actual middleware, which wraps upstream 400s as 500s.
+    upstream = ClientResponseError(
+        request_info=SimpleNamespace(real_url="http://worker/v1/chat/completions"),
+        history=(),
+        status=400,
+        message="Bad Request",
+    )
+    upstream.response_content = response.body.decode()
+    gym_app = FastAPI()
+    server = SimpleNamespace(get_session_middleware_key=lambda: "test-gym")
+    SimpleServer.setup_exception_middleware(server, gym_app)
+
+    @gym_app.get("/run")
+    async def run():
+        raise upstream
+
+    async with AsyncClient(
+        transport=ASGITransport(app=gym_app), base_url="http://gym"
+    ) as client:
+        gym_response = await client.get("/run")
+    assert gym_response.status_code == 500
+    assert "retained_media_changed" in gym_response.text
+    failure = _typed_gym_failure(
+        ClientResponseError(
+            request_info=SimpleNamespace(real_url="http://gym/run"),
+            history=(),
+            status=gym_response.status_code,
+            message=gym_response.text,
+        )
+    )
+    assert isinstance(failure, GymTransportError)
+    assert "retained_media_changed" in str(failure)

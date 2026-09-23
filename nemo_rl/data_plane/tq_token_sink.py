@@ -34,6 +34,7 @@ use.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -74,7 +75,7 @@ from nemo_rl.experience.route_assembly import RouteFragment
 # on both sides and pass that check silently.
 # Media the engine's vision encoder consumed, staged in the *same* put as the
 # token columns (``TQTokenSink.stage`` with attachments). Every row of a
-# media-enabled staging partition carries all of these columns: two bool flags
+# media-enabled staging partition carries two bool flags, a metadata checksum,
 # and three tensor columns. Tensors keep their native shape and dtype on the
 # wire (TQ adds its row dimension): ``media_imgs`` is ``[total_patches, 3*P*P]``
 # per row in the engine's float dtype, ``media_imgs_sizes`` ``[N, 2]`` int32,
@@ -89,13 +90,15 @@ MEDIA_HAS_FRAMES_FIELD = "media_has_frames"
 MEDIA_IMGS_FIELD = "media_imgs"
 MEDIA_IMGS_SIZES_FIELD = "media_imgs_sizes"
 MEDIA_NUM_FRAMES_FIELD = "media_num_frames"
+MEDIA_METADATA_DIGEST_FIELD = "media_metadata_digest"
 MEDIA_TENSOR_COLUMNS: dict[str, str] = {
     "imgs": MEDIA_IMGS_FIELD,
     "imgs_sizes": MEDIA_IMGS_SIZES_FIELD,
     "num_frames": MEDIA_NUM_FRAMES_FIELD,
 }
 MEDIA_FLAG_FIELDS = [MEDIA_PRESENT_FIELD, MEDIA_HAS_FRAMES_FIELD]
-MEDIA_STAGING_FIELDS = [*MEDIA_FLAG_FIELDS, *MEDIA_TENSOR_COLUMNS.values()]
+MEDIA_METADATA_FIELDS = [*MEDIA_FLAG_FIELDS, MEDIA_METADATA_DIGEST_FIELD]
+MEDIA_STAGING_FIELDS = [*MEDIA_METADATA_FIELDS, *MEDIA_TENSOR_COLUMNS.values()]
 _MEDIA_REQUIRED = ("imgs", "imgs_sizes")
 _MEDIA_PIXEL_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _MEDIA_INDEX_DTYPES = (torch.int32, torch.int64)
@@ -130,6 +133,10 @@ STAGING_FIELDS = [
 
 _MODE_TO_CODE = {"text": 0, "token_in": 1}
 _CODE_TO_MODE = {code: mode for mode, code in _MODE_TO_CODE.items()}
+
+
+class MediaMetadataIntegrityError(ValueError):
+    """Stored media metadata does not match its framework-owned checksum."""
 
 
 def _bytes_tensor(value: bytes) -> torch.Tensor:
@@ -488,14 +495,19 @@ class TQTokenSink:
                 if extras_metadata is not None
                 else None
             )
-            field_dict[ROUTED_EXTRAS_METADATA_FIELD] = _bytes_tensor(
-                json.dumps(
-                    extras_metadata,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    ensure_ascii=False,
-                ).encode("utf-8")
-            )
+            metadata_json = json.dumps(
+                extras_metadata,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+            field_dict[ROUTED_EXTRAS_METADATA_FIELD] = _bytes_tensor(metadata_json)
+            if self._capture_media:
+                # Detect metadata corruption without loading route or pixel tensors.
+                # This checksum is independent of Gym's combined extras commitment.
+                field_dict[MEDIA_METADATA_DIGEST_FIELD] = _bytes_tensor(
+                    hashlib.sha256(metadata_json).digest()
+                )
             routed_len = 0
             routed_encoding = ROUTE_ENCODING_NONE
             if routed is not None:
@@ -842,7 +854,7 @@ class TQTokenSource:
         # columns so the finalizer can select tensor rows without a probe.
         select_fields = list(STAGING_FIELDS)
         if self._capture_media:
-            select_fields += MEDIA_FLAG_FIELDS
+            select_fields += MEDIA_METADATA_FIELDS
         try:
             if include_route_fragments:
                 # Route payloads are optional per run (feature-gated at the
@@ -898,7 +910,7 @@ class TQTokenSource:
                     fragment=(
                         _row_to_route_fragment(row) if include_route_fragments else None
                     ),
-                    extras=_row_extras(row),
+                    extras=_row_extras(row, verify_media=self._capture_media),
                     media_present=media_present,
                     media_has_frames=media_has_frames,
                 )
@@ -995,9 +1007,23 @@ def _row_to_base_snapshot(row: Any) -> StagedCallBaseSnapshot:
     )
 
 
-def _row_extras(row: Any) -> dict[str, Any] | None:
-    """Decode the staged extras JSON (None for ``null`` / absent extras)."""
-    decoded = json.loads(_row_text(row, ROUTED_EXTRAS_METADATA_FIELD))
+def _row_extras(row: Any, *, verify_media: bool) -> dict[str, Any] | None:
+    """Verify media-partition metadata before exposing the decoded extras."""
+    metadata_json = bytes(_row_leaf(row, ROUTED_EXTRAS_METADATA_FIELD).tolist())
+    if verify_media:
+        try:
+            checksum = _row_leaf(row, MEDIA_METADATA_DIGEST_FIELD)
+        except KeyError as error:
+            raise MediaMetadataIntegrityError(
+                "Missing media metadata checksum"
+            ) from error
+        if (
+            checksum.dtype != torch.uint8
+            or checksum.numel() != 32
+            or bytes(checksum.tolist()) != hashlib.sha256(metadata_json).digest()
+        ):
+            raise MediaMetadataIntegrityError("Media metadata checksum mismatch")
+    decoded = json.loads(metadata_json)
     if decoded is None:
         return None
     if not isinstance(decoded, dict):

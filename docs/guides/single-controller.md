@@ -414,34 +414,46 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   Only newly introduced occurrences are staged. vLLM-specific `media_spans`
   extras retain placeholder positions and token hashes for multi-turn prefix
   replacement, including video's timestamp-separated visual-token spans.
-  Processor-cache bypass ensures the worker has concrete pixels to capture.
-  Retained images are re-processed by vLLM under the current turn's token
-  budget, which is shared across every image in the prompt; when that budget
-  binds (an image's native patch grid exceeds its share of
-  `max_model_len - prompt_len`) vLLM re-tiles the image and the continuation
-  is rejected before inference with HTTP 400 and error code
+  Capture requests use vLLM's `skip_mm_cache=True` path to obtain concrete
+  processor tensors. vLLM can still reuse its processor-only cache; this does
+  not guarantee fresh preprocessing. With caching disabled, the current text
+  and images share the token budget. The processor-only cache preprocesses
+  missing images using dummy text, so warm and fresh caches can also produce
+  different geometry when images compete for a tight budget. If that changes retained geometry or placeholder tokens, the worker
+  rejects the continuation before inference with HTTP 400 and error code
   `retained_media_changed` (other capture-time validation failures use
-  `media_capture_rejected`), and Gym records the rollout as failed. Text-call
-  rows carry sentinels in each column's own dtype, because TransferQueue keeps
-  one dtype per field across live rows.
+  `media_capture_rejected`). Gym's current exception middleware wraps the
+  upstream error in HTTP 500, retaining the code in the response body. RL then
+  classifies it as an infrastructure `GymTransportError`, eligible for the
+  configured prompt retry policy; it is not a dedicated terminal rejection.
+  Text-call rows carry sentinels in each column's own dtype, because
+  TransferQueue keeps one dtype per field across live rows.
+  Media-enabled rows also store `media_metadata_digest`, a SHA-256 checksum of
+  the small route-less extras JSON. Sources check it before exposing media
+  descriptors, without reading pixels or routed-expert tensors. Missing or
+  changed checksums reject the row. This detects accidental metadata corruption;
+  it is independent of Gym's receipt and combined `extras_digest` commitment.
   Media bundles are structurally validated before writing and after reading
   (required tensors, patch geometry, frame grouping); malformed or missing
   columns reject the rollout as `invalid_media_columns`, incompatible parts
   along a chain as `media_chain_incompatible`. Tensor contents are not hashed;
-  retained occurrences are checked by geometry and placeholder tokens. Call
+  retained occurrences are checked by geometry and placeholder tokens. Media
+  must remain immutable for the rollout's lifetime and preprocessing must be
+  deterministic. Same-shape pixel changes and corruption of stored pixel values
+  are outside this check's coverage. Call
   rows share the existing checkpoint and cleanup lifecycle. TQ has no
   transactional rollback: a failed combined write is discarded best-effort by
   the sink, and a failed discard is logged at ERROR.
   Upgrade the paired Gym and RL changes together; checkpoints written with the
   former `media_capture`/tensor-attachment format or with the two-write
-  `media_geometry_json` layout are not compatible. The GB200 functional shard
+  `media_geometry_json` layout, or without `media_metadata_digest`, are not compatible. The GB200 functional shard
   `L1_Functional_Tests_GB200_Vllm_Omni_Single_Controller.sh` smokes this path
   end to end (CLEVR-style images through Gym `string_match`, native video
   through Gym `mcqa`) and gates on `train/finalize/media_row_rate == 1`, the
   metric that reports the fraction of learner rows built from captured media.
   This integration does not require Megatron inference capture support or a new
   Megatron-LM pin. Compaction, mixed image/video conversations, native audio,
-  video token pruning, static tiling (`num_tiles`), other processor families,
+  video token pruning, static tiling (`image_num_patches`), other processor families,
   and `token_capture.defer_routed_experts_to_policy: true` are not supported.
 - Multi-Teacher On-Policy Distillation (MOPD) is supported for text-only NeMo
   Gym rollouts; multimodal/VLM MOPD is not yet supported. See

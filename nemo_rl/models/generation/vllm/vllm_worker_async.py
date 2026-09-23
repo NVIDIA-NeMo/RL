@@ -37,6 +37,7 @@ from nemo_rl.data.captured_media import (
     capture_processed_media,
 )
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
+from nemo_rl.data_plane.tq_token_sink import MediaMetadataIntegrityError
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_GENERATION_PORT_RANGE_HIGH,
@@ -660,25 +661,30 @@ class VllmAsyncGenerationWorkerImpl(
             source = self._staging_source
             if source is None:
                 raise RuntimeError("Media capture staging source is not initialized")
-            if admission.staging_chain:
-                calls = source.fetch_for_finalization(
-                    list(admission.staging_chain), include_route_fragments=False
-                )
-            else:
-                # Inline token admissions still have receipt-owned parent keys.
-                calls, visited = [], set()
-                parent = admission.parent_call_id
-                while parent is not None:
-                    if parent in visited:
-                        raise MediaCaptureRejected("Cycle in retained media chain")
-                    visited.add(parent)
-                    call = source.fetch_for_finalization(
-                        [staging_key(admission.rollout_id, parent)],
-                        include_route_fragments=False,
-                    )[0]
-                    calls.append(call)
-                    parent = call.snapshot.parent_call_id
-                calls.reverse()
+            try:
+                if admission.staging_chain:
+                    calls = source.fetch_for_finalization(
+                        list(admission.staging_chain), include_route_fragments=False
+                    )
+                else:
+                    # Inline token admissions still have receipt-owned parent keys.
+                    calls, visited = [], set()
+                    parent = admission.parent_call_id
+                    while parent is not None:
+                        if parent in visited:
+                            raise MediaCaptureRejected("Cycle in retained media chain")
+                        visited.add(parent)
+                        call = source.fetch_for_finalization(
+                            [staging_key(admission.rollout_id, parent)],
+                            include_route_fragments=False,
+                        )[0]
+                        calls.append(call)
+                        parent = call.snapshot.parent_call_id
+                    calls.reverse()
+            except (KeyError, MediaMetadataIntegrityError) as error:
+                raise MediaCaptureRejected(
+                    f"Invalid retained media metadata: {error}"
+                ) from error
             parent, length, chain_hash = None, 0, None
             for call in calls:
                 snapshot = call.snapshot

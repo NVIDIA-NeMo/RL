@@ -37,7 +37,7 @@ from nemo_gym.token_id_capture.staging.protocols import (  # noqa: E402
 )
 
 from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
-    MEDIA_FLAG_FIELDS,
+    MEDIA_METADATA_FIELDS,
     MEDIA_STAGING_FIELDS,
     MEDIA_TENSOR_COLUMNS,
     STAGING_FIELDS,
@@ -169,7 +169,7 @@ def test_media_rows_round_trip_in_a_single_put(tq_client, media_partition):
 
     keys = [record.staging_key for record in records]
     fetched = source.fetch_for_finalization(keys)
-    assert client.gets[-1] == STAGING_FIELDS + MEDIA_FLAG_FIELDS
+    assert client.gets[-1] == STAGING_FIELDS + MEDIA_METADATA_FIELDS
     assert [item.media_present for item in fetched] == [True, True, False]
     assert [item.media_has_frames for item in fetched] == [False, True, False]
 

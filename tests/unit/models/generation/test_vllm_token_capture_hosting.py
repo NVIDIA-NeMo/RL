@@ -530,9 +530,10 @@ def test_request_capture_abort_fails_the_call_and_drains_state():
     assert "ng_commit_coords" not in out
 
 
+@pytest.mark.vllm
 @pytest.mark.parametrize("pruning_rate", [0.0, 0.5])
 def test_omni_capture_setup_rejects_video_pruning(monkeypatch, pruning_rate):
-    # nemo_gym-marked tests run in a lane without the vllm extra.
+    # Both dependency markers select the combined vLLM + Gym lane.
     pytest.importorskip("vllm")
     from vllm.model_executor.models.nano_nemotron_vl import NanoNemotronVLProcessingInfo
 
