@@ -587,7 +587,10 @@ class TQMegatronTokenStager:
         """Stage an admitted request, or decline ordinary non-capture traffic."""
         if not isinstance(uid, str) or not uid:
             raise ValueError("MInf request UID must be a non-empty string")
-        capture_payload = (offload_params or {}).get("ng_capture")
+        # Deferred: nemo_gym is an optional extra absent in non-gym runs.
+        from nemo_gym.token_id_capture import NG_CAPTURE_FIELD
+
+        capture_payload = (offload_params or {}).get(NG_CAPTURE_FIELD)
         if capture_payload is None:
             return None
         try:
