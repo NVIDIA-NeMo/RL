@@ -388,6 +388,46 @@ def test_context_capped_max_new_tokens():
         )
 
 
+@pytest.mark.parametrize("async_engine", [False, True])
+@pytest.mark.parametrize("success", [False, True])
+def test_vllm_prefix_cache_reset_preserves_engine_result(
+    monkeypatch: pytest.MonkeyPatch, async_engine: bool, success: bool
+) -> None:
+    """A refused reset must reach the collector through the worker group."""
+    worker_cls = (
+        VllmAsyncGenerationWorkerImpl if async_engine else VllmGenerationWorkerImpl
+    )
+    worker = worker_cls.__new__(worker_cls)
+    worker.cfg = {"vllm_cfg": {"async_engine": async_engine}}
+    module = "vllm_worker_async" if async_engine else "vllm_worker"
+    monkeypatch.setattr(
+        f"nemo_rl.models.generation.vllm.{module}.gc.collect", lambda: None
+    )
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    if async_engine:
+        reset = AsyncMock(return_value=success)
+        worker.llm = MagicMock(reset_prefix_cache=reset)
+        result = asyncio.run(worker.reset_prefix_cache_async())
+        reset.assert_awaited_once_with()
+    else:
+        reset = MagicMock(return_value=success)
+        worker.llm = MagicMock(llm_engine=MagicMock(reset_prefix_cache=reset))
+        result = worker.reset_prefix_cache()
+        reset.assert_called_once_with()
+    assert result is success
+
+    generation = VllmGeneration.__new__(VllmGeneration)
+    generation.cfg = worker.cfg
+    generation.worker_group = MagicMock()
+    # Non-leader ranks return None; the other engine succeeds.
+    monkeypatch.setattr(ray, "get", lambda _: [True, None, result])
+    assert generation.invalidate_kv_cache() is success
+    generation.worker_group.run_all_workers_single_data.assert_called_once_with(
+        "reset_prefix_cache_async" if async_engine else "reset_prefix_cache",
+        run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+    )
+
+
 @pytest.mark.asyncio
 async def test_async_vllm_worker_uses_native_keep_pause_and_resume() -> None:
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
