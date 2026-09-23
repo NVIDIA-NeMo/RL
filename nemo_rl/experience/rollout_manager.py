@@ -92,7 +92,10 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
 )
-from nemo_rl.telemetry.instrumentation import dispatch_with_trace_context
+from nemo_rl.telemetry.instrumentation import (
+    dispatch_with_trace_context,
+    in_per_prompt_scope,
+)
 from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
@@ -1155,10 +1158,13 @@ class AsyncNemoGymRolloutImpl:
         received: set[int] = set()
         env_timing_metrics: Optional[dict[str, Any]] = None
 
+        # Read here, not in the actor: the scope is a ContextVar in this
+        # process, and NemoGym is a separate Ray actor.
         async for result_ref in dispatch_with_trace_context(
             nemo_gym_env.run_rollouts.options(num_returns="streaming"),
             pending,
             timer_prefix,
+            per_prompt=in_per_prompt_scope(),
         ):
             rowidx, resolved_agent_ref, result, timing_metrics = await result_ref
             # Validated against the original group, not the pending subset: on a

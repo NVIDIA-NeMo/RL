@@ -188,27 +188,26 @@ def build_data_plane_client(
         else cfg.get("observability")
     ) or {}
     obs_enabled = obs.get("enabled", False)
-    # The wrapper carries the trace spans as well as the event callback, so
-    # telemetry alone is reason enough to install it -- otherwise transfer-queue
-    # traffic would be missing from every trace unless a user happened to also
-    # switch on data-plane event logging. With observability off the callback is
-    # a no-op, so this costs one span per op and nothing else.
+    # Telemetry alone installs the wrapper, for its spans.
     if obs_enabled or telemetry_enabled_in_env():
         from nemo_rl.data_plane.observability import MetricsDataPlaneClient
 
-        # No default per-op sink. The metrics surface is ``get_step_metrics``,
-        # which the trainer logs once a step; a callback here fires on every
-        # single transfer. ``log_event`` is still exported for anyone who
-        # wants that, but it is opt-in via ``observability.callback``.
+        # Callback, hash check and counters are observability features, so they
+        # stay off for a telemetry-only run: obs_enabled travels into the
+        # wrapper rather than only deciding these two arguments, because
+        # is_metrics_client is how three readers ask whether to poll every
+        # worker for data-plane stats.
         #
-        # Both options stay gated on obs_enabled: a telemetry-only run installs
-        # the wrapper for its spans, and must not start firing a per-op callback
-        # or re-reading every tensor byte because a disabled observability block
-        # happened to carry those fields.
+        # No default per-op sink even with observability on. The metrics
+        # surface is ``get_step_metrics``, which the trainer logs once a step;
+        # a callback here fires on every single transfer. ``log_event`` is
+        # still exported for anyone who wants that, but it is opt-in via
+        # ``observability.callback``.
         # pyrefly: obs.get returns Any, can't narrow to the expected callback type.
         client = MetricsDataPlaneClient(
             client,  # type: ignore[bad-argument-type]
             on_event=obs.get("callback") if obs_enabled else None,  # type: ignore[bad-argument-type]
             verify_tensor_hash=obs_enabled and bool(obs.get("verify_tensor_hash")),
+            observability_enabled=obs_enabled,
         )
     return client

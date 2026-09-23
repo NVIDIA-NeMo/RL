@@ -1282,6 +1282,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         inner: DataPlaneClient,
         on_event: Callable[[DataPlaneEvent], None] | None = None,
         verify_tensor_hash: bool = False,
+        observability_enabled: bool = True,
     ) -> None:
         """Wrap ``inner``, accumulating per-op timing and volume.
 
@@ -1295,10 +1296,17 @@ class MetricsDataPlaneClient(DataPlaneClient):
                 reads every tensor element again on both sides (~8 ms
                 for a 107 MB batch of 1536 rows), so it is off unless the
                 config asks.
+            observability_enabled: Whether the user asked for data-plane
+                observability. False on a telemetry-only run, where the
+                wrapper is installed for its spans alone: the counters stop
+                being collected and :func:`is_metrics_client` reports False,
+                so the readers that poll every worker for data-plane stats
+                stay off, as ``observability.enabled: false`` asked.
         """
         self._inner = inner
         self._on_event = on_event
         self._verify_tensor_hash = verify_tensor_hash
+        self._observability_enabled = observability_enabled
         self._stats = DataPlaneStats()
         # Live bytes and live keys per partition. Populated on successful
         # ``put_samples``, released on successful ``clear_samples`` -- or, for
@@ -1317,6 +1325,11 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # every trainer use get_step_metrics() without copying the
         # differencing and unit-conversion logic.
         self._prev_snapshot: dict[str, Any] = {}
+
+    @property
+    def observability_enabled(self) -> bool:
+        """Whether the counters this wrapper accumulates are worth reading."""
+        return self._observability_enabled
 
     def snapshot(self, reset_step_window: bool = False) -> dict[str, Any]:
         """Return cumulative totals plus live byte / key outstanding counts.
@@ -1773,7 +1786,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
                 raise
             # If the call returns a TensorDict, the read-side bytes are more
             # informative than the input estimate.
-            if isinstance(out, TensorDict):
+            if isinstance(out, TensorDict) and self._observability_enabled:
                 n_bytes = _td_bytes(out)
             elif isinstance(out, KVBatchMeta) and not n_keys:
                 n_keys = len(out.sample_ids)
@@ -1916,7 +1929,9 @@ class MetricsDataPlaneClient(DataPlaneClient):
 
     def put_samples(self, sample_ids, partition_id, fields=None, tags=None):
         entered = monotonic()
-        n_bytes = _td_bytes(fields)
+        # Walks the whole payload, so it is skipped when nothing reads the
+        # result: the spans carry bytes only as an attribute.
+        n_bytes = _td_bytes(fields) if self._observability_enabled else 0
         # Materialize once: ``_run`` consumes its lambda and we also need
         # to attribute bytes per sample after success.
         sample_ids_list = _as_list(sample_ids)
@@ -2028,11 +2043,15 @@ class MetricsDataPlaneClient(DataPlaneClient):
 
 
 def is_metrics_client(client: Any) -> TypeGuard[MetricsDataPlaneClient]:
-    """Whether ``client`` is the wrapper that carries the counters.
+    """Whether ``client`` carries counters worth reading.
 
     The one answer to "is observability on here", replacing four call sites
     that asked it three ways -- two by probing for a ``snapshot`` attribute,
     which is not on the :class:`DataPlaneClient` ABC. ``isinstance(None,
     ...)`` is ``False``, so this covers "no client at all" too.
+
+    The type alone is not the answer: a telemetry-only run installs the
+    wrapper for its spans with observability off, and the readers must not
+    then poll every worker for stats the user switched off.
     """
-    return isinstance(client, MetricsDataPlaneClient)
+    return isinstance(client, MetricsDataPlaneClient) and client.observability_enabled

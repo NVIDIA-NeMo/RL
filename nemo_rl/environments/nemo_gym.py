@@ -85,7 +85,7 @@ from nemo_rl.models.policy import PolicyConfig, TokenizerConfig
 from nemo_rl.telemetry.instrumentation import (
     accepts_trace_context,
     is_span_group_enabled,
-    umbrella_span,
+    streaming_umbrella_span,
 )
 from nemo_rl.telemetry.setup import (
     init_telemetry_worker,
@@ -449,7 +449,7 @@ class NemoGym(EnvironmentInterface):
         # registry rather than by RayWorkerGroup, so nothing sets
         # NRL_WORKER_GROUP for it and its spans would otherwise carry no
         # rl.worker_group at all.
-        init_telemetry_worker(resource_attributes={"rl.worker_group": "nemo_gym"})
+        init_telemetry_worker(worker_group="nemo_gym")
         # Before _spinup, which is where Gym builds the ClientSession that
         # carries every rollout: the instrumentor patches the session class, so
         # a session that already exists keeps the uninstrumented behaviour and
@@ -780,6 +780,7 @@ Depending on your data shape, you may want to change these values."""
         nemo_gym_examples: list[dict],
         timer_prefix: str,
         deduplicate_multimodal_data: bool = False,
+        per_prompt: bool = False,
     ) -> AsyncGenerator[tuple[int, dict, dict, dict | None], None]:
         """Stream postprocessed rollouts as NeMo-Gym tasks complete.
 
@@ -793,9 +794,17 @@ Depending on your data shape, you may want to change these values."""
         :func:`instrument_aiohttp_client`) and read the ambient context rather
         than anything passed here.
 
-        An umbrella span, so it carries no ``rl.bucket``: several batches are
-        in flight at once on the async path, and their durations would sum past
-        the wall clock they happened in.
+        An umbrella span either way, so it carries no ``rl.bucket``: several
+        of these are in flight at once, and their durations would sum past the
+        wall clock they happened in.
+
+        Args:
+            per_prompt: Whether the caller dispatches this once per prompt.
+                Decided by the caller because ``in_per_prompt_scope`` reads a
+                ``ContextVar`` in the calling process, and this is a separate
+                Ray actor. On the single-controller path a step issues one of
+                these per prompt, so the span belongs in ``per_prompt`` rather
+                than ``per_step``, whose count is meant to scale with steps.
 
         Yields:
             One ``(rowidx, resolved_agent_ref, result, timing_metrics)`` tuple
@@ -805,17 +814,33 @@ Depending on your data shape, you may want to change these values."""
             ``timing_metrics`` is ``None`` on every tuple but the last, which
             carries the batch totals.
         """
-        with umbrella_span(
-            RLSpanGroup.U_ROLLOUT,
-            "rl.gym.run_rollouts",
-            **{"rl.gym.batch_size": len(nemo_gym_examples)},
-        ):
-            async for item in self._stream_rollouts(
+        attributes = {"rl.gym.batch_size": len(nemo_gym_examples)}
+        # Two branches rather than a group variable, so the drift test can read
+        # the group/helper pairing at the call site.
+        if per_prompt:
+            span = streaming_umbrella_span(
+                RLSpanGroup.U_PER_PROMPT, "rl.gym.run_rollouts", **attributes
+            )
+        else:
+            span = streaming_umbrella_span(
+                RLSpanGroup.U_ROLLOUT, "rl.gym.run_rollouts", **attributes
+            )
+        with span as activate:
+            inner = self._stream_rollouts(
                 nemo_gym_examples,
                 timer_prefix,
                 deduplicate_multimodal_data,
-            ):
-                yield item
+            )
+            try:
+                while True:
+                    with activate():
+                        try:
+                            item = await inner.__anext__()
+                        except StopAsyncIteration:
+                            return
+                    yield item
+            finally:
+                await inner.aclose()
 
     async def _stream_rollouts(
         self,

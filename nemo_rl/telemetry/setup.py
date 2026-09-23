@@ -68,13 +68,34 @@ _RUN_ID_ENV = f"{_OTEL_PREFIX}_RUN_ID"
 _WORKER_GROUP_ENV = "NRL_WORKER_GROUP"
 
 # Which stage of a model's lifecycle (pretrain -> SFT -> RL) produced this
-# telemetry. A backend collecting several NeMo products selects the RL stage on
-# this rather than on service names, which differ per launcher. Constant rather
-# than configurable: a process running this package *is* the RL stage. Seeded
-# into both the driver and the worker attributes, since a resource is per
-# process and neither path sees the other's.
+# telemetry. A backend collecting several NeMo products selects a stage on this
+# rather than on service names, which differ per launcher. Seeded into both the
+# driver and the worker attributes, since a resource is per process and neither
+# path sees the other's.
+#
+# Not in lens semconv at the pinned rev, so the key and its vocabulary are
+# ours. Derived from the algorithm rather than fixed: this package runs
+# supervised fine-tuning and reward-model training too, and tagging those RL
+# makes a backend filtering on stage=SFT miss them.
 _CAMPAIGN_STAGE_ATTR = "nv.dl.campaign.stage"
-_CAMPAIGN_STAGE = "RL"
+_DEFAULT_CAMPAIGN_STAGE = "RL"
+_CAMPAIGN_STAGE_BY_ALGORITHM = {
+    "sft": "SFT",
+    "sft_v2": "SFT",
+    # Its own stage: a reward model is a separate artifact, not a step in the
+    # policy's lifecycle, so folding it into RL would make the RL stage cover
+    # two different models.
+    "rm": "RM",
+    # DPO stays RL: it is preference alignment of the policy itself, the same
+    # stage GRPO and PPO occupy, arrived at without rollouts.
+}
+# Written by the driver, read by workers, which see no algorithm of their own.
+_CAMPAIGN_STAGE_ENV = f"{_OTEL_PREFIX}_CAMPAIGN_STAGE"
+
+
+def _campaign_stage(algorithm: str) -> str:
+    """Lifecycle stage for *algorithm*; :data:`_DEFAULT_CAMPAIGN_STAGE` if unknown."""
+    return _CAMPAIGN_STAGE_BY_ALGORITHM.get(algorithm, _DEFAULT_CAMPAIGN_STAGE)
 
 # TelemetryConfig field -> NEMO_RL_OTEL_* env var. ``service_name`` maps to the
 # standard ``OTEL_SERVICE_NAME`` (lens reads it directly, unprefixed).
@@ -169,7 +190,7 @@ def _build_resource_attributes(
     Rank identity comes from :func:`_rank_attributes`, which the callers merge in.
     """
     attrs: dict[str, Any] = {
-        _CAMPAIGN_STAGE_ATTR: _CAMPAIGN_STAGE,
+        _CAMPAIGN_STAGE_ATTR: _campaign_stage(algorithm),
         "rl.algorithm": algorithm,
     }
 
@@ -235,6 +256,9 @@ def init_telemetry_driver(
     tel = getattr(master_config, "telemetry", None)
     if tel is not None:
         _config_to_env(tel)
+    # Projected here for the same reason, and because a worker has no algorithm
+    # of its own to derive the stage from.
+    os.environ.setdefault(_CAMPAIGN_STAGE_ENV, _campaign_stage(algorithm))
 
     from nemo.lens import NemoLensConfig, setup_telemetry
 
@@ -319,21 +343,32 @@ def init_telemetry_driver(
     return handle
 
 
+#: Resource key naming which worker group a process belongs to. Written only
+#: here; callers pass ``worker_group=`` rather than the key.
+_WORKER_GROUP_ATTR = "rl.worker_group"
+
+
 def _worker_resource_attributes(
+    worker_group: Optional[str],
     extra: Optional[dict[str, Any]],
 ) -> dict[str, Any]:
     """Build resource attributes identifying this worker process.
 
     ``RANK`` is group-local — the policy group and the generation group each
     number their workers from zero — so ``nv.dl.rank`` alone cannot tell their
-    spans apart. ``rl.worker_group`` carries the group's ``name_prefix``
+    spans apart. :data:`_WORKER_GROUP_ATTR` carries the group's ``name_prefix``
     (``lm_policy``, ``vllm_policy``, ...), which ``RayWorkerGroup`` exports as
-    ``NRL_WORKER_GROUP``. Explicit ``extra`` attributes win.
+    ``NRL_WORKER_GROUP``. An explicit *worker_group* wins over the environment,
+    for the actors built outside ``RayWorkerGroup``, which nothing sets it for.
+    Explicit ``extra`` attributes win over both.
     """
-    attrs: dict[str, Any] = {_CAMPAIGN_STAGE_ATTR: _CAMPAIGN_STAGE}
-    worker_group = os.environ.get(_WORKER_GROUP_ENV, "").strip()
-    if worker_group:
-        attrs["rl.worker_group"] = worker_group
+    attrs: dict[str, Any] = {
+        _CAMPAIGN_STAGE_ATTR: os.environ.get(_CAMPAIGN_STAGE_ENV, "").strip()
+        or _DEFAULT_CAMPAIGN_STAGE
+    }
+    group = worker_group or os.environ.get(_WORKER_GROUP_ENV, "").strip()
+    if group:
+        attrs[_WORKER_GROUP_ATTR] = group
     if extra:
         attrs.update(extra)
     return attrs
@@ -342,6 +377,7 @@ def _worker_resource_attributes(
 def init_telemetry_worker(
     rank: Optional[int] = None,
     world_size: Optional[int] = None,
+    worker_group: Optional[str] = None,
     resource_attributes: Optional[dict[str, Any]] = None,
 ) -> Optional["TelemetryHandle"]:
     """Initialise telemetry inside a Ray actor (call once per worker process).
@@ -397,7 +433,7 @@ def init_telemetry_worker(
         if not config.enabled:
             return None
 
-        attrs = _worker_resource_attributes(resource_attributes)
+        attrs = _worker_resource_attributes(worker_group, resource_attributes)
         attrs.update(_rank_attributes(rank=rank, world_size=world_size))
 
         handle = setup_telemetry(config, resource_attributes=attrs)

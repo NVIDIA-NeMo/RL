@@ -108,11 +108,19 @@ def _span_name_candidates(
 # rl.bucket, so every guard here has to look at all four or it silently stops
 # covering whichever spans were most recently moved between them.
 _GROUP_TAKING_HELPERS = frozenset(
-    {"managed_span", "trace_fn", "umbrella_span", "umbrella_trace_fn"}
+    {
+        "managed_span",
+        "trace_fn",
+        "umbrella_span",
+        "umbrella_trace_fn",
+        "streaming_umbrella_span",
+    }
 )
 
 # Which helper goes with which kind of group.
-_UMBRELLA_HELPERS = frozenset({"umbrella_span", "umbrella_trace_fn"})
+_UMBRELLA_HELPERS = frozenset(
+    {"umbrella_span", "umbrella_trace_fn", "streaming_umbrella_span"}
+)
 _LEAF_HELPERS = frozenset({"managed_span", "trace_fn"})
 
 

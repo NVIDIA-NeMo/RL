@@ -74,7 +74,7 @@ def test_campaign_stage_is_tagged_on_driver_and_worker():
         _build_resource_attributes(_FakeMasterConfig(), "grpo")["nv.dl.campaign.stage"]
         == "RL"
     )
-    assert _worker_resource_attributes(None)["nv.dl.campaign.stage"] == "RL"
+    assert _worker_resource_attributes(None, None)["nv.dl.campaign.stage"] == "RL"
 
 
 def test_build_resource_attributes_dtensor_tp():
@@ -251,7 +251,7 @@ def test_vllm_native_tracing_needs_the_master_switch(monkeypatch):
 
 def test_worker_resource_attributes_carries_worker_group(monkeypatch):
     monkeypatch.setenv("NRL_WORKER_GROUP", "vllm_policy")
-    assert _worker_resource_attributes(None) == {
+    assert _worker_resource_attributes(None, None) == {
         "nv.dl.campaign.stage": "RL",
         "rl.worker_group": "vllm_policy",
     }
@@ -259,12 +259,12 @@ def test_worker_resource_attributes_carries_worker_group(monkeypatch):
 
 def test_worker_resource_attributes_without_group_env():
     # Workers not created by RayWorkerGroup simply omit the attribute.
-    assert _worker_resource_attributes(None) == {"nv.dl.campaign.stage": "RL"}
+    assert _worker_resource_attributes(None, None) == {"nv.dl.campaign.stage": "RL"}
 
 
 def test_worker_resource_attributes_explicit_extra_wins(monkeypatch):
     monkeypatch.setenv("NRL_WORKER_GROUP", "lm_policy")
-    attrs = _worker_resource_attributes({"rl.worker_group": "override", "k": 1})
+    attrs = _worker_resource_attributes(None, {"rl.worker_group": "override", "k": 1})
     assert attrs == {
         "nv.dl.campaign.stage": "RL",
         "rl.worker_group": "override",

@@ -681,16 +681,20 @@ class VllmGeneration(GenerationInterface):
                 "Previous snapshot will be overwritten.",
                 RuntimeWarning,
             )
-        # Guarded for the same reason get_step_metrics is, against the same
-        # input: this reads the engine's whole Prometheus snapshot, whose series
-        # names and shapes move between vLLM releases, and the callers invoke it
-        # bare in the step loop. Left as None on failure so the paired
-        # get_step_metrics returns {} rather than delta-ing against a stale
-        # baseline and reporting a step's worth of counters as one step's work.
+        # Callers do not guard this, and vLLM metric names change between
+        # releases. None on failure, so the paired get_step_metrics returns {}
+        # rather than delta-ing against a stale baseline.
         try:
             self._step_metrics_snapshot = self._get_raw_spec_counters()
+        except ray.exceptions.RayActorError:
+            # A dead generation actor is the caller's to handle: it has its own
+            # RayActorError handler and this is not an observability failure.
+            self._step_metrics_snapshot = None
+            raise
         except Exception:
-            warn_once("vllm_step_metrics", "failed to snapshot vLLM step metrics")
+            warn_once(
+                "vllm_step_metrics_snapshot", "failed to snapshot vLLM step metrics"
+            )
             self._step_metrics_snapshot = None
 
     def get_step_metrics(self) -> dict[str, float]:
@@ -720,19 +724,19 @@ class VllmGeneration(GenerationInterface):
         # make the next snapshot_step_metrics() warn about a double snapshot.
         self._step_metrics_snapshot = None
 
-        # The callers merge this straight into the step's metrics dict with no
-        # guard of their own, so an exception here would end the run. These are
-        # derived from the engine's Prometheus snapshot, whose series names and
-        # shapes move between vLLM releases -- exactly the input that should
-        # cost observability rather than training.
+        # Callers merge this into the step's metrics dict unguarded, so a
+        # vLLM rename must cost observability rather than the run.
         try:
             counters_end = self._get_raw_spec_counters()
             step_metrics = compute_spec_decode_metrics(counters_start, counters_end)
             step_metrics.update(
                 compute_engine_step_metrics(counters_start, counters_end)
             )
+        except ray.exceptions.RayActorError:
+            # See snapshot_step_metrics: the caller handles a dead actor.
+            raise
         except Exception:
-            warn_once("vllm_step_metrics", "failed to collect vLLM step metrics")
+            warn_once("vllm_step_metrics_read", "failed to collect vLLM step metrics")
             return {}
 
         return step_metrics

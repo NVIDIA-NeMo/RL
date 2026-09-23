@@ -28,13 +28,14 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from enum import Enum
 from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    ContextManager,
     Iterator,
     Mapping,
     Optional,
@@ -80,6 +81,7 @@ RL_IDLE_POLLS_ATTR = "rl.idle.polls"
 __all__ = [
     "managed_span",
     "umbrella_span",
+    "streaming_umbrella_span",
     "trace_fn",
     "umbrella_trace_fn",
     "span_cm",
@@ -390,15 +392,32 @@ def remote_trace_context(carrier: Optional[Mapping[str, str]]) -> Iterator[None]
     :class:`~contextvars.ContextVar`, and ``threading.Thread`` does not inherit
     them — a fire-and-forget worker thread starts with an empty context.
     """
+    with attached_context(remote_trace_parent(carrier)):
+        yield
+
+
+def remote_trace_parent(carrier: Optional[Mapping[str, str]]) -> Optional[Any]:
+    """The OTel context *carrier* names, or None when there is nothing to attach."""
     if not carrier:
+        return None
+    from nemo.lens.contrib.ray import extract_ray_context
+
+    return extract_ray_context(dict(carrier))
+
+
+@contextmanager
+def attached_context(context: Optional[Any]) -> Iterator[None]:
+    """Attach *context* for the duration of the block; a no-op for None.
+
+    Attach/detach come from opentelemetry because lens wraps the extraction but
+    not the activation.
+    """
+    if context is None:
         yield
         return
-    # attach/detach come from opentelemetry because lens wraps the extraction
-    # but not the activation.
-    from nemo.lens.contrib.ray import extract_ray_context
     from opentelemetry import context as otel_ctx
 
-    token = otel_ctx.attach(extract_ray_context(dict(carrier)))
+    token = otel_ctx.attach(context)
     try:
         yield
     finally:
@@ -472,7 +491,7 @@ def dispatch_with_trace_context(
     except TypeError as exc:
         if TRACE_CARRIER_KWARG not in str(exc):
             raise
-        name = getattr(remote_method, "_method_name", None) or repr(remote_method)
+        name = _dispatch_method_name(remote_method)
         if name not in _CARRIER_REFUSED:
             _CARRIER_REFUSED.add(name)
             logger.warning(
@@ -482,6 +501,19 @@ def dispatch_with_trace_context(
                 exc,
             )
         return remote_method.remote(*args, **kwargs)
+
+
+def _dispatch_method_name(remote_method: Any) -> str:
+    """Name of the method behind a dispatch handle, for the warning key.
+
+    ``.options(...)`` hands back ``_ActorMethodOptionsWrapper`` (Ray 2.56.1),
+    which keeps the real ``ActorMethod`` in ``_actor_method`` and carries no
+    ``_method_name`` itself. A repr would do for a key, except it embeds a
+    fresh address per call, so the warning would repeat on every dispatch --
+    and both NeMo-Gym call sites go through ``.options``.
+    """
+    target = getattr(remote_method, "_actor_method", remote_method)
+    return getattr(target, "_method_name", None) or type(remote_method).__name__
 
 
 def _advertise_carrier(method: Any) -> None:
@@ -550,18 +582,25 @@ def accepts_trace_context(method: _F) -> _F:
 
         @functools.wraps(method)
         async def agen_wrapper(*args: Any, **kwargs: Any) -> Any:
-            carrier = kwargs.pop(TRACE_CARRIER_KWARG, None)
-            # ``async for`` rather than driving ``__anext__`` by hand so that
-            # closing this generator early closes the inner one -- worth more
-            # than the precision the manual form would buy. The cost is that
-            # the context stays attached while the consumer handles each item
-            # instead of only while the body advances. Harmless here: an async
-            # actor call is its own asyncio task, and a task gets a private
-            # copy of the context, so the attachment cannot reach a concurrent
-            # rollout.
-            with remote_trace_context(carrier):
-                async for item in method(*args, **kwargs):
+            # Attached around each step rather than across the yield: Ray does
+            # not close this generator when it cancels the call (ray.cancel on
+            # a sharded Gym stream), so a context still attached at the yield
+            # is detached later by the garbage collector, in a different
+            # context, and OTel logs "Failed to detach context".
+            context = remote_trace_parent(kwargs.pop(TRACE_CARRIER_KWARG, None))
+            inner = method(*args, **kwargs)
+            try:
+                while True:
+                    with attached_context(context):
+                        try:
+                            item = await inner.__anext__()
+                        except StopAsyncIteration:
+                            return
                     yield item
+            finally:
+                # Driving __anext__ by hand loses what ``async for`` gave for
+                # free, so closing this generator still closes the inner one.
+                await inner.aclose()
 
         return cast(_F, agen_wrapper)
 
@@ -664,6 +703,48 @@ def umbrella_span(
     else:
         with _managed_span(group, name, tracer=tracer, **attributes) as span:
             yield span
+
+
+@contextmanager
+def streaming_umbrella_span(
+    group: str, name: str, tracer: Optional[Tracer] = None, **attributes: Any
+) -> Iterator[Callable[[], ContextManager[None]]]:
+    """An umbrella span over an async generator, made current one step at a time.
+
+    :func:`umbrella_span` cannot wrap a generator's ``yield``: Ray abandons a
+    cancelled streaming call without closing the generator, so a context still
+    attached at the yield is detached later by the garbage collector, in a
+    different context, and OTel logs ``Failed to detach context``.
+
+    The span itself still spans the whole stream -- it is started here and
+    ended when the block leaves. Only the *attachment* is per step, which is
+    all that has to be, since nothing between two items belongs to this span.
+
+    Yields:
+        A callable returning a context manager to wrap each ``__anext__``. It
+        is a no-op when the group is disabled, so the caller needs no branch.
+    """
+    if not is_span_group_enabled(group):
+        yield _no_span_activation
+        return
+    if group not in UMBRELLA_GROUPS:
+        _warn_leaf_group_at_umbrella_call(group, name)
+        attributes = {**goodput_span_attributes(group), **attributes}
+
+    from opentelemetry import trace as otel_trace
+
+    span = (tracer or otel_trace.get_tracer(__name__)).start_span(name)
+    if attributes:
+        _safe_set_span_attributes(span, attributes)
+    try:
+        yield lambda: otel_trace.use_span(span, end_on_exit=False)
+    finally:
+        span.end()
+
+
+def _no_span_activation() -> ContextManager[None]:
+    """Activation for a disabled group: nothing to attach, nothing to detach."""
+    return nullcontext()
 
 
 def _efficiency_span_name_and_attrs(

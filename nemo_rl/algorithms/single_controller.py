@@ -356,7 +356,7 @@ class SingleControllerActor:
         _telemetry = init_telemetry_worker(
             rank=0,
             world_size=1,
-            resource_attributes={"rl.worker_group": "single_controller"},
+            worker_group="single_controller",
         )
         self._tracer = _telemetry.tracer if _telemetry is not None else None
 
