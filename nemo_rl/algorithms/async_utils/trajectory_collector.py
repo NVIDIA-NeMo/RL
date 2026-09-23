@@ -1106,6 +1106,14 @@ class AsyncTrajectoryCollector:
                 "⏸️ Non-async engine: waiting for all pending generations to complete..."
             )
             self.wait_for_pending_generations()
+            # Completed vLLM requests leave reusable prefix-cache entries behind.
+            # These must not survive a weight update, even when recomputation of
+            # in-flight request KV is disabled. Sync GRPO clears them in
+            # finish_generation(); the drained async path must do so here.
+            if backend == "vllm" and not self.policy_generation.invalidate_kv_cache():
+                raise RuntimeError(
+                    "Failed to invalidate vLLM prefix cache before drained refit"
+                )
 
         elapsed = time.time() - start_time
         print(f"✅ Ready for refit (took {elapsed:.2f}s)")

@@ -120,6 +120,9 @@ class MockGenerationInterface:
     def finish_generation(self):
         self.finish_calls += 1
 
+    def invalidate_kv_cache(self) -> bool:
+        return True
+
     def pause_generation_for_refit(self, *, clear_cache: bool) -> bool:
         self.pause_generation_for_refit_calls.append(clear_cache)
         if self.pause_generation_for_refit_supported:
@@ -2689,21 +2692,51 @@ class TestAsyncTrajectoryCollector:
         collector.wait_for_pending_generations.assert_not_called()
         assert not collector._refit_pause_cleared.is_set()
 
-    def test_vllm_refit_drains_without_native_pause_when_in_flight_disabled(
-        self,
+    @pytest.mark.parametrize("async_engine", [False, True])
+    @pytest.mark.parametrize("recompute_kv_cache", [False, True])
+    def test_vllm_drained_refit_invalidates_prefix_cache(
+        self, async_engine: bool, recompute_kv_cache: bool
     ) -> None:
         collector = self.create_local_collector()
         collector.master_config.policy["generation"] = {
             "backend": "vllm",
-            "vllm_cfg": {"async_engine": True},
+            "vllm_cfg": {"async_engine": async_engine},
         }
-        collector.master_config.grpo.async_grpo.in_flight_weight_updates = False
+        async_cfg = collector.master_config.grpo.async_grpo
+        async_cfg.in_flight_weight_updates = False
+        async_cfg.recompute_kv_cache_after_weight_updates = recompute_kv_cache
         collector.wait_for_pending_generations = mock.Mock()
 
+        def invalidate() -> bool:
+            collector.wait_for_pending_generations.assert_called_once_with()
+            assert not collector._refit_pause_cleared.is_set()
+            return True
+
+        collector.policy_generation.invalidate_kv_cache = mock.Mock(
+            side_effect=invalidate
+        )
         collector.prepare_for_refit()
 
         assert collector.policy_generation.pause_generation_for_refit_calls == []
-        collector.wait_for_pending_generations.assert_called_once_with()
+        collector.policy_generation.invalidate_kv_cache.assert_called_once_with()
+        assert not collector._refit_pause_cleared.is_set()
+
+    @pytest.mark.parametrize("raises", [False, True])
+    def test_vllm_drained_refit_cache_failure_keeps_collection_paused(
+        self, raises: bool
+    ) -> None:
+        collector = self.create_local_collector()
+        collector.master_config.grpo.async_grpo.in_flight_weight_updates = False
+        collector.wait_for_pending_generations = mock.Mock()
+        collector.policy_generation.invalidate_kv_cache = mock.Mock(
+            return_value=False,
+            side_effect=RuntimeError("cache reset failed") if raises else None,
+        )
+
+        with pytest.raises(RuntimeError, match="cache"):
+            collector.prepare_for_refit()
+
+        assert not collector._refit_pause_cleared.is_set()
 
     def test_non_vllm_async_backend_uses_pause_contract_and_legacy_fallback(
         self, capsys: pytest.CaptureFixture[str]
