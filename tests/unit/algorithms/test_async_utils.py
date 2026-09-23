@@ -1945,6 +1945,7 @@ class TestAsyncTrajectoryCollector:
                 target_weight_version=3,
                 num_generations=1,
                 use_nemo_gym=False,
+                trace_prefix="rollout",
             )
         )
 
@@ -2434,6 +2435,7 @@ class TestAsyncTrajectoryCollector:
             },
             env={"should_use_nemo_gym": False},
             logger={
+                "log_dir": "logs",
                 "wandb_enabled": False,
                 "wandb": {"log_nemo_gym_full_result_tables": False},
             },
@@ -2461,6 +2463,7 @@ class TestAsyncTrajectoryCollector:
                 max_rollout_turns=1,
                 async_ppo=async_config,
             ),
+            logger={"log_dir": "logs"},
         )
         collector_cls = AsyncTrajectoryCollector.__ray_metadata__.modified_class
         collector = collector_cls(
@@ -3271,6 +3274,7 @@ class TestAsyncTrajectoryCollector:
                     target_weight_version=3,
                     num_generations=3,
                     use_nemo_gym=False,
+                    trace_prefix="rollout",
                 )
             )
 
@@ -3529,7 +3533,7 @@ class TestAsyncTrajectoryCollector:
             collector._generating_targets.add(target_weight)
             asyncio.run(
                 collector._run_rollout_batch_worker(
-                    repeated_batch=None,
+                    repeated_batch=self.create_mock_batch(size=1),
                     generation_weight_version=4,
                     target_weight_version=target_weight,
                     num_generations=1,
@@ -3631,7 +3635,7 @@ class TestAsyncTrajectoryCollector:
 
         asyncio.run(
             collector._run_rollout_batch_worker(
-                repeated_batch=None,
+                repeated_batch=self.create_mock_batch(size=1),
                 generation_weight_version=4,
                 target_weight_version=target_weight,
                 num_generations=1,
@@ -3662,7 +3666,7 @@ class TestAsyncTrajectoryCollector:
 
         asyncio.run(
             collector._run_rollout_batch_worker(
-                repeated_batch=None,
+                repeated_batch=self.create_mock_batch(size=1),
                 generation_weight_version=4,
                 target_weight_version=target_weight,
                 num_generations=1,
@@ -3697,6 +3701,7 @@ class TestAsyncUtilsIntegration:
                 "max_total_sequence_length": 512,
                 "make_sequence_length_divisible_by": 1,
             },
+            logger={"log_dir": "logs"},
         )
 
     def create_mock_batch(self, size: int = 2) -> BatchedDataDict[DatumSpec]:
