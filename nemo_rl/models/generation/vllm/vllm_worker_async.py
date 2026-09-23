@@ -2143,15 +2143,10 @@ class VllmAsyncGenerationWorkerImpl(
             print(f"Error during vLLM shutdown: {e}")
             return False
         finally:
-            # Flush buffered spans/metrics before the actor goes away. Off the
-            # event loop: the flush blocks on a network export bounded to 5s by
-            # shutdown_telemetry, and this is an async actor whose other
-            # coroutines -- including in-flight generate requests -- share this
-            # loop. Same reason the sparse-refit shutdown above is offloaded.
-            #
-            # Shielded like the single controller's: a cancel landing on this
-            # await is cleanup being interrupted, and should not decide what
-            # this method returns.
+            # Flush buffered spans before the actor goes away, off the event
+            # loop: the export blocks for up to 5s and this async actor's
+            # in-flight generate requests share the loop. Shielded because a
+            # cancel here is cleanup being interrupted.
             try:
                 await asyncio.shield(asyncio.to_thread(shutdown_telemetry))
             except asyncio.CancelledError:

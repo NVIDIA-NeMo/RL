@@ -445,28 +445,14 @@ class NemoGym(EnvironmentInterface):
     """This environment class isn't really used for training. It's really meant as an integration wrapper around NeMo-Gym that hooks into the existing NeMo RL resource management via ray. So there is still one source of truth for resource management in NeMo RL."""
 
     def __init__(self, cfg: NemoGymConfig):
-        # Named explicitly because this actor is built from the environment
-        # registry rather than by RayWorkerGroup, so nothing sets
-        # NRL_WORKER_GROUP for it and its spans would otherwise carry no
-        # rl.worker_group at all.
+        # Named explicitly: built from the environment registry rather than
+        # by RayWorkerGroup, so nothing sets NRL_WORKER_GROUP for it.
         init_telemetry_worker(worker_group="nemo_gym")
-        # Before _spinup, which is where Gym builds the ClientSession that
-        # carries every rollout: the instrumentor patches the session class, so
-        # a session that already exists keeps the uninstrumented behaviour and
-        # the whole Gym leg of the trace is lost.
-        #
-        # Gated, because the instrumentor spans every request off the global
-        # tracer with no reference to the enabled-group set: whatever turns it
-        # on pays a span per HTTP call for the rest of the run.
-        #
-        # PER_PROMPT rather than ROLLOUT, even though these spans sit inside the
-        # rollout. The group has to describe the volume, not the phase, and this
-        # is the highest-cardinality thing NeMo-RL emits -- prompts x turns x
-        # tool calls, strictly more than the ~2-per-prompt spans PER_PROMPT
-        # exists to fence off. ROLLOUT is in `per_step`, whose stated contract
-        # is that its cost scales with steps rather than dataset size, so
-        # gating here on ROLLOUT would quietly break that for every Gym run.
-        # Ask for the Gym HTTP leg with "per_step,per_prompt".
+        # Before _spinup, where Gym builds the ClientSession every rollout
+        # goes through: the instrumentor patches the class, so a session that
+        # already exists keeps the uninstrumented behaviour. Gated on
+        # PER_PROMPT because it spans every HTTP call off the global tracer --
+        # see RLSpanGroup.PER_PROMPT for why the volume picks the group.
         if is_span_group_enabled(RLSpanGroup.PER_PROMPT):
             instrument_aiohttp_client()
         self.cfg = cfg

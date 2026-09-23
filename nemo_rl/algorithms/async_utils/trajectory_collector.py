@@ -157,13 +157,10 @@ class AsyncTrajectoryCollector:
         resume_covered_task_indices: Optional[list[int]] = None,
         trace_carrier: Optional[dict[str, str]] = None,
     ) -> None:
-        # Every rollout in an async run is generated from this process, so
-        # without this the spans below are no-ops and an async trace has no
-        # rollout phase at all. rank/world_size are passed explicitly: this
-        # actor is a singleton rather than a member of a ranked group, and its
-        # runtime_env is a copy of the driver's environment, so a stray RANK
-        # there would otherwise label every rollout span with another group's
-        # rank.
+        # Every rollout in an async run is generated here, so without this
+        # an async trace has no rollout phase at all. rank/world_size are
+        # explicit because this actor is a singleton whose runtime_env copies
+        # the driver's, where a stray RANK would mislabel every span.
         _telemetry = init_telemetry_worker(rank=0, world_size=1)
         self._tracer = _telemetry.tracer if _telemetry is not None else None
         # The driver's rl.<algo>.job span, so this actor's spans land in the run's
@@ -944,14 +941,10 @@ class AsyncTrajectoryCollector:
                     _collect()
 
             def _collect() -> None:
-                # The async counterpart of the driver's rl.<algo>.generation.
-                # ROLLOUT is an umbrella group, so this carries no rl.bucket --
-                # several batch workers run concurrently, so their durations sum
-                # past wall time and cannot go into a bucket rollup. It is here
-                # for the trace: how long a batch took, and at which weight
-                # version. Deliberately one span per batch, not per sample:
-                # generate_async is dispatched one coroutine per sample, which
-                # would be thousands of overlapping spans per step.
+                # The async counterpart of the driver's rl.<algo>.generation,
+                # unbucketed because batch workers overlap. One span per
+                # batch, not per sample: generate_async is dispatched one
+                # coroutine per sample, which would be thousands per step.
                 with umbrella_span(
                     RLSpanGroup.U_ROLLOUT,
                     self._rollout_span_name,

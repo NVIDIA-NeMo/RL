@@ -1740,15 +1740,11 @@ class MetricsDataPlaneClient(DataPlaneClient):
             Whatever ``fn`` returned.
         """
         t0 = monotonic()
-        # One client per process serves both the rollout path, which puts once
-        # per prompt, and the batch stages, which put once per step. Same op,
-        # counts orders of magnitude apart, so the group has to come from the
-        # caller's scope rather than from ``op``. PER_PROMPT is an umbrella, so
-        # a rollout put is unbucketed where a batch put is overhead: rollouts
-        # overlap each other and training, and their durations would sum past
-        # the wall clock. Two branches rather than one variable group because
-        # the umbrella helper is what marks a span as unbucketed at the call
-        # site, and a drift test enforces the pairing statically.
+        # One client serves both the rollout path (once per prompt) and the
+        # batch stages (once per step), so the group comes from the caller's
+        # scope rather than from ``op``. Two branches rather than a variable
+        # group: the umbrella helper is what marks a span unbucketed at the
+        # call site, and a drift test enforces that pairing statically.
         per_prompt = in_per_prompt_scope()
         group = RLSpanGroup.U_PER_PROMPT if per_prompt else RLSpanGroup.DATA_PLANE
         if not is_span_group_enabled(group):

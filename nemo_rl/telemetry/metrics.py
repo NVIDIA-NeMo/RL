@@ -375,13 +375,9 @@ map_setup_seconds = SetupTimingMetrics.phase_seconds
 def _tee_setup_metrics(meter: Meter, metrics: dict[str, Any]) -> None:
     """Emit the startup phase durations as ``rl.setup.duration``."""
     for phase, value in map_setup_seconds(metrics).items():
-        # No rl.bucket, unlike the efficiency series. These phases overlap each
-        # other by construction -- total_setup contains the rest, parallel_wall
-        # covers the generation and policy builds running concurrently, and
-        # generation_init_{reserve,load} are parts of generation_init -- so
-        # anything summing them by bucket would count startup several times
-        # over. Read one phase at a time; the rl.setup.* spans carry the bucket
-        # for the flat subset where summing is well defined.
+        # No rl.bucket, unlike the efficiency series: these phases nest and
+        # overlap by construction, so summing them by bucket would count
+        # startup several times over. Read one phase at a time.
         _record(meter, {_SETUP_DURATION_KEY: value}, {RL_SETUP_PHASE_ATTR: phase})
 
 

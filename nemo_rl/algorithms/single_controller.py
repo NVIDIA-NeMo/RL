@@ -345,16 +345,12 @@ class SingleControllerActor:
             actor_args: Pre-built actor args from setup_single_controller.
             setup_timing_metrics: Driver-side setup timings; logged here (Logger isn't cloudpickleable).
         """
-        # The driver here only sets up and launches; the whole run happens inside
-        # this actor, so this is the process that has to open the job span. It is
-        # rank 0 of 1 in its own right, which is what it reports rather than
-        # inheriting a stray RANK from the driver's environment.
-        #
-        # Named explicitly for the same reason NemoGym is: this actor is built
-        # directly rather than by RayWorkerGroup, so nothing sets
-        # NRL_WORKER_GROUP for it. Without the name it reports rank 0 of 1 with
-        # no rl.worker_group, which is exactly what the launcher driver reports
-        # -- leaving every rl.sc.* span indistinguishable from the driver's.
+        # The whole run happens inside this actor, so this is the process
+        # that opens the job span, and it is rank 0 of 1 in its own right
+        # rather than inheriting a stray RANK. Named explicitly because it is
+        # built directly rather than by RayWorkerGroup, so nothing sets
+        # NRL_WORKER_GROUP -- without it the rl.sc.* spans are
+        # indistinguishable from the launcher driver's.
         _telemetry = init_telemetry_worker(
             rank=0,
             world_size=1,
@@ -736,15 +732,10 @@ class SingleControllerActor:
             ):
                 result = await self._run_pumps()
         finally:
-            # Outside the span so the job span itself is flushed, and off the
-            # event loop because the flush blocks: the exporter batches, so
-            # without it the last steps' spans die with the process.
-            #
-            # Shielded, and a cancel arriving during it swallowed, because this
-            # is cleanup: teardown is exactly when cancellation lands, and an
-            # unguarded await here would surface CancelledError to the caller
-            # with whatever _run_pumps actually raised gone. Losing the flush is
-            # the smaller failure, and shield avoids even that.
+            # Outside the span so the job span is flushed too, and off the
+            # event loop because the exporter's flush blocks. Shielded, and a
+            # cancel swallowed, because teardown is exactly when cancellation
+            # lands and it would mask what _run_pumps actually raised.
             try:
                 await asyncio.shield(asyncio.to_thread(shutdown_telemetry))
             except asyncio.CancelledError:
@@ -2139,25 +2130,10 @@ class SingleControllerActor:
                 else:
                     while True:
                         try:
-                            # One span per dispatch *attempt* rather than per
-                            # step: these run concurrently with training, so a
-                            # step-shaped span would misreport when generation
-                            # happened. A SKIPPED outcome re-enters this loop
-                            # with a substitute prompt and opens another span,
-                            # which rl.rollout.attempt distinguishes.
-                            #
-                            # PER_PROMPT, and carrying no rl.bucket: up to
-                            # max_inflight_prompts of these overlap (1280 in
-                            # some recipes), so tagged productive they would sum
-                            # to many times the wall clock they happened in.
-                            # Productive generation is attributed inside the
-                            # generation workers instead.
-                            #
-                            # Gated before the attribute dict is built, since
-                            # this runs once per prompt. per_prompt_scope() is
-                            # entered either way: the data-plane put inside
-                            # reads it, and that client cannot otherwise see
-                            # whether its caller is a rollout or a batch stage.
+                            # One span per dispatch attempt, gated before
+                            # the attribute dict since this runs per prompt.
+                            # per_prompt_scope() is entered either way: the
+                            # data-plane put inside reads it.
                             if is_span_group_enabled(RLSpanGroup.U_PER_PROMPT):
                                 rollout_span: Any = umbrella_span(
                                     RLSpanGroup.U_PER_PROMPT,
@@ -2860,18 +2836,12 @@ class SingleControllerActor:
                                     f"groups with {buffered_groups} group(s) "
                                     f"remaining in the buffer"
                                 )
-                            # Opened on the first starved poll and left open
-                            # across the retries, so one span covers the whole
-                            # wait. Safe to span the selection above it only
-                            # because a *starved* poll never reaches the data
-                            # plane: evict() returns 0 without calling remove()
-                            # when nothing is stale, and select() gives up in
-                            # _finalize_selection before claiming anything. A
-                            # bucketed span over bucketed children would
-                            # otherwise be counted twice by a rollup that sums
-                            # durations by bucket -- the reason async GRPO, whose
-                            # poll is 100x slower and so needs no coalescing,
-                            # still wraps its bare sleep under this same name.
+                            # Opened on the first starved poll and held
+                            # across retries, so one span covers the whole
+                            # wait. Safe to span the selection above only
+                            # because a starved poll never reaches the data
+                            # plane, so this cannot nest over bucketed
+                            # children and be counted twice.
                             if starvation_span is None:
                                 starvation_span = start_efficiency_span(
                                     "idle/buffer_starvation", tracer=self._tracer
@@ -3159,14 +3129,10 @@ class SingleControllerActor:
                         self._algo_cfg.num_prompts_per_step,
                     )
 
-                # The loop can also leave a wait open by breaking on a target that
-                # fell to what is already dispatched, or by its condition going
-                # false while the pump was still polling. Both continue the run,
-                # so an unended span here would stay open over the training that
-                # follows -- and never be exported. The remaining exits (the
-                # `return` on a drained buffer, the invariant `raise`s, task
-                # cancellation) all end the run, where dropping the span costs
-                # nothing, so they are deliberately not covered.
+                # The loop can leave a wait open on two exits that continue
+                # the run, where an unended span would stay open over the
+                # training that follows and never be exported. The other
+                # exits all end the run, so they are not covered.
                 if starvation_span is not None:
                     safe_set_span_attributes(
                         starvation_span, {RL_IDLE_POLLS_ATTR: starvation_polls}
@@ -3334,11 +3300,9 @@ class SingleControllerActor:
                         # Refit-deferral (colocated): the engine is about to be saved; let it sleep.
                         # Record `weight_sync` for consistency in reports.
                         #
-                        # No idle/refit_bubble here: this branch syncs nothing, and
-                        # the wake that stands in for the refit runs after the save
-                        # below. Bucketing a no-op would report a bubble whose
-                        # duration is unrelated to how long generation served stale
-                        # weights.
+                        # No idle/refit_bubble: this branch syncs nothing, so
+                        # its duration says nothing about how long generation
+                        # served stale weights.
                         with self._timer.time("weight_sync"):
                             pass
                         with self._timer.time("offload_before_refit"):

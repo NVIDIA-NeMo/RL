@@ -293,17 +293,11 @@ def init_telemetry_driver(
         os.environ[_RUN_ID_ENV] = run_id
         config.run_id = run_id
 
-    # An unresolvable span_groups entry is warned about by lens itself, from
-    # set_span_group_spec inside the setup_telemetry call below. Not duplicated
-    # here: lens resolves the spec against every namespace registered in the
-    # process, so it can name the registered groups, presets and namespaces,
-    # where this module knows only its own -- and a warning that listed only
-    # NeMo-RL's groups would call a Megatron group unregistered.
-    #
-    # Unguarded on purpose: _build_resource_attributes is total by construction
-    # (missing keys omit an attribute), so a raise here is a real bug, and
-    # swallowing it would drop rl.model / nemo.precision / dl.*_parallel.size
-    # from every span and metric for the whole run.
+    # Unresolvable span_groups entries are lens's warning to make, from
+    # set_span_group_spec below: it resolves against every namespace in the
+    # process, where this module knows only its own. Unguarded on purpose --
+    # _build_resource_attributes omits rather than raises on a missing key,
+    # so a raise here is a real bug.
     resource_attrs = _build_resource_attributes(master_config, algorithm)
     # The driver is a singleton, not a member of a distributed group. Rank 0 of
     # 1 is the honest description, and stating it silences lens's warning about
