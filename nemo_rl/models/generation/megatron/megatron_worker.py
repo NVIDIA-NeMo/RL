@@ -1019,7 +1019,13 @@ class MegatronGenerationMixin:
             return
         if self.inference_client is None:
             raise RuntimeError("Megatron token capture is not initialized")
-        self.inference_client.set_generation_epoch(version)
+
+        # The client's socket is also read by its listener task on the inference
+        # loop thread, and ZMQ sockets are not thread safe: send from that loop.
+        async def _send_epoch() -> None:
+            self.inference_client.set_generation_epoch(version)
+
+        asyncio.run_coroutine_threadsafe(_send_epoch(), self._inference_loop).result()
 
     def _build_sampling_params(
         self,
