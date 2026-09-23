@@ -84,7 +84,6 @@ from nemo_rl.environments.gym_checkpoint import (
     GymCheckpointTopology,
     GymCompletionReceipt,
     GymCompletedExecution,
-    GymCompletedExecutionAcknowledgementRequest,
     GymCompletedExecutionAcknowledgementResponse,
     GymCoordinatorModelStatusResponse,
     GymControlCapabilities,
@@ -1010,37 +1009,18 @@ Depending on your data shape, you may want to change these values."""
         acknowledged: list[GymCompletedExecution] = []
         for agent_name, receipts in sorted(by_agent.items()):
             discovered = self._agent_checkpoint_participant(agent_name)
-            request = GymCompletedExecutionAcknowledgementRequest(executions=receipts)
-            response = GymCompletedExecutionAcknowledgementResponse.model_validate(
-                await self._control(
-                    "POST",
-                    GYM_AGENT_COMPLETION_ACK_PATH,
-                    server_name=discovered.participant.server_name,
-                    json=request.model_dump(mode="json"),
+            for receipt in receipts:
+                GymCompletedExecutionAcknowledgementResponse.model_validate(
+                    await self._control(
+                        "POST",
+                        GYM_AGENT_COMPLETION_ACK_PATH,
+                        server_name=discovered.participant.server_name,
+                        json=receipt.model_dump(mode="json"),
+                    )
                 )
-            )
-            requested_keys = {
-                (receipt.rollout_id, receipt.attempt_index) for receipt in receipts
-            }
-            requested_receipts = {
-                (receipt.rollout_id, receipt.attempt_index): receipt
-                for receipt in receipts
-            }
-            response_receipts = {
-                (receipt.rollout_id, receipt.attempt_index): receipt
-                for receipt in response.acknowledged
-            }
-            if response_receipts != requested_receipts:
-                raise RuntimeError(
-                    "Gym completed-result acknowledgement did not cover the "
-                    f"requested executions for agent {agent_name!r}: "
-                    f"requested={sorted(requested_keys)!r}, "
-                    f"acknowledged={sorted(response_receipts)!r}"
+                acknowledged.append(
+                    GymCompletedExecution(receipt=receipt, agent_name=agent_name)
                 )
-            acknowledged.extend(
-                GymCompletedExecution(receipt=receipt, agent_name=agent_name)
-                for receipt in response.acknowledged
-            )
         return {"acknowledged": [item.model_dump(mode="json") for item in acknowledged]}
 
     def _ordered_checkpoint_participants(

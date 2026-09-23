@@ -683,13 +683,10 @@ def test_completed_results_are_acknowledged_by_resolved_agent() -> None:
 
     async def acknowledge_control(method, path, *, server_name, json, **_kwargs):
         assert method == "POST"
-        assert path.endswith("/acknowledge-completed")
+        assert path.endswith("/acknowledge")
         assert server_name == "agent-route"
-        assert json == {
-            "schema_version": 1,
-            "executions": [receipt],
-        }
-        return {"acknowledged": json["executions"]}
+        assert json == receipt
+        return {"acknowledged": True, "idempotent": False}
 
     env._control = AsyncMock(side_effect=acknowledge_control)
     result = asyncio.run(
@@ -711,7 +708,14 @@ def test_completed_results_are_acknowledged_by_resolved_agent() -> None:
     ]
 
 
-def test_completed_result_acknowledgement_rejects_a_different_receipt() -> None:
+@pytest.mark.parametrize(
+    ("acknowledged", "idempotent"),
+    [(True, False), (False, True)],
+)
+def test_completed_result_acknowledgement_accepts_new_and_idempotent_dispositions(
+    acknowledged: bool,
+    idempotent: bool,
+) -> None:
     env = _checkpoint_env()
     capabilities = {
         "policy": _capability(
@@ -735,13 +739,58 @@ def test_completed_result_acknowledgement_rejects_a_different_receipt() -> None:
     asyncio.run(env.discover_checkpoint_capabilities(list(capabilities)))
     receipt = _completion_receipt()
 
-    async def acknowledge_control(_method, _path, **_kwargs):
-        return {
-            "acknowledged": [{**receipt, "result_digest": "f" * 64}],
-        }
+    async def acknowledge_control(_method, path, *, json, **_kwargs):
+        assert path.endswith("/acknowledge")
+        assert json == receipt
+        return {"acknowledged": acknowledged, "idempotent": idempotent}
 
     env._control = AsyncMock(side_effect=acknowledge_control)
-    with pytest.raises(RuntimeError, match="did not cover"):
+    result = asyncio.run(
+        env.acknowledge_completed_executions(
+            [{"receipt": receipt, "agent_name": "resolved-agent"}]
+        )
+    )
+
+    assert result["acknowledged"] == [
+        {"receipt": receipt, "agent_name": "resolved-agent"}
+    ]
+
+
+@pytest.mark.parametrize(
+    ("acknowledged", "idempotent"),
+    [(False, False), (True, True)],
+)
+def test_completed_result_acknowledgement_rejects_invalid_disposition(
+    acknowledged: bool,
+    idempotent: bool,
+) -> None:
+    env = _checkpoint_env()
+    capabilities = {
+        "policy": _capability(
+            "responses_api_models",
+            "policy",
+            admission_states=["accepting", "draining", "paused"],
+            concurrency_contract="stateless",
+            instance_role="policy",
+        ),
+        "agent-route": _capability(
+            "responses_api_agents",
+            "resolved-agent",
+            features=["completed_result_acknowledgement"],
+        ),
+    }
+
+    async def discover_control(_method, _path, *, server_name, **_kwargs):
+        return capabilities[server_name]
+
+    env._control = AsyncMock(side_effect=discover_control)
+    asyncio.run(env.discover_checkpoint_capabilities(list(capabilities)))
+    receipt = _completion_receipt()
+    env._control = AsyncMock(
+        return_value={"acknowledged": acknowledged, "idempotent": idempotent}
+    )
+
+    with pytest.raises(ValueError, match="exactly one"):
         asyncio.run(
             env.acknowledge_completed_executions(
                 [{"receipt": receipt, "agent_name": "resolved-agent"}]

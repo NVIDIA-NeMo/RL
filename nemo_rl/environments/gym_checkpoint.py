@@ -39,7 +39,7 @@ GYM_MODEL_ADMISSION_PREFIX = f"{GYM_CHECKPOINT_CONTROL_PREFIX}/model-admission"
 GYM_MODEL_CHECKPOINT_PREFIX = f"{GYM_CHECKPOINT_CONTROL_PREFIX}/model-checkpoint"
 GYM_AGENT_CHECKPOINT_PREFIX = f"{GYM_CHECKPOINT_CONTROL_PREFIX}/agent-checkpoint"
 GYM_AGENT_COMPLETION_RECEIPT_PATH = f"{GYM_AGENT_CHECKPOINT_PREFIX}/completion-receipt"
-GYM_AGENT_COMPLETION_ACK_PATH = f"{GYM_AGENT_CHECKPOINT_PREFIX}/acknowledge-completed"
+GYM_AGENT_COMPLETION_ACK_PATH = f"{GYM_AGENT_CHECKPOINT_PREFIX}/acknowledge"
 GYM_AGENT_DISCARD_RESTORED_CONTINUATION_PATH = (
     f"{GYM_AGENT_CHECKPOINT_PREFIX}/discard-restored-continuation"
 )
@@ -532,28 +532,21 @@ class GymCompletedExecution(_StrictWireModel):
     agent_name: str = Field(min_length=1)
 
 
-class GymCompletedExecutionAcknowledgementRequest(_StrictWireModel):
-    """Idempotent batch release of terminal results owned durably by RL."""
-
-    schema_version: Literal[1] = GYM_CHECKPOINT_SCHEMA_VERSION
-    executions: list[GymCompletionReceipt] = Field(min_length=1)
-
-
 class GymCompletedExecutionAcknowledgementResponse(_StrictWireModel):
-    """Every requested identity the agent now considers acknowledged."""
+    """Disposition for one exact receipt-bound completion acknowledgement."""
 
-    acknowledged: list[GymCompletionReceipt]
+    acknowledged: bool
+    idempotent: bool
 
     @model_validator(mode="after")
-    def validate_unique_identities(
+    def validate_disposition(
         self,
     ) -> "GymCompletedExecutionAcknowledgementResponse":
-        keys = [
-            (identity.rollout_id, identity.attempt_index)
-            for identity in self.acknowledged
-        ]
-        if len(keys) != len(set(keys)):
-            raise ValueError("acknowledged Gym execution identities must be unique")
+        if self.acknowledged == self.idempotent:
+            raise ValueError(
+                "Gym completion acknowledgement must report exactly one of "
+                "acknowledged or idempotent"
+            )
         return self
 
 
