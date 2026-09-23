@@ -353,14 +353,6 @@ class MegatronPayloadStageResult:
     response_metadata: dict[str, Any]
 
 
-# Request-metadata keys the Megatron chat endpoint writes when it defers the
-# prefix splice to the engine's prompt preparer. Must match the constants of
-# the same name in Megatron-LM's ``megatron/core/inference/inference_request.py``;
-# the names mirror the ``replace_prefix_tokens`` arguments they feed.
-PREFIX_TEMPLATE_TOKEN_IDS_FIELD = "template_prefix_token_ids"
-PREFIX_EOS_TOKEN_ID_FIELD = "eos_token_id"
-
-
 class ChainPrefixCache:
     """Worker-local cache of resolved ``staging_chain`` prefixes."""
 
@@ -436,8 +428,12 @@ class TQMegatronPromptPreparer:
     ) -> RequestPromptPreparationResult:
         """Fetch a chained prefix, splice it into the prompt, and update admission."""
         # Deferred because the prompt preparer is optional and requires the
-        # Megatron-LM hooks from NVIDIA/Megatron-LM#7015.
+        # Megatron-LM hooks from NVIDIA/Megatron-LM#7015. The two field names
+        # are the request-metadata keys the Megatron chat endpoint writes when
+        # it defers the prefix splice to this preparer.
         from megatron.core.inference.inference_request import (
+            PREFIX_EOS_TOKEN_ID_FIELD,
+            PREFIX_TEMPLATE_TOKEN_IDS_FIELD,
             RequestPromptPreparationResult,
         )
 

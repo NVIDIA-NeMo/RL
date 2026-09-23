@@ -17,9 +17,7 @@
 from __future__ import annotations
 
 import contextlib
-import sys
 import threading
-import types
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -234,54 +232,6 @@ def _save_state(
     state.current_epoch = epoch
     state.trainer_version = trainer_version
     return state
-
-
-def _stub_megatron_inference_request(
-    monkeypatch: pytest.MonkeyPatch, inference_request: types.SimpleNamespace
-) -> None:
-    """Make ``from megatron.core.inference import inference_request`` resolve to a stub.
-
-    Stubs the parent packages too, so the check does not depend on whether the
-    driver venv carries megatron-core (unit tests run without it).
-    """
-    for name in ("megatron", "megatron.core", "megatron.core.inference"):
-        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
-    monkeypatch.setitem(
-        sys.modules, "megatron.core.inference.inference_request", inference_request
-    )
-
-
-def test_require_minf_capture_hooks_rejects_megatron_core_without_pr_7015(
-    monkeypatch,
-) -> None:
-    _stub_megatron_inference_request(
-        monkeypatch, types.SimpleNamespace(RequestPayloadStager=object)
-    )
-
-    with pytest.raises(NotImplementedError, match="lacks RequestPromptPreparer"):
-        sc_setup_mod._require_minf_capture_hooks()
-
-
-def test_require_minf_capture_hooks_accepts_megatron_core_with_pr_7015(
-    monkeypatch,
-) -> None:
-    _stub_megatron_inference_request(
-        monkeypatch,
-        types.SimpleNamespace(
-            RequestPayloadStager=object, RequestPromptPreparer=object
-        ),
-    )
-
-    assert sc_setup_mod._require_minf_capture_hooks() is None
-
-
-def test_require_minf_capture_hooks_defers_to_worker_without_megatron_core(
-    monkeypatch,
-) -> None:
-    # None in sys.modules makes the import raise ModuleNotFoundError.
-    monkeypatch.setitem(sys.modules, "megatron", None)
-
-    assert sc_setup_mod._require_minf_capture_hooks() is None
 
 
 @pytest.fixture
@@ -2308,12 +2258,7 @@ class TestSetup:
         return mc
 
     def test_megatron_token_capture_propagates_backend(self, patched_factories):
-        """Megatron token capture derives generation_backend and rides into Gym.
-
-        The #7015 gate is stubbed to pass so the happy path is deterministic
-        regardless of the pinned megatron-core; the gate itself is covered by
-        test_megatron_token_capture_requires_minf_capture_hooks.
-        """
+        """Megatron token capture derives generation_backend and rides into Gym."""
         mc = self._make_megatron_token_capture_config()
         patched_factories["setup_response_data"].return_value = (
             list(range(8)),
@@ -2329,7 +2274,6 @@ class TestSetup:
                 sc_setup_mod, "build_nemo_gym_actors", return_value=fake_gym_actor
             ) as mock_spinup,
             patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
-            patch.object(sc_setup_mod, "_require_minf_capture_hooks") as mock_gate,
             patch.object(sc_setup_mod, "MegatronGeneration") as mock_megatron,
             patch.object(sc_setup_mod, "ray"),
             patch(
@@ -2344,7 +2288,6 @@ class TestSetup:
             )
             actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
-        mock_gate.assert_called_once_with()
         assert mc.token_capture.generation_backend == "megatron"
         assert mock_spinup.call_args.kwargs["token_capture"]["generation_backend"] == (
             "megatron"
@@ -2360,12 +2303,10 @@ class TestSetup:
 
         with (
             patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
-            patch.object(sc_setup_mod, "_require_minf_capture_hooks") as mock_gate,
             pytest.raises(ValueError, match="expose_http_server=true"),
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
-        mock_gate.assert_not_called()
         assert mc.token_capture.generation_backend is None
         patched_factories["setup_response_data"].assert_not_called()
         patched_factories["_build_clusters"].assert_not_called()
@@ -2377,29 +2318,7 @@ class TestSetup:
 
         with (
             patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
-            patch.object(sc_setup_mod, "_require_minf_capture_hooks") as mock_gate,
             pytest.raises(NotImplementedError, match="router replay"),
-        ):
-            setup_single_controller(mc, MagicMock(pad_token_id=0))
-
-        # Router replay is rejected before the megatron-core pin is consulted.
-        mock_gate.assert_not_called()
-        assert mc.token_capture.generation_backend is None
-        patched_factories["setup_response_data"].assert_not_called()
-        patched_factories["_build_clusters"].assert_not_called()
-
-    def test_megatron_token_capture_requires_minf_capture_hooks(
-        self, patched_factories, monkeypatch
-    ):
-        """A pinned megatron-core without PR #7015 fails before any factory runs."""
-        mc = self._make_megatron_token_capture_config()
-        _stub_megatron_inference_request(
-            monkeypatch, types.SimpleNamespace(RequestPayloadStager=object)
-        )
-
-        with (
-            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
-            pytest.raises(NotImplementedError, match="7015"),
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 

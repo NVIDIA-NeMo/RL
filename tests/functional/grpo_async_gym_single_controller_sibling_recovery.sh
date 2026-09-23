@@ -18,15 +18,6 @@ case "$GENERATION_BACKEND" in
     megatron)
         BASE_NAME=grpo_megatron_generation_gym_single_controller
         TEST_DIR=$SCRIPT_DIR/grpo_megatron_generation_gym_single_controller_sibling_recovery
-        # Megatron capture needs the MInf hooks from NVIDIA/Megatron-LM PR #7015.
-        # Until the pinned megatron-core carries them, setup refuses the config,
-        # so skip with the same annotation the >= 3-GPU tests use instead of
-        # failing on a known-missing dependency.
-        if ! uv run --directory "$PROJECT_ROOT" --no-sync python -c \
-            'from nemo_rl.algorithms.single_controller_utils.setup import _require_minf_capture_hooks; _require_minf_capture_hooks()'; then
-            echo "::warning title=Megatron sibling recovery test skipped::The pinned megatron-core lacks the MInf capture hooks (Megatron-LM PR #7015); this test proves nothing until the submodule bump lands."
-            exit 0
-        fi
         ;;
     *)
         echo "Unsupported SC_SIBLING_RECOVERY_GENERATION_BACKEND=$GENERATION_BACKEND (expected vllm or megatron)"
@@ -93,6 +84,16 @@ SC_SIBLING_RECOVERY_TEST_EVENTS="$PHASE2_EVENTS" \
 RUN_CONVERGENCE_CHECKS=0 bash "$BASE_TEST" \
     "${COMMON_OVERRIDES[@]}"
 cp "$BASE_RUN_LOG" "$PHASE2_LOG"
+
+# Token capture must not reject or poison any rollout in the resumed run. Phase 1
+# is cut off on purpose, so only phase 2's metrics are checked. Both phases run
+# the base test with RUN_CONVERGENCE_CHECKS=0, so the metrics are dumped here.
+PHASE2_METRICS=$TEST_DIR/phase2-metrics.json
+uv run --directory "$PROJECT_ROOT" --no-sync tests/json_dump_tb_logs.py \
+    "$SCRIPT_DIR/$BASE_NAME/logs" --output_path "$PHASE2_METRICS"
+uv run --directory "$PROJECT_ROOT" --no-sync tests/check_metrics.py "$PHASE2_METRICS" \
+    'max(data["train/finalize/invalid_row_rate"]) == 0' \
+    'max(data["train/finalize/capture_poisoned_rollouts"]) == 0'
 
 grep -q "Native TQ checkpoint restored and validated" "$PHASE2_LOG"
 grep -q "Loaded .* unfinished rollout group(s)" "$PHASE2_LOG"

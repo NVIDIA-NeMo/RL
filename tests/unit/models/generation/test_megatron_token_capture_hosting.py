@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -12,9 +11,6 @@ nemo_gym = pytest.importorskip("nemo_gym.token_id_capture.staging")
 # megatron_worker imports megatron.core at module level; skip when it is absent.
 pytest.importorskip("megatron.core")
 
-from nemo_rl.algorithms.single_controller_utils.setup import (  # noqa: E402
-    _require_minf_capture_hooks,
-)
 from nemo_rl.models.generation.megatron.megatron_generation import (  # noqa: E402
     MegatronGeneration,
 )
@@ -181,35 +177,3 @@ def test_worker_requires_minf_payload_stager_protocol() -> None:
 
     with pytest.raises(RuntimeError, match="RequestPayloadStager"):
         worker.setup_token_capture({}, "rollout_staging")
-
-
-def test_setup_capture_hook_gate_matches_pinned_dynamic_engine() -> None:
-    """The driver-side #7015 gate must agree with the pinned engine's hooks.
-
-    The pinned megatron-core may or may not carry the MInf capture hooks
-    (NVIDIA/Megatron-LM PR #7015). This does not assert either way; it asserts
-    that ``_require_minf_capture_hooks`` reaches the same verdict as inspecting
-    ``DynamicInferenceEngine`` itself, so it fails only when the detection logic
-    and reality diverge, and stays green across the pin bump.
-    """
-    dynamic_engine = pytest.importorskip(
-        "megatron.core.inference.engines.dynamic_engine"
-    )
-    engine_cls = dynamic_engine.DynamicInferenceEngine
-    init_source = inspect.getsource(engine_cls.__init__)
-    has_hooks = all(
-        hasattr(engine_cls, name)
-        or name in getattr(engine_cls, "__annotations__", {})
-        or name in init_source
-        for name in ("payload_stager", "prompt_preparer")
-    )
-
-    try:
-        _require_minf_capture_hooks()
-    except NotImplementedError as exc:
-        assert "7015" in str(exc)
-        gate_passes = False
-    else:
-        gate_passes = True
-
-    assert gate_passes == has_hooks
