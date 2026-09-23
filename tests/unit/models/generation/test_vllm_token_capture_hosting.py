@@ -384,7 +384,8 @@ def test_staging_chain_prefix_flows_through_adapter_and_begin_call():
     # enter_prefix is the production writer of the request field.
     assert request.required_prefix_token_ids == prefix
     call, prompt = worker._capture_calls[id(request)]
-    assert call.admission.required_prefix_token_ids == prefix
+    # Gym's begin_call resolves the caller-supplied prefix onto the ActiveCall.
+    assert call.prefix_token_ids == prefix
     assert prompt == [10, 11, 12, 20]
 
 
@@ -431,7 +432,7 @@ def test_staging_chain_cache_fetches_only_uncached_suffix():
 
 
 def test_staging_chain_prefix_length_mismatch_is_rejected_by_begin_call():
-    """The worker validates a fetched prefix before constructing ActiveCall."""
+    """Gym's begin_call rejects a fetched prefix whose length is not prev_len."""
     worker = _worker_with_capture(_MemorySink())
     worker._chain_prefix.install(_MemoryPrefixSource({"r0/c1": [10, 11], "r0/c2": []}))
     request = _staging_chain_request(prev_len=3)
@@ -453,7 +454,10 @@ def test_staging_chain_admission_requires_the_resolved_prefix_keyword():
     worker = _worker_with_capture(_MemorySink())
     request = _staging_chain_request()
 
-    with pytest.raises(CaptureError, match="requires resolved prefix_token_ids"):
+    with pytest.raises(
+        CaptureError,
+        match="requires the caller to pass the resolved prefix_token_ids",
+    ):
         VllmAsyncGenerationWorkerImpl._begin_request_capture(
             worker, request, [10, 11, 12, 20]
         )
