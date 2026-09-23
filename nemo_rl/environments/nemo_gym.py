@@ -2837,6 +2837,27 @@ def as_nemo_gym_shard_set(environment: Any) -> NemoGymShardSet:
     return NemoGymShardSet(handles={DEFAULT_SHARD_NAME: [environment]})
 
 
+def sole_nemo_gym_checkpoint_actor(environment: Any) -> Any:
+    """Return the one Gym actor supported by participant checkpointing.
+
+    Rollout routing always stores a :class:`NemoGymShardSet`, including the
+    legacy unsharded case. The checkpoint control protocol is not shard-aware
+    yet, so silently choosing one actor from a larger set would omit participant
+    state. Keep bare actor handles working for older callers while failing
+    closed for a genuinely sharded or replicated stack.
+    """
+    shard_set = as_nemo_gym_shard_set(environment)
+    actor_count = len(shard_set.all_handles)
+    if actor_count != 1:
+        raise ShardSetupError(
+            "Gym participant checkpointing currently supports exactly one "
+            f"NeMo-Gym actor, but this stack has {actor_count} actors across "
+            f"shards {sorted(shard_set.handles)}. Disable Gym participant "
+            "checkpointing or configure one shard with replicas=1."
+        )
+    return shard_set.sole_handle()
+
+
 def build_nemo_gym_actors(
     env_configs: dict[str, Any],
     *,

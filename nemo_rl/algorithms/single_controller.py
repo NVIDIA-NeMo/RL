@@ -162,7 +162,10 @@ from nemo_rl.environments.gym_checkpoint import (
     gym_checkpoint_staging_keys,
     validate_gym_checkpoint_manifests,
 )
-from nemo_rl.environments.nemo_gym import should_use_nemo_gym
+from nemo_rl.environments.nemo_gym import (
+    should_use_nemo_gym,
+    sole_nemo_gym_checkpoint_actor,
+)
 from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.payload import VIOLATION_TAG_KEYS
 from nemo_rl.experience.rollout_manager import RolloutOutcome
@@ -1721,11 +1724,12 @@ class SingleControllerActor:
 
     def _nemo_gym_checkpoint_actor(self) -> Any:
         try:
-            return self._env_handles["nemo_gym"]
+            environment = self._env_handles["nemo_gym"]
         except KeyError as error:
             raise RuntimeError(
                 "Gym participant checkpointing is enabled without a nemo_gym actor"
             ) from error
+        return sole_nemo_gym_checkpoint_actor(environment)
 
     async def _discard_restart_only_gym_continuations(self) -> None:
         """Make interrupted attempts start fresh when resource state cannot restore."""

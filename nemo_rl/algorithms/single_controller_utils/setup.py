@@ -111,6 +111,7 @@ from nemo_rl.environments.nemo_gym import (
     NemoGymShardSet,
     build_nemo_gym_actors,
     should_use_nemo_gym,
+    sole_nemo_gym_checkpoint_actor,
     validate_dataset_agent_coverage,
 )
 from nemo_rl.experience.rollout_manager import (
@@ -1840,7 +1841,7 @@ def setup_single_controller(
 
     gym_checkpoint_topology: Optional[GymCheckpointTopology] = None
     if rollout_checkpoint_cfg.gym.capability_discovery_enabled:
-        gym_actor = env_handles["nemo_gym"]
+        gym_actor = sole_nemo_gym_checkpoint_actor(env_handles["nemo_gym"])
         discovered = ray.get(gym_actor.discover_checkpoint_capabilities.remote())
         gym_checkpoint_topology = GymCheckpointTopology.model_validate(discovered)
         if rollout_checkpoint_cfg.gym.participant_checkpointing_enabled:
@@ -1937,7 +1938,7 @@ def setup_single_controller(
 
     if saved_gym_checkpoint is not None:
         assert resolved_snapshot is not None
-        awaitable_gym_actor = env_handles["nemo_gym"]
+        awaitable_gym_actor = sole_nemo_gym_checkpoint_actor(env_handles["nemo_gym"])
         gym_checkpoint_restore_operation_id = f"restore-{uuid.uuid4().hex}"
         restore_deadline_ts = time.time() + rollout_checkpoint_cfg.gym.prepare_timeout_s
         restored_gym_checkpoint = GymCheckpointRestoreResult.model_validate(

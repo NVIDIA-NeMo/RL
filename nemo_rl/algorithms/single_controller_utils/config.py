@@ -58,6 +58,7 @@ from nemo_rl.distributed.virtual_cluster import (
     ClusterConfig,
 )
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
+from nemo_rl.environments.nemo_gym_shards import parse_shard_plan
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 from nemo_rl.models.generation.vllm.config import (
     VllmConfig,
@@ -1299,6 +1300,22 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "Use the non-streaming GRPO trainer."
         )
     _validate_algo_settings(master_config)
+
+    if master_config.rollout_checkpointing.gym.capability_discovery_enabled:
+        nemo_gym_config = master_config.env.get("nemo_gym", {})
+        shard_plan = parse_shard_plan(nemo_gym_config)
+        gym_actor_count = (
+            1
+            if shard_plan is None
+            else sum(shard.replicas for shard in shard_plan.shards)
+        )
+        if gym_actor_count != 1:
+            raise NotImplementedError(
+                "Gym participant checkpointing currently supports exactly one "
+                f"NeMo-Gym actor, but env.nemo_gym.shards configures "
+                f"{gym_actor_count}. Configure one shard with replicas=1, or "
+                "disable rollout_checkpointing.gym.capability_discovery_enabled."
+            )
 
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)

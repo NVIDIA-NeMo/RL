@@ -79,6 +79,7 @@ from nemo_rl.data_plane.schema import (
     SC_ROLLOUT_SCHEMA_FIELDS,
 )
 from nemo_rl.environments.gym_checkpoint import GymCheckpointTopology
+from nemo_rl.environments.nemo_gym import NemoGymShardSet
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 from nemo_rl.experience.rollouts import EffortLevelsConfig
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
@@ -933,6 +934,74 @@ class TestSetup:
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
+    @pytest.mark.parametrize(
+        "shards",
+        [
+            [
+                {"name": "first", "config_paths": ["first.yaml"]},
+                {"name": "second", "config_paths": ["second.yaml"]},
+            ],
+            [
+                {
+                    "name": "replicated",
+                    "config_paths": ["replicated.yaml"],
+                    "replicas": 2,
+                }
+            ],
+        ],
+    )
+    def test_gym_checkpointing_rejects_multiple_gym_actors_before_setup(self, shards):
+        mc = _make_master_config(
+            env={
+                "should_use_nemo_gym": True,
+                "nemo_gym": {"shards": shards},
+            }
+        )
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=1.0,
+            gym={"capability_discovery_enabled": True},
+        )
+
+        with pytest.raises(
+            NotImplementedError,
+            match="participant checkpointing currently supports exactly one",
+        ):
+            validate_single_controller_config(mc)
+
+    def test_gym_checkpointing_accepts_one_explicit_shard(self):
+        mc = _make_master_config(
+            env={
+                "should_use_nemo_gym": True,
+                "nemo_gym": {
+                    "shards": [{"name": "only", "config_paths": ["only.yaml"]}]
+                },
+            }
+        )
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=1.0,
+            gym={"capability_discovery_enabled": True},
+        )
+
+        validate_single_controller_config(mc)
+
+    def test_completed_rollout_checkpointing_allows_multiple_gym_actors(self):
+        mc = _make_master_config(
+            env={
+                "should_use_nemo_gym": True,
+                "nemo_gym": {
+                    "shards": [
+                        {"name": "first", "config_paths": ["first.yaml"]},
+                        {"name": "second", "config_paths": ["second.yaml"]},
+                    ]
+                },
+            }
+        )
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=1.0
+        )
+
+        validate_single_controller_config(mc)
+
     def test_gym_checkpointing_discovers_topology_during_setup(
         self,
         tmp_path: Path,
@@ -1015,6 +1084,7 @@ class TestSetup:
         fake_gym_actor.discover_checkpoint_capabilities.remote.return_value = (
             topology_ref
         )
+        fake_gym_shards = NemoGymShardSet(handles={"default": [fake_gym_actor]})
         fake_finalizers = [MagicMock(name="finalizer")]
         patched_factories["setup_response_data"].return_value = (list(range(8)), None)
 
@@ -1022,9 +1092,10 @@ class TestSetup:
             patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
             patch.object(
                 sc_setup_mod,
-                "spinup_nemo_gym_actor",
-                return_value=fake_gym_actor,
+                "build_nemo_gym_actors",
+                return_value=fake_gym_shards,
             ),
+            patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
             patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
             patch.object(
                 sc_setup_mod.ray,

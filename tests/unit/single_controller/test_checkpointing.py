@@ -104,6 +104,7 @@ from nemo_rl.environments.gym_checkpoint import (
     GymCheckpointContinuation,
     GymCheckpointTopology,
 )
+from nemo_rl.environments.nemo_gym import NemoGymShardSet
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
@@ -1710,7 +1711,10 @@ class TestPeriodicRolloutCheckpoint:
         events: list[str] = []
         actor._gym_participant_checkpointing_enabled = True
         actor._master_config.rollout_checkpointing.gym.participant_checkpointing_enabled = True
-        actor._env_handles = {"nemo_gym": _FakeGymCheckpointActor(events)}
+        gym_actor = _FakeGymCheckpointActor(events)
+        actor._env_handles = {
+            "nemo_gym": NemoGymShardSet(handles={"default": [gym_actor]})
+        }
         actor._gym_checkpoint_topology = GymCheckpointTopology.model_validate(
             {
                 "schema_version": 1,
