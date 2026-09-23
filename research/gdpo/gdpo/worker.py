@@ -37,7 +37,6 @@ from gdpo.denoise import (
 from gdpo.train_gdpo import gdpo_forward_backward
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.automodel.train import (
-    LogprobsPostProcessor,
     forward_with_post_processing_fn,
     prepare_model_forward,
 )
@@ -94,7 +93,6 @@ class DTensorGDPOPolicyWorker(DTensorPolicyWorkerV2Impl):
             dp_size=kwargs["dp_size"],
             cp_size=kwargs["cp_size"],
             num_global_batches=kwargs["num_global_batches"],
-            train_context_fn=kwargs["train_context_fn"],
             num_valid_microbatches=kwargs["num_valid_microbatches"],
             on_microbatch_start=kwargs["on_microbatch_start"],
         )
@@ -155,15 +153,10 @@ class DTensorGDPOPolicyWorker(DTensorPolicyWorkerV2Impl):
         )
 
     def _gdpo_train_elbo_scorer(self, sequence_dim: int):
-        post_processor = LogprobsPostProcessor(
+        post_processor = self._make_logprobs_post_processor(
             cfg=self.cfg,
-            device_mesh=self.device_mesh,
-            cp_mesh=self.cp_mesh,
-            tp_mesh=self.tp_mesh,
-            cp_size=self.cp_size,
             enable_seq_packing=self.enable_seq_packing,
             sampling_params=self.sampling_params,
-            shift_targets=self.diffusion_cfg.shift_targets,
         )
 
         def score(processed_mb: Any) -> torch.Tensor:
@@ -227,7 +220,10 @@ class DTensorGDPOPolicyWorker(DTensorPolicyWorkerV2Impl):
             max_sequence_length=self.cfg["max_total_sequence_length"],
             block_length=self.denoise_cfg.block_length,
         )
-        self.model.eval()
+        # The colocated GRPO loop offloads the policy to CPU before generation to
+        # make room for a separate inference engine. Denoising runs on these same
+        # weights, so bring them back (this also switches to eval mode).
+        self.prepare_for_lp_inference()
         canvas, attention_mask = build_canvas(
             data["input_ids"].to(device),
             input_lengths,
