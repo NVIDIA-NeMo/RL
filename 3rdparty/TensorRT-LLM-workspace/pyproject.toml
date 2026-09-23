@@ -146,4 +146,4 @@ backend-path = ["."]
 #
 # Public TensorRT-LLM feat/rl_rc tip at the time of this pin.
 url = "https://github.com/NVIDIA/TensorRT-LLM.git"
-ref = "f94eeb3738aeacb4bdf9676ba06f620499cdb357"   # pragma: allowlist secret
+ref = "bfb1da6936469cfe906358840463e27c89fcf18d"   # pragma: allowlist secret
