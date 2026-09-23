@@ -947,8 +947,11 @@ Depending on your data shape, you may want to change these values."""
         The receipt records the resolving stage in ``terminal_selection``
         (``declared``/``response_id``/``content``/``heuristic`` — failed
         selections stamp the last stage attempted; ``None`` when no stage ran
-        because the manifest failed to parse) and the witness trail in
-        ``terminal_attribution_reason``. Retry duplicates are dead-branch
+        because a manifest row failed to parse) and the witness trail in
+        ``terminal_attribution_reason``. A row that fails ``CallRecord``
+        validation masks the rollout (``invalid_manifest_row``) and is
+        dropped from the shipped manifest, so the finalizer can still
+        enumerate and clean the rows that did parse. Retry duplicates are dead-branch
         rows: they stay in the manifest (their staged rows are fetched,
         verified, and cleaned) but never join the terminal chain —
         ``verify_and_linearize`` tolerates rows unreferenced by the terminal
@@ -983,14 +986,20 @@ Depending on your data shape, you may want to change these values."""
         selection_reason = None
         attribution_reason = None
         terminal_selection = None
-        parsed_records = None
-        try:
-            parsed_records = [
-                CallRecord.model_validate(record) for record in deduped.values()
-            ]
-        except ValueError:
-            selection_reason = "invalid_manifest_row"
-        if parsed_records is not None:
+        # Validate row by row so one malformed row masks the rollout without
+        # taking the good rows' staging keys with it: the finalizer re-runs
+        # RolloutReceipt validation and would otherwise reject the whole
+        # receipt as invalid_receipt with no keys to clean.
+        parsed_records: list[CallRecord] = []
+        valid_rows: list[dict] = []
+        for record in deduped.values():
+            try:
+                parsed_records.append(CallRecord.model_validate(record))
+            except ValueError:
+                selection_reason = "invalid_manifest_row"
+            else:
+                valid_rows.append(record)
+        if selection_reason is None:
             attribution = resolve_terminal(
                 parsed_records,
                 scored_response,
@@ -1032,7 +1041,7 @@ Depending on your data shape, you may want to change these values."""
                 if terminal_record is not None
                 else None
             ),
-            "manifest": list(deduped.values()),
+            "manifest": valid_rows,
             "capture_poisoned": failure_reason is not None,
             "failure_reason": failure_reason,
             "terminal_selection": terminal_selection,
