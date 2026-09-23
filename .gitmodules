@@ -13,3 +13,8 @@
 	url = https://github.com/NVIDIA-NeMo/Gym.git
 	branch = main
 	shallow = true
+[submodule "3rdparty/opencode-workspace/nv-opencode"]
+	path = 3rdparty/opencode-workspace/nv-opencode
+	url = ssh://git@gitlab-master.nvidia.com:12051/jiaqiz/nv-opencode.git
+	branch = geshen-compaction-prod
+	shallow = true
