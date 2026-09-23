@@ -1227,7 +1227,7 @@ def test_nemo_gym_reward_penalties_match_legacy_rewards_counts_and_metrics(
     impl = _nemo_gym_impl(True, reward_penalty_config)
     result = _reward_penalty_result(output, assistant_overrides, assistant_tokens)
 
-    completions, penalty_counts = impl._results_to_completions([result])
+    completions, penalty_counts, _ = impl._results_to_completions([result])
 
     assert completions[0].reward == 0.0
     assert penalty_counts[count_key] == 1
@@ -2278,7 +2278,7 @@ def test_session_traces_become_completions_sharing_the_rollout_reward():
     from nemo_rl.experience.interfaces import TRACE_METADATA_KEY
 
     answer = [{"type": "message", "content": [{"text": "sub answer"}]}]
-    completions, _ = _nemo_gym_impl(True)._results_to_completions(
+    completions, _, _ = _nemo_gym_impl(True)._results_to_completions(
         [_multi_trace_result(answer)]
     )
 
@@ -2295,7 +2295,7 @@ def test_forced_mask_on_one_session_trace_masks_only_that_completion():
     answer = [{"type": "message", "content": [{"text": "sub answer"}]}]
     result = _multi_trace_result(answer)
     result["session_traces"][1][FORCED_MASK_SAMPLE_KEY] = True
-    completions, _ = _nemo_gym_impl(True)._results_to_completions([result])
+    completions, _, _ = _nemo_gym_impl(True)._results_to_completions([result])
 
     flags = [
         bool((c.env_extras.get("instance_config") or {}).get("mask_sample"))
@@ -2312,7 +2312,7 @@ def test_rollout_scoped_penalties_check_only_the_aggregate_response_by_default()
     impl = _nemo_gym_impl(True, {"penalize_empty_final_answer": True})
     empty_answer = [{"type": "message", "content": [{"text": ""}]}]
 
-    completions, penalty_counts = impl._results_to_completions(
+    completions, penalty_counts, _ = impl._results_to_completions(
         [_multi_trace_result(empty_answer)]
     )
 
@@ -2327,7 +2327,7 @@ def test_rollout_scoped_penalty_on_the_aggregate_response_zeroes_every_trace():
         "output": [{"type": "message", "content": [{"text": ""}]}]
     }
 
-    completions, penalty_counts = impl._results_to_completions([result])
+    completions, penalty_counts, _ = impl._results_to_completions([result])
 
     assert [c.reward for c in completions] == [0.0, 0.0]
     assert penalty_counts["empty_final_answer"] == 1

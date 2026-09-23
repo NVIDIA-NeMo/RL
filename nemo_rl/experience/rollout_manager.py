@@ -21,7 +21,7 @@ import json
 import math
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
@@ -70,6 +70,11 @@ from nemo_rl.experience.interfaces import (
 from nemo_rl.experience.legacy_rollout_metrics import (
     legacy_rollout_group_metrics,
     legacy_rollout_timing_aliases,
+)
+from nemo_rl.experience.mask_sample_rules import (
+    MaskSampleRule,
+    apply_mask_sample_rules,
+    mask_rule_metrics,
 )
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.experience.rollout_recovery import (
@@ -1021,6 +1026,9 @@ class AsyncNemoGymRolloutImpl:
         max_rollout_turns: int,
         generation_config: GenerationConfig,
         mask_env_flagged_samples: bool = True,
+        # Operator-side mask_sample rules over the Gym response (env.mask_sample_rules);
+        # empty means the response is used as-is.
+        mask_sample_rules: Sequence[MaskSampleRule] = (),
         reward_penalty_config: Optional[dict[str, Any]] = None,
         # Optional so direct construction does not have to carry the resiliency wiring;
         # RolloutManager always passes both explicitly.
@@ -1042,6 +1050,7 @@ class AsyncNemoGymRolloutImpl:
         self._max_rollout_turns = max_rollout_turns
         self._generation_config = generation_config
         self._mask_env_flagged_samples = mask_env_flagged_samples
+        self._mask_sample_rules = tuple(mask_sample_rules)
         self._log_full_result_tables = log_full_result_tables
         self._reward_penalty_config = reward_penalty_config
         self._timeouts = timeouts if timeouts is not None else RolloutTimeouts()
@@ -1284,7 +1293,7 @@ class AsyncNemoGymRolloutImpl:
                 # recovery records inherit the current mask and reward semantics.
                 # Completion callbacks are token-capture receipt-only, making this
                 # conversion lightweight and safe to repeat during group metrics.
-                row_completions, _ = self._results_to_completions([result])
+                row_completions, _, _ = self._results_to_completions([result])
                 await on_completion(rowidx, row_completions[0])
             if timing_metrics is not None:
                 env_timing_metrics = timing_metrics
@@ -1446,8 +1455,8 @@ class AsyncNemoGymRolloutImpl:
             _tensorize_by_key(prompt_message_log, "token_ids")
             # Apply penalties before Completion captures each result's reward, while
             # preserving the batch-level counts used by legacy Gym metrics.
-            completions, penalty_counts = self._results_to_completions(
-                completed_results
+            completions, penalty_counts, mask_rule_counts = (
+                self._results_to_completions(completed_results)
             )
 
         # Compute rollout metrics.
@@ -1480,6 +1489,11 @@ class AsyncNemoGymRolloutImpl:
             rollout_metrics.update(
                 self._compute_reward_penalty_metrics(
                     penalty_counts, len(completed_results)
+                )
+            )
+            rollout_metrics.update(
+                mask_rule_metrics(
+                    mask_rule_counts, self._mask_sample_rules, len(completed_results)
                 )
             )
             # Legacy async-PPO rollout breakdowns (termination/*, reward/by_*,
@@ -1516,7 +1530,7 @@ class AsyncNemoGymRolloutImpl:
 
     def _results_to_completions(
         self, results: list[dict]
-    ) -> tuple[list[Completion], dict[str, int]]:
+    ) -> tuple[list[Completion], dict[str, int], dict[str, int]]:
         """Apply configured penalties and convert a Gym result batch.
 
         Receipt-mode (token-capture) results are token-free — the message_log
@@ -1543,6 +1557,16 @@ class AsyncNemoGymRolloutImpl:
                 (result["full_result"].get("instance_config") or {}).pop(
                     "mask_sample", None
                 )
+        # Operator rules (env.mask_sample_rules) set the same flag from fields the
+        # Gym response already carries. Applied after the gate so an explicit rule
+        # is honored even when the environment's own flags are dropped. Idempotent:
+        # the streamed per-row conversion and the group conversion see one result.
+        mask_rule_counts: dict[str, int] = {}
+        for result in results:
+            for rule_name in apply_mask_sample_rules(
+                result["full_result"], self._mask_sample_rules
+            ):
+                mask_rule_counts[rule_name] = mask_rule_counts.get(rule_name, 0) + 1
 
         # Empty-rollout placeholders carry no response to check (legacy skipped them).
         single_trace = [
@@ -1616,7 +1640,7 @@ class AsyncNemoGymRolloutImpl:
                     reward=float(result["full_result"]["reward"]),
                 )
             )
-        return completions, penalty_counts
+        return completions, penalty_counts, mask_rule_counts
 
     def _compute_reward_penalty_metrics(
         self, penalty_counts: dict[str, int], num_results: int
@@ -1759,6 +1783,7 @@ class RolloutManager:
         generation_config: Optional[GenerationConfig] = None,
         use_nemo_gym: bool = False,
         mask_env_flagged_samples: bool = True,
+        mask_sample_rules: Sequence[MaskSampleRule] = (),
         reward_penalty_config: Optional[dict[str, Any]] = None,
         tq_buffer: Optional[TQReplayBuffer] = None,
         timeouts: Optional[RolloutTimeouts] = None,
@@ -1803,6 +1828,7 @@ class RolloutManager:
             generation_config=generation_config,
             # Only used by AsyncNemoGymRolloutImpl; AsyncRolloutImpl ignores these.
             mask_env_flagged_samples=mask_env_flagged_samples,
+            mask_sample_rules=mask_sample_rules,
             log_full_result_tables=log_full_result_tables,
             reward_penalty_config=reward_penalty_config,
             # None means "no deadlines", which is what async_rl's own defaults resolve
