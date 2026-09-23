@@ -734,6 +734,11 @@ def _pad_rows_for_value(
     by data-parallel rank. Padding duplicates row 0 with sample_mask zeroed so
     padded rows contribute no loss and no metric. Returns (padded_batch,
     n_unpadded); the input is returned unchanged when already divisible.
+
+    ``sample_mask`` is optional: an inference-only batch (the privileged
+    critic's answer-augmented rows, before returns/sample_mask are grafted on)
+    has no loss to contribute to, and its padded rows are sliced off the values
+    immediately by the caller.
     """
     n = data["input_ids"].shape[0]
     pad = (-n) % max(int(multiple), 1)
@@ -748,8 +753,9 @@ def _pad_rows_for_value(
             out[key] = list(value) + [value[0]] * pad
         else:
             out[key] = value
-    out["sample_mask"] = out["sample_mask"].clone()
-    out["sample_mask"][n:] = 0
+    if "sample_mask" in out:
+        out["sample_mask"] = out["sample_mask"].clone()
+        out["sample_mask"][n:] = 0
     return out, n
 
 
@@ -845,7 +851,16 @@ def _forward_values_and_returns(
         # patch, one instance_id per group). The within-group no-confound
         # argument is likewise unaffected: the block stays byte-identical across
         # every trace of every sibling rollout.
-        vals_aug = value_model.get_values(critic_batch)["values"].squeeze(-1)
+        # Row-pad for the value workers' data-parallel sharding exactly like the
+        # blind path below. Single-trace batches were always a clean multiple
+        # (groups x gpp), so this was invisible until multi-trace made the row
+        # count variable: 32 groups x 32 rollouts + their subagent traces = 1281
+        # rows, which is not a multiple of value_dp=8.
+        _value_dp = value_model.sharding_annotations.get_axis_size("data_parallel")
+        _padded_critic, _n_critic = _pad_rows_for_value(critic_batch, _value_dp)
+        vals_aug = value_model.get_values(_padded_critic)["values"].squeeze(-1)[
+            :_n_critic
+        ]
         critic_batch["values"] = vals_aug
         train_data["values"] = remap_by_response_mask(
             vals_aug,
