@@ -1,0 +1,245 @@
+# syntax=docker/dockerfile:1
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+ARG NEMO_RL_BASE_IMAGE=nvcr.io/nvidia/pytorch:26.08-py3
+ARG NEMO_RL_REPO=https://github.com/NVIDIA-NeMo/RL.git
+# Also pins the TensorRT-LLM source ref built below
+# (3rdparty/TensorRT-LLM-workspace/pyproject.toml [tool.trtllm]).
+ARG NEMO_RL_REVISION=main
+ARG TE_REPO_URL=https://github.com/NVIDIA/TransformerEngine.git TE_REPO_REF=main
+ARG BUILD_CUSTOM_TRTLLM_ARCH="100-real;103-real"
+
+## Stage: base
+FROM ${NEMO_RL_BASE_IMAGE} AS base
+
+# ccache, libzmq3-dev: TRT-LLM build (libzmq is also dlopen()ed by its UCX cache
+# transceiver at run time).
+RUN sed -i 's|http://ports.ubuntu.com|https://ports.ubuntu.com|g' /etc/apt/sources.list.d/ubuntu.sources && \
+    export DEBIAN_FRONTEND=noninteractive && apt-get update && \
+    apt-get install -y --no-install-recommends ccache libzmq3-dev && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Preserve the base Apex CUDA extensions for Megatron gradient accumulation
+# fusion. Transformer Engine is rebuilt below for the trainer venv.
+RUN python3 -m pip uninstall -y transformer_engine
+
+# CUTLASS DSL >= 4.8.0.dev0; the base ships 4.6.2. quack-kernels (imported by FA4,
+# TRT-LLM and modelopt) must match it: 0.4.1 fails on import against 4.8
+# (cute.core.ThrMma is gone), 0.6.1 is the tested pairing.
+ARG CUTLASS_DSL_VERSION=4.8.0.dev0 QUACK_KERNELS_VERSION=0.6.1
+RUN unset PIP_CONSTRAINT && python3 -m pip install --no-cache-dir --pre "nvidia-cutlass-dsl[cu13]==${CUTLASS_DSL_VERSION}" && \
+    python3 -m pip install --no-cache-dir --no-deps "quack-kernels==${QUACK_KERNELS_VERSION}" && \
+    python3 -c 'import quack; import cutlass.cute as cute; print(quack.__file__)'
+
+# The FlashInfer release the pinned TRT-LLM targets (the base ships none). The cubin and
+# jit-cache wheels carry the prebuilt trtllm-gen kernels for sm_100a/103a.
+ARG FLASHINFER_VERSION=0.6.18.post1
+RUN <<"EOF" bash -exu -o pipefail
+unset PIP_CONSTRAINT
+python3 -m pip install --no-cache-dir --no-deps "flashinfer-python==${FLASHINFER_VERSION}"
+python3 -m pip install --no-cache-dir --no-deps --index-url https://flashinfer.ai/whl "flashinfer-cubin==${FLASHINFER_VERSION}"
+python3 -m pip install --no-cache-dir --no-deps --index-url https://flashinfer.ai/whl/cu134 "flashinfer-jit-cache==${FLASHINFER_VERSION}+cu134"
+# flashinfer itself is not imported: its GDN module reads the GPU at import and the builder has none.
+python3 -c 'import pathlib, flashinfer_cubin; assert list(pathlib.Path(flashinfer_cubin.get_cubin_dir()).rglob("fmha/trtllm-gen/fmhaSm100a*.cubin"))'
+EOF
+
+# NIXL for TRT-LLM's KV-cache transceiver (disaggregated prefill/decode), at the prefix
+# build-custom-trtllm.sh expects. Built against the base's UCX.
+ARG NIXL_VERSION=v1.4.0
+RUN <<"EOF" bash -exu -o pipefail
+pip install --no-cache-dir meson
+git clone --depth 1 -b "${NIXL_VERSION}" https://github.com/ai-dynamo/nixl.git /tmp/nixl
+cd /tmp/nixl
+GDS_PATH=/usr/local/cuda/targets/sbsa-linux
+[[ "$(uname -m)" != x86_64 ]] || GDS_PATH=/usr/local/cuda/targets/x86_64-linux
+# meson's CUDA probe needs a loadable libcuda.so.1; the builder only has the compat copy.
+LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:$(dirname "$(find /usr/local -name libcuda.so.1 -print -quit)")" meson setup builddir \
+    -Ducx_path=/usr/local/ucx -Dcudapath_lib=/usr/local/cuda/lib64 -Dcudapath_inc=/usr/local/cuda/include \
+    -Dgds_path="${GDS_PATH}" -Dinstall_headers=true -Ddisable_plugins=POSIX,GUSLI \
+    -Dbuild_tests=false -Dbuild_examples=false --buildtype=release
+ninja -C builddir install
+rm -rf /tmp/nixl
+test -f /opt/nvidia/nvda_nixl/include/nixl.h
+# meson picks lib/, lib64/ or lib/<triplet> depending on the prefix; register what it chose.
+NIXL_LIB=$(dirname "$(find /opt/nvidia/nvda_nixl -name libnixl.so -print -quit)")
+printf '%s\n' "${NIXL_LIB}" "${NIXL_LIB}/plugins" > /etc/ld.so.conf.d/nixl.conf
+ldconfig
+echo "${NIXL_VERSION}" > /NIXL_VERSION.env
+EOF
+ENV LD_LIBRARY_PATH="/opt/nvidia/nvda_nixl/lib:/opt/nvidia/nvda_nixl/lib64:/opt/nvidia/nvda_nixl/lib/aarch64-linux-gnu:/opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu:/usr/local/ucx/lib:${LD_LIBRARY_PATH}"
+
+ARG UV_VERSION=0.11.28
+RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | XDG_BIN_HOME=/usr/local/bin sh
+
+# NEMO_GYM_VENV_DIR: pre-baked Gym server venvs, reused at runtime. TRT-LLM initialises MPI
+# (mpi4py) as the container's root user.
+ENV NRL_CONTAINER=1 NEMO_GYM_VENV_DIR=/opt/gym_venvs \
+    UV_PYTHON_PREFERENCE=only-system UV_LINK_MODE=copy \
+    OMPI_ALLOW_RUN_AS_ROOT=1 OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
+    PRTE_ALLOW_RUN_AS_ROOT=1 PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1
+
+## Stage: nemo-rl-src — pinned clone.
+FROM base AS nemo-rl-src
+ARG NEMO_RL_REPO NEMO_RL_REVISION
+RUN <<"EOF" bash -exu
+git clone "${NEMO_RL_REPO}" /opt/nemo-rl-src
+cd /opt/nemo-rl-src
+# Pinned commits may no longer be reachable from the branches fetched by clone.
+git fetch origin "${NEMO_RL_REVISION}"
+git checkout --detach FETCH_HEAD
+git submodule update --init --recursive
+MCORE_DIR=3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM
+git -C "${MCORE_DIR}" fetch https://github.com/NVIDIA/Megatron-LM.git 54c62dfb6852e9218bf38590be9b90930bf7d589
+git -C "${MCORE_DIR}" checkout --detach FETCH_HEAD
+EOF
+
+## Stage: build_te — Transformer Engine wheel.
+FROM base AS build_te
+ARG NVTE_BUILD_THREADS_PER_JOB TE_REPO_URL TE_REPO_REF
+ARG NVTE_CUDA_ARCHS="100a;103a"
+# TE main calls assert() without including <cassert>, which this toolchain does not pull in.
+ENV NVCC_APPEND_FLAGS="-include cassert"
+RUN <<"EOF" bash -exu
+git clone -b "${TE_REPO_REF}" --single-branch --recursive "${TE_REPO_URL}" /opt/transformerengine
+mkdir -p /opt/te_wheel
+git -C /opt/transformerengine rev-parse HEAD > /opt/te_wheel/TE_COMMIT_HASH.env
+# NVTE_WITH_NCCL_EP=0: the base torch lacks NCCLSymmetricMemory::get_window_offset, which
+# TE's NCCL-EP extension needs; no config uses that dispatcher.
+env NVTE_WITH_NCCL_EP=0 NVTE_CUDA_ARCHS="${NVTE_CUDA_ARCHS}" NVTE_BUILD_THREADS_PER_JOB="${NVTE_BUILD_THREADS_PER_JOB:-8}" \
+    pip wheel --no-deps --no-build-isolation --wheel-dir /opt/te_wheel /opt/transformerengine
+EOF
+
+## Stage: build_trtllm — TRT-LLM wheel, built by nemo-rl's own script from the source ref in
+## 3rdparty/TensorRT-LLM-workspace/pyproject.toml. Its own stage so the ~60 min build overlaps
+## build_te and the venv syncs.
+FROM base AS build_trtllm
+ARG BUILD_CUSTOM_TRTLLM_ARCH TRTLLM_BUILD_JOBS
+ENV BUILD_CUSTOM_TRTLLM_ARCH=${BUILD_CUSTOM_TRTLLM_ARCH} NIXL_ROOT_DIR=/opt/nvidia/nvda_nixl
+# TensorRT-LLM calls assert() without including <cassert> in one kernel.
+ENV NVCC_APPEND_FLAGS="-include cassert"
+WORKDIR /opt/trtllm-build
+# The script derives its build dir from its own location; keep this layout.
+COPY --from=nemo-rl-src /opt/nemo-rl-src/tools/build-custom-trtllm.sh ./tools/
+COPY --from=nemo-rl-src /opt/nemo-rl-src/3rdparty/TensorRT-LLM-workspace/pyproject.toml ./3rdparty/TensorRT-LLM-workspace/
+# Drop the pip NCCL/NVRTC pins from TRT-LLM's requirements.txt right after the script's
+# checkout: a pip NCCL that differs from the one the base torch links breaks `import torch`.
+RUN <<"EOF" python3
+import pathlib
+p = pathlib.Path("tools/build-custom-trtllm.sh")
+s = p.read_text()
+anchor = "sed -i '/^nvidia-modelopt/d' requirements.txt\n"
+assert s.count(anchor) == 1, "build-custom-trtllm.sh changed; re-check this hook"
+p.write_text(s.replace(anchor, anchor + "sed -i '/^nvidia-nccl-cu13/d;/^nvidia-cuda-nvrtc/d' requirements.txt\n"))
+EOF
+RUN --mount=type=cache,target=/root/.cache/ccache \
+    <<"EOF" bash -exu -o pipefail
+read -r TRTLLM_URL TRTLLM_REF < <(python3 -c 'import tomllib; t = tomllib.load(open("3rdparty/TensorRT-LLM-workspace/pyproject.toml", "rb"))["tool"]["trtllm"]; print(t["url"], t["ref"])')
+# A full build is ~9.8k objects; ccache's 5G default would thrash.
+CCACHE_DIR=/root/.cache/ccache ccache -M 20G
+CCACHE_DIR=/root/.cache/ccache bash tools/build-custom-trtllm.sh "${TRTLLM_URL}" "${TRTLLM_REF}"
+ls /opt/trtllm_wheels/tensorrt_llm-*.whl
+EOF
+
+## Stage: release — the NeMo-RL venv, plus TE and TRT-LLM.
+FROM base AS release
+WORKDIR /opt/nemo-rl
+COPY --from=nemo-rl-src /opt/nemo-rl-src/ /opt/nemo-rl
+
+ARG MAX_JOBS
+# sm_100 SASS runs on GB200/GB300. CUDA 13 keeps cub/thrust under include/cccl.
+ENV TORCH_CUDA_ARCH_LIST="10.0" CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl \
+    UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
+
+RUN <<"EOF" bash -exu -o pipefail
+# Upstream pins python 3.13; the base has 3.12.
+sed -i 's/requires-python = ">=3.13.14,<3.14"/requires-python = ">=3.12,<3.13"/' pyproject.toml
+sed -i "s/python_version == '3.13' and sys_platform/python_version == '3.12' and sys_platform/g" pyproject.toml
+sed -i 's/cp313-cp313/cp312-cp312/g' pyproject.toml
+# match-runtime needs torch in the resolution graph; torch comes from the base.
+sed -i '\#^\[tool\.uv\.extra-build-dependencies\]#,\#^\[#{/match-runtime[[:space:]]*=[[:space:]]*true/d}' pyproject.toml
+# The TRT-LLM wheel is built here for the venv's own interpreter, so cp312 is fine.
+sed -i 's/requires-python = ">=3.13"/requires-python = ">=3.12"/' 3rdparty/TensorRT-LLM-workspace/pyproject.toml
+sed -i 's/requires-python = ">=3.13.14"/requires-python = ">=3.12"/' \
+    research/template_project/pyproject.toml \
+    3rdparty/Gym-workspace/Gym/pyproject.toml \
+    3rdparty/Gym-workspace/Gym/responses_api_models/vllm_model/pyproject.toml
+# Gym's vllm extra is not installed here.
+sed -Ei 's/"(vllm==[^"]+)"/"\1; python_version >= '\''3.13'\''"/;s/"(flashinfer-python==[^"]+)"/"\1; python_version >= '\''3.13'\''"/' \
+    3rdparty/Gym-workspace/Gym/pyproject.toml
+printf '3.12\n' > .python-version
+
+uv venv --seed --system-site-packages --python python3 /opt/nemo_rl_venv
+export VIRTUAL_ENV=/opt/nemo_rl_venv
+uv lock
+
+# Packages the lock must not replace: base-provided ones, the CUTLASS DSL pairing from the
+# base stage, and the two engines installed below into the system layer (tensorrt-llm,
+# flash-attn-4). The trtllm extra stays in the resolution so its ~90 deps are lock-pinned.
+NO_INSTALL="--no-install-package tensorrt-llm --no-install-package nvidia-nvjitlink --no-install-package torch --no-install-package torchvision --no-install-package torchaudio --no-install-package torchcodec --no-install-package triton --no-install-package triton-kernels --no-install-package nvidia-cublas --no-install-package nvidia-cuda-cupti --no-install-package nvidia-cuda-nvrtc --no-install-package nvidia-cuda-runtime --no-install-package nvidia-cudnn-cu13 --no-install-package nvidia-cudnn-frontend --no-install-package nvidia-cufft --no-install-package nvidia-cufile --no-install-package nvidia-curand --no-install-package nvidia-cusolver --no-install-package nvidia-cusparse --no-install-package nvidia-cusparselt-cu13 --no-install-package nvidia-nccl-cu13 --no-install-package vllm --no-install-package flash-attn --no-install-package flash-attn-4 --no-install-package numpy --no-install-package nixl --no-install-package nixl-cu13 --no-install-package nixl-cu12 --no-install-package cuda-bindings --no-install-package cuda-python --no-install-package transformer-engine --no-install-package transformer-engine-torch --no-install-package nvidia-cutlass-dsl --no-install-package nvidia-cutlass-dsl-libs-base --no-install-package nvidia-cutlass-dsl-libs-cu12 --no-install-package nvidia-cutlass-dsl-libs-cu13 --no-install-package apache-tvm-ffi --no-install-package flashinfer-python --no-install-package flashinfer-cubin --no-install-package flashinfer-jit-cache --no-install-package quack-kernels"
+# trtllm is declared conflicting with mcore/nemo_gym: sync it first, training last so it
+# owns any shared pin; --inexact keeps the earlier packages installed.
+uv sync --locked --inexact --extra trtllm --no-install-project ${NO_INSTALL}
+uv sync --locked --inexact --extra mcore --extra nemo_gym ${NO_INSTALL}
+rm -rf /root/.cache/uv
+EOF
+
+# --no-config: pyproject pins TE to a git URL. --no-deps: the base owns the CUDA-native
+# dependencies. cuDNN Frontend 1.29.0 fixes a VR200 break in the version the lock pins.
+RUN --mount=type=bind,from=build_te,source=/opt/te_wheel,target=/tmp/te,readonly \
+    VIRTUAL_ENV=/opt/nemo_rl_venv uv pip install --no-cache-dir --no-config --no-deps /tmp/te/*.whl && \
+    VIRTUAL_ENV=/opt/nemo_rl_venv uv pip install --no-cache-dir --no-config --no-deps --reinstall-package nvidia-cudnn-frontend nvidia-cudnn-frontend==1.29.0 && \
+    cp /tmp/te/TE_COMMIT_HASH.env /TE_COMMIT_HASH.env
+
+# TRT-LLM goes into the system layer, which the venv must never shadow (see
+# NO_INSTALL above). --no-deps: the trtllm extra installed its deps above.
+RUN --mount=type=bind,from=build_trtllm,source=/opt/trtllm_wheels,target=/tmp/trtllm,readonly \
+    <<"EOF" bash -exu -o pipefail
+python3 -m pip install --no-cache-dir --no-deps /tmp/trtllm/tensorrt_llm-*.whl
+# The wheel's bundled CCCL predates cuda/std/__tuple_dir/structured_bindings.h, which its
+# own FMHA headers include when NVRTC JIT-compiles them; use the toolkit's CCCL instead.
+SITE=$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')
+FMHA_CCCL="${SITE}/tensorrt_llm/include/trtllm_gen_kernels/fmha/cuda/cccl"
+if [[ -d "${FMHA_CCCL}" && ! -e "${FMHA_CCCL}/cuda/std/__tuple_dir/structured_bindings.h" ]]; then
+    test -e /usr/local/cuda/include/cccl/cuda/std/__tuple_dir/structured_bindings.h
+    rm -rf "${FMHA_CCCL}" && ln -s /usr/local/cuda/include/cccl "${FMHA_CCCL}"
+fi
+EOF
+
+# Megatron imports flash_attn.cute (FA4); needs the CUTLASS DSL from the base stage.
+RUN python3 -m pip install --no-cache-dir --no-deps "flash-attn-4==4.0.0b27"
+
+ENV PATH="/opt/nemo_rl_venv/bin:${PATH}"
+# All actors use this interpreter; `uv run` must never re-sync.
+ENV NEMO_RL_PY_EXECUTABLES_SYSTEM=1 UV_NO_SYNC=1
+# aarch64: TLS-heavy libtvm (tilelang) needs these registered first.
+ENV LD_PRELOAD="libstdc++.so.6:libgomp.so.1"
+RUN mkdir -p /opt/cudart-compat && ln -sf /usr/local/cuda/lib64/libcudart.so /opt/cudart-compat/libcudart_stub.so
+ENV LD_LIBRARY_PATH="/opt/amazon/ofi-nccl/lib:/opt/amazon/efa/lib:/opt/cudart-compat:${LD_LIBRARY_PATH}"
+
+# nemo_rl checks this fingerprint at import.
+RUN python tools/generate_fingerprint.py > /opt/nemo_rl_container_fingerprint
+
+RUN <<"EOF" bash -exu
+python - <<'PY'
+import importlib.util
+
+import torch
+import tensorrt
+import tensorrt_llm
+
+for name in ("tensorrt_llm", "tensorrt"):
+    spec = importlib.util.find_spec(name)
+    print(f"{name} -> {spec.origin}")
+assert not importlib.util.find_spec("tensorrt_llm").origin.startswith("/opt/nemo_rl_venv/")
+
+import apex
+import fused_weight_gradient_mlp_cuda
+import transformer_engine.pytorch
+
+for fn_name in ("wgrad_gemm_accum_fp16", "wgrad_gemm_accum_fp32"):
+    assert callable(getattr(fused_weight_gradient_mlp_cuda, fn_name)), fn_name
+
+print(f"torch {torch.__version__}, tensorrt_llm {tensorrt_llm.__version__}")
+PY
+test -z "$(find /usr/local/lib/python3.12/dist-packages /opt/nemo_rl_venv -name 'libnvrtc.so*')"
+EOF
