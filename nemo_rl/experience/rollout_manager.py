@@ -1327,8 +1327,8 @@ class AsyncNemoGymRolloutImpl:
             _tensorize_by_key(prompt_message_log, "token_ids")
             # Apply penalties before Completion captures each result's reward, while
             # preserving the batch-level counts used by legacy Gym metrics.
-            completions, penalty_counts, mask_rule_counts = (
-                self._results_to_completions(completed_results)
+            completions, penalty_counts, mask_rule_stats = self._results_to_completions(
+                completed_results
             )
 
         # Compute rollout metrics.
@@ -1343,9 +1343,16 @@ class AsyncNemoGymRolloutImpl:
                     penalty_counts, len(completed_results)
                 )
             )
+            mask_rule_counts, mask_rule_reward_sums, mask_rule_any_count = (
+                mask_rule_stats
+            )
             rollout_metrics.update(
                 mask_rule_metrics(
-                    mask_rule_counts, self._mask_sample_rules, len(completed_results)
+                    mask_rule_counts,
+                    self._mask_sample_rules,
+                    len(completed_results),
+                    reward_sums=mask_rule_reward_sums,
+                    any_count=mask_rule_any_count,
                 )
             )
 
@@ -1355,7 +1362,9 @@ class AsyncNemoGymRolloutImpl:
 
     def _results_to_completions(
         self, results: list[dict]
-    ) -> tuple[list[Completion], dict[str, int], dict[str, int]]:
+    ) -> tuple[
+        list[Completion], dict[str, int], tuple[dict[str, int], dict[str, float], int]
+    ]:
         """Apply configured penalties and convert a Gym result batch.
 
         Receipt-mode (token-capture) results are token-free — the message_log
@@ -1386,11 +1395,22 @@ class AsyncNemoGymRolloutImpl:
         # is honored even when the environment's own flags are dropped. Idempotent:
         # the streamed per-row conversion and the group conversion see one result.
         mask_rule_counts: dict[str, int] = {}
+        mask_rule_reward_sums: dict[str, float] = {}
+        mask_rule_any_count = 0
         for result in results:
-            for rule_name in apply_mask_sample_rules(
+            matched = apply_mask_sample_rules(
                 result["full_result"], self._mask_sample_rules
-            ):
+            )
+            if not matched:
+                continue
+            mask_rule_any_count += 1
+            reward = float(result["full_result"].get("reward") or 0.0)
+            for rule_name in matched:
                 mask_rule_counts[rule_name] = mask_rule_counts.get(rule_name, 0) + 1
+                mask_rule_reward_sums[rule_name] = (
+                    mask_rule_reward_sums.get(rule_name, 0.0) + reward
+                )
+        mask_rule_stats = (mask_rule_counts, mask_rule_reward_sums, mask_rule_any_count)
 
         penalty_counts = apply_reward_penalties(
             token_results, self._reward_penalty_config
@@ -1425,7 +1445,7 @@ class AsyncNemoGymRolloutImpl:
                     reward=float(result["full_result"]["reward"]),
                 )
             )
-        return completions, penalty_counts, mask_rule_counts
+        return completions, penalty_counts, mask_rule_stats
 
     def _compute_reward_penalty_metrics(
         self, penalty_counts: dict[str, int], num_results: int

@@ -348,6 +348,12 @@ class GRPOConfig(BaseModel, extra="allow"):
     # Legacy async config block; SC reads its async knobs from `async_rl` instead.
     async_grpo: AsyncGRPOConfig | None = Field(default_factory=AsyncGRPOConfig)
     overlong_filtering: bool = False
+    # SingleController only. Rows masked as incomplete (env mask_sample, which
+    # env.mask_sample_rules also sets, or overlong_filtering) keep contributing
+    # their reward to the group baseline/std when True, so a timed-out rollout
+    # still reads as a failure for its siblings; they never contribute a
+    # gradient either way. Placeholder and seq-logprob-error rows stay excluded.
+    masked_sample_rewards_in_baseline: bool = False
     # whether to enable dynamic sampling, i.e.
     # whether to discard prompts whose rewards have zero standard deviation
     use_dynamic_sampling: bool = False

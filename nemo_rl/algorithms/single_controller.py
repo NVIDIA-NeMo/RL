@@ -120,10 +120,18 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     prune_bootstrap_snapshots,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
+from nemo_rl.algorithms.single_controller_utils.masking_stats import (
+    accumulate_masking_stats,
+    new_masking_stats_accumulator,
+    reduce_masking_stats,
+)
 from nemo_rl.algorithms.single_controller_utils.rollout_stats import (
     accumulate_rollout_stats,
     new_rollout_stats_accumulator,
     reduce_rollout_stats,
+)
+from nemo_rl.algorithms.single_controller_utils.sample_masks import (
+    baseline_valid_mask,
 )
 from nemo_rl.algorithms.single_controller_utils.utils import (
     aggregate_step_metrics,
@@ -576,6 +584,7 @@ class SingleControllerActor:
         # Per-sample rollout distributions (generated tokens, assistant turns,
         # group reward mix, context use); see single_controller_utils/rollout_stats.py.
         self._rollout_stats_acc = new_rollout_stats_accumulator()
+        self._masking_stats_acc = new_masking_stats_accumulator()
         self._opd_stat_sum = 0.0
         self._opd_stat_sumsq = 0.0
         self._opd_stat_count = 0
@@ -2868,6 +2877,10 @@ class SingleControllerActor:
                     )
                 except Exception as error:  # metrics must never fail a step
                     log.warning("Skipping rollout_stats metrics: %s", error)
+                try:
+                    step_metrics.update(reduce_masking_stats(self._masking_stats_acc))
+                except Exception as error:  # metrics must never fail a step
+                    log.warning("Skipping masking_stats metrics: %s", error)
                 per_group_rollout_metrics: dict[str, list[Any]] = {}
                 for group_metrics in selected_rollout_metrics:
                     for metric_name, value in group_metrics.items():
@@ -2885,6 +2898,7 @@ class SingleControllerActor:
                     log.warning("Skipping generation step metrics: %s", error)
                 self._step_log_dict = {k: [] for k in self._step_log_dict}
                 self._rollout_stats_acc = new_rollout_stats_accumulator()
+                self._masking_stats_acc = new_masking_stats_accumulator()
                 step_metrics.update(
                     _pooled_opd_metrics(
                         self._opd_stat_sum,
@@ -4750,8 +4764,13 @@ class SingleControllerActor:
         num_mask_sample_filtered = int(mask_sample.sum().item())
         self._step_log_dict["num_mask_sample_filtered"].append(num_mask_sample_filtered)
         final_sample_mask = sample_mask * (~mask_sample).to(sample_mask.dtype)
+        # Rows masked for being incomplete (env flag incl. env.mask_sample_rules,
+        # overlong filtering); grpo.masked_sample_rewards_in_baseline decides whether
+        # their reward still counts in the group baseline/std (never a gradient).
+        incomplete_sample = mask_sample.clone()
         if self._algo_cfg.overlong_filtering:
             final_sample_mask = final_sample_mask * (~truncated).to(sample_mask.dtype)
+            incomplete_sample = incomplete_sample | truncated
 
         seq_logprob_error_threshold = self._algo_cfg.seq_logprob_error_threshold
         # Match the legacy path: whenever real policy logprobs are available,
@@ -4825,6 +4844,31 @@ class SingleControllerActor:
         if self._is_ppo:
             kwargs["values"] = tensor_field(data, adv_cfg.values_field)
 
+        # Rows whose reward enters the baseline/std; identical to final_sample_mask
+        # unless grpo.masked_sample_rewards_in_baseline reinstates incomplete rows.
+        baseline_mask = baseline_valid_mask(
+            sample_mask=sample_mask,
+            final_sample_mask=final_sample_mask,
+            incomplete=incomplete_sample,
+            keep_incomplete_rewards=bool(
+                getattr(self._algo_cfg, "masked_sample_rewards_in_baseline", False)
+            ),
+        )
+        try:
+            accumulate_masking_stats(
+                self._masking_stats_acc,
+                prompt_ids=prompt_ids,
+                rewards=rewards,
+                sample_mask=sample_mask,
+                mask_sample=mask_sample,
+                truncated=truncated,
+                overlong_filtering=bool(self._algo_cfg.overlong_filtering),
+                final_sample_mask=final_sample_mask,
+                baseline_mask=baseline_mask,
+            )
+        except Exception as error:  # metrics must never fail a step
+            log.warning("Skipping masking_stats accumulation: %s", error)
+
         # Training predicts token t from position t - 1, so token_mask[:, 1:]
         # is the exact mask used when global_valid_toks and the loss are built.
         has_valid_training_tokens = bool(mask[:, 1:].bool().any().item())
@@ -4840,7 +4884,9 @@ class SingleControllerActor:
                 # Real validity (token-capture placeholders carry sample_mask 0,
                 # and mask_sample/overlong/seq-logprob-error rows are folded in
                 # via final_sample_mask) instead of the hardwired all-ones.
-                valid_mask=final_sample_mask,
+                # With grpo.masked_sample_rewards_in_baseline the incomplete rows
+                # re-enter the baseline/std only; `mask` still zeroes their loss.
+                valid_mask=baseline_mask,
                 **kwargs,
             )
             if self._is_ppo:
