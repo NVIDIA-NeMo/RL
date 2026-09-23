@@ -63,6 +63,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.models.policy.utils import reject_dtensor_v1
 from nemo_rl.utils.checkpoint import (
     CheckpointingConfig,
     CheckpointManager,
@@ -247,17 +248,22 @@ def setup(
         f"tokenizers for {len(teachers)} teachers."
     )
 
-    # Backend gate: DTensor V2 only, for the student and every teacher. Unlike
+    # Backend gate: DTensor only, for the student and every teacher. Unlike
     # the TP=CP=1 multi-teacher prototype, this path supports TP/CP/diff-DP
     # sharding (the loss is parallelism-invariant), so there is deliberately NO
     # tensor/context_parallel_size==1 assert.
-    assert policy_config["dtensor_cfg"]["enabled"] and policy_config["dtensor_cfg"].get(
-        "_v2"
-    ), "xtoken distillation requires policy.dtensor_cfg.enabled=true and _v2=true."
+    assert policy_config["dtensor_cfg"]["enabled"], (
+        "xtoken distillation requires policy.dtensor_cfg.enabled=true."
+    )
+    reject_dtensor_v1(
+        policy_config["dtensor_cfg"], "policy.dtensor_cfg", suggest_megatron=False
+    )
     for i, tc in enumerate(teacher_configs):
-        assert tc["dtensor_cfg"]["enabled"] and tc["dtensor_cfg"].get("_v2"), (
-            f"xtoken distillation requires teachers[{i}].dtensor_cfg.enabled=true "
-            "and _v2=true."
+        assert tc["dtensor_cfg"]["enabled"], (
+            f"xtoken distillation requires teachers.{i}.dtensor_cfg.enabled=true."
+        )
+        reject_dtensor_v1(
+            tc["dtensor_cfg"], f"teachers.{i}.dtensor_cfg", suggest_megatron=False
         )
 
     # A null projection path marks a same-vocab teacher (direct KL, no

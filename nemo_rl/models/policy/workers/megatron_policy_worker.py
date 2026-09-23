@@ -51,6 +51,8 @@ from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossFn
+from nemo_rl.algorithms.loss.utils import rescale_loss_metrics
 from nemo_rl.data.multimodal_utils import (
     attach_media_token_validity_mask,
     chunks_accept_media_token_validity_mask,
@@ -80,6 +82,12 @@ from nemo_rl.models.megatron.common import (
 from nemo_rl.models.megatron.data import (
     get_microbatch_iterator,
     process_global_batch,
+)
+from nemo_rl.models.megatron.draft.step_state import (
+    DRAFT_LOSS_METRIC_KEY,
+    DRAFT_STEP_PAYLOAD_KEY,
+    DraftStepPayload,
+    DraftStepState,
 )
 from nemo_rl.models.megatron.pipeline_parallel import (
     broadcast_loss_metrics_from_last_stage,
@@ -968,6 +976,81 @@ class MegatronPolicyWorkerImpl(
             return
         self.model.load_state_dict(extra_state, strict=False)
 
+    def _normalize_in_loss_seq_filter(
+        self,
+        loss_fn: ClippedPGLossFn,
+        losses_reduced: list[dict[str, Any]],
+        *,
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+        eval_mode: bool,
+    ) -> tuple[list[dict[str, Any]], torch.Tensor, torch.Tensor]:
+        """Normalize one complete optimizer batch after in-loss filtering.
+
+        When we use seq_logprob_error_threshold with seq_logprob_error_in_loss,
+        we only have access to the global valid token count. After the full batch is computed.
+
+        Therefore, we need to normalize the gradient values by the global valid token count.
+        All microbatches have now finished, so sum survivor counts over DP, broadcast them to
+        every PP stage, and correct gradients before the optimizer clips them.
+        CP/TP replicas must not be counted as additional samples.
+        """
+        metrics = losses_reduced
+        counts = torch.tensor(
+            [
+                sum(m["seq_logprob_error_valid_seqs"] for m in metrics),
+                sum(m["seq_logprob_error_valid_tokens"] for m in metrics),
+            ],
+            dtype=torch.float64,
+            device=global_valid_toks.device,
+        )
+        if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+            torch.distributed.all_reduce(
+                counts, group=parallel_state.get_data_parallel_group()
+            )
+        if parallel_state.get_pipeline_model_parallel_world_size() > 1:
+            torch.distributed.broadcast(
+                counts,
+                src=parallel_state.get_pipeline_model_parallel_last_rank(),
+                group=parallel_state.get_pipeline_model_parallel_group(),
+            )
+
+        # counts is a tensor with 2 elements: [kept_seqs, kept_toks]
+        kept_seqs, kept_toks = counts
+        if kept_toks.item() == 0 and not eval_mode:
+            raise RuntimeError(
+                "No valid response tokens remain after in-loss sequence-logprob "
+                "filtering; refusing an empty optimizer update. Check "
+                "grpo.seq_logprob_error_threshold."
+            )
+        # Counts are weighted by sample_mask and may be positive fractions.
+        # Only replace zero denominators (possible during evaluation).
+        token_denominator = torch.where(kept_toks > 0, kept_toks, 1.0)
+        sequence_denominator = torch.where(kept_seqs > 0, kept_seqs, 1.0)
+        # Each microbatch loss divides by the original global token count G.
+        # Rejected tokens contribute zero, so accumulation and DP SUM produce
+        # S/G, where S is the sum of surviving tokens' gradient contributions.
+        # Multiplying by G/K, with K the global surviving token count, restores
+        # S/K: the same normalization as filtering before training. Apply this
+        # correction before optimizer.step() so gradient clipping sees S/K.
+        token_factor = float((global_valid_toks / token_denominator).item())
+        sequence_factor = float((global_valid_seqs / sequence_denominator).item())
+        if not eval_mode:
+            # Finish any overlap on the comm stream before touching the reduced
+            # gradient buffers (including distributed-optimizer gradient shards).
+            torch.cuda.synchronize()
+            self.model.scale_gradients(token_factor)
+        metrics = [
+            rescale_loss_metrics(
+                m,
+                loss_fn.metric_normalizations,
+                token_factor=token_factor,
+                sequence_factor=sequence_factor,
+            )
+            for m in metrics
+        ]
+        return metrics, kept_seqs, kept_toks
+
     @wrap_with_nvtx_name("megatron_policy_worker/train")
     def train(
         self,
@@ -980,8 +1063,8 @@ class MegatronPolicyWorkerImpl(
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function.
 
-        ``check_dim_skip_keys`` is accepted for parity with the v1/v2 DTensor
-        workers (cross-tokenizer ride-along tensors whose dim 1 is not the
+        ``check_dim_skip_keys`` is accepted for parity with the DTensor
+        worker (cross-tokenizer ride-along tensors whose dim 1 is not the
         student sequence axis). Megatron doesn't run cross-tokenizer, so it
         must be None.
         """
@@ -1095,6 +1178,7 @@ class MegatronPolicyWorkerImpl(
                 )
 
                 rerun_state_machine = get_rerun_state_machine()
+                losses_reduced: list[dict[str, Any]] = []
                 while rerun_state_machine.should_run_forward_backward(data_iterator):
                     # Set grad to zero. For MXFP8 overlap eval, the param and
                     # grad buffers are shared and pre-hooks are disabled above.
@@ -1163,6 +1247,22 @@ class MegatronPolicyWorkerImpl(
                 # Empty unused memory.
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
                     torch.cuda.empty_cache()
+
+                if (
+                    isinstance(loss_fn, ClippedPGLossFn)
+                    and loss_fn.requires_survivor_normalization
+                ):
+                    (
+                        losses_reduced,
+                        global_valid_seqs,
+                        global_valid_toks,
+                    ) = self._normalize_in_loss_seq_filter(
+                        loss_fn,
+                        losses_reduced,
+                        global_valid_seqs=global_valid_seqs,
+                        global_valid_toks=global_valid_toks,
+                        eval_mode=eval_mode,
+                    )
 
                 # Update parameters.
                 if not eval_mode:
@@ -1405,9 +1505,10 @@ class MegatronPolicyWorkerImpl(
     #    ``forward_backward_func``, i.e. once per chunk). All three are nulled
     #    for the duration of the step and restored at finish/abort; see
     #    ``begin_train_step`` for what each one does.
-    # 3. Grad clip is bundled inside ``MegatronOptimizer.step()``; the 1/N
-    #    rescale via ``self.model.scale_gradients(1/N)`` must run before
-    #    ``optimizer.step()`` so the clip operates on the rescaled grad.
+    # 3. Grad clip is bundled inside ``MegatronOptimizer.step()``; the policy
+    #    1/N rescale and relative draft-denominator correction must run before
+    #    end-of-step finalization and ``optimizer.step()`` so clipping sees
+    #    normalized gradients.
     # 4. With ``calculate_per_token_loss=True`` + ``average_in_collective=
     #    False``, mcore's DDP sums (does not average) grads across DP, so
     #    no FSDP-style ``loss *= dp_size*cp_size`` cancellation is needed
@@ -1473,6 +1574,7 @@ class MegatronPolicyWorkerImpl(
             # streaming chunks the controller has fed into this optimizer step
             # so far.
             "num_chunks": 0,
+            "draft_step_state": DraftStepState(),
             # Saved across the step so we can restore at finish/abort.
             "saved_grad_sync_func": None,
             "saved_no_sync_func": None,
@@ -1747,6 +1849,7 @@ class MegatronPolicyWorkerImpl(
             num_microbatches=num_microbatches,
             sampling_params=self.sampling_params,
             draft_model=self.draft_model,
+            defer_draft_normalization=True,
             teacher_output_layer_weight_by_index=self._opd_full_teacher_lm_heads,
         )
 
@@ -1814,6 +1917,14 @@ class MegatronPolicyWorkerImpl(
         )
 
         for m in mb_metrics_collected:
+            draft_payload = m.get(DRAFT_STEP_PAYLOAD_KEY)
+            if draft_payload is not None:
+                if not isinstance(draft_payload, DraftStepPayload):
+                    raise TypeError(
+                        "draft step metric payload must be DraftStepPayload, "
+                        f"got {type(draft_payload).__name__}."
+                    )
+                state["draft_step_state"].accumulate(draft_payload)
             state["all_mb_metrics"].append(m)
             # ``loss`` key is the un-normalized per-mb scalar; collect for
             # the global_loss aggregation at finish.
@@ -1848,15 +1959,29 @@ class MegatronPolicyWorkerImpl(
     def _finish_train_step_body(self, state: dict[str, Any]) -> dict[str, Any]:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
-        # All-reduce accumulated mask sums across DP to recover true N.
-        to_reduce = torch.stack(
+        # Recover policy and draft counts with one existing DP collective.
+        # The draft slice is length-1 while the step is active and empty
+        # otherwise, so every rank in the DP group has to agree on
+        # ``active`` or this all_reduce sees mismatched shapes. It does:
+        # the payload comes from the draft loss wrapper, which is built
+        # from the same policy config on every DP rank, and Megatron runs
+        # the same microbatch count on all of them.
+        draft_step_state: DraftStepState = state["draft_step_state"]
+        policy_counts = torch.stack(
             [state["local_valid_seqs"], state["local_valid_toks"]]
         ).to(torch.float64)
+        to_reduce = torch.cat(
+            [
+                policy_counts,
+                draft_step_state.counts_for_reduction(policy_counts),
+            ]
+        )
         torch.distributed.all_reduce(
             to_reduce, group=parallel_state.get_data_parallel_group()
         )
         global_valid_seqs = to_reduce[0]
         global_valid_toks = to_reduce[1]
+        draft_step_state.set_global_counts(to_reduce[2:])
 
         if state["loss_type"] == LossType.TOKEN_LEVEL:
             n_true = global_valid_toks
@@ -1870,6 +1995,11 @@ class MegatronPolicyWorkerImpl(
         # global mean grad; for reduce_scatter (dist-opt) it's the shard.
         # Either way, opt.step sees the right-normalized gradient.
         self.model.scale_gradients(inv_n)
+        if draft_step_state.active:
+            draft_step_state.correct_main_grads(
+                self.model.parameters(),
+                policy_normalization_count=n_true,
+            )
         # The uniform rescale gives MTP the main loss's denominator. Correct
         # detached, MTP-tagged parameters back to the valid-token denominator
         # used by the synchronous path. For token-level loss the factor is 1.
@@ -1941,6 +2071,11 @@ class MegatronPolicyWorkerImpl(
             else None
         )
 
+        draft_grad_norm = None
+        if draft_step_state.active:
+            grad_norms_by_group = self.optimizer.grad_norms_by_group
+            draft_grad_norm = grad_norms_by_group.get("draft")
+
         pg_collection = get_pg_collection(self.model)
         update_successful = logical_and_across_model_parallel_group(
             update_successful, mp_group=pg_collection.mp
@@ -1950,6 +2085,9 @@ class MegatronPolicyWorkerImpl(
         )
         num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(
             num_zeros_in_grad, mp_group=pg_collection.mp
+        )
+        draft_grad_norm = reduce_max_stat_across_model_parallel_group(
+            draft_grad_norm, mp_group=pg_collection.mp
         )
         if state["mtp_enabled"]:
             # MTP parameters live on the last PP stage. Make their independently
@@ -2054,7 +2192,11 @@ class MegatronPolicyWorkerImpl(
         for m in state["all_mb_metrics"]:
             out: dict[str, Any] = {}
             for k, v in m.items():
-                if "_min" in k or "_max" in k:
+                if k == DRAFT_STEP_PAYLOAD_KEY:
+                    continue
+                if k == DRAFT_LOSS_METRIC_KEY and draft_step_state.active:
+                    out[k] = draft_step_state.normalize_metric(v)
+                elif "_min" in k or "_max" in k:
                     out[k] = v
                 else:
                     out[k] = _scale_metric(k, v)
@@ -2082,6 +2224,8 @@ class MegatronPolicyWorkerImpl(
             "all_mb_metrics": mb_metrics,
             "grad_norm": torch.tensor([grad_norm]),
         }
+        if draft_grad_norm is not None:
+            metrics["draft_grad_norm"] = torch.tensor([draft_grad_norm])
 
         # MoE aux-loss metrics: same convention as sync train() — scale
         # by the total pipeline-microbatch count accumulated across all
@@ -2234,7 +2378,15 @@ class MegatronPolicyWorkerImpl(
 
         no_grad.__exit__(None, None, None)
         self.timer.stop("get_logprobs")
-        return BatchedDataDict[LogprobOutputSpec](logprobs=logprobs).to("cpu")
+
+        # TODO: @nan: will remove in the future
+        cpu_logprobs = torch.empty_like(
+            logprobs,
+            device="cpu",
+            pin_memory=True,
+        )
+        cpu_logprobs.copy_(logprobs, non_blocking=False)
+        return BatchedDataDict[LogprobOutputSpec](logprobs=cpu_logprobs)
 
     def _resolve_output_layer_owner(self) -> Optional[Any]:
         """Return the unwrapped module owning ``output_layer``, or None off the last PP stage.

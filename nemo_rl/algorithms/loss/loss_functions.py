@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 
 from nemo_rl.algorithms.loss.draft import (
     DEFAULT_DRAFT_TOKEN_CHUNK_SIZE,
+    DraftLossStats,
     streaming_vocab_parallel_soft_ce,
 )
 from nemo_rl.algorithms.loss.interfaces import (
@@ -28,7 +29,11 @@ from nemo_rl.algorithms.loss.interfaces import (
     LossType,
     MetricNormalizer,
 )
-from nemo_rl.algorithms.utils import calculate_kl, masked_mean
+from nemo_rl.algorithms.utils import (
+    calculate_kl,
+    compute_seq_logprob_errors,
+    masked_mean,
+)
 from nemo_rl.algorithms.x_token.loss_utils import (
     LocalizedAlignment,
     build_exact_token_map,
@@ -47,11 +52,11 @@ from nemo_rl.distributed.model_utils import (
     cp_shift_next,
     group_all_reduce_sum,
     group_all_reduce_sum_with_grad,
+    to_local_if_dtensor,
     vocab_parallel_full_log_softmax,
     vocab_parallel_gather_columns,
     vocab_parallel_log_softmax,
 )
-from nemo_rl.models.dtensor.parallelize import to_local_if_dtensor
 
 if TYPE_CHECKING:
     # Import-time only: nemo_rl.algorithms.opd imports the data plane, which
@@ -100,16 +105,31 @@ class DraftCrossEntropyLossFn(LossFunction):
         global_valid_toks: torch.Tensor,
     ) -> torch.Tensor:
         """Reduce the masked per-token draft loss to a scalar."""
+        stats = self.loss_stats(
+            teacher_logits=teacher_logits,
+            student_logits=student_logits,
+            token_mask=token_mask,
+            data=data,
+        )
+        return stats.normalized(
+            normalization_counts=global_valid_toks.reshape(1),
+        )
+
+    def loss_stats(
+        self,
+        teacher_logits: Tensor,
+        student_logits: Tensor,
+        token_mask: Tensor,
+        data: BatchedDataDict[DraftCrossEntropyLossDataDict],
+    ) -> DraftLossStats:
+        """Return raw one-bin EAGLE statistics for deferred normalization."""
         mask = token_mask * data["sample_mask"].unsqueeze(-1)
-        stats = streaming_vocab_parallel_soft_ce(
+        return streaming_vocab_parallel_soft_ce(
             student_logits=student_logits,
             teacher_logits=teacher_logits,
             mask=mask,
             token_chunk_size=self.token_chunk_size,
             tp_group=self.vocab_parallel_group,
-        )
-        return stats.normalized(
-            normalization_counts=global_valid_toks.reshape(1),
         )
 
 
@@ -156,11 +176,16 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # --- On-policy ---
     # (default off) loss formulation improvements (docs/guides/grpo.md#loss)
     use_on_policy_kl_approximation: bool = False
-    # If True, force the ratio to 1.0 for truly on-policy behavior,
-    # eliminating any importance sampling effects.
+    # If True, force the PPO ratio to 1.0 while preserving its gradient.
+    # Generation-to-trainer importance sampling remains independently enabled.
     # NOTE: This should only be used when doing exactly one update per rollout
     # (i.e., num_prompts_per_step * num_generations_per_prompt == train_global_batch_size)
     force_on_policy_ratio: bool = False
+    # Evaluate grpo.seq_logprob_error_threshold in the training loss, then
+    # normalize accumulated gradients over survivors before the optimizer step.
+    # Opt-in; supported only for token-level, force-on-policy Megatron GRPO
+    # with the non-streaming trainer.
+    seq_logprob_error_in_loss: bool = False
     # If True, use CISPO (Clipped IS-weight Policy Optimization) from MiniMax-M1.
     use_cispo: bool = False
     # VAPO: weight μ for positive-example NLL loss on correct samples.
@@ -235,7 +260,38 @@ class ClippedPGLossFn(LossFunction):
         cfg: ClippedPGLossConfig,
         use_fused_linear_logprobs: bool = False,
         opd_full: Optional["OnPolicyDistillationFullConfig"] = None,
+        *,
+        seq_logprob_error_threshold: float | None = None,
     ):
+        """Initialize the loss and its worker normalization requirements.
+
+        Args:
+            cfg: Policy-gradient loss configuration.
+            use_fused_linear_logprobs: Whether the model returns precomputed
+                next-token logprobs instead of logits.
+            opd_full: Optional full-vocabulary distillation configuration.
+            seq_logprob_error_threshold: Required when
+                ``cfg.seq_logprob_error_in_loss`` is enabled; otherwise unused.
+                The loss emits survivor counts but normalizes by
+                the original global counts. The worker must aggregate survivor
+                counts across all microbatches and data-parallel ranks, then
+                rescale gradients and normalized metrics before clipping or
+                stepping the optimizer. See ``requires_survivor_normalization``.
+        """
+        self.seq_logprob_error_in_loss = cfg.seq_logprob_error_in_loss
+        self.seq_logprob_error_threshold = seq_logprob_error_threshold
+        if self.seq_logprob_error_in_loss:
+            if seq_logprob_error_threshold is None:
+                raise ValueError(
+                    "loss_fn.seq_logprob_error_in_loss requires seq_logprob_error_threshold"
+                )
+            if not cfg.force_on_policy_ratio or not cfg.token_level_loss:
+                raise ValueError(
+                    "In-loss sequence filtering requires force_on_policy_ratio "
+                    "and token_level_loss"
+                )
+            if cfg.positive_example_nll_weight != 0:
+                raise ValueError("In-loss sequence filtering does not support NLL")
         # When True, the model forward is patched to return precomputed next-token
         # logprobs (via chunked linear CE fusion) instead of full logits. This is
         # consumed by prepare_loss_input, which short-circuits the logits->logprobs
@@ -369,6 +425,9 @@ class ClippedPGLossFn(LossFunction):
             ),
             # Raw count — the downstream per-microbatch sum IS the value.
             "num_valid_samples": MetricNormalizer.NONE,
+            "seq_logprob_error_valid_tokens": MetricNormalizer.NONE,
+            "seq_logprob_error_valid_seqs": MetricNormalizer.NONE,
+            "num_masked_seqs_by_logprob_error": MetricNormalizer.NONE,
             # Normalized by the microbatch's own correct-token count, not a
             # global factor — already a per-microbatch mean.
             "positive_nll_loss": MetricNormalizer.NONE,
@@ -405,6 +464,14 @@ class ClippedPGLossFn(LossFunction):
                         "opd_full_decomposition_error": MetricNormalizer.NONE,
                     }
                 )
+
+    @property
+    def requires_survivor_normalization(self) -> bool:
+        """Whether the worker must renormalize using in-loss survivor counts.
+
+        Uses the same switch as filtering so the loss and worker agree.
+        """
+        return self.seq_logprob_error_in_loss
 
     def __call__(
         self,
@@ -476,6 +543,38 @@ class ClippedPGLossFn(LossFunction):
         # This avoids computing prev_logprobs upstream
         if self.force_on_policy_ratio:
             prev_logprobs = curr_logprobs.detach()
+
+        seq_error_metrics = {}
+        if self.seq_logprob_error_in_loss:
+            errors, _ = compute_seq_logprob_errors(
+                policy_logprobs=curr_logprobs.detach(),
+                generation_logprobs=generation_logprobs,
+                token_mask=token_mask,
+                sample_mask=sample_mask,
+            )
+            filtered_sample_mask = sample_mask * (
+                errors <= self.seq_logprob_error_threshold
+            ).to(sample_mask.dtype)
+            seq_error_metrics["num_masked_seqs_by_logprob_error"] = (
+                (sample_mask - filtered_sample_mask).sum().item()
+            )
+            sample_mask = filtered_sample_mask
+            mask = token_mask * sample_mask.unsqueeze(-1)
+            seq_error_metrics["seq_logprob_error_valid_tokens"] = mask.sum().item()
+            seq_error_metrics["seq_logprob_error_valid_seqs"] = sample_mask.sum().item()
+            # A rejected nonfinite logprob must not poison a zero-weight loss.
+            curr_logprobs = torch.where(mask.bool(), curr_logprobs, 0.0)
+            prev_logprobs = curr_logprobs.detach()
+            generation_logprobs = torch.where(mask.bool(), generation_logprobs, 0.0)
+            if self.reference_policy_kl_penalty != 0:
+                curr_logprobs_unfiltered = torch.where(
+                    mask.bool(),
+                    data.get("curr_logprobs_unfiltered", next_token_logprobs),
+                    0.0,
+                )
+                reference_policy_logprobs = torch.where(
+                    mask.bool(), data["reference_policy_logprobs"][:, 1:], 0.0
+                )
 
         # token_mult_prob_error
         # See more details and other metrics in docs/guides/grpo.md#metrics
@@ -859,6 +958,7 @@ class ClippedPGLossFn(LossFunction):
                 "num_valid_samples": sample_mask.sum().item(),
                 "approx_entropy": seq_entropy_approx.item(),
                 **_is_filter_metrics,
+                **seq_error_metrics,
                 "positive_nll_loss": nll_loss.item(),
             },
         )

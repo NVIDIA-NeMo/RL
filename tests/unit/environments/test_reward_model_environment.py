@@ -78,11 +78,7 @@ def reward_model_env():
     env_actor = None
     try:
         assert ray.is_initialized()
-        reward_model_py_executable_class = (
-            "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2"
-            if basic_env_config["dtensor_cfg"]["_v2"]
-            else "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker"
-        )
+        reward_model_py_executable_class = "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2"
         env_actor = RewardModelEnvironment.options(  # type: ignore # it's wrapped with ray.remote
             runtime_env={
                 "py_executable": get_actor_python_env(reward_model_py_executable_class),
@@ -216,10 +212,10 @@ class TestRewardModelEnvironment:
         assert output.rewards.dtype == torch.float32
         # Verify expected reward values (with tolerance for floating point precision).
         # The incorrect-answer score is sensitive to the transformers/torch/kernel build
-        # (observed -5.2500 / -5.3750 / -5.4062 across environments); -5.2500 is what the
+        # (observed -5.2500 / -5.3750 / -5.4062 across environments); -5.4062 is what the
         # CI build produces. The version-robust correct>incorrect invariant below is the
         # primary check.
-        expected_rewards = torch.tensor([-5.2500, 2.6719])
+        expected_rewards = torch.tensor([-5.4062, 2.6719])
         assert torch.allclose(output.rewards, expected_rewards, atol=1e-1)
         # Version-robust invariant: correct answer must out-score the incorrect one.
         assert output.rewards[1] > output.rewards[0]
