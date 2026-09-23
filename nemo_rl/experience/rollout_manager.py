@@ -39,9 +39,14 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 )
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
+from nemo_rl.data.multimodal_utils import VLLM_CONTENT_KEY, VLLM_PROMPT_KEYS
 from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.nemo_gym import (
+    as_nemo_gym_shard_set,
+    get_nemo_gym_route_name,
+)
 from nemo_rl.experience.failures import (
     FailureClass,
     GenerationUnavailable,
@@ -572,6 +577,12 @@ class AsyncRolloutImpl:
     ) -> tuple[Completion, dict]:
         """Run one multi-turn rollout for a single generation index."""
         current_message_log = copy.deepcopy(input_sample["message_log"])
+        input_sample_data: Mapping[str, Any] = input_sample
+        native_generation_data = {
+            key: input_sample_data[key]
+            for key in VLLM_PROMPT_KEYS
+            if key in input_sample_data
+        }
         current_extra_env_info = copy.deepcopy(input_sample["extra_env_info"])
         current_stop_strings = input_sample.get("stop_strings", None)
         task_name = input_sample["task_name"]
@@ -599,6 +610,11 @@ class AsyncRolloutImpl:
                 break
 
             turn_count += 1
+            turn_native_generation_data = dict(native_generation_data)
+            # Raw processor content describes only the original conversation.
+            # Later turns keep the media but use the updated pre-tokenized prefix.
+            if turn_count > 1 and VLLM_CONTENT_KEY in turn_native_generation_data:
+                turn_native_generation_data[VLLM_CONTENT_KEY] = None
 
             # Generate response for this sample using async generation.
             # A failure here must not be absorbed: returning a partial completion
@@ -612,6 +628,7 @@ class AsyncRolloutImpl:
                 ) = await self._generate_response(
                     current_message_log,
                     current_stop_strings,
+                    native_generation_data=turn_native_generation_data,
                 )
             except Exception as e:
                 raise _classify_generation_failure(
@@ -738,6 +755,8 @@ class AsyncRolloutImpl:
         self,
         message_log: list[dict],
         stop_strings: list[str] | None,
+        *,
+        native_generation_data: dict[str, Any] | None = None,
     ) -> tuple[dict, torch.Tensor, dict[str, Any]]:
         """Generate a single-turn response for one sample.
 
@@ -762,6 +781,12 @@ class AsyncRolloutImpl:
         generation_input_data.update(
             flat_messages.get_multimodal_dict(as_tensors=False)
         )
+        if native_generation_data:
+            # This method handles one sample; vLLM's formatter expects batched
+            # native content/media side channels.
+            generation_input_data.update(
+                {key: [value] for key, value in native_generation_data.items()}
+            )
 
         # Generate response
         # TODO: update generate_async to return a single item directly
@@ -1189,9 +1214,14 @@ class AsyncNemoGymRolloutImpl:
         recovery performs one physical Gym dispatch here and delegates a complete
         cohort replacement to the outer recovery loop.
         """
-        nemo_gym_env = self._task_to_env["nemo_gym"]
         if not inputs:
             raise ValueError("NeMo-Gym rollout dispatch requires at least one row")
+        # These rows are all one prompt's generations.
+        # They share one Gym route and must stay on one instance.
+        shard_set = as_nemo_gym_shard_set(self._task_to_env["nemo_gym"])
+        nemo_gym_env = shard_set.pick_handle(get_nemo_gym_route_name(inputs[0]))
+        instance_label = shard_set.instance_label(nemo_gym_env)
+        instance_timer_prefix = f"{timer_prefix}/shard/{instance_label}"
         total_rows = self._num_generations_per_prompt
         # Re-dispatch maps NeMo-Gym's echoed _rowidx back onto the original group, so
         # the rows must carry the index _build_inputs stamped on them. Checked here
@@ -1260,7 +1290,7 @@ class AsyncNemoGymRolloutImpl:
                             results,
                             shaping_by_rowidx,
                             total_rows,
-                            timer_prefix,
+                            instance_timer_prefix,
                             on_completion=on_completion,
                         )
                     except Exception as error:
@@ -1271,6 +1301,9 @@ class AsyncNemoGymRolloutImpl:
                             classify_rollout_failure(error) is not FailureClass.INFRA
                             or attempt == max_row_attempts
                         ):
+                            error.add_note(
+                                f"NeMo-Gym instance '{instance_label}' failed during rollout collection"
+                            )
                             raise
                     else:
                         if timing_metrics is not None:
@@ -1279,7 +1312,8 @@ class AsyncNemoGymRolloutImpl:
             missing = [index for index in expected_indices if results[index] is None]
             if missing:
                 failure = GymTransportError(
-                    "NeMo-Gym rollout stream ended before all rows arrived; missing "
+                    f"NeMo-Gym instance '{instance_label}' rollout stream ended "
+                    "before all rows arrived; missing "
                     f"rows {missing} of {total_rows} after "
                     f"{max_row_attempts} attempt(s)"
                 )
@@ -1338,6 +1372,10 @@ class AsyncNemoGymRolloutImpl:
             )
 
         rollout_metrics.update(env_timing_metrics)
+        for handle in shard_set.all_handles:
+            label = shard_set.instance_label(handle)
+            rollout_metrics[f"{timer_prefix}/routing/group_share/{label}"] = 0
+        rollout_metrics[f"{timer_prefix}/routing/group_share/{instance_label}"] = 1
 
         return completions, prompt_message_log, rollout_metrics
 

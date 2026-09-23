@@ -32,7 +32,10 @@ from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
+from nemo_rl.models.automodel.checkpoint import (
+    AutomodelCheckpointManager,
+    build_checkpoint_config,
+)
 from nemo_rl.models.automodel.data import (
     check_sequence_dim,
     get_microbatch_iterator,
@@ -76,7 +79,6 @@ from nemo_rl.models.policy.workers.patches import (
     apply_transformer_engine_patch,
 )
 from nemo_rl.telemetry.setup import init_telemetry_worker
-from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
@@ -298,18 +300,19 @@ class DTensorPolicyWorkerV2Impl(
         requires_synchronous_checkpoint = (
             getattr(runtime_config.model_config, "model_type", None) == "deepseek_v4"
         )
+        dtensor_cfg = config["dtensor_cfg"]
+        checkpoint_config = build_checkpoint_config(
+            dtensor_cfg,
+            model_repo_id=config["model_name"],
+            dequantize_base_checkpoint=config.get("dequantize_base_checkpoint", False),
+            is_peft=self.lora_enabled,
+            # Automodel's process-based async DCP cannot serialize the
+            # HF-adapted DeepSeek-V4 DTensor/view state. Other v2 models keep
+            # the pre-existing async checkpoint path.
+            is_async=not requires_synchronous_checkpoint,
+        )
         self._init_checkpoint_manager(
-            config_updates={
-                "model_repo_id": config["model_name"],
-                "dequantize_base_checkpoint": config.get(
-                    "dequantize_base_checkpoint", False
-                ),
-                "is_peft": self.lora_enabled,
-                # Automodel's process-based async DCP cannot serialize the
-                # HF-adapted DeepSeek-V4 DTensor/view state. Other v2 models keep
-                # the pre-existing async checkpoint path.
-                "is_async": not requires_synchronous_checkpoint,
-            },
+            config_updates=checkpoint_config,
         )
 
         # Set up model and optimizer.
@@ -1354,7 +1357,8 @@ class DTensorPolicyWorkerV2Impl(
         weights_path: str,
         optimizer_path: Optional[str] = None,
         tokenizer_path: Optional[str] = None,
-        checkpointing_cfg: Optional[CheckpointingConfig] = None,
+        *,
+        is_final_checkpoint: bool,
     ) -> None:
         """Save a checkpoint of the model.
 
@@ -1368,8 +1372,7 @@ class DTensorPolicyWorkerV2Impl(
             scheduler=self.scheduler,
             tokenizer=self.tokenizer if tokenizer_path else None,
             tokenizer_path=tokenizer_path,
-            checkpointing_cfg=checkpointing_cfg,
-            lora_enabled=self.lora_enabled,
+            is_final_checkpoint=is_final_checkpoint,
             peft_config=self.peft_config,
         )
 
@@ -1401,7 +1404,6 @@ class DTensorPolicyWorkerV2Impl(
     def _init_checkpoint_manager(
         self,
         config_updates: Optional[dict[str, Any]] = None,
-        checkpoint_root: Optional[str] = None,
     ) -> None:
         """Initialize the AutomodelCheckpointManager for this worker.
 
@@ -1409,8 +1411,7 @@ class DTensorPolicyWorkerV2Impl(
         and initializes its underlying checkpointer.
 
         Args:
-            config_updates: Dict of CheckpointingConfig fields to set during initialization.
-            checkpoint_root: Optional root directory for checkpoints.
+            config_updates: Automodel checkpoint fields to set during initialization.
         """
         if self.checkpoint_manager is None:
             self.checkpoint_manager = AutomodelCheckpointManager(
@@ -1420,7 +1421,6 @@ class DTensorPolicyWorkerV2Impl(
             )
             self.checkpoint_manager.init_checkpointer(
                 config_updates=config_updates,
-                checkpoint_root=checkpoint_root,
             )
 
 

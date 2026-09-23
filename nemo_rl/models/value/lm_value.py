@@ -32,7 +32,6 @@ from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.models.value.config import ValueConfig
 from nemo_rl.models.value.interfaces import ValueInterface, ValueOutputSpec
-from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.timer import Timer
 
 PathLike = Union[str, "os.PathLike[Any]"]
@@ -77,7 +76,6 @@ class Value(ValueInterface):
         # Value models use the same backend configuration as policy models
         megatron_enable = bool(config.get("megatron_cfg", {}).get("enabled", False))
         dtensor_enable = bool(config.get("dtensor_cfg", {}).get("enabled", False))
-
         if megatron_enable and dtensor_enable:
             raise ValueError(
                 "Configure either Megatron (value.megatron_cfg.enabled=true) or "
@@ -154,15 +152,18 @@ class Value(ValueInterface):
         from ray.util.queue import Queue as RayQueue
 
         pre_init_queue = RayQueue()
+        worker_kwargs = {
+            "tokenizer": tokenizer,
+            "init_optimizer": init_optimizer,
+            "weights_path": weights_path,
+            "optimizer_path": optimizer_path,
+            "worker_sharding_annotations": self.sharding_annotations,
+            "pre_init_communication_queue": pre_init_queue,
+        }
         worker_builder = RayWorkerBuilder(
             worker_builder_cls,
             config,
-            tokenizer=tokenizer,
-            init_optimizer=init_optimizer,
-            weights_path=weights_path,
-            optimizer_path=optimizer_path,
-            worker_sharding_annotations=self.sharding_annotations,
-            pre_init_communication_queue=pre_init_queue,
+            **worker_kwargs,
         )
 
         if cluster._sorted_bundle_indices is not None:
@@ -427,9 +428,14 @@ class Value(ValueInterface):
         weights_path: str,
         optimizer_path: Optional[str] = None,
         tokenizer_path: Optional[str] = None,
-        checkpointing_cfg: Optional[CheckpointingConfig] = None,
+        *,
+        is_final_checkpoint: bool,
     ) -> None:
-        """Save a checkpoint of the value model."""
+        """Save a checkpoint of the value model.
+
+        DTensor v2 checkpoint resources are configured when the Value is
+        constructed. ``weights_path`` selects the destination for each save.
+        """
         megatron_enable = bool(self.cfg.get("megatron_cfg", {}).get("enabled", False))
 
         if megatron_enable:
@@ -448,7 +454,7 @@ class Value(ValueInterface):
                 weights_path=weights_path,
                 optimizer_path=optimizer_path,
                 tokenizer_path=tokenizer_path,
-                checkpointing_cfg=checkpointing_cfg,
+                is_final_checkpoint=is_final_checkpoint,
             )
         ray.get(futures)
 

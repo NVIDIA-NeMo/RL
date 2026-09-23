@@ -89,6 +89,7 @@ from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
+    normalize_nvfp4_pertoken_policy_config,
     normalize_vllm_refit_config,
 )
 from nemo_rl.models.policy import MegatronConfig, PolicyConfig
@@ -356,6 +357,7 @@ def setup(
         "A generation config in the PolicyConfig is required for PPO"
     )
     if generation_config["backend"] == "vllm":
+        normalize_nvfp4_pertoken_policy_config(policy_config, entry_point="ppo")
         vllm_config = cast(VllmConfig, generation_config)
         normalize_vllm_refit_config(vllm_config)
         refit_transport = vllm_config.get("refit_transport")
@@ -744,14 +746,20 @@ def setup(
     weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
     # Only a fresh run reads this; a resume ignores it and restores the critic from
     # its own checkpoint, so the key can stay in the config.
-    warm_start = ppo_config.warm_start_value_checkpoint
-    if last_checkpoint_path is None and warm_start is not None:
+    warm_start = (
+        ppo_config.warm_start_value_checkpoint if last_checkpoint_path is None else None
+    )
+    if warm_start is not None:
         validate_warm_start_checkpoint(warm_start)
-        print(f"🔥 Warm-starting the value model from {warm_start}")
+        print(f"🔥 Warm-starting the value model from {warm_start} (weights only)")
     value_weights_path, value_optimizer_path = checkpointer.get_resume_paths(
         last_checkpoint_path or warm_start,
         model_component="value",
     )
+    if warm_start is not None:
+        # The seed's Adam state and LR-scheduler step count belong to the run that
+        # produced it, so the critic rebuilds both -- only the weights carry over.
+        value_optimizer_path = None
 
     # train_iters is the total scheduler-tick budget. Each Megatron worker
     # ticks once per train() call, so policy and value need separate budgets
@@ -1040,13 +1048,15 @@ def dynamic_sampling(
     master_config: MasterConfig,
     timer: Timer,
     batch_cache: BatchedDataDict[DatumSpec] = None,
+    is_trivial_prompt_distribution: torch.Tensor | None = None,
 ) -> BatchedDataDict[DatumSpec]:
-    """Implements the dynamic sampling algorithm to select prompts with non-zero standard deviation.
+    """Select complete prompt groups with non-trivial reward distributions.
 
-    This function filters the current batch to retain only those prompts that have a non-zero standard deviation.
-    If the current batch has fewer number of prompts with non-zero standard deviation than the required batch size, defined as num_prompts_per_step * num_generations_per_prompt,
+    Exact reward equality determines triviality, independently of floating-point
+    standard-deviation noise. Every rollout for a prompt is kept or discarded together.
+    If the current batch has fewer non-trivial prompt groups than the required batch size, defined as num_prompts_per_step * num_generations_per_prompt,
     we store it in the batch_cache to be used in later iterations.
-    If the current batch has more number of prompts with non-zero standard deviation than the required batch size, defined as num_prompts_per_step * num_generations_per_prompt,
+    If the current batch has more non-trivial prompt groups than the required batch size,
     the batch is sliced to ensure batch size is num_prompts_per_step * num_generations_per_prompt.
     is_batch_complete is set to False to indicate that the current batch is not enough to meet the required batch size. This is used as a signal in the training loop
     to continue sampling or proceed to training.
@@ -1059,15 +1069,18 @@ def dynamic_sampling(
         baseline (torch.Tensor): Baseline values for each prompt group.
         dynamic_sampling_num_gen_batches (int): Number of generation batches processed at the current step.
         master_config (MasterConfig): Configuration containing PPO and policy settings.
-        batch_cache (BatchedDataDict[DatumSpec], optional): Cache storing previously selected prompts with non-zero std.
+        batch_cache (BatchedDataDict[DatumSpec], optional): Cache storing previously selected non-trivial prompt groups.
+        is_trivial_prompt_distribution (torch.Tensor, optional): Exact-equality
+            mask for each sample's full prompt reward group. Trivial groups are
+            filtered all-or-nothing.
 
     Returns:
         tuple: A tuple containing:
             - repeated_batch (BatchedDataDict[DatumSpec]): Updated batch with selected prompts.
-            - is_batch_complete (bool): Indicates if the batch has enough samples with non-zero std for training.
+            - is_batch_complete (bool): Indicates if the batch has enough non-trivial samples for training.
             - batch_cache (BatchedDataDict[DatumSpec]): Updated cache for future iterations.
     """
-    # is_batch_complete is used to indicate if the current batch was able to generate enough prompts with non-zero std.
+    # is_batch_complete indicates whether enough non-trivial prompt groups were found.
     is_batch_complete = True
 
     # Required batch size for training
@@ -1081,19 +1094,22 @@ def dynamic_sampling(
     total_rewards = repeated_batch["total_reward"]
     dynamic_sampling_metrics = {}
 
-    # Dynamic sampling algorithm (used in DAPO algorithm)
-    # This block implements dynamic sampling by selecting prompt groups with non-zero std.
-    # If sampled prompts (with non-zero std) are fewer than num_prompts_per_step * num_generations_per_prompt, continue sampling until dynamic_sampling_max_gen_batches is reached.
+    # Dynamic sampling algorithm (used in DAPO).
     if master_config.ppo.use_dynamic_sampling:
         with timer.time("dynamic_sampling"):
-            # Get the prompt indices with non-zero std
-            non_zero_std_mask = std != 0.0
+            if is_trivial_prompt_distribution is None:
+                raise ValueError(
+                    "dynamic_sampling: is_trivial_prompt_distribution is None -- "
+                    "the caller must compute it before this call when "
+                    "use_dynamic_sampling is set."
+                )
+            non_trivial_reward_mask = ~is_trivial_prompt_distribution
 
             keep_prompt_indices = torch.arange(
-                len(non_zero_std_mask), device=std.device
-            )[non_zero_std_mask].tolist()
+                len(non_trivial_reward_mask), device=std.device
+            )[non_trivial_reward_mask].tolist()
 
-            # Only select the inputs that have non-zero std
+            # Select every rollout belonging to each non-trivial prompt group.
             # total_reward is already a part of repeated_batch so we don't need to add it again
             filtered_repeated_batch = repeated_batch.select_indices(keep_prompt_indices)
             filtered_repeated_batch["std"] = std[keep_prompt_indices]
@@ -1121,7 +1137,7 @@ def dynamic_sampling(
 
             filtered_prompts_size = filtered_repeated_batch.size
             print(
-                f"Detected {filtered_prompts_size} prompts with non-zero std; "
+                f"Detected {filtered_prompts_size} samples from non-trivial prompts; "
                 f"{train_prompts_size} are required and used for training."
             )
 
@@ -1463,6 +1479,9 @@ def ppo_train(
                             task_to_env=task_to_env,
                             max_seq_len=None,
                             generation_config=generation_config,
+                            num_generations_per_prompt=(
+                                master_config.ppo.num_generations_per_prompt
+                            ),
                             log_full_result_tables=should_log_nemo_gym_full_result_tables(
                                 wandb_enabled=master_config.logger["wandb_enabled"],
                                 wandb_config=master_config.logger["wandb"],
@@ -1996,7 +2015,7 @@ def ppo_train(
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
-                            checkpointing_cfg=master_config.checkpointing,
+                            is_final_checkpoint=is_last_step,
                         )
                         policy.offload_to_cpu()
 
@@ -2013,7 +2032,7 @@ def ppo_train(
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "value", "tokenizer"
                             ),
-                            checkpointing_cfg=master_config.checkpointing,
+                            is_final_checkpoint=is_last_step,
                         )
                         value_model.finish_training()
 
@@ -2969,7 +2988,7 @@ def async_ppo_train(
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
-                            checkpointing_cfg=master_config.checkpointing,
+                            is_final_checkpoint=is_last_step,
                         )
                         policy.offload_to_cpu()
 
@@ -2986,7 +3005,7 @@ def async_ppo_train(
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "value", "tokenizer"
                             ),
-                            checkpointing_cfg=master_config.checkpointing,
+                            is_final_checkpoint=is_last_step,
                         )
                         value_model.finish_training()
 

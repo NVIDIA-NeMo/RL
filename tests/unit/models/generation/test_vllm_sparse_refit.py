@@ -582,6 +582,7 @@ async def test_async_sparse_refit_post_init_records_worker_locality() -> None:
 
 def test_sync_post_init_binds_numa() -> None:
     worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
+    worker.cfg = {}
     worker._sparse_refit_receiver = None
     worker._mtp_load_from_disk = False
     worker._mtp_speculative_enabled = True

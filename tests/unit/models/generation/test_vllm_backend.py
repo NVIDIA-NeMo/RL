@@ -1636,9 +1636,12 @@ def test_generation_prepare_refit_info_rejects_mxfp8_grouped_moe(
             "is_mx": True,
         }
     }
-    generation.worker_group = SimpleNamespace(
-        run_all_workers_single_data=MagicMock(return_value=["future"])
-    )
+    # Same per-leader dispatch as the test below. Asserting on the old whole-group call
+    # would pass whatever the code did, since nothing calls it any more.
+    leader = MagicMock()
+    generation.worker_group = SimpleNamespace(workers=[leader])
+    generation.dp_size = 1
+    generation._refit_membership = None
     monkeypatch.setattr(vllm_generation.ray, "get", MagicMock())
 
     with pytest.raises(AssertionError, match="MXFP8 refit does not support"):
@@ -1646,7 +1649,8 @@ def test_generation_prepare_refit_info_rejects_mxfp8_grouped_moe(
             {"model.layers.0.mlp.experts.gate_up_proj": object()}
         )
 
-    generation.worker_group.run_all_workers_single_data.assert_not_called()
+    leader.prepare_refit_info.remote.assert_not_called()
+    leader.prepare_refit_info_async.remote.assert_not_called()
 
 
 @pytest.mark.vllm
@@ -1708,21 +1712,25 @@ def test_generation_prepare_refit_info_keeps_reload_flag_out_of_rpc(
             "refit_with_reload_api": True,
         }
     }
-    generation.worker_group = SimpleNamespace(
-        run_all_workers_single_data=MagicMock(return_value=["future"])
-    )
+    # Addressed per surviving DP leader rather than through the worker group: the
+    # whole-group fan-out reaches a dead actor once a shard is lost, which is exactly
+    # the state prepare_refit_info runs in on the recovery path. _refit_leader_workers
+    # with no recorded membership is every leader, so one shard is one worker here.
+    leader = MagicMock()
+    generation.worker_group = SimpleNamespace(workers=[leader])
+    generation.dp_size = 1
+    generation._refit_membership = None
     ray_get = MagicMock()
     monkeypatch.setattr(vllm_generation.ray, "get", ray_get)
     state_dict_info = {"model.weight": object()}
 
     generation.prepare_refit_info(state_dict_info)
 
-    generation.worker_group.run_all_workers_single_data.assert_called_once_with(
-        expected_method,
-        state_dict_info=state_dict_info,
-        run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-    )
-    ray_get.assert_called_once_with(["future"])
+    # The point of the test: state_dict_info and nothing else. refit_with_reload_api is
+    # a local engine setting and must not travel in the RPC.
+    remote = getattr(leader, expected_method).remote
+    remote.assert_called_once_with(state_dict_info=state_dict_info)
+    ray_get.assert_called_once_with([remote.return_value])
 
 
 @pytest.mark.vllm
@@ -1755,6 +1763,231 @@ def test_update_weights_via_ipc_acks_manifest_error_and_returns_false(monkeypatc
 
     assert ext.update_weights_via_ipc_zmq() is False
     assert ext.zmq_socket.sent == [IPCProtocol.ACK.value.encode()]
+
+
+@pytest.mark.vllm
+def test_native_ipc_reload_drains_sender_after_loader_failure(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.policy.utils import IPCProtocol, calculate_aligned_size
+
+    source = torch.tensor([1.0], dtype=torch.float32)
+    source_buffer = source.view(torch.uint8)
+    used_bytes = calculate_aligned_size(source.nbytes)
+    payloads = [
+        ("handle-a", ["model.a"], used_bytes),
+        ("handle-b", ["model.b"], used_bytes),
+        IPCProtocol.COMPLETE,
+    ]
+
+    class FakeSocket:
+        def __init__(self):
+            self.payloads = iter(payloads)
+            self.sent = []
+
+        def recv_pyobj(self):
+            return next(self.payloads)
+
+        def send(self, payload):
+            self.sent.append(payload)
+
+    class OwnedPreparer:
+        def __init__(self):
+            self.reset_calls = 0
+            self.process_calls = 0
+            self.finish_calls = 0
+
+        def reset(self):
+            self.reset_calls += 1
+
+        def process(self, weights):
+            self.process_calls += 1
+            return [(name, weight.clone()) for name, weight in weights]
+
+        def finish(self):
+            self.finish_calls += 1
+
+    preparer = OwnedPreparer()
+
+    def reload_weights(*, weights_iterator, is_checkpoint_format):
+        assert is_checkpoint_format is True
+        next(iter(weights_iterator))
+        raise RuntimeError("loader failed")
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.state_dict_info = {
+        "model.a": (source.shape, source.dtype),
+        "model.b": (source.shape, source.dtype),
+    }
+    ext.device = torch.device("cuda:0")
+    ext.zmq_socket = FakeSocket()
+    ext.model_runner = SimpleNamespace(reload_weights=reload_weights)
+    ext.maybe_init_zmq = lambda: None
+    ext._get_reload_weight_preparer = lambda: preparer
+    ext._weight_update_errors_are_fatal = lambda: True
+    ext._synchronize_before_ipc_data_ack = lambda: None
+
+    monkeypatch.setattr(
+        vllm_backend,
+        "rebuild_cuda_tensor_from_ipc",
+        lambda _handle, _device_index: source_buffer,
+    )
+
+    with pytest.raises(RuntimeError, match="loader failed"):
+        ext.update_weights_via_ipc_zmq()
+
+    assert ext.zmq_socket.sent == [IPCProtocol.ACK.value.encode()] * len(payloads)
+    assert preparer.reset_calls == 1
+    assert preparer.process_calls == 1
+    assert preparer.finish_calls == 0
+
+
+@pytest.mark.vllm
+def test_native_ipc_reload_acks_complete_after_preparer_finish_failure(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.policy.utils import IPCProtocol, calculate_aligned_size
+
+    source = torch.tensor([1.0], dtype=torch.float32)
+    source_buffer = source.view(torch.uint8)
+    used_bytes = calculate_aligned_size(source.nbytes)
+
+    class FakeSocket:
+        def __init__(self):
+            self.payloads = iter(
+                [
+                    ("handle", ["model.weight"], used_bytes),
+                    IPCProtocol.COMPLETE,
+                ]
+            )
+            self.sent = []
+
+        def recv_pyobj(self):
+            return next(self.payloads)
+
+        def send(self, payload):
+            self.sent.append(payload)
+
+    class FailingPreparer:
+        def reset(self):
+            pass
+
+        def process(self, weights):
+            return [(name, weight.clone()) for name, weight in weights]
+
+        def finish(self):
+            raise RuntimeError("unpaired projection")
+
+    def reload_weights(*, weights_iterator, is_checkpoint_format):
+        assert is_checkpoint_format is True
+        list(weights_iterator)
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.state_dict_info = {
+        "model.weight": (source.shape, source.dtype),
+    }
+    ext.device = torch.device("cuda:0")
+    ext.zmq_socket = FakeSocket()
+    ext.model_runner = SimpleNamespace(reload_weights=reload_weights)
+    ext.maybe_init_zmq = lambda: None
+    ext._get_reload_weight_preparer = lambda: FailingPreparer()
+    ext._weight_update_errors_are_fatal = lambda: True
+    ext._synchronize_before_ipc_data_ack = lambda: None
+
+    monkeypatch.setattr(
+        vllm_backend,
+        "rebuild_cuda_tensor_from_ipc",
+        lambda _handle, _device_index: source_buffer,
+    )
+
+    with pytest.raises(RuntimeError, match="unpaired projection"):
+        ext.update_weights_via_ipc_zmq()
+
+    assert ext.zmq_socket.sent == [IPCProtocol.ACK.value.encode()] * 2
+
+
+@pytest.mark.vllm
+def test_native_ipc_reload_acks_incomplete_manifest_error():
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.policy.utils import IPCProtocol
+
+    class FakeSocket:
+        def __init__(self):
+            self.sent = []
+
+        def recv_pyobj(self):
+            return IPCProtocol.COMPLETE
+
+        def send(self, payload):
+            self.sent.append(payload)
+
+    preparer = MagicMock()
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.state_dict_info = {"model.weight": (torch.Size([1]), torch.float32)}
+    ext.device = torch.device("cuda:0")
+    ext.zmq_socket = FakeSocket()
+    ext.model_runner = SimpleNamespace(
+        reload_weights=lambda **kwargs: list(kwargs["weights_iterator"])
+    )
+    ext.maybe_init_zmq = lambda: None
+    ext._get_reload_weight_preparer = lambda: preparer
+    ext._weight_update_errors_are_fatal = lambda: True
+
+    with pytest.raises(vllm_backend.IPCWeightManifestError, match="missing keys"):
+        ext.update_weights_via_ipc_zmq()
+
+    preparer.finish.assert_not_called()
+    assert ext.zmq_socket.sent == [IPCProtocol.ACK.value.encode()]
+
+
+@pytest.mark.vllm
+def test_native_ipc_reload_drains_sender_when_loader_returns_early():
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.policy.utils import IPCProtocol
+
+    payloads = [
+        ("handle-a", ["model.a"], 4),
+        ("handle-b", ["model.b"], 4),
+        IPCProtocol.COMPLETE,
+    ]
+
+    class FakeSocket:
+        def __init__(self):
+            self.payloads = iter(payloads)
+            self.sent = []
+
+        def recv_pyobj(self):
+            return next(self.payloads)
+
+        def send(self, payload):
+            self.sent.append(payload)
+
+    preparer = MagicMock()
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.state_dict_info = {
+        "model.a": (torch.Size([1]), torch.float32),
+        "model.b": (torch.Size([1]), torch.float32),
+    }
+    ext.device = torch.device("cuda:0")
+    ext.zmq_socket = FakeSocket()
+    ext.model_runner = SimpleNamespace(reload_weights=lambda **_kwargs: None)
+    ext.maybe_init_zmq = lambda: None
+    ext._get_reload_weight_preparer = lambda: preparer
+    ext._weight_update_errors_are_fatal = lambda: True
+
+    with pytest.raises(RuntimeError, match="before exhausting"):
+        ext.update_weights_via_ipc_zmq()
+
+    preparer.reset.assert_called_once_with()
+    preparer.process.assert_not_called()
+    preparer.finish.assert_not_called()
+    assert ext.zmq_socket.sent == [IPCProtocol.ACK.value.encode()] * len(payloads)
 
 
 @pytest.mark.vllm

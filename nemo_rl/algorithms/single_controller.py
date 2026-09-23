@@ -119,7 +119,11 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     prepare_snapshot_paths,
     prune_bootstrap_snapshots,
 )
-from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
+from nemo_rl.algorithms.single_controller_utils.setup import (
+    SingleControllerActorArgs,
+    _maybe_restore_native_data_plane_checkpoint,
+    _register_single_controller_partitions,
+)
 from nemo_rl.algorithms.single_controller_utils.utils import (
     aggregate_step_metrics,
     apply_message_level_advantage_penalties,
@@ -130,8 +134,19 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 )
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.multimodal_utils import present_multimodal_fields
-from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
+from nemo_rl.data_plane import (
+    DATA_PLANE_CHECKPOINT_SCHEMA_VERSION,
+    KVBatchMeta,
+)
+from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import (
+    configure_checkpoint_workers,
+)
 from nemo_rl.data_plane.async_utils import call_data_plane
+from nemo_rl.data_plane.observability import (
+    is_metrics_client,
+    log_step_metrics,
+    metrics_never_fail_the_step,
+)
 from nemo_rl.data_plane.schema import (
     DP_CALIB_INPUT_FIELDS,
     DP_TRAIN_FIELDS,
@@ -153,13 +168,17 @@ from nemo_rl.experience.rollout_recovery import (
     parse_rollout_recovery_state,
 )
 from nemo_rl.experience.route_plan import decode_route_plan
+from nemo_rl.models.generation.engine_supervisor import EngineSupervisor
 from nemo_rl.models.generation.fleet_health import ShardState
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.models.value.tq_value import TQValue
-from nemo_rl.utils.checkpoint import CheckpointManager, PathLike
+from nemo_rl.utils.checkpoint import (
+    CheckpointManager,
+    PathLike,
+)
 from nemo_rl.utils.logger import TELEMETRY_WALL_TIME_METRIC, Logger
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
@@ -172,6 +191,11 @@ Generation = Union[VllmGeneration, SGLangGeneration, MegatronGeneration]
 # Named `log` rather than `logger` to keep it distinct from the experiment
 # Logger this module also uses as `self._logger`.
 log = logging.getLogger(__name__)
+
+# How long teardown waits for an in-flight engine restart. Short, and not the restart's own
+# budget: at this point the run is over, so the only thing a completed restart buys is a
+# cleaner exit. Not configurable for the same reason.
+_SUPERVISOR_DRAIN_TIMEOUT_S = 30.0
 
 
 @dataclass(frozen=True)
@@ -329,6 +353,65 @@ class SingleControllerActor:
             reference_logprobs_required=self._reference_logprobs_required,
         )
         self._dp_client = actor_args.dp_client
+        if master_config.data_plane["backend"] == "mooncake_cpu":
+            if actor_args.last_checkpoint_path is not None or (
+                master_config.checkpointing["enabled"]
+                and master_config.checkpointing.get("save_data_plane")
+            ):
+                checkpoint_workers = list(
+                    actor_args.trainer_handle.worker_group.workers
+                )
+                if actor_args.value_handle is not None:
+                    checkpoint_workers.extend(
+                        actor_args.value_handle.worker_group.workers
+                    )
+                for teacher in (actor_args.teacher_worker_groups or {}).values():
+                    checkpoint_workers.extend(teacher.worker_group.workers)
+                if master_config.token_capture.enabled:
+                    generation_workers = actor_args.gen_handle.worker_group
+                    checkpoint_workers.extend(
+                        generation_workers.workers[index]
+                        for index in generation_workers.dp_leader_worker_indices
+                    )
+                checkpoint_workers.extend(actor_args.finalizer_actors)
+                # Reuse existing actor RPCs. This actor's local store is handled
+                # directly: __init__ cannot service an RPC back to itself.
+                configure_checkpoint_workers(checkpoint_workers)
+            # actor_args is fully deserialized before __init__, so this process's
+            # Mooncake client and memory segment are attached. Teachers were
+            # attached during driver setup; restore now sees the full topology.
+            data_plane_load_started = time.monotonic()
+            data_plane_checkpoint_metadata = (
+                _maybe_restore_native_data_plane_checkpoint(
+                    load_checkpoint=self._dp_client.load_checkpoint,
+                    last_checkpoint_path=actor_args.last_checkpoint_path,
+                    save_state=actor_args.save_state,
+                    partition_id=self._partition_id,
+                    sampler_name=master_config.async_rl.sampler.name,
+                    opd_full_teacher_checkpoints=(
+                        opd_module.opd_full_teacher_checkpoints_by_index(master_config)
+                    ),
+                )
+            )
+            if actor_args.rollout_checkpoint_load_metrics is not None:
+                actor_args.rollout_checkpoint_load_metrics["tq_load_seconds"] = (
+                    time.monotonic() - data_plane_load_started
+                )
+            # A restored controller already contains the partition schema.
+            # Re-warming it with float32 placeholders conflicts with restored
+            # fields such as int64 input_ids. Fresh Mooncake runs still need
+            # the warm-up before concurrent producers start.
+            if data_plane_checkpoint_metadata is None:
+                _register_single_controller_partitions(
+                    self._dp_client,
+                    master_config=master_config,
+                    partition_id=self._partition_id,
+                    include_multimodal_fields=(
+                        actor_args.partition_includes_multimodal_fields
+                    ),
+                )
+        else:
+            data_plane_checkpoint_metadata = actor_args.data_plane_checkpoint_metadata
         self._gen: Generation = actor_args.gen_handle
         self._trainer: TQPolicy = actor_args.trainer_handle
         self._value: Optional[TQValue] = getattr(actor_args, "value_handle", None)
@@ -379,6 +462,19 @@ class SingleControllerActor:
             self._buffer.set_post_write_enricher(self._teacher_coordinator.enrich)
         else:
             self._teacher_coordinator = None
+        # Only with fleet health: without a ledger nothing ever reaches DEAD, so there
+        # is nothing for a supervisor to restart.
+        _fleet_health_cfg = master_config.async_rl.generation_fleet_health
+        self._engine_supervisor = (
+            EngineSupervisor(
+                generation=self._gen,
+                monitor=self._gen_fleet,
+                restart_timeout_s=_fleet_health_cfg.restart_timeout_s,
+                restart_backoff_s=_fleet_health_cfg.restart_backoff_s,
+            )
+            if self._gen_fleet is not None and _fleet_health_cfg.restart_dead_shards
+            else None
+        )
 
         # Built here, not on the driver: Logger backends (wandb/tb/...) hold
         # _thread.lock that Ray can't cloudpickle into the actor.
@@ -416,7 +512,7 @@ class SingleControllerActor:
         self._save_state: GRPOSaveState = actor_args.save_state
         self._last_checkpoint_path: Optional[str] = actor_args.last_checkpoint_path
         self._data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = (
-            actor_args.data_plane_checkpoint_metadata
+            data_plane_checkpoint_metadata
         )
         self._rollout_checkpoint_load_metrics = (
             actor_args.rollout_checkpoint_load_metrics
@@ -690,6 +786,15 @@ class SingleControllerActor:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            if self._engine_supervisor is not None:
+                # Not in `tasks`: the supervisor creates a task per restart, on demand, so
+                # there is nothing to cancel in that list. Without this an in-flight
+                # restart at shutdown is simply abandoned mid-way. Bounded, because the
+                # thread underneath cannot be cancelled -- giving up is what lets the
+                # process exit, and the thread being a daemon is what makes that safe.
+                await self._engine_supervisor.drain(
+                    timeout_s=_SUPERVISOR_DRAIN_TIMEOUT_S
+                )
             for actor in self._finalizer_actors:
                 try:
                     ray.kill(actor, no_restart=True)
@@ -1446,6 +1551,15 @@ class SingleControllerActor:
             metadata["rollout_recovery_group_count"] = rollout_recovery_group_count
         elif rollout_recovery_group_count is not None:
             raise ValueError("rollout recovery group count requires a payload hash")
+        if self._teacher_coordinator is not None:
+            # The rows in this checkpoint are tagged with a teacher_index each;
+            # record what those indices meant so a restore can reject a config
+            # that would renumber them.
+            teacher_checkpoints = (
+                self._teacher_coordinator.teacher_checkpoints_by_index()
+            )
+            if teacher_checkpoints is not None:
+                metadata["opd_full_teacher_checkpoints"] = teacher_checkpoints
         started = time.monotonic()
         print(f"data-plane checkpoint save started: {checkpoint_dir}", flush=True)
         try:
@@ -1723,6 +1837,39 @@ class SingleControllerActor:
                     errors.append(cleanup_error)
         if errors:
             raise BaseExceptionGroup("post-train DataPlane cleanup failed", errors)
+
+    def _log_data_plane_metrics(self, total_step_time: float) -> None:
+        """Log this step's data-plane cost. Never raises.
+
+        On by default, so this runs every step of every recipe. Mirrors
+        ``grpo_sync._log_data_plane_metrics``.
+        """
+        with metrics_never_fail_the_step(self._train_steps):
+            self._log_data_plane_metrics_impl(total_step_time)
+
+    def _log_data_plane_metrics_impl(self, total_step_time: float) -> None:
+        """Log this step's data-plane cost. No-op unless observability is enabled.
+
+        The synchronous loop logs these series from ``_log_data_plane_metrics``
+        in ``grpo_sync``. Without the same call here the single-controller path
+        builds the metrics client, pays for its counters on every op, and emits
+        nothing -- the failure is silent, because an empty dashboard looks the
+        same as a data plane that cost nothing.
+
+        Driver scope only, and the prefix says so. This client issues the
+        advantage stage's get, the put that writes the advantages back, and
+        the post-train clear; the bulk traffic is
+        the trainer and generation workers' own clients, in their own
+        processes with their own counters, so ``comm_volume_mb`` here is well
+        under what the job actually moved. ``grpo_sync`` gets a cluster view by
+        fanning out over its policy worker group; this loop has no such group to
+        fan out over, so driver scope is all there is here.
+        """
+        if not is_metrics_client(self._dp_client):
+            return  # observability disabled -> plain adapter
+
+        metrics = self._dp_client.get_step_metrics(total_step_time)
+        log_step_metrics(self._logger, metrics, self._train_steps, "driver")
 
     @staticmethod
     def _group_ids_from_meta(meta: KVBatchMeta) -> list[str]:
@@ -2995,6 +3142,7 @@ class SingleControllerActor:
                         await self._save_checkpoint(
                             step_metrics,
                             is_policy_training_step=is_policy_training_step,
+                            is_final_checkpoint=is_last_step,
                         )
                     if defer_refit_for_save:
                         # The save is done; wake the engine unless the loop is about to exit.
@@ -3049,6 +3197,11 @@ class SingleControllerActor:
             self._logger.log_metrics(
                 step_metrics, step=self._train_steps, prefix="train"
             )
+            # Must precede the step_finished=True log below. That log commits
+            # the wandb step, and wandb silently discards anything logged
+            # against a step it has already committed -- no exception, no
+            # failed return, just an empty chart. grpo_sync had the same bug.
+            self._log_data_plane_metrics(total_time)
             # step_finished=True here since this is the final log of our current step.
             self._logger.log_metrics(
                 timing_metrics,
@@ -3112,11 +3265,12 @@ class SingleControllerActor:
             metrics["rollout/train_steps"] = float(self._train_steps)
             if self._gen_fleet is not None:
                 metrics.update(self._gen_fleet.as_metrics())
+            if self._engine_supervisor is not None:
+                metrics.update(self._engine_supervisor.as_metrics())
             if self._generation_router is not None:
                 # router/* counters are exactly what you want when a backend starts
-                # failing; computed since P2 landed but never published until now.
-                # Best-effort like the membership push: a router being recreated must
-                # not cost a metrics tick.
+                # failing. Best-effort like the membership push: a router being
+                # recreated must not cost a metrics tick.
                 try:
                     metrics.update(
                         await self._ray_get(self._generation_router.metrics.remote())
@@ -3185,6 +3339,12 @@ class SingleControllerActor:
         while True:
             await asyncio.sleep(interval_s)
             await self._probe_generation_fleet()
+            # Between probing and publishing: a shard condemned by the probe above starts
+            # restarting on this tick rather than the next, and moving to RESTARTING
+            # before the router push keeps a shard that is coming back out of the
+            # serving set.
+            if self._engine_supervisor is not None:
+                self._engine_supervisor.tick()
             # Both of these are best-effort: they talk to a max_restarts=-1 actor that
             # may be mid-recreation, and run() awaits this task and re-raises, so an
             # unguarded RayActorError here would end the training job over a push that
@@ -3226,15 +3386,29 @@ class SingleControllerActor:
             return
 
         fleet_cfg = self._async_cfg.generation_fleet_health
-        worker_group = self._gen.worker_group
 
         async def probe(shard_idx: int) -> None:
-            worker_idx = worker_group.get_dp_leader_worker_idx(shard_idx)
+            # By shard index, not by reaching through to the worker group: which worker
+            # leads a shard depends on the backend's layout, and doing that arithmetic
+            # here put a second copy of it in the control loop -- one that also assumed
+            # every backend has a `worker_group`, the assumption that broke the Dynamo
+            # lane. restart_shard already asks this way.
             try:
                 await asyncio.wait_for(
-                    self._ray_get(worker_group.workers[worker_idx].is_alive.remote()),
+                    self._ray_get(self._gen.shard_liveness_ref(shard_idx)),
                     timeout=fleet_cfg.probe_timeout_s,
                 )
+            except NotImplementedError as error:
+                # A backend that cannot be probed is a misconfiguration, not an unhealthy
+                # shard, and the two must not look alike. Recorded as a probe failure it
+                # condemns every shard within unhealthy_threshold ticks and ends the run
+                # as GenerationFleetExhausted -- a healthy fleet reported as a dead one.
+                raise RuntimeError(
+                    f"generation backend {type(self._gen).__name__} does not implement "
+                    "shard_liveness_ref, so async_rl.generation_fleet_health cannot probe "
+                    "it. Turn fleet health off for this backend, or implement the method "
+                    "over the backend's own worker group."
+                ) from error
             except RayActorError as error:
                 # Conclusive, unlike a timeout: Ray only reports this once the actor
                 # process is actually gone. Counting it as one more ambiguous failure
@@ -3319,7 +3493,25 @@ class SingleControllerActor:
                 continue
             if successes:
                 self._gen_fleet.report_success(shard_idx)
-            for _ in range(failures):
+            if failures:
+                # ONE failure event per backend per window, not one per request.
+                #
+                # The two halves of the same drain used to be counted differently:
+                # successes aggregated, failures replayed one by one. Requests to a
+                # backend are concurrent, so a single brief outage fails everything in
+                # flight at once -- and unhealthy_threshold=3 then condemned a shard on
+                # one tick, from evidence that is one observation, not three. On a
+                # single-shard fleet that ends the run, because min_healthy_shards=1 and
+                # the router has nothing left to route to.
+                #
+                # The threshold is calibrated against the probe path, where a tick really
+                # is an independent observation. Draining on the same clock makes this
+                # streak mean the same thing: three consecutive *windows* with failures
+                # and no success, which at the default probe_interval_s is the same ~15s
+                # a wedged engine already takes to be condemned by probes. A genuinely
+                # wedged shard produces no successes, so nothing clears its streak and it
+                # still dies on schedule; a shard that drops one burst and recovers is
+                # SUSPECT, keeps serving, and clears the streak on its next success.
                 self._gen_fleet.report_failure(
                     shard_idx,
                     RuntimeError(f"router: {failures} failed request(s) to {url}"),
@@ -3400,7 +3592,7 @@ class SingleControllerActor:
         """Mark the span where the serving set is deliberately empty.
 
         _recover_from_failed_refit marks every serving shard partial, so they all go
-        STALE and serving_shards() is empty until _promote_refit_shards runs -- after a
+        STALE and serving_shards() is empty until _record_refit_landed runs -- after a
         rebuild and a full retry refit, both of which await and yield the event loop.
 
         _stall_watchdog_pump is a task on that same loop and calls raise_if_exhausted()
@@ -3513,25 +3705,76 @@ class SingleControllerActor:
                     "needed to attribute the failure)."
                 ) from failure
 
-    def _promote_refit_shards(self) -> None:
-        """Return shards holding current weights to the serving set.
+    def _refit_participants(self) -> set[int]:
+        """Shards eligible to receive this refit's weights, as of right now.
 
-        The exit from STALE, and the reason marking partial weights is safe rather than
-        terminal. An aborted refit leaves every engine that was receiving with a mix of
-        old and new weights, so they are pulled out of service -- but nothing else moves
-        a shard out of STALE, so without this the recovery would succeed and then leave
-        the fleet empty, which ``raise_if_exhausted`` would end the run over. A worse
+        Captured at the moment membership settles rather than read at promotion time,
+        because a restart finishing mid-transfer turns its shard STALE -- which is not
+        absent -- and the communicator was already built without it.
+
+        Derived from the fleet rather than from the transport's membership so it holds for
+        backends that own no membership at all: a shard that is absent when the transfer
+        starts receives nothing either way.
+        """
+        if self._gen_fleet is None:
+            return set()
+        absent = set(self._gen_fleet.absent_shards())
+        return {
+            health.dp_shard_idx
+            for health in self._gen_fleet.snapshot()
+            if health.dp_shard_idx not in absent
+        }
+
+    def _record_refit_landed(self, participants: set[int]) -> None:
+        """Write down what each shard now holds, and return the STALE ones to service.
+
+        Two things, because they are the same fact seen from two sides: this refit reached
+        these shards. The version is what they hold; promotion is what that entitles them
+        to.
+
+        Promotion is the exit from STALE, and the reason marking partial weights is safe
+        rather than terminal. An aborted refit leaves every engine that was receiving with
+        a mix of old and new weights, so they are pulled out of service -- but nothing else
+        moves a shard out of STALE, so without this the recovery would succeed and then
+        leave the fleet empty, which ``raise_if_exhausted`` would end the run over. A worse
         failure than the one being recovered from, and reached only on the recovery path.
 
-        Only STALE shards are promoted. A SUSPECT shard also took part in the refit, but
-        it is failing probes for its own reasons and promoting it here would reset the
-        failure count that is supposed to condemn it.
+        Only STALE shards are promoted. A SUSPECT shard also took part in the refit, but it
+        is failing probes for its own reasons and promoting it here would reset the failure
+        count that is supposed to condemn it. It is still stamped: what weights an engine
+        holds is not a verdict on how well it is serving them.
+
+        And only STALE shards that were IN the refit. Asking "is this shard STALE?" alone
+        was correct until restart existed, because nothing could turn a shard STALE while a
+        refit was in flight. A restart can: it takes minutes, nothing blocks it, and
+        mark_loaded moves the shard DEAD -> STALE at whatever moment the reload lands. A
+        shard absent when membership settled received no weights from this transfer, so
+        promoting it would return it to service holding the checkpoint it read off disk --
+        the outcome this module's docstring exists to prevent. It stays STALE, is not
+        absent, and the next refit picks it up.
+
+        The stamp used to live inside ``report_refit`` alone, which meant it was only ever
+        written by a promotion. Nothing turns a shard STALE on a refit that succeeds, so a
+        fleet that has never lost a shard reports version 0 for the life of the run however
+        many refits it received -- and a metric that reads 0 on every healthy shard is one
+        nobody watches, which is the part that matters: this is the reading that would catch
+        the next bug of this shape.
+
+        Args:
+            participants: shards eligible for this refit, from :meth:`_refit_participants`
+                at the point membership settled.
         """
         if self._gen_fleet is None:
             return
         for health in self._gen_fleet.snapshot():
+            if health.dp_shard_idx not in participants:
+                continue
             if health.state is ShardState.STALE:
                 self._gen_fleet.report_refit(
+                    health.dp_shard_idx, weight_version=self._trainer_version
+                )
+            else:
+                self._gen_fleet.record_weight_version(
                     health.dp_shard_idx, weight_version=self._trainer_version
                 )
 
@@ -4213,12 +4456,14 @@ class SingleControllerActor:
         step_metrics: dict[str, Any],
         *,
         is_policy_training_step: bool,
+        is_final_checkpoint: bool,
     ) -> None:
         """Serialize full and rollout-only checkpoint publication."""
         async with self._checkpoint_save_lock:
             await self._save_checkpoint_impl(
                 step_metrics,
                 is_policy_training_step=is_policy_training_step,
+                is_final_checkpoint=is_final_checkpoint,
             )
 
     async def _save_checkpoint_impl(
@@ -4226,6 +4471,7 @@ class SingleControllerActor:
         step_metrics: dict[str, Any],
         *,
         is_policy_training_step: bool,
+        is_final_checkpoint: bool,
     ) -> None:
         """Write a full checkpoint for the just-finished train step.
 
@@ -4376,7 +4622,7 @@ class SingleControllerActor:
                 if self._checkpointer.save_optimizer
                 else None,
                 tokenizer_path=os.path.join(checkpoint_path, "value", "tokenizer"),
-                checkpointing_cfg=self._master_config.checkpointing,
+                is_final_checkpoint=is_final_checkpoint,
             )
             await asyncio.to_thread(self._value.finish_training)
             # Also covers a warmup step, which never ran prepare_for_training in
@@ -4397,7 +4643,7 @@ class SingleControllerActor:
             if self._checkpointer.save_optimizer and is_policy_training_step
             else None,
             tokenizer_path=os.path.join(checkpoint_path, "policy", "tokenizer"),
-            checkpointing_cfg=self._master_config.checkpointing,
+            is_final_checkpoint=is_final_checkpoint,
         )
 
         await asyncio.to_thread(
@@ -4526,8 +4772,9 @@ class SingleControllerActor:
         Flow:
           1. _rollout_permitted.clear()  — no new dispatches
           2. Optionally calibrate FP8 KV-cache scales.
-          3. weight_synchronizer.sync_weights(kv_scales=...)
-          4. _rollout_permitted.set()   — resume
+          3. Materialize deferred policy parameter all-gathers.
+          4. weight_synchronizer.sync_weights(kv_scales=...)
+          5. _rollout_permitted.set()   — resume
 
         Args:
             calibration_data: Optional data used to calibrate FP8 KV-cache
@@ -4580,6 +4827,16 @@ class SingleControllerActor:
         # set comparison in the common case -- it used to be a full rebuild on every call
         # once a shard was gone, because absent_shards() never empties again.
         await self._reconcile_refit_membership()
+        # Read once, here, because the answer changes underneath a refit. A restart takes
+        # minutes and nothing blocks it, so mark_loaded can turn a shard STALE mid-transfer
+        # -- and STALE is not absent, so asking again at promotion time would include a
+        # shard the communicator was deliberately built without.
+        participants = self._refit_participants()
+
+        # Recovery may repeat the transport, but an optimizer update only needs
+        # one parameter all-gather, so keep this outside the retry block.
+        with self._timer.time("prepare_for_generation/sync_policy_params"):
+            await asyncio.to_thread(self._trainer.sync_params_before_refit)
 
         try:
             await self._sync_weights_within(kv_scales, "first")
@@ -4609,19 +4866,24 @@ class SingleControllerActor:
                 raise
             with self._recovery_window():
                 await self._recover_from_failed_refit(failure)
+                # Re-read: the recovery condemns the silent participant and rebuilds over
+                # the survivors, so the retry's membership is not the first attempt's. This
+                # is the likelier of the two windows -- the shard is restarting precisely
+                # because this refit just failed.
+                participants = self._refit_participants()
                 # Once only: a second failure is a real fault, not a membership problem,
                 # and retrying forever would recreate the wedge this exists to remove.
                 await self._sync_weights_within(kv_scales, "retry")
                 # Inside the window: this is what refills the serving set, so releasing
                 # the flag before it runs would reopen the gap it exists to close.
-                self._promote_refit_shards()
+                self._record_refit_landed(participants)
         else:
             # A completed refit is what makes an engine's weights current, so this is
             # where a shard pulled out of service for holding partial ones earns its way
             # back. else, not a trailing statement: the recovery path above already
             # promoted inside its window, and everything below this must still run on
             # both paths.
-            self._promote_refit_shards()
+            self._record_refit_landed(participants)
         if self._async_cfg.recompute_kv_cache_after_weight_updates:
             # to_thread, like every other call into the workers here. Run directly on
             # the loop this is a blocking Ray call, and a wedged generation worker would

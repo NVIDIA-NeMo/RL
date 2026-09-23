@@ -318,8 +318,8 @@ class RolloutReassembler:
             return rejected(f"rollout_failed:{parsed.failure_reason}", staging_keys)
         if parsed.capture_poisoned:
             return rejected("capture_poisoned", staging_keys)
-        if not parsed.manifest:
-            return rejected("empty_manifest", staging_keys)
+        # An unpoisoned receipt must name a terminal call that is in the manifest
+        # (RolloutReceipt validators), so a valid receipt here is never empty.
         if len(set(staging_keys)) != len(staging_keys):
             return rejected(
                 "duplicate_staging_key",
