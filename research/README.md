@@ -84,3 +84,5 @@ It should be noted that because we use `uv`, even if we must disable tests becau
 ## Projects
 
 - **[template_project](template_project/)** - A starting point for new research projects with example code and test structure
+
+- **[flow_grpo](flow_grpo/)** - Experimental Flow-GRPO image diffusion training with Automodel and Diffusers
