@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +21,18 @@ from nemo_rl.models.generation.megatron.megatron_worker import (  # noqa: E402
 )
 
 pytestmark = pytest.mark.nemo_gym
+
+
+@pytest.fixture
+def inference_loop():
+    """Run an asyncio loop on a background thread, mirroring the worker's setup."""
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    yield loop, thread
+    loop.call_soon_threadsafe(loop.stop)
+    thread.join(timeout=5)
+    loop.close()
 
 
 class _WorkerGroup:
@@ -88,7 +102,7 @@ def test_worker_rejects_invalid_rollout_weight_versions(monkeypatch, version) ->
 
 
 def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
-    monkeypatch,
+    monkeypatch, inference_loop
 ):
     installed_sinks = []
     installed_sources = []
@@ -131,9 +145,13 @@ def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
         prompt_preparer=None,
         is_mp_coordinator=True,
     )
+    loop, loop_thread = inference_loop
+    worker._inference_loop = loop
     epochs = []
     worker.inference_client = SimpleNamespace(
-        set_generation_epoch=lambda version: epochs.append(version)
+        set_generation_epoch=lambda version: epochs.append(
+            (version, threading.current_thread())
+        )
     )
     worker._token_capture_enabled = False
     worker._request_payload_stager = None
@@ -151,7 +169,9 @@ def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
     assert installed_sources == [("dp", "rollout_staging")]
 
     worker.set_rollout_weight_version(7)
-    assert epochs == [7]
+    # The client's ZMQ socket is not thread safe and its listener task runs on
+    # the inference loop thread, so the epoch send must happen on that thread.
+    assert epochs == [(7, loop_thread)]
 
     follower = object.__new__(MegatronGenerationMixin)
     follower.dynamic_inference_engine = SimpleNamespace(
