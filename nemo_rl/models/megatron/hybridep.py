@@ -146,6 +146,8 @@ def pad_packed_seq_for_hybridep(
     pad_packed_seq_to_multiple_of: int,
     cp_rank: int,
     cp_size: int,
+    *,
+    group_aligned: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, PackedSeqParams, torch.Tensor]:
     """Align packed inputs once, before model collectives can overlap."""
     local_seq_len = input_ids_cp_sharded.shape[1]
@@ -153,11 +155,14 @@ def pad_packed_seq_for_hybridep(
         pad_packed_seq_to_multiple_of,
         cp_size,
     )
-    target_seq_len = _get_hybridep_aligned_seq_len(
-        local_seq_len,
-        local_pad_multiple,
-        input_ids_cp_sharded.device,
-    )
+    if group_aligned:
+        target_seq_len = _round_up_to_multiple(local_seq_len, local_pad_multiple)
+    else:
+        target_seq_len = _get_hybridep_aligned_seq_len(
+            local_seq_len,
+            local_pad_multiple,
+            input_ids_cp_sharded.device,
+        )
 
     if target_seq_len == local_seq_len:
         return input_ids, input_ids_cp_sharded, packed_seq_params, cu_seqlens_padded

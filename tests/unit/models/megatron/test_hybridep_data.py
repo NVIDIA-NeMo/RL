@@ -313,6 +313,47 @@ def test_hybridep_prepadding_returns_original_objects_when_already_aligned() -> 
 
 
 @pytest.mark.mcore
+def test_dynamic_cp_hybridep_alignment_skips_group_reduction() -> None:
+    from megatron.core.packed_seq_params import PackedSeqParams
+
+    from nemo_rl.models.megatron import hybridep
+
+    input_ids = torch.arange(1, 13).view(1, 12)
+    cu_seqlens_padded = torch.tensor([0, 12], dtype=torch.int32)
+    packed_seq_params = PackedSeqParams(
+        cu_seqlens_q=cu_seqlens_padded,
+        cu_seqlens_kv=cu_seqlens_padded,
+        cu_seqlens_q_padded=cu_seqlens_padded,
+        cu_seqlens_kv_padded=cu_seqlens_padded,
+        max_seqlen_q=12,
+        max_seqlen_kv=12,
+        qkv_format="thd",
+        total_tokens=12,
+    )
+
+    with patch.object(
+        hybridep.torch.distributed,
+        "all_reduce",
+        side_effect=AssertionError("planner-aligned input performed a reduction"),
+    ):
+        result = hybridep.pad_packed_seq_for_hybridep(
+            input_ids=input_ids,
+            input_ids_cp_sharded=input_ids,
+            packed_seq_params=packed_seq_params,
+            cu_seqlens_padded=cu_seqlens_padded,
+            pad_packed_seq_to_multiple_of=8,
+            cp_rank=0,
+            cp_size=1,
+            group_aligned=True,
+        )
+
+    assert result[0].shape == (1, 16)
+    assert result[1].shape == (1, 16)
+    assert result[2].total_tokens == 16
+    assert torch.equal(result[3], torch.tensor([0, 16]))
+
+
+@pytest.mark.mcore
 @patch("nemo_rl.models.megatron.data.get_context_parallel_rank", return_value=0)
 @patch("nemo_rl.models.megatron.data.get_context_parallel_world_size", return_value=2)
 @patch(

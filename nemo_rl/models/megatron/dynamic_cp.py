@@ -26,6 +26,7 @@ _DYNAMIC_TP_CP_GROUPS: dict[int, Any] = {}
 _ROUTER_CONFIG_BASELINES: dict[int, tuple[Any, Any]] = {}
 _DYNAMIC_MTP_METRICS: dict[str, torch.Tensor] = {}
 _ACTIVE_BIND_TARGETS: dict[int, "_BindTargets"] = {}
+_ACTIVE_BIND_SIGNATURES: dict[int, tuple[int, int, int, bool]] = {}
 
 
 @dataclass(frozen=True)
@@ -351,24 +352,30 @@ def get_dynamic_mtp_metrics(
     if "loss_sums" not in _DYNAMIC_MTP_METRICS:
         return {}
     try:
-        for value in _DYNAMIC_MTP_METRICS.values():
-            torch.distributed.all_reduce(
-                value, op=torch.distributed.ReduceOp.SUM, group=parallel_group
+        totals = torch.stack(
+            tuple(
+                _DYNAMIC_MTP_METRICS[name]
+                for name in (
+                    "loss_sums",
+                    "loss_token_counts",
+                    "correct_values",
+                    "total_values",
+                )
             )
-        losses = _DYNAMIC_MTP_METRICS["loss_sums"] / _DYNAMIC_MTP_METRICS[
-            "loss_token_counts"
-        ].clamp(min=1)
-        acceptance = (
-            _DYNAMIC_MTP_METRICS["correct_values"]
-            / _DYNAMIC_MTP_METRICS["total_values"].clamp(min=1)
-            * 100.0
         )
-        metrics: dict[str, float] = {}
-        for index in range(losses.numel()):
-            metrics[f"mtp_{index + 1}_loss"] = float(losses[index].item())
-            metrics[f"mtp_{index + 1}_acceptance_rate"] = float(
-                acceptance[index].item()
+        if parallel_group.size() > 1:
+            torch.distributed.all_reduce(
+                totals, op=torch.distributed.ReduceOp.SUM, group=parallel_group
             )
+        losses = totals[0] / totals[1].clamp(min=1)
+        acceptance = totals[2] / totals[3].clamp(min=1) * 100.0
+        loss_values, acceptance_values = torch.stack((losses, acceptance)).tolist()
+        metrics: dict[str, float] = {}
+        for index, (loss, rate) in enumerate(
+            zip(loss_values, acceptance_values, strict=True)
+        ):
+            metrics[f"mtp_{index + 1}_loss"] = float(loss)
+            metrics[f"mtp_{index + 1}_acceptance_rate"] = float(rate)
         return metrics
     finally:
         _DYNAMIC_MTP_METRICS.clear()
@@ -594,9 +601,9 @@ def _dynamic_attach_and_log_load_balancing_loss(
 
     MCore's pinned implementation multiplies by ``local_tokens *
     tp_cp_group.size()``.  That is only equal to the task token count for
-    equally populated fixed shards.  The router pre-hook has already reduced
-    the current mask over the runtime TP*CP group, so attach that exact count.
-    Logging intentionally retains the unscaled aux value.
+    equally populated fixed shards.  The task setup (or the MTP mask hook) has
+    already reduced the current mask over the runtime TP*CP group, so attach
+    that exact count. Logging intentionally retains the unscaled aux value.
     """
     from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
     from megatron.core.transformer.moe.moe_utils import MoEAuxLossAutoScaler
@@ -628,15 +635,9 @@ def _dynamic_attach_and_log_load_balancing_loss(
     if self.calculate_per_token_loss:
         task_tokens = getattr(self, "_nemo_dynamic_aux_scale_tokens", None)
         if task_tokens is None:
-            local_tokens = (
-                valid_token_count
-                if valid_token_count is not None
-                else activation.shape[0]
+            raise RuntimeError(
+                "Dynamic CP MoE token scaling was not prepared before router forward"
             )
-            task_tokens = (
-                torch.as_tensor(local_tokens, device=activation.device).detach().clone()
-            )
-            torch.distributed.all_reduce(task_tokens, group=self.tp_cp_group)
         return MoEAuxLossAutoScaler.apply(activation, aux_loss * task_tokens)
     return MoEAuxLossAutoScaler.apply(activation, aux_loss)
 
@@ -663,6 +664,8 @@ def _patch_hybrid_mtp_padding_masks(
     the mask received by HybridModel already has the ordering needed by MTP.
     """
     padding_masks: dict[int, torch.Tensor | None] = {}
+    mtp_token_counts: dict[int, tuple[torch.Tensor, Any, torch.Tensor]] = {}
+    active_task_marker: object | None = None
     handles: list[Any] = []
     modules = modules or tuple(model.modules())
     mtp_blocks: list[torch.nn.Module] = []
@@ -722,10 +725,12 @@ def _patch_hybrid_mtp_padding_masks(
     def prepare_router_padding_mask(
         module: Router, args: tuple[Any, ...], kwargs: dict[str, Any]
     ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        nonlocal active_task_marker
         padding_mask = kwargs.get("padding_mask")
         if padding_mask is None and len(args) > 1:
             padding_mask = args[1]
-        if padding_mask is not None and id(module) in mtp_router_ids:
+        validity_mask = padding_mask
+        if padding_mask is not None:
             padding_mask = ~padding_mask.to(dtype=torch.bool)
             if len(args) > 1:
                 args = (args[0], padding_mask, *args[2:])
@@ -735,18 +740,44 @@ def _patch_hybrid_mtp_padding_masks(
         if (
             module.training
             and torch.is_grad_enabled()
-            and getattr(module.config, "calculate_per_token_loss", False)
+            and getattr(module, "calculate_per_token_loss", False)
             and _has_positive_coefficient(module.config.moe_aux_loss_coeff)
         ):
-            if padding_mask is None:
+            if validity_mask is None:
                 raise ValueError(
                     "Dynamic CP MoE aux loss requires a packed padding mask"
                 )
-            group_tokens = (~padding_mask).sum().detach().clone()
-            torch.distributed.all_reduce(group_tokens, group=module.tp_cp_group)
+            task_marker = getattr(module, "_nemo_dynamic_moe_task_marker", None)
+            if task_marker is None:
+                raise RuntimeError(
+                    "Dynamic CP MoE token scaling was not configured for this task"
+                )
+            if task_marker is not active_task_marker:
+                mtp_token_counts.clear()
+                active_task_marker = task_marker
+
+            cache_key = id(validity_mask)
+            cached = mtp_token_counts.get(cache_key)
+            if (
+                cached is not None
+                and cached[0] is validity_mask
+                and cached[1] is module.tp_cp_group
+            ):
+                group_tokens = cached[2]
+            else:
+                group_tokens = validity_mask.sum().detach()
+                if module.tp_cp_group.size() > 1:
+                    torch.distributed.all_reduce(
+                        group_tokens,
+                        op=torch.distributed.ReduceOp.SUM,
+                        group=module.tp_cp_group,
+                    )
+                mtp_token_counts[cache_key] = (
+                    validity_mask,
+                    module.tp_cp_group,
+                    group_tokens,
+                )
             module._nemo_dynamic_aux_scale_tokens = group_tokens
-        else:
-            module._nemo_dynamic_aux_scale_tokens = None
         return args, kwargs
 
     patched_classes: list[tuple[type[Any], bool, Any]] = []
@@ -773,7 +804,7 @@ def _patch_hybrid_mtp_padding_masks(
             mtp.register_forward_pre_hook(prepare_mtp_validity_mask, with_kwargs=True)
         )
     for module in modules:
-        if isinstance(module, Router):
+        if isinstance(module, Router) and id(module) in mtp_router_ids:
             handles.append(
                 module.register_forward_pre_hook(
                     prepare_router_padding_mask, with_kwargs=True
@@ -789,6 +820,10 @@ def _patch_hybrid_mtp_padding_masks(
                 module, "_nemo_dynamic_aux_scale_tokens"
             ):
                 del module._nemo_dynamic_aux_scale_tokens
+            if isinstance(module, Router) and hasattr(
+                module, "_nemo_dynamic_moe_task_marker"
+            ):
+                del module._nemo_dynamic_moe_task_marker
         for router_class, had_direct_method, original_method in patched_classes:
             if had_direct_method:
                 router_class.attach_and_log_load_balancing_loss = original_method
@@ -882,6 +917,7 @@ def preserve_attention_cp_groups(model: torch.nn.Module) -> Iterator[None]:
                 raise
     finally:
         _ACTIVE_BIND_TARGETS.pop(model_id, None)
+        _ACTIVE_BIND_SIGNATURES.pop(model_id, None)
         for module, collection in saved_collections:
             module.pg_collection = collection
         for module, cp in saved_mamba:
@@ -948,14 +984,7 @@ def _has_positive_coefficient(value: Any) -> bool:
 def configure_dynamic_moe_loss_scaling(
     model: torch.nn.Module, padding_mask: torch.Tensor | None
 ) -> None:
-    """Validate inputs for the temporary exact-token router attachment.
-
-    ``preserve_attention_cp_groups`` installs a router pre-hook which reduces
-    the current mask and an attachment shim which uses that exact TP*CP token
-    count.  Keeping the check here fails before entering a router collective if
-    a caller forgot the packed padding mask.  The worker's ordinary
-    ``1/global_valid_tokens`` MoE scale is therefore sufficient.
-    """
+    """Reduce a task token count once and share it across all MoE routers."""
     routers = _bind_targets(model).routers
     if not routers:
         return
@@ -963,7 +992,8 @@ def configure_dynamic_moe_loss_scaling(
     if not model.training or not torch.is_grad_enabled():
         return
     if not any(
-        _has_positive_coefficient(router.config.moe_aux_loss_coeff)
+        getattr(router, "calculate_per_token_loss", False)
+        and _has_positive_coefficient(router.config.moe_aux_loss_coeff)
         for router in routers
     ):
         return
@@ -972,6 +1002,19 @@ def configure_dynamic_moe_loss_scaling(
 
     if any(router.tp_cp_group is not routers[0].tp_cp_group for router in routers[1:]):
         raise ValueError("Dynamic CP routers disagree on the active TP*CP group")
+
+    task_marker = object()
+    task_tokens = (~padding_mask.to(dtype=torch.bool)).sum().detach()
+    tp_cp_group = routers[0].tp_cp_group
+    if tp_cp_group.size() > 1:
+        torch.distributed.all_reduce(
+            task_tokens,
+            op=torch.distributed.ReduceOp.SUM,
+            group=tp_cp_group,
+        )
+    for router in routers:
+        router._nemo_dynamic_moe_task_marker = task_marker
+        router._nemo_dynamic_aux_scale_tokens = task_tokens
 
 
 def bind_attention_cp_group(model: torch.nn.Module, packed_seq_params: Any) -> Any:
@@ -1001,39 +1044,48 @@ def bind_attention_cp_group(model: torch.nn.Module, packed_seq_params: Any) -> A
         raise ValueError("Dynamic MoE TP*CP group has the wrong size")
     padding_only = bool(getattr(packed_seq_params, "dynamic_cp_padding_only", False))
     targets = _bind_targets(model)
-    for module in targets.pg_collections:
-        module.pg_collection.cp = group
-        if hasattr(module.pg_collection, "tp_cp"):
-            module.pg_collection.tp_cp = tp_cp_group
-    for module in targets.direct_groups:
-        module.cp_group = group
-        if hasattr(module, "tp_cp_group"):
+    model_id = id(model)
+    binding_signature = (context.size, id(group), id(tp_cp_group), padding_only)
+    binding_cache_active = model_id in _ACTIVE_BIND_TARGETS
+    if (
+        not binding_cache_active
+        or _ACTIVE_BIND_SIGNATURES.get(model_id) != binding_signature
+    ):
+        for module in targets.pg_collections:
+            module.pg_collection.cp = group
+            if hasattr(module.pg_collection, "tp_cp"):
+                module.pg_collection.tp_cp = tp_cp_group
+        for module in targets.direct_groups:
+            module.cp_group = group
+            if hasattr(module, "tp_cp_group"):
+                module.tp_cp_group = tp_cp_group
+        for module in targets.hybrid_stacks:
+            _bind_hybrid_stack_layout(module, group=group, tp_cp_group=tp_cp_group)
+        for module in targets.routers:
+            module.cp_group = group
             module.tp_cp_group = tp_cp_group
-    for module in targets.hybrid_stacks:
-        _bind_hybrid_stack_layout(module, group=group, tp_cp_group=tp_cp_group)
-    for module in targets.routers:
-        module.cp_group = group
-        module.tp_cp_group = tp_cp_group
-        _bind_router_config(module, padding_only=padding_only)
-    for module in targets.mamba_mixers:
-        _rebuild_mamba_cp(module, group)
-    for module in targets.gated_delta_products:
-        _rebuild_gdp_cp(module, group)
-    for module in targets.gated_delta_nets:
-        baseline_size = module.cp_size
-        baseline_split = getattr(module, "feat_dim_split", None)
-        module.cp_size = context.size
-        if baseline_split is not None:
-            scaled_split = []
-            for value in baseline_split:
-                numerator = value * baseline_size
-                if numerator % context.size:
-                    raise ValueError(
-                        "GatedDeltaNet projection dimensions are not divisible "
-                        f"by runtime CP={context.size}"
-                    )
-                scaled_split.append(numerator // context.size)
-            module.feat_dim_split = tuple(scaled_split)
+            _bind_router_config(module, padding_only=padding_only)
+        for module in targets.mamba_mixers:
+            _rebuild_mamba_cp(module, group)
+        for module in targets.gated_delta_products:
+            _rebuild_gdp_cp(module, group)
+        for module in targets.gated_delta_nets:
+            baseline_size = module.cp_size
+            baseline_split = getattr(module, "feat_dim_split", None)
+            module.cp_size = context.size
+            if baseline_split is not None:
+                scaled_split = []
+                for value in baseline_split:
+                    numerator = value * baseline_size
+                    if numerator % context.size:
+                        raise ValueError(
+                            "GatedDeltaNet projection dimensions are not divisible "
+                            f"by runtime CP={context.size}"
+                        )
+                    scaled_split.append(numerator // context.size)
+                module.feat_dim_split = tuple(scaled_split)
+        if binding_cache_active:
+            _ACTIVE_BIND_SIGNATURES[model_id] = binding_signature
     model_packed = copy(packed_seq_params)
     model_packed.cp_group = group
     return model_packed
@@ -1059,43 +1111,51 @@ def planned_microbatches(
         or domain.rank() != plan.lane
     ):
         raise ValueError("Ray's DP*CP lane map disagrees with initialized MCore groups")
+    expert_group = parallel_state.get_expert_tensor_and_model_parallel_group()
+    expert_ranks = set(torch.distributed.get_process_group_ranks(expert_group))
+    tp_size = parallel_state.get_tensor_model_parallel_world_size()
+    runtime_contexts: dict[tuple[int, int], RuntimeCPContext] = {}
     for group_index, rank_group in enumerate(step.groups):
         if not rank_group.assignments:
             raise ValueError("Every CP synchronization group needs one local task")
         for task_index, assignment in enumerate(rank_group.assignments):
             size = assignment.cp_size
-            group = (
-                parallel_state.get_hybrid_data_context_parallel_groups(group_size=size)
-                if size > 1
-                else None
-            )
-            rank = plan.lane - assignment.lane_start
-            if group is not None:
-                members = expected[assignment.lane_start : assignment.lane_start + size]
-                if (
-                    group.size() != size
-                    or group.rank() != rank
-                    or torch.distributed.get_process_group_ranks(group) != members
-                ):
-                    raise ValueError(
-                        "Active CP group disagrees with the driver's assignment"
+            context_key = (assignment.lane_start, size)
+            context = runtime_contexts.get(context_key)
+            if context is None:
+                group = (
+                    parallel_state.get_hybrid_data_context_parallel_groups(
+                        group_size=size
                     )
-            expert_group = parallel_state.get_expert_tensor_and_model_parallel_group()
-            tp_size = parallel_state.get_tensor_model_parallel_world_size()
-            task_ranks = {
-                base + offset
-                for base in plan.lane_ranks[
-                    assignment.lane_start : assignment.lane_start + size
-                ]
-                for offset in range(tp_size)
-            }
-            if not set(
-                torch.distributed.get_process_group_ranks(expert_group)
-            ).issubset(task_ranks):
-                raise ValueError(
-                    "Joint expert TP*EP group crosses dynamic CP task boundaries"
+                    if size > 1
+                    else None
                 )
-            context = RuntimeCPContext(size=size, rank=rank, group=group)
+                rank = plan.lane - assignment.lane_start
+                if group is not None:
+                    members = expected[
+                        assignment.lane_start : assignment.lane_start + size
+                    ]
+                    if (
+                        group.size() != size
+                        or group.rank() != rank
+                        or torch.distributed.get_process_group_ranks(group) != members
+                    ):
+                        raise ValueError(
+                            "Active CP group disagrees with the driver's assignment"
+                        )
+                task_ranks = {
+                    base + offset
+                    for base in plan.lane_ranks[
+                        assignment.lane_start : assignment.lane_start + size
+                    ]
+                    for offset in range(tp_size)
+                }
+                if not expert_ranks.issubset(task_ranks):
+                    raise ValueError(
+                        "Joint expert TP*EP group crosses dynamic CP task boundaries"
+                    )
+                context = RuntimeCPContext(size=size, rank=rank, group=group)
+                runtime_contexts[context_key] = context
             if assignment.sample_indices:
                 batch = data.select_indices(list(assignment.sample_indices)).to("cuda")
             else:

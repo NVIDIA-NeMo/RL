@@ -593,6 +593,9 @@ def process_microbatch(
                             pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
                             cp_rank=cp_rank,
                             cp_size=cp_size,
+                            # Dynamic CP's planner pads every task to the same
+                            # HybridEP-aligned length on all participating ranks.
+                            group_aligned=cp_context is not None,
                         )
                     full_padding_mask = get_packed_seq_padding_mask(
                         cu_seqlens=cu_seqlens,

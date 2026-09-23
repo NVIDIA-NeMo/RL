@@ -123,6 +123,9 @@ class _Router(torch.nn.Module):
         self.cp_group = group
         self.tp_cp_group = group
         self.config = config
+        self.calculate_per_token_loss = getattr(
+            config, "calculate_per_token_loss", False
+        )
 
 
 def test_dynamic_binding_updates_router_and_ssm_then_restores(monkeypatch):
@@ -175,6 +178,13 @@ def test_dynamic_binding_updates_router_and_ssm_then_restores(monkeypatch):
         assert model.gdp.d_inner_local_cp == 16
         assert config.moe_aux_loss_coeff == [0.0, 0.0]
         assert config.moe_z_loss_coeff is None
+
+        # Consecutive tasks in one partition reuse all runtime bindings.
+        bound_mamba_helper = model.mamba.cp
+        bound_gdp_helper = model.gdp.cp
+        dynamic_cp.bind_attention_cp_group(model, packed)
+        assert model.mamba.cp is bound_mamba_helper
+        assert model.gdp.cp is bound_gdp_helper
 
     assert model.router.cp_group is original_tp_cp
     assert model.router.tp_cp_group is original_tp_cp
@@ -252,29 +262,41 @@ def test_dynamic_binding_setup_failure_cleans_global_state(monkeypatch):
 
 
 @pytest.mark.parametrize("active_size", [1, 4])
-def test_dynamic_moe_scaling_is_applied_by_router_attachment(monkeypatch, active_size):
+def test_dynamic_moe_scaling_reduces_once_per_task(monkeypatch, active_size):
     from nemo_rl.models.megatron import dynamic_cp
 
     active_tp_cp = _Group(active_size)
-    config = SimpleNamespace(moe_aux_loss_coeff=0.1, moe_z_loss_coeff=0.02)
+    config = SimpleNamespace(
+        calculate_per_token_loss=True,
+        moe_aux_loss_coeff=0.1,
+        moe_z_loss_coeff=0.02,
+    )
     model = torch.nn.Module()
     model.add_module("router", _Router(active_tp_cp, config))
+    model.add_module("router2", _Router(active_tp_cp, config))
     padding_mask = torch.tensor([[False, False, False, True]])
+    reductions = []
 
     monkeypatch.setattr(dynamic_cp, "Router", _Router)
 
-    monkeypatch.setattr(
-        dynamic_cp.torch.distributed,
-        "all_reduce",
-        lambda *_args, **_kwargs: pytest.fail(
-            "pre-forward validation performed a token reduction"
-        ),
-    )
+    def _all_reduce(count, *, op, group):
+        reductions.append((op, group))
+        count.fill_(10)
+
+    monkeypatch.setattr(dynamic_cp.torch.distributed, "all_reduce", _all_reduce)
 
     with dynamic_cp.preserve_attention_cp_groups(model):
         dynamic_cp.configure_dynamic_moe_loss_scaling(model, padding_mask)
+        expected_tokens = 3 if active_size == 1 else 10
+        assert model.router._nemo_dynamic_aux_scale_tokens.item() == expected_tokens
+        assert (
+            model.router._nemo_dynamic_aux_scale_tokens
+            is model.router2._nemo_dynamic_aux_scale_tokens
+        )
+        assert len(reductions) == (1 if active_size > 1 else 0)
         assert config.moe_z_loss_coeff == 0.02
 
+    assert not hasattr(model.router, "_nemo_dynamic_aux_scale_tokens")
     assert config.moe_aux_loss_coeff == 0.1
     assert config.moe_z_loss_coeff == 0.02
 
@@ -292,6 +314,13 @@ def test_dynamic_router_attachment_uses_exact_task_token_count(monkeypatch):
 
     monkeypatch.setattr(moe_logging, "get_moe_metrics_tracker", lambda: tracker)
     monkeypatch.setattr(moe_utils.MoEAuxLossAutoScaler, "apply", _apply)
+    monkeypatch.setattr(
+        dynamic_cp.torch.distributed,
+        "all_reduce",
+        lambda *_args, **_kwargs: pytest.fail(
+            "router attachment performed a fallback reduction"
+        ),
+    )
 
     router = SimpleNamespace(
         is_mtp_layer=False,
@@ -416,16 +445,18 @@ def test_dynamic_mtp_metrics_are_token_weighted(monkeypatch):
         layer_number=0,
         num_layers=1,
     )
-    monkeypatch.setattr(
-        dynamic_cp.torch.distributed,
-        "all_reduce",
-        lambda _value, *, op, group: None,
-    )
+    reductions = []
+
+    def _all_reduce(_value, *, op, group):
+        reductions.append((op, group))
+
+    monkeypatch.setattr(dynamic_cp.torch.distributed, "all_reduce", _all_reduce)
 
     metrics = dynamic_cp.get_dynamic_mtp_metrics(parallel_group=_Group(4))
 
     assert metrics["mtp_1_loss"] == pytest.approx(3.0)
     assert metrics["mtp_1_acceptance_rate"] == pytest.approx(60.0)
+    assert len(reductions) == 1
     assert dynamic_cp._DYNAMIC_MTP_METRICS == {}
 
 
@@ -479,6 +510,62 @@ def test_dynamic_hybrid_mtp_receives_router_padding_mask(monkeypatch):
     assert torch.equal(model.mtp.seen_padding_mask, ~padding_mask)
     model.mtp.seen_padding_mask = None
     assert model(padding_mask=padding_mask) is None
+
+
+def test_dynamic_mtp_routers_share_one_count_reduction(monkeypatch):
+    from nemo_rl.models.megatron import dynamic_cp
+
+    group = _Group(2)
+    config = SimpleNamespace(
+        calculate_per_token_loss=True,
+        moe_aux_loss_coeff=0.1,
+        moe_z_loss_coeff=None,
+    )
+
+    class _MTPRouter(_Router):
+        def forward(self, hidden_states, padding_mask=None):
+            return hidden_states
+
+    class _MTP(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.router1 = _MTPRouter(group, config)
+            self.router2 = _MTPRouter(group, config)
+
+        def forward(self, *, padding_mask=None):
+            value = self.router1(torch.ones(1), padding_mask=padding_mask)
+            return self.router2(value, padding_mask=padding_mask)
+
+    class _HybridModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.mtp = _MTP()
+
+        def forward(self, *, padding_mask=None):
+            return self.mtp()
+
+    _HybridModel.__module__ = "megatron.core.models.hybrid.hybrid_model"
+    model = _HybridModel()
+    padding_mask = torch.tensor([[False, True]])
+    reductions = []
+
+    def _all_reduce(count, *, op, group):
+        reductions.append((op, group))
+        count.mul_(2)
+
+    monkeypatch.setattr(dynamic_cp, "Router", _MTPRouter)
+    monkeypatch.setattr(dynamic_cp.torch.distributed, "all_reduce", _all_reduce)
+
+    with dynamic_cp._patch_hybrid_mtp_padding_masks(model):
+        dynamic_cp.configure_dynamic_moe_loss_scaling(model, padding_mask)
+        model(padding_mask=padding_mask)
+        assert (
+            model.mtp.router1._nemo_dynamic_aux_scale_tokens
+            is model.mtp.router2._nemo_dynamic_aux_scale_tokens
+        )
+
+    # One main-task reduction plus one shared reduction for the shifted MTP mask.
+    assert len(reductions) == 2
 
 
 def test_dynamic_model_validation_rejects_unmerged_mla_support():
