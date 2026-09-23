@@ -15,7 +15,11 @@
 
 import pytest
 
-from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
+from nemo_rl.models.generation.openai_server_utils import (
+    PrefixSplice,
+    replace_prefix_tokens,
+    splice_prefix_tokens,
+)
 
 
 def test_replace_prefix_tokens_empty_model_prefix_returns_template():
@@ -85,6 +89,20 @@ def test_replace_prefix_tokens_without_tokenizer_uses_explicit_eos():
         eos_token_id=2,
     )
     assert result == [100, 2, 77, 88]
+
+
+def test_splice_prefix_tokens_without_tokenizer_uses_explicit_eos():
+    """splice_prefix_tokens must accept eos_token_id itself, not only via replace_prefix_tokens."""
+    result = splice_prefix_tokens(
+        tokenizer=None,
+        model_prefix_token_ids=[100, 2],
+        template_prefix_token_ids=[9, 2],
+        template_token_ids=[9, 2, 77, 88],
+        eos_token_id=2,
+    )
+    assert result == PrefixSplice(
+        token_ids=[100, 2, 77, 88], model_cut_end=1, template_cut_start=1
+    )
 
 
 def test_replace_prefix_tokens_without_tokenizer_reports_missing_eos_without_decoding():

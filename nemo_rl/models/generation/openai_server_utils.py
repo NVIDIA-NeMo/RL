@@ -49,6 +49,7 @@ def replace_prefix_tokens(
         model_prefix_token_ids=model_prefix_token_ids,
         template_prefix_token_ids=template_prefix_token_ids,
         template_token_ids=template_token_ids,
+        eos_token_id=eos_token_id,
     ).token_ids
 
 
@@ -58,6 +59,7 @@ def splice_prefix_tokens(
     model_prefix_token_ids: list[int],
     template_prefix_token_ids: list[int],
     template_token_ids: list[int],
+    eos_token_id: int | None = None,
 ) -> PrefixSplice:
     """This is a subroutine used inside the OpenAI-compatible Chat Completion server.
 
