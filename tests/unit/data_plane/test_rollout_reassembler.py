@@ -266,7 +266,7 @@ def test_finalize_group_skips_unset_terminal_selection(tq_client, partitions):
     receipt["rollout_id"] = f"{group_id}_g0"
     assert receipt["terminal_selection"] == "declared"
     # A manifest that never parsed ran no attribution stage, so the receipt
-    # carries terminal_selection=None (Gym 37dc751f) rather than a method.
+    # carries terminal_selection=None (Gym #2823, pinned 9fc05c0f) rather than a method.
     unset = {
         "rollout_id": f"{group_id}_g1",
         "reward": 0.0,
