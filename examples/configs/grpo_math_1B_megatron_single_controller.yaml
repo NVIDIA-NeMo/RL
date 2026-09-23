@@ -216,6 +216,13 @@ data_plane:
 token_capture:
   enabled: false
   staging_partition: rollout_staging
+  # "local_file" reads the colocated proxy ledger directly; "http" is the compatibility default.
+  manifest_transport: local_file
+  # Positive actor-wide worker and queue limits for local reads.
+  manifest_read_workers: 2
+  manifest_queue_size: 256
+  # Positive, finite seconds for local admission/read or the existing HTTP control call.
+  control_timeout_s: 60.0
 
 # Retry and restore policy for unfinished token-capture groups. "sibling" reuses
 # already sealed generations; "prompt_group" regenerates every sibling when any

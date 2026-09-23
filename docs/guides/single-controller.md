@@ -105,6 +105,46 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
 
 6. **(PPO) Set `ppo:` instead of `grpo:`** — the two algorithm blocks are mutually exclusive, and SC reads every step setting from whichever one is present. A PPO run also needs `value:`, `value_loss_fn:` and `ppo.adv_estimator.name: gae` (same schemas as legacy PPO), a Megatron critic, and `policy.offload_optimizer_for_logprob: true`, which is what keeps the policy optimizer off the GPU while the critic runs. `ppo.policy_training_start_step: N` gives the usual critic warmup: for the first N steps the policy is neither trained nor refit, while the critic trains every step. `ppo.warm_start_value_checkpoint` seeds that critic from another run's checkpoint instead, so a fresh run can skip the online warmup entirely — see [Warm-Starting the Critic](./ppo.md#warm-starting-the-critic).
 
+### Direct manifest reads for NeMo-Gym token capture
+
+When a Gym actor and its policy proxy share the same node-local filesystem,
+read completed-rollout manifests directly from the ledger:
+
+```yaml
+token_capture:
+  enabled: true
+  manifest_transport: local_file
+  manifest_read_workers: 2
+  manifest_queue_size: 256
+  control_timeout_s: 60.0
+  capture_dir: /dev/shm/gym_token_capture/my-run
+```
+
+The proxy commits `<capture_dir>/lineage/<rollout_id>.lineage.jsonl` before
+returning its response. The actor snapshots that file under the writer's shared
+lock, then parses and assembles the existing token-free receipt in a dedicated
+thread pool. The controller and finalizer continue using the same receipt and
+TransferQueue payloads. Rollout HTTP traffic and uvloop stay unchanged.
+
+All streams in an actor share the pool. A semaphore caps executor submissions at
+`manifest_read_workers + manifest_queue_size`; other callers wait asynchronously.
+One deadline covers admission, read and assembly. A timeout or cancelled caller
+signals the worker but retains its permit until the job actually finishes.
+Ready receipts stream immediately. Existing rollout timing metrics include
+`manifest_read_total`; there is no manifest cache or separate metrics service.
+Start with two workers: additional parsing threads can increase GIL contention.
+
+Use a unique capture directory per run. Startup checks the writer's hostname,
+directory device and inode, and fails if the actor cannot see the same ledger.
+The companion Gym reader API is required. There is no automatic HTTP fallback.
+Missing/corrupt/timed-out manifests retain the existing receipt/finalizer failure
+behavior; deadlines still depend on the actor event loop getting CPU.
+
+The schema default remains `http` for older configurations; the GRPO/PPO
+single-controller examples select `local_file`. Worker count and queue capacity
+must be positive integers; the timeout must be positive and finite. These
+operational settings are excluded from checkpoint compatibility fingerprints.
+
 ## Checkpointing and Replay Recovery
 
 With `checkpointing.save_data_plane: true`, each Single-Controller checkpoint contains:

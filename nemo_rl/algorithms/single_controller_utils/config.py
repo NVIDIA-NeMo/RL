@@ -633,9 +633,13 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # minted per run at setup; set explicitly only for multi-controller
     # setups that must share one ledger.
     control_auth_token: Optional[str] = None
-    # Hard deadline per control-plane call (S5 finding: control-plane death must
-    # surface as a failed dispatch, not a silent retry stall).
-    control_timeout_s: float = 60.0
+    # HTTP preserves compatibility; local_file requires actor/proxy filesystem visibility.
+    manifest_transport: Literal["http", "local_file"] = "http"
+    # Actor-wide file-reader threads and pending queue capacity, both positive.
+    manifest_read_workers: PositiveInt = 2
+    manifest_queue_size: PositiveInt = 256
+    # Positive, finite seconds: local admission/read deadline or existing HTTP control timeout.
+    control_timeout_s: PositiveFloat = Field(default=60.0, allow_inf_nan=False)
     # Root for Gym's per-rollout capture ledgers and base capture layer. None =
     # derived at setup
     # under the run's log dir.

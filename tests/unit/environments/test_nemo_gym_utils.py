@@ -17,6 +17,7 @@ These run in the default L0 suite. Keep this module free of heavy imports
 (e.g. vllm) so the fast detector tests are not gated behind the nemo_gym extra.
 """
 
+import asyncio
 import copy
 import json
 import os
@@ -414,14 +415,12 @@ def test_nemo_gym_fails_fast_instead_of_restarting():
 
 
 def test_nemo_gym_shutdown_is_idempotent():
-    actor = nemo_gym_mod.NemoGym.__ray_metadata__.modified_class.__new__(
-        nemo_gym_mod.NemoGym.__ray_metadata__.modified_class
-    )
+    actor = nemo_gym_mod.NemoGym.__ray_metadata__.modified_class({})
     actor.rh = MagicMock()
     run_helper = actor.rh
 
-    actor.shutdown()
-    actor.shutdown()
+    asyncio.run(actor.shutdown())
+    asyncio.run(actor.shutdown())
 
     run_helper.shutdown.assert_called_once_with()
 
@@ -431,7 +430,7 @@ def test_nemo_gym_shutdown_before_spinup_is_a_noop():
     actor = cls.__new__(cls)
     actor.__init__({})
 
-    actor.shutdown()  # must not raise
+    asyncio.run(actor.shutdown())  # must not raise
 
 
 @contextmanager

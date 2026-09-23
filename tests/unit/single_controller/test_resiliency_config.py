@@ -36,6 +36,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     GenerationRouterConfig,
     MasterConfig,
     RolloutFailureConfig,
+    TokenCaptureConfig,
     WatchdogConfig,
     validate_single_controller_config,
 )
@@ -105,6 +106,44 @@ class TestDefaultsAreInert:
         assert cfg.rollout_failure.nemo_gym.rollout_timeout_s is None
         assert cfg.rollout_failure.native.generation_timeout_s is None
         assert cfg.rollout_failure.native.env_timeout_s is None
+
+    def test_capture_control_defaults_support_old_configs(self) -> None:
+        cfg = TokenCaptureConfig(enabled=True)
+        assert cfg.control_timeout_s == 60.0
+        assert cfg.manifest_transport == "http"
+        assert cfg.manifest_read_workers == 2
+        assert cfg.manifest_queue_size == 256
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "control_timeout_s",
+            "manifest_read_workers",
+            "manifest_queue_size",
+        ],
+    )
+    @pytest.mark.parametrize("value", [0, -1])
+    def test_capture_control_rejects_nonpositive_settings(
+        self, field: str, value: int
+    ) -> None:
+        with pytest.raises(ValidationError, match=field):
+            TokenCaptureConfig(**{field: value})
+
+    @pytest.mark.parametrize("value", [float("inf"), float("nan")])
+    def test_capture_control_requires_a_finite_deadline(self, value: float) -> None:
+        with pytest.raises(ValidationError, match="control_timeout_s"):
+            TokenCaptureConfig(control_timeout_s=value)
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "manifest_read_workers",
+            "manifest_queue_size",
+        ],
+    )
+    def test_capture_control_requires_integer_limits(self, field: str) -> None:
+        with pytest.raises(ValidationError, match=field):
+            TokenCaptureConfig(**{field: 1.5})
 
     def test_retry_budgets_have_documented_defaults(self):
         cfg = AsyncRLConfig().rollout_failure

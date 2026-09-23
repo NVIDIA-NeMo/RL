@@ -4044,7 +4044,6 @@ requires-dist = [
     { name = "gitpython", specifier = ">=3.1.61" },
     { name = "gprof2dot", marker = "extra == 'dev'" },
     { name = "httptools" },
-    { name = "httpx-aiohttp", marker = "extra == 'sandbox'", specifier = ">=0.2.0" },
     { name = "hydra-core" },
     { name = "itsdangerous" },
     { name = "mcp", specifier = ">=1.28.1,<2" },
