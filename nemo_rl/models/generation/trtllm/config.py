@@ -25,6 +25,11 @@ class TrtllmSpecificArgs(TypedDict):
     precision: str
     max_batch_size: int
     max_num_tokens: int
+    # "auto" | "dummy", mirroring vllm_cfg.load_format. Set by
+    # configure_generation_config, not by the recipe: training starts the
+    # engine on dummy weights because the initial refit overwrites them
+    # anyway, so the checkpoint read at startup is pure latency.
+    load_format: NotRequired[str]
     expose_http_server: NotRequired[bool]
     async_engine: NotRequired[bool]
     # MoE expert parallelism. TRT-LLM splits the TP dimension on MoE layers
