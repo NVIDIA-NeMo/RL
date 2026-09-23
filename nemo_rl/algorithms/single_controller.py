@@ -2881,6 +2881,10 @@ class SingleControllerActor:
                     step_metrics.update(reduce_masking_stats(self._masking_stats_acc))
                 except Exception as error:  # metrics must never fail a step
                     log.warning("Skipping masking_stats metrics: %s", error)
+                try:
+                    step_metrics.update(self._rollout_manager.pop_mask_rule_metrics())
+                except Exception as error:  # metrics must never fail a step
+                    log.warning("Skipping mask_rules metrics: %s", error)
                 per_group_rollout_metrics: dict[str, list[Any]] = {}
                 for group_metrics in selected_rollout_metrics:
                     for metric_name, value in group_metrics.items():

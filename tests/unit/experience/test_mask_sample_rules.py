@@ -19,6 +19,7 @@ from nemo_rl.experience.mask_sample_rules import (
     MaskSampleRule,
     apply_mask_sample_rules,
     mask_rule_metrics,
+    mask_rule_step_metrics,
     matching_rules,
     parse_mask_sample_rules,
 )
@@ -138,4 +139,36 @@ def test_metrics_report_a_rate_for_every_configured_rule():
         "mask_rules/harness_unfinished_rate": 0.0,
         "mask_rules/verify_status_rate": 0.0,
         "mask_rules/any_rate": 0.0,
+    }
+
+
+def test_step_metrics_report_counts_fracs_and_reward_means():
+    rules = parse_mask_sample_rules({"mask_sample_rules": RULES_CFG})
+    assert (
+        mask_rule_step_metrics({}, (), reward_sums={}, any_count=0, rollouts_seen=512)
+        == {}
+    )
+    assert (
+        mask_rule_step_metrics({}, rules, reward_sums={}, any_count=0, rollouts_seen=0)
+        == {}
+    )
+    out = mask_rule_step_metrics(
+        {"eval_incomplete": 6, "harness_unfinished": 4},
+        rules,
+        reward_sums={"eval_incomplete": 0.0, "harness_unfinished": 1.0},
+        any_count=9,  # one rollout matched both rules
+        rollouts_seen=512,
+    )
+    assert out == {
+        "mask_rules/rollouts_seen": 512.0,
+        "mask_rules/eval_incomplete_count": 6.0,
+        "mask_rules/eval_incomplete_frac": 6 / 512,
+        "mask_rules/eval_incomplete_reward_mean": 0.0,
+        "mask_rules/harness_unfinished_count": 4.0,
+        "mask_rules/harness_unfinished_frac": 4 / 512,
+        "mask_rules/harness_unfinished_reward_mean": 0.25,
+        "mask_rules/verify_status_count": 0.0,
+        "mask_rules/verify_status_frac": 0.0,
+        "mask_rules/any_count": 9.0,
+        "mask_rules/any_frac": 9 / 512,
     }

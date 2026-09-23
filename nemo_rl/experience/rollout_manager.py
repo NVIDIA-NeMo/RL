@@ -63,6 +63,7 @@ from nemo_rl.experience.mask_sample_rules import (
     MaskSampleRule,
     apply_mask_sample_rules,
     mask_rule_metrics,
+    mask_rule_step_metrics,
 )
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.experience.rollout_recovery import (
@@ -937,6 +938,13 @@ class AsyncNemoGymRolloutImpl:
         self._generation_config = generation_config
         self._mask_env_flagged_samples = mask_env_flagged_samples
         self._mask_sample_rules = tuple(mask_sample_rules)
+        # Step-level rule hits, drained by pop_mask_rule_metrics() once per
+        # training step (the per-group rollout_metrics do not reach the
+        # controller's logger on the token-capture path).
+        self._mask_rule_step_counts: dict[str, int] = {}
+        self._mask_rule_step_reward_sums: dict[str, float] = {}
+        self._mask_rule_step_any = 0
+        self._mask_rule_step_seen = 0
         self._log_full_result_tables = log_full_result_tables
         self._reward_penalty_config = reward_penalty_config
         self._timeouts = timeouts if timeouts is not None else RolloutTimeouts()
@@ -1328,7 +1336,7 @@ class AsyncNemoGymRolloutImpl:
             # Apply penalties before Completion captures each result's reward, while
             # preserving the batch-level counts used by legacy Gym metrics.
             completions, penalty_counts, mask_rule_stats = self._results_to_completions(
-                completed_results
+                completed_results, record_rule_hits=True
             )
 
         # Compute rollout metrics.
@@ -1361,7 +1369,7 @@ class AsyncNemoGymRolloutImpl:
         return completions, prompt_message_log, rollout_metrics
 
     def _results_to_completions(
-        self, results: list[dict]
+        self, results: list[dict], *, record_rule_hits: bool = False
     ) -> tuple[
         list[Completion], dict[str, int], tuple[dict[str, int], dict[str, float], int]
     ]:
@@ -1411,6 +1419,19 @@ class AsyncNemoGymRolloutImpl:
                     mask_rule_reward_sums.get(rule_name, 0.0) + reward
                 )
         mask_rule_stats = (mask_rule_counts, mask_rule_reward_sums, mask_rule_any_count)
+        if record_rule_hits and self._mask_sample_rules:
+            # Only the group-level conversion records, so the streamed per-row
+            # conversion of the same result does not double count.
+            self._mask_rule_step_seen += len(results)
+            self._mask_rule_step_any += mask_rule_any_count
+            for name, count in mask_rule_counts.items():
+                self._mask_rule_step_counts[name] = (
+                    self._mask_rule_step_counts.get(name, 0) + count
+                )
+                self._mask_rule_step_reward_sums[name] = (
+                    self._mask_rule_step_reward_sums.get(name, 0.0)
+                    + mask_rule_reward_sums.get(name, 0.0)
+                )
 
         penalty_counts = apply_reward_penalties(
             token_results, self._reward_penalty_config
@@ -1446,6 +1467,21 @@ class AsyncNemoGymRolloutImpl:
                 )
             )
         return completions, penalty_counts, mask_rule_stats
+
+    def pop_mask_rule_metrics(self) -> dict[str, float]:
+        """Drain the step-level env.mask_sample_rules hits as ``mask_rules/*`` metrics."""
+        out = mask_rule_step_metrics(
+            self._mask_rule_step_counts,
+            self._mask_sample_rules,
+            reward_sums=self._mask_rule_step_reward_sums,
+            any_count=self._mask_rule_step_any,
+            rollouts_seen=self._mask_rule_step_seen,
+        )
+        self._mask_rule_step_counts = {}
+        self._mask_rule_step_reward_sums = {}
+        self._mask_rule_step_any = 0
+        self._mask_rule_step_seen = 0
+        return out
 
     def _compute_reward_penalty_metrics(
         self, penalty_counts: dict[str, int], num_results: int
@@ -1677,6 +1713,11 @@ class RolloutManager:
     def resume_request_deadlines(self) -> None:
         """Resume live request-deadline clocks when a colocated engine exits training mode."""
         self._request_deadlines.resume()
+
+    def pop_mask_rule_metrics(self) -> dict[str, float]:
+        """Step-level ``mask_rules/*`` hits since the last call ({} on the native impl)."""
+        pop = getattr(self._impl, "pop_mask_rule_metrics", None)
+        return pop() if pop is not None else {}
 
     @property
     def recovery_ledger(self) -> RolloutRecoveryLedger:

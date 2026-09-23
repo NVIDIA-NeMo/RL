@@ -167,6 +167,35 @@ def apply_mask_sample_rules(
     return matched
 
 
+def mask_rule_step_metrics(
+    counts: Mapping[str, int],
+    rules: Sequence[MaskSampleRule],
+    *,
+    reward_sums: Mapping[str, float],
+    any_count: int,
+    rollouts_seen: int,
+) -> dict[str, float]:
+    """Step-level rule metrics, logged by the controller under ``train/``.
+
+    ``mask_rules/rollouts_seen``, and per rule ``mask_rules/<name>_count``,
+    ``mask_rules/<name>_frac`` (of rollouts seen) and ``mask_rules/<name>_reward_mean``
+    (when it matched), plus ``mask_rules/any_count`` / ``mask_rules/any_frac``.
+    Empty when no rules are configured or no rollout was seen.
+    """
+    if not rules or rollouts_seen <= 0:
+        return {}
+    out: dict[str, float] = {"mask_rules/rollouts_seen": float(rollouts_seen)}
+    for rule in rules:
+        count = counts.get(rule.name, 0)
+        out[f"mask_rules/{rule.name}_count"] = float(count)
+        out[f"mask_rules/{rule.name}_frac"] = count / rollouts_seen
+        if count and rule.name in reward_sums:
+            out[f"mask_rules/{rule.name}_reward_mean"] = reward_sums[rule.name] / count
+    out["mask_rules/any_count"] = float(any_count)
+    out["mask_rules/any_frac"] = any_count / rollouts_seen
+    return out
+
+
 def mask_rule_metrics(
     counts: Mapping[str, int],
     rules: Sequence[MaskSampleRule],
@@ -175,10 +204,11 @@ def mask_rule_metrics(
     reward_sums: Mapping[str, float] | None = None,
     any_count: int = 0,
 ) -> dict[str, float]:
-    """Per-group rule metrics: ``mask_rules/<name>_rate`` for every configured rule
-    (0.0 when unmatched), ``mask_rules/<name>_reward_mean`` when the rule matched
-    (mean reward of the rows it masked), and ``mask_rules/any_rate`` (rows masked
-    by at least one rule).
+    """Per-group rule metrics attached to the group's rollout_metrics.
+
+    ``mask_rules/<name>_rate`` for every configured rule (0.0 when unmatched),
+    ``mask_rules/<name>_reward_mean`` when the rule matched (mean reward of the
+    rows it masked), and ``mask_rules/any_rate`` (rows masked by at least one rule).
     """
     if not rules or num_results <= 0:
         return {}
