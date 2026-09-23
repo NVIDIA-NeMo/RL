@@ -1668,6 +1668,7 @@ def test_native_rollout_groups_match_whole_batch(monkeypatch):
             "env_tokens": 8,
             "terminated": sample_idx % 2 == 0,
             "truncated": sample_idx == 3,
+            "logprobs_valid": sample_idx != 1,
             "max_turns_reached": sample_idx == 3,
             "total_reward": float(sample_idx - 1),
             "turn_gen_tokens": [sample_idx + 2],
@@ -1747,6 +1748,7 @@ def test_native_rollout_groups_match_whole_batch(monkeypatch):
         "avg_turns_per_sample",
         "natural_termination_rate",
         "truncation_rate",
+        "invalid_generation_logprob_rate",
         "max_turns_reached_rate",
         "mean_total_tokens_per_sample",
         "mean_gen_tokens_per_sample",
@@ -2775,3 +2777,55 @@ def test_run_async_nemo_gym_rollout(
     1. In nemo_rl/experience/rollouts.py::run_async_nemo_gym_rollout, the sampling params are passed appropriately
     2. In nemo_rl/models/generation/vllm/vllm_worker_async.py::VllmAsyncGenerationWorker::_setup_vllm_server::create_chat_completion, the sampling params (like top_k) are set as appropriate
     """
+
+
+def test_aggregate_metrics_reports_the_invalid_generation_logprob_rate():
+    """Samples whose generation log-probs failed validation are visible per step."""
+    base = {
+        "turn_count": 1,
+        "max_gen_tokens_per_turn": 1,
+        "terminated": True,
+        "truncated": False,
+        "max_turns_reached": False,
+        "total_reward": 0.0,
+        "total_tokens": 2,
+        "assistant_tokens": 1,
+        "env_tokens": 1,
+        "turn_gen_tokens": [1],
+        "turn_input_tokens": [1],
+        "turn_total_tokens": [2],
+        "per_worker_token_counts": {},
+    }
+    all_sample_metrics = [
+        {**base, "logprobs_valid": True},
+        {**base, "logprobs_valid": False},
+        {**base, "logprobs_valid": True},
+        {**base, "logprobs_valid": True},
+    ]
+
+    metrics = rollouts_mod._aggregate_multi_turn_rollout_metrics(all_sample_metrics)
+
+    assert metrics["invalid_generation_logprob_rate"] == pytest.approx(0.25)
+
+
+def test_aggregate_metrics_reports_zero_when_every_sample_is_valid():
+    base = {
+        "turn_count": 1,
+        "max_gen_tokens_per_turn": 1,
+        "terminated": True,
+        "truncated": False,
+        "max_turns_reached": False,
+        "total_reward": 0.0,
+        "total_tokens": 2,
+        "assistant_tokens": 1,
+        "env_tokens": 1,
+        "turn_gen_tokens": [1],
+        "turn_input_tokens": [1],
+        "turn_total_tokens": [2],
+        "per_worker_token_counts": {},
+        "logprobs_valid": True,
+    }
+
+    metrics = rollouts_mod._aggregate_multi_turn_rollout_metrics([base, dict(base)])
+
+    assert metrics["invalid_generation_logprob_rate"] == 0.0

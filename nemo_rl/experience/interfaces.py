@@ -49,6 +49,10 @@ class Completion:
     env_extras: Optional[dict[str, Any]]
     truncated: bool
     reward: float
+    # False when the generation backend could not extract a trustworthy
+    # log-prob for every sampled token. Defaults to True for backends and
+    # rollout paths that do not report it.
+    logprobs_valid: bool = True
 
 
 @dataclass

@@ -52,6 +52,7 @@ from nemo_rl.models.generation.vllm.config import parse_nvfp4_pertoken_rollout
 from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
+    extract_sampled_logprobs,
     format_prompt_for_vllm_generation,
     model_dump_chat_response_with_dynamic_message_fields,
     pad_and_align_routed_expert_indices,
@@ -1542,6 +1543,9 @@ class VllmAsyncGenerationWorkerImpl(
                         "generation_lengths": generation_lengths_tensor,
                         "unpadded_sequence_lengths": unpadded_sequence_lengths_tensor,
                         "truncated": truncated_tensor,
+                        "logprobs_valid": torch.ones(
+                            1, dtype=torch.bool, device=input_ids_single_row.device
+                        ),
                     }
                 )
 
@@ -1609,23 +1613,21 @@ class VllmAsyncGenerationWorkerImpl(
                 dtype=torch.float32,
                 device=original_input_ids_single_row.device,
             )
-            if hasattr(generation_details, "logprobs") and generation_details.logprobs:
-                for idx, logprob_dict_per_token in enumerate(
-                    generation_details.logprobs
-                ):
-                    if logprob_dict_per_token and idx < len(generated_token_ids):
-                        token_id_at_idx = generated_token_ids[idx]
-                        if token_id_at_idx in logprob_dict_per_token:
-                            logprob_value = logprob_dict_per_token[
-                                token_id_at_idx
-                            ].logprob
-                            position_in_output_tensor = (
-                                current_input_actual_length + idx
-                            )
-                            if position_in_output_tensor < final_output_tensor_len:
-                                logprobs_single_item[0, position_in_output_tensor] = (
-                                    logprob_value
-                                )
+            sampled_logprobs = extract_sampled_logprobs(
+                generated_token_ids,
+                getattr(generation_details, "logprobs", None),
+                sample_label=f"sample_idx={sample_idx}",
+            )
+            if sampled_logprobs.values:
+                logprobs_single_item[
+                    0,
+                    current_input_actual_length : current_input_actual_length
+                    + len(sampled_logprobs.values),
+                ] = torch.tensor(
+                    sampled_logprobs.values,
+                    dtype=torch.float32,
+                    device=original_input_ids_single_row.device,
+                )
 
             # Generation lengths
             generation_lengths_tensor = torch.tensor(
@@ -1656,6 +1658,11 @@ class VllmAsyncGenerationWorkerImpl(
                 "generation_lengths": generation_lengths_tensor,
                 "unpadded_sequence_lengths": unpadded_sequence_lengths_tensor,
                 "truncated": truncated_tensor,
+                "logprobs_valid": torch.tensor(
+                    [sampled_logprobs.valid],
+                    dtype=torch.bool,
+                    device=original_input_ids_single_row.device,
+                ),
             }
             routed_experts, r3_stats = pad_and_align_routed_expert_indices(
                 final_request_output,

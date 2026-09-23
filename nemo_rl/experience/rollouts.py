@@ -611,6 +611,10 @@ def generate_responses(
     # Extract truncated info if available (response hit max_tokens without stop token)
     response_truncated = generation_outputs.get("truncated")
 
+    # Whether the backend could extract a trustworthy log-prob for every
+    # generated token. Only some backends report it; absent means "assume so".
+    response_logprobs_valid = generation_outputs.get("logprobs_valid")
+
     # Extract generated parts
     generated_ids = []
     for i in range(len(input_lengths)):
@@ -662,6 +666,8 @@ def generate_responses(
     # Add response_truncated to gen_metrics for use by caller
     if response_truncated is not None:
         gen_metrics["_response_truncated"] = response_truncated
+    if response_logprobs_valid is not None:
+        gen_metrics["_response_logprobs_valid"] = response_logprobs_valid
 
     return batch, generated_ids, gen_metrics
 
@@ -752,6 +758,10 @@ async def generate_responses_async(
     # Extract truncated info if available (response hit max_tokens without stop token)
     response_truncated = generation_outputs.get("truncated")
 
+    # Whether the backend could extract a trustworthy log-prob for every
+    # generated token. Only some backends report it; absent means "assume so".
+    response_logprobs_valid = generation_outputs.get("logprobs_valid")
+
     # Extract generated parts
     generated_ids = []
     for i in range(len(input_lengths)):
@@ -813,6 +823,8 @@ async def generate_responses_async(
     # Add response_truncated to gen_metrics for use by caller
     if response_truncated is not None:
         gen_metrics["_response_truncated"] = response_truncated
+    if response_logprobs_valid is not None:
+        gen_metrics["_response_logprobs_valid"] = response_logprobs_valid
 
     return batch, generated_ids, gen_metrics
 
@@ -999,6 +1011,9 @@ def run_multi_turn_rollout(
     sample_env_token_counts = torch.zeros(batch_size, dtype=torch.int32)
     sample_terminated = torch.zeros(batch_size, dtype=torch.bool)
     sample_truncated = torch.zeros(batch_size, dtype=torch.bool)
+    # Sticky across turns: one turn with untrustworthy generation
+    # log-probs poisons the whole sample's importance ratios.
+    sample_logprobs_valid = torch.ones(batch_size, dtype=torch.bool)
     sample_max_turns_reached = torch.zeros(batch_size, dtype=torch.bool)
 
     # Tracking per-turn metrics
@@ -1060,6 +1075,13 @@ def run_multi_turn_rollout(
             for i, global_idx in enumerate(active_indices.tolist()):
                 if response_truncated[i]:
                     sample_truncated[global_idx] = True
+
+        # Record samples whose generation log-probs failed backend validation
+        response_logprobs_valid = gen_metrics.pop("_response_logprobs_valid", None)
+        if response_logprobs_valid is not None:
+            for i, global_idx in enumerate(active_indices.tolist()):
+                if not response_logprobs_valid[i]:
+                    sample_logprobs_valid[global_idx] = False
 
         # Record token usage - assistant
         for i, global_idx in enumerate(active_indices.tolist()):
@@ -1171,6 +1193,7 @@ def run_multi_turn_rollout(
     # Add total rewards to the final batch
     current_batch["total_reward"] = total_rewards
     current_batch["truncated"] = sample_truncated
+    current_batch["logprobs_valid"] = sample_logprobs_valid
     # Expose per-component rewards for multi-reward envs (e.g. GDPO advantage calculation).
     if multi_rewards is not None:
         for name, reward_tensor in multi_rewards.items():
@@ -1184,6 +1207,9 @@ def run_multi_turn_rollout(
         "max_turns_per_sample": int(sample_turn_counts.max().item()),
         "natural_termination_rate": float(sample_terminated.float().mean().item()),
         "truncation_rate": float(sample_truncated.float().mean().item()),
+        "invalid_generation_logprob_rate": float(
+            (~sample_logprobs_valid).float().mean().item()
+        ),
         "max_turns_reached_rate": float(sample_max_turns_reached.float().mean().item()),
         # Token usage metrics
         "mean_total_tokens_per_sample": float(
@@ -1336,6 +1362,8 @@ async def run_sample_multi_turn_rollout(
     env_token_count = 0
     terminated = False
     truncated = False
+    # Sticky across turns, like `truncated`.
+    logprobs_valid = True
     max_turns_reached = False
 
     # Track per-turn metrics
@@ -1379,6 +1407,11 @@ async def run_sample_multi_turn_rollout(
             response_truncated = gen_metrics.pop("_response_truncated", None)
             if response_truncated is not None and response_truncated[0]:
                 truncated = True
+
+            # Check if the backend flagged this turn's generation log-probs
+            response_logprobs_valid = gen_metrics.pop("_response_logprobs_valid", None)
+            if response_logprobs_valid is not None and not response_logprobs_valid[0]:
+                logprobs_valid = False
 
             # Update token counts
             gen_token_count = len(generated_tokens)
@@ -1495,6 +1528,7 @@ async def run_sample_multi_turn_rollout(
         "env_tokens": env_token_count,
         "terminated": terminated,
         "truncated": truncated,
+        "logprobs_valid": logprobs_valid,
         "max_turns_reached": max_turns_reached,
         "total_reward": total_reward,
         "turn_gen_tokens": turn_gen_tokens,
@@ -1541,6 +1575,10 @@ def _aggregate_multi_turn_rollout_metrics(
         "natural_termination_rate": sum(m["terminated"] for m in all_sample_metrics)
         / batch_size,
         "truncation_rate": sum(m["truncated"] for m in all_sample_metrics) / batch_size,
+        "invalid_generation_logprob_rate": sum(
+            not m["logprobs_valid"] for m in all_sample_metrics
+        )
+        / batch_size,
         "max_turns_reached_rate": sum(
             m["max_turns_reached"] for m in all_sample_metrics
         )
@@ -1668,6 +1706,10 @@ async def _run_multi_turn_rollout_async(
             "idx": [state.get("idx", i) for i, state in enumerate(final_sample_states)],
             "truncated": torch.tensor(
                 [metrics["truncated"] for metrics in all_sample_metrics],
+                dtype=torch.bool,
+            ),
+            "logprobs_valid": torch.tensor(
+                [metrics["logprobs_valid"] for metrics in all_sample_metrics],
                 dtype=torch.bool,
             ),
         }
@@ -3166,6 +3208,9 @@ def _postprocess_single_nemo_gym_group(
             "truncated": torch.tensor(
                 [m["hit_max_tokens"] for m in all_sample_metrics], dtype=torch.bool
             ),
+            # This path never sees raw generation outputs, so there is nothing
+            # to invalidate; written unconditionally so the key is uniform.
+            "logprobs_valid": torch.ones(len(results), dtype=torch.bool),
         }
     )
     # Carry the raw env/agent flag downstream; the advantage stage composes it

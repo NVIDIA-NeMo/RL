@@ -34,6 +34,7 @@ from nemo_rl.algorithms.advantage_estimator import (
 from nemo_rl.algorithms.grpo import (
     RewardScalingConfig,
     aggregate_rollout_metrics,
+    apply_invalid_generation_logprobs_filter,
     compute_and_apply_seq_logprob_error_masking,
     extract_initial_prompt_messages,
     refit_policy_generation,
@@ -1567,6 +1568,10 @@ def ppo_train(
                         loss_multiplier[truncated] = 0
                         repeated_batch["loss_multiplier"] = loss_multiplier
 
+                    metrics["num_invalid_generation_logprobs_filtered"] = (
+                        apply_invalid_generation_logprobs_filter(repeated_batch)
+                    )
+
                     for i, message_log in enumerate(repeated_batch["message_log"]):
                         for j, message in enumerate(message_log):
                             if message["role"] == "assistant":
@@ -2604,6 +2609,10 @@ def async_ppo_train(
                             truncated = torch.tensor(truncated, dtype=torch.bool)
                         loss_multiplier[truncated] = 0
                         repeated_batch["loss_multiplier"] = loss_multiplier
+
+                    metrics["num_invalid_generation_logprobs_filtered"] = (
+                        apply_invalid_generation_logprobs_filter(repeated_batch)
+                    )
 
                     # PPO's inline loss-mask setup (unmask all assistant messages),
                     # matching sync ppo_train — deliberately NOT GRPO's helper,

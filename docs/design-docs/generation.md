@@ -86,6 +86,50 @@ The {py:class}`VllmGenerationWorker <nemo_rl.models.generation.vllm.VllmGenerati
 3. Supports dynamic weight updates through IPC handles.
 4. Implements sleep/wake mechanisms for efficient resource utilization.
 
+### Generation Log-Prob Validation
+
+Both vLLM workers return one log-prob per generated token, and the RL loop uses
+those values as the behavior-policy log-probs in its importance ratios. If vLLM
+omits a position — a per-position list whose length does not match the
+generated tokens, an entry that is not a mapping, or a mapping without the
+token that was actually sampled — there is no safe substitute: a `0.0`
+placeholder asserts the token was sampled with probability 1.0 and skews every
+ratio computed from it. A log-prob of exactly `0.0` is a legitimate value for a
+token the model was certain about; an absent, malformed, non-finite or positive
+one is not.
+
+The workers validate each sample and report the outcome in the `logprobs_valid`
+field of `GenerationOutputSpec`, alongside `truncated`. Positions that failed
+validation are written as `0.0` so the tensor stays finite — a `NaN` would
+survive multiplication by a zero loss weight — and the sample as a whole is
+marked invalid.
+
+An invalid sample is then masked out of the loss. Every rollout path carries
+`logprobs_valid` onto the rollout batch, and every training path zeroes the
+`loss_multiplier` of the samples it marks:
+
+| rollout path | training path |
+| --- | --- |
+| `rollouts.run_multi_turn_rollout` (sync) | `grpo_train`, `ppo_train` |
+| `rollouts.run_async_multi_turn_rollout` | `async_grpo_train`, `async_ppo_train` |
+| `rollouts` NeMo-Gym postprocessor | as above |
+| `sync_rollout_actor` driver carry | `grpo_train_sync` |
+
+This is the same treatment overlong filtering gives truncated samples: the
+sample's reward still counts toward its group's baseline and standard
+deviation, and only its loss term is dropped. Unlike overlong filtering it is
+not configurable — an unusable behavior-policy log-prob is a correctness
+problem, not a policy choice.
+
+Generation backends that do not report `logprobs_valid` are treated as valid,
+so nothing changes for them. For samples that pass validation the extracted
+numbers are unchanged, so this is a no-op for any run that never hits an
+invalid log-prob.
+
+Two metrics make it visible: `invalid_generation_logprob_rate` per rollout
+step, and `num_invalid_generation_logprobs_filtered` per training step. The
+worker also warns once per process on the first failure.
+
 ### Custom VLLM Extensions
 
 The {py:class}`UpdatableVllmInternalWorker <nemo_rl.models.generation.vllm_backend.UpdatableVllmInternalWorker>` class in `vllm_backend.py` extends the VLLM worker with additional capabilities:

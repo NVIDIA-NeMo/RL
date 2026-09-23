@@ -368,6 +368,9 @@ class SyncRolloutActor:
         truncated = fb["truncated"]
         if not isinstance(truncated, torch.Tensor):
             truncated = torch.tensor(truncated, dtype=torch.bool)
+        logprobs_valid = fb["logprobs_valid"]
+        if not isinstance(logprobs_valid, torch.Tensor):
+            logprobs_valid = torch.tensor(logprobs_valid, dtype=torch.bool)
         length = fb.get("length", input_lengths)
         if not isinstance(length, torch.Tensor):
             length = torch.tensor(length)
@@ -375,6 +378,7 @@ class SyncRolloutActor:
             "total_reward": fb["total_reward"],
             "loss_multiplier": fb["loss_multiplier"],
             "truncated": truncated,
+            "logprobs_valid": logprobs_valid,
             "length": length,
             "input_lengths": input_lengths,
             "prompt_ids_for_adv": prompt_flat["token_ids"],
