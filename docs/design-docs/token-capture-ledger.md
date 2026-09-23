@@ -91,9 +91,8 @@ MInf now uses the same canonical durability boundary through two generic engine
 hooks. These hooks (`DynamicInferenceEngine.payload_stager` /
 `prompt_preparer`, the `RequestPayloadStager` protocol, and the rendered
 prior-turn tokens plus EOS id carried as request metadata) come from
-[NVIDIA/Megatron-LM PR #7015](https://github.com/NVIDIA/Megatron-LM/pull/7015)
-and are not yet in the Megatron-LM pinned through Megatron-Bridge; setup fails
-with a `NotImplementedError` naming that dependency until the pin is bumped.
+[NVIDIA/Megatron-LM PR #7015](https://github.com/NVIDIA/Megatron-LM/pull/7015),
+which the Megatron-LM pinned through Megatron-Bridge includes.
 
 Gym's complete `CaptureAdmission` travels as opaque request metadata.
 Before engine admission, the model-parallel coordinator resolves an admitted
