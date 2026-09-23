@@ -2352,6 +2352,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
 
 def test_nemo_gym_rollout_record_persists_runtime_resolved_agent_ref():
     manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager.set_next_nemo_gym_task_index(0)
     manager._num_generations_per_prompt = 2
     manager._generation_config = {
         "temperature": 1.0,

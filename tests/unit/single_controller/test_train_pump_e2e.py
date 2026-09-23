@@ -312,6 +312,8 @@ def test_train_pump_drives_mcore_training_step(
         rollout_manager = SimpleNamespace(
             _tq_buffer=None,
             recovery_ledger=None,
+            get_next_nemo_gym_task_index=lambda: 0,
+            set_next_nemo_gym_task_index=lambda _value: None,
             set_data_plane_checkpoint_barrier=lambda _barrier: None,
             set_weight_version=lambda v: ray.get(
                 log.record.remote("set_weight_version", {"version": int(v)})
