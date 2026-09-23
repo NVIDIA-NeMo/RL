@@ -51,6 +51,8 @@ from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossFn
+from nemo_rl.algorithms.loss.utils import rescale_loss_metrics
 from nemo_rl.data.multimodal_utils import (
     attach_media_token_validity_mask,
     chunks_accept_media_token_validity_mask,
@@ -974,6 +976,81 @@ class MegatronPolicyWorkerImpl(
             return
         self.model.load_state_dict(extra_state, strict=False)
 
+    def _normalize_in_loss_seq_filter(
+        self,
+        loss_fn: ClippedPGLossFn,
+        losses_reduced: list[dict[str, Any]],
+        *,
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+        eval_mode: bool,
+    ) -> tuple[list[dict[str, Any]], torch.Tensor, torch.Tensor]:
+        """Normalize one complete optimizer batch after in-loss filtering.
+
+        When we use seq_logprob_error_threshold with seq_logprob_error_in_loss,
+        we only have access to the global valid token count. After the full batch is computed.
+
+        Therefore, we need to normalize the gradient values by the global valid token count.
+        All microbatches have now finished, so sum survivor counts over DP, broadcast them to
+        every PP stage, and correct gradients before the optimizer clips them.
+        CP/TP replicas must not be counted as additional samples.
+        """
+        metrics = losses_reduced
+        counts = torch.tensor(
+            [
+                sum(m["seq_logprob_error_valid_seqs"] for m in metrics),
+                sum(m["seq_logprob_error_valid_tokens"] for m in metrics),
+            ],
+            dtype=torch.float64,
+            device=global_valid_toks.device,
+        )
+        if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+            torch.distributed.all_reduce(
+                counts, group=parallel_state.get_data_parallel_group()
+            )
+        if parallel_state.get_pipeline_model_parallel_world_size() > 1:
+            torch.distributed.broadcast(
+                counts,
+                src=parallel_state.get_pipeline_model_parallel_last_rank(),
+                group=parallel_state.get_pipeline_model_parallel_group(),
+            )
+
+        # counts is a tensor with 2 elements: [kept_seqs, kept_toks]
+        kept_seqs, kept_toks = counts
+        if kept_toks.item() == 0 and not eval_mode:
+            raise RuntimeError(
+                "No valid response tokens remain after in-loss sequence-logprob "
+                "filtering; refusing an empty optimizer update. Check "
+                "grpo.seq_logprob_error_threshold."
+            )
+        # Counts are weighted by sample_mask and may be positive fractions.
+        # Only replace zero denominators (possible during evaluation).
+        token_denominator = torch.where(kept_toks > 0, kept_toks, 1.0)
+        sequence_denominator = torch.where(kept_seqs > 0, kept_seqs, 1.0)
+        # Each microbatch loss divides by the original global token count G.
+        # Rejected tokens contribute zero, so accumulation and DP SUM produce
+        # S/G, where S is the sum of surviving tokens' gradient contributions.
+        # Multiplying by G/K, with K the global surviving token count, restores
+        # S/K: the same normalization as filtering before training. Apply this
+        # correction before optimizer.step() so gradient clipping sees S/K.
+        token_factor = float((global_valid_toks / token_denominator).item())
+        sequence_factor = float((global_valid_seqs / sequence_denominator).item())
+        if not eval_mode:
+            # Finish any overlap on the comm stream before touching the reduced
+            # gradient buffers (including distributed-optimizer gradient shards).
+            torch.cuda.synchronize()
+            self.model.scale_gradients(token_factor)
+        metrics = [
+            rescale_loss_metrics(
+                m,
+                loss_fn.metric_normalizations,
+                token_factor=token_factor,
+                sequence_factor=sequence_factor,
+            )
+            for m in metrics
+        ]
+        return metrics, kept_seqs, kept_toks
+
     @wrap_with_nvtx_name("megatron_policy_worker/train")
     def train(
         self,
@@ -1101,6 +1178,7 @@ class MegatronPolicyWorkerImpl(
                 )
 
                 rerun_state_machine = get_rerun_state_machine()
+                losses_reduced: list[dict[str, Any]] = []
                 while rerun_state_machine.should_run_forward_backward(data_iterator):
                     # Set grad to zero. For MXFP8 overlap eval, the param and
                     # grad buffers are shared and pre-hooks are disabled above.
@@ -1169,6 +1247,22 @@ class MegatronPolicyWorkerImpl(
                 # Empty unused memory.
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
                     torch.cuda.empty_cache()
+
+                if (
+                    isinstance(loss_fn, ClippedPGLossFn)
+                    and loss_fn.requires_survivor_normalization
+                ):
+                    (
+                        losses_reduced,
+                        global_valid_seqs,
+                        global_valid_toks,
+                    ) = self._normalize_in_loss_seq_filter(
+                        loss_fn,
+                        losses_reduced,
+                        global_valid_seqs=global_valid_seqs,
+                        global_valid_toks=global_valid_toks,
+                        eval_mode=eval_mode,
+                    )
 
                 # Update parameters.
                 if not eval_mode:
@@ -2284,7 +2378,15 @@ class MegatronPolicyWorkerImpl(
 
         no_grad.__exit__(None, None, None)
         self.timer.stop("get_logprobs")
-        return BatchedDataDict[LogprobOutputSpec](logprobs=logprobs).to("cpu")
+
+        # TODO: @nan: will remove in the future
+        cpu_logprobs = torch.empty_like(
+            logprobs,
+            device="cpu",
+            pin_memory=True,
+        )
+        cpu_logprobs.copy_(logprobs, non_blocking=False)
+        return BatchedDataDict[LogprobOutputSpec](logprobs=cpu_logprobs)
 
     def _resolve_output_layer_owner(self) -> Optional[Any]:
         """Return the unwrapped module owning ``output_layer``, or None off the last PP stage.
