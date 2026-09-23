@@ -1,5 +1,2 @@
 # Codeowners
 /.github/CODEOWNERS @nvidia-nemo/rl_maintainers
-
-# Research project authors: add your project path here to be notified of changes.
-/research/template_project @terrykong
