@@ -38,7 +38,12 @@ Metrics (logged under the ``train/`` prefix):
   within-group reward std; ``groups/zero_advantage_sample_frac``: valid samples
   sitting in a non-mixed group (they contribute no gradient).
 * ``reward/std`` over valid samples and ``reward/pass_frac`` (reward >= 0.5).
-* ``truncated_frac``: valid samples the generation cut at the length limit.
+* ``truncated_frac``: valid samples flagged ``truncated``. On the token-capture
+  path that flag is set when the rebuilt sequence reaches the max sequence
+  length (rollout_reassembler); on the message-log path it is the
+  completion's own truncated flag.
+* ``gen_tokens/mean_pass``, ``mean_fail``, ``turns/mean_pass``, ``mean_fail``
+  are omitted (not logged as 0) when the step has no sample of that outcome.
 
 Rows with ``sample_mask == 0`` (token-capture placeholders, environment
 mask_sample, overlong filter, sequence-logprob-error masking) are excluded
@@ -118,6 +123,8 @@ def accumulate_rollout_stats(
     that depend on them when any chunk lacks them.
     """
     batch = rewards.shape[0]
+    if batch == 0:
+        return
     stats = per_sample_rollout_stats(token_mask)
     _, local_groups = torch.unique(
         prompt_ids.detach().reshape(batch, -1), dim=0, return_inverse=True
@@ -146,8 +153,10 @@ def _distribution(out: dict[str, float], name: str, values: torch.Tensor) -> Non
     out[f"{name}/max"] = float(values.max())
 
 
-def _mean_or_zero(values: torch.Tensor) -> float:
-    return float(values.float().mean()) if values.numel() else 0.0
+def _set_mean(out: dict[str, float], key: str, values: torch.Tensor) -> None:
+    """Log the mean only when there are values; a 0 for "no passes" would mislead."""
+    if values.numel():
+        out[key] = float(values.float().mean())
 
 
 def reduce_rollout_stats(
@@ -175,11 +184,11 @@ def reduce_rollout_stats(
     turns = torch.cat(acc["turns"])[valid]
 
     _distribution(out, "gen_tokens", gen_tokens)
-    out["gen_tokens/mean_pass"] = _mean_or_zero(gen_tokens[passed])
-    out["gen_tokens/mean_fail"] = _mean_or_zero(gen_tokens[~passed])
+    _set_mean(out, "gen_tokens/mean_pass", gen_tokens[passed])
+    _set_mean(out, "gen_tokens/mean_fail", gen_tokens[~passed])
     _distribution(out, "turns", turns)
-    out["turns/mean_pass"] = _mean_or_zero(turns[passed])
-    out["turns/mean_fail"] = _mean_or_zero(turns[~passed])
+    _set_mean(out, "turns/mean_pass", turns[passed])
+    _set_mean(out, "turns/mean_fail", turns[~passed])
 
     if len(acc["seq_lens"]) == num_chunks:
         seq_lens = torch.cat(acc["seq_lens"])[valid]

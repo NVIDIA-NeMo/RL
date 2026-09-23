@@ -150,7 +150,21 @@ def test_chunks_accumulate_across_calls_and_empty_is_empty():
     out = reduce_rollout_stats(acc)
     assert out["groups/count"] == 3 and out["groups/mixed_count"] == 2
     assert math.isclose(out["groups/zero_advantage_sample_frac"], 2 / 6, rel_tol=1e-6)
-    # An all-masked accumulator reduces to nothing.
+    # A step with no failures logs no mean_fail rather than a misleading 0.
+    acc = new_rollout_stats_accumulator()
+    _fill(acc, prompt_ids=[1, 1], rewards=[1, 1], sample_mask=[1, 1], gen_tokens=[2, 4])
+    out = reduce_rollout_stats(acc)
+    assert out["gen_tokens/mean_pass"] == 3.0 and "gen_tokens/mean_fail" not in out
+    assert out["groups/all_pass_frac"] == 1.0 and out["groups/mixed_count"] == 0
+    # An empty chunk is ignored; an all-masked accumulator reduces to nothing.
+    accumulate_rollout_stats(
+        acc,
+        prompt_ids=torch.zeros(0, dtype=torch.long),
+        rewards=torch.zeros(0),
+        sample_mask=torch.zeros(0),
+        token_mask=torch.zeros(0, 4),
+    )
+    assert len(acc["rewards"]) == 1
     empty = new_rollout_stats_accumulator()
     _fill(
         empty, prompt_ids=[1, 1], rewards=[1, 0], sample_mask=[0, 0], gen_tokens=[2, 4]
