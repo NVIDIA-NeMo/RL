@@ -4089,3 +4089,77 @@ def test_turn_count_fallback_priority():
     assert f({"turns_per_sample/max": 5, "turns_per_sample/mean": 3}) == 5.0
     assert f({"turns_per_sample/mean": 6}) == 6.0
     assert f({"reward": 1.0}) is None
+
+
+class TestReplayBufferLogprobsValidBackfill:
+    """Resuming across the introduction of ``logprobs_valid`` must not crash.
+
+    Trajectories are pickled into the checkpoint. On resume they are
+    concatenated with freshly generated ones via
+    ``BatchedDataDict.from_batches``, which raises when a key is present in
+    some batches and missing from others.
+    """
+
+    @staticmethod
+    def _trajectory(batch):
+        return {"batch": batch, "rollout_metrics": {}}
+
+    @staticmethod
+    def _state(trajectories):
+        return {
+            "trajectories": trajectories,
+            "trajectory_versions": [0] * len(trajectories),
+            "target_weight_versions": [1] * len(trajectories),
+            "last_target_weight_already_generated": 0,
+            "max_size": 10,
+        }
+
+    def test_restored_trajectories_are_backfilled(self):
+        from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+        old_batch = BatchedDataDict({"total_reward": torch.tensor([1.0, 2.0])})
+        buffer = ReplayBufferImpl(max_size=10, drop_incomplete_targets_on_restore=False)
+
+        buffer.load_state_dict(self._state([self._trajectory(old_batch)]))
+
+        restored = buffer.trajectories[0]["batch"]
+        assert "logprobs_valid" in restored
+        assert restored["logprobs_valid"].tolist() == [True, True]
+
+    def test_restored_and_fresh_batches_concatenate(self):
+        """The actual failure mode: a mixed from_batches on resume."""
+        from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+        without_key = BatchedDataDict({"total_reward": torch.tensor([1.0])})
+        with_key = BatchedDataDict(
+            {
+                "total_reward": torch.tensor([3.0]),
+                "logprobs_valid": torch.tensor([False]),
+            }
+        )
+        buffer = ReplayBufferImpl(max_size=10, drop_incomplete_targets_on_restore=False)
+
+        buffer.load_state_dict(self._state([self._trajectory(without_key)]))
+
+        combined = BatchedDataDict.from_batches(
+            [buffer.trajectories[0]["batch"], with_key]
+        )
+        assert combined["logprobs_valid"].tolist() == [True, False]
+
+    def test_an_already_backfilled_trajectory_is_left_alone(self):
+        from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+        batch = BatchedDataDict(
+            {
+                "total_reward": torch.tensor([1.0, 2.0]),
+                "logprobs_valid": torch.tensor([True, False]),
+            }
+        )
+        buffer = ReplayBufferImpl(max_size=10, drop_incomplete_targets_on_restore=False)
+
+        buffer.load_state_dict(self._state([self._trajectory(batch)]))
+
+        assert buffer.trajectories[0]["batch"]["logprobs_valid"].tolist() == [
+            True,
+            False,
+        ]

@@ -596,6 +596,8 @@ class AsyncRolloutImpl:
         # truncated statistics
         terminated = False
         truncated = False
+        # Sticky across turns, like `truncated`.
+        logprobs_valid = True
         max_turns_reached = False
 
         # Track per-turn metrics
@@ -641,6 +643,11 @@ class AsyncRolloutImpl:
             response_truncated = gen_metrics.pop("_response_truncated", None)
             if response_truncated is not None and response_truncated[0]:
                 truncated = True
+
+            # Check if the backend flagged this turn's generation log-probs
+            response_logprobs_valid = gen_metrics.pop("_response_logprobs_valid", None)
+            if response_logprobs_valid is not None and not response_logprobs_valid[0]:
+                logprobs_valid = False
 
             # Update token counts
             gen_token_count = len(assistant_message["token_ids"])
@@ -736,6 +743,7 @@ class AsyncRolloutImpl:
             env_extras=current_extra_env_info,
             truncated=truncated,
             reward=total_reward,
+            logprobs_valid=logprobs_valid,
         )
         sample_metrics = {
             "turn_count": turn_count,
@@ -842,6 +850,8 @@ class AsyncRolloutImpl:
                 print(f"Error extracting gen_leader_worker_idx: {e}")
         if "truncated" in output:
             gen_metrics["_response_truncated"] = output["truncated"]
+        if "logprobs_valid" in output:
+            gen_metrics["_response_logprobs_valid"] = output["logprobs_valid"]
 
         return assistant_message, input_lengths, gen_metrics
 

@@ -86,6 +86,86 @@ The {py:class}`VllmGenerationWorker <nemo_rl.models.generation.vllm.VllmGenerati
 3. Supports dynamic weight updates through IPC handles.
 4. Implements sleep/wake mechanisms for efficient resource utilization.
 
+### Generation Log-Prob Validation
+
+Both vLLM workers return one log-prob per generated token, and the RL loop uses
+those values as the behavior-policy log-probs in its importance ratios. If vLLM
+omits a position — a per-position list whose length does not match the
+generated tokens, an entry that is not a mapping, or a mapping without the
+token that was actually sampled — there is no safe substitute: a `0.0`
+placeholder asserts the token was sampled with probability 1.0 and skews every
+ratio computed from it. A log-prob of exactly `0.0` is a legitimate value for a
+token the model was certain about; an absent, malformed, non-finite or positive
+one is not.
+
+The workers validate each sample and report the outcome in the `logprobs_valid`
+field of `GenerationOutputSpec`, alongside `truncated`. Positions that failed
+validation are written as `0.0` so the tensor stays finite — a `NaN` would
+survive multiplication by a zero loss weight — and the sample as a whole is
+marked invalid.
+
+An invalid sample is then masked out of the loss. Every rollout path carries
+`logprobs_valid` onto the rollout batch, and every training path zeroes the
+`loss_multiplier` of the samples it marks:
+
+| rollout path | training path |
+| --- | --- |
+| `rollouts.run_multi_turn_rollout` (sync) | `grpo_train`, `ppo_train` |
+| `rollouts.run_async_multi_turn_rollout` | `async_grpo_train`, `async_ppo_train` |
+| `rollouts` NeMo-Gym postprocessor | as above |
+| `sync_rollout_actor` driver carry | `grpo_train_sync` |
+
+This is the same treatment overlong filtering gives truncated samples: the
+sample's reward still counts toward its group's baseline and standard
+deviation, and only its loss term is dropped. Unlike overlong filtering it is
+not configurable — an unusable behavior-policy log-prob is a correctness
+problem, not a policy choice.
+
+Generation backends that do not report `logprobs_valid` are treated as valid,
+so nothing changes for them. For samples that pass validation the extracted
+numbers are unchanged, so this is a no-op for any run that never hits an
+invalid log-prob.
+
+Two metrics make it visible: `invalid_generation_logprob_rate` per rollout
+step, and `num_invalid_generation_logprobs_filtered` per training step. The
+worker also warns once per process on the first failure.
+
+#### When the worker gives up
+
+Masking invalid samples keeps a bad rollout out of the loss, but if the engine
+keeps producing them there is nothing left worth training on. The workers
+therefore also track failures and stop the run on either of two independent
+triggers:
+
+- the failure rate over the **last 1000 samples** exceeds
+  `policy.generation.vllm_cfg.max_generation_logprob_failure_rate`. The window
+  is the point: a cumulative rate is diluted by history, so after 100k clean
+  samples a 1% threshold would need ~1000 consecutive failures to trip. The
+  rate is only judged once the window holds enough samples to resolve it — at
+  least `max(ceil(1/rate), 100)` — so neither an early failure nor a very
+  permissive threshold makes the check hair-trigger.
+- **32 consecutive failures**, which catches an abrupt onset before the window
+  can establish a rate.
+
+```yaml
+policy:
+  generation:
+    vllm_cfg:
+      strict_generation_logprobs: true          # default
+      max_generation_logprob_failure_rate: 0.01 # 0.0 fails immediately; 1.0 never
+```
+
+`max_generation_logprob_failure_rate: 1.0` tolerates everything and disables
+both triggers, including the consecutive one. `strict_generation_logprobs:
+false` turns the accounting off entirely. Neither disables the per-sample
+masking above — that is always on.
+
+Note that the raise happens inside a generation worker, so it discards the
+shard that worker was producing, and because each data-parallel replica keeps
+its own counters it can fire on one replica while the others keep going. Treat
+it as a stop signal for the run, not as a per-sample recovery mechanism; that
+is what `logprobs_valid` is for.
+
 ### Custom VLLM Extensions
 
 The {py:class}`UpdatableVllmInternalWorker <nemo_rl.models.generation.vllm_backend.UpdatableVllmInternalWorker>` class in `vllm_backend.py` extends the VLLM worker with additional capabilities:

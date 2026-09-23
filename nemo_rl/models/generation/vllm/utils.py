@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections import defaultdict
+import logging
+import math
+from collections import defaultdict, deque
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
@@ -28,7 +32,10 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.telemetry.metrics import warn_once
 from nemo_rl.utils.routed_experts_codec import encode_routed_experts
+
+logger = logging.getLogger(__name__)
 
 R3_MISSING_ROUTE_SENTINEL = ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL
 VLLM_LOGPROB_FLOOR = -9999.0
@@ -644,3 +651,366 @@ def resolve_generation_worker_cls(default_cls: str, config: dict) -> str:
     if config.get("quant_cfg") is None:
         return default_cls
     return GENERATION_WORKER_OVERRIDES.get(default_cls, default_cls)
+
+
+# ---------------------------------------------------------------------------
+# Per-token generation log-prob extraction for the RL generation workers.
+#
+# vLLM returns one ``{token_id: Logprob}`` mapping per generated token, and the
+# RL loop uses the sampled token's value as the behavior-policy log-prob in its
+# importance ratios. A position with no usable entry has no safe substitute:
+# filling it with 0.0 claims the token was sampled with probability 1, which
+# silently skews every ratio computed from it. A log-prob of exactly 0.0 is a
+# legitimate value for a token the model was certain about, so only an absent,
+# malformed, non-finite or positive entry counts as a failure.
+#
+# This is the worker-side counterpart to the validation
+# ``attach_token_information_to_chat_response_choices`` performs for the
+# OpenAI-compatible server path above. That path raises per request; a rollout
+# worker instead reports the sample as invalid so the training paths can mask
+# it out of the loss.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SampledLogprobs:
+    """Per-token log-probs for one sample, plus whether they are trustworthy.
+
+    Attributes:
+        values: One float per generated token. Values extracted from a
+            well-formed entry are passed through unchanged; every position
+            that failed validation is 0.0, which keeps the tensor finite so
+            downstream masking arithmetic stays well-defined.
+        error: Description of the first validation failure, or None when the
+            sample is clean.
+    """
+
+    values: list[float]
+    error: str | None = None
+
+    @property
+    def valid(self) -> bool:
+        return self.error is None
+
+
+def _sampled_logprob_value(entry: Any) -> tuple[float | None, str | None]:
+    """Pull a usable float out of one vLLM ``Logprob``.
+
+    Returns ``(value, error_detail)`` with exactly one side populated.
+    """
+    raw = getattr(entry, "logprob", None)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None, (
+            f"entry is a {type(entry).__name__} with logprob={raw!r}, expected "
+            "a vLLM Logprob carrying a float"
+        )
+    value = float(raw)
+    if not math.isfinite(value):
+        return None, f"log-prob is {value}"
+    if value > 0.0:
+        return None, f"log-prob is positive ({value})"
+    return value, None
+
+
+def extract_sampled_logprobs(
+    generated_token_ids: Sequence[int],
+    logprobs: Sequence[Any] | None,
+    *,
+    sample_label: str,
+) -> SampledLogprobs:
+    """Pull the sampled token's log-prob out of each position of a vLLM output.
+
+    Args:
+        generated_token_ids: Token ids vLLM sampled for this request.
+        logprobs: Per-position log-prob mappings from the vLLM output, or None
+            when the request did not ask for log-probs.
+        sample_label: Identifier for the request, used in the error text.
+
+    Returns:
+        A :class:`SampledLogprobs`. This never raises on bad engine output; the
+        caller decides what an invalid sample means.
+    """
+    num_generated_tokens = len(generated_token_ids)
+    num_positions = len(logprobs) if logprobs else 0
+    error: str | None = None
+
+    def fail(message: str) -> None:
+        nonlocal error
+        if error is None:
+            error = f"{sample_label}: {message}"
+
+    if num_positions == 0:
+        if num_generated_tokens > 0:
+            fail(
+                "vLLM returned no generation log-probs despite generating "
+                f"{num_generated_tokens} tokens"
+            )
+        return SampledLogprobs(values=[0.0] * num_generated_tokens, error=error)
+
+    if num_positions != num_generated_tokens:
+        fail(
+            "vLLM returned a generation log-prob list whose length does not "
+            f"match the generated tokens: token_count={num_generated_tokens}, "
+            f"logprob_count={num_positions}"
+        )
+
+    values: list[float] = []
+    for position, token_id in enumerate(generated_token_ids):
+        position_logprobs = logprobs[position] if position < num_positions else None
+        if position_logprobs is None:
+            fail(f"no log-prob entry at position={position}, token_id={token_id}")
+            values.append(0.0)
+            continue
+        if not isinstance(position_logprobs, Mapping):
+            fail(
+                f"log-prob entry at position={position} is a "
+                f"{type(position_logprobs).__name__}, expected a mapping of "
+                "token id to Logprob"
+            )
+            values.append(0.0)
+            continue
+
+        entry = position_logprobs.get(token_id)
+        if entry is None:
+            fail(
+                "vLLM generation log-probs did not include the sampled token: "
+                f"position={position}, token_id={token_id}"
+            )
+            values.append(0.0)
+            continue
+
+        value, detail = _sampled_logprob_value(entry)
+        if value is None:
+            fail(f"{detail} at position={position}, token_id={token_id}")
+            values.append(0.0)
+            continue
+        values.append(value)
+
+    if error is not None:
+        warn_once(
+            "vllm_generation_logprobs_invalid",
+            "A generation sample's per-token log-probs failed validation and "
+            "will be masked out of the loss. These are the behavior-policy "
+            f"term of the importance ratios. First failure: {error}",
+        )
+
+    return SampledLogprobs(values=values, error=error)
+
+
+# The failure rate is measured over a sliding window rather than over the whole
+# run. A cumulative rate is diluted by history: after 100k clean samples a 1%
+# threshold would need ~1,000 consecutive failures to trip, so corruption that
+# starts mid-run is effectively unbounded.
+GENERATION_LOGPROB_FAILURE_WINDOW = 1000
+
+# A rate is not meaningful until the window holds enough samples to resolve it,
+# but a very permissive threshold must not make the check hair-trigger either
+# (at 50%, ceil(1/rate) is 2). Never judge a rate on fewer than this many
+# samples.
+GENERATION_LOGPROB_MIN_RATE_SAMPLES = 100
+
+# Independent trigger for corruption that starts abruptly. This many failures
+# in a row is not a rate question -- something is wrong now -- and it fires
+# well before the window has enough samples to establish a rate. Set
+# vllm_cfg.max_generation_logprob_failure_rate to 1.0 to disable both triggers.
+GENERATION_LOGPROB_CONSECUTIVE_FAILURE_LIMIT = 32
+
+
+def resolve_generation_logprob_settings(
+    vllm_cfg: Mapping[str, Any],
+) -> tuple[bool, float]:
+    """Resolve and validate the generation log-prob abort policy.
+
+    Args:
+        vllm_cfg: The ``policy.generation.vllm_cfg`` mapping. Both keys are
+            required and carry their defaults in the exemplar YAML; an
+            explicit ``None`` means "use the built-in behavior" (strict, and
+            the default rate) rather than False / a TypeError.
+
+    Returns:
+        ``(strict, max_failure_rate)``.
+
+    Raises:
+        ValueError: If the failure rate is not a number in [0, 1].
+    """
+    strict = vllm_cfg["strict_generation_logprobs"]
+    strict = True if strict is None else bool(strict)
+
+    rate = vllm_cfg["max_generation_logprob_failure_rate"]
+    if rate is None:
+        rate = 1.0
+    try:
+        rate = float(rate)
+    except (TypeError, ValueError):
+        raise ValueError(
+            "policy.generation.vllm_cfg.max_generation_logprob_failure_rate "
+            f"must be a number between 0.0 and 1.0, got {rate!r}."
+        ) from None
+    if math.isnan(rate) or not 0.0 <= rate <= 1.0:
+        raise ValueError(
+            "policy.generation.vllm_cfg.max_generation_logprob_failure_rate "
+            f"must be between 0.0 and 1.0, got {rate}."
+        )
+    return strict, rate
+
+
+def validate_generation_logprob_settings(config: Mapping[str, Any]) -> None:
+    """Driver-side pre-flight for the abort-policy settings.
+
+    The worker reads these keys directly -- they are required, and the
+    exemplar YAML is their source of truth. This is only a pre-flight so a bad
+    value surfaces before any engine starts rather than as a Ray actor death,
+    so it checks presence explicitly and stays quiet for a config that
+    predates the keys (or has no ``vllm_cfg`` at all); such a config fails
+    loudly in the worker instead.
+    """
+    vllm_cfg = config.get("vllm_cfg") or {}
+    required = {"strict_generation_logprobs", "max_generation_logprob_failure_rate"}
+    if not required <= set(vllm_cfg):
+        return
+    resolve_generation_logprob_settings(vllm_cfg)
+
+
+class GenerationLogprobValidator:
+    """Per-worker accounting for generation log-prob extraction failures.
+
+    Every invalid sample is already masked out of the loss by the training
+    paths, so this layer answers a different question: at what point is the
+    engine broken enough that continuing is worse than stopping? Failures are
+    counted and warned about on a backoff schedule, and the worker raises on
+    either of two independent triggers:
+
+    * the failure rate over the last ``GENERATION_LOGPROB_FAILURE_WINDOW``
+      samples exceeds ``max_failure_rate`` (a sliding window, so corruption
+      that starts mid-run is not diluted by earlier clean history), or
+    * ``GENERATION_LOGPROB_CONSECUTIVE_FAILURE_LIMIT`` samples fail in a row,
+      which catches an abrupt onset before the window fills.
+
+    A ``max_failure_rate`` of 1.0 means "tolerate anything" and disables both
+    triggers; 0.0 aborts on the first failure.
+
+    Not thread-safe; each worker touches its own instance from its own loop.
+    """
+
+    def __init__(self, *, strict: bool, max_failure_rate: float) -> None:
+        self.strict = strict
+        self.max_failure_rate = max_failure_rate
+        self.samples = 0
+        self.failures = 0
+        self.consecutive_failures = 0
+        self._window: deque[bool] = deque(maxlen=GENERATION_LOGPROB_FAILURE_WINDOW)
+
+    @classmethod
+    def from_config(cls, vllm_cfg: Mapping[str, Any]) -> "GenerationLogprobValidator":
+        """Build a validator from ``policy.generation.vllm_cfg``."""
+        strict, max_failure_rate = resolve_generation_logprob_settings(vllm_cfg)
+        return cls(strict=strict, max_failure_rate=max_failure_rate)
+
+    @property
+    def failure_rate(self) -> float:
+        """Failure rate over the sliding window."""
+        if not self._window:
+            return 0.0
+        return sum(self._window) / len(self._window)
+
+    @property
+    def cumulative_failure_rate(self) -> float:
+        """Failure rate over the whole run, for reporting only."""
+        return self.failures / self.samples if self.samples else 0.0
+
+    def extract(
+        self,
+        generated_token_ids: Sequence[int],
+        logprobs: Sequence[Any] | None,
+        *,
+        sample_label: str,
+    ) -> SampledLogprobs:
+        """Extract one sample's log-probs and fold the outcome into the totals.
+
+        Raises:
+            RuntimeError: In strict mode, once either abort trigger fires.
+        """
+        result = extract_sampled_logprobs(
+            generated_token_ids, logprobs, sample_label=sample_label
+        )
+        self._record(result)
+        return result
+
+    def _record(self, result: SampledLogprobs) -> None:
+        self.samples += 1
+        self._window.append(not result.valid)
+
+        if result.valid:
+            self.consecutive_failures = 0
+            return
+
+        self.failures += 1
+        self.consecutive_failures += 1
+        if _is_backoff_step(self.failures):
+            logger.warning(
+                "Generation log-prob validation failed for %d of the last %d "
+                "samples (%.3f%%; tolerating up to %.3f%%), %d of %d overall, "
+                "%d in a row. First failure in this sample: %s",
+                sum(self._window),
+                len(self._window),
+                100.0 * self.failure_rate,
+                100.0 * self.max_failure_rate,
+                self.failures,
+                self.samples,
+                self.consecutive_failures,
+                result.error,
+            )
+
+        trigger = self._abort_trigger()
+        if trigger is not None:
+            raise RuntimeError(
+                f"Generation log-prob validation gave up: {trigger}. These "
+                "log-probs are the behavior-policy term of the importance "
+                "ratios, so training on them is not meaningful. Overall "
+                f"{self.failures} of {self.samples} samples failed. Set "
+                "policy.generation.vllm_cfg.strict_generation_logprobs=false "
+                "to keep going without this check, or raise "
+                "policy.generation.vllm_cfg.max_generation_logprob_failure_rate "
+                f"(1.0 disables it). Most recent failure: {result.error}"
+            )
+
+    def _abort_trigger(self) -> str | None:
+        """Which abort condition fired, if any."""
+        if not self.strict or self.max_failure_rate >= 1.0:
+            # 100% tolerated: nothing can exceed it, including a run of
+            # consecutive failures.
+            return None
+        if self.consecutive_failures >= GENERATION_LOGPROB_CONSECUTIVE_FAILURE_LIMIT:
+            return (
+                f"{self.consecutive_failures} consecutive samples failed "
+                f"(limit {GENERATION_LOGPROB_CONSECUTIVE_FAILURE_LIMIT})"
+            )
+        if self.max_failure_rate <= 0.0:
+            # 0% tolerated: any failure aborts.
+            return "a sample failed and the tolerated failure rate is 0"
+        min_samples = min(
+            max(
+                math.ceil(1.0 / self.max_failure_rate),
+                GENERATION_LOGPROB_MIN_RATE_SAMPLES,
+            ),
+            GENERATION_LOGPROB_FAILURE_WINDOW,
+        )
+        if (
+            len(self._window) >= min_samples
+            and self.failure_rate > self.max_failure_rate
+        ):
+            return (
+                f"{100.0 * self.failure_rate:.3f}% of the last "
+                f"{len(self._window)} samples failed, above the tolerated "
+                f"{100.0 * self.max_failure_rate:.3f}%"
+            )
+        return None
+
+
+def _is_backoff_step(count: int) -> bool:
+    """Whether to emit a warning for the ``count``-th failure.
+
+    Warns on the 1st, 2nd, 4th, 8th, ... failure so a systemic problem stays
+    visible without one log line per sample.
+    """
+    return count > 0 and (count & (count - 1)) == 0

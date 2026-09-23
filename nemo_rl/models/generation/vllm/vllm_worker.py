@@ -52,6 +52,7 @@ from nemo_rl.models.generation.vllm.config import (
 )
 from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
 from nemo_rl.models.generation.vllm.utils import (
+    GenerationLogprobValidator,
     format_prompt_for_vllm_generation,
     pad_and_align_routed_expert_indices,
 )
@@ -475,6 +476,8 @@ class BaseVllmGenerationWorker:
         self.py_executable = sys.executable
 
         vllm_cfg = self.cfg["vllm_cfg"]
+        # Accumulates generation log-prob validation outcomes for this worker.
+        self._logprob_validator = GenerationLogprobValidator.from_config(vllm_cfg)
         _apply_vllm_patches(
             self.py_executable,
             extra_env_vars=extra_env_vars,
@@ -1034,6 +1037,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                     "generation_lengths": torch.zeros(0, dtype=torch.long),
                     "unpadded_sequence_lengths": torch.zeros(0, dtype=torch.long),
                     "truncated": torch.zeros(0, dtype=torch.bool),
+                    "logprobs_valid": torch.zeros(0, dtype=torch.bool),
                 }
             )
 
@@ -1095,6 +1099,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         # Process the outputs - but preserve the original input padding structure
         output_ids_list = []
         logprobs_list = []
+        logprobs_valid_list: list[bool] = []
         routed_experts_list = []
         r3_missing_routes = []
         r3_expected_routes = []
@@ -1133,23 +1138,18 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
 
             output_ids_list.append(full_output)
             full_logprobs = torch.zeros(total_length, dtype=torch.float32)
-            if hasattr(generation, "logprobs") and generation.logprobs:
-                try:
-                    for idx, (token_id, logprob_dict) in enumerate(
-                        zip(generated_tokens, generation.logprobs)
-                    ):
-                        if logprob_dict:
-                            sampled_logprob = logprob_dict.get(token_id)
-                            if sampled_logprob is not None:
-                                full_logprobs[sequence_length + idx] = (
-                                    sampled_logprob.logprob
-                                )
-                except Exception:
-                    import traceback
-
-                    traceback.print_exc()
+            sampled_logprobs = self._logprob_validator.extract(
+                generated_tokens,
+                getattr(generation, "logprobs", None),
+                sample_label=f"request_idx={i}",
+            )
+            if sampled_logprobs.values:
+                full_logprobs[
+                    sequence_length : sequence_length + len(sampled_logprobs.values)
+                ] = torch.tensor(sampled_logprobs.values, dtype=torch.float32)
 
             logprobs_list.append(full_logprobs)
+            logprobs_valid_list.append(sampled_logprobs.valid)
 
             response_length = sequence_length + len(generated_tokens)
             full_routed_experts, r3_stats = pad_and_align_routed_expert_indices(
@@ -1217,6 +1217,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                     unpadded_sequence_lengths, dtype=torch.long
                 ),
                 "truncated": torch.tensor(truncated_list, dtype=torch.bool),
+                "logprobs_valid": torch.tensor(logprobs_valid_list, dtype=torch.bool),
             }
         )
         if routed_experts_list:

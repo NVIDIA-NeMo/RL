@@ -73,6 +73,15 @@ class VllmSpecificArgs(TypedDict):
     # with generation-time processors should request ``raw_logprobs`` when
     # comparing generation and policy logprobs.
     logprobs_mode: NotRequired[Literal["processed_logprobs", "raw_logprobs"]]
+    # Stop the run when the generation backend keeps returning per-token
+    # log-probs that fail validation. Invalid samples are always masked out of
+    # the loss; this decides when to give up instead. null keeps the check on.
+    strict_generation_logprobs: bool | None
+    # Share of samples, over a sliding window of the last 1000, whose
+    # generation log-probs may fail validation before the worker stops the
+    # run. 0.0 fails on the first bad sample; 1.0 (or null) never fails.
+    # Only consulted when strict_generation_logprobs is on.
+    max_generation_logprob_failure_rate: float | None
     # Nemotron-H only: compute vLLM Nemotron-H logits with an fp32 LM head.
     # Pair this with policy.megatron_cfg.fp32_lm_head when using a Megatron
     # trainer.
