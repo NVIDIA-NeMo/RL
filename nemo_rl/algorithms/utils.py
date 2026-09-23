@@ -260,6 +260,28 @@ def surpress_user_warnings(f):  # type: ignore
     return wrapper
 
 
+@torch.no_grad()
+def compute_seq_logprob_errors(
+    *,
+    policy_logprobs: torch.Tensor,
+    generation_logprobs: torch.Tensor,
+    token_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return mean multiplicative absolute error and validity per sequence.
+
+    Inputs must already be aligned to predicted tokens (without the first
+    input token). Padding and previously masked samples do not participate.
+    Nonfinite errors on valid tokens fail any finite threshold.
+    """
+    mask = token_mask * sample_mask.unsqueeze(-1)
+    counts = mask.sum(dim=-1)
+    valid = counts > 0
+    error = torch.where(mask.bool(), (generation_logprobs - policy_logprobs).abs(), 0.0)
+    errors = (torch.exp(error * mask) * mask).sum(dim=-1) / counts.clamp(min=1)
+    return errors, valid
+
+
 def masked_mean(
     values: torch.Tensor,
     mask: torch.Tensor,
