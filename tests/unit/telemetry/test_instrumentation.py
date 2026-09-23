@@ -531,6 +531,45 @@ def test_a_method_refusing_the_carrier_degrades_instead_of_failing(caplog):
     handle.shutdown()
 
 
+class _OptionsWrapper:
+    """What ``.options(...)`` hands back: no ``_method_name`` of its own.
+
+    Named for Ray 2.56.1's ``_ActorMethodOptionsWrapper``, which keeps the real
+    ``ActorMethod`` in ``_actor_method`` and delegates ``remote``.
+    """
+
+    def __init__(self, actor_method):
+        self._actor_method = actor_method
+
+    def remote(self, *args, **kwargs):
+        return self._actor_method.remote(*args, **kwargs)
+
+
+@requires_lens
+def test_the_refusal_warning_is_still_once_per_method_through_options(caplog):
+    """Both NeMo-Gym dispatch sites go through ``.options``.
+
+    Keying on the handle's repr would embed a fresh address per call, so the
+    warning would repeat every dispatch and name a wrapper rather than the
+    method the reader has to go and decorate.
+    """
+    handle, _ = _setup("all")
+    underlying = _RefusesCarrier("run_rollouts")
+    with managed_span(RLSpanGroup.JOB, "rl.grpo.job", tracer=handle.tracer):
+        with caplog.at_level(logging.WARNING):
+            dispatch_with_trace_context(_OptionsWrapper(underlying), 1)
+        assert "run_rollouts" in caplog.text
+
+        # A second .options() call is a different wrapper object, same method.
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            dispatch_with_trace_context(_OptionsWrapper(underlying), 2)
+        assert caplog.text == ""
+    handle.shutdown()
+
+    assert underlying.calls == [((1,), {}), ((2,), {})]
+
+
 @requires_lens
 def test_an_unrelated_type_error_still_propagates():
     """Only the carrier kwarg is swallowed -- a real signature mistake is not."""

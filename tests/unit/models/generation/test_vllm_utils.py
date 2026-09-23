@@ -974,6 +974,75 @@ def test_a_renamed_series_is_omitted_rather_than_reported_as_zero():
     assert metrics == {}
 
 
+@pytest.mark.vllm
+def test_engine_metric_names_match_vllm():
+    """The series names are copies of vLLM's, so they can go stale silently.
+
+    A renamed series is omitted rather than reported as zero, which is the
+    right runtime behaviour but leaves no error to notice -- the dashboard just
+    loses a line. Checking the copies against vLLM's own declarations turns
+    that into a test failure at the version bump that causes it.
+    """
+    pytest.importorskip("vllm")
+
+    import inspect
+
+    from vllm.v1.metrics.loggers import PrometheusStatLogger
+
+    from nemo_rl.models.generation.vllm.metric_names import (
+        FINISHED_REASON_LABEL,
+        GENERATION_LENGTH_HISTOGRAMS,
+        GENERATION_TOKEN_COUNTERS,
+        PROMPT_LENGTH_HISTOGRAMS,
+        PROMPT_TOKEN_COUNTERS,
+        REQUEST_SUCCESS_COUNTERS,
+    )
+
+    # vLLM declares each of these as a literal ``name=`` on the collector, so
+    # the names it registers are readable straight off the source. Reading the
+    # registry instead would mean standing up an engine.
+    declared = inspect.getsource(PrometheusStatLogger)
+    expected = (
+        *PROMPT_TOKEN_COUNTERS,
+        *GENERATION_TOKEN_COUNTERS,
+        *PROMPT_LENGTH_HISTOGRAMS,
+        *GENERATION_LENGTH_HISTOGRAMS,
+        *REQUEST_SUCCESS_COUNTERS,
+    )
+    missing = [name for name in expected if f'name="{name}"' not in declared]
+
+    assert not missing, (
+        f"vLLM no longer declares {missing}; these step metrics will silently "
+        "stop being reported. Update nemo_rl/models/generation/vllm/metric_names.py."
+    )
+    assert f'"{FINISHED_REASON_LABEL}"' in declared
+
+
+def test_a_counter_that_went_backwards_is_omitted_rather_than_negative():
+    """These totals are summed over workers, so a drop means an engine restarted.
+
+    restart_shard replaces a worker's engine and its counters start from zero,
+    so the step's true count is unknown -- reporting end minus start would put
+    a negative token count on the dashboard.
+    """
+    start = _engine_snapshot(
+        1000.0, 500.0, 1000.0, 10.0, 500.0, 10.0, {"stop": 8.0, "abort": 2.0}
+    )
+    # One of two workers restarted, so the fleet totals are below where they
+    # were, except generation_tokens which still grew overall.
+    end = _engine_snapshot(
+        400.0, 900.0, 400.0, 4.0, 900.0, 12.0, {"stop": 3.0, "abort": 1.0}
+    )
+
+    metrics = compute_engine_step_metrics(start, end)
+
+    assert "vllm/prompt_tokens" not in metrics
+    assert "vllm/generations_ok" not in metrics
+    assert "vllm/generations_failed" not in metrics
+    # The series that did grow is still reported.
+    assert metrics["vllm/generation_tokens"] == 400.0
+
+
 def test_engine_metrics_accept_the_alternate_total_suffixed_names():
     """``vllm:prompt_tokens`` has also shipped as ``vllm:prompt_tokens_total``."""
     metrics = compute_engine_step_metrics(
