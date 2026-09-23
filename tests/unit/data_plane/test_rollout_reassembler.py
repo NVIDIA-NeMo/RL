@@ -43,7 +43,12 @@ from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
     StagedCallRecord,
 )
 
-from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS  # noqa: E402
+from nemo_rl.data.multimodal_utils import (  # noqa: E402
+    WIRE_MULTIMODAL_FIELDS,
+    PackedTensor,
+    reassemble_packed_multimodal,
+    row_shapes_key,
+)
 from nemo_rl.data_plane.schema import (  # noqa: E402
     ROUTE_PASSTHROUGH_FLAG,
     ROUTE_PLAN_TAG,
@@ -947,24 +952,32 @@ def media_partitions(tq_client):
     tq_client.clear_samples(sample_ids=None, partition_id=MEDIA_CANONICAL_PARTITION)
 
 
-def _still_images(*sizes: tuple[int, int], seed: int) -> dict[str, torch.Tensor]:
+def _still_images(
+    *sizes: tuple[int, int], seed: int, dtype: torch.dtype = MEDIA_PIXEL_DTYPE
+) -> dict[str, torch.Tensor]:
     """MInf packed patches for ``sizes`` (h, w) still images: ``[1, patches, 3*P*P]``."""
     sizes_t = torch.tensor(sizes, dtype=torch.int32)
     patches = int((sizes_t[:, 0] * sizes_t[:, 1]).sum()) // MEDIA_PATCH**2
     generator = torch.Generator().manual_seed(seed)
     imgs = torch.randn(1, patches, 3 * MEDIA_PATCH**2, generator=generator)
-    return {"imgs": imgs.to(MEDIA_PIXEL_DTYPE), "imgs_sizes": sizes_t}
+    return {"imgs": imgs.to(dtype), "imgs_sizes": sizes_t}
 
 
 def _stage_media_rollout(
-    tq_client, rollout_id: str, *, media: bool = True, second_turn: bool = False
+    tq_client,
+    rollout_id: str,
+    *,
+    media: bool = True,
+    second_turn: bool = False,
+    pixel_dtype: torch.dtype = MEDIA_PIXEL_DTYPE,
 ):
     """Stage a rollout on the media partition; each call carries only its new image.
 
     Returns ``(receipt_dict, expected_row, [per-call bundle or None])``. With
     ``second_turn`` the chain is the two-call golden fixture, and the second
     call carries a second image, so the finalizer must concatenate the two
-    calls' pixels in chain order.
+    calls' pixels in chain order. ``pixel_dtype`` is the partition's pinned
+    pixel dtype (bf16 for the vLLM worker, float32 for the Megatron worker).
     """
     records, receipt, row = build_fixture_artifacts(
         "worked_example" if second_turn else "single_call", rollout_id=rollout_id
@@ -973,10 +986,10 @@ def _stage_media_rollout(
         tq_client,
         staging_partition=MEDIA_STAGING_PARTITION,
         capture_media=True,
-        media_pixel_dtype=MEDIA_PIXEL_DTYPE,
+        media_pixel_dtype=pixel_dtype,
     )
     bundles = [
-        _still_images((4, 4), seed=index) if media else None
+        _still_images((4, 4), seed=index, dtype=pixel_dtype) if media else None
         for index in range(len(records))
     ]
     for record, bundle in zip(records, bundles, strict=True):
@@ -1005,16 +1018,29 @@ def _assert_staging_cleared(tq_client, staging_keys: list[str]) -> None:
             source.fetch_for_finalization([key])
 
 
-@pytest.mark.parametrize("case", ["attached", "two-call-chain", "no-media-tensors"])
-def test_finalize_rollout_media(tq_client, media_partitions, case):
+@pytest.mark.parametrize(
+    ("case", "pixel_dtype"),
+    [
+        # Both backends' pinned pixel dtypes round-trip the finalizer read-back
+        # and pack_payload unchanged.
+        ("attached", torch.bfloat16),
+        ("attached", torch.float32),
+        ("two-call-chain", torch.bfloat16),
+        ("no-media-tensors", torch.bfloat16),
+    ],
+    ids=["attached-bf16", "attached-f32", "two-call-chain", "no-media-tensors"],
+)
+def test_finalize_rollout_media(tq_client, media_partitions, case, pixel_dtype):
     """Media on the call rows: each call's row says whether it carries media,
     the per-call deltas are concatenated along the chain, and the packed-patch
-    layout is handed to the trainer unchanged (one frame per still image)."""
+    layout (and dtype) is handed to the trainer unchanged (one frame per still
+    image)."""
     receipt, expected, bundles = _stage_media_rollout(
         tq_client,
         "mm",
         media=case != "no-media-tensors",
         second_turn=case == "two-call-chain",
+        pixel_dtype=pixel_dtype,
     )
 
     row = _media_finalizer(tq_client).finalize_rollout("mm", receipt, reward=1.0)
@@ -1031,7 +1057,7 @@ def test_finalize_rollout_media(tq_client, media_partitions, case):
     pixels = row.media["pixel_values"].as_tensor()
     # [1, total_patches, F] squeezed to [total_patches, F]; 4 patches per image.
     assert pixels.shape == (4 * len(bundles), 3 * MEDIA_PATCH**2)
-    assert pixels.dtype == MEDIA_PIXEL_DTYPE
+    assert pixels.dtype == pixel_dtype
     assert torch.equal(pixels, expected_pixels.squeeze(0))
     assert row.media["imgs_sizes"].as_tensor().tolist() == [[4, 4]] * len(bundles)
     assert row.media["num_frames"].as_tensor().tolist() == [1] * len(bundles)
@@ -1040,12 +1066,6 @@ def test_finalize_rollout_media(tq_client, media_partitions, case):
 def test_finalize_group_publishes_media_with_empty_rows_for_text_siblings(
     tq_client, media_partitions
 ):
-    from nemo_rl.data.multimodal_utils import (
-        PackedTensor,
-        reassemble_packed_multimodal,
-        row_shapes_key,
-    )
-
     group_id = "mmgrp"
     rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
     receipt, _, [bundle] = _stage_media_rollout(tq_client, rollout_ids[0])

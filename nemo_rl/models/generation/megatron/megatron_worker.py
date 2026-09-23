@@ -293,6 +293,9 @@ class MegatronGenerationMixin:
     processor: Optional[Any] = None
     inference_model = None
     _colocated_reshard_plan = None
+    # Raw-image preprocessing the engine was built with; None when the
+    # inference wrapper is text-only (see _build_image_preprocessing_config).
+    _image_preprocessing_config: Optional[Any] = None
 
     def _gen_model(self) -> MegatronModule:
         """The model the inference engine wraps.
@@ -569,6 +572,7 @@ class MegatronGenerationMixin:
         image_preprocessing_config = self._build_image_preprocessing_config(
             mcore_generation_config
         )
+        self._image_preprocessing_config = image_preprocessing_config
         video_preprocessing_config = build_video_preprocessing_config(
             image_preprocessing_config,
             mcore_generation_config,
@@ -984,6 +988,14 @@ class MegatronGenerationMixin:
         staging schema so the stager can hand the engine's media tensors to
         TQ beside each call's tokens.
         """
+        if capture_media and self._image_preprocessing_config is None:
+            # Without image preprocessing the engine never produces media
+            # tensors, so a media-enabled partition would only ever receive
+            # text sentinels; fail at setup instead of training image-blind.
+            raise ValueError(
+                "Megatron media capture requires an image-capable inference wrapper "
+                "(mcore_generation_config.megatron_inference_wrapper)"
+            )
         engine = self.dynamic_inference_engine
         if engine is None:
             raise RuntimeError(
@@ -1012,13 +1024,7 @@ class MegatronGenerationMixin:
         )
 
         dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
-        # MInf's wire preprocessing (dynamic_text_gen_server/image_preprocessing
-        # .preprocess_image: torchvision ToTensor + Normalize) emits packed
-        # patches in float32 and nothing downstream recasts them before the
-        # payload stager takes custody (the vision encoder casts internally),
-        # so the media column is pinned to float32. The sink rejects any other
-        # pixel dtype, and text-call sentinels never introduce a second dtype
-        # (TQ keeps one dtype per field).
+        # Pins the media column to what MInf emits (see MINF_MEDIA_PIXEL_DTYPE).
         pixel_dtype = MINF_MEDIA_PIXEL_DTYPE if capture_media else None
         prompt_preparer = TQMegatronPromptPreparer(
             TQTokenSource(

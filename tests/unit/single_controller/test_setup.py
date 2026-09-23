@@ -24,7 +24,7 @@ import types
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 import torch
@@ -3125,7 +3125,7 @@ def test_token_capture_megatron_registers_media_columns_only_for_multimodal(
             {0: 5555},
             port_holders,
         )
-        setup_single_controller(
+        actor_args, _ = setup_single_controller(
             mc,
             MagicMock(pad_token_id=0),
             processor=MagicMock(name="processor") if multimodal else None,
@@ -3150,13 +3150,12 @@ def test_token_capture_megatron_registers_media_columns_only_for_multimodal(
     # in a media run it must be dropped (see RolloutReassembler.finalize_group).
     finalizer_config = mock_finalizers.call_args.args[1]
     assert finalizer_config.capture_media is multimodal
-    # The workers build their sink/source against the same schema. This
-    # config is non-colocated, so the backend comes from the patched
-    # _build_generation factory rather than the MegatronGeneration class.
-    mock_megatron.return_value.setup_token_capture.assert_not_called()
-    generation = patched_factories["_build_generation"].return_value[0]
-    setup_call = generation.setup_token_capture.call_args
-    assert setup_call.kwargs["capture_media"] is multimodal
+    # The workers build their sink/source against the same schema; the handle
+    # setup hands the actor is the backend it configured, whichever factory
+    # (colocated MegatronGeneration or _build_generation) produced it.
+    actor_args.gen_handle.setup_token_capture.assert_called_once_with(
+        ANY, mc.token_capture.staging_partition, capture_media=multimodal
+    )
 
 
 @pytest.mark.mcore
@@ -3175,3 +3174,36 @@ def test_offloaded_payload_exposes_multimodal_capture_fields():
         for field in dataclasses.fields(inference_request.OffloadedRequestPayload)
     }
     assert {"media_tensors", "compact_prompt_token_ids"} <= names
+
+
+@pytest.mark.mcore
+def test_minf_image_preprocessing_emits_pinned_pixel_dtype():
+    """Pin the premise behind MINF_MEDIA_PIXEL_DTYPE: MInf's wire image path
+    hands the payload stager float32 packed patches, whatever the model's
+    params dtype, so the Megatron worker's media column must match it."""
+    # Deferred imports: megatron-core (and its torchvision dependency for the
+    # image path) are heavy, optional dependencies of the mcore lane only.
+    Image = pytest.importorskip("PIL.Image")
+    pytest.importorskip("torchvision")
+    from megatron.core.inference.config import ImageProcessingConfig
+    from megatron.core.inference.text_generation_server.dynamic_text_gen_server.image_preprocessing import (
+        preprocess_image,
+    )
+
+    from nemo_rl.models.generation.megatron.megatron_worker import (
+        MINF_MEDIA_PIXEL_DTYPE,
+    )
+
+    # 4x4 RGB with 2x2 patches: dynamic resolution keeps it at a 2x2 patch grid.
+    config = ImageProcessingConfig(
+        patch_dim=2,
+        dynamic_resolution=True,
+        pixel_mean=[0.5, 0.5, 0.5],
+        pixel_std=[0.5, 0.5, 0.5],
+    )
+    imgs, imgs_sizes = preprocess_image(Image.new("RGB", (4, 4)), config)
+
+    assert imgs.dtype == MINF_MEDIA_PIXEL_DTYPE
+    assert tuple(imgs.shape) == (1, 4, 3 * 2 * 2)
+    assert imgs_sizes.dtype == torch.int32
+    assert imgs_sizes.tolist() == [[4, 4]]
