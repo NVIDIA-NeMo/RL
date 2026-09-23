@@ -119,9 +119,23 @@ def test_metrics_report_a_rate_for_every_configured_rule():
     assert mask_rule_metrics({}, (), 16) == {}
     assert mask_rule_metrics({"eval_incomplete": 4}, rules, 0) == {}
     assert mask_rule_metrics(
-        {"eval_incomplete": 4, "harness_unfinished": 1}, rules, 16
+        {"eval_incomplete": 4, "harness_unfinished": 1},
+        rules,
+        16,
+        reward_sums={"eval_incomplete": 1.0, "harness_unfinished": 0.0},
+        any_count=4,
     ) == {
         "mask_rules/eval_incomplete_rate": 0.25,
+        "mask_rules/eval_incomplete_reward_mean": 0.25,
         "mask_rules/harness_unfinished_rate": 1 / 16,
+        "mask_rules/harness_unfinished_reward_mean": 0.0,
         "mask_rules/verify_status_rate": 0.0,
+        "mask_rules/any_rate": 0.25,
+    }
+    # Without reward sums only the rates (and any_rate) are reported.
+    assert mask_rule_metrics({"eval_incomplete": 2}, rules, 8) == {
+        "mask_rules/eval_incomplete_rate": 0.25,
+        "mask_rules/harness_unfinished_rate": 0.0,
+        "mask_rules/verify_status_rate": 0.0,
+        "mask_rules/any_rate": 0.0,
     }
