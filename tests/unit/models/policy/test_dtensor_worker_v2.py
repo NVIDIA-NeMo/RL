@@ -749,6 +749,33 @@ def test_prepare_refit_info_preserves_fp32_router_correction_bias():
 
 @pytest.mark.automodel
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+def test_prepare_refit_info_preserves_fp32_router_bias_after_adapter_rename():
+    """Refit metadata must select special dtypes using the native key."""
+
+    class RouterAdapter:
+        def convert_single_tensor_to_hf(self, fqn, tensor, **_kwargs):
+            assert fqn == "e_score_correction_bias"
+            return [("model.layers.0.mlp.gate.bias", tensor)]
+
+    class RouterModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer(
+                "e_score_correction_bias", torch.arange(4, dtype=torch.float32)
+            )
+            self.state_dict_adapter = RouterAdapter()
+
+    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+    worker.model = RouterModel()
+    worker.dtype = torch.bfloat16
+
+    refit_info = DTensorPolicyWorkerV2Impl.prepare_refit_info(worker)
+
+    assert refit_info["model.layers.0.mlp.gate.bias"][1] == torch.float32
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
 class TestAutocastContext:
     """Tests for the precision context retained by the policy worker."""
 

@@ -1078,9 +1078,7 @@ class DTensorPolicyWorkerV2Impl(
                 self.model, name, full_tensor
             )
             for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
-                refit_dtype = _refit_tensor_dtype(
-                    adapted_fqn, adapted_tensor, self.dtype
-                )
+                refit_dtype = _refit_tensor_dtype(name, adapted_tensor, self.dtype)
                 state_dict_info[adapted_fqn] = (adapted_tensor.shape, refit_dtype)
 
         return state_dict_info
