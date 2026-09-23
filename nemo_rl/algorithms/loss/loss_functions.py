@@ -971,7 +971,9 @@ class ClippedPGLossFn(LossFunction):
                 "probs_ratio_max": probs_ratio_max,
                 "probs_ratio_clamped_min": probs_ratio_clamped_min,
                 "probs_ratio_clamped_max": probs_ratio_clamped_max,
-                KL_PENALTY_KEY: kl.item() / self.reference_policy_kl_penalty if kl else 0,
+                KL_PENALTY_KEY: kl.item() / self.reference_policy_kl_penalty
+                if kl
+                else 0,
                 "token_mult_prob_error": mult_prob_error,
                 "gen_kl_error": gen_kl_error,
                 "policy_kl_error": policy_kl_error,

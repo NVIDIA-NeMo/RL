@@ -143,10 +143,9 @@ from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.instrumentation import (
-    Bucket,
-    bucket_scope,
     current_trace_carrier,
     efficiency_span,
+    evaluate_span,
     managed_span,
     umbrella_span,
     umbrella_trace_fn,
@@ -4256,25 +4255,9 @@ def validate(
         return {}, {}
 
     timer = Timer(context={"worker": "validator"})
-    _telemetry = get_telemetry_handle()
-    _tracer = _telemetry.tracer if _telemetry is not None else None
     with (
         timer.time("total_validation_time"),
-        umbrella_span(
-            RLSpanGroup.U_EVALUATE,
-            "rl.grpo.evaluate",
-            tracer=_tracer,
-            **{"rl.step": step},
-        ),
-        # Validation generates through the same path as training rollouts, but
-        # its tokens are scored and thrown away — no weights advance. Without
-        # this the generate spans below land in productive and a validation
-        # pass reads as goodput. Effective on the sync rollout path, which is
-        # where those spans exist; async validation goes through
-        # generate_async, which carries no span yet (see the coverage gaps in
-        # nemo_rl/telemetry/README.md). The scope is set regardless so it
-        # applies as soon as that path is instrumented.
-        bucket_scope(Bucket.OVERHEAD),
+        evaluate_span("grpo", **{"rl.step": step}),
     ):
         print(f"▶ Starting validation at step {step}...", flush=True)
         # >= 1 is validated in setup().

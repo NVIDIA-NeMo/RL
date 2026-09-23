@@ -306,6 +306,9 @@ def _emitted_span_names(
     if called == "setup_span":
         phase = _string_arg(node)
         return {f"rl.setup.{phase}"} if phase else set()
+    if called == "evaluate_span":
+        algorithm = _string_arg(node)
+        return {f"rl.{algorithm}.evaluate"} if algorithm else set()
     if called == "efficiency_span":
         category = _string_arg(node)
         return {f"rl.{category.replace('/', '.')}"} if category else set()
@@ -396,6 +399,7 @@ def test_every_registered_group_has_an_emitter():
     fixed_group_helpers = {
         "startup_span": RLSpanGroup.SETUP,
         "setup_span": RLSpanGroup.SETUP,
+        "evaluate_span": RLSpanGroup.U_EVALUATE,
         "efficiency_span": RLSpanGroup.EFFICIENCY,
         "traced_worker_init": RLSpanGroup.MODEL_INIT,
     }

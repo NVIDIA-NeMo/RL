@@ -97,6 +97,7 @@ def _campaign_stage(algorithm: str) -> str:
     """Lifecycle stage for *algorithm*; :data:`_DEFAULT_CAMPAIGN_STAGE` if unknown."""
     return _CAMPAIGN_STAGE_BY_ALGORITHM.get(algorithm, _DEFAULT_CAMPAIGN_STAGE)
 
+
 # TelemetryConfig field -> NEMO_RL_OTEL_* env var. ``service_name`` maps to the
 # standard ``OTEL_SERVICE_NAME`` (lens reads it directly, unprefixed).
 _ENV_FIELD_MAP = {

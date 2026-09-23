@@ -36,6 +36,7 @@ from typing import (
     Any,
     Callable,
     ContextManager,
+    Final,
     Iterator,
     Mapping,
     Optional,
@@ -107,6 +108,7 @@ __all__ = [
     "start_efficiency_span",
     "startup_span",
     "setup_span",
+    "evaluate_span",
     "RL_EFFICIENCY_CATEGORY_ATTR",
     "RL_IDLE_POLLS_ATTR",
 ]
@@ -884,6 +886,35 @@ def setup_span(
     with _managed_span(
         RLSpanGroup.SETUP, f"rl.setup.{phase}", tracer=tracer, **attributes
     ) as span:
+        yield span
+
+
+@contextmanager
+def evaluate_span(
+    algorithm: str, tracer: Optional[Tracer] = None, **attributes: Any
+) -> Iterator[Any]:
+    """One validation pass, named ``rl.<algorithm>.evaluate``.
+
+    Validation generates through the same path as training rollouts, but its
+    tokens are scored and thrown away -- no weights advance -- so the enclosed
+    generate spans are overhead rather than goodput. The bucket scope is part
+    of the helper because every algorithm's validation has that property, and
+    three of the six sites that predate it had already drifted without one.
+
+    The scope only bites on the sync rollout path, which is where those spans
+    exist; async validation goes through ``generate_async``, which carries no
+    span yet. It is set regardless, so it applies as soon as that is
+    instrumented.
+    """
+    with (
+        _managed_span(
+            RLSpanGroup.U_EVALUATE,
+            f"rl.{algorithm}.evaluate",
+            tracer=tracer,
+            **attributes,
+        ) as span,
+        bucket_scope(Bucket.OVERHEAD),
+    ):
         yield span
 
 

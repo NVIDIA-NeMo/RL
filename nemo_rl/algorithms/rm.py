@@ -41,6 +41,7 @@ from nemo_rl.models.policy.interfaces import PolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.instrumentation import (
+    evaluate_span,
     managed_span,
     umbrella_span,
     umbrella_trace_fn,
@@ -372,16 +373,9 @@ def validate_one_dataset(
         return
 
     timer = Timer()
-    _telemetry = get_telemetry_handle()
-    _tracer = _telemetry.tracer if _telemetry is not None else None
-
     with (
         timer.time("total_validation_time"),
-        umbrella_span(
-            RLSpanGroup.U_EVALUATE,
-            "rl.rm.evaluate",
-            tracer=_tracer,
-        ),
+        evaluate_span("rm"),
     ):
         print(f"▶ Starting validation at step {step} for `{dataset_name}` set..")
 

@@ -45,8 +45,8 @@ from nemo_rl.algorithms.loss import (
     ClippedPGLossFn,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
-from nemo_rl.algorithms.metric_utils import SETUP_TIMING_PREFIX
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig, MseValueLossFn
+from nemo_rl.algorithms.metric_utils import SETUP_TIMING_PREFIX
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
     apply_reward_shaping,
@@ -100,8 +100,7 @@ from nemo_rl.models.value import Value, ValueConfig
 from nemo_rl.models.value.interfaces import ValueInterface
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.instrumentation import (
-    Bucket,
-    bucket_scope,
+    evaluate_span,
     managed_span,
     umbrella_span,
     umbrella_trace_fn,
@@ -3206,18 +3205,9 @@ def validate(
         return {}, {}
 
     timer = Timer()
-    _telemetry = get_telemetry_handle()
-    _tracer = _telemetry.tracer if _telemetry is not None else None
     with (
         timer.time("total_validation_time"),
-        umbrella_span(
-            RLSpanGroup.U_EVALUATE,
-            "rl.ppo.evaluate",
-            tracer=_tracer,
-        ),
-        # Scored-and-discarded generation: overhead, not goodput. See the same
-        # scope in nemo_rl/algorithms/grpo.py::validate.
-        bucket_scope(Bucket.OVERHEAD),
+        evaluate_span("ppo"),
     ):
         print(f"▶ Starting validation at step {step}...", flush=True)
 

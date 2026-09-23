@@ -49,6 +49,7 @@ from nemo_rl.models.generation.vllm.config import (
     REFITTABLE_FP8_KV_CACHE_DTYPES,
     VllmConfig,
 )
+from nemo_rl.models.generation.vllm.metric_names import BATCH_DURATION_KEY
 from nemo_rl.models.generation.vllm.utils import (
     aggregate_spec_decode_counters,
     assert_refit_unsupported_grouped_moe_params,
@@ -58,7 +59,6 @@ from nemo_rl.models.generation.vllm.utils import (
     resolve_generation_worker_cls,
 )
 from nemo_rl.telemetry.instrumentation import trace_fn
-from nemo_rl.models.generation.vllm.metric_names import BATCH_DURATION_KEY
 from nemo_rl.telemetry.metrics import record_rl_metrics, warn_once
 from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.span_groups import RLSpanGroup
