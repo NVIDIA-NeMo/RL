@@ -596,6 +596,8 @@ class TQPolicy(TQDriverMixin, Policy):
     # ``begin``, so no step identifier is threaded through the API):
     #   begin_train_step                    — open step; broadcast loss_fn/gbs/mbs
     #   train_microbatches_from_meta (N×)   — DP-sharded fwd/bwd, grads accumulate
+    #   offload_train_step (optional)      — preserve grads while a critic runs
+    #   prepare_for_training              — restore an offloaded step
     #   finish_train_step                   — all_reduce + opt.step + sched.step
     #   abort_train_step                    — drop accumulators, no opt.step
     #
@@ -621,6 +623,17 @@ class TQPolicy(TQDriverMixin, Policy):
             gbs=batch_size,
             mbs=micro_batch_size,
         )
+        ray.get(futures)
+
+    def offload_train_step(self) -> None:
+        """Park an open policy step on CPU without discarding its gradients.
+
+        Used by colocated PPO between streaming chunks while the value model
+        occupies the training GPUs. ``prepare_for_training`` restores the
+        accumulated gradients before the next policy chunk. Only the Megatron
+        DDP worker supports this lifecycle.
+        """
+        futures = self.worker_group.run_all_workers_single_data("offload_train_step")
         ray.get(futures)
 
     def train_microbatches_from_meta(

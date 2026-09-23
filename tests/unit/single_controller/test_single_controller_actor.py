@@ -27,6 +27,10 @@ from ray.exceptions import ActorDiedError
 from tensordict import TensorDict
 
 import nemo_rl.algorithms.single_controller as single_controller
+from nemo_rl.algorithms.advantage_estimator import (
+    GAEConfig,
+    GeneralizedAdvantageEstimator,
+)
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     DATA_PLANE_CHECKPOINT_DIR,
     REPLAY_BUFFER_METADATA_FILENAME,
@@ -1433,6 +1437,9 @@ class _NoOpTrainer:
     def offload_to_cpu(self) -> None:
         pass
 
+    def offload_train_step(self) -> None:
+        pass
+
 
 class _LpRecordingTrainer(_NoOpTrainer):
     """Records ``keep_train_buffers`` flags and the per-chunk call order.
@@ -1615,6 +1622,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._rollout_exhausted.set()
     ctrl._trainer = _NoOpTrainer()
     ctrl._is_ppo = False
+    ctrl._streaming_ppo = False
     ctrl._ppo_epochs = 1
     ctrl._critic_ppo_epochs = 1
     ctrl._value = None
@@ -1636,6 +1644,8 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._timer = Timer()
     ctrl._trainer_version = 0
     ctrl._train_steps = 0
+    ctrl._checkpoint_save_lock = asyncio.Lock()
+    ctrl._optimizer_commit_in_progress = False
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._batch_shortfall = {}
     ctrl._batch_replacements = {}
@@ -2515,6 +2525,434 @@ def test_train_pump_runs_all_critic_epochs_before_actor_epochs(monkeypatch) -> N
         "policy.finish_train_step",
     ]
     ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
+
+
+class _StreamingPPOTrainer(_EpochRecordingTrainer):
+    """Reject destructive offload while an optimizer step owns accumulated grads."""
+
+    def __init__(self, calls: list[str]) -> None:
+        super().__init__(calls)
+        self.step_open = False
+        self.trained_metas: list[KVBatchMeta] = []
+        self.sharding_annotations = SimpleNamespace(get_axis_size=lambda axis: 1)
+
+    def begin_train_step(self, loss_fn) -> None:
+        assert not self.step_open
+        self.step_open = True
+        super().begin_train_step(loss_fn)
+
+    def train_microbatches_from_meta(
+        self, meta: KVBatchMeta, *, train_fields: tuple[str, ...]
+    ) -> None:
+        assert self.step_open
+        self.trained_metas.append(meta)
+        super().train_microbatches_from_meta(meta, train_fields=train_fields)
+
+    def finish_train_step(self) -> dict:
+        assert self.step_open
+        self.step_open = False
+        return super().finish_train_step()
+
+    def offload_train_step(self) -> None:
+        assert self.step_open
+        self.calls.append("policy.offload_train_step")
+
+    def offload_to_cpu(self) -> None:
+        assert not self.step_open, "pending policy gradients would be lost"
+        super().offload_to_cpu()
+
+    def finish_inference(self) -> None:
+        assert not self.step_open, "pending policy gradients would be lost"
+        super().finish_inference()
+
+
+class _StreamingPPOValue(_NoOpValue):
+    def __init__(self, calls: list[str]) -> None:
+        super().__init__(calls=calls, prefix="critic.")
+        self.trained_metas: list[KVBatchMeta] = []
+        self.sharding_annotations = SimpleNamespace(get_axis_size=lambda axis: 1)
+
+    def train_from_meta(self, meta: KVBatchMeta, loss_fn) -> dict:
+        self.trained_metas.append(meta)
+        return super().train_from_meta(meta, loss_fn)
+
+
+class _StreamingPPODataPlane(_NoOpDataPlane):
+    def __init__(self, calls: list[str]) -> None:
+        self.calls = calls
+        self.cleared_ids: list[str] = []
+
+    def clear_samples(self, *, sample_ids: list[str], partition_id: str) -> None:
+        del partition_id
+        self.cleared_ids.extend(sample_ids)
+        self.calls.append("clear_samples")
+
+
+def _streaming_ppo_controller(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    valid_chunks: tuple[bool, ...] = (True, True, True),
+    critic_epochs: int = 2,
+    warmup: bool = False,
+) -> tuple[object, list[KVBatchMeta], list[str]]:
+    calls: list[str] = []
+    metas = [
+        KVBatchMeta(
+            partition_id="rollout_data",
+            task_name="train",
+            sample_ids=[f"group-{index}_g0"],
+            fields=["input_ids", "token_mask"],
+            sequence_lengths=[index + 1],
+            tags=[{"weight_version": 0}],
+        )
+        for index in range(len(valid_chunks))
+    ]
+    ctrl, _ = _ppo_train_pump_controller(
+        sampler=_SequenceSampler(metas),
+        value=_StreamingPPOValue(calls),
+        critic_ppo_epochs=critic_epochs,
+        policy_training_start_step=int(warmup),
+    )
+    ctrl._streaming_ppo = True
+    ctrl._algo_cfg.num_prompts_per_step = len(metas)
+    ctrl._master_config.policy = {"dynamic_batching": {"enabled": True}}
+    ctrl._master_config.value = {"dynamic_batching": {"enabled": True}}
+    ctrl._trainer = _StreamingPPOTrainer(calls)
+    ctrl._dp_client = _StreamingPPODataPlane(calls)
+    ctrl._policy_logprobs_required = True
+    validity = iter(valid_chunks)
+
+    async def advantage_stage(meta: KVBatchMeta) -> tuple[KVBatchMeta, bool]:
+        assert "values" in meta.fields
+        calls.append("gae")
+        return meta.with_fields(["advantages", "returns"]), next(validity)
+
+    async def sync_weights(*, calibration_data) -> int:
+        assert calibration_data is None
+        assert ctrl._trainer_version == 1
+        assert ctrl._optimizer_commit_in_progress
+        calls.append("refit")
+        return 0
+
+    ctrl._advantage_stage = AsyncMock(side_effect=advantage_stage)
+    ctrl._sync_weights = AsyncMock(side_effect=sync_weights)
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+    return ctrl, metas, calls
+
+
+@pytest.mark.parametrize("critic_epochs", [1, 2, 4])
+def test_streaming_ppo_accumulates_policy_then_trains_full_batch_critic(
+    monkeypatch: pytest.MonkeyPatch, critic_epochs: int
+) -> None:
+    ctrl, metas, calls = _streaming_ppo_controller(
+        monkeypatch, critic_epochs=critic_epochs
+    )
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    chunk_phases = {
+        "critic.get_values_from_meta",
+        "policy.get_logprobs_from_meta",
+        "gae",
+        "policy.train_microbatches_from_meta",
+    }
+    assert [call for call in calls if call in chunk_phases] == [
+        "critic.get_values_from_meta",
+        "policy.get_logprobs_from_meta",
+        "gae",
+        "policy.train_microbatches_from_meta",
+    ] * len(metas)
+    assert calls.count("policy.begin_train_step") == 1
+    assert calls.count("policy.finish_train_step") == 1
+    # Every handoff to another critic forward must save the partial policy step.
+    assert calls.count("policy.offload_train_step") == len(metas) - 1
+    assert calls.index("policy.finish_train_step") < calls.index("refit")
+    assert calls.index("refit") < calls.index("critic.prepare_for_training")
+    assert calls.count("critic.prepare_for_training") == 1
+    assert calls.count("critic.train_from_meta") == critic_epochs
+    assert calls.count("critic.finish_training") == 1
+    # Neither canonical rows nor their retained GAE results may disappear early.
+    assert calls.index("critic.finish_training") < calls.index("clear_samples")
+    all_ids = [sample_id for meta in metas for sample_id in meta.sample_ids]
+    for critic_meta in ctrl._value.trained_metas:
+        assert critic_meta.sample_ids == all_ids
+        assert critic_meta.sequence_lengths == [1, 2, 3]
+        assert {"values", "advantages", "returns"} <= set(critic_meta.fields)
+    assert ctrl._dp_client.cleared_ids == all_ids
+    assert [meta.sample_ids for meta in ctrl._trainer.trained_metas] == [
+        meta.sample_ids for meta in metas
+    ]
+    ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
+    ctrl._rollout_manager.set_weight_version.assert_called_once_with(1)
+    assert ctrl._train_steps == ctrl._trainer_version == 1
+    assert not ctrl._optimizer_commit_in_progress
+
+
+@pytest.mark.parametrize(
+    (
+        "policy_dp",
+        "value_dp",
+        "generations",
+        "batching",
+        "value_inference_mbs",
+        "expected_multiple",
+    ),
+    [
+        (8, 4, 1, "dynamic_batching", None, 8),
+        (8, 4, 2, "dynamic_batching", None, 4),
+        (8, 4, 3, "dynamic_batching", None, 8),
+        (6, 4, 8, "dynamic_batching", None, 3),
+        (8, 4, 2, "sequence_packing", None, 4),
+        # Static policy microbatches require 4*2 and 4*3 samples; value
+        # inference falls back to its 2*5 train microbatch size: LCM=120.
+        (4, 2, 1, "static", None, 120),
+        (4, 2, 5, "static", None, 24),
+        # Explicit value inference mbs=2 reduces the sample alignment to24.
+        (4, 2, 1, "static", 2, 24),
+    ],
+)
+def test_streaming_ppo_aligns_complete_groups_to_both_model_dp_sizes(
+    monkeypatch: pytest.MonkeyPatch,
+    policy_dp: int,
+    value_dp: int,
+    generations: int,
+    batching: str,
+    value_inference_mbs: int | None,
+    expected_multiple: int,
+) -> None:
+    ctrl, _, _ = _streaming_ppo_controller(monkeypatch, valid_chunks=(True, True))
+    ctrl._trainer.sharding_annotations.get_axis_size = MagicMock(return_value=policy_dp)
+    ctrl._value.sharding_annotations.get_axis_size = MagicMock(return_value=value_dp)
+    ctrl._algo_cfg.num_generations_per_prompt = generations
+    ctrl._algo_cfg.num_prompts_per_step = 2 * expected_multiple
+    ctrl._master_config.policy = {
+        "train_micro_batch_size": 2,
+        "logprob_batch_size": 3,
+        "dynamic_batching": {"enabled": batching == "dynamic_batching"},
+        "sequence_packing": {"enabled": batching == "sequence_packing"},
+    }
+    ctrl._master_config.value = {
+        "train_micro_batch_size": 5,
+        "dynamic_batching": {"enabled": batching == "dynamic_batching"},
+        "sequence_packing": {"enabled": batching == "sequence_packing"},
+    }
+    if value_inference_mbs is not None:
+        ctrl._master_config.value["logprob_batch_size"] = value_inference_mbs
+    sample_count = expected_multiple * generations
+    metas = [
+        KVBatchMeta(
+            partition_id="rollout_data",
+            task_name="train",
+            sample_ids=[
+                f"chunk-{chunk}-group-{group}_g{generation}"
+                for group in range(expected_multiple)
+                for generation in range(generations)
+            ],
+            fields=["input_ids", "token_mask"],
+            sequence_lengths=[2] * sample_count,
+            tags=[{"weight_version": 0}] * sample_count,
+        )
+        for chunk in range(2)
+    ]
+    ctrl._sampler.select = AsyncMock(
+        side_effect=[(meta, expected_multiple) for meta in metas]
+    )
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert ctrl._sampler.select.await_count == 2
+    for selection in ctrl._sampler.select.await_args_list:
+        assert selection.kwargs["group_multiple"] == expected_multiple
+    ctrl._trainer.sharding_annotations.get_axis_size.assert_called_once_with(
+        "data_parallel"
+    )
+    ctrl._value.sharding_annotations.get_axis_size.assert_called_once_with(
+        "data_parallel"
+    )
+    for meta in ctrl._trainer.trained_metas:
+        assert meta.size % policy_dp == meta.size % value_dp == 0
+    assert all(meta.size == 2 * sample_count for meta in ctrl._value.trained_metas)
+
+
+def test_streaming_ppo_rejects_unshardable_full_batch_before_claiming_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctrl, _, calls = _streaming_ppo_controller(monkeypatch)
+    ctrl._trainer.sharding_annotations.get_axis_size = MagicMock(return_value=8)
+    ctrl._value.sharding_annotations.get_axis_size = MagicMock(return_value=4)
+    ctrl._algo_cfg.num_generations_per_prompt = 1
+    ctrl._algo_cfg.num_prompts_per_step = 10
+    ctrl._sampler.select = AsyncMock()
+
+    with pytest.raises(ValueError, match="multiple"):
+        asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    ctrl._sampler.select.assert_not_awaited()
+    assert calls == []
+
+
+def test_streaming_ppo_waits_for_inflight_snapshot_before_early_refit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctrl, metas, calls = _streaming_ppo_controller(monkeypatch)
+
+    async def run_with_inflight_snapshot() -> None:
+        waiting_for_snapshot = asyncio.Event()
+        acquire = ctrl._checkpoint_save_lock.acquire
+
+        async def observe_acquire() -> bool:
+            waiting_for_snapshot.set()
+            return await acquire()
+
+        # A snapshot has captured the old train step and is still writing it.
+        # Signal the exact lock acquisition instead of relying on a timed sleep.
+        async with ctrl._checkpoint_save_lock:
+            monkeypatch.setattr(ctrl._checkpoint_save_lock, "acquire", observe_acquire)
+            pump = asyncio.create_task(ctrl._train_pump())
+            await asyncio.wait_for(waiting_for_snapshot.wait(), timeout=1.0)
+            assert len(ctrl._trainer.trained_metas) == len(metas)
+            assert "policy.finish_train_step" not in calls
+            assert "critic.train_from_meta" not in calls
+            assert "refit" not in calls
+            assert ctrl._train_steps == ctrl._trainer_version == 0
+            assert not ctrl._optimizer_commit_in_progress
+
+        await asyncio.wait_for(pump, timeout=1.0)
+
+    asyncio.run(run_with_inflight_snapshot())
+
+    assert calls.count("policy.finish_train_step") == 1
+    assert calls.index("policy.finish_train_step") < calls.index("refit")
+    assert calls.index("refit") < calls.index("critic.prepare_for_training")
+    ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
+    ctrl._rollout_manager.set_weight_version.assert_called_once_with(1)
+    assert ctrl._train_steps == ctrl._trainer_version == 1
+    assert not ctrl._optimizer_commit_in_progress
+
+
+def test_streaming_ppo_warmup_keeps_the_policy_frozen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctrl, metas, calls = _streaming_ppo_controller(monkeypatch, warmup=True)
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert calls.count("critic.get_values_from_meta") == len(metas)
+    assert calls.count("gae") == len(metas)
+    assert "policy.begin_train_step" not in calls
+    assert "policy.train_microbatches_from_meta" not in calls
+    assert "policy.finish_train_step" not in calls
+    assert "policy.offload_train_step" not in calls
+    assert calls.count("critic.train_from_meta") == 2
+    assert all(meta.size == len(metas) for meta in ctrl._value.trained_metas)
+    ctrl._sync_weights.assert_not_awaited()
+    ctrl._rollout_manager.set_weight_version.assert_called_once_with(1)
+    assert ctrl._train_steps == ctrl._trainer_version == 1
+
+
+@pytest.mark.parametrize(
+    "valid_chunks", [(False, True, True), (True, False, True), (True, True, False)]
+)
+def test_streaming_ppo_skips_invalid_policy_chunks_but_preserves_full_critic_batch(
+    monkeypatch: pytest.MonkeyPatch, valid_chunks: tuple[bool, ...]
+) -> None:
+    ctrl, metas, calls = _streaming_ppo_controller(
+        monkeypatch, valid_chunks=valid_chunks
+    )
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert [meta.sample_ids for meta in ctrl._trainer.trained_metas] == [
+        meta.sample_ids for meta, valid in zip(metas, valid_chunks) if valid
+    ]
+    assert calls.count("policy.begin_train_step") == 1
+    assert calls.count("policy.finish_train_step") == 1
+    assert all(meta.size == len(metas) for meta in ctrl._value.trained_metas)
+    assert calls.index("critic.finish_training") < calls.index("clear_samples")
+    ctrl._sync_weights.assert_awaited_once()
+
+
+@pytest.mark.parametrize("warmup", [False, True])
+def test_streaming_ppo_all_invalid_batch_fails_before_either_optimizer(
+    monkeypatch: pytest.MonkeyPatch, warmup: bool
+) -> None:
+    ctrl, metas, calls = _streaming_ppo_controller(
+        monkeypatch, valid_chunks=(False, False, False), warmup=warmup
+    )
+
+    with pytest.raises(RuntimeError, match="no valid response tokens after filtering"):
+        asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert calls.count("gae") == len(metas)
+    assert "policy.begin_train_step" not in calls
+    assert "policy.finish_train_step" not in calls
+    assert "critic.train_from_meta" not in calls
+    assert "clear_samples" not in calls
+    ctrl._sync_weights.assert_not_awaited()
+    assert ctrl._train_steps == ctrl._trainer_version == 0
+
+
+@pytest.mark.parametrize("normalize_advantages", [True, False])
+def test_streaming_ppo_advantage_stage_normalizes_each_chunk_independently(
+    normalize_advantages: bool,
+) -> None:
+    ctrl, _ = _ppo_train_pump_controller(sampler=_EmptySampler())
+    ctrl._streaming_ppo = True
+    ctrl._advantage_estimator = GeneralizedAdvantageEstimator(
+        GAEConfig(
+            gae_lambda=1.0,
+            gae_gamma=1.0,
+            normalize_advantages=normalize_advantages,
+        ),
+        ClippedPGLossConfig(reference_policy_kl_penalty=0.0),
+    )
+    chunk_advantages: list[torch.Tensor] = []
+    for chunk, rewards in enumerate(
+        (torch.tensor([1.0, 3.0]), torch.tensor([101.0, 107.0]))
+    ):
+        data = TensorDict(
+            {
+                "prompt_ids_for_adv": torch.zeros(2, 2, dtype=torch.long),
+                "total_reward": rewards,
+                "token_mask": torch.tensor([[0.0, 1.0], [0.0, 1.0]]),
+                "sample_mask": torch.ones(2),
+                "values": torch.zeros(2, 2),
+                "mask_sample": torch.zeros(2, dtype=torch.bool),
+                "truncated": torch.zeros(2, dtype=torch.bool),
+            },
+            batch_size=[2],
+        )
+        data_plane = _AdvantageDataPlane(data)
+        ctrl._dp_client = data_plane
+        meta = KVBatchMeta(
+            partition_id="rollout_data",
+            task_name="train",
+            sample_ids=[f"chunk-{chunk}_g{sample}" for sample in range(2)],
+            fields=list(data.keys()),
+        )
+
+        _, has_valid_tokens = asyncio.run(ctrl._advantage_stage(meta))
+
+        assert has_valid_tokens
+        written = data_plane.written_fields
+        assert written is not None
+        advantages = written["advantages"]
+        torch.testing.assert_close(advantages[:, 0], torch.zeros(2))
+        expected = (
+            torch.tensor([-1.0, 1.0]) / math.sqrt(2)
+            if normalize_advantages
+            else rewards
+        )
+        torch.testing.assert_close(advantages[:, 1], expected)
+        # With zero values and one response token, the critic target is the
+        # terminal reward regardless of whether policy advantages are whitened.
+        torch.testing.assert_close(written["returns"], rewards[:, None].expand(2, 2))
+        chunk_advantages.append(advantages[:, 1])
+
+    if normalize_advantages:
+        full_rewards = torch.tensor([1.0, 3.0, 101.0, 107.0])
+        batch_normalized = (full_rewards - full_rewards.mean()) / full_rewards.std()
+        assert not torch.allclose(torch.cat(chunk_advantages), batch_normalized)
 
 
 def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:

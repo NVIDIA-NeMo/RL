@@ -53,9 +53,9 @@ class TQValue(TQDriverMixin, Value):
     built alongside this critic already did that. Partition lifecycle stays
     with the caller.
 
-    TODO(#2625): the value workers have no split begin/microbatch/finish train
-    API yet, so one train_from_meta call is one optimizer step and the
-    SingleController requires a PPO step to be a single streaming chunk.
+    The value workers have no split begin/microbatch/finish train API, so one
+    train_from_meta call is one optimizer step. Streaming PPO retains every
+    chunk's rows and trains the critic on the complete batch after policy refit.
     """
 
     def __init__(

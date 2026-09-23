@@ -290,6 +290,67 @@ def test_prepare_for_training_leaves_native_cpu_optimizer_placement():
     assert model.train_called
 
 
+@pytest.mark.parametrize("optimizer_cpu_offload", [False, True])
+def test_finish_training_updates_eval_cache_before_parameter_offload(
+    optimizer_cpu_offload: bool,
+) -> None:
+    """Mamba's eval cache needs live parameters before CPU offload frees storage."""
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        MegatronValueWorkerImpl,
+    )
+
+    events: list[str] = []
+
+    class _ModelWithEvalCache:
+        def __init__(self) -> None:
+            self.a_log: torch.Tensor | None = torch.tensor([0.0, 1.0])
+            self.decay: torch.Tensor | None = None
+
+        def eval(self) -> None:
+            assert self.a_log is not None, "eval read freed parameter storage"
+            self.decay = -torch.exp(self.a_log.float())
+            events.append("eval")
+
+    model = _ModelWithEvalCache()
+
+    def move_model(
+        moved_model: _ModelWithEvalCache,
+        device: str,
+        move_params: bool,
+        move_grads: bool,
+    ) -> _ModelWithEvalCache:
+        assert moved_model is model
+        assert (device, move_params, move_grads) == ("cpu", True, True)
+        # Model offload invalidates the original parameter storage. Accessing it
+        # during a later eval() reproduces the Mamba lifecycle failure.
+        moved_model.a_log = None
+        events.append("model_cpu")
+        return moved_model
+
+    def move_optimizer(device: str) -> None:
+        assert device == "cpu"
+        events.append("optimizer_cpu")
+
+    worker = SimpleNamespace(
+        model=model,
+        optimizer=object(),
+        optimizer_cpu_offload=optimizer_cpu_offload,
+        move_model=move_model,
+        move_optimizer=move_optimizer,
+    )
+    with (
+        patch("nemo_rl.models.value.workers.megatron_value_worker.gc.collect"),
+        patch("torch.cuda.empty_cache"),
+    ):
+        MegatronValueWorkerImpl.finish_training(worker)
+
+    assert worker.model is model
+    torch.testing.assert_close(model.decay, -torch.exp(torch.tensor([0.0, 1.0])))
+    assert events == ["eval", "model_cpu"] + (
+        [] if optimizer_cpu_offload else ["optimizer_cpu"]
+    )
+
+
 @pytest.fixture
 def value_setup(request, tiny_qwen2_model_path):
     """Spin up a `Value` wrapper around a tiny Qwen2 backbone for testing.

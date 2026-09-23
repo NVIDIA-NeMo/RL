@@ -68,8 +68,8 @@ async_rl:
     # override from the inherited recipe.
     warmup_lookahead_versions: 4
   recompute_kv_cache_after_weight_updates: true
-  # SC PPO assembles each step from a single chunk; the critic has no split
-  # train API, so this must equal num_prompts_per_step.
+  # Full-batch default. A smaller value streams policy training with ppo_epochs=1
+  # and normalizes per chunk when normalize_advantages=true; critic epochs stay full batch.
   min_groups_for_streaming_train: ${ppo.num_prompts_per_step}
   max_inflight_prompts: 1280
   # num_prompts_per_step * (warmup_lookahead_versions + 1) -- sized for the peak window.
