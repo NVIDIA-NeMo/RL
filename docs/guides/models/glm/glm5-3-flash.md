@@ -6,8 +6,9 @@ training backend and vLLM generation. It uses the local experiment configuration
 
 > [!IMPORTANT]
 > **Status: Short-run training results available.** The supplied training curves
-> cover approximately 29 steps, with validation measurements at steps 10 and 20.
-> They do not establish long-run convergence. This guide documents the experiment
+> include a reference run of approximately 29 steps and a full QDQ run of
+> approximately 74 steps, with QDQ validation through step 70.
+> They do not establish long-run convergence or a controlled QDQ comparison. This guide documents the experiment
 > configuration rather than a registered nightly recipe.
 
 ## Support Status
@@ -133,7 +134,120 @@ a validation batch size of 240; validation at startup is disabled.
 
 
 
-## Reference Training Curves
+## Full FP8 QDQ
+
+Quantize-dequantize (QDQ) exposes the BF16 training forward pass to FP8
+rounding at selected operands, to more closely model FP8 generation. The
+[full QDQ configuration](../../../../exp/grpo-glm-flash-full-qdq.yaml)
+combines DSA Indexer QDQ with weight and activation QDQ in dense FFNs,
+routed experts, and shared experts. Here, **full** means these seven options;
+it does not mean that every model operation or the main MLA KV cache is
+quantized.
+
+All seven flags default to `false`. Enable them together with:
+
+```yaml
+policy:
+  hf_config_overrides:
+    text_config:
+      indexer_fp8_fake_quant: true
+      dense_fp8_weight_qdq: true
+      dense_fp8_activation_qdq: true
+      routed_fp8_weight_qdq: true
+      routed_fp8_activation_qdq: true
+      shared_fp8_weight_qdq: true
+      shared_fp8_activation_qdq: true
+```
+
+### DSA Indexer QDQ
+
+With the updated AutoModel GLM implementation, enable the following model
+override to simulate vLLM's Indexer activation quantization during policy
+forward passes:
+
+```yaml
+policy:
+  hf_config_overrides:
+    text_config:
+      indexer_fp8_fake_quant: true
+```
+
+The flag defaults to `false`. It applies normalized Hadamard-128 rotation,
+BF16 materialization, and per-vector E4M3FN quantize/dequantize with UE8M0
+power-of-two scales to Indexer queries and completed pooled keys. Pooling and
+head-weight scoring use FP32 accumulation. Incomplete tail tokens retain the
+existing selection behavior. The supported layout has `index_head_dim: 128`
+and `qk_rope_head_dim: 0`.
+
+This option does not quantize projection weights, the main MLA computation,
+KDA, dense FFNs, routed experts, or shared experts. Indexer top-k selection
+already runs without gradients, so it does not introduce a straight-through
+gradient estimator. Model parameters and checkpoint keys are unchanged.
+
+### Dense FFN and MoE QDQ
+
+The FFN paths use E4M3FN fake quantization without Hadamard rotation or
+power-of-two scales:
+
+| Operand | Quantization granularity | Scale calculation |
+| --- | --- | --- |
+| Gate, up, and down projection weights | Independent 128 × 128 blocks; experts are independent | Multiply by `448 / amax`, round to E4M3FN, then dequantize with the reciprocal multiplier; zero blocks use multiplier 1 |
+| Inputs to gate/up projections and the activated input to the down projection | Groups of 128 channels per token | Divide by `max(amax, 1e-10) / 448`, round to E4M3FN, then multiply by that scale |
+
+Quantization statistics and scaling are computed in FP32. Values are clamped
+to the E4M3FN range before conversion and dequantized back to the operand's
+original dtype. Weight matrix dimensions must be divisible by 128. Weights
+are quantized afresh on each forward; parameter storage and checkpoint keys
+remain unchanged.
+
+An identity straight-through estimator (STE) passes the backward gradient
+through the FFN quantization boundary to the original operand. Dense and
+shared FFNs use ordinary PyTorch linears on the QDQ path, even when the base
+backend selects Transformer Engine. Routed experts apply QDQ before both
+expert GEMMs; the full configuration uses `torch_mm` with HybridEP. This
+simulates operand rounding, not the accumulation behavior of actual FP8 GEMMs.
+
+### Generation Settings and Launch
+
+The standalone full QDQ YAML retains BF16 training, 18 nodes × 8 GPUs,
+EP72 for training, TP16 for generation, and a global batch of 576. It does
+not require YAML defaults inheritance. Its generation settings include:
+
+```yaml
+policy:
+  generation:
+    vllm_cfg:
+      precision: fp8
+      kv_cache_dtype: auto
+      pow2_weight_scaling_factors: false
+      pow2_activation_scaling_factors: false
+    vllm_kwargs:
+      kernel_config:
+        enable_flashinfer_autotune: false
+        linear_backend: cutlass
+        moe_backend: triton
+```
+
+The FFN simulation uses ordinary FP32 scales to match this kernel selection;
+the DSA Indexer uses its separate power-of-two scaling scheme. Main MLA KV
+remains BF16 in this experiment. No additional QDQ is applied to the main
+MLA computation, KDA, or Indexer projection weights.
+
+From the head node of the prepared Ray cluster, run:
+
+```bash
+uv run --no-sync examples/run_grpo.py --config exp/grpo-glm-flash-full-qdq.yaml
+```
+
+Checkpoints go to `results/grpo-glm-flash-full-qdq`; the W&B project is
+`nemorl-glm-flash-full-qdq` and the run name is `grpo-glm-flash-full-qdq`.
+The YAML allows 10,000 training steps, but the supplied results below cover
+only the initial short run. QDQ does not guarantee bitwise agreement with
+vLLM's fused kernels or eliminate all training/generation differences.
+
+## Training Experiments
+
+### Reference Run Without QDQ
 
 The supplied screenshot shows training reward, validation accuracy, mean
 generated tokens per sample, generation KL error, approximate entropy, and
@@ -146,6 +260,30 @@ step 16, reward is **0.45313**, mean generated length is **1,597.9 tokens**, and
 generation KL error is **0.010896**. Generation KL error rises later in the
 displayed run, so these curves do not demonstrate resolved train/generation
 parity or long-run convergence.
+
+### Full QDQ Run
+
+The following supplied screenshot is labeled `grpo-glm-flash-full-qdq` and
+shows approximately 74 training steps, with validation every 10 steps through
+step 70. Values below are approximate readings from the image rather than
+an export of the underlying metrics.
+
+![GLM-5.3-Flash full QDQ GRPO training reward, validation accuracy, response length, generation KL error, gradient norm, and entropy over approximately 74 steps](../../../assets/glm/glm-5.3-flash-qdq-grpo.png)
+
+| Metric | Observation in the displayed full QDQ run |
+| --- | --- |
+| Validation accuracy | Rises from about 0.283 at step 10 to 0.467 at step 70 |
+| Training reward | Noisy upward trend, ending around 0.65 |
+| Mean generated length | Falls from roughly 1,500–1,600 tokens early in training to about 1,050 at the end |
+| Generation KL error | Rises from about 0.012 to 0.018, with a late peak around 0.021 |
+| Gradient norm | Mostly around 0.1–0.25, with a spike near 0.9 around step 64 |
+| Approximate entropy | Fluctuates around 0.4–0.5 and ends near 0.42 |
+
+The full QDQ run shows improving validation accuracy over this interval,
+while generation KL error still increases. The reference and QDQ screenshots
+cover different training horizons and do not establish a controlled A/B
+comparison. These curves alone cannot attribute the accuracy trend to QDQ,
+prove train/generation parity, or establish long-run convergence.
 
 ## Known Limitations
 
