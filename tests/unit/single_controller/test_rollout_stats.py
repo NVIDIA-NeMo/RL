@@ -130,6 +130,26 @@ def test_chunks_accumulate_across_calls_and_empty_is_empty():
     out = reduce_rollout_stats(acc)
     assert out["groups/count"] == 2 and out["groups/mixed_count"] == 1
     assert math.isclose(out["gen_tokens/mean"], 5.0)
+    # Chunks carry padded prompt token ids of different widths; the same token
+    # prefix in two chunks is still two different groups (grouping is per chunk).
+    acc = new_rollout_stats_accumulator()
+    _fill(
+        acc,
+        prompt_ids=[[1, 2, 3, 0], [1, 2, 3, 0]],
+        rewards=[1, 0],
+        sample_mask=[1, 1],
+        gen_tokens=[2, 4],
+    )
+    _fill(
+        acc,
+        prompt_ids=[[1, 2], [1, 2], [5, 6], [5, 6]],
+        rewards=[1, 1, 0, 1],
+        sample_mask=[1] * 4,
+        gen_tokens=[1, 1, 1, 1],
+    )
+    out = reduce_rollout_stats(acc)
+    assert out["groups/count"] == 3 and out["groups/mixed_count"] == 2
+    assert math.isclose(out["groups/zero_advantage_sample_frac"], 2 / 6, rel_tol=1e-6)
     # An all-masked accumulator reduces to nothing.
     empty = new_rollout_stats_accumulator()
     _fill(
