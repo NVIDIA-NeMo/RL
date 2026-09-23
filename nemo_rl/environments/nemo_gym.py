@@ -1802,13 +1802,13 @@ Depending on your data shape, you may want to change these values."""
         counts_left = Counter(row["agent_ref"]["name"] for row in nemo_gym_examples)
 
         num_results = 0
+        first_error: Exception | None = None
+        suppress_error_cause = False
         for task in nemo_gym_result_iterator:
             with timer.time(label=f"{timer_prefix}/await_results"):
                 try:
                     nemo_gym_row, nemo_gym_result = await task
                 except Exception as error:
-                    for execution in registered_executions:
-                        self._gym_execution_registry.release(execution)
                     if hasattr(error, "response_content"):
                         print(
                             "EXCEPTION RESULT",
@@ -1816,12 +1816,15 @@ Depending on your data shape, you may want to change these values."""
                             file=sys.stderr,
                         )
                     typed = _typed_gym_failure(error)
-                    if typed is not None:
-                        # `from None`, deliberately: chaining the original would put the
-                        # unpicklable exception back on the wire as __cause__ and undo
-                        # the whole point. The status and message are already in `detail`.
-                        raise typed from None
-                    raise
+                    if first_error is None:
+                        first_error = typed if typed is not None else error
+                        suppress_error_cause = typed is not None
+                    # Every task in the batch already owns a remote Gym execution.
+                    # Drain the rest even after one row fails so successful siblings
+                    # can become durable and no task exception is abandoned. The
+                    # caller will retry only the missing rows under a new execution
+                    # attempt; reusing this attempt would race the still-live /run.
+                    continue
 
             execution: GymExecutionIdentity | None = None
             if self._gym_checkpoint_participants:
@@ -1904,6 +1907,15 @@ Depending on your data shape, you may want to change these values."""
             finally:
                 if execution is not None:
                     self._gym_execution_registry.release(execution)
+
+        if first_error is not None:
+            for execution in registered_executions:
+                self._gym_execution_registry.release(execution)
+            if suppress_error_cause:
+                # Deliberately omit the original exception: it may be unpicklable,
+                # while the typed replacement already contains its status/detail.
+                raise first_error from None
+            raise first_error
 
     async def _postprocess_receipt_mode(
         self,

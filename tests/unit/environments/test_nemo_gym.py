@@ -1774,6 +1774,52 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
     asyncio.run(_run())
 
 
+def test_nemo_gym_run_rollouts_drains_siblings_after_one_task_fails():
+    """A failed row must not abandon already-running sibling /run tasks."""
+
+    async def _run():
+        failed_row = {"_rowidx": 0, "agent_ref": {"name": "agent"}}
+        completed_row = {"_rowidx": 1, "agent_ref": {"name": "agent"}}
+
+        class _RolloutCollectionHelper:
+            def run_examples(self, examples, head_server_config):
+                del examples, head_server_config
+
+                async def _failed_result():
+                    raise ConnectionResetError("row zero failed")
+
+                async def _completed_result():
+                    return completed_row, {"response": {"output": []}}
+
+                return [_failed_result(), _completed_result()]
+
+        class _MockSelf:
+            cfg = {}
+            rch = _RolloutCollectionHelper()
+            head_server_config = object()
+            _tokenizer = object()
+            _token_capture_enabled = False
+            _stable_execution_identity_enabled = True
+            _gym_checkpoint_participants = ()
+
+            def _require_spinup(self):
+                pass
+
+            def _postprocess_nemo_gym_to_nemo_rl_result(self, *args, **kwargs):
+                del self, args, kwargs
+                return {"message_log": []}
+
+        stream = NemoGym.__ray_metadata__.modified_class.run_rollouts(
+            _MockSelf(), [failed_row, completed_row], "test"
+        )
+        completed = await anext(stream)
+        assert completed[0] == 1
+        with pytest.raises(ConnectionResetError, match="row zero failed"):
+            await anext(stream)
+
+    asyncio.run(_run())
+
+
 @pytest.mark.parametrize("modality", ["image", "video"])
 def test_nemo_gym_megatron_multimodal_response_round_trip(tmp_path, modality):
     """Round-trip normalized media and a mocked Megatron HTTP response through Gym."""

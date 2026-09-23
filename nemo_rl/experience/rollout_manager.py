@@ -1294,9 +1294,13 @@ class AsyncNemoGymRolloutImpl:
             # below, and a wider annotation makes the `raise ... from last_error` at the
             # end unverifiable.
             last_error: Optional[Exception] = None
+            stable_execution_attempts = any(
+                "_ng_attempt_index" in row for row in inputs
+            )
             max_row_attempts = (
                 1
                 if recovery_granularity is RecoveryGranularity.PROMPT_GROUP
+                or stable_execution_attempts
                 else self._max_gym_row_attempts
             )
             async with _Deadline(
