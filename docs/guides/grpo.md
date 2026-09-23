@@ -810,6 +810,37 @@ The headline metric is per-reward convergence, not just aggregate reward. NeMo-R
 - **Reward scaling applies per component.** `reward_scaling` rescales each `reward/<name>` component as well as `total_reward`, so keep components on comparable scales or rely on GDPO's per-component normalization.
 - **Final batch normalization always runs.** In `GDPOAdvantageEstimator`, the final per-batch normalization applies regardless of `normalize_rewards` (which only gates the per-component std division). Account for this when reasoning about advantage magnitudes.
 
+### ArgMaxRL: Optimizing best@k on Graded Rewards
+[ArgMaxRL](https://www.doubleai.com/research/argmaxrl-generalizing-maxrl-to-continuous-rewards) generalizes [MaxRL](https://arxiv.org/abs/2602.02710) from binary to continuous non-negative rewards. Instead of optimizing expected reward, it optimizes $\sum_{k=1}^{N} \frac{1}{k}\,\text{best@k}$, where best@k is the expected maximum reward among $k$ samples, so the policy is trained for test-time sampling rather than single-sample quality.
+
+For a prompt with $N$ sampled rewards sorted as $r_{(1)} \ge \dots \ge r_{(N)}$ and $r_{(N+1)} := 0$, the sample at rank $j$ receives the advantage
+
+$$
+w_{(j)} = \sum_{m=j}^{N} \frac{r_{(m)} - r_{(m+1)}}{m}
+$$
+
+For example, rewards $[1, 1/2, 0]$ give weights $[3/4, 1/4, 0]$. On $\{0, 1\}$ rewards every correct sample receives $1/K$ (with $K$ the number of correct samples), which is exactly MaxRL.
+
+To enable it:
+```
+grpo:
+  adv_estimator:
+    name: "argmaxrl"
+    minus_baseline: false
+    use_leave_one_out_baseline: false
+```
+`examples/configs/argmaxrl_math_1B.yaml` runs this on the `math_multi_reward` environment, whose reward is the sum of three 0/1 components and therefore graded in $\{0, 1, 2, 3\}$:
+```
+uv run examples/run_grpo.py --config examples/configs/argmaxrl_math_1B.yaml
+```
+
+#### Practical notes
+
+- **Rewards must be non-negative.** The estimator raises on negative or non-finite rewards.
+- **Baselines are optional and change the estimator.** `minus_baseline: true` subtracts the group mean of the weights, or the leave-one-out mean with `use_leave_one_out_baseline: true`. The unbiasedness result in the paper is for the plain weights above. Note that the exemplar `grpo_math_1B.yaml` sets both flags to `true`, so a config that only changes `name` gets the leave-one-out variant.
+- **No std normalization.** `normalize_rewards` has no effect. The weights of an all-equal group of reward $c$ are $c/N$, so advantage magnitudes shrink with group size relative to GRPO; retune the learning rate and KL coefficient accordingly.
+- **`use_kl_in_reward` is rejected.** Keep KL regularization in the loss.
+
 ## LoRA Configuration
 
 GRPO supports LoRA on both the DTensor and Megatron backends. To enable LoRA on the default DTensor backend:
