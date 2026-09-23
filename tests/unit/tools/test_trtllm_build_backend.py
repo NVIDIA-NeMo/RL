@@ -51,7 +51,7 @@ def test_cached_wheel_is_mirrored_for_runtime(monkeypatch, tmp_path):
         build_inputs,
     )
     source_dir.mkdir(parents=True)
-    wheel = source_dir / "tensorrt_llm-1.3.0rc21-py3-none-any.whl"
+    wheel = source_dir / "tensorrt_llm-1.3.0rc23-py3-none-any.whl"
     wheel.write_bytes(b"cached wheel")
 
     result = backend.build_wheel(str(wheel_directory))

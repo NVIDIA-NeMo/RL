@@ -148,6 +148,10 @@ policy:
   logprob_chunk_size: null
   offload_optimizer_for_logprob: false # Only useful for non-colocated generation since colocated generation will always offload optimizer to cuda before refit
   worker_extension_cls_fqn: null # optional registered policy-worker subclass; mutually exclusive with quant_cfg
+  # Free completed gradient buffers before non-colocated NCCL collective refit.
+  release_grads_before_refit: false
+  # Also move optimizer state to CPU whenever the refit offload lifecycle runs.
+  offload_optimizer_for_refit: true
 
   dtensor_cfg:
     _v2: true

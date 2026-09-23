@@ -174,7 +174,10 @@ from nemo_rl.utils.venvs import make_actor_runtime_env
 from nemo_rl.weight_sync.checkpoint_engine_config import (
     checkpoint_engine_refit_config,
 )
-from nemo_rl.weight_sync.factory import create_weight_synchronizer
+from nemo_rl.weight_sync.factory import (
+    create_weight_synchronizer,
+    validate_release_grads_before_refit,
+)
 from nemo_rl.weight_sync.nccl_reshard_utils import check_nccl_reshard_refit_support
 
 # ===============================================================================
@@ -556,6 +559,19 @@ def _shutdown_completed_nemo_gym_startup(
     shard_set.shutdown()
 
 
+def _uses_managed_noncolocated_refit(
+    generation_backend: str,
+    nccl_reshard_refit_enabled: bool,
+    release_grads_before_refit: bool,
+) -> bool:
+    """Whether non-colocated setup must attach a weight synchronizer."""
+    return (
+        nccl_reshard_refit_enabled
+        or generation_backend == "dynamo"
+        or release_grads_before_refit
+    )
+
+
 def setup(
     master_config: MasterConfig,
     tokenizer: TokenizerType,
@@ -628,19 +644,22 @@ def setup(
     _validate_multimodal_dedup_capability(master_config)
     _validate_seq_logprob_error_in_loss(master_config)
 
-    # Validation-only sampling is honored only on the NeMo-Gym vLLM rollout
-    # path; everywhere else validation must sample exactly like training.
+    # Validation-only sampling is honored on the NeMo-Gym rollout path for the
+    # backends whose HTTP server accepts a second sampling profile; everywhere
+    # else validation must sample exactly like training.
     val_sampling_overridden = (
         generation_config["val_temperature"] != generation_config["temperature"]
         or generation_config["val_top_p"] != generation_config["top_p"]
         or generation_config["val_top_k"] != generation_config["top_k"]
     )
     if val_sampling_overridden:
-        assert generation_config["backend"] == "vllm" and should_use_nemo_gym(
-            master_config
-        ), (
+        assert generation_config["backend"] in (
+            "vllm",
+            "trtllm",
+        ) and should_use_nemo_gym(master_config), (
             "generation.val_temperature/val_top_p/val_top_k differing from the "
-            "train sampling params is only supported for vLLM NeMo-Gym rollouts."
+            "train sampling params is only supported for vLLM and TRT-LLM "
+            "NeMo-Gym rollouts."
         )
         # The NeMo-Gym path only stamps temperature/top_p onto requests and
         # rejects any top_k at rollout time, so a val_top_k override can never
@@ -1133,9 +1152,39 @@ def setup(
                     )
                 elif generation_config["backend"] == "trtllm":
                     trtllm_cfg = generation_config.get("trtllm_cfg", {})
-                    gpus_per_instance = trtllm_cfg[
-                        "tensor_parallel_size"
-                    ] * trtllm_cfg.get("pipeline_parallel_size", 1)
+                    disagg_cfg = trtllm_cfg.get("disaggregation") or {}
+                    if disagg_cfg.get("enabled"):
+                        # Under PD disaggregation the unit to keep inside one
+                        # NVLink domain is the *replica*, not the engine: an
+                        # engine's TP group all-reduces internally, but the KV
+                        # cache handed from the replica's context engines to its
+                        # generation engines crosses the transceiver on every
+                        # turn. Sizing this by the engine (below) yields
+                        # nodes_per_instance=1 whenever an engine fits in a node,
+                        # which skips domain pinning entirely and lets a replica
+                        # straddle racks -- correct, but with the KV transfer
+                        # demoted from NVLink to InfiniBand.
+                        #
+                        # No pipeline_parallel_size factor: TrtllmGeneration
+                        # asserts pp == 1, so folding it in would only suggest a
+                        # dimension this backend does not have.
+                        def _role_tp(role: str) -> int:
+                            overrides = disagg_cfg.get(f"{role}_trtllm_kwargs") or {}
+                            return int(
+                                overrides.get(
+                                    "tensor_parallel_size",
+                                    trtllm_cfg["tensor_parallel_size"],
+                                )
+                            )
+
+                        gpus_per_instance = int(
+                            disagg_cfg["num_context_engines"] * _role_tp("ctx")
+                            + disagg_cfg["num_generation_engines"] * _role_tp("gen")
+                        )
+                    else:
+                        gpus_per_instance = trtllm_cfg[
+                            "tensor_parallel_size"
+                        ] * trtllm_cfg.get("pipeline_parallel_size", 1)
                 elif generation_config["backend"] == "dynamo":
                     gpus_per_instance = DynamoConfig.model_validate(
                         generation_config
@@ -1252,6 +1301,16 @@ def setup(
 
     # vllm model loading prefers clean environment, initialize policy_generation before policy in colocated mode
     backend = generation_config["backend"]
+    release_grads_before_refit = policy_config.get("release_grads_before_refit") is True
+    validate_release_grads_before_refit(
+        enabled=release_grads_before_refit,
+        megatron_enabled=bool(
+            (policy_config.get("megatron_cfg") or {}).get("enabled", False)
+        ),
+        generation_backend=backend,
+        colocated=colocated_inference,
+        refit_transport=generation_config.get("refit_transport"),
+    )
     generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
     generation_config["_debug_payload_metrics"] = grpo_config.debug_payload_metrics
     remote_transport = None
@@ -1804,6 +1863,7 @@ def setup(
     if refit_transport is not None and not (
         backend == "vllm"
         or (backend == "megatron" and refit_transport in ("mcore", "nccl_reshard"))
+        or (backend == "trtllm" and refit_transport == "nccl_reshard")
     ):
         raise NotImplementedError(
             f"refit_transport={refit_transport!r} is not supported for "
@@ -1828,7 +1888,11 @@ def setup(
     ):
         t0 = time.perf_counter()
         # init collective
-        if nccl_reshard_refit_enabled or backend == "dynamo":
+        if _uses_managed_noncolocated_refit(
+            generation_backend=backend,
+            nccl_reshard_refit_enabled=nccl_reshard_refit_enabled,
+            release_grads_before_refit=release_grads_before_refit,
+        ):
             policy_generation.weight_synchronizer = create_weight_synchronizer(
                 policy=policy,
                 generation=policy_generation,
@@ -2468,6 +2532,42 @@ def _apply_mask_sample_filter(repeated_batch: BatchedDataDict[DatumSpec]) -> int
 
     num_masked = int(mask_sample_bool.sum().item())
     loss_multiplier[mask_sample_bool] = 0
+    repeated_batch["loss_multiplier"] = loss_multiplier
+    return num_masked
+
+
+def _apply_empty_rollout_filter(repeated_batch: BatchedDataDict[DatumSpec]) -> int:
+    """Zero loss_multiplier where the rollout produced nothing, and count it.
+
+    NemoGym stands a rollout that returned no assistant turn up as a
+    prompt-only sample so one dead rollout cannot fail the step. Such a sample
+    already contributes 0 to the loss -- it has no trainable tokens -- but
+    without zeroing loss_multiplier it still counts toward num_valid_samples,
+    which would then overstate how much of the batch actually trained.
+
+    The returned count answers "how many rollouts came back empty", which is a
+    statement about generation health, and it deliberately counts every empty
+    rollout rather than only the ones this call was first to zero. The masking
+    metrics are attribution, not a partition: with
+    env.should_mask_flagged_samples on, Gym flags an agent that timed out
+    before its first completion, so the same sample is counted here and in
+    num_mask_sample_filtered. Zeroing is idempotent so the loss is unaffected,
+    but the counts overlap and must not be summed -- num_valid_samples
+    (sample_mask.sum()) is the one authoritative figure for how much of the
+    batch trained.
+    """
+    if "empty_rollout" not in repeated_batch:
+        return 0
+
+    loss_multiplier = repeated_batch["loss_multiplier"].clone()
+    empty_rollout = repeated_batch["empty_rollout"]
+
+    if isinstance(empty_rollout, list):
+        empty_rollout = torch.tensor(empty_rollout, dtype=torch.bool)
+    empty_rollout_bool = empty_rollout.bool()
+
+    num_masked = int(empty_rollout_bool.sum().item())
+    loss_multiplier[empty_rollout_bool] = 0
     repeated_batch["loss_multiplier"] = loss_multiplier
     return num_masked
 
@@ -3501,6 +3601,10 @@ def _grpo_train_impl(
                     num_mask_sample_filtered = _apply_mask_sample_filter(repeated_batch)
                     metrics["num_mask_sample_filtered"] = num_mask_sample_filtered
 
+                    metrics["num_masked_seqs_by_empty_rollout"] = (
+                        _apply_empty_rollout_filter(repeated_batch)
+                    )
+
                     add_grpo_token_loss_masks_and_generation_logprobs(
                         repeated_batch["message_log"]
                     )
@@ -4284,8 +4388,10 @@ def validate(
         total_lengths = []
         all_message_logs = []  # Collect all message logs
 
-        max_batches = (
-            master_config.grpo.max_val_samples // master_config.grpo.val_batch_size
+        # Cover the whole validation set: the last wave may be a partial batch
+        # (e.g. 251 prompts in waves of 126), so round up instead of down.
+        max_batches = -(
+            -master_config.grpo.max_val_samples // master_config.grpo.val_batch_size
         )
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
@@ -5343,6 +5449,9 @@ def async_grpo_train(
                         num_mask_sample_filtered = _apply_mask_sample_filter(
                             repeated_batch
                         )
+                        num_masked_seqs_by_empty_rollout = _apply_empty_rollout_filter(
+                            repeated_batch
+                        )
 
                     # Add loss mask to each message
                     # Only unmask assistant messages that were actually generated (have generation_logprobs),
@@ -5734,6 +5843,7 @@ def async_grpo_train(
                     "loss": train_results["loss"].numpy(),
                     "reward": rewards.numpy(),
                     "num_mask_sample_filtered": num_mask_sample_filtered,
+                    "num_masked_seqs_by_empty_rollout": num_masked_seqs_by_empty_rollout,
                     "grad_norm": train_results["grad_norm"].numpy(),
                     "mean_prompt_length": repeated_batch["length"].numpy(),
                     "total_num_tokens": input_lengths.numpy(),

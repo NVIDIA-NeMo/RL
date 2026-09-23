@@ -20,12 +20,15 @@ broadcasts its weights, and generation workers receive them via the
 established NCCL process group.
 
 Lifecycle per sync:
-  1. policy.broadcast_weights_for_collective()    -- send via NCCL
+  1. policy.sync_params_before_refit()            -- materialize optimizer updates
+     policy.offload_before_refit()                 -- optional trainer memory release
+  2. policy.broadcast_weights_for_collective()    -- send via NCCL
      generation.update_weights_from_collective()  -- receive via NCCL
-  2. Verify transfer success
+  3. Verify transfer success
 
-No offload/restore steps are needed since policy and generation run on
-separate GPUs with dedicated memory.
+Policy and generation run on separate GPUs. Trainer offload is disabled by
+default, but large quantized exports can opt in when their temporary tensors
+need more trainer GPU headroom.
 """
 
 from collections.abc import Sequence
@@ -95,6 +98,11 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
             arms a watchdog and aborts its own communicator when it expires, which is
             what lets the controller rebuild over the survivors instead of blocking in
             NCCL forever. ``None`` disarms it entirely, so the hang protection is lost.
+        sync_policy_params: Whether this synchronizer owns the pre-transfer policy
+            parameter sync. A lifecycle wrapper may perform it earlier and disable it
+            here to avoid a duplicate worker round trip.
+        release_grads_before_refit: Whether to run the policy's existing refit
+            offload lifecycle before exporting weights.
     """
 
     def __init__(
@@ -104,7 +112,10 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         train_cluster: Any,
         inference_cluster: Any,
         refit_timeout_s: Optional[float] = None,
-    ):
+        *,
+        sync_policy_params: bool = True,
+        release_grads_before_refit: bool = False,
+    ) -> None:
         # None disarms the abort watchdog in every worker, which is the default and
         # reproduces the pre-existing behaviour exactly.
         self._refit_timeout_s = refit_timeout_s
@@ -112,6 +123,8 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         self._generation = generation
         self._train_cluster = train_cluster
         self._inference_cluster = inference_cluster
+        self._sync_policy_params = sync_policy_params
+        self._release_grads_before_refit = release_grads_before_refit
         self._stale = True
         # What the communicator was last built over. None until init_communicator.
         self._built_membership: Optional[RefitMembership] = None
@@ -122,6 +135,17 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         timer: Optional[Timer] = None,
         kv_scales: Optional[dict[str, float]] = None,
     ) -> None:
+        import time
+
+        refit_t0 = time.perf_counter()
+        if self._sync_policy_params:
+            self._policy.sync_params_before_refit()
+        sync_params_s = time.perf_counter() - refit_t0
+        t_offload = time.perf_counter()
+        if self._release_grads_before_refit:
+            self._policy.offload_before_refit()
+        offload_s = time.perf_counter() - t_offload
+
         timer_context = (
             timer.time("prepare_for_generation/transfer_and_update_weights")
             if timer is not None
@@ -156,6 +180,14 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
                 )
                 raise
             results = ray.get(futures_inference)
+            print(
+                f"[refit-timing] controller sync_params={sync_params_s:.2f}s "
+                f"offload_before_refit={offload_s:.2f}s "
+                f"transfer_and_update="
+                f"{time.perf_counter() - refit_t0 - sync_params_s - offload_s:.2f}s "
+                f"total={time.perf_counter() - refit_t0:.2f}s",
+                flush=True,
+            )
             update_success = all(result for result in results if result is not None)
 
             if not update_success:

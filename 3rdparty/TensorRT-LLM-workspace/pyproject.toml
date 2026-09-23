@@ -9,28 +9,35 @@
 # Declared as no-build-isolation-package in the root pyproject.toml so the
 # build runs in the main venv context and has access to torch / CUDA headers.
 #
-# Sourced from requirements.txt on github.com/shuyixiong/TensorRT-LLM@nemorl.
+# Sourced from requirements.txt of TensorRT-LLM.
 # Intentional omissions from requirements.txt:
 #   - datasets==3.1.0        → conflicts with nemorl base datasets>=4.0.0
 #   - setuptools<80          → conflicts with nemorl override setuptools>=80.10.2
 #   - llguidance==0.7.29     → conflicts with nemorl override llguidance>=1.3.0,<1.4.0
 #   - triton==3.6.0          → nemorl base manages triton via pytorch-cu130 index
 #   - evaluate               → pulls in conflicting datasets==3.1.0 transitively
-#   - build / ninja / meson / patchelf  → build-time only, not runtime deps
+#   - build / ninja / meson / patchelf / packaging  → build-time only, not runtime deps
 #   - cuda-core              → included in cuda-python>=13
 #   - graphviz / polygraphy / mcp  → optional dev/test tools
+#   - PyNvVideoCodec~=2.1.0  → no aarch64/py3.13 wheel in that range (PyPI has
+#                              2.0.5 then 2.2.0). Only tensorrt_llm/media/decoding.py
+#                              imports it, function-locally, for Cosmos video
+#                              decode; LLM inference never touches it. Also
+#                              stripped from requirements.txt by
+#                              tools/build-custom-trtllm.sh, or the wheel build
+#                              dies in pip before cmake starts.
 
 [project]
 name = "tensorrt-llm"
-version = "1.3.0rc21"
+# Must match tensorrt_llm/version.py at [tool.trtllm].ref, and the pin in the
+# root pyproject.toml's `trtllm` extra. All three move together on a ref bump.
+version = "1.3.0rc23"
 requires-python = ">=3.13"
 dependencies = [
-  "tensorrt~=10.16.1",
   "mpi4py",
   "numpy>=2.0.0,<2.4",
-  "torch>=2.11.0",
+  "torch",
   "torchvision",
-  "nvidia-modelopt>=0.37.0",
   # Ceiling raised from upstream's <=2.29.7 (which tracks what NGC rel-26-04 ships,
   # not a tested incompatibility) so it matches the nvidia-nccl-cu13==2.30.7 override.
   "nvidia-nccl-cu13>=2.28.9,<=2.30.7",
@@ -39,41 +46,47 @@ dependencies = [
   "nvidia-ml-py>=13",
   "cuda-python>=13",
   "flash-attn-4==4.0.0b11",
-  "flashinfer-python==0.6.12",
-  "torchao>=0.14.1,<0.16.0",
+  "flashinfer-python==0.6.15",
+  "torchao",
   "apache-tvm-ffi==0.1.6",
   "torch-c-dlpack-ext==0.1.3",
   "xdsl>=0.59.0",
   "cuda-tile>=1.0.1",
   "nvidia-cuda-tileiras>=13.1,<13.2",
+  # Matches the ref's requirements.txt and the base image's TRT 10.16.1.11.
+  # Resolvable only because the root pyproject supplies static
+  # [[tool.uv.dependency-metadata]] for tensorrt / tensorrt-cu13{,-libs,-bindings};
+  # without it `uv lock` builds the wheel_stub sdist and pulls multi-GB binaries.
+  "tensorrt~=10.16.1",
+  # NOTE: the ref's requirements.txt adds nvidia-modelopt[torch]~=0.39.0, but it
+  # is intentionally not mirrored here: the root pyproject already pins modelopt
+  # to a git rev via [tool.uv.sources] and forces >=0.44.0a0 via
+  # override-dependencies, so a ~=0.39.0 declaration would be overridden anyway.
   "transformers==5.5.4",
   "accelerate>=1.7.0",
   "sentencepiece>=0.1.99",
   "mistral-common>=1.10.0",
   "tiktoken",
   "diffusers>=0.37.1",
-  "peft>=0.18.1",
+  "peft>=0.18.1,<0.19.0",
   "optimum",
   "ftfy",
-  "xgrammar>=0.1.32",
+  "xgrammar==0.1.32",
   "lark",
   "partial_json_parser",
-  "onnx>=1.21.0",
-  "onnx_graphsurgeon>=0.5.2",
-  "fastapi>=0.120.1",
+  "fastapi>=0.120.1,<=0.121.3",
   "starlette>=0.49.1",
   "uvicorn",
   "pydantic>=2.9.1",
   "pydantic-settings[yaml]",
   "python-multipart",
   "prometheus_client",
-  "prometheus-fastapi-instrumentator>=8.0.2",
+  "prometheus-fastapi-instrumentator",
   "openai-harmony==0.0.4",
   "etcd-sdk-python==0.0.7",
   "smg-grpc-proto>=0.4.2",
   "cache-dit>=1.3.5",
   "pillow",
-  "opencv-python-headless",
   "soundfile",
   "librosa",
   "h5py==3.12.1",
@@ -87,10 +100,14 @@ dependencies = [
   "einops",
   "aenum",
   "strenum",
+  # Deliberately ahead of the ref's requirements.txt (which pins 0.7.29): vLLM
+  # needs >=1.3.0 and the root pyproject's [tool.uv] override-dependencies
+  # enforces that project-wide, so declaring 0.7.29 here would be inert and
+  # misleading. Do not "re-sync" this one to upstream.
   "llguidance>=1.3.0,<1.4.0",
   "backoff",
   "jsonschema",
-  "click>=8.3.1",
+  "click>=8.3.1,<8.4",
   "click_option_group",
   "ordered-set",
   "msgpack",
@@ -102,6 +119,13 @@ dependencies = [
   "plotly",
   "matplotlib",
   "openai",
+  "jinja2",
+  "lazy_loader~=0.5",
+  "msgspec",
+  "nccl4py>=0.3.1,<0.4",
+  "nvidia-matmul-heuristics==0.1.0.27",
+  "quack-kernels>=0.2.10",
+  "uvloop>=0.19.0",
 ]
 
 [build-system]
@@ -119,5 +143,7 @@ backend-path = ["."]
 # image is scoped by base image and architecture so valid compiler objects can
 # be reused across ref and uv-version changes. When bumping `ref`, also re-sync
 # [project].dependencies against the new requirements.txt.
+#
+# Public TensorRT-LLM feat/rl_rc tip at the time of this pin.
 url = "https://github.com/NVIDIA/TensorRT-LLM.git"
-ref = "bf2ef86f9a2652132b11773d4041e292c553c142"   # pragma: allowlist secret
+ref = "bfb1da6936469cfe906358840463e27c89fcf18d"   # pragma: allowlist secret

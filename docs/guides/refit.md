@@ -69,6 +69,38 @@ delta is currently limited to GRPO. NIXL is
 initialized by the GRPO and distillation setup paths; PPO currently requires
 colocated generation.
 
+### TRT-LLM Qwen3.5 Routed-Expert FP8
+
+TRT-LLM supports online block-FP8 refit for Qwen3.5 MoE rollouts. Policy
+training remains in BF16, and this setting does not change optimizer-state
+precision. During each refit, NeMo RL converts only the routed-expert weights
+to E4M3 with 128x128 blocks and FP32 scales; attention, routers, shared experts,
+embeddings, and the output head remain in BF16.
+
+This path starts from a BF16 policy checkpoint. Direct loading of a
+pre-quantized ModelOpt FP8 checkpoint is outside its scope.
+
+Enable the path with:
+
+```yaml
+policy:
+  generation:
+    trtllm_cfg:
+      precision: fp8
+```
+
+This path currently accepts only checkpoints whose Transformers `model_type`
+is `qwen3_5_moe`. NeMo RL initializes the TRT-LLM model with `load_format` set
+to `dummy`, then populates it from the first BF16 policy refit. The TRTLLM MoE
+backend is required to preserve FP32 block scales; MXFP8/E8M0 scales are not
+used.
+
+The installed TRT-LLM must provide the incremental-refit lifecycle APIs
+`begin_update_weights`, `finalize_update_weights`, `abort_update_weights`, and
+`WorkerExtension.finalize_weight_update`. NeMo RL fails during setup if any of
+these APIs are unavailable. Supporting another model architecture requires a
+model-specific quantization filter and weight mapper.
+
 ## Minimal Configuration
 
 Colocated vLLM and SGLang refit need no transport configuration:
@@ -85,6 +117,7 @@ For non-colocated NCCL, change the topology and leave the selector unset:
 
 ```yaml
 policy:
+  release_grads_before_refit: false
   generation:
     colocated:
       enabled: false
@@ -102,6 +135,31 @@ policy:
       refit_backend: nccl  # gloo | nccl | nccl_m2n (nvshmem is broken; see #3646)
 ```
 
+Large quantized exports can temporarily need more memory than training itself.
+Set `release_grads_before_refit: true` to drop completed gradient buffers before
+the collective export. The same lifecycle can also move the optimizer and clear
+Transformer Engine workspaces:
+
+```yaml
+policy:
+  release_grads_before_refit: true
+  offload_optimizer_for_refit: true
+  megatron_cfg:
+    fp8_cfg:
+      enabled: true
+      force_clear_fp8_caches: true
+  generation:
+    colocated:
+      enabled: false
+    refit_transport: null
+```
+
+This option requires the Megatron policy backend and applies only to the default
+non-colocated vLLM NCCL collective transport or `nccl_reshard`. Unsupported
+combinations fail during synchronizer setup. It is disabled by default because
+CPU offload adds transfer overhead when the export already fits in trainer GPU
+memory.
+
 For NCCL reshard with Megatron policy training and vLLM generation:
 
 ```yaml
@@ -111,6 +169,10 @@ policy:
       enabled: false
     refit_transport: nccl_reshard
 ```
+
+`release_grads_before_refit` also works here, unchanged: the reshard only moves
+params, so releasing grad buffers/optimizer state/caches first is as safe as it
+is for the default collective transport.
 
 For sparse delta, select one data plane and configure its scope:
 

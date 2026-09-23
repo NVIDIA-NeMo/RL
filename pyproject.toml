@@ -231,11 +231,7 @@ mcore = [
 # backend (_backend.py). The path source lets uv lock resolve the dep graph
 # without compiling (prepare_metadata_for_build_wheel returns static metadata).
 # The actual ~60-min wheel build is triggered by `uv sync --extra trtllm`.
-trtllm = [
-  "tensorrt-llm==1.3.0rc21",
-  "transformers==5.5.4",
-  "tilelang==0.1.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
-]
+trtllm = ["tensorrt-llm==1.3.0rc23"]
 modelopt = ["nvidia-modelopt"]
 nvrx = [
   "nvidia-resiliency-ext==0.6.0",
@@ -449,6 +445,12 @@ override-dependencies = [
   # decord2 is pulled transitively by sglang → qwen-vl-utils[decord] on aarch64 Linux.
   # NeMo-RL no longer calls any decord API (replaced by torchvision/torchaudio).
   "decord2; sys_platform == 'never'",
+  # Force fla-core to 0.5.2 (PR #953 + PR #1000): Blackwell GDN fwd/bwd
+  # autotune restricted to 2 warps for the Triton tl.dot recurrence race.
+  # megatron-core's dev extra would otherwise pin ==0.5.1 (still racy on
+  # VR200/GB300). See fla-org/flash-linear-attention#945 / PR #953.
+  "fla-core==0.5.2",
+  "flash-linear-attention==0.5.2",
 ]
 
 # CVE fixes
@@ -482,10 +484,11 @@ constraint-dependencies = [
   "pyjwt>=2.13.0",
   "dulwich>=1.2.5",
   "diffusers>=0.38.0",
-  # 8.0.1 fixed _IncludedRouter.path crash on fastapi>=0.137 (github.com/trallnag/prometheus-fastapi-instrumentator/issues/370)
-  "prometheus-fastapi-instrumentator>=8.0.2",
-  "av>=17.1.0",                               # Address CVE-2026-40962 (FFmpeg 8.0.1 bundled in av.libs; 17.1.0+ ships FFmpeg 8.1.x)
-  "opencv-python-headless>=5.0.0",            # CVE floor: patches CVE-2025-9951, CVE-2025-1594, CVE-2024-31582 (bundled FFmpeg 5.1.6 in 4.x)
+  # NOTE: dropped the `prometheus-fastapi-instrumentator>=8.0.2` floor. It fixed
+  # a crash on fastapi>=0.137, but tensorrt-llm now pins fastapi<=0.121.3, and
+  # >=8.0.2 requires starlette>=1.0.0 which conflicts with fastapi's starlette<0.51.
+  "av>=17.1.0",                    # Address CVE-2026-40962 (FFmpeg 8.0.1 bundled in av.libs; 17.1.0+ ships FFmpeg 8.1.x)
+  "opencv-python-headless>=5.0.0", # CVE floor: patches CVE-2025-9951, CVE-2025-1594, CVE-2024-31582 (bundled FFmpeg 5.1.6 in 4.x)
 ]
 
 conflicts = [
