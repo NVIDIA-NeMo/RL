@@ -1,0 +1,464 @@
+# Standalone full experiment: GLM-5.3-Flash, 18 nodes x 8 GPUs.
+# Expanded from grpo-glm-flash-ffn-qdq.yaml; no defaults inheritance required.
+# Automodel: BF16 with dense/routed/shared FFN weight + activation QDQ,
+# and DSA indexer Q/completed pooled-K fake quantization.
+# Main MLA KV stays BF16 (vLLM kv_cache_dtype=auto); no MLA KV QDQ.
+# vLLM FFN kernels use ordinary FP32 scales: CUTLASS linear + Triton MoE.
+# GPU FFN-QDQ parity and the full RL experiment have not yet been validated.
+# Run in the existing cluster/container environment:
+# uv run --no-sync examples/run_grpo.py --config exp/grpo-glm-flash-full-qdq.yaml
+
+grpo:
+  num_prompts_per_step: 36
+  num_generations_per_prompt: 16
+  max_rollout_turns: 1
+  max_num_epochs: 10
+  max_num_steps: 10000
+  normalize_rewards: true
+  use_leave_one_out_baseline: false
+  val_period: 10
+  val_start_at: -1
+  val_at_start: false
+  val_at_end: false
+  overlong_filtering: false
+  advantage_clip_low: null
+  advantage_clip_high: null
+  max_val_samples: 240
+  val_num_generations_per_prompt: 1
+  stop_at_validation_metric: null
+  stop_at_validation_threshold: null
+  val_batch_size: 240
+  seed: 42
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 10
+  batch_multiplier: 1
+  reward_shaping:
+    enabled: false
+    overlong_buffer_length: 512
+    overlong_buffer_penalty: 1
+    max_response_length: 6144
+    stop_properly_penalty_coef: null
+  adv_estimator:
+    name: grpo
+    normalize_rewards: ${grpo.normalize_rewards}
+    use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
+    minus_baseline: true
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: -1.0
+    target_max: 1.0
+  seq_logprob_error_threshold: null
+  invalid_tool_call_advantage: null
+  malformed_thinking_advantage: null
+  async_grpo:
+    enabled: false
+    max_trajectory_age_steps: 1
+    max_generation_failures: 0
+    in_flight_weight_updates: false
+    recompute_kv_cache_after_weight_updates: false
+reward_penalties:
+  penalize_duplicated_reasoning: false
+  penalize_empty_final_answer: false
+  penalize_unwanted_tokens: false
+  penalize_malformed_think_tag: false
+  token_ids: null
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  reference_policy_kl_type: k3
+  kl_input_clamp_value: 20.0
+  kl_output_clamp_value: 10.0
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10
+  use_on_policy_kl_approximation: false
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 2.0
+  truncated_importance_sampling_ratio_min: null
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  force_on_policy_ratio: false
+  use_kl_in_reward: false
+  use_cispo: false
+  disable_ppo_ratio: false
+  positive_example_nll_weight: 0.0
+checkpointing:
+  enabled: true
+  checkpoint_dir: results/grpo-glm-flash-full-qdq
+  metric_name: null
+  higher_is_better: true
+  keep_top_k: 1
+  save_period: 5
+  checkpoint_must_save_by: 00:03:45:00
+  load_replay_buffer: true
+  model_save_format: safetensors
+  save_consolidated: false
+  save_optimizer: true
+  save_data_plane: false
+policy:
+  model_name: /apps/models/GLM-5.3-Flash
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs: null
+    tokenizer_kwargs: null
+    use_fastokens: false
+  hf_config_overrides:
+    text_config:
+      num_mtp_modules: 0
+      # DSA indexer only; incomplete pool tails retain their original precision.
+      indexer_fp8_fake_quant: true
+      # Dense FFN and both routed/shared MoE: quantize weights and GEMM inputs.
+      dense_fp8_weight_qdq: true
+      dense_fp8_activation_qdq: true
+      routed_fp8_weight_qdq: true
+      routed_fp8_activation_qdq: true
+      shared_fp8_weight_qdq: true
+      shared_fp8_activation_qdq: true
+  train_global_batch_size: 576
+  train_micro_batch_size: 1
+  generation_batch_size: 32
+  logprob_batch_size: 1
+  max_total_sequence_length: 4096
+  precision: bfloat16
+  logprob_chunk_size: 1024
+  offload_optimizer_for_logprob: true
+  worker_extension_cls_fqn: null
+  dtensor_cfg:
+    _v2: true
+    enabled: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+    automodel_kwargs:
+      backend:
+        _target_: nemo_automodel.components.models.common.utils.BackendConfig
+        attn: sdpa
+        linear: te
+        rms_norm: torch_fp32
+        fake_balanced_gate: false
+        rope_fusion: false
+        enable_hf_state_dict_adapter: true
+        experts: torch_mm
+        dispatcher: hybridep
+        dispatcher_share_token_dispatcher: true
+        enable_fsdp_optimizations: true
+      freeze_config:
+        freeze_vision_tower: true
+        freeze_audio_tower: true
+        freeze_language_model: false
+    lora_cfg:
+      enabled: false
+      target_modules: []
+      exclude_modules: []
+      match_all_linear: true
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: post
+      lora_A_init: xavier
+      use_triton: true
+      restore_from: null
+    expert_parallel_size: 72
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  megatron_cfg:
+    enabled: false
+    model_overrides: {}
+    checkpoint:
+      async_save: true
+      ckpt_assume_constant_structure: true
+    use_fused_linear_logprobs: false
+    fused_linear_logprobs_chunk_size: 256
+    force_reconvert_from_hf: false
+    empty_unused_memory_level: 1
+    activation_checkpointing: false
+    cuda_graph_impl: none
+    cuda_graph_modules: []
+    cuda_graph_warmup_steps: 3
+    fine_grained_activation_offloading: false
+    offload_modules: null
+    recompute_granularity: full
+    recompute_modules: null
+    tensor_model_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    context_parallel_size: 1
+    pipeline_dtype: ${policy.precision}
+    sequence_parallel: false
+    freeze_moe_router: true
+    moe_router_dtype: fp64
+    moe_router_load_balancing_type: none
+    moe_router_bias_update_rate: 0.0
+    moe_permute_fusion: true
+    apply_rope_fusion: true
+    bias_activation_fusion: true
+    defer_fp32_logits: false
+    moe_per_layer_logging: false
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: alltoall
+    moe_hybridep_prepad_packed_inputs: false
+    moe_shared_expert_overlap: false
+    use_gloo_process_groups: false
+    mtp_num_layers: 0
+    mtp_loss_scaling_factor: 0.0
+    mtp_use_repeated_layer: false
+    mtp_detach_heads: false
+    gradient_accumulation_fusion: false
+    use_fused_weighted_squared_relu: false
+    peft:
+      enabled: false
+      target_modules: []
+      exclude_modules: []
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: post
+      lora_A_init_method: xavier
+      lora_B_init_method: zero
+      a2a_experimental: false
+      lora_dtype: None
+      restore_from: null
+    optimizer:
+      optimizer: adam
+      lr: 5.0e-06
+      min_lr: 5.0e-07
+      weight_decay: 0.01
+      bf16: true
+      fp16: false
+      params_dtype: float32
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_eps: 1.0e-08
+      sgd_momentum: 0.9
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+      clip_grad: ${policy.max_grad_norm}
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+      overlap_cpu_optimizer_d2h_h2d: false
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: constant
+      lr_decay_style: constant
+      lr_decay_iters: 1000
+      lr_warmup_iters: 13
+      lr_warmup_init: 5.0e-07
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: true
+      overlap_param_gather: true
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: optim_grads_params
+    fp8_cfg:
+      enabled: false
+      fp8: e4m3
+      fp8_recipe: blockwise
+      fp8_param: false
+    env_vars: null
+  draft:
+    enabled: false
+    model_name: null
+    loss_weight: 0.1
+    num_layers: null
+    aux_layer_indices: null
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    sequence_length_round: 64
+  sequence_packing:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: modified_first_fit_decreasing
+    microbatch_order: packer
+    sequence_length_round: 64
+  make_sequence_length_divisible_by: 1024
+  max_grad_norm: 1.0
+  optimizer:
+    name: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+    kwargs:
+      lr: 1.0e-06
+      weight_decay: 0.1
+      betas:
+      - 0.9
+      - 0.999
+      eps: 1.0e-08
+      master_weights: true
+      store_param_remainders: true
+      exp_avg_dtype: torch.bfloat16
+      exp_avg_sq_dtype: torch.bfloat16
+  scheduler:
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 1.0e-08
+      end_factor: 1.0
+      total_iters: 10
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones:
+    - 10
+  generation:
+    port_range_low: 3000
+    port_range_high: 4999
+    backend: vllm
+    max_new_tokens: 2048
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    val_temperature: ${.temperature}
+    val_top_p: ${.top_p}
+    val_top_k: ${.top_k}
+    stop_token_ids: null
+    stop_strings: null
+    refit_transport: null
+    worker_extension_cls_fqn: null
+    real_quant_export_cpu_offload: true
+    refit_cfg:
+      nixl:
+        update_weights_bucket_memory_ratio: 0.05
+        device: cuda
+        backend_name: UCX
+        backend_init_params: null
+        release_after_refit: false
+        shard_expert_weights: false
+    mcore_generation_config:
+      max_model_len: ${policy.max_total_sequence_length}
+      cuda_graph_impl: local
+      cuda_graph_sizing_distribution: hybrid
+      cuda_graph_max_tokens: 512
+      inference_cuda_graph_scope: block
+      buffer_size_gb: 10
+      num_cuda_graphs: 4
+      block_size_tokens: 256
+      use_cuda_graphs_for_non_decode_steps: true
+      enable_chunked_prefill: true
+      enable_prefix_caching: false
+      prefix_caching_mamba_gb: null
+      prefix_caching_eviction_policy: lru
+      prefix_caching_coordinator_policy: longest_prefix
+      prefix_cache_ttl_seconds: 300.0
+      prefix_caching_routing_alpha: 1.0
+      max_tokens: 16384
+      kv_cache_management_mode: persist
+      async_sched_mode: async
+      materialize_only_last_token_logits: true
+      num_speculative_tokens: 0
+      refit_backend: null
+      refit_execution_batch_bytes: null
+      logprobs_mode: processed_logprobs
+      offload_policy_before_refit: false
+      parsers: []
+      expose_http_server: false
+      http_server_num_replicas: 8
+    vllm_cfg:
+      async_engine: false
+      precision: fp8
+      kv_cache_dtype: auto
+      logprobs_mode: processed_logprobs
+      refit_with_reload_api: false
+      tensor_parallel_size: 16
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.6
+      max_model_len: 4096
+      enforce_eager: true
+      use_tqdm: true
+      use_deep_gemm: false
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 0.5
+      http_refit_api_key_env_var: null
+      reset_encoder_cache_after_weight_update: false
+      http_refit_server_port: null
+      zmq_refit_server_port: null
+      pow2_weight_scaling_factors: false
+      pow2_activation_scaling_factors: false
+    vllm_kwargs:
+      language_model_only: true
+      kernel_config:
+        enable_flashinfer_autotune: false
+        linear_backend: cutlass
+        moe_backend: triton
+    colocated:
+      enabled: true
+      resources:
+        gpus_per_node: null
+        num_nodes: null
+data:
+  max_input_seq_length: 2048
+  shuffle: true
+  num_workers: 1
+  use_multiple_dataloader: false
+  train:
+    dataset_name: DAPOMath17K
+    split_validation_size: 0.05
+    seed: ${grpo.seed}
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
+    system_prompt_file: null
+    processor: math_hf_data_processor
+    env_name: math
+env:
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+logger:
+  log_dir: logs
+  num_val_samples_to_print: 0
+  wandb_enabled: true
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: nemorl-glm-flash-full-qdq
+    name: grpo-glm-flash-full-qdq
+    log_nemo_gym_full_result_tables: false
+  swanlab:
+    project: grpo-dev
+    name: grpo-dev-logger
+  tensorboard: {}
+  mlflow:
+    experiment_name: grpo-dev
+    run_name: grpo-dev-logger
+    tracking_uri: http://localhost:5000
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+cluster:
+  gpus_per_node: 8
+  num_nodes: 18
+  master_port_range_low: 1400
+  master_port_range_high: 1999
+  segment_size: null
+data_plane:
+  enabled: false
+  impl: transfer_queue
+  backend: simple
+  claim_meta_poll_interval_s: 0.5
+  simple:
+    storage_capacity: 1000000
+    num_storage_units: ${mul:2, ${cluster.num_nodes}}
+  mooncake_cpu:
+    global_segment_size: 68719476736
+    local_buffer_size: 4294967296
+    reuse_registered_buffers: true
+    staging_buffer_size: 268435456
+    use_gdr: false
+    gdr_staging_buffer_mb: 1024
+on_policy_distillation: null
