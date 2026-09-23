@@ -52,7 +52,7 @@ from typing import Optional
 import torch
 
 ROLLOUT_STATS_KEYS: tuple[str, ...] = (
-    "prompt_ids",
+    "group_ids",
     "rewards",
     "sample_masks",
     "gen_tokens",
@@ -109,14 +109,21 @@ def accumulate_rollout_stats(
 ) -> None:
     """Append one advantage-stage chunk to ``acc`` (all tensors moved to CPU).
 
-    ``prompt_ids`` may be ``(B,)`` group ids or ``(B, P)`` prompt token ids; the
-    reducer groups rows by identical values along the trailing dimensions.
+    ``prompt_ids`` may be ``(B,)`` group ids or ``(B, P)`` prompt token ids
+    (padded to the chunk's own width, so chunks cannot be concatenated as-is).
+    Rows with identical values form a group, exactly as the advantage
+    estimator groups them within a chunk; each chunk's groups get ids that
+    continue from the previous chunk's, so the reducer can concatenate them.
     ``truncated`` / ``seq_lens`` are optional; the reducer skips the metrics
     that depend on them when any chunk lacks them.
     """
     batch = rewards.shape[0]
     stats = per_sample_rollout_stats(token_mask)
-    acc["prompt_ids"].append(prompt_ids.detach().reshape(batch, -1).cpu())
+    _, local_groups = torch.unique(
+        prompt_ids.detach().reshape(batch, -1), dim=0, return_inverse=True
+    )
+    offset = int(acc["group_ids"][-1].max()) + 1 if acc["group_ids"] else 0
+    acc["group_ids"].append(local_groups.reshape(batch).long().cpu() + offset)
     acc["rewards"].append(rewards.detach().float().reshape(batch).cpu())
     acc["sample_masks"].append(sample_mask.detach().float().reshape(batch).cpu())
     acc["gen_tokens"].append(stats["gen_tokens"])
@@ -193,9 +200,12 @@ def reduce_rollout_stats(
     )
     out["reward/pass_frac"] = float(passed.float().mean())
 
-    # Group statistics: rows sharing a prompt id form one GRPO group.
-    prompt_ids = torch.cat(acc["prompt_ids"])[valid]
-    _, group_index = torch.unique(prompt_ids, dim=0, return_inverse=True)
+    # Group statistics: rows sharing a prompt form one GRPO group (ids were
+    # made unique across chunks at accumulation time; compact them after
+    # dropping invalid rows).
+    _, group_index = torch.unique(
+        torch.cat(acc["group_ids"])[valid], return_inverse=True
+    )
     group_index = group_index.reshape(-1)
     num_groups = int(group_index.max()) + 1
     counts = torch.bincount(group_index, minlength=num_groups).float()
