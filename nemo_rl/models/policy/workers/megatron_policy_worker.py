@@ -986,8 +986,8 @@ class MegatronPolicyWorkerImpl(
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function.
 
-        ``check_dim_skip_keys`` is accepted for parity with the v1/v2 DTensor
-        workers (cross-tokenizer ride-along tensors whose dim 1 is not the
+        ``check_dim_skip_keys`` is accepted for parity with the DTensor
+        worker (cross-tokenizer ride-along tensors whose dim 1 is not the
         student sequence axis). Megatron doesn't run cross-tokenizer, so it
         must be None.
         """
