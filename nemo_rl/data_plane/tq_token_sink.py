@@ -70,7 +70,6 @@ from nemo_rl.data_plane.schema import (
     ROUTED_LEN_FIELD,
 )
 from nemo_rl.experience.route_assembly import RouteFragment
-from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
 
 # These names come from nemo_gym.token_id_capture.staging.records.StagedCallRecord,
 # transformed by stage() below. Adding a field means editing both this list and
@@ -807,10 +806,6 @@ class ChainPrefixCache:
             self._source = source
             self._cache.clear()
 
-    def fetch(self, staging_chain: list[str]) -> list[int]:
-        """Assemble the expanded prefix from staging_chain (see :meth:`fetch_chains`)."""
-        return list(self.fetch_chains(staging_chain).expanded)
-
     def fetch_chains(self, staging_chain: list[str]) -> PrefixChains:
         """Assemble both prefix spaces from staging_chain, with a worker-local FIFO (256-entry) cache."""
         cache = self._cache
@@ -844,13 +839,6 @@ class ChainPrefixCache:
         )
 
 
-def resolve_admission_prefix(
-    admission: Any, chain_prefix: ChainPrefixCache
-) -> list[int]:
-    """Resolve a ``CaptureAdmission`` to the flat prefix the engine prompt starts with."""
-    return resolve_admission_prefix_chains(admission, chain_prefix).expanded
-
-
 def resolve_admission_prefix_chains(
     admission: Any, chain_prefix: ChainPrefixCache
 ) -> PrefixChains:
@@ -870,10 +858,12 @@ def resolve_admission_prefix_chains(
 class TQMegatronPromptPreparer:
     """Resolve a Gym-authorized staged prefix before MInf admits a request.
 
-    Mirrors the vLLM worker: ``prepare_prompt`` resolves the prefix through the
-    shared ``resolve_admission_prefix`` / ``ChainPrefixCache`` pair, then splices
-    it with the shared ``replace_prefix_tokens`` using the rendered prior-turn
-    tokens and EOS id the Megatron endpoint carried in ``offload_params``.
+    Same shape as the vLLM worker's ``_resolve_admission_prefix``:
+    ``prepare_prompt`` resolves the admission through
+    ``resolve_admission_prefix_chains`` over a worker-local ``ChainPrefixCache``,
+    then splices the result with the shared ``replace_prefix_tokens`` using the
+    rendered prior-turn tokens and EOS id the Megatron endpoint carried in
+    ``offload_params``.
     """
 
     def __init__(self, source: TQTokenSource) -> None:
@@ -891,6 +881,12 @@ class TQMegatronPromptPreparer:
         # Megatron-LM hooks from NVIDIA/Megatron-LM#7015.
         from megatron.core.inference.inference_request import (
             RequestPromptPreparationResult,
+        )
+
+        # Deferred: nemo_rl.models.generation pulls transformers and the
+        # vLLM/TRT-LLM modules into the finalizer's import path.
+        from nemo_rl.models.generation.openai_server_utils import (
+            replace_prefix_tokens,
         )
 
         if offload_params is None:
@@ -990,8 +986,13 @@ class _MegatronCapturePayload:
     def from_offloaded(
         cls, payload: Any, minf_params: Any
     ) -> "_MegatronCapturePayload":
+        if minf_params is not None and not isinstance(minf_params, dict):
+            raise TypeError(
+                f"MInf capture params must be a dict, got {type(minf_params).__name__}"
+            )
+
         def _count(key: str) -> int:
-            value = minf_params.get(key) if isinstance(minf_params, dict) else None
+            value = minf_params.get(key) if minf_params is not None else None
             if value is None:
                 return 0
             if type(value) is not int or value < 0:
@@ -1000,9 +1001,13 @@ class _MegatronCapturePayload:
                 )
             return value
 
-        media_tensors = slice_media_tensors(
-            getattr(payload, "media_tensors", None), _count(MEDIA_PREV_COUNT_KEY)
-        )
+        media_tensors = getattr(payload, "media_tensors", None)
+        if media_tensors is not None and not isinstance(media_tensors, Mapping):
+            raise TypeError(
+                "MInf payload media_tensors must be a mapping, got "
+                f"{type(media_tensors).__name__}"
+            )
+        media_tensors = slice_media_tensors(media_tensors, _count(MEDIA_PREV_COUNT_KEY))
         return cls(
             prompt_token_ids=getattr(payload, "prompt_token_ids", None),
             generated_token_ids=getattr(payload, "generated_token_ids", None),
@@ -1183,7 +1188,10 @@ class TQTokenSource:
         self._store = TQStagingStore(dp_client, staging_partition=staging_partition)
         self._staging_partition = staging_partition
         # Mirrors the partition schema: only a media-enabled partition has the
-        # flag/tensor columns, so selection is gated rather than probed.
+        # flag/tensor columns, so selection is gated rather than probed. Must
+        # match the sink's ``capture_media`` for the same partition: the
+        # ``media_count`` this source reports (and so the Megatron preparer's
+        # ``media_prev_count``) is only computed when it is True.
         self._capture_media = capture_media
 
     def fetch(self, staging_keys: list[str]) -> list[StagedCallBaseSnapshot]:
@@ -1200,8 +1208,12 @@ class TQTokenSource:
         The compact chain uses each row's ``compact_token_ids_delta`` when the
         call staged one (``compact_len > 0``) and its ``token_ids_delta``
         otherwise, so text calls contribute the same ids to both chains.
-        ``media_count`` is read off the small media columns of a media-enabled
-        partition (never the pixels); a text-only partition reports 0.
+        ``media_count`` is read off the small media columns (never the pixels)
+        and is only computed when this source was built with
+        ``capture_media=True``; otherwise it is 0 regardless of what the rows
+        staged. The Megatron preparer's ``media_prev_count`` therefore depends
+        on the source's ``capture_media`` matching the sink's -- both are set
+        from setup's ``capture_media`` in ``megatron_worker.setup_token_capture``.
         """
         if not staging_keys:
             return PrefixChains(expanded=[], compact=[])

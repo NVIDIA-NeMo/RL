@@ -40,10 +40,17 @@ from nemo_gym.token_id_capture.staging.protocols import (  # noqa: E402
 from nemo_gym.token_id_capture.staging.protocols import (  # noqa: E402
     StagingSource as TokenSourceProtocol,
 )
+from nemo_gym.token_id_capture.staging.digest import (  # noqa: E402
+    compute_extras_digest,
+    compute_staging_digest,
+)
+from nemo_gym.token_id_capture.staging.records import StagedCallRecord  # noqa: E402
 
 from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
+    COMPACT_LEN_FIELD,
     COMPACT_PREV_LEN_KEY,
     COMPACT_TOKEN_IDS_EXTRAS_KEY,
+    COMPACT_TOKEN_IDS_FIELD,
     MEDIA_FLAG_FIELDS,
     MEDIA_PREV_COUNT_KEY,
     MEDIA_STAGING_FIELDS,
@@ -56,10 +63,11 @@ from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     PrefixChains,
     TQMegatronPromptPreparer,
     TQMegatronTokenStager,
+    TQStagingStore,
     TQTokenSink,
     TQTokenSource,
     _MegatronCapturePayload,
-    resolve_admission_prefix,
+    resolve_admission_prefix_chains,
     slice_media_tensors,
 )
 from tests.unit.data_plane.token_capture_test_fixtures import (  # noqa: E402
@@ -461,6 +469,76 @@ def test_stage_failure_reports_not_raises(staging_partition):
     assert "controller down" in (result.error or "")
 
 
+def _with_extras(record: StagedCallRecord, extras: dict) -> StagedCallRecord:
+    """Rebuild a fixture record carrying ``extras`` with both digests recomputed."""
+    values = record.model_dump()
+    values["extras"] = extras
+    values["extras_digest"] = compute_extras_digest(extras)
+    values["digest"] = compute_staging_digest(
+        **{
+            name: values[name]
+            for name in (
+                "schema_version",
+                "digest_version",
+                "extras_digest_version",
+                "rollout_id",
+                "model_call_id",
+                "parent_call_id",
+                "mode",
+                "prev_len",
+                "delta_len",
+                "cum_len",
+                "weight_version",
+                "token_ids_delta",
+                "token_mask_delta",
+                "generation_log_probs_delta",
+                "extras_digest",
+                "chain_hash",
+                "cumulative_hash",
+            )
+        }
+    )
+    return StagedCallRecord(**values)
+
+
+@pytest.mark.parametrize(
+    "compact_delta",
+    ["not-a-list", [], [1, 1.5], [True]],
+    ids=["str", "empty", "float", "bool"],
+)
+def test_stage_rejects_malformed_compact_delta_and_leaves_no_row(
+    tq_client, staging_partition, compact_delta
+):
+    """A malformed ``compact_token_ids_delta`` fails the stage and stages nothing."""
+    sink = TQTokenSink(tq_client, staging_partition=staging_partition)
+    records, _, _ = build_fixture_artifacts("single_call")
+    record = _with_extras(records[0], {COMPACT_TOKEN_IDS_EXTRAS_KEY: compact_delta})
+
+    result = sink.stage(record)
+
+    assert result.ok is False
+    assert "compact_token_ids_delta" in (result.error or "")
+    source = TQTokenSource(tq_client, staging_partition=staging_partition)
+    with pytest.raises(KeyError):
+        source.fetch_for_finalization([record.staging_key])
+
+
+def test_fetch_prefix_chains_rejects_compact_len_mismatch(tq_client, staging_partition):
+    """A row whose ``compact_len`` disagrees with its delta column is refused, not truncated."""
+    store = TQStagingStore(tq_client, staging_partition=staging_partition)
+    store.put(
+        "r0/c1",
+        {
+            "token_ids_delta": torch.tensor([[1, 2, 3]], dtype=torch.int64),
+            COMPACT_TOKEN_IDS_FIELD: torch.tensor([[7, 8]], dtype=torch.int64),
+            COMPACT_LEN_FIELD: torch.tensor([3], dtype=torch.int64),
+        },
+    )
+    source = TQTokenSource(tq_client, staging_partition=staging_partition)
+    with pytest.raises(ValueError, match="compact_len"):
+        source.fetch_prefix_chains(["r0/c1"])
+
+
 def test_sink_clear_drops_rows(tq_client, staging_partition):
     sink = TQTokenSink(tq_client, staging_partition=staging_partition)
     source = TQTokenSource(tq_client, staging_partition=staging_partition)
@@ -671,11 +749,19 @@ def test_megatron_stager_passes_media_tensors_as_attachments():
     kwargs = capture.complete_call_from_response.call_args.kwargs
     assert kwargs["attachments"]["imgs"] is imgs
     assert kwargs["attachments"]["imgs_sizes"] is sizes
-    assert not hasattr(sink, "attach_media")
 
 
-def test_megatron_stager_passes_no_attachments_for_text_calls():
-    """A text call (no media tensors) reaches Gym with attachments=None."""
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(_minf_payload(multimodal=False), id="text"),
+        pytest.param(
+            _minf_payload(multimodal=True, media_tensors={}), id="empty-media-mapping"
+        ),
+    ],
+)
+def test_megatron_stager_passes_no_attachments_for_text_calls(payload):
+    """A call without media tensors (absent or empty) reaches Gym with attachments=None."""
     sink = MagicMock(spec=TQTokenSink)
     stager = TQMegatronTokenStager(sink)
     capture = MagicMock()
@@ -687,7 +773,7 @@ def test_megatron_stager_passes_no_attachments_for_text_calls():
         rollout_id="r0", model_call_id="c1", mode="text"
     ).model_dump(mode="json")
     stager._stage_admitted(
-        _minf_payload(multimodal=False),
+        payload,
         capture_payload=admission,
         finished_metadata=SimpleNamespace(policy_epoch=[(0, 0)]),
     )
@@ -1009,6 +1095,76 @@ def test_megatron_stager_poisons_payload_view_failures_with_capture_failed(
         )
 
 
+@pytest.mark.parametrize(
+    ("payload", "minf_params", "match"),
+    [
+        pytest.param(
+            _minf_payload(multimodal=True, media_tensors=[torch.zeros(1, 4, 12)]),
+            {COMPACT_PREV_LEN_KEY: 0, MEDIA_PREV_COUNT_KEY: 1},
+            "media_tensors must be a mapping, got list",
+            id="media-tensors-list",
+        ),
+        pytest.param(
+            _minf_payload(multimodal=False),
+            ["not", "a", "dict"],
+            "capture params must be a dict, got list",
+            id="minf-params-list",
+        ),
+    ],
+)
+def test_megatron_payload_view_rejects_non_mapping_inputs(payload, minf_params, match):
+    """Structural payload errors surface as TypeError, which the stager's poison path catches."""
+    with pytest.raises(TypeError, match=match):
+        _MegatronCapturePayload.from_offloaded(payload, minf_params)
+
+
+@pytest.mark.parametrize(
+    ("payload", "minf_params"),
+    [
+        pytest.param(
+            _minf_payload(multimodal=True, media_tensors=[torch.zeros(1, 4, 12)]),
+            {COMPACT_PREV_LEN_KEY: 0, MEDIA_PREV_COUNT_KEY: 1},
+            id="media-tensors-list",
+        ),
+        pytest.param(
+            _minf_payload(multimodal=False), ["not", "a", "dict"], id="minf-params-list"
+        ),
+    ],
+)
+def test_megatron_stager_poisons_non_mapping_payload_inputs_with_capture_failed(
+    tq_client, staging_partition, payload, minf_params
+):
+    """A non-mapping ``media_tensors`` or non-dict capture params poison the call.
+
+    Without the explicit type checks these escape ``from_offloaded`` as
+    ``AttributeError`` (``slice_media_tensors`` calls ``.get``) or are silently
+    treated as empty, instead of returning ``capture_failed`` coordinates.
+    """
+    stager = TQMegatronTokenStager(_megatron_sink(tq_client, staging_partition))
+    admission = nemo_gym.CaptureAdmission(
+        rollout_id="minf-r0", model_call_id="c1", mode="text"
+    )
+
+    result = stager.stage(
+        "minf-response-1",
+        payload,
+        finished_metadata=SimpleNamespace(policy_epoch=[(0, 7)]),
+        offload_params={
+            "ng_capture": admission.model_dump(mode="json"),
+            MINF_CAPTURE_PARAMS_FIELD: minf_params,
+        },
+    )
+
+    assert result is not None
+    coords = result.response_metadata["ng_commit_coords"]
+    assert coords["disposition"] == "capture_failed"
+    assert coords["weight_version"] == 7
+    with pytest.raises(KeyError):
+        TQTokenSource(tq_client, staging_partition=staging_partition).fetch(
+            ["minf-r0/c1"]
+        )
+
+
 def test_megatron_stager_reports_media_on_text_partition_as_capture_failed(
     tq_client, staging_partition
 ):
@@ -1087,9 +1243,9 @@ def test_chain_prefix_cache_fetches_only_uncached_suffix():
     source = _RecordingSource()
     cache = ChainPrefixCache(source)
 
-    assert cache.fetch(["k1", "k2"]) == [10, 11, 20, 21]
-    assert cache.fetch(["k1", "k2", "k3"]) == [10, 11, 20, 21, 30, 31]
-    assert cache.fetch(["k1", "k2"]) == [10, 11, 20, 21]
+    assert cache.fetch_chains(["k1", "k2"]).expanded == [10, 11, 20, 21]
+    assert cache.fetch_chains(["k1", "k2", "k3"]).expanded == [10, 11, 20, 21, 30, 31]
+    assert cache.fetch_chains(["k1", "k2"]).expanded == [10, 11, 20, 21]
     assert source.calls == [["k1", "k2"], ["k3"]]
     assert cache.fetch_chains(["k1", "k2", "k3"]) == PrefixChains(
         expanded=[10, 11, 20, 21, 30, 31], compact=[10, 20, 30]
@@ -1100,26 +1256,27 @@ def test_chain_prefix_cache_fetches_only_uncached_suffix():
 def test_chain_prefix_cache_requires_an_installed_source():
     cache = ChainPrefixCache()
     with pytest.raises(RuntimeError, match="setup_token_capture"):
-        cache.fetch(["k1"])
+        cache.fetch_chains(["k1"])
     source = _RecordingSource()
     cache.install(source)
-    assert cache.fetch(["k1"]) == [10, 11]
+    assert cache.fetch_chains(["k1"]).expanded == [10, 11]
 
 
 def test_chain_prefix_cache_evicts_oldest_insertion_past_256_entries():
     source = _RecordingSource()
     cache = ChainPrefixCache(source)
     for i in range(257):
-        cache.fetch([f"k{i}"])
+        cache.fetch_chains([f"k{i}"])
     # k0 was the first insertion and is gone; k1 is still a hit.
     calls_before = len(source.calls)
-    cache.fetch(["k1"])
+    cache.fetch_chains(["k1"])
     assert len(source.calls) == calls_before
-    cache.fetch(["k0"])
+    cache.fetch_chains(["k0"])
     assert len(source.calls) == calls_before + 1
 
 
-def test_resolve_admission_prefix_dispatches_like_the_vllm_worker():
+def test_resolve_admission_prefix_chains_dispatches_on_admission_shape():
+    """Text -> empty; inline prefix -> same ids in both spaces; chain -> cache fetch."""
     source = _RecordingSource()
     cache = ChainPrefixCache(source)
     text = SimpleNamespace(mode="text", staging_chain=[], required_prefix_token_ids=[])
@@ -1130,9 +1287,15 @@ def test_resolve_admission_prefix_dispatches_like_the_vllm_worker():
         mode="token_in", staging_chain=["k1"], required_prefix_token_ids=[]
     )
 
-    assert resolve_admission_prefix(text, cache) == []
-    assert resolve_admission_prefix(inline, cache) == [7, 8]
-    assert resolve_admission_prefix(chained, cache) == [10, 11]
+    assert resolve_admission_prefix_chains(text, cache) == PrefixChains(
+        expanded=[], compact=[]
+    )
+    assert resolve_admission_prefix_chains(inline, cache) == PrefixChains(
+        expanded=[7, 8], compact=[7, 8]
+    )
+    assert resolve_admission_prefix_chains(chained, cache) == PrefixChains(
+        expanded=[10, 11], compact=[10]
+    )
     assert source.calls == [["k1"]]
 
 
