@@ -1,5 +1,5 @@
-# Prefetch config: every NeMo Gym environment used by the Nemotron 3.5 Super RLVR blend28
-# recipe (pipeline: RLVR/nemotron-3.5-super/configs/grpo_superv3_5_rlvr_blend28-oci-hsg-20260902-r1.yaml).
+# Prefetch config: NeMo Gym environments used by the Nemotron 3.5 Super recipes,
+# including the RLVR blend28 and newer multimodal/MOPD environments.
 # Pass to the docker build to bake every Gym server venv into the image so no server has to
 # create its venv at job start:
 #   docker buildx build -f docker/Dockerfile \
@@ -37,7 +37,7 @@ env:
       - "<think>"
       - "</think>"
 
-    # Same order as the recipe's config_paths.
+    # Preserve the blend28 recipe's config order, then add newer environments.
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
     - resources_servers/scicode/configs/scicode.yaml
@@ -84,6 +84,13 @@ env:
     - resources_servers/terminal_multi_harness/configs/terminal_multi_harness_agent006.yaml
     - resources_servers/terminal_multi_harness/configs/terminal_multi_harness_opencode.yaml
     - resources_servers/terminal_multi_harness/configs/terminal_multi_harness_codex.yaml
+
+    # Newer blends: the simulation config adds both resource-server and agent
+    # venvs; structured_outputs_v4 adds the non_executing_simple_agent venv.
+    - resources_servers/sav_tracks/configs/sav_tracks.yaml
+    - resources_servers/citation_if/configs/citation_if.yaml
+    - resources_servers/conversational_tool_use_simulation/configs/conversational_tool_use_simulation.yaml
+    - resources_servers/structured_outputs/configs/structured_outputs_v4.yaml
 
     # Recipe data still names the removed rdkit_chemistry agent. This alias keeps
     # that data compatible while prefetching the replacement Litmus environment.
