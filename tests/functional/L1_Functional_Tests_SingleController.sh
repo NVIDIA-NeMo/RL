@@ -207,6 +207,10 @@ run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controll
 # Stateless GenRM cohort recovery: crash with one sibling blocked in /verify
 # and its peer parked, then replay both without duplicate reward computation.
 run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_genrm_turn_recovery.sh
+# Full-process restart while a policy-model call is still generating. This is
+# the end-to-end guard that proves a durable TQ prefix is restored and only the
+# missing suffix is generated after restart.
+run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_prefix_recovery.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then

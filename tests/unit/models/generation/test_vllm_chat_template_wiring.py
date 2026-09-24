@@ -39,7 +39,20 @@ from nemo_rl.models.generation.vllm.vllm_worker_async import (
 # recording list is bound explicitly rather than looked up through the instance.
 # A class attribute would be shadowed by the subclass and the construction would
 # be recorded somewhere the assertions never look.
-_BUILT: dict[str, list] = {"renderer": [], "chat": [], "tokenize": []}
+_BUILT: dict[str, list] = {"renderer": [], "chat": [], "tokenize": [], "app": []}
+
+
+class _FakeRequestOutputKind:
+    FINAL_ONLY = object()
+    CUMULATIVE = object()
+    DELTA = object()
+
+
+class _FakeChatCompletionRequest:
+    ng_capture = None
+
+    def to_sampling_params(self, *_args, **_kwargs):
+        return types.SimpleNamespace(output_kind=_FakeRequestOutputKind.FINAL_ONLY)
 
 
 def _recorder(slot: str):
@@ -61,6 +74,7 @@ class _FakeApp:
 
     def __init__(self):
         self.routes = []
+        _BUILT["app"].append(self)
 
     def _register(self, path):
         def decorator(fn):
@@ -109,7 +123,7 @@ def _install_fake_vllm(monkeypatch):
     )
     module(
         "vllm.entrypoints.openai.chat_completion.protocol",
-        ChatCompletionRequest=placeholder("ChatCompletionRequest"),
+        ChatCompletionRequest=_FakeChatCompletionRequest,
         ChatCompletionResponse=placeholder("ChatCompletionResponse"),
     )
     module(
@@ -139,6 +153,7 @@ def _install_fake_vllm(monkeypatch):
         ServingTokenization=_ServingTokenization,
     )
     module("vllm.renderers.online_renderer", OnlineRenderer=_OnlineRenderer)
+    module("vllm.sampling_params", RequestOutputKind=_FakeRequestOutputKind)
     module(
         "vllm.exceptions",
         VLLMValidationError=type("VLLMValidationError", (Exception,), {}),
@@ -161,7 +176,9 @@ def _install_fake_vllm(monkeypatch):
         built.clear()
 
 
-def _build_server(monkeypatch, serving_chat_kwargs):
+def _build_server(
+    monkeypatch, serving_chat_kwargs, *, generation_prefix_cuts_enabled=False
+):
     """Run the real server setup and hand back the three consumer stubs."""
     _install_fake_vllm(monkeypatch)
 
@@ -175,6 +192,7 @@ def _build_server(monkeypatch, serving_chat_kwargs):
     worker._http_engine_client = MagicMock(
         model_config="http-model-config", renderer="http-renderer"
     )
+    worker._generation_prefix_cuts_enabled = generation_prefix_cuts_enabled
     worker.llm_async_engine_args = MagicMock()
     worker.llm_async_engine_args.create_model_config.return_value = MagicMock(
         served_model_name="served-model", model="model-path"
@@ -247,3 +265,34 @@ def test_absent_kwargs_render_as_empty_dict(monkeypatch):
 
     assert renderer[0].kwargs["default_chat_template_kwargs"] == {}
     assert tokenization[0].kwargs["default_chat_template_kwargs"] == {}
+
+
+def test_captured_prefix_cut_request_uses_delta_engine_outputs(monkeypatch):
+    _build_server(monkeypatch, {}, generation_prefix_cuts_enabled=True)
+    app = _BUILT["app"][0]
+    handler = next(fn for path, fn in app.routes if path == "/v1/chat/completions")
+    request_type = handler.__annotations__["request"]
+
+    captured_request = request_type()
+    captured_request.ng_capture = {"rollout_id": "rollout-1"}
+    plain_request = request_type()
+
+    assert (
+        captured_request.to_sampling_params().output_kind
+        is _FakeRequestOutputKind.DELTA
+    )
+    assert (
+        plain_request.to_sampling_params().output_kind
+        is _FakeRequestOutputKind.FINAL_ONLY
+    )
+
+
+def test_capture_without_prefix_cuts_keeps_final_only_engine_outputs(monkeypatch):
+    _build_server(monkeypatch, {}, generation_prefix_cuts_enabled=False)
+    app = _BUILT["app"][0]
+    handler = next(fn for path, fn in app.routes if path == "/v1/chat/completions")
+    request_type = handler.__annotations__["request"]
+    request = request_type()
+    request.ng_capture = {"rollout_id": "rollout-1"}
+
+    assert request.to_sampling_params().output_kind is _FakeRequestOutputKind.FINAL_ONLY
