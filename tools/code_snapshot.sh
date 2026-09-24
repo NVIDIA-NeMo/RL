@@ -1,4 +1,17 @@
 #!/bin/bash
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 set -euo pipefail
 
@@ -23,14 +36,25 @@ fi
 EXP_NAME=$1
 CODE_SNAPSHOT_DIRNAME=${CODE_SNAPSHOT_DIRNAME:-code_snapshots}
 
+# Nested names like team/run1 are allowed, but the name must stay inside
+# $CODE_SNAPSHOT_DIRNAME and be a single line, since callers `cd` into the echoed path.
+is_valid_exp_name() {
+  local name=$1 part
+  local -a parts
+  [[ -n "$name" && "$name" != /* && "$name" != *$'\n'* ]] || return 1
+  IFS=/ read -ra parts <<< "$name"
+  for part in "${parts[@]}"; do
+    [[ "$part" != . && "$part" != .. ]] || return 1
+  done
+}
+
+if ! is_valid_exp_name "$EXP_NAME"; then
+  echo2 "[Error]: Invalid experiment name: '$EXP_NAME'"
+  exit 1
+fi
+
 SNAPSHOT_DIR="$PROJECT_ROOT/${CODE_SNAPSHOT_DIRNAME}/${EXP_NAME}"
-# Written last, so its presence means the copy below ran to completion. The
-# directory used to be created up front and treated as reusable from then on,
-# which meant a run that died between the mkdir and the end of the rsync left a
-# directory that exists but is missing files. Every later run for the same
-# experiment name then reused that partial tree -- for instance failing at
-# `sbatch` because ray.sub had never been copied. Checking for the marker rather
-# than for the directory also repairs snapshots left behind before this change.
+# Written last: an unmarked dir is an interrupted or pre-marker copy.
 SNAPSHOT_MARKER="$SNAPSHOT_DIR/.snapshot_complete"
 
 if [[ -f "$SNAPSHOT_MARKER" ]]; then
@@ -39,36 +63,19 @@ if [[ -f "$SNAPSHOT_MARKER" ]]; then
   echo ${SNAPSHOT_DIR}
   exit
 elif [[ -d "$SNAPSHOT_DIR" ]]; then
-  echo2 "Existing code snapshot in $SNAPSHOT_DIR is unmarked or incomplete; rebuilding it"
+  echo2 "Existing code snapshot in $SNAPSHOT_DIR is incomplete; filling in missing files"
 else
   echo2 "Creating new code snapshot in $SNAPSHOT_DIR"
 fi
-
-# Build in a staging directory and put it in place with a rename, which is
-# atomic, so the final path never appears in a half-copied state.
-STAGING_DIR="${SNAPSHOT_DIR}.partial.$$"
-rm -rf "$STAGING_DIR"
-mkdir -p "$STAGING_DIR"
-trap 'rm -rf "$STAGING_DIR"' EXIT
+mkdir -p "$SNAPSHOT_DIR"
 
 echo2 "Copying git-tracked files and submodules..."
-rsync -a --files-from=<(
-  git ls-files --recurse-submodules --cached --full-name
-) ./ "$STAGING_DIR"/
-touch "$STAGING_DIR/.snapshot_complete"
-
-# A rename cannot replace a non-empty directory, so clear any unmarked remains
-# first. Two jobs staging the same experiment concurrently are both complete by
-# this point, so whichever lands second simply keeps what it finds.
-rm -rf "$SNAPSHOT_DIR"
-if mv -T "$STAGING_DIR" "$SNAPSHOT_DIR" 2>/dev/null; then
-  trap - EXIT
-elif [[ -f "$SNAPSHOT_MARKER" ]]; then
-  echo2 "Another complete snapshot of $EXP_NAME appeared while copying; using it"
-else
-  echo2 "[Error]: Failed to move the staged snapshot into $SNAPSHOT_DIR"
-  exit 1
-fi
+# Materialized so a git failure trips set -e instead of marking an empty snapshot complete.
+TRACKED_FILES=$(git ls-files --recurse-submodules --cached --full-name)
+# The dir may hold run outputs (logs, ckpts, continue.sh), so never delete it; --ignore-existing
+# keeps already-copied code frozen, and rsync's temp-file+rename leaves no truncated files.
+rsync -a --ignore-existing --files-from=<(printf '%s\n' "$TRACKED_FILES") ./ "$SNAPSHOT_DIR"/
+touch "$SNAPSHOT_MARKER"
 
 # Echo the snapshot directory so the caller can use it to `cd` into it
 echo ${SNAPSHOT_DIR}
