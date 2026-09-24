@@ -30,6 +30,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 
 from nemo_rl.algorithms import grpo as grpo_mod
 from nemo_rl.algorithms.advantage_estimator import (
+    AdvantageResult,
     GDPOAdvantageEstimator,
     GRPOAdvantageEstimator,
     ReinforcePlusPlusAdvantageEstimator,
@@ -1520,7 +1521,9 @@ def mock_sync_grpo_infrastructure(policy):
         )
     )
     adv_estimator = MagicMock()
-    adv_estimator.compute_advantage.return_value = torch.zeros(1, 4)
+    adv_estimator.compute_advantage.return_value = AdvantageResult(
+        advantages=torch.zeros(1, 4)
+    )
     stack.enter_context(
         patch(
             "nemo_rl.algorithms.grpo_sync._create_advantage_estimator",
@@ -4384,7 +4387,9 @@ def test_grpo_train_clips_advantages_when_configured(
     """Advantages passed to policy.train are clamped when clip bounds are set."""
     extreme_advantages = torch.tensor([[-10.0, 15.0]])
     mock_adv_estimator = MagicMock()
-    mock_adv_estimator.compute_advantage.return_value = extreme_advantages.clone()
+    mock_adv_estimator.compute_advantage.return_value = AdvantageResult(
+        advantages=extreme_advantages.clone()
+    )
     monkeypatch.setattr(
         "nemo_rl.algorithms.grpo._create_advantage_estimator",
         lambda _cfg: mock_adv_estimator,
@@ -4410,7 +4415,9 @@ def test_grpo_train_preserves_advantages_when_clipping_disabled(
     """Advantages are unchanged when advantage_clip_low/high are null."""
     extreme_advantages = torch.tensor([[-10.0, 15.0]])
     mock_adv_estimator = MagicMock()
-    mock_adv_estimator.compute_advantage.return_value = extreme_advantages.clone()
+    mock_adv_estimator.compute_advantage.return_value = AdvantageResult(
+        advantages=extreme_advantages.clone()
+    )
     monkeypatch.setattr(
         "nemo_rl.algorithms.grpo._create_advantage_estimator",
         lambda _cfg: mock_adv_estimator,
@@ -5273,7 +5280,7 @@ def test_grpo_advantage_estimator_zero_std():
         prompt_ids=prompt_ids,
         rewards=rewards,
         mask=mask,
-    )
+    ).advantages
 
     # prompt 0: std=0 -> skip normalization, advantage=0 (reward - mean = 0)
     # prompt 1: With Bessel correction for 2 samples, std = sqrt(2), normalized = ±1/sqrt(2) ≈ ±0.7071
@@ -5308,7 +5315,7 @@ def test_grpo_advantage_estimator_tensor_shapes():
         prompt_ids=prompt_ids,
         rewards=rewards,
         mask=mask,
-    )
+    ).advantages
     assert result.shape == (2, 3)
 
     # Verify normalized values: (reward - mean) / std
@@ -5326,7 +5333,7 @@ def test_grpo_advantage_estimator_tensor_shapes():
         prompt_ids=prompt_ids,
         rewards=rewards,
         mask=mask,
-    )
+    ).advantages
     assert result.shape == (10, 5)
 
     # After normalization, mean should be ~0
@@ -5355,7 +5362,7 @@ def test_grpo_advantage_estimator_negative_advantages():
         prompt_ids=prompt_ids,
         rewards=rewards,
         mask=mask,
-    )
+    ).advantages
 
     # Verify ordering: first should be negative, middle ~0, last positive
     assert result[0, 0] < 0  # below mean -> negative advantage
@@ -5389,7 +5396,7 @@ def test_grpo_advantage_estimator_zero_std_and_zero_advantage():
         prompt_ids=prompt_ids,
         rewards=rewards,
         mask=mask,
-    )
+    ).advantages
 
     # All advantages should be exactly 0
     expected = torch.zeros(4, 3)
@@ -5410,7 +5417,7 @@ def test_grpo_advantage_estimator_skips_trivial_leave_one_out_normalization():
         prompt_ids=prompt_ids,
         rewards=rewards,
         mask=torch.ones(8, 3),
-    )
+    ).advantages
 
     torch.testing.assert_close(result[0], torch.full((3,), -0.95))
     assert torch.isfinite(result).all()
@@ -5439,7 +5446,7 @@ def test_grpo_advantage_estimator_small_nonzero_std():
         prompt_ids=prompt_ids,
         rewards=rewards,
         mask=mask,
-    )
+    ).advantages
 
     # Even with small std, normalization should still happen
     # After normalization, the values should be ±1/sqrt(2) (for 2 samples with Bessel)
@@ -5473,7 +5480,9 @@ def test_gdpo_advantage_estimator_multiple_rewards():
         "reward/format": torch.tensor([1.0, 0.0]),
     }
 
-    result = estimator.compute_advantage(prompt_ids, None, mask, repeated_batch)
+    result = estimator.compute_advantage(
+        prompt_ids, None, mask, repeated_batch
+    ).advantages
     assert result.shape == (2, 3)
     assert torch.allclose(result[0, 0], torch.tensor(0.7071))
     assert torch.allclose(result[1, 0], torch.tensor(-0.7071))
@@ -5513,7 +5522,9 @@ def test_gdpo_advantage_estimator_reward_weights():
             reward_weights=weights,
         )
         estimator = GDPOAdvantageEstimator(config, loss_config)
-        return estimator.compute_advantage(prompt_ids, None, mask, dict(repeated_batch))
+        return estimator.compute_advantage(
+            prompt_ids, None, mask, dict(repeated_batch)
+        ).advantages
 
     default = run(None)
 
@@ -5544,7 +5555,7 @@ def test_gdpo_advantage_estimator_skips_trivial_leave_one_out_normalization():
 
     result = estimator.compute_advantage(
         prompt_ids, None, torch.ones(8, 3), repeated_batch
-    )
+    ).advantages
 
     # Samples 1 and 2 differ only in reward/format, so that component has to
     # still move them apart after aggregation.
@@ -5584,7 +5595,7 @@ def test_reinforce_plus_plus_global_normalization():
         prompt_ids=prompt_ids,
         rewards=rewards,
         mask=mask,
-    )
+    ).advantages
 
     # After global normalization, mean should be ~0
     result_mean = (result * mask).sum() / mask.sum()
