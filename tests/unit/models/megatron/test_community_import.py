@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for community_import checkpoint-save strategy shim."""
+"""Unit tests for community_import."""
 
 import importlib
 import os
@@ -72,21 +72,6 @@ def _load_community_import_module(monkeypatch):
     return importlib.import_module(module_name)
 
 
-def _install_torch_strategy_module(monkeypatch, strategy_cls):
-    """Install a fake dist-checkpoint strategy module for local import."""
-    _ensure_package(monkeypatch, "megatron")
-    _ensure_package(monkeypatch, "megatron.core")
-    _ensure_package(monkeypatch, "megatron.core.dist_checkpointing")
-    _ensure_package(monkeypatch, "megatron.core.dist_checkpointing.strategies")
-    strategy_module = ModuleType("megatron.core.dist_checkpointing.strategies.torch")
-    strategy_module.TorchDistSaveShardedStrategy = strategy_cls
-    monkeypatch.setitem(
-        sys.modules,
-        "megatron.core.dist_checkpointing.strategies.torch",
-        strategy_module,
-    )
-
-
 def _install_runtime_stubs_for_hf_import(monkeypatch):
     """Install minimal megatron-core stubs needed by import_model_from_hf_name."""
     core_module = _ensure_package(monkeypatch, "megatron.core")
@@ -114,85 +99,6 @@ def _install_runtime_stubs_for_hf_import(monkeypatch):
         sys.modules, "megatron.core.tensor_parallel.random", tensor_parallel_random
     )
     core_module.tensor_parallel = tensor_parallel
-
-
-def test_prefer_nvrx_is_noop_when_strategy_import_fails(monkeypatch):
-    module = _load_community_import_module(monkeypatch)
-    # Force this import to fail even if real megatron modules were preloaded by
-    # earlier tests in the same process.
-    monkeypatch.setitem(
-        sys.modules, "megatron.core.dist_checkpointing.strategies.torch", None
-    )
-
-    # Should not raise when dist-checkpoint strategy is unavailable.
-    with module._prefer_nvrx_for_dist_ckpt_save():
-        pass
-
-
-def test_prefer_nvrx_uses_async_save_and_restores_original_save(monkeypatch):
-    module = _load_community_import_module(monkeypatch)
-
-    class FakeAsyncRequest:
-        def __init__(self, owner):
-            self.owner = owner
-
-        def execute_sync(self):
-            self.owner.execute_sync_calls += 1
-
-    class FakeStrategy:
-        def __init__(self):
-            self.original_save_calls = []
-            self.async_save_calls = []
-            self.execute_sync_calls = 0
-
-        def save(self, sharded_state_dict, checkpoint_dir):
-            self.original_save_calls.append((sharded_state_dict, checkpoint_dir))
-
-        def async_save(self, sharded_state_dict, checkpoint_dir, async_strategy):
-            self.async_save_calls.append(
-                (sharded_state_dict, checkpoint_dir, async_strategy)
-            )
-            return FakeAsyncRequest(self)
-
-    _install_torch_strategy_module(monkeypatch, FakeStrategy)
-    strategy = FakeStrategy()
-    original_save = FakeStrategy.save
-
-    with module._prefer_nvrx_for_dist_ckpt_save():
-        strategy.save({"x": 1}, "/tmp/ckpt")
-        assert FakeStrategy.save is not original_save
-
-    assert strategy.async_save_calls == [({"x": 1}, "/tmp/ckpt", "nvrx")]
-    assert strategy.execute_sync_calls == 1
-    assert strategy.original_save_calls == []
-    assert FakeStrategy.save is original_save
-
-
-def test_prefer_nvrx_falls_back_to_original_save_when_nvrx_missing(monkeypatch):
-    module = _load_community_import_module(monkeypatch)
-
-    class FakeStrategy:
-        def __init__(self):
-            self.original_save_calls = []
-            self.async_save_calls = []
-
-        def save(self, sharded_state_dict, checkpoint_dir):
-            self.original_save_calls.append((sharded_state_dict, checkpoint_dir))
-
-        def async_save(self, sharded_state_dict, checkpoint_dir, async_strategy):
-            self.async_save_calls.append(
-                (sharded_state_dict, checkpoint_dir, async_strategy)
-            )
-            raise ModuleNotFoundError("nvrx is unavailable")
-
-    _install_torch_strategy_module(monkeypatch, FakeStrategy)
-    strategy = FakeStrategy()
-
-    with module._prefer_nvrx_for_dist_ckpt_save():
-        strategy.save({"y": 2}, "/tmp/ckpt")
-
-    assert strategy.async_save_calls == [({"y": 2}, "/tmp/ckpt", "nvrx")]
-    assert strategy.original_save_calls == [({"y": 2}, "/tmp/ckpt")]
 
 
 def _stage_conversion(path) -> None:
