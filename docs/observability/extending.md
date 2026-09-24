@@ -221,7 +221,7 @@ rather than threading a flag through the signatures.
 
 If nothing fits, add a group to `RLSpanGroup` in `nemo_rl/telemetry/span_groups.py`:
 
-1. Add the constant and add it to `ALL_GROUPS`. `ALL_GROUPS` is what `register_span_groups()` declares to lens, so a group missing from it is never selectable — not even under `all`.
+1. Add the constant to `RLSpanGroup`. The `ALL_GROUPS` set is computed from the class, so there is nothing to add it to. `ALL_GROUPS` is what `register_span_groups()` declares to lens, so a group missing from it is never selectable — not even under `all`.
 2. Slot it into the right preset(s) in `_PRESETS`. Decide per preset: `default` is coarse (rarely add here); `per_step` for per-step spans. There is no `all` to edit — lens resolves `all` as a wildcard over whatever is registered, so a group in `ALL_GROUPS` is reachable that way automatically. A group whose span count scales with dataset size rather than step count belongs in `all` only — see `per_prompt`, and add it to `PER_PROMPT_GROUPS` rather than `EMITTED_GROUPS` in the test below.
 3. Document the new group in [Span Groups](span-groups.md), and add it to `EMITTED_GROUPS` in `tests/unit/telemetry/test_span_groups.py` so the preset-reachability test covers it.
 

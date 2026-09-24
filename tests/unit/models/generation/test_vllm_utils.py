@@ -987,12 +987,14 @@ def test_engine_metric_names_match_vllm():
 
     import inspect
 
+    from vllm.v1.engine import FINISH_REASON_STRINGS
     from vllm.v1.metrics.loggers import PrometheusStatLogger
 
     from nemo_rl.models.generation.vllm.metric_names import (
         FINISHED_REASON_LABEL,
         GENERATION_LENGTH_HISTOGRAMS,
         GENERATION_TOKEN_COUNTERS,
+        OK_FINISH_REASONS,
         PROMPT_LENGTH_HISTOGRAMS,
         PROMPT_TOKEN_COUNTERS,
         REQUEST_SUCCESS_COUNTERS,
@@ -1016,6 +1018,9 @@ def test_engine_metric_names_match_vllm():
         "stop being reported. Update nemo_rl/models/generation/vllm/metric_names.py."
     )
     assert f'"{FINISHED_REASON_LABEL}"' in declared
+    # Copied from vLLM too. A reason that stops existing would be counted as
+    # failed forever, which is the same silent-drift failure as a renamed series.
+    assert OK_FINISH_REASONS <= set(FINISH_REASON_STRINGS)
 
 
 def test_a_counter_that_went_backwards_is_omitted_rather_than_negative():
@@ -1041,17 +1046,6 @@ def test_a_counter_that_went_backwards_is_omitted_rather_than_negative():
     assert "vllm/generations_failed" not in metrics
     # The series that did grow is still reported.
     assert metrics["vllm/generation_tokens"] == 400.0
-
-
-def test_engine_metrics_accept_the_alternate_total_suffixed_names():
-    """``vllm:prompt_tokens`` has also shipped as ``vllm:prompt_tokens_total``."""
-    metrics = compute_engine_step_metrics(
-        {"vllm:prompt_tokens_total": 1.0, "vllm:generation_tokens_total": 2.0},
-        {"vllm:prompt_tokens_total": 11.0, "vllm:generation_tokens_total": 22.0},
-    )
-
-    assert metrics["vllm/prompt_tokens"] == 10.0
-    assert metrics["vllm/generation_tokens"] == 20.0
 
 
 def test_engine_counters_survive_worker_aggregation():

@@ -693,6 +693,7 @@ def test_the_u_aliases_are_the_same_groups_under_another_name():
     } == UMBRELLA_GROUPS
 
 
+@requires_lens
 def test_an_umbrella_span_is_the_same_span_minus_the_bucket():
     from nemo_rl.telemetry.instrumentation import umbrella_span
 
@@ -706,6 +707,7 @@ def test_an_umbrella_span_is_the_same_span_minus_the_bucket():
     assert RL_BUCKET_ATTR not in span.attributes
 
 
+@requires_lens
 def test_a_leaf_group_at_an_umbrella_call_warns_and_keeps_its_bucket(caplog):
     """Degrade, do not raise: telemetry must not end a training run.
 
@@ -757,6 +759,7 @@ def test_a_leaf_group_at_an_umbrella_call_still_runs_the_body():
     assert train() == "done"
 
 
+@requires_lens
 def test_umbrella_trace_fn_returns_what_it_wraps():
     from nemo_rl.telemetry.instrumentation import umbrella_trace_fn
 
@@ -774,6 +777,7 @@ def test_umbrella_trace_fn_returns_what_it_wraps():
     assert RL_BUCKET_ATTR not in span.attributes
 
 
+@requires_lens
 def test_startup_spans_nest_without_a_bucket():
     """Startup phases nest and overlap, so none of them may carry a bucket."""
     from nemo_rl.telemetry.instrumentation import setup_span, startup_span

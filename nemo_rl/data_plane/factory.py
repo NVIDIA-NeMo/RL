@@ -192,12 +192,8 @@ def build_data_plane_client(
     if obs_enabled or telemetry_enabled_in_env():
         from nemo_rl.data_plane.observability import MetricsDataPlaneClient
 
-        # Callback, hash check and counters stay off for a telemetry-only
-        # run. obs_enabled travels into the wrapper rather than only deciding
-        # these arguments, because is_metrics_client is how three readers ask
-        # whether to poll every worker for data-plane stats. No default
-        # per-op sink either: the metrics surface is get_step_metrics, logged
-        # once a step, where a callback fires on every transfer.
+        # Callback and hash check are observability features; off for
+        # telemetry-only runs.
         # pyrefly: obs.get returns Any, can't narrow to the expected callback type.
         client = MetricsDataPlaneClient(
             client,  # type: ignore[bad-argument-type]

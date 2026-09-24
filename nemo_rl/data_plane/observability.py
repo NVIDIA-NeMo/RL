@@ -1740,11 +1740,8 @@ class MetricsDataPlaneClient(DataPlaneClient):
             Whatever ``fn`` returned.
         """
         t0 = monotonic()
-        # One client serves both the rollout path (once per prompt) and the
-        # batch stages (once per step), so the group comes from the caller's
-        # scope rather than from ``op``. Two branches rather than a variable
-        # group: the umbrella helper is what marks a span unbucketed at the
-        # call site, and a drift test enforces that pairing statically.
+        # Rollout puts are per-prompt (umbrella, no bucket); batch puts are
+        # DATA_PLANE. See per_prompt_scope.
         per_prompt = in_per_prompt_scope()
         group = RLSpanGroup.U_PER_PROMPT if per_prompt else RLSpanGroup.DATA_PLANE
         if not is_span_group_enabled(group):

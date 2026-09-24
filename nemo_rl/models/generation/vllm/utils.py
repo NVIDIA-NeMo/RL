@@ -668,11 +668,7 @@ def compute_engine_step_metrics(
         omitted rather than reported as zero, so a vLLM release that renames one
         leaves a gap in the dashboard instead of a plausible-looking zero.
     """
-    # A series absent from the end snapshot stays absent (see Returns). These
-    # totals are summed over workers, so one that went backwards means an
-    # engine restarted mid-step (restart_shard) and reset its counters: the
-    # step's true count is unknown, so leave it out rather than report a
-    # negative number.
+    # Drop series that went backwards: an engine restart reset its counters.
     delta = {
         k: end - start_counters.get(k, 0.0)
         for k, end in end_counters.items()

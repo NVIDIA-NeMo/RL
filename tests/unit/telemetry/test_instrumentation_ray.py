@@ -69,13 +69,6 @@ class _Worker:
         return value, _current_trace_id()
 
 
-@pytest.fixture(scope="module")
-def ray_cluster():
-    ray.init(num_cpus=2, include_dashboard=False, ignore_reinit_error=True)
-    yield
-    ray.shutdown()
-
-
 @pytest.fixture
 def telemetry():
     handle = setup_telemetry(
@@ -87,7 +80,7 @@ def telemetry():
 
 
 @requires_lens
-def test_a_decorated_actor_method_runs_under_the_callers_trace(ray_cluster, telemetry):
+def test_a_decorated_actor_method_runs_under_the_callers_trace(telemetry):
     worker = _Worker.remote()
     with managed_span(RLSpanGroup.JOB, "rl.grpo.job", tracer=telemetry.tracer) as span:
         expected = span.get_span_context().trace_id
@@ -98,9 +91,7 @@ def test_a_decorated_actor_method_runs_under_the_callers_trace(ray_cluster, tele
 
 
 @requires_lens
-def test_a_decorated_coroutine_method_runs_under_the_callers_trace(
-    ray_cluster, telemetry
-):
+def test_a_decorated_coroutine_method_runs_under_the_callers_trace(telemetry):
     worker = _Worker.remote()
     with managed_span(RLSpanGroup.JOB, "rl.grpo.job", tracer=telemetry.tracer) as span:
         expected = span.get_span_context().trace_id
@@ -111,9 +102,7 @@ def test_a_decorated_coroutine_method_runs_under_the_callers_trace(
 
 
 @requires_lens
-def test_every_step_of_a_streamed_method_runs_under_the_callers_trace(
-    ray_cluster, telemetry
-):
+def test_every_step_of_a_streamed_method_runs_under_the_callers_trace(telemetry):
     """The context is attached per ``__anext__``, not held across the yield.
 
     Holding it across the yield is what made Ray's abandoned generators detach
@@ -133,9 +122,7 @@ def test_every_step_of_a_streamed_method_runs_under_the_callers_trace(
 
 
 @requires_lens
-def test_an_undecorated_actor_method_is_dispatched_without_the_carrier(
-    ray_cluster, telemetry
-):
+def test_an_undecorated_actor_method_is_dispatched_without_the_carrier(telemetry):
     """Ray rejects the kwarg on the caller; the dispatch has to survive it.
 
     The fake in ``test_instrumentation.py`` raises the ``TypeError`` by hand.
@@ -151,7 +138,7 @@ def test_an_undecorated_actor_method_is_dispatched_without_the_carrier(
 
 
 @requires_lens
-def test_the_carrier_survives_an_options_handle(ray_cluster, telemetry):
+def test_the_carrier_survives_an_options_handle(telemetry):
     """Both NeMo-Gym dispatch sites call ``.options(...)`` before ``.remote``."""
     worker = _Worker.remote()
     with managed_span(RLSpanGroup.JOB, "rl.grpo.job", tracer=telemetry.tracer) as span:

@@ -167,7 +167,8 @@ def test_concurrently_dispatched_rollout_spans_stay_unbucketed():
     ``productive``) while up to ``max_inflight_prompts`` of them were open at
     once, so a rollup summing by ``rl.bucket`` could report a large multiple of
     the run's wall clock as productive. Productive generation is attributed by
-    the worker-side ``rl.vllm.generate`` spans instead.
+    the ``rl.vllm.generate`` spans on the sync ``generate()`` path; the async
+    path has no generation span yet.
     """
     from nemo_rl.telemetry.instrumentation import UMBRELLA_GROUPS
     from nemo_rl.telemetry.span_groups import RLSpanGroup

@@ -53,6 +53,7 @@ from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.vocabulary import (
     RUN_WINDOW_WALL_CLOCK_CATEGORIES,
     as_scalar,
+    freeze_metrics,
     recorded_metrics,
     registry_key,
     teed_metrics,
@@ -265,6 +266,8 @@ def ensure_metric_group_registered() -> bool:
             f"metrics will not be exported; fix _metric_specs(): {exc}",
         )
         return False
+    # lens took the specs, so a row declared from here on has no instrument.
+    freeze_metrics()
     _REGISTERED = True
     return True
 

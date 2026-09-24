@@ -448,11 +448,8 @@ class NemoGym(EnvironmentInterface):
         # Named explicitly: built from the environment registry rather than
         # by RayWorkerGroup, so nothing sets NRL_WORKER_GROUP for it.
         init_telemetry_worker(worker_group="nemo_gym")
-        # Before _spinup, where Gym builds the ClientSession every rollout
-        # goes through: the instrumentor patches the class, so a session that
-        # already exists keeps the uninstrumented behaviour. Gated on
-        # PER_PROMPT because it spans every HTTP call off the global tracer --
-        # see RLSpanGroup.PER_PROMPT for why the volume picks the group.
+        # Before _spinup: the instrumentor patches the session class, so a
+        # session built earlier is not traced.
         if is_span_group_enabled(RLSpanGroup.PER_PROMPT):
             instrument_aiohttp_client()
         self.cfg = cfg

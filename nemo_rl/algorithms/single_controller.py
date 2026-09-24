@@ -345,12 +345,8 @@ class SingleControllerActor:
             actor_args: Pre-built actor args from setup_single_controller.
             setup_timing_metrics: Driver-side setup timings; logged here (Logger isn't cloudpickleable).
         """
-        # The whole run happens inside this actor, so this is the process
-        # that opens the job span, and it is rank 0 of 1 in its own right
-        # rather than inheriting a stray RANK. Named explicitly because it is
-        # built directly rather than by RayWorkerGroup, so nothing sets
-        # NRL_WORKER_GROUP -- without it the rl.sc.* spans are
-        # indistinguishable from the launcher driver's.
+        # The run lives in this actor, so it opens the job span. Named
+        # explicitly: nothing sets NRL_WORKER_GROUP outside RayWorkerGroup.
         _telemetry = init_telemetry_worker(
             rank=0,
             world_size=1,
@@ -2010,19 +2006,23 @@ class SingleControllerActor:
                     ownership_transferred = False
                     try:
                         while True:
-                            if lineage_group_id is None:
-                                request = await self._rollout_manager.generate_for_finalization(
-                                    prompt,
-                                    target_step=target_step,
-                                    inflight_registry=self._inflight_by_group_id,
-                                )
-                            else:
-                                request = await self._rollout_manager.generate_for_finalization(
-                                    prompt,
-                                    target_step=target_step,
-                                    inflight_registry=self._inflight_by_group_id,
-                                    lineage_group_id=lineage_group_id,
-                                )
+                            # Scope only, no span: dispatched per prompt like
+                            # the branch below, so the gym and data-plane
+                            # spans under it must be gated on PER_PROMPT.
+                            with per_prompt_scope():
+                                if lineage_group_id is None:
+                                    request = await self._rollout_manager.generate_for_finalization(
+                                        prompt,
+                                        target_step=target_step,
+                                        inflight_registry=self._inflight_by_group_id,
+                                    )
+                                else:
+                                    request = await self._rollout_manager.generate_for_finalization(
+                                        prompt,
+                                        target_step=target_step,
+                                        inflight_registry=self._inflight_by_group_id,
+                                        lineage_group_id=lineage_group_id,
+                                    )
                             if not inflight_count_released:
                                 self._inflight_rollouts -= 1
                                 inflight_count_released = True
@@ -2720,11 +2720,7 @@ class SingleControllerActor:
                     },
                 ),
             ):
-                # One span for a whole starvation episode, not one per retry. The
-                # loop below polls every 5ms, so a span per iteration turns a
-                # startup wait into thousands of identical spans. Hand-managed
-                # because the span has to outlive the iteration that opened it;
-                # `start_efficiency_span` says why it is not a `with`.
+                # One span per starvation episode, not per 5ms poll.
                 starvation_span: Optional[Any] = None
                 starvation_polls = 0
                 # Re-read on every iteration rather than once: a prompt stamped for this
@@ -2836,12 +2832,9 @@ class SingleControllerActor:
                                     f"groups with {buffered_groups} group(s) "
                                     f"remaining in the buffer"
                                 )
-                            # Opened on the first starved poll and held
-                            # across retries, so one span covers the whole
-                            # wait. Safe to span the selection above only
-                            # because a starved poll never reaches the data
-                            # plane, so this cannot nest over bucketed
-                            # children and be counted twice.
+                            # Safe to span the select: a starved poll never
+                            # reaches the data plane, so nothing below is
+                            # counted twice.
                             if starvation_span is None:
                                 starvation_span = start_efficiency_span(
                                     "idle/buffer_starvation", tracer=self._tracer
@@ -3299,10 +3292,7 @@ class SingleControllerActor:
                     if defer_refit_for_save:
                         # Refit-deferral (colocated): the engine is about to be saved; let it sleep.
                         # Record `weight_sync` for consistency in reports.
-                        #
-                        # No idle/refit_bubble: this branch syncs nothing, so
-                        # its duration says nothing about how long generation
-                        # served stale weights.
+                        # No refit_bubble: this branch syncs nothing.
                         with self._timer.time("weight_sync"):
                             pass
                         with self._timer.time("offload_before_refit"):

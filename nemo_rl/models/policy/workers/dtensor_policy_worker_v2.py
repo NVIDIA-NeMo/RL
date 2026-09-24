@@ -30,6 +30,7 @@ from torch.distributed.tensor import DTensor
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.metric_utils import LEARNING_RATE_KEY
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.automodel.checkpoint import (
@@ -521,7 +522,9 @@ class DTensorPolicyWorkerV2Impl(
                     # Only process valid (non-dummy) batches for metrics
                     if mb_idx < iterator_len:
                         num_valid_samples = loss_metrics["num_valid_samples"]
-                        loss_metrics["lr"] = self.optimizer.param_groups[0]["lr"]
+                        loss_metrics[LEARNING_RATE_KEY] = self.optimizer.param_groups[
+                            0
+                        ]["lr"]
                         loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
                         loss_metrics["global_valid_toks"] = global_valid_toks.item()
 

@@ -585,11 +585,8 @@ def accepts_trace_context(method: _F) -> _F:
 
         @functools.wraps(method)
         async def agen_wrapper(*args: Any, **kwargs: Any) -> Any:
-            # Attached around each step rather than across the yield: Ray does
-            # not close this generator when it cancels the call (ray.cancel on
-            # a sharded Gym stream), so a context still attached at the yield
-            # is detached later by the garbage collector, in a different
-            # context, and OTel logs "Failed to detach context".
+            # Attach the caller's context around each step only, never
+            # across a yield.
             context = remote_trace_parent(kwargs.pop(TRACE_CARRIER_KWARG, None))
             inner = method(*args, **kwargs)
             try:
@@ -711,7 +708,7 @@ def umbrella_span(
 @contextmanager
 def streaming_umbrella_span(
     group: str, name: str, tracer: Optional[Tracer] = None, **attributes: Any
-) -> Iterator[Callable[[], ContextManager[None]]]:
+) -> Iterator[Callable[[], ContextManager[Any]]]:
     """An umbrella span over an async generator, made current one step at a time.
 
     :func:`umbrella_span` cannot wrap a generator's ``yield``: Ray abandons a
@@ -751,7 +748,7 @@ def streaming_umbrella_span(
 NO_SPAN: Final[ContextManager[None]] = nullcontext(None)
 
 
-def _no_span_activation() -> ContextManager[None]:
+def _no_span_activation() -> ContextManager[Any]:
     """Activation for a disabled group: nothing to attach, nothing to detach."""
     return nullcontext()
 

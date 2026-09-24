@@ -383,9 +383,10 @@ their durations sum past wall time and cannot enter a bucket rollup.
 The SingleController dispatches one asyncio task per prompt group, bounded by
 `async_rl.max_inflight_prompts` — `num_prompts_per_step` in most recipes and
 `1280` in one — so that many spans can be open at once. Tagged `productive` they
-would sum to a large multiple of the wall clock they happened in. On both paths
-the productive generation term comes from the worker-side `rl.vllm.generate`
-spans, not from these driver-side dispatch spans.
+would sum to a large multiple of the wall clock they happened in. On the sync path the
+productive generation term comes from the `rl.vllm.generate` spans on the
+`generate()` call instead; the async single-controller path has no generation
+span yet.
 
 It also carries `rl.rollout.attempt`, because the span is opened inside the
 dispatch retry loop: a skipped group is substituted in place and the loop opens

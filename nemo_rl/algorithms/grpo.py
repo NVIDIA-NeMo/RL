@@ -48,6 +48,10 @@ from nemo_rl.algorithms.loss import (
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.metric_utils import (
+    GRAD_NORM_KEY,
+    LOSS_KEY,
+    MEAN_GEN_TOKENS_PER_SAMPLE_KEY,
+    REWARD_KEY,
     SETUP_TIMING_PREFIX,
     SetupTimingMetrics,
     print_setup_timing_summary,
@@ -3339,8 +3343,8 @@ def _grpo_train_impl(
                             policy_generation.get_logger_metrics()
                         )
 
-                    metrics_logging_data["mean_gen_tokens_per_sample"] = (
-                        rollout_metrics["mean_gen_tokens_per_sample"]
+                    metrics_logging_data[MEAN_GEN_TOKENS_PER_SAMPLE_KEY] = (
+                        rollout_metrics[MEAN_GEN_TOKENS_PER_SAMPLE_KEY]
                     )
                     logger.log_metrics(rollout_metrics, total_steps + 1, prefix="train")
 
@@ -3815,9 +3819,9 @@ def _grpo_train_impl(
                 memory_tracker.snapshot_start_of_stage("Metrics", dir())
                 metrics = {
                     **metrics,
-                    "loss": train_results["loss"].numpy(),
-                    "grad_norm": train_results["grad_norm"].numpy(),
-                    "reward": rewards.numpy(),
+                    LOSS_KEY: train_results["loss"].numpy(),
+                    GRAD_NORM_KEY: train_results["grad_norm"].numpy(),
+                    REWARD_KEY: rewards.numpy(),
                     "mean_prompt_length": repeated_batch["length"].numpy(),
                     "total_num_tokens": input_lengths.numpy(),
                     # Add masked advantages tracking metrics (only for valid response tokens)
@@ -4842,11 +4846,8 @@ def async_grpo_train(
         },
     )
 
-    # Captured inside rl.grpo.job, so the collector's spans join this run's
-    # trace instead of starting their own roots. Empty unless the job group is
-    # enabled — both shipped presets enable it, but a hand-written group list
-    # need not, and that degrades to roots rather than failing. See
-    # docs/observability/span-groups.md.
+    # Captured inside rl.grpo.job so the collector's spans join this trace.
+    # Empty if the job group is off, which degrades to roots.
     _tc_trace_carrier = current_trace_carrier()
 
     # Initialize trajectory collector with synchronized collection
@@ -5728,10 +5729,10 @@ def async_grpo_train(
                 )
 
                 metrics = {
-                    "loss": train_results["loss"].numpy(),
-                    "reward": rewards.numpy(),
+                    LOSS_KEY: train_results["loss"].numpy(),
+                    REWARD_KEY: rewards.numpy(),
                     "num_mask_sample_filtered": num_mask_sample_filtered,
-                    "grad_norm": train_results["grad_norm"].numpy(),
+                    GRAD_NORM_KEY: train_results["grad_norm"].numpy(),
                     "mean_prompt_length": repeated_batch["length"].numpy(),
                     "total_num_tokens": input_lengths.numpy(),
                     # Add masked advantages tracking metrics (only for valid response tokens)

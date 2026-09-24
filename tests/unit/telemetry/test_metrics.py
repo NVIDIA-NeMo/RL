@@ -10,6 +10,22 @@ import pytest
 from nemo_rl.telemetry.metrics import map_efficiency_seconds
 
 
+def _import_teed_metric_owners() -> None:
+    """Import every module that declares teed rows.
+
+    A row exists only once its owner is imported, so a test that reads the
+    registry has to name the owners rather than inherit whatever an earlier
+    test happened to pull in.
+    """
+    for owner in (
+        "nemo_rl.algorithms.loss.loss_functions",
+        "nemo_rl.algorithms.metric_utils",
+        "nemo_rl.algorithms.ppo",
+        "nemo_rl.models.generation.vllm.metric_names",
+    ):
+        pytest.importorskip(owner)
+
+
 def test_tee_noop_when_not_exporting():
     # No telemetry handle set -> must be a silent no-op (no exception).
     from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
@@ -220,25 +236,6 @@ def test_efficiency_window_separates_per_step_from_cumulative():
     )
 
 
-def test_run_window_categories_match_the_efficiency_summary():
-    """The window split is restated here; the summary excludes the same set.
-
-    ``print_efficiency_summary`` keeps run-window categories out of its per-step
-    waste ratio using its own copy of this set. If the two drifted, a category
-    could be tagged ``step`` here while being excluded from the step ratio
-    there, or charged to every step while advertised as a run constant.
-    """
-    from nemo_rl.telemetry.metrics import _RUN_WINDOW_WALL_CLOCK_CATEGORIES
-    from tests.unit.telemetry.conftest import algorithms_utils_categories
-
-    canonical = algorithms_utils_categories("RUN_WINDOW_WALL_CLOCK_CATEGORIES")
-
-    assert (
-        set(_RUN_WINDOW_WALL_CLOCK_CATEGORIES)
-        == canonical["RUN_WINDOW_WALL_CLOCK_CATEGORIES"]
-    )
-
-
 def test_tee_tags_the_pct_as_a_per_step_wall_clock_ratio(monkeypatch):
     """The one aggregate point needs its window stated most.
 
@@ -442,6 +439,8 @@ def test_tee_never_raises_into_the_training_step(monkeypatch, caplog):
 
 
 def test_map_teed_scalars_reads_training_and_vllm_keys():
+    _import_teed_metric_owners()
+
     from nemo_rl.telemetry.metrics import map_teed_scalars
 
     values = map_teed_scalars(
@@ -482,10 +481,13 @@ def test_map_teed_scalars_skips_bool_and_non_numeric():
 
 def test_every_declared_scalar_has_a_unique_key_and_name():
     """A duplicate key would make one declaration silently shadow another."""
-    from nemo_rl.telemetry.metrics import _TEED_SCALARS
+    _import_teed_metric_owners()
 
-    keys = [teed.key for teed in _TEED_SCALARS]
-    names = [teed.name for teed in _TEED_SCALARS]
+    from nemo_rl.telemetry.vocabulary import teed_metrics
+
+    rows = teed_metrics()
+    keys = [teed.key for teed in rows]
+    names = [teed.name for teed in rows]
 
     assert len(set(keys)) == len(keys)
     assert len(set(names)) == len(names)

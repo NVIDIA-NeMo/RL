@@ -122,6 +122,30 @@ class TeedMetric:
 
 _REGISTERED: dict[str, TeedMetric] = {}
 
+_FROZEN = False
+
+
+def freeze_metrics() -> None:
+    """Close registration, once the rows have been handed to lens.
+
+    Called by ``ensure_metric_group_registered``. lens takes the specs once
+    per process, so a row declared after that is read into the recorded values
+    but was never declared -- lens drops it with a single warning and RL says
+    nothing at all.
+    """
+    global _FROZEN
+    _FROZEN = True
+
+
+def _check_not_frozen(name: str) -> None:
+    if _FROZEN:
+        raise RuntimeError(
+            f"{name!r} was declared after the metric group was registered with "
+            "lens, so it has no instrument and would be silently dropped. "
+            "Import the module that declares it before the first metric is "
+            "recorded -- at startup, not lazily from inside the training loop."
+        )
+
 
 def register_teed_metrics(rows: Iterable[TeedMetric]) -> None:
     """Declare *rows* for teeing, from the module that logs their keys.
@@ -130,8 +154,10 @@ def register_teed_metrics(rows: Iterable[TeedMetric]) -> None:
         ValueError: Two rows claim the same logger key or the same series name.
             Both would be silent otherwise: the first makes one row unreachable,
             and the second makes two rows record against one instrument.
+        RuntimeError: Registration is already closed -- see :func:`freeze_metrics`.
     """
     for row in rows:
+        _check_not_frozen(row.name)
         clash = _REGISTERED.get(row.logger_key)
         if clash is not None and clash != row:
             raise ValueError(
@@ -161,8 +187,10 @@ def register_recorded_metrics(rows: Iterable[RecordedMetric]) -> None:
     Raises:
         ValueError: Two rows claim the same series name with different
             definitions, which would otherwise have them share one instrument.
+        RuntimeError: Registration is already closed -- see :func:`freeze_metrics`.
     """
     for row in rows:
+        _check_not_frozen(row.name)
         clash = _RECORDED.get(row.name)
         if clash is not None and clash != row:
             raise ValueError(f"series {row.name!r} is already declared as {clash!r}")

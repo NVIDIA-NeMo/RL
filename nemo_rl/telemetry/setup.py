@@ -264,10 +264,8 @@ def init_telemetry_driver(
 
     from nemo.lens import NemoLensConfig, setup_telemetry
 
-    # Imported purely for the side effect: importing this module is what
-    # registers NeMo-RL's groups with lens's SpanRegistry, and setup_telemetry
-    # below resolves span_groups against whatever is registered by then. Without
-    # this every RL group would come back pending and select nothing.
+    # Imported for the side effect: this is what registers RL's groups with
+    # lens, and setup_telemetry below resolves span_groups against them.
     from nemo_rl.telemetry import span_groups as _rl_span_groups  # noqa: F401
 
     config = NemoLensConfig.from_env(
@@ -293,11 +291,7 @@ def init_telemetry_driver(
         os.environ[_RUN_ID_ENV] = run_id
         config.run_id = run_id
 
-    # Unresolvable span_groups entries are lens's warning to make, from
-    # set_span_group_spec below: it resolves against every namespace in the
-    # process, where this module knows only its own. Unguarded on purpose --
-    # _build_resource_attributes omits rather than raises on a missing key,
-    # so a raise here is a real bug.
+    # lens itself warns about an unresolvable span_groups entry.
     resource_attrs = _build_resource_attributes(master_config, algorithm)
     # The driver is a singleton, not a member of a distributed group. Rank 0 of
     # 1 is the honest description, and stating it silences lens's warning about
