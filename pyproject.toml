@@ -224,14 +224,10 @@ mcore = [
   "mamba-ssm",
   "causal-conv1d",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
-  "flashinfer-python==0.6.8.post1",
-  "flashinfer-cubin==0.6.8.post1",
-  "flashinfer-jit-cache==0.6.8.post1",
+  "flashinfer-python==0.6.18.post1",
+  "flashinfer-cubin==0.6.18.post1",
+  "flashinfer-jit-cache==0.6.18.post1",
   "flash_mla ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
-  # Keep on the same cutlass-dsl line as the vllm extra. 4.5.x is the only series whose
-  # libs-base and libs-cu13 wheels overwrite each other's files (cutlass#3259), and with
-  # libs-base no longer excluded a 4.5.x pin here would reintroduce that nondeterministic
-  # install into the training venv. flashinfer 0.6.8.post1 accepts >=4.4.2.
   "nvidia-cutlass-dsl[cu13]==4.6.2 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "torch-memory-saver>=0.0.9.post1",
   "nvshmem4py-cu13>=0.2.1",
@@ -392,7 +388,7 @@ explicit = true
 
 [[tool.uv.index]]
 name = "flashinfer"
-url = "https://flashinfer.ai/whl"
+url = "https://flashinfer.ai/whl/"
 explicit = true
 
 [[tool.uv.index]]

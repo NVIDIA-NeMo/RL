@@ -401,9 +401,6 @@ def destroy_parallel_state():
     # Also reset the Megatron async calls queue if it exists
     try:
         import megatron.training.async_utils as megatron_async_utils
-        from megatron.core.dist_checkpointing.strategies.async_utils import (
-            AsyncCallsQueue,
-        )
 
         # Clean up any existing async callers first
         old_call_idx = getattr(
@@ -421,8 +418,9 @@ def destroy_parallel_state():
             megatron_async_utils._async_calls_queue.close()
         except:
             pass  # Ignore errors during cleanup
-        # Reset the Megatron global async calls queue as well
-        megatron_async_utils._async_calls_queue = AsyncCallsQueue()
+        # Reset the Megatron global async calls queue as well. Mcore rebuilds it
+        # lazily in _get_async_calls_queue() using flags from the run's args.
+        megatron_async_utils._async_calls_queue = None
         print(
             f"[DEBUG] Reset Megatron async calls queue (old call_idx: {old_call_idx})"
         )

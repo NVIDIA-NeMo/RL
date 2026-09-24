@@ -110,8 +110,6 @@ def test_rebuild_cuda_tensor_from_ipc_normalizes_the_storage_handle(monkeypatch)
 
 
 def test_sglang_rebuild_patch_normalizes_the_storage_handle(monkeypatch):
-    from torch.multiprocessing import reductions
-
     from nemo_rl.models.generation.sglang.utils import train_utils
 
     seen = {}
@@ -120,9 +118,10 @@ def test_sglang_rebuild_patch_normalizes_the_storage_handle(monkeypatch):
         seen["args"] = args
         return "tensor"
 
-    monkeypatch.setattr(
-        reductions, "_rebuild_cuda_tensor_original", fake_original, raising=False
-    )
+    # train_utils captures the original at import time (see the comment above
+    # ``_REBUILD_CUDA_TENSOR_ORIGINAL``), so hook the module constant, not the
+    # ``reductions`` attribute that ``monkey_patch_torch_reductions`` publishes.
+    monkeypatch.setattr(train_utils, "_REBUILD_CUDA_TENSOR_ORIGINAL", fake_original)
     monkeypatch.setattr(train_utils, "_device_from_maybe_uuid", lambda d: 5)
     newer = _versioned(3, b"c")
     args = ("cls", (2,), (1,), 0, "storage_cls", "dtype", "gpu-uuid", newer, 128, 0)
