@@ -4,9 +4,9 @@ set -eou pipefail
 TRTLLM_SRC="${TRTLLM_SRC:-/workspace/TensorRT-LLM}"
 WHEEL_OUTPUT_DIR=/tmp/trtllm-wheels
 # SM arch list. Shares the BUILD_CUSTOM_TRTLLM_ARCH knob with build-custom-trtllm.sh.
-# Default targets Blackwell (sm_100), Blackwell-Ultra (sm_103) and Rubin (sm_107)
+# Default targets Blackwell (sm_100) and Blackwell-Ultra (sm_103)
 # -- MUST stay in sync with build-custom-trtllm.sh / _backend.py's _DEFAULT_ARCH.
-ARCH="${BUILD_CUSTOM_TRTLLM_ARCH:-100-real;103-real;107-real}"
+ARCH="${BUILD_CUSTOM_TRTLLM_ARCH:-100-real;103-real}"
 
 mkdir -p "${WHEEL_OUTPUT_DIR}"
 
@@ -29,10 +29,10 @@ sed -i 's|COMMAND ${Python3_EXECUTABLE} setup_library.py develop --user|COMMAND 
     cpp/tensorrt_llm/kernels/cutlass_kernels/CMakeLists.txt
 
 # Fix nvshmem: it doesn't accept the 'f' suffix CMake >= 3.31 generates for
-# Blackwell / Rubin ('100f-real', '107f-real'). Substitute bare archs for the
-# nvshmem cmake call only; DeepEP kernels keep the full arch string for FP4
-# support. Must match the ARCH default above (bare, semicolon-separated).
-sed -i 's|-DCMAKE_CUDA_ARCHITECTURES:STRING=${DEEP_EP_CUDA_ARCHITECTURES}|-DCMAKE_CUDA_ARCHITECTURES:STRING=100\;103\;107|' \
+# Blackwell ('100f-real'). Substitute bare archs for the nvshmem cmake call
+# only; DeepEP kernels keep the full arch string for FP4 support. Must match
+# the ARCH default above (bare, semicolon-separated).
+sed -i 's|-DCMAKE_CUDA_ARCHITECTURES:STRING=${DEEP_EP_CUDA_ARCHITECTURES}|-DCMAKE_CUDA_ARCHITECTURES:STRING=100\;103|' \
     cpp/tensorrt_llm/deep_ep/CMakeLists.txt
 
 # NIXL is what cache_transceiver_backend=DEFAULT resolves to with UCX enabled
