@@ -101,6 +101,41 @@ def _refit_tensor_dtype(
     return default_dtype
 
 
+# Wrapper modules that PyTorch registers as children but strips from state-dict keys:
+# activation-checkpoint wrappers (``CheckpointWrapper``) and ``torch.compile`` (``OptimizedModule``).
+_STATE_DICT_TRANSPARENT_PREFIXES: tuple[str, ...] = (
+    "_checkpoint_wrapped_module.",
+    "_orig_mod.",
+)
+
+
+def _state_dict_module_name(module_name: str) -> str:
+    """Return ``module_name`` spelled the way ``model.state_dict()`` spells it.
+
+    ``nn.Module.named_modules()`` includes wrapper modules such as the activation
+    checkpoint ``CheckpointWrapper`` (``...layers.0._checkpoint_wrapped_module.mlp``),
+    while ``state_dict()`` drops those components (``...layers.0.mlp.weight``).
+    """
+    for prefix in _STATE_DICT_TRANSPARENT_PREFIXES:
+        module_name = module_name.replace(prefix, "")
+    return module_name
+
+
+def build_state_dict_module_map(model: nn.Module) -> dict[str, nn.Module]:
+    """Map every module to its state-dict-style name (wrapper components removed).
+
+    Used to resolve a state-dict key back to the module that owns it, e.g. to find the
+    ``LinearLoRA`` whose adapter must be merged into the base weight before refit. Keyed
+    by both the raw ``named_modules()`` name and the state-dict spelling, so lookups
+    work with or without activation-checkpoint / ``torch.compile`` wrappers.
+    """
+    module_map: dict[str, nn.Module] = {}
+    for name, module in model.named_modules():
+        module_map.setdefault(_state_dict_module_name(name), module)
+        module_map.setdefault(name, module)
+    return module_map
+
+
 def dtensor_params_generator(
     model: nn.Module, target_dtype: torch.dtype
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
@@ -115,7 +150,7 @@ def dtensor_params_generator(
         Tuples of (fully_qualified_name, tensor) where tensors are converted to
         the refit dtype and made contiguous.
     """
-    module_map = dict(model.named_modules())
+    module_map = build_state_dict_module_map(model)
     for name, tensor in model.state_dict().items():
         if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
             continue
