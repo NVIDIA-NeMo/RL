@@ -17,6 +17,7 @@ import pytest
 
 from nemo_rl.utils.cuda_ipc import (
     CUDA_IPC_MEM_HANDLE_SIZE,
+    CURRENT_SHAREABLE_HANDLE_VERSION,
     LEGACY_SHAREABLE_HANDLE_VERSION,
     normalize_cuda_ipc_handle,
 )
@@ -29,7 +30,7 @@ def _versioned(version: int, kind: bytes, payload: bytes = _MEM_HANDLE) -> bytes
 
 
 def test_newer_cudamalloc_handle_is_downgraded_to_the_legacy_version():
-    handle = _versioned(3, b"c")
+    handle = _versioned(CURRENT_SHAREABLE_HANDLE_VERSION, b"c")
     out = normalize_cuda_ipc_handle(handle)
     assert out[0] == LEGACY_SHAREABLE_HANDLE_VERSION
     # Only the version byte changes; type byte and cudaIpcMemHandle_t are intact.
@@ -40,6 +41,22 @@ def test_newer_cudamalloc_handle_is_downgraded_to_the_legacy_version():
 @pytest.mark.parametrize("version", [1, LEGACY_SHAREABLE_HANDLE_VERSION])
 def test_legacy_or_older_handles_pass_through(version: int):
     handle = _versioned(version, b"c")
+    assert normalize_cuda_ipc_handle(handle) is handle
+
+
+@pytest.mark.parametrize("version", [CURRENT_SHAREABLE_HANDLE_VERSION + 1, 255])
+def test_unverified_newer_cudamalloc_version_raises(version: int):
+    # Only the 2/3 'c' payloads are known to be identical; relabelling an
+    # unknown version as legacy would hand the consumer a handle it misparses.
+    with pytest.raises(ValueError, match=f"handle version {version}"):
+        normalize_cuda_ipc_handle(_versioned(version, b"c"))
+
+
+def test_unverified_newer_expandable_segment_version_still_passes_through():
+    # The strictness applies to 'c' handles only; 'e' handles are never touched.
+    handle = _versioned(
+        CURRENT_SHAREABLE_HANDLE_VERSION + 1, b"e", payload=b"\x00" * 200
+    )
     assert normalize_cuda_ipc_handle(handle) is handle
 
 
@@ -61,7 +78,7 @@ def test_non_handle_values_pass_through(value):
 
 
 def test_bytearray_input_is_returned_as_bytes():
-    handle = bytearray(_versioned(3, b"c"))
+    handle = bytearray(_versioned(CURRENT_SHAREABLE_HANDLE_VERSION, b"c"))
     out = normalize_cuda_ipc_handle(handle)
     assert isinstance(out, bytes)
     assert out[0] == LEGACY_SHAREABLE_HANDLE_VERSION

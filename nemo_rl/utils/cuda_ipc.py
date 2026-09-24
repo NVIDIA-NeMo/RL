@@ -48,6 +48,9 @@ SHAREABLE_CUDA_MALLOC = ord("c")
 LEGACY_SHAREABLE_HANDLE_VERSION = 2
 """The version byte torch <= 2.12 writes. torch 2.13 writes 3 with an identical ``'c'`` payload."""
 
+CURRENT_SHAREABLE_HANDLE_VERSION = 3
+"""The version byte torch 2.13 writes; its ``'c'`` payload is identical to version 2's."""
+
 
 def normalize_cuda_ipc_handle(handle: Any) -> Any:
     """Rewrite a newer ``'c'``-type storage handle so older torch can open it.
@@ -60,7 +63,12 @@ def normalize_cuda_ipc_handle(handle: Any) -> Any:
     Returns:
         The handle, with its version byte lowered to
         :data:`LEGACY_SHAREABLE_HANDLE_VERSION` when it is a ``'c'`` handle
-        carrying a newer version byte.
+        carrying :data:`CURRENT_SHAREABLE_HANDLE_VERSION`.
+
+    Raises:
+        ValueError: For a ``'c'`` handle with a version byte newer than
+            :data:`CURRENT_SHAREABLE_HANDLE_VERSION`, whose payload has not
+            been verified against the legacy layout.
     """
     if not isinstance(handle, (bytes, bytearray)):
         return handle
@@ -72,4 +80,12 @@ def normalize_cuda_ipc_handle(handle: Any) -> Any:
         return handle
     if handle[0] <= LEGACY_SHAREABLE_HANDLE_VERSION:
         return handle
+    if handle[0] != CURRENT_SHAREABLE_HANDLE_VERSION:
+        # Rewriting a version whose payload has not been compared would silently
+        # hand the consumer a handle it misparses.
+        raise ValueError(
+            f"cannot normalize CUDA IPC handle version {handle[0]}; only version "
+            f"{CURRENT_SHAREABLE_HANDLE_VERSION} is known to share the version-"
+            f"{LEGACY_SHAREABLE_HANDLE_VERSION} 'c' payload"
+        )
     return bytes([LEGACY_SHAREABLE_HANDLE_VERSION]) + bytes(handle[1:])

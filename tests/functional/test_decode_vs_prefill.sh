@@ -12,7 +12,7 @@ cd "$PROJECT_ROOT"
 # allocation OOMs at the first MoE forward; on 80 GiB H100 parts the model (29.5 GiB per
 # TP rank) plus the profiled activation peak already take ~58 GiB, so 0.7 leaves no room
 # for any KV cache at all. Pick the fraction from the device size.
-GPU_MEM_MIB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+GPU_MEM_MIB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ' || echo 0)
 if [ "${GPU_MEM_MIB:-0}" -gt 120000 ]; then
     GPU_MEM_UTIL=0.7
 else
