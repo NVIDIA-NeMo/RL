@@ -17,7 +17,6 @@ import random
 import time
 import unittest.mock
 from datetime import datetime
-from io import StringIO
 from typing import Callable, TypedDict
 
 import pytest
@@ -318,28 +317,6 @@ def session_data(request, init_ray_cluster, _unit_test_data):
     )
     unit_test_data["gpu_types"] = list(set(logger._collect_gpu_sku().values()))
 
-    ############################################################
-    # 3. Gather the coverage data #
-    ############################################################
-    # We directly access the coverage controller from the plugin manager
-    # so we can access the coverage total before the pytest session finishes.
-    cov_controller = None
-    if request.config.pluginmanager.hasplugin("_cov"):
-        plugin = request.config.pluginmanager.getplugin("_cov")
-        if plugin.cov_controller:
-            cov_controller = plugin.cov_controller
-
-    if not cov_controller:
-        # Means the user didn't run with --cov=...
-        return
-
-    # We currently don't use the cov_report since we can always access the coverage.json later, but
-    # in the future if we want to report the coverage more granularly as part of the session finish,
-    # we can access it here.
-    cov_report = StringIO()
-    cov_total = cov_controller.summary(cov_report)
-    unit_test_data["coverage"] = cov_total
-
 
 @pytest.fixture
 def tracker(request, session_data, ray_gpu_monitor):
@@ -385,6 +362,10 @@ def pytest_sessionfinish(session, exitstatus):
         return
 
     data = session.config._unit_test_data
+    # pytest-cov finalizes and combines worker coverage after the runtest loop.
+    plugin = session.config.pluginmanager.getplugin("_cov")
+    if plugin is not None and plugin.cov_total is not None:
+        data["coverage"] = plugin.cov_total
     data["exit_status"] = exitstatus
     print(f"\nSaving unit test data to {UNIT_RESULTS_FILE}")
     print(f"and saving to {UNIT_RESULTS_FILE_DATED}")
