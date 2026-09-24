@@ -97,7 +97,10 @@ from nemo_rl.algorithms.grpo import (
     aggregate_rollout_metrics,
     compute_and_apply_seq_logprob_error_masking,
 )
-from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
+from nemo_rl.algorithms.metric_utils import (
+    SETUP_TIMING_PREFIX,
+    SetupTimingMetrics,
+)
 from nemo_rl.algorithms.ppo import _compute_critic_metrics
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
@@ -175,6 +178,22 @@ from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.models.value.tq_value import TQValue
+from nemo_rl.telemetry.instrumentation import (
+    NO_SPAN,
+    RL_IDLE_POLLS_ATTR,
+    efficiency_span,
+    is_span_group_enabled,
+    managed_span,
+    per_prompt_scope,
+    safe_set_span_attributes,
+    start_efficiency_span,
+    umbrella_span,
+)
+from nemo_rl.telemetry.setup import (
+    init_telemetry_worker,
+    shutdown_telemetry,
+)
+from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.utils.checkpoint import (
     CheckpointManager,
     PathLike,
@@ -307,6 +326,12 @@ class SingleControllerActor:
     # tick, and it must exist on any instance the watchdog can reach.
     _recovering_from_refit: bool = False
 
+    # Declared on the class for the same reason, and because every pump reaches
+    # for it: ``None`` makes ``managed_span`` fall back to the process-global
+    # handle, so an instance built without running __init__ emits no spans
+    # rather than raising out of the training loop.
+    _tracer: Any = None
+
     def __init__(
         self,
         master_config: MasterConfig,
@@ -320,6 +345,15 @@ class SingleControllerActor:
             actor_args: Pre-built actor args from setup_single_controller.
             setup_timing_metrics: Driver-side setup timings; logged here (Logger isn't cloudpickleable).
         """
+        # The run lives in this actor, so it opens the job span. Named
+        # explicitly: nothing sets NRL_WORKER_GROUP outside RayWorkerGroup.
+        _telemetry = init_telemetry_worker(
+            rank=0,
+            world_size=1,
+            worker_group="single_controller",
+        )
+        self._tracer = _telemetry.tracer if _telemetry is not None else None
+
         self._advantage_cfg = AdvantageConfig()
         self._partition_id: str = actor_args.partition_id
 
@@ -485,7 +519,7 @@ class SingleControllerActor:
             hparams["token_capture"]["control_auth_token"] = "<redacted>"
         self._logger.log_hyperparams(hparams)
         self._logger.log_metrics(
-            setup_timing_metrics.to_metrics_dict(), step=0, prefix="timing/setup"
+            setup_timing_metrics.to_metrics_dict(), step=0, prefix=SETUP_TIMING_PREFIX
         )
         self._timer = Timer()
         self._throughput_sample_time: Optional[float] = None
@@ -685,6 +719,29 @@ class SingleControllerActor:
 
     async def run(self) -> dict[str, Any]:
         """Main entry point. Runs until max_train_steps is reached."""
+        try:
+            with umbrella_span(
+                RLSpanGroup.U_JOB,
+                "rl.sc.job",
+                tracer=self._tracer,
+                **{"rl.algorithm": "ppo" if self._is_ppo else "grpo"},
+            ):
+                result = await self._run_pumps()
+        finally:
+            # Outside the span so the job span is flushed too, and off the
+            # event loop because the exporter's flush blocks. Shielded, and a
+            # cancel swallowed, because teardown is exactly when cancellation
+            # lands and it would mask what _run_pumps actually raised.
+            try:
+                await asyncio.shield(asyncio.to_thread(shutdown_telemetry))
+            except asyncio.CancelledError:
+                pass
+        # After the try, not inside it: pyrefly 0.24.2 reads a return nested in a
+        # try/finally as a path that can fall off the end of the function.
+        return result
+
+    async def _run_pumps(self) -> dict[str, Any]:
+        """Start the rollout / train / watchdog pumps and run until one finishes."""
         # Synchronize weights before starting the pumps, unless setup already delivered them.
         if self._weight_synchronizer.is_stale:
             await self._sync_weights()
@@ -1949,19 +2006,23 @@ class SingleControllerActor:
                     ownership_transferred = False
                     try:
                         while True:
-                            if lineage_group_id is None:
-                                request = await self._rollout_manager.generate_for_finalization(
-                                    prompt,
-                                    target_step=target_step,
-                                    inflight_registry=self._inflight_by_group_id,
-                                )
-                            else:
-                                request = await self._rollout_manager.generate_for_finalization(
-                                    prompt,
-                                    target_step=target_step,
-                                    inflight_registry=self._inflight_by_group_id,
-                                    lineage_group_id=lineage_group_id,
-                                )
+                            # Scope only, no span: dispatched per prompt like
+                            # the branch below, so the gym and data-plane
+                            # spans under it must be gated on PER_PROMPT.
+                            with per_prompt_scope():
+                                if lineage_group_id is None:
+                                    request = await self._rollout_manager.generate_for_finalization(
+                                        prompt,
+                                        target_step=target_step,
+                                        inflight_registry=self._inflight_by_group_id,
+                                    )
+                                else:
+                                    request = await self._rollout_manager.generate_for_finalization(
+                                        prompt,
+                                        target_step=target_step,
+                                        inflight_registry=self._inflight_by_group_id,
+                                        lineage_group_id=lineage_group_id,
+                                    )
                             if not inflight_count_released:
                                 self._inflight_rollouts -= 1
                                 inflight_count_released = True
@@ -2069,19 +2130,40 @@ class SingleControllerActor:
                 else:
                     while True:
                         try:
-                            if lineage_group_id is None:
-                                outcome = await self._rollout_manager.generate_and_push(
-                                    prompt,
-                                    target_step=target_step,
-                                    inflight_registry=self._inflight_by_group_id,
+                            # One span per dispatch attempt, gated before
+                            # the attribute dict since this runs per prompt.
+                            # per_prompt_scope() is entered either way: the
+                            # data-plane put inside reads it.
+                            if is_span_group_enabled(RLSpanGroup.U_PER_PROMPT):
+                                rollout_span: Any = umbrella_span(
+                                    RLSpanGroup.U_PER_PROMPT,
+                                    "rl.sc.generate_and_push",
+                                    tracer=self._tracer,
+                                    **{
+                                        "rl.rollout.attempt": replacements,
+                                        **(
+                                            {}
+                                            if target_step is None
+                                            else {"rl.target_step": target_step}
+                                        ),
+                                    },
                                 )
                             else:
-                                outcome = await self._rollout_manager.generate_and_push(
-                                    prompt,
-                                    target_step=target_step,
-                                    inflight_registry=self._inflight_by_group_id,
-                                    lineage_group_id=lineage_group_id,
-                                )
+                                rollout_span = NO_SPAN
+                            with per_prompt_scope(), rollout_span:
+                                if lineage_group_id is None:
+                                    outcome = await self._rollout_manager.generate_and_push(
+                                        prompt,
+                                        target_step=target_step,
+                                        inflight_registry=self._inflight_by_group_id,
+                                    )
+                                else:
+                                    outcome = await self._rollout_manager.generate_and_push(
+                                        prompt,
+                                        target_step=target_step,
+                                        inflight_registry=self._inflight_by_group_id,
+                                        lineage_group_id=lineage_group_id,
+                                    )
                         except BaseException:
                             # On success ownership transfers to the train pump, which
                             # releases this permit after consuming the committed group.
@@ -2623,7 +2705,24 @@ class SingleControllerActor:
             consumed_group_count = 0
             step_finalizer_metrics: dict[str, list[float]] = {}
 
-            with self._timer.time("total_step_time"):
+            with (
+                self._timer.time("total_step_time"),
+                umbrella_span(
+                    RLSpanGroup.U_STEP,
+                    "rl.sc.step",
+                    tracer=self._tracer,
+                    # No rl.epoch: the rollout pump advances the epoch on its own
+                    # clock, so its value here would describe whichever epoch that
+                    # pump had reached, not the one this step's data came from.
+                    **{
+                        "rl.iteration": self._train_steps + 1,
+                        "rl.weight_version": version_during_step,
+                    },
+                ),
+            ):
+                # One span per starvation episode, not per 5ms poll.
+                starvation_span: Optional[Any] = None
+                starvation_polls = 0
                 # Re-read on every iteration rather than once: a prompt stamped for this
                 # step can be dropped while the pump is already waiting for it, which is
                 # precisely the case that would otherwise wait forever.
@@ -2733,8 +2832,29 @@ class SingleControllerActor:
                                     f"groups with {buffered_groups} group(s) "
                                     f"remaining in the buffer"
                                 )
+                            # Safe to span the select: a starved poll never
+                            # reaches the data plane, so nothing below is
+                            # counted twice.
+                            if starvation_span is None:
+                                starvation_span = start_efficiency_span(
+                                    "idle/buffer_starvation", tracer=self._tracer
+                                )
+                                starvation_polls = 0
+                            starvation_polls += 1
                             await asyncio.sleep(0.005)
                             continue
+
+                        # A batch is selectable, so the wait is over. Closing it
+                        # here rather than after the loop keeps the span on the
+                        # stall itself; the loop can go around again for the next
+                        # chunk, which opens a fresh episode.
+                        if starvation_span is not None:
+                            safe_set_span_attributes(
+                                starvation_span,
+                                {RL_IDLE_POLLS_ATTR: starvation_polls},
+                            )
+                            starvation_span.end()
+                            starvation_span = None
 
                         consumed_metas.append(train_meta)
                         consumed_training_claim_ids.extend(selected_training_claim_ids)
@@ -2774,7 +2894,14 @@ class SingleControllerActor:
                         self._policy_logprobs_required
                         or self._reference_logprobs_required
                     ):
-                        with self._timer.time("logprob_inference_prep"):
+                        with (
+                            self._timer.time("logprob_inference_prep"),
+                            managed_span(
+                                RLSpanGroup.DATA_PROCESSING,
+                                "rl.sc.logprob_inference_prep",
+                                tracer=self._tracer,
+                            ),
+                        ):
                             # Once the step is open, gradients are accumulating
                             # in the trainer's grad buffers across chunks. The
                             # Megatron buffer offload frees that storage outright
@@ -2785,7 +2912,14 @@ class SingleControllerActor:
                                 self._trainer.prepare_for_lp_inference,
                                 keep_train_buffers=step_open,
                             )
-                        with self._timer.time("policy_and_reference_logprobs"):
+                        with (
+                            self._timer.time("policy_and_reference_logprobs"),
+                            managed_span(
+                                RLSpanGroup.LOGPROB,
+                                "rl.sc.policy_and_reference_logprobs",
+                                tracer=self._tracer,
+                            ),
+                        ):
                             if self._policy_logprobs_required:
                                 await asyncio.to_thread(
                                     self._trainer.get_logprobs_from_meta, train_meta
@@ -2798,17 +2932,38 @@ class SingleControllerActor:
                     elif self._is_ppo:
                         # prepare_for_lp_inference is skipped here, and it is the only
                         # other call that parks the policy optimizer before the critic.
-                        with self._timer.time("value_inference_prep"):
+                        with (
+                            self._timer.time("value_inference_prep"),
+                            managed_span(
+                                RLSpanGroup.DATA_PROCESSING,
+                                "rl.sc.value_inference_prep",
+                                tracer=self._tracer,
+                            ),
+                        ):
                             await asyncio.to_thread(self._trainer.offload_to_cpu)
 
                     # Value model forward
                     if self._is_ppo:
-                        with self._timer.time("value_inference"):
+                        with (
+                            self._timer.time("value_inference"),
+                            managed_span(
+                                RLSpanGroup.ADVANTAGE,
+                                "rl.sc.value_inference",
+                                tracer=self._tracer,
+                            ),
+                        ):
                             await asyncio.to_thread(self._trainer.finish_inference)
                             train_meta = await self._value_stage(train_meta)
 
                     # Compute advantages
-                    with self._timer.time("advantage_calculation"):
+                    with (
+                        self._timer.time("advantage_calculation"),
+                        managed_span(
+                            RLSpanGroup.ADVANTAGE,
+                            "rl.sc.advantage_calculation",
+                            tracer=self._tracer,
+                        ),
+                    ):
                         (
                             train_meta,
                             has_valid_training_tokens,
@@ -2840,7 +2995,15 @@ class SingleControllerActor:
                         # periodic snapshots out until this whole training step is
                         # published as consumed below.
                         self._optimizer_commit_in_progress = True
-                        with self._timer.time("value_training"):
+                        with (
+                            self._timer.time("value_training"),
+                            managed_span(
+                                RLSpanGroup.POLICY_UPDATE,
+                                "rl.sc.value_training",
+                                tracer=self._tracer,
+                                **{"rl.critic_epochs": self._critic_ppo_epochs},
+                            ),
+                        ):
                             value_result = await self._value_train_epochs(
                                 train_meta,
                                 num_epochs=self._critic_ppo_epochs,
@@ -2860,12 +3023,27 @@ class SingleControllerActor:
                         # Always restore training mode because log-prob inference may have
                         # switched the model to inference mode. Keep it resident
                         # across every PPO actor epoch.
-                        with self._timer.time("training_prep"):
+                        with (
+                            self._timer.time("training_prep"),
+                            managed_span(
+                                RLSpanGroup.DATA_PROCESSING,
+                                "rl.sc.training_prep",
+                                tracer=self._tracer,
+                            ),
+                        ):
                             await asyncio.to_thread(self._trainer.prepare_for_training)
 
                         if has_valid_training_tokens:
-                            for _ in range(self._ppo_epochs):
-                                with self._timer.time("policy_training"):
+                            for epoch in range(self._ppo_epochs):
+                                with (
+                                    self._timer.time("policy_training"),
+                                    managed_span(
+                                        RLSpanGroup.POLICY_UPDATE,
+                                        "rl.sc.policy_training",
+                                        tracer=self._tracer,
+                                        **{"rl.ppo_epoch": epoch + 1},
+                                    ),
+                                ):
                                     if not step_open:
                                         await asyncio.to_thread(
                                             self._trainer.begin_train_step,
@@ -2944,6 +3122,16 @@ class SingleControllerActor:
                         self._algo_cfg.num_prompts_per_step,
                     )
 
+                # The loop can leave a wait open on two exits that continue
+                # the run, where an unended span would stay open over the
+                # training that follows and never be exported. The other
+                # exits all end the run, so they are not covered.
+                if starvation_span is not None:
+                    safe_set_span_attributes(
+                        starvation_span, {RL_IDLE_POLLS_ATTR: starvation_polls}
+                    )
+                    starvation_span.end()
+
                 # ---- 5. Train the policy model -- finish_train_step ----
                 log.info(
                     "train_pump: step %d closing on %d chunk(s), %d group(s)",
@@ -2963,7 +3151,14 @@ class SingleControllerActor:
                             "to avoid an optimizer step with an empty batch."
                         )
 
-                    with self._timer.time("policy_training"):
+                    with (
+                        self._timer.time("policy_training"),
+                        managed_span(
+                            RLSpanGroup.POLICY_UPDATE,
+                            "rl.sc.policy_optimizer_step",
+                            tracer=self._tracer,
+                        ),
+                    ):
                         policy_result = await asyncio.to_thread(
                             self._trainer.finish_train_step
                         )
@@ -3097,12 +3292,19 @@ class SingleControllerActor:
                     if defer_refit_for_save:
                         # Refit-deferral (colocated): the engine is about to be saved; let it sleep.
                         # Record `weight_sync` for consistency in reports.
+                        # No refit_bubble: this branch syncs nothing.
                         with self._timer.time("weight_sync"):
                             pass
                         with self._timer.time("offload_before_refit"):
                             await asyncio.to_thread(self._trainer.offload_before_refit)
                     else:
-                        with self._timer.time("weight_sync"):
+                        # Named to match async GRPO's refit phase: training cannot
+                        # proceed and generation is serving stale weights, so the
+                        # same seconds are idle on both fleets.
+                        with (
+                            self._timer.time("weight_sync"),
+                            efficiency_span("idle/refit_bubble", tracer=self._tracer),
+                        ):
                             calibration_data = (
                                 BatchedDataDict.from_batches(calibration_batches)
                                 if calibration_batches
@@ -3138,7 +3340,15 @@ class SingleControllerActor:
 
                 # Checkpointing (mirrors async_grpo_train's save block).
                 if will_save_checkpoint:
-                    with self._timer.time("checkpointing"):
+                    with (
+                        self._timer.time("checkpointing"),
+                        managed_span(
+                            RLSpanGroup.CHECKPOINT,
+                            "rl.sc.checkpointing",
+                            tracer=self._tracer,
+                            **{"rl.step": self._train_steps},
+                        ),
+                    ):
                         await self._save_checkpoint(
                             step_metrics,
                             is_policy_training_step=is_policy_training_step,

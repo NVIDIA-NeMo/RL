@@ -32,6 +32,7 @@ from nemo_rl.data.deepseek_v4_tokenizer import (
     should_use_deepseek_v4_chat_template,
 )
 from nemo_rl.models.policy import TokenizerConfig
+from nemo_rl.telemetry.vocabulary import RUN_WINDOW_WALL_CLOCK_CATEGORIES
 from nemo_rl.utils.fastokens import maybe_patch_fastokens
 from nemo_rl.utils.logger import Logger
 
@@ -258,6 +259,28 @@ def surpress_user_warnings(f):  # type: ignore
         return output
 
     return wrapper
+
+
+@torch.no_grad()
+def compute_seq_logprob_errors(
+    *,
+    policy_logprobs: torch.Tensor,
+    generation_logprobs: torch.Tensor,
+    token_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return mean multiplicative absolute error and validity per sequence.
+
+    Inputs must already be aligned to predicted tokens (without the first
+    input token). Padding and previously masked samples do not participate.
+    Nonfinite errors on valid tokens fail any finite threshold.
+    """
+    mask = token_mask * sample_mask.unsqueeze(-1)
+    counts = mask.sum(dim=-1)
+    valid = counts > 0
+    error = torch.where(mask.bool(), (generation_logprobs - policy_logprobs).abs(), 0.0)
+    errors = (torch.exp(error * mask) * mask).sum(dim=-1) / counts.clamp(min=1)
+    return errors, valid
 
 
 def masked_mean(
@@ -1015,15 +1038,6 @@ THREAD_ACCUMULATED_EFFICIENCY_CATEGORIES = [
 EFFICIENCY_CATEGORIES = (
     WALL_CLOCK_EFFICIENCY_CATEGORIES + THREAD_ACCUMULATED_EFFICIENCY_CATEGORIES
 )
-
-# Wall-clock categories whose value covers the whole run rather than one step.
-# The driver's Timer is reset every step, so its idle categories are per-step
-# deltas -- but init/total is measured once before the loop and republished
-# unchanged afterwards, so it cannot be compared against a single step's wall
-# time. Mirrored by _RUN_WINDOW_WALL_CLOCK_CATEGORIES in
-# nemo_rl/telemetry/metrics.py, which cannot import this module (torch); a test
-# keeps the two in lockstep.
-RUN_WINDOW_WALL_CLOCK_CATEGORIES = frozenset({"init/total"})
 
 STEP_WINDOW_WALL_CLOCK_CATEGORIES = [
     category

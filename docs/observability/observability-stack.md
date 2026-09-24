@@ -14,7 +14,7 @@ telemetry:
   span_groups: default        # start coarse; raise to per_step / all as needed
   metrics_enabled: true
   logs_enabled: true
-  vllm_native_tracing: false  # gRPC-only; leave off on an http/protobuf path
+  vllm_native_tracing: false  # gRPC by default, one span per request; leave off outside debugging
 ```
 
 Where you send it goes in the environment, since it describes the machine rather than the run. These are the standard OTel SDK variables, read by the SDK directly:
@@ -47,6 +47,8 @@ uv run examples/run_grpo.py --config examples/configs/grpo_math_1B.yaml \
 
 `console` (set via `telemetry.exporter`) is the only backend-free JSON option nemo-lens exposes. For structured JSON-lines *files*, export OTLP to an OpenTelemetry Collector with a `file` exporter (nemo-lens ships a collector-file config) and point `OTEL_EXPORTER_OTLP_ENDPOINT` at the collector.
 
-## vLLM native tracing needs a gRPC endpoint
+## vLLM native tracing chooses its protocol separately
 
-vLLM's **native** OTLP tracing (`telemetry.vllm_native_tracing: true`) uses a gRPC-only exporter, so it will not ride an `http/protobuf` OTLP endpoint. To capture vLLM's native engine spans, add an OTLP/gRPC receiver (an OTel Collector on `:4317`, or a gRPC-capable backend) that forwards to your backend, and point `OTEL_EXPORTER_OTLP_ENDPOINT` (or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`) at it. The driver-side `rl.vllm.*` spans and `gen_ai.*` metrics (Layer 1) reach your backend regardless. See [vLLM Tracing](vllm-tracing.md).
+vLLM's **native** OTLP tracing (`telemetry.vllm_native_tracing: true`) builds its own exporter rather than reusing lens's, and reads the protocol from `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` alone — defaulting to `grpc` and ignoring the generic `OTEL_EXPORTER_OTLP_PROTOCOL`. On an `http/protobuf` stack it would otherwise speak gRPC at an HTTP port, so either set `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf` or add an OTLP/gRPC receiver (an OTel Collector on `:4317`) that forwards to your backend. The driver-side `rl.vllm.*` spans and `gen_ai.*` metrics (Layer 1) reach your backend regardless.
+
+Keep `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` **unset** and configure the generic `OTEL_EXPORTER_OTLP_ENDPOINT` instead: vLLM's worker processes enable tracing on the mere presence of the traces-specific variable, which the Ray `runtime_env` spreads cluster-wide, so exporting it switches on per-request worker spans even with `vllm_native_tracing: false`. See [vLLM Tracing](vllm-tracing.md).

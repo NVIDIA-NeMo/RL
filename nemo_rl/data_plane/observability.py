@@ -67,8 +67,27 @@ from tensordict import NonTensorData, NonTensorStack, TensorDict, TensorDictBase
 
 from nemo_rl.data_plane.codec import drain_codec_ms
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
+from nemo_rl.telemetry.instrumentation import (
+    NO_SPAN,
+    in_per_prompt_scope,
+    is_span_group_enabled,
+    managed_span,
+    safe_set_span_attributes,
+    umbrella_span,
+)
+from nemo_rl.telemetry.span_groups import RLSpanGroup
 
 logger = logging.getLogger(__name__)
+
+# Span attribute names for a data-plane op. ``op`` and ``partition`` are bounded
+# (a fixed op vocabulary, a handful of partitions), so they are safe as
+# attributes; the byte and key counts are per-op numbers recorded on the span
+# rather than metric labels.
+_OP_ATTR = "rl.data_plane.op"
+_PARTITION_ATTR = "rl.data_plane.partition"
+_KEYS_ATTR = "rl.data_plane.keys"
+_BYTES_ATTR = "rl.data_plane.bytes"
+_STATUS_ATTR = "rl.data_plane.status"
 
 
 # Upper edges in ms for the latency histogram. Fixed buckets (rather than
@@ -1127,6 +1146,29 @@ def log_event(event: DataPlaneEvent) -> None:
     logger.info("data_plane_event: %s", event)
 
 
+def _annotate(span: Any, n_keys: int, n_bytes: int, status: EventStatus) -> None:
+    """Record an op's outcome on its span.
+
+    Set after the call rather than at open because the byte and key counts are
+    only known once the inner client has returned. ``status`` distinguishes a
+    timeout from a generic error, which the exception the span already records
+    does not.
+    """
+    # safe_set_span_attributes absorbs a None span, but the dict below is built
+    # by the caller before it can: returning first keeps that allocation off
+    # the disabled path, which is the common case and runs once per op.
+    if span is None:
+        return
+    safe_set_span_attributes(
+        span,
+        {
+            _KEYS_ATTR: int(n_keys),
+            _BYTES_ATTR: int(n_bytes),
+            _STATUS_ATTR: status,
+        },
+    )
+
+
 @dataclass
 class OpStats:
     """Per-op-tag accumulation. ``calls``/``wall_ms`` count every status.
@@ -1237,6 +1279,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         inner: DataPlaneClient,
         on_event: Callable[[DataPlaneEvent], None] | None = None,
         verify_tensor_hash: bool = False,
+        observability_enabled: bool = True,
     ) -> None:
         """Wrap ``inner``, accumulating per-op timing and volume.
 
@@ -1250,10 +1293,17 @@ class MetricsDataPlaneClient(DataPlaneClient):
                 reads every tensor element again on both sides (~8 ms
                 for a 107 MB batch of 1536 rows), so it is off unless the
                 config asks.
+            observability_enabled: Whether the user asked for data-plane
+                observability. False on a telemetry-only run, where the
+                wrapper is installed for its spans alone: the counters stop
+                being collected and :func:`is_metrics_client` reports False,
+                so the readers that poll every worker for data-plane stats
+                stay off, as ``observability.enabled: false`` asked.
         """
         self._inner = inner
         self._on_event = on_event
         self._verify_tensor_hash = verify_tensor_hash
+        self._observability_enabled = observability_enabled
         self._stats = DataPlaneStats()
         # Live bytes and live keys per partition. Populated on successful
         # ``put_samples``, released on successful ``clear_samples`` -- or, for
@@ -1272,6 +1322,11 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # every trainer use get_step_metrics() without copying the
         # differencing and unit-conversion logic.
         self._prev_snapshot: dict[str, Any] = {}
+
+    @property
+    def observability_enabled(self) -> bool:
+        """Whether the counters this wrapper accumulates are worth reading."""
+        return self._observability_enabled
 
     def snapshot(self, reset_step_window: bool = False) -> dict[str, Any]:
         """Return cumulative totals plus live byte / key outstanding counts.
@@ -1667,6 +1722,11 @@ class MetricsDataPlaneClient(DataPlaneClient):
     ) -> Any:
         """Run ``fn`` and emit one observability event with wall-time and status.
 
+        Also opens one span per op, which is what puts transfer-queue traffic in
+        the trace waterfall: on the single-controller path most of a step's
+        non-compute time is data-plane traffic, and without these spans that time
+        showed up only as a gap between phases.
+
         Args:
             op: Operation tag (``"put"``, ``"get"``, ``"clear"``, etc.).
             partition_id: Partition the op targets.
@@ -1680,22 +1740,46 @@ class MetricsDataPlaneClient(DataPlaneClient):
             Whatever ``fn`` returned.
         """
         t0 = monotonic()
-        try:
-            out = fn()
-        except TimeoutError:
-            self._emit(op, partition_id, n_keys, n_bytes, t0, "timeout")
-            raise
-        except Exception:
-            self._emit(op, partition_id, n_keys, n_bytes, t0, "error")
-            raise
-        # If the call returns a TensorDict, the read-side bytes are more
-        # informative than the input estimate.
-        if isinstance(out, TensorDict):
-            n_bytes = _td_bytes(out)
-        elif isinstance(out, KVBatchMeta) and not n_keys:
-            n_keys = len(out.sample_ids)
-        self._emit(op, partition_id, n_keys, n_bytes, t0, "ok")
-        return out
+        # Rollout puts are per-prompt (umbrella, no bucket); batch puts are
+        # DATA_PLANE. See per_prompt_scope.
+        per_prompt = in_per_prompt_scope()
+        group = RLSpanGroup.U_PER_PROMPT if per_prompt else RLSpanGroup.DATA_PLANE
+        if not is_span_group_enabled(group):
+            # Gate before building the name, the attribute dict and either
+            # helper's generator: this is the most frequent telemetry call site
+            # in the repo, once per data-plane op, and those allocations cost
+            # ~1.8us each on a run that never enabled telemetry.
+            span_ctx: Any = NO_SPAN
+        else:
+            name = f"rl.data_plane.{op}"
+            # Annotated rather than inferred as dict[str, str]: these are span
+            # attributes, whose values are heterogeneous, and the helpers below
+            # take a typed ``tracer`` ahead of their ``**attributes``.
+            attributes: dict[str, Any] = {_OP_ATTR: op, _PARTITION_ATTR: partition_id}
+            if per_prompt:
+                span_ctx = umbrella_span(RLSpanGroup.U_PER_PROMPT, name, **attributes)
+            else:
+                span_ctx = managed_span(RLSpanGroup.DATA_PLANE, name, **attributes)
+        with span_ctx as span:
+            try:
+                out = fn()
+            except TimeoutError:
+                _annotate(span, n_keys, n_bytes, "timeout")
+                self._emit(op, partition_id, n_keys, n_bytes, t0, "timeout")
+                raise
+            except Exception:
+                _annotate(span, n_keys, n_bytes, "error")
+                self._emit(op, partition_id, n_keys, n_bytes, t0, "error")
+                raise
+            # If the call returns a TensorDict, the read-side bytes are more
+            # informative than the input estimate.
+            if isinstance(out, TensorDict) and self._observability_enabled:
+                n_bytes = _td_bytes(out)
+            elif isinstance(out, KVBatchMeta) and not n_keys:
+                n_keys = len(out.sample_ids)
+            _annotate(span, n_keys, n_bytes, "ok")
+            self._emit(op, partition_id, n_keys, n_bytes, t0, "ok")
+            return out
 
     def _emit(
         self,
@@ -1832,7 +1916,9 @@ class MetricsDataPlaneClient(DataPlaneClient):
 
     def put_samples(self, sample_ids, partition_id, fields=None, tags=None):
         entered = monotonic()
-        n_bytes = _td_bytes(fields)
+        # Walks the whole payload, so it is skipped when nothing reads the
+        # result: the spans carry bytes only as an attribute.
+        n_bytes = _td_bytes(fields) if self._observability_enabled else 0
         # Materialize once: ``_run`` consumes its lambda and we also need
         # to attribute bytes per sample after success.
         sample_ids_list = _as_list(sample_ids)
@@ -1944,11 +2030,15 @@ class MetricsDataPlaneClient(DataPlaneClient):
 
 
 def is_metrics_client(client: Any) -> TypeGuard[MetricsDataPlaneClient]:
-    """Whether ``client`` is the wrapper that carries the counters.
+    """Whether ``client`` carries counters worth reading.
 
     The one answer to "is observability on here", replacing four call sites
     that asked it three ways -- two by probing for a ``snapshot`` attribute,
     which is not on the :class:`DataPlaneClient` ABC. ``isinstance(None,
     ...)`` is ``False``, so this covers "no client at all" too.
+
+    The type alone is not the answer: a telemetry-only run installs the
+    wrapper for its spans with observability off, and the readers must not
+    then poll every worker for stats the user switched off.
     """
-    return isinstance(client, MetricsDataPlaneClient)
+    return isinstance(client, MetricsDataPlaneClient) and client.observability_enabled

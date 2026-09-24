@@ -269,8 +269,8 @@ class _RunRolloutsRemote:
         assert num_returns == "streaming"
         return self
 
-    def remote(self, inputs, timer_prefix):
-        del inputs, timer_prefix
+    def remote(self, inputs, timer_prefix, per_prompt=False):
+        del inputs, timer_prefix, per_prompt
         return _Stream(
             [
                 _ReadyRef((i, {"name": "agent"}, result, None))
