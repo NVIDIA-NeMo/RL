@@ -1,6 +1,6 @@
 # Automodel v0.6.0 and Context-Parallel Integration
 
-This design note describes NeMo RL's Automodel DTensor v2 integration after the
+This design note describes NeMo RL's Automodel DTensor integration after the
 Automodel dependency was pinned to the official `v0.6.0` tag. It also explains the
 migration from NeMo RL's fixed context-parallel (CP) layout to Automodel's model-owned
 sharding protocol.

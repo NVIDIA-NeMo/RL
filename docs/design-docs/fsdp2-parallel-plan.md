@@ -4,7 +4,7 @@ This guide outlines the parallelization strategy for Fully Sharded Data Parallel
 
 ## Fallback Priority
 
-NeMo RL supports three parallelization strategies, applied in the following order of fallback priority:
+Automodel selects the tensor-parallel plan, applying four strategies in the following order of fallback priority:
 
 ### 1. Custom Parallel Plan
 
@@ -16,7 +16,11 @@ Optimized parallel plans are available for specific model architectures. They ma
 
 ### 3. Hugging Face Tensor Parallel Plan
 
-The Hugging Face tensor parallel plan is the default. It's available for most models via `._tp_plan` and is used when neither a custom nor an optimized parallel plan is available.
+The Hugging Face tensor parallel plan is available for most models via `._tp_plan` and is used when neither a custom nor an optimized parallel plan is available.
+
+### 4. Default Base Plan
+
+When a model provides none of the above, Automodel falls back to a default base plan. Models loaded from a custom-code source (Hugging Face's `trust_remote_code=True` path) raise instead of taking this fallback, because the default plan's placements trip an assert inside PyTorch's redistribute.
 
 ## Custom Parallel Plan Example
 
