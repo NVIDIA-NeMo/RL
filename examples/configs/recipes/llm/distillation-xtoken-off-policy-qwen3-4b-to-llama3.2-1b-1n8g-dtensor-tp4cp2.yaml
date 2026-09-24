@@ -46,7 +46,6 @@ teachers:
     offload_optimizer_for_logprob: false
     dtensor_cfg:
       enabled: true
-      _v2: true
       checkpoint:
         model_save_format: "safetensors"
         save_consolidated: "false"

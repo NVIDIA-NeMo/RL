@@ -25,7 +25,6 @@ policy:
   make_sequence_length_divisible_by: 1
   dtensor_cfg:
     enabled: true
-    _v2: true
     tensor_parallel_size: 1
     context_parallel_size: 1
   megatron_cfg:
@@ -61,7 +60,6 @@ teacher:
   make_sequence_length_divisible_by: 1
   dtensor_cfg:
     enabled: true
-    _v2: true
     tensor_parallel_size: 1
     context_parallel_size: 1
   megatron_cfg:
