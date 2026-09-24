@@ -103,7 +103,7 @@ class Value(ValueInterface):
                     "Megatron-Core)."
                 )
 
-            worker_builder_cls = "nemo_rl.models.value.workers.dtensor_value_worker_v2.DTensorValueWorkerV2"
+            worker_builder_cls = "nemo_rl.models.value.workers.automodel_value_worker.AutomodelValueWorker"
 
             tp_size = config["automodel_cfg"]["tensor_parallel_size"]
             # DTensor V2 does not pipeline-parallel; pp_size stays at the
