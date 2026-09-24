@@ -78,6 +78,8 @@ jobs:
       h100_functional_test_count: ${{ steps.evaluate.outputs.h100_functional_test_count }}
       gb200_functional_test_scripts: ${{ steps.evaluate.outputs.gb200_functional_test_scripts }}
       gb200_functional_test_count: ${{ steps.evaluate.outputs.gb200_functional_test_count }}
+      gb200_trtllm_functional_test_scripts: ${{ steps.evaluate.outputs.gb200_trtllm_functional_test_scripts }}
+      gb200_trtllm_functional_test_count: ${{ steps.evaluate.outputs.gb200_trtllm_functional_test_count }}
       megatron_lm_commit: ${{ steps.evaluate.outputs.megatron_lm_commit }}
       base_ref: ${{ steps.base-head-ref.outputs.base_ref }}
       base_sha: ${{ steps.base-head-ref.outputs.base_sha }}
@@ -225,14 +227,19 @@ jobs:
             '[.functional[] | select((ascii_downcase | contains("gb200")) | not)]' \
             <<< "$test_plan")
           # The managed Dynamo runtime is currently amd64-only and is not
-          # installed in the arm64 GB200 image.
+          # installed in the arm64 GB200 image. L1_Functional_Tests_Trtllm runs
+          # against docker/Dockerfile.trtllm instead of the shared GB200 image.
           gb200_functional_test_scripts=$(jq -c \
-            '[.functional[] | select(. != "L1_Functional_Tests_Dynamo")]' \
+            '[.functional[] | select(. != "L1_Functional_Tests_Dynamo" and . != "L1_Functional_Tests_Trtllm")]' \
+            <<< "$test_plan")
+          gb200_trtllm_functional_test_scripts=$(jq -c \
+            '[.functional[] | select(. == "L1_Functional_Tests_Trtllm")]' \
             <<< "$test_plan")
 
           unit_test_count=$(jq 'length' <<< "$unit_test_scripts")
           h100_functional_test_count=$(jq 'length' <<< "$h100_functional_test_scripts")
           gb200_functional_test_count=$(jq 'length' <<< "$gb200_functional_test_scripts")
+          gb200_trtllm_functional_test_count=$(jq 'length' <<< "$gb200_trtllm_functional_test_scripts")
 
           effective_test_count=0
           case "$TEST_LEVEL" in
@@ -251,7 +258,7 @@ jobs:
                 effective_test_count=$((effective_test_count + unit_test_count + h100_functional_test_count))
               fi
               if [[ "$TEST_PLATFORM" != "h100" ]]; then
-                effective_test_count=$((effective_test_count + gb200_functional_test_count))
+                effective_test_count=$((effective_test_count + gb200_functional_test_count + gb200_trtllm_functional_test_count))
               fi
               ;;
           esac
@@ -271,6 +278,8 @@ jobs:
             echo "h100_functional_test_count=$h100_functional_test_count"
             echo "gb200_functional_test_scripts=$gb200_functional_test_scripts"
             echo "gb200_functional_test_count=$gb200_functional_test_count"
+            echo "gb200_trtllm_functional_test_scripts=$gb200_trtllm_functional_test_scripts"
+            echo "gb200_trtllm_functional_test_count=$gb200_trtllm_functional_test_count"
             echo "megatron_lm_commit=${MEGATRON_LM_COMMIT,,}"
           } | tee -a "$GITHUB_OUTPUT"
 
@@ -560,14 +569,11 @@ jobs:
       build-contexts: |
         nemo-rl=.
         ${{ vars.UV_BUILD_CACHE == 'enabled' && format('uv-cache-seed=docker-image://{0}/{1}:uv-cache', needs.org-member-pre-flight.outputs.registry, vars.CI_CONTAINER_NAME) || '' }}
-      trtllm-ccache-tag: ${{ vars.TRTLLM_BUILD_CACHE == 'enabled' && 'trtllm-ccache' || '' }}
-      trtllm-wheel-cache-tag: ${{ vars.TRTLLM_BUILD_CACHE == 'enabled' && 'trtllm-wheel-cache' || '' }}
       megatron-lm-commit: ${{ needs.pre-flight.outputs.megatron_lm_commit }}
       megatron-lock-artifact: ${{ needs.prepare-megatron-lock.outputs.artifact_name }}
       build-args: |
         MAX_JOBS=4
         BUILD_DYNAMO=1
-        TRTLLM_BUILD_JOBS=24
         NEMO_RL_COMMIT=${{ needs.pre-flight.outputs.test_sha }}
 
   build-container-gb200:
@@ -608,14 +614,58 @@ jobs:
       build-contexts: |
         nemo-rl=.
         ${{ vars.UV_BUILD_CACHE == 'enabled' && format('uv-cache-seed=docker-image://{0}/{1}:uv-cache', needs.gb200-config.outputs.registry, vars.CI_CONTAINER_NAME) || '' }}
-      trtllm-ccache-tag: ${{ vars.TRTLLM_BUILD_CACHE == 'enabled' && 'trtllm-ccache' || '' }}
-      trtllm-wheel-cache-tag: ${{ vars.TRTLLM_BUILD_CACHE == 'enabled' && 'trtllm-wheel-cache' || '' }}
       megatron-lm-commit: ${{ needs.pre-flight.outputs.megatron_lm_commit }}
       megatron-lock-artifact: ${{ needs.prepare-megatron-lock.outputs.artifact_name }}
       build-args: |
         MAX_JOBS=4
-        TRTLLM_BUILD_JOBS=8
         NEMO_RL_COMMIT=${{ needs.pre-flight.outputs.test_sha }}
+
+  # docker/Dockerfile's trtllm build resolves torch via uv's normal isolated-venv
+  # resolution (override-dependencies: torch==2.11.0), but TensorRT-LLM's own
+  # requirements.txt at the feat/rl_rc ref needs torch>=2.13.0,<=2.14.0a0 --
+  # compiling against one and running against the other is a hard C++ ABI break
+  # (confirmed via a real build: "undefined symbol: ...torch::Library::_def...").
+  # docker/Dockerfile.trtllm builds on the NGC PyTorch (dlfw) base image instead
+  # and inherits its native torch via --system-site-packages, which resolves it.
+  # Scope: trtllm + mcore + nemo_gym only (no vllm/sglang/automodel), GB200/arm64
+  # only, Rubin (sm_107) intentionally excluded.
+  build-container-gb200-trtllm:
+    name: Build GB200/GCP trtllm container
+    if: >-
+      ${{
+        always() &&
+        needs.pre-flight.result == 'success' &&
+        needs.org-member-pre-flight.result == 'success' &&
+        needs.gb200-config.result == 'success' &&
+        needs.pre-flight.outputs.test_level != 'none' &&
+        needs.pre-flight.outputs.image_tag == '' &&
+        needs.org-member-pre-flight.outputs.is_member == 'true' &&
+        vars.DISABLE_GB200_TESTS != 'true' &&
+        needs.pre-flight.outputs.test_platform != 'h100' &&
+        contains('L1 L2', needs.pre-flight.outputs.test_level) &&
+        needs.pre-flight.outputs.gb200_trtllm_functional_test_count != '0' &&
+        (
+          needs.cicd-wait-in-queue.result == 'success' ||
+          !startsWith(github.ref, 'refs/heads/pull-request/')
+        ) &&
+        !cancelled()
+      }}
+    needs: [pre-flight, org-member-pre-flight, gb200-config, cicd-wait-in-queue]
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: ./.github/workflows/_build_container.yml
+    with:
+      build-ref: ${{ needs.pre-flight.outputs.test_sha }}
+      image-name: ${{ vars.CI_CONTAINER_NAME }}-trtllm
+      dockerfile: docker/Dockerfile.trtllm
+      platform: linux/arm64
+      registry: ${{ needs.gb200-config.outputs.registry }}
+      runner: ${{ vars.GB200_RUNNER }}
+      target: release
+      build-args: |
+        NEMO_RL_REPO=${{ github.server_url }}/${{ github.repository }}.git
+        NEMO_RL_REVISION=${{ needs.pre-flight.outputs.test_sha }}
 
   update-uv-cache:
     name: Update uv build cache
@@ -965,6 +1015,63 @@ jobs:
           test-commit-sha: ${{ needs.pre-flight.outputs.test_sha }}
           megatron-lm-commit: ${{ needs.pre-flight.outputs.megatron_lm_commit }}
           megatron-lock-artifact: ${{ needs.prepare-megatron-lock.outputs.artifact_name }}
+
+  cicd-functional-tests-gb200-trtllm:
+    strategy:
+      fail-fast: false
+      matrix:
+        script: ${{ fromJSON(needs.pre-flight.outputs.gb200_trtllm_functional_test_scripts) }}
+    needs: [pre-flight, build-container-gb200-trtllm, cicd-unit-tests, functional-test-script-check, org-member-pre-flight, gb200-config, cicd-wait-in-queue]
+    runs-on: ${{ vars.GB200_RUNNER }}
+    if: >-
+      ${{
+        always() &&
+        contains('L1 L2', needs.pre-flight.outputs.test_level) &&
+        needs.pre-flight.outputs.test_platform != 'h100' &&
+        needs.pre-flight.outputs.gb200_trtllm_functional_test_count != '0' &&
+        needs.org-member-pre-flight.outputs.is_member == 'true' &&
+        vars.DISABLE_GB200_TESTS != 'true' &&
+        needs.pre-flight.result == 'success' &&
+        needs.org-member-pre-flight.result == 'success' &&
+        (
+          needs.cicd-wait-in-queue.result == 'success' ||
+          !startsWith(github.ref, 'refs/heads/pull-request/')
+        ) &&
+        (needs.build-container-gb200-trtllm.result == 'success' || needs.build-container-gb200-trtllm.result == 'skipped') &&
+        (
+          needs.cicd-unit-tests.result == 'success' ||
+          (
+            (needs.pre-flight.outputs.test_platform == 'gb200' || needs.pre-flight.outputs.unit_test_count == '0') &&
+            needs.cicd-unit-tests.result == 'skipped'
+          )
+        ) &&
+        needs.functional-test-script-check.result == 'success' &&
+        !cancelled()
+      }}
+    name: gb200_trtllm_${{ matrix.script }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: main
+        uses: ./.github/actions/test-template
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          # docker/Dockerfile.trtllm bakes UV_NO_SYNC=1 so Ray actor launches
+          # never re-sync (and never risk uv reconciling the base image's native
+          # torch back to this repo's uv.lock-pinned torch==2.11.0, which is
+          # the whole reason this image exists). Test tooling (pytest/coverage)
+          # is deliberately not pre-baked, so override it here to let `uv run
+          # --group test ...` sync on demand -- same mechanism the non-trtllm
+          # image already relies on, since it never sets UV_NO_SYNC at all.
+          UV_NO_SYNC: "0"
+        with:
+          runner: ${{ vars.GB200_RUNNER }}
+          registry: ${{ needs.gb200-config.outputs.registry }}
+          image: ${{ vars.CI_CONTAINER_NAME }}-trtllm
+          test_data_path: ${{ needs.org-member-pre-flight.outputs.test_data_path }}
+          image-tag: ${{ needs.pre-flight.outputs.image_tag }}
+          script: ${{ matrix.script }}
+          test-commit-sha: ${{ needs.pre-flight.outputs.test_sha }}
 
   cicd-fast-functional-tests:
     strategy:

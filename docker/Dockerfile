@@ -21,9 +21,13 @@
 # Optional build args to skip vLLM or SGLang dependencies:
 #   --build-arg SKIP_VLLM_BUILD=1    # Skip vLLM dependencies
 #   --build-arg SKIP_SGLANG_BUILD=1  # Skip SGLang dependencies
-#   --build-arg SKIP_TRTLLM_BUILD=1  # Skip TRT-LLM dependencies
 # Optional isolated managed Dynamo runtime (Dynamo + vLLM only):
 #   --build-arg BUILD_DYNAMO=1
+#
+# TRT-LLM is not built here -- see docker/Dockerfile.trtllm. TRT-LLM's own
+# requirements.txt needs a torch version incompatible with the override this
+# file's venvs pin (torch==2.11.0); docker/Dockerfile.trtllm resolves that by
+# inheriting a dlfw base image's native torch instead.
 
 ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.05-cuda13.2-devel-ubuntu24.04
 FROM scratch AS nemo-rl
@@ -32,20 +36,6 @@ ADD --keep-git-dir=true https://github.com/NVIDIA-NeMo/RL.git#${NRL_GIT_REF} /
 
 # Empty default; CI overrides with --build-context to inject pre-compiled wheels
 FROM scratch AS uv-cache-seed
-
-# Empty default; CI overrides with --build-context to restore custom TRT-LLM
-# wheels across builds. Normal downloads use the shared uv cache.
-FROM scratch AS trtllm-wheel-cache-seed
-
-# Empty default; CI overrides with --build-context to restore the TRT-LLM
-# compiler cache from a registry image.
-FROM scratch AS trtllm-ccache-seed
-
-# Empty defaults for incremental cache export. CI overrides these contexts
-# with the current cache images when appending a delta layer, and leaves them
-# empty when periodically compacting the cache into a full snapshot.
-FROM scratch AS trtllm-wheel-cache-output-base
-FROM scratch AS trtllm-ccache-output-base
 
 # Default custom-setup stage: installs apptainer.
 # Override with: --build-context custom-setup=<your-dir>
@@ -163,15 +153,12 @@ ARG BUILD_CUSTOM_FLASHINFER
 ARG BUILD_CUSTOM_FLASHINFER_URL
 ARG BUILD_CUSTOM_FLASHINFER_REF
 
-# Skip building vLLM, SGLang, or TRT-LLM dependencies (set to any non-empty value to skip)
+# Skip building vLLM or SGLang dependencies (set to any non-empty value to skip)
 ARG SKIP_VLLM_BUILD
 ARG SKIP_SGLANG_BUILD
-ARG SKIP_TRTLLM_BUILD
 ARG BASE_IMAGE
 ARG UV_VERSION
 ARG TARGETARCH
-ARG TRTLLM_CCACHE_MAXSIZE=20G
-ARG TRTLLM_BUILD_JOBS=24
 
 ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 ENV UV_LINK_MODE=copy
@@ -290,15 +277,13 @@ UV_LINK_MODE=hardlink uv sync --frozen --all-groups --no-install-project
 # each actor needs; the runtime registry imports the same dict. It is run as a script rather
 # than imported, because importing it would execute nemo_rl/__init__.py, which does real work
 # (fingerprint check, sys.path setup) that cannot run in this layer.
-SKIP_EXTRAS=""
+# trtllm is always skipped here: see docker/Dockerfile.trtllm instead.
+SKIP_EXTRAS="trtllm"
 if [[ -n "${SKIP_VLLM_BUILD:-}" ]]; then
     SKIP_EXTRAS="$SKIP_EXTRAS vllm"
 fi
 if [[ -n "${SKIP_SGLANG_BUILD:-}" ]]; then
     SKIP_EXTRAS="$SKIP_EXTRAS sglang"
-fi
-if [[ -n "${SKIP_TRTLLM_BUILD:-}" ]]; then
-    SKIP_EXTRAS="$SKIP_EXTRAS trtllm"
 fi
 # Write the list once, in a plain redirect so `set -e` catches a failure here
 # instead of silently prefetching nothing.
@@ -306,10 +291,6 @@ fi
     > /opt/actor_venvs.tsv
 test -s /opt/actor_venvs.tsv
 while IFS=$'\t' read -r venv_name stage extras; do
-    if [[ "$stage" == "trtllm" ]]; then
-        # tensorrt_llm does not exist yet; warm the base and finish in the TRT-LLM layer.
-        extras=""
-    fi
     venv_path="${NEMO_RL_VENV_DIR}/${venv_name}"
     uv venv --allow-existing "$venv_path"
     UV_PROJECT_ENVIRONMENT="$venv_path" UV_LINK_MODE=hardlink uv sync --frozen $extras --no-install-project
@@ -326,107 +307,20 @@ find /root/.cache/uv -type d -path "*ray/_private/runtime_env/agent/thirdparty_f
 echo "${CACHE_KEY}" > /root/.cache/uv/.cache-key
 EOF
 
-# Keep the frequently changing TRT-LLM build inputs after the other backend
-# warmups so TRT-only changes can reuse expensive wheels such as Transformer
-# Engine from the preceding layer.
-COPY --from=nemo-rl tools/build-custom-trtllm.sh ./tools/build-custom-trtllm.sh
+# The tensorrt-llm package is still a [tool.uv.sources] path member of this
+# workspace (3rdparty/TensorRT-LLM-workspace/), so uv needs it present to
+# resolve/verify the lock below even though it's never built here.
 COPY --from=nemo-rl --link 3rdparty/TensorRT-LLM-workspace/ ./3rdparty/TensorRT-LLM-workspace/
 
-RUN --mount=type=ssh \
-    --mount=type=bind,from=trtllm-ccache-seed,source=.,target=/tmp/trtllm-ccache-seed \
-    --mount=type=cache,id=trtllm-wheel-cache-${TARGETARCH}-${BASE_IMAGE},from=trtllm-wheel-cache-seed,source=.,target=/root/.cache/trtllm-wheels,sharing=locked \
-    --mount=type=cache,id=trtllm-ccache-${TARGETARCH}-${BASE_IMAGE},target=/root/.cache/ccache,sharing=locked <<"EOF" bash -exu
+RUN --mount=type=ssh <<"EOF" bash -exu
 # Lock/pyproject consistency is verified LATE here, for the whole image. The
 # dependency syncs above run --frozen (read-only on uv.lock: they neither update
 # nor validate it), so this uv lock --check is the ONLY place a stale lock is
 # caught. It can't move earlier: it needs the full workspace, but the tensorrt-llm
-# path-source member isn't copied until the COPY just above (kept late so a
-# TRT-LLM ref bump doesn't bust the cached TE/backend build).
+# path-source member isn't copied until the COPY just above.
 # WARNING: removing this check (or this layer) without also reverting --frozen
-# above would let an out-of-date lock ship silently. Keep it before the SKIP exit.
+# above would let an out-of-date lock ship silently.
 uv lock --check
-
-if [[ -n "${SKIP_TRTLLM_BUILD:-}" ]]; then
-    echo "SKIP_TRTLLM_BUILD is set; skipping the isolated TRT-LLM build"
-    exit 0
-fi
-
-# These settings are build-only and intentionally do not persist in the final
-# NeMo-RL image. COMPILERCHECK=content is robust to compiler timestamp changes
-# between ephemeral CI runners.
-export CCACHE_DIR=/root/.cache/ccache
-export CCACHE_COMPILERCHECK=content
-export CCACHE_COMPRESS=true
-export CCACHE_MAXSIZE="${TRTLLM_CCACHE_MAXSIZE}"
-
-# Cache entries are content-addressed, so keep newer builder-local entries when
-# merging the registry seed.
-rsync -a --ignore-existing /tmp/trtllm-ccache-seed/ "${CCACHE_DIR}/"
-
-# uv uses the shared image cache. Only the custom wheel needs a cache mount
-# because uv can miss no-build-isolation wheels across build environments.
-# The mount is builder-local scratch: it is not part of this layer, so a later
-# stage cannot rely on it -- when this RUN is served from the BuildKit layer
-# cache the mount stays empty. The build below therefore also mirrors the
-# current content-addressed wheel into /opt/trtllm_wheels, which IS part of this
-# layer; the release stage and runtime `uv run --extra trtllm` read it from there.
-echo "TRT-LLM cache state before build:"
-du -sh /root/.cache/uv /root/.cache/trtllm-wheels
-
-TRTLLM_SYNC_LOG=$(mktemp /tmp/trtllm-sync.XXXXXX.log)
-set +e
-# Build TRT-LLM into a throwaway venv instead of the main one:
-# the main venv is fully hardlinked from the dependency layer,
-# and churning it here would copy files up into this layer.
-# The throwaway venv must be symlink-mode: hardlinks to files in the dependency layer's uv
-# cache make overlayfs copy them up into this layer, and the copies outlive the rm -rf below.
-UV_CACHE_DIR=/root/.cache/uv \
-    TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-wheels \
-    TRTLLM_WHEEL_CACHE_MIRROR_DIR=/opt/trtllm_wheels \
-    UV_PROJECT_ENVIRONMENT=/tmp/trtllm-build-venv \
-    uv sync --verbose --link-mode symlink --locked --extra trtllm --no-install-project \
-    2>&1 | tee "$TRTLLM_SYNC_LOG" \
-    | awk '/\[TRTLLM_CCACHE\]|Ninja progress:/ { print; fflush() }'
-TRTLLM_SYNC_STATUS=$?
-set -e
-if [[ "${TRTLLM_SYNC_STATUS}" -ne 0 ]]; then
-    echo "[ERROR] TRT-LLM uv sync failed with exit code ${TRTLLM_SYNC_STATUS}." >&2
-    echo "[ERROR] Last 200 lines of captured uv output:" >&2
-    tail -n 200 "$TRTLLM_SYNC_LOG" >&2
-    rm -f "$TRTLLM_SYNC_LOG"
-    exit "${TRTLLM_SYNC_STATUS}"
-fi
-rm -f "$TRTLLM_SYNC_LOG"
-
-echo "TRT-LLM cache state after build:"
-du -sh /root/.cache/uv /root/.cache/trtllm-wheels
-
-# Worker-venv prefetch, phase 1 for the "trtllm"-stage actors:
-# the dependency layer gave them a base-only warm; now that the tensorrt_llm wheel exists,
-# top off the venv with the full extra set so that the added files hardlink in-layer.
-# tensorrt_llm itself is new in this layer; trtllm-extra deps already present in the
-# dependency layer's cache (e.g. tilelang) get copied up here, a small accepted cost.
-# The dependency layer already wrote the actor list to /opt/actor_venvs.tsv, so this layer
-# reuses it rather than re-deriving it -- one reader, one place it can go wrong.
-while IFS=$'\t' read -r venv_name stage extras; do
-    if [[ "$stage" != "trtllm" ]]; then
-        continue
-    fi
-    venv_path="${NEMO_RL_VENV_DIR}/${venv_name}"
-    uv venv --allow-existing "$venv_path"
-    UV_PROJECT_ENVIRONMENT="$venv_path" UV_LINK_MODE=hardlink \
-        TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-wheels \
-        TRTLLM_REQUIRE_CACHED_WHEEL=1 \
-        uv sync --frozen $extras --no-install-project
-done < /opt/actor_venvs.tsv
-
-# The main venv was never touched (the build ran in the throwaway venv), so
-# the previous "restore the default environment" sync is no longer needed.
-rm -rf /tmp/trtllm-build-venv
-
-# The syncs above can repopulate the shared uv cache, so repeat the security
-# cleanup performed in the preceding dependency layer.
-find /root/.cache/uv -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +
 EOF
 
 ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
@@ -497,13 +391,6 @@ EOF
 # so do a quick check before trying to unshallow.
 RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
 RUN <<"EOF" bash -exu
-# Reuse the custom wheel the hermetic stage mirrored into /opt/trtllm_wheels
-# (the runtime default of the TRT-LLM build backend). It lives in that layer,
-# so it is present whether the TRT-LLM RUN executed on this builder or was
-# restored from the layer cache; do not read it from the builder-local cache
-# mount here. Normal uv artifacts stay in /root/.cache/uv.
-export TRTLLM_WHEEL_CACHE_DIR=/opt/trtllm_wheels
-export TRTLLM_REQUIRE_CACHED_WHEEL=1
 # Worker-venv prefetch, phase 2: the nemo_rl project itself.
 #
 # The other half of the split described in the dependency stage. Every venv already holds
@@ -554,105 +441,3 @@ RUN python tools/generate_fingerprint.py > /opt/nemo_rl_container_fingerprint
 RUN echo "This distribution includes open source which is archived at the following URL: https://opensource.nvidia.com/oss/teams/nvidia/nemo-rl/${RC_DATE}:linux-${TARGETARCH}/index.html" > NOTICES.txt && \
     echo "For further inquiries or assistance, contact us at oss-requests@nvidia.com" >> NOTICES.txt
 
-# Export the builder-local ccache as a separate scratch image. CI builds this
-# target immediately after the release target with the same Buildx builder, so
-# it can read the cache mount without adding ccache data to the release image.
-FROM base AS trtllm-ccache-export
-ARG BASE_IMAGE
-ARG CCACHE_EXPORT_NONCE
-ARG CCACHE_EXPORT_MODE=full
-ARG TARGETARCH
-RUN --mount=type=bind,from=trtllm-ccache-seed,source=.,target=/tmp/trtllm-ccache-seed \
-    --mount=type=cache,id=trtllm-ccache-${TARGETARCH}-${BASE_IMAGE},target=/root/.cache/ccache,sharing=locked <<"EOF" bash -exu
-# Make this export run once per CI build instead of reusing an older layer.
-echo "Exporting TRT-LLM ccache for build ${CCACHE_EXPORT_NONCE:-local} (${CCACHE_EXPORT_MODE})"
-# The hermetic layer may have been reused from BuildKit without executing its
-# RUN command, leaving this builder-local mount empty. Restore the seed only in
-# that case; unconditionally merging it would resurrect entries ccache evicted.
-if [[ -z "$(find /root/.cache/ccache -mindepth 1 -print -quit)" ]]; then
-    rsync -a /tmp/trtllm-ccache-seed/ /root/.cache/ccache/
-fi
-echo "TRT-LLM ccache state before export:"
-ccache --show-stats
-mkdir -p /tmp/trtllm-ccache-export
-case "${CCACHE_EXPORT_MODE}" in
-    incremental)
-        # The output image inherits the seed layers, so copy only files whose
-        # content or metadata differs from the seed into the new top layer.
-        rsync -aH --checksum \
-            --compare-dest=/tmp/trtllm-ccache-seed/ \
-            /root/.cache/ccache/ /tmp/trtllm-ccache-export/
-        ;;
-    full)
-        cp -a /root/.cache/ccache/. /tmp/trtllm-ccache-export/
-        ;;
-    *)
-        echo "Unsupported CCACHE_EXPORT_MODE: ${CCACHE_EXPORT_MODE}" >&2
-        exit 1
-        ;;
-esac
-echo "TRT-LLM ccache export payload:"
-du -sh /tmp/trtllm-ccache-export
-CCACHE_HAS_DELTA=true
-if [[ "${CCACHE_EXPORT_MODE}" == "incremental" ]] && \
-    [[ -z "$(find /tmp/trtllm-ccache-export -mindepth 1 ! -type d -print -quit)" ]]; then
-    CCACHE_HAS_DELTA=false
-fi
-echo "TRT-LLM ccache export has delta: ${CCACHE_HAS_DELTA}"
-printf '%s\n' "${CCACHE_HAS_DELTA}" > /tmp/trtllm-ccache-export-has-delta
-EOF
-
-FROM trtllm-ccache-output-base AS trtllm-ccache
-COPY --link --from=trtllm-ccache-export /tmp/trtllm-ccache-export/ /
-LABEL com.nvidia.nemo-rl.cache-layout="incremental-v1"
-
-# Export only the custom TRT-LLM wheels. Normal downloads stay in the shared uv
-# cache, while this small cache mount survives changes to the late TRT layer.
-FROM base AS trtllm-wheel-cache-export
-ARG BASE_IMAGE
-ARG TARGETARCH
-ARG WHEEL_CACHE_EXPORT_MODE=full
-ARG WHEEL_CACHE_EXPORT_NONCE
-RUN --mount=type=bind,from=trtllm-wheel-cache-seed,source=.,target=/tmp/trtllm-wheel-cache-seed \
-    --mount=type=cache,id=trtllm-wheel-cache-${TARGETARCH}-${BASE_IMAGE},from=trtllm-wheel-cache-seed,source=.,target=/root/.cache/trtllm-wheels,sharing=locked <<"EOF" bash -exu
-echo "Exporting TRT-LLM wheel cache for build ${WHEEL_CACHE_EXPORT_NONCE:-local} (${WHEEL_CACHE_EXPORT_MODE})"
-# If the hermetic TRT-LLM RUN was a BuildKit cache hit, this builder-local mount is empty;
-# restore the seed before exporting it.
-if [[ -z "$(find /root/.cache/trtllm-wheels -mindepth 1 -print -quit)" ]]; then
-    rsync -a /tmp/trtllm-wheel-cache-seed/ /root/.cache/trtllm-wheels/
-fi
-mkdir -p /tmp/trtllm-wheel-cache-export
-case "${WHEEL_CACHE_EXPORT_MODE}" in
-    incremental)
-        rsync -aH --checksum \
-            --compare-dest=/tmp/trtllm-wheel-cache-seed/ \
-            /root/.cache/trtllm-wheels/ /tmp/trtllm-wheel-cache-export/
-        ;;
-    full)
-        cp -a /root/.cache/trtllm-wheels/. /tmp/trtllm-wheel-cache-export/
-        ;;
-    *)
-        echo "Unsupported WHEEL_CACHE_EXPORT_MODE: ${WHEEL_CACHE_EXPORT_MODE}" >&2
-        exit 1
-        ;;
-esac
-echo "TRT-LLM wheel cache export payload:"
-du -sh /tmp/trtllm-wheel-cache-export
-WHEEL_CACHE_HAS_DELTA=true
-if [[ "${WHEEL_CACHE_EXPORT_MODE}" == "incremental" ]] && \
-    [[ -z "$(find /tmp/trtllm-wheel-cache-export -mindepth 1 ! -type d -print -quit)" ]]; then
-    WHEEL_CACHE_HAS_DELTA=false
-fi
-echo "TRT-LLM wheel cache export has delta: ${WHEEL_CACHE_HAS_DELTA}"
-printf '%s\n' "${WHEEL_CACHE_HAS_DELTA}" > /tmp/trtllm-wheel-cache-export-has-delta
-EOF
-
-FROM trtllm-wheel-cache-output-base AS trtllm-wheel-cache
-COPY --link --from=trtllm-wheel-cache-export /tmp/trtllm-wheel-cache-export/ /
-LABEL com.nvidia.nemo-rl.cache-layout="incremental-v1"
-
-# Export only the delta decisions so CI can avoid pushing no-op incremental
-# cache layers. This target stays small even when the cache seeds are large.
-FROM scratch AS trtllm-cache-export-status
-COPY --from=trtllm-ccache-export /tmp/trtllm-ccache-export-has-delta /ccache-has-delta
-COPY --from=trtllm-wheel-cache-export /tmp/trtllm-wheel-cache-export-has-delta /wheel-has-delta
