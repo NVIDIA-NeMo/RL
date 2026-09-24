@@ -115,11 +115,14 @@ RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.ru
     && rustc --version \
     && cargo --version
 
-# Install uv and python
+# Install uv and python outside /root so an unprivileged runtime UID (for example
+# 65532) can execute them: /root is not traversable by other users, and the project
+# venv's python is a symlink into uv's managed-Python directory.
 ARG UV_VERSION=0.11.28
 ARG PYTHON_VERSION=3.13.14
-ENV PATH="/root/.local/bin:$PATH"
-RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh && \
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
+RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh \
+        | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh && \
     uv python install ${PYTHON_VERSION}
 
 # Disable usage stats by default for users who are sensitive to sharing usage.
