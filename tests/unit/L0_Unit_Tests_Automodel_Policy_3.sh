@@ -13,7 +13,7 @@
 # limitations under the License.
 
 #!/bin/bash
-# Shard: automodel-marked policy worker tests (test_dtensor_worker*.py, test_automodel_types.py)
+# Shard: automodel-marked policy worker tests (test_automodel_worker.py, test_automodel_types.py)
 
 source "$(dirname "${BASH_SOURCE[0]}")/run_unit_shard_common.sh"
 

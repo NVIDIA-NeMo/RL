@@ -135,30 +135,55 @@ EXCLUDED_UNIT_TESTS=(
     # MODELS — Policy (run in L0_Unit_Tests_Policy)
     ###########################################################################
 
-    # test_dtensor_worker_v2.py — all heavy GPU tests (~54s each)
-    --ignore=unit/models/policy/test_dtensor_worker_v2.py
+    # test_automodel_worker.py, the half merged in from test_automodel_worker_v2.py (~54s each).
+    # Listed individually because --ignore now takes the whole merged file with it.
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::test_automodel_prepare_for_training_restores_optimizer
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::test_automodel_prepare_for_lp_inference_keep_train_buffers
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::test_automodel_update_moe_gate_bias_called_when_supported
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::test_automodel_update_moe_gate_bias_noop_when_unsupported
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::test_automodel_checkpoint_save_and_load
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::test_automodel_mixed_precision_training_and_logprobs
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestMaybeAdaptTensorToHF::test_no_adapter_returns_single_tuple
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestMaybeAdaptTensorToHF::test_adapter_converts_single_tensor
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestMaybeAdaptTensorToHF::test_adapter_with_quantization_flag
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestMaybeAdaptTensorToHF::test_adapter_excludes_extra_state_regex
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestDTensorParamsGenerator::test_simple_model_yields_adapted_tensors
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestDTensorParamsGenerator::test_dtype_conversion
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestDTensorParamsGenerator::test_preserves_fp32_router_correction_bias
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestDTensorParamsGenerator::test_contiguous_output
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestDTensorParamsGenerator::test_with_adapter_model
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestDTensorParamsGenerator::test_empty_model
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestDTensorParamsGenerator::test_generator_is_iterable
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestDTensorParamsGenerator::test_multiple_layers
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::test_prepare_refit_info_preserves_fp32_router_correction_bias
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestAutocastContext::test_disabled_returns_noop_context
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestAutocastContext::test_enabled_uses_worker_dtype
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::test_automodel_scopes_synchronous_checkpointing_to_dsv4
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::test_automodel_resume_with_reference_model_defers_checkpoint_load
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::test_automodel_resume_without_reference_model_passes_paths_through
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::test_automodel_fresh_run_with_reference_model_does_not_defer
 
     # test_patches.py — requires model loading
     --ignore=unit/models/policy/test_patches.py
 
-    # test_dtensor_worker.py — keep 3 correctness checks, exclude rest (~52-116s each)
-    # Kept: test_dtensor_single_gpu_training, test_dtensor_loss_independent_of_microbatch_size_two_gpus,
-    #        test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded (no llama)
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestSingleGPUCluster::test_dtensor_single_gpu_logprob
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_lm_policy_init
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_training
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_training_with_lora
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_tp_and_tied_model_with_custom_parallel_plan
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_policy_flops_range_check
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_with_lora
+    # test_automodel_worker.py — keep 3 correctness checks, exclude rest (~52-116s each)
+    # Kept: test_automodel_single_gpu_training, test_automodel_loss_independent_of_microbatch_size_two_gpus,
+    #        test_automodel_worker_logprob_tp2_or_cp2_matches_unsharded (no llama)
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestSingleGPUCluster::test_automodel_single_gpu_logprob
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestTwoGPUCluster::test_lm_policy_init
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestTwoGPUCluster::test_automodel_worker_training
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestTwoGPUCluster::test_automodel_worker_training_with_lora
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestTwoGPUCluster::test_automodel_tp_and_tied_model_with_custom_parallel_plan
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestTwoGPUCluster::test_automodel_policy_flops_range_check
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestTwoGPUCluster::test_automodel_worker_logprob_with_lora
 
     # DTensor logprob — exclude llama variants: setup2-4 = llama TP=2, setup11-13 = llama CP=2
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[logprob_setup2]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[logprob_setup3]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[logprob_setup4]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[logprob_setup11]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[logprob_setup12]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[logprob_setup13]
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestTwoGPUCluster::test_automodel_worker_logprob_tp2_or_cp2_matches_unsharded[logprob_setup2]
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestTwoGPUCluster::test_automodel_worker_logprob_tp2_or_cp2_matches_unsharded[logprob_setup3]
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestTwoGPUCluster::test_automodel_worker_logprob_tp2_or_cp2_matches_unsharded[logprob_setup4]
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestTwoGPUCluster::test_automodel_worker_logprob_tp2_or_cp2_matches_unsharded[logprob_setup11]
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestTwoGPUCluster::test_automodel_worker_logprob_tp2_or_cp2_matches_unsharded[logprob_setup12]
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestTwoGPUCluster::test_automodel_worker_logprob_tp2_or_cp2_matches_unsharded[logprob_setup13]
 
     # test_megatron_worker.py — keep 2 correctness checks (~190s total), exclude rest (~77-114s each)
     # Kept: test_megatron_loss_independent_of_microbatch_size (loss correctness),

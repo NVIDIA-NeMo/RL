@@ -462,7 +462,7 @@ class TestAutomodelCheckpointManager:
 
         manager.finalize_async_save()
 
-    def test_dtensor_worker_overrides_finalize_async_save(self):
+    def test_automodel_worker_overrides_finalize_async_save(self):
         """The worker must not inherit the base class no-op.
 
         AutomodelPolicyWorker passes is_async=True, so grpo.py's
