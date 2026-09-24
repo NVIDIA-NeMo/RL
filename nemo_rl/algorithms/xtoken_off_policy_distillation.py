@@ -79,7 +79,7 @@ from nemo_rl.utils.timer import TimeoutChecker, Timer
 # pre-flight (which assumes [B, student_seq, ...] for every 2+D tensor) must
 # skip them. Sources:
 #   - teacher_full_logits_ipc: list[B] of CUDA IPC handle dicts produced by
-#     FullLogitsPostProcessor in dtensor_policy_worker_v2.get_full_logits_ipc.
+#     FullLogitsPostProcessor in automodel_policy_worker.get_full_logits_ipc.
 #     Not a tensor at all — list of dicts — but listed here so the worker's
 #     dict-level dim check skips it.
 #   - teacher_input_ids/teacher_token_mask + alignment_*: produced by

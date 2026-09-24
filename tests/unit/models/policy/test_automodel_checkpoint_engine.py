@@ -19,8 +19,8 @@ import torch
 import torch.nn as nn
 
 try:
-    from nemo_rl.models.policy.workers.dtensor_policy_worker_v2 import (
-        DTensorPolicyWorkerV2Impl,
+    from nemo_rl.models.policy.workers.automodel_policy_worker import (
+        AutomodelPolicyWorkerImpl,
     )
 
     NEMO_AUTOMODEL_AVAILABLE = True
@@ -30,12 +30,12 @@ except ImportError:
 
 @pytest.mark.automodel
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
-def test_dtensor_v2_checkpoint_engine_weight_iterator():
-    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+def test_automodel_checkpoint_engine_weight_iterator():
+    worker = object.__new__(AutomodelPolicyWorkerImpl)
     worker.model = nn.Linear(2, 1)
     worker.dtype = torch.float32
 
-    weights = list(DTensorPolicyWorkerV2Impl._checkpoint_engine_weight_iterator(worker))
+    weights = list(AutomodelPolicyWorkerImpl._checkpoint_engine_weight_iterator(worker))
 
     assert [name for name, _tensor in weights] == ["weight", "bias"]
     for _name, tensor in weights:
@@ -45,21 +45,21 @@ def test_dtensor_v2_checkpoint_engine_weight_iterator():
 
 @pytest.mark.automodel
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
-def test_dtensor_v2_checkpoint_engine_rejects_kv_scales():
-    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+def test_automodel_checkpoint_engine_rejects_kv_scales():
+    worker = object.__new__(AutomodelPolicyWorkerImpl)
     worker.model = nn.Linear(2, 1)
     worker.dtype = torch.float32
 
     with pytest.raises(NotImplementedError, match="FP8 kvcache"):
-        DTensorPolicyWorkerV2Impl._checkpoint_engine_weight_iterator(
+        AutomodelPolicyWorkerImpl._checkpoint_engine_weight_iterator(
             worker, kv_scales={"scale": 1.0}
         )
 
 
 @pytest.mark.automodel
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
-def test_dtensor_v2_checkpoint_engine_cpu_offload_hooks():
-    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+def test_automodel_checkpoint_engine_cpu_offload_hooks():
+    worker = object.__new__(AutomodelPolicyWorkerImpl)
     worker.model = "cpu_model"
     worker.cpu_offload = True
     calls = []
@@ -76,9 +76,9 @@ def test_dtensor_v2_checkpoint_engine_cpu_offload_hooks():
     worker.move_to_cpu = move_to_cpu
 
     with pytest.warns(UserWarning, match="cpu_offload adds an onload/offload cycle"):
-        DTensorPolicyWorkerV2Impl._prepare_checkpoint_engine_weight_send(worker)
+        AutomodelPolicyWorkerImpl._prepare_checkpoint_engine_weight_send(worker)
     assert worker.model == "cuda_model"
-    DTensorPolicyWorkerV2Impl._finalize_checkpoint_engine_weight_send(worker)
+    AutomodelPolicyWorkerImpl._finalize_checkpoint_engine_weight_send(worker)
 
     assert worker.model == "cpu_model"
     assert calls == [("cuda", "cpu_model"), ("cpu", "cuda_model")]

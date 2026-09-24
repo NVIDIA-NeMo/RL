@@ -265,7 +265,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
             reject_dtensor_v1(config["dtensor_cfg"], "policy.dtensor_cfg")
             worker_builder_cls_fqn = resolve_policy_worker_cls(
-                "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2",
+                "nemo_rl.models.policy.workers.automodel_policy_worker.AutomodelPolicyWorker",
                 config,
             )
             if "TORCH_CUDA_ARCH_LIST" not in os.environ:

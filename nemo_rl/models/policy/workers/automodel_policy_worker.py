@@ -188,7 +188,7 @@ def _maybe_adapt_tensor_to_hf(
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
-class DTensorPolicyWorkerV2Impl(
+class AutomodelPolicyWorkerImpl(
     TQWorkerMixin,
     DTensorCheckpointEngineSendMixin,
     PolicyCheckpointEngineMixin,
@@ -225,7 +225,7 @@ class DTensorPolicyWorkerV2Impl(
         init_reference_model: bool = True,
         **kwargs: Any,
     ):
-        """Initialize the DTensorPolicyWorkerV2."""
+        """Initialize the AutomodelPolicyWorker."""
         # Apply TE patch until TE is upgraded to 2.10.0
         apply_transformer_engine_patch()
 
@@ -261,7 +261,7 @@ class DTensorPolicyWorkerV2Impl(
             config["dtensor_cfg"].get("lora_cfg", {}).get("enabled", False)
         )
 
-        print(f"Initializing DTensorPolicyWorkerV2 with is_vlm={self.is_vlm}")
+        print(f"Initializing AutomodelPolicyWorker with is_vlm={self.is_vlm}")
 
         # Initialize checkpoint manager
         self.checkpoint_manager: Optional[AutomodelCheckpointManager] = None
@@ -404,7 +404,7 @@ class DTensorPolicyWorkerV2Impl(
         """Record the rollout engine's TP size for later use in ``stream_weights_via_http``."""
         self._rollout_num_gpus_per_engine = num_gpus_per_engine
 
-    @wrap_with_nvtx_name("dtensor_policy_worker_v2/train")
+    @wrap_with_nvtx_name("automodel_policy_worker/train")
     def train(
         self,
         data: BatchedDataDict[Any],
@@ -582,7 +582,7 @@ class DTensorPolicyWorkerV2Impl(
             self.timer.stop("train")
             return metrics
 
-    @wrap_with_nvtx_name("dtensor_policy_worker_v2/get_logprobs")
+    @wrap_with_nvtx_name("automodel_policy_worker/get_logprobs")
     def get_logprobs(
         self, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
     ) -> BatchedDataDict[LogprobOutputSpec]:
@@ -674,7 +674,7 @@ class DTensorPolicyWorkerV2Impl(
         self.timer.stop("get_logprobs")
         return return_data
 
-    @wrap_with_nvtx_name("dtensor_policy_worker_v2/score")
+    @wrap_with_nvtx_name("automodel_policy_worker/score")
     def score(self, data: BatchedDataDict) -> BatchedDataDict[ScoreOutputSpec]:
         global_batch_size = min(self.cfg["batch_size"], data.size)
 
@@ -737,7 +737,7 @@ class DTensorPolicyWorkerV2Impl(
         )
         return return_data
 
-    @wrap_with_nvtx_name("dtensor_policy_worker_v2/get_topk_logits")
+    @wrap_with_nvtx_name("automodel_policy_worker/get_topk_logits")
     def get_topk_logits(
         self,
         data: BatchedDataDict[Any],
@@ -1090,13 +1090,13 @@ class DTensorPolicyWorkerV2Impl(
         margin: float = 1.05,
         include_q: bool = False,
     ) -> dict[str, Any]:
-        """Placeholder for FP8 Q/K/V scale calibration, not implemented for DTensorPolicyWorkerV2."""
+        """Placeholder for FP8 Q/K/V scale calibration, not implemented for AutomodelPolicyWorker."""
         raise NotImplementedError(
-            "calibrate_qkv_fp8_scales is not implemented for DTensorPolicyWorkerV2"
+            "calibrate_qkv_fp8_scales is not implemented for AutomodelPolicyWorker"
         )
 
     @torch.no_grad()
-    @wrap_with_nvtx_name("dtensor_policy_worker_v2/stream_weights_via_ipc_zmq")
+    @wrap_with_nvtx_name("automodel_policy_worker/stream_weights_via_ipc_zmq")
     def stream_weights_via_ipc_zmq(
         self,
         buffer_size_bytes: int = 0,
@@ -1125,7 +1125,7 @@ class DTensorPolicyWorkerV2Impl(
         )
 
     @torch.no_grad()
-    @wrap_with_nvtx_name("dtensor_policy_worker_v2/update_weights_to_sglang_colocated")
+    @wrap_with_nvtx_name("automodel_policy_worker/update_weights_to_sglang_colocated")
     def update_weights_to_sglang_colocated(
         self,
         *,
@@ -1243,7 +1243,7 @@ class DTensorPolicyWorkerV2Impl(
         if self.cpu_offload:
             self.model = self.move_to_cpu(self.model)
 
-    @wrap_with_nvtx_name("dtensor_policy_worker_v2/prepare_for_lp_inference")
+    @wrap_with_nvtx_name("automodel_policy_worker/prepare_for_lp_inference")
     def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
         """Put the model in eval mode for logprob inference.
 
@@ -1274,7 +1274,7 @@ class DTensorPolicyWorkerV2Impl(
         gc.collect()
         torch.cuda.empty_cache()
 
-    @wrap_with_nvtx_name("dtensor_policy_worker_v2/prepare_for_training")
+    @wrap_with_nvtx_name("automodel_policy_worker/prepare_for_training")
     def prepare_for_training(self, *args, **kwargs) -> None:
         # onload models and optimizer state to cuda
         if not self.cpu_offload:
@@ -1302,7 +1302,7 @@ class DTensorPolicyWorkerV2Impl(
         torch.cuda.empty_cache()
 
     @torch.no_grad()
-    @wrap_with_nvtx_name("dtensor_policy_worker_v2/offload_before_refit")
+    @wrap_with_nvtx_name("automodel_policy_worker/offload_before_refit")
     def offload_before_refit(self) -> None:
         """Offload the optimizer to the CPU."""
         torch.randn(1).cuda()  # wake up torch allocator
@@ -1313,7 +1313,7 @@ class DTensorPolicyWorkerV2Impl(
         torch.cuda.empty_cache()
 
     @torch.no_grad()
-    @wrap_with_nvtx_name("dtensor_policy_worker_v2/offload_after_refit")
+    @wrap_with_nvtx_name("automodel_policy_worker/offload_after_refit")
     def offload_after_refit(self) -> None:
         """Offload as much as possible on the CPU."""
         self.model = self.move_to_cpu(self.model)
@@ -1432,7 +1432,7 @@ class DTensorPolicyWorkerV2Impl(
 
 
 @ray.remote(
-    runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker_v2")
+    runtime_env=get_runtime_env_for_policy_worker("automodel_policy_worker")
 )  # pragma: no cover
-class DTensorPolicyWorkerV2(DTensorPolicyWorkerV2Impl):
+class AutomodelPolicyWorker(AutomodelPolicyWorkerImpl):
     pass

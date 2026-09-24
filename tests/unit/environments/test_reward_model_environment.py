@@ -78,7 +78,7 @@ def reward_model_env():
     env_actor = None
     try:
         assert ray.is_initialized()
-        reward_model_py_executable_class = "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2"
+        reward_model_py_executable_class = "nemo_rl.models.policy.workers.automodel_policy_worker.AutomodelPolicyWorker"
         env_actor = RewardModelEnvironment.options(  # type: ignore # it's wrapped with ray.remote
             runtime_env={
                 "py_executable": get_actor_python_env(reward_model_py_executable_class),

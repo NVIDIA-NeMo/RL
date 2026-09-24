@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""End-to-end tests for `DTensorValueWorkerV2` via the `Value` wrapper.
+"""End-to-end tests for `AutomodelValueWorker` via the `Value` wrapper.
 
 Worker-level tests use a tiny Qwen2 model on a small Ray cluster, mirroring
 `test_megatron_value_worker.py`. They cover:
@@ -52,7 +52,7 @@ pytestmark = pytest.mark.automodel
 
 
 def test_right_shift_values_aligns_value_predictions_to_state_tokens():
-    from nemo_rl.models.value.workers.dtensor_value_worker_v2 import right_shift_values
+    from nemo_rl.models.value.workers.automodel_value_worker import right_shift_values
 
     values = torch.tensor(
         [
@@ -74,7 +74,7 @@ def test_right_shift_values_aligns_value_predictions_to_state_tokens():
 
 
 def test_right_shift_loss_wrapper_shifts_logits_and_delegates_attributes():
-    from nemo_rl.models.value.workers.dtensor_value_worker_v2 import (
+    from nemo_rl.models.value.workers.automodel_value_worker import (
         RightShiftLossWrapper,
     )
 
@@ -175,12 +175,12 @@ def _create_value_test_config(
 
 
 def test_value_worker_init_rejects_cp_scoring_before_setup(monkeypatch):
-    from nemo_rl.models.value.workers import dtensor_value_worker_v2
+    from nemo_rl.models.value.workers import automodel_value_worker
 
     config = _create_value_test_config(model_name="unused", cp=2)
     apply_transformer_engine_patch = MagicMock()
     monkeypatch.setattr(
-        dtensor_value_worker_v2,
+        automodel_value_worker,
         "apply_transformer_engine_patch",
         apply_transformer_engine_patch,
     )
@@ -189,7 +189,7 @@ def test_value_worker_init_rejects_cp_scoring_before_setup(monkeypatch):
         NotImplementedError,
         match=r"get_values\(\) scoring path does not support context parallelism",
     ):
-        dtensor_value_worker_v2.DTensorValueWorkerV2Impl(
+        automodel_value_worker.AutomodelValueWorkerImpl(
             config=config,
             tokenizer=MagicMock(),
         )
