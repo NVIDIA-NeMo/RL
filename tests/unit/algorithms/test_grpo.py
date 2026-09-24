@@ -2803,6 +2803,7 @@ def test_dapo_dynamic_sampling_discard_slice_preserves_reward_alignment(
         dynamic_sampling_num_gen_batches=1,
         master_config=master_config,
         timer=Timer(),
+        is_trivial_prompt_distribution=std == 0,
     )
 
     # 5 kept >= 4 needed, so the first round already completes the batch;
@@ -2860,6 +2861,7 @@ def test_dapo_dynamic_sampling_cache_preserves_reward_alignment(
         dynamic_sampling_num_gen_batches=1,
         master_config=master_config,
         timer=timer,
+        is_trivial_prompt_distribution=std1 == 0,
     )
     assert is_batch_complete is False  # 3 kept < 6 needed
 
@@ -2873,6 +2875,7 @@ def test_dapo_dynamic_sampling_cache_preserves_reward_alignment(
         master_config=master_config,
         timer=timer,
         batch_cache=batch_cache,
+        is_trivial_prompt_distribution=std2 == 0,
     )
 
     assert is_batch_complete is True
@@ -2910,12 +2913,12 @@ def test_grpo_train_this_round_unfiltered_rewards_usage():
       raise inside `log_batched_dict_as_jsonl` whenever the two sizes
       differ (over-generation or a multi-round accumulation).
 
-    grpo_train builds both of these inline, so this test locks the two
-    literals in place via source inspection rather than invoking the
-    function, which would require standing up rollout, policy, and
-    generation actors.
+    grpo_train delegates to _grpo_train_impl, which builds both of these
+    inline, so this test locks the two literals in place via source
+    inspection rather than invoking the function, which would require
+    standing up rollout, policy, and generation actors.
     """
-    source = inspect.getsource(grpo_train)
+    source = inspect.getsource(grpo_mod._grpo_train_impl)
     assert 'metrics["reward"] = this_round_unfiltered_rewards.numpy()' in source, (
         "grpo_train no longer sources metrics['reward'] from the reward "
         "captured before dynamic_sampling filtering; it would silently "
