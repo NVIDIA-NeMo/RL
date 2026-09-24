@@ -371,7 +371,6 @@ def student_next_token_ce(
     logits: torch.Tensor,
     *,
     input_ids: torch.Tensor,
-    seq_index: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Per-token next-token cross-entropy ``[B, T-1]`` on the student.
 
@@ -381,9 +380,7 @@ def student_next_token_ce(
     convention the KL terms use.
     """
     if isinstance(logits, DTensor):
-        next_token_logprobs = get_logprobs_from_vocab_parallel_logits(
-            logits, input_ids, seq_index=seq_index
-        )
+        next_token_logprobs = get_logprobs_from_vocab_parallel_logits(logits, input_ids)
         return -next_token_logprobs
     shift_logits = logits[:, :-1].contiguous()
     shift_labels = input_ids[:, 1:].contiguous()
