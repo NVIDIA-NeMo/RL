@@ -49,12 +49,13 @@ import math
 import os
 import shutil
 import statistics
+import sys
 import threading
 import time
 import uuid
 import warnings
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -233,6 +234,20 @@ class _PendingGymCheckpointAbort:
     """An unpublished Gym checkpoint whose admission fence still needs abort."""
 
     checkpoint_id: str
+
+
+@dataclass
+class _RolloutSnapshotPublication:
+    """One temporary snapshot that must either publish or abort Gym."""
+
+    checkpoint_id: str
+    tmp_path: Path
+    gym_checkpoint: Optional[GymCheckpointCommitResult] = None
+    published: bool = False
+
+    def mark_published(self) -> None:
+        """Record that the atomic snapshot rename completed."""
+        self.published = True
 
 
 class _GymCheckpointReleasePendingError(OSError):
@@ -657,6 +672,11 @@ class SingleControllerActor:
         )
         self._gym_completed_acknowledgement_lock = asyncio.Lock()
         self._gym_completed_acknowledgement_task: Optional[asyncio.Task[None]] = None
+        self._rollout_manager.bind_gym_acknowledgement_sink(
+            self._schedule_completed_gym_acknowledgement_drain
+            if self._gym_participant_checkpointing_enabled
+            else None
+        )
         self._pending_gym_checkpoint_abort: Optional[_PendingGymCheckpointAbort]
         self._pending_gym_checkpoint_abort = None
         self._pending_gym_checkpoint_release: Optional[_PendingGymCheckpointRelease]
@@ -1862,34 +1882,19 @@ class SingleControllerActor:
                 return 0
             payload = [
                 GymCompletedExecution(
-                    receipt={
-                        "rollout_id": rollout_id,
-                        "attempt_index": attempt_index,
-                        "execution_generation": execution_generation,
-                        "result_identity": result_identity,
-                        "result_digest": result_digest,
-                        "manifest_capture_key": manifest_capture_key,
-                        "terminal_model_call_id": terminal_model_call_id,
-                    },
-                    agent_name=agent_name,
+                    receipt=acknowledgement.receipt,
+                    agent_name=acknowledgement.agent_name,
                 ).model_dump(mode="json")
-                for (
-                    rollout_id,
-                    attempt_index,
-                    agent_name,
-                    execution_generation,
-                    result_identity,
-                    result_digest,
-                    manifest_capture_key,
-                    terminal_model_call_id,
-                ) in pending
+                for acknowledgement in pending
             ]
             await self._nemo_gym_checkpoint_actor().acknowledge_completed_executions.remote(
                 payload
             )
-            # The HTTP call deliberately runs without a mutation cut. If a
-            # checkpoint lands after Gym accepts the idempotent ACK but before
-            # this removal, it preserves the obligation and safely retries it.
+            # The HTTP call deliberately runs without a mutation cut. Within
+            # this live Gym process, a checkpoint racing between remote ACK
+            # acceptance and local removal may retry the receipt idempotently.
+            # Snapshot publication separately requires this durable outbox to
+            # be empty, so no unresolved ACK obligation crosses a restart.
             async with self._data_plane_checkpoint_barrier.mutation(
                 "gym_acknowledgements"
             ) as cut:
@@ -2383,11 +2388,6 @@ class SingleControllerActor:
                                     prompt,
                                     target_step=target_step,
                                     inflight_registry=self._inflight_by_group_id,
-                                    on_gym_acknowledgements_ready=(
-                                        self._schedule_completed_gym_acknowledgement_drain
-                                        if self._gym_participant_checkpointing_enabled
-                                        else None
-                                    ),
                                 )
                             else:
                                 request = await self._rollout_manager.generate_for_finalization(
@@ -2395,11 +2395,6 @@ class SingleControllerActor:
                                     target_step=target_step,
                                     inflight_registry=self._inflight_by_group_id,
                                     lineage_group_id=lineage_group_id,
-                                    on_gym_acknowledgements_ready=(
-                                        self._schedule_completed_gym_acknowledgement_drain
-                                        if self._gym_participant_checkpointing_enabled
-                                        else None
-                                    ),
                                 )
                             if not inflight_count_released:
                                 self._inflight_rollouts -= 1
@@ -4447,258 +4442,294 @@ class SingleControllerActor:
             lambda: sum(path.stat().st_size for path in written_paths)
         )
 
+    @contextlib.asynccontextmanager
+    async def _rollout_snapshot_publication(
+        self,
+        publication: _RolloutSnapshotPublication,
+    ) -> AsyncIterator[_RolloutSnapshotPublication]:
+        """Abort every prepared Gym cut that does not publish atomically."""
+        try:
+            yield publication
+        finally:
+            if not publication.published:
+                save_error = sys.exception()
+                tmp_cleanup_error: Optional[BaseException] = None
+                if publication.tmp_path.exists():
+                    try:
+                        await asyncio.to_thread(
+                            partial(shutil.rmtree, publication.tmp_path)
+                        )
+                    except BaseException as error:
+                        tmp_cleanup_error = error
+
+                if publication.gym_checkpoint is not None:
+                    try:
+                        await self._abort_prepared_gym_checkpoint(
+                            publication.checkpoint_id
+                        )
+                    except _GymCheckpointAbortPendingError as abort_error:
+                        if save_error is not None:
+                            abort_error.add_note(
+                                "Checkpoint save failure that required the pending "
+                                f"abort: {type(save_error).__name__}: {save_error}"
+                            )
+                        if tmp_cleanup_error is not None:
+                            abort_error.add_note(
+                                "Temporary snapshot cleanup also failed: "
+                                f"{type(tmp_cleanup_error).__name__}: "
+                                f"{tmp_cleanup_error}"
+                            )
+                        raise
+                    except BaseException as abort_error:
+                        cleanup_errors = [
+                            error
+                            for error in (save_error, tmp_cleanup_error, abort_error)
+                            if error is not None
+                        ]
+                        if len(cleanup_errors) == 1:
+                            raise
+                        raise BaseExceptionGroup(
+                            "rollout checkpoint failed and Gym participant admission "
+                            "could not be restored",
+                            cleanup_errors,
+                        )
+
+                if tmp_cleanup_error is not None:
+                    if save_error is None:
+                        raise tmp_cleanup_error
+                    raise BaseExceptionGroup(
+                        "rollout checkpoint and temporary snapshot cleanup failed",
+                        [save_error, tmp_cleanup_error],
+                    )
+
     async def _save_rollout_checkpoint(
         self,
         *,
         force: bool = False,
-        trainer_anchor: Optional[Path] = None,
     ) -> _RolloutCheckpointSaveResult:
-        """Publish one rollout snapshot anchored to matching trainer state.
+        """Serialize and publish one periodic rollout snapshot."""
+        async with self._checkpoint_save_lock:
+            return await self._save_rollout_checkpoint_locked(
+                force=force,
+                trainer_anchor=None,
+            )
+
+    async def _save_rollout_checkpoint_locked(
+        self,
+        *,
+        force: bool,
+        trainer_anchor: Optional[Path],
+    ) -> _RolloutCheckpointSaveResult:
+        """Publish one rollout snapshot while the checkpoint lock is held.
 
         Periodic callers resolve an already-published trainer directory. A full
         trainer save publishes its trainer/data-plane tier first, then passes
         that durable directory while retaining the common checkpoint lock.
         """
-        if trainer_anchor is not None and not self._checkpoint_save_lock.locked():
-            raise RuntimeError("trainer_anchor requires the checkpoint save lock")
-        save_guard = (
-            contextlib.nullcontext()
-            if trainer_anchor is not None
-            else self._checkpoint_save_lock
-        )
-        async with save_guard:
-            pending_abort = self._pending_gym_checkpoint_abort
-            if pending_abort is not None:
-                await self._abort_prepared_gym_checkpoint(pending_abort.checkpoint_id)
-            pending_release = self._pending_gym_checkpoint_release
-            if pending_release is not None:
-                await self._release_committed_gym_checkpoint(pending_release)
-                if (
-                    trainer_anchor is None
-                    and not pending_release.trainer_anchored
-                    and pending_release.snapshot_path.is_dir()
-                ):
+        pending_abort = self._pending_gym_checkpoint_abort
+        if pending_abort is not None:
+            await self._abort_prepared_gym_checkpoint(pending_abort.checkpoint_id)
+        pending_release = self._pending_gym_checkpoint_release
+        if pending_release is not None:
+            await self._release_committed_gym_checkpoint(pending_release)
+            if (
+                trainer_anchor is None
+                and not pending_release.trainer_anchored
+                and pending_release.snapshot_path.is_dir()
+            ):
+                print(
+                    "rollout checkpoint participant release completed: "
+                    f"{pending_release.snapshot_path}",
+                    flush=True,
+                )
+                return _RolloutCheckpointSaveResult(
+                    saved=True,
+                    reason="completed",
+                )
+        if self._optimizer_commit_in_progress:
+            return _RolloutCheckpointSaveResult(
+                saved=False,
+                reason="optimizer_commit_in_progress",
+            )
+        if (
+            not force
+            and not self._gym_participant_checkpointing_enabled
+            and self._last_rollout_snapshot_mutation_version
+            == self._data_plane_checkpoint_barrier.mutation_version
+        ):
+            return _RolloutCheckpointSaveResult(
+                saved=False,
+                reason="no_data_plane_mutations",
+            )
+
+        save_started = time.monotonic()
+        await asyncio.to_thread(self._checkpointer.finalize_pending)
+        if trainer_anchor is not None:
+            if self._train_steps == 0:
+                raise RuntimeError(
+                    "a trainer-boundary rollout snapshot requires a completed step"
+                )
+            anchor = Path(trainer_anchor)
+            if not anchor.is_dir():
+                raise FileNotFoundError(
+                    f"trainer-boundary rollout snapshot anchor is missing: {anchor}"
+                )
+            snapshot_fingerprint = None
+        elif self._train_steps == 0:
+            if self._trainer_version != 0:
+                raise RuntimeError(
+                    "bootstrap rollout snapshot requires trainer version zero"
+                )
+            if self._bootstrap_identity is None:
+                raise RuntimeError("rollout snapshotting requires a bootstrap identity")
+            anchor = await asyncio.to_thread(
+                ensure_bootstrap_anchor,
+                self._checkpointer.checkpoint_dir,
+                identity=self._bootstrap_identity,
+            )
+            snapshot_fingerprint = self._bootstrap_identity.fingerprint()
+        else:
+            if self._trainer_version != self._train_steps:
+                raise RuntimeError(
+                    "rollout snapshot trainer identity is ambiguous: "
+                    f"step={self._train_steps}, "
+                    f"trainer_version={self._trainer_version}"
+                )
+            anchor = self._checkpointer.checkpoint_dir / f"step_{self._train_steps}"
+            if not anchor.is_dir():
+                skip_key = (self._train_steps, self._trainer_version)
+                if self._last_missing_rollout_snapshot_anchor != skip_key:
                     print(
-                        "rollout checkpoint participant release completed: "
-                        f"{pending_release.snapshot_path}",
+                        "rollout checkpoint skipped: matching trainer "
+                        f"checkpoint is not durable yet: {anchor}",
                         flush=True,
                     )
-                    return _RolloutCheckpointSaveResult(
-                        saved=True,
-                        reason="completed",
-                    )
-            if self._optimizer_commit_in_progress:
+                self._last_missing_rollout_snapshot_anchor = skip_key
                 return _RolloutCheckpointSaveResult(
                     saved=False,
-                    reason="optimizer_commit_in_progress",
+                    reason="missing_trainer_anchor",
                 )
-            if (
-                not force
-                and not self._gym_participant_checkpointing_enabled
-                and self._last_rollout_snapshot_mutation_version
-                == self._data_plane_checkpoint_barrier.mutation_version
-            ):
-                return _RolloutCheckpointSaveResult(
-                    saved=False,
-                    reason="no_data_plane_mutations",
-                )
-
-            save_started = time.monotonic()
-            await asyncio.to_thread(self._checkpointer.finalize_pending)
-            if trainer_anchor is not None:
-                if self._train_steps == 0:
-                    raise RuntimeError(
-                        "a trainer-boundary rollout snapshot requires a completed step"
-                    )
-                anchor = Path(trainer_anchor)
-                if not anchor.is_dir():
-                    raise FileNotFoundError(
-                        f"trainer-boundary rollout snapshot anchor is missing: {anchor}"
-                    )
-                snapshot_fingerprint = None
-            elif self._train_steps == 0:
-                if self._trainer_version != 0:
-                    raise RuntimeError(
-                        "bootstrap rollout snapshot requires trainer version zero"
-                    )
-                if self._bootstrap_identity is None:
-                    raise RuntimeError(
-                        "rollout snapshotting requires a bootstrap identity"
-                    )
-                anchor = await asyncio.to_thread(
-                    ensure_bootstrap_anchor,
+            try:
+                await asyncio.to_thread(
+                    prune_bootstrap_snapshots,
                     self._checkpointer.checkpoint_dir,
-                    identity=self._bootstrap_identity,
+                    durable_trainer_checkpoint=anchor,
                 )
-                snapshot_fingerprint = self._bootstrap_identity.fingerprint()
-            else:
-                if self._trainer_version != self._train_steps:
-                    raise RuntimeError(
-                        "rollout snapshot trainer identity is ambiguous: "
-                        f"step={self._train_steps}, "
-                        f"trainer_version={self._trainer_version}"
-                    )
-                anchor = self._checkpointer.checkpoint_dir / f"step_{self._train_steps}"
-                if not anchor.is_dir():
-                    skip_key = (self._train_steps, self._trainer_version)
-                    if self._last_missing_rollout_snapshot_anchor != skip_key:
-                        print(
-                            "rollout checkpoint skipped: matching trainer "
-                            f"checkpoint is not durable yet: {anchor}",
-                            flush=True,
-                        )
-                    self._last_missing_rollout_snapshot_anchor = skip_key
-                    return _RolloutCheckpointSaveResult(
-                        saved=False,
-                        reason="missing_trainer_anchor",
-                    )
-                try:
-                    await asyncio.to_thread(
-                        prune_bootstrap_snapshots,
-                        self._checkpointer.checkpoint_dir,
-                        durable_trainer_checkpoint=anchor,
-                    )
-                except OSError as error:
-                    warnings.warn(
-                        "Failed to prune obsolete bootstrap rollout snapshots: "
-                        f"{type(error).__name__}: {error}",
-                        stacklevel=2,
-                    )
-                snapshot_fingerprint = None
+            except OSError as error:
+                warnings.warn(
+                    "Failed to prune obsolete bootstrap rollout snapshots: "
+                    f"{type(error).__name__}: {error}",
+                    stacklevel=2,
+                )
+            snapshot_fingerprint = None
 
-            expected_train_step = self._train_steps
-            expected_trainer_version = self._trainer_version
-            tmp_path, final_path, snapshot_sequence = await asyncio.to_thread(
-                prepare_snapshot_paths, anchor
-            )
-            gym_checkpoint: Optional[GymCheckpointCommitResult] = None
-            gym_staging_keys: set[str] = set()
-            # A failed attempt removes its temporary directory, so its numeric
-            # snapshot sequence can be reused. Gym retires every completed or
-            # aborted control ID, however; add a nonce so the next attempt is not
-            # rejected as a stale coordinator.
-            checkpoint_id = (
-                f"rollout-step-{expected_train_step}-snapshot-{snapshot_sequence}-"
-                f"{uuid.uuid4().hex}"
-            )
+        expected_train_step = self._train_steps
+        expected_trainer_version = self._trainer_version
+        tmp_path, final_path, snapshot_sequence = await asyncio.to_thread(
+            prepare_snapshot_paths, anchor
+        )
+        # A failed attempt removes its temporary directory, so its numeric
+        # snapshot sequence can be reused. Gym retires every completed or
+        # aborted control ID, however; add a nonce so the next attempt is not
+        # rejected as a stale coordinator.
+        checkpoint_id = (
+            f"rollout-step-{expected_train_step}-snapshot-{snapshot_sequence}-"
+            f"{uuid.uuid4().hex}"
+        )
+        publication = _RolloutSnapshotPublication(
+            checkpoint_id=checkpoint_id,
+            tmp_path=tmp_path,
+        )
+        gym_checkpoint: Optional[GymCheckpointCommitResult] = None
+        gym_staging_keys: set[str] = set()
+        trainer_state_changed = False
+        snapshot_epoch: Optional[int] = None
+        snapshot_cut: Optional[_RolloutCheckpointCut] = None
+        async with self._rollout_snapshot_publication(publication):
             if self._gym_participant_checkpointing_enabled:
-                try:
-                    gym_checkpoint = await self._prepare_and_commit_gym_checkpoint(
+                publication.gym_checkpoint = (
+                    await self._prepare_and_commit_gym_checkpoint(
                         checkpoint_id,
                         tmp_path,
                     )
-                except BaseException:
-                    if tmp_path.exists():
-                        await asyncio.to_thread(partial(shutil.rmtree, tmp_path))
-                    raise
-            gym_abort_attempted = False
-            trainer_state_changed = False
-            snapshot_epoch: Optional[int] = None
-            snapshot_cut: Optional[_RolloutCheckpointCut] = None
-            try:
-                if gym_checkpoint is not None:
-                    gym_staging_keys = await asyncio.to_thread(
-                        gym_checkpoint_staging_keys,
-                        tmp_path,
-                        gym_checkpoint,
-                    )
-                barrier_requested = time.monotonic()
-                async with self._data_plane_checkpoint_barrier.checkpoint() as cut:
-                    barrier_acquired = time.monotonic()
-                    if (
-                        self._optimizer_commit_in_progress
-                        or self._train_steps != expected_train_step
-                        or self._trainer_version != expected_trainer_version
-                    ):
-                        trainer_state_changed = True
-                    else:
-                        snapshot_epoch = self._current_epoch
-                        snapshot_cut = await self._capture_rollout_checkpoint_cut(
-                            cut,
-                            tmp_path,
-                            gym_staging_keys=gym_staging_keys,
-                        )
-                barrier_released = time.monotonic()
-
-                if trainer_state_changed:
-                    await asyncio.to_thread(partial(shutil.rmtree, tmp_path))
-                    if gym_checkpoint is not None:
-                        gym_abort_attempted = True
-                        await self._abort_prepared_gym_checkpoint(checkpoint_id)
-                    return _RolloutCheckpointSaveResult(
-                        saved=False,
-                        reason="trainer_state_changed",
-                    )
-                if snapshot_cut is None or snapshot_epoch is None:
-                    raise AssertionError(
-                        "rollout checkpoint cut was not captured after trainer "
-                        "state validation"
-                    )
-
-                sidecar_save_started = time.monotonic()
-                controller_sidecar_bytes = (
-                    await self._write_rollout_checkpoint_sidecars(
-                        tmp_path,
-                        snapshot_cut,
-                    )
                 )
-                manifest = RolloutSnapshotManifest(
-                    schema_version=ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
-                    base_train_step=expected_train_step,
-                    trainer_version=expected_trainer_version,
-                    current_epoch=snapshot_epoch,
-                    sampler_dispatch_index=snapshot_cut.sampler_dispatch_index,
-                    mutation_version=snapshot_cut.mutation_version,
-                    rolled_back_train_group_count=(
-                        snapshot_cut.rolled_back_train_group_count
-                    ),
-                    bootstrap_fingerprint=snapshot_fingerprint,
-                    gym_topology_fingerprint=(
-                        self._gym_checkpoint_topology.fingerprint()
-                        if self._gym_checkpoint_topology is not None
-                        else None
-                    ),
-                    gym_checkpoint=gym_checkpoint,
-                )
-                manifest_text = (
-                    json.dumps(manifest.to_dict(), sort_keys=True, indent=2) + "\n"
-                )
-                await asyncio.to_thread(
-                    (tmp_path / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).write_text,
-                    manifest_text,
-                )
-                controller_sidecar_bytes += len(manifest_text.encode())
-                sidecar_save_seconds = time.monotonic() - sidecar_save_started
-                snapshot_commit_started = time.monotonic()
-                await asyncio.to_thread(
-                    commit_snapshot,
+            gym_checkpoint = publication.gym_checkpoint
+            if gym_checkpoint is not None:
+                gym_staging_keys = await asyncio.to_thread(
+                    gym_checkpoint_staging_keys,
                     tmp_path,
-                    final_path,
-                    keep_latest_k=(
-                        self._master_config.rollout_checkpointing.keep_latest_k
-                    ),
+                    gym_checkpoint,
                 )
-                snapshot_commit_seconds = time.monotonic() - snapshot_commit_started
-            except BaseException as save_error:
-                if tmp_path.exists():
-                    await asyncio.to_thread(partial(shutil.rmtree, tmp_path))
-                if gym_checkpoint is not None and not gym_abort_attempted:
-                    try:
-                        await self._abort_prepared_gym_checkpoint(checkpoint_id)
-                    except _GymCheckpointAbortPendingError as abort_error:
-                        abort_error.add_note(
-                            "Checkpoint save failure that required the pending "
-                            f"abort: {type(save_error).__name__}: {save_error}"
-                        )
-                        raise
-                    except BaseException as abort_error:
-                        raise BaseExceptionGroup(
-                            "rollout checkpoint failed and Gym participant admission "
-                            "could not be restored",
-                            [save_error, abort_error],
-                        )
-                raise
+            barrier_requested = time.monotonic()
+            async with self._data_plane_checkpoint_barrier.checkpoint() as cut:
+                barrier_acquired = time.monotonic()
+                if (
+                    self._optimizer_commit_in_progress
+                    or self._train_steps != expected_train_step
+                    or self._trainer_version != expected_trainer_version
+                ):
+                    trainer_state_changed = True
+                else:
+                    snapshot_epoch = self._current_epoch
+                    snapshot_cut = await self._capture_rollout_checkpoint_cut(
+                        cut,
+                        tmp_path,
+                        gym_staging_keys=gym_staging_keys,
+                    )
+            barrier_released = time.monotonic()
 
+            if trainer_state_changed:
+                return _RolloutCheckpointSaveResult(
+                    saved=False,
+                    reason="trainer_state_changed",
+                )
+            if snapshot_cut is None or snapshot_epoch is None:
+                raise AssertionError(
+                    "rollout checkpoint cut was not captured after trainer "
+                    "state validation"
+                )
+
+            sidecar_save_started = time.monotonic()
+            controller_sidecar_bytes = await self._write_rollout_checkpoint_sidecars(
+                tmp_path,
+                snapshot_cut,
+            )
+            manifest = RolloutSnapshotManifest(
+                schema_version=ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
+                base_train_step=expected_train_step,
+                trainer_version=expected_trainer_version,
+                current_epoch=snapshot_epoch,
+                sampler_dispatch_index=snapshot_cut.sampler_dispatch_index,
+                mutation_version=snapshot_cut.mutation_version,
+                rolled_back_train_group_count=(
+                    snapshot_cut.rolled_back_train_group_count
+                ),
+                bootstrap_fingerprint=snapshot_fingerprint,
+                gym_topology_fingerprint=(
+                    self._gym_checkpoint_topology.fingerprint()
+                    if self._gym_checkpoint_topology is not None
+                    else None
+                ),
+                gym_checkpoint=gym_checkpoint,
+            )
+            manifest_text = (
+                json.dumps(manifest.to_dict(), sort_keys=True, indent=2) + "\n"
+            )
+            await asyncio.to_thread(
+                (tmp_path / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).write_text,
+                manifest_text,
+            )
+            controller_sidecar_bytes += len(manifest_text.encode())
+            sidecar_save_seconds = time.monotonic() - sidecar_save_started
+            snapshot_commit_started = time.monotonic()
+            await asyncio.to_thread(
+                commit_snapshot,
+                tmp_path,
+                final_path,
+                keep_latest_k=(self._master_config.rollout_checkpointing.keep_latest_k),
+            )
+            snapshot_commit_seconds = time.monotonic() - snapshot_commit_started
+            publication.mark_published()
             self._last_rollout_snapshot_mutation_version = snapshot_cut.mutation_version
             self._last_missing_rollout_snapshot_anchor = None
             if gym_checkpoint is not None:
@@ -4722,44 +4753,44 @@ class SingleControllerActor:
                         stacklevel=2,
                     )
 
-            save_completed = time.monotonic()
-            checkpoint_metrics = {
-                "snapshot_sequence": float(snapshot_sequence),
-                "total_save_seconds": save_completed - save_started,
-                "tq_save_seconds": snapshot_cut.tq_save_seconds,
-                "barrier_wait_seconds": barrier_acquired - barrier_requested,
-                "exclusive_hold_seconds": barrier_released - barrier_acquired,
-                "sidecar_save_seconds": sidecar_save_seconds,
-                "snapshot_commit_seconds": snapshot_commit_seconds,
-                "replay_groups": float(
-                    len(snapshot_cut.replay_metadata["groups"])
-                    if snapshot_cut.replay_metadata is not None
-                    else 0
-                ),
-                "ledger_groups": float(snapshot_cut.rollout_recovery_group_count or 0),
-                "replay_rows": float(snapshot_cut.replay_row_count),
-                "staging_rows": float(snapshot_cut.staging_row_count),
-                "snapshot_rows": float(
-                    snapshot_cut.replay_row_count + snapshot_cut.staging_row_count
-                ),
-                "controller_sidecar_bytes": float(controller_sidecar_bytes),
-            }
-            self._log_telemetry_metrics(
-                checkpoint_metrics,
-                step=expected_train_step,
-                prefix="timing/rollout_checkpoint",
-            )
-            print(
-                "rollout checkpoint save completed: "
-                f"{final_path} (step={expected_train_step}, "
-                f"trainer_version={expected_trainer_version}, "
-                f"ledger_groups={snapshot_cut.rollout_recovery_group_count or 0}, "
-                f"total_save_seconds={checkpoint_metrics['total_save_seconds']:.2f}, "
-                "exclusive_hold_seconds="
-                f"{checkpoint_metrics['exclusive_hold_seconds']:.2f})",
-                flush=True,
-            )
-            return _RolloutCheckpointSaveResult(saved=True, reason="completed")
+        save_completed = time.monotonic()
+        checkpoint_metrics = {
+            "snapshot_sequence": float(snapshot_sequence),
+            "total_save_seconds": save_completed - save_started,
+            "tq_save_seconds": snapshot_cut.tq_save_seconds,
+            "barrier_wait_seconds": barrier_acquired - barrier_requested,
+            "exclusive_hold_seconds": barrier_released - barrier_acquired,
+            "sidecar_save_seconds": sidecar_save_seconds,
+            "snapshot_commit_seconds": snapshot_commit_seconds,
+            "replay_groups": float(
+                len(snapshot_cut.replay_metadata["groups"])
+                if snapshot_cut.replay_metadata is not None
+                else 0
+            ),
+            "ledger_groups": float(snapshot_cut.rollout_recovery_group_count or 0),
+            "replay_rows": float(snapshot_cut.replay_row_count),
+            "staging_rows": float(snapshot_cut.staging_row_count),
+            "snapshot_rows": float(
+                snapshot_cut.replay_row_count + snapshot_cut.staging_row_count
+            ),
+            "controller_sidecar_bytes": float(controller_sidecar_bytes),
+        }
+        self._log_telemetry_metrics(
+            checkpoint_metrics,
+            step=expected_train_step,
+            prefix="timing/rollout_checkpoint",
+        )
+        print(
+            "rollout checkpoint save completed: "
+            f"{final_path} (step={expected_train_step}, "
+            f"trainer_version={expected_trainer_version}, "
+            f"ledger_groups={snapshot_cut.rollout_recovery_group_count or 0}, "
+            f"total_save_seconds={checkpoint_metrics['total_save_seconds']:.2f}, "
+            "exclusive_hold_seconds="
+            f"{checkpoint_metrics['exclusive_hold_seconds']:.2f})",
+            flush=True,
+        )
+        return _RolloutCheckpointSaveResult(saved=True, reason="completed")
 
     def _log_rollout_checkpoint_outcome(
         self,
@@ -5310,7 +5341,7 @@ class SingleControllerActor:
             )
             gym_snapshot_error: Optional[Exception] = None
             try:
-                boundary_snapshot = await self._save_rollout_checkpoint(
+                boundary_snapshot = await self._save_rollout_checkpoint_locked(
                     force=True,
                     trainer_anchor=durable_checkpoint_path,
                 )

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any
@@ -1141,14 +1141,8 @@ def test_actor_path_releases_generation_permit_before_finalization() -> None:
             *,
             target_step: int | None = None,
             inflight_registry: dict[str, tuple[asyncio.Task[None], int]] | None = None,
-            on_gym_acknowledgements_ready: Callable[[], None] | None = None,
         ) -> Any:
-            del (
-                prompt,
-                target_step,
-                inflight_registry,
-                on_gym_acknowledgements_ready,
-            )
+            del prompt, target_step, inflight_registry
             self.generated += 1
             if self.generated == 2:
                 self.two_generated.set()
@@ -1279,14 +1273,8 @@ def test_actor_finalization_discards_recovery_ledger_ownership(
             target_step: int | None,
             inflight_registry: dict[str, tuple[asyncio.Task[None], int]],
             lineage_group_id: str,
-            on_gym_acknowledgements_ready: Callable[[], None] | None = None,
         ) -> Any:
-            del (
-                prompt,
-                target_step,
-                inflight_registry,
-                on_gym_acknowledgements_ready,
-            )
+            del prompt, target_step, inflight_registry
             assert self.recovery_ledger.get_group(lineage_group_id)
             return SimpleNamespace(group_id=lineage_group_id)
 
@@ -1438,6 +1426,7 @@ def test_rollout_pump_writes_expected_tq_data(
         num_generations_per_prompt=num_generations,
         max_seq_len=max_seq_len,
         rollout_recovery_config=RolloutRecoveryConfig(),
+        gym_acknowledgement_sink=None,
         max_rollout_turns=max_rollout_turns,
         policy_generation=vllm_generation,
         use_nemo_gym=False,

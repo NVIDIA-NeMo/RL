@@ -113,6 +113,7 @@ from nemo_rl.environments.nemo_gym import NemoGymShardSet
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
+    PendingCompletedExecutionAcknowledgement,
     RolloutRecoveryLedger,
     RolloutAttemptStatus,
 )
@@ -525,6 +526,11 @@ class _FakeRolloutManager:
 
     def set_data_plane_checkpoint_barrier(self, barrier: Any) -> None:
         self.data_plane_checkpoint_barrier = barrier
+
+    def bind_gym_acknowledgement_sink(
+        self, on_ready: Optional[Callable[[], None]]
+    ) -> None:
+        self.gym_acknowledgements_ready = on_ready
 
     def set_weight_version(self, version: int) -> None:
         self.weight_versions.append(version)
@@ -1692,6 +1698,48 @@ class TestPeriodicRolloutCheckpoint:
             SetupTimingMetrics(),
         )
 
+    def test_periodic_saves_are_serialized_by_the_checkpoint_lock(
+        self, tmp_path: Path
+    ) -> None:
+        actor = self._actor(tmp_path)
+        first_entered = asyncio.Event()
+        release_first = asyncio.Event()
+        active = 0
+        max_active = 0
+        calls: list[tuple[bool, Path | None]] = []
+
+        async def save_locked(*, force: bool, trainer_anchor: Path | None) -> Any:
+            nonlocal active, max_active
+            calls.append((force, trainer_anchor))
+            active += 1
+            max_active = max(max_active, active)
+            try:
+                if len(calls) == 1:
+                    first_entered.set()
+                    await release_first.wait()
+            finally:
+                active -= 1
+            return MagicMock(saved=True, reason="completed")
+
+        actor._save_rollout_checkpoint_locked = save_locked
+
+        async def scenario() -> None:
+            first = asyncio.create_task(actor._save_rollout_checkpoint(force=True))
+            await asyncio.wait_for(first_entered.wait(), timeout=1.0)
+            second = asyncio.create_task(actor._save_rollout_checkpoint(force=False))
+            await asyncio.sleep(0)
+            assert calls == [(True, None)]
+            release_first.set()
+            await asyncio.gather(first, second)
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert max_active == 1
+        assert calls == [(True, None), (False, None)]
+
     def test_pre_step_snapshot_contains_only_rollout_state(self, tmp_path: Path):
         actor = self._actor(tmp_path)
         try:
@@ -2089,6 +2137,7 @@ class TestPeriodicRolloutCheckpoint:
         actor = self._actor(tmp_path)
         actor._gym_participant_checkpointing_enabled = True
         attempts = 0
+        received_payloads: list[list[dict[str, Any]]] = []
 
         async def acknowledge(executions: list[dict[str, Any]]) -> dict[str, Any]:
             nonlocal attempts
@@ -2097,6 +2146,7 @@ class TestPeriodicRolloutCheckpoint:
             async with actor._data_plane_checkpoint_barrier.checkpoint():
                 pass
             attempts += 1
+            received_payloads.append(executions)
             if attempts == 1:
                 raise OSError("temporary Gym control failure")
             return {"acknowledged": executions}
@@ -2107,28 +2157,40 @@ class TestPeriodicRolloutCheckpoint:
             )
         }
         pending = [
-            (
-                "group-7_g0",
-                0,
-                "test-agent",
-                1,
-                "result-group-7_g0-0",
-                "1" * 64,
-                None,
-                None,
+            PendingCompletedExecutionAcknowledgement(
+                rollout_id="group-7_g0",
+                attempt_index=0,
+                agent_name="test-agent",
+                execution_generation=1,
+                result_identity="result-group-7_g0-0",
+                result_digest="1" * 64,
             )
+        ]
+        expected_payload = [
+            {
+                "receipt": {
+                    "rollout_id": "group-7_g0",
+                    "attempt_index": 0,
+                    "execution_generation": 1,
+                    "result_identity": "result-group-7_g0-0",
+                    "result_digest": "1" * 64,
+                    "manifest_capture_key": None,
+                    "terminal_model_call_id": None,
+                },
+                "agent_name": "test-agent",
+            }
         ]
         state = {
             "schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
             "groups": [],
             "pending_completed_execution_acknowledgements": [
                 {
-                    "rollout_id": pending[0][0],
-                    "attempt_index": pending[0][1],
-                    "agent_name": pending[0][2],
-                    "execution_generation": pending[0][3],
-                    "result_identity": pending[0][4],
-                    "result_digest": pending[0][5],
+                    "rollout_id": pending[0].rollout_id,
+                    "attempt_index": pending[0].attempt_index,
+                    "agent_name": pending[0].agent_name,
+                    "execution_generation": pending[0].execution_generation,
+                    "result_identity": pending[0].result_identity,
+                    "result_digest": pending[0].result_digest,
                 }
             ],
         }
@@ -2151,6 +2213,7 @@ class TestPeriodicRolloutCheckpoint:
                 actor._rollout_recovery_ledger.pending_completed_execution_acknowledgements()
                 == []
             )
+            assert received_payloads == [expected_payload, expected_payload]
 
         try:
             asyncio.run(scenario())
@@ -2564,6 +2627,8 @@ class TestPeriodicRolloutCheckpoint:
         assert result.reason == "trainer_state_changed"
         assert events == ["prepare", "commit", "abort"]
         assert actor._gym_checkpoint_rollout_permitted.is_set()
+        snapshots = tmp_path / "checkpoints" / BOOTSTRAP_DIRNAME / "rollout_snapshots"
+        assert not list(snapshots.glob("tmp_snapshot_*"))
 
     def test_logs_snapshot_phase_durations(self, tmp_path: Path) -> None:
         actor = self._actor(tmp_path)

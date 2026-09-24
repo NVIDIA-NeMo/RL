@@ -116,6 +116,7 @@ from nemo_rl.environments.nemo_gym import (
     validate_dataset_agent_coverage,
 )
 from nemo_rl.experience.rollout_manager import (
+    GymAcknowledgementSink,
     RolloutManager,
     RolloutRetryPolicy,
     RolloutTimeouts,
@@ -2157,6 +2158,11 @@ def setup_single_controller(
         num_generations_per_prompt=algo_cfg.num_generations_per_prompt,
         max_seq_len=_generation_max_seq_len(generation_config),
         rollout_recovery_config=master_config.rollout_recovery,
+        gym_acknowledgement_sink=(
+            GymAcknowledgementSink()
+            if rollout_checkpoint_cfg.gym.participant_checkpointing_enabled
+            else None
+        ),
         max_rollout_turns=algo_cfg.max_rollout_turns,
         policy_generation=generation,
         generation_config=generation_config,

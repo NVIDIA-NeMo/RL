@@ -24,6 +24,7 @@ import pytest
 from nemo_rl.environments.nemo_gym import (
     GymControlRequestError,
     NemoGym,
+    _GymCheckpointPhase,
     _adapt_execution_identity_for_installed_gym,
 )
 from nemo_rl.environments.gym_checkpoint import (
@@ -94,6 +95,81 @@ def _completion_receipt(
         "result_identity": f"result-{rollout_id}-{attempt_index}",
         "result_digest": f"{attempt_index + 1:064x}",
     }
+
+
+def test_checkpoint_participation_and_order_are_phase_specific() -> None:
+    env = _checkpoint_env()
+    capabilities = {
+        "policy-stateful": _capability(
+            "responses_api_models",
+            "policy-stateful",
+            instance_role="policy",
+        ),
+        "policy-drain-only": _capability(
+            "responses_api_models",
+            "policy-drain-only",
+            checkpoint_mode="stateless",
+            instance_role="policy",
+        ),
+        "auxiliary": _capability(
+            "responses_api_models",
+            "auxiliary",
+            instance_role="auxiliary",
+        ),
+        "agent-stateful": _capability(
+            "responses_api_agents",
+            "agent-stateful",
+        ),
+        "agent-stateless": _capability(
+            "responses_api_agents",
+            "agent-stateless",
+            checkpoint_mode="stateless",
+        ),
+        "resources-stateful": _capability(
+            "resources_servers",
+            "resources-stateful",
+        ),
+        "resources-restart-only": _capability(
+            "resources_servers",
+            "resources-restart-only",
+            checkpoint_mode="restart_only",
+        ),
+    }
+
+    async def discover_control(_method, _path, *, server_name, **_kwargs):
+        return capabilities[server_name]
+
+    env._control = AsyncMock(side_effect=discover_control)
+    asyncio.run(env.discover_checkpoint_capabilities(list(capabilities)))
+
+    def ordered_names(phase: _GymCheckpointPhase) -> list[str]:
+        return [
+            item.participant.server_name
+            for item in env._ordered_checkpoint_participants(phase=phase)
+        ]
+
+    assert ordered_names(_GymCheckpointPhase.PREPARE) == [
+        "policy-drain-only",
+        "policy-stateful",
+        "agent-stateful",
+        "resources-stateful",
+    ]
+    assert ordered_names(_GymCheckpointPhase.COMMIT) == [
+        "agent-stateful",
+        "policy-stateful",
+        "resources-stateful",
+    ]
+    assert ordered_names(_GymCheckpointPhase.RESTORE) == [
+        "policy-stateful",
+        "agent-stateful",
+        "resources-stateful",
+    ]
+    assert ordered_names(_GymCheckpointPhase.RESUME) == [
+        "resources-stateful",
+        "policy-drain-only",
+        "policy-stateful",
+        "agent-stateful",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -692,8 +768,8 @@ def test_checkpoint_commit_restore_and_resume_fan_out() -> None:
         "agent",
         "tools",
         "tools",
-        "agent",
         "policy",
+        "agent",
     ]
     commit_calls = calls[:3]
     assert "include_continuation_index" not in commit_calls[0][2]

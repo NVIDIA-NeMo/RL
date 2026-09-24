@@ -17,6 +17,7 @@
 import asyncio
 import math
 import threading
+from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -98,6 +99,11 @@ class _InitRolloutManager:
         self, barrier: DataPlaneCheckpointBarrier
     ) -> None:
         self.checkpoint_barrier = barrier
+
+    def bind_gym_acknowledgement_sink(
+        self, on_ready: Callable[[], None] | None
+    ) -> None:
+        self.gym_acknowledgements_ready = on_ready
 
 
 def _checkpointing_config(tmp_path) -> dict:

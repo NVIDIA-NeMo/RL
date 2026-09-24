@@ -17,6 +17,10 @@
 NeMo-Gym's checkpoint package is currently experimental.  Keeping these
 models in NeMo-RL makes the HTTP boundary explicit and prevents a Gym package
 refactor from silently changing a durable RL checkpoint protocol.
+
+Models described as persisted are serialized into the rollout snapshot.
+Changing their fields or invariants requires reviewing, and normally bumping,
+the outer rollout-checkpoint schema version.
 """
 
 from __future__ import annotations
@@ -627,11 +631,15 @@ class GymModelCheckpointRestoreRequest(GymCheckpointDirectoryRequest):
 
 
 class GymWorkerAcknowledgements(_StrictWireModel):
+    """Number of model workers that acknowledged a control operation."""
+
     acknowledged: NonNegativeInt
     expected: NonNegativeInt
 
 
 class GymModelPrepareResponse(_StrictWireModel):
+    """Policy-model admission state after a checkpoint prepare request."""
+
     state: Literal["accepting", "draining", "paused"]
     workers: GymWorkerAcknowledgements
     inflight_total: NonNegativeInt
@@ -639,6 +647,8 @@ class GymModelPrepareResponse(_StrictWireModel):
 
 
 class GymModelInflightRequest(_LiveResponseWireModel):
+    """Diagnostic identity and age of one live policy-model request."""
+
     rollout_id: str | None = Field(default=None, pattern=_IDENTITY_PATTERN)
     attempt_index: NonNegativeInt | None = None
     plane: str | None
@@ -646,11 +656,15 @@ class GymModelInflightRequest(_LiveResponseWireModel):
 
 
 class GymSingleWorkerModelStatus(_LiveResponseWireModel):
+    """Live admission and request counts for one policy-model worker."""
+
     state: Literal["accepting", "draining", "paused"]
     inflight: NonNegativeInt
 
 
 class GymSingleWorkerModelStatusResponse(_LiveResponseWireModel):
+    """Read-only checkpoint status for a single-worker policy service."""
+
     checkpoint_id: str = Field(min_length=1, pattern=_IDENTITY_PATTERN)
     state: Literal["accepting", "draining", "paused"]
     per_worker: dict[str, GymSingleWorkerModelStatus]
@@ -663,12 +677,16 @@ class GymSingleWorkerModelStatusResponse(_LiveResponseWireModel):
 
 
 class GymCoordinatorWorkers(_LiveResponseWireModel):
+    """Live acknowledgement counts for a coordinated policy service."""
+
     acknowledged: NonNegativeInt
     expected: PositiveInt
     live: NonNegativeInt
 
 
 class GymCoordinatorWorkerStatus(_LiveResponseWireModel):
+    """Read-only checkpoint status reported for one coordinated worker."""
+
     acked_seq: NonNegativeInt
     inflight: NonNegativeInt
     generation_pending: NonNegativeInt | None = None
@@ -679,6 +697,8 @@ class GymCoordinatorWorkerStatus(_LiveResponseWireModel):
 
 
 class GymCoordinatorModelStatusResponse(_LiveResponseWireModel):
+    """Read-only aggregate checkpoint status for a coordinated model."""
+
     state: Literal["accepting", "draining", "paused"]
     workers: GymCoordinatorWorkers
     missing_workers: NonNegativeInt
@@ -690,6 +710,8 @@ class GymCoordinatorModelStatusResponse(_LiveResponseWireModel):
 
 
 class GymAgentExecutionStatus(GymExecutionIdentity):
+    """Live checkpoint state for one agent execution."""
+
     generation: PositiveInt
     state: Literal[
         "running",
@@ -725,6 +747,8 @@ class GymAgentSelectedBoundary(GymExecutionIdentity):
 
 
 class GymAgentPrepareResponse(_StrictWireModel):
+    """Agent inventory proving whether its checkpoint cut is safe to commit."""
+
     state: Literal["accepting", "preparing"]
     ready_to_commit: bool
     running: NonNegativeInt
@@ -754,6 +778,8 @@ class GymResourcesPrepareInventoryEntry(GymExecutionIdentity):
 
 
 class GymResourcesPrepareResponse(_StrictWireModel):
+    """Resource-session inventory frozen by checkpoint preparation."""
+
     sessions: NonNegativeInt
     state: Literal["prepared"]
     inventory: list[GymResourcesPrepareInventoryEntry]
@@ -775,6 +801,8 @@ GymPreparePayload: TypeAlias = Annotated[
 
 
 class GymParticipantPrepareResult(_StrictWireModel):
+    """Normalized prepare result for one discovered Gym participant."""
+
     participant: GymParticipantIdentity
     ready: bool
     payload: GymPreparePayload
@@ -789,6 +817,8 @@ class GymCheckpointPrepareResult(_StrictWireModel):
 
 
 class GymModelCommitResponse(_StrictWireModel):
+    """Policy lineage and external-storage index written during commit."""
+
     rollouts: NonNegativeInt
     rows: NonNegativeInt
     excluded_tombstoned: NonNegativeInt
@@ -798,12 +828,16 @@ class GymModelCommitResponse(_StrictWireModel):
 
 
 class GymAgentCommitResponse(_StrictWireModel):
+    """Agent continuation index written during checkpoint commit."""
+
     records: NonNegativeInt
     manifest_digest: Sha256Digest
     continuation_index: GymCheckpointArtifactReference
 
 
 class GymResourcesCommitResponse(_StrictWireModel):
+    """Resource-session state written during checkpoint commit."""
+
     sessions: NonNegativeInt
     manifest_digest: Sha256Digest
 
@@ -823,12 +857,20 @@ class GymParticipantManifestReference(_StrictWireModel):
 
 
 class GymParticipantCommitResult(_StrictWireModel):
+    """Persisted participant payload bound to its digest-checked manifest."""
+
     participant: GymParticipantIdentity
     payload: GymCommitPayload
     manifest: GymParticipantManifestReference
 
 
 class GymCheckpointCommitResult(_StrictWireModel):
+    """Persisted Gym commit included in the outer rollout snapshot manifest.
+
+    Participant identities must be unique and must match their manifest
+    identities. Field changes require rollout-checkpoint schema review.
+    """
+
     checkpoint_id: str
     participants: list[GymParticipantCommitResult]
 
@@ -1140,6 +1182,8 @@ def gym_checkpoint_continuations(
 
 
 class GymModelRestoreResponse(_StrictWireModel):
+    """Policy lineage and external-storage index installed during restore."""
+
     rollouts: NonNegativeInt
     rows: NonNegativeInt
     checkpoint_id: str | None = None
@@ -1149,12 +1193,16 @@ class GymModelRestoreResponse(_StrictWireModel):
 
 
 class GymAgentRestoreResponse(_StrictWireModel):
+    """Agent continuation index installed from a saved checkpoint."""
+
     records: NonNegativeInt
     source_checkpoint_id: str = Field(min_length=1)
     continuation_index: GymCheckpointArtifactReference
 
 
 class GymResourcesRestoreResponse(_StrictWireModel):
+    """Resource sessions installed from a saved checkpoint."""
+
     sessions: NonNegativeInt
     source_checkpoint_id: str = Field(min_length=1)
 
@@ -1166,11 +1214,15 @@ GymRestorePayload: TypeAlias = Annotated[
 
 
 class GymParticipantRestoreResult(_StrictWireModel):
+    """Normalized restore result for one discovered Gym participant."""
+
     participant: GymParticipantIdentity
     payload: GymRestorePayload
 
 
 class GymCheckpointRestoreResult(_StrictWireModel):
+    """Aggregate runtime proof that every persisted Gym participant restored."""
+
     checkpoint_id: str
     participants: list[GymParticipantRestoreResult]
 
@@ -1238,17 +1290,23 @@ def validate_gym_checkpoint_restore_artifacts(
 
 
 class GymModelResumeResponse(_StrictWireModel):
+    """Policy-model admission state after checkpoint release."""
+
     state: Literal["accepting"]
     workers: GymWorkerAcknowledgements
     released_waiters: NonNegativeInt
 
 
 class GymAgentResumeResponse(_StrictWireModel):
+    """Number of parked agent executions released after checkpointing."""
+
     state: Literal["accepting"]
     released: NonNegativeInt
 
 
 class GymResourcesResumeResponse(_StrictWireModel):
+    """Resource-server admission state after checkpoint release."""
+
     state: Literal["accepting"]
 
 
@@ -1259,10 +1317,14 @@ GymResumePayload: TypeAlias = Annotated[
 
 
 class GymParticipantResumeResult(_StrictWireModel):
+    """Normalized release result for one Gym participant."""
+
     participant: GymParticipantIdentity
     payload: GymResumePayload
 
 
 class GymCheckpointResumeResult(_StrictWireModel):
+    """Aggregate runtime proof that the Gym checkpoint fence was released."""
+
     checkpoint_id: str
     participants: list[GymParticipantResumeResult]

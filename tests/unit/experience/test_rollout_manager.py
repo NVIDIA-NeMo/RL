@@ -57,6 +57,7 @@ from nemo_rl.experience.interfaces import (
 from nemo_rl.experience.rollout_manager import (
     AsyncNemoGymRolloutImpl,
     AsyncRolloutImpl,
+    GymAcknowledgementSink,
     RolloutManager,
     RolloutOutcome,
     RolloutRetryPolicy,
@@ -64,6 +65,7 @@ from nemo_rl.experience.rollout_manager import (
     _nemo_gym_metric_namespace,
 )
 from nemo_rl.experience.rollout_recovery import (
+    PendingCompletedExecutionAcknowledgement,
     RecoveryGranularity,
     RolloutRecoveryLedger,
 )
@@ -355,6 +357,7 @@ def _make_manager(
     mgr._tokenizer = None
     mgr._num_generations_per_prompt = 1
     mgr._rollout_recovery_config = RolloutRecoveryConfig()
+    mgr._gym_acknowledgement_sink = None
     mgr._tq_buffer = buffer
     mgr._recovery_ledger = RolloutRecoveryLedger()
     mgr._data_plane_checkpoint_barrier = buffer.data_plane_checkpoint_barrier
@@ -874,6 +877,7 @@ def test_rollout_manager_raises_without_impl_params():
         "num_generations_per_prompt": 1,
         "max_seq_len": 1,
         "rollout_recovery_config": RolloutRecoveryConfig(),
+        "gym_acknowledgement_sink": None,
     }
 
     with pytest.raises(AssertionError, match="num_generations_per_prompt must be >= 1"):
@@ -888,6 +892,67 @@ def test_rollout_manager_raises_without_impl_params():
         RolloutManager(**common, use_nemo_gym=True)
 
 
+def test_gym_acknowledgement_sink_is_explicit_and_bound_once() -> None:
+    notifications: list[str] = []
+    sink = GymAcknowledgementSink()
+
+    with pytest.raises(RuntimeError, match="is not bound"):
+        sink.notify_ready()
+
+    sink.bind(lambda: notifications.append("ready"))
+    sink.notify_ready()
+    assert notifications == ["ready"]
+
+    with pytest.raises(RuntimeError, match="already bound"):
+        sink.bind(lambda: None)
+
+
+def test_rollout_manager_rejects_gym_acknowledgement_mode_mismatches() -> None:
+    generation_config = {
+        "stop_strings": None,
+        "stop_token_ids": None,
+        "top_k": None,
+    }
+    manager = RolloutManager(
+        tokenizer=None,
+        task_to_env={},
+        num_generations_per_prompt=1,
+        max_seq_len=1,
+        rollout_recovery_config=RolloutRecoveryConfig(),
+        gym_acknowledgement_sink=None,
+        generation_config=generation_config,
+        use_nemo_gym=True,
+    )
+    with pytest.raises(ValueError, match="persistent acknowledgement sink"):
+        manager.bind_gym_acknowledgement_sink(lambda: None)
+
+    sink = GymAcknowledgementSink()
+    manager = RolloutManager(
+        tokenizer=None,
+        task_to_env={},
+        num_generations_per_prompt=1,
+        max_seq_len=1,
+        rollout_recovery_config=RolloutRecoveryConfig(),
+        gym_acknowledgement_sink=sink,
+        generation_config=generation_config,
+        use_nemo_gym=True,
+    )
+    with pytest.raises(ValueError, match="checkpointing is disabled"):
+        manager.bind_gym_acknowledgement_sink(None)
+
+    with pytest.raises(ValueError, match="requires the NeMo-Gym rollout path"):
+        RolloutManager(
+            tokenizer=None,
+            task_to_env={},
+            num_generations_per_prompt=1,
+            max_seq_len=1,
+            rollout_recovery_config=RolloutRecoveryConfig(),
+            gym_acknowledgement_sink=GymAcknowledgementSink(),
+            policy_generation=object(),
+            use_nemo_gym=False,
+        )
+
+
 def test_rollout_manager_forwards_mask_env_flagged_samples():
     """env.should_mask_flagged_samples reaches the NeMo-Gym impl through RolloutManager."""
     common = {
@@ -896,6 +961,7 @@ def test_rollout_manager_forwards_mask_env_flagged_samples():
         "num_generations_per_prompt": 1,
         "max_seq_len": 1,
         "rollout_recovery_config": RolloutRecoveryConfig(),
+        "gym_acknowledgement_sink": None,
         "generation_config": {
             "stop_strings": None,
             "stop_token_ids": None,
@@ -922,6 +988,7 @@ def test_rollout_manager_hands_its_deadline_registry_to_the_impl(use_nemo_gym):
         num_generations_per_prompt=1,
         max_seq_len=1,
         rollout_recovery_config=RolloutRecoveryConfig(),
+        gym_acknowledgement_sink=None,
         policy_generation=object(),
         generation_config={"stop_strings": None, "stop_token_ids": None, "top_k": None},
         use_nemo_gym=use_nemo_gym,
@@ -937,6 +1004,7 @@ def test_rollout_manager_forwards_log_full_result_tables():
         "num_generations_per_prompt": 1,
         "max_seq_len": 1,
         "rollout_recovery_config": RolloutRecoveryConfig(),
+        "gym_acknowledgement_sink": None,
         "generation_config": {
             "stop_strings": None,
             "stop_token_ids": None,
@@ -1383,6 +1451,7 @@ def test_async_rollout_manager(
         num_generations_per_prompt=num_generations,
         max_seq_len=max_seq_len,
         rollout_recovery_config=RolloutRecoveryConfig(),
+        gym_acknowledgement_sink=None,
         max_rollout_turns=max_rollout_turns,
         policy_generation=vllm_generation,
     )
@@ -1444,6 +1513,7 @@ def test_async_rollout_manager_truncation(
         num_generations_per_prompt=num_generations,
         max_seq_len=max_seq_len,
         rollout_recovery_config=RolloutRecoveryConfig(),
+        gym_acknowledgement_sink=None,
         max_rollout_turns=max_rollout_turns,
         policy_generation=vllm_generation,
     )
@@ -1510,6 +1580,7 @@ def test_async_rollout_manager_matches_original(
         num_generations_per_prompt=num_generations,
         max_seq_len=max_seq_len,
         rollout_recovery_config=RolloutRecoveryConfig(),
+        gym_acknowledgement_sink=None,
         max_rollout_turns=max_rollout_turns,
         policy_generation=vllm_generation,
     )
@@ -1645,6 +1716,7 @@ def test_async_nemo_gym_rollout_manager(
         num_generations_per_prompt=num_generations,
         max_seq_len=nemo_gym_vllm_generation.cfg["vllm_cfg"]["max_model_len"],
         rollout_recovery_config=RolloutRecoveryConfig(),
+        gym_acknowledgement_sink=None,
         generation_config=nemo_gym_vllm_generation.cfg,
     )
     record = asyncio.run(manager.run_rollout(single_prompt))
@@ -1768,6 +1840,7 @@ def test_async_nemo_gym_rollout_manager_matches_original(
         num_generations_per_prompt=num_generations,
         max_seq_len=nemo_gym_vllm_generation.cfg["vllm_cfg"]["max_model_len"],
         rollout_recovery_config=RolloutRecoveryConfig(),
+        gym_acknowledgement_sink=None,
         generation_config=nemo_gym_vllm_generation.cfg,
     )
     record = asyncio.run(manager.run_rollout(single_prompt))
@@ -1921,11 +1994,14 @@ def _make_capture_manager(
     retry_policy: RolloutRetryPolicy | None = None,
     instance_configs=None,
     recovery_config: RolloutRecoveryConfig | None = None,
+    gym_acknowledgement_sink: GymAcknowledgementSink | None = None,
+    include_completion_receipts: bool = True,
 ):
     mgr = object.__new__(RolloutManager)
     mgr._tokenizer = None
     mgr._num_generations_per_prompt = num_generations
     mgr._rollout_recovery_config = recovery_config or RolloutRecoveryConfig()
+    mgr._gym_acknowledgement_sink = gym_acknowledgement_sink
     mgr._tq_buffer = buf
     mgr._weight_version = 7
     mgr._retry_policy = (
@@ -1995,6 +2071,9 @@ def _make_capture_manager(
                 attempt_indices=[attempt_indices[index] for index in indices],
                 loss_multiplier=float(_sample.get("loss_multiplier", 1.0)),
             )
+            if not include_completion_receipts:
+                for completion in record.completions:
+                    completion.env_extras.pop("_ng_completion_receipt")
             if on_completion is not None:
                 for generation_index, completion in zip(indices, record.completions):
                     await on_completion(generation_index, completion)
@@ -2021,20 +2100,24 @@ class TestGenerateForFinalizationFlow:
 
     def test_mints_ids_and_returns_metadata_request(self):
         buf = _FakeCaptureBuffer()
-        mgr = _make_capture_manager(buf)
         pending_acknowledgement_history: list[
-            list[tuple[str, int, str, int, str, str, str | None, str | None]]
+            list[PendingCompletedExecutionAcknowledgement]
         ] = []
+        acknowledgement_sink = GymAcknowledgementSink()
+        mgr = _make_capture_manager(
+            buf,
+            gym_acknowledgement_sink=acknowledgement_sink,
+        )
+        acknowledgement_sink.bind(
+            lambda: pending_acknowledgement_history.append(
+                mgr.recovery_ledger.pending_completed_execution_acknowledgements()
+            )
+        )
 
         request = _run(
             mgr.generate_for_finalization(
                 {"prompt": "p", "idx": 0, "loss_multiplier": 0.25},
                 target_step=5,
-                on_gym_acknowledgements_ready=lambda: (
-                    pending_acknowledgement_history.append(
-                        mgr.recovery_ledger.pending_completed_execution_acknowledgements()
-                    )
-                ),
             )
         )
         assert request is not None
@@ -2059,43 +2142,53 @@ class TestGenerateForFinalizationFlow:
         assert request.fallback_weight_version == 7
         assert pending_acknowledgement_history == [
             [
-                (
-                    canonical_ids[0],
-                    0,
-                    "test-agent",
-                    1,
-                    f"result-{canonical_ids[0]}-0",
-                    f"{1:064x}",
-                    None,
-                    None,
+                PendingCompletedExecutionAcknowledgement(
+                    rollout_id=canonical_ids[0],
+                    attempt_index=0,
+                    agent_name="test-agent",
+                    execution_generation=1,
+                    result_identity=f"result-{canonical_ids[0]}-0",
+                    result_digest=f"{1:064x}",
                 )
             ],
             [
-                (
-                    canonical_ids[0],
-                    0,
-                    "test-agent",
-                    1,
-                    f"result-{canonical_ids[0]}-0",
-                    f"{1:064x}",
-                    None,
-                    None,
+                PendingCompletedExecutionAcknowledgement(
+                    rollout_id=canonical_ids[0],
+                    attempt_index=0,
+                    agent_name="test-agent",
+                    execution_generation=1,
+                    result_identity=f"result-{canonical_ids[0]}-0",
+                    result_digest=f"{1:064x}",
                 ),
-                (
-                    canonical_ids[1],
-                    0,
-                    "test-agent",
-                    1,
-                    f"result-{canonical_ids[1]}-0",
-                    f"{1:064x}",
-                    None,
-                    None,
+                PendingCompletedExecutionAcknowledgement(
+                    rollout_id=canonical_ids[1],
+                    attempt_index=0,
+                    agent_name="test-agent",
+                    execution_generation=1,
+                    result_identity=f"result-{canonical_ids[1]}-0",
+                    result_digest=f"{1:064x}",
                 ),
             ],
         ]
         # Finalization and commit are exclusively owned by the controller's
         # actor-pool path; the manager leaves the reservation unready.
         assert buf.commit_calls == []
+
+    def test_checkpoint_aware_completion_requires_exact_receipt(self):
+        buf = _FakeCaptureBuffer()
+        acknowledgement_sink = GymAcknowledgementSink()
+        acknowledgement_sink.bind(lambda: None)
+        mgr = _make_capture_manager(
+            buf,
+            gym_acknowledgement_sink=acknowledgement_sink,
+            include_completion_receipts=False,
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="checkpointable Gym completion must contain its exact completion receipt",
+        ):
+            _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
 
     def test_failed_dispatch_aborts_the_reservation(self):
         buf = _FakeCaptureBuffer()
@@ -2226,11 +2319,21 @@ class TestGenerateForFinalizationFlow:
 
     def test_prompt_group_policy_retries_the_complete_live_cohort(self):
         buf = _FakeCaptureBuffer()
+        pending_acknowledgement_history: list[
+            list[PendingCompletedExecutionAcknowledgement]
+        ] = []
+        acknowledgement_sink = GymAcknowledgementSink()
         mgr = _make_capture_manager(
             buf,
             recovery_config=RolloutRecoveryConfig(
                 default_granularity=RecoveryGranularity.PROMPT_GROUP
             ),
+            gym_acknowledgement_sink=acknowledgement_sink,
+        )
+        acknowledgement_sink.bind(
+            lambda: pending_acknowledgement_history.append(
+                mgr.recovery_ledger.pending_completed_execution_acknowledgements()
+            )
         )
         mgr._retry_policy = RolloutRetryPolicy.single_attempt(
             max_infra_attempts=2,
@@ -2292,18 +2395,10 @@ class TestGenerateForFinalizationFlow:
 
         impl = _PartialCaptureImpl()
         mgr._impl = impl
-        pending_acknowledgement_history: list[
-            list[tuple[str, int, str, int, str, str, str | None, str | None]]
-        ] = []
 
         request = _run(
             mgr.generate_for_finalization(
                 {"prompt": "p", "idx": 9},
-                on_gym_acknowledgements_ready=lambda: (
-                    pending_acknowledgement_history.append(
-                        mgr.recovery_ledger.pending_completed_execution_acknowledgements()
-                    )
-                ),
             )
         )
 
@@ -2321,25 +2416,21 @@ class TestGenerateForFinalizationFlow:
         assert request.rollout_ids == (second_ids[0], second_ids[1])
         assert pending_acknowledgement_history == [
             [
-                (
-                    f"{request.group_id}_g0",
-                    1,
-                    "test-agent",
-                    2,
-                    f"result-{request.group_id}_g0-1",
-                    f"{2:064x}",
-                    None,
-                    None,
+                PendingCompletedExecutionAcknowledgement(
+                    rollout_id=f"{request.group_id}_g0",
+                    attempt_index=1,
+                    agent_name="test-agent",
+                    execution_generation=2,
+                    result_identity=f"result-{request.group_id}_g0-1",
+                    result_digest=f"{2:064x}",
                 ),
-                (
-                    f"{request.group_id}_g1",
-                    1,
-                    "test-agent",
-                    2,
-                    f"result-{request.group_id}_g1-1",
-                    f"{2:064x}",
-                    None,
-                    None,
+                PendingCompletedExecutionAcknowledgement(
+                    rollout_id=f"{request.group_id}_g1",
+                    attempt_index=1,
+                    agent_name="test-agent",
+                    execution_generation=2,
+                    result_identity=f"result-{request.group_id}_g1-1",
+                    result_digest=f"{2:064x}",
                 ),
             ]
         ]

@@ -36,6 +36,7 @@ from nemo_rl.experience.rollout_recovery import (
     _PROMPT_REF_STATE_FIELDS,
     _SIBLING_STATE_FIELDS,
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
+    PendingCompletedExecutionAcknowledgement,
     PromptGroupPhase,
     PromptGroupRecoveryRecord,
     PromptRef,
@@ -941,10 +942,27 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
 
     state = ledger.state_dict()
     restored = RolloutRecoveryLedger.from_state_dict(state)
-    assert restored.completed_execution_acknowledgements("g7") == [
-        ("g7_g0", 0, "test-agent", 1, "result-g7_g0-0", f"{1:064x}", None, None),
-        ("g7_g1", 0, "test-agent", 1, "result-g7_g1-0", f"{1:064x}", None, None),
+    expected_acknowledgements = [
+        PendingCompletedExecutionAcknowledgement(
+            rollout_id="g7_g0",
+            attempt_index=0,
+            agent_name="test-agent",
+            execution_generation=1,
+            result_identity="result-g7_g0-0",
+            result_digest=f"{1:064x}",
+        ),
+        PendingCompletedExecutionAcknowledgement(
+            rollout_id="g7_g1",
+            attempt_index=0,
+            agent_name="test-agent",
+            execution_generation=1,
+            result_identity="result-g7_g1-0",
+            result_digest=f"{1:064x}",
+        ),
     ]
+    assert (
+        restored.completed_execution_acknowledgements("g7") == expected_acknowledgements
+    )
     physical_ids, _, restored_receipts, rewards, mask_sample = (
         restored.finalization_inputs("g7")
     )
@@ -956,10 +974,7 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
     assert mask_sample == [True, False]
 
     recorded = restored.pending_completed_execution_acknowledgements()
-    assert recorded == [
-        ("g7_g0", 0, "test-agent", 1, "result-g7_g0-0", f"{1:064x}", None, None),
-        ("g7_g1", 0, "test-agent", 1, "result-g7_g1-0", f"{1:064x}", None, None),
-    ]
+    assert recorded == expected_acknowledgements
     _mutate(lambda cut: restored.discard_group(cut, "g7"))
     restored = RolloutRecoveryLedger.from_state_dict(restored.state_dict())
     assert restored.groups() == []

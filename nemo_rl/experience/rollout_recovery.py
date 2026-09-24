@@ -112,17 +112,6 @@ _COMPLETED_EXECUTION_ACKNOWLEDGEMENT_FIELDS = frozenset(
     }
 )
 
-CompletedExecutionAcknowledgement: TypeAlias = tuple[
-    str,
-    int,
-    str,
-    int,
-    str,
-    str,
-    Optional[str],
-    Optional[str],
-]
-
 
 def _reject_unknown_fields(
     mapping: Mapping[Any, Any],
@@ -367,7 +356,17 @@ class PendingCompletedExecutionAcknowledgement:
             raise ValueError("acknowledgement attempt_index must be non-negative")
         if not isinstance(self.agent_name, str) or not self.agent_name:
             raise ValueError("acknowledgement agent_name must not be empty")
-        GymCompletionReceipt(
+        _ = self.receipt
+
+    @property
+    def identity(self) -> tuple[str, int]:
+        """Return the stable Gym execution identity used for deduplication."""
+        return (self.rollout_id, self.attempt_index)
+
+    @property
+    def receipt(self) -> GymCompletionReceipt:
+        """Return the receipt-bound portion sent to Gym's ACK endpoint."""
+        return GymCompletionReceipt(
             rollout_id=self.rollout_id,
             attempt_index=self.attempt_index,
             execution_generation=self.execution_generation,
@@ -375,24 +374,6 @@ class PendingCompletedExecutionAcknowledgement:
             result_digest=self.result_digest,
             manifest_capture_key=self.manifest_capture_key,
             terminal_model_call_id=self.terminal_model_call_id,
-        )
-
-    @property
-    def identity(self) -> tuple[str, int]:
-        """Return the stable Gym execution identity used for deduplication."""
-        return (self.rollout_id, self.attempt_index)
-
-    def as_tuple(self) -> CompletedExecutionAcknowledgement:
-        """Return the transport-neutral representation used by the controller."""
-        return (
-            self.rollout_id,
-            self.attempt_index,
-            self.agent_name,
-            self.execution_generation,
-            self.result_identity,
-            self.result_digest,
-            self.manifest_capture_key,
-            self.terminal_model_call_id,
         )
 
 
@@ -962,7 +943,7 @@ class RolloutRecoveryLedger:
     def completed_execution_acknowledgements(
         self,
         group_id: str,
-    ) -> list[CompletedExecutionAcknowledgement]:
+    ) -> list[PendingCompletedExecutionAcknowledgement]:
         """Return every sealed Gym execution identity for one finalizable group."""
         record = self._require_group(group_id)
         if record.status not in {
@@ -976,7 +957,7 @@ class RolloutRecoveryLedger:
         if record.resolved_agent_name is None:
             raise RuntimeError(f"group {group_id!r} has no resolved Gym agent identity")
         return [
-            self._acknowledgement_for_sibling(record, sibling).as_tuple()
+            self._acknowledgement_for_sibling(record, sibling)
             for sibling in record.siblings
         ]
 
@@ -985,7 +966,7 @@ class RolloutRecoveryLedger:
         cut: DataPlaneMutationCut,
         group_id: str,
         generation_index: int,
-    ) -> CompletedExecutionAcknowledgement:
+    ) -> PendingCompletedExecutionAcknowledgement:
         """Persist one sibling-scoped ACK obligation alongside its seal."""
         cut.require_live()
         record = self._require_group(group_id)
@@ -996,13 +977,13 @@ class RolloutRecoveryLedger:
         sibling = self._require_sibling(record, generation_index)
         acknowledgement = self._acknowledgement_for_sibling(record, sibling)
         self._record_completed_execution_acknowledgements([acknowledgement])
-        return acknowledgement.as_tuple()
+        return acknowledgement
 
     def record_sealed_group_acknowledgements(
         self,
         cut: DataPlaneMutationCut,
         group_id: str,
-    ) -> list[CompletedExecutionAcknowledgement]:
+    ) -> list[PendingCompletedExecutionAcknowledgement]:
         """Persist every prompt-group-scoped ACK after its atomic seal."""
         cut.require_live()
         record = self._require_group(group_id)
@@ -1016,23 +997,20 @@ class RolloutRecoveryLedger:
             for sibling in record.siblings
         ]
         self._record_completed_execution_acknowledgements(acknowledgements)
-        return [acknowledgement.as_tuple() for acknowledgement in acknowledgements]
+        return acknowledgements
 
     def pending_completed_execution_acknowledgements(
         self,
-    ) -> list[CompletedExecutionAcknowledgement]:
+    ) -> list[PendingCompletedExecutionAcknowledgement]:
         """Return a stable copy of Gym ACK obligations not confirmed remotely."""
-        return [
-            acknowledgement.as_tuple()
-            for acknowledgement in sorted(
-                self._pending_completed_execution_acknowledgements.values(),
-                key=lambda item: (
-                    item.agent_name,
-                    item.rollout_id,
-                    item.attempt_index,
-                ),
-            )
-        ]
+        return sorted(
+            self._pending_completed_execution_acknowledgements.values(),
+            key=lambda item: (
+                item.agent_name,
+                item.rollout_id,
+                item.attempt_index,
+            ),
+        )
 
     def discard_completed_execution_acknowledgements(
         self,
@@ -1053,31 +1031,12 @@ class RolloutRecoveryLedger:
     def mark_completed_executions_acknowledged(
         self,
         cut: DataPlaneMutationCut,
-        acknowledgements: list[CompletedExecutionAcknowledgement],
+        acknowledgements: list[PendingCompletedExecutionAcknowledgement],
     ) -> None:
         """Remove only ACK obligations confirmed by Gym's idempotent endpoint."""
         cut.require_live()
         seen: set[tuple[str, int]] = set()
-        for (
-            rollout_id,
-            attempt_index,
-            agent_name,
-            execution_generation,
-            result_identity,
-            result_digest,
-            manifest_capture_key,
-            terminal_model_call_id,
-        ) in acknowledgements:
-            acknowledgement = PendingCompletedExecutionAcknowledgement(
-                rollout_id=rollout_id,
-                attempt_index=attempt_index,
-                agent_name=agent_name,
-                execution_generation=execution_generation,
-                result_identity=result_identity,
-                result_digest=result_digest,
-                manifest_capture_key=manifest_capture_key,
-                terminal_model_call_id=terminal_model_call_id,
-            )
+        for acknowledgement in acknowledgements:
             if acknowledgement.identity in seen:
                 raise ValueError("completed execution acknowledgements must be unique")
             seen.add(acknowledgement.identity)
@@ -1091,7 +1050,7 @@ class RolloutRecoveryLedger:
                     "Gym acknowledgement agent identity changed for "
                     f"{acknowledgement.identity!r}: "
                     f"pending={pending.agent_name!r}, "
-                    f"acknowledged={agent_name!r}"
+                    f"acknowledged={acknowledgement.agent_name!r}"
                 )
             del self._pending_completed_execution_acknowledgements[
                 acknowledgement.identity

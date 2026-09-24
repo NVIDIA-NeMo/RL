@@ -23,10 +23,11 @@ import time
 from collections import Counter
 from collections.abc import AsyncGenerator, Mapping
 from dataclasses import dataclass, field
+from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
 from time import monotonic
-from typing import Any, Dict, List, NotRequired, Optional, Protocol, TypedDict
+from typing import Any, Dict, List, NotRequired, Optional, Protocol, TypedDict, cast
 
 import ray
 import torch
@@ -350,6 +351,15 @@ def get_nemo_gym_venv_dir() -> str | None:
     return os.environ.get("NEMO_GYM_VENV_DIR")
 
 
+class NemoGymTokenCaptureConfig(TypedDict):
+    """Resolved token-capture settings required by a live Gym actor."""
+
+    enabled: bool
+    capture_dir: str
+    control_auth_token: str
+    control_timeout_s: NotRequired[float | None]
+
+
 class NemoGymConfig(TypedDict):
     model_name: str
     base_urls: List[str]
@@ -385,7 +395,7 @@ class NemoGymConfig(TypedDict):
     # TokenCaptureConfig. Turns on external staging in Gym's policy model
     # server, switches run_rollouts to receipt mode, and assembles receipts
     # from the manifest control route. None/absent = legacy token-echo path.
-    token_capture: NotRequired[Dict[str, Any] | None]
+    token_capture: NotRequired[NemoGymTokenCaptureConfig | None]
 
 
 # Gym control-plane server name (the model server hosting the ledger) and the
@@ -401,6 +411,43 @@ _CHECKPOINT_CONTROL_ENV = "NEMO_GYM_CHECKPOINT_CONTROL_TOKEN"
 _GYM_COMPONENT_KEYS = frozenset(
     {"responses_api_models", "responses_api_agents", "resources_servers"}
 )
+
+
+class _GymCheckpointPhase(StrEnum):
+    """One participant-control phase in the Gym checkpoint transaction."""
+
+    PREPARE = "prepare"
+    COMMIT = "commit"
+    RESTORE = "restore"
+    RESUME = "resume"
+
+
+# Each phase has a deliberate dependency order. Preparation fences model
+# admission before parking callers. Commit writes agent continuation indexes
+# before model lineage consumes them. Resume reopens agent dependencies before
+# releasing parked agent coroutines.
+_GYM_CHECKPOINT_COMPONENT_ORDERS = {
+    _GymCheckpointPhase.PREPARE: {
+        "responses_api_models": 0,
+        "responses_api_agents": 1,
+        "resources_servers": 2,
+    },
+    _GymCheckpointPhase.COMMIT: {
+        "responses_api_agents": 0,
+        "responses_api_models": 1,
+        "resources_servers": 2,
+    },
+    _GymCheckpointPhase.RESTORE: {
+        "responses_api_models": 0,
+        "responses_api_agents": 1,
+        "resources_servers": 2,
+    },
+    _GymCheckpointPhase.RESUME: {
+        "resources_servers": 0,
+        "responses_api_models": 1,
+        "responses_api_agents": 2,
+    },
+}
 
 
 class GymControlRequestError(RuntimeError):
@@ -707,6 +754,7 @@ Depending on your data shape, you may want to change these values."""
         self._gym_checkpoint_participants = ()
         self._gym_checkpoint_topology = None
         if self._token_capture_enabled:
+            assert token_capture is not None
             policy_overrides = (
                 initial_global_config_dict.setdefault("policy_model", {})
                 .setdefault("responses_api_models", {})
@@ -1023,22 +1071,44 @@ Depending on your data shape, you may want to change these values."""
                 )
         return {"acknowledged": [item.model_dump(mode="json") for item in acknowledged]}
 
+    @staticmethod
+    def _participates_in_checkpoint_phase(
+        discovered: GymDiscoveredParticipant,
+        phase: _GymCheckpointPhase,
+    ) -> bool:
+        """Return whether one participant joins the requested control phase."""
+        capabilities = discovered.capabilities
+        if discovered.participant.component == "responses_api_models":
+            if capabilities.instance_role != "policy":
+                return False
+            if phase in {
+                _GymCheckpointPhase.PREPARE,
+                _GymCheckpointPhase.RESUME,
+            }:
+                # Every policy model must close admission around the cut, even
+                # when it has no exportable state of its own.
+                return True
+        return capabilities.checkpoint_mode == "export_restore"
+
     def _ordered_checkpoint_participants(
         self,
         *,
-        resume: bool = False,
+        phase: _GymCheckpointPhase,
+        participants: Optional[tuple[GymDiscoveredParticipant, ...]] = None,
     ) -> tuple[GymDiscoveredParticipant, ...]:
-        """Order policy fencing first and policy reopening last."""
-        component_order = {
-            "responses_api_models": 0,
-            "responses_api_agents": 1,
-            "resources_servers": 2,
-        }
+        """Return phase participants in their dependency-safe control order."""
+        component_order = _GYM_CHECKPOINT_COMPONENT_ORDERS[phase]
+        candidates = (
+            self._checkpoint_participants() if participants is None else participants
+        )
         return tuple(
             sorted(
-                self._checkpoint_participants(),
+                (
+                    discovered
+                    for discovered in candidates
+                    if self._participates_in_checkpoint_phase(discovered, phase)
+                ),
                 key=lambda item: component_order[item.participant.component],
-                reverse=resume,
             )
         )
 
@@ -1088,7 +1158,9 @@ Depending on your data shape, you may want to change these values."""
         results: list[GymParticipantPrepareResult] = []
         prepare_attempted: list[GymDiscoveredParticipant] = []
         try:
-            for discovered in self._ordered_checkpoint_participants():
+            for discovered in self._ordered_checkpoint_participants(
+                phase=_GymCheckpointPhase.PREPARE
+            ):
                 participant = discovered.participant
                 capabilities = discovered.capabilities
                 payload: (
@@ -1097,8 +1169,6 @@ Depending on your data shape, you may want to change these values."""
                     | GymResourcesPrepareResponse
                 )
                 if participant.component == "responses_api_models":
-                    if capabilities.instance_role != "policy":
-                        continue
                     if "paused" not in capabilities.admission_states:
                         raise RuntimeError(
                             f"Gym policy model {participant.server_name!r} cannot pause"
@@ -1122,8 +1192,6 @@ Depending on your data shape, you may want to change these values."""
                         and payload.workers.acknowledged == payload.workers.expected
                     )
                 elif participant.component == "responses_api_agents":
-                    if capabilities.checkpoint_mode != "export_restore":
-                        continue
                     prepare_attempted.append(discovered)
                     payload = await self._prepare_agent_checkpoint(
                         discovered,
@@ -1132,8 +1200,6 @@ Depending on your data shape, you may want to change these values."""
                     )
                     ready = payload.ready_to_commit
                 else:
-                    if capabilities.checkpoint_mode != "export_restore":
-                        continue
                     prepare_attempted.append(discovered)
                     payload = GymResourcesPrepareResponse.model_validate(
                         await self._control(
@@ -1324,28 +1390,17 @@ Depending on your data shape, you may want to change these values."""
         ).model_dump(mode="json")
         results: list[GymParticipantCommitResult] = []
         continuation_indexes: list[GymCheckpointArtifactReference] = []
-        component_order = {
-            "responses_api_agents": 0,
-            "responses_api_models": 1,
-            "resources_servers": 2,
-        }
-        participants = sorted(
-            self._checkpoint_participants(),
-            key=lambda item: component_order[item.participant.component],
-        )
-        for discovered in participants:
+        for discovered in self._ordered_checkpoint_participants(
+            phase=_GymCheckpointPhase.COMMIT
+        ):
             participant = discovered.participant
             capabilities = discovered.capabilities
-            if capabilities.checkpoint_mode != "export_restore":
-                continue
             payload: (
                 GymModelCommitResponse
                 | GymAgentCommitResponse
                 | GymResourcesCommitResponse
             )
             if participant.component == "responses_api_models":
-                if capabilities.instance_role != "policy":
-                    continue
                 if (
                     GYM_EXTERNAL_STORAGE_REFERENCE_INDEX_FEATURE
                     not in capabilities.features
@@ -1437,19 +1492,17 @@ Depending on your data shape, you may want to change these values."""
             checkpoint_dir=checkpoint_dir,
         ).model_dump(mode="json")
         results: list[GymParticipantRestoreResult] = []
-        for discovered in self._ordered_checkpoint_participants():
+        for discovered in self._ordered_checkpoint_participants(
+            phase=_GymCheckpointPhase.RESTORE
+        ):
             participant = discovered.participant
             capabilities = discovered.capabilities
-            if capabilities.checkpoint_mode != "export_restore":
-                continue
             payload: (
                 GymModelRestoreResponse
                 | GymAgentRestoreResponse
                 | GymResourcesRestoreResponse
             )
             if participant.component == "responses_api_models":
-                if capabilities.instance_role != "policy":
-                    continue
                 if (
                     GYM_EXTERNAL_STORAGE_REFERENCE_INDEX_FEATURE
                     not in capabilities.features
@@ -1603,15 +1656,9 @@ Depending on your data shape, you may want to change these values."""
             deadline_ts=deadline_ts,
         ).model_dump(mode="json")
         results: list[GymParticipantResumeResult] = []
-        component_order = {
-            "responses_api_agents": 0,
-            "responses_api_models": 1,
-            "resources_servers": 2,
-        }
-        ordered = sorted(
-            participants,
-            key=lambda item: component_order[item.participant.component],
-            reverse=True,
+        ordered = self._ordered_checkpoint_participants(
+            phase=_GymCheckpointPhase.RESUME,
+            participants=participants,
         )
         errors: list[BaseException] = []
         for discovered in ordered:
@@ -1624,8 +1671,7 @@ Depending on your data shape, you may want to change these values."""
             except (Exception, asyncio.CancelledError) as error:
                 errors.append(error)
                 continue
-            if result is not None:
-                results.append(result)
+            results.append(result)
         if errors:
             raise BaseExceptionGroup(
                 "one or more Gym checkpoint participants failed to resume",
@@ -1639,16 +1685,13 @@ Depending on your data shape, you may want to change these values."""
         *,
         request: dict[str, Any],
         deadline_ts: float,
-    ) -> Optional[GymParticipantResumeResult]:
-        """Resume one participant, returning None when it does not participate."""
+    ) -> GymParticipantResumeResult:
+        """Resume one participant selected for the resume phase."""
         participant = discovered.participant
-        capabilities = discovered.capabilities
         payload: (
             GymModelResumeResponse | GymAgentResumeResponse | GymResourcesResumeResponse
         )
         if participant.component == "responses_api_models":
-            if capabilities.instance_role != "policy":
-                return None
             payload = GymModelResumeResponse.model_validate(
                 await self._control(
                     "POST",
@@ -1659,8 +1702,6 @@ Depending on your data shape, you may want to change these values."""
                 )
             )
         elif participant.component == "responses_api_agents":
-            if capabilities.checkpoint_mode != "export_restore":
-                return None
             payload = GymAgentResumeResponse.model_validate(
                 await self._control(
                     "POST",
@@ -1671,8 +1712,6 @@ Depending on your data shape, you may want to change these values."""
                 )
             )
         else:
-            if capabilities.checkpoint_mode != "export_restore":
-                return None
             payload = GymResourcesResumeResponse.model_validate(
                 await self._control(
                     "POST",
@@ -1884,11 +1923,13 @@ Depending on your data shape, you may want to change these values."""
             if num_results == len(nemo_gym_examples):
                 timer.stop("_run_rollouts_total")
                 timing_metrics = timer.get_timing_metrics("sum")
-                total_time = timing_metrics.pop("_run_rollouts_total")
+                total_time = cast(float, timing_metrics.pop("_run_rollouts_total"))
+                postprocess_time = cast(
+                    float,
+                    timing_metrics[f"{timer_prefix}/postprocess_results"],
+                )
                 timing_metrics[f"{timer_prefix}/postprocess_results_pct"] = (
-                    100
-                    * timing_metrics[f"{timer_prefix}/postprocess_results"]
-                    / total_time
+                    100 * postprocess_time / total_time
                 )
 
             agent_name = nemo_gym_row["agent_ref"]["name"]
@@ -2405,7 +2446,7 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                         container[key], raw_initial_sources
                     )
 
-        result = {
+        result: dict[str, Any] = {
             "message_log": nemo_rl_message_log,
             "input_message_log": nemo_rl_message_log[:1],
             "full_result": nemo_gym_result,
@@ -2657,7 +2698,7 @@ def _build_gym_actor_config(
         routed_experts_dtype=routed_experts_dtype,
         use_fastokens=use_fastokens,
         initial_global_config_dict=nemo_gym_dict,
-        token_capture=token_capture,
+        token_capture=cast(NemoGymTokenCaptureConfig | None, token_capture),
         **port_range,
         **multimodal_flags,
     )
@@ -3289,6 +3330,8 @@ def _iter_dataset_agent_names(dataset: Any) -> set[str]:
 
     # AllTaskProcessedDataset wraps the raw rows; a plain sequence is also fine.
     rows = getattr(dataset, "dataset", dataset)
+    if rows is None:
+        return set()
 
     names: set[str] = set()
     for row in rows:
