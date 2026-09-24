@@ -81,14 +81,15 @@ class TQMegatronPromptPreparer:
 
         if offload_params is None:
             return RequestPromptPreparationResult(prompt=prompt)
-        capture_payload = offload_params.get("ng_capture")
+        # Deferred: nemo_gym is an optional extra absent in non-gym runs.
+        from nemo_gym.token_id_capture import NG_CAPTURE_FIELD
+        from nemo_gym.token_id_capture.staging.records import CaptureAdmission
+
+        capture_payload = offload_params.get(NG_CAPTURE_FIELD)
         if capture_payload is None:
             return RequestPromptPreparationResult(
                 prompt=prompt, offload_params=offload_params
             )
-
-        # Deferred: nemo_gym is an optional extra absent in non-gym runs.
-        from nemo_gym.token_id_capture.staging.records import CaptureAdmission
 
         admission = CaptureAdmission.model_validate(capture_payload)
         if admission.mode == "text":
@@ -109,7 +110,9 @@ class TQMegatronPromptPreparer:
         updated_admission = admission.model_copy(
             update={"required_prefix_token_ids": prefix_token_ids}
         )
-        updated_offload_params["ng_capture"] = updated_admission.model_dump(mode="json")
+        updated_offload_params[NG_CAPTURE_FIELD] = updated_admission.model_dump(
+            mode="json"
+        )
 
         template_prefix_token_ids = updated_offload_params.get(
             PREFIX_TEMPLATE_TOKEN_IDS_FIELD
@@ -266,13 +269,15 @@ class TQMegatronTokenStager:
         # which would leave Gym with no coordinates at all.
         coords = self._capture.complete_call_from_response(call, payload)
         # Deferred: Megatron-LM's inference hooks are only present on the
-        # Megatron generation backend (see prepare_prompt).
+        # Megatron generation backend (see prepare_prompt); nemo_gym is an
+        # optional extra absent in non-gym runs.
         from megatron.core.inference.inference_request import (
             RequestPayloadStageResult,
         )
+        from nemo_gym.token_id_capture import NG_COMMIT_COORDS_FIELD
 
         return RequestPayloadStageResult(
             response_metadata={
-                "ng_commit_coords": coords.model_dump(mode="json"),
+                NG_COMMIT_COORDS_FIELD: coords.model_dump(mode="json"),
             }
         )
