@@ -988,6 +988,6 @@ def test_actor_registry_honors_system_flag(use_system_executable):
     else:
         envs = payload["envs"]
         assert envs[
-            "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2"
+            "nemo_rl.models.policy.workers.automodel_policy_worker.AutomodelPolicyWorker"
         ].startswith("uv run")
         assert envs["nemo_rl.environments.nemo_gym.NemoGym"].startswith("uv run")
