@@ -271,30 +271,13 @@ def convert_dcp_to_hf(
         )
     os.makedirs(hf_ckpt_path, exist_ok=True)
 
-    # The ckpt path of dtensor v2 is like <ckpt_dir>/model, while v1 is like <ckpt_dir>
-    # Choose the correct subdir based on the presence of the metadata file.
-    metadata_path = os.path.join(dcp_ckpt_path, ".metadata")
-    if not os.path.exists(metadata_path):
-        model_subdir = os.path.join(dcp_ckpt_path, "model")
-        model_metadata_path = os.path.join(model_subdir, ".metadata")
-        if os.path.exists(model_metadata_path):
-            dcp_ckpt_path = model_subdir
-            print(f"Using dcp_ckpt_path of Dtensor V2: {model_subdir}")
-        else:
-            raise FileNotFoundError(
-                f"No metadata file found in {dcp_ckpt_path}(Dtensor V1 ckpt path) or {model_subdir}(Dtensor V2 ckpt path)."
-            )
-    else:
-        print(f"Using dcp_ckpt_path of Dtensor V1: {dcp_ckpt_path}")
+    # Checkpoints are written at <ckpt_dir>/model.
+    dcp_ckpt_path = os.path.join(dcp_ckpt_path, "model")
+    if not os.path.exists(os.path.join(dcp_ckpt_path, ".metadata")):
+        raise FileNotFoundError(f"No metadata file found in {dcp_ckpt_path}.")
 
     weights_path = os.path.join(hf_ckpt_path, "pytorch_model.bin")
     dcp_to_torch_save(dcp_ckpt_path, weights_path)
-
-    # Reload and save because DCP exports wrap weights under {"model": ...} in dtensor v1
-    # while others save a flat state_dict already in dtensor v2.``
-    state_dict = torch.load(weights_path)
-    if set(state_dict.keys()) == {"model"}:
-        torch.save(state_dict["model"], weights_path)
 
     config = AutoConfig.from_pretrained(
         model_name_or_path, trust_remote_code=True, **hf_overrides
