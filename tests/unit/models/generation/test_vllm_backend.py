@@ -711,6 +711,15 @@ def test_padded_trtllm_reload_finalizes_at_logical_weight_size(monkeypatch):
     record_metadata_for_reloading(layer)
     initialize_layerwise_reload(layer)
     layer.w13_weight.weight_loader(layer.w13_weight, torch.ones(2, 6, 3))
+
+    monkeypatch.setattr(
+        vllm_backend,
+        "_unquantized_flashinfer_trtllm_modules",
+        lambda _model: [layer],
+    )
+    vllm_backend._finalize_complete_padded_trtllm_layers(layer, object())
+    assert get_layerwise_info(layer).can_load() is True
+
     layer.w2_weight.weight_loader(layer.w2_weight, torch.full((2, 3, 3), 2.0))
 
     info = get_layerwise_info(layer)
@@ -718,11 +727,6 @@ def test_padded_trtllm_reload_finalizes_at_logical_weight_size(monkeypatch):
     assert info.load_numel_total == 72
     assert len(info.loaded_weights) == 2
 
-    monkeypatch.setattr(
-        vllm_backend,
-        "_unquantized_flashinfer_trtllm_modules",
-        lambda _model: [layer],
-    )
     vllm_backend._finalize_complete_padded_trtllm_layers(layer, object())
 
     assert get_layerwise_info(layer).can_load() is False
