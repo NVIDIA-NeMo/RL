@@ -13,13 +13,10 @@
 # limitations under the License.
 """TransferQueue implementations of NeMo-Gym's token staging protocols.
 
-``TQTokenSink``/``TQTokenSource`` are NeMo-RL's providers for the
-ledger-authoritative capture design:
-the sink is the worker-side write of one model call's token delta to the
-``rollout_staging`` partition — the design's only heavy token hop — and the
-source is the finalizer's read-back of those rows by staging key. This module
-is the only hot-path file that knows tokens live in TQ; Gym sees opaque
-staging keys.
+``TQStagingStore`` is NeMo RL's single keyed-row transport for token custody.
+Both vLLM and MInf write canonical Gym call deltas through ``TQTokenSink``.
+This module is the only hot-path file that knows tokens live in TQ; Gym sees
+opaque staging keys.
 
 Each staged row carries three jagged columns (``token_ids_delta``,
 ``token_mask_delta``, ``generation_logprobs_delta``), the complete receipt
@@ -36,6 +33,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -139,6 +137,49 @@ def _call_dp(dp_client: Any, method_name: str, **kwargs: Any) -> Any:
     return method(**kwargs)
 
 
+class TQStagingStore:
+    """Shared keyed-row transport for all token-capture TQ codecs."""
+
+    def __init__(self, dp_client: Any, *, staging_partition: str) -> None:
+        self._dp_client = dp_client
+        self._staging_partition = staging_partition
+
+    def put(
+        self,
+        key: str,
+        field_dict: dict[str, torch.Tensor],
+        *,
+        tags: dict[str, Any] | None = None,
+    ) -> None:
+        _call_dp(
+            self._dp_client,
+            "put_samples",
+            sample_ids=[key],
+            partition_id=self._staging_partition,
+            fields=TensorDict(field_dict, batch_size=[1]),
+            tags=[tags or {}],
+        )
+
+    def get(self, keys: list[str], *, select_fields: list[str]) -> TensorDict:
+        return _call_dp(
+            self._dp_client,
+            "get_samples",
+            sample_ids=list(keys),
+            partition_id=self._staging_partition,
+            select_fields=list(select_fields),
+        )
+
+    def clear(self, keys: list[str]) -> None:
+        if not keys:
+            return
+        _call_dp(
+            self._dp_client,
+            "clear_samples",
+            sample_ids=list(keys),
+            partition_id=self._staging_partition,
+        )
+
+
 class TQTokenSink:
     """Gym ``StagingSink`` over ``DataPlaneClient.put_samples``.
 
@@ -154,8 +195,7 @@ class TQTokenSink:
     """
 
     def __init__(self, dp_client: Any, *, staging_partition: str) -> None:
-        self._dp_client = dp_client
-        self._staging_partition = staging_partition
+        self._store = TQStagingStore(dp_client, staging_partition=staging_partition)
 
     def stage(self, record: StagedCallRecord) -> StageResult:
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
@@ -267,7 +307,6 @@ class TQTokenSink:
                 [routed_encoding], dtype=torch.int64
             )
             field_dict[ROUTED_LEN_FIELD] = torch.tensor([routed_len], dtype=torch.int64)
-            fields = TensorDict(field_dict, batch_size=[1])
             tags = [
                 {
                     "rollout_id": record.rollout_id,
@@ -281,14 +320,7 @@ class TQTokenSink:
                     "schema_version": record.schema_version,
                 }
             ]
-            _call_dp(
-                self._dp_client,
-                "put_samples",
-                sample_ids=[key],
-                partition_id=self._staging_partition,
-                fields=fields,
-                tags=tags,
-            )
+            self._store.put(key, field_dict, tags=tags[0])
         except Exception as error:  # noqa: BLE001 — any failure must poison, not crash serving
             # The reason string is dropped downstream (_failed_coords carries
             # only the disposition) — this log line is the only place the
@@ -306,14 +338,61 @@ class TQTokenSink:
 
     def clear(self, staging_keys: list[str]) -> None:
         """Drop staged rows (finalizer / eviction cleanup)."""
-        if not staging_keys:
-            return
-        _call_dp(
-            self._dp_client,
-            "clear_samples",
-            sample_ids=list(staging_keys),
-            partition_id=self._staging_partition,
-        )
+        self._store.clear(staging_keys)
+
+
+class ChainPrefixCache:
+    """Worker-local cache of resolved ``staging_chain`` prefixes."""
+
+    def __init__(self, source: Any | None = None) -> None:
+        self._source = source
+        self._cache: dict[str, list[int]] = {}
+        self._lock = threading.Lock()
+
+    def install(self, source: Any) -> None:
+        """Attach (or replace) the ``TQTokenSource`` and drop cached chains."""
+        with self._lock:
+            self._source = source
+            self._cache.clear()
+
+    def fetch(self, staging_chain: list[str]) -> list[int]:
+        """Assemble prefix token ids from staging_chain, with a worker-local FIFO (256-entry) cache."""
+        cache = self._cache
+        with self._lock:
+            source = self._source
+            cached_ids: list[int] = []
+            miss_start = 0
+            for i, key in enumerate(staging_chain):
+                if key in cache:
+                    cached_ids = cache[key]
+                    miss_start = i + 1
+            miss_keys = staging_chain[miss_start:]
+        if not miss_keys:
+            return list(cached_ids)
+        if source is None:
+            raise RuntimeError(
+                "staging source not initialized; call setup_token_capture() first"
+            )
+        # TQ read stays outside the lock so concurrent fetches overlap.
+        fetched = source.fetch_prefix_token_ids(miss_keys)
+        result = cached_ids + fetched
+        last_key = staging_chain[-1]
+        with self._lock:
+            cache[last_key] = result
+            if len(cache) > 256:
+                del cache[next(iter(cache))]
+        return result
+
+
+def resolve_admission_prefix(
+    admission: Any, chain_prefix: ChainPrefixCache
+) -> list[int]:
+    """Resolve a ``CaptureAdmission`` to the flat prefix the engine prompt starts with."""
+    if admission.mode == "text":
+        return []
+    if admission.staging_chain:
+        return chain_prefix.fetch(list(admission.staging_chain))
+    return list(admission.required_prefix_token_ids)
 
 
 class TQTokenSource:
@@ -331,7 +410,7 @@ class TQTokenSource:
     """
 
     def __init__(self, dp_client: Any, *, staging_partition: str) -> None:
-        self._dp_client = dp_client
+        self._store = TQStagingStore(dp_client, staging_partition=staging_partition)
         self._staging_partition = staging_partition
 
     def fetch(self, staging_keys: list[str]) -> list[StagedCallBaseSnapshot]:
@@ -345,11 +424,8 @@ class TQTokenSource:
         if len(set(staging_keys)) != len(staging_keys):
             raise KeyError("prefix fetch: staging_keys contains duplicates")
         try:
-            rows = _call_dp(
-                self._dp_client,
-                "get_samples",
-                sample_ids=list(staging_keys),
-                partition_id=self._staging_partition,
+            rows = self._store.get(
+                staging_keys,
                 select_fields=["token_ids_delta"],
             )
         except Exception as error:  # noqa: BLE001 — protocol maps any miss to KeyError
@@ -393,29 +469,14 @@ class TQTokenSource:
                 # worker); fall back to the base schema so extras-free rows
                 # keep fetching.
                 try:
-                    rows = _call_dp(
-                        self._dp_client,
-                        "get_samples",
-                        sample_ids=list(staging_keys),
-                        partition_id=self._staging_partition,
+                    rows = self._store.get(
+                        staging_keys,
                         select_fields=STAGING_FIELDS + [ROUTED_EXPERTS_FIELD],
                     )
                 except Exception:  # noqa: BLE001 — field-not-present probe
-                    rows = _call_dp(
-                        self._dp_client,
-                        "get_samples",
-                        sample_ids=list(staging_keys),
-                        partition_id=self._staging_partition,
-                        select_fields=STAGING_FIELDS,
-                    )
+                    rows = self._store.get(staging_keys, select_fields=STAGING_FIELDS)
             else:
-                rows = _call_dp(
-                    self._dp_client,
-                    "get_samples",
-                    sample_ids=list(staging_keys),
-                    partition_id=self._staging_partition,
-                    select_fields=STAGING_FIELDS,
-                )
+                rows = self._store.get(staging_keys, select_fields=STAGING_FIELDS)
         except Exception as error:  # noqa: BLE001 — protocol maps misses to KeyError
             raise KeyError(
                 f"staged rows for {len(staging_keys)} keys could not be "

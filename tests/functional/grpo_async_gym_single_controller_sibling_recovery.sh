@@ -1,14 +1,32 @@
 #!/bin/bash
 # Two-process functional test for sibling-level token-capture recovery.
+#
+# SC_SIBLING_RECOVERY_GENERATION_BACKEND selects the SC+Gym smoke that both
+# phases run through: vllm (default) or megatron. The hook, overrides and
+# assertions are backend-agnostic; only the base test and its log path differ.
 
 set -eou pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 PROJECT_ROOT=$(realpath "$SCRIPT_DIR/../..")
-BASE_TEST=$SCRIPT_DIR/grpo_async_gym_single_controller.sh
-TEST_DIR=$SCRIPT_DIR/grpo_async_gym_single_controller_sibling_recovery
+GENERATION_BACKEND=${SC_SIBLING_RECOVERY_GENERATION_BACKEND:-vllm}
+case "$GENERATION_BACKEND" in
+    vllm)
+        BASE_NAME=grpo_async_gym_single_controller
+        TEST_DIR=$SCRIPT_DIR/grpo_async_gym_single_controller_sibling_recovery
+        ;;
+    megatron)
+        BASE_NAME=grpo_megatron_generation_gym_single_controller
+        TEST_DIR=$SCRIPT_DIR/grpo_megatron_generation_gym_single_controller_sibling_recovery
+        ;;
+    *)
+        echo "Unsupported SC_SIBLING_RECOVERY_GENERATION_BACKEND=$GENERATION_BACKEND (expected vllm or megatron)"
+        exit 2
+        ;;
+esac
+BASE_TEST=$SCRIPT_DIR/$BASE_NAME.sh
 CHECKPOINT_DIR=$TEST_DIR/checkpoints
-BASE_RUN_LOG=$SCRIPT_DIR/grpo_async_gym_single_controller/run.log
+BASE_RUN_LOG=$SCRIPT_DIR/$BASE_NAME/run.log
 PHASE1_LOG=$TEST_DIR/phase1.log
 PHASE2_LOG=$TEST_DIR/phase2.log
 PHASE1_EVENTS=$TEST_DIR/phase1-events.jsonl
@@ -23,7 +41,7 @@ COMMON_OVERRIDES=(
     checkpointing.checkpoint_dir="$CHECKPOINT_DIR"
     checkpointing.metric_name=null
     checkpointing.save_period=1
-    +checkpointing.save_data_plane=true
+    ++checkpointing.save_data_plane=true
     ++token_capture.enabled=true
     ++rollout_recovery.default_granularity=sibling
     async_rl.sampler.name=in_order
@@ -67,6 +85,16 @@ RUN_CONVERGENCE_CHECKS=0 bash "$BASE_TEST" \
     "${COMMON_OVERRIDES[@]}"
 cp "$BASE_RUN_LOG" "$PHASE2_LOG"
 
+# Token capture must not reject or poison any rollout in the resumed run. Phase 1
+# is cut off on purpose, so only phase 2's metrics are checked. Both phases run
+# the base test with RUN_CONVERGENCE_CHECKS=0, so the metrics are dumped here.
+PHASE2_METRICS=$TEST_DIR/phase2-metrics.json
+uv run --directory "$PROJECT_ROOT" --no-sync tests/json_dump_tb_logs.py \
+    "$SCRIPT_DIR/$BASE_NAME/logs" --output_path "$PHASE2_METRICS"
+uv run --directory "$PROJECT_ROOT" --no-sync tests/check_metrics.py "$PHASE2_METRICS" \
+    'max(data["train/finalize/invalid_row_rate"]) == 0' \
+    'max(data["train/finalize/capture_poisoned_rollouts"]) == 0'
+
 grep -q "Native TQ checkpoint restored and validated" "$PHASE2_LOG"
 grep -q "Loaded .* unfinished rollout group(s)" "$PHASE2_LOG"
 test -d "$CHECKPOINT_DIR/step_2/data_plane"
@@ -78,4 +106,4 @@ uv run --directory "$PROJECT_ROOT" --no-sync python -c \
     'import sys, torch; state = torch.load(sys.argv[1], weights_only=True); group_id = sys.argv[2]; assert group_id not in {group["group_id"] for group in state["groups"]}, state' \
     "$CHECKPOINT_DIR/step_2/rollout_recovery.pt" "$PARTIAL_GROUP_ID"
 
-echo "Sibling-level token-capture recovery functional test passed."
+echo "Sibling-level token-capture recovery functional test passed ($GENERATION_BACKEND backend)."

@@ -38,7 +38,6 @@ from megatron.bridge.training.utils.train_utils import (
 )
 from megatron.bridge.utils.common_utils import get_rank_safe
 from megatron.core import parallel_state
-from megatron.core.dist_checkpointing.strategies.torch import get_async_strategy
 from megatron.core.distributed import DistributedDataParallel
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallelV1,
@@ -48,6 +47,15 @@ from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import get_model_config, unwrap_model
 from transformers import PreTrainedTokenizerBase
+
+try:
+    from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
+        FileSystemWriterAsync,
+    )
+except ImportError:
+    # nvidia-resiliency-ext is optional; it is only needed to release the NVRx
+    # persistent writer's CUDA cache after colocated async checkpoint saves.
+    FileSystemWriterAsync = None  # type: ignore
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossFunction
@@ -4757,10 +4765,13 @@ class MegatronPolicyWorkerImpl(
             terminate=release_cuda_cache,
         )
         if release_cuda_cache:
-            _, async_modules = get_async_strategy(
-                self.mcore_state.cfg.checkpoint.async_strategy
-            )
-            writer_cls = async_modules["FileSystemWriterAsync"]
+            if FileSystemWriterAsync is None:
+                raise ModuleNotFoundError(
+                    "nvidia-resiliency-ext is required to release the NVRx async "
+                    "checkpoint writer's CUDA cache, but it could not be imported "
+                    "in the megatron worker environment."
+                )
+            writer_cls = FileSystemWriterAsync
             cleanup_tensor_caches = getattr(writer_cls, "cleanup_tensor_caches", None)
             if cleanup_tensor_caches is not None:
                 cleanup_tensor_caches()
