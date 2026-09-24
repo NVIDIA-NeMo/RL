@@ -323,6 +323,17 @@ def main():
         help="vLLM tensor parallel size (default 1)",
     )
     parser.add_argument(
+        "--max-model-len",
+        type=int,
+        default=None,
+        help=(
+            "vLLM max_model_len (default: the model's own limit). With chunked "
+            "prefill disabled vLLM profiles a full max_model_len prefill, so a "
+            "262k-token limit costs ~11 GiB of activation headroom that this "
+            "diagnostic never uses; bound it to prompt + --max-tokens instead."
+        ),
+    )
+    parser.add_argument(
         "--num-batches",
         type=int,
         default=2,
@@ -369,6 +380,8 @@ def main():
         # decode sequence), so keep the sequence budget small.
         max_num_seqs=64,
     )
+    if args.max_model_len is not None:
+        llm_kwargs["max_model_len"] = args.max_model_len
     llm = LLM(**llm_kwargs)
 
     if args.prompts == "arc":
