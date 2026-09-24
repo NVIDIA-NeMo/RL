@@ -67,6 +67,11 @@ from nemo_rl.algorithms.loss import (
     ClippedPGLossDataDict,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.metric_utils import (
+    GRAD_NORM_KEY,
+    LOSS_KEY,
+    REWARD_KEY,
+)
 from nemo_rl.algorithms.reward_functions import apply_reward_shaping
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
@@ -1165,9 +1170,9 @@ def grpo_train_sync(
                 memory_tracker.snapshot_start_of_stage("Metrics", dir())
                 metrics = {
                     **metrics,
-                    "loss": train_results["loss"].numpy(),
-                    "grad_norm": train_results["grad_norm"].numpy(),
-                    "reward": rewards.numpy(),
+                    LOSS_KEY: train_results["loss"].numpy(),
+                    GRAD_NORM_KEY: train_results["grad_norm"].numpy(),
+                    REWARD_KEY: rewards.numpy(),
                     "mean_prompt_length": length.numpy(),
                     "total_num_tokens": input_lengths.numpy(),
                     "advantages/mean": torch.mean(response_advantages).detach().item()

@@ -53,6 +53,7 @@ from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossFn
 from nemo_rl.algorithms.loss.utils import rescale_loss_metrics
+from nemo_rl.algorithms.metric_utils import LEARNING_RATE_KEY
 from nemo_rl.data.multimodal_utils import (
     attach_media_token_validity_mask,
     chunks_accept_media_token_validity_mask,
@@ -139,7 +140,10 @@ from nemo_rl.models.policy.workers.checkpoint_engine import (
     maybe_preinit_nixl_checkpoint_engine,
 )
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
-from nemo_rl.telemetry.setup import init_telemetry_worker
+from nemo_rl.telemetry.setup import (
+    init_telemetry_worker,
+    traced_worker_init,
+)
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
@@ -563,6 +567,7 @@ class MegatronPolicyWorkerImpl(
         init_kwargs: dict[str, Any] = {}
         return resources, env_vars, init_kwargs, {}
 
+    @traced_worker_init("rl.policy.load_model", **{"rl.backend": "megatron"})
     def __init__(
         self,
         config: PolicyConfig,
@@ -1333,7 +1338,7 @@ class MegatronPolicyWorkerImpl(
                         gb_loss_metrics.append(loss_metrics)
                         curr_lr = self.scheduler.get_lr(self.optimizer.param_groups[0])
                         curr_wd = self.scheduler.get_wd()
-                        loss_metrics["lr"] = curr_lr
+                        loss_metrics[LEARNING_RATE_KEY] = curr_lr
                         loss_metrics["wd"] = curr_wd
                         loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
                         loss_metrics["global_valid_toks"] = global_valid_toks.item()
