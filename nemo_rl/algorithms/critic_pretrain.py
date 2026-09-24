@@ -582,18 +582,28 @@ def split_group_responses(
     """
     batch = group["batch"]
     size = batch.size
-    if "rollout_local_idx" in batch:
+    if "trace_in_rollout_idx" in batch:
         # Multi-trace shards: rows are TRACES, several per rollout, stored
         # contiguously per rollout. `start`/`end` are ROLLOUT indices; cutting
         # by raw row position would split a rollout's root and subagent traces
         # across train/heldout (label leakage: siblings share the reward).
-        rid = batch["rollout_local_idx"].tolist()
-        assert all(a <= b for a, b in zip(rid, rid[1:])), (
-            "rollout_local_idx is not non-decreasing within a group — the "
-            "flatten order changed; response-level splitting cannot cut at "
-            "rollout boundaries."
+        #
+        # Boundaries come from trace_in_rollout_idx, NOT rollout_local_idx:
+        # collection generates each rollout as its own single-sample batch, so
+        # that field is sample-local and reads all-zero once the group is
+        # assembled — it would report every group as exactly 1 rollout.
+        tir = [int(t) for t in batch["trace_in_rollout_idx"].tolist()]
+        assert tir and tir[0] == 0, (
+            "trace_in_rollout_idx does not start a rollout at row 0 "
+            f"(got {tir[:8]}); cannot cut at rollout boundaries."
         )
-        n_rollouts = len(set(rid))
+        rid: list[int] = []
+        cur = -1
+        for t in tir:
+            if t == 0:
+                cur += 1
+            rid.append(cur)
+        n_rollouts = cur + 1
         assert 0 <= start < end <= n_rollouts, (
             f"response slice [{start}, {end}) out of range for a group of "
             f"{n_rollouts} rollouts ({size} trace rows); check critic_pretrain."
