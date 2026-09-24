@@ -955,7 +955,7 @@ class TestLoRAMergeUnderStateDictTransparentWrappers:
     the base policy for the whole run."""
 
     @staticmethod
-    def _lora_model():
+    def _lora_model(n=4):
         lora = pytest.importorskip("nemo_automodel.components._peft.lora")
         from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
             checkpoint_wrapper,
@@ -964,7 +964,7 @@ class TestLoRAMergeUnderStateDictTransparentWrappers:
         class Block(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.proj = nn.Linear(4, 4, bias=False)
+                self.proj = nn.Linear(n, n, bias=False)
 
             def forward(self, x):
                 return self.proj(x)
@@ -1013,3 +1013,22 @@ class TestLoRAMergeUnderStateDictTransparentWrappers:
         out = dict(dtensor_params_generator(model, torch.float32))
         assert set(out) == {"layers.0.proj.weight"}
         torch.testing.assert_close(out["layers.0.proj.weight"], expected)
+
+    def test_bf16_merge_matches_fp32_offline_merge_exactly(self):
+        # A bf16 base weight merged in bf16 rounds twice (delta, then sum) and can land one
+        # ulp away from an offline fp32 merge; the refit must produce the offline result.
+        model, _ = self._lora_model(n=64)
+        proj = model.layers[0]._checkpoint_wrapped_module.proj
+        with torch.no_grad():
+            proj.weight.copy_(torch.randn_like(proj.weight))
+            proj.lora_A.weight.copy_(torch.randn_like(proj.lora_A.weight) * 0.05)
+            proj.lora_B.weight.copy_(torch.randn_like(proj.lora_B.weight) * 0.05)
+        model.to(torch.bfloat16)
+        scale = getattr(proj, "scale", None) or proj.alpha / proj.dim
+        offline = (
+            proj.weight.float()
+            + (proj.lora_B.weight.float() @ proj.lora_A.weight.float()) * scale
+        ).to(torch.bfloat16)
+        out = dict(dtensor_params_generator(model, torch.bfloat16))
+        assert out["layers.0.proj.weight"].dtype == torch.bfloat16
+        assert torch.equal(out["layers.0.proj.weight"], offline)

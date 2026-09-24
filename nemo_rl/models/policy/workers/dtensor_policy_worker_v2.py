@@ -195,8 +195,6 @@ def _maybe_merge_lora_weight(
         if isinstance(module.lora_B.weight, DTensor)
         else module.lora_B.weight
     )
-    lora_a = lora_a.to(device=tensor.device, dtype=tensor.dtype)
-    lora_b = lora_b.to(device=tensor.device, dtype=tensor.dtype)
     scale = getattr(module, "scale", None)
 
     if scale is None and hasattr(module, "alpha") and hasattr(module, "dim"):
@@ -204,7 +202,15 @@ def _maybe_merge_lora_weight(
     if scale is None:
         scale = 1.0
 
-    return tensor + torch.matmul(lora_b, lora_a) * scale
+    # Merge in fp32 and round once. Computing ``B @ A`` and the sum in the base weight's
+    # dtype (bf16 in practice) rounds twice, so the refit weights differ from an offline
+    # merge (``W.float() + (B.float() @ A.float()) * scale``, then a single cast) by up to
+    # one bf16 ulp per element; merging in fp32 makes the generation engine serve exactly
+    # the weights a merged checkpoint would.
+    lora_a = lora_a.to(device=tensor.device, dtype=torch.float32)
+    lora_b = lora_b.to(device=tensor.device, dtype=torch.float32)
+    merged = tensor.to(torch.float32) + torch.matmul(lora_b, lora_a) * scale
+    return merged.to(tensor.dtype)
 
 
 def _maybe_adapt_tensor_to_hf(
