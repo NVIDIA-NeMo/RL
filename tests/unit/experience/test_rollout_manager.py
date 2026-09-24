@@ -1065,8 +1065,8 @@ def test_streamed_receipt_callback_uses_current_completion_conversion():
             assert num_returns == "streaming"
             return self
 
-        def remote(self, pending, timer_prefix):
-            del pending, timer_prefix
+        def remote(self, pending, timer_prefix, per_prompt=False):
+            del pending, timer_prefix, per_prompt
 
             async def result_ref():
                 return (
