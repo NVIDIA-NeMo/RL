@@ -228,10 +228,7 @@ jobs:
             <<< "$test_plan")
           # The managed Dynamo runtime is currently amd64-only and is not
           # installed in the arm64 GB200 image. L1_Functional_Tests_Trtllm runs
-          # against docker/Dockerfile.trtllm instead of the shared GB200 image
-          # (see build-container-gb200-trtllm / cicd-functional-tests-gb200-trtllm)
-          # -- docker/Dockerfile's own trtllm build is torch-ABI-incompatible
-          # with the version TensorRT-LLM actually needs.
+          # against docker/Dockerfile.trtllm instead of the shared GB200 image.
           gb200_functional_test_scripts=$(jq -c \
             '[.functional[] | select(. != "L1_Functional_Tests_Dynamo" and . != "L1_Functional_Tests_Trtllm")]' \
             <<< "$test_plan")
