@@ -104,11 +104,22 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         "setup_single_controller",
         setup_single_controller,
     )
+    actor_remote = MagicMock(return_value=actor)
     monkeypatch.setattr(
         run_grpo_single_controller.SingleControllerActor,
         "remote",
-        MagicMock(return_value=actor),
+        actor_remote,
     )
+    # .options() returns a fresh actor class on the real thing, so route it back
+    # to the same remote or the patch above is bypassed.
+    actor_options = MagicMock(return_value=SimpleNamespace(remote=actor_remote))
+    monkeypatch.setattr(
+        run_grpo_single_controller.SingleControllerActor,
+        "options",
+        actor_options,
+    )
+    # No dedicated head in these tests, so the driver takes the unpinned path.
+    monkeypatch.setattr(run_grpo_single_controller.ray, "cluster_resources", lambda: {})
     monkeypatch.setattr(run_grpo_single_controller.ray, "get", ray_get)
     monkeypatch.setattr(run_grpo_single_controller.ray, "wait", ray_wait)
     monkeypatch.setattr(
@@ -119,6 +130,7 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
 
     return SimpleNamespace(
         actor_args=actor_args,
+        actor_options=actor_options,
         config=config,
         configure_generation=configure_generation,
         configured_generation=configured_generation,
@@ -163,6 +175,78 @@ def test_cleanup_is_best_effort_and_preserves_run_error(
     trainer.shutdown.assert_called_once_with()
     output = capsys.readouterr().out
     assert "Generation shutdown failed: generation cleanup failed" in output
+
+
+def test_a_dedicated_ray_head_claims_the_whole_unit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("NRL_PIN_CONTROLLER_TO_HEAD", raising=False)
+    monkeypatch.setattr(
+        run_grpo_single_controller.ray,
+        "cluster_resources",
+        lambda: {"ray_head": 1.0, "GPU": 8.0},
+    )
+
+    assert run_grpo_single_controller._controller_placement() == {
+        "resources": {"ray_head": 1}
+    }
+
+
+def test_the_pin_can_be_switched_off_on_a_cluster_that_has_a_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reservation and the pin are separable, which ray.sub cannot express."""
+    monkeypatch.setenv("NRL_PIN_CONTROLLER_TO_HEAD", "0")
+    monkeypatch.setattr(
+        run_grpo_single_controller.ray,
+        "cluster_resources",
+        lambda: {"ray_head": 1.0, "GPU": 8.0},
+    )
+
+    assert run_grpo_single_controller._controller_placement() == {}
+
+
+def test_no_dedicated_head_leaves_the_controller_unpinned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ray.sub advertises ray_head only under DEDICATED_RAY_HEAD=1.
+
+    Read from the live cluster rather than the env var, so a launcher that asked
+    for a head it did not get falls back instead of pinning to nothing.
+    """
+    monkeypatch.setattr(
+        run_grpo_single_controller.ray,
+        "cluster_resources",
+        lambda: {"GPU": 8.0},
+    )
+
+    assert run_grpo_single_controller._controller_placement() == {}
+
+
+def test_main_applies_the_placement_when_launching_the_controller(
+    main_context: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("NRL_PIN_CONTROLLER_TO_HEAD", raising=False)
+    # Overrides the fixture's headless cluster.
+    monkeypatch.setattr(
+        run_grpo_single_controller.ray,
+        "cluster_resources",
+        lambda: {"ray_head": 1.0},
+    )
+
+    run_grpo_single_controller.main()
+
+    main_context.actor_options.assert_called_once_with(resources={"ray_head": 1})
+
+
+def test_main_requests_no_resource_without_a_dedicated_head(
+    main_context: SimpleNamespace,
+) -> None:
+    """The fixture's cluster has no head, which is every non-ray.sub run."""
+    run_grpo_single_controller.main()
+
+    main_context.actor_options.assert_called_once_with()
 
 
 def test_main_configures_generation_for_trained_mtp(
