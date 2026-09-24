@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "flow-grpo"
+version = "0.1.0"
+description = "Experimental Flow-GRPO image diffusion training on NeMo RL"
+readme = "README.md"
+requires-python = ">=3.13.14,<3.14"
+dependencies = [
+  "nemo-rl[automodel]",
+  "diffusers>=0.37",
+  "paddleocr>=2.9,<3.0",
+  "paddlepaddle>=2.6",
+]
+
+[dependency-groups]
+test = ["pytest>=7.0.0", "pytest-timeout", "pytest-cov"]
+
+[tool.uv.sources]
+nemo-rl = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["flow_grpo"]
+
+[tool.pytest.ini_options]
+addopts = "--durations=15 -s -rA -x"
+testpaths = ["tests"]
+python_files = "test_*.py"

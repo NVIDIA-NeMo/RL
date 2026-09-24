@@ -142,44 +142,23 @@ EXCLUDED_UNIT_TESTS=(
     --ignore=unit/models/policy/test_patches.py
 
     # test_dtensor_worker.py — keep 3 correctness checks, exclude rest (~52-116s each)
-    # Kept: test_dtensor_single_gpu_training[True], test_dtensor_loss_independent_of_microbatch_size_two_gpus,
-    #        test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded (v2 only, no llama)
+    # Kept: test_dtensor_single_gpu_training, test_dtensor_loss_independent_of_microbatch_size_two_gpus,
+    #        test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded (no llama)
     --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestSingleGPUCluster::test_dtensor_single_gpu_logprob
     --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_lm_policy_init
     --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_training
     --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_training_with_lora
     --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_tp_and_tied_model_with_custom_parallel_plan
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_v1_policy_flops_range_check
+    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_policy_flops_range_check
     --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_with_lora
 
-    # DTensor — exclude v1 (use_v2=False) variants of kept tests
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestSingleGPUCluster::test_dtensor_single_gpu_training[False]
-
-    # DTensor logprob — exclude v1 variants (all 16 setups)
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[False-setup0]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[False-setup1]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[False-setup2]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[False-setup3]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[False-setup4]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[False-setup5]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[False-setup6]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[False-setup7]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[False-setup8]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[False-setup9]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[False-setup10]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[False-setup11]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[False-setup12]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[False-setup13]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[False-setup14]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[False-setup15]
-
-    # DTensor logprob — exclude llama variants (v2 only): setup2-4 = llama TP=2, setup11-13 = llama CP=2
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[True-setup2]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[True-setup3]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[True-setup4]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[True-setup11]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[True-setup12]
-    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[True-setup13]
+    # DTensor logprob — exclude llama variants: setup2-4 = llama TP=2, setup11-13 = llama CP=2
+    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[logprob_setup2]
+    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[logprob_setup3]
+    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[logprob_setup4]
+    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[logprob_setup11]
+    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[logprob_setup12]
+    --deselect=tests/unit/models/policy/test_dtensor_worker.py::TestTwoGPUCluster::test_dtensor_worker_logprob_tp2_or_cp2_matches_unsharded[logprob_setup13]
 
     # test_megatron_worker.py — keep 2 correctness checks (~190s total), exclude rest (~77-114s each)
     # Kept: test_megatron_loss_independent_of_microbatch_size (loss correctness),
@@ -206,9 +185,6 @@ EXCLUDED_UNIT_TESTS=(
 
     # Megatron — GPU-heavy data tests
     --ignore=unit/models/megatron/test_megatron_data.py
-
-    # DTensor — exclude parallelize_plan_keys (loads HF model configs, ~31-33s per param)
-    --deselect=tests/unit/models/dtensor/test_parallelize.py::test_parallelize_plan_keys
 
     ###########################################################################
     # EXPERIENCE — rollout tests need vLLM setup (~67-91s each).

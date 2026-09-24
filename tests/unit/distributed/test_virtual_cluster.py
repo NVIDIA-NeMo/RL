@@ -25,7 +25,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 import ray
 
+from nemo_rl.distributed import virtual_cluster
 from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_DATA_PLANE_PORT_RANGE_HIGH,
+    DEFAULT_DATA_PLANE_PORT_RANGE_LOW,
     DEFAULT_DYNAMO_CONTROL_PORT_RANGE_LOW,
     DEFAULT_GENERATION_PORT_RANGE_HIGH,
     DEFAULT_GENERATION_PORT_RANGE_LOW,
@@ -42,12 +45,17 @@ from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_VLLM_PORT_RANGE_LOW,
     DEFAULT_VLLM_PORTS_PER_ENGINE,
     PY_EXECUTABLES,
+    RAY_CLUSTER_EXTERNAL,
+    RAY_CLUSTER_REUSED_LOCAL,
+    RAY_CLUSTER_STARTED_LOCAL,
     RayVirtualCluster,
     ResourceInsufficientError,
     _bind_socket_in_range,
     _get_free_consecutive_ports_local,
     _get_free_port_local,
     _get_node_ip_and_free_port,
+    _init_ray,
+    _reserve_data_plane_ports,
 )
 from nemo_rl.utils.venvs import create_local_venv
 from tests.unit.conftest import TEST_ASSETS_DIR
@@ -238,6 +246,39 @@ def test_ray_uses_same_cluster_for_permuted_cuda_devices():
         assert mock_ray_init.call_count == 1
         assert mock_ray_init.call_args_list[0][1]["address"] == "auto"
         assert mock_ray_shutdown.call_count == 0
+
+
+@pytest.mark.parametrize(
+    "cluster_res, expected",
+    [
+        # A cluster NeMo-RL started earlier, whose CVD tag still matches.
+        ({"GPU": 1, "nrl_tag_0": 1}, RAY_CLUSTER_REUSED_LOCAL),
+        # Somebody else's cluster (ray.sub, KubeRay): no nrl_tag_ resource.
+        ({"GPU": 8}, RAY_CLUSTER_EXTERNAL),
+    ],
+)
+def test_init_ray_reports_how_it_got_its_cluster(cluster_res, expected):
+    """Recorded on rl.setup.ray_init: attaching and booting differ by minutes,
+    and that difference is the usual reason two identical runs disagree on
+    time-to-first-step.
+    """
+    with (
+        patch("ray.init"),
+        patch("ray.shutdown"),
+        patch("ray.cluster_resources", return_value=cluster_res),
+        patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0"}, clear=True),
+    ):
+        assert _init_ray() == expected
+
+
+def test_init_ray_reports_a_freshly_booted_cluster():
+    with (
+        patch("ray.init", side_effect=[ConnectionError("no cluster"), None]),
+        patch("ray.shutdown"),
+        patch("ray.cluster_resources", return_value={"GPU": 1}),
+        patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0"}, clear=True),
+    ):
+        assert _init_ray() == RAY_CLUSTER_STARTED_LOCAL
 
 
 def test_maybe_configure_data_plane_env_then_init_ray_threads_env_vars():
@@ -576,6 +617,81 @@ class TestGetFreeConsecutivePortsLocal:
             _get_free_consecutive_ports_local(14950, 15000, consecutive=0)
 
 
+class TestReserveDataPlanePorts:
+    """Tests for _reserve_data_plane_ports().
+
+    The defaults the data plane lands on -- 50050 for mooncake's metadata
+    server and 50051 for the master RPC, both from TransferQueue's config.yaml,
+    plus 9003 for the master's metrics server from its own gflag -- all sit
+    inside the 9000-65000 ephemeral range these nodes use. The kernel can hand
+    any of them to an outgoing connection in the minutes between job start and
+    the master's bind, and the master then exits with EADDRINUSE after every
+    node is already up.
+    """
+
+    def test_ports_are_distinct_bindable_and_in_band(self):
+        ports = _reserve_data_plane_ports(3)
+
+        # Distinctness is the regression worth guarding: without excluded_ports
+        # the allocator can hand back the same port twice, pointing two of the
+        # master's servers at one address.
+        assert len(set(ports)) == 3, f"all ports must differ, got {ports}"
+        for label, port in zip(("metadata", "master", "metrics"), ports):
+            assert (
+                DEFAULT_DATA_PLANE_PORT_RANGE_LOW
+                <= port
+                < DEFAULT_DATA_PLANE_PORT_RANGE_HIGH
+            ), f"{label} port {port} escaped the band ray.sub's map documents"
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                # No SO_REUSEADDR, matching mooncake_master: a port obtainable
+                # only by reusing a lingering slot is not one the master could
+                # bind either.
+                s.bind(("", port))
+
+    def test_ports_stay_below_the_ephemeral_floor(self):
+        ephemeral_range = Path("/proc/sys/net/ipv4/ip_local_port_range")
+        if not ephemeral_range.exists():
+            pytest.skip(f"{ephemeral_range} is unavailable on this platform")
+
+        ephemeral_low = int(ephemeral_range.read_text().split()[0])
+        assert max(_reserve_data_plane_ports(3)) < ephemeral_low
+
+    def test_occupied_port_is_routed_around(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as held:
+            try:
+                held.bind(("", DEFAULT_DATA_PLANE_PORT_RANGE_LOW))
+            except OSError:
+                pytest.skip(
+                    f"port {DEFAULT_DATA_PLANE_PORT_RANGE_LOW} is in use on this host"
+                )
+            held.listen(1)
+            ports = _reserve_data_plane_ports(3)
+
+        assert DEFAULT_DATA_PLANE_PORT_RANGE_LOW not in ports
+
+    def test_raises_when_the_band_cannot_satisfy_the_request(self, monkeypatch):
+        # A one-port band also proves each choice is excluded from the next:
+        # without that, the second call would reuse the first port instead of
+        # failing.
+        monkeypatch.setattr(
+            virtual_cluster,
+            "DEFAULT_DATA_PLANE_PORT_RANGE_HIGH",
+            DEFAULT_DATA_PLANE_PORT_RANGE_LOW + 1,
+        )
+        try:
+            # The one-port case has to succeed first, or a busy port would
+            # raise this same error before the exclusion is ever reached and
+            # the assertion below would pass for the wrong reason.
+            _reserve_data_plane_ports(1)
+        except RuntimeError:
+            pytest.skip(
+                f"port {DEFAULT_DATA_PLANE_PORT_RANGE_LOW} is in use on this host"
+            )
+
+        with pytest.raises(RuntimeError, match="Could not find a free port in range"):
+            _reserve_data_plane_ports(2)
+
+
 class TestRayVirtualClusterPortRange:
     """Tests for port range propagation in RayVirtualCluster."""
 
@@ -728,7 +844,8 @@ class TestVllmPortAssignment:
         assert "VLLM_PORT" not in env_vars
 
 
-def test_router_band_does_not_collide_with_ray_sub_ports():
+def _ray_sub_reserved_ports() -> set[int]:
+    """Every port ray.sub hands to Ray itself."""
     reserved = {
         _ray_sub_default("PORT"),
         _ray_sub_default("RAY_CLIENT_SERVER_PORT"),
@@ -750,6 +867,11 @@ def test_router_band_does_not_collide_with_ray_sub_ports():
             _ray_sub_default("MAX_WORKER_PORT") + 1,
         )
     )
+    return reserved
+
+
+def test_router_band_does_not_collide_with_ray_sub_ports():
+    reserved = _ray_sub_reserved_ports()
 
     router_band = set(
         range(
@@ -758,6 +880,15 @@ def test_router_band_does_not_collide_with_ray_sub_ports():
         )
     )
     assert not router_band & reserved, sorted(router_band & reserved)
+
+
+def test_data_plane_band_does_not_collide_with_ray_sub_ports():
+    reserved = _ray_sub_reserved_ports()
+
+    data_plane_band = set(
+        range(DEFAULT_DATA_PLANE_PORT_RANGE_LOW, DEFAULT_DATA_PLANE_PORT_RANGE_HIGH)
+    )
+    assert not data_plane_band & reserved, sorted(data_plane_band & reserved)
 
 
 def test_default_port_ranges_ordered_and_below_ephemeral_floor():
@@ -797,9 +928,18 @@ def test_default_port_ranges_ordered_and_below_ephemeral_floor():
         < DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_HIGH
     )
     assert DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_HIGH < EPHEMERAL_FLOOR
+    # The data-plane band sits below the Ray GCS ports, which is the only gap
+    # left under the router band, and has to hold every port mooncake's master
+    # listens on.
+    assert DEFAULT_DATA_PLANE_PORT_RANGE_LOW < DEFAULT_DATA_PLANE_PORT_RANGE_HIGH
+    assert DEFAULT_DATA_PLANE_PORT_RANGE_HIGH <= _ray_sub_default("PORT")
+    assert (
+        DEFAULT_DATA_PLANE_PORT_RANGE_HIGH - DEFAULT_DATA_PLANE_PORT_RANGE_LOW >= 3
+    ), "the band must fit the metadata, master RPC and metrics ports"
     # Avoid privileged ports (<1024).
     assert DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW > 1024
     assert DEFAULT_MASTER_PORT_RANGE_LOW > 1024
+    assert DEFAULT_DATA_PLANE_PORT_RANGE_LOW > 1024
 
 
 _REGISTRY_PROBE = """
@@ -848,6 +988,6 @@ def test_actor_registry_honors_system_flag(use_system_executable):
     else:
         envs = payload["envs"]
         assert envs[
-            "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker"
+            "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2"
         ].startswith("uv run")
         assert envs["nemo_rl.environments.nemo_gym.NemoGym"].startswith("uv run")

@@ -43,6 +43,7 @@ from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.models.policy.interfaces import ReferenceLogprobOutputSpec
+from nemo_rl.telemetry.instrumentation import trace_context_kwargs
 
 
 @dataclass
@@ -129,10 +130,16 @@ class TeacherWorkerGroup:
         cluster: RayVirtualCluster,
         policy_config: dict[str, Any],
         tokenizer: PreTrainedTokenizerBase,
+        teacher_index: int,
     ):
         self.alias = teacher_cfg.alias
         self.model_name = teacher_cfg.model_name
         self.teacher_cfg = teacher_cfg
+        # Stable per-checkpoint index assigned by create_teacher_worker_groups
+        # (ordered by checkpoint, so an alias edit does not renumber). Tags every
+        # payload row this group writes so the student can select the matching
+        # teacher LM head at training time.
+        self.teacher_index = teacher_index
 
         # Build a policy config for inference-only use.
         cfg = deepcopy(policy_config)
@@ -167,8 +174,7 @@ class TeacherWorkerGroup:
             cfg["dtensor_cfg"]["enabled"] = False
         if "peft" in cfg["megatron_cfg"]:
             cfg["megatron_cfg"]["peft"]["enabled"] = False
-        if "draft" in cfg:
-            cfg["draft"]["enabled"] = False
+        cfg.pop("draft", None)
         # Router replay keeps the student's rollout and training logprobs
         # consistent. A frozen teacher has no training pass, and its text-only
         # TQ fetch does not carry routed_experts, so replay must stay off.
@@ -252,6 +258,9 @@ class TeacherWorkerGroup:
         )
         self._opd_full_payload_field: Optional[str] = (
             opd_full_cfg["payload_field"] if opd_full_cfg else None
+        )
+        self._opd_full_teacher_index_field: Optional[str] = (
+            opd_full_cfg["teacher_index_field"] if opd_full_cfg else None
         )
 
         # Set up sequence packing / dynamic batching (mirrors lm_policy.py)
@@ -355,6 +364,9 @@ class TeacherWorkerGroup:
                 "opd_full_payload": self._opd_full_payload,
                 "opd_full_payload_dtype": self._opd_full_payload_dtype,
                 "opd_full_payload_field": self._opd_full_payload_field,
+                "opd_full_teacher_index": self.teacher_index,
+                "opd_full_teacher_index_field": self._opd_full_teacher_index_field,
+                **trace_context_kwargs(),
             },
         )
         self.worker_group.get_all_worker_results(futures)
