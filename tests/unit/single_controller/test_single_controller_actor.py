@@ -173,6 +173,11 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         partition_includes_multimodal_fields=False,
         bootstrap_identity=None,
         rollout_checkpoint_load_metrics=None,
+        gym_checkpoint_topology=None,
+        gym_checkpoint_restore_operation_id=None,
+        gym_checkpoint_staging_keys=(),
+        gym_checkpoint_continuations=(),
+        gym_restart_unfinished=False,
     )
     args.update(overrides)
     return SimpleNamespace(**args)

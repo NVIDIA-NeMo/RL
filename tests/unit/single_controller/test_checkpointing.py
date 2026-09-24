@@ -140,6 +140,34 @@ _PARTITION_ID = "rollout_data"
 _STAGING_PARTITION_ID = "rollout_staging"
 
 
+def _agent_checkpoint_topology() -> GymCheckpointTopology:
+    """Return the topology exported by ``_FakeGymCheckpointActor``."""
+    return GymCheckpointTopology.model_validate(
+        {
+            "schema_version": 1,
+            "participants": [
+                {
+                    "participant": {
+                        "server_name": "agent-route",
+                        "component": "responses_api_agents",
+                        "participant_name": "test-agent",
+                    },
+                    "schema_version": 1,
+                    "admission_states": ["accepting"],
+                    "checkpoint_mode": "export_restore",
+                    "concurrency_contract": "serialized_per_session",
+                    "multi_process": {
+                        "mode": "single_worker",
+                        "num_workers": 1,
+                    },
+                    "instance_role": None,
+                    "features": ["completed_result_acknowledgement"],
+                }
+            ],
+        }
+    )
+
+
 def _consumed_meta(*sample_ids: str) -> KVBatchMeta:
     """A train-consumed canonical meta as the train pump hands to cleanup."""
     return KVBatchMeta(
@@ -2514,6 +2542,7 @@ class TestPeriodicRolloutCheckpoint:
         actor._gym_participant_checkpointing_enabled = True
         actor._master_config.rollout_checkpointing.gym.participant_checkpointing_enabled = True
         actor._env_handles = {"nemo_gym": _FakeGymCheckpointActor(events)}
+        actor._gym_checkpoint_topology = _agent_checkpoint_topology()
 
         try:
             with (
@@ -2538,6 +2567,7 @@ class TestPeriodicRolloutCheckpoint:
         actor._gym_participant_checkpointing_enabled = True
         actor._master_config.rollout_checkpointing.gym.participant_checkpointing_enabled = True
         actor._env_handles = {"nemo_gym": _FakeGymCheckpointActor(events)}
+        actor._gym_checkpoint_topology = _agent_checkpoint_topology()
 
         try:
             with (
@@ -3705,6 +3735,7 @@ def _ppo_save_actor(tmp_path: Path, calls: list[str]):
     actor._checkpointer = MagicMock()
     actor._checkpointer.save_optimizer = True
     actor._checkpointer.init_tmp_checkpoint.return_value = str(checkpoint_path)
+    actor._gym_participant_checkpointing_enabled = False
     actor._is_ppo = True
     actor._trainer = _OrderRecordingPolicy(calls)
     actor._value = _OrderRecordingCritic(calls)
@@ -4046,6 +4077,7 @@ class TestSetupResumeWiring:
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=120.0
         )
+        mc.env["should_use_nemo_gym"] = True
         mc.token_capture = TokenCaptureConfig(enabled=True)
         mc.async_rl.rollout_failure.nemo_gym.max_row_attempts = 1
         mc.policy["generation"].update(

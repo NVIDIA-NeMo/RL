@@ -94,6 +94,8 @@ def _completion_receipt(
         "execution_generation": attempt_index + 1,
         "result_identity": f"result-{rollout_id}-{attempt_index}",
         "result_digest": f"{attempt_index + 1:064x}",
+        "manifest_capture_key": None,
+        "terminal_model_call_id": None,
     }
 
 
