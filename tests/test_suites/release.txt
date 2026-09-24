@@ -49,6 +49,9 @@ tests/test_suites/llm/grpo-dapomath17k-dsv3-megatron.sh
 # Functional MiniMax M2.7 run (text-only task)
 tests/test_suites/llm/grpo-minimax-m27-dapo-8n8g-automodel.sh
 
+# Functional MiniMax M3 run (CP8/EP128, non-colocated)
+tests/test_suites/llm/grpo-minimax-m3-32n8g-automodel-cp8ep128-noncolocated.sh
+
 # GPT-OSS
 tests/test_suites/llm/grpo-gptoss-20b-8n8g-megatron.sh
 

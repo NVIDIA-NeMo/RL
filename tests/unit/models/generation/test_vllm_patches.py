@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Guards for the vLLM source patches that had no coverage.
+"""Guards for vLLM source patches and scoped runtime workarounds.
 
-The two port patches ship their own suites. These cover the remaining patches:
+The two port patches ship their own suites. This module covers the other
+source-sensitive compatibility patches:
 
 * ``_patch_vllm_tool_parser_namespace_tool`` is the most load-bearing patch in
   the repo -- it is the only thing that makes vLLM 0.25.1 importable against
@@ -28,16 +29,32 @@ The two port patches ship their own suites. These cover the remaining patches:
   ``RAY_ENABLE_UV_RUN_RUNTIME_ENV`` and every user ``extra_env_vars`` to the
   Ray workers. Being additive rather than clobbering is the whole point of the
   rewrite, and it is pure string handling, so it is cheap to pin.
+* the MiniMax-M3 top-k patch must update both the indexer writer and sparse
+  attention reader together. Its tests pin both vLLM 0.25.1 source anchors and
+  ensure an unknown source cannot leave a half-applied layout change.
+* ``modelopt_moe_amax_aliases`` adapts nested ModelOpt buffers to vLLM's
+  MoE refit loader. Its lifecycle and installed-loader compatibility are
+  checked here, alongside the source patches.
 """
 
 import ast
 import logging
 import os
+import sys
+import types
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 from nemo_rl.models.generation.vllm import patches
+from nemo_rl.models.generation.vllm.config import (
+    VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
+    vllm_nemotron_h_fp32_lm_head_enabled,
+)
 from tests.unit.models.generation.vllm_patch_source_utils import (
+    patch_snippets,
     write_unpatched_copy,
 )
 
@@ -50,6 +67,255 @@ _RADIO_MARKER = "initializer_factor = self.config.initializer_factor"
 _GLM_DSA_SOURCE = "model_executor/models/deepseek_v2.py"
 _GLM_DSA_PATCH_FN = "_patch_vllm_glm_decoder_sequence_parallel_moe"
 _GLM_DSA_MARKER = 'getattr(config, "model_type", None) != "glm_moe_dsa"'
+_MINIMAX_M3_PATCH_FN = "_patch_vllm_minimax_m3_topk_buffer_layout"
+_MINIMAX_M3_SOURCES = {
+    "models/minimax_m3/common/indexer.py": (
+        "indexer_old_snippet",
+        "indexer_new_snippet",
+    ),
+    "models/minimax_m3/common/sparse_attention.py": (
+        "sparse_attention_old_snippet",
+        "sparse_attention_new_snippet",
+    ),
+}
+_MINIMAX_M3_INDEXER_MARKER = "buf_htk = ("
+_MINIMAX_M3_SPARSE_ATTN_MARKER = "else topk_buffer[:num_tokens].transpose(0, 1)"
+_NEMOTRON_H_SOURCE = """import torch
+from torch import nn
+
+
+def maybe_prefix(prefix, name):
+    return f"{prefix}.{name}"
+
+
+class LogitsProcessor:
+    def __init__(self, vocab_size):
+        self.vocab_size = vocab_size
+
+    def __call__(self, lm_head, hidden_states):
+        return lm_head.quant_method.apply(lm_head, hidden_states)
+
+
+class QuantMethod:
+    def __init__(self):
+        self.seen_dtypes = []
+
+    def apply(self, lm_head, hidden_states, bias=None):
+        self.seen_dtypes.append(
+            (
+                hidden_states.dtype,
+                lm_head.weight.dtype,
+                None if bias is None else bias.dtype,
+            )
+        )
+        logits = hidden_states @ lm_head.weight.t()
+        if bias is not None:
+            logits = logits + bias
+        return logits
+
+
+class ParallelLMHead(nn.Module):
+    def __init__(
+        self,
+        vocab_size,
+        hidden_size,
+        params_dtype=None,
+        quant_config=None,
+        prefix="",
+    ):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        self.params_dtype = params_dtype
+        self.quant_config = quant_config
+        self.prefix = prefix
+        self.weight = nn.Parameter(
+            torch.ones(vocab_size, hidden_size, dtype=torch.bfloat16),
+            requires_grad=False,
+        )
+        self.bias = None
+        self.quant_method = QuantMethod()
+
+    def forward(self, input_):
+        del input_
+        raise RuntimeError("LMHead's weights should be used in the sampler.")
+
+
+class NemotronHForCausalLM:
+    def __init__(self, config, prefix):
+        self.quant_config = object()
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=self.quant_config,
+            prefix=maybe_prefix(prefix, "lm_head"),
+        )
+        self.logits_processor = LogitsProcessor(config.vocab_size)
+
+    def compute_logits(self, hidden_states):
+        logits = self.logits_processor(self.lm_head, hidden_states)
+        return logits
+"""
+_MOE_SOURCE = "model_executor/layers/fused_moe/runner/moe_runner.py"
+_MOE_PATCH_FN = "_patch_vllm_moe_routed_experts_capture"
+_MOE_MARKER = "NeMo-RL patch (routed-experts capture for router replay)"
+
+
+@pytest.fixture
+def modelopt_moe_model() -> torch.nn.Module:
+    model = torch.nn.Module()
+    model.experts = torch.nn.Module()
+    for name in ("w13_input_quantizer", "w2_input_quantizer"):
+        quantizer = torch.nn.Module()
+        quantizer.register_buffer("_amax", torch.tensor(-1.0))
+        model.experts.add_module(name, quantizer)
+    model.in_proj = torch.nn.Linear(1, 1)
+    model.in_proj.input_quantizer = torch.nn.Module()
+    model.in_proj.input_quantizer.register_buffer("_amax", torch.tensor(-1.0))
+    return model
+
+
+def test_modelopt_moe_amax_aliases_preserve_buffer_identity_and_registration(
+    modelopt_moe_model: torch.nn.Module,
+) -> None:
+    model = modelopt_moe_model
+    buffers_before = list(model.named_buffers())
+    parameters_before = list(model.named_parameters())
+    state_before = {name: value.clone() for name, value in model.state_dict().items()}
+
+    with patches.modelopt_moe_amax_aliases(model):
+        for name in ("w13_input_quantizer", "w2_input_quantizer"):
+            assert (
+                getattr(model.experts, f"{name}._amax")
+                is getattr(model.experts, name)._amax
+            )
+        assert list(model.named_buffers()) == buffers_before
+        assert list(model.named_parameters()) == parameters_before
+        torch.testing.assert_close(model.state_dict(), state_before)
+        assert not hasattr(model.in_proj, "input_quantizer._amax")
+
+    assert not hasattr(model.experts, "w13_input_quantizer._amax")
+    assert not hasattr(model.experts, "w2_input_quantizer._amax")
+    torch.testing.assert_close(model.state_dict(), state_before)
+
+
+def test_modelopt_moe_amax_aliases_support_nested_and_repeated_use(
+    modelopt_moe_model: torch.nn.Module,
+) -> None:
+    model = modelopt_moe_model
+    for _ in range(2):
+        with patches.modelopt_moe_amax_aliases(model):
+            with patches.modelopt_moe_amax_aliases(model):
+                assert getattr(model.experts, "w13_input_quantizer._amax") is (
+                    model.experts.w13_input_quantizer._amax
+                )
+            assert hasattr(model.experts, "w13_input_quantizer._amax")
+        assert not hasattr(model.experts, "w13_input_quantizer._amax")
+        assert not hasattr(model.experts, "w2_input_quantizer._amax")
+
+
+def test_modelopt_moe_amax_aliases_preserve_existing_attributes(
+    modelopt_moe_model: torch.nn.Module,
+) -> None:
+    model = modelopt_moe_model
+    existing = torch.tensor(123.0)
+    setattr(model.experts, "w13_input_quantizer._amax", existing)
+    with patches.modelopt_moe_amax_aliases(model):
+        assert getattr(model.experts, "w13_input_quantizer._amax") is existing
+        assert hasattr(model.experts, "w2_input_quantizer._amax")
+    assert getattr(model.experts, "w13_input_quantizer._amax") is existing
+    assert not hasattr(model.experts, "w2_input_quantizer._amax")
+
+
+@pytest.mark.parametrize("during_setup", [False, True])
+def test_modelopt_moe_amax_aliases_clean_up_on_error(
+    modelopt_moe_model: torch.nn.Module,
+    monkeypatch: pytest.MonkeyPatch,
+    during_setup: bool,
+) -> None:
+    model = modelopt_moe_model
+
+    def fail_buffer_scan(*, recurse: bool = True) -> None:
+        # The first quantizer's alias must already exist when the second fails.
+        assert hasattr(model.experts, "w13_input_quantizer._amax")
+        raise RuntimeError("quantizer scan failed")
+
+    if during_setup:
+        monkeypatch.setattr(
+            model.experts.w2_input_quantizer, "named_buffers", fail_buffer_scan
+        )
+    expected = "quantizer scan failed" if during_setup else "refit failed"
+    with pytest.raises(RuntimeError, match=expected):
+        with patches.modelopt_moe_amax_aliases(model):
+            raise RuntimeError("refit failed")
+    assert not hasattr(model.experts, "w13_input_quantizer._amax")
+    assert not hasattr(model.experts, "w2_input_quantizer._amax")
+
+
+@pytest.mark.vllm
+def test_modelopt_moe_amax_aliases_satisfy_installed_vllm_loader(
+    modelopt_moe_model: torch.nn.Module,
+) -> None:
+    # Keep the optional vLLM import inside the test selected by its marker.
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+
+    class LoaderFixture(torch.nn.Module):
+        """CPU state for the installed loader and its real expert mapping."""
+
+        load_weights = RoutedExperts.load_weights
+        get_expert_mapping = RoutedExperts.get_expert_mapping
+        build_expert_params_mapping = staticmethod(
+            RoutedExperts.build_expert_params_mapping
+        )
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.layer_name = "model.layers.1.mixer.experts"
+            self.moe_config = SimpleNamespace(
+                hidden_dim_unpadded=1, num_experts=2, num_logical_experts=2
+            )
+            self.expert_map_manager = SimpleNamespace(num_fused_shared_experts=0)
+            self.ckpt_gate_proj_name = "up_proj"
+            self.ckpt_down_proj_name = "down_proj"
+            self.ckpt_up_proj_name = ""
+            self.lora_base_layer_prefix = ""
+
+    def load_amax(
+        param: torch.Tensor, loaded_weight: torch.Tensor, **kwargs: object
+    ) -> bool:
+        param.copy_(torch.maximum(param, loaded_weight))
+        return True
+
+    model = modelopt_moe_model
+    experts = LoaderFixture()
+    for name, quantizer in model.experts.named_children():
+        experts.add_module(name, quantizer)
+        quantizer._amax.weight_loader = load_amax
+    model.experts = experts
+    weights = [
+        (f"{expert}.{projection}.input_quantizer._amax", torch.tensor(value))
+        for expert, projection, value in (
+            (0, "up_proj", 2.0),
+            (1, "up_proj", 6.0),
+            (0, "down_proj", 1.0),
+            (1, "down_proj", 0.25),
+        )
+    ]
+
+    with pytest.raises(AttributeError, match=r"w13_input_quantizer\._amax"):
+        list(experts.load_weights(weights))
+    with patches.modelopt_moe_amax_aliases(model):
+        loaded = list(experts.load_weights(weights))
+        assert loaded == [
+            "w13_input_quantizer._amax",
+            "w13_input_quantizer._amax",
+            "w2_input_quantizer._amax",
+            "w2_input_quantizer._amax",
+        ]
+    torch.testing.assert_close(experts.w13_input_quantizer._amax, torch.tensor(6.0))
+    torch.testing.assert_close(experts.w2_input_quantizer._amax, torch.tensor(1.0))
+    assert not hasattr(experts, "w13_input_quantizer._amax")
+    assert not hasattr(experts, "w2_input_quantizer._amax")
 
 
 @pytest.fixture
@@ -78,6 +344,59 @@ def patched_glm_dsa_source(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
     patches._patch_vllm_glm_decoder_sequence_parallel_moe(logging.getLogger(__name__))
+    return copied
+
+
+@pytest.fixture
+def patched_minimax_m3_sources(tmp_path, monkeypatch):
+    """Installed MiniMax-M3 sources, restored to 0.25.1 then patched in tmp."""
+    copied_sources = {}
+    for relative_source, (old_name, new_name) in _MINIMAX_M3_SOURCES.items():
+        old_snippet, new_snippet = patch_snippets(
+            _MINIMAX_M3_PATCH_FN,
+            old_name,
+            new_name,
+        )
+        content = Path(patches._get_vllm_file(relative_source)).read_text()
+        if new_snippet in content:
+            content = content.replace(new_snippet, old_snippet, 1)
+        assert old_snippet in content, (
+            f"{relative_source} contains neither the vLLM 0.25.1 nor the fixed "
+            "MiniMax-M3 top-k layout anchor"
+        )
+
+        copied = tmp_path / Path(relative_source).name
+        copied.write_text(content)
+        copied_sources[relative_source] = copied
+
+    monkeypatch.setattr(
+        patches,
+        "_get_vllm_file",
+        lambda relative: str(copied_sources[relative]),
+    )
+    patches._patch_vllm_minimax_m3_topk_buffer_layout(logging.getLogger(__name__))
+    return copied_sources
+
+
+@pytest.fixture
+def patched_nemotron_h_source(tmp_path, monkeypatch):
+    source = tmp_path / "nemotron_h.py"
+    source.write_text(_NEMOTRON_H_SOURCE)
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(source))
+    patches._patch_vllm_nemotron_h_fp32_lm_head(logging.getLogger(__name__))
+    return source
+
+
+@pytest.fixture
+def patched_moe_source(tmp_path, monkeypatch):
+    """The installed monolithic MoE runner, unpatched then patched in tmp."""
+    copied = write_unpatched_copy(
+        _MOE_SOURCE, _MOE_PATCH_FN, tmp_path / "moe_runner.py"
+    )
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
+    assert patches._patch_vllm_moe_routed_experts_capture(
+        logging.getLogger(__name__), required=True
+    )
     return copied
 
 
@@ -185,6 +504,17 @@ def test_glm_decoder_sp_moe_patch_anchor_still_matches_installed_vllm(
 
 
 @pytest.mark.vllm
+def test_moe_routed_experts_patch_anchor_still_matches_installed_vllm(
+    patched_moe_source,
+):
+    content = patched_moe_source.read_text()
+    assert _MOE_MARKER in content
+    assert "self.router.select_experts(" in content
+    assert 'getattr(self.router, "capture_fn", None)' in content
+    ast.parse(content)
+
+
+@pytest.mark.vllm
 def test_glm_decoder_sp_moe_patch_is_idempotent(patched_glm_dsa_source, monkeypatch):
     before = patched_glm_dsa_source.read_text()
     monkeypatch.setattr(
@@ -210,6 +540,380 @@ def test_glm_decoder_sp_moe_patch_warns_on_unknown_source(
 
     assert model_source.read_text() == "class DeepseekV2DecoderLayer:\n    pass\n"
     assert "vLLM 0.25.1 source shape was not found" in caplog.text
+
+
+@pytest.mark.vllm
+def test_minimax_m3_topk_patch_applies_to_installed_vllm_and_is_idempotent(
+    patched_minimax_m3_sources,
+):
+    indexer = patched_minimax_m3_sources[
+        "models/minimax_m3/common/indexer.py"
+    ].read_text()
+    sparse_attention = patched_minimax_m3_sources[
+        "models/minimax_m3/common/sparse_attention.py"
+    ].read_text()
+
+    assert _MINIMAX_M3_INDEXER_MARKER in indexer
+    assert "out=buf_htk," in indexer
+    assert "out=buf_htk[:, nd:, :] if buf_htk is not None else None" in indexer
+    assert _MINIMAX_M3_SPARSE_ATTN_MARKER in sparse_attention
+    ast.parse(indexer)
+    ast.parse(sparse_attention)
+
+    before = {
+        source: copied.read_text()
+        for source, copied in patched_minimax_m3_sources.items()
+    }
+
+    patches._patch_vllm_minimax_m3_topk_buffer_layout(logging.getLogger(__name__))
+
+    assert {
+        source: copied.read_text()
+        for source, copied in patched_minimax_m3_sources.items()
+    } == before
+
+
+def test_minimax_m3_topk_patch_does_not_partially_patch_unknown_source(
+    monkeypatch,
+    tmp_path,
+    caplog,
+):
+    indexer_source = "models/minimax_m3/common/indexer.py"
+    sparse_source = "models/minimax_m3/common/sparse_attention.py"
+    indexer_old, _ = patch_snippets(
+        _MINIMAX_M3_PATCH_FN,
+        *_MINIMAX_M3_SOURCES[indexer_source],
+    )
+    indexer_file = tmp_path / "indexer.py"
+    sparse_file = tmp_path / "sparse_attention.py"
+    indexer_file.write_text(indexer_old)
+    sparse_file.write_text("class UnknownSparseAttention:\n    pass\n")
+    sources = {
+        indexer_source: indexer_file,
+        sparse_source: sparse_file,
+    }
+    monkeypatch.setattr(
+        patches,
+        "_get_vllm_file",
+        lambda relative: str(sources[relative]),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        patches._patch_vllm_minimax_m3_topk_buffer_layout(logging.getLogger(__name__))
+
+    assert indexer_file.read_text() == indexer_old
+    assert sparse_file.read_text() == "class UnknownSparseAttention:\n    pass\n"
+    assert "indexer=True, sparse_attention=False" in caplog.text
+
+
+@pytest.mark.vllm
+def test_moe_routed_experts_patch_is_idempotent(patched_moe_source, monkeypatch):
+    before = patched_moe_source.read_text()
+    monkeypatch.setattr(
+        patches, "_get_vllm_file", lambda _relative: str(patched_moe_source)
+    )
+
+    assert patches._patch_vllm_moe_routed_experts_capture(
+        logging.getLogger(__name__), required=True
+    )
+    assert patched_moe_source.read_text() == before
+
+
+def test_moe_routed_experts_patch_fails_closed_when_required(monkeypatch, tmp_path):
+    moe_source = tmp_path / "moe_runner.py"
+    moe_source.write_text("class MoERunner:\n    pass\n")
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(moe_source))
+
+    with pytest.raises(RuntimeError, match="expected code snippet not found"):
+        patches._patch_vllm_moe_routed_experts_capture(
+            logging.getLogger(__name__), required=True
+        )
+
+
+@pytest.mark.parametrize(
+    ("vllm_cfg", "expected"),
+    [
+        ({}, False),
+        ({"fp32_lm_head": False}, False),
+        ({"fp32_lm_head": True}, True),
+        ({"env_vars": {VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR: "1"}}, False),
+        ({"env_vars": {VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR: "0"}}, False),
+    ],
+)
+def test_vllm_nemotron_h_fp32_lm_head_enabled(vllm_cfg, expected):
+    assert vllm_nemotron_h_fp32_lm_head_enabled(vllm_cfg) is expected
+
+
+@pytest.mark.parametrize("env_value", [None, "0", "1"])
+def test_nemotron_h_fp32_lm_head_patch_is_env_gated(
+    patched_nemotron_h_source, monkeypatch, env_value
+):
+    if env_value is None:
+        monkeypatch.delenv(VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR, raising=False)
+    else:
+        monkeypatch.setenv(VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR, env_value)
+
+    namespace = {}
+    source = patched_nemotron_h_source.read_text()
+    exec(compile(source, str(patched_nemotron_h_source), "exec"), namespace)
+    config = types.SimpleNamespace(vocab_size=16, hidden_size=8)
+    model = namespace["NemotronHForCausalLM"](config, "model")
+    hidden_states = torch.ones(2, 8, dtype=torch.bfloat16)
+
+    logits = model.compute_logits(hidden_states)
+
+    if env_value == "1":
+        assert model._nrl_fp32_lm_head is True
+        assert model.lm_head.params_dtype is None
+        assert model.lm_head.quant_config is model.quant_config
+        assert model.lm_head.weight.dtype is torch.bfloat16
+        assert logits.dtype is torch.float32
+        assert model.lm_head(hidden_states).dtype is torch.float32
+        assert model.lm_head.quant_method.seen_dtypes == []
+    else:
+        assert model._nrl_fp32_lm_head is False
+        assert model.lm_head.params_dtype is None
+        assert model.lm_head.quant_config is model.quant_config
+        assert model.lm_head.weight.dtype is torch.bfloat16
+        assert logits.dtype is torch.bfloat16
+        assert model.lm_head.quant_method.seen_dtypes == [
+            (torch.bfloat16, torch.bfloat16, None)
+        ]
+
+    assert "deepcopy" not in source
+    assert "params_dtype=torch.float32" not in source
+    assert "NemotronH vLLM lm_head.forward casts " in source
+    assert "input and weight to fp32" in source
+    assert "torch.matmul(" in source
+    ast.parse(source)
+
+
+def test_nemotron_h_fp32_lm_head_patch_is_idempotent(
+    patched_nemotron_h_source, monkeypatch
+):
+    before = patched_nemotron_h_source.read_text()
+    monkeypatch.setattr(
+        patches, "_get_vllm_file", lambda _relative: str(patched_nemotron_h_source)
+    )
+
+    patches._patch_vllm_nemotron_h_fp32_lm_head(logging.getLogger(__name__))
+
+    assert patched_nemotron_h_source.read_text() == before
+
+
+def test_nemotron_h_fp32_lm_head_patch_warns_on_unknown_source(
+    tmp_path, monkeypatch, caplog
+):
+    source = tmp_path / "nemotron_h.py"
+    source.write_text("class NemotronHForCausalLM:\n    pass\n")
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(source))
+
+    with caplog.at_level(logging.WARNING):
+        applied = patches._patch_vllm_nemotron_h_fp32_lm_head(
+            logging.getLogger(__name__)
+        )
+
+    assert applied is False
+    assert source.read_text() == "class NemotronHForCausalLM:\n    pass\n"
+    assert "NemotronH fp32 LM head import anchor not found exactly once" in caplog.text
+
+
+@pytest.mark.vllm
+def test_nemotron_h_fp32_lm_head_patch_anchor_still_matches_installed_vllm(
+    tmp_path, monkeypatch
+):
+    """Pin the vLLM 0.25.1 Nemotron-H source shape used by the patch."""
+    copied = tmp_path / "nemotron_h.py"
+    with open(patches._get_vllm_file("model_executor/models/nemotron_h.py")) as f:
+        copied.write_text(f.read())
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
+
+    applied = patches._patch_vllm_nemotron_h_fp32_lm_head(logging.getLogger(__name__))
+
+    assert applied is True
+    content = copied.read_text()
+    assert "self._nrl_fp32_lm_head = (" in content
+    assert "def _nrl_fp32_lm_head_forward(" in content
+    assert content.index("import os\n") < content.index("import torch\n")
+    ast.parse(content)
+
+
+def _install_fake_vllm_modules(monkeypatch):
+    vllm_module = types.ModuleType("vllm")
+    envs_module = types.ModuleType("vllm.envs")
+    envs_module.VLLM_USE_RAY_V2_EXECUTOR_BACKEND = True
+    logger_module = types.ModuleType("vllm.logger")
+    logger_module.init_logger = lambda name: logging.getLogger(name)
+    vllm_module.envs = envs_module
+    vllm_module.logger = logger_module
+    monkeypatch.setitem(sys.modules, "vllm", vllm_module)
+    monkeypatch.setitem(sys.modules, "vllm.envs", envs_module)
+    monkeypatch.setitem(sys.modules, "vllm.logger", logger_module)
+
+
+def _stub_non_fp32_vllm_patches(monkeypatch, captured_extra_env_vars):
+    monkeypatch.setattr(
+        patches,
+        "_patch_vllm_init_workers_ray",
+        lambda _py, extra: captured_extra_env_vars.append(extra) or False,
+    )
+    for patch_name in (
+        "_patch_vllm_llama_eagle3_own_lm_head",
+        "_patch_vllm_tool_parser_namespace_tool",
+        "_patch_vllm_ray_executor_v2_tcpstore_port",
+        "_patch_vllm_shm_broadcast_bind_retry",
+        "_patch_vllm_radio_layerscale_loader",
+        "_patch_vllm_glm_decoder_sequence_parallel_moe",
+        "_patch_vllm_minimax_m3_topk_buffer_layout",
+    ):
+        monkeypatch.setattr(patches, patch_name, lambda _logger: None)
+    monkeypatch.setattr(
+        patches,
+        "_patch_vllm_moe_routed_experts_capture",
+        lambda _logger, *, required=False: True,
+    )
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("require_capture", [False, True])
+def test_apply_vllm_patches_gates_nemotron_h_fp32_lm_head(
+    monkeypatch, enabled, require_capture: bool
+):
+    _install_fake_vllm_modules(monkeypatch)
+    monkeypatch.delenv(patches.VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR, raising=False)
+    captured_extra_env_vars = []
+    fp32_patch_calls = []
+    capture_requirements = []
+    _stub_non_fp32_vllm_patches(monkeypatch, captured_extra_env_vars)
+    monkeypatch.setattr(
+        patches,
+        "_patch_vllm_nemotron_h_fp32_lm_head",
+        lambda _logger: fp32_patch_calls.append(True) or True,
+    )
+    monkeypatch.setattr(
+        patches,
+        "_patch_vllm_moe_routed_experts_capture",
+        lambda _logger, *, required: capture_requirements.append(required) or True,
+    )
+
+    patches._apply_vllm_patches(
+        "py",
+        extra_env_vars=["USER_VAR"],
+        nemotron_h_fp32_lm_head=enabled,
+        require_moe_routed_experts_capture=require_capture,
+    )
+
+    assert bool(fp32_patch_calls) is enabled
+    assert capture_requirements == [require_capture]
+    if enabled:
+        assert os.environ[patches.VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR] == "1"
+        assert captured_extra_env_vars == [
+            ["USER_VAR", patches.VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR]
+        ]
+    else:
+        assert patches.VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR not in os.environ
+        assert captured_extra_env_vars == [["USER_VAR"]]
+
+
+def test_apply_vllm_patches_ignores_ambient_fp32_lm_head_env_toggle(monkeypatch):
+    _install_fake_vllm_modules(monkeypatch)
+    monkeypatch.setenv(patches.VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR, "1")
+    captured_extra_env_vars = []
+    fp32_patch_calls = []
+    _stub_non_fp32_vllm_patches(monkeypatch, captured_extra_env_vars)
+    monkeypatch.setattr(
+        patches,
+        "_patch_vllm_nemotron_h_fp32_lm_head",
+        lambda _logger: fp32_patch_calls.append(True) or True,
+    )
+
+    patches._apply_vllm_patches("py")
+
+    assert fp32_patch_calls == []
+    assert patches.VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR not in os.environ
+    assert captured_extra_env_vars == [None]
+
+
+def test_apply_vllm_patches_raises_when_nemotron_h_fp32_lm_head_patch_fails(
+    monkeypatch,
+):
+    _install_fake_vllm_modules(monkeypatch)
+    monkeypatch.delenv(patches.VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR, raising=False)
+    _stub_non_fp32_vllm_patches(monkeypatch, [])
+    monkeypatch.setattr(
+        patches, "_patch_vllm_nemotron_h_fp32_lm_head", lambda _logger: False
+    )
+
+    with pytest.raises(RuntimeError, match="could not be applied"):
+        patches._apply_vllm_patches("py", nemotron_h_fp32_lm_head=True)
+
+
+@pytest.mark.parametrize("require_capture", [False, True])
+@pytest.mark.parametrize(
+    ("vllm_cfg_overrides", "expected_nemotron_h_fp32_lm_head"),
+    [
+        ({"env_vars": {"USER_VAR": "value"}, "fp32_lm_head": True}, True),
+        (
+            {
+                "env_vars": {
+                    "USER_VAR": "value",
+                    VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR: "1",
+                }
+            },
+            False,
+        ),
+    ],
+)
+def test_vllm_worker_threads_nemotron_h_fp32_lm_head_cfg_into_source_patches(
+    monkeypatch,
+    vllm_cfg_overrides,
+    expected_nemotron_h_fp32_lm_head,
+    require_capture: bool,
+):
+    from nemo_rl.models.generation.vllm import vllm_worker
+
+    patch_calls = []
+    monkeypatch.setattr(
+        vllm_worker,
+        "_apply_vllm_patches",
+        lambda py,
+        *,
+        extra_env_vars,
+        nemotron_h_fp32_lm_head,
+        require_moe_routed_experts_capture: patch_calls.append(
+            {
+                "py": py,
+                "extra_env_vars": extra_env_vars,
+                "nemotron_h_fp32_lm_head": nemotron_h_fp32_lm_head,
+                "require_moe_routed_experts_capture": require_moe_routed_experts_capture,
+            }
+        ),
+    )
+
+    vllm_worker.BaseVllmGenerationWorker(
+        {
+            "model_name": "model",
+            "vllm_kwargs": {"enable_return_routed_experts": require_capture},
+            "vllm_cfg": {
+                "tensor_parallel_size": 1,
+                "pipeline_parallel_size": 1,
+                "expert_parallel_size": 1,
+                "gpu_memory_utilization": 0.6,
+                "precision": "bfloat16",
+                **vllm_cfg_overrides,
+            },
+        },
+        extra_env_vars=["EXPLICIT_VAR"],
+    )
+
+    assert patch_calls == [
+        {
+            "py": sys.executable,
+            "extra_env_vars": ["EXPLICIT_VAR"],
+            "nemotron_h_fp32_lm_head": expected_nemotron_h_fp32_lm_head,
+            "require_moe_routed_experts_capture": require_capture,
+        }
+    ]
 
 
 @pytest.mark.parametrize(

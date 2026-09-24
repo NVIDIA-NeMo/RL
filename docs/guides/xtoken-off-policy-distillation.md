@@ -101,9 +101,8 @@ weight thresholds, hand-picked intermediate filenames, etc.).
 
 ## Backend and scope
 
-- **DTensor V2 only.** Set `policy.dtensor_cfg.enabled=true` and
-  `policy.dtensor_cfg._v2=true`. The Megatron policy worker is not wired
-  for cross-tokenizer distillation.
+- **DTensor only.** Set `policy.dtensor_cfg.enabled=true`. The Megatron policy
+  worker is not wired for cross-tokenizer distillation.
 - **Teacher logits travel via CUDA IPC**, so student and teacher policies must
   be colocated on the same node. No remote-Ray transport for x-token logits.
 - **One colocated GPU pool, serial execution.** All teachers and the student

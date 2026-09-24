@@ -41,6 +41,7 @@ from nemo_rl.models.generation.interfaces import (
     RefitPayloadMode,
 )
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy.draft_config import coerce_draft_config
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
@@ -50,9 +51,10 @@ from nemo_rl.models.policy.interfaces import (
 )
 from nemo_rl.models.policy.utils import (
     aggregate_per_sample_handles,
+    reject_dtensor_v1,
     resolve_policy_worker_cls,
+    validate_fp32_lm_head_config,
 )
-from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.flops_tracker import (
     FLOPTracker,
     get_hf_config,
@@ -146,16 +148,48 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         tp_size = 1
         pp_size = 1
         cp_size = 1
-        use_v2 = False
 
         megatron_enable = bool(config.get("megatron_cfg", {}).get("enabled", False))
         dtensor_enable = bool(config.get("dtensor_cfg", {}).get("enabled", False))
-        draft_enabled = bool(config.get("draft", {}).get("enabled", False))
+        # Normalize in place: every downstream reader (workers, setup, train)
+        # accesses draft config by attribute, so a hand-built PolicyConfig has
+        # to be validated here rather than only inside MasterConfig.
+        draft_config = coerce_draft_config(config.get("draft"))
+        if draft_config is not None:
+            config["draft"] = draft_config
+        draft_enabled = bool(draft_config is not None and draft_config.enabled)
+        generation_config = config.get("generation") or {}
+        nvfp4_pertoken_rollout = generation_config.get("nvfp4_pertoken_rollout") or {}
         if megatron_enable and dtensor_enable:
             raise ValueError(
                 "Configure either Megatron (policy.megatron_cfg.enabled=true) or "
                 "DTensor (policy.dtensor_cfg.enabled=true), not both."
             )
+        if nvfp4_pertoken_rollout.get("enabled", False) and not megatron_enable:
+            raise ValueError(
+                "generation.nvfp4_pertoken_rollout requires the Megatron "
+                "training backend (policy.megatron_cfg.enabled=true); DTensor "
+                "does not implement TE NVFP4 training."
+            )
+        validate_fp32_lm_head_config(
+            config, megatron_enabled=megatron_enable, dtensor_enabled=dtensor_enable
+        )
+        hf_config = None
+        hf_config_overrides = config.get("hf_config_overrides") or {}
+        generation_config = config.get("generation")
+        if generation_config is not None and generation_config["backend"] == "vllm":
+            vllm_cfg = generation_config.get("vllm_cfg")
+            if vllm_cfg is not None and vllm_cfg.get("fp32_lm_head"):
+                hf_config = get_hf_config(
+                    config["model_name"],
+                    **hf_config_overrides,
+                )
+                validate_fp32_lm_head_config(
+                    config,
+                    megatron_enabled=megatron_enable,
+                    dtensor_enabled=dtensor_enable,
+                    model_config=hf_config,
+                )
         if reserved_http_server_ports is not None and not megatron_enable:
             raise ValueError(
                 "reserved_http_server_ports is only supported by the Megatron "
@@ -229,38 +263,15 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     "or set policy.dtensor_cfg.enabled=true to use DTensor training backend."
                 )
 
-            # Check if _v2 is enabled in dtensor_cfg (defaults to False for backward compatibility)
-            use_v2 = config.get("dtensor_cfg", {}).get("_v2", False)
-            if use_v2:
-                worker_builder_cls_fqn = resolve_policy_worker_cls(
-                    "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2",
-                    config,
-                )
-                if "TORCH_CUDA_ARCH_LIST" not in os.environ:
-                    warnings.warn(
-                        "TORCH_CUDA_ARCH_LIST is not set. This is needed if using DeepEP in DTensorPolicyWorker V2. This variable is set in our container, but "
-                        "if you are running a custom container or baremetal, you may need to set this variable manually. Example: export TORCH_CUDA_ARCH_LIST='9.0 10.0'"
-                    )
-            else:
-                assert (
-                    config["dtensor_cfg"].get("lora_cfg", {}).get("enabled", False)
-                    is False
-                ), "LoRA is not supported for DTensorPolicyWorker V1"
-                if (config.get("generation") or {}).get("backend") == "sglang":
-                    raise ValueError(
-                        "policy.generation.backend='sglang' requires "
-                        "policy.dtensor_cfg._v2=true or policy.megatron_cfg.enabled=true; "
-                        "DTensorPolicyWorker V1 does not implement the SGLang refit path."
-                    )
-                if config["dtensor_cfg"].get("dp_replicate_size", 1) > 1:
-                    raise ValueError(
-                        "dp_replicate_size > 1 requires policy.dtensor_cfg._v2: true "
-                        "(Automodel DTensor v2 backend). HSDP is not supported with the "
-                        "V1 DTensor worker."
-                    )
-                worker_builder_cls_fqn = resolve_policy_worker_cls(
-                    "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker",
-                    config,
+            reject_dtensor_v1(config["dtensor_cfg"], "policy.dtensor_cfg")
+            worker_builder_cls_fqn = resolve_policy_worker_cls(
+                "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2",
+                config,
+            )
+            if "TORCH_CUDA_ARCH_LIST" not in os.environ:
+                warnings.warn(
+                    "TORCH_CUDA_ARCH_LIST is not set. This is needed if using DeepEP in DTensorPolicyWorker V2. This variable is set in our container, but "
+                    "if you are running a custom container or baremetal, you may need to set this variable manually. Example: export TORCH_CUDA_ARCH_LIST='9.0 10.0'"
                 )
 
             tp_size = config["dtensor_cfg"]["tensor_parallel_size"]
@@ -349,8 +360,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         if reserved_http_server_ports is not None:
             worker_kwargs["reserved_http_server_ports"] = reserved_http_server_ports
 
-        if use_v2:
-            # DTensor v2 workers reconstruct tokenizer/processor locally to avoid
+        if dtensor_enable:
+            # DTensor workers reconstruct tokenizer/processor locally to avoid
             # pickling across incompatible transformers versions (v4 head → v5 worker).
             config["tokenizer"]["use_processor"] = processor is not None
         else:
@@ -412,12 +423,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         # initialize FLOPs tracker
         try:
+            if hf_config is None:
+                hf_config = get_hf_config(
+                    config["model_name"],
+                    **hf_config_overrides,
+                )
             self.flops_tracker = FLOPTracker.from_config(
                 config["model_name"],
-                get_hf_config(
-                    config["model_name"],
-                    **(config.get("hf_config_overrides") or {}),
-                ),
+                hf_config,
             )
         except ValueError as e:
             self.flops_tracker = None
@@ -1357,32 +1370,26 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         weights_path: str,
         optimizer_path: Optional[str] = None,
         tokenizer_path: Optional[str] = None,
-        checkpointing_cfg: Optional[CheckpointingConfig] = None,
+        *,
+        is_final_checkpoint: bool,
     ) -> None:
         """Save a checkpoint of the model.
 
         With Megatron async_save=True, this returns after D2H staging. The caller
         must call finalize_async_save() before renaming the checkpoint directory.
-        """
-        # Only pass checkpointing_cfg for DTensor v2
-        use_v2 = self.cfg.get("dtensor_cfg", {}).get("_v2", False)
 
-        if use_v2:
+        DTensor checkpoint resources are configured when the Policy is
+        constructed. ``weights_path`` selects the destination for each save.
+        """
+        if bool(self.cfg.get("dtensor_cfg", {}).get("enabled", False)):
             futures = self.worker_group.run_all_workers_single_data(
                 "save_checkpoint",
                 weights_path=weights_path,
                 optimizer_path=optimizer_path,
                 tokenizer_path=tokenizer_path,
-                checkpointing_cfg=checkpointing_cfg,
+                is_final_checkpoint=is_final_checkpoint,
             )
         else:
-            if (
-                checkpointing_cfg is not None
-                and checkpointing_cfg.get("model_save_format", None) is not None
-            ):
-                raise ValueError(
-                    "model_save_format must be None or omitted if using DTensorPolicyWorker (_v2=False)."
-                )
             futures = self.worker_group.run_all_workers_single_data(
                 "save_checkpoint",
                 weights_path=weights_path,

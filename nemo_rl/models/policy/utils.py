@@ -18,7 +18,7 @@ import traceback
 import warnings
 from datetime import timedelta
 from enum import Enum
-from typing import Any, Dict, Iterable, Optional, cast
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, cast
 
 import torch
 import torch.distributed as dist
@@ -55,6 +55,14 @@ except ImportError:
     NEMO_AUTOMODEL_AVAILABLE = False
 
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
+from nemo_rl.models.generation.vllm.config import (
+    VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
+    VllmSpecificArgs,
+    vllm_nemotron_h_fp32_lm_head_enabled,
+)
+
+if TYPE_CHECKING:
+    from nemo_rl.models.policy import PolicyConfig
 
 # Plain Hugging Face classes remain separate from the NeMo AutoModel wrappers so
 # callers that manage distribution can request them when NeMo AutoModel is installed.
@@ -116,9 +124,39 @@ class IPCProtocol(Enum):
 # worker classes.
 POLICY_WORKER_OVERRIDES = {
     "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker": "nemo_rl.modelopt.models.policy.workers.megatron_quant_policy_worker.MegatronQuantPolicyWorker",
-    "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker": "nemo_rl.modelopt.models.policy.workers.dtensor_quant_policy_worker.DTensorQuantPolicyWorker",
     "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2": "nemo_rl.modelopt.models.policy.workers.dtensor_quant_policy_worker_v2.DTensorQuantPolicyWorkerV2",
 }
+
+_NEMOTRON_H_MODEL_TYPES = frozenset({"nemotron_h"})
+_NEMOTRON_H_ARCHITECTURES = frozenset({"NemotronHForCausalLM"})
+
+
+def reject_dtensor_v1(
+    dtensor_cfg: dict[str, Any],
+    config_path: str,
+    *,
+    suggest_megatron: bool = True,
+) -> None:
+    """Fail at setup when a config still selects the DTensor v1 backend.
+
+    Args:
+        dtensor_cfg: The resolved dtensor_cfg mapping to inspect.
+        config_path: Dotted path used in the error message, e.g. policy.dtensor_cfg.
+        suggest_megatron: Whether to offer Megatron-Core as an alternative. Callers whose
+            config has no megatron_cfg, or that require DTensor, pass False.
+    """
+    if dtensor_cfg.get("_v2") is False:
+        message = (
+            f"{config_path}._v2=false selects the DTensor v1 backend, which has been "
+            f"removed. Set {config_path}._v2=true (v2 is the only supported DTensor "
+            f"backend)"
+        )
+        if suggest_megatron:
+            message += (
+                f", or set {config_path.rsplit('.', 1)[0]}.megatron_cfg.enabled=true "
+                f"together with {config_path}.enabled=false to train with Megatron-Core"
+            )
+        raise ValueError(message + ".")
 
 
 def resolve_policy_worker_cls(default_cls: str, config: dict) -> str:
@@ -131,6 +169,138 @@ def resolve_policy_worker_cls(default_cls: str, config: dict) -> str:
     if config.get("quant_cfg") is None:
         return default_cls
     return POLICY_WORKER_OVERRIDES.get(default_cls, default_cls)
+
+
+def _normalize_model_type(model_type: object) -> str:
+    return str(model_type).lower().replace("-", "_")
+
+
+def _get_config_model_type(model_config: object) -> object | None:
+    return getattr(model_config, "model_type", None) or getattr(
+        model_config.__class__, "model_type", None
+    )
+
+
+def _get_config_architectures(model_config: object) -> list[str]:
+    architectures = getattr(model_config, "architectures", None) or []
+    if isinstance(architectures, str):
+        return [architectures]
+    try:
+        return [str(architecture) for architecture in architectures]
+    except TypeError:
+        return []
+
+
+def _is_nemotron_h_model_config(model_config: object) -> bool:
+    model_type = _get_config_model_type(model_config)
+    if (
+        model_type is not None
+        and _normalize_model_type(model_type) in _NEMOTRON_H_MODEL_TYPES
+    ):
+        return True
+
+    return any(
+        architecture in _NEMOTRON_H_ARCHITECTURES
+        for architecture in _get_config_architectures(model_config)
+    ) or any(
+        _is_nemotron_h_model_config(inner)
+        for inner in (
+            getattr(model_config, attr, None) for attr in ("llm_config", "text_config")
+        )
+        if inner is not None
+    )
+
+
+def _describe_model_config(model_config: object) -> str:
+    model_type = _get_config_model_type(model_config)
+    architectures = _get_config_architectures(model_config)
+    if architectures:
+        return f"architectures={architectures!r}, model_type={model_type!r}"
+    return f"model_type={model_type!r}"
+
+
+def validate_fp32_lm_head_config(
+    config: "PolicyConfig",
+    *,
+    megatron_enabled: bool,
+    dtensor_enabled: bool,
+    model_config: object | None = None,
+) -> None:
+    """Reject fp32 LM-head settings that the selected backends cannot match."""
+    megatron_cfg = config.get("megatron_cfg")
+    megatron_fp32_value = (
+        megatron_cfg.get("fp32_lm_head")
+        if megatron_enabled and megatron_cfg is not None
+        else None
+    )
+    if megatron_fp32_value not in (None, True, False):
+        raise ValueError("policy.megatron_cfg.fp32_lm_head must be true or false.")
+    megatron_fp32 = bool(megatron_fp32_value)
+
+    if (
+        megatron_fp32
+        and megatron_cfg is not None
+        and megatron_cfg.get("use_fused_linear_logprobs")
+    ):
+        raise ValueError(
+            "policy.megatron_cfg.fp32_lm_head has no effect with "
+            "use_fused_linear_logprobs=true (the fused linear+CE kernel bypasses "
+            "output_layer). Disable one of them."
+        )
+
+    generation_config = config.get("generation")
+    if generation_config is None:
+        return
+
+    generation_backend = generation_config["backend"]
+    if generation_backend != "vllm":
+        return
+
+    vllm_cfg = generation_config.get("vllm_cfg")
+    if vllm_cfg is None:
+        return
+    vllm_cfg = cast(VllmSpecificArgs | dict[str, Any], vllm_cfg)
+
+    env_vars = vllm_cfg.get("env_vars") or {}
+    if VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR in env_vars:
+        raise ValueError(
+            f"{VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR} is reserved for "
+            "NeMo-RL internal vLLM Nemotron-H patch plumbing; configure fp32 "
+            "LM head with "
+            "policy.generation.vllm_cfg.fp32_lm_head instead."
+        )
+
+    vllm_fp32 = vllm_nemotron_h_fp32_lm_head_enabled(vllm_cfg)
+    if dtensor_enabled and vllm_fp32:
+        raise ValueError(
+            "policy.generation.vllm_cfg.fp32_lm_head=true is only supported "
+            "with the Megatron trainer because DTensor has no matching "
+            "policy.dtensor_cfg fp32 LM-head implementation."
+        )
+    if megatron_enabled and megatron_fp32 != vllm_fp32:
+        raise ValueError(
+            "fp32 LM head must be enabled on both Megatron training and vLLM "
+            "generation or neither: "
+            f"policy.megatron_cfg.fp32_lm_head={megatron_fp32_value!r} but "
+            f"policy.generation.vllm_cfg.fp32_lm_head="
+            f"{vllm_cfg.get('fp32_lm_head')!r}. "
+            "A one-sided fp32 head increases the generation/training logprob "
+            "mismatch instead of reducing it."
+        )
+    if (
+        vllm_fp32
+        and model_config is not None
+        and not _is_nemotron_h_model_config(model_config)
+    ):
+        warnings.warn(
+            "policy.generation.vllm_cfg.fp32_lm_head=true currently only "
+            "patches vLLM's Nemotron-H model implementation "
+            "(NemotronHForCausalLM). The configured policy model does not "
+            f"look like Nemotron-H ({_describe_model_config(model_config)}), "
+            "so vLLM generation will not execute an fp32 LM-head path.",
+            UserWarning,
+            stacklevel=2,
+        )
 
 
 def resolve_model_class(

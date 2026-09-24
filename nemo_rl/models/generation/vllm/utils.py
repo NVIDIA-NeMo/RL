@@ -17,6 +17,10 @@ from typing import Any, Optional
 
 import torch
 
+from nemo_rl.data.multimodal_utils import (
+    VLLM_CONTENT_KEY,
+    VLLM_MULTI_MODAL_DATA_KEY,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import (
     ROUTED_EXPERTS_FALLBACK_DTYPE,
@@ -24,6 +28,21 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.generation.vllm.metric_names import (
+    FINISHED_REASON_LABEL,
+    GENERATION_LENGTH_HISTOGRAMS,
+    GENERATION_LENGTH_MEAN_KEY,
+    GENERATION_TOKEN_COUNTERS,
+    GENERATION_TOKENS_KEY,
+    GENERATIONS_FAILED_KEY,
+    GENERATIONS_OK_KEY,
+    OK_FINISH_REASONS,
+    PROMPT_LENGTH_HISTOGRAMS,
+    PROMPT_LENGTH_MEAN_KEY,
+    PROMPT_TOKEN_COUNTERS,
+    PROMPT_TOKENS_KEY,
+    REQUEST_SUCCESS_COUNTERS,
+)
 from nemo_rl.utils.routed_experts_codec import encode_routed_experts
 
 R3_MISSING_ROUTE_SENTINEL = ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL
@@ -43,7 +62,8 @@ _GROUPED_MOE_EXPERT_WEIGHT_SUFFIXES = (
 
 def assert_reload_refit_config_supported(config: VllmConfig) -> None:
     """Reject pure-config combinations unsupported by vLLM reload refit."""
-    if not config["vllm_cfg"].get("refit_with_reload_api"):
+    vllm_cfg = config.get("vllm_cfg")
+    if not vllm_cfg or not vllm_cfg.get("refit_with_reload_api"):
         return
 
     assert not config["colocated"]["enabled"], (
@@ -182,37 +202,32 @@ def format_prompt_for_vllm_generation(
         token_ids = valid_ids.tolist()
         return {"prompt_token_ids": token_ids}
 
-    def _get_multi_modal_data(index: int) -> dict[str, Any]:
-        multi_modal_data = {}
-        images = data.get("vllm_images", None)
-        if images is not None and len(images[index]) > 0:
-            multi_modal_data["image"] = (
-                images[index][0] if len(images[index]) == 1 else images[index]
-            )
-        audios = data.get("vllm_audios", None)
-        if audios is not None and len(audios[index]) > 0:
-            multi_modal_data["audio"] = (
-                audios[index][0] if len(audios[index]) == 1 else audios[index]
-            )
-        videos = data.get("vllm_videos", None)
-        if videos is not None and len(videos[index]) > 0:
-            multi_modal_data["video"] = (
-                videos[index][0] if len(videos[index]) == 1 else videos[index]
-            )
-        return multi_modal_data
+    content_rows = data.get(VLLM_CONTENT_KEY)
+    multi_modal_rows = data.get(VLLM_MULTI_MODAL_DATA_KEY)
 
-    # Native image, audio, and video side channels share this formatter path.
-    if "vllm_content" in data:
+    def _get_multi_modal_data(index: int) -> dict[str, Any]:
+        row = multi_modal_rows[index] if multi_modal_rows is not None else None
+        if not row:
+            return {}
+        return {
+            modality: value
+            for modality, value in row.items()
+            if value is not None
+            and (not isinstance(value, (list, tuple)) or len(value) > 0)
+        }
+
+    # vLLM-ready content and modality data share this formatter path.
+    if content_rows is not None or multi_modal_rows is not None:
         # VLM generation using content and multi_modal_data
         for i in range(start_idx, end_idx):
-            msg = data["vllm_content"][i]
+            msg = content_rows[i] if content_rows is not None else None
             multi_modal_data = _get_multi_modal_data(i)
             if not multi_modal_data:
                 prompts.append(_get_regular_prompt(i))
                 continue
             # Raw processor content is valid only for the initial turn. Later
             # turns use the updated pre-tokenized conversation plus the same
-            # native media, preventing vLLM from regenerating the stale prompt.
+            # modality data, preventing vLLM from regenerating the stale prompt.
             prompt_dict = {"prompt": msg} if msg is not None else _get_regular_prompt(i)
             prompt_dict["multi_modal_data"] = multi_modal_data
             prompts.append(prompt_dict)
@@ -524,13 +539,53 @@ def model_dump_chat_response_with_dynamic_message_fields(
     return response_dict
 
 
+# --- vLLM engine counters -------------------------------------------------
+#
+# Workers hand the driver a flat ``{str: float | list[float]}`` dict, which is
+# all the aggregation below needs (it only ever sums). vLLM's reader, though,
+# reports labelled series as several objects sharing one ``name``, and
+# histograms as a ``count``/``sum``/``buckets`` triple with no scalar at all.
+# Both are folded into that flat shape by encoding the extra dimension in the
+# key, so a plain sum across workers still gives the right fleet total.
+COUNTER_KEY_SEP = "|"
+HISTOGRAM_SUM_PART = "sum"
+HISTOGRAM_COUNT_PART = "count"
+
+# Metric names kept from a worker's snapshot. The snapshot carries every series
+# vLLM exposes (~40), and forwarding all of them would put unbounded,
+# version-dependent cardinality on the step metrics.
+#
+# Matched exactly, not by prefix: vLLM ships close siblings of these names
+# (``vllm:prompt_tokens_by_source``, ``vllm:prompt_tokens_cached``) that a
+# prefix test would pull in as extra per-step payload nothing here reads.
+_KEPT_COUNTER_NAMES: tuple[str, ...] = (
+    PROMPT_TOKEN_COUNTERS
+    + GENERATION_TOKEN_COUNTERS
+    + PROMPT_LENGTH_HISTOGRAMS
+    + GENERATION_LENGTH_HISTOGRAMS
+    + REQUEST_SUCCESS_COUNTERS
+)
+
+
+def encode_counter_key(name: str, part: str) -> str:
+    """Encode a histogram component or a label into a flat counter key."""
+    return f"{name}{COUNTER_KEY_SEP}{part}"
+
+
+def _is_kept(metric_name: str) -> bool:
+    """Whether a snapshot key belongs to a family the driver consumes."""
+    base = metric_name.split(COUNTER_KEY_SEP, 1)[0]
+    return "spec_decode" in base or base in _KEPT_COUNTER_NAMES
+
+
 def aggregate_spec_decode_counters(
     worker_metrics: list[dict[str, float | list[float]]],
 ) -> dict[str | tuple[str, int], float]:
-    """Aggregate speculative decoding counters from multiple workers.
+    """Aggregate vLLM engine counters from multiple workers.
 
-    Combines spec decode metrics collected from DP leader workers into
-    a single aggregated counter dictionary.
+    Combines the metrics collected from DP leader workers into a single
+    aggregated counter dictionary. Retains the spec-decode family and the engine
+    series listed above; everything else in the snapshot is dropped.
 
     Args:
         worker_metrics: List of metric dictionaries from each worker.
@@ -551,15 +606,110 @@ def aggregate_spec_decode_counters(
 
     for report in worker_metrics:
         for metric_name, value in report.items():
-            if "spec_decode" in metric_name:
-                if isinstance(value, list):
-                    # Per-position metrics (e.g., acceptance counts at each draft position)
-                    for position, pos_value in enumerate(value, 1):
-                        counters[metric_name, position] += pos_value
-                else:
-                    counters[metric_name] += value
+            if not _is_kept(metric_name):
+                continue
+            if isinstance(value, list):
+                # Per-position metrics (e.g., acceptance counts at each draft position)
+                for position, pos_value in enumerate(value, 1):
+                    counters[metric_name, position] += pos_value
+            else:
+                counters[metric_name] += value
 
     return dict(counters)
+
+
+def _first_delta(
+    delta: dict[str | tuple[str, int], float],
+    candidates: tuple[str, ...],
+    part: Optional[str] = None,
+) -> Optional[float]:
+    """Return the delta for the first candidate name present, else ``None``."""
+    for name in candidates:
+        key = encode_counter_key(name, part) if part is not None else name
+        if key in delta:
+            return delta[key]
+    return None
+
+
+def _mean_from_histogram(
+    delta: dict[str | tuple[str, int], float], candidates: tuple[str, ...]
+) -> Optional[float]:
+    """Mean of a histogram over the step, from its ``sum``/``count`` delta.
+
+    Exact rather than bucket-interpolated: vLLM tracks both, so the mean needs no
+    approximation. ``None`` when the engine served no request in the step, which
+    is a real state (a step spent entirely in training) and not a zero-length
+    sequence.
+    """
+    total = _first_delta(delta, candidates, HISTOGRAM_SUM_PART)
+    count = _first_delta(delta, candidates, HISTOGRAM_COUNT_PART)
+    if total is None or count is None or count <= 0:
+        return None
+    return total / count
+
+
+def compute_engine_step_metrics(
+    start_counters: dict[str | tuple[str, int], float],
+    end_counters: dict[str | tuple[str, int], float],
+) -> dict[str, float]:
+    """Compute per-step vLLM engine token, sequence-length and outcome metrics.
+
+    These are the engine's own accounting, which is why they are worth carrying
+    even though the driver already derives token counts from the tensors a
+    ``generate()`` call returns: sequence-length distributions and aborted
+    requests leave no trace in the returned tensors at all.
+
+    Args:
+        start_counters: Counter snapshot taken before generation.
+        end_counters: Counter snapshot taken after generation.
+
+    Returns:
+        Metrics for logging, keyed with a ``vllm/`` prefix. Absent series are
+        omitted rather than reported as zero, so a vLLM release that renames one
+        leaves a gap in the dashboard instead of a plausible-looking zero.
+    """
+    # Drop series that went backwards: an engine restart reset its counters.
+    delta = {
+        k: end - start_counters.get(k, 0.0)
+        for k, end in end_counters.items()
+        if end >= start_counters.get(k, 0.0)
+    }
+
+    metrics: dict[str, float] = {}
+
+    prompt_tokens = _first_delta(delta, PROMPT_TOKEN_COUNTERS)
+    if prompt_tokens is not None:
+        metrics[PROMPT_TOKENS_KEY] = prompt_tokens
+    generation_tokens = _first_delta(delta, GENERATION_TOKEN_COUNTERS)
+    if generation_tokens is not None:
+        metrics[GENERATION_TOKENS_KEY] = generation_tokens
+
+    prompt_length = _mean_from_histogram(delta, PROMPT_LENGTH_HISTOGRAMS)
+    if prompt_length is not None:
+        metrics[PROMPT_LENGTH_MEAN_KEY] = prompt_length
+    generation_length = _mean_from_histogram(delta, GENERATION_LENGTH_HISTOGRAMS)
+    if generation_length is not None:
+        metrics[GENERATION_LENGTH_MEAN_KEY] = generation_length
+
+    ok, failed, saw_any = 0.0, 0.0, False
+    for name in REQUEST_SUCCESS_COUNTERS:
+        prefix = encode_counter_key(name, f"{FINISHED_REASON_LABEL}=")
+        for key, value in delta.items():
+            if not isinstance(key, str) or not key.startswith(prefix):
+                continue
+            saw_any = True
+            reason = key[len(prefix) :]
+            if reason in OK_FINISH_REASONS:
+                ok += value
+            else:
+                failed += value
+        if saw_any:
+            break
+    if saw_any:
+        metrics[GENERATIONS_OK_KEY] = ok
+        metrics[GENERATIONS_FAILED_KEY] = failed
+
+    return metrics
 
 
 def compute_spec_decode_metrics(
