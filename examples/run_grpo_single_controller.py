@@ -78,6 +78,33 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     return args, overrides
 
 
+def _controller_placement() -> dict[str, Any]:
+    """Pin the controller to the dedicated Ray head when the cluster has one.
+
+    The controller's host-memory peak is set by cohort postprocessing, which is
+    fixed by the batch shape rather than by cluster size, so a node it shares
+    with GPU workers can exhaust host memory. ``ray.sub``'s
+    ``DEDICATED_RAY_HEAD=1`` reserves one compute-free node and advertises it as
+    ``ray_head``, and ``advantage_actor._placement_node_ids`` already keeps the
+    advantage pool off that node on the assumption this claim exists.
+
+    Read the live cluster rather than the env var, so a launcher that asked for a
+    head it did not get falls back instead of pinning to nothing. Claim the whole
+    unit rather than a fraction: the point is that nothing else lands here. Set
+    ``NRL_PIN_CONTROLLER_TO_HEAD=0`` to keep the reserved head but leave the
+    controller to Ray's normal scheduling.
+
+    Returns:
+        Keyword arguments for ``SingleControllerActor.options``, empty when the
+        cluster has no dedicated head or the pin is disabled.
+    """
+    if os.environ.get("NRL_PIN_CONTROLLER_TO_HEAD", "1") != "1":
+        return {}
+    if ray.cluster_resources().get("ray_head", 0) >= 1:
+        return {"resources": {"ray_head": 1}}
+    return {}
+
+
 def main() -> None:
     """Main entry point."""
     # The training loop runs in SingleControllerActor, whose flush=True prints only
@@ -203,8 +230,11 @@ def main() -> None:
                     config, tokenizer, processor=processor
                 )
 
-        print("🚀 Launching SingleControllerActor")
-        sc = SingleControllerActor.remote(
+        placement = _controller_placement()
+        print(
+            f"🚀 Launching SingleControllerActor (placement={placement or 'default'})"
+        )
+        sc = SingleControllerActor.options(**placement).remote(
             master_config=config,
             actor_args=actor_args,
             setup_timing_metrics=setup_timing_metrics,
