@@ -410,6 +410,34 @@ class RolloutRecoveryLedger:
         record.start_weight_version = start_weight_version
         record.phase = PromptGroupPhase.ADMITTED
 
+    def restamp_group_for_dispatch(
+        self,
+        cut: DataPlaneMutationCut,
+        group_id: str,
+        *,
+        start_weight_version: int,
+    ) -> None:
+        """Retag an admitted group before its first physical dispatch.
+
+        The controller calls this only for groups admitted in the current process;
+        restored groups may already contain sibling results from the durable
+        version and are intentionally excluded.
+        """
+        cut.require_live()
+        record = self._require_group(group_id)
+        if record.phase is not PromptGroupPhase.ADMITTED:
+            raise ValueError(
+                f"recovery group {group_id!r} is not admitted: {record.phase.value}"
+            )
+        if any(
+            sibling.current_attempt.status is not RolloutAttemptStatus.RESERVED
+            for sibling in record.siblings
+        ):
+            raise ValueError(
+                f"recovery group {group_id!r} has already started physical dispatch"
+            )
+        record.start_weight_version = start_weight_version
+
     def bind_runtime_prompt(
         self,
         cut: DataPlaneMutationCut,

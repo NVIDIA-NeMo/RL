@@ -1066,10 +1066,42 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # We don't need to do anything here
         return True
 
-    def prepare_for_training(self, *args: Any, **kwargs: Any) -> None:
-        # onload everything to the GPU
+    @staticmethod
+    def _validate_resident_worker_results(results: list[Any], stage: str) -> int:
+        if not results:
+            raise RuntimeError(f"{stage} returned no policy-worker residency results")
+        invalid = [
+            result
+            for result in results
+            if not isinstance(result, dict)
+            or result.get("params_resident_on_cuda") is not True
+            or not isinstance(result.get("checked_units"), int)
+            or result["checked_units"] <= 0
+        ]
+        if invalid:
+            raise RuntimeError(
+                f"{stage} failed policy-param residency verification on "
+                f"{len(invalid)}/{len(results)} worker(s): {invalid[:3]}"
+            )
+        return len(results)
+
+    def prepare_for_training(
+        self, verify_params_resident: bool = False, *args: Any, **kwargs: Any
+    ) -> Optional[int]:
+        """Onload training state, optionally proving params were already resident."""
+        if verify_params_resident:
+            futures = self.worker_group.run_all_workers_single_data(
+                "prepare_for_training",
+                verify_params_resident=True,
+            )
+            results = ray.get(futures)
+            return self._validate_resident_worker_results(
+                results, "prepare_for_training"
+            )
+
         futures = self.worker_group.run_all_workers_single_data("prepare_for_training")
         ray.get(futures)
+        return None
 
     def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
         """Put every worker in eval mode for logprob inference.
@@ -1106,10 +1138,28 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # Only get the first worker's info since all workers will have the same result
         return results[0]
 
-    def finish_inference(self) -> None:
-        """Offload policy model to CPU after inference."""
-        futures = self.worker_group.run_all_workers_single_data("finish_inference")
+    def finish_inference(self, keep_params_for_training: bool = False) -> Optional[int]:
+        """Finish policy inference and optionally retain params for actor training.
+
+        Args:
+            keep_params_for_training: Keep model parameters resident on CUDA while
+                still releasing inference temporaries. The single-controller PPO
+                early-refit pipeline uses this when actor training immediately
+                follows policy logprob inference.
+        """
+        if keep_params_for_training:
+            futures = self.worker_group.run_all_workers_single_data(
+                "finish_inference",
+                keep_params_for_training=True,
+            )
+            results = ray.get(futures)
+            return self._validate_resident_worker_results(results, "finish_inference")
+        else:
+            # Preserve the legacy no-keyword call for worker extensions that have
+            # not opted in to the parameter-residency transition yet.
+            futures = self.worker_group.run_all_workers_single_data("finish_inference")
         ray.get(futures)
+        return None
 
     def finish_training(self, *args: Any, **kwargs: Any) -> None:
         # Placeholder implementation

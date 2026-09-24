@@ -4309,7 +4309,44 @@ class MegatronPolicyWorkerImpl(
         # The plan is consumed (provider mutated to the inference layout); release it.
         self._colocated_reshard_plan = None
 
-    def prepare_for_training(self, *args, **kwargs):
+    def _policy_param_residency(self) -> dict[str, int | bool]:
+        """Verify that the model's real parameter storage is resident on CUDA."""
+
+        def _storage_is_cuda_and_allocated(tensor: torch.Tensor) -> bool:
+            return tensor.is_cuda and tensor.untyped_storage().nbytes() > 0
+
+        parameters = list(self.model.parameters())
+        param_buffers: list[torch.Tensor] = []
+        if isinstance(self.model, DistributedDataParallel):
+            for buffers in (self.model.buffers, self.model.expert_parallel_buffers):
+                param_buffers.extend(
+                    buffer.param_data
+                    for buffer in buffers
+                    if getattr(buffer, "param_data", None) is not None
+                )
+        elif isinstance(
+            self.model, (FullyShardedDataParallelV1, FullyShardedDataParallelV2)
+        ):
+            param_data = getattr(self.model.param_and_grad_buffer, "param_data", None)
+            if param_data is not None:
+                param_buffers.append(param_data)
+
+        parameters_on_cuda = bool(parameters) and all(
+            parameter.is_cuda for parameter in parameters
+        )
+        storage_units = param_buffers or parameters
+        storage_allocated = bool(storage_units) and all(
+            _storage_is_cuda_and_allocated(tensor) for tensor in storage_units
+        )
+        return {
+            "params_resident_on_cuda": parameters_on_cuda and storage_allocated,
+            "checked_units": len(parameters) + len(param_buffers),
+        }
+
+    def prepare_for_training(self, verify_params_resident: bool = False):
+        residency_before_prepare = (
+            self._policy_param_residency() if verify_params_resident else None
+        )
         # onload models and optimizer state to cuda
         self.model = self.move_model(
             self.model, "cuda", move_grads=True, move_params=True
@@ -4335,19 +4372,26 @@ class MegatronPolicyWorkerImpl(
         # grad/optimizer onload, which is the figure that decides whether keeping
         # the train buffers resident fits in HBM.
         self._log_gpu_mem("train_prep_exit")
+        return residency_before_prepare
 
-    def finish_inference(self) -> None:
-        """Offload model params to CPU after inference. Only used in PPO."""
+    def finish_inference(
+        self, keep_params_for_training: bool = False
+    ) -> dict[str, int | bool]:
+        """Finish PPO inference, optionally retaining params for actor training."""
         # MambaMixer.eval() recomputes and caches a state transition decay,
         # -torch.exp(self.A_log.float()). Set the model in inference mode
         # before offloading the model parameters (including self.A_log).
         self.model.eval()
-        self.model = self.move_model(
-            self.model, "cpu", move_params=True, move_grads=False
-        )
+        if not keep_params_for_training:
+            self.model = self.move_model(
+                self.model, "cpu", move_params=True, move_grads=False
+            )
 
+        # Even on the fast path, release inference-only Python references and
+        # unused allocator segments before restoring grad and optimizer state.
         gc.collect()
         torch.cuda.empty_cache()
+        return self._policy_param_residency()
 
     def _clear_fp8_caches(self):
         """Clear FP8 workspace caches and release fragmented GPU memory.

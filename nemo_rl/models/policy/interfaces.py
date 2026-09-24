@@ -162,7 +162,14 @@ class PolicyInterface(ABC):
         pass
 
     @abstractmethod
-    def prepare_for_training(self, *args: Any, **kwargs: Any) -> None:
+    def prepare_for_training(
+        self, verify_params_resident: bool = False, *args: Any, **kwargs: Any
+    ) -> Optional[int]:
+        """Prepare training state; optionally verify parameters stayed on CUDA.
+
+        Implementations may return the number of workers that proved parameter
+        residency. The default preserves the legacy onload behavior.
+        """
         pass
 
     @abstractmethod
@@ -179,6 +186,19 @@ class PolicyInterface(ABC):
 
 
 class ColocatablePolicyInterface(PolicyInterface):
+    def finish_inference(self, keep_params_for_training: bool = False) -> Optional[int]:
+        """Release inference state, optionally retaining verified CUDA params.
+
+        Early Refit backends override this capability. The default makes an
+        unsupported worker fail explicitly instead of accepting the option and
+        silently performing the legacy transition.
+        """
+        del keep_params_for_training
+        raise NotImplementedError(
+            "this policy backend does not support the Early Refit inference "
+            "residency transition"
+        )
+
     @abstractmethod
     def init_collective(
         self,
