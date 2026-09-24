@@ -433,6 +433,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
     _nrl_named_parameters: dict[str, torch.nn.Parameter]
     hf_to_local_param_map: HFToLocalParamMap
     _nrl_layerwise_reload_active: bool = False
+    _nrl_padded_trtllm_reload_active: bool = False
     # Initialization detaches parameters, so any later failure leaves this
     # worker unsafe to reuse. Keep the original failure for the worker lifetime.
     _nrl_layerwise_reload_failure: Exception | None = None
@@ -473,7 +474,9 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             raise
         finally:
             try:
-                if load_error is None:
+                if load_error is None and getattr(
+                    self, "_nrl_padded_trtllm_reload_active", False
+                ):
                     _finalize_complete_padded_trtllm_layers(
                         self.model_runner.model, self.model_config
                     )
@@ -1208,12 +1211,14 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                         for reload_target in reload_targets:
                             initialize_layerwise_reload(reload_target)
                     self._nrl_layerwise_reload_active = True
+                    self._nrl_padded_trtllm_reload_active = not use_deepseek_v4_fp8
                     yield finalize
             except Exception as error:
                 self._nrl_layerwise_reload_failure = error
                 raise
             finally:
                 self._nrl_layerwise_reload_active = False
+                self._nrl_padded_trtllm_reload_active = False
                 if use_deepseek_v4_fp8:
                     deepseek_v4_fp8.restore_refit(added_skip_tensors)
 
