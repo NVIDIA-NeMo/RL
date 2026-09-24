@@ -82,7 +82,10 @@ def monkey_patch_torch_reductions():
     """Monkey patching before Torch https://github.com/pytorch/pytorch/pull/149248 is fixed."""
     if hasattr(reductions, "_reduce_tensor_original"):
         return
-    reductions._reduce_tensor_original = reductions.reduce_tensor
+    # sglang's patch skips itself on this same check, but its wrappers read both
+    # attributes, so whoever wins the check must set both.
+    reductions._reduce_tensor_original = _REDUCE_TENSOR_ORIGINAL
+    reductions._rebuild_cuda_tensor_original = _REBUILD_CUDA_TENSOR_ORIGINAL
 
     reductions.reduce_tensor = _reduce_tensor_modified
     reductions.rebuild_cuda_tensor = _rebuild_cuda_tensor_modified
