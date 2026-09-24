@@ -384,7 +384,7 @@ design-docs/sparse-delta-refit.md
 design-docs/checkpoint-engines.md
 design-docs/checkpointing.md
 design-docs/loss-functions.md
-design-docs/fsdp2-parallel-plan.md
+design-docs/automodel-parallel-plan.md
 design-docs/training-backends.md
 design-docs/sequence-packing-and-dynamic-batching.md
 design-docs/env-vars.md

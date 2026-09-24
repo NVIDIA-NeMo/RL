@@ -1,6 +1,6 @@
-# FSDP2 Parallel Plan
+# Automodel Parallel Plan
 
-This guide outlines the parallelization strategy for Fully Sharded Data Parallel version 2 (FSDP2) training in NeMo RL.
+This guide outlines the parallelization strategy for Automodel training in NeMo RL.
 
 ## Fallback Priority
 
