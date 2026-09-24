@@ -599,6 +599,10 @@ class SingleControllerActor:
         # Gate: cleared during _sync_weights, set when generation may proceed
         self._rollout_permitted: asyncio.Event = asyncio.Event()
         self._rollout_permitted.set()
+        # Serialize the final admission check and dispatch registration with
+        # close/publish. Event.wait() alone has a TOCTOU window in which refit can
+        # start after a waiter wakes but before its rollout is registered.
+        self._rollout_admission_lock: asyncio.Lock = asyncio.Lock()
 
         # Set only after _rollout_pump exhausts its configured epochs and all
         # dispatched tasks finish successfully. Rollout failures propagate
@@ -652,6 +656,17 @@ class SingleControllerActor:
         )
 
         self._trainer_version: int = restored_trainer_version
+        # Early Refit publishes actor v+1 while critic v is still finishing. Keep
+        # the generation-visible frontier separate from the checkpointable trainer
+        # transaction until the critic and data-plane commit both complete.
+        self._rollout_admission_version: int = restored_trainer_version
+        self._last_policy_publish_monotonic: Optional[float] = None
+        self._first_dispatch_pending_by_version: dict[int, float] = {}
+        # Newly admitted recovery groups can wait on dispatch capacity while a
+        # policy publishes. Track only those groups so launch can safely restamp
+        # them to the physical version it actually dispatches; restored groups may
+        # already contain partial results and must retain their durable version.
+        self._pending_reserved_admission_versions: dict[str, int] = {}
         self._train_steps: int = actor_args.save_state.current_step
         self._current_epoch: int = actor_args.save_state.current_epoch
         self._step_log_dict: dict[str, list] = {
@@ -686,9 +701,16 @@ class SingleControllerActor:
     async def run(self) -> dict[str, Any]:
         """Main entry point. Runs until max_train_steps is reached."""
         # Synchronize weights before starting the pumps, unless setup already delivered them.
-        if self._weight_synchronizer.is_stale:
-            await self._sync_weights()
-        self._rollout_manager.set_weight_version(self._trainer_version)
+        try:
+            if self._weight_synchronizer.is_stale:
+                await self._sync_weights(target_version=self._trainer_version)
+            await self._publish_policy_version(self._trainer_version)
+        except BaseException:
+            # Initial refit is part of the run lifecycle too. A failed collective
+            # must not leak the synchronizer/checkpointer because pumps were not yet
+            # created and therefore cannot reach the ordinary finally block below.
+            await self._shutdown_run([])
+            raise
 
         replay_restore_started = time.monotonic()
         restored_replay_groups = await self._maybe_restore_replay_buffer()
@@ -783,41 +805,45 @@ class SingleControllerActor:
             if not stop_after_rollout_checkpoint:
                 await train_task
         finally:
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            if self._engine_supervisor is not None:
-                # Not in `tasks`: the supervisor creates a task per restart, on demand, so
-                # there is nothing to cancel in that list. Without this an in-flight
-                # restart at shutdown is simply abandoned mid-way. Bounded, because the
-                # thread underneath cannot be cancelled -- giving up is what lets the
-                # process exit, and the thread being a daemon is what makes that safe.
-                await self._engine_supervisor.drain(
-                    timeout_s=_SUPERVISOR_DRAIN_TIMEOUT_S
-                )
-            for actor in self._finalizer_actors:
-                try:
-                    ray.kill(actor, no_restart=True)
-                except Exception as error:
-                    print(f"finalizer actor termination failed: {error}", flush=True)
-            try:
-                self._weight_synchronizer.shutdown()
-            except Exception as e:  # teardown must not mask the original failure
-                print(f"Error during weight-synchronizer shutdown: {e}", flush=True)
-            finally:
-                self._logger.finish()
-                await asyncio.to_thread(self._checkpointer.shutdown)
+            await self._shutdown_run(tasks)
 
         return {
             "train_steps": self._train_steps,
             "trainer_version": self._trainer_version,
+            "rollout_admission_version": self._rollout_admission_version,
         }
+
+    async def _shutdown_run(self, tasks: list[asyncio.Task[Any]]) -> None:
+        """Best-effort teardown shared by pre-pump and pump failures."""
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        if self._engine_supervisor is not None:
+            # Not in `tasks`: the supervisor creates a task per restart, on demand, so
+            # there is nothing to cancel in that list. Without this an in-flight
+            # restart at shutdown is simply abandoned mid-way. Bounded, because the
+            # thread underneath cannot be cancelled -- giving up is what lets the
+            # process exit, and the thread being a daemon is what makes that safe.
+            await self._engine_supervisor.drain(timeout_s=_SUPERVISOR_DRAIN_TIMEOUT_S)
+        for actor in self._finalizer_actors:
+            try:
+                ray.kill(actor, no_restart=True)
+            except Exception as error:
+                print(f"finalizer actor termination failed: {error}", flush=True)
+        try:
+            self._weight_synchronizer.shutdown()
+        except Exception as error:  # teardown must not mask the original failure
+            print(f"Error during weight-synchronizer shutdown: {error}", flush=True)
+        finally:
+            self._logger.finish()
+            await asyncio.to_thread(self._checkpointer.shutdown)
 
     async def ping(self) -> dict[str, Any]:
         """Liveness check — returns immediately if event loop is running."""
         return {
             "alive": True,
             "trainer_version": self._trainer_version,
+            "rollout_admission_version": self._rollout_admission_version,
             "train_steps": self._train_steps,
             "inflight_rollouts": self._inflight_rollouts,
             "rollout_permitted": self._rollout_permitted.is_set(),
@@ -1215,6 +1241,26 @@ class SingleControllerActor:
                 cast(DatumSpec, prompt),
             )
 
+    async def _admit_rollout_batch(self) -> Optional[int]:
+        """Commit one sampler admission atomically with the refit gate."""
+        if not isinstance(self._sampler, TransactionalAdmissionSampler):
+            return await self._sampler.admit(
+                trainer_version_fn=lambda: self._rollout_admission_version
+            )
+
+        while True:
+            await self._sampler.wait_until_admissible(
+                trainer_version_fn=lambda: self._rollout_admission_version
+            )
+            await self._rollout_permitted.wait()
+            async with self._rollout_admission_lock:
+                if not self._rollout_permitted.is_set():
+                    continue
+                async with self._data_plane_checkpoint_barrier.mutation(
+                    "prompt_reservations"
+                ) as cut:
+                    return self._sampler.commit_admission(cut)
+
     async def _admit_reserved_prompt_groups(
         self,
         group_ids: list[str],
@@ -1240,18 +1286,26 @@ class SingleControllerActor:
                     group_id,
                     target_step=target_step,
                 )
+                self._pending_reserved_admission_versions[group_id] = (
+                    self._rollout_admission_version
+                )
 
             return target_step
 
         if isinstance(self._sampler, TransactionalAdmissionSampler):
-            await self._sampler.wait_until_admissible(
-                trainer_version_fn=lambda: self._trainer_version
-            )
-            async with self._data_plane_checkpoint_barrier.mutation(
-                "prompt_reservations"
-            ) as cut:
-                target_step = self._sampler.commit_admission(cut)
-                return _commit(cut, target_step)
+            while True:
+                await self._sampler.wait_until_admissible(
+                    trainer_version_fn=lambda: self._rollout_admission_version
+                )
+                await self._rollout_permitted.wait()
+                async with self._rollout_admission_lock:
+                    if not self._rollout_permitted.is_set():
+                        continue
+                    async with self._data_plane_checkpoint_barrier.mutation(
+                        "prompt_reservations"
+                    ) as cut:
+                        target_step = self._sampler.commit_admission(cut)
+                        return _commit(cut, target_step)
 
         # Custom samplers retain their existing monolithic admission API. Hold
         # the mutation cut across it for correctness. Contract: a custom admit()
@@ -1263,7 +1317,7 @@ class SingleControllerActor:
             "prompt_reservations"
         ) as cut:
             target_step = await self._sampler.admit(
-                trainer_version_fn=lambda: self._trainer_version
+                trainer_version_fn=lambda: self._rollout_admission_version
             )
             return _commit(cut, target_step)
 
@@ -1926,11 +1980,24 @@ class SingleControllerActor:
             target_step: Optional[int],
             lineage_group_id: Optional[str],
             task_started_event: asyncio.Event,
+            admitted_policy_version: int,
             *,
             work_started: float,
             dispatch_started: float,
         ) -> None:
             task_started_event.set()
+            publish_t0 = self._first_dispatch_pending_by_version.pop(
+                admitted_policy_version, None
+            )
+            if publish_t0 is not None:
+                self._timer.record(
+                    "early_refit_publish_to_first_dispatch",
+                    time.monotonic() - publish_t0,
+                )
+                self._timer.mark(
+                    "early_refit_first_dispatch",
+                    {"policy_version": admitted_policy_version},
+                )
             self._inflight_rollouts += 1
             # This task owns one slot of a step, which can outlive both the prompt it
             # started with and the step it started on: a dropped prompt is substituted in
@@ -2049,7 +2116,6 @@ class SingleControllerActor:
                             # observes the same pause a first dispatch does
                             # instead of pushing new generation into a
                             # weight-sync window.
-                            await self._rollout_permitted.wait()
                             # The next generate_for_finalization call is a
                             # brand-new generation and must be re-counted
                             # against the same concurrency limiter a first
@@ -2057,6 +2123,17 @@ class SingleControllerActor:
                             # early above, right after the attempt that fell
                             # short finished generating.
                             await sem.acquire()
+                            # Admission may close while this replacement is
+                            # waiting for generation capacity. Re-check only
+                            # after the permit is held, under the same lock used
+                            # by close/publish, so a replacement cannot slip
+                            # into the weight-transfer window.
+                            while True:
+                                await self._rollout_permitted.wait()
+                                async with self._rollout_admission_lock:
+                                    if not self._rollout_permitted.is_set():
+                                        continue
+                                    break
                             self._inflight_rollouts += 1
                             inflight_count_released = False
                             generation_permit_released = False
@@ -2117,6 +2194,9 @@ class SingleControllerActor:
                                             target_step=target_step,
                                         )
                                     )
+                                    self._pending_reserved_admission_versions[
+                                        lineage_group_id
+                                    ] = self._rollout_admission_version
                                 else:
                                     self._credit_shortfall(target_step)
                         else:
@@ -2150,7 +2230,13 @@ class SingleControllerActor:
                         # A substitution is a fresh rollout, not a continuation of the one
                         # that failed, so it observes the same pause a first dispatch does
                         # instead of pushing new generation into a weight-sync window.
-                        await self._rollout_permitted.wait()
+                        while True:
+                            await self._rollout_permitted.wait()
+                            async with self._rollout_admission_lock:
+                                if not self._rollout_permitted.is_set():
+                                    continue
+                                await _restamp_pending_recovery_group(lineage_group_id)
+                                break
             finally:
                 if not inflight_count_released:
                     self._inflight_rollouts -= 1
@@ -2188,6 +2274,25 @@ class SingleControllerActor:
                 self._buffer_capacity.release()
                 sem.release()
 
+        async def _restamp_pending_recovery_group(group_id: Optional[str]) -> None:
+            """Align a newly admitted recovery record with its dispatch weights."""
+            if (
+                group_id is None
+                or group_id not in self._pending_reserved_admission_versions
+            ):
+                return
+            admitted_version = self._pending_reserved_admission_versions[group_id]
+            if admitted_version != self._rollout_admission_version:
+                async with self._data_plane_checkpoint_barrier.mutation(
+                    "prompt_reservations"
+                ) as cut:
+                    self._rollout_manager.restamp_prompt_group_for_dispatch(
+                        cut,
+                        group_id,
+                        start_weight_version=self._rollout_admission_version,
+                    )
+            del self._pending_reserved_admission_versions[group_id]
+
         async def _launch(
             prompt: DatumSpec,
             target_step: Optional[int],
@@ -2211,34 +2316,49 @@ class SingleControllerActor:
                 await sem.acquire()
             finally:
                 self._rollout_slot_waiters -= 1
-            # wait for rollout to be permitted
-            self._rollout_permitted_waiters += 1
             try:
-                await self._rollout_permitted.wait()
-            finally:
-                self._rollout_permitted_waiters -= 1
-            dispatch_started = time.monotonic()
-
-            task_started_event = asyncio.Event()
-            # dispatch rollout
-            task = rollout_tasks.create_task(
-                _dispatch_one_prompt(
-                    prompt,
-                    target_step,
-                    lineage_group_id,
-                    task_started_event,
-                    work_started=work_started,
-                    dispatch_started=dispatch_started,
-                )
-            )
-            self._dispatched_rollouts.add(task)
-            task.add_done_callback(self._dispatched_rollouts.discard)
-            task.add_done_callback(
-                partial(
-                    _release_permits_if_task_not_started,
-                    task_started_event=task_started_event,
-                )
-            )
+                while True:
+                    # wait for rollout to be permitted
+                    self._rollout_permitted_waiters += 1
+                    try:
+                        await self._rollout_permitted.wait()
+                    finally:
+                        self._rollout_permitted_waiters -= 1
+                    async with self._rollout_admission_lock:
+                        if not self._rollout_permitted.is_set():
+                            continue
+                        await _restamp_pending_recovery_group(lineage_group_id)
+                        dispatch_started = time.monotonic()
+                        admitted_policy_version = self._rollout_admission_version
+                        task_started_event = asyncio.Event()
+                        # Register under the same lock used to close refit admission.
+                        # The task is therefore either visible to the stale-request
+                        # handling path or remains blocked until publication.
+                        task = rollout_tasks.create_task(
+                            _dispatch_one_prompt(
+                                prompt,
+                                target_step,
+                                lineage_group_id,
+                                task_started_event,
+                                admitted_policy_version,
+                                work_started=work_started,
+                                dispatch_started=dispatch_started,
+                            )
+                        )
+                        self._dispatched_rollouts.add(task)
+                        task.add_done_callback(self._dispatched_rollouts.discard)
+                        task.add_done_callback(
+                            partial(
+                                _release_permits_if_task_not_started,
+                                task_started_event=task_started_event,
+                            )
+                        )
+                        return
+            except BaseException:
+                # A dispatch task does not own the permits until registration.
+                self._buffer_capacity.release()
+                sem.release()
+                raise
 
         max_epochs = self._algo_cfg.max_num_epochs
         async with asyncio.TaskGroup() as rollout_tasks:
@@ -2249,9 +2369,7 @@ class SingleControllerActor:
                     for prompt_batch in self._dataloader:
                         if self._divert_batch_to_reserve(prompt_batch):
                             continue
-                        target_step = await self._sampler.admit(
-                            trainer_version_fn=lambda: self._trainer_version
-                        )
+                        target_step = await self._admit_rollout_batch()
                         if target_step is not None:
                             self._sampler_stamps_target_steps = True
                         self._require_unoccupied_target_step(target_step)
@@ -2418,9 +2536,7 @@ class SingleControllerActor:
             step_prompts = [
                 self._replacement_reserve.popleft() for _ in range(num_prompts_per_step)
             ]
-            target_step = await self._sampler.admit(
-                trainer_version_fn=lambda: self._trainer_version
-            )
+            target_step = await self._admit_rollout_batch()
             self._require_unoccupied_target_step(target_step)
             print(
                 f"  dataloader exhausted; training on {len(step_prompts)} pooled "
@@ -2616,8 +2732,13 @@ class SingleControllerActor:
             # model updates -- the last epoch's, when there is more than one.
             policy_result: Optional[dict[str, Any]] = None
             value_result: Optional[dict[str, Any]] = None
+            aborted_stale_inflight_groups = 0
+            early_refit_publish_t0: Optional[float] = None
             # Always True off the PPO path: the start step is pinned to 0 there.
             is_policy_training_step = self._train_steps >= policy_training_start_step
+            early_refit_this_step = bool(
+                self._is_ppo and self._async_cfg.early_refit and is_policy_training_step
+            )
             consumed_metas: list[KVBatchMeta] = []
             consumed_training_claim_ids: list[str] = []
             consumed_group_count = 0
@@ -2762,18 +2883,30 @@ class SingleControllerActor:
                     # Safe mid-loop: colocated steps are assembled whole, so the loop closes after this.
                     # The gate reopens at the post-step _sync_weights wake, or after the save on save-bound steps.
                     if self._gen.blocks_training():
-                        self._rollout_permitted.clear()
+                        await self._close_rollout_admission()
                         # Deadline clocks measure inference service time, not wall clock:
                         # the switch to training must not tick them down.
                         self._rollout_manager.suspend_request_deadlines()
                         await asyncio.to_thread(self._gen.finish_generation)
 
                     # ---- 2. Prepare the batch ----
-                    # Compute prev_logprobs / ref_logprobs
-                    if (
+                    logprobs_required = bool(
                         self._policy_logprobs_required
                         or self._reference_logprobs_required
-                    ):
+                    )
+
+                    # Early Refit computes old-critic values before policy
+                    # logprobs. The following policy pass can then retain params
+                    # directly into actor training, avoiding one D2H/H2D round trip.
+                    if early_refit_this_step:
+                        with self._timer.time("early_refit_policy_pre_value_offload"):
+                            await asyncio.to_thread(self._trainer.offload_to_cpu)
+                        with self._timer.time("value_inference"):
+                            train_meta = await self._value_stage(train_meta)
+
+                    # Compute prev_logprobs / ref_logprobs. Baseline retains its
+                    # existing logprobs-before-value order.
+                    if logprobs_required:
                         with self._timer.time("logprob_inference_prep"):
                             # Once the step is open, gradients are accumulating
                             # in the trainer's grad buffers across chunks. The
@@ -2795,17 +2928,23 @@ class SingleControllerActor:
                                     self._trainer.get_reference_policy_logprobs_from_meta,
                                     train_meta,
                                 )
-                    elif self._is_ppo:
+                    elif self._is_ppo and not early_refit_this_step:
                         # prepare_for_lp_inference is skipped here, and it is the only
                         # other call that parks the policy optimizer before the critic.
                         with self._timer.time("value_inference_prep"):
                             await asyncio.to_thread(self._trainer.offload_to_cpu)
 
-                    # Value model forward
-                    if self._is_ppo:
+                    # Value model forward. Early Refit already ran it above.
+                    if self._is_ppo and not early_refit_this_step:
                         with self._timer.time("value_inference"):
                             await asyncio.to_thread(self._trainer.finish_inference)
                             train_meta = await self._value_stage(train_meta)
+                    elif self._is_ppo and early_refit_this_step and logprobs_required:
+                        with self._timer.time("policy_inference_cleanup_keep_params"):
+                            await asyncio.to_thread(
+                                self._trainer.finish_inference,
+                                keep_params_for_training=True,
+                            )
 
                     # Compute advantages
                     with self._timer.time("advantage_calculation"):
@@ -2835,7 +2974,7 @@ class SingleControllerActor:
                     # the colocated models do not move between CPU and GPU per epoch.
                     # TODO(#2625): value_result, policy_result only record the last epoch's metrics.
                     # That matches ppo.py for the losses; total_flops is additive and undercounted.
-                    if self._is_ppo:
+                    if self._is_ppo and not early_refit_this_step:
                         # A critic optimizer update is already irreversible. Keep
                         # periodic snapshots out until this whole training step is
                         # published as consumed below.
@@ -2860,8 +2999,21 @@ class SingleControllerActor:
                         # Always restore training mode because log-prob inference may have
                         # switched the model to inference mode. Keep it resident
                         # across every PPO actor epoch.
+                        if early_refit_this_step:
+                            # The actor update is the first irreversible mutation in
+                            # this order. Keep periodic snapshots out until critic and
+                            # the data-plane transaction commit below.
+                            self._optimizer_commit_in_progress = True
                         with self._timer.time("training_prep"):
-                            await asyncio.to_thread(self._trainer.prepare_for_training)
+                            if early_refit_this_step and logprobs_required:
+                                await asyncio.to_thread(
+                                    self._trainer.prepare_for_training,
+                                    verify_params_resident=True,
+                                )
+                            else:
+                                await asyncio.to_thread(
+                                    self._trainer.prepare_for_training
+                                )
 
                         if has_valid_training_tokens:
                             for _ in range(self._ppo_epochs):
@@ -2908,6 +3060,42 @@ class SingleControllerActor:
                                 select_fields=calibration_fields,
                             )
                         )
+
+                    if early_refit_this_step:
+                        next_policy_version = version_during_step + 1
+                        calibration_data = (
+                            BatchedDataDict.from_batches(calibration_batches)
+                            if calibration_batches
+                            else None
+                        )
+                        with self._timer.time("weight_sync"):
+                            aborted_stale_inflight_groups = await self._sync_weights(
+                                target_version=next_policy_version,
+                                calibration_data=calibration_data,
+                            )
+                        await self._publish_policy_version(next_policy_version)
+                        self._timer.mark(
+                            "early_refit_policy_published",
+                            {"policy_version": next_policy_version},
+                        )
+                        early_refit_publish_t0 = time.monotonic()
+
+                        try:
+                            with self._timer.time("early_refit_policy_offload"):
+                                await asyncio.to_thread(self._trainer.offload_to_cpu)
+                            with self._timer.time("value_training"):
+                                with self._timer.time(
+                                    "early_refit_critic_after_publish"
+                                ):
+                                    value_result = await self._value_train_epochs(
+                                        train_meta,
+                                        num_epochs=self._critic_ppo_epochs,
+                                    )
+                        except BaseException:
+                            # Policy v+1 is serving but the PPO transaction is not
+                            # checkpointable until critic v+1 also completes.
+                            await self._close_rollout_admission()
+                            raise
 
                     # ---- 4. Clear the batch ----
                     # Refresh min_sample_version
@@ -3021,9 +3209,15 @@ class SingleControllerActor:
                 if self._teacher_coordinator is not None:
                     step_metrics.update(self._teacher_coordinator.drain_metrics())
 
-                self._trainer_version += 1
+                next_trainer_version = version_during_step + 1
+                self._trainer_version = next_trainer_version
                 self._train_steps += 1
                 self._optimizer_commit_in_progress = False
+                if early_refit_publish_t0 is not None:
+                    self._timer.record(
+                        "early_refit_publish_to_commit",
+                        time.monotonic() - early_refit_publish_t0,
+                    )
                 dropped_prompt_groups = self._batch_shortfall.get(
                     version_during_step, 0
                 )
@@ -3092,8 +3286,7 @@ class SingleControllerActor:
                 # ---- 6. Refit the model ----
                 # Critic warmup doesn't need a refit and the version still advances.
                 # But a colocated engine that was stood down still needs to be woken up via reshard.
-                aborted_stale_inflight_groups = 0
-                if is_policy_training_step or self._gen.blocks_training():
+                if not early_refit_this_step:
                     if defer_refit_for_save:
                         # Refit-deferral (colocated): the engine is about to be saved; let it sleep.
                         # Record `weight_sync` for consistency in reports.
@@ -3101,7 +3294,7 @@ class SingleControllerActor:
                             pass
                         with self._timer.time("offload_before_refit"):
                             await asyncio.to_thread(self._trainer.offload_before_refit)
-                    else:
+                    elif is_policy_training_step or self._gen.blocks_training():
                         with self._timer.time("weight_sync"):
                             calibration_data = (
                                 BatchedDataDict.from_batches(calibration_batches)
@@ -3109,10 +3302,14 @@ class SingleControllerActor:
                                 else None
                             )
                             aborted_stale_inflight_groups = await self._sync_weights(
+                                target_version=self._trainer_version,
                                 calibration_data=calibration_data,
                             )
-                self._retune_lookahead_versions()
-                self._rollout_manager.set_weight_version(self._trainer_version)
+                    if not defer_refit_for_save:
+                        # Critic warmup advances the logical frontier without a
+                        # physical refit; ordinary policy steps publish only after
+                        # the physical transfer above succeeds.
+                        await self._publish_policy_version(self._trainer_version)
                 step_metrics.update(
                     {
                         "evicted_stale_prompt_groups": evicted_stale_prompt_groups,
@@ -3157,8 +3354,9 @@ class SingleControllerActor:
                                 await asyncio.to_thread(
                                     self._gen.prepare_for_generation
                                 )
-                                self._rollout_permitted.set()
-                                self._rollout_manager.resume_request_deadlines()
+                                await self._publish_policy_version(
+                                    self._trainer_version
+                                )
 
             timing_metrics: dict[str, float] = self._timer.get_timing_metrics(
                 reduction_op="sum"
@@ -3725,7 +3923,9 @@ class SingleControllerActor:
             if health.dp_shard_idx not in absent
         }
 
-    def _record_refit_landed(self, participants: set[int]) -> None:
+    def _record_refit_landed(
+        self, participants: set[int], *, weight_version: Optional[int] = None
+    ) -> None:
         """Write down what each shard now holds, and return the STALE ones to service.
 
         Two things, because they are the same fact seen from two sides: this refit reached
@@ -3763,19 +3963,23 @@ class SingleControllerActor:
         Args:
             participants: shards eligible for this refit, from :meth:`_refit_participants`
                 at the point membership settled.
+            weight_version: Physical policy version delivered by this refit.
         """
         if self._gen_fleet is None:
             return
+        landed_version = (
+            self._trainer_version if weight_version is None else weight_version
+        )
         for health in self._gen_fleet.snapshot():
             if health.dp_shard_idx not in participants:
                 continue
             if health.state is ShardState.STALE:
                 self._gen_fleet.report_refit(
-                    health.dp_shard_idx, weight_version=self._trainer_version
+                    health.dp_shard_idx, weight_version=landed_version
                 )
             else:
                 self._gen_fleet.record_weight_version(
-                    health.dp_shard_idx, weight_version=self._trainer_version
+                    health.dp_shard_idx, weight_version=landed_version
                 )
 
     async def _check_env_health(self, timeout_s: float) -> list[str]:
@@ -3884,6 +4088,7 @@ class SingleControllerActor:
         the live trainer keeps accumulating gradients without modification.
         """
         cut.require_live()
+        self._restamp_pending_recovery_groups_for_checkpoint(cut)
         dataloader_state = self._dataloader.state_dict()
         replacement_reserve = list(self._replacement_reserve)
         training_owned_groups = self._buffer.training_owned_replay_groups()
@@ -4521,6 +4726,7 @@ class SingleControllerActor:
         # contain a cursor without its prompt owner, or two durable owners for one
         # canonical group.
         async with self._data_plane_checkpoint_barrier.checkpoint() as cut:
+            self._restamp_pending_recovery_groups_for_checkpoint(cut)
             save_state.current_step = self._train_steps
             save_state.total_steps = self._train_steps
             save_state.trainer_version = self._trainer_version
@@ -4758,25 +4964,85 @@ class SingleControllerActor:
                 "is unbounded. Giving up so the fleet can be reconciled and retried."
             ) from None
 
+    async def _close_rollout_admission(self) -> None:
+        """Close the rollout gate atomically with dispatch registration."""
+        async with self._rollout_admission_lock:
+            self._rollout_permitted.clear()
+
+    def _restamp_pending_recovery_groups_for_checkpoint(
+        self, cut: DataPlaneMutationCut
+    ) -> None:
+        """Persist the physical version for admitted groups not yet dispatched."""
+        cut.require_live()
+        for group_id, admitted_version in list(
+            self._pending_reserved_admission_versions.items()
+        ):
+            if admitted_version == self._rollout_admission_version:
+                continue
+            self._rollout_manager.restamp_prompt_group_for_dispatch(
+                cut,
+                group_id,
+                start_weight_version=self._rollout_admission_version,
+            )
+            self._pending_reserved_admission_versions[group_id] = (
+                self._rollout_admission_version
+            )
+
+    async def _publish_policy_version(self, version: int) -> None:
+        """Publish a generation-visible policy version and reopen admission."""
+        async with self._rollout_admission_lock:
+            if version < self._rollout_admission_version:
+                raise RuntimeError(
+                    "policy versions must publish monotonically: "
+                    f"published={self._rollout_admission_version}, requested={version}"
+                )
+
+            # Retune and retag every rollout-facing component before reopening.
+            # In an Early Refit step this version is intentionally one ahead of
+            # the committed/checkpointable trainer version.
+            self._retune_lookahead_versions(trainer_version=version)
+            self._rollout_manager.set_weight_version(version)
+            if self._master_config.token_capture.enabled:
+                await asyncio.to_thread(
+                    self._gen.set_rollout_weight_version,
+                    version,
+                )
+            self._rollout_admission_version = version
+
+            now = time.monotonic()
+            if self._last_policy_publish_monotonic is not None:
+                self._timer.record(
+                    "policy_publish_interval",
+                    now - self._last_policy_publish_monotonic,
+                )
+            self._last_policy_publish_monotonic = now
+            if self._async_cfg.early_refit and version > self._trainer_version:
+                self._first_dispatch_pending_by_version[version] = now
+
+            self._rollout_permitted.set()
+            self._rollout_manager.resume_request_deadlines()
+
     async def _sync_weights(
         self,
         *,
+        target_version: Optional[int] = None,
         calibration_data: Optional[BatchedDataDict[Any]] = None,
     ) -> int:
-        """Pause new rollout dispatches, synchronize weights, resume.
+        """Close rollout admission and synchronize weights for ``target_version``.
 
         SC owns the pause gate. vLLM serves through the refit; it supports live weight updates.
         A colocated engine is instead already stood down: the synchronizer's sync is the wake,
         and step 4 resumes dispatch.
 
         Flow:
-          1. _rollout_permitted.clear()  — no new dispatches
+          1. Atomically close rollout admission.
           2. Optionally calibrate FP8 KV-cache scales.
           3. Materialize deferred policy parameter all-gathers.
           4. weight_synchronizer.sync_weights(kv_scales=...)
-          5. _rollout_permitted.set()   — resume
+          5. Leave admission closed; the caller publishes the logical version.
 
         Args:
+            target_version: Physical policy version transferred to generation.
             calibration_data: Optional data used to calibrate FP8 KV-cache
                 scales before synchronizing weights.
 
@@ -4784,7 +5050,9 @@ class SingleControllerActor:
             The number of stale in-flight rollout groups aborted before the
             weight synchronization.
         """
-        self._rollout_permitted.clear()
+        if target_version is None:
+            target_version = self._trainer_version
+        await self._close_rollout_admission()
 
         # TODO(#2625): Abort unconditionally once Gym-path abort is validated;
         # for now only the native path aborts stale in-flight requests.
@@ -4876,14 +5144,14 @@ class SingleControllerActor:
                 await self._sync_weights_within(kv_scales, "retry")
                 # Inside the window: this is what refills the serving set, so releasing
                 # the flag before it runs would reopen the gap it exists to close.
-                self._record_refit_landed(participants)
+                self._record_refit_landed(participants, weight_version=target_version)
         else:
             # A completed refit is what makes an engine's weights current, so this is
             # where a shard pulled out of service for holding partial ones earns its way
             # back. else, not a trailing statement: the recovery path above already
             # promoted inside its window, and everything below this must still run on
             # both paths.
-            self._record_refit_landed(participants)
+            self._record_refit_landed(participants, weight_version=target_version)
         if self._async_cfg.recompute_kv_cache_after_weight_updates:
             # to_thread, like every other call into the workers here. Run directly on
             # the loop this is a blocking Ray call, and a wedged generation worker would
@@ -4893,14 +5161,6 @@ class SingleControllerActor:
         elapsed = time.monotonic() - t0
 
         print(f"  _sync_weights: sync done in {elapsed:.3f}s", flush=True)
-        if self._master_config.token_capture.enabled:
-            # Rotate the version vLLM workers stamp on captured model calls
-            # (per-call tagging; group staleness = min over the group's calls).
-            await asyncio.to_thread(
-                self._gen.set_rollout_weight_version, self._trainer_version
-            )
-        self._rollout_permitted.set()
-        self._rollout_manager.resume_request_deadlines()
         return aborted_stale_inflight_groups
 
     async def _value_stage(self, meta: KVBatchMeta) -> KVBatchMeta:
@@ -5186,7 +5446,9 @@ class SingleControllerActor:
             fields.append(adv_cfg.values_field)
         return list(dict.fromkeys(fields))
 
-    def _retune_lookahead_versions(self) -> None:
+    def _retune_lookahead_versions(
+        self, *, trainer_version: Optional[int] = None
+    ) -> None:
         """Widen the sampler's lookahead while the policy is frozen, then shrink it back.
 
         Port of ppo.py's _async_ppo_generation_lead_steps.
@@ -5196,9 +5458,10 @@ class SingleControllerActor:
         steady = self._async_cfg.sampler.max_lookahead_versions
         warmup = self._async_cfg.sampler.warmup_lookahead_versions
         start = self._algo_cfg.policy_training_start_step
-        if warmup is None or self._trainer_version >= start:
+        frontier = self._trainer_version if trainer_version is None else trainer_version
+        if warmup is None or frontier >= start:
             window = steady
         else:
-            remaining_to_frontier = start + steady - self._trainer_version
+            remaining_to_frontier = start + steady - frontier
             window = max(steady, min(warmup, remaining_to_frontier))
         self._sampler.set_gate_window(window)

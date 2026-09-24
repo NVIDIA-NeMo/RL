@@ -641,6 +641,47 @@ class TestLookaheadSchedule:
 
         ctrl._sampler.set_gate_window.assert_not_called()
 
+    def test_publish_retunes_and_tags_before_reopening_admission(self):
+        ctrl = _lookahead_controller(
+            trainer_version=3,
+            policy_training_start_step=4,
+            max_lookahead_versions=1,
+            warmup_lookahead_versions=4,
+        )
+        calls: list[tuple[str, int]] = []
+        ctrl._sampler.set_gate_window.side_effect = lambda window: calls.append(
+            ("retune", window)
+        )
+        ctrl._rollout_manager = SimpleNamespace(
+            set_weight_version=lambda version: calls.append(("publish", version)),
+            resume_request_deadlines=MagicMock(),
+        )
+        ctrl._master_config = SimpleNamespace(
+            token_capture=SimpleNamespace(enabled=True)
+        )
+        ctrl._gen = SimpleNamespace(
+            set_rollout_weight_version=lambda version: calls.append(
+                ("token_capture", version)
+            )
+        )
+        ctrl._rollout_admission_lock = asyncio.Lock()
+        ctrl._rollout_permitted = asyncio.Event()
+        ctrl._rollout_admission_version = 3
+        ctrl._last_policy_publish_monotonic = None
+        ctrl._first_dispatch_pending_by_version = {}
+        ctrl._timer = Timer()
+        ctrl._async_cfg.early_refit = False
+
+        asyncio.run(ctrl._publish_policy_version(4))
+
+        assert calls == [
+            ("retune", 1),
+            ("publish", 4),
+            ("token_capture", 4),
+        ]
+        assert ctrl._rollout_admission_version == 4
+        assert ctrl._rollout_permitted.is_set()
+
 
 @pytest.mark.parametrize(
     ("recompute_kv_cache", "expected_invalidation_calls"),
@@ -657,6 +698,7 @@ def test_sync_weights_honors_recompute_kv_cache_config(
     )
     ctrl._rollout_permitted = asyncio.Event()
     ctrl._rollout_permitted.set()
+    ctrl._rollout_admission_lock = asyncio.Lock()
     # No fleet health: _sync_weights reconciles refit membership first, and with no
     # monitor there is nothing to reconcile.
     ctrl._gen_fleet = None
@@ -676,12 +718,14 @@ def test_sync_weights_honors_recompute_kv_cache_config(
         env={}, token_capture=SimpleNamespace(enabled=False)
     )
 
-    asyncio.run(ctrl._sync_weights())
+    asyncio.run(ctrl._sync_weights(target_version=1))
 
     ctrl._weight_synchronizer.sync_weights.assert_called_once_with(kv_scales=None)
     ctrl._trainer.sync_params_before_refit.assert_called_once_with()
     assert ctrl._gen.invalidate_kv_cache.call_count == expected_invalidation_calls
-    assert ctrl._rollout_permitted.is_set()
+    # Physical refit and logical publication are separate. A caller must publish
+    # the matching version before rollout admission reopens.
+    assert not ctrl._rollout_permitted.is_set()
 
 
 def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
@@ -690,6 +734,7 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
     ctrl._async_cfg = AsyncRLConfig()
     ctrl._rollout_permitted = asyncio.Event()
     ctrl._rollout_permitted.set()
+    ctrl._rollout_admission_lock = asyncio.Lock()
     # No fleet health: _sync_weights reconciles refit membership first, and with no
     # monitor there is nothing to reconcile.
     ctrl._gen_fleet = None
@@ -718,7 +763,7 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
         }
     )
 
-    asyncio.run(ctrl._sync_weights(calibration_data=calibration_data))
+    asyncio.run(ctrl._sync_weights(target_version=1, calibration_data=calibration_data))
 
     ctrl._trainer.calibrate_qkv_fp8_scales.assert_called_once_with(
         calibration_data,
@@ -1413,11 +1458,11 @@ class _NoOpTrainer:
     def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
         del keep_train_buffers
 
-    def finish_inference(self) -> None:
-        pass
+    def finish_inference(self, keep_params_for_training: bool = False) -> int | None:
+        return 1 if keep_params_for_training else None
 
-    def prepare_for_training(self) -> None:
-        pass
+    def prepare_for_training(self, verify_params_resident: bool = False) -> int | None:
+        return 1 if verify_params_resident else None
 
     def begin_train_step(self, loss_fn) -> None:
         del loss_fn
@@ -1449,8 +1494,9 @@ class _LpRecordingTrainer(_NoOpTrainer):
         self.keep_train_buffers_calls.append(keep_train_buffers)
         self.calls.append("lp_inference_prep")
 
-    def prepare_for_training(self) -> None:
+    def prepare_for_training(self, verify_params_resident: bool = False) -> int | None:
         self.calls.append("prepare_for_training")
+        return 1 if verify_params_resident else None
 
     def train_microbatches_from_meta(
         self, meta: KVBatchMeta, *, train_fields: tuple[str, ...]
@@ -1497,11 +1543,14 @@ class _OrderRecordingTrainer(_NoOpTrainer):
         del meta
         self.calls.append("policy.get_logprobs_from_meta")
 
-    def finish_inference(self) -> None:
-        self.calls.append("policy.finish_inference")
+    def finish_inference(self, keep_params_for_training: bool = False) -> int | None:
+        suffix = "_keep_params" if keep_params_for_training else ""
+        self.calls.append(f"policy.finish_inference{suffix}")
+        return 1 if keep_params_for_training else None
 
-    def prepare_for_training(self) -> None:
+    def prepare_for_training(self, verify_params_resident: bool = False) -> int | None:
         self.calls.append("policy.prepare_for_training")
+        return 1 if verify_params_resident else None
 
     def offload_to_cpu(self) -> None:
         self.calls.append("policy.offload_to_cpu")
@@ -1583,10 +1632,12 @@ def _train_pump_controller(*, sampler) -> object:
         # The pump's step epilogue reads the save triggers even when saving
         # is disabled.
         checkpointing={"enabled": False, "save_period": 10},
+        token_capture=SimpleNamespace(enabled=False),
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._async_cfg = SimpleNamespace(
+        early_refit=False,
         min_groups_for_streaming_train=1,
         rollout_failure=SimpleNamespace(min_step_batch_fraction=0.9),
         sampler=SimpleNamespace(
@@ -1635,7 +1686,14 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._dp_client = _NoOpDataPlane()
     ctrl._timer = Timer()
     ctrl._trainer_version = 0
+    ctrl._rollout_admission_version = 0
+    ctrl._rollout_admission_lock = asyncio.Lock()
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+    ctrl._last_policy_publish_monotonic = None
+    ctrl._first_dispatch_pending_by_version = {}
     ctrl._train_steps = 0
+    ctrl._optimizer_commit_in_progress = False
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._batch_shortfall = {}
     ctrl._batch_replacements = {}
@@ -1949,7 +2007,7 @@ def test_train_pump_logs_nonzero_stale_group_metrics(monkeypatch) -> None:
 
     asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
-    ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
+    ctrl._sync_weights.assert_awaited_once_with(target_version=1, calibration_data=None)
     train_metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
     assert train_metrics["evicted_stale_prompt_groups"] == 2
     assert train_metrics["aborted_stale_inflight_groups"] == 1
@@ -2108,6 +2166,8 @@ def test_train_pump_chunked_step_by_engine_regime(
     )
     ctrl._rollout_permitted = asyncio.Event()
     ctrl._rollout_permitted.set()
+    close_rollout_admission = AsyncMock(wraps=ctrl._close_rollout_admission)
+    ctrl._close_rollout_admission = close_rollout_admission
     ctrl._sync_weights = AsyncMock(return_value=0)
     ctrl._logger = MagicMock()
     monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
@@ -2119,11 +2179,13 @@ def test_train_pump_chunked_step_by_engine_regime(
     if engine_blocks_training:
         # Stood down exactly once, with the gate already closed, before the
         # trainer touched the GPUs; the whole step then ran as one chunk. The
-        # (mocked) post-step _sync_weights reopens the gate.
+        # post-step logical publication reopens the gate after the mocked sync.
         assert calls == [("finish_generation", False)] + chunk
         assert trainer.keep_train_buffers_calls == [False]
-        assert not ctrl._rollout_permitted.is_set()
+        assert ctrl._rollout_permitted.is_set()
+        assert ctrl._rollout_admission_version == 1
         assert sampler.select_bounds == [(2, 2)]
+        close_rollout_admission.assert_awaited_once_with()
         # Frozen requests' deadline clocks pause with the engine.
         ctrl._rollout_manager.suspend_request_deadlines.assert_called_once()
     else:
@@ -2131,8 +2193,9 @@ def test_train_pump_chunked_step_by_engine_regime(
         assert trainer.keep_train_buffers_calls == [False, True]
         assert ctrl._rollout_permitted.is_set()
         assert sampler.select_bounds[0] == (1, 2)
+        close_rollout_admission.assert_not_awaited()
         ctrl._rollout_manager.suspend_request_deadlines.assert_not_called()
-    ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
+    ctrl._sync_weights.assert_awaited_once_with(target_version=1, calibration_data=None)
 
 
 def test_train_pump_does_not_offload_the_policy_on_a_grpo_run(monkeypatch) -> None:
@@ -2403,7 +2466,9 @@ def test_train_pump_freezes_the_policy_during_critic_warmup(
         # closed; the sync (mocked -- the real one reopens the gate) is the wake.
         assert stand_downs == [False]
         ctrl._rollout_manager.suspend_request_deadlines.assert_called_once()
-        ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
+        ctrl._sync_weights.assert_awaited_once_with(
+            target_version=1, calibration_data=None
+        )
     else:
         ctrl._sync_weights.assert_not_awaited()
         ctrl._rollout_manager.suspend_request_deadlines.assert_not_called()
@@ -2434,7 +2499,7 @@ def test_train_pump_trains_the_policy_once_warmup_is_over(monkeypatch, capsys) -
 
     trainer.begin_train_step.assert_called_once()
     trainer.finish_train_step.assert_called_once_with()
-    ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
+    ctrl._sync_weights.assert_awaited_once_with(target_version=2, calibration_data=None)
     # Announced exactly once, on the step that crosses the boundary.
     assert capsys.readouterr().out.count("Critic warmup complete") == 1
 
@@ -2477,7 +2542,7 @@ def test_train_pump_groups_ppo_epochs_by_model(monkeypatch) -> None:
         "policy.finish_train_step",
     ]
     # Still one RL step, so one refit and one version bump.
-    ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
+    ctrl._sync_weights.assert_awaited_once_with(target_version=1, calibration_data=None)
     assert ctrl._trainer_version == 1
 
 
@@ -2514,7 +2579,120 @@ def test_train_pump_runs_all_critic_epochs_before_actor_epochs(monkeypatch) -> N
         "policy.train_microbatches_from_meta",
         "policy.finish_train_step",
     ]
-    ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
+    ctrl._sync_weights.assert_awaited_once_with(target_version=1, calibration_data=None)
+
+
+def test_early_refit_publishes_actor_before_critic_epochs(monkeypatch) -> None:
+    meta = _single_group_meta()
+    calls: list[str] = []
+    ctrl, _ = _ppo_train_pump_controller(
+        sampler=_OneThenEmptySampler(meta),
+        value=_NoOpValue(calls=calls, prefix="critic."),
+        critic_ppo_epochs=2,
+    )
+    ctrl._async_cfg.early_refit = True
+    ctrl._policy_logprobs_required = True
+    ctrl._trainer = _EpochRecordingTrainer(calls)
+
+    async def _record_sync(**kwargs) -> int:
+        assert kwargs == {"target_version": 1, "calibration_data": None}
+        calls.append("refit.sync")
+        return 0
+
+    ctrl._sync_weights = AsyncMock(side_effect=_record_sync)
+    ctrl._rollout_manager.set_weight_version.side_effect = lambda version: calls.append(
+        f"refit.publish_v{version}"
+    )
+    ctrl._advantage_stage = AsyncMock(return_value=(meta, True))
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert calls == [
+        "policy.offload_to_cpu",
+        "critic.prepare_for_inference",
+        "critic.get_values_from_meta",
+        "critic.finish_inference",
+        "policy.prepare_for_lp_inference",
+        "policy.get_logprobs_from_meta",
+        "policy.finish_inference_keep_params",
+        "policy.prepare_for_training",
+        "policy.begin_train_step",
+        "policy.train_microbatches_from_meta",
+        "policy.finish_train_step",
+        "refit.sync",
+        "refit.publish_v1",
+        "policy.offload_to_cpu",
+        "critic.prepare_for_training",
+        "critic.train_from_meta",
+        "critic.train_from_meta",
+        "critic.finish_training",
+    ]
+    assert ctrl._rollout_admission_version == 1
+    assert ctrl._trainer_version == 1
+    assert ctrl._train_steps == 1
+    assert ctrl._optimizer_commit_in_progress is False
+
+
+def test_early_refit_critic_failure_does_not_commit_and_fails_closed(
+    monkeypatch,
+) -> None:
+    class _FailingValue(_NoOpValue):
+        def train_from_meta(self, meta: KVBatchMeta, loss_fn) -> dict:
+            del meta, loss_fn
+            raise RuntimeError("critic exploded")
+
+    meta = _single_group_meta()
+    ctrl, _ = _ppo_train_pump_controller(
+        sampler=_OneThenEmptySampler(meta),
+        value=_FailingValue(),
+    )
+    ctrl._async_cfg.early_refit = True
+    ctrl._trainer = _EpochRecordingTrainer([])
+    ctrl._advantage_stage = AsyncMock(return_value=(meta, True))
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    with pytest.raises(RuntimeError, match="critic exploded"):
+        asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert ctrl._rollout_admission_version == 1
+    assert ctrl._trainer_version == 0
+    assert ctrl._train_steps == 0
+    assert ctrl._optimizer_commit_in_progress is True
+    assert not ctrl._rollout_permitted.is_set()
+    ctrl._logger.log_metrics.assert_not_called()
+
+
+def test_early_refit_post_publish_policy_offload_failure_fails_closed(
+    monkeypatch,
+) -> None:
+    class _FailingPublishedOffloadTrainer(_EpochRecordingTrainer):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.offload_calls = 0
+
+        def offload_to_cpu(self) -> None:
+            self.offload_calls += 1
+            if self.offload_calls == 2:
+                raise RuntimeError("post-publish offload exploded")
+            super().offload_to_cpu()
+
+    meta = _single_group_meta()
+    ctrl, _ = _ppo_train_pump_controller(sampler=_OneThenEmptySampler(meta))
+    ctrl._async_cfg.early_refit = True
+    ctrl._trainer = _FailingPublishedOffloadTrainer()
+    ctrl._advantage_stage = AsyncMock(return_value=(meta, True))
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    with pytest.raises(RuntimeError, match="post-publish offload exploded"):
+        asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert ctrl._rollout_admission_version == 1
+    assert ctrl._trainer_version == 0
+    assert ctrl._train_steps == 0
+    assert ctrl._optimizer_commit_in_progress is True
+    assert not ctrl._rollout_permitted.is_set()
+    ctrl._logger.log_metrics.assert_not_called()
 
 
 def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:

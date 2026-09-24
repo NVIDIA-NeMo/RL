@@ -1780,6 +1780,20 @@ class RolloutManager:
             start_weight_version=self._weight_version,
         )
 
+    def restamp_prompt_group_for_dispatch(
+        self,
+        cut: DataPlaneMutationCut,
+        group_id: str,
+        *,
+        start_weight_version: int,
+    ) -> None:
+        """Retag a newly admitted, not-yet-dispatched recovery group."""
+        self._recovery_ledger.restamp_group_for_dispatch(
+            cut,
+            group_id,
+            start_weight_version=start_weight_version,
+        )
+
     def discard_prompt_group(
         self,
         cut: DataPlaneMutationCut,

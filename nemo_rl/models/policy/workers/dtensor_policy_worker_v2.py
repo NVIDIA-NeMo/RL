@@ -1267,8 +1267,31 @@ class DTensorPolicyWorkerV2Impl(
         gc.collect()
         torch.cuda.empty_cache()
 
+    def _policy_param_residency(self) -> dict[str, int | bool]:
+        """Check local DTensor shards for actual CUDA parameter residency."""
+        param_tensors = []
+        for parameter in self.model.parameters():
+            local_parameter = (
+                parameter.to_local() if hasattr(parameter, "to_local") else parameter
+            )
+            param_tensors.append(local_parameter)
+        return {
+            "params_resident_on_cuda": not self.cpu_offload
+            and bool(param_tensors)
+            and all(
+                parameter.is_cuda and parameter.untyped_storage().nbytes() > 0
+                for parameter in param_tensors
+            ),
+            "checked_units": len(param_tensors),
+        }
+
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/prepare_for_training")
-    def prepare_for_training(self, *args, **kwargs) -> None:
+    def prepare_for_training(
+        self, verify_params_resident: bool = False
+    ) -> Optional[dict[str, int | bool]]:
+        residency_before_prepare = (
+            self._policy_param_residency() if verify_params_resident else None
+        )
         # onload models and optimizer state to cuda
         if not self.cpu_offload:
             self.move_to_cuda(self.model)
@@ -1285,14 +1308,25 @@ class DTensorPolicyWorkerV2Impl(
             self.move_optimizer_to_device("cuda")
 
         torch.cuda.empty_cache()
+        return residency_before_prepare
 
-    def finish_inference(self) -> None:
-        """Offload model params to CPU after inference. Only used in PPO."""
-        self.model = self.move_to_cpu(self.model)
+    def finish_inference(
+        self, keep_params_for_training: bool = False
+    ) -> dict[str, int | bool]:
+        """Finish PPO inference, optionally retaining params for imminent training."""
+        if keep_params_for_training and self.cpu_offload:
+            raise RuntimeError(
+                "keep_params_for_training is unsupported when DTensor cpu_offload=true"
+            )
+        if not keep_params_for_training:
+            self.model = self.move_to_cpu(self.model)
         self.model.eval()
 
+        # Retaining params must not retain inference temporaries or stale allocator
+        # segments; the actor prep can then restore only optimizer state/buffers.
         gc.collect()
         torch.cuda.empty_cache()
+        return self._policy_param_residency()
 
     @torch.no_grad()
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/offload_before_refit")

@@ -198,6 +198,11 @@ Use NIXL checkpoint-engine refit to update non-colocated vLLM generation workers
 Run async GRPO or PPO via the SingleController path: TransferQueue data plane, pluggable staleness samplers, and streaming trainer.
 :::
 
+:::{grid-item-card} {octicon}`sync` PPO Early Refit
+
+Set `async_rl.early_refit=true` to publish the updated PPO policy before critic training and overlap new-policy rollout generation with the critic update.
+:::
+
 ::::
 
 ## Advanced Topics

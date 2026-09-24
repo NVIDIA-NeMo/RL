@@ -271,6 +271,63 @@ class TestPPOValidation:
         ):
             validate_single_controller_config(mc)
 
+    def test_accepts_early_refit_with_in_order_lookahead(self):
+        mc = _ppo_master_config(megatron_enabled=True)
+        mc.async_rl.early_refit = True
+
+        validate_single_controller_config(mc)
+
+    def test_accepts_early_refit_with_dtensor_v2_without_cpu_offload(self):
+        mc = _ppo_master_config(
+            megatron_enabled=False,
+            value=_value_config(megatron_enabled=True),
+        )
+        mc.policy["dtensor_cfg"] = {
+            "enabled": True,
+            "_v2": True,
+            "cpu_offload": False,
+        }
+        mc.async_rl.early_refit = True
+
+        validate_single_controller_config(mc)
+
+    @pytest.mark.parametrize(
+        "dtensor_cfg",
+        [
+            {"enabled": True, "_v2": False, "cpu_offload": False},
+            {"enabled": True, "_v2": True, "cpu_offload": True},
+        ],
+        ids=["dtensor-v1", "dtensor-v2-cpu-offload"],
+    )
+    def test_rejects_early_refit_without_param_residency_backend(self, dtensor_cfg):
+        mc = _ppo_master_config(
+            megatron_enabled=False,
+            value=_value_config(megatron_enabled=True),
+        )
+        mc.policy["dtensor_cfg"] = dtensor_cfg
+        mc.async_rl.early_refit = True
+
+        with pytest.raises(ValueError, match="parameter-residency contract"):
+            validate_single_controller_config(mc)
+
+    def test_rejects_early_refit_without_lookahead(self):
+        mc = _ppo_master_config(megatron_enabled=True)
+        mc.async_rl.early_refit = True
+        mc.async_rl.sampler.max_lookahead_versions = 0
+
+        with pytest.raises(ValueError, match="max_lookahead_versions>=1"):
+            validate_single_controller_config(mc)
+
+    def test_rejects_early_refit_with_colocated_generation(self):
+        mc = _ppo_master_config(megatron_enabled=True)
+        mc.async_rl.early_refit = True
+        mc.policy["generation"]["colocated"]["enabled"] = True
+        mc.policy["generation"]["backend"] = "megatron"
+        mc.async_rl.min_groups_for_streaming_train = mc.ppo.num_prompts_per_step
+
+        with pytest.raises(ValueError, match="requires disaggregated generation"):
+            validate_single_controller_config(mc)
+
     @pytest.mark.parametrize("missing", ["value", "value_loss_fn"])
     def test_rejects_ppo_without_its_critic_blocks(self, missing):
         mc = _ppo_master_config(**{missing: None})

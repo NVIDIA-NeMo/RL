@@ -159,6 +159,23 @@ class TestAdmission:
         assert _run(s.admit(trainer_version_fn=lambda: 10)) == 0
         assert _run(s.admit(trainer_version_fn=lambda: 10)) == 1
 
+    def test_in_order_lookahead_one_publish_opens_target_two(self):
+        """Policy v1 publication after train step 0 opens target step 2."""
+        trainer_version = 0
+        s = InOrderSampler(FakeBuffer(), max_lookahead_versions=1)
+
+        assert _run(s.admit(trainer_version_fn=lambda: trainer_version)) == 0
+        assert _run(s.admit(trainer_version_fn=lambda: trainer_version)) == 1
+        with pytest.raises(asyncio.TimeoutError):
+            _run(
+                asyncio.wait_for(
+                    s.admit(trainer_version_fn=lambda: trainer_version), timeout=0.05
+                )
+            )
+
+        trainer_version = 1
+        assert _run(s.admit(trainer_version_fn=lambda: trainer_version)) == 2
+
     def test_weight_fifo_gates_on_lookahead_and_does_not_stamp(self):
         # dispatch_index starts at -1; window 0 => admits exactly one batch
         # ahead of the trainer, then blocks. Assert the second admit would block

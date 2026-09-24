@@ -56,6 +56,7 @@ from nemo_rl.experience.rollout_recovery import (
     RolloutRecoveryLedger,
     RolloutRecoveryState,
 )
+from nemo_rl.utils.timer import Timer
 
 # Reuse fixtures from the experience tests; same shape as test_async_rollout_manager.
 from tests.unit.experience.test_rollout_manager import (
@@ -112,6 +113,13 @@ def _init_pump_ledgers(ctrl: Any) -> None:
     ctrl._buffer_capacity_waiters = 0
     ctrl._rollout_completion_durations_s = deque(maxlen=10_000)
     ctrl._rollout_queue_wait_durations_s = deque(maxlen=10_000)
+    ctrl._rollout_admission_lock = asyncio.Lock()
+    ctrl._rollout_admission_version = getattr(ctrl, "_trainer_version", 0)
+    ctrl._first_dispatch_pending_by_version = {}
+    ctrl._pending_reserved_admission_versions = {}
+    ctrl._timer = Timer()
+    if not hasattr(ctrl, "_data_plane_checkpoint_barrier"):
+        ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
 
 
 class _PausingMutationBarrier(DataPlaneCheckpointBarrier):
@@ -301,6 +309,11 @@ def test_reserved_admission_rejects_an_occupied_target_step() -> None:
     )
     ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=0)
     ctrl._trainer_version = 0
+    ctrl._rollout_admission_version = 0
+    ctrl._rollout_admission_lock = asyncio.Lock()
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+    ctrl._pending_reserved_admission_versions = {}
     ctrl._sampler_stamps_target_steps = False
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
 
@@ -310,6 +323,28 @@ def test_reserved_admission_rejects_an_occupied_target_step() -> None:
     assert buffer.target_step_list == [0]
     ctrl._rollout_manager.mark_prompt_group_admitted.assert_not_called()
     ctrl._rollout_manager.discard_prompt_group.assert_not_called()
+
+
+def test_checkpoint_restamps_admitted_group_waiting_for_dispatch() -> None:
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._rollout_admission_version = 4
+    ctrl._pending_reserved_admission_versions = {"group-1": 3}
+    ctrl._rollout_manager = SimpleNamespace(
+        restamp_prompt_group_for_dispatch=MagicMock()
+    )
+
+    async def _exercise() -> None:
+        barrier = DataPlaneCheckpointBarrier()
+        async with barrier.checkpoint() as cut:
+            ctrl._restamp_pending_recovery_groups_for_checkpoint(cut)
+
+    asyncio.run(_exercise())
+
+    ctrl._rollout_manager.restamp_prompt_group_for_dispatch.assert_called_once()
+    _, kwargs = ctrl._rollout_manager.restamp_prompt_group_for_dispatch.call_args
+    assert kwargs == {"start_weight_version": 4}
+    assert ctrl._pending_reserved_admission_versions == {"group-1": 4}
 
 
 def test_non_recovery_reserve_drain_rejects_an_occupied_target_step() -> None:
@@ -323,6 +358,12 @@ def test_non_recovery_reserve_drain_rejects_an_occupied_target_step() -> None:
     ctrl._rollout_recovery_enabled = False
     ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=0)
     ctrl._trainer_version = 0
+    ctrl._rollout_admission_version = 0
+    ctrl._rollout_admission_lock = asyncio.Lock()
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+    ctrl._pending_reserved_admission_versions = {}
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     launched: list[Any] = []
 
     async def launch(*args: Any) -> None:
@@ -1209,6 +1250,90 @@ def test_actor_path_releases_generation_permit_before_finalization() -> None:
         # Successful commits transfer both buffer permits to the train pump.
         assert ctrl._buffer_capacity._value == 0
         assert ctrl._rollout_exhausted.is_set()
+
+    asyncio.run(_main())
+
+
+def test_actor_replacement_rechecks_gate_after_waiting_for_generation_slot(
+    monkeypatch,
+) -> None:
+    """A finalizer replacement must not start inside a refit window."""
+
+    class _CaptureManager:
+        def __init__(self) -> None:
+            self.prompts_seen: list[str] = []
+            self.first_generated = asyncio.Event()
+            self.stats = SimpleNamespace(committed=0)
+
+        async def generate_for_finalization(
+            self,
+            prompt: Any,
+            *,
+            target_step: int | None = None,
+            inflight_registry: dict[str, tuple[asyncio.Task[None], int]] | None = None,
+        ) -> Any:
+            del target_step, inflight_registry
+            self.prompts_seen.append(prompt["message_log"][0]["content"])
+            self.first_generated.set()
+            return SimpleNamespace(group_id=f"g{len(self.prompts_seen)}")
+
+    async def _main() -> None:
+        manager = _CaptureManager()
+        ctrl = _pump_controller(manager, [_batch("step0"), _batch("spare")])
+        ctrl._async_cfg.max_inflight_prompts = 1
+        ctrl._master_config.token_capture = SimpleNamespace(
+            min_valid_fraction_per_group=0.5
+        )
+        ctrl._finalizer_actors = [object()]
+        release_first_finalizer = asyncio.Event()
+        finalizations = 0
+
+        async def _finalize(request: Any) -> Any:
+            nonlocal finalizations
+            del request
+            finalizations += 1
+            if finalizations == 1:
+                await release_first_finalizer.wait()
+                return SimpleNamespace(valid_row_count=0, total_row_count=1)
+            return SimpleNamespace(valid_row_count=1, total_row_count=1)
+
+        async def _cleanup(request: Any) -> None:
+            del request
+
+        ctrl._finalize_with_actor = _finalize
+        ctrl._cleanup_known_finalization_request = _cleanup
+
+        real_semaphore = asyncio.Semaphore
+        generation_semaphores: list[asyncio.Semaphore] = []
+
+        def _recording_semaphore(value: int) -> asyncio.Semaphore:
+            semaphore = real_semaphore(value)
+            generation_semaphores.append(semaphore)
+            return semaphore
+
+        monkeypatch.setattr(asyncio, "Semaphore", _recording_semaphore)
+        pump = asyncio.create_task(ctrl._rollout_pump())
+        await asyncio.wait_for(manager.first_generated.wait(), timeout=1.0)
+
+        generation_sem = generation_semaphores[0]
+        await generation_sem.acquire()
+        release_first_finalizer.set()
+        for _ in range(100):
+            if not ctrl._replacement_reserve:
+                break
+            await asyncio.sleep(0)
+        assert not ctrl._replacement_reserve
+
+        await ctrl._close_rollout_admission()
+        generation_sem.release()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert manager.prompts_seen == ["step0"]
+
+        async with ctrl._rollout_admission_lock:
+            ctrl._rollout_permitted.set()
+        await asyncio.wait_for(pump, timeout=1.0)
+        assert manager.prompts_seen == ["step0", "spare"]
 
     asyncio.run(_main())
 
