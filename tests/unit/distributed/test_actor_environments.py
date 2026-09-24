@@ -95,7 +95,6 @@ def test_registry_matches_py_executables():
         ("vllm",): PY_EXECUTABLES.VLLM,
         ("vllm", "nemo_gym"): PY_EXECUTABLES.VLLM_GYM,
         ("sglang",): PY_EXECUTABLES.SGLANG,
-        ("fsdp",): PY_EXECUTABLES.FSDP,
         ("automodel",): PY_EXECUTABLES.AUTOMODEL,
         ("mcore",): PY_EXECUTABLES.MCORE,
         ("trtllm",): PY_EXECUTABLES.TRTLLM,

@@ -18,6 +18,7 @@ import asyncio
 import copy
 import enum
 import json
+import math
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
@@ -30,6 +31,7 @@ from transformers import PreTrainedTokenizerBase
 from wandb import Table
 
 from nemo_rl.algorithms.async_utils.replay_buffer import (
+    CheckpointMutationKind,
     DataPlaneCheckpointBarrier,
     DataPlaneMutationCut,
     PostWriteEnrichmentError,
@@ -37,9 +39,14 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 )
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
+from nemo_rl.data.multimodal_utils import VLLM_CONTENT_KEY, VLLM_PROMPT_KEYS
 from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.nemo_gym import (
+    as_nemo_gym_shard_set,
+    get_nemo_gym_route_name,
+)
 from nemo_rl.experience.failures import (
     FailureClass,
     GenerationUnavailable,
@@ -84,6 +91,10 @@ from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     GenerationDatumSpec,
     GenerationInterface,
+)
+from nemo_rl.telemetry.instrumentation import (
+    dispatch_with_trace_context,
+    in_per_prompt_scope,
 )
 from nemo_rl.utils.timer import Timer
 
@@ -570,6 +581,12 @@ class AsyncRolloutImpl:
     ) -> tuple[Completion, dict]:
         """Run one multi-turn rollout for a single generation index."""
         current_message_log = copy.deepcopy(input_sample["message_log"])
+        input_sample_data: Mapping[str, Any] = input_sample
+        native_generation_data = {
+            key: input_sample_data[key]
+            for key in VLLM_PROMPT_KEYS
+            if key in input_sample_data
+        }
         current_extra_env_info = copy.deepcopy(input_sample["extra_env_info"])
         current_stop_strings = input_sample.get("stop_strings", None)
         task_name = input_sample["task_name"]
@@ -597,6 +614,11 @@ class AsyncRolloutImpl:
                 break
 
             turn_count += 1
+            turn_native_generation_data = dict(native_generation_data)
+            # Raw processor content describes only the original conversation.
+            # Later turns keep the media but use the updated pre-tokenized prefix.
+            if turn_count > 1 and VLLM_CONTENT_KEY in turn_native_generation_data:
+                turn_native_generation_data[VLLM_CONTENT_KEY] = None
 
             # Generate response for this sample using async generation.
             # A failure here must not be absorbed: returning a partial completion
@@ -610,6 +632,7 @@ class AsyncRolloutImpl:
                 ) = await self._generate_response(
                     current_message_log,
                     current_stop_strings,
+                    native_generation_data=turn_native_generation_data,
                 )
             except Exception as e:
                 raise _classify_generation_failure(
@@ -736,6 +759,8 @@ class AsyncRolloutImpl:
         self,
         message_log: list[dict],
         stop_strings: list[str] | None,
+        *,
+        native_generation_data: dict[str, Any] | None = None,
     ) -> tuple[dict, torch.Tensor, dict[str, Any]]:
         """Generate a single-turn response for one sample.
 
@@ -760,6 +785,12 @@ class AsyncRolloutImpl:
         generation_input_data.update(
             flat_messages.get_multimodal_dict(as_tensors=False)
         )
+        if native_generation_data:
+            # This method handles one sample; vLLM's formatter expects batched
+            # native content/media side channels.
+            generation_input_data.update(
+                {key: [value] for key, value in native_generation_data.items()}
+            )
 
         # Generate response
         # TODO: update generate_async to return a single item directly
@@ -1127,9 +1158,14 @@ class AsyncNemoGymRolloutImpl:
         received: set[int] = set()
         env_timing_metrics: Optional[dict[str, Any]] = None
 
-        async for result_ref in nemo_gym_env.run_rollouts.options(
-            num_returns="streaming"
-        ).remote(pending, timer_prefix):
+        # Read here, not in the actor: the scope is a ContextVar in this
+        # process, and NemoGym is a separate Ray actor.
+        async for result_ref in dispatch_with_trace_context(
+            nemo_gym_env.run_rollouts.options(num_returns="streaming"),
+            pending,
+            timer_prefix,
+            per_prompt=in_per_prompt_scope(),
+        ):
             rowidx, resolved_agent_ref, result, timing_metrics = await result_ref
             # Validated against the original group, not the pending subset: on a
             # re-dispatch the row keeps its original index so results stay ordered.
@@ -1185,9 +1221,14 @@ class AsyncNemoGymRolloutImpl:
         recovery performs one physical Gym dispatch here and delegates a complete
         cohort replacement to the outer recovery loop.
         """
-        nemo_gym_env = self._task_to_env["nemo_gym"]
         if not inputs:
             raise ValueError("NeMo-Gym rollout dispatch requires at least one row")
+        # These rows are all one prompt's generations.
+        # They share one Gym route and must stay on one instance.
+        shard_set = as_nemo_gym_shard_set(self._task_to_env["nemo_gym"])
+        nemo_gym_env = shard_set.pick_handle(get_nemo_gym_route_name(inputs[0]))
+        instance_label = shard_set.instance_label(nemo_gym_env)
+        instance_timer_prefix = f"{timer_prefix}/shard/{instance_label}"
         total_rows = self._num_generations_per_prompt
         # Re-dispatch maps NeMo-Gym's echoed _rowidx back onto the original group, so
         # the rows must carry the index _build_inputs stamped on them. Checked here
@@ -1256,7 +1297,7 @@ class AsyncNemoGymRolloutImpl:
                             results,
                             shaping_by_rowidx,
                             total_rows,
-                            timer_prefix,
+                            instance_timer_prefix,
                             on_completion=on_completion,
                         )
                     except Exception as error:
@@ -1267,6 +1308,9 @@ class AsyncNemoGymRolloutImpl:
                             classify_rollout_failure(error) is not FailureClass.INFRA
                             or attempt == max_row_attempts
                         ):
+                            error.add_note(
+                                f"NeMo-Gym instance '{instance_label}' failed during rollout collection"
+                            )
                             raise
                     else:
                         if timing_metrics is not None:
@@ -1275,7 +1319,8 @@ class AsyncNemoGymRolloutImpl:
             missing = [index for index in expected_indices if results[index] is None]
             if missing:
                 failure = GymTransportError(
-                    "NeMo-Gym rollout stream ended before all rows arrived; missing "
+                    f"NeMo-Gym instance '{instance_label}' rollout stream ended "
+                    "before all rows arrived; missing "
                     f"rows {missing} of {total_rows} after "
                     f"{max_row_attempts} attempt(s)"
                 )
@@ -1334,6 +1379,10 @@ class AsyncNemoGymRolloutImpl:
             )
 
         rollout_metrics.update(env_timing_metrics)
+        for handle in shard_set.all_handles:
+            label = shard_set.instance_label(handle)
+            rollout_metrics[f"{timer_prefix}/routing/group_share/{label}"] = 0
+        rollout_metrics[f"{timer_prefix}/routing/group_share/{instance_label}"] = 1
 
         return completions, prompt_message_log, rollout_metrics
 
@@ -1605,6 +1654,10 @@ class RolloutManager:
         self._data_plane_checkpoint_barrier: Optional[DataPlaneCheckpointBarrier] = None
         self._env_handles = task_to_env
         self._weight_version: int = 0
+        self._canonical_groups_finalized = 0
+        self._canonical_output_tokens = 0
+        self._recovery_siblings_reused = 0
+        self._recovery_siblings_redispatched = 0
         # Run-wide, shared across concurrent generate_and_push calls. Safe as a plain
         # int: every caller runs on the SingleController's single event loop.
         self._skipped_prompts: int = 0
@@ -1658,7 +1711,9 @@ class RolloutManager:
         self._data_plane_checkpoint_barrier = barrier
 
     @asynccontextmanager
-    async def _recovery_mutation(self) -> AsyncIterator[DataPlaneMutationCut]:
+    async def _recovery_mutation(
+        self, kind: CheckpointMutationKind = "recovery_retries"
+    ) -> AsyncIterator[DataPlaneMutationCut]:
         """Serialize short lineage transitions with native TQ snapshots."""
         barrier = self._data_plane_checkpoint_barrier
         if barrier is None:
@@ -1666,8 +1721,27 @@ class RolloutManager:
                 "RolloutManager must be bound to the SingleController data-plane "
                 "checkpoint barrier before mutating rollout recovery state"
             )
-        async with barrier.mutation() as cut:
+        async with barrier.mutation(kind) as cut:
             yield cut
+
+    def telemetry_snapshot(self) -> dict[str, int]:
+        """Return cumulative committed-publication and recovery counters."""
+        return {
+            "committed_groups": self._canonical_groups_finalized,
+            "committed_output_tokens": self._canonical_output_tokens,
+            "recovery_siblings_reused": self._recovery_siblings_reused,
+            "recovery_siblings_rerun": self._recovery_siblings_redispatched,
+        }
+
+    def record_canonical_publication(self, output_tokens: int) -> None:
+        """Count one prompt group after its canonical TQ commit succeeds."""
+        self._canonical_groups_finalized += 1
+        self._canonical_output_tokens += max(0, int(output_tokens))
+
+    def record_recovery_siblings(self, *, reused: int, redispatched: int) -> None:
+        """Count sibling work avoided and repeated after a process restart."""
+        self._recovery_siblings_reused += max(0, int(reused))
+        self._recovery_siblings_redispatched += max(0, int(redispatched))
 
     def reserve_prompt_group(
         self,
@@ -1969,14 +2043,24 @@ class RolloutManager:
                 raise
 
             self._stats.committed += 1
+            rollout_metrics = record.rollout_metrics
+            mean_output_tokens = rollout_metrics.get("mean_gen_tokens_per_sample", 0)
+            output_tokens = 0
+            if isinstance(mean_output_tokens, (int, float)):
+                total_output_tokens = float(mean_output_tokens) * len(
+                    record.completions
+                )
+                if math.isfinite(total_output_tokens):
+                    output_tokens = max(0, round(total_output_tokens))
+            self.record_canonical_publication(output_tokens)
             # A commit proves the fleet is answering, which is exactly the claim the
             # consecutive budget is testing, so it clears the run of drops. Placed on
             # the success path rather than in the infra handler so that a prompt which
             # succeeded on a retry also counts -- the fleet recovered either way.
             self._consecutive_infra_drops = 0
             if lineage_group_id is not None:
-                async with (
-                    self._tq_buffer.data_plane_checkpoint_barrier.mutation()
+                async with self._tq_buffer.data_plane_checkpoint_barrier.mutation(
+                    "group_removals"
                 ) as cut:
                     self._recovery_ledger.discard_group(cut, lineage_group_id)
             return RolloutOutcome.COMMITTED
@@ -2038,7 +2122,7 @@ class RolloutManager:
         owns_recovery_group = lineage_group_id is None
         recovery_group_id = lineage_group_id
         if recovery_group_id is None:
-            async with self._recovery_mutation() as cut:
+            async with self._recovery_mutation("prompt_reservations") as cut:
                 recovery_group_id = self.reserve_prompt_group(
                     cut,
                     input_sample,
@@ -2222,7 +2306,7 @@ class RolloutManager:
                 pending_group_results[generation_index] = result
                 if len(pending_group_results) < recovery_group.expected_generations:
                     return
-                async with self._recovery_mutation() as cut:
+                async with self._recovery_mutation("sibling_seals") as cut:
                     self._recovery_ledger.mark_group_sealed(
                         cut,
                         group_id,
@@ -2230,7 +2314,7 @@ class RolloutManager:
                     )
                 return
 
-            async with self._recovery_mutation() as cut:
+            async with self._recovery_mutation("sibling_seals") as cut:
                 self._recovery_ledger.mark_sibling_sealed(
                     cut,
                     group_id,

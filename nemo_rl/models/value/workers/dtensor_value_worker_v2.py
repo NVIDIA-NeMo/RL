@@ -27,7 +27,10 @@ from transformers import (
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
+from nemo_rl.models.automodel.checkpoint import (
+    AutomodelCheckpointManager,
+    build_checkpoint_config,
+)
 from nemo_rl.models.automodel.data import (
     check_sequence_dim,
     get_microbatch_iterator,
@@ -51,8 +54,10 @@ from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorke
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.models.value.config import ValueConfig
 from nemo_rl.models.value.interfaces import ValueOutputSpec
-from nemo_rl.telemetry.setup import init_telemetry_worker
-from nemo_rl.utils.checkpoint import CheckpointingConfig
+from nemo_rl.telemetry.setup import (
+    init_telemetry_worker,
+    traced_worker_init,
+)
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 
@@ -98,6 +103,7 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
         else:
             return f"{self.__class__.__qualname__}"
 
+    @traced_worker_init("rl.value.load_model", **{"rl.backend": "dtensor_v2"})
     def __init__(
         self,
         config: ValueConfig,
@@ -182,15 +188,18 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
         self.cp_size = distributed_manager.cp_size
 
         # Initialize checkpoint manager
+        dtensor_cfg = config["dtensor_cfg"]
+        checkpoint_config = build_checkpoint_config(
+            dtensor_cfg,
+            model_repo_id=config["model_name"],
+            dequantize_base_checkpoint=config.get("dequantize_base_checkpoint", False),
+            is_peft=self.lora_enabled,
+            skip_task_head_prefixes_for_base_model=["score."],
+            # Callers rename after Value.save_checkpoint returns.
+            is_async=False,
+        )
         self._init_checkpoint_manager(
-            config_updates={
-                "model_repo_id": config["model_name"],
-                "dequantize_base_checkpoint": config.get(
-                    "dequantize_base_checkpoint", False
-                ),
-                "is_peft": self.lora_enabled,
-                "skip_task_head_prefixes_for_base_model": ["score."],
-            },
+            config_updates=checkpoint_config,
         )
 
         # Set up model and optimizer
@@ -575,7 +584,8 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
         weights_path: str,
         optimizer_path: Optional[str] = None,
         tokenizer_path: Optional[str] = None,
-        checkpointing_cfg: Optional[CheckpointingConfig] = None,
+        *,
+        is_final_checkpoint: bool,
     ) -> None:
         """Save a checkpoint of the value model."""
         self.checkpoint_manager.save_checkpoint(
@@ -586,8 +596,7 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
             scheduler=self.scheduler,
             tokenizer=self.tokenizer if tokenizer_path else None,
             tokenizer_path=tokenizer_path,
-            checkpointing_cfg=checkpointing_cfg,
-            lora_enabled=self.lora_enabled,
+            is_final_checkpoint=is_final_checkpoint,
             peft_config=self.peft_config,
         )
 
@@ -608,7 +617,6 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
     def _init_checkpoint_manager(
         self,
         config_updates: Optional[dict[str, Any]] = None,
-        checkpoint_root: Optional[str] = None,
     ) -> None:
         """Initialize the AutomodelCheckpointManager for this worker."""
         if self.checkpoint_manager is None:
@@ -619,7 +627,6 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
             )
             self.checkpoint_manager.init_checkpointer(
                 config_updates=config_updates,
-                checkpoint_root=checkpoint_root,
             )
 
 

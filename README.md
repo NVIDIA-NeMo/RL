@@ -428,7 +428,7 @@ NeMo RL supports two distillation recipes:
 | Recipe | Multi-teacher | Asynchronous | Policy | Loss | Tokenizer | Backend |
 |---|---|---|---|---|---|---|
 | MOPD | Yes | Yes | On-policy | Top-1 sampled (RL-style) | Same | Megatron |
-| xToken | Yes | No (sync) | Off-policy | Full-logit (KL) | Same or different | DTensor V2 |
+| xToken | Yes | No (sync) | Off-policy | Full-logit (KL) | Same or different | DTensor |
 
 ## On-policy Distillation
 
@@ -490,7 +490,7 @@ Before launching a run, build the projection matrix for your (student, teacher) 
 ```
 
 > [!NOTE]
-> X-token distillation runs on the DTensor V2 backend only, and the student and teacher must be colocated on the same node (teacher logits travel via CUDA IPC).
+> X-token distillation runs on the DTensor backend only, and the student and teacher must be colocated on the same node (teacher logits travel via CUDA IPC).
 
 ### X-Token Off-Policy Distillation Single Node
 

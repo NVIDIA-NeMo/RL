@@ -38,7 +38,6 @@ from nemo_rl.distributed.virtual_cluster import (
 _UV_EXECUTABLES = [
     "BASE",
     "VLLM",
-    "FSDP",
     "AUTOMODEL",
     "MCORE",
     "NEMO_GYM",

@@ -56,6 +56,10 @@ from transformers import (
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
+from nemo_rl.data.deepseek_v4_tokenizer import (
+    get_deepseek_v4_tokenizer,
+    should_use_deepseek_v4_chat_template,
+)
 from nemo_rl.models.automodel.checkpoint import (
     AutomodelCheckpointManager,
     _resolve_lora_adapter_dir,
@@ -73,6 +77,26 @@ STRING_TO_DTYPE = {
     "bfloat16": torch.bfloat16,
     "float16": torch.float16,
 }
+
+
+def _has_optimizer_fp32_master(
+    optimizer_cls: type[torch.optim.Optimizer], optimizer_kwargs: dict[str, Any]
+) -> bool:
+    """Whether the resolved optimizer and kwargs provide FP32 master weights."""
+    if optimizer_kwargs.get("master_weights") is not True:
+        return False
+
+    # TE is optional; only import it when checking an optimizer with master weights.
+    try:
+        from transformer_engine.pytorch.optimizers import FusedAdam
+    except ImportError:
+        return False
+
+    # FusedAdam defaults to FP32 masters when master_weight_dtype is omitted.
+    return optimizer_cls is FusedAdam and (
+        "master_weight_dtype" not in optimizer_kwargs
+        or optimizer_kwargs["master_weight_dtype"] == torch.float32
+    )
 
 
 def _maybe_set_force_hf(automodel_kwargs: dict, model_config) -> None:
@@ -200,7 +224,18 @@ def get_tokenizer(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    if "chat_template" in tokenizer_config:
+    use_deepseek_v4_tokenizer = should_use_deepseek_v4_chat_template(tokenizer_config)
+    chat_template_kwargs = tokenizer_config.get("chat_template_kwargs")
+    if chat_template_kwargs is not None:
+        assert isinstance(chat_template_kwargs, dict), (
+            "chat_template_kwargs should be a dictionary"
+        )
+    if use_deepseek_v4_tokenizer:
+        print("Using vLLM 0.25.1's DeepSeek V4 chat renderer")
+        tokenizer = get_deepseek_v4_tokenizer(tokenizer, chat_template_kwargs)
+        if processor is not None:
+            processor.tokenizer = tokenizer
+    elif "chat_template" in tokenizer_config:
         if tokenizer_config["chat_template"] is None:
             print("Using passthrough chat template")
             tokenizer.chat_template = COMMON_CHAT_TEMPLATES.passthrough_prompt_response
@@ -217,15 +252,9 @@ def get_tokenizer(
     else:
         print("No chat template provided, using tokenizer's default")
 
-    if (
-        "chat_template_kwargs" in tokenizer_config
-        and tokenizer_config["chat_template_kwargs"] is not None
-    ):
-        assert isinstance(tokenizer_config["chat_template_kwargs"], dict), (
-            "chat_template_kwargs should be a dictionary"
-        )
+    if chat_template_kwargs is not None and not use_deepseek_v4_tokenizer:
         tokenizer.apply_chat_template = partial(
-            tokenizer.apply_chat_template, **tokenizer_config["chat_template_kwargs"]
+            tokenizer.apply_chat_template, **chat_template_kwargs
         )
 
     if processor is not None:
@@ -334,7 +363,7 @@ def validate_and_prepare_config(
     # Load model config
     model_config = AutoConfig.from_pretrained(
         model_name,
-        torch_dtype=torch.float32,  # Always load in float32 for master weights
+        torch_dtype=dtype,
         trust_remote_code=True,
         attn_implementation="flash_attention_2" if enable_seq_packing else None,
         **hf_config_overrides,
@@ -723,6 +752,26 @@ def setup_model_and_optimizer(
 
     model_name = config["model_name"]
 
+    if init_optimizer:
+        optimizer_cfg = config.get("optimizer")
+        if not optimizer_cfg:
+            raise ValueError("optimizer config is required when init_optimizer=True")
+        optimizer_cls = get_class(optimizer_cfg["name"])
+        optimizer_kwargs = dict(optimizer_cfg["kwargs"])
+        # Normalize once for both load-dtype selection and optimizer construction.
+        for key, value in optimizer_kwargs.items():
+            if isinstance(value, str) and value.startswith("torch."):
+                optimizer_kwargs[key] = getattr(torch, value.removeprefix("torch."))
+        # Params are the only weight copy unless the optimizer keeps FP32 masters.
+        if _has_optimizer_fp32_master(optimizer_cls, optimizer_kwargs):
+            load_dtype = runtime_config.dtype
+        else:
+            load_dtype = torch.float32
+    else:
+        # Frozen forward-only model (distillation teacher, reward model): no
+        # optimizer, so there are no master weights to protect.
+        load_dtype = runtime_config.dtype
+
     # Validate CP configuration with model type before from_pretrained
     if cp_size > 1:
         if model_config.model_type == "gemma3":
@@ -878,7 +927,7 @@ def setup_model_and_optimizer(
         distributed_setup=distributed_setup,
         peft_config=peft_config,
         attn_implementation=attn_impl,
-        torch_dtype=str(model_config.torch_dtype),
+        torch_dtype=load_dtype,
         trust_remote_code=True,
         sdpa_method=sdpa_method,
         **from_pretrained_kwargs,
@@ -918,12 +967,6 @@ def setup_model_and_optimizer(
     # Initialize optimizer
     optimizer = None
     if init_optimizer:
-        optimizer_cls = get_class(config["optimizer"]["name"])
-        optimizer_kwargs = dict(config["optimizer"]["kwargs"])
-        # Resolve string-valued torch dtypes (e.g. "torch.bfloat16" -> torch.bfloat16)
-        for key, value in optimizer_kwargs.items():
-            if isinstance(value, str) and value.startswith("torch."):
-                optimizer_kwargs[key] = getattr(torch, value.removeprefix("torch."))
         # Only pass trainable params to the optimizer. TE FusedAdam's step()
         # allocates per-param state (exp_avg/exp_avg_sq/master_param) before the
         # p.grad-is-None check, so passing frozen params (e.g. the visual

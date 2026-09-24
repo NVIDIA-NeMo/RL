@@ -15,6 +15,7 @@
 """Unit tests for automodel setup utilities."""
 
 import os
+import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, create_autospec, patch
 
@@ -27,9 +28,6 @@ except ImportError:
     pytest.skip("nemo_automodel not available", allow_module_level=True)
 
 import torch
-from nemo_automodel.components.checkpoint._backports.filesystem import (
-    SerializationFormat,
-)
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 
 from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
@@ -116,6 +114,10 @@ class TestValidateAndPrepareConfig:
         # Verify result is a RuntimeConfig named tuple
         assert isinstance(result, RuntimeConfig)
         assert result.dtype == torch.bfloat16
+        assert (
+            mock_autoconfig_class.from_pretrained.call_args.kwargs["torch_dtype"]
+            == torch.bfloat16
+        )
         assert result.cpu_offload is False
         assert result.offload_optimizer_for_logprob is False
         assert result.max_grad_norm == 1.0
@@ -914,6 +916,31 @@ class TestSetupModelAndOptimizer:
         tokenizer.pad_token_id = 0
         return tokenizer
 
+    @pytest.mark.parametrize(
+        "use_te, optimizer_kwargs, expected_dtype",
+        [
+            (False, {}, torch.float32),
+            (True, {"master_weights": False}, torch.float32),
+            (True, {"master_weights": True}, torch.bfloat16),
+            (
+                True,
+                {"master_weights": True, "master_weight_dtype": "torch.float32"},
+                torch.bfloat16,
+            ),
+            (
+                True,
+                {"master_weights": True, "master_weight_dtype": "torch.float16"},
+                torch.float32,
+            ),
+        ],
+        ids=[
+            "adamw",
+            "te-no-master",
+            "te-default-master",
+            "te-fp32-master",
+            "te-fp16-master",
+        ],
+    )
     @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
     @patch("nemo_rl.models.automodel.setup.get_class")
@@ -927,8 +954,12 @@ class TestSetupModelAndOptimizer:
         mock_distributed_context,
         mock_checkpoint_manager,
         mock_tokenizer,
+        monkeypatch,
+        use_te,
+        optimizer_kwargs,
+        expected_dtype,
     ):
-        """Test basic model and optimizer setup."""
+        """Test model setup and the load dtype selected for optimizer precision."""
         mock_get_rank.return_value = 0
         mock_lambda_lr.return_value = MagicMock()
 
@@ -943,6 +974,17 @@ class TestSetupModelAndOptimizer:
         # Setup mock optimizer
         mock_optimizer = MagicMock()
         mock_get_class.return_value = MagicMock(return_value=mock_optimizer)
+
+        mock_config["optimizer"]["kwargs"] = optimizer_kwargs
+        if use_te:
+            mock_config["optimizer"]["name"] = (
+                "transformer_engine.pytorch.optimizers.FusedAdam"
+            )
+        monkeypatch.setitem(
+            sys.modules,
+            "transformer_engine.pytorch.optimizers",
+            SimpleNamespace(FusedAdam=mock_get_class.return_value) if use_te else None,
+        )
 
         result = setup_model_and_optimizer(
             config=mock_config,
@@ -959,6 +1001,7 @@ class TestSetupModelAndOptimizer:
         # single DistributedSetup; the separate kwargs are rejected with a TypeError.
         mock_runtime_config.model_class.from_pretrained.assert_called_once()
         call_kwargs = mock_runtime_config.model_class.from_pretrained.call_args[1]
+        assert call_kwargs["torch_dtype"] == expected_dtype
         for legacy_kwarg in (
             "device_mesh",
             "moe_mesh",
@@ -1265,6 +1308,8 @@ class TestSetupModelAndOptimizer:
 
         assert result.optimizer is None
         assert result.scheduler is None
+        call_kwargs = mock_runtime_config.model_class.from_pretrained.call_args[1]
+        assert call_kwargs["torch_dtype"] == mock_runtime_config.dtype
 
     @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
@@ -2020,6 +2065,36 @@ class TestGetTokenizer:
         assert mock_tokenizer.pad_token == "<eos>"
 
     @patch("nemo_rl.models.automodel.setup.NeMoAutoTokenizer")
+    @patch("nemo_rl.models.automodel.setup.get_deepseek_v4_tokenizer")
+    def test_uses_vllm_deepseek_v4_renderer(
+        self, mock_get_deepseek_v4_tokenizer, mock_nemo_auto_tokenizer, capsys
+    ):
+        base_tokenizer = MagicMock()
+        base_tokenizer.pad_token = "<pad>"
+        tokenizer = MagicMock()
+        mock_nemo_auto_tokenizer.from_pretrained.return_value = base_tokenizer
+        mock_get_deepseek_v4_tokenizer.return_value = tokenizer
+
+        result = get_tokenizer(
+            {
+                "name": "deepseek-ai/DeepSeek-V4-Flash-Base",
+                "chat_template": "deepseek_v4",
+                "chat_template_kwargs": {"enable_thinking": True},
+            }
+        )
+
+        assert result is tokenizer
+        mock_nemo_auto_tokenizer.from_pretrained.assert_called_once_with(
+            "deepseek-ai/DeepSeek-V4-Flash-Base", trust_remote_code=True
+        )
+        mock_get_deepseek_v4_tokenizer.assert_called_once_with(
+            base_tokenizer, {"enable_thinking": True}
+        )
+        assert (
+            "Using vLLM 0.25.1's DeepSeek V4 chat renderer" in capsys.readouterr().out
+        )
+
+    @patch("nemo_rl.models.automodel.setup.NeMoAutoTokenizer")
     def test_does_not_override_existing_pad_token(self, mock_nemo_auto_tokenizer):
         """Test that existing pad_token is not overridden."""
         mock_tokenizer = MagicMock()
@@ -2619,15 +2694,27 @@ class TestValidateLoraAdapterKeys:
 
 @pytest.mark.automodel
 class TestLoadInitialLoraAdapter:
+    def test_requires_peft_checkpointer(self, tmp_path):
+        adapter_dir = tmp_path / "adapter"
+        _write_adapter_checkpoint(adapter_dir)
+        manager = AutomodelCheckpointManager(dp_mesh=MagicMock(), tp_mesh=MagicMock())
+        manager.checkpointer = MagicMock()
+        manager.checkpointer.config.is_peft = False
+
+        with pytest.raises(RuntimeError, match="is_peft=True"):
+            manager.load_lora_adapter(_TinyLoraModel(), str(adapter_dir))
+
+        manager.checkpointer.load_model.assert_not_called()
+
     @pytest.mark.parametrize("fail_load", [False, True])
-    def test_restores_config_and_removes_staging(self, tmp_path, fail_load):
+    def test_preserves_config_and_removes_staging(self, tmp_path, fail_load):
         adapter_dir = tmp_path / "adapter"
         _write_adapter_checkpoint(adapter_dir)
         manager = AutomodelCheckpointManager(dp_mesh=MagicMock(), tp_mesh=MagicMock())
         manager.checkpointer = MagicMock()
         cfg = manager.checkpointer.config
-        cfg.model_save_format = SerializationFormat.SAFETENSORS
-        cfg.is_peft = False
+        cfg.model_save_format = "original-format"
+        cfg.is_peft = True
         cfg.dequantize_base_checkpoint = True
         cfg.checkpoint_dir = "/original"
         previous_config = (
@@ -2642,18 +2729,17 @@ class TestLoadInitialLoraAdapter:
             seen.append(model_path)
             assert os.path.isfile(os.path.join(model_path, "adapter_model.safetensors"))
             assert cfg.is_peft is True
-            assert cfg.dequantize_base_checkpoint is False
-            assert cfg.checkpoint_dir == os.path.dirname(model_path)
+            assert cfg.dequantize_base_checkpoint is True
+            assert cfg.checkpoint_dir == "/original"
             if fail_load:
                 raise RuntimeError("load failed")
 
         manager.checkpointer.load_model.side_effect = load_model
-        with patch.object(manager, "_rebuild_checkpointer_addons"):
-            if fail_load:
-                with pytest.raises(RuntimeError, match="load failed"):
-                    manager.load_lora_adapter(_TinyLoraModel(), str(adapter_dir))
-            else:
+        if fail_load:
+            with pytest.raises(RuntimeError, match="load failed"):
                 manager.load_lora_adapter(_TinyLoraModel(), str(adapter_dir))
+        else:
+            manager.load_lora_adapter(_TinyLoraModel(), str(adapter_dir))
         assert (
             cfg.model_save_format,
             cfg.is_peft,
@@ -2681,6 +2767,7 @@ class TestLoadInitialLoraAdapter:
         manager = create_autospec(AutomodelCheckpointManager, instance=True)
         manager.checkpointer = create_autospec(Checkpointer, instance=True)
         manager.checkpointer.config = MagicMock()
+        manager.checkpointer.config.is_peft = True
         manager.load_lora_adapter.side_effect = lambda model, adapter_dir: (
             AutomodelCheckpointManager.load_lora_adapter(manager, model, adapter_dir)
         )
@@ -2691,11 +2778,6 @@ class TestLoadInitialLoraAdapter:
             lora_cfg=_lora_cfg(),
             model_name="tiny-model",
         )
-        assert manager.update_checkpointer_config.call_count == 2
-        config_updates = manager.update_checkpointer_config.call_args_list[0].kwargs[
-            "config_updates"
-        ]
-        assert config_updates["is_peft"] is True
         manager.checkpointer.load_model.assert_called_once_with(
             model=model, model_path=str(adapter_dir)
         )
@@ -2738,6 +2820,7 @@ class TestLoadInitialLoraAdapter:
         manager = create_autospec(AutomodelCheckpointManager, instance=True)
         manager.checkpointer = create_autospec(Checkpointer, instance=True)
         manager.checkpointer.config = MagicMock()
+        manager.checkpointer.config.is_peft = True
         manager.load_lora_adapter.side_effect = lambda model, adapter_dir: (
             AutomodelCheckpointManager.load_lora_adapter(manager, model, adapter_dir)
         )
@@ -2783,6 +2866,7 @@ class TestLoadInitialLoraAdapter:
         manager = create_autospec(AutomodelCheckpointManager, instance=True)
         manager.checkpointer = create_autospec(Checkpointer, instance=True)
         manager.checkpointer.config = MagicMock()
+        manager.checkpointer.config.is_peft = True
         manager.load_lora_adapter.side_effect = lambda model, adapter_dir: (
             AutomodelCheckpointManager.load_lora_adapter(manager, model, adapter_dir)
         )
@@ -2878,12 +2962,7 @@ class TestLoadInitialLoraAdapterEndToEnd:
         manager.save_checkpoint(
             model=donor,
             weights_path=weights_path,
-            checkpointing_cfg={
-                "enabled": True,
-                "model_save_format": "safetensors",
-                "is_peft": True,
-            },
-            lora_enabled=True,
+            is_final_checkpoint=False,
             peft_config=peft_config,
         )
 
@@ -2951,12 +3030,7 @@ class TestLoadInitialLoraAdapterEndToEnd:
         manager.save_checkpoint(
             model=donor,
             weights_path=weights_path,
-            checkpointing_cfg={
-                "enabled": True,
-                "model_save_format": "safetensors",
-                "is_peft": True,
-            },
-            lora_enabled=True,
+            is_final_checkpoint=False,
             peft_config=donor_peft_config,
         )
 
