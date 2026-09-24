@@ -14,10 +14,9 @@
 """``num_valid_samples`` must come from the sample mask, in every loss.
 
 Workers gate on ``num_valid_samples > 0`` to decide whether a microbatch's
-loss and metrics are recorded at all -- ``dtensor_policy_worker.py``,
-``dtensor_policy_worker_v2.py`` and ``dtensor_value_worker_v2.py`` all do. A
-loss that reports the raw batch dimension makes a fully-masked microbatch look
-like it contributed, and its zero loss then dilutes the step's reported mean.
+loss and metrics are recorded at all. A loss that reports the raw batch
+dimension makes a fully-masked microbatch look like it contributed, and its
+zero loss then dilutes the step's reported mean.
 
 CPU-only: these construct the loss inputs directly rather than going through
 ``prepare_loss_input``, so no GPU and no distributed init.

@@ -1254,8 +1254,7 @@ def _compute_critic_metrics(value_results: dict[str, Any]) -> dict[str, Any]:
         if key in {"lr", "wd", "global_valid_seqs", "global_valid_toks", "grad_norm"}:
             critic_metrics[metric_name] = np.mean(value).item()
         elif key == "values_min":
-            # Skip the empty-mask sentinel, as the probs_ratio extrema are
-            # handled at :1774 and :2757.
+            # Empty microbatches use infinities as extrema sentinels.
             finite = [x for x in value if not np.isinf(x)]
             critic_metrics[metric_name] = np.min(finite).item() if finite else -1.0
         elif key == "values_max":
