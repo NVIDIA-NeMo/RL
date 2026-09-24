@@ -270,7 +270,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             )
             if "TORCH_CUDA_ARCH_LIST" not in os.environ:
                 warnings.warn(
-                    "TORCH_CUDA_ARCH_LIST is not set. This is needed if using DeepEP in DTensorPolicyWorker V2. This variable is set in our container, but "
+                    "TORCH_CUDA_ARCH_LIST is not set. This is needed if using DeepEP in AutomodelPolicyWorker. This variable is set in our container, but "
                     "if you are running a custom container or baremetal, you may need to set this variable manually. Example: export TORCH_CUDA_ARCH_LIST='9.0 10.0'"
                 )
 
