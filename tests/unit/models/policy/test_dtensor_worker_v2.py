@@ -39,6 +39,7 @@ try:
     from nemo_rl.models.policy.workers.dtensor_policy_worker_v2 import (
         DTensorPolicyWorkerV2Impl,
         _maybe_adapt_tensor_to_hf,
+        build_state_dict_module_map,
         dtensor_params_generator,
     )
 
@@ -943,3 +944,91 @@ def test_dtensor_v2_fresh_run_with_reference_model_does_not_defer(monkeypatch):
     assert setup_mock.call_args.kwargs["weights_path"] is None
     load_mock.assert_not_called()
     assert worker.reference_model_state_dict == {"ref": "state"}
+
+
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+class TestLoRAMergeUnderStateDictTransparentWrappers:
+    """The refit generator must merge LoRA adapters even when the owning module sits behind a
+    wrapper that ``state_dict()`` does not spell out (activation-checkpoint ``CheckpointWrapper``,
+    ``torch.compile``). Before the fix the state-dict key never resolved to the ``LinearLoRA``
+    module, the base weight was streamed unmerged, and the inference engine kept sampling from
+    the base policy for the whole run."""
+
+    @staticmethod
+    def _lora_model(n=4):
+        lora = pytest.importorskip("nemo_automodel.components._peft.lora")
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+            checkpoint_wrapper,
+        )
+
+        class Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj = nn.Linear(n, n, bias=False)
+
+            def forward(self, x):
+                return self.proj(x)
+
+        class Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.ModuleList([Block()])
+
+            def forward(self, x):
+                return self.layers[0](x)
+
+        torch.manual_seed(0)
+        model = Model()
+        model.layers[0].proj = lora.patch_linear_module(
+            model.layers[0].proj, dim=2, alpha=4, use_triton=False
+        )
+        proj = model.layers[0].proj
+        with torch.no_grad():  # a zero-initialised lora_B would make the merge a no-op
+            proj.lora_A.weight.copy_(torch.randn_like(proj.lora_A.weight))
+            proj.lora_B.weight.copy_(torch.randn_like(proj.lora_B.weight))
+        scale = getattr(proj, "scale", None)
+        if scale is None:
+            scale = proj.alpha / proj.dim
+        expected = (
+            proj.weight.detach() + (proj.lora_B.weight @ proj.lora_A.weight) * scale
+        )
+        model.layers[0] = checkpoint_wrapper(model.layers[0])
+        return model, expected.detach()
+
+    def test_named_modules_and_state_dict_disagree_under_checkpoint_wrapper(self):
+        model, _ = self._lora_model()
+        assert "layers.0._checkpoint_wrapped_module.proj" in dict(model.named_modules())
+        assert "layers.0.proj" not in dict(model.named_modules())
+        assert "layers.0.proj.weight" in model.state_dict()
+
+    def test_module_map_resolves_state_dict_keys(self):
+        model, _ = self._lora_model()
+        module_map = build_state_dict_module_map(model)
+        target = model.layers[0]._checkpoint_wrapped_module.proj
+        assert module_map["layers.0.proj"] is target
+        assert module_map["layers.0._checkpoint_wrapped_module.proj"] is target
+
+    def test_generator_merges_lora_behind_checkpoint_wrapper(self):
+        model, expected = self._lora_model()
+        out = dict(dtensor_params_generator(model, torch.float32))
+        assert set(out) == {"layers.0.proj.weight"}
+        torch.testing.assert_close(out["layers.0.proj.weight"], expected)
+
+    def test_bf16_merge_matches_fp32_offline_merge_exactly(self):
+        # A bf16 base weight merged in bf16 rounds twice (delta, then sum) and can land one
+        # ulp away from an offline fp32 merge; the refit must produce the offline result.
+        model, _ = self._lora_model(n=64)
+        proj = model.layers[0]._checkpoint_wrapped_module.proj
+        with torch.no_grad():
+            proj.weight.copy_(torch.randn_like(proj.weight))
+            proj.lora_A.weight.copy_(torch.randn_like(proj.lora_A.weight) * 0.05)
+            proj.lora_B.weight.copy_(torch.randn_like(proj.lora_B.weight) * 0.05)
+        model.to(torch.bfloat16)
+        scale = getattr(proj, "scale", None) or proj.alpha / proj.dim
+        offline = (
+            proj.weight.float()
+            + (proj.lora_B.weight.float() @ proj.lora_A.weight.float()) * scale
+        ).to(torch.bfloat16)
+        out = dict(dtensor_params_generator(model, torch.bfloat16))
+        assert out["layers.0.proj.weight"].dtype == torch.bfloat16
+        assert torch.equal(out["layers.0.proj.weight"], offline)
