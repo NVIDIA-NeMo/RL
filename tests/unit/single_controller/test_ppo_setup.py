@@ -71,7 +71,7 @@ def _value_config(
         "train_micro_batch_size": 1,
         "max_total_sequence_length": 32,
         "megatron_cfg": {"enabled": megatron_enabled},
-        "dtensor_cfg": {"enabled": not megatron_enabled, "_v2": True},
+        "dtensor_cfg": {"enabled": not megatron_enabled},
     }
 
 
