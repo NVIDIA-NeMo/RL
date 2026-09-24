@@ -503,9 +503,9 @@ The table below covers the metrics reported by `ClippedPGLossFn` (the GRPO/PPO f
 | **Follows `token_level_loss`** — token-normalized when `true`, sequence-normalized when `false` | `loss`, `kl_penalty` |
 | **Always token-normalized**, regardless of the setting | `probs_ratio`, `probs_ratio_clamped`, `token_mult_prob_error`, `gen_kl_error`, `policy_kl_error`, `js_divergence_error`, `approx_entropy` |
 | **Keyed on a different parameter** | `sampling_importance_ratio` follows `sequence_level_importance_ratios`; `is_oob_ratio` is sequence-normalized only for `truncated_importance_sampling_type: seq-mask-tis` |
-| **Not normalized** — raw counts, per-microbatch means, or extrema combined with min/max | `num_valid_samples`, `positive_nll_loss`, `probs_ratio_min`, `probs_ratio_max`, `probs_ratio_clamped_min`, `probs_ratio_clamped_max` |
+| **Not normalized** — raw counts, per-microbatch means, or extrema combined with min/max | `num_valid_samples`, `positive_nll_loss`, `probs_ratio_min`, `probs_ratio_max`, `probs_ratio_clamped_min`, `probs_ratio_clamped_max`, `num_masked_seqs_by_logprob_error`, `seq_logprob_error_valid_tokens`, `seq_logprob_error_valid_seqs` |
 
-The authoritative list is the [`metric_normalizations` table in `ClippedPGLossFn`](https://github.com/NVIDIA-NeMo/RL/blob/4a1454bf430624786251d14ba0197169c8e68a5c/nemo_rl/algorithms/loss/loss_functions.py#L335-L371), which is kept in sync with the metrics the loss returns.
+The authoritative list is the [`metric_normalizations` table in `ClippedPGLossFn`](https://github.com/NVIDIA-NeMo/RL/blob/1343b2f6fb92b4cced5e515e404595dcac627d98/nemo_rl/algorithms/loss/loss_functions.py#L372-L394), which is kept in sync with the metrics the loss returns.
 
 #### Choosing a setting
 
@@ -556,6 +556,35 @@ By multiplying the first term of the loss function by the importance weights $\f
 
 To enable the importance sampling correction, set the config `use_importance_sampling_correction=True` in the `ClippedPGLossConfig`. By default, we set this config to False to align with standard GRPO.
 
+
+#### Single-forward sequence-logprob filtering
+
+For non-streaming Megatron GRPO, enable `loss_fn.seq_logprob_error_in_loss` to apply the absolute sequence-logprob error threshold inside the training loss. This avoids the standalone policy-logprob forward even when `grpo.seq_logprob_error_threshold` is set:
+
+```yaml
+grpo:
+  seq_logprob_error_threshold: 2.0
+  skip_reference_policy_logprobs_calculation: true
+loss_fn:
+  seq_logprob_error_in_loss: true
+  force_on_policy_ratio: true
+  token_level_loss: true
+  reference_policy_kl_penalty: 0.0
+```
+
+The default is `false`, retaining the existing pre-training check. This mode requires the `grpo` advantage estimator and one optimizer update per rollout batch (`force_on_policy_ratio`'s existing constraint). It supports synchronous and legacy asynchronous training, including synchronous data-plane training, sequence packing, and gradient accumulation. SingleController is rejected because its advantage baselines depend on the earlier filtering decision. DTensor, KL-in-reward, MTP, draft training, positive-example NLL, and distillation are not supported by this mode. A reference-model forward is still needed if reference KL is enabled; the example disables it. Existing recipes using MTP (such as the NeMo-Gym Nemotron recipes), distillation (`mopd`), or Automodel must first satisfy these constraints; setting the flag alone does not make them compatible.
+
+The [Qwen2.5-Math-1.5B single-forward recipe](../../examples/configs/recipes/llm/grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-single-forward.yaml) provides a complete configuration for one node with eight GPUs. The comparison below used two GB300 nodes with four GPUs each, with overrides `cluster.num_nodes=2 cluster.gpus_per_node=4 cluster.segment_size=2`. The reported step times therefore do not describe the recipe's default topology and also depend on the benchmark hardware and runtime.
+
+The loss computes the same mean `exp(abs(policy_logprob - generation_logprob))` over valid response tokens, using detached logprobs from the training forward. Both seq_logprob_error_in_loss true and false ignore nonfinite logprobs at masked-out positions. Rejected sequences contribute zero loss but are still processed by the batched forward/backward. The worker sums survivor counts over every microbatch and DP rank, then rescales accumulated gradients before gradient clipping and the optimizer step. Thus the denominator excludes threshold-rejected tokens, regardless of how sequences were packed. Existing `seq-mask-tis` remains active: TIS-only failures still count in that denominator. An optimizer batch with no surviving response tokens raises an error before the optimizer or scheduler updates.
+
+Loss-local filtering does not alter the rollout tensors or reward-group advantages. Because it evaluates the training forward rather than a separate inference forward, FP8 scale history, packing, and other numerical differences can change which sequences pass. Bitwise equivalence is not expected. The training metrics report `num_masked_seqs_by_logprob_error`, `seq_logprob_error_valid_tokens`, and `seq_logprob_error_valid_seqs`; separate-pass sequence-error summary metrics are omitted rather than reported as placeholders. In this mode, all three counts are weighted by `sample_mask`: the masked sequence metric sums the weights of newly rejected sequences, and the valid token and sequence metrics sum surviving weights. With fractional sample weights, `num_masked_seqs_by_logprob_error` can therefore be fractional, unlike the integer count emitted by the separate-forward filter.
+
+Measure end-to-end step time and reward/gradient-norm trajectories on the target recipe when comparing the modes. The avoided policy-logprob forward must be weighed against the device synchronization before gradient rescaling and the forward/backward work on rejected sequences. The rescaling restores normalization over surviving tokens before clipping; it does not introduce a different clipping threshold.
+
+The following Qwen2.5-Math-1.5B comparison shows both modes over 450 steps with seed 42 on eight GB300 GPUs (two nodes). The reward curves closely track, with a 17.8% reduction in mean step time over steps 51–450 (6.69 seconds with in-loss filtering versus 8.14 seconds with separate-forward filtering).
+
+![Train reward, token multiplicative probability error, step time, and gradient norm for single-forward versus separate-forward sequence-logprob filtering.](../assets/grpo-qwen-single-forward-comparison.png)
 
 #### Overlong Filtering
 

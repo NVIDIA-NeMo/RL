@@ -23,6 +23,7 @@ from nemo_rl.data_plane.interfaces import (
     DataPlaneRuntimeConfig,
     LocalDataPlaneConfig,
 )
+from nemo_rl.telemetry.setup import telemetry_enabled_in_env
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.grpo import MasterConfig
@@ -186,17 +187,18 @@ def build_data_plane_client(
         if isinstance(cfg, LocalDataPlaneConfig)
         else cfg.get("observability")
     ) or {}
-    if obs.get("enabled", False):
+    obs_enabled = obs.get("enabled", False)
+    # Telemetry alone installs the wrapper, for its spans.
+    if obs_enabled or telemetry_enabled_in_env():
         from nemo_rl.data_plane.observability import MetricsDataPlaneClient
 
-        # No default per-op sink. The metrics surface is ``get_step_metrics``,
-        # which the trainer logs once a step; a callback here fires on every
-        # single transfer. ``log_event`` is still exported for anyone who
-        # wants that, but it is opt-in via ``observability.callback``.
+        # Callback and hash check are observability features; off for
+        # telemetry-only runs.
         # pyrefly: obs.get returns Any, can't narrow to the expected callback type.
         client = MetricsDataPlaneClient(
             client,  # type: ignore[bad-argument-type]
-            on_event=obs.get("callback"),  # type: ignore[bad-argument-type]
-            verify_tensor_hash=bool(obs.get("verify_tensor_hash")),
+            on_event=obs.get("callback") if obs_enabled else None,  # type: ignore[bad-argument-type]
+            verify_tensor_hash=obs_enabled and bool(obs.get("verify_tensor_hash")),
+            observability_enabled=obs_enabled,
         )
     return client

@@ -22,6 +22,7 @@ import numpy as np
 import torch
 from tensordict import TensorDict
 
+from nemo_rl.algorithms.metric_utils import REWARD_KEY
 from nemo_rl.data_plane import KVBatchMeta
 
 # Reduction rules for all_mb_metrics. Mirror grpo.py / grpo_sync.py.
@@ -153,7 +154,7 @@ def reduce_advantage_pump_metrics(
         if sample_masks:
             cat_masks = torch.cat([m.flatten() for m in sample_masks])
             mask_sum = cat_masks.sum()
-            out["reward"] = (
+            out[REWARD_KEY] = (
                 float((cat_rewards * cat_masks).sum() / mask_sum)
                 if mask_sum > 0
                 else 0.0
