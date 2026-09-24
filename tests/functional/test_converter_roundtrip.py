@@ -87,7 +87,6 @@ def create_test_config() -> Dict[str, Any]:
             "precision": "bfloat16",
             "offload_optimizer_for_logprob": False,
             "dtensor_cfg": {
-                "_v2": True,
                 "enabled": True,
                 "checkpoint": {
                     "model_save_format": "torch_save",
