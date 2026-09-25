@@ -52,7 +52,10 @@ class _FakeChatCompletionRequest:
     ng_capture = None
 
     def to_sampling_params(self, *_args, **_kwargs):
-        return types.SimpleNamespace(output_kind=_FakeRequestOutputKind.FINAL_ONLY)
+        return types.SimpleNamespace(
+            output_kind=_FakeRequestOutputKind.FINAL_ONLY,
+            max_tokens=128,
+        )
 
 
 def _recorder(slot: str):

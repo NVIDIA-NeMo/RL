@@ -2763,7 +2763,17 @@ class TestPeriodicRolloutCheckpoint:
             assert kwargs["gym_staging_keys"] == {staging_key}
             raise OSError("injected snapshot failure")
 
-        prepare_checkpoint = AsyncMock(return_value=(prepare, checkpoint))
+        async def prepare_checkpoint_side_effect(
+            _checkpoint_id: str,
+            checkpoint_dir: Path,
+        ) -> tuple[GymCheckpointPrepareResult, GymCheckpointCommitResult]:
+            (checkpoint_dir / storage_index_path.name).write_bytes(
+                storage_index_payload
+            )
+            (checkpoint_dir / manifest_path.name).write_bytes(manifest_payload)
+            return prepare, checkpoint
+
+        prepare_checkpoint = AsyncMock(side_effect=prepare_checkpoint_side_effect)
         release_checkpoint = AsyncMock()
         try:
             with (
@@ -4082,6 +4092,7 @@ def _ppo_save_actor(tmp_path: Path, calls: list[str]):
     actor._checkpointer.save_optimizer = True
     actor._checkpointer.init_tmp_checkpoint.return_value = str(checkpoint_path)
     actor._gym_participant_checkpointing_enabled = False
+    actor._generation_prefix_cuts_enabled = False
     actor._is_ppo = True
     actor._trainer = _OrderRecordingPolicy(calls)
     actor._value = _OrderRecordingCritic(calls)
