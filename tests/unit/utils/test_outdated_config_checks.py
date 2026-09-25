@@ -26,6 +26,10 @@ assert entrypoints, "No entrypoints found"
 # MasterConfig.model_validate(resolved).
 _BUILDS_MASTER_CONFIG = re.compile(r"MasterConfig(\(\*\*|\.model_validate)")
 
+# Eval configs legitimately keep the flat data layout the dataset check rejects: they name
+# one dataset directly rather than a train/validation split.
+_EXEMPT = {"run_eval.py": "eval configs do not use the train/validation data layout"}
+
 
 @pytest.mark.parametrize("entrypoint", entrypoints, ids=lambda p: p.name)
 def test_every_entrypoint_checks_outdated_config(entrypoint):
@@ -34,6 +38,9 @@ def test_every_entrypoint_checks_outdated_config(entrypoint):
     Without this, a new run_*.py silently skips the check and a stale config gets as far
     as worker startup before failing.
     """
+    if entrypoint.name in _EXEMPT:
+        pytest.skip(f"{entrypoint.name}: {_EXEMPT[entrypoint.name]}")
+
     source = entrypoint.read_text()
     if not _BUILDS_MASTER_CONFIG.search(source):
         pytest.skip(f"{entrypoint.name} does not build a MasterConfig")
@@ -65,3 +72,16 @@ def test_each_teacher_is_checked():
         check_outdated_config(
             {"teachers": [{"dtensor_cfg": {}}, {"dtensor_cfg": {"_v2": False}}]}
         )
+
+
+def test_flat_dataset_config_is_rejected():
+    with pytest.raises(ValueError, match="data has no train section"):
+        check_outdated_config({"data": {"dataset_name": "AIME2024"}})
+
+
+def test_split_dataset_config_passes():
+    check_outdated_config({"data": {"train": {}, "validation": {}}})
+
+
+def test_absent_data_section_passes():
+    check_outdated_config({"policy": {}})

@@ -16,17 +16,14 @@
 from typing import Any, Iterator
 
 
-def _train_backend_configs(config: Any) -> Iterator[tuple[str, dict[str, Any]]]:
+def _train_backend_configs(
+    config: dict[str, Any],
+) -> Iterator[tuple[str, dict[str, Any]]]:
     """Yields (dotted path, config) for every block that selects a training backend.
 
     The policy, the value model, each teacher and the reward-model environment. A check
     for any backend key can iterate these rather than re-deriving the locations.
     """
-    if hasattr(config, "model_dump"):
-        config = config.model_dump()
-    if not isinstance(config, dict):
-        return
-
     # policy and value model blocks
     blocks = [(section, config.get(section)) for section in ("policy", "value")]
 
@@ -45,11 +42,11 @@ def _train_backend_configs(config: Any) -> Iterator[tuple[str, dict[str, Any]]]:
             yield path, block
 
 
-def reject_outdated_dtensor_v2_key(config: Any) -> None:
+def reject_outdated_dtensor_v2_key(config: dict[str, Any]) -> None:
     """Fail when a config still carries the removed dtensor_cfg._v2 key.
 
     Args:
-        config: The resolved MasterConfig, or any mapping holding one.
+        config: The resolved config, already flattened to plain dicts.
     """
     for path, backend_config in _train_backend_configs(config):
         dtensor_cfg = backend_config.get("dtensor_cfg")
@@ -63,6 +60,24 @@ def reject_outdated_dtensor_v2_key(config: Any) -> None:
         )
 
 
+def reject_outdated_dataset_config(config: dict[str, Any]) -> None:
+    """Fail when data still uses the flat pre-train/validation layout.
+
+    Args:
+        config: The resolved config, already flattened to plain dicts.
+    """
+    data = config.get("data")
+    if isinstance(data, dict) and "train" not in data:
+        raise ValueError(
+            "data has no train section. The dataset config structure changed: datasets "
+            "now live under data.train and data.validation. See "
+            "https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/grpo.md#dataset and "
+            "the migration guides in https://github.com/NVIDIA-NeMo/RL/pull/1649 "
+            "(response datasets) and https://github.com/NVIDIA-NeMo/RL/pull/1763 "
+            "(preference datasets)."
+        )
+
+
 def check_outdated_config(config: Any) -> None:
     """Fail fast on config the code no longer accepts, naming the migration to apply.
 
@@ -73,4 +88,10 @@ def check_outdated_config(config: Any) -> None:
     Args:
         config: The resolved MasterConfig, or any mapping holding one.
     """
+    if hasattr(config, "model_dump"):
+        config = config.model_dump()
+    if not isinstance(config, dict):
+        return
+
     reject_outdated_dtensor_v2_key(config)
+    reject_outdated_dataset_config(config)
