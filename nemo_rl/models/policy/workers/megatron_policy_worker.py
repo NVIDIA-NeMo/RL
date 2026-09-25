@@ -1333,7 +1333,7 @@ class MegatronPolicyWorkerImpl(
                     for x in losses_reduced:
                         loss_metrics = {}
                         for k in x.keys():
-                            if "_min" in k or "_max" in k:
+                            if k.endswith(("_min", "_max")):
                                 loss_metrics[k] = x[k]
                             else:
                                 loss_metrics[k] = x[k] / num_global_batches
@@ -2203,7 +2203,7 @@ class MegatronPolicyWorkerImpl(
                     continue
                 if k == DRAFT_LOSS_METRIC_KEY and draft_step_state.active:
                     out[k] = draft_step_state.normalize_metric(v)
-                elif "_min" in k or "_max" in k:
+                elif k.endswith(("_min", "_max")):
                     out[k] = v
                 else:
                     out[k] = _scale_metric(k, v)

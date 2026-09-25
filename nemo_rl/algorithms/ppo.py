@@ -1254,9 +1254,12 @@ def _compute_critic_metrics(value_results: dict[str, Any]) -> dict[str, Any]:
         if key in {"lr", "wd", "global_valid_seqs", "global_valid_toks", "grad_norm"}:
             critic_metrics[metric_name] = np.mean(value).item()
         elif key == "values_min":
-            critic_metrics[metric_name] = np.min(value).item()
+            # Empty microbatches use infinities as extrema sentinels.
+            finite = [x for x in value if not np.isinf(x)]
+            critic_metrics[metric_name] = np.min(finite).item() if finite else -1.0
         elif key == "values_max":
-            critic_metrics[metric_name] = np.max(value).item()
+            finite = [x for x in value if not np.isinf(x)]
+            critic_metrics[metric_name] = np.max(finite).item() if finite else -1.0
         elif isinstance(value, (np.ndarray, list)):
             critic_metrics[metric_name] = np.sum(value).item()
         else:
