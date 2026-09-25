@@ -658,6 +658,24 @@ class TestPartialGymRedispatch:
         assert method.dispatched == [[0, 1, 2, 3]]
         assert impl._stats.gym_row_redispatches == 0
 
+    def test_checkpoint_identities_defer_missing_row_retry_to_outer_recovery(self):
+        """A stable Gym attempt must never be physically dispatched twice.
+
+        The first /run may still own the identity after its result stream fails.
+        Outer recovery retires that execution and assigns attempt+1 before retrying.
+        """
+        method = _PartialGymMethod(fail_after_rows=2, failures_before_success=1)
+        impl = _make_gym_impl(method, num_generations=4, row_attempts=3)
+        rows = _gym_rows(4)
+        for row in rows:
+            row["_ng_attempt_index"] = 0
+
+        with pytest.raises(ConnectionResetError, match="gym stream died"):
+            asyncio.run(impl._run_rollouts(rows, Timer(), "timing/rollout"))
+
+        assert method.dispatched == [[0, 1, 2, 3]]
+        assert impl._stats.gym_row_redispatches == 0
+
     def test_a_stale_echo_of_a_landed_row_is_rejected(self):
         """Re-dispatch narrows the stream; an echo of an already-landed row must not win.
 

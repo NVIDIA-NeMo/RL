@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from nemo_rl.environments.gym_checkpoint import GymCompletionReceipt
 from nemo_rl.environments.nemo_gym import NemoGym
 
 # Receipt assembly imports nemo_gym at call time (resolve_terminal etc.), so
@@ -120,6 +121,100 @@ def test_receipt_postprocess_fetches_manifest_and_selects_terminal_row() -> None
     assert receipt["failure_reason"] is None
     assert receipt["reward"] == 1.0
     assert [r["model_call_id"] for r in receipt["manifest"]] == ["c1", "c2"]
+
+
+def test_receipt_postprocess_fetches_attempt_qualified_capture_key() -> None:
+    env = _capture_env()
+    records = [_manifest_record("c1")]
+    env._control = AsyncMock(
+        return_value={
+            "rollout_id": "stable-rollout-a2",
+            "records": records,
+            "failures": [],
+        }
+    )
+
+    result = asyncio.run(
+        env._postprocess_receipt_mode(
+            {"_ng_rollout_id": "stable-rollout", "_ng_attempt_index": 2},
+            {"reward": 1.0, "terminal_response_id": "resp-c1"},
+        )
+    )
+
+    call = env._control.await_args
+    assert call.args == (
+        "GET",
+        "/training-token-capture/control/rollouts/stable-rollout-a2/manifest",
+    )
+    assert result["rollout_id"] == "stable-rollout-a2"
+    assert result["receipt"]["rollout_id"] == "stable-rollout-a2"
+
+
+def test_restored_completion_fetches_its_source_attempt_manifest() -> None:
+    env = _capture_env()
+    records = [
+        _manifest_record("c1"),
+        _manifest_record("unrelated-later-call", parent="c1"),
+    ]
+    env._control = AsyncMock(
+        return_value={
+            "rollout_id": "stable-rollout",
+            "records": records,
+            "failures": [],
+        }
+    )
+    completion_receipt = GymCompletionReceipt(
+        rollout_id="stable-rollout",
+        attempt_index=1,
+        execution_generation=2,
+        result_identity="result-stable-rollout-1",
+        result_digest="1" * 64,
+        manifest_capture_key="stable-rollout",
+        terminal_model_call_id="c1",
+    )
+
+    result = asyncio.run(
+        env._postprocess_receipt_mode(
+            {"_ng_rollout_id": "stable-rollout", "_ng_attempt_index": 1},
+            {"reward": 1.0},
+            completion_receipt=completion_receipt,
+        )
+    )
+
+    call = env._control.await_args
+    assert call.args == (
+        "GET",
+        "/training-token-capture/control/rollouts/stable-rollout/manifest",
+    )
+    assert result["rollout_id"] == "stable-rollout-a1"
+    assert result["receipt"]["rollout_id"] == "stable-rollout-a1"
+    assert result["receipt"]["terminal_model_call_id"] == "c1"
+    assert result["receipt"]["terminal_selection"] == "declared"
+
+
+def test_restored_completion_rejects_the_wrong_source_manifest() -> None:
+    env = _capture_env()
+    env._control = AsyncMock(
+        return_value={"rollout_id": "wrong-attempt", "records": [], "failures": []}
+    )
+    completion_receipt = GymCompletionReceipt(
+        rollout_id="stable-rollout",
+        attempt_index=1,
+        execution_generation=2,
+        result_identity="result-stable-rollout-1",
+        result_digest="1" * 64,
+        manifest_capture_key="stable-rollout",
+        terminal_model_call_id="c1",
+    )
+
+    with pytest.raises(ValueError, match="model manifest identity mismatch"):
+        asyncio.run(
+            env._postprocess_receipt_mode(
+                {"_ng_rollout_id": "stable-rollout", "_ng_attempt_index": 1},
+                {"reward": 1.0},
+                completion_receipt=completion_receipt,
+            )
+        )
 
 
 def test_receipt_assembly_poisons_on_failure_rows() -> None:

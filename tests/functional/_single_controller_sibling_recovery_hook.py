@@ -26,10 +26,11 @@ import asyncio
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from examples import run_grpo_single_controller
-from nemo_rl.experience.rollout_manager import RolloutCompletionCallback
+from nemo_rl.environments.gym_checkpoint import gym_capture_key
+from nemo_rl.experience.rollout_manager import RolloutCompletionCallback, RolloutManager
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 
 
@@ -71,7 +72,7 @@ class _InstrumentedNemoGymRolloutImpl:
         matches = [
             group
             for group in self._recovery_ledger.groups()
-            if rollout_id_set.intersection(group.gate_rollout_ids)
+            if rollout_id_set.intersection(group.logical_rollout_ids)
         ]
         if len(matches) != 1:
             raise RuntimeError(
@@ -91,11 +92,17 @@ class _InstrumentedNemoGymRolloutImpl:
         input_sample: Any,
         *,
         rollout_ids: list[str] | None = None,
+        attempt_indices: list[int] | None = None,
         generation_indices: list[int] | None = None,
         on_completion: RolloutCompletionCallback | None = None,
         recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
     ) -> Any:
-        if rollout_ids is None or generation_indices is None or on_completion is None:
+        if (
+            rollout_ids is None
+            or attempt_indices is None
+            or generation_indices is None
+            or on_completion is None
+        ):
             raise RuntimeError(
                 "sibling recovery hook requires the token-capture rollout path"
             )
@@ -106,12 +113,18 @@ class _InstrumentedNemoGymRolloutImpl:
 
         group = self._find_group(rollout_ids)
         indices = list(generation_indices)
+        capture_rollout_ids = [
+            gym_capture_key(rollout_id, attempt_index)
+            for rollout_id, attempt_index in zip(
+                rollout_ids, attempt_indices, strict=True
+            )
+        ]
         fields = {
             "group_id": group.group_id,
             "prompt_idx": int(input_sample["idx"]),
             "target_step": group.target_step,
             "generation_indices": indices,
-            "rollout_ids": list(rollout_ids),
+            "rollout_ids": capture_rollout_ids,
         }
         self._append_event("dispatch", **fields)
 
@@ -135,7 +148,7 @@ class _InstrumentedNemoGymRolloutImpl:
             completion_fields = {
                 **fields,
                 "generation_index": generation_index,
-                "rollout_id": rollout_ids[generation_index],
+                "rollout_id": capture_rollout_ids[generation_index],
             }
             if selected:
                 if not sealed_in_selected_call:
@@ -167,12 +180,75 @@ class _InstrumentedNemoGymRolloutImpl:
         result = await self._delegate.run_rollout(
             input_sample,
             rollout_ids=rollout_ids,
+            attempt_indices=attempt_indices,
             generation_indices=indices,
             on_completion=_instrumented_completion,
             recovery_granularity=recovery_granularity,
         )
         self._append_event("capture_complete", **fields)
         return result
+
+
+class _InstrumentedRolloutManager:
+    """Install the streamed-completion hook inside the controller actor.
+
+    The rollout manager is created on the driver and serialized into Ray. Deferring
+    installation until the first actor-side call ensures the inner hook receives the
+    exact recovery ledger mutated by the live manager rather than a driver-side copy.
+    """
+
+    def __init__(
+        self,
+        delegate: RolloutManager,
+        *,
+        events_path: Path,
+        block_target_step: int | None,
+    ) -> None:
+        self._delegate = delegate
+        self._events_path = events_path
+        self._block_target_step = block_target_step
+        self._hook_installed = False
+
+    def __getattr__(self, name: str) -> Any:
+        delegate = self.__dict__.get("_delegate")
+        if delegate is None:
+            raise AttributeError(name)
+        return getattr(delegate, name)
+
+    @property
+    def _tq_buffer(self) -> Any:
+        return self._delegate._tq_buffer
+
+    @_tq_buffer.setter
+    def _tq_buffer(self, value: Any) -> None:
+        self._delegate._tq_buffer = value
+
+    def _install_hook(self) -> None:
+        if self._hook_installed:
+            return
+        self._delegate._impl = _InstrumentedNemoGymRolloutImpl(
+            self._delegate._impl,
+            recovery_ledger=self._delegate.recovery_ledger,
+            events_path=self._events_path,
+            block_target_step=self._block_target_step,
+        )
+        self._hook_installed = True
+
+    async def generate_for_finalization(
+        self,
+        input_sample: Any,
+        *,
+        target_step: int | None = None,
+        inflight_registry: Any = None,
+        lineage_group_id: str | None = None,
+    ) -> Any:
+        self._install_hook()
+        return await self._delegate.generate_for_finalization(
+            input_sample,
+            target_step=target_step,
+            inflight_registry=inflight_registry,
+            lineage_group_id=lineage_group_id,
+        )
 
 
 _original_setup_single_controller = run_grpo_single_controller.setup_single_controller
@@ -183,12 +259,13 @@ def _setup_with_sibling_recovery_hook(*args: Any, **kwargs: Any) -> Any:
     events_path = Path(os.environ["SC_SIBLING_RECOVERY_TEST_EVENTS"])
     raw_target_step = os.environ.get("SC_SIBLING_RECOVERY_BLOCK_TARGET_STEP")
     block_target_step = int(raw_target_step) if raw_target_step is not None else None
-    manager = actor_args.rollout_manager
-    manager._impl = _InstrumentedNemoGymRolloutImpl(
-        manager._impl,
-        recovery_ledger=manager.recovery_ledger,
-        events_path=events_path,
-        block_target_step=block_target_step,
+    actor_args.rollout_manager = cast(
+        RolloutManager,
+        _InstrumentedRolloutManager(
+            actor_args.rollout_manager,
+            events_path=events_path,
+            block_target_step=block_target_step,
+        ),
     )
     return actor_args, timing_metrics
 

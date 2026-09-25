@@ -1983,6 +1983,10 @@ def setup_single_controller(
         num_generations_per_prompt=algo_cfg.num_generations_per_prompt,
         max_seq_len=_generation_max_seq_len(generation_config),
         rollout_recovery_config=master_config.rollout_recovery,
+        # The controller supplies a persistent sink when coordinated Gym
+        # snapshot scheduling is enabled. Ordinary rollout execution does not
+        # create durable completion-acknowledgement obligations.
+        gym_acknowledgement_sink=None,
         max_rollout_turns=algo_cfg.max_rollout_turns,
         policy_generation=generation,
         generation_config=generation_config,
