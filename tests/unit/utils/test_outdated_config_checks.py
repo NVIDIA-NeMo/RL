@@ -54,7 +54,15 @@ def test_every_entrypoint_checks_outdated_config(entrypoint):
 
     assert "check_outdated_config(" in source, (
         f"{entrypoint.name} builds a MasterConfig but never calls "
-        "check_outdated_config(). Add the call right after the config is built."
+        "check_outdated_config(). Add the call just before the config is built."
+    )
+    assert (
+        source.index("check_outdated_config(")
+        < _BUILDS_MASTER_CONFIG.search(source).start()
+    ), (
+        f"{entrypoint.name} calls check_outdated_config() after building the "
+        "MasterConfig. Validation rejects a missing required key first, so the "
+        "migration message would never be reached; move the call before the build."
     )
 
 

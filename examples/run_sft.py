@@ -177,8 +177,8 @@ def main(is_vlm: bool = False):
         config = parse_hydra_overrides(config, overrides)
 
     config = OmegaConf.to_container(config, resolve=True)
-    config = MasterConfig(**config)
     check_outdated_config(config)
+    config = MasterConfig(**config)
     print("Applied CLI overrides")
 
     # Print config

@@ -51,7 +51,7 @@ def reject_outdated_dtensor_v2_key(config: dict[str, Any]) -> None:
     """Fail when a config still carries the removed dtensor_cfg._v2 key.
 
     Args:
-        config: The resolved config, already flattened to plain dicts.
+        config: The config as the user wrote it, resolved to plain dicts.
     """
     for path, backend_config in _train_backend_configs(config):
         dtensor_cfg = backend_config.get("dtensor_cfg")
@@ -69,7 +69,7 @@ def reject_outdated_dataset_config(config: dict[str, Any]) -> None:
     """Fail when data still uses the flat pre-train/validation layout.
 
     Args:
-        config: The resolved config, already flattened to plain dicts.
+        config: The config as the user wrote it, resolved to plain dicts.
     """
     data = config.get("data")
     if isinstance(data, dict) and "train" not in data:
@@ -87,7 +87,7 @@ def reject_outdated_metric_name_format(config: dict[str, Any]) -> None:
     """Fail when checkpointing.metric_name still uses the bare-name format.
 
     Args:
-        config: The resolved config, already flattened to plain dicts.
+        config: The config as the user wrote it, resolved to plain dicts.
     """
     checkpointing = config.get("checkpointing")
     if not isinstance(checkpointing, dict):
@@ -104,21 +104,17 @@ def reject_outdated_metric_name_format(config: dict[str, Any]) -> None:
     )
 
 
-def check_outdated_config(config: Any) -> None:
+def check_outdated_config(config: dict[str, Any]) -> None:
     """Fail fast on config the code no longer accepts, naming the migration to apply.
 
-    Call this from every entrypoint right after the MasterConfig is built, so a stale
-    config fails before any cluster or worker is created. Add a check here whenever a key
-    is removed or the shape it accepts changes.
+    Call this from every entrypoint on the resolved config, before the MasterConfig is
+    built. Validation rejects a missing required key on its own terms, so a check that
+    runs after it can never explain a removal that changed such a key's shape. Add a
+    check here whenever a key is removed or the shape it accepts changes.
 
     Args:
-        config: The resolved MasterConfig, or any mapping holding one.
+        config: The config as the user wrote it, resolved by OmegaConf.to_container.
     """
-    if hasattr(config, "model_dump"):
-        config = config.model_dump()
-    if not isinstance(config, dict):
-        return
-
     reject_outdated_dtensor_v2_key(config)
     reject_outdated_dataset_config(config)
     reject_outdated_metric_name_format(config)
