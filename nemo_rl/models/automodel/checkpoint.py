@@ -38,8 +38,6 @@ from torch.distributed.checkpoint._nested_dict import flatten_state_dict
 from torch.distributed.device_mesh import DeviceMesh
 from transformers import AutoTokenizer
 
-from nemo_rl.utils.native_checkpoint import save_tokenizer_on_rank0
-
 logger = logging.getLogger(__name__)
 
 
@@ -279,6 +277,40 @@ class AutomodelCheckpointManager:
         self.checkpointer.maybe_wait_for_staging()
         self.checkpointer.async_wait()
 
+    @staticmethod
+    def _save_tokenizer_on_rank0(tokenizer: Any, tokenizer_path: str) -> None:
+        """Save a tokenizer (or processor) to ``tokenizer_path`` from rank 0 only.
+
+        Unlike model/optimizer state, the tokenizer is *replicated* rather than
+        sharded: every rank holds an identical copy, and ``save_pretrained`` writes
+        to the same rank-independent filenames (``tokenizer_config.json``, ...).
+        Letting all ranks write means N-1 redundant writes racing on the same file.
+        ``save_pretrained`` is not atomic (it opens with ``O_TRUNC``, writes, and may
+        read files back), so concurrent writers can deadlock on the inode lock. On a
+        ``hard``-mounted NFS share this manifests as ranks stuck indefinitely in
+        uninterruptible disk sleep, hanging the whole job at checkpoint time.
+
+        This mirrors the rank-0 guard nemo_automodel applies to the same artifacts in
+        ``nemo_automodel.components.checkpoint.addons.ConsolidatedHFAddon.pre_save``.
+
+        Note this must NOT be applied to ``dcp.save``-based model/optimizer saves:
+        those are collective calls whose output is already rank-disjoint, so guarding
+        them would deadlock and drop every non-zero rank's shard.
+
+        Args:
+            tokenizer: The tokenizer or processor to save.
+            tokenizer_path: Directory to save the tokenizer into.
+        """
+        is_distributed = torch.distributed.is_initialized()
+        if not is_distributed or torch.distributed.get_rank() == 0:
+            print(f"Saving tokenizer (or processor) to {tokenizer_path}")
+            tokenizer.save_pretrained(tokenizer_path)
+        if is_distributed:
+            # Keep non-zero ranks from returning while rank 0 is still writing, so
+            # that the tokenizer directory is complete for any caller that reads it
+            # right after save_checkpoint() returns.
+            torch.distributed.barrier()
+
     def save_checkpoint(
         self,
         model: nn.Module,
@@ -344,7 +376,7 @@ class AutomodelCheckpointManager:
             # Rank-0 guarded: passing tokenizer_path bypasses save_model()'s
             # ConsolidatedHFAddon (we pass tokenizer=None above), which is where
             # nemo_automodel applies its own rank-0 guard, so we must apply it here.
-            save_tokenizer_on_rank0(tokenizer, tokenizer_path)
+            self._save_tokenizer_on_rank0(tokenizer, tokenizer_path)
 
         # Async DCP staging reads from the live model and optimizer state. Wait
         # for those copies before callers can update or offload the source tensors;
@@ -401,17 +433,14 @@ class AutomodelCheckpointManager:
             "Call init_checkpointer() first."
         )
 
-        model_dir = (
-            weights_path
-            if weights_path.endswith("/model")
-            else os.path.join(weights_path, "model")
-        )
-
+        # load model
+        model_dir = os.path.join(weights_path, "model")
         self.checkpointer.load_model(
             model=model,
             model_path=model_dir,
         )
 
+        # load optimizer
         if optimizer_path and optimizer is not None:
             if getattr(optimizer, "master_weights", False):
                 # Check the on-disk dtype before DCP copies into current buffers:
