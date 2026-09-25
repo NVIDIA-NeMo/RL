@@ -490,10 +490,10 @@ class RayWorkerGroup:
             self.cluster.get_master_address_and_port()
         )
 
-        # Update env_vars with the current environment variables
-        for k, v in os.environ.items():
-            if k not in env_vars:
-                env_vars[k] = v
+        # Merge the driver environment into a new dict (caller values win) rather than
+        # updating env_vars in place: callers pass dicts owned by the run config, which is
+        # written to every checkpoint's config.yaml.
+        env_vars = {**os.environ, **env_vars}
 
         # Get the python environment for the actor
         actor_python_env = get_actor_python_env(
