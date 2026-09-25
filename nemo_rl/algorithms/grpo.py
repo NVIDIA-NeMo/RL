@@ -32,6 +32,7 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from nemo_rl.algorithms import opd as opd_module
 from nemo_rl.algorithms.advantage_estimator import (
     AdvEstimatorConfig,
+    ArgMaxRLAdvantageEstimator,
     GDPOAdvantageEstimator,
     GRPOAdvantageEstimator,
     OPDAdvantageEstimator,
@@ -2560,7 +2561,7 @@ def _create_advantage_estimator(master_config: MasterConfig):
         master_config: The master configuration dictionary.
 
     Returns:
-        An advantage estimator instance (GRPO, GDPO, or ReinforcePlusPlus).
+        An advantage estimator instance (GRPO, GDPO, OPD, ReinforcePlusPlus, or ArgMaxRL).
 
     Raises:
         ValueError: If the advantage estimator name is not recognized.
@@ -2600,6 +2601,9 @@ def _create_advantage_estimator(master_config: MasterConfig):
             adv_estimator_config, loss_config
         )
         print("  ✓ Using Reinforce++ advantage estimator")
+    elif adv_estimator_name == "argmaxrl":
+        adv_estimator = ArgMaxRLAdvantageEstimator(adv_estimator_config, loss_config)
+        print("  ✓ Using ArgMaxRL advantage estimator")
     else:
         raise ValueError(f"Invalid adv_estimator name: {adv_estimator_name}")
 

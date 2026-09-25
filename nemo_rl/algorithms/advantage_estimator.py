@@ -21,8 +21,9 @@ This module provides different advantage estimation strategies:
 - RawRewardAdvantageEstimator: Raw reward as advantage with optional batch normalization (no baseline, no value model)
 - GeneralizedAdvantageEstimator: Generalized Advantage Estimation (GAE) with temporal bootstrapping
 - OPDAdvantageEstimator: Multi-Teacher On-Policy Distillation (MOPD) token-level distillation advantages
+- ArgMaxRLAdvantageEstimator: ArgMaxRL best@k weights with optional baseline subtraction
 
-Every group-relative estimator (GRPO, GDPO, Reinforce++) accepts ``valid_mask``
+Every group-relative estimator (GRPO, GDPO, Reinforce++, ArgMaxRL) accepts ``valid_mask``
 and must honor it: the SingleController always passes ``final_sample_mask`` as
 ``valid_mask`` so token-capture placeholder rows (and sequence-logprob-error
 masked rows) do not vote in their siblings' baselines.
@@ -32,6 +33,7 @@ Reference papers:
 - Reinforce++: https://arxiv.org/abs/2501.03262
 - GAE: https://arxiv.org/abs/1506.02438 (High-Dimensional Continuous Control Using Generalized Advantage Estimation)
 - MOPD: https://arxiv.org/abs/2601.02780
+- ArgMaxRL: https://www.doubleai.com/research/argmaxrl-generalizing-maxrl-to-continuous-rewards
 """
 
 from typing import Literal, Optional
@@ -50,9 +52,9 @@ from nemo_rl.algorithms.utils import (
 
 
 class AdvEstimatorConfig(BaseModel, extra="allow"):
-    """Configuration for advantage estimator (GRPO, GDPO, OPD, or Reinforce++)."""
+    """Configuration for advantage estimator (GRPO, GDPO, OPD, Reinforce++, or ArgMaxRL)."""
 
-    name: Literal["grpo", "gdpo", "opd", "reinforce_plus_plus"] = "grpo"
+    name: Literal["grpo", "gdpo", "opd", "reinforce_plus_plus", "argmaxrl"] = "grpo"
     # GRPO specific
     normalize_rewards: bool = True
     use_leave_one_out_baseline: bool = True
@@ -127,6 +129,111 @@ class GRPOAdvantageEstimator:
             )
 
         return advantages.expand(mask.shape)
+
+
+class ArgMaxRLAdvantageEstimator:
+    """ArgMaxRL advantage estimator with optional (leave-one-out) baseline.
+
+    Note: ArgMaxRL never divides by the reward std, so ``normalize_rewards`` is ignored.
+    """
+
+    def __init__(
+        self, estimator_config: AdvEstimatorConfig, loss_config: ClippedPGLossConfig
+    ):
+        if loss_config.use_kl_in_reward:
+            raise ValueError(
+                "ArgMaxRL does not add a KL penalty to advantages; "
+                "set loss_fn.use_kl_in_reward=false to keep KL in the loss."
+            )
+        self.minus_baseline = estimator_config.minus_baseline
+        self.use_leave_one_out_baseline = estimator_config.use_leave_one_out_baseline
+
+    def compute_advantage(
+        self,
+        prompt_ids: torch.Tensor,
+        rewards: torch.Tensor,
+        mask: torch.Tensor,
+        valid_mask: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Compute ArgMaxRL advantages.
+
+        Args:
+            prompt_ids: Tensor of shape [batch_size] identifying which prompt each sample belongs to.
+            rewards: Tensor of shape [batch_size] containing reward for each sample.
+            mask: Response token mask of shape [batch_size, seq_len]. Rows with no
+                  positive entry are excluded from their group and get advantage 0.
+            valid_mask: Optional tensor of shape [batch_size], 1.0 for samples whose
+                  reward should participate in the per-prompt weights.
+            **kwargs: Additional arguments (unused).
+
+        Returns:
+            Advantages tensor of shape [batch_size, seq_len].
+        """
+        assert prompt_ids.shape[0] == rewards.shape[0], (
+            "prompt_ids must match reward batch size; "
+            f"got {prompt_ids.shape[0]} vs {rewards.shape[0]}"
+        )
+        participates = (mask > 0).any(dim=-1)
+        if valid_mask is not None:
+            participates &= valid_mask > 0
+        self._validate_rewards(rewards[participates])
+
+        advantages = torch.zeros_like(rewards)
+        _, group_index = torch.unique(prompt_ids, dim=0, return_inverse=True)
+        for group in torch.unique(group_index[participates]):
+            rows = participates & (group_index == group)
+            weights = self.compute_weights(rewards[rows])
+            advantages[rows] = weights - self._baseline(weights)
+        return advantages.unsqueeze(-1).expand(mask.shape)
+
+    @staticmethod
+    def compute_weights(rewards: torch.Tensor) -> torch.Tensor:
+        """Compute per-sample ArgMaxRL weights for one prompt group.
+
+        With rewards sorted as ``r_(1) >= ... >= r_(N)`` and ``r_(N+1) = 0``, the
+        sample at rank ``j`` gets ``sum_{m=j}^{N} (r_(m) - r_(m+1)) / m``.
+
+        Args:
+            rewards: Finite, non-negative rewards of shape [N].
+
+        Returns:
+            Weights of shape [N] in the original sample order.
+        """
+        if rewards.numel() == 0:
+            return torch.zeros_like(rewards)
+        sorted_rewards, order = torch.sort(rewards, descending=True)
+        next_lower = torch.cat([sorted_rewards[1:], sorted_rewards.new_zeros(1)])
+        ranks = torch.arange(
+            1, rewards.numel() + 1, device=rewards.device, dtype=rewards.dtype
+        )
+        sorted_weights = (
+            ((sorted_rewards - next_lower) / ranks).flip(0).cumsum(0).flip(0)
+        )
+        weights = torch.empty_like(rewards)
+        weights[order] = sorted_weights
+        return weights
+
+    @staticmethod
+    def _validate_rewards(rewards: torch.Tensor) -> None:
+        """Raise if any reward is negative or non-finite."""
+        if rewards.numel() > 0 and (
+            not torch.isfinite(rewards).all() or (rewards < 0).any()
+        ):
+            raise ValueError(
+                "ArgMaxRL requires finite, non-negative rewards; got "
+                f"min={rewards.min().item()}, max={rewards.max().item()}. "
+                "Use grpo.reward_scaling to map rewards into a non-negative range."
+            )
+
+    def _baseline(self, weights: torch.Tensor) -> torch.Tensor:
+        if not self.minus_baseline:
+            return torch.zeros_like(weights)
+        if self.use_leave_one_out_baseline:
+            if weights.numel() == 1:
+                return torch.zeros_like(weights)
+            return (weights.sum() - weights) / (weights.numel() - 1)
+        return weights.mean().expand_as(weights)
 
 
 class GDPOAdvantageEstimator:

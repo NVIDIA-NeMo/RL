@@ -38,6 +38,7 @@ run_test() {
 run_test      bash ./tests/functional/grpo_frozen_env.sh
 
 run_test fast uv run --no-sync bash ./tests/functional/gdpo.sh
+run_test fast uv run --no-sync bash ./tests/functional/argmaxrl.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo.sh
 run_test      uv run --no-sync bash ./tests/functional/grpo_multiple_dataloaders.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_simple.sh
