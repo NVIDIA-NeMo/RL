@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from fnmatch import fnmatchcase
+from pathlib import Path
 from typing import Any, Iterator, Literal
 
 MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS = 600_000
@@ -292,8 +293,9 @@ def resolve_quant_cfg(quant_cfg: str) -> dict[str, Any]:
        ``.yml`` / ``.yaml`` suffix is optional) or the path to a user-authored
        YAML recipe. Resolution is performed by ``modelopt.recipe.load_config``,
        which searches the filesystem first and then the built-in recipe library.
-       For Ray/container workers, use an absolute path for user-authored recipe
-       files; NeMo-RL repo-relative recipe paths are not resolved here.
+       NeMo-RL repo-relative paths are resolved against the checkout root so
+       Ray workers do not depend on their process CWD. Other user-authored
+       recipes should use absolute paths for distributed execution.
 
     YAML recipes are expected to follow the standard ModelOpt PTQ recipe layout
     with a top-level ``quantize:`` section in the ``{"quant_cfg": [...],
@@ -330,8 +332,16 @@ def resolve_quant_cfg(quant_cfg: str) -> dict[str, Any]:
     if builtin is not None:
         return _normalize_mtq_cfg(builtin)
 
+    config_file = quant_cfg
+    config_path = Path(quant_cfg)
+    if not config_path.is_absolute() and not config_path.is_file():
+        repo_root = Path(__file__).resolve().parents[2]
+        repo_path = (repo_root / config_path).resolve()
+        if repo_path.is_relative_to(repo_root) and repo_path.is_file():
+            config_file = str(repo_path)
+
     try:
-        loaded = load_config(quant_cfg)
+        loaded = load_config(config_file)
     except (ValueError, FileNotFoundError) as e:
         raise ValueError(
             f"Unknown quant_cfg '{quant_cfg}'. Must be either a built-in "
