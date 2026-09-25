@@ -109,6 +109,7 @@ from nemo_rl.environments.gym_checkpoint import (
     GymSingleWorkerModelStatusResponse,
     GymWorkerAcknowledgements,
     gym_capture_key,
+    gym_generation_cut_receipts,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym_multimodal import (
@@ -451,6 +452,24 @@ _GYM_CHECKPOINT_COMPONENT_ORDERS = {
 }
 
 
+def _model_checkpoint_ready(
+    *,
+    state: str,
+    inflight_total: int,
+    generation_pending_total: int | None,
+    generation_cut_summary: dict[str, object] | None,
+) -> bool:
+    """Accept drained models or a complete durable cut of their live calls."""
+    if state != "paused":
+        return False
+    if generation_pending_total is None:
+        # Compatibility with Gym versions that only implement full draining.
+        return inflight_total == 0
+    if generation_pending_total != 0:
+        return False
+    return inflight_total == 0 or generation_cut_summary is not None
+
+
 class GymControlRequestError(RuntimeError):
     """Typed non-success response from one Gym checkpoint control route."""
 
@@ -775,6 +794,9 @@ Depending on your data shape, you may want to change these values."""
                 "lineage_store": ("nemo_gym.token_id_capture.lineage:FileLineageStore"),
                 "lineage_store_kwargs": {"root": os.path.join(capture_dir, "lineage")},
                 "external_staging": True,
+                "generation_prefix_cuts_enabled": bool(
+                    token_capture.get("generation_prefix_cuts_enabled", False)
+                ),
                 "control_auth_token_env": _TOKEN_CAPTURE_CONTROL_ENV,
             }
             # Gym resolves the credential inside each serving process. Keep
@@ -1171,44 +1193,88 @@ Depending on your data shape, you may want to change these values."""
         results: list[GymParticipantPrepareResult] = []
         prepare_attempted: list[GymDiscoveredParticipant] = []
         try:
-            for discovered in self._ordered_checkpoint_participants(
+            ordered_participants = self._ordered_checkpoint_participants(
                 phase=_GymCheckpointPhase.PREPARE
-            ):
+            )
+            # Reconcile every policy-model fence before an agent decides whether
+            # it may park at a model-wait boundary. The initial pause response is
+            # non-blocking and can report ``draining`` while prefix capture runs.
+            for discovered in ordered_participants:
                 participant = discovered.participant
                 capabilities = discovered.capabilities
-                payload: (
-                    GymModelPrepareResponse
-                    | GymAgentPrepareResponse
-                    | GymResourcesPrepareResponse
+                if participant.component != "responses_api_models":
+                    continue
+                if "paused" not in capabilities.admission_states:
+                    raise RuntimeError(
+                        f"Gym policy model {participant.server_name!r} cannot pause"
+                    )
+                # Record before the RPC. A participant may apply the pause and
+                # lose its response, so rollback must safely resume an attempted
+                # participant even when the caller saw failure.
+                prepare_attempted.append(discovered)
+                payload = GymModelPrepareResponse.model_validate(
+                    await self._control(
+                        "POST",
+                        f"{GYM_MODEL_ADMISSION_PREFIX}/pause",
+                        server_name=participant.server_name,
+                        timeout_s=self._checkpoint_request_timeout(deadline_ts),
+                        json=request,
+                    )
                 )
-                if participant.component == "responses_api_models":
-                    if "paused" not in capabilities.admission_states:
-                        raise RuntimeError(
-                            f"Gym policy model {participant.server_name!r} cannot pause"
-                        )
-                    # Record before the RPC. A participant may apply the pause
-                    # and lose its response, so rollback must safely resume an
-                    # attempted participant even when the caller saw failure.
-                    prepare_attempted.append(discovered)
-                    payload = GymModelPrepareResponse.model_validate(
-                        await self._control(
-                            "POST",
-                            f"{GYM_MODEL_ADMISSION_PREFIX}/pause",
-                            server_name=participant.server_name,
-                            timeout_s=self._checkpoint_request_timeout(deadline_ts),
-                            json=request,
-                        )
+                ready = (
+                    _model_checkpoint_ready(
+                        state=payload.state,
+                        inflight_total=payload.inflight_total,
+                        generation_pending_total=payload.generation_pending_total,
+                        generation_cut_summary=payload.generation_cut_summary,
+                    )
+                    and payload.workers.acknowledged == payload.workers.expected
+                )
+                if not ready:
+                    payload = await self._wait_for_policy_model_pause(
+                        discovered,
+                        checkpoint_id=checkpoint_id,
+                        deadline_ts=deadline_ts,
                     )
                     ready = (
-                        payload.state == "paused"
-                        and payload.inflight_total == 0
+                        _model_checkpoint_ready(
+                            state=payload.state,
+                            inflight_total=payload.inflight_total,
+                            generation_pending_total=payload.generation_pending_total,
+                            generation_cut_summary=payload.generation_cut_summary,
+                        )
                         and payload.workers.acknowledged == payload.workers.expected
                     )
-                elif participant.component == "responses_api_agents":
+                results.append(
+                    GymParticipantPrepareResult(
+                        participant=participant,
+                        ready=ready,
+                        payload=payload,
+                    )
+                )
+
+            generation_cut_prepared = any(
+                result.ready
+                and isinstance(result.payload, GymModelPrepareResponse)
+                and result.payload.generation_cut_summary is not None
+                for result in results
+            )
+            for discovered in ordered_participants:
+                participant = discovered.participant
+                if participant.component == "responses_api_models":
+                    continue
+                if participant.component == "responses_api_agents":
                     prepare_attempted.append(discovered)
                     payload = await self._prepare_agent_checkpoint(
                         discovered,
-                        request=request,
+                        request=(
+                            {
+                                **request,
+                                "allow_model_wait_boundary": True,
+                            }
+                            if generation_cut_prepared
+                            else request
+                        ),
                         deadline_ts=deadline_ts,
                     )
                     ready = payload.ready_to_commit
@@ -1230,28 +1296,6 @@ Depending on your data shape, you may want to change these values."""
                         ready=ready,
                         payload=payload,
                     )
-                )
-
-            for index, result in enumerate(results):
-                if (
-                    result.ready
-                    or result.participant.component != "responses_api_models"
-                ):
-                    continue
-                discovered = next(
-                    item
-                    for item in prepare_attempted
-                    if item.participant == result.participant
-                )
-                payload = await self._wait_for_policy_model_pause(
-                    discovered,
-                    checkpoint_id=checkpoint_id,
-                    deadline_ts=deadline_ts,
-                )
-                results[index] = GymParticipantPrepareResult(
-                    participant=result.participant,
-                    ready=(payload.state == "paused" and payload.inflight_total == 0),
-                    payload=payload,
                 )
 
             if not all(item.ready for item in results):
@@ -1364,8 +1408,12 @@ Depending on your data shape, you may want to change these values."""
                 expected=status.workers.expected,
             )
             ready = (
-                status.state == "paused"
-                and status.inflight_total == 0
+                _model_checkpoint_ready(
+                    state=status.state,
+                    inflight_total=status.inflight_total,
+                    generation_pending_total=status.generation_pending_total,
+                    generation_cut_summary=status.generation_cut_summary,
+                )
                 and status.missing_workers == 0
                 and status.workers.acknowledged == status.workers.expected
             )
@@ -1375,11 +1423,19 @@ Depending on your data shape, you may want to change these values."""
                 acknowledged=len(status.per_worker),
                 expected=discovered.capabilities.multi_process.num_workers,
             )
-            ready = status.state == "paused" and status.inflight_total == 0
+            ready = _model_checkpoint_ready(
+                state=status.state,
+                inflight_total=status.inflight_total,
+                generation_pending_total=status.generation_pending_total,
+                generation_cut_summary=status.generation_cut_summary,
+            )
         payload = GymModelPrepareResponse(
             state=status.state,
             workers=workers,
             inflight_total=status.inflight_total,
+            response_inflight_total=status.response_inflight_total,
+            generation_pending_total=status.generation_pending_total,
+            generation_cut_summary=status.generation_cut_summary,
             waiters_total=status.waiters_total,
         )
         if not ready:
@@ -1491,6 +1547,8 @@ Depending on your data shape, you may want to change these values."""
         deadline_ts: float,
         checkpoint_dir: str,
         source_checkpoint_id: Optional[str] = None,
+        generation_cut_proofs: tuple[dict[str, object], ...] = (),
+        generation_cut_exclusions: tuple[dict[str, object], ...] = (),
     ) -> dict[str, Any]:
         """Restore every stateful participant but leave admission paused."""
         if self._active_gym_checkpoint_id not in (None, checkpoint_id):
@@ -1528,6 +1586,14 @@ Depending on your data shape, you may want to change these values."""
                     checkpoint_id=checkpoint_id,
                     deadline_ts=deadline_ts,
                     checkpoint_dir=checkpoint_dir,
+                    generation_cut_receipts=gym_generation_cut_receipts(
+                        generation_cut_proofs,
+                        server_name=participant.server_name,
+                    ),
+                    generation_cut_exclusions=[
+                        GymExecutionIdentity.model_validate(item)
+                        for item in generation_cut_exclusions
+                    ],
                 ).model_dump(mode="json")
                 payload = GymModelRestoreResponse.model_validate(
                     await self._control(

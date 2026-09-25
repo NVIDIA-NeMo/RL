@@ -32,7 +32,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Annotated, Literal, TypeAlias, TypeVar, cast
+from typing import Annotated, Literal, Mapping, TypeAlias, TypeVar, cast
 
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, model_validator
 
@@ -54,6 +54,7 @@ GYM_AGENT_CONTINUATION_INDEX_FEATURE = "agent_continuation_index_v1"
 GYM_AGENT_DISCARD_RESTORED_CONTINUATION_FEATURE = "discard_restored_continuation_v1"
 GYM_AGENT_RESOURCE_DEPENDENCY_INDEX_FEATURE = "agent_resource_dependency_index_v1"
 GYM_EXTERNAL_STORAGE_REFERENCE_INDEX_FEATURE = "external_storage_reference_index_v1"
+GYM_GENERATION_CUT_LINEAGE_FEATURE = "generation_cut_lineage_v1"
 
 _IDENTITY_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
 
@@ -442,7 +443,11 @@ class GymCheckpointTopology(_StrictWireModel):
                 f"unexpected={sorted(actual - expected)!r}"
             )
 
-    def validate_turn_recovery_capabilities(self) -> None:
+    def validate_turn_recovery_capabilities(
+        self,
+        *,
+        generation_prefix_cuts_enabled: bool = False,
+    ) -> None:
         """Require the Gym features used by coordinated turn recovery."""
         missing_acknowledgement: list[str] = []
         missing_agent_checkpoint_participation: list[str] = []
@@ -451,6 +456,7 @@ class GymCheckpointTopology(_StrictWireModel):
         missing_resource_dependencies: list[str] = []
         missing_storage_reference_index: list[str] = []
         unsupported_auxiliary_export_restore: list[str] = []
+        missing_generation_cut_lineage: list[str] = []
         requires_fresh_restart = bool(self.restart_only_resources())
         for contract in self.participants:
             if contract.participant.component == "responses_api_agents":
@@ -495,12 +501,21 @@ class GymCheckpointTopology(_StrictWireModel):
             if (
                 contract.participant.component == "responses_api_models"
                 and contract.instance_role == "policy"
-                and GYM_EXTERNAL_STORAGE_REFERENCE_INDEX_FEATURE
-                not in contract.features
             ):
-                missing_storage_reference_index.append(
-                    contract.participant.participant_name
-                )
+                if (
+                    GYM_EXTERNAL_STORAGE_REFERENCE_INDEX_FEATURE
+                    not in contract.features
+                ):
+                    missing_storage_reference_index.append(
+                        contract.participant.participant_name
+                    )
+                if (
+                    generation_prefix_cuts_enabled
+                    and GYM_GENERATION_CUT_LINEAGE_FEATURE not in contract.features
+                ):
+                    missing_generation_cut_lineage.append(
+                        contract.participant.participant_name
+                    )
 
         if missing_acknowledgement:
             raise RuntimeError(
@@ -545,6 +560,12 @@ class GymCheckpointTopology(_StrictWireModel):
                 "for auxiliary model participants; configure them as stateless "
                 "or restart-only; "
                 f"unsupported={unsupported_auxiliary_export_restore!r}"
+            )
+        if missing_generation_cut_lineage:
+            raise RuntimeError(
+                "Gym generation-prefix recovery requires durable lineage cuts "
+                "from every stateful policy model; "
+                f"missing={missing_generation_cut_lineage!r}"
             )
 
 
@@ -634,6 +655,9 @@ class GymModelCheckpointCommitRequest(GymCheckpointDirectoryRequest):
 class GymModelCheckpointRestoreRequest(GymCheckpointDirectoryRequest):
     """Model restore request returning its external-storage index."""
 
+    generation_cut_receipts: list[dict[str, object]] = Field(default_factory=list)
+    generation_cut_exclusions: list[GymExecutionIdentity] = Field(default_factory=list)
+
 
 class GymWorkerAcknowledgements(_StrictWireModel):
     """Number of model workers that acknowledged a control operation."""
@@ -648,6 +672,11 @@ class GymModelPrepareResponse(_LiveResponseWireModel):
     state: Literal["accepting", "draining", "paused"]
     workers: GymWorkerAcknowledgements
     inflight_total: NonNegativeInt
+    response_inflight_total: NonNegativeInt | None = None
+    generation_pending_total: NonNegativeInt | None = None
+    # Gym owns the full cut artifacts. RL only needs bounded evidence that
+    # every worker published a complete, digest-validated cut.
+    generation_cut_summary: dict[str, object] | None = None
     waiters_total: NonNegativeInt
     response_inflight_total: NonNegativeInt | None = None
     generation_pending_total: NonNegativeInt | None = None
@@ -678,6 +707,7 @@ class GymSingleWorkerModelStatusResponse(_LiveResponseWireModel):
     inflight_total: NonNegativeInt
     response_inflight_total: NonNegativeInt | None = None
     generation_pending_total: NonNegativeInt | None = None
+    generation_cut_summary: dict[str, object] | None = None
     waiters_total: NonNegativeInt
     inflight: list[GymModelInflightRequest]
     tombstones: list[GymExecutionIdentity]
@@ -697,8 +727,8 @@ class GymCoordinatorWorkerStatus(_LiveResponseWireModel):
     acked_seq: NonNegativeInt
     inflight: NonNegativeInt
     generation_pending: NonNegativeInt | None = None
-    # RL only observes proof presence here; Gym owns the nested proof schema.
-    generation_cut_proof: dict[str, object] | None = None
+    # RL only observes summary presence here; Gym owns the worker artifact.
+    generation_cut_summary: dict[str, object] | None = None
     proof_error: str | None = None
     connected: bool
 
@@ -712,6 +742,7 @@ class GymCoordinatorModelStatusResponse(_LiveResponseWireModel):
     inflight_total: NonNegativeInt
     response_inflight_total: NonNegativeInt | None = None
     generation_pending_total: NonNegativeInt | None = None
+    generation_cut_summary: dict[str, object] | None = None
     waiters_total: NonNegativeInt
     per_worker: dict[str, GymCoordinatorWorkerStatus]
 
@@ -725,6 +756,7 @@ class GymAgentExecutionStatus(GymExecutionIdentity):
         "park_requested",
         "parked",
         "external_wait_frozen",
+        "model_wait_frozen",
         "completed",
         "retired",
     ]
@@ -733,6 +765,7 @@ class GymAgentExecutionStatus(GymExecutionIdentity):
             "parked_with_boundary",
             "parked_without_boundary",
             "external_wait_frozen",
+            "model_wait_frozen",
         ]
         | None
     )
@@ -823,13 +856,142 @@ class GymCheckpointPrepareResult(_StrictWireModel):
     participants: list[GymParticipantPrepareResult]
 
 
+def gym_generation_cut_proofs(
+    prepare: GymCheckpointPrepareResult,
+) -> tuple[dict[str, object], ...]:
+    """Return legacy inline proofs; current Gym prepare responses contain none."""
+    return ()
+
+
+def gym_generation_cut_receipts(
+    proofs: tuple[dict[str, object], ...],
+    *,
+    server_name: str,
+) -> list[dict[str, object]]:
+    """Extract opaque cut receipts owned by one policy model server."""
+    found: list[dict[str, object]] = []
+    seen: set[tuple[str, str]] = set()
+    for proof in proofs:
+        candidates: list[object] = [proof.get("generation_cut_receipt")]
+        workers = proof.get("workers")
+        if workers is not None:
+            if not isinstance(workers, list):
+                raise ValueError("Gym generation-cut proof workers must be a list")
+            for worker in workers:
+                if not isinstance(worker, Mapping):
+                    raise ValueError(
+                        "Gym generation-cut worker proof must be an object"
+                    )
+                candidates.append(worker.get("generation_cut_receipt"))
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            if not isinstance(candidate, Mapping):
+                raise ValueError("Gym generation-cut receipt must be an object")
+            inventory = candidate.get("inventory")
+            if not isinstance(inventory, Mapping):
+                raise ValueError(
+                    "Gym generation-cut receipt inventory must be an object"
+                )
+            if inventory.get("server_name") != server_name:
+                continue
+            checkpoint_id = candidate.get("checkpoint_id")
+            cut_id = candidate.get("cut_id")
+            if not isinstance(checkpoint_id, str) or not isinstance(cut_id, str):
+                raise ValueError(
+                    "Gym generation-cut receipt requires checkpoint_id and cut_id"
+                )
+            identity = (checkpoint_id, cut_id)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            found.append(dict(candidate))
+    return found
+
+
+def gym_generation_cut_staging_keys(
+    prepare: GymCheckpointPrepareResult | tuple[dict[str, object], ...],
+    *,
+    excluded_replacements: set[tuple[str, int]] | None = None,
+) -> set[str]:
+    """Extract every durable-prefix TQ key named by Gym's cut proofs."""
+
+    def receipts(proof: Mapping[str, object]) -> list[Mapping[str, object]]:
+        direct = proof.get("generation_cut_receipt")
+        if isinstance(direct, Mapping):
+            return [direct]
+        workers = proof.get("workers")
+        if workers is None:
+            return []
+        if not isinstance(workers, list):
+            raise ValueError("Gym generation-cut proof workers must be a list")
+        found: list[Mapping[str, object]] = []
+        for worker in workers:
+            if not isinstance(worker, Mapping):
+                raise ValueError("Gym generation-cut worker proof must be an object")
+            receipt = worker.get("generation_cut_receipt")
+            if receipt is not None:
+                if not isinstance(receipt, Mapping):
+                    raise ValueError("Gym generation-cut receipt must be an object")
+                found.append(receipt)
+        return found
+
+    keys: set[str] = set()
+    excluded = excluded_replacements or set()
+    proofs = (
+        gym_generation_cut_proofs(prepare)
+        if isinstance(prepare, GymCheckpointPrepareResult)
+        else prepare
+    )
+    for proof in proofs:
+        for receipt in receipts(proof):
+            prefixes = receipt.get("prefixes")
+            if not isinstance(prefixes, list):
+                raise ValueError("Gym generation-cut receipt prefixes must be a list")
+            for prefix in prefixes:
+                if not isinstance(prefix, Mapping):
+                    raise ValueError(
+                        "Gym generation-cut prefix acknowledgement must be an object"
+                    )
+                disposition = prefix.get("disposition")
+                if disposition == "durable_failure":
+                    continue
+                if disposition != "durable_prefix":
+                    raise ValueError(
+                        f"unknown Gym generation-cut disposition {disposition!r}"
+                    )
+                rollout_id = prefix.get("rollout_id")
+                attempt_index = prefix.get("attempt_index")
+                if (
+                    isinstance(rollout_id, str)
+                    and isinstance(attempt_index, int)
+                    and (rollout_id, attempt_index + 1) in excluded
+                ):
+                    continue
+                staging_keys = prefix.get("staging_keys")
+                if not isinstance(staging_keys, list) or not staging_keys:
+                    raise ValueError(
+                        "durable Gym generation-cut prefix requires staging keys"
+                    )
+                if any(not isinstance(key, str) or not key for key in staging_keys):
+                    raise ValueError(
+                        "durable Gym generation-cut prefix contains an invalid staging key"
+                    )
+                if len(staging_keys) != len(set(staging_keys)):
+                    raise ValueError(
+                        "durable Gym generation-cut prefix contains duplicate staging keys"
+                    )
+                keys.update(staging_keys)
+    return keys
+
+
 class GymModelCommitResponse(_StrictWireModel):
     """Policy lineage and external-storage index written during commit."""
 
     rollouts: NonNegativeInt
     rows: NonNegativeInt
     excluded_tombstoned: NonNegativeInt
-    excluded_inactive: NonNegativeInt = 0
+    generation_cut_records: NonNegativeInt = 0
     manifest_digest: Sha256Digest
     storage_reference_index: GymCheckpointArtifactReference
 
@@ -945,12 +1107,14 @@ def validate_gym_checkpoint_manifests(
 
 
 class GymExternalStorageReference(_StrictWireModel):
-    """One TQ staging row required by a parked Gym continuation."""
+    """One TQ staging row required by a Gym recovery point."""
 
     schema_version: Literal[1] = GYM_CHECKPOINT_SCHEMA_VERSION
     capture_key: str = Field(min_length=1, pattern=_IDENTITY_PATTERN)
     boundary_model_call_id: str = Field(min_length=1)
-    kind: Literal["token_capture_staging"] = "token_capture_staging"
+    kind: Literal["token_capture_staging", "generation_prefix_cut"] = (
+        "token_capture_staging"
+    )
     key: str = Field(min_length=1)
 
 
@@ -1117,6 +1281,17 @@ def gym_checkpoint_staging_keys(
     return set(_gym_checkpoint_external_storage_references(checkpoint_dir, checkpoint))
 
 
+def gym_checkpoint_generation_cut_records(
+    checkpoint: GymCheckpointCommitResult,
+) -> int:
+    """Return the number of prefix cuts embedded in Gym model lineage."""
+    return sum(
+        result.payload.generation_cut_records
+        for result in checkpoint.participants
+        if isinstance(result.payload, GymModelCommitResponse)
+    )
+
+
 def gym_checkpoint_continuations(
     checkpoint_dir: Path,
     checkpoint: GymCheckpointCommitResult,
@@ -1145,10 +1320,14 @@ def gym_checkpoint_continuations(
                 )
             roots_by_capture_key[root.capture_key] = root
 
-    references = _gym_checkpoint_external_storage_references(
-        checkpoint_dir,
-        checkpoint,
-    )
+    references = {
+        key: reference
+        for key, reference in _gym_checkpoint_external_storage_references(
+            checkpoint_dir,
+            checkpoint,
+        ).items()
+        if reference.kind == "token_capture_staging"
+    }
     keys_by_capture_key: dict[str, list[str]] = {}
     for key, reference in references.items():
         root = roots_by_capture_key.get(reference.capture_key)
@@ -1194,9 +1373,9 @@ class GymModelRestoreResponse(_StrictWireModel):
     rollouts: NonNegativeInt
     rows: NonNegativeInt
     checkpoint_id: str | None = None
-    tombstones: list[GymExecutionIdentity]
-    source_attempts: list[GymExecutionIdentity]
+    tombstones_restored: NonNegativeInt
     storage_reference_index: GymCheckpointArtifactReference
+    generation_cuts_restored: NonNegativeInt = 0
 
 
 class GymAgentRestoreResponse(_StrictWireModel):

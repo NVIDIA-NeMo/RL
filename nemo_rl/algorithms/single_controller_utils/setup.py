@@ -103,7 +103,9 @@ from nemo_rl.environments.gym_checkpoint import (
     GymCheckpointRestoreResult,
     GymCheckpointTopology,
     gym_checkpoint_continuations,
+    gym_checkpoint_generation_cut_records,
     gym_checkpoint_staging_keys,
+    gym_generation_cut_staging_keys,
     validate_gym_checkpoint_manifests,
     validate_gym_checkpoint_restore_artifacts,
 )
@@ -207,6 +209,24 @@ class SingleControllerActorArgs:
     # the MSE loss it trains under.
     value_handle: Optional[TQValue] = None
     value_loss_fn: Optional[LossFunction] = None
+
+
+def _validate_generation_prefix_restore_compatibility(
+    *,
+    generation_cut_proofs: tuple[dict[str, object], ...],
+    generation_cut_records: int = 0,
+    generation_prefix_cuts_enabled: bool,
+) -> None:
+    """Reject a prefix-bearing snapshot before starting an incompatible run."""
+    if (
+        generation_cut_proofs or generation_cut_records > 0
+    ) and not generation_prefix_cuts_enabled:
+        raise ValueError(
+            "The selected rollout snapshot contains durable generation-prefix "
+            "cuts. Set "
+            "rollout_checkpointing.gym.generation_prefix_cuts_enabled=true "
+            "to restore it."
+        )
 
 
 def _maybe_restore_native_data_plane_checkpoint(
@@ -780,6 +800,15 @@ def _spinup_gym(
     policy_config = master_config.policy
     generation_config = policy_config["generation"]
     enable_router_replay = router_replay_enabled(policy_config)
+    if (
+        master_config.rollout_checkpointing.gym.generation_prefix_cuts_enabled
+        and enable_router_replay
+    ):
+        raise NotImplementedError(
+            "generation-prefix recovery does not yet preserve the original "
+            "per-token routed-expert trace; disable policy.router_replay or "
+            "generation-prefix cuts"
+        )
     shard_set = build_nemo_gym_actors(
         master_config.env,
         base_urls=base_urls,
@@ -789,7 +818,12 @@ def _spinup_gym(
         use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
         # Ledger config rides into Gym's policy model server.
         token_capture=(
-            master_config.token_capture.model_dump()
+            {
+                **master_config.token_capture.model_dump(),
+                "generation_prefix_cuts_enabled": (
+                    master_config.rollout_checkpointing.gym.generation_prefix_cuts_enabled
+                ),
+            }
             if master_config.token_capture.enabled
             else None
         ),
@@ -1427,6 +1461,21 @@ def setup_single_controller(
             )
     snapshot_resolution_seconds = time.monotonic() - snapshot_resolution_started
     if resolved_snapshot is not None:
+        _validate_generation_prefix_restore_compatibility(
+            generation_cut_proofs=(
+                resolved_snapshot.manifest.gym_generation_cut_proofs
+            ),
+            generation_cut_records=(
+                gym_checkpoint_generation_cut_records(
+                    resolved_snapshot.manifest.gym_checkpoint
+                )
+                if resolved_snapshot.manifest.gym_checkpoint is not None
+                else 0
+            ),
+            generation_prefix_cuts_enabled=(
+                rollout_checkpoint_cfg.gym.generation_prefix_cuts_enabled
+            ),
+        )
         recovery_checkpoint_path = str(resolved_snapshot.path)
         save_state.current_epoch = resolved_snapshot.manifest.current_epoch
         save_state.sampler_dispatch_index = (
@@ -1875,7 +1924,11 @@ def setup_single_controller(
         discovered = ray.get(gym_actor.discover_checkpoint_capabilities.remote())
         gym_checkpoint_topology = GymCheckpointTopology.model_validate(discovered)
         if rollout_checkpoint_cfg.gym.participant_checkpointing_enabled:
-            gym_checkpoint_topology.validate_turn_recovery_capabilities()
+            gym_checkpoint_topology.validate_turn_recovery_capabilities(
+                generation_prefix_cuts_enabled=(
+                    rollout_checkpoint_cfg.gym.generation_prefix_cuts_enabled
+                )
+            )
         if resolved_snapshot is not None:
             saved_topology_fingerprint = (
                 resolved_snapshot.manifest.gym_topology_fingerprint
@@ -1919,6 +1972,7 @@ def setup_single_controller(
 
     restored_gym_checkpoint_staging_keys: tuple[str, ...] = ()
     restored_gym_checkpoint_continuations: tuple[GymCheckpointContinuation, ...] = ()
+    generation_cut_exclusions: tuple[dict[str, object], ...] = ()
     if saved_gym_checkpoint is not None:
         assert resolved_snapshot is not None
         assert gym_checkpoint_topology is not None
@@ -1930,17 +1984,45 @@ def setup_single_controller(
             resolved_snapshot.path,
             saved_gym_checkpoint,
         )
+        restored_gym_checkpoint_continuations = gym_checkpoint_continuations(
+            resolved_snapshot.path,
+            saved_gym_checkpoint,
+        )
+        restart_only_resources = set(gym_checkpoint_topology.restart_only_resources())
+        excluded_generation_cut_replacements = {
+            (
+                continuation.rollout_id,
+                continuation.replacement_attempt_index,
+            )
+            for continuation in restored_gym_checkpoint_continuations
+            if restart_only_resources
+            and (
+                continuation.resource_state_revisions is None
+                or bool(
+                    restart_only_resources.intersection(
+                        name
+                        for name, _revision in continuation.resource_state_revisions
+                    )
+                )
+            )
+        }
+        generation_cut_exclusions = tuple(
+            {"rollout_id": rollout_id, "attempt_index": attempt_index}
+            for rollout_id, attempt_index in sorted(
+                excluded_generation_cut_replacements
+            )
+        )
         restored_gym_checkpoint_staging_keys = tuple(
             sorted(
                 gym_checkpoint_staging_keys(
                     resolved_snapshot.path,
                     saved_gym_checkpoint,
                 )
+                | gym_generation_cut_staging_keys(
+                    resolved_snapshot.manifest.gym_generation_cut_proofs,
+                    excluded_replacements=excluded_generation_cut_replacements,
+                )
             )
-        )
-        restored_gym_checkpoint_continuations = gym_checkpoint_continuations(
-            resolved_snapshot.path,
-            saved_gym_checkpoint,
         )
 
     # SimpleStorage's dedicated storage actors already exist, so preserve its
@@ -1968,6 +2050,7 @@ def setup_single_controller(
 
     if saved_gym_checkpoint is not None:
         assert resolved_snapshot is not None
+        assert gym_checkpoint_topology is not None
         awaitable_gym_actor = sole_nemo_gym_checkpoint_actor(env_handles["nemo_gym"])
         gym_checkpoint_restore_operation_id = f"restore-{uuid.uuid4().hex}"
         restore_deadline_ts = time.time() + rollout_checkpoint_cfg.gym.prepare_timeout_s
@@ -1978,6 +2061,8 @@ def setup_single_controller(
                     restore_deadline_ts,
                     str(resolved_snapshot.path),
                     saved_gym_checkpoint.checkpoint_id,
+                    resolved_snapshot.manifest.gym_generation_cut_proofs,
+                    generation_cut_exclusions,
                 )
             )
         )
@@ -2081,7 +2166,17 @@ def setup_single_controller(
         # Host Gym's capture core in every vLLM DP leader (in-worker DP
         # client + TQTokenSink + the single install_capture call), and give
         # workers the initial weight version to stamp on captured calls.
-        generation.setup_token_capture(dp_config, token_capture_cfg.staging_partition)
+        generation.setup_token_capture(
+            dp_config,
+            token_capture_cfg.staging_partition,
+            generation_prefix_cuts_enabled=(
+                rollout_checkpoint_cfg.gym.generation_prefix_cuts_enabled
+            ),
+            generation_cut_control_token=token_capture_cfg.control_auth_token,
+            generation_chunk_flush_tokens=(
+                rollout_checkpoint_cfg.gym.generation_chunk_flush_tokens
+            ),
+        )
         generation.set_rollout_weight_version(0)
 
     if weight_synchronizer is None:
