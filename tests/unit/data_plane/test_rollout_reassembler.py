@@ -216,11 +216,13 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
         fallback_weight_version=9,
         prompt_idx=17,
         loss_multiplier=0.25,
+        rollout_environment="swe",
     )
     assert not finalized.dropped
     assert finalized.meta is not None
     assert finalized.meta.sample_ids == rollout_ids
     assert [tag["prompt_idx"] for tag in finalized.meta.tags] == [17, 17]
+    assert [tag["rollout_environment"] for tag in finalized.meta.tags] == ["swe", "swe"]
     # Group staleness comes from the valid rollout's calls (wv 4), not the fallback.
     assert (finalized.group_min_wv, finalized.group_max_wv) == (4, 4)
     assert finalized.metrics["finalize/invalid_row_rate"] == 0.5

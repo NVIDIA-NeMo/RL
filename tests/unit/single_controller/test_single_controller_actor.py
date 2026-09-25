@@ -832,6 +832,9 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
         fields=list(data.keys()),
     )
 
+    meta.tags = [
+        {"rollout_environment": name} for name in ("swe", "swe", "math", "math")
+    ]
     result_meta, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
     capsys.readouterr()
 
@@ -857,6 +860,13 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
     assert estimator.mask[0].all()
     assert estimator.mask[1:].count_nonzero() == 0
     assert ctrl._step_log_dict["num_mask_sample_filtered"] == [1]
+    counts = ctrl._step_log_dict["environment_counts"][0]
+    assert counts["environment/swe/num_mask_sample_filtered"] == 1
+    assert counts["environment/swe/num_valid_samples"] == 1
+    assert counts["environment/swe/num_valid_tokens"] == 4
+    assert counts["environment/math/num_mask_sample_filtered"] == 0
+    assert counts["environment/math/num_valid_samples"] == 0
+    assert counts["environment/math/num_valid_tokens"] == 0
     metrics = ctrl._step_log_dict["seq_logprob_error_metrics"]
     assert len(metrics) == 1
     assert metrics[0]["num_masked_seqs_by_logprob_error"] == 1

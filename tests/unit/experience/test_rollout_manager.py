@@ -30,6 +30,7 @@ import tempfile
 import uuid
 from copy import deepcopy
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -38,12 +39,15 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     DataPlaneCheckpointBarrier,
     PostWriteEnrichmentError,
 )
+from nemo_rl.algorithms.grpo import aggregate_rollout_metrics
 from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets.response_datasets import NemoGymDataset
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data.processors import nemo_gym_data_processor
+from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.schema import ROLLOUT_METRICS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentReturn
 from nemo_rl.experience.failures import GenerationUnavailable
@@ -54,6 +58,7 @@ from nemo_rl.experience.interfaces import (
     Completion,
     PromptGroupRecord,
 )
+from nemo_rl.experience.metric_utils import RolloutTelemetry
 from nemo_rl.experience.rollout_manager import (
     AsyncNemoGymRolloutImpl,
     AsyncRolloutImpl,
@@ -62,15 +67,24 @@ from nemo_rl.experience.rollout_manager import (
     RolloutRetryPolicy,
     RolloutStats,
     _nemo_gym_metric_namespace,
+    _rollout_environment_metric_component,
+)
+from nemo_rl.experience.rollout_reassembler import FinalizedGroup
+from nemo_rl.experience.rollout_reassembler_actor import (
+    ReassemblyRequest,
+    RolloutReassemblerActor,
 )
 from nemo_rl.experience.rollout_recovery import (
     RecoveryGranularity,
     RolloutRecoveryLedger,
 )
 from nemo_rl.experience.rollouts import (
+    _aggregate_multi_turn_rollout_metrics,
+    _postprocess_single_nemo_gym_group,
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
 )
+from nemo_rl.utils.timer import Timer
 
 # Fixtures shared with the heavyweight rollout tests.
 from tests.unit.environments.test_nemo_gym import (
@@ -92,6 +106,69 @@ from tests.unit.test_envs import MultiStepCalcMetadata
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+@pytest.mark.parametrize("environment", [None, "calculator/tool"])
+def test_native_telemetry_retains_every_v1_metric(environment):
+    samples = [
+        {
+            "turn_count": turns,
+            "total_tokens": 5 + turns * 3,
+            "assistant_tokens": turns * 2,
+            "env_tokens": turns,
+            "terminated": index == 0,
+            "truncated": index == 1,
+            "max_turns_reached": index == 2,
+            "total_reward": float(index - 1),
+            "turn_gen_tokens": [2] * turns,
+            "turn_input_tokens": [5] * turns,
+            "turn_total_tokens": [7] * turns,
+            "max_gen_tokens_per_turn": 2 if turns else 0,
+            "per_worker_token_counts": {index % 2: 2 * turns},
+        }
+        for index, turns in enumerate((1, 3, 0))
+    ]
+    completions = [
+        Completion([], None, row["truncated"], row["total_reward"]) for row in samples
+    ]
+    impl = object.__new__(AsyncRolloutImpl)
+    actual = impl._aggregate_rollout_metrics(
+        completions, samples, environment=environment
+    )
+    expected = _aggregate_multi_turn_rollout_metrics(samples)
+    # Enumerate V1's actual output keys rather than a hand-picked subset.
+    for name, value in expected.items():
+        assert actual[name] == value, name
+        if (
+            environment is not None
+            and name != "per_worker_token_counts"
+            and not name.startswith("histogram/")
+        ):
+            prefix = f"environment/{_rollout_environment_metric_component(environment)}"
+            assert actual[f"{prefix}/{name}"] == value, name
+    if environment is not None:
+        assert actual[f"{prefix}/sample_count"] == 3
+        assert actual[f"{prefix}/gen_tokens_per_turn/histogram"] == [2, 2, 2, 2]
+        assert actual[f"{prefix}/turns_per_sample/histogram"] == [1, 3, 0]
+
+    # Selected groups need not have equal populations. Compare all V1 keys
+    # again after the same step reducer used by the controller.
+    group_metrics = {}
+    for start, stop in ((0, 1), (1, 3)):
+        metrics = impl._aggregate_rollout_metrics(
+            completions[start:stop], samples[start:stop], environment=environment
+        )
+        for name, value in metrics.items():
+            group_metrics.setdefault(name, []).append(value)
+    pooled = aggregate_rollout_metrics(group_metrics)
+    for name, value in expected.items():
+        assert pooled[name] == pytest.approx(value), name
+        if (
+            environment is not None
+            and name != "per_worker_token_counts"
+            and not name.startswith("histogram/")
+        ):
+            assert pooled[f"{prefix}/{name}"] == pytest.approx(value), name
 
 
 def _with_cut(buffer, callback):
@@ -1000,6 +1077,11 @@ def test_nemo_gym_metric_namespace_supports_task_source_only_rows(
     assert _nemo_gym_metric_namespace(row) == expected
 
 
+def test_rollout_environment_metric_component_avoids_sanitization_collisions():
+    assert _rollout_environment_metric_component("swe-e2e") == "swe-e2e"
+    assert _rollout_environment_metric_component("swe/e2e").startswith("swe_e2e-")
+
+
 def _mask_gate_result():
     return {
         "message_log": [
@@ -1049,6 +1131,29 @@ def test_receipt_completion_keeps_mask_flag_when_gate_on():
     )[0][0]
     assert completion.env_extras["instance_config"]["mask_sample"] is True
     assert completion.truncated is False
+
+
+def test_capture_proxy_metrics_cannot_be_confused_with_v1_messages():
+    result = _mask_gate_receipt_result()
+    result["receipt"]["manifest"] = [
+        {"cum_len": 11, "delta_len": 4},
+        {"cum_len": 20, "delta_len": 9},
+    ]
+    impl = _nemo_gym_impl(True)
+    completions, _ = impl._results_to_completions([result])
+    metrics = impl._compute_rollout_metrics(completions, "swe")
+    for scope in ("", "environment/swe/"):
+        assert metrics[f"{scope}capture/calls_per_sample/histogram"] == [2]
+        assert metrics[f"{scope}capture/delta_tokens_per_sample/histogram"] == [13]
+        assert metrics[f"{scope}capture/deepest_chain_tokens_per_sample/histogram"] == [
+            20
+        ]
+        assert metrics[f"{scope}capture/max_delta_tokens_per_call/histogram"] == [9]
+        assert f"{scope}turns_per_sample/histogram" not in metrics
+        assert f"{scope}gen_tokens_per_sample/histogram" not in metrics
+    assert "mean_gen_tokens_per_sample" not in metrics
+    assert "mean_prompt_length" not in metrics
+    assert metrics["total_reward/mean"] == 1.0
 
 
 def test_receipt_completion_drops_mask_flag_when_gate_off():
@@ -1106,6 +1211,12 @@ def test_streamed_receipt_callback_uses_current_completion_conversion():
     generation_index, completion = streamed[0]
     assert generation_index == 0
     assert completion.env_extras["ng_rollout_id"] == "r0"
+    assert completion.telemetry is not None
+    assert completion.telemetry.environment == "resolved-agent"
+    assert (
+        completion.telemetry.to_metrics()["environment/resolved-agent/sample_count"]
+        == 1
+    )
     assert "mask_sample" not in completion.env_extras["instance_config"]
 
 
@@ -1125,6 +1236,206 @@ def test_nemo_gym_full_result_tables_are_opt_in(log_full_result_tables):
     metrics = impl._compute_rollout_metrics([completion], "agent")
 
     assert ("agent/full_result" in metrics) is log_full_result_tables
+
+
+def test_nemo_gym_rollout_metrics_include_environment_distributions():
+    impl = _nemo_gym_impl(True)
+    completions = [
+        Completion(
+            message_log=[
+                {"role": "user", "token_ids": [1]},
+                {"role": "assistant", "token_ids": [2, 3]},
+            ],
+            env_extras={"judge_score": 0.75},
+            truncated=False,
+            reward=1.0,
+        ),
+        Completion(
+            message_log=[
+                {"role": "user", "token_ids": [1]},
+                {"role": "assistant", "token_ids": [2, 3, 4, 5]},
+            ],
+            env_extras={"judge_score": 0.25},
+            truncated=True,
+            reward=0.0,
+        ),
+    ]
+
+    metrics = impl._compute_rollout_metrics(completions, "swe/e2e")
+    prefix = "environment/swe_e2e-"
+    environment_prefix = next(
+        key.removesuffix("/gen_tokens_per_sample/histogram")
+        for key in metrics
+        if key.startswith(prefix) and key.endswith("/gen_tokens_per_sample/histogram")
+    )
+
+    assert metrics[f"{environment_prefix}/gen_tokens_per_sample/histogram"] == [2, 4]
+    assert metrics[f"{environment_prefix}/total_reward/histogram"] == [1.0, 0.0]
+    assert metrics[f"{environment_prefix}/truncated/histogram"] == [0, 1]
+    assert metrics[f"{environment_prefix}/env_extra/judge_score/histogram"] == [
+        0.75,
+        0.25,
+    ]
+    assert metrics[f"{environment_prefix}/sample_count"] == 2
+
+
+@pytest.mark.parametrize("agent_name", ["swe", "swe/e2e"])
+@pytest.mark.parametrize("field", ["judge_score", "judge/score"])
+@pytest.mark.parametrize("optional", [False, True])
+def test_capture_agent_summaries_match_selected_population(agent_name, field, optional):
+    """Pool sealed siblings after actor finalization, including optional extras."""
+    impl = _nemo_gym_impl(True)
+    environment = _rollout_environment_metric_component(agent_name)
+    completions = []
+    snapshots = []
+    for index, score in enumerate([0.0, 1.0, 10.0]):
+        result = _mask_gate_receipt_result()
+        result["full_result"]["reward"] = float(index == 2)
+        if not (optional and index == 1):
+            result["full_result"][field] = score
+        completion = impl._results_to_completions([result])[0][0]
+        completions.append(completion)
+        snapshots.append(
+            RolloutTelemetry.from_metrics(
+                environment, impl._compute_rollout_metrics([completion], agent_name)
+            )
+        )
+
+    expected = impl._compute_rollout_metrics(completions, agent_name)
+    actor_cls = RolloutReassemblerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_cls)
+    actor._max_seq_len = 10
+    # Exercise the real actor's metadata publication; tensor reconstruction is
+    # covered by the Gym-backed finalizer tests, not this CPU regression.
+    actor._finalizer = MagicMock()
+    actor._finalizer.finalize_group.return_value = FinalizedGroup(
+        meta=KVBatchMeta(
+            partition_id="canonical",
+            task_name="train",
+            sample_ids=["g0", "g1", "g2"],
+            sequence_lengths=[3, 3, 3],
+        ),
+        group_min_wv=4,
+        group_max_wv=4,
+        staging_keys=[],
+    )
+    finalized = actor.finalize(
+        ReassemblyRequest(
+            group_id="group",
+            rollout_ids=("g0", "g1", "g2"),
+            canonical_sample_ids=("g0", "g1", "g2"),
+            receipts=(None, None, None),
+            rewards=tuple(c.reward for c in completions),
+            fallback_weight_version=4,
+            prompt_idx=17,
+            mask_sample=(False, False, False),
+            rollout_environment=environment,
+            telemetry=tuple(snapshots),
+        )
+    )
+    per_group = {}
+    for metrics in finalized.meta.extra_info[ROLLOUT_METRICS]:
+        for name, value in metrics.items():
+            per_group.setdefault(name, []).append(value)
+    actual = aggregate_rollout_metrics(per_group)
+    for diagnostic in ("reward", field):
+        for stat in ("mean", "min", "max", "median", "stddev", "histogram"):
+            key = f"{agent_name}/{diagnostic}/{stat}"
+            assert actual[key] == pytest.approx(expected[key]), key
+            assert actual[key] == pytest.approx(
+                actual[f"environment/{environment}/env_extra/{diagnostic}/{stat}"]
+            ), key
+
+
+@pytest.mark.parametrize("mask_env_flagged_samples", [False, True])
+def test_nemo_gym_telemetry_matches_v1_postprocessing(mask_env_flagged_samples):
+    """Same completed trajectories, including failures, must give V1 metrics."""
+    results = []
+    for turns, reward, flagged in ((1, 1.0, False), (3, 0.0, True), (2, 0.5, False)):
+        messages = []
+        for turn in range(turns):
+            messages.extend(
+                [
+                    {
+                        "role": "user",
+                        "content": "prompt",
+                        "token_ids": torch.tensor([1]),
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "answer",
+                        "token_ids": torch.tensor([2] * (turn + 1)),
+                        "generation_logprobs": torch.tensor([-0.1] * (turn + 1)),
+                    },
+                ]
+            )
+        results.append(
+            {
+                "input_message_log": messages[:1],
+                "message_log": messages,
+                "full_result": {
+                    "reward": reward,
+                    "eval_timed_out": flagged,
+                    "instance_config": {"mask_sample": flagged},
+                },
+            }
+        )
+    # Second row reaches the length cap; it remains in raw rollout metrics
+    # regardless of the environment masking switch.
+    impl = _nemo_gym_impl(mask_env_flagged_samples)
+    impl._max_seq_len = 9
+    completions, _ = impl._results_to_completions(deepcopy(results))
+    actual = impl._compute_rollout_metrics(completions, "swe", prompt_lengths=[1, 1, 1])
+    legacy_result = _postprocess_single_nemo_gym_group(
+        nemo_gym_rows=[{"agent_ref": {"name": "swe"}} for _ in results],
+        results=deepcopy(results),
+        timer=Timer(),
+        timer_prefix="timing/test",
+        policy_generation=SimpleNamespace(cfg={"vllm_cfg": {"max_model_len": 9}}),
+        input_batch=BatchedDataDict({"loss_multiplier": torch.ones(3)}),
+        tokenizer=SimpleNamespace(pad_token_id=0),
+        log_full_result_tables=False,
+        mask_env_flagged_samples=mask_env_flagged_samples,
+    )
+    legacy = legacy_result.rollout_metrics
+    # Guard the complete V1 producer output, including existing agent names,
+    # rather than only the distributions named below.
+    for name, value in legacy.items():
+        assert name in actual, name
+        assert actual[name] == pytest.approx(value, nan_ok=True), name
+    assert (
+        actual["mean_prompt_length"]
+        == legacy_result.final_batch["length"].float().mean().item()
+    )
+    assert (
+        actual["environment/swe/prompt_tokens_per_sample/mean"]
+        == actual["mean_prompt_length"]
+    )
+    for name in (
+        "turns_per_sample",
+        "gen_tokens_per_sample",
+        "total_tokens_per_sample",
+        "max_gen_tokens_per_turn",
+        "total_reward",
+    ):
+        for stat in ("mean", "min", "max", "median", "stddev", "histogram"):
+            key = f"{name}/{stat}"
+            assert actual[key] == pytest.approx(legacy[key])
+            assert actual[f"environment/swe/{key}"] == pytest.approx(legacy[key])
+    for name in (
+        "natural_termination_rate",
+        "truncation_rate",
+        "turns_per_sample/p95",
+        "turns_per_sample/p99",
+        "max_gen_tokens_per_turn/p95",
+    ):
+        assert actual[name] == legacy[name]
+        assert actual[f"environment/swe/{name}"] == legacy[name]
+    for stat in ("mean", "min", "max", "median", "stddev", "histogram"):
+        assert actual[
+            f"environment/swe/env_extra/eval_timed_out/{stat}"
+        ] == pytest.approx(legacy[f"swe/eval_timed_out/{stat}"])
+    assert actual["environment/swe/sample_count"] == 3
 
 
 def _reward_penalty_result(output, assistant_overrides=None, assistant_tokens=None):
@@ -1873,6 +2184,7 @@ def _make_capture_manager(
     retry_policy: RolloutRetryPolicy | None = None,
     instance_configs=None,
     recovery_config: RolloutRecoveryConfig | None = None,
+    telemetry_environment: str | None = None,
 ):
     mgr = object.__new__(RolloutManager)
     mgr._tokenizer = None
@@ -1937,6 +2249,16 @@ def _make_capture_manager(
             )
             if on_completion is not None:
                 for generation_index, completion in zip(indices, record.completions):
+                    if telemetry_environment is not None:
+                        completion.telemetry = RolloutTelemetry(
+                            telemetry_environment,
+                            {
+                                f"environment/{telemetry_environment}/turns_per_sample": float(
+                                    generation_index + 1
+                                )
+                            },
+                            {f"environment/{telemetry_environment}/sample_count": 1.0},
+                        )
                     await on_completion(generation_index, completion)
             return record
 
@@ -1945,6 +2267,54 @@ def _make_capture_manager(
 
 
 class TestGenerateForFinalizationFlow:
+    @pytest.mark.parametrize("partial", [False, True])
+    def test_restored_groups_keep_sealed_sibling_observations(self, partial):
+        first = _make_capture_manager(
+            _FakeCaptureBuffer(), telemetry_environment="resolved"
+        )
+        prompt = {"prompt": "p", "idx": 9}
+        original = _run(first.generate_for_finalization(prompt, target_step=7))
+        state = first.recovery_ledger.state_dict()
+        if partial:
+            state["groups"][0]["status"] = "generating"
+            state["groups"][0]["siblings"][1]["attempts"][0].update(
+                status="dispatched",
+                receipt=None,
+                reward=None,
+                mask_sample=None,
+                staging_keys=[],
+                telemetry=None,
+            )
+        restored = _make_capture_manager(
+            _FakeCaptureBuffer(), telemetry_environment="resolved"
+        )
+        _with_cut(
+            restored._tq_buffer,
+            lambda cut: restored.recovery_ledger.load_state_dict(cut, state),
+        )
+        _with_cut(
+            restored._tq_buffer,
+            lambda cut: restored.recovery_ledger.bind_runtime_prompt(
+                cut, original.group_id, prompt
+            ),
+        )
+        _with_cut(
+            restored._tq_buffer,
+            lambda cut: restored.recovery_ledger.prepare_for_restart(cut),
+        )
+        request = _run(
+            restored.generate_for_finalization(
+                prompt, target_step=7, lineage_group_id=original.group_id
+            )
+        )
+        assert request.telemetry == original.telemetry
+        assert request.rollout_environment == "resolved"
+        assert restored._impl.seen_generation_indices == ([1] if partial else None)
+        assert [
+            s.observations["environment/resolved/turns_per_sample"]
+            for s in request.telemetry
+        ] == [1.0, 2.0]
+
     def test_request_carries_env_mask_flags(self):
         buf = _FakeCaptureBuffer()
         mgr = _make_capture_manager(
@@ -1965,7 +2335,13 @@ class TestGenerateForFinalizationFlow:
 
         request = _run(
             mgr.generate_for_finalization(
-                {"prompt": "p", "idx": 0, "loss_multiplier": 0.25}, target_step=5
+                {
+                    "prompt": "p",
+                    "idx": 0,
+                    "loss_multiplier": 0.25,
+                    "extra_env_info": {"agent_ref": {"name": "swe"}},
+                },
+                target_step=5,
             )
         )
         assert request is not None
@@ -1989,6 +2365,7 @@ class TestGenerateForFinalizationFlow:
         assert request.rewards == (0.5, 0.5)
         assert request.mask_sample == (False, False)
         assert request.loss_multiplier == 0.25
+        assert request.rollout_environment == "swe"
         assert request.fallback_weight_version == 7
         # Finalization and commit are exclusively owned by the controller's
         # actor-pool path; the manager leaves the reservation unready.

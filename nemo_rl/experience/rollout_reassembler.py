@@ -366,6 +366,7 @@ class RolloutReassembler:
         fallback_weight_version: int,
         prompt_idx: int,
         loss_multiplier: float = 1.0,
+        rollout_environment: str = "unknown",
         canonical_sample_ids: Optional[list[str]] = None,
     ) -> FinalizedGroup:
         """Publish exactly N canonical rows for one prompt group.
@@ -531,6 +532,7 @@ class RolloutReassembler:
             "sample_mask": sample_mask,
             "prompt_ids_for_adv": prompt_ids_for_adv,
             "total_reward": rewards_t,
+            "rollout_environment": rollout_environment,
             MASK_SAMPLE: torch.tensor(mask_sample, dtype=torch.bool),
             TRUNCATED: torch.tensor(
                 [seq_len == self._max_seq_len for seq_len in seq_lens],

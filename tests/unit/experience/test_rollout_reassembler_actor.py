@@ -26,7 +26,9 @@ import torch
 
 import nemo_rl.experience.rollout_reassembler_actor as actor_module
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.schema import ROLLOUT_METRICS
 from nemo_rl.distributed.actor_environments import ACTOR_ENVIRONMENTS
+from nemo_rl.experience.metric_utils import RolloutTelemetry
 from nemo_rl.experience.rollout_reassembler import FinalizedGroup
 from nemo_rl.experience.rollout_reassembler_actor import (
     _FORBIDDEN_RPC_KEYS,
@@ -94,7 +96,7 @@ def test_finalize_forwards_loss_multiplier_to_reassembler() -> None:
         drop_reason="test",
     )
     actor._finalizer.finalize_group.return_value = result
-    request = replace(_request(), loss_multiplier=0.25)
+    request = replace(_request(), loss_multiplier=0.25, rollout_environment="swe")
 
     assert actor.finalize(request) is result
     actor._finalizer.finalize_group.assert_called_once_with(
@@ -106,6 +108,7 @@ def test_finalize_forwards_loss_multiplier_to_reassembler() -> None:
         fallback_weight_version=4,
         prompt_idx=17,
         loss_multiplier=0.25,
+        rollout_environment="swe",
         canonical_sample_ids=["group_g0"],
     )
 
@@ -155,6 +158,8 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "prompt_idx",
         "mask_sample",
         "loss_multiplier",
+        "rollout_environment",
+        "telemetry",
     }
     assert {f.name for f in fields(FinalizedGroup)} == {
         "meta",
@@ -168,6 +173,63 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "valid_row_count",
         "total_row_count",
     }
+
+
+@pytest.mark.parametrize("complete", [False, True])
+@pytest.mark.parametrize("max_seq_len", [3, 4])
+def test_finalizer_retains_only_complete_sibling_telemetry(
+    complete, max_seq_len, caplog
+):
+    actor_cls = RolloutReassemblerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_cls)
+    actor._max_seq_len = max_seq_len
+    actor._finalizer = MagicMock()
+    meta = KVBatchMeta(
+        partition_id="canonical",
+        task_name="train",
+        sample_ids=["group_g0"],
+        sequence_lengths=[3],
+    )
+    result = FinalizedGroup(meta=meta, group_min_wv=4, group_max_wv=4, staging_keys=[])
+    actor._finalizer.finalize_group.return_value = result
+    snapshot = RolloutTelemetry(
+        "swe",
+        {"environment/swe/turns_per_sample": 3.0},
+        {"environment/swe/sample_count": 1.0},
+    )
+    request = replace(
+        _request(),
+        rollout_environment="swe",
+        telemetry=(snapshot if complete else None,),
+    )
+    assert actor.finalize(request) is result
+    if complete:
+        assert meta.extra_info[ROLLOUT_METRICS][0][
+            "environment/swe/turns_per_sample/histogram"
+        ] == [3.0]
+        assert_metadata_only(result)
+        assert meta.extra_info[ROLLOUT_METRICS][0]["truncation_rate"] == int(
+            max_seq_len == 3
+        )
+        assert meta.extra_info[ROLLOUT_METRICS][0][
+            "environment/swe/truncated/histogram"
+        ] == [int(max_seq_len == 3)]
+    else:
+        assert ROLLOUT_METRICS not in meta.extra_info
+        assert "lacks complete rollout telemetry" in caplog.text
+
+
+def test_finalizer_rejects_misaligned_telemetry_before_publication():
+    actor_cls = RolloutReassemblerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_cls)
+    actor._finalizer = MagicMock()
+    with pytest.raises(ValueError, match="align with logical siblings"):
+        actor.finalize(replace(_request(), telemetry=(None, None)))
+    with pytest.raises(ValueError, match="environment mismatch"):
+        actor.finalize(
+            replace(_request(), telemetry=(RolloutTelemetry("wrong", {}, {}),))
+        )
+    actor._finalizer.finalize_group.assert_not_called()
 
 
 @pytest.mark.parametrize("key", sorted(_FORBIDDEN_RPC_KEYS))

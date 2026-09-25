@@ -108,7 +108,12 @@ from nemo_rl.experience.interfaces import (
     RETAINED_TASK_INDICES_KEY,
     TRAINED_TASK_INDICES_KEY,
 )
-from nemo_rl.experience.metric_utils import is_histogram_metric
+from nemo_rl.experience.metric_utils import (
+    calculate_single_metric,
+    is_histogram_metric,
+    pct,
+    rollout_environment_metric_component,
+)
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
     attach_initial_nemo_gym_image_payloads,
@@ -4461,7 +4466,9 @@ def aggregate_rollout_metrics(
     """Aggregate rollout metrics from multiple trajectory groups.
 
     Different metric types are aggregated according to their semantics:
-    - Histogram observations: flattened into one step-level distribution
+    - Histogram observations: flattened into one step-level distribution;
+      core rollout, per-environment and recognized legacy agent summaries
+      are recomputed from it
     - Metrics ending with "/min" or starting with "min_" (excluding "_rate" suffix): take the minimum
     - Metrics ending with "/max" or starting with "max_" (excluding "_rate" suffix): take the maximum
     - "total_turns": summed
@@ -4477,14 +4484,25 @@ def aggregate_rollout_metrics(
     aggregated = {}
     for k, v in per_group_metrics.items():
         if is_histogram_metric(k):
-            aggregated[k] = [observation for group in v for observation in group]
+            observations = [observation for group in v for observation in group]
+            aggregated[k] = observations
+        elif k == "per_worker_token_counts":
+            counts = {}
+            for group in v:
+                for worker, count in group.items():
+                    counts[worker] = counts.get(worker, 0) + count
+            aggregated[k] = counts
         elif not isinstance(v[0], (int, float)):
             aggregated[k] = v
         elif k.endswith("/min") or (k.startswith("min_") and not k.endswith("_rate")):
             aggregated[k] = min(v)
         elif k.endswith("/max") or (k.startswith("max_") and not k.endswith("_rate")):
             aggregated[k] = max(v)
-        elif k == "total_turns":
+        elif k == "total_turns" or (
+            k.startswith("environment/") and k.endswith("/total_turns")
+        ):
+            aggregated[k] = sum(v)
+        elif k.startswith("environment/") and k.endswith("/sample_count"):
             aggregated[k] = sum(v)
         elif k == "trajectory_duration_s":
             sorted_v = sorted(v)
@@ -4496,6 +4514,127 @@ def aggregate_rollout_metrics(
             )
         else:
             aggregated[k] = sum(v) / len(v)
+    # Reduce distributions last: dictionary insertion order must not allow a
+    # per-group median/stddev to overwrite the selected-cohort statistic.
+    aliases = {
+        "turns_per_sample": {
+            "avg_turns_per_sample": "mean",
+            "max_turns_per_sample": "max",
+        },
+        "gen_tokens_per_sample": {
+            "mean_gen_tokens_per_sample": "mean",
+            "max_gen_tokens_per_sample": "max",
+        },
+        "total_tokens_per_sample": {"mean_total_tokens_per_sample": "mean"},
+        "env_tokens_per_sample": {"mean_env_tokens_per_sample": "mean"},
+        "total_reward": {
+            "mean_total_reward": "mean",
+            "max_total_reward": "max",
+            "min_total_reward": "min",
+        },
+        "terminated": {"natural_termination_rate": "mean"},
+        "truncated": {"truncation_rate": "mean"},
+        "max_turns_reached": {"max_turns_reached_rate": "mean"},
+    }
+    # Old ordinary replay metadata has agent histograms but no environment
+    # counts. Preserve its legacy reduction when any selected rows lack those
+    # counts, rather than divide a mixed old/new population by only new rows.
+    can_pool_agent_metrics = "total_reward/histogram" in aggregated and len(
+        aggregated["total_reward/histogram"]
+    ) == sum(
+        value
+        for name, value in aggregated.items()
+        if name.startswith("environment/")
+        and name.endswith("/sample_count")
+        and name.count("/") == 2
+    )
+    for key, observations in list(aggregated.items()):
+        if not key.endswith("/histogram"):
+            continue
+        metric_name = key.removesuffix("/histogram")
+        # Gym retains raw <agent>/<field> aliases alongside sanitized env_extra
+        # names. Either part may contain '/', so match exact canonical families
+        # rather than assuming a single split or comparing histogram values.
+        agent_counts = {}
+        if can_pool_agent_metrics:
+            for index, character in enumerate(metric_name):
+                if character != "/":
+                    continue
+                environment = rollout_environment_metric_component(metric_name[:index])
+                prefix = f"environment/{environment}"
+                field = metric_name[index + 1 :]
+                if (
+                    f"{prefix}/env_extra/{field}/histogram" in aggregated
+                    and f"{prefix}/sample_count" in aggregated
+                ):
+                    agent_counts[prefix] = aggregated[f"{prefix}/sample_count"]
+        if not (
+            agent_counts
+            or key.startswith("environment/")
+            or key.startswith("capture/")
+            or metric_name
+            in {
+                "turns_per_sample",
+                "total_tokens_per_sample",
+                "gen_tokens_per_sample",
+                "env_tokens_per_sample",
+                "max_gen_tokens_per_turn",
+                "total_reward",
+                "truncated",
+                "terminated",
+                "max_turns_reached",
+            }
+        ):
+            continue
+        if not observations:
+            continue
+        denominator = len(observations)
+        if agent_counts:
+            # Optional fields use all selected siblings of the agent. If raw
+            # names collide, the flattened legacy histogram already combines
+            # those agents; pool their counts too, without conflating the
+            # separately named per-environment distributions.
+            denominator = sum(agent_counts.values())
+        elif "/env_extra/" in metric_name:
+            # V1 divides numeric extra sums by all samples for that agent,
+            # even when some rows omit an optional field. Distribution
+            # statistics still describe the observations that are present.
+            environment_prefix = metric_name.split("/env_extra/", 1)[0]
+            denominator = aggregated.get(
+                f"{environment_prefix}/sample_count", denominator
+            )
+        aggregated.update(
+            calculate_single_metric(observations, denominator, metric_name)
+        )
+        aggregated[f"{metric_name}/p50"] = aggregated[f"{metric_name}/median"]
+        # Match V1's discrete percentile convention, not numpy interpolation.
+        aggregated[f"{metric_name}/p95"] = pct(observations, 95)
+        aggregated[f"{metric_name}/p99"] = pct(observations, 99)
+        # Preserve V1 native aliases, including their per-environment versions,
+        # using the same pooled population as the distribution metrics.
+        scope, _, family = metric_name.rpartition("/")
+        for alias, statistic in aliases.get(family, {}).items():
+            alias_key = f"{scope}/{alias}" if scope else alias
+            if alias_key in aggregated:
+                aggregated[alias_key] = aggregated[f"{metric_name}/{statistic}"]
+        prefix = f"{scope}/" if scope else ""
+        if (
+            family == "truncated"
+            and f"{prefix}terminated/histogram" not in aggregated
+            and f"{prefix}natural_termination_rate" in aggregated
+        ):
+            # Gym defines natural termination as not length-capped; native
+            # environments report a separate terminal signal and keep it.
+            aggregated[f"{prefix}natural_termination_rate"] = (
+                1.0 - aggregated[f"{metric_name}/mean"]
+            )
+    if (
+        "gen_tokens_per_sample/histogram" in aggregated
+        and aggregated["gen_tokens_per_sample/histogram"]
+    ):
+        aggregated["mean_gen_tokens_per_sample"] = aggregated[
+            "gen_tokens_per_sample/mean"
+        ]
     return aggregated
 
 

@@ -176,6 +176,7 @@ def record_to_train_batch(
         TRUNCATED: truncated,
         "total_reward": total_reward,
         _VIOLATION_COUNTS_KEY: violation_counts,
+        "rollout_environment": record.metadata.get("rollout_environment", "unknown"),
     }
     if ROUTED_EXPERTS_FIELD in flat:
         train_data[ROUTED_EXPERTS_FIELD] = flat[ROUTED_EXPERTS_FIELD]
@@ -231,6 +232,11 @@ def pack_payload(
         {
             "weight_version": weight_version,
             "prompt_idx": prompt_idx,
+            **(
+                {"rollout_environment": train_batch["rollout_environment"]}
+                if train_batch.get("rollout_environment", "unknown") != "unknown"
+                else {}
+            ),
             **violations[i],
             **multimodal_tags[i],
         }

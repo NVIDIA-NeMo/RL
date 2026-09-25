@@ -1517,10 +1517,12 @@ def test_rollout_pump_writes_expected_tq_data(
     for tag in tags:
         assert tag["weight_version"] == 0
         assert tag["prompt_idx"] == input_sample["idx"]
-        # Tag schema: recovery identity plus per-row violation counts.
+        assert tag["rollout_environment"] == input_sample["task_name"]
+        # Tag schema: recovery/environment identity plus per-row violation counts.
         assert set(tag) == {
             "weight_version",
             "prompt_idx",
+            "rollout_environment",
             "num_invalid_tool_calls",
             "num_malformed_thinking",
             "num_assistant_messages",

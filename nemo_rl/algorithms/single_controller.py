@@ -130,6 +130,7 @@ from nemo_rl.algorithms.single_controller_utils.setup import (
 from nemo_rl.algorithms.single_controller_utils.utils import (
     aggregate_step_metrics,
     apply_message_level_advantage_penalties,
+    environment_sample_counts,
     fields_for_put,
     reduce_advantage_pump_metrics,
     squeeze_trailing_unit_dim,
@@ -165,6 +166,7 @@ from nemo_rl.experience.rollout_manager import RolloutOutcome
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
+    SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS,
     PromptGroupPhase,
     RolloutRecoveryState,
     build_rollout_recovery_state,
@@ -693,6 +695,7 @@ class SingleControllerActor:
             "sample_masks": [],
             "masked_advantages": [],
             "num_mask_sample_filtered": [],
+            "environment_counts": [],
             "sequence_lengths": [],
             "seq_logprob_error_metrics": [],
             **{key: [] for key in VIOLATION_TAG_KEYS},
@@ -1061,12 +1064,13 @@ class SingleControllerActor:
         expected_schema_version = metadata.get("rollout_recovery_schema_version")
         if (
             isinstance(expected_schema_version, bool)
-            or expected_schema_version != ROLLOUT_RECOVERY_SCHEMA_VERSION
+            or not isinstance(expected_schema_version, int)
+            or expected_schema_version not in SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS
         ):
             raise ValueError(
                 "native TQ checkpoint rollout recovery schema mismatch: "
                 f"checkpoint={expected_schema_version!r}, "
-                f"expected={ROLLOUT_RECOVERY_SCHEMA_VERSION}"
+                f"supported={sorted(SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS)}"
             )
         expected_group_count = metadata.get("rollout_recovery_group_count")
         if (
@@ -1098,6 +1102,10 @@ class SingleControllerActor:
             weights_only=True,
         )
         parsed_state = parse_rollout_recovery_state(state)
+        if parsed_state.ledger_state["schema_version"] != expected_schema_version:
+            raise ValueError(
+                "Rollout recovery sidecar schema does not match native TQ metadata"
+            )
         if len(parsed_state.ledger_state["groups"]) != expected_group_count:
             raise ValueError(
                 "rollout recovery sidecar group count does not match native "
@@ -5244,6 +5252,14 @@ class SingleControllerActor:
             self._step_log_dict["seq_logprob_error_metrics"].append(seq_error_metrics)
 
         mask = token_mask * final_sample_mask.unsqueeze(-1)
+        self._step_log_dict.setdefault("environment_counts", []).append(
+            environment_sample_counts(
+                meta.tags,
+                mask_sample=mask_sample,
+                final_sample_mask=final_sample_mask,
+                final_token_mask=mask,
+            )
+        )
 
         repeated_batch: dict[str, torch.Tensor] = {
             "total_reward": rewards,

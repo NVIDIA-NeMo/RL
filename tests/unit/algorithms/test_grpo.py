@@ -6328,6 +6328,37 @@ class TestComputeAndApplySeqLogprobErrorMasking:
 class TestAggregateRolloutMetrics:
     """Tests for aggregate_rollout_metrics which aggregates per-group metrics by semantic type."""
 
+    def test_worker_accounting_sums_by_worker(self):
+        result = aggregate_rollout_metrics(
+            {"per_worker_token_counts": [{0: 3, 1: 5}, {0: 7, 2: 4}]}
+        )
+        assert result["per_worker_token_counts"] == {0: 10, 1: 5, 2: 4}
+
+    @pytest.mark.parametrize("prefix", ["", "environment/calculator/"])
+    def test_native_aliases_follow_pooled_population(self, prefix):
+        result = aggregate_rollout_metrics(
+            {
+                f"{prefix}turns_per_sample/histogram": [[1], [2, 3, 6]],
+                f"{prefix}avg_turns_per_sample": [1, 11 / 3],
+                f"{prefix}max_turns_per_sample": [1, 6],
+                f"{prefix}total_turns": [1, 11],
+                f"{prefix}terminated/histogram": [[False], [True, False, False]],
+                f"{prefix}natural_termination_rate": [0, 1 / 3],
+                f"{prefix}truncated/histogram": [[False], [True, False, True]],
+                f"{prefix}truncation_rate": [0, 2 / 3],
+            }
+        )
+        assert result[f"{prefix}avg_turns_per_sample"] == 3
+        assert result[f"{prefix}max_turns_per_sample"] == 6
+        assert result[f"{prefix}total_turns"] == 12
+        assert result[f"{prefix}truncation_rate"] == 0.5
+        # Native termination is not assumed to be the complement of truncation.
+        assert result[f"{prefix}natural_termination_rate"] == 0.25
+
+    @pytest.fixture(autouse=True)
+    def reset_env_calls(self):
+        """Pure metric reductions do not need the module's Ray environment actors."""
+
     def test_min_metrics_take_minimum(self):
         metrics = {
             "gen_tokens/min": [10, 5, 8],
@@ -6385,6 +6416,144 @@ class TestAggregateRolloutMetrics:
 
         assert result["agent/reward/histogram"] == [0.1, 0.2, 0.3]
         assert result["histogram/gen_tokens_length"] == [10, 20, 30]
+
+    def test_environment_histogram_recomputes_exact_step_statistics(self):
+        metrics = {
+            "environment/swe/gen_tokens_per_sample/mean": [15.0, 70.0],
+            "environment/swe/gen_tokens_per_sample/median": [15.0, 70.0],
+            "environment/swe/gen_tokens_per_sample/histogram": [
+                [10, 20],
+                [40, 100],
+            ],
+            "environment/swe/sample_count": [2, 2],
+        }
+
+        result = aggregate_rollout_metrics(metrics)
+
+        assert result["environment/swe/gen_tokens_per_sample/mean"] == 42.5
+        assert result["environment/swe/gen_tokens_per_sample/median"] == 30.0
+        assert result["environment/swe/gen_tokens_per_sample/p50"] == 30.0
+        assert result["environment/swe/gen_tokens_per_sample/p95"] == 100
+        assert result["environment/swe/gen_tokens_per_sample/p99"] == 100
+        assert result["environment/swe/sample_count"] == 4
+
+    def test_environment_statistics_ignore_key_order_and_group_partition(self):
+        histogram = "environment/swe/turns_per_sample/histogram"
+        # Deliberately put derived statistics AFTER the histogram.
+        metrics = {
+            histogram: [[1], [2, 3, 40]],
+            "environment/swe/turns_per_sample/mean": [1, 15],
+            "environment/swe/turns_per_sample/median": [1, 3],
+            "environment/swe/turns_per_sample/stddev": [float("nan"), 21.66],
+            "environment/swe/turns_per_sample/p95": [1, 40],
+        }
+        result = aggregate_rollout_metrics(metrics)
+        pooled = aggregate_rollout_metrics({histogram: [[1, 2, 3, 40]]})
+        assert result == pooled
+        assert result["environment/swe/turns_per_sample/mean"] == 11.5
+        assert result["environment/swe/turns_per_sample/median"] == 2.5
+        assert result["environment/swe/turns_per_sample/p95"] == 40
+
+    def test_optional_environment_extra_keeps_v1_denominator(self):
+        result = aggregate_rollout_metrics(
+            {
+                "environment/swe/env_extra/timeout/histogram": [[1.0], [0.0]],
+                "environment/swe/env_extra/timeout/mean": [0.5, 0.0],
+                "environment/swe/sample_count": [2, 2, 2],
+                "environment/math/sample_count": [4],
+            }
+        )
+        assert result["environment/swe/env_extra/timeout/mean"] == pytest.approx(1 / 6)
+        assert result["environment/swe/env_extra/timeout/median"] == 0.5
+        assert result["environment/swe/env_extra/timeout/histogram"] == [1.0, 0.0]
+
+    def test_legacy_agent_alias_pools_only_its_selected_environment(self):
+        result = aggregate_rollout_metrics(
+            {
+                "total_reward/histogram": [[0.0] * 2] * 3 + [[0.0] * 4],
+                "swe/timeout/histogram": [[1.0], [0.0]],
+                "swe/timeout/mean": [0.5, 0.0],
+                "swe/timeout/stddev": [float("nan"), float("nan")],
+                "environment/swe/env_extra/timeout/histogram": [[1.0], [0.0]],
+                "environment/swe/sample_count": [2, 2, 2],
+                "environment/math/sample_count": [4],
+                "unrelated/timeout/histogram": [[1.0], [0.0]],
+                "unrelated/timeout/mean": [0.5, 0.0],
+            }
+        )
+        assert result["swe/timeout/mean"] == pytest.approx(1 / 6)
+        assert result["swe/timeout/median"] == 0.5
+        assert result["swe/timeout/stddev"] == pytest.approx(2**-0.5)
+        # A histogram alone is not evidence of a Gym agent alias.
+        assert result["unrelated/timeout/mean"] == 0.25
+
+    def test_colliding_legacy_names_pool_both_agent_populations(self):
+        component = grpo_mod.rollout_environment_metric_component("a/b")
+        result = aggregate_rollout_metrics(
+            {
+                "total_reward/histogram": [[0.0] * 3, [0.0] * 2],
+                # agent=a, field=b/c and agent=a/b, field=c share a legacy key.
+                "a/b/c/histogram": [[0.0], [10.0]],
+                "a/b/c/mean": [0.0, 5.0],
+                "environment/a/env_extra/b/c/histogram": [[0.0]],
+                "environment/a/sample_count": [3],
+                f"environment/{component}/env_extra/c/histogram": [[10.0]],
+                f"environment/{component}/sample_count": [2],
+            }
+        )
+        assert result["a/b/c/mean"] == 2.0
+        assert result["a/b/c/median"] == 5.0
+        assert result["a/b/c/stddev"] == pytest.approx(50**0.5)
+        assert result["environment/a/env_extra/b/c/mean"] == 0.0
+        assert result[f"environment/{component}/env_extra/c/mean"] == 5.0
+
+    @pytest.mark.parametrize("old_has_diagnostic", [False, True])
+    def test_mixed_old_replay_preserves_legacy_reduction(self, old_has_diagnostic):
+        # Both groups contain two samples. The old group predates environment
+        # telemetry, including when it omits the optional diagnostic entirely.
+        old_means = [0.0] if old_has_diagnostic else []
+        old_histograms = [[0.0, 0.0]] if old_has_diagnostic else []
+        result = aggregate_rollout_metrics(
+            {
+                "total_reward/histogram": [[0.0, 0.0], [1.0, 1.0]],
+                "swe/score/histogram": old_histograms + [[10.0]],
+                "swe/score/mean": old_means + [5.0],
+                "environment/swe/env_extra/score/histogram": [[10.0]],
+                "environment/swe/sample_count": [2],
+            }
+        )
+        assert result["swe/score/mean"] == (2.5 if old_has_diagnostic else 5.0)
+        assert "swe/score/p50" not in result
+        # Canonical summaries still describe the explicitly attributed cohort.
+        assert result["environment/swe/env_extra/score/mean"] == 5.0
+
+    def test_global_and_environment_core_distributions_match(self):
+        groups = [[1], [2, 3, 40]]
+        result = aggregate_rollout_metrics(
+            {
+                "turns_per_sample/histogram": groups,
+                "turns_per_sample/p95": [1, 40],
+                "gen_tokens_per_sample/histogram": groups,
+                "mean_gen_tokens_per_sample": [1, 15],
+                "environment/swe/turns_per_sample/histogram": groups,
+            }
+        )
+        for stat in (
+            "histogram",
+            "mean",
+            "min",
+            "max",
+            "median",
+            "stddev",
+            "p50",
+            "p95",
+            "p99",
+        ):
+            assert (
+                result[f"turns_per_sample/{stat}"]
+                == result[f"environment/swe/turns_per_sample/{stat}"]
+            )
+        assert result["mean_gen_tokens_per_sample"] == 11.5
 
     def test_histogram_substring_keys_still_average(self):
         """Histogram-like substrings do not identify distributions."""
