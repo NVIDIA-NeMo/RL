@@ -69,8 +69,9 @@ from nemo_rl.models.automodel.config import (
     ModelAndOptimizerState,
     RuntimeConfig,
 )
+from nemo_rl.models.automodel.utils import resolve_model_class
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig, TokenizerConfig
-from nemo_rl.models.policy.utils import configure_dynamo_cache, resolve_model_class
+from nemo_rl.models.policy.utils import configure_dynamo_cache
 
 STRING_TO_DTYPE = {
     "float32": torch.float32,
