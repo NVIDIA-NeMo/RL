@@ -49,7 +49,9 @@ def _master_config(backend: str, transport):
         policy={"generation": generation},
         value={},
         env={},
-        loss_fn=SimpleNamespace(),
+        # Keep this focused fixture aligned with setup()'s current preflight.
+        # The refit guard runs after the loss/config consistency check.
+        loss_fn=SimpleNamespace(seq_logprob_error_in_loss=False),
         ppo=SimpleNamespace(),
         data={},
         logger={},
