@@ -300,14 +300,21 @@ def _add_r3_fallback_metrics(
 
 
 def _mask_sample_flags(extras: Iterable[dict[str, Any] | None]) -> torch.Tensor:
-    """Return True for samples the environment asks GRPO to mask from loss."""
-    return torch.tensor(
-        [
-            bool(((extra or {}).get("instance_config") or {}).get(MASK_SAMPLE, False))
-            for extra in extras
-        ],
-        dtype=torch.bool,
-    )
+    """Return True for samples the environment asks GRPO to mask from loss.
+
+    The flag is read from the verify response's first-class ``mask_sample``
+    field (NeMo-Gym ``BaseVerifyResponse``), with the response-extras mapping
+    ``instance_config.mask_sample`` as the fallback for environments that emit
+    only that older form.
+    """
+
+    def flagged(extra: dict[str, Any] | None) -> bool:
+        extra = extra or {}
+        if extra.get(MASK_SAMPLE):
+            return True
+        return bool((extra.get("instance_config") or {}).get(MASK_SAMPLE, False))
+
+    return torch.tensor([flagged(extra) for extra in extras], dtype=torch.bool)
 
 
 def _attach_routed_experts_to_message_log_prefix(
