@@ -614,6 +614,54 @@ class TestAutomodelCheckpointManager:
 
 
 @pytest.mark.automodel
+class TestSaveTokenizerOnRank0:
+    """Tests for the rank-0 guard around tokenizer saving.
+
+    The tokenizer is replicated across ranks and ``save_pretrained`` writes
+    rank-independent filenames, so letting every rank write races on the same
+    file and can hang the job on a hard-mounted NFS share.
+    """
+
+    def test_saves_when_distributed_not_initialized(self):
+        tokenizer = MagicMock()
+        with patch("torch.distributed.is_initialized", return_value=False):
+            AutomodelCheckpointManager._save_tokenizer_on_rank0(
+                tokenizer, "/some/tokenizer/path"
+            )
+        tokenizer.save_pretrained.assert_called_once_with("/some/tokenizer/path")
+
+    def test_saves_on_rank0_and_barriers(self):
+        tokenizer = MagicMock()
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_rank", return_value=0),
+            patch("torch.distributed.barrier") as mock_barrier,
+        ):
+            AutomodelCheckpointManager._save_tokenizer_on_rank0(
+                tokenizer, "/some/tokenizer/path"
+            )
+        tokenizer.save_pretrained.assert_called_once_with("/some/tokenizer/path")
+        mock_barrier.assert_called_once()
+
+    @pytest.mark.parametrize("rank", [1, 7, 31])
+    def test_skips_write_on_non_zero_ranks(self, rank):
+        tokenizer = MagicMock()
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_rank", return_value=rank),
+            patch("torch.distributed.barrier") as mock_barrier,
+        ):
+            AutomodelCheckpointManager._save_tokenizer_on_rank0(
+                tokenizer, "/some/tokenizer/path"
+            )
+        # Non-zero ranks must not write: concurrent save_pretrained() calls on
+        # the same path are what deadlocked on the NFS inode lock.
+        tokenizer.save_pretrained.assert_not_called()
+        # ...but they must still reach the barrier, otherwise rank 0 hangs.
+        mock_barrier.assert_called_once()
+
+
+@pytest.mark.automodel
 class TestSaveCheckpointFunctional:
     """Functional tests for save_checkpoint method with mocked internals."""
 
