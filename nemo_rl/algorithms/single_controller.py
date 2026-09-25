@@ -177,6 +177,7 @@ from nemo_rl.models.value.tq_value import TQValue
 from nemo_rl.utils.checkpoint import CheckpointManager, PathLike
 from nemo_rl.utils.logger import TELEMETRY_WALL_TIME_METRIC, Logger
 from nemo_rl.utils.timer import TimeoutChecker, Timer
+from nemo_rl.utils.train_step_file import write_train_step_file
 
 if TYPE_CHECKING:
     from nemo_rl.experience.rollout_reassembler import FinalizedGroup
@@ -302,6 +303,18 @@ class SingleControllerActor:
     # AbstractPolicyWorker.model_update_group is: the stall watchdog reads it on every
     # tick, and it must exist on any instance the watchdog can reach.
     _recovering_from_refit: bool = False
+
+    def _write_train_step_file(self) -> None:
+        """Rewrite ``<logger.log_dir>/train_step.json`` with the current step.
+
+        Read by NeMo Gym's live W&B sink (``NEMO_GYM_LIVE_WANDB_STEP_FILE``) so its
+        ``gym/*`` rows carry ``nemo_rl/step`` and continue across resumed jobs.
+        """
+        try:
+            log_dir = self._master_config.logger.get("log_dir")
+        except Exception:
+            return
+        write_train_step_file(log_dir, self._train_steps, self._trainer_version)
 
     def __init__(
         self,
@@ -591,6 +604,8 @@ class SingleControllerActor:
         self._trainer_version: int = restored_trainer_version
         self._train_steps: int = actor_args.save_state.current_step
         self._current_epoch: int = actor_args.save_state.current_epoch
+        # Mirror the (resumed) step for side-car telemetry before any rollout runs.
+        self._write_train_step_file()
         self._step_log_dict: dict[str, list] = {
             "rewards": [],
             "sample_masks": [],
@@ -2946,6 +2961,7 @@ class SingleControllerActor:
 
                 self._trainer_version += 1
                 self._train_steps += 1
+                self._write_train_step_file()
                 self._optimizer_commit_in_progress = False
                 dropped_prompt_groups = self._batch_shortfall.get(
                     version_during_step, 0
