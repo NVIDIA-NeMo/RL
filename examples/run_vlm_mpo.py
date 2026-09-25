@@ -54,10 +54,9 @@ def main() -> None:
     config = load_config(args.config)
     if overrides:
         config = parse_hydra_overrides(config, overrides)
-    master_config = MasterConfig.model_validate(
-        OmegaConf.to_container(config, resolve=True)
-    )
-    check_outdated_config(master_config)
+    resolved = OmegaConf.to_container(config, resolve=True)
+    check_outdated_config(resolved)
+    master_config = MasterConfig.model_validate(resolved)
     pprint.pprint(master_config.model_dump())
 
     master_config.logger["log_dir"] = get_next_experiment_dir(

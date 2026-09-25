@@ -66,8 +66,8 @@ def main() -> None:
     if overrides:
         config = parse_hydra_overrides(config, overrides)
     resolved = OmegaConf.to_container(config, resolve=True)
+    check_outdated_config(resolved)
     master_config = MasterConfig.model_validate(resolved)
-    check_outdated_config(master_config)
     master_config.logger["log_dir"] = get_next_experiment_dir(
         master_config.logger["log_dir"]
     )

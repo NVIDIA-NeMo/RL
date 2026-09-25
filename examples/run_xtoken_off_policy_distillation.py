@@ -65,9 +65,9 @@ def main() -> None:
         config = parse_hydra_overrides(config, overrides)
 
     config = OmegaConf.to_container(config, resolve=True)
-    config = MasterConfig(**config)
-
     check_outdated_config(config)
+
+    config = MasterConfig(**config)
     # Per-teacher same-vocab vs cross-tokenizer is determined solely by
     # `teachers[i].projection_matrix_path` (null => same-vocab direct KL; set =>
     # cross-tokenizer). The consistency check (a same-vocab teacher must

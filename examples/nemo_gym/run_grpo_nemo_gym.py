@@ -148,8 +148,8 @@ def main() -> None:
             config = parse_hydra_overrides(config, overrides)
 
         config = OmegaConf.to_container(config, resolve=True)
-        config = MasterConfig(**config)
         check_outdated_config(config)
+        config = MasterConfig(**config)
         materialize_vllm_video_config(config.policy, config.data)
         print("Applied CLI overrides")
 

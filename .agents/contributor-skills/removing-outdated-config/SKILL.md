@@ -35,7 +35,7 @@ def reject_outdated_<thing>(config: dict[str, Any]) -> None:
     """Fail when <the old shape> is still present.
 
     Args:
-        config: The resolved config, already flattened to plain dicts.
+        config: The config as the user wrote it, resolved to plain dicts.
     """
     ...
     raise ValueError(
@@ -43,10 +43,11 @@ def reject_outdated_<thing>(config: dict[str, Any]) -> None:
     )
 ```
 
-`check_outdated_config` normalizes the input (one recursive `model_dump`), so your
-function receives plain dicts and must not repeat that. If the key lives on a training
-backend block, iterate `_train_backend_configs` instead of re-deriving where `policy`,
-`value`, `teacher`, `teachers[i]` and `env.reward_model` are.
+Every training entrypoint calls `check_outdated_config(config)` on the resolved config
+before it builds the `MasterConfig`, so your function runs on the first line of every
+run and receives the config as the user wrote it -- plain dicts, no pydantic. If the key
+lives on a training backend block, iterate `_train_backend_configs` instead of
+re-deriving where `policy`, `value`, `teacher`, `teachers[i]` and `env.reward_model` are.
 
 The message is the whole point. State what is wrong and what to write instead — a user
 who only reads the exception should be able to fix their YAML. Do not write "deprecated"
@@ -86,12 +87,15 @@ startup.
 ## Where the check must NOT go
 
 Not in the consumer. A check next to the code that reads the key only fires if that code
-path runs, which is how the `metric_name` format check ended up living in six copies
-across five algorithms and only firing at the first checkpoint save.
+path runs, which is how the `metric_name` format check ended up living in nine copies
+across six algorithms and only firing at the first checkpoint save.
 
-Entrypoints call `check_outdated_config(config)` immediately after the `MasterConfig` is
-built. `tests/unit/utils/test_outdated_config_checks.py::test_every_entrypoint_checks_outdated_config`
-enforces that a new `run_*.py` cannot skip it.
+Not after schema validation either. Entrypoints call `check_outdated_config(config)` on
+the resolved config **before** building the `MasterConfig`: pydantic rejects a missing
+required key on its own terms, so a check that runs later can never explain a removal
+that changed such a key's shape -- the user sees `data.train Field required` instead of
+the migration guide. `tests/unit/utils/test_outdated_config_checks.py::test_every_entrypoint_checks_outdated_config`
+enforces that a new `run_*.py` cannot skip the call, and that it comes first.
 
 ## Exemptions
 
