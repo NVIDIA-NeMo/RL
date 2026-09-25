@@ -270,6 +270,7 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
         [1.0, 0.0],
         mask_sample=[True, False],
         fallback_weight_version=9,
+        latest_weight_version=10,
         prompt_idx=17,
         loss_multiplier=0.25,
     )
@@ -277,8 +278,9 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
     assert finalized.meta is not None
     assert finalized.meta.sample_ids == rollout_ids
     assert [tag["prompt_idx"] for tag in finalized.meta.tags] == [17, 17]
-    # Group staleness comes from the valid rollout's calls (wv 4), not the fallback.
-    assert (finalized.group_min_wv, finalized.group_max_wv) == (4, 4)
+    # Start comes from the oldest call; end includes a live refit that may have
+    # happened inside that same long-running call.
+    assert (finalized.group_min_wv, finalized.group_max_wv) == (4, 10)
     assert finalized.metrics["finalize/invalid_row_rate"] == 0.5
     assert finalized.metrics["finalize/terminal_selection_heuristic_count"] == 1.0
     assert finalized.metrics["finalize/terminal_selection_heuristic_fraction"] == 0.5

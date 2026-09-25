@@ -90,6 +90,7 @@ def _request() -> ReassemblyRequest:
         rewards=(1.0,),
         mask_sample=(False,),
         fallback_weight_version=3,
+        end_weight_version=3,
     )
 
 
