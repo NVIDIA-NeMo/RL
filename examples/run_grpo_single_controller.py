@@ -55,6 +55,7 @@ from nemo_rl.utils.config import (
     register_omegaconf_resolvers,
 )
 from nemo_rl.utils.logger import get_next_experiment_dir
+from nemo_rl.utils.outdated_config_checks import check_outdated_config
 
 # Drop examples/ from sys.path so examples/nemo_gym/ (no __init__.py) doesn't
 # shadow the real nemo_gym package as a namespace package.
@@ -96,6 +97,7 @@ def main() -> None:
 
     config = OmegaConf.to_container(config, resolve=True)
     config = MasterConfig(**config)
+    check_outdated_config(config)
     print("Applied CLI overrides")
 
     if is_ppo_run(config):
