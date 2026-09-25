@@ -928,6 +928,7 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(tmp_path) -> None
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = object.__new__(controller_cls)
         _init_recovery_telemetry(controller, train_steps=7)
+        controller._restored_replay_groups_to_regenerate = []
         controller._sampler = sampler
         controller._rollout_manager = rollout_manager
         controller._master_config = SimpleNamespace(
@@ -1045,6 +1046,7 @@ def test_recovery_readmits_one_reserved_batch_only_once(tmp_path) -> None:
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = object.__new__(controller_cls)
         _init_recovery_telemetry(controller, train_steps=7)
+        controller._restored_replay_groups_to_regenerate = []
         controller._sampler = sampler
         controller._rollout_manager = rollout_manager
         controller._master_config = SimpleNamespace(
@@ -1203,6 +1205,7 @@ def test_recovery_load_does_not_require_every_unfinished_group_to_fit_at_once(
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = object.__new__(controller_cls)
         controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+        controller._restored_replay_groups_to_regenerate = []
         controller._rollout_manager = rollout_manager
         controller._master_config = SimpleNamespace(
             token_capture=SimpleNamespace(enabled=False)

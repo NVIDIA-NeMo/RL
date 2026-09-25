@@ -59,6 +59,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     REPLAY_BUFFER_METADATA_STORAGE,
     DataPlaneCheckpointBarrier,
     DataPlaneCheckpointMetadata,
+    DataPlaneMutationCut,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSamplerConfig,
@@ -503,6 +504,7 @@ class _FakeRolloutManager:
         self._tq_buffer = None
         self.recovery_ledger = RolloutRecoveryLedger()
         self._events = events
+        self.reserved_prompts: list[dict[str, Any]] = []
         self.telemetry = {
             "committed_groups": 0,
             "committed_output_tokens": 0,
@@ -515,6 +517,25 @@ class _FakeRolloutManager:
 
     def set_weight_version(self, version: int) -> None:
         self.weight_versions.append(version)
+
+    def reserve_prompt_group(
+        self,
+        cut: Any,
+        input_sample: dict[str, Any],
+        *,
+        target_step: Optional[int],
+        admitted: bool = True,
+        admission_id: Optional[str] = None,
+    ) -> str:
+        del cut, admission_id
+        self.reserved_prompts.append(
+            {
+                "prompt": input_sample,
+                "target_step": target_step,
+                "admitted": admitted,
+            }
+        )
+        return f"regenerated-{len(self.reserved_prompts)}"
 
     def suspend_request_deadlines(self) -> None:
         if self._events is not None:
@@ -560,6 +581,7 @@ class _FakeTQBuffer:
         self.load_return = load_return
         self.metadata_state_dict_calls: list[int] = []
         self.load_calls: list[dict[str, Any]] = []
+        self.remove_calls: list[dict[str, Any]] = []
         self.checkpoint_barrier: Optional[DataPlaneCheckpointBarrier] = None
         self.training_claims: list[dict[str, Any]] = []
 
@@ -650,6 +672,10 @@ class _FakeTQBuffer:
         ]
         return self.load_return
 
+    async def remove(self, idxs: list[int], remove_in_dp: bool) -> int:
+        self.remove_calls.append({"idxs": list(idxs), "remove_in_dp": remove_in_dp})
+        return len(idxs)
+
 
 # Default position sentinel the fake dataloader reports via state_dict().
 _SENTINEL_DL_STATE = {"fake_position": 42}
@@ -663,9 +689,16 @@ class _FakeDataloader(list):
     train_dataloader.pt.
     """
 
-    def __init__(self, batches: Any = (), state: Optional[dict[str, Any]] = None):
+    def __init__(
+        self,
+        batches: Any = (),
+        state: Optional[dict[str, Any]] = None,
+        dataset: Optional[Any] = None,
+    ) -> None:
         super().__init__(batches)
         self._state = dict(state) if state is not None else dict(_SENTINEL_DL_STATE)
+        self.dataset = dataset
+        self.collate_fn = None
 
     def state_dict(self) -> dict[str, Any]:
         return dict(self._state)
@@ -690,6 +723,7 @@ def _actor_master_config(
     data_plane_checkpoint: bool = True,
     rollout_checkpoint_attempt_interval_s: Optional[float] = None,
     token_capture_enabled: bool = False,
+    load_replay_buffer: bool = True,
 ) -> MasterConfig:
     """MasterConfig for in-process SingleControllerActor tests.
 
@@ -735,6 +769,7 @@ def _actor_master_config(
             "save_period": save_period,
             "save_optimizer": save_optimizer,
             "save_data_plane": data_plane_checkpoint,
+            "load_replay_buffer": load_replay_buffer,
             "checkpoint_must_save_by": checkpoint_must_save_by,
             "ft_save_period": ft_save_period,
         },
@@ -3015,6 +3050,148 @@ class TestReplayBufferPersistence:
         assert result["train_steps"] == 0
         # run()'s finally must tear the synchronizer down exactly once.
         assert actor._weight_synchronizer.shutdown_count == 1
+
+    @pytest.mark.parametrize(
+        ("checkpointing_enabled", "save_data_plane"),
+        [(True, True), (False, True), (False, False)],
+    )
+    def test_replay_free_restore_discards_rows_and_queues_original_prompt(
+        self, tmp_path, checkpointing_enabled, save_data_plane
+    ):
+        ckpt_dir = tmp_path / "resume_ckpt"
+        ckpt_dir.mkdir()
+        group = {
+            "meta": KVBatchMeta(
+                partition_id=_PARTITION_ID,
+                task_name=None,
+                sample_ids=["g0-0", "g0-1"],
+                sequence_lengths=[16, 16],
+                tags=[
+                    {"weight_version": 0, "prompt_idx": 1},
+                    {"weight_version": 0, "prompt_idx": 1},
+                ],
+            ),
+            "start_weight": 0,
+            "end_weight": 0,
+            "target_step": 3,
+            "group_id": "g0",
+        }
+        envelope = {"groups": [group]}
+        torch.save(envelope, ckpt_dir / REPLAY_BUFFER_METADATA_FILENAME)
+        mc = _actor_master_config(
+            tmp_path,
+            enabled=checkpointing_enabled,
+            max_num_steps=0,
+            buffer_checkpoint=True,
+            data_plane_checkpoint=save_data_plane,
+            load_replay_buffer=False,
+        )
+        buffer = _FakeTQBuffer(load_return=1)
+
+        class RecordingRolloutManager(_FakeRolloutManager):
+            def reserve_prompt_group(
+                self,
+                cut: DataPlaneMutationCut,
+                input_sample: dict[str, Any],
+                *,
+                target_step: Optional[int],
+                admitted: bool = True,
+                admission_id: Optional[str] = None,
+            ) -> str:
+                super().reserve_prompt_group(
+                    cut,
+                    input_sample,
+                    target_step=target_step,
+                    admitted=admitted,
+                    admission_id=admission_id,
+                )
+                return self.recovery_ledger.reserve_group(
+                    cut,
+                    prompt_id=str(input_sample["idx"]),
+                    prompt_payload=input_sample,
+                    expected_generations=2,
+                    target_step=target_step,
+                    start_weight_version=0,
+                    admitted=admitted,
+                    admission_id=admission_id,
+                ).group_id
+
+        rollout_manager = RecordingRolloutManager()
+        rollout_manager.generate_and_push = AsyncMock()
+        dataloader = _FakeDataloader(
+            dataset=[{"idx": 0}, {"idx": 1, "message_log": ["fresh"]}]
+        )
+
+        async def _restore() -> Any:
+            actor = _ACTOR_CLS(
+                mc,
+                _make_actor_args(
+                    tq_buffer=buffer,
+                    rollout_manager=rollout_manager,
+                    dataloader=dataloader,
+                    dp_client=_FakeDPClient(sample_ids=["g0-0", "g0-1"]),
+                    last_checkpoint_path=str(ckpt_dir),
+                    data_plane_checkpoint_metadata=(
+                        _data_plane_checkpoint_metadata(group_count=1)
+                    ),
+                ),
+                SetupTimingMetrics(),
+            )
+            restored = await actor._maybe_restore_replay_buffer()
+            await actor._maybe_restore_rollout_recovery(restored_replay_groups=restored)
+            assert actor._buffer_capacity._value == 4
+            actor._rollout_permitted.set()
+            try:
+                await asyncio.wait_for(actor._rollout_pump(), timeout=5)
+            finally:
+                actor._checkpointer.shutdown()
+            return actor
+
+        actor = asyncio.run(_restore())
+
+        assert buffer.remove_calls == [{"idxs": [0], "remove_in_dp": True}]
+        rollout_manager.generate_and_push.assert_awaited_once()
+        dispatch = rollout_manager.generate_and_push.await_args
+        assert dispatch.args == ({"idx": 1, "message_log": ["fresh"]},)
+        assert dispatch.kwargs["target_step"] == 3
+        assert dispatch.kwargs["lineage_group_id"] in {
+            group.group_id for group in rollout_manager.recovery_ledger.groups()
+        }
+        assert actor._buffer_capacity._value == 3
+        assert rollout_manager.reserved_prompts == [
+            {
+                "prompt": {"idx": 1, "message_log": ["fresh"]},
+                "target_step": 3,
+                "admitted": True,
+            }
+        ]
+
+    @pytest.mark.parametrize("dataset_idx", [99, True])
+    def test_replay_free_restore_rejects_changed_prompt_identity(self, dataset_idx):
+        actor = object.__new__(_ACTOR_CLS)
+        actor._dataloader = _FakeDataloader(dataset=[{"idx": 0}, {"idx": dataset_idx}])
+        actor._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+        actor._rollout_manager = _FakeRolloutManager()
+        actor._restored_replay_groups_to_regenerate = [
+            {
+                "meta": KVBatchMeta(
+                    partition_id=_PARTITION_ID,
+                    task_name=None,
+                    sample_ids=["g0-0", "g0-1"],
+                    tags=[{"prompt_idx": 1}, {"prompt_idx": 1}],
+                ),
+                "target_step": 3,
+                "group_id": "g0",
+            }
+        ]
+
+        async def regenerate() -> None:
+            async with actor._data_plane_checkpoint_barrier.mutation() as cut:
+                await actor._queue_restored_replay_groups_for_regeneration(cut)
+
+        with pytest.raises(ValueError, match="prompt"):
+            asyncio.run(regenerate())
+        assert actor._rollout_manager.reserved_prompts == []
 
     def test_restored_permits_are_released_by_a_live_pump(self, tmp_path):
         # The restore takes one capacity permit per group; a running pump must
