@@ -146,9 +146,7 @@ def test_generation_cut_receipts_are_filtered_by_model_server() -> None:
         {"workers": [{"generation_cut_receipt": other_receipt}]},
     )
 
-    assert gym_generation_cut_receipts(proofs, server_name="policy") == [
-        policy_receipt
-    ]
+    assert gym_generation_cut_receipts(proofs, server_name="policy") == [policy_receipt]
 
 
 def _capability(component: str, name: str, **overrides):

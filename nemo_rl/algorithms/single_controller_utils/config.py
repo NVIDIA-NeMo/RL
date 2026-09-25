@@ -753,9 +753,9 @@ class GymRolloutCheckpointConfig(BaseModel, extra="forbid"):
     active generation prefixes.
     """
 
-    mode: Literal[
-        "disabled", "discover", "turn_recovery", "prefix_recovery"
-    ] = "disabled"
+    mode: Literal["disabled", "discover", "turn_recovery", "prefix_recovery"] = (
+        "disabled"
+    )
     # Stage an in-flight call's accumulated tokens once its unstaged segment
     # reaches this many tokens. 0 disables periodic chunk flushing.
     generation_chunk_flush_tokens: Annotated[int, Field(ge=0)] = 0

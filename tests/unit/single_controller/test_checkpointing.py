@@ -1755,13 +1755,13 @@ class TestPeriodicRolloutCheckpoint:
         with pytest.raises(ValidationError, match="restore_mode"):
             RolloutCheckpointConfig.model_validate({"restore_mode": "none"})
 
-    def test_generation_prefix_cuts_require_gym_participant_checkpointing(self):
+    def test_generation_chunk_flush_requires_prefix_recovery_mode(self):
         with pytest.raises(
             ValidationError,
-            match="generation_prefix_cuts_enabled=true requires",
+            match="gym.mode=prefix_recovery",
         ):
             RolloutCheckpointConfig.model_validate(
-                {"gym": {"generation_prefix_cuts_enabled": True}}
+                {"gym": {"generation_chunk_flush_tokens": 128}}
             )
 
     @pytest.mark.parametrize(

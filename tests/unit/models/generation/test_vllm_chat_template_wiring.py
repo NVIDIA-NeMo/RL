@@ -26,6 +26,7 @@ module tree and inspect what each consumer was constructed with.
 """
 
 import sys
+import threading
 import types
 from unittest.mock import MagicMock
 
@@ -195,6 +196,8 @@ def _build_server(
     worker._http_engine_client = MagicMock(
         model_config="http-model-config", renderer="http-renderer"
     )
+    worker._capture_calls = {}
+    worker._capture_registry_lock = threading.Lock()
     worker._generation_prefix_cuts_enabled = generation_prefix_cuts_enabled
     worker.llm_async_engine_args = MagicMock()
     worker.llm_async_engine_args.create_model_config.return_value = MagicMock(
