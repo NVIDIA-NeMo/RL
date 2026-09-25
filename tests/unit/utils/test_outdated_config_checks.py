@@ -85,3 +85,18 @@ def test_split_dataset_config_passes():
 
 def test_absent_data_section_passes():
     check_outdated_config({"policy": {}})
+
+
+@pytest.mark.parametrize("metric_name", ["val:accuracy", "train:loss", None])
+def test_current_metric_name_format_passes(metric_name):
+    check_outdated_config({"checkpointing": {"metric_name": metric_name}})
+
+
+@pytest.mark.parametrize("metric_name", ["val_loss", "accuracy", "reward"])
+def test_bare_metric_name_is_rejected(metric_name):
+    with pytest.raises(ValueError, match=r"must start with 'train:' or 'val:'"):
+        check_outdated_config({"checkpointing": {"metric_name": metric_name}})
+
+
+def test_absent_checkpointing_passes():
+    check_outdated_config({"policy": {}})
