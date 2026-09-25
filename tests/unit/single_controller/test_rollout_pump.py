@@ -107,9 +107,12 @@ def _init_pump_ledgers(ctrl: Any) -> None:
     ctrl._finalizer_actors = []
     ctrl._replacement_reserve = deque()
     ctrl._rollout_recovery_enabled = False
+    ctrl._gym_participant_checkpointing_enabled = False
     ctrl._rollout_slot_waiters = 0
     ctrl._rollout_permitted_waiters = 0
     ctrl._buffer_capacity_waiters = 0
+    ctrl._gym_checkpoint_rollout_permitted = asyncio.Event()
+    ctrl._gym_checkpoint_rollout_permitted.set()
     ctrl._rollout_completion_durations_s = deque(maxlen=10_000)
     ctrl._rollout_queue_wait_durations_s = deque(maxlen=10_000)
 

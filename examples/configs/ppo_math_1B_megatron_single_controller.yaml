@@ -105,6 +105,8 @@ async_rl:
       # Re-send just the rows that never arrived before retrying the whole group.
       # Gym's stream dies on its first failing row, so one bad row loses every later
       # one; recovering those individually beats redoing all N.
+      # Must be 1 when token_capture.enabled=true; durable retries then create a new
+      # recovery-ledger attempt instead of reusing one physical Gym execution identity.
       max_row_attempts: 3
 
   # Last-resort stall detection. stall_timeout_s must exceed interval_s and every
@@ -185,6 +187,15 @@ rollout_checkpointing:
   # Every config path not excluded here or by NeMo-RL's built-in denylist must
   # match before a bootstrap rollout snapshot can be restored.
   extra_fingerprint_excluded_paths: []
+  # Experimental multi-turn NeMo-Gym checkpoint control-plane discovery.
+  # Requires a Gym revision exposing the /ng-control/v1 checkpoint protocol.
+  gym:
+    capability_discovery_enabled: false
+    # Adds prepared Gym model, agent, and resources state to each rollout
+    # snapshot. Requires token capture and completed-result acknowledgement in
+    # the Gym agent participant.
+    participant_checkpointing_enabled: false
+    prepare_timeout_s: 300
 
 policy:
   tokenizer:
