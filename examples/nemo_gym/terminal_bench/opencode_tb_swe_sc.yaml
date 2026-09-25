@@ -1,0 +1,127 @@
+# Terminal Bench and SWE rows in one run on 4 training + 4 generation nodes,
+# 32 prompts x 16 generations per step, one single-GPU vLLM engine per GPU.
+# Terminal Bench rows route by task_source (tb_resources); SWE rows by
+# agent_ref.name = <server>_opencode_sandboxed_agent.
+# Launch with examples/nemo_gym/terminal_bench/launch.sh and
+# CONFIG=examples/nemo_gym/terminal_bench/opencode_tb_swe_sc.yaml NUM_TRAIN_NODES=4 NUM_GEN_NODES=4.
+defaults: opencode_sc.yaml
+
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
+
+# On-policy: the next step's prompts are dispatched only after this step trains.
+async_rl:
+  sampler:
+    name: in_order
+    max_lookahead_versions: 0  # max_staleness_versions from opencode_sc.yaml is ignored by in_order
+  min_groups_for_streaming_train: 8
+  max_inflight_prompts: 32
+  max_buffered_rollouts: 32
+
+# A checkpoint after every step (only the newest kept) and every 5th step kept for good.
+checkpointing:
+  save_period: 5
+  keep_top_k: null
+  ft_save_period: 1
+  ft_keep_latest_k: 1
+  checkpoint_must_save_by: "00:03:30:00"  # 4 h walltime with room for the async save
+
+policy:
+  megatron_cfg:
+    expert_model_parallel_size: 16
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 1
+
+env:
+  nemo_gym:
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - responses_api_agents/opencode_sandboxed_agent/configs/opencode_sandboxed_agent.yaml
+      - resources_servers/terminal_bench_2_1/configs/terminal_bench_2_1.yaml
+      - resources_servers/swe_rebench/configs/swe_rebench_opencode.yaml
+      - resources_servers/scale_swe/configs/scale_swe_opencode.yaml
+      - resources_servers/swemer_v1/configs/swemer_v1_opencode.yaml
+      - resources_servers/swemer_v2/configs/swemer_v2_opencode.yaml
+      - resources_servers/swe_next/configs/swe_next_opencode.yaml
+      - nemo_gym/sandbox/providers/opensandbox/configs/opensandbox.yaml
+    # SWE agents: the policy's context window, a one-hour harness budget, rows from
+    # data.train only, and OpenCode from the shared harness path.
+    swe_rebench_opencode_sandboxed_agent:
+      responses_api_agents:
+        opencode_sandboxed_agent:
+          opencode_max_context_window: ${policy.max_total_sequence_length}
+          sandbox_timeout: 3600
+          datasets: []
+          remote_opencode_install_script_path: /mnt/s3-data/data/harness/opencode/install.sh
+          remote_opencode_binary_path: /mnt/s3-data/data/harness/opencode/linux-x64/1.17.11/opencode
+    scale_swe_opencode_sandboxed_agent:
+      responses_api_agents:
+        opencode_sandboxed_agent:
+          opencode_max_context_window: ${policy.max_total_sequence_length}
+          sandbox_timeout: 3600
+          datasets: []
+          remote_opencode_install_script_path: /mnt/s3-data/data/harness/opencode/install.sh
+          remote_opencode_binary_path: /mnt/s3-data/data/harness/opencode/linux-x64/1.17.11/opencode
+    swemer_v1_opencode_sandboxed_agent:
+      responses_api_agents:
+        opencode_sandboxed_agent:
+          opencode_max_context_window: ${policy.max_total_sequence_length}
+          sandbox_timeout: 3600
+          datasets: []
+          remote_opencode_install_script_path: /mnt/s3-data/data/harness/opencode/install.sh
+          remote_opencode_binary_path: /mnt/s3-data/data/harness/opencode/linux-x64/1.17.11/opencode
+    swemer_v2_opencode_sandboxed_agent:
+      responses_api_agents:
+        opencode_sandboxed_agent:
+          opencode_max_context_window: ${policy.max_total_sequence_length}
+          sandbox_timeout: 3600
+          datasets: []
+          remote_opencode_install_script_path: /mnt/s3-data/data/harness/opencode/install.sh
+          remote_opencode_binary_path: /mnt/s3-data/data/harness/opencode/linux-x64/1.17.11/opencode
+    swe_next_opencode_sandboxed_agent:
+      responses_api_agents:
+        opencode_sandboxed_agent:
+          opencode_max_context_window: ${policy.max_total_sequence_length}
+          sandbox_timeout: 3600
+          datasets: []
+          remote_opencode_install_script_path: /mnt/s3-data/data/harness/opencode/install.sh
+          remote_opencode_binary_path: /mnt/s3-data/data/harness/opencode/linux-x64/1.17.11/opencode
+    # SWE servers: a 20-minute verification budget and the OpenCode version the
+    # staged install.sh reads from the sandbox environment.
+    swe_rebench_resources_server:
+      resources_servers:
+        swe_rebench:
+          evaluation_timeout: 1200
+          sandbox_config:
+            env:
+              OPENCODE_VERSION: "1.17.11"
+    scale_swe_resources_server:
+      resources_servers:
+        scale_swe:
+          evaluation_timeout: 1200
+          sandbox_config:
+            env:
+              OPENCODE_VERSION: "1.17.11"
+    swemer_v1_resources_server:
+      resources_servers:
+        swemer_v1:
+          evaluation_timeout: 1200
+          sandbox_config:
+            env:
+              OPENCODE_VERSION: "1.17.11"
+    swemer_v2_resources_server:
+      resources_servers:
+        swemer_v2:
+          evaluation_timeout: 1200
+          sandbox_config:
+            env:
+              OPENCODE_VERSION: "1.17.11"
+    swe_next_resources_server:
+      resources_servers:
+        swe_next:
+          evaluation_timeout: 1200
+          sandbox_config:
+            env:
+              OPENCODE_VERSION: "1.17.11"
