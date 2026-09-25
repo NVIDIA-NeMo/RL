@@ -1011,6 +1011,9 @@ def _mask_gate_result():
         ],
         "full_result": {
             "reward": 1.0,
+            # Both forms of the env mask flag: the verify response's
+            # first-class field and the older instance_config mapping.
+            "mask_sample": True,
             "instance_config": {"mask_sample": True, "other_key": "kept"},
         },
     }
@@ -1020,6 +1023,7 @@ def test_result_to_completion_keeps_mask_flag_when_gate_on():
     completion = _nemo_gym_impl(True)._results_to_completions([_mask_gate_result()])[0][
         0
     ]
+    assert completion.env_extras["mask_sample"] is True
     assert completion.env_extras["instance_config"]["mask_sample"] is True
 
 
@@ -1027,6 +1031,7 @@ def test_result_to_completion_drops_mask_flag_when_gate_off():
     completion = _nemo_gym_impl(False)._results_to_completions([_mask_gate_result()])[
         0
     ][0]
+    assert "mask_sample" not in completion.env_extras
     assert "mask_sample" not in completion.env_extras["instance_config"]
     assert completion.env_extras["instance_config"]["other_key"] == "kept"
 

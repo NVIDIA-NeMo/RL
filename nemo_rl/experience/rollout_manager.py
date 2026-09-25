@@ -1425,8 +1425,9 @@ class AsyncNemoGymRolloutImpl:
         # from the completion's env_extras.
         if not self._mask_env_flagged_samples:
             for result in results:
+                result["full_result"].pop(MASK_SAMPLE, None)
                 (result["full_result"].get("instance_config") or {}).pop(
-                    "mask_sample", None
+                    MASK_SAMPLE, None
                 )
 
         penalty_counts = apply_reward_penalties(
@@ -2322,10 +2323,9 @@ class RolloutManager:
                     f"expected={gate_rollout_id!r}"
                 )
             mask_sample = bool(
-                (
-                    ((completion.env_extras or {}).get("instance_config") or {}).get(
-                        MASK_SAMPLE, False
-                    )
+                (completion.env_extras or {}).get(MASK_SAMPLE)
+                or ((completion.env_extras or {}).get("instance_config") or {}).get(
+                    MASK_SAMPLE, False
                 )
             )
 
