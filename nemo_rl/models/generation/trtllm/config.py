@@ -12,9 +12,117 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, NotRequired, TypedDict
+from typing import Any, Literal, NotRequired, Optional, TypedDict
+
+from pydantic import BaseModel, Field
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
+
+
+class TrtllmDisaggConfig(BaseModel, extra="allow"):
+    """Prefill/decode disaggregation.
+
+    A *replica* is ``num_context_engines`` context engines plus
+    ``num_generation_engines`` generation engines, fronted by one
+    ``OpenAIDisaggServer`` that exposes the single URL NeMo-Gym talks to. The
+    replica *count* is not configured: it follows from the inference cluster's
+    size, the same way the DP-shard count does without disaggregation.
+
+    Requires non-colocated generation: colocated sleeps the engines between
+    rollouts, and a replica's context and generation engines must be resident
+    together for the KV transceiver to work.
+    """
+
+    enabled: bool = False
+
+    # Engines per replica. The two are independent, so the P:D ratio is free.
+    num_context_engines: int = 1
+    num_generation_engines: int = 1
+
+    # Routing inside a replica, decided entirely by the disagg server.
+    #
+    # The context router must be *stateful* so a trajectory's turns return to
+    # the engine holding its prefix -- that engine accumulates the prefix across
+    # turns and only prefills the delta, so sending a later turn elsewhere
+    # throws the work away.
+    #
+    # The generation router need not be: a generation engine receives KV freshly
+    # from the context engine on every turn, so it has nothing worth returning
+    # to, and a wrong load guess only costs transient skew. Keeping it stateless
+    # also keeps placement local, with no coordinator process.
+    #
+    # Both are ``Literal`` rather than ``str`` because a plausible-but-wrong
+    # value is the dangerous case: ``ctx_router="round_robin"`` parses fine and
+    # silently throws away the prefix affinity the context engines depend on.
+    ctx_router: Literal["conversation", "kv_cache_aware"] = "conversation"
+    gen_router: Literal["round_robin", "load_balancing"] = "load_balancing"
+
+    # Frontend (disagg server) workers per replica. Each is its own
+    # DisaggServerActor with a distinct URL; NeMo-Gym's per-session client
+    # selection shards conversations across them, so one frontend's CPU stops
+    # being the replica's turn-throughput ceiling. 1 = single-frontend
+    # behavior. replicas * workers must be <= 256 (snowflake node_id space).
+    num_frontend_workers: int = 1
+    # Relay ctx->gen prompt token ids as one base64 int32 string instead of a
+    # 30k-int JSON array (TRT-LLM DisaggServerConfig.gen_tokids_ctxbytes).
+    gen_tokids_ctxbytes: bool = False
+    # Strip the conversation history from the generation leg; the relayed
+    # token ids carry the full prefix, so the generation adapter never needs
+    # the messages (DisaggServerConfig.gen_strip_message_history).
+    gen_strip_message_history: bool = False
+    # Frontends render the chat template and tokenize (via the adapters'
+    # exact shared pipeline) and attach prompt_token_ids_b64 to the ctx leg,
+    # so the single ctx adapter process does no template work. Guarded by
+    # ctx-side shadow validation (NRL_TRTLLM_TOKENIZE_SHADOW_RATE).
+    frontend_tokenize: bool = False
+    # Base port for the frontend workers' deterministic ports
+    # (base + replica_idx * num_frontend_workers + frontend_idx). Deterministic
+    # so a restarted frontend actor re-binds the SAME port and its URL stays
+    # valid; keep the range outside virtual_cluster's random master-port window
+    # (1400-1999).
+    frontend_base_port: int = 17300
+
+    # Mapped onto TRT-LLM's CacheTransceiverConfig.
+    cache_transceiver_backend: Literal["DEFAULT", "UCX", "NIXL", "MOONCAKE", "MPI"] = (
+        "DEFAULT"
+    )
+
+    # "CPP" | "PYTHON". TRT-LLM defaults to "auto", which only adopts
+    # the model's preferred runtime when the effective backend supports it and
+    # silently falls back to the C++ transceiver otherwise -- and that fallback
+    # is not what a hybrid Mamba model wants: the recurrent-state handoff needs
+    # the Python (v2) transceiver. Left unset here so TRT-LLM keeps its own
+    # default; set it explicitly to force one.
+    cache_transceiver_runtime: Optional[Literal["CPP", "PYTHON"]] = None
+
+    # MiB of bounce buffer, or 0 to keep the per-block path. Bounce coalesces a
+    # request's scattered per-block KV into one contiguous fabric-VMM buffer and
+    # issues a single multi-rail NIXL write, which sidesteps registering every
+    # VMM-split block descriptor individually -- the step that fails here with
+    # "registerMem: registration failed for the specified or all potential
+    # backends". Only the Python (v2) transceiver reads it.
+    kv_cache_bounce_size_mb: Optional[int] = None
+    max_tokens_in_buffer: Optional[int] = None
+
+    # Milliseconds before an unfinished KV transfer is cancelled on either
+    # side. TRT-LLM's default (60 s) is tuned for short prompts at low
+    # concurrency; at high rollout concurrency the ctx-side timeout can fire
+    # in bulk and the resulting cancel/retry churn stresses the transceiver,
+    # so large multi-turn workloads want a much larger value.
+    kv_transfer_timeout_ms: Optional[int] = None
+
+    # Per-role overrides merged over trtllm_cfg. Any trtllm_cfg key goes here --
+    # tensor_parallel_size and the MoE split are the ones that usually differ,
+    # and each role must satisfy moe_tp * moe_ep == its own TP. A role may also
+    # carry its own ``trtllm_kwargs`` (including ``kv_cache_config``) when
+    # prefill and decode want different engine tuning. Genuinely an arbitrary
+    # TRT-LLM passthrough, so ``dict[str, Any]`` is the right type here.
+    ctx_trtllm_kwargs: dict[str, Any] = Field(default_factory=dict)
+    gen_trtllm_kwargs: dict[str, Any] = Field(default_factory=dict)
+
+    def role_trtllm_kwargs(self, role: Literal["ctx", "gen"]) -> dict[str, Any]:
+        """One role's engine overrides, selected without attribute reflection."""
+        return self.ctx_trtllm_kwargs if role == "ctx" else self.gen_trtllm_kwargs
 
 
 class TrtllmSpecificArgs(TypedDict):
@@ -43,6 +151,7 @@ class TrtllmSpecificArgs(TypedDict):
     # grpo.async_grpo so they cannot diverge).
     in_flight_weight_updates: NotRequired[bool]
     recompute_kv_cache_after_weight_updates: NotRequired[bool]
+    disaggregation: NotRequired[TrtllmDisaggConfig]
     default_chat_template_kwargs: NotRequired[dict[str, Any]]
     # TRT-LLM's registered parser names:
     #   "qwen3"       -> Qwen3ToolParser      (JSON format: {"name":..., "arguments":{...}})
@@ -57,3 +166,18 @@ class TrtllmConfig(GenerationConfig):
     # covered by TrtllmSpecificArgs (e.g. sampler_type, enable_attention_dp).
     # Spread into the engine constructor as `**trtllm_kwargs`.
     trtllm_kwargs: NotRequired[dict[str, Any]]
+
+
+def resolve_trtllm_disagg_config(config: TrtllmConfig) -> TrtllmDisaggConfig:
+    """Validate ``trtllm_cfg.disaggregation`` into its schema.
+
+    Absent is the same as present-and-disabled: every field carries its default
+    on :class:`TrtllmDisaggConfig`, so callers read attributes unconditionally
+    instead of re-deriving a default per key at the call site.
+    """
+    raw = config["trtllm_cfg"].get("disaggregation")
+    if raw is None:
+        return TrtllmDisaggConfig()
+    if isinstance(raw, TrtllmDisaggConfig):
+        return raw
+    return TrtllmDisaggConfig.model_validate(raw)
