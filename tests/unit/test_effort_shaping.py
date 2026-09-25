@@ -344,6 +344,7 @@ def test_rollout_manager_forwards_effort_config():
         "num_generations_per_prompt": 1,
         "max_seq_len": 1,
         "rollout_recovery_config": RolloutRecoveryConfig(),
+        "gym_acknowledgement_sink": None,
         "generation_config": _GENERATION_CONFIG,
         "use_nemo_gym": True,
     }

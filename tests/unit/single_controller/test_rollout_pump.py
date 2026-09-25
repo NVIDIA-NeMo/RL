@@ -1423,6 +1423,7 @@ def test_rollout_pump_writes_expected_tq_data(
         num_generations_per_prompt=num_generations,
         max_seq_len=max_seq_len,
         rollout_recovery_config=RolloutRecoveryConfig(),
+        gym_acknowledgement_sink=None,
         max_rollout_turns=max_rollout_turns,
         policy_generation=vllm_generation,
         use_nemo_gym=False,

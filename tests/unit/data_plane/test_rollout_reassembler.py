@@ -133,6 +133,62 @@ def test_finalize_rollout_reproduces_the_golden_row(tq_client, partitions):
     assert (row.min_wv, row.max_wv) == (4, 4)
 
 
+def test_finalize_rollout_rebuilds_a_chain_across_recovery_attempts(
+    tq_client, partitions
+):
+    current_attempt = "recovered-a1"
+    source_attempt = "recovered"
+    records, receipt, expected = build_fixture_artifacts(
+        "worked_example", rollout_id=current_attempt
+    )
+    source_values = records[0].model_dump()
+    source_values["rollout_id"] = source_attempt
+    source_values["digest"] = compute_staging_digest(
+        schema_version=records[0].schema_version,
+        digest_version=records[0].digest_version,
+        extras_digest_version=records[0].extras_digest_version,
+        rollout_id=source_attempt,
+        model_call_id=records[0].model_call_id,
+        parent_call_id=records[0].parent_call_id,
+        mode=records[0].mode,
+        prev_len=records[0].prev_len,
+        delta_len=records[0].delta_len,
+        cum_len=records[0].cum_len,
+        weight_version=records[0].weight_version,
+        token_ids_delta=records[0].token_ids_delta,
+        token_mask_delta=records[0].token_mask_delta,
+        generation_log_probs_delta=records[0].generation_log_probs_delta,
+        extras_digest=records[0].extras_digest,
+        chain_hash=records[0].chain_hash,
+        cumulative_hash=records[0].cumulative_hash,
+    )
+    source_record = StagedCallRecord.model_validate(source_values)
+    sink = TQTokenSink(tq_client, staging_partition=STAGING_PARTITION)
+    assert sink.stage(source_record).ok
+    assert sink.stage(records[1]).ok
+    manifest = [
+        receipt.manifest[0].model_copy(
+            update={
+                "capture_key": source_attempt,
+                "staging_key": source_record.staging_key,
+                "digest": source_record.digest,
+            }
+        ),
+        receipt.manifest[1].model_copy(update={"capture_key": current_attempt}),
+    ]
+    recovered_receipt = receipt.model_copy(update={"manifest": manifest})
+
+    row = _finalizer(tq_client).finalize_rollout(
+        current_attempt,
+        recovered_receipt.model_dump(),
+        reward=1.0,
+    )
+
+    assert row.valid, row.rejection_reason
+    assert row.token_ids == expected.token_ids
+    assert row.staging_keys == [source_record.staging_key, records[1].staging_key]
+
+
 def test_finalize_rollout_rejections(tq_client, partitions):
     finalizer = _finalizer(tq_client)
     assert (

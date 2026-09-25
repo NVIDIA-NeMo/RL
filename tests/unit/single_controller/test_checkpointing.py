@@ -858,6 +858,7 @@ def _sealed_recovery_ledger(staging_key: str) -> RolloutRecoveryLedger:
                 },
                 reward=1.0,
                 mask_sample=False,
+                resolved_agent_name="test-agent",
             )
 
     asyncio.run(seed())
