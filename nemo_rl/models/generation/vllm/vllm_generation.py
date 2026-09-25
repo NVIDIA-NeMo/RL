@@ -34,6 +34,7 @@ from ray.util.placement_group import PlacementGroup
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SlicedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
+from nemo_rl.distributed.refit_watchdog import RefitAborted
 from nemo_rl.distributed.virtual_cluster import NVLINK_DOMAIN_UNKNOWN, RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 from nemo_rl.models.generation.fleet_health import (
@@ -1676,37 +1677,77 @@ class VllmGeneration(GenerationInterface):
             print(f"Error invalidating vLLM caches: {e}")
             return False
 
-    def pause_generation_for_refit(self, *, clear_cache: bool) -> bool:
+    def pause_generation_for_refit(
+        self, *, clear_cache: bool, timeout_s: Optional[float] = None
+    ) -> bool:
         """Pause every async vLLM engine while preserving in-flight requests."""
         if not self.cfg["vllm_cfg"]["async_engine"]:
-            raise RuntimeError("pause_generation_for_refit requires async_engine=True")
-        if not self.worker_group or not self.worker_group.workers:
-            raise RuntimeError("Worker group is not initialized")
-
-        futures = self.worker_group.run_all_workers_single_data(
-            "pause_generation_async",
-            clear_cache=clear_cache,
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-        )
-        if not all(ray.get(futures)):
-            raise RuntimeError("Failed to pause every async vLLM engine")
-        return True
-
-    def resume_generation_after_refit(self) -> bool:
-        """Resume every async vLLM engine paused for refit."""
-        if not self.cfg["vllm_cfg"]["async_engine"]:
-            raise RuntimeError(
-                "resume_generation_after_refit requires async_engine=True"
+            return super().pause_generation_for_refit(
+                clear_cache=clear_cache, timeout_s=timeout_s
             )
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
 
-        futures = self.worker_group.run_all_workers_single_data(
-            "resume_generation_async",
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        # Address surviving DP leaders directly. SingleController may have rebuilt the
+        # refit communicator after losing a shard; walking the whole worker group here
+        # would call the dead Ray actor and undo that recovery before the refit starts.
+        futures = [
+            worker.pause_generation_async.remote(clear_cache=clear_cache)
+            for worker in self._refit_leader_workers()
+        ]
+        try:
+            results = ray.get(futures, timeout=timeout_s)
+        except ray.exceptions.GetTimeoutError as exc:
+            raise RefitAborted(
+                f"vLLM generation pause did not return within {timeout_s}s"
+            ) from exc
+        if not all(results):
+            raise RuntimeError("Failed to pause every async vLLM engine")
+        return True
+
+    def resume_generation_after_refit(
+        self, *, timeout_s: Optional[float] = None
+    ) -> bool:
+        """Resume surviving engines; fleet health excludes confirmed actor deaths."""
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            return super().resume_generation_after_refit(timeout_s=timeout_s)
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+
+        membership = self._refit_membership
+        shard_indices = (
+            list(membership.shard_prefixes)
+            if membership is not None
+            else list(range(self.dp_size))
         )
-        if not all(ray.get(futures)):
-            raise RuntimeError("Failed to resume every async vLLM engine")
+        per_shard = (
+            membership.workers_per_shard
+            if membership is not None
+            else len(self.worker_group.workers) // self.dp_size
+        )
+        leaders = self._refit_leader_workers()
+        futures = [worker.resume_generation_async.remote() for worker in leaders]
+        # Settle all calls within one budget before inspecting failures. A dead leader
+        # must not prevent us from waiting for the surviving engines to resume.
+        _, pending = ray.wait(futures, num_returns=len(futures), timeout=timeout_s)
+        if pending:
+            raise RefitAborted(
+                f"vLLM generation resume did not return within {timeout_s}s"
+            )
+        for shard_idx, worker, future in zip(shard_indices, leaders, futures):
+            try:
+                resumed = ray.get(future)
+            except ray.exceptions.ActorDiedError as exc:
+                if self.fleet_monitor is None:
+                    raise
+                # A late error from an old actor must not condemn its replacement.
+                if self.worker_group.workers[shard_idx * per_shard] is worker:
+                    self.fleet_monitor.record_actor_death(shard_idx, error=str(exc))
+                continue
+            if not resumed:
+                raise RuntimeError("Failed to resume every async vLLM engine")
+        if self.fleet_monitor is not None:
+            self.fleet_monitor.raise_if_exhausted()
         return True
 
     @property
