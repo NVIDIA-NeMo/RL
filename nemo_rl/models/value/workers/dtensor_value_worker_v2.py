@@ -170,6 +170,11 @@ class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
             "DTensor value models require reward_model_cfg.enabled=true and reward_model_cfg.reward_model_type='regression'."
         )
 
+        if (config.get("value_head") or {"type": "scalar"})["type"] != "scalar":
+            raise NotImplementedError(
+                "Categorical value heads are only supported by the Megatron value backend."
+            )
+
         print("Initializing DTensorValueWorkerV2")
 
         # Initialize checkpoint manager

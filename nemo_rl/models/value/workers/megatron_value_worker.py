@@ -51,6 +51,7 @@ from megatron.core.rerun_state_machine import get_rerun_state_machine
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.loss_functions import CategoricalValueSupport
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import allgather_cp_sharded_tensor
 from nemo_rl.distributed.named_sharding import NamedSharding
@@ -134,7 +135,7 @@ def _install_value_head_load_skip(chunk: Any) -> None:
     chunk.hide_loss_modules = hide_loss_modules
 
 
-def make_value_head_hook(hidden_size: int, sequence_parallel: bool):
+def make_value_head_hook(hidden_size: int, sequence_parallel: bool, output_size: int = 1):
     """Build the pre-wrap hook that installs the value head and skips base loads.
 
     Megatron-Bridge's generic hook assigns ``chunk.output_layer``.  Qwen3.5 is
@@ -144,7 +145,9 @@ def make_value_head_hook(hidden_size: int, sequence_parallel: bool):
     loading checkpoints.  Plain GPT models keep the generic behavior.
     """
     base_hook = create_value_head_hook(
-        hidden_size=hidden_size, sequence_parallel=sequence_parallel
+        hidden_size=hidden_size,
+        sequence_parallel=sequence_parallel,
+        output_size=output_size,
     )
 
     def hook(model):
@@ -163,6 +166,16 @@ def make_value_head_hook(hidden_size: int, sequence_parallel: bool):
         return model
 
     return hook
+
+
+def _categorical_support(config: ValueConfig) -> Optional[CategoricalValueSupport]:
+    """Return the histogram support for a categorical value head, else ``None``."""
+    head_cfg = config.get("value_head") or {"type": "scalar"}
+    if head_cfg["type"] == "scalar":
+        return None
+    if head_cfg["type"] != "categorical":
+        raise ValueError(f"Unsupported value_head.type: {head_cfg['type']!r}")
+    return CategoricalValueSupport.from_value_head_cfg(head_cfg)
 
 
 def _unpack_value_sequences(
@@ -218,10 +231,11 @@ def _value_loss_prepare_fn(
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> tuple[dict[str, torch.Tensor], BatchedDataDict[Any]]:
-    """Prepare the value-head output for ``MseValueLossFn`` (LossPostProcessor prepare_fn).
+    """Prepare the value-head output for the value loss (LossPostProcessor prepare_fn).
 
     All-gather across CP (packed only — CP requires packing), shift right by one
     so ``values[t] = V(state before token t)``, then truncate to ``data["returns"]``.
+    A scalar head yields ``[B, S]``; a categorical head keeps its ``[B, S, K]`` logits.
     """
     values = logits
     # Drop the value head's trailing singleton ([..., 1]).
@@ -399,9 +413,15 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
         self.megatron_cfg.model.share_embeddings_and_output_weights = False
         # Replace output_layer with a hidden->1 value head before DDP wrapping, so grad
         # sync, the optimizer, dist-checkpoint save/load, PP, and SP are all inherited.
+        self.categorical_support = _categorical_support(config)
         value_head_hook = make_value_head_hook(
             hidden_size=self.megatron_cfg.model.hidden_size,
             sequence_parallel=self.megatron_cfg.model.sequence_parallel,
+            output_size=(
+                1
+                if self.categorical_support is None
+                else self.categorical_support.num_bins
+            ),
         )
 
         model_and_optimizer_state = setup_model_and_optimizer(
@@ -731,6 +751,13 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
             )
 
             def collection_fn(output_tensor):
+                if is_pipeline_last_stage(ignore_virtual=True):
+                    if self.categorical_support is None:
+                        output_tensor = output_tensor.squeeze(-1)
+                    else:
+                        output_tensor = self.categorical_support.expected_value(
+                            output_tensor
+                        )
                 # The head-owning stage returns per-token values (SP/TP already
                 # gathered in the head); other stages return hidden states whose
                 # collection output is discarded (values are broadcast from the
@@ -744,14 +771,14 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
                     # per-sequence shift + CP all-gather.
                     cp_size = get_context_parallel_world_size()
                     values = _unpack_value_sequences(
-                        output_tensor.squeeze(-1),
+                        output_tensor,
                         processed_mb.cu_seqlens_padded,
                         seq_length,
                         cp_group=get_context_parallel_group() if cp_size > 1 else None,
                     )
                 else:
                     # [B, S]: shift right by 1 so values[t] = V(state before token t).
-                    values = output_tensor.squeeze(-1)
+                    values = output_tensor
                     values = torch.cat(
                         [torch.zeros_like(values[:, :1]), values[:, :-1]], dim=1
                     )

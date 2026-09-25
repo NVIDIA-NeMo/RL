@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, NotRequired, Optional, TypedDict, TypeVar
+import math
+from typing import Any, Literal, NotRequired, Optional, TypedDict, TypeVar
 
 import torch
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 from nemo_rl.algorithms.loss.interfaces import (
     LossFunction,
@@ -1311,12 +1312,86 @@ class DistillationLossFn(LossFunction):
 
 
 class MseValueLossConfig(BaseModel, extra="forbid"):
-    """Config for the MSE value loss used by PPO's value model."""
+    """Config for the value loss used by PPO's value model.
+
+    ``type="mse"`` regresses a scalar head.  ``"hl_gauss"`` and ``"two_hot"``
+    train a categorical head (``value.value_head.type="categorical"``) with
+    cross-entropy against a histogram of the scalar return (Farebrother et al.,
+    2024, "Stop Regressing: Training Value Functions via Classification").
+    """
 
     # Scaling factor applied to the value loss before it is added to the policy loss.
     scale: float = 1.0
     # Clipping range for value predictions (PPO-style). Set to None to disable clipping.
+    # Only supported by the MSE loss.
     cliprange: Optional[float] = None
+    type: Literal["mse", "hl_gauss", "two_hot"] = "mse"
+    # HL-Gauss smoothing: sigma = hl_gauss_sigma_ratio * bin_width (paper default 0.75).
+    hl_gauss_sigma_ratio: float = 0.75
+
+    @model_validator(mode="after")
+    def _validate_classification(self) -> "MseValueLossConfig":
+        if self.type != "mse" and self.cliprange:
+            raise ValueError(
+                f"value_loss_fn.cliprange is only supported for type='mse', got type={self.type!r}"
+            )
+        if self.hl_gauss_sigma_ratio <= 0:
+            raise ValueError("value_loss_fn.hl_gauss_sigma_ratio must be positive")
+        return self
+
+
+class CategoricalValueSupport:
+    """Uniform histogram support ``[v_min, v_max]`` split into ``num_bins`` bins."""
+
+    def __init__(self, num_bins: int, v_min: float, v_max: float):
+        if num_bins < 2:
+            raise ValueError(f"categorical value head needs num_bins >= 2, got {num_bins}")
+        if not v_max > v_min:
+            raise ValueError(f"categorical value head needs v_max > v_min, got [{v_min}, {v_max}]")
+        self.num_bins = num_bins
+        self.v_min = float(v_min)
+        self.v_max = float(v_max)
+        self.bin_width = (self.v_max - self.v_min) / num_bins
+
+    @classmethod
+    def from_value_head_cfg(cls, cfg: dict[str, Any]) -> "CategoricalValueSupport":
+        return cls(cfg["num_bins"], cfg["v_min"], cfg["v_max"])
+
+    def edges(self, device: torch.device) -> torch.Tensor:
+        return torch.linspace(
+            self.v_min, self.v_max, self.num_bins + 1, device=device, dtype=torch.float32
+        )
+
+    def centers(self, device: torch.device) -> torch.Tensor:
+        edges = self.edges(device)
+        return (edges[:-1] + edges[1:]) / 2
+
+    def expected_value(self, logits: torch.Tensor) -> torch.Tensor:
+        """Map ``[..., num_bins]`` logits to the scalar mean of the categorical."""
+        probs = torch.softmax(logits.float(), dim=-1)
+        return probs @ self.centers(logits.device)
+
+    def hl_gauss_target(self, returns: torch.Tensor, sigma: float) -> torch.Tensor:
+        """Gaussian mass of N(return, sigma^2) in each bin, renormalized to the support."""
+        edges = self.edges(returns.device)
+        z = (edges - returns.float().unsqueeze(-1)) / (sigma * math.sqrt(2.0))
+        cdf = torch.special.erf(z)
+        mass = cdf[..., 1:] - cdf[..., :-1]
+        return mass / (cdf[..., -1:] - cdf[..., :1]).clamp_min(1e-12)
+
+    def two_hot_target(self, returns: torch.Tensor) -> torch.Tensor:
+        """Split each return between its two neighbouring bin centers."""
+        centers = self.centers(returns.device)
+        pos = (returns.float() - centers[0]) / self.bin_width
+        pos = pos.clamp(0, self.num_bins - 1)
+        lower = pos.floor().long().clamp(max=self.num_bins - 2)
+        upper_weight = pos - lower
+        target = torch.zeros(
+            (*returns.shape, self.num_bins), device=returns.device, dtype=torch.float32
+        )
+        target.scatter_(-1, lower.unsqueeze(-1), (1 - upper_weight).unsqueeze(-1))
+        target.scatter_add_(-1, (lower + 1).unsqueeze(-1), upper_weight.unsqueeze(-1))
+        return target
 
 
 class MseValueLossFn(LossFunction):
@@ -1443,6 +1518,129 @@ class MseValueLossFn(LossFunction):
         }
 
         return loss, metrics
+
+
+class ClassificationValueLossFn(LossFunction):
+    """Cross-entropy value loss for a categorical value head (HL-Gauss or two-hot).
+
+    The scalar return is clipped to the support and projected onto a histogram
+    target; the loss is the token-level cross-entropy between that target and
+    the head's softmax.  The critic's scalar value is the mean of the predicted
+    categorical, so GAE and all regression metrics are unchanged.
+    """
+
+    input_type = LossInputType.LOGIT
+
+    def __init__(self, cfg: MseValueLossConfig, support: CategoricalValueSupport):
+        if cfg.type not in ("hl_gauss", "two_hot"):
+            raise ValueError(f"ClassificationValueLossFn does not support type={cfg.type!r}")
+        self.scale = cfg.scale
+        self.target_type = cfg.type
+        self.support = support
+        self.sigma = cfg.hl_gauss_sigma_ratio * support.bin_width
+        self.loss_type = LossType.TOKEN_LEVEL
+
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        data: BatchedDataDict,
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Compute the categorical cross-entropy value loss."""
+        if logits.ndim != 3 or logits.shape[-1] != self.support.num_bins:
+            raise ValueError(
+                f"Expected value logits [B, S, {self.support.num_bins}], got {tuple(logits.shape)}"
+            )
+        logits = logits.float()
+        token_mask = data["token_mask"]
+        sample_mask = data["sample_mask"]
+        returns = data["returns"]
+        mask = token_mask * sample_mask.unsqueeze(-1)
+
+        clipped_returns = returns.float().clamp(self.support.v_min, self.support.v_max)
+        with torch.no_grad():
+            if self.target_type == "hl_gauss":
+                target = self.support.hl_gauss_target(clipped_returns, self.sigma)
+            else:
+                target = self.support.two_hot_target(clipped_returns)
+
+        log_probs = torch.log_softmax(logits, dim=-1)
+        ce = -(target * log_probs).sum(dim=-1)
+        loss = self.scale * masked_mean(
+            ce, mask, global_normalization_factor=global_valid_toks
+        )
+
+        with torch.no_grad():
+            probs = log_probs.exp()
+            values = probs @ self.support.centers(logits.device)
+            entropy = -(probs * log_probs).sum(dim=-1)
+
+            returns_mean = masked_mean(
+                returns, mask, global_normalization_factor=global_valid_toks
+            ).item()
+            values_mean = masked_mean(
+                values, mask, global_normalization_factor=global_valid_toks
+            ).item()
+            masked_values = values[mask.bool()]
+            values_min = (
+                masked_values.min().item() if masked_values.numel() > 0 else 0.0
+            )
+            values_max = (
+                masked_values.max().item() if masked_values.numel() > 0 else 0.0
+            )
+            returns_sq_mean = masked_mean(
+                returns**2, mask, global_normalization_factor=global_valid_toks
+            ).item()
+            residual_sq_mean = masked_mean(
+                (returns - values) ** 2,
+                mask,
+                global_normalization_factor=global_valid_toks,
+            ).item()
+            value_entropy = masked_mean(
+                entropy, mask, global_normalization_factor=global_valid_toks
+            ).item()
+            returns_clip_frac = masked_mean(
+                (clipped_returns != returns).float(),
+                mask,
+                global_normalization_factor=global_valid_toks,
+            ).item()
+
+        metrics = {
+            "loss": float(loss.item()),
+            "vf_clipfrac": 0.0,
+            "returns_mean": returns_mean,
+            "values_mean": values_mean,
+            "values_min": values_min,
+            "values_max": values_max,
+            "returns_sq_mean": returns_sq_mean,
+            "residual_sq_mean": residual_sq_mean,
+            "value_entropy": value_entropy,
+            "returns_clip_frac": returns_clip_frac,
+            "num_valid_samples": int(values.shape[0]),
+        }
+        return loss, metrics
+
+
+def make_value_loss_fn(
+    cfg: MseValueLossConfig, value_head_cfg: Optional[dict[str, Any]]
+) -> LossFunction:
+    """Build the value loss that matches ``value.value_head``."""
+    categorical = (value_head_cfg or {}).get("type", "scalar") == "categorical"
+    if cfg.type == "mse":
+        if categorical:
+            raise ValueError(
+                "value.value_head.type='categorical' requires value_loss_fn.type "
+                "in {'hl_gauss', 'two_hot'}"
+            )
+        return MseValueLossFn(cfg)
+    if not categorical:
+        raise ValueError(
+            f"value_loss_fn.type={cfg.type!r} requires value.value_head.type='categorical'"
+        )
+    return ClassificationValueLossFn(
+        cfg, CategoricalValueSupport.from_value_head_cfg(value_head_cfg)
+    )
 
 
 # =====================================================================

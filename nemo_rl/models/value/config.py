@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, NotRequired, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict
 
 from nemo_rl.models.policy import (
     DTensorConfig,
@@ -30,6 +30,20 @@ from nemo_rl.models.policy import (
     SinglePytorchSchedulerConfig,
     TokenizerConfig,
 )
+
+
+class ValueHeadConfig(TypedDict):
+    """Output head of the value model.
+
+    ``scalar`` is the default hidden->1 regression head.  ``categorical`` emits
+    ``num_bins`` logits over a uniform support ``[v_min, v_max]``; the value is
+    the mean of the softmax distribution (Megatron backend only).
+    """
+
+    type: Literal["scalar", "categorical"]
+    num_bins: NotRequired[int]
+    v_min: NotRequired[float]
+    v_max: NotRequired[float]
 
 
 class ValueConfig(TypedDict):
@@ -52,6 +66,8 @@ class ValueConfig(TypedDict):
 
     # Reward model config (value models use regression head)
     reward_model_cfg: RewardModelConfig
+    # Value head; defaults to a scalar regression head when absent.
+    value_head: NotRequired[ValueHeadConfig]
 
     # Backend configuration - DTensor or Megatron
     dtensor_cfg: DTensorConfig | DTensorConfigDisabled

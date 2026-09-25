@@ -48,7 +48,10 @@ from nemo_rl.algorithms.loss import (
     ClippedPGLossFn,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
-from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig, MseValueLossFn
+from nemo_rl.algorithms.loss.loss_functions import (
+    MseValueLossConfig,
+    make_value_loss_fn,
+)
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
     apply_reward_shaping,
@@ -394,7 +397,7 @@ def setup(
     StatefulDataLoader,
     Optional[StatefulDataLoader],
     ClippedPGLossFn,
-    MseValueLossFn,
+    LossFunction,
     Logger,
     CheckpointManager,
     PPOSaveState,
@@ -563,7 +566,9 @@ def setup(
     #        Loss Function
     # ==========================
     loss_fn = ClippedPGLossFn(loss_config)
-    value_loss_fn = MseValueLossFn(master_config.value_loss_fn)
+    value_loss_fn = make_value_loss_fn(
+        master_config.value_loss_fn, master_config.value.get("value_head")
+    )
 
     if ppo_config["adv_estimator"].get("cross_trajectory"):
         assert ppo_config["adv_estimator"]["name"] == "gae", (
