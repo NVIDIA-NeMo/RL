@@ -249,6 +249,18 @@ class AutomodelCheckpointManager:
         # groups. NeMo-RL passes explicit paths to every save/load operation, so
         # the configured root is intentionally unused.
         config_updates.setdefault("save_consolidated", "false")
+        # Automodel's async saves use torch's process-based checkpointer
+        # (AsyncCheckpointerType.PROCESS): every rank spawns a daemon and, by
+        # default, rank 0 binds a port from get_free_port() for the daemons'
+        # GLOO group. That probe-then-bind is racy: on the CI nodes the port
+        # is taken again before the daemon binds it and the first save dies
+        # with EADDRINUSE (seen at every step-10 save on the torch 2.13 image).
+        # DCP_USE_PREFIX_STORE=1 makes the daemons join the training process
+        # group's TCPStore at MASTER_ADDR:MASTER_PORT under a prefix instead,
+        # so nothing new is bound. torch asserts on those variables, so only
+        # opt in when the worker has them (RL sets both for every worker).
+        if "MASTER_ADDR" in os.environ and "MASTER_PORT" in os.environ:
+            os.environ.setdefault("DCP_USE_PREFIX_STORE", "1")
         base_cfg = AutomodelCheckpointingConfig(
             enabled=True,
             checkpoint_dir="",

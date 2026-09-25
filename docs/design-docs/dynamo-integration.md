@@ -50,7 +50,7 @@ cache mode determines where it runs.
 `BUILD_DYNAMO=1` adds a Python 3.12 `/opt/dynamo_venv` to the standard image.
 It contains only `ai-dynamo[vllm]==1.3.0.post1`, its pinned vLLM 0.23.0, etcd,
 and NATS. NeMo-RL's normal Ray and engine environments are unchanged; the
-standard NeMo-RL vLLM environment currently uses vLLM 0.25.1.
+standard NeMo-RL vLLM environment currently uses vLLM 0.29.0.
 
 vLLM 0.23.0 predates PR #44814, which fixes layerwise reload accounting for
 composed loaders. The installer asserts the exact vLLM version, checks and

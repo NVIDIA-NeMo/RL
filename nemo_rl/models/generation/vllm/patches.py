@@ -290,7 +290,17 @@ def _patch_vllm_ray_executor_v2_tcpstore_port(logger) -> None:
     and falls through to ``get_open_port()`` — straight back to ``VLLM_PORT``.
     That is exactly the port the MessageQueue takes. See RL-1104.
 
-    Returns without raising when the snippet is missing, but logs at warning
+    vLLM 0.29 fixes the race upstream (vllm-project/vllm#53666, #50969): the
+    rank-0 actor now binds the TCPStore itself, on a kernel-assigned port, and
+    *holds* that socket (``self._dist_init_store = store``) until
+    ``init_process_group`` reuses it, so there is no probe/bind window for the
+    MessageQueue to land in. That is not the TOCTOU pattern the reserved band
+    guards against (the port is never released between selection and use), and
+    ``_select_tcpstore_port`` no longer exists to patch. When that upstream
+    marker is present this function logs at info level and leaves the file
+    alone.
+
+    Returns without raising when neither form is found, but logs at warning
     level so a silent no-op is visible in worker logs.
     """
     try:
@@ -302,6 +312,9 @@ def _patch_vllm_ray_executor_v2_tcpstore_port(logger) -> None:
         )
         return
 
+    # vLLM >= 0.29: RayWorkerProc.create_dist_init_method binds and keeps the
+    # TCPStore before publishing its port (vllm-project/vllm#50969).
+    upstream_fix_marker = "self._dist_init_store = store"
     marker = "start_port=envs.VLLM_PORT + 32"
     old_snippet = (
         "        if local_dp_rank is None:\n            return get_open_port()\n"
@@ -334,6 +347,12 @@ def _patch_vllm_ray_executor_v2_tcpstore_port(logger) -> None:
     with _locked_file_patch(file_to_patch) as (content, write_back):
         if marker in content:
             logger.info("vLLM RayExecutorV2 TCPStore port patch already applied.")
+            return
+        if upstream_fix_marker in content:
+            logger.info(
+                "vLLM binds the RayExecutorV2 TCPStore before publishing its port "
+                "(vllm-project/vllm#50969); NeMo-RL TCPStore port patch not needed."
+            )
             return
 
         if old_snippet not in content:
@@ -368,13 +387,12 @@ def _patch_vllm_ray_executor_v2_tcpstore_port(logger) -> None:
 
 
 def _patch_vllm_shm_broadcast_bind_retry(logger) -> None:
-    """Make MessageQueue's remote socket survive losing a port race.
+    """Keep MessageQueue's remote socket in the reserved band with bind retries.
 
-    ``MessageQueue.__init__`` picks the port for its remote (TCP) socket with
-    ``remote_subscribe_port = get_open_port()``, which *probes a port and
-    releases it*, and only binds it with ZMQ several statements later
-    (``shm_broadcast.py``: ``self.remote_socket.bind(socket_addr)``). The
-    window between the probe and the bind is a TOCTOU race.
+    vLLM 0.28 binds port zero directly, avoiding the old probe/bind race but
+    ignoring ``VLLM_PORT``. Restore reserved-band selection with retries so
+    engine sockets do not consume the ephemeral ports used by other services.
+    A probe alone releases its socket before ZMQ binds, leaving a TOCTOU race.
 
     On vLLM 0.25 that race is lost reliably, not occasionally. Every
     ``RayWorkerProc`` on a **non-driver** node takes ``n_local_reader=0``
@@ -426,10 +444,14 @@ def _patch_vllm_shm_broadcast_bind_retry(logger) -> None:
 
     marker = "_nrl_bind_attempts"
     old_snippet = (
-        '            socket_addr = f"tcp://{connect_ip}:{remote_subscribe_port}"\n'
-        "            self.remote_socket.bind(socket_addr)\n"
+        '            self.remote_socket.bind(f"tcp://{connect_ip}:0")\n'
+        "            last_endpoint = self.remote_socket.getsockopt(zmq.LAST_ENDPOINT)\n"
+        '            remote_subscribe_port = last_endpoint.decode().rsplit(":", 1)[1]\n'
     )
     new_snippet = (
+        "            from vllm.utils.network_utils import get_open_port, _get_open_port\n"
+        "\n"
+        "            remote_subscribe_port = get_open_port()\n"
         "            # NeMo-RL: get_open_port() above probed this port and then\n"
         "            # released it; ZMQ only binds it for real here. Every worker\n"
         "            # on a non-driver node builds its response queue at the same\n"
@@ -450,8 +472,6 @@ def _patch_vllm_shm_broadcast_bind_retry(logger) -> None:
         "                except zmq.ZMQError:\n"
         "                    if _nrl_bind_attempt == _nrl_bind_attempts - 1:\n"
         "                        raise\n"
-        "                    from vllm.utils.network_utils import _get_open_port\n"
-        "\n"
         "                    logger.info(\n"
         '                        "Port %s was taken between probe and bind; '
         'retrying.",\n'
@@ -631,195 +651,6 @@ def _patch_vllm_glm_decoder_sequence_parallel_moe(logger) -> None:
     logger.info("Successfully disabled decoder-level SP-MoE for GLM DSA models.")
 
 
-def _patch_vllm_minimax_m3_topk_buffer_layout(logger) -> None:
-    """Backport the MiniMax-M3 token-major top-k buffer fix to vLLM 0.26.0.
-
-    vLLM 0.26.0 allocates ``topk_indices_buffer`` as token-major ``[T, H, K]``
-    for the NVIDIA MSA path, while its common Triton indexer and sparse-attention
-    paths read and write it as head-major ``[H, T, K]``. The wrong shape and
-    strides can make ``_topk_index_kernel`` access memory out of bounds and fail
-    with ``CUDA illegal memory access``.
-
-    Remove this patch after upgrading to vLLM >= 0.27.0, which contains the
-    upstream fix. See https://github.com/vllm-project/vllm/issues/48603 and
-    https://github.com/vllm-project/vllm/commit/d1a8ba63d9d2bb51ebf60dd5ea1463cf61c70cea.
-    """
-    try:
-        indexer_file = _get_vllm_file("models/minimax_m3/common/indexer.py")
-        sparse_attention_file = _get_vllm_file(
-            "models/minimax_m3/common/sparse_attention.py"
-        )
-    except RuntimeError as error:
-        logger.warning("Could not locate MiniMax-M3 sources for top-k patch: %s", error)
-        return
-
-    indexer_old_snippet = """        # Both sides write into the single shared persistent topk_indices_buffer
-        # (decode at [:, :nd], prefill at [:, nd:]) and return views into it; the
-        # kernels' out= writes out[:, :total_q]. None -> allocate fresh.
-        buf = self.topk_indices_buffer
-        decode_topk: torch.Tensor | None = None
-        prefill_topk: torch.Tensor | None = None
-        if index_md.num_decodes > 0:
-            d = index_md.decode
-            assert d is not None
-            decode_topk = minimax_m3_index_decode(
-                iq[:nd],
-                kv,
-                d.block_table,
-                d.seq_lens,
-                d.max_seq_len,
-                self.topk_blocks,
-                self.init_blocks,
-                self.local_blocks,
-                self.num_kv_heads,
-                d.decode_query_len,
-                d.max_decode_query_len,
-                out=buf,
-            )
-        if index_md.num_prefills > 0:
-            p = index_md.prefill
-            assert p is not None
-            score = minimax_m3_index_score(
-                iq[nd:],
-                kv,
-                p.block_table,
-                p.cu_seqlens_q,
-                p.seq_lens,
-                p.context_lens,
-                p.max_query_len,
-                p.max_seq_len,
-                self.num_kv_heads,
-            )
-            prefill_topk = minimax_m3_index_topk(
-                score,
-                p.cu_seqlens_q,
-                p.context_lens,
-                p.max_query_len,
-                self.topk_blocks,
-                self.init_blocks,
-                self.local_blocks,
-                out=buf[:, nd:, :] if buf is not None else None,
-            )
-        return decode_topk, prefill_topk
-"""
-    indexer_new_snippet = """        # Both sides write into the single shared persistent topk_indices_buffer
-        # (decode at [:, :nd], prefill at [:, nd:]) and return views into it; the
-        # kernels' out= writes out[:, :total_q]. None -> allocate fresh.
-        buf = self.topk_indices_buffer
-        buf_htk = (
-            buf if buf is None or current_platform.is_rocm() else buf.transpose(0, 1)
-        )
-        decode_topk: torch.Tensor | None = None
-        prefill_topk: torch.Tensor | None = None
-        if index_md.num_decodes > 0:
-            d = index_md.decode
-            assert d is not None
-            decode_topk = minimax_m3_index_decode(
-                iq[:nd],
-                kv,
-                d.block_table,
-                d.seq_lens,
-                d.max_seq_len,
-                self.topk_blocks,
-                self.init_blocks,
-                self.local_blocks,
-                self.num_kv_heads,
-                d.decode_query_len,
-                d.max_decode_query_len,
-                out=buf_htk,
-            )
-        if index_md.num_prefills > 0:
-            p = index_md.prefill
-            assert p is not None
-            score = minimax_m3_index_score(
-                iq[nd:],
-                kv,
-                p.block_table,
-                p.cu_seqlens_q,
-                p.seq_lens,
-                p.context_lens,
-                p.max_query_len,
-                p.max_seq_len,
-                self.num_kv_heads,
-            )
-            prefill_topk = minimax_m3_index_topk(
-                score,
-                p.cu_seqlens_q,
-                p.context_lens,
-                p.max_query_len,
-                self.topk_blocks,
-                self.init_blocks,
-                self.local_blocks,
-                out=buf_htk[:, nd:, :] if buf_htk is not None else None,
-            )
-        return decode_topk, prefill_topk
-"""
-    sparse_attention_old_snippet = """        # Indexer top-k from the shared buffer: decode [:, :nd], prefill [:, nd:].
-        topk = layer.topk_indices_buffer  # type: ignore[attr-defined]
-        assert topk is not None
-"""
-    sparse_attention_new_snippet = """        # Indexer top-k from the shared buffer: decode [:, :nd], prefill [:, nd:].
-        topk_buffer = layer.topk_indices_buffer  # type: ignore[attr-defined]
-        assert topk_buffer is not None
-
-        topk = (
-            topk_buffer
-            if current_platform.is_rocm()
-            else topk_buffer[:num_tokens].transpose(0, 1)
-        )
-        assert topk is not None
-"""
-
-    # Lock both files in a fixed order and validate both anchors before writing
-    # either one. This prevents an unexpected vLLM source shape from leaving the
-    # indexer and sparse-attention sides with incompatible buffer layouts.
-    with _locked_file_patch(indexer_file) as (indexer_content, write_indexer):
-        with _locked_file_patch(sparse_attention_file) as (
-            sparse_attention_content,
-            write_sparse_attention,
-        ):
-            indexer_known = (
-                indexer_old_snippet in indexer_content
-                or indexer_new_snippet in indexer_content
-            )
-            sparse_attention_known = (
-                sparse_attention_old_snippet in sparse_attention_content
-                or sparse_attention_new_snippet in sparse_attention_content
-            )
-            if not indexer_known or not sparse_attention_known:
-                logger.warning(
-                    "Could not apply MiniMax-M3 top-k buffer patch: expected "
-                    "vLLM 0.26.0 source shape was not found (indexer=%s, "
-                    "sparse_attention=%s).",
-                    indexer_known,
-                    sparse_attention_known,
-                )
-                return
-
-            indexer_patched = indexer_new_snippet in indexer_content
-            sparse_attention_patched = (
-                sparse_attention_new_snippet in sparse_attention_content
-            )
-            if indexer_patched and sparse_attention_patched:
-                logger.info("vLLM MiniMax-M3 top-k buffer patch already applied.")
-                return
-
-            if not indexer_patched:
-                write_indexer(
-                    indexer_content.replace(indexer_old_snippet, indexer_new_snippet, 1)
-                )
-            if not sparse_attention_patched:
-                write_sparse_attention(
-                    sparse_attention_content.replace(
-                        sparse_attention_old_snippet,
-                        sparse_attention_new_snippet,
-                        1,
-                    )
-                )
-
-    logger.info("Successfully patched vLLM MiniMax-M3 top-k buffer layout.")
-
-
 def _patch_vllm_moe_routed_experts_capture(logger, *, required: bool = False) -> bool:
     """Fire the routed-experts capture hook on the monolithic fused-MoE path.
 
@@ -890,6 +721,100 @@ def _patch_vllm_moe_routed_experts_capture(logger, *, required: bool = False) ->
         write_back(content)
 
     logger.info("Successfully patched MoE routed-experts capture (monolithic path).")
+    return True
+
+
+def _patch_vllm_routed_experts_capture_router_fallback(
+    logger, *, required: bool = False
+) -> bool:
+    """Let monolithic MoE kernels without in-kernel capture use the router hook.
+
+    vLLM 0.29 moved the routed-experts binding into
+    ``routed_experts_capturer.bind_routed_experts_capturer``. For a monolithic
+    kernel it requires ``fused_experts.supports_routing_replay_capture()`` and
+    binds the capture function to that experts *object* (the kernel then writes
+    ``routing_replay_out`` itself); any other monolithic kernel is rejected with
+    ``ValueError``. Two things make the object binding unusable for NeMo-RL's
+    NVFP4 per-token method: the kernel is rebuilt on every refit, so the bound
+    capture function is dropped after the first weight update and the returned
+    routes go back to all-zero; and the per-token kernel is the one FlashInfer
+    launch that has not been validated with a replay buffer attached. Kernels
+    that report no in-kernel capture (see ``nvfp4_pertoken.host_captured_experts_cls``)
+    therefore fall back to ``router.set_capture_fn`` — the hook that
+    ``_patch_vllm_moe_routed_experts_capture`` fires on the monolithic branch
+    and the path vLLM 0.26 used for every monolithic kernel.
+    """
+    try:
+        file_to_patch = _get_vllm_file(
+            "model_executor/layers/fused_moe/routed_experts_capturer.py"
+        )
+    except RuntimeError:
+        message = (
+            "Could not locate routed_experts_capturer.py for the routed-experts "
+            "capture router-fallback patch."
+        )
+        if required:
+            raise RuntimeError(message) from None
+        logger.warning(message)
+        return False
+
+    marker = "NeMo-RL patch (router fallback for monolithic routed-experts capture)"
+    old_snippet = (
+        "        if quant_method.is_monolithic:\n"
+        "            if not (\n"
+        "                isinstance(fused_experts, FusedMoEExpertsMonolithic)\n"
+        "                and fused_experts.supports_routing_replay_capture()\n"
+        "            ):\n"
+        "                raise ValueError(\n"
+        '                    "Routed-experts capture is not supported with monolithic "\n'
+        '                    f"MoE kernel {type(fused_experts).__name__}."\n'
+        "                )\n"
+        "            fused_experts.set_capture_fn(capture_fn)\n"
+        "            num_bound += 1\n"
+    )
+    new_snippet = (
+        "        if quant_method.is_monolithic:\n"
+        "            # NeMo-RL patch (router fallback for monolithic routed-experts capture):\n"
+        "            # a monolithic kernel that does not capture routing itself is\n"
+        "            # captured through the router; NeMo-RL's moe_runner patch fires\n"
+        "            # router.select_experts on the monolithic branch when capture_fn is set.\n"
+        "            if (\n"
+        "                isinstance(fused_experts, FusedMoEExpertsMonolithic)\n"
+        "                and fused_experts.supports_routing_replay_capture()\n"
+        "            ):\n"
+        "                fused_experts.set_capture_fn(capture_fn)\n"
+        "                num_bound += 1\n"
+        "            elif isinstance(module.router, BaseRouter):\n"
+        "                module.router.set_capture_fn(capture_fn)\n"
+        "                num_bound += 1\n"
+        "            else:\n"
+        "                raise ValueError(\n"
+        '                    "Routed-experts capture is not supported with monolithic "\n'
+        '                    f"MoE kernel {type(fused_experts).__name__}."\n'
+        "                )\n"
+    )
+
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if marker in content:
+            logger.info("Routed-experts capture router-fallback patch already applied.")
+            return True
+        if old_snippet not in content:
+            message = (
+                "Could not apply the routed-experts capture router-fallback patch: "
+                f"expected code snippet not found in {file_to_patch}. The vLLM "
+                "version may have changed."
+            )
+            if required:
+                raise RuntimeError(message)
+            logger.warning(message)
+            return False
+        content = content.replace(old_snippet, new_snippet, 1)
+        write_back(content)
+
+    logger.info(
+        "Successfully patched routed-experts capture (router fallback for "
+        "monolithic kernels)."
+    )
     return True
 
 
@@ -1099,7 +1024,6 @@ def ensure_vllm_source_compat() -> None:
     _patch_vllm_tool_parser_namespace_tool(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
-    _patch_vllm_minimax_m3_topk_buffer_layout(patch_logger)
 
 
 def _apply_vllm_patches(
@@ -1166,7 +1090,6 @@ def _apply_vllm_patches(
     _patch_vllm_shm_broadcast_bind_retry(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
-    _patch_vllm_minimax_m3_topk_buffer_layout(patch_logger)
     if nemotron_h_fp32_lm_head_enabled and not _patch_vllm_nemotron_h_fp32_lm_head(
         patch_logger
     ):
@@ -1177,5 +1100,8 @@ def _apply_vllm_patches(
             "for this vLLM version."
         )
     _patch_vllm_moe_routed_experts_capture(
+        patch_logger, required=require_moe_routed_experts_capture
+    )
+    _patch_vllm_routed_experts_capture_router_fallback(
         patch_logger, required=require_moe_routed_experts_capture
     )

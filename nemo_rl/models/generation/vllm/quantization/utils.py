@@ -70,15 +70,21 @@ def resolve_module_from_param_name(
         return None
     module_path = path_parts[:-1]
 
-    reversed_mapping = {
-        original_name: fused_name
-        for fused_name, original_names in getattr(
-            model, "packed_modules_mapping", {}
-        ).items()
-        for original_name in original_names
-    }
-    if module_path[-1] in reversed_mapping:
-        module_path[-1] = reversed_mapping[module_path[-1]]
+    # A shard name that several fused modules share (vLLM >= 0.29's DeepSeek V4
+    # lists ``wkv`` under both ``fused_wqa_wkv`` and ``fused_wkv_wgate``) cannot
+    # be resolved from the leaf alone; leave it for the parent-aware DeepSeek V4
+    # remap below instead of picking whichever fused module came last.
+    reversed_mapping: dict[str, str] = {}
+    ambiguous_shards: set[str] = set()
+    for fused_name, original_names in getattr(
+        model, "packed_modules_mapping", {}
+    ).items():
+        for original_name in original_names:
+            if reversed_mapping.setdefault(original_name, fused_name) != fused_name:
+                ambiguous_shards.add(original_name)
+    leaf = module_path[-1]
+    if leaf in reversed_mapping and leaf not in ambiguous_shards:
+        module_path[-1] = reversed_mapping[leaf]
 
     module_path = deepseek_v4_fp8.remap_packed_module_path(model, module_path)
 

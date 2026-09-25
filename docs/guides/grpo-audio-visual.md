@@ -12,7 +12,7 @@ The NeMo RL container does not ship `torchaudio`, `torchcodec`, or system FFmpeg
 bash tools/install_audio_deps.sh
 ```
 
-This installs system FFmpeg (required by `torchcodec` at runtime) and pins `torchaudio==2.11.0` + `torchcodec>=0.3.0` into the container venv. The script is idempotent — re-running it on a machine where the deps are already present exits immediately.
+This installs system FFmpeg (required by `torchcodec` at runtime) and pins `torchaudio==2.11.0` + `torchcodec==0.16.0` into the container venv. The script is idempotent — re-running it on a machine where the deps are already present exits immediately.
 
 > **Note:** `decord` and `av` (PyAV) are **not** used. Audio and video are decoded via `torchcodec` (backed by system FFmpeg) and `torchaudio` respectively.
 

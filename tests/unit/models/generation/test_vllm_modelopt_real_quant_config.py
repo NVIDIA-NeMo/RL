@@ -1185,6 +1185,9 @@ def test_real_quant_load_weights_expands_non_gated_experts_per_expert(
         )
         == "loaded"
     )
+    # Per-expert 2-D shards, never one batched 3-D tensor under expert 0: a
+    # non-gated model has no fused mapping, so vLLM's fused branch would keep
+    # only chunk(2, dim=1)[0] of every expert (the nanov3 w4a16 3/4 failure).
     assert [name for name, _ in batched_forwarded] == [
         f"{prefix}.experts.0.up_proj.weight",
         f"{prefix}.experts.1.up_proj.weight",

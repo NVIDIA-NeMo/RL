@@ -44,9 +44,9 @@ def rebalance_nd_tensor(
         dtype=torch.int64,
         device=torch.cuda.current_device(),
     )
-    torch.distributed.all_gather_into_tensor(
-        batch_num_per_rank, num_samples, group=group
-    )
+    # all_gather_single lands in torch 2.13; the sglang and trtllm extras pin
+    # 2.11, so this module is 2.13-only until they move.
+    torch.distributed.all_gather_single(batch_num_per_rank, num_samples, group=group)
 
     B = batch_num_per_rank.sum()
     other_dims = tensor.shape[1:]
