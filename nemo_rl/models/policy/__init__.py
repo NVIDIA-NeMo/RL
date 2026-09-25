@@ -698,8 +698,8 @@ class PolicyConfig(TypedDict):
 
     is_vlm: NotRequired[bool]
 
-    # FQN of a worker extension class to use instead of the resolved default
-    # policy worker. Must be a subclass of the resolved worker and cannot be
-    # combined with quant_cfg. Its runtime environment must already be in
-    # ACTOR_ENVIRONMENT_REGISTRY.
+    # FQN of a worker extension class to use instead of the backend default.
+    # Must subclass the backend worker and be in ACTOR_ENVIRONMENT_REGISTRY.
+    # With quant_cfg, this must name the backend's ModelOpt worker; when unset,
+    # it is filled automatically with a warning.
     worker_extension_cls_fqn: NotRequired[str | None]

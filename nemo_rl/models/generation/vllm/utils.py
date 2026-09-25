@@ -43,6 +43,7 @@ from nemo_rl.models.generation.vllm.metric_names import (
     PROMPT_TOKENS_KEY,
     REQUEST_SUCCESS_COUNTERS,
 )
+from nemo_rl.models.worker_config import resolve_worker_cls
 from nemo_rl.utils.routed_experts_codec import encode_routed_experts
 
 R3_MISSING_ROUTE_SENTINEL = ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL
@@ -784,13 +785,14 @@ GENERATION_WORKER_OVERRIDES = {
 }
 
 
-def resolve_generation_worker_cls(default_cls: str, config: dict) -> str:
-    """Return the quantized vLLM generation worker FQN if ``quant_cfg`` is set, else ``default_cls``.
-
-    Safe to call even when ModelOpt is not installed — returns ``default_cls``
-    unchanged whenever ``quant_cfg`` is ``None``, so the core generation path
-    stays import-free of ModelOpt.
-    """
-    if config.get("quant_cfg") is None:
-        return default_cls
-    return GENERATION_WORKER_OVERRIDES.get(default_cls, default_cls)
+def resolve_generation_worker_cls(default_cls: str, config: VllmConfig) -> str:
+    """Resolve the configured generation worker without importing ModelOpt."""
+    return resolve_worker_cls(
+        default_cls,
+        config,
+        quantized_cls=(
+            GENERATION_WORKER_OVERRIDES.get(default_cls, default_cls)
+            if config.get("quant_cfg") is not None
+            else None
+        ),
+    )
