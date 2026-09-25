@@ -16,7 +16,6 @@ from typing import List, Optional
 
 from psutil import Process
 from pydantic import BaseModel, Field
-from ray.scripts.scripts import memory_summary
 
 
 class MemoryTrackerDataPoint(BaseModel):
@@ -40,6 +39,11 @@ class MemoryTrackerDataPoint(BaseModel):
         ]
 
     def get_snapshot_str(self) -> str:
+        # ray.scripts.scripts is Ray's CLI entrypoint; importing it at module
+        # scope pulls in the dashboard stack (fastapi, uvicorn) for every
+        # importer of nemo_rl.algorithms.grpo.
+        from ray.scripts.scripts import memory_summary
+
         ray_memory_summary = memory_summary(stats_only=True, num_entries=5)
         return f"""💭 Driver CPU memory tracker for {self.stage}:
 - Mem usage before                  {self.memory_used_before_stage_gb:>7.2f} GB
