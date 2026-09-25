@@ -2676,6 +2676,7 @@ class TestNativeTQRecoverySetup:
                 current_epoch=2,
                 sampler_dispatch_index=7,
                 gym_checkpoint=None,
+                gym_generation_cut_proofs=(),
             ),
         )
 
