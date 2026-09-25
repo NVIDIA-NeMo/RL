@@ -191,13 +191,22 @@ run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller
 
 # Token-capture (gate-authoritative) path: same SC+Gym smoke with the gate
 # custodying token lineage and the finalizer publishing training rows.
-run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh ++token_capture.enabled=true
+run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh ++token_capture.enabled=true ++async_rl.rollout_failure.nemo_gym.max_row_attempts=1
 # Two-process token-capture recovery: preserve one sealed sibling in TQ and
 # redispatch only its unfinished peer after restoring the step checkpoint.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_sibling_recovery.sh
 # Periodic native-TQ snapshot while a streamed step owns only part of its
 # rollout batch, followed by SIGKILL and rollback to the durable trainer anchor.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_streaming_recovery.sh
+# Coordinated Gym participant + TQ checkpoint at a deterministic post-mutation
+# turn boundary, followed by a full process restart and exact continuation.
+run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_turn_recovery.sh
+# The same recovery contract against Workplace Assistant's real DataFrame-backed
+# state adapter, including an exactly-once calendar mutation across restart.
+run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_workplace_turn_recovery.sh
+# Stateless GenRM cohort recovery: crash with one sibling blocked in /verify
+# and its peer parked, then replay both without duplicate reward computation.
+run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_genrm_turn_recovery.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then

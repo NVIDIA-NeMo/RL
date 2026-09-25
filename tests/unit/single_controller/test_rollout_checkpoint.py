@@ -29,6 +29,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     BOOTSTRAP_COMPATIBILITY_SCHEMA_VERSION,
     BOOTSTRAP_MANIFEST_FILENAME,
+    GYM_RESTART_FALLBACK_MANIFEST_FILENAME,
     ROLLOUT_SNAPSHOT_MANIFEST_FILENAME,
     ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
     BootstrapCompatibilityIdentity,
@@ -37,10 +38,13 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     bootstrap_fingerprint,
     commit_snapshot,
     ensure_bootstrap_anchor,
+    load_gym_restart_fallback_manifest,
     prepare_snapshot_paths,
     prune_bootstrap_snapshots,
+    remove_gym_restart_fallback_manifest,
     resolve_latest_snapshot,
     validate_bootstrap_anchor,
+    write_gym_restart_fallback_manifest,
 )
 from nemo_rl.data import DataConfig
 from nemo_rl.models.generation.vllm.config import VllmConfig, VllmSpecificArgs
@@ -100,6 +104,52 @@ def _commit_snapshot(
     )
     commit_snapshot(tmp_path, final_path, keep_latest_k=3)
     return final_path
+
+
+def test_gym_restart_fallback_manifest_round_trip(tmp_path: Path) -> None:
+    path = write_gym_restart_fallback_manifest(
+        tmp_path,
+        base_train_step=7,
+        trainer_version=9,
+    )
+
+    assert path == tmp_path / GYM_RESTART_FALLBACK_MANIFEST_FILENAME
+    manifest = load_gym_restart_fallback_manifest(
+        tmp_path,
+        expected_train_step=7,
+        expected_trainer_version=9,
+    )
+    assert manifest is not None
+    assert manifest.mode == "restart_unfinished"
+
+    assert remove_gym_restart_fallback_manifest(tmp_path)
+    assert not path.exists()
+    assert not remove_gym_restart_fallback_manifest(tmp_path)
+    assert (
+        load_gym_restart_fallback_manifest(
+            tmp_path,
+            expected_train_step=7,
+            expected_trainer_version=9,
+        )
+        is None
+    )
+
+
+def test_gym_restart_fallback_manifest_rejects_different_trainer_state(
+    tmp_path: Path,
+) -> None:
+    write_gym_restart_fallback_manifest(
+        tmp_path,
+        base_train_step=7,
+        trainer_version=9,
+    )
+
+    with pytest.raises(ValueError, match="does not match the trainer checkpoint"):
+        load_gym_restart_fallback_manifest(
+            tmp_path,
+            expected_train_step=8,
+            expected_trainer_version=9,
+        )
 
 
 def test_bootstrap_anchor_rejects_different_initial_state(tmp_path):

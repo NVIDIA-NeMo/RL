@@ -64,6 +64,7 @@ COMMON_OVERRIDES=(
     async_rl.max_inflight_prompts="$MIN_STREAMING_GROUPS"
     async_rl.max_buffered_rollouts=$((NUM_PROMPTS + MIN_STREAMING_GROUPS))
     ++async_rl.rollout_failure.nemo_gym.rollout_timeout_s=120
+    ++async_rl.rollout_failure.nemo_gym.max_row_attempts=1
     ++async_rl.stall_watchdog.interval_s=10
     ++async_rl.stall_watchdog.stall_timeout_s=300
     ++async_rl.stall_watchdog.stall_action=abort

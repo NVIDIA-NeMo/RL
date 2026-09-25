@@ -494,6 +494,25 @@ class TestWrongPathFaultToleranceIsRejected:
             )
         )
 
+    def test_token_capture_rejects_physical_row_redispatch(self):
+        cfg = self._master_config(
+            use_nemo_gym=True,
+            rollout_failure={"nemo_gym": {"max_row_attempts": 2}},
+        )
+        cfg.token_capture.enabled = True
+
+        with pytest.raises(ValueError, match="max_row_attempts=1"):
+            validate_single_controller_config(cfg)
+
+    def test_token_capture_accepts_one_physical_row_attempt(self):
+        cfg = self._master_config(
+            use_nemo_gym=True,
+            rollout_failure={"nemo_gym": {"max_row_attempts": 1}},
+        )
+        cfg.token_capture.enabled = True
+
+        validate_single_controller_config(cfg)
+
     @pytest.mark.parametrize("use_nemo_gym", [True, False])
     def test_defaults_are_accepted_on_both_paths(self, use_nemo_gym):
         """Inert by default: an untouched config must never trip this."""
