@@ -24,7 +24,6 @@ env:
       checkpoint:
         model_save_format: "safetensors"
         save_consolidated: "false"
-      _v2: true
       enabled: true
       sequence_parallel: false
       tensor_parallel_size: 1

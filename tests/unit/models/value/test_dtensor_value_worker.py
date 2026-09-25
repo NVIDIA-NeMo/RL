@@ -138,7 +138,6 @@ def _create_value_test_config(
         "megatron_cfg": {"enabled": False},
         "dtensor_cfg": {
             "enabled": True,
-            "_v2": True,
             "checkpoint": {
                 "model_save_format": "safetensors",
                 "save_consolidated": "false",

@@ -44,7 +44,6 @@ policy:
   offload_optimizer_for_logprob: false
 
   dtensor_cfg:
-    _v2: true
     enabled: true
     checkpoint:
       model_save_format: "safetensors"

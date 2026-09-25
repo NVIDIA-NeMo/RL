@@ -185,7 +185,6 @@ def create_test_config(
             },
         },
         "dtensor_cfg": {
-            "_v2": True,
             "enabled": True,
             "checkpoint": {
                 "model_save_format": "safetensors",

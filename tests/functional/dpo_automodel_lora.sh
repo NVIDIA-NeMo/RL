@@ -29,8 +29,6 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     dpo.max_num_steps=3 \
     dpo.val_batches=1 \
     dpo.val_global_batch_size=8 \
-    ++policy.dtensor_cfg._v2=true \
-    ++policy.dtensor_cfg.checkpoint.model_save_format=safetensors \
     policy.train_global_batch_size=8 \
     policy.dtensor_cfg.lora_cfg.enabled=true \
     logger.tensorboard_enabled=true \

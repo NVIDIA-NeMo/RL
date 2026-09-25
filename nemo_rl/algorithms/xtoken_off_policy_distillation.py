@@ -63,7 +63,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
-from nemo_rl.models.policy.utils import reject_dtensor_v1
+from nemo_rl.models.policy.utils import reject_legacy_dtensor_key
 from nemo_rl.utils.checkpoint import (
     CheckpointingConfig,
     CheckpointManager,
@@ -255,16 +255,12 @@ def setup(
     assert policy_config["dtensor_cfg"]["enabled"], (
         "xtoken distillation requires policy.dtensor_cfg.enabled=true."
     )
-    reject_dtensor_v1(
-        policy_config["dtensor_cfg"], "policy.dtensor_cfg", suggest_megatron=False
-    )
+    reject_legacy_dtensor_key(policy_config["dtensor_cfg"], "policy.dtensor_cfg")
     for i, tc in enumerate(teacher_configs):
         assert tc["dtensor_cfg"]["enabled"], (
             f"xtoken distillation requires teachers.{i}.dtensor_cfg.enabled=true."
         )
-        reject_dtensor_v1(
-            tc["dtensor_cfg"], f"teachers.{i}.dtensor_cfg", suggest_megatron=False
-        )
+        reject_legacy_dtensor_key(tc["dtensor_cfg"], f"teachers.{i}.dtensor_cfg")
 
     # A null projection path marks a same-vocab teacher (direct KL, no
     # projection/alignment); that only makes sense when it shares the student's

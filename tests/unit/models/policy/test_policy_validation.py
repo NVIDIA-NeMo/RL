@@ -658,12 +658,13 @@ def test_world_size_validation_dtensor(
 
 
 @patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
-def test_dtensor_v2_false_is_rejected(mock_ray_worker_group):
-    """An explicit _v2=false fails before any worker is built."""
+@pytest.mark.parametrize("v2", [True, False])
+def test_legacy_v2_key_is_rejected(mock_ray_worker_group, v2):
+    """The removed _v2 key fails before any worker is built, whatever its value."""
     config = create_dtensor_config("test/model", tp=1)
-    config["dtensor_cfg"]["_v2"] = False
+    config["dtensor_cfg"]["_v2"] = v2
 
-    with pytest.raises(ValueError, match="_v2=false selects the DTensor v1 backend"):
+    with pytest.raises(ValueError, match=r"_v2 key itself have been removed"):
         Policy(
             cluster=create_mock_cluster(world_size=1),
             config=config,
@@ -682,7 +683,6 @@ def test_dtensor_dp_replicate_size_sets_batching_dp(
     cluster = create_mock_cluster(world_size=8)
     tokenizer = create_mock_tokenizer()
     config = create_dtensor_config(tiny_llama_model_path, tp=1)
-    config["dtensor_cfg"]["_v2"] = True
     config["dtensor_cfg"]["dp_replicate_size"] = 2
 
     policy = Policy(cluster=cluster, config=config, tokenizer=tokenizer)
@@ -707,7 +707,6 @@ def test_dtensor_hsdp_dispatches_distinct_batches(
     cluster = create_mock_cluster(world_size=8)
     tokenizer = create_mock_tokenizer()
     config = create_dtensor_config(tiny_llama_model_path, tp=1)
-    config["dtensor_cfg"]["_v2"] = True
     config["dtensor_cfg"]["dp_replicate_size"] = 2  # HSDP enabled
 
     policy = Policy(cluster=cluster, config=config, tokenizer=tokenizer)

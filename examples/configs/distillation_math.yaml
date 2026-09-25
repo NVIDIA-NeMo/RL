@@ -45,7 +45,6 @@ policy: &POLICY_BASE
 
     dtensor_cfg: &DTENSOR_BASE
         enabled: true
-        _v2: true
         checkpoint:
             model_save_format: "safetensors"
             # Canonical Automodel modes: "false", "final", or "every".

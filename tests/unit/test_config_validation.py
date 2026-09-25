@@ -356,13 +356,11 @@ def test_all_config_no_tp_size_accuracy_issues(config_file):
 
 
 @pytest.mark.parametrize("config_file", full_config_files)
-def test_all_config_dtensor_selects_v2(config_file):
-    """Test that no shipped config selects the DTensor v1 backend.
+def test_all_config_has_no_legacy_v2_key(config_file):
+    """Test that no shipped config still carries the removed dtensor_cfg._v2 key.
 
-    v1 is being removed, so every dtensor_cfg that is enabled must pin _v2: true. An absent
-    _v2 is also a failure while the schema default is still False, since that silently
-    resolves to v1. The walk is recursive because dtensor_cfg also appears under teacher,
-    teachers[i] and env.reward_model, and distillation.py has no _v2 check of its own.
+    The walk is recursive because dtensor_cfg also appears under teacher, teachers[i] and
+    env.reward_model.
     """
 
     print(f"\nValidating config file: {config_file}")
@@ -385,17 +383,8 @@ def test_all_config_dtensor_selects_v2(config_file):
                 yield from walk(value, f"{path}[{index}]")
 
     for section, dtensor_cfg in walk(config_dict, ""):
-        v2 = dtensor_cfg.get("_v2", "<absent>")
-
-        # Mirrors reject_dtensor_v1, which fires on an explicit false regardless of enabled.
-        if v2 is False:
+        if "_v2" in dtensor_cfg:
             raise AssertionError(
-                f"Config file {config_file} sets {section}.dtensor_cfg._v2: false, which "
-                "selects the removed DTensor v1 backend. Set it to true."
-            )
-
-        if dtensor_cfg.get("enabled") and v2 is not True:
-            raise AssertionError(
-                f"Config file {config_file} enables {section}.dtensor_cfg but does not set "
-                f"_v2: true (found {v2!r}). DTensor v2 is the only supported backend."
+                f"Config file {config_file} still carries {section}.dtensor_cfg._v2. The key "
+                "was removed -- DTensor is always the Automodel backend now."
             )
