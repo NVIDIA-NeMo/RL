@@ -394,6 +394,7 @@ design-docs/te-nvfp4-per-token-rollout.md
 design-docs/nccl-reshard-refit.md
 design-docs/media-token-validity-mask.md
 design-docs/automodel-context-parallel.md
+design-docs/policy-lifecycle.md
 ```
 
 ```{toctree}
