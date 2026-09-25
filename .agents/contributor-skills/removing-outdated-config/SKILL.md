@@ -46,7 +46,7 @@ def reject_outdated_<thing>(config: dict[str, Any]) -> None:
 `check_outdated_config` normalizes the input (one recursive `model_dump`), so your
 function receives plain dicts and must not repeat that. If the key lives on a training
 backend block, iterate `_train_backend_configs` instead of re-deriving where `policy`,
-`value`, `teachers[i]` and `env.reward_model` are.
+`value`, `teacher`, `teachers[i]` and `env.reward_model` are.
 
 The message is the whole point. State what is wrong and what to write instead — a user
 who only reads the exception should be able to fix their YAML. Do not write "deprecated"
