@@ -18,8 +18,9 @@ SUBMIT_OPTIONS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -d|--dependent) DEPENDENCY=("--dependency=afterany:${JOBID:?Set JOBID for a dependent run}") ;;
+        --afterok) DEPENDENCY=("--dependency=afterok:${JOBID:?Set JOBID for a dependent run}") ;;
         --hold) SUBMIT_OPTIONS+=(--hold) ;;
-        *) echo "Usage: $0 [-d|--dependent] [--hold]" >&2; exit 1 ;;
+        *) echo "Usage: $0 [-d|--dependent|--afterok] [--hold]" >&2; exit 1 ;;
     esac
     shift
 done
