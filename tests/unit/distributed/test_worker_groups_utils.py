@@ -15,7 +15,38 @@
 
 from copy import deepcopy
 
-from nemo_rl.distributed.worker_group_utils import recursive_merge_options
+from nemo_rl.distributed.worker_group_utils import (
+    merge_env_vars_with_process_env,
+    recursive_merge_options,
+)
+
+
+class TestMergeEnvVarsWithProcessEnv:
+    """Test cases for the merge_env_vars_with_process_env function."""
+
+    def test_does_not_mutate_the_caller_dict(self, monkeypatch):
+        """The caller's dict is a live reference into the run config, so it must not grow."""
+        monkeypatch.setenv("NRL_TEST_LAUNCHER_ONLY", "launcher-value")
+        declared = {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
+
+        merge_env_vars_with_process_env(declared)
+
+        assert declared == {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
+
+    def test_merges_process_environment_into_the_result(self, monkeypatch):
+        monkeypatch.setenv("NRL_TEST_LAUNCHER_ONLY", "launcher-value")
+
+        result = merge_env_vars_with_process_env({"NRL_TEST_DECLARED": "declared"})
+
+        assert result["NRL_TEST_LAUNCHER_ONLY"] == "launcher-value"
+        assert result["NRL_TEST_DECLARED"] == "declared"
+
+    def test_declared_values_win_over_the_process_environment(self, monkeypatch):
+        monkeypatch.setenv("NRL_TEST_OVERRIDDEN", "launcher-value")
+
+        result = merge_env_vars_with_process_env({"NRL_TEST_OVERRIDDEN": "declared"})
+
+        assert result["NRL_TEST_OVERRIDDEN"] == "declared"
 
 
 class TestRecursiveMergeOptions:
