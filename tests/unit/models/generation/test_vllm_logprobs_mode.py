@@ -38,7 +38,7 @@ def test_worker_generate_records_sampled_token_logprob(monkeypatch):
         ],
         finish_reason="stop",
     )
-    raw_output = SimpleNamespace(outputs=[generation])
+    raw_output = SimpleNamespace(prompt_token_ids=[101, 102], outputs=[generation])
 
     worker = vllm_worker.VllmGenerationWorkerImpl.__new__(
         vllm_worker.VllmGenerationWorkerImpl
