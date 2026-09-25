@@ -20,6 +20,8 @@ Most cases run on CPU with Gloo; one optional NCCL case covers device staging.
 from __future__ import annotations
 
 import os
+from functools import partial
+from pathlib import Path
 
 import pytest
 import torch
@@ -260,6 +262,61 @@ def _unsupported_type_body(rank: int):
     data = BatchedDataDict({"source_ids": ["a", "b"]}) if rank == 0 else None
     _broadcast_batched_data_dict(
         data, is_leader=(rank == 0), src=0, group=dist.group.WORLD
+    )
+
+
+def _tensor_layout_round_trip_body(rank: int, *, source_device: str) -> None:
+    device = torch.device(source_device)
+    if device.type == "cuda":
+        device = torch.device("cuda", rank)
+    for source_rank in (0, 1):
+        expected = {}
+        for dtype in (torch.float32, torch.int64, torch.int16):
+            values = torch.arange(24, dtype=dtype, device=device).reshape(4, 6)
+            expected[f"{dtype}_transpose"] = values.T
+            expected[f"{dtype}_slice"] = values[:, ::2]
+            expected[f"{dtype}_contiguous"] = values
+            expected[f"{dtype}_scalar"] = torch.tensor(-1, dtype=dtype, device=device)
+            expected[f"{dtype}_empty"] = torch.empty(2, 0, dtype=dtype, device=device)
+        expected["int16_domain"] = torch.arange(
+            -32768, 32768, dtype=torch.int32, device=device
+        ).to(torch.int16)
+        data = BatchedDataDict(expected) if rank == source_rank else None
+
+        result = _broadcast_batched_data_dict(
+            data, is_leader=rank == source_rank, src=source_rank, group=dist.group.WORLD
+        )
+
+        assert result.keys() == expected.keys()
+        for key, original in expected.items():
+            actual = result[key]
+            assert actual.dtype == original.dtype, key
+            assert actual.shape == original.shape, key
+            assert actual.device == device, key
+            assert torch.equal(actual, original), key
+            if rank == source_rank:
+                assert actual is original, key
+
+
+def test_leader_broadcast_preserves_strided_tensors(tmp_path: Path) -> None:
+    _run_two_ranks(
+        partial(_tensor_layout_round_trip_body, source_device="cpu"),
+        str(tmp_path / "init_strided"),
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 2,
+    reason="two CUDA devices are required for NCCL broadcast",
+)
+@pytest.mark.parametrize("source_device", ["cpu", "cuda"])
+def test_leader_broadcast_preserves_strided_tensors_nccl(
+    tmp_path: Path, source_device: str
+) -> None:
+    _run_two_ranks(
+        partial(_tensor_layout_round_trip_body, source_device=source_device),
+        str(tmp_path / "init_strided_nccl"),
+        backend="nccl",
     )
 
 
