@@ -13,6 +13,15 @@
 
 For more details on the architecture and design philosophy, see the [design documents](../design-docs/design-and-philosophy.md).
 
+## NeMo Gym Integration
+
+NeMo RL and [NeMo Gym](https://docs.nvidia.com/nemo/gym/) provide complementary parts of an environment-driven post-training workflow:
+
+- **NeMo RL** runs scalable model training, including policy updates, rollout generation, and checkpointing.
+- **NeMo Gym** defines reusable datasets, tools, verifiers, and single-step or multi-step interactions. Verifier scores can be used as evaluation metrics or as rewards during training.
+
+Together, NeMo RL serves the model for rollouts and trains it from the rewards produced by NeMo Gym environments. See the [NeMo Gym integration guide](../design-docs/nemo-gym-integration.md) for supported algorithms, configuration, and architecture details.
+
 ## Releases
 
 For a complete list of releases and detailed changelogs, visit the [GitHub Releases page](https://github.com/NVIDIA-NeMo/RL/releases).
