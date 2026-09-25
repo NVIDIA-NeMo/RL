@@ -2707,6 +2707,14 @@ def test_run_async_nemo_gym_rollout(
             "truncation_rate": None,
             # per agent metrics
             "example_multi_step_simple_agent/full_result": None,
+            # Gym #2611 puts ``mask_sample`` on every verify response, so the
+            # per-agent aggregation reports it like any other numeric field.
+            "example_multi_step_simple_agent/mask_sample/histogram": None,
+            "example_multi_step_simple_agent/mask_sample/max": 0.0,
+            "example_multi_step_simple_agent/mask_sample/mean": 0.0,
+            "example_multi_step_simple_agent/mask_sample/median": 0.0,
+            "example_multi_step_simple_agent/mask_sample/min": 0.0,
+            "example_multi_step_simple_agent/mask_sample/stddev": 0.0,
             "example_multi_step_simple_agent/accuracy/histogram": None,
             "example_multi_step_simple_agent/accuracy/max": 0.0,
             "example_multi_step_simple_agent/accuracy/mean": 0.0,

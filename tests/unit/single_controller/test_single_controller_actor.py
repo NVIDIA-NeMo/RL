@@ -50,7 +50,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, ROLLOUT_METRICS
-from nemo_rl.data_plane.tq_token_sink import STAGING_FIELDS
+from nemo_rl.data_plane.tq_token_sink import MEDIA_STAGING_FIELDS, STAGING_FIELDS
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.rollout_reassembler_actor import RolloutReassemblerActor
@@ -165,6 +165,7 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         finalizer_actors=[],
         data_plane_checkpoint_metadata=None,
         partition_includes_multimodal_fields=False,
+        staging_partition_includes_media=False,
         bootstrap_identity=None,
         rollout_checkpoint_load_metrics=None,
     )
@@ -261,8 +262,9 @@ def test_fresh_mooncake_init_registers_partition(
     assert controller._data_plane_checkpoint_metadata is None
 
 
+@pytest.mark.parametrize("capture_media", [False, True])
 def test_fresh_mooncake_init_preserves_token_capture_and_multimodal_partitions(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, capture_media
 ) -> None:
     monkeypatch.setattr(single_controller, "Logger", lambda _: MagicMock())
     monkeypatch.setattr(single_controller, "configure_checkpoint_workers", MagicMock())
@@ -273,6 +275,7 @@ def test_fresh_mooncake_init_preserves_token_capture_and_multimodal_partitions(
     actor_args = _actor_args_for_init(
         dp_client=dp_client,
         partition_includes_multimodal_fields=True,
+        staging_partition_includes_media=capture_media,
     )
 
     _init_controller(master_config, actor_args)
@@ -285,7 +288,10 @@ def test_fresh_mooncake_init_preserves_token_capture_and_multimodal_partitions(
     assert staging_call.kwargs["partition_id"] == (
         master_config.token_capture.staging_partition
     )
-    assert staging_call.kwargs["fields"] == list(STAGING_FIELDS)
+    # The actor-side warm-up must register the same media columns the
+    # driver-side path does, or a Mooncake run would stage into missing fields.
+    expected_media = list(MEDIA_STAGING_FIELDS) if capture_media else []
+    assert staging_call.kwargs["fields"] == list(STAGING_FIELDS) + expected_media
 
 
 @pytest.mark.parametrize("token_capture", [False, True])
