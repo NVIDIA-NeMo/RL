@@ -138,6 +138,13 @@ class AsyncPPOConfig(BaseModel, extra="allow"):
     enabled: bool = False
     # Maximum generation-version age accepted for training.
     max_trajectory_age_steps: int = Field(default=1, ge=1)
+    # Stamp each arriving prompt group onto the earliest live training step
+    # that still lacks a full batch (inside the group's age window) instead of
+    # the step its rollout batch was reserved for, so groups that finish out of
+    # batch order form the next step's batch in arrival order. Pair with
+    # max_trajectory_age_steps >= 2 so a group may move one step ahead of its
+    # reservation; with an age window of 1 there is nowhere for it to go.
+    fifo_target_assignment: bool = False
     # Number of future target steps generation may fill during critic warmup.
     # None uses max_trajectory_age_steps as the generation lead.
     warmup_generation_lead_steps: int | None = Field(default=None, ge=1)
@@ -2381,6 +2388,9 @@ def async_ppo_train(
         drop_incomplete_targets_on_restore=(
             async_config.drop_incomplete_targets_on_restore
         ),
+        fifo_target_assignment=async_config.fifo_target_assignment,
+        num_prompts_per_step=num_prompts_per_step,
+        max_age_steps=max_trajectory_age_steps,
     )
 
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
