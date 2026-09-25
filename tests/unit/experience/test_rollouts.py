@@ -2857,3 +2857,20 @@ def test_run_async_nemo_gym_rollout(
     1. In nemo_rl/experience/rollouts.py::run_async_nemo_gym_rollout, the sampling params are passed appropriately
     2. In nemo_rl/models/generation/vllm/vllm_worker_async.py::VllmAsyncGenerationWorker::_setup_vllm_server::create_chat_completion, the sampling params (like top_k) are set as appropriate
     """
+
+
+def test_mask_sample_flags_read_the_first_class_field_with_the_extras_fallback():
+    """The verify response's first-class ``mask_sample`` field flags a sample
+    directly; the older ``instance_config.mask_sample`` extras mapping still
+    flags one for environments that emit only that form; unflagged and empty
+    rows stay unmasked."""
+    flags = rollouts_mod._mask_sample_flags(
+        [
+            {"mask_sample": True},
+            {"instance_config": {"mask_sample": True}},
+            {"mask_sample": False, "instance_config": {}},
+            {},
+            None,
+        ]
+    )
+    assert flags.tolist() == [True, True, False, False, False]
