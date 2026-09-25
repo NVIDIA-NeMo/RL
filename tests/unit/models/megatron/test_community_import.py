@@ -116,6 +116,34 @@ def _install_runtime_stubs_for_hf_import(monkeypatch):
     core_module.tensor_parallel = tensor_parallel
 
 
+def test_iter_vlm_config_overrides_forwards_vision_training_controls(monkeypatch):
+    module = _load_community_import_module(monkeypatch)
+    config = {
+        "radio_force_eval_mode": False,
+        "radio_force_cpe_eval_mode": True,
+        "recompute_vision": True,
+        "vision_recompute_granularity": "full",
+        "vision_recompute_modules": None,
+        "vision_recompute_method": "block",
+        "vision_recompute_num_layers": 30,
+        "freeze_vision_model": False,
+        "freeze_vision_projection": False,
+        "unrelated": "ignored",
+    }
+
+    assert dict(module.iter_vlm_config_overrides(config)) == {
+        "radio_force_eval_mode": False,
+        "radio_force_cpe_eval_mode": True,
+        "recompute_vision": True,
+        "vision_recompute_granularity": "full",
+        "vision_recompute_modules": None,
+        "vision_recompute_method": "block",
+        "vision_recompute_num_layers": 30,
+        "freeze_vision_model": False,
+        "freeze_vision_projection": False,
+    }
+
+
 def test_prefer_nvrx_is_noop_when_strategy_import_fails(monkeypatch):
     module = _load_community_import_module(monkeypatch)
     # Force this import to fail even if real megatron modules were preloaded by

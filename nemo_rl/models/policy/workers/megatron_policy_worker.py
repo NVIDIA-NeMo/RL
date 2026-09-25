@@ -4538,6 +4538,12 @@ class MegatronPolicyWorkerImpl(
 
             if self.should_disable_forward_pre_hook:
                 self.disable_forward_pre_hook()
+
+            # NCCL lazily allocates checkpoint communication buffers outside
+            # PyTorch's allocator, so release cached blocks before the save.
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
             save_checkpoint(
                 state=self.mcore_state,
                 model=[self.model],
