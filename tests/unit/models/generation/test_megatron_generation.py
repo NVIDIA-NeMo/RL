@@ -50,6 +50,82 @@ from tests.unit.test_utils import SimpleLossFn
 model_name = "Qwen/Qwen3-0.6B"
 
 
+def _master_config_for_megatron_validation(
+    policy_config: PolicyConfig, data: dict
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        policy=policy_config,
+        data=data,
+        async_rl=SimpleNamespace(
+            recompute_kv_cache_after_weight_updates=False,
+            generation_fleet_health=SimpleNamespace(enabled=False),
+        ),
+    )
+
+
+@pytest.mark.mcore
+def test_nemotron_video_style_materializes_megatron_prompt_contract() -> None:
+    config = deepcopy(basic_megatron_test_config)
+    mcore_config = config["generation"]["mcore_generation_config"]
+    mcore_config["multimodal_prompt_config"] = {
+        "video_spec": {"model_token": "<video>"}
+    }
+    master_config = _master_config_for_megatron_validation(
+        config,
+        {
+            "default": {"video_sampling_style": "nemotron_vl"},
+            "train": {"video_sampling_style": None},
+            "validation": {"video_sampling_style": None},
+        },
+    )
+
+    MegatronGeneration.validate_settings(master_config)
+
+    assert mcore_config["multimodal_prompt_config"]["video_spec"] == {
+        "model_token": "<video>",
+        "content_part_separator": "\n",
+        "expansion_mode": "temporal_patch",
+        "include_frame_timestamps_for_nemotron_vl": True,
+    }
+
+
+@pytest.mark.mcore
+def test_nemotron_video_style_rejects_conflicting_megatron_prompt_contract() -> None:
+    config = deepcopy(basic_megatron_test_config)
+    config["generation"]["mcore_generation_config"]["multimodal_prompt_config"] = {
+        "video_spec": {"expansion_mode": "single"}
+    }
+    master_config = _master_config_for_megatron_validation(
+        config, {"default": {"video_sampling_style": "nemotron_vl"}}
+    )
+
+    with pytest.raises(ValueError, match="video_spec conflicts"):
+        MegatronGeneration.validate_settings(master_config)
+
+
+@pytest.mark.mcore
+def test_split_video_styles_do_not_override_explicit_inference_prompt_config() -> None:
+    config = deepcopy(basic_megatron_test_config)
+    mcore_config = config["generation"]["mcore_generation_config"]
+    mcore_config["multimodal_prompt_config"] = {
+        "video_spec": {"expansion_mode": "single"}
+    }
+    master_config = _master_config_for_megatron_validation(
+        config,
+        {
+            "default": {},
+            "train": {"video_sampling_style": "nemotron_vl"},
+            "validation": {"video_sampling_style": "nemotron_vl"},
+        },
+    )
+
+    MegatronGeneration.validate_settings(master_config)
+
+    assert mcore_config["multimodal_prompt_config"]["video_spec"] == {
+        "expansion_mode": "single"
+    }
+
+
 @pytest.mark.mcore
 @pytest.mark.parametrize(
     ("pixels", "preprocess_mode", "expected_shape"),

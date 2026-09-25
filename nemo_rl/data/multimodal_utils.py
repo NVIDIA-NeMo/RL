@@ -125,6 +125,8 @@ PER_TOKEN_MULTIMODAL_FIELDS = frozenset(
     {
         "token_type_ids",  # gemma3: which tokens are image
         "mm_token_type_ids",  # qwen2.5-vl (transformers>=5.3): text(0)/image(1)/video(2) for 3D RoPE
+        # Which tokens are allowed to be replaced by multimodal embeddings.
+        "media_token_validity_mask",
     }
 )
 
@@ -1668,6 +1670,34 @@ def attach_image_model_inputs_to_message(
             if isinstance(value, PackedTensor)
         }
     )
+    attach_processor_media_token_validity_mask(message, processor)
+
+
+def attach_processor_media_token_validity_mask(
+    message: dict[str, Any], processor: Any
+) -> None:
+    """Record which rollout tokens are processor-owned media placeholders."""
+    token_ids = message.get("token_ids")
+    image_token = getattr(processor, "image_token", None)
+    tokenizer = getattr(processor, "tokenizer", None)
+    convert_token = getattr(tokenizer, "convert_tokens_to_ids", None)
+    if (
+        not isinstance(token_ids, torch.Tensor)
+        or not isinstance(image_token, str)
+        or not callable(convert_token)
+    ):
+        return
+
+    media_token_id = convert_token(image_token)
+    if isinstance(media_token_id, bool) or not isinstance(media_token_id, int):
+        return
+    if media_token_id == getattr(tokenizer, "unk_token_id", None):
+        # An unknown-token fallback does not prove that the processor owns
+        # those positions; masking every literal UNK as media would corrupt text.
+        return
+    # Construct the media placeholder token validity mask, which represents
+    # which tokens are permitted substitutes of multimodal embeddings.
+    message["media_token_validity_mask"] = token_ids.eq(media_token_id)
 
 
 _VIDEO_EXT_TO_MIME = {
@@ -1899,12 +1929,18 @@ def image_counts_by_row(batch: Any, num_rows: int) -> Optional[list[int]]:
 
 
 def attach_media_token_validity_mask(batch: Any, media_token_id: Optional[int]) -> None:
-    """Mark media tokens that anchor nothing, so the model keeps their embedding.
+    """Mark media tokens that do not anchor input media.
 
     Builds the mask while rows still are samples. Sequence packing later
     concatenates those rows into one THD sequence, after which no per-row
     question can be asked, so the packing step carries this through the same
     transform as ``input_ids`` rather than deriving it downstream.
+
+    ``token_mask`` is deliberately not used as media provenance. It is a loss
+    mask, and runs 7310230/7311217 proved that intersecting it with media-token
+    IDs can invalidate one complete 176-feature input-media block. Exact
+    message-owned provenance, when present, wins. The fallback only corrects the
+    unambiguous legacy case: media-token IDs in rows with no attached media.
 
     The batch is duck-typed rather than annotated as ``BatchedDataDict``:
     that module imports this one, so naming it here would be circular.
@@ -1913,6 +1949,21 @@ def attach_media_token_validity_mask(batch: Any, media_token_id: Optional[int]) 
         return
     input_ids = batch.get("input_ids", None)
     if not isinstance(input_ids, torch.Tensor) or input_ids.ndim != 2:
+        return
+    existing_mask = batch.get("media_token_validity_mask", None)
+    if existing_mask is not None:
+        if not isinstance(existing_mask, torch.Tensor):
+            raise TypeError(
+                "media_token_validity_mask must be a torch.Tensor, got "
+                f"{type(existing_mask).__name__}."
+            )
+        if existing_mask.shape != input_ids.shape:
+            raise ValueError(
+                "media_token_validity_mask must align with input_ids: "
+                f"mask={tuple(existing_mask.shape)}, "
+                f"input_ids={tuple(input_ids.shape)}."
+            )
+        batch["media_token_validity_mask"] = existing_mask.bool()
         return
     counts = image_counts_by_row(batch, input_ids.shape[0])
     if counts is None:

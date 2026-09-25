@@ -223,6 +223,28 @@ class MegatronGeneration(GenerationInterface):
         mcore_cfg = cast(MCoreGenerationConfig, policy_config["generation"])[
             "mcore_generation_config"
         ]
+        default_data_config = master_config.data.get("default") or {}
+        if default_data_config.get("video_sampling_style") == "nemotron_vl":
+            prompt_config = mcore_cfg.setdefault("multimodal_prompt_config", {})
+            video_spec = prompt_config.setdefault("video_spec", {})
+            expected_video_spec = {
+                "content_part_separator": "\n",
+                "expansion_mode": "temporal_patch",
+                "include_frame_timestamps_for_nemotron_vl": True,
+            }
+            conflicts = {
+                key: video_spec[key]
+                for key, expected in expected_video_spec.items()
+                if key in video_spec and video_spec[key] != expected
+            }
+            if conflicts:
+                raise ValueError(
+                    "data.default.video_sampling_style='nemotron_vl' requires "
+                    "Megatron's temporal-patch video prompt with frame timestamps, "
+                    f"but multimodal_prompt_config.video_spec conflicts: {conflicts}."
+                )
+            video_spec.update(expected_video_spec)
+
         # Recompute-after-refit is implemented engine-side (kv_cache_management_mode="recompute");
         # the loop-level flag must agree with that mode, and setup errors on a mismatch.
         kv_cache_mode = mcore_cfg["kv_cache_management_mode"]

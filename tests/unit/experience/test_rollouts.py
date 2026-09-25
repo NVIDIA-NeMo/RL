@@ -34,6 +34,7 @@ from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data.multimodal_utils import (
     PackedTensor,
     attach_image_model_inputs_to_message,
+    attach_processor_media_token_validity_mask,
     image_to_data_url,
 )
 from nemo_rl.data.processors import nemo_gym_data_processor
@@ -178,6 +179,10 @@ def test_attach_image_model_inputs_keeps_rollout_tokens_and_packs_media():
     class _TextTokenizer:
         model_input_names = ["input_ids"]
 
+        def convert_tokens_to_ids(self, token):
+            assert token == "<image>"
+            return 8
+
     class _Processor:
         image_token = "<image>"
         image_processor = _ImageProcessor()
@@ -208,6 +213,9 @@ def test_attach_image_model_inputs_keeps_rollout_tokens_and_packs_media():
     # token_ids remain authoritative.
     assert message["token_ids"] is rollout_tokens
     assert "input_ids" not in message
+    torch.testing.assert_close(
+        message["media_token_validity_mask"], torch.tensor([False, True, False])
+    )
 
 
 def test_attach_image_model_inputs_is_a_noop_without_images_or_processor():
@@ -221,15 +229,35 @@ def test_attach_image_model_inputs_is_a_noop_without_images_or_processor():
     assert set(message) == {"role", "content", "token_ids"}
 
 
+def test_processor_media_mask_rejects_unknown_token_fallback():
+    tokenizer = SimpleNamespace(
+        unk_token_id=0,
+        convert_tokens_to_ids=lambda _token: 0,
+    )
+    processor = SimpleNamespace(image_token="<image>", tokenizer=tokenizer)
+    message = {
+        "role": "user",
+        "content": "",
+        "token_ids": torch.tensor([0, 7]),
+    }
+
+    attach_processor_media_token_validity_mask(message, processor)
+
+    assert "media_token_validity_mask" not in message
+
+
 def test_reattach_original_multimodal_payloads_is_media_only_and_turn_aligned():
     first_image = PackedTensor(torch.tensor([[1.0]]), dim_to_pack=0)
     second_image = PackedTensor(torch.tensor([[2.0]]), dim_to_pack=0)
+    first_media_mask = torch.tensor([False, True])
     original_logs = [
         [
             {
                 "role": "user",
                 "content": "first",
+                "token_ids": torch.tensor([1, 7]),
                 "pixel_values": first_image,
+                "media_token_validity_mask": first_media_mask,
                 "request_metadata": {"must_not": "reattach"},
             },
             {"role": "assistant", "content": "answer"},
@@ -245,18 +273,28 @@ def test_reattach_original_multimodal_payloads_is_media_only_and_turn_aligned():
         {
             "_initial_multimodal_data_omitted": True,
             "input_message_log": [
-                {"role": "user", "content": "first"},
-                {"role": "user", "content": "second"},
+                {
+                    "role": "user",
+                    "content": "first",
+                    "token_ids": torch.tensor([7, 2, 7]),
+                },
+                {"role": "user", "content": "second", "token_ids": torch.tensor([3])},
             ],
             "message_log": [
                 {"role": "system", "content": "system"},
                 {
                     "role": "user",
                     "content": "first",
+                    "token_ids": torch.tensor([7, 2, 7]),
                     "pixel_values": "remote placeholder",
                 },
-                {"role": "assistant", "content": "answer"},
-                {"role": "user", "content": "second"},
+                {
+                    "role": "assistant",
+                    "content": "answer",
+                    "token_ids": torch.tensor([7]),
+                    "generation_logprobs": torch.tensor([0.1]),
+                },
+                {"role": "user", "content": "second", "token_ids": torch.tensor([3])},
             ],
         }
     ]
@@ -268,9 +306,17 @@ def test_reattach_original_multimodal_payloads_is_media_only_and_turn_aligned():
             message for message in results[0][log_key] if message["role"] == "user"
         ]
         assert user_messages[0]["pixel_values"] is first_image
+        torch.testing.assert_close(
+            user_messages[0]["media_token_validity_mask"],
+            torch.tensor([True, False, True]),
+        )
+        assert user_messages[0]["media_token_validity_mask"] is not first_media_mask
         assert user_messages[1]["pixel_values"] is second_image
         assert user_messages[1]["vllm_multi_modal_data"] == {"video": "video.mp4"}
         assert "request_metadata" not in user_messages[0]
+    generated_assistant = results[0]["message_log"][2]
+    assert generated_assistant["role"] == "assistant"
+    assert "media_token_validity_mask" not in generated_assistant
 
 
 @pytest.mark.parametrize("omission_marker", [False, None])
