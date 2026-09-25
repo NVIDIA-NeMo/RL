@@ -38,7 +38,6 @@ from torch.distributed.checkpoint._nested_dict import flatten_state_dict
 from torch.distributed.device_mesh import DeviceMesh
 from transformers import AutoTokenizer
 
-
 logger = logging.getLogger(__name__)
 
 
