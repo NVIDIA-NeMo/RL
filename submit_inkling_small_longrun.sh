@@ -27,7 +27,7 @@ done
 WORK_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 RUN=grpo-inkling-small-16n4g-fsdp2-automodel-ep64
 MODEL_DIR=${MODEL_DIR:-/lustre/fsw/general_sa/shuangy/models/thinkingmachines/Inkling-Small}
-CONTAINER=${CONTAINER:-/lustre/fsw/general_sa/shuangy/images/nemo-rl-inkling-main-a9c-tf514-20260922-v7.sqsh}
+CONTAINER=${CONTAINER:-/lustre/fsw/general_sa/shuangy/images/nemo-rl-inkling-main-0aa-tf514-20260924-v9.sqsh}
 PROJECT=${PROJECT:-nemo-rl-Inkling}
 ENTITY=${ENTITY:-nv-welcome}
 CKPTDIR=${CKPTDIR:-$WORK_DIR/results/${PROJECT}_${RUN}}
