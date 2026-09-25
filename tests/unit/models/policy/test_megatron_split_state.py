@@ -73,6 +73,30 @@ pytestmark = pytest.mark.mcore
 WORKER_MOD = "nemo_rl.models.policy.workers.megatron_policy_worker"
 
 
+def test_batch_flops_uses_runtime_freeze_config():
+    from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = _make_worker(None)
+    worker.mcore_state.cfg = SimpleNamespace(
+        peft=None,
+        model=SimpleNamespace(freeze_language_model=False),
+    )
+    worker.cfg["megatron_cfg"]["freeze_config"] = {
+        "freeze_language_model": True,
+        "freeze_vision_model": False,
+        "freeze_vision_projection": False,
+    }
+    data = BatchedDataDict({"input_lengths": torch.tensor([7, 11])})
+
+    # The runtime freeze hook does not change the provider's flag. Counting a
+    # full backward pass here would overstate MFU instead of selecting fallback.
+    with pytest.warns(UserWarning, match="frozen language model"):
+        assert MegatronPolicyWorkerImpl._batch_flops(worker, data) is None
+
+
 # ── Mock fabric ──────────────────────────────────────────────────────────
 
 
@@ -135,6 +159,7 @@ def _make_worker(loss_type):
     w.scheduler.get_wd.return_value = 0.01
     w.mcore_state = MagicMock()
     w.mcore_state.straggler_timer = None
+    w._batch_flops = MagicMock(return_value=100.0)
     w.cfg = {
         "train_global_batch_size": 32,
         "train_micro_batch_size": 4,
@@ -646,6 +671,34 @@ class TestTrainMicrobatch:
 
 
 class TestFinish:
+    def test_flops_accumulate_and_reset_after_finish_and_abort(
+        self, mock_module_symbols
+    ):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w._batch_flops.side_effect = [11.0, 17.0, 23.0, 31.0]
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(_fake_batch())
+        w.train_microbatch(_fake_batch())
+        assert w.finish_train_step()["local_flops"] == 28.0
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(_fake_batch())
+        w.abort_train_step()
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(_fake_batch())
+        assert w.finish_train_step()["local_flops"] == 31.0
+
+    def test_unsupported_chunk_discards_partial_flops(self, mock_module_symbols):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w._batch_flops.side_effect = [11.0, None]
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(_fake_batch())
+        w.train_microbatch(_fake_batch())
+        assert w.finish_train_step()["local_flops"] is None
+
     def _setup_open_step(self, mock_module_symbols, loss_type):
         w = _make_worker(loss_type)
         w.begin_train_step(loss_fn=w._test_loss_fn)

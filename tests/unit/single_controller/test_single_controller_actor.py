@@ -2346,6 +2346,62 @@ def test_train_pump_logs_critic_metrics(monkeypatch) -> None:
     assert "critic/explained_var" in train_metrics
 
 
+@pytest.mark.parametrize("ppo_epochs", [1, 2])
+def test_train_pump_mfu_counts_all_policy_epochs(monkeypatch, ppo_epochs: int) -> None:
+    meta = _single_group_meta()
+    ctrl, _ = _ppo_train_pump_controller(
+        sampler=_OneThenEmptySampler(meta), ppo_epochs=ppo_epochs
+    )
+    ctrl._trainer = MagicMock()
+    ctrl._trainer.finish_train_step.return_value = {
+        "loss": 1.0,
+        "total_flops": 1e15,
+        "theoretical_tflops": 500.0,
+    }
+    ctrl._advantage_stage = AsyncMock(return_value=(meta, True))
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+    monkeypatch.setattr(
+        ctrl._timer,
+        "get_timing_metrics",
+        lambda **kwargs: {"policy_training": 4.0 * ppo_epochs, "total_step_time": 100},
+    )
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    train_metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
+    assert train_metrics["total_flops"] == 1e15 * ppo_epochs
+    assert train_metrics["train_fp_utilization"] == pytest.approx(0.5)
+
+
+def test_train_pump_logs_mfu_on_a_grpo_run(monkeypatch) -> None:
+    meta = _single_group_meta()
+    ctrl = _train_pump_controller(sampler=_OneThenEmptySampler(meta))
+    ctrl._master_config.grpo.num_prompts_per_step = 1
+    ctrl._trainer = MagicMock()
+    ctrl._trainer.finish_train_step.return_value = {
+        "loss": 1.0,
+        "total_flops": 1e15,
+        "theoretical_tflops": 500.0,
+        "flops_from_bridge": 1.0,
+    }
+    ctrl._advantage_stage = AsyncMock(return_value=(meta, True))
+    ctrl._sync_weights = AsyncMock(return_value=1)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+    monkeypatch.setattr(
+        ctrl._timer,
+        "get_timing_metrics",
+        lambda **kwargs: {"policy_training": 4.0, "total_step_time": 100},
+    )
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
+    assert metrics["total_flops"] == 1e15
+    assert metrics["flops_from_bridge"] == 1.0
+    assert metrics["train_fp_utilization"] == pytest.approx(0.5)
+
+
 def test_train_pump_skips_the_critic_on_an_empty_chunk(monkeypatch) -> None:
     """No training tokens means no GAE returns to regress against."""
     meta = _single_group_meta()

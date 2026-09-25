@@ -20,8 +20,35 @@ import pytest
 
 from nemo_rl.algorithms.metric_utils import (
     SetupTimingMetrics,
+    compute_mfu_metrics,
     print_setup_timing_summary,
 )
+
+
+@pytest.mark.parametrize("flops,expected", [(1e15, 0.5), (0.0, 0.0), (3e15, 1.5)])
+def test_mfu_is_an_unclipped_fraction(flops: float, expected: float) -> None:
+    assert compute_mfu_metrics(
+        {"total_flops": flops, "theoretical_tflops": 500}, training_seconds=4
+    ) == {"train_fp_utilization": pytest.approx(expected)}
+
+
+@pytest.mark.parametrize(
+    "results,seconds",
+    [
+        ({}, 4),
+        ({"total_flops": 1e15}, 4),
+        ({"theoretical_tflops": 500}, 4),
+        ({"total_flops": 1e15, "theoretical_tflops": 0}, 4),
+        ({"total_flops": -1, "theoretical_tflops": 500}, 4),
+        ({"total_flops": float("nan"), "theoretical_tflops": 500}, 4),
+        ({"total_flops": 1e15, "theoretical_tflops": float("inf")}, 4),
+        ({"total_flops": 1e15, "theoretical_tflops": 500}, 0),
+        ({"total_flops": 1e15, "theoretical_tflops": 500}, -1),
+        ({"total_flops": 1e15, "theoretical_tflops": 500}, float("nan")),
+    ],
+)
+def test_mfu_omits_missing_or_invalid_inputs(results: dict, seconds: float) -> None:
+    assert compute_mfu_metrics(results, training_seconds=seconds) == {}
 
 
 class TestPrintSetupTimingSummary:

@@ -18,7 +18,6 @@ import pytest
 import torch
 from transformers.configuration_utils import PretrainedConfig
 
-from nemo_rl.models.policy.lm_policy import _aggregate_megatron_flops_metrics
 from nemo_rl.utils.flops_formulas import FLOPSConfig, glm_moe_dsa, qwen3
 from nemo_rl.utils.flops_tracker import (
     FLOPTracker,
@@ -26,7 +25,44 @@ from nemo_rl.utils.flops_tracker import (
     get_hf_config,
     get_theoretical_tflops,
     is_using_tf32,
+    resolve_flops_metrics,
 )
+
+
+def test_bridge_flops_take_priority_over_fallback():
+    assert resolve_flops_metrics(
+        [{"local_flops": 11.0}, {"local_flops": 17.0}], fallback_flops=999.0
+    ) == {"total_flops": 28.0, "flops_from_bridge": 1.0}
+
+
+@pytest.mark.parametrize("fallback", [None, 123.0])
+def test_unsupported_bridge_uses_only_complete_fallback(fallback):
+    with pytest.warns(UserWarning, match="unsupported"):
+        metrics = resolve_flops_metrics(
+            [{"local_flops": 11.0}, {"local_flops": None}], fallback_flops=fallback
+        )
+    assert metrics == (
+        {} if fallback is None else {"total_flops": fallback, "flops_from_bridge": 0.0}
+    )
+
+
+@pytest.mark.parametrize("value", [-1, float("nan"), float("inf")])
+def test_invalid_bridge_result_does_not_fall_back(value):
+    with pytest.raises(ValueError, match="Invalid Bridge"):
+        resolve_flops_metrics([{"local_flops": value}], fallback_flops=123.0)
+
+
+def test_missing_shard_does_not_report_partial_bridge_flops():
+    with pytest.raises(ValueError, match="Missing Bridge"):
+        resolve_flops_metrics([{"local_flops": 1.0}, {}], fallback_flops=123.0)
+
+
+def test_backend_agnostic_flops_remain_available():
+    assert resolve_flops_metrics([{}], fallback_flops=123.0) == {
+        "total_flops": 123.0,
+        "flops_from_bridge": 0.0,
+    }
+    assert resolve_flops_metrics([{}], fallback_flops=None) == {}
 
 
 class GlmMoeDsaConfigForTest(PretrainedConfig):
@@ -234,73 +270,6 @@ def test_glm_5_2_reused_indices_reduce_indexer_flops():
         seq_len * projection_params + dense_causal_pairs * 32 * 128
     )
     assert actual_difference == (78 - 21) * per_layer_indexer_flops
-
-
-def test_worker_total_flops_aggregation_megatron_path():
-    """Verify _aggregate_megatron_flops_metrics for the basic case (no train_elapsed_seconds)."""
-    world_size = 8
-    results = [
-        {
-            "total_flops": 1.0e15,
-            "num_ranks": world_size,
-            "gpu_name": "NVIDIA H100 80GB HBM3",
-            "model_dtype": torch.bfloat16,
-        }
-    ]
-
-    aggregated_results = _aggregate_megatron_flops_metrics(results, world_size)
-
-    assert aggregated_results["total_flops"] == pytest.approx(1.0e15)
-    assert aggregated_results["num_ranks"] == 8
-    assert "train_elapsed_seconds" not in aggregated_results
-    # 8 GPUs × (1979/2 TFLOPS) for H100 bfloat16
-    assert aggregated_results["theoretical_tflops"] == pytest.approx(8 * 1979 / 2)
-
-
-def test_worker_total_flops_aggregation_megatron_path_with_elapsed():
-    """Verify train_elapsed_seconds is forwarded when present in worker results."""
-    world_size = 4
-    results = [
-        {
-            "total_flops": 2.0e15,
-            "num_ranks": world_size,
-            "gpu_name": "NVIDIA H100 80GB HBM3",
-            "model_dtype": torch.bfloat16,
-            "train_elapsed_seconds": 3.5,
-        }
-    ]
-
-    aggregated_results = _aggregate_megatron_flops_metrics(results, world_size)
-
-    assert aggregated_results["total_flops"] == pytest.approx(2.0e15)
-    assert aggregated_results["num_ranks"] == 4
-    assert aggregated_results["train_elapsed_seconds"] == pytest.approx(3.5)
-    assert aggregated_results["theoretical_tflops"] == pytest.approx(4 * 1979 / 2)
-
-
-def test_worker_total_flops_aggregation_unknown_gpu_warns():
-    """Verify a warning is emitted and theoretical_tflops is absent for unknown GPUs."""
-    world_size = 2
-    results = [
-        {
-            "total_flops": 1.0e14,
-            "num_ranks": world_size,
-            "gpu_name": "NVIDIA UNKNOWN GPU XYZ",
-            "model_dtype": torch.bfloat16,
-        }
-    ]
-
-    import warnings
-
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always")
-        aggregated_results = _aggregate_megatron_flops_metrics(results, world_size)
-
-    assert aggregated_results["total_flops"] == pytest.approx(1.0e14)
-    assert aggregated_results["num_ranks"] == 2
-    assert "theoretical_tflops" not in aggregated_results
-    assert len(w) == 1
-    assert "theoretical flops" in str(w[0].message).lower()
 
 
 @pytest.mark.parametrize(

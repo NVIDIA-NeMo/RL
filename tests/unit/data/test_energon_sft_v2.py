@@ -124,6 +124,36 @@ def test_sft_v2_worker_uses_megatron_worker_environment() -> None:
     )
 
 
+@pytest.mark.parametrize("multimodal", [False, True])
+def test_loader_uses_processor_or_worker_tokenizer(multimodal) -> None:
+    from nemo_rl.data.energon.sft_worker import SFTMegatronPolicyWorker
+
+    worker_cls = SFTMegatronPolicyWorker.__ray_metadata__.modified_class
+    worker = object.__new__(worker_cls)
+    worker._is_replica_leader = lambda: True
+    worker._sft_loader = None
+    worker.tokenizer = object()
+    worker._sft_processor = object() if multimodal else None
+    with (
+        patch("nemo_rl.data.energon.sft_worker.parallel_state") as topology,
+        patch("nemo_rl.data.energon.sft_worker.build_energon_sft_loader") as build,
+    ):
+        topology.get_data_parallel_rank.return_value = 0
+        topology.get_data_parallel_world_size.return_value = 1
+        assert worker.setup_sft_dataloader(
+            data_config={"train": {"path": "/dataset"}},
+            batch_size=1,
+            max_sequence_length=128,
+            placement_fingerprint="single-dp",
+            packing_algorithm=None,
+            max_sequences_per_bin=None,
+            sequence_length_pad_multiple=1,
+            only_unmask_final=False,
+        )
+    expected = worker._sft_processor if multimodal else worker.tokenizer
+    assert build.call_args.kwargs["processor"] is expected
+
+
 def test_sft_v2_worker_publishes_sequence_alignment() -> None:
     from nemo_rl.data.energon.sft_worker import SFTMegatronPolicyWorker
 

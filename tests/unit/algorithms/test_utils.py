@@ -493,9 +493,11 @@ def test_sync_colocated_throughput_flops_and_imbalance(capsys):
     assert "Floating Point Utilization" in out
 
 
-def test_train_elapsed_seconds_used_for_flops_calculation(capsys):
+@pytest.mark.parametrize("packing", [False, True])
+def test_train_elapsed_seconds_used_for_flops_calculation(capsys, packing):
     """train_elapsed_seconds in train_results overrides policy_training timing for TFLOPS."""
     master_config = _base_master_config(colocated=True)
+    master_config.policy["sequence_packing"] = {"enabled": packing}
 
     timing_metrics = {
         "policy_and_reference_logprobs": 2.0,

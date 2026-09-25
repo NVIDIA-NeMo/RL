@@ -31,6 +31,7 @@ from pydantic import BaseModel
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.loss.loss_functions import NLLLossFn
+from nemo_rl.algorithms.metric_utils import compute_mfu_metrics
 from nemo_rl.algorithms.sft import SFTConfig
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data import DataConfig
@@ -266,6 +267,7 @@ class SFTSingleControllerActor:
             )
             train_results = self._trainer.finish_train_step()
             step_open = False
+            policy_seconds = time.monotonic() - train_started
             self._owner_call("commit_sft_batch")
         except Exception:
             if step_open:
@@ -279,7 +281,6 @@ class SFTSingleControllerActor:
                 warnings.warn(f"SFTv2 loader abort failed: {error}", stacklevel=2)
             raise
 
-        policy_seconds = time.monotonic() - train_started
         valid_tokens = sum(envelope.valid_tokens for envelope in envelopes)
         self._save_state.total_steps += 1
         self._save_state.consumed_samples += sum(
@@ -303,6 +304,9 @@ class SFTSingleControllerActor:
             / max(time.monotonic() - started, 1e-12),
         }
         metrics.update(self._policy_metrics(train_results))
+        metrics.update(
+            compute_mfu_metrics(train_results, training_seconds=policy_seconds)
+        )
         return metrics
 
     @staticmethod
@@ -319,7 +323,12 @@ class SFTSingleControllerActor:
                 metrics[key] = np.sum(values).item()
         for key, value in train_results.get("moe_metrics", {}).items():
             metrics[f"moe/{key}"] = value
-        for key in ("total_flops", "num_ranks", "theoretical_tflops"):
+        for key in (
+            "total_flops",
+            "num_ranks",
+            "theoretical_tflops",
+            "flops_from_bridge",
+        ):
             if key in train_results:
                 metrics[key] = train_results[key]
         return metrics
@@ -483,13 +492,11 @@ def setup_sft_v2(
     if not isinstance(tokenizer_or_processor, PreTrainedTokenizerBase):
         processor = tokenizer_or_processor
         tokenizer = tokenizer_or_processor.tokenizer
-    if processor is None:
-        raise ValueError("SFTv2 requires a multimodal processor.")
     # Workers rebuild the processor in-process rather than receiving it as a
     # pickled constructor argument. A trust_remote_code processor's class lives
     # in ``transformers_modules``, which Ray's worker interpreters cannot import
     # while deserializing their arguments, so shipping the object fails there.
-    master_config.policy["tokenizer"]["use_processor"] = True
+    master_config.policy["tokenizer"]["use_processor"] = processor is not None
 
     checkpoint_probe = CheckpointManager(master_config.checkpointing)
     latest = checkpoint_probe.get_latest_checkpoint_path()

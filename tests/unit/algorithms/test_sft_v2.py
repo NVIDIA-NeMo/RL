@@ -34,6 +34,18 @@ from nemo_rl.models.policy.lm_policy import Policy
 _ACTOR_CLS = SFTSingleControllerActor.__ray_metadata__.modified_class
 
 
+@pytest.mark.parametrize(
+    ("config_name", "use_processor"), [("sft.yaml", False), ("sft_vlm_3B.yaml", True)]
+)
+def test_tokenizer_mode_is_defined_by_config(config_name, use_processor):
+    from nemo_rl.utils.config import load_config
+
+    config = load_config(
+        Path(__file__).resolve().parents[3] / "examples" / "configs" / config_name
+    )
+    assert config.policy.tokenizer.use_processor is use_processor
+
+
 def _envelope(rank: int, *, source_count: int = 1) -> StepEnvelope:
     return StepEnvelope(
         meta=KVBatchMeta(
@@ -143,6 +155,50 @@ def test_train_step_aborts_policy_and_loader_on_training_failure() -> None:
     controller._trainer.abort_train_step.assert_called_once_with()
     controller._owner_call.assert_called_once_with("abort_sft_batch")
     assert controller._save_state.total_steps == 0
+
+
+def test_train_step_mfu_excludes_loading_and_loader_commit() -> None:
+    controller = _controller()
+    controller._trainer.finish_train_step.return_value.update(
+        total_flops=1e15, theoretical_tflops=500.0, num_ranks=2
+    )
+    # Loading takes 10 s, training 4 s, and loader commit another 6 s.
+    with patch(
+        "nemo_rl.algorithms.sft_v2.time.monotonic",
+        side_effect=[0.0, 10.0, 14.0, 20.0, 20.0],
+    ):
+        metrics = controller._run_train_step()
+    assert metrics["policy_time"] == 4.0
+    assert metrics["total_step_time"] == 20.0
+    assert metrics["train_fp_utilization"] == pytest.approx(0.5)
+
+
+def test_train_step_omits_mfu_for_unsupported_model() -> None:
+    assert "train_fp_utilization" not in _controller()._run_train_step()
+
+
+def test_run_logs_mfu_at_the_optimizer_step() -> None:
+    controller = _controller()
+    controller._max_steps = 1
+    controller._logger = MagicMock()
+    controller._timeout = MagicMock()
+    controller._timeout.check_save.return_value = False
+    controller._should_save = MagicMock(return_value=False)
+    controller._checkpoint_metric = MagicMock(return_value={})
+    controller._close_loaders = MagicMock()
+    controller._checkpointer = MagicMock()
+    controller._trainer.finish_train_step.return_value.update(
+        total_flops=1e15, theoretical_tflops=500.0, flops_from_bridge=1.0
+    )
+    with patch(
+        "nemo_rl.algorithms.sft_v2.time.monotonic",
+        side_effect=[0.0, 10.0, 14.0, 20.0, 20.0],
+    ):
+        controller.run()
+    logged, step = controller._logger.log_metrics.call_args.args
+    assert step == 1
+    assert logged["train_fp_utilization"] == pytest.approx(0.5)
+    assert logged["flops_from_bridge"] == 1.0
 
 
 def _save_controller(**checkpointing: Any) -> object:
