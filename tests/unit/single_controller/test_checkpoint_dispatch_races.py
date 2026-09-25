@@ -91,6 +91,7 @@ def _init_recovery_telemetry(controller: Any, *, train_steps: int = 0) -> None:
     """Initialize constructor-owned telemetry state for hand-built controllers."""
     controller._train_steps = train_steps
     controller._logger = MagicMock()
+    controller._gym_restart_unfinished = False
 
 
 async def _wait_for_event_or_pump(
@@ -189,6 +190,7 @@ class _PendingLedger:
     def state_dict(self) -> dict[str, Any]:
         return {
             "schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+            "pending_completed_execution_acknowledgements": [],
             "groups": [
                 {
                     "group_id": group.group_id,
@@ -267,6 +269,10 @@ class _BlockingRolloutManager:
     ) -> None:
         """Accept the controller-owned barrier used by the production manager."""
         del barrier
+
+    def bind_gym_acknowledgement_sink(self, sink: Any) -> None:
+        """Accept the optional Gym ACK collaborator used by the controller."""
+        del sink
 
     def reserve_prompt_group(
         self,
@@ -1202,6 +1208,7 @@ def test_recovery_load_does_not_require_every_unfinished_group_to_fit_at_once(
         rollout_manager = _RecoveryRolloutManager(RolloutRecoveryLedger())
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = object.__new__(controller_cls)
+        _init_recovery_telemetry(controller)
         controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
         controller._rollout_manager = rollout_manager
         controller._master_config = SimpleNamespace(
