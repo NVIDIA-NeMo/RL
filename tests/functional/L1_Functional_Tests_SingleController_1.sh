@@ -13,7 +13,7 @@
 # limitations under the License.
 
 #!/bin/bash
-set -xeuo pipefail
+set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 PROJECT_ROOT=$(realpath ${SCRIPT_DIR}/../..)
@@ -34,12 +34,12 @@ run_test() {
     fi
 }
 
-run_test uv run --no-sync bash ./tests/functional/grpo_vllm_mxfp8_rollout_gb200.sh
-
-# MXFP8 leg of the Megatron M-to-N reshard refit. Sized for 2 GPUs
-# (cluster.gpus_per_node=2, 1 train + 1 gen), so it fits this shard's runner.
-# MXFP8 inference is Blackwell-only, which is what this runner provides.
-run_test env REFIT_PRECISION=mxfp8 uv run --no-sync bash ./tests/functional/grpo_megatron_generation_nccl_reshard_refit.sh
+run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller.sh
+# Same non-colocated vLLM SingleController smoke, but install refitted weights
+# through vLLM's native reload_weights API.
+run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_reload_refit.sh
+run_test fast uv run --no-sync bash ./tests/functional/ppo_async_single_controller.sh
+run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then
