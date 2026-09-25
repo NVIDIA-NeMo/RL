@@ -365,6 +365,55 @@ GRPO uses temperature, top-p (nucleus sampling), and top-k sampling during rollo
 
 **Known issue (Qwen models):** For some Qwen-based models, a `ValueError: Token id 151708 is out of vocabulary` error may occur when the policy drifts from its initial distribution. Setting `top_p` to `0.9999` in the generation config is a recommended workaround. For details and discussion, see [#237](https://github.com/NVIDIA-NeMo/RL/issues/237).
 
+### Masked rewards in advantage statistics
+
+`grpo.masked_reward_policy` controls whether loss-masked rewards participate in
+advantage statistics across synchronous GRPO (legacy and TransferQueue trainers),
+asynchronous GRPO, and SingleController. It covers GRPO's group baseline/std, GDPO's per-reward
+baseline/std and final batch normalization, and Reinforce++'s optional group
+baseline and token-level batch normalization:
+
+- `exclude` (default): use the final sample loss mask for reward participation.
+- `include`: let rewards from usable rollout rows participate, including rows
+  removed by environment, overlong, or sequence-logprob-error filters.
+
+Both options preserve the sample and token loss masks, so masked rows have no
+direct loss. Reinforce++ uses response tokens from participating samples for
+normalization, always excluding prompt and padding tokens; this also applies when
+`minus_baseline=false`. GDPO retains sample-level normalization with an unbiased
+standard deviation, and Reinforce++ retains token-level population variance.
+For example, with
+rewards `[1, 1, 0]`, a masked last row, and leave-one-out disabled, the valid rows'
+baseline is `1` under `exclude` and `2/3` under `include`.
+
+To compare the policies, use the paired
+[exclude experiment config](../../examples/configs/experiments/grpo-qwen2.5-1.5b-1n1g-dtensor2tp1-masked-reward-exclude.yaml)
+and [include experiment config](../../examples/configs/experiments/grpo-qwen2.5-1.5b-1n1g-dtensor2tp1-masked-reward-include.yaml),
+which differ only in `grpo.masked_reward_policy`, or override that key on your
+existing config. Keep the revisions and all other settings identical.
+
+In the legacy and TransferQueue trainers, `include` also includes rewards from
+rows with pre-existing zero loss weights. SingleController preserves the raw
+data-plane sample mask under both policies: rows with zero validity, including
+token-capture placeholders, never enter group statistics or batch normalization.
+An environment-masked result with a usable rollout is distinct from a placeholder
+with no usable tokens.
+
+Synchronous dynamic sampling uses the same policy for its reward standard
+deviation, applying the environment, pre-existing loss, and overlong masks
+available at that stage. Sequence-logprob-error masking happens later and therefore
+affects final advantage statistics but cannot affect this earlier admission step.
+Groups with at most one participating reward retain the existing zero
+group-relative reward difference before batch normalization. GDPO returns zeros
+when the entire batch has at most one participating sample; Reinforce++ returns
+zeros when normalization has no participating tokens. Batch normalization and
+Reinforce++'s optional token-level KL penalty still apply otherwise.
+SingleController skips advantage computation when a whole chunk has no trainable
+tokens, under either policy.
+
+This setting does not change PPO, OPD, DPO, SFT, or reward-model training. They do
+not use these group-relative reward estimators.
+
 ## Performance Optimizations
 
 RL generations typically produce highly variable sequence lengths, which result in a significant amount of padding if approached naively. We address this with Sequence Packing and Dynamic Batching, which are techniques to reduce the amount of padding required. You can read more about these in the [design doc](../design-docs/sequence-packing-and-dynamic-batching.md).

@@ -5244,6 +5244,14 @@ class SingleControllerActor:
             self._step_log_dict["seq_logprob_error_metrics"].append(seq_error_metrics)
 
         mask = token_mask * final_sample_mask.unsqueeze(-1)
+        advantage_valid_mask = final_sample_mask
+        if (
+            not self._is_ppo
+            and cast(GRPOConfig, self._algo_cfg).masked_reward_policy == "include"
+        ):
+            # Include policy-filtered rewards, but retain the data-plane validity
+            # mask: token-capture placeholders must never vote in statistics.
+            advantage_valid_mask = sample_mask
 
         repeated_batch: dict[str, torch.Tensor] = {
             "total_reward": rewards,
@@ -5285,10 +5293,8 @@ class SingleControllerActor:
                 rewards=rewards,
                 mask=mask,
                 repeated_batch=repeated_batch,
-                # Real validity (token-capture placeholders carry sample_mask 0,
-                # and mask_sample/overlong/seq-logprob-error rows are folded in
-                # via final_sample_mask) instead of the hardwired all-ones.
-                valid_mask=final_sample_mask,
+                valid_mask=advantage_valid_mask,
+                normalization_mask=token_mask * advantage_valid_mask.unsqueeze(-1),
                 **kwargs,
             )
             if self._is_ppo:
