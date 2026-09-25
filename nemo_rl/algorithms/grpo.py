@@ -63,6 +63,7 @@ from nemo_rl.algorithms.reward_functions import (
 )
 from nemo_rl.algorithms.utils import (
     WALL_CLOCK_EFFICIENCY_CATEGORIES,
+    aggregate_policy_update_results,
     calculate_baseline_and_std_per_prompt,
     calculate_trivial_reward_distributions,
     compute_seq_logprob_errors,
@@ -328,6 +329,8 @@ _REWARD_PENALTY_FLAGS = (
 class GRPOConfig(BaseModel, extra="allow"):
     num_prompts_per_step: int = 32
     num_generations_per_prompt: int = 16
+    # Number of policy updates performed on each rollout batch.
+    num_updates_per_rollout: int = Field(default=1, ge=1)
     max_num_epochs: int = 1
     max_num_steps: int = 1000000
     max_rollout_turns: int = 1
@@ -845,6 +848,10 @@ def setup(
 
     # Validate force_on_policy_ratio
     if loss_config.force_on_policy_ratio:
+        assert grpo_config.num_updates_per_rollout == 1, (
+            "force_on_policy_ratio requires grpo.num_updates_per_rollout == 1 "
+            "because repeated updates reuse off-policy rollouts"
+        )
         assert (
             grpo_config.num_prompts_per_step * grpo_config.num_generations_per_prompt
             == policy_config["train_global_batch_size"]
@@ -1273,7 +1280,7 @@ def setup(
 
     if policy_config.get("megatron_cfg", {}).get("enabled", False):
         ## NOTE: this is equal to the total number of scheduler steps
-        total_train_iters = min(
+        total_train_iters = grpo_config.num_updates_per_rollout * min(
             grpo_config.max_num_steps,
             grpo_config.max_num_epochs * train_sample_count,
         )
@@ -3709,7 +3716,8 @@ def _grpo_train_impl(
                     policy.prepare_for_training()  # set model train and reload optim to GPU
                     POLICY_GENERATION_STALE = True
 
-                print("▶ Training policy...", flush=True)
+                num_updates_per_rollout = master_config.grpo.num_updates_per_rollout
+                update_results = []
                 with (
                     timer.time("policy_training"),
                     managed_span(
@@ -3719,11 +3727,22 @@ def _grpo_train_impl(
                         **{"rl.iteration": total_steps + 1},
                     ),
                 ):
-                    train_results = policy.train(
-                        train_data,
-                        loss_fn,
-                        timer=timer,
-                    )
+                    for update_idx in range(num_updates_per_rollout):
+                        print(
+                            f"▶ Training policy update {update_idx + 1}/{num_updates_per_rollout}...",
+                            flush=True,
+                        )
+                        train_results = policy.train(
+                            train_data,
+                            loss_fn,
+                            timer=timer,
+                        )
+                        update_results.append(train_results)
+                        print(
+                            f"    • Policy loss: {train_results['loss'].mean().item():.4f}",
+                            flush=True,
+                        )
+                train_results = aggregate_policy_update_results(update_results)
 
                 # Recompute KV scales after policy training if needed
                 if sync_kv_scales:
@@ -4124,6 +4143,17 @@ def _grpo_train_impl(
                 if k != "total_step_time":
                     percent = (v / total_time * 100) if total_time > 0 else 0
                     print(f"  • {k}: {v:.2f}s ({percent:.1f}%)", flush=True)
+
+            # Amortize the full rollout step across all updates on its batch.
+            # Keep total_step_time unchanged for throughput and wall-time accounting.
+            timing_metrics["time_per_policy_update"] = (
+                total_time / num_updates_per_rollout
+            )
+            print(
+                "  • Time per policy update (amortized): "
+                f"{timing_metrics['time_per_policy_update']:.2f}s",
+                flush=True,
+            )
 
             timing_metrics["valid_tokens_per_sec_per_gpu"] = (
                 metrics["global_valid_toks"] / total_time / total_num_gpus
@@ -5527,7 +5557,8 @@ def async_grpo_train(
                     policy.prepare_for_training()
                     POLICY_GENERATION_STALE = True
 
-                print("▶ Training policy...")
+                num_updates_per_rollout = master_config.grpo.num_updates_per_rollout
+                update_results = []
                 with (
                     timer.time("policy_training"),
                     managed_span(
@@ -5537,11 +5568,22 @@ def async_grpo_train(
                         **{"rl.iteration": step + 1},
                     ),
                 ):
-                    train_results = policy.train(
-                        train_data,
-                        loss_fn,
-                        timer=timer,
-                    )
+                    for update_idx in range(num_updates_per_rollout):
+                        print(
+                            f"▶ Training policy update {update_idx + 1}/{num_updates_per_rollout}...",
+                            flush=True,
+                        )
+                        train_results = policy.train(
+                            train_data,
+                            loss_fn,
+                            timer=timer,
+                        )
+                        update_results.append(train_results)
+                        print(
+                            f"    • Policy loss: {train_results['loss'].mean().item():.4f}",
+                            flush=True,
+                        )
+                train_results = aggregate_policy_update_results(update_results)
 
                 is_last_step = step + 1 == max_num_steps
                 should_save_by_step = (
@@ -6022,6 +6064,17 @@ def async_grpo_train(
                 master_config.cluster["num_nodes"]
                 * master_config.cluster["gpus_per_node"]
             )
+            # Amortize the full rollout step across all updates on its batch.
+            # Keep total_step_time unchanged for throughput and wall-time accounting.
+            timing_metrics["time_per_policy_update"] = (
+                total_time / num_updates_per_rollout
+            )
+            print(
+                "  • Time per policy update (amortized): "
+                f"{timing_metrics['time_per_policy_update']:.2f}s",
+                flush=True,
+            )
+
             timing_metrics["valid_tokens_per_sec_per_gpu"] = (
                 metrics["global_valid_toks"] / total_time / total_num_gpus
             )

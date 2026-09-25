@@ -1083,6 +1083,12 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
     """
     algo_cfg = algo_config(master_config)
 
+    if isinstance(algo_cfg, GRPOConfig) and algo_cfg.num_updates_per_rollout != 1:
+        raise NotImplementedError(
+            "grpo.num_updates_per_rollout != 1 is not supported on the "
+            "SingleController path. Set grpo.num_updates_per_rollout=1."
+        )
+
     # None means no epoch bound. SC has no -1 convention though: the rollout pump
     # gates on _current_epoch < max_num_epochs, so <= 0 trains nothing and exits 0.
     if algo_cfg.max_num_epochs is not None and algo_cfg.max_num_epochs <= 0:
