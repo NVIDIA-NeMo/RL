@@ -2105,6 +2105,10 @@ class CrossTokenizerDistillationLossConfig(TypedDict):
             detached magnitude matches CE, then add CE; ``kl_loss_weight`` /
             ``ce_loss_scale`` are ignored in this mode. Applies to both the
             P-KL and gold-loss paths.
+        logical_window_controls: If True, the Automodel worker collects detached
+            statistics over the optimizer batch before backward. Currently limited
+            to DP1/TP1/CP1, same-vocabulary, full-vocabulary distillation at T=1,
+            with dynamic scaling in sum mode or batch-wide teacher selection.
         student_vocab_size: Full student tokenizer vocab size, used to size
             the projection matrix's student-side (V_s) axis. Runtime-injected
             by ``xtoken_off_policy_distillation.setup`` from ``len(student_tokenizer)``;
@@ -2129,6 +2133,7 @@ class CrossTokenizerDistillationLossConfig(TypedDict):
     kl_loss_weight: float
     ce_loss_scale: float
     dynamic_loss_scaling: bool
+    logical_window_controls: NotRequired[bool]
     # Multi-teacher aggregation (user loss_fn knobs). gold_loss/xtoken_loss above
     # are the global defaults; teachers[i].gold_loss / .xtoken_loss can override
     # them per teacher in kd_loss_mode="sum".
@@ -2316,6 +2321,32 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                 f"per-teacher lists must be equal length, got {per_teacher_lens}"
             )
         self.num_teachers = len(self.projection_matrix_paths)
+        # Opt in to optimizer-batch statistics within the supported configuration.
+        self.logical_window_controls = cfg.get("logical_window_controls", False)
+        self._window_phase = None
+        self._window_ce_kd = []
+        self._window_teacher_stats = []
+        self._window_control = None
+        if self.logical_window_controls:
+            if not all(p is None for p in self.projection_matrix_paths):
+                raise NotImplementedError(
+                    "Window controls currently require the same vocabulary"
+                )
+            if (
+                self.kd_loss_mode not in ("sum", "select_teacher")
+                or self.sum_weights_metric is not None
+            ):
+                raise NotImplementedError(
+                    "Window controls support static sum or select_teacher"
+                )
+            if self.dynamic_loss_scaling and self.kd_loss_mode != "sum":
+                raise NotImplementedError(
+                    "Combined dynamic scaling and teacher selection are not supported"
+                )
+            if self.temperature != 1.0 or self.vocab_topk < self.student_vocab_size:
+                raise NotImplementedError(
+                    "Window controls require T=1 and the full vocabulary"
+                )
         # The materialized projection matrix and the derived exact-map
         # partition both live in process-local caches in
         # ``x_token.loss_utils`` (see ``get_sparse_projection_matrix``,
@@ -2323,6 +2354,39 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         # this instance. That keeps the driver-side ``loss_fn`` free of
         # any large CUDA tensors and lets multiple loss instances on
         # the same worker share one load.
+
+    def begin_logical_window_control_collection(self) -> None:
+        if self._window_phase is not None:
+            raise RuntimeError("Nested logical-window control collection")
+        self._window_phase = "collect"
+        self._window_ce_kd = []
+        self._window_teacher_stats = []
+        self._window_control = None
+
+    def finalize_logical_window_control_collection(self) -> None:
+        if self._window_phase != "collect" or not self._window_ce_kd:
+            raise RuntimeError("Missing logical-window collection")
+        # CE and same-vocab KD already share the logical token denominator.
+        # Sum numerators before taking a single detached ratio.
+        totals = torch.stack(self._window_ce_kd).sum(dim=0)
+        ce, kd = totals[0].abs(), totals[1].abs()
+        ratio = torch.where(kd > 0, ce / kd, torch.ones_like(kd))
+        selected = None
+        scores = None
+        if self.kd_loss_mode == "select_teacher":
+            stats = torch.stack(self._window_teacher_stats).sum(dim=0)
+            scores = stats[:, 0] / stats[:, 1].clamp(min=1.0)
+            selected = int(torch.argmin(scores).item())  # first-index tie break
+        self._window_control = {
+            "ratio": ratio.detach(),
+            "selected_teacher": selected,
+            "ce_kd_sums": totals.detach(),
+            "teacher_scores": scores,
+        }
+        self._window_phase = "apply"
+
+    def end_logical_window_control(self) -> None:
+        self._window_phase = None
 
     def _teacher_is_same_vocab(self, i: int) -> bool:
         """A teacher is same-vocab (direct KL, no projection) iff its path is None."""
@@ -2397,6 +2461,10 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         else:
             raise ValueError(f"Unknown kd_loss_mode: {self.kd_loss_mode!r}")
 
+        if self._window_phase == "collect":
+            self._window_ce_kd.append(
+                torch.stack((ce_loss.detach().double(), total_kd.detach().double()))
+            )
         # Combine the aggregated KD term with the single student CE term.
         if self.dynamic_loss_scaling:
             # loss = sg(ce/kd) * kd + ce; user kl_loss_weight / ce_loss_scale
@@ -2408,6 +2476,8 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                 ce_detached / kd_detached,
                 torch.ones_like(kd_detached),
             )
+            if self._window_phase == "apply":
+                kl_scale = self._window_control["ratio"].to(total_kd)
             loss = kl_scale * total_kd + ce_loss
         else:
             kl_scale = torch.tensor(1.0, device=total_kd.device, dtype=total_kd.dtype)
@@ -2862,6 +2932,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         """Use only the teacher with the lowest next-token CE on its own tokens."""
         with torch.no_grad():
             ces: list[float] = []
+            teacher_stats = []
             for i in range(self.num_teachers):
                 t_logits, t_ids, t_mask = self._teacher_score_inputs(
                     i, data, teacher_full_logits_by_idx, aligns_by_idx
@@ -2875,7 +2946,14 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                     t_mask[:, 1:].float() * data["sample_mask"].unsqueeze(-1).float()
                 ).reshape(-1)
                 ces.append(self._dp_global_masked_mean(ce_pos, mask).item())
+                teacher_stats.append(
+                    torch.stack(((ce_pos * mask).double().sum(), mask.double().sum()))
+                )
             best = int(min(range(self.num_teachers), key=lambda j: ces[j]))
+            if self._window_phase == "collect":
+                self._window_teacher_stats.append(torch.stack(teacher_stats))
+            if self._window_phase == "apply":
+                best = self._window_control["selected_teacher"]
 
         kd, m = self._compute_teacher_kd(
             best,
