@@ -31,6 +31,11 @@ _BUILDS_MASTER_CONFIG = re.compile(r"MasterConfig(\(\*\*|\.model_validate)")
 _EXEMPT = {"run_eval.py": "eval configs do not use the train/validation data layout"}
 
 
+# ============================================================================
+# Entrypoint wiring
+# ============================================================================
+
+
 @pytest.mark.parametrize("entrypoint", entrypoints, ids=lambda p: p.name)
 def test_every_entrypoint_checks_outdated_config(entrypoint):
     """An entrypoint that builds a MasterConfig must also reject outdated config.
@@ -49,6 +54,11 @@ def test_every_entrypoint_checks_outdated_config(entrypoint):
         f"{entrypoint.name} builds a MasterConfig but never calls "
         "check_outdated_config(). Add the call right after the config is built."
     )
+
+
+# ============================================================================
+# reject_outdated_dtensor_v2_key
+# ============================================================================
 
 
 def test_absent_key_passes():
@@ -74,6 +84,11 @@ def test_each_teacher_is_checked():
         )
 
 
+# ============================================================================
+# reject_outdated_dataset_config
+# ============================================================================
+
+
 def test_flat_dataset_config_is_rejected():
     with pytest.raises(ValueError, match="data has no train section"):
         check_outdated_config({"data": {"dataset_name": "AIME2024"}})
@@ -85,6 +100,11 @@ def test_split_dataset_config_passes():
 
 def test_absent_data_section_passes():
     check_outdated_config({"policy": {}})
+
+
+# ============================================================================
+# reject_outdated_metric_name_format
+# ============================================================================
 
 
 @pytest.mark.parametrize("metric_name", ["val:accuracy", "train:loss", None])
