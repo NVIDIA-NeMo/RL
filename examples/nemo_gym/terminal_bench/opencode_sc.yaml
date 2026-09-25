@@ -10,6 +10,10 @@ grpo:
   max_num_steps: 100
   skip_reference_policy_logprobs_calculation: true
   seq_logprob_error_threshold: 2
+  # Rollouts cut at max_total_sequence_length or matched by env.mask_sample_rules
+  # get no gradient but keep their reward in the group baseline.
+  overlong_filtering: true
+  masked_sample_rewards_in_baseline: true
 
 loss_fn:
   reference_policy_kl_penalty: 0.0
@@ -116,6 +120,13 @@ data:
 env:
   _override_: true
   should_use_nemo_gym: true
+  mask_sample_rules:
+    - name: eval_incomplete  # verifier timed out or errored
+      field: evaluation_completed
+      equals: false
+    - name: harness_unfinished  # opencode hit sandbox_timeout or an exec error
+      field: opencode_finished
+      equals: false
   nemo_gym:
     use_absolute_ip: true
     config_paths:
