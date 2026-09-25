@@ -2046,8 +2046,8 @@ def get_distillation_topk_logprobs_from_logits(
     # Move teacher topk indices to the same device as student logits
     teacher_topk_indices = teacher_topk_indices.to(student_logits.device)
 
-    # Automodel owns the sequence layout when a sharder is present. Neutralize
-    # the legacy CP group before deriving its size so no legacy layout work runs.
+    # Automodel owns the sequence layout when a sharder is present, so its CP group
+    # must not drive the layout work below.
     cp_group = None if cp_sharder is not None else context_parallel_group
     cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
 
@@ -2075,27 +2075,13 @@ def get_distillation_topk_logprobs_from_logits(
         vocab_start_index = tp_rank * V_local
         vocab_end_index = (tp_rank + 1) * V_local
 
-        # Legacy DTensor callers still derive CP from the tensor mesh. Automodel
-        # supplies its model-owned sequence layout explicitly instead.
-        if cp_sharder is None:
-            if (
-                device_mesh.mesh_dim_names is not None
-                and "cp" in device_mesh.mesh_dim_names
-            ):
-                cp_group = device_mesh.get_group("cp")
-                cp_size = cp_group.size()
-            else:
-                cp_group = None
-                cp_size = 1
-
     else:
         student_logits = student_logits
         parallel_group = None
 
-    # Automodel owns the sequence layout: shard the teacher indices into the
-    # model's local layout. The legacy CP state was neutralized above so its
-    # load-balanced relayout stays out of the way. Gather back to canonical order
-    # through the sharder once the student log-probs exist.
+    # Automodel owns the sequence layout: shard the teacher indices into the model's
+    # local layout, then gather back to canonical order through the sharder once the
+    # student log-probs exist.
     indices_for_logits = teacher_topk_indices
     if cp_sharder is not None:
         indices_for_logits = cp_sharder.shard_token_tensor(
