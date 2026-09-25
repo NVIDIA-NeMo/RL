@@ -320,6 +320,70 @@ def test_leader_broadcast_preserves_strided_tensors_nccl(
     )
 
 
+def _int16_byte_wire_round_trip_body(rank: int, *, source_device: str) -> None:
+    values = torch.arange(-32768, 32768, dtype=torch.int32).to(torch.int16)
+    if source_device == "cuda":
+        values = values.cuda()
+    packed_values = values.reshape(256, 256).T
+    data = (
+        BatchedDataDict(
+            {
+                "routed_experts": values,
+                "pixel_values": PackedTensor([packed_values, None], dim_to_pack=0),
+            }
+        )
+        if rank == 0
+        else None
+    )
+    observed: list[tuple[torch.dtype, int]] = []
+    real_broadcast = dist.broadcast
+
+    def record_broadcast(
+        tensor: torch.Tensor, *, src: int, group: dist.ProcessGroup
+    ) -> None:
+        observed.append((tensor.dtype, tensor.numel() * tensor.element_size()))
+        real_broadcast(tensor, src=src, group=group)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(dist, "broadcast", record_broadcast)
+        result = _broadcast_batched_data_dict(
+            data, is_leader=rank == 0, src=0, group=dist.group.WORLD
+        )
+
+    # Each payload covers the complete int16 domain without int32 expansion.
+    assert observed == [(torch.uint8, 131072), (torch.uint8, 131072)], observed
+    assert result["routed_experts"].dtype == torch.int16
+    assert result["routed_experts"].device == values.device
+    assert torch.equal(result["routed_experts"], values)
+    packed = result["pixel_values"]
+    assert packed.tensors[0].dtype == torch.int16
+    assert packed.tensors[0].device == values.device
+    assert torch.equal(packed.tensors[0], packed_values)
+    assert packed.tensors[1] is None
+
+
+def test_leader_broadcast_int16_uses_two_bytes_per_value(tmp_path: Path) -> None:
+    _run_two_ranks(
+        partial(_int16_byte_wire_round_trip_body, source_device="cpu"),
+        str(tmp_path / "init_byte_wire"),
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 2,
+    reason="two CUDA devices are required for NCCL broadcast",
+)
+@pytest.mark.parametrize("source_device", ["cpu", "cuda"])
+def test_leader_broadcast_int16_uses_two_bytes_per_value_nccl(
+    tmp_path: Path, source_device: str
+) -> None:
+    _run_two_ranks(
+        partial(_int16_byte_wire_round_trip_body, source_device=source_device),
+        str(tmp_path / "init_byte_wire_nccl"),
+        backend="nccl",
+    )
+
+
 def test_leader_broadcast_round_trip(tmp_path):
     _run_two_ranks(_round_trip_body, str(tmp_path / "init"))
 
