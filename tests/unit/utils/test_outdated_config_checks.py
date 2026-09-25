@@ -26,9 +26,9 @@ assert entrypoints, "No entrypoints found"
 # MasterConfig.model_validate(resolved).
 _BUILDS_MASTER_CONFIG = re.compile(r"MasterConfig(\(\*\*|\.model_validate)")
 
-# Eval configs legitimately keep the flat data layout the dataset check rejects: they name
-# one dataset directly rather than a train/validation split.
-_EXEMPT = {"run_eval.py": "eval configs do not use the train/validation data layout"}
+# Eval configs have a different structure from training configs, so the entrypoint checks
+# do not apply to them.
+_EXEMPT = {"run_eval.py": "eval configs have a different structure from training configs"}
 
 
 # ============================================================================

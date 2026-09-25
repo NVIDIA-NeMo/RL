@@ -43,6 +43,7 @@ from nemo_rl.utils.config import (
     load_config_with_inheritance,
     register_omegaconf_resolvers,
 )
+from nemo_rl.utils.outdated_config_checks import check_outdated_config
 
 # All tests in this module should run first
 pytestmark = pytest.mark.run_first
@@ -103,8 +104,9 @@ configs_dir = Path(
 config_files = glob.glob(str(configs_dir / "**/*.yaml"), recursive=True)
 assert len(config_files) > 0, "No config files found"
 
-# Every shipped config tree. Only the dtensor guard uses it -- most of examples/nemo_gym cannot
-# satisfy the schema test by design (env manifests, launcher templates, unset env interpolations).
+# Every shipped config tree. Only the outdated-config guard uses it -- most of examples/nemo_gym
+# cannot satisfy the schema test by design (env manifests, launcher templates, unset env
+# interpolations).
 repo_root = Path(os.path.join(os.path.dirname(absolute_path), "../..")).resolve()
 full_config_files = config_files + [
     path
@@ -356,35 +358,25 @@ def test_all_config_no_tp_size_accuracy_issues(config_file):
 
 
 @pytest.mark.parametrize("config_file", full_config_files)
-def test_all_config_has_no_legacy_v2_key(config_file):
-    """Test that no shipped config still carries the removed dtensor_cfg._v2 key.
+def test_no_shipped_config_is_outdated(config_file):
+    """Test that every shipped config passes the same checks the entrypoints run.
 
-    The walk is recursive because dtensor_cfg also appears under teacher, teachers[i] and
-    env.reward_model.
+    Reusing check_outdated_config keeps this from drifting: a check added there is
+    enforced on the shipped configs without a second implementation here.
     """
+    # Eval configs have a different structure from training configs, so the entrypoint
+    # checks do not apply to them. run_eval.py skips them for the same reason.
+    if "/evals/" in config_file:
+        pytest.skip("eval configs have a different structure from training configs")
 
     print(f"\nValidating config file: {config_file}")
 
     config = load_config_with_inheritance(config_file)
-    # resolve=False: _v2 / enabled are never interpolations, and resolving would fail on the
-    # configs that interpolate an env var CI does not set.
+    # resolve=False: the checked keys are never interpolations, and resolving would fail
+    # on the configs that interpolate an env var CI does not set.
     config_dict = OmegaConf.to_container(config, resolve=False)
 
-    def walk(node, path):
-        if isinstance(node, dict):
-            nested = node.get("dtensor_cfg")
-            if isinstance(nested, dict):
-                yield path, nested
-            for key, value in node.items():
-                if key != "dtensor_cfg":
-                    yield from walk(value, f"{path}.{key}" if path else key)
-        elif isinstance(node, list):
-            for index, value in enumerate(node):
-                yield from walk(value, f"{path}[{index}]")
-
-    for section, dtensor_cfg in walk(config_dict, ""):
-        if "_v2" in dtensor_cfg:
-            raise AssertionError(
-                f"Config file {config_file} still carries {section}.dtensor_cfg._v2. The key "
-                "was removed -- DTensor is always the Automodel backend now."
-            )
+    try:
+        check_outdated_config(config_dict)
+    except ValueError as e:
+        raise AssertionError(f"Config file {config_file} is outdated: {e}") from e
