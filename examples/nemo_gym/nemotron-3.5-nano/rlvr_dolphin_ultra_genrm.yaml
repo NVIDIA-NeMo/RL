@@ -1,0 +1,88 @@
+# =============================================================================
+# Nemotron 3.5 Nano — RLVR against the Ultra 550B GenRM, GB300 static tier
+# =============================================================================
+# Same policy, blend, parallelism and 5:1 generation-to-training split as
+# rlvr_dolphin.yaml. What changes is the static-model tier — the servers that
+# answer requests but never train — so that a Slurm run can be compared
+# against an NVCF deployment hosting exactly the same three services.
+#
+# Static tier, 108 GPUs. All GB300: 4 GPUs/node, ~278 GiB visible per GPU.
+#   Ultra GenRM   9 x TP=8    72 GPUs   in-job hetgroup 1 (18 nodes)
+#   Qwen3-235B    16 x TP=2   32 GPUs   Gym pool
+#   Safety 4B      4 x TP=1    4 GPUs   Gym pool
+#
+# Job shape, 82 nodes:
+#   hetgroup 0    8 train + 40 generation + 16 gym = 64 nodes
+#   hetgroup 1    18 nodes
+#
+# Only the GenRM tier grows relative to rlvr_dolphin.yaml (4 nodes -> 18): the
+# Ultra checkpoint is 1.1 TB against the Qwen GenRM's 438 GiB, so it needs
+# TP=8 and 9 replicas where that one needed TP=8 and 2. Train and generation are
+# untouched, which is the point — they are the constant in the comparison.
+#
+# Both judges stay in the Gym pool rather than moving to hetgroup 1, because
+# tools/external_gym_vllm gives every pool replica whole nodes: each replica
+# brings up a private Ray cluster on a fixed port and serves HTTP on a fixed
+# port, so two replicas may never share a host. register_external_vllm_pool
+# rejects any TP that is not a multiple of GPUS_PER_NODE for exactly that
+# reason, which rules out TP=2 and TP=1. Gym has no such constraint — it hands
+# the model to Ray as a placement group and vLLM assigns the per-rank ports
+# itself — so sub-node replicas are only expressible there.
+# =============================================================================
+defaults: rlvr_dolphin.yaml
+
+checkpointing:
+  # Tracks WALLTIME in nano35_ultra_genrm_launch.sh (12 h on batch_long), minus
+  # the reference's 25 min teardown margin. rlvr_dolphin.yaml's 3 h 35 m assumes
+  # the 4 h `batch` cap, which this recipe does not use: nine replicas loading
+  # 1.1 TB each would spend a large fraction of a 4 h job just reading weights.
+  checkpoint_must_save_by: "00:11:35:00"
+
+env:
+  nemo_gym:
+    # 64 GPUs. The two judges below draw 36 of them, but strict DP packing hands
+    # out whole nodes, so they occupy 9 of the 16: NL2Bash 8 nodes at two TP=2
+    # ranks each, safety 1 node at four TP=1 ranks. The remaining 7 nodes carry
+    # the CPU-side env servers — the same headroom rlvr_dolphin.yaml leaves
+    # whenever the NL2Bash judge runs here rather than in the external pool.
+    num_gpu_nodes: 16
+
+    nl2bash_judge_model:
+      responses_api_models:
+        local_vllm_model:
+          vllm_serve_kwargs:
+            # TP=2 measured faster than TP=4 for this checkpoint. Qwen3-235B-A22B
+            # carries only 4 KV heads, so TP=4 leaves one head per rank, and the
+            # MoE all-to-all narrows as TP shrinks.
+            #
+            # Sixteen replicas hold sixteen copies of the 221 GiB FP8 weights,
+            # which is affordable only because a GB300 pair is ~556 GiB: at 0.85
+            # utilization that leaves ~252 GiB of KV per replica. A GB200 pair is
+            # ~370 GiB and leaves ~94 GiB, roughly four sequences at
+            # max_model_len=131072 against max_num_seqs=256. Do not port this
+            # shape to GB200 without also setting kv_cache_dtype: fp8.
+            tensor_parallel_size: 2
+            data_parallel_size: 16
+            # Two TP=2 ranks fill one 4-GPU node exactly, so this pool occupies 8
+            # of the 16 Gym nodes. The inherited VLLM_RAY_DP_PACK_STRATEGY=strict
+            # allocates exactly data_parallel_size_local ranks to every node it
+            # picks, so the inherited 1 would place one rank per node across 16
+            # nodes -- 2 GPUs used and 2 idle on each -- and together with the
+            # safety judge below that needs 20 nodes, which does not fit.
+            data_parallel_size_local: 2
+
+    safety_judge_model:
+      responses_api_models:
+        local_vllm_model:
+          vllm_serve_kwargs:
+            # Four replicas rather than the reference's one. jailbreak_detection
+            # and indirect_prompt_injection both reach this server through
+            # judge_model_server, so a single 4B replica gates two env families.
+            # TP stays 1 — the model is 4B and needs no sharding.
+            data_parallel_size: 4
+            # All four TP=1 ranks on one node, so this pool costs 1 Gym node
+            # rather than 4. Under strict the inherited 1 would take a whole node
+            # per replica to run a single GPU on each. With the judge above, the
+            # two pools then fit in 9 of the 16 Gym nodes, leaving 7 for the
+            # CPU-side env servers.
+            data_parallel_size_local: 4

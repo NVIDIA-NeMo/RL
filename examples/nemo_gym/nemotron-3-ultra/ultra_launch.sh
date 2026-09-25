@@ -76,8 +76,9 @@ set -euo pipefail
 # Hydra overrides are forwarded verbatim as positional arguments:
 #   bash examples/nemo_gym/nemotron-3-ultra/ultra_launch.sh policy.megatron_cfg.optimizer.lr=1e-6 grpo.val_period=50
 #
-# GB200 NVL72 nodes have 4 GPUs each. SLURM total = NUM_TRAIN + NUM_GEN + NUM_GYM
-# and must be a multiple of SEGMENT_SIZE (default 16, one NVLink domain group).
+# NVL72 nodes (GB200 and GB300) have 4 GPUs each. SLURM total = NUM_TRAIN +
+# NUM_GEN + NUM_GYM and must be a multiple of SEGMENT_SIZE (default 16, one
+# NVLink domain group).
 # =============================================================================
 
 # =============================================================================
@@ -89,7 +90,11 @@ set -euo pipefail
 : "${TRAIN_PATH:?TRAIN_PATH is required (training data jsonl path)}"
 : "${VAL_PATH:?VAL_PATH is required (validation data jsonl path)}"
 : "${CONTAINER:?CONTAINER is required (NGC image URI or .sqsh path)}"
-: "${SANDBOX_CONTAINER:?SANDBOX_CONTAINER is required (nemo-skills sandbox image)}"
+# Set it empty to disable the colocated sandbox: ray.sub starts the sandbox only
+# when SANDBOX_CONTAINER and SANDBOX_COMMAND are both non-empty, and a blend that
+# routes to none of the three sandbox-backed Gym servers does not need it. Hence
+# `?` rather than `:?` -- unset is still an error, empty is a deliberate opt-out.
+: "${SANDBOX_CONTAINER?SANDBOX_CONTAINER is required (nemo-skills sandbox image; set it empty to disable the sandbox)}"
 : "${PERSISTENT_CACHE:?PERSISTENT_CACHE is required (Lustre dir for vLLM/Triton/Inductor caches)}"
 : "${SLURM_PARTITION:?SLURM_PARTITION is required}"
 : "${SLURM_ACCOUNT:?SLURM_ACCOUNT is required}"
@@ -435,10 +440,14 @@ CHECKPOINTING_SAVE_BY="${CHECKPOINTING_SAVE_BY:-}"
 export CONTAINER
 MOUNTS="${MOUNTS:-}"
 
-# GB200 NVL72 defaults to 4 GPUs/node. Allow H100 smoke configs to request
-# their native 8-GPU node shape through the launch environment.
+# NVL72 trays hold 4 GPUs on both GB200 and GB300. Allow H100 smoke configs to
+# request their native 8-GPU node shape through the launch environment.
 export GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
-export CPUS_PER_WORKER="${CPUS_PER_WORKER:-144}"
+# Left empty on purpose: ray.sub resolves this from CPUTot on the nodes the job is
+# actually allocated. The per-node core count varies by platform (GB200 144,
+# GB300 140) and by site config (CoreSpecCount), so no launcher-side default is
+# portable. Set it in the environment only to override a specific allocation.
+export CPUS_PER_WORKER="${CPUS_PER_WORKER:-}"
 
 # =============================================================================
 # HuggingFace configuration
@@ -556,7 +565,8 @@ if (( NUM_GYM_NODES < 0 )); then
   echo "ERROR: NUM_GYM_NODES must be >= 0 (got ${NUM_GYM_NODES})" >&2; exit 1
 fi
 
-# GB200 NVL72 topology: 18 nodes per NVLink domain, allocate in groups of 16.
+# NVL72 topology (GB200 and GB300): 18 nodes per NVLink domain, allocate in
+# groups of 16 so each segment stays inside one domain.
 # With external judges, Slurm schedules two heterogeneous components, so the
 # NeMo RL nodes and the external-service nodes are validated separately.
 SEGMENT_SIZE="${SEGMENT_SIZE:-16}"
@@ -855,6 +865,36 @@ export SETUP_COMMAND
 # learning rate, etc.) live in CONFIG_PATH. The launcher only passes the
 # per-run overrides: cluster shape, paths, judge endpoints, logging.
 # =============================================================================
+# SingleController recipes swap this for ./examples/run_grpo_single_controller.py.
+# Both drivers accept the same --config and Hydra override surface.
+TRAIN_ENTRYPOINT="${TRAIN_ENTRYPOINT:-./examples/nemo_gym/run_grpo_nemo_gym.py}"
+if [[ ! -f "${PROJECT_ROOT}/${TRAIN_ENTRYPOINT#./}" ]]; then
+  echo "ERROR: TRAIN_ENTRYPOINT does not exist: ${TRAIN_ENTRYPOINT}" >&2
+  exit 1
+fi
+
+# UV_CACHE_DIR points at the warm cache the container already ships at
+# /root/.cache/uv, rather than /tmp/nemo-gym-uv-cache-${SLURM_JOB_ID:-default},
+# which breaks twice over:
+#
+#   - ray.sub scrubs every SLURM_* variable before entering the head container,
+#     so the job-id suffix always collapses to "default"; and /tmp is node-local
+#     and wiped, so the cache is cold on every node of every job by construction.
+#   - Worse, pointing uv at /tmp discards the image's own cache, which holds git
+#     databases for all 13 git dependencies plus the vllm and flash-attn wheels,
+#     so every job re-clones and re-downloads roughly 700 MB from github.
+#
+# Any run that mounts a Gym differing from the baked one pays this: the mismatch
+# invalidates the lock and forces a re-resolve, and with a cold cache that
+# re-resolve has to reach github from a compute node. It cost ~26 min of startup
+# in jobs 6231494/6232802/6233682, and earlier killed 6071350, 6071353 and
+# 6071948 outright when a clone timed out at ~134s.
+#
+# Set explicitly rather than simply unset: sbatch --export=ALL carries an
+# inherited UV_CACHE_DIR from the submitting shell all the way into the
+# container, so relying on uv's default is not enough. Verified in job 6072555 --
+# with github made unreachable, the /tmp arm failed exactly as in production and
+# this arm resolved and synced clean.
 TRAIN_CMD="cd ${CODE_ROOT} && date ; \
 OMP_NUM_THREADS=16 \
 RAY_DEDUP_LOGS=1 \
@@ -864,7 +904,7 @@ NRL_VLLM_CACHE_SEED_DIR=${NRL_VLLM_CACHE_SEED_DIR} \
 DG_JIT_CACHE_DIR=${NRL_VLLM_LOCAL_CACHE_DIR}/deep_gemm \
 TORCHINDUCTOR_CACHE_DIR=${INDUCTOR_CACHE_DIR} \
 TRITON_CACHE_DIR=${TRITON_CACHE_DIR} \
-UV_CACHE_DIR=/tmp/nemo-gym-uv-cache-\${SLURM_JOB_ID:-default} \
+UV_CACHE_DIR=/root/.cache/uv \
 UV_LOCK_TIMEOUT=1800 \
 RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 \
 UV_HTTP_TIMEOUT=10 \
@@ -875,7 +915,7 @@ NRL_WG_USE_RAY_REF=1 \
 HF_HOME=${HF_HOME:-} \
 HF_TOKEN=${HF_TOKEN:-} \
 NRL_USE_FASTOKENS=${NRL_USE_FASTOKENS:-1} \
-uv run ./examples/nemo_gym/run_grpo_nemo_gym.py \
+uv run ${TRAIN_ENTRYPOINT} \
 --config ${CONFIG_PATH} \
 policy.model_name=${MODEL_PATH} \
 cluster.num_nodes=${NUM_ACTOR_NODES} \
@@ -904,6 +944,21 @@ if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
   validate_external_vllm_submission "${COMMAND}" "${NUM_EXTERNAL_SERVICE_NODES}"
 fi
 
+# TRAIN_CMD is assembled in double quotes, so ${HF_TOKEN} and friends are already
+# expanded to their literal values. Anything that writes it to disk must go
+# through this first: RUN_DIR lives on shared Lustre with a default 0644 umask.
+# Substituting the unexpanded name keeps the output runnable when sourced from a
+# shell that has the secret set. The -n guards matter — an empty search pattern
+# would splice the replacement between every character.
+redact_secrets() {
+  local text="$1" name
+  for name in HF_TOKEN WANDB_API_KEY OPENAI_API_KEY NGC_API_KEY; do
+    local value="${!name:-}"
+    [[ -n "${value}" ]] && text="${text//"${value}"/\$${name}}"
+  done
+  printf '%s' "${text}"
+}
+
 # =============================================================================
 # Summary
 # =============================================================================
@@ -913,6 +968,7 @@ echo "  Nemotron 3 Ultra — ${EXP_NAME} (${NUM_TOTAL_NODES}-node)"
 echo "================================================================"
 echo "  Job name:    ${JOB_NAME}  (singleton — only one runs at a time)"
 echo "  Config:      ${CONFIG_PATH}"
+echo "  Entrypoint:  ${TRAIN_ENTRYPOINT}"
 echo "  Nodes:       ${NUM_TOTAL_NODES} total"
 if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
 echo "    Hetgroup 0: ${NUM_RAY_NODES} NeMo RL nodes  (segment=${SEGMENT_SIZE})"
@@ -970,7 +1026,7 @@ echo ""
   fi
   echo "container: ${CONTAINER}"
   echo "config: ${CONFIG_PATH}"
-  echo "command: ${TRAIN_CMD}"
+  echo "command: $(redact_secrets "${TRAIN_CMD}")"
 } > "${RUN_DIR}/provenance.txt"
 
 # =============================================================================
@@ -981,7 +1037,7 @@ if [[ "${DRY_RUN}" == "1" ]]; then
   echo "DRY_RUN=1 — printing TRAIN_CMD and exiting without submission."
   echo ""
   echo "--- TRAIN_CMD ---"
-  echo "${TRAIN_CMD}"
+  redact_secrets "${TRAIN_CMD}"; echo
   echo "--- end ---"
   exit 0
 fi
@@ -1032,7 +1088,7 @@ if [[ "${INTERACTIVE}" == "1" ]]; then
   ATTACH_SCRIPT="${LAUNCH_DIR}/${JOB_ID}-attach.sh"
   CMD_FILE="${LAUNCH_DIR}/${JOB_ID}-run-cmd.sh"
   cat > "${CMD_FILE}" <<CMDEOF
-${TRAIN_CMD}
+$(redact_secrets "${TRAIN_CMD}")
 CMDEOF
   chmod +x "${CMD_FILE}"
 
