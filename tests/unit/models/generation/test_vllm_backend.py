@@ -680,6 +680,62 @@ def test_layerwise_reload_detaches_deferred_transport_weights(monkeypatch):
 
 
 @pytest.mark.vllm
+def test_padded_trtllm_reload_finalizes_at_logical_weight_size(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from vllm.model_executor.model_loader.reload.layerwise import (
+        get_layerwise_info,
+        initialize_layerwise_reload,
+        record_metadata_for_reloading,
+    )
+
+    layer = torch.nn.Module()
+    layer.moe_config = SimpleNamespace(
+        intermediate_size_per_partition_unpadded=3,
+        is_act_and_mul=True,
+    )
+    layer.w13_weight = torch.nn.Parameter(torch.zeros(2, 8, 3))
+    layer.w2_weight = torch.nn.Parameter(torch.zeros(2, 3, 4))
+
+    def load_w13(param, loaded_weight):
+        param[:, :3].copy_(loaded_weight[:, :3])
+        param[:, 4:7].copy_(loaded_weight[:, 3:])
+
+    def load_w2(param, loaded_weight):
+        param[:, :, :3].copy_(loaded_weight)
+
+    layer.w13_weight.weight_loader = load_w13
+    layer.w2_weight.weight_loader = load_w2
+    kernel_w13 = layer.w13_weight
+    kernel_w2 = layer.w2_weight
+
+    record_metadata_for_reloading(layer)
+    initialize_layerwise_reload(layer)
+    layer.w13_weight.weight_loader(layer.w13_weight, torch.ones(2, 6, 3))
+
+    monkeypatch.setattr(
+        vllm_backend,
+        "_unquantized_flashinfer_trtllm_modules",
+        lambda _model: [layer],
+    )
+    vllm_backend._finalize_complete_padded_trtllm_layers(layer, object())
+    assert get_layerwise_info(layer).can_load() is True
+
+    layer.w2_weight.weight_loader(layer.w2_weight, torch.full((2, 3, 3), 2.0))
+
+    info = get_layerwise_info(layer)
+    assert info.load_numel == 54
+    assert info.load_numel_total == 72
+    assert len(info.loaded_weights) == 2
+
+    vllm_backend._finalize_complete_padded_trtllm_layers(layer, object())
+
+    assert get_layerwise_info(layer).can_load() is False
+    torch.testing.assert_close(kernel_w13[:, :3], torch.ones(2, 3, 3))
+    torch.testing.assert_close(kernel_w13[:, 4:7], torch.ones(2, 3, 3))
+    torch.testing.assert_close(kernel_w2[:, :, :3], torch.full((2, 3, 3), 2.0))
+
+
+@pytest.mark.vllm
 def test_layerwise_reload_preserves_weight_load_error(monkeypatch, caplog):
     from nemo_rl.models.generation.vllm import vllm_backend
 

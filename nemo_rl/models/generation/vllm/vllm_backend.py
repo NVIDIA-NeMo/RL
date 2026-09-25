@@ -142,6 +142,72 @@ def _unquantized_flashinfer_trtllm_modules(
     ]
 
 
+def _logical_trtllm_reload_numel(module: torch.nn.Module) -> int | None:
+    """Return the unpadded checkpoint payload size for a TRTLLM expert module."""
+    from vllm.model_executor.model_loader.reload.utils import get_layer_size
+
+    moe_config = getattr(module, "moe_config", None)
+    unpadded = getattr(moe_config, "intermediate_size_per_partition_unpadded", None)
+    w13_weight = getattr(module, "w13_weight", None)
+    w2_weight = getattr(module, "w2_weight", None)
+    if unpadded is None or not isinstance(w13_weight, torch.Tensor):
+        return None
+    if not isinstance(w2_weight, torch.Tensor) or w2_weight.ndim != 3:
+        return None
+
+    num_experts, hidden_size, padded = w2_weight.shape
+    if unpadded == padded:
+        return None
+    if unpadded <= 0 or unpadded > padded:
+        raise RuntimeError(
+            "Invalid FlashInfer TRTLLM intermediate dimensions: "
+            f"unpadded={unpadded}, padded={padded}"
+        )
+
+    gate_multiplier = 2 if getattr(moe_config, "is_act_and_mul", False) else 1
+    expected_w13_shape = (num_experts, gate_multiplier * padded, hidden_size)
+    if tuple(w13_weight.shape) != expected_w13_shape:
+        raise RuntimeError(
+            "Unexpected FlashInfer TRTLLM reload shape: "
+            f"w13={tuple(w13_weight.shape)}, expected={expected_w13_shape}"
+        )
+
+    padding = num_experts * hidden_size * (padded - unpadded)
+    padding *= gate_multiplier + 1
+    w13_bias = getattr(module, "w13_bias", None)
+    if isinstance(w13_bias, torch.Tensor):
+        expected_bias_shape = (num_experts, gate_multiplier * padded)
+        if tuple(w13_bias.shape) != expected_bias_shape:
+            raise RuntimeError(
+                "Unexpected FlashInfer TRTLLM reload bias shape: "
+                f"w13_bias={tuple(w13_bias.shape)}, expected={expected_bias_shape}"
+            )
+        padding += num_experts * gate_multiplier * (padded - unpadded)
+
+    return get_layer_size(module) - padding
+
+
+def _finalize_complete_padded_trtllm_layers(
+    model: torch.nn.Module, model_config: Any
+) -> None:
+    """Process padded TRTLLM experts as soon as their logical weights arrive."""
+    from vllm.model_executor.model_loader.reload.layerwise import (
+        finalize_layerwise_processing,
+        get_layerwise_info,
+    )
+
+    for module in _unquantized_flashinfer_trtllm_modules(model):
+        info = get_layerwise_info(module)
+        load_numel_total = info.load_numel_total
+        if load_numel_total is None:
+            continue
+        logical_numel = _logical_trtllm_reload_numel(module)
+        if logical_numel is None or logical_numel >= load_numel_total:
+            continue
+        if info.load_numel >= logical_numel:
+            finalize_layerwise_processing(module, model_config)
+
+
 def _reload_target_module_ids(
     reload_targets: Sequence[torch.nn.Module],
 ) -> set[int]:
@@ -367,6 +433,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
     _nrl_named_parameters: dict[str, torch.nn.Parameter]
     hf_to_local_param_map: HFToLocalParamMap
     _nrl_layerwise_reload_active: bool = False
+    _nrl_padded_trtllm_reload_active: bool = False
     # Initialization detaches parameters, so any later failure leaves this
     # worker unsafe to reuse. Keep the original failure for the worker lifetime.
     _nrl_layerwise_reload_failure: Exception | None = None
@@ -407,6 +474,12 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             raise
         finally:
             try:
+                if load_error is None and getattr(
+                    self, "_nrl_padded_trtllm_reload_active", False
+                ):
+                    _finalize_complete_padded_trtllm_layers(
+                        self.model_runner.model, self.model_config
+                    )
                 # Native layerwise reload may defer weight_loader calls until all
                 # shards for a layer have arrived. NCCL/IPC weights are views into
                 # reusable receive buffers that subsequent transfers may overwrite,
@@ -1138,12 +1211,14 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                         for reload_target in reload_targets:
                             initialize_layerwise_reload(reload_target)
                     self._nrl_layerwise_reload_active = True
+                    self._nrl_padded_trtllm_reload_active = not use_deepseek_v4_fp8
                     yield finalize
             except Exception as error:
                 self._nrl_layerwise_reload_failure = error
                 raise
             finally:
                 self._nrl_layerwise_reload_active = False
+                self._nrl_padded_trtllm_reload_active = False
                 if use_deepseek_v4_fp8:
                     deepseek_v4_fp8.restore_refit(added_skip_tensors)
 
