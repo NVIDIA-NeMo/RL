@@ -154,9 +154,6 @@ env:
           remote_opencode_install_script_path: /mnt/s3-data/data/harness/opencode/install.sh
           remote_opencode_binary_path: /mnt/s3-data/data/harness/opencode/linux-x64/1.17.11/opencode
           opencode_config:
-            compaction:
-              auto: false
-              prune: false
             tools:
               task: false
 
