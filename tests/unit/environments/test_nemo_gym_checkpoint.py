@@ -31,8 +31,12 @@ from nemo_rl.environments.gym_checkpoint import (
     GymAgentExecutionStatus,
     GymCheckpointCommitResult,
     GymCheckpointPhase,
+    GymCheckpointPrepareResult,
     GymExecutionIdentity,
     GymResourcesPrepareResponse,
+    gym_generation_cut_proofs,
+    gym_generation_cut_receipts,
+    gym_generation_cut_staging_keys,
 )
 
 
@@ -54,6 +58,97 @@ def test_agent_status_accepts_external_wait_frozen_boundary() -> None:
 
     assert status.state == "external_wait_frozen"
     assert status.parked_boundary_state == "external_wait_frozen"
+
+
+def test_agent_execution_status_accepts_frozen_model_wait() -> None:
+    status = GymAgentExecutionStatus.model_validate(
+        {
+            "rollout_id": "rollout-1",
+            "attempt_index": 0,
+            "generation": 1,
+            "state": "model_wait_frozen",
+            "parked_boundary_state": "model_wait_frozen",
+            "boundary_index": 2,
+            "turn_index": 1,
+            "boundary_kind": "pending_model",
+            "resource_state_revisions": {"tools": 3},
+            "completion_receipt": None,
+            "age_seconds": 0.5,
+        }
+    )
+
+    assert status.state == "model_wait_frozen"
+    assert status.parked_boundary_state == "model_wait_frozen"
+
+
+def test_legacy_generation_cut_proof_exposes_durable_tq_prefix_keys() -> None:
+    proof = {
+        "checkpoint_id": "checkpoint-1",
+        "generation_cut_receipt": {
+            "prefixes": [
+                {
+                    "disposition": "durable_prefix",
+                    "staging_keys": ["__generation_cut__/checkpoint-1/r0/c1"],
+                },
+                {"disposition": "durable_failure"},
+            ]
+        },
+    }
+    prepare = GymCheckpointPrepareResult.model_validate(
+        {
+            "checkpoint_id": "checkpoint-1",
+            "ready": True,
+            "participants": [
+                {
+                    "participant": {
+                        "server_name": "policy",
+                        "component": "responses_api_models",
+                        "participant_name": "policy",
+                    },
+                    "ready": True,
+                    "payload": {
+                        "state": "paused",
+                        "workers": {"acknowledged": 1, "expected": 1},
+                        "inflight_total": 1,
+                        "response_inflight_total": 1,
+                        "generation_pending_total": 0,
+                        "generation_cut_summary": {
+                            "checkpoint_id": "checkpoint-1",
+                            "records": 1,
+                            "proof_digest": "a" * 64,
+                        },
+                        "waiters_total": 0,
+                    },
+                }
+            ],
+        }
+    )
+
+    assert gym_generation_cut_proofs(prepare) == ()
+    assert gym_generation_cut_staging_keys((proof,)) == {
+        "__generation_cut__/checkpoint-1/r0/c1"
+    }
+
+
+def test_generation_cut_receipts_are_filtered_by_model_server() -> None:
+    policy_receipt = {
+        "checkpoint_id": "checkpoint-1",
+        "cut_id": "policy-cut",
+        "inventory": {"server_name": "policy"},
+    }
+    other_receipt = {
+        "checkpoint_id": "checkpoint-1",
+        "cut_id": "other-cut",
+        "inventory": {"server_name": "other-policy"},
+    }
+    proofs = (
+        {"generation_cut_receipt": policy_receipt},
+        {"workers": [{"generation_cut_receipt": other_receipt}]},
+    )
+
+    assert gym_generation_cut_receipts(proofs, server_name="policy") == [
+        policy_receipt
+    ]
 
 
 def _capability(component: str, name: str, **overrides):

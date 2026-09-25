@@ -178,3 +178,29 @@ def test_model_prepare_accepts_additive_coordinator_evidence() -> None:
 
     assert response.state == "paused"
     assert response.workers.acknowledged == 2
+
+
+def test_prefix_recovery_requires_generation_cut_lineage_capability() -> None:
+    model = _discovered(features=["external_storage_reference_index_v1"])
+    agent = _discovered(
+        component="responses_api_agents",
+        name="agent",
+        admission_states=["accepting"],
+        concurrency_contract="serialized_per_session",
+        instance_role=None,
+        features=[
+            "agent_continuation_index_v1",
+            "completed_result_acknowledgement",
+        ],
+    )
+    topology = GymCheckpointTopology.from_discovered([model, agent])
+
+    with pytest.raises(RuntimeError, match="durable lineage cuts"):
+        topology.validate_turn_recovery_capabilities(
+            generation_prefix_cuts_enabled=True
+        )
+
+    model.capabilities.features.append("generation_cut_lineage_v1")
+    GymCheckpointTopology.from_discovered(
+        [model, agent]
+    ).validate_turn_recovery_capabilities(generation_prefix_cuts_enabled=True)
