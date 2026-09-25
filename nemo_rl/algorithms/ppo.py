@@ -141,6 +141,10 @@ class AsyncPPOConfig(BaseModel, extra="allow"):
     # Number of future target steps generation may fill during critic warmup.
     # None uses max_trajectory_age_steps as the generation lead.
     warmup_generation_lead_steps: int | None = Field(default=None, ge=1)
+    # Generation-worker failures tolerated before the AsyncTrajectoryCollector
+    # aborts the run. A successful batch worker resets the count.
+    # 0 makes the very first worker exception fatal.
+    max_generation_failures: int = Field(default=0, ge=0)
     # Allows weight updates while rollout requests are still in flight.
     in_flight_weight_updates: bool = False
     # Recomputes the KV cache after weight updates.
@@ -195,6 +199,11 @@ class PPOConfig(BaseModel, extra="allow"):
     batch_multiplier: float = 1.0
     # Number of actor (policy) passes over each rollout batch.
     ppo_epochs: int = 4
+    # Share and compact immutable image/video/audio payload segments across
+    # logical PPO rows. Prompt identity is never used as proof of equality.
+    deduplicate_multimodal_data: bool = False
+    # Emit exact-boundary and logical-vs-physical payload metrics.
+    debug_payload_metrics: bool = False
     # Number of critic (value) passes over each rollout batch. Defaults to
     # ppo_epochs (see validate_epoch) unless explicitly set.
     critic_ppo_epochs: int = 4
@@ -382,6 +391,18 @@ def setup(
                 "default collective path. Set policy.generation.refit_transport=null. "
                 "Tracked in https://github.com/NVIDIA-NeMo/RL/issues/3275."
             )
+    elif generation_config.get("refit_transport") is not None:
+        # The block above only runs for vLLM, but PPO also supports SGLang, so
+        # a transport set there used to be dropped without a word. GRPO rejects
+        # the same pairing at grpo.py's setup; this mirrors it.
+        raise ValueError(
+            f"policy.generation.refit_transport="
+            f"{generation_config['refit_transport']!r} is not yet supported by "
+            f"PPO on the {generation_config['backend']!r} generation backend; "
+            "PPO refits over the default collective path. Set "
+            "policy.generation.refit_transport=null. Tracked in "
+            "https://github.com/NVIDIA-NeMo/RL/issues/3275."
+        )
 
     if "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]:
         policy_megatron_config = cast(MegatronConfig, policy_config["megatron_cfg"])
@@ -456,12 +477,18 @@ def setup(
     # Validate batch_multiplier
     batch_multiplier = ppo_config.batch_multiplier
     dataloader_batch_size = ppo_config.num_prompts_per_step
-    if not ppo_config.use_dynamic_sampling:
-        assert batch_multiplier == 1, (
-            "batch_multiplier>1 can only be used if use_dynamic_sampling=True"
+    if ppo_config.use_dynamic_sampling:
+        # PPO never calls its dynamic-sampling helper. Accepting this flag only
+        # enlarged the rollout batch and then trained on every generated sample.
+        raise NotImplementedError(
+            "ppo.use_dynamic_sampling=true is not supported: PPO does not "
+            "implement dynamic sampling, so enabling it would resize the "
+            "rollout batch without filtering it. Set it to false, or use GRPO."
         )
-    else:
-        dataloader_batch_size = int(dataloader_batch_size * batch_multiplier)
+    assert batch_multiplier == 1, (
+        "ppo.batch_multiplier>1 only has an effect under dynamic sampling, "
+        "which PPO does not support."
+    )
 
     dataloader = StatefulDataLoader(
         dataset,
