@@ -593,6 +593,100 @@ def test_checkpoint_prepare_waits_for_draining_policy_model() -> None:
     )
 
 
+def test_checkpoint_prepare_waits_for_draining_coordinator_policy_model() -> None:
+    env = _checkpoint_env()
+    capabilities = {
+        "policy": _capability(
+            "responses_api_models",
+            "policy",
+            admission_states=["accepting", "draining", "paused"],
+            concurrency_contract="stateless",
+            instance_role="policy",
+            multi_process={"mode": "coordinator", "num_workers": 2},
+        ),
+        "agent": _capability("responses_api_agents", "agent"),
+    }
+
+    async def discover_control(_method, _path, *, server_name, **_kwargs):
+        return capabilities[server_name]
+
+    env._control = AsyncMock(side_effect=discover_control)
+    asyncio.run(env.discover_checkpoint_capabilities(list(capabilities)))
+    calls = []
+
+    async def prepare_control(method, path, *, server_name, **_kwargs):
+        calls.append((method, path, server_name))
+        if server_name == "policy" and path.endswith("/pause"):
+            return {
+                "state": "draining",
+                "workers": {"acknowledged": 2, "expected": 2},
+                "inflight_total": 1,
+                "response_inflight_total": 1,
+                "generation_pending_total": 1,
+                "waiters_total": 0,
+            }
+        if server_name == "policy" and path.endswith("/status"):
+            return {
+                "checkpoint_id": "snapshot-coordinator",
+                "state": "paused",
+                "workers": {"acknowledged": 2, "expected": 2, "live": 2},
+                "missing_workers": 0,
+                "inflight_total": 0,
+                "response_inflight_total": 0,
+                "generation_pending_total": 0,
+                "generation_cut_summary": {"proof_digest": "c" * 64},
+                "waiters_total": 0,
+                "per_worker": {
+                    "worker-0": {
+                        "acked_seq": 1,
+                        "inflight": 0,
+                        "generation_pending": 0,
+                        "generation_cut_summary": None,
+                        "proof_error": None,
+                        "connected": True,
+                    },
+                    "worker-1": {
+                        "acked_seq": 1,
+                        "inflight": 0,
+                        "generation_pending": 0,
+                        "generation_cut_summary": None,
+                        "proof_error": None,
+                        "connected": True,
+                    },
+                },
+            }
+        if server_name == "agent":
+            return {
+                "state": "preparing",
+                "ready_to_commit": True,
+                "running": 0,
+                "parked": 0,
+                "parked_with_boundary": 0,
+                "parked_without_boundary": 0,
+                "completed_unacknowledged": 0,
+                "acknowledged_completed": 0,
+                "active": 0,
+                "blocking_attempts": [],
+                "completed_unacknowledged_attempts": [],
+                "selected_boundaries": [],
+                "executions": [],
+            }
+        raise AssertionError(f"unexpected checkpoint control call: {method} {path}")
+
+    env._control = AsyncMock(side_effect=prepare_control)
+
+    result = asyncio.run(
+        env.prepare_checkpoint("snapshot-coordinator", time.time() + 10.0)
+    )
+
+    assert result["ready"] is True
+    assert [path.rsplit("/", 1)[-1] for _method, path, _server in calls] == [
+        "pause",
+        "status",
+        "prepare",
+    ]
+
+
 def test_checkpoint_prepare_timeout_resumes_touched_participants() -> None:
     env = _checkpoint_env()
     capabilities = {
