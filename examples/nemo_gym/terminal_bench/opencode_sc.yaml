@@ -141,6 +141,8 @@ env:
             ttl_s: 10800
             metadata:
               nemo.nvidia.com/resources: custom
+            env:
+              OPENCODE_VERSION: "1.17.11"  # read by the staged install.sh
     tb_opencode:
       _inherit_from: opencode_sandboxed_agent
       responses_api_agents:
@@ -149,8 +151,8 @@ env:
             name: tb_resources
           sandbox_timeout: 3600
           opencode_max_context_window: ${policy.max_total_sequence_length}
-          remote_opencode_install_script_path: /mnt/s3-data/data/bxyu/opencode/install.sh
-          remote_opencode_binary_path: /mnt/s3-data/data/bxyu/opencode/opencode-linux-x64
+          remote_opencode_install_script_path: /mnt/s3-data/data/harness/opencode/install.sh
+          remote_opencode_binary_path: /mnt/s3-data/data/harness/opencode/linux-x64/1.17.11/opencode
           opencode_config:
             compaction:
               auto: false
