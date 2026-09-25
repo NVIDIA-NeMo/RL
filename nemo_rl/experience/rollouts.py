@@ -1755,12 +1755,26 @@ async def run_async_multi_turn_rollout_groups(
     max_rollout_turns: int = 999999,
     greedy: bool = False,
     deduplicate_multimodal_data: bool = False,
+    stream_groups: bool = False,
 ) -> AsyncGenerator[RolloutGroupResult, None]:
-    """Run one native batch, then yield prompt groups with group-local metrics.
+    """Run one native batch and yield prompt groups with group-local metrics.
 
-    This intentionally retains the native path's full-batch completion barrier.
-    The group iterator gives the collector a common interface with NeMo-Gym
-    without changing native rollout scheduling semantics.
+    By default this retains the native path's full-batch completion barrier:
+    the whole batch runs to completion and groups are then yielded in input
+    order. The group iterator gives the collector a common interface with
+    NeMo-Gym without changing native rollout scheduling semantics.
+
+    With ``stream_groups=True`` every prompt group runs as its own rollout
+    coroutine on the shared generation engine and is yielded as soon as its
+    ``num_generations`` samples finish, in completion order. A step's wait is
+    then bounded by its slowest *group* rather than the slowest sample of the
+    whole batch, which matters for multi-turn agent rollouts with a heavy tail
+    (a few episodes running many more turns than the median). Per-sample
+    ``idx`` values keep their whole-batch meaning (position in the input
+    batch). If a group fails, its exception propagates once the failing group
+    is reached and the groups still in flight are cancelled, which aborts
+    their generation requests; the whole-batch path instead lets sibling
+    samples run to completion before raising.
 
     Args:
         policy_generation: Generation interface used to produce policy responses.
@@ -1771,10 +1785,14 @@ async def run_async_multi_turn_rollout_groups(
         num_generations: Number of contiguous rollout samples in each prompt group.
         max_rollout_turns: Maximum number of agent-environment interaction turns.
         greedy: Whether policy generation should use greedy decoding.
+        stream_groups: Yield each prompt group as soon as it completes instead of
+            after the whole batch (see above). Groups then arrive in completion
+            order; ``group_index`` still identifies the input position.
 
     Yields:
-        Complete prompt groups in input order. Each ``RolloutGroupResult`` contains
-        exactly ``num_generations`` samples and metrics aggregated only over those
+        Complete prompt groups, in input order by default or in completion order
+        with ``stream_groups``. Each ``RolloutGroupResult`` contains exactly
+        ``num_generations`` samples and metrics aggregated only over those
         samples.
 
     Raises:
@@ -1788,6 +1806,21 @@ async def run_async_multi_turn_rollout_groups(
         raise ValueError(
             "Native rollout batch size must be divisible by num_generations"
         )
+
+    if stream_groups and input_batch.size > num_generations:
+        async for group in _stream_multi_turn_rollout_groups(
+            policy_generation=policy_generation,
+            input_batch=input_batch,
+            tokenizer=tokenizer,
+            task_to_env=task_to_env,
+            max_seq_len=max_seq_len,
+            num_generations=num_generations,
+            max_rollout_turns=max_rollout_turns,
+            greedy=greedy,
+            deduplicate_multimodal_data=deduplicate_multimodal_data,
+        ):
+            yield group
+        return
 
     final_batch, sample_metrics = await _run_multi_turn_rollout_async(
         policy_generation=policy_generation,
@@ -1808,6 +1841,65 @@ async def run_async_multi_turn_rollout_groups(
                 sample_metrics[start:end]
             ),
         )
+
+
+async def _stream_multi_turn_rollout_groups(
+    policy_generation: GenerationInterface,
+    input_batch: BatchedDataDict[DatumSpec],
+    tokenizer: TokenizerType,
+    task_to_env: dict[str, EnvironmentInterface],
+    max_seq_len: int,
+    num_generations: int,
+    max_rollout_turns: int,
+    greedy: bool,
+    deduplicate_multimodal_data: bool,
+) -> AsyncGenerator[RolloutGroupResult, None]:
+    """Run every prompt group of ``input_batch`` concurrently and yield each as it finishes.
+
+    Each group is a contiguous slice of ``num_generations`` samples. The slices
+    share the generation engine, so this changes when results become visible,
+    not how many requests are in flight. The failing group's exception is
+    re-raised when that group is reached; groups still in flight are cancelled
+    (their generation requests are aborted by the cancellation plumbing) and
+    every task is awaited so no exception goes unretrieved.
+    """
+
+    async def run_group(group_index: int, start: int) -> RolloutGroupResult:
+        final_batch, sample_metrics = await _run_multi_turn_rollout_async(
+            policy_generation=policy_generation,
+            input_batch=input_batch.slice(start, start + num_generations),
+            tokenizer=tokenizer,
+            task_to_env=task_to_env,
+            max_seq_len=max_seq_len,
+            max_rollout_turns=max_rollout_turns,
+            greedy=greedy,
+            deduplicate_multimodal_data=deduplicate_multimodal_data,
+        )
+        if "idx" in final_batch:
+            # The per-sample rollout records the position within the batch it
+            # was handed; restore the position within the whole input batch so
+            # the streamed and whole-batch paths agree.
+            final_batch["idx"] = [start + int(i) for i in final_batch["idx"]]
+        return RolloutGroupResult(
+            group_index=group_index,
+            final_batch=final_batch,
+            rollout_metrics=_aggregate_multi_turn_rollout_metrics(sample_metrics),
+        )
+
+    tasks = [
+        asyncio.ensure_future(run_group(group_index, start))
+        for group_index, start in enumerate(range(0, input_batch.size, num_generations))
+    ]
+    try:
+        for completed in asyncio.as_completed(tasks):
+            yield await completed
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        # Await every task, including ones that already failed, so no
+        # exception is left unretrieved when another group raised first.
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def _tensorize_by_key(message_logs: list, key: str):

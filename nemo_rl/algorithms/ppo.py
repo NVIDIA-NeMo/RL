@@ -143,6 +143,14 @@ class AsyncPPOConfig(BaseModel, extra="allow"):
     warmup_generation_lead_steps: int | None = Field(default=None, ge=1)
     # Allows weight updates while rollout requests are still in flight.
     in_flight_weight_updates: bool = False
+    # Yield each finished prompt group from the native multi-turn collector to
+    # the replay buffer as soon as its samples complete, instead of after the
+    # whole rollout batch. Groups arrive in completion order, earlier than
+    # under the whole-batch barrier, never later. For a step to actually start
+    # on them, pair this with the replay buffer's fifo_target_assignment (and
+    # max_trajectory_age_steps >= 2). Native multi-turn rollouts only;
+    # NeMo-Gym already streams groups.
+    stream_prompt_groups: bool = False
     # Recomputes the KV cache after weight updates.
     recompute_kv_cache_after_weight_updates: bool = False
     # Drops partial restored targets; replacement rollouts use subsequent prompts.
