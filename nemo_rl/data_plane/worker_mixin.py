@@ -83,6 +83,9 @@ def _broadcast_batched_data_dict(
     first, then each tensor's data ships via ``broadcast`` on its
     transport device. The leader supplies ``data``; non-leaders pass
     ``None`` and get an empty BatchedDataDict filled in-place.
+
+    Int16 payloads use byte views because Gloo and NCCL do not support that
+    collective dtype. This preserves the original storage without widening.
     """
     # NCCL groups can only broadcast CUDA tensors; pick the broadcast
     # device from the group backend so CPU TQ outputs are moved to GPU
@@ -159,26 +162,25 @@ def _broadcast_batched_data_dict(
         if kind == "tensor":
             dtype_str, shape, src_device = entry[2], entry[3], entry[4]
             dtype = getattr(torch, dtype_str.split(".")[-1])
-            wire_dtype = torch.int32 if dtype == torch.int16 else dtype
             if is_leader:
                 # Send logical order without replacing the leader's original view.
                 tensor = (
                     out[key]
                     .to(
                         device=bcast_device,
-                        dtype=wire_dtype,
                         memory_format=torch.contiguous_format,
                     )
                     .contiguous()
                 )
             else:
-                tensor = torch.empty(shape, dtype=wire_dtype, device=bcast_device)
-            # NCCL has no int16 ("Short") type; ship as int32 and narrow back
-            # (routed_experts rides TQ as int16).
-            torch.distributed.broadcast(tensor, src=src, group=group)
+                tensor = torch.empty(shape, dtype=dtype, device=bcast_device)
+            # Flatten first so scalars also support dtype reinterpretation.
+            wire = (
+                tensor.reshape(-1).view(torch.uint8) if dtype == torch.int16 else tensor
+            )
+            torch.distributed.broadcast(wire, src=src, group=group)
+            del wire
             if not is_leader:
-                if tensor.dtype != dtype:
-                    tensor = tensor.to(dtype)
                 if torch.device(src_device).type != torch.device(bcast_device).type:
                     tensor = tensor.to(src_device)
                 out[key] = tensor
@@ -208,13 +210,11 @@ def _broadcast_batched_data_dict(
                 )
                 tensor = torch.empty(numel, dtype=dtype, device=bcast_device)
             if tensor.numel():
-                if tensor.dtype == torch.int16:
-                    wire = tensor.to(torch.int32)
-                    torch.distributed.broadcast(wire, src=src, group=group)
-                    tensor = wire.to(torch.int16)
-                    del wire
-                else:
-                    torch.distributed.broadcast(tensor, src=src, group=group)
+                wire = (
+                    tensor.view(torch.uint8) if tensor.dtype == torch.int16 else tensor
+                )
+                torch.distributed.broadcast(wire, src=src, group=group)
+                del wire
             if not is_leader:
                 if torch.device(source_device).type != torch.device(bcast_device).type:
                     tensor = tensor.to(source_device)
