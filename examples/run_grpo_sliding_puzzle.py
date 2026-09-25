@@ -42,8 +42,8 @@ from nemo_rl.utils.config import (
     register_omegaconf_resolvers,
 )
 from nemo_rl.utils.logger import get_next_experiment_dir, log_container_init_timing
-from nemo_rl.utils.timer import Timer
 from nemo_rl.utils.outdated_config_checks import check_outdated_config
+from nemo_rl.utils.timer import Timer
 
 
 def parse_args():
