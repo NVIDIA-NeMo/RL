@@ -14,10 +14,6 @@ policy:
   megatron_cfg:
     context_parallel_size: 1
     moe_router_dtype: fp32
-    freeze_config:
-      freeze_vision_model: true
-      freeze_vision_projection: true
-      freeze_language_model: false
     fp8_cfg:
       enabled: true
     optimizer:
