@@ -134,12 +134,20 @@ def _patch_vllm_postload(monkeypatch):
 
 
 def _make_mtp_refit_extension(
-    *, method="mtp", from_disk=False, has_drafter=True, draft_model_config=None
+    *,
+    method="mtp",
+    from_disk=False,
+    has_drafter=True,
+    draft_model_config=None,
+    runner="legacy",
 ):
     """Build an extension for exercising the MTP-refit drafter gating.
 
     The drafter here is fed from the refit stream (co-trained MTP layer), as
     opposed to the disk-load path built by ``_make_extension_with_drafter``.
+    ``runner`` picks where the fake model runner hangs the proposer: the legacy
+    GPUModelRunner's ``drafter`` or the v2 model runner's ``speculator``
+    (vLLM >= 0.29 default); the other attribute is absent, as on the real runner.
 
     Returns:
         (ext, drafter_model): drafter_model is None when has_drafter is False.
@@ -158,9 +166,11 @@ def _make_mtp_refit_extension(
         else SimpleNamespace(method=method, draft_model_config=draft_model_config)
     )
     drafter_model = SimpleNamespace(load_weights=MagicMock()) if has_drafter else None
+    assert runner in ("legacy", "v2")
+    owner_attr = "drafter" if runner == "legacy" else "speculator"
     ext.model_runner = SimpleNamespace(
         vllm_config=SimpleNamespace(speculative_config=spec_config),
-        drafter=SimpleNamespace(model=drafter_model) if has_drafter else None,
+        **{owner_attr: SimpleNamespace(model=drafter_model) if has_drafter else None},
     )
     return ext, drafter_model
 
@@ -2168,7 +2178,10 @@ def test_load_mtp_weights_from_disk_without_drafter(
     ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
     ext.device = torch.device("cpu")
     ext.model_runner = MagicMock()
+    # A runner without a drafter has neither proposer attribute; MagicMock would
+    # otherwise conjure a `speculator.model` for the v2-runner lookup.
     ext.model_runner.drafter = None
+    ext.model_runner.speculator = None
     ext._load_draft_weights = MagicMock()
     monkeypatch.setattr(
         "nemo_rl.models.generation.vllm.vllm_backend.get_pp_group",
@@ -2411,6 +2424,72 @@ def test_mtp_drafter_refit_enabled(method, from_disk, has_drafter, expected):
         method=method, from_disk=from_disk, has_drafter=has_drafter
     )
     assert ext._mtp_drafter_refit_enabled() is expected
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize("runner", ["legacy", "v2"])
+@pytest.mark.parametrize("has_drafter", [True, False])
+def test_get_drafter_model_reads_either_runner(runner, has_drafter):
+    """The drafter is found under legacy ``drafter`` and v2 ``speculator`` alike.
+
+    vLLM 0.29 made the v2 model runner the default and it keeps the proposer as
+    ``speculator``; reading only ``drafter`` left the co-trained MTP head on its
+    dummy load-time weights (0% acceptance on nemotron3-super).
+    """
+    ext, drafter_model = _make_mtp_refit_extension(
+        method="mtp", from_disk=False, has_drafter=has_drafter, runner=runner
+    )
+
+    assert ext._get_drafter_model() is drafter_model
+    assert ext._mtp_drafter_refit_enabled() is has_drafter
+
+
+@pytest.mark.vllm
+def test_mtp_drafter_refit_enabled_warns_once_without_drafter(caplog):
+    """A co-trained MTP head with no drafter to feed is reported, once per worker."""
+    ext, _ = _make_mtp_refit_extension(method="mtp", from_disk=False, has_drafter=False)
+
+    with caplog.at_level(
+        "WARNING", logger="nemo_rl.models.generation.vllm.vllm_backend"
+    ):
+        assert ext._mtp_drafter_refit_enabled() is False
+        assert ext._mtp_drafter_refit_enabled() is False
+
+    warnings = [
+        r for r in caplog.records if "exposes no drafter model" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "model_runner.drafter / model_runner.speculator" in warnings[0].getMessage()
+
+
+@pytest.mark.vllm
+def test_installed_vllm_runners_keep_the_drafter_under_a_known_attribute():
+    """Trip-wire: both installed vLLM model runners assign the proposer under a name
+    ``_get_drafter_model`` looks at, so a future rename fails here, not as 0% MTP
+    acceptance in a nightly."""
+    import inspect
+
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtension,
+    )
+
+    pytest.importorskip("vllm")
+    from vllm.v1.worker import gpu_model_runner as legacy_runner_module
+    from vllm.v1.worker.gpu import model_runner as v2_runner_module
+
+    known = VllmInternalWorkerExtension._DRAFTER_OWNER_ATTRS
+    for module in (legacy_runner_module, v2_runner_module):
+        source = inspect.getsource(module.GPUModelRunner)
+        assigned = {
+            attr for attr in ("drafter", "speculator") if f"self.{attr} = " in source
+        }
+        assert assigned, (
+            f"{module.__name__}.GPUModelRunner assigns no proposer attribute"
+        )
+        assert assigned <= set(known), (
+            f"{module.__name__}.GPUModelRunner keeps the proposer under {assigned}, "
+            f"which _get_drafter_model does not read ({known})"
+        )
 
 
 @pytest.mark.vllm

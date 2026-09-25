@@ -408,6 +408,13 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
     # False for a checkpoint-loaded static MTP drafter; True only when the
     # trainer exports MTP weights in every policy refit stream.
     _mtp_drafter_weights_from_refit: bool = True
+    # vLLM's legacy GPUModelRunner keeps the speculative proposer as ``drafter``;
+    # the v2 model runner (vllm/v1/worker/gpu/model_runner.py, the default since
+    # vLLM 0.29) keeps it as ``speculator``. Both expose the draft nn.Module as
+    # ``.model``. Checked in this order so a legacy runner is never shadowed.
+    _DRAFTER_OWNER_ATTRS: tuple[str, ...] = ("drafter", "speculator")
+    # Each worker reports a missing drafter for a co-trained MTP head at most once.
+    _warned_missing_mtp_drafter: bool = False
     # Each worker logs the Gemma 4 Unified multimodal filtering at most once.
     _logged_gemma4_unified_drop: bool = False
     _sparse_delta_applier: Any = None
@@ -822,12 +829,20 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         """Return the vLLM drafter's underlying model, or None if absent.
 
         The drafter holds the speculative-decoding draft model (Eagle3 or MTP),
-        which vLLM keeps as a module separate from the main model. Typed ``Any``
-        because these are dynamic vLLM model classes whose ``load_weights`` /
+        which vLLM keeps as a module separate from the main model, under
+        ``model_runner.drafter`` (legacy runner) or ``model_runner.speculator``
+        (v2 runner); see ``_DRAFTER_OWNER_ATTRS``. Typed ``Any`` because these
+        are dynamic vLLM model classes whose ``load_weights`` /
         ``mtp_start_layer_idx`` members are not visible through ``nn.Module``.
         """
-        draft_owner = getattr(self.model_runner, "drafter", None)
-        return getattr(draft_owner, "model", None) if draft_owner else None
+        for owner_attr in self._DRAFTER_OWNER_ATTRS:
+            draft_owner = getattr(self.model_runner, owner_attr, None)
+            draft_model = (
+                getattr(draft_owner, "model", None) if draft_owner is not None else None
+            )
+            if draft_model is not None:
+                return draft_model
+        return None
 
     def configure_mtp_drafter_weight_source(self, weights_from_refit: bool) -> None:
         """Record whether the trainer owns and refreshes the MTP weights."""
@@ -867,7 +882,21 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         method = getattr(spec_config, "method", None) if spec_config else None
         if method not in ("deepseek_mtp", "mtp"):
             return False
-        return self._get_drafter_model() is not None
+        if self._get_drafter_model() is None:
+            # Silently skipping here is how vLLM 0.29's runner rename went
+            # unnoticed: the drafter kept its dummy load-time weights and MTP
+            # acceptance sat at 0% while every golden still passed.
+            if not self._warned_missing_mtp_drafter:
+                self._warned_missing_mtp_drafter = True
+                logger.warning(
+                    "[mtp] The policy refit carries co-trained MTP drafter weights "
+                    "but vLLM exposes no drafter model (looked for model_runner.%s); "
+                    "the drafter keeps its load-time weights, so speculative "
+                    "acceptance will collapse.",
+                    " / model_runner.".join(self._DRAFTER_OWNER_ATTRS),
+                )
+            return False
+        return True
 
     def _maybe_refit_mtp_drafter(self, weights: list[tuple[str, torch.Tensor]]) -> None:
         """Load refit weights into an MTP drafter co-trained with the policy.
