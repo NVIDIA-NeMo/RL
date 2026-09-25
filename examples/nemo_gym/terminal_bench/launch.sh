@@ -18,7 +18,8 @@
 #           MODEL (policy checkpoint dir) DATA (TB JSONL)
 #           TASK_ROOT (host dir mounted at /terminal-bench-tasks, matching task_folder in DATA)
 #           RUN_DIR (checkpoints, logs, Gym output) OPENSANDBOX_DOMAIN OPENSANDBOX_API_KEY WANDB_API_KEY
-# Optional: WALLTIME (4:00:00) EXP_NAME WANDB_PROJECT HF_HOME MOUNTS (extra host:container,...) SBATCH_ARGS
+# Optional: CONFIG (recipe path in the repo, default examples/nemo_gym/terminal_bench/opencode_sc.yaml)
+#           WALLTIME (4:00:00) EXP_NAME WANDB_PROJECT HF_HOME MOUNTS (extra host:container,...) SBATCH_ARGS
 # Additional recipe overrides may be passed as arguments.
 set -euo pipefail
 
@@ -43,7 +44,7 @@ EOF
 
 read -r -d '' COMMAND <<EOF || true
 cd /opt/nemo-rl && uv run --locked --extra nemo_gym examples/run_grpo_single_controller.py \
-  --config examples/nemo_gym/terminal_bench/opencode_sc.yaml \
+  --config ${CONFIG:-examples/nemo_gym/terminal_bench/opencode_sc.yaml} \
   cluster.num_nodes=$NUM_NODES \
   policy.generation.colocated.resources.num_nodes=$NUM_GEN_NODES \
   policy.generation.vllm_cfg.reasoning_parser_plugin=/opt/nemo-rl/nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py \
