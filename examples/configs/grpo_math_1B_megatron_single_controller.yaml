@@ -81,14 +81,23 @@ async_rl:
     # from the dataloader before it is admitted, so a refill yields a batch of spares.
     replacement_reserve_prompts: 1
 
-    # Deadlines. null disables, which is the default and reproduces the historical
-    # behaviour of waiting forever. Set them in any run that matters: without one a
-    # wedged generation engine parks a rollout permanently, holding a
-    # max_inflight_prompts slot for the rest of the job.
+    # Deadlines, set rather than left at their null default, because null means wait
+    # forever: nothing below SC bounds a rollout, so a wedged generation engine or
+    # environment server parks one permanently and holds its max_inflight_prompts
+    # slot for the rest of the job. Under a sampler that stamps target steps that is
+    # a hang rather than a slowdown -- the stamped step never fills, and since no
+    # exception is raised, none of the retry budgets above ever see it.
+    #
+    # Sized so only a wedge can trip them, not a slow rollout: this config generates
+    # at most max_total_sequence_length=512 tokens per turn and scores with a local
+    # math verifier, both of which are seconds' work. Size your own from the p99 you
+    # measure, keeping watchdog.stall_timeout_s (below) above every value set here.
     native:                           # AsyncRolloutImpl only
-      generation_timeout_s: null      # one generate_async turn
-      env_timeout_s: null             # one environment step
+      generation_timeout_s: 300.0     # one generate_async turn
+      env_timeout_s: 120.0            # one environment step
     nemo_gym:                         # AsyncNemoGymRolloutImpl only
+      # Left at its default: this is a native run, and setup rejects a populated
+      # nemo_gym block instead of letting it read as effective while being ignored.
       rollout_timeout_s: null         # the whole prompt-group rollout, retries included
       # Re-send just the rows that never arrived before retrying the whole group.
       # Gym's stream dies on its first failing row, so one bad row loses every later
