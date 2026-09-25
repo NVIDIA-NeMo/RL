@@ -1369,11 +1369,11 @@ def test_completed_capture_evidence_expires_by_age_not_entry_count(monkeypatch):
     worker = _worker_with_capture(_MemorySink())
     now = [100.0]
     monkeypatch.setattr(
-        "nemo_rl.models.generation.vllm.vllm_worker_async.time.monotonic",
+        "nemo_rl.models.generation.generation_cut_capture.time.monotonic",
         lambda: now[0],
     )
     monkeypatch.setattr(
-        "nemo_rl.models.generation.vllm.vllm_worker_async."
+        "nemo_rl.models.generation.generation_cut_capture."
         "_COMPLETED_CAPTURE_RETENTION_S",
         10.0,
     )
