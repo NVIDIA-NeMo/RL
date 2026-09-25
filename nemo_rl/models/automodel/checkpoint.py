@@ -434,17 +434,14 @@ class AutomodelCheckpointManager:
             "Call init_checkpointer() first."
         )
 
-        model_dir = (
-            weights_path
-            if weights_path.endswith("/model")
-            else os.path.join(weights_path, "model")
-        )
-
+        # load model
+        model_dir = os.path.join(weights_path, "model")
         self.checkpointer.load_model(
             model=model,
             model_path=model_dir,
         )
 
+        # load optimizer
         if optimizer_path and optimizer is not None:
             if getattr(optimizer, "master_weights", False):
                 # Check the on-disk dtype before DCP copies into current buffers:
