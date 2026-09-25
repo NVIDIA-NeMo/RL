@@ -19,6 +19,7 @@ from pydantic import BaseModel
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 from nemo_rl.utils.checkpoint import PretrainedCheckpointConfig
+from nemo_rl.utils.memory_snapshot import MemorySnapshotConfig
 
 
 def _patch_transformers_tokenizer_class_set():
@@ -221,6 +222,9 @@ class DTensorConfig(TypedDict):
     # Runtime
     clear_cache_every_n_steps: NotRequired[int | None]
     checkpoint: NotRequired[AutomodelCheckpointConfig]
+    # Opt-in CUDA allocation history + snapshot dump when train/get_logprobs OOM
+    # (DTensor v2). See nemo_rl.utils.memory_snapshot.
+    memory_snapshot: NotRequired[MemorySnapshotConfig]
 
 
 class SequencePackingConfigDisabled(TypedDict):

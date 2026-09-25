@@ -163,6 +163,10 @@ policy:
     cpu_offload: False
     sequence_parallel: false
     activation_checkpointing: false
+    # Opt-in CUDA allocation history + snapshot dump when train/get_logprobs/score
+    # OOM (DTensor v2). Directory defaults to a temp-dir subfolder.
+    memory_snapshot:
+      enabled: false
     tensor_parallel_size: 1
     context_parallel_size: 1
     custom_parallel_plan: null

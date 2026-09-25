@@ -84,6 +84,11 @@ from nemo_rl.telemetry.setup import (
     traced_worker_init,
 )
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
+from nemo_rl.utils.memory_snapshot import (
+    MemorySnapshotConfig,
+    enable_memory_history,
+    snapshot_on_oom,
+)
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 from nemo_rl.utils.timer import Timer
@@ -388,6 +393,22 @@ class DTensorPolicyWorkerV2Impl(
             _runtime_is_reward_model,  # Duplicate, already set as _is_reward_model
         ) = runtime_config
 
+        # Opt-in allocator history: lets an OOM in train/get_logprobs report the
+        # live blocks with the code that allocated them (see utils/memory_snapshot).
+        # Defaults live on the pydantic model, not at this call site.
+        self._memory_snapshot_cfg = MemorySnapshotConfig.model_validate(
+            self.cfg["dtensor_cfg"].get("memory_snapshot") or {}
+        )
+        if self._memory_snapshot_cfg.enabled:
+            if self._memory_snapshot_cfg.record_history:
+                enable_memory_history(self._memory_snapshot_cfg.max_entries)
+            print(
+                "[MEMORY_SNAPSHOT] enabled: an OOM in train/get_logprobs/score dumps "
+                "a snapshot to "
+                f"{self._memory_snapshot_cfg.directory or 'the temp dir'}",
+                flush=True,
+            )
+
     def _update_moe_gate_bias_if_supported(self) -> None:
         """Update the non-gradient MoE routing bias after the optimizer step."""
         update_moe_gate_bias = getattr(self.model, "update_moe_gate_bias", None)
@@ -405,6 +426,7 @@ class DTensorPolicyWorkerV2Impl(
         self._rollout_num_gpus_per_engine = num_gpus_per_engine
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/train")
+    @snapshot_on_oom("train")
     def train(
         self,
         data: BatchedDataDict[Any],
@@ -583,6 +605,7 @@ class DTensorPolicyWorkerV2Impl(
             return metrics
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/get_logprobs")
+    @snapshot_on_oom("get_logprobs")
     def get_logprobs(
         self, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
     ) -> BatchedDataDict[LogprobOutputSpec]:
@@ -675,6 +698,7 @@ class DTensorPolicyWorkerV2Impl(
         return return_data
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/score")
+    @snapshot_on_oom("score")
     def score(self, data: BatchedDataDict) -> BatchedDataDict[ScoreOutputSpec]:
         global_batch_size = min(self.cfg["batch_size"], data.size)
 
