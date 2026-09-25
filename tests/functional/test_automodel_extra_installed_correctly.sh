@@ -55,8 +55,8 @@ except ImportError as e:
 
 # Test automodel factory
 try:
-    from nemo_rl.models.policy.utils import AUTOMODEL_FACTORY, NEMO_AUTOMODEL_AVAILABLE
-    print(f"[Automodel factory available: {NEMO_AUTOMODEL_AVAILABLE}]")
+    from nemo_rl.models.automodel.utils import AUTOMODEL_FACTORY
+    print(f"[Automodel factory available: {len(AUTOMODEL_FACTORY)} entries]")
 except ImportError as e:
     print(f"[Automodel factory import failed: {e}]")
 
