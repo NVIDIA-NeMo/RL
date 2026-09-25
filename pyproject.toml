@@ -52,9 +52,9 @@ dependencies = [
   "torchvision==0.26.0",
   # torchaudio and torchcodec are NOT installed in the container image.
   # Run tools/install_audio_deps.sh before using audio features or audio tests.
-  # Keep the base range compatible with backend-specific pins while selecting 5.12.1
-  # for the base and compatible backend environments in uv.lock.
-  "transformers>=5.5.0,<=5.12.1",
+  # Keep the base range compatible with backend-specific pins while selecting 5.14.0
+  # for the driver and vLLM environments in uv.lock (Inkling config support).
+  "transformers>=5.5.0,<=5.14.0",
   "num2words>=0.5.14",                                                                                                       # for SmolVLM
   "timm",
   "open-clip-torch>=3.2.0",
@@ -145,7 +145,8 @@ automodel = [
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
 ]
 vllm = [
-  "transformers==5.12.1",
+  # Inkling's config is loaded by NeMo-RL before vLLM's custom registration.
+  "transformers==5.14.0",
   "tilelang==0.1.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "cuda-python",
   "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@67fc64863d43521080bf2005e6528d0fceee9510",

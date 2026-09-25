@@ -12,6 +12,9 @@ loss_fn:
   truncated_importance_sampling_ratio: 2
 checkpointing:
   checkpoint_dir: results/grpo-inkling-small-16n4g-fsdp2-automodel-ep64
+  keep_top_k: 1
+  save_period: 100
+  checkpoint_must_save_by: 00:03:45:00
 policy:
   model_name: thinkingmachines/Inkling-Small
   tokenizer:
@@ -23,13 +26,19 @@ policy:
   train_global_batch_size: 64
   train_micro_batch_size: 1
   logprob_batch_size: 1
-  max_total_sequence_length: 10240
-  logprob_chunk_size: 2048
+  make_sequence_length_divisible_by: 1024
+  max_total_sequence_length: 8192
+  logprob_chunk_size: 1024
   offload_optimizer_for_logprob: true
   optimizer:
+    name: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
     kwargs:
-      lr: 3.0e-07
+      lr: 1.0e-06
       weight_decay: 0.1
+      master_weights: true
+      store_param_remainders: true
+      exp_avg_dtype: torch.bfloat16
+      exp_avg_sq_dtype: torch.bfloat16
   scheduler:
   - name: torch.optim.lr_scheduler.LinearLR
     kwargs:
@@ -43,8 +52,12 @@ policy:
   - milestones:
     - 10
   dtensor_cfg:
+    context_parallel_size: 1
     expert_parallel_size: 64
     activation_checkpointing: true
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+      NRL_REFIT_NUM_BUFFERS: '1'
     automodel_kwargs:
       freeze_config:
         freeze_vision_tower: true
@@ -56,15 +69,16 @@ policy:
         linear: torch
         rms_norm: torch_fp32
         experts: torch_mm
-        dispatcher: torch
+        dispatcher: hybridep
         gate_precision: float32
         enable_hf_state_dict_adapter: true
+        enable_fsdp_optimizations: true
   sequence_packing:
     enabled: false
   dynamic_batching:
     enabled: true
   generation:
-    max_new_tokens: 8192
+    max_new_tokens: 4096
     colocated:
       enabled: false
       resources:
@@ -78,6 +92,9 @@ policy:
     vllm_cfg:
       tensor_parallel_size: 8
       skip_tokenizer_init: false
+      gpu_memory_utilization: 0.8
+      enforce_eager: true
+      max_model_len: 8192
       # Inkling carries short-convolution state alongside the attention KV cache.
       # Disable cached-prefix execution so rollout logprobs stay comparable with
       # the policy's full-sequence recomputation.
@@ -87,6 +104,7 @@ policy:
     vllm_kwargs:
       tokenizer_mode: inkling
       language_model_only: true
+      block_size: 128
 data:
   max_input_seq_length: 2048
   train:
