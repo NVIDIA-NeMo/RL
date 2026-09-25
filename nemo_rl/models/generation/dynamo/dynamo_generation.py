@@ -185,7 +185,7 @@ class DynamoGeneration(GenerationInterface):
         )
         self._token_wrapper_server: Optional[DynamoTokenWrapperServer] = None
         self._dynamo_frontend_base_url = ""
-        self.dp_openai_server_base_urls: list[Optional[str]] = []
+        self.dp_openai_server_base_urls: list[str] = []
         self._refit_channel: DynamoRefitChannel | None = None
         self._metrics_sampler: DynamoMetricsSampler | None = None
         try:
@@ -218,7 +218,9 @@ class DynamoGeneration(GenerationInterface):
                     flush=True,
                 )
             else:
-                self.dp_openai_server_base_urls = [None]
+                # Rollouts go straight to the frontend, so there is no
+                # OpenAI-compatible server of ours to report.
+                self.dp_openai_server_base_urls = []
                 print(f"  [Dynamo] Forwarding rollouts to {url}", flush=True)
 
             if vllm_cfg.enable_vllm_metrics_logger:
