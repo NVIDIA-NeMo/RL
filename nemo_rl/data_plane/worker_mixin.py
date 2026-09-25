@@ -81,7 +81,7 @@ def _broadcast_batched_data_dict(
     Two-phase to avoid pickling tensor payloads on the hot path: a small
     descriptor (per-key dtype/shape) ships via ``broadcast_object_list``
     first, then each tensor's data ships via ``broadcast`` on its
-    current device. The leader supplies ``data``; non-leaders pass
+    transport device. The leader supplies ``data``; non-leaders pass
     ``None`` and get an empty BatchedDataDict filled in-place.
     """
     # NCCL groups can only broadcast CUDA tensors; pick the broadcast
@@ -158,31 +158,31 @@ def _broadcast_batched_data_dict(
         kind = entry[1]
         if kind == "tensor":
             dtype_str, shape, src_device = entry[2], entry[3], entry[4]
+            dtype = getattr(torch, dtype_str.split(".")[-1])
+            wire_dtype = torch.int32 if dtype == torch.int16 else dtype
             if is_leader:
-                tensor = out[key]
-                if tensor.device.type != torch.device(bcast_device).type:
-                    tensor = tensor.to(bcast_device)
-                    out[key] = tensor
+                # Send logical order without replacing the leader's original view.
+                tensor = (
+                    out[key]
+                    .to(
+                        device=bcast_device,
+                        dtype=wire_dtype,
+                        memory_format=torch.contiguous_format,
+                    )
+                    .contiguous()
+                )
             else:
-                dtype = getattr(torch, dtype_str.split(".")[-1])
-                tensor = torch.empty(shape, dtype=dtype, device=bcast_device)
-                out[key] = tensor
+                tensor = torch.empty(shape, dtype=wire_dtype, device=bcast_device)
             # NCCL has no int16 ("Short") type; ship as int32 and narrow back
             # (routed_experts rides TQ as int16).
-            if tensor.dtype == torch.int16:
-                wire = tensor.to(torch.int32)
-                torch.distributed.broadcast(wire, src=src, group=group)
-                tensor = wire.to(torch.int16)
+            torch.distributed.broadcast(tensor, src=src, group=group)
+            if not is_leader:
+                if tensor.dtype != dtype:
+                    tensor = tensor.to(dtype)
+                if torch.device(src_device).type != torch.device(bcast_device).type:
+                    tensor = tensor.to(src_device)
                 out[key] = tensor
-            else:
-                torch.distributed.broadcast(tensor, src=src, group=group)
-            # Restore non-leader tensors to the leader's source device
-            # so downstream code sees the same layout pre-broadcast.
-            if (
-                not is_leader
-                and torch.device(src_device).type != torch.device(bcast_device).type
-            ):
-                out[key] = tensor.to(src_device)
+            del tensor
         elif kind == "packed_tensor":
             header, shapes, dtype_str, source_device = entry[2:]
             if is_leader:
