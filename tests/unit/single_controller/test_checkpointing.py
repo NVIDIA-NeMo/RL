@@ -1800,7 +1800,7 @@ class TestPeriodicRolloutCheckpoint:
         actor = self._actor(tmp_path)
         events: list[str] = []
         actor._gym_participant_checkpointing_enabled = True
-        actor._master_config.rollout_checkpointing.gym.participant_checkpointing_enabled = True
+        actor._master_config.rollout_checkpointing.gym.mode = "turn_recovery"
         gym_actor = _FakeGymCheckpointActor(events)
         actor._env_handles = {
             "nemo_gym": NemoGymShardSet(handles={"default": [gym_actor]})
@@ -1887,7 +1887,7 @@ class TestPeriodicRolloutCheckpoint:
     ) -> None:
         actor = self._actor(tmp_path)
         actor._gym_participant_checkpointing_enabled = True
-        actor._master_config.rollout_checkpointing.gym.participant_checkpointing_enabled = True
+        actor._master_config.rollout_checkpointing.gym.mode = "turn_recovery"
         actor._gym_checkpoint_topology = GymCheckpointTopology.model_validate(
             {
                 "schema_version": 1,
@@ -2036,7 +2036,7 @@ class TestPeriodicRolloutCheckpoint:
         actor = self._actor(tmp_path)
         events: list[str] = []
         actor._gym_participant_checkpointing_enabled = True
-        actor._master_config.rollout_checkpointing.gym.participant_checkpointing_enabled = True
+        actor._master_config.rollout_checkpointing.gym.mode = "turn_recovery"
         actor._env_handles = {"nemo_gym": _FakeGymCheckpointActor(events)}
         actor._gym_checkpoint_topology = GymCheckpointTopology.model_validate(
             {
@@ -2096,7 +2096,7 @@ class TestPeriodicRolloutCheckpoint:
         actor = self._actor(tmp_path)
         events: list[str] = []
         actor._gym_participant_checkpointing_enabled = True
-        actor._master_config.rollout_checkpointing.gym.participant_checkpointing_enabled = True
+        actor._master_config.rollout_checkpointing.gym.mode = "turn_recovery"
         actor._env_handles = {
             "nemo_gym": _FakeGymCheckpointActor(events, fail_commit=True)
         }
@@ -2319,7 +2319,7 @@ class TestPeriodicRolloutCheckpoint:
         actor = self._actor(tmp_path)
         events: list[str] = []
         actor._gym_participant_checkpointing_enabled = True
-        actor._master_config.rollout_checkpointing.gym.participant_checkpointing_enabled = True
+        actor._master_config.rollout_checkpointing.gym.mode = "turn_recovery"
         gym_actor = _FakeGymCheckpointActor(events, fail_resume_attempts=1)
         actor._env_handles = {"nemo_gym": gym_actor}
         actor._gym_checkpoint_topology = GymCheckpointTopology.model_validate(
@@ -2377,7 +2377,7 @@ class TestPeriodicRolloutCheckpoint:
         actor = self._actor(tmp_path)
         events: list[str] = []
         actor._gym_participant_checkpointing_enabled = True
-        actor._master_config.rollout_checkpointing.gym.participant_checkpointing_enabled = True
+        actor._master_config.rollout_checkpointing.gym.mode = "turn_recovery"
         gym_actor = _FakeGymCheckpointActor(events, fail_commit=True)
         actor._env_handles = {"nemo_gym": gym_actor}
         try:
@@ -2404,7 +2404,7 @@ class TestPeriodicRolloutCheckpoint:
         actor = self._actor(tmp_path)
         events: list[str] = []
         actor._gym_participant_checkpointing_enabled = True
-        actor._master_config.rollout_checkpointing.gym.participant_checkpointing_enabled = True
+        actor._master_config.rollout_checkpointing.gym.mode = "turn_recovery"
         gym_actor = _FakeGymCheckpointActor(
             events,
             fail_commit=True,
@@ -2481,7 +2481,7 @@ class TestPeriodicRolloutCheckpoint:
         actor = self._actor(tmp_path)
         events: list[str] = []
         actor._gym_participant_checkpointing_enabled = True
-        actor._master_config.rollout_checkpointing.gym.participant_checkpointing_enabled = True
+        actor._master_config.rollout_checkpointing.gym.mode = "turn_recovery"
         gym_actor = _FakeGymCheckpointActor(events)
         actor._env_handles = {"nemo_gym": gym_actor}
         actor._gym_checkpoint_topology = GymCheckpointTopology.model_validate(
@@ -2540,7 +2540,7 @@ class TestPeriodicRolloutCheckpoint:
         actor = self._actor(tmp_path)
         events: list[str] = []
         actor._gym_participant_checkpointing_enabled = True
-        actor._master_config.rollout_checkpointing.gym.participant_checkpointing_enabled = True
+        actor._master_config.rollout_checkpointing.gym.mode = "turn_recovery"
         actor._env_handles = {"nemo_gym": _FakeGymCheckpointActor(events)}
         actor._gym_checkpoint_topology = _agent_checkpoint_topology()
 
@@ -2565,7 +2565,7 @@ class TestPeriodicRolloutCheckpoint:
         actor = self._actor(tmp_path)
         events: list[str] = []
         actor._gym_participant_checkpointing_enabled = True
-        actor._master_config.rollout_checkpointing.gym.participant_checkpointing_enabled = True
+        actor._master_config.rollout_checkpointing.gym.mode = "turn_recovery"
         actor._env_handles = {"nemo_gym": _FakeGymCheckpointActor(events)}
         actor._gym_checkpoint_topology = _agent_checkpoint_topology()
 
@@ -2601,7 +2601,7 @@ class TestPeriodicRolloutCheckpoint:
         actor = self._actor(tmp_path)
         events: list[str] = []
         actor._gym_participant_checkpointing_enabled = True
-        actor._master_config.rollout_checkpointing.gym.participant_checkpointing_enabled = True
+        actor._master_config.rollout_checkpointing.gym.mode = "turn_recovery"
         gym_actor = _FakeGymCheckpointActor(events)
         actor._env_handles = {"nemo_gym": gym_actor}
         actor._gym_checkpoint_topology = GymCheckpointTopology.model_validate(

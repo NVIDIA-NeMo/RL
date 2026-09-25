@@ -793,12 +793,14 @@ class TestSetup:
         snapshot_interval: float | None,
         fleet_health_enabled: bool,
     ) -> None:
-        mc = _make_master_config()
+        mc = _make_master_config(env={"should_use_nemo_gym": token_capture_enabled})
         mc.data_plane["backend"] = "mooncake_cpu"
         mc.checkpointing.update(enabled=True, save_data_plane=True)
         mc.async_rl.generation_fleet_health.enabled = fleet_health_enabled
         mc.async_rl.generation_fleet_health.restart_dead_shards = True
         mc.token_capture = TokenCaptureConfig(enabled=token_capture_enabled)
+        if token_capture_enabled:
+            mc.async_rl.rollout_failure.nemo_gym.max_row_attempts = 1
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=snapshot_interval
         )
@@ -863,9 +865,7 @@ class TestSetup:
 
     def test_gym_discovery_mode_requires_nemo_gym(self):
         mc = _make_master_config(env={"should_use_nemo_gym": False})
-        mc.rollout_checkpointing = RolloutCheckpointConfig(
-            gym={"mode": "discover"}
-        )
+        mc.rollout_checkpointing = RolloutCheckpointConfig(gym={"mode": "discover"})
 
         with pytest.raises(
             ValueError,
@@ -999,7 +999,11 @@ class TestSetup:
         tmp_path: Path,
         patched_factories,
     ):
-        mc = _make_master_config(colocated=False, backend="vllm")
+        mc = _make_master_config(
+            colocated=False,
+            backend="vllm",
+            env={"should_use_nemo_gym": True},
+        )
         mc.checkpointing.update(
             {
                 "checkpoint_dir": str(tmp_path / "checkpoints"),
@@ -1141,9 +1145,10 @@ class TestSetup:
 
     def test_periodic_checkpointing_requires_replay_capable_sampler(self):
         mc = _make_master_config(
+            env={"should_use_nemo_gym": True},
             sampler_cfg=CustomSamplerConfig(
                 target=f"{__name__}:_NonCheckpointingCustomSampler"
-            )
+            ),
         )
         mc.checkpointing["enabled"] = True
         mc.checkpointing["save_data_plane"] = True
@@ -1161,9 +1166,10 @@ class TestSetup:
 
     def test_periodic_checkpointing_requires_claim_aware_custom_sampler(self):
         mc = _make_master_config(
+            env={"should_use_nemo_gym": True},
             sampler_cfg=CustomSamplerConfig(
                 target=(f"{__name__}:_CheckpointingNonClaimingCustomSampler")
-            )
+            ),
         )
         mc.checkpointing["enabled"] = True
         mc.checkpointing["save_data_plane"] = True
@@ -1181,7 +1187,11 @@ class TestSetup:
         tmp_path: Path,
         patched_factories,
     ):
-        mc = _make_master_config(colocated=False, backend="vllm")
+        mc = _make_master_config(
+            colocated=False,
+            backend="vllm",
+            env={"should_use_nemo_gym": True},
+        )
         mc.checkpointing.update(
             {
                 "checkpoint_dir": str(tmp_path / "checkpoints"),
@@ -1259,7 +1269,11 @@ class TestSetup:
         tmp_path: Path,
         patched_factories,
     ):
-        mc = _make_master_config(colocated=False, backend="vllm")
+        mc = _make_master_config(
+            colocated=False,
+            backend="vllm",
+            env={"should_use_nemo_gym": True},
+        )
         checkpoint_dir = tmp_path / "checkpoints"
         mc.checkpointing.update(
             {
@@ -2015,7 +2029,10 @@ class TestSetup:
         assert WIRE_MULTIMODAL_FIELDS <= set(warmup_fields)
 
     def test_token_capture_always_creates_finalizer_actor_pool(self, patched_factories):
-        mc = _make_master_config(backend="vllm")
+        mc = _make_master_config(
+            backend="vllm",
+            env={"should_use_nemo_gym": True},
+        )
         mc.policy["generation"].update(
             {
                 "model_name": "test-model",
@@ -2633,10 +2650,18 @@ class TestNativeTQRecoverySetup:
         checkpointer.get_resume_paths.return_value = (None, None)
         resolved_snapshot = SimpleNamespace(
             path=snapshot_path,
-            manifest=SimpleNamespace(current_epoch=2, sampler_dispatch_index=7),
+            manifest=SimpleNamespace(
+                current_epoch=2,
+                sampler_dispatch_index=7,
+                gym_checkpoint=None,
+            ),
         )
 
-        mc = _make_master_config(colocated=False, backend="vllm")
+        mc = _make_master_config(
+            colocated=False,
+            backend="vllm",
+            env={"should_use_nemo_gym": True},
+        )
         mc.data_plane["backend"] = "mooncake_cpu"
         mc.checkpointing.update(
             {
