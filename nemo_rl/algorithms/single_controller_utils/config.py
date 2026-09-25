@@ -749,10 +749,16 @@ class GymRolloutCheckpointConfig(BaseModel, extra="forbid"):
     ``disabled`` skips protocol discovery. ``discover`` validates and
     fingerprints the Gym checkpoint topology without saving participant state.
     ``turn_recovery`` also saves Gym participant state and enables durable
-    completion acknowledgements.
+    completion acknowledgements. ``prefix_recovery`` additionally captures
+    active generation prefixes.
     """
 
-    mode: Literal["disabled", "discover", "turn_recovery"] = "disabled"
+    mode: Literal[
+        "disabled", "discover", "turn_recovery", "prefix_recovery"
+    ] = "disabled"
+    # Stage an in-flight call's accumulated tokens once its unstaged segment
+    # reaches this many tokens. 0 disables periodic chunk flushing.
+    generation_chunk_flush_tokens: Annotated[int, Field(ge=0)] = 0
     prepare_timeout_s: Annotated[float, Field(gt=0)] = 300.0
 
     @property
@@ -761,7 +767,24 @@ class GymRolloutCheckpointConfig(BaseModel, extra="forbid"):
 
     @property
     def participant_checkpointing_enabled(self) -> bool:
-        return self.mode == "turn_recovery"
+        return self.mode in {"turn_recovery", "prefix_recovery"}
+
+    @property
+    def generation_prefix_cuts_enabled(self) -> bool:
+        return self.mode == "prefix_recovery"
+
+    @model_validator(mode="after")
+    def validate_prefix_checkpointing(self) -> "GymRolloutCheckpointConfig":
+        if (
+            self.generation_chunk_flush_tokens
+            and not self.generation_prefix_cuts_enabled
+        ):
+            raise ValueError(
+                "generation_chunk_flush_tokens requires "
+                "gym.mode=prefix_recovery; without prefix cuts a "
+                "staged chunk has no restore path"
+            )
+        return self
 
 
 class RolloutCheckpointConfig(BaseModel, extra="forbid"):

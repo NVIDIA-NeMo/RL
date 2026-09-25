@@ -156,6 +156,7 @@ from nemo_rl.data_plane.schema import (
     ROLLOUT_METRICS,
     ROUTE_PLAN_TAG,
 )
+from nemo_rl.data_plane.tq_token_sink import GENERATION_CUT_STAGING_PREFIX
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lost
 from nemo_rl.environments.gym_checkpoint import (
@@ -636,6 +637,10 @@ class SingleControllerActor:
         # Full trainer checkpoints and lightweight rollout snapshots share one
         # namespace and must never publish concurrently.
         self._checkpoint_save_lock = asyncio.Lock()
+        # Prefix-cut snapshots and weight refits both pause the same generation
+        # engines. Serialize those lifecycles so one owner cannot resume an
+        # engine while the other still requires it frozen.
+        self._generation_control_lock = asyncio.Lock()
         self._last_rollout_snapshot_mutation_version: Optional[int] = None
         self._last_missing_rollout_snapshot_anchor: Optional[tuple[int, int]] = None
         self._bootstrap_identity: Optional[BootstrapCompatibilityIdentity] = (
@@ -670,6 +675,10 @@ class SingleControllerActor:
         self._gym_participant_checkpointing_enabled = (
             master_config.rollout_checkpointing.gym.participant_checkpointing_enabled
         )
+        self._generation_prefix_cuts_enabled = (
+            master_config.rollout_checkpointing.gym.generation_prefix_cuts_enabled
+        )
+        self._generation_checkpoint_id: Optional[str] = None
         self._gym_completed_acknowledgement_lock = asyncio.Lock()
         self._gym_completed_acknowledgement_task: Optional[asyncio.Task[None]] = None
         self._rollout_manager.bind_gym_acknowledgement_sink(
@@ -1516,6 +1525,7 @@ class SingleControllerActor:
         *,
         replay_metadata: Optional[TQReplayMetadataState],
         clear_unreferenced: bool,
+        clear_unreferenced_generation_cuts: bool = False,
         gym_staging_keys: set[str] | None = None,
     ) -> int:
         """Validate staging ownership while the caller holds a stable cut."""
@@ -1546,6 +1556,23 @@ class SingleControllerActor:
                 f"(total={len(missing)})"
             )
         unreferenced = sorted(actual_staging_keys - expected_staging_keys)
+        stale_generation_cuts = [
+            key for key in unreferenced if key.startswith(GENERATION_CUT_STAGING_PREFIX)
+        ]
+        if clear_unreferenced_generation_cuts and stale_generation_cuts:
+            await self._call_dp(
+                "clear_samples",
+                sample_ids=stale_generation_cuts,
+                partition_id=staging_partition,
+            )
+            unreferenced = [
+                key for key in unreferenced if key not in stale_generation_cuts
+            ]
+            print(
+                "rollout recovery cleared obsolete generation-cut rows: "
+                f"count={len(stale_generation_cuts)}",
+                flush=True,
+            )
         if clear_unreferenced and unreferenced:
             await self._call_dp(
                 "clear_samples",
@@ -1950,7 +1977,7 @@ class SingleControllerActor:
         self,
         checkpoint_id: str,
         checkpoint_dir: Path,
-    ) -> GymCheckpointCommitResult:
+    ) -> tuple[GymCheckpointPrepareResult, GymCheckpointCommitResult]:
         """Park Gym and write participant state into an unpublished snapshot."""
         timeout_s = self._master_config.rollout_checkpointing.gym.prepare_timeout_s
         gym_actor = self._nemo_gym_checkpoint_actor()
@@ -1961,6 +1988,26 @@ class SingleControllerActor:
             # adopted it. Flush every canonical result queued by finalization
             # before asking Gym to park the remaining active executions.
             await self._flush_completed_gym_acknowledgements()
+            if self._generation_prefix_cuts_enabled:
+                try:
+                    await asyncio.to_thread(
+                        self._gen.begin_generation_checkpoint,
+                        timeout_s=timeout_s,
+                    )
+                except BaseException as fence_error:
+                    try:
+                        await asyncio.to_thread(
+                            self._gen.finish_generation_checkpoint,
+                            timeout_s=timeout_s,
+                        )
+                    except BaseException as release_error:
+                        raise BaseExceptionGroup(
+                            "generation checkpoint fencing failed and partially "
+                            "fenced workers could not be released",
+                            [fence_error, release_error],
+                        )
+                    raise
+                self._generation_checkpoint_id = checkpoint_id
             # Record before the RPC. Gym may freeze its participants and lose
             # the response, so every attempted prepare needs an idempotent abort.
             prepare_attempted = True
@@ -2001,8 +2048,9 @@ class SingleControllerActor:
                 checkpoint_dir,
                 checkpoint,
             )
-            return checkpoint
+            return prepare, checkpoint
         except BaseException as checkpoint_error:
+            recovery_errors: list[BaseException] = [checkpoint_error]
             if prepare_attempted:
                 try:
                     await self._abort_prepared_gym_checkpoint(checkpoint_id)
@@ -2011,15 +2059,32 @@ class SingleControllerActor:
                         "Checkpoint failure that required the pending abort: "
                         f"{type(checkpoint_error).__name__}: {checkpoint_error}"
                     )
+                    for recovery_error in recovery_errors[1:]:
+                        abort_error.add_note(
+                            "Additional checkpoint cleanup failure: "
+                            f"{type(recovery_error).__name__}: {recovery_error}"
+                        )
                     raise
                 except BaseException as abort_error:
-                    raise BaseExceptionGroup(
-                        "Gym checkpoint failed and participant admission could not "
-                        "be restored",
-                        [checkpoint_error, abort_error],
-                    )
+                    recovery_errors.append(abort_error)
             else:
+                if self._generation_checkpoint_id == checkpoint_id:
+                    try:
+                        await asyncio.to_thread(
+                            self._gen.finish_generation_checkpoint,
+                            timeout_s=timeout_s,
+                        )
+                    except BaseException as release_error:
+                        recovery_errors.append(release_error)
+                    else:
+                        self._generation_checkpoint_id = None
                 self._gym_checkpoint_rollout_permitted.set()
+            if len(recovery_errors) > 1:
+                raise BaseExceptionGroup(
+                    "Gym checkpoint failed and checkpoint admission cleanup also "
+                    "failed",
+                    recovery_errors,
+                )
             raise
 
     async def _release_prepared_gym_checkpoint(
@@ -2035,9 +2100,16 @@ class SingleControllerActor:
             gym_actor.resume_checkpoint if committed else gym_actor.abort_checkpoint
         )
         await method.remote(checkpoint_id, time.time() + timeout_s)
+        if self._generation_checkpoint_id == checkpoint_id:
+            await asyncio.to_thread(
+                self._gen.finish_generation_checkpoint,
+                timeout_s=timeout_s,
+            )
+            self._generation_checkpoint_id = None
         # Reopen local admission only after Gym confirms that its own admission
-        # fence has been released. If the RPC fails, keeping this event cleared
-        # fails closed instead of dispatching requests into a possibly paused Gym.
+        # fence and the generation engines have been released. If either call
+        # fails, keeping this event cleared fails closed instead of dispatching
+        # requests into a partially paused serving fleet.
         self._gym_checkpoint_rollout_permitted.set()
 
     async def _abort_prepared_gym_checkpoint(self, checkpoint_id: str) -> None:
@@ -4362,6 +4434,7 @@ class SingleControllerActor:
                 cut,
                 replay_metadata=replay_metadata,
                 clear_unreferenced=False,
+                clear_unreferenced_generation_cuts=True,
                 gym_staging_keys=gym_staging_keys,
             )
         tq_save_started = time.monotonic()
@@ -4483,7 +4556,11 @@ class SingleControllerActor:
                     except BaseException as abort_error:
                         cleanup_errors = [
                             error
-                            for error in (save_error, tmp_cleanup_error, abort_error)
+                            for error in (
+                                save_error,
+                                tmp_cleanup_error,
+                                abort_error,
+                            )
                             if error is not None
                         ]
                         if len(cleanup_errors) == 1:
@@ -4507,12 +4584,18 @@ class SingleControllerActor:
         *,
         force: bool = False,
     ) -> _RolloutCheckpointSaveResult:
-        """Serialize and publish one periodic rollout snapshot."""
-        async with self._checkpoint_save_lock:
-            return await self._save_rollout_checkpoint_locked(
-                force=force,
-                trainer_anchor=None,
-            )
+        """Serialize a periodic snapshot with any generation pause lifecycle."""
+        generation_guard = (
+            self._generation_control_lock
+            if self._generation_prefix_cuts_enabled
+            else contextlib.nullcontext()
+        )
+        async with generation_guard:
+            async with self._checkpoint_save_lock:
+                return await self._save_rollout_checkpoint_locked(
+                    force=force,
+                    trainer_anchor=None,
+                )
 
     async def _save_rollout_checkpoint_locked(
         self,
@@ -4640,6 +4723,7 @@ class SingleControllerActor:
             checkpoint_id=checkpoint_id,
             tmp_path=tmp_path,
         )
+        gym_prepare: Optional[GymCheckpointPrepareResult] = None
         gym_checkpoint: Optional[GymCheckpointCommitResult] = None
         gym_staging_keys: set[str] = set()
         trainer_state_changed = False
@@ -4647,11 +4731,12 @@ class SingleControllerActor:
         snapshot_cut: Optional[_RolloutCheckpointCut] = None
         async with self._rollout_snapshot_publication(publication):
             if self._gym_participant_checkpointing_enabled:
-                publication.gym_checkpoint = (
-                    await self._prepare_and_commit_gym_checkpoint(
-                        checkpoint_id,
-                        tmp_path,
-                    )
+                (
+                    gym_prepare,
+                    publication.gym_checkpoint,
+                ) = await self._prepare_and_commit_gym_checkpoint(
+                    checkpoint_id,
+                    tmp_path,
                 )
             gym_checkpoint = publication.gym_checkpoint
             if gym_checkpoint is not None:
@@ -5098,12 +5183,18 @@ class SingleControllerActor:
         is_final_checkpoint: bool,
     ) -> None:
         """Serialize full and rollout-only checkpoint publication."""
-        async with self._checkpoint_save_lock:
-            await self._save_checkpoint_impl(
-                step_metrics,
-                is_policy_training_step=is_policy_training_step,
-                is_final_checkpoint=is_final_checkpoint,
-            )
+        generation_guard = (
+            self._generation_control_lock
+            if self._generation_prefix_cuts_enabled
+            else contextlib.nullcontext()
+        )
+        async with generation_guard:
+            async with self._checkpoint_save_lock:
+                await self._save_checkpoint_impl(
+                    step_metrics,
+                    is_policy_training_step=is_policy_training_step,
+                    is_final_checkpoint=is_final_checkpoint,
+                )
 
     async def _save_checkpoint_impl(
         self,
@@ -5443,6 +5534,15 @@ class SingleControllerActor:
             ) from None
 
     async def _sync_weights(
+        self,
+        *,
+        calibration_data: Optional[BatchedDataDict[Any]] = None,
+    ) -> int:
+        """Serialize refit with a generation-prefix checkpoint pause."""
+        async with self._generation_control_lock:
+            return await self._sync_weights_unlocked(calibration_data=calibration_data)
+
+    async def _sync_weights_unlocked(
         self,
         *,
         calibration_data: Optional[BatchedDataDict[Any]] = None,
