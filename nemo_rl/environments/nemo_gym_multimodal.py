@@ -280,6 +280,97 @@ def _index_per_turn_images(
     return per_turn
 
 
+def _explicit_prompt_multimodal_payload(
+    output_item: dict[str, Any],
+) -> tuple[list[Image.Image], dict[str, Any], list[int] | None] | None:
+    """Decode media captured for one trainable Gym policy call.
+
+    Agentic environments can add media between model calls. Inferring that
+    media from the final Responses history is lossy because the history does
+    not retain the processor grouping used for each request. Newer Gym agents
+    therefore attach the newly introduced content and the corresponding
+    processor kwargs directly to each trainable output item.
+
+    Returns ``None`` when the item uses the legacy inferred-history contract.
+    An explicitly empty content list returns an empty payload and deliberately
+    suppresses that fallback.
+    """
+    if "prompt_multimodal_content" not in output_item:
+        return None
+
+    content = output_item["prompt_multimodal_content"]
+    if not isinstance(content, list):
+        raise TypeError("prompt_multimodal_content must be a list.")
+    if any(not isinstance(part, dict) for part in content):
+        raise TypeError("Every prompt_multimodal_content item must be a dict.")
+
+    raw_kwargs = output_item.get("prompt_mm_processor_kwargs") or {}
+    if not isinstance(raw_kwargs, dict):
+        raise TypeError("prompt_mm_processor_kwargs must be a dict.")
+    processor_kwargs = copy.deepcopy(raw_kwargs)
+    uses_video_as_images = processor_kwargs.pop("video_as_images", False)
+    raw_frame_counts = processor_kwargs.pop("video_as_images_frame_counts", None)
+    raw_group_types = processor_kwargs.pop("video_as_images_group_types", None)
+
+    images = _extract_input_images_from_message({"content": content})
+    if content and not images:
+        raise ValueError(
+            "prompt_multimodal_content did not contain a resolvable image. "
+            "Dynamic native-video and audio payloads are not supported."
+        )
+    if not images:
+        return [], processor_kwargs, None
+
+    frame_counts: list[int] | None = None
+    group_types: list[str] | None = None
+    if raw_frame_counts is not None:
+        if not isinstance(raw_frame_counts, list) or any(
+            isinstance(count, bool) or not isinstance(count, int)
+            for count in raw_frame_counts
+        ):
+            raise TypeError("video_as_images_frame_counts must be a list of ints.")
+        frame_counts = list(raw_frame_counts)
+    if raw_group_types is not None:
+        if not isinstance(raw_group_types, list) or any(
+            group_type not in {"video", "image"} for group_type in raw_group_types
+        ):
+            raise ValueError(
+                "video_as_images_group_types must contain only 'video' or 'image'."
+            )
+        group_types = list(raw_group_types)
+
+    if group_types is not None and frame_counts is None:
+        raise ValueError(
+            "video_as_images_group_types requires video_as_images_frame_counts."
+        )
+    if frame_counts is not None:
+        if group_types is not None and len(group_types) != len(frame_counts):
+            raise ValueError(
+                "video-as-images group types and frame counts must have equal length."
+            )
+        if any(count <= 0 for count in frame_counts):
+            raise ValueError("Video-as-images frame counts must all be positive.")
+        if sum(frame_counts) != len(images):
+            raise ValueError(
+                "Video-as-images frame counts must cover the captured images: "
+                f"sum(frame_counts)={sum(frame_counts)}, images={len(images)}."
+            )
+
+    if uses_video_as_images:
+        if frame_counts is None:
+            frame_counts = [len(images)]
+            group_types = ["video"]
+        elif group_types is None:
+            group_types = ["video" if count > 1 else "image" for count in frame_counts]
+        processor_kwargs["video_flags"] = [
+            group_type == "video"
+            for group_type, count in zip(group_types, frame_counts)
+            for _ in range(count)
+        ]
+
+    return images, processor_kwargs, frame_counts
+
+
 def _without_initial_media_sources(
     messages: Any, initial_sources: list[Any]
 ) -> tuple[Any, bool]:

@@ -18,7 +18,7 @@ import logging
 import re
 import uuid
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from copy import copy, deepcopy
 from io import BytesIO
 from pathlib import Path
@@ -1641,8 +1641,16 @@ def attach_image_model_inputs_to_message(
     images: list[Image.Image],
     processor: Any,
     pad_dynamic_image_shapes: bool = False,
+    processor_kwargs: Mapping[str, Any] | None = None,
+    image_group_frame_counts: Sequence[int] | None = None,
 ) -> None:
-    """Attach processor-owned image tensors without replacing rollout tokens."""
+    """Attach processor-owned image tensors without replacing rollout tokens.
+
+    ``processor_kwargs`` and ``image_group_frame_counts`` let an environment
+    replay the exact image grouping used by its generation request. The token
+    IDs authored by the generation backend remain authoritative; only model
+    inputs owned by the multimodal processor are copied onto ``message``.
+    """
     if not images or processor is None:
         return
 
@@ -1656,11 +1664,25 @@ def attach_image_model_inputs_to_message(
         text=image_token * len(images),
         images=images,
         return_tensors=None if allow_ragged_output else "pt",
+        **dict(processor_kwargs or {}),
     )
     processed = dict(processed)
     if allow_ragged_output:
         processed = _materialize_ragged_pixel_values(processed, processor)
     model_inputs = extract_multimodal_model_inputs(processor, processed)
+    if image_group_frame_counts is not None:
+        frame_counts = [int(count) for count in image_group_frame_counts]
+        if any(count <= 0 for count in frame_counts):
+            raise ValueError("Image group frame counts must all be positive.")
+        if sum(frame_counts) != len(images):
+            raise ValueError(
+                "Image group frame counts must cover every image exactly once: "
+                f"sum(frame_counts)={sum(frame_counts)}, images={len(images)}."
+            )
+        model_inputs["num_frames"] = PackedTensor(
+            torch.tensor(frame_counts, dtype=torch.int32),
+            dim_to_pack=0,
+        )
     message.update(
         {
             key: value
