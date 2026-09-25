@@ -18,6 +18,7 @@ import inspect
 import logging
 import os
 import sys
+from collections.abc import Mapping
 from typing import Any, Optional, cast
 
 import ray
@@ -46,7 +47,9 @@ from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
     VllmConfig,
     parse_nvfp4_pertoken_rollout,
+    resolve_reasoning_parser,
     resolve_vllm_video_config,
+    thinking_token_budget_sampling_kwargs,
     validate_nvfp4_pertoken_model,
     vllm_nemotron_h_fp32_lm_head_enabled,
 )
@@ -489,6 +492,11 @@ class BaseVllmGenerationWorker:
         self.fraction_of_gpus = fraction_of_gpus
         self.is_model_owner = bundle_indices is not None
         self._extra_env_vars = extra_env_vars
+        # Resolved (and validated) once here rather than per request. Empty
+        # unless policy.generation.vllm_cfg.thinking_token_budget is set.
+        self._extra_sampling_kwargs: dict[str, Any] = (
+            thinking_token_budget_sampling_kwargs(self.cfg)
+        )
 
         # Store the Python executable being used by this worker
         self.py_executable = sys.executable
@@ -517,6 +525,31 @@ class BaseVllmGenerationWorker:
         # vLLM handles the parallelism internally through Ray
         self.rank = 0
         self.world_size = 1
+
+    @staticmethod
+    def _apply_reasoning_engine_kwargs(
+        config: Mapping[str, Any], llm_kwargs: dict[str, Any]
+    ) -> None:
+        """Forward the reasoning-parser engine arguments, if configured.
+
+        vLLM builds its ``ReasoningConfig`` from ``EngineArgs.reasoning_parser``,
+        and ``SamplingParams.thinking_token_budget`` is only honored on an
+        engine that has one. ``vllm_kwargs.reasoning_parser`` already reaches
+        the engine by being splatted into ``EngineArgs``, so the resolver
+        accepts either location and rejects a disagreement; writing the
+        resolved value back is a no-op in that case. The plugin is forwarded
+        alongside the parser, and only then, so configs that set the plugin
+        for the HTTP serving layer alone keep their current engine behavior.
+        """
+        reasoning_parser = resolve_reasoning_parser(config)
+        if reasoning_parser is None:
+            return
+        llm_kwargs["reasoning_parser"] = reasoning_parser
+        reasoning_parser_plugin = (config.get("vllm_cfg") or {}).get(
+            "reasoning_parser_plugin"
+        )
+        if reasoning_parser_plugin is not None:
+            llm_kwargs["reasoning_parser_plugin"] = reasoning_parser_plugin
 
     def _refit_with_reload_api_enabled(self) -> bool:
         return bool(self.cfg["vllm_cfg"].get("refit_with_reload_api"))
@@ -763,6 +796,8 @@ class BaseVllmGenerationWorker:
         if logprobs_mode is not None:
             llm_kwargs["logprobs_mode"] = logprobs_mode
 
+        self._apply_reasoning_engine_kwargs(self.cfg, llm_kwargs)
+
         video_config = resolve_vllm_video_config(self.cfg)
         if video_config is not None:
             register_torchcodec_vllm_video_loader(
@@ -831,6 +866,7 @@ class BaseVllmGenerationWorker:
             include_stop_str_in_output=True,
             bad_words=self.cfg.get("bad_words"),
             ignore_eos=self.cfg.get("ignore_eos", False),
+            **self._extra_sampling_kwargs,
         )
 
     def start_gpu_profiling(self) -> None:
@@ -1317,6 +1353,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             stop_token_ids=self.cfg["stop_token_ids"],
             stop=stop_strings,
             include_stop_str_in_output=True,  # returning stop strings like hf
+            **self._extra_sampling_kwargs,
         )
 
         # Generate outputs

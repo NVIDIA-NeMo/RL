@@ -451,6 +451,14 @@ policy:
       precision: ${policy.precision}
       kv_cache_dtype: "auto"
       logprobs_mode: processed_logprobs
+      # Name of the vLLM reasoning parser the engine is built with (e.g. "deepseek_r1").
+      # Forwarded to vLLM's EngineArgs.reasoning_parser. null leaves reasoning parsing off.
+      # Required by thinking_token_budget; also makes guided decoding reasoning-aware.
+      reasoning_parser: null
+      # Per-request cap on reasoning tokens, forwarded to vLLM's SamplingParams field of
+      # the same name. A non-negative token count, or -1 for unlimited. null leaves it unset.
+      # Needs reasoning_parser, a tokenizer, and VLLM_USE_V2_MODEL_RUNNER=0.
+      thinking_token_budget: null
       fp32_lm_head: ${policy.megatron_cfg.fp32_lm_head}
       # false: use NeMo-RL's legacy refit loader; true: opt into vLLM reload_weights.
       refit_with_reload_api: false
