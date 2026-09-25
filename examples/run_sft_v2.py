@@ -38,6 +38,7 @@ from nemo_rl.utils.config import (
     register_omegaconf_resolvers,
 )
 from nemo_rl.utils.logger import get_next_experiment_dir
+from nemo_rl.utils.outdated_config_checks import check_outdated_config
 
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
@@ -65,6 +66,7 @@ def main() -> None:
     if overrides:
         config = parse_hydra_overrides(config, overrides)
     resolved = OmegaConf.to_container(config, resolve=True)
+    check_outdated_config(resolved)
     master_config = MasterConfig.model_validate(resolved)
     master_config.logger["log_dir"] = get_next_experiment_dir(
         master_config.logger["log_dir"]

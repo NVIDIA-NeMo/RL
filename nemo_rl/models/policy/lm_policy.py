@@ -51,7 +51,6 @@ from nemo_rl.models.policy.interfaces import (
 )
 from nemo_rl.models.policy.utils import (
     aggregate_per_sample_handles,
-    reject_legacy_dtensor_key,
     resolve_policy_worker_cls,
     validate_fp32_lm_head_config,
 )
@@ -263,7 +262,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     "or set policy.dtensor_cfg.enabled=true to use DTensor training backend."
                 )
 
-            reject_legacy_dtensor_key(config["dtensor_cfg"], "policy.dtensor_cfg")
             worker_builder_cls_fqn = resolve_policy_worker_cls(
                 "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2",
                 config,

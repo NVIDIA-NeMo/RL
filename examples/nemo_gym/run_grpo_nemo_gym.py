@@ -56,6 +56,7 @@ from nemo_rl.utils.config import (
     register_omegaconf_resolvers,
 )
 from nemo_rl.utils.logger import get_next_experiment_dir, log_container_init_timing
+from nemo_rl.utils.outdated_config_checks import check_outdated_config
 from nemo_rl.utils.timer import Timer
 
 
@@ -147,6 +148,7 @@ def main() -> None:
             config = parse_hydra_overrides(config, overrides)
 
         config = OmegaConf.to_container(config, resolve=True)
+        check_outdated_config(config)
         config = MasterConfig(**config)
         materialize_vllm_video_config(config.policy, config.data)
         print("Applied CLI overrides")

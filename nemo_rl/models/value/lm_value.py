@@ -30,7 +30,6 @@ from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
-from nemo_rl.models.policy.utils import reject_legacy_dtensor_key
 from nemo_rl.models.value.config import ValueConfig
 from nemo_rl.models.value.interfaces import ValueInterface, ValueOutputSpec
 from nemo_rl.utils.timer import Timer
@@ -100,7 +99,6 @@ class Value(ValueInterface):
                     "training backend (or value.megatron_cfg.enabled=true for "
                     "Megatron-Core)."
                 )
-            reject_legacy_dtensor_key(config["dtensor_cfg"], "value.dtensor_cfg")
 
             worker_builder_cls = "nemo_rl.models.value.workers.dtensor_value_worker_v2.DTensorValueWorkerV2"
 
