@@ -35,6 +35,7 @@ from nemo_rl.utils.config import (
     register_omegaconf_resolvers,
 )
 from nemo_rl.utils.logger import get_next_experiment_dir
+from nemo_rl.utils.outdated_config_checks import check_outdated_config
 
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
@@ -66,6 +67,7 @@ def main() -> None:
     config = OmegaConf.to_container(config, resolve=True)
     config = MasterConfig(**config)
 
+    check_outdated_config(config)
     # Per-teacher same-vocab vs cross-tokenizer is determined solely by
     # `teachers[i].projection_matrix_path` (null => same-vocab direct KL; set =>
     # cross-tokenizer). The consistency check (a same-vocab teacher must

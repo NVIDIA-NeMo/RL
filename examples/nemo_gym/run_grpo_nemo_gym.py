@@ -57,6 +57,7 @@ from nemo_rl.utils.config import (
 )
 from nemo_rl.utils.logger import get_next_experiment_dir, log_container_init_timing
 from nemo_rl.utils.timer import Timer
+from nemo_rl.utils.outdated_config_checks import check_outdated_config
 
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
@@ -148,6 +149,7 @@ def main() -> None:
 
         config = OmegaConf.to_container(config, resolve=True)
         config = MasterConfig(**config)
+        check_outdated_config(config)
         materialize_vllm_video_config(config.policy, config.data)
         print("Applied CLI overrides")
 

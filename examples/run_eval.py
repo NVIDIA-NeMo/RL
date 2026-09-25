@@ -30,6 +30,7 @@ from nemo_rl.environments.utils import create_env
 from nemo_rl.evals.eval import MasterConfig, run_env_eval, setup
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config
+from nemo_rl.utils.outdated_config_checks import check_outdated_config
 
 
 def parse_args():
@@ -103,6 +104,7 @@ def main():
 
     config = OmegaConf.to_container(config, resolve=True)
     config = MasterConfig(**config)
+    check_outdated_config(config)
     print("Applied CLI overrides")
 
     # Print config
