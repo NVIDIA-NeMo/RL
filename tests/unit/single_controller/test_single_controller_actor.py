@@ -91,8 +91,12 @@ class _InitRolloutManager:
 
     def __init__(self, tq_buffer: _InitBuffer) -> None:
         self._tq_buffer = tq_buffer
+        self.next_nemo_gym_task_index = 0
         self.recovery_ledger = RolloutRecoveryLedger()
         self.checkpoint_barrier: DataPlaneCheckpointBarrier | None = None
+
+    def set_next_nemo_gym_task_index(self, value: int) -> None:
+        self.next_nemo_gym_task_index = value
 
     def set_data_plane_checkpoint_barrier(
         self, barrier: DataPlaneCheckpointBarrier

@@ -1384,6 +1384,10 @@ def setup_single_controller(
         save_state.sampler_dispatch_index = (
             resolved_snapshot.manifest.sampler_dispatch_index
         )
+        if resolved_snapshot.manifest.next_nemo_gym_task_index is not None:
+            save_state.next_nemo_gym_task_index = (
+                resolved_snapshot.manifest.next_nemo_gym_task_index
+            )
         print(
             f"📦 Selected rollout recovery snapshot: {recovery_checkpoint_path}",
             flush=True,
