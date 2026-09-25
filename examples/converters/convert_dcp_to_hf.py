@@ -17,7 +17,7 @@ import os
 
 import yaml
 
-from nemo_rl.utils.native_checkpoint import convert_dcp_to_hf
+from nemo_rl.models.automodel.convert import convert_dcp_to_hf
 
 
 def parse_args():
