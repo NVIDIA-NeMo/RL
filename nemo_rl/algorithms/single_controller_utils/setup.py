@@ -96,11 +96,13 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
     prepare_segment_topology,
 )
+from nemo_rl.environments.gym_checkpoint import GymCheckpointTopology
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import (
     NemoGymShardSet,
     build_nemo_gym_actors,
     should_use_nemo_gym,
+    sole_nemo_gym_checkpoint_actor,
     validate_dataset_agent_coverage,
 )
 from nemo_rl.experience.rollout_manager import (
@@ -1083,6 +1085,15 @@ def setup_single_controller(
     data_plane_checkpointing_supported = data_plane_supports_checkpointing(dp_config)
     rollout_checkpoint_cfg = master_config.rollout_checkpointing
     if (
+        rollout_checkpoint_cfg.gym.capability_discovery_enabled
+        and not should_use_nemo_gym(master_config)
+    ):
+        raise ValueError(
+            "rollout_checkpointing.gym.capability_discovery_enabled=true "
+            "requires the NeMo-Gym rollout path "
+            "(env.should_use_nemo_gym=true)"
+        )
+    if (
         master_config.checkpointing.get("save_data_plane")
         or rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None
     ) and not data_plane_checkpointing_supported:
@@ -1783,6 +1794,11 @@ def setup_single_controller(
             ray.kill(megatron_port_holder)
 
     setup_timing_metrics.generation_init_time_s = gen_reserve_time + gen_load_time
+
+    if rollout_checkpoint_cfg.gym.capability_discovery_enabled:
+        gym_actor = sole_nemo_gym_checkpoint_actor(env_handles["nemo_gym"])
+        discovered = ray.get(gym_actor.discover_checkpoint_capabilities.remote())
+        GymCheckpointTopology.model_validate(discovered)
 
     setup_timing_metrics.policy_init_time_s = time_metrics["trainer_time"]
     if "value_time" in time_metrics:

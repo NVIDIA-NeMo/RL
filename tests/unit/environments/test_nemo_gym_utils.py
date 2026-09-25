@@ -33,13 +33,16 @@ from nemo_rl.environments import nemo_gym as nemo_gym_mod
 from nemo_rl.environments.nemo_gym import (
     NEMO_GYM_ACTOR_FQN,
     NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S,
+    NemoGymShardSet,
     _detect_invalid_tool_call_and_malformed_thinking,
     build_nemo_gym_actors,
     build_nemo_gym_config,
     get_nemo_gym_uv_cache_dir,
     get_nemo_gym_venv_dir,
+    sole_nemo_gym_checkpoint_actor,
     spinup_nemo_gym_actor,
 )
+from nemo_rl.environments.nemo_gym_shards import ShardSetupError
 
 
 @pytest.mark.parametrize(
@@ -454,6 +457,48 @@ def _spun_up_actor():
     return actor
 
 
+def test_control_client_uses_the_resolved_actor_config():
+    resolved = DictConfig(
+        {
+            "default_host": "10.0.0.1",
+            "code_gen": {
+                "resources_servers": {
+                    "code_gen": {
+                        "host": "10.0.0.1",
+                        "port": 12345,
+                    }
+                }
+            },
+        }
+    )
+    constructed_client = object()
+    expected_head_server_config = object()
+    server_client_factory = MagicMock(return_value=constructed_client)
+
+    package = types.ModuleType("nemo_gym")
+    package.__path__ = []
+    global_config_module = types.ModuleType("nemo_gym.global_config")
+    global_config_module.get_global_config_dict = lambda: resolved
+    server_utils_module = types.ModuleType("nemo_gym.server_utils")
+    server_utils_module.ServerClient = server_client_factory
+    actor = _spun_up_actor()
+    actor.head_server_config = expected_head_server_config
+    with patch.dict(
+        sys.modules,
+        {
+            "nemo_gym": package,
+            "nemo_gym.global_config": global_config_module,
+            "nemo_gym.server_utils": server_utils_module,
+        },
+    ):
+        assert actor._control_client() is constructed_client
+        assert actor._control_client() is constructed_client
+    server_client_factory.assert_called_once_with(
+        head_server_config=expected_head_server_config,
+        global_config_dict=resolved,
+    )
+
+
 def test_list_entries_reports_entry_names_and_server_types():
     resolved = DictConfig(
         {
@@ -718,6 +763,26 @@ def test_build_nemo_gym_actors_unsharded_makes_exactly_one_actor(detected_uv_dir
         cluster.actor_options[0]["scheduling_strategy"],
         nemo_gym_mod.NodeAffinitySchedulingStrategy,
     )
+
+
+def test_checkpoint_actor_unwraps_the_only_gym_actor():
+    actor = object()
+    shard_set = NemoGymShardSet(handles={"only": [actor]})
+
+    assert sole_nemo_gym_checkpoint_actor(shard_set) is actor
+    assert sole_nemo_gym_checkpoint_actor(actor) is actor
+
+
+def test_checkpoint_actor_rejects_sharded_or_replicated_gym():
+    shard_set = NemoGymShardSet(
+        handles={"first": [object()], "second": [object(), object()]}
+    )
+
+    with pytest.raises(
+        ShardSetupError,
+        match="participant checkpointing currently supports exactly one",
+    ):
+        sole_nemo_gym_checkpoint_actor(shard_set)
 
 
 def test_build_nemo_gym_actors_spreads_every_replica_onto_its_own_node(

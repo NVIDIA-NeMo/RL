@@ -857,6 +857,18 @@ class TestSetup:
         with pytest.raises(ValueError, match="requires checkpointing.enabled=true"):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
+    def test_gym_capability_discovery_requires_nemo_gym(self):
+        mc = _make_master_config(env={"should_use_nemo_gym": False})
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            gym={"capability_discovery_enabled": True}
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="capability_discovery_enabled=true requires the NeMo-Gym",
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
     def test_periodic_checkpointing_requires_data_plane_save(self):
         mc = _make_master_config(
             sampler_cfg=CustomSamplerConfig(

@@ -58,6 +58,7 @@ from nemo_rl.distributed.virtual_cluster import (
     ClusterConfig,
 )
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
+from nemo_rl.environments.nemo_gym_shards import parse_shard_plan
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 from nemo_rl.models.generation.vllm.config import (
     VllmConfig,
@@ -739,6 +740,12 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
         return TaskSourceRecoveryGranularity(task_source, self.default_granularity)
 
 
+class GymRolloutCheckpointConfig(BaseModel, extra="forbid"):
+    """Opt-in discovery of the experimental NeMo-Gym checkpoint protocol."""
+
+    capability_discovery_enabled: bool = False
+
+
 class RolloutCheckpointConfig(BaseModel, extra="forbid"):
     """Frequent rollout-state snapshots anchored to durable trainer state.
 
@@ -783,6 +790,7 @@ class RolloutCheckpointConfig(BaseModel, extra="forbid"):
     keep_latest_k: Annotated[int, Field(ge=1)] = 2
     restore_mode: Literal["latest", "trainer_checkpoint"] = "latest"
     extra_fingerprint_excluded_paths: list[str] = Field(default_factory=list)
+    gym: GymRolloutCheckpointConfig = Field(default_factory=GymRolloutCheckpointConfig)
 
     @model_validator(mode="after")
     def validate_extra_fingerprint_excluded_paths(self) -> "RolloutCheckpointConfig":
@@ -1268,6 +1276,22 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "Use the non-streaming GRPO trainer."
         )
     _validate_algo_settings(master_config)
+
+    if master_config.rollout_checkpointing.gym.capability_discovery_enabled:
+        nemo_gym_config = master_config.env.get("nemo_gym", {})
+        shard_plan = parse_shard_plan(nemo_gym_config)
+        gym_actor_count = (
+            1
+            if shard_plan is None
+            else sum(shard.replicas for shard in shard_plan.shards)
+        )
+        if gym_actor_count != 1:
+            raise NotImplementedError(
+                "Gym participant checkpointing currently supports exactly one "
+                f"NeMo-Gym actor, but env.nemo_gym.shards configures "
+                f"{gym_actor_count}. Configure one shard with replicas=1, or "
+                "disable rollout_checkpointing.gym.capability_discovery_enabled."
+            )
 
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)
