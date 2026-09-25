@@ -13,6 +13,8 @@
 # limitations under the License.
 
 from dataclasses import asdict
+import math
+import warnings
 from typing import Any, Callable, Optional
 
 import torch
@@ -233,6 +235,42 @@ def get_theoretical_tflops(device_name: str, model_dtype: torch.dtype) -> float:
         raise ValueError(
             f"Unknown device name: {device_name} and dtype name: {model_dtype}"
         )
+
+
+def resolve_flops_metrics(
+    results: list[dict[str, Any]], *, fallback_flops: float | None
+) -> dict[str, float]:
+    """Prefer Bridge totals from one worker per DP shard, then use the fallback.
+
+    local_flops=None explicitly means unsupported. A missing result on only
+    some shards is an error, not permission to report a partial estimate.
+    """
+    if any("local_flops" in result for result in results):
+        if not all("local_flops" in result for result in results):
+            raise ValueError("Missing Bridge FLOPs result on some training shards")
+        if all(result["local_flops"] is not None for result in results):
+            values = [float(result["local_flops"]) for result in results]
+            if any(not math.isfinite(value) or value < 0 for value in values):
+                raise ValueError("Invalid Bridge FLOPs result on a training shard")
+            return {"total_flops": sum(values), "flops_from_bridge": 1.0}
+        warnings.warn(
+            "Bridge FLOPs unsupported for this step; "
+            + (
+                "using NeMo-RL fallback."
+                if fallback_flops is not None
+                else "MFU omitted."
+            ),
+            stacklevel=2,
+        )
+    elif results and "total_flops" in results[0]:
+        # Older Megatron workers report a replicated global total.
+        return {
+            "total_flops": float(results[0]["total_flops"]),
+            "flops_from_bridge": 1.0,
+        }
+    if fallback_flops is not None:
+        return {"total_flops": fallback_flops, "flops_from_bridge": 0.0}
+    return {}
 
 
 class FLOPTracker:

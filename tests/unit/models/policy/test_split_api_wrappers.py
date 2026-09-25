@@ -32,6 +32,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import (
@@ -138,6 +139,58 @@ def _make_tq_policy() -> tuple[TQPolicy, MagicMock]:
 
 
 class TestTQPolicySplitFanout:
+    def test_bridge_flops_sum_dp_leaders_but_capacity_counts_every_gpu(self) -> None:
+        p, wg = _make_tq_policy()
+        p.flops_tracker = MagicMock(total_flops=999.0)
+        wg.cluster.world_size.return_value = 4
+        results = [
+            {
+                "global_loss": 1.0,
+                "grad_norm": 0.5,
+                "all_mb_metrics": {},
+                "local_flops": flops,
+                "is_replica_leader": leader,
+                "gpu_name": "NVIDIA H100 80GB HBM3",
+                "model_dtype": torch.bfloat16,
+            }
+            for flops, leader in [(11, True), (11, False), (17, True), (17, False)]
+        ]
+        with patch("nemo_rl.models.policy.tq_policy.ray.get", return_value=results):
+            out = p.finish_train_step()
+        assert out["total_flops"] == 28
+        assert out["flops_from_bridge"] == 1
+        assert out["theoretical_tflops"] == 4 * 989.5
+
+    @pytest.mark.parametrize("unknown_gpu", [False, True])
+    def test_finish_mfu_capacity_counts_all_ranks(self, unknown_gpu: bool) -> None:
+        p, wg = _make_tq_policy()
+        p.flops_tracker = MagicMock(total_flops=1e15)
+        wg.cluster.world_size.return_value = 4
+        results = [
+            {
+                "global_loss": 1.0,
+                "grad_norm": 0.5,
+                "all_mb_metrics": {"loss": [0.1]},
+                "is_replica_leader": rank % 2 == 0,
+                "gpu_name": "NVIDIA H100 80GB HBM3",
+                "model_dtype": torch.bfloat16,
+            }
+            for rank in range(4)
+        ]
+        if unknown_gpu:
+            results[-1]["gpu_name"] = "unknown"
+        with patch("nemo_rl.models.policy.tq_policy.ray.get", return_value=results):
+            if unknown_gpu:
+                with pytest.warns(UserWarning, match="Unknown device"):
+                    out = p.finish_train_step()
+                assert "theoretical_tflops" not in out
+            else:
+                out = p.finish_train_step()
+                assert out["theoretical_tflops"] == pytest.approx(4 * 989.5)
+        assert out["total_flops"] == 1e15
+        assert out["num_ranks"] == 4
+        assert out["all_mb_metrics"]["loss"] == [0.1, 0.1]
+
     def test_begin_consumes_single_data_futures_with_ray_get(self):
         """run_all_workers_single_data returns plain ObjectRefs, not a
         MultiWorkerFuture — the fan-out must ray.get them (PR #2683

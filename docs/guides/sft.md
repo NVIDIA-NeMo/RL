@@ -275,6 +275,12 @@ conversations. NLL loss scaling is unchanged because it is normalized by
 
 Training dataloader checkpoints include the Energon worker state plus a fingerprint of the source, loader, and processor settings. Restore must occur before the first iteration, and a changed fingerprint fails instead of silently continuing with a different stream. SFTv2 accepts a single train source; use an Energon metadataset to blend prepared sources.
 
+For text-only models, set `policy.tokenizer.use_processor=false`. The existing `hf_multimodal` adapter also accepts a plain Hugging Face tokenizer and text conversations. Media samples still require a multimodal processor; existing vision recipes keep using one by default.
+
+SFTv2 logs model FLOPs utilization (MFU) as `train_fp_utilization` after each optimizer step. It is a fraction (`0.5` means 50%): estimated model FLOPs divided by policy training seconds and the combined theoretical FLOPs/s of all training GPUs. The timer covers the split training calls, including dispatch and optimizer work, but excludes data loading, loader commit, and checkpointing.
+
+Megatron workers use Megatron-Bridge's formulas with real input lengths, including prompt tokens. For Qwen vision models, they add vision encoder and merger FLOPs from image/video grids, preserving image and frame boundaries. `flops_from_bridge=1` identifies this estimate. Explicitly unsupported cases, including partially frozen models, PEFT, and media without the required metadata, warn and use NeMo-RL's backend-agnostic tracker when available (`flops_from_bridge=0`). If neither calculator supports the model, or GPU peak capacity is unknown, MFU is omitted. Unexpected Bridge errors are not silently replaced by fallback estimates. Treat a calculator change as a change in measurement when comparing MFU across runs.
+
 ### OpenAI Format Datasets (with Tool Calling Support)
 
 NeMo RL also supports datasets in the OpenAI conversation format, which is commonly used for chat models and function calling. This format is particularly useful for training models with tool-use capabilities.

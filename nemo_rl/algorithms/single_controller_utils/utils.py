@@ -78,6 +78,10 @@ def aggregate_step_metrics(train_result: dict[str, Any]) -> dict[str, Any]:
         metrics["total_flops"] = float(train_result["total_flops"])
     if "num_ranks" in train_result:
         metrics["num_ranks"] = int(train_result["num_ranks"])
+    if "theoretical_tflops" in train_result:
+        metrics["theoretical_tflops"] = float(train_result["theoretical_tflops"])
+    if "flops_from_bridge" in train_result:
+        metrics["flops_from_bridge"] = float(train_result["flops_from_bridge"])
 
     # moe/mtp share the same reduction rules as all_mb_metrics in grpo.py.
     mb: dict[str, list[Any]] = {}

@@ -76,7 +76,10 @@ def main() -> None:
     init_telemetry_driver(master_config, algorithm="sft_v2")
 
     init_ray()
-    processor = get_tokenizer(master_config.policy["tokenizer"], get_processor=True)
+    processor = get_tokenizer(
+        master_config.policy["tokenizer"],
+        get_processor=master_config.policy["tokenizer"]["use_processor"],
+    )
     actor_args = setup_sft_v2(master_config, processor)
     controller = SFTSingleControllerActor.remote(master_config, actor_args)
     try:

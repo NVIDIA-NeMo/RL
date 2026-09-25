@@ -91,10 +91,13 @@ class TestAggregateStepMetrics:
         assert out["grad_norm"] == pytest.approx(2.0)
 
     def test_float_loss_and_optional_scalars(self) -> None:
-        out = aggregate_step_metrics({"loss": 0.5, "total_flops": 10, "num_ranks": 4})
+        out = aggregate_step_metrics(
+            {"loss": 0.5, "total_flops": 10, "num_ranks": 4, "theoretical_tflops": 500}
+        )
         assert out["loss"] == pytest.approx(0.5)
         assert out["total_flops"] == pytest.approx(10.0)
         assert out["num_ranks"] == 4
+        assert out["theoretical_tflops"] == 500.0
         assert "grad_norm" not in out
 
     def test_draft_grad_norm_tensor_is_preserved(self) -> None:

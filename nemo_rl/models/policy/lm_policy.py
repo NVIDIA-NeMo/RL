@@ -59,6 +59,7 @@ from nemo_rl.utils.flops_tracker import (
     FLOPTracker,
     get_hf_config,
     get_theoretical_tflops,
+    resolve_flops_metrics,
 )
 from nemo_rl.utils.multimodal_payload_metrics import (
     collect_sharded_multimodal_payload_metrics,
@@ -944,8 +945,15 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         if "draft_grad_norm" in results[0]:
             aggregated_results["draft_grad_norm"] = results[0]["draft_grad_norm"]
 
-        if self.flops_tracker is not None:
-            aggregated_results["total_flops"] = self.flops_tracker.total_flops
+        aggregated_results.update(
+            resolve_flops_metrics(
+                results,
+                fallback_flops=self.flops_tracker.total_flops
+                if self.flops_tracker is not None
+                else None,
+            )
+        )
+        if "total_flops" in aggregated_results:
             aggregated_results["num_ranks"] = self.worker_group.cluster.world_size()
             gpus_per_worker = self.worker_group.cluster.world_size() / len(results)
 
@@ -956,12 +964,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 )
             except Exception as e:
                 warnings.warn(f"Error getting theoretical flops: {e}")
-        elif results and "total_flops" in results[0]:
-            aggregated_results.update(
-                _aggregate_megatron_flops_metrics(
-                    results, self.worker_group.cluster.world_size()
-                )
-            )
+            if "train_elapsed_seconds" in results[0]:
+                aggregated_results["train_elapsed_seconds"] = results[0][
+                    "train_elapsed_seconds"
+                ]
 
         # Aggregate metrics across all workers
         all_mb_metrics = defaultdict(list)

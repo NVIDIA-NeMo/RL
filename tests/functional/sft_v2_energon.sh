@@ -62,4 +62,10 @@ uv run --no-sync python examples/run_sft_v2.py \
 uv run --no-sync tests/json_dump_tb_logs.py \
     "${LOG_DIR}" --output_path "${JSON_METRICS}"
 uv run --no-sync tests/check_metrics.py "${JSON_METRICS}" \
-    'all_finite(data["loss"])'
+    'all_finite(data["loss"])' \
+    'all_finite(data["train_fp_utilization"])' \
+    'min(data["train_fp_utilization"]) > 0' \
+    'len(data["train_fp_utilization"]) == len(data["loss"])' \
+    'len(data["flops_from_bridge"]) == len(data["loss"])' \
+    'min(data["flops_from_bridge"]) == 1' \
+    'max(data["flops_from_bridge"]) == 1'

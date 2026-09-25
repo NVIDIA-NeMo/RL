@@ -242,6 +242,66 @@ def _encoder(adapter, *, include_source_ids=False):
     )
 
 
+def _text_tokenizer():
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import WhitespaceSplit
+    from transformers import PreTrainedTokenizerFast
+
+    backend = Tokenizer(
+        WordLevel(
+            {"[UNK]": 0, "[PAD]": 1, "user": 2, "assistant": 3, "hello": 4, "world": 5},
+            unk_token="[UNK]",
+        )
+    )
+    backend.pre_tokenizer = WhitespaceSplit()
+    return PreTrainedTokenizerFast(
+        tokenizer_object=backend,
+        unk_token="[UNK]",
+        pad_token="[PAD]",
+        chat_template="{% for m in messages %}{{ m.role + ' ' + m.content + ' ' }}{% endfor %}",
+    )
+
+
+@pytest.mark.parametrize("structured_content", [False, True])
+def test_text_tokenizer_encodes_conversation(structured_content):
+    content = [{"type": "text", "text": "hello"}] if structured_content else "hello"
+    sample = CanonicalSFTSample(
+        __key__="text",
+        __restore_key__=(),
+        __subflavors__={},
+        messages=[
+            {"role": "user", "content": content},
+            {"role": "assistant", "content": "world"},
+        ],
+        media=[],
+        tools=None,
+    )
+    encoded = _adapter(_text_tokenizer()).encode(sample)
+    assert encoded.length == 4
+    assert encoded.loss_multiplier == 1.0
+    assert [m["token_ids"].tolist() for m in encoded.message_log] == [[2, 4], [3, 5]]
+    assert [m["role"] for m in encoded.message_log] == ["user", "assistant"]
+
+
+def test_text_tokenizer_rejects_media_instead_of_dropping_it():
+    with pytest.raises(ValueError, match="processor"):
+        _adapter(_text_tokenizer()).encode(_sample())
+
+
+def test_text_tokenizer_rejects_inline_media_without_references():
+    sample = CanonicalSFTSample(
+        __key__="inline-media",
+        __restore_key__=(),
+        __subflavors__={},
+        messages=[{"role": "user", "content": [{"type": "image", "image": "x"}]}],
+        media=[],
+        tools=None,
+    )
+    with pytest.raises(ValueError, match="processor"):
+        _adapter(_text_tokenizer()).encode(sample)
+
+
 def test_qwen_adapter_returns_tokenized_message_log_with_model_inputs():
     processor = _FakeQwenProcessor()
     encoded = _adapter(processor).encode(_sample(with_tools=True))

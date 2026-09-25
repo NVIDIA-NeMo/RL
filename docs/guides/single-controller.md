@@ -105,6 +105,14 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
 
 6. **(PPO) Set `ppo:` instead of `grpo:`** — the two algorithm blocks are mutually exclusive, and SC reads every step setting from whichever one is present. A PPO run also needs `value:`, `value_loss_fn:` and `ppo.adv_estimator.name: gae` (same schemas as legacy PPO), a Megatron critic, and `policy.offload_optimizer_for_logprob: true`, which is what keeps the policy optimizer off the GPU while the critic runs. `ppo.policy_training_start_step: N` gives the usual critic warmup: for the first N steps the policy is neither trained nor refit, while the critic trains every step. `ppo.warm_start_value_checkpoint` seeds that critic from another run's checkpoint instead, so a fresh run can skip the online warmup entirely — see [Warm-Starting the Critic](./ppo.md#warm-starting-the-critic).
 
+## Model FLOPs Utilization
+
+Single-controller training logs MFU as `train/train_fp_utilization`, a fraction (`0.5` means 50%). It divides estimated model FLOPs by the sum of `policy_training` durations and the combined theoretical FLOPs/s of the policy GPUs. All training GPUs count toward capacity, including tensor, context, and pipeline parallel replicas; generation-only GPUs do not.
+
+The timer includes training dispatch and optimizer work, but excludes rollout waits, log-prob inference, critic training, and weight refits. PPO sums policy FLOPs across all actor epochs to match that timer. Critic-only warmup steps do not emit policy MFU. Megatron prefers Bridge's worker-side estimate (`train/flops_from_bridge=1`), with an explicit warning and backend-agnostic fallback for unsupported cases (`0`). Models unsupported by both calculators or unknown GPU/dtype combinations omit MFU instead of reporting zero.
+
+SFTv2 uses the same calculation and logs `train_fp_utilization`; see the [SFT guide](./sft.md).
+
 ## Checkpointing and Replay Recovery
 
 With `checkpointing.save_data_plane: true`, each Single-Controller checkpoint contains:

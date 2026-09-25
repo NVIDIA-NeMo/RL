@@ -26,7 +26,44 @@ from nemo_rl.utils.flops_tracker import (
     get_hf_config,
     get_theoretical_tflops,
     is_using_tf32,
+    resolve_flops_metrics,
 )
+
+
+def test_bridge_flops_take_priority_over_fallback():
+    assert resolve_flops_metrics(
+        [{"local_flops": 11.0}, {"local_flops": 17.0}], fallback_flops=999.0
+    ) == {"total_flops": 28.0, "flops_from_bridge": 1.0}
+
+
+@pytest.mark.parametrize("fallback", [None, 123.0])
+def test_unsupported_bridge_uses_only_complete_fallback(fallback):
+    with pytest.warns(UserWarning, match="unsupported"):
+        metrics = resolve_flops_metrics(
+            [{"local_flops": 11.0}, {"local_flops": None}], fallback_flops=fallback
+        )
+    assert metrics == (
+        {} if fallback is None else {"total_flops": fallback, "flops_from_bridge": 0.0}
+    )
+
+
+@pytest.mark.parametrize("value", [-1, float("nan"), float("inf")])
+def test_invalid_bridge_result_does_not_fall_back(value):
+    with pytest.raises(ValueError, match="Invalid Bridge"):
+        resolve_flops_metrics([{"local_flops": value}], fallback_flops=123.0)
+
+
+def test_missing_shard_does_not_report_partial_bridge_flops():
+    with pytest.raises(ValueError, match="Missing Bridge"):
+        resolve_flops_metrics([{"local_flops": 1.0}, {}], fallback_flops=123.0)
+
+
+def test_backend_agnostic_flops_remain_available():
+    assert resolve_flops_metrics([{}], fallback_flops=123.0) == {
+        "total_flops": 123.0,
+        "flops_from_bridge": 0.0,
+    }
+    assert resolve_flops_metrics([{}], fallback_flops=None) == {}
 
 
 class GlmMoeDsaConfigForTest(PretrainedConfig):

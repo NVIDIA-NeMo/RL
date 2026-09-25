@@ -100,6 +100,7 @@ from nemo_rl.algorithms.grpo import (
 from nemo_rl.algorithms.metric_utils import (
     SETUP_TIMING_PREFIX,
     SetupTimingMetrics,
+    compute_mfu_metrics,
 )
 from nemo_rl.algorithms.ppo import _compute_critic_metrics
 from nemo_rl.algorithms.single_controller_utils.config import (
@@ -2697,6 +2698,7 @@ class SingleControllerActor:
             # One chunk per step on the PPO path, so these are the step's own
             # model updates -- the last epoch's, when there is more than one.
             policy_result: Optional[dict[str, Any]] = None
+            policy_epoch_flops = 0.0
             value_result: Optional[dict[str, Any]] = None
             # Always True off the PPO path: the start step is pinned to 0 there.
             is_policy_training_step = self._train_steps >= policy_training_start_step
@@ -2988,8 +2990,8 @@ class SingleControllerActor:
                     # For PPO, each actor epoch and critic epoch is a full optimizer
                     # step. Group each model's epochs under one residency cycle so
                     # the colocated models do not move between CPU and GPU per epoch.
-                    # TODO(#2625): value_result, policy_result only record the last epoch's metrics.
-                    # That matches ppo.py for the losses; total_flops is additive and undercounted.
+                    # Losses use the last epoch, matching ppo.py. FLOPs are
+                    # summed across policy epochs to match the training timer.
                     if self._is_ppo:
                         # A critic optimizer update is already irreversible. Keep
                         # periodic snapshots out until this whole training step is
@@ -3060,6 +3062,9 @@ class SingleControllerActor:
                                     if self._is_ppo:
                                         policy_result = await asyncio.to_thread(
                                             self._trainer.finish_train_step
+                                        )
+                                        policy_epoch_flops += policy_result.get(
+                                            "total_flops", 0.0
                                         )
                                         step_open = False
 
@@ -3168,6 +3173,8 @@ class SingleControllerActor:
                 step_metrics = {}
                 if policy_result is not None:
                     step_metrics.update(aggregate_step_metrics(policy_result))
+                    if self._is_ppo and "total_flops" in policy_result:
+                        step_metrics["total_flops"] = policy_epoch_flops
                 if value_result is not None:
                     step_metrics.update(_compute_critic_metrics(value_result))
                 async with self._data_plane_checkpoint_barrier.mutation(
@@ -3375,6 +3382,12 @@ class SingleControllerActor:
             )  # type: ignore
 
             total_time = timing_metrics.get("total_step_time", 0.0)
+            step_metrics.update(
+                compute_mfu_metrics(
+                    step_metrics,
+                    training_seconds=timing_metrics.get("policy_training", 0.0),
+                )
+            )
             total_num_gpus = int(ray.cluster_resources().get("GPU", 0))
             if (
                 total_time > 0
