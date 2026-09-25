@@ -30,9 +30,9 @@ AUDIT_EVENTS=$TEST_DIR/resource-audit.jsonl
 PHASE1_PID=""
 
 GYM_ROOT=${NEMO_GYM_SOURCE_DIR:-$PROJECT_ROOT/3rdparty/Gym-workspace/Gym}
-DEFAULT_SNAPSHOT_INTERVAL_S=1
-DEFAULT_MIN_GENERATION_TOKENS=384
-DEFAULT_MAX_TOTAL_SEQUENCE_LENGTH=1024
+DEFAULT_SNAPSHOT_INTERVAL_S=0.05
+DEFAULT_MIN_GENERATION_TOKENS=4096
+DEFAULT_MAX_TOTAL_SEQUENCE_LENGTH=8192
 if [[ "$PROFILE" == "workplace" ]]; then
     # The combined profile must first complete a tool turn. Give its second
     # call a longer decode window so a periodic cut reliably catches it.
