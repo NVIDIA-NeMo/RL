@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import asdict
 import math
 import warnings
+from dataclasses import asdict
 from typing import Any, Callable, Optional
 
 import torch
@@ -262,12 +262,6 @@ def resolve_flops_metrics(
             ),
             stacklevel=2,
         )
-    elif results and "total_flops" in results[0]:
-        # Older Megatron workers report a replicated global total.
-        return {
-            "total_flops": float(results[0]["total_flops"]),
-            "flops_from_bridge": 1.0,
-        }
     if fallback_flops is not None:
         return {"total_flops": fallback_flops, "flops_from_bridge": 0.0}
     return {}

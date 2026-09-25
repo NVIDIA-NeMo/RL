@@ -73,6 +73,30 @@ pytestmark = pytest.mark.mcore
 WORKER_MOD = "nemo_rl.models.policy.workers.megatron_policy_worker"
 
 
+def test_batch_flops_uses_runtime_freeze_config():
+    from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = _make_worker(None)
+    worker.mcore_state.cfg = SimpleNamespace(
+        peft=None,
+        model=SimpleNamespace(freeze_language_model=False),
+    )
+    worker.cfg["megatron_cfg"]["freeze_config"] = {
+        "freeze_language_model": True,
+        "freeze_vision_model": False,
+        "freeze_vision_projection": False,
+    }
+    data = BatchedDataDict({"input_lengths": torch.tensor([7, 11])})
+
+    # The runtime freeze hook does not change the provider's flag. Counting a
+    # full backward pass here would overstate MFU instead of selecting fallback.
+    with pytest.warns(UserWarning, match="frozen language model"):
+        assert MegatronPolicyWorkerImpl._batch_flops(worker, data) is None
+
+
 # ── Mock fabric ──────────────────────────────────────────────────────────
 
 

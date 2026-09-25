@@ -12,6 +12,7 @@
 """Bridge FLOPs estimates for a worker's unsharded, local data batch."""
 
 import math
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -23,8 +24,48 @@ if TYPE_CHECKING:
     from megatron.bridge.training.config import ConfigContainer
 
 
+def _sequence_lengths(data: BatchedDataDict[Any]) -> torch.Tensor:
+    """Read conversation lengths, excluding padding inside Energon packs."""
+    lengths = data["input_lengths"].to(dtype=torch.int64)
+    if lengths.ndim != 1 or len(lengths) != data.size or bool((lengths <= 0).any()):
+        raise ValueError(
+            "FLOPs input_lengths must contain one positive length per sample"
+        )
+    if "cu_seqlens" not in data:
+        return lengths
+
+    boundaries = data["cu_seqlens"]
+    if not isinstance(boundaries, PackedTensor) or len(boundaries.tensors) != data.size:
+        raise ValueError("FLOPs cu_seqlens must contain one boundary tensor per pack")
+    source_lengths = []
+    for row, pack_length in zip(boundaries.tensors, lengths):
+        if (
+            row is None
+            or row.ndim != 1
+            or row.numel() < 2
+            or row.dtype not in (torch.int32, torch.int64)
+            or row[0].item() != 0
+            or row[-1].item() > pack_length.item()
+        ):
+            raise ValueError("Invalid FLOPs cu_seqlens boundaries")
+        row_lengths = row.to(dtype=torch.int64).diff()
+        if bool((row_lengths <= 0).any()):
+            raise ValueError("FLOPs cu_seqlens must have positive source lengths")
+        source_lengths.append(row_lengths)
+    return torch.cat(source_lengths)
+
+
+def _has_grid_rows(grid: torch.Tensor | PackedTensor | None) -> bool:
+    """Check for vision work, including packed batches with empty media rows."""
+    grids = grid.tensors if isinstance(grid, PackedTensor) else [grid]
+    return any(value is not None and value.numel() > 0 for value in grids)
+
+
 def compute_bridge_batch_flops(
-    config: "ConfigContainer", data: BatchedDataDict[Any]
+    config: "ConfigContainer",
+    data: BatchedDataDict[Any],
+    *,
+    freeze_config: Mapping[str, bool] | None = None,
 ) -> float:
     """Estimate full-model training work for one DP shard, before TP/CP slicing.
 
@@ -37,15 +78,22 @@ def compute_bridge_batch_flops(
     from megatron.bridge.training.utils import flop_utils
 
     model = config.model
-    if any(
-        getattr(model, name, False)
+    # Runtime freeze hooks change model weights, not the provider's flags.
+    frozen = {
+        name
         for name in (
             "freeze_language_model",
             "freeze_vision_model",
             "freeze_vision_projection",
         )
+        if getattr(model, name, False) or (freeze_config or {}).get(name, False)
+    }
+    if "freeze_language_model" in frozen:
+        raise NotImplementedError("Bridge FLOPs for a frozen language model")
+    if frozen and any(
+        _has_grid_rows(data.get(key)) for key in ("image_grid_thw", "video_grid_thw")
     ):
-        raise NotImplementedError("Bridge FLOPs for partially frozen models")
+        raise NotImplementedError("Bridge FLOPs for frozen vision towers with media")
     if config.peft is not None:
         raise NotImplementedError("Bridge FLOPs for NeMo-RL PEFT batches")
     if hasattr(model, "_get_num_floating_point_operations") and not hasattr(
@@ -57,14 +105,10 @@ def compute_bridge_batch_flops(
     if any(key in data for key in ("input_features", "audio_features", "audio_signal")):
         raise NotImplementedError("Bridge FLOPs for audio batches")
 
-    lengths = data["input_lengths"].to(dtype=torch.int64)
-    if lengths.ndim != 1 or len(lengths) != data.size or bool((lengths <= 0).any()):
-        raise ValueError(
-            "FLOPs input_lengths must contain one positive length per sample"
-        )
+    lengths = _sequence_lengths(data)
     total = flop_utils.num_floating_point_operations(
         config,
-        batch_size=data.size,
+        batch_size=len(lengths),
         seqlen_sum=int(lengths.sum().item()),
         seqlen_squared_sum=int(lengths.square().sum().item()),
         num_vision_patches=0,

@@ -88,11 +88,81 @@ def test_images_and_videos_are_counted_once(calculator, packed, nested):
 @pytest.mark.parametrize(
     "flag", ["freeze_language_model", "freeze_vision_model", "freeze_vision_projection"]
 )
-def test_frozen_model_explicitly_requests_fallback(calculator, flag):
+@pytest.mark.parametrize("source", ["provider", "runtime"])
+@pytest.mark.parametrize("grid_key", [None, "image_grid_thw", "video_grid_thw"])
+def test_frozen_model_fallback_depends_on_active_modules(
+    calculator, flag, source, grid_key
+):
+    config, data = _config(), _batch()
+    options = {}
+    if source == "provider":
+        setattr(config.model, flag, True)
+    else:
+        options["freeze_config"] = {flag: True}
+    if grid_key is not None:
+        data[grid_key] = torch.tensor([[1, 4, 4]])
+    if flag == "freeze_language_model" or grid_key is not None:
+        with pytest.raises(NotImplementedError, match="frozen"):
+            compute_bridge_batch_flops(config, data, **options)
+        calculator.num_floating_point_operations.assert_not_called()
+    else:
+        assert compute_bridge_batch_flops(config, data, **options) == 120
+
+
+def test_false_freeze_flags_and_empty_media_keep_text_estimate(calculator):
+    config, data = _config(), _batch()
+    config.model.freeze_vision_model = True
+    data["image_grid_thw"] = PackedTensor([None, None], dim_to_pack=0)
+    data["video_grid_thw"] = torch.empty(0, 3, dtype=torch.long)
+    assert (
+        compute_bridge_batch_flops(
+            config, data, freeze_config={"freeze_language_model": False}
+        )
+        == 120
+    )
+
+
+def _packed_batch():
+    data = _batch()
+    data["input_ids"] = torch.zeros(2, 24, dtype=torch.long)
+    data["input_lengths"] = torch.tensor([24, 8])
+    data["cu_seqlens"] = PackedTensor(
+        [torch.tensor([0, 7, 18]), torch.tensor([0, 5])], dim_to_pack=0
+    )
+    data["cu_seqlens_padded"] = PackedTensor(
+        [torch.tensor([0, 8, 24]), torch.tensor([0, 8])], dim_to_pack=0
+    )
+    return data
+
+
+def test_packed_attention_uses_source_lengths_without_padding(calculator):
     config = _config()
-    setattr(config.model, flag, True)
-    with pytest.raises(NotImplementedError, match="frozen"):
-        compute_bridge_batch_flops(config, _batch())
+    assert compute_bridge_batch_flops(config, _packed_batch()) == 120
+    calculator.num_floating_point_operations.assert_called_once_with(
+        config,
+        batch_size=3,
+        seqlen_sum=23,
+        seqlen_squared_sum=195,
+        num_vision_patches=0,
+    )
+
+
+@pytest.mark.parametrize("boundaries", [[1, 7], [0, 7, 7], [0, 9, 8], [0, 25], [0]])
+def test_malformed_packed_lengths_are_errors(calculator, boundaries):
+    data = _packed_batch()
+    data["cu_seqlens"] = PackedTensor(
+        [torch.tensor(boundaries), torch.tensor([0, 5])], dim_to_pack=0
+    )
+    with pytest.raises(ValueError, match="cu_seqlens"):
+        compute_bridge_batch_flops(_config(), data)
+
+
+@pytest.mark.parametrize("rows", [[torch.tensor([0, 7])], [None, torch.tensor([0, 5])]])
+def test_missing_packed_boundaries_are_errors(calculator, rows):
+    data = _packed_batch()
+    data["cu_seqlens"] = PackedTensor(rows, dim_to_pack=0)
+    with pytest.raises(ValueError, match="cu_seqlens"):
+        compute_bridge_batch_flops(_config(), data)
 
 
 def test_peft_explicitly_requests_fallback(calculator):
@@ -184,6 +254,7 @@ def _real_config():
 def test_real_bridge_matches_backend_agnostic_text_formula(family):
     pytest.importorskip("megatron.bridge.training.utils.flop_utils")
     from transformers import LlamaConfig, Qwen3Config
+
     from nemo_rl.utils.flops_tracker import FLOPTracker
 
     config_cls = LlamaConfig if family == "llama" else Qwen3Config
@@ -256,6 +327,7 @@ def test_model_flops_match_megatron_lm_and_bridge_vision(family, lengths):
     args = SimpleNamespace(
         **vars(model),
         group_query_attention=True,
+        decoder_seq_length=None,
         num_experts=None,
         moe_latent_size=None,
         swiglu=True,

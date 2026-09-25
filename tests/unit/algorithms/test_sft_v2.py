@@ -40,7 +40,9 @@ _ACTOR_CLS = SFTSingleControllerActor.__ray_metadata__.modified_class
 def test_tokenizer_mode_is_defined_by_config(config_name, use_processor):
     from nemo_rl.utils.config import load_config
 
-    config = load_config(f"examples/configs/{config_name}")
+    config = load_config(
+        Path(__file__).resolve().parents[3] / "examples" / "configs" / config_name
+    )
     assert config.policy.tokenizer.use_processor is use_processor
 
 

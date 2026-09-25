@@ -145,6 +145,10 @@ def test_loader_uses_processor_or_worker_tokenizer(multimodal) -> None:
             batch_size=1,
             max_sequence_length=128,
             placement_fingerprint="single-dp",
+            packing_algorithm=None,
+            max_sequences_per_bin=None,
+            sequence_length_pad_multiple=1,
+            only_unmask_final=False,
         )
     expected = worker._sft_processor if multimodal else worker.tokenizer
     assert build.call_args.kwargs["processor"] is expected

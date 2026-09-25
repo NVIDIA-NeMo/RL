@@ -652,7 +652,8 @@ def test_identity_pins_packing_semantics():
         assert _identity_fingerprint(changed) != _identity_fingerprint(baseline)
 
 
-def test_train_loader_rejects_shuffle_false():
+@pytest.mark.parametrize("multimodal", [False, True])
+def test_train_loader_rejects_shuffle_false(multimodal):
     # get_train_dataset shards by slice and Energon asserts a single slice
     # iterator when it does not shuffle over epochs, so shuffle=false is not a
     # valid training config. Reject it here instead of failing on the first
@@ -663,7 +664,7 @@ def test_train_loader_rejects_shuffle_false():
             source=EnergonSourceConfig(
                 path="/data/prepared", split="train", virtual_epoch_length=10
             ),
-            processor=_FakeQwenProcessor(),
+            processor=_FakeQwenProcessor() if multimodal else _text_tokenizer(),
             batch_size=2,
             max_sequence_length=128,
             split_role="train",

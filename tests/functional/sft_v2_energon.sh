@@ -15,7 +15,7 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 
 EXP_NAME=$(basename "$0" .sh)
-EXP_DIR="${SCRIPT_DIR}/${EXP_NAME}"
+EXP_DIR="${NRL_RUN_DIR:-${SCRIPT_DIR}}/${EXP_NAME}"
 DATA_DIR="${EXP_DIR}/clevr-energon"
 LOG_DIR="${EXP_DIR}/logs"
 CKPT_DIR="${EXP_DIR}/checkpoints"

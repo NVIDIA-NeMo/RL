@@ -1435,7 +1435,11 @@ class MegatronPolicyWorkerImpl(
     def _batch_flops(self, data: BatchedDataDict[Any]) -> float | None:
         """Use Bridge, explicitly marking unsupported cases for driver fallback."""
         try:
-            return compute_bridge_batch_flops(self.mcore_state.cfg, data)
+            return compute_bridge_batch_flops(
+                self.mcore_state.cfg,
+                data,
+                freeze_config=self.cfg["megatron_cfg"].get("freeze_config"),
+            )
         except NotImplementedError as error:
             warnings.warn(
                 f"{error}; using NeMo-RL FLOPs fallback if supported.", stacklevel=2
