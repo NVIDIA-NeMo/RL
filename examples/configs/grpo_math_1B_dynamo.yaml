@@ -20,6 +20,9 @@ loss_fn:
 
 checkpointing:
   enabled: false
+  # set to false to start fresh in a checkpoint_dir that already has
+  # checkpoints; the existing ones are moved to checkpoint_dir/run_<n>/
+  resume_if_exists: true
 
 policy:
   train_global_batch_size: 4
