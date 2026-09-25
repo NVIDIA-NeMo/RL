@@ -47,7 +47,8 @@ env:
       - resources_servers/swe_next/configs/swe_next_opencode.yaml
       - nemo_gym/sandbox/providers/opensandbox/configs/opensandbox.yaml
     # SWE agents: the policy's context window, a one-hour harness budget, rows from
-    # data.train only, and OpenCode from the shared harness path.
+    # data.train only, OpenCode from the shared harness path, and no compaction,
+    # which token capture cannot follow.
     swe_rebench_opencode_sandboxed_agent:
       responses_api_agents:
         opencode_sandboxed_agent:
@@ -56,6 +57,10 @@ env:
           datasets: []
           remote_opencode_install_script_path: /mnt/s3-data/data/harness/opencode/install.sh
           remote_opencode_binary_path: /mnt/s3-data/data/harness/opencode/linux-x64/1.17.11/opencode
+          opencode_config:
+            compaction:
+              auto: false
+              prune: false
     scale_swe_opencode_sandboxed_agent:
       responses_api_agents:
         opencode_sandboxed_agent:
@@ -64,6 +69,10 @@ env:
           datasets: []
           remote_opencode_install_script_path: /mnt/s3-data/data/harness/opencode/install.sh
           remote_opencode_binary_path: /mnt/s3-data/data/harness/opencode/linux-x64/1.17.11/opencode
+          opencode_config:
+            compaction:
+              auto: false
+              prune: false
     swemer_v1_opencode_sandboxed_agent:
       responses_api_agents:
         opencode_sandboxed_agent:
@@ -72,6 +81,10 @@ env:
           datasets: []
           remote_opencode_install_script_path: /mnt/s3-data/data/harness/opencode/install.sh
           remote_opencode_binary_path: /mnt/s3-data/data/harness/opencode/linux-x64/1.17.11/opencode
+          opencode_config:
+            compaction:
+              auto: false
+              prune: false
     swemer_v2_opencode_sandboxed_agent:
       responses_api_agents:
         opencode_sandboxed_agent:
@@ -80,6 +93,10 @@ env:
           datasets: []
           remote_opencode_install_script_path: /mnt/s3-data/data/harness/opencode/install.sh
           remote_opencode_binary_path: /mnt/s3-data/data/harness/opencode/linux-x64/1.17.11/opencode
+          opencode_config:
+            compaction:
+              auto: false
+              prune: false
     swe_next_opencode_sandboxed_agent:
       responses_api_agents:
         opencode_sandboxed_agent:
@@ -88,6 +105,10 @@ env:
           datasets: []
           remote_opencode_install_script_path: /mnt/s3-data/data/harness/opencode/install.sh
           remote_opencode_binary_path: /mnt/s3-data/data/harness/opencode/linux-x64/1.17.11/opencode
+          opencode_config:
+            compaction:
+              auto: false
+              prune: false
     # SWE servers: a 20-minute verification budget and the OpenCode version the
     # staged install.sh reads from the sandbox environment.
     swe_rebench_resources_server:
