@@ -109,7 +109,7 @@ echo "  TRT-LLM Git ref: $GIT_REF"
 # (matches Stage 2 (CMake) and Stage 3 (uv) which are also installer-based).
 if ! command -v git-lfs >/dev/null 2>&1; then
     echo "Installing git-lfs (static binary, apt-free)..."
-    LFS_VER=3.7.0
+    LFS_VER=3.8.0
     LFS_ARCH=$(uname -m | sed 's/aarch64/arm64/;s/x86_64/amd64/')
     LFS_TGZ="/tmp/git-lfs-${LFS_VER}.tar.gz"
     curl --retry 3 --retry-delay 2 -fsSL -o "$LFS_TGZ" \
