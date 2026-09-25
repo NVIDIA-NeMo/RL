@@ -500,40 +500,28 @@ def math_data_processor(
     solution = str(datum_dict["expected_answer"])
     extra_env_info = {"ground_truth": solution}
 
-    message_log: LLMMessageLogType = []
-
-    # system prompt
+    # Render the full conversation together, as in math_hf_data_processor.
+    message_list = []
     if task_data_spec.system_prompt:
-        sys_prompt: dict[str, str | torch.Tensor] = {
-            "role": "system",
-            "content": task_data_spec.system_prompt,
-        }
-        sys = tokenizer.apply_chat_template(
-            [cast(dict[str, str], sys_prompt)],
-            tokenize=False,
-            add_generation_prompt=False,
-            add_special_tokens=False,
-        )
-        sys_prompt["token_ids"] = tokenizer(
-            sys, return_tensors="pt", add_special_tokens=False
-        )["input_ids"][0]
-        message_log.append(sys_prompt)
+        message_list.append({"role": "system", "content": task_data_spec.system_prompt})
 
     # user prompt
     if task_data_spec.prompt:
         problem = task_data_spec.prompt.format(problem)
     user_message = {"role": "user", "content": problem}
+    message_list.append(user_message)
     message = tokenizer.apply_chat_template(
-        [user_message],
+        message_list,
         tokenize=False,
         add_generation_prompt=True,
         add_special_tokens=False,
     )
-    user_message["token_ids"] = tokenizer(
-        message, return_tensors="pt", add_special_tokens=False
-    )["input_ids"][0]
-    user_message["content"] = message
-    message_log.append(user_message)
+    token_ids = tokenizer(message, return_tensors="pt", add_special_tokens=False)[
+        "input_ids"
+    ][0]
+    message_log: LLMMessageLogType = [
+        {"role": "user", "content": message, "token_ids": token_ids}
+    ]
 
     length = sum(len(m["token_ids"]) for m in message_log)
 
@@ -873,24 +861,10 @@ def multichoice_qa_processor(
     if "subject" in datum_dict:
         extra_env_info.update({"subject": datum_dict["subject"]})
 
-    message_log: LLMMessageLogType = []
-
-    # system prompt
+    # Render the full conversation together, as in math_hf_data_processor.
+    message_list = []
     if task_data_spec.system_prompt:
-        sys_prompt: dict[str, str | torch.Tensor] = {
-            "role": "system",
-            "content": task_data_spec.system_prompt,
-        }
-        sys = tokenizer.apply_chat_template(
-            [cast(dict[str, str], sys_prompt)],
-            tokenize=False,
-            add_generation_prompt=False,
-            add_special_tokens=False,
-        )
-        sys_prompt["token_ids"] = tokenizer(
-            sys, return_tensors="pt", add_special_tokens=False
-        )["input_ids"][0]
-        message_log.append(sys_prompt)
+        message_list.append({"role": "system", "content": task_data_spec.system_prompt})
 
     # user prompt
     if task_data_spec.prompt:
@@ -898,17 +872,19 @@ def multichoice_qa_processor(
             task_data_spec.prompt, question, options
         )
     user_message = {"role": "user", "content": question}
+    message_list.append(user_message)
     message = tokenizer.apply_chat_template(
-        [user_message],
+        message_list,
         tokenize=False,
         add_generation_prompt=True,
         add_special_tokens=False,
     )
-    user_message["token_ids"] = tokenizer(
-        message, return_tensors="pt", add_special_tokens=False
-    )["input_ids"][0]
-    user_message["content"] = message
-    message_log.append(user_message)
+    token_ids = tokenizer(message, return_tensors="pt", add_special_tokens=False)[
+        "input_ids"
+    ][0]
+    message_log: LLMMessageLogType = [
+        {"role": "user", "content": message, "token_ids": token_ids}
+    ]
 
     length = sum(len(m["token_ids"]) for m in message_log)
     output: DatumSpec = {

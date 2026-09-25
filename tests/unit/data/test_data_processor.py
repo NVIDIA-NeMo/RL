@@ -21,6 +21,8 @@ from collections import defaultdict
 import pytest
 import torch
 from datasets import Dataset
+from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+from transformers import PreTrainedTokenizerFast
 
 abspath = os.path.abspath(__file__)
 sys.path.append("/".join(abspath.split("/")[:-4]))
@@ -44,6 +46,7 @@ from nemo_rl.data.processors import (
     kd_data_processor,
     math_data_processor,
     math_hf_data_processor,
+    multichoice_qa_processor,
     nemo_gym_data_processor,
 )
 from nemo_rl.models.policy import TokenizerConfig
@@ -124,6 +127,127 @@ def test_math_data_processor():
 
     assert dataset[0]["extra_env_info"]["ground_truth"] == "answer1"
     assert dataset[1]["extra_env_info"]["ground_truth"] == "answer2"
+
+
+@pytest.fixture(params=[False, True], ids=["default-system", "default-system-bos"])
+def eval_chat_tokenizer(request: pytest.FixtureRequest) -> PreTrainedTokenizerFast:
+    backend = Tokenizer(
+        models.BPE(
+            vocab={
+                char: idx
+                for idx, char in enumerate(sorted(pre_tokenizers.ByteLevel.alphabet()))
+            },
+            merges=[],
+        )
+    )
+    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    backend.decoder = decoders.ByteLevel()
+    template = (
+        "{% if messages[0]['role'] != 'system' %}"
+        "system: Default instruction.\n{% endif %}"
+        "{% for message in messages %}"
+        "{{ message['role'] + ': ' + message['content'] + '\\n' }}"
+        "{% endfor %}"
+        "{% if add_generation_prompt %}assistant:{% endif %}"
+    )
+    if request.param:
+        template = "{{ bos_token }}" + template
+    return PreTrainedTokenizerFast(
+        tokenizer_object=backend, bos_token="<bos>", chat_template=template
+    )
+
+
+@pytest.mark.parametrize("processor", [math_data_processor, multichoice_qa_processor])
+@pytest.mark.parametrize("with_system", [False, True])
+@pytest.mark.parametrize("with_prompt", [False, True])
+def test_eval_processors_render_complete_conversation(
+    eval_chat_tokenizer: PreTrainedTokenizerFast,
+    processor: TaskDataProcessFnCallable,
+    with_system: bool,
+    with_prompt: bool,
+) -> None:
+    tokenizer = eval_chat_tokenizer
+    spec = TaskDataSpec(task_name="eval")
+    spec.system_prompt = "Use only the supplied instruction." if with_system else None
+    datum = {
+        "problem": "What is 2+2?",
+        "expected_answer": 4,
+        "question": "What is 2+2?",
+        "answer": "B",
+        "options": {"A": "3", "B": "4", "C": None},
+        "subject": "arithmetic",
+    }
+    if with_system:
+        datum["task_name"] = "eval"
+    user_content = "What is 2+2?"
+    if processor is math_data_processor:
+        spec.prompt = "Solve: {}" if with_prompt else None
+        if with_prompt:
+            user_content = "Solve: What is 2+2?"
+        expected_info = {"ground_truth": "4"}
+    else:
+        spec.prompt = "Choose one." if with_prompt else None
+        if with_prompt:
+            user_content = "Choose one.\n\nQuestion: What is 2+2?\nOptions:\nA) 3\nB) 4"
+        expected_info = {"ground_truth": "B", "subject": "arithmetic"}
+    messages = []
+    if with_system:
+        messages.append({"role": "system", "content": spec.system_prompt})
+    messages.append({"role": "user", "content": user_content})
+    expected_text = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    expected_ids = tokenizer(expected_text, add_special_tokens=False)["input_ids"]
+
+    result = processor(datum, spec, tokenizer, max_seq_length=1024, idx=7)
+
+    # Evaluation sends joined content to generation, while training flattens token_ids.
+    rendered = "\n".join(message["content"] for message in result["message_log"])
+    token_ids = torch.cat([message["token_ids"] for message in result["message_log"]])
+    assert rendered == expected_text
+    assert token_ids.tolist() == expected_ids
+    assert rendered.count("system:") == 1
+    assert rendered.count("assistant:") == 1
+    assert rendered.count("<bos>") == expected_text.count("<bos>")
+    assert ("Default instruction." in rendered) == (not with_system)
+    assert result["length"] == len(expected_ids)
+    assert result["loss_multiplier"] == 1.0
+    assert result["extra_env_info"] == expected_info
+    assert result["idx"] == 7
+    assert result.get("task_name") == datum.get("task_name")
+
+
+@pytest.mark.parametrize("limit_offset", [-1, 0, 1])
+def test_eval_math_processor_length_boundary(
+    eval_chat_tokenizer: PreTrainedTokenizerFast, limit_offset: int
+) -> None:
+    tokenizer = eval_chat_tokenizer
+    spec = TaskDataSpec()
+    spec.system_prompt = "Answer concisely."
+    messages = [
+        {"role": "system", "content": spec.system_prompt},
+        {"role": "user", "content": "What is 2+2?"},
+    ]
+    expected_text = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    expected_ids = tokenizer(expected_text, add_special_tokens=False)["input_ids"]
+    max_seq_length = len(expected_ids) + limit_offset
+    result = math_data_processor(
+        {"problem": "What is 2+2?", "expected_answer": 4},
+        spec,
+        tokenizer,
+        max_seq_length=max_seq_length,
+        idx=0,
+    )
+
+    assert result["length"] == len(expected_ids)
+    assert result["loss_multiplier"] == (1.0 if limit_offset > 0 else 0.0)
+    token_ids = torch.cat([message["token_ids"] for message in result["message_log"]])
+    if limit_offset > 0:
+        assert token_ids.tolist() == expected_ids
+    else:
+        assert token_ids.tolist() == expected_ids[:4]
 
 
 @pytest.mark.hf_gated
