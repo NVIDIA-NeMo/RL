@@ -78,6 +78,27 @@ def reject_outdated_dataset_config(config: dict[str, Any]) -> None:
         )
 
 
+def reject_outdated_metric_name_format(config: dict[str, Any]) -> None:
+    """Fail when checkpointing.metric_name still uses the bare-name format.
+
+    Args:
+        config: The resolved config, already flattened to plain dicts.
+    """
+    checkpointing = config.get("checkpointing")
+    if not isinstance(checkpointing, dict):
+        return
+
+    metric_name = checkpointing.get("metric_name")
+    if metric_name is None or metric_name.startswith(("train:", "val:")):
+        return
+
+    raise ValueError(
+        f"checkpointing.metric_name={metric_name!r} must start with 'train:' or 'val:', "
+        f"followed by the name in the matching metrics dictionary. The bare-name format "
+        f"is gone, e.g. 'val_loss' is now 'val:val_loss'."
+    )
+
+
 def check_outdated_config(config: Any) -> None:
     """Fail fast on config the code no longer accepts, naming the migration to apply.
 
@@ -95,3 +116,4 @@ def check_outdated_config(config: Any) -> None:
 
     reject_outdated_dtensor_v2_key(config)
     reject_outdated_dataset_config(config)
+    reject_outdated_metric_name_format(config)
