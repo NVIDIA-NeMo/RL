@@ -470,8 +470,8 @@ class _PartialGymMethod:
         del kwargs
         return self
 
-    def remote(self, inputs, timer_prefix):
-        del timer_prefix
+    def remote(self, inputs, timer_prefix, per_prompt=False):
+        del timer_prefix, per_prompt
         self.dispatched.append([row["_rowidx"] for row in inputs])
         attempt = self.attempts
         self.attempts += 1
@@ -511,8 +511,8 @@ class _FakeGymMethod:
         del kwargs
         return self
 
-    def remote(self, inputs, timer_prefix):
-        del timer_prefix
+    def remote(self, inputs, timer_prefix, per_prompt=False):
+        del timer_prefix, per_prompt
         return self._stream(len(inputs))
 
     async def _stream(self, num_inputs):

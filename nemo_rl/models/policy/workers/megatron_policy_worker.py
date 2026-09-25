@@ -38,7 +38,6 @@ from megatron.bridge.training.utils.train_utils import (
 )
 from megatron.bridge.utils.common_utils import get_rank_safe
 from megatron.core import parallel_state
-from megatron.core.dist_checkpointing.strategies.torch import get_async_strategy
 from megatron.core.distributed import DistributedDataParallel
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallelV1,
@@ -47,12 +46,16 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
 from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import get_model_config, unwrap_model
+from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
+    FileSystemWriterAsync,
+)
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossFn
 from nemo_rl.algorithms.loss.utils import rescale_loss_metrics
+from nemo_rl.algorithms.metric_utils import LEARNING_RATE_KEY
 from nemo_rl.data.multimodal_utils import (
     attach_media_token_validity_mask,
     chunks_accept_media_token_validity_mask,
@@ -139,7 +142,10 @@ from nemo_rl.models.policy.workers.checkpoint_engine import (
     maybe_preinit_nixl_checkpoint_engine,
 )
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
-from nemo_rl.telemetry.setup import init_telemetry_worker
+from nemo_rl.telemetry.setup import (
+    init_telemetry_worker,
+    traced_worker_init,
+)
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
@@ -563,6 +569,7 @@ class MegatronPolicyWorkerImpl(
         init_kwargs: dict[str, Any] = {}
         return resources, env_vars, init_kwargs, {}
 
+    @traced_worker_init("rl.policy.load_model", **{"rl.backend": "megatron"})
     def __init__(
         self,
         config: PolicyConfig,
@@ -1333,7 +1340,7 @@ class MegatronPolicyWorkerImpl(
                         gb_loss_metrics.append(loss_metrics)
                         curr_lr = self.scheduler.get_lr(self.optimizer.param_groups[0])
                         curr_wd = self.scheduler.get_wd()
-                        loss_metrics["lr"] = curr_lr
+                        loss_metrics[LEARNING_RATE_KEY] = curr_lr
                         loss_metrics["wd"] = curr_wd
                         loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
                         loss_metrics["global_valid_toks"] = global_valid_toks.item()
@@ -4730,7 +4737,6 @@ class MegatronPolicyWorkerImpl(
         colocated_cfg = generation_cfg.get("colocated") or {}
         return bool(
             ckpt_cfg.async_save
-            and getattr(ckpt_cfg, "async_strategy", "nvrx") == "nvrx"
             and getattr(ckpt_cfg, "use_persistent_ckpt_worker", False)
             and getattr(ckpt_cfg, "ckpt_assume_constant_structure", False)
             and not getattr(ckpt_cfg, "async_ckpt_use_cpu_shm", False)
@@ -4757,19 +4763,7 @@ class MegatronPolicyWorkerImpl(
             terminate=release_cuda_cache,
         )
         if release_cuda_cache:
-            _, async_modules = get_async_strategy(
-                self.mcore_state.cfg.checkpoint.async_strategy
-            )
-            writer_cls = async_modules["FileSystemWriterAsync"]
-            cleanup_tensor_caches = getattr(writer_cls, "cleanup_tensor_caches", None)
-            if cleanup_tensor_caches is not None:
-                cleanup_tensor_caches()
-            else:
-                # Compatibility with older NVRx versions that predate the
-                # public cleanup helper.
-                cached_identifiers = getattr(writer_cls, "_cached_identifiers", None)
-                if cached_identifiers is not None:
-                    cached_identifiers.clear()
+            FileSystemWriterAsync.cleanup_tensor_caches()
             gc.collect()
             torch.cuda.ipc_collect()
             torch.cuda.empty_cache()

@@ -15,6 +15,7 @@
 import asyncio
 import logging
 import os
+import time
 import warnings
 from collections import defaultdict
 from typing import (
@@ -48,15 +49,17 @@ from nemo_rl.models.generation.vllm.config import (
     REFITTABLE_FP8_KV_CACHE_DTYPES,
     VllmConfig,
 )
+from nemo_rl.models.generation.vllm.metric_names import BATCH_DURATION_KEY
 from nemo_rl.models.generation.vllm.utils import (
     aggregate_spec_decode_counters,
     assert_refit_unsupported_grouped_moe_params,
     assert_reload_refit_config_supported,
+    compute_engine_step_metrics,
     compute_spec_decode_metrics,
     resolve_generation_worker_cls,
 )
 from nemo_rl.telemetry.instrumentation import trace_fn
-from nemo_rl.telemetry.metrics import warn_once
+from nemo_rl.telemetry.metrics import record_rl_metrics, warn_once
 from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.utils.fastokens import normalize_fastokens_env
@@ -78,6 +81,7 @@ def _record_vllm_generation_metrics(
     model_name: str | None,
     data: BatchedDataDict,
     combined: BatchedDataDict,
+    batch_duration_s: float | None = None,
 ) -> None:
     """Record vLLM token-usage metrics to nemo-lens (no-op unless exporting)."""
     telemetry = get_telemetry_handle()
@@ -97,13 +101,20 @@ def _record_vllm_generation_metrics(
             if "generation_lengths" in combined
             else None
         )
+        # No duration: this call is a batch across every data-parallel shard,
+        # and record_inference_metrics would put it in the per-request
+        # gen_ai.server.request.duration histogram. The token counts are sums
+        # over the batch, which is what those instruments mean.
         record_inference_metrics(
             telemetry.meter,
+            None,
             model=model_name or "",
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             provider_name="vllm",
         )
+        if batch_duration_s is not None:
+            record_rl_metrics({BATCH_DURATION_KEY: batch_duration_s})
     except Exception:
         warn_once("vllm_inference_metrics", "nemo-lens: failed to record vLLM metrics")
 
@@ -682,10 +693,28 @@ class VllmGeneration(GenerationInterface):
                 "Previous snapshot will be overwritten.",
                 RuntimeWarning,
             )
-        self._step_metrics_snapshot = self._get_raw_spec_counters()
+        # Callers do not guard this, and vLLM metric names change between
+        # releases. None on failure, so the paired get_step_metrics returns {}
+        # rather than delta-ing against a stale baseline.
+        try:
+            self._step_metrics_snapshot = self._get_raw_spec_counters()
+        except ray.exceptions.RayActorError:
+            # A dead generation actor is the caller's to handle: it has its own
+            # RayActorError handler and this is not an observability failure.
+            self._step_metrics_snapshot = None
+            raise
+        except Exception:
+            warn_once(
+                "vllm_step_metrics_snapshot", "failed to snapshot vLLM step metrics"
+            )
+            self._step_metrics_snapshot = None
 
     def get_step_metrics(self) -> dict[str, float]:
-        """Get speculative decoding metrics delta since snapshot_step_metrics().
+        """Get the vLLM engine metrics delta since snapshot_step_metrics().
+
+        Covers the speculative-decoding family plus the engine's token,
+        sequence-length and request-outcome series, all derived from the same
+        pair of snapshots so the wider coverage costs no extra RPC.
 
         Returns:
             Dictionary of delta metrics with 'vllm/' prefix.
@@ -702,13 +731,25 @@ class VllmGeneration(GenerationInterface):
             )
             return {}
 
-        counters_end = self._get_raw_spec_counters()
-        step_metrics = compute_spec_decode_metrics(
-            self._step_metrics_snapshot, counters_end
-        )
-
-        # Reset snapshot for next step
+        counters_start = self._step_metrics_snapshot
+        # Reset before the work, not after: on failure a stale snapshot would
+        # make the next snapshot_step_metrics() warn about a double snapshot.
         self._step_metrics_snapshot = None
+
+        # Callers merge this into the step's metrics dict unguarded, so a
+        # vLLM rename must cost observability rather than the run.
+        try:
+            counters_end = self._get_raw_spec_counters()
+            step_metrics = compute_spec_decode_metrics(counters_start, counters_end)
+            step_metrics.update(
+                compute_engine_step_metrics(counters_start, counters_end)
+            )
+        except ray.exceptions.RayActorError:
+            # See snapshot_step_metrics: the caller handles a dead actor.
+            raise
+        except Exception:
+            warn_once("vllm_step_metrics_read", "failed to collect vLLM step metrics")
+            return {}
 
         return step_metrics
 
@@ -924,6 +965,7 @@ class VllmGeneration(GenerationInterface):
         assert "input_ids" in data and "input_lengths" in data, (
             "input_ids and input_lengths are required in data for vLLM generation"
         )
+        started_at = time.perf_counter()
 
         # Shard the data across the tied worker groups
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
@@ -967,7 +1009,12 @@ class VllmGeneration(GenerationInterface):
                 f"Missing required keys for GenerationOutputSpec: {missing_keys}"
             )
 
-        _record_vllm_generation_metrics(self.cfg.get("model_name"), data, combined)
+        _record_vllm_generation_metrics(
+            self.cfg.get("model_name"),
+            data,
+            combined,
+            batch_duration_s=time.perf_counter() - started_at,
+        )
         return combined
 
     @trace_fn(RLSpanGroup.GENERATION, "rl.vllm.generate_text")
@@ -984,6 +1031,7 @@ class VllmGeneration(GenerationInterface):
             raise RuntimeError(
                 "generate_text cannot be used with async_engine=True. Use generate_text_async instead."
             )
+        started_at = time.perf_counter()
 
         # Shard the data across the tied worker groups
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
@@ -1022,7 +1070,12 @@ class VllmGeneration(GenerationInterface):
                 f"Missing required keys for GenerationOutputSpec: {missing_keys}"
             )
 
-        _record_vllm_generation_metrics(self.cfg.get("model_name"), data, combined)
+        _record_vllm_generation_metrics(
+            self.cfg.get("model_name"),
+            data,
+            combined,
+            batch_duration_s=time.perf_counter() - started_at,
+        )
         return combined
 
     async def _async_generate_base(
