@@ -21,13 +21,18 @@ def _train_backend_configs(
 ) -> Iterator[tuple[str, dict[str, Any]]]:
     """Yields (dotted path, config) for every block that selects a training backend.
 
-    The policy, the value model, each teacher and the reward-model environment. A check
+    The policy, the value model, the teachers and the reward-model environment. A check
     for any backend key can iterate these rather than re-deriving the locations.
-    """
-    # policy and value model blocks
-    blocks = [(section, config.get(section)) for section in ("policy", "value")]
 
-    # teacher blocks
+    Distillation keeps its single teacher under "teacher", while the multi-teacher
+    algorithms use a "teachers" list, so both spellings are visited.
+    """
+    # policy, value model and single-teacher (distillation) blocks
+    blocks = [
+        (section, config.get(section)) for section in ("policy", "value", "teacher")
+    ]
+
+    # multi-teacher blocks
     teachers = config.get("teachers")
     if isinstance(teachers, (list, tuple)):
         blocks += [(f"teachers.{i}", t) for i, t in enumerate(teachers)]

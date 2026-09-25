@@ -73,8 +73,8 @@ def test_outdated_dtensor_v2_key_is_rejected(value):
         check_outdated_config({"policy": {"dtensor_cfg": {"_v2": value}}})
 
 
-@pytest.mark.parametrize("section", ["policy", "value"])
-def test_both_top_level_sections_are_checked(section):
+@pytest.mark.parametrize("section", ["policy", "value", "teacher"])
+def test_each_top_level_section_is_checked(section):
     with pytest.raises(ValueError, match=rf"{section}\.dtensor_cfg\._v2"):
         check_outdated_config({section: {"dtensor_cfg": {"_v2": True}}})
 
@@ -84,6 +84,11 @@ def test_each_teacher_is_checked():
         check_outdated_config(
             {"teachers": [{"dtensor_cfg": {}}, {"dtensor_cfg": {"_v2": False}}]}
         )
+
+
+def test_reward_model_env_is_checked():
+    with pytest.raises(ValueError, match=r"env\.reward_model\.dtensor_cfg\._v2"):
+        check_outdated_config({"env": {"reward_model": {"dtensor_cfg": {"_v2": True}}}})
 
 
 # ============================================================================
