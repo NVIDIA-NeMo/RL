@@ -165,6 +165,7 @@ from nemo_rl.environments.gym_checkpoint import (
     GymCheckpointCommitResult,
     GymCheckpointPrepareResult,
     GymCompletedExecution,
+    GymModelCommitResponse,
     GymParticipantCommitResult,
     gym_checkpoint_continuations,
     gym_checkpoint_staging_keys,
@@ -2058,9 +2059,10 @@ class SingleControllerActor:
         """Commit shard-local state, then the shared policy ledger.
 
         Agent and resource servers belong to one Gym shard and write below an
-        instance-specific directory. Policy-model proxies share one capture
-        ledger, so one deterministic leader commits it at the snapshot root
-        after receiving the union of every shard's continuation index.
+        instance-specific directory. With prefix cuts enabled, non-leader
+        proxies first commit cut-only fragments there. One deterministic
+        leader then commits the shared ledger at the snapshot root from the
+        union of continuation and generation-cut indexes.
         """
         instances = self._nemo_gym_checkpoint_instances()
         if len(instances) == 1:
@@ -2117,10 +2119,62 @@ class SingleControllerActor:
                 if isinstance(result.payload, GymAgentCommitResponse)
             )
 
-        # Every proxy exposes the same model participant and capture ledger.
-        # Committing that participant more than once with the same checkpoint
-        # ID is invalid when proxy-local attempt inventories differ, so the
-        # first deterministic instance owns the one global model commit.
+        generation_cut_indexes: list[GymCheckpointArtifactReference] = []
+        fragment_root = checkpoint_dir / ".gym-cut-fragments"
+        if self._generation_prefix_cuts_enabled:
+            fragment_calls = [
+                (
+                    label,
+                    actor.commit_checkpoint.remote(
+                        checkpoint_id,
+                        time.time() + timeout_s,
+                        str(fragment_root / shard_set.checkpoint_relative_dir(label)),
+                        ["responses_api_models"],
+                        [],
+                        [],
+                    ),
+                )
+                for label, actor in instances[1:]
+            ]
+            raw_fragments = await self._await_gym_checkpoint_calls(
+                "generation-cut fragment commit",
+                fragment_calls,
+            )
+            for label, _actor in instances[1:]:
+                fragment = GymCheckpointCommitResult.model_validate(
+                    raw_fragments[label]
+                )
+                if fragment.checkpoint_id != checkpoint_id:
+                    raise RuntimeError(
+                        "Gym generation-cut fragment returned the wrong checkpoint "
+                        f"ID: instance={label!r}, expected={checkpoint_id!r}, "
+                        f"actual={fragment.checkpoint_id!r}"
+                    )
+                rebased_fragment = rebase_gym_checkpoint_commit_result(
+                    fragment,
+                    Path(".gym-cut-fragments")
+                    / shard_set.checkpoint_relative_dir(label),
+                )
+                model_results = [
+                    result
+                    for result in rebased_fragment.participants
+                    if isinstance(result.payload, GymModelCommitResponse)
+                ]
+                if len(model_results) != 1:
+                    raise RuntimeError(
+                        "Gym generation-cut fragment must contain exactly one "
+                        f"policy-model participant: instance={label!r}, "
+                        f"found={len(model_results)}"
+                    )
+                generation_cut_indexes.append(
+                    model_results[0].payload.storage_reference_index
+                )
+
+        # Every proxy exposes the same logical model participant and shared
+        # capture ledger. Only the first deterministic instance contributes
+        # that participant to the outer checkpoint; peer fragment indexes let
+        # it include active first-turn cuts without exposing duplicate model
+        # identities.
         continuation_payload = [
             reference.model_dump(mode="json") for reference in continuation_indexes
         ]
@@ -2132,6 +2186,10 @@ class SingleControllerActor:
                 str(checkpoint_dir),
                 ["responses_api_models"],
                 continuation_payload,
+                [
+                    reference.model_dump(mode="json")
+                    for reference in generation_cut_indexes
+                ],
             )
         )
         if model_checkpoint.checkpoint_id != checkpoint_id:
@@ -2140,6 +2198,8 @@ class SingleControllerActor:
                 f"instance={model_label!r}, expected={checkpoint_id!r}, "
                 f"actual={model_checkpoint.checkpoint_id!r}"
             )
+        if self._generation_prefix_cuts_enabled:
+            await asyncio.to_thread(shutil.rmtree, fragment_root)
 
         component_order = {
             "responses_api_agents": 0,
@@ -2329,7 +2389,7 @@ class SingleControllerActor:
         self._gym_checkpoint_rollout_permitted.set()
 
     async def _release_restored_gym_checkpoint(self, checkpoint_id: str) -> None:
-        """Release one shared model restore plus every shard-local restore."""
+        """Release every restored shard and any proxy-local prefix registry."""
         instances = self._nemo_gym_checkpoint_instances()
         if len(instances) == 1:
             await self._release_prepared_gym_checkpoint(
@@ -2343,7 +2403,7 @@ class SingleControllerActor:
         self._gym_checkpoint_rollout_permitted.clear()
         calls = []
         for index, (label, actor) in enumerate(instances):
-            if index == 0:
+            if index == 0 or self._generation_prefix_cuts_enabled:
                 call = actor.resume_checkpoint.remote(checkpoint_id, deadline_ts)
             else:
                 call = actor.resume_checkpoint.remote(

@@ -2088,25 +2088,43 @@ def setup_single_controller(
                 )
             )
         else:
-            # Every shard's policy proxy reads the same capture directory. One
-            # deterministic leader installs the shared ledger once; repeating
-            # the archive extraction per shard would multiply restore I/O by
-            # the shard count. Prefix cuts remain disabled for this path until
-            # Gym can distribute proxy-local cut state independently.
-            _model_label, model_actor = checkpoint_instances[0]
-            model_restore = GymCheckpointRestoreResult.model_validate(
-                ray.get(
-                    model_actor.restore_checkpoint.remote(
-                        gym_checkpoint_restore_operation_id,
-                        time.time() + restore_timeout_s,
-                        str(resolved_snapshot.path),
-                        saved_gym_checkpoint.checkpoint_id,
-                        resolved_snapshot.manifest.gym_generation_cut_proofs,
-                        generation_cut_exclusions,
-                        ["responses_api_models"],
-                    )
-                )
+            # Turn-only recovery needs one shared-ledger restore. Prefix
+            # recovery additionally installs the same authenticated cut union
+            # into every proxy's process-local generation registry.
+            model_restore_instances = (
+                checkpoint_instances
+                if rollout_checkpoint_cfg.gym.generation_prefix_cuts_enabled
+                else checkpoint_instances[:1]
             )
+            model_restore_refs = [
+                gym_actor.restore_checkpoint.remote(
+                    gym_checkpoint_restore_operation_id,
+                    time.time() + restore_timeout_s,
+                    str(resolved_snapshot.path),
+                    saved_gym_checkpoint.checkpoint_id,
+                    resolved_snapshot.manifest.gym_generation_cut_proofs,
+                    generation_cut_exclusions,
+                    ["responses_api_models"],
+                )
+                for _label, gym_actor in model_restore_instances
+            ]
+            model_restores = [
+                GymCheckpointRestoreResult.model_validate(raw_result)
+                for raw_result in ray.get(model_restore_refs)
+            ]
+            model_restore = model_restores[0]
+            for (label, _actor), restored_model in zip(
+                model_restore_instances,
+                model_restores,
+                strict=True,
+            ):
+                if restored_model.checkpoint_id != gym_checkpoint_restore_operation_id:
+                    raise RuntimeError(
+                        "Gym model restore returned the wrong operation ID: "
+                        f"instance={label!r}, "
+                        f"expected={gym_checkpoint_restore_operation_id!r}, "
+                        f"actual={restored_model.checkpoint_id!r}"
+                    )
 
             local_restore_deadline_ts = time.time() + restore_timeout_s
             local_restore_refs = [

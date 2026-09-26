@@ -1349,18 +1349,6 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 f"{replicated_shards!r}. Configure replicas=1 for every shard, or "
                 "disable rollout_checkpointing.gym.capability_discovery_enabled."
             )
-        gym_actor_count = 1 if shard_plan is None else len(shard_plan.shards)
-        if (
-            gym_actor_count > 1
-            and master_config.rollout_checkpointing.gym.generation_prefix_cuts_enabled
-        ):
-            raise NotImplementedError(
-                "Generation-prefix recovery with multiple NeMo-Gym shards requires "
-                "Gym to aggregate every policy proxy's generation-cut proof and "
-                "attempt inventory into one model-ledger commit. Use turn-level "
-                "recovery for sharded Gym actors until that Gym contract is available."
-            )
-
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)
 

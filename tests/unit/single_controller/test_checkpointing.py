@@ -766,6 +766,7 @@ class _FakeGymCheckpointActor:
         generation_cut_staging_key: Optional[str] = None,
         agent_name: str = "test-agent",
         agent_server_name: str = "agent-route",
+        emit_model_participant: bool = False,
     ):
         self.events = events
         self.fail_prepare = fail_prepare
@@ -776,11 +777,13 @@ class _FakeGymCheckpointActor:
         self.generation_cut_staging_key = generation_cut_staging_key
         self.agent_name = agent_name
         self.agent_server_name = agent_server_name
+        self.emit_model_participant = emit_model_participant
         self.checkpoint_ids: list[str] = []
         self.abort_checkpoint_ids: list[str] = []
         self.commit_components: list[Optional[list[str]]] = []
         self.resume_components: list[Optional[list[str]]] = []
         self.model_continuation_indexes: list[list[dict[str, Any]]] = []
+        self.model_generation_cut_indexes: list[list[dict[str, Any]]] = []
         self.acknowledge_completed_executions = _AsyncRemoteMethod(self._acknowledge)
         self.prepare_checkpoint = _AsyncRemoteMethod(self._prepare)
         self.commit_checkpoint = _AsyncRemoteMethod(self._commit)
@@ -835,6 +838,7 @@ class _FakeGymCheckpointActor:
         checkpoint_dir: str,
         components: Optional[list[str]] = None,
         continuation_indexes: Optional[list[dict[str, Any]]] = None,
+        generation_cut_indexes: Optional[list[dict[str, Any]]] = None,
     ) -> dict[str, Any]:
         assert deadline_ts > time.time()
         self.events.append("commit")
@@ -843,7 +847,70 @@ class _FakeGymCheckpointActor:
             if self.fail_model_commit:
                 raise OSError("Gym model checkpoint storage failed")
             self.model_continuation_indexes.append(continuation_indexes or [])
-            return {"checkpoint_id": checkpoint_id, "participants": []}
+            self.model_generation_cut_indexes.append(generation_cut_indexes or [])
+            if not self.emit_model_participant:
+                return {"checkpoint_id": checkpoint_id, "participants": []}
+            model_dir = Path(checkpoint_dir) / "model-ledger" / "policy"
+            model_dir.mkdir(parents=True, exist_ok=True)
+            storage_index = model_dir / "storage-references.jsonl"
+            if self.generation_cut_staging_key is None:
+                storage_index.write_text("")
+                storage_records = 0
+            else:
+                storage_index.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "capture_key": self.agent_name,
+                            "boundary_model_call_id": f"{self.agent_name}-call",
+                            "kind": "generation_prefix_cut",
+                            "key": self.generation_cut_staging_key,
+                        },
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+                storage_records = 1
+            storage_bytes = storage_index.stat().st_size
+            storage_reference = {
+                "schema_version": 1,
+                "relative_path": "model-ledger/policy/storage-references.jsonl",
+                "sha256": hashlib.sha256(storage_index.read_bytes()).hexdigest(),
+                "records": storage_records,
+                "bytes": storage_bytes,
+            }
+            manifest = model_dir / "manifest.json"
+            manifest.write_text("{}")
+            participant = {
+                "server_name": "policy",
+                "component": "responses_api_models",
+                "participant_name": "policy",
+            }
+            return {
+                "checkpoint_id": checkpoint_id,
+                "participants": [
+                    {
+                        "participant": participant,
+                        "payload": {
+                            "rollouts": storage_records,
+                            "rows": storage_records,
+                            "excluded_tombstoned": 0,
+                            "generation_cut_records": storage_records,
+                            "manifest_digest": hashlib.sha256(
+                                manifest.read_bytes()
+                            ).hexdigest(),
+                            "storage_reference_index": storage_reference,
+                        },
+                        "manifest": {
+                            "participant": participant,
+                            "relative_path": "model-ledger/policy/manifest.json",
+                            "manifest_digest": hashlib.sha256(
+                                manifest.read_bytes()
+                            ).hexdigest(),
+                        },
+                    }
+                ],
+            }
         if self.fail_commit:
             raise OSError("Gym checkpoint storage failed")
         path = Path(checkpoint_dir) / "gym" / "agent-manifest.json"
@@ -2761,6 +2828,65 @@ class TestPeriodicRolloutCheckpoint:
         assert events.count("prepare") == 2
         assert events.count("resume") == 2
 
+    def test_sharded_prefix_checkpoint_unions_nonleader_cut_indexes(
+        self, tmp_path: Path
+    ) -> None:
+        actor = self._actor(tmp_path)
+        actor._generation_prefix_cuts_enabled = True
+        events: list[str] = []
+        first = _FakeGymCheckpointActor(
+            events,
+            agent_name="agent-a",
+            agent_server_name="agent-a-route",
+            generation_cut_staging_key="prefix/agent-a",
+            emit_model_participant=True,
+        )
+        second = _FakeGymCheckpointActor(
+            events,
+            agent_name="agent-b",
+            agent_server_name="agent-b-route",
+            generation_cut_staging_key="prefix/agent-b",
+            emit_model_participant=True,
+        )
+        actor._env_handles = {
+            "nemo_gym": NemoGymShardSet(
+                handles={"first": [first], "second": [second]},
+                route_to_shard={"agent-a": "first", "agent-b": "second"},
+            )
+        }
+
+        try:
+            checkpoint = asyncio.run(
+                actor._commit_sharded_gym_checkpoint(
+                    "checkpoint-prefix",
+                    tmp_path,
+                    timeout_s=30.0,
+                )
+            )
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert {result.participant.component for result in checkpoint.participants} == {
+            "responses_api_agents",
+            "responses_api_models",
+        }
+        assert first.commit_components == [
+            ["responses_api_agents", "resources_servers"],
+            ["responses_api_models"],
+        ]
+        assert second.commit_components == [
+            ["responses_api_agents", "resources_servers"],
+            ["responses_api_models"],
+        ]
+        assert second.model_continuation_indexes == [[]]
+        assert second.model_generation_cut_indexes == [[]]
+        assert len(first.model_continuation_indexes[0]) == 2
+        assert len(first.model_generation_cut_indexes[0]) == 1
+        assert first.model_generation_cut_indexes[0][0]["relative_path"].startswith(
+            ".gym-cut-fragments/gym-shards/second/"
+        )
+        assert not (tmp_path / ".gym-cut-fragments").exists()
+
     @pytest.mark.parametrize("failure", ["prepare", "local_commit", "model_commit"])
     def test_sharded_gym_checkpoint_failure_aborts_every_shard(
         self,
@@ -2814,6 +2940,44 @@ class TestPeriodicRolloutCheckpoint:
         else:
             # Two local commits succeed before the one leader model commit fails.
             assert events.count("commit") == 3
+
+    def test_sharded_prefix_fragment_failure_aborts_every_shard(
+        self, tmp_path: Path
+    ) -> None:
+        actor = self._actor(tmp_path)
+        actor._generation_prefix_cuts_enabled = True
+        events: list[str] = []
+        actor._gen = _CheckpointGeneration(events)
+        first = _FakeGymCheckpointActor(events)
+        second = _FakeGymCheckpointActor(events, fail_model_commit=True)
+        actor._env_handles = {
+            "nemo_gym": NemoGymShardSet(
+                handles={"first": [first], "second": [second]},
+            )
+        }
+
+        try:
+            with pytest.raises(OSError, match="model checkpoint storage failed"):
+                asyncio.run(
+                    actor._prepare_and_commit_gym_checkpoint(
+                        "checkpoint-prefix-fragment-failure",
+                        tmp_path,
+                    )
+                )
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert first.commit_components == [
+            ["responses_api_agents", "resources_servers"]
+        ]
+        assert second.commit_components == [
+            ["responses_api_agents", "resources_servers"],
+            ["responses_api_models"],
+        ]
+        assert first.abort_checkpoint_ids == ["checkpoint-prefix-fragment-failure"]
+        assert second.abort_checkpoint_ids == ["checkpoint-prefix-fragment-failure"]
+        assert actor._generation_checkpoint_id is None
+        assert actor._gym_checkpoint_rollout_permitted.is_set()
 
     def test_sharded_gym_resume_failure_keeps_admission_closed(self, tmp_path: Path):
         actor = self._actor(tmp_path)
@@ -2870,6 +3034,29 @@ class TestPeriodicRolloutCheckpoint:
         assert second.resume_components == [
             ["responses_api_agents", "resources_servers"]
         ]
+        assert actor._gym_checkpoint_rollout_permitted.is_set()
+
+    def test_sharded_prefix_restore_resumes_model_on_every_shard(
+        self, tmp_path: Path
+    ) -> None:
+        actor = self._actor(tmp_path)
+        actor._generation_prefix_cuts_enabled = True
+        events: list[str] = []
+        first = _FakeGymCheckpointActor(events)
+        second = _FakeGymCheckpointActor(events)
+        actor._env_handles = {
+            "nemo_gym": NemoGymShardSet(
+                handles={"first": [first], "second": [second]},
+            )
+        }
+
+        try:
+            asyncio.run(actor._release_restored_gym_checkpoint("restore-sharded"))
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert first.resume_components == [None]
+        assert second.resume_components == [None]
         assert actor._gym_checkpoint_rollout_permitted.is_set()
 
     def test_generation_prefix_cut_prepare_failure_resumes_engine(

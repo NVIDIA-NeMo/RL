@@ -1006,7 +1006,7 @@ class TestSetup:
         ):
             validate_single_controller_config(mc)
 
-    def test_prefix_checkpointing_rejects_multiple_gym_shards_before_setup(self):
+    def test_prefix_checkpointing_accepts_multiple_single_replica_gym_shards(self):
         mc = _make_master_config(
             env={
                 "should_use_nemo_gym": True,
@@ -1027,11 +1027,7 @@ class TestSetup:
             },
         )
 
-        with pytest.raises(
-            NotImplementedError,
-            match="aggregate every policy proxy's generation-cut proof",
-        ):
-            validate_single_controller_config(mc)
+        validate_single_controller_config(mc)
 
     def test_gym_checkpointing_accepts_one_explicit_shard(self):
         mc = _make_master_config(

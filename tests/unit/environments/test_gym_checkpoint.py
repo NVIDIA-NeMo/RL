@@ -634,6 +634,21 @@ def test_prefix_recovery_requires_generation_cut_lineage_capability() -> None:
         )
 
     model.features.append("generation_cut_lineage_v1")
+    with pytest.raises(RuntimeError, match="peer cut indexes"):
+        GymCheckpointTopology.from_discovered(
+            [
+                GymDiscoveredParticipant(
+                    participant=model.participant("policy-route"),
+                    capabilities=model,
+                ),
+                GymDiscoveredParticipant(
+                    participant=agent.participant("agent-route"),
+                    capabilities=agent,
+                ),
+            ]
+        ).validate_turn_recovery_capabilities(generation_prefix_cuts_enabled=True)
+
+    model.features.append("generation_cut_index_union_v1")
     GymCheckpointTopology.from_discovered(
         [
             GymDiscoveredParticipant(
