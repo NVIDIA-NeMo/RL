@@ -3973,15 +3973,26 @@ def async_ppo_train(
                 # PPO-arm restrictions that would silently mis-train on
                 # multi-trace batches — fail loud instead (see multi_trace.md).
                 if has_multi_trace_rollouts:
-                    if master_config.value.get("swe_privileged_critic", {}).get(
+                    # SWE privileged critic + multi-trace IS supported on the
+                    # token-level path: the reference-block builder and
+                    # remap_by_response_mask are strictly per-row (a subagent
+                    # trace is just another row naming the same instance, so it
+                    # gets the same byte-identical block), and the augmented
+                    # batch is row-padded to the trace batch right after it is
+                    # built (see the value-forward step). Mirrors the stage-B
+                    # lift in critic_pretrain.py. turn_gae + multi-trace is
+                    # rejected at the padding site; the MATH privileged critic
+                    # stays rejected (its prompt/response split is unverified
+                    # under multi-trace).
+                    if (master_config.value.get("privileged_critic") or {}).get(
                         "enabled"
-                    ) or (
-                        master_config.value.get("privileged_critic") or {}
-                    ).get("enabled"):
+                    ):
                         raise NotImplementedError(
-                            "Multi-trace rollouts are not supported with a "
-                            "privileged critic (the reference-block remap assumes "
-                            "one trace per rollout)."
+                            "Multi-trace rollouts are not supported with the "
+                            "math privileged critic (its prompt/response split "
+                            "is unverified for multi-trace rows). The SWE "
+                            "privileged critic (value.swe_privileged_critic) is "
+                            "supported."
                         )
                     if master_config.ppo["adv_estimator"].get("residual_baseline"):
                         raise NotImplementedError(
@@ -4244,6 +4255,31 @@ def async_ppo_train(
                             ],
                         )
                     if critic_batch is not None:
+                        # Multi-trace: train_data was row-padded (dup of row 0,
+                        # sample_mask 0) for DP/mbs divisibility AFTER
+                        # repeated_batch was frozen, so the augmented batch —
+                        # built from repeated_batch — is short by exactly those
+                        # rows. Pad it identically: every downstream consumer
+                        # (remap in both directions, the sample_mask copy, and
+                        # value_model.train with gbs = padded row count) needs
+                        # row-for-row alignment with train_data, and duplicating
+                        # row 0 on BOTH sides keeps the per-row response-token
+                        # counts equal, which remap_by_response_mask asserts.
+                        _n_aug = critic_batch["input_ids"].shape[0]
+                        _n_train = train_data["input_ids"].shape[0]
+                        if _n_train != _n_aug:
+                            assert multi_trace and _n_train > _n_aug, (
+                                f"augmented critic batch has {_n_aug} rows vs "
+                                f"{_n_train} train rows outside multi-trace padding"
+                            )
+                            _pad_idx = torch.zeros(
+                                _n_train - _n_aug, dtype=torch.long
+                            )
+                            for _k in ("input_ids", "input_lengths", "token_mask"):
+                                critic_batch[_k] = torch.cat(
+                                    [critic_batch[_k], critic_batch[_k][_pad_idx]],
+                                    dim=0,
+                                )
                         vals_aug = value_model.get_values(critic_batch)[
                             "values"
                         ].squeeze(-1)
