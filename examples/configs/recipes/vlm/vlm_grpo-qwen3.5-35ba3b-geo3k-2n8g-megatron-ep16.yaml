@@ -13,7 +13,7 @@ policy:
   train_global_batch_size: 512
   logprob_batch_size: 1
   max_total_sequence_length: 3072
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
   dynamic_batching:
     enabled: false

@@ -54,7 +54,7 @@ simple_policy_config = {
             "eps": 1e-8,
         },
     },
-    "dtensor_cfg": {
+    "automodel_cfg": {
         "enabled": True,
         "cpu_offload": False,
         "sequence_parallel": False,
@@ -129,8 +129,8 @@ def policy(cluster, tokenizer, request):
     """Initialize the policy with dtensor."""
     config = {
         **simple_policy_config,
-        "dtensor_cfg": {
-            **simple_policy_config["dtensor_cfg"],
+        "automodel_cfg": {
+            **simple_policy_config["automodel_cfg"],
             "checkpoint": {
                 "model_save_format": "torch_save",
                 "save_consolidated": "false",

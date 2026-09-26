@@ -2,7 +2,7 @@ defaults: ../../grpo_math_1B.yaml
 # Nano v3.5 (NemotronH + MTP) DAPO-512 on the automodel (DTensor v2) backend.
 # The checkpoint's mtp.* tensors / num_nextn_predict_layers=1 are ignored
 # end-to-end with no code changes, provided:
-#   - dtensor_cfg.automodel_kwargs.force_hf is NOT set
+#   - automodel_cfg.automodel_kwargs.force_hf is NOT set
 #   - generation speculative_config is NOT set
 #   - Automodel stays pinned at 24b47e85 (1f13c9aa+ auto-builds MTP)
 # moe_parallelizer.ignore_router_for_ac is required with activation
@@ -59,7 +59,7 @@ policy:
       total_iters: 10000000000
   - milestones:
     - 10
-  dtensor_cfg:
+  automodel_cfg:
     expert_parallel_size: 8
     activation_checkpointing: true
     moe_parallelizer:

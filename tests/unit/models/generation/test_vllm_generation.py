@@ -220,7 +220,7 @@ basic_dtensor_test_config: PolicyConfig = {
             "eps": 1e-8,
         },
     },
-    "dtensor_cfg": {
+    "automodel_cfg": {
         "enabled": True,
         "checkpoint": {
             "model_save_format": "safetensors",
@@ -1615,7 +1615,7 @@ def get_basic_megatron_test_config(
         "logprob_batch_size": 2,
         "precision": precision,
         "offload_optimizer_for_logprob": False,
-        "dtensor_cfg": {
+        "automodel_cfg": {
             "enabled": False,  # Disabled for Megatron tests
         },
         "dynamic_batching": {
@@ -2461,9 +2461,9 @@ async def test_vllm_generation_with_hf_training_colocated(
     # Create Policy
     print("Creating DTensor policy...")
     dtensor_config = deepcopy(basic_dtensor_test_config)
-    dtensor_config["dtensor_cfg"]["cpu_offload"] = cpu_offload
-    dtensor_config["dtensor_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
-    dtensor_config["dtensor_cfg"]["lora_cfg"]["enabled"] = enable_lora
+    dtensor_config["automodel_cfg"]["cpu_offload"] = cpu_offload
+    dtensor_config["automodel_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
+    dtensor_config["automodel_cfg"]["lora_cfg"]["enabled"] = enable_lora
     dtensor_config["train_global_batch_size"] = 4
     lm_policy = Policy(cluster, dtensor_config, tokenizer)
 
@@ -2537,10 +2537,10 @@ async def test_vllm_generation_with_hf_training_non_colocated(
     print("Creating DTensor policy...")
     dtensor_config = deepcopy(basic_dtensor_test_config)
     dtensor_config["generation"]["colocated"]["enabled"] = False
-    dtensor_config["dtensor_cfg"]["cpu_offload"] = cpu_offload
+    dtensor_config["automodel_cfg"]["cpu_offload"] = cpu_offload
     dtensor_config["train_global_batch_size"] = 4
-    dtensor_config["dtensor_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
-    dtensor_config["dtensor_cfg"]["lora_cfg"]["enabled"] = enable_lora
+    dtensor_config["automodel_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
+    dtensor_config["automodel_cfg"]["lora_cfg"]["enabled"] = enable_lora
     lm_policy = Policy(policy_cluster_separate, dtensor_config, tokenizer)
 
     # Refit

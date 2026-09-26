@@ -43,7 +43,7 @@ Key knobs in the config:
 | Field | Value |
 |---|---|
 | `policy.model_name` | path to the Nemotron-Omni HF checkpoint |
-| `policy.dtensor_cfg.expert_parallel_size` | 8 |
+| `policy.automodel_cfg.expert_parallel_size` | 8 |
 | `policy.generation.vllm_cfg.tensor_parallel_size` | 8 |
 | `policy.max_total_sequence_length` | 8192 |
 | `data.train.dataset_name` | `clevr-cogent` (split `train`) |

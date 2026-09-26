@@ -95,7 +95,7 @@ def create_dtensor_config(
                 },
             },
         },
-        "dtensor_cfg": {
+        "automodel_cfg": {
             "enabled": True,
             "cpu_offload": False,
             "sequence_parallel": False,
@@ -666,7 +666,7 @@ def test_dtensor_dp_replicate_size_sets_batching_dp(
     cluster = create_mock_cluster(world_size=8)
     tokenizer = create_mock_tokenizer()
     config = create_dtensor_config(tiny_llama_model_path, tp=1)
-    config["dtensor_cfg"]["dp_replicate_size"] = 2
+    config["automodel_cfg"]["dp_replicate_size"] = 2
 
     policy = Policy(cluster=cluster, config=config, tokenizer=tokenizer)
 
@@ -690,7 +690,7 @@ def test_dtensor_hsdp_dispatches_distinct_batches(
     cluster = create_mock_cluster(world_size=8)
     tokenizer = create_mock_tokenizer()
     config = create_dtensor_config(tiny_llama_model_path, tp=1)
-    config["dtensor_cfg"]["dp_replicate_size"] = 2  # HSDP enabled
+    config["automodel_cfg"]["dp_replicate_size"] = 2  # HSDP enabled
 
     policy = Policy(cluster=cluster, config=config, tokenizer=tokenizer)
 

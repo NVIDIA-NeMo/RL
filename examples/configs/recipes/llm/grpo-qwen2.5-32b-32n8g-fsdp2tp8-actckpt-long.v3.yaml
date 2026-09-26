@@ -11,7 +11,7 @@ policy:
     name: Qwen/Qwen2.5-32B
   train_micro_batch_size: 1
   max_total_sequence_length: 16384
-  dtensor_cfg:
+  automodel_cfg:
     activation_checkpointing: true
     tensor_parallel_size: 8
   dynamic_batching:

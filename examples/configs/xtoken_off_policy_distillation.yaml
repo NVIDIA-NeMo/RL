@@ -85,7 +85,7 @@ policy:
   precision: "bfloat16"
   logprob_chunk_size: null
   offload_optimizer_for_logprob: true
-  dtensor_cfg:
+  automodel_cfg:
     enabled: true
     checkpoint:
       model_save_format: "safetensors"
@@ -158,7 +158,7 @@ teachers:
     precision: "bfloat16"
     logprob_chunk_size: null
     offload_optimizer_for_logprob: false
-    dtensor_cfg:
+    automodel_cfg:
       enabled: true
       checkpoint:
         model_save_format: "safetensors"
@@ -212,7 +212,7 @@ teachers:
   #   precision: "bfloat16"
   #   logprob_chunk_size: null
   #   offload_optimizer_for_logprob: false
-  #   dtensor_cfg:
+  #   automodel_cfg:
   #     enabled: true
   #     checkpoint:
   #       model_save_format: "safetensors"

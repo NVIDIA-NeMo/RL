@@ -149,7 +149,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         cp_size = 1
 
         megatron_enable = bool(config.get("megatron_cfg", {}).get("enabled", False))
-        dtensor_enable = bool(config.get("dtensor_cfg", {}).get("enabled", False))
+        dtensor_enable = bool(config.get("automodel_cfg", {}).get("enabled", False))
         # Normalize in place: every downstream reader (workers, setup, train)
         # accesses draft config by attribute, so a hand-built PolicyConfig has
         # to be validated here rather than only inside MasterConfig.
@@ -162,7 +162,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         if megatron_enable and dtensor_enable:
             raise ValueError(
                 "Configure either Megatron (policy.megatron_cfg.enabled=true) or "
-                "DTensor (policy.dtensor_cfg.enabled=true), not both."
+                "DTensor (policy.automodel_cfg.enabled=true), not both."
             )
         if nvfp4_pertoken_rollout.get("enabled", False) and not megatron_enable:
             raise ValueError(
@@ -259,7 +259,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             if not dtensor_enable:
                 raise ValueError(
                     "Please either set policy.megatron_cfg.enabled=true to use Megatron training backend "
-                    "or set policy.dtensor_cfg.enabled=true to use DTensor training backend."
+                    "or set policy.automodel_cfg.enabled=true to use DTensor training backend."
                 )
 
             worker_builder_cls_fqn = resolve_policy_worker_cls(
@@ -272,10 +272,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     "if you are running a custom container or baremetal, you may need to set this variable manually. Example: export TORCH_CUDA_ARCH_LIST='9.0 10.0'"
                 )
 
-            tp_size = config["dtensor_cfg"]["tensor_parallel_size"]
-            cp_size = config["dtensor_cfg"]["context_parallel_size"]
+            tp_size = config["automodel_cfg"]["tensor_parallel_size"]
+            cp_size = config["automodel_cfg"]["context_parallel_size"]
 
-            env_vars = config["dtensor_cfg"].get("env_vars", {})
+            env_vars = config["automodel_cfg"].get("env_vars", {})
 
         # If a worker extension class is provided, use it instead of the default worker builder class
         if extension_fqn is not None:
@@ -1379,7 +1379,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         DTensor checkpoint resources are configured when the Policy is
         constructed. ``weights_path`` selects the destination for each save.
         """
-        if bool(self.cfg.get("dtensor_cfg", {}).get("enabled", False)):
+        if bool(self.cfg.get("automodel_cfg", {}).get("enabled", False)):
             futures = self.worker_group.run_all_workers_single_data(
                 "save_checkpoint",
                 weights_path=weights_path,
