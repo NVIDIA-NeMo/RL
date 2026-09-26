@@ -28,7 +28,10 @@ import pytest
 import torch
 
 from nemo_rl.algorithms.x_token.token_aligner import AlignmentBatch, TokenAligner
-from nemo_rl.data.cross_tokenizer_collate import CrossTokenizerCollator
+from nemo_rl.data.cross_tokenizer_collate import (
+    CrossTokenizerCollator,
+    CrossTokenizerCollatorConfig,
+)
 
 # ---------------------------------------------------------------------------
 # Fake tokenizer — deterministic, no HF dependency.
@@ -160,6 +163,7 @@ class TestCollatorOutputKeys:
         teacher_tok = FakeTokenizer(vocab_size=24, prefix="t")
         aligner = _fake_aligner(b=2, t_s=8, t_t=8)
         collator = CrossTokenizerCollator(
+            config=CrossTokenizerCollatorConfig(),
             student_tokenizer=student_tok,
             teacher_tokenizers=[teacher_tok],
             aligners=[aligner],
@@ -179,6 +183,7 @@ class TestCollatorOutputKeys:
             ValueError, match="drop_first_assistant_chunk_kl_by_teacher"
         ):
             CrossTokenizerCollator(
+                config=CrossTokenizerCollatorConfig(),
                 student_tokenizer=student_tok,
                 teacher_tokenizers=[teacher_tok],
                 aligners=[aligner],
@@ -194,6 +199,7 @@ class TestCollatorShapes:
         teacher_tok = FakeTokenizer(vocab_size=24, prefix="t")
         aligner = _fake_aligner(b=2, t_s=8, t_t=16, max_pairs=3)
         collator = CrossTokenizerCollator(
+            config=CrossTokenizerCollatorConfig(),
             student_tokenizer=student_tok,
             teacher_tokenizers=[teacher_tok],
             aligners=[aligner],
@@ -216,6 +222,7 @@ class TestCollatorShapes:
         teacher_tok = FakeTokenizer(vocab_size=24, prefix="t")
         aligner = _fake_aligner(b=1, t_s=8, t_t=8)
         collator = CrossTokenizerCollator(
+            config=CrossTokenizerCollatorConfig(),
             student_tokenizer=student_tok,
             teacher_tokenizers=[teacher_tok],
             aligners=[aligner],
@@ -236,6 +243,7 @@ class TestCollatorTruncation:
         ctx = 4
         aligner = _fake_aligner(b=1, t_s=ctx, t_t=ctx)
         collator = CrossTokenizerCollator(
+            config=CrossTokenizerCollatorConfig(),
             student_tokenizer=student_tok,
             teacher_tokenizers=[teacher_tok],
             aligners=[aligner],
@@ -259,6 +267,7 @@ class TestCollatorSequenceDivisibility:
         # Verify both student and teacher pad independently.
         aligner = _fake_aligner(b=1, t_s=16, t_t=12)
         collator = CrossTokenizerCollator(
+            config=CrossTokenizerCollatorConfig(),
             student_tokenizer=student_tok,
             teacher_tokenizers=[teacher_tok],
             aligners=[aligner],
@@ -286,6 +295,7 @@ class TestCollatorPadTokenFallback:
         teacher_tok = FakeTokenizer(vocab_size=24, prefix="t")
         aligner = _fake_aligner(b=1, t_s=4, t_t=4)
         _ = CrossTokenizerCollator(
+            config=CrossTokenizerCollatorConfig(),
             student_tokenizer=student_tok,
             teacher_tokenizers=[teacher_tok],
             aligners=[aligner],
@@ -305,6 +315,7 @@ class TestCollatorReadsMessageLog:
         teacher_tok = FakeTokenizer(vocab_size=24, prefix="t")
         aligner = _fake_aligner(b=1, t_s=8, t_t=8)
         collator = CrossTokenizerCollator(
+            config=CrossTokenizerCollatorConfig(),
             student_tokenizer=student_tok,
             teacher_tokenizers=[teacher_tok],
             aligners=[aligner],
@@ -390,7 +401,7 @@ def _chat_aligner(student_tok, teacher_tok) -> TokenAligner:
 
 
 class TestCollatorChatMode:
-    def test_teacher_scoring_masks_only_assistant_content(self):
+    def test_teacher_scoring_masks_assistant_content_and_terminators(self):
         student_tok = FakeChatTokenizer(
             {"system": ("[S]", ""), "user": ("[U]", ""), "assistant": ("[A]", "[E]")}
         )
@@ -410,7 +421,7 @@ class TestCollatorChatMode:
             drop_first_assistant_chunk_kl_by_teacher=[False],
             make_seq_div_by_student=8,
             make_seq_div_by_teachers=[16],
-            mode="chat",
+            config=CrossTokenizerCollatorConfig(mode="chat"),
         )
         conversations = [
             [
@@ -434,7 +445,7 @@ class TestCollatorChatMode:
         )
 
         # Each model retains the full conversation as context, but scores only
-        # assistant content at its own token positions. The different templates
+        # assistant content and EOT at its own token positions. Different templates
         # prevent accidentally reusing the student's mask for the teacher.
         assert out["input_ids"].shape != out["teacher_0_input_ids"].shape
         for prefix, tokenizer in (("", student_tok), ("teacher_0_", teacher_tok)):
@@ -447,7 +458,7 @@ class TestCollatorChatMode:
                 for message in messages:
                     if message["role"] == "assistant":
                         start = rendered.index(message["content"])
-                        expected_mask[start : start + len(message["content"])] = 1
+                        expected_mask[start : start + len(message["content"]) + 1] = 1
 
                 assert out[f"{prefix}input_lengths"][i].item() == length
                 assert ids[:length].tolist() == [ord(char) for char in rendered]
@@ -473,7 +484,7 @@ class TestCollatorChatMode:
             ctx_length_student=64,
             ctx_length_teachers=[64],
             drop_first_assistant_chunk_kl_by_teacher=[False],
-            mode="chat",
+            config=CrossTokenizerCollatorConfig(mode="chat"),
         )
         datum = {
             "loss_multiplier": 1.0,
@@ -487,7 +498,7 @@ class TestCollatorChatMode:
 
         # student render "[U]hi[A]Hello world[E]" -> assistant content chars [8,19)
         tok_mask = out["token_mask"][0].tolist()
-        assert [p for p, v in enumerate(tok_mask) if v == 1] == list(range(8, 19))
+        assert [p for p, v in enumerate(tok_mask) if v == 1] == list(range(8, 20))
 
         # Alignment covers assistant content + the EOT token (char 19), scaffold
         # stays unaligned (chunk_id == -1).
@@ -505,7 +516,7 @@ class TestCollatorChatMode:
             ctx_length_student=32,
             ctx_length_teachers=[32],
             drop_first_assistant_chunk_kl_by_teacher=[False],
-            mode="chat",
+            config=CrossTokenizerCollatorConfig(mode="chat"),
         )
         out = collator(
             [
@@ -543,7 +554,7 @@ class TestCollatorChatMode:
             ctx_length_student=64,
             ctx_length_teachers=[64, 64, 64],
             drop_first_assistant_chunk_kl_by_teacher=[False, False, True],
-            mode="chat",
+            config=CrossTokenizerCollatorConfig(mode="chat"),
         )
         datum = {
             "loss_multiplier": 1.0,
@@ -557,13 +568,13 @@ class TestCollatorChatMode:
         with (
             patch.object(
                 aligner_0,
-                "align_one_offset_per_asst",
-                wraps=aligner_0.align_one_offset_per_asst,
+                "align_chat",
+                wraps=aligner_0.align_chat,
             ) as align_0,
             patch.object(
                 aligner_2,
-                "align_one_offset_per_asst",
-                wraps=aligner_2.align_one_offset_per_asst,
+                "align_chat",
+                wraps=aligner_2.align_chat,
             ) as align_2,
         ):
             out = collator([datum])
@@ -587,7 +598,9 @@ class TestCollatorChatMode:
                 ctx_length_student=32,
                 ctx_length_teachers=[32],
                 drop_first_assistant_chunk_kl_by_teacher=[False],
-                mode="chat",
-                include_thinking_in_loss=True,
-                native_thinking_alignment=True,
+                config=CrossTokenizerCollatorConfig(
+                    mode="chat",
+                    include_thinking_in_loss=True,
+                    native_thinking_alignment=True,
+                ),
             )
