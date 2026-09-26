@@ -136,7 +136,7 @@ def _create_value_test_config(
             "reward_model_type": "regression",
         },
         "megatron_cfg": {"enabled": False},
-        "dtensor_cfg": {
+        "automodel_cfg": {
             "enabled": True,
             "checkpoint": {
                 "model_save_format": "safetensors",
@@ -239,7 +239,7 @@ def _apply_config_updates(config: ValueConfig, config_updates: dict) -> None:
         if k == "precision":
             config["precision"] = v
         elif k == "sequence_parallel":
-            config["dtensor_cfg"]["sequence_parallel"] = v
+            config["automodel_cfg"]["sequence_parallel"] = v
         elif k == "dynamic_batching":
             mbt = config["max_total_sequence_length"] * config["train_micro_batch_size"]
             lbt = config["max_total_sequence_length"] * config["logprob_batch_size"]

@@ -536,7 +536,7 @@ def test_rollout_recovery_functional_config_resolves_to_runtime_contract(
     )
     overrides = [
         "policy.model_name=Qwen/Qwen3-0.6B",
-        "policy.dtensor_cfg.enabled=false",
+        "policy.automodel_cfg.enabled=false",
         "policy.megatron_cfg.enabled=true",
         "policy.megatron_cfg.tensor_model_parallel_size=1",
         "policy.megatron_cfg.pipeline_model_parallel_size=1",

@@ -173,7 +173,7 @@ def validate_fp32_lm_head_config(
         raise ValueError(
             "policy.generation.vllm_cfg.fp32_lm_head=true is only supported "
             "with the Megatron trainer because DTensor has no matching "
-            "policy.dtensor_cfg fp32 LM-head implementation."
+            "policy.automodel_cfg fp32 LM-head implementation."
         )
     if megatron_enabled and megatron_fp32 != vllm_fp32:
         raise ValueError(

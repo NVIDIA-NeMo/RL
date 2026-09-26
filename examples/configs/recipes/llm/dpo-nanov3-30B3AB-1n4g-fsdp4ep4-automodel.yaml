@@ -1,6 +1,6 @@
 defaults: ./dpo-nanov3-30B3AB-1n8g-fsdp8ep8-automodel.v2.yaml
 policy:
-  dtensor_cfg:
+  automodel_cfg:
     expert_parallel_size: 4
     automodel_kwargs:
       backend:

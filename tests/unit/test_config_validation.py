@@ -345,7 +345,7 @@ def test_all_config_no_tp_size_accuracy_issues(config_file):
     if config_dict["policy"]["megatron_cfg"]["enabled"]:
         tp_size = config_dict["policy"]["megatron_cfg"]["tensor_model_parallel_size"]
     else:
-        tp_size = config_dict["policy"]["dtensor_cfg"]["tensor_parallel_size"]
+        tp_size = config_dict["policy"]["automodel_cfg"]["tensor_parallel_size"]
 
     train_micro_bs = config_dict["policy"]["train_micro_batch_size"]
     logprob_bs = config_dict["policy"]["logprob_batch_size"]

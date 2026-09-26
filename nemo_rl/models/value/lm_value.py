@@ -75,11 +75,11 @@ class Value(ValueInterface):
 
         # Value models use the same backend configuration as policy models
         megatron_enable = bool(config.get("megatron_cfg", {}).get("enabled", False))
-        dtensor_enable = bool(config.get("dtensor_cfg", {}).get("enabled", False))
+        dtensor_enable = bool(config.get("automodel_cfg", {}).get("enabled", False))
         if megatron_enable and dtensor_enable:
             raise ValueError(
                 "Configure either Megatron (value.megatron_cfg.enabled=true) or "
-                "DTensor (value.dtensor_cfg.enabled=true), not both."
+                "DTensor (value.automodel_cfg.enabled=true), not both."
             )
 
         if megatron_enable:
@@ -95,19 +95,19 @@ class Value(ValueInterface):
         else:
             if not dtensor_enable:
                 raise ValueError(
-                    "Please set value.dtensor_cfg.enabled=true to use DTensor "
+                    "Please set value.automodel_cfg.enabled=true to use DTensor "
                     "training backend (or value.megatron_cfg.enabled=true for "
                     "Megatron-Core)."
                 )
 
             worker_builder_cls = "nemo_rl.models.value.workers.dtensor_value_worker_v2.DTensorValueWorkerV2"
 
-            tp_size = config["dtensor_cfg"]["tensor_parallel_size"]
+            tp_size = config["automodel_cfg"]["tensor_parallel_size"]
             # DTensor V2 does not pipeline-parallel; pp_size stays at the
             # default of 1 initialised above.
-            cp_size = config["dtensor_cfg"]["context_parallel_size"]
+            cp_size = config["automodel_cfg"]["context_parallel_size"]
 
-            env_vars = config["dtensor_cfg"].get("env_vars", {})
+            env_vars = config["automodel_cfg"].get("env_vars", {})
 
         # Validate world_size compatibility with parallelism configuration
         model_parallel_size = pp_size * cp_size * tp_size
