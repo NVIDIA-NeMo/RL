@@ -23,7 +23,7 @@ For the full list of supported models, see
 - **[Nemotron 3 Ultra](nemotron-3-ultra.md)** — RLVR, teacher training, and
   MOPD stages on GB200 NVL72 hardware.
 - **[Nemotron 3.5 Lightning](nemotron-3.5-lightning.md)** — RLVR with NeMo Gym
-  on GB200, plus a compact 4-node DAPO math recipe on the DTensor (AutoModel)
+  on GB200, plus a compact 4-node DAPO math recipe on the Automodel
   backend.
 
 ```{toctree}

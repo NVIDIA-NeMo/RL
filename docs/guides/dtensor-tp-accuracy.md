@@ -1,12 +1,12 @@
-# DTensor Tensor Parallel Accuracy Issue
+# Automodel Tensor Parallel Accuracy Issue
 
 During reinforcement learning (RL) post-training, maintaining accuracy is both **critical and challenging**. Minor numerical deviations can propagate and amplify across policy updates, ultimately distorting reward signals and affecting convergence. Consequently, understanding and mitigating accuracy issues is central to ensuring consistent and reliable training behavior in large-scale distributed RL settings.
 
-## Observed Accuracy Issues Under Tensor Parallelism with DTensor Backend
+## Observed Accuracy Issues Under Tensor Parallelism with the Automodel Backend
 
 During our development, we identified that the **tensor parallel (TP)** strategy can be a significant factor contributing to accuracy problems.
 
-We have encountered several accuracy issues related to TP in **DTensor**, including:
+We have encountered several accuracy issues related to TP in **Automodel**, including:
 
 1. **For policy models**: We observed severe `token_mult_prob_error` spikes when TP was enabled during post-training of a Qwen3 dense model (e.g., [Qwen/Qwen3-4B-Instruct-2507 · Hugging Face](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507)), indicating a significant difference between the training and inference engines.
 2. **For reward models**: The reward model exhibited large discrepancies under different TP configurations.
@@ -110,7 +110,7 @@ After aligning `train_micro_batch_size` and `logprob_batch_size` so that the sam
 
 ### Recommended Solutions
 
-When using DTensor with TP > 1, or when `probs_ratio != 1` is observed in an on-policy setting, the following mitigation strategies are recommended to restore numerical consistency and stabilize training:
+When using Automodel with TP > 1, or when `probs_ratio != 1` is observed in an on-policy setting, the following mitigation strategies are recommended to restore numerical consistency and stabilize training:
 
 - **Align micro-batch sizes**:
   Configure `train_micro_batch_size` and `logprob_batch_size` to be exactly equal so that both the training forward pass and the logprob evaluation traverse identical kernel configurations and batching patterns. This alignment minimizes batch-variant behavior in underlying kernels and ensures that `current_logprobs` and `prev_logprobs` are computed under the same numerical conditions, which in turn drives `probs_ratio` back toward 1.
