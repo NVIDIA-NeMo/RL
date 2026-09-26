@@ -52,7 +52,6 @@ policy:
   - milestones:
     - 10
   dtensor_cfg:
-    context_parallel_size: 1
     expert_parallel_size: 64
     activation_checkpointing: true
     env_vars:
