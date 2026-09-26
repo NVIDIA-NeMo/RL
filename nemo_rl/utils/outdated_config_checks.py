@@ -50,10 +50,18 @@ def _train_backend_configs(
 def reject_outdated_dtensor_v2_key(config: dict[str, Any]) -> None:
     """Fail when a config still carries the removed dtensor_cfg._v2 key.
 
+    Blocks that select Megatron are skipped: their dtensor_cfg is inert, and before this
+    module existed the check lived on the DTensor branch of Policy.__init__ and never saw
+    them.
+
     Args:
         config: The config as the user wrote it, resolved to plain dicts.
     """
     for path, backend_config in _train_backend_configs(config):
+        megatron_cfg = backend_config.get("megatron_cfg")
+        if isinstance(megatron_cfg, dict) and megatron_cfg.get("enabled"):
+            continue
+
         dtensor_cfg = backend_config.get("dtensor_cfg")
         if not isinstance(dtensor_cfg, dict) or "_v2" not in dtensor_cfg:
             continue

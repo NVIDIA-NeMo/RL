@@ -94,6 +94,30 @@ def test_each_teacher_is_checked():
         )
 
 
+def test_megatron_block_is_skipped():
+    """A Megatron run's dtensor_cfg is inert, so a stale _v2 there is not its problem."""
+    check_outdated_config(
+        {
+            "policy": {
+                "megatron_cfg": {"enabled": True},
+                "dtensor_cfg": {"enabled": False, "_v2": False},
+            }
+        }
+    )
+
+
+def test_megatron_disabled_still_checks():
+    with pytest.raises(ValueError, match=r"policy\.dtensor_cfg\._v2"):
+        check_outdated_config(
+            {
+                "policy": {
+                    "megatron_cfg": {"enabled": False},
+                    "dtensor_cfg": {"enabled": True, "_v2": True},
+                }
+            }
+        )
+
+
 def test_reward_model_env_is_checked():
     with pytest.raises(ValueError, match=r"env\.reward_model\.dtensor_cfg\._v2"):
         check_outdated_config({"env": {"reward_model": {"dtensor_cfg": {"_v2": True}}}})
