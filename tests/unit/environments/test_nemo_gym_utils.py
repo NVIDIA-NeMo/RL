@@ -39,10 +39,12 @@ from nemo_rl.environments.nemo_gym import (
     build_nemo_gym_config,
     get_nemo_gym_uv_cache_dir,
     get_nemo_gym_venv_dir,
+    merge_nemo_gym_checkpoint_topologies,
     sole_nemo_gym_checkpoint_actor,
     spinup_nemo_gym_actor,
 )
 from nemo_rl.environments.nemo_gym_shards import ShardSetupError
+from nemo_rl.environments.gym_checkpoint import GymCheckpointTopology
 
 
 @pytest.mark.parametrize(
@@ -783,6 +785,109 @@ def test_checkpoint_actor_rejects_sharded_or_replicated_gym():
         match="participant checkpointing currently supports exactly one",
     ):
         sole_nemo_gym_checkpoint_actor(shard_set)
+
+
+def _checkpoint_topology(*participants):
+    return GymCheckpointTopology.model_validate(
+        {
+            "participants": [
+                {
+                    "participant": {
+                        "server_name": server_name,
+                        "component": component,
+                        "participant_name": participant_name,
+                    },
+                    "schema_version": 1,
+                    "admission_states": ["accepting"],
+                    "checkpoint_mode": "export_restore",
+                    "concurrency_contract": "stateless",
+                    "multi_process": {
+                        "mode": "single_worker",
+                        "num_workers": 1,
+                    },
+                    "instance_role": "policy"
+                    if component == "responses_api_models"
+                    else None,
+                    "features": [],
+                }
+                for server_name, component, participant_name in participants
+            ]
+        }
+    )
+
+
+def test_checkpoint_topology_merge_deduplicates_shared_models():
+    policy = ("policy", "responses_api_models", "policy")
+    merged = merge_nemo_gym_checkpoint_topologies(
+        {
+            "first": _checkpoint_topology(
+                policy,
+                ("agent-a", "responses_api_agents", "agent-a"),
+            ),
+            "second": _checkpoint_topology(
+                policy,
+                ("agent-b", "responses_api_agents", "agent-b"),
+            ),
+        }
+    )
+
+    assert [
+        (
+            contract.participant.component,
+            contract.participant.participant_name,
+        )
+        for contract in merged.participants
+    ] == [
+        ("responses_api_agents", "agent-a"),
+        ("responses_api_agents", "agent-b"),
+        ("responses_api_models", "policy"),
+    ]
+    assert sorted(merged.participant_owners.values()) == [
+        ["first"],
+        ["first", "second"],
+        ["second"],
+    ]
+
+
+def test_checkpoint_topology_merge_rejects_duplicate_local_participants():
+    duplicated = ("agent", "responses_api_agents", "agent")
+
+    with pytest.raises(ShardSetupError, match="hosted by multiple shards"):
+        merge_nemo_gym_checkpoint_topologies(
+            {
+                "first": _checkpoint_topology(duplicated),
+                "second": _checkpoint_topology(duplicated),
+            }
+        )
+
+
+def test_checkpoint_topology_merge_requires_shared_model_on_every_shard():
+    policy = ("policy", "responses_api_models", "policy")
+
+    with pytest.raises(ShardSetupError, match="every shard to expose the same shared"):
+        merge_nemo_gym_checkpoint_topologies(
+            {
+                "first": _checkpoint_topology(
+                    policy,
+                    ("agent-a", "responses_api_agents", "agent-a"),
+                ),
+                "second": _checkpoint_topology(
+                    ("agent-b", "responses_api_agents", "agent-b")
+                ),
+            }
+        )
+
+
+def test_checkpoint_route_selects_sole_replica_and_stable_directory():
+    first = object()
+    second = object()
+    shard_set = NemoGymShardSet(
+        handles={"first": [first], "second": [second]},
+        route_to_shard={"agent-a": "first", "agent-b": "second"},
+    )
+
+    assert shard_set.checkpoint_handle_for_route("agent-b") is second
+    assert str(shard_set.checkpoint_relative_dir("second")) == "gym-shards/second"
 
 
 def test_build_nemo_gym_actors_spreads_every_replica_onto_its_own_node(
