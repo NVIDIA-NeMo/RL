@@ -134,23 +134,16 @@ class AlignmentBatch:
         pair_valid: ``[B, max_pairs]`` bool. False on padding entries.
         pair_is_correct: ``[B, max_pairs]`` bool. True when canonicalized
             student span text matches canonicalized teacher span text.
-        student_exact_partition_mask: ``[B, T_s]`` bool. True at student
-            tokens that sit on a 1-1 exact-match pair (gold_loss partition).
-        teacher_exact_partition_mask: ``[B, T_t]`` bool. Counterpart.
         student_chunk_id: ``[B, T_s]`` long. Chunk index (= pair index) the
             student token belongs to; ``-1`` if not in any chunk
             (insertion-only pair on student side).
         teacher_chunk_id: ``[B, T_t]`` long. Counterpart.
-        num_chunks: ``[B]`` long. Number of valid chunks in each sample.
     """
 
     pair_valid: torch.Tensor
     pair_is_correct: torch.Tensor
-    student_exact_partition_mask: torch.Tensor
-    teacher_exact_partition_mask: torch.Tensor
     student_chunk_id: torch.Tensor
     teacher_chunk_id: torch.Tensor
-    num_chunks: torch.Tensor
 
 
 class TokenAligner:
@@ -206,8 +199,8 @@ class TokenAligner:
             teacher_offsets: ``[B, T_t, 2]`` counterpart.
             student_attention_mask: optional ``[B, T_s]`` mask (1 = real
                 token, 0 = padding). When given, padded positions are forced
-                to the ``chunk_id = -1`` / partition-``False`` sentinels so
-                tokenizer padding never forms a valid chunk.
+                to ``chunk_id = -1`` so tokenizer padding never forms a
+                valid chunk.
             teacher_attention_mask: optional ``[B, T_t]`` counterpart.
 
         Returns:
@@ -247,12 +240,11 @@ class TokenAligner:
         student_attention_mask: torch.Tensor | None,
         teacher_attention_mask: torch.Tensor | None,
     ) -> None:
-        """Strip tokenizer padding out of the chunk-id / partition tensors.
+        """Strip tokenizer padding out of the chunk-id tensors.
 
         Mutates ``batch`` in place. For every position the attention mask
-        marks as padding, reset ``*_chunk_id`` to ``-1`` and
-        ``*_exact_partition_mask`` to ``False``. Gating per position (rather
-        than trimming a contiguous span) keeps this correct under either
+        marks as padding, reset ``*_chunk_id`` to ``-1``. Gating per position
+        (rather than trimming a contiguous span) keeps this correct under either
         left- or right-padding. A pair whose tokens are entirely padding on
         one side then has size 0 there and is dropped by
         :func:`nemo_rl.algorithms.x_token.loss_utils.valid_chunk_mask`; a pair
@@ -261,11 +253,9 @@ class TokenAligner:
         if student_attention_mask is not None:
             s_pad = student_attention_mask == 0
             batch.student_chunk_id[s_pad] = -1
-            batch.student_exact_partition_mask[s_pad] = False
         if teacher_attention_mask is not None:
             t_pad = teacher_attention_mask == 0
             batch.teacher_chunk_id[t_pad] = -1
-            batch.teacher_exact_partition_mask[t_pad] = False
 
     @staticmethod
     def _pairs_to_batch(
@@ -282,14 +272,10 @@ class TokenAligner:
 
         pair_valid = torch.zeros((b, max_pairs), dtype=torch.bool)
         pair_is_correct = torch.zeros((b, max_pairs), dtype=torch.bool)
-        student_partition = torch.zeros((b, t_s), dtype=torch.bool)
-        teacher_partition = torch.zeros((b, t_t), dtype=torch.bool)
         student_chunk_id = torch.full((b, t_s), -1, dtype=torch.long)
         teacher_chunk_id = torch.full((b, t_t), -1, dtype=torch.long)
-        num_chunks = torch.zeros((b,), dtype=torch.long)
 
         for batch_i, pairs in enumerate(per_sample_pairs):
-            num_chunks[batch_i] = len(pairs)
             for pair_i, pair in enumerate(pairs):
                 if pair.s_start != -1 and pair.s_end != -1:
                     if 0 <= pair.s_start < t_s and 0 < pair.s_end <= t_s:
@@ -299,27 +285,12 @@ class TokenAligner:
                         teacher_chunk_id[batch_i, pair.t_start : pair.t_end] = pair_i
                 pair_valid[batch_i, pair_i] = True
                 pair_is_correct[batch_i, pair_i] = bool(pair.is_correct)
-                # gold_loss partition: tokens on a 1-1 exact-match pair.
-                if (
-                    pair.is_correct
-                    and pair.s_start != -1
-                    and pair.t_start != -1
-                    and (pair.s_end - pair.s_start) == 1
-                    and (pair.t_end - pair.t_start) == 1
-                ):
-                    if 0 <= pair.s_start < t_s:
-                        student_partition[batch_i, pair.s_start] = True
-                    if 0 <= pair.t_start < t_t:
-                        teacher_partition[batch_i, pair.t_start] = True
 
         return AlignmentBatch(
             pair_valid=pair_valid,
             pair_is_correct=pair_is_correct,
-            student_exact_partition_mask=student_partition,
-            teacher_exact_partition_mask=teacher_partition,
             student_chunk_id=student_chunk_id,
             teacher_chunk_id=teacher_chunk_id,
-            num_chunks=num_chunks,
         )
 
     # ------------------------------------------------------------------ #
@@ -745,11 +716,10 @@ def _strings_equal_flexible(s1: str, s2: str, ignore_leading_char_diff: bool) ->
 # When one tokenizer has pad_token_id == eos_token_id (e.g. Llama-3.2 with the
 # collator fallback that sets pad_token = eos_token if undefined), trailing pad
 # positions get role "eos"; the other tokenizer with a separate pad_token_id
-# tags its trailing pads as "pad". Treating these roles as equivalent pairs
-# those positions 1<->1, giving the student KL signal at pad positions.
-# Without this set, role-based pairing silently drops the mismatched roles and
-# the student loses training signal at every trailing pad on the mismatched
-# side.
+# tags its trailing pads as "pad". Pairing these positions 1<->1 avoids
+# emitting a separate orphan pair for each side, which would double their
+# contribution to max_pairs. _drop_padding clears padded chunk ids, so these
+# positions do not contribute to the loss.
 _PAD_EQUIVALENT_ROLES = {"pad", "eos"}
 
 

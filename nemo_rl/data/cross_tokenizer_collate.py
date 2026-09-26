@@ -15,13 +15,16 @@
 
 The collator runs inside DataLoader worker processes. It does:
 
-1. Tokenizes the source text once with the student tokenizer (no chat
-   template, no special handling); this tokenization is shared by all
-   teachers.
+1. Tokenizes the student input once; this tokenization is shared by all
+   teachers. In ``mode="text"``, tokenizes raw text without a chat template.
+   In ``mode="chat"``, renders the student's chat template and identifies
+   assistant content for the loss mask.
 2. For each *cross-tokenizer* teacher, tokenizes with that teacher's
-   tokenizer and calls :class:`TokenAligner.align` to produce a dense-padded
-   :class:`AlignmentBatch` (P-KL, gold_loss, xtoken_loss), emitted under
-   teacher-indexed keys ``teacher_{i}_*`` / ``alignment_{i}_*``.
+   tokenizer and aligns with its :class:`TokenAligner`. Text mode aligns
+   the full text; chat mode renders the teacher's own chat template and
+   aligns assistant messages independently. Teacher scoring masks also
+   select only assistant content in chat mode. Dense-padded alignment and
+   teacher inputs are emitted under ``alignment_{i}_*`` / ``teacher_{i}_*``.
 3. *Same-tokenizer* teachers (``aligners[i] is None``) emit nothing extra —
    their forward reuses the student tokenization, so projection and alignment
    are skipped.
@@ -50,12 +53,14 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 class CrossTokenizerCollator:
     """Tokenize the student once, tokenize+align each teacher, return a flat batch.
 
-    Supports N teachers. The student text is tokenized once and shared; each
-    cross-tokenizer teacher is tokenized with its own tokenizer and aligned
-    with its own :class:`TokenAligner`, emitting teacher-indexed keys
+    Supports N teachers in raw-text or chat mode. Student inputs are tokenized
+    once and shared; each cross-tokenizer teacher uses its own tokenizer and
+    :class:`TokenAligner`, emitting teacher-indexed keys
     (``teacher_{i}_*`` and ``alignment_{i}_*``). A *same-tokenizer* teacher
     (``aligners[i] is None``) emits nothing extra — its forward reuses the
     student tokenization, so projection and alignment are skipped entirely.
+    Chat mode applies each model's chat template, masks loss and teacher
+    scoring to assistant content, and aligns assistant messages separately.
 
     Args:
         student_tokenizer: HF tokenizer matching the student model.
@@ -64,7 +69,8 @@ class CrossTokenizerCollator:
         aligners: Per-teacher :class:`TokenAligner`. ``None`` marks a
             same-tokenizer teacher (no projection / no alignment).
         ctx_length_student: Hard tokenization length cap on the student
-            side (also the padded sequence length of the student tensor).
+            side. Text mode pads to this cap; chat mode pads to the batch's
+            longest tokenization. Sequence-length divisors may add padding.
         ctx_length_teachers: Per-teacher tokenization length caps.
         drop_first_assistant_chunk_kl_by_teacher: Per-teacher flags controlling
             whether chat alignment drops the first content pair in each
@@ -73,6 +79,25 @@ class CrossTokenizerCollator:
         make_seq_div_by_student: Round student sequence length up to a
             multiple of this value (typically TP * CP * 2 for DTensor V2).
         make_seq_div_by_teachers: Per-teacher sequence-length divisors.
+        mode: ``"text"`` tokenizes raw text from the first message without
+            chat templating. ``"chat"`` renders all messages with each
+            model's chat template and masks loss/scoring to assistant
+            content. Cross-tokenizer chat alignment requires fast tokenizers.
+        include_thinking_in_loss: Reserved flag for thinking-region loss
+            control. Currently stored but does not change whole-message
+            assistant masking; native thinking alignment requires it to
+            be ``True``.
+        native_thinking_alignment: Request semantic-region alignment of
+            thinking content. Requires chat mode and
+            ``include_thinking_in_loss=True``. Not yet implemented;
+            ``True`` raises ``NotImplementedError``.
+        kd_alignment_regions: Requested regions for native thinking
+            alignment. Requires ``native_thinking_alignment=True`` and is
+            therefore not yet supported; leave as ``None``.
+        num_packed_rows: Requested number of examples packed into each row.
+            Only ``1`` is supported; other values raise
+            ``NotImplementedError`` because lockstep packing is not yet
+            implemented.
     """
 
     def __init__(
@@ -236,8 +261,7 @@ class CrossTokenizerCollator:
             ).long()
             out[f"teacher_{i}_token_mask"] = teacher_attention_mask.long()
             # Alignment payload, dense-padded so DTensor V2 can shard on dim 0.
-            # Keys are driven off AlignmentBatch fields so they can't drift
-            # from `alignment_from_flat_batch(data, prefix=f"alignment_{i}_")`.
+            # Keys follow AlignmentBatch fields to keep the payload consistent.
             for f in dataclass_fields(alignment):
                 out[f"alignment_{i}_{f.name}"] = getattr(alignment, f.name)
 
@@ -302,12 +326,14 @@ class CrossTokenizerCollator:
                 t_mask.append(mask)
                 t_spans.append(spans)
 
-            teacher_input_ids, teacher_attention_mask, _, _ = self._pad_chat_batch(
-                t_ids,
-                t_off,
-                t_mask,
-                self.teacher_tokenizers[i].pad_token_id,
-                self.make_seq_div_by_teachers[i],
+            teacher_input_ids, teacher_attention_mask, _, teacher_asst_mask = (
+                self._pad_chat_batch(
+                    t_ids,
+                    t_off,
+                    t_mask,
+                    self.teacher_tokenizers[i].pad_token_id,
+                    self.make_seq_div_by_teachers[i],
+                )
             )
             t_t = teacher_input_ids.shape[1]
 
@@ -343,7 +369,9 @@ class CrossTokenizerCollator:
             out[f"teacher_{i}_input_lengths"] = teacher_attention_mask.sum(
                 dim=-1
             ).long()
-            out[f"teacher_{i}_token_mask"] = teacher_attention_mask.long()
+            out[f"teacher_{i}_token_mask"] = (
+                teacher_attention_mask * teacher_asst_mask
+            ).long()
             for f in dataclass_fields(alignment):
                 out[f"alignment_{i}_{f.name}"] = getattr(alignment, f.name)
 
