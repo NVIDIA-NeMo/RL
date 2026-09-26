@@ -56,7 +56,10 @@ from nemo_rl.algorithms.x_token.utils import (
     pad_distillation_val_batch,
 )
 from nemo_rl.data import DataConfig
-from nemo_rl.data.cross_tokenizer_collate import CrossTokenizerCollator
+from nemo_rl.data.cross_tokenizer_collate import (
+    CrossTokenizerCollator,
+    CrossTokenizerCollatorConfig,
+)
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -226,10 +229,37 @@ class MasterConfig(BaseModel, extra="allow"):
     teachers: list[TeacherConfig] = Field(min_length=1)
     loss_fn: CrossTokenizerDistillationLossConfig
     data: DataConfig
+    collator: CrossTokenizerCollatorConfig = Field(
+        default_factory=CrossTokenizerCollatorConfig
+    )
     distillation: OffPolicyDistillationConfig
     logger: LoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_legacy_collator_keys(cls, value: Any) -> Any:
+        """Reject obsolete data keys before the shared schema discards them."""
+        if isinstance(value, dict) and isinstance(value.get("data"), dict):
+            destinations = {
+                "collator_mode": "mode",
+                "include_thinking_in_loss": "include_thinking_in_loss",
+                "native_thinking_alignment": "native_thinking_alignment",
+                "kd_alignment_regions": "kd_alignment_regions",
+                "num_packed_rows": "num_packed_rows",
+            }
+            migrations = [
+                f"data.{old} -> collator.{new}"
+                for old, new in destinations.items()
+                if old in value["data"]
+            ]
+            if migrations:
+                raise ValueError(
+                    "Collator options no longer belong under data; move them to "
+                    "the top-level collator block: " + ", ".join(migrations)
+                )
+        return value
 
 
 # ===============================================================================
@@ -336,6 +366,7 @@ def setup(
     ]
 
     collator = CrossTokenizerCollator(
+        config=master_config.collator,
         student_tokenizer=student_tokenizer,
         teacher_tokenizers=list(teacher_tokenizers),
         aligners=aligners,
@@ -348,12 +379,6 @@ def setup(
         drop_first_assistant_chunk_kl_by_teacher=[
             teacher.aligner.drop_first_assistant_chunk_kl for teacher in teachers
         ],
-        # Shared chat/instruct knobs; default to the raw-text path.
-        mode=data_config.get("collator_mode", "text"),
-        include_thinking_in_loss=data_config.get("include_thinking_in_loss", False),
-        native_thinking_alignment=data_config.get("native_thinking_alignment", False),
-        kd_alignment_regions=data_config.get("kd_alignment_regions", None),
-        num_packed_rows=data_config.get("num_packed_rows", 1),
     )
 
     # ==========================

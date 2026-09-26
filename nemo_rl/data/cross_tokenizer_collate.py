@@ -18,12 +18,12 @@ The collator runs inside DataLoader worker processes. It does:
 1. Tokenizes the student input once; this tokenization is shared by all
    teachers. In ``mode="text"``, tokenizes raw text without a chat template.
    In ``mode="chat"``, renders the student's chat template and identifies
-   assistant content for the loss mask.
+   assistant content and end-of-turn tokens for the loss mask.
 2. For each *cross-tokenizer* teacher, tokenizes with that teacher's
    tokenizer and aligns with its :class:`TokenAligner`. Text mode aligns
    the full text; chat mode renders the teacher's own chat template and
    aligns assistant messages independently. Teacher scoring masks also
-   select only assistant content in chat mode. Dense-padded alignment and
+   select assistant content and end-of-turn tokens in chat mode. Dense-padded alignment and
    teacher inputs are emitted under ``alignment_{i}_*`` / ``teacher_{i}_*``.
 3. *Same-tokenizer* teachers (``aligners[i] is None``) emit nothing extra —
    their forward reuses the student tokenization, so projection and alignment
@@ -39,15 +39,41 @@ to KL/CE math runs here.
 from __future__ import annotations
 
 from dataclasses import fields as dataclass_fields
-from typing import Any, List, Optional
+from typing import Any, List, Literal, Optional
 
 import torch
+from pydantic import BaseModel, PositiveInt
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.x_token.token_aligner import AlignmentPair, TokenAligner
+from nemo_rl.algorithms.x_token.token_aligner import TokenAligner
 from nemo_rl.data.chat_templates import find_rendered_message_content_span
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+
+class CrossTokenizerCollatorConfig(BaseModel, extra="allow"):
+    """Shared batching options for cross-tokenizer distillation.
+
+    Attributes:
+        mode: ``"text"`` tokenizes raw text; ``"chat"`` renders each model's
+            chat template and supervises assistant turns.
+        include_thinking_in_loss: Reserved reasoning-loss flag. Currently
+            does not change whole-message assistant masking.
+        native_thinking_alignment: Request reasoning/answer-region alignment.
+            Requires chat mode and thinking loss; currently unsupported.
+        kd_alignment_regions: Optional subset of reasoning, close, answer,
+            and eot regions. Requires native thinking alignment.
+        num_packed_rows: Positive number of examples packed into each row.
+            Only one is currently supported.
+    """
+
+    mode: Literal["text", "chat"] = "text"
+    include_thinking_in_loss: bool = False
+    native_thinking_alignment: bool = False
+    kd_alignment_regions: (
+        list[Literal["reasoning", "close", "answer", "eot"]] | None
+    ) = None
+    num_packed_rows: PositiveInt = 1
 
 
 class CrossTokenizerCollator:
@@ -60,9 +86,12 @@ class CrossTokenizerCollator:
     (``aligners[i] is None``) emits nothing extra — its forward reuses the
     student tokenization, so projection and alignment are skipped entirely.
     Chat mode applies each model's chat template, masks loss and teacher
-    scoring to assistant content, and aligns assistant messages separately.
+    scoring to assistant content and end-of-turn tokens, and aligns assistant
+    messages separately.
 
     Args:
+        config: Typed batching options, including text/chat mode and the
+            reserved thinking-region and packing settings.
         student_tokenizer: HF tokenizer matching the student model.
         teacher_tokenizers: Per-teacher HF tokenizers. May be ``None`` for a
             same-tokenizer teacher (its tokenization is the student's).
@@ -79,30 +108,12 @@ class CrossTokenizerCollator:
         make_seq_div_by_student: Round student sequence length up to a
             multiple of this value (typically TP * CP * 2 for DTensor V2).
         make_seq_div_by_teachers: Per-teacher sequence-length divisors.
-        mode: ``"text"`` tokenizes raw text from the first message without
-            chat templating. ``"chat"`` renders all messages with each
-            model's chat template and masks loss/scoring to assistant
-            content. Cross-tokenizer chat alignment requires fast tokenizers.
-        include_thinking_in_loss: Reserved flag for thinking-region loss
-            control. Currently stored but does not change whole-message
-            assistant masking; native thinking alignment requires it to
-            be ``True``.
-        native_thinking_alignment: Request semantic-region alignment of
-            thinking content. Requires chat mode and
-            ``include_thinking_in_loss=True``. Not yet implemented;
-            ``True`` raises ``NotImplementedError``.
-        kd_alignment_regions: Requested regions for native thinking
-            alignment. Requires ``native_thinking_alignment=True`` and is
-            therefore not yet supported; leave as ``None``.
-        num_packed_rows: Requested number of examples packed into each row.
-            Only ``1`` is supported; other values raise
-            ``NotImplementedError`` because lockstep packing is not yet
-            implemented.
     """
 
     def __init__(
         self,
         *,
+        config: CrossTokenizerCollatorConfig,
         student_tokenizer: PreTrainedTokenizerBase,
         teacher_tokenizers: List[Optional[PreTrainedTokenizerBase]],
         aligners: List[Optional[TokenAligner]],
@@ -111,12 +122,7 @@ class CrossTokenizerCollator:
         drop_first_assistant_chunk_kl_by_teacher: List[bool],
         make_seq_div_by_student: int = 1,
         make_seq_div_by_teachers: Optional[List[int]] = None,
-        mode: str = "text",
-        include_thinking_in_loss: bool = False,
-        native_thinking_alignment: bool = False,
-        kd_alignment_regions: Optional[List[str]] = None,
-        num_packed_rows: int = 1,
-    ):
+    ) -> None:
         n = len(aligners)
         assert len(teacher_tokenizers) == n and len(ctx_length_teachers) == n, (
             "teacher_tokenizers, aligners, and ctx_length_teachers must all "
@@ -131,9 +137,7 @@ class CrossTokenizerCollator:
         if make_seq_div_by_teachers is None:
             make_seq_div_by_teachers = [1] * n
         assert len(make_seq_div_by_teachers) == n
-        if mode not in ("text", "chat"):
-            raise ValueError(f"mode must be 'text' or 'chat', got {mode!r}")
-        if mode == "chat":
+        if config.mode == "chat":
             for i, aligner in enumerate(aligners):
                 if aligner is None:
                     continue
@@ -144,27 +148,30 @@ class CrossTokenizerCollator:
                         "mode='chat' requires fast student/teacher tokenizers for "
                         "return_offsets_mapping=True."
                     )
-        if native_thinking_alignment and (
-            mode != "chat" or not include_thinking_in_loss
+        if config.native_thinking_alignment and (
+            config.mode != "chat" or not config.include_thinking_in_loss
         ):
             raise ValueError(
                 "native_thinking_alignment requires mode='chat' and "
                 "include_thinking_in_loss=true."
             )
-        if kd_alignment_regions is not None and not native_thinking_alignment:
+        if (
+            config.kd_alignment_regions is not None
+            and not config.native_thinking_alignment
+        ):
             raise ValueError(
                 "kd_alignment_regions requires native_thinking_alignment=true."
             )
         # Native-thinking semantic-region parsing and multi-doc lockstep packing
         # are not yet wired in this collator; fail loudly rather than silently
         # produce whole-message alignment when they were requested.
-        if native_thinking_alignment:
+        if config.native_thinking_alignment:
             raise NotImplementedError(
                 "native_thinking_alignment is not yet implemented in this "
                 "collator (whole-message chat alignment only); this is a "
                 "planned follow-up."
             )
-        if num_packed_rows != 1:
+        if config.num_packed_rows != 1:
             raise NotImplementedError(
                 "num_packed_rows > 1 (lockstep packing) is not yet implemented "
                 "in this collator; use num_packed_rows=1."
@@ -176,11 +183,11 @@ class CrossTokenizerCollator:
         self.ctx_length_teachers = ctx_length_teachers
         self.make_seq_div_by_student = make_seq_div_by_student
         self.make_seq_div_by_teachers = make_seq_div_by_teachers
-        self.mode = mode
+        self.mode = config.mode
         self.drop_first_assistant_chunk_kl_by_teacher = list(
             drop_first_assistant_chunk_kl_by_teacher
         )
-        self.include_thinking_in_loss = include_thinking_in_loss
+        self.include_thinking_in_loss = config.include_thinking_in_loss
         # Downstream consumers assume real tokens occupy the leading
         # positions: ``input_lengths = attention_mask.sum(-1)`` plus the
         # ``[:length]`` slices in the policy forward and the token-chunk
@@ -271,15 +278,15 @@ class CrossTokenizerCollator:
         """Chat/instruct path: align each assistant message independently.
 
         Renders each side's chat template, then calls
-        :meth:`TokenAligner.align_one_offset_per_asst` per assistant message.
-        Loss fires only on assistant content (``token_mask = attention_mask *
-        assistant_mask``). Same-tokenizer teachers (``aligners[i] is None``)
+        :meth:`TokenAligner.align_chat` for the batch. Loss covers assistant
+        content and each retained end-of-turn token (``token_mask =
+        attention_mask * assistant_mask``). Same-tokenizer teachers
+        (``aligners[i] is None``)
         reuse the student tokenization, as in the text path.
         """
-        b = len(batch)
-        s_ids, s_off, s_mask, s_spans = [], [], [], []
+        s_ids, s_off, s_mask, s_spans, s_eot = [], [], [], [], []
         for datum in batch:
-            ids, off, mask, spans = self._render_and_tokenize_chat(
+            ids, off, mask, spans, eot_indices = self._render_and_tokenize_chat(
                 self.student_tokenizer,
                 datum["message_log"],
                 self.ctx_length_student,
@@ -288,22 +295,24 @@ class CrossTokenizerCollator:
             s_off.append(off)
             s_mask.append(mask)
             s_spans.append(spans)
+            s_eot.append(eot_indices)
 
-        student_input_ids, student_attention_mask, _, student_asst_mask = (
-            self._pad_chat_batch(
-                s_ids,
-                s_off,
-                s_mask,
-                self.student_tokenizer.pad_token_id,
-                self.make_seq_div_by_student,
-            )
+        (
+            student_input_ids,
+            student_attention_mask,
+            student_offsets,
+            student_asst_mask,
+        ) = self._pad_chat_batch(
+            s_ids,
+            s_off,
+            s_mask,
+            self.student_tokenizer.pad_token_id,
+            self.make_seq_div_by_student,
         )
-        t_s = student_input_ids.shape[1]
-
         out: dict[str, Any] = {
             "input_ids": student_input_ids,
             "input_lengths": student_attention_mask.sum(dim=-1).long(),
-            # Loss only on assistant-content tokens.
+            # CE and same-tokenizer KD include assistant content and EOT.
             "token_mask": (student_attention_mask * student_asst_mask).long(),
             "sample_mask": torch.tensor(
                 [datum["loss_multiplier"] for datum in batch], dtype=torch.float32
@@ -314,9 +323,9 @@ class CrossTokenizerCollator:
         for i, aligner in enumerate(self.aligners):
             if aligner is None:
                 continue
-            t_ids, t_off, t_mask, t_spans = [], [], [], []
+            t_ids, t_off, t_mask, t_spans, t_eot = [], [], [], [], []
             for datum in batch:
-                ids, off, mask, spans = self._render_and_tokenize_chat(
+                ids, off, mask, spans, eot_indices = self._render_and_tokenize_chat(
                     self.teacher_tokenizers[i],
                     datum["message_log"],
                     self.ctx_length_teachers[i],
@@ -325,45 +334,36 @@ class CrossTokenizerCollator:
                 t_off.append(off)
                 t_mask.append(mask)
                 t_spans.append(spans)
+                t_eot.append(eot_indices)
 
-            teacher_input_ids, teacher_attention_mask, _, teacher_asst_mask = (
-                self._pad_chat_batch(
-                    t_ids,
-                    t_off,
-                    t_mask,
-                    self.teacher_tokenizers[i].pad_token_id,
-                    self.make_seq_div_by_teachers[i],
-                )
+            (
+                teacher_input_ids,
+                teacher_attention_mask,
+                teacher_offsets,
+                teacher_asst_mask,
+            ) = self._pad_chat_batch(
+                t_ids,
+                t_off,
+                t_mask,
+                self.teacher_tokenizers[i].pad_token_id,
+                self.make_seq_div_by_teachers[i],
             )
-            t_t = teacher_input_ids.shape[1]
-
-            per_sample_pairs: List[List[AlignmentPair]] = []
-            for j in range(b):
-                raw = aligner.align_one_offset_per_asst(
-                    s_ids[j],
-                    s_off[j],
-                    s_spans[j],
-                    t_ids[j],
-                    t_off[j],
-                    t_spans[j],
-                    student_asst_mask=s_mask[j],
-                    teacher_asst_mask=t_mask[j],
-                    drop_first_content_pair=(
-                        self.drop_first_assistant_chunk_kl_by_teacher[i]
-                    ),
-                )
-                per_sample_pairs.append(
-                    [
-                        AlignmentPair(p[0], p[1], p[2], p[3], p[4], p[5], p[6])
-                        for p in raw
-                    ]
-                )
-
-            alignment = aligner._pairs_to_batch(per_sample_pairs, b=b, t_s=t_s, t_t=t_t)
-            aligner._drop_padding(
-                alignment,
+            alignment = aligner.align_chat(
+                student_input_ids,
+                teacher_input_ids,
+                student_offsets=student_offsets,
+                teacher_offsets=teacher_offsets,
+                student_asst_char_spans=s_spans,
+                teacher_asst_char_spans=t_spans,
                 student_attention_mask=student_attention_mask,
                 teacher_attention_mask=teacher_attention_mask,
+                student_asst_mask=student_asst_mask,
+                teacher_asst_mask=teacher_asst_mask,
+                student_eot_indices=s_eot,
+                teacher_eot_indices=t_eot,
+                drop_first_content_pair=self.drop_first_assistant_chunk_kl_by_teacher[
+                    i
+                ],
             )
             out[f"teacher_{i}_input_ids"] = teacher_input_ids
             out[f"teacher_{i}_input_lengths"] = teacher_attention_mask.sum(
@@ -382,14 +382,18 @@ class CrossTokenizerCollator:
         tokenizer: PreTrainedTokenizerBase,
         messages: List[dict],
         ctx_length: int,
-    ) -> tuple[List[int], List[tuple[int, int]], List[int], List[tuple[int, int]]]:
+    ) -> tuple[
+        List[int], List[tuple[int, int]], List[int], List[tuple[int, int]], List[int]
+    ]:
         """Render + tokenize one conversation and derive its assistant spans.
 
         Renders with the tokenizer's chat template, tokenizes with char offsets,
         and derives the per-token assistant mask and each assistant message's
         char span. Returns ``(input_ids, offsets, assistant_mask,
-        assistant_char_spans)`` for a single (unpadded) sample. The rendered
-        string already carries the template's special tokens, so tokenization
+        assistant_char_spans, assistant_eot_indices)`` for a single unpadded
+        sample. Missing/truncated terminators have index ``-1``. Content spans
+        exclude EOT so adding EOT supervision does not change content alignment.
+        The rendered string already carries the template's special tokens, so tokenization
         uses ``add_special_tokens=False``.
         """
         rendered = tokenizer.apply_chat_template(messages, tokenize=False)
@@ -406,8 +410,9 @@ class CrossTokenizerCollator:
         # Locate each assistant message's content in the rendered text, scanning
         # left-to-right so repeated content in later turns doesn't rematch early.
         asst_char_spans: List[tuple[int, int]] = []
+        asst_eot_indices: List[int] = []
         cursor = 0
-        for message in messages:
+        for message_i, message in enumerate(messages):
             span = find_rendered_message_content_span(
                 rendered, message.get("content", ""), cursor
             )
@@ -416,6 +421,11 @@ class CrossTokenizerCollator:
             cursor = span[1]
             if message.get("role") == "assistant":
                 asst_char_spans.append((span[0], span[1]))
+                asst_eot_indices.append(
+                    CrossTokenizerCollator._find_assistant_eot(
+                        tokenizer, messages[: message_i + 1], rendered, offsets, span
+                    )
+                )
 
         assistant_mask = [
             1
@@ -423,7 +433,55 @@ class CrossTokenizerCollator:
             else 0
             for (cs, ce) in offsets
         ]
-        return input_ids, offsets, assistant_mask, asst_char_spans
+        for eot_idx in asst_eot_indices:
+            if eot_idx >= 0:
+                assistant_mask[eot_idx] = 1
+        return input_ids, offsets, assistant_mask, asst_char_spans, asst_eot_indices
+
+    @staticmethod
+    def _find_assistant_eot(
+        tokenizer: PreTrainedTokenizerBase,
+        messages_through_turn: List[dict],
+        rendered: str,
+        offsets: List[tuple[int, int]],
+        content_span: tuple[int, int, str],
+    ) -> int:
+        """Locate a retained turn terminator without including the next header.
+
+        Render through this assistant turn to identify its template suffix.
+        The first non-whitespace suffix token is the terminator. Checking the
+        suffix avoids mistaking the next role header for EOT in templates with
+        no terminator. Offsets come from the truncated full conversation, so a
+        removed terminator returns ``-1`` rather than supervising another token.
+        """
+        turn_rendered = tokenizer.apply_chat_template(
+            messages_through_turn, tokenize=False
+        )
+        turn_content_span = None
+        cursor = 0
+        for message in messages_through_turn:
+            turn_content_span = find_rendered_message_content_span(
+                turn_rendered, message.get("content", ""), cursor
+            )
+            if turn_content_span is not None:
+                cursor = turn_content_span[1]
+        if turn_content_span is None:
+            return -1
+        suffix = turn_rendered[turn_content_span[1] :]
+        terminator = suffix.lstrip()
+        if not terminator:
+            return -1
+        eot_char_start = content_span[1] + len(suffix) - len(terminator)
+        for token_i, (char_start, char_end) in enumerate(offsets):
+            if char_start <= eot_char_start < char_end:
+                # AddedToken(lstrip=True) can absorb whitespace preceding EOT,
+                # including trailing whitespace from the assistant content.
+                if not rendered[
+                    char_start:eot_char_start
+                ].strip() and terminator.startswith(rendered[eot_char_start:char_end]):
+                    return token_i
+                break
+        return -1
 
     @staticmethod
     def _pad_chat_batch(
