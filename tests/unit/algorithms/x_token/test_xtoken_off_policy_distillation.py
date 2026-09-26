@@ -31,6 +31,7 @@ from __future__ import annotations
 import math
 import os
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -38,6 +39,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from omegaconf import OmegaConf
 from pydantic import ValidationError
 from torchdata.stateful_dataloader import StatefulDataLoader
 
@@ -54,7 +56,16 @@ from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     xtoken_non_student_seq_keys,
     xtoken_off_policy_distillation_train,
 )
+from nemo_rl.data.cross_tokenizer_collate import (
+    CrossTokenizerCollator,
+    CrossTokenizerCollatorConfig,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.utils.config import (
+    load_config,
+    parse_hydra_overrides,
+    register_omegaconf_resolvers,
+)
 
 
 def has_gloo() -> bool:
@@ -272,7 +283,14 @@ def mock_xtoken_components():
 def _patched_setup_call(master_config, *, student_vocab=32, teacher_vocab=24):
     """Drive setup() with every heavy collaborator patched out."""
     student_tok = _make_tokenizer(student_vocab)
-    teacher_tok = _make_tokenizer(teacher_vocab)
+    teacher_tokenizers = [
+        _make_tokenizer(
+            student_vocab
+            if teacher.aligner.projection_matrix_path is None
+            else teacher_vocab
+        )
+        for teacher in master_config.teachers
+    ]
     train_ds = MagicMock()
     train_ds.__len__ = MagicMock(return_value=4)
     val_ds = MagicMock()
@@ -284,7 +302,9 @@ def _patched_setup_call(master_config, *, student_vocab=32, teacher_vocab=24):
         patch.object(xt_mod, "Logger"),
         patch.object(xt_mod, "CheckpointManager") as mock_cp_cls,
         patch.object(xt_mod, "TokenAligner"),
-        patch.object(xt_mod, "CrossTokenizerCollator") as mock_collator_cls,
+        patch.object(
+            xt_mod, "CrossTokenizerCollator", wraps=CrossTokenizerCollator
+        ) as mock_collator_cls,
         patch.object(xt_mod, "CrossTokenizerDistillationLossFn") as mock_loss_cls,
         patch.object(xt_mod, "StatefulDataLoader") as mock_dl_cls,
         patch.object(xt_mod, "assert_teacher_student_batch_grid"),
@@ -299,7 +319,7 @@ def _patched_setup_call(master_config, *, student_vocab=32, teacher_vocab=24):
         result = setup(
             master_config,
             student_tokenizer=student_tok,
-            teacher_tokenizers=[teacher_tok],
+            teacher_tokenizers=teacher_tokenizers,
             train_dataset=train_ds,
             val_dataset=val_ds,
         )
@@ -308,8 +328,138 @@ def _patched_setup_call(master_config, *, student_vocab=32, teacher_vocab=24):
             "policy": mock_policy_cls,
             "loss": mock_loss_cls,
             "collator": mock_collator_cls,
+            "dataloader": mock_dl_cls,
             "checkpointer": mock_cp_cls,
         }
+
+
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "xtoken_off_policy_distillation.yaml",
+        "xtoken_multiteacher_off_policy_distillation.yaml",
+    ],
+)
+def test_collator_cli_overrides_reach_setup(config_name: str) -> None:
+    """Both documented recipes accept ordinary overrides before schema loading."""
+    register_omegaconf_resolvers()
+    config_path = Path(__file__).resolve().parents[4] / "examples/configs" / config_name
+    loaded = load_config(config_path)
+    overridden = parse_hydra_overrides(
+        loaded,
+        [
+            "collator.mode=chat",
+            "collator.include_thinking_in_loss=true",
+            "collator.native_thinking_alignment=false",
+            "collator.kd_alignment_regions=null",
+            "collator.num_packed_rows=1",
+        ],
+    )
+    config = MasterConfig.model_validate(
+        OmegaConf.to_container(overridden, resolve=True)
+    )
+
+    _, mocks = _patched_setup_call(config)
+
+    assert isinstance(config.collator, CrossTokenizerCollatorConfig)
+    assert mocks["collator"].call_args.kwargs["config"] is config.collator
+    collator = mocks["dataloader"].call_args_list[0].kwargs["collate_fn"]
+    assert isinstance(collator, CrossTokenizerCollator)
+    assert collator.mode == "chat"
+    assert collator.include_thinking_in_loss is True
+    assert config.collator.model_dump() == {
+        "mode": "chat",
+        "include_thinking_in_loss": True,
+        "native_thinking_alignment": False,
+        "kd_alignment_regions": None,
+        "num_packed_rows": 1,
+    }
+
+
+def test_collator_schema_defaults_when_block_is_omitted() -> None:
+    register_omegaconf_resolvers()
+    config_path = (
+        Path(__file__).resolve().parents[4]
+        / "examples/configs/xtoken_off_policy_distillation.yaml"
+    )
+    loaded = load_config(config_path)
+    del loaded["collator"]
+    config = MasterConfig.model_validate(OmegaConf.to_container(loaded, resolve=True))
+
+    _, mocks = _patched_setup_call(config)
+
+    assert config.collator.model_dump() == {
+        "mode": "text",
+        "include_thinking_in_loss": False,
+        "native_thinking_alignment": False,
+        "kd_alignment_regions": None,
+        "num_packed_rows": 1,
+    }
+    collator = mocks["dataloader"].call_args_list[0].kwargs["collate_fn"]
+    assert collator.mode == "text"
+
+
+@pytest.mark.parametrize(
+    "old_key,new_key,value",
+    [
+        ("collator_mode", "mode", "chat"),
+        ("include_thinking_in_loss", "include_thinking_in_loss", True),
+        ("native_thinking_alignment", "native_thinking_alignment", False),
+        ("kd_alignment_regions", "kd_alignment_regions", None),
+        ("num_packed_rows", "num_packed_rows", 1),
+    ],
+)
+def test_legacy_data_collator_options_fail_with_migration_path(
+    old_key: str, new_key: str, value: object
+) -> None:
+    with pytest.raises(
+        ValidationError, match=rf"data\.{old_key} -> collator\.{new_key}"
+    ):
+        MasterConfig.model_validate({"data": {old_key: value}})
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"mode": "invalid"},
+        {"include_thinking_in_loss": "invalid"},
+        {"kd_alignment_regions": ["unknown"]},
+        {"num_packed_rows": 0},
+    ],
+)
+def test_collator_config_rejects_invalid_values(overrides: dict) -> None:
+    with pytest.raises(ValidationError):
+        CrossTokenizerCollatorConfig.model_validate(overrides)
+
+
+@pytest.mark.parametrize(
+    "overrides,error,match",
+    [
+        ({"native_thinking_alignment": True}, ValueError, "requires mode='chat'"),
+        (
+            {"kd_alignment_regions": ["answer"]},
+            ValueError,
+            "requires native_thinking_alignment=true",
+        ),
+        (
+            {
+                "mode": "chat",
+                "include_thinking_in_loss": True,
+                "native_thinking_alignment": True,
+            },
+            NotImplementedError,
+            "native_thinking_alignment is not yet implemented",
+        ),
+        ({"num_packed_rows": 2}, NotImplementedError, "lockstep packing"),
+    ],
+)
+def test_collator_config_preserves_unsupported_feature_guards(
+    overrides: dict, error: type[Exception], match: str
+) -> None:
+    config = _make_master_config()
+    config.collator = CrossTokenizerCollatorConfig.model_validate(overrides)
+    with pytest.raises(error, match=match):
+        _patched_setup_call(config)
 
 
 def test_teacher_aligner_config_defaults():

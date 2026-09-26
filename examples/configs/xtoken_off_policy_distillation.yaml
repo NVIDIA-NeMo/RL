@@ -255,14 +255,11 @@ teachers:
   #       foreach: false
   #       fused: false
 
-data:
-  max_input_seq_length: 2048
-  shuffle: true
-  num_workers: 4
+collator:
   # Collator mode. "text" (default) = raw-text KD; "chat" = per-assistant-message
   # alignment over each side's rendered chat template (SFT/instruct data).
-  collator_mode: "text"
-  # Include the reasoning body (thinking) in the loss (chat mode).
+  mode: "text"
+  # Reserved reasoning-loss flag; whole-message assistant masking is unchanged.
   include_thinking_in_loss: false
   # Split each assistant message into native reasoning/close/answer regions and
   # align them independently (requires include_thinking_in_loss). Not yet wired.
@@ -272,6 +269,11 @@ data:
   kd_alignment_regions: null
   # Lockstep multi-doc packing per row (chat mode). Only 1 is supported for now.
   num_packed_rows: 1
+
+data:
+  max_input_seq_length: 2048
+  shuffle: true
+  num_workers: 4
   train:
     dataset_name: "arrow_text"
     processor: "kd_data_processor"

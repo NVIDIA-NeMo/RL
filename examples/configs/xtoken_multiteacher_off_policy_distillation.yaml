@@ -257,6 +257,20 @@ teachers:
         foreach: false
         fused: false
 
+collator:
+  # "text" (default) tokenizes raw text; "chat" uses each model's chat template
+  # and aligns assistant messages independently.
+  mode: "text"
+  # Reserved reasoning-loss flag; whole-message assistant masking is unchanged.
+  include_thinking_in_loss: false
+  # Semantic reasoning/answer alignment requires chat mode and thinking loss.
+  # Not yet implemented; leave disabled.
+  native_thinking_alignment: false
+  # Optional subset of {reasoning, close, answer, eot}; requires native alignment.
+  kd_alignment_regions: null
+  # Positive number of examples per packed row; only 1 is currently supported.
+  num_packed_rows: 1
+
 data:
   max_input_seq_length: 2048
   shuffle: true

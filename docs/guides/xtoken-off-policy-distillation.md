@@ -223,6 +223,33 @@ config reusable across (student, teacher) pairs. `data.train.data_files`
 already points at the default NVIDIA corpus described above; override it only
 to train on your own `.arrow`/`.parquet`/`.json`/`.txt` corpus.
 
+### Text and chat batches
+
+Both exemplar configs declare a typed top-level `collator` block:
+
+```yaml
+collator:
+  mode: text
+  include_thinking_in_loss: false
+  native_thinking_alignment: false
+  kd_alignment_regions: null
+  num_packed_rows: 1
+```
+
+For conversation data, set `collator.mode=chat` and use a data processor that
+preserves the conversation's `message_log`. Each model renders its own chat
+template. CE, same-tokenizer KD, and teacher scoring include assistant content
+and each retained end-of-turn token; user turns, role headers, and padding are
+excluded. Cross-tokenizer KD aligns assistant content and uses a separate EOT
+pair when both tokenizations retain the terminator.
+
+The configuration class supplies defaults. The old `data.collator_mode` key
+becomes `collator.mode`; the other four settings also move from `data` into
+`collator`. Native thinking-region alignment and packing multiple examples per
+row are not implemented: keep `native_thinking_alignment=false`,
+`kd_alignment_regions=null`, and `num_packed_rows=1`. The reserved
+`include_thinking_in_loss` flag does not currently change whole-message masking.
+
 ### Loss-mode knobs
 
 `loss_fn` has two flags that pick between three behaviors:
