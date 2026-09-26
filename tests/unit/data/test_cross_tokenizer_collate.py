@@ -123,11 +123,8 @@ def _fake_aligner(b: int, t_s: int, t_t: int, max_pairs: int = 2) -> MagicMock:
     aligner.align.return_value = AlignmentBatch(
         pair_valid=torch.ones((b, max_pairs), dtype=torch.bool),
         pair_is_correct=torch.ones((b, max_pairs), dtype=torch.bool),
-        student_exact_partition_mask=torch.zeros((b, t_s), dtype=torch.bool),
-        teacher_exact_partition_mask=torch.zeros((b, t_t), dtype=torch.bool),
         student_chunk_id=torch.zeros((b, t_s), dtype=torch.long),
         teacher_chunk_id=torch.zeros((b, t_t), dtype=torch.long),
-        num_chunks=torch.tensor([max_pairs] * b, dtype=torch.long),
     )
     return aligner
 
@@ -146,11 +143,8 @@ _EXPECTED_COLLATOR_KEYS = {
     "teacher_0_token_mask",
     "alignment_0_pair_valid",
     "alignment_0_pair_is_correct",
-    "alignment_0_student_exact_partition_mask",
-    "alignment_0_teacher_exact_partition_mask",
     "alignment_0_student_chunk_id",
     "alignment_0_teacher_chunk_id",
-    "alignment_0_num_chunks",
     "idx",
 }
 
@@ -216,7 +210,6 @@ class TestCollatorShapes:
         assert out["alignment_0_pair_valid"].shape == (2, 3)
         assert out["alignment_0_student_chunk_id"].shape == (2, 8)
         assert out["alignment_0_teacher_chunk_id"].shape == (2, 16)
-        assert out["alignment_0_num_chunks"].shape == (2,)
 
     def test_input_lengths_match_attention_mask_sum(self):
         student_tok = FakeTokenizer(vocab_size=32, prefix="s")
@@ -397,6 +390,73 @@ def _chat_aligner(student_tok, teacher_tok) -> TokenAligner:
 
 
 class TestCollatorChatMode:
+    def test_teacher_scoring_masks_only_assistant_content(self):
+        student_tok = FakeChatTokenizer(
+            {"system": ("[S]", ""), "user": ("[U]", ""), "assistant": ("[A]", "[E]")}
+        )
+        teacher_tok = FakeChatTokenizer(
+            {
+                "system": ("<system>", "</system>"),
+                "user": ("<user>", "</user>"),
+                "assistant": ("<assistant>", "<end>"),
+            }
+        )
+        collator = CrossTokenizerCollator(
+            student_tokenizer=student_tok,
+            teacher_tokenizers=[teacher_tok],
+            aligners=[_chat_aligner(student_tok, teacher_tok)],
+            ctx_length_student=256,
+            ctx_length_teachers=[256],
+            drop_first_assistant_chunk_kl_by_teacher=[False],
+            make_seq_div_by_student=8,
+            make_seq_div_by_teachers=[16],
+            mode="chat",
+        )
+        conversations = [
+            [
+                {"role": "system", "content": "Follow instructions"},
+                {"role": "user", "content": "First question"},
+                {"role": "assistant", "content": "First answer"},
+                {"role": "user", "content": "Next question"},
+                {"role": "assistant", "content": "Next answer"},
+            ],
+            [
+                {"role": "system", "content": "Be brief"},
+                {"role": "user", "content": "Ready?"},
+                {"role": "assistant", "content": "Yes"},
+            ],
+        ]
+        out = collator(
+            [
+                {"loss_multiplier": 1.0, "idx": i, "message_log": messages}
+                for i, messages in enumerate(conversations)
+            ]
+        )
+
+        # Each model retains the full conversation as context, but scores only
+        # assistant content at its own token positions. The different templates
+        # prevent accidentally reusing the student's mask for the teacher.
+        assert out["input_ids"].shape != out["teacher_0_input_ids"].shape
+        for prefix, tokenizer in (("", student_tok), ("teacher_0_", teacher_tok)):
+            for i, messages in enumerate(conversations):
+                rendered = tokenizer.apply_chat_template(messages, tokenize=False)
+                length = len(rendered)
+                ids = out[f"{prefix}input_ids"][i]
+                mask = out[f"{prefix}token_mask"][i]
+                expected_mask = torch.zeros_like(mask)
+                for message in messages:
+                    if message["role"] == "assistant":
+                        start = rendered.index(message["content"])
+                        expected_mask[start : start + len(message["content"])] = 1
+
+                assert out[f"{prefix}input_lengths"][i].item() == length
+                assert ids[:length].tolist() == [ord(char) for char in rendered]
+                assert torch.equal(mask, expected_mask)
+                assert ids[length:].eq(tokenizer.pad_token_id).all()
+
+            # The shorter conversation has padding in both tokenizations.
+            assert out[f"{prefix}input_lengths"][1] < out[f"{prefix}input_ids"].shape[1]
+
     def test_chat_aligns_only_assistant_content(self):
         # Same content, different scaffold => different full-string coordinates.
         student_tok = FakeChatTokenizer(
@@ -431,7 +491,7 @@ class TestCollatorChatMode:
 
         # Alignment covers assistant content + the EOT token (char 19), scaffold
         # stays unaligned (chunk_id == -1).
-        assert int(out["alignment_0_num_chunks"][0]) > 0
+        assert out["alignment_0_pair_valid"][0].any()
         s_chunk = out["alignment_0_student_chunk_id"][0].tolist()
         assert all(s_chunk[p] != -1 for p in range(8, 20)), s_chunk
         assert all(s_chunk[p] == -1 for p in list(range(0, 8)) + [20, 21]), s_chunk
