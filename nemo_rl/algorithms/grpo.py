@@ -16,6 +16,7 @@ import json
 import os
 import time
 import warnings
+from collections import defaultdict
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
@@ -49,6 +50,11 @@ from nemo_rl.algorithms.loss import (
     ClippedPGLossFn,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.loss_functions import (
+    PER_AGENT_METRIC_PREFIX,
+    PER_AGENT_NUM_VALID_TOKS_KEY,
+    PER_AGENT_TOKEN_ERROR_METRICS,
+)
 from nemo_rl.algorithms.metric_utils import (
     SetupTimingMetrics,
     print_setup_timing_summary,
@@ -2325,6 +2331,58 @@ def _build_async_grpo_train_data(
     )
     train_data.update(extra_multimodal_data)
     return train_data
+
+
+def _attach_agent_ids(
+    train_data: BatchedDataDict[ClippedPGLossDataDict],
+    repeated_batch: BatchedDataDict,
+) -> Optional[list[str]]:
+    """Attach a [B] ``agent_ids`` tensor for per-agent loss metrics.
+
+    Agent names stay on the driver; the loss only sees integer indices into
+    the returned (sorted) name list. Returns None and attaches nothing when the
+    batch has no usable ``agent_ref`` on every row.
+    """
+    agent_refs = repeated_batch.get("agent_ref")
+    if not isinstance(agent_refs, list) or len(agent_refs) != train_data.size:
+        return None
+    row_agent_names = [
+        ref.get("name") if isinstance(ref, Mapping) else None for ref in agent_refs
+    ]
+    if any(not isinstance(name, str) or not name for name in row_agent_names):
+        return None
+    agent_names = sorted(set(row_agent_names))
+    name_to_id = {name: i for i, name in enumerate(agent_names)}
+    train_data["agent_ids"] = torch.tensor(
+        [name_to_id[name] for name in row_agent_names], dtype=torch.long
+    )
+    return agent_names
+
+
+def _finalize_per_agent_error_metrics(
+    metrics: dict[str, Any], agent_names: Optional[list[str]]
+) -> None:
+    """Turn the loss's per-agent raw sums into ``{agent}/{metric}`` means, in place.
+
+    Expects the ``PER_AGENT_METRIC_PREFIX`` entries in ``metrics`` to already be
+    summed over microbatches/ranks. Each metric is divided by that agent's
+    summed valid-token count (token-weighted mean, same mask as the aggregate
+    metric). All internal per-agent keys are removed.
+    """
+    per_agent: dict[str, dict[str, float]] = defaultdict(dict)
+    for key in [k for k in metrics if k.startswith(PER_AGENT_METRIC_PREFIX)]:
+        agent_id, name = key[len(PER_AGENT_METRIC_PREFIX) :].split("/", 1)
+        per_agent[agent_id][name] = float(metrics.pop(key))
+    if agent_names is None:
+        return
+    for agent_id, sums in per_agent.items():
+        num_valid_toks = sums.get(PER_AGENT_NUM_VALID_TOKS_KEY, 0.0)
+        if num_valid_toks <= 0:
+            continue
+        agent_name = agent_names[int(agent_id)]
+        for name in PER_AGENT_TOKEN_ERROR_METRICS:
+            if name in sums:
+                metrics[f"{agent_name}/{name}"] = sums[name] / num_valid_toks
 
 
 def _apply_mask_sample_filter(repeated_batch: BatchedDataDict[DatumSpec]) -> int:
@@ -5157,6 +5215,9 @@ def async_grpo_train(
                         repeated_batch,
                         master_config.policy,
                     )
+                    # Per-agent token-level error metrics: the loss emits
+                    # per-agent sums keyed by these indices.
+                    agent_names = _attach_agent_ids(train_data, repeated_batch)
                     print_multimodal_payload_metrics(
                         collect_multimodal_payload_metrics(
                             train_data,
@@ -5602,6 +5663,7 @@ def async_grpo_train(
                         metrics[k] = np.mean(v).item()
                     else:
                         metrics[k] = np.sum(v).item()
+                _finalize_per_agent_error_metrics(metrics, agent_names)
                 metrics.update(rollout_metrics)
                 if generation_logger_metrics is not None:
                     metrics["generation_logger_metrics"] = generation_logger_metrics

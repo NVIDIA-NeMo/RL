@@ -665,6 +665,9 @@ Assuming other tokens have near-zero divergence, this single token's metrics wit
 
 Ideally, all KL divergence metrics should be close to 0, with values below 1e-3 considered acceptable. Investigate any metric that shows spikes above this threshold.
 
+### Per-Agent Error Metrics (Async GRPO)
+In async GRPO with NeMo Gym, where every sample has an `agent_ref`, `token_mult_prob_error`, `gen_kl_error`, `policy_kl_error`, and `js_divergence_error` are also logged per agent as `train/{agent_name}/{metric}` (for example, `train/my_agent/gen_kl_error`). These use the same formulas and the same token/sample mask as the aggregate metrics, including any sequence-level logprob error masking. Each is a token-weighted mean over that agent's valid tokens in the step. An agent whose samples are all masked in a step has no per-agent metrics for that step. When a step has one optimizer update, the token-weighted average of the per-agent values equals the aggregate metric. With several updates per step, the aggregate combines per-update values, so the two can differ.
+
 ### Sampling Importance Ratio
 This feature is controlled by the parameter `sampling_importance_ratio`. It adjusts the weighting of samples based on the ratio between the target policy and the behavior policy, helping to correct for distributional shift in off-policy learning. Not to be confused with the clipped importance ratio in PPO/GRPO, this is the importance ratio between $\pi_{\text{training}}$ and $\pi_{\text{inference}}$.
 
