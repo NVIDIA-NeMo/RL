@@ -2922,3 +2922,121 @@ def test_vocab_parallel_gather_columns_tp_sharded(monkeypatch):
     ref[..., idx].float().backward(grad_out)
     torch.testing.assert_close(shards[0].grad, ref.grad[..., :v_local])
     torch.testing.assert_close(shards[1].grad, ref.grad[..., v_local:])
+
+
+# ── Per-agent token-level error metrics ───────────────────────────────────
+
+
+def _setup_per_agent_pg_data(device):
+    torch.manual_seed(0)
+    batch_size, seq_len = 4, 6
+    data, _, _, _ = _setup_clipped_pg_test_data(
+        batch_size=batch_size, seq_len=seq_len, device=device
+    )
+    data["generation_logprobs"] = -torch.rand(batch_size, seq_len, device=device) * 3
+    data["prev_logprobs"] = data["generation_logprobs"] + 0.3 * torch.randn(
+        batch_size, seq_len, device=device
+    )
+    data["reference_policy_logprobs"] = -torch.rand(batch_size, seq_len, device=device)
+    data["advantages"] = torch.randn(batch_size, seq_len, device=device)
+    # Uneven token counts across samples, and one sample masked out entirely so
+    # the per-agent metrics must follow the post-mask aggregate semantics.
+    data["token_mask"][1, -2:] = 0
+    data["sample_mask"][3] = 0
+    data["agent_ids"] = torch.tensor([0, 1, 0, 1], dtype=torch.long, device=device)
+    next_token_logprobs = data["prev_logprobs"][:, 1:] + 0.05 * torch.randn(
+        batch_size, seq_len - 1, device=device
+    )
+    mask = data["token_mask"][:, 1:] * data["sample_mask"].unsqueeze(-1)
+    return data, next_token_logprobs, mask
+
+
+def _call_pg_loss(loss_fn, data, next_token_logprobs, global_valid_toks):
+    return loss_fn(
+        next_token_logprobs=next_token_logprobs,
+        data=data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=global_valid_toks,
+    )
+
+
+def test_clipped_pg_loss_per_agent_error_metrics():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    data, next_token_logprobs, mask = _setup_per_agent_pg_data(device)
+    loss_fn = ClippedPGLossFn(ClippedPGLossConfig(reference_policy_kl_penalty=0.1))
+    global_valid_toks = mask.sum()
+
+    _, metrics = _call_pg_loss(loss_fn, data, next_token_logprobs, global_valid_toks)
+
+    data_no_agents = BatchedDataDict(
+        {k: v for k, v in data.items() if k != "agent_ids"}
+    )
+    _, metrics_no_agents = _call_pg_loss(
+        loss_fn, data_no_agents, next_token_logprobs, global_valid_toks
+    )
+
+    # Without agent_ids nothing per-agent is emitted, and the existing metrics
+    # are identical with or without agent_ids.
+    assert not any(k.startswith("_per_agent/") for k in metrics_no_agents)
+    for key, value in metrics_no_agents.items():
+        assert metrics[key] == value, key
+
+    gen = data["generation_logprobs"][:, 1:]
+    prev = data["prev_logprobs"][:, 1:]
+    kl_type = loss_fn.reference_policy_kl_type
+    log_mixture = torch.log(0.5 * torch.exp(prev) + 0.5 * torch.exp(gen))
+    per_token = {
+        "token_mult_prob_error": torch.exp(torch.abs(gen - prev) * mask),
+        "gen_kl_error": calculate_kl(gen, prev, kl_type, None, None),
+        "policy_kl_error": calculate_kl(prev, gen, kl_type, None, None),
+        "js_divergence_error": 0.5
+        * (torch.exp(prev - log_mixture) - (prev - log_mixture) - 1)
+        + 0.5 * (torch.exp(gen - log_mixture) - (gen - log_mixture) - 1),
+    }
+
+    for agent_id in (0, 1):
+        agent_mask = mask * (data["agent_ids"] == agent_id).unsqueeze(-1)
+        prefix = f"_per_agent/{agent_id}/"
+        assert metrics[prefix + "num_valid_toks"] == agent_mask.sum().item()
+        for name, values in per_token.items():
+            assert metrics[prefix + name] == pytest.approx(
+                torch.sum(values * agent_mask).item(), rel=1e-5
+            ), name
+
+    # The masked-out sample (agent 1, row 3) contributes no tokens.
+    assert metrics["_per_agent/1/num_valid_toks"] == mask[1].sum().item()
+
+    # Summing the per-agent sums and dividing by the global token count
+    # gives back the aggregate metric.
+    for name in per_token:
+        recombined = sum(metrics[f"_per_agent/{a}/{name}"] for a in (0, 1))
+        assert recombined / global_valid_toks.item() == pytest.approx(
+            metrics[name], rel=1e-5
+        ), name
+
+
+def test_clipped_pg_loss_per_agent_error_metrics_sum_across_microbatches():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    data, next_token_logprobs, mask = _setup_per_agent_pg_data(device)
+    loss_fn = ClippedPGLossFn(ClippedPGLossConfig(reference_policy_kl_penalty=0.1))
+    global_valid_toks = mask.sum()
+
+    _, full = _call_pg_loss(loss_fn, data, next_token_logprobs, global_valid_toks)
+    # Rows [0, 1] carry both agents; rows [2, 3] carry agent 0 plus a masked
+    # agent-1 row, so agent 1 must be absent from the second microbatch.
+    _, first = _call_pg_loss(
+        loss_fn, data.slice(0, 2), next_token_logprobs[:2], global_valid_toks
+    )
+    _, second = _call_pg_loss(
+        loss_fn, data.slice(2, 4), next_token_logprobs[2:], global_valid_toks
+    )
+
+    assert not any(k.startswith("_per_agent/1/") for k in second)
+    per_agent_keys = {k for k in full if k.startswith("_per_agent/")}
+    assert per_agent_keys == {
+        k for k in (*first, *second) if k.startswith("_per_agent/")
+    }
+    for key in per_agent_keys:
+        assert first.get(key, 0.0) + second.get(key, 0.0) == pytest.approx(
+            full[key], rel=1e-5
+        ), key

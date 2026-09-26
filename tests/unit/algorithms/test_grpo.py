@@ -39,6 +39,8 @@ from nemo_rl.algorithms.grpo import (
     _apply_configured_message_level_advantage_penalties,
     _apply_mask_sample_filter,
     _apply_message_level_advantage_penalties,
+    _attach_agent_ids,
+    _finalize_per_agent_error_metrics,
     _get_grpo_save_state,
     _initial_grpo_save_state,
     _initial_policy_generation_stale,
@@ -5964,3 +5966,89 @@ def test_train_fields_for_step(skip_prev_logprobs, expect_prev):
 )
 def test_needs_hf_refit_handshake(backend, nccl_reshard, colocated, expected):
     assert _needs_hf_refit_handshake(backend, nccl_reshard, colocated) is expected
+
+
+def _agent_ref_batch(agent_refs: list[Any]) -> tuple[BatchedDataDict, BatchedDataDict]:
+    train_data = BatchedDataDict(
+        {"sample_mask": torch.ones(len(agent_refs), dtype=torch.float32)}
+    )
+    repeated_batch = BatchedDataDict({"agent_ref": agent_refs})
+    return train_data, repeated_batch
+
+
+def test_attach_agent_ids_maps_names_to_sorted_indices():
+    train_data, repeated_batch = _agent_ref_batch(
+        [
+            {"name": "zeta_agent"},
+            {"name": "alpha_agent", "extra": 1},
+            {"name": "zeta_agent"},
+        ]
+    )
+
+    agent_names = _attach_agent_ids(train_data, repeated_batch)
+
+    assert agent_names == ["alpha_agent", "zeta_agent"]
+    assert train_data["agent_ids"].dtype == torch.long
+    assert train_data["agent_ids"].tolist() == [1, 0, 1]
+
+
+@pytest.mark.parametrize(
+    "agent_refs",
+    [
+        None,  # no agent_ref key at all
+        [{"name": "a"}, None],  # a row without an agent_ref
+        [{"name": "a"}, {"other": "b"}],  # a row without a name
+        [{"name": "a"}],  # length mismatch with train_data
+    ],
+)
+def test_attach_agent_ids_skips_unusable_agent_refs(agent_refs):
+    train_data = BatchedDataDict({"sample_mask": torch.ones(2)})
+    repeated_batch = BatchedDataDict(
+        {} if agent_refs is None else {"agent_ref": agent_refs}
+    )
+
+    assert _attach_agent_ids(train_data, repeated_batch) is None
+    assert "agent_ids" not in train_data
+
+
+def test_finalize_per_agent_error_metrics():
+    metrics = {
+        "gen_kl_error": 0.5,
+        # agent 0: 4 valid tokens
+        "_per_agent/0/num_valid_toks": 4.0,
+        "_per_agent/0/token_mult_prob_error": 4.4,
+        "_per_agent/0/gen_kl_error": 0.2,
+        "_per_agent/0/policy_kl_error": 0.4,
+        "_per_agent/0/js_divergence_error": 0.08,
+        # agent 1: 2 valid tokens
+        "_per_agent/1/num_valid_toks": 2.0,
+        "_per_agent/1/token_mult_prob_error": 3.0,
+        "_per_agent/1/gen_kl_error": 1.0,
+        "_per_agent/1/policy_kl_error": 0.6,
+        "_per_agent/1/js_divergence_error": 0.1,
+        # agent 2: no valid tokens (e.g. every sample masked)
+        "_per_agent/2/num_valid_toks": 0.0,
+        "_per_agent/2/gen_kl_error": 0.0,
+    }
+
+    _finalize_per_agent_error_metrics(metrics, ["agent_a", "agent_b", "agent_c"])
+
+    assert not any(k.startswith("_per_agent/") for k in metrics)
+    assert metrics["gen_kl_error"] == 0.5  # aggregate untouched
+    assert metrics["agent_a/token_mult_prob_error"] == pytest.approx(1.1)
+    assert metrics["agent_a/gen_kl_error"] == pytest.approx(0.05)
+    assert metrics["agent_a/policy_kl_error"] == pytest.approx(0.1)
+    assert metrics["agent_a/js_divergence_error"] == pytest.approx(0.02)
+    assert metrics["agent_b/token_mult_prob_error"] == pytest.approx(1.5)
+    assert metrics["agent_b/gen_kl_error"] == pytest.approx(0.5)
+    assert metrics["agent_b/policy_kl_error"] == pytest.approx(0.3)
+    assert metrics["agent_b/js_divergence_error"] == pytest.approx(0.05)
+    assert not any(k.startswith("agent_c/") for k in metrics)
+
+
+def test_finalize_per_agent_error_metrics_without_agent_names_drops_internal_keys():
+    metrics = {"gen_kl_error": 0.5, "_per_agent/0/gen_kl_error": 1.0}
+
+    _finalize_per_agent_error_metrics(metrics, None)
+
+    assert metrics == {"gen_kl_error": 0.5}

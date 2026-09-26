@@ -174,7 +174,60 @@ class ClippedPGLossDataDict(TypedDict):
     reference_policy_logprobs: torch.Tensor
     token_mask: torch.Tensor
     sample_mask: torch.Tensor
+    # Optional [B] integer agent index per sample. When present, the loss also
+    # emits per-agent raw sums of the token-level error metrics (see
+    # PER_AGENT_METRIC_PREFIX); the driver maps indices back to agent names.
+    agent_ids: NotRequired[torch.Tensor]
     __extra__: Any
+
+
+# Prefix of the internal per-agent metric keys emitted by ClippedPGLossFn when
+# ``agent_ids`` is present: ``f"{PER_AGENT_METRIC_PREFIX}{agent_id}/{name}"``.
+# Values are raw (un-normalized) sums over the agent's valid tokens in the
+# microbatch, so they add up correctly across sequences, microbatches, and
+# ranks; the driver divides each by the matching
+# ``PER_AGENT_NUM_VALID_TOKS_KEY`` sum to get a token-weighted mean.
+PER_AGENT_METRIC_PREFIX = "_per_agent/"
+PER_AGENT_NUM_VALID_TOKS_KEY = "num_valid_toks"
+PER_AGENT_TOKEN_ERROR_METRICS = (
+    "token_mult_prob_error",
+    "gen_kl_error",
+    "policy_kl_error",
+    "js_divergence_error",
+)
+
+
+@torch.no_grad()
+def _per_agent_token_error_sums(
+    agent_ids: torch.Tensor,
+    mask: torch.Tensor,
+    per_token_values: dict[str, torch.Tensor],
+) -> dict[str, float]:
+    """Per-agent raw sums of token-level metrics over valid tokens.
+
+    Args:
+        agent_ids: [B] integer agent index per sample.
+        mask: [B, T] combined token/sample mask (the same mask used by the
+            aggregate metrics, i.e. after sample masking).
+        per_token_values: metric name -> [B, T] per-token values.
+
+    Returns:
+        ``{f"{PER_AGENT_METRIC_PREFIX}{id}/{name}": sum}`` for every metric plus
+        ``PER_AGENT_NUM_VALID_TOKS_KEY``, for each agent with >=1 valid token.
+    """
+    agent_ids = agent_ids.to(device=mask.device).view(-1)
+    out: dict[str, float] = {}
+    for agent_id in torch.unique(agent_ids).tolist():
+        agent_mask = mask * (agent_ids == agent_id).unsqueeze(-1).to(mask.dtype)
+        num_valid_toks = agent_mask.sum().item()
+        if num_valid_toks == 0:
+            continue
+        prefix = f"{PER_AGENT_METRIC_PREFIX}{int(agent_id)}/"
+        out[prefix + PER_AGENT_NUM_VALID_TOKS_KEY] = num_valid_toks
+        for name, values in per_token_values.items():
+            # Same reduction as masked_mean, minus the global normalization.
+            out[prefix + name] = torch.sum(values * agent_mask).item()
+    return out
 
 
 class ClippedPGLossFn(LossFunction):
@@ -413,7 +466,7 @@ class ClippedPGLossFn(LossFunction):
 
         # gen-kl: kl(P_gen || P_train)
         # where log_ratio = prev_logprobs - generation_logprobs
-        gen_kl_error = calculate_kl(
+        gen_kl_error_per_token = calculate_kl(
             logprobs=generation_logprobs,
             logprobs_reference=prev_logprobs,
             kl_type=self.reference_policy_kl_type,
@@ -421,14 +474,14 @@ class ClippedPGLossFn(LossFunction):
             output_clamp_value=None,
         )
         gen_kl_error = masked_mean(
-            gen_kl_error,
+            gen_kl_error_per_token,
             mask,
             global_normalization_factor=global_valid_toks,
         ).item()
 
         # policy-kl: kl(P_train || P_gen)
         # where log_ratio = generation_logprobs - prev_logprobs
-        policy_kl_error = calculate_kl(
+        policy_kl_error_per_token = calculate_kl(
             logprobs=prev_logprobs,
             logprobs_reference=generation_logprobs,
             kl_type=self.reference_policy_kl_type,
@@ -436,7 +489,7 @@ class ClippedPGLossFn(LossFunction):
             output_clamp_value=None,
         )
         policy_kl_error = masked_mean(
-            policy_kl_error,
+            policy_kl_error_per_token,
             mask,
             global_normalization_factor=global_valid_toks,
         ).item()
@@ -459,11 +512,25 @@ class ClippedPGLossFn(LossFunction):
             - 1
         )
 
+        js_divergence_per_token = 0.5 * kl_prev_to_mixture + 0.5 * kl_gen_to_mixture
         js_divergence_error = masked_mean(
-            0.5 * kl_prev_to_mixture + 0.5 * kl_gen_to_mixture,
+            js_divergence_per_token,
             mask,
             global_normalization_factor=global_valid_toks,
         ).item()
+
+        per_agent_error_metrics: dict[str, float] = {}
+        if "agent_ids" in data:
+            per_agent_error_metrics = _per_agent_token_error_sums(
+                agent_ids=data["agent_ids"],
+                mask=mask,
+                per_token_values={
+                    "token_mult_prob_error": torch.exp(lp_error * mask),
+                    "gen_kl_error": gen_kl_error_per_token,
+                    "policy_kl_error": policy_kl_error_per_token,
+                    "js_divergence_error": js_divergence_per_token,
+                },
+            )
 
         # Calculate KL regularization.
         if self.reference_policy_kl_penalty != 0:
@@ -784,6 +851,7 @@ class ClippedPGLossFn(LossFunction):
                 "approx_entropy": seq_entropy_approx.item(),
                 **_is_filter_metrics,
                 "positive_nll_loss": nll_loss.item(),
+                **per_agent_error_metrics,
             },
         )
 
