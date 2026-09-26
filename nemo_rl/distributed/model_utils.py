@@ -1047,62 +1047,6 @@ def get_cp_sharded_next_token_logprobs(
     return logprobs[:, :-1]
 
 
-def dtensor_from_parallel_logits_to_logprobs(
-    vocab_parallel_logits: torch.Tensor,
-    target: DTensor | torch.Tensor,
-    vocab_start_index: int,
-    vocab_end_index: int,
-    tp_group: torch.distributed.ProcessGroup,
-    inference_only: bool = False,
-    chunk_size: Optional[int] = None,
-    sampling_params: Optional[TrainingSamplingParams] = None,
-) -> torch.Tensor:
-    """Get log probabilities from TP+CP sharded vocab logits.
-
-    Args:
-        vocab_parallel_logits (orch.Tensor): Logits distributed across tensor parallel workers,
-            with shape [batch_size, seq_len, vocab_size/tp_size].
-        target (DTensor): Target token indices with shape [batch_size, seq_len].
-            NOTE: Must be the unmodified targets as this function will shift them internally.
-        vocab_start_index (int): Starting vocabulary index for this worker's partition.
-        vocab_end_index (int): Ending vocabulary index for this worker's partition.
-        tp_group (torch.distributed.ProcessGroup): Process group for distributed communication.
-        inference_only (bool, optional): If True, tensors won't be saved for backward pass. Defaults to False.
-        chunk_size (Optional[int]): Sequence dimension chunk size for computing the log probabilities.
-        sampling_params (TrainingSamplingParams, optional): Sampling parameters for Top-k/Top-p filtering and temperature scaling.
-
-    Returns:
-        torch.Tensor: Log probabilities tensor with shape [batch_size, seq_len-1].
-            The sequence dimension is reduced by 1 due to the target shifting.
-    """
-    # A CP-sharded DTensor target needs a sequence index to reorder against, which only the
-    # removed DTensor v1 worker ever produced. Fail loudly rather than silently mis-shifting.
-    if (
-        isinstance(target, DTensor)
-        and target.device_mesh.mesh_dim_names is not None
-        and "cp" in target.device_mesh.mesh_dim_names
-    ):
-        raise NotImplementedError(
-            "CP-sharded DTensor targets are not supported here; Automodel shards context "
-            "parallelism with ContextParallelSharder on plain tensors."
-        )
-
-    target = target.roll(shifts=-1, dims=-1)
-
-    logprobs = _tp_target_logprobs(
-        vocab_parallel_logits,
-        target,
-        vocab_start_index=vocab_start_index,
-        vocab_end_index=vocab_end_index,
-        tp_group=tp_group,
-        chunk_size=chunk_size,
-        sampling_params=sampling_params,
-        inference_only=inference_only,
-    )
-
-    return logprobs[:, :-1]
-
-
 def from_parallel_logits_to_logprobs(
     vocab_parallel_logits: torch.Tensor,
     target: torch.Tensor,
@@ -1737,33 +1681,44 @@ def get_logprobs_from_vocab_parallel_logits(
         vocab_parallel_logits (DTensor): Logits distributed across tensor parallel workers,
             with shape [batch_size, seq_len, vocab_size/tp_size].
         input_ids (torch.Tensor | DTensor): Input token IDs for which to compute log probabilities,
-            with shape [batch_size, seq_len].
+            with shape [batch_size, seq_len]. NOTE: Must be the unmodified targets as this
+            function will shift them internally.
         chunk_size (Optional[int]): Sequence dimension chunk size for computing log probabilities.
         sampling_params (TrainingSamplingParams, optional): Sampling parameters for Top-k/Top-p filtering and temperature scaling.
 
     Returns:
-        torch.Tensor: Log probabilities for the given input IDs.
+        torch.Tensor: Log probabilities for the given input IDs, with shape
+            [batch_size, seq_len-1]. The sequence dimension is reduced by 1 due to the
+            target shifting.
     """
-    device_mesh = vocab_parallel_logits.device_mesh
+    # This function handles TP only. Fail loudly rather than silently mis-shifting.
+    if (
+        isinstance(input_ids, DTensor)
+        and input_ids.device_mesh.mesh_dim_names is not None
+        and "cp" in input_ids.device_mesh.mesh_dim_names
+    ):
+        raise NotImplementedError(
+            "get_logprobs_from_vocab_parallel_logits handles TP only; use "
+            "get_cp_sharded_next_token_logprobs for context parallelism."
+        )
 
-    tp_size = 1
-
-    tp_group = device_mesh.get_group("tp")
+    tp_group = vocab_parallel_logits.device_mesh.get_group("tp")
     tp_rank = tp_group.rank()
     tp_size = tp_group.size()
-
     vocab_interval_per_rank = vocab_parallel_logits.shape[-1] // tp_size
 
-    return dtensor_from_parallel_logits_to_logprobs(
+    logprobs = _tp_target_logprobs(
         vocab_parallel_logits.to_local(),
-        input_ids,
-        vocab_interval_per_rank * tp_rank,
-        (tp_rank + 1) * vocab_interval_per_rank,
-        tp_group,
-        inference_only=not torch.is_grad_enabled(),
+        input_ids.roll(shifts=-1, dims=-1),
+        vocab_start_index=vocab_interval_per_rank * tp_rank,
+        vocab_end_index=(tp_rank + 1) * vocab_interval_per_rank,
+        tp_group=tp_group,
         chunk_size=chunk_size,
         sampling_params=sampling_params,
+        inference_only=not torch.is_grad_enabled(),
     )
+
+    return logprobs[:, :-1]
 
 
 def get_next_token_logprobs_from_logits(
