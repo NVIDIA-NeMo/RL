@@ -37,13 +37,19 @@ MAX_STEPS=${SC_GYM_RECOVERY_PARITY_STEPS:-5}
 NUM_PROMPTS=${SC_GYM_RECOVERY_PARITY_PROMPTS_PER_STEP:-2}
 NUM_GENERATIONS=${SC_GYM_RECOVERY_PARITY_GENERATIONS_PER_PROMPT:-2}
 MIN_GENERATION_TOKENS=${SC_GYM_RECOVERY_PARITY_MIN_TOKENS:-256}
-MAX_TOTAL_SEQUENCE_LENGTH=${SC_GYM_RECOVERY_PARITY_MAX_TOTAL_SEQUENCE_LENGTH:-2048}
-CUT_INTERVAL_S=${SC_GYM_RECOVERY_PARITY_CUT_INTERVAL_S:-0.25}
+SIMPLE_CUT_PROOF_ITEMS=${SC_GYM_RECOVERY_PARITY_SIMPLE_CUT_PROOF_ITEMS:-512}
+SIMPLE_CUT_MAX_OUTPUT_TOKENS=${SC_GYM_RECOVERY_PARITY_SIMPLE_CUT_MAX_TOKENS:-2048}
+MAX_TOTAL_SEQUENCE_LENGTH=${SC_GYM_RECOVERY_PARITY_MAX_TOTAL_SEQUENCE_LENGTH:-4096}
+CUT_INTERVAL_S=${SC_GYM_RECOVERY_PARITY_CUT_INTERVAL_S:-0.05}
 FINAL_INTERVAL_S=${SC_GYM_RECOVERY_PARITY_FINAL_INTERVAL_S:-600}
 CUT_TIMEOUT_S=${SC_GYM_RECOVERY_PARITY_CUT_TIMEOUT_S:-3600}
 RUN_TIMEOUT_S=${SC_GYM_RECOVERY_PARITY_RUN_TIMEOUT_S:-7200}
 REQUIRE_COMPLETION_ORDER_MATCH=${SC_GYM_RECOVERY_PARITY_REQUIRE_COMPLETION_ORDER_MATCH:-0}
 TRAIN_GLOBAL_BATCH_SIZE=$((NUM_PROMPTS * NUM_GENERATIONS))
+POLICY_MAX_NEW_TOKENS=$MIN_GENERATION_TOKENS
+if [[ "$SIMPLE_CUT_MAX_OUTPUT_TOKENS" -gt "$POLICY_MAX_NEW_TOKENS" ]]; then
+    POLICY_MAX_NEW_TOKENS=$SIMPLE_CUT_MAX_OUTPUT_TOKENS
+fi
 
 if [[ "$NUM_PROMPTS" -ne 2 ]]; then
     echo "[ERROR] This parity fixture requires two prompts per step (simple + Workplace)."
@@ -78,7 +84,9 @@ mkdir -p "$TEST_DIR"
 jq -n -c \
     --slurpfile simple "$GYM_ROOT/resources_servers/example_session_state_mgmt/data/example.jsonl" \
     --slurpfile workplace "$GYM_ROOT/resources_servers/workplace_assistant/data/example.jsonl" \
-    --argjson steps "$MAX_STEPS" '
+    --argjson steps "$MAX_STEPS" \
+    --argjson simple_cut_proof_items "$SIMPLE_CUT_PROOF_ITEMS" \
+    --argjson simple_cut_max_output_tokens "$SIMPLE_CUT_MAX_OUTPUT_TOKENS" '
       range(0; $steps) as $step |
       (
         $simple[$step % ($simple | length)]
@@ -86,9 +94,13 @@ jq -n -c \
         | .task_source = "example_session_state_mgmt_simple_agent"
         | .initial_count = (10 * $step)
         | .expected_count = (10 * $step + 1)
+        # Stage two selects this constrained call at train step 2. Keep earlier
+        # steps cheap, then require a large enough JSON array that a periodic
+        # checkpoint can reliably cut the structured decode on fast GPUs.
+        | (if $step >= 2 then $simple_cut_proof_items else 64 end) as $proof_items
         | .responses_create_params.input = [{
             "role": "user",
-            "content": ("Call increment_counter exactly once with count 1 and checkpoint_proof containing every integer from 0 through 63 in order, then report the result. Case " + ($step | tostring))
+            "content": ("Call increment_counter exactly once with count 1 and checkpoint_proof containing every integer from 0 through " + (($proof_items - 1) | tostring) + " in order, then report the result. Case " + ($step | tostring))
           }]
         | .responses_create_params.tools = [
             .responses_create_params.tools[]
@@ -96,8 +108,8 @@ jq -n -c \
             | .parameters.properties.checkpoint_proof = {
                 "type": "array",
                 "items": {"type": "integer"},
-                "minItems": 64,
-                "maxItems": 64
+                "minItems": $proof_items,
+                "maxItems": $proof_items
               }
             | .parameters.required += ["checkpoint_proof"]
           ]
@@ -106,7 +118,7 @@ jq -n -c \
             "name": "increment_counter"
           }
         | .responses_create_params.parallel_tool_calls = false
-        | .responses_create_params.max_output_tokens = 256
+        | .responses_create_params.max_output_tokens = (if $step >= 2 then $simple_cut_max_output_tokens else 256 end)
       ),
       (
         $workplace[0]
@@ -193,7 +205,7 @@ COMMON_OVERRIDES=(
     grpo.num_generations_per_prompt="$NUM_GENERATIONS"
     grpo.max_num_steps="$MAX_STEPS"
     policy.max_total_sequence_length="$MAX_TOTAL_SEQUENCE_LENGTH"
-    policy.generation.max_new_tokens="$MIN_GENERATION_TOKENS"
+    policy.generation.max_new_tokens="$POLICY_MAX_NEW_TOKENS"
     policy.train_global_batch_size="$TRAIN_GLOBAL_BATCH_SIZE"
     # Keep train-time logit scaling finite while making generation effectively
     # greedy, including the tail regenerated after a restored prefix.
@@ -256,7 +268,7 @@ ACTIVE_PID=$!
 uv run --directory "$PROJECT_ROOT" --no-sync python "$PARITY_HELPER" select-cut \
     "$RECOVERY_CHECKPOINT_DIR" "$SECOND_SELECTION" "$ACTIVE_PID" \
     "$BASE_RUN_LOG" "$CUT_TIMEOUT_S" 2 \
-    example_session_state_mgmt_simple_agent "$MIN_GENERATION_TOKENS" \
+    example_session_state_mgmt_simple_agent "$SIMPLE_CUT_MAX_OUTPUT_TOKENS" \
     --boundary-requirement root --expected-outcome restart
 stop_active_run
 cp "$BASE_RUN_LOG" "$TEST_DIR/recovery-crash-2.log"
