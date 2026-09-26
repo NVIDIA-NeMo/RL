@@ -15,7 +15,7 @@ BASE_RUN_LOG=$SCRIPT_DIR/grpo_async_gym_single_controller/run.log
 RECOVERY_HOOK=$SCRIPT_DIR/_single_controller_sibling_recovery_hook.py
 SNAPSHOT_HELPER=$SCRIPT_DIR/_gym_turn_recovery_snapshot.py
 PROFILE=${SC_GYM_TURN_RECOVERY_PROFILE:-counter}
-if [[ "$PROFILE" != "counter" && "$PROFILE" != "workplace" && "$PROFILE" != "genrm" ]]; then
+if [[ "$PROFILE" != "counter" && "$PROFILE" != "workplace" && "$PROFILE" != "genrm" && "$PROFILE" != "sharded" ]]; then
     echo "[ERROR] Unsupported SC_GYM_TURN_RECOVERY_PROFILE=$PROFILE"
     exit 2
 fi
@@ -41,13 +41,19 @@ PHASE2_TIMEOUT_S=${SC_GYM_TURN_RECOVERY_PHASE2_TIMEOUT_S:-2400}
 if [[ "$PROFILE" == "genrm" ]]; then
     DEFAULT_MAX_STEPS=1
     DEFAULT_NUM_PROMPTS=1
+    DEFAULT_NUM_GENERATIONS=2
+elif [[ "$PROFILE" == "sharded" ]]; then
+    DEFAULT_MAX_STEPS=1
+    DEFAULT_NUM_PROMPTS=4
+    DEFAULT_NUM_GENERATIONS=2
 else
     DEFAULT_MAX_STEPS=2
     DEFAULT_NUM_PROMPTS=4
+    DEFAULT_NUM_GENERATIONS=2
 fi
 MAX_STEPS=${SC_GYM_TURN_RECOVERY_MAX_STEPS:-$DEFAULT_MAX_STEPS}
 NUM_PROMPTS=${SC_GYM_TURN_RECOVERY_NUM_PROMPTS:-$DEFAULT_NUM_PROMPTS}
-NUM_GENERATIONS=${SC_GYM_TURN_RECOVERY_NUM_GENERATIONS:-2}
+NUM_GENERATIONS=${SC_GYM_TURN_RECOVERY_NUM_GENERATIONS:-$DEFAULT_NUM_GENERATIONS}
 TRAIN_GLOBAL_BATCH_SIZE=$((NUM_PROMPTS * NUM_GENERATIONS))
 
 if [[ ! -f "$GYM_ROOT/nemo_gym/_checkpoint/agent.py" ]]; then
@@ -64,6 +70,7 @@ mkdir -p "$TEST_DIR"
 
 EXPECTED_GYM_COMPONENTS=resources_servers,responses_api_agents,responses_api_models
 PHASE1_BOUNDARY_HOOK=NEMO_GYM_TEST_HOLD_FIRST_MUTATED_BOUNDARY=1
+GYM_LAYOUT_OVERRIDES=()
 if [[ "$PROFILE" == "counter" ]]; then
     # A restored rollout receives reward 1 only when its saved counter is
     # continued exactly once.
@@ -105,7 +112,7 @@ elif [[ "$PROFILE" == "workplace" ]]; then
     ' "$GYM_ROOT/resources_servers/workplace_assistant/data/example.jsonl" \
         > "$TEST_DATA"
     GYM_CONFIG_PATHS='[responses_api_models/vllm_model/configs/vllm_model_for_training.yaml,responses_api_agents/checkpoint_test_agent/configs/workplace_assistant.yaml]'
-else
+elif [[ "$PROFILE" == "genrm" ]]; then
     # One sibling waits in the stateless cohort verifier while the second is
     # parked at its terminal boundary. Recovery must replay both /verify calls
     # and compute the cohort reward exactly once.
@@ -124,6 +131,58 @@ else
     GYM_CONFIG_PATHS='[responses_api_models/vllm_model/configs/vllm_model_for_training.yaml,responses_api_agents/checkpoint_test_agent/configs/genrm_compare.yaml]'
     EXPECTED_GYM_COMPONENTS=responses_api_agents,responses_api_models
     PHASE1_BOUNDARY_HOOK=NEMO_GYM_TEST_HOLD_SECOND_TERMINAL_BOUNDARY=1
+else
+    # Put two checkpoint-aware agents behind distinct Gym shards. Each actor
+    # holds its first post-mutation boundary while its second row completes,
+    # producing one recoverable continuation per shard plus canonical rows.
+    jq -c -s '
+        limit(2; .[])
+        | .task_source //= "example_session_state_mgmt_simple_agent"
+    ' "$GYM_ROOT/resources_servers/example_session_state_mgmt/data/example.jsonl" \
+        > "$TEST_DATA"
+    jq -c -s '
+        limit(2; .[])
+        | .task_source = "workplace_assistant_checkpoint_test_agent"
+        | .responses_create_params.input = [{
+            "role": "user",
+            "content": "Call calendar_create_event exactly once with event_name NeMo RL checkpoint recovery sentinel, participant_email checkpoint-recovery@example.com, event_start 2025-01-15 10:00:00, and duration 30."
+          }]
+        | .responses_create_params.tools = [
+            .responses_create_params.tools[]
+            | select(.name == "calendar_create_event")
+          ]
+        | .responses_create_params.tool_choice = {
+            "type": "function",
+            "name": "calendar_create_event"
+          }
+        | .responses_create_params.parallel_tool_calls = false
+        | .ground_truth = [{
+            "name": "calendar_create_event",
+            "arguments": ({
+              "event_name": "NeMo RL checkpoint recovery sentinel",
+              "participant_email": "checkpoint-recovery@example.com",
+              "event_start": "2025-01-15 10:00:00",
+              "duration": "30"
+            } | tojson)
+          }]
+        | .category = "workplace_assistant_calendar"
+        | .environment_name = "workplace_assistant"
+    ' "$GYM_ROOT/resources_servers/workplace_assistant/data/example.jsonl" \
+        >> "$TEST_DATA"
+    GYM_LAYOUT_OVERRIDES=(
+        'env.nemo_gym.config_paths=null'
+        '~env.nemo_gym.code_gen'
+        '+env.nemo_gym.placement_strategy=PACK'
+        '+env.nemo_gym.common_inherited_overlays=[policy_model]'
+        '+env.nemo_gym.allowed_duplicate_entries=[policy_model]'
+        '+env.nemo_gym.shards=[{name:counter,port_range_low:5000,port_range_high:5499,config_paths:[responses_api_models/vllm_model/configs/vllm_model_for_training.yaml,responses_api_agents/checkpoint_test_agent/configs/example_session_state_mgmt.yaml]},{name:workplace,port_range_low:5500,port_range_high:5999,config_paths:[responses_api_models/vllm_model/configs/vllm_model_for_training.yaml,responses_api_agents/checkpoint_test_agent/configs/workplace_assistant.yaml]}]'
+    )
+fi
+if [[ "$PROFILE" != "sharded" ]]; then
+    GYM_LAYOUT_OVERRIDES=(
+        "env.nemo_gym.config_paths=$GYM_CONFIG_PATHS"
+        '~env.nemo_gym.code_gen'
+    )
 fi
 export NEMO_GYM_TRAIN_DATA_PATH=$TEST_DATA
 export NEMO_GYM_VALIDATION_DATA_PATH=$TEST_DATA
@@ -180,8 +239,7 @@ COMMON_OVERRIDES=(
     policy.train_global_batch_size="$TRAIN_GLOBAL_BATCH_SIZE"
     policy.generation.temperature=0.1
     policy.generation.max_new_tokens=128
-    "env.nemo_gym.config_paths=$GYM_CONFIG_PATHS"
-    '~env.nemo_gym.code_gen'
+    "${GYM_LAYOUT_OVERRIDES[@]}"
 )
 
 echo "=== Phase 1: publish one coordinated Gym + TQ turn checkpoint ==="

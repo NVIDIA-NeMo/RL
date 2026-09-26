@@ -187,6 +187,15 @@ acknowledgement, agent continuation indexes, and external-storage reference
 indexes. It also requires
 `token_capture.enabled: true`; NeMo-RL never tells Gym to release a completed
 terminal result until the canonical TQ and replay-buffer commit has succeeded.
+Turn-level participant recovery supports multiple distinct Gym shards when each
+shard has exactly one replica. Each shard writes its agent and resource state
+under `gym-shards/<shard-name>/`, while one deterministic shard commits the
+shared policy-model ledger. The configured `token_capture.capture_dir` must be
+shared storage visible to every Gym shard and the Single Controller; a
+node-local override would split one logical lineage across hosts. Replicated
+Gym shards and generation-prefix cuts combined with multiple Gym shards are
+rejected during setup until their ownership and restore-routing contracts are
+supported.
 On restore, Gym validates and rehydrates its own artifacts, and NeMo-RL checks
 that Gym reports the same sidecar digests and that every indexed TQ row exists.
 The continuation and external-storage indexes are required; checkpoints that

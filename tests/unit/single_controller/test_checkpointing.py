@@ -760,18 +760,27 @@ class _FakeGymCheckpointActor:
         *,
         fail_prepare: bool = False,
         fail_commit: bool = False,
+        fail_model_commit: bool = False,
         fail_abort_attempts: int = 0,
         fail_resume_attempts: int = 0,
         generation_cut_staging_key: Optional[str] = None,
+        agent_name: str = "test-agent",
+        agent_server_name: str = "agent-route",
     ):
         self.events = events
         self.fail_prepare = fail_prepare
         self.fail_commit = fail_commit
+        self.fail_model_commit = fail_model_commit
         self.fail_abort_attempts = fail_abort_attempts
         self.fail_resume_attempts = fail_resume_attempts
         self.generation_cut_staging_key = generation_cut_staging_key
+        self.agent_name = agent_name
+        self.agent_server_name = agent_server_name
         self.checkpoint_ids: list[str] = []
         self.abort_checkpoint_ids: list[str] = []
+        self.commit_components: list[Optional[list[str]]] = []
+        self.resume_components: list[Optional[list[str]]] = []
+        self.model_continuation_indexes: list[list[dict[str, Any]]] = []
         self.acknowledge_completed_executions = _AsyncRemoteMethod(self._acknowledge)
         self.prepare_checkpoint = _AsyncRemoteMethod(self._prepare)
         self.commit_checkpoint = _AsyncRemoteMethod(self._commit)
@@ -824,9 +833,17 @@ class _FakeGymCheckpointActor:
         checkpoint_id: str,
         deadline_ts: float,
         checkpoint_dir: str,
+        components: Optional[list[str]] = None,
+        continuation_indexes: Optional[list[dict[str, Any]]] = None,
     ) -> dict[str, Any]:
         assert deadline_ts > time.time()
         self.events.append("commit")
+        self.commit_components.append(components)
+        if components == ["responses_api_models"]:
+            if self.fail_model_commit:
+                raise OSError("Gym model checkpoint storage failed")
+            self.model_continuation_indexes.append(continuation_indexes or [])
+            return {"checkpoint_id": checkpoint_id, "participants": []}
         if self.fail_commit:
             raise OSError("Gym checkpoint storage failed")
         path = Path(checkpoint_dir) / "gym" / "agent-manifest.json"
@@ -850,9 +867,9 @@ class _FakeGymCheckpointActor:
         )
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         participant = {
-            "server_name": "agent-route",
+            "server_name": self.agent_server_name,
             "component": "responses_api_agents",
-            "participant_name": "test-agent",
+            "participant_name": self.agent_name,
         }
         return {
             "checkpoint_id": checkpoint_id,
@@ -873,8 +890,14 @@ class _FakeGymCheckpointActor:
             ],
         }
 
-    async def _resume(self, _checkpoint_id: str, _deadline_ts: float) -> dict[str, Any]:
+    async def _resume(
+        self,
+        _checkpoint_id: str,
+        _deadline_ts: float,
+        components: Optional[list[str]] = None,
+    ) -> dict[str, Any]:
         self.events.append("resume")
+        self.resume_components.append(components)
         if self.fail_resume_attempts:
             self.fail_resume_attempts -= 1
             raise OSError("temporary Gym resume failure")
@@ -950,6 +973,9 @@ def test_restart_only_resources_discard_only_dependent_continuations() -> None:
         controller._rollout_recovery_ledger = SimpleNamespace(
             groups=lambda: [
                 SimpleNamespace(
+                    group_id="group",
+                    task_source="agent",
+                    resolved_agent_name=None,
                     siblings=[
                         SimpleNamespace(
                             generation_index=0,
@@ -983,7 +1009,27 @@ def test_restart_only_resources_discard_only_dependent_continuations() -> None:
                     logical_rollout_id=lambda generation_index: (
                         f"group_g{generation_index}"
                     ),
-                )
+                ),
+                # A never-sealed group can legitimately lack both a resolved
+                # route and task_source. It is irrelevant unless a restored
+                # continuation actually refers to one of its attempts.
+                SimpleNamespace(
+                    group_id="unmatched",
+                    task_source=None,
+                    resolved_agent_name=None,
+                    siblings=[
+                        SimpleNamespace(
+                            generation_index=0,
+                            current_attempt=SimpleNamespace(
+                                attempt_index=0,
+                                status=RolloutAttemptStatus.ABANDONED,
+                            ),
+                        )
+                    ],
+                    logical_rollout_id=lambda generation_index: (
+                        f"unmatched_g{generation_index}"
+                    ),
+                ),
             ]
         )
         controller._env_handles = {"nemo_gym": gym_actor}
@@ -1045,6 +1091,36 @@ def test_restart_only_resources_discard_only_dependent_continuations() -> None:
         assert controller._restored_gym_checkpoint_staging_keys == {
             "stage/export-restore"
         }
+
+    asyncio.run(exercise())
+
+
+def test_gym_checkpoint_call_failures_report_every_instance() -> None:
+    async def exercise() -> None:
+        async def fail(message: str) -> None:
+            raise OSError(message)
+
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        with pytest.raises(BaseExceptionGroup) as exc_info:
+            await controller_cls._await_gym_checkpoint_calls(
+                "prepare",
+                [
+                    ("first", fail("first failed")),
+                    ("second", fail("second failed")),
+                ],
+            )
+
+        assert str(exc_info.value).startswith(
+            "NeMo-Gym checkpoint prepare failed on 2 instance(s)"
+        )
+        assert [str(error) for error in exc_info.value.exceptions] == [
+            "first failed",
+            "second failed",
+        ]
+        assert [error.__notes__ for error in exc_info.value.exceptions] == [
+            ["NeMo-Gym checkpoint prepare failed on instance 'first'"],
+            ["NeMo-Gym checkpoint prepare failed on instance 'second'"],
+        ]
 
     asyncio.run(exercise())
 
@@ -2380,6 +2456,63 @@ class TestPeriodicRolloutCheckpoint:
         finally:
             actor._checkpointer.shutdown()
 
+    def test_gym_acknowledgements_are_routed_to_the_owning_shard(
+        self, tmp_path: Path
+    ) -> None:
+        actor = self._actor(tmp_path)
+        actor._gym_participant_checkpointing_enabled = True
+        received: dict[str, list[dict[str, Any]]] = {}
+
+        def gym_actor(label: str):
+            async def acknowledge(executions: list[dict[str, Any]]):
+                received[label] = executions
+                return {"acknowledged": executions}
+
+            return SimpleNamespace(
+                acknowledge_completed_executions=_AsyncRemoteMethod(acknowledge)
+            )
+
+        first = gym_actor("first")
+        second = gym_actor("second")
+        actor._env_handles = {
+            "nemo_gym": NemoGymShardSet(
+                handles={"first": [first], "second": [second]},
+                route_to_shard={"agent-a": "first", "agent-b": "second"},
+            )
+        }
+        state = {
+            "schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+            "groups": [],
+            "pending_completed_execution_acknowledgements": [
+                {
+                    "rollout_id": f"rollout-{suffix}",
+                    "attempt_index": 0,
+                    "agent_name": f"agent-{suffix}",
+                    "execution_generation": 1,
+                    "result_identity": f"result-{suffix}",
+                    "result_digest": suffix * 64,
+                }
+                for suffix in ("a", "b")
+            ],
+        }
+
+        async def scenario() -> int:
+            async with actor._data_plane_checkpoint_barrier.mutation(
+                "gym_acknowledgements"
+            ) as cut:
+                actor._rollout_recovery_ledger.load_state_dict(cut, state)
+            return await actor._flush_completed_gym_acknowledgements()
+
+        try:
+            assert asyncio.run(scenario()) == 2
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert {
+            label: [item["agent_name"] for item in payload]
+            for label, payload in received.items()
+        } == {"first": ["agent-a"], "second": ["agent-b"]}
+
     def test_committed_gym_checkpoint_retries_release_with_same_id(
         self, tmp_path: Path
     ) -> None:
@@ -2597,6 +2730,199 @@ class TestPeriodicRolloutCheckpoint:
             "generation-finish-checkpoint",
         ]
         assert actor._generation_checkpoint_id is None
+        assert actor._gym_checkpoint_rollout_permitted.is_set()
+
+    def test_sharded_gym_checkpoint_fans_out_and_unions_continuation_indexes(
+        self, tmp_path: Path
+    ) -> None:
+        actor = self._actor(tmp_path)
+        events: list[str] = []
+        first = _FakeGymCheckpointActor(
+            events,
+            agent_name="agent-a",
+            agent_server_name="agent-a-route",
+        )
+        second = _FakeGymCheckpointActor(
+            events,
+            agent_name="agent-b",
+            agent_server_name="agent-b-route",
+        )
+        actor._env_handles = {
+            "nemo_gym": NemoGymShardSet(
+                handles={"first": [first], "second": [second]},
+                route_to_shard={"agent-a": "first", "agent-b": "second"},
+            )
+        }
+        actor._gym_checkpoint_topology = GymCheckpointTopology.model_validate(
+            {
+                "participants": [
+                    {
+                        "participant": {
+                            "server_name": f"agent-{suffix}-route",
+                            "component": "responses_api_agents",
+                            "participant_name": f"agent-{suffix}",
+                        },
+                        "schema_version": 1,
+                        "admission_states": ["accepting"],
+                        "checkpoint_mode": "export_restore",
+                        "concurrency_contract": "serialized_per_session",
+                        "multi_process": {
+                            "mode": "single_worker",
+                            "num_workers": 1,
+                        },
+                        "features": ["completed_result_acknowledgement"],
+                    }
+                    for suffix in ("a", "b")
+                ]
+            }
+        )
+
+        async def scenario():
+            prepare, checkpoint = await actor._prepare_and_commit_gym_checkpoint(
+                "checkpoint-sharded",
+                tmp_path,
+            )
+            await actor._release_prepared_gym_checkpoint(
+                "checkpoint-sharded",
+                committed=True,
+            )
+            return prepare, checkpoint
+
+        try:
+            prepare, checkpoint = asyncio.run(scenario())
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert prepare.ready
+        assert {
+            result.participant.participant_name for result in checkpoint.participants
+        } == {"agent-a", "agent-b"}
+        assert {
+            result.manifest.relative_path.split("/", 2)[1]
+            for result in checkpoint.participants
+        } == {"first", "second"}
+        assert first.commit_components == [
+            ["responses_api_agents", "resources_servers"],
+            ["responses_api_models"],
+        ]
+        assert len(first.model_continuation_indexes) == 1
+        assert len(first.model_continuation_indexes[0]) == 2
+        assert second.commit_components == [
+            ["responses_api_agents", "resources_servers"]
+        ]
+        assert second.model_continuation_indexes == []
+        assert events.count("prepare") == 2
+        assert events.count("resume") == 2
+
+    @pytest.mark.parametrize("failure", ["prepare", "local_commit", "model_commit"])
+    def test_sharded_gym_checkpoint_failure_aborts_every_shard(
+        self,
+        tmp_path: Path,
+        failure: str,
+    ) -> None:
+        actor = self._actor(tmp_path)
+        events: list[str] = []
+        first = _FakeGymCheckpointActor(
+            events,
+            agent_name="agent-a",
+            agent_server_name="agent-a-route",
+            fail_model_commit=failure == "model_commit",
+        )
+        second = _FakeGymCheckpointActor(
+            events,
+            agent_name="agent-b",
+            agent_server_name="agent-b-route",
+            fail_prepare=failure == "prepare",
+            fail_commit=failure == "local_commit",
+        )
+        actor._env_handles = {
+            "nemo_gym": NemoGymShardSet(
+                handles={"first": [first], "second": [second]},
+                route_to_shard={"agent-a": "first", "agent-b": "second"},
+            )
+        }
+
+        try:
+            with pytest.raises((OSError, TimeoutError)):
+                asyncio.run(
+                    actor._prepare_and_commit_gym_checkpoint(
+                        f"checkpoint-{failure}",
+                        tmp_path,
+                    )
+                )
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert events.count("prepare") == 2
+        assert events.count("abort") == 2
+        assert first.abort_checkpoint_ids == [f"checkpoint-{failure}"]
+        assert second.abort_checkpoint_ids == [f"checkpoint-{failure}"]
+        assert actor._gym_checkpoint_rollout_permitted.is_set()
+
+        if failure == "prepare":
+            assert events.count("commit") == 0
+        elif failure == "local_commit":
+            # Both already-issued shard-local commits are drained before abort.
+            assert events.count("commit") == 2
+        else:
+            # Two local commits succeed before the one leader model commit fails.
+            assert events.count("commit") == 3
+
+    def test_sharded_gym_resume_failure_keeps_admission_closed(self, tmp_path: Path):
+        actor = self._actor(tmp_path)
+        events: list[str] = []
+        first = _FakeGymCheckpointActor(events)
+        second = _FakeGymCheckpointActor(events, fail_resume_attempts=1)
+        actor._env_handles = {
+            "nemo_gym": NemoGymShardSet(
+                handles={"first": [first], "second": [second]},
+            )
+        }
+
+        try:
+            with pytest.raises(OSError, match="temporary Gym resume failure"):
+                asyncio.run(
+                    actor._release_prepared_gym_checkpoint(
+                        "checkpoint-sharded",
+                        committed=True,
+                    )
+                )
+            assert not actor._gym_checkpoint_rollout_permitted.is_set()
+
+            asyncio.run(
+                actor._release_prepared_gym_checkpoint(
+                    "checkpoint-sharded",
+                    committed=True,
+                )
+            )
+            assert actor._gym_checkpoint_rollout_permitted.is_set()
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert events == ["resume", "resume", "resume", "resume"]
+
+    def test_sharded_gym_restore_resumes_model_once_and_every_local_shard(
+        self, tmp_path: Path
+    ) -> None:
+        actor = self._actor(tmp_path)
+        events: list[str] = []
+        first = _FakeGymCheckpointActor(events)
+        second = _FakeGymCheckpointActor(events)
+        actor._env_handles = {
+            "nemo_gym": NemoGymShardSet(
+                handles={"first": [first], "second": [second]},
+            )
+        }
+
+        try:
+            asyncio.run(actor._release_restored_gym_checkpoint("restore-sharded"))
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert first.resume_components == [None]
+        assert second.resume_components == [
+            ["responses_api_agents", "resources_servers"]
+        ]
         assert actor._gym_checkpoint_rollout_permitted.is_set()
 
     def test_generation_prefix_cut_prepare_failure_resumes_engine(

@@ -364,6 +364,41 @@ class GymCheckpointTopology(_StrictWireModel):
 
     schema_version: Literal[1] = GYM_CHECKPOINT_SCHEMA_VERSION
     participants: list[GymCheckpointParticipantContract]
+    participant_owners: dict[str, list[str]] = Field(default_factory=dict)
+
+    @staticmethod
+    def participant_identity_key(participant: GymParticipantIdentity) -> str:
+        """Encode one participant identity for shard-ownership fingerprints."""
+        return json.dumps(
+            [
+                participant.server_name,
+                participant.component,
+                participant.participant_name,
+            ],
+            separators=(",", ":"),
+        )
+
+    @model_validator(mode="after")
+    def validate_participant_owners(self) -> "GymCheckpointTopology":
+        if not self.participant_owners:
+            return self
+        expected = {
+            self.participant_identity_key(contract.participant)
+            for contract in self.participants
+        }
+        if set(self.participant_owners) != expected:
+            raise ValueError(
+                "Gym checkpoint participant ownership does not match topology: "
+                f"missing={sorted(expected - set(self.participant_owners))!r}, "
+                f"unexpected={sorted(set(self.participant_owners) - expected)!r}"
+            )
+        for identity, owners in self.participant_owners.items():
+            if not owners or owners != sorted(set(owners)):
+                raise ValueError(
+                    "Gym checkpoint participant owners must be a non-empty sorted "
+                    f"unique list: identity={identity!r}, owners={owners!r}"
+                )
+        return self
 
     @classmethod
     def from_discovered(
@@ -391,13 +426,15 @@ class GymCheckpointTopology(_StrictWireModel):
 
     def fingerprint(self) -> str:
         """Return a canonical digest without runtime or additive capabilities."""
-        compatibility_identity = {
+        compatibility_identity: dict[str, object] = {
             "schema_version": self.schema_version,
             "participants": [
                 participant.model_dump(mode="json", exclude={"features"})
                 for participant in self.participants
             ],
         }
+        if self.participant_owners:
+            compatibility_identity["participant_owners"] = self.participant_owners
         payload = json.dumps(
             compatibility_identity,
             sort_keys=True,
@@ -1066,6 +1103,49 @@ class GymCheckpointCommitResult(_StrictWireModel):
         return self
 
 
+def rebase_gym_checkpoint_commit_result(
+    checkpoint: GymCheckpointCommitResult,
+    relative_root: Path,
+) -> GymCheckpointCommitResult:
+    """Rebase one Gym actor's artifact paths into the outer snapshot root."""
+    if relative_root.is_absolute() or ".." in relative_root.parts:
+        raise ValueError(
+            f"Gym checkpoint rebase root must be a safe relative path: {relative_root}"
+        )
+
+    def rebase_artifact(
+        artifact: GymCheckpointArtifactReference,
+    ) -> GymCheckpointArtifactReference:
+        return artifact.model_copy(
+            update={"relative_path": str(relative_root / artifact.relative_path)}
+        )
+
+    participants: list[GymParticipantCommitResult] = []
+    for result in checkpoint.participants:
+        payload = result.payload
+        if isinstance(payload, GymAgentCommitResponse):
+            payload = payload.model_copy(
+                update={
+                    "continuation_index": rebase_artifact(payload.continuation_index)
+                }
+            )
+        elif isinstance(payload, GymModelCommitResponse):
+            payload = payload.model_copy(
+                update={
+                    "storage_reference_index": rebase_artifact(
+                        payload.storage_reference_index
+                    )
+                }
+            )
+        manifest = result.manifest.model_copy(
+            update={"relative_path": str(relative_root / result.manifest.relative_path)}
+        )
+        participants.append(
+            result.model_copy(update={"payload": payload, "manifest": manifest})
+        )
+    return checkpoint.model_copy(update={"participants": participants})
+
+
 def validate_gym_checkpoint_manifests(
     checkpoint_dir: Path,
     checkpoint: GymCheckpointCommitResult,
@@ -1425,6 +1505,44 @@ class GymCheckpointRestoreResult(_StrictWireModel):
         if len(identities) != len(set(identities)):
             raise ValueError("Gym checkpoint restore contains duplicate participants")
         return self
+
+
+def rebase_gym_checkpoint_restore_result(
+    restored: GymCheckpointRestoreResult,
+    relative_root: Path,
+) -> GymCheckpointRestoreResult:
+    """Rebase one Gym actor's restored artifact paths to the snapshot root."""
+    if relative_root.is_absolute() or ".." in relative_root.parts:
+        raise ValueError(
+            f"Gym checkpoint rebase root must be a safe relative path: {relative_root}"
+        )
+
+    def rebase_artifact(
+        artifact: GymCheckpointArtifactReference,
+    ) -> GymCheckpointArtifactReference:
+        return artifact.model_copy(
+            update={"relative_path": str(relative_root / artifact.relative_path)}
+        )
+
+    participants: list[GymParticipantRestoreResult] = []
+    for result in restored.participants:
+        payload = result.payload
+        if isinstance(payload, GymAgentRestoreResponse):
+            payload = payload.model_copy(
+                update={
+                    "continuation_index": rebase_artifact(payload.continuation_index)
+                }
+            )
+        elif isinstance(payload, GymModelRestoreResponse):
+            payload = payload.model_copy(
+                update={
+                    "storage_reference_index": rebase_artifact(
+                        payload.storage_reference_index
+                    )
+                }
+            )
+        participants.append(result.model_copy(update={"payload": payload}))
+    return restored.model_copy(update={"participants": participants})
 
 
 def validate_gym_checkpoint_restore_artifacts(

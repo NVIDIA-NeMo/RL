@@ -12,8 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import importlib.util
+import io
 import json
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -28,6 +31,70 @@ _SPEC = importlib.util.spec_from_file_location(
 assert _SPEC is not None and _SPEC.loader is not None
 _HELPER = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_HELPER)
+
+
+def _sha256(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def test_agent_records_resolve_index_from_shard_commit_root(tmp_path: Path) -> None:
+    snapshot = tmp_path / "snapshot"
+    commit_root = snapshot / "gym-shards" / "first"
+    directory = commit_root / "gym" / "agent"
+    directory.mkdir(parents=True)
+    member_name = "rollout-a.a0.json"
+    record = {
+        "rollout_id": "rollout-a",
+        "attempt_index": 0,
+        "boundary_index": 1,
+    }
+    record_payload = json.dumps(record).encode()
+
+    archive_path = directory / "agent-part-000000.tar"
+    with tarfile.open(archive_path, mode="w") as archive:
+        info = tarfile.TarInfo(member_name)
+        info.size = len(record_payload)
+        archive.addfile(info, io.BytesIO(record_payload))
+    archive_payload = archive_path.read_bytes()
+
+    index_record = {
+        "rollout_id": "rollout-a",
+        "attempt_index": 0,
+        "archive": archive_path.name,
+        "member": member_name,
+        "sha256": _sha256(record_payload),
+        "bytes": len(record_payload),
+    }
+    index_payload = (json.dumps(index_record) + "\n").encode()
+    index_path = directory / "agent-index.jsonl"
+    index_path.write_bytes(index_payload)
+
+    manifest = {
+        "schema_version": 2,
+        "records": 1,
+        "archives": [
+            {
+                "name": archive_path.name,
+                "sha256": _sha256(archive_payload),
+                "members": 1,
+                "bytes": len(archive_payload),
+            }
+        ],
+        "record_index": {
+            "relative_path": str(index_path.relative_to(commit_root)),
+            "sha256": _sha256(index_payload),
+            "records": 1,
+            "bytes": len(index_payload),
+        },
+    }
+    manifest_path = directory / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest))
+
+    assert _HELPER._read_agent_records(
+        snapshot,
+        manifest_path,
+        commit_root=commit_root,
+    ) == [record]
 
 
 def test_workplace_snapshot_counts_exact_sentinel_row() -> None:
