@@ -307,7 +307,7 @@ def test_all_config_no_tp_size_accuracy_issues(config_file):
     """Test that all config files in examples/configs have no TP size >= 4 accuracy issues.
 
     There is a known batch-variant accuracy issue with TP>=4 for both DTensor and Megatron backend.
-    Related document: https://docs.nvidia.com/nemo/rl/latest/guides/dtensor-tp-accuracy.html#root-cause.
+    Related document: https://docs.nvidia.com/nemo/rl/latest/guides/automodel-tp-accuracy.html#root-cause.
     """
 
     skip_config_files = [

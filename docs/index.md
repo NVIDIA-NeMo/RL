@@ -341,7 +341,7 @@ guides/checkpoint-engine-refit.md
 guides/dynamo-generation.md
 guides/router-replay.md
 guides/muon-optimizer.md
-guides/dtensor-tp-accuracy.md
+guides/automodel-tp-accuracy.md
 guides/ft-launcher-guide.md
 ```
 
