@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import math
 import os
-import warnings
 from typing import Any, NotRequired, Optional, TypedDict, cast
 
 import numpy as np
@@ -81,8 +80,8 @@ from nemo_rl.utils.timer import TimeoutChecker, Timer
 #     dict-level dim check skips it.
 #   - teacher_input_ids/teacher_token_mask + alignment_*: produced by
 #     CrossTokenizerCollator (in DataLoader workers).
-# alignment_student_chunk_id and alignment_student_exact_partition_mask are
-# [B, T_s] and DO follow the student-seq invariant, so they are NOT listed.
+# alignment_student_chunk_id is [B, T_s] and DOES follow the student-seq
+# invariant, so it is NOT listed.
 def xtoken_non_student_seq_keys(
     loss_fn: "CrossTokenizerDistillationLossFn",
 ) -> frozenset[str]:
@@ -97,8 +96,8 @@ def xtoken_non_student_seq_keys(
     dicts, not a tensor); a cross-tokenizer teacher additionally rides its
     teacher-seq tokenization (``teacher_{i}_input_ids`` / ``teacher_{i}_token_mask``,
     ``[B, T_t]``) and its teacher-seq / max_pairs ``alignment_{i}_*`` keys. The
-    ``alignment_{i}_student_*`` (``[B, T_s]``) and ``alignment_{i}_num_chunks``
-    (``[B]``) keys follow the student-seq invariant and are NOT skipped.
+    ``alignment_{i}_student_chunk_id`` (``[B, T_s]``) follows the student-seq
+    invariant and is NOT skipped.
     """
     keys: set[str] = set()
     for i in range(loss_fn.num_teachers):
@@ -108,7 +107,6 @@ def xtoken_non_student_seq_keys(
             keys.add(f"teacher_{i}_token_mask")
             keys.add(f"alignment_{i}_pair_valid")
             keys.add(f"alignment_{i}_pair_is_correct")
-            keys.add(f"alignment_{i}_teacher_exact_partition_mask")
             keys.add(f"alignment_{i}_teacher_chunk_id")
     return frozenset(keys)
 
@@ -203,56 +201,14 @@ class TeacherConfig(BaseModel, extra="allow"):
 
     @model_validator(mode="before")
     @classmethod
-    def _migrate_legacy_projection_matrix_path(cls, value: Any) -> Any:
-        """Migrate the released root projection path into ``aligner``."""
-        if not isinstance(value, dict) or "projection_matrix_path" not in value:
-            return value
-
-        migrated = dict(value)
-        legacy_path = migrated.pop("projection_matrix_path")
-        if "aligner" not in migrated:
-            migrated["aligner"] = {"projection_matrix_path": legacy_path}
-        else:
-            raw_aligner = migrated["aligner"]
-            if isinstance(raw_aligner, TeacherAlignerConfig):
-                if (
-                    "projection_matrix_path" in raw_aligner.model_fields_set
-                    and raw_aligner.projection_matrix_path != legacy_path
-                ):
-                    raise ValueError(
-                        "conflicting projection matrix paths at "
-                        "teachers[i].projection_matrix_path and "
-                        "teachers[i].aligner.projection_matrix_path"
-                    )
-                aligner = raw_aligner.model_dump()
-                aligner["projection_matrix_path"] = legacy_path
-                migrated["aligner"] = aligner
-            elif isinstance(raw_aligner, dict):
-                aligner = dict(raw_aligner)
-                if (
-                    "projection_matrix_path" in aligner
-                    and aligner["projection_matrix_path"] != legacy_path
-                ):
-                    raise ValueError(
-                        "conflicting projection matrix paths at "
-                        "teachers[i].projection_matrix_path and "
-                        "teachers[i].aligner.projection_matrix_path"
-                    )
-                aligner["projection_matrix_path"] = legacy_path
-                migrated["aligner"] = aligner
-            else:
-                raise ValueError(
-                    "teachers[i].aligner must be a mapping when using the legacy "
-                    "teachers[i].projection_matrix_path field"
-                )
-
-        warnings.warn(
-            "teachers[i].projection_matrix_path is deprecated; use "
-            "teachers[i].aligner.projection_matrix_path instead.",
-            FutureWarning,
-            stacklevel=2,
-        )
-        return migrated
+    def _reject_legacy_projection_matrix_path(cls, value: Any) -> Any:
+        """Reject the legacy root projection path with the supported location."""
+        if isinstance(value, dict) and "projection_matrix_path" in value:
+            raise ValueError(
+                "teachers[i].projection_matrix_path is no longer supported; "
+                "move it to teachers[i].aligner.projection_matrix_path."
+            )
+        return value
 
     def policy_config(self) -> PolicyConfig:
         """Recover the plain ``PolicyConfig`` dict (cross-tokenizer knobs stripped)."""
@@ -271,20 +227,6 @@ class MasterConfig(BaseModel, extra="allow"):
     logger: LoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
-
-    @model_validator(mode="before")
-    @classmethod
-    def _reject_shared_drop_first_assistant_chunk_kl(cls, value: Any) -> Any:
-        """Reject the unreleased shared spelling instead of ignoring it."""
-        if isinstance(value, dict):
-            data = value.get("data")
-            if isinstance(data, dict) and "drop_first_assistant_chunk_kl" in data:
-                raise ValueError(
-                    "data.drop_first_assistant_chunk_kl was replaced by the "
-                    "per-teacher "
-                    "teachers[i].aligner.drop_first_assistant_chunk_kl field"
-                )
-        return value
 
 
 # ===============================================================================
@@ -643,11 +585,8 @@ def export_teacher_logits_and_pack(
             for field in (
                 "pair_valid",
                 "pair_is_correct",
-                "student_exact_partition_mask",
-                "teacher_exact_partition_mask",
                 "student_chunk_id",
                 "teacher_chunk_id",
-                "num_chunks",
             ):
                 train_data[f"alignment_{i}_{field}"] = batch[f"alignment_{i}_{field}"]
 

@@ -101,20 +101,11 @@ def _make_batch(
         batch[f"alignment_{i}_pair_is_correct"] = torch.ones(
             (batch_size, 2), dtype=torch.bool
         )
-        batch[f"alignment_{i}_student_exact_partition_mask"] = torch.zeros(
-            (batch_size, t_student), dtype=torch.bool
-        )
-        batch[f"alignment_{i}_teacher_exact_partition_mask"] = torch.zeros(
-            (batch_size, t_teacher), dtype=torch.bool
-        )
         batch[f"alignment_{i}_student_chunk_id"] = torch.zeros(
             (batch_size, t_student), dtype=torch.long
         )
         batch[f"alignment_{i}_teacher_chunk_id"] = torch.zeros(
             (batch_size, t_teacher), dtype=torch.long
-        )
-        batch[f"alignment_{i}_num_chunks"] = torch.tensor(
-            [1] * batch_size, dtype=torch.long
         )
     # validate() pads ragged val batches via BatchedDataDict.size, so the mock
     # batches must be BatchedDataDict (the train path reads them as a dict too).
@@ -347,28 +338,28 @@ def test_teacher_aligner_config_explicit_values_serialize_and_stay_out_of_policy
     assert "aligner" not in teacher.policy_config()
 
 
-def test_legacy_teacher_projection_path_migrates_and_warns():
-    with pytest.warns(FutureWarning, match="aligner.projection_matrix_path"):
-        teacher = TeacherConfig(projection_matrix_path="/tmp/legacy.pt")
-
-    assert teacher.aligner.projection_matrix_path == "/tmp/legacy.pt"
-    assert "projection_matrix_path" not in teacher.model_dump()
-
-
-def test_conflicting_legacy_and_nested_projection_paths_fail():
-    with pytest.raises(ValidationError, match="conflicting projection matrix paths"):
-        TeacherConfig(
-            projection_matrix_path="/tmp/legacy.pt",
-            aligner={"projection_matrix_path": "/tmp/nested.pt"},
-        )
-
-
-def test_shared_drop_first_assistant_chunk_kl_is_rejected():
+@pytest.mark.parametrize("legacy_path", [None, "/tmp/legacy.pt"])
+@pytest.mark.parametrize(
+    "aligner",
+    [
+        None,
+        {},
+        {"projection_matrix_path": "/tmp/legacy.pt"},
+        {"projection_matrix_path": "/tmp/nested.pt"},
+        TeacherAlignerConfig(projection_matrix_path="/tmp/legacy.pt"),
+    ],
+)
+def test_legacy_teacher_projection_path_is_rejected(
+    legacy_path: str | None, aligner: dict | TeacherAlignerConfig | None
+) -> None:
+    config = {"projection_matrix_path": legacy_path}
+    if aligner is not None:
+        config["aligner"] = aligner
     with pytest.raises(
         ValidationError,
-        match=r"teachers\[i\]\.aligner\.drop_first_assistant_chunk_kl",
+        match=r"move it to teachers\[i\]\.aligner\.projection_matrix_path",
     ):
-        MasterConfig.model_validate({"data": {"drop_first_assistant_chunk_kl": True}})
+        TeacherConfig.model_validate(config)
 
 
 def test_empty_teachers_list_rejected_at_config_load():
@@ -719,9 +710,8 @@ def test_skip_keys_builder_cross_and_same_vocab():
     assert "teacher_0_token_mask" in keys
     assert "alignment_0_pair_valid" in keys
     assert "alignment_0_teacher_chunk_id" in keys
-    # Student-seq alignment keys ([B, T_s]) and num_chunks ([B]) are NOT skipped.
+    # Student-seq alignment keys ([B, T_s]) are NOT skipped.
     assert "alignment_0_student_chunk_id" not in keys
-    assert "alignment_0_num_chunks" not in keys
     # Same-vocab teacher 1 also ships full logits over IPC, so its handle-list
     # key (a non-tensor) is skipped; it reuses the student tokenization, so it
     # has no teacher-seq token keys and no teacher-indexed alignment keys.
@@ -1006,34 +996,48 @@ def test_averaged_logits_same_tokenizer_takes_direct_kl_fast_path():
 
 
 @pytest.mark.parametrize("metric", ["ce", "entropy", "max_prob"])
-def test_teacher_weight_score_ignores_padded_positions(metric):
-    # The per-teacher weight/selection score must exclude padded positions:
-    # padding logits are near-uniform noise and would otherwise dominate the
-    # score on long-padded batches. Corrupting everything in the padded tail
-    # must not change the score.
+@pytest.mark.parametrize(
+    "mask", [[1, 1, 1, 0, 0], [0, 0, 1, 1, 0]], ids=["padding", "chat"]
+)
+def test_teacher_weight_score_uses_only_scored_positions(
+    metric: str, mask: list[int]
+) -> None:
+    # Context and padding remain available to the model but must not affect
+    # teacher weights or selection. Only assistant positions count in chat mode.
     fn = CrossTokenizerDistillationLossFn.__new__(CrossTokenizerDistillationLossFn)
     fn.sum_weights_metric = metric
 
-    torch.manual_seed(0)
     batch, seqlen, vocab = 2, 5, 8
-    logits = torch.randn(batch, seqlen, vocab)
-    ids = torch.randint(0, vocab, (batch, seqlen))
-    # Last two positions of each sample are padding.
-    token_mask = torch.tensor([[1, 1, 1, 0, 0], [1, 1, 1, 0, 0]], dtype=torch.float32)
+    logits = torch.zeros(batch, seqlen, vocab)
+    ids = torch.ones(batch, seqlen, dtype=torch.long)
+    token_mask = torch.tensor([mask] * batch, dtype=torch.float32)
     sample_mask = torch.ones(batch)
 
     score = fn._teacher_weight_score(logits, ids, token_mask, sample_mask)
 
-    # Corrupt the padded tail; a properly masked score must not move.
+    # CE scores the next token, so the preceding logit predicts each target.
+    # In particular, the last prompt logit predicts the first assistant token.
+    scored_logits = token_mask.bool()
+    if metric == "ce":
+        scored_logits = torch.zeros_like(scored_logits)
+        scored_logits[:, :-1] = token_mask[:, 1:].bool()
+
     logits_corrupt = logits.clone()
-    logits_corrupt[:, 3:, :] = 1e4
+    logits_corrupt[..., 0][~scored_logits] = 10.0
     ids_corrupt = ids.clone()
-    ids_corrupt[:, 3:] = 0
+    ids_corrupt[~token_mask.bool()] = 0
     score_corrupt = fn._teacher_weight_score(
         logits_corrupt, ids_corrupt, token_mask, sample_mask
     )
 
     assert torch.allclose(score, score_corrupt, atol=1e-5)
+
+    # Making the scored predictions confident in the correct token must change
+    # the score, ruling out a mask that accidentally excludes the answer too.
+    logits_answer = logits.clone()
+    logits_answer[..., 1][scored_logits] = 10.0
+    score_answer = fn._teacher_weight_score(logits_answer, ids, token_mask, sample_mask)
+    assert score_answer > score
 
 
 def test_teacher_weight_score_masks_dropped_samples():

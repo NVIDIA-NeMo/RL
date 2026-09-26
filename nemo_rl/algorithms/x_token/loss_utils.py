@@ -31,20 +31,17 @@ Used by both :mod:`token_aligner` and
   :func:`get_sparse_projection_matrix` / :func:`get_topk_projection`
   process-local caches, :func:`slice_sparse_projection_rows`, and
   :func:`build_exact_token_map` (cached common/uncommon partition).
-- :func:`alignment_from_flat_batch` rehydrates the flat ``alignment_*``
-  data-dict keys into an :class:`AlignmentBatch`.
 """
 
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional, Tuple, Union
 
 import torch
 from torch.distributed.tensor import DTensor
 
-from nemo_rl.algorithms.x_token.token_aligner import AlignmentBatch
 from nemo_rl.distributed.model_utils import (
     cp_load_balanced_to_contiguous,
     cp_shift_next,
@@ -57,17 +54,6 @@ from nemo_rl.models.dtensor.parallelize import to_local_if_dtensor
 if TYPE_CHECKING:
     from nemo_automodel.components.distributed.context_parallel import (
         ContextParallelSharder,
-    )
-
-
-def alignment_from_flat_batch(data: Mapping[str, Any]) -> AlignmentBatch:
-    """Rebuild :class:`AlignmentBatch` from the flat ``alignment_*`` keys.
-
-    The field set is driven off :class:`AlignmentBatch` so the helper
-    can't drift from the schema.
-    """
-    return AlignmentBatch(
-        **{f.name: data[f"alignment_{f.name}"] for f in fields(AlignmentBatch)}
     )
 
 

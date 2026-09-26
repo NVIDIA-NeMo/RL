@@ -2045,8 +2045,7 @@ class CrossTokenizerDistillationLossDataDict(TypedDict):
     - Cross-tokenizer teacher only: ``teacher_{i}_input_ids`` /
       ``teacher_{i}_token_mask`` ``[B, T_t]`` and ``alignment_{i}_*``
       (``pair_valid`` / ``pair_is_correct`` ``[B, max_pairs]``;
-      ``student_chunk_id`` ``[B, T_s]``; ``teacher_chunk_id`` ``[B, T_t]``;
-      partition masks; ``num_chunks``).
+      ``student_chunk_id`` ``[B, T_s]``; ``teacher_chunk_id`` ``[B, T_t]``).
     - Same-tokenizer teacher: no ``teacher_{i}_input_ids`` / ``alignment_{i}_*``;
       it reuses the student tokenization (identity 1:1 aligned).
     """

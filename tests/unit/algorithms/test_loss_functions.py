@@ -2508,13 +2508,11 @@ def _ct_loss_cfg(projection_path, *, gold_loss):
 def _ct_gold_data(student_chunk_id, teacher_chunk_id, pair_valid, sample_mask):
     """Flat CT loss data dict the gold path consumes.
 
-    ``_compute_gold`` reads the ``alignment_*`` keys via
-    ``alignment_from_flat_batch`` plus ``sample_mask``. The partition masks
-    and ``pair_is_correct`` are required by the schema but unused by the gold
-    path, so they are filled with correctly shaped zeros/ones.
+    ``_ct_gold_prep`` reads the ``alignment_*`` keys via ``localize_alignment``
+    plus ``sample_mask``. ``pair_is_correct`` is unused by the gold path, so
+    it is filled with correctly shaped ones.
     """
     b, t_s = student_chunk_id.shape
-    t_t = teacher_chunk_id.shape[1]
     max_pairs = pair_valid.shape[1]
     return BatchedDataDict(
         {
@@ -2524,15 +2522,8 @@ def _ct_gold_data(student_chunk_id, teacher_chunk_id, pair_valid, sample_mask):
             "sample_mask": sample_mask,
             "alignment_pair_valid": pair_valid,
             "alignment_pair_is_correct": torch.ones((b, max_pairs), dtype=torch.bool),
-            "alignment_student_exact_partition_mask": torch.zeros(
-                (b, t_s), dtype=torch.bool
-            ),
-            "alignment_teacher_exact_partition_mask": torch.zeros(
-                (b, t_t), dtype=torch.bool
-            ),
             "alignment_student_chunk_id": student_chunk_id,
             "alignment_teacher_chunk_id": teacher_chunk_id,
-            "alignment_num_chunks": pair_valid.sum(dim=1).long(),
         }
     )
 
