@@ -215,11 +215,39 @@ def get_microbatch_iterator(
     if cfg["dynamic_batching"]["enabled"]:
         mb_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
         iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
+        max_batch_ct = torch.tensor([iterator_len], device="cuda")
+        torch.distributed.all_reduce(
+            max_batch_ct,
+            op=torch.distributed.ReduceOp.MAX,
+            group=dp_mesh.get_group(),
+        )
+
+        # Dynamic batching can produce a different number of microbatches on each
+        # DP rank because rank-local sequence lengths differ. Every rank must still
+        # execute the same number of forwards/backwards: FSDP and MoE collectives
+        # otherwise diverge when a shorter rank exhausts its iterator. Replay local
+        # batches as zero-loss dummies; ``num_valid_microbatches`` keeps them out of
+        # metrics and gradients in automodel_forward_backward().
+        dummy_batch_ct = int(max_batch_ct.item() - iterator_len)
+        if dummy_batch_ct > 0:
+            if iterator_len == 0:
+                raise RuntimeError(
+                    "Dynamic batching cannot pad an empty rank-local iterator; "
+                    "every DP rank must receive at least one microbatch"
+                )
+            dummy_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
+            dummy_iterator = itertools.islice(
+                itertools.cycle(dummy_iterator), dummy_batch_ct
+            )
     elif enable_seq_packing:
         mb_iterator = data.make_microbatch_iterator_for_packable_sequences()
         iterator_len, _ = data.get_microbatch_iterator_for_packable_sequences_len()
         max_batch_ct = torch.tensor([iterator_len], device="cuda")
-        torch.distributed.all_reduce(max_batch_ct, op=torch.distributed.ReduceOp.MAX)
+        torch.distributed.all_reduce(
+            max_batch_ct,
+            op=torch.distributed.ReduceOp.MAX,
+            group=dp_mesh.get_group(),
+        )
 
         # Sequence packing can end up with unevenly distributed batch counts across DP ranks.
         # We add dummy batches to the end of the iterator to make the batch counts equal.

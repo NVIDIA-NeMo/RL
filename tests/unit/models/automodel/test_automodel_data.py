@@ -46,6 +46,25 @@ def mock_loss_fn():
 
 
 @pytest.fixture
+def mock_cuda_tensor():
+    """Keep collective-count tensors on CPU for host-only unit tests."""
+    original_tensor = torch.tensor
+
+    def make_cpu_tensor(*args, **kwargs):
+        if kwargs.get("device") == "cuda":
+            kwargs["device"] = "cpu"
+        return original_tensor(*args, **kwargs)
+
+    with (
+        patch(
+            "nemo_rl.models.automodel.data.torch.tensor", side_effect=make_cpu_tensor
+        ),
+        patch.object(torch.Tensor, "cuda", lambda self, *args, **kwargs: self),
+    ):
+        yield
+
+
+@pytest.fixture
 def mock_dp_mesh():
     mesh = MagicMock()
     mesh.get_group.return_value = MagicMock()
@@ -92,7 +111,8 @@ class TestGetMicrobatchIterator:
             assert batch.original_batch_size == 4
             assert batch.original_seq_len == 128
 
-    def test_dynamic_batching(self, mock_tokenizer):
+    @patch("nemo_rl.models.automodel.data.torch.distributed.all_reduce")
+    def test_dynamic_batching(self, mock_all_reduce, mock_tokenizer, mock_cuda_tensor):
         """Test dynamic batching."""
         # Create test data
         data = BatchedDataDict(
@@ -135,6 +155,11 @@ class TestGetMicrobatchIterator:
         mbs = 4
         mock_dp_mesh = MagicMock()
 
+        def keep_local_batch_count(tensor, *args, **kwargs):
+            tensor[0] = 3
+
+        mock_all_reduce.side_effect = keep_local_batch_count
+
         processed_iterator, iterator_len = get_microbatch_iterator(
             data=data,
             cfg=cfg,
@@ -153,6 +178,57 @@ class TestGetMicrobatchIterator:
         assert len(batches) == 3
         for batch in batches:
             assert isinstance(batch, ProcessedMicrobatch)
+
+        mock_all_reduce.assert_called_once()
+        _, kwargs = mock_all_reduce.call_args
+        assert kwargs["op"] == torch.distributed.ReduceOp.MAX
+        assert kwargs["group"] is mock_dp_mesh.get_group.return_value
+
+    @patch("nemo_rl.models.automodel.data.torch.distributed.all_reduce")
+    def test_dynamic_batching_with_dummy_batches(
+        self, mock_all_reduce, mock_tokenizer, mock_cuda_tensor
+    ):
+        """Shorter DP ranks replay local batches so collective order stays aligned."""
+        batch = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 1000, (2, 128)),
+                "sample_mask": torch.ones(2, dtype=torch.bool),
+            }
+        )
+        data = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 1000, (2, 128)),
+                "sample_mask": torch.ones(2, dtype=torch.bool),
+            }
+        )
+        data.make_microbatch_iterator_with_dynamic_shapes = MagicMock(
+            side_effect=lambda: iter([batch])
+        )
+        data.get_microbatch_iterator_dynamic_shapes_len = MagicMock(return_value=1)
+
+        def set_group_max(tensor, *args, **kwargs):
+            tensor[0] = 3
+
+        mock_all_reduce.side_effect = set_group_max
+        cfg = {
+            "dynamic_batching": {"enabled": True},
+            "sequence_packing": {"enabled": False},
+            "dtensor_cfg": {"sequence_parallel": False},
+        }
+        mock_dp_mesh = MagicMock()
+
+        processed_iterator, iterator_len = get_microbatch_iterator(
+            data=data,
+            cfg=cfg,
+            mbs=1,
+            dp_mesh=mock_dp_mesh,
+            tokenizer=mock_tokenizer,
+        )
+
+        assert iterator_len == 1
+        assert len(list(processed_iterator)) == 3
+        assert data.make_microbatch_iterator_with_dynamic_shapes.call_count == 2
+        mock_all_reduce.assert_called_once()
 
     @patch("nemo_rl.models.automodel.data.torch.distributed.all_reduce")
     def test_sequence_packing(self, mock_all_reduce, mock_tokenizer):
