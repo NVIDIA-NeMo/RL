@@ -28,7 +28,7 @@ Public surface:
     - :class:`AlignmentBatch` — dense-padded per-batch alignment payload that
       covers all three loss modes (P-KL, gold_loss, xtoken_loss).
     - :class:`TokenAligner` — owns the two tokenizers and the projection
-      matrix, exposes :meth:`align` for the collator.
+      matrix, exposes :meth:`align` and :meth:`align_chat` for the collator.
     - :func:`align_by_offsets_cluster` — the single-sample offset alignment
       kernel, also usable directly.
 """
@@ -233,6 +233,151 @@ class TokenAligner:
         )
         return batch
 
+    def align_chat(
+        self,
+        student_ids: torch.Tensor,
+        teacher_ids: torch.Tensor,
+        *,
+        student_offsets: torch.Tensor,
+        teacher_offsets: torch.Tensor,
+        student_asst_char_spans: list[list[tuple[int, int]]],
+        teacher_asst_char_spans: list[list[tuple[int, int]]],
+        student_attention_mask: torch.Tensor | None = None,
+        teacher_attention_mask: torch.Tensor | None = None,
+        student_asst_mask: torch.Tensor | None = None,
+        teacher_asst_mask: torch.Tensor | None = None,
+        student_eot_indices: list[list[int]] | None = None,
+        teacher_eot_indices: list[list[int]] | None = None,
+        student_alignment_regions: list[list[dict[str, tuple[int, int]]]] | None = None,
+        teacher_alignment_regions: list[list[dict[str, tuple[int, int]]]] | None = None,
+        drop_first_content_pair: bool = False,
+        included_regions: Collection[str] | None = None,
+    ) -> AlignmentBatch:
+        """Align assistant turns in a batch of independently rendered chats.
+
+        Args:
+            student_ids: Padded ``[B, T_s]`` student token IDs.
+            teacher_ids: Padded ``[B, T_t]`` teacher token IDs.
+            student_offsets: ``[B, T_s, 2]`` offsets in each student render.
+            teacher_offsets: ``[B, T_t, 2]`` offsets in each teacher render.
+            student_asst_char_spans: Per-sample assistant content spans in the
+                student renders. Turns must correspond to the teacher spans.
+            teacher_asst_char_spans: Counterpart in the teacher renders.
+            student_attention_mask: Optional ``[B, T_s]`` real-token mask.
+                Padding is excluded from the returned chunk IDs.
+            teacher_attention_mask: Optional ``[B, T_t]`` counterpart.
+            student_asst_mask: Optional ``[B, T_s]`` mask selecting tokens
+                within assistant content regions.
+            teacher_asst_mask: Optional ``[B, T_t]`` counterpart.
+            student_eot_indices: Optional per-sample, per-turn EOT positions.
+                Use ``-1`` when truncation removed a turn's terminator. If
+                omitted, locate EOT by the end of the content span.
+            teacher_eot_indices: Counterpart for the teacher tokens.
+            student_alignment_regions: Optional per-sample, per-turn named
+                reasoning, close, and answer character spans.
+            teacher_alignment_regions: Counterpart for the teacher renders.
+            drop_first_content_pair: Omit each turn's first paired content
+                chunk from KD while retaining its EOT pair.
+            included_regions: Optional subset of reasoning, close, answer,
+                and eot to align when semantic regions are supplied.
+
+        Returns:
+            A dense-padded :class:`AlignmentBatch`, using the same token-index
+            coordinates and padding sentinels as :meth:`align`.
+        """
+        if student_ids.ndim != 2 or teacher_ids.ndim != 2:
+            raise ValueError("student_ids and teacher_ids must have shape [B, T]")
+        b, t_s = student_ids.shape
+        teacher_b, t_t = teacher_ids.shape
+        if teacher_b != b:
+            raise ValueError(f"student/teacher batch size mismatch: {b} vs {teacher_b}")
+        for name, offsets, ids, attention_mask, asst_mask in (
+            (
+                "student",
+                student_offsets,
+                student_ids,
+                student_attention_mask,
+                student_asst_mask,
+            ),
+            (
+                "teacher",
+                teacher_offsets,
+                teacher_ids,
+                teacher_attention_mask,
+                teacher_asst_mask,
+            ),
+        ):
+            if offsets.shape != (*ids.shape, 2):
+                raise ValueError(f"{name}_offsets must have shape [B, T, 2]")
+            for mask_name, mask in (
+                ("attention_mask", attention_mask),
+                ("asst_mask", asst_mask),
+            ):
+                if mask is not None and mask.shape != ids.shape:
+                    raise ValueError(f"{name}_{mask_name} must have shape [B, T]")
+        for name, values in (
+            ("student_asst_char_spans", student_asst_char_spans),
+            ("teacher_asst_char_spans", teacher_asst_char_spans),
+            ("student_eot_indices", student_eot_indices),
+            ("teacher_eot_indices", teacher_eot_indices),
+            ("student_alignment_regions", student_alignment_regions),
+            ("teacher_alignment_regions", teacher_alignment_regions),
+        ):
+            if values is not None and len(values) != b:
+                raise ValueError(f"{name} must have one entry per batch sample ({b})")
+
+        per_sample_pairs: list[list[AlignmentPair]] = []
+        for i in range(b):
+            per_sample_pairs.append(
+                self.align_one_offset_per_asst(
+                    student_ids[i].tolist(),
+                    [tuple(offset) for offset in student_offsets[i].tolist()],
+                    student_asst_char_spans[i],
+                    teacher_ids[i].tolist(),
+                    [tuple(offset) for offset in teacher_offsets[i].tolist()],
+                    teacher_asst_char_spans[i],
+                    student_asst_mask=(
+                        student_asst_mask[i].tolist()
+                        if student_asst_mask is not None
+                        else None
+                    ),
+                    teacher_asst_mask=(
+                        teacher_asst_mask[i].tolist()
+                        if teacher_asst_mask is not None
+                        else None
+                    ),
+                    student_eot_indices=(
+                        student_eot_indices[i]
+                        if student_eot_indices is not None
+                        else None
+                    ),
+                    teacher_eot_indices=(
+                        teacher_eot_indices[i]
+                        if teacher_eot_indices is not None
+                        else None
+                    ),
+                    student_alignment_regions=(
+                        student_alignment_regions[i]
+                        if student_alignment_regions is not None
+                        else None
+                    ),
+                    teacher_alignment_regions=(
+                        teacher_alignment_regions[i]
+                        if teacher_alignment_regions is not None
+                        else None
+                    ),
+                    drop_first_content_pair=drop_first_content_pair,
+                    included_regions=included_regions,
+                )
+            )
+        batch = self._pairs_to_batch(per_sample_pairs, b=b, t_s=t_s, t_t=t_t)
+        self._drop_padding(
+            batch,
+            student_attention_mask=student_attention_mask,
+            teacher_attention_mask=teacher_attention_mask,
+        )
+        return batch
+
     @staticmethod
     def _drop_padding(
         batch: AlignmentBatch,
@@ -372,8 +517,7 @@ class TokenAligner:
 
     # ------------------------------------------------------------------ #
     # Chat / instruct path: per-assistant-message alignment.
-    # These return raw 7-tuples (s_tokens, t_tokens, s_start, s_end, t_start,
-    # t_end, is_correct); the chat collator converts them to AlignmentPair.
+    # Both helpers return the same typed pairs as the plain-text path.
     # ------------------------------------------------------------------ #
     def _align_one_offset(
         self,
@@ -381,16 +525,15 @@ class TokenAligner:
         teacher_ids: List[int],
         student_offsets: List[Tuple[int, int]],
         teacher_offsets: List[Tuple[int, int]],
-    ) -> List[Tuple[Any, ...]]:
+    ) -> List[AlignmentPair]:
         """Single-sample offset-cluster alignment with the decode-fix mask.
 
-        Returns the raw 7-tuple pair list. Used by
-        :meth:`align_one_offset_per_asst` for each independently rebased
+        Used by :meth:`align_one_offset_per_asst` for each independently rebased
         assistant region. ``is_correct`` starts from the canonical-text match;
         pairs that fail are re-checked against their NFC-decoded text (catches
         CJK / whitespace-split asymmetry).
         """
-        pairs = align_by_offsets_cluster(
+        raw_pairs = align_by_offsets_cluster(
             student_ids,
             student_offsets,
             self.student_tokenizer,
@@ -398,19 +541,19 @@ class TokenAligner:
             teacher_offsets,
             self.teacher_tokenizer,
         )
-        if pairs:
-            pairs_6 = [(p[0], p[1], p[2], p[3], p[4], p[5]) for p in pairs]
-            mask = _decode_fix_correct_mask(
-                pairs_6,
-                student_ids_seq=student_ids,
-                teacher_ids_seq=teacher_ids,
-                student_tokenizer=self.student_tokenizer,
-                teacher_tokenizer=self.teacher_tokenizer,
+        mask = _decode_fix_correct_mask(
+            raw_pairs,
+            student_ids_seq=student_ids,
+            teacher_ids_seq=teacher_ids,
+            student_tokenizer=self.student_tokenizer,
+            teacher_tokenizer=self.teacher_tokenizer,
+        )
+        return [
+            AlignmentPair(s_tokens, t_tokens, s_start, s_end, t_start, t_end, correct)
+            for (s_tokens, t_tokens, s_start, s_end, t_start, t_end, _), correct in zip(
+                raw_pairs, mask
             )
-            pairs = [
-                (p[0], p[1], p[2], p[3], p[4], p[5], m) for p, m in zip(pairs_6, mask)
-            ]
-        return pairs
+        ]
 
     def align_one_offset_per_asst(
         self,
@@ -428,7 +571,7 @@ class TokenAligner:
         teacher_eot_indices: List[int] | None = None,
         drop_first_content_pair: bool = False,
         included_regions: Collection[str] | None = None,
-    ) -> List[Tuple[Any, ...]]:
+    ) -> List[AlignmentPair]:
         """Per-assistant-message offset-cluster alignment.
 
         Used by the chat collator where each side has its own rendered text,
@@ -450,7 +593,7 @@ class TokenAligner:
         teacher spans per message (removes cross-tokenizer KL on the opener
         chunk while leaving the CE token mask untouched). ``included_regions``
         optionally limits KD to a subset of ``reasoning``, ``close``,
-        ``answer``, ``eot``. Returns a flat 7-tuple list with full-sequence
+        ``answer``, ``eot``. Returns typed alignment pairs with full-sequence
         position indices.
         """
         if len(student_asst_char_spans) != len(teacher_asst_char_spans):
@@ -493,7 +636,7 @@ class TokenAligner:
                     "included_regions requires native semantic alignment regions"
                 )
 
-        combined: List[Tuple[Any, ...]] = []
+        combined: List[AlignmentPair] = []
         for turn_i, ((s_start_c, s_end_c), (t_start_c, t_end_c)) in enumerate(
             zip(student_asst_char_spans, teacher_asst_char_spans)
         ):
@@ -519,7 +662,7 @@ class TokenAligner:
                     ):
                         paired_regions.append((name, s_region, t_region))
 
-            turn_pairs: List[Tuple[Any, ...]] = []
+            turn_pairs: List[AlignmentPair] = []
             for _region_name, (s_region_start, s_region_end), (
                 t_region_start,
                 t_region_end,
@@ -569,18 +712,26 @@ class TokenAligner:
                     teacher_offsets=t_slice_off,
                 )
 
-                for s_toks, t_toks, s0, s1, t0, t1, ok in slice_pairs:
-                    full_s0 = s_idx[s0] if s0 != -1 else -1
-                    full_s1 = s_idx[s1 - 1] + 1 if s0 != -1 else -1
-                    full_t0 = t_idx[t0] if t0 != -1 else -1
-                    full_t1 = t_idx[t1 - 1] + 1 if t0 != -1 else -1
+                for pair in slice_pairs:
                     turn_pairs.append(
-                        (s_toks, t_toks, full_s0, full_s1, full_t0, full_t1, ok)
+                        AlignmentPair(
+                            s_tokens=pair.s_tokens,
+                            t_tokens=pair.t_tokens,
+                            s_start=s_idx[pair.s_start] if pair.s_start != -1 else -1,
+                            s_end=s_idx[pair.s_end - 1] + 1
+                            if pair.s_start != -1
+                            else -1,
+                            t_start=t_idx[pair.t_start] if pair.t_start != -1 else -1,
+                            t_end=t_idx[pair.t_end - 1] + 1
+                            if pair.t_start != -1
+                            else -1,
+                            is_correct=pair.is_correct,
+                        )
                     )
 
             if drop_first_content_pair:
                 for pair_i, pair in enumerate(turn_pairs):
-                    if pair[2] != -1 and pair[4] != -1:
+                    if pair.s_start != -1 and pair.t_start != -1:
                         del turn_pairs[pair_i]
                         break
             combined.extend(turn_pairs)
@@ -616,14 +767,18 @@ class TokenAligner:
             include_eot = included_region_set is None or "eot" in included_region_set
             if include_eot and s_eot_idx is not None and t_eot_idx is not None:
                 combined.append(
-                    (
-                        [student_ids[s_eot_idx]],
-                        [teacher_ids[t_eot_idx]],
-                        s_eot_idx,
-                        s_eot_idx + 1,
-                        t_eot_idx,
-                        t_eot_idx + 1,
-                        True,
+                    AlignmentPair(
+                        s_tokens=self.student_tokenizer.convert_ids_to_tokens(
+                            [student_ids[s_eot_idx]]
+                        ),
+                        t_tokens=self.teacher_tokenizer.convert_ids_to_tokens(
+                            [teacher_ids[t_eot_idx]]
+                        ),
+                        s_start=s_eot_idx,
+                        s_end=s_eot_idx + 1,
+                        t_start=t_eot_idx,
+                        t_end=t_eot_idx + 1,
+                        is_correct=True,
                     )
                 )
 
