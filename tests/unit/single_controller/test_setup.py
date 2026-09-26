@@ -961,27 +961,38 @@ class TestSetup:
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
-    @pytest.mark.parametrize(
-        "shards",
-        [
-            [
-                {"name": "first", "config_paths": ["first.yaml"]},
-                {"name": "second", "config_paths": ["second.yaml"]},
-            ],
-            [
-                {
-                    "name": "replicated",
-                    "config_paths": ["replicated.yaml"],
-                    "replicas": 2,
-                }
-            ],
-        ],
-    )
-    def test_gym_checkpointing_rejects_multiple_gym_actors_before_setup(self, shards):
+    def test_gym_checkpointing_accepts_multiple_distinct_shards(self):
         mc = _make_master_config(
             env={
                 "should_use_nemo_gym": True,
-                "nemo_gym": {"shards": shards},
+                "nemo_gym": {
+                    "shards": [
+                        {"name": "first", "config_paths": ["first.yaml"]},
+                        {"name": "second", "config_paths": ["second.yaml"]},
+                    ]
+                },
+            }
+        )
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=1.0,
+            gym={"capability_discovery_enabled": True},
+        )
+
+        validate_single_controller_config(mc)
+
+    def test_gym_checkpointing_rejects_replicated_shards_before_setup(self):
+        mc = _make_master_config(
+            env={
+                "should_use_nemo_gym": True,
+                "nemo_gym": {
+                    "shards": [
+                        {
+                            "name": "replicated",
+                            "config_paths": ["replicated.yaml"],
+                            "replicas": 2,
+                        }
+                    ]
+                },
             }
         )
         mc.rollout_checkpointing = RolloutCheckpointConfig(
@@ -991,7 +1002,34 @@ class TestSetup:
 
         with pytest.raises(
             NotImplementedError,
-            match="participant checkpointing currently supports exactly one",
+            match="not replicated shards yet",
+        ):
+            validate_single_controller_config(mc)
+
+    def test_prefix_checkpointing_rejects_multiple_gym_shards_before_setup(self):
+        mc = _make_master_config(
+            env={
+                "should_use_nemo_gym": True,
+                "nemo_gym": {
+                    "shards": [
+                        {"name": "first", "config_paths": ["first.yaml"]},
+                        {"name": "second", "config_paths": ["second.yaml"]},
+                    ]
+                },
+            }
+        )
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=1.0,
+            gym={
+                "capability_discovery_enabled": True,
+                "participant_checkpointing_enabled": True,
+                "generation_prefix_cuts_enabled": True,
+            },
+        )
+
+        with pytest.raises(
+            NotImplementedError,
+            match="aggregate every policy proxy's generation-cut proof",
         ):
             validate_single_controller_config(mc)
 
@@ -1132,7 +1170,13 @@ class TestSetup:
             patch.object(
                 sc_setup_mod.ray,
                 "get",
-                side_effect=lambda ref: topology if ref is topology_ref else ref,
+                side_effect=lambda ref: (
+                    [topology if item is topology_ref else item for item in ref]
+                    if isinstance(ref, list)
+                    else topology
+                    if ref is topology_ref
+                    else ref
+                ),
             ),
             patch(
                 "nemo_rl.experience.rollout_reassembler_actor."

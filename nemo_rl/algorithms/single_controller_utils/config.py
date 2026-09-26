@@ -1332,17 +1332,33 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     if master_config.rollout_checkpointing.gym.capability_discovery_enabled:
         nemo_gym_config = master_config.env.get("nemo_gym", {})
         shard_plan = parse_shard_plan(nemo_gym_config)
-        gym_actor_count = (
-            1
+        replicated_shards = (
+            []
             if shard_plan is None
-            else sum(shard.replicas for shard in shard_plan.shards)
+            else [
+                (shard.name, shard.replicas)
+                for shard in shard_plan.shards
+                if shard.replicas != 1
+            ]
         )
-        if gym_actor_count != 1:
+        if replicated_shards:
             raise NotImplementedError(
-                "Gym participant checkpointing currently supports exactly one "
-                f"NeMo-Gym actor, but env.nemo_gym.shards configures "
-                f"{gym_actor_count}. Configure one shard with replicas=1, or "
+                "Gym participant checkpointing supports multiple distinct shards, "
+                "but not replicated shards yet. A replica-local continuation must "
+                "be routed back to the exact actor that restored it; unsupported="
+                f"{replicated_shards!r}. Configure replicas=1 for every shard, or "
                 "disable rollout_checkpointing.gym.capability_discovery_enabled."
+            )
+        gym_actor_count = 1 if shard_plan is None else len(shard_plan.shards)
+        if (
+            gym_actor_count > 1
+            and master_config.rollout_checkpointing.gym.generation_prefix_cuts_enabled
+        ):
+            raise NotImplementedError(
+                "Generation-prefix recovery with multiple NeMo-Gym shards requires "
+                "Gym to aggregate every policy proxy's generation-cut proof and "
+                "attempt inventory into one model-ledger commit. Use turn-level "
+                "recovery for sharded Gym actors until that Gym contract is available."
             )
 
     async_config = master_config.async_rl

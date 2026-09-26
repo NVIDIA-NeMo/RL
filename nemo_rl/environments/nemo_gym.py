@@ -80,9 +80,11 @@ from nemo_rl.environments.gym_checkpoint import (
     GymCheckpointControlRequest,
     GymCheckpointDirectoryRequest,
     GymCheckpointPrepareResult,
+    GymCheckpointParticipantContract,
     GymCheckpointResumeResult,
     GymCheckpointRestoreResult,
     GymCheckpointTopology,
+    GymComponent,
     GymCompletionReceipt,
     GymCompletedExecution,
     GymCompletedExecutionAcknowledgementResponse,
@@ -1130,6 +1132,7 @@ Depending on your data shape, you may want to change these values."""
         *,
         phase: _GymCheckpointPhase,
         participants: Optional[tuple[GymDiscoveredParticipant, ...]] = None,
+        components: Optional[frozenset[GymComponent]] = None,
     ) -> tuple[GymDiscoveredParticipant, ...]:
         """Return phase participants in their dependency-safe control order."""
         component_order = _GYM_CHECKPOINT_COMPONENT_ORDERS[phase]
@@ -1142,6 +1145,10 @@ Depending on your data shape, you may want to change these values."""
                     discovered
                     for discovered in candidates
                     if self._participates_in_checkpoint_phase(discovered, phase)
+                    and (
+                        components is None
+                        or discovered.participant.component in components
+                    )
                 ),
                 key=lambda item: component_order[item.participant.component],
             )
@@ -1450,17 +1457,36 @@ Depending on your data shape, you may want to change these values."""
         checkpoint_id: str,
         deadline_ts: float,
         checkpoint_dir: str,
+        components: Optional[list[GymComponent]] = None,
+        continuation_indexes: Optional[list[dict[str, Any]]] = None,
     ) -> dict[str, Any]:
-        """Commit every stateful participant into a caller-owned temp directory."""
+        """Commit selected stateful participants into a caller-owned directory.
+
+        ``components`` and ``continuation_indexes`` let a controller coordinate
+        several Gym actors: local agents commit first, then one shared model
+        commit receives the union of their continuation indexes. The default
+        preserves the original single-actor transaction.
+        """
         common_request = GymCheckpointDirectoryRequest(
             checkpoint_id=checkpoint_id,
             deadline_ts=deadline_ts,
             checkpoint_dir=checkpoint_dir,
         ).model_dump(mode="json")
         results: list[GymParticipantCommitResult] = []
-        continuation_indexes: list[GymCheckpointArtifactReference] = []
+        validated_continuation_indexes = [
+            GymCheckpointArtifactReference.model_validate(item)
+            for item in continuation_indexes or []
+        ]
+        selected_components = frozenset(components) if components is not None else None
+        if selected_components is not None:
+            unknown_components = selected_components - _GYM_COMPONENT_KEYS
+            if unknown_components:
+                raise ValueError(
+                    f"Unknown Gym checkpoint components: {sorted(unknown_components)!r}"
+                )
         for discovered in self._ordered_checkpoint_participants(
-            phase=_GymCheckpointPhase.COMMIT
+            phase=_GymCheckpointPhase.COMMIT,
+            components=selected_components,
         ):
             participant = discovered.participant
             capabilities = discovered.capabilities
@@ -1482,7 +1508,7 @@ Depending on your data shape, you may want to change these values."""
                     checkpoint_id=checkpoint_id,
                     deadline_ts=deadline_ts,
                     checkpoint_dir=checkpoint_dir,
-                    continuation_indexes=continuation_indexes,
+                    continuation_indexes=validated_continuation_indexes,
                 ).model_dump(mode="json")
                 payload = GymModelCommitResponse.model_validate(
                     await self._control(
@@ -1512,7 +1538,7 @@ Depending on your data shape, you may want to change these values."""
                         json=request,
                     )
                 )
-                continuation_indexes.append(payload.continuation_index)
+                validated_continuation_indexes.append(payload.continuation_index)
             else:
                 request = common_request
                 payload = GymResourcesCommitResponse.model_validate(
@@ -1549,6 +1575,7 @@ Depending on your data shape, you may want to change these values."""
         source_checkpoint_id: Optional[str] = None,
         generation_cut_proofs: tuple[dict[str, object], ...] = (),
         generation_cut_exclusions: tuple[dict[str, object], ...] = (),
+        components: Optional[list[GymComponent]] = None,
     ) -> dict[str, Any]:
         """Restore every stateful participant but leave admission paused."""
         if self._active_gym_checkpoint_id not in (None, checkpoint_id):
@@ -1563,8 +1590,16 @@ Depending on your data shape, you may want to change these values."""
             checkpoint_dir=checkpoint_dir,
         ).model_dump(mode="json")
         results: list[GymParticipantRestoreResult] = []
+        selected_components = frozenset(components) if components is not None else None
+        if selected_components is not None:
+            unknown_components = selected_components - _GYM_COMPONENT_KEYS
+            if unknown_components:
+                raise ValueError(
+                    f"Unknown Gym checkpoint components: {sorted(unknown_components)!r}"
+                )
         for discovered in self._ordered_checkpoint_participants(
-            phase=_GymCheckpointPhase.RESTORE
+            phase=_GymCheckpointPhase.RESTORE,
+            components=selected_components,
         ):
             participant = discovered.participant
             capabilities = discovered.capabilities
@@ -1709,12 +1744,21 @@ Depending on your data shape, you may want to change these values."""
         self,
         checkpoint_id: str,
         deadline_ts: float,
+        components: Optional[list[GymComponent]] = None,
     ) -> dict[str, Any]:
         """Resume participants after commit, restore, or an aborted prepare."""
+        selected_components = frozenset(components) if components is not None else None
+        if selected_components is not None:
+            unknown_components = selected_components - _GYM_COMPONENT_KEYS
+            if unknown_components:
+                raise ValueError(
+                    f"Unknown Gym checkpoint components: {sorted(unknown_components)!r}"
+                )
         results = await self._resume_checkpoint_participants(
             checkpoint_id,
             deadline_ts,
             self._checkpoint_participants(),
+            components=selected_components,
         )
         self._gym_execution_registry.unfreeze(checkpoint_id)
         self._active_gym_checkpoint_id = None
@@ -1728,6 +1772,8 @@ Depending on your data shape, you may want to change these values."""
         checkpoint_id: str,
         deadline_ts: float,
         participants: tuple[GymDiscoveredParticipant, ...],
+        *,
+        components: Optional[frozenset[GymComponent]] = None,
     ) -> list[GymParticipantResumeResult]:
         """Resume a prepared subset after reopening every agent dependency."""
         request = GymCheckpointControlRequest(
@@ -1738,6 +1784,7 @@ Depending on your data shape, you may want to change these values."""
         ordered = self._ordered_checkpoint_participants(
             phase=_GymCheckpointPhase.RESUME,
             participants=participants,
+            components=components,
         )
         errors: list[BaseException] = []
         for discovered in ordered:
@@ -2843,6 +2890,45 @@ class NemoGymShardSet:
         return [handle for replicas in self.handles.values() for handle in replicas]
 
     @property
+    def checkpoint_instances(self) -> tuple[tuple[str, Any], ...]:
+        """Return deterministic checkpoint instance labels and actor handles.
+
+        Participant checkpointing currently rejects replicated shards during
+        config validation. Keep the replica suffix here anyway so the durable
+        directory layout and diagnostics remain unambiguous when replica-aware
+        continuation affinity is added later.
+        """
+        return tuple(
+            (
+                shard_name if len(replicas) == 1 else f"{shard_name}/{index}",
+                handle,
+            )
+            for shard_name, replicas in sorted(self.handles.items())
+            for index, handle in enumerate(replicas)
+        )
+
+    def checkpoint_handle_for_route(self, route_name: str) -> Any:
+        """Return the sole checkpoint actor that owns one routed Gym entry."""
+        shard_name = self.shard_for_route(route_name)
+        replicas = self.handles[shard_name]
+        if len(replicas) != 1:
+            raise ShardSetupError(
+                "Gym participant checkpoint routing requires exactly one replica "
+                f"for shard {shard_name!r}; configured={len(replicas)}"
+            )
+        return replicas[0]
+
+    def checkpoint_relative_dir(self, instance_label: str) -> Path:
+        """Return the snapshot-relative directory owned by one Gym instance."""
+        known_labels = {label for label, _handle in self.checkpoint_instances}
+        if instance_label not in known_labels:
+            raise ShardSetupError(
+                f"Unknown NeMo-Gym checkpoint instance {instance_label!r}; "
+                f"known={sorted(known_labels)!r}"
+            )
+        return Path("gym-shards", *instance_label.split("/"))
+
+    @property
     def hosted_routes(self) -> frozenset[str]:
         """Agent and task-source entry names this set can route to."""
         return frozenset(self.route_to_shard)
@@ -2989,6 +3075,102 @@ def sole_nemo_gym_checkpoint_actor(environment: Any) -> Any:
             "checkpointing or configure one shard with replicas=1."
         )
     return shard_set.sole_handle()
+
+
+def merge_nemo_gym_checkpoint_topologies(
+    topologies: Mapping[str, GymCheckpointTopology],
+) -> GymCheckpointTopology:
+    """Merge per-shard discovery while deduplicating shared model proxies.
+
+    Every shard has its own agent and resource servers, but all shards expose
+    the same policy-model participant backed by the shared generation fleet.
+    A repeated model contract is therefore one logical participant. Repeated
+    agent/resource identities are unsafe: they would make a continuation's
+    owning shard ambiguous, so fail during setup instead of silently restoring
+    it into the wrong actor.
+    """
+    if not topologies:
+        raise ValueError("NeMo-Gym checkpoint topology merge requires one actor")
+    if len(topologies) == 1:
+        return next(iter(topologies.values()))
+
+    contracts_by_identity: dict[
+        tuple[str, str, str], GymCheckpointParticipantContract
+    ] = {}
+    owners_by_identity: dict[tuple[str, str, str], str] = {}
+    all_owners_by_identity: dict[tuple[str, str, str], list[str]] = {}
+    for instance_label, topology in sorted(topologies.items()):
+        for contract in topology.participants:
+            participant = contract.participant
+            identity = (
+                participant.server_name,
+                participant.component,
+                participant.participant_name,
+            )
+            previous = contracts_by_identity.get(identity)
+            if previous is None:
+                contracts_by_identity[identity] = contract
+                owners_by_identity[identity] = instance_label
+                all_owners_by_identity[identity] = [instance_label]
+                continue
+            if participant.component != "responses_api_models":
+                raise ShardSetupError(
+                    "Gym checkpoint participant identity is hosted by multiple "
+                    "shards, so restored state cannot be routed safely: "
+                    f"identity={identity!r}, first={owners_by_identity[identity]!r}, "
+                    f"second={instance_label!r}"
+                )
+            if previous != contract:
+                raise ShardSetupError(
+                    "Gym shards disagree about the shared model checkpoint "
+                    f"contract: identity={identity!r}, "
+                    f"first={owners_by_identity[identity]!r}, "
+                    f"second={instance_label!r}"
+                )
+            all_owners_by_identity[identity].append(instance_label)
+
+    expected_model_owners = set(topologies)
+    for identity, contract in contracts_by_identity.items():
+        if contract.participant.component != "responses_api_models":
+            continue
+        actual_model_owners = set(all_owners_by_identity[identity])
+        if actual_model_owners != expected_model_owners:
+            raise ShardSetupError(
+                "Gym participant checkpointing requires every shard to expose "
+                "the same shared model participants so one leader can commit the "
+                f"capture-ledger union: identity={identity!r}, "
+                f"missing={sorted(expected_model_owners - actual_model_owners)!r}"
+            )
+
+    component_order = {
+        "responses_api_agents": 0,
+        "responses_api_models": 1,
+        "resources_servers": 2,
+    }
+    participants = sorted(
+        contracts_by_identity.values(),
+        key=lambda contract: (
+            component_order[contract.participant.component],
+            contract.participant.server_name,
+            contract.participant.participant_name,
+        ),
+    )
+    participant_owners = {
+        GymCheckpointTopology.participant_identity_key(contract.participant): sorted(
+            all_owners_by_identity[
+                (
+                    contract.participant.server_name,
+                    contract.participant.component,
+                    contract.participant.participant_name,
+                )
+            ]
+        )
+        for contract in participants
+    }
+    return GymCheckpointTopology(
+        participants=participants,
+        participant_owners=participant_owners,
+    )
 
 
 def build_nemo_gym_actors(

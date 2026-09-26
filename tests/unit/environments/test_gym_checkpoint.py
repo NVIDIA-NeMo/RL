@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -39,10 +40,13 @@ from nemo_rl.environments.gym_checkpoint import (
     GymCoordinatorModelStatusResponse,
     GymModelPrepareResponse,
     GymModelRestoreResponse,
+    GymParticipantIdentity,
     GymSingleWorkerModelStatusResponse,
     gym_capture_key,
     gym_checkpoint_continuations,
     gym_checkpoint_staging_keys,
+    rebase_gym_checkpoint_commit_result,
+    rebase_gym_checkpoint_restore_result,
     validate_gym_checkpoint_manifests,
     validate_gym_checkpoint_restore_artifacts,
 )
@@ -304,6 +308,117 @@ def test_topology_fingerprint_excludes_dynamic_checkpoint_phase() -> None:
     )
 
     assert first_topology.fingerprint() == second_topology.fingerprint()
+
+
+def test_shard_artifact_rebase_updates_commit_and_restore_coordinates() -> None:
+    participant = {
+        "server_name": "agent-route",
+        "component": "responses_api_agents",
+        "participant_name": "agent",
+    }
+    artifact = {
+        "schema_version": 1,
+        "relative_path": "agent/continuations.jsonl",
+        "sha256": "a" * 64,
+        "records": 1,
+        "bytes": 10,
+    }
+    committed = GymCheckpointCommitResult.model_validate(
+        {
+            "checkpoint_id": "checkpoint-1",
+            "participants": [
+                {
+                    "participant": participant,
+                    "payload": {
+                        "records": 1,
+                        "manifest_digest": "b" * 64,
+                        "continuation_index": artifact,
+                    },
+                    "manifest": {
+                        "participant": participant,
+                        "relative_path": "agent/manifest.json",
+                        "manifest_digest": "b" * 64,
+                    },
+                }
+            ],
+        }
+    )
+    restored = GymCheckpointRestoreResult.model_validate(
+        {
+            "checkpoint_id": "restore-1",
+            "participants": [
+                {
+                    "participant": participant,
+                    "payload": {
+                        "records": 1,
+                        "source_checkpoint_id": "checkpoint-1",
+                        "continuation_index": artifact,
+                    },
+                }
+            ],
+        }
+    )
+
+    rebased_commit = rebase_gym_checkpoint_commit_result(
+        committed,
+        Path("gym-shards/first"),
+    )
+    rebased_restore = rebase_gym_checkpoint_restore_result(
+        restored,
+        Path("gym-shards/first"),
+    )
+
+    committed_payload = rebased_commit.participants[0].payload
+    restored_payload = rebased_restore.participants[0].payload
+    assert isinstance(committed_payload, GymAgentCommitResponse)
+    assert isinstance(restored_payload, GymAgentRestoreResponse)
+    assert (
+        committed_payload.continuation_index.relative_path
+        == "gym-shards/first/agent/continuations.jsonl"
+    )
+    assert (
+        rebased_commit.participants[0].manifest.relative_path
+        == "gym-shards/first/agent/manifest.json"
+    )
+    assert (
+        restored_payload.continuation_index.relative_path
+        == "gym-shards/first/agent/continuations.jsonl"
+    )
+
+
+def test_topology_fingerprint_includes_shard_ownership() -> None:
+    participant = {
+        "server_name": "agent-route",
+        "component": "responses_api_agents",
+        "participant_name": "agent",
+    }
+    contract = {
+        "participant": participant,
+        "schema_version": 1,
+        "admission_states": ["accepting"],
+        "checkpoint_mode": "export_restore",
+        "concurrency_contract": "serialized_per_session",
+        "multi_process": {"mode": "single_worker", "num_workers": 1},
+        "instance_role": None,
+        "features": [],
+    }
+    identity = GymCheckpointTopology.participant_identity_key(
+        GymParticipantIdentity.model_validate(participant)
+    )
+    first = GymCheckpointTopology.model_validate(
+        {
+            "participants": [contract],
+            "participant_owners": {identity: ["first"]},
+        }
+    )
+    second = GymCheckpointTopology.model_validate(
+        {
+            "participants": [contract],
+            "participant_owners": {identity: ["second"]},
+        }
+    )
+
+    assert first.fingerprint() != second.fingerprint()
 
 
 @pytest.mark.parametrize(

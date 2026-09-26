@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 
-_PROFILES = ("counter", "workplace", "genrm")
+_PROFILES = ("counter", "workplace", "genrm", "sharded")
 _WORKPLACE_EVENT = {
     "event_name": "NeMo RL checkpoint recovery sentinel",
     "participant_email": "checkpoint-recovery@example.com",
@@ -58,6 +58,14 @@ def _participant(checkpoint: dict[str, Any], component: str) -> dict[str, Any]:
             f"expected one {component!r} checkpoint participant, got {len(matches)}"
         )
     return matches[0]
+
+
+def _participants(checkpoint: dict[str, Any], component: str) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in checkpoint.get("participants", [])
+        if item.get("participant", {}).get("component") == component
+    ]
 
 
 def _validate_participant_manifest(snapshot: Path, participant: dict[str, Any]) -> Path:
@@ -319,6 +327,273 @@ def _inspect_genrm_snapshot(
     }
 
 
+def _checkpoint_shard_name(snapshot: Path, manifest_path: Path) -> str:
+    relative = manifest_path.relative_to(snapshot)
+    if len(relative.parts) < 3 or relative.parts[0] != "gym-shards":
+        raise AssertionError(
+            f"shard-local Gym artifact is not under gym-shards/<name>: {relative}"
+        )
+    return relative.parts[1]
+
+
+def _inspect_sharded_snapshot(
+    snapshot: Path,
+    dataset_rows: list[dict[str, Any]],
+    gym_checkpoint: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate one two-shard cut and select one continuation per shard."""
+    import torch
+
+    models = _participants(gym_checkpoint, "responses_api_models")
+    agents = _participants(gym_checkpoint, "responses_api_agents")
+    resources = _participants(gym_checkpoint, "resources_servers")
+    if len(models) != 1 or len(agents) != 2 or len(resources) != 2:
+        raise AssertionError(
+            "sharded recovery requires one shared model plus two shard-local "
+            f"agent/resource participants; got models={len(models)}, "
+            f"agents={len(agents)}, resources={len(resources)}"
+        )
+
+    model = models[0]
+    _validate_participant_manifest(snapshot, model)
+    agent_manifests = {
+        _checkpoint_shard_name(
+            snapshot,
+            manifest_path := _validate_participant_manifest(snapshot, participant),
+        ): (participant, manifest_path)
+        for participant in agents
+    }
+    resource_manifests = {
+        _checkpoint_shard_name(
+            snapshot,
+            manifest_path := _validate_participant_manifest(snapshot, participant),
+        ): (participant, manifest_path)
+        for participant in resources
+    }
+    if set(agent_manifests) != set(resource_manifests) or len(agent_manifests) != 2:
+        raise AssertionError(
+            "agent and resource checkpoint artifacts do not cover the same two "
+            f"shards: agents={sorted(agent_manifests)!r}, "
+            f"resources={sorted(resource_manifests)!r}"
+        )
+
+    continuation_rows: list[dict[str, Any]] = []
+    agent_records_by_shard: dict[str, list[dict[str, Any]]] = {}
+    for shard_name, (agent, manifest_path) in agent_manifests.items():
+        if agent["payload"]["records"] < 1:
+            raise AssertionError(f"Gym shard {shard_name!r} has no parked boundary")
+        continuation_rows.extend(
+            _read_artifact(snapshot, agent["payload"]["continuation_index"])
+        )
+        agent_records_by_shard[shard_name] = _read_agent_records(
+            snapshot, manifest_path
+        )
+    if model["payload"]["rows"] < 2:
+        raise AssertionError(
+            "shared Gym model ledger has fewer than two committed turns"
+        )
+    storage_reference_rows = _read_artifact(
+        snapshot,
+        model["payload"]["storage_reference_index"],
+    )
+    continuation_capture_keys = {row["capture_key"] for row in continuation_rows}
+    storage_capture_keys = {row["capture_key"] for row in storage_reference_rows}
+    if not storage_capture_keys.issubset(continuation_capture_keys):
+        raise AssertionError(
+            "shared model storage references contain a rollout without a "
+            "shard-local parked continuation"
+        )
+
+    recovery = torch.load(snapshot / "rollout_recovery.pt", weights_only=True)
+    replay = torch.load(snapshot / "replay_buffer_metadata.pt", weights_only=False)
+    if not isinstance(recovery, dict):
+        raise TypeError("rollout recovery sidecar is not a mapping")
+    if not isinstance(replay, dict) or not replay.get("groups"):
+        raise AssertionError(
+            "sharded snapshot has no completed canonical group alongside its "
+            "unfinished continuations"
+        )
+    if recovery.get("pending_completed_execution_acknowledgements"):
+        raise AssertionError(
+            "completed Gym executions were not acknowledged before checkpoint commit"
+        )
+
+    resource_by_name = {
+        participant["participant"]["participant_name"]: (
+            shard_name,
+            participant,
+            path,
+        )
+        for shard_name, (participant, path) in resource_manifests.items()
+    }
+    selected_rollouts: list[dict[str, Any]] = []
+    selected_capture_keys: set[str] = set()
+    for shard_name, records in sorted(agent_records_by_shard.items()):
+        candidates: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for record in records:
+            pending_model = record.get("pending_model")
+            if (
+                record.get("boundary_index", 0) < 1
+                or not record.get("last_committed_model_call_id")
+                or not record.get("resource_state_revisions")
+                or not isinstance(pending_model, dict)
+                or pending_model.get("pending_action_cursor", 0) < 1
+            ):
+                continue
+            group, attempt = _matching_recovery_attempt(recovery, record["rollout_id"])
+            if attempt["attempt_index"] != record["attempt_index"]:
+                raise AssertionError(
+                    "Gym boundary and RL ledger disagree about the physical attempt"
+                )
+            if attempt["status"] != "dispatched":
+                raise AssertionError(
+                    "a parked, unfinished Gym execution must remain dispatched in RL"
+                )
+            candidates.append((record, group))
+        if len(candidates) != 1:
+            raise AssertionError(
+                f"expected one recoverable continuation on shard {shard_name!r}, "
+                f"got {len(candidates)}"
+            )
+        boundary, group = candidates[0]
+
+        try:
+            prompt_index = int(group["prompt_ref"]["sample_id"])
+            dataset_row = dataset_rows[prompt_index]
+        except (IndexError, KeyError, TypeError, ValueError) as error:
+            raise AssertionError(
+                "selected sharded recovery group does not resolve to its dataset row"
+            ) from error
+
+        revisions = boundary["resource_state_revisions"]
+        matching_resources = [
+            resource_by_name[name] for name in revisions if name in resource_by_name
+        ]
+        if len(matching_resources) != 1:
+            raise AssertionError(
+                "shard continuation does not resolve to exactly one checkpointed "
+                f"resource: shard={shard_name!r}, revisions={revisions!r}"
+            )
+        resource_shard, resource, resource_manifest_path = matching_resources[0]
+        if resource_shard != shard_name:
+            raise AssertionError(
+                "agent continuation and resource state were committed under "
+                f"different shards: agent={shard_name!r}, resource={resource_shard!r}"
+            )
+        if resource["payload"]["sessions"] < 1:
+            raise AssertionError(f"Gym shard {shard_name!r} saved no environment")
+
+        resource_manifest = _read_json(resource_manifest_path)
+        resource_snapshots = []
+        for name, expected_digest in resource_manifest.get("files", {}).items():
+            resource_path = resource_manifest_path.parent / name
+            if _digest(resource_path) != expected_digest:
+                raise AssertionError(
+                    f"resources state digest mismatch for {resource_path}"
+                )
+            resource_record = _read_json(resource_path)
+            if (
+                resource_record.get("rollout_id") == boundary["rollout_id"]
+                and resource_record.get("attempt_index") == boundary["attempt_index"]
+            ):
+                resource_snapshots.append(resource_record)
+        if len(resource_snapshots) != 1:
+            raise AssertionError(
+                f"shard {shard_name!r} continuation did not map to exactly one "
+                "resources snapshot"
+            )
+        resource_snapshot = resource_snapshots[0]
+        resource_name = resource["participant"]["participant_name"]
+        expected_revision = revisions.get(resource_name)
+        if resource_snapshot.get("state_revision") != expected_revision:
+            raise AssertionError(
+                "agent boundary and resources snapshot disagree about state revision"
+            )
+        if not isinstance(expected_revision, int) or expected_revision < 2:
+            raise AssertionError(
+                "checkpointed resource state has no committed mutation"
+            )
+
+        task_source = group.get("task_source")
+        state = resource_snapshot.get("state") or {}
+        rollout = {
+            "shard": shard_name,
+            "task_source": task_source,
+            "rollout_id": boundary["rollout_id"],
+            "source_attempt_index": boundary["attempt_index"],
+            "restored_attempt_index": boundary["attempt_index"] + 1,
+            "boundary_index": boundary["boundary_index"],
+            "last_committed_model_call_id": boundary["last_committed_model_call_id"],
+            "resource_state_revisions": revisions,
+            "group_id": group["group_id"],
+            "prompt_index": prompt_index,
+        }
+        if task_source == "example_session_state_mgmt_simple_agent":
+            initial_count = dataset_row.get("initial_count")
+            expected_count = dataset_row.get("expected_count")
+            checkpoint_counter = state.get("counter")
+            if (
+                isinstance(initial_count, bool)
+                or not isinstance(initial_count, int)
+                or isinstance(expected_count, bool)
+                or not isinstance(expected_count, int)
+                or isinstance(checkpoint_counter, bool)
+                or not isinstance(checkpoint_counter, int)
+                or not initial_count < checkpoint_counter <= expected_count
+            ):
+                raise AssertionError("sharded counter state is not recoverable")
+            rollout.update(
+                initial_count=initial_count,
+                checkpoint_counter=checkpoint_counter,
+                expected_count=expected_count,
+            )
+        elif task_source == "workplace_assistant_checkpoint_test_agent":
+            sentinel_count = _workplace_sentinel_count(state)
+            if sentinel_count != 1:
+                raise AssertionError(
+                    "sharded Workplace checkpoint must contain exactly one "
+                    f"sentinel event, got {sentinel_count}"
+                )
+            rollout["checkpoint_sentinel_count"] = sentinel_count
+        else:
+            raise AssertionError(
+                f"unexpected task source in sharded recovery cut: {task_source!r}"
+            )
+
+        capture_key = (
+            boundary["rollout_id"]
+            if boundary["attempt_index"] == 0
+            else f"{boundary['rollout_id']}-a{boundary['attempt_index']}"
+        )
+        selected_capture_keys.add(capture_key)
+        selected_rollouts.append(rollout)
+
+    expected_task_sources = {
+        "example_session_state_mgmt_simple_agent",
+        "workplace_assistant_checkpoint_test_agent",
+    }
+    if {
+        rollout["task_source"] for rollout in selected_rollouts
+    } != expected_task_sources:
+        raise AssertionError(
+            "sharded checkpoint did not capture one continuation from each test "
+            f"agent: rollouts={selected_rollouts!r}"
+        )
+    if not selected_capture_keys.issubset(continuation_capture_keys):
+        raise AssertionError(
+            "sharded agent continuation roots are missing from their indexes"
+        )
+
+    return {
+        "snapshot_path": str(snapshot.resolve()),
+        "checkpoint_id": gym_checkpoint["checkpoint_id"],
+        "profile": "sharded",
+        "shards": sorted(agent_manifests),
+        "completed_group_ids": sorted(item["group_id"] for item in replay["groups"]),
+        "rollouts": sorted(selected_rollouts, key=lambda item: item["shard"]),
+    }
+
+
 def inspect_snapshot(
     snapshot: Path,
     dataset_rows: list[dict[str, Any]],
@@ -345,6 +620,9 @@ def inspect_snapshot(
     ):
         if not required.exists():
             raise FileNotFoundError(required)
+
+    if profile == "sharded":
+        return _inspect_sharded_snapshot(snapshot, dataset_rows, gym_checkpoint)
 
     model = _participant(gym_checkpoint, "responses_api_models")
     agent = _participant(gym_checkpoint, "responses_api_agents")
@@ -613,6 +891,9 @@ def verify_restore(args: argparse.Namespace) -> None:
     if args.profile == "genrm":
         _verify_genrm_restore(selected, events, args.audit_events)
         return
+    if args.profile == "sharded":
+        _verify_sharded_restore(selected, events, args.audit_events)
+        return
     expected_capture_key = (
         f"{selected['rollout_id']}-a{selected['restored_attempt_index']}"
     )
@@ -669,6 +950,67 @@ def verify_restore(args: argparse.Namespace) -> None:
         )
     if args.profile == "workplace":
         _verify_workplace_audit(selected, args.audit_events)
+
+
+def _verify_sharded_restore(
+    selected: dict[str, Any],
+    events: list[dict[str, Any]],
+    audit_path: Path | None,
+) -> None:
+    if len(selected["rollouts"]) != 2:
+        raise AssertionError("sharded recovery selection must contain two rollouts")
+    for rollout in selected["rollouts"]:
+        expected_capture_key = (
+            f"{rollout['rollout_id']}-a{rollout['restored_attempt_index']}"
+        )
+        dispatches = [
+            event
+            for event in events
+            if event.get("event") == "dispatch"
+            and expected_capture_key in event.get("rollout_ids", [])
+        ]
+        if len(dispatches) != 1:
+            raise AssertionError(
+                "restored shard continuation was not redispatched exactly once: "
+                f"capture_key={expected_capture_key!r}, matches={dispatches!r}"
+            )
+        stale_dispatches = [
+            event
+            for event in events
+            if event.get("event") == "dispatch"
+            and rollout["rollout_id"] in event.get("rollout_ids", [])
+        ]
+        if stale_dispatches:
+            raise AssertionError(
+                "sharded restore reused a tombstoned source attempt: "
+                f"events={stale_dispatches!r}"
+            )
+        completions = [
+            event
+            for event in events
+            if event.get("event") == "completion_forwarded"
+            and event.get("rollout_id") == expected_capture_key
+        ]
+        if len(completions) != 1 or completions[0].get("reward") != 1.0:
+            raise AssertionError(
+                "restored shard continuation did not complete exactly once with "
+                f"reward 1: capture_key={expected_capture_key!r}, "
+                f"events={completions!r}"
+            )
+        if rollout["task_source"] == "workplace_assistant_checkpoint_test_agent":
+            _verify_workplace_audit(rollout, audit_path)
+
+    regenerated_completed_groups = [
+        event
+        for event in events
+        if event.get("event") == "dispatch"
+        and event.get("group_id") in selected["completed_group_ids"]
+    ]
+    if regenerated_completed_groups:
+        raise AssertionError(
+            "a completed, checkpointed sharded group was regenerated after restore: "
+            f"events={regenerated_completed_groups!r}"
+        )
 
 
 def _verify_genrm_restore(

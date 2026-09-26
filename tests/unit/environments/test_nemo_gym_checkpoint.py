@@ -247,6 +247,7 @@ def test_legacy_generation_cut_proof_exposes_durable_tq_prefix_keys() -> None:
         "__generation_cut__/checkpoint-1/r0/c1"
     }
 
+
 def test_generation_cut_receipts_are_filtered_by_model_server() -> None:
     policy_receipt = {
         "checkpoint_id": "checkpoint-1",
@@ -1018,6 +1019,103 @@ def test_checkpoint_commit_restore_and_resume_fan_out() -> None:
         {"rollout_id": "rollout-1", "attempt_index": 1}
     ]
     assert "include_continuation_index" not in restore_calls[1][2]
+
+
+def test_checkpoint_component_selection_accepts_cross_shard_continuation_indexes() -> (
+    None
+):
+    env = _checkpoint_env()
+    capabilities = {
+        "policy": _capability(
+            "responses_api_models",
+            "policy",
+            admission_states=["accepting", "draining", "paused"],
+            concurrency_contract="stateless",
+            instance_role="policy",
+            features=["external_storage_reference_index_v1"],
+        ),
+        "agent": _capability(
+            "responses_api_agents",
+            "agent",
+            features=["agent_continuation_index_v1"],
+        ),
+        "tools": _capability("resources_servers", "tools"),
+    }
+
+    async def discover_control(_method, _path, *, server_name, **_kwargs):
+        return capabilities[server_name]
+
+    env._control = AsyncMock(side_effect=discover_control)
+    asyncio.run(env.discover_checkpoint_capabilities(list(capabilities)))
+
+    continuation_index = {
+        "schema_version": 1,
+        "relative_path": "gym-shards/first/agent/continuations.jsonl",
+        "sha256": "a" * 64,
+        "records": 1,
+        "bytes": 10,
+    }
+    storage_reference_index = {
+        "schema_version": 1,
+        "relative_path": "model-ledger/policy/storage-references.jsonl",
+        "sha256": "b" * 64,
+        "records": 1,
+        "bytes": 10,
+    }
+    calls = []
+
+    async def commit_control(method, path, *, server_name, timeout_s, json):
+        assert method == "POST"
+        assert timeout_s > 0
+        calls.append((server_name, path, json))
+        if server_name == "policy":
+            return {
+                "rollouts": 1,
+                "rows": 1,
+                "excluded_tombstoned": 0,
+                "manifest_digest": "c" * 64,
+                "storage_reference_index": storage_reference_index,
+            }
+        if server_name == "agent":
+            return {
+                "records": 1,
+                "manifest_digest": "d" * 64,
+                "continuation_index": continuation_index,
+            }
+        return {"sessions": 1, "manifest_digest": "e" * 64}
+
+    env._control = AsyncMock(side_effect=commit_control)
+    local = asyncio.run(
+        env.commit_checkpoint(
+            "snapshot-sharded",
+            time.time() + 10.0,
+            "/tmp/shard",
+            components=["responses_api_agents", "resources_servers"],
+        )
+    )
+    model = asyncio.run(
+        env.commit_checkpoint(
+            "snapshot-sharded",
+            time.time() + 10.0,
+            "/tmp/root",
+            components=["responses_api_models"],
+            continuation_indexes=[continuation_index],
+        )
+    )
+
+    assert [item["participant"]["component"] for item in local["participants"]] == [
+        "responses_api_agents",
+        "resources_servers",
+    ]
+    assert [item["participant"]["component"] for item in model["participants"]] == [
+        "responses_api_models"
+    ]
+    assert [server_name for server_name, _path, _json in calls] == [
+        "agent",
+        "tools",
+        "policy",
+    ]
+    assert calls[-1][2]["continuation_indexes"] == [continuation_index]
 
 
 def test_abort_checkpoint_uses_idempotent_resume_routes() -> None:

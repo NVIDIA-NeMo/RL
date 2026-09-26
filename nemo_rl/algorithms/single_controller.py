@@ -160,15 +160,20 @@ from nemo_rl.data_plane.tq_token_sink import GENERATION_CUT_STAGING_PREFIX
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lost
 from nemo_rl.environments.gym_checkpoint import (
+    GymAgentCommitResponse,
+    GymCheckpointArtifactReference,
     GymCheckpointCommitResult,
     GymCheckpointPrepareResult,
     GymCompletedExecution,
+    GymParticipantCommitResult,
     gym_checkpoint_continuations,
     gym_checkpoint_staging_keys,
+    rebase_gym_checkpoint_commit_result,
 )
 from nemo_rl.environments.nemo_gym import (
+    NemoGymShardSet,
+    as_nemo_gym_shard_set,
     should_use_nemo_gym,
-    sole_nemo_gym_checkpoint_actor,
 )
 from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.payload import VIOLATION_TAG_KEYS
@@ -798,10 +803,8 @@ class SingleControllerActor:
         )
         if self._gym_checkpoint_restore_operation_id is not None:
             await self._discard_restart_only_gym_continuations()
-            await self._nemo_gym_checkpoint_actor().resume_checkpoint.remote(
-                self._gym_checkpoint_restore_operation_id,
-                time.time()
-                + self._master_config.rollout_checkpointing.gym.prepare_timeout_s,
+            await self._release_restored_gym_checkpoint(
+                self._gym_checkpoint_restore_operation_id
             )
             self._gym_checkpoint_restore_operation_id = None
         self._schedule_completed_gym_acknowledgement_drain()
@@ -1798,14 +1801,47 @@ class SingleControllerActor:
         ) as cut:
             await self._cleanup_known_finalization_request_unlocked(cut, request)
 
-    def _nemo_gym_checkpoint_actor(self) -> Any:
+    def _nemo_gym_checkpoint_shards(self) -> NemoGymShardSet:
         try:
             environment = self._env_handles["nemo_gym"]
         except KeyError as error:
             raise RuntimeError(
                 "Gym participant checkpointing is enabled without a nemo_gym actor"
             ) from error
-        return sole_nemo_gym_checkpoint_actor(environment)
+        return as_nemo_gym_shard_set(environment)
+
+    def _nemo_gym_checkpoint_instances(self) -> tuple[tuple[str, Any], ...]:
+        """Return every Gym checkpoint actor in deterministic shard order."""
+        return self._nemo_gym_checkpoint_shards().checkpoint_instances
+
+    @staticmethod
+    async def _await_gym_checkpoint_calls(
+        operation: str,
+        calls: list[tuple[str, Any]],
+    ) -> dict[str, Any]:
+        """Wait for every already-issued shard RPC and report all failures."""
+        outcomes = await asyncio.gather(
+            *(awaitable for _label, awaitable in calls),
+            return_exceptions=True,
+        )
+        results: dict[str, Any] = {}
+        errors: list[BaseException] = []
+        for (label, _awaitable), outcome in zip(calls, outcomes, strict=True):
+            if isinstance(outcome, BaseException):
+                outcome.add_note(
+                    f"NeMo-Gym checkpoint {operation} failed on instance {label!r}"
+                )
+                errors.append(outcome)
+            else:
+                results[label] = outcome
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise BaseExceptionGroup(
+                f"NeMo-Gym checkpoint {operation} failed on {len(errors)} instance(s)",
+                errors,
+            )
+        return results
 
     async def _discard_restart_only_gym_continuations(self) -> None:
         """Make interrupted attempts start fresh when resource state cannot restore."""
@@ -1817,16 +1853,22 @@ class SingleControllerActor:
         if not restart_only_resources:
             return
 
-        candidates = {
-            (
-                group.logical_rollout_id(sibling.generation_index),
-                sibling.current_attempt.attempt_index + 1,
-            )
-            for group in self._rollout_recovery_ledger.groups()
-            for sibling in group.siblings
-            if sibling.current_attempt.status is not RolloutAttemptStatus.SEALED
-        }
-        executions = []
+        candidates: dict[tuple[str, int], str] = {}
+        for group in self._rollout_recovery_ledger.groups():
+            if group.resolved_agent_name is None:
+                raise RuntimeError(
+                    f"restored Gym group {group.group_id!r} has no agent route"
+                )
+            for sibling in group.siblings:
+                if sibling.current_attempt.status is RolloutAttemptStatus.SEALED:
+                    continue
+                candidates[
+                    (
+                        group.logical_rollout_id(sibling.generation_index),
+                        sibling.current_attempt.attempt_index + 1,
+                    )
+                ] = group.resolved_agent_name
+        executions_by_instance: dict[str, list[dict[str, Any]]] = {}
         staging_keys: set[str] = set()
         restart_only = set(restart_only_resources)
         resource_modes = {
@@ -1839,7 +1881,8 @@ class SingleControllerActor:
                 continuation.rollout_id,
                 continuation.replacement_attempt_index,
             )
-            if execution not in candidates:
+            agent_name = candidates.get(execution)
+            if agent_name is None:
                 continue
             resource_revisions = continuation.resource_state_revisions
             if resource_revisions is not None:
@@ -1853,21 +1896,37 @@ class SingleControllerActor:
                     )
                 if not dependencies.intersection(restart_only):
                     continue
-            executions.append(
+            shard_set = self._nemo_gym_checkpoint_shards()
+            handle = shard_set.checkpoint_handle_for_route(agent_name)
+            instance_label = shard_set.instance_label(handle)
+            executions_by_instance.setdefault(instance_label, []).append(
                 {
                     "rollout_id": continuation.rollout_id,
                     "attempt_index": continuation.replacement_attempt_index,
                 }
             )
             staging_keys.update(continuation.staging_keys)
-        if not executions:
+        if not executions_by_instance:
             return
 
-        result = await self._nemo_gym_checkpoint_actor().discard_restored_agent_continuations.remote(
-            checkpoint_id,
+        handles_by_label = dict(self._nemo_gym_checkpoint_instances())
+        deadline_ts = (
             time.time()
-            + self._master_config.rollout_checkpointing.gym.prepare_timeout_s,
-            executions,
+            + self._master_config.rollout_checkpointing.gym.prepare_timeout_s
+        )
+        results = await self._await_gym_checkpoint_calls(
+            "discard-restored-continuations",
+            [
+                (
+                    label,
+                    handles_by_label[label].discard_restored_agent_continuations.remote(
+                        checkpoint_id,
+                        deadline_ts,
+                        executions,
+                    ),
+                )
+                for label, executions in sorted(executions_by_instance.items())
+            ],
         )
         if staging_keys:
             async with self._data_plane_checkpoint_barrier.mutation(
@@ -1881,7 +1940,7 @@ class SingleControllerActor:
             self._restored_gym_checkpoint_staging_keys.difference_update(staging_keys)
         print(
             "📦 Restarting unfinished Gym executions from their initial task: "
-            f"executions={result['executions']}, "
+            f"executions={sum(result['executions'] for result in results.values())}, "
             f"resources={','.join(restart_only_resources)}",
             flush=True,
         )
@@ -1907,15 +1966,32 @@ class SingleControllerActor:
             pending = self._rollout_recovery_ledger.pending_completed_execution_acknowledgements()
             if not pending:
                 return 0
-            payload = [
-                GymCompletedExecution(
-                    receipt=acknowledgement.receipt,
-                    agent_name=acknowledgement.agent_name,
-                ).model_dump(mode="json")
-                for acknowledgement in pending
-            ]
-            await self._nemo_gym_checkpoint_actor().acknowledge_completed_executions.remote(
-                payload
+            shard_set = self._nemo_gym_checkpoint_shards()
+            payloads_by_instance: dict[str, list[dict[str, Any]]] = {}
+            handles_by_instance: dict[str, Any] = {}
+            for acknowledgement in pending:
+                handle = shard_set.checkpoint_handle_for_route(
+                    acknowledgement.agent_name
+                )
+                instance_label = shard_set.instance_label(handle)
+                handles_by_instance[instance_label] = handle
+                payloads_by_instance.setdefault(instance_label, []).append(
+                    GymCompletedExecution(
+                        receipt=acknowledgement.receipt,
+                        agent_name=acknowledgement.agent_name,
+                    ).model_dump(mode="json")
+                )
+            await self._await_gym_checkpoint_calls(
+                "completed-execution acknowledgement",
+                [
+                    (
+                        label,
+                        handles_by_instance[
+                            label
+                        ].acknowledge_completed_executions.remote(payload),
+                    )
+                    for label, payload in sorted(payloads_by_instance.items())
+                ],
             )
             # The HTTP call deliberately runs without a mutation cut. Within
             # this live Gym process, a checkpoint racing between remote ACK
@@ -1973,6 +2049,119 @@ class SingleControllerActor:
             ):
                 return
 
+    async def _commit_sharded_gym_checkpoint(
+        self,
+        checkpoint_id: str,
+        checkpoint_dir: Path,
+        timeout_s: float,
+    ) -> GymCheckpointCommitResult:
+        """Commit shard-local state, then the shared policy ledger.
+
+        Agent and resource servers belong to one Gym shard and write below an
+        instance-specific directory. Policy-model proxies share one capture
+        ledger, so one deterministic leader commits it at the snapshot root
+        after receiving the union of every shard's continuation index.
+        """
+        instances = self._nemo_gym_checkpoint_instances()
+        if len(instances) == 1:
+            _label, actor = instances[0]
+            return GymCheckpointCommitResult.model_validate(
+                await actor.commit_checkpoint.remote(
+                    checkpoint_id,
+                    time.time() + timeout_s,
+                    str(checkpoint_dir),
+                )
+            )
+
+        shard_set = self._nemo_gym_checkpoint_shards()
+        local_calls: list[tuple[str, Any]] = []
+        for label, actor in instances:
+            relative_dir = shard_set.checkpoint_relative_dir(label)
+            local_dir = checkpoint_dir / relative_dir
+            await asyncio.to_thread(local_dir.mkdir, parents=True, exist_ok=True)
+            local_calls.append(
+                (
+                    label,
+                    actor.commit_checkpoint.remote(
+                        checkpoint_id,
+                        time.time() + timeout_s,
+                        str(local_dir),
+                        ["responses_api_agents", "resources_servers"],
+                        None,
+                    ),
+                )
+            )
+        raw_local = await self._await_gym_checkpoint_calls(
+            "local participant commit",
+            local_calls,
+        )
+
+        local_participants: list[GymParticipantCommitResult] = []
+        continuation_indexes: list[GymCheckpointArtifactReference] = []
+        for label, _actor in instances:
+            checkpoint = GymCheckpointCommitResult.model_validate(raw_local[label])
+            if checkpoint.checkpoint_id != checkpoint_id:
+                raise RuntimeError(
+                    "Gym local checkpoint commit returned the wrong checkpoint ID: "
+                    f"instance={label!r}, expected={checkpoint_id!r}, "
+                    f"actual={checkpoint.checkpoint_id!r}"
+                )
+            rebased = rebase_gym_checkpoint_commit_result(
+                checkpoint,
+                shard_set.checkpoint_relative_dir(label),
+            )
+            local_participants.extend(rebased.participants)
+            continuation_indexes.extend(
+                result.payload.continuation_index
+                for result in rebased.participants
+                if isinstance(result.payload, GymAgentCommitResponse)
+            )
+
+        # Every proxy exposes the same model participant and capture ledger.
+        # Committing that participant more than once with the same checkpoint
+        # ID is invalid when proxy-local attempt inventories differ, so the
+        # first deterministic instance owns the one global model commit.
+        continuation_payload = [
+            reference.model_dump(mode="json") for reference in continuation_indexes
+        ]
+        model_label, model_actor = instances[0]
+        model_checkpoint = GymCheckpointCommitResult.model_validate(
+            await model_actor.commit_checkpoint.remote(
+                checkpoint_id,
+                time.time() + timeout_s,
+                str(checkpoint_dir),
+                ["responses_api_models"],
+                continuation_payload,
+            )
+        )
+        if model_checkpoint.checkpoint_id != checkpoint_id:
+            raise RuntimeError(
+                "Gym model checkpoint commit returned the wrong checkpoint ID: "
+                f"instance={model_label!r}, expected={checkpoint_id!r}, "
+                f"actual={model_checkpoint.checkpoint_id!r}"
+            )
+
+        component_order = {
+            "responses_api_agents": 0,
+            "responses_api_models": 1,
+            "resources_servers": 2,
+        }
+        participants = [
+            *local_participants,
+            *model_checkpoint.participants,
+        ]
+        participants.sort(
+            key=lambda result: (
+                component_order[result.participant.component],
+                result.participant.server_name,
+                result.participant.participant_name,
+            )
+        )
+        return GymCheckpointCommitResult(
+            checkpoint_id=checkpoint_id,
+            participants=participants,
+        )
+
     async def _prepare_and_commit_gym_checkpoint(
         self,
         checkpoint_id: str,
@@ -1980,7 +2169,6 @@ class SingleControllerActor:
     ) -> tuple[GymCheckpointPrepareResult, GymCheckpointCommitResult]:
         """Park Gym and write participant state into an unpublished snapshot."""
         timeout_s = self._master_config.rollout_checkpointing.gym.prepare_timeout_s
-        gym_actor = self._nemo_gym_checkpoint_actor()
         prepare_attempted = False
         self._gym_checkpoint_rollout_permitted.clear()
         try:
@@ -2011,22 +2199,45 @@ class SingleControllerActor:
             # Record before the RPC. Gym may freeze its participants and lose
             # the response, so every attempted prepare needs an idempotent abort.
             prepare_attempted = True
-            prepare = GymCheckpointPrepareResult.model_validate(
-                await gym_actor.prepare_checkpoint.remote(
-                    checkpoint_id,
-                    time.time() + timeout_s,
-                )
+            deadline_ts = time.time() + timeout_s
+            raw_prepares = await self._await_gym_checkpoint_calls(
+                "prepare",
+                [
+                    (
+                        label,
+                        actor.prepare_checkpoint.remote(
+                            checkpoint_id,
+                            deadline_ts,
+                        ),
+                    )
+                    for label, actor in self._nemo_gym_checkpoint_instances()
+                ],
             )
-            if not prepare.ready:
-                raise RuntimeError(
-                    f"Gym checkpoint {checkpoint_id!r} returned an incomplete cut"
-                )
-            checkpoint = GymCheckpointCommitResult.model_validate(
-                await gym_actor.commit_checkpoint.remote(
-                    checkpoint_id,
-                    time.time() + timeout_s,
-                    str(checkpoint_dir),
-                )
+            prepares = []
+            for label, raw_prepare in raw_prepares.items():
+                prepare_result = GymCheckpointPrepareResult.model_validate(raw_prepare)
+                if (
+                    prepare_result.checkpoint_id != checkpoint_id
+                    or not prepare_result.ready
+                ):
+                    raise RuntimeError(
+                        f"Gym checkpoint {checkpoint_id!r} returned an incomplete "
+                        f"cut from instance {label!r}"
+                    )
+                prepares.append(prepare_result)
+            prepare = GymCheckpointPrepareResult(
+                checkpoint_id=checkpoint_id,
+                ready=True,
+                participants=[
+                    participant
+                    for prepare_result in prepares
+                    for participant in prepare_result.participants
+                ],
+            )
+            checkpoint = await self._commit_sharded_gym_checkpoint(
+                checkpoint_id,
+                checkpoint_dir,
+                timeout_s,
             )
             if checkpoint.checkpoint_id != checkpoint_id:
                 raise RuntimeError(
@@ -2095,11 +2306,16 @@ class SingleControllerActor:
     ) -> None:
         """Resume Gym after publish, or abort it after a failed local save."""
         timeout_s = self._master_config.rollout_checkpointing.gym.prepare_timeout_s
-        gym_actor = self._nemo_gym_checkpoint_actor()
-        method = (
-            gym_actor.resume_checkpoint if committed else gym_actor.abort_checkpoint
+        deadline_ts = time.time() + timeout_s
+        self._gym_checkpoint_rollout_permitted.clear()
+        calls = []
+        for label, actor in self._nemo_gym_checkpoint_instances():
+            method = actor.resume_checkpoint if committed else actor.abort_checkpoint
+            calls.append((label, method.remote(checkpoint_id, deadline_ts)))
+        await self._await_gym_checkpoint_calls(
+            "resume" if committed else "abort",
+            calls,
         )
-        await method.remote(checkpoint_id, time.time() + timeout_s)
         if self._generation_checkpoint_id == checkpoint_id:
             await asyncio.to_thread(
                 self._gen.finish_generation_checkpoint,
@@ -2110,6 +2326,33 @@ class SingleControllerActor:
         # fence and the generation engines have been released. If either call
         # fails, keeping this event cleared fails closed instead of dispatching
         # requests into a partially paused serving fleet.
+        self._gym_checkpoint_rollout_permitted.set()
+
+    async def _release_restored_gym_checkpoint(self, checkpoint_id: str) -> None:
+        """Release one shared model restore plus every shard-local restore."""
+        instances = self._nemo_gym_checkpoint_instances()
+        if len(instances) == 1:
+            await self._release_prepared_gym_checkpoint(
+                checkpoint_id,
+                committed=True,
+            )
+            return
+
+        timeout_s = self._master_config.rollout_checkpointing.gym.prepare_timeout_s
+        deadline_ts = time.time() + timeout_s
+        self._gym_checkpoint_rollout_permitted.clear()
+        calls = []
+        for index, (label, actor) in enumerate(instances):
+            if index == 0:
+                call = actor.resume_checkpoint.remote(checkpoint_id, deadline_ts)
+            else:
+                call = actor.resume_checkpoint.remote(
+                    checkpoint_id,
+                    deadline_ts,
+                    ["responses_api_agents", "resources_servers"],
+                )
+            calls.append((label, call))
+        await self._await_gym_checkpoint_calls("restore resume", calls)
         self._gym_checkpoint_rollout_permitted.set()
 
     async def _abort_prepared_gym_checkpoint(self, checkpoint_id: str) -> None:

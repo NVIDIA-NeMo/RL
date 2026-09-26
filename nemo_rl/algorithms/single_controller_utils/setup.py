@@ -106,15 +106,17 @@ from nemo_rl.environments.gym_checkpoint import (
     gym_checkpoint_generation_cut_records,
     gym_checkpoint_staging_keys,
     gym_generation_cut_staging_keys,
+    rebase_gym_checkpoint_restore_result,
     validate_gym_checkpoint_manifests,
     validate_gym_checkpoint_restore_artifacts,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import (
     NemoGymShardSet,
+    as_nemo_gym_shard_set,
     build_nemo_gym_actors,
+    merge_nemo_gym_checkpoint_topologies,
     should_use_nemo_gym,
-    sole_nemo_gym_checkpoint_actor,
     validate_dataset_agent_coverage,
 )
 from nemo_rl.experience.rollout_manager import (
@@ -1920,9 +1922,25 @@ def setup_single_controller(
 
     gym_checkpoint_topology: Optional[GymCheckpointTopology] = None
     if rollout_checkpoint_cfg.gym.capability_discovery_enabled:
-        gym_actor = sole_nemo_gym_checkpoint_actor(env_handles["nemo_gym"])
-        discovered = ray.get(gym_actor.discover_checkpoint_capabilities.remote())
-        gym_checkpoint_topology = GymCheckpointTopology.model_validate(discovered)
+        gym_shards = as_nemo_gym_shard_set(env_handles["nemo_gym"])
+        checkpoint_instances = gym_shards.checkpoint_instances
+        discovered = ray.get(
+            [
+                actor.discover_checkpoint_capabilities.remote()
+                for _label, actor in checkpoint_instances
+            ]
+        )
+        topology_by_instance = {
+            label: GymCheckpointTopology.model_validate(raw_topology)
+            for (label, _actor), raw_topology in zip(
+                checkpoint_instances,
+                discovered,
+                strict=True,
+            )
+        }
+        gym_checkpoint_topology = merge_nemo_gym_checkpoint_topologies(
+            topology_by_instance
+        )
         if rollout_checkpoint_cfg.gym.participant_checkpointing_enabled:
             gym_checkpoint_topology.validate_turn_recovery_capabilities(
                 generation_prefix_cuts_enabled=(
@@ -2051,21 +2069,81 @@ def setup_single_controller(
     if saved_gym_checkpoint is not None:
         assert resolved_snapshot is not None
         assert gym_checkpoint_topology is not None
-        awaitable_gym_actor = sole_nemo_gym_checkpoint_actor(env_handles["nemo_gym"])
+        gym_shards = as_nemo_gym_shard_set(env_handles["nemo_gym"])
+        checkpoint_instances = gym_shards.checkpoint_instances
         gym_checkpoint_restore_operation_id = f"restore-{uuid.uuid4().hex}"
-        restore_deadline_ts = time.time() + rollout_checkpoint_cfg.gym.prepare_timeout_s
-        restored_gym_checkpoint = GymCheckpointRestoreResult.model_validate(
-            ray.get(
-                awaitable_gym_actor.restore_checkpoint.remote(
+        restore_timeout_s = rollout_checkpoint_cfg.gym.prepare_timeout_s
+        if len(checkpoint_instances) == 1:
+            _label, gym_actor = checkpoint_instances[0]
+            restored_gym_checkpoint = GymCheckpointRestoreResult.model_validate(
+                ray.get(
+                    gym_actor.restore_checkpoint.remote(
+                        gym_checkpoint_restore_operation_id,
+                        time.time() + restore_timeout_s,
+                        str(resolved_snapshot.path),
+                        saved_gym_checkpoint.checkpoint_id,
+                        resolved_snapshot.manifest.gym_generation_cut_proofs,
+                        generation_cut_exclusions,
+                    )
+                )
+            )
+        else:
+            # Every shard's policy proxy reads the same capture directory. One
+            # deterministic leader installs the shared ledger once; repeating
+            # the archive extraction per shard would multiply restore I/O by
+            # the shard count. Prefix cuts remain disabled for this path until
+            # Gym can distribute proxy-local cut state independently.
+            _model_label, model_actor = checkpoint_instances[0]
+            model_restore = GymCheckpointRestoreResult.model_validate(
+                ray.get(
+                    model_actor.restore_checkpoint.remote(
+                        gym_checkpoint_restore_operation_id,
+                        time.time() + restore_timeout_s,
+                        str(resolved_snapshot.path),
+                        saved_gym_checkpoint.checkpoint_id,
+                        resolved_snapshot.manifest.gym_generation_cut_proofs,
+                        generation_cut_exclusions,
+                        ["responses_api_models"],
+                    )
+                )
+            )
+
+            local_restore_deadline_ts = time.time() + restore_timeout_s
+            local_restore_refs = [
+                gym_actor.restore_checkpoint.remote(
                     gym_checkpoint_restore_operation_id,
-                    restore_deadline_ts,
-                    str(resolved_snapshot.path),
+                    local_restore_deadline_ts,
+                    str(
+                        resolved_snapshot.path
+                        / gym_shards.checkpoint_relative_dir(label)
+                    ),
                     saved_gym_checkpoint.checkpoint_id,
                     resolved_snapshot.manifest.gym_generation_cut_proofs,
                     generation_cut_exclusions,
+                    ["responses_api_agents", "resources_servers"],
                 )
+                for label, gym_actor in checkpoint_instances
+            ]
+            local_restores = [
+                rebase_gym_checkpoint_restore_result(
+                    GymCheckpointRestoreResult.model_validate(raw_result),
+                    gym_shards.checkpoint_relative_dir(label),
+                )
+                for (label, _actor), raw_result in zip(
+                    checkpoint_instances,
+                    ray.get(local_restore_refs),
+                    strict=True,
+                )
+            ]
+            restored_gym_checkpoint = GymCheckpointRestoreResult(
+                checkpoint_id=gym_checkpoint_restore_operation_id,
+                participants=[
+                    result
+                    for restore in local_restores
+                    for result in restore.participants
+                ]
+                + model_restore.participants,
             )
-        )
         validate_gym_checkpoint_restore_artifacts(
             saved_gym_checkpoint,
             restored_gym_checkpoint,
