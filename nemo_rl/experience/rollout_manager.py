@@ -1038,7 +1038,9 @@ class AsyncNemoGymRolloutImpl:
             prompt_idx=input_sample["idx"],
             prompt=prompt_message_log,
             extra_env_info=record_extra_env_info,
-            metadata={"task_name": "nemo_gym"},
+            # Preserve dataset identity for prompt recycling and checkpoint resume.
+            # Gym dispatch uses task_to_env["nemo_gym"], independently of this label.
+            metadata={"task_name": input_sample.get("task_name")},
             completions=completions,
             rollout_metrics=rollout_metrics,
             loss_multiplier=float(input_sample.get("loss_multiplier", 1.0)),

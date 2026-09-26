@@ -732,7 +732,14 @@ class TestADropBudgetNeedsASamplerThatStamps:
                 sampler={"name": sampler_name},
                 rollout_failure={"max_consecutive_dropped_prompts": 1},
             )
-            with pytest.raises(ValueError, match="stamps no target step"):
+            expected_error = "stamps no target step"
+            if sampler_name == "queue_recycle":
+                # Reach its dedicated drop-budget check with a valid cycling setup.
+                cfg.grpo = cfg.grpo.model_copy(update={"max_num_epochs": None})
+                expected_error = (
+                    "queue_recycle requires fail-fast rollout failure budgets"
+                )
+            with pytest.raises(ValueError, match=expected_error):
                 validate_single_controller_config(cfg)
 
     def test_shrink_mode_is_rejected_too_not_only_replace(self):

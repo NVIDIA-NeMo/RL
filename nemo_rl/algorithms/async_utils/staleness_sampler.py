@@ -52,9 +52,10 @@ from typing import (
     runtime_checkable,
 )
 
-from pydantic import BaseModel, Field, NonNegativeInt, model_validator
+from pydantic import BaseModel, Field, NonNegativeInt, PositiveInt, model_validator
 
 from nemo_rl.algorithms.async_utils.replay_buffer import (
+    QUEUE_DEQUEUE_VERSION,
     DataPlaneMutationCut,
     TQReplayBuffer,
 )
@@ -396,6 +397,151 @@ class WindowedSampler(BaseSampler):
         )
 
 
+class QueueRecycleSampler(WindowedSampler):
+    """Completion FIFO with Miles-style age rejection and prompt recycling.
+
+    ``max_staleness_versions`` is a strict bound at dequeue, as in Miles.
+    The next batch is prefetched BEFORE the current update is published, so
+    its realized training lag can equal that bound. The bootstrap batch has
+    no intervening update. Unfinished groups are allowed to finish.
+    """
+
+    def __init__(
+        self,
+        buffer: TQReplayBuffer,
+        *,
+        max_staleness_versions: int,
+        min_groups_for_streaming_train: Optional[int] = None,
+    ) -> None:
+        if max_staleness_versions < 1:
+            raise ValueError("queue_recycle requires max_staleness_versions >= 1")
+        super().__init__(
+            buffer,
+            max_staleness_versions=max_staleness_versions,
+            min_groups_for_streaming_train=min_groups_for_streaming_train,
+        )
+        self._prefetch_task: Optional[asyncio.Task[None]] = None
+        self._recycled_groups = 0
+
+    @property
+    def is_on_policy(self) -> bool:
+        # Even bound=1 trains a prefetched batch one version after its dequeue.
+        return False
+
+    def required_buffer_capacity(self, groups_per_step: int) -> int:
+        # Groups leave the completed queue one by one during the drain.
+        return 1
+
+    async def evict(self, *, current_train_weight: int) -> int:
+        # Do not sweep past the prefix that this training step will consume.
+        return 0
+
+    def should_abort_inflight(
+        self,
+        *,
+        start_weight_version: int,
+        current_train_weight: int,
+    ) -> bool:
+        return False
+
+    async def select(
+        self,
+        *,
+        current_train_weight: int,
+        min_prompt_groups: int,
+        max_prompt_groups: int,
+    ) -> tuple[Optional[KVBatchMeta], int]:
+        self._validate_group_bounds(min_prompt_groups, max_prompt_groups)
+        if min_prompt_groups != max_prompt_groups:
+            raise ValueError("queue_recycle selects complete optimizer batches")
+        await self._drain(
+            dequeue_version=current_train_weight,
+            train_version=current_train_weight,
+            num_groups=max_prompt_groups,
+        )
+        groups = self._buffer.queue_training_groups(current_train_weight)
+        metas = [group["meta"] for group in groups]
+        meta = metas[0].concat(*metas[1:])
+        meta.extra_info[ROLLOUT_METRICS] = [
+            metrics
+            for part in metas
+            for metrics in part.extra_info.get(ROLLOUT_METRICS, [])
+        ]
+        return meta, len(groups)
+
+    async def _drain(
+        self, *, dequeue_version: int, train_version: int, num_groups: int
+    ) -> None:
+        while True:
+            groups = self._buffer.queue_training_groups(train_version)
+            if len(groups) == num_groups:
+                # A prefetched batch was already admitted under its old clock.
+                # Do not re-check its age after the intervening weight update.
+                return
+            if len(groups) > num_groups:
+                raise RuntimeError("Checkpoint contains an oversized prefetched batch")
+            if (
+                groups
+                and groups[0]["meta"].extra_info[QUEUE_DEQUEUE_VERSION]
+                != dequeue_version
+            ):
+                raise RuntimeError(
+                    "Cannot finish a partial batch under a different dequeue version"
+                )
+            ready = self._buffer.ready_queue_indices()
+            if not ready:
+                await asyncio.sleep(_GATE_POLL_SECONDS)
+                continue
+            idx = ready[0]
+            group_id = self._buffer.group_ids[idx]
+            gap = dequeue_version - self._buffer.start_weight_list[idx]
+            if gap < 0:
+                raise RuntimeError("Completed group is newer than the dequeue clock")
+            if gap >= self.max_staleness_versions:
+                await self._buffer.recycle_queue_group(group_id)
+                self._recycled_groups += 1
+                continue
+            await self._buffer.claim_queue_group(
+                group_id, train_version=train_version, dequeue_version=dequeue_version
+            )
+
+    def start_prefetch(self, *, dequeue_version: int, num_groups: int) -> None:
+        """Drain one next batch concurrently with the current optimizer step."""
+        if self._prefetch_task is not None:
+            raise RuntimeError("A queue prefetch is already active")
+        self._prefetch_task = asyncio.create_task(
+            self._drain(
+                dequeue_version=dequeue_version,
+                train_version=dequeue_version + 1,
+                num_groups=num_groups,
+            ),
+            name="queue-recycle-prefetch",
+        )
+
+    async def finish_prefetch(self) -> None:
+        """Complete dequeue decisions before publishing the next policy version."""
+        if self._prefetch_task is not None:
+            await self._prefetch_task
+            self._prefetch_task = None
+
+    async def cancel_prefetch(self) -> None:
+        """Join the auxiliary task when the controller exits or fails."""
+        if self._prefetch_task is not None:
+            self._prefetch_task.cancel()
+            await asyncio.gather(self._prefetch_task, return_exceptions=True)
+            self._prefetch_task = None
+
+    def drain_metrics(self) -> dict[str, float]:
+        metrics = {
+            "queue_recycle/recycled_groups": float(self._recycled_groups),
+            "queue_recycle/pending_prompts": float(
+                len(self._buffer.recycled_prompt_group_ids)
+            ),
+        }
+        self._recycled_groups = 0
+        return metrics
+
+
 def _gated_required_buffer_capacity(
     groups_per_step: int,
     *,
@@ -630,6 +776,14 @@ class WindowedSamplerConfig(BaseModel, extra="allow"):
     sample_freshest_first: bool = False
 
 
+class QueueRecycleSamplerConfig(BaseModel, extra="forbid"):
+    """Completion FIFO with prompt retries; no freshness-based reordering."""
+
+    name: Literal["queue_recycle"] = "queue_recycle"
+    # Reject dequeue gaps >= this bound; one prefetch update follows admission.
+    max_staleness_versions: PositiveInt = 8
+
+
 class ReadyFirstSamplerConfig(BaseModel, extra="allow"):
     name: Literal["ready_first"] = "ready_first"
     # How far generation may run ahead of the trainer, in dispatch batches.
@@ -686,6 +840,7 @@ class CustomSamplerConfig(BaseModel, extra="allow"):
 SamplerConfig = Annotated[
     Union[
         WindowedSamplerConfig,
+        QueueRecycleSamplerConfig,
         ReadyFirstSamplerConfig,
         WeightFifoSamplerConfig,
         InOrderSamplerConfig,
@@ -717,6 +872,8 @@ def required_buffer_capacity_for_config(
             groups_per_step,
             gate_window=cfg.peak_lookahead_versions,
         )
+    if isinstance(cfg, QueueRecycleSamplerConfig):
+        return 1
     if isinstance(cfg, WindowedSamplerConfig):
         return min_groups_for_streaming_train
     return None
@@ -742,6 +899,7 @@ def _sampler_class_for_config(cfg: SamplerConfig) -> type:
     try:
         return {
             WindowedSamplerConfig: WindowedSampler,
+            QueueRecycleSamplerConfig: QueueRecycleSampler,
             ReadyFirstSamplerConfig: ReadyFirstSampler,
             WeightFifoSamplerConfig: WeightFifoSampler,
             InOrderSamplerConfig: InOrderSampler,
@@ -813,6 +971,12 @@ def create_sampler(
             buffer,
             max_staleness_versions=cfg.max_staleness_versions,
             sample_freshest_first=cfg.sample_freshest_first,
+            min_groups_for_streaming_train=min_groups_for_streaming_train,
+        )
+    elif isinstance(cfg, QueueRecycleSamplerConfig):
+        sampler = sampler_cls(
+            buffer,
+            max_staleness_versions=cfg.max_staleness_versions,
             min_groups_for_streaming_train=min_groups_for_streaming_train,
         )
     elif isinstance(cfg, ReadyFirstSamplerConfig):

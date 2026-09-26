@@ -26,12 +26,14 @@ from pydantic import (
     NonNegativeInt,
     PositiveFloat,
     PositiveInt,
+    field_validator,
     model_validator,
 )
 
 from nemo_rl.algorithms import opd as opd_module
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSamplerConfig,
+    QueueRecycleSamplerConfig,
     ReadyFirstSamplerConfig,
     SamplerConfig,
     required_buffer_capacity_for_config,
@@ -799,9 +801,24 @@ class RolloutCheckpointConfig(BaseModel, extra="forbid"):
         return self
 
 
+class SingleControllerGRPOConfig(GRPOConfig):
+    # The SingleController dataloader and step-budget setup support cycling
+    # until max_num_steps; the synchronous GRPO loop still requires an integer.
+    max_num_epochs: Optional[int] = 1
+
+
 class MasterConfig(BaseModel, extra="allow"):
+    @field_validator("grpo", mode="before")
+    @classmethod
+    def _accept_common_grpo_config(cls, value: Any) -> Any:
+        if isinstance(value, GRPOConfig) and not isinstance(
+            value, SingleControllerGRPOConfig
+        ):
+            return value.model_dump()
+        return value
+
     # algo configs
-    grpo: Optional[GRPOConfig] = None
+    grpo: Optional[SingleControllerGRPOConfig] = None
     ppo: Optional[PPOConfig] = None
     policy: PolicyConfig
     value: Optional[ValueConfig] = None  # PPO extras
@@ -1277,6 +1294,27 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
 
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)
+
+    if isinstance(async_config.sampler, QueueRecycleSamplerConfig):
+        if is_ppo_run(master_config) or master_config.token_capture.enabled:
+            raise ValueError(
+                "queue_recycle currently requires GRPO without token_capture"
+            )
+        if master_config.policy["generation"]["colocated"]["enabled"]:
+            raise ValueError("queue_recycle prefetch requires non-colocated generation")
+        if algo_cfg.max_num_epochs is not None:
+            raise ValueError(
+                "queue_recycle uses a cycling dataset; set max_num_epochs=null and max_num_steps"
+            )
+        if async_config.min_groups_for_streaming_train != algo_cfg.num_prompts_per_step:
+            raise ValueError(
+                "queue_recycle requires complete prompt batches before training"
+            )
+        failure = async_config.rollout_failure
+        if failure.max_skipped_prompts or failure.max_consecutive_dropped_prompts:
+            raise ValueError(
+                "queue_recycle requires fail-fast rollout failure budgets (both drop limits=0)"
+            )
 
     reward_penalties_enabled = any(
         getattr(master_config.reward_penalties, flag) for flag in _REWARD_PENALTY_FLAGS

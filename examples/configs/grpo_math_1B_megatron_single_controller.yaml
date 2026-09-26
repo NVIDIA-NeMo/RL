@@ -22,6 +22,11 @@ reward_penalties:
   # token_ids: {unwanted: [2], think_open: 12, think_close: 13}
 
 async_rl:
+  # Native, non-colocated GRPO alternative:
+  # sampler: {name: queue_recycle, max_staleness_versions: 8}
+  # This strict dequeue bound allows training lag 8 after one-batch prefetch.
+  # Requires max_num_epochs=null, full prompt batches, and zero skip/drop budgets.
+  # max_buffered_rollouts then bounds only completed queue entries.
   sampler:
     name: in_order
     # How far generation may run ahead of the trainer.
