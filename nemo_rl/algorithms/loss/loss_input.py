@@ -187,7 +187,6 @@ def _prepare_opd_full_loss_input(
         loss_input["next_token_logprobs"] = get_next_token_logprobs_from_logits(
             input_ids=data["input_ids"],
             next_token_logits=logits,
-            seq_index=data.get("seq_index", None),
             vocab_parallel_rank=vocab_parallel_rank,
             vocab_parallel_group=vocab_parallel_group,
             context_parallel_group=context_parallel_group,
@@ -225,8 +224,8 @@ def prepare_loss_input(
             computation (policy.logprob_chunk_size); avoids materializing
             full-size float32 logits during training.
         cp_sharder: Automodel ``ContextParallelSharder`` owning this forward's
-            sequence layout (V2 automodel worker with cp_size > 1); ``logits``
-            are then this rank's CP-local shard while ``data`` stays canonical.
+            sequence layout; set only when cp_size > 1. ``logits`` are then this
+            rank's CP-local shard while ``data`` stays canonical.
         teacher_output_layer_weight_by_index: This TP rank's
             ``[V_local, H_teacher]`` teacher LM-head shards, keyed by the stable
             index rows are tagged with. The ``opd_full`` hidden-state path
@@ -258,7 +257,6 @@ def prepare_loss_input(
             logprobs = get_next_token_logprobs_from_logits(
                 input_ids=data["input_ids"],
                 next_token_logits=logits,
-                seq_index=data.get("seq_index", None),
                 vocab_parallel_rank=vocab_parallel_rank,
                 vocab_parallel_group=vocab_parallel_group,
                 context_parallel_group=context_parallel_group,
@@ -282,7 +280,6 @@ def prepare_loss_input(
                 data["curr_logprobs_unfiltered"] = get_next_token_logprobs_from_logits(
                     input_ids=data["input_ids"],
                     next_token_logits=logits,
-                    seq_index=data.get("seq_index", None),
                     vocab_parallel_rank=vocab_parallel_rank,
                     vocab_parallel_group=vocab_parallel_group,
                     context_parallel_group=context_parallel_group,
