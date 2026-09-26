@@ -17,7 +17,7 @@ The aligner pairs student and teacher tokens by the character spans they cover
 in the shared source text. These tests exercise the single-sample kernel
 (:func:`align_by_offsets_cluster`) and the batched :meth:`TokenAligner.align`
 entry point with hand-built offsets, plus the invariants downstream loss code
-relies on (chunk-id sentinels for padding, the 1-1 exact partition).
+relies on (chunk-id sentinels for padding and correct token pairing).
 """
 
 from __future__ import annotations
@@ -187,7 +187,7 @@ def test_kernel_leading_specials_paired_by_role():
 
 
 # ---------------------------------------------------------------------------
-# Batched align(): shapes, padding sentinels, exact partition.
+# Batched align(): shapes, padding sentinels, correct token pairing.
 # ---------------------------------------------------------------------------
 
 
@@ -211,14 +211,12 @@ def test_align_end_to_end_shapes_are_consistent():
     assert batch.student_chunk_id.shape == (b, t_s)
     assert batch.teacher_chunk_id.shape == (b, t_t)
     assert batch.pair_valid.dtype == torch.bool
-    assert batch.num_chunks.shape == (b,)
-    assert batch.num_chunks[0] <= batch.pair_valid.shape[1]
+    assert batch.pair_valid.shape == (b, 4)
+    assert batch.pair_is_correct.shape == batch.pair_valid.shape
 
 
-def test_align_exact_partition_marks_one_to_one_correct_pairs():
-    """Identical 1-1 tokenization → every content position sits in the
-    gold-loss exact partition on both sides.
-    """
+def test_align_marks_one_to_one_correct_pairs():
+    """Identical tokenizations assign each content token a correct 1-1 pair."""
     vocab = {1: "Hello", 2: "Ġworld", 3: "!"}
     aligner = _make_aligner(vocab, vocab, pad_token_id=0)
     ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
@@ -228,10 +226,10 @@ def test_align_exact_partition_marks_one_to_one_correct_pairs():
         ids, ids.clone(), student_offsets=offsets, teacher_offsets=offsets.clone()
     )
 
-    assert batch.student_exact_partition_mask[0].tolist() == [True, True, True]
-    assert batch.teacher_exact_partition_mask[0].tolist() == [True, True, True]
-    assert (batch.student_chunk_id[0] != -1).all()
-    assert (batch.teacher_chunk_id[0] != -1).all()
+    assert batch.pair_valid[0].tolist() == [True, True, True]
+    assert batch.pair_is_correct[0].tolist() == [True, True, True]
+    assert batch.student_chunk_id[0].tolist() == [0, 1, 2]
+    assert batch.teacher_chunk_id[0].tolist() == [0, 1, 2]
 
 
 def test_align_padding_positions_receive_sentinel_chunk_id():
@@ -266,7 +264,6 @@ def test_align_padding_positions_receive_sentinel_chunk_id():
     # Pad positions of sample 0 are not-in-any-chunk on both sides.
     assert (masked.student_chunk_id[0, -3:] == -1).all(), masked.student_chunk_id[0]
     assert (masked.teacher_chunk_id[0, -3:] == -1).all(), masked.teacher_chunk_id[0]
-    assert not masked.student_exact_partition_mask[0, -3:].any()
     # Real content is untouched: sample 0's first 3 positions keep a chunk,
     # and the fully-real sample 1 is all-chunked.
     assert (masked.student_chunk_id[0, :3] != -1).all()
