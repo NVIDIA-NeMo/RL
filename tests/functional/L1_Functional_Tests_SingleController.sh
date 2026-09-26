@@ -215,6 +215,9 @@ run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controll
 # the end-to-end guard that proves a durable TQ prefix is restored and only the
 # missing suffix is generated after restart.
 run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_prefix_recovery.sh
+# Exercise the same cut through the sharded model-ledger union path. The active
+# prefix belongs to the non-leader Gym shard and must survive full restart.
+run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_sharded_prefix_recovery.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then

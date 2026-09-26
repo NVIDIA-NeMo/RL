@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 
-_PROFILES = ("basic", "workplace")
+_PROFILES = ("basic", "workplace", "sharded")
 _WORKPLACE_EVENT = {
     "event_name": "NeMo RL checkpoint recovery sentinel",
     "participant_email": "checkpoint-recovery@example.com",
@@ -60,6 +60,14 @@ def _participant(checkpoint: dict[str, Any], component: str) -> dict[str, Any]:
     return matches[0]
 
 
+def _participants(checkpoint: dict[str, Any], component: str) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in checkpoint.get("participants", [])
+        if item.get("participant", {}).get("component") == component
+    ]
+
+
 def _participant_manifest(snapshot: Path, participant: dict[str, Any]) -> Path:
     reference = participant["manifest"]
     path = (snapshot / reference["relative_path"]).resolve()
@@ -69,6 +77,15 @@ def _participant_manifest(snapshot: Path, participant: dict[str, Any]) -> Path:
     if _digest(path) != reference["manifest_digest"]:
         raise AssertionError(f"participant manifest digest mismatch for {path}")
     return path
+
+
+def _checkpoint_shard_name(snapshot: Path, manifest_path: Path) -> str:
+    relative = manifest_path.relative_to(snapshot)
+    if len(relative.parts) < 3 or relative.parts[0] != "gym-shards":
+        raise AssertionError(
+            f"shard-local Gym artifact is not under gym-shards/<name>: {relative}"
+        )
+    return relative.parts[1]
 
 
 def _read_artifact(snapshot: Path, reference: dict[str, Any]) -> list[dict[str, Any]]:
@@ -389,38 +406,154 @@ def inspect_snapshot(
             "active generation prefixes are terminal or already exhaust the "
             "request output limit"
         )
-    prefix = sorted(
-        prefixes,
+    recovery = torch.load(snapshot / "rollout_recovery.pt", weights_only=True)
+    if not isinstance(recovery, dict):
+        raise TypeError("rollout recovery sidecar is not a mapping")
+    candidates: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] = []
+    for candidate in prefixes:
+        group, attempt = _matching_attempt(
+            recovery,
+            candidate["rollout_id"],
+            candidate["attempt_index"],
+        )
+        if (
+            profile == "sharded"
+            and group.get("task_source")
+            != "workplace_assistant_prefix_checkpoint_test_agent"
+        ):
+            continue
+        candidates.append((candidate, group, attempt))
+    if not candidates:
+        raise AssertionError(
+            "sharded snapshot has no recoverable active prefix owned by the "
+            "non-leader Workplace shard"
+        )
+    prefix, group, attempt = sorted(
+        candidates,
         key=lambda item: (
-            -item["prefix_token_count"],
-            item["rollout_id"],
-            item["attempt_index"],
+            -item[0]["prefix_token_count"],
+            item[0]["rollout_id"],
+            item[0]["attempt_index"],
         ),
     )[0]
 
-    agent = _participant(gym_checkpoint, "responses_api_agents")
-    resources = _participant(gym_checkpoint, "resources_servers")
     model = _participant(gym_checkpoint, "responses_api_models")
     _participant_manifest(snapshot, model)
-    resources_manifest_path = _participant_manifest(snapshot, resources)
+    checkpoint_shard: str | None = None
+    if profile == "sharded":
+        agents = _participants(gym_checkpoint, "responses_api_agents")
+        resources_participants = _participants(gym_checkpoint, "resources_servers")
+        if len(agents) != 2 or len(resources_participants) != 2:
+            raise AssertionError(
+                "sharded prefix recovery requires two shard-local agent/resource "
+                f"participants; got agents={len(agents)}, "
+                f"resources={len(resources_participants)}"
+            )
+        if (snapshot / ".gym-cut-fragments").exists():
+            raise AssertionError(
+                "published checkpoint retained temporary generation-cut fragments"
+            )
+        agents_by_shard = {
+            _checkpoint_shard_name(
+                snapshot,
+                manifest_path := _participant_manifest(snapshot, participant),
+            ): (participant, manifest_path)
+            for participant in agents
+        }
+        resources_by_shard = {
+            _checkpoint_shard_name(
+                snapshot,
+                manifest_path := _participant_manifest(snapshot, participant),
+            ): (participant, manifest_path)
+            for participant in resources_participants
+        }
+        if set(agents_by_shard) != {"counter", "workplace"} or set(
+            resources_by_shard
+        ) != {"counter", "workplace"}:
+            raise AssertionError(
+                "sharded prefix checkpoint does not contain the expected counter "
+                f"and workplace shards: agents={sorted(agents_by_shard)!r}, "
+                f"resources={sorted(resources_by_shard)!r}"
+            )
+        matching_agents = [
+            (shard_name, participant, record)
+            for shard_name, (participant, _manifest_path) in agents_by_shard.items()
+            for record in _agent_records(snapshot, participant)
+            if record.get("rollout_id") == prefix["rollout_id"]
+            and record.get("attempt_index") == prefix["attempt_index"]
+        ]
+        if len(matching_agents) != 1:
+            raise AssertionError(
+                "active generation cut has no unique shard-local agent boundary"
+            )
+        checkpoint_shard, agent, boundary = matching_agents[0]
+        if checkpoint_shard != "workplace":
+            raise AssertionError(
+                "selected prefix must be owned by the non-leader Workplace shard"
+            )
+        selected_capture_key = (
+            prefix["rollout_id"]
+            if prefix["attempt_index"] == 0
+            else f"{prefix['rollout_id']}-a{prefix['attempt_index']}"
+        )
+        continuation_capture_keys = {
+            row["capture_key"]
+            for participant, _manifest_path in agents_by_shard.values()
+            for row in _read_artifact(
+                snapshot,
+                participant["payload"]["continuation_index"],
+            )
+        }
+        if selected_capture_key in continuation_capture_keys:
+            raise AssertionError(
+                "non-leader first-call prefix unexpectedly has a committed-turn "
+                "continuation root"
+            )
+        if boundary.get("last_committed_model_call_id") is not None:
+            raise AssertionError(
+                "selected non-leader prefix must belong to its first model call"
+            )
+    else:
+        agent = _participant(gym_checkpoint, "responses_api_agents")
+        matching_boundaries = [
+            record
+            for record in _agent_records(snapshot, agent)
+            if record.get("rollout_id") == prefix["rollout_id"]
+            and record.get("attempt_index") == prefix["attempt_index"]
+        ]
+        if len(matching_boundaries) != 1:
+            raise AssertionError(
+                "active generation cut has no unique saved agent continuation boundary"
+            )
+        boundary = matching_boundaries[0]
+
     if agent.get("payload", {}).get("records", 0) < 1:
         raise AssertionError("Gym agent has no saved continuation boundary")
-    if resources.get("payload", {}).get("sessions", 0) < 1:
-        raise AssertionError("Gym resources participant has no saved environment")
-    matching_boundaries = [
-        record
-        for record in _agent_records(snapshot, agent)
-        if record.get("rollout_id") == prefix["rollout_id"]
-        and record.get("attempt_index") == prefix["attempt_index"]
-    ]
-    if len(matching_boundaries) != 1:
-        raise AssertionError(
-            "active generation cut has no unique saved agent continuation boundary"
-        )
-    boundary = matching_boundaries[0]
     resource_revisions = boundary.get("resource_state_revisions")
     if not isinstance(resource_revisions, dict) or not resource_revisions:
         raise AssertionError("saved agent boundary has no resource state revision")
+
+    if profile == "sharded":
+        matching_resources = [
+            (shard_name, participant, manifest_path)
+            for shard_name, (participant, manifest_path) in resources_by_shard.items()
+            if participant["participant"]["participant_name"] in resource_revisions
+        ]
+        if len(matching_resources) != 1:
+            raise AssertionError(
+                "active generation cut does not resolve to one shard-local "
+                "resources participant"
+            )
+        resource_shard, resources, resources_manifest_path = matching_resources[0]
+        if resource_shard != checkpoint_shard:
+            raise AssertionError(
+                "active prefix agent and resource state belong to different shards"
+            )
+    else:
+        resources = _participant(gym_checkpoint, "resources_servers")
+        resources_manifest_path = _participant_manifest(snapshot, resources)
+    if resources.get("payload", {}).get("sessions", 0) < 1:
+        raise AssertionError("Gym resources participant has no saved environment")
 
     resources_manifest = _read_json(resources_manifest_path)
     matching_resource_states: list[dict[str, Any]] = []
@@ -450,14 +583,6 @@ def inspect_snapshot(
             "agent boundary and resources snapshot disagree about state revision"
         )
 
-    recovery = torch.load(snapshot / "rollout_recovery.pt", weights_only=True)
-    if not isinstance(recovery, dict):
-        raise TypeError("rollout recovery sidecar is not a mapping")
-    group, attempt = _matching_attempt(
-        recovery,
-        prefix["rollout_id"],
-        prefix["attempt_index"],
-    )
     if attempt.get("status") != "dispatched":
         raise AssertionError("a cut generation must remain dispatched in the RL ledger")
 
@@ -476,6 +601,8 @@ def inspect_snapshot(
         "group_id": group["group_id"],
         "profile": profile,
     }
+    if checkpoint_shard is not None:
+        selected["checkpoint_shard"] = checkpoint_shard
     if profile == "workplace":
         if model.get("payload", {}).get("rows", 0) < 1:
             raise AssertionError(

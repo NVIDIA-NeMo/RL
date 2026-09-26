@@ -54,6 +54,7 @@ GYM_AGENT_COMPLETED_RESULT_ACKNOWLEDGEMENT_FEATURE = "completed_result_acknowled
 GYM_AGENT_COMPLETION_BULK_ACK_FEATURE = "completed_result_bulk_acknowledgement_v1"
 GYM_AGENT_INLINE_COMPLETION_RECEIPT_FEATURE = "completion_receipt_in_run_response_v1"
 GYM_EXTERNAL_STORAGE_REFERENCE_INDEX_FEATURE = "external_storage_reference_index_v1"
+GYM_GENERATION_CUT_INDEX_UNION_FEATURE = "generation_cut_index_union_v1"
 GYM_GENERATION_CUT_LINEAGE_FEATURE = "generation_cut_lineage_v1"
 
 _IDENTITY_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
@@ -535,6 +536,7 @@ class GymCheckpointTopology(_VersionedWireModel):
         missing_resource_dependencies: list[str] = []
         missing_storage_reference_index: list[str] = []
         unsupported_auxiliary_export_restore: list[str] = []
+        missing_generation_cut_index_union: list[str] = []
         missing_generation_cut_lineage: list[str] = []
         requires_fresh_restart = bool(self.restart_only_resources())
         for contract in self.participants:
@@ -602,6 +604,13 @@ class GymCheckpointTopology(_VersionedWireModel):
                     missing_generation_cut_lineage.append(
                         contract.participant.participant_name
                     )
+                if (
+                    generation_prefix_cuts_enabled
+                    and GYM_GENERATION_CUT_INDEX_UNION_FEATURE not in contract.features
+                ):
+                    missing_generation_cut_index_union.append(
+                        contract.participant.participant_name
+                    )
 
         if missing_acknowledgement:
             raise RuntimeError(
@@ -658,6 +667,12 @@ class GymCheckpointTopology(_VersionedWireModel):
                 "Gym generation-prefix recovery requires durable lineage cuts "
                 "from every stateful policy model; "
                 f"missing={missing_generation_cut_lineage!r}"
+            )
+        if missing_generation_cut_index_union:
+            raise RuntimeError(
+                "Gym generation-prefix recovery requires digest-bound peer cut "
+                "indexes from every stateful policy model; "
+                f"missing={missing_generation_cut_index_union!r}"
             )
 
 
