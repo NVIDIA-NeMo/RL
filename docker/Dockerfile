@@ -115,11 +115,14 @@ RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.ru
     && rustc --version \
     && cargo --version
 
-# Install uv and python
+# Install uv and python outside /root so an unprivileged runtime UID (for example
+# 65532) can execute them: /root is not traversable by other users, and the project
+# venv's python is a symlink into uv's managed-Python directory.
 ARG UV_VERSION=0.11.28
 ARG PYTHON_VERSION=3.13.14
-ENV PATH="/root/.local/bin:$PATH"
-RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh && \
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
+RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh \
+        | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh && \
     uv python install ${PYTHON_VERSION}
 
 # Disable usage stats by default for users who are sensitive to sharing usage.
@@ -553,6 +556,32 @@ RUN python tools/generate_fingerprint.py > /opt/nemo_rl_container_fingerprint
 # NOTICES.txt file points to where the OSS source code is archived
 RUN echo "This distribution includes open source which is archived at the following URL: https://opensource.nvidia.com/oss/teams/nvidia/nemo-rl/${RC_DATE}:linux-${TARGETARCH}/index.html" > NOTICES.txt && \
     echo "For further inquiries or assistance, contact us at oss-requests@nvidia.com" >> NOTICES.txt
+
+# Let an unprivileged runtime UID (for example 65532, the NeMo CI agent workloads) run this
+# image, which stays root by default. Create its home and the writable runtime paths callers
+# point caches and sources at, and hand it the prebuilt environment roots so it can create
+# entries there. Only the directories change owner: a recursive chown would copy every
+# hardlinked venv file into this layer.
+ARG RUNTIME_UID=65532
+ARG RUNTIME_GID=65532
+RUN <<"EOF" bash -exu
+getent group "${RUNTIME_GID}" >/dev/null || groupadd --gid "${RUNTIME_GID}" nemo-runtime
+getent passwd "${RUNTIME_UID}" >/dev/null || useradd --no-log-init --uid "${RUNTIME_UID}" \
+    --gid "${RUNTIME_GID}" --create-home --home-dir /home/nemo-runtime --shell /bin/bash nemo-runtime
+install -d -o "${RUNTIME_UID}" -g "${RUNTIME_GID}" /home/nemo-runtime /nemo_run \
+    "${NEMO_GYM_VENV_DIR}" /opt/nemo-rl-source /opt/nemo_rl_cache/uv /opt/nemo_rl_python
+chown "${RUNTIME_UID}:${RUNTIME_GID}" /opt/nemo-rl "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}"
+EOF
+USER ${RUNTIME_UID}:${RUNTIME_GID}
+RUN <<"EOF" bash -exu
+uv --version
+"${UV_PROJECT_ENVIRONMENT}/bin/python" --version
+for dir in /home/nemo-runtime /nemo_run /opt/nemo-rl "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}" \
+        "${NEMO_GYM_VENV_DIR}" /opt/nemo-rl-source /opt/nemo_rl_cache/uv /opt/nemo_rl_python; do
+    test -w "${dir}"
+done
+EOF
+USER root
 
 # Export the builder-local ccache as a separate scratch image. CI builds this
 # target immediately after the release target with the same Buildx builder, so
