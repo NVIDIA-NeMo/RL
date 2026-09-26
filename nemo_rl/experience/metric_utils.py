@@ -157,12 +157,14 @@ def calculate_staleness_metrics(
         for group_id in group_versions:
             category_groups[group_categories[group_id]].append(group_id)
         for category, group_ids in sorted(category_groups.items()):
-            # Encode '/', '%' and other separators without conflating labels
-            # such as "ifbench/v1" and "ifbench_v1".
-            prefix = f"staleness/category/{quote(category, safe='')}"
+            # Preserve category hierarchy; encode literal '%' so "a/b" and
+            # "a%2Fb" still have distinct metric keys.
+            prefix = f"staleness/category/{quote(category, safe='/')}"
             values = [train_weight_version - group_versions[g] for g in group_ids]
-            # Preserve the original category keys as aliases of total.
-            metrics.update(_summarize_staleness(values, prefix=prefix))
+            # Keep legacy aliases only for flat labels. A hierarchical alias
+            # for "math/total" would overwrite "math"'s canonical total keys.
+            if "/" not in category:
+                metrics.update(_summarize_staleness(values, prefix=prefix))
             metrics.update(_summarize_staleness(values, prefix=f"{prefix}/total"))
             populations[prefix] = group_ids
     if sample_ready_versions is not None:

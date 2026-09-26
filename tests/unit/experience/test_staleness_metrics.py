@@ -213,11 +213,26 @@ def test_category_labels_are_escaped_without_collisions_or_overwriting_total():
         train_weight_version=3,
         sample_categories={"a": "a/b", "b": "a%2Fb", "c": "a_b", "d": "total"},
     )
-    _assert_counts(metrics, "staleness/category/a%2Fb", [3])
+    _assert_counts(metrics, "staleness/category/a/b/total", [3])
     _assert_counts(metrics, "staleness/category/a%252Fb", [2])
     _assert_counts(metrics, "staleness/category/a_b", [1])
     _assert_counts(metrics, "staleness/category/total", [0])
     _assert_counts(metrics, "staleness/total", [3, 2, 1, 0])
+
+
+def test_hierarchical_categories_do_not_overwrite_parent_statistics():
+    metrics = calculate_staleness_metrics(
+        [("a", 1), ("b", 2), ("c", 3)],
+        train_weight_version=4,
+        sample_categories={"a": "math", "b": "math/total", "c": "math/dapo-math-17k"},
+        sample_ready_versions={"a": 2, "b": 3, "c": 4},
+    )
+    _assert_counts(metrics, "staleness/category/math/total", [3])
+    _assert_counts(metrics, "staleness/category/math/total/total", [2])
+    _assert_counts(metrics, "staleness/category/math/dapo-math-17k/total", [1])
+    assert metrics["staleness/category/math/dapo-math-17k/pre_queue/mean"] == 1
+    assert metrics["staleness/category/math/dapo-math-17k/in_queue/mean"] == 0
+    assert metrics["staleness/total/num_groups"] == 3
 
 
 def test_category_uses_oldest_sibling_version_and_retains_overflow():
