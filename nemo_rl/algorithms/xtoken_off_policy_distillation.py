@@ -40,7 +40,7 @@ from typing import Any, NotRequired, Optional, TypedDict, cast
 
 import numpy as np
 import torch
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
@@ -84,8 +84,8 @@ from nemo_rl.utils.timer import TimeoutChecker, Timer
 #     dict-level dim check skips it.
 #   - teacher_input_ids/teacher_token_mask + alignment_*: produced by
 #     CrossTokenizerCollator (in DataLoader workers).
-# alignment_student_chunk_id and alignment_student_exact_partition_mask are
-# [B, T_s] and DO follow the student-seq invariant, so they are NOT listed.
+# alignment_student_chunk_id is [B, T_s] and DOES follow the student-seq
+# invariant, so it is NOT listed.
 def xtoken_non_student_seq_keys(
     loss_fn: "CrossTokenizerDistillationLossFn",
 ) -> frozenset[str]:
@@ -100,8 +100,8 @@ def xtoken_non_student_seq_keys(
     dicts, not a tensor); a cross-tokenizer teacher additionally rides its
     teacher-seq tokenization (``teacher_{i}_input_ids`` / ``teacher_{i}_token_mask``,
     ``[B, T_t]``) and its teacher-seq / max_pairs ``alignment_{i}_*`` keys. The
-    ``alignment_{i}_student_*`` (``[B, T_s]``) and ``alignment_{i}_num_chunks``
-    (``[B]``) keys follow the student-seq invariant and are NOT skipped.
+    ``alignment_{i}_student_chunk_id`` (``[B, T_s]``) follows the student-seq
+    invariant and is NOT skipped.
     """
     keys: set[str] = set()
     for i in range(loss_fn.num_teachers):
@@ -111,7 +111,6 @@ def xtoken_non_student_seq_keys(
             keys.add(f"teacher_{i}_token_mask")
             keys.add(f"alignment_{i}_pair_valid")
             keys.add(f"alignment_{i}_pair_is_correct")
-            keys.add(f"alignment_{i}_teacher_exact_partition_mask")
             keys.add(f"alignment_{i}_teacher_chunk_id")
     return frozenset(keys)
 
@@ -162,19 +161,33 @@ def _default_off_policy_distillation_save_state() -> OffPolicyDistillationSaveSt
     }
 
 
+class TeacherAlignerConfig(BaseModel, extra="allow"):
+    """Per-teacher token-alignment configuration.
+
+    Attributes:
+        projection_matrix_path: Path to this teacher's student-to-teacher
+            projection matrix. ``None`` marks a same-tokenizer teacher, which
+            bypasses projection and alignment and uses direct per-position KL.
+        drop_first_assistant_chunk_kl: Whether chat-mode alignment drops the
+            first content pair in each assistant message for this teacher. The
+            CE token mask is unaffected.
+    """
+
+    projection_matrix_path: Optional[str] = None
+    drop_first_assistant_chunk_kl: bool = False
+
+
 class TeacherConfig(BaseModel, extra="allow"):
     """Per-teacher config for multi-teacher cross-tokenizer distillation.
 
     Carries the full ``PolicyConfig`` content (``model_name``, ``tokenizer``,
     ``dtensor_cfg``, …) as permitted extras, plus the cross-tokenizer knobs
-    declared below. Use :meth:`policy_config` to recover the plain
-    ``PolicyConfig`` dict for ``Policy`` construction.
+    declared below. Alignment-specific settings live in the typed ``aligner``
+    block. Use :meth:`policy_config` to recover the plain ``PolicyConfig`` dict
+    for ``Policy`` construction.
 
     Attributes:
-        projection_matrix_path: Path to this teacher's student->teacher
-            projection matrix. ``None`` marks a *same-tokenizer* teacher:
-            projection and alignment are skipped and the loss uses a direct
-            per-position KL on the shared vocab.
+        aligner: This teacher's projection and chat-alignment settings.
         weight: Static loss weight for this teacher when several teachers are
             aggregated (``kd_loss_mode="sum"`` / the convex ``"averaged_logits"``
             mix). Single-teacher runs leave it at ``1.0``.
@@ -185,18 +198,27 @@ class TeacherConfig(BaseModel, extra="allow"):
             same semantics as ``gold_loss``.
     """
 
-    projection_matrix_path: Optional[str] = None
+    aligner: TeacherAlignerConfig = Field(default_factory=TeacherAlignerConfig)
     weight: float = 1.0
     gold_loss: Optional[bool] = None
     xtoken_loss: Optional[bool] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_legacy_projection_matrix_path(cls, value: Any) -> Any:
+        """Reject the legacy root projection path with the supported location."""
+        if isinstance(value, dict) and "projection_matrix_path" in value:
+            raise ValueError(
+                "teachers[i].projection_matrix_path is no longer supported; "
+                "move it to teachers[i].aligner.projection_matrix_path."
+            )
+        return value
 
     def policy_config(self) -> PolicyConfig:
         """Recover the plain ``PolicyConfig`` dict (cross-tokenizer knobs stripped)."""
         return cast(
             PolicyConfig,
-            self.model_dump(
-                exclude={"projection_matrix_path", "weight", "gold_loss", "xtoken_loss"}
-            ),
+            self.model_dump(exclude={"aligner", "weight", "gold_loss", "xtoken_loss"}),
         )
 
 
@@ -273,13 +295,14 @@ def setup(
     # validated against their projection matrix in the loss.
     student_vocab = len(student_tokenizer)
     for i, teacher in enumerate(teachers):
-        if teacher.projection_matrix_path is None:
+        if teacher.aligner.projection_matrix_path is None:
             assert len(teacher_tokenizers[i]) == student_vocab, (
-                f"teachers[{i}] has projection_matrix_path=null (same-vocab "
-                f"teacher) but its tokenizer vocab ({len(teacher_tokenizers[i])}) "
-                f"!= student vocab ({student_vocab}). A same-vocab teacher must "
-                "share the student tokenizer; set a projection_matrix_path to "
-                "run it as a cross-tokenizer teacher."
+                f"teachers[{i}].aligner.projection_matrix_path is null "
+                f"(same-vocab teacher) but its tokenizer vocab "
+                f"({len(teacher_tokenizers[i])}) != student vocab "
+                f"({student_vocab}). A same-vocab teacher must share the "
+                "student tokenizer; set aligner.projection_matrix_path to run "
+                "it as a cross-tokenizer teacher."
             )
 
     set_seed(distillation_config["seed"])
@@ -310,11 +333,11 @@ def setup(
     # no alignment — the loss does a direct per-position KL there).
     aligners: list[Optional[TokenAligner]] = [
         None
-        if teacher.projection_matrix_path is None
+        if teacher.aligner.projection_matrix_path is None
         else TokenAligner(
             student_tokenizer=student_tokenizer,
             teacher_tokenizer=teacher_tokenizers[i],
-            projection_matrix_path=teacher.projection_matrix_path,
+            projection_matrix_path=teacher.aligner.projection_matrix_path,
         )
         for i, teacher in enumerate(teachers)
     ]
@@ -329,6 +352,15 @@ def setup(
         make_seq_div_by_teachers=[
             tc["make_sequence_length_divisible_by"] for tc in teacher_configs
         ],
+        drop_first_assistant_chunk_kl_by_teacher=[
+            teacher.aligner.drop_first_assistant_chunk_kl for teacher in teachers
+        ],
+        # Shared chat/instruct knobs; default to the raw-text path.
+        mode=data_config.get("collator_mode", "text"),
+        include_thinking_in_loss=data_config.get("include_thinking_in_loss", False),
+        native_thinking_alignment=data_config.get("native_thinking_alignment", False),
+        kd_alignment_regions=data_config.get("kd_alignment_regions", None),
+        num_packed_rows=data_config.get("num_packed_rows", 1),
     )
 
     # ==========================
@@ -480,7 +512,9 @@ def setup(
         **loss_config,
         "student_vocab_size": len(student_tokenizer),
         "teacher_vocab_sizes": [len(tok) for tok in teacher_tokenizers],
-        "projection_matrix_paths": [t.projection_matrix_path for t in teachers],
+        "projection_matrix_paths": [
+            teacher.aligner.projection_matrix_path for teacher in teachers
+        ],
         "teacher_weights": [t.weight for t in teachers],
         "teacher_gold_loss": [t.gold_loss for t in teachers],
         "teacher_xtoken_loss": [t.xtoken_loss for t in teachers],
@@ -560,11 +594,8 @@ def export_teacher_logits_and_pack(
             for field in (
                 "pair_valid",
                 "pair_is_correct",
-                "student_exact_partition_mask",
-                "teacher_exact_partition_mask",
                 "student_chunk_id",
                 "teacher_chunk_id",
-                "num_chunks",
             ):
                 train_data[f"alignment_{i}_{field}"] = batch[f"alignment_{i}_{field}"]
 

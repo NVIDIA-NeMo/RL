@@ -141,7 +141,7 @@ def test_all_config_files_have_required_keys(config_file):
         # ``distillation`` branch below. The multi-teacher cross-tokenizer config
         # is identified by its top-level ``teachers`` list (online distillation
         # uses a singular ``teacher``); the per-(student, teacher) projection path
-        # now lives on each ``teachers[i].projection_matrix_path`` rather than
+        # now lives at ``teachers[i].aligner.projection_matrix_path`` rather than
         # ``loss_fn``. The legacy ``loss_fn.projection_matrix_path`` check is kept
         # as a fallback for any single-teacher config that still carries it.
         master_config_class = XTokenOffPolicyDistillationMasterConfig

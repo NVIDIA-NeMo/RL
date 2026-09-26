@@ -45,6 +45,7 @@ import nemo_rl.algorithms.xtoken_off_policy_distillation as xt_mod
 from nemo_rl.algorithms.loss.loss_functions import CrossTokenizerDistillationLossFn
 from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     MasterConfig,
+    TeacherAlignerConfig,
     TeacherConfig,
     _default_off_policy_distillation_save_state,
     export_teacher_logits_and_pack,
@@ -100,20 +101,11 @@ def _make_batch(
         batch[f"alignment_{i}_pair_is_correct"] = torch.ones(
             (batch_size, 2), dtype=torch.bool
         )
-        batch[f"alignment_{i}_student_exact_partition_mask"] = torch.zeros(
-            (batch_size, t_student), dtype=torch.bool
-        )
-        batch[f"alignment_{i}_teacher_exact_partition_mask"] = torch.zeros(
-            (batch_size, t_teacher), dtype=torch.bool
-        )
         batch[f"alignment_{i}_student_chunk_id"] = torch.zeros(
             (batch_size, t_student), dtype=torch.long
         )
         batch[f"alignment_{i}_teacher_chunk_id"] = torch.zeros(
             (batch_size, t_teacher), dtype=torch.long
-        )
-        batch[f"alignment_{i}_num_chunks"] = torch.tensor(
-            [1] * batch_size, dtype=torch.long
         )
     # validate() pads ragged val batches via BatchedDataDict.size, so the mock
     # batches must be BatchedDataDict (the train path reads them as a dict too).
@@ -170,7 +162,9 @@ def _make_master_config(
             "teachers": [
                 TeacherConfig(
                     **{
-                        "projection_matrix_path": "/tmp/dummy-projection.pt",
+                        "aligner": {
+                            "projection_matrix_path": "/tmp/dummy-projection.pt"
+                        },
                         "weight": 1.0,
                         "dtensor_cfg": {
                             "enabled": True,
@@ -290,7 +284,7 @@ def _patched_setup_call(master_config, *, student_vocab=32, teacher_vocab=24):
         patch.object(xt_mod, "Logger"),
         patch.object(xt_mod, "CheckpointManager") as mock_cp_cls,
         patch.object(xt_mod, "TokenAligner"),
-        patch.object(xt_mod, "CrossTokenizerCollator"),
+        patch.object(xt_mod, "CrossTokenizerCollator") as mock_collator_cls,
         patch.object(xt_mod, "CrossTokenizerDistillationLossFn") as mock_loss_cls,
         patch.object(xt_mod, "StatefulDataLoader") as mock_dl_cls,
         patch.object(xt_mod, "assert_teacher_student_batch_grid"),
@@ -313,8 +307,59 @@ def _patched_setup_call(master_config, *, student_vocab=32, teacher_vocab=24):
             "cluster": mock_cluster,
             "policy": mock_policy_cls,
             "loss": mock_loss_cls,
+            "collator": mock_collator_cls,
             "checkpointer": mock_cp_cls,
         }
+
+
+def test_teacher_aligner_config_defaults():
+    teacher = TeacherConfig(model_name="teacher")
+
+    assert isinstance(teacher.aligner, TeacherAlignerConfig)
+    assert teacher.aligner.projection_matrix_path is None
+    assert teacher.aligner.drop_first_assistant_chunk_kl is False
+
+
+def test_teacher_aligner_config_explicit_values_serialize_and_stay_out_of_policy():
+    teacher = TeacherConfig(
+        model_name="teacher",
+        aligner={
+            "projection_matrix_path": "/tmp/projection.pt",
+            "drop_first_assistant_chunk_kl": True,
+        },
+    )
+
+    dumped = teacher.model_dump()
+    assert dumped["aligner"] == {
+        "projection_matrix_path": "/tmp/projection.pt",
+        "drop_first_assistant_chunk_kl": True,
+    }
+    assert "projection_matrix_path" not in dumped
+    assert "aligner" not in teacher.policy_config()
+
+
+@pytest.mark.parametrize("legacy_path", [None, "/tmp/legacy.pt"])
+@pytest.mark.parametrize(
+    "aligner",
+    [
+        None,
+        {},
+        {"projection_matrix_path": "/tmp/legacy.pt"},
+        {"projection_matrix_path": "/tmp/nested.pt"},
+        TeacherAlignerConfig(projection_matrix_path="/tmp/legacy.pt"),
+    ],
+)
+def test_legacy_teacher_projection_path_is_rejected(
+    legacy_path: str | None, aligner: dict | TeacherAlignerConfig | None
+) -> None:
+    config = {"projection_matrix_path": legacy_path}
+    if aligner is not None:
+        config["aligner"] = aligner
+    with pytest.raises(
+        ValidationError,
+        match=r"move it to teachers\[i\]\.aligner\.projection_matrix_path",
+    ):
+        TeacherConfig.model_validate(config)
 
 
 def test_empty_teachers_list_rejected_at_config_load():
@@ -380,6 +425,9 @@ def test_setup_injects_vocab_sizes_into_loss_config():
     assert injected_cfg["teacher_vocab_sizes"] == [256]
     assert injected_cfg["projection_matrix_paths"] == ["/tmp/dummy-projection.pt"]
     assert injected_cfg["teacher_weights"] == [1.0]
+    assert mocks["collator"].call_args.kwargs[
+        "drop_first_assistant_chunk_kl_by_teacher"
+    ] == [False]
     # Original master_config not mutated by the injection.
     assert cfg.loss_fn == original_loss_cfg
 
@@ -682,9 +730,8 @@ def test_skip_keys_builder_cross_and_same_vocab():
     assert "teacher_0_token_mask" in keys
     assert "alignment_0_pair_valid" in keys
     assert "alignment_0_teacher_chunk_id" in keys
-    # Student-seq alignment keys ([B, T_s]) and num_chunks ([B]) are NOT skipped.
+    # Student-seq alignment keys ([B, T_s]) are NOT skipped.
     assert "alignment_0_student_chunk_id" not in keys
-    assert "alignment_0_num_chunks" not in keys
     # Same-vocab teacher 1 also ships full logits over IPC, so its handle-list
     # key (a non-tensor) is skipped; it reuses the student tokenization, so it
     # has no teacher-seq token keys and no teacher-indexed alignment keys.
@@ -748,13 +795,13 @@ def test_export_teacher_logits_packs_indexed_keys_and_runs_serially():
     )
 
 
-def test_setup_builds_one_policy_per_teacher():
+def test_setup_preserves_aligner_config_across_interleaved_teacher_types():
     cfg = _make_master_config()
-    # Add a second (same-vocab) teacher.
+    # Interleave a same-vocab teacher between two cross-tokenizer teachers.
     cfg.teachers.append(
         TeacherConfig(
             **{
-                "projection_matrix_path": None,
+                "aligner": {"projection_matrix_path": None},
                 "weight": 0.5,
                 "dtensor_cfg": {
                     "enabled": True,
@@ -770,8 +817,30 @@ def test_setup_builds_one_policy_per_teacher():
             }
         )
     )
+    cfg.teachers.append(
+        TeacherConfig(
+            **{
+                "aligner": {
+                    "projection_matrix_path": "/tmp/dummy-projection-2.pt",
+                    "drop_first_assistant_chunk_kl": True,
+                },
+                "weight": 0.25,
+                "dtensor_cfg": {
+                    "enabled": True,
+                    "_v2": True,
+                    "tensor_parallel_size": 1,
+                    "context_parallel_size": 1,
+                },
+                "max_total_sequence_length": 64,
+                "make_sequence_length_divisible_by": 8,
+                "train_global_batch_size": 1,
+                "train_micro_batch_size": 1,
+                "tokenizer": {"name": "teacher-2-tok"},
+            }
+        )
+    )
     student_tok = _make_tokenizer(32)
-    teacher_toks = [_make_tokenizer(24), _make_tokenizer(32)]
+    teacher_toks = [_make_tokenizer(24), _make_tokenizer(32), _make_tokenizer(28)]
     train_ds = MagicMock()
     train_ds.__len__ = MagicMock(return_value=4)
 
@@ -780,8 +849,8 @@ def test_setup_builds_one_policy_per_teacher():
         patch.object(xt_mod, "Policy") as mock_policy_cls,
         patch.object(xt_mod, "Logger"),
         patch.object(xt_mod, "CheckpointManager") as mock_cp_cls,
-        patch.object(xt_mod, "TokenAligner"),
-        patch.object(xt_mod, "CrossTokenizerCollator"),
+        patch.object(xt_mod, "TokenAligner") as mock_aligner_cls,
+        patch.object(xt_mod, "CrossTokenizerCollator") as mock_collator_cls,
         patch.object(xt_mod, "CrossTokenizerDistillationLossFn") as mock_loss_cls,
         patch.object(xt_mod, "StatefulDataLoader") as mock_dl_cls,
         patch.object(xt_mod, "assert_teacher_student_batch_grid"),
@@ -803,14 +872,24 @@ def test_setup_builds_one_policy_per_teacher():
 
     # One teacher Policy per entry (+ the student), and the colocation cap
     # accounts for all teacher groups + the student.
-    assert isinstance(teachers, list) and len(teachers) == 2
-    assert mock_policy_cls.call_count == 3  # 2 teachers + 1 student
-    assert mock_cluster.call_args.kwargs["max_colocated_worker_groups"] == 3
+    assert isinstance(teachers, list) and len(teachers) == 3
+    assert mock_policy_cls.call_count == 4  # 3 teachers + 1 student
+    assert mock_cluster.call_args.kwargs["max_colocated_worker_groups"] == 4
+    assert mock_aligner_cls.call_count == 2
+    aligners = mock_collator_cls.call_args.kwargs["aligners"]
+    assert aligners[0] is not None and aligners[1] is None and aligners[2] is not None
+    assert mock_collator_cls.call_args.kwargs[
+        "drop_first_assistant_chunk_kl_by_teacher"
+    ] == [False, False, True]
     # Per-teacher metadata injected as parallel lists.
     injected_cfg = mock_loss_cls.call_args.args[0]
-    assert injected_cfg["projection_matrix_paths"] == ["/tmp/dummy-projection.pt", None]
-    assert injected_cfg["teacher_weights"] == [1.0, 0.5]
-    assert injected_cfg["teacher_vocab_sizes"] == [24, 32]
+    assert injected_cfg["projection_matrix_paths"] == [
+        "/tmp/dummy-projection.pt",
+        None,
+        "/tmp/dummy-projection-2.pt",
+    ]
+    assert injected_cfg["teacher_weights"] == [1.0, 0.5, 0.25]
+    assert injected_cfg["teacher_vocab_sizes"] == [24, 32, 28]
 
 
 def test_setup_rejects_same_vocab_teacher_with_mismatched_vocab():
@@ -820,7 +899,7 @@ def test_setup_rejects_same_vocab_teacher_with_mismatched_vocab():
     # in setup() (the right place — it has the real tokenizers; tokenizer
     # *names* would wrongly flag Llama-3.2-3B vs -1B, which share a vocab).
     cfg = _make_master_config()
-    cfg.teachers[0].projection_matrix_path = None  # mark same-vocab
+    cfg.teachers[0].aligner.projection_matrix_path = None  # mark same-vocab
     student_tok = _make_tokenizer(32)
     teacher_toks = [_make_tokenizer(24)]  # 24 != 32 -> mismatch
     with (
@@ -937,34 +1016,48 @@ def test_averaged_logits_same_tokenizer_takes_direct_kl_fast_path():
 
 
 @pytest.mark.parametrize("metric", ["ce", "entropy", "max_prob"])
-def test_teacher_weight_score_ignores_padded_positions(metric):
-    # The per-teacher weight/selection score must exclude padded positions:
-    # padding logits are near-uniform noise and would otherwise dominate the
-    # score on long-padded batches. Corrupting everything in the padded tail
-    # must not change the score.
+@pytest.mark.parametrize(
+    "mask", [[1, 1, 1, 0, 0], [0, 0, 1, 1, 0]], ids=["padding", "chat"]
+)
+def test_teacher_weight_score_uses_only_scored_positions(
+    metric: str, mask: list[int]
+) -> None:
+    # Context and padding remain available to the model but must not affect
+    # teacher weights or selection. Only assistant positions count in chat mode.
     fn = CrossTokenizerDistillationLossFn.__new__(CrossTokenizerDistillationLossFn)
     fn.sum_weights_metric = metric
 
-    torch.manual_seed(0)
     batch, seqlen, vocab = 2, 5, 8
-    logits = torch.randn(batch, seqlen, vocab)
-    ids = torch.randint(0, vocab, (batch, seqlen))
-    # Last two positions of each sample are padding.
-    token_mask = torch.tensor([[1, 1, 1, 0, 0], [1, 1, 1, 0, 0]], dtype=torch.float32)
+    logits = torch.zeros(batch, seqlen, vocab)
+    ids = torch.ones(batch, seqlen, dtype=torch.long)
+    token_mask = torch.tensor([mask] * batch, dtype=torch.float32)
     sample_mask = torch.ones(batch)
 
     score = fn._teacher_weight_score(logits, ids, token_mask, sample_mask)
 
-    # Corrupt the padded tail; a properly masked score must not move.
+    # CE scores the next token, so the preceding logit predicts each target.
+    # In particular, the last prompt logit predicts the first assistant token.
+    scored_logits = token_mask.bool()
+    if metric == "ce":
+        scored_logits = torch.zeros_like(scored_logits)
+        scored_logits[:, :-1] = token_mask[:, 1:].bool()
+
     logits_corrupt = logits.clone()
-    logits_corrupt[:, 3:, :] = 1e4
+    logits_corrupt[..., 0][~scored_logits] = 10.0
     ids_corrupt = ids.clone()
-    ids_corrupt[:, 3:] = 0
+    ids_corrupt[~token_mask.bool()] = 0
     score_corrupt = fn._teacher_weight_score(
         logits_corrupt, ids_corrupt, token_mask, sample_mask
     )
 
     assert torch.allclose(score, score_corrupt, atol=1e-5)
+
+    # Making the scored predictions confident in the correct token must change
+    # the score, ruling out a mask that accidentally excludes the answer too.
+    logits_answer = logits.clone()
+    logits_answer[..., 1][scored_logits] = 10.0
+    score_answer = fn._teacher_weight_score(logits_answer, ids, token_mask, sample_mask)
+    assert score_answer > score
 
 
 def test_teacher_weight_score_masks_dropped_samples():

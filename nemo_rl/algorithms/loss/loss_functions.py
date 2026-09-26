@@ -2075,8 +2075,9 @@ class CrossTokenizerDistillationLossConfig(TypedDict):
             [V_student, top_k]) or the sparse multi-token format
             (dict[(student_id, teacher_id)] -> count), loaded lazily on first
             call by each worker process. Runtime-injected by
-            ``xtoken_off_policy_distillation.setup`` from ``teachers[i]``; not a
-            user loss_fn key in YAML.
+            ``xtoken_off_policy_distillation.setup`` from
+            ``teachers[i].aligner.projection_matrix_path``; not a user loss_fn
+            key in YAML.
         gold_loss: If True, switch to the gold-loss formulation: split the
             vocab into an exact-token-mapped *common* set (KL) and an
             *uncommon* set (sorted L1).
@@ -2166,8 +2167,7 @@ class CrossTokenizerDistillationLossDataDict(TypedDict):
     - Cross-tokenizer teacher only: ``teacher_{i}_input_ids`` /
       ``teacher_{i}_token_mask`` ``[B, T_t]`` and ``alignment_{i}_*``
       (``pair_valid`` / ``pair_is_correct`` ``[B, max_pairs]``;
-      ``student_chunk_id`` ``[B, T_s]``; ``teacher_chunk_id`` ``[B, T_t]``;
-      partition masks; ``num_chunks``).
+      ``student_chunk_id`` ``[B, T_s]``; ``teacher_chunk_id`` ``[B, T_t]``).
     - Same-tokenizer teacher: no ``teacher_{i}_input_ids`` / ``alignment_{i}_*``;
       it reuses the student tokenization (identity 1:1 aligned).
     """
