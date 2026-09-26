@@ -89,7 +89,7 @@ on_policy_distillation:
 ```
 
 > [!NOTE]
-> Teachers run the Megatron backend in inference-only mode. A DTensor-configured
+> Teachers run the Megatron backend in inference-only mode. An Automodel-configured
 > policy is rejected for the teacher; PEFT / draft modules are stripped so
 > adapters are never attached to the frozen teacher; and teachers run
 > unquantized (a policy `quant_cfg` is ignored, with a warning).

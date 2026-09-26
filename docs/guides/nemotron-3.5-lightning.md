@@ -12,7 +12,7 @@ This guide covers two ways to post-train Nemotron 3.5 Lightning with NeMo RL:
   the full 86-node asynchronous GRPO + NeMo Gym recipe used for the reference
   RLVR stage on GB200 NVL72 (ARM64 / aarch64) hardware.
 - [DAPO math RL with the automodel backend](#dapo-math-rl-with-the-automodel-backend) —
-  a compact 4-node DAPO recipe on the DTensor (automodel) training backend,
+  a compact 4-node DAPO recipe on the Automodel training backend,
   useful as a smaller-footprint starting point on x86 H100 clusters.
 
 ## RLVR with NeMo Gym (GB200 reference run)
@@ -258,7 +258,7 @@ bash examples/nemo_gym/nemotron-3.5-lightning/lightning35_launch.sh
 
 The recipe `examples/configs/recipes/llm/dapo-nanov3.5-30BA3B-4n8g-automodel.yaml`
 trains [`nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16)
-with DAPO on math data using the DTensor (automodel) training backend and
+with DAPO on math data using the Automodel training backend and
 colocated vLLM generation. It runs on 4 nodes of 8x H100 80GB and is also
 exercised as a nightly test
 (`tests/test_suites/llm/dapo-nanov3.5-30BA3B-4n8g-automodel.sh`).
@@ -271,7 +271,7 @@ exercised as a nightly test
 | Data | `DAPOMath17K` train / `DAPOMathAIME2024` validation |
 | Maximum sequence length | 9,216 tokens (8,192 generated) |
 | Rollouts per step | 32 prompts x 16 generations (global batch size 512) |
-| Training parallelism | DTensor FSDP with EP=8, TP=1, activation checkpointing |
+| Training parallelism | Automodel FSDP2 with EP=8, TP=1, activation checkpointing |
 | Policy generation | Colocated vLLM TP=4 |
 | Optimizer | TransformerEngine `FusedAdam`, lr 1e-6, wd 0.1, 10-step warmup |
 | Training precision | BF16 |

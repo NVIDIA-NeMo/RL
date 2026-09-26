@@ -4,15 +4,15 @@ NeMo RL supports multiple training backends to accommodate different model sizes
 
 ## Available Backends
 
-- **DTensor (FSDP2)** - PyTorch's next-generation distributed training with improved memory efficiency.
+- **Automodel** - PyTorch's next-generation distributed training with improved memory efficiency.
 - **Megatron** - NVIDIA's high-performance training framework for scaling to large models (>100B parameters).
 
 ## Supported Input Checkpoint Format
 
 At this time, NeMo RL only supports Hugging Face checkpoints as inputs to the training scripts. This applies to both
-the `DTensor` backend and the `Megatron` backend.
+the `Automodel` backend and the `Megatron` backend.
 
-* `DTensor` uses the Hugging Face checkpoint both to initialize the training backend and to configure `vllm`, ensuring the model implementations match exactly. This is crucial for correctness.
+* `Automodel` uses the Hugging Face checkpoint both to initialize the training backend and to configure `vllm`, ensuring the model implementations match exactly. This is crucial for correctness.
 * `Megatron` also uses the Hugging Face checkpoint to configure `vllm`, and performs a one-time conversion to a Megatron-format checkpoint to initialize the training backend.
 
 If you would like to see direct support for Megatron checkpoints, please share your use case on
@@ -134,13 +134,13 @@ state remains GPU resident; choose a fraction that leaves enough GPU memory for
 the colocated generation backend. Optimizer CPU offload is independent of
 activation CPU offload.
 
-### DTensor Backend
-To enable DTensor (FSDP2) training:
+### Automodel Backend
+To enable Automodel training:
 
 1. Set `policy.dtensor_cfg.enabled=True`.
 2. Refer to [examples/configs/grpo_math_1B.yaml](../../examples/configs/grpo_math_1B.yaml) for a configuration example.
 
-For multi-node runs, set `policy.dtensor_cfg.dp_replicate_size > 1` to enable Hybrid Sharded Data Parallel (HSDP). This keeps FSDP collectives intra-node and only replicates gradients across nodes. See [HSDP (`dp_replicate_size`)](fsdp2-parallel-plan.md#hsdp-dp_replicate_size).
+For multi-node runs, set `policy.dtensor_cfg.dp_replicate_size > 1` to enable Hybrid Sharded Data Parallel (HSDP). This keeps FSDP collectives intra-node and only replicates gradients across nodes. See [HSDP (`dp_replicate_size`)](automodel-parallel-plan.md#hsdp-dp_replicate_size).
 
 ## Configuration Examples
 

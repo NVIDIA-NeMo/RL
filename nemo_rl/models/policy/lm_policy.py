@@ -299,7 +299,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             assert config["train_micro_batch_size"] == config["logprob_batch_size"], (
                 f"{sep_line}\n"
                 "There is a known batch-variant accuracy issue with TP>=4 for both DTensor and Megatron backend.\n"
-                "See https://docs.nvidia.com/nemo/rl/latest/guides/dtensor-tp-accuracy.html#root-cause for more details.\n"
+                "See https://docs.nvidia.com/nemo/rl/latest/guides/automodel-tp-accuracy.html#root-cause for more details.\n"
                 "\n"
                 "Please choose either of the following solutions to avoid this issue:\n"
                 "1. Set tp_size to 1 or 2. (tensor_parallel_size for DTensor, or tensor_model_parallel_size for Megatron)\n"
