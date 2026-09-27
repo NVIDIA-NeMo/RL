@@ -176,6 +176,7 @@ from nemo_rl.experience.rollout_manager import RolloutOutcome
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
+    PendingCompletedExecutionAcknowledgement,
     PromptGroupPhase,
     RolloutAttemptStatus,
     RolloutRecoveryState,
@@ -202,6 +203,11 @@ if TYPE_CHECKING:
     from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
 
 Generation = Union[VllmGeneration, SGLangGeneration, MegatronGeneration]
+
+_GYM_ACKNOWLEDGEMENT_CHUNK_SIZE = 256
+_GYM_ACKNOWLEDGEMENT_MAX_CONCURRENT_AGENTS = 8
+_GYM_ACKNOWLEDGEMENT_COALESCE_S = 1.0
+_GYM_ACKNOWLEDGEMENT_CHECKPOINT_COALESCE_S = 0.05
 
 # Named `log` rather than `logger` to keep it distinct from the experiment
 # Logger this module also uses as `self._logger`.
@@ -681,6 +687,8 @@ class SingleControllerActor:
         self._generation_checkpoint_id: Optional[str] = None
         self._gym_completed_acknowledgement_lock = asyncio.Lock()
         self._gym_completed_acknowledgement_task: Optional[asyncio.Task[None]] = None
+        self._gym_completed_acknowledgement_flush_requested = asyncio.Event()
+        self._gym_acknowledgement_checkpoint_active = False
         self._rollout_manager.bind_gym_acknowledgement_sink(
             self._schedule_completed_gym_acknowledgement_drain
             if self._gym_participant_checkpointing_enabled
@@ -1942,7 +1950,8 @@ class SingleControllerActor:
         """Schedule delivery for ledger-backed Gym acknowledgement obligations."""
         if not self._gym_participant_checkpointing_enabled:
             return
-        if not self._rollout_recovery_ledger.pending_completed_execution_acknowledgements():
+        pending_count = self._rollout_recovery_ledger.pending_completed_execution_acknowledgement_count()
+        if pending_count == 0:
             return
 
         task = self._gym_completed_acknowledgement_task
@@ -1950,48 +1959,119 @@ class SingleControllerActor:
             self._gym_completed_acknowledgement_task = asyncio.create_task(
                 self._drain_completed_gym_acknowledgements_best_effort()
             )
+        if pending_count >= _GYM_ACKNOWLEDGEMENT_CHUNK_SIZE:
+            self._gym_completed_acknowledgement_flush_requested.set()
+
+    async def _wait_for_completed_gym_acknowledgement_flush(self) -> bool:
+        """Wait for a full ACK chunk, a deadline, or a checkpoint flush request."""
+        if self._gym_completed_acknowledgement_flush_requested.is_set():
+            self._gym_completed_acknowledgement_flush_requested.clear()
+            return True
+        pending_count = self._rollout_recovery_ledger.pending_completed_execution_acknowledgement_count()
+        if pending_count == 0:
+            return False
+        if pending_count >= _GYM_ACKNOWLEDGEMENT_CHUNK_SIZE:
+            return True
+
+        timeout_s = (
+            _GYM_ACKNOWLEDGEMENT_CHECKPOINT_COALESCE_S
+            if self._gym_acknowledgement_checkpoint_active
+            else _GYM_ACKNOWLEDGEMENT_COALESCE_S
+        )
+        try:
+            await asyncio.wait_for(
+                self._gym_completed_acknowledgement_flush_requested.wait(),
+                timeout=timeout_s,
+            )
+        except TimeoutError:
+            return True
+        self._gym_completed_acknowledgement_flush_requested.clear()
+        return True
 
     async def _flush_completed_gym_acknowledgements(self) -> int:
-        """Send all currently queued acknowledgements as one idempotent batch."""
+        """Drain agent-bounded ACK chunks and retire each confirmed chunk."""
         if not self._gym_participant_checkpointing_enabled:
             return 0
         async with self._gym_completed_acknowledgement_lock:
             pending = self._rollout_recovery_ledger.pending_completed_execution_acknowledgements()
             if not pending:
                 return 0
-            payload = [
-                GymCompletedExecution(
-                    receipt=acknowledgement.receipt,
-                    agent_name=acknowledgement.agent_name,
-                ).model_dump(mode="json")
-                for acknowledgement in pending
-            ]
-            await self._nemo_gym_checkpoint_actor().acknowledge_completed_executions.remote(
-                payload
-            )
-            # The HTTP call deliberately runs without a mutation cut. Within
-            # this live Gym process, a checkpoint racing between remote ACK
-            # acceptance and local removal may retry the receipt idempotently.
-            # Snapshot publication separately requires this durable outbox to
-            # be empty, so no unresolved ACK obligation crosses a restart.
-            async with self._data_plane_checkpoint_barrier.mutation(
-                "gym_acknowledgements"
-            ) as cut:
-                self._rollout_recovery_ledger.mark_completed_executions_acknowledged(
-                    cut,
-                    pending,
+
+            by_agent: dict[str, list[PendingCompletedExecutionAcknowledgement]] = {}
+            for acknowledgement in pending:
+                by_agent.setdefault(acknowledgement.agent_name, []).append(
+                    acknowledgement
                 )
-            return len(pending)
+
+            semaphore = asyncio.Semaphore(_GYM_ACKNOWLEDGEMENT_MAX_CONCURRENT_AGENTS)
+            gym_actor = self._nemo_gym_checkpoint_actor()
+            acknowledged_count = 0
+
+            async def acknowledge_agent(
+                agent_name: str,
+                acknowledgements: list[PendingCompletedExecutionAcknowledgement],
+            ) -> int:
+                nonlocal acknowledged_count
+                acknowledged = 0
+                async with semaphore:
+                    for offset in range(
+                        0,
+                        len(acknowledgements),
+                        _GYM_ACKNOWLEDGEMENT_CHUNK_SIZE,
+                    ):
+                        chunk = acknowledgements[
+                            offset : offset + _GYM_ACKNOWLEDGEMENT_CHUNK_SIZE
+                        ]
+                        payload = [
+                            GymCompletedExecution(
+                                receipt=acknowledgement.receipt,
+                                agent_name=agent_name,
+                            ).model_dump(mode="json")
+                            for acknowledgement in chunk
+                        ]
+                        await gym_actor.acknowledge_completed_executions.remote(payload)
+                        # Transport runs without a mutation cut. If a checkpoint
+                        # lands between remote acceptance and local removal, the
+                        # durable obligation is retried idempotently.
+                        async with self._data_plane_checkpoint_barrier.mutation(
+                            "gym_acknowledgements"
+                        ) as cut:
+                            self._rollout_recovery_ledger.mark_completed_executions_acknowledged(
+                                cut,
+                                chunk,
+                            )
+                        acknowledged += len(chunk)
+                        acknowledged_count += len(chunk)
+                return acknowledged
+
+            results = await asyncio.gather(
+                *(
+                    acknowledge_agent(agent_name, acknowledgements)
+                    for agent_name, acknowledgements in sorted(by_agent.items())
+                ),
+                return_exceptions=True,
+            )
+            for result in results:
+                if isinstance(result, BaseException):
+                    if acknowledged_count:
+                        print(
+                            "Gym completed-result acknowledgement partially "
+                            f"drained before failure: acknowledged={acknowledged_count}, "
+                            f"pending_at_start={len(pending)}",
+                            flush=True,
+                        )
+                    raise result
+            return acknowledged_count
 
     async def _drain_completed_gym_acknowledgements_best_effort(self) -> None:
         """Keep rollout publication fast; checkpoint preparation retries strictly."""
         clean_exit = False
         try:
             # A completion can be queued while the current HTTP request is in
-            # flight. Keep draining until one serialized pass observes no work;
-            # otherwise that completion would wait for the next group or save.
-            while await self._flush_completed_gym_acknowledgements():
-                pass
+            # flight. Coalesce short bursts, but wake immediately for a full
+            # chunk or a checkpoint that needs an empty durable outbox.
+            while await self._wait_for_completed_gym_acknowledgement_flush():
+                await self._flush_completed_gym_acknowledgements()
             clean_exit = True
         except (Exception, asyncio.CancelledError) as error:
             if isinstance(error, asyncio.CancelledError):
@@ -2035,6 +2115,8 @@ class SingleControllerActor:
         gym_actor = self._nemo_gym_checkpoint_actor()
         prepare_attempted = False
         self._gym_checkpoint_rollout_permitted.clear()
+        self._gym_acknowledgement_checkpoint_active = True
+        self._gym_completed_acknowledgement_flush_requested.set()
         try:
             # A completed agent result blocks Gym prepare until RL has durably
             # adopted it. Flush every canonical result queued by finalization
@@ -2138,6 +2220,13 @@ class SingleControllerActor:
                     recovery_errors,
                 )
             raise
+        finally:
+            self._gym_acknowledgement_checkpoint_active = False
+            if (
+                self._rollout_recovery_ledger.pending_completed_execution_acknowledgement_count()
+                == 0
+            ):
+                self._gym_completed_acknowledgement_flush_requested.clear()
 
     async def _release_prepared_gym_checkpoint(
         self,

@@ -51,6 +51,7 @@ GYM_AGENT_CONTINUATION_INDEX_FEATURE = "agent_continuation_index_v1"
 GYM_AGENT_DISCARD_RESTORED_CONTINUATION_FEATURE = "discard_restored_continuation_v1"
 GYM_AGENT_RESOURCE_DEPENDENCY_INDEX_FEATURE = "agent_resource_dependency_index_v1"
 GYM_AGENT_COMPLETED_RESULT_ACKNOWLEDGEMENT_FEATURE = "completed_result_acknowledgement"
+GYM_AGENT_COMPLETION_BULK_ACK_FEATURE = "completed_result_bulk_acknowledgement_v1"
 GYM_AGENT_INLINE_COMPLETION_RECEIPT_FEATURE = "completion_receipt_in_run_response_v1"
 GYM_EXTERNAL_STORAGE_REFERENCE_INDEX_FEATURE = "external_storage_reference_index_v1"
 GYM_GENERATION_CUT_LINEAGE_FEATURE = "generation_cut_lineage_v1"
@@ -675,6 +676,24 @@ class GymCompletedExecutionAcknowledgementResponse(_StrictWireModel):
             raise ValueError(
                 "Gym completion acknowledgement must report exactly one of "
                 "acknowledged or idempotent"
+            )
+        return self
+
+
+class GymCompletedExecutionAcknowledgementBatchResponse(_StrictWireModel):
+    """Atomic disposition for one exact bulk acknowledgement request."""
+
+    accepted_count: PositiveInt
+    newly_acknowledged_count: NonNegativeInt
+    idempotent_count: NonNegativeInt
+    batch_digest: Sha256Digest
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> "GymCompletedExecutionAcknowledgementBatchResponse":
+        if self.newly_acknowledged_count + self.idempotent_count != self.accepted_count:
+            raise ValueError(
+                "Gym bulk completion acknowledgement disposition count does not "
+                "match accepted count"
             )
         return self
 
