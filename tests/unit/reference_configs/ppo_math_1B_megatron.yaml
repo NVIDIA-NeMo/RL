@@ -470,13 +470,20 @@ logger:
     project: "ppo-dapo-megatron-dev"
     name: "ppo_dapo_megatron_1B"
     log_nemo_gym_full_result_tables: false
+    entity: null
+    id: null
+    resume: null
   swanlab:
     project: "ppo-dapo-megatron-dev"
     name: "ppo_dapo_megatron_1B"
-  tensorboard: {}
+  tensorboard:
+    log_dir: null
   mlflow:
     experiment_name: "ppo-dapo-megatron-dev"
     run_name: "ppo_dapo_megatron_1B"
+    run_id: null
+    tracking_uri: null
+    artifact_location: null
   gpu_monitoring:
     collection_interval: 10
     flush_interval: 10
