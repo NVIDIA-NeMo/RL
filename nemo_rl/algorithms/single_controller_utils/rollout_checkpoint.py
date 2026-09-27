@@ -117,6 +117,8 @@ _BOOTSTRAP_FINGERPRINT_EXCLUDED_PATHS = frozenset(
         "env.**.entrypoint",
         "env.**.global_aiohttp_connector_limit",
         "env.**.global_aiohttp_connector_limit_per_host",
+        "env.**.global_aiohttp_control_connector_limit",
+        "env.**.global_aiohttp_control_connector_limit_per_host",
         "env.**.head_server",
         "env.**.head_server_deps",
         "env.**.json",

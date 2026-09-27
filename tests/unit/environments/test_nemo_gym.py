@@ -240,6 +240,92 @@ def test_run_rollouts_waits_when_checkpoint_freezes_before_actor_registration() 
     asyncio.run(_run())
 
 
+def test_run_rollouts_uses_inline_completion_receipt_without_control_get() -> None:
+    async def _run() -> None:
+        row = {
+            "_rowidx": 0,
+            "_ng_rollout_id": "group-1_g0",
+            "_ng_attempt_index": 0,
+            "agent_ref": {"name": "test-agent"},
+            "responses_create_params": {"input": []},
+        }
+        receipt = GymCompletionReceipt(
+            rollout_id="group-1_g0",
+            attempt_index=0,
+            execution_generation=1,
+            result_identity="result-group-1_g0-0",
+            result_digest="1" * 64,
+        ).model_dump(mode="json")
+
+        class _RolloutCollectionHelper:
+            def run_examples(self, examples, head_server_config):
+                raise AssertionError("metadata-aware rollout path must be used")
+
+            def run_examples_with_metadata(self, examples, head_server_config):
+                del head_server_config
+
+                async def _completed_result():
+                    return (
+                        examples[0],
+                        {"response": {"output": []}},
+                        {"completion_receipt": receipt},
+                    )
+
+                return [_completed_result()]
+
+        class _MockSelf:
+            cfg = {}
+            rch = _RolloutCollectionHelper()
+            head_server_config = object()
+            _token_capture_enabled = False
+            _stable_execution_identity_enabled = True
+            _gym_checkpoint_participants = (object(),)
+            _gym_execution_registry = GymActorExecutionRegistry()
+            _tokenizer = object()
+
+            def _require_spinup(self):
+                pass
+
+            def _agent_checkpoint_participant(self, agent_name):
+                assert agent_name == "test-agent"
+                return SimpleNamespace(
+                    capabilities=SimpleNamespace(
+                        features=["completion_receipt_in_run_response_v1"]
+                    )
+                )
+
+            async def _completion_receipt_for(self, execution, *, agent_name):
+                raise AssertionError("inline receipt must avoid the control GET")
+
+            def _postprocess_nemo_gym_to_nemo_rl_result(
+                self,
+                result_row,
+                result,
+                result_tokenizer,
+                *,
+                include_initial_multimodal_data,
+            ):
+                del (
+                    self,
+                    result_row,
+                    result,
+                    result_tokenizer,
+                    include_initial_multimodal_data,
+                )
+                return {"message_log": []}
+
+        results = []
+        async for item in NemoGym.__ray_metadata__.modified_class.run_rollouts(
+            _MockSelf(), [row], "test"
+        ):
+            results.append(item)
+
+        assert len(results) == 1
+        assert results[0][2]["gym_completion_receipt"] == receipt
+
+    asyncio.run(_run())
+
+
 def test_multimodal_content_types_cover_responses_media_aliases():
     assert {
         "input_image",

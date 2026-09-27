@@ -63,10 +63,10 @@ set -euo pipefail
 #   EXTRA_MOUNTS=                          Comma-separated host:container pairs
 #   MOUNT_LOCAL_GYM=1                      0 to skip the full local Gym overlay
 #   NRL_DRIVER_PYTHONPATH=                 Extra PYTHONPATH for the driver
-#   NRL_DRIVER_PIP_INSTALL=                Packages to install in the driver venv
-#   NRL_VLLM_WORKER_PIP_INSTALL=           Packages to install in the async vLLM worker venv
-#   NRL_NEMO_GYM_PIP_INSTALL=              Packages to install in the Gym actor venv
-#   NRL_GYM_SERVER_PIP_INSTALL=            Packages to install in every Gym server venv
+#   NRL_DRIVER_PIP_INSTALL=                Optional driver packages; empty skips install
+#   NRL_VLLM_WORKER_PIP_INSTALL=           Optional async-vLLM-worker packages; empty skips install
+#   NRL_NEMO_GYM_PIP_INSTALL=              Optional Gym-actor packages; empty skips install
+#   NRL_GYM_SERVER_PIP_INSTALL=            Optional Gym-server packages; empty skips install
 #   USE_SNAPSHOT=1                         Snapshot source tree at submission
 #   DRY_RUN=0                              1 to print TRAIN_CMD and exit
 #   INTERACTIVE=0                          1 to bring up Ray and idle for attach

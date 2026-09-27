@@ -173,6 +173,7 @@ from nemo_rl.experience.rollout_manager import RolloutOutcome
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
+    CompletedExecutionAcknowledgement,
     PromptGroupPhase,
     RolloutAttemptStatus,
     RolloutRecoveryState,
@@ -199,6 +200,11 @@ if TYPE_CHECKING:
     from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
 
 Generation = Union[VllmGeneration, SGLangGeneration, MegatronGeneration]
+
+_GYM_ACKNOWLEDGEMENT_CHUNK_SIZE = 256
+_GYM_ACKNOWLEDGEMENT_MAX_CONCURRENT_AGENTS = 8
+_GYM_ACKNOWLEDGEMENT_COALESCE_S = 1.0
+_GYM_ACKNOWLEDGEMENT_CHECKPOINT_COALESCE_S = 0.05
 
 # Named `log` rather than `logger` to keep it distinct from the experiment
 # Logger this module also uses as `self._logger`.
@@ -652,6 +658,8 @@ class SingleControllerActor:
         self._generation_checkpoint_id: Optional[str] = None
         self._gym_completed_acknowledgement_lock = asyncio.Lock()
         self._gym_completed_acknowledgement_task: Optional[asyncio.Task[None]] = None
+        self._gym_completed_acknowledgement_flush_requested = asyncio.Event()
+        self._gym_acknowledgement_checkpoint_active = False
         self._pending_gym_checkpoint_release: Optional[_PendingGymCheckpointRelease]
         self._pending_gym_checkpoint_release = None
 
@@ -1841,7 +1849,8 @@ class SingleControllerActor:
         """Schedule delivery for ledger-backed Gym acknowledgement obligations."""
         if not self._gym_participant_checkpointing_enabled:
             return
-        if not self._rollout_recovery_ledger.pending_completed_execution_acknowledgements():
+        pending_count = self._rollout_recovery_ledger.pending_completed_execution_acknowledgement_count()
+        if pending_count == 0:
             return
 
         task = self._gym_completed_acknowledgement_task
@@ -1849,63 +1858,135 @@ class SingleControllerActor:
             self._gym_completed_acknowledgement_task = asyncio.create_task(
                 self._drain_completed_gym_acknowledgements_best_effort()
             )
+        if pending_count >= _GYM_ACKNOWLEDGEMENT_CHUNK_SIZE:
+            self._gym_completed_acknowledgement_flush_requested.set()
+
+    async def _wait_for_completed_gym_acknowledgement_flush(self) -> bool:
+        """Wait for a full ACK chunk, a deadline, or a checkpoint flush request."""
+        if self._gym_completed_acknowledgement_flush_requested.is_set():
+            self._gym_completed_acknowledgement_flush_requested.clear()
+            return True
+        pending_count = self._rollout_recovery_ledger.pending_completed_execution_acknowledgement_count()
+        if pending_count == 0:
+            return False
+        if pending_count >= _GYM_ACKNOWLEDGEMENT_CHUNK_SIZE:
+            return True
+
+        timeout_s = (
+            _GYM_ACKNOWLEDGEMENT_CHECKPOINT_COALESCE_S
+            if self._gym_acknowledgement_checkpoint_active
+            else _GYM_ACKNOWLEDGEMENT_COALESCE_S
+        )
+        try:
+            await asyncio.wait_for(
+                self._gym_completed_acknowledgement_flush_requested.wait(),
+                timeout=timeout_s,
+            )
+        except TimeoutError:
+            return True
+        self._gym_completed_acknowledgement_flush_requested.clear()
+        return True
 
     async def _flush_completed_gym_acknowledgements(self) -> int:
-        """Send all currently queued acknowledgements as one idempotent batch."""
+        """Drain agent-bounded ACK chunks and retire each confirmed chunk."""
         if not self._gym_participant_checkpointing_enabled:
             return 0
         async with self._gym_completed_acknowledgement_lock:
             pending = self._rollout_recovery_ledger.pending_completed_execution_acknowledgements()
             if not pending:
                 return 0
-            payload = [
-                GymCompletedExecution(
-                    receipt={
-                        "rollout_id": rollout_id,
-                        "attempt_index": attempt_index,
-                        "execution_generation": execution_generation,
-                        "result_identity": result_identity,
-                        "result_digest": result_digest,
-                        "manifest_capture_key": manifest_capture_key,
-                        "terminal_model_call_id": terminal_model_call_id,
-                    },
-                    agent_name=agent_name,
-                ).model_dump(mode="json")
-                for (
-                    rollout_id,
-                    attempt_index,
-                    agent_name,
-                    execution_generation,
-                    result_identity,
-                    result_digest,
-                    manifest_capture_key,
-                    terminal_model_call_id,
-                ) in pending
-            ]
-            await self._nemo_gym_checkpoint_actor().acknowledge_completed_executions.remote(
-                payload
+
+            by_agent: dict[str, list[CompletedExecutionAcknowledgement]] = {}
+            for acknowledgement in pending:
+                by_agent.setdefault(acknowledgement[2], []).append(acknowledgement)
+
+            semaphore = asyncio.Semaphore(_GYM_ACKNOWLEDGEMENT_MAX_CONCURRENT_AGENTS)
+            gym_actor = self._nemo_gym_checkpoint_actor()
+            acknowledged_count = 0
+
+            async def acknowledge_agent(
+                agent_name: str,
+                acknowledgements: list[CompletedExecutionAcknowledgement],
+            ) -> int:
+                nonlocal acknowledged_count
+                acknowledged = 0
+                async with semaphore:
+                    for offset in range(
+                        0,
+                        len(acknowledgements),
+                        _GYM_ACKNOWLEDGEMENT_CHUNK_SIZE,
+                    ):
+                        chunk = acknowledgements[
+                            offset : offset + _GYM_ACKNOWLEDGEMENT_CHUNK_SIZE
+                        ]
+                        payload = [
+                            GymCompletedExecution(
+                                receipt={
+                                    "rollout_id": rollout_id,
+                                    "attempt_index": attempt_index,
+                                    "execution_generation": execution_generation,
+                                    "result_identity": result_identity,
+                                    "result_digest": result_digest,
+                                    "manifest_capture_key": manifest_capture_key,
+                                    "terminal_model_call_id": terminal_model_call_id,
+                                },
+                                agent_name=agent_name,
+                            ).model_dump(mode="json")
+                            for (
+                                rollout_id,
+                                attempt_index,
+                                _receipt_agent_name,
+                                execution_generation,
+                                result_identity,
+                                result_digest,
+                                manifest_capture_key,
+                                terminal_model_call_id,
+                            ) in chunk
+                        ]
+                        await gym_actor.acknowledge_completed_executions.remote(payload)
+                        # The HTTP call deliberately runs without a mutation cut.
+                        # If a checkpoint lands between remote acceptance and this
+                        # removal, the durable obligation is retried idempotently.
+                        async with self._data_plane_checkpoint_barrier.mutation(
+                            "gym_acknowledgements"
+                        ) as cut:
+                            self._rollout_recovery_ledger.mark_completed_executions_acknowledged(
+                                cut,
+                                chunk,
+                            )
+                        acknowledged += len(chunk)
+                        acknowledged_count += len(chunk)
+                return acknowledged
+
+            results = await asyncio.gather(
+                *(
+                    acknowledge_agent(agent_name, acknowledgements)
+                    for agent_name, acknowledgements in sorted(by_agent.items())
+                ),
+                return_exceptions=True,
             )
-            # The HTTP call deliberately runs without a mutation cut. If a
-            # checkpoint lands after Gym accepts the idempotent ACK but before
-            # this removal, it preserves the obligation and safely retries it.
-            async with self._data_plane_checkpoint_barrier.mutation(
-                "gym_acknowledgements"
-            ) as cut:
-                self._rollout_recovery_ledger.mark_completed_executions_acknowledged(
-                    cut,
-                    pending,
-                )
-            return len(pending)
+            for result in results:
+                if isinstance(result, BaseException):
+                    if acknowledged_count:
+                        print(
+                            "Gym completed-result acknowledgement partially "
+                            f"drained before failure: acknowledged={acknowledged_count}, "
+                            f"pending_at_start={len(pending)}",
+                            flush=True,
+                        )
+                    raise result
+            return acknowledged_count
 
     async def _drain_completed_gym_acknowledgements_best_effort(self) -> None:
         """Keep rollout publication fast; checkpoint preparation retries strictly."""
         clean_exit = False
         try:
             # A completion can be queued while the current HTTP request is in
-            # flight. Keep draining until one serialized pass observes no work;
-            # otherwise that completion would wait for the next group or save.
-            while await self._flush_completed_gym_acknowledgements():
-                pass
+            # flight. Keep coalescing and draining until one serialized pass
+            # observes no work; otherwise that completion would wait for the
+            # next group or save.
+            while await self._wait_for_completed_gym_acknowledgement_flush():
+                await self._flush_completed_gym_acknowledgements()
             clean_exit = True
         except (Exception, asyncio.CancelledError) as error:
             if isinstance(error, asyncio.CancelledError):
@@ -1948,13 +2029,75 @@ class SingleControllerActor:
         timeout_s = self._master_config.rollout_checkpointing.gym.prepare_timeout_s
         gym_actor = self._nemo_gym_checkpoint_actor()
         prepared = False
+        operation_started = time.monotonic()
+        current_phase = "initializing"
+        trace_events: list[dict[str, Any]] = []
+
+        def trace(event: str, **fields: Any) -> None:
+            payload = {
+                "event": event,
+                "timestamp": time.time(),
+                "elapsed_seconds": time.monotonic() - operation_started,
+                "checkpoint_id": checkpoint_id,
+                **fields,
+            }
+            trace_events.append(payload)
+            print(
+                "rollout_checkpoint_telemetry "
+                + json.dumps(payload, sort_keys=True, default=str),
+                flush=True,
+            )
+
+        def persist_failure_diagnostic(error: BaseException) -> Path:
+            diagnostic_dir = checkpoint_dir.parent / "checkpoint_diagnostics"
+            diagnostic_dir.mkdir(parents=True, exist_ok=True)
+            diagnostic_path = diagnostic_dir / f"{checkpoint_id}.json"
+            diagnostic_path.write_text(
+                json.dumps(
+                    {
+                        "checkpoint_id": checkpoint_id,
+                        "failed_phase": current_phase,
+                        "error_type": type(error).__name__,
+                        "error": str(error),
+                        "events": trace_events,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                    default=str,
+                )
+                + "\n"
+            )
+            return diagnostic_path
+
+        trace(
+            "checkpoint_prepare_commit_started",
+            timeout_seconds=timeout_s,
+            checkpoint_dir=str(checkpoint_dir),
+        )
         self._gym_checkpoint_rollout_permitted.clear()
+        self._gym_acknowledgement_checkpoint_active = True
+        # Wake a background coalescer before the strict flush below. Whichever
+        # coroutine acquires the ACK lock first drains the same durable outbox;
+        # the other then observes the idempotently emptied state.
+        self._gym_completed_acknowledgement_flush_requested.set()
         try:
             # A completed agent result blocks Gym prepare until RL has durably
             # adopted it. Flush every canonical result queued by finalization
             # before asking Gym to park the remaining active executions.
-            await self._flush_completed_gym_acknowledgements()
+            current_phase = "ack_flush"
+            phase_started = time.monotonic()
+            trace("checkpoint_phase_started", phase=current_phase)
+            acknowledged_count = await self._flush_completed_gym_acknowledgements()
+            trace(
+                "checkpoint_phase_completed",
+                phase=current_phase,
+                duration_seconds=time.monotonic() - phase_started,
+                acknowledged_count=acknowledged_count,
+            )
             if self._generation_prefix_cuts_enabled:
+                current_phase = "generation_fence"
+                phase_started = time.monotonic()
+                trace("checkpoint_phase_started", phase=current_phase)
                 try:
                     await asyncio.to_thread(
                         self._gen.begin_generation_checkpoint,
@@ -1974,6 +2117,14 @@ class SingleControllerActor:
                         )
                     raise
                 self._generation_checkpoint_id = checkpoint_id
+                trace(
+                    "checkpoint_phase_completed",
+                    phase=current_phase,
+                    duration_seconds=time.monotonic() - phase_started,
+                )
+            current_phase = "gym_prepare"
+            phase_started = time.monotonic()
+            trace("checkpoint_phase_started", phase=current_phase)
             prepare = GymCheckpointPrepareResult.model_validate(
                 await gym_actor.prepare_checkpoint.remote(
                     checkpoint_id,
@@ -1984,7 +2135,16 @@ class SingleControllerActor:
                 raise RuntimeError(
                     f"Gym checkpoint {checkpoint_id!r} returned an incomplete cut"
                 )
+            trace(
+                "checkpoint_phase_completed",
+                phase=current_phase,
+                duration_seconds=time.monotonic() - phase_started,
+                participant_count=len(prepare.participants),
+            )
             prepared = True
+            current_phase = "gym_commit"
+            phase_started = time.monotonic()
+            trace("checkpoint_phase_started", phase=current_phase)
             checkpoint = GymCheckpointCommitResult.model_validate(
                 await gym_actor.commit_checkpoint.remote(
                     checkpoint_id,
@@ -2008,8 +2168,39 @@ class SingleControllerActor:
                 checkpoint_dir,
                 checkpoint,
             )
+            trace(
+                "checkpoint_phase_completed",
+                phase=current_phase,
+                duration_seconds=time.monotonic() - phase_started,
+                participant_count=len(checkpoint.participants),
+            )
+            trace("checkpoint_prepare_commit_completed")
             return prepare, checkpoint
         except BaseException as checkpoint_error:
+            trace(
+                "checkpoint_prepare_commit_failed",
+                phase=current_phase,
+                error_type=type(checkpoint_error).__name__,
+                error=str(checkpoint_error),
+            )
+            try:
+                diagnostic_path = await asyncio.to_thread(
+                    persist_failure_diagnostic,
+                    checkpoint_error,
+                )
+            except Exception as diagnostic_error:
+                trace(
+                    "checkpoint_failure_diagnostic_failed",
+                    phase=current_phase,
+                    error_type=type(diagnostic_error).__name__,
+                    error=str(diagnostic_error),
+                )
+            else:
+                trace(
+                    "checkpoint_failure_diagnostic_written",
+                    phase=current_phase,
+                    path=str(diagnostic_path),
+                )
             recovery_errors: list[BaseException] = [checkpoint_error]
             if prepared:
                 try:
@@ -2037,6 +2228,13 @@ class SingleControllerActor:
                     recovery_errors,
                 )
             raise
+        finally:
+            self._gym_acknowledgement_checkpoint_active = False
+            if (
+                self._rollout_recovery_ledger.pending_completed_execution_acknowledgement_count()
+                == 0
+            ):
+                self._gym_completed_acknowledgement_flush_requested.clear()
 
     async def _release_prepared_gym_checkpoint(
         self,

@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import time
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -30,8 +30,10 @@ from nemo_rl.environments.gym_checkpoint import (
     GymActorExecutionRegistry,
     GymAgentExecutionStatus,
     GymCheckpointPrepareResult,
+    GymCompletionReceipt,
     GymExecutionIdentity,
     GymResourcesPrepareResponse,
+    gym_completion_acknowledgement_batch_digest,
     gym_generation_cut_proofs,
     gym_generation_cut_receipts,
     gym_generation_cut_staging_keys,
@@ -103,6 +105,8 @@ def _checkpoint_env():
     env.rh = object()
     env._gym_checkpoint_participants = ()
     env._control_timeout_s = 60.0
+    env._completion_receipt_total_semaphore = asyncio.Semaphore(512)
+    env._completion_receipt_agent_semaphores = {}
     env._active_gym_checkpoint_id = None
     env._gym_execution_registry = GymActorExecutionRegistry()
     return env
@@ -879,6 +883,149 @@ def test_checkpoint_commit_restore_and_resume_fan_out() -> None:
     assert "include_continuation_index" not in restore_calls[1][2]
 
 
+@pytest.mark.asyncio
+async def test_checkpoint_commit_runs_concurrently_within_dependency_stages() -> None:
+    env = _checkpoint_env()
+    capabilities = {
+        "agent-a": _capability(
+            "responses_api_agents",
+            "agent-a",
+            features=["agent_continuation_index_v1"],
+        ),
+        "agent-b": _capability(
+            "responses_api_agents",
+            "agent-b",
+            features=["agent_continuation_index_v1"],
+        ),
+        "policy-a": _capability(
+            "responses_api_models",
+            "policy-a",
+            instance_role="policy",
+            features=["external_storage_reference_index_v1"],
+        ),
+        "policy-b": _capability(
+            "responses_api_models",
+            "policy-b",
+            instance_role="policy",
+            features=["external_storage_reference_index_v1"],
+        ),
+        "tools-a": _capability("resources_servers", "tools-a"),
+        "tools-b": _capability("resources_servers", "tools-b"),
+    }
+
+    async def discover_control(_method, _path, *, server_name, **_kwargs):
+        return capabilities[server_name]
+
+    env._control = AsyncMock(side_effect=discover_control)
+    await env.discover_checkpoint_capabilities(list(capabilities))
+
+    component_by_server = {
+        server_name: capability["component"]
+        for server_name, capability in capabilities.items()
+    }
+    stage_started = {
+        component: asyncio.Event()
+        for component in (
+            "responses_api_agents",
+            "responses_api_models",
+            "resources_servers",
+        )
+    }
+    stage_release = {
+        component: asyncio.Event()
+        for component in (
+            "responses_api_models",
+            "resources_servers",
+        )
+    }
+    started: dict[str, set[str]] = {component: set() for component in stage_started}
+    agent_release = {
+        "agent-a": asyncio.Event(),
+        "agent-b": asyncio.Event(),
+    }
+    agent_b_completed = asyncio.Event()
+    model_requests: list[dict] = []
+
+    def artifact(server_name: str, kind: str) -> dict:
+        digest = hashlib.sha256(f"{server_name}-{kind}".encode()).hexdigest()
+        return {
+            "schema_version": 1,
+            "relative_path": f"{server_name}/{kind}.jsonl",
+            "sha256": digest,
+            "records": 1,
+            "bytes": 1,
+        }
+
+    async def lifecycle_control(_method, path, *, server_name, json, **_kwargs):
+        assert path.endswith("/commit")
+        component = component_by_server[server_name]
+        started[component].add(server_name)
+        if len(started[component]) == 2:
+            stage_started[component].set()
+
+        if component == "responses_api_agents":
+            await agent_release[server_name].wait()
+            if server_name == "agent-b":
+                agent_b_completed.set()
+            return {
+                "records": 1,
+                "manifest_digest": hashlib.sha256(server_name.encode()).hexdigest(),
+                "continuation_index": artifact(server_name, "continuations"),
+            }
+        if component == "responses_api_models":
+            model_requests.append(json)
+            await stage_release[component].wait()
+            return {
+                "rollouts": 1,
+                "rows": 1,
+                "excluded_tombstoned": 0,
+                "manifest_digest": hashlib.sha256(server_name.encode()).hexdigest(),
+                "storage_reference_index": artifact(server_name, "storage"),
+            }
+
+        await stage_release[component].wait()
+        return {
+            "sessions": 1,
+            "manifest_digest": hashlib.sha256(server_name.encode()).hexdigest(),
+        }
+
+    env._control = AsyncMock(side_effect=lifecycle_control)
+    commit_task = asyncio.create_task(
+        env.commit_checkpoint(
+            "snapshot-concurrent",
+            time.time() + 10.0,
+            "/tmp/snapshot-concurrent",
+        )
+    )
+
+    await asyncio.wait_for(stage_started["responses_api_agents"].wait(), 1.0)
+    assert not started["responses_api_models"]
+    agent_release["agent-b"].set()
+    await asyncio.wait_for(agent_b_completed.wait(), 1.0)
+    assert not started["responses_api_models"]
+    agent_release["agent-a"].set()
+
+    await asyncio.wait_for(stage_started["responses_api_models"].wait(), 1.0)
+    assert not started["resources_servers"]
+    expected_indexes = [
+        artifact("agent-a", "continuations"),
+        artifact("agent-b", "continuations"),
+    ]
+    assert [request["continuation_indexes"] for request in model_requests] == [
+        expected_indexes,
+        expected_indexes,
+    ]
+    stage_release["responses_api_models"].set()
+
+    await asyncio.wait_for(stage_started["resources_servers"].wait(), 1.0)
+    stage_release["resources_servers"].set()
+    committed = await asyncio.wait_for(commit_task, 1.0)
+
+    assert [
+        item["participant"]["server_name"] for item in committed["participants"]
+    ] == ["agent-a", "agent-b", "policy-a", "policy-b", "tools-a", "tools-b"]
+
+
 def test_abort_checkpoint_uses_idempotent_resume_routes() -> None:
     env = _checkpoint_env()
     env.resume_checkpoint = AsyncMock(return_value={"checkpoint_id": "snapshot-7"})
@@ -989,6 +1136,65 @@ def test_completed_result_acknowledgement_accepts_new_and_idempotent_disposition
     ]
 
 
+def test_completed_result_acknowledgement_uses_bulk_capability() -> None:
+    env = _checkpoint_env()
+    capabilities = {
+        "policy": _capability(
+            "responses_api_models",
+            "policy",
+            admission_states=["accepting", "draining", "paused"],
+            concurrency_contract="stateless",
+            instance_role="policy",
+        ),
+        "agent-route": _capability(
+            "responses_api_agents",
+            "resolved-agent",
+            features=[
+                "completed_result_acknowledgement",
+                "completed_result_bulk_acknowledgement_v1",
+            ],
+        ),
+    }
+
+    async def discover_control(_method, _path, *, server_name, **_kwargs):
+        return capabilities[server_name]
+
+    env._control = AsyncMock(side_effect=discover_control)
+    asyncio.run(env.discover_checkpoint_capabilities(list(capabilities)))
+    receipts = [
+        _completion_receipt("group-7_g0", 0),
+        _completion_receipt("group-7_g1", 1),
+    ]
+
+    async def acknowledge_control(method, path, *, server_name, json, **_kwargs):
+        assert method == "POST"
+        assert path.endswith("/acknowledge-batch")
+        assert server_name == "agent-route"
+        assert json["receipts"] == receipts
+        digest = gym_completion_acknowledgement_batch_digest(
+            [GymCompletionReceipt.model_validate(receipt) for receipt in receipts]
+        )
+        assert json["batch_digest"] == digest
+        return {
+            "accepted_count": 2,
+            "newly_acknowledged_count": 2,
+            "idempotent_count": 0,
+            "batch_digest": digest,
+        }
+
+    env._control = AsyncMock(side_effect=acknowledge_control)
+    result = asyncio.run(
+        env.acknowledge_completed_executions(
+            [
+                {"receipt": receipt, "agent_name": "resolved-agent"}
+                for receipt in receipts
+            ]
+        )
+    )
+
+    assert len(result["acknowledged"]) == 2
+
+
 @pytest.mark.parametrize(
     ("acknowledged", "idempotent"),
     [(False, False), (True, True)],
@@ -1074,6 +1280,49 @@ def test_completion_receipt_uses_exact_participant_lookup() -> None:
     )
 
     assert resolved.model_dump(mode="json") == receipt
+
+
+def test_idempotent_receipt_transport_retries_a_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = _checkpoint_env()
+    env._checkpoint_control_headers = {}
+    env._token_capture_control_headers = {}
+
+    class _Response:
+        status = 200
+
+        async def json(self):
+            return _completion_receipt()
+
+    client = type("Client", (), {})()
+    client.request = AsyncMock(side_effect=[asyncio.TimeoutError(), _Response()])
+    env._server_client = client
+
+    async def controlled_sleep(delay: float) -> None:
+        if delay >= 10.0:
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        "nemo_rl.environments.nemo_gym.asyncio.sleep",
+        controlled_sleep,
+    )
+
+    payload = asyncio.run(
+        env._control(
+            "GET",
+            "/ng-control/v1/agent-checkpoint/completion-receipt",
+            server_name="agent-route",
+            timeout_s=0.01,
+        )
+    )
+
+    assert payload == _completion_receipt()
+    assert client.request.await_count == 2
+    assert all(
+        call.kwargs["traffic_class"] == "control"
+        for call in client.request.await_args_list
+    )
 
 
 def test_actor_registry_fences_dispatch_and_tracks_frozen_membership() -> None:
@@ -1232,6 +1481,11 @@ def test_agent_prepare_retries_completed_result_blocker() -> None:
                 "not ready",
                 status=409,
                 error_code="agent_prepare_incomplete",
+                error_metadata={
+                    "running": 11,
+                    "parked_without_boundary": 2,
+                    "completed_unacknowledged": 7,
+                },
             )
         return {
             "state": "preparing",
@@ -1250,10 +1504,20 @@ def test_agent_prepare_retries_completed_result_blocker() -> None:
         }
 
     env._control = AsyncMock(side_effect=prepare_control)
-    result = asyncio.run(env.prepare_checkpoint("snapshot-ack", time.time() + 2.0))
+    with patch("nemo_rl.environments.nemo_gym._checkpoint_telemetry") as telemetry:
+        result = asyncio.run(env.prepare_checkpoint("snapshot-ack", time.time() + 2.0))
 
     assert result["ready"] is True
     assert calls == [2]
+    progress = [
+        call
+        for call in telemetry.call_args_list
+        if call.args[0] == "gym_agent_prepare_incomplete"
+    ]
+    assert len(progress) == 1
+    assert progress[0].kwargs["running"] == 11
+    assert progress[0].kwargs["parked_without_boundary"] == 2
+    assert progress[0].kwargs["completed_unacknowledged"] == 7
 
 
 def test_agent_prepare_timeout_resumes_after_completed_result_blocker() -> None:

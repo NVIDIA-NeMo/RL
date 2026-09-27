@@ -1023,6 +1023,10 @@ class RolloutRecoveryLedger:
             )
         ]
 
+    def pending_completed_execution_acknowledgement_count(self) -> int:
+        """Return the pending Gym ACK count without copying or sorting the outbox."""
+        return len(self._pending_completed_execution_acknowledgements)
+
     def mark_completed_executions_acknowledged(
         self,
         cut: DataPlaneMutationCut,

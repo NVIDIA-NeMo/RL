@@ -15,6 +15,7 @@
 import asyncio
 import copy
 import gc
+import json
 import logging
 import threading
 import time
@@ -73,6 +74,18 @@ LOGGER = logging.getLogger(__name__)
 # than 100k calls, while still bounding idle-job memory growth.
 _COMPLETED_CAPTURE_RETENTION_S = 60.0 * 60.0
 _RESTORED_PREFIX_TERMINAL_PROMPT_KEY = "__nemo_rl_restored_prefix_terminal__"
+
+
+def _generation_cut_telemetry(event: str, **fields: Any) -> None:
+    print(
+        "gym_checkpoint_telemetry "
+        + json.dumps(
+            {"event": event, "timestamp": time.time(), **fields},
+            sort_keys=True,
+            default=str,
+        ),
+        flush=True,
+    )
 
 
 @dataclass(frozen=True)
@@ -2003,13 +2016,44 @@ class VllmAsyncGenerationWorkerImpl(
         sink = self._capture_sink
         if capture is None or sink is None:
             raise RuntimeError("generation-prefix cuts require token capture setup")
+        cut_started = time.monotonic()
+        total_prefixes = len(inventory.active_prefixes)
+        _generation_cut_telemetry(
+            "rl_generation_cut_started",
+            checkpoint_id=inventory.checkpoint_id,
+            server_name=inventory.server_name,
+            inventory_digest=inventory.inventory_digest,
+            prefix_count=total_prefixes,
+        )
         receipt_key = (inventory.checkpoint_id, inventory.inventory_digest)
         with self._capture_registry_lock:
             cached_receipt = self._generation_cut_receipts.get(receipt_key)
         if cached_receipt is not None:
+            _generation_cut_telemetry(
+                "rl_generation_cut_cache_hit",
+                checkpoint_id=inventory.checkpoint_id,
+                server_name=inventory.server_name,
+                inventory_digest=inventory.inventory_digest,
+                prefix_count=total_prefixes,
+                duration_seconds=time.monotonic() - cut_started,
+            )
             return cached_receipt
         acknowledgements = []
-        for prefix in inventory.active_prefixes:
+        for prefix_index, prefix in enumerate(inventory.active_prefixes, start=1):
+            if prefix_index == 1 or prefix_index % 10 == 0:
+                _generation_cut_telemetry(
+                    "rl_generation_cut_progress",
+                    checkpoint_id=inventory.checkpoint_id,
+                    server_name=inventory.server_name,
+                    inventory_digest=inventory.inventory_digest,
+                    completed_prefixes=prefix_index - 1,
+                    total_prefixes=total_prefixes,
+                    current_rollout_id=prefix.rollout_id,
+                    current_attempt_index=prefix.attempt_index,
+                    current_model_call_id=prefix.model_call_id,
+                    elapsed_seconds=time.monotonic() - cut_started,
+                )
+            prefix_started = time.monotonic()
             with self._capture_registry_lock:
                 state = self._capture_calls_by_model_call_id.get(prefix.model_call_id)
             if state is None:
@@ -2025,6 +2069,20 @@ class VllmAsyncGenerationWorkerImpl(
                     prefix, inventory.checkpoint_id
                 )
             acknowledgements.append(acknowledgement)
+            prefix_duration = time.monotonic() - prefix_started
+            if prefix_duration >= 1.0:
+                _generation_cut_telemetry(
+                    "rl_generation_cut_slow_prefix",
+                    checkpoint_id=inventory.checkpoint_id,
+                    server_name=inventory.server_name,
+                    inventory_digest=inventory.inventory_digest,
+                    rollout_id=prefix.rollout_id,
+                    attempt_index=prefix.attempt_index,
+                    model_call_id=prefix.model_call_id,
+                    duration_seconds=prefix_duration,
+                    disposition=acknowledgement.disposition,
+                    prefix_token_count=acknowledgement.prefix_token_count,
+                )
         receipt = GenerationCutReceipt(
             checkpoint_id=inventory.checkpoint_id,
             cut_id=f"worker-{inventory.inventory_digest}",
@@ -2039,6 +2097,32 @@ class VllmAsyncGenerationWorkerImpl(
                 self._generation_cut_receipts.pop(
                     next(iter(self._generation_cut_receipts))
                 )
+        durable_prefixes = [
+            acknowledgement
+            for acknowledgement in acknowledgements
+            if acknowledgement.disposition == "durable_prefix"
+        ]
+        _generation_cut_telemetry(
+            "rl_generation_cut_completed",
+            checkpoint_id=inventory.checkpoint_id,
+            server_name=inventory.server_name,
+            inventory_digest=inventory.inventory_digest,
+            duration_seconds=time.monotonic() - cut_started,
+            prefix_count=total_prefixes,
+            durable_prefix_count=len(durable_prefixes),
+            durable_failure_count=len(acknowledgements) - len(durable_prefixes),
+            prefix_tokens_total=sum(
+                acknowledgement.prefix_token_count or 0
+                for acknowledgement in durable_prefixes
+            ),
+            prefix_tokens_max=max(
+                (
+                    acknowledgement.prefix_token_count or 0
+                    for acknowledgement in durable_prefixes
+                ),
+                default=0,
+            ),
+        )
         return receipt
 
     # ruff: noqa

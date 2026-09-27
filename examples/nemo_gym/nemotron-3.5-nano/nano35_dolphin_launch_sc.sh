@@ -63,6 +63,10 @@ set -euo pipefail
 #   ROUTER_REPLAY_ENABLED=1      # replay vLLM MoE routes during training
 #   GYM_SOURCE_ROOT=<repo>/3rdparty/Gym-workspace/Gym
 #   MOUNT_LOCAL_GYM=0            # selectively overlay token-capture code
+#   NRL_DRIVER_PIP_INSTALL=       # optional driver packages; empty skips install
+#   NRL_VLLM_WORKER_PIP_INSTALL=  # optional vLLM-worker packages; empty skips install
+#   NRL_NEMO_GYM_PIP_INSTALL=     # optional Gym-actor packages; empty skips install
+#   NRL_GYM_SERVER_PIP_INSTALL=   # optional Gym-server packages; empty skips install
 #
 # Extra positional args are forwarded as Hydra overrides, after ours, so they win.
 # =============================================================================
@@ -70,12 +74,11 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 _SC_REPO_ROOT=$(cd -- "${SCRIPT_DIR}/../../.." &>/dev/null && pwd)
 
-# The nightly contains prefetched driver and async-vLLM-worker environments,
-# but this branch's token-capture code is newer than the Gym copy in the image.
-# Overlay only the relevant Gym modules so the container's project metadata and
-# lock file stay paired, then add the one missing binary dependency to both
-# prefetched environments. Exact pinning also keeps the generated shell command
-# free of comparison operators such as `>`.
+# The nightly contains prefetched driver, async-vLLM-worker, Gym-actor, and
+# Gym-server environments, while this branch's token-capture code can be newer
+# than the Gym copy in the image. Overlay the relevant Gym modules, and leave
+# dependency installation as an opt-in compatibility escape hatch for older
+# images. The shared launcher installs only non-empty package lists.
 export GYM_SOURCE_ROOT="${GYM_SOURCE_ROOT:-${_SC_REPO_ROOT}/3rdparty/Gym-workspace/Gym}"
 export GYM_CONTAINER_ROOT="${GYM_CONTAINER_ROOT:-/opt/nemo-rl/3rdparty/Gym-workspace/Gym}"
 export MOUNT_LOCAL_GYM="${MOUNT_LOCAL_GYM:-0}"
@@ -100,8 +103,10 @@ done
 unset _destination _mount _relative_path _SC_GYM_PATHS
 
 export NRL_DRIVER_PYTHONPATH="${NRL_DRIVER_PYTHONPATH:-${GYM_CONTAINER_ROOT}}"
-export NRL_DRIVER_PIP_INSTALL="${NRL_DRIVER_PIP_INSTALL:-orjson==3.11.9}"
-export NRL_VLLM_WORKER_PIP_INSTALL="${NRL_VLLM_WORKER_PIP_INSTALL:-orjson==3.11.9}"
+export NRL_DRIVER_PIP_INSTALL="${NRL_DRIVER_PIP_INSTALL-}"
+export NRL_VLLM_WORKER_PIP_INSTALL="${NRL_VLLM_WORKER_PIP_INSTALL-}"
+export NRL_NEMO_GYM_PIP_INSTALL="${NRL_NEMO_GYM_PIP_INSTALL-}"
+export NRL_GYM_SERVER_PIP_INSTALL="${NRL_GYM_SERVER_PIP_INSTALL-}"
 
 export CONFIG_PATH="${CONFIG_PATH:-examples/nemo_gym/nemotron-3.5-nano/rlvr_dolphin_sc.yaml}"
 

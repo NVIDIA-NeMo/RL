@@ -40,6 +40,7 @@ GYM_MODEL_CHECKPOINT_PREFIX = f"{GYM_CHECKPOINT_CONTROL_PREFIX}/model-checkpoint
 GYM_AGENT_CHECKPOINT_PREFIX = f"{GYM_CHECKPOINT_CONTROL_PREFIX}/agent-checkpoint"
 GYM_AGENT_COMPLETION_RECEIPT_PATH = f"{GYM_AGENT_CHECKPOINT_PREFIX}/completion-receipt"
 GYM_AGENT_COMPLETION_ACK_PATH = f"{GYM_AGENT_CHECKPOINT_PREFIX}/acknowledge"
+GYM_AGENT_COMPLETION_BULK_ACK_PATH = f"{GYM_AGENT_CHECKPOINT_PREFIX}/acknowledge-batch"
 GYM_AGENT_DISCARD_RESTORED_CONTINUATION_PATH = (
     f"{GYM_AGENT_CHECKPOINT_PREFIX}/discard-restored-continuation"
 )
@@ -49,8 +50,11 @@ GYM_RESOURCES_CHECKPOINT_PREFIX = (
 GYM_AGENT_CONTINUATION_INDEX_FEATURE = "agent_continuation_index_v1"
 GYM_AGENT_DISCARD_RESTORED_CONTINUATION_FEATURE = "discard_restored_continuation_v1"
 GYM_AGENT_RESOURCE_DEPENDENCY_INDEX_FEATURE = "agent_resource_dependency_index_v1"
+GYM_AGENT_COMPLETION_BULK_ACK_FEATURE = "completed_result_bulk_acknowledgement_v1"
+GYM_AGENT_INLINE_COMPLETION_RECEIPT_FEATURE = "completion_receipt_in_run_response_v1"
 GYM_EXTERNAL_STORAGE_REFERENCE_INDEX_FEATURE = "external_storage_reference_index_v1"
 GYM_GENERATION_CUT_LINEAGE_FEATURE = "generation_cut_lineage_v1"
+GYM_AGENT_COMPLETION_BULK_ACK_MAX_RECEIPTS = 512
 
 _IDENTITY_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
 
@@ -242,6 +246,19 @@ class GymCompletionReceipt(GymExecutionIdentity):
                 "id must be supplied together"
             )
         return self
+
+
+def gym_completion_acknowledgement_batch_digest(
+    receipts: Sequence[GymCompletionReceipt],
+) -> str:
+    """Bind one bulk acknowledgement response to its ordered receipt batch."""
+    payload = json.dumps(
+        [receipt.model_dump(mode="json") for receipt in receipts],
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
 
 
 def gym_capture_key(logical_rollout_id: str, attempt_index: int) -> str:
@@ -567,6 +584,50 @@ class GymCompletedExecutionAcknowledgementResponse(_StrictWireModel):
             raise ValueError(
                 "Gym completion acknowledgement must report exactly one of "
                 "acknowledged or idempotent"
+            )
+        return self
+
+
+class GymCompletedExecutionAcknowledgementBatchRequest(_StrictWireModel):
+    """Bounded, digest-bound set of receipts owned by one agent."""
+
+    receipts: list[GymCompletionReceipt] = Field(
+        min_length=1,
+        max_length=GYM_AGENT_COMPLETION_BULK_ACK_MAX_RECEIPTS,
+    )
+    batch_digest: Sha256Digest
+
+    @model_validator(mode="after")
+    def validate_batch(self) -> "GymCompletedExecutionAcknowledgementBatchRequest":
+        identities = [
+            (receipt.rollout_id, receipt.attempt_index) for receipt in self.receipts
+        ]
+        if len(identities) != len(set(identities)):
+            raise ValueError(
+                "Gym bulk completion acknowledgements must have unique execution identities"
+            )
+        if self.batch_digest != gym_completion_acknowledgement_batch_digest(
+            self.receipts
+        ):
+            raise ValueError(
+                "Gym bulk completion acknowledgement digest does not match receipts"
+            )
+        return self
+
+
+class GymCompletedExecutionAcknowledgementBatchResponse(_StrictWireModel):
+    """Atomic disposition for one exact bulk acknowledgement request."""
+
+    accepted_count: PositiveInt
+    newly_acknowledged_count: NonNegativeInt
+    idempotent_count: NonNegativeInt
+    batch_digest: Sha256Digest
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> "GymCompletedExecutionAcknowledgementBatchResponse":
+        if self.newly_acknowledged_count + self.idempotent_count != self.accepted_count:
+            raise ValueError(
+                "Gym bulk completion acknowledgement disposition count does not match accepted count"
             )
         return self
 
