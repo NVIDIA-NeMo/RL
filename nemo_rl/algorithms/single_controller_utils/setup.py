@@ -1517,7 +1517,7 @@ def setup_single_controller(
         master_config
     )
     colocated = generation_config["colocated"]["enabled"]
-    segment_size = getattr(master_config, "cluster", {}).get("segment_size")
+    segment_size = master_config.cluster.segment_size
 
     # Claim constrained training nodes before unconstrained inference or Gym
     # tasks can consume them. This matters when inference topology alignment

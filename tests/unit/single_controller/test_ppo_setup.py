@@ -743,12 +743,14 @@ class TestValueWarmStart:
 
 def _cluster_config(mc: MasterConfig, *, colocated: bool, backend: str) -> MasterConfig:
     """Fill in the cluster / generation keys _build_clusters reads."""
-    mc.cluster = {
-        "num_nodes": 1,
-        "gpus_per_node": 8,
-        "master_port_range_low": None,
-        "master_port_range_high": None,
-    }
+    mc.cluster = ClusterConfig.model_validate(
+        {
+            "num_nodes": 1,
+            "gpus_per_node": 8,
+            "master_port_range_low": None,
+            "master_port_range_high": None,
+        }
+    )
     mc.policy["generation"] = {
         "backend": backend,
         "colocated": {

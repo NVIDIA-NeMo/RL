@@ -347,7 +347,9 @@ def test_build_generation_passes_sglang_config():
 def test_build_clusters_rejects_unsupported_topology_backend(monkeypatch):
     """Topology planning reports the supported SC backends instead of KeyError."""
     master_config = _make_master_config(colocated=False, backend="trtllm")
-    master_config.cluster = {"num_nodes": 2, "gpus_per_node": 8, "segment_size": 1}
+    master_config.cluster = ClusterConfig.model_validate(
+        {"num_nodes": 2, "gpus_per_node": 8, "segment_size": 1}
+    )
     master_config.policy["generation"]["colocated"]["resources"] = {
         "gpus_per_node": 8,
         "num_nodes": 1,
@@ -375,7 +377,9 @@ def test_build_clusters_rejects_unsupported_topology_backend(monkeypatch):
 def test_build_clusters_leaves_dedicated_teacher_nodes(monkeypatch):
     """Teacher nodes are removed before the student train/inference split."""
     master_config = _make_master_config(colocated=False)
-    master_config.cluster = {"num_nodes": 3, "gpus_per_node": 8}
+    master_config.cluster = ClusterConfig.model_validate(
+        {"num_nodes": 3, "gpus_per_node": 8}
+    )
     master_config.policy["generation"]["colocated"]["resources"] = {
         "gpus_per_node": 8,
         "num_nodes": 1,
@@ -405,7 +409,9 @@ def test_build_clusters_leaves_dedicated_teacher_nodes(monkeypatch):
 def test_build_clusters_supports_two_node_shared_student_layout(monkeypatch):
     """One student node can split train/inference while node two hosts teacher."""
     master_config = _make_master_config(colocated=False)
-    master_config.cluster = {"num_nodes": 2, "gpus_per_node": 8}
+    master_config.cluster = ClusterConfig.model_validate(
+        {"num_nodes": 2, "gpus_per_node": 8}
+    )
     master_config.policy["generation"]["colocated"]["resources"] = {
         "gpus_per_node": 4,
         "num_nodes": 1,
@@ -1230,7 +1236,7 @@ class TestSetup:
         self, patched_factories, monkeypatch
     ):
         mc = _make_master_config(env={"should_use_nemo_gym": True})
-        mc.cluster = {"num_nodes": 3, "gpus_per_node": 8}
+        mc.cluster = ClusterConfig.model_validate({"num_nodes": 3, "gpus_per_node": 8})
         mc.policy["generation"]["vllm_cfg"] = {
             "async_engine": True,
             "expose_http_server": True,
@@ -1497,7 +1503,9 @@ class TestSetup:
         self, patched_factories
     ):
         mc = _make_master_config(colocated=False)
-        mc.cluster = {"num_nodes": 2, "gpus_per_node": 8, "segment_size": 1}
+        mc.cluster = ClusterConfig.model_validate(
+            {"num_nodes": 2, "gpus_per_node": 8, "segment_size": 1}
+        )
         mc.policy["generation"]["colocated"]["resources"] = {
             "gpus_per_node": 4,
             "num_nodes": 1,

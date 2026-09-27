@@ -2111,8 +2111,8 @@ def test_noncolocated_vllm_builds_separate_clusters_and_collective(monkeypatch):
         total_gpus_per_node=8,
         inference_gpus_per_node=2,
     )
-    config.cluster["master_port_range_low"] = 1400
-    config.cluster["master_port_range_high"] = 1999
+    config.cluster.master_port_range_low = 1400
+    config.cluster.master_port_range_high = 1999
     (
         result,
         cluster_calls,
