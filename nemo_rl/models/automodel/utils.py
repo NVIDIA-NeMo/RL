@@ -29,8 +29,6 @@ from nemo_automodel._transformers.auto_model import (
 # which architectures have custom impls:
 # https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/_transformers/registry.py#L32-L146
 AUTOMODEL_FACTORY: Dict[str, Any] = {
-    # NeMo wrappers — keep in sync with the vanilla HF dict above.
-    # See comment above for when to add entries.
     "qwen2_5_vl": NeMoAutoModelForImageTextToText,
     "qwen2_vl": NeMoAutoModelForImageTextToText,
     "qwen2_5_omni": NeMoAutoModelForTextToWaveform,
