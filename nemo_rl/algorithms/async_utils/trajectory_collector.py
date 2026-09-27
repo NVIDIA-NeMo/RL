@@ -35,7 +35,11 @@ from nemo_rl.algorithms.grpo import (
 from nemo_rl.algorithms.grpo import (
     MasterConfig as GRPOMasterConfig,
 )
-from nemo_rl.algorithms.opd import resolve_reference_aliases, teacher_seq_pad_multiple
+from nemo_rl.algorithms.opd import (
+    resolve_reference_aliases,
+    should_only_unmask_final,
+    teacher_seq_pad_multiple,
+)
 from nemo_rl.algorithms.ppo import (
     AsyncPPOConfig,
     PPOConfig,
@@ -221,6 +225,7 @@ class AsyncTrajectoryCollector:
                 student_tokenizer_config=self.master_config.policy["tokenizer"],
                 teacher_group=teacher_group,
                 cross_tokenizer_config=teacher_group.cross_tokenizer,
+                only_unmask_final=should_only_unmask_final(self.master_config),
             )
             for group_key, teacher_group in self.teacher_worker_groups.items()
             if getattr(teacher_group, "cross_tokenizer", None) is not None

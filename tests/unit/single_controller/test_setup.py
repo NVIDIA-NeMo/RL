@@ -1067,6 +1067,28 @@ class TestSetup:
 
         patched_factories["_build_clusters"].assert_not_called()
 
+    def test_final_turn_mopd_rejects_token_capture_before_allocating_resources(
+        self, patched_factories
+    ):
+        mc = _make_master_config(env={"should_use_nemo_gym": True})
+        mc.token_capture.enabled = True
+        mc.grpo.adv_estimator = AdvEstimatorConfig(name="opd")
+        mc.on_policy_distillation = OnPolicyDistillationConfig(
+            enabled=True,
+            only_unmask_final=True,
+            teacher_model_by_agent_name={"teacher": "/ckpt/teacher"},
+            non_colocated_teachers={"enabled": True},
+        )
+
+        with pytest.raises(
+            NotImplementedError,
+            match="only_unmask_final=true is not supported with token_capture",
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
+
     def test_mopd_reserves_before_models_and_initializes_teacher_last(
         self, patched_factories, monkeypatch
     ):

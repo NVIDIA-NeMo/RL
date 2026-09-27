@@ -180,6 +180,9 @@ class OnPolicyDistillationConfig(BaseModel, extra="allow"):
     """User-facing config for the top-level ``on_policy_distillation`` block."""
 
     enabled: bool = False
+    # Keep every rollout turn as model context, but supervise only the final
+    # generated assistant message. False preserves all-generated-turn MOPD.
+    only_unmask_final: bool = False
     teacher_model_by_agent_name: dict[str, str] = Field(default_factory=dict)
     default_teacher_alias: Optional[str] = None
     strict_agent_name_match: bool = False
@@ -230,6 +233,15 @@ def _opd_cfg(master_config: Any) -> dict[str, Any]:
 def is_opd_enabled(master_config: Any) -> bool:
     """Whether on-policy distillation is enabled in the config."""
     return bool(_opd_cfg(master_config).get("enabled", False))
+
+
+def should_only_unmask_final(master_config: Any) -> bool:
+    """Whether MOPD should supervise only its final generated turn."""
+    config = _opd_cfg(master_config)
+    if not config:
+        return False
+    validated = OnPolicyDistillationConfig.model_validate(config)
+    return validated.enabled and validated.only_unmask_final
 
 
 def is_non_colocated_teachers_enabled(master_config: Any) -> bool:

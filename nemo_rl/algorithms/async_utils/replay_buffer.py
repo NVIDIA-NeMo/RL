@@ -1171,6 +1171,7 @@ class TQReplayBuffer:
         *,
         pad_value_dict: Mapping[str, int],
         include_message_violation_fields: bool,
+        only_unmask_final: bool = False,
         staging_partition_id: Optional[str] = None,
         require_routed_experts: bool = False,
     ):
@@ -1178,6 +1179,7 @@ class TQReplayBuffer:
         self._partition_id = partition_id
         self._pad_value_dict = dict(pad_value_dict)
         self._include_message_violation_fields = include_message_violation_fields
+        self._only_unmask_final = only_unmask_final
         # Token-capture mode only: the staging partition whose per-call delta
         # rows `remove` must clear alongside the canonical rows. None on the
         # legacy path.
@@ -1313,6 +1315,7 @@ class TQReplayBuffer:
             record,
             pad_value_dict=self._pad_value_dict,
             include_message_violation_fields=self._include_message_violation_fields,
+            only_unmask_final=self._only_unmask_final,
         )
         sample_ids, fields, tags = pack_payload(
             train_batch,

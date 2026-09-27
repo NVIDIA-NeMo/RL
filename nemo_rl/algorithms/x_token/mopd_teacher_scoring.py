@@ -145,6 +145,7 @@ class MOPDTeacherScoringContext:
     teacher_tokenizer: PreTrainedTokenizerBase
     aligner: TokenAligner
     alignment_method: str
+    only_unmask_final: bool
     mask_first_teacher_prefix_chunk: bool
     exclude_proven_template_only_teacher_tokens: bool
     missing_think_close_policy: Literal["mask", "preserve_open_if_proven"]
@@ -542,6 +543,7 @@ class MOPDTeacherScorer:
         student_tokenizer: PreTrainedTokenizerBase,
         teacher_group: Any,
         cross_tokenizer_config: Any,
+        only_unmask_final: bool = False,
         student_tokenizer_config: Any | None = None,
         student_alignment_tokenizer: PreTrainedTokenizerBase | None = None,
         teacher_tokenizer: PreTrainedTokenizerBase | None = None,
@@ -592,6 +594,7 @@ class MOPDTeacherScorer:
             teacher_tokenizer=alignment_tokenizer,
             aligner=cached_aligner,
             alignment_method=method,
+            only_unmask_final=only_unmask_final,
             mask_first_teacher_prefix_chunk=_required_bool(
                 config,
                 "mask_first_teacher_prefix_chunk",
@@ -954,6 +957,17 @@ class MOPDTeacherScorer:
         turns: list[_PreparedTurn] = []
         student_cursor = 0
         teacher_search_start = 0
+        final_generated_assistant_index = None
+        if self.context.only_unmask_final:
+            final_generated_assistant_index = next(
+                (
+                    message_index
+                    for message_index in range(len(message_log) - 1, -1, -1)
+                    if message_log[message_index].get("role") == "assistant"
+                    and "generation_logprobs" in message_log[message_index]
+                ),
+                None,
+            )
         for message_index, message in enumerate(message_log):
             raw_token_ids = message.get("token_ids")
             if raw_token_ids is None:
@@ -962,9 +976,18 @@ class MOPDTeacherScorer:
             message_start = student_cursor
             message_end = message_start + len(message_token_ids)
             student_cursor = message_end
+            is_generated_assistant = (
+                message.get("role") == "assistant" and "generation_logprobs" in message
+            )
+            if (
+                is_generated_assistant
+                and self.context.only_unmask_final
+                and message_index != final_generated_assistant_index
+            ):
+                metrics["turns_excluded_by_loss_mask"] += 1
+                continue
             if not (
-                message.get("role") == "assistant"
-                and "generation_logprobs" in message
+                is_generated_assistant
                 and message_token_ids
                 and message_end <= student_length
             ):
@@ -1382,6 +1405,7 @@ class MOPDTeacherScorer:
             "samples_fully_masked",
             "turns_aligned",
             "turns_skipped",
+            "turns_excluded_by_loss_mask",
             "valid_tokens",
             "teacher_calls",
             "dp_padding_rows",
@@ -1542,6 +1566,7 @@ def build_mopd_teacher_scorer(
     student_tokenizer: PreTrainedTokenizerBase,
     teacher_group: Any,
     cross_tokenizer_config: Any,
+    only_unmask_final: bool = False,
     student_tokenizer_config: Any | None = None,
     student_alignment_tokenizer: PreTrainedTokenizerBase | None = None,
     teacher_tokenizer: PreTrainedTokenizerBase | None = None,
@@ -1552,6 +1577,7 @@ def build_mopd_teacher_scorer(
         student_tokenizer=student_tokenizer,
         teacher_group=teacher_group,
         cross_tokenizer_config=cross_tokenizer_config,
+        only_unmask_final=only_unmask_final,
         student_tokenizer_config=student_tokenizer_config,
         student_alignment_tokenizer=student_alignment_tokenizer,
         teacher_tokenizer=teacher_tokenizer,

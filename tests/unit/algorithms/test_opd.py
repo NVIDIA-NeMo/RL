@@ -948,6 +948,30 @@ def test_opd_cfg_preserves_sparse_teacher_overrides():
     )
 
 
+def test_opd_only_unmask_final_defaults_off_and_round_trips():
+    from types import SimpleNamespace
+
+    from nemo_rl.algorithms.opd import (
+        OnPolicyDistillationConfig,
+        _opd_cfg,
+        should_only_unmask_final,
+    )
+
+    default_config = OnPolicyDistillationConfig(enabled=True)
+    assert default_config.only_unmask_final is False
+    assert not should_only_unmask_final(
+        SimpleNamespace(on_policy_distillation=default_config)
+    )
+
+    final_only_config = OnPolicyDistillationConfig(
+        enabled=True,
+        only_unmask_final=True,
+    )
+    master_config = SimpleNamespace(on_policy_distillation=final_only_config)
+    assert should_only_unmask_final(master_config)
+    assert _opd_cfg(master_config)["only_unmask_final"] is True
+
+
 def _cross_token_master_config(**overrides):
     from types import SimpleNamespace
 

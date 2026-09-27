@@ -133,6 +133,9 @@ cluster:
   num_nodes: 3
 on_policy_distillation:
   enabled: true
+  # Keep earlier assistant turns as context, but calculate MOPD KD only on the
+  # final rollout-generated assistant turn.
+  only_unmask_final: true
   teacher_model_by_agent_name:
     default_teacher: /path/to/teacher-checkpoint-at-pinned-revision
   default_teacher_alias: default_teacher

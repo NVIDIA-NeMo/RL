@@ -4266,6 +4266,74 @@ class TestPromptExtraction:
         assert torch.equal(message_log[1]["token_loss_mask"], torch.tensor([0, 0]))
         assert torch.equal(message_log[2]["token_loss_mask"], torch.tensor([1, 1]))
 
+    @pytest.mark.parametrize(
+        ("only_unmask_final", "expected_message_mask"),
+        [
+            (False, [0, 1, 0, 1, 0]),
+            (True, [0, 0, 0, 1, 0]),
+        ],
+    )
+    def test_grpo_loss_mask_can_select_final_generated_assistant(
+        self,
+        only_unmask_final,
+        expected_message_mask,
+    ):
+        """Final-turn mode keeps earlier generated turns as masked context."""
+        message_log = [
+            {"role": "user", "token_ids": torch.tensor([1])},
+            {
+                "role": "assistant",
+                "token_ids": torch.tensor([2, 3]),
+                "generation_logprobs": torch.tensor([-0.1, -0.2]),
+            },
+            {"role": "tool", "token_ids": torch.tensor([4])},
+            {
+                "role": "assistant",
+                "token_ids": torch.tensor([5, 6]),
+                "generation_logprobs": torch.tensor([-0.3, -0.4]),
+            },
+            # A tool result may follow the final generated assistant. Selection
+            # must use the generation marker instead of the literal last entry.
+            {"role": "tool", "token_ids": torch.tensor([7])},
+        ]
+
+        add_grpo_token_loss_masks_and_generation_logprobs(
+            [message_log],
+            only_unmask_final=only_unmask_final,
+        )
+
+        assert [
+            int(message["token_loss_mask"].bool().any()) for message in message_log
+        ] == expected_message_mask
+
+    def test_final_generated_assistant_is_selected_before_logprob_backfill(self):
+        """Rows without generated assistants stay fully masked after backfill."""
+        message_logs = [
+            [
+                {"role": "user", "token_ids": torch.tensor([1])},
+                {"role": "assistant", "token_ids": torch.tensor([2])},
+            ],
+            [
+                {
+                    "role": "assistant",
+                    "token_ids": torch.tensor([3]),
+                    "generation_logprobs": torch.tensor([-0.1]),
+                },
+                {"role": "tool", "token_ids": torch.tensor([4])},
+            ],
+        ]
+
+        add_grpo_token_loss_masks_and_generation_logprobs(
+            message_logs,
+            only_unmask_final=True,
+        )
+
+        assert all(
+            not message["token_loss_mask"].bool().any() for message in message_logs[0]
+        )
+        assert message_logs[1][0]["token_loss_mask"].tolist() == [1]
+        assert message_logs[1][1]["token_loss_mask"].tolist() == [0]
+
 
 def test_turn_count_fallback_priority():
     """_rollout_metrics_turn_count_for_diagnostics honors the documented key priority."""

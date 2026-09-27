@@ -2110,13 +2110,19 @@ def extract_initial_prompt_messages(
 
 def add_grpo_token_loss_masks_and_generation_logprobs(
     message_logs: list[LLMMessageLogType | VLMMessageLogType],
+    *,
+    only_unmask_final: bool = False,
 ) -> None:
     """Add GRPO loss masks and ensure generation logprobs exist in message logs.
 
     Assistant messages can be part of the original multi-turn prompt history. Only
     generated assistant messages have generation_logprobs, so use that field as the
-    trainable-token marker. This function mutates each message in-place by adding a
+    trainable-token marker. When ``only_unmask_final`` is true, only the last such
+    assistant message in each sample is trainable; earlier generated turns remain
+    available as context. This function mutates each message in-place by adding a
     token_loss_mask and, when missing, a zero-valued generation_logprobs tensor.
+    The final generated assistant is selected before missing generation-logprob
+    fields are backfilled, so prompt history cannot become trainable accidentally.
     Router-replay routes get the same treatment via
     :func:`backfill_missing_routed_experts`, so every per-token field is defined
     for every tokenized message before the batch is flattened.
@@ -2125,14 +2131,35 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
         message_logs: Batch of tokenized message logs. Each message must contain a
             ``role`` and ``token_ids`` field. Messages that already contain
             ``generation_logprobs`` are treated as rollout-generated messages.
+        only_unmask_final: Whether to train only the final generated assistant
+            message in each message log. Defaults to False to train every
+            generated assistant message.
     """
     backfill_missing_routed_experts(message_logs)
     for message_log in message_logs:
-        for message in message_log:
+        final_generated_assistant_index = None
+        if only_unmask_final:
+            final_generated_assistant_index = next(
+                (
+                    message_index
+                    for message_index in range(len(message_log) - 1, -1, -1)
+                    if message_log[message_index]["role"] == "assistant"
+                    and "generation_logprobs" in message_log[message_index]
+                ),
+                None,
+            )
+
+        for message_index, message in enumerate(message_log):
             role = cast(str, message["role"])
             token_ids = cast(torch.Tensor, message["token_ids"])
 
-            if role == "assistant" and "generation_logprobs" in message:
+            is_generated_assistant = (
+                role == "assistant" and "generation_logprobs" in message
+            )
+            if is_generated_assistant and (
+                not only_unmask_final
+                or message_index == final_generated_assistant_index
+            ):
                 message["token_loss_mask"] = torch.ones_like(token_ids)
             else:
                 message["token_loss_mask"] = torch.zeros_like(token_ids)
@@ -3394,7 +3421,10 @@ def _grpo_train_impl(
                     metrics["num_mask_sample_filtered"] = num_mask_sample_filtered
 
                     add_grpo_token_loss_masks_and_generation_logprobs(
-                        repeated_batch["message_log"]
+                        repeated_batch["message_log"],
+                        only_unmask_final=opd_module.should_only_unmask_final(
+                            master_config
+                        ),
                     )
 
                     # Convert updated LLMMessageLogType to FlatMessagesType for training
@@ -5249,7 +5279,10 @@ def async_grpo_train(
                     # Only unmask assistant messages that were actually generated (have generation_logprobs),
                     # not assistant messages that were part of the prompt history
                     add_grpo_token_loss_masks_and_generation_logprobs(
-                        repeated_batch["message_log"]
+                        repeated_batch["message_log"],
+                        only_unmask_final=opd_module.should_only_unmask_final(
+                            master_config
+                        ),
                     )
 
                     # Convert to flat format for training

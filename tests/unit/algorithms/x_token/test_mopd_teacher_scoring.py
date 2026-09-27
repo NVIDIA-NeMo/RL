@@ -16,6 +16,7 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 
 from nemo_rl.algorithms.x_token.token_aligner import AlignmentPair
@@ -99,8 +100,28 @@ def _cross_tokenizer_config():
     }
 
 
-def test_cross_token_scorer_projects_only_generated_assistant_turns_in_tool_loop(
+@pytest.mark.parametrize(
+    (
+        "only_unmask_final",
+        "supervise_tool_call",
+        "expected_alignment_calls",
+        "final_answer",
+    ),
+    [
+        (False, True, 2, "It is sunny."),
+        (True, False, 1, "It is sunny."),
+        # Select the logical final generated assistant before checking whether
+        # it is alignable. An empty final turn must not fall back to the prior
+        # tool-call turn.
+        (True, False, 0, ""),
+    ],
+)
+def test_cross_token_scorer_applies_generated_turn_mask_in_tool_loop(
     monkeypatch,
+    only_unmask_final,
+    supervise_tool_call,
+    expected_alignment_calls,
+    final_answer,
 ):
     from nemo_rl.algorithms.x_token import mopd_teacher_scoring as scoring
 
@@ -139,6 +160,7 @@ def test_cross_token_scorer_projects_only_generated_assistant_turns_in_tool_loop
         student_tokenizer=student_tokenizer,
         teacher_group=teacher_group,
         cross_tokenizer_config=_cross_tokenizer_config(),
+        only_unmask_final=only_unmask_final,
         teacher_tokenizer=teacher_tokenizer,
         aligner=SimpleNamespace(
             student_tokenizer=student_tokenizer,
@@ -149,13 +171,20 @@ def test_cross_token_scorer_projects_only_generated_assistant_turns_in_tool_loop
         'answer<tool_call>{"name":"weather","arguments":{"city":"SF"}}</tool_call>'
     )
     tool_result = "sunny"
-    final_answer = "It is sunny."
+    trailing_tool_result = "logged"
     prompt_ids = student_tokenizer("q")["input_ids"]
     tool_call_ids = student_tokenizer(tool_call)["input_ids"]
     tool_result_ids = student_tokenizer(tool_result)["input_ids"]
     final_answer_ids = student_tokenizer(final_answer)["input_ids"]
+    trailing_tool_result_ids = student_tokenizer(trailing_tool_result)["input_ids"]
     input_ids = torch.tensor(
-        [prompt_ids + tool_call_ids + tool_result_ids + final_answer_ids],
+        [
+            prompt_ids
+            + tool_call_ids
+            + tool_result_ids
+            + final_answer_ids
+            + trailing_tool_result_ids
+        ],
         dtype=torch.long,
     )
 
@@ -182,6 +211,11 @@ def test_cross_token_scorer_projects_only_generated_assistant_turns_in_tool_loop
                     "token_ids": final_answer_ids,
                     "generation_logprobs": [0.0] * len(final_answer_ids),
                 },
+                {
+                    "role": "tool",
+                    "content": trailing_tool_result,
+                    "token_ids": trailing_tool_result_ids,
+                },
             ]
         ],
     )
@@ -189,25 +223,34 @@ def test_cross_token_scorer_projects_only_generated_assistant_turns_in_tool_loop
     expected_scores = torch.tensor(
         [
             [0.0] * len(prompt_ids)
-            + [-2.0] * len(tool_call_ids)
+            + ([-2.0] if supervise_tool_call else [0.0]) * len(tool_call_ids)
             + [0.0] * len(tool_result_ids)
             + [-2.0] * len(final_answer_ids)
+            + [0.0] * len(trailing_tool_result_ids)
         ]
     )
     expected_mask = torch.tensor(
         [
             [False] * len(prompt_ids)
-            + [True] * len(tool_call_ids)
+            + [supervise_tool_call] * len(tool_call_ids)
             + [False] * len(tool_result_ids)
             + [True] * len(final_answer_ids)
+            + [False] * len(trailing_tool_result_ids)
         ]
     )
     torch.testing.assert_close(result.logprobs, expected_scores)
     assert torch.equal(result.valid_mask, expected_mask)
     assert teacher_group.calls == 1
-    assert len(alignment_calls) == 2
+    assert len(alignment_calls) == expected_alignment_calls
     assert all(call[2] == "offset_cluster_decode_fix" for call in alignment_calls)
-    assert result.metrics["mopd/turns_aligned"] == 2.0
+    assert result.metrics["mopd/turns_aligned"] == float(expected_alignment_calls)
+    assert result.metrics["mopd/turns_excluded_by_loss_mask"] == float(
+        int(only_unmask_final)
+    )
+    teacher_length = int(teacher_group.last_batch["input_lengths"][0].item())
+    assert teacher_tokenizer.decode(
+        teacher_group.last_batch["input_ids"][0, :teacher_length]
+    ) == ("q" + tool_call + tool_result + final_answer + trailing_tool_result)
 
 
 def test_alignment_tokenizer_uses_plain_transformers_construction(monkeypatch):

@@ -32,9 +32,12 @@ distribution. See [Full-vocabulary MOPD](#full-vocabulary-mopd) for the exact
 K=V variant, which trades that property for an unbiased objective.
 
 The advantage is applied only to trained (assistant) tokens via the loss mask;
-tool / environment tokens contribute zero. Because the advantage subtracts a
-real `prev_logprobs`, MOPD requires the student log-probabilities to actually be
-computed — see [Configuration](#configuration).
+tool / environment tokens contribute zero. By default, every rollout-generated
+assistant turn is trained. Set `on_policy_distillation.only_unmask_final: true`
+to keep earlier turns as context while applying KD only to the final generated
+assistant turn. Because the advantage subtracts a real `prev_logprobs`, MOPD
+requires the student log-probabilities to actually be computed — see
+[Configuration](#configuration).
 
 When student and teacher tokenizers differ, the teacher scores its own rendered
 transcript and the resulting log-probabilities are projected onto student token
@@ -81,6 +84,9 @@ loss_fn:
 
 on_policy_distillation:
   enabled: true
+  # false (default): distill every generated assistant turn.
+  # true: retain earlier turns as context and distill only the final one.
+  only_unmask_final: false
   # Map each NeMo Gym agent name to a teacher checkpoint.
   teacher_model_by_agent_name:
     default_teacher: Qwen/Qwen3-1.7B
@@ -171,7 +177,10 @@ Cross-token scoring reconstructs the exact sampled student token stream from
 native chat template. This includes developer/system normalization and tool
 loops. Only generated assistant messages that carry generation log-probabilities
 are aligned and trained; user, tool, environment, and template-only regions do
-not become distillation targets.
+not become distillation targets. With `only_unmask_final: true`, the complete
+transcript is still teacher and student context, but only the last generated
+assistant message is included in the common training loss mask. A trailing tool
+or environment message does not change which assistant turn is selected.
 
 The scorer preserves native or proven-open Qwen thinking state. An ambiguous
 thinking/tool structure fails closed by masking the causally affected suffix.
@@ -192,7 +201,10 @@ teachers produce an all-valid mask. At advantage time the effective mask is the
 intersection of token, sample, and teacher masks, and masked selection is used
 so invalid `NaN` or infinite scores cannot leak through `0 * value` arithmetic.
 The mask affects only OPD advantages, not the training token mask, loss
-denominator, or global valid-token count.
+denominator, or global valid-token count. In contrast,
+`on_policy_distillation.only_unmask_final` deliberately changes the common
+training token mask, so the loss denominator and valid-token count cover only
+the selected final assistant turn, matching x-token message-loss-mask semantics.
 
 Older same-token replay entries without the mask are loaded with an all-ones
 mask. A cross-token run rejects an older replay entry that lacks the mask; start
@@ -275,6 +287,12 @@ teachers, `grpo.adv_estimator.name: opd`, `grpo.async_grpo.enabled: true`, and
 `env.should_use_nemo_gym: true`. The existing same-token teacher batching and
 multimodal path are unchanged; cross-token v1 does not add cross-prompt teacher
 batching.
+
+Single-Controller token capture currently rejects
+`only_unmask_final: true`: capture receipts contain a flat token mask but not
+the message boundaries required to identify the final generated assistant turn.
+Use the regular Single-Controller rollout path or legacy async GRPO for this
+mode.
 
 ## Full-vocabulary MOPD
 

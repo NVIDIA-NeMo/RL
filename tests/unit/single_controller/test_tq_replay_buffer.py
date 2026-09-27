@@ -57,8 +57,9 @@ def _stub_record_to_train_batch(
     *,
     pad_value_dict: Any,
     include_message_violation_fields: bool,
+    only_unmask_final: bool,
 ) -> BatchedDataDict[Any]:
-    del record, pad_value_dict, include_message_violation_fields
+    del record, pad_value_dict, include_message_violation_fields, only_unmask_final
     return BatchedDataDict[Any](
         {
             "input_ids": torch.ones((_N_GENS, 3), dtype=torch.long),
@@ -236,6 +237,7 @@ def _make_buffer(
     dp: FakeDataPlaneClient,
     *,
     require_routed_experts: bool = False,
+    only_unmask_final: bool = False,
     checkpoint_barrier: DataPlaneCheckpointBarrier | None = None,
 ) -> TQReplayBuffer:
     buffer = TQReplayBuffer(
@@ -243,6 +245,7 @@ def _make_buffer(
         partition_id="rollout_data",
         pad_value_dict={"token_ids": 0},
         include_message_violation_fields=False,
+        only_unmask_final=only_unmask_final,
         require_routed_experts=require_routed_experts,
     )
     buffer.set_data_plane_checkpoint_barrier(
@@ -532,6 +535,35 @@ class TestTQReplayBufferReserveCommit:
             assert buf.ready_list == [True]
 
         asyncio.run(exercise())
+
+    def test_commit_propagates_final_turn_mask_setting(self, monkeypatch):
+        observed: list[bool] = []
+
+        def recording_converter(
+            record: PromptGroupRecord,
+            *,
+            pad_value_dict: Any,
+            include_message_violation_fields: bool,
+            only_unmask_final: bool,
+        ) -> BatchedDataDict[Any]:
+            observed.append(only_unmask_final)
+            return _stub_record_to_train_batch(
+                record,
+                pad_value_dict=pad_value_dict,
+                include_message_violation_fields=include_message_violation_fields,
+                only_unmask_final=only_unmask_final,
+            )
+
+        monkeypatch.setattr(
+            _replay_buffer_module,
+            "record_to_train_batch",
+            recording_converter,
+        )
+        buf = _make_buffer(FakeDataPlaneClient(), only_unmask_final=True)
+
+        _add_group(buf, weight=3)
+
+        assert observed == [True]
 
     def test_commit_enriches_after_put_before_slot_becomes_ready(self):
         dp = FakeDataPlaneClient()

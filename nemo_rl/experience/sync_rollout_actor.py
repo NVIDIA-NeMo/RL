@@ -77,6 +77,7 @@ def _flatten_rollout_message_log_for_tq(
     *,
     pad_token_id: int,
     make_sequence_length_divisible_by: int,
+    only_unmask_final: bool = False,
 ) -> tuple[BatchedDataDict[Any], torch.Tensor, BatchedDataDict[Any]]:
     """Prepare rollout message logs for the TQ payload and driver carry."""
     from nemo_rl.algorithms.grpo import (
@@ -99,7 +100,10 @@ def _flatten_rollout_message_log_for_tq(
         **pad,
     )
 
-    add_grpo_token_loss_masks_and_generation_logprobs(message_logs)
+    add_grpo_token_loss_masks_and_generation_logprobs(
+        message_logs,
+        only_unmask_final=only_unmask_final,
+    )
     flat, input_lengths = batched_message_log_to_flat_message(
         message_logs,
         **pad,
@@ -217,6 +221,7 @@ class SyncRolloutActor:
         # Lazy imports keep rollout-specific dependencies off the actor startup path.
         # ``_policy_dtype`` sizes the VLM pixel tensors below.
         from nemo_rl.algorithms.grpo import _policy_dtype
+        from nemo_rl.algorithms.opd import should_only_unmask_final
         from nemo_rl.algorithms.utils import get_gdpo_reward_component_keys
         from nemo_rl.data.llm_message_utils import (
             MESSAGE_LOG_BULK_FIELDS,
@@ -297,6 +302,7 @@ class SyncRolloutActor:
             make_sequence_length_divisible_by=cfg.policy[
                 "make_sequence_length_divisible_by"
             ],
+            only_unmask_final=should_only_unmask_final(cfg),
         )
 
         router_replay_enabled = bool(

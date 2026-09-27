@@ -1490,6 +1490,17 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 "Use the legacy async NeMo-Gym GRPO entrypoint "
                 "examples/nemo_gym/run_grpo_nemo_gym.py."
             )
+        if opd_config.only_unmask_final and token_capture_config.enabled:
+            # Capture receipts contain a flat token mask, not the message
+            # boundaries needed to identify the final generated assistant
+            # turn. Refuse to silently train every captured turn.
+            raise NotImplementedError(
+                "on_policy_distillation.only_unmask_final=true is not "
+                "supported with token_capture.enabled=true: token-capture "
+                "receipts do not preserve the message boundaries needed for "
+                "final-turn masking. Disable token capture or set "
+                "on_policy_distillation.only_unmask_final=false."
+            )
         if algo_cfg.adv_estimator.name != "opd":
             raise ValueError(
                 "on_policy_distillation.enabled=true requires "

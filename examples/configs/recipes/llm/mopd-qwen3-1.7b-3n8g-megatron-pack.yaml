@@ -126,6 +126,8 @@ cluster:
   num_nodes: 3
 on_policy_distillation:
   enabled: true
+  # false trains on every rollout-generated assistant turn.
+  only_unmask_final: false
   teacher_model_by_agent_name:
     default_teacher: Qwen/Qwen3-1.7B
   default_teacher_alias: default_teacher
