@@ -3262,10 +3262,21 @@ class TestPeriodicRolloutCheckpoint:
             generation_cut_staging_key="prefix/agent-b",
             emit_model_participant=True,
         )
+        third = _FakeGymCheckpointActor(
+            events,
+            agent_name="agent-c",
+            agent_server_name="agent-c-route",
+            generation_cut_staging_key="prefix/agent-c",
+            emit_model_participant=True,
+        )
         actor._env_handles = {
             "nemo_gym": NemoGymShardSet(
-                handles={"first": [first], "second": [second]},
-                route_to_shard={"agent-a": "first", "agent-b": "second"},
+                handles={"first": [first], "second": [second], "third": [third]},
+                route_to_shard={
+                    "agent-a": "first",
+                    "agent-b": "second",
+                    "agent-c": "third",
+                },
             )
         }
 
@@ -3292,14 +3303,57 @@ class TestPeriodicRolloutCheckpoint:
             ["responses_api_agents", "resources_servers"],
             ["responses_api_models"],
         ]
+        assert third.commit_components == [
+            ["responses_api_agents", "resources_servers"],
+            ["responses_api_models"],
+        ]
         assert second.model_continuation_indexes == [[]]
         assert second.model_generation_cut_indexes == [[]]
-        assert len(first.model_continuation_indexes[0]) == 2
-        assert len(first.model_generation_cut_indexes[0]) == 1
-        assert first.model_generation_cut_indexes[0][0]["relative_path"].startswith(
-            ".gym-cut-fragments/gym-shards/second/"
-        )
+        assert third.model_continuation_indexes == [[]]
+        assert third.model_generation_cut_indexes == [[]]
+        assert len(first.model_continuation_indexes[0]) == 3
+        assert {
+            reference["relative_path"].split("/", 3)[2]
+            for reference in first.model_generation_cut_indexes[0]
+        } == {"second", "third"}
         assert not (tmp_path / ".gym-cut-fragments").exists()
+
+    def test_sharded_prefix_checkpoint_rejects_missing_peer_model_index(
+        self, tmp_path: Path
+    ) -> None:
+        actor = self._actor(tmp_path)
+        actor._generation_prefix_cuts_enabled = True
+        events: list[str] = []
+        first = _FakeGymCheckpointActor(
+            events,
+            generation_cut_staging_key="prefix/first",
+            emit_model_participant=True,
+        )
+        second = _FakeGymCheckpointActor(
+            events,
+            generation_cut_staging_key="prefix/second",
+            emit_model_participant=False,
+        )
+        actor._env_handles = {
+            "nemo_gym": NemoGymShardSet(
+                handles={"first": [first], "second": [second]},
+            )
+        }
+
+        try:
+            with pytest.raises(
+                RuntimeError,
+                match="must contain exactly one policy-model participant",
+            ):
+                asyncio.run(
+                    actor._commit_sharded_gym_checkpoint(
+                        "checkpoint-prefix",
+                        tmp_path,
+                        timeout_s=30.0,
+                    )
+                )
+        finally:
+            actor._checkpointer.shutdown()
 
     @pytest.mark.parametrize("failure", ["prepare", "local_commit", "model_commit"])
     def test_sharded_gym_checkpoint_failure_aborts_every_shard(

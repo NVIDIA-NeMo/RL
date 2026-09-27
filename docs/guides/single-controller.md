@@ -193,9 +193,11 @@ under `gym-shards/<shard-name>/`, while one deterministic shard commits the
 shared policy-model ledger. The configured `token_capture.capture_dir` must be
 shared storage visible to every Gym shard and the Single Controller; a
 node-local override would split one logical lineage across hosts. Replicated
-Gym shards and generation-prefix cuts combined with multiple Gym shards are
-rejected during setup until their ownership and restore-routing contracts are
-supported.
+Gym shards are rejected during setup. Generation-prefix recovery supports
+multiple distinct, single-replica Gym shards: non-leader shards first export
+temporary generation-cut indexes, and one deterministic leader commits their
+union into the shared policy-model ledger. During restore, every model proxy
+installs that authenticated cut union into its process-local prefix registry.
 On restore, Gym validates and rehydrates its own artifacts, and NeMo-RL checks
 that Gym reports the same sidecar digests and that every indexed TQ row exists.
 The continuation and external-storage indexes are required; checkpoints that
