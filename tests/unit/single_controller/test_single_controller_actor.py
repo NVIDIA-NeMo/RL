@@ -245,8 +245,8 @@ def test_fresh_mooncake_init_registers_partition(
     dp_client = MagicMock(name="dp_client")
     master_config = _grpo_master_config(tmp_path)
     master_config.data_plane = _data_plane_config("mooncake_cpu")
-    master_config.checkpointing["enabled"] = checkpoint_enabled
-    master_config.checkpointing["save_data_plane"] = save_data_plane
+    master_config.checkpointing.enabled = checkpoint_enabled
+    master_config.checkpointing.save_data_plane = save_data_plane
     actor_args = _actor_args_for_init(dp_client=dp_client)
     if not checkpoint_enabled:
         actor_args.trainer_handle = None

@@ -778,7 +778,7 @@ class TestSetup:
     def test_rejects_unknown_backend_data_plane_checkpointing(self):
         mc = _make_master_config()
         mc.data_plane["backend"] = "future_backend"
-        mc.checkpointing["save_data_plane"] = True
+        mc.checkpointing.save_data_plane = True
         with pytest.raises(NotImplementedError, match="backend='future_backend'"):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
@@ -2350,8 +2350,8 @@ class TestNativeTQRecoverySetup:
         checkpointer.get_resume_paths.return_value = (None, None)
         mc = _make_master_config()
         mc.data_plane["backend"] = "mooncake_cpu"
-        mc.checkpointing["enabled"] = save_enabled
-        mc.checkpointing["save_data_plane"] = save_enabled
+        mc.checkpointing.enabled = save_enabled
+        mc.checkpointing.save_data_plane = save_enabled
 
         with patch.object(sc_setup_mod, "CheckpointManager", return_value=checkpointer):
             actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))

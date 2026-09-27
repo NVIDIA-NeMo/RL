@@ -150,12 +150,14 @@ def test_train_step_aborts_policy_and_loader_on_training_failure() -> None:
 
 def _save_controller(**checkpointing: Any) -> object:
     controller = _controller()
-    controller._master_config.checkpointing = {
-        "enabled": True,
-        "save_period": 10,
-        "metric_name": None,
-        **checkpointing,
-    }
+    controller._master_config.checkpointing = CheckpointingConfig.model_construct(
+        **{
+            "enabled": True,
+            "save_period": 10,
+            "metric_name": None,
+            **checkpointing,
+        }
+    )
     controller._max_steps = 25
     return controller
 

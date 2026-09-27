@@ -5122,8 +5122,8 @@ def test_grpo_exit_on_timeout(mock_grpo_components, train_func, capsys, tmp_path
     master_config = mock_grpo_components["master_config"]
     master_config.grpo.max_num_steps = 100
     master_config.grpo.max_num_epochs = 10
-    master_config.checkpointing["enabled"] = True
-    master_config.checkpointing["metric_name"] = None
+    master_config.checkpointing.enabled = True
+    master_config.checkpointing.metric_name = None
     mock_grpo_components["checkpointer"].init_tmp_checkpoint.return_value = str(
         tmp_path / "tmp_step"
     )

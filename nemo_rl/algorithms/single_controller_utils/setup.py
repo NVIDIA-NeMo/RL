@@ -1542,8 +1542,8 @@ def setup_single_controller(
             checkpointing=bool(
                 recovery_checkpoint_path is not None
                 or (
-                    master_config.checkpointing["enabled"]
-                    and master_config.checkpointing.get("save_data_plane")
+                    master_config.checkpointing.enabled
+                    and master_config.checkpointing.save_data_plane
                 )
             ),
             reserved_http_server_ports=reserved_http_server_ports,

@@ -227,8 +227,8 @@ def test_exit_on_timeout(mock_components, capsys, tmp_path):
     # Set max steps and epochs to large numbers
     mock_components["master_config"].sft.max_num_steps = 100
     mock_components["master_config"].sft.max_num_epochs = 10
-    mock_components["master_config"].checkpointing["enabled"] = True
-    mock_components["master_config"].checkpointing["metric_name"] = None
+    mock_components["master_config"].checkpointing.enabled = True
+    mock_components["master_config"].checkpointing.metric_name = None
     mock_components["checkpointer"].init_tmp_checkpoint.return_value = str(
         tmp_path / "tmp_step"
     )

@@ -417,8 +417,8 @@ def test_exit_on_timeout(mock_dpo_components, capsys, tmp_path):
     # Set max steps and epochs to large numbers
     mock_dpo_components["master_config"].dpo.max_num_steps = 100
     mock_dpo_components["master_config"].dpo.max_num_epochs = 10
-    mock_dpo_components["master_config"].checkpointing["enabled"] = True
-    mock_dpo_components["master_config"].checkpointing["metric_name"] = None
+    mock_dpo_components["master_config"].checkpointing.enabled = True
+    mock_dpo_components["master_config"].checkpointing.metric_name = None
     mock_dpo_components["checkpointer"].init_tmp_checkpoint.return_value = str(
         tmp_path / "tmp_step"
     )

@@ -2699,10 +2699,12 @@ def test_async_ppo_completed_resume_exits_before_actor_start(monkeypatch):
     config.ppo.val_at_end = False
     config.ppo.num_prompts_per_step = 1
     config.ppo.skip_reference_policy_logprobs_calculation = False
-    config.checkpointing = {
-        "checkpoint_must_save_by": None,
-        "ft_save_period": None,
-    }
+    config.checkpointing = CheckpointingConfig.model_construct(
+        **{
+            "checkpoint_must_save_by": None,
+            "ft_save_period": None,
+        }
+    )
     policy = MagicMock()
     generation = MagicMock()
     generation.requires_kv_scale_sync = False
@@ -2757,10 +2759,12 @@ def test_async_ppo_initial_refit_failure_cleans_up_actors(monkeypatch):
     config.ppo.max_rollout_turns = 1
     config.ppo.skip_reference_policy_logprobs_calculation = False
     config.ppo.adv_estimator = GAEConfig(name="raw_reward", normalize_advantages=False)
-    config.checkpointing = {
-        "checkpoint_must_save_by": None,
-        "ft_save_period": None,
-    }
+    config.checkpointing = CheckpointingConfig.model_construct(
+        **{
+            "checkpoint_must_save_by": None,
+            "ft_save_period": None,
+        }
+    )
 
     replay_actor = MagicMock()
     collector_actor = MagicMock()

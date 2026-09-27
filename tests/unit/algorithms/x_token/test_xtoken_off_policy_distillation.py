@@ -513,8 +513,8 @@ def test_exit_on_max_epochs(mock_xtoken_components):
 
 def test_exit_on_timeout(mock_xtoken_components, capsys, tmp_path):
     mock_xtoken_components.master_config.distillation["max_num_steps"] = 100
-    mock_xtoken_components.master_config.checkpointing["enabled"] = True
-    mock_xtoken_components.master_config.checkpointing["metric_name"] = None
+    mock_xtoken_components.master_config.checkpointing.enabled = True
+    mock_xtoken_components.master_config.checkpointing.metric_name = None
     mock_xtoken_components.checkpointer.init_tmp_checkpoint.return_value = str(
         tmp_path / "tmp_step"
     )
