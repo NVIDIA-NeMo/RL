@@ -223,6 +223,7 @@ log = logging.getLogger(__name__)
 # budget: at this point the run is over, so the only thing a completed restart buys is a
 # cleaner exit. Not configurable for the same reason.
 _SUPERVISOR_DRAIN_TIMEOUT_S = 30.0
+_GYM_GENERATION_CUT_FRAGMENT_DIR = ".gym-cut-fragments"
 
 
 @dataclass(frozen=True)
@@ -2191,10 +2192,11 @@ class SingleControllerActor:
         """Commit shard-local state, then the shared policy ledger.
 
         Agent and resource servers belong to one Gym shard and write below an
-        instance-specific directory. With prefix cuts enabled, non-leader
-        proxies first commit cut-only fragments there. One deterministic
-        leader then commits the shared ledger at the snapshot root from the
-        union of continuation and generation-cut indexes.
+        shard-local directory. With prefix cuts enabled, non-leader proxies
+        first commit temporary cut-only fragments below
+        ``.gym-cut-fragments/``. One deterministic leader then commits the
+        shared ledger at the snapshot root from the union of continuation and
+        generation-cut indexes; the temporary fragments are removed.
         """
         instances = self._nemo_gym_checkpoint_instances()
         if len(instances) == 1:
@@ -2252,7 +2254,7 @@ class SingleControllerActor:
             )
 
         generation_cut_indexes: list[GymCheckpointArtifactReference] = []
-        fragment_root = checkpoint_dir / ".gym-cut-fragments"
+        fragment_root = checkpoint_dir / _GYM_GENERATION_CUT_FRAGMENT_DIR
         if self._generation_prefix_cuts_enabled:
             fragment_calls = [
                 (
@@ -2284,7 +2286,7 @@ class SingleControllerActor:
                     )
                 rebased_fragment = rebase_gym_checkpoint_commit_result(
                     fragment,
-                    Path(".gym-cut-fragments")
+                    Path(_GYM_GENERATION_CUT_FRAGMENT_DIR)
                     / shard_set.checkpoint_relative_dir(label),
                 )
                 model_results = [
@@ -2331,7 +2333,9 @@ class SingleControllerActor:
                 f"actual={model_checkpoint.checkpoint_id!r}"
             )
         if self._generation_prefix_cuts_enabled:
-            await asyncio.to_thread(shutil.rmtree, fragment_root)
+            await asyncio.to_thread(
+                partial(shutil.rmtree, fragment_root, ignore_errors=True)
+            )
 
         component_order = {
             "responses_api_agents": 0,
@@ -2542,9 +2546,18 @@ class SingleControllerActor:
         timeout_s = self._master_config.rollout_checkpointing.gym.prepare_timeout_s
         deadline_ts = time.time() + timeout_s
         self._gym_checkpoint_rollout_permitted.clear()
+        shard_set = self._nemo_gym_checkpoint_shards()
+        model_restore_labels = {
+            label
+            for label, _actor in shard_set.model_restore_instances(
+                generation_prefix_cuts_enabled=(
+                    self._generation_prefix_cuts_enabled
+                )
+            )
+        }
         calls = []
-        for index, (label, actor) in enumerate(instances):
-            if index == 0 or self._generation_prefix_cuts_enabled:
+        for label, actor in instances:
+            if label in model_restore_labels:
                 call = actor.resume_checkpoint.remote(checkpoint_id, deadline_ts)
             else:
                 call = actor.resume_checkpoint.remote(

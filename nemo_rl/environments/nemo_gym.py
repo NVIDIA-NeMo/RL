@@ -3268,6 +3268,15 @@ class NemoGymShardSet:
             for index, handle in enumerate(replicas)
         )
 
+    def model_restore_instances(
+        self,
+        *,
+        generation_prefix_cuts_enabled: bool,
+    ) -> tuple[tuple[str, Any], ...]:
+        """Return proxies that must restore and resume shared model state."""
+        instances = self.checkpoint_instances
+        return instances if generation_prefix_cuts_enabled else instances[:1]
+
     def checkpoint_handle_for_route(self, route_name: str) -> Any:
         """Return the sole checkpoint actor that owns one routed Gym entry."""
         shard_name = self.shard_for_route(route_name)
