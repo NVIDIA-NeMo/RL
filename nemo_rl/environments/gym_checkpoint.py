@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Versioned NeMo-Gym checkpoint wire contracts owned by NeMo-RL.
+"""Versioned NeMo-Gym checkpoint contracts owned by NeMo-RL.
 
 NeMo-Gym's checkpoint package is currently experimental.  Keeping these
-models in NeMo-RL makes the HTTP boundary explicit and prevents a Gym package
-refactor from silently changing a durable RL checkpoint protocol.
+persisted and response models in NeMo-RL makes the HTTP boundary explicit and
+prevents a Gym package refactor from silently changing a durable RL checkpoint
+protocol. Live request and capability models are imported from Gym inside the
+``NemoGym`` actor, where that optional dependency is installed.
 
 Models described as persisted are serialized into the rollout snapshot.
 Changing their fields or invariants requires reviewing, and normally bumping,
@@ -27,22 +29,23 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
+from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Literal, TypeAlias, cast
+from typing import TYPE_CHECKING, Annotated, Literal, TypeAlias, cast
 
-from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+if TYPE_CHECKING:
+    from nemo_gym._checkpoint import ControlCapabilities
 
 GYM_CHECKPOINT_SCHEMA_VERSION = 1
-GYM_CHECKPOINT_CONTROL_PREFIX = "/ng-control/v1"
-GYM_CHECKPOINT_CAPABILITIES_PATH = f"{GYM_CHECKPOINT_CONTROL_PREFIX}/capabilities"
-GYM_MODEL_ADMISSION_PREFIX = f"{GYM_CHECKPOINT_CONTROL_PREFIX}/model-admission"
-GYM_MODEL_CHECKPOINT_PREFIX = f"{GYM_CHECKPOINT_CONTROL_PREFIX}/model-checkpoint"
-GYM_AGENT_CHECKPOINT_PREFIX = f"{GYM_CHECKPOINT_CONTROL_PREFIX}/agent-checkpoint"
-GYM_RESOURCES_CHECKPOINT_PREFIX = (
-    f"{GYM_CHECKPOINT_CONTROL_PREFIX}/resources-checkpoint"
+GYM_SERVER_TYPE_KEYS = (
+    "responses_api_agents",
+    "responses_api_models",
+    "resources_servers",
 )
-GYM_AGENT_CONTINUATION_INDEX_FEATURE = "agent_continuation_index_v1"
-GYM_EXTERNAL_STORAGE_REFERENCE_INDEX_FEATURE = "external_storage_reference_index_v1"
 
 _IDENTITY_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
 
@@ -55,6 +58,57 @@ NonNegativeInt: TypeAlias = Annotated[int, Field(strict=True, ge=0)]
 PositiveInt: TypeAlias = Annotated[int, Field(strict=True, ge=1)]
 NonNegativeFloat: TypeAlias = Annotated[float, Field(ge=0)]
 Sha256Digest: TypeAlias = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+
+
+class GymCheckpointPhase(StrEnum):
+    """One participant-control phase in the Gym checkpoint transaction."""
+
+    PREPARE = "prepare"
+    COMMIT = "commit"
+    RESTORE = "restore"
+    RESUME = "resume"
+
+
+# Each phase has a deliberate dependency order. Preparation fences model
+# admission before parking callers. Commit writes agent continuation indexes
+# before model lineage consumes them. Restore installs model lineage first and
+# then deterministically installs the remaining participant state while all
+# admission remains closed. Resume reopens agent dependencies before releasing
+# parked agent coroutines.
+GYM_CHECKPOINT_COMPONENT_ORDERS: dict[GymCheckpointPhase, dict[GymComponent, int]] = {
+    GymCheckpointPhase.PREPARE: {
+        "responses_api_models": 0,
+        "responses_api_agents": 1,
+        "resources_servers": 2,
+    },
+    GymCheckpointPhase.COMMIT: {
+        "responses_api_agents": 0,
+        "responses_api_models": 1,
+        "resources_servers": 2,
+    },
+    GymCheckpointPhase.RESTORE: {
+        "responses_api_models": 0,
+        "responses_api_agents": 1,
+        "resources_servers": 2,
+    },
+    GymCheckpointPhase.RESUME: {
+        "resources_servers": 0,
+        "responses_api_models": 1,
+        "responses_api_agents": 2,
+    },
+}
+
+
+def checkpoint_server_names(global_config: Mapping[str, object]) -> list[str]:
+    """Return deterministic Gym service routing names from resolved config."""
+    component_keys = frozenset(GYM_SERVER_TYPE_KEYS)
+    server_names: list[str] = []
+    for server_name, entry in global_config.items():
+        if not isinstance(server_name, str) or not isinstance(entry, Mapping):
+            continue
+        if len(component_keys.intersection(entry)) == 1:
+            server_names.append(server_name)
+    return sorted(server_names)
 
 
 class _StrictWireModel(BaseModel):
@@ -130,58 +184,67 @@ class GymParticipantIdentity(_StrictWireModel):
     participant_name: str = Field(min_length=1)
 
 
-class GymControlCapabilities(_StrictWireModel):
-    """Response from ``GET /ng-control/v1/capabilities``."""
-
-    component: GymComponent
-    name: str = Field(min_length=1)
-    schema_version: Literal[1]
-    admission_states: list[Literal["accepting", "draining", "paused"]]
-    checkpoint_mode: Literal["stateless", "restart_only", "export_restore"]
-    concurrency_contract: Literal[
-        "stateless",
-        "serialized_per_session",
-        "transactional_parallel",
-    ]
-    multi_process: GymMultiProcessCapability
-    instance_role: Literal["policy", "auxiliary"] | None = None
-    phase: Literal[
-        "idle",
-        "preparing",
-        "prepared",
-        "committing",
-        "committed_paused",
-        "restoring",
-        "restore_failed_paused",
-        "restored_paused",
-    ]
-    active_checkpoint_id: str | None = None
-    deadline_ts: FiniteFloat | None = None
-    # Capabilities are additive. Older NeMo-RL clients must tolerate features
-    # advertised by a newer Gym and explicitly check only the ones they require.
-    features: list[str] = Field(default_factory=list)
-
-    def participant(self, server_name: str) -> GymParticipantIdentity:
-        """Bind Gym's reported identity to its NeMo-RL routing name."""
-        return GymParticipantIdentity(
-            server_name=server_name,
-            component=self.component,
-            participant_name=self.name,
-        )
-
-
-class GymDiscoveredParticipant(_StrictWireModel):
+@dataclass(frozen=True)
+class GymDiscoveredParticipant:
     """One routable Gym participant and its validated capabilities."""
 
     participant: GymParticipantIdentity
-    capabilities: GymControlCapabilities
+    capabilities: ControlCapabilities
+
+
+def participates_in_checkpoint_phase(
+    discovered: GymDiscoveredParticipant,
+    phase: GymCheckpointPhase,
+) -> bool:
+    """Return whether one participant joins the requested control phase."""
+    capabilities = discovered.capabilities
+    if discovered.participant.component == "responses_api_models":
+        if capabilities.instance_role != "policy":
+            return False
+        if phase in {
+            GymCheckpointPhase.PREPARE,
+            GymCheckpointPhase.RESUME,
+        }:
+            # Every policy model must close admission around the cut, even
+            # when it has no exportable state of its own.
+            return True
+    return capabilities.checkpoint_mode == "export_restore"
+
+
+def participant_checkpoint_path(
+    participant: GymParticipantIdentity,
+    *,
+    model_ledger_subdir: str,
+    model_manifest_name: str,
+    resources_state_subdir: str,
+    resources_manifest_name: str,
+    agent_state_subdir: str,
+    agent_manifest_name: str,
+) -> str:
+    """Return one participant manifest path using Gym-owned path constants."""
+    if participant.component == "responses_api_models":
+        safe_name = GymExecutionIdentity(
+            rollout_id=participant.participant_name,
+            attempt_index=0,
+        ).rollout_id
+        return f"{model_ledger_subdir}/{safe_name}/{model_manifest_name}"
+    if participant.component == "resources_servers":
+        safe_name = GymExecutionIdentity(
+            rollout_id=participant.participant_name,
+            attempt_index=0,
+        ).rollout_id
+        return f"{resources_state_subdir}/{safe_name}/{resources_manifest_name}"
+    name_digest = hashlib.sha256(
+        participant.participant_name.encode("utf-8")
+    ).hexdigest()
+    return f"{agent_state_subdir}/instance-{name_digest}/{agent_manifest_name}"
 
 
 class GymCheckpointParticipantContract(_StrictWireModel):
     """Credential-free participant properties that must match on restore."""
 
     participant: GymParticipantIdentity
-    schema_version: Literal[1]
+    schema_version: Literal[1] = GYM_CHECKPOINT_SCHEMA_VERSION
     admission_states: list[Literal["accepting", "draining", "paused"]]
     checkpoint_mode: Literal["stateless", "restart_only", "export_restore"]
     concurrency_contract: Literal[
@@ -209,7 +272,10 @@ class GymCheckpointParticipantContract(_StrictWireModel):
             ),
             checkpoint_mode=capabilities.checkpoint_mode,
             concurrency_contract=capabilities.concurrency_contract,
-            multi_process=capabilities.multi_process,
+            multi_process=GymMultiProcessCapability(
+                mode=capabilities.multi_process.mode,
+                num_workers=capabilities.multi_process.num_workers,
+            ),
             instance_role=capabilities.instance_role,
             features=sorted(capabilities.features),
         )
@@ -227,6 +293,8 @@ class GymCheckpointTopology(_StrictWireModel):
         participants: list[GymDiscoveredParticipant],
     ) -> "GymCheckpointTopology":
         """Build a deterministically ordered topology from discovery results."""
+        # This order only canonicalizes the persisted topology fingerprint; it
+        # is not a checkpoint lifecycle phase order.
         component_order = {
             "responses_api_agents": 0,
             "responses_api_models": 1,
@@ -262,24 +330,6 @@ class GymCheckpointTopology(_StrictWireModel):
         return hashlib.sha256(payload).hexdigest()
 
 
-class GymCheckpointControlRequest(_StrictWireModel):
-    """Fields shared by all Gym checkpoint control requests."""
-
-    schema_version: Literal[1] = GYM_CHECKPOINT_SCHEMA_VERSION
-    checkpoint_id: str = Field(
-        min_length=1,
-        max_length=128,
-        pattern=_IDENTITY_PATTERN,
-    )
-    deadline_ts: FiniteFloat
-
-
-class GymCheckpointDirectoryRequest(GymCheckpointControlRequest):
-    """Checkpoint request that reads or writes one shared snapshot directory."""
-
-    checkpoint_dir: str = Field(min_length=1)
-
-
 class GymCheckpointArtifactReference(_StrictWireModel):
     """Digest-bound coordinate for a Gym-owned checkpoint sidecar."""
 
@@ -295,20 +345,6 @@ class GymCheckpointArtifactReference(_StrictWireModel):
         if path.is_absolute() or not path.parts or ".." in path.parts:
             raise ValueError("Gym checkpoint artifact path must be safely relative")
         return self
-
-
-class GymAgentCheckpointDirectoryRequest(GymCheckpointDirectoryRequest):
-    """Agent commit/restore request returning continuation coordinates."""
-
-
-class GymModelCheckpointCommitRequest(GymCheckpointDirectoryRequest):
-    """Model commit request scoped to agent-owned continuation roots."""
-
-    continuation_indexes: list[GymCheckpointArtifactReference]
-
-
-class GymModelCheckpointRestoreRequest(GymCheckpointDirectoryRequest):
-    """Model restore request returning its external-storage index."""
 
 
 class GymWorkerAcknowledgements(_StrictWireModel):
@@ -507,6 +543,9 @@ class GymModelCommitResponse(_StrictWireModel):
     excluded_tombstoned: NonNegativeInt
     excluded_inactive: NonNegativeInt = 0
     manifest_digest: Sha256Digest
+    # Gym owns these nested experimental schemas. RL persists them unchanged.
+    generation_cut_receipt: dict[str, object] | None = None
+    generation_cut_proof: dict[str, object] | None = None
     storage_reference_index: GymCheckpointArtifactReference
 
 
@@ -586,8 +625,11 @@ class GymModelRestoreResponse(_StrictWireModel):
     rollouts: NonNegativeInt
     rows: NonNegativeInt
     checkpoint_id: str | None = None
-    tombstones: list[GymExecutionIdentity]
-    source_attempts: list[GymExecutionIdentity]
+    tombstones: list[GymExecutionIdentity] = Field(default_factory=list)
+    source_attempts: list[GymExecutionIdentity] = Field(default_factory=list)
+    # Gym owns these nested experimental schemas. RL persists them unchanged.
+    generation_cut_receipt: dict[str, object] | None = None
+    generation_cut_proof: dict[str, object] | None = None
     storage_reference_index: GymCheckpointArtifactReference
 
 

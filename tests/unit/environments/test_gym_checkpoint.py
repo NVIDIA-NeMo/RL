@@ -14,17 +14,23 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from pydantic import ValidationError
 
 from nemo_rl.environments.gym_checkpoint import (
     GYM_CHECKPOINT_SCHEMA_VERSION,
     GymCheckpointTopology,
-    GymControlCapabilities,
+    GymCheckpointPhase,
     GymDiscoveredParticipant,
     GymExecutionIdentity,
     GymModelPrepareResponse,
+    GymMultiProcessCapability,
+    GymParticipantIdentity,
+    checkpoint_server_names,
     gym_capture_key,
+    participates_in_checkpoint_phase,
 )
 
 
@@ -38,12 +44,28 @@ def _capabilities(**overrides):
         "concurrency_contract": "stateless",
         "multi_process": {"mode": "single_worker", "num_workers": 1},
         "instance_role": "policy",
+        "features": [],
         "phase": "idle",
         "active_checkpoint_id": None,
         "deadline_ts": None,
     }
     payload.update(overrides)
-    return payload
+    multi_process = GymMultiProcessCapability.model_validate(
+        payload.pop("multi_process")
+    )
+    return SimpleNamespace(**payload, multi_process=multi_process)
+
+
+def _discovered(**overrides) -> GymDiscoveredParticipant:
+    capabilities = _capabilities(**overrides)
+    return GymDiscoveredParticipant(
+        participant=GymParticipantIdentity(
+            server_name="policy-route",
+            component=capabilities.component,
+            participant_name=capabilities.name,
+        ),
+        capabilities=capabilities,
+    )
 
 
 def test_gym_execution_identity_separates_logical_id_from_capture_key() -> None:
@@ -75,53 +97,44 @@ def test_gym_execution_identity_rejects_invalid_values(
         )
 
 
-def test_capability_contract_rejects_unknown_fields_and_schema_drift() -> None:
-    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
-        GymControlCapabilities.model_validate(_capabilities(unexpected=True))
-
-    with pytest.raises(ValidationError, match="Input should be 1"):
-        GymControlCapabilities.model_validate(_capabilities(schema_version=2))
-
-
-def test_capability_contract_binds_routing_and_participant_identity() -> None:
-    capabilities = GymControlCapabilities.model_validate(_capabilities())
-
-    participant = capabilities.participant("policy_model_route")
-
-    assert participant.model_dump() == {
-        "server_name": "policy_model_route",
-        "component": "responses_api_models",
-        "participant_name": "policy_model",
-    }
+def test_checkpoint_server_names_selects_only_server_entries() -> None:
+    assert checkpoint_server_names(
+        {
+            "policy": {"responses_api_models": {}},
+            "agent": {"responses_api_agents": {}},
+            "global": {"policy_base_url": "http://policy"},
+            "ambiguous": {
+                "responses_api_agents": {},
+                "resources_servers": {},
+            },
+        }
+    ) == ["agent", "policy"]
 
 
-def test_topology_fingerprint_excludes_dynamic_checkpoint_phase() -> None:
-    first = GymControlCapabilities.model_validate(_capabilities())
-    second = GymControlCapabilities.model_validate(
-        _capabilities(
-            admission_states=["paused", "accepting", "draining"],
-            phase="preparing",
-            active_checkpoint_id="snapshot-7",
-            deadline_ts=123.0,
-        )
+def test_checkpoint_phase_participation_distinguishes_policy_and_state() -> None:
+    policy = _discovered(checkpoint_mode="stateless")
+    auxiliary = _discovered(instance_role="auxiliary")
+    agent = _discovered(
+        component="responses_api_agents",
+        name="agent",
+        instance_role=None,
     )
 
-    first_topology = GymCheckpointTopology.from_discovered(
-        [
-            GymDiscoveredParticipant(
-                participant=first.participant("policy-route"),
-                capabilities=first,
-            )
-        ]
+    assert participates_in_checkpoint_phase(policy, GymCheckpointPhase.PREPARE)
+    assert participates_in_checkpoint_phase(policy, GymCheckpointPhase.RESUME)
+    assert not participates_in_checkpoint_phase(policy, GymCheckpointPhase.COMMIT)
+    assert not participates_in_checkpoint_phase(auxiliary, GymCheckpointPhase.PREPARE)
+    assert participates_in_checkpoint_phase(agent, GymCheckpointPhase.COMMIT)
+
+
+def test_topology_fingerprint_canonicalizes_capability_ordering() -> None:
+    first = _discovered()
+    second = _discovered(
+        admission_states=["paused", "accepting", "draining"],
     )
-    second_topology = GymCheckpointTopology.from_discovered(
-        [
-            GymDiscoveredParticipant(
-                participant=second.participant("policy-route"),
-                capabilities=second,
-            )
-        ]
-    )
+
+    first_topology = GymCheckpointTopology.from_discovered([first])
+    second_topology = GymCheckpointTopology.from_discovered([second])
 
     assert first_topology.fingerprint() == second_topology.fingerprint()
 

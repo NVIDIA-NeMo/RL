@@ -446,8 +446,14 @@ class RolloutReassembler:
 
         from nemo_gym.token_id_capture.staging.records import RolloutReceipt
 
-        terminal_selection_methods = get_args(
-            RolloutReceipt.model_fields["terminal_selection"].annotation
+        terminal_selection_annotation = RolloutReceipt.model_fields[
+            "terminal_selection"
+        ].annotation
+        terminal_selection_methods = tuple(
+            method
+            for annotation_member in get_args(terminal_selection_annotation)
+            if annotation_member is not type(None)
+            for method in (get_args(annotation_member) or (annotation_member,))
         )
         for method in terminal_selection_methods:
             method_receipts = sum(

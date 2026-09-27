@@ -146,7 +146,7 @@ def test_finalize_rollout_rejections(tq_client, partitions):
         finalizer.finalize_rollout("rej_a", poisoned, reward=0.0).rejection_reason
         == "capture_poisoned"
     )
-    empty = dict(receipt, manifest=[], terminal_model_call_id=None)
+    empty = dict(receipt, manifest=[])
     assert (
         finalizer.finalize_rollout("rej_a", empty, reward=0.0).rejection_reason
         == "empty_manifest"

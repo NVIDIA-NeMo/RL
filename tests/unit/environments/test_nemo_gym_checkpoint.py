@@ -17,10 +17,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from pydantic import ValidationError
 
+from nemo_rl.environments.gym_checkpoint import GymCheckpointCommitResult
 from nemo_rl.environments.nemo_gym import (
     NemoGym,
 )
@@ -53,10 +56,42 @@ def _capability(component: str, name: str, **overrides):
 def _checkpoint_env():
     env_cls = NemoGym.__ray_metadata__.modified_class
     env = object.__new__(env_cls)
+    env.cfg = {"base_urls": ["http://policy/v1"]}
     env.rh = object()
+    env._server_client = SimpleNamespace(
+        global_config_dict={
+            "policy": {
+                "responses_api_models": {
+                    "vllm_model": {"base_url": ["http://policy/v1"]}
+                }
+            }
+        }
+    )
     env._gym_checkpoint_participants = ()
     env._control_timeout_s = 60.0
     env._active_gym_checkpoint_id = None
+    return env
+
+
+def _discovered_env():
+    env = _checkpoint_env()
+    capabilities = {
+        "policy": _capability(
+            "responses_api_models",
+            "policy",
+            admission_states=["accepting", "draining", "paused"],
+            concurrency_contract="stateless",
+            instance_role="policy",
+        ),
+        "agent": _capability("responses_api_agents", "agent"),
+        "tools": _capability("resources_servers", "tools"),
+    }
+
+    async def discover(_method, _path, *, server_name, **_kwargs):
+        return capabilities[server_name]
+
+    env._control = AsyncMock(side_effect=discover)
+    asyncio.run(env.discover_checkpoint_capabilities(list(capabilities)))
     return env
 
 
@@ -91,8 +126,7 @@ def test_checkpoint_capability_discovery_validates_and_caches_participants() -> 
         "tools",
     ]
     assert [
-        item.participant.server_name
-        for item in env._gym_checkpoint_participants
+        item.participant.server_name for item in env._gym_checkpoint_participants
     ] == [
         "agent",
         "policy",
@@ -120,6 +154,62 @@ def test_checkpoint_capability_discovery_requires_policy_model() -> None:
 
     with pytest.raises(RuntimeError, match="no policy model participant"):
         asyncio.run(env.discover_checkpoint_capabilities(["tools"]))
+
+
+def test_checkpoint_capability_discovery_rejects_non_rl_policy_model() -> None:
+    env = _checkpoint_env()
+    env._server_client.global_config_dict["judge"] = {
+        "responses_api_models": {"vllm_model": {"base_url": ["http://judge/v1"]}}
+    }
+    capabilities = {
+        "policy": _capability("responses_api_models", "policy", instance_role="policy"),
+        "judge": _capability("responses_api_models", "judge", instance_role="policy"),
+    }
+
+    async def control(_method, _path, *, server_name, **_kwargs):
+        return capabilities[server_name]
+
+    env._control = AsyncMock(side_effect=control)
+
+    with pytest.raises(RuntimeError, match="Set instance_role: auxiliary"):
+        asyncio.run(env.discover_checkpoint_capabilities(list(capabilities)))
+
+
+def test_discovery_accepts_policy_aliases_and_auxiliary_models() -> None:
+    env = _checkpoint_env()
+    env._server_client.global_config_dict.update(
+        {
+            "policy_alias": {
+                "responses_api_models": {
+                    "vllm_model": {"base_url": "http://policy/v1/"}
+                }
+            },
+            "judge": {
+                "responses_api_models": {
+                    "vllm_model": {"base_url": ["http://judge/v1"]}
+                }
+            },
+        }
+    )
+    capabilities = {
+        "policy": _capability("responses_api_models", "policy", instance_role="policy"),
+        "policy_alias": _capability(
+            "responses_api_models", "policy_alias", instance_role="policy"
+        ),
+        "judge": _capability(
+            "responses_api_models", "judge", instance_role="auxiliary"
+        ),
+    }
+
+    async def control(_method, _path, *, server_name, **_kwargs):
+        return capabilities[server_name]
+
+    env._control = AsyncMock(side_effect=control)
+    discovered = asyncio.run(env.discover_checkpoint_capabilities(list(capabilities)))
+
+    assert {
+        item["participant"]["server_name"] for item in discovered["participants"]
+    } == {"policy", "policy_alias", "judge"}
 
 
 def test_checkpoint_prepare_fans_out_using_component_routes() -> None:
@@ -233,6 +323,7 @@ def test_checkpoint_prepare_waits_for_draining_policy_model() -> None:
                 "waiters_total": 0,
             }
         if server_name == "policy" and path.endswith("/status"):
+            assert _kwargs["params"]["timeout_s"] < _kwargs["timeout_s"]
             return {
                 "checkpoint_id": "snapshot-8",
                 "state": "paused",
@@ -345,7 +436,7 @@ def test_checkpoint_prepare_timeout_resumes_touched_participants() -> None:
 
     env._control = AsyncMock(side_effect=prepare_control)
 
-    with pytest.raises(TimeoutError, match="remained 'draining'"):
+    with pytest.raises(TimeoutError, match="rollout-1"):
         asyncio.run(env.prepare_checkpoint("snapshot-9", time.time() + 10.0))
 
     assert resume_order == ["tools", "policy", "agent"]
@@ -482,3 +573,118 @@ def test_abort_checkpoint_uses_idempotent_resume_routes() -> None:
 
     assert result == {"checkpoint_id": "snapshot-7"}
     env.resume_checkpoint.assert_awaited_once_with("snapshot-7", 123.0)
+
+
+def test_prepare_rejects_a_second_checkpoint_while_one_is_active() -> None:
+    env = _discovered_env()
+    env._active_gym_checkpoint_id = "snap-1"
+    env._control = AsyncMock(side_effect=AssertionError("no RPC expected"))
+
+    with pytest.raises(RuntimeError, match="'snap-1' is already active"):
+        asyncio.run(env.prepare_checkpoint("snap-2", time.time() + 10.0))
+
+
+def test_abort_of_a_different_checkpoint_is_rejected() -> None:
+    env = _checkpoint_env()
+    env._active_gym_checkpoint_id = "snap-1"
+    env.resume_checkpoint = AsyncMock()
+
+    with pytest.raises(RuntimeError, match="'snap-1' is already active"):
+        asyncio.run(env.abort_checkpoint("snap-2", 123.0))
+
+    env.resume_checkpoint.assert_not_awaited()
+
+
+def test_restore_rejects_a_participant_that_restored_another_checkpoint() -> None:
+    env = _discovered_env()
+    responses = {
+        "policy": {
+            "rollouts": 0,
+            "rows": 0,
+            "checkpoint_id": "snap-7",
+            "tombstones": [],
+            "source_attempts": [],
+            "storage_reference_index": {
+                "relative_path": "model-ledger/policy/i.jsonl",
+                "sha256": "d" * 64,
+                "records": 0,
+                "bytes": 0,
+            },
+        },
+        "agent": {
+            "records": 0,
+            "source_checkpoint_id": "snap-6",
+            "continuation_index": {
+                "relative_path": "agent/i.jsonl",
+                "sha256": "e" * 64,
+                "records": 0,
+                "bytes": 0,
+            },
+        },
+    }
+
+    async def control(_method, _path, *, server_name, **_kwargs):
+        return responses[server_name]
+
+    env._control = AsyncMock(side_effect=control)
+
+    with pytest.raises(RuntimeError, match="expected='snap-7', actual='snap-6'"):
+        asyncio.run(
+            env.restore_checkpoint(
+                "restore-1",
+                time.time() + 10.0,
+                "/tmp/x",
+                source_checkpoint_id="snap-7",
+            )
+        )
+
+
+def _commit_participant(
+    server: str,
+    component: str,
+    name: str,
+    manifest_name: str | None = None,
+) -> dict[str, object]:
+    return {
+        "participant": {
+            "server_name": server,
+            "component": component,
+            "participant_name": name,
+        },
+        "payload": {"sessions": 0, "manifest_digest": "c" * 64},
+        "manifest": {
+            "participant": {
+                "server_name": server,
+                "component": component,
+                "participant_name": manifest_name or name,
+            },
+            "relative_path": f"resources/{name}/manifest.json",
+            "manifest_digest": "c" * 64,
+        },
+    }
+
+
+def test_commit_result_rejects_manifest_for_another_participant() -> None:
+    with pytest.raises(ValidationError, match="manifest identity does not match"):
+        GymCheckpointCommitResult.model_validate(
+            {
+                "checkpoint_id": "snap",
+                "participants": [
+                    _commit_participant(
+                        "tools",
+                        "resources_servers",
+                        "tools",
+                        manifest_name="other",
+                    )
+                ],
+            }
+        )
+
+
+def test_commit_result_rejects_duplicate_participants() -> None:
+    item = _commit_participant("tools", "resources_servers", "tools")
+
+    with pytest.raises(ValidationError, match="duplicate participants"):
+        GymCheckpointCommitResult.model_validate(
+            {"checkpoint_id": "snap", "participants": [item, item]}
+        )
