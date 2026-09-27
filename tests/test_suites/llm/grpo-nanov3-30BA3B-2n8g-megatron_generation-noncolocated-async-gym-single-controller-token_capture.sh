@@ -5,12 +5,14 @@ source $SCRIPT_DIR/common.env
 # ===== BEGIN CONFIG =====
 NUM_NODES=2
 GPUS_PER_NODE=8
-STEPS_PER_RUN=8
-MAX_STEPS=8
+STEPS_PER_RUN=3
+MAX_STEPS=3
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-# Same budget as the legacy sibling: ~25 min startup (30B-MoE load + CUDA-graph
-# warmup + nemo_gym servers) plus ~130 min for 8 steps.
-NUM_MINUTES=180
+# Shorter than the legacy sibling (8 steps / 180 min) so the nightly suite stays
+# under its 4720 GPU-hour cap: ~25 min startup (30B-MoE load + CUDA-graph
+# warmup + nemo_gym servers) plus ~16 min/step. Three steps still cover a
+# refit with requests in flight and a checkpoint save through the finalizer.
+NUM_MINUTES=82  # 2n x 8g x 82 min = 21 GPU-hours
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
@@ -53,7 +55,7 @@ uv run examples/run_grpo_single_controller.py \
     logger.tensorboard_enabled=True \
     checkpointing.enabled=True \
     checkpointing.checkpoint_dir=$CKPT_DIR \
-    checkpointing.save_period=8 \
+    checkpointing.save_period=3 \
     data.train.data_path=$TRAIN_PATH \
     data.validation.data_path=$VALIDATION_PATH \
     $@ \
