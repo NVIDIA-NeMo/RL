@@ -35,6 +35,7 @@ from nemo_rl.algorithms.advantage_estimator import (
 from nemo_rl.algorithms.grpo import (
     RewardPenaltyConfig,
     RewardScalingConfig,
+    _apply_message_level_advantage_penalties,
     _raise_if_reward_penalties_enabled_without_nemo_gym,
     _should_use_async_rollouts,
     _should_use_nemo_gym,
@@ -226,6 +227,13 @@ class PPOConfig(TypedDict):
     # Nullable sequence-level multiplicative probability-error threshold.
     # None logs metrics without masking; values above the threshold are excluded.
     seq_logprob_error_threshold: float | None
+    # Optional NeMo-Gym message-level advantage overrides (same semantics as
+    # grpo.invalid_tool_call_advantage / grpo.malformed_thinking_advantage): after
+    # GAE, the advantage span of every assistant message flagged as an invalid
+    # tool call / malformed thinking is overwritten with this value. Critic
+    # returns are unaffected.
+    invalid_tool_call_advantage: NotRequired[float | None]
+    malformed_thinking_advantage: NotRequired[float | None]
     # Asynchronous PPO uses a replay buffer with non-colocated generation.
     async_ppo: NotRequired[AsyncPPOConfig]
 
@@ -1024,6 +1032,15 @@ def setup(
     _raise_if_reward_penalties_enabled_without_nemo_gym(
         master_config, enable_nemo_gym=enable_nemo_gym
     )
+    invalid_adv, malformed_adv = _resolve_ppo_message_level_advantage_penalties(
+        master_config
+    )
+    if invalid_adv is not None or malformed_adv is not None:
+        print(
+            "  ✓ Message-level advantage overrides: "
+            f"invalid_tool_call={invalid_adv}, malformed_thinking={malformed_adv}",
+            flush=True,
+        )
     if enable_nemo_gym:
         assert backend == "vllm", (
             f"NeMo-Gym requires the vLLM generation backend; got {backend!r}."
@@ -1294,6 +1311,48 @@ def _create_advantage_estimator(master_config: MasterConfig):
         )
 
     return adv_estimator
+
+
+def _resolve_ppo_message_level_advantage_penalties(
+    master_config: "MasterConfig",
+) -> tuple[Optional[float], Optional[float]]:
+    """Return PPO message-level advantage overrides and validate their support."""
+    ppo_config = master_config.ppo
+    invalid_tool_call_advantage = ppo_config.get("invalid_tool_call_advantage")
+    malformed_thinking_advantage = ppo_config.get("malformed_thinking_advantage")
+    if invalid_tool_call_advantage is None and malformed_thinking_advantage is None:
+        return None, None
+    if not _should_use_nemo_gym(master_config):
+        raise ValueError(
+            "ppo.invalid_tool_call_advantage / ppo.malformed_thinking_advantage "
+            "require the NeMo-Gym path (env.should_use_nemo_gym=true)."
+        )
+    if ppo_config["adv_estimator"].get("cross_trajectory"):
+        raise ValueError(
+            "ppo.invalid_tool_call_advantage / ppo.malformed_thinking_advantage "
+            "are not supported with adv_estimator.cross_trajectory."
+        )
+    return invalid_tool_call_advantage, malformed_thinking_advantage
+
+
+def _apply_ppo_message_level_advantage_penalties(
+    train_data: BatchedDataDict,
+    message_logs: list,
+    master_config: "MasterConfig",
+) -> dict[str, float]:
+    """Overwrite flagged assistant-message advantage spans after GAE."""
+    invalid_adv, malformed_adv = _resolve_ppo_message_level_advantage_penalties(
+        master_config
+    )
+    if invalid_adv is None and malformed_adv is None:
+        return {}
+    penalty_metrics = _apply_message_level_advantage_penalties(
+        train_data=train_data,
+        message_logs=message_logs,
+        invalid_tool_call_advantage=invalid_adv,
+        malformed_thinking_advantage=malformed_adv,
+    )
+    return {f"advantage_penalty/{k}": v for k, v in (penalty_metrics or {}).items()}
 
 
 def _compute_critic_metrics(value_results: dict[str, Any]) -> dict[str, Any]:
@@ -1918,6 +1977,13 @@ def ppo_train(
                     train_data["advantages"] = advantages
                     if returns is not None:
                         train_data["returns"] = returns
+                    metrics.update(
+                        _apply_ppo_message_level_advantage_penalties(
+                            train_data,
+                            repeated_batch["message_log"],
+                            master_config,
+                        )
+                    )
 
                 metrics.update(
                     _compute_rollout_critic_metrics(train_data, advantage_mask)
@@ -3078,6 +3144,13 @@ def async_ppo_train(
                     train_data["advantages"] = advantages
                     if returns is not None:
                         train_data["returns"] = returns
+                    metrics.update(
+                        _apply_ppo_message_level_advantage_penalties(
+                            train_data,
+                            repeated_batch["message_log"],
+                            master_config,
+                        )
+                    )
 
                 metrics.update(
                     _compute_rollout_critic_metrics(train_data, advantage_mask)
