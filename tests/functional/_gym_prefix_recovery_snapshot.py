@@ -80,7 +80,7 @@ def _participant_manifest(snapshot: Path, participant: dict[str, Any]) -> Path:
 
 
 def _checkpoint_shard_name(snapshot: Path, manifest_path: Path) -> str:
-    relative = manifest_path.relative_to(snapshot)
+    relative = manifest_path.resolve().relative_to(snapshot.resolve())
     if len(relative.parts) < 3 or relative.parts[0] != "gym-shards":
         raise AssertionError(
             f"shard-local Gym artifact is not under gym-shards/<name>: {relative}"
@@ -280,7 +280,14 @@ def _agent_records(snapshot: Path, participant: dict[str, Any]) -> list[dict[str
         raise AssertionError(
             "prefix recovery requires the archive-only Gym agent checkpoint schema"
         )
-    indexed = _read_artifact(snapshot, manifest["record_index"])
+    manifest_relative = manifest_path.relative_to(snapshot.resolve())
+    commit_root = snapshot.resolve()
+    if (
+        len(manifest_relative.parts) >= 3
+        and manifest_relative.parts[0] == "gym-shards"
+    ):
+        commit_root = commit_root.joinpath(*manifest_relative.parts[:2])
+    indexed = _read_artifact(commit_root, manifest["record_index"])
     archives = manifest.get("archives")
     if not isinstance(archives, list):
         raise TypeError("agent checkpoint archives must be a list")
