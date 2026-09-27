@@ -63,9 +63,12 @@ A ready-to-edit exemplar lives at `research/gdpo/configs/gdpo_llada_8b.yaml`, an
 runnable recipe at
 `research/gdpo/configs/recipes/llm/gdpo-llada-8b-instruct-1n8g-fsdp2tp1.yaml`:
 
+Like the other research projects, GDPO runs from its own directory, and
+relative paths in the configs are resolved from there:
+
 ```sh
-uv run research/gdpo/gdpo.py \
-    --config research/gdpo/configs/recipes/llm/gdpo-llada-8b-instruct-1n8g-fsdp2tp1.yaml
+cd research/gdpo
+uv run gdpo.py --config configs/recipes/llm/gdpo-llada-8b-instruct-1n8g-fsdp2tp1.yaml
 ```
 
 ### Cost

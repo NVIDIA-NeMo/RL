@@ -130,6 +130,12 @@ policy:
       diffusion_steps: 128
       cfg_scale: 0.0
 
+data:
+  default:
+    # GDPO runs from research/gdpo, and prompt paths resolve from the working
+    # directory, so point back at the repository's shared prompts.
+    prompt_file: "../../examples/prompts/cot.txt"
+
 cluster:
   gpus_per_node: 8
   num_nodes: 1
