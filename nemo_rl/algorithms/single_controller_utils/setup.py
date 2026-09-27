@@ -1085,11 +1085,11 @@ def setup_single_controller(
     data_plane_checkpointing_supported = data_plane_supports_checkpointing(dp_config)
     rollout_checkpoint_cfg = master_config.rollout_checkpointing
     if (
-        rollout_checkpoint_cfg.gym.capability_discovery_enabled
+        rollout_checkpoint_cfg.gym.mode != "disabled"
         and not should_use_nemo_gym(master_config)
     ):
         raise ValueError(
-            "rollout_checkpointing.gym.capability_discovery_enabled=true "
+            f"rollout_checkpointing.gym.mode={rollout_checkpoint_cfg.gym.mode!r} "
             "requires the NeMo-Gym rollout path "
             "(env.should_use_nemo_gym=true)"
         )
@@ -1795,7 +1795,7 @@ def setup_single_controller(
 
     setup_timing_metrics.generation_init_time_s = gen_reserve_time + gen_load_time
 
-    if rollout_checkpoint_cfg.gym.capability_discovery_enabled:
+    if rollout_checkpoint_cfg.gym.mode != "disabled":
         gym_actor = sole_nemo_gym_checkpoint_actor(env_handles["nemo_gym"])
         discovered = ray.get(gym_actor.discover_checkpoint_capabilities.remote())
         GymCheckpointTopology.model_validate(discovered)

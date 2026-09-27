@@ -741,9 +741,13 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
 
 
 class GymRolloutCheckpointConfig(BaseModel, extra="forbid"):
-    """Opt-in discovery of the experimental NeMo-Gym checkpoint protocol."""
+    """Configure the experimental NeMo-Gym checkpoint protocol.
 
-    capability_discovery_enabled: bool = False
+    ``disabled`` skips protocol discovery. ``discover`` validates and
+    fingerprints the Gym checkpoint topology without saving participant state.
+    """
+
+    mode: Literal["disabled", "discover"] = "disabled"
 
 
 class RolloutCheckpointConfig(BaseModel, extra="forbid"):
@@ -1277,7 +1281,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         )
     _validate_algo_settings(master_config)
 
-    if master_config.rollout_checkpointing.gym.capability_discovery_enabled:
+    if master_config.rollout_checkpointing.gym.mode != "disabled":
         nemo_gym_config = master_config.env.get("nemo_gym", {})
         shard_plan = parse_shard_plan(nemo_gym_config)
         gym_actor_count = (
@@ -1290,7 +1294,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 "Gym participant checkpointing currently supports exactly one "
                 f"NeMo-Gym actor, but env.nemo_gym.shards configures "
                 f"{gym_actor_count}. Configure one shard with replicas=1, or "
-                "disable rollout_checkpointing.gym.capability_discovery_enabled."
+                "set rollout_checkpointing.gym.mode='disabled'."
             )
 
     async_config = master_config.async_rl
