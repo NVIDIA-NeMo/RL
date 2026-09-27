@@ -84,3 +84,43 @@ def test_validation():
         _resolve_ppo_message_level_advantage_penalties(_config(invalid=-5.0, gym=False))
     with pytest.raises(ValueError, match="cross_trajectory"):
         _resolve_ppo_message_level_advantage_penalties(_config(invalid=-5.0, cross=True))
+
+
+def _config_empty(empty=-5.0, invalid=None, exempt=("finish",)):
+    cfg = _config(invalid=invalid)
+    cfg.ppo["empty_tool_call_advantage"] = empty
+    cfg.ppo["empty_tool_call_exempt_tools"] = list(exempt)
+    return cfg
+
+
+def test_empty_tool_call_override_skips_exempt_and_invalid():
+    message_logs = [
+        [
+            _msg("user", 2),
+            _msg("assistant", 2, is_empty_tool_call=True, tool_call_name="think"),
+            _msg("assistant", 2, is_empty_tool_call=True, tool_call_name="finish"),
+            _msg(
+                "assistant",
+                2,
+                is_empty_tool_call=True,
+                is_invalid_tool_call=True,
+                tool_call_name="str_replace_editor",
+            ),
+            _msg("assistant", 1, tool_call_name="execute_bash"),
+        ]
+    ]
+    data = BatchedDataDict({"advantages": torch.full((1, 9), 0.5)})
+    metrics = _apply_ppo_message_level_advantage_penalties(
+        data, message_logs, _config_empty(empty=-4.0, invalid=-5.0)
+    )
+    expected = torch.tensor([[0.5, 0.5, -4.0, -4.0, 0.5, 0.5, -5.0, -5.0, 0.5]])
+    torch.testing.assert_close(data["advantages"], expected)
+    assert metrics["advantage_penalty/num_empty_tool_calls"] == 1
+    assert metrics["advantage_penalty/num_invalid_tool_calls"] == 1
+
+
+def test_empty_only_config_is_validated():
+    cfg = _config_empty(empty=-5.0)
+    cfg.env["should_use_nemo_gym"] = False
+    with pytest.raises(ValueError, match="NeMo-Gym"):
+        _resolve_ppo_message_level_advantage_penalties(cfg)

@@ -234,6 +234,11 @@ class PPOConfig(TypedDict):
     # returns are unaffected.
     invalid_tool_call_advantage: NotRequired[float | None]
     malformed_thinking_advantage: NotRequired[float | None]
+    # Same override for structured tool calls with empty ``{}`` arguments that the
+    # runtime still accepts (e.g. ``think``), which ``invalid_tool_call_advantage``
+    # does not cover. Tools in ``empty_tool_call_exempt_tools`` are skipped.
+    empty_tool_call_advantage: NotRequired[float | None]
+    empty_tool_call_exempt_tools: NotRequired[list[str]]
     # Asynchronous PPO uses a replay buffer with non-colocated generation.
     async_ppo: NotRequired[AsyncPPOConfig]
 
@@ -1035,10 +1040,16 @@ def setup(
     invalid_adv, malformed_adv = _resolve_ppo_message_level_advantage_penalties(
         master_config
     )
-    if invalid_adv is not None or malformed_adv is not None:
+    if (
+        invalid_adv is not None
+        or malformed_adv is not None
+        or master_config.ppo.get("empty_tool_call_advantage") is not None
+    ):
         print(
             "  ✓ Message-level advantage overrides: "
-            f"invalid_tool_call={invalid_adv}, malformed_thinking={malformed_adv}",
+            f"invalid_tool_call={invalid_adv}, malformed_thinking={malformed_adv}, "
+            f"empty_tool_call={master_config.ppo.get('empty_tool_call_advantage')} "
+            f"(exempt={master_config.ppo.get('empty_tool_call_exempt_tools', ['finish'])})",
             flush=True,
         )
     if enable_nemo_gym:
@@ -1320,17 +1331,24 @@ def _resolve_ppo_message_level_advantage_penalties(
     ppo_config = master_config.ppo
     invalid_tool_call_advantage = ppo_config.get("invalid_tool_call_advantage")
     malformed_thinking_advantage = ppo_config.get("malformed_thinking_advantage")
-    if invalid_tool_call_advantage is None and malformed_thinking_advantage is None:
+    empty_tool_call_advantage = ppo_config.get("empty_tool_call_advantage")
+    if (
+        invalid_tool_call_advantage is None
+        and malformed_thinking_advantage is None
+        and empty_tool_call_advantage is None
+    ):
         return None, None
     if not _should_use_nemo_gym(master_config):
         raise ValueError(
-            "ppo.invalid_tool_call_advantage / ppo.malformed_thinking_advantage "
-            "require the NeMo-Gym path (env.should_use_nemo_gym=true)."
+            "ppo.invalid_tool_call_advantage / ppo.malformed_thinking_advantage / "
+            "ppo.empty_tool_call_advantage require the NeMo-Gym path "
+            "(env.should_use_nemo_gym=true)."
         )
     if ppo_config["adv_estimator"].get("cross_trajectory"):
         raise ValueError(
-            "ppo.invalid_tool_call_advantage / ppo.malformed_thinking_advantage "
-            "are not supported with adv_estimator.cross_trajectory."
+            "ppo.invalid_tool_call_advantage / ppo.malformed_thinking_advantage / "
+            "ppo.empty_tool_call_advantage are not supported with "
+            "adv_estimator.cross_trajectory."
         )
     return invalid_tool_call_advantage, malformed_thinking_advantage
 
@@ -1344,15 +1362,73 @@ def _apply_ppo_message_level_advantage_penalties(
     invalid_adv, malformed_adv = _resolve_ppo_message_level_advantage_penalties(
         master_config
     )
-    if invalid_adv is None and malformed_adv is None:
-        return {}
-    penalty_metrics = _apply_message_level_advantage_penalties(
-        train_data=train_data,
-        message_logs=message_logs,
-        invalid_tool_call_advantage=invalid_adv,
-        malformed_thinking_advantage=malformed_adv,
+    penalty_metrics: dict[str, float] = {}
+    if invalid_adv is not None or malformed_adv is not None:
+        penalty_metrics.update(
+            _apply_message_level_advantage_penalties(
+                train_data=train_data,
+                message_logs=message_logs,
+                invalid_tool_call_advantage=invalid_adv,
+                malformed_thinking_advantage=malformed_adv,
+            )
+            or {}
+        )
+    empty_adv = master_config.ppo.get("empty_tool_call_advantage")
+    if empty_adv is not None:
+        penalty_metrics.update(
+            _apply_empty_tool_call_advantage(
+                train_data,
+                message_logs,
+                empty_adv,
+                exempt_tools=set(
+                    master_config.ppo.get("empty_tool_call_exempt_tools", ["finish"])
+                ),
+                skip_invalid=invalid_adv is not None,
+            )
+        )
+    return {f"advantage_penalty/{k}": v for k, v in penalty_metrics.items()}
+
+
+def _apply_empty_tool_call_advantage(
+    train_data: BatchedDataDict,
+    message_logs: list,
+    empty_adv: float,
+    exempt_tools: set[str],
+    skip_invalid: bool,
+) -> dict[str, float]:
+    """Overwrite advantages of accepted-but-empty structured tool calls.
+
+    Messages already overwritten by ``invalid_tool_call_advantage`` are skipped
+    so the invalid-call value keeps precedence.
+    """
+    advantages = train_data["advantages"]
+    materialized = False
+    num_empty = num_assistant = 0
+    for i, message_log in enumerate(message_logs):
+        token_offset = 0
+        for message in message_log:
+            msg_len = len(message["token_ids"])
+            if message["role"] == "assistant" and "generation_logprobs" in message:
+                num_assistant += 1
+                if (
+                    message.get("is_empty_tool_call", False)
+                    and message.get("tool_call_name") not in exempt_tools
+                    and not (skip_invalid and message.get("is_invalid_tool_call", False))
+                ):
+                    if not materialized:
+                        # Advantages may be a zero-stride expanded view.
+                        advantages = advantages.contiguous().clone()
+                        train_data["advantages"] = advantages
+                        materialized = True
+                    advantages[i, token_offset : token_offset + msg_len] = empty_adv
+                    num_empty += 1
+            token_offset += msg_len
+    rate = num_empty / max(num_assistant, 1)
+    print(
+        f"Empty tool call advantage override: {rate:.4f} ({num_empty}/{num_assistant})",
+        flush=True,
     )
-    return {f"advantage_penalty/{k}": v for k, v in (penalty_metrics or {}).items()}
+    return {"empty_tool_call_rate": rate, "num_empty_tool_calls": num_empty}
 
 
 def _compute_critic_metrics(value_results: dict[str, Any]) -> dict[str, Any]:

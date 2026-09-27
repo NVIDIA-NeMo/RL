@@ -579,6 +579,13 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                     else False
                 ),
                 "tool_call_payload_chars": tool_call_payload_chars,
+                # Tool name of a structured call, used to exempt tools that are
+                # legitimately called without arguments (e.g. ``finish``).
+                "tool_call_name": (
+                    output_item_dict.get("name")
+                    if output_item_dict.get("type") == "function_call"
+                    else None
+                ),
                 "has_malformed_thinking": has_malformed_thinking,
             }
             if routed_experts is not None:
