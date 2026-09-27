@@ -2641,9 +2641,7 @@ class TestNativeTQRecoverySetup:
         second = MagicMock()
         first.restore_checkpoint.remote.side_effect = [restored, restored]
         second.restore_checkpoint.remote.side_effect = (
-            [restored, restored]
-            if generation_prefix_cuts_enabled
-            else [restored]
+            [restored, restored] if generation_prefix_cuts_enabled else [restored]
         )
         gym_shards = NemoGymShardSet(
             handles={"first": [first], "second": [second]},
@@ -2669,10 +2667,13 @@ class TestNativeTQRecoverySetup:
         assert sum(call.args[-1] == ["responses_api_models"] for call in calls) == (
             expected_model_restores
         )
-        assert sum(
-            call.args[-1] == ["responses_api_agents", "resources_servers"]
-            for call in calls
-        ) == 2
+        assert (
+            sum(
+                call.args[-1] == ["responses_api_agents", "resources_servers"]
+                for call in calls
+            )
+            == 2
+        )
 
     def test_sharded_gym_restore_rejects_wrong_model_operation_id(
         self, tmp_path: Path

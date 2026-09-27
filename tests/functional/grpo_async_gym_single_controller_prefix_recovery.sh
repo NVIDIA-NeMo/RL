@@ -40,10 +40,14 @@ if [[ "$PROFILE" == "workplace" ]]; then
     DEFAULT_MIN_GENERATION_TOKENS=1024
     DEFAULT_MAX_TOTAL_SEQUENCE_LENGTH=2048
 elif [[ "$PROFILE" == "sharded" ]]; then
-    # The sharded profile cuts a first model call, so it needs only a modest
-    # decode window to deterministically exercise the peer cut-index union.
-    DEFAULT_MIN_GENERATION_TOKENS=1024
-    DEFAULT_MAX_TOTAL_SEQUENCE_LENGTH=2048
+    # A two-shard checkpoint performs peer-fragment and leader-union commits.
+    # Give both Gym actors time to dispatch before the first cut, then keep the
+    # decode alive through the longer transaction so the published ledger
+    # contains an unfinished prefix rather than a pre-generation failure or a
+    # fully committed call.
+    DEFAULT_SNAPSHOT_INTERVAL_S=1
+    DEFAULT_MIN_GENERATION_TOKENS=4096
+    DEFAULT_MAX_TOTAL_SEQUENCE_LENGTH=8192
 fi
 SNAPSHOT_INTERVAL_S=${SC_GYM_PREFIX_RECOVERY_INTERVAL_S:-$DEFAULT_SNAPSHOT_INTERVAL_S}
 PHASE2_SNAPSHOT_INTERVAL_S=${SC_GYM_PREFIX_RECOVERY_PHASE2_INTERVAL_S:-600}

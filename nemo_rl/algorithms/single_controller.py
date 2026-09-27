@@ -2550,9 +2550,7 @@ class SingleControllerActor:
         model_restore_labels = {
             label
             for label, _actor in shard_set.model_restore_instances(
-                generation_prefix_cuts_enabled=(
-                    self._generation_prefix_cuts_enabled
-                )
+                generation_prefix_cuts_enabled=(self._generation_prefix_cuts_enabled)
             )
         }
         calls = []

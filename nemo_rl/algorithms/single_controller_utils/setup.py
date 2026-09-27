@@ -418,9 +418,7 @@ def _restore_sharded_gym_checkpoint(
     return GymCheckpointRestoreResult(
         checkpoint_id=restore_operation_id,
         participants=[
-            result
-            for restore in local_restores
-            for result in restore.participants
+            result for restore in local_restores for result in restore.participants
         ]
         + model_restore.participants,
     )
