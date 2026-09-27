@@ -1953,6 +1953,10 @@ def setup_single_controller(
                 router_replay_enabled=router_replay_enabled(policy_config),
                 defer_routed_experts_to_policy=token_capture_cfg.defer_routed_experts_to_policy,
                 max_seq_len=_generation_max_seq_len(generation_config),
+                train_all_paths=token_capture_cfg.train_all_paths,
+                train_dp_size=trainer.sharding_annotations.get_axis_size(
+                    "data_parallel"
+                ),
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,
         )

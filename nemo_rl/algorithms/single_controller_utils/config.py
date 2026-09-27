@@ -645,6 +645,8 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     defer_routed_experts_to_policy: bool = False
     # Fixed CPU finalizer pool size; actors are never automatically replaced.
     num_reassembler_workers: PositiveInt = 2
+    # Train every captured call chain (subagents, branches), not only the terminal one.
+    train_all_paths: bool = False
 
 
 @dataclass(frozen=True)
@@ -1351,6 +1353,14 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "non-default rollout_recovery policies require "
             "token_capture.enabled=true; without token capture, unfinished Gym "
             "siblings have no durable receipts to recover"
+        )
+    if token_capture_config.train_all_paths and (
+        not token_capture_config.enabled
+        or token_capture_config.defer_routed_experts_to_policy
+    ):
+        raise ValueError(
+            "token_capture.train_all_paths requires token_capture.enabled=true "
+            "and defer_routed_experts_to_policy=false"
         )
     if token_capture_config.defer_routed_experts_to_policy and not (
         token_capture_config.enabled
