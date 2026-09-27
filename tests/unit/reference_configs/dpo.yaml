@@ -30,6 +30,11 @@ checkpointing:
   save_period: 50
   checkpoint_must_save_by: null
   save_optimizer: true
+  ft_keep_latest_k: null
+  ft_save_period: null
+  pretrained_checkpoint: null
+  save_data_plane: false
+  load_replay_buffer: null
 
 policy:
   model_name: "meta-llama/Llama-3.2-1B-Instruct"
