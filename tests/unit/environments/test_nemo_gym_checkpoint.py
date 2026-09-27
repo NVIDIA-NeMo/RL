@@ -1283,6 +1283,115 @@ def test_completed_result_acknowledgement_accepts_new_and_idempotent_disposition
     ]
 
 
+def test_completed_result_acknowledgement_uses_bulk_capability() -> None:
+    env = _checkpoint_env()
+    capabilities = {
+        "policy": _capability(
+            "responses_api_models",
+            "policy",
+            admission_states=["accepting", "draining", "paused"],
+            concurrency_contract="stateless",
+            instance_role="policy",
+        ),
+        "agent-route": _capability(
+            "responses_api_agents",
+            "resolved-agent",
+            features=[
+                "completed_result_acknowledgement",
+                "completed_result_bulk_acknowledgement_v1",
+            ],
+        ),
+    }
+
+    async def discover_control(_method, _path, *, server_name, **_kwargs):
+        return capabilities[server_name]
+
+    env._control = AsyncMock(side_effect=discover_control)
+    asyncio.run(env.discover_checkpoint_capabilities(list(capabilities)))
+    receipts = [
+        _completion_receipt("group-7_g0", 0),
+        _completion_receipt("group-7_g1", 1),
+    ]
+
+    async def acknowledge_control(method, path, *, server_name, json, **_kwargs):
+        assert method == "POST"
+        assert path.endswith("/acknowledge-batch")
+        assert server_name == "agent-route"
+        assert json["receipts"] == receipts
+        return {
+            "accepted_count": 2,
+            "newly_acknowledged_count": 2,
+            "idempotent_count": 0,
+            "batch_digest": json["batch_digest"],
+        }
+
+    env._control = AsyncMock(side_effect=acknowledge_control)
+    result = asyncio.run(
+        env.acknowledge_completed_executions(
+            [
+                {"receipt": receipt, "agent_name": "resolved-agent"}
+                for receipt in receipts
+            ]
+        )
+    )
+
+    assert len(result["acknowledged"]) == 2
+
+
+def test_idempotent_bulk_ack_transport_retries_a_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = _checkpoint_env()
+    env._checkpoint_control_headers = {}
+    env._token_capture_control_headers = {}
+
+    class _Response:
+        status = 200
+
+        async def json(self):
+            return {
+                "accepted_count": 1,
+                "newly_acknowledged_count": 1,
+                "idempotent_count": 0,
+                "batch_digest": "1" * 64,
+            }
+
+    client = type("Client", (), {})()
+    client.request = AsyncMock(side_effect=[asyncio.TimeoutError(), _Response()])
+    env._server_client = client
+
+    async def controlled_sleep(delay: float) -> None:
+        if delay >= 10.0:
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        "nemo_rl.environments.nemo_gym.asyncio.sleep",
+        controlled_sleep,
+    )
+
+    payload = asyncio.run(
+        env._control(
+            "POST",
+            "/ng-control/v1/agent-checkpoint/acknowledge-batch",
+            server_name="agent-route",
+            timeout_s=0.01,
+            json={"receipts": [], "batch_digest": "1" * 64},
+        )
+    )
+
+    assert payload == {
+        "accepted_count": 1,
+        "newly_acknowledged_count": 1,
+        "idempotent_count": 0,
+        "batch_digest": "1" * 64,
+    }
+    assert client.request.await_count == 2
+    assert all(
+        call.kwargs["traffic_class"] == "control"
+        for call in client.request.await_args_list
+    )
+
+
 @pytest.mark.parametrize(
     ("acknowledged", "idempotent"),
     [(False, False), (True, True)],

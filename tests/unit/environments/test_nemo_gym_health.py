@@ -61,7 +61,7 @@ class _FakeRunHelper:
 class _TaskSourceResolvingRolloutHelper:
     """Mimic Gym's synchronous task_source-to-agent_ref resolution."""
 
-    def run_examples(
+    def run_examples_with_metadata(
         self, examples: list[dict[str, Any]], head_server_config: str
     ) -> list[Any]:
         assert head_server_config == "head-server"
@@ -75,13 +75,13 @@ class _TaskSourceResolvingRolloutHelper:
 
 
 class _TaskSourceResolvingRolloutHelperWithResult(_TaskSourceResolvingRolloutHelper):
-    def run_examples(
+    def run_examples_with_metadata(
         self, examples: list[dict[str, Any]], head_server_config: str
     ) -> list[Any]:
-        super().run_examples(examples, head_server_config)
+        super().run_examples_with_metadata(examples, head_server_config)
 
         async def completed(example):
-            return example, {}
+            return example, {}, {}
 
         return [completed(example) for example in examples]
 
