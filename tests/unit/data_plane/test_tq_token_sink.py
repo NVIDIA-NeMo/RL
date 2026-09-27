@@ -428,7 +428,12 @@ def test_backend_capture_glue_reproduces_the_gym_worked_example(
             weight_versions=(version, version + int(refit_mid_request)),
         )
 
-    coord_fields = set(receipt.manifest[0].model_fields) - {"mode", "response_id"}
+    # The manifest row also carries attribution-only fields (response_id,
+    # admitted_at, the fingerprints) that commit coords never report, so
+    # compare on the fields both models share.
+    coord_fields = set(receipt.manifest[0].model_fields) & set(
+        nemo_gym.CommitCoords.model_fields
+    )
     assert [c["disposition"] for c in coords] == ["staged", "staged"]
     assert [{name: c[name] for name in coord_fields} for c in coords] == [
         manifest.model_dump(include=coord_fields) for manifest in receipt.manifest
