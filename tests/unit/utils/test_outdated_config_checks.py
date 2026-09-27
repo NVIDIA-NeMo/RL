@@ -101,60 +101,58 @@ def test_every_entrypoint_checks_outdated_config(entrypoint):
 
 
 # ============================================================================
-# reject_outdated_dtensor_v2_key
+# reject_outdated_dtensor_cfg_key
 # ============================================================================
 
 
-def test_absent_key_passes():
-    check_outdated_config({"policy": {"dtensor_cfg": {"enabled": True}}})
-
-
-@pytest.mark.parametrize("value", [True, False])
-def test_outdated_dtensor_v2_key_is_rejected(value):
-    with pytest.raises(ValueError, match=r"policy\.dtensor_cfg\._v2"):
-        check_outdated_config({"policy": {"dtensor_cfg": {"_v2": value}}})
-
-
 @pytest.mark.parametrize("section", ["policy", "value", "teacher"])
-def test_each_top_level_section_is_checked(section):
-    with pytest.raises(ValueError, match=rf"{section}\.dtensor_cfg\._v2"):
-        check_outdated_config({section: {"dtensor_cfg": {"_v2": True}}})
+def test_outdated_dtensor_cfg_key_is_rejected(section):
+    with pytest.raises(ValueError, match=rf"{section}\.dtensor_cfg has been renamed"):
+        check_outdated_config({section: {"dtensor_cfg": {"enabled": True}}})
 
 
-def test_each_teacher_is_checked():
-    with pytest.raises(ValueError, match=r"teachers\.1\.dtensor_cfg\._v2"):
+def test_each_teacher_dtensor_cfg_key_is_rejected():
+    with pytest.raises(ValueError, match=r"teachers\.1\.dtensor_cfg has been renamed"):
         check_outdated_config(
-            {"teachers": [{"dtensor_cfg": {}}, {"dtensor_cfg": {"_v2": False}}]}
+            {"teachers": [{"automodel_cfg": {}}, {"dtensor_cfg": {"enabled": True}}]}
         )
 
 
-def test_megatron_block_is_skipped():
-    """A Megatron run's dtensor_cfg is inert, so a stale _v2 there is not its problem."""
+def test_renamed_key_passes():
+    check_outdated_config({"policy": {"automodel_cfg": {"enabled": True}}})
+
+
+def test_megatron_block_keeps_its_dtensor_cfg():
+    """A Megatron run's block is inert, so the old name there is not its problem."""
     check_outdated_config(
         {
             "policy": {
                 "megatron_cfg": {"enabled": True},
-                "dtensor_cfg": {"enabled": False, "_v2": False},
+                "dtensor_cfg": {"enabled": False},
             }
         }
     )
 
 
 def test_megatron_disabled_still_checks():
-    with pytest.raises(ValueError, match=r"policy\.dtensor_cfg\._v2"):
+    with pytest.raises(ValueError, match=r"policy\.dtensor_cfg has been renamed"):
         check_outdated_config(
             {
                 "policy": {
                     "megatron_cfg": {"enabled": False},
-                    "dtensor_cfg": {"enabled": True, "_v2": True},
+                    "dtensor_cfg": {"enabled": True},
                 }
             }
         )
 
 
 def test_reward_model_env_is_checked():
-    with pytest.raises(ValueError, match=r"env\.reward_model\.dtensor_cfg\._v2"):
-        check_outdated_config({"env": {"reward_model": {"dtensor_cfg": {"_v2": True}}}})
+    with pytest.raises(
+        ValueError, match=r"env\.reward_model\.dtensor_cfg has been renamed"
+    ):
+        check_outdated_config(
+            {"env": {"reward_model": {"dtensor_cfg": {"enabled": True}}}}
+        )
 
 
 # ============================================================================
