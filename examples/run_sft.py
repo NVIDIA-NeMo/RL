@@ -218,9 +218,9 @@ def main(is_vlm: bool = False):
 
     config.logger.log_dir = get_next_experiment_dir(config.logger.log_dir)
     print(f"📊 Using log directory: {config.logger.log_dir}")
-    if config.checkpointing["enabled"]:
+    if config.checkpointing.enabled:
         print(
-            f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
+            f"📊 Using checkpoint directory: {config.checkpointing.checkpoint_dir}"
         )
 
     # Initialise telemetry on the driver BEFORE init_ray() so the resolved
