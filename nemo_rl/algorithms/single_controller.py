@@ -414,8 +414,8 @@ class SingleControllerActor:
         self._dp_client = actor_args.dp_client
         if master_config.data_plane["backend"] == "mooncake_cpu":
             if actor_args.last_checkpoint_path is not None or (
-                master_config.checkpointing["enabled"]
-                and master_config.checkpointing.get("save_data_plane")
+                master_config.checkpointing.enabled
+                and master_config.checkpointing.save_data_plane
             ):
                 checkpoint_workers = list(
                     actor_args.trainer_handle.worker_group.workers
