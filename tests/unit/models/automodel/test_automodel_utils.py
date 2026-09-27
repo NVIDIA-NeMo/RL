@@ -13,6 +13,11 @@
 # limitations under the License.
 import pytest
 
+try:
+    import nemo_automodel  # noqa: F401
+except ImportError:
+    pytest.skip("nemo_automodel not available", allow_module_level=True)
+
 from nemo_rl.models.automodel.utils import resolve_model_class
 
 
