@@ -64,10 +64,27 @@ def _clear_telemetry_env() -> None:
 
 
 def _reset_rl_telemetry() -> None:
+    import nemo_rl.telemetry.metrics as metrics_mod
     import nemo_rl.telemetry.setup as setup_mod
 
     setup_mod._TELEMETRY_HANDLE = None
     setup_mod._TELEMETRY_INITIALISED = False
+
+    # The lens metric registry is process-global, so a group declared by one
+    # test would otherwise satisfy the next test's registration guard and hide
+    # a regression in it.
+    metrics_mod._REGISTERED = False
+    # Also the failure memo, which is what makes a failure permanent: a test
+    # that forces registration to fail would otherwise disable the tee for
+    # every test after it in the session.
+    metrics_mod._REGISTRATION_FAILED = False
+    metrics_mod._WARNED.clear()
+    try:
+        from nemo.lens.instruments import unregister_metric_group
+
+        unregister_metric_group(metrics_mod.RL_METRIC_GROUP)
+    except Exception:
+        pass
 
 
 def _reset_otel_and_lens() -> None:

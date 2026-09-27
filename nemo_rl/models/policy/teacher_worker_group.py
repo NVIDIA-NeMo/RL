@@ -43,6 +43,7 @@ from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.models.policy.interfaces import ReferenceLogprobOutputSpec
+from nemo_rl.telemetry.instrumentation import trace_context_kwargs
 
 
 @dataclass
@@ -365,6 +366,7 @@ class TeacherWorkerGroup:
                 "opd_full_payload_field": self._opd_full_payload_field,
                 "opd_full_teacher_index": self.teacher_index,
                 "opd_full_teacher_index_field": self._opd_full_teacher_index_field,
+                **trace_context_kwargs(),
             },
         )
         self.worker_group.get_all_worker_results(futures)

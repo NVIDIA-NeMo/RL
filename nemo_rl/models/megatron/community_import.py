@@ -12,13 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
 import os
 import shutil
 import threading
 import uuid
 from collections.abc import Iterator
-from contextlib import contextmanager
 from typing import Any, Callable, Optional
 
 import torch
@@ -134,55 +132,6 @@ def publish_megatron_conversion(
             kwargs={"ignore_errors": True},
             daemon=True,
         ).start()
-
-
-@contextmanager
-def _prefer_nvrx_for_dist_ckpt_save():
-    """Prefer NVRx async strategy for torch_dist save in HF->Megatron import.
-
-    Megatron-LM's torch_dist sync save currently routes through the MCore async
-    finalize path, which can fail when write results contain non-picklable
-    objects (e.g., code objects) during gather_object.
-
-    Newer Megatron-LM pins (NVIDIA/Megatron-LM#7052 and later) dropped the MCore
-    async writer: ``async_save`` no longer takes ``async_strategy`` and the sync
-    save uses PyTorch's writer directly, so this is a no-op there.
-    """
-    try:
-        from megatron.core.dist_checkpointing.strategies.torch import (
-            TorchDistSaveShardedStrategy,
-        )
-    except ImportError:
-        # If dist-checkpoint strategy cannot be imported, leave behavior unchanged.
-        yield
-        return
-
-    if (
-        "async_strategy"
-        not in inspect.signature(TorchDistSaveShardedStrategy.async_save).parameters
-    ):
-        # Without an MCore async writer there is nothing to prefer NVRx over.
-        yield
-        return
-
-    original_save = TorchDistSaveShardedStrategy.save
-
-    def _save_with_nvrx_fallback(self, sharded_state_dict, checkpoint_dir):
-        try:
-            async_request = self.async_save(
-                sharded_state_dict, checkpoint_dir, async_strategy="nvrx"
-            )
-            async_request.execute_sync()
-            del async_request
-        except (ImportError, ModuleNotFoundError):
-            # Keep backward compatibility on environments without nvrx.
-            original_save(self, sharded_state_dict, checkpoint_dir)
-
-    TorchDistSaveShardedStrategy.save = _save_with_nvrx_fallback
-    try:
-        yield
-    finally:
-        TorchDistSaveShardedStrategy.save = original_save
 
 
 def import_model_from_hf_name(
@@ -332,8 +281,7 @@ def import_model_from_hf_name(
         output_parent, f".{os.path.basename(output_path)}.staging-{staging_token}"
     )
 
-    with _prefer_nvrx_for_dist_ckpt_save():
-        bridge.save_megatron_model(megatron_model, staging_path)
+    bridge.save_megatron_model(megatron_model, staging_path)
 
     # Every rank must finish writing before rank 0 publishes the staging dir,
     # and no rank may read output_path before the rename lands.
