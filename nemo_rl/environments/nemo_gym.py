@@ -20,7 +20,7 @@ import sys
 import threading
 import time
 from collections import Counter
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator, Iterable, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -403,7 +403,7 @@ def _normalized_model_base_urls(
     configured = model_config.get("base_url")
     if isinstance(configured, str):
         urls = (configured,)
-    elif isinstance(configured, Mapping):
+    elif isinstance(configured, Mapping) or not isinstance(configured, Iterable):
         return frozenset()
     else:
         try:
@@ -3131,6 +3131,8 @@ def _iter_dataset_agent_names(dataset: Any) -> set[str]:
 
     # AllTaskProcessedDataset wraps the raw rows; a plain sequence is also fine.
     rows = getattr(dataset, "dataset", dataset)
+    if rows is None:
+        raise TypeError("dataset rows must be iterable, got None")
 
     names: set[str] = set()
     for row in rows:
