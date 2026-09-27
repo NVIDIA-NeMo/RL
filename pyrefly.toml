@@ -71,6 +71,8 @@ project-includes = [
   "nemo_rl/algorithms/single_controller_utils/utils.py",
   "nemo_rl/algorithms/utils.py",
   "nemo_rl/algorithms/x_token/__init__.py",
+  "nemo_rl/algorithms/x_token/mopd.py",
+  "nemo_rl/algorithms/x_token/mopd_teacher_scoring.py",
   "nemo_rl/algorithms/x_token/utils.py",
   "nemo_rl/data/__init__.py",
   "nemo_rl/data/chat_templates.py",

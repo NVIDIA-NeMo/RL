@@ -27,9 +27,9 @@ from typing import Any, Optional
 
 import numpy as np
 import ray
-from transformers import PreTrainedTokenizerBase
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.opd import TeacherResourceConfig
+from nemo_rl.algorithms.opd import CrossTokenizerMOPDConfig, TeacherResourceConfig
 from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta
 from nemo_rl.data_plane.column_io import round_up
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
@@ -60,6 +60,25 @@ class TeacherConfig:
     precision: str
     micro_batch_size: int
     megatron_cfg_overrides: dict[str, Any]
+    use_fused_linear_logprobs: bool = False
+    cross_tokenizer: CrossTokenizerMOPDConfig | None = None
+
+
+def _merge_resource_patch(
+    defaults: dict[str, Any],
+    override: dict[str, Any],
+) -> dict[str, Any]:
+    """Recursively apply a sparse per-alias teacher resource patch."""
+    merged = deepcopy(defaults)
+    for key, value in override.items():
+        default_value = merged.get(key)
+        if isinstance(default_value, dict) and isinstance(value, dict):
+            merged[key] = _merge_resource_patch(default_value, value)
+        else:
+            # In particular, an explicit ``cross_tokenizer: null`` opts this
+            # alias out of a cross-token default.
+            merged[key] = deepcopy(value)
+    return merged
 
 
 def create_teacher_configs_from_opd_config(
@@ -79,36 +98,49 @@ def create_teacher_configs_from_opd_config(
     deduplicate = bool(opd_cfg.get("deduplicate_shared_teacher_checkpoints", True))
 
     configs: list[TeacherConfig] = []
-    seen_models: set[str] = set()
+    primary_by_model: dict[str, TeacherConfig] = {}
 
     for alias, model_name in teacher_model_by_agent_name.items():
-        if deduplicate and model_name in seen_models:
-            continue
-        seen_models.add(model_name)
-
         # defaults <- per-alias override, then validated/typed by the schema.
-        merged = {**default_cfg, **dict(overrides.get(alias, {}))}
+        alias_override = dict(overrides.get(alias, {}))
+        merged = _merge_resource_patch(default_cfg, alias_override)
         res = TeacherResourceConfig(**merged)
 
         # Unknown top-level keys (extra="allow") fold into megatron_cfg_overrides;
         # explicit megatron_cfg_overrides take precedence.
         all_overrides = {**(res.model_extra or {}), **res.megatron_cfg_overrides}
 
-        configs.append(
-            TeacherConfig(
-                alias=alias,
-                model_name=model_name,
-                tensor_model_parallel_size=res.tensor_model_parallel_size,
-                pipeline_model_parallel_size=res.pipeline_model_parallel_size,
-                context_parallel_size=res.context_parallel_size,
-                expert_model_parallel_size=res.expert_model_parallel_size,
-                num_nodes=res.num_nodes,
-                gpus_per_node=res.gpus_per_node,
-                precision=res.precision,
-                micro_batch_size=res.micro_batch_size,
-                megatron_cfg_overrides=all_overrides,
-            )
+        resolved = TeacherConfig(
+            alias=alias,
+            model_name=model_name,
+            tensor_model_parallel_size=res.tensor_model_parallel_size,
+            pipeline_model_parallel_size=res.pipeline_model_parallel_size,
+            context_parallel_size=res.context_parallel_size,
+            expert_model_parallel_size=res.expert_model_parallel_size,
+            num_nodes=res.num_nodes,
+            gpus_per_node=res.gpus_per_node,
+            precision=res.precision,
+            micro_batch_size=res.micro_batch_size,
+            use_fused_linear_logprobs=res.use_fused_linear_logprobs,
+            megatron_cfg_overrides=all_overrides,
+            cross_tokenizer=res.cross_tokenizer,
         )
+
+        primary = primary_by_model.get(model_name)
+        if deduplicate and primary is not None:
+            primary_resource = replace(primary, alias=alias)
+            if primary_resource != resolved:
+                raise ValueError(
+                    "Teacher aliases sharing checkpoint "
+                    f"{model_name!r} resolve to different resources: "
+                    f"{primary.alias!r} and {alias!r}. Make their complete "
+                    "resource, tokenizer, alignment, fused-logprob, and masking "
+                    "settings identical or disable checkpoint deduplication."
+                )
+            continue
+
+        configs.append(resolved)
+        primary_by_model.setdefault(model_name, resolved)
 
     return configs
 
@@ -133,6 +165,24 @@ class TeacherWorkerGroup:
         self.alias = teacher_cfg.alias
         self.model_name = teacher_cfg.model_name
         self.teacher_cfg = teacher_cfg
+        self.cross_tokenizer = teacher_cfg.cross_tokenizer
+
+        # Same-token teachers keep the already-constructed policy tokenizer.
+        # Cross-token teachers load a distinct model-worker tokenizer from the
+        # resolved teacher config. The collector separately constructs its own
+        # plain-HF preprocessing tokenizer for offsets and chat rendering.
+        if self.cross_tokenizer is None:
+            self.teacher_tokenizer = tokenizer
+        else:
+            tokenizer_spec = self.cross_tokenizer.tokenizer
+            tokenizer_kwargs = dict(tokenizer_spec.tokenizer_kwargs)
+            tokenizer_kwargs.setdefault("trust_remote_code", True)
+            self.teacher_tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_spec.name,
+                **tokenizer_kwargs,
+            )
+            if self.teacher_tokenizer.pad_token_id is None:
+                self.teacher_tokenizer.pad_token = self.teacher_tokenizer.eos_token
 
         # Build a policy config for inference-only use.
         cfg = deepcopy(policy_config)
@@ -151,6 +201,10 @@ class TeacherWorkerGroup:
         cfg["megatron_cfg"]["expert_model_parallel_size"] = (
             teacher_cfg.expert_model_parallel_size
         )
+        cfg["megatron_cfg"]["use_fused_linear_logprobs"] = (
+            teacher_cfg.use_fused_linear_logprobs
+        )
+        cfg["megatron_cfg"].setdefault("use_fused_weighted_squared_relu", False)
 
         # Apply any additional megatron config overrides from teacher config.
         for key, value in teacher_cfg.megatron_cfg_overrides.items():
@@ -218,7 +272,7 @@ class TeacherWorkerGroup:
         worker_builder = RayWorkerBuilder(
             "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker",
             cfg,
-            tokenizer=tokenizer,
+            tokenizer=self.teacher_tokenizer,
             processor=None,
             init_optimizer=False,
             weights_path=None,

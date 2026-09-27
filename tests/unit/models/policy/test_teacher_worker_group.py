@@ -36,6 +36,55 @@ def test_teacher_resource_config_defaults():
     assert res.pipeline_model_parallel_size == 1
     assert res.gpus_per_node == 8
     assert res.precision == "bf16"
+    assert res.use_fused_linear_logprobs is False
+    assert res.cross_tokenizer is None
+
+
+def test_teacher_resource_config_accepts_strict_nested_cross_tokenizer():
+    from nemo_rl.algorithms.opd import TeacherResourceConfig
+
+    resource = TeacherResourceConfig(
+        cross_tokenizer={
+            "tokenizer": {
+                "name": "teacher-tokenizer",
+                "chat_template": "default",
+                "chat_template_kwargs": {"enable_thinking": True},
+                "tokenizer_kwargs": {"trust_remote_code": False},
+            },
+            "alignment_method": "offset_cluster_decode_fix",
+            "mask_first_teacher_prefix_chunk": True,
+            "exclude_proven_template_only_teacher_tokens": True,
+            "missing_think_close_policy": "preserve_open_if_proven",
+        }
+    )
+
+    assert resource.cross_tokenizer is not None
+    assert resource.cross_tokenizer.tokenizer.name == "teacher-tokenizer"
+    assert resource.cross_tokenizer.mask_first_teacher_prefix_chunk is True
+    assert resource.cross_tokenizer.exclude_proven_template_only_teacher_tokens is True
+    assert (
+        resource.cross_tokenizer.missing_think_close_policy == "preserve_open_if_proven"
+    )
+
+
+@pytest.mark.parametrize(
+    "legacy_key", ["tokenizer_name", "alignment_method", "chunk_size"]
+)
+def test_teacher_resource_config_rejects_legacy_cross_tokenizer_keys(legacy_key):
+    from nemo_rl.algorithms.opd import TeacherResourceConfig
+
+    with pytest.raises(ValueError, match="Legacy flat cross-token MOPD key"):
+        TeacherResourceConfig(**{legacy_key: "legacy"})
+
+
+def test_cross_tokenizer_config_rejects_unknown_fields():
+    from nemo_rl.algorithms.opd import CrossTokenizerMOPDConfig
+
+    with pytest.raises(ValueError, match="extra_forbidden"):
+        CrossTokenizerMOPDConfig(
+            tokenizer={"name": "teacher-tokenizer"},
+            chunk_size=64,
+        )
 
 
 def test_create_teacher_configs_homogeneous():
@@ -73,6 +122,83 @@ def test_create_teacher_configs_heterogeneous_override():
     assert code_cfg.tensor_model_parallel_size == 8
 
 
+def test_create_teacher_configs_sparse_override_keeps_cross_tokenizer_defaults():
+    from nemo_rl.models.policy.teacher_worker_group import (
+        create_teacher_configs_from_opd_config,
+    )
+
+    configs = create_teacher_configs_from_opd_config(
+        {
+            "teacher_model_by_agent_name": {"math": "/math", "code": "/code"},
+            "non_colocated_teachers": {
+                "default_teacher_cfg": {
+                    "tensor_model_parallel_size": 4,
+                    "use_fused_linear_logprobs": True,
+                    "cross_tokenizer": {
+                        "tokenizer": {"name": "teacher-tokenizer"},
+                        "mask_first_teacher_prefix_chunk": True,
+                    },
+                },
+                "teacher_overrides": {"code": {"tensor_model_parallel_size": 8}},
+            },
+        }
+    )
+
+    code_cfg = next(config for config in configs if config.alias == "code")
+    assert code_cfg.tensor_model_parallel_size == 8
+    assert code_cfg.use_fused_linear_logprobs is True
+    assert code_cfg.cross_tokenizer is not None
+    assert code_cfg.cross_tokenizer.tokenizer.name == "teacher-tokenizer"
+    assert code_cfg.cross_tokenizer.mask_first_teacher_prefix_chunk is True
+
+
+def test_cross_tokenizer_overrides_deep_merge_and_explicit_null_opts_out():
+    from types import SimpleNamespace
+
+    from nemo_rl.algorithms.opd import OnPolicyDistillationConfig, _opd_cfg
+    from nemo_rl.models.policy.teacher_worker_group import (
+        create_teacher_configs_from_opd_config,
+    )
+
+    validated = OnPolicyDistillationConfig(
+        enabled=True,
+        teacher_model_by_agent_name={
+            "default": "/default",
+            "masked": "/masked",
+            "same_token": "/same-token",
+        },
+        non_colocated_teachers={
+            "enabled": True,
+            "default_teacher_cfg": {
+                "cross_tokenizer": {
+                    "tokenizer": {"name": "teacher-tokenizer"},
+                    "exclude_proven_template_only_teacher_tokens": True,
+                }
+            },
+            "teacher_overrides": {
+                "masked": {
+                    "cross_tokenizer": {"mask_first_teacher_prefix_chunk": True}
+                },
+                "same_token": {"cross_tokenizer": None},
+            },
+        },
+    )
+
+    configs = create_teacher_configs_from_opd_config(
+        _opd_cfg(SimpleNamespace(on_policy_distillation=validated))
+    )
+    by_alias = {config.alias: config for config in configs}
+
+    assert by_alias["same_token"].cross_tokenizer is None
+    assert by_alias["masked"].cross_tokenizer is not None
+    assert by_alias["masked"].cross_tokenizer.tokenizer.name == "teacher-tokenizer"
+    assert by_alias["masked"].cross_tokenizer.mask_first_teacher_prefix_chunk is True
+    assert (
+        by_alias["masked"].cross_tokenizer.exclude_proven_template_only_teacher_tokens
+        is True
+    )
+
+
 def test_create_teacher_configs_deduplicates():
     from nemo_rl.models.policy.teacher_worker_group import (
         create_teacher_configs_from_opd_config,
@@ -92,6 +218,82 @@ def test_create_teacher_configs_deduplicates():
         }
     )
     assert len(configs) == 2
+
+
+def test_teacher_dedup_compares_resolved_tokenizer_defaults():
+    from nemo_rl.models.policy.teacher_worker_group import (
+        create_teacher_configs_from_opd_config,
+    )
+
+    configs = create_teacher_configs_from_opd_config(
+        {
+            "teacher_model_by_agent_name": {
+                "implicit": "/shared",
+                "explicit": "/shared",
+            },
+            "deduplicate_shared_teacher_checkpoints": True,
+            "non_colocated_teachers": {
+                "default_teacher_cfg": {
+                    "cross_tokenizer": {"tokenizer": {"name": "teacher-tokenizer"}}
+                },
+                "teacher_overrides": {
+                    "explicit": {
+                        "cross_tokenizer": {
+                            "tokenizer": {
+                                "tokenizer_kwargs": {"trust_remote_code": True}
+                            }
+                        }
+                    }
+                },
+            },
+        }
+    )
+
+    assert [config.alias for config in configs] == ["implicit"]
+
+
+def test_create_teacher_configs_rejects_conflicting_shared_checkpoint_resources():
+    from nemo_rl.models.policy.teacher_worker_group import (
+        create_teacher_configs_from_opd_config,
+    )
+
+    with pytest.raises(ValueError, match="resolve to different resources"):
+        create_teacher_configs_from_opd_config(
+            {
+                "teacher_model_by_agent_name": {
+                    "math": "/shared",
+                    "code": "/shared",
+                },
+                "deduplicate_shared_teacher_checkpoints": True,
+                "non_colocated_teachers": {
+                    "default_teacher_cfg": {"tensor_model_parallel_size": 2},
+                    "teacher_overrides": {"code": {"use_fused_linear_logprobs": True}},
+                },
+            }
+        )
+
+
+def test_create_teacher_configs_can_keep_shared_checkpoint_aliases_independent():
+    from nemo_rl.models.policy.teacher_worker_group import (
+        create_teacher_configs_from_opd_config,
+    )
+
+    configs = create_teacher_configs_from_opd_config(
+        {
+            "teacher_model_by_agent_name": {
+                "math": "/shared",
+                "code": "/shared",
+            },
+            "deduplicate_shared_teacher_checkpoints": False,
+            "non_colocated_teachers": {
+                "default_teacher_cfg": {"tensor_model_parallel_size": 2},
+                "teacher_overrides": {"code": {"use_fused_linear_logprobs": True}},
+            },
+        }
+    )
+
+    assert [config.alias for config in configs] == ["math", "code"]
+    assert [config.use_fused_linear_logprobs for config in configs] == [False, True]
 
 
 def test_teacher_worker_group_disables_student_router_replay(monkeypatch):
@@ -147,8 +349,86 @@ def test_teacher_worker_group_disables_student_router_replay(monkeypatch):
     )
 
     assert captured["cfg"]["router_replay"]["enabled"] is False
+    assert captured["cfg"]["megatron_cfg"]["use_fused_linear_logprobs"] is False
+    assert captured["cfg"]["megatron_cfg"]["use_fused_weighted_squared_relu"] is False
     assert teacher.cfg["router_replay"]["enabled"] is False
     assert policy_config["router_replay"]["enabled"] is True
+
+
+def test_teacher_worker_group_constructs_independent_cross_tokenizer(monkeypatch):
+    import nemo_rl.distributed.worker_groups as worker_groups
+    import nemo_rl.models.policy.teacher_worker_group as teacher_worker_group
+    from nemo_rl.algorithms.opd import CrossTokenizerMOPDConfig
+    from nemo_rl.models.policy.teacher_worker_group import (
+        TeacherConfig,
+        TeacherWorkerGroup,
+    )
+
+    captured = {}
+    teacher_tokenizer = MagicMock()
+    teacher_tokenizer.pad_token_id = None
+    teacher_tokenizer.eos_token = "<eos>"
+
+    def fake_from_pretrained(name, **kwargs):
+        captured["tokenizer_load"] = (name, kwargs)
+        return teacher_tokenizer
+
+    class FakeWorkerBuilder:
+        def __init__(self, worker_path, cfg, **kwargs):
+            del worker_path, cfg
+            captured["worker_tokenizer"] = kwargs["tokenizer"]
+
+    class FakeWorkerGroup:
+        def __init__(self, cluster, worker_builder, **kwargs):
+            del cluster, worker_builder, kwargs
+
+    monkeypatch.setattr(
+        teacher_worker_group.AutoTokenizer, "from_pretrained", fake_from_pretrained
+    )
+    monkeypatch.setattr(worker_groups, "RayWorkerBuilder", FakeWorkerBuilder)
+    monkeypatch.setattr(worker_groups, "RayWorkerGroup", FakeWorkerGroup)
+
+    cluster = MagicMock()
+    cluster.world_size.return_value = 1
+    student_tokenizer = MagicMock()
+    teacher = TeacherWorkerGroup(
+        TeacherConfig(
+            alias="teacher",
+            model_name="/ckpt/teacher",
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=1,
+            expert_model_parallel_size=1,
+            num_nodes=1,
+            gpus_per_node=1,
+            precision="bf16",
+            micro_batch_size=1,
+            megatron_cfg_overrides={},
+            cross_tokenizer=CrossTokenizerMOPDConfig(
+                tokenizer={
+                    "name": "teacher-tokenizer",
+                    "tokenizer_kwargs": {"revision": "stable"},
+                }
+            ),
+        ),
+        cluster,
+        {
+            "model_name": "/ckpt/student",
+            "megatron_cfg": {"enabled": True},
+            "dtensor_cfg": {"enabled": False},
+            "sequence_packing": {"enabled": False},
+            "dynamic_batching": {"enabled": False},
+        },
+        student_tokenizer,
+    )
+
+    assert captured["tokenizer_load"] == (
+        "teacher-tokenizer",
+        {"revision": "stable", "trust_remote_code": True},
+    )
+    assert teacher.teacher_tokenizer is teacher_tokenizer
+    assert captured["worker_tokenizer"] is teacher_tokenizer
+    assert captured["worker_tokenizer"] is not student_tokenizer
 
 
 def test_teacher_worker_group_drops_the_student_pretrained_checkpoint(monkeypatch):

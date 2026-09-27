@@ -162,6 +162,35 @@ def test_record_to_train_batch_preserves_routed_experts_in_tq_payload() -> None:
     ]
 
 
+def test_record_to_train_batch_only_unmasks_final_generated_assistant() -> None:
+    completion = _completion(route_start=10, reward=1.0)
+    completion.message_log[1:1] = [
+        {
+            "role": "assistant",
+            "content": "tool call",
+            "token_ids": torch.tensor([15, 16]),
+            "generation_logprobs": torch.tensor([-0.3, -0.4]),
+            "routed_experts": _routes(12, 2),
+        },
+        {
+            "role": "tool",
+            "content": "tool result",
+            "token_ids": torch.tensor([17]),
+            "routed_experts": _fallback_routes(1),
+        },
+    ]
+
+    train_batch = record_to_train_batch(
+        _record([completion]),
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+        include_message_violation_fields=False,
+        only_unmask_final=True,
+    )
+
+    # user(2), earlier assistant(2), tool(1), final assistant(2), trailing user(1)
+    assert train_batch["token_mask"].tolist() == [[0, 0, 0, 0, 0, 1, 1, 0]]
+
+
 def test_record_to_train_batch_preserves_message_violation_masks() -> None:
     invalid = _completion(route_start=10, reward=1.0)
     invalid.message_log[1]["is_invalid_tool_call"] = True

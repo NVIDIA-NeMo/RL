@@ -212,8 +212,9 @@ def _stub_converter(
     *,
     pad_value_dict: Any,
     include_message_violation_fields: bool,
+    only_unmask_final: bool,
 ):
-    del record, pad_value_dict, include_message_violation_fields
+    del record, pad_value_dict, include_message_violation_fields, only_unmask_final
     return BatchedDataDict[Any](
         {
             "input_ids": torch.ones((ROLLOUTS_PER_GROUP, 3), dtype=torch.long),

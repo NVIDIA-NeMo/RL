@@ -1,12 +1,15 @@
 defaults: ../../grpo_math_1B.yaml
 grpo:
-  num_prompts_per_step: 8
-  num_generations_per_prompt: 4
+  num_prompts_per_step: 256
+  num_generations_per_prompt: 1
   max_num_steps: 5
   val_period: 1000
   overlong_filtering: true
+  advantage_clip_low: -50.0
+  advantage_clip_high: 50.0
   max_val_samples: null
-  val_batch_size: 32
+  invalid_tool_call_advantage: -5.0
+  malformed_thinking_advantage: -5.0
   async_grpo:
     enabled: true
   adv_estimator:
@@ -18,6 +21,7 @@ loss_fn:
   kl_output_clamp_value: null
   ratio_clip_max: 0.28
   use_on_policy_kl_approximation: true
+  force_on_policy_ratio: true
   disable_ppo_ratio: true
   use_importance_sampling_correction: true
   truncated_importance_sampling_ratio: 5.0
@@ -25,19 +29,22 @@ loss_fn:
   truncated_importance_sampling_type: icepop
 checkpointing:
   enabled: false
-  checkpoint_dir: results/mopd-qwen3-1.7b-3n8g-megatron-pack
+  checkpoint_dir: results/mopd-qwen3-1.7b-3n8g-megatron-pack-xtoken
   metric_name: val:total_reward/mean
   keep_top_k: 1
   save_period: 1000
   checkpoint_must_save_by: 00:03:40:00
   save_optimizer: false
 policy:
-  model_name: Qwen/Qwen3-1.7B
-  train_global_batch_size: 32
+  model_name: /path/to/student-checkpoint-at-pinned-revision
+  tokenizer:
+    name: /path/to/student-tokenizer-at-pinned-revision
+    use_fastokens: true
+  train_global_batch_size: 256
   train_micro_batch_size: 1
-  generation_batch_size: 64
+  generation_batch_size: 256
   logprob_batch_size: 1
-  max_total_sequence_length: 32768
+  max_total_sequence_length: 65536
   logprob_chunk_size: 2048
   dtensor_cfg:
     enabled: false
@@ -49,20 +56,20 @@ policy:
     sequence_parallel: true
     defer_fp32_logits: true
     optimizer:
-      lr: 3.0e-06
-      min_lr: 3.0e-06
+      lr: 1.0e-06
+      min_lr: 1.0e-06
       weight_decay: 0.0
     scheduler:
       lr_decay_iters: null
-      lr_warmup_iters: 10
-      lr_warmup_init: 3.0e-07
+      lr_warmup_iters: 0
+      lr_warmup_init: 1.0e-06
     distributed_data_parallel_config:
       average_in_collective: false
   make_sequence_length_divisible_by: 8
   optimizer: null
   scheduler: null
   generation:
-    max_new_tokens: 2048
+    max_new_tokens: 32768
     vllm_cfg:
       async_engine: true
       tensor_parallel_size: 2
@@ -80,10 +87,10 @@ policy:
 data:
   max_input_seq_length: null
   train:
-    data_path: "${oc.env:HF_HOME}/nanov3_data/train-split.jsonl"
+    data_path: /path/to/public-or-synthetic/train.jsonl
     dataset_name: NemoGymDataset
   validation:
-    data_path: "${oc.env:HF_HOME}/nanov3_data/val-split.jsonl"
+    data_path: /path/to/public-or-synthetic/validation.jsonl
     dataset_name: NemoGymDataset
   default:
     dataset_name: NemoGymDataset
@@ -117,19 +124,20 @@ logger:
   tensorboard_enabled: true
   wandb:
     project: mopd
-    name: mopd-qwen3-1.7b-3n8g-megatron-pack
+    name: mopd-qwen3-1.7b-3n8g-megatron-pack-xtoken
   mlflow:
     experiment_name: mopd
-    run_name: mopd-qwen3-1.7b-3n8g-megatron-pack
+    run_name: mopd-qwen3-1.7b-3n8g-megatron-pack-xtoken
 cluster:
   gpus_per_node: 8
   num_nodes: 3
 on_policy_distillation:
   enabled: true
-  # false trains on every rollout-generated assistant turn.
-  only_unmask_final: false
+  # Keep earlier assistant turns as context, but calculate MOPD KD only on the
+  # final rollout-generated assistant turn.
+  only_unmask_final: true
   teacher_model_by_agent_name:
-    default_teacher: Qwen/Qwen3-1.7B
+    default_teacher: /path/to/teacher-checkpoint-at-pinned-revision
   default_teacher_alias: default_teacher
   strict_agent_name_match: false
   deduplicate_shared_teacher_checkpoints: true
@@ -143,3 +151,15 @@ on_policy_distillation:
       gpus_per_node: 8
       precision: bf16
       micro_batch_size: 1
+      use_fused_linear_logprobs: false
+      cross_tokenizer:
+        tokenizer:
+          name: /path/to/teacher-tokenizer-at-pinned-revision
+          chat_template: default
+          chat_template_kwargs: {}
+          tokenizer_kwargs: {}
+        alignment_method: offset_cluster_decode_fix
+        mask_first_teacher_prefix_chunk: false
+        exclude_proven_template_only_teacher_tokens: true
+        missing_think_close_policy: preserve_open_if_proven
+    teacher_overrides: {}

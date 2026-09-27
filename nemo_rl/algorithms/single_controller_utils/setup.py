@@ -1841,6 +1841,7 @@ def setup_single_controller(
             algo_cfg.invalid_tool_call_advantage is not None
             or algo_cfg.malformed_thinking_advantage is not None
         ),
+        only_unmask_final=opd_module.should_only_unmask_final(master_config),
         require_routed_experts=router_replay_enabled(policy_config),
         staging_partition_id=(
             token_capture_cfg.staging_partition if token_capture_cfg.enabled else None

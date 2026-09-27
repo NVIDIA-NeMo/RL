@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import inspect
 
+import pytest
+
 
 def test_sync_utils_module_imports() -> None:
     """Catches FQN drift after the algorithms.sync_utils consolidation."""
@@ -122,7 +124,17 @@ def test_async_and_sync_actors_share_env_tier() -> None:
     )
 
 
-def test_sync_rollout_actor_prompt_extraction_and_masks_match_grpo() -> None:
+@pytest.mark.parametrize(
+    ("only_unmask_final", "expected_mask"),
+    [
+        (False, [0, 0, 0, 0, 0, 1, 1, 0, 1, 1, 0]),
+        (True, [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0]),
+    ],
+)
+def test_sync_rollout_actor_prompt_extraction_and_masks_match_grpo(
+    only_unmask_final: bool,
+    expected_mask: list[int],
+) -> None:
     """TQ rollouts must mirror GRPO's length-based prompt extraction."""
     import torch
 
@@ -141,10 +153,18 @@ def test_sync_rollout_actor_prompt_extraction_and_masks_match_grpo() -> None:
             {"role": "user", "content": "next", "token_ids": torch.tensor([5])},
             {
                 "role": "assistant",
-                "content": "generated",
+                "content": "tool call",
                 "token_ids": torch.tensor([6, 7]),
                 "generation_logprobs": torch.tensor([0.1, 0.2]),
             },
+            {"role": "tool", "content": "result", "token_ids": torch.tensor([8])},
+            {
+                "role": "assistant",
+                "content": "final",
+                "token_ids": torch.tensor([9, 10]),
+                "generation_logprobs": torch.tensor([0.3, 0.4]),
+            },
+            {"role": "tool", "content": "trailing", "token_ids": torch.tensor([11])},
         ]
     ]
 
@@ -153,14 +173,15 @@ def test_sync_rollout_actor_prompt_extraction_and_masks_match_grpo() -> None:
         torch.tensor([5]),
         pad_token_id=0,
         make_sequence_length_divisible_by=1,
+        only_unmask_final=only_unmask_final,
     )
 
     assert torch.equal(prompt_flat["token_ids"], torch.tensor([[1, 2, 3, 4, 5]]))
     assert torch.equal(
         flat["token_loss_mask"],
-        torch.tensor([[0, 0, 0, 0, 0, 1, 1]]),
+        torch.tensor([expected_mask]),
     )
     assert torch.allclose(
         flat["generation_logprobs"],
-        torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0, 0.1, 0.2]]),
+        torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0, 0.1, 0.2, 0.0, 0.3, 0.4, 0.0]]),
     )

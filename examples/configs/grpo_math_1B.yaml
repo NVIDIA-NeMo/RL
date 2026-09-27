@@ -41,6 +41,9 @@ grpo:
     normalize_rewards: ${grpo.normalize_rewards}
     use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
     minus_baseline: true  # Reinforce++-baseline specific: subtract per-prompt mean baseline
+    # OPD only: null disables TOP-D scalar proximal-reward shaping.
+    proximal_reward_alpha: null
+    proximal_reward_scale: 1.0
   reward_scaling:
     enabled: false
     source_min: 0.0

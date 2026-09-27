@@ -179,6 +179,7 @@ def _maybe_restore_async_replay_buffer_checkpoint(
     num_prompts_per_step: int,
     current_training_step: int,
     max_age_steps: int,
+    teacher_mask_mode: str | None = None,
 ) -> dict[str, Any] | None:
     """Restore async replay state unless the config explicitly opts out.
 
@@ -209,13 +210,15 @@ def _maybe_restore_async_replay_buffer_checkpoint(
         return None
 
     print(f"📦 Restoring replay buffer from checkpoint: {replay_buffer_path}")
+    restore_kwargs: dict[str, Any] = {
+        "num_prompts_per_step": num_prompts_per_step,
+        "current_training_step": current_training_step,
+        "max_age_steps": max_age_steps,
+    }
+    if teacher_mask_mode is not None:
+        restore_kwargs["teacher_mask_mode"] = teacher_mask_mode
     restore_metadata = ray.get(
-        replay_buffer.load_from_path.remote(
-            replay_buffer_path,
-            num_prompts_per_step=num_prompts_per_step,
-            current_training_step=current_training_step,
-            max_age_steps=max_age_steps,
-        )
+        replay_buffer.load_from_path.remote(replay_buffer_path, **restore_kwargs)
     )
     print("✅ Replay buffer restored from checkpoint")
     return restore_metadata
@@ -611,6 +614,8 @@ def setup(
             "silently train the sampled-token top-k objective instead of the "
             "full-vocabulary reverse KL."
         )
+    opd_module.validate_cross_tokenizer_mopd(master_config)
+    opd_module.preflight_cross_tokenizer_mopd(master_config)
 
     # Set seed for all random number generators
     set_seed(grpo_config.seed)
@@ -2105,13 +2110,19 @@ def extract_initial_prompt_messages(
 
 def add_grpo_token_loss_masks_and_generation_logprobs(
     message_logs: list[LLMMessageLogType | VLMMessageLogType],
+    *,
+    only_unmask_final: bool = False,
 ) -> None:
     """Add GRPO loss masks and ensure generation logprobs exist in message logs.
 
     Assistant messages can be part of the original multi-turn prompt history. Only
     generated assistant messages have generation_logprobs, so use that field as the
-    trainable-token marker. This function mutates each message in-place by adding a
+    trainable-token marker. When ``only_unmask_final`` is true, only the last such
+    assistant message in each sample is trainable; earlier generated turns remain
+    available as context. This function mutates each message in-place by adding a
     token_loss_mask and, when missing, a zero-valued generation_logprobs tensor.
+    The final generated assistant is selected before missing generation-logprob
+    fields are backfilled, so prompt history cannot become trainable accidentally.
     Router-replay routes get the same treatment via
     :func:`backfill_missing_routed_experts`, so every per-token field is defined
     for every tokenized message before the batch is flattened.
@@ -2120,14 +2131,35 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
         message_logs: Batch of tokenized message logs. Each message must contain a
             ``role`` and ``token_ids`` field. Messages that already contain
             ``generation_logprobs`` are treated as rollout-generated messages.
+        only_unmask_final: Whether to train only the final generated assistant
+            message in each message log. Defaults to False to train every
+            generated assistant message.
     """
     backfill_missing_routed_experts(message_logs)
     for message_log in message_logs:
-        for message in message_log:
+        final_generated_assistant_index = None
+        if only_unmask_final:
+            final_generated_assistant_index = next(
+                (
+                    message_index
+                    for message_index in range(len(message_log) - 1, -1, -1)
+                    if message_log[message_index]["role"] == "assistant"
+                    and "generation_logprobs" in message_log[message_index]
+                ),
+                None,
+            )
+
+        for message_index, message in enumerate(message_log):
             role = cast(str, message["role"])
             token_ids = cast(torch.Tensor, message["token_ids"])
 
-            if role == "assistant" and "generation_logprobs" in message:
+            is_generated_assistant = (
+                role == "assistant" and "generation_logprobs" in message
+            )
+            if is_generated_assistant and (
+                not only_unmask_final
+                or message_index == final_generated_assistant_index
+            ):
                 message["token_loss_mask"] = torch.ones_like(token_ids)
             else:
                 message["token_loss_mask"] = torch.zeros_like(token_ids)
@@ -2468,7 +2500,7 @@ def _create_advantage_estimator(master_config: MasterConfig):
         print("  ✓ Using GRPO advantage estimator")
     elif adv_estimator_name == "opd":
         opd_module.assert_prev_logprobs_available(master_config)
-        adv_estimator = OPDAdvantageEstimator({"name": "opd"}, loss_config)
+        adv_estimator = OPDAdvantageEstimator(adv_estimator_config, loss_config)
         print("  ✓ Using OPD advantage estimator")
         # Warn if loss_fn is not configured per MOPD paper recommendations.
         if not loss_config.disable_ppo_ratio:
@@ -3389,7 +3421,10 @@ def _grpo_train_impl(
                     metrics["num_mask_sample_filtered"] = num_mask_sample_filtered
 
                     add_grpo_token_loss_masks_and_generation_logprobs(
-                        repeated_batch["message_log"]
+                        repeated_batch["message_log"],
+                        only_unmask_final=opd_module.should_only_unmask_final(
+                            master_config
+                        ),
                     )
 
                     # Convert updated LLMMessageLogType to FlatMessagesType for training
@@ -4646,6 +4681,13 @@ def async_grpo_train(
             num_prompts_per_step=num_prompts_per_step,
             current_training_step=step,
             max_age_steps=max_trajectory_age_steps,
+            teacher_mask_mode=(
+                "cross_token"
+                if opd_module.is_cross_tokenizer_mopd_enabled(master_config)
+                else "same_token"
+                if opd_module.is_opd_enabled(master_config)
+                else None
+            ),
         )
 
         rollouts_path = os.path.join(last_checkpoint_path, "rollouts.pt")
@@ -5122,11 +5164,23 @@ def async_grpo_train(
                     # Teacher logprobs are stored in batch dict by collection-time
                     # computation and padded by from_batches. Extract here.
                     trajectory_teacher_logprobs = None
+                    trajectory_teacher_logprobs_mask = None
                     if opd_module.is_opd_enabled(master_config):
-                        if "teacher_reference_logprobs" in repeated_batch:
-                            trajectory_teacher_logprobs = repeated_batch[
-                                "teacher_reference_logprobs"
-                            ]
+                        has_score = "teacher_reference_logprobs" in repeated_batch
+                        has_mask = "teacher_reference_logprobs_mask" in repeated_batch
+                        if not has_score or not has_mask:
+                            raise RuntimeError(
+                                "Every MOPD replay batch must contain both "
+                                "teacher_reference_logprobs and "
+                                "teacher_reference_logprobs_mask; got "
+                                f"score={has_score}, mask={has_mask}."
+                            )
+                        trajectory_teacher_logprobs = repeated_batch[
+                            "teacher_reference_logprobs"
+                        ]
+                        trajectory_teacher_logprobs_mask = repeated_batch[
+                            "teacher_reference_logprobs_mask"
+                        ]
 
                     # Aggregate rollout metrics across groups with proper aggregation per metric type
                     per_group_metrics = {}
@@ -5225,7 +5279,10 @@ def async_grpo_train(
                     # Only unmask assistant messages that were actually generated (have generation_logprobs),
                     # not assistant messages that were part of the prompt history
                     add_grpo_token_loss_masks_and_generation_logprobs(
-                        repeated_batch["message_log"]
+                        repeated_batch["message_log"],
+                        only_unmask_final=opd_module.should_only_unmask_final(
+                            master_config
+                        ),
                     )
 
                     # Convert to flat format for training
@@ -5329,6 +5386,11 @@ def async_grpo_train(
                     trajectory_teacher_logprobs = _pad_teacher_logprobs(
                         trajectory_teacher_logprobs, train_data["input_ids"].shape[1]
                     )
+                if trajectory_teacher_logprobs_mask is not None:
+                    trajectory_teacher_logprobs_mask = _pad_teacher_logprobs(
+                        trajectory_teacher_logprobs_mask,
+                        train_data["input_ids"].shape[1],
+                    )
 
                 # Compute advantages with adv_estimator using correct mask and logprobs
                 with (
@@ -5357,6 +5419,11 @@ def async_grpo_train(
                             train_data["prev_logprobs"].device
                         )
                         if trajectory_teacher_logprobs is not None
+                        else None,
+                        teacher_logprobs_mask=trajectory_teacher_logprobs_mask.to(
+                            train_data["prev_logprobs"].device
+                        )
+                        if trajectory_teacher_logprobs_mask is not None
                         else None,
                         prev_logprobs=train_data["prev_logprobs"],
                         generation_logprobs=train_data["generation_logprobs"],
