@@ -481,8 +481,7 @@ def _tokenize_preformatted_message_log(
             raw_turns.append(content)
             continue
         if not isinstance(content, list) or any(
-            not isinstance(part, dict) or part.get("type") != "text"
-            for part in content
+            not isinstance(part, dict) or part.get("type") != "text" for part in content
         ):
             raise ValueError(
                 "skip_chat_template=True requires pre-rendered text-only turns."
@@ -535,10 +534,9 @@ def _tokenize_preformatted_message_log(
                 cumulative_lengths = []
                 break
             cumulative_lengths.append(token_index)
-        if (
-            len(cumulative_lengths) == len(boundary_offsets)
-            and cumulative_lengths[-1] == len(input_ids)
-        ):
+        if len(cumulative_lengths) == len(boundary_offsets) and cumulative_lengths[
+            -1
+        ] == len(input_ids):
             token_ids = torch.as_tensor(input_ids, dtype=torch.long)
     except (KeyError, NotImplementedError, TypeError, ValueError):
         pass
