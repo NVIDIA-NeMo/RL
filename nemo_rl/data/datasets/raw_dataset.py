@@ -80,4 +80,5 @@ class RawDataset:
                 "video_maintain_aspect_ratio"
             ),
             min_generation_tokens=self.data_config.get("min_generation_tokens"),
+            image_max_num_tiles=self.data_config.get("image_max_num_tiles"),
         )
