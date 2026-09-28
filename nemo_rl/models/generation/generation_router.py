@@ -199,7 +199,7 @@ class GenerationRouterImpl:
         return backend.removesuffix("/v1") + path_qs
 
     async def _handle(self, request: Any) -> Any:
-        from aiohttp import ClientError, web
+        from aiohttp import ClientConnectionResetError, ClientError, web
 
         self._requests_total += 1
         backend = self._pick_backend()
@@ -220,6 +220,25 @@ class GenerationRouterImpl:
         try:
             return await self._forward(request, backend)
         except (TimeoutError, ClientError) as error:
+            print(
+                "policy router: backend request failed "
+                f"method={request.method} path={request.rel_url.path_qs} "
+                f"backend={backend}: {type(error).__name__}: {error}",
+                flush=True,
+            )
+            if request.rel_url.path == "/v1/models" and isinstance(
+                error, ClientConnectionResetError
+            ):
+                # Gym uses this only as a startup probe and treats every HTTP status,
+                # including vLLM's expected 404, as "answering". In particular, its
+                # short client timeout can close the downstream connection while this
+                # streaming proxy is finishing that 404; aiohttp then raises a
+                # ClientConnectionResetError here even though vLLM answered. Do not let
+                # that transport race poison fleet health and evict a working shard.
+                return web.json_response(
+                    {"error": f"backend probe failed: {type(error).__name__}: {error}"},
+                    status=404,
+                )
             return self._on_backend_error(backend, error)
         finally:
             self._inflight[backend] = max(0, self._inflight.get(backend, 0) - 1)
@@ -245,6 +264,15 @@ class GenerationRouterImpl:
 
         self._backend_error_total += 1
         self._backend_failures[backend] = self._backend_failures.get(backend, 0) + 1
+        # The transport cause, logged here because nothing else keeps it. It goes into
+        # the response body, which is Gym's to interpret, and the ledger only ever sees
+        # the aggregated "N failed request(s)" summary -- so without this line a
+        # condemned shard's record cannot say whether it refused connections, reset them,
+        # or timed out, which are three different problems.
+        print(
+            f"policy router: backend {backend} failed: {type(error).__name__}: {error}",
+            flush=True,
+        )
         if self._health_managed:
             # Reflex: stop routing here until the next membership push re-adds it.
             # Rebound, not mutated -- same reason as set_serving_backends, and this runs

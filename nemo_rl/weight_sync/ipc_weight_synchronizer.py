@@ -19,13 +19,12 @@ backend using ZMQ IPC sockets and CUDA IPC handles. This is the primary
 transport for colocated vLLM deployments.
 
 Lifecycle per sync:
-  1. policy.sync_params_before_refit()   -- materialize optimizer updates
-  2. policy.offload_before_refit()       -- free GPU for weight staging
-  3. generation.prepare_for_generation(tags=["weights"])  -- allocate buffers
-  4. policy.stream_weights_via_ipc_zmq() -- send weights via ZMQ
+  1. policy.offload_before_refit()       -- free GPU for weight staging
+  2. generation.prepare_for_generation(tags=["weights"])  -- allocate buffers
+  3. policy.stream_weights_via_ipc_zmq() -- send weights via ZMQ
      generation.update_weights_via_ipc_zmq() -- receive weights
-  5. policy.offload_after_refit()        -- restore optimizer state
-  6. generation.prepare_for_generation(tags=["kv_cache"]) -- rebuild KV cache
+  4. policy.offload_after_refit()        -- restore optimizer state
+  5. generation.prepare_for_generation(tags=["kv_cache"]) -- rebuild KV cache
 """
 
 import os
@@ -70,7 +69,6 @@ class IPCWeightSynchronizer(WeightSynchronizer):
         timer: Optional[Timer] = None,
         kv_scales: Optional[dict[str, float]] = None,
     ) -> None:
-        self._policy.sync_params_before_refit()
         self._policy.offload_before_refit()
         self._generation.prepare_for_generation(tags=["weights"])
 

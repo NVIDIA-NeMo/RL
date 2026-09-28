@@ -37,6 +37,28 @@ from nemo_rl.utils.venvs import (
 )
 
 
+@ray.remote(num_cpus=0, num_gpus=0)
+def _log_gpu_state_on_bundle(label: str, local_rank: int) -> None:
+    """Read one bundle's GPU from the node that holds it. See log_worker_gpu_state.
+
+    Module level, not defined inside the method that dispatches it: a ``@ray.remote``
+    decorator in a function body registers a new remote function with the GCS every call.
+
+    ``num_gpus=0`` deliberately. The task is pinned to the bundle, not given the device --
+    asking for the GPU would queue behind whatever is still holding it, which is precisely
+    the state being measured.
+    """
+    import os
+
+    from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
+
+    # How the helper resolves which device to read when CUDA is not initialised.
+    os.environ.setdefault("LOCAL_RANK", str(local_rank))
+    log_gpu_memory_diagnostics(
+        label=label, worker_type="generation", device_id=local_rank
+    )
+
+
 def _get_initializer_env_vars(env_vars: dict[str, str]) -> dict[str, str]:
     """Build the environment needed to unpickle worker constructor arguments."""
     initializer_env_vars = {
@@ -370,6 +392,13 @@ class RayWorkerGroup:
         """
         self._workers: list[ray.actor.ActorHandle] = []
         self._worker_metadata: list[dict[str, Any]] = []
+        # worker_idx -> the arguments its creation call was made with, so a single
+        # worker can be rebuilt without redoing group-wide setup. Populated during
+        # creation; see _create_workers_from_bundle_indices.
+        self._worker_specs: dict[int, dict[str, Any]] = {}
+        # How many times each worker has been recreated. Only used to keep Ray actor
+        # names unique, since a dead actor's name can linger in the GCS.
+        self._worker_incarnations: dict[int, int] = {}
         self.cluster = cluster
         self.name_prefix = name_prefix
         self.sharding_annotations = sharding_annotations
@@ -619,6 +648,19 @@ class RayWorkerGroup:
 
                 # Store the future and metadata
                 worker_idx = len(worker_futures)
+                # Everything needed to build this exact worker again. Captured rather
+                # than re-derived, because re-deriving means reproducing the placement
+                # group, bundle, venv and rank bookkeeping above -- a second
+                # implementation that would drift from this one. Replaying the recorded
+                # call is the only way a restart is guaranteed to reproduce the original.
+                self._worker_specs[worker_idx] = {
+                    "pg_idx": pg_idx,
+                    "pg": pg,
+                    "bundle_idx": bundle_idx,
+                    "num_gpus": num_gpus,
+                    "worker_bundle_indices": worker_bundle_indices,
+                    "extra_options": extra_options,
+                }
                 worker_futures.append(worker_future)
                 worker_info.append(
                     {
@@ -685,6 +727,104 @@ class RayWorkerGroup:
                     "dp_shard_idx": info["group_idx"],
                 }
             )
+
+    def log_worker_gpu_state(
+        self, worker_idx: int, *, label: str, timeout_s: float = 30.0
+    ) -> None:
+        """Print the state of the GPU a worker's bundle holds, from that node.
+
+        For the moment *before* a restart: what is on the device decides whether the
+        attempt can succeed at all. The same reading is already taken inside the new
+        worker, at ``_load_model`` -- but that is too late to be a signal (the old actor is
+        already killed and the replacement is mid-``__init__``) and it does not happen at
+        all in the case that matters most, a bundle that never gets scheduled, because
+        ``_load_model`` is never reached.
+
+        Runs as a short-lived task pinned to the same bundle, because the caller is the
+        controller and reading NVML there would report the controller's node. Bounded and
+        non-raising for the same reason the diagnostic itself is: a probe that hangs or
+        fails the restart path is worse than no probe. Not reaching the node is itself the
+        finding, so it is printed rather than swallowed.
+        """
+        spec = self._worker_specs.get(worker_idx)
+        if spec is None:
+            print(
+                f"  [GPU_DIAG] {label}: no creation spec for worker {worker_idx}; "
+                "cannot locate its bundle",
+                flush=True,
+            )
+            return
+
+        try:
+            ref = _log_gpu_state_on_bundle.options(
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=spec["pg"],
+                    placement_group_bundle_index=spec["bundle_idx"],
+                )
+            ).remote(label, spec["bundle_idx"])
+            ray.get(ref, timeout=timeout_s)
+        except Exception as e:  # noqa: BLE001 - a diagnostic must never fail the caller
+            print(
+                f"  [GPU_DIAG] {label}: could not read the GPU on worker "
+                f"{worker_idx}'s bundle within {timeout_s}s "
+                f"({type(e).__name__}: {e}). The node may be gone, which is itself the "
+                "answer to whether a restart can succeed.",
+                flush=True,
+            )
+
+    def recreate_worker(self, worker_idx: int) -> ray.actor.ActorHandle:
+        """Rebuild one worker in place, replaying the call that created it.
+
+        Used to bring a dead generation shard back without disturbing the rest of the
+        fleet. The placement-group bundle the old actor held is still reserved -- Ray
+        does not release a bundle when an actor dies -- so the replacement lands on the
+        same GPU.
+
+        The old actor is killed first with ``no_restart=True``. It is usually already
+        dead, but a worker can be unresponsive rather than gone, and creating its
+        replacement while it still holds the GPU would fail on memory rather than on
+        anything informative.
+
+        Returns:
+            The new actor handle, also installed at ``workers[worker_idx]``.
+        """
+        if worker_idx not in self._worker_specs:
+            raise KeyError(
+                f"no creation spec recorded for worker {worker_idx}; "
+                f"known workers: {sorted(self._worker_specs)}"
+            )
+        spec = self._worker_specs[worker_idx]
+
+        old = self._workers[worker_idx]
+        if old is not None:
+            try:
+                ray.kill(old, no_restart=True)
+            except Exception as e:  # noqa: BLE001 - already-dead actors raise variously
+                print(
+                    f"  recreate_worker({worker_idx}): old actor not killable: {e}",
+                    flush=True,
+                )
+
+        # A fresh name each incarnation: Ray rejects a duplicate named actor, and the
+        # dead one's registration can outlive the process.
+        incarnation = self._worker_incarnations.get(worker_idx, 0) + 1
+        self._worker_incarnations[worker_idx] = incarnation
+        extra_options = dict(spec["extra_options"])
+        extra_options["name"] = f"{extra_options['name']}-r{incarnation}"
+
+        initializer = self._initializer_pool[spec["pg_idx"]]
+        worker = ray.get(
+            initializer.create_worker.remote(
+                spec["pg"],
+                spec["bundle_idx"],
+                spec["num_gpus"],
+                spec["worker_bundle_indices"],
+                num_gpus_per_node=self.cluster.num_gpus_per_node,
+                **extra_options,
+            )
+        )
+        self._workers[worker_idx] = worker
+        return worker
 
     @property
     def workers(self) -> list[ray.actor.ActorHandle]:
