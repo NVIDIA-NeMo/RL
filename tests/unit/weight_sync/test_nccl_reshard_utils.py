@@ -239,9 +239,7 @@ def test_check_nccl_reshard_refit_support_rejects_native_mxfp8_with_etp() -> Non
         }
     )
 
-    with pytest.raises(
-        ValueError, match="expert_tensor_parallel_size is not supported"
-    ):
+    with pytest.raises(ValueError, match="expert_tensor_parallel_size must be 1"):
         check_nccl_reshard_refit_support(config)
 
 
