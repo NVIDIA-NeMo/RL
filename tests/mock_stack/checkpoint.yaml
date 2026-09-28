@@ -1,0 +1,13 @@
+prompts:
+  - {id: P1, turns: 6, turn_seconds: [11, 11, 11]}
+  - {id: P2, turns: 2, turn_seconds: [8, 8, 8]}
+  - {id: P3, turns: 7, turn_seconds: [2, 7, 7]}
+  - {id: P4, turns: 2, turn_seconds: [3, 3, 3]}
+siblings_per_prompt: 3
+policy:
+  factory: tests.mock_stack.components:Policy
+  config: {train_seconds: 2}
+generation:
+  factory: tests.mock_stack.components:Generation
+refit:
+  factory: tests.mock_stack.components:CopyRefit
