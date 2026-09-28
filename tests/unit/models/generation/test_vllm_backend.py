@@ -439,6 +439,7 @@ def test_mixed_mxfp8_native_refit_processes_each_module_once(monkeypatch, transp
     ext._mtp_drafter_refit_enabled = lambda: False
     ext._maybe_process_mtp_drafter_after_loading = lambda: call_order.append("mtp")
     ext._maybe_process_fp8_kv_cache = MagicMock()
+    ext._get_mxfp8_linear_reload_roots = lambda: (mxfp8_qkv,)
 
     monkeypatch.setattr(
         vllm_backend,
@@ -504,10 +505,11 @@ def test_mixed_mxfp8_native_refit_processes_each_module_once(monkeypatch, transp
         "config_enter",
         ("initialize", first_bf16_moe),
         ("initialize", last_bf16_moe),
+        ("initialize", mxfp8_qkv),
         "transfer",
         ("finalize", model, model_config),
-        ("process_mxfp8", mxfp8_moe),
         ("process_mxfp8", mxfp8_qkv),
+        ("process_mxfp8", mxfp8_moe),
         ("hpc", model),
         "mtp",
         "config_exit",

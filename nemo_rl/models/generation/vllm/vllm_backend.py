@@ -1124,10 +1124,13 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
 
     def _uses_native_layerwise_refit(self, transport: WeightUpdateTransport) -> bool:
         """Return whether this transport needs vLLM's layerwise lifecycle."""
+        if transport not in ("ipc", "collective", "nccl_reshard"):
+            return False
         return (
-            transport in ("ipc", "collective", "nccl_reshard")
-            and self._uses_unquantized_flashinfer_trtllm()
-        ) or (transport in ("ipc", "collective") and self._uses_deepseek_v4_fp8_refit())
+            self._uses_unquantized_flashinfer_trtllm()
+            or self._uses_deepseek_v4_fp8_refit()
+            or bool(self._get_mxfp8_linear_reload_roots())
+        )
 
     def _uses_deepseek_v4_fp8_refit(self) -> bool:
         """Return whether the realized rollout model needs DSV4 FP8 reload hooks."""
@@ -1231,13 +1234,23 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             )
 
             model = self.model_runner.model
-            # DSV4 needs a full-model reload; BF16 TRTLLM reload stays scoped
-            # to its realized modules so mixed-model MXFP8 metadata survives.
-            reload_targets = (
-                [model]
-                if use_deepseek_v4_fp8
-                else _unquantized_flashinfer_trtllm_modules(model)
-            )
+            # DSV4 needs a full-model reload. Other mixed models reload the
+            # union of realized BF16 TRTLLM experts and native MXFP8 linears.
+            # Keeping one lifecycle prevents one target family from restoring
+            # checkpoint storage after the other has installed runtime layout.
+            if use_deepseek_v4_fp8:
+                reload_targets = [model]
+            else:
+                reload_targets = []
+                seen_target_ids: set[int] = set()
+                for target in (
+                    *_unquantized_flashinfer_trtllm_modules(model),
+                    *self._get_mxfp8_linear_reload_roots(),
+                ):
+                    if id(target) in seen_target_ids:
+                        continue
+                    seen_target_ids.add(id(target))
+                    reload_targets.append(target)
             reloaded_module_ids = _reload_target_module_ids(reload_targets)
             added_skip_tensors: Any = None
             if use_deepseek_v4_fp8:
