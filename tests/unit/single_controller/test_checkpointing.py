@@ -3851,6 +3851,101 @@ class TestDataPlaneCheckpoint:
         assert dp_client.clear_calls == [([obsolete_cut], staging_partition)]
         assert sorted(dp_client.sample_ids) == [current_cut, unrelated]
 
+    def test_successor_snapshot_keeps_restored_prefix_until_replacement_seals(self):
+        staging_partition = "rollout_staging"
+        restored_cut = "__generation_cut__/checkpoint-1/group_g0/call-1"
+        obsolete_cut = "__generation_cut__/checkpoint-0/obsolete/call-1"
+        terminal_key = "group_g0-a1/call-1"
+        dp_client = _StagingInventoryDPClient(
+            [restored_cut, obsolete_cut],
+            partition_id=staging_partition,
+        )
+        ledger = RolloutRecoveryLedger()
+        actor = object.__new__(_ACTOR_CLS)
+        actor._rollout_recovery_ledger = ledger
+        actor._restored_gym_checkpoint_continuations = (
+            GymCheckpointContinuation(
+                rollout_id="group_g0",
+                source_attempt_index=0,
+                capture_key="group_g0",
+                resource_state_revisions=(),
+                staging_keys=(restored_cut,),
+            ),
+        )
+        actor._restored_gym_checkpoint_staging_keys = {restored_cut}
+        actor._master_config = SimpleNamespace(
+            token_capture=SimpleNamespace(staging_partition=staging_partition)
+        )
+        actor._dp_client = dp_client
+        barrier = DataPlaneCheckpointBarrier()
+
+        async def exercise() -> None:
+            async with barrier.mutation() as cut:
+                group = ledger.reserve_group(
+                    cut,
+                    group_id="group",
+                    admission_id="batch",
+                    prompt_id="7",
+                    prompt_payload={"idx": 7, "message_log": []},
+                    expected_generations=1,
+                    target_step=0,
+                    start_weight_version=0,
+                    admitted=True,
+                )
+                ledger.mark_group_dispatched(cut, group.group_id)
+                ledger.prepare_for_restart(cut)
+                replacement = ledger.prepare_incomplete_retry(cut, group.group_id)
+                ledger.mark_group_dispatched(cut, replacement.group_id)
+
+                protected = actor._restored_generation_cut_keys_in_use(cut)
+                assert protected == {restored_cut}
+                await actor._validate_rollout_recovery_inventory(
+                    cut,
+                    replay_metadata=None,
+                    clear_unreferenced=False,
+                    clear_unreferenced_generation_cuts=True,
+                    protected_generation_cut_keys=protected,
+                )
+
+            assert dp_client.clear_calls == [([obsolete_cut], staging_partition)]
+            assert dp_client.sample_ids == [restored_cut]
+
+            dp_client.sample_ids.append(terminal_key)
+            async with barrier.mutation() as cut:
+                replacement = ledger.groups()[0]
+                gate_rollout_id = replacement.gate_rollout_id(0)
+                ledger.mark_sibling_sealed(
+                    cut,
+                    replacement.group_id,
+                    generation_index=0,
+                    gate_rollout_id=gate_rollout_id,
+                    receipt={
+                        "rollout_id": gate_rollout_id,
+                        "manifest": [{"staging_key": terminal_key}],
+                    },
+                    reward=1.0,
+                    mask_sample=False,
+                    resolved_agent_name="test-agent",
+                )
+
+                protected = actor._restored_generation_cut_keys_in_use(cut)
+                assert protected == set()
+                await actor._validate_rollout_recovery_inventory(
+                    cut,
+                    replay_metadata=None,
+                    clear_unreferenced=False,
+                    clear_unreferenced_generation_cuts=True,
+                    protected_generation_cut_keys=protected,
+                )
+
+            assert dp_client.clear_calls == [
+                ([obsolete_cut], staging_partition),
+                ([restored_cut], staging_partition),
+            ]
+            assert dp_client.sample_ids == [terminal_key]
+
+        asyncio.run(exercise())
+
     def test_gated_sampler_writes_authoritative_tq_checkpoint(self, tmp_path):
         mc = _actor_master_config(
             tmp_path,
