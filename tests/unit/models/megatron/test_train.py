@@ -40,6 +40,75 @@ from nemo_rl.algorithms.loss.interfaces import (
 pytestmark = pytest.mark.mcore
 
 
+def _run_local_mean_cp2_loss_post_processor(rank: int, world_size: int) -> None:
+    """Exercise the false-mode callback with a real two-rank CP group."""
+    assert world_size == 2
+
+    from megatron.core import parallel_state
+
+    from nemo_rl.algorithms.loss.loss_functions import NLLLossFn
+    from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+    from nemo_rl.models.megatron.train import LossPostProcessor
+
+    parallel_state.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=2,
+    )
+    try:
+        device = torch.device("cuda", torch.cuda.current_device())
+        data = BatchedDataDict(
+            {
+                # CP rank 0 owns target positions 0, 1, 6, and 7, all of
+                # which are masked. Rank 1 owns the four supervised targets.
+                "token_mask": torch.tensor(
+                    [[0, 0, 0, 1, 1, 1, 1, 0]], device=device
+                ),
+                "sample_mask": torch.ones(1, device=device),
+            }
+        )
+        gathered_logprobs = -torch.arange(
+            1, 8, device=device, dtype=torch.float32
+        ).view(1, 7)
+        gathered_logprobs.requires_grad_()
+        processor = LossPostProcessor(
+            loss_fn=NLLLossFn(),
+            cfg={
+                "sequence_packing": {"enabled": False},
+                "megatron_cfg": {"calculate_per_token_loss": False},
+            },
+            prepare_fn=lambda logits, data, **_: (
+                {"next_token_logprobs": logits},
+                data,
+            ),
+        )
+
+        loss_callback = processor(
+            data_dict=data,
+            global_valid_seqs=torch.tensor(1, device=device),
+            global_valid_toks=torch.tensor(4, device=device),
+        )
+        local_sum, local_token_count, metrics = loss_callback(gathered_logprobs)
+
+        expected_local_sum = torch.tensor(0.0 if rank == 0 else 18.0, device=device)
+        expected_local_token_count = 0 if rank == 0 else 4
+        torch.testing.assert_close(local_sum, expected_local_sum)
+        assert local_token_count.item() == expected_local_token_count
+        assert metrics["num_unmasked_tokens"] == 4
+        assert metrics["loss"].item() == pytest.approx(4.5)
+
+        # This is the local-count division performed by MCore. In particular,
+        # a CP rank with no supervised tokens must remain finite.
+        (local_sum / local_token_count.clamp(min=1)).backward()
+        assert torch.isfinite(gathered_logprobs.grad).all()
+        expected_gradient = torch.zeros_like(gathered_logprobs)
+        if rank == 1:
+            expected_gradient[:, 2:6] = -0.25
+        torch.testing.assert_close(gathered_logprobs.grad, expected_gradient)
+    finally:
+        parallel_state.destroy_model_parallel()
+
+
 class TestModelForward:
     """Tests for model_forward function."""
 
@@ -1681,6 +1750,13 @@ class TestLossPostProcessor:
             local_data["token_mask"], torch.tensor([[0, 1, 1, 1, 0]])
         )
 
+
+def test_local_mean_mode_cp2_uses_real_loss_callback(distributed_test_runner):
+    """False mode preserves CP-local MCore loss inputs and counts."""
+    distributed_test_runner(_run_local_mean_cp2_loss_post_processor, world_size=2)
+
+
+class TestLossPostProcessorPacking:
     @patch(
         "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0
     )
