@@ -314,6 +314,7 @@ from nemo_rl.models.megatron.config import (
     RuntimeConfig,
 )
 from nemo_rl.models.megatron.draft.training import resolve_draft_speculator
+from nemo_rl.models.megatron.prefix_tree import install_prefix_tree
 from nemo_rl.models.megatron.draft.utils import (
     find_draft_owner_chunk,
     get_attached_draft_model,
@@ -2538,6 +2539,9 @@ def setup_model_and_optimizer(
         pg_collection=pg_collection,
         wrap_with_ddp=load_optimizer,
     )
+    if policy_cfg["sequence_packing"].get("share_prefixes", False):
+        for model_chunk in model:
+            install_prefix_tree(model_chunk)
 
     if load_optimizer:
         optimizer, scheduler = setup_optimizer(
