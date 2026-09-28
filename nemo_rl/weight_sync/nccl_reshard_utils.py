@@ -762,8 +762,9 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
         #   BF16 storage → MXFP8 gen  (receiver quantizes the resharded BF16 shard)
         # FP8→BF16 has no consumer (vLLM doesn't accept FP8 bytes into a BF16 param).
         fp8_cfg = megatron_cfg.get("fp8_cfg", {}) or {}
+        fp8_param_requested = bool(fp8_cfg.get("fp8_param", False))
         fp8_param = bool(
-            fp8_cfg.get("enabled", False) and fp8_cfg.get("fp8_param", False)
+            fp8_cfg.get("enabled", False) and fp8_param_requested
         )
         fp8_recipe = fp8_cfg.get("fp8_recipe", None)
         trainer_precision = policy.get("precision")
@@ -856,7 +857,7 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
                     "policy.precision must be 'bfloat16' for Megatron-generation "
                     "nccl_reshard refit."
                 )
-            if fp8_param and not fp8_cfg.get("enabled", False):
+            if fp8_param_requested and not fp8_cfg.get("enabled", False):
                 violations.append(
                     "policy.megatron_cfg.fp8_cfg.fp8_param=True requires "
                     "policy.megatron_cfg.fp8_cfg.enabled=True."
