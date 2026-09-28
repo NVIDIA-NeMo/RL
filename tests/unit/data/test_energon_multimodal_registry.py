@@ -30,6 +30,10 @@ def test_builtin_registries_resolve_lazily_with_stable_versions():
         "key": "generic_conversation",
         "version": "1",
     }
+    assert COOKER_REGISTRY.identity("nemotron_conversation") == {
+        "key": "nemotron_conversation",
+        "version": "1",
+    }
     assert TASK_ENCODER_REGISTRY.identity("generic_sft") == {
         "key": "generic_sft",
         "version": "1",
