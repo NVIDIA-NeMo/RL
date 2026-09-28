@@ -236,8 +236,8 @@ collator:
   num_packed_rows: 1
 ```
 
-For conversation data, set `collator.mode=chat` and use a data processor that
-preserves the conversation's `message_log`. Each model renders its own chat
+For conversation data, set `collator.mode=chat` and use `chat_kd_processor` with
+raw `messages` or `conversation` data. Each model renders its own chat
 template. CE, same-tokenizer KD, and teacher scoring include assistant content
 and each retained end-of-turn token; user turns, role headers, and padding are
 excluded. Cross-tokenizer KD aligns assistant content and uses a separate EOT
@@ -245,10 +245,88 @@ pair when both tokenizations retain the terminator.
 
 The configuration class supplies defaults. The old `data.collator_mode` key
 becomes `collator.mode`; the other four settings also move from `data` into
-`collator`. Native thinking-region alignment and packing multiple examples per
-row are not implemented: keep `native_thinking_alignment=false`,
-`kd_alignment_regions=null`, and `num_packed_rows=1`. The reserved
-`include_thinking_in_loss` flag does not currently change whole-message masking.
+`collator`. Packing multiple examples per row remains unsupported; keep
+`num_packed_rows=1`. Text tokenization uses `add_special_tokens=False`. Chat
+rows exceeding either the student's or any teacher's context limit are rejected
+instead of independently truncating their conversations.
+
+### Native reasoning and tool conversations
+
+Native alignment supports the Nano/Qwen ChatML layouts with explicit reasoning,
+answer, tool-call, and end-of-turn regions. Literal ChatML turn delimiters inside
+source content or schemas are rejected as ambiguous; embedded tool/think markup
+inside tool arguments is supported. Other layouts fail with an error;
+the Llama text exemplars are not native-chat recipes. Enable it explicitly:
+
+```yaml
+collator:
+  mode: chat
+  include_thinking_in_loss: true
+  native_thinking_alignment: true
+  kd_alignment_regions: [reasoning, close, answer, eot]
+  num_packed_rows: 1
+```
+
+Each row can supply `tools` and `message_loss_mask`, a list containing one binary
+integer per message. Only assistant turns may have a value of `1`; the default
+selects every assistant turn. A zero masks loss while retaining the message and
+its reasoning in the model's context. The OpenAI adapter prepends a zero when it
+inserts a system message. Set `use_preserving_dataset: true` for JSONL tool data
+to retain heterogeneous argument objects without Arrow adding null fields.
+
+Selected turns supervise reasoning text (when `include_thinking_in_loss` is true),
+the closing `</think>`, answers, tool payloads, and EOT. Opening thinking scaffolds,
+formatting-only tokens, schemas, user/system/tool-result text, unselected turns, and padding
+are excluded. `kd_alignment_regions` further restricts cross-tokenizer KD without
+changing CE or same-tokenizer KD masks. Prose and each tool call align separately;
+permitted Boolean/null spelling differences retain CE but omit the unequal piece
+from exact-text KD. Missing or transformed required content fails explicitly.
+Selected empty or whitespace-only assistant turns are rejected; tool-only turns
+are supported. Supervising a separate `reasoning_content` field requires native
+alignment. Ordinary chat supports reasoning embedded in `content` and rejects
+requests to supervise a separate reasoning field without native alignment.
+
+Qwen3-4B's stock template drops historical reasoning when a later user turn
+follows it. Apply the maintained override to **each Qwen tokenizer** used by the
+collator (both `policy.tokenizer` and the appropriate `teachers[i].tokenizer`):
+
+```yaml
+tokenizer:
+  name: Qwen/Qwen3-4B
+  tokenizer_kwargs:
+    revision: 1cfa9a7208912126459214e8b04321603b3df60c
+  chat_template: examples/chat_templates/qwen3_history.jinja
+  chat_template_kwargs:
+    enable_thinking: true
+    preserve_thinking: true
+    truncate_history_thinking: false
+```
+
+The template accepts explicit `reasoning_content` and leading inline
+`<think>...</think>` content. An explicit `truncate_history_thinking` wins:
+`false` retains history and `true` uses stock history truncation. When absent,
+`preserve_thinking=true` enables retention; otherwise stock behavior applies.
+`enable_thinking` preserves Qwen3's generation-prompt behavior, including its
+empty thinking block when false; it does not delete supplied reasoning. Training
+renders with `add_generation_prompt=False`. Native training requires retained
+reasoning and rejects a template that silently drops it.
+
+The override adds explicit history-retention controls to the pinned Qwen3-4B
+template while preserving its tool serialization and generation behavior. The shared offset matcher compares literal decoded strings; whitespace
+differences are unequal. Native Unicode repair is separate and requires both
+NFC-normalized decodings to equal the original source region. Ordinary chat uses
+one canonical nonempty content key on both sides and follows logical turn order.
+Content tokens that also absorb surrounding whitespace retain CE supervision;
+their full decoded strings still determine exact-match correctness.
+
+The runnable
+[`distillation-xtoken-qwen3-4b-to-qwen3-0.6b-1n8g-fsdp2tp1-native-chat.yaml`](../../examples/configs/recipes/llm/distillation-xtoken-qwen3-4b-to-qwen3-0.6b-1n8g-fsdp2tp1-native-chat.yaml)
+recipe uses the local multi-turn JSONL fixture and Qwen3-0.6B student with the
+shared pinned Qwen vocabulary. Its matching nightly driver creates a projection
+to exercise native region alignment. With a null projection, this pair instead
+uses the existing same-tokenizer teacher bypass. The recipe is a smoke test,
+not a convergence benchmark. DP alignment, native student-only SFT, sequence
+packing, and backend/loss changes are outside this port.
 
 ### Loss-mode knobs
 
