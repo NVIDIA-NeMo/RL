@@ -34,6 +34,7 @@ pre-publication ``route_assembly:<reason>`` rejection.
 
 from __future__ import annotations
 
+import logging
 import time
 from collections import Counter
 from dataclasses import dataclass, field
@@ -363,6 +364,7 @@ class RolloutReassembler:
             }
             route_spans: list[RouteSpan] = []
             seen_span_call_ids: set[str] = set()
+            position = 0
             for call_id, carry_len, generation_len in row.link_spans:
                 if call_id in seen_span_call_ids:
                     return rejected(f"duplicate_route_span:{call_id}", staging_keys)
@@ -382,6 +384,36 @@ class RolloutReassembler:
                     return rejected(
                         f"route_carry_span_mismatch:{call_id}", staging_keys
                     )
+                boundary_index = item.boundary_token_index
+                if boundary_index is not None and (
+                    record.mode != "token_in"
+                    or position == 0
+                    or record.prev_len != position
+                    or boundary_index != position - 1
+                    or item.routed_len == 0
+                ):
+                    return rejected(
+                        f"route_boundary_index_mismatch:{call_id}", staging_keys
+                    )
+                repair_previous_token = bool(
+                    route_spans
+                    and route_spans[-1].generation_len > 0
+                    and generation_len > 0
+                    and boundary_index is not None
+                )
+                if (
+                    route_spans
+                    and route_spans[-1].generation_len > 0
+                    and generation_len > 0
+                    and item.routed_len > 0
+                    and boundary_index is None
+                ):
+                    logging.getLogger(__name__).warning(
+                        "Legacy captured call %s has no boundary route; retaining "
+                        "the previous token's route. Fresh capture is required "
+                        "for turn-boundary replay parity.",
+                        call_id,
+                    )
                 route_spans.append(
                     RouteSpan(
                         staging_key=record.staging_key,
@@ -390,8 +422,11 @@ class RolloutReassembler:
                         staged_route_len=item.routed_len,
                         extras_digest_version=commitment.extras_digest_version,
                         extras_digest=commitment.extras_digest,
+                        boundary_token_index=boundary_index,
+                        repair_previous_token=repair_previous_token,
                     )
                 )
+                position += carry_len + generation_len
             if sum(span.carry_len + span.generation_len for span in route_spans) != len(
                 row.token_ids
             ):

@@ -547,6 +547,23 @@ class VllmAsyncGenerationWorkerImpl(
         from nemo_rl.data_plane import build_data_plane_client
         from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
 
+        if self.cfg.get("vllm_kwargs", {}).get("enable_return_routed_experts", False):
+            # Only R3 capture needs the new adapter contract; ordinary token
+            # capture remains compatible with adapters predating sidecars.
+            try:
+                from nemo_gym.token_id_capture.adapters.vllm import (
+                    ROUTED_EXPERTS_BOUNDARY_SCHEMA_VERSION,
+                )
+            except ImportError as error:
+                raise RuntimeError(
+                    "Router replay requires a Gym vLLM adapter that preserves "
+                    "boundary sidecars. Update Gym together with NeMo-RL."
+                ) from error
+            if ROUTED_EXPERTS_BOUNDARY_SCHEMA_VERSION != 1:
+                raise RuntimeError(
+                    "Router replay requires Gym's routed-experts boundary schema v1. "
+                    "Deploy the matching NeMo-RL and Gym capture implementations."
+                )
         dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
         # The Omni processor emits pixels in the engine's model dtype; the
         # sink pins its media column to it so text-call sentinels never
@@ -785,7 +802,13 @@ class VllmAsyncGenerationWorkerImpl(
     def _delta_align_routed_experts(
         payload: dict[str, Any], *, prev_len: int, prompt_len: int, generated_len: int
     ) -> None:
-        """Normalize optional vLLM routes to the exact staged token delta."""
+        """Keep delta routes plus the child's one-token prefill boundary repair."""
+        # Token capture is optional; these fields are only needed at this seam.
+        from nemo_rl.data_plane.schema import (
+            ROUTED_EXPERTS_BOUNDARY_FIELD,
+            ROUTED_EXPERTS_BOUNDARY_INDEX_FIELD,
+        )
+
         choices = payload.get("choices") or []
         if len(choices) != 1 or not isinstance(choices[0], dict):
             return
@@ -794,6 +817,8 @@ class VllmAsyncGenerationWorkerImpl(
         routed = message.get("routed_experts")
         if routed is None:
             return
+        message.pop(ROUTED_EXPERTS_BOUNDARY_FIELD, None)
+        message.pop(ROUTED_EXPERTS_BOUNDARY_INDEX_FIELD, None)
         try:
             from nemo_rl.utils.routed_experts_codec import (
                 decode_routed_experts,
@@ -813,17 +838,28 @@ class VllmAsyncGenerationWorkerImpl(
                 dtype = torch.int16
             experts = decode_routed_experts(routed, dtype)
             expected_full_len = prompt_len + generated_len
+            if not 0 <= prev_len <= prompt_len:
+                raise ValueError("prev_len must be within the captured prompt")
             if experts.dim() != 3 or experts.shape[0] != expected_full_len:
                 raise ValueError(
                     f"route length {experts.shape[0]} does not match engine sequence "
                     f"length {expected_full_len}"
                 )
             message["routed_experts"] = encode_routed_experts(experts[prev_len:])
+            if prev_len > 0 and generated_len > 0:
+                # Do not extend the token delta or mutate the parent's staged
+                # bytes. Only the selected child will repair the assembled row.
+                message[ROUTED_EXPERTS_BOUNDARY_FIELD] = encode_routed_experts(
+                    experts[prev_len - 1 : prev_len]
+                )
+                message[ROUTED_EXPERTS_BOUNDARY_INDEX_FIELD] = prev_len - 1
         except (IndexError, TypeError, ValueError) as error:
             LOGGER.warning(
                 "dropping invalid routed_experts from staged capture: %s", error
             )
             message.pop("routed_experts", None)
+            message.pop(ROUTED_EXPERTS_BOUNDARY_FIELD, None)
+            message.pop(ROUTED_EXPERTS_BOUNDARY_INDEX_FIELD, None)
         choice["message"] = message
         payload["choices"] = [choice]
 
@@ -880,6 +916,8 @@ class VllmAsyncGenerationWorkerImpl(
                     "generation_token_ids",
                     "generation_log_probs",
                     "routed_experts",
+                    "routed_experts_boundary",
+                    "routed_experts_boundary_index",
                 ):
                     message.pop(field, None)
         content["ng_commit_coords"] = coords.model_dump()

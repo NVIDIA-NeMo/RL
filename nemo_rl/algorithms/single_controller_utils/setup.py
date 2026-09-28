@@ -87,6 +87,7 @@ from nemo_rl.data_plane import (
     data_plane_supports_checkpointing,
 )
 from nemo_rl.data_plane.schema import (
+    ROUTED_EXPERTS_BOUNDARY_SCHEMA_VERSION,
     SC_ROLLOUT_SCHEMA_FIELDS,
     fields_with_optional_routed_experts,
 )
@@ -197,6 +198,7 @@ def _maybe_restore_native_data_plane_checkpoint(
     partition_id: str,
     sampler_name: str,
     opd_full_teacher_checkpoints: Optional[list[str]] = None,
+    require_route_boundaries: bool = False,
 ) -> Optional[DataPlaneCheckpointMetadata]:
     """Load and validate an authoritative native TQ checkpoint when present.
 
@@ -244,6 +246,20 @@ def _maybe_restore_native_data_plane_checkpoint(
             f"got {type(raw_metadata).__name__}"
         )
     metadata = cast(DataPlaneCheckpointMetadata, raw_metadata)
+    boundary_version = metadata.get("routed_experts_boundary_schema_version")
+    if require_route_boundaries and (
+        type(boundary_version) is not int
+        or boundary_version != ROUTED_EXPERTS_BOUNDARY_SCHEMA_VERSION
+    ):
+        # In particular, don't lazily add a new column to a restored Mooncake
+        # controller while producers are live. Legacy plans can be decoded, but
+        # upgrading the native staging schema requires a separate migration.
+        raise ValueError(
+            "Native TQ checkpoint has an incompatible routed-experts boundary staging schema. "
+            "Use a checkpoint written with boundary capture, or start with "
+            "fresh rollout/staging state. Legacy native staging-schema migration "
+            "is not supported."
+        )
     expected_values: DataPlaneCheckpointMetadata = {
         "data_plane_checkpoint_schema_version": (DATA_PLANE_CHECKPOINT_SCHEMA_VERSION),
         "single_controller_train_steps": save_state.current_step,
@@ -345,6 +361,9 @@ def _register_single_controller_partitions(
 
     if token_capture_cfg.enabled:
         from nemo_rl.data_plane.schema import (
+            ROUTED_EXPERTS_BOUNDARY_FIELD,
+        )
+        from nemo_rl.data_plane.schema import (
             ROUTED_EXPERTS_FIELD as STAGING_ROUTED_EXPERTS_FIELD,
         )
         from nemo_rl.data_plane.tq_token_sink import (
@@ -355,7 +374,11 @@ def _register_single_controller_partitions(
         dp_client.register_partition(
             partition_id=token_capture_cfg.staging_partition,
             fields=list(STAGING_FIELDS)
-            + ([STAGING_ROUTED_EXPERTS_FIELD] if r3_enabled else [])
+            + (
+                [STAGING_ROUTED_EXPERTS_FIELD, ROUTED_EXPERTS_BOUNDARY_FIELD]
+                if r3_enabled
+                else []
+            )
             + (list(MEDIA_STAGING_FIELDS) if capture_media else []),
             num_samples=num_rollout_samples,
             consumer_tasks=["finalize", "prev_lp", "train"],
@@ -1849,6 +1872,10 @@ def setup_single_controller(
             sampler_name=master_config.async_rl.sampler.name,
             opd_full_teacher_checkpoints=(
                 opd_module.opd_full_teacher_checkpoints_by_index(master_config)
+            ),
+            require_route_boundaries=(
+                master_config.token_capture.enabled
+                and router_replay_enabled(master_config.policy)
             ),
         )
         if rollout_checkpoint_load_metrics is not None:

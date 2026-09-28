@@ -46,6 +46,66 @@ The native async TransferQueue path uses the SingleController entrypoint with:
 examples/configs/recipes/llm/grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async-single-controller.yaml
 ```
 
+## Multi-turn rollouts with token capture
+
+This section applies when both `policy.router_replay.enabled=true` and
+`token_capture.enabled=true`.
+
+### Why turn boundaries need special handling
+
+In a multi-turn rollout, each turn is a separate vLLM call. The last token a
+call generates is sampled but never run back through the model in that call,
+so vLLM returns only a placeholder route for it. The next turn's prompt
+includes that token, and vLLM computes its real route during prefill.
+
+NeMo RL uses the next turn's route to replace the placeholder, so every token
+except the very last one in the trajectory is replayed with a real routing
+decision.
+
+### How it works
+
+- When a follow-up (`token_in`) call is captured, it stages its usual
+  per-token routes (`[delta_len, layers, topk]`) plus one extra route for the
+  previous turn's last token: `routed_experts_boundary`, shape
+  `[1, layers, topk]`. That token's position in the trajectory,
+  `routed_experts_boundary_index`, is stored in the extras metadata. The
+  extras digest covers both.
+- During route assembly, this route replaces the placeholder in the assembled
+  tensor. The previous turn's staged routes are not modified.
+- Only the follow-up call on the selected path, as recorded in the route
+  plan, does the replacement. Abandoned retries and the order in which
+  responses arrive have no effect.
+- The replacement only happens when both turns generated tokens.
+- Token IDs, masks, logprobs, and delta lengths are unchanged.
+- The last token of the final turn keeps its placeholder route, because no
+  later call runs prefill on it.
+- If the replacement route is all `-1`, that token falls back to Megatron's
+  native router (see [Fallback for Missing Routes](#fallback-for-missing-routes)).
+
+This works both when routes are assembled up front and when
+`token_capture.defer_routed_experts_to_policy=true`.
+
+If a boundary route is missing or fails verification, the existing failure
+policy applies. When routes are assembled up front, the rollout is rejected.
+With `defer_routed_experts_to_policy=true`, that rollout uses native routing.
+
+### Upgrading and compatibility
+
+- **Upgrade NeMo RL and Gym together.** With Router Replay enabled, the vLLM
+  worker fails at startup if the installed Gym adapter does not support
+  boundary routes. Token capture without Router Replay is not affected.
+- **Route plans** are now written as schema v3. Schema v2 plans can still be
+  read and simply have no boundary routes.
+- **Previously staged data** can still be read. Follow-up turns without a
+  boundary route keep the placeholder and log a warning
+  ("... has no boundary route ...").
+- **Native TQ checkpoints:** resuming with token capture and Router Replay
+  enabled requires a checkpoint written by this version (metadata
+  `routed_experts_boundary_schema_version: 1`). Older checkpoints, and those
+  saved with Router Replay disabled, are rejected at startup because the
+  staging schema cannot be migrated. Resume from a compatible checkpoint or
+  start with fresh rollout/staging state.
+
 ## Validation
 
 Router Replay validation covers two end-to-end questions:
