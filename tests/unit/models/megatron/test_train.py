@@ -25,7 +25,7 @@ focusing on:
 from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import torch
@@ -34,6 +34,14 @@ from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossInputType
 
 pytestmark = pytest.mark.mcore
+
+
+class _ModelWithConfig(torch.nn.Module):
+    """Minimal model supporting configuration lookup and module traversal."""
+
+    def __init__(self, config: SimpleNamespace) -> None:
+        super().__init__()
+        self.config = config
 
 
 class TestModelForward:
@@ -251,9 +259,7 @@ class TestModelForward:
                 train, "get_tensor_model_parallel_group", return_value=tp_group
             ),
         ):
-            result = train._prepare_padding_mask_for_router_scaling(
-                model, padding_mask
-            )
+            result = train._prepare_padding_mask_for_router_scaling(model, padding_mask)
 
         mock_scatter.assert_called_once()
         assert torch.equal(mock_scatter.call_args.args[0], padding_mask.transpose(0, 1))
@@ -1010,7 +1016,7 @@ class TestMegatronForwardBackward:
         )
 
         model_config = SimpleNamespace(fine_grained_activation_offloading=True)
-        model = SimpleNamespace(config=model_config)
+        model = _ModelWithConfig(model_config)
         empty_manager = SimpleNamespace(
             _is_warmup=True,
             _cached_chunks_forward=[],
@@ -1078,7 +1084,7 @@ class TestMegatronForwardBackward:
 
         manager = StatefulOffloadManager()
         model_config = SimpleNamespace(fine_grained_activation_offloading=True)
-        model = SimpleNamespace(config=model_config)
+        model = _ModelWithConfig(model_config)
         observed_phases: list[tuple[bool, int]] = []
 
         def run_schedule(**kwargs: Any) -> dict[str, torch.Tensor]:
@@ -1141,7 +1147,7 @@ class TestMegatronForwardBackward:
 
         with patch.object(PipelineOffloadManager, "OFFLOAD_MGR", manager):
             megatron_forward_backward(
-                model=SimpleNamespace(config=model_config),
+                model=_ModelWithConfig(model_config),
                 data_iterator=iter([]),
                 num_microbatches=1,
                 seq_length=64,
@@ -1237,7 +1243,7 @@ class TestMegatronForwardBackward:
         )
 
         model_config = SimpleNamespace(fine_grained_activation_offloading=True)
-        model = SimpleNamespace(config=model_config)
+        model = _ModelWithConfig(model_config)
 
         def fail_forward_only(**kwargs):
             assert kwargs["forward_only"] is True
@@ -1271,7 +1277,7 @@ class TestMegatronForwardBackward:
         )
 
         model_config = SimpleNamespace(fine_grained_activation_offloading=True)
-        model = SimpleNamespace(config=model_config)
+        model = _ModelWithConfig(model_config)
 
         def run_training(**kwargs):
             assert kwargs["forward_only"] is False
@@ -1893,3 +1899,129 @@ class TestAggregateTrainingStatistics:
         )
 
         assert grad_enabled_during_all_reduce == [False]
+
+
+@pytest.mark.parametrize("loss_name", ["preference", "dpo", "mpo"])
+@pytest.mark.parametrize("fuse_loss", [False, True])
+def test_padding_only_preference_loss_has_zero_gradient(
+    loss_name: str, fuse_loss: bool
+) -> None:
+    """Idle dynamic-CP lanes bypass preference-pair validation safely."""
+    from nemo_rl.algorithms.loss import (
+        DPOLossConfig,
+        DPOLossFn,
+        MPOLossConfig,
+        MPOLossFn,
+        PreferenceLossFn,
+    )
+    from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+    from nemo_rl.models.megatron.train import LossPostProcessor
+
+    loss_fn = {
+        "preference": PreferenceLossFn,
+        "dpo": lambda: DPOLossFn(DPOLossConfig()),
+        "mpo": lambda: MPOLossFn(MPOLossConfig()),
+    }[loss_name]()
+    data = BatchedDataDict(
+        input_ids=torch.zeros((1, 2), dtype=torch.long),
+        input_lengths=torch.tensor([2]),
+        token_mask=torch.zeros((1, 2)),
+        sample_mask=torch.zeros(1),
+        reference_policy_logprobs=torch.zeros((1, 2)),
+        pair_index=torch.zeros(1, dtype=torch.long),
+        is_chosen=torch.zeros(1, dtype=torch.bool),
+    )
+    with pytest.raises(ValueError, match="exactly one chosen and one rejected"):
+        loss_fn(
+            torch.zeros((1, 1)),
+            data,
+            global_valid_seqs=torch.tensor(2),
+            global_valid_toks=torch.tensor(2),
+        )
+
+    processor = LossPostProcessor(
+        loss_fn=loss_fn,
+        cfg={"sequence_packing": {"enabled": True, "fuse_loss": fuse_loss}},
+    )
+    output = torch.randn((1, 2, 4), requires_grad=True)
+    loss, metrics = processor(
+        data,
+        packed_seq_params=SimpleNamespace(dynamic_cp_padding_only=True),
+        global_valid_seqs=torch.tensor(2),
+        global_valid_toks=torch.tensor(2),
+    )(output)
+    loss.backward()
+
+    assert loss.item() == 0.0
+    assert metrics == {}
+    torch.testing.assert_close(output.grad, torch.zeros_like(output))
+
+
+@pytest.mark.parametrize("nonfinite", [float("inf"), float("nan")])
+@pytest.mark.parametrize("with_draft", [False, True])
+def test_padding_loss_skips_preparation_and_connects_draft_backward(
+    nonfinite: float, with_draft: bool
+) -> None:
+    """Placeholder loss remains finite and connects every model output."""
+    from nemo_rl.models.megatron.train import LossPostProcessor
+
+    loss_fn = Mock(side_effect=AssertionError("Padding invoked the real loss"))
+    prepare_fn = Mock(side_effect=AssertionError("Padding prepared loss inputs"))
+    data = {}
+    student_logits = torch.full((1, 2, 4), nonfinite, requires_grad=True)
+    if with_draft:
+        data["student_logits"] = student_logits
+    processor = LossPostProcessor(loss_fn=loss_fn, cfg={}, prepare_fn=prepare_fn)
+    output = torch.full((1, 2, 4), nonfinite, requires_grad=True)
+    loss, metrics = processor(
+        data, packed_seq_params=SimpleNamespace(dynamic_cp_padding_only=True)
+    )(output.transpose(1, 2))
+    loss.backward()
+
+    assert loss.item() == 0.0
+    assert metrics == {}
+    torch.testing.assert_close(output.grad, torch.zeros_like(output))
+    if with_draft:
+        torch.testing.assert_close(
+            student_logits.grad, torch.zeros_like(student_logits)
+        )
+    loss_fn.assert_not_called()
+    prepare_fn.assert_not_called()
+
+
+@pytest.mark.parametrize("padding_flag", [None, False])
+def test_real_tasks_keep_normal_loss_processing(
+    monkeypatch: pytest.MonkeyPatch, padding_flag: bool | None
+) -> None:
+    """The placeholder shortcut does not alter ordinary microbatches."""
+    from nemo_rl.models.megatron import train
+
+    monkeypatch.setattr(
+        train,
+        "_postprocessing_cp_context",
+        lambda packed: SimpleNamespace(size=1, group=None),
+    )
+    monkeypatch.setattr(train, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(train, "get_tensor_model_parallel_group", lambda: None)
+    monkeypatch.setattr(train, "get_context_parallel_world_size", lambda: 1)
+    output = torch.tensor([[2.0]], requires_grad=True)
+    loss_fn = Mock(return_value=(output.sum(), {"loss": 2.0}))
+    prepare_fn = Mock(return_value=({"logits": output}, {}))
+    processor = train.LossPostProcessor(
+        loss_fn=loss_fn,
+        cfg={"sequence_packing": {"enabled": False}},
+        prepare_fn=prepare_fn,
+    )
+    packed = (
+        None
+        if padding_flag is None
+        else SimpleNamespace(dynamic_cp_padding_only=padding_flag)
+    )
+    loss, metrics = processor({}, packed_seq_params=packed)(output)
+    loss.backward()
+
+    assert loss.item() == 2.0
+    assert metrics == {"loss": 2.0}
+    torch.testing.assert_close(output.grad, torch.ones_like(output))
+    loss_fn.assert_called_once()
+    prepare_fn.assert_called_once()

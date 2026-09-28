@@ -23,6 +23,7 @@ focusing on:
 - Sequence dimension validation
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1981,3 +1982,140 @@ def test_get_pack_sequence_parameters_for_megatron(get_pack_sequence_parameters_
         # Check that all workers succeeded
         for i, result in enumerate(results):
             assert result["success"], f"Worker {i} failed: {result['error']}"
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize(
+    "model_owned_flags",
+    [
+        {},
+        {"delegate_pack_to_model": True},
+        {"model_slices_context_parallel_inputs": True},
+    ],
+)
+def test_dense_no_cp_masks_physical_padding_but_keeps_prompt_tokens(
+    monkeypatch, model_owned_flags
+):
+    """Dense no-CP masks physical padding without masking real prompt tokens."""
+    from nemo_rl.models.megatron import data
+
+    monkeypatch.setattr(data, "get_context_parallel_rank", lambda: 0)
+    monkeypatch.setattr(data, "get_context_parallel_world_size", lambda: 1)
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 4, 5, 0], [6, 7, 8, 0, 0, 0]]),
+        "input_lengths": torch.tensor([5, 3]),
+        "token_mask": torch.tensor([[0, 0, 1, 1, 1, 0], [0, 1, 1, 0, 0, 0]]),
+    }
+    result = data.process_microbatch(
+        batch, pad_individual_seqs_to_multiple_of=8, **model_owned_flags
+    )
+    assert result.input_ids_cp_sharded.shape == (2, 8)
+    assert result.packed_seq_params is None
+    if model_owned_flags:
+        assert result.padding_mask is None
+    else:
+        assert torch.equal(
+            result.padding_mask,
+            torch.tensor(
+                [
+                    [False, False, False, False, False, True, True, True],
+                    [False, False, False, True, True, True, True, True],
+                ]
+            ),
+        )
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize(
+    "settings, keeps_mask",
+    [
+        ({"context_parallel_size": 2, "linear_cp_mode": "headwise"}, True),
+        ({"moe_router_load_balancing_type": "quantile_balancing"}, False),
+        ({"context_parallel_size": 1, "linear_cp_mode": "chunkwise"}, True),
+        ({"context_parallel_size": 2, "linear_cp_mode": "chunkwise"}, False),
+        (
+            {
+                "context_parallel_size": 2,
+                "linear_cp_layout": "contiguous",
+                "attention_cp_layout": "zigzag",
+            },
+            False,
+        ),
+    ],
+)
+def test_provider_resolved_padding_capability(monkeypatch, settings, keeps_mask):
+    """Resolved model settings decide whether a router mask is compatible."""
+    from nemo_rl.models.megatron import train
+
+    config = SimpleNamespace(sequence_parallel=False, **settings)
+    monkeypatch.setattr(train, "get_model_config", lambda _: config)
+    padding_mask = torch.tensor([[False, True]])
+    result = train._prepare_padding_mask_for_model(torch.nn.Identity(), padding_mask)
+    if keeps_mask:
+        assert result is padding_mask
+    else:
+        assert result is None
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize("dispatcher", ["alltoall", "allgather", "flex"])
+@pytest.mark.parametrize("cp_size", [1, 2])
+@pytest.mark.parametrize(
+    "options, expected",
+    [
+        ({}, True),
+        ({"delegate_pack_to_model": True}, False),
+        ({"model_slices_context_parallel_inputs": True}, False),
+        ({"moe_router_load_balancing_type": "quantile_balancing"}, False),
+        (
+            {
+                "model_overrides": {
+                    "moe_router_load_balancing_type": "quantile_balancing"
+                }
+            },
+            False,
+        ),
+        ({"model_overrides": {"linear_cp_mode": "chunkwise"}}, "cp1"),
+    ],
+)
+def test_static_packing_masks_every_supported_dispatcher(
+    monkeypatch, dispatcher, cp_size, options, expected
+):
+    """NeMo-owned static packing supplies masks to supported dispatchers."""
+    from nemo_rl.models.megatron import data
+
+    cfg = {
+        "dynamic_batching": {"enabled": False},
+        "sequence_packing": {"enabled": True},
+        "make_sequence_length_divisible_by": 1,
+        "megatron_cfg": {
+            "context_parallel_size": cp_size,
+            "pipeline_model_parallel_size": 1,
+            "moe_token_dispatcher_type": dispatcher,
+            "moe_flex_dispatcher_backend": "deepep",
+        },
+    }
+    flags = {}
+    for key, value in options.items():
+        (
+            flags
+            if key.startswith(("delegate_", "model_slices_"))
+            else cfg["megatron_cfg"]
+        )[key] = value
+    packed_data = MagicMock()
+    packed_data.get_microbatch_iterator_for_packable_sequences_len.return_value = (1, 8)
+    make_iterator = MagicMock(return_value=iter(()))
+    monkeypatch.setattr(data, "get_and_validate_seqlen", lambda _: (1, 8))
+    monkeypatch.setattr(data, "make_processed_microbatch_iterator", make_iterator)
+    monkeypatch.setattr(
+        data, "_get_pack_sequence_parameters_for_megatron", lambda *args: (4, 8, None)
+    )
+
+    data.get_microbatch_iterator(packed_data, cfg, 1, MagicMock(), **flags)
+
+    expected_mask = cp_size == 1 if expected == "cp1" else expected
+    assert (
+        make_iterator.call_args.kwargs["create_packed_seq_padding_mask"]
+        is expected_mask
+    )
+    assert not make_iterator.call_args.kwargs["prepad_packed_seq_for_hybridep"]

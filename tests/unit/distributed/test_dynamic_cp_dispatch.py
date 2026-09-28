@@ -25,6 +25,7 @@ from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.policy.dynamic_cp import (
     _enabled_global_aux_loss,
     _minimum_cp_size_for_experts,
+    _requires_aligned_collective_rounds,
     build_cp_dispatch,
     collect_cp_outputs,
     cp_schedule_matches,
@@ -47,6 +48,7 @@ class TestDynamicCPDispatch(unittest.TestCase):
         ).long()
         self.cfg = {
             "make_sequence_length_divisible_by": 1,
+            "sequence_packing": {"enabled": True, "pair_grouping_key": None},
             "megatron_cfg": {
                 "tensor_model_parallel_size": 2,
                 "expert_model_parallel_size": 1,
@@ -67,6 +69,34 @@ class TestDynamicCPDispatch(unittest.TestCase):
                 "tensor_parallel",
             ],
         )
+
+    def test_cp_peers_share_driver_payload_without_copying_global_batches(self):
+        cfg = {**self.cfg, "megatron_cfg": dict(self.cfg["megatron_cfg"])}
+        cfg["megatron_cfg"]["dynamic_context_parallel"] = {
+            "enabled": True,
+            "min_size": 4,
+            "max_size": 4,
+            "tokens_per_rank": 32,
+        }
+        original_ids = self.data["input_ids"].clone()
+        with patch.object(
+            self.data, "select_indices", wraps=self.data.select_indices
+        ) as select:
+            dispatch = build_cp_dispatch(
+                self.data, cfg, self.mesh, batch_size=5, training=True
+            )
+        # One real payload allocation, shared by all four CP lanes. Previously
+        # this copied the whole batch five times, including an unused temporary.
+        self.assertEqual(select.call_count, 1)
+        payload = dispatch.data[0][0]
+        self.assertTrue(all(shard is payload for row in dispatch.data for shard in row))
+        self.assertEqual(dispatch.plans[0][0].steps[0].valid_sequences, 4)
+        self.assertEqual(dispatch.plans[0][0].steps[0].valid_tokens, 66)
+        # Workers make per-task selections before adding masks or staging CUDA.
+        task_data = payload.select_indices([0])
+        task_data["input_ids"].zero_()
+        torch.testing.assert_close(self.data["input_ids"], original_ids)
+        torch.testing.assert_close(payload["input_ids"], original_ids)
 
     def test_moe_minimum_contains_complete_expert_group(self):
         self.assertEqual(
@@ -185,6 +215,95 @@ class TestDynamicCPDispatch(unittest.TestCase):
             for task in plan.steps[0].assignments
         )
 
+    def test_fp8_recipe_controls_collective_round_alignment(self):
+        data = BatchedDataDict(
+            input_ids=torch.zeros(5, 128, dtype=torch.long),
+            input_lengths=torch.full((5,), 128),
+            sample_mask=torch.ones(5, dtype=torch.long),
+            token_mask=torch.ones(5, 128, dtype=torch.long),
+        )
+        cfg = self._validation_cfg()
+        cfg["max_total_sequence_length"] = 128
+        cfg["megatron_cfg"]["dynamic_context_parallel"].update(
+            tokens_per_rank=128, max_size=1
+        )
+        for recipe in ("delayed", "tensorwise", "blockwise", "mxfp8", "custom"):
+            cfg["megatron_cfg"]["fp8_cfg"] = {
+                "enabled": True,
+                "fp8_recipe": recipe,
+            }
+            for training in (False, True):
+                with self.subTest(recipe=recipe, training=training):
+                    dispatch = build_cp_dispatch(
+                        data, cfg, self.mesh, batch_size=5, training=training
+                    )
+                    plans = [plan for dp_plans in dispatch.plans for plan in dp_plans]
+                    counts = [len(plan.steps[0].assignments) for plan in plans]
+                    if recipe in ("delayed", "custom"):
+                        self.assertEqual(counts, [2, 2, 2, 2])
+                    else:
+                        self.assertEqual(sorted(counts), [1, 1, 1, 2])
+                    self.assertEqual(sum(owned_real_task_count(p) for p in plans), 5)
+
+    def test_fp8_round_alignment_honors_overrides_and_opaque_recipes(self):
+        aligned = [
+            {"model_overrides": {"fp8": "hybrid"}},
+            {"model_overrides": {"fp8": "hybrid", "fp8_recipe": "delayed"}},
+            {"te_precision_config_file": "/recipe/with_custom_quantizers.yaml"},
+            {"model_overrides": {"quant_recipe": {"configs": {}}}},
+            {
+                "fp8_cfg": {"enabled": True, "fp8_recipe": "tensorwise"},
+                "model_overrides": {"fp8_dot_product_attention": True},
+            },
+            {
+                "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8"},
+                "model_overrides": {"fp8_multi_head_attention": True},
+            },
+            {
+                "fp8_cfg": {"enabled": True, "fp8_recipe": "delayed"},
+                "model_overrides": {"fp8": "hybrid", "fp8_recipe": "mxfp8"},
+                "tp_only_amax_red": True,
+            },
+        ]
+        unaligned = [
+            {},
+            {"fp8_cfg": {"enabled": False, "fp8_recipe": "delayed"}},
+            {"model_overrides": {"fp8": "hybrid", "fp8_recipe": "mxfp8"}},
+            {"model_overrides": {"fp8": None, "fp8_recipe": "delayed"}},
+            {
+                "fp8_cfg": {"enabled": True, "fp8_recipe": "tensorwise"},
+                "model_overrides": {"fp8": "hybrid", "fp8_recipe": "delayed"},
+            },
+        ]
+        for configs, expected in ((aligned, True), (unaligned, False)):
+            for cfg in configs:
+                with self.subTest(cfg=cfg):
+                    self.assertEqual(_requires_aligned_collective_rounds(cfg), expected)
+
+        with patch.dict("os.environ", {"NVTE_DPA_FP8_RECIPE": "DelayedScaling"}):
+            self.assertTrue(
+                _requires_aligned_collective_rounds(
+                    {"fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8"}}
+                )
+            )
+
+    def test_schedule_cache_rejects_fp8_collective_change_with_same_padding(self):
+        cfg = self._validation_cfg()
+        cfg["megatron_cfg"]["dynamic_context_parallel"]["tokens_per_rank"] = 32
+        cfg["megatron_cfg"]["fp8_cfg"] = {
+            "enabled": True,
+            "fp8_recipe": "tensorwise",
+        }
+        dispatch = build_cp_dispatch(
+            self.data, cfg, self.mesh, batch_size=5, training=False
+        )
+        cfg["megatron_cfg"]["fp8_cfg"]["fp8_recipe"] = "delayed"
+        self.assertFalse(
+            cp_schedule_matches(
+                dispatch.schedule, self.data, cfg, self.mesh, batch_size=5
+            )
+        )
+
     def _validation_cfg(self) -> dict:
         return {
             "make_sequence_length_divisible_by": 1,
@@ -235,13 +354,9 @@ class TestDynamicCPDispatch(unittest.TestCase):
             "override cp_comm_type list": {
                 "model_overrides": {"cp_comm_type": ["p2p", "a2a+p2p"]}
             },
-            "direct hierarchy sizes": {
-                "hierarchical_context_parallel_sizes": [2, 2]
-            },
+            "direct hierarchy sizes": {"hierarchical_context_parallel_sizes": [2, 2]},
             "override hierarchy sizes": {
-                "model_overrides": {
-                    "hierarchical_context_parallel_sizes": [2, 2]
-                }
+                "model_overrides": {"hierarchical_context_parallel_sizes": [2, 2]}
             },
         }
         for name, settings in cases.items():

@@ -89,7 +89,7 @@ def main() -> None:
         token_mask=(torch.arange(112)[None, :] < lengths[:, None]).long(),
         sample_mask=torch.tensor([1, 1, 1, 0, 1, 1, 1, 1, 1, 1]),
     )
-    for tp, base_cp in ((1, 1), (1, 2), (2, 1), (2, 2)):
+    for tp, base_cp in ((1, 1), (1, 2), (1, 4), (2, 1), (2, 2)):
         parallel_state.initialize_model_parallel(
             tensor_model_parallel_size=tp,
             context_parallel_size=base_cp,
@@ -302,6 +302,59 @@ def main() -> None:
                     )
             relative_error = (squared_error / squared_reference).sqrt().item()
             assert relative_error < 0.03, (tp, base_cp, relative_error)
+
+        # Exercise an ordinary static/no-CP forward AFTER dynamic binding exits.
+        # The earlier CP1 reference deliberately used runtime metadata, so it
+        # alone cannot detect state leaking into the ordinary static path.
+        model.zero_grad(set_to_none=True)
+        static_data = reference_data.select_indices(
+            list(
+                range(
+                    parallel_state.get_data_parallel_rank(),
+                    data.size,
+                    parallel_state.get_data_parallel_world_size(),
+                )
+            )
+        )
+        static_batch = process_microbatch(
+            static_data,
+            seq_length_key="input_lengths",
+            pack_sequences=True,
+            pad_individual_seqs_to_multiple_of=(
+                tp * (2 * base_cp if base_cp > 1 else 1)
+            ),
+        )
+        assert static_batch.packed_seq_params.local_cp_size is None
+        static_loss, static_metrics = LossPostProcessor(NLLLossFn(), cfg)(
+            static_data, static_batch.packed_seq_params, *normalizers
+        )(forward(static_batch, static_data))
+        (static_loss * base_cp).backward()
+        static_reported = torch.tensor(
+            static_metrics["loss"]
+            if parallel_state.get_context_parallel_rank() == 0
+            else 0.0,
+            device="cuda",
+        )
+        dist.all_reduce(static_reported, group=domain)
+        torch.testing.assert_close(
+            static_reported.item(), reference_metrics["loss"], rtol=0.01, atol=0.01
+        )
+        for name, parameter in model.named_parameters():
+            if name not in reference_grads:
+                continue
+            gradient = parameter.grad.float()
+            if getattr(parameter, "sequence_parallel", False):
+                dist.all_reduce(
+                    gradient, group=parallel_state.get_tensor_model_parallel_group()
+                )
+            dist.all_reduce(gradient, group=domain)
+            torch.testing.assert_close(
+                gradient,
+                reference_grads[name],
+                rtol=0.08,
+                atol=0.003,
+                msg=lambda msg: f"static tp={tp}, cp={base_cp}, {name}: {msg}",
+            )
         print(
             f"attention CP parity passed: rank={rank} tp={tp} base_cp={base_cp} "
             f"active_sizes={sizes} gradient_relative_error={relative_error:.6f}",

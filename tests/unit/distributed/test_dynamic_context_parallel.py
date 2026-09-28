@@ -10,8 +10,10 @@
 # limitations under the License.
 
 import random
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 from nemo_rl.distributed.dynamic_context_parallel import (
     DynamicContextParallelConfig,
@@ -273,3 +275,41 @@ def test_dynamic_outputs_are_not_static_cp_replicas():
     assert "context_parallel" in REPLICATED_AXES
     assert replicated_axes() == REPLICATED_AXES
     assert replicated_axes(dynamic_cp=True) == ("tensor_parallel", "pipeline_parallel")
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize("base_cp", [1, 2])
+@pytest.mark.parametrize("active_cp", [1, 2, 4])
+@pytest.mark.parametrize("num_microbatches", [1, 3])
+@pytest.mark.parametrize("per_token", [False, True])
+@pytest.mark.parametrize("replicated_cp_loss", [False, True])
+def test_mcore_legacy_loss_scaling(
+    base_cp, active_cp, num_microbatches, per_token, replicated_cp_loss
+):
+    """The NeMo multiplier cancels the pinned MCore callback scaling."""
+    from megatron.core.pipeline_parallel.schedules import forward_step_calc_loss
+
+    original_loss = torch.tensor(2.0, requires_grad=True)
+    multiplier = cp_loss_multiplier(
+        active_cp_size=active_cp,
+        schedule_cp_size=base_cp,
+        num_microbatches=num_microbatches,
+        replicated_cp_loss=replicated_cp_loss,
+    )
+    metrics = []
+    loss, _ = forward_step_calc_loss(
+        model=None,
+        output_tensor=original_loss,
+        loss_func=lambda value: (value * multiplier, {"loss": value.detach().item()}),
+        config=SimpleNamespace(timers=None, calculate_per_token_loss=per_token),
+        vp_stage=None,
+        collect_non_loss_data=False,
+        num_microbatches=num_microbatches,
+        forward_data_store=metrics,
+        cp_group_size=base_cp,
+        is_last_stage=True,
+    )
+    loss.backward()
+    expected_grad = 1.0 / active_cp if replicated_cp_loss else 1.0
+    assert original_loss.grad.item() == pytest.approx(expected_grad)
+    assert metrics == [{"loss": 2.0}]

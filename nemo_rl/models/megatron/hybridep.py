@@ -23,6 +23,7 @@ from megatron.core.parallel_state import (
 
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
 from nemo_rl.models.megatron.common import _round_up_to_multiple
+from nemo_rl.models.policy.dynamic_cp import dynamic_cp_config
 
 
 def uses_hybridep_flex_dispatcher(megatron_cfg: Mapping[str, object]) -> bool:
@@ -57,8 +58,7 @@ def configure_hybridep_packed_input_padding(
             raise ValueError(
                 "HybridEP input prepadding currently requires pipeline parallel size 1."
             )
-        dynamic_cp = megatron_cfg.get("dynamic_context_parallel") or {}
-        if megatron_cfg.get("mtp_num_layers") and not dynamic_cp.get("enabled", False):
+        if megatron_cfg.get("mtp_num_layers") and dynamic_cp_config(config) is None:
             raise ValueError(
                 "HybridEP input prepadding with MTP currently requires Dynamic CP."
             )

@@ -794,7 +794,8 @@ class MegatronPolicyWorkerImpl(
             if _model_accepts_media_token_validity_mask(self.model)
             else None
         )
-        if dynamic_cp_config(self.cfg) is not None:
+        dynamic_cp = dynamic_cp_config(self.cfg)
+        if dynamic_cp is not None:
             # Dynamic dispatch collects every DP*CP result rather than Ray's
             # usual replicated-rank subset. Keep the serializer scoped to these
             # workers so unrelated Megatron RPCs retain Ray's CUDA behavior.
@@ -828,7 +829,13 @@ class MegatronPolicyWorkerImpl(
                 raise ValueError("Dynamic CP does not support quantile_balancing")
             from nemo_rl.models.megatron.dynamic_cp import validate_dynamic_cp_model
 
-            validate_dynamic_cp_model(self.model)
+            validate_dynamic_cp_model(
+                self.model,
+                max_cp_size=dynamic_cp.max_size
+                or parallel_state.get_data_parallel_world_size(
+                    with_context_parallel=True
+                ),
+            )
 
         if self.model_slices_context_parallel_inputs:
             if self.delegate_pack_to_model:

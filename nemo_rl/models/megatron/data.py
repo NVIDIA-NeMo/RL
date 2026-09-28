@@ -41,7 +41,7 @@ from nemo_rl.models.megatron.hybridep import (
     pad_packed_seq_for_hybridep,
     uses_hybridep_flex_dispatcher,
 )
-from nemo_rl.models.policy.dynamic_cp import dynamic_cp_config
+from nemo_rl.models.policy.dynamic_cp import _model_setting, dynamic_cp_config
 from nemo_rl.utils.r3_trace import (
     r3_trace_verify_forward_enabled,
     trace_cp_routed_experts,
@@ -322,12 +322,28 @@ def get_microbatch_iterator(
         raw_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
         data_iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
     elif cfg["sequence_packing"]["enabled"]:
-        create_packed_seq_padding_mask = uses_hybridep_flex_dispatcher(
-            cfg["megatron_cfg"]
+        uses_hybridep = uses_hybridep_flex_dispatcher(cfg["megatron_cfg"])
+        routing_type = _model_setting(
+            cfg["megatron_cfg"], "moe_router_load_balancing_type"
         )
-        prepad_packed_seq_for_hybridep = create_packed_seq_padding_mask and cfg[
-            "megatron_cfg"
-        ].get("moe_hybridep_prepad_packed_inputs")
+        routing_types = (
+            routing_type if isinstance(routing_type, (list, tuple)) else (routing_type,)
+        )
+        # Every dispatcher needs to exclude alignment padding from router losses
+        # and expert-bias counts. Self-packing/slicing models own the mask layout;
+        # quantile routing does not yet accept padding masks in pinned MCore.
+        create_packed_seq_padding_mask = uses_hybridep or (
+            not delegate_pack_to_model
+            and not model_slices_context_parallel_inputs
+            and "quantile_balancing" not in routing_types
+            and not (
+                cfg["megatron_cfg"].get("context_parallel_size", 1) > 1
+                and _model_setting(cfg["megatron_cfg"], "linear_cp_mode") == "chunkwise"
+            )
+        )
+        prepad_packed_seq_for_hybridep = uses_hybridep and cfg["megatron_cfg"].get(
+            "moe_hybridep_prepad_packed_inputs"
+        )
         raw_iterator = data.make_microbatch_iterator_for_packable_sequences()
         data_iterator_len, pack_seq_dim_size = (
             data.get_microbatch_iterator_for_packable_sequences_len()
@@ -803,6 +819,18 @@ def process_microbatch(
                         data_dict["input_lengths"],
                     )
             input_ids_cp_sharded = input_ids
+            if (
+                cp_size == 1
+                and not delegate_pack_to_model
+                and not model_slices_context_parallel_inputs
+                and "input_lengths" in data_dict
+            ):
+                # Dense no-CP batches still contain physical right padding,
+                # including alignment added above. Prompt tokens are real
+                # router inputs even when their language-model loss is masked.
+                padding_mask = torch.arange(
+                    input_ids.shape[1], device=input_ids.device
+                ).unsqueeze(0) >= data_dict["input_lengths"].unsqueeze(1)
             verified_token_count = _verify_r3_trace_cp_token_alignment(
                 source_input_ids=data_dict["input_ids"],
                 source_routed_experts=data_dict.get("routed_experts"),

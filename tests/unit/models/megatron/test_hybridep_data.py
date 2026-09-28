@@ -19,9 +19,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from nemo_rl.distributed.dynamic_context_parallel import DynamicContextParallelConfig
+
 
 @pytest.mark.mcore
-def test_hybridep_mtp_prepad_requires_dynamic_cp():
+@pytest.mark.parametrize("typed_config", [False, True])
+def test_hybridep_mtp_prepad_requires_dynamic_cp(typed_config):
     from nemo_rl.models.megatron.hybridep import (
         configure_hybridep_packed_input_padding,
     )
@@ -41,7 +44,19 @@ def test_hybridep_mtp_prepad_requires_dynamic_cp():
     with pytest.raises(ValueError, match="requires Dynamic CP"):
         configure_hybridep_packed_input_padding(None, config)
 
-    megatron_cfg["dynamic_context_parallel"] = {"enabled": True}
+    megatron_cfg["dynamic_context_parallel"] = (
+        DynamicContextParallelConfig(enabled=False)
+        if typed_config
+        else {"enabled": False}
+    )
+    with pytest.raises(ValueError, match="requires Dynamic CP"):
+        configure_hybridep_packed_input_padding(None, config)
+
+    megatron_cfg["dynamic_context_parallel"] = (
+        DynamicContextParallelConfig(enabled=True)
+        if typed_config
+        else {"enabled": True}
+    )
     configure_hybridep_packed_input_padding(None, config)
 
 
@@ -416,6 +431,7 @@ def test_hybridep_padding_mask_preserves_existing_cp_local_layout(
         cp_size=2,
         cp_rank=0,
         device=input_ids.device,
+        cp_group=None,
     )
 
 

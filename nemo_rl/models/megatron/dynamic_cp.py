@@ -13,14 +13,13 @@
 from contextlib import contextmanager
 from copy import copy
 from dataclasses import dataclass
-from typing import Any, Callable, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional, cast
 
 import torch
 from megatron.core import parallel_state
 from megatron.core.transformer.moe.router import Router
 
 from nemo_rl.distributed.dynamic_context_parallel import CPRankPlan, CPRankStep
-
 
 _DYNAMIC_TP_CP_GROUPS: dict[int, Any] = {}
 _ROUTER_CONFIG_BASELINES: dict[int, tuple[Any, Any]] = {}
@@ -196,7 +195,9 @@ def _bind_targets(model: torch.nn.Module) -> _BindTargets:
     return _ACTIVE_BIND_TARGETS.get(id(model)) or _classify_bind_targets(model)
 
 
-def _rebuild_mamba_cp(module: torch.nn.Module, group: Any) -> None:
+# The optional SSM/hybrid classes are identified structurally above. Their
+# scalar metadata and CP helper types are not part of nn.Module's attribute API.
+def _rebuild_mamba_cp(module: Any, group: Any) -> None:
     """Rebuild Mamba's cached CP helper for the active microbatch size."""
     cp = module.cp
     module.cp = type(cp)(
@@ -215,7 +216,7 @@ def _rebuild_mamba_cp(module: torch.nn.Module, group: Any) -> None:
     )
 
 
-def _rebuild_gdp_cp(module: torch.nn.Module, group: Any) -> None:
+def _rebuild_gdp_cp(module: Any, group: Any) -> None:
     """Rebuild GDP's cached headwise CP helper for one runtime task."""
     cp = module.cp
     module.cp = type(cp)(
@@ -238,9 +239,7 @@ def _rebuild_gdp_cp(module: torch.nn.Module, group: Any) -> None:
     module.ngroups_local_cp = module.cp.ngroups_local_tpcp
 
 
-def _bind_hybrid_stack_layout(
-    module: torch.nn.Module, *, group: Any, tp_cp_group: Any
-) -> None:
+def _bind_hybrid_stack_layout(module: Any, *, group: Any, tp_cp_group: Any) -> None:
     """Build the CP layout converter omitted by a static CP=1 construction."""
     from megatron.core.context_parallel import ContextParallelLayoutManager
     from megatron.core.models.hybrid.layers import utils as layer_utils
@@ -279,7 +278,9 @@ def _bind_hybrid_stack_layout(
     )
 
 
-def validate_dynamic_cp_model(model: torch.nn.Module) -> None:
+def validate_dynamic_cp_model(
+    model: torch.nn.Module, *, max_cp_size: int | None = None
+) -> None:
     """Reject MCore model internals that cannot be safely rebound at runtime."""
     modules = list(model.modules())
     for module in modules:
@@ -316,6 +317,52 @@ def validate_dynamic_cp_model(model: torch.nn.Module) -> None:
                 "Dynamic CP does not support chunkwise linear CP with the pinned "
                 "MCore; use headwise linear_cp_mode"
             )
+        if max_cp_size is None or max_cp_size == 1:
+            continue
+        # Inspect initialized modules: providers may derive head counts, and
+        # different hybrid layers can have different shapes. Since allowed CP
+        # sizes are powers of two, divisibility by the maximum covers all sizes.
+        if _is_mamba_mixer(module) or _is_gated_delta_product(module):
+            heads = cast(int, module.cp.nheads_local_tp)
+            groups = cast(int, module.cp.ngroups_local_tp)
+            if heads % max_cp_size:
+                raise ValueError(
+                    f"Dynamic CP max_size={max_cp_size} must divide {class_name}'s "
+                    f"TP-local head count ({heads}); lower max_size or TP size"
+                )
+            if max(groups, max_cp_size) % min(groups, max_cp_size):
+                raise ValueError(
+                    f"Dynamic CP max_size={max_cp_size} and {class_name}'s "
+                    f"TP-local group count ({groups}) must divide one another; "
+                    "lower max_size or TP size"
+                )
+        if _is_gated_delta_net(module):
+            for label, heads in (
+                ("key", cast(int, module.num_k_heads_local_tp)),
+                ("value", cast(int, module.num_v_heads_local_tp)),
+            ):
+                if heads % max_cp_size:
+                    raise ValueError(
+                        f"Dynamic CP max_size={max_cp_size} must divide "
+                        f"{class_name}'s TP-local {label} head count ({heads}); "
+                        "lower max_size or TP size"
+                    )
+        if getattr(module, "cp_comm_type", None) == "a2a" and hasattr(
+            module, "num_gqa_groups_per_partition"
+        ):
+            for label, heads in (
+                (
+                    "query",
+                    cast(int, module.num_attention_heads) // cast(int, module.tp_size),
+                ),
+                ("key/value", cast(int, module.num_gqa_groups_per_partition)),
+            ):
+                if heads % max_cp_size:
+                    raise ValueError(
+                        f"Dynamic CP max_size={max_cp_size} must divide the "
+                        f"TP-local attention {label} head count ({heads}) for "
+                        "cp_comm_type='a2a'; use 'p2p' or lower max_size or TP size"
+                    )
 
 
 def _save_dynamic_mtp_metrics(
@@ -376,9 +423,9 @@ def get_dynamic_mtp_metrics(
         ):
             metrics[f"mtp_{index + 1}_loss"] = float(loss)
             metrics[f"mtp_{index + 1}_acceptance_rate"] = float(rate)
-        return metrics
     finally:
         _DYNAMIC_MTP_METRICS.clear()
+    return metrics
 
 
 def _runtime_mtp_token_counts(
@@ -392,7 +439,7 @@ def _runtime_mtp_token_counts(
         torch.distributed.all_reduce(
             counts, op=torch.distributed.ReduceOp.SUM, group=cp_group
         )
-    return counts.unbind()
+    return counts[0], counts[1]
 
 
 def _dynamic_process_mtp_loss(
@@ -414,14 +461,15 @@ def _dynamic_process_mtp_loss(
     metric_avg_group: Optional[torch.distributed.ProcessGroup] = None,
     main_hidden_states: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Pinned MCore MTP loss with runtime-CP normalization and raw metrics."""
-    del metric_avg_group  # Dynamic metrics reduce once over the fixed lane group.
+    """MCore MTP loss with task-wide CP counts and mode-appropriate metrics."""
     from megatron.core.transformer.multi_token_prediction import (
         MTPLossAutoScaler,
+        MTPLossLoggingHelper,
         _compute_mtp_acceptance_counts,
         roll_tensor,
     )
 
+    dynamic_cp = isinstance(getattr(packed_seq_params, "local_cp_size", None), int)
     hidden_states_list = torch.chunk(hidden_states, 1 + config.mtp_num_layers, dim=0)
     hidden_states = (
         hidden_states_list[0] if main_hidden_states is None else main_hidden_states
@@ -522,6 +570,11 @@ def _dynamic_process_mtp_loss(
             num_tokens = rolled_num_tokens
 
         mtp_loss = layer_loss_mask * compute_language_model_loss(mtp_labels, mtp_logits)
+        main_num_tokens, task_mtp_num_tokens = original_num_tokens, num_tokens
+        if config.calculate_per_token_loss or (is_training and not dynamic_cp):
+            main_num_tokens, task_mtp_num_tokens = _runtime_mtp_token_counts(
+                original_num_tokens, num_tokens, cp_group
+            )
         if is_training:
             correct, total = _compute_mtp_acceptance_counts(
                 mtp_logits,
@@ -531,20 +584,36 @@ def _dynamic_process_mtp_loss(
                 runtime_gather_output,
                 tp_group,
             )
-            _save_dynamic_mtp_metrics(
-                loss_sum=mtp_loss.sum(),
-                num_tokens=num_tokens,
-                correct=correct,
-                total=total,
-                layer_number=mtp_layer_number,
-                num_layers=config.mtp_num_layers,
-            )
+            if dynamic_cp:
+                _save_dynamic_mtp_metrics(
+                    loss_sum=mtp_loss.sum(),
+                    num_tokens=num_tokens,
+                    correct=correct,
+                    total=total,
+                    layer_number=mtp_layer_number,
+                    num_layers=config.mtp_num_layers,
+                )
+            else:
+                # Static CP/PP workers still collect metrics through MCore's
+                # tracker, including its existing PP and DP reductions.
+                if metric_avg_group is None:
+                    metric_avg_group = parallel_state.get_data_parallel_group(
+                        with_context_parallel=True
+                    )
+                # The tracker averages CP ranks. Weight each rank by its share
+                # of valid tokens instead of averaging unequal shard means.
+                cp_size = cp_group.size() if cp_group is not None else 1
+                MTPLossLoggingHelper.save_metrics_to_tracker(
+                    mtp_loss.sum() * cp_size / task_mtp_num_tokens.clamp(min=1),
+                    correct,
+                    total,
+                    mtp_layer_number,
+                    config.mtp_num_layers,
+                    avg_group=metric_avg_group,
+                )
 
         mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
         if config.calculate_per_token_loss:
-            main_num_tokens, task_mtp_num_tokens = _runtime_mtp_token_counts(
-                original_num_tokens, num_tokens, cp_group
-            )
             mtp_loss = (
                 mtp_loss_scale
                 * mtp_loss
@@ -558,7 +627,7 @@ def _dynamic_process_mtp_loss(
 
 
 @contextmanager
-def _patch_mtp_loss_for_dynamic_cp(enabled: bool) -> Iterator[None]:
+def _patch_mtp_loss(enabled: bool) -> Iterator[None]:
     """Temporarily route GPT/HybridModel MTP through the NeMo-side fix.
 
     This module-level patch relies on the current worker contract: one training
@@ -587,6 +656,105 @@ def _patch_mtp_loss_for_dynamic_cp(enabled: bool) -> Iterator[None]:
             target.process_mtp_loss = original
 
 
+def _reduce_router_token_count(
+    activation: torch.Tensor,
+    valid_token_count: int | torch.Tensor | None,
+    group: torch.distributed.ProcessGroup,
+) -> torch.Tensor:
+    local_tokens = (
+        valid_token_count if valid_token_count is not None else activation.shape[0]
+    )
+    group_tokens = (
+        torch.as_tensor(local_tokens, device=activation.device).detach().clone()
+    )
+    if group.size() > 1:
+        torch.distributed.all_reduce(
+            group_tokens, op=torch.distributed.ReduceOp.SUM, group=group
+        )
+    return group_tokens
+
+
+def _apply_moe_z_loss(
+    self: Router, logits: torch.Tensor, padding_mask: torch.Tensor | None = None
+) -> torch.Tensor:
+    """Apply pinned z-loss with repeated-MTP scaling before autograd attachment."""
+    from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
+    from megatron.core.transformer.moe.moe_utils import (
+        MoEAuxLossAutoScaler,
+        z_loss_func,
+    )
+
+    if (
+        self.config.moe_z_loss_coeff is None
+        or self.config.moe_z_loss_coeff == 0
+        or not self.training
+        or not torch.is_grad_enabled()
+    ):
+        return logits
+    coefficient = self.config.moe_z_loss_coeff / self.tp_cp_group.size()
+    z_loss = z_loss_func(logits, coefficient, padding_mask=padding_mask)
+    if (
+        self.is_mtp_layer
+        and self.config.mtp_use_repeated_layer
+        and self.config.mtp_num_layers is not None
+    ):
+        z_loss = z_loss / self.config.mtp_num_layers
+    if self.calculate_per_token_loss:
+        local_tokens = (
+            (~padding_mask).sum() if padding_mask is not None else logits.shape[0]
+        )
+        logits = MoEAuxLossAutoScaler.apply(
+            logits, z_loss * local_tokens * self.tp_cp_group.size()
+        )
+    else:
+        logits = MoEAuxLossAutoScaler.apply(logits, z_loss)
+
+    num_layers = self.config.num_layers
+    if self.config.mtp_num_layers is not None:
+        num_layers += self.config.mtp_num_layers
+    layer_number = (
+        self.layer_number + self.config.num_layers
+        if self.is_mtp_layer
+        else self.layer_number
+    )
+    get_moe_metrics_tracker().record(
+        "z_loss",
+        z_loss / coefficient,
+        layer_number,
+        num_layers,
+        avg_group=self.tp_dp_cp_group,
+    )
+    return logits
+
+
+@contextmanager
+def _patch_moe_aux_loss_fixes() -> Iterator[None]:
+    """Scope empty-token and repeated-MTP corrections without changing groups."""
+    from megatron.core.transformer.moe import router as router_module
+
+    original = router_module.switch_load_balancing_loss_func
+    original_z_loss = router_module.TopKRouter.apply_z_loss
+
+    def padding_safe_loss(probs, tokens_per_expert, total_num_tokens, *args, **kwargs):
+        # A masked-out group contributes zero scores. The pinned implementation
+        # otherwise evaluates 0 / 0; clamping only its denominator leaves the
+        # loss and gradients zero and retains every rank's collective schedule.
+        denominator = (
+            total_num_tokens.clamp(min=1)
+            if isinstance(total_num_tokens, torch.Tensor)
+            else max(total_num_tokens, 1)
+        )
+        return original(probs, tokens_per_expert, denominator, *args, **kwargs)
+
+    router_module.switch_load_balancing_loss_func = padding_safe_loss
+    router_module.TopKRouter.apply_z_loss = _apply_moe_z_loss
+    try:
+        yield
+    finally:
+        router_module.switch_load_balancing_loss_func = original
+        router_module.TopKRouter.apply_z_loss = original_z_loss
+
+
 def _dynamic_attach_and_log_load_balancing_loss(
     self: Router,
     activation: torch.Tensor,
@@ -596,6 +764,8 @@ def _dynamic_attach_and_log_load_balancing_loss(
     reduce_group: torch.distributed.ProcessGroup,
     needs_dp_avg: bool = True,
     valid_token_count: int | torch.Tensor | None = None,
+    *,
+    aux_scale_tokens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Pinned router attachment with exact runtime-group token scaling.
 
@@ -603,7 +773,10 @@ def _dynamic_attach_and_log_load_balancing_loss(
     tp_cp_group.size()``.  That is only equal to the task token count for
     equally populated fixed shards.  The task setup (or the MTP mask hook) has
     already reduced the current mask over the runtime TP*CP group, so attach
-    that exact count. Logging intentionally retains the unscaled aux value.
+    that exact count. Global aux loss instead uses a common token count over
+    its fixed TP*DP*CP domain: all ranks contribute parts of the same global
+    objective, which must not depend on how its tokens were divided into tasks.
+    Logging intentionally retains the unscaled aux value.
     """
     from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
     from megatron.core.transformer.moe.moe_utils import MoEAuxLossAutoScaler
@@ -633,7 +806,13 @@ def _dynamic_attach_and_log_load_balancing_loss(
     )
 
     if self.calculate_per_token_loss:
-        task_tokens = getattr(self, "_nemo_dynamic_aux_scale_tokens", None)
+        task_tokens = aux_scale_tokens
+        if aux_loss_name == "global_load_balancing_loss" and task_tokens is None:
+            task_tokens = _reduce_router_token_count(
+                activation, valid_token_count, reduce_group
+            )
+        elif task_tokens is None:
+            task_tokens = getattr(self, "_nemo_dynamic_aux_scale_tokens", None)
         if task_tokens is None:
             raise RuntimeError(
                 "Dynamic CP MoE token scaling was not prepared before router forward"
@@ -642,16 +821,99 @@ def _dynamic_attach_and_log_load_balancing_loss(
     return MoEAuxLossAutoScaler.apply(activation, aux_loss)
 
 
+def _static_attach_and_log_load_balancing_loss(
+    self: Router,
+    activation: torch.Tensor,
+    aux_loss_coeff: float,
+    aux_loss: torch.Tensor,
+    aux_loss_name: str,
+    reduce_group: torch.distributed.ProcessGroup,
+    needs_dp_avg: bool = True,
+    valid_token_count: int | torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Normalize fixed CP/TP shards by their actual common token count.
+
+    Packed padding and sequence-parallel sharding can leave different numbers
+    of valid tokens on each rank, even with fixed CP. Count at attachment so
+    pipeline schedules and checkpoint recomputation use the current activation
+    instead of mutable metadata from a more recent microbatch.
+    """
+    group_tokens = None
+    if self.calculate_per_token_loss:
+        group = (
+            reduce_group
+            if aux_loss_name == "global_load_balancing_loss"
+            else self.tp_cp_group
+        )
+        group_tokens = _reduce_router_token_count(activation, valid_token_count, group)
+    return _dynamic_attach_and_log_load_balancing_loss(
+        self,
+        activation,
+        aux_loss_coeff,
+        aux_loss,
+        aux_loss_name,
+        reduce_group,
+        needs_dp_avg,
+        valid_token_count,
+        aux_scale_tokens=group_tokens,
+    )
+
+
+@contextmanager
+def preserve_static_moe_loss_scaling(
+    model: torch.nn.Module | list[torch.nn.Module],
+) -> Iterator[None]:
+    """Scope the fixed-group router correction to a full forward/backward run."""
+    model_chunks = model if isinstance(model, list) else [model]
+    modules = tuple(module for chunk in model_chunks for module in chunk.modules())
+    router_classes = {type(module) for module in modules if isinstance(module, Router)}
+    mtp_enabled = any(
+        bool(getattr(getattr(module, "config", None), "mtp_num_layers", 0))
+        for module in modules
+    )
+    patched_classes: list[tuple[type[Any], bool, Any]] = []
+    try:
+        for router_class in router_classes:
+            method_name = "attach_and_log_load_balancing_loss"
+            if not hasattr(router_class, method_name):
+                continue
+            patched_classes.append(
+                (
+                    router_class,
+                    method_name in router_class.__dict__,
+                    router_class.__dict__.get(method_name),
+                )
+            )
+            router_class.attach_and_log_load_balancing_loss = (
+                _static_attach_and_log_load_balancing_loss
+            )
+        with (
+            _patch_moe_aux_loss_fixes(),
+            _patch_mtp_loss(mtp_enabled),
+            _patch_hybrid_mtp_padding_masks(model_chunks[0], modules, dynamic=False),
+        ):
+            yield
+    finally:
+        for router_class, had_direct_method, original_method in patched_classes:
+            if had_direct_method:
+                router_class.attach_and_log_load_balancing_loss = original_method
+            else:
+                delattr(router_class, "attach_and_log_load_balancing_loss")
+
+
 @contextmanager
 def _patch_hybrid_mtp_padding_masks(
-    model: torch.nn.Module, modules: tuple[torch.nn.Module, ...] | None = None
+    model: torch.nn.Module,
+    modules: tuple[torch.nn.Module, ...] | None = None,
+    *,
+    dynamic: bool = True,
 ) -> Iterator[None]:
-    """Carry correct router padding semantics through every dynamic MTP block.
+    """Carry correct router padding semantics through every MTP block.
 
     The pinned HybridModel accepts ``padding_mask`` and sends it through the
     backbone, while its nested MTP call accidentally omits the same keyword.
     A HybridModel pre-hook captures that missing value and an MTP pre-hook
-    supplies it without changing static execution or the MCore submodule.
+    supplies it without changing the MCore submodule.
 
     MCore's MTP roll helper fills newly exposed positions with false.  That is
     correct for a validity mask, but ``padding_mask`` uses the opposite meaning
@@ -738,7 +1000,8 @@ def _patch_hybrid_mtp_padding_masks(
                 kwargs["padding_mask"] = padding_mask
 
         if (
-            module.training
+            dynamic
+            and module.training
             and torch.is_grad_enabled()
             and getattr(module, "calculate_per_token_loss", False)
             and _has_positive_coefficient(module.config.moe_aux_loss_coeff)
@@ -784,7 +1047,7 @@ def _patch_hybrid_mtp_padding_masks(
     # This class-level patch has the same single-model worker assumption as the
     # MTP patch above; the preservation context always restores it in finally.
     for router_class in {
-        type(module) for module in modules if isinstance(module, Router)
+        type(module) for module in modules if dynamic and isinstance(module, Router)
     }:
         if not hasattr(router_class, "attach_and_log_load_balancing_loss"):
             continue
@@ -816,12 +1079,16 @@ def _patch_hybrid_mtp_padding_masks(
         for handle in handles:
             handle.remove()
         for module in modules:
-            if isinstance(module, Router) and hasattr(
-                module, "_nemo_dynamic_aux_scale_tokens"
+            if (
+                dynamic
+                and isinstance(module, Router)
+                and hasattr(module, "_nemo_dynamic_aux_scale_tokens")
             ):
                 del module._nemo_dynamic_aux_scale_tokens
-            if isinstance(module, Router) and hasattr(
-                module, "_nemo_dynamic_moe_task_marker"
+            if (
+                dynamic
+                and isinstance(module, Router)
+                and hasattr(module, "_nemo_dynamic_moe_task_marker")
             ):
                 del module._nemo_dynamic_moe_task_marker
         for router_class, had_direct_method, original_method in patched_classes:
@@ -843,6 +1110,23 @@ def preserve_attention_cp_groups(model: torch.nn.Module) -> Iterator[None]:
     saved_collections = [
         (module, module.pg_collection) for module in targets.pg_collections
     ]
+    # TE stores its CP state outside MCore's pg_collection. Its packed forward
+    # updates these fields even when the enclosing model never rebinds them.
+    saved_te_contexts = [
+        (
+            cast(Any, module),
+            module.cp_group,
+            module.cp_global_ranks,
+            module.cp_stream,
+            module.cp_comm_type,
+        )
+        for module in modules
+        if callable(getattr(module, "set_context_parallel_group", None))
+        and all(
+            hasattr(module, name)
+            for name in ("cp_group", "cp_global_ranks", "cp_stream", "cp_comm_type")
+        )
+    ]
     saved_mamba = [(module, module.cp) for module in targets.mamba_mixers]
     saved_gdp = [
         (
@@ -860,7 +1144,7 @@ def preserve_attention_cp_groups(model: torch.nn.Module) -> Iterator[None]:
     ]
     saved_direct_groups = [
         (
-            module,
+            cast(Any, module),
             module.cp_group,
             getattr(module, "tp_cp_group", None),
             hasattr(module, "tp_cp_group"),
@@ -907,7 +1191,8 @@ def preserve_attention_cp_groups(model: torch.nn.Module) -> Iterator[None]:
             _ROUTER_CONFIG_BASELINES[config_id] = baseline
             router_configs[config_id] = config
         with (
-            _patch_mtp_loss_for_dynamic_cp(mtp_enabled),
+            _patch_moe_aux_loss_fixes(),
+            _patch_mtp_loss(mtp_enabled),
             _patch_hybrid_mtp_padding_masks(model, modules),
         ):
             try:
@@ -920,6 +1205,10 @@ def preserve_attention_cp_groups(model: torch.nn.Module) -> Iterator[None]:
         _ACTIVE_BIND_SIGNATURES.pop(model_id, None)
         for module, collection in saved_collections:
             module.pg_collection = collection
+        for module, cp_group, cp_ranks, cp_stream, cp_comm_type in saved_te_contexts:
+            module.set_context_parallel_group(
+                cp_group, cp_ranks, cp_stream, cp_comm_type
+            )
         for module, cp in saved_mamba:
             module.cp = cp
         for module, cp_size, feat_dim_split in saved_gdn:
@@ -1070,9 +1359,14 @@ def bind_attention_cp_group(model: torch.nn.Module, packed_seq_params: Any) -> A
         for module in targets.gated_delta_products:
             _rebuild_gdp_cp(module, group)
         for module in targets.gated_delta_nets:
-            baseline_size = module.cp_size
-            baseline_split = getattr(module, "feat_dim_split", None)
-            module.cp_size = context.size
+            # The class-name predicate identifies optional MCore GDN variants;
+            # nn.Module itself does not declare their scalar/layout metadata.
+            gdn = cast(Any, module)
+            baseline_size: int = gdn.cp_size
+            baseline_split: tuple[int, ...] | None = getattr(
+                gdn, "feat_dim_split", None
+            )
+            gdn.cp_size = context.size
             if baseline_split is not None:
                 scaled_split = []
                 for value in baseline_split:
@@ -1083,7 +1377,7 @@ def bind_attention_cp_group(model: torch.nn.Module, packed_seq_params: Any) -> A
                             f"by runtime CP={context.size}"
                         )
                     scaled_split.append(numerator // context.size)
-                module.feat_dim_split = tuple(scaled_split)
+                gdn.feat_dim_split = tuple(scaled_split)
         if binding_cache_active:
             _ACTIVE_BIND_SIGNATURES[model_id] = binding_signature
     model_packed = copy(packed_seq_params)

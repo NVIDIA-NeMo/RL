@@ -65,9 +65,19 @@ experts from communicating across independently scheduled CP blocks. Router
 auxiliary losses and per-layer MoE metrics stay attached to the real microbatch
 that produced them; placeholder tasks carry zero valid tokens and do not affect
 loss normalization. `global_aux_loss` uses aligned placeholder rounds so every
-rank enters its full-domain collective in the same order. Quantile balancing and
+rank enters its full-domain collective in the same order. The same alignment is
+required for FP8 delayed scaling, FP8 attention, and opaque custom/per-module
+precision recipes: their amax reductions can use fixed groups larger than an
+active task. Built-in current/block/MXFP8 GEMM recipes without these additional
+reductions retain uneven task counts. Quantile balancing and
 overlapped MoE microbatch execution remain rejected because their mask or
 scheduling requirements cannot follow the active task safely.
+
+Workers validate the largest active CP size against the initialized model's
+head/group counts. Headwise Mamba/GDP, GDN, and A2A attention have divisibility
+constraints beyond the planner's power-of-two requirement. An incompatible
+maximum is rejected during initialization, before a long example reaches an
+unsupported runtime group.
 
 ## Dispatch and execution
 
@@ -121,6 +131,9 @@ the active group through forward and backward, then restores the original
 collection. The model receives a shallow copy of packed metadata with a real
 singleton group for CP=1, because RoPE interprets `None` as a static-group
 fallback. Loss and logprob code retain the explicit size-one/None convention.
+Scope exit also restores TE's separate group, global ranks, stream, and
+communication type through its setter, including when execution raises an
+exception. This allows subsequent ordinary static/no-CP model reuse.
 
 During worker setup, only dynamic-CP Megatron actors register a Ray serializer
 for tensor results. Importing MCore in the worker replaces
@@ -147,6 +160,14 @@ worker. Each sequence is aligned to the least common multiple of the user
 padding factor and the active CP, sequence-parallel, and precision requirements.
 CP>1 uses the two-chunk balanced layout. Padding tokens and placeholder samples
 are excluded from the objective and returned outputs.
+Placeholder loss processing returns an autograd-connected zero before invoking
+the algorithm's loss preparation. This keeps backward collectives active without
+presenting a one-row dummy batch to preference losses that require complete pairs.
+
+Identical row selections share one CPU payload allocation on the driver. Only
+sample and token masks are read to compute training denominators; the driver
+does not copy a complete global batch for that calculation. This reduces local
+tensor copies, without assuming Ray deduplicates separate RPC argument puts.
 
 Static `REPLICATED_AXES` remains valid for static CP. Dynamic dispatch removes CP
 from both input replication and output replication filters. Outputs are gathered
@@ -173,19 +194,41 @@ This cancels the pinned no-pipeline executor's
 `static_CP / number_of_local_tasks`
 scaling and compensates the active-CP gather's backward SUM. DDP sums gradients
 over the fixed DP × CP domain. Metrics are retained only on task owners before
-global aggregation. `tests/unit/models/megatron/test_dynamic_cp_scaling.py`
-checks this multiplier against the installed MCore loss callback. A future
-MCore pin must pass that contract test and distributed parity before adoption.
+global aggregation. The contract test in
+`tests/unit/distributed/test_dynamic_context_parallel.py` checks this multiplier
+against the installed MCore loss callback. A future MCore pin must pass that
+contract test and distributed parity before adoption.
 
 For MoE load balancing, MCore's per-token path assumes
-`local_valid_tokens * TP_CP_size` equals the active task's token count. Dynamic
+`local_valid_tokens * TP_CP_size` equals the active task's token count. Both static and dynamic
 packing can leave different valid-token counts on participating shards. A router
 pre-hook sums the exact valid count over the active TP×CP group, and the temporary
-router attachment uses that task count directly. The worker's ordinary
+dynamic router attachment uses that task count directly. Static training sums
+the current attachment's count, so PP schedules and recomputation do not depend
+on metadata from another microbatch. Global load balancing instead uses the
+common count over its full reduction domain; its gradient weight must not depend
+on which dynamic task contains a token. The worker's ordinary
 `1/global_valid_tokens` gradient scale therefore remains sufficient and does not
 need a second per-shard correction. For reporting, ordinary aux
 metrics are divided by unique real tasks, while z-loss reproduces MCore's
 average over every real TP×CP rank participation.
+
+NeMo-owned static packed inputs and dense no-CP inputs also supply physical
+padding masks for ordinary MoE dispatchers. Prompt tokens remain router inputs
+even if their language-model loss is masked. Model-owned multimodal layouts,
+quantile routing, and incompatible hybrid CP layouts retain their existing mask
+handling; this does not add padding-aware routing support to those paths.
+An all-padding auxiliary group uses a denominator of at least one so its zero
+scores contribute a finite zero rather than `0/0`.
+Repeated-layer MTP z-loss is divided by prediction depth before attaching its
+gradient, matching the logged value. A zero z-loss coefficient disables it
+without recording a `0/0` metric.
+
+The shared MTP helper uses CP-wide main/MTP token counts for per-token loss
+scaling in dynamic, static, and no-CP execution. Static MTP logging weights CP
+shards by their valid-token count while preserving the native PP/DP tracker.
+MTP mask rolling operates on validity and converts back to padding semantics at
+the router; hybrid MTP receives the mask omitted by the pinned upstream caller.
 
 ## Validation
 
@@ -198,7 +241,10 @@ bash tests/functional/dynamic_cp.sh
 
 The functional test compares loss, gradients, an optimizer update, output
 reassembly, fused RoPE, and Transformer Engine attention across active CP sizes
-1, 2, and 4, including TP and initialized-static-CP variants.
+1, 2, and 4, including TP and initialized-static-CP variants. It also executes an
+ordinary static/no-CP forward and backward after leaving a dynamic scope to check
+that model state is restored. This small dense test is not a substitute for
+distributed MoE, MTP, FP8, HybridEP, or PP/VPP validation on the training image.
 
 End-to-end performance should be measured with matched local recipes. Keep the
 model, generated token batch, parallel topology, optimizer, and precision fixed;

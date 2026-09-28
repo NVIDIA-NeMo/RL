@@ -11,7 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -261,3 +263,216 @@ def test_collect_mtp_metrics_noop_when_mtp_disabled(monkeypatch):
     )
     assert "mtp_metrics" not in metrics
     assert not called["get_mtp_metrics"]
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize("cp_size", [1, 2, 4])
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_mtp_gradient_survives_a_roll_into_an_empty_cp_shard(
+    monkeypatch: pytest.MonkeyPatch, cp_size: int, dynamic: bool
+) -> None:
+    """MTP normalization includes valid targets rolled onto an empty shard."""
+    from megatron.core.transformer import multi_token_prediction as mcore_mtp
+
+    from nemo_rl.models.megatron import dynamic_cp
+
+    group = SimpleNamespace(size=lambda: cp_size)
+    rolled_mask = torch.tensor([[1.0, 0.0]])
+    main_mask = (
+        torch.ones_like(rolled_mask) if cp_size == 1 else torch.zeros_like(rolled_mask)
+    )
+
+    def roll_tensor(tensor: torch.Tensor, **kwargs):
+        rolled = tensor if tensor.dtype == torch.long else rolled_mask
+        return rolled, rolled.sum() if kwargs.get("return_sum", True) else None
+
+    def all_reduce(counts: torch.Tensor, *, group, op) -> None:
+        assert group.size() == cp_size
+        counts.copy_(torch.tensor([4.0, 2.0]))
+
+    monkeypatch.setattr(mcore_mtp, "roll_tensor", roll_tensor)
+    reduction = Mock(side_effect=all_reduce)
+    monkeypatch.setattr(dynamic_cp.torch.distributed, "all_reduce", reduction)
+    monkeypatch.setattr(
+        mcore_mtp.MTPLossAutoScaler, "main_loss_backward_scale", torch.tensor(1.0)
+    )
+    hidden = torch.ones((4, 1), requires_grad=True)
+    output = dynamic_cp._dynamic_process_mtp_loss(
+        hidden_states=hidden,
+        labels=torch.zeros((1, 2), dtype=torch.long),
+        loss_mask=main_mask,
+        output_layer=lambda value, **kwargs: (value.transpose(0, 1), None),
+        output_weight=None,
+        runtime_gather_output=False,
+        is_training=False,
+        compute_language_model_loss=lambda labels, logits: logits,
+        config=SimpleNamespace(
+            mtp_num_layers=1,
+            mtp_detach_heads=False,
+            mtp_loss_scaling_factor=0.5,
+            calculate_per_token_loss=True,
+        ),
+        cp_group=group,
+        packed_seq_params=SimpleNamespace(local_cp_size=cp_size) if dynamic else None,
+    )
+    output.sum().backward()
+
+    torch.testing.assert_close(hidden.grad[:2], torch.ones((2, 1)))
+    torch.testing.assert_close(hidden.grad[2:], torch.tensor([[1.0], [0.0]]))
+    assert reduction.call_count == (1 if cp_size > 1 else 0)
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize("explicit_metric_group", [False, True])
+def test_mtp_metrics_use_the_mode_specific_tracker(
+    monkeypatch: pytest.MonkeyPatch, dynamic: bool, explicit_metric_group: bool
+) -> None:
+    """Static and dynamic execution keep their respective metric reducers."""
+    from megatron.core.transformer import multi_token_prediction as mcore_mtp
+
+    from nemo_rl.models.megatron import dynamic_cp
+
+    monkeypatch.setattr(
+        mcore_mtp,
+        "roll_tensor",
+        lambda tensor, **kwargs: (
+            tensor,
+            tensor.sum() if kwargs.get("return_sum", True) else None,
+        ),
+    )
+    monkeypatch.setattr(
+        mcore_mtp,
+        "_compute_mtp_acceptance_counts",
+        lambda *args: (torch.tensor(1.0), torch.tensor(2.0)),
+    )
+    static_tracker = Mock()
+    dynamic_tracker = Mock()
+    monkeypatch.setattr(
+        mcore_mtp.MTPLossLoggingHelper, "save_metrics_to_tracker", static_tracker
+    )
+    monkeypatch.setattr(dynamic_cp, "_save_dynamic_mtp_metrics", dynamic_tracker)
+    metric_group = object()
+    fallback = Mock(return_value=metric_group)
+    monkeypatch.setattr(dynamic_cp.parallel_state, "get_data_parallel_group", fallback)
+
+    dynamic_cp._dynamic_process_mtp_loss(
+        hidden_states=torch.ones((4, 1)),
+        labels=torch.zeros((1, 2), dtype=torch.long),
+        loss_mask=torch.ones((1, 2)),
+        output_layer=lambda value, **kwargs: (value.transpose(0, 1), None),
+        output_weight=None,
+        runtime_gather_output=False,
+        is_training=True,
+        compute_language_model_loss=lambda labels, logits: logits,
+        config=SimpleNamespace(
+            mtp_num_layers=1,
+            mtp_detach_heads=False,
+            mtp_loss_scaling_factor=0.5,
+            calculate_per_token_loss=True,
+        ),
+        packed_seq_params=SimpleNamespace(local_cp_size=1) if dynamic else None,
+        metric_avg_group=metric_group if explicit_metric_group else None,
+    )
+
+    if dynamic:
+        dynamic_tracker.assert_called_once()
+        assert dynamic_tracker.call_args.kwargs["loss_sum"].item() == 2.0
+        assert dynamic_tracker.call_args.kwargs["num_tokens"].item() == 2.0
+        static_tracker.assert_not_called()
+        fallback.assert_not_called()
+    else:
+        static_tracker.assert_called_once()
+        assert static_tracker.call_args.args[0].item() == 1.0
+        assert static_tracker.call_args.kwargs["avg_group"] is metric_group
+        dynamic_tracker.assert_not_called()
+        assert fallback.call_count == (0 if explicit_metric_group else 1)
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize("raise_inside", [False, True])
+def test_static_schedule_scopes_the_shared_mtp_callback(raise_inside: bool) -> None:
+    """Static execution restores MCore's MTP callback after success or failure."""
+    from megatron.core.models.gpt import gpt_model
+
+    from nemo_rl.models.megatron import dynamic_cp
+
+    model = torch.nn.Linear(2, 2)
+    model.config = SimpleNamespace(mtp_num_layers=1)
+    original = gpt_model.process_mtp_loss
+    expected_error = (
+        pytest.raises(RuntimeError, match="schedule failed")
+        if raise_inside
+        else nullcontext()
+    )
+    with expected_error:
+        with dynamic_cp.preserve_static_moe_loss_scaling(model):
+            assert gpt_model.process_mtp_loss is dynamic_cp._dynamic_process_mtp_loss
+            if raise_inside:
+                raise RuntimeError("schedule failed")
+
+    assert gpt_model.process_mtp_loss is original
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize("per_token", [False, True])
+def test_static_mtp_metrics_weight_uneven_cp_masks(
+    monkeypatch: pytest.MonkeyPatch, per_token: bool
+) -> None:
+    """Static MTP metrics use the context-wide token-weighted mean."""
+    from megatron.core.transformer import multi_token_prediction as mcore_mtp
+
+    from nemo_rl.models.megatron import dynamic_cp
+
+    cp_group = SimpleNamespace(size=lambda: 2)
+    monkeypatch.setattr(
+        mcore_mtp,
+        "roll_tensor",
+        lambda tensor, **kwargs: (
+            tensor,
+            tensor.sum() if kwargs.get("return_sum", True) else None,
+        ),
+    )
+    monkeypatch.setattr(
+        mcore_mtp,
+        "_compute_mtp_acceptance_counts",
+        lambda *args: (torch.tensor(1.0), torch.tensor(1.0)),
+    )
+    tracker = Mock()
+    monkeypatch.setattr(
+        mcore_mtp.MTPLossLoggingHelper, "save_metrics_to_tracker", tracker
+    )
+
+    def all_reduce(counts: torch.Tensor, *, group, op) -> None:
+        assert group is cp_group
+        counts.copy_(torch.tensor([4.0, 4.0]))
+
+    reduction = Mock(side_effect=all_reduce)
+    monkeypatch.setattr(dynamic_cp.torch.distributed, "all_reduce", reduction)
+    for mask, values in (
+        ([1.0, 0.0, 0.0], [2.0, 0.0, 0.0]),
+        ([1.0, 1.0, 1.0], [4.0, 4.0, 4.0]),
+    ):
+        hidden = torch.cat((torch.zeros((3, 1)), torch.tensor(values).unsqueeze(-1)))
+        dynamic_cp._dynamic_process_mtp_loss(
+            hidden_states=hidden,
+            labels=torch.zeros((1, 3), dtype=torch.long),
+            loss_mask=torch.tensor([mask]),
+            output_layer=lambda value, **kwargs: (value.transpose(0, 1), None),
+            output_weight=None,
+            runtime_gather_output=False,
+            is_training=True,
+            compute_language_model_loss=lambda labels, logits: logits,
+            config=SimpleNamespace(
+                mtp_num_layers=1,
+                mtp_detach_heads=False,
+                mtp_loss_scaling_factor=0.5,
+                calculate_per_token_loss=per_token,
+            ),
+            cp_group=cp_group,
+            metric_avg_group=object(),
+        )
+
+    logged_average = sum(call.args[0] for call in tracker.call_args_list) / 2
+    assert logged_average.item() == pytest.approx(3.5)
+    assert reduction.call_count == 2

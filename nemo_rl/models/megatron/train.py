@@ -70,6 +70,7 @@ from nemo_rl.models.megatron.dynamic_cp import (
     bind_attention_cp_group,
     configure_dynamic_moe_loss_scaling,
     preserve_attention_cp_groups,
+    preserve_static_moe_loss_scaling,
     runtime_cp_from_packed,
 )
 from nemo_rl.models.megatron.opd_full_capture import get_opd_full_capture_context
@@ -110,7 +111,25 @@ def _prepare_padding_mask_for_model(
     padding_mask: Optional[torch.Tensor],
 ) -> Optional[torch.Tensor]:
     """Match a CP-local padding mask to the model's sequence-parallel layout."""
-    if padding_mask is None or not get_model_config(model).sequence_parallel:
+    if padding_mask is None:
+        return None
+    config = get_model_config(model)
+    routing_type = getattr(config, "moe_router_load_balancing_type", None)
+    routing_types = (
+        routing_type if isinstance(routing_type, (list, tuple)) else (routing_type,)
+    )
+    # Providers can select these modes without an explicit policy config entry.
+    # Retain their existing mask-free path until MCore supports their layouts.
+    if "quantile_balancing" in routing_types or (
+        getattr(config, "context_parallel_size", 1) > 1
+        and (
+            getattr(config, "linear_cp_mode", None) == "chunkwise"
+            or getattr(config, "linear_cp_layout", None)
+            != getattr(config, "attention_cp_layout", None)
+        )
+    ):
+        return None
+    if not config.sequence_parallel:
         return padding_mask
 
     core_model = unwrap_model(model)
@@ -599,7 +618,7 @@ def megatron_forward_backward(
         suspend_activation_offload_for_forward_only(model, forward_only),
         preserve_attention_cp_groups(model)
         if dynamic_cp_config(post_processing_fn.cfg) is not None
-        else nullcontext(),
+        else preserve_static_moe_loss_scaling(model),
     ):
         try:
             return forward_backward_func(
@@ -684,6 +703,24 @@ class LossPostProcessor:
         Returns:
             Callable: Function that takes output tensor and returns (loss, metrics) tuple
         """
+        if getattr(packed_seq_params, "dynamic_cp_padding_only", False) is True:
+            # Idle lanes still run forward/backward to match model collectives,
+            # but their one-row placeholder is not a valid preference pair (or
+            # an input to every other loss). Skip loss preparation and validation.
+            student_logits = data_dict.get("student_logits")
+
+            def padding_loss(
+                output_tensor: torch.Tensor,
+            ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+                # An empty view keeps autograd connected without reading the
+                # logits: unlike sum() * 0, it cannot turn inf/nan into a loss.
+                loss = output_tensor[..., :0].sum(dtype=torch.float32)
+                if student_logits is not None:
+                    loss = loss + student_logits[..., :0].sum(dtype=torch.float32)
+                return loss, {}
+
+            return padding_loss
+
         cp_context = _postprocessing_cp_context(packed_seq_params)
         # A custom prepare_fn (e.g. value models) overrides the default logit prep.
         logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)

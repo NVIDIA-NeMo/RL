@@ -2,7 +2,9 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 """Runtime binding contracts shared by Qwen MoE and Nemotron hybrid models."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -135,7 +137,11 @@ def test_dynamic_binding_updates_router_and_ssm_then_restores(monkeypatch):
     active_cp = _Group(2, rank=1)
     original_tp_cp = _Group(2)
     active_tp_cp = _Group(4)
-    config = SimpleNamespace(moe_aux_loss_coeff=[0.1, 0.2], moe_z_loss_coeff=0.01)
+    config = SimpleNamespace(
+        moe_aux_loss_coeff=[0.1, 0.2],
+        moe_router_load_balancing_type=["aux_loss", "seq_aux_loss"],
+        moe_z_loss_coeff=0.01,
+    )
 
     model = torch.nn.Module()
     model.add_module("mamba", _Mamba(original_cp))
@@ -303,6 +309,7 @@ def test_dynamic_moe_scaling_reduces_once_per_task(monkeypatch, active_size):
 
 def test_dynamic_router_attachment_uses_exact_task_token_count(monkeypatch):
     from megatron.core.transformer.moe import moe_logging, moe_utils
+
     from nemo_rl.models.megatron import dynamic_cp
 
     tracker = SimpleNamespace(record=lambda *args, **kwargs: None)
@@ -381,6 +388,7 @@ def test_runtime_mtp_counts_reduce_before_division(monkeypatch):
 
 def test_dynamic_mtp_backward_uses_task_wide_token_ratio(monkeypatch):
     from megatron.core.transformer import multi_token_prediction as mcore_mtp
+
     from nemo_rl.models.megatron import dynamic_cp
 
     group = _Group(2)
@@ -460,7 +468,8 @@ def test_dynamic_mtp_metrics_are_token_weighted(monkeypatch):
     assert dynamic_cp._DYNAMIC_MTP_METRICS == {}
 
 
-def test_dynamic_hybrid_mtp_receives_router_padding_mask(monkeypatch):
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_hybrid_mtp_receives_router_padding_mask(monkeypatch, dynamic):
     from nemo_rl.models.megatron import dynamic_cp
 
     class _MTPRouter(torch.nn.Module):
@@ -503,7 +512,7 @@ def test_dynamic_hybrid_mtp_receives_router_padding_mask(monkeypatch):
     padding_mask = torch.tensor([[False, True]])
     monkeypatch.setattr(dynamic_cp, "Router", _MTPRouter)
 
-    with dynamic_cp._patch_hybrid_mtp_padding_masks(model):
+    with dynamic_cp._patch_hybrid_mtp_padding_masks(model, dynamic=dynamic):
         result = model(padding_mask=padding_mask)
 
     assert torch.equal(result, padding_mask)
@@ -595,3 +604,340 @@ def test_dynamic_model_validation_rejects_chunkwise_ssm():
 
     with pytest.raises(ValueError, match="headwise"):
         dynamic_cp.validate_dynamic_cp_model(model)
+
+
+@pytest.mark.parametrize("module_type", [_Mamba, _GatedDeltaProduct])
+def test_dynamic_model_validation_checks_headwise_ssm_capacity(module_type):
+    from nemo_rl.models.megatron import dynamic_cp
+
+    model = module_type(_Group(1))
+    # Groups may be repeated across CP ranks; max CP need not divide ngroups.
+    dynamic_cp.validate_dynamic_cp_model(model, max_cp_size=16)
+    with pytest.raises(ValueError, match="TP-local head count"):
+        dynamic_cp.validate_dynamic_cp_model(model, max_cp_size=32)
+
+    # A valid static model can have 24 heads in 6 groups. CP=8 divides
+    # its heads, but neither 6 nor 8 divides the other for group replication.
+    model.cp.nheads_local_tp = 24
+    model.cp.ngroups_local_tp = 6
+    with pytest.raises(ValueError, match="group count"):
+        dynamic_cp.validate_dynamic_cp_model(model, max_cp_size=8)
+
+
+def test_dynamic_model_validation_requires_whole_gdn_heads():
+    from nemo_rl.models.megatron import dynamic_cp
+
+    model = _GatedDelta(_Group(1))
+    model.num_k_heads_local_tp = 2
+    model.num_v_heads_local_tp = 8
+    # Projection channel widths can divide CP=4 even though two key heads
+    # cannot be split into four whole heads.
+    assert all(width % 4 == 0 for width in model.feat_dim_split)
+    with pytest.raises(ValueError, match="TP-local key head count"):
+        dynamic_cp.validate_dynamic_cp_model(model, max_cp_size=4)
+    dynamic_cp.validate_dynamic_cp_model(model, max_cp_size=2)
+
+
+def test_dynamic_model_validation_checks_a2a_kv_heads_only_for_a2a():
+    from nemo_rl.models.megatron import dynamic_cp
+
+    attention = torch.nn.Module()
+    attention.cp_comm_type = "a2a"
+    attention.tp_size = 2
+    attention.num_attention_heads = 16
+    attention.num_gqa_groups_per_partition = 2
+    with pytest.raises(ValueError, match="attention key/value head count"):
+        dynamic_cp.validate_dynamic_cp_model(attention, max_cp_size=4)
+    dynamic_cp.validate_dynamic_cp_model(attention, max_cp_size=2)
+
+    # Ring/P2P CP partitions sequence positions, so this head count limit
+    # belongs only to attention's all-to-all implementation.
+    attention.cp_comm_type = "p2p"
+    dynamic_cp.validate_dynamic_cp_model(attention, max_cp_size=16)
+
+
+class _TEAttention(torch.nn.Module):
+    """CPU stand-in for TE's context-parallel setter."""
+
+    def __init__(self, cp_group: object | None) -> None:
+        super().__init__()
+        self.set_context_parallel_group(cp_group, [0, 1], object(), "p2p")
+
+    def set_context_parallel_group(
+        self,
+        cp_group: object | None,
+        cp_global_ranks: list[int] | None,
+        cp_stream: object | None,
+        cp_comm_type: str,
+    ) -> None:
+        self.cp_group = cp_group
+        self.cp_global_ranks = cp_global_ranks
+        self.cp_stream = cp_stream
+        self.cp_comm_type = cp_comm_type
+
+    def forward(self) -> tuple[Any, ...]:
+        return self.cp_group, self.cp_global_ranks, self.cp_stream, self.cp_comm_type
+
+
+@pytest.mark.parametrize("static_cp", [False, True])
+@pytest.mark.parametrize("raise_inside", [False, True])
+def test_te_context_is_restored_after_dynamic_schedule(
+    static_cp: bool, raise_inside: bool
+) -> None:
+    """Dynamic TE state does not leak into later static/no-CP work."""
+    from nemo_rl.models.megatron.dynamic_cp import preserve_attention_cp_groups
+
+    attention = _TEAttention(object() if static_cp else None)
+    model = torch.nn.Sequential(attention)
+    original = attention()
+    dynamic_group = object()
+    expected_error = (
+        pytest.raises(RuntimeError, match="schedule failed")
+        if raise_inside
+        else nullcontext()
+    )
+    with expected_error:
+        with preserve_attention_cp_groups(model):
+            attention.set_context_parallel_group(
+                dynamic_group, [0, 1, 2, 3], object(), "a2a"
+            )
+            assert attention.cp_group is dynamic_group
+            if raise_inside:
+                raise RuntimeError("schedule failed")
+
+    restored = attention()
+    for before, after in zip(original, restored, strict=True):
+        assert after is before
+
+
+def _mock_aux_attachment(monkeypatch):
+    from megatron.core.transformer.moe import moe_logging, moe_utils
+
+    attached = []
+    monkeypatch.setattr(
+        moe_logging,
+        "get_moe_metrics_tracker",
+        lambda: SimpleNamespace(record=lambda *args, **kwargs: None),
+    )
+
+    def attach(activation, loss):
+        attached.append(loss)
+        return activation
+
+    monkeypatch.setattr(moe_utils.MoEAuxLossAutoScaler, "apply", attach)
+    return attached
+
+
+def _router(group):
+    return SimpleNamespace(
+        is_mtp_layer=False,
+        layer_number=1,
+        calculate_per_token_loss=True,
+        tp_cp_group=group,
+        config=SimpleNamespace(
+            mtp_use_repeated_layer=False, mtp_num_layers=None, num_layers=1
+        ),
+    )
+
+
+def test_static_aux_uses_exact_count_for_uneven_valid_shards(monkeypatch):
+    from nemo_rl.models.megatron import dynamic_cp
+
+    attached = _mock_aux_attachment(monkeypatch)
+    group = _Group(2)
+    local_count = torch.tensor(1.0)
+
+    def reduce_count(count, *, op, group):
+        count.add_(3)
+
+    monkeypatch.setattr(dynamic_cp.torch.distributed, "all_reduce", reduce_count)
+    loss = torch.tensor(2.0, requires_grad=True)
+    dynamic_cp._static_attach_and_log_load_balancing_loss(
+        _router(group),
+        torch.ones(4),
+        0.1,
+        loss,
+        "load_balancing_loss",
+        group,
+        valid_token_count=local_count,
+    )
+
+    attached[0].backward()
+    assert attached[0].item() == 8.0
+    assert loss.grad.item() == 4.0
+    assert local_count.item() == 1.0
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_global_aux_matches_single_device_objective_with_uneven_tasks(
+    monkeypatch, dynamic
+):
+    from megatron.core.transformer.moe.moe_utils import (
+        switch_load_balancing_loss_func,
+    )
+
+    from nemo_rl.models.megatron import dynamic_cp
+
+    attached = _mock_aux_attachment(monkeypatch)
+    global_group = _Group(3)
+    reductions = []
+
+    def reduce_count(count, *, op, group):
+        assert group is global_group
+        reductions.append(count.item())
+        count.fill_(12)
+
+    monkeypatch.setattr(dynamic_cp.torch.distributed, "all_reduce", reduce_count)
+    logits = torch.arange(36, dtype=torch.float32).reshape(12, 3).sin().requires_grad_()
+    reference_logits = logits.detach().clone().requires_grad_()
+    probabilities = logits.softmax(dim=-1)
+    expert_counts = torch.bincount(probabilities.argmax(-1), minlength=3)
+    attach = (
+        dynamic_cp._dynamic_attach_and_log_load_balancing_loss
+        if dynamic
+        else dynamic_cp._static_attach_and_log_load_balancing_loss
+    )
+
+    offset = 0
+    for local_tokens, task_tokens, cp_size in [(3, 3, 1), (4, 9, 2), (5, 9, 2)]:
+        local_probs = probabilities[offset : offset + local_tokens]
+        loss = switch_load_balancing_loss_func(
+            local_probs, expert_counts, 12, 1, 3, 0.1
+        )
+        router = _router(_Group(cp_size))
+        router._nemo_dynamic_aux_scale_tokens = torch.tensor(float(task_tokens))
+        attach(
+            router,
+            local_probs,
+            0.1,
+            loss,
+            "global_load_balancing_loss",
+            global_group,
+            needs_dp_avg=False,
+            valid_token_count=torch.tensor(float(local_tokens)),
+        )
+        offset += local_tokens
+
+    distributed_objective = sum(attached) / 24
+    reference_objective = switch_load_balancing_loss_func(
+        reference_logits.softmax(dim=-1), expert_counts, 12, 1, 3, 0.1
+    ) * (12 / 24)
+    distributed_objective.backward()
+    reference_objective.backward()
+    torch.testing.assert_close(distributed_objective, reference_objective)
+    torch.testing.assert_close(logits.grad, reference_logits.grad)
+    assert reductions == [3, 4, 5]
+
+
+def test_empty_mtp_router_group_has_zero_finite_aux_gradient():
+    from megatron.core.transformer.moe import router
+
+    from nemo_rl.models.megatron import dynamic_cp
+
+    original = router.switch_load_balancing_loss_func
+    logits = torch.ones(2, 3, requires_grad=True)
+    probabilities = logits.softmax(dim=-1) * 0
+    with dynamic_cp._patch_moe_aux_loss_fixes():
+        loss = router.switch_load_balancing_loss_func(
+            probabilities, torch.zeros(3), torch.tensor(0.0), 1, 3, 0.1
+        )
+        loss.backward()
+    assert loss.item() == 0
+    torch.testing.assert_close(logits.grad, torch.zeros_like(logits))
+    assert router.switch_load_balancing_loss_func is original
+
+
+@pytest.mark.parametrize("depth", [1, 3])
+@pytest.mark.parametrize("all_padding", [False, True])
+def test_repeated_mtp_z_loss_gradient_is_depth_normalized(
+    monkeypatch, depth, all_padding
+):
+    from megatron.core.transformer.moe import moe_logging, moe_utils, router
+
+    from nemo_rl.models.megatron import dynamic_cp
+
+    metrics = []
+    monkeypatch.setattr(
+        moe_logging,
+        "get_moe_metrics_tracker",
+        lambda: SimpleNamespace(record=lambda *args, **kwargs: metrics.append(args)),
+    )
+    monkeypatch.setattr(
+        moe_utils.MoEAuxLossAutoScaler, "main_loss_backward_scale", torch.tensor(1.0)
+    )
+    module = _router(_Group(2))
+    module.training = True
+    module.is_mtp_layer = True
+    module.tp_dp_cp_group = _Group(4)
+    module.config.mtp_use_repeated_layer = True
+    module.config.mtp_num_layers = depth
+    module.config.moe_z_loss_coeff = 0.3
+    padding = torch.tensor([all_padding, True, all_padding, True])
+    logits = torch.arange(12, dtype=torch.float32).reshape(4, 3).sin().requires_grad_()
+    reference_logits = logits.detach().clone().requires_grad_()
+    original = router.TopKRouter.apply_z_loss
+
+    with dynamic_cp._patch_moe_aux_loss_fixes():
+        output = router.TopKRouter.apply_z_loss(module, logits, padding)
+        output[:0].sum().backward()
+    reference = (
+        (reference_logits.logsumexp(-1).square() * (~padding)).sum() * 0.3 / depth
+    )
+    reference.backward()
+
+    torch.testing.assert_close(logits.grad, reference_logits.grad)
+    assert torch.isfinite(logits.grad).all()
+    assert module.config.moe_z_loss_coeff == 0.3
+    expected_metric = (
+        (logits.detach().logsumexp(-1).square() * (~padding)).sum()
+        / (~padding).sum().clamp(min=1)
+        / depth
+    )
+    torch.testing.assert_close(metrics[0][1], expected_metric)
+    assert router.TopKRouter.apply_z_loss is original
+
+
+@pytest.mark.parametrize("coefficient", [None, 0.0])
+def test_disabled_z_loss_keeps_logits_without_recording_metrics(
+    monkeypatch, coefficient
+):
+    from megatron.core.transformer.moe import moe_logging, moe_utils
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    from nemo_rl.models.megatron import dynamic_cp
+
+    module = _router(_Group(2))
+    module.training = True
+    module.config = TransformerConfig(
+        num_layers=1,
+        hidden_size=8,
+        num_attention_heads=2,
+        moe_z_loss_coeff=coefficient,
+    )
+
+    def unexpected_call(*args, **kwargs):
+        pytest.fail("disabled z-loss must not attach gradients or record metrics")
+
+    monkeypatch.setattr(moe_logging, "get_moe_metrics_tracker", unexpected_call)
+    monkeypatch.setattr(moe_utils.MoEAuxLossAutoScaler, "apply", unexpected_call)
+    logits = torch.ones(2, 3, requires_grad=True)
+    result = dynamic_cp._apply_moe_z_loss(module, logits)
+    assert result is logits
+    assert result.grad_fn is None
+
+
+def test_static_router_context_restores_method_after_failure(monkeypatch):
+    from nemo_rl.models.megatron import dynamic_cp
+
+    class Router(torch.nn.Module):
+        def attach_and_log_load_balancing_loss(self):
+            pass
+
+    monkeypatch.setattr(dynamic_cp, "Router", Router)
+    model = torch.nn.Sequential(Router())
+    original = Router.attach_and_log_load_balancing_loss
+    with pytest.raises(RuntimeError, match="schedule failed"):
+        with dynamic_cp.preserve_static_moe_loss_scaling([model]):
+            assert Router.attach_and_log_load_balancing_loss is not original
+            raise RuntimeError("schedule failed")
+    assert Router.attach_and_log_load_balancing_loss is original

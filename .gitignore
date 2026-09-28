@@ -62,6 +62,9 @@ code_snapshots*/
 # Named rather than ignoring the directory shape: tests/test_suites/llm/
 # performance/ sits at that depth and is tracked.
 /tests/test_suites/**/metrics.json
+/tools/launch_dynamic_cp_comparison.sh
+/tools/launch_super35_rlvr_32n_cp_comparison_131k.sh
+/tools/analyze_dynamic_cp_comparison.py
 
 # Local dynamic/static context-parallel benchmark recipes (not in upstream main)
 /examples/configs/recipes/llm/performance/grpo-nemotron3-nano-30ba3b-8n4g-megatron-dynamiccp-quick.yaml
@@ -71,9 +74,13 @@ code_snapshots*/
 /examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-4n4g-async-1off-megatron-dynamiccp-10step.yaml
 /examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-4n4g-async-1off-megatron-dynamiccp-quick.yaml
 /examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-4n4g-async-1off-megatron-staticcp-10step.yaml
+/examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-4n8g-40K-dynamiccp-quick.yaml
+/examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-8n4g-40K-gb200-dynamiccp-quick.yaml
+/examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-8n4g-40K-gb200-staticcp-quick.yaml
 /examples/configs/recipes/llm/performance/grpo-qwen3-32b-4n4g-async-1off-megatron-dynamiccp-10step.yaml
 /examples/configs/recipes/llm/performance/grpo-qwen3-32b-4n4g-async-1off-megatron-staticcp-10step.yaml
 /examples/configs/recipes/llm/performance/grpo-qwen3-32b-4n4g-megatron-dynamiccp-10step.yaml
 /examples/configs/recipes/llm/performance/grpo-qwen3-32b-4n4g-megatron-dynamiccp-profile.yaml
 /examples/configs/recipes/llm/performance/grpo-qwen3-32b-4n4g-megatron-dynamiccp-quick.yaml
 /examples/configs/recipes/llm/performance/grpo-qwen3-32b-4n4g-megatron-staticcp-10step.yaml
+

@@ -11,7 +11,9 @@
 """Ray payload construction and output ownership for dynamic context parallelism."""
 
 import logging
+import os
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -53,6 +55,40 @@ def _enabled_global_aux_loss(megatron_cfg: dict[str, Any]) -> bool:
     dictionary, so the routing type is the stable scheduling signal.
     """
     return "global_aux_loss" in _routing_types(megatron_cfg)
+
+
+def _requires_aligned_collective_rounds(megatron_cfg: dict[str, Any]) -> bool:
+    """Keep model collectives outside dynamic CP groups in the same order.
+
+    TE delayed scaling reduces amax after forward/backward on MCore's fixed
+    TP*DP*CP group (or fixed TP*CP with ``tp_only_amax_red``). Unequal task
+    counts can therefore leave a rank waiting for peers that already finished.
+    Built-in current/block/MXFP8 GEMM recipes do not use that reduction, but
+    FP8 attention may add delayed-scaled tensors or override its recipe in TE.
+    FP8 attention and opaque custom/per-module recipes conservatively keep
+    rounds aligned because the driver cannot inspect their quantizers safely.
+    """
+    if _enabled_global_aux_loss(megatron_cfg):
+        return True
+    if (
+        megatron_cfg.get("te_precision_config_file") is not None
+        or _model_setting(megatron_cfg, "quant_recipe") is not None
+    ):
+        return True
+    fp8 = megatron_cfg.get("fp8_cfg") or {}
+    if fp8.get("enabled"):
+        # setup applies fp8_cfg after model_overrides.
+        recipe = fp8["fp8_recipe"]
+    elif _model_setting(megatron_cfg, "fp8"):
+        recipe = _model_setting(megatron_cfg, "fp8_recipe") or "delayed"
+    else:
+        return False
+    return recipe in ("delayed", "custom") or bool(
+        _model_setting(megatron_cfg, "fp8_dot_product_attention")
+        or _model_setting(megatron_cfg, "fp8_multi_head_attention")
+        or os.environ.get("NVTE_DPA_FP8_RECIPE")
+        in ("DelayedScaling", "Float8CurrentScaling")
+    )
 
 
 def _minimum_cp_size_for_experts(
@@ -97,7 +133,7 @@ def _dynamic_cp_token_alignment(megatron_cfg: dict[str, Any]) -> int:
     return alignment
 
 
-def dynamic_cp_config(cfg: dict[str, Any]) -> DynamicContextParallelConfig | None:
+def dynamic_cp_config(cfg: Mapping[str, Any]) -> DynamicContextParallelConfig | None:
     """Read optional config without introducing defaults at worker call sites."""
     megatron = cfg.get("megatron_cfg")
     raw = megatron.get("dynamic_context_parallel") if megatron is not None else None
@@ -127,9 +163,7 @@ def validate_dynamic_cp(cfg: dict[str, Any], *, lanes: int) -> None:
         raise ValueError("Dynamic CP does not support CUDA graph capture")
     cp_comm_type = _model_setting(mc, "cp_comm_type")
     cp_comm_types = (
-        cp_comm_type
-        if isinstance(cp_comm_type, (list, tuple))
-        else [cp_comm_type]
+        cp_comm_type if isinstance(cp_comm_type, (list, tuple)) else [cp_comm_type]
     )
     if (
         "a2a+p2p" in cp_comm_types
@@ -332,7 +366,9 @@ def build_cp_schedule(
                 "Dynamic CP atomic groups cannot cross optimizer-step batch "
                 f"boundaries; split group ids: {split_groups[:8]}"
             )
-    align_full_domain_collectives = _enabled_global_aux_loss(cfg["megatron_cfg"])
+    align_full_domain_collectives = _requires_aligned_collective_rounds(
+        cfg["megatron_cfg"]
+    )
     groups_by_batch = tuple(
         plan_cp_phases(
             list(lengths[start : start + gbs]),
@@ -384,7 +420,7 @@ def cp_schedule_matches(
         schedule.input_lengths == _input_lengths(data)
         and schedule.pair_grouping == _pair_grouping(data, cfg)
         and schedule.align_full_domain_collectives
-        == _enabled_global_aux_loss(cfg["megatron_cfg"])
+        == _requires_aligned_collective_rounds(cfg["megatron_cfg"])
         and schedule.batch_size == gbs
         and (
             schedule.lanes,
@@ -434,19 +470,18 @@ def build_cp_dispatch(
         raise ValueError("Cached dynamic CP schedule does not match this ordered batch")
     rank_steps: list[list[CPRankStep]] = [[] for _ in range(lanes)]
     for batch_index, start in enumerate(range(0, data.size, gbs)):
-        batch = data.select_indices(list(range(start, start + gbs)))
         groups = schedule.groups_by_batch[batch_index]
         if training:
-            if "sample_mask" not in batch or "token_mask" not in batch:
+            if "sample_mask" not in data or "token_mask" not in data:
                 raise ValueError(
                     "Dynamic CP training requires sample_mask and token_mask"
                 )
-            valid_sequences = float(batch["sample_mask"].sum().item())
-            valid_tokens = float(
-                (batch["token_mask"][:, 1:] * batch["sample_mask"].unsqueeze(-1))
-                .sum()
-                .item()
-            )
+            # Only the masks are needed here. Selecting the whole batch copies
+            # every field, including large teacher logits, before dispatch.
+            sample_mask = data["sample_mask"][start : start + gbs]
+            token_mask = data["token_mask"][start : start + gbs, 1:]
+            valid_sequences = float(sample_mask.sum().item())
+            valid_tokens = float((token_mask * sample_mask.unsqueeze(-1)).sum().item())
         else:
             valid_sequences = valid_tokens = 0.0
         assignments_by_group_lane = tuple(
@@ -517,6 +552,7 @@ def build_cp_dispatch(
             )
 
     payloads, plans, output_rows = [], [], []
+    payloads_by_indices: dict[tuple[int, ...], BatchedDataDict] = {}
     for lane, steps in enumerate(rank_steps):
         indices = sorted(
             {
@@ -558,7 +594,13 @@ def build_cp_dispatch(
                     originals.extend(task.sample_indices)
                 offset += max(1, len(task.sample_indices))
         output_rows.append((rows, originals))
-        payloads.append(data.select_indices(indices))
+        # CP peers often need exactly the same rows. Keep one driver-side
+        # tensor allocation for those immutable RPC payloads. Each actor still
+        # selects its own task batch before any mutation or GPU transfer.
+        payload_key = tuple(indices)
+        if payload_key not in payloads_by_indices:
+            payloads_by_indices[payload_key] = data.select_indices(indices)
+        payloads.append(payloads_by_indices[payload_key])
         plans.append(CPRankPlan(lane, group_ranks, remapped_steps))
     return CPDispatch(
         data=[payloads[i : i + cp] for i in range(0, lanes, cp)],
