@@ -1,52 +1,36 @@
-# TE per-module precision recipe.
-# Schema: Megatron-LM/megatron/core/extensions/TransformerEngineMixedPrecision.md
-#
-# Effect:
-# - Run Megatron globally with the configured MXFP8 FP8 recipe.
-# - Override selected attention, shared expert, Mamba, and MTP projection modules
-#   back to BF16 by disabling TE quantized autocast for those matched modules.
-#
+# Quantize only routed (non-shared) MoE expert projections. Megatron runs under
+# a global MXFP8 context, so the final catch-all matcher must explicitly turn
+# quantization off for every module not matched by the two expert rules above it.
 # Matchers are ordered and the first enabled match wins.
 configs:
   bf16:
     transformer_engine_config_type: "TEQuantizationParams"
     training_recipe:
-      # Explicitly override a globally quantized autocast context back to BF16.
+      override_quantized_autocast: true
+  mxfp8:
+    transformer_engine_config_type: "TEQuantizationParams"
+    training_recipe:
+      fp8_quantization_recipe: "mxfp8"
       override_quantized_autocast: true
 
 matchers:
-  attn_qkv_bf16:
+  mtp_bf16:
     config: "bf16"
     type: "glob"
-    pattern: "*.linear_qkv"
+    pattern: "*mtp*"
     enabled: true
-  attn_proj_bf16:
-    config: "bf16"
+  routed_experts_fc1_mxfp8:
+    config: "mxfp8"
     type: "glob"
-    pattern: "*.linear_proj"
+    pattern: "*mlp.experts.linear_fc1"
     enabled: true
-  shared_experts_fc1_bf16:
-    config: "bf16"
+  routed_experts_fc2_mxfp8:
+    config: "mxfp8"
     type: "glob"
-    pattern: "*.shared_experts.linear_fc1"
+    pattern: "*mlp.experts.linear_fc2"
     enabled: true
-  shared_experts_fc2_bf16:
+  all_other_modules_bf16:
     config: "bf16"
     type: "glob"
-    pattern: "*.shared_experts.linear_fc2"
-    enabled: true
-  mamba_in_proj_bf16:
-    config: "bf16"
-    type: "glob"
-    pattern: "*.mixer.in_proj"
-    enabled: true
-  mamba_out_proj_bf16:
-    config: "bf16"
-    type: "glob"
-    pattern: "*.mixer.out_proj"
-    enabled: true
-  mtp_eh_proj_bf16:
-    config: "bf16"
-    type: "glob"
-    pattern: "*eh_proj"
+    pattern: "*"
     enabled: true
