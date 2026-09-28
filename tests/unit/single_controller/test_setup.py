@@ -595,6 +595,34 @@ def test_token_capture_top_logprobs_requires_vllm_backend():
         validate_single_controller_config(mc)
 
 
+def test_score_centering_requires_top_logprobs_and_unfiltered_sampling():
+    mc = _make_master_config(loss_cfg=ClippedPGLossConfig(score_centering=True))
+
+    with pytest.raises(ValueError, match="token_capture.top_logprobs > 0"):
+        validate_single_controller_config(mc)
+
+    mc.token_capture.enabled = True
+    mc.token_capture.top_logprobs = 4
+    mc.policy["generation"]["vllm_kwargs"] = {"max_logprobs": 4}
+    mc.policy["generation"]["top_p"] = 0.9
+    mc.policy["generation"]["top_k"] = None
+    with pytest.raises(ValueError, match="unfiltered sampling"):
+        validate_single_controller_config(mc)
+
+    mc.policy["generation"]["top_p"] = 1.0
+    mc.policy["generation"]["temperature"] = 0.7
+    with pytest.raises(ValueError, match="temperature=1"):
+        validate_single_controller_config(mc)
+
+    mc.policy["generation"]["temperature"] = 1.0
+    mc.policy["sequence_packing"] = {"enabled": True, "fuse_loss": True}
+    with pytest.raises(ValueError, match="fuse_loss=false"):
+        validate_single_controller_config(mc)
+
+    mc.policy["sequence_packing"]["fuse_loss"] = False
+    validate_single_controller_config(mc)
+
+
 @pytest.mark.parametrize(
     ("reference_policy_kl_penalty", "expected_init_reference_model"),
     [(0.0, False), (0.01, True)],

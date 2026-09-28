@@ -89,6 +89,8 @@ loss_fn:
   use_kl_in_reward: false  # No KL in reward (KL penalty is 0 anyway)
   # VAPO: NLL loss on correct samples. 0 = disabled.
   positive_example_nll_weight: 0.0  # VAPO: 0.1
+  # Score centering (https://arxiv.org/abs/2609.20807); needs token_capture.top_logprobs > 0.
+  score_centering: false
 
 value_loss_fn:
   scale: 0.4
