@@ -74,15 +74,15 @@ class Value(ValueInterface):
         cp_size = 1
 
         # Value models use the same backend configuration as policy models
-        megatron_enable = bool(config.get("megatron_cfg", {}).get("enabled", False))
+        megatron_enabled = bool(config.get("megatron_cfg", {}).get("enabled", False))
         automodel_enabled = bool(config.get("automodel_cfg", {}).get("enabled", False))
-        if megatron_enable and automodel_enabled:
+        if megatron_enabled and automodel_enabled:
             raise ValueError(
                 "Configure either Megatron (value.megatron_cfg.enabled=true) or "
                 "DTensor (value.automodel_cfg.enabled=true), not both."
             )
 
-        if megatron_enable:
+        if megatron_enabled:
             worker_builder_cls = (
                 "nemo_rl.models.value.workers.megatron_value_worker.MegatronValueWorker"
             )
@@ -432,9 +432,9 @@ class Value(ValueInterface):
         DTensor v2 checkpoint resources are configured when the Value is
         constructed. ``weights_path`` selects the destination for each save.
         """
-        megatron_enable = bool(self.cfg.get("megatron_cfg", {}).get("enabled", False))
+        megatron_enabled = bool(self.cfg.get("megatron_cfg", {}).get("enabled", False))
 
-        if megatron_enable:
+        if megatron_enabled:
             futures = self.worker_group.run_all_workers_single_data(
                 "save_checkpoint",
                 weights_path=weights_path,
