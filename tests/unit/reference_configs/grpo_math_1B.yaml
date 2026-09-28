@@ -115,6 +115,9 @@ loss_fn:
   # VAPO positive-example NLL loss weight: L = L_PPO + mu * L_NLL(correct samples).
   # 0.0 disables it. VAPO paper recommends 0.1.
   positive_example_nll_weight: 0.0
+  # Score centering (https://arxiv.org/abs/2609.20807): subtract the sampler-expected
+  # score per token, using the captured top-k (needs token_capture.top_logprobs > 0).
+  score_centering: false
 
 checkpointing:
   enabled: true

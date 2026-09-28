@@ -1899,6 +1899,84 @@ def get_next_token_logprobs_from_logits(
     return logprobs
 
 
+def get_next_token_topk_logprobs_from_logits(
+    topk_ids: torch.Tensor,
+    next_token_logits: torch.Tensor,
+    vocab_parallel_rank: Optional[int] = None,
+    vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    chunk_size: Optional[int] = None,
+    cp_sharder: Optional["ContextParallelSharder"] = None,
+) -> torch.Tensor:
+    """Next-token log-probs at each position's sampler top-k ids.
+
+    ``topk_ids`` is token-aligned like ``generation_logprobs`` (row t holds the
+    ids the sampler ranked when it drew token t), so it is rolled by one to line
+    up with the logits, which predict the next token; the result is aligned with
+    :func:`get_next_token_logprobs_from_logits`. On the vocab-parallel path the
+    full-vocabulary log-softmax and its backward run in fp32 inside
+    :class:`ChunkedDistributedGatherLogprob`, so the head and tail terms of score
+    centering cancel in fp32 rather than in the logits' dtype.
+
+    Args:
+        topk_ids: Sampler top-k ids ``[B, S, k]``, any integer dtype.
+        next_token_logits: Logits ``[B, S, V]``, or the ``[B, S // CP, V // TP]`` shard.
+        vocab_parallel_rank: Rank in the vocab parallel group (required with the group).
+        vocab_parallel_group: Process group for vocab parallelism.
+        context_parallel_group: Process group for context parallelism.
+        chunk_size: Sequence-dim chunk size for the vocab-parallel path
+            (policy.logprob_chunk_size); the whole sequence when None.
+        cp_sharder: Automodel context-parallel sharder; not supported here.
+
+    Returns:
+        Log-probs ``[B, S - 1, k]``.
+    """
+    if cp_sharder is not None or isinstance(
+        next_token_logits, torch.distributed.tensor.DTensor
+    ):
+        raise NotImplementedError(
+            "score centering supports the Megatron vocab-parallel and single-device paths"
+        )
+    target = topk_ids.to(device=next_token_logits.device, dtype=torch.int64)
+    target = target.roll(shifts=-1, dims=1)
+    if vocab_parallel_group is None:
+        logprobs = torch.nn.functional.log_softmax(
+            next_token_logits.to(torch.float32), dim=-1
+        )
+        return logprobs.gather(dim=-1, index=target)[:, :-1]
+
+    assert vocab_parallel_rank is not None, (
+        "vocab_parallel_rank must be provided when vocab_parallel_group is provided"
+    )
+    vocab_part_size = int(next_token_logits.shape[-1])
+    cp_size = (
+        1
+        if context_parallel_group is None
+        else torch.distributed.get_world_size(context_parallel_group)
+    )
+    pad_len = next_token_logits.shape[1] * cp_size - target.shape[1]
+    if pad_len > 0:
+        target = torch.nn.functional.pad(target, (0, 0, 0, pad_len), value=0)
+    cp_rank = torch.distributed.get_rank(context_parallel_group)
+    target = _get_tokens_on_this_cp_rank(target, cp_rank, cp_size, seq_dim=1)
+    logprobs = ChunkedDistributedGatherLogprob.apply(  # type: ignore
+        next_token_logits,
+        target,
+        vocab_parallel_rank * vocab_part_size,
+        (vocab_parallel_rank + 1) * vocab_part_size,
+        chunk_size if chunk_size is not None else int(next_token_logits.shape[1]),
+        vocab_parallel_group,
+        False,
+    )
+    if cp_size > 1:
+        logprobs = allgather_cp_sharded_tensor(
+            logprobs, context_parallel_group, seq_dim=1
+        )
+    if pad_len > 0:
+        logprobs = logprobs[:, :-pad_len]
+    return logprobs[:, :-1]
+
+
 @torch.no_grad()
 def distributed_vocab_topk(
     vocab_parallel_logits: torch.Tensor,

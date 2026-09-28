@@ -148,6 +148,7 @@ from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.schema import (
     DP_CALIB_INPUT_FIELDS,
     DP_TRAIN_FIELDS,
+    GENERATION_TOPK_FIELDS,
     INPUT_LENGTHS,
     ROLLOUT_METRICS,
     ROUTE_PLAN_TAG,
@@ -259,14 +260,18 @@ def _train_fields_for_step(
     *,
     policy_logprobs_required: bool,
     reference_logprobs_required: bool,
+    score_centering: bool,
 ) -> tuple[str, ...]:
     """Return only the data-plane columns produced for this train step."""
-    return tuple(
+    fields = tuple(
         field
         for field in DP_TRAIN_FIELDS
         if (policy_logprobs_required or field != "prev_logprobs")
         and (reference_logprobs_required or field != "reference_policy_logprobs")
     )
+    if score_centering:
+        fields += GENERATION_TOPK_FIELDS
+    return fields
 
 
 @ray.remote(num_cpus=1, num_gpus=0)  # pragma: no cover
@@ -341,6 +346,7 @@ class SingleControllerActor:
         self._train_fields = _train_fields_for_step(
             policy_logprobs_required=self._policy_logprobs_required,
             reference_logprobs_required=self._reference_logprobs_required,
+            score_centering=master_config.loss_fn.score_centering,
         )
         self._dp_client = actor_args.dp_client
         self._gen: Generation = actor_args.gen_handle
