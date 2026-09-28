@@ -25,7 +25,7 @@ import torch
 # text. Mirrors the reference's _MM_MARKER (multimodal_tokenizer.py:514).
 # Defined here rather than in nemotron_visual because that module imports this
 # one.
-MM_MARKER = "\uE000"
+MM_MARKER = "\ue000"
 
 # Media tags that must never appear verbatim in source text.
 #
@@ -150,8 +150,7 @@ def _nemotron6_assistant_indices(
         native_tool_boundaries.any()
     )
     user_starts = torch.where(
-        (tokens[:-1] == _MESSAGE_START_TOKEN_ID)
-        & (tokens[1:] == _USER_ROLE_TOKEN_ID)
+        (tokens[:-1] == _MESSAGE_START_TOKEN_ID) & (tokens[1:] == _USER_ROLE_TOKEN_ID)
     )[0]
     if len(user_starts) == 0:
         if use_native_boundaries:
@@ -161,9 +160,8 @@ def _nemotron6_assistant_indices(
     legacy_tool_responses = torch.zeros_like(user_starts, dtype=torch.bool)
     valid = user_starts + 3 < len(tokens)
     positions = user_starts[valid]
-    legacy_tool_responses[valid] = (
-        (tokens[positions + 2] == _LINE_BREAK_TOKEN_ID)
-        & (tokens[positions + 3] == _TOOL_RESPONSE_TOKEN_ID)
+    legacy_tool_responses[valid] = (tokens[positions + 2] == _LINE_BREAK_TOKEN_ID) & (
+        tokens[positions + 3] == _TOOL_RESPONSE_TOKEN_ID
     )
     if use_native_boundaries and len(native_tool_boundaries) != len(user_starts):
         raise ValueError("Tool-response roles do not match rendered user boundaries.")
@@ -185,9 +183,7 @@ def _nemotron6_assistant_indices(
 
 def _validate_nemotron6_tokenizer(tokenizer: Any) -> None:
     for token_ids, expected in _NEMOTRON6_TOKENIZER_LAYOUT.items():
-        actual = tokenizer.decode(
-            list(token_ids), clean_up_tokenization_spaces=False
-        )
+        actual = tokenizer.decode(list(token_ids), clean_up_tokenization_spaces=False)
         if actual != expected:
             raise ValueError(
                 f"Nemotron 6 tokenizer IDs {list(token_ids)} decode to "
@@ -238,7 +234,9 @@ def _raw_tokens_and_mask(
         isinstance(token_ids, list)
         and isinstance(offsets, list)
         and len(token_ids) == len(offsets)
-        and all(isinstance(offset, (tuple, list)) and len(offset) == 2 for offset in offsets)
+        and all(
+            isinstance(offset, (tuple, list)) and len(offset) == 2 for offset in offsets
+        )
     ):
         boundaries: list[int] = []
         offset = 0
@@ -333,7 +331,9 @@ def tokenize_nemotron_conversation(
         )
     if assistant_turn_loss is not None:
         if prompt_format != "nemotron6-moe":
-            raise ValueError("Explicit assistant loss is supported only for nemotron6-moe.")
+            raise ValueError(
+                "Explicit assistant loss is supported only for nemotron6-moe."
+            )
         if train_only_on_last_assistant_turn:
             raise ValueError(
                 "Explicit assistant loss is incompatible with last-assistant-only loss."
@@ -380,7 +380,9 @@ def tokenize_nemotron_conversation(
         )
         if isinstance(rendered_text, list):
             if len(rendered_text) != 1:
-                raise ValueError("Nemotron chat template returned several conversations.")
+                raise ValueError(
+                    "Nemotron chat template returned several conversations."
+                )
             rendered_text = rendered_text[0]
         tokens, placeholder_positions = _encode_with_marker_splices(
             rendered_text,
@@ -392,7 +394,9 @@ def tokenize_nemotron_conversation(
             target = tokens.clone()
             boundaries = torch.where(tokens == 11)[0]
             if len(boundaries) < 2:
-                raise ValueError("Nemotron-H conversation has incomplete turn boundaries.")
+                raise ValueError(
+                    "Nemotron-H conversation has incomplete turn boundaries."
+                )
             target[: boundaries[1]] = IGNORE_INDEX
             for index in range(1, len(boundaries)):
                 if index % 2 == 0:
@@ -440,13 +444,19 @@ def tokenize_nemotron_conversation(
             end_indices = torch.where(tokens == _MESSAGE_END_TOKEN_ID)[0]
             for assistant_index in assistant_indices:
                 lower = int(assistant_index)
-                if lower + 2 >= len(tokens) or tokens[lower + 2] != _LINE_BREAK_TOKEN_ID:
+                if (
+                    lower + 2 >= len(tokens)
+                    or tokens[lower + 2] != _LINE_BREAK_TOKEN_ID
+                ):
                     raise ValueError("Invalid Nemotron 6 assistant start boundary.")
                 following_ends = end_indices[end_indices > lower]
                 if len(following_ends) == 0:
                     raise ValueError("Missing Nemotron 6 assistant end boundary.")
                 upper = int(following_ends[0])
-                if upper + 1 >= len(tokens) or tokens[upper + 1] != _LINE_BREAK_TOKEN_ID:
+                if (
+                    upper + 1 >= len(tokens)
+                    or tokens[upper + 1] != _LINE_BREAK_TOKEN_ID
+                ):
                     raise ValueError("Invalid Nemotron 6 assistant end boundary.")
                 token_loss_mask[lower + 3 : upper + 1] = 1
 

@@ -245,8 +245,7 @@ def _normalize_assistant_thinking(
     error: str | None = None
     if start_count != 1 or end_count != 1:
         error = (
-            "Nemotron assistant turns require exactly one matched pair of <think> "
-            "tags."
+            "Nemotron assistant turns require exactly one matched pair of <think> tags."
         )
     elif text.find("<think>") > text.find("</think>"):
         error = "Nemotron assistant </think> appears before <think>."
@@ -407,9 +406,7 @@ def _tokenize_nemotron_sample(
         messages,
         processor=processor,
         prompt_format=prompt_format,
-        skip_chat_template=bool(
-            sample.__subflavors__.get("skip_chat_template", False)
-        ),
+        skip_chat_template=bool(sample.__subflavors__.get("skip_chat_template", False)),
         train_only_on_last_assistant_turn=bool(
             sample.__subflavors__.get("train_only_on_last_assistant_turn", False)
         ),
@@ -692,9 +689,7 @@ class _NemotronVisualProcessorAdapter:
         clip_start = 0.0 if start_time is None else start_time
         if start_time is not None:
             duration = (
-                end_time - start_time
-                if end_time is not None
-                else duration - start_time
+                end_time - start_time if end_time is not None else duration - start_time
             )
         elif end_time is not None:
             duration = end_time
@@ -706,8 +701,7 @@ class _NemotronVisualProcessorAdapter:
         scale_values = [1.0]
         if self.video_aug_scale_frames_up is not None:
             scale_values.extend(
-                float(value)
-                for value in range(2, self.video_aug_scale_frames_up + 1)
+                float(value) for value in range(2, self.video_aug_scale_frames_up + 1)
             )
         if self.video_aug_scale_resolution_up is not None:
             scale_values.extend(
@@ -763,8 +757,7 @@ class _NemotronVisualProcessorAdapter:
         if self.video_frame_temporal_jitter:
             jitter_size = segment_size * 0.5
             timestamps += (
-                torch.rand(len(timestamps), dtype=torch.float32)
-                * (jitter_size * 2)
+                torch.rand(len(timestamps), dtype=torch.float32) * (jitter_size * 2)
                 - jitter_size
             )
             timestamps = torch.clamp(timestamps, 0, duration)
@@ -789,9 +782,8 @@ class _NemotronVisualProcessorAdapter:
             duration = _required_metadata_float(ref, "video_duration")
             start_time = _optional_metadata_float(ref, "start_time")
             end_time = _optional_metadata_float(ref, "end_time")
-            clip_duration = (
-                (end_time if end_time is not None else duration)
-                - (start_time if start_time is not None else 0.0)
+            clip_duration = (end_time if end_time is not None else duration) - (
+                start_time if start_time is not None else 0.0
             )
             if not allow_large_videos and clip_duration > 600:
                 raise ValueError(f"Video is too large: {ref.value}")
@@ -860,18 +852,14 @@ class _NemotronVisualProcessorAdapter:
                         "Nemotron video_frame media requires numeric timestamp "
                         "metadata."
                     )
-                aug_scale = _optional_metadata_float(
-                    ref, "video_aug_scale_frames_up"
-                )
+                aug_scale = _optional_metadata_float(ref, "video_aug_scale_frames_up")
                 frames.append(
                     _VisualFrameSpec(
                         occurrence_index=occurrence_index,
                         width=_required_metadata_int(ref, "video_width"),
                         height=_required_metadata_int(ref, "video_height"),
                         is_video=True,
-                        aug_scale_frames_up=(
-                            1.0 if aug_scale is None else aug_scale
-                        ),
+                        aug_scale_frames_up=(1.0 if aug_scale is None else aug_scale),
                     )
                 )
                 continue
@@ -902,15 +890,12 @@ class _NemotronVisualProcessorAdapter:
                     patch_budget
                     * (
                         num_images / len(frames)
-                        + num_video_frames
-                        / len(frames)
-                        * self.temporal_patch_size
+                        + num_video_frames / len(frames) * self.temporal_patch_size
                     )
                 )
         patch_budget = max(patch_budget, min_num_patches * len(frames))
         per_frame_budgets = [
-            max(min(patch_budget, max_num_patches), min_num_patches)
-            for _ in frames
+            max(min(patch_budget, max_num_patches), min_num_patches) for _ in frames
         ]
 
         def process_frame(
@@ -921,13 +906,8 @@ class _NemotronVisualProcessorAdapter:
             factor = min(math.sqrt(available / (closest_h * closest_w)), 1.0)
             target_h = math.floor(factor * closest_h)
             target_w = math.floor(factor * closest_w)
-            if (
-                available > min_num_patches
-                and target_h * target_w < min_num_patches
-            ):
-                up_factor = math.sqrt(
-                    min_num_patches / max(target_h * target_w, 1)
-                )
+            if available > min_num_patches and target_h * target_w < min_num_patches:
+                up_factor = math.sqrt(min_num_patches / max(target_h * target_w, 1))
                 up_h = math.ceil(up_factor * target_h)
                 up_w = math.ceil(up_factor * target_w)
                 if available > up_h * up_w:
@@ -936,7 +916,10 @@ class _NemotronVisualProcessorAdapter:
             if data_augment and random.random() < self.tiling_augment_prob:
                 minimum_side_patches = 32
                 if random.random() < 0.5:
-                    if target_w > minimum_side_patches and target_h > minimum_side_patches:
+                    if (
+                        target_w > minimum_side_patches
+                        and target_h > minimum_side_patches
+                    ):
                         if random.random() < 0.5:
                             target_w -= minimum_side_patches
                         else:
@@ -1005,9 +988,7 @@ class _NemotronVisualProcessorAdapter:
             if total <= patch_budget:
                 break
             scale = patch_budget / total
-            scaled = [
-                max(min_num_patches, int(count * scale)) for count in counts
-            ]
+            scaled = [max(min_num_patches, int(count * scale)) for count in counts]
             per_frame_budgets = (
                 scaled
                 if any(
@@ -1054,7 +1035,9 @@ class _NemotronVisualProcessorAdapter:
                 ]
                 embedding_widths = tuple(
                     frame_embeddings[index]
-                    for index in range(0, len(frame_embeddings), self.temporal_patch_size)
+                    for index in range(
+                        0, len(frame_embeddings), self.temporal_patch_size
+                    )
                 )
             else:
                 width, height = sizes[0]
@@ -1109,15 +1092,12 @@ class _NemotronVisualProcessorAdapter:
             data_augment=bool(sample.__subflavors__.get("data_augment", False)),
         )
         visual_embeddings = sum(plan.num_embeddings for plan in visual_plans)
-        compact_placeholders = sum(
-            len(plan.embedding_widths) for plan in visual_plans
-        )
+        compact_placeholders = sum(len(plan.embedding_widths) for plan in visual_plans)
         max_text_tokens = (
             self.packing_sequence_length - visual_embeddings + compact_placeholders
         )
         image_tokens_before_truncation = sum(
-            len(message["visual_placeholder_positions"])
-            for message in message_log
+            len(message["visual_placeholder_positions"]) for message in message_log
         )
         # Separate the two ways the placeholder count can disagree with the plan.
         # Conflating them blames truncation for samples that were never truncated.
@@ -1138,8 +1118,7 @@ class _NemotronVisualProcessorAdapter:
             sample=sample,
         )
         remaining_placeholders = sum(
-            len(message["visual_placeholder_positions"])
-            for message in message_log
+            len(message["visual_placeholder_positions"]) for message in message_log
         )
         if remaining_placeholders != image_tokens_before_truncation:
             raise ValueError(
@@ -1198,9 +1177,7 @@ class _NemotronVisualProcessorAdapter:
         def get_clips() -> list[Any]:
             return list(
                 av_decoder.get_clips(
-                    video_clip_ranges=[
-                        (timestamp, timestamp) for timestamp in targets
-                    ],
+                    video_clip_ranges=[(timestamp, timestamp) for timestamp in targets],
                     video_unit="seconds",
                 ).video_clips
             )
@@ -1294,7 +1271,9 @@ class _NemotronVisualProcessorAdapter:
                 if not clips:
                     raise ValueError("Unable to decode any selected video frame.")
                 if len(clips) < len(plan.frame_timestamps):
-                    clips.extend([clips[-1]] * (len(plan.frame_timestamps) - len(clips)))
+                    clips.extend(
+                        [clips[-1]] * (len(plan.frame_timestamps) - len(clips))
+                    )
                 raw_frames = [
                     torch.as_tensor(clip)[0]
                     for clip in clips[: len(plan.frame_timestamps)]

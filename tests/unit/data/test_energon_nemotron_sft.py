@@ -301,9 +301,7 @@ def test_preformatted_sample_skips_thinking_check_and_chat_template() -> None:
     expected = processor.tokenizer(
         "<|im_start|>assistant\n<think>\nreasoning</think>answer<|im_end|>\n"
     )["input_ids"][0]
-    actual = torch.cat(
-        [message["token_ids"] for message in preencoded.message_log]
-    )
+    actual = torch.cat([message["token_ids"] for message in preencoded.message_log])
     assert torch.equal(actual, expected)
 
 

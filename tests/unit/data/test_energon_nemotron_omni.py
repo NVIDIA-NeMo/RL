@@ -320,11 +320,14 @@ def test_oversized_text_sample_is_truncated_to_sequence_length() -> None:
 
     assert preencoded.length == 80
     assert preencoded.packing_cost == 80
-    assert sum(
-        len(message["token_ids"])
-        for message in preencoded.message_log
-        if message["role"] == "assistant"
-    ) > 0
+    assert (
+        sum(
+            len(message["token_ids"])
+            for message in preencoded.message_log
+            if message["role"] == "assistant"
+        )
+        > 0
+    )
 
 
 def test_audio_width_is_predicted_without_processing_payload() -> None:

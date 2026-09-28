@@ -123,7 +123,9 @@ def _audio_duration(ref: MediaRef) -> float:
 
 def _decoded_audio_clips(ref: MediaRef) -> tuple[torch.Tensor, ...]:
     """Load audio in the same channels-first form used by the reference."""
-    payload = ref.value.get() if callable(getattr(ref.value, "get", None)) else ref.value
+    payload = (
+        ref.value.get() if callable(getattr(ref.value, "get", None)) else ref.value
+    )
     from_soundfile = False
     if isinstance(payload, str):
         import soundfile as sf
@@ -202,6 +204,7 @@ def _subsampled_length(frame_count: int, subsampling_factor: int) -> int:
         # Parakeet uses kernel_size=3, stride=2, and padding=1.
         length = (length + 1) // 2
     return max(1, length)
+
 
 def _audio_plan(
     ref: MediaRef,
@@ -375,9 +378,7 @@ def _expand_audio_placeholders(
                 )
             )
             mask_pieces.append(token_loss_mask[start:position])
-            mask_pieces.append(
-                token_loss_mask[position].expand(plan.total_embeddings)
-            )
+            mask_pieces.append(token_loss_mask[position].expand(plan.total_embeddings))
             start = position + 1
         token_pieces.append(token_ids[start:])
         mask_pieces.append(token_loss_mask[start:])
@@ -587,9 +588,7 @@ class NemotronMultiModalProcessorAdapter(_NemotronVisualProcessorAdapter):
             media_indexes=visual_media_indexes,
         )
         visual_embeddings = sum(plan.num_embeddings for plan in visual_plans)
-        visual_placeholders = sum(
-            len(plan.embedding_widths) for plan in visual_plans
-        )
+        visual_placeholders = sum(len(plan.embedding_widths) for plan in visual_plans)
         audio_embeddings = sum(
             plan.total_embeddings for _, _, plan in audio_occurrences
         )
@@ -597,8 +596,7 @@ class NemotronMultiModalProcessorAdapter(_NemotronVisualProcessorAdapter):
             self.packing_sequence_length - visual_embeddings + visual_placeholders
         )
         image_tokens_before_truncation = sum(
-            len(message["visual_placeholder_positions"])
-            for message in message_log
+            len(message["visual_placeholder_positions"]) for message in message_log
         )
         # Separate the two ways the placeholder count can disagree with the plan.
         # Conflating them blames truncation for samples that were never truncated.
@@ -618,8 +616,7 @@ class NemotronMultiModalProcessorAdapter(_NemotronVisualProcessorAdapter):
             sample=sample,
         )
         remaining_visual_placeholders = sum(
-            len(message["visual_placeholder_positions"])
-            for message in message_log
+            len(message["visual_placeholder_positions"]) for message in message_log
         )
         if remaining_visual_placeholders != image_tokens_before_truncation:
             raise ValueError(
@@ -685,9 +682,7 @@ class NemotronMultiModalProcessorAdapter(_NemotronVisualProcessorAdapter):
                     target_sr=self.target_sampling_rate,
                 )
             )
-        min_samples = round(
-            self.min_audio_duration_seconds * self.target_sampling_rate
-        )
+        min_samples = round(self.min_audio_duration_seconds * self.target_sampling_rate)
         if audio.shape[2] < min_samples:
             audio = F.pad(audio, (0, min_samples - audio.shape[2]))
         audio = audio.squeeze(1)
