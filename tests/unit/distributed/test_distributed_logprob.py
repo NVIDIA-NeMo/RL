@@ -24,12 +24,14 @@ import functools
 import pytest
 import torch
 
+import nemo_rl.distributed.model_utils as model_utils
 from nemo_rl.distributed.model_utils import (
     ChunkedDistributedEntropy,
     ChunkedDistributedGatherLogprob,
     ChunkedDistributedLogprob,
     DistributedLogprob,
     _compute_distributed_log_softmax,
+    _emit_super35_distributed_logprob_diagnostics,
     get_next_token_logprobs_from_logits,
 )
 
@@ -224,6 +226,60 @@ def _run_edge_cases(rank, world_size, tp_size):
 # ---------------------------------------------------------------------------
 # Pytest test functions
 # ---------------------------------------------------------------------------
+
+
+def test_super35_distributed_logprob_diagnostics(monkeypatch, capsys):
+    monkeypatch.setattr(model_utils, "_super35_distributed_logprob_events_reported", 0)
+    monkeypatch.setattr(model_utils.socket, "gethostname", lambda: "test-node")
+    monkeypatch.setattr(
+        torch.distributed,
+        "get_rank",
+        lambda group=None: 1 if group is not None else 7,
+    )
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda tensor, **kwargs: None)
+
+    _emit_super35_distributed_logprob_diagnostics(
+        source_logits=torch.tensor(
+            [[[0.5, float("nan"), float("inf"), -float("inf")]]]
+        ),
+        token_logprobs=torch.tensor([[float("nan")]]),
+        target=torch.tensor([[1]]),
+        vocab_start_index=0,
+        vocab_end_index=4,
+        tp_group=object(),
+        chunk_start=2048,
+        path="chunked",
+    )
+
+    output = capsys.readouterr().out
+    assert "[SUPER35_DEBUG][DISTRIBUTED_LOGPROB_NONFINITE]" in output
+    assert "event=1/8" in output
+    assert "host=test-node global_rank=7 tp_rank=1" in output
+    assert "first_tensor_position=2048" in output
+    assert "local_row_nan=1 local_row_posinf=1 local_row_neginf=1" in output
+    assert "tp_ranks_with_nonfinite_source=1" in output
+
+
+def test_super35_distributed_logprob_diagnostics_ignores_finite_output(
+    monkeypatch, capsys
+):
+    def unexpected_all_reduce(*args, **kwargs):
+        raise AssertionError("finite output must not run a diagnostic collective")
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", unexpected_all_reduce)
+
+    _emit_super35_distributed_logprob_diagnostics(
+        source_logits=torch.tensor([[[0.5, 1.0]]]),
+        token_logprobs=torch.tensor([[-0.5]]),
+        target=torch.tensor([[1]]),
+        vocab_start_index=0,
+        vocab_end_index=2,
+        tp_group=object(),
+        chunk_start=0,
+        path="chunked",
+    )
+
+    assert capsys.readouterr().out == ""
 
 
 @pytest.mark.parametrize(

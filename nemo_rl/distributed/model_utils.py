@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import socket
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -28,6 +29,97 @@ if TYPE_CHECKING:
     # megatron-core (optional "mcore" extra) is imported lazily below so this
     # module imports without mcore installed.
     from megatron.core.models.gpt import GPTModel
+
+
+_SUPER35_DISTRIBUTED_LOGPROB_EVENT_LIMIT = 8
+_super35_distributed_logprob_events_reported = 0
+
+
+@torch.no_grad()
+def _emit_super35_distributed_logprob_diagnostics(
+    *,
+    source_logits: torch.Tensor,
+    token_logprobs: torch.Tensor,
+    target: torch.Tensor,
+    vocab_start_index: int,
+    vocab_end_index: int,
+    tp_group: torch.distributed.ProcessGroup,
+    chunk_start: int,
+    path: str,
+) -> None:
+    """Log the source row when distributed logprob output becomes nonfinite."""
+    global _super35_distributed_logprob_events_reported
+
+    bad_positions = torch.nonzero(~torch.isfinite(token_logprobs), as_tuple=False)
+    if bad_positions.numel() == 0:
+        return
+
+    first_batch = int(bad_positions[0, 0].item())
+    first_local_position = int(bad_positions[0, 1].item())
+    source_row = source_logits[first_batch, first_local_position]
+    target_token = int(target[first_batch, first_local_position].item())
+
+    nan_count = int(torch.isnan(source_row).sum().item())
+    posinf_count = int(torch.isposinf(source_row).sum().item())
+    neginf_count = int(torch.isneginf(source_row).sum().item())
+    local_row_nonfinite = nan_count + posinf_count + neginf_count
+    finite_values = source_row[torch.isfinite(source_row)]
+    finite_min = (
+        float(finite_values.min().item()) if finite_values.numel() > 0 else float("nan")
+    )
+    finite_max = (
+        float(finite_values.max().item()) if finite_values.numel() > 0 else float("nan")
+    )
+
+    target_is_local = vocab_start_index <= target_token < vocab_end_index
+    local_target_logit = float("nan")
+    if target_is_local:
+        local_target_logit = float(source_row[target_token - vocab_start_index].item())
+
+    ranks_with_nonfinite_source = torch.tensor(
+        int(local_row_nonfinite > 0), device=source_logits.device
+    )
+    torch.distributed.all_reduce(
+        ranks_with_nonfinite_source,
+        op=torch.distributed.ReduceOp.SUM,
+        group=tp_group,
+    )
+
+    if (
+        _super35_distributed_logprob_events_reported
+        >= _SUPER35_DISTRIBUTED_LOGPROB_EVENT_LIMIT
+    ):
+        return
+    _super35_distributed_logprob_events_reported += 1
+
+    print(
+        "[SUPER35_DEBUG][DISTRIBUTED_LOGPROB_NONFINITE] "
+        f"event={_super35_distributed_logprob_events_reported}/"
+        f"{_SUPER35_DISTRIBUTED_LOGPROB_EVENT_LIMIT} "
+        f"host={socket.gethostname()} "
+        f"global_rank={torch.distributed.get_rank()} "
+        f"tp_rank={torch.distributed.get_rank(tp_group)} "
+        f"path={path} chunk_start={chunk_start} "
+        f"chunk_tokens={source_logits.shape[1]} "
+        f"bad_output_tokens={bad_positions.shape[0]} "
+        f"first_batch={first_batch} "
+        f"first_local_position={first_local_position} "
+        f"first_tensor_position={chunk_start + first_local_position} "
+        f"target_token={target_token} "
+        f"vocab_range=[{vocab_start_index},{vocab_end_index}) "
+        f"target_is_local={target_is_local} "
+        f"local_target_logit={local_target_logit!r} "
+        f"local_row_nan={nan_count} "
+        f"local_row_posinf={posinf_count} "
+        f"local_row_neginf={neginf_count} "
+        f"local_row_finite_min={finite_min!r} "
+        f"local_row_finite_max={finite_max!r} "
+        f"tp_ranks_with_nonfinite_source="
+        f"{int(ranks_with_nonfinite_source.item())} "
+        f"output_logprob="
+        f"{float(token_logprobs[first_batch, first_local_position].item())!r}",
+        flush=True,
+    )
 
 
 @torch.no_grad()
@@ -184,6 +276,17 @@ class DistributedLogprob(torch.autograd.Function):
             log_probs,
             op=torch.distributed.ReduceOp.SUM,
             group=group,
+        )
+
+        _emit_super35_distributed_logprob_diagnostics(
+            source_logits=vocab_parallel_logits,
+            token_logprobs=log_probs,
+            target=target,
+            vocab_start_index=vocab_start_index,
+            vocab_end_index=vocab_end_index,
+            tp_group=group,
+            chunk_start=0,
+            path="unchunked",
         )
 
         if not inference_only:
@@ -347,6 +450,17 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
                 log_probs,
                 op=torch.distributed.ReduceOp.SUM,
                 group=tp_group,
+            )
+
+            _emit_super35_distributed_logprob_diagnostics(
+                source_logits=vocab_parallel_logits[:, chunk_start:chunk_end, :],
+                token_logprobs=log_probs,
+                target=target[:, chunk_start:chunk_end],
+                vocab_start_index=vocab_start_index,
+                vocab_end_index=vocab_end_index,
+                tp_group=tp_group,
+                chunk_start=chunk_start,
+                path="chunked",
             )
 
             all_log_probs.append(log_probs)
