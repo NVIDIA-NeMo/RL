@@ -78,6 +78,7 @@ from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
     NVFP4_PERTOKEN_ZMQ_TIMEOUT_MS,
     NvFp4PerTokenRolloutConfig,
 )
+from nemo_rl.models.megatron.attention import attention_backend_workspace
 from nemo_rl.models.megatron.common import (
     get_aux_loss_track_names,
     get_moe_metrics,
@@ -1126,7 +1127,7 @@ class MegatronPolicyWorkerImpl(
         torch.cuda.synchronize()  # pragma: no cover
         _train_t0 = time.perf_counter()  # pragma: no cover
 
-        with ctx:
+        with ctx, attention_backend_workspace():
             all_mb_metrics = []
             losses = []
             total_num_microbatches = 0
