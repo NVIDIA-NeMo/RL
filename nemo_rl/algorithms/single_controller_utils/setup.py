@@ -328,12 +328,14 @@ def _register_single_controller_partitions(
             enabled=r3_enabled,
         )
     else:
-        from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
+        from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, GENERATION_TOPK_FIELDS
 
         partition_fields = fields_with_optional_routed_experts(
             DP_TRAIN_FIELDS,
             enabled=r3_enabled and not token_capture_cfg.defer_routed_experts_to_policy,
         )
+        if token_capture_cfg.top_logprobs > 0:
+            partition_fields.extend(GENERATION_TOPK_FIELDS)
     if include_multimodal_fields:
         partition_fields.extend(
             field
@@ -361,7 +363,12 @@ def _register_single_controller_partitions(
             partition_id=token_capture_cfg.staging_partition,
             fields=list(STAGING_FIELDS)
             + ([STAGING_ROUTED_EXPERTS_FIELD] if r3_enabled else [])
-            + (list(MEDIA_STAGING_FIELDS) if capture_media else []),
+            + (list(MEDIA_STAGING_FIELDS) if capture_media else [])
+            + (
+                list(GENERATION_TOPK_FIELDS)
+                if token_capture_cfg.top_logprobs > 0
+                else []
+            ),
             num_samples=num_rollout_samples,
             consumer_tasks=["finalize", "prev_lp", "train"],
         )
@@ -1938,11 +1945,13 @@ def setup_single_controller(
         )
     if token_capture_cfg.enabled:
         # Both active backends stage canonical Gym rows in serving workers;
-        # only vLLM workers stage captured media beside them (capture_media).
+        # only vLLM workers stage captured media beside them (capture_media)
+        # and the sampler's top-k logprobs (top_logprobs, score centering).
         generation.setup_token_capture(
             dp_config,
             token_capture_cfg.staging_partition,
             capture_media=capture_media,
+            top_logprobs=token_capture_cfg.top_logprobs,
         )
         generation.set_rollout_weight_version(0)
 
@@ -2007,6 +2016,7 @@ def setup_single_controller(
                 defer_routed_experts_to_policy=token_capture_cfg.defer_routed_experts_to_policy,
                 max_seq_len=_generation_max_seq_len(generation_config),
                 capture_media=capture_media,
+                top_logprobs=token_capture_cfg.top_logprobs,
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,
         )

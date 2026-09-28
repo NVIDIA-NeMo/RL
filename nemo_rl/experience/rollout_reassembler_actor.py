@@ -60,6 +60,8 @@ class RolloutReassemblerActorConfig:
     max_seq_len: int
     # Whether the staging partition carries media columns (VLM capture).
     capture_media: bool
+    # token_capture.top_logprobs: sampler top-k columns to assemble (0 = none).
+    top_logprobs: int = 0
 
 
 @ray.remote(
@@ -86,6 +88,7 @@ class RolloutReassemblerActor:  # pragma: no cover
             defer_routed_experts_to_policy=config.defer_routed_experts_to_policy,
             max_seq_len=config.max_seq_len,
             capture_media=config.capture_media,
+            top_logprobs=config.top_logprobs,
         )
 
     def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:

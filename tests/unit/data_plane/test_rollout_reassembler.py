@@ -44,6 +44,9 @@ from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
 )
 
 from nemo_rl.data_plane.schema import (  # noqa: E402
+    GENERATION_TOPK_FIELDS,
+    GENERATION_TOPK_IDS_FIELD,
+    GENERATION_TOPK_LOGPROBS_FIELD,
     ROUTE_PASSTHROUGH_FLAG,
     ROUTE_PLAN_TAG,
 )
@@ -326,6 +329,150 @@ def test_finalize_group_skips_unset_terminal_selection(tq_client, partitions):
         if key.startswith("finalize/terminal_selection_") and key.endswith("_count")
     ]
     assert sum(bucket_counts) == 1.0
+
+
+STAGING_PARTITION_TOPK = "rollout_staging_topk_fin_test"
+CANONICAL_PARTITION_TOPK = "rollout_data_topk_fin_test"
+TOPK = 3
+
+
+@pytest.fixture()
+def topk_partitions(tq_client):
+    tq_client.register_partition(
+        partition_id=STAGING_PARTITION_TOPK,
+        fields=list(STAGING_FIELDS) + list(GENERATION_TOPK_FIELDS),
+        num_samples=64,
+        consumer_tasks=["finalize"],
+    )
+    tq_client.register_partition(
+        partition_id=CANONICAL_PARTITION_TOPK,
+        fields=[
+            "input_ids",
+            "input_lengths",
+            "generation_logprobs",
+            "token_mask",
+            "sample_mask",
+            "prompt_ids_for_adv",
+            "total_reward",
+            "mask_sample",
+            "truncated",
+            *GENERATION_TOPK_FIELDS,
+        ],
+        num_samples=64,
+        consumer_tasks=["train"],
+    )
+    yield
+    tq_client.clear_samples(sample_ids=None, partition_id=STAGING_PARTITION_TOPK)
+    tq_client.clear_samples(sample_ids=None, partition_id=CANONICAL_PARTITION_TOPK)
+
+
+def _topk_finalizer(tq_client) -> RolloutReassembler:
+    return RolloutReassembler(
+        tq_client,
+        partition_id=CANONICAL_PARTITION_TOPK,
+        staging_partition=STAGING_PARTITION_TOPK,
+        pad_token_id=PAD,
+        max_seq_len=4096,
+        top_logprobs=TOPK,
+    )
+
+
+def _stage_fixture_with_topk(
+    tq_client, name: str, *, rollout_id: str, short_call: str | None = None
+):
+    """Stage a fixture plus a distinct top-k per call.
+
+    Returns (receipt_dict, expected LinearizedRow, expected row ids, expected
+    row log-probs); the expectation follows the row's link spans: zeros for
+    each span's carried tokens, then that call's fragment. ``short_call``
+    stages one row too few for that call.
+    """
+    records, receipt, row = build_fixture_artifacts(name, rollout_id=rollout_id)
+    sink = TQTokenSink(tq_client, staging_partition=STAGING_PARTITION_TOPK)
+    fragments = {}
+    for call_idx, record in enumerate(records):
+        assert sink.stage(record).ok
+        generated = int(sum(record.token_mask_delta))
+        ids = torch.arange(generated * TOPK, dtype=torch.int32).reshape(generated, TOPK)
+        ids = ids + 100 * (call_idx + 1)
+        logprobs = -(torch.arange(generated * TOPK, dtype=torch.float32) + call_idx + 1)
+        logprobs = logprobs.reshape(generated, TOPK) / 10
+        if record.model_call_id == short_call:
+            ids, logprobs = ids[:-1], logprobs[:-1]
+        sink.stage_topk(record.staging_key, ids, logprobs)
+        fragments[record.model_call_id] = (ids, logprobs)
+    expected_ids, expected_logprobs = [], []
+    for call_id, carry_len, _generation_len in row.link_spans:
+        ids, logprobs = fragments[call_id]
+        expected_ids += [torch.zeros((carry_len, TOPK), dtype=torch.int32), ids]
+        expected_logprobs += [torch.zeros((carry_len, TOPK)), logprobs]
+    return (
+        receipt.model_dump(),
+        row,
+        torch.cat(expected_ids),
+        torch.cat(expected_logprobs),
+    )
+
+
+def test_finalize_group_publishes_the_sampler_topk(tq_client, topk_partitions):
+    group_id = "topk_grp"
+    receipt, expected, expected_ids, expected_logprobs = _stage_fixture_with_topk(
+        tq_client, "worked_example", rollout_id=f"{group_id}_g0"
+    )
+    rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
+
+    finalized = _topk_finalizer(tq_client).finalize_group(
+        group_id,
+        rollout_ids,
+        [receipt, None],  # second rollout lost its receipt -> placeholder
+        [1.0, 0.0],
+        mask_sample=[True, False],
+        fallback_weight_version=9,
+        prompt_idx=3,
+    )
+
+    assert not finalized.dropped
+    assert set(GENERATION_TOPK_FIELDS) <= set(finalized.meta.fields)
+    rows = tq_client.get_samples(
+        sample_ids=rollout_ids,
+        partition_id=CANONICAL_PARTITION_TOPK,
+        select_fields=["token_mask", *GENERATION_TOPK_FIELDS],
+    )
+    length = len(expected.token_ids)
+    ids = torch.as_tensor(rows[GENERATION_TOPK_IDS_FIELD][0])
+    logprobs = torch.as_tensor(rows[GENERATION_TOPK_LOGPROBS_FIELD][0])
+    assert ids.dtype == torch.int32
+    assert logprobs.dtype == torch.float32
+    assert torch.equal(ids[:length], expected_ids)
+    assert torch.equal(logprobs[:length], expected_logprobs)
+    # Token-aligned: zeros exactly on the carried (mask 0) positions.
+    generated = torch.as_tensor(rows["token_mask"][0]).flatten()[:length].bool()
+    assert not ids[:length][~generated].any()
+    assert ids[:length][generated].all()
+    placeholder = torch.as_tensor(rows[GENERATION_TOPK_IDS_FIELD][1])
+    assert tuple(placeholder.shape) == (1, TOPK)
+    assert not placeholder.any()
+
+
+def test_finalize_rollout_rejects_a_topk_fragment_of_the_wrong_length(
+    tq_client, topk_partitions
+):
+    receipt, _, _, _ = _stage_fixture_with_topk(
+        tq_client, "worked_example", rollout_id="topk_short", short_call="c2"
+    )
+    row = _topk_finalizer(tq_client).finalize_rollout("topk_short", receipt, reward=1.0)
+    assert row.rejection_reason == "topk_length_mismatch:c2"
+
+
+def test_finalize_rollout_rejects_a_row_without_topk(tq_client, topk_partitions):
+    records, receipt, _ = build_fixture_artifacts("single_call", rollout_id="topk_none")
+    sink = TQTokenSink(tq_client, staging_partition=STAGING_PARTITION_TOPK)
+    for record in records:
+        assert sink.stage(record).ok
+    row = _topk_finalizer(tq_client).finalize_rollout(
+        "topk_none", receipt.model_dump(), reward=0.0
+    )
+    assert (row.rejection_reason or "").startswith("missing_staging_row")
 
 
 def test_finalize_group_maps_physical_attempt_to_stable_canonical_id(
@@ -722,9 +869,9 @@ def test_deferred_finalizer_rejects_invalid_routed_len(
 
     class _InjectedSource:
         def fetch_for_finalization(
-            self, staging_keys, *, include_route_fragments=False
+            self, staging_keys, *, include_route_fragments=False, include_topk=False
         ):
-            del staging_keys, include_route_fragments
+            del staging_keys, include_route_fragments, include_topk
             return fetched
 
     finalizer._source = _InjectedSource()
@@ -830,9 +977,9 @@ def test_direct_extras_corruption_rejects_before_publication(
 
     class _InjectedSource:
         def fetch_for_finalization(
-            self, staging_keys, *, include_route_fragments=False
+            self, staging_keys, *, include_route_fragments=False, include_topk=False
         ):
-            del staging_keys, include_route_fragments
+            del staging_keys, include_route_fragments, include_topk
             return fetched
 
     finalizer._source = _InjectedSource()

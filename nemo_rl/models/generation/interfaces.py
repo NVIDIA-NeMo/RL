@@ -618,6 +618,7 @@ class GenerationInterface(ABC):
         staging_partition: str,
         *,
         capture_media: bool = False,
+        top_logprobs: int = 0,
     ) -> None:
         """Install token capture in the serving workers (``token_capture.enabled``).
 
@@ -630,6 +631,8 @@ class GenerationInterface(ABC):
             staging_partition: Data-plane partition that captured rows are staged in.
             capture_media: Also stage the processed VLM media each call ran on
                 beside its token delta (vLLM only; see ``MEDIA_STAGING_FIELDS``).
+            top_logprobs: Also stage the sampler's top-k log-probs per generated
+                token when > 0 (vLLM only; see ``GENERATION_TOPK_FIELDS``).
         """
         raise NotImplementedError(
             f"token_capture.enabled is not supported for {type(self).__name__}"

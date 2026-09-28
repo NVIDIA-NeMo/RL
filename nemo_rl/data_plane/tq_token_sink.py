@@ -29,7 +29,10 @@ the wire, matching ``compute_staging_digest``'s float32-bit-pattern scheme, so
 digest recomputation over fetched values is byte-exact. Route payloads never
 ride inside snapshots: the source returns them as separate ``RouteFragment``
 values keyed by staging key, digest-verified by the plan executor at point of
-use.
+use. With ``token_capture.top_logprobs`` the worker adds two more jagged
+columns to the row after the digest-covered put (``stage_topk``): the
+sampler's top-k ids and log-probs of the call's generated tokens. They are not
+digest-covered; the finalizer checks their shape against the generated length.
 """
 
 from __future__ import annotations
@@ -59,6 +62,9 @@ if TYPE_CHECKING:
 
 from nemo_rl.data_plane.schema import (
     PER_TOKEN_STAGING_FIELDS,
+    GENERATION_TOPK_FIELDS,
+    GENERATION_TOPK_IDS_FIELD,
+    GENERATION_TOPK_LOGPROBS_FIELD,
     ROUTE_ENCODING_ENVELOPE,
     ROUTE_ENCODING_LIST,
     ROUTE_ENCODING_NONE,
@@ -293,7 +299,9 @@ class FetchedStagedCall:
 
     ``fragment`` is populated only when the fetch requested route payloads
     (direct mode); deferred finalization leaves route bytes in TQ and carries
-    only ``routed_len`` transport metadata.
+    only ``routed_len`` transport metadata. ``topk`` is the call's staged
+    sampler top-k ``(ids, logprobs)``, each ``[generated_len, k]``, only when
+    the fetch requested it.
     """
 
     staging_key: str
@@ -308,6 +316,7 @@ class FetchedStagedCall:
     # ``media_present`` is True; ``media_has_frames`` selects the video shape.
     media_present: bool = False
     media_has_frames: bool = False
+    topk: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 def _call_dp(dp_client: Any, method_name: str, **kwargs: Any) -> Any:
@@ -340,6 +349,16 @@ class TQStagingStore:
             partition_id=self._staging_partition,
             fields=TensorDict(field_dict, batch_size=[1]),
             tags=[tags or {}],
+        )
+
+    def add_columns(self, key: str, field_dict: dict[str, torch.Tensor]) -> None:
+        """Write more columns onto an existing row, leaving its tags as they are."""
+        _call_dp(
+            self._dp_client,
+            "put_samples",
+            sample_ids=[key],
+            partition_id=self._staging_partition,
+            fields=TensorDict(field_dict, batch_size=[1]),
         )
 
     def get(self, keys: list[str], *, select_fields: list[str]) -> TensorDict:
@@ -598,6 +617,24 @@ class TQTokenSink:
                 error,
             )
 
+    def stage_topk(
+        self, staging_key: str, topk_ids: torch.Tensor, topk_logprobs: torch.Tensor
+    ) -> None:
+        """Add the sampler's top-k (``[generated_len, k]`` ids and log-probs) to a staged row.
+
+        A second put on the same key: TransferQueue merges columns per
+        (sample, field) and keeps the row's tags. Unlike ``stage`` this raises
+        on failure; the caller logs it and the finalizer rejects the rollout
+        when the row lacks the columns.
+        """
+        self._store.add_columns(
+            staging_key,
+            {
+                GENERATION_TOPK_IDS_FIELD: topk_ids.unsqueeze(0),
+                GENERATION_TOPK_LOGPROBS_FIELD: topk_logprobs.unsqueeze(0),
+            },
+        )
+
     def clear(self, staging_keys: list[str]) -> None:
         """Drop staged rows (finalizer / eviction cleanup)."""
         self._store.clear(staging_keys)
@@ -823,6 +860,7 @@ class TQTokenSource:
         staging_keys: list[str],
         *,
         include_route_fragments: bool = False,
+        include_topk: bool = False,
     ) -> list[FetchedStagedCall]:
         """Fetch digest-covered base columns, plus route payloads when requested.
 
@@ -830,7 +868,9 @@ class TQTokenSource:
         bytes stay in TQ for the policy worker. Direct mode passes
         ``include_route_fragments=True`` to pull the payloads in the same
         batched read and receives them as ``RouteFragment`` values beside the
-        base snapshots, never inside them.
+        base snapshots, never inside them. ``include_topk`` adds the sampler
+        top-k columns (``token_capture.top_logprobs``); a row without them
+        fails the fetch like a missing row.
         """
         if not staging_keys:
             return []
@@ -841,6 +881,8 @@ class TQTokenSource:
         select_fields = list(STAGING_FIELDS)
         if self._capture_media:
             select_fields += MEDIA_METADATA_FIELDS
+        if include_topk:
+            select_fields += list(GENERATION_TOPK_FIELDS)
         try:
             if include_route_fragments:
                 # Route payloads are optional per run (feature-gated at the
@@ -899,6 +941,14 @@ class TQTokenSource:
                     extras=_row_extras(row, verify_media=self._capture_media),
                     media_present=media_present,
                     media_has_frames=media_has_frames,
+                    topk=(
+                        (
+                            row[GENERATION_TOPK_IDS_FIELD][0],
+                            row[GENERATION_TOPK_LOGPROBS_FIELD][0],
+                        )
+                        if include_topk
+                        else None
+                    ),
                 )
             )
         return fetched

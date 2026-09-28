@@ -222,6 +222,9 @@ data_plane:
 token_capture:
   enabled: false
   staging_partition: rollout_staging
+  # Also stage the sampler's top-k log-probs per generated token (0 = off), for
+  # loss_fn.score_centering. Needs policy.generation.vllm_kwargs.max_logprobs >= top_logprobs.
+  top_logprobs: 0
 
 # Retry and restore policy for unfinished token-capture groups. "sibling" reuses
 # already sealed generations; "prompt_group" regenerates every sibling when any

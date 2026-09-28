@@ -645,12 +645,18 @@ class MegatronGeneration(GenerationInterface):
         staging_partition: str,
         *,
         capture_media: bool = False,
+        top_logprobs: int = 0,
     ) -> None:
         """Install MInf's canonical prompt and completion capture hooks."""
         if capture_media:
             raise NotImplementedError(
                 "Media token capture is only implemented for the vLLM generation "
                 "backend; the MInf stager writes text-only rows"
+            )
+        if top_logprobs > 0:
+            raise NotImplementedError(
+                "token_capture.top_logprobs is only implemented for the vLLM "
+                "generation backend; the MInf stager writes no top-k log-probs"
             )
         if not self.cfg["mcore_generation_config"]["expose_http_server"]:
             raise ValueError(

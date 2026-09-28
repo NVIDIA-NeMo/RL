@@ -246,6 +246,7 @@ def test_factory_selects_gym_environment_and_waits_for_dependencies(
         defer_routed_experts_to_policy=False,
         max_seq_len=4096,
         capture_media=False,
+        top_logprobs=0,
     )
     dp_config = {"enabled": True, "impl": "transfer_queue", "backend": "simple"}
     actors = [MagicMock(), MagicMock()]
