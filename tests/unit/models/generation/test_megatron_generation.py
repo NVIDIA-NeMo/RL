@@ -36,8 +36,10 @@ from nemo_rl.models.generation.megatron.config import (
 from nemo_rl.models.generation.megatron.megatron_worker import MegatronGenerationMixin
 from nemo_rl.models.generation.megatron.utils import (
     build_prompt_and_multimodal_data,
+    sample_vision_tensors,
 )
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.weight_sync.megatron_weight_synchronizer import (
     MegatronWeightSynchronizer,
@@ -46,6 +48,36 @@ from nemo_rl.weight_sync.membership import RefitMembership
 from tests.unit.test_utils import SimpleLossFn
 
 model_name = "Qwen/Qwen3-0.6B"
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize(
+    ("pixels", "preprocess_mode", "expected_shape"),
+    [
+        (torch.ones(3, 32, 32), None, (1, 3, 32, 32)),
+        (torch.ones(1, 4, 768), "patchify", (1, 4, 768)),
+    ],
+)
+def test_sample_vision_tensors_preserves_patchified_shape(
+    pixels: torch.Tensor,
+    preprocess_mode: str | None,
+    expected_shape: tuple[int, ...],
+) -> None:
+    data = {
+        "pixel_values": PackedTensor(
+            [pixels],
+            dim_to_pack=0,
+            preprocess_mode=preprocess_mode,
+            preprocess_kwargs={"patch_dim": 16} if preprocess_mode else None,
+        ),
+        "imgs_sizes": PackedTensor([torch.tensor([32, 32])], dim_to_pack=0),
+    }
+
+    images, image_sizes, num_frames = sample_vision_tensors(data, 0)
+
+    assert images.shape == expected_shape
+    assert image_sizes.shape == (1, 2)
+    assert num_frames is None
 
 
 @pytest.mark.mcore
@@ -725,7 +757,7 @@ basic_megatron_test_config: PolicyConfig = {
             "data_parallel_sharding_strategy": "optim_grads_params",
         },
     },
-    "draft": {"enabled": False},
+    "draft": Eagle3DraftConfig(enabled=False),
     "optimizer": None,
     "scheduler": None,
     "max_grad_norm": 1.0,

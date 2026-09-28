@@ -49,6 +49,7 @@ from nemo_rl.algorithms.loss import (
     prepare_packed_loss_input,
     wrap_loss_fn_with_input_preparation,
 )
+from nemo_rl.algorithms.loss.draft import DEFAULT_DRAFT_TOKEN_CHUNK_SIZE
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.utils import _pack_input_ids
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
@@ -84,9 +85,14 @@ PostProcessingFunction = Union[
 def _prepare_padding_mask_for_model(
     model: GPTModel,
     padding_mask: Optional[torch.Tensor],
+    model_slices_context_parallel_inputs: bool = False,
 ) -> Optional[torch.Tensor]:
     """Match a CP-local padding mask to the model's sequence-parallel layout."""
-    if padding_mask is None or not get_model_config(model).sequence_parallel:
+    if (
+        padding_mask is None
+        or model_slices_context_parallel_inputs
+        or not get_model_config(model).sequence_parallel
+    ):
         return padding_mask
 
     core_model = unwrap_model(model)
@@ -159,6 +165,7 @@ def model_forward(
     straggler_timer: Optional[StragglerDetector] = None,
     use_fused_linear_logprobs: bool = False,
     media_token_validity_mask: Optional[torch.Tensor] = None,
+    model_slices_context_parallel_inputs: bool = False,
 ) -> torch.Tensor:
     """Perform a single forward pass through the model.
 
@@ -179,6 +186,7 @@ def model_forward(
         media_token_validity_mask: Which media-token positions actually anchor a
             projected feature, already in this model's token layout. Only passed
             when the model accepts it; otherwise the model derives its own.
+        model_slices_context_parallel_inputs: Whether the model CP-slices its own inputs.
 
     Returns:
         torch.Tensor: Output tensor from the model (logits)
@@ -186,7 +194,15 @@ def model_forward(
     multimodal_data = data_dict.get_multimodal_dict(
         as_tensors=True, device=input_ids_cp_sharded.device
     )
-    if len(multimodal_data) > 0:
+    # Energon boundaries use PackedTensor for transport, but they are packing
+    # metadata rather than model inputs. PackedSeqParams carries them forward.
+    multimodal_data.pop("cu_seqlens", None)
+    multimodal_data.pop("cu_seqlens_padded", None)
+    # VLM wrappers normally derive their own positions or expand the token sequence,
+    # so position_ids are dropped for multimodal batches.
+    # A model that consumes caller-packed THD inputs keeps them:
+    # it CP-slices them with the tokens and its MTP block asserts they are present.
+    if len(multimodal_data) > 0 and not model_slices_context_parallel_inputs:
         position_ids = None
 
     additional_kwargs = {}
@@ -197,7 +213,11 @@ def model_forward(
     # Pass MTP loss mask to exclude prompt tokens from MTP loss
     if mtp_loss_mask is not None:
         additional_kwargs["loss_mask"] = mtp_loss_mask
-    padding_mask = _prepare_padding_mask_for_model(model, padding_mask)
+    padding_mask = _prepare_padding_mask_for_model(
+        model,
+        padding_mask,
+        model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
+    )
     if padding_mask is not None:
         additional_kwargs["padding_mask"] = padding_mask
 
@@ -267,6 +287,7 @@ def forward_with_post_processing_fn(
     use_fused_linear_logprobs: bool = False,
     use_router_replay: bool = False,
     router_replay_train: bool = False,
+    model_slices_context_parallel_inputs: bool = False,
 ) -> Tuple[torch.Tensor, Callable]:
     """Perform forward pass with pre-processed microbatch and return output tensor and post-processing function.
 
@@ -287,6 +308,7 @@ def forward_with_post_processing_fn(
         enable_hidden_capture: Whether to enable hidden state capture for draft model training
         enable_opd_full_capture: Whether to capture pre-LM-head hidden states for
             the full-vocabulary MOPD teacher payload
+        model_slices_context_parallel_inputs: Whether the model CP-slices its own inputs.
 
     Returns:
         tuple: (output_tensor, post_processing_fn_wrapped)
@@ -344,6 +366,7 @@ def forward_with_post_processing_fn(
                 straggler_timer=straggler_timer,
                 use_fused_linear_logprobs=use_fused_linear_logprobs,
                 media_token_validity_mask=media_token_validity_mask,
+                model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
             )
     except Exception:
         # The forward above armed the router-replay action (set_router_replay_forward);
@@ -473,6 +496,7 @@ def megatron_forward_backward(
     use_fused_linear_logprobs: bool = False,
     use_router_replay: bool = False,
     router_replay_train: bool = False,
+    model_slices_context_parallel_inputs: bool = False,
 ) -> Any:
     """Execute forward and backward passes using Megatron's utilities.
 
@@ -497,6 +521,7 @@ def megatron_forward_backward(
         enable_hidden_capture: Whether to enable hidden state capture for draft model training
         enable_opd_full_capture: Whether to capture pre-LM-head hidden states for
             the full-vocabulary MOPD teacher payload
+        model_slices_context_parallel_inputs: Whether the model CP-slices its own inputs.
 
     Returns:
         Results from the forward/backward execution
@@ -515,6 +540,7 @@ def megatron_forward_backward(
         use_fused_linear_logprobs=use_fused_linear_logprobs,
         use_router_replay=use_router_replay,
         router_replay_train=router_replay_train,
+        model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
     )
     forward_backward_func = get_forward_backward_func()
     if use_router_replay:
@@ -546,7 +572,8 @@ class LossPostProcessor:
         sampling_params: Optional[TrainingSamplingParams] = None,
         draft_model: Optional[MegatronModule] = None,
         prepare_fn: Optional[Callable[..., Any]] = None,
-        teacher_output_layer_weight: Optional[torch.Tensor] = None,
+        defer_draft_normalization: bool = False,
+        teacher_output_layer_weight_by_index: Optional[dict[int, torch.Tensor]] = None,
     ):
         """Build a per-microbatch loss post-processor for the Megatron train loop.
 
@@ -563,11 +590,16 @@ class LossPostProcessor:
                 vocab_parallel_group, context_parallel_group)`` and return
                 ``(loss_input, data)``; value models pass one that right-shifts
                 and CP-all-gathers the scalar value-head output.
-            teacher_output_layer_weight: This rank's teacher LM-head shard, used
-                by the full-vocabulary MOPD loss to project the teacher payload.
-                It rides this argument rather than the data dict because the
-                sequence-packing wrapper batch-slices every data entry, and
-                rather than the loss object because that is pickled to workers.
+            defer_draft_normalization: Return raw draft loss statistics for split
+                optimizer-step finalization instead of normalizing per microbatch.
+            teacher_output_layer_weight_by_index: This rank's teacher LM-head
+                shards for every configured teacher, keyed by the stable
+                per-checkpoint index rows are tagged with (see
+                ``OPD_FULL_TEACHER_INDEX_FIELD``). The full-vocabulary MOPD loss
+                projects each row's teacher payload with them. They ride this
+                argument rather than the data dict because the sequence-packing
+                wrapper batch-slices every data entry, and rather than the loss
+                object because that is pickled to workers.
         """
         self.loss_fn = loss_fn
         self.cfg = cfg
@@ -575,7 +607,8 @@ class LossPostProcessor:
         self.cp_normalize = cp_normalize
         self.sampling_params = sampling_params
         self.prepare_fn = prepare_fn
-        self.teacher_output_layer_weight = teacher_output_layer_weight
+        self.defer_draft_normalization = defer_draft_normalization
+        self.teacher_output_layer_weight_by_index = teacher_output_layer_weight_by_index
         if draft_model is not None and draft_model.eagle_module is not None:
             self.d2t = getattr(draft_model.eagle_module, "d2t", None)
         else:
@@ -613,7 +646,7 @@ class LossPostProcessor:
                 sampling_params=self.sampling_params,
                 d2t=self.d2t,
                 chunk_size=logprob_chunk_size,
-                teacher_output_layer_weight=self.teacher_output_layer_weight,
+                teacher_output_layer_weight_by_index=self.teacher_output_layer_weight_by_index,
             )
 
         # wrap loss function with loss input preparation
@@ -659,7 +692,7 @@ class LossPostProcessor:
                     loss_fn=loss_fn_wrapped,
                     prepare_fn=None,
                     data_dict=data_dict,
-                    loss_weight=float(self.cfg["draft"]["loss_weight"]),
+                    loss_weight=float(self.cfg["draft"].loss_weight),
                     vocab_parallel_rank=get_tensor_model_parallel_rank(),
                     vocab_parallel_group=get_tensor_model_parallel_group(),
                     context_parallel_group=get_context_parallel_group(),
@@ -667,6 +700,14 @@ class LossPostProcessor:
                     cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
                     d2t=self.d2t,
                     student_logits=student_logits,
+                    token_chunk_size=int(
+                        getattr(
+                            self.cfg["draft"],
+                            "token_chunk_size",
+                            DEFAULT_DRAFT_TOKEN_CHUNK_SIZE,
+                        )
+                    ),
+                    defer_normalization=self.defer_draft_normalization,
                 )
         else:
             loss_fn_wrapped = partial(
@@ -682,10 +723,18 @@ class LossPostProcessor:
                     loss_fn=loss_fn_wrapped,
                     prepare_fn=prepare_loss_input_wrapped,
                     data_dict=data_dict,
-                    loss_weight=float(self.cfg["draft"]["loss_weight"]),
+                    loss_weight=float(self.cfg["draft"].loss_weight),
                     vocab_parallel_rank=get_tensor_model_parallel_rank(),
                     vocab_parallel_group=get_tensor_model_parallel_group(),
                     context_parallel_group=get_context_parallel_group(),
+                    token_chunk_size=int(
+                        getattr(
+                            self.cfg["draft"],
+                            "token_chunk_size",
+                            DEFAULT_DRAFT_TOKEN_CHUNK_SIZE,
+                        )
+                    ),
+                    defer_normalization=self.defer_draft_normalization,
                 )
 
         loss_fn_wrapped = partial(

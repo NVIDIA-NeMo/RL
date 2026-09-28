@@ -50,9 +50,9 @@ from nemo_rl.distributed.model_utils import (
     cp_shift_next,
     get_logprobs_from_vocab_parallel_logits,
     group_all_reduce_sum_with_grad,
+    to_local_if_dtensor,
     vocab_parallel_argmax,
 )
-from nemo_rl.models.dtensor.parallelize import to_local_if_dtensor
 
 if TYPE_CHECKING:
     from nemo_automodel.components.distributed.context_parallel import (
