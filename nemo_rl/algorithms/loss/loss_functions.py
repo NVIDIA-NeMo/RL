@@ -1328,6 +1328,11 @@ class MseValueLossConfig(BaseModel, extra="forbid"):
     type: Literal["mse", "hl_gauss", "two_hot"] = "mse"
     # HL-Gauss smoothing: sigma = hl_gauss_sigma_ratio * bin_width (paper default 0.75).
     hl_gauss_sigma_ratio: float = 0.75
+    # Mirror label smoothing for categorical critics: the target becomes
+    # (1 - eps) * T(return) + eps * T(v_min + v_max - return). For 0/1 returns
+    # this bounds the predicted value to [eps, 1 - eps] and stops the logits
+    # from saturating on single-trajectory outcomes. 0 disables it.
+    hl_gauss_label_smoothing: float = 0.0
 
     @model_validator(mode="after")
     def _validate_classification(self) -> "MseValueLossConfig":
@@ -1337,6 +1342,12 @@ class MseValueLossConfig(BaseModel, extra="forbid"):
             )
         if self.hl_gauss_sigma_ratio <= 0:
             raise ValueError("value_loss_fn.hl_gauss_sigma_ratio must be positive")
+        if not 0.0 <= self.hl_gauss_label_smoothing < 0.5:
+            raise ValueError("value_loss_fn.hl_gauss_label_smoothing must be in [0, 0.5)")
+        if self.type == "mse" and self.hl_gauss_label_smoothing:
+            raise ValueError(
+                "value_loss_fn.hl_gauss_label_smoothing requires a categorical loss type"
+            )
         return self
 
 
@@ -1538,7 +1549,13 @@ class ClassificationValueLossFn(LossFunction):
         self.target_type = cfg.type
         self.support = support
         self.sigma = cfg.hl_gauss_sigma_ratio * support.bin_width
+        self.label_smoothing = cfg.hl_gauss_label_smoothing
         self.loss_type = LossType.TOKEN_LEVEL
+
+    def _target(self, returns: torch.Tensor) -> torch.Tensor:
+        if self.target_type == "hl_gauss":
+            return self.support.hl_gauss_target(returns, self.sigma)
+        return self.support.two_hot_target(returns)
 
     def __call__(
         self,
@@ -1560,10 +1577,12 @@ class ClassificationValueLossFn(LossFunction):
 
         clipped_returns = returns.float().clamp(self.support.v_min, self.support.v_max)
         with torch.no_grad():
-            if self.target_type == "hl_gauss":
-                target = self.support.hl_gauss_target(clipped_returns, self.sigma)
-            else:
-                target = self.support.two_hot_target(clipped_returns)
+            target = self._target(clipped_returns)
+            if self.label_smoothing > 0:
+                mirrored = self.support.v_min + self.support.v_max - clipped_returns
+                target = (1 - self.label_smoothing) * target + (
+                    self.label_smoothing * self._target(mirrored)
+                )
 
         log_probs = torch.log_softmax(logits, dim=-1)
         ce = -(target * log_probs).sum(dim=-1)

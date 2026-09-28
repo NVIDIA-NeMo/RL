@@ -125,3 +125,29 @@ def test_expected_value_matches_softmax_mean():
     manual = (logits.softmax(-1) * support.centers(torch.device("cpu"))).sum(-1)
     torch.testing.assert_close(expected, manual)
     assert expected.shape == (2, 5)
+
+
+def test_label_smoothing_bounds_optimum():
+    cfg = MseValueLossConfig(type="hl_gauss", hl_gauss_label_smoothing=0.1)
+    loss_fn = make_value_loss_fn(cfg, HEAD)
+    returns = torch.tensor([[1.0, 1.0], [0.0, 0.0]])
+    data = _data(returns)
+    logits = torch.zeros(2, 2, 61, requires_grad=True)
+    opt = torch.optim.Adam([logits], lr=0.5)
+    for _ in range(400):
+        opt.zero_grad()
+        loss, _ = loss_fn(logits, data, torch.tensor(2), torch.tensor(4))
+        loss.backward()
+        opt.step()
+    values = CategoricalValueSupport.from_value_head_cfg(HEAD).expected_value(
+        logits.detach()
+    )
+    torch.testing.assert_close(values[0], torch.full((2,), 0.9), atol=0.01, rtol=0)
+    torch.testing.assert_close(values[1], torch.full((2,), 0.1), atol=0.01, rtol=0)
+
+
+def test_label_smoothing_validation():
+    with pytest.raises(ValueError, match="label_smoothing"):
+        MseValueLossConfig(type="hl_gauss", hl_gauss_label_smoothing=0.6)
+    with pytest.raises(ValueError, match="categorical"):
+        MseValueLossConfig(hl_gauss_label_smoothing=0.05)
