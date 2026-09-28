@@ -50,9 +50,9 @@ def _train_backend_configs(
 def reject_outdated_dtensor_cfg_key(config: dict[str, Any]) -> None:
     """Fail when a config still names the Automodel block dtensor_cfg.
 
-    Blocks that select Megatron are skipped: their dtensor_cfg is inert, and before this
-    module existed the check lived on the DTensor branch of Policy.__init__ and never saw
-    them.
+    Blocks that select Megatron are skipped: the run does not read dtensor_cfg. If such a
+    config relied on the old key to disable Automodel, Policy/Value.__init__ reports the
+    rename when both backends end up enabled.
 
     Args:
         config: The config as the user wrote it, resolved to plain dicts.

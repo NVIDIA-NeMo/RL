@@ -162,7 +162,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         if megatron_enabled and automodel_enabled:
             raise ValueError(
                 "Configure either Megatron (policy.megatron_cfg.enabled=true) or "
-                "DTensor (policy.automodel_cfg.enabled=true), not both."
+                "Automodel (policy.automodel_cfg.enabled=true), not both. A config "
+                "that used to set policy.dtensor_cfg.enabled=false must now set "
+                "policy.automodel_cfg.enabled=false: dtensor_cfg has been renamed "
+                "and no longer disables anything."
             )
         if nvfp4_pertoken_rollout.get("enabled", False) and not megatron_enabled:
             raise ValueError(

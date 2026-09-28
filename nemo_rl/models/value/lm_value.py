@@ -79,7 +79,10 @@ class Value(ValueInterface):
         if megatron_enabled and automodel_enabled:
             raise ValueError(
                 "Configure either Megatron (value.megatron_cfg.enabled=true) or "
-                "DTensor (value.automodel_cfg.enabled=true), not both."
+                "Automodel (value.automodel_cfg.enabled=true), not both. A config "
+                "that used to set value.dtensor_cfg.enabled=false must now set "
+                "value.automodel_cfg.enabled=false: dtensor_cfg has been renamed "
+                "and no longer disables anything."
             )
 
         if megatron_enabled:
