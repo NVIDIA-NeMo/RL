@@ -174,3 +174,21 @@ def test_build_video_config_overrides_patch_budget_without_mutating_image_config
     assert video_config.temporal_patch_size == 2
     assert video_config.frame_manifest_magic == b"manifest"
     assert video_config.video_maintain_aspect_ratio is False
+
+
+def test_pinned_megatron_core_has_the_token_capture_hooks() -> None:
+    """Megatron token capture needs the engine hooks from NVIDIA/Megatron-LM#7015.
+
+    ``MegatronGenerationMixin.setup_token_capture`` installs a
+    ``RequestPromptPreparer`` and a ``RequestPayloadStager`` on the live
+    ``DynamicInferenceEngine``. This file is mcore-marked with no importorskip,
+    so a Megatron-Bridge / Megatron-LM bump that drops the hooks fails here
+    rather than skipping.
+    """
+    from megatron.core.inference import inference_request
+    from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
+
+    assert hasattr(inference_request, "RequestPayloadStager")
+    assert hasattr(inference_request, "RequestPromptPreparer")
+    assert hasattr(DynamicInferenceEngine, "payload_stager")
+    assert hasattr(DynamicInferenceEngine, "prompt_preparer")
