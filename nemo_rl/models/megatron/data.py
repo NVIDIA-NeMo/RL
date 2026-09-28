@@ -38,6 +38,7 @@ from nemo_rl.models.megatron.alignment import (
     get_parallel_token_alignment,
 )
 from nemo_rl.models.megatron.common import _round_up_to_multiple
+from nemo_rl.models.megatron.prefix_tree import share_packed_prefixes
 from nemo_rl.models.megatron.hybridep import (
     get_packed_seq_padding_mask,
     pad_packed_seq_for_hybridep,
@@ -168,6 +169,7 @@ def make_processed_microbatch_iterator(
             create_packed_seq_padding_mask=create_packed_seq_padding_mask,
             prepad_packed_seq_for_hybridep=prepad_packed_seq_for_hybridep,
             mtp_enabled=mtp_enabled,
+            share_prefixes=cfg["sequence_packing"].get("share_prefixes", False),
         )
 
         yield ProcessedMicrobatch(
@@ -521,6 +523,7 @@ def process_microbatch(
     create_packed_seq_padding_mask: bool = False,
     prepad_packed_seq_for_hybridep: bool = False,
     mtp_enabled: bool = False,
+    share_prefixes: bool = False,
 ) -> ProcessedInputs:
     """Process a microbatch for Megatron model forward pass."""
     prepacked = "cu_seqlens" in data_dict
@@ -948,6 +951,29 @@ def process_microbatch(
                     )
                 else:
                     position_ids = None
+                if share_prefixes:
+                    if (
+                        get_context_parallel_world_size() > 1
+                        or pad_full_seq_to is not None
+                        or padding_mask is not None
+                    ):
+                        raise NotImplementedError(
+                            "sequence_packing.share_prefixes requires CP=1, PP=1, "
+                            "and no HybridEP padding mask"
+                        )
+                    packed_seq_params, routed_experts_cp_sharded = (
+                        share_packed_prefixes(
+                            input_ids_cp_sharded,
+                            packed_seq_params,
+                            cu_seqlens,
+                            cu_seqlens_padded,
+                            routed_experts_cp_sharded,
+                            lcm(
+                                pad_individual_seqs_to_multiple_of,
+                                pad_packed_seq_to_multiple_of,
+                            ),
+                        )
+                    )
         else:
             if routed_experts is not None:
                 if "input_lengths" not in data_dict:
