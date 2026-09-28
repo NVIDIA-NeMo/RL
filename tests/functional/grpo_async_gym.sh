@@ -14,6 +14,7 @@ JSON_METRICS=$EXP_DIR/metrics.json
 RUN_LOG=$EXP_DIR/run.log
 CHECKPOINT_DIR=$EXP_DIR/checkpoints
 DATA_DIR=$EXP_DIR/data
+CONFIG_PATH=${NEMO_GYM_GRPO_CONFIG:-$PROJECT_ROOT/examples/nemo_gym/grpo_qwen3_30ba3b_instruct.yaml}
 export PYTHONPATH=${PROJECT_ROOT}:${PYTHONPATH:-}
 
 rm -rf $EXP_DIR $LOG_DIR
@@ -54,7 +55,7 @@ jq -c '.responses_create_params.tools |= (.[0:1])' 3rdparty/Gym-workspace/Gym/da
 
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
     $PROJECT_ROOT/examples/nemo_gym/run_grpo_nemo_gym.py \
-    --config $PROJECT_ROOT/examples/nemo_gym/grpo_qwen3_30ba3b_instruct.yaml \
+    --config $CONFIG_PATH \
     policy.model_name=Qwen/Qwen3-0.6B \
     policy.dtensor_cfg.enabled=false \
     policy.megatron_cfg.enabled=true \

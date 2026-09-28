@@ -24,7 +24,7 @@ import shutil
 from dataclasses import asdict, dataclass
 from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Literal, Mapping, Optional, get_args
 
 from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
 
@@ -34,6 +34,25 @@ BOOTSTRAP_DIRNAME = "bootstrap"
 BOOTSTRAP_MANIFEST_FILENAME = "manifest.json"
 ROLLOUT_SNAPSHOTS_DIRNAME = "rollout_snapshots"
 ROLLOUT_SNAPSHOT_MANIFEST_FILENAME = "manifest.json"
+
+RolloutCheckpointAttemptOutcome = Literal["completed", "failed", "skipped"]
+ROLLOUT_CHECKPOINT_ATTEMPT_OUTCOMES: tuple[RolloutCheckpointAttemptOutcome, ...] = (
+    get_args(RolloutCheckpointAttemptOutcome)
+)
+
+RolloutCheckpointAttemptReason = Literal[
+    "completed",
+    "invariant_error",
+    "io_error",
+    "missing_trainer_anchor",
+    "no_data_plane_mutations",
+    "optimizer_commit_in_progress",
+    "timeout",
+    "trainer_state_changed",
+]
+ROLLOUT_CHECKPOINT_ATTEMPT_REASONS: tuple[RolloutCheckpointAttemptReason, ...] = (
+    get_args(RolloutCheckpointAttemptReason)
+)
 
 _SNAPSHOT_RE = re.compile(r"snapshot_(\d+)")
 _TMP_SNAPSHOT_RE = re.compile(r"tmp_snapshot_(\d+)")
