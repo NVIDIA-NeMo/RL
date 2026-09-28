@@ -147,6 +147,12 @@ ARG NVTE_BUILD_MAX_JOBS=8
 ARG NVTE_BUILD_THREADS_PER_JOB=2
 ARG NVTE_CUDA_ARCHS=90;100
 ARG NVTE_FRAMEWORK=pytorch
+# TE 2.18 enables its experimental NCCL-EP backend by default on Hopper and
+# newer GPUs. Current recipes use Megatron Core's standard token dispatcher,
+# so retain the existing capability set and avoid requiring matching system
+# NCCL-EP headers. Custom NCCL-EP experiments can opt in explicitly with
+# ``--build-arg NVTE_WITH_NCCL_EP=1``.
+ARG NVTE_WITH_NCCL_EP=0
 # Only use for custom vllm installs. Learn more at https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/use-custom-vllm.md
 ARG BUILD_CUSTOM_VLLM
 ARG BUILD_CUSTOM_VLLM_URL
@@ -374,6 +380,12 @@ set +e
 # and churning it here would copy files up into this layer.
 # The throwaway venv must be symlink-mode: hardlinks to files in the dependency layer's uv
 # cache make overlayfs copy them up into this layer, and the copies outlive the rm -rf below.
+# TRTLLM_WHEEL_CACHE_MIRROR_DIR keeps a copy of the wheel in this image layer.
+# CI creates a fresh buildx builder for every job, so the cache mount above only
+# lives for the duration of one build: when a later build reuses this layer from
+# the registry cache and re-executes the release stage (any NeMo-RL source
+# change does that), the mount is empty there. The release stage reads the
+# wheel from this mirror instead of failing on TRTLLM_REQUIRE_CACHED_WHEEL.
 UV_CACHE_DIR=/root/.cache/uv \
     TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-wheels \
     TRTLLM_WHEEL_CACHE_MIRROR_DIR=/opt/trtllm_wheels \

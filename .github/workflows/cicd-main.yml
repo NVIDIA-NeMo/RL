@@ -1210,7 +1210,9 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           verbose: true
           flags: ${{ matrix.flag }}
-          base_sha: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha }}
+          # Copied PR branches run on push, so upload-coverage needs explicit PR metadata.
+          override_pr: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || '' }}
+          commit_parent: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha || '' }}
 
       - name: Upload artifacts
         if: ${{ steps.check-artifacts.outputs.artifacts-found == 'true' }}
