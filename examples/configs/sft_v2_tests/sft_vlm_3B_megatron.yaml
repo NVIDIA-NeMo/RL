@@ -1,0 +1,31 @@
+  defaults:
+    - ../sft_vlm_3B.yaml
+
+  sft:
+    max_num_epochs: 1
+    max_num_steps: 1000
+    val_period: 20
+    val_batches: 8
+    val_global_batch_size: 32
+    val_micro_batch_size: 1
+    val_at_start: true
+    val_at_end: false
+    seed: 42
+    only_unmask_final: false
+
+  policy:
+    dtensor_cfg:
+      enabled: false
+
+    megatron_cfg:
+      enabled: true
+      apply_rope_fusion: false
+      tensor_model_parallel_size: 1
+      distributed_data_parallel_config:
+        overlap_grad_reduce: false
+
+    make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+    optimizer: null
+
+  logger:
+    wandb_enabled: true

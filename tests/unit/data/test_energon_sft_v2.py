@@ -116,6 +116,78 @@ def test_v2_fingerprint_identifies_each_logical_shard() -> None:
     )
 
 
+def test_v2_loader_applies_cache_pool_and_gc_controls() -> None:
+    adapter = MagicMock(fingerprint="processor")
+    task_encoder = MagicMock()
+    task_encoder.cookers = [MagicMock(need_cache=True)]
+    dataset = object()
+    cache_pool = object()
+    raw_loader = MagicMock()
+
+    with (
+        patch(
+            "nemo_rl.data.energon.sft_dataloader.build_processor_adapter",
+            return_value=adapter,
+        ),
+        patch(
+            "nemo_rl.data.energon.sft_dataloader._task_encoder",
+            return_value=task_encoder,
+        ),
+        patch(
+            "nemo_rl.data.energon.sft_dataloader.get_train_dataset",
+            return_value=dataset,
+        ) as get_train_dataset,
+        patch(
+            "nemo_rl.data.energon.sft_dataloader.FileStoreCachePool",
+            return_value=cache_pool,
+        ) as cache_pool_type,
+        patch(
+            "nemo_rl.data.energon.sft_dataloader.get_savable_loader",
+            return_value=raw_loader,
+        ) as get_savable_loader,
+    ):
+        build_energon_sft_loader(
+            data_config={
+                "shuffle": True,
+                "energon": {
+                    "model_family": "qwen",
+                    "cache_pool_max_gbytes": 8,
+                    "cache_pool_num_workers": 3,
+                    "gc_collect_every_n_steps": 1234,
+                    "task_encoder": {
+                        "packing": {
+                            "name": "balanced_greedy_knapsack",
+                            "buffer_size": 5000,
+                            "options": {
+                                "max_sequence_length": 128,
+                                "sequence_length_pad_multiple": 8,
+                                "balanced_knapsack_delta": 5,
+                            },
+                        }
+                    },
+                },
+            },
+            source=EnergonSourceConfig(
+                path="/dataset", split="train", virtual_epoch_length=8
+            ),
+            processor=MagicMock(tokenizer=MagicMock()),
+            batch_size=2,
+            max_sequence_length=128,
+            split_role="train",
+            logical_rank=0,
+            logical_world_size=1,
+            placement_fingerprint="placement",
+            only_unmask_final=False,
+        )
+
+    cache_pool_type.assert_called_once_with(
+        method="raw", num_workers=3, max_cache_size_gbytes=8.0
+    )
+    assert get_train_dataset.call_args.kwargs["packing_buffer_size"] == 5000
+    assert get_savable_loader.call_args.kwargs["cache_pool"] is cache_pool
+    assert get_savable_loader.call_args.kwargs["gc_collect_every_n_steps"] == 1234
+
+
 def test_sft_v2_worker_uses_megatron_worker_environment() -> None:
     assert get_actor_python_env(
         "nemo_rl.data.energon.sft_worker.SFTMegatronPolicyWorker"

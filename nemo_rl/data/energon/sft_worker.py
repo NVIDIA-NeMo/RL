@@ -67,9 +67,6 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         batch_size: int,
         max_sequence_length: int,
         placement_fingerprint: str,
-        packing_algorithm: str | None,
-        max_sequences_per_bin: int | None,
-        sequence_length_pad_multiple: int,
         only_unmask_final: bool,
         restored_state: Optional[dict[str, Any]] = None,
     ) -> bool:
@@ -89,6 +86,28 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
             self._sft_processor = get_tokenizer(tokenizer_config, get_processor=True)
 
+        def _field(obj: Any, key: str) -> Any:
+            if obj is None:
+                return None
+            if isinstance(obj, Mapping):
+                return obj.get(key)
+            return getattr(obj, key, None)
+
+        packing = _field(
+            _field(_field(data_config, "energon"), "task_encoder"), "packing"
+        )
+        if packing is not None:
+            cp_size = parallel_state.get_context_parallel_world_size()
+            pad_multiple = _field(
+                _field(packing, "options"), "sequence_length_pad_multiple"
+            )
+            if cp_size > 1 and pad_multiple % (2 * cp_size):
+                raise ValueError(
+                    "Energon packing sequence_length_pad_multiple "
+                    f"({pad_multiple}) must be divisible by 2 * "
+                    f"context_parallel_size ({2 * cp_size})."
+                )
+
         logical_rank = parallel_state.get_data_parallel_rank()
         logical_world_size = parallel_state.get_data_parallel_world_size()
         self._sft_loader = build_energon_sft_loader(
@@ -101,9 +120,6 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             logical_rank=logical_rank,
             logical_world_size=logical_world_size,
             placement_fingerprint=placement_fingerprint,
-            packing_algorithm=packing_algorithm,
-            max_sequences_per_bin=max_sequences_per_bin,
-            sequence_length_pad_multiple=sequence_length_pad_multiple,
             only_unmask_final=only_unmask_final,
         )
         if restored_state is not None:

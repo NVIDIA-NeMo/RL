@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 from collections.abc import Sequence
 from copy import deepcopy
 from typing import Any, Protocol, cast
@@ -302,11 +303,13 @@ class GenericSFTTaskEncoder(BaseSFTTaskEncoder):
     ) -> list[list[EncodedSFTSample]]:
         if self.packer is None:
             raise RuntimeError("Energon packing is not configured.")
-        return select_samples_to_pack(
+        packs = select_samples_to_pack(
             samples,
             packer=self.packer,
             sequence_length_pad_multiple=self.sequence_length_pad_multiple,
         )
+        random.shuffle(packs)
+        return packs
 
     @stateless
     def pack_selected_samples(self, samples: list[EncodedSFTSample]) -> PackedSFTSample:
