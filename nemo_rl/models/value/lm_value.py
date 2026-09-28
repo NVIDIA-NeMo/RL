@@ -98,7 +98,7 @@ class Value(ValueInterface):
         else:
             if not automodel_enabled:
                 raise ValueError(
-                    "Please set value.automodel_cfg.enabled=true to use DTensor "
+                    "Please set value.automodel_cfg.enabled=true to use the Automodel "
                     "training backend (or value.megatron_cfg.enabled=true for "
                     "Megatron-Core)."
                 )

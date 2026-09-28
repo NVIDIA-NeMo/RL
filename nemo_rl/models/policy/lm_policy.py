@@ -264,7 +264,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             if not automodel_enabled:
                 raise ValueError(
                     "Please either set policy.megatron_cfg.enabled=true to use Megatron training backend "
-                    "or set policy.automodel_cfg.enabled=true to use DTensor training backend."
+                    "or set policy.automodel_cfg.enabled=true to use the Automodel training backend."
                 )
 
             worker_builder_cls_fqn = resolve_policy_worker_cls(

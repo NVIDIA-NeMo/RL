@@ -18,7 +18,7 @@ LoRA is implemented on two training backends, each with its own config schema:
 
 | Backend | Config path | Notes |
 | --- | --- | --- |
-| **DTensor (Automodel)** | `policy.automodel_cfg.lora_cfg` | This is the default backend. |
+| **Automodel** | `policy.automodel_cfg.lora_cfg` | This is the default backend. |
 | **Megatron Core** | `policy.megatron_cfg.peft` | Requires `policy.megatron_cfg.enabled=true` (and `policy.automodel_cfg.enabled=false`). |
 
 LoRA is supported across the SFT, GRPO, and DPO algorithms on both backends.
@@ -138,7 +138,7 @@ policy:
 `restore_from` initializes this run's adapters from a donor PEFT checkpoint, e.g. to carry an
 SFT LoRA into GRPO. The accepted path format differs by backend:
 
-- **DTensor (Automodel)**: `policy.automodel_cfg.lora_cfg.restore_from` — a directory containing
+- **Automodel**: `policy.automodel_cfg.lora_cfg.restore_from` — a directory containing
   `adapter_model.safetensors` + `adapter_config.json` (a previous run's `step_*/policy/weights`
   or its `model/` subdirectory).
 - **Megatron Core**: `policy.megatron_cfg.peft.restore_from` — a native Megatron `iter_XXXXXXX`

@@ -47,7 +47,7 @@ class RewardModelEnvironmentConfig(TypedDict):
         logprob_batch_size: Batch size for log probability computation
         resources: Resource allocation configuration
         reward_model_cfg: Reward model specific configuration
-        automodel_cfg: DTensor configuration for distributed training
+        automodel_cfg: Automodel configuration for distributed training
         dynamic_batching: Dynamic batching configuration
         sequence_packing: Sequence packing configuration
         max_grad_norm: Maximum gradient norm for training
