@@ -65,6 +65,7 @@ from nemo_rl.models.generation.vllm.config import (
 )
 from nemo_rl.models.policy import MegatronConfig, PolicyConfig
 from nemo_rl.models.value import ValueConfig
+from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 
 # ── User-facing SingleController configs ────────────────────────────────────
@@ -641,6 +642,9 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # derived at setup
     # under the run's log dir.
     capture_dir: Optional[str] = None
+    # Generation backend hosting token capture. This is derived from
+    # policy.generation.backend during setup; users should not set it separately.
+    generation_backend: Optional[Literal["vllm", "megatron"]] = None
     # Keep routed_experts out of canonical rows and assemble them on policy
     # workers from strict staged-fragment plans.
     defer_routed_experts_to_policy: bool = False
@@ -828,6 +832,7 @@ class MasterConfig(BaseModel, extra="allow"):
         default_factory=RolloutCheckpointConfig
     )
     on_policy_distillation: Optional[OnPolicyDistillationConfig] = None
+    telemetry: Optional[TelemetryConfig] = None
     token_capture: TokenCaptureConfig = Field(default_factory=TokenCaptureConfig)
 
     @model_validator(mode="after")
@@ -1262,6 +1267,12 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
 
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
+    if master_config.loss_fn.seq_logprob_error_in_loss:
+        raise ValueError(
+            "loss_fn.seq_logprob_error_in_loss is not supported by SingleController: "
+            "its advantage baselines depend on the pre-training sequence mask. "
+            "Use the non-streaming GRPO trainer."
+        )
     _validate_algo_settings(master_config)
 
     async_config = master_config.async_rl

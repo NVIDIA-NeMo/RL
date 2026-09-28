@@ -24,6 +24,7 @@ from collections.abc import Mapping
 from typing import Any, Optional
 
 import torch
+import torch.distributed.checkpoint as dcp
 from nemo_automodel.components._peft.lora import PeftConfig
 from nemo_automodel.components.checkpoint import (
     CheckpointingConfig as AutomodelCheckpointingConfig,
@@ -31,7 +32,9 @@ from nemo_automodel.components.checkpoint import (
 from nemo_automodel.components.checkpoint.checkpointing import (
     Checkpointer,
 )
+from nemo_automodel.components.checkpoint.stateful_wrappers import OptimizerState
 from torch import nn
+from torch.distributed.checkpoint._nested_dict import flatten_state_dict
 from torch.distributed.device_mesh import DeviceMesh
 from transformers import AutoTokenizer
 
@@ -410,6 +413,34 @@ class AutomodelCheckpointManager:
         )
 
         if optimizer_path and optimizer is not None:
+            if getattr(optimizer, "master_weights", False):
+                # Check the on-disk dtype before DCP copies into current buffers:
+                # legacy FP32 masters must not be cast into BF16 int16 remainders.
+                metadata = dcp.FileSystemReader(
+                    os.path.join(optimizer_path, "optim")
+                ).read_metadata()
+                optimizer_state = OptimizerState(
+                    model,
+                    optimizer,
+                    is_peft=self.checkpointer.config.is_peft,
+                    has_expert_parallelism=self.moe_mesh is not None,
+                )
+                expected_state, _ = flatten_state_dict(optimizer_state.state_dict())
+                for key, value in expected_state.items():
+                    if not key.endswith(".master_param"):
+                        continue
+                    saved = metadata.state_dict_metadata.get(key)
+                    if saved is not None and saved.properties.dtype != value.dtype:
+                        raise ValueError(
+                            f"Cannot resume optimizer master weights: {key} has "
+                            f"checkpoint dtype {saved.properties.dtype}, but the "
+                            f"current optimizer expects {value.dtype}. "
+                            "Check policy.precision and policy.optimizer.kwargs "
+                            "(especially store_param_remainders and master_weight_dtype) "
+                            "against the configuration and code used to save the checkpoint, "
+                            "or start a fresh run without restoring optimizer state."
+                        )
+                del expected_state, optimizer_state
             self.checkpointer.load_optimizer(
                 optimizer=optimizer,
                 model=model,

@@ -572,6 +572,7 @@ class LossPostProcessor:
         sampling_params: Optional[TrainingSamplingParams] = None,
         draft_model: Optional[MegatronModule] = None,
         prepare_fn: Optional[Callable[..., Any]] = None,
+        defer_draft_normalization: bool = False,
         teacher_output_layer_weight_by_index: Optional[dict[int, torch.Tensor]] = None,
     ):
         """Build a per-microbatch loss post-processor for the Megatron train loop.
@@ -589,6 +590,8 @@ class LossPostProcessor:
                 vocab_parallel_group, context_parallel_group)`` and return
                 ``(loss_input, data)``; value models pass one that right-shifts
                 and CP-all-gathers the scalar value-head output.
+            defer_draft_normalization: Return raw draft loss statistics for split
+                optimizer-step finalization instead of normalizing per microbatch.
             teacher_output_layer_weight_by_index: This rank's teacher LM-head
                 shards for every configured teacher, keyed by the stable
                 per-checkpoint index rows are tagged with (see
@@ -604,6 +607,7 @@ class LossPostProcessor:
         self.cp_normalize = cp_normalize
         self.sampling_params = sampling_params
         self.prepare_fn = prepare_fn
+        self.defer_draft_normalization = defer_draft_normalization
         self.teacher_output_layer_weight_by_index = teacher_output_layer_weight_by_index
         if draft_model is not None and draft_model.eagle_module is not None:
             self.d2t = getattr(draft_model.eagle_module, "d2t", None)
@@ -703,6 +707,7 @@ class LossPostProcessor:
                             DEFAULT_DRAFT_TOKEN_CHUNK_SIZE,
                         )
                     ),
+                    defer_normalization=self.defer_draft_normalization,
                 )
         else:
             loss_fn_wrapped = partial(
@@ -729,6 +734,7 @@ class LossPostProcessor:
                             DEFAULT_DRAFT_TOKEN_CHUNK_SIZE,
                         )
                     ),
+                    defer_normalization=self.defer_draft_normalization,
                 )
 
         loss_fn_wrapped = partial(
