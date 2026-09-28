@@ -35,13 +35,9 @@ def test_builtin_registries_resolve_lazily_with_stable_versions():
         "version": "1",
     }
     assert selected_registry_identity(
-        task_encoder=SimpleNamespace(
-            name="generic_sft", python_file=None, object=None
-        ),
+        task_encoder=SimpleNamespace(name="generic_sft", python_file=None, object=None),
         cookers=[
-            SimpleNamespace(
-                name="generic_conversation", python_file=None, object=None
-            )
+            SimpleNamespace(name="generic_conversation", python_file=None, object=None)
         ],
     ) == {
         "task_encoder": {"key": "generic_sft", "version": "1"},
