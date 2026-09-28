@@ -141,6 +141,17 @@ def _validate_checkpoint_runtime(manager: Any) -> None:
         )
 
 
+def _has_no_named_dims(tensor: torch.Tensor) -> bool:
+    """True when the tensor carries no named dimensions.
+
+    torch < 2.13 exposes the named-tensor API and reports ``(None, None)`` for
+    an unnamed 2-D tensor; torch 2.13 removed named tensors along with the
+    ``names`` attribute, so every tensor is unnamed there.
+    """
+    names = getattr(tensor, "names", None)
+    return names is None or all(name is None for name in names)
+
+
 def _physical_keys(controller_state: Mapping[str, Any]) -> list[str]:
     """Return every produced Mooncake key referenced by a TQ controller cut."""
     partitions = controller_state.get("partitions")
@@ -168,7 +179,7 @@ def _physical_keys(controller_state: Mapping[str, Any]) -> list[str]:
             and produced.dtype == torch.int8
             and produced.ndim == 2
             and produced.layout == torch.strided
-            and produced.names == (None, None)
+            and _has_no_named_dims(produced)
             and type(indexes) in (set, list, tuple)
             and type(fields) is dict
         ):

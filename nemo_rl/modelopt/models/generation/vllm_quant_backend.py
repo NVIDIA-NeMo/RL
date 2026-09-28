@@ -23,6 +23,9 @@ import vllm  # noqa: F401
 import zmq
 from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
 
+from nemo_rl.modelopt.models.generation.vllm_quant_moe_amax import (
+    route_moe_input_quantizer_amax,
+)
 from nemo_rl.modelopt.utils import (
     MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS,
     matches_quant_ignore_pattern,
@@ -687,6 +690,19 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                         self._get_modelopt_reload_roots(),
                         source_storage_ptrs,
                     )
+
+        # vLLM 0.28 routes every ``experts.*`` name through
+        # ``RoutedExperts.load_weights``, which resolves the rewritten name with a
+        # single ``getattr`` and therefore cannot reach the dotted quantizer
+        # buffers (``w13_input_quantizer._amax``). Fan the per-expert amax values
+        # into the fused quantizers here and keep them away from vLLM's loader.
+        # Checkpoint names (e.g. Nemotron-H's ``backbone.*``) only turn into the
+        # module's vLLM ``layer_name`` through the model's hf_to_vllm_mapper.
+        weights = route_moe_input_quantizer_amax(
+            self.model_runner.model,
+            weights,
+            mapper=getattr(self.model_runner.model, "hf_to_vllm_mapper", None),
+        )
 
         # MBridge exports K/V amax with the HF-semantic attention path, such as
         # ``self_attn.k_bmm_quantizer._amax``. ModelOpt installs these quantizers
