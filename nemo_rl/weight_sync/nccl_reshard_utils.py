@@ -638,13 +638,13 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
     # Only Megatron training currently provides the local Bridge source views;
     # DTensor training is not supported by this transport yet.
     megatron_enabled = megatron_cfg.get("enabled", False)
-    dtensor_enabled = automodel_cfg.get("enabled", False)
+    automodel_enabled = automodel_cfg.get("enabled", False)
     if not megatron_enabled:
         violations.append(
             "policy.megatron_cfg.enabled must be True "
             "(this initial version supports the Megatron train backend only)."
         )
-    if dtensor_enabled:
+    if automodel_enabled:
         violations.append(
             "policy.automodel_cfg.enabled must be False "
             "(this initial version supports the Megatron train backend only)."

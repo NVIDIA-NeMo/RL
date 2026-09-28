@@ -379,7 +379,7 @@ def test_validate_fp32_lm_head_rejects_fused_logprobs_without_generation():
 
     with pytest.raises(ValueError, match="use_fused_linear_logprobs"):
         validate_fp32_lm_head_config(
-            config, megatron_enabled=True, dtensor_enabled=False
+            config, megatron_enabled=True, automodel_enabled=False
         )
 
 

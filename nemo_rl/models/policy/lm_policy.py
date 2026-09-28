@@ -149,7 +149,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         cp_size = 1
 
         megatron_enable = bool(config.get("megatron_cfg", {}).get("enabled", False))
-        dtensor_enable = bool(config.get("automodel_cfg", {}).get("enabled", False))
+        automodel_enabled = bool(config.get("automodel_cfg", {}).get("enabled", False))
         # Normalize in place: every downstream reader (workers, setup, train)
         # accesses draft config by attribute, so a hand-built PolicyConfig has
         # to be validated here rather than only inside MasterConfig.
@@ -159,7 +159,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         draft_enabled = bool(draft_config is not None and draft_config.enabled)
         generation_config = config.get("generation") or {}
         nvfp4_pertoken_rollout = generation_config.get("nvfp4_pertoken_rollout") or {}
-        if megatron_enable and dtensor_enable:
+        if megatron_enable and automodel_enabled:
             raise ValueError(
                 "Configure either Megatron (policy.megatron_cfg.enabled=true) or "
                 "DTensor (policy.automodel_cfg.enabled=true), not both."
@@ -171,7 +171,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "does not implement TE NVFP4 training."
             )
         validate_fp32_lm_head_config(
-            config, megatron_enabled=megatron_enable, dtensor_enabled=dtensor_enable
+            config,
+            megatron_enabled=megatron_enable,
+            automodel_enabled=automodel_enabled,
         )
         hf_config = None
         hf_config_overrides = config.get("hf_config_overrides") or {}
@@ -186,7 +188,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 validate_fp32_lm_head_config(
                     config,
                     megatron_enabled=megatron_enable,
-                    dtensor_enabled=dtensor_enable,
+                    automodel_enabled=automodel_enabled,
                     model_config=hf_config,
                 )
         if reserved_http_server_ports is not None and not megatron_enable:
@@ -256,7 +258,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 )
 
         else:
-            if not dtensor_enable:
+            if not automodel_enabled:
                 raise ValueError(
                     "Please either set policy.megatron_cfg.enabled=true to use Megatron training backend "
                     "or set policy.automodel_cfg.enabled=true to use DTensor training backend."
@@ -358,7 +360,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         if reserved_http_server_ports is not None:
             worker_kwargs["reserved_http_server_ports"] = reserved_http_server_ports
 
-        if dtensor_enable:
+        if automodel_enabled:
             # DTensor workers reconstruct tokenizer/processor locally to avoid
             # pickling across incompatible transformers versions (v4 head → v5 worker).
             config["tokenizer"]["use_processor"] = processor is not None

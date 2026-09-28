@@ -75,8 +75,8 @@ class Value(ValueInterface):
 
         # Value models use the same backend configuration as policy models
         megatron_enable = bool(config.get("megatron_cfg", {}).get("enabled", False))
-        dtensor_enable = bool(config.get("automodel_cfg", {}).get("enabled", False))
-        if megatron_enable and dtensor_enable:
+        automodel_enabled = bool(config.get("automodel_cfg", {}).get("enabled", False))
+        if megatron_enable and automodel_enabled:
             raise ValueError(
                 "Configure either Megatron (value.megatron_cfg.enabled=true) or "
                 "DTensor (value.automodel_cfg.enabled=true), not both."
@@ -93,7 +93,7 @@ class Value(ValueInterface):
 
             env_vars = config["megatron_cfg"].get("env_vars", {})
         else:
-            if not dtensor_enable:
+            if not automodel_enabled:
                 raise ValueError(
                     "Please set value.automodel_cfg.enabled=true to use DTensor "
                     "training backend (or value.megatron_cfg.enabled=true for "
