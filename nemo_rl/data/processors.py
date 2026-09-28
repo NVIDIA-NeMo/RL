@@ -23,6 +23,7 @@ import numpy as np
 import torch
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 
+from nemo_rl.data.chat_utils import normalize_message_loss_mask
 from nemo_rl.data.interfaces import (
     DatumSpec,
     LLMMessageLogType,
@@ -993,9 +994,9 @@ def kd_data_processor(
     as a single assistant message in ``message_log``.
     """
     output: DatumSpec = {
-        # Defensive shallow-per-message copy so downstream mutation (e.g.
-        # adding token_ids) doesn't leak back into the dataset row.
-        "message_log": [dict(m) for m in datum_dict["messages"]],
+        # Tool call arguments can contain nested dictionaries and lists. Isolate
+        # the complete message payload from downstream preparation and rendering.
+        "message_log": deepcopy(datum_dict["messages"]),
         "loss_multiplier": 1.0,
         "idx": idx,
         # fake keys (not used for cross-tokenizer distillation)
@@ -1004,7 +1005,52 @@ def kd_data_processor(
     }
     if "task_name" in datum_dict:
         output["task_name"] = datum_dict["task_name"]
+    if datum_dict.get("message_loss_mask") is not None:
+        output["message_loss_mask"] = normalize_message_loss_mask(
+            datum_dict["messages"], datum_dict["message_loss_mask"]
+        )
+    tools = datum_dict.get("tools")
+    if tools is not None:
+        if not isinstance(tools, list) or any(
+            not isinstance(tool, dict) for tool in tools
+        ):
+            raise TypeError(
+                "kd_data_processor expected 'tools' to be a list of objects or None"
+            )
+        output["tools"] = deepcopy(tools)
     return output
+
+
+def chat_kd_processor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer: TokenizerType,
+    max_seq_length: int | None,
+    idx: int,
+) -> DatumSpec:
+    """Preserve raw chat history and metadata for cross-tokenizer distillation.
+
+    Accepts either ``messages`` or ``conversation``. Historical messages remain
+    in the context even when their ``message_loss_mask`` entry is zero. The
+    collator owns tokenization, length checks, and native template rendering.
+    """
+    if "messages" in datum_dict:
+        messages = datum_dict["messages"]
+    elif "conversation" in datum_dict:
+        messages = datum_dict["conversation"]
+    else:
+        raise KeyError("chat_kd_processor requires 'messages' or 'conversation'")
+    if not isinstance(messages, list) or any(
+        not isinstance(message, dict) for message in messages
+    ):
+        raise TypeError("chat_kd_processor expected a list of message objects")
+    return kd_data_processor(
+        {**datum_dict, "messages": messages},
+        task_data_spec,
+        tokenizer,
+        max_seq_length,
+        idx,
+    )
 
 
 # Processor registry. Key is the processor name, value is the processor function.
@@ -1019,6 +1065,7 @@ PROCESSOR_REGISTRY: Dict[str, TaskDataProcessFnCallable] = cast(
         "default": math_hf_data_processor,
         "helpsteer3_data_processor": helpsteer3_data_processor,
         "kd_data_processor": kd_data_processor,
+        "chat_kd_processor": chat_kd_processor,
         "math_data_processor": math_data_processor,
         "math_hf_data_processor": math_hf_data_processor,
         "multichoice_qa_processor": multichoice_qa_processor,

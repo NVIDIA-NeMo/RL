@@ -113,7 +113,27 @@ def test_chat_loss_supervises_eot_predictor_only(
     tokenizer = _tokenizer()
     # The full chat has assistant targets at 4/5 and 10/11 (answer/EOT).
     # Truncation at 5 retains the first answer but removes its EOT.
-    batch = _batch(tokenizer, ctx_length=5 if truncated else 32)
+    if truncated:
+        # Production rejects overflow. Exercise the reusable lower-level
+        # truncation helper separately to keep its loss-boundary regression.
+        with pytest.raises(ValueError, match="exceeds context length"):
+            _batch(tokenizer, ctx_length=5)
+        ids, offsets, mask, _, _ = CrossTokenizerCollator._render_and_tokenize_chat(
+            tokenizer, _MESSAGES, 5
+        )
+        input_ids, attention, _, token_mask = CrossTokenizerCollator._pad_chat_batch(
+            [ids], [offsets], [mask], tokenizer.pad_token_id, 16
+        )
+        batch = BatchedDataDict(
+            {
+                "input_ids": input_ids,
+                "input_lengths": attention.sum(-1),
+                "token_mask": token_mask,
+                "sample_mask": torch.ones(1),
+            }
+        )
+    else:
+        batch = _batch(tokenizer)
     expected_targets = [4] if truncated else [4, 5, 10, 11]
     assert batch["token_mask"].nonzero(as_tuple=True)[1].tolist() == expected_targets
     logits = torch.zeros(

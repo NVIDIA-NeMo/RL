@@ -129,27 +129,25 @@ def test_masks_include_each_assistant_eot_only(
 @pytest.mark.parametrize("length,expected_count", [(4, 0), (5, 1), (6, 2)])
 def test_same_tokenizer_mask_respects_truncation(length: int, expected_count: int):
     tokenizer = _tokenizer(suffix=" \n<eot>\n", pad_is_eot=True)
-    batch = _collator(tokenizer, None, student_length=length)([_datum()])
-    assert batch["input_lengths"].item() == length
-    assert batch["token_mask"].sum().item() == expected_count
-    assert batch["token_mask"][0, length:].eq(0).all()
-    assert not any(key.startswith("alignment_") for key in batch)
+    ids, _, mask, _, _ = CrossTokenizerCollator._render_and_tokenize_chat(
+        tokenizer, _datum()["message_log"], length
+    )
+    assert len(ids) == length
+    assert sum(mask) == expected_count
 
 
 @pytest.mark.parametrize("student_length,teacher_length", [(5, 6), (6, 5)])
-def test_one_sided_truncation_does_not_create_eot_alignment(
-    student_length: int, teacher_length: int
-):
+def test_one_sided_overflow_is_rejected(student_length: int, teacher_length: int):
     student = _tokenizer(suffix="<eot>")
     teacher = _tokenizer(suffix="\n<eot>", teacher=True)
-    batch = _collator(
-        student, teacher, student_length=student_length, teacher_length=teacher_length
-    )([_datum()])
-    assert batch["token_mask"].sum().item() == student_length - 4
-    assert batch["teacher_0_token_mask"].sum().item() == teacher_length - 4
-    assert batch["alignment_0_pair_valid"].sum().item() == 1
-    assert batch["alignment_0_student_chunk_id"][0, 5:].eq(-1).all()
-    assert batch["alignment_0_teacher_chunk_id"][0, 5:].eq(-1).all()
+    side = "student" if student_length < 6 else "teacher 0"
+    with pytest.raises(ValueError, match=side + ".*overlength"):
+        _collator(
+            student,
+            teacher,
+            student_length=student_length,
+            teacher_length=teacher_length,
+        )([_datum()])
 
 
 def test_template_without_terminators_does_not_supervise_next_role_header():

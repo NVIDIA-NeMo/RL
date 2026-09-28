@@ -1,0 +1,12 @@
+{
+  "qwen3_4b_stock.jinja": {
+    "model": "Qwen/Qwen3-4B",
+    "revision": "1cfa9a7208912126459214e8b04321603b3df60c",
+    "source": "tokenizer_config.json:chat_template",
+    "sha256": "a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8"
+  },
+  "qwen_thinking_history_reference.jinja": {
+    "description": "Qwen-style tool chat template regression fixture retaining all assistant reasoning.",
+    "sha256": "272e93e7e28b93e4a18cb0120e115bb53df5a2c3bd232f53ab5df1ba5eed7e6f"
+  }
+}
