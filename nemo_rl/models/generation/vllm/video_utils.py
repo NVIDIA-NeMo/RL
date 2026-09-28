@@ -14,10 +14,11 @@
 
 import base64
 import json
+import math
 import os
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from urllib.parse import unquote, urlparse
 
 import numpy as np
@@ -167,20 +168,70 @@ def _resolve_cached_video_media_path(value: str) -> Path:
     return resolved
 
 
-def build_cached_video_frame_metadata(num_frames: int) -> dict[str, Any]:
-    """Return the shared synthetic timing contract for cached video frames."""
+def build_cached_video_frame_metadata(
+    num_frames: int,
+    *,
+    frame_indices: list[int | None] | None = None,
+    frame_fps: list[float | None] | None = None,
+) -> dict[str, Any]:
+    """Use JSONL frame timing, falling back only for caches without timing."""
     if num_frames < 1:
         raise ValueError("Cached Gym video requires at least one frame.")
+    resolved_frame_indices = (
+        frame_indices
+        if frame_indices is not None
+        else cast(list[int | None], [None] * num_frames)
+    )
+    resolved_frame_fps = (
+        frame_fps
+        if frame_fps is not None
+        else cast(list[float | None], [None] * num_frames)
+    )
+    if (
+        len(resolved_frame_indices) != num_frames
+        or len(resolved_frame_fps) != num_frames
+    ):
+        raise ValueError("Cached Gym video timing must match the frame count.")
 
-    # The cache contains lossless sampled frames but not source timing
-    # metadata, and original videos are not guaranteed to remain mounted.
-    # Match vLLM's built-in image-sequence contract: one synthetic second
-    # per cached frame with stable sequential indices.
+    if all(value is None for value in [*resolved_frame_indices, *resolved_frame_fps]):
+        # Legacy caches have no source timing. Preserve their 1 FPS contract.
+        indices = list(range(num_frames))
+        fps = 1.0
+    else:
+        if any(
+            isinstance(index, bool) or not isinstance(index, int) or index < 0
+            for index in resolved_frame_indices
+        ):
+            raise ValueError(
+                "Cached Gym video requires a non-negative _video_frame_index "
+                "on every frame when timing metadata is present."
+            )
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0
+            for value in resolved_frame_fps
+        ):
+            raise ValueError(
+                "Cached Gym video requires a positive finite _video_fps "
+                "on every frame when timing metadata is present."
+            )
+        indices = cast(list[int], resolved_frame_indices)
+        fps = float(cast(float, resolved_frame_fps[0]))
+        if any(value != fps for value in resolved_frame_fps):
+            raise ValueError("Cached Gym video frames must use one _video_fps value.")
+        if indices != sorted(indices):
+            raise ValueError("Cached Gym video frame indices must be nondecreasing.")
+
+    # The cache does not store the original duration/frame count. The last
+    # sampled index gives a lower bound in source-frame units (not cache size).
+    total_num_frames = max(indices) + 1
     return {
-        "fps": 1.0,
-        "duration": float(num_frames),
-        "total_num_frames": num_frames,
-        "frames_indices": list(range(num_frames)),
+        "fps": fps,
+        "duration": total_num_frames / fps,
+        "total_num_frames": total_num_frames,
+        "frames_indices": indices,
         "video_backend": "cached_png_sequence",
         "do_sample_frames": False,
     }
@@ -188,6 +239,9 @@ def build_cached_video_frame_metadata(num_frames: int) -> dict[str, Any]:
 
 def build_cached_video_frame_data_url(
     frame_paths: list[str],
+    *,
+    frame_indices: list[int | None] | None = None,
+    frame_fps: list[float | None] | None = None,
 ) -> str:
     """Build a compact native-video URL backed by lossless cached PNG frames."""
     if not frame_paths:
@@ -198,7 +252,9 @@ def build_cached_video_frame_data_url(
     ]
     manifest = {
         "frame_paths": resolved_frames,
-        "metadata": build_cached_video_frame_metadata(len(resolved_frames)),
+        "metadata": build_cached_video_frame_metadata(
+            len(resolved_frames), frame_indices=frame_indices, frame_fps=frame_fps
+        ),
     }
     payload = CACHED_VIDEO_FRAME_MANIFEST_MAGIC + json.dumps(
         manifest, separators=(",", ":")
