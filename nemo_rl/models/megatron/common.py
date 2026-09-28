@@ -351,6 +351,8 @@ def get_mtp_metrics(loss_scale: float = 1.0) -> dict[str, Any]:
         where i is 1-indexed (matching Megatron-LM).
     """
     tracker = MTPLossLoggingHelper.tracker
+    MTPLossLoggingHelper.reduce_metrics_in_tracker()
+
     loss_sums = tracker.get(_MTP_LOSS_SUMS_KEY)
     if loss_sums is not None:
         if tracker.get("reduce_group") is not None:
@@ -361,8 +363,6 @@ def get_mtp_metrics(loss_scale: float = 1.0) -> dict[str, Any]:
                 group=tracker["avg_group"],
                 op=torch.distributed.ReduceOp.SUM,
             )
-    MTPLossLoggingHelper.reduce_metrics_in_tracker()
-
     metrics: dict[str, Any] = {}
     if "loss_values" in tracker:
         loss_values = tracker["loss_values"].float()
