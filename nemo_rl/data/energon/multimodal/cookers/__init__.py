@@ -34,9 +34,7 @@ _EXPORT_MODULES = {
     "cook_granary_english_webdataset": (
         "nemo_rl.data.energon.multimodal.cookers.nemotron"
     ),
-    "cook_nemotron_conversation": (
-        "nemo_rl.data.energon.multimodal.cookers.nemotron"
-    ),
+    "cook_nemotron_conversation": ("nemo_rl.data.energon.multimodal.cookers.nemotron"),
     "cook_nano_openai_messages_jsonl": (
         "nemo_rl.data.energon.multimodal.cookers.nemotron"
     ),

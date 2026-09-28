@@ -78,9 +78,7 @@ _DEFAULT_EXTENSIONS = {
 }
 _ROLE_ALIASES = {"human": "user", "gpt": "assistant", "agent": "assistant"}
 _ROLES = frozenset({"system", "user", "assistant", "tool"})
-_CONVERSATION_MEDIA_TYPES = frozenset(
-    {"image", "video", "video_frame", "audio"}
-)
+_CONVERSATION_MEDIA_TYPES = frozenset({"image", "video", "video_frame", "audio"})
 
 warn_about_slow_media_loading: defaultdict[str, bool] = defaultdict(lambda: True)
 
@@ -250,9 +248,7 @@ def _load_media_metadata(
                         "mode": image.mode,
                     }
                 )
-        return freeze_media_metadata(
-            _metadata_values(AVDecoder(stream).get_metadata())
-        )
+        return freeze_media_metadata(_metadata_values(AVDecoder(stream).get_metadata()))
 
 
 def _source_info(store: FileStore, path: str) -> SourceInfo:
@@ -330,9 +326,7 @@ def _aux_media(
     )
     if store is None:
         if not allow_local:
-            raise ValueError(
-                f"No configured media source matches media path {path!r}."
-            )
+            raise ValueError(f"No configured media source matches media path {path!r}.")
         local_path = Path(path)
         if not local_path.is_file():
             raise ValueError(f"Cannot find media file {path!r} in configured sources.")
@@ -460,7 +454,9 @@ def _validate_explicit_assistant_loss(
                 f"conversations[{index}].loss is only valid on assistant turns."
             )
     if not has_trainable_assistant:
-        raise ValueError("Explicit assistant loss requires at least one loss=true turn.")
+        raise ValueError(
+            "Explicit assistant loss requires at least one loss=true turn."
+        )
 
 
 def _validate_loss_mask_subflavors(
@@ -487,7 +483,10 @@ def _validate_loss_mask_subflavors(
             f"loss_mask_mode={EXPLICIT_ASSISTANT_LOSS_MODE} requires "
             f"cook={EXPLICIT_ASSISTANT_LOSS_COOK}."
         )
-    if selected_explicit_loss and assistant_loss_mask_field != EXPLICIT_ASSISTANT_LOSS_FIELD:
+    if (
+        selected_explicit_loss
+        and assistant_loss_mask_field != EXPLICIT_ASSISTANT_LOSS_FIELD
+    ):
         raise ValueError(
             f"loss_mask_mode={EXPLICIT_ASSISTANT_LOSS_MODE} requires "
             f"assistant_loss_mask_field={EXPLICIT_ASSISTANT_LOSS_FIELD}."
@@ -498,7 +497,11 @@ def _validate_loss_mask_subflavors(
             f"loss_mask_mode={EXPLICIT_ASSISTANT_LOSS_MODE}."
         )
     if selected_explicit_loss != explicit_assistant_loss:
-        expected = EXPLICIT_ASSISTANT_LOSS_COOK if explicit_assistant_loss else "a standard cooker"
+        expected = (
+            EXPLICIT_ASSISTANT_LOSS_COOK
+            if explicit_assistant_loss
+            else "a standard cooker"
+        )
         raise ValueError(f"Loss-mask configuration does not match {expected}.")
 
 
@@ -509,7 +512,9 @@ def _apply_last_assistant_mask(
     if not subflavors.get("train_only_on_last_assistant_turn", False):
         return
     assistant_indexes = [
-        index for index, message in enumerate(messages) if message["role"] == "assistant"
+        index
+        for index, message in enumerate(messages)
+        if message["role"] == "assistant"
     ]
     if not assistant_indexes:
         raise ValueError(

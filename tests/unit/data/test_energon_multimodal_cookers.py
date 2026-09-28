@@ -366,9 +366,7 @@ def test_media_metadata_warns_once_per_unprepared_store(capsys):
     assert "data/second.png" not in output
 
 
-def test_missing_media_metadata_is_probed_from_seekable_file(
-    monkeypatch, tmp_path
-):
+def test_missing_media_metadata_is_probed_from_seekable_file(monkeypatch, tmp_path):
     media_path = tmp_path / "sample.mp4"
     media_path.write_bytes(b"video")
 
