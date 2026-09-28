@@ -47,6 +47,7 @@ from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.schema import (
+    PATH_OF_TAG,
     ROLLOUT_METRICS,
     ROUTE_PLAN_TAG,
     ROUTED_EXPERTS_FIELD,
@@ -1781,7 +1782,7 @@ class TQReplayBuffer:
             expected_partition_id: Partition this buffer writes to; must
                 match the envelope.
             expected_group_size: num_generations_per_prompt; every group must
-                hold exactly this many rows (a changed group size silently
+                hold exactly this many primary rows (a changed group size silently
                 breaks the group-relative baseline).
             expected_manifest_digest: Digest returned by the matching native
                 TQ checkpoint load. It must match the replay metadata file.
@@ -1858,13 +1859,15 @@ class TQReplayBuffer:
             num_lengths = (
                 len(meta.sequence_lengths) if meta.sequence_lengths is not None else -1
             )
+            primary_rows = sum(PATH_OF_TAG not in tag for tag in meta.tags or [])
             if not (
-                len(meta.sample_ids) == num_tags == num_lengths == expected_group_size
+                len(meta.sample_ids) == num_tags == num_lengths
+                and primary_rows == expected_group_size
             ):
                 raise ValueError(
                     "Replay buffer checkpoint group misaligned: "
                     f"sample_ids={len(meta.sample_ids)}, tags={num_tags}, "
-                    f"sequence_lengths={num_lengths}, "
+                    f"sequence_lengths={num_lengths}, primary_rows={primary_rows}, "
                     f"expected_group_size={expected_group_size}"
                 )
             for sid in meta.sample_ids:

@@ -940,6 +940,71 @@ def test_advantage_stage_writes_each_sample_filter_without_seq_threshold(
     )
 
 
+@pytest.mark.parametrize("leave_one_out", [False, True])
+def test_advantage_stage_extra_paths_copy_primary_advantage(
+    leave_one_out: bool,
+) -> None:
+    from nemo_rl.algorithms.advantage_estimator import (
+        AdvEstimatorConfig,
+        GRPOAdvantageEstimator,
+    )
+
+    def advantages(rewards: list[float], tags: list[dict]) -> torch.Tensor:
+        batch_size = len(rewards)
+        data = TensorDict(
+            {
+                "prompt_ids_for_adv": torch.zeros(batch_size, 3, dtype=torch.long),
+                "total_reward": torch.tensor(rewards),
+                "token_mask": torch.ones(batch_size, 3),
+                "sample_mask": torch.ones(batch_size),
+                "mask_sample": torch.zeros(batch_size, dtype=torch.bool),
+                "truncated": torch.zeros(batch_size, dtype=torch.bool),
+            },
+            batch_size=[batch_size],
+        )
+        data_plane = _AdvantageDataPlane(data)
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        ctrl = object.__new__(controller_cls)
+        ctrl._dp_client = data_plane
+        ctrl._advantage_cfg = AdvantageConfig()
+        ctrl._advantage_estimator = GRPOAdvantageEstimator(
+            AdvEstimatorConfig(
+                use_leave_one_out_baseline=leave_one_out, normalize_rewards=True
+            ),
+            ClippedPGLossConfig(),
+        )
+        ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+        ctrl._policy_logprobs_required = False
+        ctrl._reference_logprobs_required = False
+        ctrl._teacher_logprobs_required = False
+        ctrl._is_ppo = False
+        ctrl._message_level_advantage_penalties_enabled = False
+        ctrl._algo_cfg = GRPOConfig(seq_logprob_error_threshold=None)
+        ctrl._step_log_dict = {
+            "rewards": [],
+            "sample_masks": [],
+            "masked_advantages": [],
+            "num_mask_sample_filtered": [],
+        }
+        meta = KVBatchMeta(
+            partition_id="rollout_data",
+            task_name="train",
+            sample_ids=[f"g_{i}" for i in range(batch_size)],
+            fields=list(data.keys()),
+            tags=tags,
+        )
+        asyncio.run(ctrl._advantage_stage(meta))
+        assert ctrl._step_log_dict["rewards"][0].tolist() == rewards[:3]
+        return data_plane.written_fields["advantages"]
+
+    rewards = [1.0, 0.0, 0.5]
+    primaries = advantages(rewards, [{}] * 3)
+    # Two extra call-chain rows of rollout g_0 must not shift the baseline.
+    with_paths = advantages(rewards + [1.0, 1.0], [{}] * 3 + [{"path_of": "g_0"}] * 2)
+    torch.testing.assert_close(with_paths[:3], primaries)
+    torch.testing.assert_close(with_paths[3:], primaries[[0, 0]])
+
+
 def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
     batch_size, sequence_length = 2, 5
     generation_logprobs = torch.zeros(batch_size, sequence_length)

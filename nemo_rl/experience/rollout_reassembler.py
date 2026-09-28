@@ -36,13 +36,18 @@ from __future__ import annotations
 
 import time
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Optional
 
 import torch
 
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import MASK_SAMPLE, ROUTE_PLAN_TAG, TRUNCATED
+from nemo_rl.data_plane.schema import (
+    MASK_SAMPLE,
+    PATH_OF_TAG,
+    ROUTE_PLAN_TAG,
+    TRUNCATED,
+)
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
 from nemo_rl.experience.payload import pack_payload
 from nemo_rl.experience.route_assembly import (
@@ -79,6 +84,8 @@ class FinalizedRollout:
     # the executed route plan; None when the rollout staged no routes.
     routed_experts: Optional[torch.Tensor] = None
     route_plan: Optional[RouteAssemblyPlan] = None
+    # Other call chains of the rollout, each call's tokens trained on exactly one.
+    extra_paths: tuple["FinalizedRollout", ...] = ()
 
 
 @dataclass
@@ -118,8 +125,12 @@ class RolloutReassembler:
         max_seq_len: int,
         router_replay_enabled: bool = False,
         defer_routed_experts_to_policy: bool = False,
+        train_all_paths: bool = False,
+        train_dp_size: int = 1,
     ) -> None:
         self._dp_client = dp_client
+        self._train_all_paths = train_all_paths
+        self._train_dp_size = train_dp_size
         self._partition_id = partition_id
         self._pad_token_id = int(pad_token_id)
         self._max_seq_len = int(max_seq_len)
@@ -220,103 +231,138 @@ class RolloutReassembler:
         if len(fetched_by_call) != len(fetched):
             return rejected("duplicate_fetched_call_id", staging_keys)
 
-        # All base token/digest/lineage/terminal semantics belong to Gym; the
-        # finalizer never re-verifies them.
-        try:
-            row = verify_and_linearize(parsed, [item.snapshot for item in fetched])
-        except (
-            KeyError,
-            ValueError,
-            TypeError,
-            ReceiptVerificationError,
-            RebuildError,
-            NotImplementedError,
-        ) as error:
-            return rejected(f"rebuild_failed:{error}", staging_keys)
         weight_versions = [record.weight_version for record in parsed.manifest]
         min_wv, max_wv = min(weight_versions), max(weight_versions)
 
-        route_plan = None
-        routed_experts: Optional[torch.Tensor] = None
-        if self._router_replay_enabled:
-            # One plan construction for both modes: join Gym's link spans and
-            # extras commitments with the fetch's staging keys and route
-            # lengths. Cleanup keys cover the whole manifest; off-chain rows
-            # stay cleanup-owned but produce no spans.
-            commitments_by_call = {
-                commitment.model_call_id: commitment
-                for commitment in row.extras_commitments
-            }
-            route_spans: list[RouteSpan] = []
-            seen_span_call_ids: set[str] = set()
-            for call_id, carry_len, generation_len in row.link_spans:
-                if call_id in seen_span_call_ids:
-                    return rejected(f"duplicate_route_span:{call_id}", staging_keys)
-                seen_span_call_ids.add(call_id)
-                record = records_by_call.get(call_id)
-                item = fetched_by_call.get(call_id)
-                commitment = commitments_by_call.get(call_id)
-                if record is None or item is None or commitment is None:
-                    return rejected(f"route_span_identity:{call_id}", staging_keys)
-                if item.routed_len not in (0, record.delta_len):
-                    return rejected(f"routed_len_mismatch:{call_id}", staging_keys)
-                if generation_len < 0 or generation_len > record.delta_len:
-                    return rejected(
-                        f"route_generation_span_mismatch:{call_id}", staging_keys
-                    )
-                if carry_len < 0:
-                    return rejected(
-                        f"route_carry_span_mismatch:{call_id}", staging_keys
-                    )
-                route_spans.append(
-                    RouteSpan(
-                        staging_key=record.staging_key,
-                        carry_len=int(carry_len),
-                        generation_len=int(generation_len),
-                        staged_route_len=item.routed_len,
-                        extras_digest_version=commitment.extras_digest_version,
-                        extras_digest=commitment.extras_digest,
-                    )
+        leaves = [parsed.terminal_model_call_id]
+        if self._train_all_paths:
+            parents = {record.parent_call_id for record in parsed.manifest}
+            leaves += [
+                call_id
+                for call_id in records_by_call
+                if call_id not in parents and call_id not in leaves
+            ]
+        snapshots = {item.snapshot.model_call_id: item.snapshot for item in fetched}
+        paths: list[FinalizedRollout] = []
+        trained_calls: set[str] = set()
+        for leaf in leaves:
+            # The first pass verifies the whole manifest, later chains only relinearize.
+            path_receipt = parsed
+            if paths:
+                chain = [records_by_call[leaf]]
+                while chain[-1].parent_call_id is not None:
+                    chain.append(records_by_call[chain[-1].parent_call_id])
+                path_receipt = parsed.model_copy(
+                    update={"terminal_model_call_id": leaf, "manifest": chain[::-1]}
                 )
-            if sum(span.carry_len + span.generation_len for span in route_spans) != len(
-                row.token_ids
-            ):
-                return rejected("route_span_length_mismatch", staging_keys)
-            plan = RouteAssemblyPlan(
-                schema_version=ROUTE_PLAN_SCHEMA_VERSION,
-                staging_partition=self._staging_partition,
-                spans=tuple(route_spans),
-                cleanup_staging_keys=tuple(staging_keys),
-                expected_token_length=len(row.token_ids),
-            )
+            # All base token/digest/lineage/terminal semantics belong to Gym; the
+            # finalizer never re-verifies them.
             try:
-                validate_route_plan(plan)
-            except (TypeError, ValueError) as error:
-                return rejected(f"invalid_route_plan:{error}", staging_keys)
-            # Both modes carry the constructed plan on the rollout; only
-            # deferred mode publishes it (direct mode executes it eagerly and
-            # the published row carries the assembled tensor instead).
-            route_plan = plan
-            if not self._defer_routed_experts_to_policy:
-                routed_experts, failure = self._execute_direct_plan(plan, fetched)
-                if failure is not None:
-                    return rejected(f"route_assembly:{failure}", staging_keys)
+                row = verify_and_linearize(
+                    path_receipt,
+                    [
+                        snapshots[record.model_call_id]
+                        for record in path_receipt.manifest
+                    ],
+                )
+            except (
+                KeyError,
+                ValueError,
+                TypeError,
+                ReceiptVerificationError,
+                RebuildError,
+                NotImplementedError,
+            ) as error:
+                return rejected(f"rebuild_failed:{error}", staging_keys)
+            route_plan = None
+            routed_experts: Optional[torch.Tensor] = None
+            if self._router_replay_enabled:
+                # One plan construction for both modes: join Gym's link spans and
+                # extras commitments with the fetch's staging keys and route
+                # lengths. Cleanup keys cover the whole manifest; off-chain rows
+                # stay cleanup-owned but produce no spans.
+                commitments_by_call = {
+                    commitment.model_call_id: commitment
+                    for commitment in row.extras_commitments
+                }
+                route_spans: list[RouteSpan] = []
+                seen_span_call_ids: set[str] = set()
+                for call_id, carry_len, generation_len in row.link_spans:
+                    if call_id in seen_span_call_ids:
+                        return rejected(f"duplicate_route_span:{call_id}", staging_keys)
+                    seen_span_call_ids.add(call_id)
+                    record = records_by_call.get(call_id)
+                    item = fetched_by_call.get(call_id)
+                    commitment = commitments_by_call.get(call_id)
+                    if record is None or item is None or commitment is None:
+                        return rejected(f"route_span_identity:{call_id}", staging_keys)
+                    if item.routed_len not in (0, record.delta_len):
+                        return rejected(f"routed_len_mismatch:{call_id}", staging_keys)
+                    if generation_len < 0 or generation_len > record.delta_len:
+                        return rejected(
+                            f"route_generation_span_mismatch:{call_id}", staging_keys
+                        )
+                    if carry_len < 0:
+                        return rejected(
+                            f"route_carry_span_mismatch:{call_id}", staging_keys
+                        )
+                    route_spans.append(
+                        RouteSpan(
+                            staging_key=record.staging_key,
+                            carry_len=int(carry_len),
+                            generation_len=int(generation_len),
+                            staged_route_len=item.routed_len,
+                            extras_digest_version=commitment.extras_digest_version,
+                            extras_digest=commitment.extras_digest,
+                        )
+                    )
+                if sum(
+                    span.carry_len + span.generation_len for span in route_spans
+                ) != len(row.token_ids):
+                    return rejected("route_span_length_mismatch", staging_keys)
+                plan = RouteAssemblyPlan(
+                    schema_version=ROUTE_PLAN_SCHEMA_VERSION,
+                    staging_partition=self._staging_partition,
+                    spans=tuple(route_spans),
+                    cleanup_staging_keys=tuple(staging_keys),
+                    expected_token_length=len(row.token_ids),
+                )
+                try:
+                    validate_route_plan(plan)
+                except (TypeError, ValueError) as error:
+                    return rejected(f"invalid_route_plan:{error}", staging_keys)
+                # Both modes carry the constructed plan on the rollout; only
+                # deferred mode publishes it (direct mode executes it eagerly and
+                # the published row carries the assembled tensor instead).
+                route_plan = plan
+                if not self._defer_routed_experts_to_policy:
+                    routed_experts, failure = self._execute_direct_plan(plan, fetched)
+                    if failure is not None:
+                        return rejected(f"route_assembly:{failure}", staging_keys)
 
-        return FinalizedRollout(
-            rollout_id=rollout_id,
-            valid=True,
-            rejection_reason=None,
-            token_ids=row.token_ids,
-            token_mask=row.token_mask,
-            logprobs=row.logprobs,
-            prompt_len=row.prompt_len,
-            reward=reward,
-            staging_keys=staging_keys,
-            min_wv=min_wv,
-            max_wv=max_wv,
-            routed_experts=routed_experts,
-            route_plan=route_plan,
-        )
+            token_mask = list(row.token_mask)
+            for span in row.weight_version_spans:
+                if span.model_call_id in trained_calls:
+                    token_mask[span.start : span.end] = [0.0] * (span.end - span.start)
+            trained_calls.update(row.model_call_ids)
+            paths.append(
+                FinalizedRollout(
+                    rollout_id=rollout_id,
+                    valid=True,
+                    rejection_reason=None,
+                    token_ids=row.token_ids,
+                    token_mask=token_mask,
+                    logprobs=row.logprobs,
+                    prompt_len=row.prompt_len,
+                    reward=reward,
+                    staging_keys=staging_keys,
+                    min_wv=min_wv,
+                    max_wv=max_wv,
+                    routed_experts=routed_experts,
+                    route_plan=route_plan,
+                )
+            )
+        return replace(paths[0], extra_paths=tuple(paths[1:]))
 
     def _execute_direct_plan(
         self,
@@ -487,6 +533,32 @@ class RolloutReassembler:
                 count
             )
 
+        # Extra rows follow the N primary rows so rollout sample ids stay stable.
+        valid_row_count, total_row_count = len(valid_rows), len(rows)
+        extra = [(i, path) for i, row in enumerate(rows) for path in row.extra_paths]
+        if self._train_all_paths and valid_rows:
+            paths = valid_rows + [path for _, path in extra]
+            generated = sum(sum(path.token_mask) for path in paths)
+            unique_tokens = sum(
+                record["delta_len"]
+                for receipt, row in zip(receipts, rows)
+                if row.valid
+                for record in receipt["manifest"]
+            )
+            metrics["finalize/paths_per_rollout"] = len(paths) / len(valid_rows)
+            metrics["finalize/off_terminal_generated_token_fraction"] = (
+                sum(sum(path.token_mask) for _, path in extra) / generated
+            )
+            metrics["finalize/path_tokens_per_unique_token"] = (
+                sum(len(path.token_ids) for path in paths) / unique_tokens
+            )
+        # Masked filler keeps the group's row count divisible by the trainer DP size.
+        filler = replace(rows[0], valid=False, token_ids=[], token_mask=[], logprobs=[])
+        extra += [(0, filler)] * (-len(extra) % self._train_dp_size)
+        rows = rows + [path for _, path in extra]
+        mask_sample = mask_sample + [mask_sample[i] for i, _ in extra]
+        valid_rows = [row for row in rows if row.valid]
+
         group_min_wv = min(
             (r.min_wv for r in valid_rows if r.min_wv is not None),
             default=fallback_weight_version,
@@ -602,10 +674,12 @@ class RolloutReassembler:
                 metrics["finalize/routed_experts_row_coverage"] = (
                     valid_route_rows / len(valid_rows)
                 )
-        assert sample_ids == canonical_sample_ids, (
+        assert sample_ids[:total_row_count] == canonical_sample_ids, (
             "canonical sample ids must equal the stable logical rollout ids: "
             f"{sample_ids} != {canonical_sample_ids}"
         )
+        for tag, (i, _) in zip(tags[total_row_count:], extra):
+            tag[PATH_OF_TAG] = canonical_sample_ids[i]
         _tensorize_ms = (time.perf_counter() - _tensorize_t0) * 1000.0
         _put_t0 = time.perf_counter()
         self._call_dp(
@@ -645,8 +719,8 @@ class RolloutReassembler:
                 int(mask) for row in valid_rows for mask in row.token_mask
             ),
             metrics=metrics,
-            valid_row_count=len(valid_rows),
-            total_row_count=len(rows),
+            valid_row_count=valid_row_count,
+            total_row_count=total_row_count,
         )
 
     # ── internals ───────────────────────────────────────────────────────────

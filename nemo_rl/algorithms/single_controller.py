@@ -153,6 +153,7 @@ from nemo_rl.data_plane.observability import (
 from nemo_rl.data_plane.schema import (
     DP_CALIB_INPUT_FIELDS,
     DP_TRAIN_FIELDS,
+    PATH_OF_TAG,
     ROLLOUT_METRICS,
     ROUTE_PLAN_TAG,
 )
@@ -5276,6 +5277,20 @@ class SingleControllerActor:
         # Training predicts token t from position t - 1, so token_mask[:, 1:]
         # is the exact mask used when global_valid_toks and the loss are built.
         has_valid_training_tokens = bool(mask[:, 1:].bool().any().item())
+        # Extra call-chain rows copy their primary row's advantage and skip the baseline.
+        row_of = {sample_id: i for i, sample_id in enumerate(meta.sample_ids)}
+        primary = torch.tensor(
+            [
+                row_of[tag.get(PATH_OF_TAG, sample_id)]
+                for sample_id, tag in zip(
+                    meta.sample_ids, meta.tags or [{}] * len(meta.sample_ids)
+                )
+            ]
+        )
+        is_primary = primary == torch.arange(len(primary))
+        assert is_primary.all() or not self._is_ppo, (
+            "token_capture.train_all_paths does not support PPO"
+        )
         # Value-model estimators (GAE) hand back the regression target alongside
         # the advantages; the group-relative ones return a bare tensor.
         returns: Optional[torch.Tensor] = None
@@ -5288,13 +5303,13 @@ class SingleControllerActor:
                 # Real validity (token-capture placeholders carry sample_mask 0,
                 # and mask_sample/overlong/seq-logprob-error rows are folded in
                 # via final_sample_mask) instead of the hardwired all-ones.
-                valid_mask=final_sample_mask,
+                valid_mask=final_sample_mask * is_primary,
                 **kwargs,
             )
             if self._is_ppo:
                 advantages, returns = result
             else:
-                advantages = result
+                advantages = result[primary]
         else:
             advantages = torch.zeros_like(mask)
             if self._is_ppo:
@@ -5322,8 +5337,10 @@ class SingleControllerActor:
             )
 
         response_advantages = torch.masked_select(advantages, mask.bool())
-        self._step_log_dict["rewards"].append(rewards.detach().cpu())
-        self._step_log_dict["sample_masks"].append(final_sample_mask.detach().cpu())
+        self._step_log_dict["rewards"].append(rewards[is_primary].detach().cpu())
+        self._step_log_dict["sample_masks"].append(
+            final_sample_mask[is_primary].detach().cpu()
+        )
         if self._teacher_logprobs_required:
             valid = response_advantages.detach().double()
             self._opd_stat_sum += float(valid.sum())

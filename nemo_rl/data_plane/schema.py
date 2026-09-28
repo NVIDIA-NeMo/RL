@@ -146,6 +146,9 @@ ROUTE_ENCODING_LIST = 2
 ROUTE_PLAN_TAG = "route_assembly_plan"
 ROUTE_PASSTHROUGH_FLAG = "route_passthrough"
 
+# Extra call-chain rows point at their rollout's primary row.
+PATH_OF_TAG = "path_of"
+
 
 def fields_with_optional_routed_experts(
     fields: Sequence[str],

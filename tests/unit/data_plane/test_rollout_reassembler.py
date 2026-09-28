@@ -257,6 +257,114 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
         finalizer._source.fetch([receipt["manifest"][0]["staging_key"]])
 
 
+def _stage_forest(tq_client, rollout_id: str) -> dict:
+    """Main chain c1->c2 (terminal), branch c1->c3, and subagent root s1->s2."""
+    from nemo_gym.token_id_capture.staging.records import RolloutReceipt
+
+    from tests.unit.data_plane.token_capture_test_fixtures import _manifest, _record
+
+    def call(call_id, parent, token_ids, token_mask):
+        prefix = [] if parent is None else by_id[parent].token_ids_delta
+        if parent is not None and by_id[parent].parent_call_id is not None:
+            prefix = by_id[by_id[parent].parent_call_id].token_ids_delta + prefix
+        by_id[call_id] = _record(
+            rollout_id=rollout_id,
+            model_call_id=call_id,
+            parent_call_id=parent,
+            prev_len=len(prefix),
+            token_ids=token_ids,
+            token_mask=token_mask,
+            logprobs=[-0.5 * m for m in token_mask],
+            weight_version=3,
+            parent_chain_hash=None if parent is None else by_id[parent].chain_hash,
+            cumulative_prefix=prefix,
+        )
+
+    by_id: dict[str, StagedCallRecord] = {}
+    call("c1", None, [10, 11, 12, 13], [0.0, 0.0, 1.0, 1.0])
+    call("c2", "c1", [20, 21, 22], [0.0, 1.0, 1.0])
+    call("c3", "c1", [30, 31], [0.0, 1.0])
+    call("s1", None, [40, 41, 42], [0.0, 1.0, 1.0])
+    call("s2", "s1", [50, 51], [0.0, 1.0])
+    sink = TQTokenSink(tq_client, staging_partition=STAGING_PARTITION)
+    for record in by_id.values():
+        assert sink.stage(record).ok
+    return RolloutReceipt(
+        rollout_id=rollout_id,
+        terminal_model_call_id="c2",
+        manifest=[_manifest(record) for record in by_id.values()],
+        terminal_selection="declared",
+    ).model_dump()
+
+
+def test_finalize_group_trains_all_paths_once(tq_client, partitions):
+    group_id = "grp_paths"
+    rollout_id = f"{group_id}_g0"
+    receipt = _stage_forest(tq_client, rollout_id)
+    finalized = _finalizer(tq_client, train_all_paths=True).finalize_group(
+        group_id,
+        [rollout_id],
+        [receipt],
+        [1.0],
+        mask_sample=[False],
+        fallback_weight_version=0,
+        prompt_idx=0,
+    )
+
+    extra_ids = [f"{group_id}_g1", f"{group_id}_g2"]
+    assert finalized.meta.sample_ids == [rollout_id, *extra_ids]
+    assert [tag.get("path_of") for tag in finalized.meta.tags] == [
+        None,
+        rollout_id,
+        rollout_id,
+    ]
+    assert (finalized.valid_row_count, finalized.total_row_count) == (1, 1)
+    assert finalized.canonical_output_tokens == 8
+    assert finalized.metrics["finalize/paths_per_rollout"] == 3.0
+    assert finalized.metrics["finalize/off_terminal_generated_token_fraction"] == 0.5
+    assert finalized.metrics["finalize/path_tokens_per_unique_token"] == 18 / 14
+
+    rows = _fetch_rows(tq_client, finalized.meta.sample_ids)
+    input_ids = [torch.as_tensor(row).flatten().tolist() for row in rows["input_ids"]]
+    token_mask = [torch.as_tensor(row).flatten().tolist() for row in rows["token_mask"]]
+    assert input_ids == [
+        [10, 11, 12, 13, 20, 21, 22],
+        [10, 11, 12, 13, 30, 31],
+        [40, 41, 42, 50, 51],
+    ]
+    # c1's tokens were trained on the terminal chain, so the branch masks them.
+    assert token_mask == [
+        [0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0],
+        [0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        [0.0, 1.0, 1.0, 0.0, 1.0],
+    ]
+    assert torch.as_tensor(rows["total_reward"]).flatten().tolist() == [1.0] * 3
+
+
+def test_finalize_group_pads_extra_paths_to_train_dp_size(tq_client, partitions):
+    group_id = "grp_paths_dp"
+    rollout_id = f"{group_id}_g0"
+    receipt = _stage_forest(tq_client, rollout_id)
+    finalized = _finalizer(
+        tq_client, train_all_paths=True, train_dp_size=4
+    ).finalize_group(
+        group_id,
+        [rollout_id],
+        [receipt],
+        [1.0],
+        mask_sample=[False],
+        fallback_weight_version=0,
+        prompt_idx=0,
+    )
+
+    # Two real extra paths plus two masked fillers make four extra rows.
+    assert len(finalized.meta.sample_ids) == 5
+    assert finalized.metrics["finalize/paths_per_rollout"] == 3.0
+    rows = _fetch_rows(tq_client, finalized.meta.sample_ids)
+    sample_mask = torch.as_tensor(rows["sample_mask"]).flatten().tolist()
+    assert sample_mask == [1.0, 1.0, 1.0, 0.0, 0.0]
+
+
 def test_finalize_group_maps_physical_attempt_to_stable_canonical_id(
     tq_client, partitions
 ):

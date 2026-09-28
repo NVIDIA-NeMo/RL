@@ -80,6 +80,8 @@ class RolloutReassemblerActorConfig:
     router_replay_enabled: bool
     defer_routed_experts_to_policy: bool
     max_seq_len: int
+    train_all_paths: bool
+    train_dp_size: int
 
 
 def assert_metadata_only(value: Any, *, path: str = "rpc") -> None:
@@ -134,6 +136,8 @@ class RolloutReassemblerActor:  # pragma: no cover
             router_replay_enabled=config.router_replay_enabled,
             defer_routed_experts_to_policy=config.defer_routed_experts_to_policy,
             max_seq_len=config.max_seq_len,
+            train_all_paths=config.train_all_paths,
+            train_dp_size=config.train_dp_size,
         )
 
     def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:
