@@ -86,6 +86,7 @@ def _install_fake_vllm(monkeypatch):
         "vllm.entrypoints.openai.engine",
         "vllm.entrypoints.openai.models",
         "vllm.entrypoints.serve",
+        "vllm.entrypoints.serve.engine",
         "vllm.entrypoints.serve.tokenize",
         "vllm.reasoning",
         "vllm.renderers",
@@ -116,8 +117,15 @@ def _install_fake_vllm(monkeypatch):
         "vllm.entrypoints.openai.chat_completion.serving",
         OpenAIServingChat=_OpenAIServingChat,
     )
+    # vLLM 0.29 moved the engine protocol out of the openai package
+    # (vllm-project/vllm#54492); NeMo-RL imports ErrorResponse from the new
+    # location, the old one is kept for the openai-side consumers.
     module(
         "vllm.entrypoints.openai.engine.protocol",
+        ErrorResponse=placeholder("ErrorResponse"),
+    )
+    module(
+        "vllm.entrypoints.serve.engine.protocol",
         ErrorResponse=placeholder("ErrorResponse"),
     )
     module(
