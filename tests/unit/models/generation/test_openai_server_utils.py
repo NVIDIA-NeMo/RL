@@ -75,6 +75,30 @@ def test_replace_prefix_tokens_tokenizer_without_eos_raises():
         )
 
 
+def test_replace_prefix_tokens_without_tokenizer_uses_explicit_eos():
+    """Callers that only hold token ids (the Megatron prompt preparer) pass eos_token_id."""
+    result = replace_prefix_tokens(
+        tokenizer=None,
+        model_prefix_token_ids=[100, 2],
+        template_prefix_token_ids=[9, 2],
+        template_token_ids=[9, 2, 77, 88],
+        eos_token_id=2,
+    )
+    assert result == [100, 2, 77, 88]
+
+
+def test_replace_prefix_tokens_without_tokenizer_reports_missing_eos_without_decoding():
+    """The failure message must not require a tokenizer to decode."""
+    with pytest.raises(AssertionError, match="EOS token #1 not found"):
+        replace_prefix_tokens(
+            tokenizer=None,
+            model_prefix_token_ids=[100, 2],
+            template_prefix_token_ids=[9, 2],
+            template_token_ids=[9, 77],
+            eos_token_id=2,
+        )
+
+
 def test_replace_prefix_tokens_uses_last_eos_in_template_prefix():
     """When the prefix contains multiple EOS tokens, the splice cuts at the last one."""
 
