@@ -26,6 +26,7 @@ from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
     canonicalize_mxfp8_refit_output,
     mxfp8_e4m3_quantize_for_refit,
 )
+from nemo_rl.models.generation.vllm.quantization import fp8_train_utils
 
 pytestmark = pytest.mark.vllm
 
@@ -77,6 +78,20 @@ def test_last_dim_not_divisible_raises():
     x = torch.randn(8, MXFP8_BLOCK_SIZE + 1, dtype=torch.bfloat16)
     with pytest.raises(AssertionError):
         _mxfp8_e4m3_quantize_torch(x)
+
+
+def test_torch_reference_matches_vllm_mxfp8_fallback():
+    vllm_mxfp8 = pytest.importorskip(
+        "vllm.model_executor.layers.quantization.utils.mxfp8_utils"
+    )
+    x = torch.randn(4, 64, dtype=torch.bfloat16)
+    x[0].zero_()
+
+    values, scales = _mxfp8_e4m3_quantize_torch(x)
+    expected_values, expected_scales = vllm_mxfp8._mxfp8_e4m3_quantize_torch(x)
+
+    assert torch.equal(values.view(torch.uint8), expected_values.view(torch.uint8))
+    assert torch.equal(scales, expected_scales)
 
 
 def test_refit_quantize_preserves_single_scale_block_dimension():
@@ -170,6 +185,7 @@ def test_blackwell_refit_prequantization_requires_flashinfer(monkeypatch):
         device = "cuda"
 
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (10, 0))
+    monkeypatch.setattr(fp8_train_utils, "_receiver_has_flashinfer", lambda: True)
     monkeypatch.setitem(sys.modules, "flashinfer", None)
 
     with pytest.raises(RuntimeError, match=r"sm100\+ requires FlashInfer"):
@@ -196,6 +212,7 @@ def test_blackwell_refit_prequantization_matches_vllm_backend(monkeypatch):
         )
 
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (10, 0))
+    monkeypatch.setattr(fp8_train_utils, "_receiver_has_flashinfer", lambda: True)
     monkeypatch.setitem(
         sys.modules,
         "flashinfer",
@@ -205,6 +222,22 @@ def test_blackwell_refit_prequantization_matches_vllm_backend(monkeypatch):
     mxfp8_e4m3_quantize_for_refit(FakeBlackwellTensor())
 
     assert call_kwargs["backend"] == "cute-dsl"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_blackwell_refit_prequantization_uses_vllm_fallback_without_flashinfer(
+    monkeypatch,
+):
+    x = torch.randn(2, 64, dtype=torch.bfloat16, device="cuda")
+    monkeypatch.setattr(fp8_train_utils, "_receiver_has_flashinfer", lambda: False)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (10, 0))
+    monkeypatch.setattr(sys.modules, "flashinfer", None)
+
+    values, scales = mxfp8_e4m3_quantize_for_refit(x)
+    expected_values, expected_scales = _mxfp8_e4m3_quantize_torch(x)
+
+    assert torch.equal(values.view(torch.uint8), expected_values.view(torch.uint8))
+    assert torch.equal(scales, expected_scales)
 
 
 @pytest.mark.skipif(

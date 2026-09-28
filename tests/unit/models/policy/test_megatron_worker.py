@@ -1872,6 +1872,7 @@ def test_checkpoint_engine_prequant_handshake_exports_mxfp8_weights():
     worker = _PrequantCheckpointWorker()
     worker._refit_prequant_names = set()
     worker._refit_param_info_hf = None
+    worker.refit_payload_mode = "hf_export"
     worker.fp8_cfg = None
     worker.model = object()
     worker.draft_model = None
@@ -2202,6 +2203,10 @@ def test_offload_after_refit_routes_cleanup_by_mode(
         }
     }
     worker.fp8_cfg = {"force_clear_fp8_caches": True}
+    worker.megatron_cfg = SimpleNamespace(
+        optimizer=SimpleNamespace(reuse_grad_buf_for_mxfp8_param_ag=False),
+        ddp=SimpleNamespace(overlap_param_gather=False),
+    )
     worker._clear_fp8_caches = MagicMock()
     worker._clear_rope_and_moe_dispatcher_caches = MagicMock()
     worker.optimizer = object()

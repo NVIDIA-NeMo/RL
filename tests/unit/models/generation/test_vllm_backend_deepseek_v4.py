@@ -68,6 +68,8 @@ async def test_checkpoint_engine_refit_guard(monkeypatch, model_type, fp8_enable
     model = torch.nn.Module()
     model.config = SimpleNamespace(model_type=model_type)
     ext.model_runner = SimpleNamespace(model=model, vllm_config=object())
+    ext.model_config = object()
+    ext.device = "cpu"
     ext._uses_unquantized_flashinfer_trtllm = lambda: False
     ext._maybe_process_fp8_kv_cache = lambda: None
 

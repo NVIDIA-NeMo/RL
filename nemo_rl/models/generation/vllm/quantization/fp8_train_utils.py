@@ -13,6 +13,11 @@
 # limitations under the License.
 
 
+import functools
+import importlib.util
+import os
+import shutil
+
 import torch
 
 MXFP8_BLOCK_SIZE = 32
@@ -98,7 +103,8 @@ def _mxfp8_e4m3_quantize_torch(
 
     amax = x_blocked.abs().amax(dim=-1)
     amax = amax.clamp(min=torch.finfo(torch.float32).tiny)
-    scale_biased = torch.floor(torch.log2(amax)) + 127.0
+    fp8_max = torch.finfo(MXFP8_VALUE_DTYPE).max
+    scale_biased = torch.ceil(torch.log2(amax / fp8_max)) + 127.0
     scale_biased = scale_biased.clamp(0, 254)
     scales_uint8 = scale_biased.to(torch.uint8)
 
@@ -115,6 +121,17 @@ def _mxfp8_e4m3_quantize_torch(
     return x_fp8, scales_uint8
 
 
+@functools.cache
+def _receiver_has_flashinfer() -> bool:
+    """Mirror vLLM's FlashInfer availability check without importing vLLM in trainer workers."""
+    if importlib.util.find_spec("flashinfer") is None:
+        return False
+    has_cubin = os.environ.get("VLLM_HAS_FLASHINFER_CUBIN") == "1" or (
+        importlib.util.find_spec("flashinfer_cubin") is not None
+    )
+    return has_cubin or shutil.which("nvcc") is not None
+
+
 def mxfp8_e4m3_quantize_for_refit(
     x: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -124,10 +141,14 @@ def mxfp8_e4m3_quantize_for_refit(
     (mxfp8_e4m3_quantize + scale reshape) so the streamed E4M3 data and
     *_scale_from_checkpoint scales load bit-identically without receiver-side
     re-quantization. Uses the same FlashInfer CuTe-DSL backend as vLLM on
-    Blackwell and the torch reference elsewhere.
+    Blackwell when vLLM can select it, and the torch reference otherwise.
     """
     x_q = x_scales = None
-    if x.is_cuda and torch.cuda.get_device_capability(x.device) >= (10, 0):
+    if (
+        x.is_cuda
+        and torch.cuda.get_device_capability(x.device) >= (10, 0)
+        and _receiver_has_flashinfer()
+    ):
         try:
             from flashinfer import mxfp8_quantize as flashinfer_mxfp8_quantize
         except ImportError as exc:
