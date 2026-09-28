@@ -100,6 +100,8 @@ class RolloutReassemblerActorConfig:
     # tokenizer config decodes generations for the think-tag string check.
     reward_penalty_config: Optional[dict[str, Any]] = None
     tokenizer_config: Optional[dict[str, Any]] = None
+    # token_capture.top_logprobs: sampler top-k columns to assemble (0 = none).
+    top_logprobs: int = 0
 
 
 def assert_metadata_only(value: Any, *, path: str = "rpc") -> None:
@@ -161,6 +163,7 @@ class RolloutReassemblerActor:  # pragma: no cover
             nan_generation_logprobs=config.nan_generation_logprobs,
             reward_penalty_config=config.reward_penalty_config,
             tokenizer_config=config.tokenizer_config,
+            top_logprobs=config.top_logprobs,
         )
 
     def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:

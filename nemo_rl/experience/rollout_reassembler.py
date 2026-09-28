@@ -62,7 +62,13 @@ import torch
 
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import MASK_SAMPLE, ROUTE_PLAN_TAG, TRUNCATED
+from nemo_rl.data_plane.schema import (
+    GENERATION_TOPK_IDS_FIELD,
+    GENERATION_TOPK_LOGPROBS_FIELD,
+    MASK_SAMPLE,
+    ROUTE_PLAN_TAG,
+    TRUNCATED,
+)
 from nemo_rl.data_plane.tq_token_sink import (
     FetchedStagedCall,
     StagedMediaTensors,
@@ -163,6 +169,10 @@ class FinalizedRollout:
     # Token-scoped reward penalties any chain of the rollout hit (canonical row
     # only); a hit zeroes the rollout's reward on every row.
     penalty_hits: tuple[str, ...] = ()
+    # Sampler top-k per token (token_capture.top_logprobs): [len(token_ids), k]
+    # int32 ids and float32 log-probs, zeros on carried tokens; None when off.
+    generation_topk_ids: Optional[torch.Tensor] = None
+    generation_topk_logprobs: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -308,6 +318,7 @@ class RolloutReassembler:
         nan_generation_logprobs: str = "mask",
         reward_penalty_config: Optional[dict[str, Any]] = None,
         tokenizer_config: Optional[dict[str, Any]] = None,
+        top_logprobs: int = 0,
     ) -> None:
         self._dp_client = dp_client
         self._partition_id = partition_id
@@ -319,6 +330,8 @@ class RolloutReassembler:
         self._max_seq_len = int(max_seq_len)
         self._router_replay_enabled = router_replay_enabled
         self._defer_routed_experts_to_policy = defer_routed_experts_to_policy
+        # token_capture.top_logprobs: sampler top-k columns to assemble (0 = none).
+        self._top_logprobs = int(top_logprobs)
         if self._defer_routed_experts_to_policy and not self._router_replay_enabled:
             raise ValueError(
                 "defer_routed_experts_to_policy requires router replay to be enabled"
@@ -451,7 +464,9 @@ class RolloutReassembler:
         )
         try:
             fetched = self._source.fetch_for_finalization(
-                staging_keys, include_route_fragments=fetch_fragments
+                staging_keys,
+                include_route_fragments=fetch_fragments,
+                include_topk=self._top_logprobs > 0,
             )
         except KeyError as error:
             return rejected(f"missing_staging_row:{error}", staging_keys)
@@ -664,6 +679,43 @@ class RolloutReassembler:
         text = self._tokenizer.decode(generation, skip_special_tokens=False)
         return text.count(tags[0]) > 0 or text.count(tags[1]) > 1
 
+    def _chain_topk(
+        self,
+        link_spans: tuple[tuple[str, int, int], ...],
+        fetched_by_call: dict[str, Any],
+        num_tokens: int,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[str]]:
+        """Token-aligned sampler top-k of one chain row (``token_capture.top_logprobs``).
+
+        The row is the chain's deltas back to back (carried tokens, then the
+        call's generated tokens); the staged top-k covers only the generated
+        part, so each span gets zeros for its carried tokens first. Returns
+        ``(ids, logprobs, None)``, each ``[num_tokens, k]``, or
+        ``(None, None, reason)``.
+        """
+        k = self._top_logprobs
+        ids_parts: list[torch.Tensor] = []
+        logprob_parts: list[torch.Tensor] = []
+        for call_id, carry_len, generation_len in link_spans:
+            item = fetched_by_call.get(call_id)
+            topk = None if item is None else item.topk
+            expected_shape = (generation_len, k)
+            if (
+                topk is None
+                or tuple(topk[0].shape) != expected_shape
+                or tuple(topk[1].shape) != expected_shape
+            ):
+                return None, None, f"topk_length_mismatch:{call_id}"
+            ids_parts += [torch.zeros((carry_len, k), dtype=torch.int32), topk[0]]
+            logprob_parts += [torch.zeros((carry_len, k), dtype=torch.float32), topk[1]]
+        if not ids_parts or sum(part.shape[0] for part in ids_parts) != num_tokens:
+            return None, None, "topk_span_length_mismatch"
+        return (
+            torch.cat(ids_parts).to(torch.int32),
+            torch.cat(logprob_parts).to(torch.float32),
+            None,
+        )
+
     def _build_chain_row(
         self,
         *,
@@ -696,6 +748,13 @@ class RolloutReassembler:
         # Cleanup ownership (staging keys / plan cleanup keys) rides the
         # canonical row only; extra rows share the same staged calls.
         owns_cleanup = trace_idx == 0
+        generation_topk_ids = generation_topk_logprobs = None
+        if self._top_logprobs > 0:
+            generation_topk_ids, generation_topk_logprobs, failure = self._chain_topk(
+                link_spans, fetched_by_call, len(chain.token_ids)
+            )
+            if failure is not None:
+                return None, failure
         if self._router_replay_enabled:
             # One plan construction for both modes: join Gym's link spans and
             # extras commitments with the fetch's staging keys and route
@@ -790,6 +849,8 @@ class RolloutReassembler:
                 link_spans=link_spans,
                 media=media,
                 nan_logprobs_masked=nan_logprobs_masked,
+                generation_topk_ids=generation_topk_ids,
+                generation_topk_logprobs=generation_topk_logprobs,
             ),
             None,
         )
@@ -1150,6 +1211,11 @@ class RolloutReassembler:
         metrics["finalize/nan_logprob_rows_masked"] = float(
             sum(row.nan_logprobs_masked for row in rows)
         )
+        topk_ids = topk_logprobs = None
+        if self._top_logprobs > 0:
+            topk_shape = (n, max_len, self._top_logprobs)
+            topk_ids = torch.zeros(topk_shape, dtype=torch.int32)
+            topk_logprobs = torch.zeros(topk_shape, dtype=torch.float32)
         for r, row in enumerate(rows):
             if not row.valid:
                 continue
@@ -1158,6 +1224,9 @@ class RolloutReassembler:
             token_mask[r, :length] = torch.tensor(row.token_mask, dtype=torch.float32)
             logprobs[r, :length] = torch.tensor(row.logprobs, dtype=torch.float32)
             sample_mask[r] = float(loss_multiplier)
+            if topk_ids is not None:
+                topk_ids[r, :length] = row.generation_topk_ids
+                topk_logprobs[r, :length] = row.generation_topk_logprobs
 
         train_batch: dict[str, Any] = {
             "input_ids": input_ids,
@@ -1173,6 +1242,9 @@ class RolloutReassembler:
                 dtype=torch.bool,
             ),
         }
+        if topk_ids is not None:
+            train_batch[GENERATION_TOPK_IDS_FIELD] = topk_ids
+            train_batch[GENERATION_TOPK_LOGPROBS_FIELD] = topk_logprobs
         if self._router_replay_enabled and not self._defer_routed_experts_to_policy:
             has_routed_row = any(r.valid and r.routed_experts is not None for r in rows)
             if not has_routed_row and self._routed_dims is None and not valid_rows:
