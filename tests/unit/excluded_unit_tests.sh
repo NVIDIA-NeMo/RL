@@ -135,8 +135,8 @@ EXCLUDED_UNIT_TESTS=(
     # MODELS — Policy (run in L0_Unit_Tests_Policy)
     ###########################################################################
 
-    # test_dtensor_worker_v2.py — all heavy GPU tests (~54s each)
-    --ignore=unit/models/policy/test_dtensor_worker_v2.py
+    # test_automodel_worker.py — all heavy GPU tests (~54s each)
+    --ignore=unit/models/policy/test_automodel_worker.py
 
     # test_patches.py — requires model loading
     --ignore=unit/models/policy/test_patches.py
