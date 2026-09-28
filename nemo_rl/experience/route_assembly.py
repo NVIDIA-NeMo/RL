@@ -35,6 +35,8 @@ import torch
 from nemo_rl.data_plane.schema import (
     ROUTE_ENCODING_ENVELOPE,
     ROUTE_ENCODING_LIST,
+    ROUTED_EXPERTS_BOUNDARY_FIELD,
+    ROUTED_EXPERTS_BOUNDARY_INDEX_FIELD,
     ROUTED_EXPERTS_FIELD,
 )
 from nemo_rl.experience.route_plan import RouteAssemblyPlan
@@ -54,6 +56,7 @@ ROUTE_FAILURE_RANK = "fragment_rank"
 ROUTE_FAILURE_LENGTH = "fragment_length"
 ROUTE_FAILURE_MODEL_SHAPE = "fragment_model_shape"
 ROUTE_FAILURE_ASSEMBLED_LENGTH = "assembled_length_mismatch"
+ROUTE_FAILURE_BOUNDARY = "fragment_boundary"
 
 
 @dataclass(frozen=True)
@@ -63,12 +66,34 @@ class RouteFragment:
     ``routes`` is the staged ``[staged_len, num_moe_layers, topk]`` tensor,
     ``encoding`` the ``ROUTE_ENCODING_*`` wire code the digest was committed
     over, and ``extras_metadata_json`` the canonical non-route extras JSON
-    staged beside it.
+    staged beside it. ``boundary_routes`` optionally carries the child's
+    one-token prefill sidecar; its source index lives in the same digest-covered
+    metadata. Boundary bytes always use the envelope encoding in the commitment.
     """
 
     routes: torch.Tensor
     encoding: int
     extras_metadata_json: bytes
+    boundary_routes: Optional[torch.Tensor] = None
+
+
+def routed_experts_boundary_index(extras_metadata_json: bytes) -> Optional[int]:
+    """Read the optional source index without fetching any boundary route bytes.
+
+    Legacy extras have no index. An explicitly malformed index is not legacy
+    data and must never silently disable boundary repair.
+    """
+    metadata = json.loads(extras_metadata_json.decode("utf-8"))
+    if metadata is None:
+        return None
+    if not isinstance(metadata, dict):
+        raise ValueError("staged extras metadata must be an object or null")
+    if ROUTED_EXPERTS_BOUNDARY_INDEX_FIELD not in metadata:
+        return None
+    index = metadata[ROUTED_EXPERTS_BOUNDARY_INDEX_FIELD]
+    if type(index) is not int or index < 0:
+        raise ValueError("routed-experts boundary index must be a non-negative int")
+    return index
 
 
 def verify_route_fragment_integrity(
@@ -101,6 +126,15 @@ def verify_route_fragment_integrity(
         elif fragment.encoding == ROUTE_ENCODING_LIST:
             extras[ROUTED_EXPERTS_FIELD] = fragment.routes.tolist()
         else:
+            return False
+        boundary_index = routed_experts_boundary_index(fragment.extras_metadata_json)
+        if boundary_index is not None:
+            if fragment.boundary_routes is None:
+                return False
+            extras[ROUTED_EXPERTS_BOUNDARY_FIELD] = encode_routed_experts(
+                fragment.boundary_routes
+            )
+        elif fragment.boundary_routes is not None:
             return False
         return compute_extras_digest(extras) == expected_extras_digest
     except (TypeError, ValueError):
@@ -167,6 +201,15 @@ def execute_route_plan(
                 return None, ROUTE_FAILURE_LENGTH
             if tuple(routes.shape[1:]) != (num_moe_layers, top_k):
                 return None, ROUTE_FAILURE_MODEL_SHAPE
+            if (
+                routed_experts_boundary_index(fragment.extras_metadata_json)
+                != span.boundary_token_index
+            ):
+                return None, ROUTE_FAILURE_BOUNDARY
+            if fragment.boundary_routes is not None and tuple(
+                fragment.boundary_routes.shape
+            ) != (1, num_moe_layers, top_k):
+                return None, ROUTE_FAILURE_BOUNDARY
             if mode == "full":
                 routed[position : position + contribution] = routes.to(torch.int16)
             else:
@@ -174,6 +217,19 @@ def execute_route_plan(
                 routed[tail_start : position + contribution] = routes[
                     -span.generation_len :
                 ].to(torch.int16)
+            if span.repair_previous_token:
+                # The plan is built from verified parent links, never response
+                # arrival order. Repair only the assembled tensor; the parent's
+                # immutable staged fragment and digest remain unchanged.
+                if (
+                    fragment.boundary_routes is None
+                    or position == 0
+                    or span.boundary_token_index != position - 1
+                ):
+                    return None, ROUTE_FAILURE_BOUNDARY
+                routed[position - 1 : position] = fragment.boundary_routes.to(
+                    torch.int16
+                )
         position += contribution
     if plan.spans and position != canonical_len:
         return None, ROUTE_FAILURE_ASSEMBLED_LENGTH

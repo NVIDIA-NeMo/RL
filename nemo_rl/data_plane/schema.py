@@ -144,6 +144,11 @@ VALUE_SEED_FIELDS = LP_SEED_FIELDS
 DP_CALIB_INPUT_FIELDS = (INPUT_IDS, INPUT_LENGTHS)
 
 ROUTED_EXPERTS_FIELD = "routed_experts"
+# Child-owned prefill route for the last token of its admitted prefix. The
+# index stays in digest-covered extras metadata; only the tensor is a column.
+ROUTED_EXPERTS_BOUNDARY_FIELD = "routed_experts_boundary"
+ROUTED_EXPERTS_BOUNDARY_INDEX_FIELD = "routed_experts_boundary_index"
+ROUTED_EXPERTS_BOUNDARY_SCHEMA_VERSION = 1
 ROUTED_LEN_FIELD = "routed_len"
 ROUTED_EXPERTS_ENCODING_FIELD = "routed_experts_encoding"
 ROUTED_EXTRAS_METADATA_FIELD = "extras_metadata_json"

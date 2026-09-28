@@ -19,7 +19,8 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-ROUTE_PLAN_SCHEMA_VERSION = 2
+ROUTE_PLAN_SCHEMA_VERSION = 3
+_LEGACY_ROUTE_PLAN_SCHEMA_VERSION = 2
 _EXTRAS_DIGEST_VERSION = 1
 _SHA256_HEX_LENGTH = 64
 
@@ -39,6 +40,11 @@ class RouteSpan:
     staged_route_len: int
     extras_digest_version: int
     extras_digest: str
+    # Absolute position in the child's admitted prefix, not an extra delta row.
+    # Presence is separate from application: every fetched sidecar participates
+    # in integrity verification, even when its application is not authorized.
+    boundary_token_index: int | None = None
+    repair_previous_token: bool = False
 
 
 @dataclass(frozen=True)
@@ -82,10 +88,14 @@ def _require_string(value: Any, *, where: str) -> str:
 
 
 def _validate_plan(plan: RouteAssemblyPlan) -> None:
-    if plan.schema_version != ROUTE_PLAN_SCHEMA_VERSION:
+    if plan.schema_version not in (
+        _LEGACY_ROUTE_PLAN_SCHEMA_VERSION,
+        ROUTE_PLAN_SCHEMA_VERSION,
+    ):
         raise ValueError(
             "unsupported route plan schema version "
-            f"{plan.schema_version}; expected {ROUTE_PLAN_SCHEMA_VERSION}"
+            f"{plan.schema_version}; expected {_LEGACY_ROUTE_PLAN_SCHEMA_VERSION} "
+            f"(legacy) or {ROUTE_PLAN_SCHEMA_VERSION}"
         )
     _require_string(plan.staging_partition, where="route_plan.staging_partition")
     _require_nonnegative_int(
@@ -97,6 +107,7 @@ def _validate_plan(plan: RouteAssemblyPlan) -> None:
         raise ValueError("route_plan.cleanup_staging_keys contains duplicates")
     for index, key in enumerate(plan.cleanup_staging_keys):
         _require_string(key, where=f"route_plan.cleanup_staging_keys[{index}]")
+    position = 0
     for index, span in enumerate(plan.spans):
         _require_string(
             span.staging_key, where=f"route_plan.spans[{index}].staging_key"
@@ -136,6 +147,34 @@ def _validate_plan(plan: RouteAssemblyPlan) -> None:
                 f"route_plan.spans[{index}] key {span.staging_key!r} is outside "
                 "cleanup_staging_keys"
             )
+        if type(span.repair_previous_token) is not bool:
+            raise TypeError(
+                f"route_plan.spans[{index}].repair_previous_token must be bool"
+            )
+        if span.boundary_token_index is not None:
+            _require_nonnegative_int(
+                span.boundary_token_index,
+                where=f"route_plan.spans[{index}].boundary_token_index",
+            )
+            if (
+                plan.schema_version == _LEGACY_ROUTE_PLAN_SCHEMA_VERSION
+                or position == 0
+                or span.boundary_token_index != position - 1
+                or span.staged_route_len == 0
+            ):
+                raise ValueError(
+                    f"route_plan.spans[{index}] has an invalid boundary token index"
+                )
+        if span.repair_previous_token and (
+            span.boundary_token_index is None
+            or index == 0
+            or plan.spans[index - 1].generation_len == 0
+            or span.generation_len == 0
+        ):
+            raise ValueError(
+                f"route_plan.spans[{index}] boundary repair requires adjacent generated spans"
+            )
+        position += span.carry_len + span.generation_len
     if plan.spans:
         contribution = sum(span.carry_len + span.generation_len for span in plan.spans)
         if contribution != plan.expected_token_length:
@@ -164,6 +203,14 @@ def encode_route_plan(plan: RouteAssemblyPlan) -> dict[str, Any]:
                 "staged_route_len": span.staged_route_len,
                 "extras_digest_version": span.extras_digest_version,
                 "extras_digest": span.extras_digest,
+                **(
+                    {
+                        "boundary_token_index": span.boundary_token_index,
+                        "repair_previous_token": span.repair_previous_token,
+                    }
+                    if plan.schema_version == ROUTE_PLAN_SCHEMA_VERSION
+                    else {}
+                ),
             }
             for span in plan.spans
         ],
@@ -173,7 +220,7 @@ def encode_route_plan(plan: RouteAssemblyPlan) -> dict[str, Any]:
 
 
 def decode_route_plan(value: Any) -> RouteAssemblyPlan:
-    """Strictly decode a plan without defaults or compatibility guesses."""
+    """Strictly decode v3 or explicit legacy v2 plans, never guessing fields."""
     if not isinstance(value, dict):
         raise TypeError(f"route plan must be a dict, got {type(value).__name__}")
     _require_exact_keys(
@@ -187,6 +234,14 @@ def decode_route_plan(value: Any) -> RouteAssemblyPlan:
         },
         where="route_plan",
     )
+    schema_version = _require_int(
+        value["schema_version"], where="route_plan.schema_version"
+    )
+    if schema_version not in (
+        _LEGACY_ROUTE_PLAN_SCHEMA_VERSION,
+        ROUTE_PLAN_SCHEMA_VERSION,
+    ):
+        raise ValueError(f"unsupported route plan schema version {schema_version}")
     spans_value = value["spans"]
     if not isinstance(spans_value, list):
         raise TypeError("route_plan.spans must be a list")
@@ -203,7 +258,12 @@ def decode_route_plan(value: Any) -> RouteAssemblyPlan:
                 "staged_route_len",
                 "extras_digest_version",
                 "extras_digest",
-            },
+            }
+            | (
+                {"boundary_token_index", "repair_previous_token"}
+                if schema_version == ROUTE_PLAN_SCHEMA_VERSION
+                else set()
+            ),
             where=f"route_plan.spans[{index}]",
         )
         spans.append(
@@ -232,6 +292,16 @@ def decode_route_plan(value: Any) -> RouteAssemblyPlan:
                     span_value["extras_digest"],
                     where=f"route_plan.spans[{index}].extras_digest",
                 ),
+                boundary_token_index=(
+                    span_value["boundary_token_index"]
+                    if schema_version == ROUTE_PLAN_SCHEMA_VERSION
+                    else None
+                ),
+                repair_previous_token=(
+                    span_value["repair_previous_token"]
+                    if schema_version == ROUTE_PLAN_SCHEMA_VERSION
+                    else False
+                ),
             )
         )
     cleanup_value = value["cleanup_staging_keys"]
@@ -242,9 +312,7 @@ def decode_route_plan(value: Any) -> RouteAssemblyPlan:
         for index, key in enumerate(cleanup_value)
     )
     plan = RouteAssemblyPlan(
-        schema_version=_require_int(
-            value["schema_version"], where="route_plan.schema_version"
-        ),
+        schema_version=schema_version,
         staging_partition=_require_string(
             value["staging_partition"], where="route_plan.staging_partition"
         ),
