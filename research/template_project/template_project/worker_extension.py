@@ -18,17 +18,17 @@ import ray
 import torch
 
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
-from nemo_rl.models.policy.workers.dtensor_policy_worker_v2 import (
-    DTensorPolicyWorkerV2Impl,
+from nemo_rl.models.policy.workers.automodel_policy_worker import (
+    AutomodelPolicyWorkerImpl,
 )
 
 
 # this worker extension class needs to be registered to the actor environment registry in your main process
 # see the example in `single_update.py`
 @ray.remote(
-    runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker_v2")
+    runtime_env=get_runtime_env_for_policy_worker("automodel_policy_worker")
 )  # pragma: no cover
-class DTensorPolicyWorkerV2Extension(DTensorPolicyWorkerV2Impl):
+class AutomodelPolicyWorkerExtension(AutomodelPolicyWorkerImpl):
     """Example worker extension that adds custom methods."""
 
     def get_worker_rank(self) -> dict[str, Any]:
