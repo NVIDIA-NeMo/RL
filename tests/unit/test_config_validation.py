@@ -104,6 +104,7 @@ configs_dir = Path(
 config_files = glob.glob(str(configs_dir / "**/*.yaml"), recursive=True)
 assert len(config_files) > 0, "No config files found"
 
+
 # Every shipped config tree. Only the outdated-config guard uses it -- most of examples/nemo_gym
 # cannot satisfy the schema test by design (env manifests, launcher templates, unset env
 # interpolations).
@@ -380,3 +381,28 @@ def test_no_shipped_config_is_outdated(config_file):
         check_outdated_config(config_dict)
     except ValueError as e:
         raise AssertionError(f"Config file {config_file} is outdated: {e}") from e
+
+
+@pytest.mark.parametrize("config_file", config_files)
+def test_automodel_moe_recipes_use_hybridep_or_explicit_torch(
+    config_file: str,
+) -> None:
+    config = load_config_with_inheritance(config_file)
+    dtensor_cfg = OmegaConf.select(config, "policy.dtensor_cfg")
+    if (
+        dtensor_cfg is None
+        or not dtensor_cfg.enabled
+        or dtensor_cfg.get("expert_parallel_size", 1) <= 1
+    ):
+        pytest.skip("Not an AutoModel expert-parallel recipe")
+
+    backend = dtensor_cfg.automodel_kwargs.backend
+    assert "enable_deepep" not in backend
+    assert backend.get("dispatcher") in {"hybridep", "torch"}
+    if backend.dispatcher == "hybridep":
+        assert backend.get("experts") is not None, (
+            f"{config_file}: HybridEP must explicitly select an experts backend"
+        )
+        assert config.policy.make_sequence_length_divisible_by % 64 == 0, (
+            f"{config_file}: HybridEP input width must be padded to a multiple of 64"
+        )
