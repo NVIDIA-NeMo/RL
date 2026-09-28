@@ -1652,6 +1652,29 @@ ray_node_gram_used{{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"}} {80.0 * 1024}
                 # Verify flush was called (flush_interval elapsed)
                 mock_flush.assert_called_once()
 
+    @patch("nemo_rl.utils.logger.ray")
+    def test_sampled_memory_peak_is_cumulative(self, mock_ray, monkeypatch):
+        monkeypatch.setenv("NRL_LOG_GPU_MEM", "1")
+        monitor = RayGpuMonitorLogger(
+            collection_interval=10.0,
+            flush_interval=60.0,
+            metric_prefix="ray",
+            step_metric="ray/ray_step",
+            parent_logger=None,
+        )
+
+        first = {
+            "node.0.gpu.0.mem_gb": 70.0,
+            "node.1.gpu.0.mem_gb": 82.5,
+            "node.0.mem_gb": 100.0,
+        }
+        monitor._add_sampled_memory_peak(first)
+        assert first["cluster.gpu.mem_gb_sampled_peak"] == 82.5
+
+        second = {"node.0.gpu.0.mem_gb": 79.0}
+        monitor._add_sampled_memory_peak(second)
+        assert second["cluster.gpu.mem_gb_sampled_peak"] == 82.5
+
     @patch("nemo_rl.utils.logger.WandbLogger")
     @patch("nemo_rl.utils.logger.TensorboardLogger")
     @patch("nemo_rl.utils.logger.RayGpuMonitorLogger")

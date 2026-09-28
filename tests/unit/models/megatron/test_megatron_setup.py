@@ -679,6 +679,27 @@ class TestApplyModelOverrides:
                 {"tensor_model_parallel_size": 2},
             )
 
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "moe_mlp_glu_interleave_size",
+            "use_grouped_gemm_for_shared_expert",
+            "moe_shared_expert_glu_interleave_size",
+            "use_transformer_engine_op_fuser",
+        ],
+    )
+    def test_cutedsl_moe_fields_are_first_class(self, field):
+        """CuTeDSL MoE settings must not be hidden in model_overrides."""
+        from nemo_rl.models.megatron.setup import (
+            _validate_model_override_conflicts,
+        )
+
+        with pytest.raises(ValueError, match=rf"model_overrides\.{field} conflicts"):
+            _validate_model_override_conflicts(
+                {"model_overrides": {field: True}},
+                {field: True},
+            )
+
 
 @pytest.mark.mcore
 class TestApplyParallelismConfig:
@@ -886,6 +907,91 @@ class TestApplyMoeConfig:
         _apply_moe_config(model_cfg, config)
 
         assert not hasattr(model_cfg, "moe_grouped_gemm")
+
+    @pytest.mark.parametrize("interleave_size", [32, None])
+    def test_moe_mlp_glu_interleave_size_explicit(self, interleave_size):
+        """The routed-expert GLU layout is forwarded when explicitly set."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        model_cfg = MagicMock()
+        megatron_cfg = self._base_moe_megatron_cfg()
+        megatron_cfg["moe_mlp_glu_interleave_size"] = interleave_size
+
+        _apply_moe_config(model_cfg, {"megatron_cfg": megatron_cfg})
+
+        assert model_cfg.moe_mlp_glu_interleave_size is interleave_size
+
+    @pytest.mark.parametrize("enabled", [True, False])
+    def test_grouped_gemm_for_shared_expert_explicit(self, enabled):
+        """The shared-expert grouped-GEMM setting is explicitly forwarded."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        model_cfg = MagicMock()
+        megatron_cfg = self._base_moe_megatron_cfg()
+        megatron_cfg["use_grouped_gemm_for_shared_expert"] = enabled
+
+        _apply_moe_config(model_cfg, {"megatron_cfg": megatron_cfg})
+
+        assert model_cfg.use_grouped_gemm_for_shared_expert is enabled
+
+    @pytest.mark.parametrize("interleave_size", [32, None])
+    def test_shared_expert_glu_interleave_size_explicit(self, interleave_size):
+        """The shared-expert GLU layout is explicitly forwarded."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        model_cfg = MagicMock()
+        megatron_cfg = self._base_moe_megatron_cfg()
+        megatron_cfg["use_grouped_gemm_for_shared_expert"] = True
+        megatron_cfg["moe_shared_expert_glu_interleave_size"] = interleave_size
+
+        _apply_moe_config(model_cfg, {"megatron_cfg": megatron_cfg})
+
+        assert model_cfg.moe_shared_expert_glu_interleave_size is interleave_size
+
+    def test_shared_expert_glu_interleave_requires_grouped_gemm(self):
+        """A shared GLU layout without its grouped kernel fails during setup."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        model_cfg = MagicMock()
+        megatron_cfg = self._base_moe_megatron_cfg()
+        megatron_cfg["use_grouped_gemm_for_shared_expert"] = False
+        megatron_cfg["moe_shared_expert_glu_interleave_size"] = 32
+
+        with pytest.raises(
+            ValueError, match="requires use_grouped_gemm_for_shared_expert=True"
+        ):
+            _apply_moe_config(model_cfg, {"megatron_cfg": megatron_cfg})
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "moe_mlp_glu_interleave_size",
+            "use_grouped_gemm_for_shared_expert",
+            "moe_shared_expert_glu_interleave_size",
+        ],
+    )
+    def test_optional_grouped_glu_fields_absent_keep_defaults(self, field):
+        """Omitted grouped-GLU settings preserve model-provider defaults."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        model_cfg = MagicMock(
+            spec=[
+                "expert_tensor_parallel_size",
+                "expert_model_parallel_size",
+                "moe_router_dtype",
+                "moe_router_load_balancing_type",
+                "moe_router_bias_update_rate",
+                "moe_permute_fusion",
+                "moe_enable_deepep",
+                "moe_token_dispatcher_type",
+                "moe_shared_expert_overlap",
+                "moe_enable_routing_replay",
+            ]
+        )
+
+        _apply_moe_config(model_cfg, {"megatron_cfg": self._base_moe_megatron_cfg()})
+
+        assert not hasattr(model_cfg, field)
 
     def test_hybridep_input_prepadding_wins_after_bridge_validation(self):
         from nemo_rl.models.megatron import setup
@@ -2157,6 +2263,32 @@ class TestApplyPerformanceConfig:
 
         assert model_cfg.cuda_graph_modules == ["attn"]
         assert model_cfg.cuda_graph_warmup_steps == 1
+
+    @pytest.mark.parametrize("enabled", [True, False])
+    def test_transformer_engine_op_fuser_explicit(self, enabled):
+        """The TE operation-fuser setting is forwarded when explicitly set."""
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        model_cfg = SimpleNamespace(gated_linear_unit=True)
+        config = self._config()
+        config["megatron_cfg"]["use_transformer_engine_op_fuser"] = enabled
+
+        _apply_performance_config(model_cfg, config)
+
+        assert model_cfg.use_transformer_engine_op_fuser is enabled
+
+    def test_omitted_transformer_engine_op_fuser_preserves_model_config(self):
+        """An omitted operation-fuser setting keeps the provider's value."""
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        model_cfg = SimpleNamespace(
+            gated_linear_unit=True,
+            use_transformer_engine_op_fuser=True,
+        )
+
+        _apply_performance_config(model_cfg, self._config())
+
+        assert model_cfg.use_transformer_engine_op_fuser is True
 
     def test_basic_performance_config(self):
         """Test applying basic performance configuration."""

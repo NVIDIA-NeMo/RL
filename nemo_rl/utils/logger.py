@@ -755,6 +755,35 @@ class RayGpuMonitorLogger:
         self.collection_thread: Optional[threading.Thread] = None
         self.lock = threading.Lock()
         self.start_time: float = float("-inf")
+        self.report_memory_peaks = os.getenv("NRL_LOG_GPU_MEM", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self.cluster_gpu_memory_peak_gb = 0.0
+
+    def _add_sampled_memory_peak(self, metrics: dict[str, Any]) -> None:
+        """Add the cumulative maximum of Ray's sampled per-GPU memory gauges."""
+        if not self.report_memory_peaks:
+            return
+        gpu_memory_values = [
+            float(value)
+            for name, value in metrics.items()
+            if re.fullmatch(r"node\.\d+\.gpu\.\d+\.mem_gb", name)
+            and isinstance(value, (int, float))
+        ]
+        if not gpu_memory_values:
+            return
+        self.cluster_gpu_memory_peak_gb = max(
+            self.cluster_gpu_memory_peak_gb,
+            *gpu_memory_values,
+        )
+        # Ray's device-memory gauge is sampled, so keep the metric name explicit
+        # about what this peak means. Emitting the cumulative maximum on every
+        # sample preserves it in the final W&B summary and in runs stopped
+        # before a graceful final flush.
+        metrics["cluster.gpu.mem_gb_sampled_peak"] = self.cluster_gpu_memory_peak_gb
 
     def start(self) -> None:
         """Start the GPU monitoring thread."""
@@ -797,6 +826,7 @@ class RayGpuMonitorLogger:
                 # Collect metrics with timing information
                 metrics = self._collect_metrics()
                 if metrics:
+                    self._add_sampled_memory_peak(metrics)
                     with self.lock:
                         self.metrics_buffer.append(
                             {

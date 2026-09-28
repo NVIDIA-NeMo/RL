@@ -13,6 +13,7 @@
 # limitations under the License.
 import copy
 import gc
+import importlib.metadata
 import logging
 import os
 import re
@@ -121,7 +122,7 @@ from nemo_rl.models.megatron.train import (
     aggregate_training_statistics,
     megatron_forward_backward,
 )
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import Fp8Config, PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
@@ -165,6 +166,367 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
 )
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
+
+
+def _cutedsl_grouped_mlp_execution_plans(
+    model: torch.nn.Module,
+) -> list[tuple[str, tuple[str, ...], tuple[str, ...]]]:
+    """Return the realized TE operation-fuser plans for grouped MoE MLPs.
+
+    Transformer Engine builds and fuses a ``Sequential`` lazily on its first
+    forward. Merely enabling Megatron's op-fuser config therefore does not
+    prove that TE selected a CuTeDSL grouped-MLP operation. This helper reads
+    the realized plan after a forward/backward pass so benchmark smoke tests
+    can fail loudly when TE falls back to unfused basic operations.
+    """
+    plans = []
+    for module in model.modules():
+        if module.__class__.__name__ != "TEGroupedMLP" or not getattr(
+            module, "_with_fused_impl", False
+        ):
+            continue
+
+        fused_ops = getattr(module, "_fused_ops", None)
+        if not fused_ops:
+            plans.append((module.__class__.__name__, (), ()))
+            continue
+
+        (sequential,) = fused_ops
+        forward_ops = []
+        backward_ops = []
+        for group in getattr(sequential, "_module_groups", None) or ():
+            for op, basic_op_indices in getattr(group, "_forward_ops", ()):
+                # Do not assume that a grouped-MLP fused op spans all three
+                # basic operations.  TE's SwiGLU and unary/SReLU matchers can
+                # represent their realized plans with different index spans.
+                # The fused operation class name is the reliable selector;
+                # include the indices so a failed smoke test is diagnostic.
+                forward_ops.append(
+                    f"{op.__class__.__name__}{tuple(basic_op_indices)!r}"
+                )
+            for op, basic_op_indices in getattr(group, "_backward_ops", ()):
+                backward_ops.append(
+                    f"{op.__class__.__name__}{tuple(basic_op_indices)!r}"
+                )
+        plans.append(
+            (
+                module.__class__.__name__,
+                tuple(sorted(set(forward_ops))),
+                tuple(sorted(set(backward_ops))),
+            )
+        )
+    return plans
+
+
+def _cutedsl_grouped_mlp_failure_diagnostics(model: torch.nn.Module) -> dict[str, Any]:
+    """Collect compact diagnostics after TE declines joint grouped-MLP fusion.
+
+    This is deliberately called only by the fail-closed benchmark check. It
+    avoids adding work to successful training steps while distinguishing the
+    common fallback causes: a stale actor environment, an unsupported device or
+    kernel import, a missing active block-scaling recipe, and ineligible MLP
+    dimensions.
+    """
+
+    diagnostics: dict[str, Any] = {
+        "nvte_env": os.getenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP"),
+    }
+
+    package_versions = {}
+    for distribution in (
+        "transformer-engine",
+        "nvidia-cudnn-frontend",
+        "nvidia-cutlass-dsl",
+    ):
+        try:
+            package_versions[distribution] = importlib.metadata.version(distribution)
+        except importlib.metadata.PackageNotFoundError:
+            package_versions[distribution] = "not-installed"
+    diagnostics["packages"] = package_versions
+
+    try:
+        device = torch.cuda.current_device()
+        diagnostics["cuda"] = {
+            "device": device,
+            "name": torch.cuda.get_device_name(device),
+            "capability": torch.cuda.get_device_capability(device),
+        }
+    except Exception as exc:  # pragma: no cover - requires a broken CUDA runtime
+        diagnostics["cuda"] = f"{type(exc).__name__}: {exc}"
+
+    first_sequential = None
+    for module in model.modules():
+        if module.__class__.__name__ != "TEGroupedMLP" or not getattr(
+            module, "_with_fused_impl", False
+        ):
+            continue
+        fused_ops = getattr(module, "_fused_ops", None)
+        if fused_ops:
+            (first_sequential,) = fused_ops
+            break
+
+    if first_sequential is not None:
+        basic_ops = []
+        try:
+            sequential_ops = list(first_sequential)
+        except TypeError:
+            sequential_ops = []
+        for op in sequential_ops:
+            details: dict[str, Any] = {"type": op.__class__.__name__}
+            for attr in (
+                "num_groups",
+                "num_gemms",
+                "in_features",
+                "out_features",
+                "glu_interleave_size",
+            ):
+                value = getattr(op, attr, None)
+                if isinstance(value, (bool, int, float, str)) or value is None:
+                    details[attr] = value
+            basic_ops.append(details)
+        diagnostics["first_basic_ops"] = basic_ops
+
+        recipe_types = []
+        for group in getattr(first_sequential, "_module_groups", None) or ():
+            recipe_type = getattr(group, "recipe_type", None)
+            recipe_types.append(
+                getattr(recipe_type, "__name__", str(recipe_type))
+                if recipe_type is not None
+                else None
+            )
+        diagnostics["recipe_types"] = recipe_types
+
+    try:
+        from transformer_engine.pytorch.ops.fused import grouped_mlp
+        from transformer_engine.pytorch.ops.fuser import OperationFuser
+
+        support = {}
+        for name, candidate in vars(grouped_mlp).items():
+            if "GroupedMLP" not in name or "CuTeGEMM" not in name:
+                continue
+            checker = getattr(candidate, "is_supported", None)
+            if not callable(checker):
+                continue
+            try:
+                support[name] = bool(checker())
+            except Exception as exc:  # pragma: no cover - depends on TE installation
+                support[name] = f"{type(exc).__name__}: {exc}"
+        diagnostics["te_support"] = support
+        diagnostics["registered_joint_fusions"] = [
+            f"{func.__module__}.{getattr(func, '__qualname__', func.__name__)}"
+            for func in OperationFuser.forward_backward_fusion_functions
+            if "grouped_mlp" in func.__module__
+        ]
+    except Exception as exc:  # pragma: no cover - depends on TE installation
+        diagnostics["te_diagnostic_error"] = f"{type(exc).__name__}: {exc}"
+
+    return diagnostics
+
+
+def _canonicalize_refit_glu_weight(
+    fused_weight: torch.Tensor,
+    *,
+    interleave_size: int,
+    param_name: str,
+) -> torch.Tensor:
+    """Restore an interleaved fused GLU weight to contiguous ``[gate; up]``.
+
+    Megatron's fused grouped-MLP path stores FC1 as alternating fixed-size
+    gate/up blocks. Hugging Face refit consumers expect the complete gate
+    projection followed by the complete up projection.
+    """
+    if (
+        isinstance(interleave_size, bool)
+        or not isinstance(interleave_size, int)
+        or interleave_size <= 0
+    ):
+        raise ValueError(
+            f"GLU interleave size for {param_name} must be a positive integer, "
+            f"got {interleave_size!r}."
+        )
+
+    rows_per_pair = 2 * interleave_size
+    # Ordinary expert weights are [rows, hidden], while grouped weights are
+    # [experts, rows, hidden]. Biases omit the hidden dimension, so their row
+    # dimension is always last: [rows] or [experts, rows]. The parameter name
+    # disambiguates a 2-D grouped bias from a 2-D ordinary weight.
+    is_bias = re.search(r"(?:^|\.)bias\d*$", param_name) is not None
+    row_dim = fused_weight.ndim - 1 if is_bias else fused_weight.ndim - 2
+    row_dim = max(row_dim, 0)
+    row_count = fused_weight.shape[row_dim] if fused_weight.ndim else 0
+    if fused_weight.ndim == 0 or row_count % rows_per_pair != 0:
+        raise ValueError(
+            f"Cannot de-interleave {param_name} with shape "
+            f"{tuple(fused_weight.shape)}: projection-row dimension must be divisible by "
+            f"2 * interleave_size ({rows_per_pair})."
+        )
+
+    shape = fused_weight.shape
+    canonical = (
+        fused_weight.reshape(
+            *shape[:row_dim],
+            row_count // rows_per_pair,
+            2,
+            interleave_size,
+            *shape[row_dim + 1 :],
+        )
+        .transpose(row_dim, row_dim + 1)
+        .contiguous()
+        .reshape(shape)
+    )
+    return canonical
+
+
+class _InterleavedGatedMLPRefitMapping:
+    """NeMo-RL-only export adapter for Megatron's interleaved GLU layout."""
+
+    def __init__(self, mapping: Any, interleave_size: int) -> None:
+        self.base_mapping = mapping
+        self.interleave_size = interleave_size
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.base_mapping, name)
+
+    def local_hf_param_specs(
+        self, global_param_name: Optional[str] = None
+    ) -> tuple[Any, ...]:
+        """Describe HF projections selected after refit deinterleaving."""
+        return self.base_mapping.local_hf_param_specs(global_param_name)
+
+    def _canonicalize(
+        self, megatron_weights: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        if megatron_weights is None:
+            return None
+        # Apply the same logical-weight conversion used by non-interleaved refit
+        # before changing the GLU row layout.  In particular, MXFP8 data and
+        # scales must be consumed together by TE dequantization; applying the
+        # row permutation directly to physical quantized storage would detach
+        # the data from its scale tiles.  The helper also handles TE's packed
+        # GroupedTensor parameter representation.
+        megatron_weights = _dequantize_refit_source(megatron_weights)
+        return _canonicalize_refit_glu_weight(
+            megatron_weights,
+            interleave_size=self.interleave_size,
+            param_name=self.base_mapping.megatron_param,
+        )
+
+    def megatron_to_hf(
+        self,
+        megatron_weights: Optional[torch.Tensor],
+        megatron_module: Optional[torch.nn.Module],
+    ) -> dict[str, torch.Tensor]:
+        """Delegate export after restoring the canonical FC1 row layout."""
+        return self.base_mapping.megatron_to_hf(
+            self._canonicalize(megatron_weights), megatron_module
+        )
+
+
+def _refit_glu_interleave_size(mapping: Any, model_cfg: Any) -> Optional[int]:
+    """Return the finalized model's interleave size when a mapping needs it."""
+    from megatron.bridge.models.conversion.param_mapping import (
+        FusedGatedExpertMapping,
+        GatedMLPMapping,
+    )
+
+    if isinstance(mapping, _InterleavedGatedMLPRefitMapping):
+        return mapping.interleave_size
+
+    is_shared_expert = False
+    if isinstance(mapping, FusedGatedExpertMapping):
+        config_key = "moe_mlp_glu_interleave_size"
+    elif isinstance(mapping, GatedMLPMapping):
+        if ".shared_experts." in mapping.megatron_param:
+            config_key = "moe_shared_expert_glu_interleave_size"
+            is_shared_expert = True
+        elif mapping.is_expert:
+            config_key = "moe_mlp_glu_interleave_size"
+        elif (
+            os.environ.get("USE_ACT_FUSION_FOR_DENSE", "0") == "1"
+            and "mlp" in mapping.megatron_param
+        ):
+            # Megatron-Bridge applies the routed GLU interleave size to dense
+            # MLP checkpoint tensors under this opt-in environment setting.
+            config_key = "moe_mlp_glu_interleave_size"
+        else:
+            return None
+    else:
+        return None
+
+    interleave_size = getattr(model_cfg, config_key, None)
+    if interleave_size is None:
+        return None
+    if (
+        isinstance(interleave_size, bool)
+        or not isinstance(interleave_size, int)
+        or interleave_size <= 0
+    ):
+        raise ValueError(
+            f"{config_key} must be a positive integer or null, got {interleave_size!r}."
+        )
+    if is_shared_expert and not model_cfg.use_grouped_gemm_for_shared_expert:
+        raise ValueError(
+            "moe_shared_expert_glu_interleave_size requires "
+            "use_grouped_gemm_for_shared_expert=True before shared-expert "
+            "weights can be de-interleaved for refit."
+        )
+    return interleave_size
+
+
+def _wrap_interleaved_refit_tasks(
+    conversion_tasks: Iterable[Any], model_cfg: Any
+) -> list[Any]:
+    """Attach NeMo RL's layout adapter to interleaved GLU refit tasks."""
+    wrapped_tasks = []
+    for task in conversion_tasks:
+        interleave_size = _refit_glu_interleave_size(task.mapping, model_cfg)
+        if interleave_size is None or isinstance(
+            task.mapping, _InterleavedGatedMLPRefitMapping
+        ):
+            wrapped_tasks.append(task)
+            continue
+        wrapped_tasks.append(
+            replace(
+                task,
+                mapping=_InterleavedGatedMLPRefitMapping(task.mapping, interleave_size),
+            )
+        )
+    return wrapped_tasks
+
+
+def _validate_refit_fp8_param_interleave(
+    model_cfg: Any,
+    fp8_cfg: Optional[Fp8Config],
+    refit_payload_mode: RefitPayloadMode,
+) -> None:
+    """Reject physical FP8 exports whose scale layout cannot be transformed."""
+    if (
+        refit_payload_mode == "logical_weights"
+        or fp8_cfg is None
+        or not fp8_cfg.get("enabled", False)
+        or not fp8_cfg.get("fp8_param", False)
+    ):
+        return
+
+    interleaved_fields = [
+        name
+        for name in (
+            "moe_mlp_glu_interleave_size",
+            "moe_shared_expert_glu_interleave_size",
+        )
+        if getattr(model_cfg, name, None) is not None
+    ]
+    # MXFP8 refit uses standard logical conversion tasks rather than Bridge's
+    # physical data/scale export tasks.  Its live parameter is dequantized with
+    # the same helper as the non-interleaved path, then the resulting BF16
+    # logical weight is de-interleaved.  Other FP8 recipes may retain a physical
+    # data + scale payload, which still needs a scale-aware layout transform.
+    if interleaved_fields and fp8_cfg.get("fp8_recipe") != "mxfp8":
+        raise NotImplementedError(
+            "Refit does not support fp8_param=True with interleaved GLU weights "
+            f"({', '.join(interleaved_fields)}). The FP8 data and scale tensors "
+            "must be de-interleaved together for physical FP8 export."
+        )
 
 
 def _should_use_router_replay(
@@ -322,6 +684,16 @@ class _QuantizedRefitSource:
 
     tensor: torch.Tensor
     spec: Any
+
+
+@dataclass(frozen=True)
+class _InterleavedRefitSource:
+    """A live interleaved parameter plus its canonical Bridge projection."""
+
+    tensor: torch.Tensor
+    spec: Any
+    interleave_size: int
+    param_name: str
 
 
 @dataclass(frozen=True)
@@ -964,6 +1336,48 @@ class MegatronPolicyWorkerImpl(
             self.megatron_cfg.optimizer, "reuse_grad_buf_for_mxfp8_param_ag", False
         ) and getattr(self.megatron_cfg.ddp, "overlap_param_gather", False)
 
+    def _verify_cutedsl_grouped_mlp_execution_plan(self) -> None:
+        """Assert once that TE selected joint CuTeDSL grouped-MLP operations."""
+        if os.getenv("NRL_VERIFY_CUTEDSL_GROUPED_MLP") != "1" or getattr(
+            self, "_cutedsl_grouped_mlp_plan_verified", False
+        ):
+            return
+
+        plans = _cutedsl_grouped_mlp_execution_plans(self.model)
+        if not plans:
+            raise RuntimeError(
+                "NRL_VERIFY_CUTEDSL_GROUPED_MLP=1, but no op-fuser-enabled "
+                "TEGroupedMLP modules were found."
+            )
+
+        failures = [
+            plan
+            for plan in plans
+            if not any("GroupedMLP_CuTeGEMM" in name for name in plan[1])
+            or not any("GroupedMLP_CuTeGEMM" in name for name in plan[2])
+        ]
+        if failures:
+            unique_failures = [
+                (failures.count(plan), plan) for plan in dict.fromkeys(failures)
+            ]
+            diagnostics = _cutedsl_grouped_mlp_failure_diagnostics(self.model)
+            raise RuntimeError(
+                "Transformer Engine did not select joint CuTeDSL grouped-MLP "
+                "forward/backward operations for every routed MLP: "
+                f"failed_modules={len(failures)} unique_plans={unique_failures!r} "
+                f"diagnostics={diagnostics!r}"
+            )
+
+        unique_forward = sorted({name for _, names, _ in plans for name in names})
+        unique_backward = sorted({name for _, _, names in plans for name in names})
+        print(
+            "[cutedsl-plan] verified "
+            f"rank={self.rank} modules={len(plans)} "
+            f"forward={unique_forward} backward={unique_backward}",
+            flush=True,
+        )
+        self._cutedsl_grouped_mlp_plan_verified = True
+
     def _get_model_extra_state_dict(self) -> dict[str, Any]:
         fp8_enabled = self.fp8_cfg and self.fp8_cfg.get("enabled", False)
         if not fp8_enabled:
@@ -1243,6 +1657,8 @@ class MegatronPolicyWorkerImpl(
                             use_router_replay=use_router_replay,
                             router_replay_train=not eval_mode,
                         )
+
+                    self._verify_cutedsl_grouped_mlp_execution_plan()
 
                 # Clear mtp_grad_scale_func after the forward-backward pass so
                 # it doesn't get serialized in the run_config.yaml when saving
@@ -1606,29 +2022,40 @@ class MegatronPolicyWorkerImpl(
         torch counters do not see.
 
         Resetting the peak counters is observable to anything else reading them,
-        so skip the whole body when the level is off rather than sampling and
-        discarding. Run with ``NRL_LOG_LEVEL=DEBUG`` to turn these on.
+        so skip the whole body when reporting is off rather than sampling and
+        discarding. Run with ``NRL_LOG_LEVEL=DEBUG`` for debug logging, or set
+        ``NRL_LOG_GPU_MEM=1`` for an always-visible benchmark record without
+        enabling verbose debug logs globally.
 
         Args:
             tag: Phase-boundary name this sample belongs to.
         """
-        if not torch.cuda.is_available() or not log.isEnabledFor(logging.DEBUG):
+        force_report = os.getenv("NRL_LOG_GPU_MEM", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if not torch.cuda.is_available() or not (
+            force_report or log.isEnabledFor(logging.DEBUG)
+        ):
             return
         dev = torch.cuda.current_device()
         gib = float(1024**3)
         free_b, total_b = torch.cuda.mem_get_info(dev)
-        log.debug(
-            "[gpumem] tag=%s rank=%d alloc=%.2f max_alloc=%.2f reserved=%.2f "
-            "max_reserved=%.2f driver_used=%.2f total=%.2f",
-            tag,
-            self.rank,
-            torch.cuda.memory_allocated(dev) / gib,
-            torch.cuda.max_memory_allocated(dev) / gib,
-            torch.cuda.memory_reserved(dev) / gib,
-            torch.cuda.max_memory_reserved(dev) / gib,
-            (total_b - free_b) / gib,
-            total_b / gib,
+        message = (
+            f"[gpumem] tag={tag} rank={self.rank} "
+            f"alloc={torch.cuda.memory_allocated(dev) / gib:.2f} "
+            f"max_alloc={torch.cuda.max_memory_allocated(dev) / gib:.2f} "
+            f"reserved={torch.cuda.memory_reserved(dev) / gib:.2f} "
+            f"max_reserved={torch.cuda.max_memory_reserved(dev) / gib:.2f} "
+            f"driver_used={(total_b - free_b) / gib:.2f} "
+            f"total={total_b / gib:.2f}"
         )
+        if force_report:
+            print(message, flush=True)
+        else:
+            log.debug(message)
         torch.cuda.reset_peak_memory_stats(dev)
 
     def _restore_saved_mcore_hooks(self, state: dict[str, Any]) -> None:
@@ -1903,6 +2330,8 @@ class MegatronPolicyWorkerImpl(
                     use_router_replay=use_router_replay,
                     router_replay_train=True,
                 )
+
+        self._verify_cutedsl_grouped_mlp_execution_plan()
 
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
             torch.cuda.empty_cache()
@@ -3150,14 +3579,21 @@ class MegatronPolicyWorkerImpl(
         # Deferred import to avoid circular import issues.
         from nemo_rl.models.megatron.draft import draft_model_detached
 
+        model_cfg = self._get_model_config()
+        _validate_refit_fp8_param_interleave(
+            model_cfg, self.fp8_cfg, self.refit_payload_mode
+        )
+
         with draft_model_detached([self.model]):
             if self._is_fp8_export() and self.refit_payload_mode != "logical_weights":
-                return self.megatron_bridge.get_export_fp8_tasks(self.model)
-            return [
-                task
-                for task in self.megatron_bridge.get_conversion_tasks([self.model])
-                if task is not None
-            ]
+                conversion_tasks = self.megatron_bridge.get_export_fp8_tasks(self.model)
+            else:
+                conversion_tasks = [
+                    task
+                    for task in self.megatron_bridge.get_conversion_tasks([self.model])
+                    if task is not None
+                ]
+        return _wrap_interleaved_refit_tasks(conversion_tasks, model_cfg)
 
     def _calculate_refit_param_info(self) -> list[tuple[str, int]]:
         """Calculate parameter information for refit.
@@ -3330,9 +3766,23 @@ class MegatronPolicyWorkerImpl(
             yield param_name, scale_tensor
 
     def _local_refit_source_spec(
-        self, tensor: torch.Tensor, spec: Any
+        self,
+        tensor: torch.Tensor,
+        spec: Any,
+        *,
+        mapping: Any,
+        param_name: str,
     ) -> LocalParamSpec:
-        """Build a live source spec for a BF16 or TE-quantized parameter."""
+        """Build a live source spec with any deferred layout conversion."""
+        if isinstance(mapping, _InterleavedGatedMLPRefitMapping):
+            return LocalParamSpec(
+                base=_InterleavedRefitSource(
+                    tensor=tensor,
+                    spec=spec,
+                    interleave_size=mapping.interleave_size,
+                    param_name=param_name,
+                )
+            )
         if not _is_quantized_refit_source(tensor):
             return LocalParamSpec(base=spec.select(tensor))
 
@@ -3341,23 +3791,39 @@ class MegatronPolicyWorkerImpl(
     def _materialize_local_refit_spec(
         self,
         spec: LocalParamSpec,
-        logical_source_cache: dict[int, torch.Tensor],
+        source_cache: dict[tuple[str, int, int], torch.Tensor],
     ) -> RefitCtx:
-        """Materialize one local source, reusing quantized-source dequantization within a layer."""
+        """Materialize one source, caching conversions within the current layer."""
         base = spec.base
         if isinstance(base, _QuantizedRefitSource):
-            source_id = id(base.tensor)
-            logical = logical_source_cache.get(source_id)
+            cache_key = ("logical", id(base.tensor), 0)
+            logical = source_cache.get(cache_key)
             if logical is None:
                 logical = _dequantize_refit_source(base.tensor)
-                logical_source_cache[source_id] = logical
+                source_cache[cache_key] = logical
             return RefitCtx(buf=base.spec.select(logical).contiguous())
+        if isinstance(base, _InterleavedRefitSource):
+            cache_key = (
+                "interleaved",
+                id(base.tensor),
+                base.interleave_size,
+            )
+            canonical = source_cache.get(cache_key)
+            if canonical is None:
+                logical = _dequantize_refit_source(base.tensor)
+                canonical = _canonicalize_refit_glu_weight(
+                    logical,
+                    interleave_size=base.interleave_size,
+                    param_name=base.param_name,
+                )
+                source_cache[cache_key] = canonical
+            return RefitCtx(buf=base.spec.select(canonical).contiguous())
         if isinstance(base, _GroupedRefitSource):
             return RefitCtx(
                 buf=torch.stack(
                     [
                         self._materialize_local_refit_spec(
-                            expert_spec, logical_source_cache
+                            expert_spec, source_cache
                         ).buf
                         for expert_spec in base.specs
                     ]
@@ -3378,7 +3844,8 @@ class MegatronPolicyWorkerImpl(
         Unlike ``_iter_params_with_optional_kv_scales`` (PP broadcast + TP gather
         via ``export_hf_weights``), this yields TP-local source specs directly
         from the Megatron params — no collectives. BF16 specs retain live tensor
-        views; quantized specs materialize logical BF16 during each refit. EP:
+        views; quantized and interleaved specs materialize a canonical logical
+        source once per layer and refit. EP:
         ``refit_conversion_tasks`` already holds only this rank's local experts;
         PP non-local params have ``param_weight is None``.
 
@@ -3408,7 +3875,12 @@ class MegatronPolicyWorkerImpl(
                 if is_nccl_reshard_param(spec.name):
                     yield (
                         spec.name,
-                        self._local_refit_source_spec(local_tensor, spec),
+                        self._local_refit_source_spec(
+                            local_tensor,
+                            spec,
+                            mapping=task.mapping,
+                            param_name=task.global_param_name,
+                        ),
                     )
 
     # ------------------------------------------------------------------
@@ -3444,9 +3916,7 @@ class MegatronPolicyWorkerImpl(
             raise ValueError(f"Unsupported SGLang target precision: {target_precision}")
 
         if self.refit_conversion_tasks is None:
-            self.refit_conversion_tasks = self.megatron_bridge.get_conversion_tasks(
-                [self.model]
-            )
+            self.refit_conversion_tasks = self._build_refit_conversion_tasks()
 
         return iter_named_tensor_buckets(
             self._iter_params_with_optional_kv_scales(include_draft=False),
@@ -3987,8 +4457,9 @@ class MegatronPolicyWorkerImpl(
         - grouped MoE expert: ``base`` holds the ordered per-expert specs, which
           are materialized and stacked into ``[E_local, ...]`` each refit.
         """
-        # This rank's local TP/EP HF param shards (live views), and the
-        # per-expert views grouped for torch.stack.  Build-time only.
+        # This rank's local TP/EP HF param sources (live views or dynamic
+        # interleave adapters), and the per-expert sources grouped for stacking.
+        # Build-time only; dynamic adapters run from pre() on every refit.
         param_map = dict(self._iter_local_hf_param_shards())
         expert_groups = self._build_expert_groups(param_map)
 
@@ -4121,15 +4592,16 @@ class MegatronPolicyWorkerImpl(
         # Keep this local because xferdtensor probes optional NCCL M-to-N bindings.
         from nemo_rl.weight_sync.xferdtensor import DTensorRef, xferdtensor
 
-        # MXFP8 source dequantization, grouped-MoE stacking, and spec.post enqueue
-        # on this worker's current stream; xferdtensor uses the same stream.
+        # Source dequantization/deinterleaving, grouped-MoE stacking, and
+        # spec.post enqueue run on this worker's current stream; xferdtensor
+        # uses the same stream.
         nccl_reshard_stream = torch.cuda.current_stream()
         for layer_name in self.nccl_reshard_refit_info["layer_names"]:
             # Gate/up and grouped expert specs in one logical layer can share a
             # training parameter. Keep those materializations only until every
             # parameter in the layer has been enqueued, rather than retaining a
             # model-sized BF16 cache for the full refit.
-            logical_source_cache: dict[int, torch.Tensor] = {}
+            source_cache: dict[tuple[str, int, int], torch.Tensor] = {}
             try:
                 for param_info in self.nccl_reshard_refit_info["per_layer_params"][
                     layer_name
@@ -4144,7 +4616,7 @@ class MegatronPolicyWorkerImpl(
                     assert spec is not None, (
                         f"no spec for {param_info['name']!r} in hf_to_local_param_map"
                     )
-                    ctx = self._materialize_local_refit_spec(spec, logical_source_cache)
+                    ctx = self._materialize_local_refit_spec(spec, source_cache)
                     assert ctx.buf is not None, (
                         f"no local tensor for {param_info['name']!r}"
                     )
@@ -4166,9 +4638,9 @@ class MegatronPolicyWorkerImpl(
                     # Drop refs to per-param views and grouped tensors promptly.
                     del ctx, src_tensor
             finally:
-                # Never retain stale BF16 materializations across layers or
-                # optimizer steps.
-                logical_source_cache.clear()
+                # Never retain stale materializations across layers or optimizer
+                # steps.
+                source_cache.clear()
 
         sync_stream_within(
             nccl_reshard_stream, refit_timeout_s, "the bulk parameter transfer"
