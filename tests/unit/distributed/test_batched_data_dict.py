@@ -16,6 +16,11 @@ import pytest
 import torch
 
 from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data_plane.schema import (
+    OPD_FULL_HIDDEN_STATES_FIELD,
+    OPD_FULL_LOGITS_FIELD,
+    OPD_FULL_TEACHER_INDEX_FIELD,
+)
 from nemo_rl.distributed.batched_data_dict import (
     BatchedDataDict,
     DynamicBatchingArgs,
@@ -1462,3 +1467,32 @@ def test_sequence_packing_rejects_oversized_preference_pair():
 
     with pytest.raises(ValueError, match="pair group 0 requires 1200 tokens"):
         batch.shard_by_batch_size(shards=2, sequence_packing_args=packing_args)
+
+
+def test_truncate_tensors_narrows_opd_full_payloads_but_never_widens_them():
+    """The teacher payload follows the microbatch seqlen, but only downwards.
+
+    ``materialize`` leaves it at its natural width, which can already be
+    shorter than the microbatch's, so the narrow has to clamp.
+    """
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.arange(12).reshape(2, 6),
+            # Wider than the microbatch seqlen: narrow it.
+            OPD_FULL_HIDDEN_STATES_FIELD: torch.randn(2, 6, 3),
+            # Already shorter than the microbatch seqlen: leave it alone.
+            OPD_FULL_LOGITS_FIELD: torch.randn(2, 3, 5),
+            OPD_FULL_TEACHER_INDEX_FIELD: torch.tensor([1, 0]),
+        }
+    )
+    hidden_before = batch[OPD_FULL_HIDDEN_STATES_FIELD].clone()
+    logits_before = batch[OPD_FULL_LOGITS_FIELD].clone()
+
+    batch.truncate_tensors(dim=1, truncated_len=4)
+
+    assert batch["input_ids"].shape == (2, 4)
+    assert batch[OPD_FULL_HIDDEN_STATES_FIELD].shape == (2, 4, 3)
+    assert torch.equal(batch[OPD_FULL_HIDDEN_STATES_FIELD], hidden_before[:, :4])
+    assert batch[OPD_FULL_LOGITS_FIELD].shape == (2, 3, 5)
+    assert torch.equal(batch[OPD_FULL_LOGITS_FIELD], logits_before)
+    assert batch[OPD_FULL_TEACHER_INDEX_FIELD].shape == (2,)
