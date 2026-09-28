@@ -16,7 +16,32 @@ from typing import Any, Optional
 
 import torch
 
+from nemo_rl.algorithms.loss.interfaces import MetricNormalizer
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
+
+
+def rescale_loss_metrics(
+    metrics: dict[str, Any],
+    normalizers: dict[str, MetricNormalizer],
+    *,
+    token_factor: float,
+    sequence_factor: float,
+) -> dict[str, Any]:
+    """Change global loss denominators while preserving raw counts and extrema.
+
+    Metrics absent from ``normalizers`` are returned unchanged. Unlike
+    split-API normalization of raw sums, this only adjusts denominators
+    explicitly advertised by the loss.
+    """
+    factors = {
+        MetricNormalizer.TOKENS: token_factor,
+        MetricNormalizer.SEQUENCES: sequence_factor,
+        MetricNormalizer.NONE: 1.0,
+    }
+    return {
+        key: value * factors[normalizers[key]] if key in normalizers else value
+        for key, value in metrics.items()
+    }
 
 
 def map_teacher_logits_to_draft_vocab(

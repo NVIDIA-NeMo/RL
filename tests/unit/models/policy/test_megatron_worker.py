@@ -2001,7 +2001,6 @@ def test_megatron_finalize_async_save_releases_colocated_nvrx_cache(
         cfg=SimpleNamespace(
             checkpoint=SimpleNamespace(
                 async_save=True,
-                async_strategy="nvrx",
                 use_persistent_ckpt_worker=True,
                 ckpt_assume_constant_structure=True,
                 async_ckpt_use_cpu_shm=False,
@@ -2022,11 +2021,7 @@ def test_megatron_finalize_async_save_releases_colocated_nvrx_cache(
         def cleanup_tensor_caches(cls):
             events.append(("cleanup_tensor_caches", None))
 
-    monkeypatch.setattr(
-        worker_module,
-        "_get_nvrx_filesystem_writer_cls",
-        lambda: _Writer,
-    )
+    monkeypatch.setattr(worker_module, "FileSystemWriterAsync", _Writer)
     monkeypatch.setattr(
         worker_module.gc, "collect", lambda: events.append(("gc_collect", None))
     )

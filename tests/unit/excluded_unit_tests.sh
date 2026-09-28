@@ -186,9 +186,6 @@ EXCLUDED_UNIT_TESTS=(
     # Megatron — GPU-heavy data tests
     --ignore=unit/models/megatron/test_megatron_data.py
 
-    # DTensor — exclude parallelize_plan_keys (loads HF model configs, ~31-33s per param)
-    --deselect=tests/unit/models/dtensor/test_parallelize.py::test_parallelize_plan_keys
-
     ###########################################################################
     # EXPERIENCE — rollout tests need vLLM setup (~67-91s each).
     # Keep pure Python tests, plus the 3 matches_original tests that guard correctness.
