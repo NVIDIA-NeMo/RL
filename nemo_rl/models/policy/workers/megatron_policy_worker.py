@@ -1870,8 +1870,6 @@ class MegatronPolicyWorkerImpl(
             stage="train",
             require=True,
         )
-        self._add_step_phase("mb_prep", time.monotonic() - prep_started)
-
         if state["calculate_per_token_loss"]:
             # The router's routed-token multiplier remains intact; finish applies
             # the global main-token denominator to every accumulated gradient.
@@ -1920,8 +1918,6 @@ class MegatronPolicyWorkerImpl(
         # chunk's token counts and so it never reaches a serialized config.
         self._set_moe_grad_scale_func(None)
         self._set_mtp_grad_scale_func(None)
-        self._add_step_phase("fwd_bwd", time.monotonic() - fwd_bwd_started)
-
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
             torch.cuda.empty_cache()
         self._log_gpu_mem("chunk_exit")

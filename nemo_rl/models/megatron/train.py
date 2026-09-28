@@ -752,9 +752,9 @@ class LossPostProcessor:
         ) -> Callable[..., Any]:
             if self.calculate_per_token_loss:
                 return prepare_fn
-            cp_group = get_context_parallel_group()
             if get_context_parallel_world_size() == 1:
                 return prepare_fn
+            cp_group = get_context_parallel_group()
 
             def _prepare_and_shard(*args, **kwargs):
                 logits = kwargs.get("logits", args[0] if args else None)
@@ -955,15 +955,13 @@ class LossPostProcessor:
                 )
                 return backward_sum, num_tokens, reporting_metrics
 
+            # Return MCore's native three-value callback before the legacy
+            # per-token-loss wrappers below, which expect a two-value callback.
             return _return_local_sum_and_count
 
         # The remaining wrappers implement NeMo-RL's legacy per-token-loss
         # contract: a two-value callback whose loss needs CP and microbatch
-        # compensation before MCore applies its per-token finalization. Local-mean
-        # mode instead returns MCore's native three-value (sum, count, metrics)
-        # contract above, so it must bypass those wrappers entirely.
-        if not self.calculate_per_token_loss:
-            return loss_fn_wrapped
+        # compensation before MCore applies its per-token finalization.
 
         if self.cp_normalize:
             cp_size = get_context_parallel_world_size()

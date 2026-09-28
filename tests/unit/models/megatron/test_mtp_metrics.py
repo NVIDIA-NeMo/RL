@@ -130,28 +130,6 @@ def test_get_mtp_metrics_default_loss_scale_is_identity(monkeypatch):
     assert get_mtp_metrics()["mtp_1_loss"] == pytest.approx(3.0)
 
 
-@pytest.mark.mcore
-def test_get_mtp_metrics_uses_global_loss_sum_over_rolled_tokens(monkeypatch):
-    """New trackers report SUM(loss numerator) / SUM(rolled valid tokens)."""
-    from nemo_rl.models.megatron.common import get_mtp_metrics
-
-    _seed_tracker(
-        monkeypatch,
-        {
-            # Deliberately inconsistent legacy local-mean aggregate: the raw
-            # numerator/count pair must be authoritative.
-            "loss_values": torch.tensor([99.0]),
-            "_nemo_rl_loss_sums": torch.tensor([50.0]),
-            "correct_values": torch.tensor([4.0]),
-            "total_values": torch.tensor([10.0]),
-        },
-    )
-
-    metrics = get_mtp_metrics(loss_scale=0.01)
-    assert metrics["mtp_1_loss"] == pytest.approx(5.0)
-    assert metrics["mtp_1_acceptance_rate"] == pytest.approx(40.0)
-
-
 def _fake_worker(mtp_num_layers):
     """A minimal stand-in for MegatronPolicyWorkerImpl for calling _collect_mtp_metrics."""
     return SimpleNamespace(
@@ -161,8 +139,8 @@ def _fake_worker(mtp_num_layers):
 
 
 @pytest.mark.mcore
-def test_collect_mtp_metrics_adds_globally_normalized_loss_and_grad_norm(monkeypatch):
-    """_collect_mtp_metrics uses the global tracker ratio and surfaces the MTP grad norm.
+def test_collect_mtp_metrics_scales_loss_and_adds_grad_norm(monkeypatch):
+    """_collect_mtp_metrics passes loss_scale=1/num_microbatches and surfaces the MTP grad norm.
 
     The grad norm is placed inside the mtp_metrics dict as "grad_norm" so grpo.py flattens it
     to mtp/grad_norm (logged as train/mtp/grad_norm).
@@ -186,10 +164,11 @@ def test_collect_mtp_metrics_adds_globally_normalized_loss_and_grad_norm(monkeyp
     mpw.MegatronPolicyWorkerImpl._collect_mtp_metrics(
         _fake_worker(mtp_num_layers=1),
         metrics,
+        total_num_microbatches=8,
         mtp_grad_norm=1.25,
     )
 
-    assert captured["loss_scale"] == pytest.approx(1.0)
+    assert captured["loss_scale"] == pytest.approx(1.0 / 8)
     assert metrics["mtp_metrics"]["mtp_1_loss"] == pytest.approx(0.5)
     assert metrics["mtp_metrics"]["grad_norm"] == pytest.approx(1.25)
 
@@ -209,6 +188,7 @@ def test_collect_mtp_metrics_omits_grad_norm_when_none(monkeypatch):
     mpw.MegatronPolicyWorkerImpl._collect_mtp_metrics(
         _fake_worker(mtp_num_layers=1),
         metrics,
+        total_num_microbatches=4,
         mtp_grad_norm=None,
     )
     assert "grad_norm" not in metrics["mtp_metrics"]
@@ -233,6 +213,7 @@ def test_collect_mtp_metrics_noop_when_mtp_disabled(monkeypatch):
     mpw.MegatronPolicyWorkerImpl._collect_mtp_metrics(
         _fake_worker(mtp_num_layers=0),
         metrics,
+        total_num_microbatches=4,
         mtp_grad_norm=1.0,
     )
     assert "mtp_metrics" not in metrics
