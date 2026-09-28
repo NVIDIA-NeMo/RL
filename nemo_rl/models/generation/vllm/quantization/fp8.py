@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
 import os
 import warnings
 from collections.abc import Callable, Iterable, Iterator, Sequence
@@ -768,6 +767,24 @@ def _quantize_grouped_experts_blockwise(grouped_moe_expert):
     return weight_fp8, scale_inv
 
 
+def _split_grouped_moe_shards(
+    key: str, weight: torch.Tensor
+) -> tuple[str, tuple[tuple[str, torch.Tensor], ...]]:
+    """Split one grouped expert slab into vLLM projection shards."""
+    base, proj = key.rsplit(".", 1)
+    if proj == "gate_up_proj":
+        intermediate = weight.shape[1] // 2
+        shards = (
+            ("gate_proj", weight[:, :intermediate, :]),
+            ("up_proj", weight[:, intermediate:, :]),
+        )
+    elif proj == "down_proj":
+        shards = (("down_proj", weight),)
+    else:
+        raise ValueError(f"Unsupported grouped MoE projection {proj!r} in {key!r}")
+    return base, shards
+
+
 def _expand_grouped_moe_expert_to_fp8(key, weight):
     """Expand a grouped Qwen3.5 MoE expert slab into per-expert FP8 weights.
 
@@ -793,15 +810,7 @@ def _expand_grouped_moe_expert_to_fp8(key, weight):
         A list of ``(name, tensor)`` pairs: for every expert, the FP8 weight and
         its ``_scale_inv`` for each unfused projection.
     """
-    base, proj = key.rsplit(".", 1)
-    if proj == "gate_up_proj":
-        intermediate = weight.shape[1] // 2
-        shards = (
-            ("gate_proj", weight[:, :intermediate, :]),
-            ("up_proj", weight[:, intermediate:, :]),
-        )
-    else:
-        shards = (("down_proj", weight),)
+    base, shards = _split_grouped_moe_shards(key, weight)
 
     entries = []
     # gate/up are dim-1 slices; feed the views directly — per-expert rows stay
@@ -820,15 +829,7 @@ def _expand_grouped_moe_expert_to_mxfp8(
     key: str, weight: torch.Tensor, *, refit_with_reload_api: bool
 ) -> list[tuple[str, torch.Tensor]]:
     """Expand a grouped Qwen3.5 MoE slab into per-expert MXFP8 entries."""
-    base, proj = key.rsplit(".", 1)
-    if proj == "gate_up_proj":
-        intermediate = weight.shape[1] // 2
-        shards = (
-            ("gate_proj", weight[:, :intermediate, :]),
-            ("up_proj", weight[:, intermediate:, :]),
-        )
-    else:
-        shards = (("down_proj", weight),)
+    base, shards = _split_grouped_moe_shards(key, weight)
 
     entries = []
     scale_suffix = "_scale" if refit_with_reload_api else "_scale_from_checkpoint"
@@ -1137,18 +1138,6 @@ def create_weights_mxfp8_moe(
     )
 
 
-def _make_fp8_moe_kernel_compat(make_fp8_moe_kernel, layer, **kwargs):
-    """Call vLLM's kernel factory across its optional ``layer`` argument."""
-    parameters = inspect.signature(make_fp8_moe_kernel).parameters
-    accepts_layer = "layer" in parameters or any(
-        parameter.kind is inspect.Parameter.VAR_KEYWORD
-        for parameter in parameters.values()
-    )
-    if accepts_layer:
-        kwargs["layer"] = layer
-    return make_fp8_moe_kernel(**kwargs)
-
-
 def process_weights_after_loading_moe(self, layer) -> None:
     """This function is used to process the weights after loading for a FusedMoE layer.
 
@@ -1211,9 +1200,7 @@ def process_weights_after_loading_moe(self, layer) -> None:
         from vllm.model_executor.layers.quantization.fp8 import make_fp8_moe_kernel
 
         assert self.experts_cls is not None
-        self.moe_kernel = _make_fp8_moe_kernel_compat(
-            make_fp8_moe_kernel,
-            layer,
+        self.moe_kernel = make_fp8_moe_kernel(
             moe_quant_config=self.moe_quant_config,
             moe_config=self.moe,
             fp8_backend=self.fp8_backend,
@@ -1541,9 +1528,7 @@ def process_weights_after_loading_mxfp8_moe(self, layer) -> None:
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         assert self.moe_quant_config is not None
         assert self.experts_cls is not None
-        self.moe_kernel = _make_fp8_moe_kernel_compat(
-            make_fp8_moe_kernel,
-            layer,
+        self.moe_kernel = make_fp8_moe_kernel(
             moe_quant_config=self.moe_quant_config,
             moe_config=kernel_moe_config,
             fp8_backend=self.mxfp8_backend,
