@@ -272,6 +272,7 @@ class GenericSFTTaskEncoder(BaseSFTTaskEncoder):
         tokenizer: Any | None = None,
         sequence_length_pad_multiple: int = 1,
         only_unmask_final: bool = False,
+        loss_mask_mode: str | None = None,
     ) -> None:
         super().__init__(cooker_functions=cooker_functions)
         self.adapter = adapter
@@ -280,6 +281,7 @@ class GenericSFTTaskEncoder(BaseSFTTaskEncoder):
         self.tokenizer = tokenizer
         self.sequence_length_pad_multiple = sequence_length_pad_multiple
         self.only_unmask_final = only_unmask_final
+        self.loss_mask_mode = loss_mask_mode
 
     @stateless
     def preencode_sample(self, sample: CanonicalSFTSample) -> EncodedSFTSample:
@@ -329,6 +331,7 @@ class GenericSFTTaskEncoder(BaseSFTTaskEncoder):
                 cast(list[PackedSFTSample], samples),
                 tokenizer=self.tokenizer,
                 only_unmask_final=self.only_unmask_final,
+                loss_mask_mode=self.loss_mask_mode,
             )
         if not all(isinstance(sample, EncodedSFTSample) for sample in samples):
             raise TypeError("Energon SFT batches accept only encoded samples.")
@@ -342,6 +345,8 @@ class GenericSFTTaskEncoder(BaseSFTTaskEncoder):
         }
         if self.include_source_ids:
             values["source_ids"] = [sample.sample_key for sample in encoded_samples]
+        if self.loss_mask_mode is not None:
+            values["loss_mask_mode"] = self.loss_mask_mode
         return BatchedDataDict(values)
 
     @stateless
