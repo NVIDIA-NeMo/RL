@@ -41,6 +41,7 @@ class ResponseDatasetConfig(TypedDict):
     video_maintain_aspect_ratio: NotRequired[bool]
     min_generation_tokens: NotRequired[int]
     max_samples: NotRequired[int | None]
+    image_max_num_tiles: NotRequired[int]
 
 
 class PreferenceDatasetConfig(TypedDict):
@@ -65,6 +66,7 @@ class PreferenceDatasetConfig(TypedDict):
     seed: NotRequired[int]
     max_samples: NotRequired[int | None]
     cache_dir: NotRequired[str | None]
+    image_max_num_tiles: NotRequired[int]
 
 
 class DataConfig(TypedDict):

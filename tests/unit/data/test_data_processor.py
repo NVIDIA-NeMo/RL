@@ -17,6 +17,7 @@ import os
 import sys
 import tempfile
 from collections import defaultdict
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -91,6 +92,56 @@ def test_nemo_gym_data_processor_without_task_data_spec():
     assert result["idx"] == 3
     assert result["task_name"] == "nemo_gym"
     assert result["length"] == 0
+
+
+def test_nemo_gym_data_processor_allows_nonvideo_rows_with_video_defaults(
+    monkeypatch,
+):
+    import nemo_rl.environments.nemo_gym_multimodal as multimodal
+
+    monkeypatch.setattr(
+        multimodal,
+        "nemo_gym_example_to_video_datum_spec",
+        lambda *args, **kwargs: None,
+    )
+    processor = SimpleNamespace(
+        apply_chat_template=lambda *args, **kwargs: None,
+        tokenizer=object(),
+    )
+
+    result = nemo_gym_data_processor(
+        datum_dict={
+            "extra_env_info": json.dumps({"agent_ref": {"name": "sav_tracks"}}),
+            "task_name": "nemo_gym",
+        },
+        task_data_spec=TaskDataSpec(video_sampling_style="nemotron_vl"),
+        tokenizer=processor,
+        max_seq_length=4096,
+        idx=4,
+    )
+
+    assert result["extra_env_info"]["agent_ref"]["name"] == "sav_tracks"
+    assert result["message_log"][0]["token_ids"].dtype == torch.long
+    assert result["message_log"][0]["token_ids"].numel() == 0
+
+
+def test_nemo_gym_data_processor_forwards_per_row_image_tile_cap():
+    processor = SimpleNamespace(image_processor=SimpleNamespace(max_num_tiles=12))
+
+    result = nemo_gym_data_processor(
+        datum_dict={"extra_env_info": "{}", "task_name": "nemo_gym"},
+        task_data_spec=TaskDataSpec(image_max_num_tiles=6),
+        tokenizer=processor,
+        max_seq_length=4096,
+        idx=5,
+    )
+
+    extra_env_info = result["extra_env_info"]
+    assert extra_env_info["_nemo_rl_image_max_num_tiles"] == 6
+    metadata = extra_env_info["responses_create_params"]["metadata"]
+    assert json.loads(metadata["extra_body"])["mm_processor_kwargs"] == {
+        "max_num_tiles": 6
+    }
 
 
 def test_math_data_processor():
