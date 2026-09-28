@@ -192,6 +192,11 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # L = L_PPO + μ·L_NLL(correct)   (arXiv:2504.05118, Eq. 10)
     # Set to 0 to disable.
     positive_example_nll_weight: float = 0.0
+    # Score centering (arXiv:2609.20807): per token, add A * sum_v sg(c_v) log p_v
+    # over the sampler's top-k ids so the update subtracts the sampler-expected
+    # (TIS-weighted) score. Needs token_capture.top_logprobs > 0; composes only
+    # with importance sampling off or token-level "tis".
+    score_centering: bool = False
 
 
 class ClippedPGLossDataDict(TypedDict):
@@ -205,6 +210,46 @@ class ClippedPGLossDataDict(TypedDict):
     token_mask: torch.Tensor
     sample_mask: torch.Tensor
     __extra__: Any
+
+
+def _score_centering_term(
+    topk_logprobs: torch.Tensor,
+    sampler_topk_logprobs: torch.Tensor,
+    is_bounds: Optional[tuple[float, float]],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-token ``sum_v sg(c_v) * log p_v`` whose gradient is the sampler-expected score.
+
+    Score centering (arXiv:2609.20807, Eq. 14) with the paper's top-k estimator:
+    the sampler's head ``q`` is exact and its tail is modeled as ``rho * p`` with
+    ``rho`` = sampler tail mass / trainer tail mass. Without importance sampling
+    the centering mass is ``q`` on the head and ``rho * p`` on the tail. With
+    token-level TIS, ``w = clamp(p / q, lo, hi)``, it is
+    ``q * w = clamp(p, lo * q, hi * q)`` on the head and ``alpha * p`` on the tail
+    with ``alpha = clamp(1, lo * rho, hi * rho)``. Since ``sum_v p_v grad log p_v``
+    is zero, the tail contributes ``-alpha * p_v`` on the head ids, so the
+    coefficient is ``c_v = mass_v - alpha * p_v``.
+
+    Args:
+        topk_logprobs: Trainer log-probs at the sampler's top-k ids, ``[B, S, k]``,
+            carrying the gradient.
+        sampler_topk_logprobs: The sampler's log-probs at those ids, ``[B, S, k]``.
+        is_bounds: ``(lo, hi)`` of the TIS clamp, or ``None`` when IS is off.
+
+    Returns:
+        The per-token term ``[B, S]`` and the sampler mass the head covers ``[B, S]``.
+    """
+    p = topk_logprobs.detach().exp()
+    q = sampler_topk_logprobs.exp()
+    head_mass = q.sum(-1)
+    rho = (1.0 - head_mass).clamp(min=0.0) / (1.0 - p.sum(-1)).clamp(min=1e-6)
+    if is_bounds is None:
+        mass, alpha = q, rho
+    else:
+        lo, hi = is_bounds
+        mass = torch.minimum(torch.maximum(p, lo * q), hi * q)
+        alpha = torch.minimum(torch.maximum(torch.ones_like(rho), lo * rho), hi * rho)
+    coefficients = mass - alpha.unsqueeze(-1) * p
+    return (coefficients * topk_logprobs).sum(-1), head_mass
 
 
 class ClippedPGLossFn(LossFunction):
@@ -395,6 +440,29 @@ class ClippedPGLossFn(LossFunction):
                     "and is incompatible with sequence_level_importance_ratios=True"
                 )
 
+        self.score_centering = cfg.score_centering
+        if self.score_centering:
+            assert self.opd_full is None and not use_fused_linear_logprobs, (
+                "score_centering needs the policy-gradient loss on full logits"
+            )
+            assert not self.sequence_level_importance_ratios and (
+                not self.use_importance_sampling_correction
+                or self.truncated_importance_sampling_type == "tis"
+            ), (
+                "score_centering composes only with importance sampling off or "
+                "token-level 'tis' (the sampler-expected weighted score has a closed "
+                "form there)"
+            )
+        # Bounds of the token-level TIS clamp; they set the effective centering mass.
+        self._score_centering_is_bounds = (
+            (
+                self.truncated_importance_sampling_ratio_min or 0.0,
+                self.truncated_importance_sampling_ratio,
+            )
+            if self.score_centering and self.use_importance_sampling_correction
+            else None
+        )
+
         # Advertise, per returned metric, the global denominator it was
         # normalized by (see MetricNormalizer). Built here — next to the flags
         # that pick the denominators — so split-API trainers can undo the
@@ -445,6 +513,10 @@ class ClippedPGLossFn(LossFunction):
                 if self.truncated_importance_sampling_type == "seq-mask-tis"
                 else MetricNormalizer.TOKENS
             )
+        if self.score_centering:
+            self.metric_normalizations["score_centering_head_mass"] = (
+                MetricNormalizer.TOKENS
+            )
         if self.opd_full is not None:
             # opd_full returns its own metric set from _opd_full_call; the
             # policy-gradient diagnostics above are never produced there.
@@ -482,6 +554,7 @@ class ClippedPGLossFn(LossFunction):
         opd_full_divergence: Optional[Tensor] = None,
         opd_full_entropy: Optional[Tensor] = None,
         opd_full_cross_entropy: Optional[Tensor] = None,
+        next_token_topk_logprobs: Optional[Tensor] = None,
     ) -> tuple[torch.Tensor, dict]:
         """Clipped Policy Gradient RL loss, or the full-vocabulary MOPD reverse KL.
 
@@ -491,6 +564,8 @@ class ClippedPGLossFn(LossFunction):
             next_token_logprobs: Sampled-token log-probabilities ``[B, S - 1]``.
                 Required on the policy-gradient branch; on the ``opd_full``
                 branch only when ``reference_policy_kl_penalty`` is non-zero.
+            next_token_topk_logprobs: Log-probabilities at the sampler's top-k
+                ids ``[B, S - 1, k]``, required when ``score_centering`` is on.
             data: Microbatch with masks, advantages, and prior log-probabilities.
             global_valid_seqs: Global valid-sequence count for normalization.
             global_valid_toks: Global valid-token count for normalization.
@@ -850,16 +925,32 @@ class ClippedPGLossFn(LossFunction):
         else:
             importance_weights_to_use = torch.ones_like(prev_logprobs)
 
+        per_token_loss = importance_weights_to_use * clip_loss
+        score_centering_metrics: dict = {}
+        if self.score_centering:
+            assert next_token_topk_logprobs is not None, (
+                "score_centering requires next_token_topk_logprobs from prepare_loss_input"
+            )
+            centering, head_mass = _score_centering_term(
+                next_token_topk_logprobs,
+                data["generation_topk_logprobs"][:, 1:],
+                self._score_centering_is_bounds,
+            )
+            per_token_loss = per_token_loss + advantages * centering
+            score_centering_metrics["score_centering_head_mass"] = masked_mean(
+                head_mass, mask, global_normalization_factor=global_valid_toks
+            ).item()
+
         if self.loss_type == LossType.TOKEN_LEVEL:
             actor_loss = masked_mean(
-                importance_weights_to_use * clip_loss,
+                per_token_loss,
                 mask,
                 global_normalization_factor=global_valid_toks,
             )
         else:
             actor_loss = masked_mean(
                 masked_mean(
-                    importance_weights_to_use * clip_loss,
+                    per_token_loss,
                     token_mask,
                     dim=-1,
                 ),
@@ -959,6 +1050,7 @@ class ClippedPGLossFn(LossFunction):
                 "approx_entropy": seq_entropy_approx.item(),
                 **_is_filter_metrics,
                 **seq_error_metrics,
+                **score_centering_metrics,
                 "positive_nll_loss": nll_loss.item(),
             },
         )

@@ -1299,6 +1299,21 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 f"policy.generation.vllm_kwargs.max_logprobs >= {top_logprobs} "
                 "(vLLM's default is 20)"
             )
+    if master_config.loss_fn.score_centering:
+        if top_logprobs == 0:
+            raise ValueError(
+                "loss_fn.score_centering requires token_capture.top_logprobs > 0"
+            )
+        generation_cfg = master_config.policy["generation"]
+        if (
+            generation_cfg.get("top_p") != 1.0
+            or generation_cfg.get("top_k") is not None
+        ):
+            raise ValueError(
+                "loss_fn.score_centering needs unfiltered sampling "
+                "(policy.generation.top_p=1, top_k=null) so the captured top-k is "
+                "the sampling distribution"
+            )
 
     if algo_cfg.num_prompts_per_step < async_config.min_groups_for_streaming_train:
         raise ValueError(
