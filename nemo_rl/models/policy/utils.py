@@ -121,7 +121,7 @@ def validate_fp32_lm_head_config(
     config: "PolicyConfig",
     *,
     megatron_enabled: bool,
-    dtensor_enabled: bool,
+    automodel_enabled: bool,
     model_config: object | None = None,
 ) -> None:
     """Reject fp32 LM-head settings that the selected backends cannot match."""
@@ -169,7 +169,7 @@ def validate_fp32_lm_head_config(
         )
 
     vllm_fp32 = vllm_nemotron_h_fp32_lm_head_enabled(vllm_cfg)
-    if dtensor_enabled and vllm_fp32:
+    if automodel_enabled and vllm_fp32:
         raise ValueError(
             "policy.generation.vllm_cfg.fp32_lm_head=true is only supported "
             "with the Megatron trainer because DTensor has no matching "
