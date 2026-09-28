@@ -26,7 +26,6 @@ from transformers import AutoConfig, AutoModel
 from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
-from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.utils import replace_parameter
 from vllm.triton_utils import tl, triton
@@ -34,13 +33,15 @@ from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.utils import CoreEngineProcManager
 
 from nemo_rl.models.generation.vllm.config import REFITTABLE_FP8_KV_CACHE_DTYPES
-from nemo_rl.models.generation.vllm.quantization import deepseek_v4_fp8
 from nemo_rl.models.generation.vllm.quantization.mxfp8_utils import (
     assign_or_replace_parameter,
     flashinfer_mxfp8_moe_padding_plan,
     pad_flashinfer_scale_k,
     pad_tensor_dim,
     pad_w13_intermediate,
+)
+from nemo_rl.models.generation.vllm.quantization.utils import (
+    resolve_module_from_param_name,
 )
 from nemo_rl.models.generation.vllm.utils import is_grouped_moe_expert_weight_name
 
@@ -494,73 +495,19 @@ def _get_params_in_layers(param_names, layers):
     return params
 
 
-def _get_module_from_param_name(model, name: str):
-    name = deepseek_v4_fp8.map_checkpoint_name(model, name)
+def get_module_from_param_name(model, name: str):
+    """Resolve the vLLM submodule owning an HF-named parameter.
 
-    # Split the name into parts (e.g., 'layers', '0', 'self_attn', 'q_proj', 'weight')
-    # The module path is all but the last part (the parameter's own name)
-    path_parts = name.split(".")
-    module_path = path_parts[:-1]
-    # Replace with the fused model name
-    packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
-    reversed_mapping = {
-        original_name: fused_name
-        for fused_name, original_names_list in packed_modules_mapping.items()
-        for original_name in original_names_list
-    }
-    if module_path[-1] in reversed_mapping.keys():
-        module_path[-1] = reversed_mapping[module_path[-1]]
-
-    module_path = deepseek_v4_fp8.remap_packed_module_path(model, module_path)
-
-    if hasattr(model, "hf_to_vllm_mapper") and hasattr(
-        model.hf_to_vllm_mapper, "orig_to_new_prefix"
-    ):
-        if module_path[0] in model.hf_to_vllm_mapper.orig_to_new_prefix:
-            module_path[0] = model.hf_to_vllm_mapper.orig_to_new_prefix[module_path[0]]
-    if hasattr(model, "hf_to_vllm_mapper") and hasattr(
-        model.hf_to_vllm_mapper, "orig_to_new_substr"
-    ):
-        for i in range(len(module_path)):
-            if module_path[i] in model.hf_to_vllm_mapper.orig_to_new_substr:
-                module_path[i] = model.hf_to_vllm_mapper.orig_to_new_substr[
-                    module_path[i]
-                ]
-
-    current_module = model
-    try:
-        # Traverse the model hierarchy
-        for part in module_path:
-            # vLLM 0.25 split the old FusedMoE module into a MoERunner that
-            # delegates to a RoutedExperts submodule owning the expert weights
-            # (w13_weight/w2_weight), so stop at either and return the
-            # weight-owning module.
-            if isinstance(current_module, MoERunner):
-                return current_module.routed_experts
-            if isinstance(current_module, RoutedExperts):
-                return current_module
-            if part == "model" and not hasattr(current_module, part):
-                # Some HF/vLLM model classes expose the decoder directly (for
-                # example ``language_model``) while parameter names still carry
-                # vLLM's synthetic ``model.`` prefix.
-                continue
-            if part == "layers" and not hasattr(current_module, part):
-                # Qwen3.5-MoE VL exposes ``language_model`` as a CausalLM
-                # wrapper; its decoder stack lives under ``language_model.model``.
-                wrapped_model = getattr(current_module, "model", None)
-                if wrapped_model is not None and hasattr(wrapped_model, part):
-                    current_module = wrapped_model
-            if isinstance(current_module, torch.nn.ModuleList):
-                current_module = current_module[int(part)]
-            else:
-                current_module = getattr(current_module, part)
-    except (AttributeError, IndexError, ValueError) as e:
-        print(f"Warning: Could not find module for parameter '{name}'. Error: {e}")
-    # Fused param names (e.g. "...experts.w13_weight") end the traversal on the
-    # MoERunner itself; normalize to the weight-owning RoutedExperts submodule.
-    if isinstance(current_module, MoERunner):
-        return current_module.routed_experts
-    return current_module
+    Walks ``name``'s dotted path through ``model``, remapping fused/renamed
+    prefixes via ``packed_modules_mapping`` and ``hf_to_vllm_mapper``, and
+    stopping early at a ``RoutedExperts`` (or its owning ``MoERunner``) since
+    per-expert path components below that point do not exist as submodules.
+    """
+    resolution = resolve_module_from_param_name(model, name)
+    if resolution is None:
+        print(f"Warning: Could not find module for parameter '{name}'.")
+        return None
+    return resolution.module
 
 
 def _is_fp8_weight(name, model):
@@ -568,7 +515,7 @@ def _is_fp8_weight(name, model):
         fp8_state.seen_params.add(name)
         # Filter out bias params
         if name.endswith("weight"):
-            module = _get_module_from_param_name(model, name)
+            module = get_module_from_param_name(model, name)
             # We currently only quantize linear layers
             if (
                 isinstance(module, LinearBase)
@@ -584,7 +531,7 @@ def _is_fp8_weight(name, model):
 
 
 def _is_fp8_grouped_moe_expert(name: str, model: Any) -> bool:
-    experts_module = _get_module_from_param_name(model, name)
+    experts_module = get_module_from_param_name(model, name)
     return (
         isinstance(experts_module, RoutedExperts)
         and experts_module.w13_weight.dtype == torch.float8_e4m3fn
@@ -1167,8 +1114,9 @@ def process_weights_after_loading_moe(self, layer) -> None:
     replace_parameter() to avoid creating new torch.nn.Parameter objects, because that removes
     the weight_loader attribute which we need for refit.
 
-    Updated for vLLM 0.25 which passes a RoutedExperts module as `layer` and
-    sets up the MoE kernel via make_fp8_moe_kernel(routing_tables=..., layer=...).
+    Updated for vLLM >= 0.25, which passes a RoutedExperts module as `layer` and
+    sets up the MoE kernel via make_fp8_moe_kernel(routing_tables=...); 0.29
+    dropped the kernel factory's `layer=` kwarg.
     """
     from vllm.model_executor.layers.quantization.fp8 import (
         convert_to_fp8_moe_kernel_format,
@@ -1221,13 +1169,14 @@ def process_weights_after_loading_moe(self, layer) -> None:
         from vllm.model_executor.layers.quantization.fp8 import make_fp8_moe_kernel
 
         assert self.experts_cls is not None
+        # vLLM 0.28 dropped the `layer` kwarg (0.25 forwarded it only to the
+        # FlashInfer TRTLLM experts); routing tables still come from the layer.
         self.moe_kernel = make_fp8_moe_kernel(
             moe_quant_config=self.moe_quant_config,
             moe_config=self.moe,
             fp8_backend=self.fp8_backend,
             experts_cls=self.experts_cls,
             routing_tables=layer._expert_routing_tables(),
-            layer=layer,
         )
 
 
@@ -1556,7 +1505,6 @@ def process_weights_after_loading_mxfp8_moe(self, layer) -> None:
             fp8_backend=self.mxfp8_backend,
             experts_cls=self.experts_cls,
             routing_tables=layer._expert_routing_tables(),
-            layer=layer,
         )
 
 
@@ -1611,14 +1559,31 @@ def process_weights_after_loading_kv(self, layer) -> None:
 
     Doesn't delete k_scale, v_scale, q_scale, and prob_scale parameters to allow
     for dynamic updates during refit.
-    """
-    # If the kv-cache dtype is auto, we enforce the k/v_scale to be 1.0
-    # regardless whether the kv-scale is available in the checkpoint.
-    # No need to process kv scales after loading if we are going to
-    # calculate them on the fly.
-    from vllm.platforms import current_platform
 
-    if layer.kv_cache_dtype != "auto" and not layer.calculate_kv_scales:
+    Ported to vLLM 0.28: the attention layer no longer carries
+    ``calculate_kv_scales`` (dynamic per-token-head scales are a KV-cache dtype
+    now, see ``kv_cache_uses_per_token_head_scales``), and the fp8 branch keys off
+    ``is_quantized_kv_cache`` instead of ``!= "auto"``. Mirrors
+    ``BaseKVCacheMethod.process_weights_after_loading`` in
+    ``vllm/model_executor/layers/quantization/kv_cache.py`` minus the parameter
+    deletion.
+    """
+    from vllm.platforms import current_platform
+    from vllm.utils.torch_utils import is_quantized_kv_cache
+    from vllm.v1.kv_cache_interface import kv_cache_uses_per_token_head_scales
+
+    # Per-token-head quantized KV cache: scales are computed dynamically per
+    # (token, head) in the kernel at cache-write time. Nothing to refit here.
+    if kv_cache_uses_per_token_head_scales(layer.kv_cache_dtype):
+        layer._k_scale.copy_(1.0)
+        layer._v_scale.copy_(1.0)
+        layer._k_scale_float = 1.0
+        layer._v_scale_float = 1.0
+        return
+
+    # If the kv-cache is not quantized, we enforce the k/v_scale to be 1.0
+    # regardless whether the kv-scale is available in the checkpoint.
+    if is_quantized_kv_cache(layer.kv_cache_dtype):
         if layer.k_scale > 0.0 and layer.v_scale > 0.0:
             # We prefer to use separate k_scale and v_scale if present
             k_scale = layer.k_scale.to("cpu").tolist()
@@ -1655,12 +1620,16 @@ def process_weights_after_loading_kv(self, layer) -> None:
         layer._v_scale.copy_(v_scale)
         layer._k_scale_float = k_scale
         layer._v_scale_float = v_scale
+        # vLLM 0.28 also keeps host copies for the AITER fused kernels; the
+        # buffers exist on every platform, so keep them in sync on refit too.
+        if hasattr(layer, "_k_scale_cpu"):
+            layer._k_scale_cpu.fill_(k_scale)
+            layer._v_scale_cpu.fill_(v_scale)
 
     if layer.q_scale > 0.0:
         q_scale = layer.q_scale
         if current_platform.is_fp8_fnuz():
             q_scale *= 2
-        layer.calculate_kv_scales = False
     else:
         q_scale = 1.0
     if layer.prob_scale > 0.0:

@@ -67,5 +67,3 @@
 
 # Codeowners
 /.github/CODEOWNERS @nvidia-nemo/rl_maintainers
-
-/research/template_project @terrykong

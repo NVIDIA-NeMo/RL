@@ -345,7 +345,9 @@ def test_init_fp8_keeps_mixed_recipe_boundary_targets_in_bf16(
     quant_config = vllm_kwargs["hf_overrides"]["quantization_config"]
     modelopt_config = ModelOptMxFp8Config.from_config(quant_config)
     mapper = WeightsMapper(orig_to_new_prefix=recipe_case.mapper_prefixes)
-    modelopt_config.apply_vllm_mapper(mapper.get_unstacked_mapper())
+    # vLLM 0.29 renamed WeightsMapper.get_unstacked_mapper -> get_rename_mapper;
+    # this mirrors what vLLM's model loader passes to apply_vllm_mapper.
+    modelopt_config.apply_vllm_mapper(mapper.get_rename_mapper())
     modelopt_config.packed_modules_mapping.update(
         {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
     )
@@ -1215,7 +1217,6 @@ def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
         "fp8_backend": Fp8MoeBackend.FLASHINFER_TRTLLM,
         "experts_cls": experts_cls,
         "routing_tables": (None, None, None),
-        "layer": layer,
     }
 
 
@@ -1964,14 +1965,23 @@ def test_dsv4_module_lookup_maps_checkpoint_attention_to_fused_vllm_module(
             layer.attn.fused_wqa_wkv = torch.nn.Linear(2, 2, bias=False)
             self.model.layers = torch.nn.ModuleList([layer])
             self.hf_to_vllm_mapper = types.SimpleNamespace(
+                orig_to_new_prefix={"model.": "model.model."},
                 apply_list=lambda names: [f"model.{names[0]}"],
             )
 
     model = DeepSeekV4ForCausalLM()
 
-    module = fp8._get_module_from_param_name(model, "layers.0.attn.wq_a.weight")
+    module = fp8.get_module_from_param_name(model, "layers.0.attn.wq_a.weight")
 
     assert module is model.model.layers[0].attn.fused_wqa_wkv
+
+    resolution = fp8.resolve_module_from_param_name(model, "layers.0.attn.wq_a.weight")
+    assert resolution is not None
+    assert resolution.module is module
+    # Bypassing the full DeepSeek mapper loses the prefix; applying the generic
+    # mapper afterward duplicates it. Check the path because the module walker
+    # tolerates missing or repeated model wrappers.
+    assert resolution.mapped_path == ("model", "layers", "0", "attn", "fused_wqa_wkv")
 
 
 def test_module_lookup_preserves_base_packed_and_mapper_handling(fp8_module):
@@ -1996,7 +2006,7 @@ def test_module_lookup_preserves_base_packed_and_mapper_handling(fp8_module):
 
     model = Model()
 
-    module = fp8._get_module_from_param_name(
+    module = fp8.get_module_from_param_name(
         model, "transformer.layers.0.self_attn.q_proj.weight"
     )
 
@@ -2403,7 +2413,12 @@ def test_deepseek_v4_two_refits_preserve_kernel_fp32_scale_references(
     layer.w13_input_scale = None
     layer.w2_input_scale = None
     layer._expert_routing_tables = lambda: None
-    layer.moe_config = types.SimpleNamespace(has_bias=False)
+    # vLLM 0.29's Fp8MoEMethod.__init__ refines the block shape from the MoE
+    # config (intermediate_size_per_partition / tp_size / hidden_dim); sizes
+    # divisible by the [2, 2] block keep the checkpoint block shape.
+    layer.moe_config = types.SimpleNamespace(
+        has_bias=False, intermediate_size_per_partition=4, tp_size=1, hidden_dim=4
+    )
     layer.quant_method = method = vllm_fp8.Fp8MoEMethod(
         vllm_fp8.Fp8Config(is_checkpoint_fp8_serialized=True, weight_block_size=[2, 2]),
         layer,
@@ -2464,14 +2479,20 @@ def _grouped_expert_model(fp8, monkeypatch, experts_dtype, wrap_language_model=F
     """
     import torch
 
-    class _RoutedExperts:
-        pass
+    class _RoutedExperts(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
 
-    class _MoERunner:
-        pass
+    class _MoERunner(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+
+    from nemo_rl.models.generation.vllm.quantization import utils as quant_utils
 
     monkeypatch.setattr(fp8, "RoutedExperts", _RoutedExperts)
-    monkeypatch.setattr(fp8, "MoERunner", _MoERunner)
+    monkeypatch.setattr(fp8, "MoERunner", _MoERunner, raising=False)
+    monkeypatch.setattr(quant_utils, "RoutedExperts", _RoutedExperts)
+    monkeypatch.setattr(quant_utils, "MoERunner", _MoERunner)
 
     experts = _RoutedExperts()
     experts.w13_weight = torch.zeros(2, 4, 4, dtype=experts_dtype)
@@ -2558,7 +2579,7 @@ def test_load_weights_passes_grouped_experts_through_for_ignored_bf16_layers(
     # Pass-through is also what a failed lookup produces, so pin that the
     # bf16 RoutedExperts was actually resolved.
     assert isinstance(
-        fp8._get_module_from_param_name(
+        fp8.get_module_from_param_name(
             model, f"{layers_prefix}.0.mlp.experts.gate_up_proj"
         ),
         fp8.RoutedExperts,
@@ -2643,3 +2664,105 @@ def test_load_weights_expands_grouped_experts_for_fp8_layers(
             assert weight.shape == shape
             assert scale.shape == (shape[0] // 128, shape[1] // 128)
             _assert_dequant_close(weight, scale, source[eid])
+
+
+def _deepseek_v4_lookup_model():
+    """A DeepSeek V4-shaped model with vLLM 0.29's ambiguous packed mapping."""
+    from vllm.model_executor.models.utils import WeightsMapper
+
+    class Attn(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fused_wqa_wkv = torch.nn.Linear(4, 4, bias=False)
+
+    class Compressor(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fused_wkv_wgate = torch.nn.Linear(4, 4, bias=False)
+
+    class Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn = Attn()
+            self.compressor = Compressor()
+
+    class Decoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleList([Layer()])
+
+    class Model(torch.nn.Module):
+        # vLLM 0.29 DeepseekV4ForCausalLM: ``wkv`` is a shard of two fused modules.
+        packed_modules_mapping = {
+            "fused_wqa_wkv": ["wq_a", "wkv"],
+            "fused_wkv_wgate": ["wkv", "wgate"],
+        }
+
+        def __init__(self):
+            super().__init__()
+            self.config = types.SimpleNamespace(model_type="deepseek_v4")
+            self.hf_to_vllm_mapper = WeightsMapper()
+            self.model = Decoder()
+
+    return Model()
+
+
+@pytest.mark.parametrize(
+    ("param_name", "expected_attr"),
+    [
+        ("model.layers.0.attn.wkv.weight", "attn.fused_wqa_wkv"),
+        ("model.layers.0.attn.wq_a.weight", "attn.fused_wqa_wkv"),
+        ("model.layers.0.compressor.wkv.weight", "compressor.fused_wkv_wgate"),
+        ("model.layers.0.compressor.wgate.weight", "compressor.fused_wkv_wgate"),
+    ],
+)
+def test_get_module_resolves_shards_shared_by_two_fused_modules(
+    fp8_module, param_name, expected_attr
+):
+    """A leaf shard listed under two fused modules is resolved by its parent.
+
+    vLLM 0.29 added ``packed_modules_mapping`` to DeepseekV4ForCausalLM with
+    ``wkv`` under both ``fused_wqa_wkv`` and ``fused_wkv_wgate``; resolving the
+    leaf alone sent ``attn.wkv`` to ``attn.fused_wkv_wgate`` (which does not
+    exist), so the weight was treated as non-fp8 and refit unquantized.
+    """
+    model = _deepseek_v4_lookup_model()
+    layer = model.model.layers[0]
+    expected = layer
+    for part in expected_attr.split("."):
+        expected = getattr(expected, part)
+
+    module = fp8_module.get_module_from_param_name(model, param_name)
+
+    assert module is expected
+
+
+def test_get_module_still_uses_unambiguous_packed_mapping(fp8_module):
+    class Attn(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.qkv_proj = torch.nn.Linear(4, 4, bias=False)
+
+    class Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = Attn()
+
+    class Decoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleList([Layer()])
+
+    class Model(torch.nn.Module):
+        packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+
+        def __init__(self):
+            super().__init__()
+            self.config = types.SimpleNamespace(model_type="llama")
+            self.model = Decoder()
+
+    model = Model()
+    module = fp8_module.get_module_from_param_name(
+        model, "model.layers.0.self_attn.k_proj.weight"
+    )
+    assert module is model.model.layers[0].self_attn.qkv_proj

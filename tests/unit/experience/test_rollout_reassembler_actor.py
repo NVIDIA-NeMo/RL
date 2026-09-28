@@ -110,6 +110,20 @@ def test_finalize_forwards_loss_multiplier_to_reassembler() -> None:
     )
 
 
+def test_finalizer_forwards_mooncake_checkpoint_commands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actor_cls = RolloutReassemblerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_cls)
+    command = {"operation": "INFO"}
+    response = {"participant_id": "finalizer"}
+    dispatch = MagicMock(return_value=response)
+    monkeypatch.setattr(actor_module, "run_checkpoint_command", dispatch)
+
+    assert actor.mooncake_checkpoint(command) is response
+    dispatch.assert_called_once_with(command)
+
+
 @pytest.mark.parametrize(
     "payload",
     [
