@@ -33,16 +33,19 @@ policy:
     moe_router_dtype: fp32
     moe_router_bias_update_rate: 0.001
     moe_router_enable_expert_bias: true
-    # # HybridEP settings. Currently disabled: this 4-GPU topology has not
-    # # been perf-validated with HybridEP yet.
-    # moe_token_dispatcher_type: flex
-    # moe_flex_dispatcher_backend: hybridep
-    # moe_hybridep_num_sms: 32
+    moe_token_dispatcher_type: flex
+    moe_flex_dispatcher_backend: hybridep
+    moe_hybridep_num_sms: 32
+    moe_hybridep_prepad_packed_inputs: true
     defer_fp32_logits: true
     # MTP — disabled
     mtp_num_layers: 0
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+      NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: "16"
+      NUM_OF_TOKENS_PER_CHUNK_COMBINE_API: "128"
+      NVLINK_DOMAIN_SIZE: "72"
+      USE_MNNVL: "1"
       NRL_REFIT_BUFFER_MEMORY_RATIO: "0.005"
       NRL_REFIT_NUM_BUFFERS: "1"
   generation:

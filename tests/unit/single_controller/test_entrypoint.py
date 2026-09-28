@@ -22,6 +22,7 @@ from examples import run_grpo_single_controller
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
+from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 
 
 @pytest.fixture
@@ -31,7 +32,7 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         policy={
             "tokenizer": {},
             "generation": generation_config,
-            "draft": {"enabled": False},
+            "draft": Eagle3DraftConfig(enabled=False),
             "megatron_cfg": {"mtp_num_layers": 2},
         },
         env={},
@@ -39,7 +40,11 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         logger={"log_dir": "/tmp/logs"},
         checkpointing={"enabled": False},
         async_rl=SimpleNamespace(
-            stall_watchdog=SimpleNamespace(interval_s=30.0, stall_timeout_s=600.0)
+            stall_watchdog=SimpleNamespace(interval_s=30.0, stall_timeout_s=600.0),
+            # model_construct skips validation, so nothing fills the real
+            # AsyncRLConfig defaults in here. main() reads this before init_ray() to
+            # decide on EngineCore reaping; off keeps that a no-op.
+            generation_fleet_health=SimpleNamespace(enabled=False),
         ),
         grpo=GRPOConfig(async_grpo=None),
     )
@@ -52,11 +57,12 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         trainer_handle=SimpleNamespace(shutdown=MagicMock()),
         value_handle=None,
     )
+    setup_single_controller = MagicMock(return_value=(actor_args, SetupTimingMetrics()))
     ray_get = MagicMock(return_value={})
     # The driver now polls ping() around the run. Report the run as ready on the first
     # check so these tests keep exercising the same path they always did.
     ray_wait = MagicMock(side_effect=lambda refs, timeout=None: (list(refs), []))
-    ray_kill = MagicMock()
+    shutdown_environments = MagicMock()
 
     monkeypatch.setattr(
         run_grpo_single_controller,
@@ -89,7 +95,7 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     monkeypatch.setattr(
         run_grpo_single_controller,
         "setup_single_controller",
-        lambda *_args, **_kwargs: (actor_args, SetupTimingMetrics()),
+        setup_single_controller,
     )
     monkeypatch.setattr(
         run_grpo_single_controller.SingleControllerActor,
@@ -98,7 +104,11 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     )
     monkeypatch.setattr(run_grpo_single_controller.ray, "get", ray_get)
     monkeypatch.setattr(run_grpo_single_controller.ray, "wait", ray_wait)
-    monkeypatch.setattr(run_grpo_single_controller.ray, "kill", ray_kill)
+    monkeypatch.setattr(
+        run_grpo_single_controller,
+        "shutdown_environments",
+        shutdown_environments,
+    )
 
     return SimpleNamespace(
         actor_args=actor_args,
@@ -108,7 +118,8 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         generation_config=generation_config,
         ray_get=ray_get,
         ray_wait=ray_wait,
-        ray_kill=ray_kill,
+        setup_single_controller=setup_single_controller,
+        shutdown_environments=shutdown_environments,
     )
 
 
@@ -116,20 +127,12 @@ def test_cleanup_is_best_effort_and_preserves_run_error(
     main_context: SimpleNamespace,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    failing_env = SimpleNamespace(
-        shutdown=SimpleNamespace(remote=MagicMock(return_value="failing-env"))
-    )
-    healthy_env = SimpleNamespace(
-        shutdown=SimpleNamespace(remote=MagicMock(return_value="healthy-env"))
-    )
+    env_handles = {"nemo_gym": MagicMock()}
     generation = SimpleNamespace(
         shutdown=MagicMock(side_effect=RuntimeError("generation cleanup failed"))
     )
     trainer = SimpleNamespace(shutdown=MagicMock())
-    main_context.actor_args.env_handles = {
-        "failing": failing_env,
-        "healthy": healthy_env,
-    }
+    main_context.actor_args.env_handles = env_handles
     main_context.actor_args.gen_handle = generation
     main_context.actor_args.trainer_handle = trainer
 
@@ -137,8 +140,6 @@ def test_cleanup_is_best_effort_and_preserves_run_error(
         del timeout
         if ref == "run":
             raise RuntimeError("training failed")
-        if ref == "failing-env":
-            raise RuntimeError("env cleanup failed")
         return None
 
     main_context.ray_get.side_effect = get
@@ -146,13 +147,13 @@ def test_cleanup_is_best_effort_and_preserves_run_error(
     with pytest.raises(RuntimeError, match="training failed"):
         run_grpo_single_controller.main()
 
-    healthy_env.shutdown.remote.assert_called_once_with()
-    # A hung env must not replace the training error with an indefinite wait.
-    main_context.ray_kill.assert_called_once_with(failing_env)
+    # Env teardown semantics (bounded wait, kill fallback) belong to the shared
+    # helper and are covered by its own tests; here the driver only has to reach
+    # it before the generation and trainer handles.
+    main_context.shutdown_environments.assert_called_once_with(env_handles)
     generation.shutdown.assert_called_once_with()
     trainer.shutdown.assert_called_once_with()
     output = capsys.readouterr().out
-    assert "Env 'failing' shutdown failed: env cleanup failed" in output
     assert "Generation shutdown failed: generation cleanup failed" in output
 
 
@@ -169,6 +170,39 @@ def test_main_configures_generation_for_trained_mtp(
     )
     assert (
         main_context.config.policy["generation"] is main_context.configured_generation
+    )
+
+
+def test_main_accepts_policy_without_draft_config(
+    main_context: SimpleNamespace,
+) -> None:
+    main_context.config.policy.pop("draft")
+
+    run_grpo_single_controller.main()
+
+    main_context.configure_generation.assert_called_once_with(
+        main_context.generation_config,
+        "tokenizer",
+        has_refit_draft_weights=False,
+        trains_mtp=True,
+    )
+
+
+def test_main_preserves_generation_config_through_setup(
+    main_context: SimpleNamespace,
+) -> None:
+    """main() forwards normalized generation config to setup_single_controller."""
+    main_context.generation_config["vllm_cfg"] = {"refit_with_reload_api": True}
+    main_context.configure_generation.side_effect = (
+        lambda generation, *_args, **_kwargs: generation
+    )
+
+    run_grpo_single_controller.main()
+
+    config_for_setup = main_context.setup_single_controller.call_args.args[0]
+    assert (
+        config_for_setup.policy["generation"]["vllm_cfg"]["refit_with_reload_api"]
+        is True
     )
 
 

@@ -40,10 +40,18 @@ from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import PolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.telemetry.config import TelemetryConfig
-from nemo_rl.telemetry.instrumentation import managed_span, trace_fn
+from nemo_rl.telemetry.instrumentation import (
+    evaluate_span,
+    managed_span,
+    umbrella_span,
+    umbrella_trace_fn,
+)
 from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.span_groups import RLSpanGroup
-from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
+from nemo_rl.utils.checkpoint import (
+    CheckpointingConfig,
+    CheckpointManager,
+)
 from nemo_rl.utils.logger import Logger, LoggerConfig
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
@@ -365,16 +373,9 @@ def validate_one_dataset(
         return
 
     timer = Timer()
-    _telemetry = get_telemetry_handle()
-    _tracer = _telemetry.tracer if _telemetry is not None else None
-
     with (
         timer.time("total_validation_time"),
-        managed_span(
-            RLSpanGroup.EVALUATE,
-            "rl.rm.evaluate",
-            tracer=_tracer,
-        ),
+        evaluate_span("rm"),
     ):
         print(f"▶ Starting validation at step {step} for `{dataset_name}` set..")
 
@@ -480,7 +481,7 @@ def validate_one_dataset(
     return val_metrics, timing_metrics
 
 
-@trace_fn(RLSpanGroup.JOB, "rl.rm.job")
+@umbrella_trace_fn(RLSpanGroup.U_JOB, "rl.rm.job")
 def rm_train(
     policy,
     train_dataloader,
@@ -548,8 +549,8 @@ def rm_train(
 
             with (
                 timer.time("total_step_time"),
-                managed_span(
-                    RLSpanGroup.STEP,
+                umbrella_span(
+                    RLSpanGroup.U_STEP,
                     "rl.rm.step",
                     tracer=_tracer,
                     **{"rl.iteration": total_steps + 1},
@@ -706,7 +707,7 @@ def rm_train(
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
-                            checkpointing_cfg=master_config.checkpointing,
+                            is_final_checkpoint=is_last_step,
                         )
                         torch.save(
                             train_dataloader.state_dict(),
@@ -747,7 +748,12 @@ def rm_train(
                 metrics["global_valid_toks"] / total_time / total_num_gpus
             )
             logger.log_metrics(metrics, total_steps + 1, prefix="train")
-            logger.log_metrics(timing_metrics, total_steps + 1, prefix="timing/train")
+            logger.log_metrics(
+                timing_metrics,
+                total_steps + 1,
+                prefix="timing/train",
+                step_finished=True,
+            )
 
             timer.reset()
             current_step += 1

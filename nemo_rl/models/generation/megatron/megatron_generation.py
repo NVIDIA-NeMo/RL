@@ -40,6 +40,7 @@ from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
+    from nemo_rl.data_plane.interfaces import DataPlaneConfig
     from nemo_rl.distributed.worker_groups import RayWorkerGroup
     from nemo_rl.models.policy.lm_policy import Policy
     from nemo_rl.weight_sync.membership import RefitMembership
@@ -396,6 +397,16 @@ class MegatronGeneration(GenerationInterface):
         """The underlying policy's worker group (fleet-health probes read dp_size)."""
         return self._policy.worker_group
 
+    def shard_liveness_ref(self, shard_idx: int) -> ray.ObjectRef:
+        """Liveness of the worker leading this shard. The caller need not know the layout.
+
+        Same shape as the vLLM backend's. Declared here because this generation object
+        wraps a Policy, so its workers are AbstractPolicyWorkers and answer ``is_alive``
+        like any other -- the fleet probe needs no knowledge of which of the two it holds.
+        """
+        leader_idx = self.worker_group.get_dp_leader_worker_idx(shard_idx)
+        return self.worker_group.workers[leader_idx].is_alive.remote()
+
     def init_collective(
         self,
         ip: str,
@@ -622,6 +633,29 @@ class MegatronGeneration(GenerationInterface):
         )
         ray.get(futures)
         return True
+
+    def setup_token_capture(
+        self, dp_cfg: "DataPlaneConfig", staging_partition: str
+    ) -> None:
+        """Install MInf's canonical prompt and completion capture hooks."""
+        if not self.cfg["mcore_generation_config"]["expose_http_server"]:
+            raise ValueError(
+                "Megatron token capture requires mcore_generation_config."
+                "expose_http_server=true"
+            )
+        futures = self._policy.worker_group.run_all_workers_single_data(
+            "setup_token_capture",
+            dp_cfg=dp_cfg,
+            staging_partition=staging_partition,
+        )
+        ray.get(futures)
+
+    def set_rollout_weight_version(self, version: int) -> None:
+        """Rotate the policy epoch stamped by MInf on subsequent requests."""
+        futures = self._policy.worker_group.run_all_workers_single_data(
+            "set_rollout_weight_version", version=version
+        )
+        ray.get(futures)
 
     def blocks_training(self) -> bool:
         """Whether the engine must stand down before a training step.

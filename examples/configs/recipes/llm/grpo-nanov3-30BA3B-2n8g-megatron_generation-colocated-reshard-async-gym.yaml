@@ -13,8 +13,12 @@ policy:
   train_global_batch_size: 16
   max_total_sequence_length: 2048
   megatron_cfg:
+    tensor_model_parallel_size: 4
     pipeline_model_parallel_size: 1
     context_parallel_size: 2
+    optimizer:
+      optimizer_cpu_offload: true
+      optimizer_offload_fraction: 1.0
   generation:
     backend: megatron
     refit_transport: mcore
