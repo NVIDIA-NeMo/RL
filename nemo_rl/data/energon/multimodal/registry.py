@@ -354,6 +354,14 @@ TASK_ENCODER_REGISTRY.register(
     ),
     version="1",
 )
+TASK_ENCODER_REGISTRY.register(
+    "nemotron_multimodal",
+    import_path=(
+        "nemo_rl.data.energon.multimodal.task_encoders.nemotron_multimodal:"
+        "NemotronMultiModalTaskEncoder"
+    ),
+    version="1",
+)
 
 
 def selected_registry_identity(

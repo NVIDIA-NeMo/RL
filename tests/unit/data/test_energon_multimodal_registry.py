@@ -38,6 +38,10 @@ def test_builtin_registries_resolve_lazily_with_stable_versions():
         "key": "generic_sft",
         "version": "1",
     }
+    assert TASK_ENCODER_REGISTRY.identity("nemotron_multimodal") == {
+        "key": "nemotron_multimodal",
+        "version": "1",
+    }
     assert selected_registry_identity(
         task_encoder=SimpleNamespace(name="generic_sft", python_file=None, object=None),
         cookers=[
