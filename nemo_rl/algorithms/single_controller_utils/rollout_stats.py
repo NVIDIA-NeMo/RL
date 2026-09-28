@@ -42,6 +42,10 @@ Metrics (logged under the ``train/`` prefix):
   path that flag is set when the rebuilt sequence reaches the max sequence
   length (rollout_reassembler); on the message-log path it is the
   completion's own truncated flag.
+* ``staleness/{mean,max}``: weight versions between the trainer and each row
+  of the step's batch, tagged with its group's oldest model-call version. With
+  in-flight weight updates the mean is an upper bound on the trained tokens'
+  average lag. Unlike the metrics above, these cover every row of the batch.
 * ``gen_tokens/mean_pass``, ``mean_fail``, ``turns/mean_pass``, ``mean_fail``
   are omitted (not logged as 0) when the step has no sample of that outcome.
 
@@ -139,6 +143,25 @@ def accumulate_rollout_stats(
         acc["truncated"].append(truncated.detach().float().reshape(batch).cpu())
     if seq_lens is not None:
         acc["seq_lens"].append(seq_lens.detach().float().reshape(batch).cpu())
+
+
+def staleness_stats(
+    trainer_version: int, sample_versions: list[int]
+) -> dict[str, float]:
+    """Weight versions between the trainer and the step's samples.
+
+    Each sample is tagged with its group's oldest model-call version, so with
+    in-flight weight updates ``staleness/mean`` is an upper bound on the average
+    lag of the trained tokens; ``staleness/max`` is the ``lag`` the step prints.
+    Returns an empty dict for a step without samples.
+    """
+    if not sample_versions:
+        return {}
+    lags = [trainer_version - version for version in sample_versions]
+    return {
+        "staleness/mean": sum(lags) / len(lags),
+        "staleness/max": float(max(lags)),
+    }
 
 
 def _distribution(out: dict[str, float], name: str, values: torch.Tensor) -> None:

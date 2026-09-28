@@ -133,6 +133,7 @@ from nemo_rl.algorithms.single_controller_utils.rollout_stats import (
     accumulate_rollout_stats,
     new_rollout_stats_accumulator,
     reduce_rollout_stats,
+    staleness_stats,
 )
 from nemo_rl.algorithms.single_controller_utils.sample_masks import (
     baseline_valid_mask,
@@ -2626,6 +2627,7 @@ class SingleControllerActor:
             groups_dispatched = 0
             evicted_stale_prompt_groups = 0
             min_sample_version = None
+            sample_versions: list[int] = []
             step_open = False
             chunks_dispatched = 0
             calibration_batches: list[BatchedDataDict[Any]] = []
@@ -2939,6 +2941,10 @@ class SingleControllerActor:
                         )
                     else:
                         min_sample_version = curr_min_sample_version
+                    sample_versions.extend(
+                        t["weight_version"]
+                        for t in train_meta.tags  # type: ignore
+                    )
 
                     groups_dispatched += num_groups
                     chunks_dispatched += 1
@@ -3024,6 +3030,9 @@ class SingleControllerActor:
                     )
                 except Exception as error:  # metrics must never fail a step
                     log.warning("Skipping rollout_stats metrics: %s", error)
+                step_metrics.update(
+                    staleness_stats(version_during_step, sample_versions)
+                )
                 try:
                     step_metrics.update(reduce_masking_stats(self._masking_stats_acc))
                 except Exception as error:  # metrics must never fail a step

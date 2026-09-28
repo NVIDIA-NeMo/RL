@@ -22,6 +22,7 @@ from nemo_rl.algorithms.single_controller_utils.rollout_stats import (
     new_rollout_stats_accumulator,
     per_sample_rollout_stats,
     reduce_rollout_stats,
+    staleness_stats,
 )
 
 
@@ -170,3 +171,10 @@ def test_chunks_accumulate_across_calls_and_empty_is_empty():
         empty, prompt_ids=[1, 1], rewards=[1, 0], sample_mask=[0, 0], gen_tokens=[2, 4]
     )
     assert reduce_rollout_stats(empty) == {}
+
+
+def test_staleness_stats_measure_versions_behind_the_trainer():
+    # Trainer at version 7; rows generated at versions 7, 7, 5 and 3.
+    stats = staleness_stats(7, [7, 7, 5, 3])
+    assert stats == {"staleness/mean": 1.5, "staleness/max": 4.0}
+    assert staleness_stats(7, []) == {}
