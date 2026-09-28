@@ -187,20 +187,6 @@ def normalize_media_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
 # WARNING: A function-call output beginning with HTTP(S) is accepted here and
 # passed to ``resolve_to_image``, which performs an outbound request during
 # postprocessing even when the tool result is not actually an image.
-_IMAGE_SRC_PREFIXES = ("data:image/", "http://", "https://", "file://")
-
-
-def _looks_like_image_src(src: str) -> bool:
-    """True when ``src`` plausibly points at an image the loader can open.
-
-    Guards against tool responses (e.g. ``{"x": 0.65, "y": 0.83}`` from a
-    click tool) that are strings but not image URLs. Without this, the
-    indexer forwards the JSON payload to ``resolve_to_image`` → PIL.open,
-    which treats it as a filesystem path and raises ``FileNotFoundError``.
-    """
-    return src.startswith(_IMAGE_SRC_PREFIXES)
-
-
 def _extract_input_images_from_message(item: dict) -> list[Image.Image]:
     """Pull PIL images out of a non-assistant Responses-API item.
 
@@ -212,9 +198,11 @@ def _extract_input_images_from_message(item: dict) -> list[Image.Image]:
     """
     images: list[Image.Image] = []
     if item.get("type") == "function_call_output":
+        # Tool outputs are free text. Only an inline image data URL is an image
+        # here; printed HTTP/file URLs and tool errors must remain text.
         src = item.get("output")
-        if isinstance(src, str) and _looks_like_image_src(src):
-            images.append(resolve_to_image(src))
+        if isinstance(src, str) and src.startswith("data:image/"):
+            _append_resolved_image(images, src)
         return images
     content = item.get("content") or []
     if not isinstance(content, list):
@@ -228,8 +216,21 @@ def _extract_input_images_from_message(item: dict) -> list[Image.Image]:
         if isinstance(src, dict):
             src = src.get("url")
         if src is not None:
-            images.append(resolve_to_image(src))
+            _append_resolved_image(images, src)
     return images
+
+
+def _append_resolved_image(images: list[Image.Image], src: Any) -> None:
+    """Append a resolved image, skipping malformed or unavailable sources."""
+    try:
+        images.append(resolve_to_image(src))
+    except (FileNotFoundError, OSError, ValueError) as error:
+        preview = src if isinstance(src, str) else type(src).__name__
+        print(
+            "[nemo_gym] skipping non-image source in trajectory "
+            f"({type(error).__name__}): {preview[:120]!r}",
+            flush=True,
+        )
 
 
 def _is_trainable_output_item(item: dict) -> bool:
