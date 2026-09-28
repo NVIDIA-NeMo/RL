@@ -28,6 +28,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 
 nemo_gym = pytest.importorskip("nemo_gym.token_id_capture.staging")
 
@@ -52,10 +53,14 @@ pytestmark = pytest.mark.nemo_gym
 class _MemorySink:
     def __init__(self) -> None:
         self.records: list[StagedCallRecord] = []
+        self.topk: list[tuple[str, torch.Tensor, torch.Tensor]] = []
 
     def stage(self, record: StagedCallRecord) -> StageResult:
         self.records.append(record)
         return StageResult(ok=True, staging_key=record.staging_key)
+
+    def stage_topk(self, staging_key, topk_ids, topk_logprobs) -> None:
+        self.topk.append((staging_key, topk_ids, topk_logprobs))
 
 
 def _fake_worker(*, is_model_owner: bool = True) -> SimpleNamespace:
@@ -65,6 +70,8 @@ def _fake_worker(*, is_model_owner: bool = True) -> SimpleNamespace:
         token_capture=None,
         _rollout_weight_version=0,
         _staging_source=None,
+        _staging_sink=None,
+        _capture_top_logprobs=0,
         _prefix_cache={},
         _prefix_cache_lock=threading.Lock(),
     )
@@ -88,13 +95,19 @@ def test_setup_token_capture_installs_capture_with_vllm_adapter(monkeypatch):
 
     installed = asyncio.run(
         VllmAsyncGenerationWorkerImpl.setup_token_capture(
-            worker, dp_cfg={"backend": "simple"}, staging_partition="rollout_staging"
+            worker,
+            dp_cfg={"backend": "simple"},
+            staging_partition="rollout_staging",
+            top_logprobs=4,
         )
     )
 
     assert installed is True
     assert isinstance(worker.token_capture, RolloutTokenCapture)
     assert worker.token_capture.adapter is not None
+    # The sink and top-k count stay on the worker for the request path.
+    assert worker._staging_sink is sink
+    assert worker._capture_top_logprobs == 4
     # The adapter is the vLLM one (prefix ids enter via the worker's field).
     payload = worker.token_capture.adapter.enter_prefix({}, [1, 2])
     assert payload["required_prefix_token_ids"] == [1, 2]
@@ -104,7 +117,7 @@ def test_setup_token_capture_skips_non_model_owners(monkeypatch):
     worker = _fake_worker(is_model_owner=False)
     installed = asyncio.run(
         VllmAsyncGenerationWorkerImpl.setup_token_capture(
-            worker, dp_cfg={}, staging_partition="rollout_staging"
+            worker, dp_cfg={}, staging_partition="rollout_staging", top_logprobs=0
         )
     )
     assert installed is False
@@ -126,7 +139,7 @@ def test_weight_version_is_stamped_from_worker_state(monkeypatch):
     worker = _fake_worker()
     asyncio.run(
         VllmAsyncGenerationWorkerImpl.setup_token_capture(
-            worker, dp_cfg={}, staging_partition="rollout_staging"
+            worker, dp_cfg={}, staging_partition="rollout_staging", top_logprobs=0
         )
     )
 
@@ -162,11 +175,12 @@ def test_generation_setup_token_capture_fans_out(monkeypatch):
         "nemo_rl.models.generation.vllm.vllm_generation.ray.get",
         lambda futures: futures,
     )
-    gen.setup_token_capture({"backend": "simple"}, "rollout_staging")
+    gen.setup_token_capture({"backend": "simple"}, "rollout_staging", 4)
     gen.worker_group.run_all_workers_single_data.assert_called_once_with(
         "setup_token_capture",
         dp_cfg={"backend": "simple"},
         staging_partition="rollout_staging",
+        top_logprobs=4,
         run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
     )
 
@@ -174,7 +188,7 @@ def test_generation_setup_token_capture_fans_out(monkeypatch):
 def test_generation_setup_token_capture_requires_async_engine():
     gen = _generation_with_mock_group(async_engine=False)
     with pytest.raises(AssertionError, match="async vLLM engine"):
-        gen.setup_token_capture({}, "rollout_staging")
+        gen.setup_token_capture({}, "rollout_staging", 0)
 
 
 def test_generation_set_rollout_weight_version_fans_out(monkeypatch):
@@ -208,6 +222,7 @@ def _worker_with_capture(sink: _MemorySink):
     worker._prefix_cache = {}
     worker._prefix_cache_lock = threading.Lock()
     worker._staging_source = None
+    worker._staging_sink = sink
     worker._delta_align_routed_experts = (
         VllmAsyncGenerationWorkerImpl._delta_align_routed_experts
     )
@@ -456,6 +471,85 @@ def test_request_capture_is_a_noop_without_context_or_capture():
     assert "ng_commit_coords" not in out
     assert out["choices"][0]["logprobs"] is not None  # untouched off the capture path
     assert sink.records == []
+
+
+def _text_root_request() -> _FakeRequest:
+    return _FakeRequest(
+        ng_capture={
+            "rollout_id": "r0",
+            "model_call_id": "c1",
+            "parent_call_id": None,
+            "prev_len": 0,
+            "mode": "text",
+        },
+        stream=False,
+    )
+
+
+def _content_with_topk(gen_ids, logprobs):
+    content = _served_content(gen_ids, logprobs)
+    content["choices"][0]["message"].update(
+        generation_topk_ids=torch.tensor(
+            [[token_id, 1] for token_id in gen_ids], dtype=torch.int32
+        ),
+        generation_topk_logprobs=torch.tensor([[lp, -5.0] for lp in logprobs]),
+    )
+    return content
+
+
+def test_request_capture_stages_topk_after_the_call():
+    sink = _MemorySink()
+    worker = _worker_with_capture(sink)
+    request = _text_root_request()
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11, 12])
+    content = _content_with_topk([13, 14], [-0.1, -0.2])
+    ids = content["choices"][0]["message"]["generation_topk_ids"]
+    logprobs = content["choices"][0]["message"]["generation_topk_logprobs"]
+
+    content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+        worker, request, content
+    )
+
+    assert content["ng_commit_coords"]["disposition"] == "staged"
+    # The top-k lands on the staged row's key, after the digest-covered put.
+    assert sink.topk == [(sink.records[0].staging_key, ids, logprobs)]
+    # It never crosses the worker -> gate hop.
+    assert content["choices"] == [
+        {"index": 0, "message": {"role": "assistant", "content": "x"}}
+    ]
+
+
+def test_request_capture_skips_topk_when_the_call_did_not_stage():
+    class _RejectingSink(_MemorySink):
+        def stage(self, record: StagedCallRecord) -> StageResult:
+            return StageResult(ok=False, staging_key=record.staging_key, error="down")
+
+    sink = _RejectingSink()
+    worker = _worker_with_capture(sink)
+    request = _text_root_request()
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11, 12])
+
+    content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+        worker, request, _content_with_topk([13], [-0.1])
+    )
+
+    assert content["ng_commit_coords"]["disposition"] == "capture_failed"
+    assert sink.topk == []
+    assert "generation_topk_ids" not in content["choices"][0]["message"]
+
+
+def test_request_capture_drops_topk_from_uncaptured_responses():
+    sink = _MemorySink()
+    worker = _worker_with_capture(sink)
+    plain = _FakeRequest(stream=False)  # no ng_capture attribute
+
+    out = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+        worker, plain, _content_with_topk([3], [-0.1])
+    )
+
+    assert "generation_topk_ids" not in out["choices"][0]["message"]
+    assert "generation_topk_logprobs" not in out["choices"][0]["message"]
+    assert sink.topk == []
 
 
 def test_request_capture_abort_fails_the_call_and_drains_state():

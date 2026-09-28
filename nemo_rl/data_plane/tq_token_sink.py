@@ -29,7 +29,10 @@ the wire, matching ``compute_staging_digest``'s float32-bit-pattern scheme, so
 digest recomputation over fetched values is byte-exact. Route payloads never
 ride inside snapshots: the source returns them as separate ``RouteFragment``
 values keyed by staging key, digest-verified by the plan executor at point of
-use.
+use. With ``token_capture.top_logprobs`` the worker adds two more jagged
+columns to the row after the digest-covered put (``stage_topk``): the
+sampler's top-k ids and log-probs of the call's generated tokens. They are not
+digest-covered; the finalizer checks their shape against the generated length.
 """
 
 from __future__ import annotations
@@ -54,6 +57,9 @@ if TYPE_CHECKING:
     )
 
 from nemo_rl.data_plane.schema import (
+    GENERATION_TOPK_FIELDS,
+    GENERATION_TOPK_IDS_FIELD,
+    GENERATION_TOPK_LOGPROBS_FIELD,
     ROUTE_ENCODING_ENVELOPE,
     ROUTE_ENCODING_LIST,
     ROUTE_ENCODING_NONE,
@@ -121,13 +127,16 @@ class FetchedStagedCall:
 
     ``fragment`` is populated only when the fetch requested route payloads
     (direct mode); deferred finalization leaves route bytes in TQ and carries
-    only ``routed_len`` transport metadata.
+    only ``routed_len`` transport metadata. ``topk`` is the call's staged
+    sampler top-k ``(ids, logprobs)``, each ``[generated_len, k]``, only when
+    the fetch requested it.
     """
 
     staging_key: str
     snapshot: StagedCallBaseSnapshot
     routed_len: int
     fragment: RouteFragment | None = None
+    topk: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 def _call_dp(dp_client: Any, method_name: str, **kwargs: Any) -> Any:
@@ -304,6 +313,30 @@ class TQTokenSink:
             )
         return StageResult(ok=True, staging_key=key)
 
+    def stage_topk(
+        self, staging_key: str, topk_ids: torch.Tensor, topk_logprobs: torch.Tensor
+    ) -> None:
+        """Add the sampler's top-k (``[generated_len, k]`` ids and log-probs) to a staged row.
+
+        A second put on the same key: TransferQueue merges columns per
+        (sample, field) and keeps the row's tags. Unlike ``stage`` this raises
+        on failure; the caller logs it and the finalizer rejects the rollout
+        when the row lacks the columns.
+        """
+        _call_dp(
+            self._dp_client,
+            "put_samples",
+            sample_ids=[staging_key],
+            partition_id=self._staging_partition,
+            fields=TensorDict(
+                {
+                    GENERATION_TOPK_IDS_FIELD: topk_ids.unsqueeze(0),
+                    GENERATION_TOPK_LOGPROBS_FIELD: topk_logprobs.unsqueeze(0),
+                },
+                batch_size=[1],
+            ),
+        )
+
     def clear(self, staging_keys: list[str]) -> None:
         """Drop staged rows (finalizer / eviction cleanup)."""
         if not staging_keys:
@@ -374,6 +407,7 @@ class TQTokenSource:
         staging_keys: list[str],
         *,
         include_route_fragments: bool = False,
+        include_topk: bool = False,
     ) -> list[FetchedStagedCall]:
         """Fetch digest-covered base columns, plus route payloads when requested.
 
@@ -381,12 +415,17 @@ class TQTokenSource:
         bytes stay in TQ for the policy worker. Direct mode passes
         ``include_route_fragments=True`` to pull the payloads in the same
         batched read and receives them as ``RouteFragment`` values beside the
-        base snapshots, never inside them.
+        base snapshots, never inside them. ``include_topk`` adds the sampler
+        top-k columns (``token_capture.top_logprobs``); a row without them
+        fails the fetch like a missing row.
         """
         if not staging_keys:
             return []
         if len(set(staging_keys)) != len(staging_keys):
             raise KeyError("finalization staging request contains duplicate keys")
+        base_fields = STAGING_FIELDS + (
+            list(GENERATION_TOPK_FIELDS) if include_topk else []
+        )
         try:
             if include_route_fragments:
                 # Route payloads are optional per run (feature-gated at the
@@ -398,7 +437,7 @@ class TQTokenSource:
                         "get_samples",
                         sample_ids=list(staging_keys),
                         partition_id=self._staging_partition,
-                        select_fields=STAGING_FIELDS + [ROUTED_EXPERTS_FIELD],
+                        select_fields=base_fields + [ROUTED_EXPERTS_FIELD],
                     )
                 except Exception:  # noqa: BLE001 — field-not-present probe
                     rows = _call_dp(
@@ -406,7 +445,7 @@ class TQTokenSource:
                         "get_samples",
                         sample_ids=list(staging_keys),
                         partition_id=self._staging_partition,
-                        select_fields=STAGING_FIELDS,
+                        select_fields=base_fields,
                     )
             else:
                 rows = _call_dp(
@@ -414,7 +453,7 @@ class TQTokenSource:
                     "get_samples",
                     sample_ids=list(staging_keys),
                     partition_id=self._staging_partition,
-                    select_fields=STAGING_FIELDS,
+                    select_fields=base_fields,
                 )
         except Exception as error:  # noqa: BLE001 — protocol maps misses to KeyError
             raise KeyError(
@@ -448,6 +487,14 @@ class TQTokenSource:
                     routed_len=_row_scalar_int(row, ROUTED_LEN_FIELD),
                     fragment=(
                         _row_to_route_fragment(row) if include_route_fragments else None
+                    ),
+                    topk=(
+                        (
+                            row[GENERATION_TOPK_IDS_FIELD][0],
+                            row[GENERATION_TOPK_LOGPROBS_FIELD][0],
+                        )
+                        if include_topk
+                        else None
                     ),
                 )
             )

@@ -620,6 +620,10 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     defer_routed_experts_to_policy: bool = False
     # Fixed CPU finalizer pool size; actors are never automatically replaced.
     num_reassembler_workers: PositiveInt = 2
+    # Also stage the sampler's top-k log-probs for every generated token
+    # (0 = off); loss_fn.score_centering consumes them. Needs
+    # policy.generation.vllm_kwargs.max_logprobs >= top_logprobs.
+    top_logprobs: int = 0
 
 
 @dataclass(frozen=True)
@@ -1265,6 +1269,21 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "reward_penalties require the NeMo-Gym rollout path "
             "(env.should_use_nemo_gym=true) on SingleController"
         )
+
+    top_logprobs = master_config.token_capture.top_logprobs
+    if top_logprobs > 0:
+        if not master_config.token_capture.enabled:
+            raise ValueError(
+                "token_capture.top_logprobs requires token_capture.enabled=true"
+            )
+        vllm_kwargs = master_config.policy["generation"].get("vllm_kwargs") or {}
+        max_logprobs = vllm_kwargs.get("max_logprobs")
+        if max_logprobs is None or max_logprobs < top_logprobs:
+            raise ValueError(
+                "token_capture.top_logprobs requires "
+                f"policy.generation.vllm_kwargs.max_logprobs >= {top_logprobs} "
+                "(vLLM's default is 20)"
+            )
 
     if algo_cfg.num_prompts_per_step < async_config.min_groups_for_streaming_train:
         raise ValueError(

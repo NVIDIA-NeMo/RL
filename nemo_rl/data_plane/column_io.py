@@ -39,6 +39,7 @@ from nemo_rl.data.multimodal_utils import PER_TOKEN_MULTIMODAL_FIELDS
 from nemo_rl.data_plane.codec import materialize, pack_jagged_fields
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
 from nemo_rl.data_plane.schema import (
+    GENERATION_TOPK_FIELDS,
     GLOBAL_FORWARD_PAD_SEQLEN,
     INVALID_TOOL_CALL_MASK,
     MALFORMED_THINKING_MASK,
@@ -65,6 +66,7 @@ _TEXT_TOKEN_ALIGNED_FIELDS = frozenset(
         "token_mask",
         "sample_mask",
         "routed_experts",
+        *GENERATION_TOPK_FIELDS,
         INVALID_TOOL_CALL_MASK,
         MALFORMED_THINKING_MASK,
     }

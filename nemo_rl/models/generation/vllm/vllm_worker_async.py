@@ -47,6 +47,7 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
 from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
+    attach_topk_logprobs_to_chat_response_choices,
     format_prompt_for_vllm_generation,
     model_dump_chat_response_with_dynamic_message_fields,
     pad_and_align_routed_expert_indices,
@@ -199,6 +200,10 @@ class VllmAsyncGenerationWorkerImpl(
         # exact engine prompt ids recorded at preprocess time).
         self._capture_calls: dict[int, tuple[Any, list[int]]] = {}
         self._staging_source: Any | None = None
+        self._staging_sink: Any | None = None
+        # token_capture.top_logprobs: sampler top-k log-probs staged next to each
+        # captured call's delta; 0 leaves captured calls as they are.
+        self._capture_top_logprobs = 0
         # Guarded by _prefix_cache_lock: _fetch_chain_prefix runs on executor
         # threads (asyncio.to_thread), so lookups/evictions can be concurrent.
         self._prefix_cache: dict[str, list[int]] = {}
@@ -465,7 +470,7 @@ class VllmAsyncGenerationWorkerImpl(
         self.token_capture = capture
 
     async def setup_token_capture(
-        self, dp_cfg: dict[str, Any], staging_partition: str
+        self, dp_cfg: dict[str, Any], staging_partition: str, top_logprobs: int
     ) -> bool:
         """Host ledger-authoritative token capture in this worker.
 
@@ -474,6 +479,8 @@ class VllmAsyncGenerationWorkerImpl(
         ``install_capture`` call wiring Gym's engine-blind capture core +
         vLLM adapter into this worker. Returns whether capture was installed
         (False on non-model-owner ranks, which serve no HTTP).
+        ``top_logprobs`` > 0 also stages the sampler's top-k log-probs of every
+        generated token next to the call's delta.
         """
         if not self.is_model_owner:
             return False
@@ -486,6 +493,8 @@ class VllmAsyncGenerationWorkerImpl(
 
         dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
         sink = TQTokenSink(dp_client, staging_partition=staging_partition)
+        self._staging_sink = sink
+        self._capture_top_logprobs = int(top_logprobs)
         self._staging_source = TQTokenSource(
             dp_client, staging_partition=staging_partition
         )
@@ -658,8 +667,18 @@ class VllmAsyncGenerationWorkerImpl(
         failure degrades to capture_failed coords without breaking the
         completion. Token ids and logprobs are stripped: the staged delta is
         the only token store on this path, so the worker->gate hop carries
-        text + delta ids + coords only.
+        text + delta ids + coords only. The sampler's top-k, when attached,
+        is popped first (it never reaches JSON) and written onto the staged
+        row once the call's coords exist.
         """
+        topk = None
+        for choice in content.get("choices") or []:
+            message = choice.get("message")
+            if isinstance(message, dict) and "generation_topk_ids" in message:
+                topk = (
+                    message.pop("generation_topk_ids"),
+                    message.pop("generation_topk_logprobs"),
+                )
         state = self._capture_calls.pop(id(request), None)
         if state is None:
             return content
@@ -682,6 +701,13 @@ class VllmAsyncGenerationWorkerImpl(
                 generated_len=len(generated_token_ids),
             )
         coords = self.token_capture.complete_call_from_response(call, payload)
+        if topk is not None and coords.disposition == "staged":
+            try:
+                self._staging_sink.stage_topk(coords.staging_key, *topk)
+            except Exception:  # noqa: BLE001 — the finalizer rejects a row without its top-k
+                LOGGER.exception(
+                    "staging the sampler top-k failed for %s", coords.staging_key
+                )
         for choice in content.get("choices") or []:
             choice.pop("logprobs", None)
             # The delta-aligned routes were staged to TQ above; the served
@@ -984,6 +1010,16 @@ class VllmAsyncGenerationWorkerImpl(
             # attaches (rollout_id, call_id, parent_call_id, prev_len, mode).
             ng_capture: Optional[dict[str, Any]] = None
 
+            def to_sampling_params(self, *args, **kwargs):
+                params = super().to_sampling_params(*args, **kwargs)
+                # Captured calls also carry the sampler's top-k
+                # (token_capture.top_logprobs). Only the engine's count changes:
+                # the response is still cut at request.top_logprobs (0), so
+                # nothing extra reaches the JSON.
+                if self.ng_capture and worker_self._capture_top_logprobs:
+                    params.logprobs = worker_self._capture_top_logprobs
+                return params
+
         # vLLM 0.25 routes both /v1/chat/completions and /tokenize through
         # OnlineRenderer.preprocess_chat, so the prefix-token override
         # belongs on the renderer subclass.
@@ -1038,6 +1074,12 @@ class VllmAsyncGenerationWorkerImpl(
                         response,
                         final_res,
                     )
+                    if request.ng_capture and worker_self._capture_top_logprobs:
+                        response = attach_topk_logprobs_to_chat_response_choices(
+                            response,
+                            final_res,
+                            top_k=worker_self._capture_top_logprobs,
+                        )
 
                 if worker_self._return_routed_experts_enabled():
                     response = attach_routed_experts_to_chat_response_choices(

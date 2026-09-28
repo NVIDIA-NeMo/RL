@@ -478,6 +478,21 @@ def test_single_controller_ppo_recipe_inherits_overlong_filtering():
     assert config.ppo.overlong_filtering is True
 
 
+def test_token_capture_top_logprobs_requires_capture_and_vllm_max_logprobs():
+    mc = _make_master_config()
+    mc.token_capture.top_logprobs = 4
+
+    with pytest.raises(ValueError, match="token_capture.enabled"):
+        validate_single_controller_config(mc)
+
+    mc.token_capture.enabled = True
+    with pytest.raises(ValueError, match="max_logprobs"):
+        validate_single_controller_config(mc)
+
+    mc.policy["generation"]["vllm_kwargs"] = {"max_logprobs": 4}
+    validate_single_controller_config(mc)
+
+
 @pytest.mark.parametrize(
     ("reference_policy_kl_penalty", "expected_init_reference_model"),
     [(0.0, False), (0.01, True)],

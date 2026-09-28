@@ -78,6 +78,8 @@ class RolloutReassemblerActorConfig:
     router_replay_enabled: bool
     defer_routed_experts_to_policy: bool
     max_seq_len: int
+    # token_capture.top_logprobs: sampler top-k columns to assemble (0 = none).
+    top_logprobs: int
 
 
 def assert_metadata_only(value: Any, *, path: str = "rpc") -> None:
@@ -132,6 +134,7 @@ class RolloutReassemblerActor:  # pragma: no cover
             router_replay_enabled=config.router_replay_enabled,
             defer_routed_experts_to_policy=config.defer_routed_experts_to_policy,
             max_seq_len=config.max_seq_len,
+            top_logprobs=config.top_logprobs,
         )
 
     def finalize(self, request: ReassemblyRequest) -> FinalizedGroup:
