@@ -16,18 +16,25 @@
 import nemo_rl.algorithms.advantage_actor as advantage_actor
 from nemo_rl.algorithms.advantage_actor import _placement_node_ids
 
+# NodeAffinitySchedulingStrategy validates node_id on construction: it decodes
+# as a 28-byte hex string and rejects a nil result. Short labels parse to nil,
+# so the pinning test cannot use them.
+HEAD_ID = "11" * 28
+COMPUTE_A_ID = "aa" * 28
+COMPUTE_B_ID = "bb" * 28
+
 HEAD = {
-    "NodeID": "head",
+    "NodeID": HEAD_ID,
     "Alive": True,
     "Resources": {"CPU": 144.0, "ray_head": 1.0},
 }
 COMPUTE_A = {
-    "NodeID": "aaa",
+    "NodeID": COMPUTE_A_ID,
     "Alive": True,
     "Resources": {"CPU": 144.0, "GPU": 4.0, "worker_units": 4.0},
 }
 COMPUTE_B = {
-    "NodeID": "bbb",
+    "NodeID": COMPUTE_B_ID,
     "Alive": True,
     "Resources": {"CPU": 144.0, "GPU": 4.0, "worker_units": 4.0},
 }
@@ -47,12 +54,12 @@ class TestPlacementNodeIds:
         _patch_cluster(monkeypatch, [HEAD, COMPUTE_A, COMPUTE_B])
         # The regression this guards: plain CPU actors have nothing stopping
         # them from packing onto the head, which still advertises all its CPUs.
-        assert _placement_node_ids() == ["aaa", "bbb"]
+        assert _placement_node_ids() == [COMPUTE_A_ID, COMPUTE_B_ID]
 
     def test_dead_nodes_are_excluded(self, monkeypatch) -> None:
         dead = {**COMPUTE_B, "Alive": False}
         _patch_cluster(monkeypatch, [HEAD, COMPUTE_A, dead])
-        assert _placement_node_ids() == ["aaa"]
+        assert _placement_node_ids() == [COMPUTE_A_ID]
 
     def test_no_dedicated_head_returns_empty(self, monkeypatch) -> None:
         # Without a dedicated head there is no single node to steer away from,
@@ -108,4 +115,4 @@ class TestActorPlacementStrategy:
         recorder = _patch_actor(monkeypatch)
         advantage_actor.create_advantage_actors(None, None, None, num_workers=3)
         pinned = [o["scheduling_strategy"].node_id for o in recorder.options_seen]
-        assert pinned == ["aaa", "bbb", "aaa"]
+        assert pinned == [COMPUTE_A_ID, COMPUTE_B_ID, COMPUTE_A_ID]
