@@ -71,7 +71,7 @@ tests/test_suites/llm/sft-llama3.2-1b-1n4g-fsdp2tp1.v3.sh
 # validate TP/DP
 tests/test_suites/llm/sft-qwen2.5-math7b-2n4g-megatron.sh
 
-# gpt-oss 20b DeepEP test
+# gpt-oss 20b HybridEP test
 tests/test_suites/llm/sft-gpt-oss-20b-1n4g-fsdp4ep4-automodel.sh
 
 # Nemotron 3 Nano 30B A3B Base BF16 tests
