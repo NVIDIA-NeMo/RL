@@ -72,7 +72,7 @@ from nemo_rl.models.policy.utils import (
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.checkpoint_engine import (
-    DTensorCheckpointEngineSendMixin,
+    AutomodelCheckpointEngineSendMixin,
     PolicyCheckpointEngineMixin,
     maybe_preinit_nixl_checkpoint_engine,
 )
@@ -101,7 +101,7 @@ def _refit_tensor_dtype(
     return default_dtype
 
 
-def dtensor_params_generator(
+def automodel_params_generator(
     model: nn.Module, target_dtype: torch.dtype
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Generator that yields (name, tensor) pairs, converting DTensors to local tensors and adapting to HF format.
@@ -190,7 +190,7 @@ def _maybe_adapt_tensor_to_hf(
 # This is useful when using worker extension classes.
 class AutomodelPolicyWorkerImpl(
     TQWorkerMixin,
-    DTensorCheckpointEngineSendMixin,
+    AutomodelCheckpointEngineSendMixin,
     PolicyCheckpointEngineMixin,
     AbstractPolicyWorker,
     ColocatablePolicyInterface,
@@ -1117,7 +1117,7 @@ class AutomodelPolicyWorkerImpl(
 
         # Use the shared implementation
         stream_weights_via_ipc_zmq_impl(
-            params_generator=dtensor_params_generator(self.model, self.dtype),
+            params_generator=automodel_params_generator(self.model, self.dtype),
             buffer_size_bytes=buffer_size_bytes,
             zmq_socket=self.zmq_socket,
             rank=self.rank,
@@ -1158,7 +1158,7 @@ class AutomodelPolicyWorkerImpl(
         )
 
         bucket_iter = iter_named_tensor_buckets(
-            dtensor_params_generator(self.model, self.dtype),
+            automodel_params_generator(self.model, self.dtype),
             buffer_size_bytes=buffer_size_bytes,
         )
         send_hf_buckets_via_ipc_actor_impl(
@@ -1170,7 +1170,7 @@ class AutomodelPolicyWorkerImpl(
     def _checkpoint_engine_params(
         self,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        return dtensor_params_generator(self.model, self.dtype)
+        return automodel_params_generator(self.model, self.dtype)
 
     @torch.no_grad()
     def broadcast_weights_for_collective(
@@ -1227,13 +1227,13 @@ class AutomodelPolicyWorkerImpl(
             self.model = self.move_to_cuda(self.model)
 
         # param_iterator will return (name, tensor), we only need tensor
-        dtensor_post_iter_func = lambda x: x[1]
+        automodel_post_iter_func = lambda x: x[1]
 
         packed_broadcast_producer(
-            iterator=dtensor_params_generator(self.model, self.dtype),
+            iterator=automodel_params_generator(self.model, self.dtype),
             group=self.model_update_group,
             src=0,
-            post_iter_func=dtensor_post_iter_func,
+            post_iter_func=automodel_post_iter_func,
             buffer_size_bytes=buffer_size_bytes,
             num_buffers=num_buffers,
         )
