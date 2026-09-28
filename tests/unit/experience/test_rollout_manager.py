@@ -45,6 +45,7 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data.processors import nemo_gym_data_processor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.environments.interfaces import EnvironmentReturn
 from nemo_rl.experience.failures import GenerationUnavailable
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
@@ -101,7 +102,7 @@ def _with_cut(buffer, callback):
     return _run(apply())
 
 
-def test_generate_response_forwards_message_log_media_to_generation() -> None:
+def test_generate_response_forwards_all_vllm_media_to_generation() -> None:
     captured: dict[str, BatchedDataDict] = {}
 
     class _Generation:
@@ -131,6 +132,7 @@ def test_generate_response_forwards_message_log_media_to_generation() -> None:
     manager._deadline_registry = None
     pixel_values = PackedTensor(torch.ones(2, 3, 4, 4), dim_to_pack=0)
     imgs_sizes = PackedTensor(torch.tensor([[4, 4], [4, 4]]), dim_to_pack=0)
+    native_image = object()
     message_log = [
         {
             "role": "user",
@@ -147,13 +149,22 @@ def test_generate_response_forwards_message_log_media_to_generation() -> None:
     ]
 
     assistant_message, input_lengths, _ = _run(
-        manager._generate_response(message_log, ["<stop>"])
+        manager._generate_response(
+            message_log,
+            ["<stop>"],
+            native_generation_data={
+                "vllm_content": "rendered prompt",
+                "vllm_multi_modal_data": {"image": native_image},
+            },
+        )
     )
 
     generation_data = captured["data"]
     assert generation_data["input_ids"].tolist() == [[1, 2, 3, 4, 5]]
     assert generation_data["input_lengths"].tolist() == [5]
     assert generation_data["stop_strings"] == [["<stop>"]]
+    assert generation_data["vllm_content"] == ["rendered prompt"]
+    assert generation_data["vllm_multi_modal_data"] == [{"image": native_image}]
     assert isinstance(generation_data["pixel_values"], PackedTensor)
     assert isinstance(generation_data["imgs_sizes"], PackedTensor)
     assert torch.equal(
@@ -165,6 +176,93 @@ def test_generate_response_forwards_message_log_media_to_generation() -> None:
     assert input_lengths.tolist() == [5]
     assert assistant_message["content"] == "answer"
     assert assistant_message["token_ids"].tolist() == [42]
+
+
+def test_run_single_rollout_preserves_native_media_across_turns(monkeypatch) -> None:
+    calls: list[dict] = []
+    image = object()
+    audio = object()
+    video = object()
+
+    async def generate_response(
+        _message_log,
+        _stop_strings,
+        *,
+        native_generation_data=None,
+    ):
+        calls.append(dict(native_generation_data or {}))
+        return (
+            {
+                "role": "assistant",
+                "content": "answer",
+                "token_ids": torch.tensor([42]),
+                "generation_logprobs": torch.tensor([0.0]),
+            },
+            torch.tensor(1),
+            {},
+        )
+
+    def calculate_rewards(_batch, _task_to_env):
+        return EnvironmentReturn(
+            observations=[{"role": "user", "content": "next"}],
+            metadata=[None],
+            next_stop_strings=[None],
+            rewards=torch.tensor([0.0]),
+            terminateds=torch.tensor([len(calls) == 2]),
+            answers=[None],
+        )
+
+    class _Tokenizer:
+        def __call__(self, *_args, **_kwargs):
+            return SimpleNamespace(input_ids=torch.tensor([[7]]))
+
+    monkeypatch.setattr(
+        "nemo_rl.experience.rollout_manager.calculate_rewards", calculate_rewards
+    )
+    manager = object.__new__(AsyncRolloutImpl)
+    manager._generate_response = generate_response
+    manager._tokenizer = _Tokenizer()
+    manager._task_to_env = {}
+    manager._max_seq_len = 32
+    manager._max_rollout_turns = 2
+    manager._timeouts = SimpleNamespace(env_s=10.0)
+
+    _run(
+        manager._run_single_rollout(
+            {
+                "idx": 0,
+                "message_log": [
+                    {
+                        "role": "user",
+                        "content": "",
+                        "token_ids": torch.tensor([1]),
+                    }
+                ],
+                "extra_env_info": None,
+                "task_name": "vlm",
+                "vllm_content": "<image><audio><video>",
+                "vllm_multi_modal_data": {
+                    "image": image,
+                    "audio": audio,
+                    "video": video,
+                },
+                # Dropped by #3803's key consolidation: must not be forwarded.
+                "vllm_images": [image],
+            },
+            traj_idx=0,
+        )
+    )
+
+    assert len(calls) == 2
+    assert calls[0]["vllm_content"] == "<image><audio><video>"
+    assert calls[1]["vllm_content"] is None
+    for call in calls:
+        assert call["vllm_multi_modal_data"] == {
+            "image": image,
+            "audio": audio,
+            "video": video,
+        }
+        assert "vllm_images" not in call
 
 
 class _FakeBuffer:
@@ -221,10 +319,21 @@ class _FakeBuffer:
 
 
 class _FakeImpl:
-    """Stand-in for AsyncRolloutImpl that returns a sentinel record."""
+    """Stand-in for AsyncRolloutImpl that returns a typed sentinel record."""
 
     def __init__(self, record="sentinel-record", on_run=None) -> None:
-        self._record = record
+        self._record = (
+            record
+            if isinstance(record, PromptGroupRecord)
+            else PromptGroupRecord(
+                prompt_idx=0,
+                prompt=[],
+                extra_env_info=None,
+                metadata={"sentinel": record},
+                completions=[],
+                rollout_metrics={},
+            )
+        )
         self._on_run = on_run
 
     async def run_rollout(self, input_sample):
@@ -257,6 +366,10 @@ def _make_manager(
         else RolloutRetryPolicy.single_attempt()
     )
     mgr._stats = RolloutStats()
+    mgr._canonical_groups_finalized = 0
+    mgr._canonical_output_tokens = 0
+    mgr._recovery_siblings_reused = 0
+    mgr._recovery_siblings_redispatched = 0
     mgr._skipped_prompts = 0
     mgr._consecutive_infra_drops = 0
     return mgr
@@ -441,10 +554,62 @@ class TestGenerateAndPushFlow:
         assert len(buf.commit_calls) == 1
         gid, record, start_v, end_v = buf.commit_calls[0]
         assert gid in buf._slots
-        assert record == "r0"
+        assert isinstance(record, PromptGroupRecord)
+        assert record.metadata["sentinel"] == "r0"
         assert start_v == 0
         assert end_v == 0
         assert len(mgr.recovery_ledger) == 0
+        assert mgr.telemetry_snapshot()["committed_groups"] == 1
+
+    def test_publication_and_recovery_telemetry_are_cumulative(self):
+        mgr = _make_manager(_FakeBuffer(), _FakeImpl())
+
+        mgr.record_canonical_publication(42)
+        mgr.record_recovery_siblings(reused=3, redispatched=1)
+
+        assert mgr.telemetry_snapshot() == {
+            "committed_groups": 1,
+            "committed_output_tokens": 42,
+            "recovery_siblings_reused": 3,
+            "recovery_siblings_rerun": 1,
+        }
+
+    @pytest.mark.parametrize(
+        ("mean_output_tokens", "expected_output_tokens"),
+        [(3.75, 8), (-2.0, 0)],
+        ids=["rounded-group-total", "negative-total-clamped"],
+    )
+    def test_non_capture_commit_estimates_committed_output_tokens(
+        self,
+        mean_output_tokens: float,
+        expected_output_tokens: int,
+    ) -> None:
+        """The legacy path rounds its per-sample mean and clamps bad totals."""
+        completions = [
+            Completion(
+                message_log=[],
+                env_extras=None,
+                truncated=False,
+                reward=0.0,
+            )
+            for _ in range(2)
+        ]
+        record = PromptGroupRecord(
+            prompt_idx=0,
+            prompt=[],
+            extra_env_info=None,
+            metadata={},
+            completions=completions,
+            rollout_metrics={"mean_gen_tokens_per_sample": mean_output_tokens},
+        )
+        mgr = _make_manager(_FakeBuffer(), _FakeImpl(record=record))
+
+        _run(mgr.generate_and_push({"prompt": "p"}))
+
+        assert (
+            mgr.telemetry_snapshot()["committed_output_tokens"]
+            == expected_output_tokens
+        )
 
     def test_ledger_hands_ownership_to_canonical_buffer_on_commit(self):
         buf = _FakeBuffer()
@@ -900,8 +1065,8 @@ def test_streamed_receipt_callback_uses_current_completion_conversion():
             assert num_returns == "streaming"
             return self
 
-        def remote(self, pending, timer_prefix):
-            del pending, timer_prefix
+        def remote(self, pending, timer_prefix, per_prompt=False):
+            del pending, timer_prefix, per_prompt
 
             async def result_ref():
                 return (
@@ -1721,6 +1886,10 @@ def _make_capture_manager(
         else RolloutRetryPolicy.single_attempt()
     )
     mgr._stats = RolloutStats()
+    mgr._canonical_groups_finalized = 0
+    mgr._canonical_output_tokens = 0
+    mgr._recovery_siblings_reused = 0
+    mgr._recovery_siblings_redispatched = 0
     mgr._skipped_prompts = 0
     mgr._consecutive_infra_drops = 0
     mgr._recovery_ledger = RolloutRecoveryLedger()
