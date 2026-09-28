@@ -344,5 +344,4 @@ def test_weight_update_lifecycle_keeps_full_post_load_for_non_deepseek_models(
         ("stream", None),
         ("post_load", None),
         ("mtp", None),
-        ("kv", None),
     ]
