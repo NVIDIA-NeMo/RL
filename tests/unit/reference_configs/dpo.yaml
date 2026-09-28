@@ -51,9 +51,15 @@ policy:
   offload_optimizer_for_logprob: false
 
   dtensor_cfg:
+    _v2: true
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: ""  # Refers to https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-alloc-conf
     enabled: true
+    checkpoint:
+      model_save_format: "safetensors"
+      save_consolidated: "false"
+      single_rank_consolidation: false
+      consolidation_timeout_minutes: 30
     cpu_offload: False
     sequence_parallel: false
     activation_checkpointing: false
@@ -155,6 +161,7 @@ policy:
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: True
     defer_fp32_logits: False
+    fp32_lm_head: false
     moe_per_layer_logging: False
     moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"

@@ -114,6 +114,18 @@ Generated audit of every test function under `tests/unit/data_plane/` with a one
 - `test_gdr_tensor_put_is_confirmed_once_and_never_falls_back` — A CUDA client's tensor PUT raises rather than downgrading to CPU RDMA, and logs the GDR confirmation exactly once.
 - `test_gdr_receiver_requires_cuda_initialized` — A policy receiver must initialize CUDA before attaching its GDR client.
 
+## `test_mooncake_metrics_port.py` (9 tests)
+
+- `test_master_argv_gains_the_reserved_metrics_port` — The proxy appends `--metrics_port=<reserved>` to `mooncake_master`'s argv.
+- `test_flag_is_appended_so_gflags_takes_it_last` — The flag lands last, which is the occurrence gflags keeps.
+- `test_binary_is_matched_by_basename` — An absolute path to the master still matches.
+- `test_other_launches_pass_through_untouched` — The offload client's launch is left alone and does not mark the master as launched.
+- `test_unknown_attributes_delegate_to_the_real_module` — Everything but `Popen` delegates to the real `subprocess`.
+- `test_patch_covers_the_registry_entry_that_is_actually_called` — Re-registration reaches the bootstrap TQ resolves, not just the module attribute.
+- `test_reinstalling_repoints_the_port_without_stacking` — A second install keeps one wrapper and repoints it.
+- `test_bootstrap_that_skips_the_wrapped_popen_is_a_drift_error` — A bootstrap that launches the master by another route fails loudly instead of silently keeping 9003.
+- `test_init_tq_reserves_every_master_port_from_the_band` — Metadata, master RPC and metrics ports all come from the data-plane band, and no `metrics_port` config key is sent.
+
 ## `test_message_log_decompose.py` (11 tests)
 
 - `test_decompose_message_log_basic_shapes` — Basic shapes of decompose output.

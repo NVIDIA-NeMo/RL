@@ -49,6 +49,7 @@ from nemo_rl.experience.failures import (
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
+    PromptGroupRecord,
 )
 from nemo_rl.experience.rollout_manager import (
     RolloutManager,
@@ -99,7 +100,14 @@ class _ScriptedImpl:
             failure = self._failures[index]
             if failure is not None:
                 raise failure
-        return f"record-{index}"
+        return PromptGroupRecord(
+            prompt_idx=0,
+            prompt=[],
+            extra_env_info=None,
+            metadata={"sentinel": f"record-{index}"},
+            completions=[],
+            rollout_metrics={},
+        )
 
 
 def _make_manager(buffer, impl, policy) -> RolloutManager:
@@ -111,6 +119,10 @@ def _make_manager(buffer, impl, policy) -> RolloutManager:
     manager._weight_version = 0
     manager._retry_policy = policy
     manager._stats = RolloutStats()
+    manager._canonical_groups_finalized = 0
+    manager._canonical_output_tokens = 0
+    manager._recovery_siblings_reused = 0
+    manager._recovery_siblings_redispatched = 0
     manager._skipped_prompts = 0
     manager._consecutive_infra_drops = 0
     return manager

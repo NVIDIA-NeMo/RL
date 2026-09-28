@@ -62,9 +62,11 @@ from megatron.bridge.training.utils.pg_utils import get_pg_collection
 from megatron.bridge.utils.cuda_graph import set_cuda_graph_modules
 from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
+from megatron.core.extensions.transformer_engine import TEQuantizationParams
 from megatron.core.inference.shards import build_inference_pg_collection
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.quantization.quant_config import MatchContext, RecipeConfig
 from megatron.core.quantization.utils import load_quantization_recipe
 from megatron.core.rerun_state_machine import RerunMode, get_rerun_state_machine
 from megatron.core.transformer import MegatronModule
@@ -75,6 +77,16 @@ from megatron.core.utils import get_model_config
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.distributed.model_utils import patch_gpt_model_forward_for_linear_ce_fusion
+from nemo_rl.models.generation.vllm.config import (
+    VllmConfig,
+    parse_nvfp4_pertoken_rollout,
+)
+from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
+    resolve_boundary_ignore_patterns,
+)
+from nemo_rl.models.megatron.draft.optimizer import (
+    build_draft_optimizer_override_provider,
+)
 
 _HF_CONFIG_PATCHED = False
 
@@ -301,8 +313,8 @@ from nemo_rl.models.megatron.config import (
     ModelAndOptimizerState,
     RuntimeConfig,
 )
+from nemo_rl.models.megatron.draft.training import resolve_draft_speculator
 from nemo_rl.models.megatron.draft.utils import (
-    build_draft_model,
     find_draft_owner_chunk,
     get_attached_draft_model,
 )
@@ -316,6 +328,7 @@ from nemo_rl.models.megatron.router_replay import (
     validate_router_replay_config,
 )
 from nemo_rl.models.policy import (
+    Fp4Config,
     MegatronConfig,
     MegatronPeftConfig,
     PolicyConfig,
@@ -388,9 +401,6 @@ def destroy_parallel_state():
     # Also reset the Megatron async calls queue if it exists
     try:
         import megatron.training.async_utils as megatron_async_utils
-        from megatron.core.dist_checkpointing.strategies.async_utils import (
-            AsyncCallsQueue,
-        )
 
         # Clean up any existing async callers first
         old_call_idx = getattr(
@@ -408,8 +418,9 @@ def destroy_parallel_state():
             megatron_async_utils._async_calls_queue.close()
         except:
             pass  # Ignore errors during cleanup
-        # Reset the Megatron global async calls queue as well
-        megatron_async_utils._async_calls_queue = AsyncCallsQueue()
+        # Reset the Megatron global async calls queue as well. Mcore rebuilds it
+        # lazily in _get_async_calls_queue() using flags from the run's args.
+        megatron_async_utils._async_calls_queue = None
         print(
             f"[DEBUG] Reset Megatron async calls queue (old call_idx: {old_call_idx})"
         )
@@ -685,9 +696,9 @@ def _validate_peft_restore_config(
                 "donor to target the same modules; train a new adapter instead."
             )
     # These megatron-bridge LoRA fields change the adapter shape/key layout
-    # for MoE expert layers. NeMo RL never sets them (a run always uses the
-    # bridge defaults), but a native Megatron-Bridge donor checkpoint may
-    # have; a mismatch would restore onto a different adapter layout.
+    # for MoE expert layers. Compare configured values when NeMo RL exposes
+    # them and bridge defaults otherwise; a mismatch would restore onto a
+    # different adapter layout.
     lora_field_defaults = {field.name: field.default for field in fields(LoRA)}
     for key in (
         "normalize_moe_lora",
@@ -1453,10 +1464,56 @@ def _validate_te_precision_config(
                 )
 
 
+def _validate_nvfp4_pertoken_precision_recipe(quant_recipe: RecipeConfig) -> None:
+    """Check effective module precision under the outer NVFP4 autocast context."""
+    expected_precision = {
+        "decoder.layers.0.self_attention.linear_qkv": "bf16",
+        "decoder.layers.0.self_attention.linear_proj": "bf16",
+        "decoder.layers.0.mlp.experts.linear_fc1": "nvfp4",
+        "decoder.layers.0.mlp.experts.linear_fc2": "nvfp4",
+        "decoder.layers.0.mlp.linear_fc1": "bf16",
+        "decoder.layers.0.mlp.linear_fc2": "bf16",
+        "decoder.layers.0.mlp.shared_experts.linear_fc1": "bf16",
+        "decoder.layers.0.mlp.shared_experts.linear_fc2": "bf16",
+    }
+    mismatches = []
+    for path, expected in expected_precision.items():
+        matched = quant_recipe.match(MatchContext(module_path=path, layer_number=0))
+        params = (
+            TEQuantizationParams.parse_from_config(matched)
+            if matched is not None
+            else None
+        )
+        for mode in ("training", "evaluation"):
+            # Megatron inherits outer NVFP4 for unmatched modules or recipes
+            # that do not override quantized autocast. Evaluation falls back
+            # to the training recipe only when its own recipe is absent.
+            actual = "nvfp4"
+            if params is not None:
+                recipe = params.training_recipe
+                if mode == "evaluation" and params.evaluation_recipe is not None:
+                    recipe = params.evaluation_recipe
+                if recipe.override_quantized_autocast:
+                    if recipe.fp8_quantization_recipe is not None:
+                        actual = f"fp8 ({_quant_recipe_name(recipe.fp8_quantization_recipe)})"
+                    elif recipe.fp4_quantization_recipe is not None:
+                        actual = _quant_recipe_name(recipe.fp4_quantization_recipe)
+                    else:
+                        actual = "bf16"
+            if actual != expected:
+                mismatches.append(f"{path} ({mode}): expected {expected}, got {actual}")
+    if mismatches:
+        raise ValueError(
+            "generation.nvfp4_pertoken_rollout requires a TE recipe with BF16 "
+            "attention, dense MLPs, and shared experts, and routed-expert-only "
+            "NVFP4 in training and evaluation; mismatches: " + "; ".join(mismatches)
+        )
+
+
 def _apply_precision_config(
     model_cfg: Any, config: PolicyConfig, dtype: torch.dtype
 ) -> None:
-    """Apply precision and dtype configuration."""
+    """Apply dtype and Transformer Engine precision configuration."""
     model_cfg.bf16 = dtype == torch.bfloat16
     model_cfg.fp16 = dtype == torch.float16
 
@@ -1475,8 +1532,20 @@ def _apply_precision_config(
         "float16": torch.float16,
     }
     model_cfg.pipeline_dtype = dtype_map[config["megatron_cfg"]["pipeline_dtype"]]
+    if config["megatron_cfg"].get("fp32_lm_head"):
+        if not hasattr(model_cfg, "logit_dtype"):
+            raise ValueError(
+                "policy.megatron_cfg.fp32_lm_head requires a Megatron-Bridge "
+                "provider that exposes logit_dtype; "
+                f"{type(model_cfg).__name__} does not."
+            )
+        # Megatron-LM emits fp32 logits from a bf16 x bf16 tensor-core GEMM.
+        model_cfg.logit_dtype = torch.float32
 
-    te_precision_config_file = config["megatron_cfg"].get("te_precision_config_file")
+    megatron_cfg = config["megatron_cfg"]
+    fp8_cfg = megatron_cfg.get("fp8_cfg", None)
+    te_precision_config_file = megatron_cfg.get("te_precision_config_file")
+    quant_recipe = None
     if te_precision_config_file is not None:
         te_precision_config_exists = os.path.isfile(te_precision_config_file)
         if not te_precision_config_exists:
@@ -1484,7 +1553,6 @@ def _apply_precision_config(
                 "megatron_cfg.te_precision_config_file does not exist: "
                 f"{te_precision_config_file}"
             )
-        fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
         fp8_cfg_enabled = fp8_cfg is not None and fp8_cfg.get("enabled", False)
         if fp8_cfg_enabled:
             warnings.warn(
@@ -1498,6 +1566,132 @@ def _apply_precision_config(
         quant_recipe = load_quantization_recipe(te_precision_config_file)
         _validate_te_precision_config(quant_recipe, fp8_cfg)
         model_cfg.quant_recipe = quant_recipe
+
+    raw_fp4_cfg = megatron_cfg.get("fp4_cfg", None)
+    fp4_cfg = Fp4Config.model_validate(raw_fp4_cfg) if raw_fp4_cfg is not None else None
+    fp8_on = fp8_cfg is not None and fp8_cfg.get("enabled", False)
+    fp4_on = fp4_cfg is not None and fp4_cfg.enabled
+
+    generation_cfg = config.get("generation")
+    if (
+        fp4_cfg is not None
+        and fp4_on
+        and fp4_cfg.fp4_param
+        and generation_cfg is not None
+    ):
+        raise ValueError(
+            "policy.megatron_cfg.fp4_cfg.fp4_param=true is not supported when "
+            "policy.generation is configured because NeMo-RL refit has no FP4 "
+            "parameter-and-scale export path; set fp4_param=false."
+        )
+    per_token_rollout = (
+        parse_nvfp4_pertoken_rollout(cast(VllmConfig, generation_cfg))
+        if generation_cfg is not None and generation_cfg.get("backend") == "vllm"
+        else None
+    )
+    if per_token_rollout is not None:
+        required_env = {
+            "NVTE_NVFP4_ROW_SCALED_ACTIVATION": "1",
+            "NVTE_NVFP4_DISABLE_RHT": "1",
+            "NVTE_NVFP4_DISABLE_2D_QUANTIZATION": "1",
+            "NVTE_BACKWARD_OVERRIDE": "dequantized",
+        }
+        env_vars = megatron_cfg.get("env_vars") or {}
+        invalid_env = {
+            key: env_vars.get(key)
+            for key, expected in required_env.items()
+            if str(env_vars.get(key)) != expected
+        }
+        if (
+            fp4_cfg is None
+            or not fp4_cfg.enabled
+            or fp4_cfg.fp4 != "e2m1"
+            or fp4_cfg.fp4_recipe != "nvfp4"
+            or fp4_cfg.fp4_param is not False
+            or config.get("precision") != "bfloat16"
+            or config.get("quant_cfg") is not None
+            or invalid_env
+            or not te_precision_config_file
+        ):
+            raise ValueError(
+                "generation.nvfp4_pertoken_rollout requires policy.precision="
+                "bfloat16, policy.quant_cfg=null (TE-only training), "
+                "megatron_cfg.fp4_cfg={enabled: true, fp4: e2m1, "
+                "fp4_recipe: nvfp4, fp4_param: false}, a routed-expert TE "
+                "precision recipe, and env_vars "
+                f"{', '.join(f'{key}={value}' for key, value in required_env.items())}; "
+                f"invalid env values: {invalid_env}"
+            )
+
+    if fp8_on and fp4_on:
+        raise ValueError(
+            "policy.megatron_cfg.fp8_cfg and fp4_cfg cannot both have enabled: "
+            "true (Megatron does not allow fp8 and fp4 together)."
+        )
+
+    if fp8_cfg is not None and fp8_on:
+        try:
+            model_cfg.fp8 = fp8_cfg["fp8"]
+            model_cfg.fp8_recipe = fp8_cfg["fp8_recipe"]
+            model_cfg.fp8_param = fp8_cfg["fp8_param"]
+            model_cfg.fp8_quantizer_factory = fp8_cfg.get("fp8_quantizer_factory")
+        except KeyError as e:
+            raise KeyError(f"Missing key in fp8_cfg: {e}")
+
+    if fp4_cfg is not None and fp4_on:
+        if fp4_cfg.fp4 is None:
+            raise KeyError("Missing key in fp4_cfg: 'fp4'")
+        model_cfg.fp4 = fp4_cfg.fp4
+        model_cfg.fp4_recipe = fp4_cfg.fp4_recipe
+        model_cfg.fp4_param = fp4_cfg.fp4_param
+        model_cfg.fp8 = None
+        print(
+            f"[fp4_cfg] Megatron FP4 training enabled: fp4={fp4_cfg.fp4} "
+            f"recipe={fp4_cfg.fp4_recipe} fp4_param={fp4_cfg.fp4_param}",
+            flush=True,
+        )
+
+    if "first_last_layers_bf16" in megatron_cfg:
+        model_cfg.first_last_layers_bf16 = megatron_cfg["first_last_layers_bf16"]
+    if "num_layers_at_start_in_bf16" in megatron_cfg:
+        model_cfg.num_layers_at_start_in_bf16 = megatron_cfg[
+            "num_layers_at_start_in_bf16"
+        ]
+    if "num_layers_at_end_in_bf16" in megatron_cfg:
+        model_cfg.num_layers_at_end_in_bf16 = megatron_cfg["num_layers_at_end_in_bf16"]
+
+    if quant_recipe is not None:
+        print(
+            "[fp4_cfg] TE per-module precision recipe loaded from "
+            f"{te_precision_config_file}",
+            flush=True,
+        )
+
+    if per_token_rollout is not None:
+        assert quant_recipe is not None
+
+        _validate_nvfp4_pertoken_precision_recipe(quant_recipe)
+
+        num_hidden_layers = getattr(
+            model_cfg, "num_layers", getattr(model_cfg, "num_hidden_layers", None)
+        )
+        # Unconditional parity check against the instantiated MCore config.
+        # The driver owns the derivation; this side only verifies that what the
+        # rollout actually received is the boundary the trainer will use. An
+        # entry point that skipped normalization arrives here with an empty
+        # value and fails, instead of quantizing layers the trainer keeps BF16.
+        resolved_ignore = resolve_boundary_ignore_patterns(
+            num_hidden_layers=num_hidden_layers,
+            first_last_layers_bf16=model_cfg.first_last_layers_bf16,
+            num_layers_at_start_in_bf16=model_cfg.num_layers_at_start_in_bf16,
+            num_layers_at_end_in_bf16=model_cfg.num_layers_at_end_in_bf16,
+            expected_additional_ignore=per_token_rollout.additional_ignore,
+        )
+        print(
+            "[fp4_cfg] verified routed-expert NVFP4 coverage and BF16 boundary "
+            f"parity: {resolved_ignore}",
+            flush=True,
+        )
 
 
 def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
@@ -1604,19 +1798,7 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
         ):
             model_cfg.use_te_rng_tracker = True
 
-    # FP8 configuration
-    fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
-    if fp8_cfg is not None and fp8_cfg.get("enabled", False):
-        try:
-            model_cfg.fp8 = fp8_cfg["fp8"]
-            model_cfg.fp8_recipe = fp8_cfg["fp8_recipe"]
-            model_cfg.fp8_param = fp8_cfg["fp8_param"]
-            model_cfg.fp8_quantizer_factory = fp8_cfg.get("fp8_quantizer_factory")
-        except KeyError as e:
-            raise KeyError(f"Missing key in fp8_cfg: {e}")
-
-    megatron_cfg = config["megatron_cfg"]
-    fine_grained_activation_offloading = megatron_cfg.get(
+    fine_grained_activation_offloading = config["megatron_cfg"].get(
         "fine_grained_activation_offloading"
     )
 
@@ -1626,7 +1808,7 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
         model_cfg.fine_grained_activation_offloading = False
         model_cfg.offload_modules = []
     elif fine_grained_activation_offloading:
-        offload_modules = megatron_cfg.get("offload_modules")
+        offload_modules = config["megatron_cfg"].get("offload_modules")
         if not isinstance(offload_modules, list) or not offload_modules:
             raise ValueError(
                 "offload_modules must be a non-empty list when "
@@ -1898,11 +2080,11 @@ def _create_draft_pre_wrap_hook(
     preload_policy_from_pretrained: bool,
 ) -> Callable[[list[MegatronModule]], list[MegatronModule]]:
     """Create the hook that attaches draft weights before mixed-precision/DDP wrapping."""
-    draft_cfg = policy_cfg["draft"]
+    draft_speculator = resolve_draft_speculator(policy_cfg.get("draft"))
 
     def draft_pre_wrap_hook(model: list[MegatronModule]) -> list[MegatronModule]:
         """Optionally preload the base policy, then attach the draft module to the owner chunk."""
-        if not draft_cfg["enabled"]:
+        if draft_speculator is None:
             return model
 
         # Base pretrained checkpoints do not contain draft weights, so load the
@@ -1937,9 +2119,8 @@ def _create_draft_pre_wrap_hook(
             )
 
         pg_collection = get_pg_collection(model)
-        draft_model = build_draft_model(
-            megatron_cfg.model,
-            draft_config=draft_cfg,
+        draft_model = draft_speculator.build_model(
+            model_provider=megatron_cfg.model,
             pg_collection=pg_collection,
             policy_model_chunk=draft_owner,
         )
@@ -2156,7 +2337,7 @@ def setup_model_and_optimizer(
             "megatron_cfg.peft.restore_from is set but megatron_cfg.peft.enabled "
             "is False. Enable PEFT to warm start from an adapter checkpoint."
         )
-    draft_enabled = "draft" in policy_cfg and policy_cfg["draft"]["enabled"]
+    draft_enabled = "draft" in policy_cfg and policy_cfg["draft"].enabled
     resume_checkpoint_exists = (
         megatron_cfg.checkpoint.load is not None
         and checkpoint_exists(megatron_cfg.checkpoint.load)
@@ -2252,6 +2433,11 @@ def setup_model_and_optimizer(
             a2a_experimental=peft_cfg["a2a_experimental"],
             lora_dtype=peft_cfg["lora_dtype"],
         )
+        if "share_expert_adapters" in peft_cfg:
+            peft = replace(
+                peft,
+                share_expert_adapters=peft_cfg["share_expert_adapters"],
+            )
         # Resolve and validate the warm-start donor checkpoint up front so a
         # bad path or mismatched donor fails before any model construction.
         peft_restore_dir = None
@@ -2357,6 +2543,9 @@ def setup_model_and_optimizer(
             scheduler_config=megatron_cfg.scheduler,
             model=model,
             use_gloo_process_groups=megatron_cfg.dist.use_gloo_process_groups,
+            optimizer_config_override_provider=build_draft_optimizer_override_provider(
+                policy_cfg.get("draft")
+            ),
         )
     else:
         optimizer = None
@@ -2581,6 +2770,11 @@ def setup_reference_model_state(
             a2a_experimental=peft_cfg["a2a_experimental"],
             lora_dtype=peft_cfg["lora_dtype"],
         )
+        if "share_expert_adapters" in peft_cfg:
+            peft = replace(
+                peft,
+                share_expert_adapters=peft_cfg["share_expert_adapters"],
+            )
     else:
         peft = None
 
@@ -2673,9 +2867,9 @@ def setup_reference_model_state(
 def load_teacher_output_layer_weight(
     *,
     teacher_pretrained_path: str,
-    local_vocab_size: int,
-    dtype: torch.dtype,
-) -> torch.Tensor:
+    local_vocab_size: Optional[int],
+    dtype: Optional[torch.dtype],
+) -> Optional[torch.Tensor]:
     """Load this rank's shard of a teacher checkpoint's LM-head weight.
 
     Full-vocabulary MOPD ships the teacher's hidden states and projects them on
@@ -2696,20 +2890,40 @@ def load_teacher_output_layer_weight(
     vocabulary entries, so the objective is unaffected in practice -- but this
     is a silent fallback, not a re-sharding mechanism.
 
+    Resolving the checkpoint iteration from a checkpoint root goes through
+    Megatron-Bridge's ``read_train_state``, a ``broadcast_object_list`` over the
+    whole student world, so under student pipeline parallelism the stages that
+    own no ``output_layer`` must still call this function. They pass
+    ``local_vocab_size=None`` to request nothing: the load then runs with an
+    empty sharded state dict and returns only the checkpoint's common state.
+    ``dist_checkpointing.load`` itself is rank-local here --
+    ``validate_access_integrity=False`` skips its only all-gather.
+
     Args:
         teacher_pretrained_path: Megatron checkpoint root of the teacher.
-        local_vocab_size: This rank's vocabulary shard width.
-        dtype: Dtype to materialize the shard in.
+        local_vocab_size: This rank's vocabulary shard width, or ``None`` to
+            request nothing.
+        dtype: Dtype to materialize the shard in. Unused, and expected to be
+            ``None``, when ``local_vocab_size`` is ``None``.
 
     Returns:
-        The ``[local_vocab_size, hidden_size]`` weight shard on CPU.
+        The ``[local_vocab_size, hidden_size]`` weight shard on CPU, or ``None``
+        when this rank requested nothing.
 
     Raises:
         FileNotFoundError: If the checkpoint root holds no readable iteration.
         KeyError: If neither an output-layer nor a tied-embedding weight exists.
         TypeError: If the loaded checkpoint entry is not a ``torch.Tensor``.
-        ValueError: If the checkpoint tensor is not a rank-2 matrix.
+        ValueError: If the checkpoint tensor is not a rank-2 matrix, or if
+            exactly one of ``local_vocab_size`` / ``dtype`` is ``None``.
     """
+    if (local_vocab_size is None) != (dtype is None):
+        raise ValueError(
+            "load_teacher_output_layer_weight takes local_vocab_size and dtype "
+            "together: pass both to request a shard, or neither to request "
+            f"nothing. Got local_vocab_size={local_vocab_size!r}, "
+            f"dtype={dtype!r}."
+        )
     from megatron.bridge.training.utils.checkpoint_utils import (
         TRACKER_PREFIX,
         get_checkpoint_name,
@@ -2767,22 +2981,29 @@ def load_teacher_output_layer_weight(
         )
     teacher_hidden_size = int(global_shape[1])
 
-    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-    weight_template = torch.empty(
-        (int(local_vocab_size), teacher_hidden_size), dtype=dtype, device="cpu"
-    )
-    sharded_template = make_tp_sharded_tensor_for_checkpoint(
-        weight_template,
-        key=checkpoint_key,
-        allow_shape_mismatch=True,
-        tp_group=pg_collection.tp,
-        dp_cp_group=pg_collection.dp_cp,
-    )
-    loaded = dist_checkpointing.load(
-        {checkpoint_key: sharded_template},
+    sharded_state_dict = {}
+    if local_vocab_size is not None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        weight_template = torch.empty(
+            (int(local_vocab_size), teacher_hidden_size), dtype=dtype, device="cpu"
+        )
+        sharded_state_dict[checkpoint_key] = make_tp_sharded_tensor_for_checkpoint(
+            weight_template,
+            key=checkpoint_key,
+            allow_shape_mismatch=True,
+            tp_group=pg_collection.tp,
+            dp_cp_group=pg_collection.dp_cp,
+        )
+
+    loaded_state_dict = dist_checkpointing.load(
+        sharded_state_dict,
         checkpoint_dir,
         validate_access_integrity=False,
-    )[checkpoint_key]
+    )
+    if local_vocab_size is None:
+        return None
+
+    loaded = loaded_state_dict[checkpoint_key]
     if not isinstance(loaded, torch.Tensor):
         raise TypeError(
             f"Expected a Tensor for {checkpoint_key!r} from {checkpoint_dir!r}, "
