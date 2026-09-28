@@ -950,6 +950,19 @@ def test_nemotron_video_timestamps_match_vllm_integer_milliseconds():
     )
 
 
+def test_nemotron_video_single_expansion_aggregates_without_timestamps():
+    expanded = _expand_nemotron_video_placeholders(
+        "<image>\n<image>\n<image>\n<image>\nquestion",
+        embeddings_per_tubelet=[2, 3],
+        frame_indices=[0, 30, 60, 90],
+        fps=30.0,
+        temporal_patch_size=2,
+        expansion_mode="single",
+    )
+
+    assert expanded == "<img>" + "<image>" * 5 + "</img>\nquestion"
+
+
 def test_nemotron_cached_video_uses_native_lossless_manifest(monkeypatch, tmp_path):
     frame_paths = []
     for index in range(4):

@@ -132,6 +132,9 @@ def build_image_preprocessing_config(
     *,
     dynamic_resolution: bool | None = None,
     vision_model_type: str | None = None,
+    dynamic_resolution_model_length: int | None = None,
+    dynamic_resolution_rounding_mode: str | None = None,
+    dynamic_resolution_resize_mode: str | None = None,
 ) -> ImageProcessingConfig:
     """Translate an HF image processor to an MCore config.
 
@@ -141,6 +144,10 @@ def build_image_preprocessing_config(
             `None` leaves MCore's own default in place.
         vision_model_type: Override for `ImageProcessingConfig.vision_model_type`.
             `None` leaves MCore's own default in place.
+        dynamic_resolution_model_length: Optional override for the processor's
+            `max_model_len`.
+        dynamic_resolution_rounding_mode: Optional patch-grid rounding contract.
+        dynamic_resolution_resize_mode: Optional image-resize contract.
     """
 
     def read(*names: str) -> Any:
@@ -188,6 +195,23 @@ def build_image_preprocessing_config(
     else:
         merge_size = int(read("merge_size", "spatial_merge_size") or 1)
 
+    dynamic_resolution_kwargs: dict[str, Any] = {}
+    model_length = (
+        dynamic_resolution_model_length
+        if dynamic_resolution_model_length is not None
+        else read("max_model_len")
+    )
+    if model_length is not None:
+        dynamic_resolution_kwargs["dynamic_resolution_model_length"] = int(model_length)
+    if dynamic_resolution_rounding_mode is not None:
+        dynamic_resolution_kwargs["dynamic_resolution_rounding_mode"] = str(
+            dynamic_resolution_rounding_mode
+        )
+    if dynamic_resolution_resize_mode is not None:
+        dynamic_resolution_kwargs["dynamic_resolution_resize_mode"] = str(
+            dynamic_resolution_resize_mode
+        )
+
     return ImageProcessingConfig(
         patch_dim=int(patch_dim),
         **(
@@ -205,6 +229,7 @@ def build_image_preprocessing_config(
         spatial_merge_size=merge_size,
         dynamic_resolution_min_patches=int(min_patches),
         dynamic_resolution_max_patches=int(max_patches),
+        **dynamic_resolution_kwargs,
         pixel_mean=[float(value) for value in pixel_mean],
         pixel_std=[float(value) for value in pixel_std],
     )

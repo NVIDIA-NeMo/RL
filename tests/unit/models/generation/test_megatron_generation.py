@@ -64,7 +64,7 @@ def _master_config_for_megatron_validation(
 
 
 @pytest.mark.mcore
-def test_nemotron_video_style_materializes_megatron_prompt_contract() -> None:
+def test_nemotron_video_style_does_not_materialize_megatron_prompt_contract() -> None:
     config = deepcopy(basic_megatron_test_config)
     mcore_config = config["generation"]["mcore_generation_config"]
     mcore_config["multimodal_prompt_config"] = {
@@ -83,14 +83,11 @@ def test_nemotron_video_style_materializes_megatron_prompt_contract() -> None:
 
     assert mcore_config["multimodal_prompt_config"]["video_spec"] == {
         "model_token": "<video>",
-        "content_part_separator": "\n",
-        "expansion_mode": "temporal_patch",
-        "include_frame_timestamps_for_nemotron_vl": True,
     }
 
 
 @pytest.mark.mcore
-def test_nemotron_video_style_rejects_conflicting_megatron_prompt_contract() -> None:
+def test_nemotron_video_style_accepts_explicit_megatron_prompt_contract() -> None:
     config = deepcopy(basic_megatron_test_config)
     config["generation"]["mcore_generation_config"]["multimodal_prompt_config"] = {
         "video_spec": {"expansion_mode": "single"}
@@ -99,8 +96,11 @@ def test_nemotron_video_style_rejects_conflicting_megatron_prompt_contract() -> 
         config, {"default": {"video_sampling_style": "nemotron_vl"}}
     )
 
-    with pytest.raises(ValueError, match="video_spec conflicts"):
-        MegatronGeneration.validate_settings(master_config)
+    MegatronGeneration.validate_settings(master_config)
+
+    assert config["generation"]["mcore_generation_config"]["multimodal_prompt_config"][
+        "video_spec"
+    ] == {"expansion_mode": "single"}
 
 
 @pytest.mark.mcore
@@ -554,6 +554,34 @@ def test_bridge_refit_converts_external_state_through_streaming_api() -> None:
     assert worker._generation_refit_pending_weights == {}
 
 
+@pytest.mark.parametrize(
+    ("ignore_eos", "expected_termination_id"),
+    [(False, 42), (True, None)],
+)
+def test_sampling_params_can_ignore_eos(
+    monkeypatch, ignore_eos, expected_termination_id
+):
+    worker = object.__new__(MegatronGenerationMixin)
+    worker.cfg = {
+        "generation": {
+            "temperature": 1.0,
+            "top_k": None,
+            "top_p": 1.0,
+            "max_new_tokens": 8,
+            "ignore_eos": ignore_eos,
+        }
+    }
+    worker.megatron_tokenizer = SimpleNamespace(eod=42)
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.megatron.megatron_worker.SamplingParams",
+        lambda **kwargs: kwargs,
+    )
+
+    params = worker._build_sampling_params(greedy=False, stop_words=None)
+
+    assert params["termination_id"] is expected_termination_id
+
+
 @pytest.mark.mcore
 def test_multimodal_preprocessing_requires_policy_processor():
     class _ImageWrapper:
@@ -583,9 +611,19 @@ def test_multimodal_preprocessing_forwards_vision_model_type():
         )
     )
 
-    config = worker._build_image_preprocessing_config({"vision_model_type": "qwen-vl"})
+    config = worker._build_image_preprocessing_config(
+        {
+            "vision_model_type": "qwen-vl",
+            "image_dynamic_resolution_model_length": 16384,
+            "image_dynamic_resolution_rounding_mode": "round_plus_half",
+            "image_dynamic_resolution_resize_mode": "torch_bicubic_antialias",
+        }
+    )
 
     assert config.vision_model_type == "qwen-vl"
+    assert config.dynamic_resolution_model_length == 16384
+    assert config.dynamic_resolution_rounding_mode == "round_plus_half"
+    assert config.dynamic_resolution_resize_mode == "torch_bicubic_antialias"
 
 
 @pytest.mark.mcore

@@ -95,6 +95,7 @@ class TaskDataSpec:
     video_temporal_patch_size: Optional[int] = None
     video_maintain_aspect_ratio: Optional[bool] = None
     pad_audio_to_hop_length: Optional[bool] = None
+    video_prompt_expansion_mode: Optional[str] = None
     min_generation_tokens: Optional[int] = None
 
     def __post_init__(self) -> None:

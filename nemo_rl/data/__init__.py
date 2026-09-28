@@ -49,6 +49,7 @@ class ResponseDatasetConfig(TypedDict):
     # Zero-pad audio to a multiple of the feature hop length, matching vLLM
     # models that do this before feature extraction (e.g. Qwen3-Omni).
     pad_audio_to_hop_length: NotRequired[bool]
+    video_prompt_expansion_mode: NotRequired[Literal["single", "temporal_patch"]]
     min_generation_tokens: NotRequired[int]
     max_samples: NotRequired[int | None]
 
@@ -70,6 +71,7 @@ class PreferenceDatasetConfig(TypedDict):
     video_temporal_patch_size: NotRequired[int]
     video_maintain_aspect_ratio: NotRequired[bool]
     pad_audio_to_hop_length: NotRequired[bool]
+    video_prompt_expansion_mode: NotRequired[Literal["single", "temporal_patch"]]
     min_generation_tokens: NotRequired[int]
     split_validation_size: NotRequired[float | int]
     legacy_validation_split: NotRequired[bool]

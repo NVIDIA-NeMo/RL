@@ -782,6 +782,10 @@ def nemo_gym_example_to_video_datum_spec(
             temporal_patch_size=temporal_patch_size,
             target_num_patches=int(video_target_num_patches),
             maintain_aspect_ratio=maintain_aspect_ratio,
+            prompt_expansion_mode=getattr(
+                data_config, "video_prompt_expansion_mode", None
+            )
+            or "temporal_patch",
         )
     else:
         processor_kwargs: dict[str, Any] = {
