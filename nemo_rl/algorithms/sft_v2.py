@@ -321,11 +321,7 @@ class SFTSingleControllerActor:
             for key, value in placed_phases.items():
                 metrics[f"placed_{key}"] = float(value)
         phase_names = sorted(
-            {
-                phase
-                for envelope in envelopes
-                for phase in envelope.load_phase_seconds
-            }
+            {phase for envelope in envelopes for phase in envelope.load_phase_seconds}
         )
         for phase in phase_names:
             values = [

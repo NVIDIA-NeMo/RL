@@ -1910,9 +1910,7 @@ class MegatronPolicyWorkerImpl(
         empty_cache_started = time.monotonic()
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
             torch.cuda.empty_cache()
-        self._add_step_phase(
-            "empty_cache", time.monotonic() - empty_cache_started
-        )
+        self._add_step_phase("empty_cache", time.monotonic() - empty_cache_started)
         self._log_gpu_mem("chunk_exit")
 
         # Collect per-mb metrics from the last PP stage; broadcast to all
