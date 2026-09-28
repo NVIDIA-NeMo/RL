@@ -389,6 +389,18 @@ class MegatronGenerationMixin:
             image_kwargs["vision_model_type"] = str(
                 generation_config["vision_model_type"]
             )
+        if "image_dynamic_resolution_model_length" in generation_config:
+            image_kwargs["dynamic_resolution_model_length"] = int(
+                generation_config["image_dynamic_resolution_model_length"]
+            )
+        if "image_dynamic_resolution_rounding_mode" in generation_config:
+            image_kwargs["dynamic_resolution_rounding_mode"] = str(
+                generation_config["image_dynamic_resolution_rounding_mode"]
+            )
+        if "image_dynamic_resolution_resize_mode" in generation_config:
+            image_kwargs["dynamic_resolution_resize_mode"] = str(
+                generation_config["image_dynamic_resolution_resize_mode"]
+            )
         return build_image_preprocessing_config(
             processor.image_processor,
             **image_kwargs,
@@ -1071,7 +1083,11 @@ class MegatronGenerationMixin:
             skip_prompt_log_probs=True,
             return_log_probs=True,
             num_tokens_to_generate=self.cfg["generation"]["max_new_tokens"],
-            termination_id=self.megatron_tokenizer.eod,
+            termination_id=(
+                None
+                if self.cfg["generation"].get("ignore_eos", False)
+                else self.megatron_tokenizer.eod
+            ),
             stop_words=stop_words,
             return_prompt_tokens=return_prompt_tokens,
             detokenize_stop_sequence=True,

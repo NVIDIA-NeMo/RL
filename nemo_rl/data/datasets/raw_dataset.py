@@ -79,5 +79,8 @@ class RawDataset:
             video_maintain_aspect_ratio=self.data_config.get(
                 "video_maintain_aspect_ratio"
             ),
+            video_prompt_expansion_mode=self.data_config.get(
+                "video_prompt_expansion_mode"
+            ),
             min_generation_tokens=self.data_config.get("min_generation_tokens"),
         )

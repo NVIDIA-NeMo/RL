@@ -222,12 +222,18 @@ def _expand_nemotron_video_placeholders(
     frame_indices: list[int],
     fps: float,
     temporal_patch_size: int,
+    expansion_mode: str = "temporal_patch",
 ) -> str:
-    """Match vLLM's timestamped one-wrapper-per-tubelet video replacement."""
+    """Expand a contiguous frame block into aggregate or timestamped video tokens."""
     if temporal_patch_size < 1:
         raise ValueError("video_temporal_patch_size must be at least 1.")
     if fps <= 0:
         raise ValueError("Nemotron video placeholder expansion requires positive fps.")
+    if expansion_mode not in ("single", "temporal_patch"):
+        raise ValueError(
+            "video_prompt_expansion_mode must be 'single' or 'temporal_patch', "
+            f"got {expansion_mode!r}."
+        )
     parts = rendered_text.split("<image>")
     frame_count = len(parts) - 1
     if len(frame_indices) != frame_count:
@@ -248,6 +254,10 @@ def _expand_nemotron_video_placeholders(
         raise ValueError(
             "Nemotron video frame placeholders must form one contiguous block."
         )
+
+    if expansion_mode == "single":
+        replacement = "<img>" + "<image>" * sum(embeddings_per_tubelet) + "</img>"
+        return parts[0] + replacement + parts[-1]
 
     tubelet_replacements = []
     frame_duration_ms = int(1000.0 / fps)
@@ -279,6 +289,7 @@ def process_nemotron_video_frames(
     temporal_patch_size: int,
     target_num_patches: int,
     maintain_aspect_ratio: bool,
+    prompt_expansion_mode: str = "temporal_patch",
 ) -> dict[str, torch.Tensor]:
     """Port the source branch's dynamic video-frame preprocessing contract."""
     model_name = getattr(processor.tokenizer, "name_or_path", None)
@@ -347,6 +358,7 @@ def process_nemotron_video_frames(
         frame_indices=frame_indices,
         fps=frame_fps,
         temporal_patch_size=temporal_patch_size,
+        expansion_mode=prompt_expansion_mode,
     )
     text_inputs = processor.tokenizer(
         expanded_text,
