@@ -272,6 +272,12 @@ uv run --directory "$PROJECT_ROOT" --no-sync python "$PARITY_HELPER" select-cut 
     --boundary-requirement root --expected-outcome restart
 stop_active_run
 cp "$BASE_RUN_LOG" "$TEST_DIR/recovery-crash-2.log"
+# Reaching train step two requires the restored Workplace call selected in
+# stage one to finish.  The newly selected checkpoint must therefore stop
+# exporting that older checkpoint's generation-prefix keys.  Stage three
+# below then proves this successor checkpoint is independently restorable.
+uv run --directory "$PROJECT_ROOT" --no-sync python "$PARITY_HELPER" \
+    assert-successor-checkpoint "$FIRST_SELECTION" "$SECOND_SELECTION"
 uv run --directory "$PROJECT_ROOT" --no-sync python "$PARITY_HELPER" \
     prune-to-selection "$RECOVERY_CHECKPOINT_DIR" "$SECOND_SELECTION"
 

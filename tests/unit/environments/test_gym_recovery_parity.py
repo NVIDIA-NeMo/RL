@@ -358,6 +358,101 @@ def test_published_snapshots_ignores_uncommitted_trainer_anchors(
     assert _HELPER._published_snapshots(checkpoint_dir) == [published, bootstrap]
 
 
+def test_successor_checkpoint_retires_restored_generation_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_snapshot = tmp_path / "step_0/rollout_snapshots/snapshot_000001"
+    successor_snapshot = tmp_path / "step_2/rollout_snapshots/snapshot_000001"
+    source_selection = tmp_path / "source.json"
+    successor_selection = tmp_path / "successor.json"
+    source_selection.write_text(
+        json.dumps(
+            {
+                "snapshot_path": str(source_snapshot),
+                "checkpoint_id": "checkpoint-a",
+                "base_train_step": 0,
+                "staging_keys": ["prefix-0", "prefix-1"],
+            }
+        )
+    )
+    successor_selection.write_text(
+        json.dumps(
+            {
+                "snapshot_path": str(successor_snapshot),
+                "checkpoint_id": "checkpoint-b",
+                "base_train_step": 2,
+            }
+        )
+    )
+    checkpoint_state = {
+        successor_snapshot.resolve(): ("checkpoint-b", {"terminal-0"}),
+    }
+    monkeypatch.setattr(
+        _HELPER,
+        "_snapshot_storage_reference_keys",
+        checkpoint_state.__getitem__,
+    )
+
+    _HELPER.assert_successor_checkpoint(
+        argparse.Namespace(
+            source_selection=source_selection,
+            successor_selection=successor_selection,
+        )
+    )
+
+
+def test_successor_checkpoint_rejects_historical_generation_prefix_reference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_snapshot = tmp_path / "step_0/rollout_snapshots/snapshot_000001"
+    successor_snapshot = tmp_path / "step_2/rollout_snapshots/snapshot_000001"
+    source_selection = tmp_path / "source.json"
+    successor_selection = tmp_path / "successor.json"
+    source_selection.write_text(
+        json.dumps(
+            {
+                "snapshot_path": str(source_snapshot),
+                "checkpoint_id": "checkpoint-a",
+                "base_train_step": 0,
+                "staging_keys": ["prefix-0"],
+            }
+        )
+    )
+    successor_selection.write_text(
+        json.dumps(
+            {
+                "snapshot_path": str(successor_snapshot),
+                "checkpoint_id": "checkpoint-b",
+                "base_train_step": 2,
+            }
+        )
+    )
+    checkpoint_state = {
+        successor_snapshot.resolve(): (
+            "checkpoint-b",
+            {"prefix-0", "terminal-0"},
+        ),
+    }
+    monkeypatch.setattr(
+        _HELPER,
+        "_snapshot_storage_reference_keys",
+        checkpoint_state.__getitem__,
+    )
+
+    with pytest.raises(
+        AssertionError,
+        match="retained historical generation-prefix references",
+    ):
+        _HELPER.assert_successor_checkpoint(
+            argparse.Namespace(
+                source_selection=source_selection,
+                successor_selection=successor_selection,
+            )
+        )
+
+
 def test_prune_to_selection_removes_only_newer_progress(tmp_path: Path) -> None:
     checkpoint_dir = tmp_path / "checkpoints"
     selected = checkpoint_dir / "step_2/rollout_snapshots/snapshot_000002"

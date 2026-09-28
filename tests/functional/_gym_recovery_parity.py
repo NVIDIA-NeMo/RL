@@ -29,6 +29,8 @@ from _gym_prefix_recovery_snapshot import (
     _active_prefixes,
     _agent_records,
     _is_recoverable_active_prefix,
+    _participant,
+    _read_artifact,
     _read_json,
 )
 
@@ -303,6 +305,73 @@ def select_cut(args: argparse.Namespace) -> None:
     raise TimeoutError(
         "no matching recovery cut was published before the deadline; "
         f"last candidate: {last_error}"
+    )
+
+
+def _snapshot_storage_reference_keys(snapshot: Path) -> tuple[str, set[str]]:
+    """Return one Gym checkpoint's ID and authenticated external TQ keys."""
+    manifest = _read_json(snapshot / "manifest.json")
+    gym_checkpoint = manifest.get("gym_checkpoint")
+    if not isinstance(gym_checkpoint, dict):
+        raise AssertionError("snapshot has no Gym participant checkpoint")
+    checkpoint_id = gym_checkpoint.get("checkpoint_id")
+    if not isinstance(checkpoint_id, str) or not checkpoint_id:
+        raise AssertionError("Gym participant checkpoint has no checkpoint ID")
+    model = _participant(gym_checkpoint, "responses_api_models")
+    storage_reference = model.get("payload", {}).get("storage_reference_index")
+    if not isinstance(storage_reference, dict):
+        raise AssertionError("Gym model checkpoint has no storage-reference index")
+    records = _read_artifact(snapshot, storage_reference)
+    keys = {record.get("key") for record in records}
+    if not all(isinstance(key, str) and key for key in keys):
+        raise AssertionError("Gym storage-reference index contains an invalid key")
+    return checkpoint_id, keys
+
+
+def assert_successor_checkpoint(args: argparse.Namespace) -> None:
+    """Prove a post-recovery checkpoint no longer owns the restored cut keys."""
+    source = _read_json(args.source_selection)
+    successor = _read_json(args.successor_selection)
+    successor_snapshot = Path(successor["snapshot_path"]).resolve()
+    successor_checkpoint_id, successor_references = (
+        _snapshot_storage_reference_keys(successor_snapshot)
+    )
+    source_checkpoint_id = source.get("checkpoint_id")
+    if not isinstance(source_checkpoint_id, str) or not source_checkpoint_id:
+        raise AssertionError("source selection has no checkpoint ID")
+    if successor.get("checkpoint_id") != successor_checkpoint_id:
+        raise AssertionError("successor selection and Gym checkpoint IDs differ")
+    if source_checkpoint_id == successor_checkpoint_id:
+        raise AssertionError(
+            "post-recovery checkpoint reused the restored checkpoint ID"
+        )
+    source_step = source.get("base_train_step")
+    successor_step = successor.get("base_train_step")
+    if (
+        not isinstance(source_step, int)
+        or not isinstance(successor_step, int)
+        or successor_step <= source_step
+    ):
+        raise AssertionError(
+            "successor checkpoint was not published after the restored cut"
+        )
+    source_prefix_keys = set(source.get("staging_keys", []))
+    if not source_prefix_keys or not all(
+        isinstance(key, str) and key for key in source_prefix_keys
+    ):
+        raise AssertionError("source selection has no valid generation-prefix keys")
+    leaked_references = source_prefix_keys & successor_references
+    if leaked_references:
+        raise AssertionError(
+            "post-recovery checkpoint retained historical generation-prefix "
+            f"references: keys={sorted(leaked_references)!r}"
+        )
+    print(
+        "validated post-recovery generation-prefix retirement: "
+        f"source_checkpoint={source_checkpoint_id} "
+        f"successor_checkpoint={successor_checkpoint_id} "
+        f"retired_keys={len(source_prefix_keys)}",
+        flush=True,
     )
 
 
@@ -1085,6 +1154,11 @@ def _parser() -> argparse.ArgumentParser:
     prune.add_argument("checkpoint_dir", type=Path)
     prune.add_argument("selection", type=Path)
     prune.set_defaults(func=prune_to_selection)
+
+    successor = commands.add_parser("assert-successor-checkpoint")
+    successor.add_argument("source_selection", type=Path)
+    successor.add_argument("successor_selection", type=Path)
+    successor.set_defaults(func=assert_successor_checkpoint)
 
     compare = commands.add_parser("compare")
     compare.add_argument("--baseline-events", type=Path, required=True)
