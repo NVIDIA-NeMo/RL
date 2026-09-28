@@ -50,11 +50,17 @@ from nemo_rl.algorithms.loss import (
     wrap_loss_fn_with_input_preparation,
 )
 from nemo_rl.algorithms.loss.draft import DEFAULT_DRAFT_TOKEN_CHUNK_SIZE
-from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import (
+    LossFunction,
+    LossInputType,
+    LossType,
+    MetricNormalizer,
+)
 from nemo_rl.algorithms.loss.utils import _pack_input_ids
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
+    _get_tokens_on_this_cp_rank,
     allgather_cp_sharded_tensor,
     distributed_vocab_topk,
     from_parallel_logits_to_logprobs,
@@ -80,6 +86,78 @@ PostProcessingFunction = Union[
     "TeacherFullPayloadPostProcessor",
     "TopkLogitsPostProcessor",
 ]
+
+
+def _shard_next_token_loss_inputs_for_cp_local_mean(
+    loss_input: dict[str, Any],
+    data: BatchedDataDict[Any],
+    context_parallel_group: torch.distributed.ProcessGroup,
+    packed_boundaries: Optional[torch.Tensor] = None,
+    physical_length: Optional[int] = None,
+) -> tuple[dict[str, Any], BatchedDataDict[Any]]:
+    """Undo NeMo-RL's loss-side CP gather for MCore local-mean semantics."""
+    if "next_token_logprobs" not in loss_input:
+        raise ValueError(
+            "calculate_per_token_loss=False currently requires LOGPROB loss input."
+        )
+
+    cp_size = torch.distributed.get_world_size(context_parallel_group)
+    if cp_size == 1:
+        return loss_input, data
+    cp_rank = torch.distributed.get_rank(context_parallel_group)
+
+    logprobs = loss_input["next_token_logprobs"]
+    target_mask = data["token_mask"][:, 1:]
+    if logprobs.shape != target_mask.shape:
+        raise ValueError(
+            "next-token logprobs and token_mask[:, 1:] must match before CP "
+            f"local-mean sharding, got {tuple(logprobs.shape)} and "
+            f"{tuple(target_mask.shape)}."
+        )
+
+    if packed_boundaries is None:
+        # The model input length, unlike the next-token view, is divisible by
+        # 2*CP. Restore its final masked slot before applying CP zigzag slicing.
+        full_length = physical_length or data["token_mask"].shape[1]
+        pad_length = full_length - logprobs.shape[1]
+        logprobs = torch.nn.functional.pad(logprobs, (0, pad_length))
+        target_mask = torch.nn.functional.pad(target_mask, (0, pad_length))
+        local_logprobs = _get_tokens_on_this_cp_rank(
+            logprobs, cp_rank, cp_size, seq_dim=1
+        )
+        local_target_mask = _get_tokens_on_this_cp_rank(
+            target_mask, cp_rank, cp_size, seq_dim=1
+        )
+    else:
+        total_length = int(packed_boundaries[-1].item())
+        pad_length = total_length - logprobs.shape[1]
+        logprobs = torch.nn.functional.pad(logprobs, (0, pad_length))
+        target_mask = torch.nn.functional.pad(target_mask, (0, pad_length))
+        local_logprob_parts = []
+        local_mask_parts = []
+        for start, end in zip(packed_boundaries[:-1], packed_boundaries[1:]):
+            start_idx = int(start.item())
+            end_idx = int(end.item())
+            local_logprob_parts.append(
+                _get_tokens_on_this_cp_rank(
+                    logprobs[:, start_idx:end_idx], cp_rank, cp_size, seq_dim=1
+                )
+            )
+            local_mask_parts.append(
+                _get_tokens_on_this_cp_rank(
+                    target_mask[:, start_idx:end_idx], cp_rank, cp_size, seq_dim=1
+                )
+            )
+        local_logprobs = torch.cat(local_logprob_parts, dim=1)
+        local_target_mask = torch.cat(local_mask_parts, dim=1)
+
+    local_data = BatchedDataDict(dict(data))
+    local_data["token_mask"] = torch.cat(
+        [torch.zeros_like(local_target_mask[:, :1]), local_target_mask], dim=1
+    )
+    local_loss_input = dict(loss_input)
+    local_loss_input["next_token_logprobs"] = local_logprobs
+    return local_loss_input, local_data
 
 
 def _prepare_padding_mask_for_model(
@@ -574,6 +652,7 @@ class LossPostProcessor:
         prepare_fn: Optional[Callable[..., Any]] = None,
         defer_draft_normalization: bool = False,
         teacher_output_layer_weight_by_index: Optional[dict[int, torch.Tensor]] = None,
+        defer_microbatch_average: bool = False,
     ):
         """Build a per-microbatch loss post-processor for the Megatron train loop.
 
@@ -600,6 +679,9 @@ class LossPostProcessor:
                 argument rather than the data dict because the sequence-packing
                 wrapper batch-slices every data entry, and rather than the loss
                 object because that is pickled to workers.
+            defer_microbatch_average: Keep each microbatch's local mean
+                unaveraged so a caller spanning several forward/backward calls
+                can apply one step-wide microbatch average at finish.
         """
         self.loss_fn = loss_fn
         self.cfg = cfg
@@ -609,6 +691,21 @@ class LossPostProcessor:
         self.prepare_fn = prepare_fn
         self.defer_draft_normalization = defer_draft_normalization
         self.teacher_output_layer_weight_by_index = teacher_output_layer_weight_by_index
+        self.calculate_per_token_loss = cfg["megatron_cfg"][
+            "calculate_per_token_loss"
+        ]
+        self.defer_microbatch_average = defer_microbatch_average
+        if (
+            not self.calculate_per_token_loss
+            and (
+                getattr(loss_fn, "loss_type", None) is not LossType.TOKEN_LEVEL
+                or getattr(loss_fn, "input_type", None) is not LossInputType.LOGPROB
+            )
+        ):
+            raise ValueError(
+                "calculate_per_token_loss=False currently requires a token-level "
+                "LOGPROB loss that reports num_unmasked_tokens."
+            )
         if draft_model is not None and draft_model.eagle_module is not None:
             self.d2t = getattr(draft_model.eagle_module, "d2t", None)
         else:
@@ -649,6 +746,44 @@ class LossPostProcessor:
                 teacher_output_layer_weight_by_index=self.teacher_output_layer_weight_by_index,
             )
 
+        def _maybe_use_cp_local_loss_inputs(
+            prepare_fn: Callable[..., Any],
+            packed_boundaries: Optional[torch.Tensor] = None,
+        ) -> Callable[..., Any]:
+            if self.calculate_per_token_loss:
+                return prepare_fn
+            cp_group = get_context_parallel_group()
+            if get_context_parallel_world_size() == 1:
+                return prepare_fn
+
+            def _prepare_and_shard(*args, **kwargs):
+                logits = kwargs.get("logits", args[0] if args else None)
+                physical_length = (
+                    int(logits.shape[1]) * get_context_parallel_world_size()
+                    if logits is not None
+                    else None
+                )
+                loss_input, prepared_data = prepare_fn(*args, **kwargs)
+                if (
+                    packed_boundaries is not None
+                    and "cu_seqlens" not in prepared_data
+                    and loss_input["next_token_logprobs"].shape[0] != 1
+                ):
+                    raise ValueError(
+                        "calculate_per_token_loss=False with CP and fused sequence "
+                        "packing currently requires an Energon prepacked sample. "
+                        "Set sequence_packing.fuse_loss=false for ordinary batches."
+                    )
+                return _shard_next_token_loss_inputs_for_cp_local_mean(
+                    loss_input,
+                    prepared_data,
+                    cp_group,
+                    packed_boundaries=packed_boundaries,
+                    physical_length=physical_length,
+                )
+
+            return _prepare_and_shard
+
         # wrap loss function with loss input preparation
         pack_sequences = self.cfg["sequence_packing"]["enabled"]
         if pack_sequences and packed_seq_params is not None:
@@ -668,9 +803,14 @@ class LossPostProcessor:
                     sampling_params=self.sampling_params,
                     chunk_size=logprob_chunk_size,
                 )
+                prepare_fn = _maybe_use_cp_local_loss_inputs(
+                    prepare_fn, packed_seq_params.cu_seqlens_q_padded
+                )
             else:
                 wrapper_cls = SequencePackingLossWrapper
-                prepare_fn = prepare_loss_input_wrapped
+                prepare_fn = _maybe_use_cp_local_loss_inputs(
+                    prepare_loss_input_wrapped
+                )
 
             loss_fn_wrapped = wrapper_cls(
                 loss_fn=self.loss_fn,
@@ -710,6 +850,9 @@ class LossPostProcessor:
                     defer_normalization=self.defer_draft_normalization,
                 )
         else:
+            prepare_loss_input_wrapped = _maybe_use_cp_local_loss_inputs(
+                prepare_loss_input_wrapped
+            )
             loss_fn_wrapped = partial(
                 wrap_loss_fn_with_input_preparation,
                 loss_fn=self.loss_fn,
@@ -737,12 +880,82 @@ class LossPostProcessor:
                     defer_normalization=self.defer_draft_normalization,
                 )
 
+        loss_global_valid_toks = global_valid_toks
+        if not self.calculate_per_token_loss:
+            assert global_valid_toks is not None, (
+                "global_valid_toks is required when calculate_per_token_loss=False"
+            )
+            # Ask the loss implementation for its local numerator. MCore divides
+            # this by the returned local token count below.
+            loss_global_valid_toks = torch.ones_like(global_valid_toks)
+
         loss_fn_wrapped = partial(
             loss_fn_wrapped,
             data=data_dict,
             global_valid_seqs=global_valid_seqs,
-            global_valid_toks=global_valid_toks,
+            global_valid_toks=loss_global_valid_toks,
         )
+
+        if not self.calculate_per_token_loss:
+            local_sum_fn = loss_fn_wrapped
+            metric_normalizations = getattr(self.loss_fn, "metric_normalizations", {})
+
+            def _return_local_sum_and_count(*args, **kwargs):
+                local_sum, metrics = local_sum_fn(*args, **kwargs)
+                if "num_unmasked_tokens" not in metrics:
+                    raise ValueError(
+                        "calculate_per_token_loss=False requires the loss to report "
+                        "num_unmasked_tokens."
+                    )
+                num_tokens = torch.as_tensor(
+                    metrics["num_unmasked_tokens"],
+                    dtype=torch.int,
+                    device=local_sum.device,
+                )
+
+                # Keep reporting token-weighted, matching Megatron-LM's default
+                # SFT logger, even though the gradient is a mean of local means.
+                reporting_metrics = dict(metrics)
+                for name, value in reporting_metrics.items():
+                    normalizer = metric_normalizations.get(name)
+                    if normalizer is MetricNormalizer.TOKENS:
+                        denominator = global_valid_toks.clamp(min=1)
+                        cp_group = get_context_parallel_group()
+                        if get_context_parallel_world_size() > 1:
+                            value = torch.as_tensor(
+                                value, dtype=torch.float32, device=local_sum.device
+                            ).detach()
+                            torch.distributed.all_reduce(value, group=cp_group)
+                    elif normalizer is MetricNormalizer.SEQUENCES:
+                        assert global_valid_seqs is not None
+                        denominator = global_valid_seqs.clamp(min=1)
+                    else:
+                        continue
+                    reporting_metrics[name] = value / float(denominator.item())
+
+                # The count returned to MCore must stay CP-local for gradient
+                # normalization. The identically named logging metric should
+                # retain its historical full-sequence meaning.
+                if get_context_parallel_world_size() > 1:
+                    reported_num_tokens = num_tokens.detach().clone()
+                    torch.distributed.all_reduce(
+                        reported_num_tokens, group=get_context_parallel_group()
+                    )
+                    reporting_metrics["num_unmasked_tokens"] = int(
+                        reported_num_tokens.item()
+                    )
+
+                # MCore divides by num_microbatches inside this invocation. The
+                # split API spans several invocations, so cancel that local
+                # average and apply one average over the whole optimizer step.
+                backward_sum = (
+                    local_sum * self.num_microbatches
+                    if self.defer_microbatch_average
+                    else local_sum
+                )
+                return backward_sum, num_tokens, reporting_metrics
+
+            return _return_local_sum_and_count
 
         if self.cp_normalize:
             cp_size = get_context_parallel_world_size()

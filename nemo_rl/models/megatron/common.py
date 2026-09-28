@@ -25,6 +25,58 @@ from megatron.core.transformer.moe.moe_utils import (
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 
 
+_MTP_LOSS_SUMS_KEY = "_nemo_rl_loss_sums"
+_MTP_GLOBAL_TRACKING_PATCH = "_nemo_rl_tracks_global_loss_sums"
+
+
+def _install_global_mtp_loss_tracking() -> None:
+    """Retain MTP loss numerators that the pinned MCore tracker discards.
+
+    The pinned tracker receives a local rolled-token mean and later averages
+    those means across microbatches/ranks. Megatron-LM's current reporting sums
+    raw loss numerators and rolled-token counts instead. Wrap the tracker input
+    once so NeMo-RL can perform that same reduction without changing MTP
+    backward behavior in the dependency.
+    """
+    if getattr(MTPLossLoggingHelper, _MTP_GLOBAL_TRACKING_PATCH, False):
+        return
+
+    original_save = MTPLossLoggingHelper.save_metrics_to_tracker
+
+    def _save_metrics_with_loss_sum(
+        loss: torch.Tensor,
+        correct: torch.Tensor,
+        total: torch.Tensor,
+        layer_number: int,
+        num_layers: int,
+        reduce_group: Optional[torch.distributed.ProcessGroup] = None,
+        avg_group: Optional[torch.distributed.ProcessGroup] = None,
+    ) -> None:
+        original_save(
+            loss,
+            correct,
+            total,
+            layer_number,
+            num_layers,
+            reduce_group=reduce_group,
+            avg_group=avg_group,
+        )
+        if layer_number is None:
+            return
+        tracker = MTPLossLoggingHelper.tracker
+        if _MTP_LOSS_SUMS_KEY not in tracker:
+            tracker[_MTP_LOSS_SUMS_KEY] = torch.zeros_like(tracker["loss_values"])
+        tracker[_MTP_LOSS_SUMS_KEY][layer_number] += loss.detach() * total.detach()
+
+    MTPLossLoggingHelper.save_metrics_to_tracker = staticmethod(
+        _save_metrics_with_loss_sum
+    )
+    setattr(MTPLossLoggingHelper, _MTP_GLOBAL_TRACKING_PATCH, True)
+
+
+_install_global_mtp_loss_tracking()
+
+
 def _round_up_to_multiple(value: int, multiple: int) -> int:
     return (
         ((value + multiple - 1) // multiple * multiple)
@@ -289,23 +341,40 @@ def get_mtp_metrics(loss_scale: float = 1.0) -> dict[str, Any]:
     This function reduces MTP metrics across ranks and returns a dictionary of metrics.
 
     Args:
-        loss_scale: Scale factor applied to each MTP layer's loss (e.g., 1/num_microbatches).
-            ``MTPLossLoggingHelper`` accumulates the per-microbatch loss across microbatches
-            without dividing, so callers must pass 1/num_microbatches to recover the mean
-            (mirroring ``get_moe_metrics``). Acceptance rate is a ratio of counts and is not
-            scaled. Defaults to 1.0.
+        loss_scale: Backward-compatible scale used only when the tracker does
+            not contain raw loss sums. New NeMo-RL workers report a globally
+            rolled-token-normalized value and therefore ignore this scale.
 
     Returns:
         dict[str, Any]: A flat dict of metrics. Each MTP layer's loss is returned
         under the key "mtp_{i}_loss" and acceptance rate under "mtp_{i}_acceptance_rate"
         where i is 1-indexed (matching Megatron-LM).
     """
-    MTPLossLoggingHelper.reduce_metrics_in_tracker()
     tracker = MTPLossLoggingHelper.tracker
+    loss_sums = tracker.get(_MTP_LOSS_SUMS_KEY)
+    if loss_sums is not None:
+        if tracker.get("reduce_group") is not None:
+            torch.distributed.all_reduce(loss_sums, group=tracker["reduce_group"])
+        if tracker.get("avg_group") is not None:
+            torch.distributed.all_reduce(
+                loss_sums,
+                group=tracker["avg_group"],
+                op=torch.distributed.ReduceOp.SUM,
+            )
+    MTPLossLoggingHelper.reduce_metrics_in_tracker()
 
     metrics: dict[str, Any] = {}
     if "loss_values" in tracker:
-        mtp_losses = tracker["loss_values"].float() * loss_scale
+        loss_values = tracker["loss_values"].float()
+        mtp_totals = tracker.get("total_values", torch.ones_like(loss_values))
+        if loss_sums is not None:
+            mtp_losses = torch.where(
+                mtp_totals > 0,
+                loss_sums.float() / mtp_totals.clamp(min=1).float(),
+                torch.zeros_like(loss_sums, dtype=torch.float32),
+            )
+        else:
+            mtp_losses = loss_values * loss_scale
         mtp_corrects = tracker.get("correct_values", torch.zeros_like(mtp_losses))
         mtp_totals = tracker.get("total_values", torch.ones_like(mtp_losses))
         mtp_num_layers = mtp_losses.shape[0]
@@ -318,4 +387,6 @@ def get_mtp_metrics(loss_scale: float = 1.0) -> dict[str, Any]:
             metrics[f"mtp_{i + 1}_acceptance_rate"] = float(acceptance_rate.item())
 
         MTPLossLoggingHelper.clean_metrics_in_tracker()
+        if loss_sums is not None:
+            loss_sums.zero_()
     return metrics

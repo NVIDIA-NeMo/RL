@@ -145,6 +145,7 @@ policy:
 
   megatron_cfg:
     enabled: true
+    calculate_per_token_loss: true
     checkpoint:
       async_save: false
       ckpt_assume_constant_structure: false

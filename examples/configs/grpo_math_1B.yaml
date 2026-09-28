@@ -188,6 +188,8 @@ policy:
   
   megatron_cfg:
     enabled: false
+    # True: normalize by global valid tokens. False: average local microbatch means.
+    calculate_per_token_loss: true
     # Arbitrary overrides applied recursively to the Megatron Bridge model
     # provider before model instantiation. Do not duplicate first-class fields.
     model_overrides: {}
