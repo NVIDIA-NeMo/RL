@@ -101,7 +101,7 @@ def test_every_entrypoint_checks_outdated_config(entrypoint):
 
 
 # ============================================================================
-# reject_outdated_dtensor_cfg_key
+# reject_outdated_automodel_block
 # ============================================================================
 
 
@@ -152,6 +152,52 @@ def test_reward_model_env_is_checked():
     ):
         check_outdated_config(
             {"env": {"reward_model": {"dtensor_cfg": {"enabled": True}}}}
+        )
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_outdated_v2_key_under_the_new_name_is_rejected(value):
+    """Following the rename message must not carry _v2 across."""
+    with pytest.raises(
+        ValueError, match=r"policy\.automodel_cfg\._v2 has been removed"
+    ):
+        check_outdated_config({"policy": {"automodel_cfg": {"_v2": value}}})
+
+
+@pytest.mark.parametrize("section", ["value", "teacher"])
+def test_each_top_level_section_is_checked_for_v2(section):
+    with pytest.raises(
+        ValueError, match=rf"{section}\.automodel_cfg\._v2 has been removed"
+    ):
+        check_outdated_config({section: {"automodel_cfg": {"_v2": True}}})
+
+
+def test_each_teacher_is_checked_for_v2():
+    with pytest.raises(
+        ValueError, match=r"teachers\.1\.automodel_cfg\._v2 has been removed"
+    ):
+        check_outdated_config(
+            {"teachers": [{"automodel_cfg": {}}, {"automodel_cfg": {"_v2": False}}]}
+        )
+
+
+def test_megatron_block_keeps_its_v2():
+    """A Megatron run reads neither key, so a stale _v2 there is not its problem."""
+    check_outdated_config(
+        {
+            "policy": {
+                "megatron_cfg": {"enabled": True},
+                "automodel_cfg": {"enabled": False, "_v2": False},
+            }
+        }
+    )
+
+
+def test_the_rename_is_reported_before_the_v2_key():
+    """A config still on the old block name is told to rename it, not about _v2."""
+    with pytest.raises(ValueError, match="has been renamed"):
+        check_outdated_config(
+            {"policy": {"dtensor_cfg": {"_v2": False}, "automodel_cfg": {"_v2": False}}}
         )
 
 
