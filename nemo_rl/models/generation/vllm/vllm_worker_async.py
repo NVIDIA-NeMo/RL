@@ -1342,13 +1342,38 @@ class VllmAsyncGenerationWorkerImpl(
             cumulative_hash=cumulative_hash,
         )
         generation_token_count = sum(mask == 1.0 for mask in token_mask_delta)
-        if (
-            generation_token_count != continuation.generation_token_count
-            or digest != continuation.digest
-        ):
-            raise RuntimeError(
-                "generation-cut checkpoint coordinates do not match the staged prefix"
+        if generation_token_count != continuation.generation_token_count:
+            message = (
+                "generation-cut token count mismatch: "
+                f"expected={continuation.generation_token_count} "
+                f"actual={generation_token_count} "
+                f"source_capture_key={continuation.source_capture_key!r} "
+                f"source_model_call_id={continuation.source_model_call_id!r}"
             )
+            LOGGER.error("%s", message)
+            raise RuntimeError(message)
+        if digest != continuation.digest:
+            parent_chain_hash_prefix = (
+                admission.parent_chain_hash[:12]
+                if admission.parent_chain_hash is not None
+                else None
+            )
+            message = (
+                "generation-cut digest mismatch: "
+                f"expected={continuation.digest} actual={digest} "
+                f"source_capture_key={continuation.source_capture_key!r} "
+                f"source_model_call_id={continuation.source_model_call_id!r} "
+                f"parent_call_id={admission.parent_call_id!r} "
+                f"mode={admission.mode!r} prev_len={admission.prev_len} "
+                f"delta_len={delta_len} cum_len={cum_len} "
+                f"weight_version={weight_version} "
+                f"schema_version={admission.schema_version} "
+                f"parent_chain_hash_prefix={parent_chain_hash_prefix!r} "
+                f"chain_hash_prefix={chain_hash[:12]!r} "
+                f"cumulative_hash_prefix={cumulative_hash[:12]!r}"
+            )
+            LOGGER.error("%s", message)
+            raise RuntimeError(message)
         snapshot = StagedCallBaseSnapshot(
             rollout_id=continuation.source_capture_key,
             model_call_id=continuation.source_model_call_id,

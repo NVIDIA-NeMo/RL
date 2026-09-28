@@ -1983,6 +1983,22 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion(caplog):
         stream=False,
     )
     admission = resumed_worker._capture_admission(request)
+    bad_count_admission = admission.model_copy(
+        update={
+            "generation_cut": admission.generation_cut.model_copy(
+                update={"generation_token_count": 3}
+            )
+        }
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="generation-cut token count mismatch: expected=3 actual=2",
+    ) as count_error:
+        resumed_worker._resolve_generation_cut(bad_count_admission, [])
+    assert "source_capture_key='r0'" in str(count_error.value)
+    assert "source_model_call_id='c1'" in str(count_error.value)
+    assert str(count_error.value) in caplog.text
+
     bad_admission = admission.model_copy(
         update={
             "generation_cut": admission.generation_cut.model_copy(
@@ -1992,9 +2008,19 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion(caplog):
     )
     with pytest.raises(
         RuntimeError,
-        match="checkpoint coordinates do not match the staged prefix",
-    ):
+        match="generation-cut digest mismatch",
+    ) as digest_error:
         resumed_worker._resolve_generation_cut(bad_admission, [])
+    digest_message = str(digest_error.value)
+    assert f"expected={'0' * 64}" in digest_message
+    assert f"actual={cut_record.digest}" in digest_message
+    assert "parent_call_id=None" in digest_message
+    assert "mode='text' prev_len=0" in digest_message
+    assert "weight_version=7 schema_version=2" in digest_message
+    assert "chain_hash_prefix=" in digest_message
+    assert "cumulative_hash_prefix=" in digest_message
+    assert digest_message in caplog.text
+
     cut = resumed_worker._resolve_generation_cut(admission, [])
     VllmAsyncGenerationWorkerImpl._begin_request_capture(
         resumed_worker,
