@@ -623,7 +623,10 @@ def _write_compare_fixture(tmp_path: Path) -> argparse.Namespace:
     baseline_audit = tmp_path / "baseline-audit.jsonl"
     recovery_audit = tmp_path / "recovery-audit.jsonl"
     mutation = {"event": "mutation_applied", "sentinel_count": 1}
-    _write_jsonl(baseline_audit, [mutation, mutation])
+    _write_jsonl(
+        baseline_audit,
+        [{**mutation, "rollout_id": f"r1_g{index}"} for index in range(2)],
+    )
     _write_jsonl(
         recovery_audit,
         [mutation, mutation, {"event": "state_restored", "sentinel_count": 1}],
@@ -641,6 +644,7 @@ def _write_compare_fixture(tmp_path: Path) -> argparse.Namespace:
         prompts_per_step=2,
         generations_per_prompt=2,
         required_retried_task_source=["simple", "workplace"],
+        workplace_task_source="workplace",
         rtol=1e-5,
         atol=1e-6,
         timeline_output=None,
@@ -653,6 +657,57 @@ def test_compare_runs_accepts_logically_identical_multi_crash_run(
     tmp_path: Path,
 ) -> None:
     _HELPER.compare_runs(_write_compare_fixture(tmp_path))
+
+
+def test_compare_runs_ignores_mutations_from_untrained_prefetch(
+    tmp_path: Path,
+) -> None:
+    args = _write_compare_fixture(tmp_path)
+    # A group prefetched for the step after the last one still mutates.
+    mutation = {"event": "mutation_applied", "sentinel_count": 1}
+    _write_jsonl(
+        args.baseline_audit,
+        [
+            {**mutation, "rollout_id": rollout_id}
+            for rollout_id in ("r1_g0", "r1_g1", "r9_g0")
+        ],
+    )
+
+    _HELPER.compare_runs(args)
+
+
+def test_compare_runs_rejects_missing_trained_workplace_mutation(
+    tmp_path: Path,
+) -> None:
+    args = _write_compare_fixture(tmp_path)
+    _write_jsonl(
+        args.baseline_audit,
+        [{"event": "mutation_applied", "sentinel_count": 1, "rollout_id": "r1_g0"}],
+    )
+
+    with pytest.raises(
+        AssertionError, match="baseline applied 1 Workplace mutations; expected 2"
+    ):
+        _HELPER.compare_runs(args)
+
+
+def test_compare_runs_ignores_logprob_error_metric_noise(tmp_path: Path) -> None:
+    args = _write_compare_fixture(tmp_path)
+    metrics = json.loads(args.recovery_metrics.read_text())
+    metrics["train/gen_kl_error"] = {"1": 0.0125}
+    args.recovery_metrics.write_text(json.dumps(metrics))
+
+    _HELPER.compare_runs(args)
+
+
+def test_compare_runs_rejects_reward_difference(tmp_path: Path) -> None:
+    args = _write_compare_fixture(tmp_path)
+    metrics = json.loads(args.recovery_metrics.read_text())
+    metrics["train/reward"] = {"1": 0.5}
+    args.recovery_metrics.write_text(json.dumps(metrics))
+
+    with pytest.raises(AssertionError, match="metric train/reward step 1 differs"):
+        _HELPER.compare_runs(args)
 
 
 def test_compare_runs_accepts_stage_replayed_after_prune(tmp_path: Path) -> None:

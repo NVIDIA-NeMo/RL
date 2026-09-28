@@ -37,9 +37,17 @@ MAX_STEPS=${SC_GYM_RECOVERY_PARITY_STEPS:-5}
 NUM_PROMPTS=${SC_GYM_RECOVERY_PARITY_PROMPTS_PER_STEP:-2}
 NUM_GENERATIONS=${SC_GYM_RECOVERY_PARITY_GENERATIONS_PER_PROMPT:-2}
 MIN_GENERATION_TOKENS=${SC_GYM_RECOVERY_PARITY_MIN_TOKENS:-256}
-SIMPLE_CUT_PROOF_ITEMS=${SC_GYM_RECOVERY_PARITY_SIMPLE_CUT_PROOF_ITEMS:-512}
-SIMPLE_CUT_MAX_OUTPUT_TOKENS=${SC_GYM_RECOVERY_PARITY_SIMPLE_CUT_MAX_TOKENS:-2048}
-MAX_TOTAL_SEQUENCE_LENGTH=${SC_GYM_RECOVERY_PARITY_MAX_TOTAL_SEQUENCE_LENGTH:-4096}
+# Rollout snapshots are skipped while the trainer checkpoint for the new step
+# is being written (~6s here), and the constrained simple-agent call starts
+# right after weight sync. Its proof array must outlast that save or no
+# snapshot can observe it mid-generation. Qwen tokenizes digits individually,
+# so the complete 1024-item call is ~5.1k tokens (~9s). The output limit must
+# exceed that or the call is truncated, fails to parse, and scores zero. The
+# follow-up turn carries the call in its prompt and gets the same output
+# limit, so the sequence limit covers both.
+SIMPLE_CUT_PROOF_ITEMS=${SC_GYM_RECOVERY_PARITY_SIMPLE_CUT_PROOF_ITEMS:-1024}
+SIMPLE_CUT_MAX_OUTPUT_TOKENS=${SC_GYM_RECOVERY_PARITY_SIMPLE_CUT_MAX_TOKENS:-6144}
+MAX_TOTAL_SEQUENCE_LENGTH=${SC_GYM_RECOVERY_PARITY_MAX_TOTAL_SEQUENCE_LENGTH:-12288}
 CUT_INTERVAL_S=${SC_GYM_RECOVERY_PARITY_CUT_INTERVAL_S:-0.05}
 FINAL_INTERVAL_S=${SC_GYM_RECOVERY_PARITY_FINAL_INTERVAL_S:-600}
 CUT_TIMEOUT_S=${SC_GYM_RECOVERY_PARITY_CUT_TIMEOUT_S:-3600}
@@ -118,7 +126,8 @@ jq -n -c \
             "name": "increment_counter"
           }
         | .responses_create_params.parallel_tool_calls = false
-        | .responses_create_params.max_output_tokens = (if $step >= 2 then $simple_cut_max_output_tokens else 256 end)
+        # The complete 64-item call is ~270 tokens.
+        | .responses_create_params.max_output_tokens = (if $step >= 2 then $simple_cut_max_output_tokens else 384 end)
       ),
       (
         $workplace[0]
@@ -213,6 +222,8 @@ COMMON_OVERRIDES=(
     policy.generation.top_p=0.000001
     "env.nemo_gym.config_paths=$GYM_CONFIG_PATHS"
     env.should_log_nemo_gym_responses=false
+    # Gym reports declined prefix restores at INFO; the outcome check greps them.
+    ++env.nemo_gym.log_level=INFO
     '~env.nemo_gym.code_gen'
 )
 

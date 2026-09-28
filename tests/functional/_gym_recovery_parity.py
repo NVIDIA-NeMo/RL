@@ -35,10 +35,18 @@ from _gym_prefix_recovery_snapshot import (
 )
 
 
-_SEMANTIC_METRICS = (
+# Logprob-error metrics (train/gen_kl_error, token_mult_prob_error, ...) are
+# deliberately excluded. With near-greedy top_p the recompute renormalizes each
+# chosen token to ~0 logprob, so the metric reduces to exp(|generation
+# logprob|) over a few uncertain tokens. Batch-composition noise in vLLM moves
+# it by several percent even between two uninterrupted runs. Token-level
+# equality is checked through the training payload dumps instead.
+_REQUIRED_SEMANTIC_METRICS = (
     "train/reward",
     "train/loss",
-    "train/gen_kl_error",
+)
+_SEMANTIC_METRICS = (
+    *_REQUIRED_SEMANTIC_METRICS,
     "train/advantages/mean",
     "train/advantages/max",
     "train/advantages/min",
@@ -333,8 +341,8 @@ def assert_successor_checkpoint(args: argparse.Namespace) -> None:
     source = _read_json(args.source_selection)
     successor = _read_json(args.successor_selection)
     successor_snapshot = Path(successor["snapshot_path"]).resolve()
-    successor_checkpoint_id, successor_references = (
-        _snapshot_storage_reference_keys(successor_snapshot)
+    successor_checkpoint_id, successor_references = _snapshot_storage_reference_keys(
+        successor_snapshot
     )
     source_checkpoint_id = source.get("checkpoint_id")
     if not isinstance(source_checkpoint_id, str) or not source_checkpoint_id:
@@ -916,7 +924,7 @@ def _compare_metrics(
     baseline = _read_json(baseline_path)
     recovery = _read_json(recovery_path)
     expected_steps = {str(step) for step in range(1, steps + 1)}
-    required = _SEMANTIC_METRICS[:3]
+    required = _REQUIRED_SEMANTIC_METRICS
     for metric in required:
         if metric not in baseline or metric not in recovery:
             raise AssertionError(f"required semantic metric is missing: {metric}")
@@ -951,13 +959,17 @@ def _verify_workplace_audit(
     baseline_path: Path,
     recovery_paths: list[Path],
     *,
-    expected_mutations: int,
+    trained_baseline_rollouts: set[str],
 ) -> None:
     baseline = _read_jsonl(baseline_path)
     recovery = [record for path in recovery_paths for record in _read_jsonl(path)]
     baseline_mutations = [
-        event for event in baseline if event.get("event") == "mutation_applied"
+        event
+        for event in baseline
+        if event.get("event") == "mutation_applied"
+        and event.get("rollout_id") in trained_baseline_rollouts
     ]
+    expected_mutations = len(trained_baseline_rollouts)
     recovery_mutations = [
         event for event in recovery if event.get("event") == "mutation_applied"
     ]
@@ -1117,10 +1129,20 @@ def compare_runs(args: argparse.Namespace) -> None:
         rtol=args.rtol,
         atol=args.atol,
     )
+    # Step membership follows completion order, so a step may train zero, one,
+    # or two Workplace groups, and rollouts prefetched for the step after the
+    # last one still run and mutate. Count only trained Workplace rollouts.
+    trained_workplace_rollouts = {
+        rollout_id
+        for event in baseline_events
+        if event.get("event") == "dispatch"
+        and event.get("task_source") == args.workplace_task_source
+        for rollout_id in event["rollout_ids"]
+    }
     _verify_workplace_audit(
         args.baseline_audit,
         args.recovery_audit,
-        expected_mutations=args.steps * args.generations_per_prompt,
+        trained_baseline_rollouts=trained_workplace_rollouts,
     )
 
 
@@ -1176,6 +1198,10 @@ def _parser() -> argparse.ArgumentParser:
     compare.add_argument("--prompts-per-step", type=int, required=True)
     compare.add_argument("--generations-per-prompt", type=int, required=True)
     compare.add_argument("--required-retried-task-source", action="append", default=[])
+    compare.add_argument(
+        "--workplace-task-source",
+        default="workplace_assistant_prefix_checkpoint_test_agent",
+    )
     compare.add_argument("--rtol", type=float, default=1e-5)
     compare.add_argument("--atol", type=float, default=1e-6)
     compare.set_defaults(func=compare_runs)
