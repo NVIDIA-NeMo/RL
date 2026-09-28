@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from nemo_rl.models.generation.vllm.quantization import fp8_train_utils
 from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
     MXFP8_BLOCK_SIZE,
     MXFP8_SCALE_DTYPE,
@@ -26,7 +27,6 @@ from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
     canonicalize_mxfp8_refit_output,
     mxfp8_e4m3_quantize_for_refit,
 )
-from nemo_rl.models.generation.vllm.quantization import fp8_train_utils
 
 pytestmark = pytest.mark.vllm
 
