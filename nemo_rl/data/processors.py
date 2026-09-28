@@ -955,11 +955,63 @@ def nemo_gym_data_processor(
             task_name=datum_dict["task_name"],
             data_config=task_data_spec,
         )
-        if video_output is None:
-            raise ValueError(
-                "Gym video data configuration requires a static video in every row"
+        # A single NeMo-Gym manifest may mix static-video rows with regular
+        # multimodal rows (for example CAPRL video + SAV tracking images). The
+        # shared data spec still carries video preprocessing settings so video
+        # rows can use the lossless cached-frame path, but those settings must
+        # not turn still-image rows into invalid video examples. Non-video rows
+        # use the normal Gym placeholder below and receive their image tensors
+        # during full-trajectory postprocessing.
+        if video_output is not None:
+            return cast(DatumSpec, video_output)
+
+    if task_data_spec is not None and task_data_spec.image_max_num_tiles is not None:
+        image_max_num_tiles = task_data_spec.image_max_num_tiles
+        if image_max_num_tiles < 1:
+            raise ValueError("image_max_num_tiles must be at least 1.")
+        image_processor = getattr(tokenizer, "image_processor", None)
+        if image_processor is None:
+            raise TypeError(
+                "Gym image_max_num_tiles requires a multimodal processor with "
+                "an image_processor attribute"
             )
-        return cast(DatumSpec, video_output)
+
+        if hasattr(image_processor, "max_num_tiles"):
+            pass
+        elif all(
+            hasattr(image_processor, name)
+            for name in ("min_num_patches", "max_num_patches")
+        ):
+            min_num_patches = image_processor.min_num_patches
+            if (
+                not isinstance(min_num_patches, int)
+                or isinstance(min_num_patches, bool)
+                or min_num_patches < 1
+            ):
+                raise ValueError(
+                    "The configured dynamic image processor has an invalid "
+                    "min_num_patches value."
+                )
+        else:
+            raise ValueError(
+                "The configured image processor supports neither max_num_tiles "
+                "nor a dynamic min_num_patches/max_num_patches budget."
+            )
+
+        # Keep the logical tile cap for Megatron postprocessing and send its
+        # vLLM-facing equivalent with the Gym request. The vLLM
+        # NanoNemotronVLProcessor uses max_num_tiles for both InternVL and
+        # dynamic-resolution checkpoints. The async worker adapts that logical
+        # tile cap to a dynamic min/max patch budget when necessary.
+        extra_env_info["_nemo_rl_image_max_num_tiles"] = image_max_num_tiles
+        from nemo_rl.environments.nemo_gym_multimodal import (
+            _inject_vllm_mm_processor_kwargs,
+        )
+
+        _inject_vllm_mm_processor_kwargs(
+            extra_env_info,
+            {"max_num_tiles": image_max_num_tiles},
+        )
 
     output: DatumSpec = {
         # load to dict format here since `Dataset` cannot handle nested structure well in `NemoGymDataset`
@@ -968,7 +1020,16 @@ def nemo_gym_data_processor(
         "idx": idx,
         "task_name": datum_dict["task_name"],
         # fake keys for compatibility with the current GRPO implementation
-        "message_log": [{"role": "user", "content": "", "token_ids": torch.tensor([])}],
+        # Empty placeholders must use the same dtype as real tokenizer output.
+        # Otherwise a mixed still-image/video Gym batch combines float32 SAV
+        # placeholders with int64 video token IDs and fails before rollout.
+        "message_log": [
+            {
+                "role": "user",
+                "content": "",
+                "token_ids": torch.empty(0, dtype=torch.long),
+            }
+        ],
         "length": 0,
     }
     return output
