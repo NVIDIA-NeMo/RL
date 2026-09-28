@@ -177,7 +177,10 @@ def test_registered_loader_reads_cached_frame_manifest(monkeypatch, tmp_path):
     assert metadata["video_sampling_style"] == "nemotron_vl"
 
 
-def test_cached_video_data_url_requires_no_driver_decoder(monkeypatch, tmp_path):
+@pytest.mark.parametrize("with_timing", [False, True])
+def test_cached_video_data_url_requires_no_driver_decoder(
+    monkeypatch, tmp_path, with_timing
+):
     monkeypatch.setenv("NEMO_RL_VIDEO_MEDIA_ROOT", str(tmp_path))
     frame_paths = []
     for index in range(4):
@@ -185,16 +188,22 @@ def test_cached_video_data_url_requires_no_driver_decoder(monkeypatch, tmp_path)
         Image.new("RGB", (2, 2), color=(index, 0, 0)).save(frame_path)
         frame_paths.append(str(frame_path))
 
-    data_url = utils.build_cached_video_frame_data_url(frame_paths)
+    indices = [0, 6, 12, 18] if with_timing else [0, 1, 2, 3]
+    fps = 23.976 if with_timing else 1.0
+    data_url = utils.build_cached_video_frame_data_url(
+        frame_paths,
+        frame_indices=indices if with_timing else None,
+        frame_fps=[fps] * 4 if with_timing else None,
+    )
 
     _, encoded = data_url.split(",", 1)
     payload = base64.b64decode(encoded)
     manifest = json.loads(payload[len(utils.CACHED_VIDEO_FRAME_MANIFEST_MAGIC) :])
     assert manifest["frame_paths"] == frame_paths
-    assert manifest["metadata"]["frames_indices"] == [0, 1, 2, 3]
-    assert manifest["metadata"]["fps"] == 1.0
-    assert manifest["metadata"]["duration"] == 4.0
-    assert manifest["metadata"]["total_num_frames"] == 4
+    assert manifest["metadata"]["frames_indices"] == indices
+    assert manifest["metadata"]["fps"] == fps
+    assert manifest["metadata"]["duration"] == (max(indices) + 1) / fps
+    assert manifest["metadata"]["total_num_frames"] == max(indices) + 1
 
 
 def test_cached_video_manifest_does_not_import_torchcodec(monkeypatch, tmp_path):
@@ -354,3 +363,31 @@ def test_video_config_rejects_obsolete_video_loader_block():
 
     with pytest.raises(ValueError, match="vllm_cfg.video_loader is not supported"):
         resolve_vllm_video_config(generation)
+
+
+@pytest.mark.parametrize(
+    "indices,fps",
+    [
+        ([0, None], [24.0, 24.0]),
+        ([0, 24], [24.0, None]),
+        ([0, 24], [24.0, 30.0]),
+        ([0, 24], [0.0, 0.0]),
+        ([0, 24], [float("nan"), float("nan")]),
+        ([0, 24], [float("inf"), float("inf")]),
+        ([0, -1], [24.0, 24.0]),
+        ([0, 1.5], [24.0, 24.0]),
+        ([24, 0], [24.0, 24.0]),
+        ([0], [24.0, 24.0]),
+    ],
+)
+def test_cached_video_metadata_rejects_invalid_timing(indices, fps):
+    with pytest.raises(ValueError):
+        utils.build_cached_video_frame_metadata(2, frame_indices=indices, frame_fps=fps)
+
+
+def test_cached_video_metadata_allows_repeated_sampled_frame():
+    metadata = utils.build_cached_video_frame_metadata(
+        2, frame_indices=[0, 0], frame_fps=[24.0, 24.0]
+    )
+    assert metadata["frames_indices"] == [0, 0]
+    assert metadata["total_num_frames"] == 1

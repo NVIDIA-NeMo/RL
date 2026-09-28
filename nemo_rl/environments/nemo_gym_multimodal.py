@@ -458,7 +458,18 @@ def _extract_static_video_messages(
                 "Gym video training requires cached frames from exactly one "
                 f"video per row; received {len(frame_groups)} sources."
             )
-        cached_metadata = build_cached_video_frame_metadata(len(cached_frame_sources))
+        cached_parts = [
+            part
+            for message in hf_messages
+            if isinstance(message.get("content"), list)
+            for part in message["content"]
+            if part.get("_is_video_frame")
+        ]
+        cached_metadata = build_cached_video_frame_metadata(
+            len(cached_parts),
+            frame_indices=[part.get("_video_frame_index") for part in cached_parts],
+            frame_fps=[part.get("_video_fps") for part in cached_parts],
+        )
         cached_frame_position = 0
         for message in hf_messages:
             content = message.get("content")
@@ -533,6 +544,8 @@ def _replace_cached_video_frames_with_native_video(
         raise TypeError("responses_create_params.input must be a list")
 
     frame_paths = []
+    frame_indices = []
+    frame_fps = []
     video_sources = set()
     for item in input_items:
         if not isinstance(item, dict):
@@ -551,6 +564,8 @@ def _replace_cached_video_frames_with_native_video(
                     "Cached Gym video frames require a non-empty image URL."
                 )
             frame_paths.append(frame_path)
+            frame_indices.append(part.get("_video_frame_index"))
+            frame_fps.append(part.get("_video_fps"))
             video_source = part.get("_video_source")
             if video_source:
                 video_sources.add(str(video_source))
@@ -563,7 +578,9 @@ def _replace_cached_video_frames_with_native_video(
             f"received {len(video_sources)}."
         )
 
-    video_url = build_cached_video_frame_data_url(frame_paths)
+    video_url = build_cached_video_frame_data_url(
+        frame_paths, frame_indices=frame_indices, frame_fps=frame_fps
+    )
     inserted_video = False
     for item in input_items:
         if not isinstance(item, dict):
