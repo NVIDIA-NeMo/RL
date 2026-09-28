@@ -460,9 +460,7 @@ def setup_distributed(config) -> None:
             ) from error
         if timeout <= 0:
             raise ValueError("NRL_DIST_TIMEOUT_MINUTES must be a positive number.")
-        torch.distributed.init_process_group(
-            "nccl", timeout=timedelta(minutes=timeout)
-        )
+        torch.distributed.init_process_group("nccl", timeout=timedelta(minutes=timeout))
     else:
         torch.distributed.init_process_group("nccl")
 
