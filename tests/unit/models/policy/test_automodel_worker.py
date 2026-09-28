@@ -39,7 +39,7 @@ try:
     from nemo_rl.models.policy.workers.automodel_policy_worker import (
         AutomodelPolicyWorkerImpl,
         _maybe_adapt_tensor_to_hf,
-        dtensor_params_generator,
+        automodel_params_generator,
     )
 
     NEMO_AUTOMODEL_AVAILABLE = True
@@ -549,8 +549,8 @@ class TestMaybeAdaptTensorToHF:
 
 @pytest.mark.automodel
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
-class TestDTensorParamsGenerator:
-    """Tests for the dtensor_params_generator helper function."""
+class TestAutomodelParamsGenerator:
+    """Tests for the automodel_params_generator helper function."""
 
     def test_simple_model_yields_adapted_tensors(self):
         """Test that generator yields correct (name, tensor) pairs for a simple model."""
@@ -559,7 +559,7 @@ class TestDTensorParamsGenerator:
         target_dtype = torch.float32
 
         # Act
-        results = list(dtensor_params_generator(model, target_dtype))
+        results = list(automodel_params_generator(model, target_dtype))
 
         # Assert
         assert len(results) == 2, "Linear layer should have weight and bias"
@@ -583,7 +583,7 @@ class TestDTensorParamsGenerator:
         target_dtype = torch.bfloat16
 
         # Act
-        results = list(dtensor_params_generator(model, target_dtype))
+        results = list(automodel_params_generator(model, target_dtype))
 
         # Assert
         for name, tensor in results:
@@ -604,7 +604,7 @@ class TestDTensorParamsGenerator:
                     "ordinary_buffer", torch.arange(4, dtype=torch.float32)
                 )
 
-        results = dict(dtensor_params_generator(RouterModel(), torch.bfloat16))
+        results = dict(automodel_params_generator(RouterModel(), torch.bfloat16))
 
         assert results["e_score_correction_bias"].dtype == torch.float32
         assert results["ordinary_buffer"].dtype == torch.bfloat16
@@ -616,7 +616,7 @@ class TestDTensorParamsGenerator:
         target_dtype = torch.float32
 
         # Act
-        results = list(dtensor_params_generator(model, target_dtype))
+        results = list(automodel_params_generator(model, target_dtype))
 
         # Assert
         for name, tensor in results:
@@ -636,7 +636,7 @@ class TestDTensorParamsGenerator:
         target_dtype = torch.float32
 
         # Act
-        results = list(dtensor_params_generator(model, target_dtype))
+        results = list(automodel_params_generator(model, target_dtype))
 
         # Assert
         # Each state_dict entry (weight, bias) goes through adapter
@@ -653,19 +653,19 @@ class TestDTensorParamsGenerator:
         target_dtype = torch.float32
 
         # Act
-        results = list(dtensor_params_generator(model, target_dtype))
+        results = list(automodel_params_generator(model, target_dtype))
 
         # Assert
         assert len(results) == 0, "Empty model should yield no parameters"
 
     def test_generator_is_iterable(self):
-        """Test that dtensor_params_generator returns an iterable generator."""
+        """Test that automodel_params_generator returns an iterable generator."""
         # Arrange
         model = nn.Linear(10, 5)
         target_dtype = torch.float32
 
         # Act
-        gen = dtensor_params_generator(model, target_dtype)
+        gen = automodel_params_generator(model, target_dtype)
 
         # Assert
         from collections.abc import Generator as ABCGenerator
@@ -687,7 +687,7 @@ class TestDTensorParamsGenerator:
         target_dtype = torch.float32
 
         # Act
-        results = list(dtensor_params_generator(model, target_dtype))
+        results = list(automodel_params_generator(model, target_dtype))
 
         # Assert
         # Should have 4 parameters: 2 weights + 2 biases from the Linear layers
