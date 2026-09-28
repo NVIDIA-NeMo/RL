@@ -14,6 +14,8 @@
 
 from typing import Any, Literal, NotRequired, TypedDict, Union
 
+from pydantic import BaseModel
+
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 from nemo_rl.utils.checkpoint import PretrainedCheckpointConfig
@@ -203,7 +205,7 @@ class DTensorConfig(TypedDict):
     tensor_parallel_size: int
     context_parallel_size: int
     expert_parallel_size: NotRequired[int]
-    # Size of the HSDP replicate dimension within the data-parallel axis (DTensor v2 only).
+    # Size of the HSDP replicate dimension within the data-parallel axis.
     dp_replicate_size: NotRequired[int]
     # Distributed config options (mirrors Automodel's FSDP2Config)
     sequence_parallel: bool
@@ -260,6 +262,9 @@ class MegatronPeftConfig(TypedDict):
     lora_B_init_method: str
     a2a_experimental: bool
     lora_dtype: str | None
+    # Share one adapter across grouped MoE experts on each EP rank. Set to
+    # False to create one adapter per local expert.
+    share_expert_adapters: NotRequired[bool]
     # Warm start: path to a native Megatron-Bridge PEFT checkpoint (an
     # iter_XXXXXXX directory, or a checkpoint root resolving to one) whose
     # adapter weights initialize this run's LoRA modules. The donor checkpoint
@@ -337,6 +342,15 @@ class Fp8Config(TypedDict):
     # cycle. Useful for FP8 training runs that observe growing reserved GPU memory
     # after offload.
     force_clear_fp8_caches: NotRequired[bool]
+
+
+class Fp4Config(BaseModel, extra="forbid"):
+    """Transformer Engine NVFP4 training configuration."""
+
+    enabled: bool
+    fp4: str | None = None
+    fp4_recipe: str = "nvfp4"
+    fp4_param: bool = False
 
 
 # Type exists to be lax if not specified
@@ -535,6 +549,13 @@ class MegatronConfig(TypedDict):
     clear_memory_caches_before_refit: NotRequired[bool]
     # FP8 quantization settings for the Megatron training backend.
     fp8_cfg: NotRequired[Fp8Config]
+    # TE NVFP4 training settings. Unknown keys are rejected by Fp4Config so
+    # misspelled precision controls cannot silently fall back to defaults.
+    fp4_cfg: NotRequired[Fp4Config]
+    # Keep the first/last N transformer blocks in BF16 under FP8/FP4 training.
+    first_last_layers_bf16: NotRequired[bool]
+    num_layers_at_start_in_bf16: NotRequired[int]
+    num_layers_at_end_in_bf16: NotRequired[int]
     # Path to a per-module Transformer Engine precision recipe loaded into
     # Megatron quant_recipe.
     te_precision_config_file: NotRequired[str]
@@ -606,9 +627,9 @@ class OnPolicyDistillationFullTransport(TypedDict):
     """Resolved full-vocabulary MOPD settings carried to the policy workers.
 
     A ``model_dump`` of ``OnPolicyDistillationFullConfig`` plus the resolved
-    ``payload_field``. That BaseModel remains the authoritative schema and the
-    only place defaults are declared, so readers must take these keys as
-    required rather than supplying their own fallbacks.
+    ``payload_field`` and ``teacher_index_field``. That BaseModel remains the
+    authoritative schema and the only place defaults are declared, so readers
+    must take these keys as required rather than supplying their own fallbacks.
     """
 
     enabled: bool
@@ -619,6 +640,10 @@ class OnPolicyDistillationFullTransport(TypedDict):
     teacher_lm_head_lifecycle: Literal["none", "offload", "evict"]
     validate_decomposition: bool
     payload_field: str
+    # Per-sample teacher-identity column, routing each row's payload to the
+    # right teacher LM-head shard. Only the hidden-state path needs it; the
+    # logits payload ships an already-projected distribution, so it is None.
+    teacher_index_field: str | None
 
 
 class PolicyConfig(TypedDict):

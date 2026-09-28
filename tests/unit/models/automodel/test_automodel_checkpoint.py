@@ -43,6 +43,54 @@ from nemo_rl.models.automodel.checkpoint import (
 
 
 @pytest.mark.automodel
+@pytest.mark.parametrize(
+    "saved_dtype,current_dtype,master_weights",
+    [
+        (torch.float32, torch.int16, True),
+        (torch.int16, torch.int16, True),
+        (torch.float32, torch.float32, True),
+        (torch.float32, torch.int16, False),
+    ],
+)
+def test_resume_master_weight_dtype(
+    tmp_path, saved_dtype, current_dtype, master_weights
+):
+    """Inspect real DCP metadata before it can cast incompatible master buffers."""
+    import torch.distributed.checkpoint as dcp
+
+    def state(dtype):
+        return {
+            "optim": {
+                "state": {"weight": {"master_param": torch.zeros(2, dtype=dtype)}}
+            }
+        }
+
+    optimizer_path = str(tmp_path / "optimizer")
+    dcp.save(state(saved_dtype), checkpoint_id=os.path.join(optimizer_path, "optim"))
+    manager = AutomodelCheckpointManager(MagicMock(), MagicMock())
+    manager.checkpointer = MagicMock()
+    manager.update_checkpointer_config = MagicMock()
+    optimizer = MagicMock(master_weights=master_weights)
+    model = torch.nn.Linear(2, 1, dtype=torch.bfloat16)
+    with patch("nemo_rl.models.automodel.checkpoint.OptimizerState") as wrapper:
+        wrapper.return_value.state_dict.return_value = state(current_dtype)
+        if master_weights and saved_dtype != current_dtype:
+            with pytest.raises(
+                ValueError, match="Cannot resume optimizer master weights"
+            ):
+                manager.load_checkpoint(model, str(tmp_path), optimizer, optimizer_path)
+            manager.checkpointer.load_optimizer.assert_not_called()
+        else:
+            manager.load_checkpoint(model, str(tmp_path), optimizer, optimizer_path)
+            manager.checkpointer.load_optimizer.assert_called_once()
+        if not master_weights:
+            wrapper.assert_not_called()
+
+    # A weights-only warm start does not inspect optimizer state.
+    manager.load_checkpoint(model, str(tmp_path))
+
+
+@pytest.mark.automodel
 def test_build_checkpoint_config_forwards_explicit_settings():
     config = build_checkpoint_config(
         {
@@ -1233,3 +1281,75 @@ def test_qwen_vl_vision_key_mapping_workaround_still_needed():
             "workaround in nemo_rl/models/automodel/checkpoint.py is obsolete - remove it "
             "and this test."
         )
+
+
+def _manager_with_stub_config(monkeypatch):
+    """A manager whose Automodel config build is stubbed out (no process groups)."""
+    from nemo_rl.models.automodel import checkpoint as ckpt_mod
+
+    built = {}
+
+    class _StubConfig:
+        def __init__(self, **kwargs):
+            built["kwargs"] = kwargs
+
+        def build(self, **kwargs):
+            return object()
+
+    monkeypatch.setattr(ckpt_mod, "AutomodelCheckpointingConfig", _StubConfig)
+    manager = ckpt_mod.AutomodelCheckpointManager.__new__(
+        ckpt_mod.AutomodelCheckpointManager
+    )
+    manager.checkpointer = None
+    manager.moe_mesh = None
+    manager._get_dp_rank = lambda: 0
+    manager._get_tp_rank = lambda: 0
+    return manager, built
+
+
+@pytest.mark.automodel
+def test_init_checkpointer_opts_async_daemons_into_the_prefix_store(monkeypatch):
+    """With the training store's address known, the DCP daemons must reuse it.
+
+    torch's process-based async checkpointer otherwise has rank 0 bind a
+    freshly probed port for the daemons' GLOO group, which raced with other
+    port users on the CI nodes (EADDRINUSE at the first save).
+    """
+    monkeypatch.setenv("MASTER_ADDR", "10.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", "1401")
+    # setenv before delenv so monkeypatch records the variable's absence and
+    # removes the "1" init_checkpointer writes at teardown; delenv alone on an
+    # absent name records nothing and the value leaks into every later test.
+    monkeypatch.setenv("DCP_USE_PREFIX_STORE", "")
+    monkeypatch.delenv("DCP_USE_PREFIX_STORE")
+    manager, _ = _manager_with_stub_config(monkeypatch)
+
+    manager.init_checkpointer(config_updates={"is_async": True})
+
+    assert os.environ["DCP_USE_PREFIX_STORE"] == "1"
+
+
+@pytest.mark.automodel
+def test_init_checkpointer_leaves_prefix_store_alone_without_master_env(monkeypatch):
+    monkeypatch.delenv("MASTER_ADDR", raising=False)
+    monkeypatch.delenv("MASTER_PORT", raising=False)
+    monkeypatch.delenv("DCP_USE_PREFIX_STORE", raising=False)
+    manager, _ = _manager_with_stub_config(monkeypatch)
+
+    manager.init_checkpointer(config_updates={"is_async": True})
+
+    # torch asserts on MASTER_ADDR/MASTER_PORT in prefix-store mode; without them
+    # the default get_free_port path is the only one that can work.
+    assert "DCP_USE_PREFIX_STORE" not in os.environ
+
+
+@pytest.mark.automodel
+def test_init_checkpointer_respects_an_explicit_prefix_store_choice(monkeypatch):
+    monkeypatch.setenv("MASTER_ADDR", "10.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", "1401")
+    monkeypatch.setenv("DCP_USE_PREFIX_STORE", "0")
+    manager, _ = _manager_with_stub_config(monkeypatch)
+
+    manager.init_checkpointer(config_updates={"is_async": True})
+
+    assert os.environ["DCP_USE_PREFIX_STORE"] == "0"

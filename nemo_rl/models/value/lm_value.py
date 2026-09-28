@@ -30,6 +30,7 @@ from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
+from nemo_rl.models.policy.utils import reject_dtensor_v1
 from nemo_rl.models.value.config import ValueConfig
 from nemo_rl.models.value.interfaces import ValueInterface, ValueOutputSpec
 from nemo_rl.utils.timer import Timer
@@ -99,10 +100,7 @@ class Value(ValueInterface):
                     "training backend (or value.megatron_cfg.enabled=true for "
                     "Megatron-Core)."
                 )
-            if not config["dtensor_cfg"]["_v2"]:
-                raise ValueError(
-                    "DTensor value models require value.dtensor_cfg._v2=true."
-                )
+            reject_dtensor_v1(config["dtensor_cfg"], "value.dtensor_cfg")
 
             worker_builder_cls = "nemo_rl.models.value.workers.dtensor_value_worker_v2.DTensorValueWorkerV2"
 
@@ -446,9 +444,6 @@ class Value(ValueInterface):
                 tokenizer_path=tokenizer_path,
             )
         else:
-            assert self.cfg["dtensor_cfg"]["_v2"], (
-                "DTensor value models only support DTensor V2 backend."
-            )
             futures = self.worker_group.run_all_workers_single_data(
                 "save_checkpoint",
                 weights_path=weights_path,
