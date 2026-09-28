@@ -54,7 +54,7 @@ class ValueConfig(TypedDict):
     reward_model_cfg: RewardModelConfig
 
     # Backend configuration - DTensor or Megatron
-    automodel_cfg: AutomodelConfig | AutomodelConfigDisabled
+    automodel_cfg: NotRequired[AutomodelConfig | AutomodelConfigDisabled]
     megatron_cfg: NotRequired[MegatronConfig | MegatronConfigDisabled]
 
     # HuggingFace config overrides

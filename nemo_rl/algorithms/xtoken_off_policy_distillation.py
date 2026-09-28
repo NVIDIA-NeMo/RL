@@ -251,11 +251,11 @@ def setup(
     # the TP=CP=1 multi-teacher prototype, this path supports TP/CP/diff-DP
     # sharding (the loss is parallelism-invariant), so there is deliberately NO
     # tensor/context_parallel_size==1 assert.
-    assert policy_config["automodel_cfg"]["enabled"], (
+    assert (policy_config.get("automodel_cfg") or {}).get("enabled"), (
         "xtoken distillation requires policy.automodel_cfg.enabled=true."
     )
     for i, tc in enumerate(teacher_configs):
-        assert tc["automodel_cfg"]["enabled"], (
+        assert (tc.get("automodel_cfg") or {}).get("enabled"), (
             f"xtoken distillation requires teachers.{i}.automodel_cfg.enabled=true."
         )
 

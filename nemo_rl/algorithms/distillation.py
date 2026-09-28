@@ -271,14 +271,12 @@ def setup(
         # Additionally, SP may not be compatible with sequence packing for some models.
         # Refer to https://github.com/NVIDIA-NeMo/RL/issues/1178 for more details.
         # Therefore, we disable SP + packing for distillation.
-        automodel_enabled = cfg["automodel_cfg"]["enabled"]
+        automodel_cfg = cfg.get("automodel_cfg") or {}
+        automodel_enabled = automodel_cfg.get("enabled", False)
         sequence_packing_enabled = (
             "sequence_packing" in cfg and cfg["sequence_packing"]["enabled"]
         )
-        sequence_parallel_enabled = (
-            "sequence_parallel" in cfg["automodel_cfg"]
-            and cfg["automodel_cfg"]["sequence_parallel"]
-        )
+        sequence_parallel_enabled = bool(automodel_cfg.get("sequence_parallel"))
 
         if automodel_enabled and sequence_packing_enabled and sequence_parallel_enabled:
             raise AssertionError(
