@@ -163,6 +163,7 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         save_state=_initial_grpo_save_state(),
         last_checkpoint_path=None,
         finalizer_actors=[],
+        advantage_actors=[],
         data_plane_checkpoint_metadata=None,
         partition_includes_multimodal_fields=False,
         bootstrap_identity=None,
@@ -818,9 +819,8 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = True
     ctrl._step_log_dict = {
-        "rewards": [],
-        "sample_masks": [],
-        "masked_advantages": [],
+        "reward_partials": [],
+        "advantage_partials": [],
         "sequence_lengths": [],
         "num_mask_sample_filtered": [],
         "seq_logprob_error_metrics": [],
@@ -913,9 +913,8 @@ def test_advantage_stage_writes_each_sample_filter_without_seq_threshold(
         overlong_filtering=overlong_filtering,
     )
     ctrl._step_log_dict = {
-        "rewards": [],
-        "sample_masks": [],
-        "masked_advantages": [],
+        "reward_partials": [],
+        "advantage_partials": [],
         "num_mask_sample_filtered": [],
         "sequence_lengths": [],
         "seq_logprob_error_metrics": [],
@@ -978,9 +977,8 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
-        "rewards": [],
-        "sample_masks": [],
-        "masked_advantages": [],
+        "reward_partials": [],
+        "advantage_partials": [],
         "num_mask_sample_filtered": [],
         "sequence_lengths": [],
         "seq_logprob_error_metrics": [],
@@ -1048,9 +1046,8 @@ def test_advantage_stage_clips_training_values_and_metrics() -> None:
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
-        "rewards": [],
-        "sample_masks": [],
-        "masked_advantages": [],
+        "reward_partials": [],
+        "advantage_partials": [],
         "num_mask_sample_filtered": [],
         "sequence_lengths": [],
         "seq_logprob_error_metrics": [],
@@ -1069,9 +1066,9 @@ def test_advantage_stage_clips_training_values_and_metrics() -> None:
         data_plane.written_fields["advantages"],
         torch.tensor([[-1.0] * sequence_length, [2.0] * sequence_length]),
     )
-    logged = torch.cat(ctrl._step_log_dict["masked_advantages"])
-    assert logged.min().item() == pytest.approx(-1.0)
-    assert logged.max().item() == pytest.approx(2.0)
+    (logged,) = ctrl._step_log_dict["advantage_partials"]
+    assert logged.minimum == pytest.approx(-1.0)
+    assert logged.maximum == pytest.approx(2.0)
 
 
 def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
@@ -1112,9 +1109,8 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
-        "rewards": [],
-        "sample_masks": [],
-        "masked_advantages": [],
+        "reward_partials": [],
+        "advantage_partials": [],
         "num_mask_sample_filtered": [],
         "sequence_lengths": [],
         "seq_logprob_error_metrics": [],
@@ -1174,9 +1170,8 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
-        "rewards": [],
-        "sample_masks": [],
-        "masked_advantages": [],
+        "reward_partials": [],
+        "advantage_partials": [],
         "num_mask_sample_filtered": [],
         "sequence_lengths": [],
         "seq_logprob_error_metrics": [],
@@ -1259,9 +1254,8 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
-        "rewards": [],
-        "sample_masks": [],
-        "masked_advantages": [],
+        "reward_partials": [],
+        "advantage_partials": [],
         "sequence_lengths": [],
         "seq_logprob_error_metrics": [],
         "num_mask_sample_filtered": [],
@@ -1303,8 +1297,10 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
         written_advantages,
         torch.full_like(written_advantages, 0.1),
     )
-    logged = torch.cat(ctrl._step_log_dict["masked_advantages"])
-    torch.testing.assert_close(logged, torch.full((4,), 0.1))
+    (logged,) = ctrl._step_log_dict["advantage_partials"]
+    assert logged.count == 4
+    assert logged.minimum == pytest.approx(0.1)
+    assert logged.maximum == pytest.approx(0.1)
 
 
 def test_pooled_opd_metrics_weight_unequal_chunks_by_valid_token_count() -> None:
@@ -1651,9 +1647,8 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._batch_promotions = {}
     ctrl._finalizer_metrics_by_group = {}
     ctrl._step_log_dict = {
-        "rewards": [],
-        "sample_masks": [],
-        "masked_advantages": [],
+        "reward_partials": [],
+        "advantage_partials": [],
         "sequence_lengths": [],
         "num_mask_sample_filtered": [],
         "seq_logprob_error_metrics": [],
@@ -2572,9 +2567,8 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     ctrl._algo_cfg = ctrl._master_config.ppo
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._step_log_dict = {
-        "rewards": [],
-        "sample_masks": [],
-        "masked_advantages": [],
+        "reward_partials": [],
+        "advantage_partials": [],
         "sequence_lengths": [],
         "num_mask_sample_filtered": [],
         "seq_logprob_error_metrics": [],

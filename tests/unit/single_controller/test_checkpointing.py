@@ -796,6 +796,7 @@ def _make_actor_args(
         ),
         last_checkpoint_path=last_checkpoint_path,
         finalizer_actors=[],
+        advantage_actors=[],
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
         bootstrap_identity=bootstrap_identity,
         rollout_checkpoint_load_metrics=rollout_checkpoint_load_metrics,

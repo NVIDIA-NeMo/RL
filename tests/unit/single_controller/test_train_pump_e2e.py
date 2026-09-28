@@ -391,6 +391,7 @@ def test_train_pump_drives_mcore_training_step(
             save_state=_initial_grpo_save_state(),
             last_checkpoint_path=None,
             finalizer_actors=[],
+            advantage_actors=[],
         )
         ctrl = _RecordingSingleControllerActor.remote(
             metric_log_handle=log,

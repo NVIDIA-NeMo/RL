@@ -1445,6 +1445,7 @@ def test_rollout_pump_writes_expected_tq_data(
         save_state=_initial_grpo_save_state(),
         last_checkpoint_path=None,
         finalizer_actors=[],
+        advantage_actors=[],
     )
     ctrl = SingleControllerActor.remote(
         master_config=master_config,

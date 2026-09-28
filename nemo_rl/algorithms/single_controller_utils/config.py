@@ -499,6 +499,13 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     max_buffered_rollouts: int = 64
     # Enable per-rollout diagnostic prints (prompt content / completion previews).
     diagnostics: bool = False
+    # CPU actors that run the advantage stage. 0 keeps it in the controller
+    # process, which is the historical behaviour and is correct, but it both
+    # holds a whole cohort's advantage inputs in the controller's heap and
+    # blocks the controller's event loop for the duration of the computation --
+    # long enough at Ultra scale to miss Ray's actor liveness ping. A positive
+    # value moves both costs onto dedicated CPU actors.
+    num_advantage_workers: NonNegativeInt = 0
 
     @model_validator(mode="after")
     def _reject_renamed_blocks(self) -> "AsyncRLConfig":

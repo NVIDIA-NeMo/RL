@@ -90,18 +90,21 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     create_sampler,
 )
 from nemo_rl.algorithms.grpo import (
-    GRPOConfig,
     GRPOSaveState,
-    _clip_grpo_advantages,
     _write_latest_checkpoint_status,
     aggregate_rollout_metrics,
-    compute_and_apply_seq_logprob_error_masking,
 )
 from nemo_rl.algorithms.metric_utils import (
     SETUP_TIMING_PREFIX,
     SetupTimingMetrics,
 )
 from nemo_rl.algorithms.ppo import _compute_critic_metrics
+from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
+    AdvantageComputer,
+    AdvantageOutcome,
+    AdvantageRequest,
+    AdvantageStageConfig,
+)
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     MasterConfig,
@@ -129,11 +132,7 @@ from nemo_rl.algorithms.single_controller_utils.setup import (
 )
 from nemo_rl.algorithms.single_controller_utils.utils import (
     aggregate_step_metrics,
-    apply_message_level_advantage_penalties,
-    fields_for_put,
     reduce_advantage_pump_metrics,
-    squeeze_trailing_unit_dim,
-    tensor_field,
 )
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.multimodal_utils import present_multimodal_fields
@@ -366,22 +365,18 @@ class SingleControllerActor:
         self._critic_ppo_epochs: int = (
             self._algo_cfg.critic_ppo_epochs if self._is_ppo else 1
         )
+        # The advantage pool is built driver-side from the same derivation, so
+        # read the gates off it rather than recomputing them here.
+        self._advantage_stage_config = AdvantageStageConfig.from_master_config(
+            master_config
+        )
+        stage_cfg = self._advantage_stage_config
         self._message_level_advantage_penalties_enabled = (
-            self._algo_cfg.invalid_tool_call_advantage is not None
-            or self._algo_cfg.malformed_thinking_advantage is not None
+            stage_cfg.message_level_advantage_penalties_enabled
         )
-
-        self._policy_logprobs_required = not (
-            master_config.loss_fn.force_on_policy_ratio
-            and self._algo_cfg.seq_logprob_error_threshold is None
-        )
-        # _build_trainer initializes the reference model only for a positive KL
-        # penalty, so the controller must use the same gate before requesting it.
-        self._reference_logprobs_required = bool(
-            master_config.loss_fn.reference_policy_kl_penalty > 0
-            and not self._algo_cfg.skip_reference_policy_logprobs_calculation
-        )
-        self._teacher_logprobs_required = opd_module.is_opd_enabled(master_config)
+        self._policy_logprobs_required = stage_cfg.policy_logprobs_required
+        self._reference_logprobs_required = stage_cfg.reference_logprobs_required
+        self._teacher_logprobs_required = stage_cfg.teacher_logprobs_required
         self._train_fields = _train_fields_for_step(
             policy_logprobs_required=self._policy_logprobs_required,
             reference_logprobs_required=self._reference_logprobs_required,
@@ -408,6 +403,10 @@ class SingleControllerActor:
                         for index in generation_workers.dp_leader_worker_indices
                     )
                 checkpoint_workers.extend(actor_args.finalizer_actors)
+                # Advantage actors write the advantages column through their own
+                # connect-only clients, so their local stores hold rows a
+                # snapshot must see.
+                checkpoint_workers.extend(actor_args.advantage_actors)
                 # Reuse existing actor RPCs. This actor's local store is handled
                 # directly: __init__ cannot service an RPC back to itself.
                 configure_checkpoint_workers(checkpoint_workers)
@@ -452,6 +451,19 @@ class SingleControllerActor:
         self._dataloader = actor_args.dataloader
         self._weight_synchronizer = actor_args.weight_synchronizer
         self._advantage_estimator = actor_args.advantage_estimator
+        # Built driver-side so the actors attach their TQ clients before this
+        # process configures checkpoint participants. Empty means the stage runs
+        # in-process through the same computer the actors wrap, so a run without
+        # a pool and a run with one cannot drift.
+        self._advantage_actors: list[Any] = list(actor_args.advantage_actors)
+        self._available_advantage_actors: asyncio.Queue = asyncio.Queue()
+        for actor in self._advantage_actors:
+            self._available_advantage_actors.put_nowait(actor)
+        self._advantage_computer = AdvantageComputer(
+            self._dp_client,
+            config=self._advantage_stage_config,
+            advantage_estimator=self._advantage_estimator,
+        )
         self._loss_fn = actor_args.loss_fn
         self._value_loss_fn = getattr(actor_args, "value_loss_fn", None)
         self._buffer = actor_args.tq_buffer
@@ -689,9 +701,8 @@ class SingleControllerActor:
         self._train_steps: int = actor_args.save_state.current_step
         self._current_epoch: int = actor_args.save_state.current_epoch
         self._step_log_dict: dict[str, list] = {
-            "rewards": [],
-            "sample_masks": [],
-            "masked_advantages": [],
+            "reward_partials": [],
+            "advantage_partials": [],
             "num_mask_sample_filtered": [],
             "sequence_lengths": [],
             "seq_logprob_error_metrics": [],
@@ -5170,231 +5181,59 @@ class SingleControllerActor:
 
         if self._advantage_estimator is None:
             return meta, True
-        adv_cfg = self._advantage_cfg
 
-        data = await call_data_plane(
-            self._dp_client,
-            "get_samples",
-            sample_ids=meta.sample_ids,
-            partition_id=meta.partition_id,
-            select_fields=self._advantage_input_fields(),
-        )
-
-        prompt_ids = tensor_field(data, adv_cfg.prompt_ids_field)
-        rewards = squeeze_trailing_unit_dim(
-            tensor_field(data, adv_cfg.reward_field)
-        ).float()
-        token_mask = tensor_field(data, adv_cfg.token_mask_field).float()
-        sample_mask = squeeze_trailing_unit_dim(
-            tensor_field(data, adv_cfg.sample_mask_field)
-        ).float()
-        mask_sample = squeeze_trailing_unit_dim(
-            tensor_field(data, adv_cfg.mask_sample_field)
-        ).bool()
-        truncated = squeeze_trailing_unit_dim(
-            tensor_field(data, adv_cfg.truncated_field)
-        ).bool()
-
-        num_mask_sample_filtered = int(mask_sample.sum().item())
-        self._step_log_dict["num_mask_sample_filtered"].append(num_mask_sample_filtered)
-        final_sample_mask = sample_mask * (~mask_sample).to(sample_mask.dtype)
-        if self._algo_cfg.overlong_filtering:
-            final_sample_mask = final_sample_mask * (~truncated).to(sample_mask.dtype)
-
-        seq_logprob_error_threshold = self._algo_cfg.seq_logprob_error_threshold
-        # Match the legacy path: whenever real policy logprobs are available,
-        # report sequence-level generation/training mismatch. A threshold adds
-        # masking; leaving it unset keeps this metrics-only.
-        if self._policy_logprobs_required:
-            masking_data = BatchedDataDict(
-                {
-                    "token_mask": token_mask,
-                    "sample_mask": final_sample_mask,
-                    "prev_logprobs": tensor_field(
-                        data,
-                        adv_cfg.policy_logprobs_field,
-                    ),
-                    "generation_logprobs": tensor_field(
-                        data,
-                        adv_cfg.generation_logprobs_field,
-                    ),
-                }
-            )
-            num_valid_seqs_before = float(
-                ((token_mask[:, 1:] * final_sample_mask.unsqueeze(-1)).sum(dim=-1) > 0)
-                .sum()
-                .item()
-            )
-            seq_error_metrics = compute_and_apply_seq_logprob_error_masking(
-                train_data=masking_data,
-                rewards=rewards,
-                seq_logprob_error_threshold=seq_logprob_error_threshold,
-            )
-            final_sample_mask = masking_data["sample_mask"]
-            num_valid_seqs_after = float(
-                ((token_mask[:, 1:] * final_sample_mask.unsqueeze(-1)).sum(dim=-1) > 0)
-                .sum()
-                .item()
-            )
-            seq_error_metrics["num_masked_seqs_by_logprob_error"] = (
-                seq_error_metrics.pop("num_masked_seqs")
-            )
-            seq_error_metrics["_num_valid_seqs_before"] = num_valid_seqs_before
-            seq_error_metrics["_num_valid_seqs_after"] = num_valid_seqs_after
-            self._step_log_dict["seq_logprob_error_metrics"].append(seq_error_metrics)
-
-        mask = token_mask * final_sample_mask.unsqueeze(-1)
-
-        repeated_batch: dict[str, torch.Tensor] = {
-            "total_reward": rewards,
-        }
-        for field_name in adv_cfg.repeated_batch_fields:
-            repeated_batch[field_name] = squeeze_trailing_unit_dim(
-                tensor_field(data, field_name)
-            )
-
-        kwargs: dict[str, torch.Tensor] = {}
-        if self._policy_logprobs_required:
-            policy_logprobs = tensor_field(data, adv_cfg.policy_logprobs_field)
-            if self._teacher_logprobs_required:
-                kwargs["prev_logprobs"] = policy_logprobs
-            else:
-                kwargs["logprobs_policy"] = policy_logprobs
-        if self._reference_logprobs_required:
-            kwargs["logprobs_reference"] = tensor_field(
-                data,
-                adv_cfg.reference_logprobs_field,
-            )
-        if self._teacher_logprobs_required:
-            kwargs["teacher_logprobs"] = tensor_field(
-                data,
-                adv_cfg.teacher_logprobs_field,
-            )
-        if self._is_ppo:
-            kwargs["values"] = tensor_field(data, adv_cfg.values_field)
-
-        # Training predicts token t from position t - 1, so token_mask[:, 1:]
-        # is the exact mask used when global_valid_toks and the loss are built.
-        has_valid_training_tokens = bool(mask[:, 1:].bool().any().item())
-        # Value-model estimators (GAE) hand back the regression target alongside
-        # the advantages; the group-relative ones return a bare tensor.
-        returns: Optional[torch.Tensor] = None
-        if has_valid_training_tokens:
-            result = self._advantage_estimator.compute_advantage(
-                prompt_ids=prompt_ids,
-                rewards=rewards,
-                mask=mask,
-                repeated_batch=repeated_batch,
-                # Real validity (token-capture placeholders carry sample_mask 0,
-                # and mask_sample/overlong/seq-logprob-error rows are folded in
-                # via final_sample_mask) instead of the hardwired all-ones.
-                valid_mask=final_sample_mask,
-                **kwargs,
-            )
-            if self._is_ppo:
-                advantages, returns = result
-            else:
-                advantages = result
-        else:
-            advantages = torch.zeros_like(mask)
-            if self._is_ppo:
-                returns = torch.zeros_like(mask)
-
-        if self._message_level_advantage_penalties_enabled:
-            # Sequence-error filtering and the pre-existing sample mask remain
-            # authoritative: a message penalty must not make a filtered token
-            # trainable again.
-            valid_tokens = mask.bool()
-            advantages = apply_message_level_advantage_penalties(
-                advantages,
-                invalid_tool_call_mask=(
-                    tensor_field(data, adv_cfg.invalid_tool_call_mask_field).bool()
-                    & valid_tokens
-                ),
-                malformed_thinking_mask=(
-                    tensor_field(data, adv_cfg.malformed_thinking_mask_field).bool()
-                    & valid_tokens
-                ),
-                invalid_tool_call_advantage=self._algo_cfg.invalid_tool_call_advantage,
-                malformed_thinking_advantage=(
-                    self._algo_cfg.malformed_thinking_advantage
-                ),
-            )
-
-        response_advantages = torch.masked_select(advantages, mask.bool())
-        self._step_log_dict["rewards"].append(rewards.detach().cpu())
-        self._step_log_dict["sample_masks"].append(final_sample_mask.detach().cpu())
-        if self._teacher_logprobs_required:
-            valid = response_advantages.detach().double()
-            self._opd_stat_sum += float(valid.sum())
-            self._opd_stat_sumsq += float((valid * valid).sum())
-            self._opd_stat_count += int(valid.numel())
-
-        # OPD accumulates its statistics from the estimator output above. The
-        # ordinary advantage metrics and policy training use the clipped values,
-        # matching the legacy paths.
-        if not self._is_ppo:
-            assert isinstance(self._algo_cfg, GRPOConfig)
-            advantages = _clip_grpo_advantages(
-                advantages,
-                self._algo_cfg,
-            )
-            response_advantages = torch.masked_select(advantages, mask.bool())
-        self._step_log_dict["masked_advantages"].append(
-            response_advantages.detach().cpu()
-        )
-
-        fields_to_put = {adv_cfg.output_field: advantages}
-        if not torch.equal(final_sample_mask, sample_mask):
-            fields_to_put[adv_cfg.sample_mask_field] = final_sample_mask
-        new_fields = [adv_cfg.output_field]
-        if returns is not None:
-            fields_to_put[adv_cfg.returns_field] = returns
-            new_fields.append(adv_cfg.returns_field)
-
+        request = AdvantageRequest(meta=meta)
+        # The writeback and the metadata the controller derives from it have to
+        # land in one mutation cut, so a snapshot cannot capture the advantages
+        # without the replay-index state that describes them. Holding the cut
+        # across the remote call deliberately makes checkpoint acquisition wait
+        # for the tail of an in-flight advantage RPC, exactly as group_commits
+        # already does for the finalizer.
         async with self._data_plane_checkpoint_barrier.mutation("advantage_writeback"):
-            await self._call_dp(
-                "put_samples",
-                sample_ids=meta.sample_ids,
-                partition_id=meta.partition_id,
-                fields=fields_for_put(meta, fields_to_put),
+            outcome = await self._run_advantage_stage(request)
+        self._absorb_advantage_outcome(outcome)
+        return outcome.meta, outcome.has_valid_training_tokens
+
+    async def _run_advantage_stage(self, request: AdvantageRequest) -> AdvantageOutcome:
+        """Run one advantage stage on the pool, or in-process without one."""
+        if not self._advantage_actors:
+            return await self._advantage_computer.run(request)
+        actor = await self._available_advantage_actors.get()
+        try:
+            outcome = await actor.run.remote(request)
+        except BaseException:
+            # The actor writes advantages before returning, so a failed RPC
+            # leaves the writeback outcome unknown. There is no correct way to
+            # continue a step from an unknown writeback, so this propagates
+            # instead of retrying elsewhere, and the actor is never handed back
+            # to the pool.
+            print(
+                "FATAL: advantage actor RPC failed after submission; the "
+                f"writeback outcome is unknown for {len(request.meta.sample_ids)} "
+                "samples.",
+                flush=True,
             )
-        return (
-            meta.with_fields(new_fields),
-            has_valid_training_tokens,
+            raise
+        else:
+            self._available_advantage_actors.put_nowait(actor)
+            return outcome
+
+    def _absorb_advantage_outcome(self, outcome: AdvantageOutcome) -> None:
+        """Fold one call's reduced results into this step's accumulators."""
+        self._step_log_dict["num_mask_sample_filtered"].append(
+            outcome.num_mask_sample_filtered
         )
+        self._step_log_dict["reward_partials"].append(outcome.reward_partial)
+        self._step_log_dict["advantage_partials"].append(outcome.advantage_partial)
+        if outcome.seq_logprob_error_metrics is not None:
+            self._step_log_dict["seq_logprob_error_metrics"].append(
+                outcome.seq_logprob_error_metrics
+            )
+        self._opd_stat_sum += outcome.opd_stat_sum
+        self._opd_stat_sumsq += outcome.opd_stat_sumsq
+        self._opd_stat_count += outcome.opd_stat_count
 
     # ── utility helpers ────────────────────────────────────────────────────
-
-    def _advantage_input_fields(self) -> list[str]:
-        adv_cfg = self._advantage_cfg
-        fields = [
-            adv_cfg.prompt_ids_field,
-            adv_cfg.reward_field,
-            adv_cfg.token_mask_field,
-            adv_cfg.sample_mask_field,
-            *adv_cfg.repeated_batch_fields,
-            adv_cfg.mask_sample_field,
-            adv_cfg.truncated_field,
-        ]
-        if self._message_level_advantage_penalties_enabled:
-            fields.extend(
-                [
-                    adv_cfg.invalid_tool_call_mask_field,
-                    adv_cfg.malformed_thinking_mask_field,
-                ]
-            )
-        if self._policy_logprobs_required:
-            fields.append(adv_cfg.policy_logprobs_field)
-        if self._policy_logprobs_required:
-            fields.append(adv_cfg.generation_logprobs_field)
-        if self._reference_logprobs_required:
-            fields.append(adv_cfg.reference_logprobs_field)
-        if self._teacher_logprobs_required:
-            fields.append(adv_cfg.teacher_logprobs_field)
-        if self._is_ppo:
-            fields.append(adv_cfg.values_field)
-        return list(dict.fromkeys(fields))
 
     def _retune_lookahead_versions(self) -> None:
         """Widen the sampler's lookahead while the policy is frozen, then shrink it back.

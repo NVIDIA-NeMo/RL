@@ -36,6 +36,10 @@ async_rl:
   max_buffered_rollouts: 64
   # Enable per-rollout diagnostic prints (prompt content / completion previews).
   diagnostics: false
+  # CPU actors that run the advantage stage. 0 keeps it in the controller
+  # process, which both holds a whole cohort's advantage inputs in the
+  # controller's heap and blocks its event loop while the stage runs.
+  num_advantage_workers: 0
 
   # ── Resiliency ─────────────────────────────────────────────────────────────
   # What happens to a prompt whose rollout fails. Infrastructure failures are

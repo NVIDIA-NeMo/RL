@@ -1,0 +1,397 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""The advantage stage, separated from the controller that used to run it.
+
+This is the compute half of ``SingleControllerActor._advantage_stage``. It was
+lifted out for two reasons, both of which showed up at Ultra scale:
+
+* It is the controller's largest transient allocation. It fetches every
+  advantage input column for a whole cohort, and the controller's RSS burst
+  tracked it exactly.
+* It is ~200 lines of synchronous torch between two awaits, so while it ran
+  nothing else on the controller's event loop could make progress -- including
+  the Ray liveness ping, which is why the controller looked hung.
+
+Neither is fixed by making the code faster; both are fixed by running it
+somewhere else. Keeping the body here, rather than in the actor, lets the
+controller drive it in-process when no actor pool is configured, so the two
+paths cannot drift.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Optional
+
+import torch
+
+from nemo_rl.algorithms.grpo import (
+    GRPOConfig,
+    _clip_grpo_advantages,
+    compute_and_apply_seq_logprob_error_masking,
+)
+from nemo_rl.algorithms.single_controller_utils.config import AdvantageConfig
+from nemo_rl.algorithms.single_controller_utils.utils import (
+    AdvantagePartial,
+    RewardPartial,
+    apply_message_level_advantage_penalties,
+    fields_for_put,
+    squeeze_trailing_unit_dim,
+    tensor_field,
+)
+from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.async_utils import call_data_plane
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+if TYPE_CHECKING:
+    # Annotation-only: importing ppo at runtime here would close a cycle
+    # back through the controller.
+    from nemo_rl.algorithms.ppo import PPOConfig
+
+
+@dataclass(frozen=True)
+class AdvantageStageConfig:
+    """Everything the stage reads off the controller, fixed at setup time."""
+
+    advantage: AdvantageConfig
+    algo: GRPOConfig | PPOConfig
+    is_ppo: bool
+    policy_logprobs_required: bool
+    reference_logprobs_required: bool
+    teacher_logprobs_required: bool
+    message_level_advantage_penalties_enabled: bool
+
+    @classmethod
+    def from_master_config(cls, master_config: Any) -> AdvantageStageConfig:
+        """Derive the stage's settings once, for the controller and the pool.
+
+        The pool is built driver-side in ``setup_single_controller`` while the
+        controller builds its in-process fallback in ``__init__``. Deriving the
+        gates here is what keeps a remote call and a local call from disagreeing
+        about which columns to fetch or which masks to apply.
+        """
+        # Deferred: this module is imported from the controller, and opd pulls
+        # ray in transitively.
+        from nemo_rl.algorithms import opd as opd_module
+        from nemo_rl.algorithms.single_controller_utils.config import (
+            algo_config,
+            is_ppo_run,
+        )
+
+        is_ppo = is_ppo_run(master_config)
+        algo_cfg = algo_config(master_config)
+        loss_cfg = master_config.loss_fn
+        return cls(
+            advantage=AdvantageConfig(),
+            algo=algo_cfg,
+            is_ppo=is_ppo,
+            policy_logprobs_required=not (
+                loss_cfg.force_on_policy_ratio
+                and algo_cfg.seq_logprob_error_threshold is None
+            ),
+            # _build_trainer initializes the reference model only for a positive
+            # KL penalty, so this must use the same gate before requesting it.
+            reference_logprobs_required=bool(
+                loss_cfg.reference_policy_kl_penalty > 0
+                and not algo_cfg.skip_reference_policy_logprobs_calculation
+            ),
+            teacher_logprobs_required=opd_module.is_opd_enabled(master_config),
+            message_level_advantage_penalties_enabled=(
+                algo_cfg.invalid_tool_call_advantage is not None
+                or algo_cfg.malformed_thinking_advantage is not None
+            ),
+        )
+
+    def input_fields(self) -> list[str]:
+        """Return the advantage input columns to fetch, in a stable order."""
+        adv_cfg = self.advantage
+        fields = [
+            adv_cfg.prompt_ids_field,
+            adv_cfg.reward_field,
+            adv_cfg.token_mask_field,
+            adv_cfg.sample_mask_field,
+            *adv_cfg.repeated_batch_fields,
+            adv_cfg.mask_sample_field,
+            adv_cfg.truncated_field,
+        ]
+        if self.message_level_advantage_penalties_enabled:
+            fields.extend(
+                [
+                    adv_cfg.invalid_tool_call_mask_field,
+                    adv_cfg.malformed_thinking_mask_field,
+                ]
+            )
+        if self.policy_logprobs_required:
+            fields.append(adv_cfg.policy_logprobs_field)
+            fields.append(adv_cfg.generation_logprobs_field)
+        if self.reference_logprobs_required:
+            fields.append(adv_cfg.reference_logprobs_field)
+        if self.teacher_logprobs_required:
+            fields.append(adv_cfg.teacher_logprobs_field)
+        if self.is_ppo:
+            fields.append(adv_cfg.values_field)
+        return list(dict.fromkeys(fields))
+
+
+@dataclass(frozen=True)
+class AdvantageRequest:
+    """One advantage-stage call, described without any payload.
+
+    ``meta`` already names the rows; the tensors are fetched from DataPlane by
+    whichever process runs the stage.
+    """
+
+    meta: KVBatchMeta
+
+
+@dataclass(frozen=True)
+class AdvantageOutcome:
+    """One call's results, every one of them already reduced to metadata.
+
+    The stage used to hand the controller whole tensors to accumulate. It now
+    hands back only what the step-close reduction actually reads, which is what
+    keeps this small enough to cross a Ray RPC boundary.
+    """
+
+    meta: KVBatchMeta
+    has_valid_training_tokens: bool
+    num_mask_sample_filtered: int
+    reward_partial: RewardPartial
+    advantage_partial: AdvantagePartial
+    seq_logprob_error_metrics: Optional[dict[str, float]] = None
+    # OPD's running moments, as this call's contribution rather than a total.
+    opd_stat_sum: float = 0.0
+    opd_stat_sumsq: float = 0.0
+    opd_stat_count: int = 0
+
+
+class AdvantageComputer:
+    """Fetch advantage inputs, compute advantages, and write them back.
+
+    The selected ``KVBatchMeta`` still contains complete prompt groups before
+    trainer DP sharding, which is what makes the group-relative estimators
+    valid here. Tensor payloads only ever move through DataPlane: this fetches
+    the configured advantage input columns and writes the computed
+    ``advantages`` column back under the same ``sample_ids``.
+    """
+
+    def __init__(
+        self,
+        dp_client: Any,
+        *,
+        config: AdvantageStageConfig,
+        advantage_estimator: Any,
+    ) -> None:
+        self._dp_client = dp_client
+        self._config = config
+        self._advantage_estimator = advantage_estimator
+
+    async def run(self, request: AdvantageRequest) -> AdvantageOutcome:
+        """Run one call's advantage stage and return its reduced results."""
+        meta = request.meta
+        cfg = self._config
+        adv_cfg = cfg.advantage
+
+        data = await call_data_plane(
+            self._dp_client,
+            "get_samples",
+            sample_ids=meta.sample_ids,
+            partition_id=meta.partition_id,
+            select_fields=cfg.input_fields(),
+        )
+
+        prompt_ids = tensor_field(data, adv_cfg.prompt_ids_field)
+        rewards = squeeze_trailing_unit_dim(
+            tensor_field(data, adv_cfg.reward_field)
+        ).float()
+        token_mask = tensor_field(data, adv_cfg.token_mask_field).float()
+        sample_mask = squeeze_trailing_unit_dim(
+            tensor_field(data, adv_cfg.sample_mask_field)
+        ).float()
+        mask_sample = squeeze_trailing_unit_dim(
+            tensor_field(data, adv_cfg.mask_sample_field)
+        ).bool()
+        truncated = squeeze_trailing_unit_dim(
+            tensor_field(data, adv_cfg.truncated_field)
+        ).bool()
+
+        num_mask_sample_filtered = int(mask_sample.sum().item())
+        final_sample_mask = sample_mask * (~mask_sample).to(sample_mask.dtype)
+        if cfg.algo.overlong_filtering:
+            final_sample_mask = final_sample_mask * (~truncated).to(sample_mask.dtype)
+
+        seq_error_metrics: Optional[dict[str, float]] = None
+        # Match the legacy path: whenever real policy logprobs are available,
+        # report sequence-level generation/training mismatch. A threshold adds
+        # masking; leaving it unset keeps this metrics-only.
+        if cfg.policy_logprobs_required:
+            masking_data = BatchedDataDict(
+                {
+                    "token_mask": token_mask,
+                    "sample_mask": final_sample_mask,
+                    "prev_logprobs": tensor_field(
+                        data,
+                        adv_cfg.policy_logprobs_field,
+                    ),
+                    "generation_logprobs": tensor_field(
+                        data,
+                        adv_cfg.generation_logprobs_field,
+                    ),
+                }
+            )
+            num_valid_seqs_before = float(
+                ((token_mask[:, 1:] * final_sample_mask.unsqueeze(-1)).sum(dim=-1) > 0)
+                .sum()
+                .item()
+            )
+            seq_error_metrics = compute_and_apply_seq_logprob_error_masking(
+                train_data=masking_data,
+                rewards=rewards,
+                seq_logprob_error_threshold=cfg.algo.seq_logprob_error_threshold,
+            )
+            final_sample_mask = masking_data["sample_mask"]
+            num_valid_seqs_after = float(
+                ((token_mask[:, 1:] * final_sample_mask.unsqueeze(-1)).sum(dim=-1) > 0)
+                .sum()
+                .item()
+            )
+            seq_error_metrics["num_masked_seqs_by_logprob_error"] = (
+                seq_error_metrics.pop("num_masked_seqs")
+            )
+            seq_error_metrics["_num_valid_seqs_before"] = num_valid_seqs_before
+            seq_error_metrics["_num_valid_seqs_after"] = num_valid_seqs_after
+
+        mask = token_mask * final_sample_mask.unsqueeze(-1)
+
+        repeated_batch: dict[str, torch.Tensor] = {
+            "total_reward": rewards,
+        }
+        for field_name in adv_cfg.repeated_batch_fields:
+            repeated_batch[field_name] = squeeze_trailing_unit_dim(
+                tensor_field(data, field_name)
+            )
+
+        kwargs: dict[str, torch.Tensor] = {}
+        if cfg.policy_logprobs_required:
+            policy_logprobs = tensor_field(data, adv_cfg.policy_logprobs_field)
+            if cfg.teacher_logprobs_required:
+                kwargs["prev_logprobs"] = policy_logprobs
+            else:
+                kwargs["logprobs_policy"] = policy_logprobs
+        if cfg.reference_logprobs_required:
+            kwargs["logprobs_reference"] = tensor_field(
+                data,
+                adv_cfg.reference_logprobs_field,
+            )
+        if cfg.teacher_logprobs_required:
+            kwargs["teacher_logprobs"] = tensor_field(
+                data,
+                adv_cfg.teacher_logprobs_field,
+            )
+        if cfg.is_ppo:
+            kwargs["values"] = tensor_field(data, adv_cfg.values_field)
+
+        # Training predicts token t from position t - 1, so token_mask[:, 1:]
+        # is the exact mask used when global_valid_toks and the loss are built.
+        has_valid_training_tokens = bool(mask[:, 1:].bool().any().item())
+        # Value-model estimators (GAE) hand back the regression target alongside
+        # the advantages; the group-relative ones return a bare tensor.
+        returns: Optional[torch.Tensor] = None
+        if has_valid_training_tokens:
+            result = self._advantage_estimator.compute_advantage(
+                prompt_ids=prompt_ids,
+                rewards=rewards,
+                mask=mask,
+                repeated_batch=repeated_batch,
+                # Real validity (token-capture placeholders carry sample_mask 0,
+                # and mask_sample/overlong/seq-logprob-error rows are folded in
+                # via final_sample_mask) instead of the hardwired all-ones.
+                valid_mask=final_sample_mask,
+                **kwargs,
+            )
+            if cfg.is_ppo:
+                advantages, returns = result
+            else:
+                advantages = result
+        else:
+            advantages = torch.zeros_like(mask)
+            if cfg.is_ppo:
+                returns = torch.zeros_like(mask)
+
+        if cfg.message_level_advantage_penalties_enabled:
+            # Sequence-error filtering and the pre-existing sample mask remain
+            # authoritative: a message penalty must not make a filtered token
+            # trainable again.
+            valid_tokens = mask.bool()
+            advantages = apply_message_level_advantage_penalties(
+                advantages,
+                invalid_tool_call_mask=(
+                    tensor_field(data, adv_cfg.invalid_tool_call_mask_field).bool()
+                    & valid_tokens
+                ),
+                malformed_thinking_mask=(
+                    tensor_field(data, adv_cfg.malformed_thinking_mask_field).bool()
+                    & valid_tokens
+                ),
+                invalid_tool_call_advantage=cfg.algo.invalid_tool_call_advantage,
+                malformed_thinking_advantage=cfg.algo.malformed_thinking_advantage,
+            )
+
+        response_advantages = torch.masked_select(advantages, mask.bool())
+        reward_partial = RewardPartial.from_rows(rewards, final_sample_mask)
+        opd_stat_sum = 0.0
+        opd_stat_sumsq = 0.0
+        opd_stat_count = 0
+        if cfg.teacher_logprobs_required:
+            valid = response_advantages.detach().double()
+            opd_stat_sum = float(valid.sum())
+            opd_stat_sumsq = float((valid * valid).sum())
+            opd_stat_count = int(valid.numel())
+
+        # OPD accumulates its statistics from the estimator output above. The
+        # ordinary advantage metrics and policy training use the clipped values,
+        # matching the legacy paths.
+        if not cfg.is_ppo:
+            assert isinstance(cfg.algo, GRPOConfig)
+            advantages = _clip_grpo_advantages(advantages, cfg.algo)
+            response_advantages = torch.masked_select(advantages, mask.bool())
+        advantage_partial = AdvantagePartial.from_values(response_advantages)
+
+        fields_to_put = {adv_cfg.output_field: advantages}
+        if not torch.equal(final_sample_mask, sample_mask):
+            fields_to_put[adv_cfg.sample_mask_field] = final_sample_mask
+        new_fields = [adv_cfg.output_field]
+        if returns is not None:
+            fields_to_put[adv_cfg.returns_field] = returns
+            new_fields.append(adv_cfg.returns_field)
+
+        await call_data_plane(
+            self._dp_client,
+            "put_samples",
+            offload_sync=True,
+            sample_ids=meta.sample_ids,
+            partition_id=meta.partition_id,
+            fields=fields_for_put(meta, fields_to_put),
+        )
+        return AdvantageOutcome(
+            meta=meta.with_fields(new_fields),
+            has_valid_training_tokens=has_valid_training_tokens,
+            num_mask_sample_filtered=num_mask_sample_filtered,
+            reward_partial=reward_partial,
+            advantage_partial=advantage_partial,
+            seq_logprob_error_metrics=seq_error_metrics,
+            opd_stat_sum=opd_stat_sum,
+            opd_stat_sumsq=opd_stat_sumsq,
+            opd_stat_count=opd_stat_count,
+        )
