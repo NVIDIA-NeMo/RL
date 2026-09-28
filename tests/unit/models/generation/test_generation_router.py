@@ -27,7 +27,7 @@ misbehave over an actual socket.
 import asyncio
 
 import pytest
-from aiohttp import ClientSession, web
+from aiohttp import ClientConnectionResetError, ClientSession, web
 
 from nemo_rl.models.generation.generation_router import GenerationRouterImpl
 
@@ -343,6 +343,37 @@ class TestBackendErrorHandling:
     no_healthy_backend_status validator exists to prevent, arriving through the error
     path the validator never covered.
     """
+
+    def test_a_disconnected_models_probe_does_not_condemn_the_backend(self):
+        """Gym accepts any probe status, so its disconnect is not shard health."""
+        backend = _Backend("healthy")
+
+        async def _main():
+            async with _Harness([backend]) as harness:
+
+                async def _disconnected_probe(*_):
+                    raise ClientConnectionResetError("downstream closed")
+
+                harness.router._forward = _disconnected_probe
+                status, _, _ = await harness.call("/v1/models")
+                assert status == 404
+                assert backend.url in harness.router._serving
+                assert harness.router.drain_backend_outcomes() == {}
+                assert harness.router.metrics()["router/backend_error_total"] == 0.0
+
+        asyncio.run(_main())
+
+    def test_a_timed_out_models_probe_still_condemns_the_backend(self):
+        wedged = _HangingBackend("wedged")
+
+        async def _main():
+            async with _Harness([wedged], backend_timeout_s=0.1) as harness:
+                status, _, _ = await harness.call("/v1/models")
+                assert status == 409
+                assert wedged.url not in harness.router._serving
+                assert harness.router.drain_backend_outcomes() == {wedged.url: (0, 1)}
+
+        asyncio.run(_main())
 
     def test_a_wedged_backend_is_answered_500_and_never_504(self):
         wedged, healthy = _HangingBackend("wedged"), _Backend("healthy")

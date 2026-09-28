@@ -43,7 +43,10 @@ import torch
 
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import MASK_SAMPLE, ROUTE_PLAN_TAG, TRUNCATED
-from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
+from nemo_rl.data_plane.tq_token_sink import (
+    TQTokenSink,
+    TQTokenSource,
+)
 from nemo_rl.experience.payload import pack_payload
 from nemo_rl.experience.route_assembly import (
     ROUTE_MISSING_SENTINEL,
@@ -89,6 +92,7 @@ class FinalizedGroup:
     group_min_wv: int
     group_max_wv: int
     staging_keys: list[str]
+    canonical_output_tokens: int = 0
     metrics: dict[str, float] = field(default_factory=dict)
     # True when the finalizer rejected the whole group as a structural outcome
     # (see drop_reason); the caller aborts the slot instead of committing it.
@@ -174,7 +178,7 @@ class RolloutReassembler:
             return rejected("missing_receipt", [])
         try:
             parsed = RolloutReceipt.model_validate(receipt)
-        except ValueError as error:
+        except (TypeError, ValueError) as error:
             return rejected(f"invalid_receipt:{error}", [])
         staging_keys = [record.staging_key for record in parsed.manifest]
         if parsed.rollout_id != rollout_id:
@@ -183,8 +187,8 @@ class RolloutReassembler:
             return rejected(f"rollout_failed:{parsed.failure_reason}", staging_keys)
         if parsed.capture_poisoned:
             return rejected("capture_poisoned", staging_keys)
-        if not parsed.manifest:
-            return rejected("empty_manifest", staging_keys)
+        # An unpoisoned receipt must name a terminal call that is in the manifest
+        # (RolloutReceipt validators), so a valid receipt here is never empty.
         if len(set(staging_keys)) != len(staging_keys):
             return rejected(
                 "duplicate_staging_key",
@@ -438,15 +442,23 @@ class RolloutReassembler:
         # on a declaring harness is a regression signal. Failed selections
         # stamp the last stage attempted, so masked rollouts stay visible in
         # their method's bucket (cross-reference finalize/invalid_row_rate).
-        # Method list is derived from Gym's own type rather than hand-copied,
-        # so a new resolution method Gym adds gets a bucket automatically
-        # instead of silently missing from these metrics.
-        from typing import get_args
+        # Receipts whose manifest never parsed carry no method (None) and
+        # fall in no bucket. Method list is derived from Gym's own type
+        # rather than hand-copied, so a new resolution method Gym adds gets a
+        # bucket automatically instead of silently missing from these
+        # metrics; the annotation is ``Literal[...] | None``, so unwrap the
+        # Literal and skip the None member.
+        from typing import Literal, get_args, get_origin
 
         from nemo_gym.token_id_capture.staging.records import RolloutReceipt
 
-        terminal_selection_methods = get_args(
-            RolloutReceipt.model_fields["terminal_selection"].annotation
+        terminal_selection_methods = tuple(
+            method
+            for member in get_args(
+                RolloutReceipt.model_fields["terminal_selection"].annotation
+            )
+            if get_origin(member) is Literal
+            for method in get_args(member)
         )
         for method in terminal_selection_methods:
             method_receipts = sum(
@@ -556,6 +568,7 @@ class RolloutReassembler:
                     group_min_wv=group_min_wv,
                     group_max_wv=group_max_wv,
                     staging_keys=[],
+                    canonical_output_tokens=0,
                     metrics=metrics,
                     dropped=True,
                     drop_reason=(
@@ -639,6 +652,9 @@ class RolloutReassembler:
             group_min_wv=group_min_wv,
             group_max_wv=group_max_wv,
             staging_keys=(staging_keys if self._defer_routed_experts_to_policy else []),
+            canonical_output_tokens=sum(
+                int(mask) for row in valid_rows for mask in row.token_mask
+            ),
             metrics=metrics,
             valid_row_count=len(valid_rows),
             total_row_count=len(rows),

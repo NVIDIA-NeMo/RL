@@ -96,8 +96,14 @@ policy:
   logprob_chunk_size: null  # Disabled to allow defer_fp32_logits: false
 
   dtensor_cfg:
-    _v2: false
+    _v2: true
     enabled: false
+    checkpoint:
+      model_save_format: "safetensors"
+      # Canonical Automodel modes: "false", "final", or "every".
+      save_consolidated: "false"
+      single_rank_consolidation: false
+      consolidation_timeout_minutes: 30
     cpu_offload: False
     sequence_parallel: false
     activation_checkpointing: true

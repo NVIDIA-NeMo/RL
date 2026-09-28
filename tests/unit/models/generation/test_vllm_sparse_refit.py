@@ -313,7 +313,7 @@ def test_sparse_refit_batch_drains_workers_before_error_cleanup(tmp_path: Path) 
             if method == "update_weights_from_decoded_sparse_payload":
                 staged_paths = args
                 raise RuntimeError("apply failed")
-            assert method == "synchronize_device"
+            assert method == "synchronize_sparse_refit_device"
             assert all(Path(path).is_file() for path in staged_paths)
             return [True]
 
@@ -330,7 +330,7 @@ def test_sparse_refit_batch_drains_workers_before_error_cleanup(tmp_path: Path) 
             for entry in receiver._worker.llm.collective_rpc.call_args_list
         ] == [
             "update_weights_from_decoded_sparse_payload",
-            "synchronize_device",
+            "synchronize_sparse_refit_device",
         ]
         assert not list(tmp_path.iterdir())
 
@@ -582,6 +582,7 @@ async def test_async_sparse_refit_post_init_records_worker_locality() -> None:
 
 def test_sync_post_init_binds_numa() -> None:
     worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
+    worker.cfg = {}
     worker._sparse_refit_receiver = None
     worker._mtp_load_from_disk = False
     worker._mtp_speculative_enabled = True
