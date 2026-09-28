@@ -105,6 +105,12 @@ class NemoGymConfig(TypedDict):
     thinking_tags: NotRequired[
         List[str] | None
     ]  # Thinking tags to check for malformed usage
+    # Tool name -> argument names a structured call must carry. A call missing
+    # any of them is flagged invalid. The runtime rejects such calls without a
+    # tool response reaching the trainer, so the "Validation failure" output
+    # check never sees them. Only list tools whose arguments the agent runtime
+    # never fills in from reasoning/content.
+    required_tool_arguments: NotRequired[Dict[str, List[str]] | None]
     require_routed_experts: NotRequired[
         bool
     ]  # Require Gym output items to carry R3 routed_experts
@@ -116,6 +122,27 @@ class NemoGymConfig(TypedDict):
     use_fastokens: NotRequired[bool]
     # Replace dataset agent_ref.name at dispatch time without rewriting JSONL data.
     agent_name_override: NotRequired[str]
+
+
+def _missing_required_tool_arguments(
+    output_item_dict: dict[str, Any],
+    required_tool_arguments: dict[str, list[str]] | None,
+) -> bool:
+    """Return True if a structured call lacks a configured required argument."""
+    if not required_tool_arguments or output_item_dict.get("type") != "function_call":
+        return False
+    required = required_tool_arguments.get(output_item_dict.get("name"))
+    if not required:
+        return False
+    arguments = output_item_dict.get("arguments", "")
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments) if arguments.strip() else {}
+        except (json.JSONDecodeError, TypeError):
+            return True
+    if not isinstance(arguments, dict):
+        return True
+    return any(arguments.get(name) in (None, "") for name in required)
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
@@ -556,10 +583,16 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                     thinking_tags=self.cfg.get("thinking_tags"),
                 )
             )
-            is_invalid_tool_call = is_invalid_tool_call or (
-                output_item_dict.get("type") == "function_call"
-                and output_item_dict.get("call_id")
-                in invalid_structured_tool_call_ids
+            is_invalid_tool_call = (
+                is_invalid_tool_call
+                or (
+                    output_item_dict.get("type") == "function_call"
+                    and output_item_dict.get("call_id")
+                    in invalid_structured_tool_call_ids
+                )
+                or _missing_required_tool_arguments(
+                    output_item_dict, self.cfg.get("required_tool_arguments")
+                )
             )
             tool_call_payload_chars = _tool_call_payload_char_count(
                 output_item_dict, is_invalid_tool_call
@@ -792,6 +825,7 @@ def spinup_nemo_gym_actor(
     # (where the detector reads them), not part of Gym's global config.
     invalid_tool_call_patterns = nemo_gym_dict.pop("invalid_tool_call_patterns", None)
     thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
+    required_tool_arguments = nemo_gym_dict.pop("required_tool_arguments", None)
     agent_name_override = nemo_gym_dict.pop("agent_name_override", None)
 
     # Pass prebuilt cache + venv dirs through the global config so the gym reuses
@@ -808,6 +842,7 @@ def spinup_nemo_gym_actor(
         base_urls=base_urls,
         invalid_tool_call_patterns=invalid_tool_call_patterns,
         thinking_tags=thinking_tags,
+        required_tool_arguments=required_tool_arguments,
         require_routed_experts=enable_router_replay,
         routed_experts_dtype=routed_experts_dtype,
         use_fastokens=use_fastokens,
