@@ -231,7 +231,6 @@ def test_blackwell_refit_prequantization_uses_vllm_fallback_without_flashinfer(
     x = torch.randn(2, 64, dtype=torch.bfloat16, device="cuda")
     monkeypatch.setattr(fp8_train_utils, "_receiver_has_flashinfer", lambda: False)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (10, 0))
-    monkeypatch.setattr(sys.modules, "flashinfer", None)
 
     values, scales = mxfp8_e4m3_quantize_for_refit(x)
     expected_values, expected_scales = _mxfp8_e4m3_quantize_torch(x)

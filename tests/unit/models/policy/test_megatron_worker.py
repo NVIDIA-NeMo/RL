@@ -2235,7 +2235,9 @@ def test_offload_after_refit_routes_cleanup_by_mode(
     worker.offload_after_refit()
 
     worker.finalize_async_save.assert_called_once_with()
-    worker.move_model.assert_called_once_with(model, "cpu", move_params=True)
+    worker.move_model.assert_called_once_with(
+        model, "cpu", move_params=True, move_grads=True
+    )
     model.eval.assert_called_once_with()
     if slim:
         worker._clear_fp8_caches.assert_called_once_with()
