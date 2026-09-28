@@ -1422,7 +1422,7 @@ class MegatronPolicyWorkerImpl(
                 metrics["moe_metrics"] = moe_metrics
         # Collect MTP metrics (kept out of train()'s body so cloudpickle does not
         # pull an unpicklable torch ConfigModuleInstance into the worker actor).
-        self._collect_mtp_metrics(metrics, mtp_grad_norm)
+        self._collect_mtp_metrics(metrics, total_num_microbatches, mtp_grad_norm)
         if draft_grad_norm is not None:
             metrics["draft_grad_norm"] = torch.tensor([draft_grad_norm])
 
@@ -2283,7 +2283,11 @@ class MegatronPolicyWorkerImpl(
             if moe_metrics:
                 metrics["moe_metrics"] = moe_metrics
 
-        self._collect_mtp_metrics(metrics, mtp_grad_norm)
+        self._collect_mtp_metrics(
+            metrics,
+            state["total_num_microbatches"],
+            mtp_grad_norm,
+        )
 
         self._train_step_state = None
         return metrics
@@ -3032,6 +3036,7 @@ class MegatronPolicyWorkerImpl(
     def _collect_mtp_metrics(
         self,
         metrics: dict[str, Any],
+        total_num_microbatches: int,
         mtp_grad_norm: Optional[float],
     ) -> None:
         """Add Multi-Token Prediction metrics to ``metrics`` when MTP is enabled.
@@ -3042,6 +3047,9 @@ class MegatronPolicyWorkerImpl(
 
         Args:
             metrics: Metrics dict to populate with MTP metrics (under "mtp_metrics").
+            total_num_microbatches: Microbatches accumulated this step. The MTP loss
+                logging helper sums the per-microbatch loss without dividing, so we pass
+                1/total_num_microbatches to recover the mean (mirroring the MoE path).
             mtp_grad_norm: The MTP parameter group's gradient norm, already reduced across
                 the model-parallel group, or None when unavailable (e.g. clip_grad == 0 or
                 mtp_detach_heads=False). Logged under "mtp_metrics" as "grad_norm".
@@ -3050,10 +3058,10 @@ class MegatronPolicyWorkerImpl(
             from nemo_rl.models.megatron.common import get_mtp_metrics
 
             # MTP layers live only on the last pipeline stage, so the tracker is
-            # populated there alone. The tracker retains raw loss sums and rolled
-            # token counts, so their ratio is already globally normalized and
-            # needs no separate microbatch-average scale.
-            mtp_metrics = get_mtp_metrics()
+            # populated there alone. Broadcast to all stages so downstream metric
+            # aggregation (which reads rank 0's results) sees them when PP > 1.
+            mtp_loss_scale = 1.0 / max(1, total_num_microbatches)
+            mtp_metrics = get_mtp_metrics(loss_scale=mtp_loss_scale)
             mtp_metrics = broadcast_loss_metrics_from_last_stage(mtp_metrics)
             # mtp_grad_norm is already MP-reduced (same value on every rank); expose it
             # under the "mtp/" namespace so it logs as train/mtp/grad_norm.
