@@ -55,12 +55,17 @@ from nemo_rl.data_plane.schema import (
     ROUTE_ENCODING_ENVELOPE,
     ROUTE_ENCODING_LIST,
     ROUTE_ENCODING_NONE,
+    ROUTED_EXPERTS_BOUNDARY_FIELD,
     ROUTED_EXPERTS_ENCODING_FIELD,
     ROUTED_EXPERTS_FIELD,
     ROUTED_EXTRAS_METADATA_FIELD,
     ROUTED_LEN_FIELD,
 )
-from nemo_rl.experience.route_assembly import RouteFragment
+from nemo_rl.experience.route_assembly import (
+    RouteFragment,
+    routed_experts_boundary_index,
+)
+from nemo_rl.utils.routed_experts_codec import decode_routed_experts
 
 # These names come from nemo_gym.token_id_capture.staging.records.StagedCallRecord,
 # transformed by stage() below. Adding a field means editing both this list and
@@ -119,13 +124,14 @@ class FetchedStagedCall:
 
     ``fragment`` is populated only when the fetch requested route payloads
     (direct mode); deferred finalization leaves route bytes in TQ and carries
-    only ``routed_len`` transport metadata.
+    only ``routed_len`` and the optional boundary token index as metadata.
     """
 
     staging_key: str
     snapshot: StagedCallBaseSnapshot
     routed_len: int
     fragment: RouteFragment | None = None
+    boundary_token_index: int | None = None
 
 
 def _call_dp(dp_client: Any, method_name: str, **kwargs: Any) -> Any:
@@ -135,6 +141,29 @@ def _call_dp(dp_client: Any, method_name: str, **kwargs: Any) -> Any:
     if remote is not None:
         return ray.get(remote(**kwargs))
     return method(**kwargs)
+
+
+def fetch_route_boundaries(
+    dp_client: Any, *, staging_partition: str, staging_keys: list[str]
+) -> dict[str, torch.Tensor]:
+    """Fetch only declared sidecars; root/legacy rows have no boundary column."""
+    if not staging_keys:
+        return {}
+    try:
+        rows = _call_dp(
+            dp_client,
+            "get_samples",
+            sample_ids=staging_keys,
+            partition_id=staging_partition,
+            select_fields=[ROUTED_EXPERTS_BOUNDARY_FIELD],
+        )
+    except Exception as error:  # noqa: BLE001 — storage boundary maps misses to KeyError
+        raise KeyError("could not fetch declared routed-experts boundaries") from error
+    n_rows = int(rows.batch_size[0]) if rows.batch_size else 0
+    column = rows.get(ROUTED_EXPERTS_BOUNDARY_FIELD)
+    if n_rows != len(staging_keys) or column is None:
+        raise KeyError("incomplete routed-experts boundary fetch")
+    return {key: column[index] for index, key in enumerate(staging_keys)}
 
 
 class TQStagingStore:
@@ -264,23 +293,25 @@ class TQTokenSink:
                 if extras_metadata is not None
                 else None
             )
-            field_dict[ROUTED_EXTRAS_METADATA_FIELD] = _bytes_tensor(
-                json.dumps(
-                    extras_metadata,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    ensure_ascii=False,
-                ).encode("utf-8")
+            boundary = (
+                extras_metadata.pop(ROUTED_EXPERTS_BOUNDARY_FIELD, None)
+                if extras_metadata is not None
+                else None
             )
+            metadata_json = json.dumps(
+                extras_metadata,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+            field_dict[ROUTED_EXTRAS_METADATA_FIELD] = _bytes_tensor(metadata_json)
+            boundary_index = routed_experts_boundary_index(metadata_json)
             routed_len = 0
             routed_encoding = ROUTE_ENCODING_NONE
+            experts: torch.Tensor | None = None
             if routed is not None:
                 delta_len = len(record.token_ids_delta)
                 if isinstance(routed, str):
-                    from nemo_rl.utils.routed_experts_codec import (
-                        decode_routed_experts,
-                    )
-
                     dtype_name = routed.split(":", 3)[1]
                     dtype = {
                         "int8": torch.int8,
@@ -303,6 +334,28 @@ class TQTokenSink:
                     )
                 field_dict[ROUTED_EXPERTS_FIELD] = experts.unsqueeze(0)
                 routed_len = int(experts.shape[0])
+            if boundary is not None or boundary_index is not None:
+                if (
+                    experts is None
+                    or not isinstance(boundary, str)
+                    or record.mode != "token_in"
+                    or record.prev_len <= 0
+                    or boundary_index != record.prev_len - 1
+                ):
+                    raise ValueError(
+                        "boundary routes must identify the child's last prefix token"
+                    )
+                # The sidecar is always an envelope, even for legacy list deltas.
+                if boundary.split(":", 3)[1:2] != [
+                    str(experts.dtype).removeprefix("torch.")
+                ]:
+                    raise ValueError("boundary and delta route dtypes must match")
+                boundary_tensor = decode_routed_experts(boundary, experts.dtype)
+                if tuple(boundary_tensor.shape) != (1, *experts.shape[1:]):
+                    raise ValueError(
+                        "boundary routes must have shape [1, layers, topk]"
+                    )
+                field_dict[ROUTED_EXPERTS_BOUNDARY_FIELD] = boundary_tensor.unsqueeze(0)
             field_dict[ROUTED_EXPERTS_ENCODING_FIELD] = torch.tensor(
                 [routed_encoding], dtype=torch.int64
             )
@@ -412,6 +465,7 @@ class TQTokenSource:
     def __init__(self, dp_client: Any, *, staging_partition: str) -> None:
         self._store = TQStagingStore(dp_client, staging_partition=staging_partition)
         self._staging_partition = staging_partition
+        self._dp_client = dp_client
 
     def fetch(self, staging_keys: list[str]) -> list[StagedCallBaseSnapshot]:
         """Gym ``StagingSource`` conformance: base snapshots only, in order."""
@@ -494,9 +548,29 @@ class TQTokenSource:
             )
         # Row order mirrors the requested key order; digest recomputation at
         # snapshot validation is the byte-exact backstop if that ever breaks.
+        selected_rows = [_select_row(rows, index) for index in range(n_rows)]
+        boundary_indices = [
+            routed_experts_boundary_index(
+                _row_text(row, ROUTED_EXTRAS_METADATA_FIELD).encode("utf-8")
+            )
+            for row in selected_rows
+        ]
+        boundaries = (
+            fetch_route_boundaries(
+                self._dp_client,
+                staging_partition=self._staging_partition,
+                staging_keys=[
+                    key
+                    for key, boundary_index in zip(staging_keys, boundary_indices)
+                    if boundary_index is not None
+                ],
+            )
+            if include_route_fragments
+            else {}
+        )
         fetched: list[FetchedStagedCall] = []
         for index, key in enumerate(staging_keys):
-            row = _select_row(rows, index)
+            row = selected_rows[index]
             snapshot = _row_to_base_snapshot(row)
             if snapshot.staging_key != key:
                 raise KeyError(
@@ -508,8 +582,11 @@ class TQTokenSource:
                     snapshot=snapshot,
                     routed_len=_row_scalar_int(row, ROUTED_LEN_FIELD),
                     fragment=(
-                        _row_to_route_fragment(row) if include_route_fragments else None
+                        _row_to_route_fragment(row, boundary_routes=boundaries.get(key))
+                        if include_route_fragments
+                        else None
                     ),
+                    boundary_token_index=boundary_indices[index],
                 )
             )
         return fetched
@@ -604,7 +681,9 @@ def _row_to_base_snapshot(row: Any) -> StagedCallBaseSnapshot:
     )
 
 
-def _row_to_route_fragment(row: Any) -> RouteFragment | None:
+def _row_to_route_fragment(
+    row: Any, *, boundary_routes: torch.Tensor | None = None
+) -> RouteFragment | None:
     """Extract one staged route payload beside (never inside) the snapshot."""
     routed_encoding = int(_row_leaf(row, ROUTED_EXPERTS_ENCODING_FIELD)[0].item())
     if routed_encoding == ROUTE_ENCODING_NONE:
@@ -622,6 +701,7 @@ def _row_to_route_fragment(row: Any) -> RouteFragment | None:
         extras_metadata_json=_row_text(row, ROUTED_EXTRAS_METADATA_FIELD).encode(
             "utf-8"
         ),
+        boundary_routes=boundary_routes,
     )
 
 

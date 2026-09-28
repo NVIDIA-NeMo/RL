@@ -46,6 +46,37 @@ The native async TransferQueue path uses the SingleController entrypoint with:
 examples/configs/recipes/llm/grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async-single-controller.yaml
 ```
 
+## Turn boundaries with TQ token capture
+
+With `token_capture.enabled=true`, both eager route assembly and
+`token_capture.defer_routed_experts_to_policy=true` repair intermediate turn
+boundaries. A decode response pads its final input-token route; the next
+verified `token_in` call supplies the actual prefill route for that token.
+
+The child stages its usual `[delta_len, layers, topk]` routes plus a separate
+`routed_experts_boundary` tensor of shape `[1, layers, topk]`. Its absolute
+`routed_experts_boundary_index` remains in the small extras metadata. Both
+the boundary bytes and index are covered by the child's extras digest. The
+selected lineage's route plan authorizes the repair; neither an abandoned
+retry nor response arrival order can overwrite a parent's staged routes.
+Token IDs, masks, logprobs, and delta lengths are unchanged. An all-`-1`
+boundary remains a missing-route sentinel, and the final trajectory token
+keeps its dummy route.
+
+New route plans use schema v3. V2 plans and older staged records remain
+readable without inventing boundary routes; older staged continuations emit
+a warning and retain their previous behavior. Native TQ checkpoints used
+with token capture and router replay must declare boundary staging schema
+v1. Checkpoints predating that column are rejected at startup: native
+staging-schema migration is not implemented, so use a compatible checkpoint
+or fresh rollout/staging state.
+
+Deploy the NeMo-RL and Gym adapter changes together. R3 capture rejects a Gym
+adapter without boundary-sidecar support; ordinary non-R3 token capture is
+unchanged. Missing/corrupt boundary fragments follow the existing failure
+policies: eager assembly rejects the rollout, while deferred assembly falls
+back to native routing for the affected rollout.
+
 ## Validation
 
 Router Replay validation covers two end-to-end questions:
