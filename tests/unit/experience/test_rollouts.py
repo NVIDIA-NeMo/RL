@@ -2296,8 +2296,8 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
             assert num_returns == "streaming"
             return self
 
-        def remote(self, inputs, timer_prefix):
-            del inputs, timer_prefix
+        def remote(self, inputs, timer_prefix, per_prompt=False):
+            del inputs, timer_prefix, per_prompt
             return _Stream()
 
     manager = object.__new__(AsyncNemoGymRolloutImpl)
@@ -2430,8 +2430,8 @@ def test_rollout_manager_rejects_duplicate_stream_rows():
             assert num_returns == "streaming"
             return self
 
-        def remote(self, inputs, timer_prefix):
-            del inputs, timer_prefix
+        def remote(self, inputs, timer_prefix, per_prompt=False):
+            del inputs, timer_prefix, per_prompt
             return _DuplicateStream()
 
     manager = object.__new__(AsyncNemoGymRolloutImpl)
@@ -2566,8 +2566,8 @@ def test_rollout_manager_attributes_awaited_stream_failure_to_instance():
             assert num_returns == "streaming"
             return self
 
-        def remote(self, inputs, timer_prefix):
-            del inputs, timer_prefix
+        def remote(self, inputs, timer_prefix, per_prompt=False):
+            del inputs, timer_prefix, per_prompt
             return _FailedStream()
 
     manager = object.__new__(AsyncNemoGymRolloutImpl)
@@ -2714,6 +2714,14 @@ def test_run_async_nemo_gym_rollout(
             "example_multi_step_simple_agent/accuracy/median": 0.0,
             "example_multi_step_simple_agent/accuracy/min": 0.0,
             "example_multi_step_simple_agent/accuracy/stddev": 0.0,
+            # Gym declares mask_sample on every verify response (Gym #2611), so it
+            # surfaces through the per-agent metric pass like any other scalar field.
+            "example_multi_step_simple_agent/mask_sample/histogram": None,
+            "example_multi_step_simple_agent/mask_sample/max": 0.0,
+            "example_multi_step_simple_agent/mask_sample/mean": 0.0,
+            "example_multi_step_simple_agent/mask_sample/median": 0.0,
+            "example_multi_step_simple_agent/mask_sample/min": 0.0,
+            "example_multi_step_simple_agent/mask_sample/stddev": 0.0,
             "example_multi_step_simple_agent/order_instruction_following_failure/histogram": None,
             "example_multi_step_simple_agent/order_instruction_following_failure/max": 0.0,
             "example_multi_step_simple_agent/order_instruction_following_failure/mean": 0.0,

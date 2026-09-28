@@ -44,8 +44,7 @@ fi
 # and one GPU hosts Megatron generation.
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 
-# Disabled until https://github.com/NVIDIA-NeMo/RL/issues/4208 is fixed
-# run_test fast uv run --no-sync bash ./tests/functional/nemotron_omni_clevr_megatron_single_controller_1n2g.sh
+run_test fast uv run --no-sync bash ./tests/functional/nemotron_omni_clevr_megatron_single_controller_1n2g.sh
 run_test fast uv run --no-sync bash ./tests/functional/nemotron_omni_gym_video_megatron_single_controller_1n2g.sh
 
 cd "${PROJECT_ROOT}/tests"

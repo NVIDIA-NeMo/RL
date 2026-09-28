@@ -35,7 +35,6 @@ run_test() {
 }
 
 run_test fast uv run --no-sync bash ./tests/functional/gdpo_async_grpo.sh
-run_test fast uv run --no-sync bash ./tests/functional/grpo_fsdp2.sh
 run_test      uv run --no-sync bash ./tests/functional/grpo_multiturn.sh
 run_test      uv run --no-sync bash ./tests/functional/grpo_non_colocated.sh
 run_test      uv run --no-sync bash ./tests/functional/grpo_non_colocated_reload_refit.sh

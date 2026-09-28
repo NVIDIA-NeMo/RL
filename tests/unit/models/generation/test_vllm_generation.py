@@ -222,8 +222,12 @@ basic_dtensor_test_config: PolicyConfig = {
         },
     },
     "dtensor_cfg": {
-        "_v2": False,
+        "_v2": True,
         "enabled": True,
+        "checkpoint": {
+            "model_save_format": "safetensors",
+            "save_consolidated": "false",
+        },
         "cpu_offload": False,
         "sequence_parallel": False,
         "activation_checkpointing": False,
@@ -793,6 +797,7 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         "vllm.entrypoints.openai.engine",
         "vllm.entrypoints.openai.models",
         "vllm.entrypoints.serve",
+        "vllm.entrypoints.serve.engine",
         "vllm.entrypoints.serve.tokenize",
         "vllm.reasoning",
         "vllm.renderers",
@@ -878,6 +883,11 @@ def _install_fake_vllm_openai_modules(monkeypatch):
     )
     make_module(
         "vllm.entrypoints.openai.engine.protocol",
+        ErrorResponse=type("ErrorResponse", (), {}),
+    )
+    # vLLM 0.29 location of the engine protocol (vllm-project/vllm#54492).
+    make_module(
+        "vllm.entrypoints.serve.engine.protocol",
         ErrorResponse=type("ErrorResponse", (), {}),
     )
     make_module(
@@ -2477,28 +2487,17 @@ async def run_hf_train_process(
 
 
 @pytest.mark.asyncio
+@pytest.mark.automodel
+@pytest.mark.timeout(360)
 @pytest.mark.parametrize(
     ("async_engine", "cpu_offload", "vllm_precision", "enable_lora"),
     [
-        pytest.param(True, False, "bfloat16", False, marks=pytest.mark.timeout(900)),
-        pytest.param(False, True, "bfloat16", False, marks=pytest.mark.timeout(900)),
-        pytest.param(True, False, "fp8", False, marks=pytest.mark.timeout(900)),
-        pytest.param(False, True, "fp8", False, marks=pytest.mark.timeout(900)),
-        # LoRA tests require dtensor v2 / automodel and take longer in CI.
-        pytest.param(
-            False,
-            False,
-            "bfloat16",
-            True,
-            marks=[pytest.mark.automodel, pytest.mark.timeout(900)],
-        ),
-        pytest.param(
-            True,
-            False,
-            "bfloat16",
-            True,
-            marks=[pytest.mark.automodel, pytest.mark.timeout(900)],
-        ),
+        (True, False, "bfloat16", False),
+        (False, True, "bfloat16", False),
+        (True, False, "fp8", False),
+        (False, True, "fp8", False),
+        (False, False, "bfloat16", True),
+        (True, False, "bfloat16", True),
     ],
 )
 async def test_vllm_generation_with_hf_training_colocated(
@@ -2524,12 +2523,6 @@ async def test_vllm_generation_with_hf_training_colocated(
     print("Creating DTensor policy...")
     dtensor_config = deepcopy(basic_dtensor_test_config)
     dtensor_config["dtensor_cfg"]["cpu_offload"] = cpu_offload
-    dtensor_config["dtensor_cfg"]["_v2"] = enable_lora
-    if enable_lora:
-        dtensor_config["dtensor_cfg"]["checkpoint"] = {
-            "model_save_format": "safetensors",
-            "save_consolidated": "false",
-        }
     dtensor_config["dtensor_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
     dtensor_config["dtensor_cfg"]["lora_cfg"]["enabled"] = enable_lora
     dtensor_config["train_global_batch_size"] = 4
@@ -2553,30 +2546,21 @@ async def test_vllm_generation_with_hf_training_colocated(
 
 
 @pytest.mark.asyncio
+@pytest.mark.automodel
+@pytest.mark.timeout(360)
 @pytest.mark.parametrize(
     ("async_engine", "cpu_offload", "vllm_precision", "enable_lora"),
     [
-        pytest.param(True, False, "bfloat16", False, marks=pytest.mark.timeout(900)),
-        pytest.param(False, True, "bfloat16", False, marks=pytest.mark.timeout(900)),
+        # cpu_offload stays off here: the policy gets 1 GPU and automodel rejects
+        # world_size=1 + cpu_offload (automodel/setup.py).
+        (True, False, "bfloat16", False),
+        (False, False, "bfloat16", False),
         # NOTE: non-colocated FP8 tests fail on main as of 3/9/2026 with
         # avg_prob_mult_error=1.13 > 1.08 threshold. Left unskipped to match main.
-        pytest.param(True, False, "fp8", False, marks=pytest.mark.timeout(900)),
-        pytest.param(False, True, "fp8", False, marks=pytest.mark.timeout(900)),
-        # LoRA tests require dtensor v2 / automodel and take longer in CI.
-        pytest.param(
-            False,
-            False,
-            "bfloat16",
-            True,
-            marks=[pytest.mark.automodel, pytest.mark.timeout(900)],
-        ),
-        pytest.param(
-            True,
-            False,
-            "bfloat16",
-            True,
-            marks=[pytest.mark.automodel, pytest.mark.timeout(900)],
-        ),
+        (True, False, "fp8", False),
+        (False, False, "fp8", False),
+        (False, False, "bfloat16", True),
+        (True, False, "bfloat16", True),
     ],
 )
 async def test_vllm_generation_with_hf_training_non_colocated(
@@ -2616,13 +2600,6 @@ async def test_vllm_generation_with_hf_training_non_colocated(
     dtensor_config["generation"]["colocated"]["enabled"] = False
     dtensor_config["dtensor_cfg"]["cpu_offload"] = cpu_offload
     dtensor_config["train_global_batch_size"] = 4
-    # lora must use dtensor v2
-    dtensor_config["dtensor_cfg"]["_v2"] = enable_lora
-    if enable_lora:
-        dtensor_config["dtensor_cfg"]["checkpoint"] = {
-            "model_save_format": "safetensors",
-            "save_consolidated": "false",
-        }
     dtensor_config["dtensor_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
     dtensor_config["dtensor_cfg"]["lora_cfg"]["enabled"] = enable_lora
     lm_policy = Policy(policy_cluster_separate, dtensor_config, tokenizer)
@@ -2898,6 +2875,8 @@ def test_vllm_http_server(cluster, tokenizer):
 
         # Remove version-dependent fields that vLLM may or may not include
         d.pop("ec_transfer_params", None)
+        # vLLM 0.29 added `completion_tokens_details` to UsageInfo.
+        d.get("usage", {}).pop("completion_tokens_details", None)
         message = d["choices"][0]["message"]
         for key in ("reasoning", "reasoning_content"):
             message.pop(key, None)
@@ -3379,10 +3358,8 @@ def test_vllm_weight_update_and_prefix_cache_reset(
 
 
 # megatron still holds little memory after refit, so we only test dtensor now
-@pytest.mark.parametrize(
-    "train_backend",
-    ["dtensor_v1", pytest.param("dtensor_v2", marks=pytest.mark.automodel)],
-)
+@pytest.mark.automodel
+@pytest.mark.parametrize("train_backend", ["dtensor"])
 def test_vllm_weight_update_memory(cluster, tokenizer, train_backend):
     """Test that vLLM streaming weight update and can save memory."""
     from nemo_rl.models.policy.lm_policy import Policy
@@ -3405,15 +3382,8 @@ def test_vllm_weight_update_memory(cluster, tokenizer, train_backend):
     vllm_policy.finish_generation()
 
     print("Creating Training Policy...")
-    if train_backend == "dtensor_v1":
-        train_config = basic_dtensor_test_config
-    elif train_backend == "dtensor_v2":
+    if train_backend == "dtensor":
         train_config = deepcopy(basic_dtensor_test_config)
-        train_config["dtensor_cfg"]["_v2"] = True
-        train_config["dtensor_cfg"]["checkpoint"] = {
-            "model_save_format": "safetensors",
-            "save_consolidated": "false",
-        }
     elif train_backend == "megatron":
         train_config = get_basic_megatron_test_config(tp=1, pp=1, precision="float32")
     else:
@@ -4260,3 +4230,28 @@ def test_vllm_megatron_weight_update_with_packing(cluster, test_input_data):
             megatron_policy.shutdown()
         if vllm_generation:
             vllm_generation.shutdown()
+
+
+def test_async_vllm_http_client_forwards_admission_checks() -> None:
+    """vLLM 0.29's serving layer calls check_admission before every response."""
+    calls = []
+
+    class Overflow(RuntimeError):
+        pass
+
+    class FakeEngine:
+        model_config = renderer = input_processor = vllm_config = None
+
+        def check_admission(self, n=1, request_id=None):
+            calls.append((n, request_id))
+            if n > 2:
+                raise Overflow("queue full")
+
+    client = _AsyncLLMHTTPClient(FakeEngine(), asyncio.new_event_loop())
+
+    client.check_admission(1)
+    client.check_admission(2, request_id="req-2")
+    with pytest.raises(Overflow):
+        client.check_admission(3, request_id="req-3")
+
+    assert calls == [(1, None), (2, "req-2"), (3, "req-3")]
