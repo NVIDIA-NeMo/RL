@@ -59,7 +59,7 @@ _PATCH_FN = "_patch_vllm_tool_parser_namespace_tool"
 _MARKER = "except ImportError:  # openai < 2.25.0 predates namespace tools"
 _RADIO_SOURCE = "model_executor/models/radio.py"
 _RADIO_PATCH_FN = "_patch_vllm_radio_layerscale_loader"
-_RADIO_MARKER = "initializer_factor = self.config.initializer_factor"
+_RADIO_MARKER = "ls_param.data.fill_(initializer_factor)"
 _GLM_DSA_SOURCE = "model_executor/models/deepseek_v2.py"
 _GLM_DSA_PATCH_FN = "_patch_vllm_glm_decoder_sequence_parallel_moe"
 _GLM_DSA_MARKER = 'getattr(config, "model_type", None) != "glm_moe_dsa"'
@@ -408,7 +408,7 @@ def test_namespace_tool_stub_never_matches(patched_tool_parser_source):
 def test_radio_layerscale_patch_anchor_still_matches_installed_vllm(
     patched_radio_source,
 ):
-    """Pin the vLLM 0.25.1 RADIO loader shape used by the source patch."""
+    """Pin the current vLLM RADIO loader shape used by the source patch."""
     content = patched_radio_source.read_text()
     assert _RADIO_MARKER in content
     assert "Skip layer-scale entries that vLLM doesn't use" not in content
@@ -421,9 +421,9 @@ def test_radio_layerscale_patch_loads_explicit_and_initializes_folded_weights(
 ):
     content = patched_radio_source.read_text()
     assert 'vllm_key = f"model.encoder.layers.{layer_idx}.{suffix}"' in content
-    assert 'name.endswith((".ls1", ".ls2"))' in content
-    assert "param.data.fill_(initializer_factor)" in content
-    assert "loaded_params.add(name)" in content
+    assert 'ls_name.endswith((".ls1", ".ls2"))' in content
+    assert "ls_param.data.fill_(initializer_factor)" in content
+    assert "loaded_params.add(ls_name)" in content
 
 
 @pytest.mark.vllm
@@ -447,7 +447,7 @@ def test_radio_layerscale_patch_warns_on_unknown_source(monkeypatch, tmp_path, c
         patches._patch_vllm_radio_layerscale_loader(logging.getLogger(__name__))
 
     assert radio_source.read_text() == "class RadioModel:\n    pass\n"
-    assert "vLLM 0.25.1 source shape was not found" in caplog.text
+    assert "load_weights tail anchor was not found" in caplog.text
 
 
 @pytest.mark.vllm
