@@ -487,14 +487,30 @@ def test_energon_config_validates_sequence_packing():
     )
     assert source.virtual_epoch_length == 10
     packed = EnergonLoaderConfig(
-        model_family="qwen", packing_buffer_size=10, max_samples_per_sequence=2
+        model_family="qwen",
+        max_samples_per_sequence=2,
+        task_encoder={
+            "packing": {
+                "name": "balanced_greedy_knapsack",
+                "buffer_size": 10,
+                "options": {
+                    "max_sequence_length": 128,
+                    "sequence_length_pad_multiple": 8,
+                    "balanced_knapsack_delta": 5,
+                },
+            }
+        },
     )
-    assert packed.packing_buffer_size == 10
+    assert packed.packing_buffer_size is None
+    assert packed.task_encoder.packing is not None
+    assert packed.task_encoder.packing.buffer_size == 10
     assert packed.max_samples_per_sequence == 2
-    for field in ("packing_buffer_size", "max_samples_per_sequence"):
+    for field in ("max_samples_per_sequence",):
         for value in (0, -1):
             with pytest.raises(ValueError):
                 EnergonLoaderConfig(model_family="qwen", **{field: value})
+    with pytest.raises(ValueError):
+        EnergonLoaderConfig(model_family="qwen", packing_buffer_size=10)
     with pytest.raises(ValueError):
         EnergonLoaderConfig.model_validate({})
     with pytest.raises(ValueError):
@@ -610,9 +626,6 @@ def test_train_loader_rejects_shuffle_false():
             logical_rank=0,
             logical_world_size=1,
             placement_fingerprint="same-placement",
-            packing_algorithm=None,
-            max_sequences_per_bin=None,
-            sequence_length_pad_multiple=1,
             only_unmask_final=False,
         )
 
@@ -647,3 +660,53 @@ def test_config_rejects_options_for_the_generic_task_encoder():
                 },
             }
         )
+def test_config_validates_file_backed_component_references():
+    config = EnergonLoaderConfig.model_validate(
+        {
+            "model_family": "qwen",
+            "task_encoder": {
+                "python_file": "/workspace/custom_encoder.py",
+                "object": "CustomTaskEncoder",
+                "options": {"custom_setting": 8},
+            },
+            "cookers": [
+                {
+                    "python_file": "/workspace/custom_encoder.py",
+                    "object": "custom_cooker",
+                    "options": {"prefix": "custom"},
+                }
+            ],
+        }
+    )
+
+    assert config.task_encoder.name is None
+    assert config.task_encoder.options == {"custom_setting": 8}
+    assert config.cookers[0].name is None
+    assert config.cookers[0].options == {"prefix": "custom"}
+
+    for task_encoder, cookers in (
+        (
+            {"python_file": "/workspace/custom_encoder.py"},
+            ["generic_conversation"],
+        ),
+        (
+            {
+                "name": "generic_sft",
+                "python_file": "/workspace/custom_encoder.py",
+                "object": "CustomTaskEncoder",
+            },
+            ["generic_conversation"],
+        ),
+        (
+            "generic_sft",
+            [{"python_file": "/workspace/custom_encoder.py"}],
+        ),
+    ):
+        with pytest.raises(ValueError):
+            EnergonLoaderConfig.model_validate(
+                {
+                    "model_family": "qwen",
+                    "task_encoder": task_encoder,
+                    "cookers": cookers,
+                }
+            )

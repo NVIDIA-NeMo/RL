@@ -70,12 +70,12 @@ def _normalize_messages(
         materialize: Decode each media value and attach the payload. Set False
             to attach the ``MediaRef`` instead.
 
-    The Nemotron renderers replace every media part with text built from
-    metadata and then overwrite ``message["content"]`` wholesale, so decoding
-    for them is pure waste. It is also waste paid at the wrong time: this runs
-    in pre-encode, before ``select_samples_to_pack``, so rows that selection
-    discards are decoded too. Measured on video rows at 2771 ms against the
-    Megatron reference's 4.7 ms, which defers all frame work to post-encode.
+    Model-specific renderers may replace media parts with text built from
+    metadata and overwrite ``message["content"]`` wholesale, so decoding for
+    them is pure waste. It is also waste paid at the wrong time: this runs in
+    pre-encode, before ``select_samples_to_pack``, so rows that selection
+    discards are decoded too. Model-specific encoders can defer media work to
+    post-encode by setting ``materialize=False``.
 
     Only ``GenericSFTTaskEncoder.encode`` consumes the payload, via
     ``get_formatted_message_log``, so it keeps the default.
