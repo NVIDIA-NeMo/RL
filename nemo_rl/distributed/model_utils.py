@@ -1567,30 +1567,6 @@ class AllGatherCPTensor(torch.autograd.Function):
         return grad_input, None, None  # , None
 
 
-def cp_load_balanced_to_contiguous(
-    x: torch.Tensor,
-    *,
-    cp_group: Optional[torch.distributed.ProcessGroup] = None,
-    seq_dim: int = 1,
-) -> torch.Tensor:
-    """Re-layout a tensor from load-balanced CP order to this rank's contiguous window.
-
-    PyTorch ``context_parallel`` shards the sequence in a load-balanced
-    (``2*cp`` interleaved) order. :func:`allgather_cp_sharded_tensor` undoes the
-    chunking to the full contiguous sequence; this re-slices to this CP rank's
-    contiguous ``[cp_rank*L, (cp_rank+1)*L)`` window. No-op when CP world <= 1.
-    Uses the grad-preserving ``DTensor.to_local()`` so the gradient is kept.
-    """
-    if cp_group is None or torch.distributed.get_world_size(cp_group) <= 1:
-        return x
-    local = x.to_local() if isinstance(x, DTensor) else x
-    full = allgather_cp_sharded_tensor(local, cp_group, seq_dim=seq_dim)
-    cp_size = torch.distributed.get_world_size(cp_group)
-    cp_rank = torch.distributed.get_rank(cp_group)
-    local_len = full.shape[seq_dim] // cp_size
-    return full.narrow(seq_dim, cp_rank * local_len, local_len).contiguous()
-
-
 def cp_shift_next(
     x: torch.Tensor,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
