@@ -517,9 +517,7 @@ def build_energon_sft_loader(
         "num_workers": loader_config.cache_pool_num_workers,
     }
     if loader_config.cache_pool_max_gbytes is not None:
-        cache_pool_kwargs["max_cache_size_gbytes"] = (
-            loader_config.cache_pool_max_gbytes
-        )
+        cache_pool_kwargs["max_cache_size_gbytes"] = loader_config.cache_pool_max_gbytes
     cache_pool = (
         FileStoreCachePool(**cache_pool_kwargs)
         if any(cooker.need_cache for cooker in task_encoder.cookers)
