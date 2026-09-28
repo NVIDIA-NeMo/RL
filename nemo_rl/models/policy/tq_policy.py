@@ -92,9 +92,7 @@ def _aggregate_train_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         for k, v in r["all_mb_metrics"].items():
             all_mb_metrics[k].extend(v)
     out["all_mb_metrics"] = dict(all_mb_metrics)
-    phase_names = {
-        name for result in results for name in result.get("step_phases", {})
-    }
+    phase_names = {name for result in results for name in result.get("step_phases", {})}
     if phase_names:
         out["step_phases"] = {
             name: max(
