@@ -47,12 +47,12 @@ def _train_backend_configs(
             yield path, block
 
 
-def reject_outdated_dtensor_cfg_key(config: dict[str, Any]) -> None:
-    """Fail when a config still names the Automodel block dtensor_cfg.
+def reject_outdated_automodel_block(config: dict[str, Any]) -> None:
+    """Fail when a config still uses the old name or the removed _v2 key for the Automodel block.
 
-    Blocks that select Megatron are skipped: the run does not read dtensor_cfg. If such a
-    config relied on the old key to disable Automodel, Policy/Value.__init__ reports the
-    rename when both backends end up enabled.
+    Blocks that select Megatron are skipped: the run reads neither. If such a config
+    relied on the old key to disable Automodel, Policy/Value.__init__ reports the rename
+    when both backends end up enabled.
 
     Args:
         config: The config as the user wrote it, resolved to plain dicts.
@@ -67,6 +67,13 @@ def reject_outdated_dtensor_cfg_key(config: dict[str, Any]) -> None:
                 f"{path}.dtensor_cfg has been renamed to {path}.automodel_cfg. The "
                 f"contents are unchanged, only the key. Automodel is the old "
                 f"dtensor_cfg with _v2=true, which is the only mode left."
+            )
+
+        automodel_cfg = backend_config.get("automodel_cfg")
+        if isinstance(automodel_cfg, dict) and "_v2" in automodel_cfg:
+            raise ValueError(
+                f"{path}.automodel_cfg._v2 has been removed. DTensor v1 (_v2=false) is "
+                f"gone and Automodel is what _v2=true selected, so delete the key."
             )
 
 
@@ -120,6 +127,6 @@ def check_outdated_config(config: dict[str, Any]) -> None:
     Args:
         config: The config as the user wrote it, resolved by OmegaConf.to_container.
     """
-    reject_outdated_dtensor_cfg_key(config)
+    reject_outdated_automodel_block(config)
     reject_outdated_dataset_config(config)
     reject_outdated_metric_name_format(config)
