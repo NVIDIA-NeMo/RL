@@ -443,6 +443,7 @@ class SingleControllerActor:
                     include_multimodal_fields=(
                         actor_args.partition_includes_multimodal_fields
                     ),
+                    capture_media=actor_args.staging_partition_includes_media,
                 )
         else:
             data_plane_checkpoint_metadata = actor_args.data_plane_checkpoint_metadata
