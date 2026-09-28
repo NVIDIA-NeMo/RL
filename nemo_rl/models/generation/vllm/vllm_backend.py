@@ -221,6 +221,7 @@ class VllmInternalWorkerExtension:
     _nrl_fp32_refresh_logged: bool = False
     _sparse_delta_applier: Any = None
     _nrl_named_parameters: dict[str, torch.nn.Parameter]
+    _super35_debug_loaded_weight_names: set[str] | None = None
 
     def _get_named_parameters(self) -> dict[str, torch.nn.Parameter]:
         params = getattr(self, "_nrl_named_parameters", None)
@@ -232,7 +233,11 @@ class VllmInternalWorkerExtension:
     def _load_full_hf_weights(
         self, policy_weights: list[tuple[str, torch.Tensor]]
     ) -> None:
-        self.model_runner.model.load_weights(weights=policy_weights)
+        loaded_names = self.model_runner.model.load_weights(weights=policy_weights)
+        if loaded_names is not None:
+            if self._super35_debug_loaded_weight_names is None:
+                self._super35_debug_loaded_weight_names = set()
+            self._super35_debug_loaded_weight_names.update(map(str, loaded_names))
 
     def _load_hf_weights(self, policy_weights: list[tuple[str, torch.Tensor]]) -> None:
         from nemo_rl.models.generation.vllm.quantization import fp8
@@ -358,6 +363,55 @@ class VllmInternalWorkerExtension:
                 e.g. {tensor_name: (shape, dtype)}
         """
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
+        self._super35_debug_loaded_weight_names = set()
+
+    def _emit_super35_refit_diagnostics(
+        self,
+        *,
+        transport: str,
+        expected_source_keys: set[str],
+        transferred_source_keys: int | str,
+    ) -> None:
+        """Log a bounded manifest and loader summary after a refit."""
+        expected_mtp = sorted(
+            key
+            for key in expected_source_keys
+            if "mtp" in key.lower() or "draft" in key.lower()
+        )
+        loaded_backend_names = self._super35_debug_loaded_weight_names
+        loaded_mtp = sorted(
+            key
+            for key in (loaded_backend_names or set())
+            if "mtp" in key.lower() or "draft" in key.lower()
+        )
+        rank = (
+            torch.distributed.get_rank()
+            if torch.distributed.is_available() and torch.distributed.is_initialized()
+            else "uninitialized"
+        )
+        print(
+            "[SUPER35_DEBUG][VLLM_REFIT_SUMMARY] "
+            f"host={socket.gethostname()} rank={rank} transport={transport} "
+            f"expected_source_keys={len(expected_source_keys)} "
+            f"transferred_source_keys={transferred_source_keys} "
+            f"expected_mtp_source_keys={len(expected_mtp)} "
+            f"backend_reported_loaded_names="
+            f"{len(loaded_backend_names) if loaded_backend_names is not None else 'unavailable'} "
+            f"backend_reported_mtp_names={len(loaded_mtp)}",
+            flush=True,
+        )
+        if expected_mtp:
+            print(
+                "[SUPER35_DEBUG][VLLM_REFIT_MTP_SOURCE_SAMPLE] "
+                f"names={expected_mtp[:12]!r}",
+                flush=True,
+            )
+        if loaded_mtp:
+            print(
+                "[SUPER35_DEBUG][VLLM_REFIT_MTP_LOADED_SAMPLE] "
+                f"names={loaded_mtp[:12]!r}",
+                flush=True,
+            )
 
     def prepare_sparse_delta_refit_info(
         self, state_dict_info: dict[str, tuple[tuple[int, ...], torch.dtype]]
@@ -827,6 +881,7 @@ class VllmInternalWorkerExtension:
         try:
             self.maybe_init_zmq()
             manifest = _IPCWeightManifest(self.state_dict_info)
+            self._super35_debug_loaded_weight_names = set()
             with self._weight_update_lifecycle("ipc") as finalize:
                 while True:
                     # Blocking receive with timeout (this is the main operation)
@@ -838,6 +893,11 @@ class VllmInternalWorkerExtension:
                         try:
                             manifest.require_complete()
                             finalize()
+                            self._emit_super35_refit_diagnostics(
+                                transport="ipc",
+                                expected_source_keys=manifest.expected_keys,
+                                transferred_source_keys=len(manifest.loaded_keys),
+                            )
                         finally:
                             self.zmq_socket.send(IPCProtocol.ACK.value.encode())
                         break
@@ -932,6 +992,7 @@ class VllmInternalWorkerExtension:
         )
 
         try:
+            self._super35_debug_loaded_weight_names = set()
             with self._weight_update_lifecycle("collective") as finalize:
                 packed_broadcast_consumer(
                     iterator=iter(self.state_dict_info.items()),
@@ -940,6 +1001,11 @@ class VllmInternalWorkerExtension:
                     post_unpack_func=self._load_weights,
                 )
                 finalize()
+                self._emit_super35_refit_diagnostics(
+                    transport="collective",
+                    expected_source_keys=set(self.state_dict_info),
+                    transferred_source_keys="collective-consumer-completed",
+                )
 
         except Exception as e:
             if self._weight_update_errors_are_fatal():

@@ -2695,6 +2695,128 @@ def _resolve_logprob_skip_flags(
     )
 
 
+def _emit_super35_logprob_diagnostics(
+    train_data: BatchedDataDict,
+    generation_logprobs: torch.Tensor,
+    prev_logprobs: torch.Tensor,
+    lp_error: torch.Tensor,
+    mask: torch.Tensor,
+    valid_seq_mask: torch.Tensor,
+    seq_mult_prob_error: torch.Tensor,
+) -> None:
+    """Print bounded diagnostics when sequence logprob comparison is nonfinite."""
+    active_mask = mask.bool()
+    relevant_mask = valid_seq_mask.unsqueeze(-1)
+    inactive_mask = ~active_mask & relevant_mask
+
+    generation_nonfinite = ~torch.isfinite(generation_logprobs)
+    prev_nonfinite = ~torch.isfinite(prev_logprobs)
+    error_nonfinite = ~torch.isfinite(lp_error)
+    seq_nonfinite = valid_seq_mask & ~torch.isfinite(seq_mult_prob_error)
+
+    if not (
+        generation_nonfinite[relevant_mask.expand_as(generation_nonfinite)].any()
+        or prev_nonfinite[relevant_mask.expand_as(prev_nonfinite)].any()
+        or seq_nonfinite.any()
+    ):
+        return
+
+    finite_active_error = lp_error[active_mask & torch.isfinite(lp_error)]
+    max_finite_active_error = (
+        float(finite_active_error.max().item())
+        if finite_active_error.numel() > 0
+        else float("nan")
+    )
+    exp_overflow_limit = float(
+        torch.log(torch.tensor(torch.finfo(lp_error.dtype).max)).item()
+    )
+    overflow_candidates = (
+        active_mask & torch.isfinite(lp_error) & (lp_error > exp_overflow_limit)
+    )
+
+    print(
+        "[SUPER35_DEBUG][LOGPROB_NONFINITE_SUMMARY] "
+        f"batch={generation_logprobs.shape[0]} tokens={generation_logprobs.shape[1]} "
+        f"generation_active_nonfinite={(generation_nonfinite & active_mask).sum().item()} "
+        f"generation_masked_nonfinite={(generation_nonfinite & inactive_mask).sum().item()} "
+        f"policy_active_nonfinite={(prev_nonfinite & active_mask).sum().item()} "
+        f"policy_masked_nonfinite={(prev_nonfinite & inactive_mask).sum().item()} "
+        f"error_active_nonfinite={(error_nonfinite & active_mask).sum().item()} "
+        f"error_masked_nonfinite={(error_nonfinite & inactive_mask).sum().item()} "
+        f"exp_overflow_candidates={overflow_candidates.sum().item()} "
+        f"nonfinite_sequence_rows={seq_nonfinite.sum().item()} "
+        f"max_finite_active_abs_logprob_error={max_finite_active_error:.8g} "
+        f"exp_overflow_limit={exp_overflow_limit:.8g}",
+        flush=True,
+    )
+
+    input_ids = train_data.get("input_ids")
+    nonfinite_rows = torch.nonzero(seq_nonfinite, as_tuple=False).flatten().tolist()
+    for row_index in nonfinite_rows[:16]:
+        active_bad = torch.nonzero(
+            active_mask[row_index]
+            & (
+                generation_nonfinite[row_index]
+                | prev_nonfinite[row_index]
+                | error_nonfinite[row_index]
+            ),
+            as_tuple=False,
+        ).flatten()
+        masked_bad = torch.nonzero(
+            inactive_mask[row_index]
+            & (
+                generation_nonfinite[row_index]
+                | prev_nonfinite[row_index]
+                | error_nonfinite[row_index]
+            ),
+            as_tuple=False,
+        ).flatten()
+        overflow_positions = torch.nonzero(
+            overflow_candidates[row_index], as_tuple=False
+        ).flatten()
+        candidate_positions = torch.cat(
+            (active_bad[:1], masked_bad[:1], overflow_positions[:1])
+        )
+        first_position = (
+            int(candidate_positions[0].item())
+            if candidate_positions.numel() > 0
+            else -1
+        )
+        token_id = "unavailable"
+        if isinstance(input_ids, torch.Tensor) and first_position >= 0:
+            # Logprobs are sliced from token index 1, so offset by one here.
+            token_id = str(int(input_ids[row_index, first_position + 1].item()))
+        generation_value = (
+            float(generation_logprobs[row_index, first_position].item())
+            if first_position >= 0
+            else float("nan")
+        )
+        policy_value = (
+            float(prev_logprobs[row_index, first_position].item())
+            if first_position >= 0
+            else float("nan")
+        )
+        print(
+            "[SUPER35_DEBUG][LOGPROB_NONFINITE_ROW] "
+            f"row={row_index} active_tokens={active_mask[row_index].sum().item()} "
+            f"active_bad_tokens={active_bad.numel()} "
+            f"masked_bad_tokens={masked_bad.numel()} "
+            f"overflow_tokens={overflow_positions.numel()} "
+            f"first_position={first_position} token_id={token_id} "
+            f"generation_logprob={generation_value!r} "
+            f"policy_logprob={policy_value!r} "
+            f"seq_mult_prob_error={float(seq_mult_prob_error[row_index].item())!r}",
+            flush=True,
+        )
+
+    if len(nonfinite_rows) > 16:
+        print(
+            "[SUPER35_DEBUG][LOGPROB_NONFINITE_ROWS_TRUNCATED] "
+            f"reported=16 total={len(nonfinite_rows)}",
+            flush=True,
+        )
+
+
 def compute_and_apply_seq_logprob_error_masking(
     train_data: BatchedDataDict,
     rewards: torch.Tensor,
@@ -2747,6 +2869,16 @@ def compute_and_apply_seq_logprob_error_masking(
         seq_mult_prob_error[valid_seq_mask] = num[valid_seq_mask] / denom[
             valid_seq_mask
         ].clamp(min=1)
+
+        _emit_super35_logprob_diagnostics(
+            train_data,
+            generation_logprobs,
+            prev_logprobs,
+            lp_error,
+            mask,
+            valid_seq_mask,
+            seq_mult_prob_error,
+        )
 
         valid_errors = seq_mult_prob_error[valid_seq_mask]
         max_seq_mult_prob_error = valid_errors.max().item()

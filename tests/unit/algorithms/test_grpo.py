@@ -5704,6 +5704,42 @@ class TestComputeAndApplySeqLogprobErrorMasking:
         assert result["min_seq_mult_prob_error_after_mask"] == pytest.approx(2.0)
         assert torch.equal(train_data["sample_mask"], torch.tensor([1.0, 0.0, 1.0]))
 
+    def test_nonfinite_diagnostics_distinguish_active_and_masked_values(self, capsys):
+        """Diagnostics identify which logprob source and mask region is nonfinite."""
+        prev_logprobs = torch.zeros(2, 4)
+        generation_logprobs = torch.zeros(2, 4)
+        generation_logprobs[0, 1] = float("nan")
+        prev_logprobs[1, 2] = float("nan")
+        token_mask = torch.tensor(
+            [
+                [0.0, 1.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+            ]
+        )
+        train_data = self._create_train_data(
+            2,
+            4,
+            prev_logprobs,
+            generation_logprobs,
+            token_mask=token_mask,
+        )
+        train_data["input_ids"] = torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]])
+
+        compute_and_apply_seq_logprob_error_masking(
+            train_data,
+            torch.tensor([1.0, 0.0]),
+            seq_logprob_error_threshold=2.0,
+        )
+
+        output = capsys.readouterr().out
+        assert "[SUPER35_DEBUG][LOGPROB_NONFINITE_SUMMARY]" in output
+        assert "generation_active_nonfinite=1" in output
+        assert "policy_active_nonfinite=0" in output
+        assert "policy_masked_nonfinite=1" in output
+        assert "nonfinite_sequence_rows=2" in output
+        assert "[SUPER35_DEBUG][LOGPROB_NONFINITE_ROW]" in output
+        assert "token_id=11" in output
+
     def test_empty_batch_returns_zero_metrics(self):
         """Test handling of edge case with empty batch."""
         # Create empty train_data
