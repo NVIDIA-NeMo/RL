@@ -52,6 +52,53 @@ class EnergonPackingConfig(BaseModel, extra="allow"):
     options: EnergonPackingOptions
 
 
+class EnergonTaskEncoderOptions(BaseModel, extra="forbid"):
+    """Validate options for the built-in Nemotron task encoder."""
+
+    patch_dim: Annotated[int, Field(ge=1)] = 16
+    temporal_patch_size: Annotated[int, Field(ge=1)] = 2
+    prompt_format: Literal["nemotron-h-5p5-reasoning", "nemotron6-moe"] = (
+        "nemotron-h-5p5-reasoning"
+    )
+    thinking_trace_format: Literal["default", "normalized", "ultra"] = "normalized"
+    relax_thinking_trace_check: bool = False
+    packing_sequence_length: Annotated[int, Field(ge=1)] | None = None
+    video_min_num_frames: Annotated[int, Field(ge=1)] = 8
+    video_max_num_frames: Annotated[int, Field(ge=1)] = 32
+    video_default_fps: Annotated[int, Field(ge=1)] = 2
+    video_frame_temporal_jitter: bool = False
+    video_aug_scale_frames_up: Annotated[int, Field(ge=1)] | None = None
+    video_aug_scale_resolution_up: Annotated[int, Field(ge=1)] | None = None
+    video_aug_scale_resolution_only: bool = False
+    tiling_augment_prob: Annotated[float, Field(ge=0.0, le=1.0)] = 0.4
+    allow_large_videos: bool = False
+    video_decode_thread_count: Annotated[int, Field(ge=0)] = 8
+    audio_subsampling_factor: Annotated[int, Field(ge=1)] | None = None
+    audio_num_mel_bins: Annotated[int, Field(ge=1)] = 128
+    audio_clip_duration_seconds: Annotated[float, Field(gt=0)] = 30.0
+    min_audio_duration_seconds: Annotated[float, Field(gt=0)] = 0.1
+    max_audio_duration_seconds: Annotated[float, Field(gt=0)] = 1800.0
+
+    @model_validator(mode="after")
+    def _validate_audio_settings(self) -> "EnergonTaskEncoderOptions":
+        if (
+            self.audio_subsampling_factor is not None
+            and self.audio_subsampling_factor & (self.audio_subsampling_factor - 1)
+        ):
+            raise ValueError("audio_subsampling_factor must be a power of two.")
+        if self.min_audio_duration_seconds > self.audio_clip_duration_seconds:
+            raise ValueError(
+                "min_audio_duration_seconds must not exceed "
+                "audio_clip_duration_seconds."
+            )
+        if self.max_audio_duration_seconds < self.audio_clip_duration_seconds:
+            raise ValueError(
+                "max_audio_duration_seconds must not be smaller than "
+                "audio_clip_duration_seconds."
+            )
+        return self
+
+
 class EnergonTaskEncoderConfig(BaseModel, extra="allow"):
     """One built-in or file-backed task encoder and optional packing."""
 
@@ -77,6 +124,10 @@ class EnergonTaskEncoderConfig(BaseModel, extra="allow"):
                 raise ValueError(
                     "Task encoder must use either name or python_file and object."
                 )
+            if self.name == "nemotron_multimodal":
+                self.options = EnergonTaskEncoderOptions.model_validate(
+                    self.options
+                ).model_dump(exclude_unset=True)
             return self
         if not self.python_file or not self.object:
             raise ValueError(

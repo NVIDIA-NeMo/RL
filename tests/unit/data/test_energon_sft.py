@@ -662,6 +662,43 @@ def test_config_rejects_options_for_the_generic_task_encoder():
         )
 
 
+def test_config_validates_nemotron_task_encoder_options():
+    config = EnergonLoaderConfig.model_validate(
+        {
+            "model_family": "nemotron",
+            "task_encoder": {
+                "name": "nemotron_multimodal",
+                "options": {
+                    "prompt_format": "nemotron6-moe",
+                    "audio_subsampling_factor": 8,
+                },
+            },
+            "cookers": ["nemotron_conversation"],
+        }
+    )
+    assert config.task_encoder.options == {
+        "prompt_format": "nemotron6-moe",
+        "audio_subsampling_factor": 8,
+    }
+
+    for options in (
+        {"audio_subsampling_factor": 3},
+        {"min_audio_duration_seconds": 31.0},
+        {"max_audio_duration_seconds": 29.0},
+        {"unknown_option": True},
+    ):
+        with pytest.raises(ValueError):
+            EnergonLoaderConfig.model_validate(
+                {
+                    "model_family": "nemotron",
+                    "task_encoder": {
+                        "name": "nemotron_multimodal",
+                        "options": options,
+                    },
+                }
+            )
+
+
 def test_config_validates_file_backed_component_references():
     config = EnergonLoaderConfig.model_validate(
         {

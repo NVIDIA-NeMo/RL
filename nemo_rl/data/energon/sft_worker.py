@@ -26,7 +26,6 @@ import ray
 from megatron.core import parallel_state
 
 from nemo_rl.algorithms.sft import prepare_sft_batch
-from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.energon.sft_dataloader import (
     EnergonSFTDataLoader,
     build_energon_sft_loader,
@@ -47,10 +46,6 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
     """Megatron policy worker with an Energon loader on each DP owner."""
 
     def __init__(self, *args: Any, processor: Any = None, **kwargs: Any) -> None:
-        if processor is None:
-            config = args[0] if args else kwargs["config"]
-            if config["tokenizer"].get("use_processor"):
-                processor = get_tokenizer(config["tokenizer"], get_processor=True)
         self._sft_processor = processor
         self._sft_loader: Optional[EnergonSFTDataLoader] = None
         self._sft_loader_iterator: Any = None
@@ -84,7 +79,15 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         if self._sft_loader is not None:
             raise RuntimeError("The SFT Energon loader is already configured.")
         if self._sft_processor is None:
-            raise ValueError("SFTv2 requires a multimodal processor on policy workers.")
+            tokenizer_config = (self.cfg or {}).get("tokenizer")
+            if tokenizer_config is None:
+                raise ValueError(
+                    "SFTv2 requires a multimodal processor on policy workers, and "
+                    "policy.tokenizer was not available to build one locally."
+                )
+            from nemo_rl.algorithms.utils import get_tokenizer
+
+            self._sft_processor = get_tokenizer(tokenizer_config, get_processor=True)
 
         logical_rank = parallel_state.get_data_parallel_rank()
         logical_world_size = parallel_state.get_data_parallel_world_size()
