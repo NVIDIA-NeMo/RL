@@ -42,6 +42,7 @@ from nemo_rl.distributed.model_utils import (
     get_cp_sharded_next_token_logprobs,
     get_distillation_topk_logprobs_from_logits,
     get_next_token_logprobs_from_logits,
+    get_next_token_topk_logprobs_from_logits,
 )
 from nemo_rl.utils.sequence_lengths import CpuIntTuple
 
@@ -298,6 +299,19 @@ def prepare_loss_input(
                 )
 
         loss_input = {"next_token_logprobs": logprobs}
+        if getattr(loss_fn, "score_centering", False):
+            # Log-probs at the sampler's captured top-k ids, for score centering.
+            loss_input["next_token_topk_logprobs"] = (
+                get_next_token_topk_logprobs_from_logits(
+                    topk_ids=data["generation_topk_ids"],
+                    next_token_logits=logits,
+                    vocab_parallel_rank=vocab_parallel_rank,
+                    vocab_parallel_group=vocab_parallel_group,
+                    context_parallel_group=context_parallel_group,
+                    chunk_size=chunk_size,
+                    cp_sharder=cp_sharder,
+                )
+            )
 
     elif loss_fn.input_type == LossInputType.OPD_FULL:
         loss_input = _prepare_opd_full_loss_input(

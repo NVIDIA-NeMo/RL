@@ -36,6 +36,7 @@ from nemo_rl.distributed.model_utils import (
     from_parallel_logits_to_logprobs,
     from_parallel_logits_to_logprobs_packed_sequences,
     gather_logits_at_global_indices,
+    get_next_token_topk_logprobs_from_logits,
 )
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.ray_actor_environment_registry import (
@@ -254,6 +255,74 @@ class ModelUtilsTestActor:
         )
         return {"success": True, "error": None}
 
+    def test_topk_logprobs_equivalence(self):
+        """TP+CP top-k log-probs and their gradient match a full-vocab log-softmax."""
+        torch.distributed.init_process_group(backend="nccl")
+
+        # Rank layout: rank = cp_rank * tp_size + tp_rank. Every rank creates
+        # every group, in the same order, as new_group requires.
+        rank = int(os.environ["RANK"])
+        tp_rank = rank % self.tp_size
+        cp_rank = rank // self.tp_size
+        tp_group = cp_group = None
+        for cp_r in range(self.cp_size):
+            ranks = [cp_r * self.tp_size + tp_r for tp_r in range(self.tp_size)]
+            group = torch.distributed.new_group(ranks=ranks)
+            if rank in ranks:
+                tp_group = group
+        for tp_r in range(self.tp_size):
+            ranks = [cp_r * self.tp_size + tp_r for cp_r in range(self.cp_size)]
+            group = torch.distributed.new_group(ranks=ranks)
+            if rank in ranks:
+                cp_group = group
+
+        batch_size, seq_len, vocab_size, top_k = 2, 16, 64, 5
+        vocab_part_size = vocab_size // self.tp_size
+        torch.manual_seed(7)  # identical full tensors on every rank
+        full_logits = torch.randn(batch_size, seq_len, vocab_size, device="cuda")
+        topk_ids = torch.randint(
+            0,
+            vocab_size,
+            (batch_size, seq_len, top_k),
+            dtype=torch.int32,
+            device="cuda",
+        )
+
+        reference_logits = full_logits.clone().requires_grad_(True)
+        expected = torch.log_softmax(reference_logits, dim=-1)[:, :-1].gather(
+            dim=-1, index=topk_ids.long()[:, 1:]
+        )
+        expected.sum().backward()
+
+        shard = full_logits[
+            ..., tp_rank * vocab_part_size : (tp_rank + 1) * vocab_part_size
+        ]
+        shard = _get_tokens_on_this_cp_rank(shard, cp_rank, self.cp_size, seq_dim=1)
+        shard = shard.clone().requires_grad_(True)
+        actual = get_next_token_topk_logprobs_from_logits(
+            topk_ids=topk_ids,
+            next_token_logits=shard,
+            vocab_parallel_rank=tp_rank,
+            vocab_parallel_group=tp_group,
+            context_parallel_group=cp_group if self.cp_size > 1 else None,
+            chunk_size=4,
+        )
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+        actual.sum().backward()
+        expected_grad = reference_logits.grad[
+            ..., tp_rank * vocab_part_size : (tp_rank + 1) * vocab_part_size
+        ]
+        expected_grad = _get_tokens_on_this_cp_rank(
+            expected_grad, cp_rank, self.cp_size, seq_dim=1
+        )
+        # The CP all-gather's backward sums the identical per-rank losses, which
+        # LossPostProcessor undoes by dividing by cp_size.
+        torch.testing.assert_close(
+            shard.grad / self.cp_size, expected_grad, rtol=1e-5, atol=1e-5
+        )
+        return {"success": True, "error": None}
+
 
 MODEL_UTILS_TEST_ACTOR_FQN = f"{ModelUtilsTestActor.__module__}.ModelUtilsTestActor"
 
@@ -345,6 +414,67 @@ def test_from_parallel_logits_to_logprobs_packed_sequences(
 
         worker_group.shutdown(force=True)
 
+    finally:
+        cluster.shutdown()
+
+
+def test_get_next_token_topk_logprobs_from_logits_single_device():
+    """The unsharded path is a rolled gather of the full log-softmax, with gradient."""
+    torch.manual_seed(0)
+    logits = torch.randn(2, 6, 11, requires_grad=True)
+    topk_ids = torch.randint(0, 11, (2, 6, 3), dtype=torch.int32)
+
+    actual = get_next_token_topk_logprobs_from_logits(
+        topk_ids=topk_ids, next_token_logits=logits
+    )
+    expected = torch.log_softmax(logits, dim=-1)[:, :-1].gather(
+        dim=-1, index=topk_ids.long()[:, 1:]
+    )
+
+    torch.testing.assert_close(actual, expected)
+    actual.sum().backward()
+    assert logits.grad is not None and torch.isfinite(logits.grad).all()
+
+
+@pytest.mark.parametrize(
+    "tp_cp_config",
+    [
+        (2, 1),  # TP=2, CP=1
+        (1, 2),  # TP=1, CP=2
+        (2, 2),  # TP=2, CP=2
+    ],
+)
+def test_get_next_token_topk_logprobs_from_logits_tp_cp(
+    register_model_utils_test_actor, tp_cp_config
+):
+    """Score centering's head log-probs under TP and CP against a full-vocab reference."""
+    tp_size, cp_size = tp_cp_config
+    world_size = tp_size * cp_size
+    if not torch.cuda.is_available() or torch.cuda.device_count() < world_size:
+        pytest.skip(
+            f"Not enough GPUs available. Need {world_size}, got {torch.cuda.device_count()}"
+        )
+
+    cluster = RayVirtualCluster(bundle_ct_per_node_list=[world_size], use_gpus=True)
+    try:
+        sharding = NamedSharding(
+            layout=np.arange(world_size).reshape(tp_size, cp_size), names=["tp", "cp"]
+        )
+        builder = RayWorkerBuilder(
+            register_model_utils_test_actor, tp_size, cp_size, sharding
+        )
+        worker_group = RayWorkerGroup(
+            cluster=cluster,
+            remote_worker_builder=builder,
+            workers_per_node=None,
+            sharding_annotations=sharding,
+        )
+        results = ray.get(
+            worker_group.run_all_workers_single_data("test_topk_logprobs_equivalence")
+        )
+        for i, result in enumerate(results):
+            assert result["success"], f"Worker {i} failed: {result['error']}"
+        worker_group.shutdown(force=True)
     finally:
         cluster.shutdown()
 

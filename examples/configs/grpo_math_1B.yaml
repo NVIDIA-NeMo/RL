@@ -117,6 +117,9 @@ loss_fn:
   # Keep full diagnostics; use "minimal" to skip diagnostic-only kernels.
   metrics_level: "full"
   enable_torch_compile: false
+  # Score centering (https://arxiv.org/abs/2609.20807): subtract the sampler-expected
+  # score per token, using the captured top-k (needs token_capture.top_logprobs > 0).
+  score_centering: false
 
 checkpointing:
   enabled: true
