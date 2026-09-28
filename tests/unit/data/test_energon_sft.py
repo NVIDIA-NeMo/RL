@@ -660,6 +660,8 @@ def test_config_rejects_options_for_the_generic_task_encoder():
                 },
             }
         )
+
+
 def test_config_validates_file_backed_component_references():
     config = EnergonLoaderConfig.model_validate(
         {
