@@ -887,6 +887,65 @@ class TestApplyMoeConfig:
 
         assert not hasattr(model_cfg, "moe_grouped_gemm")
 
+    def test_cutedsl_moe_fields_are_forwarded(self):
+        """Explicit CuTeDSL MoE settings are forwarded to the model config."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        model_cfg = MagicMock()
+        megatron_cfg = self._base_moe_megatron_cfg()
+        megatron_cfg.update(
+            {
+                "moe_mlp_glu_interleave_size": 32,
+                "use_grouped_gemm_for_shared_expert": True,
+                "moe_shared_expert_glu_interleave_size": 16,
+            }
+        )
+
+        _apply_moe_config(model_cfg, {"megatron_cfg": megatron_cfg})
+
+        assert model_cfg.moe_mlp_glu_interleave_size == 32
+        assert model_cfg.use_grouped_gemm_for_shared_expert is True
+        assert model_cfg.moe_shared_expert_glu_interleave_size == 16
+
+    def test_shared_expert_glu_interleave_requires_grouped_gemm(self):
+        """A shared GLU layout without its grouped kernel fails during setup."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        model_cfg = MagicMock()
+        megatron_cfg = self._base_moe_megatron_cfg()
+        megatron_cfg["use_grouped_gemm_for_shared_expert"] = False
+        megatron_cfg["moe_shared_expert_glu_interleave_size"] = 32
+
+        with pytest.raises(
+            ValueError, match="requires use_grouped_gemm_for_shared_expert=True"
+        ):
+            _apply_moe_config(model_cfg, {"megatron_cfg": megatron_cfg})
+
+    def test_optional_grouped_glu_fields_absent_keep_defaults(self):
+        """Omitted grouped-GLU settings preserve model-provider defaults."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        model_cfg = MagicMock(
+            spec=[
+                "expert_tensor_parallel_size",
+                "expert_model_parallel_size",
+                "moe_router_dtype",
+                "moe_router_load_balancing_type",
+                "moe_router_bias_update_rate",
+                "moe_permute_fusion",
+                "moe_enable_deepep",
+                "moe_token_dispatcher_type",
+                "moe_shared_expert_overlap",
+                "moe_enable_routing_replay",
+            ]
+        )
+
+        _apply_moe_config(model_cfg, {"megatron_cfg": self._base_moe_megatron_cfg()})
+
+        assert not hasattr(model_cfg, "moe_mlp_glu_interleave_size")
+        assert not hasattr(model_cfg, "use_grouped_gemm_for_shared_expert")
+        assert not hasattr(model_cfg, "moe_shared_expert_glu_interleave_size")
+
     def test_hybridep_input_prepadding_wins_after_bridge_validation(self):
         from nemo_rl.models.megatron import setup
 
@@ -2157,6 +2216,24 @@ class TestApplyPerformanceConfig:
 
         assert model_cfg.cuda_graph_modules == ["attn"]
         assert model_cfg.cuda_graph_warmup_steps == 1
+
+    def test_transformer_engine_op_fuser_is_optional_and_forwarded(self):
+        """The TE operation-fuser setting is forwarded only when explicit."""
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        model_cfg = SimpleNamespace(
+            gated_linear_unit=True,
+            use_transformer_engine_op_fuser=True,
+        )
+        _apply_performance_config(model_cfg, self._config())
+        assert model_cfg.use_transformer_engine_op_fuser is True
+
+        config = self._config()
+        config["megatron_cfg"]["use_transformer_engine_op_fuser"] = False
+
+        _apply_performance_config(model_cfg, config)
+
+        assert model_cfg.use_transformer_engine_op_fuser is False
 
     def test_basic_performance_config(self):
         """Test applying basic performance configuration."""
