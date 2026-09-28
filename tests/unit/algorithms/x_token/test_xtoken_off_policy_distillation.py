@@ -350,8 +350,8 @@ def test_collator_cli_overrides_reach_setup(config_name: str) -> None:
         [
             "collator.mode=chat",
             "collator.include_thinking_in_loss=true",
-            "collator.native_thinking_alignment=false",
-            "collator.kd_alignment_regions=null",
+            "collator.native_thinking_alignment=true",
+            "collator.kd_alignment_regions=[reasoning,close,answer,eot]",
             "collator.num_packed_rows=1",
         ],
     )
@@ -370,8 +370,8 @@ def test_collator_cli_overrides_reach_setup(config_name: str) -> None:
     assert config.collator.model_dump() == {
         "mode": "chat",
         "include_thinking_in_loss": True,
-        "native_thinking_alignment": False,
-        "kd_alignment_regions": None,
+        "native_thinking_alignment": True,
+        "kd_alignment_regions": ["reasoning", "close", "answer", "eot"],
         "num_packed_rows": 1,
     }
 
@@ -440,15 +440,6 @@ def test_collator_config_rejects_invalid_values(overrides: dict) -> None:
             {"kd_alignment_regions": ["answer"]},
             ValueError,
             "requires native_thinking_alignment=true",
-        ),
-        (
-            {
-                "mode": "chat",
-                "include_thinking_in_loss": True,
-                "native_thinking_alignment": True,
-            },
-            NotImplementedError,
-            "native_thinking_alignment is not yet implemented",
         ),
         ({"num_packed_rows": 2}, NotImplementedError, "lockstep packing"),
     ],

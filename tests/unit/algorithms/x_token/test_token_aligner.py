@@ -77,6 +77,15 @@ class _FakeTokenizer:
     def convert_ids_to_tokens(self, ids):
         return [self._id_to_tok.get(int(i), f"<unk{i}>") for i in ids]
 
+    def decode(
+        self, ids, *, skip_special_tokens=False, clean_up_tokenization_spaces=False
+    ):
+        assert not skip_special_tokens
+        assert not clean_up_tokenization_spaces
+        return (
+            "".join(self.convert_ids_to_tokens(ids)).replace("Ġ", " ").replace("▁", " ")
+        )
+
 
 def _make_aligner(
     student_vocab: dict[int, str],
@@ -324,9 +333,9 @@ def test_per_asst_whole_message_plus_eot():
     assert pairs[-1].t_tokens == ["<eot>"]
 
 
-def test_per_asst_calls_private_offset_helper_with_rebased_decode_fix():
+def test_per_asst_uses_shared_strict_decoded_matcher():
     """The production per-assistant path owns slicing/rebasing and delegates
-    each region's offset alignment plus decode-fix mask to the private helper.
+    each region's offset alignment and strict decoded comparison to the shared helper.
     """
     aligner = _chat_aligner(
         {10: "student_surface", 99: "<eot>"},
@@ -359,7 +368,8 @@ def test_per_asst_calls_private_offset_helper_with_rebased_decode_fix():
         0,
         1,
     )
-    assert pairs[0].is_correct is True
+    # NFC repair is reserved for native regions validated against source text.
+    assert pairs[0].is_correct is False
     assert isinstance(pairs[0], AlignmentPair)
 
 
@@ -597,7 +607,7 @@ def test_align_chat_preserves_per_turn_validation():
     aligner = _chat_aligner({1: "Hi"}, {1: "Hi"})
     ids = torch.tensor([[1]])
     offsets = torch.tensor([[(0, 2)]])
-    with pytest.raises(ValueError, match="asst message count mismatch"):
+    with pytest.raises(ValueError, match="assistant-turn count mismatch"):
         aligner.align_chat(
             ids,
             ids,
