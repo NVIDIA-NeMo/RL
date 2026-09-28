@@ -3656,6 +3656,27 @@ class TestMakePolicyLikeConfig:
 
 
 @pytest.mark.mcore
+def test_apply_mtp_config_removes_inherited_mtp_when_disabled() -> None:
+    from nemo_rl.models.megatron.setup import _apply_mtp_config
+
+    model_cfg = SimpleNamespace(
+        mtp_num_layers=1,
+        mtp_use_repeated_layer=True,
+        mtp_hybrid_override_pattern="decoder/MTP",
+        hybrid_layer_pattern="decoder/MTP",
+        hybrid_override_pattern="decoder/MTP",
+    )
+
+    _apply_mtp_config(model_cfg, {"megatron_cfg": {"mtp_num_layers": 0}})
+
+    assert model_cfg.mtp_num_layers == 0
+    assert model_cfg.mtp_use_repeated_layer is False
+    assert model_cfg.mtp_hybrid_override_pattern is None
+    assert model_cfg.hybrid_layer_pattern == "decoder"
+    assert model_cfg.hybrid_override_pattern == "decoder"
+
+
+@pytest.mark.mcore
 class TestSetupModelConfig:
     """Tests for setup_model_config override handling."""
 
