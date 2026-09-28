@@ -113,7 +113,7 @@ class RewardModelEnvironment(EnvironmentInterface):
         assert not self.config["sequence_packing"]["enabled"], (
             "Sequence packing is currently not supported with reward model environment."
         )
-        assert self.config["automodel_cfg"]["enabled"], (
+        assert (self.config.get("automodel_cfg") or {}).get("enabled"), (
             "Reward model environment currently only support with DTensor. You can show your interest in mcore path by upvoting on https://github.com/NVIDIA-NeMo/RL/issues/1154"
         )
         assert self.config["max_grad_norm"] == None, (

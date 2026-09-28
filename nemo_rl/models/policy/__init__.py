@@ -666,7 +666,7 @@ class PolicyConfig(TypedDict):
     ]  # used in static batched (framework) generation
     precision: str
     reward_model_cfg: NotRequired[RewardModelConfig]
-    automodel_cfg: AutomodelConfig | AutomodelConfigDisabled
+    automodel_cfg: NotRequired[AutomodelConfig | AutomodelConfigDisabled]
     megatron_cfg: NotRequired[MegatronConfig | MegatronConfigDisabled]
     draft: NotRequired[Eagle3DraftConfig]
     pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
