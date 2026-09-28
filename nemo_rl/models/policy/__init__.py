@@ -399,9 +399,15 @@ class MegatronConfig(TypedDict):
     num_layers_in_first_pipeline_stage: int | None
     num_layers_in_last_pipeline_stage: int | None
     context_parallel_size: int
-    # Nemotron Omni RADIO/provider booleans. Omit any field to retain the model
+    # Nemotron Omni RADIO/provider controls. Omit any field to retain the model
     # provider's checkpoint/default value.
+    radio_force_eval_mode: NotRequired[bool]
     radio_force_cpe_eval_mode: NotRequired[bool]
+    recompute_vision: NotRequired[bool]
+    vision_recompute_granularity: NotRequired[Literal["full", "selective"] | None]
+    vision_recompute_modules: NotRequired[list[str] | None]
+    vision_recompute_method: NotRequired[Literal["uniform", "block"] | None]
+    vision_recompute_num_layers: NotRequired[int | None]
     # Nemotron Omni tower freeze booleans. Omit any field to retain the model
     # provider's checkpoint/default value.
     freeze_vision_model: NotRequired[bool]
@@ -420,6 +426,8 @@ class MegatronConfig(TypedDict):
     moe_router_dtype: str | None
     moe_router_load_balancing_type: str | list[str]
     moe_router_bias_update_rate: float
+    # Optional so model-provider defaults remain effective when it is unset.
+    moe_aux_loss_coeff: NotRequired[float | list[float]]
     moe_permute_fusion: bool
     expert_tensor_parallel_size: int
     expert_model_parallel_size: int
