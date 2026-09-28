@@ -277,6 +277,8 @@ TASK_ENCODER_REGISTRY.register(
     ),
     version="1",
 )
+
+
 def selected_registry_identity(
     *, task_encoder: ComponentConfig, cookers: list[ComponentConfig]
 ) -> dict[str, Any]:
