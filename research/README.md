@@ -51,7 +51,7 @@ The acceptance criteria for merging your research project into the main reposito
 
 ### Code Reviews and Ownership
 
-Code reviews for research projects will always involve the original authors. Please add your name to the `.github/CODEOWNERS` file to be alerted when any changes touch your project. The NeMo RL core team reserves the right to merge PRs that touch your project if the original author does not respond in a timely manner. This allows the core team to move quickly to resolve issues.
+Code reviews for research projects will always involve the original authors. The NeMo RL core team reserves the right to merge PRs that touch your project if the original author does not respond in a timely manner. This allows the core team to move quickly to resolve issues.
 
 ### Testing
 
@@ -84,3 +84,5 @@ It should be noted that because we use `uv`, even if we must disable tests becau
 ## Projects
 
 - **[template_project](template_project/)** - A starting point for new research projects with example code and test structure
+
+- **[flow_grpo](flow_grpo/)** - Experimental Flow-GRPO image diffusion training with Automodel and Diffusers
