@@ -37,6 +37,7 @@ from nemo_rl.data.energon.sft_dataloader import (  # noqa: E402
     _loader_identity,
     _v2_topology,
     _worker_config,
+    build_energon_sft_loader,
 )
 from nemo_rl.data_plane import KVBatchMeta  # noqa: E402
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict  # noqa: E402
