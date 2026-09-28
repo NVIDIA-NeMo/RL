@@ -623,13 +623,14 @@ class VllmGeneration(GenerationInterface):
         return results
 
     def setup_token_capture(
-        self, dp_cfg: dict[str, Any], staging_partition: str
+        self, dp_cfg: dict[str, Any], staging_partition: str, top_logprobs: int
     ) -> None:
         """Install ledger-authoritative token capture in every DP-leader worker.
 
         Called once at setup when ``token_capture.enabled``; each async worker
         builds its in-worker data-plane client + TQTokenSink and makes the
-        single Gym ``install_capture`` call.
+        single Gym ``install_capture`` call. ``top_logprobs`` > 0 also stages
+        the sampler's top-k log-probs per generated token.
         """
         assert self.cfg["vllm_cfg"]["async_engine"], (
             "token capture requires the async vLLM engine (the capture host "
@@ -639,6 +640,7 @@ class VllmGeneration(GenerationInterface):
             "setup_token_capture",
             dp_cfg=dp_cfg,
             staging_partition=staging_partition,
+            top_logprobs=top_logprobs,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
         ray.get(futures)

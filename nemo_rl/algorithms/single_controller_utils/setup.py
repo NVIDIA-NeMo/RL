@@ -318,12 +318,14 @@ def _register_single_controller_partitions(
             enabled=r3_enabled,
         )
     else:
-        from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
+        from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, GENERATION_TOPK_FIELDS
 
         partition_fields = fields_with_optional_routed_experts(
             DP_TRAIN_FIELDS,
             enabled=r3_enabled and not token_capture_cfg.defer_routed_experts_to_policy,
         )
+        if token_capture_cfg.top_logprobs > 0:
+            partition_fields.extend(GENERATION_TOPK_FIELDS)
     if include_multimodal_fields:
         partition_fields.extend(
             field
@@ -347,7 +349,12 @@ def _register_single_controller_partitions(
         dp_client.register_partition(
             partition_id=token_capture_cfg.staging_partition,
             fields=list(STAGING_FIELDS)
-            + ([STAGING_ROUTED_EXPERTS_FIELD] if r3_enabled else []),
+            + ([STAGING_ROUTED_EXPERTS_FIELD] if r3_enabled else [])
+            + (
+                list(GENERATION_TOPK_FIELDS)
+                if token_capture_cfg.top_logprobs > 0
+                else []
+            ),
             num_samples=num_rollout_samples,
             consumer_tasks=["finalize", "prev_lp", "train"],
         )
@@ -1891,7 +1898,11 @@ def setup_single_controller(
         # Host Gym's capture core in every vLLM DP leader (in-worker DP
         # client + TQTokenSink + the single install_capture call), and give
         # workers the initial weight version to stamp on captured calls.
-        generation.setup_token_capture(dp_config, token_capture_cfg.staging_partition)
+        generation.setup_token_capture(
+            dp_config,
+            token_capture_cfg.staging_partition,
+            token_capture_cfg.top_logprobs,
+        )
         generation.set_rollout_weight_version(0)
 
     if weight_synchronizer is None:
@@ -1954,6 +1965,7 @@ def setup_single_controller(
                 router_replay_enabled=router_replay_enabled(policy_config),
                 defer_routed_experts_to_policy=token_capture_cfg.defer_routed_experts_to_policy,
                 max_seq_len=_generation_max_seq_len(generation_config),
+                top_logprobs=token_capture_cfg.top_logprobs,
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,
         )
