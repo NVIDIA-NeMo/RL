@@ -52,13 +52,15 @@ from nemo_rl.data_plane.schema import (  # noqa: E402
 )
 from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     STAGING_FIELDS,
-    TQMegatronTokenStager,
     TQTokenSink,
     TQTokenSource,
 )
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin  # noqa: E402
 from nemo_rl.experience.rollout_reassembler import RolloutReassembler  # noqa: E402
 from nemo_rl.experience.route_plan import decode_route_plan  # noqa: E402
+from nemo_rl.models.generation.megatron.token_capture import (  # noqa: E402
+    TQMegatronTokenStager,
+)
 from tests.unit.data_plane.token_capture_test_fixtures import (  # noqa: E402
     build_fixture_artifacts,
     f32,
