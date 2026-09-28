@@ -1566,6 +1566,84 @@ class TestLossPostProcessor:
         assert torch.isclose(backward_sum, torch.tensor(48.0))
         assert num_tokens.item() == 3
 
+    @patch(
+        "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0
+    )
+    @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
+    @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
+    @patch(
+        "nemo_rl.models.megatron.train.get_context_parallel_world_size", return_value=2
+    )
+    @patch("nemo_rl.models.megatron.train.torch.distributed.all_reduce")
+    @patch("nemo_rl.models.megatron.train.torch.distributed.get_rank", return_value=0)
+    @patch(
+        "nemo_rl.models.megatron.train.torch.distributed.get_world_size",
+        return_value=2,
+    )
+    def test_local_mean_mode_allows_zero_local_tokens(
+        self,
+        mock_world_size,
+        mock_rank,
+        mock_all_reduce,
+        mock_cp_size,
+        mock_cp_grp,
+        mock_tp_grp,
+        mock_tp_rank,
+    ):
+        """A CP rank with no valid targets returns a zero numerator and count."""
+        from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+        from nemo_rl.models.megatron.train import LossPostProcessor
+
+        mock_loss_fn = MagicMock(
+            return_value=(
+                torch.tensor(0.0),
+                {"loss": 0.0, "num_unmasked_tokens": 0},
+            )
+        )
+        mock_loss_fn.input_type = LossInputType.LOGPROB
+        mock_loss_fn.loss_type = LossType.TOKEN_LEVEL
+        mock_loss_fn.metric_normalizations = {
+            "loss": MetricNormalizer.TOKENS,
+            "num_unmasked_tokens": MetricNormalizer.NONE,
+        }
+        cfg = {
+            "sequence_packing": {"enabled": False},
+            "megatron_cfg": {"calculate_per_token_loss": False},
+        }
+        processor = LossPostProcessor(
+            loss_fn=mock_loss_fn,
+            cfg=cfg,
+            prepare_fn=lambda logits, data, **_: (
+                {"next_token_logprobs": torch.zeros(1, 7)},
+                data,
+            ),
+        )
+        mock_tp_grp.return_value = MagicMock()
+        mock_cp_grp.return_value = MagicMock()
+        data = BatchedDataDict(
+            {
+                # CP rank 0 owns target positions 0, 1, 6, and 7. All are
+                # masked, while rank 1 owns the four valid middle positions.
+                "token_mask": torch.tensor([[0, 0, 0, 1, 1, 1, 1, 0]]),
+                "sample_mask": torch.ones(1),
+            }
+        )
+
+        wrapped_fn = processor(
+            data_dict=data,
+            global_valid_seqs=torch.tensor(1),
+            global_valid_toks=torch.tensor(4),
+        )
+        local_sum, num_tokens, metrics = wrapped_fn(torch.randn(1, 4, 8))
+
+        assert torch.isclose(local_sum, torch.tensor(0.0))
+        assert num_tokens.item() == 0
+        assert metrics["loss"] == pytest.approx(0.0)
+        assert torch.equal(
+            mock_loss_fn.call_args.kwargs["data"]["token_mask"],
+            torch.zeros((1, 5), dtype=torch.long),
+        )
+
     @patch("nemo_rl.models.megatron.train.torch.distributed.get_rank", return_value=0)
     @patch(
         "nemo_rl.models.megatron.train.torch.distributed.get_world_size",

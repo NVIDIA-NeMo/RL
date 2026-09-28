@@ -38,6 +38,7 @@ run_test fast uv run --no-sync bash ./tests/functional/sft.sh
 run_test      uv run --no-sync bash ./tests/functional/sft_avlm.sh
 run_test      uv run --no-sync bash ./tests/functional/sft_resume_diamond.sh
 run_test      uv run --no-sync bash ./tests/functional/sft_v2_energon.sh
+run_test      uv run --no-sync bash ./tests/functional/sft_v2_energon_local_mean.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then
