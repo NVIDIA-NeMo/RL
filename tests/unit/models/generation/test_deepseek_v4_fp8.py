@@ -29,15 +29,28 @@ def deepseek_v4_fp8():
 
 @pytest.fixture
 def skip_tensors():
-    """Guard the process-global reload skip list that prepare_refit mutates."""
-    from vllm.model_executor.model_loader.reload.meta import SKIP_TENSORS
+    """Guard the process-global reload skip lists that prepare_refit mutates."""
+    from vllm.model_executor.model_loader.reload import meta
 
-    original = set(SKIP_TENSORS)
+    guarded = [meta.SKIP_TENSORS]
+    skip_load = getattr(meta, "SKIP_LOAD_TENSORS", None)
+    if isinstance(skip_load, set) and skip_load is not meta.SKIP_TENSORS:
+        guarded.append(skip_load)
+    originals = [set(s) for s in guarded]
     try:
-        yield SKIP_TENSORS
+        yield meta.SKIP_TENSORS
     finally:
-        SKIP_TENSORS.clear()
-        SKIP_TENSORS.update(original)
+        for skip_set, original in zip(guarded, originals):
+            skip_set.clear()
+            skip_set.update(original)
+
+
+@pytest.fixture
+def skip_load_tensors():
+    """vLLM 0.29's load-accounting skip set (same object as SKIP_TENSORS before it)."""
+    from vllm.model_executor.model_loader.reload import meta
+
+    return getattr(meta, "SKIP_LOAD_TENSORS", meta.SKIP_TENSORS)
 
 
 class DeepSeekV4ForCausalLM(torch.nn.Module):
@@ -50,6 +63,23 @@ class OtherForCausalLM(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.config = types.SimpleNamespace(model_type="deepseek_v3")
+
+
+class PostLoadDeepSeekV4ForCausalLM(DeepSeekV4ForCausalLM):
+    """Mirrors vLLM >= 0.29: ``load_weights`` ends with the model-level hook."""
+
+    def __init__(self):
+        super().__init__()
+        self.post_load_calls = 0
+
+    def load_weights(self, weights):
+        for _ in weights:
+            pass
+        self.process_weights_after_loading()
+        return set()
+
+    def process_weights_after_loading(self):
+        self.post_load_calls += 1
 
 
 def test_is_model_detects_config_model_type(deepseek_v4_fp8):
@@ -282,7 +312,7 @@ def test_prepare_refit_restores_expert_stride_only(
 
 
 def test_prepare_refit_marks_expert_and_sink_tensors_for_immediate_load(
-    deepseek_v4_fp8, monkeypatch, skip_tensors
+    deepseek_v4_fp8, monkeypatch, skip_tensors, skip_load_tensors
 ):
     monkeypatch.setattr(deepseek_v4_fp8, "RoutedExperts", FakeRoutedExpertsLayer)
     layer = FakeRoutedExpertsLayer(weight_block_size=[2, 2])
@@ -291,12 +321,15 @@ def test_prepare_refit_marks_expert_and_sink_tensors_for_immediate_load(
 
     added_skip_tensors = deepseek_v4_fp8.prepare_refit(model)
 
-    assert "attn_sink" in skip_tensors
-    assert {"w13_weight", "w2_weight", "w13_weight_scale_inv"} <= skip_tensors
+    expected = {"attn_sink", "w13_weight", "w2_weight", "w13_weight_scale_inv"}
+    assert expected <= skip_tensors
+    # vLLM 0.29 only keeps a tensor out of the layer's load accounting (so the
+    # layer is not processed online) through SKIP_LOAD_TENSORS.
+    assert expected <= skip_load_tensors
 
     deepseek_v4_fp8.restore_refit(added_skip_tensors)
-    assert "attn_sink" not in skip_tensors
-    assert "w13_weight" not in skip_tensors
+    assert not expected & skip_tensors
+    assert not expected & skip_load_tensors
 
 
 def test_restore_refit_preserves_preexisting_global_skip_names(
@@ -338,8 +371,99 @@ def test_refit_ignores_unquantized_routed_experts(
 
     added_skip_tensors = deepseek_v4_fp8.prepare_refit(model)
 
-    assert added_skip_tensors == {"attn_sink"}
+    assert added_skip_tensors.tensors == {"attn_sink"}
+    assert added_skip_tensors.load == {"attn_sink"}
     assert "w13_weight" not in skip_tensors
     deepseek_v4_fp8.finalize_refit(model)
     assert process_calls == []
     deepseek_v4_fp8.restore_refit(added_skip_tensors)
+
+
+def test_prepare_refit_defers_the_model_post_load_hook_until_finalize(
+    deepseek_v4_fp8, monkeypatch, skip_tensors
+):
+    monkeypatch.setattr(deepseek_v4_fp8, "RoutedExperts", FakeRoutedExpertsLayer)
+    model = PostLoadDeepSeekV4ForCausalLM()
+
+    added_skip_tensors = deepseek_v4_fp8.prepare_refit(model)
+
+    # Buffer-sized load_weights calls stream while layers sit on meta; the
+    # hook must not run until every layer is materialized.
+    model.load_weights([])
+    model.load_weights([])
+    assert model.post_load_calls == 0
+
+    deepseek_v4_fp8.finalize_refit(model)
+    assert model.post_load_calls == 1
+    # The shadow is gone, so a later full load runs the class hook itself.
+    model.load_weights([])
+    assert model.post_load_calls == 2
+
+    deepseek_v4_fp8.restore_refit(added_skip_tensors, model)
+    assert "process_weights_after_loading" not in vars(model)
+
+
+def test_restore_refit_lifts_the_post_load_shadow_after_a_failed_stream(
+    deepseek_v4_fp8, monkeypatch, skip_tensors
+):
+    monkeypatch.setattr(deepseek_v4_fp8, "RoutedExperts", FakeRoutedExpertsLayer)
+    model = PostLoadDeepSeekV4ForCausalLM()
+
+    added_skip_tensors = deepseek_v4_fp8.prepare_refit(model)
+    assert "process_weights_after_loading" in vars(model)
+
+    # No finalize_refit: the stream failed before the lifecycle got there.
+    deepseek_v4_fp8.restore_refit(added_skip_tensors, model)
+
+    assert "process_weights_after_loading" not in vars(model)
+    model.load_weights([])
+    assert model.post_load_calls == 1
+
+
+def test_restore_refit_without_a_model_only_touches_skip_names(
+    deepseek_v4_fp8, monkeypatch, skip_tensors
+):
+    monkeypatch.setattr(deepseek_v4_fp8, "RoutedExperts", FakeRoutedExpertsLayer)
+    model = PostLoadDeepSeekV4ForCausalLM()
+
+    added_skip_tensors = deepseek_v4_fp8.prepare_refit(model)
+    deepseek_v4_fp8.restore_refit(added_skip_tensors)
+
+    assert "attn_sink" not in skip_tensors
+    assert "process_weights_after_loading" in vars(model)
+    deepseek_v4_fp8.resume_model_post_load(model)
+
+
+def test_suspend_model_post_load_ignores_models_without_the_hook(deepseek_v4_fp8):
+    model = DeepSeekV4ForCausalLM()
+
+    deepseek_v4_fp8.suspend_model_post_load(model)
+
+    assert "process_weights_after_loading" not in vars(model)
+    # Nothing to run at the end either; vLLM < 0.29 models have no hook.
+    deepseek_v4_fp8.finalize_refit(model)
+
+
+def test_resume_model_post_load_keeps_a_foreign_instance_override(deepseek_v4_fp8):
+    model = PostLoadDeepSeekV4ForCausalLM()
+    calls = []
+    model.process_weights_after_loading = lambda: calls.append("custom")
+
+    deepseek_v4_fp8.suspend_model_post_load(model)
+    deepseek_v4_fp8.resume_model_post_load(model)
+    model.process_weights_after_loading()
+
+    assert calls == ["custom"]
+
+
+def test_vllm_layerwise_reload_keeps_two_distinct_skip_sets():
+    """_layerwise_skip_sets falls back to one set when SKIP_LOAD_TENSORS is
+    absent; right for vLLM 0.25, silently wrong for a rename (experts get
+    counted and finalize_refit converts them twice). Pin the 0.29 shape."""
+    from vllm.model_executor.model_loader.reload.meta import (
+        SKIP_LOAD_TENSORS,
+        SKIP_TENSORS,
+    )
+
+    assert SKIP_LOAD_TENSORS is not SKIP_TENSORS
+    assert SKIP_LOAD_TENSORS <= SKIP_TENSORS
