@@ -67,7 +67,9 @@ class FakeTokenizer:
         max_length,
         return_tensors,
         return_offsets_mapping=False,
+        add_special_tokens=True,
     ):
+        assert not add_special_tokens
         assert padding == "max_length"
         assert truncation is True
         assert return_tensors == "pt"
@@ -366,7 +368,9 @@ class FakeChatTokenizer:
         self.all_special_ids = [0, 1]
         self._scaffold = scaffold
 
-    def apply_chat_template(self, messages, tokenize=False):
+    def apply_chat_template(
+        self, messages, tokenize=False, add_generation_prompt=False, **kwargs
+    ):
         parts = []
         for m in messages:
             pre, suf = self._scaffold.get(m["role"], ("", ""))
@@ -391,6 +395,9 @@ class FakeChatTokenizer:
 
     def convert_ids_to_tokens(self, ids):
         return [chr(int(i)) for i in ids]
+
+    def decode(self, ids, **kwargs):
+        return "".join(chr(int(i)) for i in ids)
 
 
 def _chat_aligner(student_tok, teacher_tok) -> TokenAligner:
@@ -587,11 +594,11 @@ class TestCollatorChatMode:
             key.startswith(("teacher_1_", "alignment_1_")) for key in out.keys()
         )
 
-    def test_native_thinking_alignment_not_implemented(self):
+    def test_native_thinking_alignment_rejects_unsupported_layout(self):
         tok = FakeChatTokenizer({"assistant": ("", "")})
         aligner = _chat_aligner(tok, tok)
-        with pytest.raises(NotImplementedError):
-            CrossTokenizerCollator(
+        with pytest.raises(ValueError, match="unsupported native layout"):
+            collator = CrossTokenizerCollator(
                 student_tokenizer=tok,
                 teacher_tokenizers=[tok],
                 aligners=[aligner],
@@ -603,4 +610,13 @@ class TestCollatorChatMode:
                     include_thinking_in_loss=True,
                     native_thinking_alignment=True,
                 ),
+            )
+            collator(
+                [
+                    {
+                        "idx": 0,
+                        "loss_multiplier": 1.0,
+                        "message_log": [{"role": "assistant", "content": "hello"}],
+                    }
+                ]
             )

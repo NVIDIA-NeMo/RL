@@ -18,6 +18,7 @@ from typing import Any, Callable, Union
 
 from datasets import load_dataset
 
+from nemo_rl.data.chat_utils import normalize_message_loss_mask
 from nemo_rl.data.datasets.raw_dataset import RawDataset
 
 
@@ -186,14 +187,25 @@ class OpenAIFormatDataset(RawDataset):
 
     def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
         messages = [message for message in data[self.chat_key]]
+        message_loss_mask = None
+        if data.get("message_loss_mask") is not None:
+            message_loss_mask = normalize_message_loss_mask(
+                messages, data["message_loss_mask"]
+            )
         if self.system_key is not None and self.system_key in data:
             messages = [{"role": "system", "content": data[self.system_key]}] + messages
+            if message_loss_mask is not None:
+                message_loss_mask = [0] + message_loss_mask
         elif self.system_prompt:
             messages = [{"role": "system", "content": self.system_prompt}] + messages
+            if message_loss_mask is not None:
+                message_loss_mask = [0] + message_loss_mask
         assert messages[-1]["role"] == "assistant"
 
         # Preserve tools if they exist in the data
         result = {"messages": messages, "task_name": self.task_name}
+        if message_loss_mask is not None:
+            result["message_loss_mask"] = message_loss_mask
         if self.tool_key and self.tool_key in data:
             result["tools"] = data[self.tool_key]
 
