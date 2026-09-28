@@ -28,23 +28,17 @@ def find_rendered_message_content_span(
     content: str,
     cursor: int = 0,
 ) -> tuple[int, int, str] | None:
-    """Find a message's content span in chat-template-rendered ``text``.
+    """Locate the same canonical nonempty content key on every model surface.
 
-    Some chat templates apply Jinja ``trim`` / ``rstrip`` to message content, so
-    the exact ``content`` string may not appear verbatim in ``text``. Search for
-    the exact content first, then whitespace-trimmed variants, starting at
-    ``cursor``. Returns ``(start, end, matched_variant)`` or ``None``.
+    Trimming the logical source *before* searching ensures templates preserving
+    and trimming boundary whitespace share one coordinate origin. Callers must
+    anchor ``cursor`` and the search surface to the corresponding logical turn.
+    Interior whitespace is never changed.
     """
-    if not content:
+    canonical = content.strip()
+    if not canonical:
         return None
-
-    candidates = (content, content.rstrip(), content.lstrip(), content.strip())
-    seen: set[str] = set()
-    for candidate in candidates:
-        if not candidate or candidate in seen:
-            continue
-        seen.add(candidate)
-        pos = text.find(candidate, cursor)
-        if pos >= 0:
-            return pos, pos + len(candidate), candidate
-    return None
+    position = text.find(canonical, cursor)
+    if position < 0:
+        return None
+    return position, position + len(canonical), canonical
