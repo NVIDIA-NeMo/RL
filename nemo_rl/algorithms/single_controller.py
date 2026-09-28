@@ -1638,7 +1638,7 @@ class SingleControllerActor:
                 and status is not RolloutAttemptStatus.SEALED
             )
             if replacement_still_live:
-                protected.update(continuation.staging_keys)
+                protected.update(continuation.generation_cut_staging_keys)
 
         return protected.intersection(self._restored_gym_checkpoint_staging_keys)
 
@@ -1911,6 +1911,7 @@ class SingleControllerActor:
                 }
             )
             staging_keys.update(continuation.staging_keys)
+            staging_keys.update(continuation.generation_cut_staging_keys)
         if not executions:
             return
 

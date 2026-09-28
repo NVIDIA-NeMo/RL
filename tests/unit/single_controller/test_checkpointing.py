@@ -110,6 +110,7 @@ from nemo_rl.environments.gym_checkpoint import (
     GymCheckpointContinuation,
     GymCheckpointPrepareResult,
     GymCheckpointTopology,
+    gym_checkpoint_continuations,
 )
 from nemo_rl.environments.nemo_gym import NemoGymShardSet
 from nemo_rl.experience.rollout_recovery import (
@@ -994,6 +995,9 @@ def test_restart_only_resources_discard_only_dependent_continuations() -> None:
                 capture_key="group_g0-a2",
                 resource_state_revisions=(("tools", 0),),
                 staging_keys=("stage/restart-only",),
+                generation_cut_staging_keys=(
+                    "__generation_cut__/restore/group_g0/call/0",
+                ),
             ),
             GymCheckpointContinuation(
                 rollout_id="group_g1",
@@ -1001,6 +1005,9 @@ def test_restart_only_resources_discard_only_dependent_continuations() -> None:
                 capture_key="group_g1-a4",
                 resource_state_revisions=(("durable-tools", 3),),
                 staging_keys=("stage/export-restore",),
+                generation_cut_staging_keys=(
+                    "__generation_cut__/restore/group_g1/call/0",
+                ),
             ),
             # A legacy continuation has no dependency index, so it retains the
             # conservative restart behavior.
@@ -1010,9 +1017,15 @@ def test_restart_only_resources_discard_only_dependent_continuations() -> None:
                 capture_key="group_g2-a1",
                 resource_state_revisions=None,
                 staging_keys=("stage/legacy",),
+                generation_cut_staging_keys=(
+                    "__generation_cut__/restore/group_g2/call/0",
+                ),
             ),
         )
         controller._restored_gym_checkpoint_staging_keys = {
+            "__generation_cut__/restore/group_g0/call/0",
+            "__generation_cut__/restore/group_g1/call/0",
+            "__generation_cut__/restore/group_g2/call/0",
             "stage/restart-only",
             "stage/export-restore",
             "stage/legacy",
@@ -1039,11 +1052,17 @@ def test_restart_only_resources_discard_only_dependent_continuations() -> None:
         ]
         controller._call_dp.assert_awaited_once_with(
             "clear_samples",
-            sample_ids=["stage/legacy", "stage/restart-only"],
+            sample_ids=[
+                "__generation_cut__/restore/group_g0/call/0",
+                "__generation_cut__/restore/group_g2/call/0",
+                "stage/legacy",
+                "stage/restart-only",
+            ],
             partition_id="staging",
         )
         assert controller._restored_gym_checkpoint_staging_keys == {
-            "stage/export-restore"
+            "__generation_cut__/restore/group_g1/call/0",
+            "stage/export-restore",
         }
 
     asyncio.run(exercise())
@@ -1243,6 +1262,126 @@ def _sealed_recovery_ledger(staging_key: str) -> RolloutRecoveryLedger:
 
     asyncio.run(seed())
     return ledger
+
+
+def _parsed_generation_cut_continuation(
+    tmp_path: Path,
+    staging_key: str,
+) -> GymCheckpointContinuation:
+    """Build one restored prefix through the production checkpoint parser."""
+    agent_dir = tmp_path / "agent"
+    model_dir = tmp_path / "model"
+    agent_dir.mkdir()
+    model_dir.mkdir()
+
+    continuation_path = agent_dir / "continuations.jsonl"
+    continuation_payload = (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "rollout_id": "group_g0",
+                "attempt_index": 0,
+                "capture_key": "group_g0",
+                "last_committed_model_call_id": "committed-call",
+                "resource_state_revisions": {},
+            },
+            separators=(",", ":"),
+        ).encode()
+        + b"\n"
+    )
+    continuation_path.write_bytes(continuation_payload)
+    continuation_reference = {
+        "schema_version": 1,
+        "relative_path": "agent/continuations.jsonl",
+        "sha256": hashlib.sha256(continuation_payload).hexdigest(),
+        "records": 1,
+        "bytes": len(continuation_payload),
+    }
+
+    storage_path = model_dir / "storage-references.jsonl"
+    storage_payload = (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "capture_key": "group_g0",
+                "boundary_model_call_id": "active-call",
+                "kind": "generation_prefix_cut",
+                "key": staging_key,
+            },
+            separators=(",", ":"),
+        ).encode()
+        + b"\n"
+    )
+    storage_path.write_bytes(storage_payload)
+    storage_reference = {
+        "schema_version": 1,
+        "relative_path": "model/storage-references.jsonl",
+        "sha256": hashlib.sha256(storage_payload).hexdigest(),
+        "records": 1,
+        "bytes": len(storage_payload),
+    }
+
+    agent_manifest = agent_dir / "manifest.json"
+    model_manifest = model_dir / "manifest.json"
+    agent_manifest.write_text("{}")
+    model_manifest.write_text("{}")
+    agent_digest = hashlib.sha256(agent_manifest.read_bytes()).hexdigest()
+    model_digest = hashlib.sha256(model_manifest.read_bytes()).hexdigest()
+    checkpoint = GymCheckpointCommitResult.model_validate(
+        {
+            "checkpoint_id": "checkpoint-1",
+            "participants": [
+                {
+                    "participant": {
+                        "server_name": "agent",
+                        "component": "responses_api_agents",
+                        "participant_name": "agent",
+                    },
+                    "payload": {
+                        "records": 1,
+                        "manifest_digest": agent_digest,
+                        "continuation_index": continuation_reference,
+                    },
+                    "manifest": {
+                        "participant": {
+                            "server_name": "agent",
+                            "component": "responses_api_agents",
+                            "participant_name": "agent",
+                        },
+                        "relative_path": "agent/manifest.json",
+                        "manifest_digest": agent_digest,
+                    },
+                },
+                {
+                    "participant": {
+                        "server_name": "model",
+                        "component": "responses_api_models",
+                        "participant_name": "policy_model",
+                    },
+                    "payload": {
+                        "rollouts": 1,
+                        "rows": 1,
+                        "excluded_tombstoned": 0,
+                        "generation_cut_records": 1,
+                        "manifest_digest": model_digest,
+                        "storage_reference_index": storage_reference,
+                    },
+                    "manifest": {
+                        "participant": {
+                            "server_name": "model",
+                            "component": "responses_api_models",
+                            "participant_name": "policy_model",
+                        },
+                        "relative_path": "model/manifest.json",
+                        "manifest_digest": model_digest,
+                    },
+                },
+            ],
+        }
+    )
+    continuations = gym_checkpoint_continuations(tmp_path, checkpoint)
+    assert len(continuations) == 1
+    return continuations[0]
 
 
 def _run_train_pump(
@@ -3851,10 +3990,13 @@ class TestDataPlaneCheckpoint:
         assert dp_client.clear_calls == [([obsolete_cut], staging_partition)]
         assert sorted(dp_client.sample_ids) == [current_cut, unrelated]
 
-    def test_successor_snapshot_keeps_restored_prefix_until_replacement_seals(self):
+    def test_successor_snapshot_keeps_restored_prefix_until_replacement_seals(
+        self,
+        tmp_path: Path,
+    ):
         staging_partition = "rollout_staging"
-        restored_cut = "__generation_cut__/checkpoint-1/group_g0/call-1"
-        obsolete_cut = "__generation_cut__/checkpoint-0/obsolete/call-1"
+        restored_cut = "__generation_cut__/checkpoint-1/group_g0/call-1/0"
+        obsolete_cut = "__generation_cut__/checkpoint-0/obsolete/call-1/0"
         terminal_key = "group_g0-a1/call-1"
         dp_client = _StagingInventoryDPClient(
             [restored_cut, obsolete_cut],
@@ -3864,13 +4006,7 @@ class TestDataPlaneCheckpoint:
         actor = object.__new__(_ACTOR_CLS)
         actor._rollout_recovery_ledger = ledger
         actor._restored_gym_checkpoint_continuations = (
-            GymCheckpointContinuation(
-                rollout_id="group_g0",
-                source_attempt_index=0,
-                capture_key="group_g0",
-                resource_state_revisions=(),
-                staging_keys=(restored_cut,),
-            ),
+            _parsed_generation_cut_continuation(tmp_path, restored_cut),
         )
         actor._restored_gym_checkpoint_staging_keys = {restored_cut}
         actor._master_config = SimpleNamespace(
