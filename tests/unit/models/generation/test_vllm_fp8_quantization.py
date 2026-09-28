@@ -948,6 +948,7 @@ def test_process_mxfp8_linear_separates_checkpoint_and_runtime_scales(
     fp8_module, monkeypatch
 ):
     from vllm.model_executor import parameter as vllm_parameter
+    from vllm.model_executor.kernels.linear.mxfp8 import flashinfer
     from vllm.model_executor.layers.quantization.utils import mxfp8_utils
 
     layer = torch.nn.Module()
@@ -971,6 +972,7 @@ def test_process_mxfp8_linear_separates_checkpoint_and_runtime_scales(
         vllm_parameter, "get_tensor_model_parallel_world_size", lambda: 1
     )
     kernel_type = type("FlashInferCutlassMxfp8LinearKernel", (), {})
+    monkeypatch.setattr(flashinfer, "FlashInferCutlassMxfp8LinearKernel", kernel_type)
     method = types.SimpleNamespace(kernel=kernel_type())
 
     fp8_module.process_weights_after_loading_mxfp8_linear(method, layer)
@@ -2998,3 +3000,54 @@ def test_load_weights_uses_scale_name_for_mxfp8_linear_backend(
         "model.layers.0.mlp.up_proj.weight",
         f"model.layers.0.mlp.up_proj.{expected_scale_name}",
     ]
+
+
+@pytest.mark.parametrize(
+    ("kernel_name", "expected_scale_name"),
+    [
+        ("FlashInferTrtllmMxfp8LinearKernel", "weight_scale"),
+        ("FlashInferCutedslMxfp8LinearKernel", "weight_scale"),
+        ("FlashInferCutlassMxfp8LinearKernel", "weight_scale_from_checkpoint"),
+    ],
+)
+def test_prequantized_mxfp8_scale_uses_native_linear_loader_name(
+    fp8_module, monkeypatch, kernel_name, expected_scale_name
+):
+    fp8 = fp8_module
+    fp8.global_fp8_config = fp8.FP8Config(
+        use_fp8_weights=True,
+        model_parallel_size=1,
+        is_mx=True,
+    )
+    kernel_type = type(kernel_name, (), {})
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.mxfp8.flashinfer." + kernel_name,
+        kernel_type,
+        raising=False,
+    )
+    layer = types.SimpleNamespace(
+        quant_method=types.SimpleNamespace(kernel=kernel_type())
+    )
+    model = types.SimpleNamespace()
+    model_runner = types.SimpleNamespace(model=model)
+    scale = torch.ones(2, 1, dtype=torch.uint8)
+    checkpoint_scale_name = "model.layers.0.mlp.up_proj.weight_scale_from_checkpoint"
+
+    monkeypatch.setattr(
+        fp8,
+        "get_module_from_param_name",
+        lambda _model, name: (
+            layer if name == "model.layers.0.mlp.up_proj.weight" else None
+        ),
+    )
+    monkeypatch.setattr(fp8, "_is_fp8_weight", lambda _name, _model: False)
+
+    loaded = list(
+        fp8.get_quantized_weight_iterator(
+            [(checkpoint_scale_name, scale)],
+            model_runner,
+            refit_with_reload_api=False,
+        )
+    )
+
+    assert loaded == [(f"model.layers.0.mlp.up_proj.{expected_scale_name}", scale)]

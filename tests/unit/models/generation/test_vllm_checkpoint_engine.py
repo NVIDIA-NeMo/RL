@@ -138,6 +138,32 @@ def test_checkpoint_engine_rejects_native_trtllm_refit():
 
 
 @pytest.mark.vllm
+def test_checkpoint_engine_rejects_native_mxfp8_linear_refit(monkeypatch):
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtensionWithCheckpointEngine,
+    )
+
+    kernel_type = type("FlashInferTrtllmMxfp8LinearKernel", (), {})
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.mxfp8.flashinfer.FlashInferTrtllmMxfp8LinearKernel",
+        kernel_type,
+        raising=False,
+    )
+    linear = torch.nn.Linear(1, 1)
+    linear.quant_method = SimpleNamespace(kernel=kernel_type())
+    model = torch.nn.Module()
+    model.add_module("linear", linear)
+
+    worker = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(
+        VllmInternalWorkerExtensionWithCheckpointEngine
+    )
+    worker.model_runner = SimpleNamespace(model=model)
+
+    with pytest.raises(RuntimeError, match="checkpoint-engine"):
+        asyncio.run(worker._update_weights_from_checkpoint_engine_async())
+
+
+@pytest.mark.vllm
 def test_checkpoint_engine_worker_reports_total_memory(monkeypatch):
     from nemo_rl.models.generation.vllm.checkpoint_engine import (
         VllmCheckpointEngineMixin,
