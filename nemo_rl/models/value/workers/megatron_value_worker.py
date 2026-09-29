@@ -49,6 +49,9 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.rerun_state_machine import get_rerun_state_machine
+from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
+    FileSystemWriterAsync,
+)
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
@@ -971,12 +974,15 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
                 checkpointing_context=self.checkpointing_context,
             )
 
+            release_cuda_cache = self._requires_nvrx_cuda_cache_release()
             maybe_finalize_async_save(
                 self.mcore_state,
                 ckpt_cfg=self.mcore_state.cfg.checkpoint,
                 blocking=True,
-                terminate=True,
+                terminate=release_cuda_cache,
             )
+            if release_cuda_cache:
+                FileSystemWriterAsync.cleanup_tensor_caches()
 
             if self.should_disable_forward_pre_hook:
                 self.enable_forward_pre_hook()
@@ -989,6 +995,20 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
             raise
         finally:
             self.mcore_state.cfg.checkpoint.save = original_save_path
+
+    def _requires_nvrx_cuda_cache_release(self) -> bool:
+        """Whether checkpoint finalization must also drop cached CUDA IPC handles.
+
+        PPO offloads the value model every step, so this only depends on whether
+        NVRx caches CUDA tensor handles at all.
+        """
+        ckpt_cfg = self.mcore_state.cfg.checkpoint
+        return bool(
+            ckpt_cfg.async_save
+            and getattr(ckpt_cfg, "use_persistent_ckpt_worker", False)
+            and getattr(ckpt_cfg, "ckpt_assume_constant_structure", False)
+            and not getattr(ckpt_cfg, "async_ckpt_use_cpu_shm", False)
+        )
 
     def load_checkpoint(self, weights_path: str, optimizer_path: Optional[str] = None):
         """Load a checkpoint for the value model."""

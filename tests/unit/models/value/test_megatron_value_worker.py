@@ -290,6 +290,65 @@ def test_prepare_for_training_leaves_native_cpu_optimizer_placement():
     assert model.train_called
 
 
+@pytest.mark.parametrize(
+    ("use_cpu_shm", "expected_tail"),
+    [
+        (False, [("finalize", True), "cleanup_tensor_caches"]),
+        (True, [("finalize", False)]),
+    ],
+    ids=["gpu_ipc_cache", "cpu_shm"],
+)
+def test_save_checkpoint_clears_nvrx_cache_with_terminated_writer(
+    monkeypatch, use_cpu_shm, expected_tail
+):
+    """A terminated writer loses its tensor cache, so the training-side keys must go too."""
+    import nemo_rl.models.value.workers.megatron_value_worker as worker_module
+
+    events = []
+    worker = object.__new__(worker_module.MegatronValueWorkerImpl)
+    worker.model = object()
+    worker.should_disable_forward_pre_hook = False
+    worker.checkpointing_context = None
+    worker.mcore_state = SimpleNamespace(
+        cfg=SimpleNamespace(
+            checkpoint=SimpleNamespace(
+                save="original_path",
+                async_save=True,
+                use_persistent_ckpt_worker=True,
+                ckpt_assume_constant_structure=True,
+                async_ckpt_use_cpu_shm=use_cpu_shm,
+            )
+        ),
+        train_state=SimpleNamespace(floating_point_operations_so_far=0),
+    )
+
+    class _Writer:
+        @classmethod
+        def cleanup_tensor_caches(cls):
+            events.append("cleanup_tensor_caches")
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "barrier", lambda: None)
+    monkeypatch.setattr(
+        worker_module,
+        "maybe_finalize_async_save",
+        lambda *args, **kwargs: events.append(
+            ("finalize", kwargs.get("terminate", False))
+        ),
+    )
+    monkeypatch.setattr(
+        worker_module, "save_checkpoint", lambda **kwargs: events.append("mcore_save")
+    )
+    monkeypatch.setattr(worker_module, "FileSystemWriterAsync", _Writer)
+
+    worker_module.MegatronValueWorkerImpl.save_checkpoint(
+        worker, weights_path="ckpt/weights"
+    )
+
+    assert events == [("finalize", False), "mcore_save", *expected_tail]
+    assert worker.mcore_state.cfg.checkpoint.save == "original_path"
+
+
 @pytest.fixture
 def value_setup(request, tiny_qwen2_model_path):
     """Spin up a `Value` wrapper around a tiny Qwen2 backbone for testing.
