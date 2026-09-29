@@ -31,6 +31,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from nemo_rl.data.datasets import extract_necessary_env_names
 from nemo_rl.data.utils import (
     _combine_agent_name_sources,
+    _registered_response_env_name,
     get_train_dataset_name,
     load_dataloader_state,
 )
@@ -142,6 +143,19 @@ def test_extract_necessary_env_names_ignores_missing_or_none_entries():
     }
 
     assert extract_necessary_env_names(data_config) == []
+
+
+@pytest.mark.parametrize(
+    ("env_name", "is_vlm", "expected"),
+    [
+        ("math", False, "math"),
+        ("math", True, "vlm"),
+        ("nemo_gym", False, "nemo_gym"),
+        ("nemo_gym", True, "nemo_gym"),
+    ],
+)
+def test_registered_response_env_name_preserves_nemo_gym(env_name, is_vlm, expected):
+    assert _registered_response_env_name(env_name, is_vlm=is_vlm) == expected
 
 
 # ---------------------------------------------------------------------------
