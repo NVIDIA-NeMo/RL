@@ -21,7 +21,7 @@ import sys
 import threading
 import time
 from collections import Counter
-from collections.abc import AsyncGenerator, Iterable, Mapping
+from collections.abc import AsyncGenerator, Coroutine, Iterable, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -59,6 +59,7 @@ from nemo_rl.environments.gym_checkpoint import (
     GYM_CHECKPOINT_SCHEMA_VERSION,
     GYM_SERVER_TYPE_KEYS,
     GYM_AGENT_COMPLETED_RESULT_ACKNOWLEDGEMENT_FEATURE,
+    GYM_AGENT_COMPLETION_BULK_ACK_FEATURE,
     GymAgentDiscardRestoredContinuationResponse,
     GymActorExecutionRegistry,
     GymAgentCommitResponse,
@@ -75,6 +76,7 @@ from nemo_rl.environments.gym_checkpoint import (
     GymCheckpointTopology,
     GymCompletionReceipt,
     GymCompletedExecution,
+    GymCompletedExecutionAcknowledgementBatchResponse,
     GymCompletedExecutionAcknowledgementResponse,
     GymCoordinatorModelStatusResponse,
     GymDiscoveredParticipant,
@@ -668,6 +670,13 @@ class NemoGym(EnvironmentInterface):
         from nemo_gym.server_utils import HEAD_SERVER_KEY_NAME, BaseServerConfig
         from omegaconf import DictConfig
 
+        if not hasattr(RolloutCollectionHelper, "run_examples_with_metadata"):
+            raise RuntimeError(
+                "installed NeMo-Gym does not provide "
+                "RolloutCollectionHelper.run_examples_with_metadata; update the "
+                "Gym dependency to the checkpoint-scale-compatible revision"
+            )
+
         RELATIVE_PATH = "nemo_rl/environments/nemo_gym.py"
         assert __file__.endswith(RELATIVE_PATH)
 
@@ -709,8 +718,15 @@ class NemoGym(EnvironmentInterface):
             "global_aiohttp_connector_limit_per_host", 16_384
         )
         initial_global_config_dict.setdefault("global_aiohttp_connector_limit", 65_536)
+        initial_global_config_dict.setdefault(
+            "global_aiohttp_control_connector_limit_per_host", 64
+        )
+        initial_global_config_dict.setdefault(
+            "global_aiohttp_control_connector_limit", 256
+        )
         print(
             f"""Set global_aiohttp_connector_limit_per_host={initial_global_config_dict["global_aiohttp_connector_limit_per_host"]} and global_aiohttp_connector_limit={initial_global_config_dict["global_aiohttp_connector_limit"]}.
+Reserved control-plane connector capacity: limit_per_host={initial_global_config_dict["global_aiohttp_control_connector_limit_per_host"]}, limit={initial_global_config_dict["global_aiohttp_control_connector_limit"]}.
 Depending on your data shape, you may want to change these values."""
         )
 
@@ -863,7 +879,10 @@ Depending on your data shape, you may want to change these values."""
         **kwargs: Any,
     ) -> dict[str, Any]:
         # Gym is available in this actor environment but not on the SC driver.
-        from nemo_gym._checkpoint import CONTROL_URL_PREFIX
+        from nemo_gym._checkpoint import (
+            AGENT_CHECKPOINT_URL_PREFIX,
+            CONTROL_URL_PREFIX,
+        )
 
         default_headers = (
             self._checkpoint_control_headers
@@ -872,22 +891,36 @@ Depending on your data shape, you may want to change these values."""
         )
         headers = {**kwargs.pop("headers", {}), **default_headers}
         request_timeout_s = self._control_timeout_s if timeout_s is None else timeout_s
-        try:
-            response = await asyncio.wait_for(
-                self._control_client().request(
-                    server_name=server_name,
-                    url_path=path,
-                    method=method,
-                    headers=headers,
-                    **kwargs,
-                ),
-                timeout=request_timeout_s,
-            )
-        except asyncio.TimeoutError:
-            raise RuntimeError(
-                f"Gym control call to {server_name!r} {method} {path} exceeded "
-                f"{request_timeout_s}s (control plane unreachable or stalled)"
-            ) from None
+        bulk_ack_path = f"{AGENT_CHECKPOINT_URL_PREFIX}/acknowledge-batch"
+        retryable_transport = method == "POST" and path == bulk_ack_path
+        max_attempts = 3 if retryable_transport else 1
+        attempt_timeout_s = (
+            min(request_timeout_s, 15.0) if retryable_transport else request_timeout_s
+        )
+        response = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = await asyncio.wait_for(
+                    self._control_client().request(
+                        server_name=server_name,
+                        url_path=path,
+                        method=method,
+                        traffic_class="control",
+                        headers=headers,
+                        **kwargs,
+                    ),
+                    timeout=attempt_timeout_s,
+                )
+                break
+            except asyncio.TimeoutError:
+                if attempt == max_attempts:
+                    raise RuntimeError(
+                        f"Gym control call to {server_name!r} {method} {path} "
+                        f"timed out after {max_attempts} attempt(s) of "
+                        f"{attempt_timeout_s}s (control plane unreachable or stalled)"
+                    ) from None
+                await asyncio.sleep(0.25 * attempt)
+        assert response is not None
         if response.status != 200:
             response_text = await response.text()
             error_code: Optional[str] = None
@@ -1153,7 +1186,12 @@ Depending on your data shape, you may want to change these values."""
         executions: list[dict[str, Any]],
     ) -> dict[str, Any]:
         """Release terminal results after RL records checkpointable ownership."""
-        from nemo_gym._checkpoint import AGENT_CHECKPOINT_URL_PREFIX
+        from nemo_gym._checkpoint import (
+            AGENT_ACKNOWLEDGEMENT_BATCH_MAX_RECEIPTS,
+            AGENT_CHECKPOINT_URL_PREFIX,
+            AgentAcknowledgeBatchRequest,
+            agent_acknowledgement_batch_digest,
+        )
 
         validated = [
             GymCompletedExecution.model_validate(execution) for execution in executions
@@ -1178,17 +1216,63 @@ Depending on your data shape, you may want to change these values."""
         acknowledged: list[GymCompletedExecution] = []
         for agent_name, receipts in sorted(by_agent.items()):
             discovered = self._agent_checkpoint_participant(agent_name)
-            for receipt in receipts:
-                GymCompletedExecutionAcknowledgementResponse.model_validate(
-                    await self._control(
-                        "POST",
-                        f"{AGENT_CHECKPOINT_URL_PREFIX}/acknowledge",
-                        server_name=discovered.participant.server_name,
-                        json=receipt.model_dump(mode="json"),
+            use_bulk_ack = (
+                GYM_AGENT_COMPLETION_BULK_ACK_FEATURE
+                in discovered.capabilities.features
+            )
+            receipt_chunks = (
+                [
+                    receipts[offset : offset + AGENT_ACKNOWLEDGEMENT_BATCH_MAX_RECEIPTS]
+                    for offset in range(
+                        0,
+                        len(receipts),
+                        AGENT_ACKNOWLEDGEMENT_BATCH_MAX_RECEIPTS,
                     )
-                )
-                acknowledged.append(
+                ]
+                if use_bulk_ack
+                else [[receipt] for receipt in receipts]
+            )
+            for receipt_chunk in receipt_chunks:
+                if use_bulk_ack:
+                    request_receipts = [
+                        receipt.model_dump(mode="json") for receipt in receipt_chunk
+                    ]
+                    batch = AgentAcknowledgeBatchRequest(
+                        receipts=request_receipts,
+                        batch_digest=agent_acknowledgement_batch_digest(
+                            request_receipts
+                        ),
+                    )
+                    acknowledgement = GymCompletedExecutionAcknowledgementBatchResponse.model_validate(
+                        await self._control(
+                            "POST",
+                            f"{AGENT_CHECKPOINT_URL_PREFIX}/acknowledge-batch",
+                            server_name=discovered.participant.server_name,
+                            json=batch.model_dump(mode="json"),
+                        )
+                    )
+                    if acknowledgement.accepted_count != len(receipt_chunk):
+                        raise RuntimeError(
+                            "Gym bulk completion acknowledgement accepted an "
+                            "unexpected receipt count"
+                        )
+                    if acknowledgement.batch_digest != batch.batch_digest:
+                        raise RuntimeError(
+                            "Gym bulk completion acknowledgement returned a "
+                            "mismatched batch digest"
+                        )
+                else:
+                    GymCompletedExecutionAcknowledgementResponse.model_validate(
+                        await self._control(
+                            "POST",
+                            f"{AGENT_CHECKPOINT_URL_PREFIX}/acknowledge",
+                            server_name=discovered.participant.server_name,
+                            json=receipt_chunk[0].model_dump(mode="json"),
+                        )
+                    )
+                acknowledged.extend(
                     GymCompletedExecution(receipt=receipt, agent_name=agent_name)
+                    for receipt in receipt_chunk
                 )
         return {"acknowledged": [item.model_dump(mode="json") for item in acknowledged]}
 
@@ -1521,7 +1605,7 @@ Depending on your data shape, you may want to change these values."""
         deadline_ts: float,
         checkpoint_dir: str,
     ) -> dict[str, Any]:
-        """Commit every stateful participant into a caller-owned temp directory."""
+        """Commit participants concurrently within dependency-ordered stages."""
         # Gym is available in this actor environment but not on the SC driver.
         from nemo_gym._checkpoint import (
             AGENT_CHECKPOINT_URL_PREFIX,
@@ -1540,18 +1624,15 @@ Depending on your data shape, you may want to change these values."""
         from nemo_gym._checkpoint.ledger import ModelCheckpointCommitRequest
         from nemo_gym._checkpoint.resources import ResourcesCommitRequest
 
-        results: list[GymParticipantCommitResult] = []
-        continuation_indexes: list[GymCheckpointArtifactReference] = []
-        for discovered in self._ordered_checkpoint_participants(
+        participants = self._ordered_checkpoint_participants(
             phase=GymCheckpointPhase.COMMIT
-        ):
+        )
+        agents: list[GymDiscoveredParticipant] = []
+        models: list[GymDiscoveredParticipant] = []
+        resources: list[GymDiscoveredParticipant] = []
+        for discovered in participants:
             participant = discovered.participant
             capabilities = discovered.capabilities
-            payload: (
-                GymModelCommitResponse
-                | GymAgentCommitResponse
-                | GymResourcesCommitResponse
-            )
             if participant.component == "responses_api_models":
                 if (
                     EXTERNAL_STORAGE_REFERENCE_INDEX_FEATURE
@@ -1561,58 +1642,25 @@ Depending on your data shape, you may want to change these values."""
                         "Gym policy model does not support external-storage "
                         "reference indexes"
                     )
-                request = ModelCheckpointCommitRequest(
-                    checkpoint_id=checkpoint_id,
-                    deadline_ts=deadline_ts,
-                    checkpoint_dir=checkpoint_dir,
-                    continuation_indexes=[
-                        item.model_dump(mode="json") for item in continuation_indexes
-                    ],
-                ).model_dump(mode="json")
-                payload = GymModelCommitResponse.model_validate(
-                    await self._control(
-                        "POST",
-                        f"{MODEL_CHECKPOINT_URL_PREFIX}/commit",
-                        server_name=participant.server_name,
-                        timeout_s=self._checkpoint_request_timeout(deadline_ts),
-                        json=request,
-                    )
-                )
+                models.append(discovered)
             elif participant.component == "responses_api_agents":
                 if AGENT_CONTINUATION_INDEX_FEATURE not in capabilities.features:
                     raise RuntimeError(
                         "Gym agent does not support continuation indexes"
                     )
-                request = AgentCommitRequest(
-                    checkpoint_id=checkpoint_id,
-                    deadline_ts=deadline_ts,
-                    checkpoint_dir=checkpoint_dir,
-                ).model_dump(mode="json")
-                payload = GymAgentCommitResponse.model_validate(
-                    await self._control(
-                        "POST",
-                        f"{AGENT_CHECKPOINT_URL_PREFIX}/commit",
-                        server_name=participant.server_name,
-                        timeout_s=self._checkpoint_request_timeout(deadline_ts),
-                        json=request,
-                    )
-                )
-                continuation_indexes.append(payload.continuation_index)
+                agents.append(discovered)
             else:
-                request = ResourcesCommitRequest(
-                    checkpoint_id=checkpoint_id,
-                    deadline_ts=deadline_ts,
-                    checkpoint_dir=checkpoint_dir,
-                ).model_dump(mode="json")
-                payload = GymResourcesCommitResponse.model_validate(
-                    await self._control(
-                        "POST",
-                        f"{RESOURCES_CHECKPOINT_URL_PREFIX}/commit",
-                        server_name=participant.server_name,
-                        timeout_s=self._checkpoint_request_timeout(deadline_ts),
-                        json=request,
-                    )
-                )
+                resources.append(discovered)
+
+        def commit_result(
+            discovered: GymDiscoveredParticipant,
+            payload: (
+                GymModelCommitResponse
+                | GymAgentCommitResponse
+                | GymResourcesCommitResponse
+            ),
+        ) -> GymParticipantCommitResult:
+            participant = discovered.participant
             manifest = GymParticipantManifestReference(
                 participant=participant,
                 relative_path=participant_checkpoint_path(
@@ -1626,16 +1674,105 @@ Depending on your data shape, you may want to change these values."""
                 ),
                 manifest_digest=payload.manifest_digest,
             )
-            results.append(
-                GymParticipantCommitResult(
-                    participant=participant,
-                    payload=payload,
-                    manifest=manifest,
+            return GymParticipantCommitResult(
+                participant=participant,
+                payload=payload,
+                manifest=manifest,
+            )
+
+        async def commit_agent(
+            discovered: GymDiscoveredParticipant,
+        ) -> GymParticipantCommitResult:
+            participant = discovered.participant
+            request = AgentCommitRequest(
+                checkpoint_id=checkpoint_id,
+                deadline_ts=deadline_ts,
+                checkpoint_dir=checkpoint_dir,
+            ).model_dump(mode="json")
+            payload = GymAgentCommitResponse.model_validate(
+                await self._control(
+                    "POST",
+                    f"{AGENT_CHECKPOINT_URL_PREFIX}/commit",
+                    server_name=participant.server_name,
+                    timeout_s=self._checkpoint_request_timeout(deadline_ts),
+                    json=request,
                 )
             )
+            return commit_result(discovered, payload)
+
+        async def commit_model(
+            discovered: GymDiscoveredParticipant,
+            continuation_indexes: list[GymCheckpointArtifactReference],
+        ) -> GymParticipantCommitResult:
+            participant = discovered.participant
+            request = ModelCheckpointCommitRequest(
+                checkpoint_id=checkpoint_id,
+                deadline_ts=deadline_ts,
+                checkpoint_dir=checkpoint_dir,
+                continuation_indexes=[
+                    item.model_dump(mode="json") for item in continuation_indexes
+                ],
+            ).model_dump(mode="json")
+            payload = GymModelCommitResponse.model_validate(
+                await self._control(
+                    "POST",
+                    f"{MODEL_CHECKPOINT_URL_PREFIX}/commit",
+                    server_name=participant.server_name,
+                    timeout_s=self._checkpoint_request_timeout(deadline_ts),
+                    json=request,
+                )
+            )
+            return commit_result(discovered, payload)
+
+        async def commit_resources(
+            discovered: GymDiscoveredParticipant,
+        ) -> GymParticipantCommitResult:
+            participant = discovered.participant
+            request = ResourcesCommitRequest(
+                checkpoint_id=checkpoint_id,
+                deadline_ts=deadline_ts,
+                checkpoint_dir=checkpoint_dir,
+            ).model_dump(mode="json")
+            payload = GymResourcesCommitResponse.model_validate(
+                await self._control(
+                    "POST",
+                    f"{RESOURCES_CHECKPOINT_URL_PREFIX}/commit",
+                    server_name=participant.server_name,
+                    timeout_s=self._checkpoint_request_timeout(deadline_ts),
+                    json=request,
+                )
+            )
+            return commit_result(discovered, payload)
+
+        async def commit_stage(
+            operations: list[Coroutine[Any, Any, GymParticipantCommitResult]],
+        ) -> list[GymParticipantCommitResult]:
+            tasks = [asyncio.create_task(operation) for operation in operations]
+            try:
+                return list(await asyncio.gather(*tasks))
+            except BaseException:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
+
+        agent_results = await commit_stage(
+            [commit_agent(discovered) for discovered in agents]
+        )
+        continuation_indexes = [
+            GymAgentCommitResponse.model_validate(result.payload).continuation_index
+            for result in agent_results
+        ]
+        model_results = await commit_stage(
+            [commit_model(discovered, continuation_indexes) for discovered in models]
+        )
+        resource_results = await commit_stage(
+            [commit_resources(discovered) for discovered in resources]
+        )
         return GymCheckpointCommitResult(
             checkpoint_id=checkpoint_id,
-            participants=results,
+            participants=agent_results + model_results + resource_results,
         ).model_dump(mode="json")
 
     async def restore_checkpoint(

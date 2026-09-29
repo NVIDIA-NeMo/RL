@@ -1932,6 +1932,33 @@ class TestPeriodicRolloutCheckpoint:
             SetupTimingMetrics(),
         )
 
+    async def _seed_pending_gym_acknowledgements(
+        self,
+        actor: Any,
+        count: int,
+        *,
+        agent_name: str = "test-agent",
+    ) -> None:
+        state = {
+            "schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+            "groups": [],
+            "pending_completed_execution_acknowledgements": [
+                {
+                    "rollout_id": f"coalesce-{index:06d}_g0",
+                    "attempt_index": 0,
+                    "agent_name": agent_name,
+                    "execution_generation": 1,
+                    "result_identity": f"result-{index:06d}",
+                    "result_digest": f"{index:064x}",
+                }
+                for index in range(count)
+            ],
+        }
+        async with actor._data_plane_checkpoint_barrier.mutation(
+            "gym_acknowledgements"
+        ) as cut:
+            actor._rollout_recovery_ledger.load_state_dict(cut, state)
+
     def test_periodic_saves_are_serialized_by_the_checkpoint_lock(
         self, tmp_path: Path
     ) -> None:
@@ -2365,6 +2392,122 @@ class TestPeriodicRolloutCheckpoint:
         assert not list((step / "rollout_snapshots").glob("snapshot_*"))
         assert events == ["prepare", "commit", "abort"]
 
+    def test_gym_ack_coalescer_chunks_burst_and_drains_outbox(
+        self, tmp_path: Path
+    ) -> None:
+        actor = self._actor(tmp_path)
+        actor._gym_participant_checkpointing_enabled = True
+        batch_sizes: list[int] = []
+
+        async def acknowledge(executions: list[dict[str, Any]]) -> dict[str, Any]:
+            batch_sizes.append(len(executions))
+            return {"acknowledged": executions}
+
+        actor._env_handles = {
+            "nemo_gym": SimpleNamespace(
+                acknowledge_completed_executions=_AsyncRemoteMethod(acknowledge)
+            )
+        }
+
+        async def scenario() -> None:
+            await self._seed_pending_gym_acknowledgements(actor, 1_000)
+            actor._schedule_completed_gym_acknowledgement_drain()
+            task = actor._gym_completed_acknowledgement_task
+            assert task is not None
+            await asyncio.wait_for(task, timeout=5.0)
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert batch_sizes == [256, 256, 256, 232]
+        assert (
+            actor._rollout_recovery_ledger.pending_completed_execution_acknowledgement_count()
+            == 0
+        )
+
+    def test_gym_ack_coalescer_flushes_sparse_completion_on_timer(
+        self, tmp_path: Path
+    ) -> None:
+        actor = self._actor(tmp_path)
+        actor._gym_participant_checkpointing_enabled = True
+        acknowledgement_received = asyncio.Event()
+
+        async def acknowledge(executions: list[dict[str, Any]]) -> dict[str, Any]:
+            acknowledgement_received.set()
+            return {"acknowledged": executions}
+
+        actor._env_handles = {
+            "nemo_gym": SimpleNamespace(
+                acknowledge_completed_executions=_AsyncRemoteMethod(acknowledge)
+            )
+        }
+
+        async def scenario() -> None:
+            await self._seed_pending_gym_acknowledgements(actor, 1)
+            with patch(
+                "nemo_rl.algorithms.single_controller._GYM_ACKNOWLEDGEMENT_COALESCE_S",
+                0.05,
+            ):
+                actor._schedule_completed_gym_acknowledgement_drain()
+                await asyncio.sleep(0.01)
+                assert not acknowledgement_received.is_set()
+                await asyncio.wait_for(acknowledgement_received.wait(), timeout=1.0)
+                task = actor._gym_completed_acknowledgement_task
+                if task is not None:
+                    await task
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert (
+            actor._rollout_recovery_ledger.pending_completed_execution_acknowledgement_count()
+            == 0
+        )
+
+    def test_gym_ack_coalescer_flushes_full_chunk_before_timer(
+        self, tmp_path: Path
+    ) -> None:
+        actor = self._actor(tmp_path)
+        actor._gym_participant_checkpointing_enabled = True
+        acknowledgement_received = asyncio.Event()
+
+        async def acknowledge(executions: list[dict[str, Any]]) -> dict[str, Any]:
+            assert len(executions) == 256
+            acknowledgement_received.set()
+            return {"acknowledged": executions}
+
+        actor._env_handles = {
+            "nemo_gym": SimpleNamespace(
+                acknowledge_completed_executions=_AsyncRemoteMethod(acknowledge)
+            )
+        }
+
+        async def scenario() -> None:
+            await self._seed_pending_gym_acknowledgements(actor, 256)
+            with patch(
+                "nemo_rl.algorithms.single_controller._GYM_ACKNOWLEDGEMENT_COALESCE_S",
+                30.0,
+            ):
+                actor._schedule_completed_gym_acknowledgement_drain()
+                await asyncio.wait_for(acknowledgement_received.wait(), timeout=1.0)
+                task = actor._gym_completed_acknowledgement_task
+                if task is not None:
+                    await task
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert (
+            actor._rollout_recovery_ledger.pending_completed_execution_acknowledgement_count()
+            == 0
+        )
+
     def test_gym_ack_outbox_retries_without_holding_a_mutation_cut(
         self, tmp_path: Path
     ) -> None:
@@ -2454,6 +2597,73 @@ class TestPeriodicRolloutCheckpoint:
         finally:
             actor._checkpointer.shutdown()
 
+    def test_gym_ack_outbox_preserves_successful_agent_chunks_on_partial_failure(
+        self, tmp_path: Path
+    ) -> None:
+        actor = self._actor(tmp_path)
+        actor._gym_participant_checkpointing_enabled = True
+
+        async def acknowledge(executions: list[dict[str, Any]]) -> dict[str, Any]:
+            agent_name = executions[0]["agent_name"]
+            if agent_name == "failed-agent":
+                raise OSError("failed agent transport")
+            return {"acknowledged": executions}
+
+        actor._env_handles = {
+            "nemo_gym": SimpleNamespace(
+                acknowledge_completed_executions=_AsyncRemoteMethod(acknowledge)
+            )
+        }
+        successful = PendingCompletedExecutionAcknowledgement(
+            rollout_id="group-8_g0",
+            attempt_index=0,
+            agent_name="successful-agent",
+            execution_generation=1,
+            result_identity="result-group-8_g0-0",
+            result_digest="2" * 64,
+        )
+        failed = PendingCompletedExecutionAcknowledgement(
+            rollout_id="group-8_g1",
+            attempt_index=0,
+            agent_name="failed-agent",
+            execution_generation=1,
+            result_identity="result-group-8_g1-0",
+            result_digest="3" * 64,
+        )
+        state = {
+            "schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+            "groups": [],
+            "pending_completed_execution_acknowledgements": [
+                {
+                    "rollout_id": item.rollout_id,
+                    "attempt_index": item.attempt_index,
+                    "agent_name": item.agent_name,
+                    "execution_generation": item.execution_generation,
+                    "result_identity": item.result_identity,
+                    "result_digest": item.result_digest,
+                }
+                for item in (successful, failed)
+            ],
+        }
+
+        async def scenario() -> None:
+            async with actor._data_plane_checkpoint_barrier.mutation(
+                "gym_acknowledgements"
+            ) as cut:
+                actor._rollout_recovery_ledger.load_state_dict(cut, state)
+
+            with pytest.raises(OSError, match="failed agent transport"):
+                await actor._flush_completed_gym_acknowledgements()
+            assert (
+                actor._rollout_recovery_ledger.pending_completed_execution_acknowledgements()
+                == [failed]
+            )
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            actor._checkpointer.shutdown()
+
     def test_gym_ack_drain_rechecks_outbox_after_clean_exit(
         self, tmp_path: Path
     ) -> None:
@@ -2464,30 +2674,41 @@ class TestPeriodicRolloutCheckpoint:
         release_empty_pass = asyncio.Event()
         replacement_drained = asyncio.Event()
         flush_calls = 0
+        wait_calls = 0
+
+        async def wait_for_flush() -> bool:
+            nonlocal wait_calls
+            wait_calls += 1
+            if wait_calls == 1:
+                return True
+            if wait_calls == 2:
+                # Hold the original drain after it observes an empty outbox but
+                # before its finally block can detach and re-check the outbox.
+                empty_pass_entered.set()
+                await release_empty_pass.wait()
+                return False
+            return pending
 
         async def flush() -> int:
             nonlocal flush_calls, pending
             flush_calls += 1
-            if flush_calls == 1:
-                pending = False
-                return 1
+            pending = False
             if flush_calls == 2:
-                empty_pass_entered.set()
-                await release_empty_pass.wait()
-                return 0
-            if flush_calls == 3:
-                pending = False
                 replacement_drained.set()
-                return 1
-            return 0
+            return 1
 
         async def scenario() -> None:
             nonlocal pending
             with (
                 patch.object(
                     actor._rollout_recovery_ledger,
-                    "pending_completed_execution_acknowledgements",
-                    side_effect=lambda: [("pending",)] if pending else [],
+                    "pending_completed_execution_acknowledgement_count",
+                    side_effect=lambda: 1 if pending else 0,
+                ),
+                patch.object(
+                    actor,
+                    "_wait_for_completed_gym_acknowledgement_flush",
+                    side_effect=wait_for_flush,
                 ),
                 patch.object(
                     actor,
@@ -2512,7 +2733,8 @@ class TestPeriodicRolloutCheckpoint:
                     await asyncio.sleep(0)
 
                 assert actor._gym_completed_acknowledgement_task is None
-                assert flush_calls == 4
+                assert flush_calls == 2
+                assert wait_calls == 4
 
         try:
             asyncio.run(scenario())
