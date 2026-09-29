@@ -153,6 +153,8 @@ from nemo_rl.data_plane.observability import (
 from nemo_rl.data_plane.schema import (
     DP_CALIB_INPUT_FIELDS,
     DP_TRAIN_FIELDS,
+    INPUT_IDS,
+    INPUT_LENGTHS,
     ROLLOUT_METRICS,
     ROUTE_PLAN_TAG,
 )
@@ -200,6 +202,7 @@ from nemo_rl.utils.checkpoint import (
 )
 from nemo_rl.utils.logger import TELEMETRY_WALL_TIME_METRIC, Logger
 from nemo_rl.utils.timer import TimeoutChecker, Timer
+from nemo_rl.utils.train_data_dump import TrainDataDump
 
 if TYPE_CHECKING:
     from nemo_rl.experience.rollout_reassembler import FinalizedGroup
@@ -700,6 +703,11 @@ class SingleControllerActor:
         self._opd_stat_sum = 0.0
         self._opd_stat_sumsq = 0.0
         self._opd_stat_count = 0
+        self._train_data_dump = (
+            TrainDataDump(self._logger.base_log_dir)
+            if self._async_cfg.log_full_train_data
+            else None
+        )
 
         # Seeded here rather than in run(): on resume _trainer_version is the
         # checkpoint's step, so a run resuming mid-warmup needs the widened
@@ -3216,6 +3224,12 @@ class SingleControllerActor:
                 if self._teacher_coordinator is not None:
                     step_metrics.update(self._teacher_coordinator.drain_metrics())
 
+                if self._train_data_dump is not None:
+                    with self._timer.time("train_data_dump"):
+                        await asyncio.to_thread(
+                            self._train_data_dump.finish_step, self._train_steps
+                        )
+
                 self._trainer_version += 1
                 self._train_steps += 1
                 self._optimizer_commit_in_progress = False
@@ -3395,7 +3409,7 @@ class SingleControllerActor:
                 percent = (v / total_time * 100) if total_time > 0 else 0.0
                 print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
 
-            # TODO: per-step train_data jsonl dump, vllm metrics logger,
+            # TODO: vllm metrics logger,
             #   histogram log, pretty-print "Training Results" block,
             #   print_performance_metrics.
             printable_step_metrics = {
@@ -5201,6 +5215,8 @@ class SingleControllerActor:
         if self._algo_cfg.overlong_filtering:
             final_sample_mask = final_sample_mask * (~truncated).to(sample_mask.dtype)
 
+        pre_seq_error_sample_mask = final_sample_mask.clone()
+
         seq_logprob_error_threshold = self._algo_cfg.seq_logprob_error_threshold
         # Match the legacy path: whenever real policy logprobs are available,
         # report sequence-level generation/training mismatch. A threshold adds
@@ -5344,6 +5360,37 @@ class SingleControllerActor:
             response_advantages.detach().cpu()
         )
 
+        if self._train_data_dump is not None:
+            with self._timer.time("train_data_dump"):
+                sequences = {
+                    "token_ids": tensor_field(data, INPUT_IDS),
+                    "token_loss_mask": token_mask,
+                    "advantages": advantages,
+                    "generation_logprobs": tensor_field(
+                        data, adv_cfg.generation_logprobs_field
+                    ),
+                }
+                if self._policy_logprobs_required:
+                    sequences["prev_logprobs"] = tensor_field(
+                        data, adv_cfg.policy_logprobs_field
+                    )
+                if self._teacher_logprobs_required:
+                    sequences["teacher_logprobs"] = kwargs["teacher_logprobs"]
+                await asyncio.to_thread(
+                    self._train_data_dump.add_chunk,
+                    step=self._train_steps,
+                    sample_ids=list(meta.sample_ids),
+                    tags=meta.tags,
+                    input_lengths=tensor_field(data, INPUT_LENGTHS),
+                    sequences=sequences,
+                    scalars={
+                        "sample_loss_mask": final_sample_mask,
+                        "pre_seq_error_sample_loss_mask": pre_seq_error_sample_mask,
+                        "rewards": rewards,
+                        "prompt_ids": prompt_ids,
+                    },
+                )
+
         fields_to_put = {adv_cfg.output_field: advantages}
         if not torch.equal(final_sample_mask, sample_mask):
             fields_to_put[adv_cfg.sample_mask_field] = final_sample_mask
@@ -5394,6 +5441,8 @@ class SingleControllerActor:
             fields.append(adv_cfg.teacher_logprobs_field)
         if self._is_ppo:
             fields.append(adv_cfg.values_field)
+        if self._train_data_dump is not None:
+            fields.extend([INPUT_IDS, INPUT_LENGTHS, adv_cfg.generation_logprobs_field])
         return list(dict.fromkeys(fields))
 
     def _retune_lookahead_versions(self) -> None:
