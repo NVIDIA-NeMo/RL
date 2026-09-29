@@ -127,6 +127,20 @@ def _combine_agent_name_source_sets(
     )
 
 
+def _registered_response_env_name(env_name: str, *, is_vlm: bool) -> str:
+    """Resolve the environment implementation used by response-data setup.
+
+    ``is_vlm`` selects the built-in ``vlm`` environment for ordinary VLM
+    recipes. NeMo Gym is different: it owns its multimodal rollout lifecycle
+    and must remain registered as ``nemo_gym`` even when its policy is a VLM.
+    Routing it to ``vlm`` makes ``VLMEnvironment`` consume the incompatible
+    ``env.nemo_gym`` config and fail on fields such as ``num_workers``.
+    """
+    if env_name == "nemo_gym":
+        return env_name
+    return "vlm" if is_vlm else env_name
+
+
 # TODO: @yukih: unify to setup_data after dataset refactored
 def setup_response_data(
     tokenizer: AutoProcessor | AutoTokenizer,
@@ -178,7 +192,7 @@ def setup_response_data(
         env_name_list = extract_necessary_env_names(data_config)
         envs = {}
         for env_name in env_name_list:
-            registered_env_name = "vlm" if is_vlm else env_name
+            registered_env_name = _registered_response_env_name(env_name, is_vlm=is_vlm)
             envs[env_name] = create_env(
                 env_name=registered_env_name, env_config=env_configs[env_name]
             )
