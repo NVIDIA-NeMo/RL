@@ -13,7 +13,9 @@
 # limitations under the License.
 
 from collections import defaultdict
-from typing import Any, Optional
+from collections.abc import Mapping
+from dataclasses import is_dataclass, replace
+from typing import Any, Callable, Optional
 
 import torch
 
@@ -28,34 +30,132 @@ from nemo_rl.utils.routed_experts_codec import encode_routed_experts
 R3_MISSING_ROUTE_SENTINEL = ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL
 VLLM_LOGPROB_FLOOR = -9999.0
 
-# The expert-id range vs carry dtype is model-constant, so it is verified on the
-# first non-empty routed-experts tensor per process and skipped afterwards.
-G_ROUTED_EXPERTS_RANGE_CHECKED = False
+
+def remap_multimodal_placeholders(
+    *,
+    template_token_ids: list[int],
+    final_token_ids: list[int],
+    mm_placeholders: Mapping[str, list[Any]],
+) -> dict[str, list[Any]]:
+    """Move vLLM multimodal ranges into the final prompt coordinates.
+
+    vLLM computes multimodal placeholder offsets while preprocessing the
+    chat-template token sequence. NeMo-RL can subsequently replace the
+    re-tokenized history with the exact model-generated token prefix. Locate
+    each unchanged media-token span in that final sequence so its associated
+    multimodal features remain aligned.
+
+    Ranges are matched in global prompt order because different media items can
+    accumulate different shifts. Coincident ranges resolve to the same offset:
+    Qwen2.5-Omni derives an audio range from its paired video range with an
+    identical ``(offset, length)``, so a span is only consumed once.
+
+    A span that cannot be located fails closed rather than submitting token IDs
+    with incorrect multimodal positions. Note that an *ambiguous* match is not
+    detected: media spans are bare runs of one repeated pad token, so if a run
+    is longer in ``final_token_ids`` than in the template, a later item can
+    match inside an earlier item's run. Locating spans by search is only
+    necessary because the splice boundary computed by ``replace_prefix_tokens``
+    is not threaded through to here; passing it would make the suffix region
+    pure arithmetic and remove that ambiguity entirely.
+
+    Args:
+        template_token_ids: The chat-template token sequence vLLM used to
+            compute ``mm_placeholders``.
+        final_token_ids: The exact-token prompt produced by
+            ``replace_prefix_tokens``, which will be submitted to the engine.
+        mm_placeholders: vLLM's per-modality placeholder ranges, in
+            ``template_token_ids`` coordinates.
+
+    Returns:
+        A new per-modality mapping with the same item ordering, whose ranges are
+        expressed in ``final_token_ids`` coordinates.
+
+    Raises:
+        ValueError: If an input range is out of bounds for
+            ``template_token_ids``, or if a media span cannot be relocated in
+            ``final_token_ids``.
+        TypeError: If a range is neither a mapping nor a dataclass instance.
+    """
+    if template_token_ids == final_token_ids or not mm_placeholders:
+        return {modality: list(ranges) for modality, ranges in mm_placeholders.items()}
+
+    entries: list[tuple[int, str, int, Any, int]] = []
+    remapped = {modality: list(ranges) for modality, ranges in mm_placeholders.items()}
+    for modality, ranges in mm_placeholders.items():
+        for item_index, placeholder_range in enumerate(ranges):
+            if isinstance(placeholder_range, Mapping):
+                offset = int(placeholder_range["offset"])
+                length = int(placeholder_range["length"])
+            else:
+                offset = int(placeholder_range.offset)
+                length = int(placeholder_range.length)
+
+            if offset < 0 or length <= 0 or offset + length > len(template_token_ids):
+                raise ValueError(
+                    f"Invalid {modality} placeholder range {item_index}: "
+                    f"offset={offset}, length={length}, "
+                    f"template_length={len(template_token_ids)}"
+                )
+            entries.append((offset, modality, item_index, placeholder_range, length))
+
+    search_start = 0
+    resolved: dict[tuple[int, int], int] = {}
+    for old_offset, modality, item_index, placeholder_range, length in sorted(
+        entries, key=lambda entry: entry[0]
+    ):
+        # Two modalities can describe the same span, so a resolved offset is
+        # reused instead of scanning past it. Only a newly located span
+        # advances the cursor.
+        new_offset = resolved.get((old_offset, length))
+        if new_offset is None:
+            expected = template_token_ids[old_offset : old_offset + length]
+            max_start = len(final_token_ids) - length
+            new_offset = next(
+                (
+                    candidate
+                    for candidate in range(search_start, max_start + 1)
+                    if final_token_ids[candidate] == expected[0]
+                    and final_token_ids[candidate : candidate + length] == expected
+                ),
+                None,
+            )
+            if new_offset is None:
+                raise ValueError(
+                    f"Could not locate {modality} placeholder range {item_index} "
+                    f"from template offset {old_offset} in the final exact-token prompt"
+                )
+            resolved[(old_offset, length)] = new_offset
+            search_start = new_offset + length
+
+        if isinstance(placeholder_range, Mapping):
+            updated_range = dict(placeholder_range)
+            updated_range["offset"] = new_offset
+        elif is_dataclass(placeholder_range):
+            updated_range = replace(placeholder_range, offset=new_offset)
+        else:
+            raise TypeError(
+                "Multimodal placeholder ranges must be mappings or dataclass "
+                f"instances, got {type(placeholder_range).__name__}"
+            )
+
+        remapped[modality][item_index] = updated_range
+
+    return remapped
 
 
 def _as_routed_experts_tensor(
     value: Any, *, device: torch.device, dtype: torch.dtype
 ) -> torch.Tensor:
-    """Convert backend routed-expert ids to the resolved carry dtype.
+    """Convert backend routed-expert ids to the metadata-selected carry dtype.
 
-    Guards against expert ids overflowing ``dtype`` before the narrowing cast,
-    which would otherwise wrap silently (e.g. if the expert count was
-    mis-detected when resolving the dtype).
+    Do not reduce the full payload to validate its maximum value here. vLLM
+    0.25.1 can return torch.uint16 routes, for which Tensor.max is not
+    implemented, and an upcast would add a large temporary allocation. The
+    destination dtype is resolved from model expert-count metadata; downstream
+    alignment still validates payload rank, shape, and route completeness.
     """
-    global G_ROUTED_EXPERTS_RANGE_CHECKED
-    tensor = torch.as_tensor(value, device=device)
-    if not G_ROUTED_EXPERTS_RANGE_CHECKED and tensor.numel() > 0:
-        max_id = int(tensor.max())
-        limit = torch.iinfo(dtype).max
-        if max_id > limit:
-            raise ValueError(
-                f"routed expert id {max_id} exceeds the resolved carry dtype "
-                f"{dtype} (max {limit}); the model's expert count was likely "
-                "mis-detected (see resolve_routed_experts_dtype in "
-                "nemo_rl.models.generation.interfaces)."
-            )
-        G_ROUTED_EXPERTS_RANGE_CHECKED = True
-    return tensor.to(dtype=dtype)
+    return torch.as_tensor(value, device=device).to(dtype=dtype)
 
 
 def format_prompt_for_vllm_generation(
@@ -242,6 +342,9 @@ def attach_routed_experts_to_chat_response_choices(
     device: torch.device,
     logger: Any = None,
     routed_experts_dtype: torch.dtype = ROUTED_EXPERTS_FALLBACK_DTYPE,
+    routed_experts_ref_factory: Optional[
+        Callable[[torch.Tensor], dict[str, Any]]
+    ] = None,
 ) -> Any:
     """Attach aligned routed experts to OpenAI chat response choices."""
     outputs_by_index = {
@@ -252,6 +355,13 @@ def attach_routed_experts_to_chat_response_choices(
     )
 
     choices = list(getattr(response, "choices", []))
+    if routed_experts_ref_factory is not None and (
+        len(choices) != 1 or choices[0].index != 0
+    ):
+        raise RuntimeError(
+            "Ray-reference router replay currently requires exactly one chat "
+            "choice with index 0."
+        )
     attached_choice_indices = set()
     for choice in choices:
         generation_details = outputs_by_index.get(choice.index)
@@ -294,13 +404,16 @@ def attach_routed_experts_to_chat_response_choices(
                 r3_stats["actual_routes"],
                 r3_stats["expected_routes"],
             )
-        # Base64 envelope instead of .tolist(): nested JSON int lists cost
-        # ~1s of CPU per serialize/parse hop at long context lengths and get
-        # re-validated at every gym HTTP hop; a single string passes through
-        # the gym chain opaquely.
-        choice.message.routed_experts = encode_routed_experts(
-            routed_experts.to(dtype=routed_experts_dtype)
-        )
+        if routed_experts_ref_factory is not None:
+            choice.message.routed_experts = routed_experts_ref_factory(routed_experts)
+        else:
+            # Base64 envelope instead of .tolist(): nested JSON int lists cost
+            # ~1s of CPU per serialize/parse hop at long context lengths and get
+            # re-validated at every gym HTTP hop; a single string passes through
+            # the gym chain opaquely.
+            choice.message.routed_experts = encode_routed_experts(
+                routed_experts.to(dtype=routed_experts_dtype)
+            )
 
     if len(attached_choice_indices) != len(choices):
         missing_choice_indices = sorted(

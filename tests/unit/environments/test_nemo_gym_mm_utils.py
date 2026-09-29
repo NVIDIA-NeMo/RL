@@ -66,6 +66,28 @@ def test_extract_input_images_ignores_text_function_call_output():
     item["output"] = "Tool failed to create result.png"
     assert _extract_input_images_from_message(item) == []
 
+    item["output"] = "https://example.com/a-result-that-is-text"
+    assert _extract_input_images_from_message(item) == []
+
+    item["output"] = "file:///tmp/a-result-that-is-text"
+    assert _extract_input_images_from_message(item) == []
+
+
+def test_extract_input_images_skips_unresolvable_sources(monkeypatch, capsys):
+    def fail_to_resolve(_source):
+        raise FileNotFoundError("missing image")
+
+    monkeypatch.setattr(
+        "nemo_rl.environments.nemo_gym.resolve_to_image", fail_to_resolve
+    )
+    item = {
+        "role": "user",
+        "content": [{"type": "input_image", "image_url": "file:///missing/image.png"}],
+    }
+
+    assert _extract_input_images_from_message(item) == []
+    assert "skipping non-image source in trajectory" in capsys.readouterr().out
+
 
 def test_index_per_turn_images_bins_images():
     output = [

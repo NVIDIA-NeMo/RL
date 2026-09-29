@@ -33,11 +33,21 @@ from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.data.multimodal_utils import (
+    NATIVE_MULTIMODAL_KEYS,
+    ROLLOUT_MATCHED_MEDIA_KEY,
+    PackedTensor,
     attach_image_model_inputs_to_message,
     encode_images_in_examples,
     extract_input_image_sources_from_responses_messages,
+    image_size_from_source,
     resolve_to_image,
     uses_image_placeholder,
+)
+from nemo_rl.environments.nemotron_utils import (
+    RolloutGeometryUnderdetermined,
+    count_image_placeholder_runs,
+    predicted_static_image_num_tokens,
+    supports_image_placeholder_run_parity,
 )
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import (
@@ -52,9 +62,15 @@ from nemo_rl.experience.failures import (
     RolloutDataFailure,
     http_status_is_infra,
 )
+from nemo_rl.experience.interfaces import NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY
 from nemo_rl.models.generation.interfaces import should_use_async_rollouts
 from nemo_rl.models.policy import PolicyConfig, TokenizerConfig
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
+from nemo_rl.utils.routed_experts_ref import (
+    is_routed_experts_ref,
+    slice_routed_experts_ref,
+    validate_routed_experts_ref,
+)
 from nemo_rl.utils.timer import Timer
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
 
@@ -93,6 +109,56 @@ def _count_structured_response_tokens(
         if answer_text
         else 0,
     )
+
+
+def _replace_last_routed_experts_ref(
+    previous_routes: Any,
+    replacement: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Replace the final logical route in a reference-backed message.
+
+    vLLM cannot report the route used to predict the final generated token in
+    the same decode response. The following turn's prefill does contain that
+    route. Dense router replay patches the final row in place; reference-backed
+    replay represents the same operation by trimming the prior slice and
+    appending a one-token slice from the next request.
+    """
+    if is_routed_experts_ref(previous_routes):
+        segments = [validate_routed_experts_ref(previous_routes)]
+    elif isinstance(previous_routes, list) and previous_routes:
+        segments = [validate_routed_experts_ref(segment) for segment in previous_routes]
+    else:
+        raise TypeError(
+            "Cannot patch a reference-backed routed-experts turn whose previous "
+            f"routes have type {type(previous_routes).__name__}."
+        )
+
+    last_nonempty = next(
+        (
+            index
+            for index in range(len(segments) - 1, -1, -1)
+            if int(segments[index]["length"]) > 0
+        ),
+        None,
+    )
+    if last_nonempty is None:
+        raise ValueError(
+            "Cannot replace the final route of an empty routed-experts turn"
+        )
+
+    last = segments[last_nonempty]
+    updated = segments[:last_nonempty]
+    if int(last["length"]) > 1:
+        updated.append(
+            slice_routed_experts_ref(
+                last,
+                offset=int(last["offset"]),
+                length=int(last["length"]) - 1,
+            )
+        )
+    updated.append(validate_routed_experts_ref(dict(replacement)))
+    updated.extend(segments[last_nonempty + 1 :])
+    return updated
 
 
 class NemoGymCompatibleConfig(Protocol):
@@ -461,23 +527,6 @@ def _detect_invalid_tool_call_and_malformed_thinking(
 ########################################
 
 
-# WARNING: A function-call output beginning with HTTP(S) is accepted here and
-# passed to ``resolve_to_image``, which performs an outbound request during
-# postprocessing even when the tool result is not actually an image.
-_IMAGE_SRC_PREFIXES = ("data:image/", "http://", "https://", "file://")
-
-
-def _looks_like_image_src(src: str) -> bool:
-    """True when ``src`` plausibly points at an image the loader can open.
-
-    Guards against tool responses (e.g. ``{"x": 0.65, "y": 0.83}`` from a
-    click tool) that are strings but not image URLs. Without this, the
-    indexer forwards the JSON payload to ``resolve_to_image`` → PIL.open,
-    which treats it as a filesystem path and raises ``FileNotFoundError``.
-    """
-    return src.startswith(_IMAGE_SRC_PREFIXES)
-
-
 def get_pad_dynamic_image_shapes(env_config: Mapping[str, Any]) -> bool:
     """Return nemo_gym's pad_dynamic_image_shapes from an env config, or False.
 
@@ -507,9 +556,11 @@ def _extract_input_images_from_message(item: dict) -> list[Image.Image]:
     """
     images: list[Image.Image] = []
     if item.get("type") == "function_call_output":
+        # Tool outputs are free text. Only an inline image data URL is an image
+        # here; printed HTTP/file URLs and tool errors must remain text.
         src = item.get("output")
-        if isinstance(src, str) and _looks_like_image_src(src):
-            images.append(resolve_to_image(src))
+        if isinstance(src, str) and src.startswith("data:image/"):
+            _append_resolved_image(images, src)
         return images
     content = item.get("content") or []
     if not isinstance(content, list):
@@ -526,8 +577,21 @@ def _extract_input_images_from_message(item: dict) -> list[Image.Image]:
             src = src.get("url")
         if src is None:
             continue
-        images.append(resolve_to_image(src))
+        _append_resolved_image(images, src)
     return images
+
+
+def _append_resolved_image(images: list[Image.Image], src: Any) -> None:
+    """Append a resolved image, skipping malformed or unavailable sources."""
+    try:
+        images.append(resolve_to_image(src))
+    except (FileNotFoundError, OSError, ValueError) as error:
+        preview = src if isinstance(src, str) else type(src).__name__
+        print(
+            "[nemo_gym] skipping non-image source in trajectory "
+            f"({type(error).__name__}): {preview[:120]!r}",
+            flush=True,
+        )
 
 
 def _is_trainable_output_item(item: dict) -> bool:
@@ -628,6 +692,7 @@ def _attach_multimodal_data_to_user_message(
     images: list[Image.Image],
     processor: Any,
     pad_dynamic_image_shapes: bool = False,
+    expected_num_tokens_per_image: "list[int] | None" = None,
 ) -> None:
     """Attach per-turn multimodal tensors to ``user_message``.
 
@@ -644,6 +709,7 @@ def _attach_multimodal_data_to_user_message(
         images=images,
         processor=processor,
         pad_dynamic_image_shapes=pad_dynamic_image_shapes,
+        expected_num_tokens_per_image=expected_num_tokens_per_image,
     )
 
 
@@ -947,6 +1013,9 @@ Depending on your data shape, you may want to change these values."""
 
         processor = getattr(self, "_processor", None)
         response = nemo_gym_result["response"]
+        empty_response_output = (
+            isinstance(response.get("output"), list) and not response["output"]
+        )
         result_input = nemo_gym_result["responses_create_params"].get("input", [])
         request_input = nemo_gym_row.get("responses_create_params", {}).get("input")
         raw_input = (
@@ -994,6 +1063,47 @@ Depending on your data shape, you may want to change these values."""
             and initial_media_matches_raw_input
             and returned_media_matches_raw_input
         )
+        parity_processor = (
+            processor
+            if processor is not None
+            and supports_image_placeholder_run_parity(processor)
+            else None
+        )
+        # Dedup omission is only safe when the statically-budgeted tensors the
+        # driver pre-attached provably match the rollout's per-image expansion.
+        # vLLM sizes image tiles per request (shrinking as prompts approach
+        # max_model_len), so budget-bound rows must be attached here, from the
+        # rollout tokens, instead.
+        if (
+            initial_multimodal_data_omitted
+            and parity_processor is not None
+            and raw_initial_sources
+        ):
+            first_trainable_item = next(
+                (
+                    item
+                    for item in response["output"]
+                    if _is_trainable_output_item(item)
+                ),
+                None,
+            )
+            predicted = predicted_static_image_num_tokens(
+                parity_processor,
+                [image_size_from_source(source) for source in raw_initial_sources],
+            )
+            first_turn_runs = (
+                count_image_placeholder_runs(
+                    first_trainable_item["prompt_token_ids"], parity_processor
+                )
+                if first_trainable_item is not None
+                else []
+            )
+            if (
+                predicted is None
+                or len(first_turn_runs) < len(predicted)
+                or first_turn_runs[: len(predicted)] != predicted
+            ):
+                initial_multimodal_data_omitted = False
         if initial_multimodal_data_omitted:
             media_messages, _ = _without_initial_image_sources(
                 media_messages, raw_initial_sources
@@ -1009,6 +1119,10 @@ Depending on your data shape, you may want to change these values."""
         turn_idx = 0
 
         nemo_rl_message_log = []
+        # Set when a turn's rollout image tiling cannot be reproduced without
+        # inferring geometry from token counts; the whole sample then carries
+        # no media and is flagged for loss masking.
+        media_geometry_failed = False
         seen_token_ids: List[int] = []
         batch_decode_items = []
         response_token_counts = _count_structured_response_tokens(
@@ -1042,27 +1156,47 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             new_prompt_token_ids = prompt_token_ids[len(seen_token_ids) :]
 
             routed_experts = None
+            routed_experts_ref = None
             if routed_experts_raw is not None:
-                routed_experts_dtype = _ROUTED_EXPERTS_DTYPES[
-                    self.cfg.get("routed_experts_dtype", "int16")
-                ]
-                routed_experts = decode_routed_experts(
-                    routed_experts_raw, dtype=routed_experts_dtype
-                )
-                if routed_experts.dim() != 3:
-                    raise ValueError(
-                        "NeMo Gym returned routed_experts with invalid shape. "
-                        "Expected [tokens, num_moe_layers, topk], got "
-                        f"{tuple(routed_experts.shape)}."
-                    )
                 expected_tokens = len(prompt_token_ids) + len(generation_token_ids)
-                if routed_experts.shape[0] < expected_tokens:
-                    raise ValueError(
-                        "NeMo Gym returned too few routed_experts rows for a "
-                        "trainable output item: "
-                        f"routes={routed_experts.shape[0]}, expected_at_least="
-                        f"{expected_tokens}."
+                if is_routed_experts_ref(routed_experts_raw):
+                    routed_experts_ref = validate_routed_experts_ref(routed_experts_raw)
+                    if (
+                        routed_experts_ref["offset"] != 0
+                        or routed_experts_ref["length"]
+                        != routed_experts_ref["shape"][0]
+                    ):
+                        raise ValueError(
+                            "NeMo Gym expects the vLLM boundary to return one "
+                            "full routed-experts object reference."
+                        )
+                    if routed_experts_ref["shape"][0] < expected_tokens:
+                        raise ValueError(
+                            "NeMo Gym returned too few routed_experts rows for a "
+                            "trainable output item: "
+                            f"routes={routed_experts_ref['shape'][0]}, "
+                            f"expected_at_least={expected_tokens}."
+                        )
+                else:
+                    routed_experts_dtype = _ROUTED_EXPERTS_DTYPES[
+                        self.cfg.get("routed_experts_dtype", "int16")
+                    ]
+                    routed_experts = decode_routed_experts(
+                        routed_experts_raw, dtype=routed_experts_dtype
                     )
+                    if routed_experts.dim() != 3:
+                        raise ValueError(
+                            "NeMo Gym returned routed_experts with invalid shape. "
+                            "Expected [tokens, num_moe_layers, topk], got "
+                            f"{tuple(routed_experts.shape)}."
+                        )
+                    if routed_experts.shape[0] < expected_tokens:
+                        raise ValueError(
+                            "NeMo Gym returned too few routed_experts rows for a "
+                            "trainable output item: "
+                            f"routes={routed_experts.shape[0]}, expected_at_least="
+                            f"{expected_tokens}."
+                        )
             elif self.cfg.get("require_routed_experts", False):
                 raise ValueError(
                     "policy.router_replay.enabled=true requires NeMo Gym output "
@@ -1078,6 +1212,18 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                 previous_routes = nemo_rl_message_log[-1].get("routed_experts")
                 if isinstance(previous_routes, torch.Tensor):
                     previous_routes[-1] = routed_experts[len(seen_token_ids) - 1]
+            elif routed_experts_ref is not None and seen_token_ids:
+                previous_routes = nemo_rl_message_log[-1].get("routed_experts")
+                nemo_rl_message_log[-1]["routed_experts"] = (
+                    _replace_last_routed_experts_ref(
+                        previous_routes,
+                        slice_routed_experts_ref(
+                            routed_experts_ref,
+                            offset=len(seen_token_ids) - 1,
+                            length=1,
+                        ),
+                    )
+                )
 
             prompt_start = len(seen_token_ids)
             prompt_end = len(prompt_token_ids)
@@ -1091,24 +1237,68 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             }
             if routed_experts is not None:
                 user_message["routed_experts"] = routed_experts[prompt_start:prompt_end]
+            elif routed_experts_ref is not None:
+                user_message["routed_experts"] = slice_routed_experts_ref(
+                    routed_experts_ref,
+                    offset=prompt_start,
+                    length=prompt_end - prompt_start,
+                )
             nemo_rl_message_log.append(user_message)
 
-            if processor is not None:
+            if processor is not None and not media_geometry_failed:
                 images_this_turn = (
                     per_turn_images[turn_idx] if turn_idx < len(per_turn_images) else []
                 )
-                _attach_multimodal_data_to_user_message(
-                    user_message,
-                    images=images_this_turn,
-                    processor=processor,
-                    # Read with a default, like _processor above: this method is
-                    # called unbound against lightweight stand-ins that define
-                    # only what they exercise, so a bare attribute access turns
-                    # an unrelated test into an AttributeError.
-                    pad_dynamic_image_shapes=getattr(
-                        self, "_pad_dynamic_image_shapes", False
-                    ),
-                )
+                expected_num_tokens: "list[int] | None" = None
+                if images_this_turn and parity_processor is not None:
+                    turn_runs = count_image_placeholder_runs(
+                        new_prompt_token_ids, parity_processor
+                    )
+                    # Under dedup omission, turn 0's leading runs belong to the
+                    # initial images whose (verified) tensors the driver
+                    # restores; only the trailing runs are attached here.
+                    omitted_leading_runs = (
+                        len(raw_initial_sources)
+                        if initial_multimodal_data_omitted and turn_idx == 0
+                        else 0
+                    )
+                    if len(turn_runs) != omitted_leading_runs + len(images_this_turn):
+                        raise ValueError(
+                            f"Rollout/image mismatch on NeMo Gym turn {turn_idx}: "
+                            f"the prompt delta contains {len(turn_runs)} image "
+                            f"placeholder runs but {len(images_this_turn)} images "
+                            f"were collected for this turn (plus "
+                            f"{omitted_leading_runs} deduplicated initial images). "
+                            "Refusing to train on misaligned media."
+                        )
+                    expected_num_tokens = turn_runs[omitted_leading_runs:]
+                try:
+                    _attach_multimodal_data_to_user_message(
+                        user_message,
+                        images=images_this_turn,
+                        processor=processor,
+                        # Read with a default, like _processor above: this method is
+                        # called unbound against lightweight stand-ins that define
+                        # only what they exercise, so a bare attribute access turns
+                        # an unrelated test into an AttributeError.
+                        pad_dynamic_image_shapes=getattr(
+                            self, "_pad_dynamic_image_shapes", False
+                        ),
+                        expected_num_tokens_per_image=expected_num_tokens,
+                    )
+                except RolloutGeometryUnderdetermined as exc:
+                    # The rollout's tiling for some image on this turn cannot be
+                    # reproduced without guessing geometry. Guessing risks
+                    # training against different pixels than generated the
+                    # rollout, so drop ALL media from this sample instead: the
+                    # per-row media validity mask then treats its placeholder
+                    # ids as ordinary tokens (no Megatron alignment to satisfy)
+                    # and the sample is flagged for loss masking below.
+                    media_geometry_failed = True
+                    print(
+                        "[NemoGym] Dropping media and masking sample: "
+                        f"turn {turn_idx}: {exc}"
+                    )
             # Valid tool calls go through the structured API (tool_calls field) and get
             # executed by NeMo-Gym. If tool call patterns appear in the text content instead,
             # the call was invalid and never executed — flag it so training can penalize it.
@@ -1134,6 +1324,12 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                 assistant_message["routed_experts"] = routed_experts[
                     generation_start:generation_end
                 ]
+            elif routed_experts_ref is not None:
+                assistant_message["routed_experts"] = slice_routed_experts_ref(
+                    routed_experts_ref,
+                    offset=generation_start,
+                    length=generation_end - generation_start,
+                )
             nemo_rl_message_log.append(assistant_message)
 
             seen_token_ids.extend(new_prompt_token_ids)
@@ -1158,6 +1354,49 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             ):
                 output_item_dict["prompt_str"] = prompt_str
                 output_item_dict["generation_str"] = generation_str
+
+        if not nemo_rl_message_log and empty_response_output:
+            # Some agents intentionally terminate without asking the policy for a
+            # generation. Keep the row structurally valid so one such response
+            # cannot terminate the rollout stream. The
+            # NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY marker added below is propagated
+            # through replay and consumed by async GRPO, which sets this row's
+            # loss multiplier to zero before training. A single valid token is
+            # sufficient because the row has no trainable assistant span and its
+            # full Gym response is retained separately for diagnostics.
+            placeholder_token_id = getattr(tokenizer, "pad_token_id", None)
+            if placeholder_token_id is None:
+                placeholder_token_id = getattr(tokenizer, "eos_token_id", None)
+            if placeholder_token_id is None:
+                placeholder_token_id = 0
+            nemo_rl_message_log.append(
+                {
+                    "role": "user",
+                    "content": "",
+                    "token_ids": torch.tensor(
+                        [int(placeholder_token_id)], dtype=torch.long
+                    ),
+                }
+            )
+            raw_agent_ref = nemo_gym_row.get("agent_ref")
+            compact_agent_ref = (
+                {
+                    str(key): value
+                    for key, value in raw_agent_ref.items()
+                    if value is None or isinstance(value, (bool, float, int, str))
+                }
+                if isinstance(raw_agent_ref, Mapping)
+                else raw_agent_ref
+            )
+            print(
+                "⚠️ Recovered empty NeMo-Gym response.output; "
+                "event=actor_empty_response_output_recovered "
+                f"task_index={nemo_gym_row.get('_ng_task_index')!r} "
+                f"rollout_index={nemo_gym_row.get('_ng_rollout_index')!r} "
+                f"attempt_index={nemo_gym_row.get('_ng_attempt_index')!r} "
+                f"agent_ref={compact_agent_ref!r}",
+                flush=True,
+            )
 
         if not nemo_rl_message_log:
             input_messages = nemo_gym_result["responses_create_params"]["input"]
@@ -1196,6 +1435,28 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                         container[key], raw_initial_sources
                     )
 
+        if media_geometry_failed:
+            # Strip every media tensor already attached to this sample (partial
+            # media would leave Megatron with fewer projected features than
+            # placeholder tokens), mark each user turn so the driver-side
+            # static reattach does not restore misaligned tensors, and flag the
+            # sample so GRPO masks it from the loss.
+            for message in nemo_rl_message_log:
+                if message.get("role") != "user":
+                    continue
+                for key in [
+                    key
+                    for key, value in message.items()
+                    if isinstance(value, PackedTensor) or key in NATIVE_MULTIMODAL_KEYS
+                ]:
+                    del message[key]
+                message[ROLLOUT_MATCHED_MEDIA_KEY] = True
+            instance_config = nemo_gym_result.get("instance_config")
+            if not isinstance(instance_config, dict):
+                instance_config = {}
+                nemo_gym_result["instance_config"] = instance_config
+            instance_config["mask_sample"] = True
+
         result = {
             "message_log": nemo_rl_message_log,
             "input_message_log": nemo_rl_message_log[:1],
@@ -1206,6 +1467,8 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             result["reasoning_token_count"],
             result["response_token_count"],
         ) = response_token_counts or (0, 0)
+        if empty_response_output:
+            result[NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY] = True
         if not include_initial_multimodal_data:
             result["_initial_multimodal_data_omitted"] = initial_multimodal_data_omitted
         return result

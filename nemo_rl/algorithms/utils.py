@@ -451,10 +451,18 @@ def get_tokenizer(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    def set_chat_template(chat_template: str) -> None:
+        # Keep the processor's template in sync with the tokenizer's: rendered
+        # text (e.g. reasoning extraction) must not depend on which of the two
+        # applies the template.
+        tokenizer.chat_template = chat_template
+        if processor is not None:
+            processor.chat_template = chat_template
+
     if "chat_template" in tokenizer_config:
         if tokenizer_config["chat_template"] is None:
             print("Using passthrough chat template")
-            tokenizer.chat_template = COMMON_CHAT_TEMPLATES.passthrough_prompt_response
+            set_chat_template(COMMON_CHAT_TEMPLATES.passthrough_prompt_response)
         elif tokenizer_config["chat_template"].lower() == "default":
             print("Using tokenizer's default chat template")
         elif tokenizer_config["chat_template"].endswith(".jinja"):
@@ -462,10 +470,10 @@ def get_tokenizer(
             template_path = tokenizer_config["chat_template"]
             print(f"Loading chat template from file: {template_path}")
             with open(template_path, "r") as f:
-                tokenizer.chat_template = f.read()
+                set_chat_template(f.read())
         else:
             print("Using custom chat template")
-            tokenizer.chat_template = tokenizer_config["chat_template"]
+            set_chat_template(tokenizer_config["chat_template"])
     else:
         print("No chat template provided, using tokenizer's default")
 

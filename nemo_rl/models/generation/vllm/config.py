@@ -69,6 +69,10 @@ class VllmSpecificArgs(TypedDict):
     kv_cache_dtype: Literal["auto", "fp8", "fp8_e4m3"]
     enforce_eager: NotRequired[bool]
     enable_return_routed_experts: NotRequired[bool]
+    # Internal router-replay transport fields populated by setup; they are not
+    # forwarded to vLLM's EngineArgs.
+    _routed_experts_transport: NotRequired[Literal["ray"]]
+    _routed_experts_store_run_instance_id: NotRequired[str]
     # Whether to show a tqdm progress bar during generation. Defaults to vLLM's own default (True) when absent. Only applies when async_engine is False.
     use_tqdm: NotRequired[bool]
     # By default, NeMo RL only has a Python handle to the vllm.LLM generation engine. The expose_http_server flag here will expose that generation engine as an HTTP server.
@@ -188,7 +192,14 @@ class VllmConfig(GenerationConfig):
 
 def resolve_vllm_video_config(config: VllmConfig) -> VllmVideoConfig | None:
     """Validate and return the optional vLLM video sampling contract."""
-    raw_video_config = config["vllm_cfg"].get("video")
+    vllm_config = cast(dict[str, Any], config["vllm_cfg"])
+    if "video_loader" in vllm_config:
+        raise ValueError(
+            "policy.generation.vllm_cfg.video_loader is not supported; "
+            "use policy.generation.vllm_cfg.video"
+        )
+
+    raw_video_config = vllm_config.get("video")
     if raw_video_config is None:
         return None
     return VllmVideoConfig.model_validate(raw_video_config)

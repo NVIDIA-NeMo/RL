@@ -786,9 +786,24 @@ class AsyncNemoGymRolloutImpl:
             rollout_inputs, timer, timer_prefix
         )
         source_message_log = input_sample["message_log"]
-        attach_static_multimodal_payload(prompt_message_log, source_message_log)
+        # The prompt log and each completion's log can alias the same message
+        # dictionaries; share one processed-id set so a rollout-matched marker
+        # consumed on one view cannot leave later views free to overwrite the
+        # repaired media.
+        processed_target_ids: set[int] = set()
+        attach_static_multimodal_payload(
+            prompt_message_log,
+            source_message_log,
+            processed_target_ids=processed_target_ids,
+            tokenizer=self._tokenizer,
+        )
         for completion in completions:
-            attach_static_multimodal_payload(completion.message_log, source_message_log)
+            attach_static_multimodal_payload(
+                completion.message_log,
+                source_message_log,
+                processed_target_ids=processed_target_ids,
+                tokenizer=self._tokenizer,
+            )
 
         timer.stop(f"{timer_prefix}/total")
         rollout_metrics.update(timer.get_timing_metrics("sum"))
@@ -1098,6 +1113,19 @@ class AsyncNemoGymRolloutImpl:
                 rollout_metrics.update(
                     calculate_single_metric(values, n, f"{agent_name}/{key}")
                 )
+
+        # Emit authoritative live token metrics after full-result metrics so
+        # similarly named environment metadata cannot overwrite them.
+        rollout_metrics.update(
+            calculate_single_metric(
+                total_tokens, n, f"{agent_name}/total_tokens_per_sample"
+            )
+        )
+        rollout_metrics.update(
+            calculate_single_metric(
+                assistant_tokens, n, f"{agent_name}/gen_tokens_per_sample"
+            )
+        )
         rollout_metrics[f"{agent_name}/full_result"] = Table(
             data=[[json.dumps(r, separators=(",", ":"))] for r in agent_extras],
             columns=["Full result"],

@@ -100,7 +100,10 @@ from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
     ReferenceLogprobOutputSpec,
 )
-from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
+from nemo_rl.models.policy.utils import (
+    get_runtime_env_for_policy_worker,
+    make_empty_cache_best_effort_under_expandable_segments,
+)
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.checkpoint_engine import (
     MegatronCheckpointEngineSendMixin,
@@ -426,6 +429,7 @@ class MegatronPolicyWorkerImpl(
         **kwargs: Any,
     ):
         """Initialize the MegatronPolicyWorker."""
+        make_empty_cache_best_effort_under_expandable_segments()
         # NVML-based and guarded on torch.cuda.is_initialized(), so this does
         # not initialize a CUDA context ahead of the set_device below.
         log_gpu_memory_diagnostics(
@@ -1804,6 +1808,7 @@ class MegatronPolicyWorkerImpl(
         data: BatchedDataDict[Any],
         micro_batch_size: Optional[int] = None,
         require_router_replay: bool = True,
+        topk: Optional[int] = None,
     ) -> BatchedDataDict[LogprobOutputSpec]:
         """Get the logprobs of the model for a batch of data.
 
@@ -1828,6 +1833,12 @@ class MegatronPolicyWorkerImpl(
         )
 
         self.model.eval()
+
+        if not require_router_replay and "routed_experts" in data:
+            # Reference-policy logprobs intentionally use their own router.
+            # Drop both dense payloads and Ray tags before microbatch processing
+            # so this path never materializes rollout routes unnecessarily.
+            del data["routed_experts"]
 
         # Logprobs run the same forward as training, so a batch that needs the
         # mask needs it here too -- otherwise these logprobs would be taken
@@ -1857,6 +1868,7 @@ class MegatronPolicyWorkerImpl(
             cfg=self.cfg,
             sampling_params=self.sampling_params,
             use_fused_linear_logprobs=use_fused_linear_logprobs,
+            topk=topk,
         )
         use_router_replay = _should_use_router_replay(
             enabled=self._router_replay_enabled,
@@ -1884,24 +1896,50 @@ class MegatronPolicyWorkerImpl(
 
         if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
             all_log_probs_padded = []
+            all_topk_logprobs_padded = []
+            all_topk_indices_padded = []
             all_logprobs = [l["logprobs"] for l in list_of_logprobs]
-            for lp in all_logprobs:
+            for output, lp in zip(list_of_logprobs, all_logprobs):
                 padding_needed = seq_length - lp.shape[1]
                 if padding_needed > 0:
                     lp = torch.nn.functional.pad(
                         lp, (0, padding_needed), mode="constant", value=0.0
                     )
                 all_log_probs_padded.append(lp)
+                if topk is not None:
+                    topk_lp = output["topk_logprobs"]
+                    topk_idx = output["topk_indices"]
+                    topk_padding_needed = seq_length - topk_lp.shape[1]
+                    if topk_padding_needed > 0:
+                        topk_lp = torch.nn.functional.pad(
+                            topk_lp, (0, 0, 0, topk_padding_needed), value=0.0
+                        )
+                        topk_idx = torch.nn.functional.pad(
+                            topk_idx, (0, 0, 0, topk_padding_needed), value=-1
+                        )
+                    all_topk_logprobs_padded.append(topk_lp)
+                    all_topk_indices_padded.append(topk_idx)
 
             logprobs = torch.cat(all_log_probs_padded, dim=0)
             tensors = {"logprobs": logprobs}
+            if topk is not None:
+                tensors["topk_logprobs"] = torch.cat(all_topk_logprobs_padded, dim=0)
+                tensors["topk_indices"] = torch.cat(all_topk_indices_padded, dim=0)
         else:
             tensors = {"logprobs": None}
-        logprobs = broadcast_tensors_from_last_stage(tensors)["logprobs"]
+            if topk is not None:
+                tensors["topk_logprobs"] = None
+                tensors["topk_indices"] = None
+        broadcasted = broadcast_tensors_from_last_stage(tensors)
+        logprobs = broadcasted["logprobs"]
 
         no_grad.__exit__(None, None, None)
         self.timer.stop("get_logprobs")
-        return BatchedDataDict[LogprobOutputSpec](logprobs=logprobs).to("cpu")
+        result = BatchedDataDict[LogprobOutputSpec](logprobs=logprobs)
+        if topk is not None:
+            result["topk_logprobs"] = broadcasted["topk_logprobs"]
+            result["topk_indices"] = broadcasted["topk_indices"]
+        return result.to("cpu")
 
     def _apply_state_dict_to_model(
         self,
@@ -2032,6 +2070,7 @@ class MegatronPolicyWorkerImpl(
         data: BatchedDataDict[GenerationDatumSpec],
         k: int,
         micro_batch_size: Optional[int] = None,
+        return_logsumexp: bool = False,
     ):
         """Get the top-k logits and indices for a batch of data.
 
@@ -2077,7 +2116,9 @@ class MegatronPolicyWorkerImpl(
             seq_length=padded_seq_length,
             mbs=micro_batch_size,
             num_microbatches=num_microbatches,
-            post_processing_fn=TopkLogitsPostProcessor(cfg=self.cfg, k=k),
+            post_processing_fn=TopkLogitsPostProcessor(
+                cfg=self.cfg, k=k, return_logsumexp=return_logsumexp
+            ),
             forward_only=True,
             defer_fp32_logits=self.defer_fp32_logits,
             sampling_params=self.sampling_params,
@@ -2087,6 +2128,7 @@ class MegatronPolicyWorkerImpl(
         if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
             logits_chunks = []
             indices_chunks = []
+            logsumexp_chunks = []
             for out in list_of_outputs:
                 tk = out["topk_logits"]
                 ti = out["topk_indices"]
@@ -2096,6 +2138,11 @@ class MegatronPolicyWorkerImpl(
                     ti = torch.nn.functional.pad(ti, (0, 0, 0, pad_len), value=0)
                 logits_chunks.append(tk)
                 indices_chunks.append(ti)
+                if return_logsumexp:
+                    lse = out["V_logsumexp"]
+                    if pad_len > 0:
+                        lse = torch.nn.functional.pad(lse, (0, pad_len), value=0.0)
+                    logsumexp_chunks.append(lse)
 
             topk_logits = torch.cat(logits_chunks, dim=0)
             topk_indices = torch.cat(indices_chunks, dim=0)
@@ -2104,11 +2151,15 @@ class MegatronPolicyWorkerImpl(
                 "topk_logits": topk_logits,
                 "topk_indices": topk_indices,
             }
+            if return_logsumexp:
+                tensors_to_broadcast["V_logsumexp"] = torch.cat(logsumexp_chunks, dim=0)
         else:
             tensors_to_broadcast = {
                 "topk_logits": None,
                 "topk_indices": None,
             }
+            if return_logsumexp:
+                tensors_to_broadcast["V_logsumexp"] = None
 
         # Broadcast tensors from last stage to all stages
         broadcasted = broadcast_tensors_from_last_stage(tensors_to_broadcast)
@@ -2116,9 +2167,13 @@ class MegatronPolicyWorkerImpl(
         topk_indices = broadcasted["topk_indices"]
 
         no_grad.__exit__(None, None, None)
-        return BatchedDataDict.from_batches(
-            [{"topk_logits": topk_logits.cpu(), "topk_indices": topk_indices.cpu()}]
-        )
+        result = {
+            "topk_logits": topk_logits.cpu(),
+            "topk_indices": topk_indices.cpu(),
+        }
+        if return_logsumexp:
+            result["V_logsumexp"] = broadcasted["V_logsumexp"].cpu()
+        return BatchedDataDict.from_batches([result])
 
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/prepare_refit_info")
@@ -2263,10 +2318,19 @@ class MegatronPolicyWorkerImpl(
             return self.megatron_bridge._model_bridge.build_export_fp8_tasks(
                 self.megatron_bridge.hf_pretrained, [self.model]
             )
+        # NRL_REFIT_SKIP_MTP=1: drop MTP params from refit entirely. The
+        # nemotron_omni bridge's megatron->HF mapping still misses MTP
+        # layer-norm params on the refit-export path (jobs 6296933, 6371264:
+        # "Unrecognized mapping type" -> TP ranks desync -> ALLGATHER hangs to
+        # the 600s NCCL watchdog in prepare_refit_info). Generation engines
+        # without speculative decoding never consume MTP weights, so skipping
+        # them here (identically on every rank) is safe.
+        skip_mtp = os.environ.get("NRL_REFIT_SKIP_MTP", "0") == "1"
         return [
             task
             for task in self.megatron_bridge.get_conversion_tasks([self.model])
             if task is not None
+            and not (skip_mtp and "mtp." in task.global_param_name)
         ]
 
     def _calculate_refit_param_info(self) -> list[tuple[str, int]]:

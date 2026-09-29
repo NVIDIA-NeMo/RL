@@ -44,6 +44,7 @@ from nemo_rl.data.llm_message_utils import (
     get_keys_from_message_log,
 )
 from nemo_rl.data.multimodal_utils import (
+    ROLLOUT_MATCHED_MEDIA_KEY,
     NATIVE_MULTIMODAL_KEYS,
     VLLM_MULTIMODAL_DATA_KEYS,
     PackedTensor,
@@ -51,6 +52,9 @@ from nemo_rl.data.multimodal_utils import (
     extract_input_images_from_responses_messages,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.environments.nemotron_utils import (
+    verify_static_video_media_alignment,
+)
 from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
     EnvironmentReturn,
@@ -59,7 +63,13 @@ from nemo_rl.environments.nemo_gym import (
     DEFAULT_THINKING_TAGS,
     get_pad_dynamic_image_shapes,
 )
-from nemo_rl.experience.interfaces import NEMO_GYM_TASK_INDEX_KEY
+from nemo_rl.experience.interfaces import (
+    NEMO_GYM_ATTEMPT_INDEX_KEY,
+    NEMO_GYM_ROLLOUT_INDEX_KEY,
+    NEMO_GYM_TARGET_WEIGHT_VERSION_KEY,
+    NEMO_GYM_TASK_INDEX_KEY,
+    NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY,
+)
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.models.generation.interfaces import (
     ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
@@ -207,20 +217,48 @@ def _reattach_original_multimodal_payloads(
 def _reattach_static_multimodal_payloads_to_result(
     result: dict[str, Any],
     source_message_log: list[dict[str, Any]],
+    tokenizer: Any = None,
 ) -> None:
-    """Restore static media to each Gym-authored message-log representation."""
+    """Restore static media to each Gym-authored message-log representation.
+
+    ``input_message_log`` is a slice of ``message_log``, so the two views alias
+    the same message dictionaries; share one processed-id set so each message
+    is handled once and a rollout-matched marker consumed while processing one
+    view cannot expose the same message to overwriting via the other.
+    """
+    processed_target_ids: set[int] = set()
     for log_key in ("input_message_log", "message_log"):
         target_log = result.get(log_key)
         if not target_log:
             continue
-        attach_static_multimodal_payload(target_log, source_message_log)
+        attach_static_multimodal_payload(
+            target_log,
+            source_message_log,
+            processed_target_ids=processed_target_ids,
+            tokenizer=tokenizer,
+        )
 
 
 def attach_static_multimodal_payload(
     target_message_log: list[dict[str, Any]],
     source_message_log: list[dict[str, Any]],
+    processed_target_ids: "set[int] | None" = None,
+    tokenizer: Any = None,
 ) -> None:
-    """Copy policy-ready media from static source turns to Gym-authored turns."""
+    """Copy policy-ready media from static source turns to Gym-authored turns.
+
+    Callers that attach to several views of the same rollout (e.g. a result's
+    ``input_message_log`` and ``message_log``, or a prompt log and its
+    completions) may alias the same message dictionaries across views. Pass one
+    shared ``processed_target_ids`` set across those calls: each unique message
+    is then processed exactly once, so a rollout-matched marker consumed on the
+    first view cannot leave later views free to overwrite the repaired media.
+
+    When ``tokenizer`` is provided, video turns are verified before the copy:
+    the rollout's placeholder expansion must match the static tensors, or the
+    attach raises a diagnostic naming the mismatch instead of letting training
+    crash on unattributable media misalignment.
+    """
     source_users = [
         message for message in source_message_log if message.get("role") == "user"
     ]
@@ -233,6 +271,19 @@ def attach_static_multimodal_payload(
             "turns than the source prompt."
         )
     for source, target in zip(source_users, target_users):
+        if processed_target_ids is not None:
+            if id(target) in processed_target_ids:
+                continue
+            processed_target_ids.add(id(target))
+        if target.pop(ROLLOUT_MATCHED_MEDIA_KEY, False):
+            # The Gym actor attached rollout-matched media for this turn (e.g.
+            # after vetoing dedup omission on a budget-bound row); never
+            # overwrite it with the statically-budgeted prompt copy. Key
+            # presence alone is not provenance: targets may carry placeholder
+            # or stale payloads that this copy is expected to replace.
+            continue
+        if tokenizer is not None:
+            verify_static_video_media_alignment(source, target, tokenizer)
         for key, value in source.items():
             if isinstance(value, PackedTensor) or key in NATIVE_MULTIMODAL_KEYS:
                 target[key] = value
@@ -2225,8 +2276,10 @@ def _prepare_nemo_gym_rows(
     rows: list[dict],
     generation_config: GenerationConfig,
     sampling_params: GenerationSamplingParams,
+    target_weight_version: Optional[int] = None,
 ) -> None:
     """Apply NeMo-RL sampling parameters and stable row indices in place."""
+    next_rollout_index_by_task: dict[Any, int] = defaultdict(int)
     for row_index, row in enumerate(rows):
         responses_create_params = row.get("responses_create_params")
         if not isinstance(responses_create_params, dict):
@@ -2244,6 +2297,16 @@ def _prepare_nemo_gym_rows(
             else configured_max_tokens
         )
         row["_rowidx"] = row_index
+
+        task_index = row.get(NEMO_GYM_TASK_INDEX_KEY)
+        if task_index is not None:
+            row[NEMO_GYM_ROLLOUT_INDEX_KEY] = next_rollout_index_by_task[task_index]
+            next_rollout_index_by_task[task_index] += 1
+
+        if target_weight_version is None:
+            row.pop(NEMO_GYM_TARGET_WEIGHT_VERSION_KEY, None)
+        else:
+            row[NEMO_GYM_TARGET_WEIGHT_VERSION_KEY] = target_weight_version
 
 
 def _tensorize_nemo_gym_result(result: dict) -> None:
@@ -2281,6 +2344,7 @@ async def run_async_nemo_gym_rollout(
     sampling_params: Optional[GenerationSamplingParams] = None,
     deduplicate_multimodal_data: bool = False,
     debug_payload_metrics: bool = False,
+    target_weight_version: Optional[int] = None,
 ) -> AsyncGenerator[NemoGymRolloutResult, None]:
     """Stream complete NeMo-Gym prompt groups in group-completion order.
 
@@ -2322,6 +2386,8 @@ async def run_async_nemo_gym_rollout(
             remote Gym return and restore the exact original payload locally.
         debug_payload_metrics: Emit logical, physical, and serialized media
             payload metrics at the Gym Ray boundary.
+        target_weight_version: Opaque async-RL target version forwarded through
+            Gym to every trainable generation request. ``None`` omits the field.
 
     Yields:
         ``NemoGymRolloutResult`` objects in prompt-group completion order. Rows
@@ -2411,7 +2477,12 @@ async def run_async_nemo_gym_rollout(
     run_rollouts_timer_label = f"{timer_prefix}/run_rollouts"
 
     with timer.time(total_timer_label):
-        _prepare_nemo_gym_rows(nemo_gym_rows, generation_config, sampling_params)
+        _prepare_nemo_gym_rows(
+            nemo_gym_rows,
+            generation_config,
+            sampling_params,
+            target_weight_version=target_weight_version,
+        )
         accumulator = _NemoGymStreamAccumulator(
             rows=nemo_gym_rows,
             num_generations=num_generations,
@@ -2469,7 +2540,7 @@ async def run_async_nemo_gym_rollout(
                 completed_group = accumulator.add(rowidx, result)
                 if original_message_logs is not None:
                     _reattach_static_multimodal_payloads_to_result(
-                        result, original_message_logs[rowidx]
+                        result, original_message_logs[rowidx], tokenizer
                     )
                     result.pop("_initial_multimodal_data_omitted", None)
                 if completed_group is not None:
@@ -2867,19 +2938,20 @@ def _postprocess_single_nemo_gym_group(
     # Per-agent misc metrics
     with timer.time(f"{timer_prefix}/per_agent_misc_metrics"):
         agent_to_results: dict[str, list[dict]] = defaultdict(list)
-        agent_to_truncations: dict[str, list[bool]] = defaultdict(list)
+        agent_to_sample_metrics: dict[str, list[dict]] = defaultdict(list)
         for nemo_gym_row, result, sample_metrics in zip(
             nemo_gym_rows, results, all_sample_metrics
         ):
             agent_ref = nemo_gym_row["agent_ref"]
             agent_name = agent_ref["name"]
             agent_to_results[agent_name].append(result["full_result"])
-            agent_to_truncations[agent_name].append(sample_metrics["hit_max_tokens"])
+            agent_to_sample_metrics[agent_name].append(sample_metrics)
             result["agent_ref"] = agent_ref
 
         per_agent_metrics = {}
         for agent_name, agent_results in agent_to_results.items():
-            agent_truncations = agent_to_truncations[agent_name]
+            agent_sample_metrics = agent_to_sample_metrics[agent_name]
+            agent_truncations = [m["hit_max_tokens"] for m in agent_sample_metrics]
             per_agent_metrics[f"{agent_name}/truncation_rate"] = sum(
                 agent_truncations
             ) / len(agent_truncations)
@@ -2899,6 +2971,23 @@ def _postprocess_single_nemo_gym_group(
                             values, len(values), f"{agent_name}/{key}"
                         )
                     )
+
+            # Emit authoritative live token metrics after full-result metrics so
+            # similarly named environment metadata cannot overwrite them.
+            per_agent_metrics.update(
+                calculate_single_metric(
+                    [m["total_tokens"] for m in agent_sample_metrics],
+                    len(agent_sample_metrics),
+                    f"{agent_name}/total_tokens_per_sample",
+                )
+            )
+            per_agent_metrics.update(
+                calculate_single_metric(
+                    [m["assistant_tokens"] for m in agent_sample_metrics],
+                    len(agent_sample_metrics),
+                    f"{agent_name}/gen_tokens_per_sample",
+                )
+            )
 
             if log_full_result_tables:
                 to_log = [
@@ -2949,6 +3038,27 @@ def _postprocess_single_nemo_gym_group(
             ),
         }
     )
+    empty_response_output = torch.tensor(
+        [bool(r.get(NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY, False)) for r in results],
+        dtype=torch.bool,
+    )
+    # Keep this column on every NeMo-Gym prompt group. Async replay collation is
+    # intentionally strict about non-packed keys, so conditionally omitting an
+    # all-false group would make a later mixed normal/recovered batch fail.
+    final_batch[NEMO_RL_EMPTY_RESPONSE_OUTPUT_KEY] = empty_response_output
+    # Preserve compact, row-aligned rollout identity through dynamic sampling
+    # and the async replay buffer. Missing fields are omitted rather than
+    # guessed, retaining compatibility with native and legacy rollout inputs.
+    for identity_key in (
+        NEMO_GYM_TASK_INDEX_KEY,
+        NEMO_GYM_ROLLOUT_INDEX_KEY,
+        NEMO_GYM_ATTEMPT_INDEX_KEY,
+    ):
+        identity_values = [row.get(identity_key) for row in nemo_gym_rows]
+        if identity_values and all(value is not None for value in identity_values):
+            final_batch[identity_key] = torch.tensor(
+                [int(value) for value in identity_values], dtype=torch.long
+            )
     # Env/agent mask flag: flagged samples are dropped from the loss but still
     # count for advantages. env.should_mask_flagged_samples=false skips this.
     if mask_env_flagged_samples:

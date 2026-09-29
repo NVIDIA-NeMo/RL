@@ -28,8 +28,11 @@ Reference papers:
 - MOPD: https://arxiv.org/abs/2601.02780
 """
 
+import math
+from typing import Annotated
+
 import torch
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.utils import (
@@ -52,6 +55,9 @@ class AdvEstimatorConfig(BaseModel, extra="allow"):
     reward_weights: list[float] | None = None
     # Reinforce++ specific
     minus_baseline: bool = True
+    # OPD specific
+    proximal_teacher_alpha: Annotated[float, Field(gt=0.0, le=1.0)] = 1.0
+    subtract_global_baseline: bool = False
 
 
 class GRPOAdvantageEstimator:
@@ -570,7 +576,13 @@ class OPDAdvantageEstimator:
         prev_logprobs: [B, S] student training-engine log probabilities
     """
 
-    def __init__(self, estimator_config: dict, loss_config: dict):
+    def __init__(
+        self,
+        estimator_config: AdvEstimatorConfig,
+        loss_config: ClippedPGLossConfig,
+    ):
+        self.proximal_teacher_alpha = estimator_config.proximal_teacher_alpha
+        self.subtract_global_baseline = estimator_config.subtract_global_baseline
         self.last_metrics: dict[str, float] = {}
 
     def compute_advantage(
@@ -599,14 +611,34 @@ class OPDAdvantageEstimator:
         if prev_logprobs is None:
             raise ValueError("OPD requires prev_logprobs")
 
-        # Â_MOPD,t = sg[log π_teacher - log π_student]  (Equation 8)
-        distill_advantages = (teacher_logprobs - prev_logprobs).detach()
+        # Diagnostics retain the raw gap even when TROPD changes the training signal.
+        raw_teacher_student_gap = (teacher_logprobs - prev_logprobs).detach()
+
+        # TROPD proximal teacher (Eq. 5). Alpha=1 is exactly legacy MOPD.
+        if self.proximal_teacher_alpha == 1.0:
+            distill_advantages = raw_teacher_student_gap
+        else:
+            alpha = self.proximal_teacher_alpha
+            proximal_teacher_logprobs = torch.logaddexp(
+                teacher_logprobs + math.log(alpha),
+                prev_logprobs + math.log1p(-alpha),
+            )
+            distill_advantages = (proximal_teacher_logprobs - prev_logprobs).detach()
+
+        if self.subtract_global_baseline:
+            valid_advantages = torch.masked_select(distill_advantages, mask.bool())
+            baseline = (
+                valid_advantages.mean()
+                if valid_advantages.numel() > 0
+                else distill_advantages.new_zeros(())
+            )
+            distill_advantages = distill_advantages - baseline
 
         # Apply mask
         advantages = distill_advantages * mask
 
         # Metrics
-        self._compute_metrics(distill_advantages, advantages, mask)
+        self._compute_metrics(raw_teacher_student_gap, advantages, mask)
 
         return advantages
 

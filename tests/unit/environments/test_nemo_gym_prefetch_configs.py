@@ -131,6 +131,44 @@ def test_prefetch_configs_exist():
 
 
 @pytest.mark.parametrize(
+    "server_dir",
+    [
+        "resources_servers/sav_tracks",
+        "resources_servers/citation_if",
+        "resources_servers/conversational_tool_use_simulation",
+        "responses_api_agents/conversational_tool_use/simulation",
+        "responses_api_agents/non_executing_simple_agent",
+    ],
+)
+def test_super35_prefetch_covers_new_service_venvs(server_dir: str) -> None:
+    """Every new service must have an entrypoint in the bundled prefetch configs."""
+    # Gym is optional outside the nemo_gym test suite.
+    gym = pytest.importorskip("nemo_gym")
+    config = load_config(
+        os.path.join(
+            REPO_ROOT, "examples", "nemo_gym", "prefetch_super35_all_envs.yaml"
+        )
+    )["env"]["nemo_gym"]
+    bundled = OmegaConf.merge(
+        *(OmegaConf.load(gym.PARENT_DIR / path) for path in config["config_paths"])
+    )
+    server_type, server_name = server_dir.split("/", 1)
+    blocks = [
+        server[server_type][server_name]
+        for server in bundled.values()
+        if OmegaConf.is_dict(server)
+        and server_type in server
+        and server_name in server[server_type]
+    ]
+    assert any(block.get("entrypoint") for block in blocks), (
+        f"Super35 prefetch does not install {server_dir}"
+    )
+    for block in blocks:
+        if block.get("entrypoint"):
+            assert (gym.PARENT_DIR / server_dir / block["entrypoint"]).is_file()
+
+
+@pytest.mark.parametrize(
     ("config_path", "server_name", "server_type"), _prefetch_block_ids()
 )
 def test_prefetch_model_servers_satisfy_gym_config(

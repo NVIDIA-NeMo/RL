@@ -71,7 +71,13 @@ def _prepare_multimodal_sharing(
             return
         if isinstance(item, dict):
             content_type = item.get("type")
-            typed_media = content_type in MULTIMODAL_CONTENT_TYPES
+            # "type" is not always a content-type string: text rows carry tool
+            # / JSON-schema dicts where item["type"] is itself a dict, which is
+            # unhashable and crashed the set-membership test (job 6501398).
+            typed_media = (
+                isinstance(content_type, str)
+                and content_type in MULTIMODAL_CONTENT_TYPES
+            )
             for key, child in item.items():
                 visit(
                     child,

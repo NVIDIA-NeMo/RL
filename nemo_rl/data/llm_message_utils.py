@@ -36,6 +36,26 @@ Tensor = torch.Tensor
 TokenizerType = PreTrainedTokenizerBase
 
 
+def _routed_experts_ref_segments(value: Any) -> list[dict[str, Any]] | None:
+    """Normalize one message's Ray-backed route value to logical slices."""
+    # Keep Ray and the router-replay implementation off this common module's
+    # import path unless a reference-backed rollout is actually flattened.
+    from nemo_rl.utils.routed_experts_ref import (
+        is_routed_experts_ref,
+        validate_routed_experts_ref,
+    )
+
+    if is_routed_experts_ref(value):
+        return [validate_routed_experts_ref(value)]
+    if (
+        isinstance(value, list)
+        and value
+        and all(is_routed_experts_ref(segment) for segment in value)
+    ):
+        return [validate_routed_experts_ref(segment) for segment in value]
+    return None
+
+
 def _validated_packed_values(key: str, values: list[Any]) -> list[PackedTensor]:
     """Return packed values while rejecting mixed non-empty representations."""
     if not any(isinstance(value, PackedTensor) for value in values):
@@ -125,6 +145,22 @@ def message_log_to_flat_messages(
     # Concatenate tensors for each key
     concat: FlatMessagesType = {}
     for key in result:
+        if key == "routed_experts" and result[key]:
+            reference_segments = [
+                _routed_experts_ref_segments(value) for value in result[key]
+            ]
+            if any(segments is not None for segments in reference_segments):
+                if any(segments is None for segments in reference_segments):
+                    raise TypeError(
+                        "routed_experts cannot mix Ray references with another "
+                        "representation in one message log"
+                    )
+                concat[key] = [
+                    segment
+                    for segments in reference_segments
+                    for segment in cast(list[dict[str, Any]], segments)
+                ]
+                continue
         if result[key] and isinstance(result[key][0], Tensor):
             try:
                 concat[key] = torch.cat(result[key])

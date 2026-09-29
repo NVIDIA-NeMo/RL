@@ -66,6 +66,7 @@ class TaskDataSpec:
     video_temporal_patch_size: Optional[int] = None
     video_maintain_aspect_ratio: Optional[bool] = None
     min_generation_tokens: Optional[int] = None
+    image_max_num_tiles: Optional[int] = None
 
     def __post_init__(self) -> None:
         def load_prompt_file(
