@@ -562,6 +562,7 @@ jobs:
         ${{ vars.UV_BUILD_CACHE == 'enabled' && format('uv-cache-seed=docker-image://{0}/{1}:uv-cache', needs.org-member-pre-flight.outputs.registry, vars.CI_CONTAINER_NAME) || '' }}
       trtllm-ccache-tag: ${{ vars.TRTLLM_BUILD_CACHE == 'enabled' && 'trtllm-ccache' || '' }}
       trtllm-wheel-cache-tag: ${{ vars.TRTLLM_BUILD_CACHE == 'enabled' && 'trtllm-wheel-cache' || '' }}
+      uv-cache-tag: ${{ vars.UV_BUILD_CACHE == 'enabled' && 'uv-cache' || '' }}
       megatron-lm-commit: ${{ needs.pre-flight.outputs.megatron_lm_commit }}
       megatron-lock-artifact: ${{ needs.prepare-megatron-lock.outputs.artifact_name }}
       build-args: |
@@ -610,78 +611,13 @@ jobs:
         ${{ vars.UV_BUILD_CACHE == 'enabled' && format('uv-cache-seed=docker-image://{0}/{1}:uv-cache', needs.gb200-config.outputs.registry, vars.CI_CONTAINER_NAME) || '' }}
       trtllm-ccache-tag: ${{ vars.TRTLLM_BUILD_CACHE == 'enabled' && 'trtllm-ccache' || '' }}
       trtllm-wheel-cache-tag: ${{ vars.TRTLLM_BUILD_CACHE == 'enabled' && 'trtllm-wheel-cache' || '' }}
+      uv-cache-tag: ${{ vars.UV_BUILD_CACHE == 'enabled' && 'uv-cache' || '' }}
       megatron-lm-commit: ${{ needs.pre-flight.outputs.megatron_lm_commit }}
       megatron-lock-artifact: ${{ needs.prepare-megatron-lock.outputs.artifact_name }}
       build-args: |
         MAX_JOBS=4
         TRTLLM_BUILD_JOBS=8
         NEMO_RL_COMMIT=${{ needs.pre-flight.outputs.test_sha }}
-
-  update-uv-cache:
-    name: Update uv build cache
-    needs: [build-container, org-member-pre-flight]
-    if: >-
-      ${{
-        github.ref == 'refs/heads/main' &&
-        vars.UV_BUILD_CACHE == 'enabled' &&
-        needs.build-container.result == 'success'
-      }}
-    runs-on: ${{ startsWith(needs.org-member-pre-flight.outputs.runner_prefix, 'ephe-v2-') && format('{0}-a{1}', needs.org-member-pre-flight.outputs.runner_prefix, github.run_attempt) || needs.org-member-pre-flight.outputs.runner_prefix }}
-    env:
-      REGISTRY: ${{ needs.org-member-pre-flight.outputs.registry }}
-      IMAGE_NAME: ${{ vars.CI_CONTAINER_NAME }}
-    steps:
-      - name: Extract and push uv cache image
-        run: |
-          set -euo pipefail
-          SRC="${REGISTRY}/${IMAGE_NAME}:${{ github.run_id }}"
-          DST="${REGISTRY}/${IMAGE_NAME}:uv-cache"
-
-          docker pull "${SRC}"
-          CID=$(docker create "${SRC}" true)
-          mkdir -p /tmp/uv-cache
-          docker cp "${CID}:/root/.cache/uv/." /tmp/uv-cache/
-          docker rm "${CID}"
-
-          printf 'FROM scratch\nCOPY uv-cache/ /\n' > /tmp/Dockerfile.uv-cache
-          docker build -t "${DST}" -f /tmp/Dockerfile.uv-cache /tmp
-          docker push "${DST}"
-
-          docker rmi "${SRC}" "${DST}" 2>/dev/null || true
-          rm -rf /tmp/uv-cache /tmp/Dockerfile.uv-cache
-
-  update-uv-cache-gb200:
-    name: Update GB200 uv build cache
-    needs: [build-container-gb200, gb200-config]
-    if: >-
-      ${{
-        github.ref == 'refs/heads/main' &&
-        vars.UV_BUILD_CACHE == 'enabled' &&
-        needs.build-container-gb200.result == 'success'
-      }}
-    runs-on: ${{ vars.GB200_RUNNER }}
-    env:
-      REGISTRY: ${{ needs.gb200-config.outputs.registry }}
-      IMAGE_NAME: ${{ vars.CI_CONTAINER_NAME }}
-    steps:
-      - name: Extract and push uv cache image
-        run: |
-          set -euo pipefail
-          SRC="${REGISTRY}/${IMAGE_NAME}:${{ github.run_id }}"
-          DST="${REGISTRY}/${IMAGE_NAME}:uv-cache"
-
-          docker pull "${SRC}"
-          CID=$(docker create "${SRC}" true)
-          mkdir -p /tmp/uv-cache
-          docker cp "${CID}:/root/.cache/uv/." /tmp/uv-cache/
-          docker rm "${CID}"
-
-          printf 'FROM scratch\nCOPY uv-cache/ /\n' > /tmp/Dockerfile.uv-cache
-          docker build -t "${DST}" -f /tmp/Dockerfile.uv-cache /tmp
-          docker push "${DST}"
-
-          docker rmi "${SRC}" "${DST}" 2>/dev/null || true
-          rm -rf /tmp/uv-cache /tmp/Dockerfile.uv-cache
 
   cicd-doc-tests:
     strategy:

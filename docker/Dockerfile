@@ -46,6 +46,7 @@ FROM scratch AS trtllm-ccache-seed
 # empty when periodically compacting the cache into a full snapshot.
 FROM scratch AS trtllm-wheel-cache-output-base
 FROM scratch AS trtllm-ccache-output-base
+FROM scratch AS uv-cache-output-base
 
 # Default custom-setup stage: installs apptainer.
 # Override with: --build-context custom-setup=<your-dir>
@@ -225,14 +226,17 @@ COPY --from=nemo-rl --link \
     3rdparty/ ./3rdparty/
 
 RUN --mount=type=ssh \
-    --mount=type=bind,from=uv-cache-seed,source=.,target=/tmp/uv-cache-seed <<"EOF" bash -exu
+    --mount=type=bind,from=uv-cache-seed,source=.,target=/tmp/uv-cache-seed \
+    --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE},target=/root/.cache/uv,sharing=locked <<"EOF" bash -exu
 CACHE_KEY=$(echo "${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE}" | md5sum | cut -c1-12)
 SEED_KEY=$(cat /tmp/uv-cache-seed/.cache-key 2>/dev/null || echo "")
+# The cache mount above is per-builder/per-runner local storage and persists
+# across builds on its own; the bind-mounted seed exists so cold (ephemeral,
+# e.g. GitHub Actions) runners still warm-start instead of hitting PyPI fresh.
 if [ -n "$SEED_KEY" ] && [ "$SEED_KEY" != "$CACHE_KEY" ]; then
     echo "Cache key mismatch (base image, uv version, or build mode changed) — skipping stale seed"
-elif [ -n "$SEED_KEY" ]; then
+elif [ -n "$SEED_KEY" ] && [ -z "$(find /root/.cache/uv -mindepth 1 -print -quit)" ]; then
     echo "Seeding uv cache (key=${CACHE_KEY})"
-    mkdir -p /root/.cache/uv
     rsync -a --exclude='.cache-key' /tmp/uv-cache-seed/ /root/.cache/uv/ 2>/dev/null || true
 fi
 
@@ -588,6 +592,38 @@ for dir in /home/nemo-runtime /nemo_run /opt/nemo-rl "${UV_PROJECT_ENVIRONMENT}"
 done
 EOF
 USER root
+
+# Export the builder-local uv cache as a separate scratch image, same pattern
+# as the TRT-LLM ccache/wheel-cache below. CI builds this target immediately
+# after the release target with the same Buildx builder, so it can read the
+# cache mount without the uv/pip download cache ever entering the release image.
+FROM base AS uv-cache-export
+ARG BASE_IMAGE
+ARG TARGETARCH
+ARG UV_VERSION=0.11.28
+ARG UV_CACHE_EXPORT_NONCE
+RUN --mount=type=bind,from=uv-cache-seed,source=.,target=/tmp/uv-cache-seed \
+    --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE},target=/root/.cache/uv,sharing=locked <<"EOF" bash -exu
+echo "Exporting uv cache for build ${UV_CACHE_EXPORT_NONCE:-local}"
+# The hermetic layer may have been reused from BuildKit without executing its
+# RUN command, leaving this builder-local mount empty. Restore the seed only in
+# that case; unconditionally merging it would resurrect wheels uv evicted.
+if [[ -z "$(find /root/.cache/uv -mindepth 1 -print -quit)" ]]; then
+    rsync -a --exclude='.cache-key' /tmp/uv-cache-seed/ /root/.cache/uv/
+fi
+mkdir -p /tmp/uv-cache-export
+cp -a /root/.cache/uv/. /tmp/uv-cache-export/
+# HYBRID_EP_MULTINODE is a fixed ENV (=1) in the hermetic stage, not a build
+# arg, so it's a constant here too — keep this formula in sync with the
+# CACHE_KEY computation in the hermetic stage's uv-sync RUN block.
+echo "${BASE_IMAGE}-${UV_VERSION}-1" | md5sum | cut -c1-12 > /tmp/uv-cache-export/.cache-key
+echo "uv cache export payload:"
+du -sh /tmp/uv-cache-export
+EOF
+
+FROM uv-cache-output-base AS uv-cache
+COPY --link --from=uv-cache-export /tmp/uv-cache-export/ /
+LABEL com.nvidia.nemo-rl.cache-layout="uv-v1"
 
 # Export the builder-local ccache as a separate scratch image. CI builds this
 # target immediately after the release target with the same Buildx builder, so
