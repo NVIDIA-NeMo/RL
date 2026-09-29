@@ -115,11 +115,14 @@ RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.ru
     && rustc --version \
     && cargo --version
 
-# Install uv and python
+# Install uv and python outside /root so an unprivileged runtime UID (for example
+# 65532) can execute them: /root is not traversable by other users, and the project
+# venv's python is a symlink into uv's managed-Python directory.
 ARG UV_VERSION=0.11.28
 ARG PYTHON_VERSION=3.13.14
-ENV PATH="/root/.local/bin:$PATH"
-RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh && \
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
+RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh \
+        | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh && \
     uv python install ${PYTHON_VERSION}
 
 # Disable usage stats by default for users who are sensitive to sharing usage.
@@ -147,6 +150,12 @@ ARG NVTE_BUILD_MAX_JOBS=8
 ARG NVTE_BUILD_THREADS_PER_JOB=2
 ARG NVTE_CUDA_ARCHS=90;100
 ARG NVTE_FRAMEWORK=pytorch
+# TE 2.18 enables its experimental NCCL-EP backend by default on Hopper and
+# newer GPUs. Current recipes use Megatron Core's standard token dispatcher,
+# so retain the existing capability set and avoid requiring matching system
+# NCCL-EP headers. Custom NCCL-EP experiments can opt in explicitly with
+# ``--build-arg NVTE_WITH_NCCL_EP=1``.
+ARG NVTE_WITH_NCCL_EP=0
 # Only use for custom vllm installs. Learn more at https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/use-custom-vllm.md
 ARG BUILD_CUSTOM_VLLM
 ARG BUILD_CUSTOM_VLLM_URL
@@ -359,6 +368,11 @@ rsync -a --ignore-existing /tmp/trtllm-ccache-seed/ "${CCACHE_DIR}/"
 
 # uv uses the shared image cache. Only the custom wheel needs a cache mount
 # because uv can miss no-build-isolation wheels across build environments.
+# The mount is builder-local scratch: it is not part of this layer, so a later
+# stage cannot rely on it -- when this RUN is served from the BuildKit layer
+# cache the mount stays empty. The build below therefore also mirrors the
+# current content-addressed wheel into /opt/trtllm_wheels, which IS part of this
+# layer; the release stage and runtime `uv run --extra trtllm` read it from there.
 echo "TRT-LLM cache state before build:"
 du -sh /root/.cache/uv /root/.cache/trtllm-wheels
 
@@ -369,8 +383,15 @@ set +e
 # and churning it here would copy files up into this layer.
 # The throwaway venv must be symlink-mode: hardlinks to files in the dependency layer's uv
 # cache make overlayfs copy them up into this layer, and the copies outlive the rm -rf below.
+# TRTLLM_WHEEL_CACHE_MIRROR_DIR keeps a copy of the wheel in this image layer.
+# CI creates a fresh buildx builder for every job, so the cache mount above only
+# lives for the duration of one build: when a later build reuses this layer from
+# the registry cache and re-executes the release stage (any NeMo-RL source
+# change does that), the mount is empty there. The release stage reads the
+# wheel from this mirror instead of failing on TRTLLM_REQUIRE_CACHED_WHEEL.
 UV_CACHE_DIR=/root/.cache/uv \
     TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-wheels \
+    TRTLLM_WHEEL_CACHE_MIRROR_DIR=/opt/trtllm_wheels \
     UV_PROJECT_ENVIRONMENT=/tmp/trtllm-build-venv \
     uv sync --verbose --link-mode symlink --locked --extra trtllm --no-install-project \
     2>&1 | tee "$TRTLLM_SYNC_LOG" \
@@ -484,14 +505,13 @@ EOF
 # Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),
 # so do a quick check before trying to unshallow.
 RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
-ARG BASE_IMAGE
-RUN --mount=type=cache,id=trtllm-wheel-cache-${TARGETARCH}-${BASE_IMAGE},from=trtllm-wheel-cache-seed,source=.,target=/root/.cache/trtllm-wheels,sharing=locked <<"EOF" bash -exu
-# Reuse the custom wheel produced by the hermetic stage. Normal uv artifacts
-# stay in /root/.cache/uv, which remains available to symlinked environments.
-# Mirror only the current content-addressed TRT-LLM wheel into the image so
-# runtime `uv run --extra trtllm` calls do not fall back to a source build.
-export TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-wheels
-export TRTLLM_WHEEL_CACHE_MIRROR_DIR=/opt/trtllm_wheels
+RUN <<"EOF" bash -exu
+# Reuse the custom wheel the hermetic stage mirrored into /opt/trtllm_wheels
+# (the runtime default of the TRT-LLM build backend). It lives in that layer,
+# so it is present whether the TRT-LLM RUN executed on this builder or was
+# restored from the layer cache; do not read it from the builder-local cache
+# mount here. Normal uv artifacts stay in /root/.cache/uv.
+export TRTLLM_WHEEL_CACHE_DIR=/opt/trtllm_wheels
 export TRTLLM_REQUIRE_CACHED_WHEEL=1
 # Worker-venv prefetch, phase 2: the nemo_rl project itself.
 #
@@ -542,6 +562,32 @@ RUN python tools/generate_fingerprint.py > /opt/nemo_rl_container_fingerprint
 # NOTICES.txt file points to where the OSS source code is archived
 RUN echo "This distribution includes open source which is archived at the following URL: https://opensource.nvidia.com/oss/teams/nvidia/nemo-rl/${RC_DATE}:linux-${TARGETARCH}/index.html" > NOTICES.txt && \
     echo "For further inquiries or assistance, contact us at oss-requests@nvidia.com" >> NOTICES.txt
+
+# Let an unprivileged runtime UID (for example 65532, the NeMo CI agent workloads) run this
+# image, which stays root by default. Create its home and the writable runtime paths callers
+# point caches and sources at, and hand it the prebuilt environment roots so it can create
+# entries there. Only the directories change owner: a recursive chown would copy every
+# hardlinked venv file into this layer.
+ARG RUNTIME_UID=65532
+ARG RUNTIME_GID=65532
+RUN <<"EOF" bash -exu
+getent group "${RUNTIME_GID}" >/dev/null || groupadd --gid "${RUNTIME_GID}" nemo-runtime
+getent passwd "${RUNTIME_UID}" >/dev/null || useradd --no-log-init --uid "${RUNTIME_UID}" \
+    --gid "${RUNTIME_GID}" --create-home --home-dir /home/nemo-runtime --shell /bin/bash nemo-runtime
+install -d -o "${RUNTIME_UID}" -g "${RUNTIME_GID}" /home/nemo-runtime /nemo_run \
+    "${NEMO_GYM_VENV_DIR}" /opt/nemo-rl-source /opt/nemo_rl_cache/uv /opt/nemo_rl_python
+chown "${RUNTIME_UID}:${RUNTIME_GID}" /opt/nemo-rl "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}"
+EOF
+USER ${RUNTIME_UID}:${RUNTIME_GID}
+RUN <<"EOF" bash -exu
+uv --version
+"${UV_PROJECT_ENVIRONMENT}/bin/python" --version
+for dir in /home/nemo-runtime /nemo_run /opt/nemo-rl "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}" \
+        "${NEMO_GYM_VENV_DIR}" /opt/nemo-rl-source /opt/nemo_rl_cache/uv /opt/nemo_rl_python; do
+    test -w "${dir}"
+done
+EOF
+USER root
 
 # Export the builder-local ccache as a separate scratch image. CI builds this
 # target immediately after the release target with the same Buildx builder, so
@@ -605,8 +651,8 @@ ARG WHEEL_CACHE_EXPORT_NONCE
 RUN --mount=type=bind,from=trtllm-wheel-cache-seed,source=.,target=/tmp/trtllm-wheel-cache-seed \
     --mount=type=cache,id=trtllm-wheel-cache-${TARGETARCH}-${BASE_IMAGE},from=trtllm-wheel-cache-seed,source=.,target=/root/.cache/trtllm-wheels,sharing=locked <<"EOF" bash -exu
 echo "Exporting TRT-LLM wheel cache for build ${WHEEL_CACHE_EXPORT_NONCE:-local} (${WHEEL_CACHE_EXPORT_MODE})"
-# If the release RUN was a BuildKit cache hit, restore the seed into a fresh
-# builder-local mount before exporting it.
+# If the hermetic TRT-LLM RUN was a BuildKit cache hit, this builder-local mount is empty;
+# restore the seed before exporting it.
 if [[ -z "$(find /root/.cache/trtllm-wheels -mindepth 1 -print -quit)" ]]; then
     rsync -a /tmp/trtllm-wheel-cache-seed/ /root/.cache/trtllm-wheels/
 fi

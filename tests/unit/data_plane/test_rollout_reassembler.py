@@ -146,11 +146,12 @@ def test_finalize_rollout_rejections(tq_client, partitions):
         finalizer.finalize_rollout("rej_a", poisoned, reward=0.0).rejection_reason
         == "capture_poisoned"
     )
+    # Gym's RolloutReceipt forbids an unpoisoned receipt without a terminal call,
+    # so an empty manifest fails schema validation before any finalizer check.
     empty = dict(receipt, manifest=[], terminal_model_call_id=None)
     assert (
-        finalizer.finalize_rollout("rej_a", empty, reward=0.0).rejection_reason
-        == "empty_manifest"
-    )
+        finalizer.finalize_rollout("rej_a", empty, reward=0.0).rejection_reason or ""
+    ).startswith("invalid_receipt:")
     wrong_identity = finalizer.finalize_rollout("someone_else", receipt, reward=0.0)
     assert (wrong_identity.rejection_reason or "").startswith("identity_mismatch")
 
@@ -255,6 +256,58 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
     # The finalizer cleared its staged rows after publishing.
     with pytest.raises(KeyError):
         finalizer._source.fetch([receipt["manifest"][0]["staging_key"]])
+
+
+def test_finalize_group_skips_unset_terminal_selection(tq_client, partitions):
+    group_id = "grp_unset"
+    receipt, expected = _stage_fixture(
+        tq_client, "worked_example", rollout_id=f"{group_id}_g0"
+    )
+    receipt["rollout_id"] = f"{group_id}_g0"
+    assert receipt["terminal_selection"] == "declared"
+    # A manifest that never parsed ran no attribution stage, so the receipt
+    # carries terminal_selection=None (Gym #2823, pinned 9fc05c0f) rather than a method.
+    unset = {
+        "rollout_id": f"{group_id}_g1",
+        "reward": 0.0,
+        "terminal_model_call_id": None,
+        "manifest": [],
+        "capture_poisoned": True,
+        "failure_reason": "invalid_manifest_row",
+        "terminal_selection": None,
+        "terminal_attribution_reason": None,
+    }
+    rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
+
+    finalizer = _finalizer(tq_client, max_seq_len=len(expected.token_ids))
+    finalized = finalizer.finalize_group(
+        group_id,
+        rollout_ids,
+        [receipt, unset],
+        [1.0, 0.0],
+        mask_sample=[True, False],
+        fallback_weight_version=9,
+        prompt_idx=3,
+        loss_multiplier=1.0,
+    )
+    assert not finalized.dropped
+    metrics = finalized.metrics
+    # The unset receipt still counts toward the group-wide totals ...
+    assert metrics["finalize/invalid_row_rate"] == 0.5
+    assert metrics["finalize/capture_poisoned_rollouts"] == 1.0
+    assert metrics["finalize/capture_failure_reason_rollout_failed_count"] == 1.0
+    assert metrics["finalize/terminal_selection_declared_count"] == 1.0
+    assert metrics["finalize/terminal_selection_declared_fraction"] == 0.5
+    assert metrics["finalize/terminal_selection_heuristic_count"] == 0.0
+    # ... but lands in no per-method bucket: None is not a method, so the
+    # buckets sum to the attributed receipts only and no None key is emitted.
+    assert not [key for key in metrics if "terminal_selection_None" in key]
+    bucket_counts = [
+        value
+        for key, value in metrics.items()
+        if key.startswith("finalize/terminal_selection_") and key.endswith("_count")
+    ]
+    assert sum(bucket_counts) == 1.0
 
 
 def test_finalize_group_maps_physical_attempt_to_stable_canonical_id(

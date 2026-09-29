@@ -80,7 +80,6 @@ env:
 checkpointing:
   checkpoint_dir: checkpoints/grpo-qwen3-8b-base-dapo-2n-long-w4a16
   checkpoint_must_save_by: 00:03:45:00
-  model_save_format: null
 
 logger:
   log_dir: logs/grpo-qwen3-8b-base-dapo-2n-long-w4a16

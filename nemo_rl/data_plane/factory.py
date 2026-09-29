@@ -23,6 +23,7 @@ from nemo_rl.data_plane.interfaces import (
     DataPlaneRuntimeConfig,
     LocalDataPlaneConfig,
 )
+from nemo_rl.telemetry.setup import telemetry_enabled_in_env
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.grpo import MasterConfig
@@ -68,7 +69,7 @@ def make_policy_factory(
     (architectural invariant — see
     ``tests/unit/data_plane/test_architecture_invariants.py``).
     """
-    if not data_plane_enabled(cfg):
+    if cfg is None or not data_plane_enabled(cfg):
         return None
 
     from nemo_rl.models.policy.tq_policy import TQPolicy
@@ -118,7 +119,10 @@ def maybe_configure_data_plane_env(cfg: DataPlaneConfig | None) -> None:
 
 
 def build_data_plane_client(
-    cfg: DataPlaneRuntimeConfig | None, *, bootstrap: bool = True
+    cfg: DataPlaneRuntimeConfig | None,
+    *,
+    bootstrap: bool = True,
+    checkpointing: bool = False,
 ) -> DataPlaneClient:
     """Construct the configured data-plane client.
 
@@ -133,6 +137,9 @@ def build_data_plane_client(
         bootstrap: ``True`` on the driver — bootstraps the TQ
             controller. ``False`` on worker processes — connects to the
             existing controller (avoids creating a second named actor).
+        checkpointing: Prepare storage for saving or restoring data-plane state.
+            Derived by the caller from its existing checkpoint settings and
+            resume path. Only used at bootstrap; workers inherit the mode from TQ.
 
     Returns:
         A configured ``DataPlaneClient``; wrapped in
@@ -160,7 +167,9 @@ def build_data_plane_client(
         from nemo_rl.data_plane.adapters.transfer_queue import TQDataPlaneClient
 
         assert not isinstance(cfg, LocalDataPlaneConfig)
-        client: DataPlaneClient = TQDataPlaneClient(cfg, bootstrap=bootstrap)
+        client: DataPlaneClient = TQDataPlaneClient(
+            cfg, bootstrap=bootstrap, checkpointing=checkpointing
+        )
     elif impl == "local":
         from nemo_rl.data_plane.adapters.local import LocalDataPlaneClient
 
@@ -178,13 +187,18 @@ def build_data_plane_client(
         if isinstance(cfg, LocalDataPlaneConfig)
         else cfg.get("observability")
     ) or {}
-    if obs.get("enabled", False):
-        from nemo_rl.data_plane.observability import (
-            MetricsDataPlaneClient,
-            log_event,
-        )
+    obs_enabled = obs.get("enabled", False)
+    # Telemetry alone installs the wrapper, for its spans.
+    if obs_enabled or telemetry_enabled_in_env():
+        from nemo_rl.data_plane.observability import MetricsDataPlaneClient
 
-        on_event = obs.get("callback") or log_event
+        # Callback and hash check are observability features; off for
+        # telemetry-only runs.
         # pyrefly: obs.get returns Any, can't narrow to the expected callback type.
-        client = MetricsDataPlaneClient(client, on_event=on_event)  # type: ignore[bad-argument-type]
+        client = MetricsDataPlaneClient(
+            client,  # type: ignore[bad-argument-type]
+            on_event=obs.get("callback") if obs_enabled else None,  # type: ignore[bad-argument-type]
+            verify_tensor_hash=obs_enabled and bool(obs.get("verify_tensor_hash")),
+            observability_enabled=obs_enabled,
+        )
     return client

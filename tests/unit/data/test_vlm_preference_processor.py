@@ -28,6 +28,7 @@ class _Tokenizer:
 
 class _ImageProcessor:
     model_input_names = ["pixel_values"]
+    patch_size = 16
 
 
 class NemotronH_Nano_Omni_Reasoning_V3Processor:
@@ -55,10 +56,8 @@ class NemotronH_Nano_Omni_Reasoning_V3Processor:
             self.saw_explicit_image_placeholder = "<image>" in text
             return {
                 "input_ids": torch.tensor([[9, 10]]),
-                "pixel_values": torch.ones(1, 3, 16, 24),
-                # The processor can report an unpadded crop that differs from
-                # the pixel tensor's padded spatial shape.
-                "imgs_sizes": torch.tensor([[15, 23]]),
+                "pixel_values": torch.ones(1, 3, 16, 32),
+                "imgs_sizes": torch.tensor([[16, 32]]),
             }
         return {"input_ids": torch.tensor([[11]])}
 
@@ -70,7 +69,7 @@ def test_vlm_preference_processor_adds_nemotron_omni_media_metadata():
             "context": [
                 {
                     "role": "user",
-                    "content": [{"type": "image", "image": Image.new("RGB", (24, 16))}],
+                    "content": [{"type": "image", "image": Image.new("RGB", (32, 16))}],
                 }
             ],
             "completions": [
@@ -101,6 +100,8 @@ def test_vlm_preference_processor_adds_nemotron_omni_media_metadata():
         result["message_log_rejected"],
     ):
         message = message_log[0]
-        assert message["pixel_values"].pad_to_max_shape
-        assert message["imgs_sizes"].as_tensor().tolist() == [[15, 23]]
+        assert message["pixel_values"].preprocess_mode == "patchify"
+        assert message["pixel_values"].preprocess_kwargs == {"patch_dim": 16}
+        assert message["pixel_values"].as_tensor().shape == (1, 2, 768)
+        assert message["imgs_sizes"].as_tensor().tolist() == [[16, 32]]
         assert message["num_frames"].as_tensor().tolist() == [1]

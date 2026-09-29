@@ -23,7 +23,7 @@ a mock worker group.
 from __future__ import annotations
 
 import asyncio
-import threading
+from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -41,6 +41,7 @@ from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
     StageResult,
 )
 
+from nemo_rl.data_plane.tq_token_sink import ChainPrefixCache  # noqa: E402
 from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration  # noqa: E402
 from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
     VllmAsyncGenerationWorkerImpl,
@@ -64,9 +65,7 @@ def _fake_worker(*, is_model_owner: bool = True) -> SimpleNamespace:
         is_model_owner=is_model_owner,
         token_capture=None,
         _rollout_weight_version=0,
-        _staging_source=None,
-        _prefix_cache={},
-        _prefix_cache_lock=threading.Lock(),
+        _chain_prefix=ChainPrefixCache(),
     )
     worker.install_token_capture = lambda capture: setattr(
         worker, "token_capture", capture
@@ -205,9 +204,7 @@ def _worker_with_capture(sink: _MemorySink):
 
     worker = _fake_worker()
     worker._capture_calls = {}
-    worker._prefix_cache = {}
-    worker._prefix_cache_lock = threading.Lock()
-    worker._staging_source = None
+    worker._chain_prefix = ChainPrefixCache()
     worker._delta_align_routed_experts = (
         VllmAsyncGenerationWorkerImpl._delta_align_routed_experts
     )
@@ -255,7 +252,11 @@ def _served_content(gen_ids, logprobs):
     }
 
 
-def test_request_capture_round_trip_stages_and_rides_coords():
+@pytest.mark.parametrize("with_message_tokens", [False, True])
+@pytest.mark.parametrize("with_routed_experts", [False, True])
+def test_request_capture_round_trip_stages_and_rides_coords(
+    with_message_tokens: bool, with_routed_experts: bool
+) -> None:
     sink = _MemorySink()
     worker = _worker_with_capture(sink)
     request = _FakeRequest(
@@ -270,14 +271,34 @@ def test_request_capture_round_trip_stages_and_rides_coords():
     )
     VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11, 12])
     content = _served_content([13, 14], [-0.1, -0.2])
-    # Full-length routes on the served response must not survive the strip.
-    content["choices"][0]["message"]["routed_experts"] = [[[0]]] * 5
+    message = content["choices"][0]["message"]
+    if with_message_tokens:
+        # The HTTP serializer preserves these dynamic fields on the message.
+        message.update(
+            prompt_token_ids=[10, 11, 12],
+            generation_token_ids=[13, 14],
+            generation_log_probs=[-0.1, -0.2],
+        )
+    if with_routed_experts:
+        message["routed_experts"] = [[[0]]] * 5
     content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
         worker, request, content
     )
     # Bytes were staged before the coords existed (fail-closed ordering).
     assert len(sink.records) == 1
     assert sink.records[0].token_ids_delta == [10, 11, 12, 13, 14]
+    assert sink.records[0].token_mask_delta == [0.0, 0.0, 0.0, 1.0, 1.0]
+    assert sink.records[0].generation_log_probs_delta == [
+        0.0,
+        0.0,
+        0.0,
+        -0.1,
+        -0.2,
+    ]
+    if with_routed_experts:
+        assert sink.records[0].extras["routed_experts"]
+    else:
+        assert sink.records[0].extras is None
     coords = content["ng_commit_coords"]
     assert coords["disposition"] == "staged"
     assert (coords["delta_len"], coords["cum_len"]) == (5, 5)
@@ -285,12 +306,10 @@ def test_request_capture_round_trip_stages_and_rides_coords():
     assert "token_ids_delta" not in coords
     assert coords["chain_hash"] == sink.records[0].chain_hash
     assert coords["cumulative_hash"] == sink.records[0].cumulative_hash
-    # Logprobs and routes never transit worker -> gate; state map is drained.
-    assert (
-        "logprobs" not in content["choices"][0]
-        or content["choices"][0]["logprobs"] is None
-    )
-    assert "routed_experts" not in content["choices"][0]["message"]
+    # Only the ordinary response fields and coords transit worker -> gate.
+    assert content["choices"] == [
+        {"index": 0, "message": {"role": "assistant", "content": "x"}}
+    ]
     assert worker._capture_calls == {}
 
 
@@ -338,12 +357,11 @@ def _staging_chain_request(prev_len: int = 3) -> _FakeRequest:
 
 
 def test_staging_chain_prefix_flows_through_adapter_and_begin_call():
-    """The admission dict is read once and never mutated: the resolved prefix
-    reaches the request via the adapter and begin_call via its keyword."""
+    """The resolved prefix reaches both the engine request and capture admission."""
     sink = _MemorySink()
     worker = _worker_with_capture(sink)
     source = _MemoryPrefixSource({"r0/c1": [10, 11], "r0/c2": [12]})
-    worker._staging_source = source
+    worker._chain_prefix.install(source)
     request = _staging_chain_request()
     context_before = dict(request.ng_capture)
 
@@ -366,13 +384,15 @@ def test_staging_chain_prefix_flows_through_adapter_and_begin_call():
     # enter_prefix is the production writer of the request field.
     assert request.required_prefix_token_ids == prefix
     call, prompt = worker._capture_calls[id(request)]
+    # Gym's begin_call resolves the caller-supplied prefix onto the ActiveCall.
     assert call.prefix_token_ids == prefix
     assert prompt == [10, 11, 12, 20]
 
 
 def test_inline_prefix_admission_resolves_without_a_fetch():
     worker = _worker_with_capture(_MemorySink())
-    worker._staging_source = _MemoryPrefixSource({})
+    source = _MemoryPrefixSource({})
+    worker._chain_prefix.install(source)
     request = _FakeRequest(
         ng_capture={
             "rollout_id": "r0",
@@ -387,7 +407,7 @@ def test_inline_prefix_admission_resolves_without_a_fetch():
     )
     admission = worker._capture_admission(request)
     assert worker._resolve_admission_prefix(admission) == [10, 11]
-    assert worker._staging_source.calls == []
+    assert source.calls == []
     text_root = worker._capture_admission(
         _FakeRequest(
             ng_capture={"rollout_id": "r0", "model_call_id": "c1", "mode": "text"}
@@ -399,7 +419,7 @@ def test_inline_prefix_admission_resolves_without_a_fetch():
 def test_staging_chain_cache_fetches_only_uncached_suffix():
     worker = _worker_with_capture(_MemorySink())
     source = _MemoryPrefixSource({"r0/c1": [10, 11], "r0/c2": [12]})
-    worker._staging_source = source
+    worker._chain_prefix.install(source)
 
     first = VllmAsyncGenerationWorkerImpl._fetch_chain_prefix(worker, ["r0/c1"])
     second = VllmAsyncGenerationWorkerImpl._fetch_chain_prefix(
@@ -412,9 +432,9 @@ def test_staging_chain_cache_fetches_only_uncached_suffix():
 
 
 def test_staging_chain_prefix_length_mismatch_is_rejected_by_begin_call():
-    """prev_len enforcement lives in Gym's begin_call, not in the worker."""
+    """Gym's begin_call rejects a fetched prefix whose length is not prev_len."""
     worker = _worker_with_capture(_MemorySink())
-    worker._staging_source = _MemoryPrefixSource({"r0/c1": [10, 11], "r0/c2": []})
+    worker._chain_prefix.install(_MemoryPrefixSource({"r0/c1": [10, 11], "r0/c2": []}))
     request = _staging_chain_request(prev_len=3)
     context_before = dict(request.ng_capture)
 
@@ -434,7 +454,10 @@ def test_staging_chain_admission_requires_the_resolved_prefix_keyword():
     worker = _worker_with_capture(_MemorySink())
     request = _staging_chain_request()
 
-    with pytest.raises(CaptureError, match="pass the resolved prefix_token_ids"):
+    with pytest.raises(
+        CaptureError,
+        match="requires the caller to pass the resolved prefix_token_ids",
+    ):
         VllmAsyncGenerationWorkerImpl._begin_request_capture(
             worker, request, [10, 11, 12, 20]
         )
@@ -442,19 +465,28 @@ def test_staging_chain_admission_requires_the_resolved_prefix_keyword():
     assert worker._capture_calls == {}
 
 
-def test_request_capture_is_a_noop_without_context_or_capture():
+@pytest.mark.parametrize("capture_enabled", [False, True])
+def test_request_capture_is_a_noop_without_context_or_capture(
+    capture_enabled: bool,
+) -> None:
     sink = _MemorySink()
     worker = _worker_with_capture(sink)
     plain = _FakeRequest(stream=False)  # no ng_capture attribute
+    if not capture_enabled:
+        worker.token_capture = None
+        plain.ng_capture = {"rollout_id": "r0", "model_call_id": "c1", "mode": "text"}
     VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, plain, [1, 2])
-    content = {
-        "choices": [{"message": {"role": "assistant"}, "logprobs": {"content": []}}]
-    }
-    out = VllmAsyncGenerationWorkerImpl._finish_request_capture(
-        worker, plain, dict(content)
+    content = _served_content([3], [-0.1])
+    content["choices"][0]["message"].update(
+        prompt_token_ids=[1, 2],
+        generation_token_ids=[3],
+        generation_log_probs=[-0.1],
+        routed_experts=[[[0]]] * 3,
     )
-    assert "ng_commit_coords" not in out
-    assert out["choices"][0]["logprobs"] is not None  # untouched off the capture path
+    original = deepcopy(content)
+    out = VllmAsyncGenerationWorkerImpl._finish_request_capture(worker, plain, content)
+    assert out == original
+    assert worker._capture_calls == {}
     assert sink.records == []
 
 
