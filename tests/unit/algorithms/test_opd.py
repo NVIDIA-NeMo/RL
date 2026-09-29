@@ -1272,7 +1272,11 @@ def test_create_advantage_estimator_opd_branch():
     )
     master_config = SimpleNamespace(
         grpo=GRPOConfig(
-            adv_estimator=AdvEstimatorConfig(name="opd", proximal_teacher_alpha=0.2)
+            adv_estimator=AdvEstimatorConfig(
+                name="opd",
+                proximal_teacher_alpha=0.2,
+                subtract_global_baseline=True,
+            )
         ),
         loss_fn=loss_fn,
     )
@@ -1281,10 +1285,20 @@ def test_create_advantage_estimator_opd_branch():
         estimator = _create_advantage_estimator(master_config)
     assert isinstance(estimator, OPDAdvantageEstimator)
     assert estimator.proximal_teacher_alpha == 0.2
+    assert estimator.subtract_global_baseline is True
     assert len(caught) == 3
 
 
-def test_create_advantage_estimator_rejects_tropd_with_full_vocab_opd():
+@pytest.mark.parametrize(
+    ("tropd_overrides", "match"),
+    [
+        ({"proximal_teacher_alpha": 0.2}, "proximal_teacher_alpha"),
+        ({"subtract_global_baseline": True}, "subtract_global_baseline"),
+    ],
+)
+def test_create_advantage_estimator_rejects_tropd_with_full_vocab_opd(
+    tropd_overrides, match
+):
     from types import SimpleNamespace
 
     from nemo_rl.algorithms.advantage_estimator import AdvEstimatorConfig
@@ -1296,7 +1310,7 @@ def test_create_advantage_estimator_rejects_tropd_with_full_vocab_opd():
 
     master_config = SimpleNamespace(
         grpo=GRPOConfig(
-            adv_estimator=AdvEstimatorConfig(name="opd", proximal_teacher_alpha=0.2)
+            adv_estimator=AdvEstimatorConfig(name="opd", **tropd_overrides)
         ),
         loss_fn=SimpleNamespace(force_on_policy_ratio=False),
         on_policy_distillation=OnPolicyDistillationConfig(
@@ -1304,7 +1318,7 @@ def test_create_advantage_estimator_rejects_tropd_with_full_vocab_opd():
             full=OnPolicyDistillationFullConfig(enabled=True),
         ),
     )
-    with pytest.raises(ValueError, match="proximal_teacher_alpha"):
+    with pytest.raises(ValueError, match=match):
         _create_advantage_estimator(master_config)
 
 

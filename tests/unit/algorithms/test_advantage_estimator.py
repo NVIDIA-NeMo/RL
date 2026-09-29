@@ -22,9 +22,14 @@ from nemo_rl.algorithms.advantage_estimator import (
 )
 
 
-def _make_estimator(alpha=1.0):
+def _make_estimator(alpha=1.0, subtract_global_baseline=False):
     return OPDAdvantageEstimator(
-        AdvEstimatorConfig(name="opd", proximal_teacher_alpha=alpha), {}
+        AdvEstimatorConfig(
+            name="opd",
+            proximal_teacher_alpha=alpha,
+            subtract_global_baseline=subtract_global_baseline,
+        ),
+        {},
     )
 
 
@@ -200,3 +205,65 @@ def test_tropd_metrics_report_raw_teacher_student_gap():
 def test_tropd_rejects_alpha_outside_unit_interval(alpha):
     with pytest.raises(ValidationError, match="proximal_teacher_alpha"):
         _make_estimator(alpha=alpha)
+
+
+def test_tropd_global_baseline_uses_only_valid_tokens_after_interpolation():
+    teacher = torch.tensor([[0.0, -1.0, 100.0]])
+    student = torch.tensor([[-1.0, -1.0, -100.0]])
+    mask = torch.tensor([[1.0, 1.0, 0.0]])
+    estimator = _make_estimator(alpha=0.2, subtract_global_baseline=True)
+
+    advantage = estimator.compute_advantage(
+        None,
+        None,
+        mask,
+        teacher_logprobs=teacher,
+        prev_logprobs=student,
+    )
+    interpolated = (
+        torch.log(0.2 * torch.exp(teacher[:, :2]) + 0.8 * torch.exp(student[:, :2]))
+        - student[:, :2]
+    )
+    expected = torch.zeros_like(teacher)
+    expected[:, :2] = interpolated - interpolated.mean()
+
+    torch.testing.assert_close(advantage, expected)
+    assert estimator.last_metrics["on_policy_distillation/adv_mean"] == pytest.approx(
+        0.0, abs=1e-7
+    )
+    assert estimator.last_metrics[
+        "on_policy_distillation/teacher_student_logprob_gap_mean"
+    ] == pytest.approx(0.5)
+
+
+def test_opd_global_baseline_without_tropd_centers_raw_gap():
+    teacher = torch.tensor([[0.0, -1.0], [-2.0, -0.5]])
+    student = torch.tensor([[-1.0, -1.0], [-1.0, -3.0]])
+    mask = torch.tensor([[1.0, 1.0], [0.0, 1.0]])
+
+    advantage = _make_estimator(subtract_global_baseline=True).compute_advantage(
+        None,
+        None,
+        mask,
+        teacher_logprobs=teacher,
+        prev_logprobs=student,
+    )
+
+    # Valid gaps are [1, 0, 2.5] (the masked -1 does not vote): mean 7/6.
+    torch.testing.assert_close(advantage, (teacher - student - 7.0 / 6.0) * mask)
+
+
+def test_tropd_all_masked_batch_is_finite_zero():
+    estimator = _make_estimator(alpha=0.2, subtract_global_baseline=True)
+    advantage = estimator.compute_advantage(
+        None,
+        None,
+        torch.zeros(2, 3),
+        teacher_logprobs=torch.randn(2, 3),
+        prev_logprobs=torch.randn(2, 3),
+    )
+
+    torch.testing.assert_close(advantage, torch.zeros(2, 3))
+    assert all(
+        torch.isfinite(torch.tensor(value)) for value in estimator.last_metrics.values()
+    )

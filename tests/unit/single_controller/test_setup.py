@@ -1204,6 +1204,28 @@ class TestSetup:
 
         patched_factories["_build_clusters"].assert_not_called()
 
+    def test_mopd_global_baseline_requires_one_streaming_chunk_per_step(
+        self, patched_factories
+    ):
+        mc = _make_master_config(env={"should_use_nemo_gym": True})
+        mc.grpo.adv_estimator = AdvEstimatorConfig(
+            name="opd", subtract_global_baseline=True
+        )
+        mc.on_policy_distillation = OnPolicyDistillationConfig(
+            enabled=True,
+            teacher_model_by_agent_name={"teacher": "/ckpt/teacher"},
+            default_teacher_alias="teacher",
+            non_colocated_teachers={"enabled": True},
+        )
+        # One chunk per step: the estimator's batch is the whole step.
+        validate_single_controller_config(mc)
+
+        mc.async_rl.min_groups_for_streaming_train = mc.grpo.num_prompts_per_step // 2
+        with pytest.raises(ValueError, match="subtract_global_baseline"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["_build_clusters"].assert_not_called()
+
     def test_mopd_reserves_before_models_and_initializes_teacher_last(
         self, patched_factories, monkeypatch
     ):

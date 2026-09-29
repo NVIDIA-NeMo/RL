@@ -65,6 +65,9 @@ class AdvEstimatorConfig(BaseModel, extra="allow"):
     # targets the mixture log(alpha * p_teacher + (1 - alpha) * p_student)
     # instead of the teacher itself; 1.0 is plain MOPD.
     proximal_teacher_alpha: Annotated[float, Field(gt=0.0, le=1.0)] = 1.0
+    # OPD specific: subtract the mean advantage over every valid token in the
+    # batch the estimator sees (a whole step; see OPDAdvantageEstimator).
+    subtract_global_baseline: bool = False
 
 
 class GAEConfig(BaseModel, extra="allow"):
@@ -652,6 +655,11 @@ class OPDAdvantageEstimator:
     The advantage is bounded below by log(1 − α), so tokens the teacher
     strongly rejects cannot dominate the update. α = 1 recovers Â_MOPD exactly.
 
+    ``subtract_global_baseline`` then centers the advantage on the mean over
+    every valid token passed to one ``compute_advantage`` call. That call
+    covers a whole training step on ``run_grpo.py``; the SingleController
+    calls it once per streaming chunk and so requires one chunk per step.
+
     The loss function should be configured with:
         disable_ppo_ratio: true               (REINFORCE, no PPO ratio)
         use_importance_sampling_correction: true
@@ -668,6 +676,7 @@ class OPDAdvantageEstimator:
         self, estimator_config: AdvEstimatorConfig, loss_config: ClippedPGLossConfig
     ):
         self.proximal_teacher_alpha = estimator_config.proximal_teacher_alpha
+        self.subtract_global_baseline = estimator_config.subtract_global_baseline
         self.last_metrics: dict[str, float] = {}
 
     def compute_advantage(
@@ -710,6 +719,11 @@ class OPDAdvantageEstimator:
                 prev_logprobs + math.log1p(-alpha),
             )
             distill_advantages = (proximal_teacher_logprobs - prev_logprobs).detach()
+
+        if self.subtract_global_baseline:
+            valid_advantages = torch.masked_select(distill_advantages, mask.bool())
+            if valid_advantages.numel() > 0:
+                distill_advantages = distill_advantages - valid_advantages.mean()
 
         # Apply mask
         advantages = distill_advantages * mask
