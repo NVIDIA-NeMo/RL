@@ -3598,9 +3598,11 @@ def test_megatron_async_save_after_ppo_offload_writes_current_weights(
 
             first, second = (_hash_checkpoint_tensors(p) for p in weights_paths)
             assert first.keys() == second.keys()
-            changed = sum(first[key] != second[key] for key in first)
-            assert changed > 0, (
-                f"all {len(first)} tensors of the second checkpoint repeat the first"
+            # Every chunk is a trained fp32 param, so none may repeat the first save.
+            repeated = [key for key in first if first[key] == second[key]]
+            assert not repeated, (
+                f"{len(repeated)} of {len(first)} tensor chunks repeat the first "
+                f"checkpoint: {repeated}"
             )
         finally:
             if policy:
