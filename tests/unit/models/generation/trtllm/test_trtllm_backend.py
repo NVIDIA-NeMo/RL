@@ -35,11 +35,6 @@ def _extension(backend):
     engine = MagicMock()
     engine.model_engine = model_engine
     engine.control_action.side_effect = lambda **_: contextlib.nullcontext()
-    # Absent by default, matching every released TRT-LLM today (the method is
-    # only on NVIDIA/TensorRT-LLM#17937, not yet merged). A bare MagicMock
-    # would auto-create this attribute and mask the fallback path entirely;
-    # tests for the "available" branch re-add it explicitly.
-    del engine.recompute_active_requests
     extension.engine = engine
     extension.device_id = 0
     extension.model_update_group = object()
@@ -127,13 +122,6 @@ def test_collective_refit_runs_at_async_engine_boundary(
     from nemo_rl.models.generation.trtllm import trtllm_backend as backend
 
     extension, module, model, model_loader, engine = _extension(backend)
-    # Force the manual finalize fallback so the asserted call order is
-    # deterministic. On an installed TRT-LLM that actually has
-    # WorkerExtension.finalize_weight_update, _finalize_weight_update takes
-    # that fast path instead and never drives process/post individually.
-    monkeypatch.setattr(
-        backend.WorkerExtension, "finalize_weight_update", None, raising=False
-    )
     call_order = []
     incoming = [("model.weight", torch.tensor([1.0]))]
     converted = {"converted.weight": torch.tensor([2.0])}
@@ -148,14 +136,12 @@ def test_collective_refit_runs_at_async_engine_boundary(
         post_unpack_func(incoming)
 
     module.pre_reload_weights.side_effect = lambda: call_order.append("pre")
-    module.process_weights_after_loading.side_effect = lambda: call_order.append(
-        "process"
-    )
-    module.post_load_weights.side_effect = lambda: call_order.append("post")
     model_loader.begin_update_weights.side_effect = lambda: call_order.append("begin")
     model_loader.reload.side_effect = lambda *_, **__: call_order.append("reload")
-    model_loader.finalize_update_weights.side_effect = lambda: call_order.append(
-        "finalize"
+    monkeypatch.setattr(
+        backend.WorkerExtension,
+        "finalize_weight_update",
+        lambda self_inner: call_order.append("finalize"),
     )
     monkeypatch.setattr(backend, "packed_broadcast_consumer", packed_consumer)
     monkeypatch.setattr(backend.fp8_quantization, "is_fp8_model", lambda _: fp8)
@@ -189,23 +175,18 @@ def test_collective_refit_runs_at_async_engine_boundary(
         "broadcast",
         "reload",
         "finalize",
-        "process",
-        "post",
         "stream_sync",
     ]
     model_loader.abort_update_weights.assert_not_called()
-    # recompute_active_requests is absent (the fixture default), so the
-    # collective path must fall back to reset_prefix_cache.
-    engine.reset_prefix_cache.assert_called_once_with()
+    engine.recompute_active_requests.assert_called_once_with()
 
 
-def test_collective_refit_uses_recompute_active_requests_when_available(monkeypatch):
-    """On TRT-LLM builds carrying NVIDIA/TensorRT-LLM#17937 (e.g. tekit_tmp),
-    prefer the precise in-flight-KV recompute over a blanket cache reset."""
+def test_collective_refit_uses_recompute_active_requests(monkeypatch):
+    """recompute_active_requests (feat/rl_rc) rebuilds in-flight KV under new
+    weights; reset_prefix_cache must not be called."""
     from nemo_rl.models.generation.trtllm import trtllm_backend as backend
 
     extension, _, model, model_loader, engine = _extension(backend)
-    engine.recompute_active_requests = MagicMock()
     model.model_config = SimpleNamespace(quant_config=object())
 
     def packed_consumer(*, post_unpack_func, **_):

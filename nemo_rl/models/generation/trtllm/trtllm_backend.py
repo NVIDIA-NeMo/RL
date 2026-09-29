@@ -69,8 +69,6 @@ def _require_fp8_refit_hooks(model_loader: Any) -> None:
         for hook_name in required_hooks
         if not callable(getattr(model_loader, hook_name, None))
     ]
-    if not callable(getattr(WorkerExtension, "finalize_weight_update", None)):
-        missing_hooks.append("WorkerExtension.finalize_weight_update")
     if missing_hooks:
         raise RuntimeError(
             "Qwen3.5 FP8 refit requires TRT-LLM weight-update hooks. "
@@ -146,7 +144,7 @@ class NcclExtension(WorkerExtension):
             fp8_quantization.validate_fused_expert_layout(state_dict_info)
             _require_fp8_refit_hooks(self.engine.model_engine.model_loader)
 
-    def _unwrap_compiled_model_for_refit(self) -> bool:
+    def _unwrap_compiled_model_for_refit(self) -> None:
         """Unwrap torch.compile before weights are loaded.
 
         REQUIRED whenever torch.compile is enabled (which
@@ -160,20 +158,10 @@ class NcclExtension(WorkerExtension):
         silently skipped and keeps its pre-refit weights. Nothing crashes: the
         refit reports success and training continues on stale weights, which
         shows up only as corrupted generations and a flat reward curve.
-
-        Returns True when the hook exists (older TRT-LLM releases lack it).
         """
-        model_engine = self.engine.model_engine
-        # Renamed in TRT-LLM; the old name remains as an alias, so try both.
-        unwrap = getattr(model_engine, "unwrap_compiled_model_for_refit", None) or getattr(
-            model_engine, "release_piecewise_cuda_graphs_for_refit", None
-        )
-        if unwrap is None:
-            return False
-        unwrap()
-        return True
+        self.engine.model_engine.unwrap_compiled_model_for_refit()
 
-    def _restore_compiled_model_after_refit(self) -> bool:
+    def _restore_compiled_model_after_refit(self) -> None:
         """Re-wrap torch.compile after weights are loaded and finalized.
 
         Must run after all post-load processing, so the compiled callable is
@@ -181,44 +169,14 @@ class NcclExtension(WorkerExtension):
         cached compiled artifact and leaves the piecewise captures intact
         (refit does not move any tensor), so it costs a few seconds against
         ~300 s of weight streaming.
-
-        If this is skipped after a successful unwrap the engine still produces
-        correct output -- it just runs eager, losing the torch.compile/PWCG
-        speedup until the next refit.
         """
-        model_engine = self.engine.model_engine
-        restore = getattr(model_engine, "restore_compiled_model_after_refit", None) or getattr(
-            model_engine, "recapture_piecewise_cuda_graphs_after_refit", None
+        self.engine.model_engine.restore_compiled_model_after_refit(
+            self.engine.resource_manager
         )
-        if restore is None:
-            return False
-        restore(self.engine.resource_manager)
-        return True
 
     def _finalize_weight_update(self) -> None:
-        """Finalize refit using TRT-LLM's CUDA-graph-safe path when available."""
-        # WorkerExtension gained this shared path after refit lifecycle hooks.
-        # Retain the fallback while NeMo-RL supports older TRT-LLM releases.
-        finalize_weight_update = getattr(
-            WorkerExtension, "finalize_weight_update", None
-        )
-        if finalize_weight_update is not None:
-            finalize_weight_update(self)
-            return
-
-        model_engine = self.engine.model_engine
-        _call_model_loader_hook_if_available(
-            model_engine.model_loader, "finalize_update_weights"
-        )
-        for module in model_engine.model.modules():
-            if hasattr(module, "process_weights_after_loading") and not getattr(
-                module, "_weights_removed", False
-            ):
-                module.process_weights_after_loading()
-            if hasattr(module, "post_load_weights") and not getattr(
-                module, "_weights_removed", False
-            ):
-                module.post_load_weights()
+        """Finalize refit using TRT-LLM's CUDA-graph-safe path."""
+        WorkerExtension.finalize_weight_update(self)
 
     def _ensure_refit_usable(self) -> None:
         failure = getattr(self, "_fp8_refit_failure", None)
@@ -322,15 +280,9 @@ class NcclExtension(WorkerExtension):
                 self._finalize_weight_update()
                 torch.cuda.current_stream().synchronize()
 
-                # recompute_active_requests (NVIDIA/TensorRT-LLM#17937, not yet
-                # merged upstream) rebuilds in-flight requests' KV under the new
-                # weights instead of just dropping the reusable prefix cache.
-                # Fall back to reset_prefix_cache on TRT-LLM builds without it —
-                # safe, just coarser.
-                if not _call_model_loader_hook_if_available(
-                    self.engine, "recompute_active_requests"
-                ):
-                    self.engine.reset_prefix_cache()
+                # Rebuilds in-flight requests' KV under the new weights instead
+                # of dropping the reusable prefix cache (NVIDIA/TensorRT-LLM#17937).
+                self.engine.recompute_active_requests()
                 self._restore_compiled_model_after_refit()
             except Exception as e:
                 self._abort_weight_update_after_failure(
@@ -446,7 +398,7 @@ class NcclExtension(WorkerExtension):
 
             self._finalize_weight_update()
             torch.cuda.current_stream().synchronize()
-            self.engine.reset_prefix_cache()
+            self.engine.recompute_active_requests()
             gc.collect()
             torch.cuda.empty_cache()
             self._restore_compiled_model_after_refit()

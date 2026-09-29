@@ -239,7 +239,6 @@ def create_weight_synchronizer(
             train_cluster=train_cluster,
             inference_cluster=inference_cluster,
             refit_timeout_s=refit_timeout_s,
-<<<<<<< HEAD
             # See NcclReshardWeightSynchronizer above: the caller already
             # owns this call.
             sync_policy_params=False,
