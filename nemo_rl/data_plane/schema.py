@@ -139,7 +139,6 @@ ROUTED_EXTRAS_METADATA_FIELD = "extras_metadata_json"
 ROUTE_ENCODING_NONE = 0
 ROUTE_ENCODING_ENVELOPE = 1
 ROUTE_ENCODING_LIST = 2
-ROUTE_ENCODING_TENSOR = 3
 
 # Deferred route storage. Canonical rows carry one strict encoded route plan
 # per tag; policy workers omit the absent canonical route column and assemble

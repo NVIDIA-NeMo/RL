@@ -349,7 +349,7 @@ def attach_routed_experts_to_chat_response_choices(
     routed_experts_dtype: torch.dtype = ROUTED_EXPERTS_FALLBACK_DTYPE,
     encode_for_wire: bool = True,
 ) -> Any:
-    """Attach aligned routes, retaining tensors for worker-local capture."""
+    """Attach aligned routes, retaining tensors until capture delta alignment."""
     outputs_by_index = {
         output.index: output for output in getattr(final_request_output, "outputs", [])
     }
@@ -400,8 +400,8 @@ def attach_routed_experts_to_chat_response_choices(
                 r3_stats["actual_routes"],
                 r3_stats["expected_routes"],
             )
-        # Capture stages the native tensor before the response leaves this
-        # worker. Ordinary HTTP responses still need the compact wire envelope.
+        # Capture slices the native tensor before encoding its staged delta.
+        # Ordinary HTTP responses still need the compact wire envelope here.
         routed_experts = routed_experts.to(dtype=routed_experts_dtype)
         choice.message.routed_experts = (
             encode_routed_experts(routed_experts) if encode_for_wire else routed_experts

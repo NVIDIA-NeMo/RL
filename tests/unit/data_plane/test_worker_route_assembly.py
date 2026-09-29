@@ -28,8 +28,6 @@ from nemo_gym.token_id_capture.staging.digest import (  # noqa: E402
 
 from nemo_rl.data_plane import KVBatchMeta  # noqa: E402
 from nemo_rl.data_plane.schema import (  # noqa: E402
-    ROUTE_ENCODING_ENVELOPE,
-    ROUTE_ENCODING_TENSOR,
     ROUTE_PASSTHROUGH_FLAG,
     ROUTE_PLAN_TAG,
     ROUTED_EXPERTS_ENCODING_FIELD,
@@ -44,21 +42,18 @@ from nemo_rl.experience.route_plan import (  # noqa: E402
     RouteSpan,
     encode_route_plan,
 )
-from nemo_rl.utils.routed_experts_codec import (  # noqa: E402
-    encode_routed_experts,
-    routed_experts_tensor_metadata,
-)
+from nemo_rl.utils.routed_experts_codec import encode_routed_experts  # noqa: E402
 
 pytestmark = pytest.mark.nemo_gym
 
 
 class _Rows(dict):
-    def __init__(self, routed: list[torch.Tensor], encoding: int) -> None:
+    def __init__(self, routed: list[torch.Tensor]) -> None:
         super().__init__(
             {
                 ROUTED_EXPERTS_FIELD: routed,
                 ROUTED_EXPERTS_ENCODING_FIELD: [
-                    torch.tensor([encoding], dtype=torch.int64) for _ in routed
+                    torch.tensor([1], dtype=torch.int64) for _ in routed
                 ],
                 ROUTED_EXTRAS_METADATA_FIELD: [
                     torch.tensor(list(b"{}"), dtype=torch.uint8) for _ in routed
@@ -69,13 +64,8 @@ class _Rows(dict):
 
 
 class _RouteClient:
-    def __init__(
-        self,
-        fragments: dict[str, torch.Tensor],
-        encoding: int = ROUTE_ENCODING_ENVELOPE,
-    ) -> None:
+    def __init__(self, fragments: dict[str, torch.Tensor]) -> None:
         self.fragments = fragments
-        self.encoding = encoding
         self.calls: list[list[str]] = []
 
     def get_samples(self, *, sample_ids, partition_id, select_fields):
@@ -86,7 +76,7 @@ class _RouteClient:
             ROUTED_EXTRAS_METADATA_FIELD,
         ]
         self.calls.append(list(sample_ids))
-        return _Rows([self.fragments[key] for key in sample_ids], self.encoding)
+        return _Rows([self.fragments[key] for key in sample_ids])
 
 
 class _Worker(TQWorkerMixin):
@@ -121,11 +111,7 @@ def _span(
 ) -> RouteSpan:
     routes = client.fragments[staging_key]
     extras_digest = compute_extras_digest(
-        {
-            ROUTED_EXPERTS_FIELD: routed_experts_tensor_metadata(routes)
-            if client.encoding == ROUTE_ENCODING_TENSOR
-            else encode_routed_experts(routes)
-        }
+        {ROUTED_EXPERTS_FIELD: encode_routed_experts(routes)}
     )
     return RouteSpan(
         staging_key,
@@ -156,15 +142,12 @@ def _meta(plans: list[dict], lengths: list[int]) -> tuple[KVBatchMeta, BatchedDa
     return meta, data
 
 
-@pytest.mark.parametrize("encoding", [ROUTE_ENCODING_ENVELOPE, ROUTE_ENCODING_TENSOR])
-def test_worker_coalesces_keys_and_replays_full_tail_and_placeholder(
-    encoding: int,
-) -> None:
+def test_worker_coalesces_keys_and_replays_full_tail_and_placeholder() -> None:
     fragments = {
         "r/c0": torch.tensor([[[10, 11]], [[12, 13]]], dtype=torch.int16),
         "r/c1": torch.tensor([[[22, 23]]], dtype=torch.int16),
     }
-    client = _RouteClient(fragments, encoding)
+    client = _RouteClient(fragments)
     worker = _Worker(client)
     plans = [
         _plan(
@@ -212,10 +195,9 @@ def test_wrong_model_shape_falls_back_for_entire_rollout() -> None:
     assert worker._route_fallback_counts == Counter({"fragment_model_shape": 1})
 
 
-@pytest.mark.parametrize("encoding", [ROUTE_ENCODING_ENVELOPE, ROUTE_ENCODING_TENSOR])
-def test_tampered_fragment_falls_back_for_entire_rollout(encoding: int) -> None:
+def test_tampered_fragment_falls_back_for_entire_rollout() -> None:
     client = _RouteClient(
-        {"r/c0": torch.tensor([[[10, 11]], [[12, 13]]], dtype=torch.int16)}, encoding
+        {"r/c0": torch.tensor([[[10, 11]], [[12, 13]]], dtype=torch.int16)}
     )
     worker = _Worker(client)
     span = _span(client, "r/c0", 0, 2, 2)

@@ -29,7 +29,6 @@ depend on torch.
 """
 
 import base64
-import hashlib
 from typing import Any, Union
 
 import torch
@@ -41,29 +40,6 @@ _WIRE_TORCH_DTYPES = {
     "int32": torch.int32,
 }
 _TORCH_DTYPE_NAMES = {v: k for k, v in _WIRE_TORCH_DTYPES.items()}
-
-
-def routed_experts_tensor_metadata(routed_experts: torch.Tensor) -> dict[str, Any]:
-    """Bind a captured route tensor to its dtype, shape, and content checksum.
-
-    Capture stages the tensor directly. Only this small descriptor enters Gym's
-    extras digest; consumers recreate it from the stored tensor for verification.
-    Hash contiguous little-endian bytes without allocating a base64 payload.
-    """
-    if routed_experts.dim() != 3:
-        raise ValueError(
-            "routed_experts must have shape [tokens, num_moe_layers, topk]"
-        )
-    dtype_name = _TORCH_DTYPE_NAMES.get(routed_experts.dtype)
-    if dtype_name is None:
-        raise ValueError(f"Unsupported routed_experts dtype {routed_experts.dtype}")
-    arr = routed_experts.detach().cpu().contiguous().numpy()
-    arr = arr.astype(arr.dtype.newbyteorder("<"), copy=False)
-    return {
-        "dtype": dtype_name,
-        "shape": list(arr.shape),
-        "sha256": hashlib.sha256(memoryview(arr)).hexdigest(),
-    }
 
 
 def encode_routed_experts(routed_experts: torch.Tensor) -> str:
