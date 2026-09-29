@@ -16,7 +16,6 @@ from typing import Any, Literal, NotRequired, TypedDict
 
 from pydantic import (
     BaseModel,
-    Field,
     NonNegativeFloat,
     NonNegativeInt,
     PositiveFloat,
@@ -98,17 +97,19 @@ class SGLangRouterConfig(TypedDict):
     cb_failure_threshold: NotRequired[int]
 
 
-class SGLangHttpClientConfig(BaseModel, extra="allow"):
+class SGLangHttpClientConfig(BaseModel, extra="allow", strict=True):
     """NeMo-RL HTTP settings, including when the router is externally managed.
 
     ``max_retries`` counts total POST attempts, including the first attempt.
     Distributed dispatch and its local fallback each use this same budget.
     """
 
-    max_retries: PositiveInt = Field(default=3, strict=True)
+    max_retries: PositiveInt = 3
 
 
-class SGLangFaultToleranceConfig(BaseModel, extra="allow"):
+class SGLangFaultToleranceConfig(
+    BaseModel, extra="allow", strict=True, allow_inf_nan=False
+):
     """Serving-health and refit-time recovery settings for SGLang engines.
 
     Durations are seconds. The first-wait grace may be zero; probe intervals
@@ -116,49 +117,11 @@ class SGLangFaultToleranceConfig(BaseModel, extra="allow"):
     engine over the generation object's lifetime; zero disables restarts.
     """
 
-    use_fault_tolerance: bool = Field(default=False, strict=True)
-    rollout_health_check_interval: PositiveFloat = Field(
-        default=60.0, strict=True, allow_inf_nan=False
-    )
-    rollout_health_check_timeout: PositiveFloat = Field(
-        default=60.0, strict=True, allow_inf_nan=False
-    )
-    rollout_health_check_first_wait: NonNegativeFloat = Field(
-        default=60.0, strict=True, allow_inf_nan=False
-    )
-    rollout_max_restart_attempts: NonNegativeInt = Field(default=3, strict=True)
-
-
-def get_sglang_fault_tolerance_config(
-    sglang_cfg: "SglangSpecificArgs",
-) -> SGLangFaultToleranceConfig:
-    """Validate nested FT settings or the legacy flat spelling, without mutation.
-
-    Mixing spellings is rejected instead of silently overriding an inherited
-    value. New configurations should use ``sglang_fault_tolerance_config``.
-    """
-    legacy_values = {
-        key: sglang_cfg[key]
-        for key in (
-            "use_fault_tolerance",
-            "rollout_health_check_interval",
-            "rollout_health_check_timeout",
-            "rollout_health_check_first_wait",
-            "rollout_max_restart_attempts",
-        )
-        if key in sglang_cfg
-    }
-    if "sglang_fault_tolerance_config" in sglang_cfg:
-        if legacy_values:
-            raise ValueError(
-                "Do not mix sglang_fault_tolerance_config with legacy flat "
-                f"fault-tolerance fields: {', '.join(sorted(legacy_values))}. "
-                "Move overrides into sglang_fault_tolerance_config."
-            )
-        return SGLangFaultToleranceConfig.model_validate(
-            sglang_cfg["sglang_fault_tolerance_config"]
-        )
-    return SGLangFaultToleranceConfig.model_validate(legacy_values)
+    use_fault_tolerance: bool = False
+    rollout_health_check_interval: PositiveFloat = 60.0
+    rollout_health_check_timeout: PositiveFloat = 60.0
+    rollout_health_check_first_wait: NonNegativeFloat = 60.0
+    rollout_max_restart_attempts: NonNegativeInt = 3
 
 
 class SglangSpecificArgs(TypedDict):
@@ -173,18 +136,10 @@ class SglangSpecificArgs(TypedDict):
     sglang_server_config: SGLangServerConfig
     sglang_router_config: SGLangRouterConfig
     sglang_http_client_config: NotRequired[SGLangHttpClientConfig]
-    sglang_fault_tolerance_config: NotRequired[SGLangFaultToleranceConfig]
+    sglang_fault_tolerance_config: SGLangFaultToleranceConfig
 
     # Weight precision for rollout/refit.
     quantization: SglangQuantizationConfig
-
-    # Legacy flat spellings, accepted only without sglang_fault_tolerance_config.
-    # Defaults and validation live on SGLangFaultToleranceConfig for both forms.
-    use_fault_tolerance: NotRequired[bool]
-    rollout_health_check_interval: NotRequired[float]
-    rollout_health_check_timeout: NotRequired[float]
-    rollout_health_check_first_wait: NotRequired[float]
-    rollout_max_restart_attempts: NotRequired[int]
 
     # Path to model weights (local folder or HF repo id).
     model_path: NotRequired[str]

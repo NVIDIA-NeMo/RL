@@ -55,7 +55,7 @@ from typing import Any, Optional
 
 import ray
 
-from nemo_rl.models.generation.sglang.config import get_sglang_fault_tolerance_config
+from nemo_rl.models.generation.sglang.config import SGLangFaultToleranceConfig
 from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
@@ -133,8 +133,8 @@ class _SGLangWeightSynchronizer(WeightSynchronizer):
         Replacements wait for this boundary rather than serving checkpoint
         weights during the interrupted rollout.
         """
-        fault_tolerance_config = get_sglang_fault_tolerance_config(
-            self._generation.sglang_cfg["sglang_cfg"]
+        fault_tolerance_config = SGLangFaultToleranceConfig.model_validate(
+            self._generation.sglang_cfg["sglang_cfg"]["sglang_fault_tolerance_config"]
         )
         if fault_tolerance_config.use_fault_tolerance:
             self._generation.recover_updatable_engines()

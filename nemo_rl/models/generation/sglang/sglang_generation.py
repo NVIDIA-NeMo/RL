@@ -38,7 +38,7 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.sglang.config import (
     SGLangConfig,
-    get_sglang_fault_tolerance_config,
+    SGLangFaultToleranceConfig,
 )
 from nemo_rl.models.generation.sglang.fault_tolerance import RolloutHealthMonitor
 from nemo_rl.models.generation.sglang.sglang_router import _start_router
@@ -91,8 +91,8 @@ class SGLangGeneration(GenerationInterface):
         self._router_actor: ray.actor.ActorHandle | None = None
         self.rollout_engine_lock: ray.actor.ActorHandle | None = None
 
-        fault_tolerance_config = get_sglang_fault_tolerance_config(
-            sglang_cfg["sglang_cfg"]
+        fault_tolerance_config = SGLangFaultToleranceConfig.model_validate(
+            sglang_cfg["sglang_cfg"]["sglang_fault_tolerance_config"]
         )
         self.cluster = cluster
         self.sglang_cfg = sglang_cfg

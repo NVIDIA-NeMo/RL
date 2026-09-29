@@ -80,7 +80,7 @@ def _make_sglang_generation_cfg(pad_token_id=PAD_TOKEN_ID, tp_size=1):
         "stop_strings": None,
         "_pad_token_id": pad_token_id,
         "sglang_cfg": {
-            "use_fault_tolerance": False,
+            "sglang_fault_tolerance_config": {"use_fault_tolerance": False},
             "model_path": MODEL_PATH,
             "dtype": "bfloat16",
             "random_seed": 42,

@@ -18,6 +18,7 @@ import gc
 import sys
 import weakref
 from copy import deepcopy
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -26,9 +27,10 @@ from pydantic import ValidationError
 from nemo_rl.models.generation.sglang.config import (
     SGLangFaultToleranceConfig,
     SGLangHttpClientConfig,
-    get_sglang_fault_tolerance_config,
+    SglangSpecificArgs,
 )
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
+from nemo_rl.utils.config import load_config
 
 
 def test_fault_tolerance_defaults_are_centralized_and_disabled():
@@ -40,17 +42,10 @@ def test_fault_tolerance_defaults_are_centralized_and_disabled():
         "rollout_max_restart_attempts": 3,
     }
     assert SGLangFaultToleranceConfig().model_dump() == expected
-    assert get_sglang_fault_tolerance_config({}).model_dump() == expected
-    assert (
-        get_sglang_fault_tolerance_config(
-            {"sglang_fault_tolerance_config": {}}
-        ).model_dump()
-        == expected
-    )
+    assert SGLangFaultToleranceConfig.model_validate({}).model_dump() == expected
 
 
-@pytest.mark.parametrize("nested", [False, True])
-def test_fault_tolerance_normalizes_both_spellings_without_mutation(nested):
+def test_fault_tolerance_validates_nested_settings_without_mutation():
     values = {
         "use_fault_tolerance": True,
         "rollout_health_check_interval": 0.5,
@@ -58,11 +53,12 @@ def test_fault_tolerance_normalizes_both_spellings_without_mutation(nested):
         "rollout_health_check_first_wait": 0,
         "rollout_max_restart_attempts": 0,
     }
-    config = {"sglang_fault_tolerance_config": values} if nested else values.copy()
-    config["model_path"] = "unrelated/model"
+    config = {"sglang_fault_tolerance_config": values, "model_path": "unrelated/model"}
     original = deepcopy(config)
 
-    actual = get_sglang_fault_tolerance_config(config)
+    actual = SGLangFaultToleranceConfig.model_validate(
+        config["sglang_fault_tolerance_config"]
+    )
 
     assert actual.model_dump() == values
     assert config == original
@@ -70,34 +66,48 @@ def test_fault_tolerance_normalizes_both_spellings_without_mutation(nested):
 
 def test_fault_tolerance_accepts_an_already_validated_model():
     config = SGLangFaultToleranceConfig(use_fault_tolerance=True)
-    assert (
-        get_sglang_fault_tolerance_config({"sglang_fault_tolerance_config": config})
-        is config
+    assert SGLangFaultToleranceConfig.model_validate(config) is config
+
+
+def test_fault_tolerance_block_is_required_without_flat_fields():
+    assert "sglang_fault_tolerance_config" in SglangSpecificArgs.__required_keys__
+    assert not SGLangFaultToleranceConfig.model_fields.keys() & (
+        SglangSpecificArgs.__annotations__.keys()
     )
 
 
 @pytest.mark.parametrize(
-    "legacy_key",
-    [
-        "use_fault_tolerance",
-        "rollout_health_check_interval",
-        "rollout_health_check_timeout",
-        "rollout_health_check_first_wait",
-        "rollout_max_restart_attempts",
-    ],
-)
-def test_fault_tolerance_rejects_mixed_spellings_even_when_values_agree(legacy_key):
-    defaults = SGLangFaultToleranceConfig().model_dump()
-    with pytest.raises(ValueError, match="Do not mix"):
-        get_sglang_fault_tolerance_config(
-            {
-                "sglang_fault_tolerance_config": defaults,
-                legacy_key: defaults[legacy_key],
-            }
+    "config_path",
+    sorted(
+        (Path(__file__).resolve().parents[5] / "examples/configs").rglob(
+            "*sglang*.yaml"
         )
+    ),
+    ids=lambda path: path.name,
+)
+def test_sglang_recipes_inherit_required_fault_tolerance_block(config_path):
+    config = load_config(config_path)
+    sglang_cfg = config.policy.generation.sglang_cfg
+    fault_tolerance = SGLangFaultToleranceConfig.model_validate(
+        dict(sglang_cfg["sglang_fault_tolerance_config"])
+    )
+    assert not fault_tolerance.use_fault_tolerance
+    assert not SGLangFaultToleranceConfig.model_fields.keys() & sglang_cfg.keys()
 
 
-@pytest.mark.parametrize("nested", [False, True])
+def test_missing_fault_tolerance_block_fails_before_cluster_allocation(monkeypatch):
+    cluster = MagicMock()
+    loop_factory = MagicMock()
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.sglang.sglang_generation.AsyncLoopThread",
+        loop_factory,
+    )
+    with pytest.raises(KeyError, match="sglang_fault_tolerance_config"):
+        SGLangGeneration(cluster, {"sglang_cfg": {}})
+    cluster._init_placement_groups.assert_not_called()
+    loop_factory.assert_not_called()
+
+
 @pytest.mark.parametrize(
     ("key", "value"),
     [
@@ -116,11 +126,9 @@ def test_fault_tolerance_rejects_mixed_spellings_even_when_values_agree(legacy_k
         ("rollout_max_restart_attempts", 1.5),
     ],
 )
-def test_fault_tolerance_rejects_invalid_values_in_both_spellings(nested, key, value):
-    values = {key: value}
-    config = {"sglang_fault_tolerance_config": values} if nested else values
+def test_fault_tolerance_rejects_invalid_values(key, value):
     with pytest.raises(ValidationError, match=key):
-        get_sglang_fault_tolerance_config(config)
+        SGLangFaultToleranceConfig.model_validate({key: value})
 
 
 def test_invalid_fault_tolerance_fails_before_cluster_allocation(monkeypatch):
@@ -178,7 +186,7 @@ def test_failed_constructor_cleanup_is_repeatable_and_destructor_safe(
         original_destructor(instance)
 
     monkeypatch.setattr(SGLangGeneration, "__del__", record_destructor)
-    config = {"sglang_cfg": {}}
+    config = {"sglang_cfg": {"sglang_fault_tolerance_config": {}}}
     if invalid_config:
         config["sglang_cfg"]["sglang_fault_tolerance_config"] = {
             "rollout_max_restart_attempts": -1

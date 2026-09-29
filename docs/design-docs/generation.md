@@ -97,10 +97,9 @@ policy:
 
 Health intervals and timeouts are positive, finite seconds; the first-wait grace
 can be zero. The restart limit is a nonnegative integer per logical engine over
-the run's lifetime. Exhaustion aborts refit; zero disables restarts. Legacy flat
-fault-tolerance keys remain accepted when the nested block is absent. Do not mix
-both spellings: move existing overrides into `sglang_fault_tolerance_config`
-when inheriting the updated exemplar.
+the run's lifetime. Exhaustion aborts refit; zero disables restarts. The
+`sglang_fault_tolerance_config` block is required and inherited from the SGLang
+exemplar. An empty block uses the defaults above, including disabled recovery.
 
 The two router knobs require positive integers and configure only a router
 launched by NeMo-RL. Omitting them retains the pinned router's defaults. An
