@@ -1832,6 +1832,41 @@ def test_megatron_finalize_async_save_releases_colocated_nvrx_cache(
         assert events == [("finalize", False)]
 
 
+@pytest.mark.parametrize(
+    ("generation_cfg", "megatron_cfg", "expected"),
+    [
+        ({"colocated": {"enabled": False}}, {"offloaded_between_steps": True}, True),
+        ({"colocated": {"enabled": False}}, {}, False),
+        ({"colocated": {"enabled": True}}, {}, True),
+    ],
+    ids=["noncolocated_ppo", "noncolocated", "colocated"],
+)
+def test_megatron_nvrx_cache_release_covers_ppo_offload(
+    generation_cfg, megatron_cfg, expected
+):
+    """PPO offloads the policy every step even when generation is not colocated."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.cfg = {"generation": generation_cfg, "megatron_cfg": megatron_cfg}
+    worker.mcore_state = SimpleNamespace(
+        cfg=SimpleNamespace(
+            checkpoint=SimpleNamespace(
+                async_save=True,
+                use_persistent_ckpt_worker=True,
+                ckpt_assume_constant_structure=True,
+                async_ckpt_use_cpu_shm=False,
+            )
+        )
+    )
+
+    assert (
+        MegatronPolicyWorkerImpl._requires_nvrx_cuda_cache_release(worker) is expected
+    )
+
+
 def test_megatron_move_model_does_not_serialize_extra_state():
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
