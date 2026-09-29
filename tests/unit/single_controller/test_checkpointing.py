@@ -1852,12 +1852,18 @@ class TestPeriodicRolloutCheckpoint:
 
 
 class TestDataPlaneCheckpoint:
-    def test_metadata_uses_explicit_snapshot_identity(self, tmp_path):
+    @pytest.mark.parametrize("token_capture", [False, True])
+    @pytest.mark.parametrize("router_replay", [False, True])
+    def test_metadata_uses_explicit_snapshot_identity(
+        self, tmp_path, token_capture: bool, router_replay: bool
+    ):
         mc = _actor_master_config(
             tmp_path,
             max_num_steps=1,
             data_plane_checkpoint=True,
         )
+        mc.token_capture.enabled = token_capture
+        mc.policy["router_replay"] = {"enabled": router_replay}
         save_state = _initial_grpo_save_state()
         save_state.current_step = 3
         save_state.trainer_version = 7
@@ -1888,6 +1894,9 @@ class TestDataPlaneCheckpoint:
         assert metadata["single_controller_train_steps"] == 3
         assert metadata["single_controller_trainer_version"] == 7
         assert metadata["single_controller_epoch"] == 2
+        assert metadata.get("routed_experts_boundary_schema_version") == (
+            1 if token_capture and router_replay else None
+        )
 
     def test_saves_authoritative_tq_state_and_metadata_only_replay_index(
         self, tmp_path

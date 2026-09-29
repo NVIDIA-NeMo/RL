@@ -28,6 +28,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 
 nemo_gym = pytest.importorskip("nemo_gym.token_id_capture.staging")
 
@@ -63,6 +64,7 @@ def _fake_worker(*, is_model_owner: bool = True) -> SimpleNamespace:
     """The attribute surface setup_token_capture touches, minus the engine."""
     worker = SimpleNamespace(
         is_model_owner=is_model_owner,
+        cfg={"vllm_kwargs": {"enable_return_routed_experts": True}},
         token_capture=None,
         _rollout_weight_version=0,
         _chain_prefix=ChainPrefixCache(),
@@ -97,6 +99,29 @@ def test_setup_token_capture_installs_capture_with_vllm_adapter(monkeypatch):
     # The adapter is the vLLM one (prefix ids enter via the worker's field).
     payload = worker.token_capture.adapter.enter_prefix({}, [1, 2])
     assert payload["required_prefix_token_ids"] == [1, 2]
+
+
+@pytest.mark.parametrize("router_replay", [False, True])
+def test_setup_token_capture_requires_boundary_adapter_only_for_r3(
+    monkeypatch, router_replay: bool
+) -> None:
+    from nemo_gym.token_id_capture.adapters import vllm as adapter_module
+
+    monkeypatch.delattr(adapter_module, "ROUTED_EXPERTS_BOUNDARY_SCHEMA_VERSION")
+    monkeypatch.setattr(
+        "nemo_rl.data_plane.build_data_plane_client",
+        lambda dp_cfg, bootstrap: MagicMock(name="dp_client"),
+    )
+    worker = _fake_worker()
+    worker.cfg["vllm_kwargs"]["enable_return_routed_experts"] = router_replay
+    setup = VllmAsyncGenerationWorkerImpl.setup_token_capture(
+        worker, dp_cfg={"backend": "simple"}, staging_partition="rollout_staging"
+    )
+    if router_replay:
+        with pytest.raises(RuntimeError, match="Update Gym together"):
+            asyncio.run(setup)
+    else:
+        assert asyncio.run(setup)
 
 
 def test_setup_token_capture_skips_non_model_owners(monkeypatch):
@@ -339,6 +364,44 @@ def test_request_capture_token_in_prev_len_chains():
     assert coords["parent_call_id"] == "c1"
     assert (coords["delta_len"], coords["cum_len"]) == (3, 6)
     assert sink.records[0].token_ids_delta == [20, 21, 22]
+
+
+def test_request_capture_preserves_prefill_boundary_without_extending_delta():
+    """The child owns the route that repairs its parent's final decode token."""
+    from nemo_rl.utils.routed_experts_codec import decode_routed_experts
+
+    sink = _MemorySink()
+    worker = _worker_with_capture(sink)
+    request = _staging_chain_request()
+    admission = CaptureAdmission.model_validate(request.ng_capture)
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(
+        worker,
+        request,
+        [10, 11, 12, 20, 21],
+        admission=admission,
+        prefix_token_ids=[10, 11, 12],
+    )
+    content = _served_content([22], [-0.5])
+    routes = torch.arange(12, dtype=torch.int16).reshape(6, 1, 2)
+    content["choices"][0]["message"]["routed_experts"] = routes.tolist()
+
+    response = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+        worker, request, content
+    )
+
+    record = sink.records[0]
+    assert record.token_ids_delta == [20, 21, 22]
+    assert record.delta_len == 3
+    assert record.extras["routed_experts_boundary_index"] == 2
+    assert torch.equal(
+        decode_routed_experts(record.extras["routed_experts_boundary"], torch.int16),
+        routes[2:3],
+    )
+    assert torch.equal(
+        decode_routed_experts(record.extras["routed_experts"], torch.int16),
+        routes[3:],
+    )
+    assert "routed_experts_boundary" not in response["choices"][0]["message"]
 
 
 def _staging_chain_request(prev_len: int = 3) -> _FakeRequest:

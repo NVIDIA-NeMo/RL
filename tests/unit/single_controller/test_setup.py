@@ -2562,6 +2562,33 @@ class TestNativeTQRecoverySetup:
             checkpoint_path / DATA_PLANE_CHECKPOINT_DIR
         )
 
+    @pytest.mark.parametrize("boundary_version", [None, True, 1, 999])
+    def test_boundary_capture_requires_compatible_native_staging_schema(
+        self, tmp_path, boundary_version
+    ):
+        checkpoint_path = tmp_path / "step_3"
+        (checkpoint_path / DATA_PLANE_CHECKPOINT_DIR).mkdir(parents=True)
+        (checkpoint_path / REPLAY_BUFFER_METADATA_FILENAME).touch()
+        metadata = _native_tq_metadata()
+        if boundary_version is not None:
+            metadata["routed_experts_boundary_schema_version"] = boundary_version
+        restore = dict(
+            load_checkpoint=MagicMock(return_value=metadata),
+            last_checkpoint_path=str(checkpoint_path),
+            save_state=_save_state(),
+            partition_id="rollout_data",
+            sampler_name="in_order",
+            require_route_boundaries=True,
+        )
+        if type(boundary_version) is int and boundary_version == 1:
+            assert (
+                sc_setup_mod._maybe_restore_native_data_plane_checkpoint(**restore)
+                == metadata
+            )
+        else:
+            with pytest.raises(ValueError, match="boundary staging schema"):
+                sc_setup_mod._maybe_restore_native_data_plane_checkpoint(**restore)
+
     def test_validates_trainer_version_independently_from_train_step(self, tmp_path):
         checkpoint_path = tmp_path / "step_3"
         (checkpoint_path / DATA_PLANE_CHECKPOINT_DIR).mkdir(parents=True)

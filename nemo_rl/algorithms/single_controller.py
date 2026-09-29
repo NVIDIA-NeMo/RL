@@ -155,6 +155,7 @@ from nemo_rl.data_plane.schema import (
     DP_TRAIN_FIELDS,
     ROLLOUT_METRICS,
     ROUTE_PLAN_TAG,
+    ROUTED_EXPERTS_BOUNDARY_SCHEMA_VERSION,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lost
@@ -424,6 +425,14 @@ class SingleControllerActor:
                     sampler_name=master_config.async_rl.sampler.name,
                     opd_full_teacher_checkpoints=(
                         opd_module.opd_full_teacher_checkpoints_by_index(master_config)
+                    ),
+                    require_route_boundaries=(
+                        master_config.token_capture.enabled
+                        and bool(
+                            (master_config.policy.get("router_replay") or {}).get(
+                                "enabled"
+                            )
+                        )
                     ),
                 )
             )
@@ -1590,6 +1599,12 @@ class SingleControllerActor:
             "sampler_name": self._async_cfg.sampler.name,
             "mode": "authoritative" if replay_metadata is not None else "shadow",
         }
+        if self._master_config.token_capture.enabled and (
+            self._master_config.policy.get("router_replay") or {}
+        ).get("enabled"):
+            metadata["routed_experts_boundary_schema_version"] = (
+                ROUTED_EXPERTS_BOUNDARY_SCHEMA_VERSION
+            )
         if replay_metadata is not None:
             metadata["replay_metadata_schema_version"] = (
                 REPLAY_BUFFER_METADATA_SCHEMA_VERSION
