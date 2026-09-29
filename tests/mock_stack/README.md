@@ -62,3 +62,34 @@ repository's torch 2.11.0 dependency resolution required a Linux-only NCCL
 wheel. That validation does not cover the pinned Linux environment.
 The complete 24-test suite passed locally in 257 seconds; the checkpoint test
 itself took 179 seconds, excluding setup and teardown.
+
+## Recorded timelines
+
+Each `run()` writes `output/traces/<run-id>.jsonl` and returns its path as
+`Run.trace_path`. These are standard OpenTelemetry span JSON records, exported
+locally through the SDK with NeMo-RL's Lens `span_cm` helper. No collector or
+GPU is required. Each run has its own provider; other tests' telemetry settings
+are untouched. Keep pytest output with `--basetemp=/tmp/cpu-checkpoint-run`.
+
+The trace records generation (prompt, sibling, turn, requested delay), policy
+training, initial/step refits, policy restore, and controller checkpoint saves.
+`test.checkpoint.prepare_commit` covers parking participants and exporting
+state. `test.checkpoint.release` starts after snapshot publication; it is an
+upper bound on publication time, not the exact instant of the atomic rename.
+Generation spans measure mock computation, not the subsequent capture write
+or final Gym tool call. Trace timing alone does not prove saved state; the
+checkpoint assertions check that state separately.
+
+The parent branch includes checkpoint metrics (#3925) but predates Single
+Controller tracing (#4052) and its Lens upgrade. `tracing.py` observes the
+existing test adapters and controller methods so this PR stays limited to
+`tests/`. It does not claim distributed traces inside Ray or Gym workers.
+The wrappers also observe replacement implementations through the same
+methods; replacements do not need a new telemetry interface.
+
+For a plot, read each JSON line, group generation spans by `test.prompt` and
+`test.sibling`, and draw `start_time`–`end_time` intervals labeled `test.turn`.
+Align each run to its earliest generation start to exclude startup. Draw
+training, refit, and checkpoint spans on separate lanes. Compare counts and
+ordering exactly; display clock differences rather than requiring equal
+wall times. Preserve both original and restored trace files.

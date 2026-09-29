@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Literal, Protocol, runtime_checkable
 
@@ -18,6 +19,7 @@ from nemo_rl.data_plane.interfaces import DataPlaneClient
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
 from tests.mock_stack.components import Generated, Turn
 from tests.mock_stack.config import Prompt
+from tests.mock_stack.tracing import TraceRun
 
 
 @runtime_checkable
@@ -45,8 +47,14 @@ class Call:
 class GenerationServer:
     """OpenAI transport around replaceable computation and real Gym capture."""
 
-    def __init__(self, generation: TurnGenerator, prompts: list[Prompt]):
+    def __init__(
+        self,
+        generation: TurnGenerator,
+        prompts: list[Prompt],
+        trace: TraceRun | None = None,
+    ):
         self.generation = generation
+        self.trace = trace
         self.prompts = {prompt.id: prompt for prompt in prompts}
         self.calls: list[Call] = []
         self.capture: RolloutTokenCapture | None = None
@@ -106,9 +114,25 @@ class GenerationServer:
         )
         call = self.capture.begin_call(admission, prefix_token_ids=prefix)
         started = time.monotonic()
-        generated = await self.generation.generate(
-            Turn(prompt_id, sibling, turn_index, prompt.turn_seconds[sibling])
-        )
+        with (
+            self.trace.span(
+                "test.generation",
+                **{
+                    "test.prompt": prompt_id,
+                    "test.sample_id": admission.rollout_id,
+                    "test.sibling": sibling,
+                    "test.turn": turn_index,
+                    "test.requested_seconds": prompt.turn_seconds[sibling],
+                },
+            )
+            if self.trace
+            else nullcontext() as span
+        ):
+            generated = await self.generation.generate(
+                Turn(prompt_id, sibling, turn_index, prompt.turn_seconds[sibling])
+            )
+            if span is not None:
+                span.set_attribute("test.weight_digest", generated.weight_digest)
         prompt_tokens = prefix + list(prompt_id.encode()) + [turn_index]
         coords = await asyncio.to_thread(
             self.capture.complete_call,

@@ -20,6 +20,35 @@ from tests.mock_stack.config import ComponentSpec, Prompt, Scenario
 from tests.mock_stack.runner import GYM, ROOT, run
 
 
+def assert_trace(observed, expected_calls, expected_steps):
+    spans = [json.loads(line) for line in observed.trace_path.read_text().splitlines()]
+    generation = [s for s in spans if s["name"] == "test.generation"]
+    assert len(generation) == expected_calls
+    assert sorted(
+        (
+            s["attributes"]["test.prompt"],
+            s["attributes"]["test.sibling"],
+            s["attributes"]["test.turn"],
+            s["attributes"]["test.sample_id"],
+        )
+        for s in generation
+    ) == sorted((c.prompt, c.sibling, c.turn, c.capture_key) for c in observed.calls)
+    assert len([s for s in spans if s["name"] == "test.policy.train"]) == expected_steps
+    assert any(s["name"] == "test.refit" for s in spans)
+    assert len({s["context"]["trace_id"] for s in spans}) == 1
+    assert all(s["status"]["status_code"] != "ERROR" for s in spans)
+    checkpoints = [s for s in spans if s["name"] == "test.checkpoint.prepare_commit"]
+    for checkpoint in checkpoints:
+        release = next(
+            s
+            for s in spans
+            if s["name"] == "test.checkpoint.release"
+            and s["attributes"] == checkpoint["attributes"]
+        )
+        assert checkpoint["end_time"] <= release["start_time"]
+    assert checkpoints
+
+
 @pytest.fixture
 def cpu_ray(monkeypatch):
     monkeypatch.setenv("NEMO_RL_PY_EXECUTABLES_SYSTEM", "1")
@@ -47,6 +76,7 @@ def test_cpu_controller_smoke(cpu_ray, tmp_path):
         (sibling, turn) for sibling in range(3) for turn in (1, 2)
     ]
     assert observed.batches[0][1]["total_reward"].tolist() == [1.0, 2.0, 3.0]
+    assert_trace(observed, 6, 1)
 
 
 @pytest.mark.timeout(300)
@@ -96,6 +126,8 @@ def test_checkpoint_restore(cpu_ray, tmp_path):
     ray.shutdown()
     ray.init(num_cpus=8, num_gpus=0, include_dashboard=False)
     restored = run(scenario, tmp_path)
+    assert_trace(original, 51, 4)
+    assert_trace(restored, 20, 2)
 
     assert Path(restored.restored_checkpoint) == snapshot
     assert restored.result["train_steps"] == 4

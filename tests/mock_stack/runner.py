@@ -40,6 +40,7 @@ from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 from tests.mock_stack.config import Scenario
 from tests.mock_stack.runtime import GenerationHandle, TrainablePolicy, Trainer
 from tests.mock_stack.servers import Call, GenerationServer, TurnGenerator
+from tests.mock_stack.tracing import TraceRun, TracedRefit
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
@@ -53,6 +54,7 @@ class Run:
     calls: list[Call]
     restored_checkpoint: str | None
     restored_calls: list[StagedCallBaseSnapshot]
+    trace_path: Path
 
 
 @ray.remote(num_cpus=1, num_gpus=0)
@@ -161,6 +163,11 @@ def dataset(scenario: Scenario) -> list[dict]:
 
 def run(scenario: Scenario, output: Path) -> Run:
     """Run once. Existing checkpoint discovery decides whether this is a restore."""
+    with TraceRun(output) as trace:
+        return _run(scenario, output, trace)
+
+
+def _run(scenario: Scenario, output: Path, trace: TraceRun) -> Run:
     config = make_config(scenario, output)
     tokenizer = PreTrainedTokenizerFast(
         tokenizer_object=Tokenizer(
@@ -180,7 +187,8 @@ def run(scenario: Scenario, output: Path) -> Run:
     ):
         if not isinstance(component, contract):
             raise TypeError(f"{name} must implement {contract.__name__}")
-    server = GenerationServer(generation, scenario.prompts)
+    refit = TracedRefit(refit, trace)
+    server = GenerationServer(generation, scenario.prompts, trace=trace)
     handle = GenerationHandle(server)
     trainer = None
     shards = None
@@ -188,11 +196,12 @@ def run(scenario: Scenario, output: Path) -> Run:
     def build_trainer(*args, weights_path, **kwargs):
         nonlocal trainer
         if weights_path is not None:
-            policy.load_checkpoint(Path(weights_path))
+            with trace.span("test.policy.restore"):
+                policy.load_checkpoint(Path(weights_path))
         plane = build_data_plane_client(
             config.data_plane, bootstrap=True, checkpointing=True
         )
-        trainer = Trainer(policy, plane)
+        trainer = Trainer(policy, plane, trace=trace)
         return trainer, 0.0
 
     def spinup(master_config, base_urls, tokenizer):
@@ -240,6 +249,8 @@ def run(scenario: Scenario, output: Path) -> Run:
         controller = SingleControllerActor.__ray_metadata__.modified_class(
             config, args, timing
         )
+        trace.root.set_attribute("test.restored", args.last_checkpoint_path is not None)
+        trace.controller(controller)
         result = asyncio.run(asyncio.wait_for(controller.run(), timeout=300))
         return Run(
             result,
@@ -247,6 +258,7 @@ def run(scenario: Scenario, output: Path) -> Run:
             server.calls,
             args.last_checkpoint_path,
             restored_calls,
+            trace.path,
         )
     finally:
         if shards is not None:

@@ -8,6 +8,7 @@ from __future__ import annotations
 import socket
 import threading
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -19,6 +20,7 @@ from nemo_rl.data_plane.column_io import read_columns, write_columns
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 from tests.mock_stack.servers import GenerationServer
+from tests.mock_stack.tracing import TraceRun
 
 
 @runtime_checkable
@@ -37,9 +39,15 @@ class TrainablePolicy(Protocol):
 
 
 class Trainer:
-    def __init__(self, policy: TrainablePolicy, plane: DataPlaneClient):
+    def __init__(
+        self,
+        policy: TrainablePolicy,
+        plane: DataPlaneClient,
+        trace: TraceRun | None = None,
+    ):
         self.policy = policy
         self.plane = plane
+        self.trace = trace
         self.batches: list[tuple[list[str], dict[str, torch.Tensor]]] = []
         self._pending: tuple[list[str], dict[str, torch.Tensor]] | None = None
         self._step_open = False
@@ -71,7 +79,14 @@ class Trainer:
     def finish_train_step(self) -> dict:
         if self._pending is None:
             raise RuntimeError("Training step has no batch")
-        self.policy.train(self._pending[1])
+        with (
+            self.trace.span(
+                "test.policy.train", **{"test.sample_ids": self._pending[0]}
+            )
+            if self.trace
+            else nullcontext()
+        ):
+            self.policy.train(self._pending[1])
         self.batches.append(self._pending)
         self._pending = None
         self._step_open = False
