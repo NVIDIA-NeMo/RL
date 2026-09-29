@@ -993,7 +993,7 @@ class TestSetup:
         ):
             validate_single_controller_config(mc)
 
-    def test_prefix_checkpointing_rejects_multiple_gym_shards_before_setup(self):
+    def test_prefix_checkpointing_accepts_multiple_single_replica_gym_shards(self):
         mc = _make_master_config(
             env={
                 "should_use_nemo_gym": True,
@@ -1014,11 +1014,7 @@ class TestSetup:
             },
         )
 
-        with pytest.raises(
-            NotImplementedError,
-            match="aggregate every policy proxy's generation-cut proof",
-        ):
-            validate_single_controller_config(mc)
+        validate_single_controller_config(mc)
 
     def test_gym_checkpointing_accepts_one_explicit_shard(self):
         mc = _make_master_config(
@@ -2629,6 +2625,89 @@ class TestSetup:
 
 
 class TestNativeTQRecoverySetup:
+    @pytest.mark.parametrize(
+        ("generation_prefix_cuts_enabled", "expected_model_restores"),
+        [(False, 1), (True, 2)],
+    )
+    def test_sharded_gym_restore_fans_model_phase_out_for_prefix_cuts(
+        self,
+        tmp_path: Path,
+        generation_prefix_cuts_enabled: bool,
+        expected_model_restores: int,
+    ) -> None:
+        operation_id = "restore-operation"
+        restored = {"checkpoint_id": operation_id, "participants": []}
+        first = MagicMock()
+        second = MagicMock()
+        first.restore_checkpoint.remote.side_effect = [restored, restored]
+        second.restore_checkpoint.remote.side_effect = (
+            [restored, restored] if generation_prefix_cuts_enabled else [restored]
+        )
+        gym_shards = NemoGymShardSet(
+            handles={"first": [first], "second": [second]},
+        )
+
+        with patch.object(sc_setup_mod.ray, "get", side_effect=lambda refs: refs):
+            result = sc_setup_mod._restore_sharded_gym_checkpoint(
+                gym_shards=gym_shards,
+                restore_operation_id=operation_id,
+                checkpoint_path=tmp_path,
+                source_checkpoint_id="checkpoint-source",
+                generation_cut_proofs=(),
+                generation_cut_exclusions=(),
+                generation_prefix_cuts_enabled=generation_prefix_cuts_enabled,
+                timeout_s=30.0,
+            )
+
+        assert result.checkpoint_id == operation_id
+        calls = [
+            *first.restore_checkpoint.remote.call_args_list,
+            *second.restore_checkpoint.remote.call_args_list,
+        ]
+        assert sum(call.args[-1] == ["responses_api_models"] for call in calls) == (
+            expected_model_restores
+        )
+        assert (
+            sum(
+                call.args[-1] == ["responses_api_agents", "resources_servers"]
+                for call in calls
+            )
+            == 2
+        )
+
+    def test_sharded_gym_restore_rejects_wrong_model_operation_id(
+        self, tmp_path: Path
+    ) -> None:
+        operation_id = "restore-operation"
+        first = MagicMock()
+        second = MagicMock()
+        first.restore_checkpoint.remote.return_value = {
+            "checkpoint_id": operation_id,
+            "participants": [],
+        }
+        second.restore_checkpoint.remote.return_value = {
+            "checkpoint_id": "wrong-operation",
+            "participants": [],
+        }
+        gym_shards = NemoGymShardSet(
+            handles={"first": [first], "second": [second]},
+        )
+
+        with (
+            patch.object(sc_setup_mod.ray, "get", side_effect=lambda refs: refs),
+            pytest.raises(RuntimeError, match="wrong operation ID"),
+        ):
+            sc_setup_mod._restore_sharded_gym_checkpoint(
+                gym_shards=gym_shards,
+                restore_operation_id=operation_id,
+                checkpoint_path=tmp_path,
+                source_checkpoint_id="checkpoint-source",
+                generation_cut_proofs=(),
+                generation_cut_exclusions=(),
+                generation_prefix_cuts_enabled=True,
+                timeout_s=30.0,
+            )
+
     def test_simple_storage_setup_loads_tq_before_creating_controller_client(
         self, tmp_path, patched_factories
     ):

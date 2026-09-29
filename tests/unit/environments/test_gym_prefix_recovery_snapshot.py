@@ -69,8 +69,13 @@ def test_is_recoverable_active_prefix(
     )
 
 
-def test_agent_records_reads_archive_only_checkpoint(tmp_path: Path) -> None:
-    directory = tmp_path / "gym" / "agent"
+@pytest.mark.parametrize("sharded", [False, True])
+def test_agent_records_reads_archive_only_checkpoint(
+    tmp_path: Path,
+    sharded: bool,
+) -> None:
+    commit_root = tmp_path / "gym-shards" / "counter" if sharded else tmp_path
+    directory = commit_root / "gym" / "agent"
     directory.mkdir(parents=True)
     member_name = "rollout-a.a0.json"
     record = {
@@ -112,7 +117,7 @@ def test_agent_records_reads_archive_only_checkpoint(tmp_path: Path) -> None:
             }
         ],
         "record_index": {
-            "relative_path": str(index_path.relative_to(tmp_path)),
+            "relative_path": str(index_path.relative_to(commit_root)),
             "sha256": _sha256(index_payload),
             "records": 1,
             "bytes": len(index_payload),

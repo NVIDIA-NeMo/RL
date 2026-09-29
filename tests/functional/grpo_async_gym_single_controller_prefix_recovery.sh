@@ -10,7 +10,7 @@ BASE_RUN_LOG=$SCRIPT_DIR/grpo_async_gym_single_controller/run.log
 RECOVERY_HOOK=$SCRIPT_DIR/_single_controller_sibling_recovery_hook.py
 SNAPSHOT_HELPER=$SCRIPT_DIR/_gym_prefix_recovery_snapshot.py
 PROFILE=${SC_GYM_PREFIX_RECOVERY_PROFILE:-basic}
-if [[ "$PROFILE" != "basic" && "$PROFILE" != "workplace" ]]; then
+if [[ "$PROFILE" != "basic" && "$PROFILE" != "workplace" && "$PROFILE" != "sharded" ]]; then
     echo "[ERROR] Unsupported SC_GYM_PREFIX_RECOVERY_PROFILE=$PROFILE"
     exit 2
 fi
@@ -39,6 +39,15 @@ if [[ "$PROFILE" == "workplace" ]]; then
     DEFAULT_SNAPSHOT_INTERVAL_S=0.25
     DEFAULT_MIN_GENERATION_TOKENS=1024
     DEFAULT_MAX_TOTAL_SEQUENCE_LENGTH=2048
+elif [[ "$PROFILE" == "sharded" ]]; then
+    # A two-shard checkpoint performs peer-fragment and leader-union commits.
+    # Give both Gym actors time to dispatch before the first cut, then keep the
+    # decode alive through the longer transaction so the published ledger
+    # contains an unfinished prefix rather than a pre-generation failure or a
+    # fully committed call.
+    DEFAULT_SNAPSHOT_INTERVAL_S=1
+    DEFAULT_MIN_GENERATION_TOKENS=4096
+    DEFAULT_MAX_TOTAL_SEQUENCE_LENGTH=8192
 fi
 SNAPSHOT_INTERVAL_S=${SC_GYM_PREFIX_RECOVERY_INTERVAL_S:-$DEFAULT_SNAPSHOT_INTERVAL_S}
 PHASE2_SNAPSHOT_INTERVAL_S=${SC_GYM_PREFIX_RECOVERY_PHASE2_INTERVAL_S:-600}
@@ -63,6 +72,7 @@ rm -rf "$TEST_DIR"
 mkdir -p "$TEST_DIR"
 
 CHECKPOINT_TEST_ENV=()
+GYM_LAYOUT_OVERRIDES=()
 if [[ "$PROFILE" == "basic" ]]; then
     # Keep the first policy call alive long enough for a periodic checkpoint to
     # cut a non-empty prefix. No tools are exposed so this profile isolates the
@@ -85,7 +95,7 @@ if [[ "$PROFILE" == "basic" ]]; then
         ' "$GYM_ROOT/resources_servers/example_session_state_mgmt/data/example.jsonl" \
         > "$TEST_DATA"
     GYM_CONFIG_PATHS='[responses_api_models/vllm_model/configs/vllm_model_for_training.yaml,responses_api_agents/checkpoint_test_agent/configs/example_session_state_mgmt.yaml]'
-else
+elif [[ "$PROFILE" == "workplace" ]]; then
     # Call one deterministically mutates Workplace. The checkpoint test agent
     # rewrites call two into a long tool-free decode so the selected snapshot
     # contains both the committed turn and an active generation prefix.
@@ -120,6 +130,57 @@ else
     ' "$GYM_ROOT/resources_servers/workplace_assistant/data/example.jsonl" \
         > "$TEST_DATA"
     GYM_CONFIG_PATHS='[responses_api_models/vllm_model/configs/vllm_model_for_training.yaml,responses_api_agents/checkpoint_test_agent/configs/workplace_assistant_prefix_recovery.yaml]'
+else
+    # The lexicographically first shard (counter) owns the checkpoint leader.
+    # Force the second shard (workplace) into a long first call. With no prior
+    # committed turn, its prefix can reach the leader only through the peer
+    # generation-cut index rather than an agent continuation root.
+    jq -c -s --argjson min_tokens "$MIN_GENERATION_TOKENS" '
+        limit(1; .[])
+        | .task_source = "example_session_state_mgmt_simple_agent"
+        | .responses_create_params.input = [{
+            "role": "user",
+            "content": "Write a long numbered list. Continue until the output limit and do not call tools."
+          }]
+        | .responses_create_params.tools = []
+        | .responses_create_params.tool_choice = "none"
+        | .responses_create_params.max_output_tokens = $min_tokens
+        | .responses_create_params.metadata = ((.responses_create_params.metadata // {}) + {
+            "extra_body": ({"min_tokens": $min_tokens} | tojson)
+          })
+    ' "$GYM_ROOT/resources_servers/example_session_state_mgmt/data/example.jsonl" \
+        > "$TEST_DATA"
+    jq -c -s --argjson min_tokens "$MIN_GENERATION_TOKENS" '
+        limit(1; .[])
+        | .task_source = "workplace_assistant_prefix_checkpoint_test_agent"
+        | .responses_create_params.input = [{
+            "role": "user",
+            "content": "Write a long numbered list. Continue until the output limit and do not call tools."
+          }]
+        | .responses_create_params.tools = []
+        | .responses_create_params.tool_choice = "none"
+        | .responses_create_params.max_output_tokens = $min_tokens
+        | .responses_create_params.metadata = ((.responses_create_params.metadata // {}) + {
+            "extra_body": ({"min_tokens": $min_tokens} | tojson)
+          })
+    ' "$GYM_ROOT/resources_servers/workplace_assistant/data/example.jsonl" \
+        >> "$TEST_DATA"
+    GYM_LAYOUT_OVERRIDES=(
+        'env.nemo_gym.config_paths=null'
+        '~env.nemo_gym.code_gen'
+        '+env.nemo_gym.placement_strategy=PACK'
+        '+env.nemo_gym.common_inherited_overlays=[policy_model]'
+        '+env.nemo_gym.allowed_duplicate_entries=[policy_model]'
+        '+env.nemo_gym.shards=[{name:counter,port_range_low:5000,port_range_high:5499,config_paths:[responses_api_models/vllm_model/configs/vllm_model_for_training.yaml,responses_api_agents/checkpoint_test_agent/configs/example_session_state_mgmt.yaml]},{name:workplace,port_range_low:5500,port_range_high:5999,config_paths:[responses_api_models/vllm_model/configs/vllm_model_for_training.yaml,responses_api_agents/checkpoint_test_agent/configs/workplace_assistant_prefix_recovery.yaml]}]'
+    )
+fi
+if [[ "$PROFILE" != "sharded" ]]; then
+    GYM_LAYOUT_OVERRIDES=(
+        "env.nemo_gym.config_paths=$GYM_CONFIG_PATHS"
+        '~env.nemo_gym.code_gen'
+    )
+fi
+if [[ "$PROFILE" == "workplace" ]]; then
     CHECKPOINT_TEST_ENV=(
         NEMO_GYM_TEST_WORKPLACE_PREFIX_AFTER_MUTATION=1
         NEMO_GYM_TEST_PREFIX_MIN_TOKENS="$MIN_GENERATION_TOKENS"
@@ -182,8 +243,7 @@ COMMON_OVERRIDES=(
     policy.generation.max_new_tokens="$MIN_GENERATION_TOKENS"
     policy.train_global_batch_size="$TRAIN_GLOBAL_BATCH_SIZE"
     policy.generation.temperature=1.0
-    "env.nemo_gym.config_paths=$GYM_CONFIG_PATHS"
-    '~env.nemo_gym.code_gen'
+    "${GYM_LAYOUT_OVERRIDES[@]}"
 )
 
 echo "=== Phase 1: checkpoint a non-empty active generation prefix ==="

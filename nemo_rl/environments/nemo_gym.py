@@ -1628,11 +1628,14 @@ Depending on your data shape, you may want to change these values."""
         checkpoint_dir: str,
         components: Optional[list[GymComponent]] = None,
         continuation_indexes: Optional[list[dict[str, Any]]] = None,
+        generation_cut_indexes: Optional[list[dict[str, Any]]] = None,
     ) -> dict[str, Any]:
         """Commit selected participants in concurrent dependency stages.
 
-        A sharded coordinator first commits each actor's agents, then supplies
-        their combined continuation indexes to the one shared model commit.
+        ``components`` and the supplied artifact indexes let a controller
+        coordinate several Gym actors: local agents and peer cut fragments
+        commit first, then one shared model commit receives their union. The
+        default preserves the original single-actor transaction.
         """
         # Gym is available in this actor environment but not on the SC driver.
         from nemo_gym._checkpoint import (
@@ -1656,6 +1659,10 @@ Depending on your data shape, you may want to change these values."""
         supplied_continuation_indexes = [
             GymCheckpointArtifactReference.model_validate(item)
             for item in continuation_indexes or []
+        ]
+        validated_generation_cut_indexes = [
+            GymCheckpointArtifactReference.model_validate(item)
+            for item in generation_cut_indexes or []
         ]
         participants = self._ordered_checkpoint_participants(
             phase=GymCheckpointPhase.COMMIT,
@@ -1737,6 +1744,7 @@ Depending on your data shape, you may want to change these values."""
         async def commit_model(
             discovered: GymDiscoveredParticipant,
             continuation_indexes: list[GymCheckpointArtifactReference],
+            generation_cut_indexes: list[GymCheckpointArtifactReference],
         ) -> GymParticipantCommitResult:
             participant = discovered.participant
             request = ModelCheckpointCommitRequest(
@@ -1745,6 +1753,9 @@ Depending on your data shape, you may want to change these values."""
                 checkpoint_dir=checkpoint_dir,
                 continuation_indexes=[
                     item.model_dump(mode="json") for item in continuation_indexes
+                ],
+                generation_cut_indexes=[
+                    item.model_dump(mode="json") for item in generation_cut_indexes
                 ],
             ).model_dump(mode="json")
             payload = GymModelCommitResponse.model_validate(
@@ -1800,7 +1811,11 @@ Depending on your data shape, you may want to change these values."""
         ]
         model_results = await commit_stage(
             [
-                commit_model(discovered, all_continuation_indexes)
+                commit_model(
+                    discovered,
+                    all_continuation_indexes,
+                    validated_generation_cut_indexes,
+                )
                 for discovered in models
             ]
         )
@@ -3252,6 +3267,15 @@ class NemoGymShardSet:
             for shard_name, replicas in sorted(self.handles.items())
             for index, handle in enumerate(replicas)
         )
+
+    def model_restore_instances(
+        self,
+        *,
+        generation_prefix_cuts_enabled: bool,
+    ) -> tuple[tuple[str, Any], ...]:
+        """Return proxies that must restore and resume shared model state."""
+        instances = self.checkpoint_instances
+        return instances if generation_prefix_cuts_enabled else instances[:1]
 
     def checkpoint_handle_for_route(self, route_name: str) -> Any:
         """Return the sole checkpoint actor that owns one routed Gym entry."""
