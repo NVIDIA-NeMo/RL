@@ -24,10 +24,8 @@
 # Optional isolated managed Dynamo runtime (Dynamo + vLLM only):
 #   --build-arg BUILD_DYNAMO=1
 #
-# TRT-LLM is not built here -- see docker/Dockerfile.trtllm. TRT-LLM's own
-# requirements.txt needs a torch version incompatible with the override this
-# file's venvs pin (torch==2.11.0); docker/Dockerfile.trtllm resolves that by
-# inheriting a dlfw base image's native torch instead.
+# TRT-LLM is not built here -- see docker/Dockerfile.trtllm, which builds it
+# against a dlfw base image's native torch.
 
 ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.05-cuda13.2-devel-ubuntu24.04
 FROM scratch AS nemo-rl

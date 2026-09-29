@@ -248,6 +248,12 @@ trtllm = [
   "torch==2.13.0",
   "torchvision==0.28.0",
   "tensorrt-llm==1.3.0rc28",
+  # tensorrt-llm pins nvidia-cutlass-dsl[cu13]==4.8.0.dev0; uv only admits pre-releases
+  # that are requested explicitly, so name its pre-release sub-packages here too.
+  "nvidia-cutlass-dsl-libs-base==4.8.0.dev0",
+  "nvidia-cutlass-dsl-libs-core==4.8.0.dev0",
+  "nvidia-cutlass-dsl-libs-cu12==4.8.0.dev0",
+  "nvidia-cutlass-dsl-libs-cu13==4.8.0.dev0",
   "transformers==5.5.4",
   "tilelang==0.1.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
