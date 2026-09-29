@@ -37,6 +37,7 @@ from nemo_rl.models.megatron.alignment import (
     get_fp8_token_alignment,
     get_parallel_token_alignment,
 )
+from nemo_rl.models.megatron.attention import register_cu_seqlens
 from nemo_rl.models.megatron.common import _round_up_to_multiple
 from nemo_rl.models.megatron.hybridep import (
     get_packed_seq_padding_mask,
@@ -384,7 +385,10 @@ def _prepacked_boundary(
         value = value[0]
     if not torch.is_tensor(value) or value.ndim != 1:
         raise ValueError(f"{key} must be a one-dimensional tensor.")
-    return value.to(device=device, dtype=torch.int32)
+    result = value.to(device=device, dtype=torch.int32)
+    if value.device.type == "cpu":
+        register_cu_seqlens(result, value.tolist())
+    return result
 
 
 def _slice_prepacked_for_cp(value: torch.Tensor, padded: torch.Tensor) -> torch.Tensor:
@@ -1313,6 +1317,7 @@ def _prepare_vlm_batch_for_megatron(
     for p in padded_lens:
         cu_vals.append(cu_vals[-1] + p)
     cu_seqlens_padded = torch.tensor(cu_vals, dtype=torch.int32, device=device)
+    register_cu_seqlens(cu_seqlens_padded, cu_vals)
 
     packed_seq_params = PackedSeqParams(
         qkv_format="thd",
@@ -1412,18 +1417,24 @@ def _pack_sequences_for_megatron(
             padded_seq_len = _round_up_to_multiple(seq_len, pad_factor)
             cu_seqlens_padded.append(cu_seqlens_padded[-1] + padded_seq_len)
 
-    # Convert to tensors
-    cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32, device=input_ids.device)
+    # Finalize host boundaries before their only device copy.
+    host_cu_seqlens = tuple(cu_seqlens)
     if needs_padding:
-        cu_seqlens_padded = torch.tensor(
-            cu_seqlens_padded, dtype=torch.int32, device=input_ids.device
-        )
         if pad_packed_seq_to is not None:
             cu_seqlens_padded[-1] = pad_packed_seq_to
         elif pad_packed_seq_to_multiple_of > 1:
             cu_seqlens_padded[-1] = _round_up_to_multiple(
                 cu_seqlens_padded[-1], pad_packed_seq_to_multiple_of
             )
+        host_cu_seqlens_padded = tuple(cu_seqlens_padded)
+        cu_seqlens_padded = torch.tensor(
+            host_cu_seqlens_padded, dtype=torch.int32, device=input_ids.device
+        )
+        register_cu_seqlens(cu_seqlens_padded, host_cu_seqlens_padded)
+    cu_seqlens = torch.tensor(
+        host_cu_seqlens, dtype=torch.int32, device=input_ids.device
+    )
+    register_cu_seqlens(cu_seqlens, host_cu_seqlens)
 
     # Calculate max sequence length (padded if using CP)
     if needs_padding:
@@ -1512,6 +1523,7 @@ def _pack_sequences_for_megatron(
 
     if cu_seqlens_padded is None:
         cu_seqlens_padded = cu_seqlens.clone()
+        register_cu_seqlens(cu_seqlens_padded, host_cu_seqlens)
 
     # total_tokens is required for PackedSeqParams.__post_init__ to build
     # seq_idx, which Mamba uses to reset SSM state at sample boundaries.
