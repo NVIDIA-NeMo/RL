@@ -51,8 +51,7 @@ rollout_checkpointing:
   snapshot_attempt_interval_s: 3600
   restore_mode: latest
   gym:
-    capability_discovery_enabled: true
-    participant_checkpointing_enabled: true
+    mode: turn_recovery
     prepare_timeout_s: 30
 logger:
   monitor_gpus: false
