@@ -683,7 +683,6 @@ jobs:
       uv-cache-tag: ${{ vars.UV_BUILD_CACHE == 'enabled' && 'uv-cache-trtllm-arm64' || '' }}
       build-contexts: |
         nemo-rl=.
-        ${{ vars.UV_BUILD_CACHE == 'enabled' && format('uv-cache-seed=docker-image://{0}/{1}:uv-cache-trtllm-arm64', needs.gb200-config.outputs.registry, vars.CI_CONTAINER_NAME) || '' }}
       build-args: |
         TRTLLM_BUILD_JOBS=8
 
@@ -723,7 +722,6 @@ jobs:
       uv-cache-tag: ${{ vars.UV_BUILD_CACHE == 'enabled' && 'uv-cache-trtllm-amd64' || '' }}
       build-contexts: |
         nemo-rl=.
-        ${{ vars.UV_BUILD_CACHE == 'enabled' && format('uv-cache-seed=docker-image://{0}/{1}:uv-cache-trtllm-amd64', needs.org-member-pre-flight.outputs.registry, vars.CI_CONTAINER_NAME) || '' }}
       build-args: |
         TRTLLM_BUILD_JOBS=24
         BUILD_CUSTOM_TRTLLM_ARCH=90-real

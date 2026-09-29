@@ -63,7 +63,7 @@ on:
       uv-cache-tag:
         required: false
         default: ""
-        description: Tag to export the Dockerfile's uv-cache target to on builds of main (for Dockerfiles that keep the uv cache in a builder-local mount). Seed it back via build-contexts (uv-cache-seed=docker-image://...). Empty disables.
+        description: Tag of this image's uv cache image, for Dockerfiles that keep the uv cache in a builder-local mount. If it exists it seeds the Dockerfile's uv-cache-seed context (otherwise the build starts with an empty cache), and builds of main export the Dockerfile's uv-cache target to it. Empty disables.
         type: string
       dockerfile:
         required: true
@@ -275,6 +275,22 @@ jobs:
             configure_export wheel "$WHEEL_SEED_REF" trtllm-wheel-cache-output-base "wheel cache"
           fi
 
+      - name: Resolve uv cache seed
+        id: uv_cache_seed
+        if: inputs.uv-cache-tag != ''
+        shell: bash
+        env:
+          UV_CACHE_TAG: ${{ inputs.uv-cache-tag }}
+        run: |
+          set -euo pipefail
+          ref="$REGISTRY/$IMAGE_NAME:$UV_CACHE_TAG"
+          if docker buildx imagetools inspect "$ref" >/dev/null 2>&1; then
+            echo "Using uv cache seed $ref"
+            echo "context=uv-cache-seed=docker-image://$ref" >> "$GITHUB_OUTPUT"
+          else
+            echo "No uv cache image found at $ref; starting with an empty cache"
+          fi
+
       - name: Get recently merged PR cache refs
         id: recent_pr_cache_refs
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
@@ -356,6 +372,7 @@ jobs:
             ${{ inputs.build-contexts }}
             ${{ steps.trtllm_cache_seed.outputs.ccache_context }}
             ${{ steps.trtllm_cache_seed.outputs.wheel_context }}
+            ${{ steps.uv_cache_seed.outputs.context }}
           build-args: ${{ inputs.build-args }}
           cache-from: |
             ${{ steps.build_meta.outputs.cache-from }}
@@ -369,14 +386,18 @@ jobs:
       - name: Update uv cache image
         # Main only, so PR builds see a stable seed (the seed is bound into the
         # venv layer, so a new seed invalidates that layer's BuildKit cache).
-        if: inputs.uv-cache-tag != '' && github.ref == 'refs/heads/main'
+        # TEMP: also on PR branches to bootstrap the trtllm uv cache images; restore
+        # `&& github.ref == 'refs/heads/main'` after the first run.
+        if: inputs.uv-cache-tag != ''
         uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
           file: ${{ inputs.dockerfile }}
           push: true
           context: .
           platforms: ${{ inputs.platform }}
-          build-contexts: ${{ inputs.build-contexts }}
+          build-contexts: |
+            ${{ inputs.build-contexts }}
+            ${{ steps.uv_cache_seed.outputs.context }}
           build-args: |
             ${{ inputs.build-args }}
             UV_CACHE_EXPORT_NONCE=${{ github.run_id }}-${{ github.run_attempt }}
