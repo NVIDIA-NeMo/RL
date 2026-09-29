@@ -47,10 +47,6 @@ from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration  # noq
 from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
     VllmAsyncGenerationWorkerImpl,
 )
-from nemo_rl.utils.routed_experts_codec import (  # noqa: E402
-    decode_routed_experts,
-    encode_routed_experts,
-)
 
 pytestmark = pytest.mark.nemo_gym
 
@@ -58,9 +54,16 @@ pytestmark = pytest.mark.nemo_gym
 class _MemorySink:
     def __init__(self) -> None:
         self.records: list[StagedCallRecord] = []
+        self.attachments: list[dict[str, torch.Tensor] | None] = []
 
-    def stage(self, record: StagedCallRecord) -> StageResult:
+    def stage(
+        self,
+        record: StagedCallRecord,
+        *,
+        attachments: dict[str, torch.Tensor] | None = None,
+    ) -> StageResult:
         self.records.append(record)
+        self.attachments.append(attachments)
         return StageResult(ok=True, staging_key=record.staging_key)
 
 
@@ -301,11 +304,16 @@ def test_request_capture_round_trip_stages_and_rides_coords(
         -0.2,
     ]
     if with_routed_experts:
-        assert sink.records[0].extras["routed_experts"] == encode_routed_experts(
-            torch.zeros((5, 1, 1), dtype=torch.int16)
+        metadata = sink.records[0].extras["routed_experts"]
+        assert metadata["dtype"] == "int16"
+        assert metadata["shape"] == [5, 1, 1]
+        torch.testing.assert_close(
+            sink.attachments[0]["routed_experts"],
+            torch.zeros((5, 1, 1), dtype=torch.int16),
         )
     else:
         assert sink.records[0].extras is None
+        assert sink.attachments[0] is None
     coords = content["ng_commit_coords"]
     assert coords["disposition"] == "staged"
     assert (coords["delta_len"], coords["cum_len"]) == (5, 5)
@@ -321,17 +329,15 @@ def test_request_capture_round_trip_stages_and_rides_coords(
 
 
 @pytest.mark.parametrize("dtype", [torch.int8, torch.int16, torch.int32])
-def test_request_capture_token_in_slices_routes_before_encoding(monkeypatch, dtype):
-    def reject_decode(*args, **kwargs):
-        pytest.fail("capture delta alignment must not decode route envelopes")
+def test_request_capture_token_in_prev_len_chains_without_codec(monkeypatch, dtype):
+    def reject_codec(*args, **kwargs):
+        pytest.fail("worker-owned capture must not encode or decode route envelopes")
 
-    encoder = MagicMock(wraps=encode_routed_experts)
     monkeypatch.setattr(
-        "nemo_rl.models.generation.vllm.vllm_worker_async.encode_routed_experts",
-        encoder,
+        "nemo_rl.utils.routed_experts_codec.encode_routed_experts", reject_codec
     )
     monkeypatch.setattr(
-        "nemo_rl.utils.routed_experts_codec.decode_routed_experts", reject_decode
+        "nemo_rl.utils.routed_experts_codec.decode_routed_experts", reject_codec
     )
     sink = _MemorySink()
     worker = _worker_with_capture(sink)
@@ -361,15 +367,11 @@ def test_request_capture_token_in_slices_routes_before_encoding(monkeypatch, dty
     assert coords["parent_call_id"] == "c1"
     assert (coords["delta_len"], coords["cum_len"]) == (3, 6)
     assert sink.records[0].token_ids_delta == [20, 21, 22]
-    encoder.assert_called_once()
-    encoded_slice = encoder.call_args.args[0]
-    torch.testing.assert_close(encoded_slice, routes[3:])
-    assert encoded_slice.data_ptr() == routes[3:].data_ptr()
-    staged_envelope = sink.records[0].extras["routed_experts"]
-    assert staged_envelope == encode_routed_experts(routes[3:])
-    torch.testing.assert_close(
-        decode_routed_experts(staged_envelope, dtype), routes[3:]
-    )
+    staged_routes = sink.attachments[0]["routed_experts"]
+    torch.testing.assert_close(staged_routes, routes[3:])
+    # Staging reuses the slice, preserving the compact dtype without a copy.
+    assert staged_routes.data_ptr() == routes[3:].data_ptr()
+    assert sink.records[0].extras["routed_experts"]["shape"] == [3, 1, 2]
     assert "routed_experts" not in content["choices"][0]["message"]
 
 
@@ -394,6 +396,7 @@ def test_request_capture_drops_routes_with_wrong_rank_or_length(routes, caplog):
 
     assert content["ng_commit_coords"]["disposition"] == "staged"
     assert sink.records[0].extras is None
+    assert sink.attachments[0] is None
     assert "dropping invalid routed_experts" in caplog.text
 
 
