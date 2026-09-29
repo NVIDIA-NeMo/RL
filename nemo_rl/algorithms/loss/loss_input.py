@@ -43,7 +43,6 @@ from nemo_rl.distributed.model_utils import (
     get_distillation_topk_logprobs_from_logits,
     get_next_token_logprobs_from_logits,
 )
-
 from nemo_rl.utils.sequence_lengths import CpuIntTuple
 
 if TYPE_CHECKING:
