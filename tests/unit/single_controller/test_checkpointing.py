@@ -2588,6 +2588,7 @@ def _setup_master_config(checkpoint_dir: str) -> MasterConfig:
         },
         loss_fn=ClippedPGLossConfig(),
         env={},
+        cluster=ClusterConfig(num_nodes=1, gpus_per_node=1),
         async_rl=AsyncRLConfig(
             min_groups_for_streaming_train=4,
             max_buffered_rollouts=8,
