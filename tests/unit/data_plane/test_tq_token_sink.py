@@ -39,6 +39,7 @@ from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     STAGING_FIELDS,
     TQTokenSink,
     TQTokenSource,
+    generation_cut_staging_key,
 )
 from tests.unit.data_plane.token_capture_test_fixtures import (  # noqa: E402
     build_fixture_artifacts,
@@ -177,6 +178,45 @@ def test_sink_clear_drops_rows(tq_client, staging_partition):
     sink.clear(keys)
     with pytest.raises(KeyError):
         source.fetch(keys)
+
+
+def test_generation_prefix_uses_checkpoint_and_chunk_scoped_key(
+    tq_client, staging_partition
+):
+    sink = TQTokenSink(tq_client, staging_partition=staging_partition)
+    source = TQTokenSource(tq_client, staging_partition=staging_partition)
+    records, _, _ = build_fixture_artifacts("single_call")
+    record = records[0]
+
+    first = sink.stage_generation_prefix(
+        record, checkpoint_id="checkpoint-1", chunk_sequence=0
+    )
+    second = sink.stage_generation_prefix(
+        record, checkpoint_id="checkpoint-1", chunk_sequence=1
+    )
+
+    first_key = generation_cut_staging_key(
+        "checkpoint-1",
+        record.rollout_id,
+        record.model_call_id,
+        chunk_sequence=0,
+    )
+    second_key = generation_cut_staging_key(
+        "checkpoint-1",
+        record.rollout_id,
+        record.model_call_id,
+        chunk_sequence=1,
+    )
+    assert first.ok and second.ok
+    assert first.staging_key == first_key
+    assert second.staging_key == second_key
+    assert first_key != second_key
+    assert [
+        snapshot.model_dump() for snapshot in source.fetch([first_key, second_key])
+    ] == [
+        record.model_dump(exclude={"extras"}),
+        record.model_dump(exclude={"extras"}),
+    ]
 
 
 def test_fetch_prefix_token_ids_empty(tq_client, staging_partition):

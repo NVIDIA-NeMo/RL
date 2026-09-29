@@ -175,10 +175,15 @@ rollout_checkpointing:
   # Every config path not excluded here or by NeMo-RL's built-in denylist must
   # match before a bootstrap rollout snapshot can be restored.
   extra_fingerprint_excluded_paths: []
-  # Set to discover to validate the NeMo-Gym checkpoint topology, or to
-  # turn_recovery to save and restore participant state with rollout snapshots.
+  # Set to discover to validate the NeMo-Gym checkpoint topology, to
+  # turn_recovery to save and restore participant state, or to prefix_recovery
+  # to additionally checkpoint active generation prefixes.
   gym:
     mode: disabled
+    # Stage an in-flight call's accumulated tokens once its unstaged segment
+    # reaches this many tokens, rather than only when a checkpoint cut fires.
+    # Bounds crash exposure independently of checkpoint cadence; 0 disables it.
+    generation_chunk_flush_tokens: 0
     prepare_timeout_s: 300
 
 policy:

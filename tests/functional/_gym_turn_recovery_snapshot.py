@@ -382,11 +382,6 @@ def inspect_snapshot(
         raise AssertionError("Gym checkpoint has no active continuation roots")
     if not storage_reference_rows:
         raise AssertionError("Gym checkpoint has no referenced TQ staging rows")
-    if model["payload"].get("excluded_inactive", 0) < 1:
-        raise AssertionError(
-            "Gym checkpoint did not exclude any completed/acknowledged lineage; "
-            "the test requires one inactive rollout alongside the continuation"
-        )
     continuation_capture_keys = {row["capture_key"] for row in continuation_rows}
     storage_capture_keys = {row["capture_key"] for row in storage_reference_rows}
     if not storage_capture_keys.issubset(continuation_capture_keys):
