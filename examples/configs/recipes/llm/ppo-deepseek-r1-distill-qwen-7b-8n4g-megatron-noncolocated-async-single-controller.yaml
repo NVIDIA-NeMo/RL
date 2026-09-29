@@ -83,7 +83,7 @@ policy:
       lr: 1.0e-06
       weight_decay: 0.01
     scheduler:
-      lr_warmup_iters: 0
+      lr_warmup_iters: 20
       lr_warmup_init: 0
       start_weight_decay: 0.01
       end_weight_decay: 0.01
