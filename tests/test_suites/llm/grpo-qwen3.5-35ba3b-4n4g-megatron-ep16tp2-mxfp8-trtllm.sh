@@ -33,8 +33,11 @@ uv run tests/json_dump_tb_logs.py "$LOG_DIR" --output_path "$JSON_METRICS"
 
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' "$JSON_METRICS") -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py "$JSON_METRICS" \
-        'mean(data["train/gen_kl_error"]) < 0.004' \
-        'max(data["train/reward"]) > 0.5'
+        'mean(data["train/gen_kl_error"]) < 0.003' \
+        'mean(data["train/reward"]) > 0.45' \
+        'all_finite(data["train/loss"])'
+    # The 4n4g GB200 verification run measured a 0.002345 mean
+    # gen_kl_error and 0.565 mean reward over 20 steps; all losses were finite.
 
     rm -rf "$CKPT_DIR"
 fi
