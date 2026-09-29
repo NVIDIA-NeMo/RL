@@ -13,6 +13,7 @@
 # limitations under the License.
 """Worker-owned image capture through the real sink and ordinary finalizer."""
 
+import inspect
 import json
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
@@ -1157,7 +1158,7 @@ def real_image_processor():
 
     def make(max_model_len, cached):
         mm_kwargs = {"limit_per_prompt": {"image": 2}, "mm_processor_cache_gb": 0.01}
-        if "mm_device_do_normalize" in MultiModalConfig.model_fields:
+        if "mm_device_do_normalize" in inspect.signature(MultiModalConfig).parameters:
             # vLLM >= 0.29 defaults to normalizing on the device and injects
             # do_normalize/do_rescale into every processor constructor; the
             # Omni processor does not take them, and real engines turn this
