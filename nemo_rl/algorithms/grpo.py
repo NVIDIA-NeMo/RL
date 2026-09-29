@@ -181,7 +181,7 @@ from nemo_rl.weight_sync.checkpoint_engine_config import (
 )
 from nemo_rl.weight_sync.factory import (
     create_weight_synchronizer,
-    validate_release_grads_before_refit,
+    validate_offload_policy_before_refit,
 )
 from nemo_rl.weight_sync.nccl_reshard_utils import check_nccl_reshard_refit_support
 
@@ -555,13 +555,13 @@ def _needs_hf_refit_handshake(
 def _uses_managed_noncolocated_refit(
     generation_backend: str,
     nccl_reshard_refit_enabled: bool,
-    release_grads_before_refit: bool,
+    offload_policy_before_refit: bool,
 ) -> bool:
     """Whether non-colocated setup must attach a weight synchronizer."""
     return (
         nccl_reshard_refit_enabled
         or generation_backend == "dynamo"
-        or release_grads_before_refit
+        or offload_policy_before_refit
     )
 
 
@@ -1273,9 +1273,9 @@ def setup(
 
     # vllm model loading prefers clean environment, initialize policy_generation before policy in colocated mode
     backend = generation_config["backend"]
-    release_grads_before_refit = policy_config.get("release_grads_before_refit") is True
-    validate_release_grads_before_refit(
-        enabled=release_grads_before_refit,
+    offload_policy_before_refit = policy_config["offload_policy_before_refit"]
+    validate_offload_policy_before_refit(
+        enabled=offload_policy_before_refit,
         megatron_enabled=bool(
             (policy_config.get("megatron_cfg") or {}).get("enabled", False)
         ),
@@ -1862,7 +1862,7 @@ def setup(
         if _uses_managed_noncolocated_refit(
             generation_backend=backend,
             nccl_reshard_refit_enabled=nccl_reshard_refit_enabled,
-            release_grads_before_refit=release_grads_before_refit,
+            offload_policy_before_refit=offload_policy_before_refit,
         ):
             policy_generation.weight_synchronizer = create_weight_synchronizer(
                 policy=policy,

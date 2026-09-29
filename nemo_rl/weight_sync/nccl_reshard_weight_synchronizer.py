@@ -120,7 +120,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
             arms a watchdog and aborts its own communicator when it expires, which is
             what lets the controller rebuild over the survivors instead of blocking in
             NCCL forever. ``None`` disarms it entirely, so the hang protection is lost.
-        release_grads_before_refit: Whether to run the policy's existing refit
+        offload_policy_before_refit: Whether to run the policy's existing refit
             offload lifecycle before the reshard transfer.
     """
 
@@ -132,14 +132,14 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         inference_cluster: Any,
         refit_timeout_s: Optional[float] = None,
         *,
-        release_grads_before_refit: bool = False,
+        offload_policy_before_refit: bool = False,
     ) -> None:
         self._policy = policy
         self._generation = generation
         self._train_cluster = train_cluster
         self._inference_cluster = inference_cluster
         self._refit_timeout_s = refit_timeout_s
-        self._release_grads_before_refit = release_grads_before_refit
+        self._offload_policy_before_refit = offload_policy_before_refit
         self._stale = True
         # What the communicators were last built over. None until init_communicator.
         self._built_membership: Optional[RefitMembership] = None
@@ -194,7 +194,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         timer: Optional[Timer] = None,
         kv_scales: Optional[dict[str, float]] = None,
     ) -> None:
-        if self._release_grads_before_refit:
+        if self._offload_policy_before_refit:
             self._policy.offload_before_refit()
 
         timer_context = (

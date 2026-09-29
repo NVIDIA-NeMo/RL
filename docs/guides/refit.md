@@ -85,7 +85,7 @@ For non-colocated NCCL, change the topology and leave the selector unset:
 
 ```yaml
 policy:
-  release_grads_before_refit: false
+  offload_policy_before_refit: false
   generation:
     colocated:
       enabled: false
@@ -93,13 +93,13 @@ policy:
 ```
 
 Large quantized exports can temporarily need more memory than training itself.
-Set `release_grads_before_refit: true` to drop completed gradient buffers before
+Set `offload_policy_before_refit: true` to drop completed gradient buffers before
 the collective export. The same lifecycle can also move the optimizer and clear
 Transformer Engine workspaces:
 
 ```yaml
 policy:
-  release_grads_before_refit: true
+  offload_policy_before_refit: true
   offload_optimizer_for_refit: true
   megatron_cfg:
     fp8_cfg:
@@ -111,11 +111,11 @@ policy:
     refit_transport: null
 ```
 
-This option requires the Megatron policy backend and applies to the default
-non-colocated vLLM NCCL collective transport or `nccl_reshard`. Unsupported
-combinations fail during synchronizer setup. It is disabled by default because
-CPU offload adds transfer overhead when the export already fits in trainer GPU
-memory.
+This option requires the Megatron policy backend. It applies to non-colocated
+vLLM collective and `nccl_reshard` transports, plus non-colocated Megatron
+generation. Unsupported combinations fail during synchronizer setup. It is
+disabled by default because CPU offload adds transfer overhead when the export
+already fits in trainer GPU memory.
 
 For native MCore refit, select it explicitly:
 
@@ -138,7 +138,7 @@ policy:
     refit_transport: nccl_reshard
 ```
 
-`release_grads_before_refit` also works with this transport. The reshard moves
+`offload_policy_before_refit` also works with this transport. The reshard moves
 only parameters, so releasing gradient buffers, optimizer state, and caches
 before transfer is safe.
 

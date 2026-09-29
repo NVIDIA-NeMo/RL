@@ -85,6 +85,8 @@ policy:
   precision: "bfloat16"
   logprob_chunk_size: null
   offload_optimizer_for_logprob: true
+  offload_policy_before_refit: false
+  offload_optimizer_for_refit: true
   dtensor_cfg:
     enabled: true
     _v2: true
@@ -159,6 +161,8 @@ teachers:
     precision: "bfloat16"
     logprob_chunk_size: null
     offload_optimizer_for_logprob: false
+    offload_policy_before_refit: false
+    offload_optimizer_for_refit: true
     dtensor_cfg:
       enabled: true
       _v2: true
@@ -214,6 +218,8 @@ teachers:
   #   precision: "bfloat16"
   #   logprob_chunk_size: null
   #   offload_optimizer_for_logprob: false
+  #   offload_policy_before_refit: false
+  #   offload_optimizer_for_refit: true
   #   dtensor_cfg:
   #     enabled: true
   #     _v2: true

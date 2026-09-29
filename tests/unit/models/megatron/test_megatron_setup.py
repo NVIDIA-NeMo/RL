@@ -3454,6 +3454,7 @@ class TestValidateAndSetConfig:
                 },
             },
             "offload_optimizer_for_logprob": False,
+            "offload_optimizer_for_refit": True,
         }
 
         with pytest.raises(NotImplementedError) as exc_info:
@@ -3495,6 +3496,7 @@ class TestValidateAndSetConfig:
                 "tensor_model_parallel_size": 2,
             },
             "offload_optimizer_for_logprob": False,
+            "offload_optimizer_for_refit": True,
         }
 
         configure_refit_environment(config)
@@ -3616,6 +3618,8 @@ class TestMakePolicyLikeConfig:
         assert policy_config["max_grad_norm"] == 1.0
         assert policy_config["hf_config_overrides"] == {}
         assert policy_config["offload_optimizer_for_logprob"] is False
+        assert policy_config["offload_policy_before_refit"] is False
+        assert policy_config["offload_optimizer_for_refit"] is True
         assert policy_config["generation"] is None
 
         megatron_cfg = policy_config["megatron_cfg"]

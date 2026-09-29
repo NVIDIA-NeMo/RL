@@ -6610,7 +6610,7 @@ def test_needs_hf_refit_handshake(backend, nccl_reshard, colocated, expected):
 
 
 @pytest.mark.parametrize(
-    ("backend", "nccl_reshard", "release_grads", "expected"),
+    ("backend", "nccl_reshard", "offload_policy", "expected"),
     [
         ("vllm", False, False, False),
         ("vllm", False, True, True),
@@ -6619,7 +6619,7 @@ def test_needs_hf_refit_handshake(backend, nccl_reshard, colocated, expected):
     ],
 )
 def test_noncolocated_refit_synchronizer_selection(
-    backend, nccl_reshard, release_grads, expected
+    backend, nccl_reshard, offload_policy, expected
 ):
     from nemo_rl.algorithms import grpo as grpo_mod
 
@@ -6627,7 +6627,7 @@ def test_noncolocated_refit_synchronizer_selection(
         grpo_mod._uses_managed_noncolocated_refit(
             generation_backend=backend,
             nccl_reshard_refit_enabled=nccl_reshard,
-            release_grads_before_refit=release_grads,
+            offload_policy_before_refit=offload_policy,
         )
         is expected
     )

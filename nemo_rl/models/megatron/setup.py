@@ -500,7 +500,7 @@ def validate_and_set_config(
     # Optimizer configuration
     optimizer_cpu_offload = config["megatron_cfg"]["optimizer"]["optimizer_cpu_offload"]
     offload_optimizer_for_logprob = config["offload_optimizer_for_logprob"]
-    offload_optimizer_for_refit = bool(config.get("offload_optimizer_for_refit", True))
+    offload_optimizer_for_refit = config["offload_optimizer_for_refit"]
 
     # Reward models are not yet supported with Megatron.
     if "reward_model_cfg" in config and config["reward_model_cfg"]["enabled"]:
@@ -3152,6 +3152,8 @@ def make_policy_like_config(config: ValueConfig) -> dict:
         "max_grad_norm": config.get("max_grad_norm", 1.0),
         "hf_config_overrides": config.get("hf_config_overrides", {}),
         "offload_optimizer_for_logprob": False,
+        "offload_policy_before_refit": False,
+        "offload_optimizer_for_refit": True,
         # Value models don't use generation or reference models
         "generation": None,
     }

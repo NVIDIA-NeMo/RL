@@ -98,7 +98,7 @@ from nemo_rl.weight_sync.checkpoint_engine_config import (
 )
 from nemo_rl.weight_sync.factory import (
     create_weight_synchronizer,
-    validate_release_grads_before_refit,
+    validate_offload_policy_before_refit,
 )
 
 # ===============================================================================
@@ -267,9 +267,9 @@ def setup(
             )
         checkpoint_engine_config = checkpoint_engine_refit_config(vllm_config)
 
-    release_grads_before_refit = policy_config.get("release_grads_before_refit") is True
-    validate_release_grads_before_refit(
-        enabled=release_grads_before_refit,
+    offload_policy_before_refit = policy_config["offload_policy_before_refit"]
+    validate_offload_policy_before_refit(
+        enabled=offload_policy_before_refit,
         megatron_enabled=bool(
             (policy_config.get("megatron_cfg") or {}).get("enabled", False)
         ),
@@ -628,7 +628,7 @@ def setup(
         init_reference_model=False,
     )
 
-    managed_refit = checkpoint_engine_config is not None or release_grads_before_refit
+    managed_refit = checkpoint_engine_config is not None or offload_policy_before_refit
     if managed_refit:
         assert isinstance(student_generation, VllmGeneration)
         student_generation.weight_synchronizer = create_weight_synchronizer(
@@ -935,12 +935,10 @@ def _distillation_train_impl(
                 print("▶ Preparing for teacher logprob inference...", flush=True)
                 with timer.time("teacher_logprob_inference_prep"):
                     if not colocated_inference:
-                        # The non-colocated refit path doesn't offload the student
-                        # optimizer (offload_before_refit only runs in the
-                        # colocated/Megatron path), so it's still on the train GPUs
-                        # from the previous training step. Offload it so the teacher
-                        # fits for top-k inference; prepare_for_training() below
-                        # reloads it.
+                        # Unless policy offload was requested for refit, optimizer
+                        # state may still be on the train GPUs from the previous
+                        # step. Offload it so the teacher fits for top-k inference;
+                        # prepare_for_training() below reloads it.
                         student_policy.offload_before_refit()
                     teacher_policy.prepare_for_lp_inference()
 
