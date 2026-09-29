@@ -870,6 +870,8 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
     master_config = MasterConfig.model_construct(
         **{
             "policy": {
+                "offload_policy_before_refit": False,
+                "offload_optimizer_for_refit": True,
                 "generation": {
                     "temperature": 1.0,
                     "top_p": 1.0,
