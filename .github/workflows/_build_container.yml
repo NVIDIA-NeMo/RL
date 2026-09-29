@@ -188,6 +188,23 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "TRT-LLM caches use $BASE_IMAGE on $ARCH (key $CACHE_KEY)"
 
+      - name: Resolve uv cache seed
+        id: uv_cache_seed
+        if: inputs.uv-cache-tag != ''
+        shell: bash
+        env:
+          UV_CACHE_TAG: ${{ inputs.uv-cache-tag }}
+        run: |
+          set -euo pipefail
+
+          ref="$REGISTRY/$IMAGE_NAME:$UV_CACHE_TAG"
+          if docker buildx imagetools inspect "$ref" >/dev/null 2>&1; then
+            echo "Using uv cache seed $ref"
+            echo "context=uv-cache-seed=docker-image://$ref" >> "$GITHUB_OUTPUT"
+          else
+            echo "No uv cache image found at $ref; starting with an empty cache"
+          fi
+
       - name: Resolve TRT-LLM cache seeds
         id: trtllm_cache_seed
         if: steps.trtllm_cache.outputs.ccache_tag != '' || steps.trtllm_cache.outputs.wheel_tag != ''
@@ -348,6 +365,7 @@ jobs:
           platforms: ${{ inputs.platform }}
           build-contexts: |
             ${{ inputs.build-contexts }}
+            ${{ steps.uv_cache_seed.outputs.context }}
             ${{ steps.trtllm_cache_seed.outputs.ccache_context }}
             ${{ steps.trtllm_cache_seed.outputs.wheel_context }}
           build-args: ${{ inputs.build-args }}
@@ -375,6 +393,7 @@ jobs:
           platforms: ${{ inputs.platform }}
           build-contexts: |
             ${{ inputs.build-contexts }}
+            ${{ steps.uv_cache_seed.outputs.context }}
             ${{ steps.trtllm_cache_seed.outputs.ccache_context }}
             ${{ steps.trtllm_cache_seed.outputs.wheel_context }}
           build-args: |
@@ -494,6 +513,7 @@ jobs:
           platforms: ${{ inputs.platform }}
           build-contexts: |
             ${{ inputs.build-contexts }}
+            ${{ steps.uv_cache_seed.outputs.context }}
           build-args: |
             ${{ inputs.build-args }}
             UV_CACHE_EXPORT_NONCE=${{ github.run_id }}-${{ github.run_attempt }}
