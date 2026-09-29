@@ -30,6 +30,7 @@ from nemo_rl.algorithms.sft_v2 import (
 from nemo_rl.data.energon.sft_types import StepEnvelope
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.telemetry.instrumentation import TRACE_CARRIER_KWARG
 
 _ACTOR_CLS = SFTSingleControllerActor.__ray_metadata__.modified_class
 
@@ -52,29 +53,17 @@ def _envelope(rank: int, *, source_count: int = 1) -> StepEnvelope:
         sequence_lengths=(8,),
         load_seconds=0.1 + rank * 0.1,
         valid_tokens=4,
-        load_phase_seconds={
-            "iter": 0.01 + rank * 0.01,
-            "prepare": 0.02,
-            "post-prepare": 0.03,
-            "tensordict": 0.04,
-            "publish": 0.05,
-        },
     )
 
 
 def _controller() -> object:
     controller = object.__new__(_ACTOR_CLS)
+    controller._tracer = None
     controller._trainer = MagicMock()
     controller._trainer.finish_train_step.return_value = {
         "loss": 1.0,
         "grad_norm": 0.5,
         "all_mb_metrics": {},
-        "mtp_metrics": {"mtp_1_loss": 0.25},
-        "step_phases": {"fetch": 0.1, "fwd_bwd": 0.2},
-    }
-    controller._trainer.train_placed_microbatches.return_value = {
-        "stamp_pad": 0.01,
-        "dispatch": 0.02,
     }
     controller._master_config = SimpleNamespace()
     controller._save_state = SFTV2SaveState(0, 0, 0, "hash")
@@ -144,23 +133,6 @@ def test_train_step_orders_split_policy_lifecycle_and_commit() -> None:
     assert metrics["valid_tokens"] == 8
     assert metrics["source_samples"] == 3
     assert metrics["physical_packs"] == 2
-    assert metrics["loader_iter_max"] == 0.02
-    assert metrics["loader_iter_mean"] == pytest.approx(0.015)
-    assert metrics["loader_prepare_mean"] == 0.02
-    assert metrics["loader_post_prepare_max"] == 0.03
-    assert metrics["loader_tensordict_mean"] == 0.04
-    assert metrics["loader_publish_max"] == 0.05
-    assert metrics["loader_wait"] >= 0.0
-    assert metrics["queue_depth"] == 1
-    assert metrics["begin_train_step"] >= 0.0
-    assert metrics["train_placed_microbatches"] >= 0.0
-    assert metrics["finish_train_step"] >= 0.0
-    assert metrics["commit_sft_batch"] >= 0.0
-    assert metrics["placed_stamp_pad"] == 0.01
-    assert metrics["placed_dispatch"] == 0.02
-    assert metrics["worker_fetch"] == 0.1
-    assert metrics["worker_fwd_bwd"] == 0.2
-    assert metrics["mtp/mtp_1_loss"] == 0.25
 
 
 def test_train_step_aborts_policy_and_loader_on_training_failure() -> None:
@@ -223,12 +195,45 @@ def test_run_stops_after_a_timeout_checkpoint() -> None:
         return {}
 
     controller._run_train_step = MagicMock(side_effect=advance)
-    controller.run()
+    with patch("nemo_rl.algorithms.sft_v2.shutdown_telemetry") as shutdown:
+        controller.run()
 
     # check_save latches after firing once, so the loop must exit instead of
     # training unsaved until the walltime kill.
     assert controller._run_train_step.call_count == 2
     controller._save_checkpoint.assert_called_once_with({})
+    shutdown.assert_called_once_with()
+
+
+def test_loader_dispatch_carries_the_controller_trace() -> None:
+    controller = _controller()
+    controller._master_config = SimpleNamespace(
+        sft=SimpleNamespace(only_unmask_final=False),
+        policy={"make_sequence_length_divisible_by": 1},
+    )
+    controller._placement_plan = SimpleNamespace(logical_world_size=2)
+    controller._trainer.worker_group.run_all_workers_single_data.return_value = [
+        object(),
+        object(),
+    ]
+    carrier = {"traceparent": "00-" + "1" * 32 + "-" + "2" * 16 + "-01"}
+
+    with (
+        patch(
+            "nemo_rl.algorithms.sft_v2.trace_context_kwargs",
+            return_value={TRACE_CARRIER_KWARG: carrier},
+        ),
+        patch(
+            "nemo_rl.algorithms.sft_v2.ray.get",
+            return_value=[_envelope(0), _envelope(1)],
+        ),
+    ):
+        _ACTOR_CLS._load_envelopes(controller)
+
+    kwargs = (
+        controller._trainer.worker_group.run_all_workers_single_data.call_args.kwargs
+    )
+    assert kwargs[TRACE_CARRIER_KWARG] == carrier
 
 
 @pytest.mark.parametrize(("step", "is_final"), [(10, False), (25, True)])

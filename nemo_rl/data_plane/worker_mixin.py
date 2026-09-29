@@ -1137,14 +1137,6 @@ class TQWorkerMixin:
             mbs=mbs,
         )
 
-    def _add_step_phase(self, name: str, seconds: float) -> None:
-        """Accumulate one worker-local phase into the active training step."""
-        state = getattr(self, "_train_step_state", None)
-        if not isinstance(state, dict):
-            return
-        phases = state.setdefault("step_phases", {})
-        phases[name] = float(phases.get(name, 0.0)) + float(seconds)
-
     @accepts_trace_context
     @wrap_with_nvtx_name("policy_worker/train_microbatch_presharded")
     def train_microbatch_presharded(
@@ -1158,17 +1150,11 @@ class TQWorkerMixin:
         accumulate in the backend's open-step state and surface once via
         ``finish_train_step_presharded``.
         """
-        started = time.monotonic()
         data = self._fetch(meta)
-        self._add_step_phase("fetch", time.monotonic() - started)
-        started = time.monotonic()
         data = self._attach_or_repack_pack_metadata(data, meta)
-        self._add_step_phase("attach_pack", time.monotonic() - started)
-        started = time.monotonic()
         self.train_microbatch(  # type: ignore[attr-defined]
             data=data,
         )
-        self._add_step_phase("train_microbatch", time.monotonic() - started)
 
     @accepts_trace_context
     @wrap_with_nvtx_name("policy_worker/finish_train_step_presharded")

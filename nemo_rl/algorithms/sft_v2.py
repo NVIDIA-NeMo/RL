@@ -55,9 +55,48 @@ from nemo_rl.models.megatron.alignment import (
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.telemetry.config import TelemetryConfig
+from nemo_rl.telemetry.instrumentation import (
+    accepts_trace_context,
+    managed_span,
+    trace_context_kwargs,
+    umbrella_span,
+    umbrella_trace_fn,
+)
+from nemo_rl.telemetry.setup import init_telemetry_worker, shutdown_telemetry
+from nemo_rl.telemetry.span_groups import RLSpanGroup
+from nemo_rl.telemetry.vocabulary import TeedMetric, register_teed_metrics
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import Logger, LoggerConfig
 from nemo_rl.utils.timer import TimeoutChecker
+
+
+SFT_V2_TEED_METRICS = (
+    TeedMetric(
+        "loader_latency_max",
+        "rl.sft_v2.loader.latency.max",
+        unit="s",
+        description="Slowest data-loader rank per SFT v2 step.",
+    ),
+    TeedMetric(
+        "policy_time",
+        "rl.sft_v2.policy.duration",
+        unit="s",
+        description="Controller policy update duration per SFT v2 step.",
+    ),
+    TeedMetric(
+        "total_step_time",
+        "rl.sft_v2.step.duration",
+        unit="s",
+        description="Wall-clock duration of an SFT v2 step.",
+    ),
+    TeedMetric(
+        "valid_tokens_per_second",
+        "rl.sft_v2.valid_tokens_per_second",
+        unit="{token}/s",
+        description="Supervised token throughput per SFT v2 step.",
+    ),
+)
+register_teed_metrics(SFT_V2_TEED_METRICS)
 
 
 class MasterConfig(BaseModel, extra="allow"):
@@ -143,6 +182,10 @@ class SFTSingleControllerActor:
     """Drive colocated loaders and the existing TQPolicy from one actor."""
 
     def __init__(self, master_config: MasterConfig, actor_args: SFTV2ActorArgs) -> None:
+        telemetry = init_telemetry_worker(
+            rank=0, world_size=1, worker_group="sft_v2_controller"
+        )
+        self._tracer = telemetry.tracer if telemetry is not None else None
         self._master_config = master_config
         self._trainer = actor_args.trainer
         self._loss_fn = actor_args.loss_fn
@@ -164,29 +207,36 @@ class SFTSingleControllerActor:
         self._timeout.start_iterations()
         self._setup_loaders()
 
+    @accepts_trace_context
+    def run_with_trace_context(self) -> dict[str, Any]:
+        """Run under the driver's trace context when called through Ray."""
+        return self.run()
+
     def run(self) -> dict[str, Any]:
         """Run SFT training."""
         try:
-            self._trainer.prepare_for_training()
-            while self._save_state.total_steps < self._max_steps:
-                metrics = self._run_train_step()
-                self._logger.log_metrics(metrics, self._save_state.total_steps)
-                metric = self._checkpoint_metric(metrics)
-                self._timeout.mark_iteration()
-                save_by_timeout = self._timeout.check_save()
-                if self._should_save(save_by_timeout=save_by_timeout):
-                    self._save_checkpoint(metric)
-                if save_by_timeout:
-                    # check_save fires once and then latches, so continuing
-                    # would train unsaved until the walltime kill.
-                    print("Timeout has been reached, stopping training early")
-                    break
-            return vars(self._save_state).copy()
+            with umbrella_span(RLSpanGroup.U_JOB, "rl.sft_v2.job", tracer=self._tracer):
+                self._trainer.prepare_for_training()
+                while self._save_state.total_steps < self._max_steps:
+                    metrics = self._run_train_step()
+                    self._logger.log_metrics(metrics, self._save_state.total_steps)
+                    metric = self._checkpoint_metric(metrics)
+                    self._timeout.mark_iteration()
+                    save_by_timeout = self._timeout.check_save()
+                    if self._should_save(save_by_timeout=save_by_timeout):
+                        self._save_checkpoint(metric)
+                    if save_by_timeout:
+                        # check_save fires once and then latches, so continuing
+                        # would train unsaved until the walltime kill.
+                        print("Timeout has been reached, stopping training early")
+                        break
+                return vars(self._save_state).copy()
         finally:
             for cleanup, name in (
                 (self._close_loaders, "loader close"),
                 (self._logger.finish, "logger close"),
                 (self._checkpointer.shutdown, "checkpoint close"),
+                (shutdown_telemetry, "telemetry flush"),
             ):
                 try:
                     cleanup()
@@ -243,6 +293,7 @@ class SFTSingleControllerActor:
             make_sequence_length_divisible_by=self._master_config.policy[
                 "make_sequence_length_divisible_by"
             ],
+            **trace_context_kwargs(),
         )
         envelopes = ray.get(futures)
         logical_ranks = [envelope.logical_rank for envelope in envelopes]
@@ -253,29 +304,27 @@ class SFTSingleControllerActor:
             )
         return envelopes
 
+    @umbrella_trace_fn(RLSpanGroup.U_STEP, "rl.sft_v2.step")
     def _run_train_step(self) -> dict[str, Any]:
         started = time.monotonic()
         envelopes = self._load_envelopes()
-        loader_wait = time.monotonic() - started
         train_started = time.monotonic()
         step_open = False
         try:
-            phase_started = time.monotonic()
-            self._trainer.begin_train_step(self._loss_fn)
-            begin_train_step = time.monotonic() - phase_started
-            step_open = True
-            phase_started = time.monotonic()
-            placed_phases = self._trainer.train_placed_microbatches(
-                [envelope.meta for envelope in envelopes]
-            )
-            train_placed_microbatches = time.monotonic() - phase_started
-            phase_started = time.monotonic()
-            train_results = self._trainer.finish_train_step()
-            finish_train_step = time.monotonic() - phase_started
-            step_open = False
-            phase_started = time.monotonic()
+            with managed_span(
+                RLSpanGroup.POLICY_UPDATE,
+                "rl.sft_v2.policy_training",
+                tracer=self._tracer,
+            ):
+                self._trainer.begin_train_step(self._loss_fn)
+                step_open = True
+                self._trainer.train_placed_microbatches(
+                    [envelope.meta for envelope in envelopes]
+                )
+                train_results = self._trainer.finish_train_step()
+                step_open = False
+            policy_seconds = time.monotonic() - train_started
             self._owner_call("commit_sft_batch")
-            commit_sft_batch = time.monotonic() - phase_started
         except Exception:
             if step_open:
                 try:
@@ -288,7 +337,6 @@ class SFTSingleControllerActor:
                 warnings.warn(f"SFTv2 loader abort failed: {error}", stacklevel=2)
             raise
 
-        policy_seconds = time.monotonic() - train_started
         valid_tokens = sum(envelope.valid_tokens for envelope in envelopes)
         self._save_state.total_steps += 1
         self._save_state.consumed_samples += sum(
@@ -302,12 +350,6 @@ class SFTSingleControllerActor:
             "loader_latency_mean": statistics.fmean(loader_seconds),
             "loader_copy_imbalance": loader_latency_max - min(loader_seconds),
             "policy_time": policy_seconds,
-            "begin_train_step": begin_train_step,
-            "train_placed_microbatches": train_placed_microbatches,
-            "finish_train_step": finish_train_step,
-            "commit_sft_batch": commit_sft_batch,
-            "loader_wait": loader_wait,
-            "queue_depth": 1,
             "total_step_time": time.monotonic() - started,
             "valid_tokens": valid_tokens,
             "source_samples": sum(len(envelope.source_ids) for envelope in envelopes),
@@ -317,19 +359,6 @@ class SFTSingleControllerActor:
             "valid_tokens_per_second": valid_tokens
             / max(time.monotonic() - started, 1e-12),
         }
-        if isinstance(placed_phases, dict):
-            for key, value in placed_phases.items():
-                metrics[f"placed_{key}"] = float(value)
-        phase_names = sorted(
-            {phase for envelope in envelopes for phase in envelope.load_phase_seconds}
-        )
-        for phase in phase_names:
-            values = [
-                envelope.load_phase_seconds.get(phase, 0.0) for envelope in envelopes
-            ]
-            metric_phase = phase.replace("-", "_")
-            metrics[f"loader_{metric_phase}_max"] = max(values)
-            metrics[f"loader_{metric_phase}_mean"] = statistics.fmean(values)
         metrics.update(self._policy_metrics(train_results))
         return metrics
 
@@ -347,13 +376,9 @@ class SFTSingleControllerActor:
                 metrics[key] = np.sum(values).item()
         for key, value in train_results.get("moe_metrics", {}).items():
             metrics[f"moe/{key}"] = value
-        for key, value in train_results.get("mtp_metrics", {}).items():
-            metrics[f"mtp/{key}"] = value
         for key in ("total_flops", "num_ranks", "theoretical_tflops"):
             if key in train_results:
                 metrics[key] = train_results[key]
-        for key, value in train_results.get("step_phases", {}).items():
-            metrics[f"worker_{key}"] = float(value)
         return metrics
 
     def _owner_call(self, method_name: str) -> list[Any]:
