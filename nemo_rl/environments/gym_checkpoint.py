@@ -32,7 +32,7 @@ import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from enum import Enum, StrEnum
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal, TypeAlias, TypeVar, cast
 
@@ -50,6 +50,8 @@ GYM_SERVER_TYPE_KEYS = (
 GYM_AGENT_CONTINUATION_INDEX_FEATURE = "agent_continuation_index_v1"
 GYM_AGENT_DISCARD_RESTORED_CONTINUATION_FEATURE = "discard_restored_continuation_v1"
 GYM_AGENT_RESOURCE_DEPENDENCY_INDEX_FEATURE = "agent_resource_dependency_index_v1"
+GYM_AGENT_COMPLETED_RESULT_ACKNOWLEDGEMENT_FEATURE = "completed_result_acknowledgement"
+GYM_AGENT_INLINE_COMPLETION_RECEIPT_FEATURE = "completion_receipt_in_run_response_v1"
 GYM_EXTERNAL_STORAGE_REFERENCE_INDEX_FEATURE = "external_storage_reference_index_v1"
 
 _IDENTITY_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
@@ -59,6 +61,9 @@ GymComponent: TypeAlias = Literal[
     "responses_api_agents",
     "resources_servers",
 ]
+# Must equal GYM_CHECKPOINT_SCHEMA_VERSION. Pyrefly does not accept a named
+# constant inside Literal[...], so the value is written out once, here.
+GymCheckpointSchemaVersion: TypeAlias = Literal[1]
 NonNegativeInt: TypeAlias = Annotated[int, Field(strict=True, ge=0)]
 PositiveInt: TypeAlias = Annotated[int, Field(strict=True, ge=1)]
 NonNegativeFloat: TypeAlias = Annotated[float, Field(ge=0)]
@@ -122,6 +127,15 @@ class _StrictWireModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class _VersionedWireModel(_StrictWireModel):
+    """A wire model RL builds using the current Gym checkpoint schema."""
+
+    schema_version: GymCheckpointSchemaVersion = Field(
+        default=GYM_CHECKPOINT_SCHEMA_VERSION,
+        validate_default=True,
+    )
+
+
 class _LiveResponseWireModel(BaseModel):
     """Validate required live fields while tolerating additive telemetry."""
 
@@ -135,35 +149,24 @@ class GymExecutionIdentity(_StrictWireModel):
     attempt_index: NonNegativeInt
 
     @property
+    def identity(self) -> tuple[str, int]:
+        """Return the stable execution identity used for deduplication."""
+        return self.rollout_id, self.attempt_index
+
+    @property
     def capture_key(self) -> str:
         """Return Gym's attempt-qualified token-capture and routing key."""
         return gym_capture_key(self.rollout_id, self.attempt_index)
 
 
-class GymActorExecutionState(str, Enum):
-    """Publication state of one rollout invocation owned by the Gym actor."""
-
-    RUNNING = "running"
-    TERMINAL = "terminal"
-
-
-@dataclass(frozen=True)
-class GymActorExecution:
-    """One actor-local rollout execution tracked across a checkpoint fence."""
-
-    identity: GymExecutionIdentity
-    state: GymActorExecutionState
-
-
 class GymActorExecutionRegistry:
-    """Fence actor dispatch and retain the exact membership of a checkpoint cut."""
+    """Fence actor dispatch while checkpoint coordination is active."""
 
     _MAX_RETIRED_CHECKPOINTS = 256
 
     def __init__(self) -> None:
-        self._live: dict[tuple[str, int], GymActorExecution] = {}
+        self._live: set[tuple[str, int]] = set()
         self._frozen_checkpoint_id: str | None = None
-        self._frozen_membership: tuple[GymActorExecution, ...] = ()
         self._retired_checkpoint_ids: list[str] = []
         self._dispatch_permitted = asyncio.Event()
         self._dispatch_permitted.set()
@@ -182,10 +185,7 @@ class GymActorExecutionRegistry:
         key = self._key(identity)
         if key in self._live:
             raise ValueError(f"Gym rollout execution {key!r} is already live")
-        self._live[key] = GymActorExecution(
-            identity=identity,
-            state=GymActorExecutionState.RUNNING,
-        )
+        self._live.add(key)
 
     async def register_when_permitted(
         self,
@@ -195,9 +195,9 @@ class GymActorExecutionRegistry:
         while self._frozen_checkpoint_id is not None:
             await self._dispatch_permitted.wait()
 
-        # There is deliberately no await between the fence check and these
-        # registrations. NemoGym is a single Ray actor, so the complete batch
-        # joins one source cut or the next; a checkpoint cannot split it.
+        # Registration is atomic relative to this actor's checkpoint fence.
+        # Participant prepare still determines each remote execution's durable
+        # boundary after dispatch begins.
         registered: list[GymExecutionIdentity] = []
         try:
             for identity in identities:
@@ -208,23 +208,12 @@ class GymActorExecutionRegistry:
                 self.release(identity)
             raise
 
-    def mark_terminal(self, identity: GymExecutionIdentity) -> None:
-        """Retain a completed invocation until it crosses the actor boundary."""
-        key = self._key(identity)
-        execution = self._live.get(key)
-        if execution is None:
-            raise KeyError(f"Gym rollout execution {key!r} is not live")
-        self._live[key] = GymActorExecution(
-            identity=identity,
-            state=GymActorExecutionState.TERMINAL,
-        )
-
     def release(self, identity: GymExecutionIdentity) -> None:
         """Release an invocation after its result crosses the actor boundary."""
-        self._live.pop(self._key(identity), None)
+        self._live.discard(self._key(identity))
 
-    def freeze(self, checkpoint_id: str) -> tuple[GymActorExecution, ...]:
-        """Close actor admission and snapshot the live source-cut membership."""
+    def freeze(self, checkpoint_id: str) -> None:
+        """Close actor admission for one checkpoint transaction."""
         if checkpoint_id in self._retired_checkpoint_ids:
             raise RuntimeError(f"checkpoint {checkpoint_id!r} is already retired")
         if self._frozen_checkpoint_id is not None:
@@ -233,11 +222,9 @@ class GymActorExecutionRegistry:
                     f"checkpoint {self._frozen_checkpoint_id!r} already owns "
                     "the Gym actor dispatch fence"
                 )
-            return self._frozen_membership
+            return
         self._dispatch_permitted.clear()
         self._frozen_checkpoint_id = checkpoint_id
-        self._frozen_membership = tuple(self._live[key] for key in sorted(self._live))
-        return self._frozen_membership
 
     def unfreeze(self, checkpoint_id: str) -> None:
         """Reopen actor admission for the transaction that owns the fence."""
@@ -252,23 +239,15 @@ class GymActorExecutionRegistry:
                 f"dispatch fence (owner={self._frozen_checkpoint_id!r})"
             )
         self._frozen_checkpoint_id = None
-        self._frozen_membership = ()
         self._retired_checkpoint_ids.append(checkpoint_id)
         del self._retired_checkpoint_ids[: -self._MAX_RETIRED_CHECKPOINTS]
         self._dispatch_permitted.set()
 
     def status(self) -> dict[str, int | str | None]:
         """Return bounded diagnostics for tests and checkpoint failures."""
-        running = sum(
-            execution.state is GymActorExecutionState.RUNNING
-            for execution in self._live.values()
-        )
         return {
             "frozen_checkpoint_id": self._frozen_checkpoint_id,
             "live": len(self._live),
-            "running": running,
-            "terminal_unreleased": len(self._live) - running,
-            "frozen_membership": len(self._frozen_membership),
         }
 
 
@@ -418,10 +397,9 @@ class GymCheckpointParticipantContract(_StrictWireModel):
         )
 
 
-class GymCheckpointTopology(_StrictWireModel):
+class GymCheckpointTopology(_VersionedWireModel):
     """Stable participant topology cached by setup and bound to snapshots."""
 
-    schema_version: Literal[1] = GYM_CHECKPOINT_SCHEMA_VERSION
     participants: list[GymCheckpointParticipantContract]
 
     @classmethod
@@ -510,6 +488,7 @@ class GymCheckpointTopology(_StrictWireModel):
         missing_agent_checkpoint_participation: list[str] = []
         missing_continuation_index: list[str] = []
         missing_fresh_restart: list[str] = []
+        missing_inline_completion_receipt: list[str] = []
         missing_resource_dependencies: list[str] = []
         missing_storage_reference_index: list[str] = []
         unsupported_auxiliary_export_restore: list[str] = []
@@ -520,8 +499,15 @@ class GymCheckpointTopology(_StrictWireModel):
                     missing_agent_checkpoint_participation.append(
                         contract.participant.participant_name
                     )
-                if "completed_result_acknowledgement" not in contract.features:
+                if (
+                    GYM_AGENT_COMPLETED_RESULT_ACKNOWLEDGEMENT_FEATURE
+                    not in contract.features
+                ):
                     missing_acknowledgement.append(
+                        contract.participant.participant_name
+                    )
+                if GYM_AGENT_INLINE_COMPLETION_RECEIPT_FEATURE not in contract.features:
+                    missing_inline_completion_receipt.append(
                         contract.participant.participant_name
                     )
                 if GYM_AGENT_CONTINUATION_INDEX_FEATURE not in contract.features:
@@ -570,6 +556,12 @@ class GymCheckpointTopology(_StrictWireModel):
                 "acknowledgement support from every agent participant; "
                 f"missing={missing_acknowledgement!r}"
             )
+        if missing_inline_completion_receipt:
+            raise RuntimeError(
+                "Gym participant checkpointing requires every agent to return "
+                "its completion receipt with the /run response; "
+                f"missing={missing_inline_completion_receipt!r}"
+            )
         if missing_agent_checkpoint_participation:
             raise RuntimeError(
                 "Gym participant checkpointing requires every agent to join the "
@@ -610,11 +602,42 @@ class GymCheckpointTopology(_StrictWireModel):
             )
 
 
+class GymAgentRetireResponse(_StrictWireModel):
+    """Atomic disposition returned by Gym for one exact execution identity."""
+
+    retired: bool
+    tombstoned: bool
+    completed_unacknowledged: bool = False
+
+    @model_validator(mode="after")
+    def validate_disposition(self) -> "GymAgentRetireResponse":
+        disposition = (
+            self.retired,
+            self.tombstoned,
+            self.completed_unacknowledged,
+        )
+        if disposition not in {
+            (False, False, True),  # completed result must be replayed and ACKed
+            (False, True, False),  # execution was absent; its identity is fenced
+            (True, True, False),  # live execution was cancelled and fenced
+        }:
+            raise ValueError(
+                "invalid Gym agent retirement disposition: "
+                f"retired={self.retired}, tombstoned={self.tombstoned}, "
+                f"completed_unacknowledged={self.completed_unacknowledged}"
+            )
+        return self
+
+
 class GymCompletedExecution(_StrictWireModel):
     """A completed Gym execution plus the agent participant that owns it."""
 
     receipt: GymCompletionReceipt
     agent_name: str = Field(min_length=1)
+
+    @property
+    def identity(self) -> tuple[str, int]:
+        return self.receipt.identity
 
 
 class GymCompletedExecutionAcknowledgementResponse(_StrictWireModel):
@@ -638,7 +661,6 @@ class GymCompletedExecutionAcknowledgementResponse(_StrictWireModel):
 class GymCheckpointArtifactReference(_StrictWireModel):
     """Digest-bound coordinate for a Gym-owned checkpoint sidecar."""
 
-    schema_version: Literal[1] = GYM_CHECKPOINT_SCHEMA_VERSION
     relative_path: str = Field(min_length=1)
     sha256: Sha256Digest
     records: NonNegativeInt
@@ -970,20 +992,18 @@ def validate_gym_checkpoint_manifests(
             )
 
 
-class GymExternalStorageReference(_StrictWireModel):
+class GymExternalStorageReference(_VersionedWireModel):
     """One TQ staging row required by a parked Gym continuation."""
 
-    schema_version: Literal[1] = GYM_CHECKPOINT_SCHEMA_VERSION
     capture_key: str = Field(min_length=1, pattern=_IDENTITY_PATTERN)
     boundary_model_call_id: str = Field(min_length=1)
     kind: Literal["token_capture_staging"] = "token_capture_staging"
     key: str = Field(min_length=1)
 
 
-class GymAgentContinuationRoot(_StrictWireModel):
+class GymAgentContinuationRoot(_VersionedWireModel):
     """Public agent boundary coordinate used for selective recovery."""
 
-    schema_version: Literal[1] = GYM_CHECKPOINT_SCHEMA_VERSION
     rollout_id: str = Field(min_length=1, pattern=_IDENTITY_PATTERN)
     attempt_index: NonNegativeInt
     capture_key: str = Field(min_length=1, pattern=_IDENTITY_PATTERN)
@@ -1143,6 +1163,19 @@ def gym_checkpoint_staging_keys(
     return set(_gym_checkpoint_external_storage_references(checkpoint_dir, checkpoint))
 
 
+def _raise_inconsistent_gym_checkpoint(
+    checkpoint_dir: Path,
+    problem: str,
+) -> None:
+    raise ValueError(
+        f"Gym checkpoint at {checkpoint_dir} is internally inconsistent: {problem}. "
+        "This is unexpected (a partly written snapshot or a Gym bug); please "
+        "report it with this path and the Gym commit. To continue, move this "
+        "snapshot directory out of rollout_snapshots/; the next start selects "
+        "the previous snapshot. Existing checkpoint state was not modified."
+    )
+
+
 def gym_checkpoint_continuations(
     checkpoint_dir: Path,
     checkpoint: GymCheckpointCommitResult,
@@ -1165,9 +1198,10 @@ def gym_checkpoint_continuations(
         )
         for root in roots:
             if root.capture_key in roots_by_capture_key:
-                raise ValueError(
+                _raise_inconsistent_gym_checkpoint(
+                    checkpoint_dir,
                     "Gym checkpoint repeats an agent continuation capture key: "
-                    f"capture_key={root.capture_key!r}"
+                    f"capture_key={root.capture_key!r}",
                 )
             roots_by_capture_key[root.capture_key] = root
 
@@ -1182,17 +1216,19 @@ def gym_checkpoint_continuations(
             root is not None
             and reference.boundary_model_call_id != root.last_committed_model_call_id
         ):
-            raise ValueError(
+            _raise_inconsistent_gym_checkpoint(
+                checkpoint_dir,
                 "Gym external storage reference does not match its agent "
                 "continuation boundary: "
-                f"capture_key={reference.capture_key!r}"
+                f"capture_key={reference.capture_key!r}",
             )
         keys_by_capture_key.setdefault(reference.capture_key, []).append(key)
     unknown_capture_keys = set(keys_by_capture_key) - set(roots_by_capture_key)
     if unknown_capture_keys:
-        raise ValueError(
+        _raise_inconsistent_gym_checkpoint(
+            checkpoint_dir,
             "Gym external storage references have no agent continuation: "
-            f"capture_keys={sorted(unknown_capture_keys)!r}"
+            f"capture_keys={sorted(unknown_capture_keys)!r}",
         )
 
     return tuple(

@@ -97,7 +97,7 @@ from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
 RolloutCompletionCallback = Callable[[int, Completion], Awaitable[None]]
-GymAcknowledgementsReadyCallback = Callable[[], None]
+GymAcknowledgementReadyCallback = Callable[[], None]
 _NG_RESOLVED_AGENT_REF_KEY = "_ng_resolved_agent_ref"
 _NG_COMPLETION_RECEIPT_KEY = "_ng_completion_receipt"
 
@@ -117,28 +117,28 @@ def _contains_post_write_enrichment_error(error: BaseException) -> bool:
     return False
 
 
-class GymAcknowledgementSink:
+class GymAcknowledgementNotifier:
     """One-time-bound notifier for durable Gym ACK obligations.
 
     Setup creates this collaborator only when Gym participant checkpointing is
     enabled. The controller binds its transport scheduler after Ray constructs
     the actor; rollout finalization then records the durable obligation before
-    notifying this sink.
+    notifying this notifier.
     """
 
     def __init__(self) -> None:
-        self._on_ready: Optional[GymAcknowledgementsReadyCallback] = None
+        self._on_ready: Optional[GymAcknowledgementReadyCallback] = None
 
-    def bind(self, on_ready: GymAcknowledgementsReadyCallback) -> None:
+    def bind(self, on_ready: GymAcknowledgementReadyCallback) -> None:
         """Bind the controller-owned transport scheduler exactly once."""
         if self._on_ready is not None:
-            raise RuntimeError("Gym acknowledgement sink is already bound")
+            raise RuntimeError("Gym acknowledgement notifier is already bound")
         self._on_ready = on_ready
 
     def notify_ready(self) -> None:
         """Notify the controller that at least one durable ACK is ready."""
         if self._on_ready is None:
-            raise RuntimeError("Gym acknowledgement sink is not bound")
+            raise RuntimeError("Gym acknowledgement notifier is not bound")
         self._on_ready()
 
 
@@ -1305,19 +1305,8 @@ class AsyncNemoGymRolloutImpl:
                 None for _ in range(total_rows)
             ]
             env_timing_metrics: dict[str, Any] = {}
-            # One deadline for the whole prompt group, re-dispatches included -- it is
-            # the group that has a budget, not each attempt. It also spans the stream
-            # rather than each await: NeMo-Gym yields rows as they finish, so a
-            # per-await budget would reset every time a fast row landed and never fire
-            # for the slow one holding the group up.
-            # Kept across attempts so the failure below can name the transport error that
-            # actually lost the rows. An intermediate attempt can absorb an INFRA error
-            # and a later one end the stream cleanly-but-short, and without this the
-            # operator reads "rows missing" with no cause attached at exactly the moment
-            # they need one.
-            # Exception, not BaseException: the only writer is the `except Exception`
-            # below, and a wider annotation makes the `raise ... from last_error` at the
-            # end unverifiable.
+            # Preserve the latest transport error so a later short stream retains
+            # the failure that lost its rows.
             last_error: Optional[Exception] = None
             stable_execution_attempts = any(
                 "_ng_attempt_index" in row for row in inputs
@@ -1648,7 +1637,7 @@ class RolloutManager:
         num_generations_per_prompt: int,
         max_seq_len: int,
         rollout_recovery_config: RolloutRecoveryConfig,
-        gym_acknowledgement_sink: Optional[GymAcknowledgementSink],
+        gym_acknowledgement_notifier: Optional[GymAcknowledgementNotifier],
         max_rollout_turns: int = 1,
         policy_generation: Optional[GenerationInterface] = None,
         generation_config: Optional[GenerationConfig] = None,
@@ -1664,9 +1653,9 @@ class RolloutManager:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
         )
-        if gym_acknowledgement_sink is not None and not use_nemo_gym:
+        if gym_acknowledgement_notifier is not None and not use_nemo_gym:
             raise ValueError(
-                "Gym acknowledgement sink requires the NeMo-Gym rollout path"
+                "Gym acknowledgement notifier requires the NeMo-Gym rollout path"
             )
         # Resolved before the impl is built: the NeMo-Gym impl reads its row-retry
         # budget out of it at construction time, and shares the counters so its
@@ -1716,7 +1705,7 @@ class RolloutManager:
         self._tokenizer = tokenizer
         self._num_generations_per_prompt = num_generations_per_prompt
         self._rollout_recovery_config = rollout_recovery_config
-        self._gym_acknowledgement_sink = gym_acknowledgement_sink
+        self._gym_acknowledgement_notifier = gym_acknowledgement_notifier
         self._tq_buffer = tq_buffer
         self._recovery_ledger = RolloutRecoveryLedger()
         self._data_plane_checkpoint_barrier: Optional[DataPlaneCheckpointBarrier] = None
@@ -1739,24 +1728,24 @@ class RolloutManager:
         """Counters describing retry/skip activity so far."""
         return self._stats
 
-    def bind_gym_acknowledgement_sink(
+    def bind_gym_acknowledgement_notifier(
         self,
-        on_ready: Optional[GymAcknowledgementsReadyCallback],
+        on_ready: Optional[GymAcknowledgementReadyCallback],
     ) -> None:
         """Bind or reject Gym ACK transport according to construction mode."""
-        if self._gym_acknowledgement_sink is None:
+        if self._gym_acknowledgement_notifier is None:
             if on_ready is not None:
                 raise ValueError(
                     "checkpoint-aware Gym rollouts require a persistent "
-                    "acknowledgement sink"
+                    "acknowledgement notifier"
                 )
             return
         if on_ready is None:
             raise ValueError(
-                "Gym acknowledgement sink was configured while participant "
+                "Gym acknowledgement notifier was configured while participant "
                 "checkpointing is disabled"
             )
-        self._gym_acknowledgement_sink.bind(on_ready)
+        self._gym_acknowledgement_notifier.bind(on_ready)
 
     def suspend_request_deadlines(self) -> None:
         """Pause live request-deadline clocks while a colocated engine is in training mode."""
@@ -2397,7 +2386,7 @@ class RolloutManager:
                 else None
             )
             if (
-                self._gym_acknowledgement_sink is not None
+                self._gym_acknowledgement_notifier is not None
                 and completion_receipt is None
             ):
                 raise ValueError(
@@ -2424,6 +2413,18 @@ class RolloutManager:
                     return
                 pending_group_results[generation_index] = result
                 if len(pending_group_results) < recovery_group.expected_generations:
+                    if self._gym_acknowledgement_notifier is not None:
+                        async with self._recovery_mutation(
+                            "gym_acknowledgements"
+                        ) as cut:
+                            self._recovery_ledger.record_partial_group_acknowledgement(
+                                cut,
+                                group_id,
+                                generation_index,
+                                result,
+                            )
+                        # Transport starts only after the obligation is durable.
+                        self._gym_acknowledgement_notifier.notify_ready()
                     return
                 async with self._recovery_mutation("sibling_seals") as cut:
                     self._recovery_ledger.mark_group_sealed(
@@ -2431,15 +2432,15 @@ class RolloutManager:
                         group_id,
                         pending_group_results,
                     )
-                    if self._gym_acknowledgement_sink is not None:
+                    if self._gym_acknowledgement_notifier is not None:
                         self._recovery_ledger.record_sealed_group_acknowledgements(
                             cut,
                             group_id,
                         )
-                if self._gym_acknowledgement_sink is not None:
+                if self._gym_acknowledgement_notifier is not None:
                     # Only schedule transport after releasing the seal cut. The
                     # checkpointable obligation itself was recorded inside the cut.
-                    self._gym_acknowledgement_sink.notify_ready()
+                    self._gym_acknowledgement_notifier.notify_ready()
                 return
 
             async with self._recovery_mutation("sibling_seals") as cut:
@@ -2454,15 +2455,15 @@ class RolloutManager:
                     mask_sample=mask_sample,
                     resolved_agent_name=resolved_agent_name,
                 )
-                if self._gym_acknowledgement_sink is not None:
+                if self._gym_acknowledgement_notifier is not None:
                     self._recovery_ledger.record_sealed_sibling_acknowledgement(
                         cut,
                         group_id,
                         generation_index,
                     )
-            if self._gym_acknowledgement_sink is not None:
+            if self._gym_acknowledgement_notifier is not None:
                 # Network delivery must never extend the data-plane mutation cut.
-                self._gym_acknowledgement_sink.notify_ready()
+                self._gym_acknowledgement_notifier.notify_ready()
 
         try:
             if inflight_registry is not None:

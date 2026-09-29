@@ -21,6 +21,7 @@ from pydantic import ValidationError
 
 from nemo_rl.environments.gym_checkpoint import (
     GYM_CHECKPOINT_SCHEMA_VERSION,
+    GymAgentRetireResponse,
     GymCheckpointTopology,
     GymCheckpointPhase,
     GymDiscoveredParticipant,
@@ -76,6 +77,29 @@ def test_gym_execution_identity_separates_logical_id_from_capture_key() -> None:
     assert first.capture_key == "group-7_g0"
     assert retry.capture_key == "group-7_g0-a2"
     assert gym_capture_key("group-7_g0", 2) == retry.capture_key
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"retired": False, "tombstoned": False, "completed_unacknowledged": True},
+        {"retired": False, "tombstoned": True},
+        {"retired": True, "tombstoned": True},
+    ],
+)
+def test_agent_retire_response_accepts_only_safe_dispositions(payload: dict) -> None:
+    GymAgentRetireResponse.model_validate(payload)
+
+
+def test_agent_retire_response_rejects_ambiguous_disposition() -> None:
+    with pytest.raises(ValidationError, match="invalid Gym agent retirement"):
+        GymAgentRetireResponse.model_validate(
+            {
+                "retired": False,
+                "tombstoned": False,
+                "completed_unacknowledged": False,
+            }
+        )
 
 
 @pytest.mark.parametrize(

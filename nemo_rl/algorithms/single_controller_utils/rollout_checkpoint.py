@@ -29,6 +29,10 @@ from typing import Any, Literal, Mapping, Optional, get_args
 from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
 from nemo_rl.environments.gym_checkpoint import GymCheckpointCommitResult
 
+# Version of the rollout snapshot manifest (manifest.json). Readers accept only
+# this version, so bump it whenever a saved field is added, removed, renamed, or
+# changes meaning, then regenerate
+# tests/unit/single_controller/checkpoint_schema_lock.json.
 ROLLOUT_SNAPSHOT_SCHEMA_VERSION = 4
 BOOTSTRAP_COMPATIBILITY_SCHEMA_VERSION = 7
 BOOTSTRAP_DIRNAME = "bootstrap"

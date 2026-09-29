@@ -69,6 +69,7 @@ from nemo_rl.experience.rollouts import (
     _reattach_original_multimodal_payloads,
     attach_static_multimodal_payload,
 )
+from nemo_rl.experience.failures import GymTransportError
 from nemo_rl.models.generation.vllm import VllmGeneration
 
 # cluster and tokenizer are fixture imports
@@ -110,7 +111,6 @@ def test_rollout_progress_counter_is_built_after_gym_resolves_task_source(
             rch = _RolloutCollectionHelper()
             head_server_config = object()
             _token_capture_enabled = False
-            _stable_execution_identity_enabled = True
             _gym_checkpoint_participants = ()
             _tokenizer = object()
 
@@ -163,15 +163,32 @@ def test_run_rollouts_waits_when_checkpoint_freezes_before_actor_registration() 
             "agent_ref": {"name": "test-agent"},
             "responses_create_params": {"input": []},
         }
+        receipt: dict | None = GymCompletionReceipt(
+            rollout_id="group-1_g0",
+            attempt_index=0,
+            execution_generation=1,
+            result_identity="result-group-1_g0-0",
+            result_digest="1" * 64,
+        ).model_dump(mode="json")
 
         class _RolloutCollectionHelper:
-            def run_examples(self, examples, head_server_config):
+            def run_examples_with_metadata(
+                self,
+                examples,
+                head_server_config,
+                route_failures_to_sidecar=False,
+            ):
                 del head_server_config
+                assert route_failures_to_sidecar is True
                 dispatch_started.set()
 
                 async def _completed_result():
                     await complete_rollout.wait()
-                    return examples[0], {"response": {"output": []}}
+                    return (
+                        examples[0],
+                        {"response": {"output": []}},
+                        {"completion_receipt": receipt},
+                    )
 
                 return [_completed_result()]
 
@@ -180,24 +197,12 @@ def test_run_rollouts_waits_when_checkpoint_freezes_before_actor_registration() 
             rch = _RolloutCollectionHelper()
             head_server_config = object()
             _token_capture_enabled = False
-            _stable_execution_identity_enabled = True
             _gym_checkpoint_participants = (object(),)
             _gym_execution_registry = registry
             _tokenizer = object()
 
             def _require_spinup(self):
                 pass
-
-            async def _completion_receipt_for(self, execution, *, agent_name):
-                assert execution.rollout_id == "group-1_g0"
-                assert agent_name == "test-agent"
-                return GymCompletionReceipt(
-                    rollout_id="group-1_g0",
-                    attempt_index=0,
-                    execution_generation=1,
-                    result_identity="result-group-1_g0-0",
-                    result_digest="1" * 64,
-                )
 
             def _postprocess_nemo_gym_to_nemo_rl_result(
                 self,
@@ -226,16 +231,690 @@ def test_run_rollouts_waits_when_checkpoint_freezes_before_actor_registration() 
 
         registry.unfreeze("snapshot-1")
         await asyncio.wait_for(dispatch_started.wait(), timeout=1.0)
-        frozen = registry.freeze("snapshot-2")
-        assert [execution.identity.rollout_id for execution in frozen] == ["group-1_g0"]
+        registry.freeze("snapshot-2")
+        assert registry.status()["live"] == 1
 
         complete_rollout.set()
         result = await asyncio.wait_for(result_task, timeout=1.0)
         assert result[0] == 0
-        assert registry.status()["terminal_unreleased"] == 1
+        assert registry.status()["live"] == 1
         await stream.aclose()
         registry.unfreeze("snapshot-2")
         assert registry.status()["live"] == 0
+
+    asyncio.run(_run())
+
+
+@pytest.mark.parametrize(
+    ("receipt_override", "message"),
+    [
+        (None, "omitted its advertised completion receipt"),
+        (
+            {"rollout_id": "other-rollout", "attempt_index": 0},
+            "identity does not match the completed execution",
+        ),
+    ],
+)
+def test_run_rollouts_rejects_missing_or_mismatched_inline_completion_receipt(
+    receipt_override: dict | None,
+    message: str,
+) -> None:
+    async def _run() -> None:
+        row = {
+            "_rowidx": 0,
+            "_ng_rollout_id": "group-1_g0",
+            "_ng_attempt_index": 0,
+            "agent_ref": {"name": "test-agent"},
+            "responses_create_params": {"input": []},
+        }
+        receipt = GymCompletionReceipt(
+            rollout_id="group-1_g0",
+            attempt_index=0,
+            execution_generation=1,
+            result_identity="result-group-1_g0-0",
+            result_digest="1" * 64,
+        ).model_dump(mode="json")
+        if receipt_override is None:
+            receipt = None
+        else:
+            assert receipt is not None
+            receipt.update(receipt_override)
+
+        class _RolloutCollectionHelper:
+            def run_examples_with_metadata(
+                self,
+                examples,
+                head_server_config,
+                route_failures_to_sidecar=False,
+            ):
+                del head_server_config
+                assert route_failures_to_sidecar is True
+
+                async def _result():
+                    return (
+                        examples[0],
+                        {"response": {"output": []}},
+                        {"completion_receipt": receipt},
+                    )
+
+                return [_result()]
+
+        registry = GymActorExecutionRegistry()
+
+        class _MockSelf:
+            cfg = {}
+            rch = _RolloutCollectionHelper()
+            head_server_config = object()
+            _token_capture_enabled = False
+            _gym_checkpoint_participants = (object(),)
+            _gym_execution_registry = registry
+            _tokenizer = object()
+
+            def _require_spinup(self):
+                pass
+
+            def _postprocess_nemo_gym_to_nemo_rl_result(
+                self,
+                result_row,
+                result,
+                result_tokenizer,
+                *,
+                include_initial_multimodal_data,
+            ):
+                del (
+                    self,
+                    result_row,
+                    result,
+                    result_tokenizer,
+                    include_initial_multimodal_data,
+                )
+                return {"message_log": []}
+
+        stream = NemoGym.__ray_metadata__.modified_class.run_rollouts(
+            _MockSelf(), [row], "test"
+        )
+        with pytest.raises(RuntimeError, match=message):
+            await anext(stream)
+        assert registry.status()["live"] == 0
+
+    asyncio.run(_run())
+
+
+def test_run_rollouts_replays_same_attempt_after_lost_response() -> None:
+    async def _run() -> None:
+        row = {
+            "_rowidx": 0,
+            "_ng_rollout_id": "group-1_g0",
+            "_ng_attempt_index": 0,
+            "agent_ref": {"name": "test-agent"},
+            "responses_create_params": {"input": []},
+        }
+        failure_result = {
+            "_ng_failure_class": "agent_request_failed",
+            "_ng_failure_type": "ServerDisconnectedError",
+            "_ng_failure_message": "response was lost",
+            "_ng_failure_http_status": None,
+        }
+        completed_result = {"response": {"output": []}}
+        completion_receipt = GymCompletionReceipt(
+            rollout_id="group-1_g0",
+            attempt_index=0,
+            execution_generation=1,
+            result_identity="result-group-1_g0-0",
+            result_digest="1" * 64,
+        ).model_dump(mode="json")
+
+        class _RolloutCollectionHelper:
+            def __init__(self):
+                self.calls = 0
+
+            def run_examples_with_metadata(
+                self,
+                examples,
+                head_server_config,
+                route_failures_to_sidecar=False,
+            ):
+                del head_server_config
+                assert route_failures_to_sidecar is True
+                assert examples == [row]
+                self.calls += 1
+                result = failure_result if self.calls <= 2 else completed_result
+
+                async def _result():
+                    return (
+                        row,
+                        result,
+                        {
+                            "completion_receipt": (
+                                completion_receipt
+                                if result is completed_result
+                                else None
+                            )
+                        },
+                    )
+
+                return [_result()]
+
+        class _MockSelf:
+            cfg = {}
+            rch = _RolloutCollectionHelper()
+            head_server_config = object()
+            _token_capture_enabled = False
+            _gym_checkpoint_participants = (object(),)
+            _gym_execution_registry = GymActorExecutionRegistry()
+            _tokenizer = object()
+            _active_gym_checkpoint_id = None
+            _control_timeout_s = 1.0
+            _resolve_ambiguous_run_result = (
+                NemoGym.__ray_metadata__.modified_class._resolve_ambiguous_run_result
+            )
+            _retire_ambiguous_execution = (
+                NemoGym.__ray_metadata__.modified_class._retire_ambiguous_execution
+            )
+
+            def _require_spinup(self):
+                pass
+
+            def _agent_checkpoint_participant(self, agent_name):
+                assert agent_name == "test-agent"
+                return SimpleNamespace(
+                    participant=SimpleNamespace(server_name="test-agent-server")
+                )
+
+            async def _control(self, method, path, *, server_name, json):
+                assert method == "POST"
+                assert path.endswith("/retire")
+                assert server_name == "test-agent-server"
+                assert json["rollout_id"] == "group-1_g0"
+                assert json["attempt_index"] == 0
+                return {
+                    "retired": False,
+                    "tombstoned": False,
+                    "completed_unacknowledged": True,
+                }
+
+            def _postprocess_nemo_gym_to_nemo_rl_result(
+                self,
+                result_row,
+                result,
+                result_tokenizer,
+                *,
+                include_initial_multimodal_data,
+            ):
+                del (
+                    self,
+                    result_row,
+                    result,
+                    result_tokenizer,
+                    include_initial_multimodal_data,
+                )
+                return {"message_log": []}
+
+        mock = _MockSelf()
+        streamed = []
+        async for item in NemoGym.__ray_metadata__.modified_class.run_rollouts(
+            mock, [row], "test"
+        ):
+            streamed.append(item)
+
+        assert len(streamed) == 1
+        assert mock.rch.calls == 3
+        assert streamed[0][2]["gym_completion_receipt"]["attempt_index"] == 0
+        assert mock._gym_execution_registry.status()["live"] == 0
+
+    asyncio.run(_run())
+
+
+def test_run_rollouts_retires_ambiguous_attempt_before_redispatch() -> None:
+    async def _run() -> None:
+        row = {
+            "_rowidx": 0,
+            "_ng_rollout_id": "group-1_g0",
+            "_ng_attempt_index": 0,
+            "agent_ref": {"name": "test-agent"},
+            "responses_create_params": {"input": []},
+        }
+
+        class _RolloutCollectionHelper:
+            calls = 0
+
+            def run_examples_with_metadata(
+                self,
+                examples,
+                head_server_config,
+                route_failures_to_sidecar=False,
+            ):
+                del head_server_config
+                assert route_failures_to_sidecar is True
+                assert examples == [row]
+                self.calls += 1
+
+                async def _failed_result():
+                    return (
+                        row,
+                        {
+                            "_ng_failure_class": "agent_request_failed",
+                            "_ng_failure_type": "ServerDisconnectedError",
+                            "_ng_failure_message": "response was lost",
+                            "_ng_failure_http_status": None,
+                        },
+                        {"completion_receipt": None},
+                    )
+
+                return [_failed_result()]
+
+        class _MockSelf:
+            cfg = {}
+            rch = _RolloutCollectionHelper()
+            head_server_config = object()
+            _token_capture_enabled = False
+            _gym_checkpoint_participants = (object(),)
+            _gym_execution_registry = GymActorExecutionRegistry()
+            _tokenizer = object()
+            _active_gym_checkpoint_id = None
+            _control_timeout_s = 1.0
+            _resolve_ambiguous_run_result = (
+                NemoGym.__ray_metadata__.modified_class._resolve_ambiguous_run_result
+            )
+            _retire_ambiguous_execution = (
+                NemoGym.__ray_metadata__.modified_class._retire_ambiguous_execution
+            )
+
+            def _require_spinup(self):
+                pass
+
+            def _agent_checkpoint_participant(self, agent_name):
+                assert agent_name == "test-agent"
+                return SimpleNamespace(
+                    participant=SimpleNamespace(server_name="test-agent-server")
+                )
+
+            async def _control(self, method, path, *, server_name, json):
+                del method, path, server_name, json
+                return {
+                    "retired": True,
+                    "tombstoned": True,
+                    "completed_unacknowledged": False,
+                }
+
+        mock = _MockSelf()
+        stream = NemoGym.__ray_metadata__.modified_class.run_rollouts(
+            mock, [row], "test"
+        )
+        with pytest.raises(GymTransportError, match="agent_request_failed"):
+            await anext(stream)
+
+        assert mock.rch.calls == 1
+        assert mock._gym_execution_registry.status()["live"] == 0
+
+    asyncio.run(_run())
+
+
+class _GymHTTPRolloutCollectionHelper:
+    """Drive replay requests through a real Gym ASGI application."""
+
+    def __init__(self, client):
+        self._client = client
+
+    def run_examples_with_metadata(
+        self,
+        examples,
+        head_server_config,
+        route_failures_to_sidecar=False,
+    ):
+        del head_server_config
+        assert route_failures_to_sidecar is True
+
+        async def _run(row):
+            from nemo_gym._checkpoint import (
+                AGENT_COMPLETION_RECEIPT_HEADER,
+                decode_agent_completion_receipt,
+            )
+
+            response = await self._client.post("/run", json=row)
+            if response.is_success:
+                encoded_receipt = response.headers.get(AGENT_COMPLETION_RECEIPT_HEADER)
+                return (
+                    row,
+                    response.json(),
+                    {
+                        "completion_receipt": (
+                            decode_agent_completion_receipt(encoded_receipt).model_dump(
+                                mode="json"
+                            )
+                            if encoded_receipt is not None
+                            else None
+                        )
+                    },
+                )
+            return (
+                row,
+                {
+                    "_ng_failure_class": "agent_request_failed",
+                    "_ng_failure_type": "ClientResponseError",
+                    "_ng_failure_message": response.text,
+                    "_ng_failure_http_status": response.status_code,
+                },
+                {"completion_receipt": None},
+            )
+
+        return [_run(row) for row in examples]
+
+
+class _RealGymReconciliationHarness:
+    _resolve_ambiguous_run_result = (
+        NemoGym.__ray_metadata__.modified_class._resolve_ambiguous_run_result
+    )
+    _retire_ambiguous_execution = (
+        NemoGym.__ray_metadata__.modified_class._retire_ambiguous_execution
+    )
+
+    def __init__(self, client):
+        self.rch = _GymHTTPRolloutCollectionHelper(client)
+        self.head_server_config = object()
+        self._client = client
+        self._active_gym_checkpoint_id = None
+        self._control_timeout_s = 1.0
+
+    def _agent_checkpoint_participant(self, agent_name):
+        assert agent_name == "test-agent"
+        return SimpleNamespace(
+            participant=SimpleNamespace(server_name="test-agent-server")
+        )
+
+    async def _control(
+        self,
+        method,
+        path,
+        *,
+        server_name,
+        json=None,
+        params=None,
+    ):
+        assert server_name == "test-agent-server"
+        response = await self._client.request(
+            method,
+            path,
+            json=json,
+            params=params,
+            headers={"authorization": "Bearer test-control-token"},
+        )
+        response.raise_for_status()
+        return response.json()
+
+
+def _real_gym_checkpoint_agent(monkeypatch, *, block_first_run=False):
+    from unittest.mock import MagicMock
+
+    from pydantic import ConfigDict
+
+    from nemo_gym.base_resources_server import BaseRunRequest
+    from nemo_gym.base_responses_api_agent import (
+        BaseResponsesAPIAgentConfig,
+        SimpleResponsesAPIAgent,
+    )
+    from nemo_gym.server_utils import ServerClient
+
+    monkeypatch.setenv(
+        "NEMO_GYM_CHECKPOINT_CONTROL_TOKEN",
+        "test-control-token",
+    )
+    state = SimpleNamespace(
+        calls=0,
+        first_run_started=asyncio.Event(),
+    )
+
+    class _RunRequest(BaseRunRequest):
+        model_config = ConfigDict(extra="allow")
+
+    class _Agent(SimpleResponsesAPIAgent):
+        async def responses(self, body):
+            raise NotImplementedError
+
+        async def run(self, body: _RunRequest) -> dict:
+            del body
+            state.calls += 1
+            if block_first_run and state.calls == 1:
+                state.first_run_started.set()
+                await asyncio.Event().wait()
+            return {
+                "response": {"output": []},
+                "run_count": state.calls,
+            }
+
+    server_client = MagicMock(spec=ServerClient)
+    server_client.global_config_dict = {}
+    agent = _Agent(
+        config=BaseResponsesAPIAgentConfig(
+            host="agent.test",
+            port=80,
+            entrypoint="app.py",
+            name="test-agent",
+        ),
+        server_client=server_client,
+    )
+    return agent, agent.setup_webserver(), state
+
+
+def _ambiguous_gym_failure():
+    return {
+        "_ng_failure_class": "agent_request_failed",
+        "_ng_failure_type": "ServerDisconnectedError",
+        "_ng_failure_message": "response was lost",
+        "_ng_failure_http_status": None,
+    }
+
+
+@pytest.mark.nemo_gym
+def test_ambiguous_run_replays_real_gym_completion_without_rerunning(
+    monkeypatch,
+) -> None:
+    async def _run() -> None:
+        import httpx
+
+        from nemo_rl.environments.gym_checkpoint import GymExecutionIdentity
+
+        agent, app, state = _real_gym_checkpoint_agent(monkeypatch)
+        row = {
+            "_rowidx": 0,
+            "_ng_rollout_id": "group-1_g0",
+            "_ng_attempt_index": 0,
+            "agent_ref": {"name": "test-agent"},
+            "responses_create_params": {"input": []},
+        }
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://gym.test",
+        ) as client:
+            # Gym completes the execution, but model the caller losing this reply.
+            original = await client.post("/run", json=row)
+            assert original.status_code == 200
+            assert state.calls == 1
+
+            harness = _RealGymReconciliationHarness(client)
+            (
+                replayed_row,
+                replayed_result,
+                replayed_metadata,
+            ) = await harness._resolve_ambiguous_run_result(
+                row,
+                _ambiguous_gym_failure(),
+                GymExecutionIdentity(rollout_id="group-1_g0", attempt_index=0),
+            )
+
+            assert replayed_row is row
+            assert replayed_result == original.json()
+            # The second /run returned Gym's retained terminal result.
+            assert state.calls == 1
+            assert (
+                agent.checkpoint_participant().status()["completed_unacknowledged"] == 1
+            )
+
+            receipt = replayed_metadata["completion_receipt"]
+            assert receipt is not None
+            acknowledged = await client.post(
+                "/ng-control/v1/agent-checkpoint/acknowledge",
+                json=receipt,
+                headers={"authorization": "Bearer test-control-token"},
+            )
+            assert acknowledged.status_code == 200
+            assert (
+                agent.checkpoint_participant().status()["completed_unacknowledged"] == 0
+            )
+
+    asyncio.run(_run())
+
+
+@pytest.mark.nemo_gym
+def test_real_gym_prompt_group_completion_after_initial_flush_blocks_prepare_until_acked(
+    monkeypatch,
+) -> None:
+    async def _run() -> None:
+        import httpx
+
+        from nemo_gym._checkpoint import (
+            AGENT_COMPLETION_RECEIPT_HEADER,
+            decode_agent_completion_receipt,
+        )
+
+        agent, app, state = _real_gym_checkpoint_agent(monkeypatch)
+        rows = [
+            {
+                "_rowidx": generation_index,
+                "_ng_rollout_id": f"group-1_g{generation_index}",
+                "_ng_attempt_index": 0,
+                "agent_ref": {"name": "test-agent"},
+                "responses_create_params": {"input": []},
+            }
+            for generation_index in range(2)
+        ]
+        control_headers = {"authorization": "Bearer test-control-token"}
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://gym.test",
+        ) as client:
+            # Model the controller's initial ACK pass observing an empty outbox.
+            assert (
+                agent.checkpoint_participant().status()["completed_unacknowledged"] == 0
+            )
+
+            completed = [await client.post("/run", json=row) for row in rows]
+            receipts = [
+                decode_agent_completion_receipt(
+                    response.headers[AGENT_COMPLETION_RECEIPT_HEADER]
+                ).model_dump(mode="json")
+                for response in completed
+            ]
+            assert [receipt["rollout_id"] for receipt in receipts] == [
+                "group-1_g0",
+                "group-1_g1",
+            ]
+
+            first_ack = await client.post(
+                "/ng-control/v1/agent-checkpoint/acknowledge",
+                json=receipts[0],
+                headers=control_headers,
+            )
+            assert first_ack.status_code == 200
+
+            blocked_prepare = await client.post(
+                "/ng-control/v1/agent-checkpoint/prepare",
+                json={
+                    "checkpoint_id": "snapshot-prompt-group",
+                    "deadline_ts": time.time() + 1,
+                },
+                headers=control_headers,
+            )
+            assert blocked_prepare.status_code == 409
+            assert (
+                agent.checkpoint_participant().status()["completed_unacknowledged"] == 1
+            )
+
+            late_ack = await client.post(
+                "/ng-control/v1/agent-checkpoint/acknowledge",
+                json=receipts[1],
+                headers=control_headers,
+            )
+            assert late_ack.status_code == 200
+            prepared = await client.post(
+                "/ng-control/v1/agent-checkpoint/prepare",
+                json={
+                    "checkpoint_id": "snapshot-prompt-group",
+                    "deadline_ts": time.time() + 1,
+                },
+                headers=control_headers,
+            )
+
+            assert prepared.status_code == 200
+            assert prepared.json()["completed_unacknowledged"] == 0
+            assert state.calls == 2
+
+    asyncio.run(_run())
+
+
+@pytest.mark.nemo_gym
+def test_ambiguous_run_retires_real_gym_execution_before_redispatch(
+    monkeypatch,
+) -> None:
+    async def _run() -> None:
+        import httpx
+
+        from nemo_rl.environments.gym_checkpoint import GymExecutionIdentity
+
+        _, app, state = _real_gym_checkpoint_agent(
+            monkeypatch,
+            block_first_run=True,
+        )
+        row = {
+            "_rowidx": 0,
+            "_ng_rollout_id": "group-1_g0",
+            "_ng_attempt_index": 0,
+            "agent_ref": {"name": "test-agent"},
+            "responses_create_params": {"input": []},
+        }
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://gym.test",
+        ) as client:
+            active_run = asyncio.create_task(client.post("/run", json=row))
+            await asyncio.wait_for(
+                state.first_run_started.wait(),
+                timeout=1.0,
+            )
+
+            harness = _RealGymReconciliationHarness(client)
+            with pytest.raises(GymTransportError, match="agent_request_failed"):
+                await harness._resolve_ambiguous_run_result(
+                    row,
+                    _ambiguous_gym_failure(),
+                    GymExecutionIdentity(
+                        rollout_id="group-1_g0",
+                        attempt_index=0,
+                    ),
+                )
+
+            try:
+                retired_response = await asyncio.wait_for(active_run, timeout=1.0)
+            except asyncio.CancelledError:
+                pass
+            except RuntimeError as error:
+                # Starlette converts a request-task cancellation into this error.
+                assert str(error) == "No response returned."
+            else:
+                assert retired_response.status_code >= 400
+
+            stale = await client.post("/run", json=row)
+            assert stale.status_code == 409
+
+            replacement = await client.post(
+                "/run",
+                json={**row, "_ng_attempt_index": 1},
+            )
+            assert replacement.status_code == 200
+            assert replacement.json()["run_count"] == 2
 
     asyncio.run(_run())
 
@@ -1733,7 +2412,6 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
             rch = _RolloutCollectionHelper()
             head_server_config = object()
             _token_capture_enabled = False
-            _stable_execution_identity_enabled = True
             _gym_checkpoint_participants = ()
 
             def _require_spinup(self):
@@ -1799,7 +2477,6 @@ def test_nemo_gym_run_rollouts_drains_siblings_after_one_task_fails():
             head_server_config = object()
             _tokenizer = object()
             _token_capture_enabled = False
-            _stable_execution_identity_enabled = True
             _gym_checkpoint_participants = ()
 
             def _require_spinup(self):
@@ -1900,7 +2577,6 @@ def test_nemo_gym_megatron_multimodal_response_round_trip(tmp_path, modality):
             _tokenizer = _Tokenizer()
             _processor = None
             _token_capture_enabled = False
-            _stable_execution_identity_enabled = True
             _gym_checkpoint_participants = ()
             # Bind the real postprocess: the assertions below are about its
             # message_log output, not about run_rollouts' dispatch alone.

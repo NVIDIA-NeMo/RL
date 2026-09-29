@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import io
 from collections.abc import Callable
 from typing import Any, TypeVar
 
@@ -29,22 +30,25 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 )
 from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
 from nemo_rl.data.interfaces import DatumSpec
-from nemo_rl.environments.gym_checkpoint import GymCompletionReceipt
+from nemo_rl.environments.gym_checkpoint import (
+    GymCompletedExecution,
+    GymCompletionReceipt,
+)
 from nemo_rl.experience.rollout_recovery import (
-    _ATTEMPT_STATE_FIELDS,
-    _GROUP_STATE_FIELDS,
-    _PROMPT_REF_STATE_FIELDS,
-    _SIBLING_STATE_FIELDS,
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
-    PendingCompletedExecutionAcknowledgement,
     PromptGroupPhase,
     PromptGroupRecoveryRecord,
+    PromptGroupRecoveryState,
+    PromptGroupStatus,
     PromptRef,
+    PromptRefState,
     RecoveryGranularity,
     RolloutAttemptRecord,
+    RolloutAttemptState,
     RolloutAttemptStatus,
     RolloutRecoveryLedger,
     RolloutSiblingRecord,
+    RolloutSiblingState,
     SiblingSealResult,
     build_rollout_recovery_state,
     parse_rollout_recovery_state,
@@ -87,6 +91,27 @@ def _prompt(idx: int = 7) -> DatumSpec:
     }
 
 
+def _dispatched_ledger(
+    recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
+) -> tuple[RolloutRecoveryLedger, list[str]]:
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=2,
+        target_step=7,
+        start_weight_version=6,
+        task_source=None,
+        recovery_granularity=recovery_granularity,
+        admitted=True,
+    )
+    _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
+    return ledger, group.gate_rollout_ids
+
+
 def _completion_receipt(
     rollout_id: str,
     attempt_index: int = 0,
@@ -98,6 +123,95 @@ def _completion_receipt(
         result_identity=f"result-{rollout_id}-{attempt_index}",
         result_digest=f"{attempt_index + 1:064x}",
     )
+
+
+def _completed_execution(
+    rollout_id: str,
+    attempt_index: int = 0,
+    *,
+    agent_name: str = "test-agent",
+) -> GymCompletedExecution:
+    return GymCompletedExecution(
+        receipt=_completion_receipt(rollout_id, attempt_index),
+        agent_name=agent_name,
+    )
+
+
+def test_stale_acknowledgement_does_not_remove_the_pending_obligation() -> None:
+    ledger, gate_ids = _dispatched_ledger()
+    _mutate(
+        lambda cut: (
+            ledger.mark_sibling_sealed(
+                cut,
+                "g7",
+                generation_index=0,
+                gate_rollout_id=gate_ids[0],
+                receipt=None,
+                completion_receipt=_completion_receipt("g7_g0"),
+                reward=0.0,
+                mask_sample=True,
+                resolved_agent_name="test-agent",
+            ),
+            ledger.record_sealed_sibling_acknowledgement(cut, "g7", 0),
+        )
+    )
+    [pending] = ledger.pending_completed_execution_acknowledgements()
+    stale = pending.model_copy(
+        update={
+            "receipt": pending.receipt.model_copy(update={"result_digest": f"{9:064x}"})
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="receipt.result_digest"):
+        _mutate(lambda cut: ledger.mark_completed_executions_acknowledged(cut, [stale]))
+    assert ledger.pending_completed_execution_acknowledgements() == [pending]
+
+
+@pytest.mark.parametrize(
+    "recovery_granularity",
+    [RecoveryGranularity.SIBLING, RecoveryGranularity.PROMPT_GROUP],
+)
+def test_seal_rejects_completion_receipt_for_another_attempt(
+    recovery_granularity: RecoveryGranularity,
+) -> None:
+    ledger, gate_ids = _dispatched_ledger(recovery_granularity)
+    wrong = _completion_receipt("g7_g0", attempt_index=1)
+
+    with pytest.raises(ValueError, match="completion receipt identity mismatch"):
+        if recovery_granularity is RecoveryGranularity.SIBLING:
+            _mutate(
+                lambda cut: ledger.mark_sibling_sealed(
+                    cut,
+                    "g7",
+                    generation_index=0,
+                    gate_rollout_id=gate_ids[0],
+                    receipt=None,
+                    completion_receipt=wrong,
+                    reward=0.0,
+                    mask_sample=True,
+                    resolved_agent_name="test-agent",
+                )
+            )
+        else:
+            _mutate(
+                lambda cut: ledger.mark_group_sealed(
+                    cut,
+                    "g7",
+                    {
+                        index: SiblingSealResult(
+                            gate_rollout_id=gate_ids[index],
+                            receipt=None,
+                            completion_receipt=(
+                                wrong if index == 0 else _completion_receipt("g7_g1")
+                            ),
+                            reward=0.0,
+                            mask_sample=True,
+                            resolved_agent_name="test-agent",
+                        )
+                        for index in range(2)
+                    },
+                )
+            )
 
 
 def _single_prompt_batch(batch: list[DatumSpec]) -> DatumSpec:
@@ -151,35 +265,100 @@ def test_ledger_round_trip_preserves_group_ownership() -> None:
     assert restored.get_group("g7").phase is PromptGroupPhase.ADMITTED
 
 
+def test_ledger_state_is_safe_for_weights_only_torch_load() -> None:
+    ledger = RolloutRecoveryLedger()
+    _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=1,
+        target_step=7,
+        start_weight_version=6,
+        admitted=True,
+    )
+    state = ledger.state_dict()
+
+    payload = io.BytesIO()
+    torch.save(state, payload)
+    payload.seek(0)
+    loaded = torch.load(payload, weights_only=True)
+
+    restored = RolloutRecoveryLedger.from_state_dict(loaded)
+    _bind(restored, "g7", _prompt())
+
+    assert restored.state_dict() == state
+
+
 def test_serialized_state_fields_match_recovery_dataclasses() -> None:
-    """Require every durable dataclass field to be classified explicitly."""
-    assert _PROMPT_REF_STATE_FIELDS == {
+    """Require every runtime field to be represented by the saved-state model."""
+    assert set(PromptRefState.model_fields) == {
         field.name for field in dataclasses.fields(PromptRef)
     }
-    assert _SIBLING_STATE_FIELDS == {
+    assert set(RolloutSiblingState.model_fields) == {
         field.name for field in dataclasses.fields(RolloutSiblingRecord)
     }
-    assert _ATTEMPT_STATE_FIELDS == {
+    assert set(RolloutAttemptState.model_fields) == {
         field.name for field in dataclasses.fields(RolloutAttemptRecord)
     }
-    assert _GROUP_STATE_FIELDS == {
+    assert set(PromptGroupRecoveryState.model_fields) == {
         field.name for field in dataclasses.fields(PromptGroupRecoveryRecord)
     } - {"runtime_prompt_payload"}
 
 
 @pytest.mark.parametrize(
-    ("path", "context"),
+    "path",
     [
-        ((), "rollout recovery state"),
-        (("groups", 0), "rollout-recovery group"),
-        (("groups", 0, "prompt_ref"), "rollout-recovery prompt_ref"),
-        (("groups", 0, "siblings", 0), "rollout-recovery sibling"),
-        (("groups", 0, "siblings", 0, "attempts", 0), "rollout-recovery attempt"),
+        ("groups", 0, "task_source"),
+        ("groups", 0, "resolved_agent_name"),
+        ("groups", 0, "target_step"),
+        ("groups", 0, "prompt_ref", "task_name"),
+        ("groups", 0, "siblings", 0, "attempts", 0, "receipt"),
+        ("groups", 0, "siblings", 0, "attempts", 0, "completion_receipt"),
+        ("groups", 0, "siblings", 0, "attempts", 0, "reward"),
+        ("groups", 0, "siblings", 0, "attempts", 0, "mask_sample"),
     ],
 )
-def test_ledger_restore_rejects_unknown_fields(
-    path: tuple[object, ...], context: str
+def test_ledger_restore_rejects_omitted_nullable_fields(
+    path: tuple[object, ...],
 ) -> None:
+    ledger = RolloutRecoveryLedger()
+    _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=1,
+        target_step=7,
+        start_weight_version=6,
+        admitted=True,
+    )
+    state = ledger.state_dict()
+    target: Any = state
+    for component in path[:-1]:
+        target = target[component]
+    assert isinstance(target, dict)
+    missing_field = path[-1]
+    assert isinstance(missing_field, str)
+    del target[missing_field]
+
+    with pytest.raises(ValueError, match=missing_field):
+        RolloutRecoveryLedger.from_state_dict(state)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        (),
+        ("groups", 0),
+        ("groups", 0, "prompt_ref"),
+        ("groups", 0, "siblings", 0),
+        ("groups", 0, "siblings", 0, "attempts", 0),
+    ],
+)
+def test_ledger_restore_rejects_unknown_fields(path: tuple[object, ...]) -> None:
     ledger = RolloutRecoveryLedger()
     _reserve(
         ledger,
@@ -199,50 +378,36 @@ def test_ledger_restore_rejects_unknown_fields(
     assert isinstance(target, dict)
     target["unexpected"] = True
 
-    with pytest.raises(ValueError, match=rf"{context} contains unknown fields"):
+    with pytest.raises(ValueError, match="unexpected"):
         RolloutRecoveryLedger.from_state_dict(state)
 
 
 @pytest.mark.parametrize(
-    ("field", "value", "error_fragment"),
+    ("field", "value"),
     [
-        ("rollout_id", "", "rollout_id must not be empty"),
-        ("attempt_index", True, "attempt_index must be non-negative"),
-        ("attempt_index", -1, "attempt_index must be non-negative"),
-        ("agent_name", "", "agent_name must not be empty"),
+        ("rollout_id", ""),
+        ("attempt_index", True),
+        ("attempt_index", -1),
+        ("agent_name", ""),
     ],
 )
 def test_ledger_restore_rejects_malformed_completion_acknowledgements(
     field: str,
     value: object,
-    error_fragment: str,
 ) -> None:
     state = RolloutRecoveryLedger().state_dict()
-    acknowledgement: dict[str, object] = {
-        "rollout_id": "g7_g0",
-        "attempt_index": 0,
-        "agent_name": "test-agent",
-        "execution_generation": 1,
-        "result_identity": "result-g7_g0-0",
-        "result_digest": "1" * 64,
-    }
-    acknowledgement[field] = value
+    acknowledgement = _completed_execution("g7_g0").model_dump(mode="json")
+    target = acknowledgement if field == "agent_name" else acknowledgement["receipt"]
+    target[field] = value
     state["pending_completed_execution_acknowledgements"] = [acknowledgement]
 
-    with pytest.raises(ValueError, match=error_fragment):
+    with pytest.raises(ValueError, match=field):
         RolloutRecoveryLedger.from_state_dict(state)
 
 
 def test_ledger_restore_rejects_duplicate_completion_acknowledgements() -> None:
     state = RolloutRecoveryLedger().state_dict()
-    acknowledgement = {
-        "rollout_id": "g7_g0",
-        "attempt_index": 0,
-        "agent_name": "test-agent",
-        "execution_generation": 1,
-        "result_identity": "result-g7_g0-0",
-        "result_digest": "1" * 64,
-    }
+    acknowledgement = _completed_execution("g7_g0").model_dump(mode="json")
     state["pending_completed_execution_acknowledgements"] = [
         acknowledgement,
         dict(acknowledgement),
@@ -258,7 +423,7 @@ def test_ledger_restore_requires_completion_acknowledgement_outbox() -> None:
 
     with pytest.raises(
         ValueError,
-        match="must contain a pending_completed_execution_acknowledgements list",
+        match="pending_completed_execution_acknowledgements",
     ):
         RolloutRecoveryLedger.from_state_dict(state)
 
@@ -267,19 +432,15 @@ def test_ledger_restore_rejects_unknown_completion_acknowledgement_fields() -> N
     state = RolloutRecoveryLedger().state_dict()
     state["pending_completed_execution_acknowledgements"] = [
         {
-            "rollout_id": "g7_g0",
-            "attempt_index": 0,
+            "receipt": _completion_receipt("g7_g0").model_dump(mode="json"),
             "agent_name": "test-agent",
-            "execution_generation": 1,
-            "result_identity": "result-g7_g0-0",
-            "result_digest": "1" * 64,
             "unexpected": True,
         }
     ]
 
     with pytest.raises(
         ValueError,
-        match="completed execution acknowledgement contains unknown fields",
+        match="unexpected",
     ):
         RolloutRecoveryLedger.from_state_dict(state)
 
@@ -321,17 +482,16 @@ def _sealed_attempt_state() -> dict[str, Any]:
     ("case", "error_fragment"),
     [
         ("attempt_index", "attempt indices must be contiguous"),
-        ("attempt_uuid", "attempt_uuid must contain exactly 16 bytes"),
-        ("status_type", "invalid rollout attempt status"),
-        ("status_value", "invalid rollout attempt status"),
-        ("staging_keys", "staging_keys must be a list of strings"),
+        ("status_type", "status"),
+        ("status_value", "status"),
+        ("staging_keys", "staging_keys"),
         ("reward", "sealed attempts require a reward"),
-        ("mask_sample", "sealed attempts require a boolean mask_sample"),
+        ("mask_sample", "mask_sample"),
         (
             "missing_receipt_staging",
             "sealed missing-receipt attempt cannot own staging keys",
         ),
-        ("receipt_type", "sealed attempt receipt must be a mapping or None"),
+        ("receipt_type", "receipt"),
         ("receipt_manifest_type", "receipt must contain a manifest list"),
         ("receipt_identity", "sealed receipt identity mismatch"),
         ("receipt_manifest", "sealed receipt staging manifest mismatch"),
@@ -346,8 +506,6 @@ def test_restore_rejects_malformed_attempt_fields(
 
     if case == "attempt_index":
         attempt["attempt_index"] = 1
-    elif case == "attempt_uuid":
-        attempt["attempt_uuid"] = b"short"
     elif case == "status_type":
         attempt["status"] = None
     elif case == "status_value":
@@ -381,30 +539,7 @@ def test_restore_rejects_non_mapping_attempt() -> None:
     state = _sealed_attempt_state()
     state["groups"][0]["siblings"][0]["attempts"][0] = None
 
-    with pytest.raises(ValueError, match="rollout-recovery attempt must be a mapping"):
-        RolloutRecoveryLedger.from_state_dict(state)
-
-
-def test_restore_rejects_duplicate_attempt_identity() -> None:
-    ledger = RolloutRecoveryLedger()
-    _reserve(
-        ledger,
-        group_id="g7",
-        admission_id="batch-7",
-        prompt_id="7",
-        prompt_payload=_prompt(),
-        expected_generations=2,
-        target_step=7,
-        start_weight_version=6,
-        admitted=True,
-    )
-    state = ledger.state_dict()
-    siblings = state["groups"][0]["siblings"]
-    siblings[1]["attempts"][0]["attempt_uuid"] = siblings[0]["attempts"][0][
-        "attempt_uuid"
-    ]
-
-    with pytest.raises(ValueError, match="duplicate rollout attempt identity"):
+    with pytest.raises(ValueError, match="attempts"):
         RolloutRecoveryLedger.from_state_dict(state)
 
 
@@ -444,26 +579,36 @@ def test_checkpoint_parser_rejects_unknown_sidecar_fields() -> None:
     )
     state["unexpected"] = True
 
-    with pytest.raises(
-        ValueError, match="rollout recovery sidecar contains unknown fields"
-    ):
+    with pytest.raises(ValueError, match="unexpected"):
         parse_rollout_recovery_state(state)
 
 
-def test_checkpoint_parser_defaults_fields_absent_from_older_state() -> None:
-    parsed = parse_rollout_recovery_state(RolloutRecoveryLedger().state_dict())
+@pytest.mark.parametrize(
+    "field",
+    [
+        "batch_shortfall",
+        "sampler_stamps_target_steps",
+    ],
+)
+def test_checkpoint_parser_rejects_missing_controller_fields(field: str) -> None:
+    state = build_rollout_recovery_state(
+        RolloutRecoveryLedger(),
+        batch_shortfall={},
+        sampler_stamps_target_steps=True,
+    )
+    del state[field]
 
-    assert parsed.batch_shortfall == {}
-    assert parsed.sampler_stamps_target_steps is None
+    with pytest.raises(ValueError, match=field):
+        parse_rollout_recovery_state(state)
 
 
 @pytest.mark.parametrize(
     ("field", "value", "error_type"),
     [
-        ("batch_shortfall", [], TypeError),
+        ("batch_shortfall", [], ValueError),
         ("batch_shortfall", {True: 1}, ValueError),
         ("batch_shortfall", {7: -1}, ValueError),
-        ("sampler_stamps_target_steps", "yes", TypeError),
+        ("sampler_stamps_target_steps", "yes", ValueError),
     ],
 )
 def test_checkpoint_parser_rejects_malformed_controller_state(
@@ -471,7 +616,11 @@ def test_checkpoint_parser_rejects_malformed_controller_state(
     value: object,
     error_type: type[Exception],
 ) -> None:
-    state: dict[str, object] = dict(RolloutRecoveryLedger().state_dict())
+    state: dict[str, object] = build_rollout_recovery_state(
+        RolloutRecoveryLedger(),
+        batch_shortfall={},
+        sampler_stamps_target_steps=True,
+    )
     state[field] = value
 
     with pytest.raises(error_type):
@@ -819,7 +968,6 @@ def test_restart_preserves_sealed_sibling_and_retries_only_interrupted_one() -> 
         admitted=True,
     )
     _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
-    sealed_attempt_id = group.siblings[0].current_attempt.attempt_id
     sealed_id = group.gate_rollout_id(0)
     _mutate(
         lambda cut: ledger.mark_sibling_sealed(
@@ -852,7 +1000,6 @@ def test_restart_preserves_sealed_sibling_and_retries_only_interrupted_one() -> 
     assert restored.expected_staging_keys() == {"g7/sibling-0/call-0"}
 
     retry = _mutate(lambda cut: restored.prepare_incomplete_retry(cut, "g7"))
-    assert retry.siblings[0].current_attempt.attempt_id == sealed_attempt_id
     assert retry.siblings[0].current_attempt.attempt_index == 0
     assert retry.siblings[0].current_attempt.status is RolloutAttemptStatus.SEALED
     assert retry.siblings[1].current_attempt.attempt_index == 1
@@ -943,26 +1090,9 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
     state = ledger.state_dict()
     restored = RolloutRecoveryLedger.from_state_dict(state)
     expected_acknowledgements = [
-        PendingCompletedExecutionAcknowledgement(
-            rollout_id="g7_g0",
-            attempt_index=0,
-            agent_name="test-agent",
-            execution_generation=1,
-            result_identity="result-g7_g0-0",
-            result_digest=f"{1:064x}",
-        ),
-        PendingCompletedExecutionAcknowledgement(
-            rollout_id="g7_g1",
-            attempt_index=0,
-            agent_name="test-agent",
-            execution_generation=1,
-            result_identity="result-g7_g1-0",
-            result_digest=f"{1:064x}",
-        ),
+        _completed_execution("g7_g0"),
+        _completed_execution("g7_g1"),
     ]
-    assert (
-        restored.completed_execution_acknowledgements("g7") == expected_acknowledgements
-    )
     physical_ids, _, restored_receipts, rewards, mask_sample = (
         restored.finalization_inputs("g7")
     )
@@ -1036,6 +1166,63 @@ def test_prompt_group_restart_retries_every_sibling_when_one_is_unfinished() -> 
         RolloutAttemptStatus.RESERVED,
         RolloutAttemptStatus.RESERVED,
     ]
+
+
+def test_prompt_group_partial_completion_ack_survives_restart() -> None:
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=2,
+        target_step=7,
+        start_weight_version=6,
+        task_source="genrm_compare",
+        recovery_granularity=RecoveryGranularity.PROMPT_GROUP,
+        admitted=True,
+    )
+    _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
+    result = SiblingSealResult(
+        gate_rollout_id=group.gate_rollout_id(0),
+        receipt={
+            "rollout_id": group.gate_rollout_id(0),
+            "manifest": [{"staging_key": "g7/sibling-0/call-0"}],
+        },
+        completion_receipt=_completion_receipt("g7_g0"),
+        reward=1.0,
+        mask_sample=False,
+        resolved_agent_name="test-agent",
+    )
+
+    acknowledgement = _mutate(
+        lambda cut: ledger.record_partial_group_acknowledgement(
+            cut,
+            "g7",
+            0,
+            result,
+        )
+    )
+
+    partial_group = ledger.get_group("g7")
+    assert partial_group.status is PromptGroupStatus.GENERATING
+    assert (
+        partial_group.siblings[0].current_attempt.status
+        is RolloutAttemptStatus.DISPATCHED
+    )
+    assert ledger.pending_completed_execution_acknowledgements() == [acknowledgement]
+
+    restored = RolloutRecoveryLedger.from_state_dict(ledger.state_dict())
+    _mutate(lambda cut: restored.prepare_for_restart(cut))
+
+    assert [
+        sibling.current_attempt.status for sibling in restored.get_group("g7").siblings
+    ] == [
+        RolloutAttemptStatus.ABANDONED,
+        RolloutAttemptStatus.ABANDONED,
+    ]
+    assert restored.pending_completed_execution_acknowledgements() == [acknowledgement]
 
 
 def test_prompt_group_restart_clears_sealed_only_attempt_state() -> None:
@@ -1222,9 +1409,9 @@ def test_checkpoint_rejects_ambiguous_finalization_state(
 @pytest.mark.parametrize(
     ("field", "value", "error_fragment"),
     [
-        ("recovery_granularity", "banana", "invalid recovery_granularity"),
-        ("recovery_granularity", None, "recovery_granularity must be a string"),
-        ("task_source", 123, "task_source must be a string or None"),
+        ("recovery_granularity", "banana", "recovery_granularity"),
+        ("recovery_granularity", None, "recovery_granularity"),
+        ("task_source", 123, "task_source"),
     ],
 )
 def test_restore_rejects_malformed_recovery_policy_fields(
@@ -1293,7 +1480,7 @@ def test_restore_rejects_non_list_groups() -> None:
         "pending_completed_execution_acknowledgements": [],
     }
 
-    with pytest.raises(ValueError, match="must contain a groups list"):
+    with pytest.raises(ValueError, match="groups"):
         _load(RolloutRecoveryLedger(), state)  # type: ignore[arg-type]
 
 
@@ -1313,7 +1500,7 @@ def test_restore_rejects_invalid_prompt_group_phase() -> None:
     state = ledger.state_dict()
     state["groups"][0]["phase"] = "unknown"
 
-    with pytest.raises(ValueError, match="invalid prompt group phase"):
+    with pytest.raises(ValueError, match="phase"):
         _load(RolloutRecoveryLedger(), state)
 
 

@@ -1084,9 +1084,8 @@ def setup_single_controller(
         )
     data_plane_checkpointing_supported = data_plane_supports_checkpointing(dp_config)
     rollout_checkpoint_cfg = master_config.rollout_checkpointing
-    if (
-        rollout_checkpoint_cfg.gym.mode != "disabled"
-        and not should_use_nemo_gym(master_config)
+    if rollout_checkpoint_cfg.gym.mode != "disabled" and not should_use_nemo_gym(
+        master_config
     ):
         raise ValueError(
             f"rollout_checkpointing.gym.mode={rollout_checkpoint_cfg.gym.mode!r} "
@@ -1986,7 +1985,7 @@ def setup_single_controller(
         # The controller supplies a persistent sink when coordinated Gym
         # snapshot scheduling is enabled. Ordinary rollout execution does not
         # create durable completion-acknowledgement obligations.
-        gym_acknowledgement_sink=None,
+        gym_acknowledgement_notifier=None,
         max_rollout_turns=algo_cfg.max_rollout_turns,
         policy_generation=generation,
         generation_config=generation_config,

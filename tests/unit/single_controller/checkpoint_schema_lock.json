@@ -1,0 +1,142 @@
+{
+  "gym_checkpoint_artifacts": {
+    "models": {
+      "GymAgentContinuationRoot": [
+        "schema_version",
+        "rollout_id",
+        "attempt_index",
+        "capture_key",
+        "last_committed_model_call_id",
+        "resource_state_revisions"
+      ],
+      "GymExternalStorageReference": [
+        "schema_version",
+        "capture_key",
+        "boundary_model_call_id",
+        "kind",
+        "key"
+      ]
+    },
+    "schema_version": 1
+  },
+  "gym_checkpoint_commit_result": {
+    "models": {
+      "GymAgentCommitResponse": [
+        "records",
+        "manifest_digest",
+        "continuation_index"
+      ],
+      "GymCheckpointArtifactReference": [
+        "schema_version",
+        "relative_path",
+        "sha256",
+        "records",
+        "bytes"
+      ],
+      "GymCheckpointCommitResult": [
+        "checkpoint_id",
+        "participants"
+      ],
+      "GymModelCommitResponse": [
+        "rollouts",
+        "rows",
+        "excluded_tombstoned",
+        "excluded_inactive",
+        "manifest_digest",
+        "storage_reference_index"
+      ],
+      "GymParticipantCommitResult": [
+        "participant",
+        "payload",
+        "manifest"
+      ],
+      "GymParticipantIdentity": [
+        "server_name",
+        "component",
+        "participant_name"
+      ],
+      "GymParticipantManifestReference": [
+        "participant",
+        "relative_path",
+        "manifest_digest"
+      ],
+      "GymResourcesCommitResponse": [
+        "sessions",
+        "manifest_digest"
+      ]
+    },
+    "schema_version": 1
+  },
+  "rollout_recovery": {
+    "models": {
+      "GymCompletedExecution": [
+        "receipt",
+        "agent_name"
+      ],
+      "GymCompletionReceipt": [
+        "rollout_id",
+        "attempt_index",
+        "execution_generation",
+        "result_identity",
+        "result_digest",
+        "manifest_capture_key",
+        "terminal_model_call_id"
+      ],
+      "PromptGroupRecoveryState": [
+        "group_id",
+        "admission_id",
+        "prompt_id",
+        "prompt_ref",
+        "task_source",
+        "resolved_agent_name",
+        "recovery_granularity",
+        "expected_generations",
+        "target_step",
+        "start_weight_version",
+        "status",
+        "phase",
+        "siblings"
+      ],
+      "PromptRefState": [
+        "sample_id",
+        "task_name"
+      ],
+      "RolloutAttemptState": [
+        "attempt_index",
+        "status",
+        "receipt",
+        "completion_receipt",
+        "reward",
+        "mask_sample",
+        "staging_keys"
+      ],
+      "RolloutRecoverySidecarState": [
+        "schema_version",
+        "groups",
+        "pending_completed_execution_acknowledgements",
+        "batch_shortfall",
+        "sampler_stamps_target_steps"
+      ],
+      "RolloutSiblingState": [
+        "generation_index",
+        "attempts"
+      ]
+    },
+    "schema_version": 3
+  },
+  "rollout_snapshot_manifest": {
+    "fields": [
+      "schema_version",
+      "base_train_step",
+      "trainer_version",
+      "current_epoch",
+      "sampler_dispatch_index",
+      "mutation_version",
+      "rolled_back_train_group_count",
+      "bootstrap_fingerprint",
+      "gym_topology_fingerprint",
+      "gym_checkpoint"
+    ],
+    "schema_version": 4
+  }
+}

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -57,10 +58,12 @@ from nemo_rl.environments.gym_checkpoint import (
     GYM_CHECKPOINT_COMPONENT_ORDERS,
     GYM_CHECKPOINT_SCHEMA_VERSION,
     GYM_SERVER_TYPE_KEYS,
+    GYM_AGENT_COMPLETED_RESULT_ACKNOWLEDGEMENT_FEATURE,
     GymAgentDiscardRestoredContinuationResponse,
     GymActorExecutionRegistry,
     GymAgentCommitResponse,
     GymAgentPrepareResponse,
+    GymAgentRetireResponse,
     GymAgentRestoreResponse,
     GymAgentResumeResponse,
     GymCheckpointArtifactReference,
@@ -93,7 +96,6 @@ from nemo_rl.environments.gym_checkpoint import (
     GymSingleWorkerModelStatusResponse,
     GymWorkerAcknowledgements,
     checkpoint_server_names,
-    gym_capture_key,
     participant_checkpoint_path,
     participates_in_checkpoint_phase,
 )
@@ -306,6 +308,30 @@ def _typed_gym_failure(error: Exception) -> Optional[Exception]:
     return RolloutDataFailure(detail)
 
 
+def _typed_gym_failure_result(result: Mapping[str, Any]) -> Optional[Exception]:
+    """Map Gym's opt-in failure row onto the rollout failure taxonomy."""
+    failure_class = result.get(_NG_FAILURE_CLASS_KEY)
+    if failure_class is None:
+        return None
+    if failure_class not in {_NG_AGENT_REQUEST_FAILED, _NG_AGENT_RUN_ERROR}:
+        return RolloutDataFailure(
+            f"NeMo-Gym /run returned unknown failure class {failure_class!r}"
+        )
+    failure_type = result.get("_ng_failure_type")
+    failure_message = result.get("_ng_failure_message")
+    status = result.get("_ng_failure_http_status")
+    detail = (
+        f"NeMo-Gym /run returned {failure_class}"
+        + (f" with HTTP {status}" if isinstance(status, int) else "")
+        + (f" ({failure_type}: {failure_message})" if failure_type else "")
+    )
+    if failure_class == _NG_AGENT_REQUEST_FAILED:
+        return GymTransportError(detail)
+    if isinstance(status, int) and http_status_is_infra(status):
+        return GymTransportError(detail)
+    return RolloutDataFailure(detail)
+
+
 def get_nemo_gym_uv_cache_dir() -> str | None:
     """Return the uv cache directory inside a container, or None outside one.
 
@@ -384,6 +410,9 @@ class NemoGymConfig(TypedDict):
 _POLICY_SERVER_NAME = "policy_model"
 _NG_ROLLOUT_ID_BODY_KEY = "_ng_rollout_id"
 _NG_ATTEMPT_INDEX_BODY_KEY = "_ng_attempt_index"
+_NG_FAILURE_CLASS_KEY = "_ng_failure_class"
+_NG_AGENT_REQUEST_FAILED = "agent_request_failed"
+_NG_AGENT_RUN_ERROR = "agent_run_error"
 _TOKEN_CAPTURE_CONTROL_PREFIX = "/training-token-capture/control"
 _TOKEN_CAPTURE_CONTROL_ENV = "NEMO_GYM_TOKEN_CAPTURE_CONTROL_TOKEN"
 
@@ -441,20 +470,6 @@ def _model_server_uses_rl_policy(
     policy_urls = frozenset(url.rstrip("/") for url in policy_base_urls)
     model_urls = _normalized_model_base_urls(global_config, server_name)
     return bool(model_urls) and model_urls.issubset(policy_urls)
-
-
-def _adapt_execution_identity_for_installed_gym(
-    row: dict[str, Any],
-    *,
-    stable_execution_identity_enabled: bool,
-) -> None:
-    """Translate the new identity pair for Gym revisions that predate it."""
-    if stable_execution_identity_enabled or _NG_ATTEMPT_INDEX_BODY_KEY not in row:
-        return
-    row[_NG_ROLLOUT_ID_BODY_KEY] = gym_capture_key(
-        row[_NG_ROLLOUT_ID_BODY_KEY],
-        row.pop(_NG_ATTEMPT_INDEX_BODY_KEY),
-    )
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
@@ -565,7 +580,6 @@ class NemoGym(EnvironmentInterface):
         # _spinup replaces this from cfg. Keep restarted/unspun actors internally
         # complete so diagnostics and focused tests do not fail with AttributeError.
         self._token_capture_enabled = False
-        self._stable_execution_identity_enabled = False
         self._server_client: Any = None
         self._token_capture_control_headers: Dict[str, str] = {}
         self._checkpoint_control_headers: Dict[str, str] = {}
@@ -631,7 +645,6 @@ class NemoGym(EnvironmentInterface):
         self.head_server_port = _get_free_port_local(_gym_port_low, _gym_port_high)
 
         from nemo_gym.cli import GlobalConfigDictParserConfig, RunHelper
-        from nemo_gym import global_config as gym_global_config
         from nemo_gym.rollout_collection import RolloutCollectionHelper
         from nemo_gym.server_utils import HEAD_SERVER_KEY_NAME, BaseServerConfig
         from omegaconf import DictConfig
@@ -643,10 +656,6 @@ class NemoGym(EnvironmentInterface):
         # do not mutate the caller's config dict (config.env["nemo_gym"]).
         initial_global_config_dict = dict(
             self.cfg.get("initial_global_config_dict") or {}
-        )
-        self._stable_execution_identity_enabled = (
-            getattr(gym_global_config, "ATTEMPT_INDEX_KEY_NAME", None)
-            == _NG_ATTEMPT_INDEX_BODY_KEY
         )
         # Strip NeMo-RL-only training knobs that must not be forwarded to the
         # NeMo-Gym server (same pattern as the pops in run_grpo_nemo_gym.py).
@@ -1017,34 +1026,105 @@ Depending on your data shape, you may want to change these values."""
                 f"participant: agent={agent_name!r}, matches={len(matches)}"
             )
         participant = matches[0]
-        if "completed_result_acknowledgement" not in participant.capabilities.features:
+        if (
+            GYM_AGENT_COMPLETED_RESULT_ACKNOWLEDGEMENT_FEATURE
+            not in participant.capabilities.features
+        ):
             raise RuntimeError(
                 f"Gym agent {agent_name!r} does not advertise completed-result "
                 "acknowledgement"
             )
         return participant
 
-    async def _completion_receipt_for(
+    async def _retire_ambiguous_execution(
         self,
         execution: GymExecutionIdentity,
         *,
         agent_name: str,
-    ) -> GymCompletionReceipt:
-        """Fetch the exact Gym-issued receipt before publishing a completion."""
-        from nemo_gym._checkpoint import AGENT_CHECKPOINT_URL_PREFIX
+    ) -> GymAgentRetireResponse:
+        """Atomically distinguish a retained completion from a safe redispatch."""
+        from nemo_gym._checkpoint import (
+            AGENT_CHECKPOINT_URL_PREFIX,
+            AgentRetireRequest,
+        )
 
         discovered = self._agent_checkpoint_participant(agent_name)
-        return GymCompletionReceipt.model_validate(
+        active_checkpoint_id = self._active_gym_checkpoint_id
+        checkpoint_id = active_checkpoint_id or (
+            "run-reconcile-"
+            + hashlib.sha256(
+                f"{execution.rollout_id}:{execution.attempt_index}".encode()
+            ).hexdigest()[:32]
+        )
+        request = AgentRetireRequest(
+            checkpoint_id=checkpoint_id,
+            deadline_ts=time.time() + self._control_timeout_s,
+            rollout_id=execution.rollout_id,
+            attempt_index=execution.attempt_index,
+        )
+        return GymAgentRetireResponse.model_validate(
             await self._control(
-                "GET",
-                f"{AGENT_CHECKPOINT_URL_PREFIX}/completion-receipt",
+                "POST",
+                f"{AGENT_CHECKPOINT_URL_PREFIX}/retire",
                 server_name=discovered.participant.server_name,
-                params={
-                    "rollout_id": execution.rollout_id,
-                    "attempt_index": execution.attempt_index,
-                },
+                json=request.model_dump(mode="json"),
             )
         )
+
+    async def _resolve_ambiguous_run_result(
+        self,
+        row: dict[str, Any],
+        result: dict[str, Any],
+        execution: GymExecutionIdentity,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        """Recover a lost ``/run`` reply without starting a second execution."""
+        failure = _typed_gym_failure_result(result)
+        if failure is None or result.get(_NG_FAILURE_CLASS_KEY) != (
+            _NG_AGENT_REQUEST_FAILED
+        ):
+            raise ValueError("ambiguous Gym reconciliation requires a request failure")
+
+        disposition = await self._retire_ambiguous_execution(
+            execution,
+            agent_name=row["agent_ref"]["name"],
+        )
+        if not disposition.completed_unacknowledged:
+            # Gym atomically cancelled or fenced the identity. The caller may now
+            # create attempt+1 without overlapping a still-running attempt.
+            raise failure
+
+        # Gym has retained the terminal result. Reissue the exact same identity;
+        # AgentCheckpointParticipant.begin() returns the cached result instead of
+        # running the agent again. A second lost reply is still ambiguous, so keep
+        # replaying this identity rather than permitting attempt+1.
+        replay_attempt = 0
+        while True:
+            replay_attempt += 1
+            replay_iterator = self.rch.run_examples_with_metadata(
+                examples=[row],
+                head_server_config=self.head_server_config,
+                route_failures_to_sidecar=True,
+            )
+            replay_tasks = list(replay_iterator)
+            if len(replay_tasks) != 1:
+                raise RuntimeError(
+                    "NeMo-Gym same-attempt replay did not create exactly one task"
+                )
+            replayed_row, replayed_result, replayed_metadata = await replay_tasks[0]
+            replayed_identity = GymExecutionIdentity(
+                rollout_id=replayed_row[_NG_ROLLOUT_ID_BODY_KEY],
+                attempt_index=replayed_row[_NG_ATTEMPT_INDEX_BODY_KEY],
+            )
+            if replayed_identity != execution:
+                raise RuntimeError(
+                    "NeMo-Gym same-attempt replay returned a different execution: "
+                    f"expected={execution.model_dump(mode='json')!r}, "
+                    f"actual={replayed_identity.model_dump(mode='json')!r}"
+                )
+            replay_failure = _typed_gym_failure_result(replayed_result)
+            if replay_failure is None:
+                return replayed_row, replayed_result, replayed_metadata
+            await asyncio.sleep(min(0.1 * replay_attempt, 1.0))
 
     async def acknowledge_completed_executions(
         self,
@@ -1902,16 +1982,6 @@ Depending on your data shape, you may want to change these values."""
 
         maybe_patch_fastokens(bool(self.cfg.get("use_fastokens")))
 
-        if not self._stable_execution_identity_enabled:
-            # Compatibility with Gym revisions predating the stable execution
-            # identity contract. They understand only one physical rollout ID,
-            # so qualify it here exactly as the newer Gym middleware would.
-            for row in nemo_gym_examples:
-                _adapt_execution_identity_for_installed_gym(
-                    row,
-                    stable_execution_identity_enabled=False,
-                )
-
         registered_executions: list[GymExecutionIdentity] = []
         if self._gym_checkpoint_participants:
             executions = [
@@ -1931,9 +2001,19 @@ Depending on your data shape, you may want to change these values."""
 
         timer = Timer()
         timer.start("_run_rollouts_total")
-        nemo_gym_result_iterator = self.rch.run_examples(
-            examples=nemo_gym_examples, head_server_config=self.head_server_config
-        )
+        if self._gym_checkpoint_participants:
+            # Preserve the input row beside an ambiguous transport failure so
+            # reconciliation can address the exact (rollout_id, attempt_index).
+            nemo_gym_result_iterator = self.rch.run_examples_with_metadata(
+                examples=nemo_gym_examples,
+                head_server_config=self.head_server_config,
+                route_failures_to_sidecar=True,
+            )
+        else:
+            nemo_gym_result_iterator = self.rch.run_examples(
+                examples=nemo_gym_examples,
+                head_server_config=self.head_server_config,
+            )
         # Gym resolves task_source to agent_ref synchronously in run_examples().
         # Build the counter afterward so completion rows use the resolved identity.
         _require_resolved_agent_refs(nemo_gym_examples)
@@ -1945,7 +2025,16 @@ Depending on your data shape, you may want to change these values."""
         for task in nemo_gym_result_iterator:
             with timer.time(label=f"{timer_prefix}/await_results"):
                 try:
-                    nemo_gym_row, nemo_gym_result = await task
+                    completed = await task
+                    if self._gym_checkpoint_participants:
+                        (
+                            nemo_gym_row,
+                            nemo_gym_result,
+                            rollout_metadata,
+                        ) = completed
+                    else:
+                        nemo_gym_row, nemo_gym_result = completed
+                        rollout_metadata = {}
                 except Exception as error:
                     if hasattr(error, "response_content"):
                         print(
@@ -1959,9 +2048,10 @@ Depending on your data shape, you may want to change these values."""
                         suppress_error_cause = typed is not None
                     # Every task in the batch already owns a remote Gym execution.
                     # Drain the rest even after one row fails so successful siblings
-                    # can become durable and no task exception is abandoned. The
-                    # caller will retry only the missing rows under a new execution
-                    # attempt; reusing this attempt would race the still-live /run.
+                    # can become durable and no task exception is abandoned. Expected
+                    # HTTP/transport failures use Gym's row-preserving failure mode
+                    # below; this path is for unexpected exceptions that cannot be
+                    # associated with one exact execution identity.
                     continue
 
             execution: GymExecutionIdentity | None = None
@@ -1970,40 +2060,93 @@ Depending on your data shape, you may want to change these values."""
                     rollout_id=nemo_gym_row[_NG_ROLLOUT_ID_BODY_KEY],
                     attempt_index=nemo_gym_row[_NG_ATTEMPT_INDEX_BODY_KEY],
                 )
-                self._gym_execution_registry.mark_terminal(execution)
 
-            with timer.time(label=f"{timer_prefix}/postprocess_results"):
-                completion_receipt = None
-                if self._gym_checkpoint_participants:
-                    assert execution is not None
-                    completion_receipt = await self._completion_receipt_for(
-                        execution,
-                        agent_name=nemo_gym_row["agent_ref"]["name"],
-                    )
-                if self._token_capture_enabled:
-                    # Receipt mode: fetch the ledger manifest and assemble the
-                    # receipt locally; token-free result. The canonical row is
-                    # rebuilt by the finalizer, so no message_log walk (and no
-                    # NaN check) applies here.
-                    nemo_rl_result = await self._postprocess_receipt_mode(
-                        nemo_gym_row,
-                        nemo_gym_result,
-                        completion_receipt=completion_receipt,
-                    )
+            failure = _typed_gym_failure_result(nemo_gym_result)
+            if failure is not None:
+                if (
+                    execution is not None
+                    and nemo_gym_result.get(_NG_FAILURE_CLASS_KEY)
+                    == _NG_AGENT_REQUEST_FAILED
+                ):
+                    try:
+                        (
+                            nemo_gym_row,
+                            nemo_gym_result,
+                            rollout_metadata,
+                        ) = await self._resolve_ambiguous_run_result(
+                            nemo_gym_row,
+                            nemo_gym_result,
+                            execution,
+                        )
+                    except Exception as error:
+                        if first_error is None:
+                            first_error = error
+                            suppress_error_cause = isinstance(
+                                error, (GymTransportError, RolloutDataFailure)
+                            )
+                        self._gym_execution_registry.release(execution)
+                        continue
                 else:
-                    nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
-                        nemo_gym_row,
-                        nemo_gym_result,
-                        tokenizer,
-                        include_initial_multimodal_data=not deduplicate_multimodal_data,
-                    )
-                    if _has_nan_generation_logprobs(nemo_rl_result):
-                        raise RuntimeError("Generation logprobs contain NaN")
-                if self._gym_checkpoint_participants:
-                    assert completion_receipt is not None
-                    nemo_rl_result["gym_completion_receipt"] = (
-                        completion_receipt.model_dump(mode="json")
-                    )
+                    if first_error is None:
+                        first_error = failure
+                        suppress_error_cause = True
+                    if execution is not None:
+                        self._gym_execution_registry.release(execution)
+                    continue
+
+            try:
+                with timer.time(label=f"{timer_prefix}/postprocess_results"):
+                    completion_receipt = None
+                    if self._gym_checkpoint_participants:
+                        assert execution is not None
+                        raw_completion_receipt = rollout_metadata.get(
+                            "completion_receipt"
+                        )
+                        if raw_completion_receipt is None:
+                            raise RuntimeError(
+                                "Gym agent /run response omitted its advertised "
+                                "completion receipt"
+                            )
+                        completion_receipt = GymCompletionReceipt.model_validate(
+                            raw_completion_receipt
+                        )
+                        if completion_receipt.identity != execution.identity:
+                            raise RuntimeError(
+                                "Gym completion receipt identity does not match the "
+                                "completed execution: "
+                                f"expected={execution.identity!r}, "
+                                f"actual={completion_receipt.identity!r}"
+                            )
+                    if self._token_capture_enabled:
+                        # Receipt mode: fetch the ledger manifest and assemble the
+                        # receipt locally; token-free result. The canonical row is
+                        # rebuilt by the finalizer, so no message_log walk (and no
+                        # NaN check) applies here.
+                        nemo_rl_result = await self._postprocess_receipt_mode(
+                            nemo_gym_row,
+                            nemo_gym_result,
+                            completion_receipt=completion_receipt,
+                        )
+                    else:
+                        nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
+                            nemo_gym_row,
+                            nemo_gym_result,
+                            tokenizer,
+                            include_initial_multimodal_data=not deduplicate_multimodal_data,
+                        )
+                        if _has_nan_generation_logprobs(nemo_rl_result):
+                            raise RuntimeError("Generation logprobs contain NaN")
+                    if self._gym_checkpoint_participants:
+                        assert completion_receipt is not None
+                        nemo_rl_result["gym_completion_receipt"] = (
+                            completion_receipt.model_dump(mode="json")
+                        )
+            except Exception as error:
+                if first_error is None:
+                    first_error = error
+                if execution is not None:
+                    self._gym_execution_registry.release(execution)
+                continue
             num_results += 1
             timing_metrics = None
             if num_results == len(nemo_gym_examples):

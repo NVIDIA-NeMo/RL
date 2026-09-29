@@ -662,7 +662,8 @@ class TestPartialGymRedispatch:
         """A stable Gym attempt must never be physically dispatched twice.
 
         The first /run may still own the identity after its result stream fails.
-        Outer recovery retires that execution and assigns attempt+1 before retrying.
+        The real NemoGym actor resolves or retires that identity before surfacing
+        the failure. This lower-level manager must still avoid reusing it blindly.
         """
         method = _PartialGymMethod(fail_after_rows=2, failures_before_success=1)
         impl = _make_gym_impl(method, num_generations=4, row_attempts=3)
