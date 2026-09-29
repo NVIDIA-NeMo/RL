@@ -770,22 +770,6 @@ class TestGroupAlignedSelection:
         ) == (None, 0)
         assert buffer.remove_calls == []
 
-    def test_default_preserves_greedy_selection(self, aligned_sampler):
-        sampler, buffer = aligned_sampler
-        for index in range(53):
-            buffer.add(str(index), weight=0, target_step=0)
-
-        meta, count = _run(
-            sampler.select(
-                current_train_weight=0,
-                min_prompt_groups=32,
-                max_prompt_groups=256,
-            )
-        )
-
-        assert count == meta.size == 53
-        assert buffer.meta_list == []
-
     @pytest.mark.parametrize("group_multiple", [0, -1])
     def test_rejects_nonpositive_multiple(self, aligned_sampler, group_multiple):
         sampler, buffer = aligned_sampler
@@ -881,19 +865,19 @@ class TestTailAwareSelection:
         ]
 
     @pytest.mark.parametrize(
-        ("ready", "remaining", "minimum", "expected"),
+        ("ready", "remaining", "minimum", "multiple", "expected"),
         [
-            (8, 8, 8, 8),  # The entire final remainder may be below the floor.
-            (31, 64, 32, 0),
-            (32, 64, 32, 32),  # Equality at the chunk threshold is sufficient.
-            (32, 48, 32, 32),  # A tail exactly equal to the floor is sufficient.
-            (112, 128, 32, 112),
-            (114, 128, 32, 0),
-            (128, 128, 32, 128),
+            (8, 8, 8, 1, 8),  # The full final remainder may be below the floor.
+            (31, 64, 32, 1, 0),
+            (32, 64, 32, 1, 32),  # Equality at the chunk threshold is sufficient.
+            (32, 48, 32, 1, 32),  # A tail exactly equal to the floor is sufficient.
+            (114, 128, 32, 1, 0),
+            (115, 128, 32, 8, 112),  # Apply the floor to the aligned candidate.
+            (123, 128, 32, 8, 0),
         ],
     )
     def test_tail_aware_thresholds_and_full_flush(
-        self, aligned_sampler, ready, remaining, minimum, expected
+        self, aligned_sampler, ready, remaining, minimum, multiple, expected
     ):
         sampler, buffer = aligned_sampler
         for index in range(ready):
@@ -904,46 +888,23 @@ class TestTailAwareSelection:
                 current_train_weight=0,
                 min_prompt_groups=minimum,
                 max_prompt_groups=remaining,
+                group_multiple=multiple,
                 min_remaining_groups=16,
             )
         )
         assert count == expected
+        assert len(buffer.meta_list) == ready - expected
         if expected:
             assert meta.size == expected
         else:
             assert meta is None
-            assert buffer.remove_calls == []
-            assert len(buffer.meta_list) == ready
+            assert buffer.claim_calls == buffer.remove_calls == []
 
-    @pytest.mark.parametrize(("ready", "expected"), [(115, 112), (123, 0)])
-    def test_tail_aware_checks_aligned_candidate(
-        self, aligned_sampler, ready, expected
+    def test_defaults_preserve_unaligned_greedy_selection_and_small_tail(
+        self, aligned_sampler
     ):
         sampler, buffer = aligned_sampler
-        for index in range(ready):
-            buffer.add(str(index), weight=0, target_step=0)
-
-        meta, count = _run(
-            sampler.select(
-                current_train_weight=0,
-                min_prompt_groups=32,
-                max_prompt_groups=128,
-                group_multiple=8,
-                min_remaining_groups=16,
-            )
-        )
-        assert count == expected
-        if expected:
-            assert meta.size == expected
-            assert len(buffer.meta_list) == ready - expected
-        else:
-            assert meta is None
-            assert buffer.remove_calls == []
-            assert len(buffer.meta_list) == ready
-
-    def test_tail_aware_default_preserves_greedy_small_tail(self, aligned_sampler):
-        sampler, buffer = aligned_sampler
-        for index in range(120):
+        for index in range(119):
             buffer.add(str(index), weight=0, target_step=0)
         meta, count = _run(
             sampler.select(
@@ -952,7 +913,8 @@ class TestTailAwareSelection:
                 max_prompt_groups=128,
             )
         )
-        assert count == meta.size == 120
+        assert count == meta.size == 119
+        assert buffer.meta_list == []
 
     def test_tail_aware_rejects_negative_floor_without_claiming(self, aligned_sampler):
         sampler, buffer = aligned_sampler

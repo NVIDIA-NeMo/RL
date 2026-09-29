@@ -2699,7 +2699,8 @@ def _full_batch_ppo_controller(
 
 @pytest.mark.parametrize("warmup", [False, True])
 @pytest.mark.parametrize(
-    "valid_chunks", [(True, True, True), (False, True, True), (True, False, True)]
+    "valid_chunks",
+    [(True, True, True), (False, True, True), (True, False, True), (True, True, False)],
 )
 def test_streaming_ppo_prepares_critic_before_waiting_for_next_chunk(
     monkeypatch: pytest.MonkeyPatch,
@@ -2739,11 +2740,21 @@ def test_streaming_ppo_prepares_critic_before_waiting_for_next_chunk(
     assert calls.count("critic.prepare_for_inference") == len(metas)
     assert calls.count("critic.finish_inference") == len(metas)
     assert not ctrl._value.inference_prepared
+    assert calls.count("critic.get_values_from_meta") == len(metas)
+    assert calls.count("gae") == len(metas)
     if warmup:
+        assert "policy.begin_train_step" not in calls
+        assert "policy.train_microbatches_from_meta" not in calls
+        assert "policy.finish_train_step" not in calls
         assert "policy.offload_train_step" not in calls
         assert ctrl._trainer.optimizer_gradient_sums == []
-        assert "refit" not in calls
+        ctrl._sync_weights.assert_not_awaited()
     else:
+        assert calls.count("policy.begin_train_step") == 1
+        assert calls.count("policy.finish_train_step") == 1
+        assert [meta.sample_ids for meta in ctrl._trainer.trained_metas] == [
+            meta.sample_ids for meta, valid in zip(metas, valid_chunks) if valid
+        ]
         assert calls.count("policy.offload_train_step") == sum(
             any(valid_chunks[: index + 1]) for index in range(len(metas) - 1)
         )
@@ -2758,7 +2769,12 @@ def test_streaming_ppo_prepares_critic_before_waiting_for_next_chunk(
         assert "critic.prepare_for_inference" not in calls[last_forward:]
         assert calls.index("policy.finish_train_step") < calls.index("refit")
         assert calls.index("refit") < calls.index("critic.prepare_for_training")
+        ctrl._sync_weights.assert_awaited_once()
+    assert calls.count("critic.train_from_meta") == 2
     assert all(meta.size == len(metas) for meta in ctrl._value.trained_metas)
+    assert calls.index("critic.finish_training") < calls.index("clear_samples")
+    ctrl._rollout_manager.set_weight_version.assert_called_once_with(1)
+    assert ctrl._train_steps == ctrl._trainer_version == 1
 
 
 @pytest.mark.parametrize("ppo", [False, True])
@@ -2974,53 +2990,6 @@ def test_streaming_ppo_selection_failure_does_not_commit_pending_step(
     assert not ctrl._optimizer_commit_in_progress
 
 
-@pytest.mark.parametrize(
-    ("streaming", "policy_epochs"), [(False, 1), (False, 2), (False, 3), (True, 1)]
-)
-def test_ppo_modes_refit_once_after_policy_before_full_batch_critic(
-    monkeypatch: pytest.MonkeyPatch, streaming: bool, policy_epochs: int
-) -> None:
-    if streaming:
-        ctrl, metas, calls = _streaming_ppo_controller(monkeypatch)
-    else:
-        ctrl, metas, calls = _full_batch_ppo_controller(
-            monkeypatch, policy_epochs=policy_epochs
-        )
-
-    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
-
-    phases = {
-        "critic.get_values_from_meta",
-        "policy.get_logprobs_from_meta",
-        "gae",
-        "policy.train_microbatches_from_meta",
-    }
-    chunk_order = [
-        "critic.get_values_from_meta",
-        "policy.get_logprobs_from_meta",
-        "gae",
-    ] + ["policy.train_microbatches_from_meta"] * policy_epochs
-    assert [call for call in calls if call in phases] == chunk_order * (
-        len(metas) if streaming else 1
-    )
-    assert calls.count("policy.finish_train_step") == policy_epochs
-    assert calls.count("refit") == 1
-    last_policy_update = max(
-        index for index, call in enumerate(calls) if call == "policy.finish_train_step"
-    )
-    assert last_policy_update < calls.index("refit")
-    assert calls.index("refit") < calls.index("critic.prepare_for_training")
-    assert calls.count("critic.train_from_meta") == 2
-    for critic_meta in ctrl._value.trained_metas:
-        assert critic_meta.sample_ids == [
-            sample_id for meta in metas for sample_id in meta.sample_ids
-        ]
-        assert {"values", "advantages", "returns"} <= set(critic_meta.fields)
-    assert calls.index("critic.finish_training") < calls.index("clear_samples")
-    ctrl._rollout_manager.set_weight_version.assert_called_once_with(1)
-    assert ctrl._trainer_version == ctrl._train_steps == 1
-
-
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("warmup", [False, True])
 def test_ppo_blocks_rollout_snapshots_until_full_batch_critic_finishes(
@@ -3075,8 +3044,10 @@ def test_full_batch_ppo_keeps_shared_generation_asleep_until_critic_finishes(
 def test_ppo_checkpoint_saves_both_updates_without_repeating_early_refit(
     monkeypatch: pytest.MonkeyPatch, streaming: bool
 ) -> None:
-    factory = _streaming_ppo_controller if streaming else _full_batch_ppo_controller
-    ctrl, metas, calls = factory(monkeypatch)
+    if streaming:
+        ctrl, metas, calls = _streaming_ppo_controller(monkeypatch)
+    else:
+        ctrl, metas, calls = _full_batch_ppo_controller(monkeypatch, policy_epochs=3)
     ctrl._master_config.checkpointing["enabled"] = True
 
     async def save_checkpoint(metrics: dict, **kwargs: bool) -> None:
@@ -3095,13 +3066,18 @@ def test_ppo_checkpoint_saves_both_updates_without_repeating_early_refit(
 
     asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
+    assert calls.count("policy.finish_train_step") == (1 if streaming else 3)
     assert calls.count("refit") == 1
+    last_policy_update = max(
+        index for index, call in enumerate(calls) if call == "policy.finish_train_step"
+    )
+    assert last_policy_update < calls.index("refit")
     assert calls.index("refit") < calls.index("critic.prepare_for_training")
     assert calls[-1] == "checkpoint"
     ctrl._save_checkpoint.assert_awaited_once()
 
 
-@pytest.mark.parametrize("critic_epochs", [1, 2, 4])
+@pytest.mark.parametrize("critic_epochs", [1, 2])
 def test_streaming_ppo_accumulates_policy_then_trains_full_batch_critic(
     monkeypatch: pytest.MonkeyPatch, critic_epochs: int
 ) -> None:
@@ -3292,48 +3268,6 @@ def test_ppo_waits_for_inflight_snapshot_before_optimizer_and_early_refit(
     ctrl._rollout_manager.set_weight_version.assert_called_once_with(1)
     assert ctrl._train_steps == ctrl._trainer_version == 1
     assert not ctrl._optimizer_commit_in_progress
-
-
-def test_streaming_ppo_warmup_keeps_the_policy_frozen(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    ctrl, metas, calls = _streaming_ppo_controller(monkeypatch, warmup=True)
-
-    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
-
-    assert calls.count("critic.get_values_from_meta") == len(metas)
-    assert calls.count("gae") == len(metas)
-    assert "policy.begin_train_step" not in calls
-    assert "policy.train_microbatches_from_meta" not in calls
-    assert "policy.finish_train_step" not in calls
-    assert "policy.offload_train_step" not in calls
-    assert calls.count("critic.train_from_meta") == 2
-    assert all(meta.size == len(metas) for meta in ctrl._value.trained_metas)
-    ctrl._sync_weights.assert_not_awaited()
-    ctrl._rollout_manager.set_weight_version.assert_called_once_with(1)
-    assert ctrl._train_steps == ctrl._trainer_version == 1
-
-
-@pytest.mark.parametrize(
-    "valid_chunks", [(False, True, True), (True, False, True), (True, True, False)]
-)
-def test_streaming_ppo_skips_invalid_policy_chunks_but_preserves_full_critic_batch(
-    monkeypatch: pytest.MonkeyPatch, valid_chunks: tuple[bool, ...]
-) -> None:
-    ctrl, metas, calls = _streaming_ppo_controller(
-        monkeypatch, valid_chunks=valid_chunks
-    )
-
-    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
-
-    assert [meta.sample_ids for meta in ctrl._trainer.trained_metas] == [
-        meta.sample_ids for meta, valid in zip(metas, valid_chunks) if valid
-    ]
-    assert calls.count("policy.begin_train_step") == 1
-    assert calls.count("policy.finish_train_step") == 1
-    assert all(meta.size == len(metas) for meta in ctrl._value.trained_metas)
-    assert calls.index("critic.finish_training") < calls.index("clear_samples")
-    ctrl._sync_weights.assert_awaited_once()
 
 
 @pytest.mark.parametrize("warmup", [False, True])

@@ -1234,6 +1234,13 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                 "gradient buffer. Disable policy.megatron_cfg."
                 "distributed_data_parallel_config.overlap_param_gather."
             )
+        if algo_cfg.adv_estimator.normalize_advantages:
+            warnings.warn(
+                "Streaming PPO with ppo.adv_estimator.normalize_advantages=true "
+                "normalizes GAE advantages per chunk instead of across the full "
+                "batch. Changing chunk boundaries can change normalized advantages.",
+                stacklevel=2,
+            )
 
     failure_config = async_config.rollout_failure
     drop_budget = (

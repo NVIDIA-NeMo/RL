@@ -1667,52 +1667,6 @@ class TestOffloadTrainStep:
         w.model.config.finalize_model_grads_func = None
         return w
 
-    def test_preserves_dense_expert_gradients_across_two_switches(
-        self, mock_module_symbols
-    ):
-        w = self._worker()
-        state = w._train_step_state
-        buffers = [*w.model.buffers, *w.model.expert_parallel_buffers]
-        # Keep the same views, as parameters do through param.main_grad.
-        main_grads = [buffer.grad_data.view(-1) for buffer in buffers]
-        expected = [grad.clone() for grad in main_grads]
-
-        # Exercise the real move_model DDP branch with the buffer lifecycle
-        # above, not a no-op mock that could hide lost gradient storage.
-        with patch(f"{WORKER_MOD}.DistributedDataParallel", type(w.model)):
-            for chunk in (2, 3):
-                w.offload_train_step()
-                assert all(grad.untyped_storage().nbytes() == 0 for grad in main_grads)
-                assert w._train_step_state is state
-                w.prepare_for_training()
-                assert state["offloaded_grads"] is None
-                for grad, saved in zip(main_grads, expected):
-                    torch.testing.assert_close(grad, saved)
-                # The logprob detour must keep the restored accumulation.
-                with patch("torch.randn"):
-                    w.prepare_for_lp_inference(keep_train_buffers=True)
-                for grad, saved in zip(main_grads, expected):
-                    grad.add_(chunk)
-                    saved.add_(chunk)
-                state["num_chunks"] += 1
-                state["local_valid_toks"] += 7
-
-        for grad, saved in zip(main_grads, expected):
-            torch.testing.assert_close(grad, saved)
-        assert state["num_chunks"] == 3
-        assert state["local_valid_toks"].item() == 21
-        assert w.model.config.grad_sync_func is None
-        assert w.model.config.finalize_model_grads_func is None
-        assert [call.args[0] for call in w.move_optimizer.call_args_list] == [
-            "cpu",
-            "cuda",
-            "cpu",
-            "cuda",
-        ]
-        w.model.zero_grad_buffer.assert_not_called()
-        w.optimizer.step.assert_not_called()
-        w.scheduler.step.assert_not_called()
-
     def test_uneven_chunks_match_full_batch_gradient_and_update(
         self, mock_module_symbols: dict[str, MagicMock]
     ) -> None:
@@ -1833,6 +1787,7 @@ class TestOffloadTrainStep:
             patch("torch.randn"),
         ):
             w.begin_train_step(loss_fn=w._test_loss_fn, gbs=6, mbs=1)
+            state = w._train_step_state
             for index, part in enumerate(chunk_slices):
                 w.train_microbatch(
                     {
@@ -1843,13 +1798,30 @@ class TestOffloadTrainStep:
                     }
                 )
                 if index < len(chunk_slices) - 1:
+                    saved = [p.grad.clone() for p in parameters]
                     w.offload_train_step()
                     assert all(
                         p.grad.untyped_storage().nbytes() == 0 for p in parameters
                     )
+                    assert w._train_step_state is state
                     w.prepare_for_training()
                     w.prepare_for_lp_inference(keep_train_buffers=True)
-            assert w._train_step_state["local_valid_toks"].item() == 11
+                    assert state["offloaded_grads"] is None
+                    for parameter, expected in zip(parameters, saved):
+                        torch.testing.assert_close(parameter.grad, expected)
+                    assert w.model.config.grad_sync_func is None
+                    assert w.model.config.finalize_model_grads_func is None
+                    w.model.zero_grad_buffer.assert_called_once()
+                    w.optimizer.step.assert_not_called()
+                    w.scheduler.step.assert_not_called()
+            assert state["num_chunks"] == 3
+            assert state["local_valid_toks"].item() == 11
+            assert [call.args[0] for call in w.move_optimizer.call_args_list] == [
+                "cpu",
+                "cuda",
+                "cpu",
+                "cuda",
+            ]
             w.finish_train_step()
 
         for gradient, reference in zip(gradients_at_step, reference_gradients):
