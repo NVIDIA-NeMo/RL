@@ -30,7 +30,6 @@ import uvicorn
 from fastapi import FastAPI
 
 from nemo_rl.data.captured_media import (
-    MEDIA_SPANS_FIELD,
     CapturedMedia,
     CapturedMediaItem,
     MediaCaptureRejected,
@@ -559,6 +558,11 @@ class VllmAsyncGenerationWorkerImpl(
             media_pixel_dtype=pixel_dtype,
         )
         if capture_media:
+            # Omni-only: a new processor family must also change setup.py (driver
+            # checks), captured_media.py (_processed_omni_tensors, pack_images,
+            # capture_processed_media), tq_token_sink.py (MEDIA_TENSOR_COLUMNS,
+            # validate_media_tensors, fetch_media) and rollout_reassembler.py
+            # (_concat_media, _trainer_media).
             # Optional engine/Gym capabilities are checked only on VLM workers.
             from vllm.model_executor.models.nano_nemotron_vl import (
                 NanoNemotronVLProcessingInfo,
@@ -676,6 +680,8 @@ class VllmAsyncGenerationWorkerImpl(
         retained: tuple[CapturedMediaItem, ...] = ()
         if admission.parent_call_id is not None:
             # Optional Gym dependency: this method only runs on captured calls.
+            # Gym owns the media_spans key its adapter copies into the extras.
+            from nemo_gym.token_id_capture.adapters.vllm import MEDIA_SPANS_FIELD
             from nemo_gym.token_id_capture.staging.digest import compute_chain_hash
             from nemo_gym.token_id_capture.staging.records import staging_key
 
@@ -839,6 +845,9 @@ class VllmAsyncGenerationWorkerImpl(
         # nemo_gym.token_id_capture.adapters.vllm.extract_prompt_ids).
         payload["prompt_token_ids"] = prompt_token_ids
         if state.media is not None:
+            # Optional Gym dependency: only captured media calls reach here.
+            from nemo_gym.token_id_capture.adapters.vllm import MEDIA_SPANS_FIELD
+
             # Placeholder metadata (offsets, token hashes, sizes) rides the
             # digest-covered extras; the pixels themselves are attachments.
             payload[MEDIA_SPANS_FIELD] = [item.to_dict() for item in state.media.items]

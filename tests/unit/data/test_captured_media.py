@@ -24,7 +24,10 @@ import torch
 
 pytest.importorskip("nemo_gym.token_id_capture.staging")
 
-from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
+from nemo_gym.token_id_capture.adapters.vllm import (
+    MEDIA_SPANS_FIELD,
+    VLLMCaptureAdapter,
+)
 from nemo_gym.token_id_capture.staging.capture import RolloutTokenCapture
 from nemo_gym.token_id_capture.staging.records import (
     CallRecord,
@@ -33,7 +36,6 @@ from nemo_gym.token_id_capture.staging.records import (
 )
 
 from nemo_rl.data.captured_media import (
-    MEDIA_SPANS_FIELD,
     MediaCaptureRejected,
     pack_images,
 )
