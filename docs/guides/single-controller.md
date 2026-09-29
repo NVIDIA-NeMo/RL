@@ -397,7 +397,7 @@ The SC path is still under active development. Feature gaps are tracked in [issu
 - NeMo-Gym token capture also supports Omni dynamic-resolution images and native video
   rollouts with async vLLM generation and a Megatron learner, and with Megatron
   Inference generation through the same media columns and finalizer (the
-  compact-chain handling that backend adds is described in
+  expanded-prefix splicing that backend adds is described in
   [Token-capture ledger](../design-docs/token-capture-ledger.md#multimodal-rollouts-on-megatron-inference)).
   With `token_capture.enabled: true` and the VLM processor configured, workers
   capture the processed media used for inference together with each call's
@@ -457,10 +457,9 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   through Gym `mcqa`) and gates on `train/finalize/media_row_rate == 1`, the
   metric that reports the fraction of learner rows built from captured media.
   The vLLM path needs no new Megatron-LM pin. The Megatron Inference path
-  requires the Megatron-LM pin from tdene/Megatron-LM#20
-  (`compact_prompt_token_ids` and `media_tensors` on the offloaded payload),
-  the Gym Megatron adapter (lauradang/Gym#1), and the compact-chain columns
-  (`compact_token_ids_delta` / `compact_len`) on the staging partition.
+  requires a Megatron-LM pin with `media_tensors` on the offloaded payload and
+  expanded-prefix stitching (NVIDIA/Megatron-LM#7598); setup refuses a
+  multimodal Megatron capture run on an older pin.
   Compaction, mixed image/video conversations, native audio,
   video token pruning, static tiling (`image_num_patches`), other processor families,
   and `token_capture.defer_routed_experts_to_policy: true` are not supported.

@@ -260,19 +260,49 @@ def _stub_offloaded_payload(*field_names: str) -> type:
     )
 
 
+# Megatron-LM's expanded-prefix stitching keys, as module attributes.
+_PREFIX_STITCHING_FIELDS = {
+    "PREFIX_MEDIA_COUNT_FIELD": "_prefix_media_count",
+    "PREFIX_EXPANDED_TOKEN_COUNT_FIELD": "_prefix_expanded_token_count",
+}
+
+
 def test_require_minf_media_payload_fields_rejects_payload_without_media_tensors(
     monkeypatch,
 ) -> None:
     _stub_megatron_inference_request(
         monkeypatch,
         types.SimpleNamespace(
+            OffloadedRequestPayload=_stub_offloaded_payload("prompt_token_ids"),
+            **_PREFIX_STITCHING_FIELDS,
+        ),
+    )
+
+    with pytest.raises(
+        NotImplementedError,
+        match=r"lacks: OffloadedRequestPayload\.media_tensors\. Bump",
+    ):
+        sc_setup_mod._require_minf_media_payload_fields()
+
+
+def test_require_minf_media_payload_fields_rejects_core_without_prefix_stitching(
+    monkeypatch,
+) -> None:
+    """A pin without expanded-prefix stitching would expand every later turn's
+    spliced media prefix twice, so it is refused at setup."""
+    _stub_megatron_inference_request(
+        monkeypatch,
+        types.SimpleNamespace(
             OffloadedRequestPayload=_stub_offloaded_payload(
-                "prompt_token_ids", "compact_prompt_token_ids"
+                "prompt_token_ids", "media_tensors"
             )
         ),
     )
 
-    with pytest.raises(NotImplementedError, match="lacks: media_tensors"):
+    with pytest.raises(
+        NotImplementedError,
+        match="lacks: PREFIX_MEDIA_COUNT_FIELD, PREFIX_EXPANDED_TOKEN_COUNT_FIELD",
+    ):
         sc_setup_mod._require_minf_media_payload_fields()
 
 
@@ -283,8 +313,9 @@ def test_require_minf_media_payload_fields_accepts_payload_with_media_fields(
         monkeypatch,
         types.SimpleNamespace(
             OffloadedRequestPayload=_stub_offloaded_payload(
-                "prompt_token_ids", "media_tensors", "compact_prompt_token_ids"
-            )
+                "prompt_token_ids", "media_tensors"
+            ),
+            **_PREFIX_STITCHING_FIELDS,
         ),
     )
 
@@ -3163,9 +3194,8 @@ def test_token_capture_megatron_media_requires_minf_media_payload_fields(
         types.SimpleNamespace(
             RequestPayloadStager=object,
             RequestPromptPreparer=object,
-            OffloadedRequestPayload=_stub_offloaded_payload(
-                "prompt_token_ids", "compact_prompt_token_ids"
-            ),
+            OffloadedRequestPayload=_stub_offloaded_payload("prompt_token_ids"),
+            **_PREFIX_STITCHING_FIELDS,
         ),
     )
 
@@ -3187,12 +3217,12 @@ def test_token_capture_megatron_media_requires_minf_media_payload_fields(
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "pending Megatron-LM pin carrying tdene/Megatron-LM#20 "
-        "(media_tensors on OffloadedRequestPayload)"
+        "pending Megatron-Bridge pin carrying Megatron-LM expanded-prefix stitching"
     ),
 )
 def test_offloaded_payload_exposes_multimodal_capture_fields():
-    """Pin the engine payload fields the multimodal stager reads with getattr defaults."""
+    """Pin the engine payload field the multimodal stager reads with getattr
+    defaults and the prefix-stitching keys the Megatron preparer writes."""
     # Deferred import: megatron-core is a heavy, optional dependency that the
     # driver venv may not carry at all.
     from megatron.core.inference import inference_request
@@ -3205,7 +3235,9 @@ def test_offloaded_payload_exposes_multimodal_capture_fields():
         field.name
         for field in dataclasses.fields(inference_request.OffloadedRequestPayload)
     }
-    assert {"media_tensors", "compact_prompt_token_ids"} <= names
+    assert "media_tensors" in names
+    for name in sc_setup_mod._MINF_PREFIX_STITCHING_FIELDS:
+        assert hasattr(inference_request, name), name
 
 
 @pytest.mark.mcore

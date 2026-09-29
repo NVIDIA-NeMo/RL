@@ -129,33 +129,30 @@ section covers only what Megatron Inference adds.
 A vision-language engine has two token spaces. The chat endpoint tokenizes the
 render in *compact* form (one media token per image or video); the engine
 expands every media token into one token per projected embedding and runs on
-the *expanded* form. The trainer needs the expanded ids; the next turn's chat
-render can only be spliced against the compact ids, because the engine expands
-whatever it is handed and would otherwise expand the previous turn twice.
+the *expanded* form. The trainer needs the expanded ids, and they are also what
+the next turn splices in: the engine splits an already-expanded prefix back off
+and expands only the media placeholders after it (NVIDIA/Megatron-LM#7598), so
+only one token space is ever staged.
 
-- MInf's `OffloadedRequestPayload` carries `compact_prompt_token_ids` and
-  `media_tensors` (`imgs` as packed patches, `imgs_sizes`, optional
-  `num_frames`; tdene/Megatron-LM#20 on NVIDIA/Megatron-LM#7015). Gym's
-  `MegatronCaptureAdapter` stages the compact delta
-  (`nemo_gym.token_id_capture.staging.media.build_compact_token_ids_delta`)
-  as `StagedCallRecord.extras["compact_token_ids_delta"]`, bound by
-  `extras_digest`; `TQTokenSink` pops it into its own columns
-  (`compact_token_ids_delta` / `compact_len`), like `routed_experts`. Text
-  calls stage no compact form (`compact_len` 0): their compact and expanded
-  deltas coincide. The pixel tensors travel beside the record as
-  `complete_call_from_response(..., attachments=...)` and land in the same
-  put as the token columns. The Gym side is lauradang/Gym#1 (on
-  NVIDIA-NeMo/Gym#3513); the Gym submodule is pinned to the PR head commit
-  (`edd2541ef`), reachable from NVIDIA-NeMo/Gym through that PR.
-- `TQMegatronPromptPreparer` resolves a `staging_chain` in both spaces
-  (`TQTokenSource.fetch_prefix_chains`), splices the *compact* chain into the
-  render, hands Gym the *expanded* chain as `required_prefix_token_ids`, and
-  records `compact_prev_len` and `media_prev_count` in
-  `offload_params["ng_capture_minf"]`. `media_prev_count` is counted from the
-  parent rows' small media columns (`media_present`, `media_has_frames`,
-  `media_imgs_sizes`, `media_num_frames`), never from pixels, and only when the
-  source was built with `capture_media=True`; setup sets the source's and the
-  sink's `capture_media` from the same flag.
+- MInf's `OffloadedRequestPayload` carries `media_tensors` (`imgs` as packed
+  patches, `imgs_sizes`, optional `num_frames`). The pixel tensors travel beside
+  the record as `complete_call_from_response(..., attachments=...)` and land in
+  the same put as the token columns.
+- `TQMegatronPromptPreparer` resolves a `staging_chain`
+  (`TQTokenSource.fetch_prefix_chains`) to its expanded tokens and the number
+  of media items its rows staged. It splices the expanded chain into the
+  compact render with the shared `replace_prefix_tokens` (counting any of the
+  EOS ids the endpoint ships, keeping the EOS the model emitted), hands Gym the
+  same chain as `required_prefix_token_ids`, and records `media_prev_count` in
+  `offload_params["ng_capture_minf"]`. When earlier turns carried media, the
+  endpoint writes `_prefix_media_count`; the preparer checks it against the
+  chain's count and answers with `_prefix_expanded_token_count` (the chain's
+  length), which tells the engine where the expanded prefix ends.
+  `media_prev_count` is counted from the parent rows' small media columns
+  (`media_present`, `media_has_frames`, `media_imgs_sizes`, `media_num_frames`),
+  never from pixels, and only when the source was built with
+  `capture_media=True`; setup sets the source's and the sink's `capture_media`
+  from the same flag.
 - `TQMegatronTokenStager` slices the payload's `media_tensors` at
   `media_prev_count` (`slice_media_tensors`) so each row holds only the media
   new to that call (every chat request carries the whole conversation, so the

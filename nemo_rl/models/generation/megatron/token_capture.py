@@ -37,7 +37,6 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from nemo_rl.data_plane.tq_token_sink import (
-    COMPACT_PREV_LEN_KEY,
     MEDIA_PREV_COUNT_KEY,
     MINF_CAPTURE_PARAMS_FIELD,
     ChainPrefixCache,
@@ -62,7 +61,7 @@ class TQMegatronPromptPreparer:
     ``prepare_prompt`` resolves the admission through
     ``resolve_admission_prefix_chains`` over a worker-local ``ChainPrefixCache``,
     then splices the result with the shared ``replace_prefix_tokens`` using the
-    rendered prior-turn tokens and EOS id the Megatron endpoint carried in
+    rendered prior-turn tokens and EOS ids the Megatron endpoint carried in
     ``offload_params``.
     """
 
@@ -77,10 +76,11 @@ class TQMegatronPromptPreparer:
         offload_params: dict[str, Any] | None = None,
     ) -> RequestPromptPreparationResult:
         """Fetch a chained prefix, splice it into the prompt, and update admission."""
-        # Deferred because the prompt preparer is optional and requires the
-        # Megatron-LM hooks from NVIDIA/Megatron-LM#7015. The two field names
+        # Deferred because the prompt preparer is optional and requires
+        # Megatron-LM's inference capture hooks. The two field names
         # are the request-metadata keys the Megatron chat endpoint writes when
         # it defers the prefix splice to this preparer.
+        from megatron.core.inference import inference_request
         from megatron.core.inference.inference_request import (
             PREFIX_EOS_TOKEN_ID_FIELD,
             PREFIX_TEMPLATE_TOKEN_IDS_FIELD,
@@ -116,56 +116,73 @@ class TQMegatronPromptPreparer:
             )
 
         updated_offload_params = dict(offload_params)
-        # Gym verifies the engine's *expanded* prompt against this prefix.
+        # Gym verifies the engine's prompt against this prefix.
         updated_admission = admission.model_copy(
             update={"required_prefix_token_ids": prefix_token_ids}
         )
         updated_offload_params[NG_CAPTURE_FIELD] = updated_admission.model_dump(
             mode="json"
         )
-        # The stager needs the compact length of the spliced chain to cut this
-        # call's compact delta (Gym's MegatronCaptureAdapter reads it off the
-        # payload the stager assembles).
+        # The stager slices MInf's whole-conversation media_tensors at this
+        # count so each row stages only the media new to this call.
         updated_offload_params[MINF_CAPTURE_PARAMS_FIELD] = {
             **(updated_offload_params.get(MINF_CAPTURE_PARAMS_FIELD) or {}),
-            COMPACT_PREV_LEN_KEY: len(chains.compact),
             MEDIA_PREV_COUNT_KEY: chains.media_count,
         }
 
         template_prefix_token_ids = updated_offload_params.get(
             PREFIX_TEMPLATE_TOKEN_IDS_FIELD
         )
-        eos_token_id = updated_offload_params.get(PREFIX_EOS_TOKEN_ID_FIELD)
-        if template_prefix_token_ids is not None or eos_token_id is not None:
+        eos_token_ids = updated_offload_params.get(PREFIX_EOS_TOKEN_ID_FIELD)
+        if template_prefix_token_ids is not None or eos_token_ids is not None:
             if not isinstance(template_prefix_token_ids, list) or any(
                 type(token_id) is not int for token_id in template_prefix_token_ids
             ):
                 raise ValueError(
                     "MInf capture request carries no valid template prefix tokens"
                 )
-            if type(eos_token_id) is not int:
-                raise ValueError("MInf capture request carries no valid EOS token id")
-            # Same splice as the vLLM worker (vllm_worker_async.py), but in the
-            # *compact* token space: the chat endpoint renders one media token
-            # per image and the engine expands every media token it is handed
-            # (Megatron-LM ``_build_vlm_request``), so splicing the expanded
-            # chain here would expand the previous turn twice. The engine's
-            # expanded prompt is then checked against ``chains.expanded`` by
-            # Gym's capture core when the call is staged.
+            if type(eos_token_ids) is not int and (
+                not isinstance(eos_token_ids, list)
+                or not eos_token_ids
+                or any(type(token_id) is not int for token_id in eos_token_ids)
+            ):
+                raise ValueError("MInf capture request carries no valid EOS token ids")
+            # Same splice as the vLLM worker (vllm_worker_async.py), with the
+            # exact expanded prefix: for a multimodal prefix the engine splits
+            # it back off at _prefix_expanded_token_count (set below) and
+            # expands only the media placeholders after it.
             prompt = replace_prefix_tokens(
                 tokenizer=None,
-                model_prefix_token_ids=chains.compact,
+                model_prefix_token_ids=prefix_token_ids,
                 template_prefix_token_ids=template_prefix_token_ids,
                 template_token_ids=prompt,
-                eos_token_id=eos_token_id,
+                eos_token_id=eos_token_ids,
             )
         elif admission.staging_chain:
             raise ValueError(
                 "MInf staged-prefix request carries no prompt splice metadata"
             )
 
-        if prompt[: len(chains.compact)] != chains.compact:
+        if prompt[: len(prefix_token_ids)] != prefix_token_ids:
             raise ValueError("MInf failed to apply the authorized token prefix")
+        # When earlier turns carried media, the endpoint reports how many and
+        # the engine expands only what follows the expanded prefix. Megatron-LM
+        # pins without expanded-prefix stitching define neither key; setup
+        # refuses media capture on them.
+        media_count_field = getattr(inference_request, "PREFIX_MEDIA_COUNT_FIELD", None)
+        endpoint_media_count = (
+            updated_offload_params.get(media_count_field) if media_count_field else None
+        )
+        if (endpoint_media_count or 0) != chains.media_count:
+            raise ValueError(
+                "MInf capture prefix media count mismatch: the chat request's history "
+                f"carries {endpoint_media_count or 0}, the staged chain "
+                f"{chains.media_count}"
+            )
+        if endpoint_media_count is not None:
+            updated_offload_params[
+                inference_request.PREFIX_EXPANDED_TOKEN_COUNT_FIELD
+            ] = len(prefix_token_ids)
         return RequestPromptPreparationResult(
             prompt=prompt, offload_params=updated_offload_params
         )
@@ -178,8 +195,6 @@ class _MegatronCapturePayload:
     prompt_token_ids: Any
     generated_token_ids: Any
     generated_log_probs: Any
-    compact_prompt_token_ids: Any
-    compact_prev_len: int
     # The engine's media tensors minus what the parent chain already staged.
     media_tensors: dict[str, Any] | None
 
@@ -216,8 +231,6 @@ class _MegatronCapturePayload:
             prompt_token_ids=getattr(payload, "prompt_token_ids", None),
             generated_token_ids=getattr(payload, "generated_token_ids", None),
             generated_log_probs=getattr(payload, "generated_log_probs", None),
-            compact_prompt_token_ids=getattr(payload, "compact_prompt_token_ids", None),
-            compact_prev_len=_count(COMPACT_PREV_LEN_KEY),
             media_tensors=media,
         )
 
@@ -347,9 +360,8 @@ class TQMegatronTokenStager:
         from nemo_gym.token_id_capture import NG_COMMIT_COORDS_FIELD
 
         # Gym's MegatronCaptureAdapter reads prompt/generated ids and log
-        # probs off the offloaded payload, plus the multimodal material
-        # (compact prompt and the compact length of the spliced chain the
-        # preparer recorded). A malformed payload poisons
+        # probs off the offloaded payload; this call's media delta rides
+        # beside them as attachments. A malformed payload poisons
         # the call with ``capture_failed`` coordinates (surfacing in Gym as
         # ``worker_capture_failed``, matching vLLM) instead of raising here,
         # which would leave Gym with no coordinates at all. The payload view

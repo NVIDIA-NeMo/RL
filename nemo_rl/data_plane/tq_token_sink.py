@@ -104,17 +104,8 @@ _MEDIA_REQUIRED = ("imgs", "imgs_sizes")
 _MEDIA_PIXEL_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _MEDIA_INDEX_DTYPES = (torch.int32, torch.int64)
 
-# Compact-space token delta for calls that carried media (see Gym's
-# nemo_gym.token_id_capture.staging.media). The expanded delta is the
-# sequence the trainer needs; the compact form is what the next turn's chat
-# render must be spliced against. Text calls stage no compact form, in which
-# case the compact and expanded deltas coincide and compact_len is 0.
-COMPACT_TOKEN_IDS_FIELD = "compact_token_ids_delta"
-COMPACT_LEN_FIELD = "compact_len"
-COMPACT_TOKEN_IDS_EXTRAS_KEY = "compact_token_ids_delta"
 # offload_params sub-dict the Megatron preparer writes and the stager reads.
 MINF_CAPTURE_PARAMS_FIELD = "ng_capture_minf"
-COMPACT_PREV_LEN_KEY = "compact_prev_len"
 # How many media items the parent chain already staged; the stager slices
 # MInf's media_tensors at that boundary so each row holds only new media.
 MEDIA_PREV_COUNT_KEY = "media_prev_count"
@@ -123,8 +114,6 @@ STAGING_FIELDS = [
     "token_ids_delta",
     "token_mask_delta",
     "generation_logprobs_delta",
-    COMPACT_TOKEN_IDS_FIELD,
-    COMPACT_LEN_FIELD,
     "schema_version",
     "digest_version",
     "extras_digest_version",
@@ -510,33 +499,6 @@ class TQTokenSink:
                 if extras_metadata is not None
                 else None
             )
-            compact_delta = (
-                extras_metadata.pop(COMPACT_TOKEN_IDS_EXTRAS_KEY, None)
-                if extras_metadata is not None
-                else None
-            )
-            if compact_delta is not None:
-                if (
-                    not isinstance(compact_delta, list)
-                    or not compact_delta
-                    or any(type(token_id) is not int for token_id in compact_delta)
-                ):
-                    raise ValueError(
-                        "compact_token_ids_delta must be a non-empty list of ints"
-                    )
-                field_dict[COMPACT_TOKEN_IDS_FIELD] = torch.tensor(
-                    [compact_delta], dtype=torch.int64
-                )
-                field_dict[COMPACT_LEN_FIELD] = torch.tensor(
-                    [len(compact_delta)], dtype=torch.int64
-                )
-            else:
-                # Sentinel row: jagged columns cannot be empty. compact_len 0
-                # tells readers the compact delta equals token_ids_delta.
-                field_dict[COMPACT_TOKEN_IDS_FIELD] = torch.tensor(
-                    [[0]], dtype=torch.int64
-                )
-                field_dict[COMPACT_LEN_FIELD] = torch.tensor([0], dtype=torch.int64)
             metadata_json = json.dumps(
                 extras_metadata,
                 sort_keys=True,
@@ -757,30 +719,26 @@ def slice_media_tensors(
 
 @dataclass(frozen=True)
 class PrefixChains:
-    """One resolved ``staging_chain`` in both token spaces.
+    """One resolved ``staging_chain``: its tokens plus how much media it staged.
 
     ``expanded`` is the concatenated ``token_ids_delta`` chain: what the engine
-    prompt must start with and what Gym's capture core verifies. ``compact`` is
-    the concatenated compact deltas (falling back to the expanded delta for
-    calls that staged none): what a multimodal chat render is spliced against.
-    They are identical for text-only chains. ``media_count`` is how many media
-    items (images, or videos) the chain's rows staged, so the next call can
-    stage only the media new to it.
+    prompt must start with, what the Megatron preparer splices in, and what
+    Gym's capture core verifies. ``media_count`` is how many media items
+    (images, or videos) the chain's rows staged, so the next call can stage
+    only the media new to it and the engine expands only the media after it.
     """
 
     expanded: list[int]
-    compact: list[int]
     media_count: int = 0
 
     def __add__(self, other: "PrefixChains") -> "PrefixChains":
         return PrefixChains(
             expanded=self.expanded + other.expanded,
-            compact=self.compact + other.compact,
             media_count=self.media_count + other.media_count,
         )
 
 
-_EMPTY_CHAINS = PrefixChains(expanded=[], compact=[])
+_EMPTY_CHAINS = PrefixChains(expanded=[])
 
 
 class ChainPrefixCache:
@@ -802,8 +760,7 @@ class ChainPrefixCache:
 
         The vLLM worker's path: it reads only ``fetch_prefix_token_ids``. A
         worker uses either this or ``fetch_chains``, never both, so the
-        compact side of an entry cached here (a copy of the expanded ids) is
-        never read.
+        media count of an entry cached here (always 0) is never read.
         """
         return self._fetch(
             staging_chain,
@@ -811,7 +768,7 @@ class ChainPrefixCache:
         ).expanded
 
     def fetch_chains(self, staging_chain: list[str]) -> PrefixChains:
-        """Assemble both prefix spaces from staging_chain (the Megatron preparer's path)."""
+        """Assemble the prefix and its media count from staging_chain (the Megatron preparer's path)."""
         return self._fetch(
             staging_chain, lambda source, keys: source.fetch_prefix_chains(keys)
         )
@@ -829,9 +786,7 @@ class ChainPrefixCache:
                     miss_start = i + 1
             miss_keys = staging_chain[miss_start:]
         if not miss_keys:
-            return PrefixChains(
-                list(cached.expanded), list(cached.compact), cached.media_count
-            )
+            return PrefixChains(list(cached.expanded), cached.media_count)
         if source is None:
             raise RuntimeError(
                 "staging source not initialized; call setup_token_capture() first"
@@ -844,14 +799,12 @@ class ChainPrefixCache:
             cache[last_key] = result
             if len(cache) > 256:
                 del cache[next(iter(cache))]
-        return PrefixChains(
-            list(result.expanded), list(result.compact), result.media_count
-        )
+        return PrefixChains(list(result.expanded), result.media_count)
 
 
 def _flat_chains(token_ids: list[int]) -> PrefixChains:
-    """A text-only chain: the compact form is the expanded one."""
-    return PrefixChains(expanded=list(token_ids), compact=list(token_ids))
+    """A chain read without its media columns (the vLLM worker's path)."""
+    return PrefixChains(expanded=list(token_ids))
 
 
 def resolve_admission_prefix(
@@ -868,17 +821,16 @@ def resolve_admission_prefix(
 def resolve_admission_prefix_chains(
     admission: Any, chain_prefix: ChainPrefixCache
 ) -> PrefixChains:
-    """Resolve a ``CaptureAdmission`` to its prefix in both token spaces.
+    """Resolve a ``CaptureAdmission`` to its prefix and staged media count.
 
-    An inline ``required_prefix_token_ids`` prefix has no separate compact form:
-    Gym only inlines prefixes for text chains.
+    An inline ``required_prefix_token_ids`` prefix carries no media: Gym only
+    inlines prefixes for text chains.
     """
     if admission.mode == "text":
-        return PrefixChains(expanded=[], compact=[])
+        return PrefixChains(expanded=[])
     if admission.staging_chain:
         return chain_prefix.fetch_chains(list(admission.staging_chain))
-    inline = list(admission.required_prefix_token_ids)
-    return PrefixChains(expanded=inline, compact=list(inline))
+    return PrefixChains(expanded=list(admission.required_prefix_token_ids))
 
 
 class TQTokenSource:
@@ -916,11 +868,8 @@ class TQTokenSource:
         return self.fetch_prefix_chains(staging_keys).expanded
 
     def fetch_prefix_chains(self, staging_keys: list[str]) -> PrefixChains:
-        """Bulk-fetch the ordered delta chain in both token spaces.
+        """Bulk-fetch the ordered delta chain and count the media it staged.
 
-        The compact chain uses each row's ``compact_token_ids_delta`` when the
-        call staged one (``compact_len > 0``) and its ``token_ids_delta``
-        otherwise, so text calls contribute the same ids to both chains.
         ``media_count`` is read off the small media columns (never the pixels)
         and is only computed when this source was built with
         ``capture_media=True``; otherwise it is 0 regardless of what the rows
@@ -929,14 +878,10 @@ class TQTokenSource:
         from setup's ``capture_media`` in ``megatron_worker.setup_token_capture``.
         """
         if not staging_keys:
-            return PrefixChains(expanded=[], compact=[])
+            return PrefixChains(expanded=[])
         if len(set(staging_keys)) != len(staging_keys):
             raise KeyError("prefix fetch: staging_keys contains duplicates")
-        select_fields = [
-            "token_ids_delta",
-            COMPACT_TOKEN_IDS_FIELD,
-            COMPACT_LEN_FIELD,
-        ]
+        select_fields = ["token_ids_delta"]
         if self._capture_media:
             # Small media columns only: enough to count items, never pixels.
             select_fields += [
@@ -958,27 +903,12 @@ class TQTokenSource:
                 f"prefix fetch incomplete: requested {len(staging_keys)} keys, got {n_rows}"
             )
         expanded: list[int] = []
-        compact: list[int] = []
         media_count = 0
         for index in range(n_rows):
             row = _select_row(rows, index)
-            delta = [int(t) for t in row["token_ids_delta"].squeeze(0).tolist()]
-            expanded.extend(delta)
+            expanded.extend(int(t) for t in row["token_ids_delta"].squeeze(0).tolist())
             media_count += _row_media_item_count(row) if self._capture_media else 0
-            compact_len = _row_scalar_int(row, COMPACT_LEN_FIELD)
-            if compact_len > 0:
-                compact_delta = [
-                    int(t) for t in row[COMPACT_TOKEN_IDS_FIELD].squeeze(0).tolist()
-                ]
-                if len(compact_delta) != compact_len:
-                    raise ValueError(
-                        f"compact_token_ids_delta length {len(compact_delta)} does not "
-                        f"match compact_len {compact_len}"
-                    )
-                compact.extend(compact_delta)
-            else:
-                compact.extend(delta)
-        return PrefixChains(expanded=expanded, compact=compact, media_count=media_count)
+        return PrefixChains(expanded=expanded, media_count=media_count)
 
     def fetch_media(self, items: list[FetchedStagedCall]) -> list[StagedMediaTensors]:
         """One batched read of the media tensor columns for rows known to carry media.

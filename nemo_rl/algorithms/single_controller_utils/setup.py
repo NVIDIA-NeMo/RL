@@ -1030,17 +1030,25 @@ def _load_opd_full_teacher_lm_heads(
         )
 
 
-_MINF_MEDIA_PAYLOAD_FIELDS = ("media_tensors", "compact_prompt_token_ids")
+_MINF_MEDIA_PAYLOAD_FIELDS = ("media_tensors",)
+# Request-metadata keys of Megatron-LM's expanded-prefix stitching contract,
+# which the Megatron prompt preparer fills in.
+_MINF_PREFIX_STITCHING_FIELDS = (
+    "PREFIX_MEDIA_COUNT_FIELD",
+    "PREFIX_EXPANDED_TOKEN_COUNT_FIELD",
+)
 
 
 def _require_minf_media_payload_fields() -> None:
-    """Fail at setup if the pinned megatron-core payload lacks the media fields.
+    """Fail at setup if the pinned megatron-core cannot capture media.
 
-    Megatron media capture stages ``OffloadedRequestPayload.media_tensors`` and
-    ``compact_prompt_token_ids`` (tdene/Megatron-LM#20 on NVIDIA/Megatron-LM
-    PR #7015). Without them the stager would hand TQ a text sentinel for every
-    VLM call and the finalizer would drop every group, so check the dataclass
-    fields at config time rather than training image-blind.
+    Megatron media capture stages ``OffloadedRequestPayload.media_tensors``,
+    and multi-turn media prompts need the engine to expand only the media after
+    an already-expanded prefix (expanded-prefix stitching). Without the first the
+    stager would hand TQ a text sentinel for every VLM call and the finalizer
+    would drop every group; without the second every later turn would expand
+    its spliced prefix twice and be rejected. Check both at config time rather
+    than training image-blind or failing mid-rollout.
     """
     try:
         # Deferred import: megatron-core is a heavy, optional dependency that the
@@ -1054,15 +1062,23 @@ def _require_minf_media_payload_fields() -> None:
         field.name
         for field in dataclass_fields(inference_request.OffloadedRequestPayload)
     }
-    missing = [name for name in _MINF_MEDIA_PAYLOAD_FIELDS if name not in present]
+    missing = [
+        f"OffloadedRequestPayload.{name}"
+        for name in _MINF_MEDIA_PAYLOAD_FIELDS
+        if name not in present
+    ]
+    missing += [
+        name
+        for name in _MINF_PREFIX_STITCHING_FIELDS
+        if not hasattr(inference_request, name)
+    ]
     if missing:
         raise NotImplementedError(
             "Megatron media token capture requires OffloadedRequestPayload."
-            "media_tensors and compact_prompt_token_ids (tdene/Megatron-LM#20 on "
-            "NVIDIA/Megatron-LM#7015); the pinned Megatron-LM lacks: "
-            f"{', '.join(missing)}. Bump 3rdparty/Megatron-Bridge-workspace/"
-            "Megatron-Bridge to a revision that includes it, or use "
-            "policy.generation.backend=vllm."
+            "media_tensors and expanded-prefix stitching; "
+            f"the pinned Megatron-LM lacks: {', '.join(missing)}. Bump "
+            "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge to a revision that "
+            "includes it, or use policy.generation.backend=vllm."
         )
 
 

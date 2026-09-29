@@ -105,6 +105,55 @@ def test_splice_prefix_tokens_without_tokenizer_uses_explicit_eos():
     )
 
 
+@pytest.mark.parametrize(
+    ("model_prefix", "expected"),
+    [
+        # The model stopped on the template's own turn terminator.
+        ([100, 2], [100, 2, 77, 88]),
+        # The model stopped on a different declared EOS: its exact id survives
+        # the splice, so the prompt still starts with the model's tokens.
+        ([100, 11], [100, 11, 77, 88]),
+    ],
+)
+def test_splice_prefix_tokens_accepts_an_eos_id_set(model_prefix, expected):
+    """Megatron-LM ships the model's full EOS set; any member marks a turn boundary."""
+    result = splice_prefix_tokens(
+        tokenizer=None,
+        model_prefix_token_ids=model_prefix,
+        template_prefix_token_ids=[9, 2],
+        template_token_ids=[9, 2, 77, 88],
+        eos_token_id=[2, 11],
+    )
+    assert result == PrefixSplice(
+        token_ids=expected, model_cut_end=1, template_cut_start=1
+    )
+    assert result.token_ids[: len(model_prefix)] == model_prefix
+
+
+def test_splice_prefix_tokens_counts_every_eos_in_the_set():
+    """A template prefix whose turns end on different EOS ids counts all of them."""
+    result = splice_prefix_tokens(
+        tokenizer=None,
+        model_prefix_token_ids=[5, 11, 6, 2],
+        template_prefix_token_ids=[5, 11, 7, 2],
+        template_token_ids=[5, 11, 7, 2, 77],
+        eos_token_id=[2, 11],
+    )
+    assert result.token_ids == [5, 11, 6, 2, 77]
+
+
+def test_splice_prefix_tokens_without_trailing_eos_keeps_template_boundary():
+    """A prefix cut by max_tokens has no EOS to keep; the template's boundary is used."""
+    result = splice_prefix_tokens(
+        tokenizer=None,
+        model_prefix_token_ids=[100, 101],
+        template_prefix_token_ids=[9, 2],
+        template_token_ids=[9, 2, 77],
+        eos_token_id=[2, 11],
+    )
+    assert result.token_ids == [100, 101, 2, 77]
+
+
 def test_replace_prefix_tokens_without_tokenizer_reports_missing_eos_without_decoding():
     """The failure message must not require a tokenizer to decode."""
     with pytest.raises(AssertionError, match="EOS token #1 not found"):
