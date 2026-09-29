@@ -1137,8 +1137,11 @@ def test_create_teacher_worker_groups_reuses_reserved_clusters(monkeypatch):
     initialized_clusters = []
 
     class FakeTeacherWorkerGroup:
-        def __init__(self, *, teacher_cfg, cluster, policy_config, tokenizer):
+        def __init__(
+            self, *, teacher_cfg, cluster, policy_config, tokenizer, teacher_index
+        ):
             initialized_clusters.append((teacher_cfg.alias, cluster))
+            self.teacher_index = teacher_index
             self.worker_group = SimpleNamespace(workers=[])
             self.use_sequence_packing = True
             self.sequence_length_pad_multiple = 1
@@ -1165,6 +1168,71 @@ def test_create_teacher_worker_groups_reuses_reserved_clusters(monkeypatch):
     ]
     assert list(worker_groups) == ["math", "code"]
     assert alias_to_group_alias == {"math": "math", "code": "code"}
+    # The teacher index is derived from the deduplicated checkpoint, not from
+    # the YAML key order this dict happens to have: it keys the student's per-
+    # teacher LM-head shards, so editing the config must not repoint an
+    # already-tagged row at another teacher's head.
+    assert {alias: group.teacher_index for alias, group in worker_groups.items()} == {
+        "code": 0,
+        "math": 1,
+    }
+
+
+def test_teacher_index_follows_the_checkpoint_not_the_alias():
+    """Renaming or reordering agents must not renumber an already-tagged row."""
+    from nemo_rl.algorithms import opd
+    from nemo_rl.models.policy.teacher_worker_group import (
+        create_teacher_configs_from_opd_config,
+    )
+
+    def checkpoints_by_index(teacher_model_by_agent_name):
+        configs = create_teacher_configs_from_opd_config(
+            {
+                "teacher_model_by_agent_name": teacher_model_by_agent_name,
+                "non_colocated_teachers": {
+                    "enabled": True,
+                    "default_teacher_cfg": {"num_nodes": 2, "gpus_per_node": 4},
+                },
+            }
+        )
+        return [cfg.model_name for cfg in opd.teacher_configs_by_index(configs)]
+
+    baseline = ["/checkpoints/code", "/checkpoints/math"]
+    assert (
+        checkpoints_by_index({"math": "/checkpoints/math", "code": "/checkpoints/code"})
+        == baseline
+    )
+    # Same two checkpoints, renamed agents in the opposite YAML order.
+    assert (
+        checkpoints_by_index(
+            {"zeta": "/checkpoints/code", "alpha": "/checkpoints/math"}
+        )
+        == baseline
+    )
+
+    # A checkpoint shared by two agents: which alias represents it is
+    # first-seen-wins over this dict, so alias-based numbering flipped here.
+    shared = ["/checkpoints/other", "/checkpoints/shared"]
+    assert (
+        checkpoints_by_index(
+            {
+                "aaa": "/checkpoints/shared",
+                "zzz": "/checkpoints/shared",
+                "mmm": "/checkpoints/other",
+            }
+        )
+        == shared
+    )
+    assert (
+        checkpoints_by_index(
+            {
+                "zzz": "/checkpoints/shared",
+                "aaa": "/checkpoints/shared",
+                "mmm": "/checkpoints/other",
+            }
+        )
+        == shared
+    )
 
 
 # ---------------------------------------------------------------------------

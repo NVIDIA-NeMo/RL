@@ -58,6 +58,24 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
             gpus_per_node: 1  # inference GPUs; remainder go to training
     ```
 
+    For default non-colocated vLLM refit, the SingleController entrypoint uses the
+    same vLLM generation path as legacy GRPO/PPO, so you can opt into vLLM's
+    native reload API with:
+
+    ```yaml
+    policy:
+      generation:
+        backend: "vllm"
+        refit_transport: null
+        colocated:
+          enabled: false
+        vllm_cfg:
+          async_engine: true
+          refit_with_reload_api: true
+    ```
+
+    This reload API path has the same limitations described in [Weight Refit](./refit.md#vllm-reload-api).
+
 3. **One RL step = one training batch.** The batch a step trains on is the whole step (see `validate_single_controller_config` in [nemo_rl/algorithms/single_controller_utils/config.py](../../nemo_rl/algorithms/single_controller_utils/config.py)). A GRPO step is also one optimizer step. A PPO step applies `ppo.ppo_epochs` actor updates and `ppo.critic_ppo_epochs` critic updates over that same batch. Both counts must be at least 1 and can be configured independently; the exemplar defaults the critic count to `${ppo.ppo_epochs}`.
 
     ```python
@@ -72,7 +90,7 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
       use_importance_sampling_correction: true
     ```
 
-5. **Save the data plane for replay recovery.** When Single-Controller checkpointing is enabled, all built-in samplers require `checkpointing.save_data_plane: true` so completed, unconsumed rollout groups survive a restart. Native TQ checkpointing currently supports only the `simple` storage backend. For multi-node runs, `checkpoint_dir` must be on a durable filesystem visible at the same path from every node.
+5. **Save the data plane for replay recovery.** When Single-Controller checkpointing is enabled, all built-in samplers require `checkpointing.save_data_plane: true` so completed, unconsumed rollout groups survive a restart. Native TQ checkpointing supports both `simple` and `mooncake_cpu` through these same checkpoint settings; no backend-specific switch is needed. For multi-node runs, `checkpoint_dir` must be on a durable filesystem visible at the same path from every node.
 
     ```yaml
     checkpointing:
@@ -180,11 +198,20 @@ on the original run as well as its restart.
 Periodic snapshots currently require all of the following:
 
 - `checkpointing.enabled: true` and `checkpointing.save_data_plane: true`.
-- `data_plane.backend: simple`, because native TQ save/load is required.
+- `data_plane.backend: simple` or `data_plane.backend: mooncake_cpu`, because native TQ save/load is required.
 - `token_capture.enabled: true`.
 - A replay-recoverable sampler with training-claim ownership. All built-in
   samplers qualify. A custom sampler must explicitly declare both
   `supports_buffer_checkpoint = True` and `supports_training_claims = True`.
+
+With `data_plane.backend: mooncake_cpu`, data-plane checkpointing also requires
+`async_rl.generation_fleet_health.restart_dead_shards: false`. Setup rejects
+automatic shard restarts because replacing a generation worker can discard
+its owned Mooncake payload and leave stale checkpoint worker handles. This
+restriction applies to both trainer-step checkpoints and periodic rollout
+snapshots; restarting the whole job from a saved checkpoint is still supported.
+Support for live shard restarts is tracked in
+[NVIDIA-NeMo/RL#4178](https://github.com/NVIDIA-NeMo/RL/issues/4178).
 
 Each trainer or bootstrap anchor has a `rollout_snapshots/` directory. A
 published `snapshot_NNNNNN/` contains the native TQ snapshot and matching
@@ -239,7 +266,7 @@ generation in the group has finished.
 
 When a sampler does not support replay recovery, a requested data-plane checkpoint is written in `shadow` mode. The TQ snapshot is retained, but no authoritative replay index is written and its rows are not restored into the training replay buffer.
 
-Native TQ save/load currently requires `data_plane.backend: "simple"`. Mooncake-backed storage is not recoverable through this mechanism. A failure while saving or validating the TQ snapshot prevents the incomplete checkpoint bundle from becoming the latest resumable checkpoint.
+Native TQ save/load works with both `data_plane.backend: "simple"` and `data_plane.backend: "mooncake_cpu"`, using the existing `checkpointing.enabled: true` and `checkpointing.save_data_plane: true` settings. A failure while saving or validating the TQ snapshot prevents the incomplete checkpoint bundle from becoming the latest resumable checkpoint.
 
 ## Async-RL Knobs and Sampler Modes
 

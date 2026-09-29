@@ -38,7 +38,7 @@ GEMMs in the three shared layers.
   The reference GLM-5.2 recipes use cuDNN.
 - **Precision**: BF16 model training and generation.
 - **vLLM compatibility patch**: NeMo RL automatically applies a GLM-specific
-  [vLLM 0.25.1 compatibility patch](../../../../nemo_rl/models/generation/vllm/patches.py)
+  [vLLM compatibility patch](../../../../nemo_rl/models/generation/vllm/patches.py)
   that disables decoder-level sequence-parallel MoE for `glm_moe_dsa` while
   retaining MoE-local sequence parallelism. This restores correct iterative
   decoding for GLM-5.1 and GLM-5.2.
