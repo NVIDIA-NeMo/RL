@@ -58,8 +58,8 @@ from nemo_rl.experience.rollout_recovery import RolloutRecoveryLedger
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
 )
-from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.logger import LoggerConfig
+from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 
 class FakeWeightSynchronizer:

@@ -33,9 +33,9 @@ import swanlab
 import torch
 import wandb
 from matplotlib import pyplot as plt
-from pydantic import BaseModel
 from prometheus_client.parser import text_string_to_metric_families
 from prometheus_client.samples import Sample
+from pydantic import BaseModel
 from rich.box import ROUNDED
 from rich.console import Console
 from rich.logging import RichHandler
