@@ -532,6 +532,7 @@ class TestMegatronTrainIters:
 
         assert mc.policy["megatron_cfg"]["train_iters"] == 7
         assert mc.value["megatron_cfg"]["train_iters"] == 21
+        assert mc.policy["megatron_cfg"]["offloaded_between_steps"] is True
 
     def test_skips_a_critic_on_a_non_megatron_backend(self):
         mc = _ppo_master_config(megatron_enabled=False, max_num_steps=7)

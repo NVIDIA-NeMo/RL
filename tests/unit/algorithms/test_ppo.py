@@ -2195,6 +2195,7 @@ def test_megatron_train_iters_matches_ppo_training_limit(
 
     assert config.policy["megatron_cfg"]["train_iters"] == expected_policy_train_iters
     assert config.value["megatron_cfg"]["train_iters"] == expected_value_train_iters
+    assert config.policy["megatron_cfg"]["offloaded_between_steps"] is True
 
 
 def test_ppo_setup_rejects_a_warm_start_that_does_not_resolve(monkeypatch, tmp_path):
