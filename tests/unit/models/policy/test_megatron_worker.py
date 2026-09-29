@@ -2183,6 +2183,8 @@ def create_megatron_test_config(
         "logprob_chunk_size": logprob_chunk_size,
         "precision": precision,
         "offload_optimizer_for_logprob": False,
+        "offload_policy_before_refit": False,
+        "offload_optimizer_for_refit": True,
         "generation": {
             "backend": generation_backend,
             "refit_transport": "mcore" if generation_backend == "megatron" else None,
