@@ -691,16 +691,13 @@ class LossPostProcessor:
         self.prepare_fn = prepare_fn
         self.defer_draft_normalization = defer_draft_normalization
         self.teacher_output_layer_weight_by_index = teacher_output_layer_weight_by_index
-        self.calculate_per_token_loss = cfg["megatron_cfg"][
-            "calculate_per_token_loss"
-        ]
+        self.calculate_per_token_loss = cfg["megatron_cfg"].get(
+            "calculate_per_token_loss", False
+        )
         self.defer_microbatch_average = defer_microbatch_average
-        if (
-            not self.calculate_per_token_loss
-            and (
-                getattr(loss_fn, "loss_type", None) is not LossType.TOKEN_LEVEL
-                or getattr(loss_fn, "input_type", None) is not LossInputType.LOGPROB
-            )
+        if not self.calculate_per_token_loss and (
+            getattr(loss_fn, "loss_type", None) is not LossType.TOKEN_LEVEL
+            or getattr(loss_fn, "input_type", None) is not LossInputType.LOGPROB
         ):
             raise ValueError(
                 "calculate_per_token_loss=False currently requires a token-level "
@@ -808,9 +805,7 @@ class LossPostProcessor:
                 )
             else:
                 wrapper_cls = SequencePackingLossWrapper
-                prepare_fn = _maybe_use_cp_local_loss_inputs(
-                    prepare_loss_input_wrapped
-                )
+                prepare_fn = _maybe_use_cp_local_loss_inputs(prepare_loss_input_wrapped)
 
             loss_fn_wrapped = wrapper_cls(
                 loss_fn=self.loss_fn,

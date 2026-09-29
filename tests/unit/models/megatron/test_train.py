@@ -61,9 +61,7 @@ def _run_local_mean_cp2_loss_post_processor(rank: int, world_size: int) -> None:
             {
                 # CP rank 0 owns target positions 0, 1, 6, and 7, all of
                 # which are masked. Rank 1 owns the four supervised targets.
-                "token_mask": torch.tensor(
-                    [[0, 0, 0, 1, 1, 1, 1, 0]], device=device
-                ),
+                "token_mask": torch.tensor([[0, 0, 0, 1, 1, 1, 1, 0]], device=device),
                 "sample_mask": torch.ones(1, device=device),
             }
         )
@@ -75,7 +73,7 @@ def _run_local_mean_cp2_loss_post_processor(rank: int, world_size: int) -> None:
             loss_fn=NLLLossFn(),
             cfg={
                 "sequence_packing": {"enabled": False},
-                "megatron_cfg": {"calculate_per_token_loss": False},
+                "megatron_cfg": {},
             },
             prepare_fn=lambda logits, data, **_: (
                 {"next_token_logprobs": logits},
@@ -1746,9 +1744,7 @@ class TestLossPostProcessor:
         assert torch.equal(
             local_input["next_token_logprobs"], torch.tensor([[0, 1, 6, 0]])
         )
-        assert torch.equal(
-            local_data["token_mask"], torch.tensor([[0, 1, 1, 1, 0]])
-        )
+        assert torch.equal(local_data["token_mask"], torch.tensor([[0, 1, 1, 1, 0]]))
 
 
 def test_local_mean_mode_cp2_uses_real_loss_callback(distributed_test_runner):

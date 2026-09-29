@@ -1939,9 +1939,9 @@ def _validate_training_config(config: PolicyConfig, model_cfg: Any) -> None:
     ## mcore averages local microbatch means and DDP averages across DP/CP.
     ## perform_initialization = True is a workaround to ensure the correct tensor parallel attributes are set
     ## on the TP-sharded parameters.
-    model_cfg.calculate_per_token_loss = config["megatron_cfg"][
-        "calculate_per_token_loss"
-    ]
+    model_cfg.calculate_per_token_loss = config["megatron_cfg"].get(
+        "calculate_per_token_loss", False
+    )
     model_cfg.perform_initialization = True
 
     # MoE aux loss validation - disabled to support aux loss normalization in RL SFT.

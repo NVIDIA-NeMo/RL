@@ -3049,6 +3049,17 @@ class TestValidateTrainingConfig:
 
         assert model_cfg.calculate_per_token_loss is False
 
+    def test_training_config_defaults_to_local_microbatch_mean_mode(self):
+        """Older configs without the flag use MCore's local-mean mode."""
+        from nemo_rl.models.megatron.setup import _validate_training_config
+
+        model_cfg = MagicMock()
+        config = {"megatron_cfg": {"train_iters": 1000}}
+
+        _validate_training_config(config, model_cfg)
+
+        assert model_cfg.calculate_per_token_loss is False
+
 
 @pytest.mark.mcore
 class TestValidateDtypeConfig:

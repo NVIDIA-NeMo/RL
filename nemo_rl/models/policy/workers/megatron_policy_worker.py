@@ -21,7 +21,7 @@ import warnings
 from collections import OrderedDict, defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, replace
-from typing import Any, Iterable, Iterator, Optional, TypeVar, cast
+from typing import Any, Callable, Iterable, Iterator, Optional, TypeVar, cast
 
 log = logging.getLogger(__name__)
 
@@ -804,9 +804,9 @@ class MegatronPolicyWorkerImpl(
         )
         mtp_num_layers = self._get_model_config().mtp_num_layers
         self.mtp_enabled = mtp_num_layers is not None and mtp_num_layers > 0
-        self.calculate_per_token_loss = self.cfg["megatron_cfg"][
-            "calculate_per_token_loss"
-        ]
+        self.calculate_per_token_loss = self.cfg["megatron_cfg"].get(
+            "calculate_per_token_loss", False
+        )
         # A media placeholder is an ordinary vocabulary entry, so text that
         # legitimately contains it must not be read as an anchor demanding a
         # projected feature. Only models that accept the mask are sent one.
@@ -1200,22 +1200,16 @@ class MegatronPolicyWorkerImpl(
                         self.optimizer.zero_grad()
                         self._copy_main_params_to_param_buffer()
 
-                    if self.calculate_per_token_loss:
-                        # Match MCore's routed-token weighting: the router's own
-                        # token-count multiplier stays intact, and only the global
-                        # main-loss denominator is supplied here.
-                        global_token_scale = (
-                            1.0 / global_valid_toks.clamp(min=1).float()
+                    moe_grad_scale_func, mtp_grad_scale_func = (
+                        self._decide_aux_grad_scale_funcs(
+                            split_step=False,
+                            calculate_per_token_loss=self.calculate_per_token_loss,
+                            global_valid_toks=global_valid_toks,
                         )
-                        self._set_moe_grad_scale_func(
-                            lambda: global_token_scale
-                        )  # pragma: no cover
-                        self._set_mtp_grad_scale_func(lambda: global_token_scale)
-                    else:
-                        # Native MCore local-mean mode supplies the auxiliary
-                        # microbatch scaling itself.
-                        self._set_moe_grad_scale_func(None)
-                        self._set_mtp_grad_scale_func(None)
+                    )
+                    self._set_aux_grad_scale_funcs(
+                        moe_grad_scale_func, mtp_grad_scale_func
+                    )
 
                     # Forward pass.
                     draft_enabled = "draft" in self.cfg and self.cfg["draft"].enabled
@@ -1249,12 +1243,7 @@ class MegatronPolicyWorkerImpl(
                             router_replay_train=not eval_mode,
                         )
 
-                # Clear mtp_grad_scale_func after the forward-backward pass so
-                # it doesn't get serialized in the run_config.yaml when saving
-                self._set_mtp_grad_scale_func(None)
-
-                # Clear moe_grad_scale_func after the forward-backward pass
-                self._set_moe_grad_scale_func(None)  # pragma: no cover
+                self._clear_aux_grad_scale_funcs()  # pragma: no cover
 
                 # Empty unused memory.
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
@@ -1454,11 +1443,56 @@ class MegatronPolicyWorkerImpl(
         self.timer.stop("train")
         return metrics
 
-    def _set_moe_grad_scale_func(self, func):
-        """Set moe_grad_scale_func on the model config for MOE aux loss scaling."""
+    @staticmethod
+    def _decide_aux_grad_scale_funcs(
+        *,
+        split_step: bool,
+        calculate_per_token_loss: bool,
+        global_valid_toks: torch.Tensor | None = None,
+        num_microbatches: int | None = None,
+    ) -> tuple[
+        Callable[[], torch.Tensor | float] | None,
+        Callable[[], torch.Tensor | float] | None,
+    ]:
+        """Return the MoE and MTP scaling callables for one MCore invocation.
+
+        Synchronous token-level loss uses the global valid-token denominator for
+        both auxiliary losses. Split training defers that denominator until
+        ``finish_train_step``: token-level loss preserves MCore's routed-token
+        MoE weighting with a unity callable, while local-mean loss cancels
+        MCore's per-invocation microbatch division for both auxiliary losses.
+        """
+        if calculate_per_token_loss:
+            if split_step:
+                return lambda: 1.0, None
+            if global_valid_toks is None:
+                raise ValueError(
+                    "global_valid_toks is required for synchronous token loss"
+                )
+            global_token_scale = 1.0 / global_valid_toks.clamp(min=1).float()
+            return lambda: global_token_scale, lambda: global_token_scale
+
+        if not split_step:
+            return None, None
+        if num_microbatches is None:
+            raise ValueError("num_microbatches is required for split local-mean loss")
+        call_microbatch_scale = float(num_microbatches)
+        return lambda: call_microbatch_scale, lambda: call_microbatch_scale
+
+    def _set_aux_grad_scale_funcs(
+        self,
+        moe_grad_scale_func: Callable[[], torch.Tensor | float] | None,
+        mtp_grad_scale_func: Callable[[], torch.Tensor | float] | None,
+    ) -> None:
+        """Apply the auxiliary loss scaling callables to the model config."""
         config = self._get_model_config()
         if config is not None:
-            config.moe_grad_scale_func = func
+            config.moe_grad_scale_func = moe_grad_scale_func
+            config.mtp_grad_scale_func = mtp_grad_scale_func
+
+    def _clear_aux_grad_scale_funcs(self) -> None:
+        """Drop transient auxiliary loss scaling callables after an invocation."""
+        self._set_aux_grad_scale_funcs(None, None)
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_reference_policy_logprobs")
     def get_reference_policy_logprobs(
@@ -1672,12 +1706,10 @@ class MegatronPolicyWorkerImpl(
 
         state = self._split_step_state_init(loss_fn=loss_fn, gbs=gbs, mbs=mbs)
 
-        # Leave this unset so mcore falls back to config.grad_scale_func and
+        # Leave these unset so MCore falls back to config.grad_scale_func and
         # inherits the optimizer's dynamic loss scale (especially for fp16).
         # Also clear any transient callable left by an interrupted older step.
-        if state["mtp_enabled"]:
-            self._set_mtp_grad_scale_func(None)
-        self._set_moe_grad_scale_func(None)
+        self._clear_aux_grad_scale_funcs()
 
         # Null the three mcore hooks that would fire a mid-step DP reduce:
         #   grad_sync_func — PP scheduler's direct call on last-MB boundaries
@@ -1754,8 +1786,7 @@ class MegatronPolicyWorkerImpl(
             # expected to invoke abort_train_step (idempotent on the saved
             # values) to drop ``_train_step_state``.
             try:
-                self._set_mtp_grad_scale_func(None)
-                self._set_moe_grad_scale_func(None)
+                self._clear_aux_grad_scale_funcs()
             except Exception:
                 log.exception(
                     "failed to clear MTP/MoE gradient scaling after train_microbatch error"
@@ -1870,19 +1901,12 @@ class MegatronPolicyWorkerImpl(
             stage="train",
             require=True,
         )
-        if state["calculate_per_token_loss"]:
-            # The router's routed-token multiplier remains intact; finish applies
-            # the global main-token denominator to every accumulated gradient.
-            self._set_moe_grad_scale_func(lambda: 1.0)
-            self._set_mtp_grad_scale_func(None)
-        else:
-            # MCore divides auxiliary losses by the microbatch count of each
-            # forward/backward invocation. Cancel that here because this split
-            # optimizer step spans several invocations; finish applies one
-            # average over all of them.
-            call_microbatch_scale = float(num_microbatches)
-            self._set_moe_grad_scale_func(lambda: call_microbatch_scale)
-            self._set_mtp_grad_scale_func(lambda: call_microbatch_scale)
+        moe_grad_scale_func, mtp_grad_scale_func = self._decide_aux_grad_scale_funcs(
+            split_step=True,
+            calculate_per_token_loss=state["calculate_per_token_loss"],
+            num_microbatches=num_microbatches,
+        )
+        self._set_aux_grad_scale_funcs(moe_grad_scale_func, mtp_grad_scale_func)
 
         # The critical wrap: hooks fire (accumulate main_grad) but the
         # per-call reduce dispatch is gated off.
@@ -1916,8 +1940,7 @@ class MegatronPolicyWorkerImpl(
                 )
         # The scale is call-local; drop it so the next chunk cannot reuse this
         # chunk's token counts and so it never reaches a serialized config.
-        self._set_moe_grad_scale_func(None)
-        self._set_mtp_grad_scale_func(None)
+        self._clear_aux_grad_scale_funcs()
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
             torch.cuda.empty_cache()
         self._log_gpu_mem("chunk_exit")
@@ -1964,8 +1987,7 @@ class MegatronPolicyWorkerImpl(
             # the right config. Leave ``_train_step_state`` for the caller's
             # abort_train_step to clear.
             try:
-                self._set_mtp_grad_scale_func(None)
-                self._set_moe_grad_scale_func(None)
+                self._clear_aux_grad_scale_funcs()
             except Exception:
                 log.exception(
                     "failed to clear MTP/MoE gradient scaling after finish_train_step error"
@@ -2040,8 +2062,7 @@ class MegatronPolicyWorkerImpl(
             )
         # No more forward/backward calls remain in this step. Clear the
         # callables before optimizer/scheduler/checkpoint state can serialize them.
-        self._set_mtp_grad_scale_func(None)
-        self._set_moe_grad_scale_func(None)
+        self._clear_aux_grad_scale_funcs()
 
         # End-of-step gradient finalization, exactly once per optimizer step.
         # ``begin_train_step`` nulled ``finalize_model_grads_func`` so mcore's
@@ -2296,8 +2317,7 @@ class MegatronPolicyWorkerImpl(
         # Drop the step-local MTP/MoE scalers and restore the mcore hooks before
         # zero_grad_buffer touches anything.
         try:
-            self._set_mtp_grad_scale_func(None)
-            self._set_moe_grad_scale_func(None)
+            self._clear_aux_grad_scale_funcs()
         finally:
             self._restore_saved_mcore_hooks(state)
             self.model.zero_grad_buffer()
@@ -3065,12 +3085,6 @@ class MegatronPolicyWorkerImpl(
                 mtp_metrics["grad_norm"] = float(mtp_grad_norm)
             if mtp_metrics:
                 metrics["mtp_metrics"] = mtp_metrics
-
-    def _set_mtp_grad_scale_func(self, func):
-        """Set mtp_grad_scale_func on the model config for MTP loss scaling."""
-        config = self._get_model_config()
-        if config is not None:
-            config.mtp_grad_scale_func = func
 
     def _scale_mtp_param_grads(self, factor: float) -> None:
         """Scale detached MTP parameters' gradients by ``factor``.

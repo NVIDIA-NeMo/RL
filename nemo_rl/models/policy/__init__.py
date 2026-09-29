@@ -377,7 +377,7 @@ class MegatronConfig(TypedDict):
     enabled: Literal[True]
     # Match Megatron-Core's loss-normalization switch. True computes a global
     # token mean; False averages local microbatch means across DP/CP ranks.
-    calculate_per_token_loss: bool
+    calculate_per_token_loss: NotRequired[bool]
     env_vars: NotRequired[dict[str, str] | None]
     # Arbitrary model-provider attributes applied recursively to the Megatron
     # Bridge model config before model instantiation. Keys must match configurable

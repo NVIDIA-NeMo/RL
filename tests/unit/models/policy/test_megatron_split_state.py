@@ -73,6 +73,48 @@ pytestmark = pytest.mark.mcore
 WORKER_MOD = "nemo_rl.models.policy.workers.megatron_policy_worker"
 
 
+def test_aux_grad_scale_policy():
+    """The synchronous and split paths select the intended MCore scalers."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    moe_scale, mtp_scale = MegatronPolicyWorkerImpl._decide_aux_grad_scale_funcs(
+        split_step=False,
+        calculate_per_token_loss=True,
+        global_valid_toks=torch.tensor(4.0),
+    )
+    assert moe_scale is not None
+    assert mtp_scale is not None
+    assert moe_scale().item() == pytest.approx(0.25)
+    assert mtp_scale().item() == pytest.approx(0.25)
+
+    moe_scale, mtp_scale = MegatronPolicyWorkerImpl._decide_aux_grad_scale_funcs(
+        split_step=False,
+        calculate_per_token_loss=False,
+    )
+    assert moe_scale is None
+    assert mtp_scale is None
+
+    moe_scale, mtp_scale = MegatronPolicyWorkerImpl._decide_aux_grad_scale_funcs(
+        split_step=True,
+        calculate_per_token_loss=True,
+    )
+    assert moe_scale is not None
+    assert moe_scale() == pytest.approx(1.0)
+    assert mtp_scale is None
+
+    moe_scale, mtp_scale = MegatronPolicyWorkerImpl._decide_aux_grad_scale_funcs(
+        split_step=True,
+        calculate_per_token_loss=False,
+        num_microbatches=3,
+    )
+    assert moe_scale is not None
+    assert mtp_scale is not None
+    assert moe_scale() == pytest.approx(3.0)
+    assert mtp_scale() == pytest.approx(3.0)
+
+
 # ── Mock fabric ──────────────────────────────────────────────────────────
 
 
@@ -776,9 +818,7 @@ class TestFinish:
         arg = w.model.scale_gradients.call_args.args[0]
         assert arg == pytest.approx(1.0 / 2048.0, rel=1e-4)
 
-    def test_local_mean_mode_averages_all_step_microbatches(
-        self, mock_module_symbols
-    ):
+    def test_local_mean_mode_averages_all_step_microbatches(self, mock_module_symbols):
         """False mode uses one microbatch average across all streamed calls."""
         from nemo_rl.algorithms.loss.interfaces import LossType
 
