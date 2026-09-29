@@ -21,7 +21,7 @@ on:
 jobs:
   cherry-pick:
     # TODO(kajalj): repin to a released tag once NVIDIA-NeMo/FW-CI-templates#584 merges.
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cherry_pick.yml@9cff8ef385723b7c3c428b58793362b4e812be00
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cherry_pick.yml@2872f82dd837f38762c1a01d7a2f21bcfd63a844
     with:
       target-branch: main
       trigger-label: cherry-pick-to-main
