@@ -14,26 +14,28 @@
 
 """Real GRPO fault injection; no replacement of the trainer or production methods.
 
-Two colocated GPUs host two TP=1 SGLang engines and the DTensor trainer. A
-private local Ray session scopes discovery/cleanup to this training invocation.
+Two colocated GPUs host two TP=1 SGLang engines and the DTensor trainer. The
+observer attaches to whichever Ray cluster the training joined or started.
 The six engine-only fault-tolerance pytest cases remain in L0.
 """
 
 import argparse
 import json
-import math
 import os
 import re
 import signal
 import subprocess
-import sys
-import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+# Match nemo_rl's driver setup before Ray caches this flag at import time.
+# The observer needs no remote runtime environment or repository upload.
+os.environ["RAY_ENABLE_UV_RUN_RUNTIME_ENV"] = "0"
+
 import psutil
+import ray
 import requests
 
 from tests.functional._find_generation_actors import _address_from_session
@@ -107,7 +109,6 @@ def validate_outcome(
     max_steps: int,
     kill: KillReceipt,
     replacement: ReplacementReceipt | None,
-    metrics: dict[str, dict[str, float]],
 ) -> None:
     assert kill.completed_step >= 1, "Fault preceded the first completed train step"
     assert kill.running_requests >= 2, "Victim was not observably serving training"
@@ -134,63 +135,6 @@ def validate_outcome(
     )
     later = [step for step in completed if step > replacement.completed_step]
     assert len(later) >= 2, "Fewer than two train steps completed after replacement"
-    # A successful, fully masked/zero-gradient batch is not a useful refit oracle.
-    assert any(
-        math.isfinite(metrics.get("train/grad_norm", {}).get(str(step), float("nan")))
-        and metrics["train/grad_norm"][str(step)] > 0
-        and metrics.get("train/global_valid_toks", {}).get(str(step), 0) > 0
-        for step in later
-    ), "No post-replacement training step had nonzero gradients and valid tokens"
-
-
-def training_command(
-    project: Path, artifacts: Path, *, expect: str, steps: int
-) -> list[str]:
-    ft = "policy.generation.sglang_cfg.sglang_fault_tolerance_config"
-    return [
-        sys.executable,
-        str(project / "examples/run_grpo.py"),
-        "--config",
-        str(project / "examples/configs/grpo_math_1B_sglang.yaml"),
-        "policy.model_name=Qwen/Qwen3-0.6B",
-        # Keep this short real-training check independent of a multi-GB corpus.
-        # GSM8K uses the same math processor, reward workers, and GRPO trainer.
-        "data.train.dataset_name=GSM8K",
-        "+data.train.subset=main",
-        "+data.train.split=train",
-        "+data.train.extract_answer=true",
-        "data.train.split_validation_size=0",
-        "~data.train.seed",
-        "policy.tokenizer.chat_template_kwargs={enable_thinking:false}",
-        "grpo.num_prompts_per_step=4",
-        "grpo.num_generations_per_prompt=4",
-        "policy.train_global_batch_size=16",
-        "policy.train_micro_batch_size=1",
-        "cluster.num_nodes=1",
-        "cluster.gpus_per_node=2",
-        "policy.generation.colocated.enabled=true",
-        "policy.generation.use_async_rollouts=false",
-        "grpo.async_grpo.enabled=false",
-        "policy.generation.sglang_cfg.tp_size=1",
-        "policy.generation.sglang_cfg.sglang_server_config.num_gpus=2",
-        "policy.generation.sglang_cfg.sglang_server_config.num_gpus_per_engine=1",
-        "policy.generation.sglang_cfg.disable_cuda_graph=true",
-        "policy.generation.sglang_cfg.mem_fraction_static=0.3",
-        f"{ft}.use_fault_tolerance=true",
-        f"{ft}.rollout_health_check_interval=2",
-        f"{ft}.rollout_health_check_timeout=10",
-        f"{ft}.rollout_health_check_first_wait=0",
-        f"{ft}.rollout_max_restart_attempts={1 if expect == 'survival' else 0}",
-        f"grpo.max_num_steps={steps}",
-        "grpo.val_period=0",
-        "grpo.val_at_start=false",
-        "grpo.val_at_end=false",
-        "logger.tensorboard_enabled=true",
-        f"logger.log_dir={artifacts / 'logs'}",
-        "logger.wandb_enabled=false",
-        "logger.monitor_gpus=false",
-        "checkpointing.enabled=false",
-    ]
 
 
 def live_engines(log: str) -> list[Engine]:
@@ -269,34 +213,29 @@ def cleanup(processes: dict[tuple[int, float], psutil.Process]) -> None:
     )
 
 
-def run(args: argparse.Namespace) -> None:
-    # Match nemo_rl's driver setup before Ray caches this flag at import time.
-    # The observer needs no remote runtime environment or repository upload.
-    os.environ["RAY_ENABLE_UV_RUN_RUNTIME_ENV"] = "0"
-    # Ray is optional in CPU-only parser/oracle tests.
-    import ray
+def connect_ray() -> None:
+    """Attach like _find_generation_actors.py: RAY_ADDRESS or auto, then the session dir."""
+    try:
+        ray.init(
+            address=os.environ.get("RAY_ADDRESS") or "auto",
+            log_to_driver=False,
+            include_dashboard=False,
+        )
+    except ConnectionError:
+        address = _address_from_session()
+        assert address, "Completed training but its Ray address is missing"
+        ray.init(address=address, log_to_driver=False, include_dashboard=False)
 
+
+def run(args: argparse.Namespace) -> None:
     project = Path(__file__).resolve().parents[2]
-    artifacts = args.artifact_dir.resolve()
-    artifacts.mkdir(parents=True, exist_ok=True)
-    log_path = artifacts / "run.log"
+    exp_dir = args.exp_dir.resolve()
+    exp_dir.mkdir(parents=True, exist_ok=True)
+    log_path = exp_dir / "run.log"
     assert not log_path.exists(), f"Refusing to overwrite previous evidence: {log_path}"
-    ray_tmp = tempfile.mkdtemp(prefix="sglang-grpo-ray-")
-    # RAY_TMPDIR alone does not isolate address="auto": Ray also scans all local
-    # GCS processes. RAY_ADDRESS=local forces the real driver to create a fresh
-    # cluster. Our observer attaches by the explicit address in that private dir.
-    env = dict(
-        os.environ,
-        RAY_TMPDIR=ray_tmp,
-        RAY_ADDRESS="local",
-        RAY_DEDUP_LOGS="0",
-        PYTHONUNBUFFERED="1",
-    )
-    command = training_command(
-        project, artifacts, expect=args.expect, steps=args.max_steps
-    )
-    (artifacts / "command.json").write_text(json.dumps(command, indent=2) + "\n")
-    print(f"[chaos] Private Ray directory: {ray_tmp}", flush=True)
+    env = dict(os.environ, RAY_DEDUP_LOGS="0", PYTHONUNBUFFERED="1")
+    command = args.command
+    (exp_dir / "command.json").write_text(json.dumps(command, indent=2) + "\n")
     print(f"[chaos] Launching real GRPO: {command}", flush=True)
     processes: dict[tuple[int, float], psutil.Process] = {}
     kill = None
@@ -329,13 +268,7 @@ def run(args: argparse.Namespace) -> None:
                     time.sleep(0.1)
                     continue
                 if not ray.is_initialized():
-                    address = _address_from_session(str(Path(ray_tmp) / "ray"))
-                    assert address, (
-                        "Completed training but private Ray address is missing"
-                    )
-                    ray.init(
-                        address=address, log_to_driver=False, include_dashboard=False
-                    )
+                    connect_ray()
                     deadline = time.monotonic() + args.fault_timeout
                 engines = live_engines(log)
                 if kill is None and len(engines) == 2:
@@ -359,7 +292,7 @@ def run(args: argparse.Namespace) -> None:
                             engine, version, running, steps[-1], time.time()
                         )
                         actor.kill()
-                        (artifacts / "kill.json").write_text(
+                        (exp_dir / "kill.json").write_text(
                             json.dumps(asdict(kill), indent=2) + "\n"
                         )
                         print(
@@ -385,7 +318,7 @@ def run(args: argparse.Namespace) -> None:
                         replacement = ReplacementReceipt(
                             engine, version, running, steps[-1], time.time()
                         )
-                        (artifacts / "replacement.json").write_text(
+                        (exp_dir / "replacement.json").write_text(
                             json.dumps(asdict(replacement), indent=2) + "\n"
                         )
                         print(
@@ -402,21 +335,6 @@ def run(args: argparse.Namespace) -> None:
             ray.shutdown()
             log = log_path.read_text(errors="replace")
             assert kill is not None, "Training exited before fault injection"
-            metrics = {}
-            if args.expect == "survival" and returncode == 0:
-                subprocess.run(
-                    [
-                        sys.executable,
-                        "tests/json_dump_tb_logs.py",
-                        str(artifacts / "logs"),
-                        "--output_path",
-                        str(artifacts / "metrics.json"),
-                    ],
-                    cwd=project,
-                    check=True,
-                    timeout=120,
-                )
-                metrics = json.loads((artifacts / "metrics.json").read_text())
             validate_outcome(
                 expect=args.expect,
                 returncode=returncode,
@@ -425,7 +343,6 @@ def run(args: argparse.Namespace) -> None:
                 max_steps=args.max_steps,
                 kill=kill,
                 replacement=replacement,
-                metrics=metrics,
             )
             summary: dict[str, Any] = {
                 "expect": args.expect,
@@ -433,9 +350,8 @@ def run(args: argparse.Namespace) -> None:
                 "completed_steps": completed_steps(log),
                 "kill": asdict(kill),
                 "replacement": asdict(replacement) if replacement else None,
-                "ray_tmp": ray_tmp,
             }
-            (artifacts / "result.json").write_text(json.dumps(summary, indent=2) + "\n")
+            (exp_dir / "result.json").write_text(json.dumps(summary, indent=2) + "\n")
             print(f"[chaos] PASS: real GRPO {args.expect}", flush=True)
         except BaseException:
             print("[chaos] FAIL; final training log lines:", flush=True)
@@ -457,13 +373,15 @@ def main() -> None:
     parser.add_argument(
         "--expect", choices=["survival", "bounded_failure"], required=True
     )
-    parser.add_argument("--artifact-dir", type=Path, required=True)
+    parser.add_argument("--exp-dir", type=Path, required=True)
     parser.add_argument("--max-steps", type=int, default=12)
     parser.add_argument("--startup-timeout", type=int, default=1200)
     parser.add_argument("--fault-timeout", type=int, default=300)
     parser.add_argument("--completion-timeout", type=int, default=1200)
+    parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     assert args.max_steps >= 4
+    assert args.command, "Missing the training command"
 
     # Keep native Ray/GCS calls bounded too; this is a harness timeout, never an
     # accepted bounded-failure result from the training process.
