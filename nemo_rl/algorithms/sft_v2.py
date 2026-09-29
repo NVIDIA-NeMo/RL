@@ -69,7 +69,6 @@ from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import Logger, LoggerConfig
 from nemo_rl.utils.timer import TimeoutChecker
 
-
 SFT_V2_TEED_METRICS = (
     TeedMetric(
         "loader_latency_max",

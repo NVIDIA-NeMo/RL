@@ -9,12 +9,12 @@ from unittest.mock import MagicMock
 import pytest
 
 from nemo_rl.algorithms.sft_v2 import (
+    SFT_V2_TEED_METRICS,
     SFTSingleControllerActor,
     SFTV2SaveState,
-    SFT_V2_TEED_METRICS,
 )
-from nemo_rl.telemetry.metrics import map_teed_scalars
 from nemo_rl.telemetry.instrumentation import umbrella_span
+from nemo_rl.telemetry.metrics import map_teed_scalars
 from nemo_rl.telemetry.span_groups import RLSpanGroup
 
 try:
