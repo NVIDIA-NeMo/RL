@@ -27,7 +27,10 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 
+from nemo_rl.experience.route_assembly import verify_route_fragment_integrity
+
 if TYPE_CHECKING:
+    from nemo_rl.data_plane.tq_token_sink import FetchedStagedCall, StagedMediaTensors
     from nemo_rl.models.generation.openai_server_utils import PrefixSplice
 
 
@@ -36,7 +39,7 @@ class MediaCaptureRejected(ValueError):
 
     ``code`` is a stable, machine-readable reason surfaced in the HTTP 400
     body and the worker log. ``retained_media_changed`` marks a retained
-    image or video whose geometry or placeholder tokens differ from the
+    image or video whose geometry, placeholder tokens, or processed pixels differ from the
     staged occurrence (e.g. vLLM re-tiled it under a tighter token budget);
     every other capture-time validation failure uses ``media_capture_rejected``.
     """
@@ -141,6 +144,85 @@ class CapturedMedia:
     tensors: dict[str, torch.Tensor] | None
 
 
+def verified_media_items(call: FetchedStagedCall) -> tuple[CapturedMediaItem, ...]:
+    """Authenticate a vLLM call's new occurrences before using their layout.
+
+    Token/lineage verification stays with the shared capture verifier. Extras
+    have a separate commitment, including routes when present, which their
+    media consumer must check even when route replay is disabled.
+    """
+    # Gym is optional outside captured-rollout paths.
+    from nemo_gym.token_id_capture.adapters.vllm import MEDIA_SPANS_FIELD
+    from nemo_gym.token_id_capture.staging.digest import compute_extras_digest
+
+    snapshot = call.snapshot
+    if call.routed_len:
+        integrity = (
+            call.fragment is not None
+            and verify_route_fragment_integrity(
+                call.fragment,
+                extras_digest_version=snapshot.extras_digest_version,
+                expected_extras_digest=snapshot.extras_digest,
+            )
+            and json.loads(call.fragment.extras_metadata_json) == call.extras
+        )
+    else:
+        integrity = compute_extras_digest(call.extras) == snapshot.extras_digest
+    if not integrity:
+        raise MediaCaptureRejected("Media extras commitment mismatch")
+    spans = (call.extras or {}).get(MEDIA_SPANS_FIELD)
+    if not isinstance(spans, list) or any(
+        not isinstance(value, dict) for value in spans
+    ):
+        raise MediaCaptureRejected("Missing or malformed captured media spans")
+    items = tuple(CapturedMediaItem.from_dict(value) for value in spans)
+    if bool(items) != call.media_present:
+        raise MediaCaptureRejected("Media presence disagrees with captured occurrences")
+    modalities = {item.modality for item in items}
+    if len(modalities) > 1 or call.media_has_frames != (modalities == {"video"}):
+        raise MediaCaptureRejected(
+            "Media frame flags disagree with captured occurrences"
+        )
+    carry_len = next(
+        (i for i, mask in enumerate(snapshot.token_mask_delta) if mask == 1.0),
+        snapshot.delta_len,
+    )
+    prompt_tokens = snapshot.token_ids_delta[:carry_len]
+    previous_end = snapshot.prev_len
+    for item in items:
+        if (
+            item.placeholder_offset < previous_end
+            or item.end > snapshot.prev_len + carry_len
+        ):
+            raise MediaCaptureRejected("Media span lies outside the new carried prompt")
+        if item.modality == "image" and len(item.imgs_sizes) != 1:
+            raise MediaCaptureRejected(
+                "Image occurrence must have exactly one geometry"
+            )
+        item.verify_tokens(prompt_tokens, origin=snapshot.prev_len)
+        previous_end = item.end
+    return items
+
+
+def verify_media_geometry(
+    items: tuple[CapturedMediaItem, ...], media: StagedMediaTensors
+) -> None:
+    """Bind the validated tensor bundle to authenticated occurrence geometry."""
+    sizes = [list(size) for item in items for size in item.imgs_sizes]
+    if media.imgs_sizes.tolist() != sizes:
+        raise MediaCaptureRejected(
+            "Media tensor geometry disagrees with captured occurrences"
+        )
+    expected_frames = [
+        len(item.imgs_sizes) for item in items if item.modality == "video"
+    ]
+    actual_frames = media.num_frames.tolist() if media.num_frames is not None else []
+    if actual_frames != expected_frames:
+        raise MediaCaptureRejected(
+            "Media frame counts disagree with captured occurrences"
+        )
+
+
 def _geometry_tensor(value: Any) -> torch.Tensor:
     tensor = torch.as_tensor(value)
     if (
@@ -228,8 +310,13 @@ def capture_processed_media(
     splice: PrefixSplice | None = None,
     image_token_id: int | None = None,
     patch_size: int | None = None,
+    retained_tensors: tuple[StagedMediaTensors, ...] | None = None,
 ) -> CapturedMedia:
-    """Remap vLLM placeholders and snapshot per-call media in Megatron's layout."""
+    """Validate retained media and capture only newly appended occurrences.
+
+    Framework-owned continuations also compare processed tensors with their
+    staged predecessors before reusing them in a shared training segment.
+    """
     tokens = engine_prompt["prompt_token_ids"]
     placeholders = engine_prompt.get("mm_placeholders") or {}
     kwargs = engine_prompt.get("mm_kwargs") or {}
@@ -363,8 +450,52 @@ def capture_processed_media(
         raise MediaCaptureRejected("Rendered prefix dropped captured media")
     tensors = None
     if packed:
-        # Retained items come first (sorted by offset, none cross prev_len), so
-        # this call's new media is everything after them.
+        if retained_tensors is not None:
+            assert patch_size is not None
+            full = {
+                "imgs": torch.cat(packed, dim=1),
+                "imgs_sizes": torch.cat(sizes_parts, dim=0),
+            }
+            if occurrences[0][1] == "video":
+                full["num_frames"] = torch.tensor(frame_counts, dtype=torch.int32)
+            # Existing TQ media bundles are ordered along the accepted chain.
+            # Compare without concatenating another copy of historical pixels.
+            offsets = {name: 0 for name in full}
+            for part in retained_tensors:
+                for name, current in full.items():
+                    previous = getattr(part, name)
+                    if previous is None:
+                        raise MediaCaptureRejected(
+                            "Retained media tensor fields changed"
+                        )
+                    axis = 1 if name == "imgs" else 0
+                    length = previous.shape[axis]
+                    start = offsets[name]
+                    actual = current.narrow(axis, start, length).detach().cpu()
+                    if actual.dtype != previous.dtype or not torch.equal(
+                        actual, previous
+                    ):
+                        raise MediaCaptureRejected(
+                            "Retained processed media changed",
+                            code="retained_media_changed",
+                        )
+                    offsets[name] += length
+            frame_count = sum(len(item.imgs_sizes) for item in retained)
+            patch_count = sum(
+                h * w // (patch_size * patch_size)
+                for item in retained
+                for h, w in item.imgs_sizes
+            )
+            if offsets["imgs_sizes"] != frame_count or offsets["imgs"] != patch_count:
+                raise MediaCaptureRejected(
+                    "Retained media tensors do not cover the captured prefix"
+                )
+            if "num_frames" in offsets and offsets["num_frames"] != len(retained):
+                raise MediaCaptureRejected(
+                    "Retained video tensors do not cover the captured prefix"
+                )
+        # Retained occurrences precede all new ones. Reuse the foundation's
+        # per-occurrence slicing rather than infer boundaries from packed data.
         new = slice(len(retained), None)
         if packed[new]:
             delta = {

@@ -172,13 +172,19 @@ def test_media_rows_round_trip_in_a_single_put(tq_client, media_partition):
     # TQ keeps one dtype per field across live rows (a mismatch is swallowed by
     # the controller and drops the row's shape metadata), so the text call's
     # sentinels must share each column's dtype with the real rows.
-    raw = tq_client.get_samples(
-        partition_id=media_partition,
-        sample_ids=[record.staging_key for record in records],
-        select_fields=list(MEDIA_TENSOR_COLUMNS.values()),
-    )
+    # Read rows separately: real patches [N, 3*P*P] and empty [1, 1]
+    # sentinels cannot share one jagged tensor. Production fetch_media also
+    # excludes empty rows before batching real media.
+    raw_rows = [
+        tq_client.get_samples(
+            partition_id=media_partition,
+            sample_ids=[record.staging_key],
+            select_fields=list(MEDIA_TENSOR_COLUMNS.values()),
+        )
+        for record in records
+    ]
     for column in MEDIA_TENSOR_COLUMNS.values():
-        dtypes = {raw[column][i].dtype for i in range(3)}
+        dtypes = {row[column].dtype for row in raw_rows}
         assert len(dtypes) == 1, (column, dtypes)
     # One put per call, each carrying token, flag, and tensor columns.
     assert len(client.puts) == 3

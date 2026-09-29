@@ -66,7 +66,7 @@ def _record(
     return StagedCallRecord(
         **values,
         digest=compute_staging_digest(
-            schema_version=2,
+            schema_version=3,
             digest_version=2,
             extras_digest_version=1,
             **{key: value for key, value in values.items() if key != "extras"},
