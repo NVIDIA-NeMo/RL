@@ -1527,6 +1527,7 @@ class SingleControllerActor:
         clear_unreferenced: bool,
         clear_unreferenced_generation_cuts: bool = False,
         gym_staging_keys: set[str] | None = None,
+        protected_generation_cut_keys: set[str] | None = None,
     ) -> int:
         """Validate staging ownership while the caller holds a stable cut."""
         cut.require_live()
@@ -1555,7 +1556,11 @@ class SingleControllerActor:
                 f"from live TQ state: missing={missing[:10]!r} "
                 f"(total={len(missing)})"
             )
-        unreferenced = sorted(actual_staging_keys - expected_staging_keys)
+        protected_generation_cuts = (
+            protected_generation_cut_keys or set()
+        ).intersection(actual_staging_keys)
+        retained_staging_keys = expected_staging_keys | protected_generation_cuts
+        unreferenced = sorted(actual_staging_keys - retained_staging_keys)
         stale_generation_cuts = [
             key for key in unreferenced if key.startswith(GENERATION_CUT_STAGING_PREFIX)
         ]
@@ -1586,10 +1591,56 @@ class SingleControllerActor:
             )
         print(
             "📦 Rollout-recovery staging inventory validated: "
-            f"referenced={len(expected_staging_keys)}",
+            f"referenced={len(expected_staging_keys)}, "
+            f"protected={len(protected_generation_cuts)}",
             flush=True,
         )
-        return len(expected_staging_keys)
+        return len(retained_staging_keys)
+
+    def _restored_generation_cut_keys_in_use(
+        self,
+        cut: DataPlaneMutationCut,
+    ) -> set[str]:
+        """Protect restored prefixes until their replacement attempt settles.
+
+        A successor Gym checkpoint can omit an old prefix as soon as it hands
+        that prefix to a replacement model call. The model worker may not have
+        fetched the TQ rows yet, so omission from the new checkpoint is not by
+        itself proof that the live rows are obsolete. Once the replacement
+        attempt seals a terminal row, or the ledger advances beyond that
+        attempt, normal generation-cut garbage collection may remove it.
+        """
+        cut.require_live()
+        current_attempts: dict[str, tuple[int, RolloutAttemptStatus]] = {}
+        for group in self._rollout_recovery_ledger.groups():
+            for sibling in group.siblings:
+                rollout_id = group.logical_rollout_id(sibling.generation_index)
+                if rollout_id in current_attempts:
+                    raise RuntimeError(
+                        "rollout recovery contains duplicate logical rollout "
+                        f"identity: rollout_id={rollout_id!r}"
+                    )
+                attempt = sibling.current_attempt
+                current_attempts[rollout_id] = (
+                    attempt.attempt_index,
+                    attempt.status,
+                )
+
+        protected: set[str] = set()
+        for continuation in self._restored_gym_checkpoint_continuations:
+            current = current_attempts.get(continuation.rollout_id)
+            if current is None:
+                continue
+            attempt_index, status = current
+            replacement_index = continuation.replacement_attempt_index
+            replacement_still_live = attempt_index < replacement_index or (
+                attempt_index == replacement_index
+                and status is not RolloutAttemptStatus.SEALED
+            )
+            if replacement_still_live:
+                protected.update(continuation.generation_cut_staging_keys)
+
+        return protected.intersection(self._restored_gym_checkpoint_staging_keys)
 
     async def _maybe_restore_replacement_reserve(self) -> None:
         """Restore spare prompts diverted before the previous run's checkpoint.
@@ -1860,6 +1911,7 @@ class SingleControllerActor:
                 }
             )
             staging_keys.update(continuation.staging_keys)
+            staging_keys.update(continuation.generation_cut_staging_keys)
         if not executions:
             return
 
@@ -4436,6 +4488,9 @@ class SingleControllerActor:
                 clear_unreferenced=False,
                 clear_unreferenced_generation_cuts=True,
                 gym_staging_keys=gym_staging_keys,
+                protected_generation_cut_keys=(
+                    self._restored_generation_cut_keys_in_use(cut)
+                ),
             )
         tq_save_started = time.monotonic()
         await self._save_data_plane_checkpoint(

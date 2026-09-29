@@ -1205,6 +1205,7 @@ class GymCheckpointContinuation:
     capture_key: str
     resource_state_revisions: tuple[tuple[str, int], ...] | None
     staging_keys: tuple[str, ...]
+    generation_cut_staging_keys: tuple[str, ...]
 
     @property
     def replacement_attempt_index(self) -> int:
@@ -1377,28 +1378,36 @@ def gym_checkpoint_continuations(
                 )
             roots_by_capture_key[root.capture_key] = root
 
-    references = {
-        key: reference
-        for key, reference in _gym_checkpoint_external_storage_references(
-            checkpoint_dir,
-            checkpoint,
-        ).items()
-        if reference.kind == "token_capture_staging"
-    }
+    references = _gym_checkpoint_external_storage_references(
+        checkpoint_dir,
+        checkpoint,
+    )
     keys_by_capture_key: dict[str, list[str]] = {}
+    generation_cut_keys_by_capture_key: dict[str, list[str]] = {}
     for key, reference in references.items():
         root = roots_by_capture_key.get(reference.capture_key)
-        if (
-            root is not None
-            and reference.boundary_model_call_id != root.last_committed_model_call_id
-        ):
-            _raise_inconsistent_gym_checkpoint(
-                checkpoint_dir,
-                "Gym external storage reference does not match its agent "
-                "continuation boundary: "
-                f"capture_key={reference.capture_key!r}",
-            )
-        keys_by_capture_key.setdefault(reference.capture_key, []).append(key)
+        if reference.kind == "token_capture_staging":
+            if (
+                root is not None
+                and reference.boundary_model_call_id
+                != root.last_committed_model_call_id
+            ):
+                _raise_inconsistent_gym_checkpoint(
+                    checkpoint_dir,
+                    "Gym external storage reference does not match its agent "
+                    "continuation boundary: "
+                    f"capture_key={reference.capture_key!r}",
+                )
+            keys_by_capture_key.setdefault(reference.capture_key, []).append(key)
+        elif root is not None:
+            # A generation cut names the active model call, not the last
+            # committed boundary. Associate it by capture key without applying
+            # the committed-call boundary check above. Model-only cuts with no
+            # agent continuation remain part of the TQ inventory but have no
+            # restored agent attempt to protect in Single Controller.
+            generation_cut_keys_by_capture_key.setdefault(
+                reference.capture_key, []
+            ).append(key)
     unknown_capture_keys = set(keys_by_capture_key) - set(roots_by_capture_key)
     if unknown_capture_keys:
         _raise_inconsistent_gym_checkpoint(
@@ -1418,6 +1427,9 @@ def gym_checkpoint_continuations(
                 else None
             ),
             staging_keys=tuple(sorted(keys_by_capture_key.get(root.capture_key, []))),
+            generation_cut_staging_keys=tuple(
+                sorted(generation_cut_keys_by_capture_key.get(root.capture_key, []))
+            ),
         )
         for root in sorted(
             roots_by_capture_key.values(),
