@@ -30,8 +30,6 @@ import torch
 if TYPE_CHECKING:
     from nemo_rl.models.generation.openai_server_utils import PrefixSplice
 
-MEDIA_SPANS_FIELD = "media_spans"
-
 
 class MediaCaptureRejected(ValueError):
     """A captured call's media cannot be staged; the request is rejected before inference.
@@ -161,6 +159,11 @@ def pack_images(
 
     This only rearranges processed pixels, preserving dtype and values. Frames
     remain in order and their temporal grouping travels separately in num_frames.
+
+    Mirrors ``NemotronOmniModel._patchify_dynamic_images`` in Megatron-Bridge
+    (the vLLM worker env has no Bridge);
+    ``test_captured_media_pack_images_matches_bridge_patchify`` (mcore lane)
+    guards the two against drift.
     """
     if (
         patch_size <= 0
@@ -227,10 +230,6 @@ def capture_processed_media(
     patch_size: int | None = None,
 ) -> CapturedMedia:
     """Remap vLLM placeholders and snapshot per-call media in Megatron's layout."""
-    # The data-plane module has optional Gym dependencies and is only needed
-    # when captured rollouts normalize their engine-owned media.
-    from nemo_rl.data_plane.tq_token_sink import slice_media_tensors
-
     tokens = engine_prompt["prompt_token_ids"]
     placeholders = engine_prompt.get("mm_placeholders") or {}
     kwargs = engine_prompt.get("mm_kwargs") or {}
@@ -364,14 +363,16 @@ def capture_processed_media(
         raise MediaCaptureRejected("Rendered prefix dropped captured media")
     tensors = None
     if packed:
-        full = {
-            "imgs": torch.cat(packed, dim=1),
-            "imgs_sizes": torch.cat(sizes_parts, dim=0),
-        }
-        if occurrences[0][1] == "video":
-            full["num_frames"] = torch.tensor(frame_counts, dtype=torch.int32)
-        delta = slice_media_tensors(full, len(retained))
-        if delta is not None:
+        # Retained items come first (sorted by offset, none cross prev_len), so
+        # this call's new media is everything after them.
+        new = slice(len(retained), None)
+        if packed[new]:
+            delta = {
+                "imgs": torch.cat(packed[new], dim=1),
+                "imgs_sizes": torch.cat(sizes_parts[new], dim=0),
+            }
+            if occurrences[0][1] == "video":
+                delta["num_frames"] = torch.tensor(frame_counts[new], dtype=torch.int32)
             tensors = {
                 name: tensor.detach().cpu().clone() for name, tensor in delta.items()
             }

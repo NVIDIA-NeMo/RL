@@ -160,8 +160,8 @@ def _trainer_media(staged: StagedMediaTensors) -> dict[str, PackedTensor]:
     """Wrap the engine's media tensors as the trainer's one-row PackedTensors.
 
     ``pixel_values`` keeps MInf's packed-patch layout: ``[total_patches, C*P*P]``
-    per row, so rows concatenate along dim 0 with no padding. The learner
-    restores Bridge's singleton batch dimension before its forward call. ``imgs_sizes`` and
+    per row, so rows concatenate along dim 0 with no padding. Bridge's
+    ``_patchify_dynamic_images`` accepts that 2-D layout directly. ``imgs_sizes`` and
     ``num_frames`` mirror what ``extract_multimodal_model_inputs`` emits on the
     token-echo path (stills get one frame per image).
     """

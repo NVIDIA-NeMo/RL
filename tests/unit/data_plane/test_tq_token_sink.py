@@ -65,12 +65,12 @@ from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     TQTokenSource,
     resolve_admission_prefix,
     resolve_admission_prefix_chains,
-    slice_media_tensors,
 )
 from nemo_rl.models.generation.megatron.token_capture import (  # noqa: E402
     TQMegatronPromptPreparer,
     TQMegatronTokenStager,
     _MegatronCapturePayload,
+    slice_media_tensors,
 )
 from tests.unit.data_plane.token_capture_test_fixtures import (  # noqa: E402
     build_fixture_artifacts,

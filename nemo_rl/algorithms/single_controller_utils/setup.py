@@ -172,8 +172,6 @@ class SingleControllerActorArgs:
     # Defaulted fields must follow the required ones above, so these stay last.
     data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = None
     partition_includes_multimodal_fields: bool = False
-    # Whether the staging partition carries captured media columns.
-    staging_partition_includes_media: bool = False
     bootstrap_identity: Optional[BootstrapCompatibilityIdentity] = None
     rollout_checkpoint_load_metrics: Optional[dict[str, float]] = None
     # None when async_rl.generation_fleet_health is disabled; the SingleController
@@ -304,18 +302,18 @@ def _register_single_controller_partitions(
     master_config: MasterConfig,
     partition_id: str,
     include_multimodal_fields: bool,
-    capture_media: bool = False,
 ) -> None:
     """Warm all SingleController partitions before concurrent data-plane use.
 
-    ``capture_media`` adds the media columns the generation workers (vLLM or
-    Megatron Inference) stage beside each captured call to the staging
-    partition (VLM token capture only).
+    VLM token capture (``include_multimodal_fields`` with capture enabled) adds
+    the media columns the generation workers (vLLM or Megatron Inference) stage
+    beside each captured call to the staging partition.
     """
     algo_cfg = algo_config(master_config)
     policy_config = master_config.policy
     token_capture_cfg = master_config.token_capture
     r3_enabled = router_replay_enabled(policy_config)
+    capture_media = token_capture_cfg.enabled and include_multimodal_fields
     group_size = algo_cfg.num_generations_per_prompt
     num_rollout_samples = master_config.async_rl.max_buffered_rollouts * group_size
 
@@ -1985,11 +1983,10 @@ def setup_single_controller(
             master_config=master_config,
             partition_id=partition_id,
             include_multimodal_fields=processor is not None,
-            capture_media=capture_media,
         )
     if token_capture_cfg.enabled:
-        # Both active backends stage canonical Gym rows in serving workers;
-        # only vLLM workers stage captured media beside them (capture_media).
+        # Both active backends stage canonical Gym rows, and captured media
+        # beside them (capture_media), in serving workers.
         generation.setup_token_capture(
             dp_config,
             token_capture_cfg.staging_partition,
@@ -2117,7 +2114,6 @@ def setup_single_controller(
         last_checkpoint_path=recovery_checkpoint_path,
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
         partition_includes_multimodal_fields=processor is not None,
-        staging_partition_includes_media=capture_media,
         bootstrap_identity=bootstrap_identity,
         rollout_checkpoint_load_metrics=rollout_checkpoint_load_metrics,
         finalizer_actors=finalizer_actors,

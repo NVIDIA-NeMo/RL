@@ -449,9 +449,7 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   rows share the existing checkpoint and cleanup lifecycle. TQ has no
   transactional rollback: a failed combined write is discarded best-effort by
   the sink, and a failed discard is logged at ERROR.
-  Upgrade the paired Gym and RL changes together; checkpoints written with the
-  former `media_capture`/tensor-attachment format or with the two-write
-  `media_geometry_json` layout, or without `media_metadata_digest`, are not compatible. The GB200 functional shard
+  Upgrade the paired Gym and RL changes together. The GB200 functional shard
   `L1_Functional_Tests_GB200_Vllm_Omni_Single_Controller.sh` smokes this path
   end to end (CLEVR-style images through Gym `string_match`, native video
   through Gym `mcqa`) and gates on `train/finalize/media_row_rate == 1`, the

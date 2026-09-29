@@ -43,7 +43,6 @@ from nemo_rl.data_plane.tq_token_sink import (
     TQTokenSink,
     TQTokenSource,
     resolve_admission_prefix_chains,
-    slice_media_tensors,
 )
 from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
 
@@ -186,6 +185,74 @@ class TQMegatronPromptPreparer:
         return RequestPromptPreparationResult(
             prompt=prompt, offload_params=updated_offload_params
         )
+
+
+def slice_media_tensors(
+    media_tensors: dict[str, Any] | None, prev_count: int
+) -> dict[str, Any] | None:
+    """Drop the first ``prev_count`` media items from the engine's media tensors.
+
+    Every chat request carries the whole conversation, so the engine hands the
+    stager pixels for every image in the prompt. The parent chain already
+    staged the first ``prev_count`` of them; this keeps only the rest so media
+    columns are per-call deltas like the token columns.
+
+    Item boundaries come from the tensors themselves: ``num_frames`` (frames per
+    video) when present, else one row of ``imgs_sizes`` per image. For packed
+    patches (``imgs`` as ``[1, total_patches, C*P*P]``) the patch count per row
+    is ``h*w/P**2`` with ``P**2`` recovered from the totals.
+    """
+    if not media_tensors or prev_count <= 0:
+        return media_tensors
+    imgs = media_tensors.get("imgs")
+    imgs_sizes = media_tensors.get("imgs_sizes")
+    num_frames = media_tensors.get("num_frames")
+    if imgs is None:
+        return media_tensors
+    if imgs_sizes is None:
+        raise ValueError("media delta requires imgs_sizes to locate items")
+
+    if num_frames is not None:
+        total_items = int(num_frames.numel())
+    else:
+        total_items = int(imgs_sizes.reshape(-1, 2).shape[0])
+    if prev_count > total_items:
+        raise ValueError(
+            f"media_prev_count {prev_count} exceeds the {total_items} media items "
+            "the engine saw"
+        )
+    if prev_count == total_items:
+        return None
+
+    # Rows of imgs_sizes / imgs covered by the parent chain.
+    if num_frames is not None:
+        prev_rows = int(num_frames.reshape(-1)[:prev_count].sum().item())
+    else:
+        prev_rows = prev_count
+
+    sliced: dict[str, Any] = {}
+    if imgs.ndim == 3 and imgs.shape[0] == 1:
+        # Packed patches: recover patches-per-row from sizes and the total.
+        sizes = imgs_sizes.reshape(-1, 2).to(torch.int64)
+        areas = sizes[:, 0] * sizes[:, 1]
+        total_area = int(areas.sum().item())
+        total_patches = int(imgs.shape[1])
+        if total_patches == 0 or total_area % total_patches:
+            raise ValueError(
+                f"packed patches {total_patches} do not divide the media area {total_area}"
+            )
+        patch_area = total_area // total_patches
+        prev_area = int(areas[:prev_rows].sum().item())
+        if prev_area % patch_area:
+            raise ValueError("parent media does not end on a patch boundary")
+        sliced["imgs"] = imgs[:, prev_area // patch_area :, :]
+    else:
+        # Padded pixels [N, C, H, W]: one row per frame.
+        sliced["imgs"] = imgs[prev_rows:]
+    sliced["imgs_sizes"] = imgs_sizes.reshape(-1, 2)[prev_rows:]
+    if num_frames is not None:
+        sliced["num_frames"] = num_frames.reshape(-1)[prev_count:]
+    return sliced
 
 
 @dataclass(frozen=True)

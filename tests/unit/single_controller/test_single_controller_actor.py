@@ -165,7 +165,6 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         finalizer_actors=[],
         data_plane_checkpoint_metadata=None,
         partition_includes_multimodal_fields=False,
-        staging_partition_includes_media=False,
         bootstrap_identity=None,
         rollout_checkpoint_load_metrics=None,
     )
@@ -262,9 +261,9 @@ def test_fresh_mooncake_init_registers_partition(
     assert controller._data_plane_checkpoint_metadata is None
 
 
-@pytest.mark.parametrize("capture_media", [False, True])
+@pytest.mark.parametrize("multimodal", [False, True])
 def test_fresh_mooncake_init_preserves_token_capture_and_multimodal_partitions(
-    monkeypatch, tmp_path, capture_media
+    monkeypatch, tmp_path, multimodal
 ) -> None:
     monkeypatch.setattr(single_controller, "Logger", lambda _: MagicMock())
     monkeypatch.setattr(single_controller, "configure_checkpoint_workers", MagicMock())
@@ -274,8 +273,7 @@ def test_fresh_mooncake_init_preserves_token_capture_and_multimodal_partitions(
     master_config.token_capture.enabled = True
     actor_args = _actor_args_for_init(
         dp_client=dp_client,
-        partition_includes_multimodal_fields=True,
-        staging_partition_includes_media=capture_media,
+        partition_includes_multimodal_fields=multimodal,
     )
 
     _init_controller(master_config, actor_args)
@@ -284,13 +282,17 @@ def test_fresh_mooncake_init_preserves_token_capture_and_multimodal_partitions(
     canonical_call, staging_call = dp_client.register_partition.call_args_list
     assert canonical_call.kwargs["partition_id"] == "rollout_data"
     assert set(DP_TRAIN_FIELDS).issubset(canonical_call.kwargs["fields"])
-    assert set(WIRE_MULTIMODAL_FIELDS).issubset(canonical_call.kwargs["fields"])
+    assert (
+        set(WIRE_MULTIMODAL_FIELDS).issubset(canonical_call.kwargs["fields"])
+        is multimodal
+    )
     assert staging_call.kwargs["partition_id"] == (
         master_config.token_capture.staging_partition
     )
     # The actor-side warm-up must register the same media columns the
     # driver-side path does, or a Mooncake run would stage into missing fields.
-    expected_media = list(MEDIA_STAGING_FIELDS) if capture_media else []
+    # Media columns are derived from the multimodal bit, not passed separately.
+    expected_media = list(MEDIA_STAGING_FIELDS) if multimodal else []
     assert staging_call.kwargs["fields"] == list(STAGING_FIELDS) + expected_media
 
 

@@ -386,7 +386,7 @@ def pytest_sessionstart(session):
 
 def pytest_sessionfinish(session, exitstatus):
     # run_unit.sh treats exit 5 as success for ordinary shards. The common lane
-    # must fail if its dependency tests were all skipped or deselected.
+    # must fail if every dependency test was deselected or skipped at import.
     if (
         session.config.getoption("--vllm-only")
         and session.config.getoption("--nemo-gym-only")

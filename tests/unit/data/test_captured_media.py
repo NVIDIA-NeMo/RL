@@ -24,7 +24,10 @@ import torch
 
 pytest.importorskip("nemo_gym.token_id_capture.staging")
 
-from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
+from nemo_gym.token_id_capture.adapters.vllm import (
+    MEDIA_SPANS_FIELD,
+    VLLMCaptureAdapter,
+)
 from nemo_gym.token_id_capture.staging.capture import RolloutTokenCapture
 from nemo_gym.token_id_capture.staging.records import (
     CallRecord,
@@ -33,7 +36,6 @@ from nemo_gym.token_id_capture.staging.records import (
 )
 
 from nemo_rl.data.captured_media import (
-    MEDIA_SPANS_FIELD,
     MediaCaptureRejected,
     pack_images,
 )
@@ -301,6 +303,7 @@ def test_publication_packs_mixed_rows_and_cleans_all_call_media(dp):
         ("dtype", "invalid_media_columns:"),
         ("frames_flag", "invalid_media_columns:"),
         ("orphan_frames_flag", "invalid_staging_row:"),
+        ("metadata_digest", "invalid_staging_row:"),
     ],
 )
 def test_missing_or_corrupt_media_rejects_rollout(dp, corruption, reason):
@@ -317,6 +320,9 @@ def test_missing_or_corrupt_media_rejects_rollout(dp, corruption, reason):
     elif corruption == "frames_flag":
         # A still flagged as video reads the all-zero num_frames sentinel.
         stored[MEDIA_HAS_FRAMES_FIELD] = torch.tensor(True)
+    elif corruption == "metadata_digest":
+        # The finalizer must reject, not crash, on a checksum mismatch.
+        stored[MEDIA_METADATA_DIGEST_FIELD][0] ^= 1
     else:
         stored[MEDIA_PRESENT_FIELD] = torch.tensor(False)
         stored[MEDIA_HAS_FRAMES_FIELD] = torch.tensor(True)
