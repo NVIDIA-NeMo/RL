@@ -1010,7 +1010,7 @@ class AsyncNemoGymRolloutImpl:
         )
         # Token-capture receipt rows carry empty message logs by design — the
         # canonical row is rebuilt by the finalizer from the capture ledger, and
-        # a multimodal rollout's media is staged by the Megatron worker as extra
+        # a multimodal rollout's media is staged by the generation worker as extra
         # columns on the call row (tq_token_sink.MEDIA_STAGING_FIELDS), so there
         # is nothing here to attach media to and the fewer-user-turns guard would
         # reject every receipt group.

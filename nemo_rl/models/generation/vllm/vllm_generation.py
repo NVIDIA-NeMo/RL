@@ -73,6 +73,7 @@ from nemo_rl.weight_sync.membership import RefitMembership
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
+    from nemo_rl.data_plane.interfaces import DataPlaneConfig
 
 logger = logging.getLogger(__name__)
 
@@ -635,7 +636,7 @@ class VllmGeneration(GenerationInterface):
 
     def setup_token_capture(
         self,
-        dp_cfg: dict[str, Any],
+        dp_cfg: "DataPlaneConfig",
         staging_partition: str,
         *,
         capture_media: bool = False,

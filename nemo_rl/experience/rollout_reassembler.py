@@ -291,8 +291,8 @@ class RolloutReassembler:
             return rejected(f"rollout_failed:{parsed.failure_reason}", staging_keys)
         if parsed.capture_poisoned:
             return rejected("capture_poisoned", staging_keys)
-        if not parsed.manifest:
-            return rejected("empty_manifest", staging_keys)
+        # An unpoisoned receipt must name a terminal call that is in the manifest
+        # (RolloutReceipt validators), so a valid receipt here is never empty.
         if len(set(staging_keys)) != len(staging_keys):
             return rejected(
                 "duplicate_staging_key",
@@ -601,25 +601,24 @@ class RolloutReassembler:
         # on a declaring harness is a regression signal. Failed selections
         # stamp the last stage attempted, so masked rollouts stay visible in
         # their method's bucket (cross-reference finalize/invalid_row_rate).
-        # Method list is derived from Gym's own type rather than hand-copied,
-        # so a new resolution method Gym adds gets a bucket automatically
-        # instead of silently missing from these metrics.
+        # Receipts whose manifest never parsed carry no method (None) and
+        # fall in no bucket. Method list is derived from Gym's own type
+        # rather than hand-copied, so a new resolution method Gym adds gets a
+        # bucket automatically instead of silently missing from these
+        # metrics; the annotation is ``Literal[...] | None``, so unwrap the
+        # Literal and skip the None member.
         from typing import Literal, get_args, get_origin
 
         from nemo_gym.token_id_capture.staging.records import RolloutReceipt
 
-        # Gym declares the field as ``Literal[...]`` or ``Literal[...] | None``
-        # (optional since Gym #2823); unwrap the union so the method names, not
-        # the union members, name the buckets.
-        annotation = RolloutReceipt.model_fields["terminal_selection"].annotation
-        terminal_selection_methods: list[str] = []
-        for member in (
-            get_args(annotation)
-            if get_origin(annotation) is not Literal
-            else (annotation,)
-        ):
-            if get_origin(member) is Literal:
-                terminal_selection_methods.extend(get_args(member))
+        terminal_selection_methods = tuple(
+            method
+            for member in get_args(
+                RolloutReceipt.model_fields["terminal_selection"].annotation
+            )
+            if get_origin(member) is Literal
+            for method in get_args(member)
+        )
         for method in terminal_selection_methods:
             method_receipts = sum(
                 1

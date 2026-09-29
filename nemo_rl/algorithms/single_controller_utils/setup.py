@@ -1972,9 +1972,8 @@ def setup_single_controller(
             capture_media=capture_media,
         )
     if token_capture_cfg.enabled:
-        # Host Gym's capture core in every vLLM DP leader (in-worker DP
-        # client + TQTokenSink + the single install_capture call), and give
-        # workers the initial weight version to stamp on captured calls.
+        # Both active backends stage canonical Gym rows in serving workers;
+        # only vLLM workers stage captured media beside them (capture_media).
         generation.setup_token_capture(
             dp_config,
             token_capture_cfg.staging_partition,

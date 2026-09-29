@@ -43,7 +43,11 @@ def replace_prefix_tokens(
     *,
     eos_token_id: int | None = None,
 ) -> list[int]:
-    """Replace a rendered history with the exact previously generated tokens."""
+    """Replace a rendered history with the exact previously generated tokens.
+
+    Thin wrapper over :func:`splice_prefix_tokens` for callers that only need
+    the spliced ids; see that function for the algorithm and ``eos_token_id``.
+    """
     return splice_prefix_tokens(
         tokenizer=tokenizer,
         model_prefix_token_ids=model_prefix_token_ids,

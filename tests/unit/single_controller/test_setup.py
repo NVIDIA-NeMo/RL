@@ -1858,7 +1858,7 @@ class TestSetup:
             patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
             patch.object(
                 sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
-            ),
+            ) as mock_spinup,
             patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
             patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
             patch.object(sc_setup_mod, "uses_image_placeholder", return_value=True),
@@ -1889,6 +1889,10 @@ class TestSetup:
             assert set(MEDIA_STAGING_FIELDS) <= staging_fields
         else:
             assert set(MEDIA_STAGING_FIELDS).isdisjoint(staging_fields)
+        assert mc.token_capture.generation_backend == "vllm"
+        assert mock_spinup.call_args.kwargs["token_capture"]["generation_backend"] == (
+            "vllm"
+        )
         # The worker fan-out receives the same capability bit.
         generation, _ = patched_factories["_build_generation"].return_value
         _, setup_kwargs = generation.setup_token_capture.call_args

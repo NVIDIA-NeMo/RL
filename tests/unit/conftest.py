@@ -96,10 +96,14 @@ def pytest_collection_modifyitems(config, items):
         run_trtllm_only,
         run_nemo_gym_only,
     ]
-    if sum(exclusive_options) > 1:
+    combined_vllm_gym = (
+        run_vllm_only and run_nemo_gym_only and sum(exclusive_options) == 2
+    )
+    if sum(exclusive_options) > 1 and not combined_vllm_gym:
         raise ValueError(
             "--mcore-only, --automodel-only, --vllm-only, --sglang-only, "
-            "--trtllm-only, and --nemo-gym-only are mutually exclusive"
+            "--trtllm-only, and --nemo-gym-only are mutually exclusive, except "
+            "--vllm-only --nemo-gym-only selects tests requiring both dependencies"
         )
 
     marker_expr = config.getoption("-m", default="")
@@ -381,6 +385,15 @@ def pytest_sessionstart(session):
 
 
 def pytest_sessionfinish(session, exitstatus):
+    # run_unit.sh treats exit 5 as success for ordinary shards. The common lane
+    # must fail if its dependency tests were all skipped or deselected.
+    if (
+        session.config.getoption("--vllm-only")
+        and session.config.getoption("--nemo-gym-only")
+        and exitstatus == pytest.ExitCode.NO_TESTS_COLLECTED
+    ):
+        exitstatus = session.exitstatus = pytest.ExitCode.USAGE_ERROR
+        print("The combined vLLM + Gym shard collected no tests")
     if not hasattr(session.config, "_unit_test_data"):
         return
 

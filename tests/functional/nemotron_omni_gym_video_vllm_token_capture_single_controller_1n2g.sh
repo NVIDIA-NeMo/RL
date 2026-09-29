@@ -78,6 +78,8 @@ uv run --no-sync examples/nemo_gym/prepare_video_dataset.py convert \
 
 # SingleController requires disaggregated generation: one GPU trains the
 # frozen-decoder policy, one GPU hosts async vLLM (TP1) with the capture host.
+# Cap KV cache at 32 GiB to leave room for weight refits even when vLLM's
+# automatic memory profiling underestimates non-Torch allocations.
 uv run --no-sync python examples/run_grpo_single_controller.py \
     --config examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-16n8g-megatron-tp4ep4-async-gym-video.v1.yaml \
     cluster.num_nodes=1 \
@@ -121,7 +123,7 @@ uv run --no-sync python examples/run_grpo_single_controller.py \
     policy.generation.vllm_cfg.video.temporal_patch_size=2 \
     policy.generation.vllm_kwargs.allowed_local_media_path="${DATA_ROOT}" \
     policy.generation.vllm_kwargs.limit_mm_per_prompt.video.num_frames=8 \
-    ++async_rl.generation_fleet_health.refit_timeout_s=null \
+    ++policy.generation.vllm_kwargs.kv_cache_memory_bytes=34359738368 \
     ++token_capture.enabled=true \
     policy.max_total_sequence_length=4096 \
     data.default.num_frames=8 \

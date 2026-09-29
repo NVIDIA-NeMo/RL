@@ -14,7 +14,7 @@
 """TransferQueue implementations of NeMo-Gym's token staging protocols.
 
 ``TQStagingStore`` is NeMo RL's single keyed-row transport for token custody.
-Inference workers write canonical Gym call deltas through ``TQTokenSink``.
+Both vLLM and MInf write canonical Gym call deltas through ``TQTokenSink``.
 This module is the only hot-path file that knows tokens live in TQ; Gym sees
 opaque staging keys.
 
@@ -34,6 +34,7 @@ use.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -75,7 +76,7 @@ from nemo_rl.experience.route_assembly import RouteFragment
 # on both sides and pass that check silently.
 # Media the engine's vision encoder consumed, staged in the *same* put as the
 # token columns (``TQTokenSink.stage`` with attachments). Every row of a
-# media-enabled staging partition carries all of these columns: two bool flags
+# media-enabled staging partition carries two bool flags, a metadata checksum,
 # and three tensor columns. Tensors keep their native shape and dtype on the
 # wire (TQ adds its row dimension): ``media_imgs`` is ``[total_patches, 3*P*P]``
 # per row in the engine's float dtype, ``media_imgs_sizes`` ``[N, 2]`` int32,
@@ -90,13 +91,15 @@ MEDIA_HAS_FRAMES_FIELD = "media_has_frames"
 MEDIA_IMGS_FIELD = "media_imgs"
 MEDIA_IMGS_SIZES_FIELD = "media_imgs_sizes"
 MEDIA_NUM_FRAMES_FIELD = "media_num_frames"
+MEDIA_METADATA_DIGEST_FIELD = "media_metadata_digest"
 MEDIA_TENSOR_COLUMNS: dict[str, str] = {
     "imgs": MEDIA_IMGS_FIELD,
     "imgs_sizes": MEDIA_IMGS_SIZES_FIELD,
     "num_frames": MEDIA_NUM_FRAMES_FIELD,
 }
 MEDIA_FLAG_FIELDS = [MEDIA_PRESENT_FIELD, MEDIA_HAS_FRAMES_FIELD]
-MEDIA_STAGING_FIELDS = [*MEDIA_FLAG_FIELDS, *MEDIA_TENSOR_COLUMNS.values()]
+MEDIA_METADATA_FIELDS = [*MEDIA_FLAG_FIELDS, MEDIA_METADATA_DIGEST_FIELD]
+MEDIA_STAGING_FIELDS = [*MEDIA_METADATA_FIELDS, *MEDIA_TENSOR_COLUMNS.values()]
 _MEDIA_REQUIRED = ("imgs", "imgs_sizes")
 _MEDIA_PIXEL_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _MEDIA_INDEX_DTYPES = (torch.int32, torch.int64)
@@ -147,6 +150,10 @@ STAGING_FIELDS = [
 
 _MODE_TO_CODE = {"text": 0, "token_in": 1}
 _CODE_TO_MODE = {code: mode for mode, code in _MODE_TO_CODE.items()}
+
+
+class MediaMetadataIntegrityError(ValueError):
+    """Stored media metadata does not match its framework-owned checksum."""
 
 
 def _bytes_tensor(value: bytes) -> torch.Tensor:
@@ -347,9 +354,7 @@ class TQStagingStore:
             "put_samples",
             sample_ids=[key],
             partition_id=self._staging_partition,
-            fields=TensorDict(
-                {name: tensor for name, tensor in field_dict.items()}, batch_size=[1]
-            ),
+            fields=TensorDict(field_dict, batch_size=[1]),
             tags=[tags or {}],
         )
 
@@ -532,14 +537,19 @@ class TQTokenSink:
                     [[0]], dtype=torch.int64
                 )
                 field_dict[COMPACT_LEN_FIELD] = torch.tensor([0], dtype=torch.int64)
-            field_dict[ROUTED_EXTRAS_METADATA_FIELD] = _bytes_tensor(
-                json.dumps(
-                    extras_metadata,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    ensure_ascii=False,
-                ).encode("utf-8")
-            )
+            metadata_json = json.dumps(
+                extras_metadata,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+            field_dict[ROUTED_EXTRAS_METADATA_FIELD] = _bytes_tensor(metadata_json)
+            if self._capture_media:
+                # Detect metadata corruption without loading route or pixel tensors.
+                # This checksum is independent of Gym's combined extras commitment.
+                field_dict[MEDIA_METADATA_DIGEST_FIELD] = _bytes_tensor(
+                    hashlib.sha256(metadata_json).digest()
+                )
             routed_len = 0
             routed_encoding = ROUTE_ENCODING_NONE
             if routed is not None:
@@ -787,8 +797,27 @@ class ChainPrefixCache:
             self._source = source
             self._cache.clear()
 
+    def fetch(self, staging_chain: list[str]) -> list[int]:
+        """Assemble the flat (expanded) prefix token ids from staging_chain.
+
+        The vLLM worker's path: it reads only ``fetch_prefix_token_ids``. A
+        worker uses either this or ``fetch_chains``, never both, so the
+        compact side of an entry cached here (a copy of the expanded ids) is
+        never read.
+        """
+        return self._fetch(
+            staging_chain,
+            lambda source, keys: _flat_chains(source.fetch_prefix_token_ids(keys)),
+        ).expanded
+
     def fetch_chains(self, staging_chain: list[str]) -> PrefixChains:
-        """Assemble both prefix spaces from staging_chain, with a worker-local FIFO (256-entry) cache."""
+        """Assemble both prefix spaces from staging_chain (the Megatron preparer's path)."""
+        return self._fetch(
+            staging_chain, lambda source, keys: source.fetch_prefix_chains(keys)
+        )
+
+    def _fetch(self, staging_chain: list[str], fetch_misses: Any) -> PrefixChains:
+        """Resolve staging_chain through a worker-local FIFO (256-entry) cache."""
         cache = self._cache
         with self._lock:
             source = self._source
@@ -808,7 +837,7 @@ class ChainPrefixCache:
                 "staging source not initialized; call setup_token_capture() first"
             )
         # TQ read stays outside the lock so concurrent fetches overlap.
-        fetched = source.fetch_prefix_chains(miss_keys)
+        fetched = fetch_misses(source, miss_keys)
         result = cached + fetched
         last_key = staging_chain[-1]
         with self._lock:
@@ -818,6 +847,22 @@ class ChainPrefixCache:
         return PrefixChains(
             list(result.expanded), list(result.compact), result.media_count
         )
+
+
+def _flat_chains(token_ids: list[int]) -> PrefixChains:
+    """A text-only chain: the compact form is the expanded one."""
+    return PrefixChains(expanded=list(token_ids), compact=list(token_ids))
+
+
+def resolve_admission_prefix(
+    admission: Any, chain_prefix: ChainPrefixCache
+) -> list[int]:
+    """Resolve a ``CaptureAdmission`` to the flat prefix the engine prompt starts with."""
+    if admission.mode == "text":
+        return []
+    if admission.staging_chain:
+        return chain_prefix.fetch(list(admission.staging_chain))
+    return list(admission.required_prefix_token_ids)
 
 
 def resolve_admission_prefix_chains(
@@ -1022,7 +1067,7 @@ class TQTokenSource:
         # columns so the finalizer can select tensor rows without a probe.
         select_fields = list(STAGING_FIELDS)
         if self._capture_media:
-            select_fields += MEDIA_FLAG_FIELDS
+            select_fields += MEDIA_METADATA_FIELDS
         try:
             if include_route_fragments:
                 # Route payloads are optional per run (feature-gated at the
@@ -1078,7 +1123,7 @@ class TQTokenSource:
                     fragment=(
                         _row_to_route_fragment(row) if include_route_fragments else None
                     ),
-                    extras=_row_extras(row),
+                    extras=_row_extras(row, verify_media=self._capture_media),
                     media_present=media_present,
                     media_has_frames=media_has_frames,
                 )
@@ -1175,9 +1220,23 @@ def _row_to_base_snapshot(row: Any) -> StagedCallBaseSnapshot:
     )
 
 
-def _row_extras(row: Any) -> dict[str, Any] | None:
-    """Decode the staged extras JSON (None for ``null`` / absent extras)."""
-    decoded = json.loads(_row_text(row, ROUTED_EXTRAS_METADATA_FIELD))
+def _row_extras(row: Any, *, verify_media: bool) -> dict[str, Any] | None:
+    """Verify media-partition metadata before exposing the decoded extras."""
+    metadata_json = bytes(_row_leaf(row, ROUTED_EXTRAS_METADATA_FIELD).tolist())
+    if verify_media:
+        try:
+            checksum = _row_leaf(row, MEDIA_METADATA_DIGEST_FIELD)
+        except KeyError as error:
+            raise MediaMetadataIntegrityError(
+                "Missing media metadata checksum"
+            ) from error
+        if (
+            checksum.dtype != torch.uint8
+            or checksum.numel() != 32
+            or bytes(checksum.tolist()) != hashlib.sha256(metadata_json).digest()
+        ):
+            raise MediaMetadataIntegrityError("Media metadata checksum mismatch")
+    decoded = json.loads(metadata_json)
     if decoded is None:
         return None
     if not isinstance(decoded, dict):

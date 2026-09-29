@@ -57,7 +57,7 @@ from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     COMPACT_PREV_LEN_KEY,
     COMPACT_TOKEN_IDS_EXTRAS_KEY,
     COMPACT_TOKEN_IDS_FIELD,
-    MEDIA_FLAG_FIELDS,
+    MEDIA_METADATA_FIELDS,
     MEDIA_PREV_COUNT_KEY,
     MEDIA_STAGING_FIELDS,
     MEDIA_TENSOR_COLUMNS,
@@ -68,6 +68,7 @@ from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     TQStagingStore,
     TQTokenSink,
     TQTokenSource,
+    resolve_admission_prefix,
     resolve_admission_prefix_chains,
     slice_media_tensors,
 )
@@ -205,7 +206,7 @@ def test_media_rows_round_trip_in_a_single_put(tq_client, media_partition):
 
     keys = [record.staging_key for record in records]
     fetched = source.fetch_for_finalization(keys)
-    assert client.gets[-1] == STAGING_FIELDS + MEDIA_FLAG_FIELDS
+    assert client.gets[-1] == STAGING_FIELDS + MEDIA_METADATA_FIELDS
     assert [item.media_present for item in fetched] == [True, True, False]
     assert [item.media_has_frames for item in fetched] == [False, True, False]
 
@@ -1488,6 +1489,43 @@ def test_chain_prefix_cache_evicts_oldest_insertion_past_256_entries():
     assert len(source.calls) == calls_before
     cache.fetch_chains(["k0"])
     assert len(source.calls) == calls_before + 1
+
+
+def test_chain_prefix_cache_flat_fetch_reads_only_expanded_token_ids():
+    """The vLLM worker's flat path uses ``fetch_prefix_token_ids`` alone."""
+
+    class _FlatSource:
+        def __init__(self):
+            self.calls = []
+
+        def fetch_prefix_token_ids(self, keys):
+            self.calls.append(list(keys))
+            return [int(k[1:]) * 10 + i for k in keys for i in range(2)]
+
+    source = _FlatSource()
+    cache = ChainPrefixCache(source)
+
+    assert cache.fetch(["k1", "k2"]) == [10, 11, 20, 21]
+    assert cache.fetch(["k1", "k2", "k3"]) == [10, 11, 20, 21, 30, 31]
+    assert cache.fetch(["k1", "k2"]) == [10, 11, 20, 21]
+    assert source.calls == [["k1", "k2"], ["k3"]]
+
+
+def test_resolve_admission_prefix_dispatches_like_the_vllm_worker():
+    source = _RecordingSource()
+    cache = ChainPrefixCache(source)
+    text = SimpleNamespace(mode="text", staging_chain=[], required_prefix_token_ids=[])
+    inline = SimpleNamespace(
+        mode="token_in", staging_chain=[], required_prefix_token_ids=[7, 8]
+    )
+    chained = SimpleNamespace(
+        mode="token_in", staging_chain=["k1"], required_prefix_token_ids=[]
+    )
+
+    assert resolve_admission_prefix(text, cache) == []
+    assert resolve_admission_prefix(inline, cache) == [7, 8]
+    assert resolve_admission_prefix(chained, cache) == [10, 11]
+    assert source.calls == [["k1"]]
 
 
 def test_resolve_admission_prefix_chains_dispatches_on_admission_shape():
