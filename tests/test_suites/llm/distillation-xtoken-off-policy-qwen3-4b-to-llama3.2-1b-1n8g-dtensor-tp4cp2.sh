@@ -73,5 +73,6 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
         'mean(data["train/accuracy"], -5, -1) > 0.80' \
         'data["validation/kl_loss"]["100"] < 0.04' \
         'data["validation/kl_loss"]["100"] < 0.65 * data["validation/kl_loss"]["0"]' \
+        'mean(data["timing/train/total_step_time"], -5, -1) < 8' \
         'max(data["ray/node.0.gpu.0.mem_gb"]) < 30'
 fi
