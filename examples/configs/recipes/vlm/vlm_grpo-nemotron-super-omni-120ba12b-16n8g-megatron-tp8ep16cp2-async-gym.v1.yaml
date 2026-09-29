@@ -96,6 +96,11 @@ policy:
       # Match the higher-throughput backend used by the earlier successful
       # policy-serving runs. This must remain compatible with repeated refits.
       moe_backend: flashinfer_cutlass
+      # vLLM 0.29's FlashInfer autotuner can stall TP ranks during cold
+      # startup. Use deterministic heuristic tactics so the generation
+      # endpoints become ready within NeMo Gym's bounded readiness window.
+      kernel_config:
+        enable_flashinfer_autotune: false
       limit_mm_per_prompt:
         image: 3
       mm_processor_cache_gb: 0
