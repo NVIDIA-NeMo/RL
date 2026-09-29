@@ -53,6 +53,7 @@ from nemo_rl.data_plane.tq_token_sink import (
     MEDIA_TENSOR_COLUMNS,
     ROUTED_EXTRAS_METADATA_FIELD,
     STAGING_FIELDS,
+    ChainPrefixCache,
     TQTokenSink,
     TQTokenSource,
 )
@@ -635,6 +636,7 @@ def test_worker_restart_recovers_retained_geometry_without_fetching_pixels(
         _capture_image_token_id=18,
         _capture_patch_size=1,
         _staging_source=source,
+        _chain_prefix=ChainPrefixCache(source),
     )
     prefix = [10, 18, 18, 11, 31, 2]
     admission = CaptureAdmission(
@@ -964,6 +966,7 @@ def retained_call(dp):
         _capture_image_token_id=18,
         _capture_patch_size=1,
         _staging_source=source,
+        _chain_prefix=ChainPrefixCache(source),
     )
     prefix = [10, 18, 18, 11, 31, 2]
     admission = CaptureAdmission(
@@ -1153,9 +1156,14 @@ def real_image_processor():
     )
 
     def make(max_model_len, cached):
-        mm_config = MultiModalConfig(
-            limit_per_prompt={"image": 2}, mm_processor_cache_gb=0.01
-        )
+        mm_kwargs = {"limit_per_prompt": {"image": 2}, "mm_processor_cache_gb": 0.01}
+        if "mm_device_do_normalize" in MultiModalConfig.model_fields:
+            # vLLM >= 0.29 defaults to normalizing on the device and injects
+            # do_normalize/do_rescale into every processor constructor; the
+            # Omni processor does not take them, and real engines turn this
+            # off for it. This bare config never goes through that logic.
+            mm_kwargs["mm_device_do_normalize"] = False
+        mm_config = MultiModalConfig(**mm_kwargs)
         config = SimpleNamespace(
             model="local-nano-nemotron-processor",
             hf_config=hf_config,
