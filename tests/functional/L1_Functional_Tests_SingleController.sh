@@ -201,6 +201,10 @@ run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_con
 # Coordinated Gym participant + TQ checkpoint at a deterministic post-mutation
 # turn boundary, followed by a full process restart and exact continuation.
 run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_turn_recovery.sh
+# The same turn-level transaction across two distinct one-replica Gym shards:
+# both shard-local continuations restore while the shared model ledger is
+# committed and installed exactly once.
+run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_sharded_turn_recovery.sh
 # The same recovery contract against Workplace Assistant's real DataFrame-backed
 # state adapter, including an exactly-once calendar mutation across restart.
 run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_workplace_turn_recovery.sh
