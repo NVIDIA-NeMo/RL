@@ -4056,7 +4056,7 @@ def _grpo_train_impl(
                 reduction_op="sum"
             )  # type: ignore
             # track example with high token mult prob error above 1.05
-            if metrics.get("token_mult_prob_error", 0.0) > 1.05:
+            if metrics["token_mult_prob_error"] > 1.05:
                 logger.log_plot_token_mult_prob_error(
                     {
                         "prompt_lengths": repeated_batch["length"],
@@ -4095,7 +4095,7 @@ def _grpo_train_impl(
                 + (
                     f"{generation_kl_error:.4f}"
                     if generation_kl_error is not None
-                    else "N/A"
+                    else "not reported"
                 )
             )
             if master_config.grpo.use_dynamic_sampling:
@@ -6017,7 +6017,7 @@ def async_grpo_train(
                 + (
                     f"{generation_kl_error:.4f}"
                     if generation_kl_error is not None
-                    else "N/A"
+                    else "not reported"
                 )
             )
             print(f"  • Avg Reward: {np.mean(rewards.numpy()):.4f}")
