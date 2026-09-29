@@ -208,9 +208,7 @@ def _make_master_config(
                 "num_workers": 0,
             },
             "logger": {"log_dir": "/tmp/logger"},
-            "cluster": ClusterConfig.model_validate(
-                {"num_nodes": 1, "gpus_per_node": 1}
-            ),
+            "cluster": ClusterConfig(num_nodes=1, gpus_per_node=1),
             "checkpointing": {
                 "enabled": save_enabled,
                 "checkpoint_must_save_by": None,

@@ -726,7 +726,7 @@ def _actor_master_config(
             "mlflow_enabled": False,
             "monitor_gpus": False,
         },
-        cluster=ClusterConfig.model_validate({"num_nodes": 1, "gpus_per_node": 1}),
+        cluster=ClusterConfig(num_nodes=1, gpus_per_node=1),
         checkpointing={
             "enabled": enabled,
             "checkpoint_dir": str(tmp_path / "checkpoints"),

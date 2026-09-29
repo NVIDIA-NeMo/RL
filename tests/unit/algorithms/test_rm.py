@@ -137,12 +137,7 @@ def mock_components():
                 "checkpoint_must_save_by": None,
                 "save_period": 10,
             },
-            "cluster": ClusterConfig.model_validate(
-                {
-                    "num_nodes": 1,
-                    "gpus_per_node": 2,
-                }
-            ),
+            "cluster": ClusterConfig(num_nodes=1, gpus_per_node=2),
         }
     )
 

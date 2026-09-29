@@ -381,7 +381,7 @@ def test_maybe_pad_last_batch_preserves_multimodal_rows():
 
 def _base_master_config(colocated: bool):
     return MasterConfig.model_construct(
-        cluster=ClusterConfig.model_validate({"num_nodes": 2, "gpus_per_node": 8}),
+        cluster=ClusterConfig(num_nodes=2, gpus_per_node=8),
         policy={
             "generation": {
                 "temperature": 1.0,
@@ -401,7 +401,7 @@ def _base_master_config(colocated: bool):
 
 def _base_ppo_master_config(colocated: bool):
     return PPOMasterConfig.model_construct(
-        cluster=ClusterConfig.model_validate({"num_nodes": 2, "gpus_per_node": 8}),
+        cluster=ClusterConfig(num_nodes=2, gpus_per_node=8),
         policy={
             "generation": {
                 "temperature": 1.0,
