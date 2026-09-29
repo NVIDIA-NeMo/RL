@@ -2776,6 +2776,8 @@ def test_load_weights_expands_grouped_experts_for_mxfp8(
             )
 
     assert len(quantized_inputs) == 6
+
+
 def _deepseek_v4_lookup_model():
     """A DeepSeek V4-shaped model with vLLM 0.29's ambiguous packed mapping."""
     from vllm.model_executor.models.utils import WeightsMapper
