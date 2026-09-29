@@ -458,6 +458,7 @@ class MegatronPolicyWorkerImpl(
     # training/source behavior unless they explicitly select destination.
     is_refit_destination: bool = False
     refit_payload_mode: RefitPayloadMode = "hf_export"
+    fp8_cfg: Optional[dict[str, Any]] = None
     # Holds the split-API train-step state between begin/finish or
     # begin/abort; None when no step is open. Declared at class level so
     # ``self._train_step_state = None`` after finish/abort type-checks.
@@ -3141,6 +3142,27 @@ class MegatronPolicyWorkerImpl(
             and self.fp8_cfg.get("fp8_recipe") == "blockwise"
         )
 
+    def _has_mxfp8_param_storage(self) -> bool:
+        """Return True if the train side stores weights as TE MXFP8."""
+        if self.fp8_cfg is None:
+            return False
+        return bool(
+            self.fp8_cfg.get("fp8_param", False)
+            and self.fp8_cfg.get("fp8_recipe") == "mxfp8"
+        )
+
+    def _uses_logical_refit_payload(self) -> bool:
+        """Return True if refit sends logical BF16 materialized from TE storage.
+
+        Megatron destinations request logical weights. MXFP8 training storage has
+        no physical export path, so it is dequantized (exactly) to BF16 for every
+        destination and the receiver re-quantizes it to MXFP8.
+        """
+        return (
+            self.refit_payload_mode == "logical_weights"
+            or self._has_mxfp8_param_storage()
+        )
+
     def _build_refit_conversion_tasks(self) -> list:
         """Build the conversion-task list driving refit (BF16 or FP8 export).
 
@@ -3151,7 +3173,7 @@ class MegatronPolicyWorkerImpl(
         from nemo_rl.models.megatron.draft import draft_model_detached
 
         with draft_model_detached([self.model]):
-            if self._is_fp8_export() and self.refit_payload_mode != "logical_weights":
+            if self._is_fp8_export() and not self._uses_logical_refit_payload():
                 return self.megatron_bridge.get_export_fp8_tasks(self.model)
             return [
                 task
@@ -3269,9 +3291,11 @@ class MegatronPolicyWorkerImpl(
 
         # Megatron generation consumes transient logical BF16, matching MCore's
         # native refit wire format; Bridge's training FP8 is not inference MXFP8.
-        # Other backends keep Bridge's physical FP8 payload and scale_inv sibling;
-        # mixing that scale with BF16 would corrupt the imported weight.
-        if self.refit_payload_mode == "logical_weights":
+        # MXFP8 training storage is also sent as logical BF16 (it has no physical
+        # export path) and re-quantized by the receiver. Other backends keep
+        # Bridge's physical blockwise FP8 payload and scale_inv sibling; mixing
+        # that scale with BF16 would corrupt the imported weight.
+        if self._uses_logical_refit_payload():
             conversion_tasks = self._iter_logical_refit_conversion_tasks(
                 conversion_tasks
             )
@@ -3382,12 +3406,13 @@ class MegatronPolicyWorkerImpl(
         ``refit_conversion_tasks`` already holds only this rank's local experts;
         PP non-local params have ``param_weight is None``.
 
-        Only a Megatron destination gets the logical-BF16 materialization. Every
-        other backend keeps Bridge's payload verbatim, which for an FP8 export
-        task is the physical fp8 view its ``_scale_inv`` sibling describes;
-        dequantizing it here would ship BF16 bytes under an fp8 scale.
+        A Megatron destination, or MXFP8 training storage (no physical export
+        path), gets the logical-BF16 materialization. Every other backend keeps
+        Bridge's payload verbatim, which for a blockwise FP8 export task is the
+        physical fp8 view its ``_scale_inv`` sibling describes; dequantizing it
+        here would ship BF16 bytes under an fp8 scale.
         """
-        uses_logical_payload = self.refit_payload_mode == "logical_weights"
+        uses_logical_payload = self._uses_logical_refit_payload()
         for task in self.refit_conversion_tasks:
             if uses_logical_payload:
                 local_tensor = _get_refit_task_source(task)

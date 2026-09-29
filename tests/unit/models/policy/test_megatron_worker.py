@@ -233,6 +233,7 @@ def test_fp8_export_payload_survives_for_non_megatron_backends() -> None:
     )
 
     worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.fp8_cfg = {"fp8_param": True, "fp8_recipe": "blockwise"}
     worker.model = object()
     worker.draft_model = None
     worker.refit_conversion_tasks = [task]
@@ -258,6 +259,67 @@ def test_fp8_export_payload_survives_for_non_megatron_backends() -> None:
     ]
     # Megatron generation gets the materializing generator instead.
     assert not isinstance(megatron_forwarded, list)
+
+
+@pytest.mark.parametrize(
+    ("fp8_cfg", "payload_mode", "expected"),
+    [
+        (None, "hf_export", False),
+        ({"fp8_param": False, "fp8_recipe": "mxfp8"}, "hf_export", False),
+        ({"fp8_param": True, "fp8_recipe": "blockwise"}, "hf_export", False),
+        ({"fp8_param": True, "fp8_recipe": "blockwise"}, "logical_weights", True),
+        ({"fp8_param": True, "fp8_recipe": "mxfp8"}, "hf_export", True),
+        ({"fp8_param": True, "fp8_recipe": "mxfp8"}, "logical_weights", True),
+    ],
+)
+def test_uses_logical_refit_payload(
+    fp8_cfg: dict | None, payload_mode: str, expected: bool
+) -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.fp8_cfg = fp8_cfg
+    worker.refit_payload_mode = payload_mode
+
+    assert worker._uses_logical_refit_payload() is expected
+
+
+def test_mxfp8_param_storage_refit_sends_logical_bf16_to_vllm() -> None:
+    """MXFP8 storage has no physical export, so vLLM gets logical BF16.
+
+    Unlike blockwise FP8 there is no ``_scale_inv`` sibling task to keep the
+    physical payload consistent, so the vLLM path must materialize the TE MXFP8
+    source as BF16 (exact) and let the receiver re-quantize it to MXFP8.
+    """
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.fp8_cfg = {"fp8_param": True, "fp8_recipe": "mxfp8"}
+    worker.model = object()
+    worker.draft_model = None
+    conversion_tasks = [None, object()]
+    worker.megatron_bridge = SimpleNamespace(
+        get_export_fp8_tasks=MagicMock(),
+        get_conversion_tasks=MagicMock(return_value=conversion_tasks),
+        export_hf_weights=MagicMock(return_value=iter(())),
+    )
+    worker.cfg = {"generation": {"backend": "vllm"}}
+    worker.refit_payload_mode = "hf_export"
+
+    assert worker._build_refit_conversion_tasks() == conversion_tasks[1:]
+    worker.megatron_bridge.get_export_fp8_tasks.assert_not_called()
+
+    worker.refit_conversion_tasks = conversion_tasks[1:]
+    list(worker._iter_params_with_optional_kv_scales())
+    forwarded = worker.megatron_bridge.export_hf_weights.call_args.kwargs[
+        "conversion_tasks"
+    ]
+    # The vLLM path gets the materializing generator, not Bridge's list verbatim.
+    assert not isinstance(forwarded, list)
 
 
 def test_local_hf_shards_follow_bridge_specs() -> None:
