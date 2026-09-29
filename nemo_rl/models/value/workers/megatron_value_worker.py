@@ -90,6 +90,7 @@ from nemo_rl.telemetry.setup import (
     traced_worker_init,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+from nemo_rl.utils.sequence_lengths import CpuIntTuple, to_cpu_int_tuple
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
@@ -148,7 +149,7 @@ def make_value_head_hook(hidden_size: int, sequence_parallel: bool):
 
 def _unpack_value_sequences(
     values: torch.Tensor,
-    cu_seqlens_padded: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor | CpuIntTuple,
     unpacked_seqlen: int,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> torch.Tensor:
@@ -161,7 +162,8 @@ def _unpack_value_sequences(
     ``values[t] = V(state before token t)`` — matching the unpacked path.
     """
     cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
-    batch_size = cu_seqlens_padded.shape[0] - 1
+    cu_seqlens_padded_cpu = to_cpu_int_tuple(cu_seqlens_padded)
+    batch_size = len(cu_seqlens_padded_cpu) - 1
     values = values.squeeze(0)  # [T // CP]
 
     if cp_size > 1:
@@ -169,8 +171,8 @@ def _unpack_value_sequences(
             values.shape[0] * cp_size, dtype=values.dtype, device=values.device
         )
         for i in range(batch_size):
-            start = cu_seqlens_padded[i].item()
-            end = cu_seqlens_padded[i + 1].item()
+            start = cu_seqlens_padded_cpu[i]
+            end = cu_seqlens_padded_cpu[i + 1]
             full[start:end] = allgather_cp_sharded_tensor(
                 values[start // cp_size : end // cp_size], cp_group, seq_dim=0
             )
@@ -180,8 +182,8 @@ def _unpack_value_sequences(
         (batch_size, unpacked_seqlen), dtype=values.dtype, device=values.device
     )
     for i in range(batch_size):
-        start = cu_seqlens_padded[i].item()
-        end = cu_seqlens_padded[i + 1].item()
+        start = cu_seqlens_padded_cpu[i]
+        end = cu_seqlens_padded_cpu[i + 1]
         seq_values = values[start:end]
         seq_values = torch.cat(
             [torch.zeros_like(seq_values[:1]), seq_values[:-1]], dim=0

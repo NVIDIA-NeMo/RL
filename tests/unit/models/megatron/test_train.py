@@ -24,7 +24,7 @@ focusing on:
 
 from contextlib import nullcontext
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1530,6 +1530,100 @@ class TestLogprobsPostProcessor:
 
         mock_from_logits_packed.assert_called_once()
         assert "logprobs" in result
+
+
+@pytest.mark.parametrize("boundary_type", [torch.tensor, tuple])
+@pytest.mark.parametrize("cp_size", [1, 2])
+@pytest.mark.parametrize("payload", ["hidden_states", "logits"])
+def test_teacher_full_payload_cpu_boundaries(
+    boundary_type: Callable[[list[int]], torch.Tensor | tuple[int, ...]],
+    cp_size: int,
+    payload: str,
+) -> None:
+    """Unpack full teacher payloads without per-sequence scalar reads."""
+    # Megatron is an optional dependency loaded only for mcore tests.
+    from nemo_rl.models.megatron.train import TeacherFullPayloadPostProcessor
+
+    cfg = {
+        "sequence_packing": {"enabled": True},
+        "megatron_cfg": {"context_parallel_size": cp_size},
+    }
+    # Unequal padded spans exercise CP slicing; true lengths exercise padding
+    # removal and truncation to the original input width.
+    sequences = [
+        torch.arange(8, dtype=torch.float32).reshape(1, 4, 2),
+        torch.arange(100, 116, dtype=torch.float32).reshape(1, 8, 2),
+    ]
+    if cp_size > 1:
+        shards = [
+            torch.cat(
+                [seq[:, : seq.shape[1] // 4], seq[:, -seq.shape[1] // 4 :]], dim=1
+            )
+            for seq in sequences
+        ]
+    else:
+        shards = sequences
+    local_payload = torch.cat(shards, dim=1)
+    data = {
+        "input_ids": torch.zeros(2, 6, dtype=torch.long),
+        "input_lengths": torch.tensor([3, 5]),
+    }
+    logprobs = torch.zeros(2, 4)
+    cp_group = object()
+
+    with (
+        patch("nemo_rl.models.megatron.train.LogprobsPostProcessor") as logprob_cls,
+        patch(
+            "nemo_rl.models.megatron.train.get_context_parallel_group",
+            return_value=cp_group,
+        ),
+        patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group"),
+        patch(
+            "megatron.core.tensor_parallel.gather_from_tensor_model_parallel_region",
+            side_effect=lambda tensor, group: tensor,
+        ),
+        patch(
+            "nemo_rl.models.megatron.train.allgather_cp_sharded_tensor",
+            side_effect=sequences,
+        ) as gather,
+        patch.object(
+            torch.Tensor, "item", side_effect=AssertionError("per-sequence item()")
+        ),
+    ):
+        logprob_cls.return_value.return_value.return_value = (
+            torch.tensor(0.0),
+            {"logprobs": logprobs},
+        )
+        processor = TeacherFullPayloadPostProcessor(cfg, payload, torch.float32)
+        wrapped_fn = processor(
+            data_dict=data,
+            input_ids=data["input_ids"],
+            cu_seqlens_padded=boundary_type([0, 4, 12]),
+            original_seq_length=4,
+            hidden_states=local_payload.transpose(0, 1),
+        )
+        assert logprob_cls.return_value.call_args.kwargs["cu_seqlens_padded"] == (
+            0,
+            4,
+            12,
+        )
+        # All metadata must already be on the host when the model returns.
+        with patch.object(
+            torch.Tensor, "tolist", side_effect=AssertionError("late CPU conversion")
+        ):
+            _, result = wrapped_fn(local_payload)
+
+    expected = torch.zeros(2, 4, 2)
+    expected[0, :3] = sequences[0][0, :3]
+    expected[1] = sequences[1][0, :4]
+    torch.testing.assert_close(result["teacher_full_payload"], expected)
+    torch.testing.assert_close(result["logprobs"], logprobs)
+    assert result["teacher_full_payload"].device.type == "cpu"
+    assert gather.call_count == (2 if cp_size > 1 else 0)
+    for call, shard in zip(gather.call_args_list, shards):
+        torch.testing.assert_close(call.args[0], shard)
+        assert call.args[1] is cp_group
+        assert call.kwargs == {"seq_dim": 1}
 
 
 class TestTopkLogitsPostProcessor:

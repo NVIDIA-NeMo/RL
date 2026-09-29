@@ -1262,8 +1262,8 @@ def _prepare_vlm_batch_for_megatron(
 
     # One CPU-GPU sync per call via .tolist(); per-seq arithmetic runs on CPU
     # ints (fast) instead of .item() in a loop (which sync'd per seq).
-    lengths_list = list(to_cpu_int_tuple(seq_lengths))
-    padded_lens = [_round_up_to_multiple(L, align) for L in lengths_list]
+    seq_lengths_cpu = list(to_cpu_int_tuple(seq_lengths))
+    padded_lens = [_round_up_to_multiple(L, align) for L in seq_lengths_cpu]
 
     # PP>1: force sum(padded_lens) to a fixed value so every microbatch produces
     # the same decoder-side packed length. We mirror _pack_sequences_for_megatron
@@ -1282,7 +1282,7 @@ def _prepare_vlm_batch_for_megatron(
             f"pad_individual_seqs_to_multiple_of ({align})."
         )
         if deficit > 0:
-            lengths_list[-1] += deficit
+            seq_lengths_cpu[-1] += deficit
             padded_lens[-1] += deficit
 
     padded_max = max(padded_lens) if padded_lens else 0
