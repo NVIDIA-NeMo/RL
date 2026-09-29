@@ -372,9 +372,7 @@ def capture_processed_media(
                 "imgs_sizes": torch.cat(sizes_parts[new], dim=0),
             }
             if occurrences[0][1] == "video":
-                delta["num_frames"] = torch.tensor(
-                    frame_counts[new], dtype=torch.int32
-                )
+                delta["num_frames"] = torch.tensor(frame_counts[new], dtype=torch.int32)
             tensors = {
                 name: tensor.detach().cpu().clone() for name, tensor in delta.items()
             }
