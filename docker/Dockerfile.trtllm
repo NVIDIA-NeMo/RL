@@ -1,22 +1,49 @@
 # syntax=docker/dockerfile:1
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-ARG NEMO_RL_BASE_IMAGE=nvcr.io/nvidia/pytorch:26.08-py3
-ARG NEMO_RL_REPO=https://github.com/NVIDIA-NeMo/RL.git
-# Also pins the TensorRT-LLM source ref built below
-# (3rdparty/TensorRT-LLM-workspace/pyproject.toml [tool.trtllm]).
-ARG NEMO_RL_REVISION=main
+# Usage:
+# Self-contained build (NeMo-RL source fetched from GitHub at NRL_GIT_REF):
+#     docker buildx build -f docker/Dockerfile.trtllm --target release --build-arg NRL_GIT_REF=main --tag <registry>/nemo-rl:trtllm --push .
+# Build from the local checkout (submodules must be initialized):
+#     docker buildx build --build-context nemo-rl=. -f docker/Dockerfile.trtllm --target release --tag <registry>/nemo-rl:trtllm --push .
+# The defaults target Blackwell (GB200/GB300). For H100 (sm_90) add:
+#     --platform linux/amd64 --build-arg BUILD_CUSTOM_TRTLLM_ARCH=90-real --build-arg NVTE_CUDA_ARCHS=90a --build-arg TORCH_CUDA_ARCH_LIST=9.0
+
+# BASE_IMAGE (not a prefixed name): _build_container.yml reads it to key the TRT-LLM caches.
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.08-py3
 ARG TE_REPO_URL=https://github.com/NVIDIA/TransformerEngine.git TE_REPO_REF=main
 ARG BUILD_CUSTOM_TRTLLM_ARCH="100-real;103-real"
 
+# NeMo-RL source. The TensorRT-LLM source ref built below also comes from here
+# (3rdparty/TensorRT-LLM-workspace/pyproject.toml [tool.trtllm]).
+# Override with: --build-context nemo-rl=<your-checkout>
+FROM scratch AS nemo-rl
+ARG NRL_GIT_REF=main
+ADD --keep-git-dir=true https://github.com/NVIDIA-NeMo/RL.git#${NRL_GIT_REF} /
+
+# Empty defaults; CI overrides these with --build-context to restore the TRT-LLM
+# compiler cache and wheel cache from registry images (see _build_container.yml).
+FROM scratch AS trtllm-ccache-seed
+FROM scratch AS trtllm-wheel-cache-seed
+
+# Empty defaults for incremental cache export. CI overrides these contexts
+# with the current cache images when appending a delta layer, and leaves them
+# empty when periodically compacting the cache into a full snapshot.
+FROM scratch AS trtllm-ccache-output-base
+FROM scratch AS trtllm-wheel-cache-output-base
+
+# Empty default; CI overrides with --build-context to seed the uv cache from the
+# previous main build's uv-cache target.
+FROM scratch AS uv-cache-seed
+
 ## Stage: base
-FROM ${NEMO_RL_BASE_IMAGE} AS base
+FROM ${BASE_IMAGE} AS base
 
 # ccache, libzmq3-dev: TRT-LLM build (libzmq is also dlopen()ed by its UCX cache
-# transceiver at run time).
+# transceiver at run time). rsync: TRT-LLM cache seed restore/export.
 RUN sed -i 's|http://ports.ubuntu.com|https://ports.ubuntu.com|g' /etc/apt/sources.list.d/ubuntu.sources && \
     export DEBIAN_FRONTEND=noninteractive && apt-get update && \
-    apt-get install -y --no-install-recommends ccache libzmq3-dev && \
+    apt-get install -y --no-install-recommends ccache libzmq3-dev rsync && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Preserve the base Apex CUDA extensions for Megatron gradient accumulation
@@ -78,19 +105,20 @@ ENV NRL_CONTAINER=1 NEMO_GYM_VENV_DIR=/opt/gym_venvs \
     OMPI_ALLOW_RUN_AS_ROOT=1 OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
     PRTE_ALLOW_RUN_AS_ROOT=1 PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1
 
-## Stage: nemo-rl-src — pinned clone.
+## Stage: nemo-rl-src — the NeMo-RL source with the Megatron-LM pin applied.
 FROM base AS nemo-rl-src
-ARG NEMO_RL_REPO NEMO_RL_REVISION
+# Forward move from the Megatron-Bridge submodule's default pin (includes fused GDN
+# attention support). Overrides whatever the build context has checked out;
+# empty keeps the context's Megatron-LM as-is.
+ARG MEGATRON_LM_COMMIT=54c62dfb6852e9218bf38590be9b90930bf7d589
+COPY --from=nemo-rl . /opt/nemo-rl-src
 RUN <<"EOF" bash -exu
-git clone "${NEMO_RL_REPO}" /opt/nemo-rl-src
-cd /opt/nemo-rl-src
-# Pinned commits may no longer be reachable from the branches fetched by clone.
-git fetch origin "${NEMO_RL_REVISION}"
-git checkout --detach FETCH_HEAD
-git submodule update --init --recursive
-MCORE_DIR=3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM
-git -C "${MCORE_DIR}" fetch https://github.com/NVIDIA/Megatron-LM.git 54c62dfb6852e9218bf38590be9b90930bf7d589
-git -C "${MCORE_DIR}" checkout --detach FETCH_HEAD
+MCORE_DIR=/opt/nemo-rl-src/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM
+test -e "${MCORE_DIR}/.git" || { echo "Megatron-LM submodule missing; run git submodule update --init --recursive" >&2; exit 1; }
+if [[ -n "${MEGATRON_LM_COMMIT}" ]]; then
+    git -C "${MCORE_DIR}" fetch https://github.com/NVIDIA/Megatron-LM.git "${MEGATRON_LM_COMMIT}"
+    git -C "${MCORE_DIR}" checkout --detach FETCH_HEAD
+fi
 EOF
 
 ## Stage: build_te — Transformer Engine wheel.
@@ -113,14 +141,15 @@ EOF
 ## 3rdparty/TensorRT-LLM-workspace/pyproject.toml. Its own stage so the ~60 min build overlaps
 ## build_te and the venv syncs.
 FROM base AS build_trtllm
-ARG BUILD_CUSTOM_TRTLLM_ARCH TRTLLM_BUILD_JOBS
+ARG BUILD_CUSTOM_TRTLLM_ARCH TRTLLM_BUILD_JOBS BASE_IMAGE TARGETARCH
+ARG TRTLLM_CCACHE_MAXSIZE=20G
 ENV BUILD_CUSTOM_TRTLLM_ARCH=${BUILD_CUSTOM_TRTLLM_ARCH} NIXL_ROOT_DIR=/opt/nvidia/nvda_nixl
 # TensorRT-LLM calls assert() without including <cassert> in one kernel.
 ENV NVCC_APPEND_FLAGS="-include cassert"
 WORKDIR /opt/trtllm-build
 # The script derives its build dir from its own location; keep this layout.
-COPY --from=nemo-rl-src /opt/nemo-rl-src/tools/build-custom-trtllm.sh ./tools/
-COPY --from=nemo-rl-src /opt/nemo-rl-src/3rdparty/TensorRT-LLM-workspace/pyproject.toml ./3rdparty/TensorRT-LLM-workspace/
+COPY --from=nemo-rl tools/build-custom-trtllm.sh ./tools/
+COPY --from=nemo-rl 3rdparty/TensorRT-LLM-workspace/pyproject.toml ./3rdparty/TensorRT-LLM-workspace/
 # Drop the pip NCCL/NVRTC pins from TRT-LLM's requirements.txt right after the script's
 # checkout: a pip NCCL that differs from the one the base torch links breaks `import torch`.
 RUN <<"EOF" python3
@@ -131,26 +160,77 @@ anchor = "sed -i '/^nvidia-modelopt/d' requirements.txt\n"
 assert s.count(anchor) == 1, "build-custom-trtllm.sh changed; re-check this hook"
 p.write_text(s.replace(anchor, anchor + "sed -i '/^nvidia-nccl-cu13/d;/^nvidia-cuda-nvrtc/d' requirements.txt\n"))
 EOF
-RUN --mount=type=cache,target=/root/.cache/ccache \
+# The cache mounts are builder-local; CI seeds them from registry images and
+# exports them back via the trtllm-ccache / trtllm-wheel-cache targets below.
+RUN --mount=type=bind,from=trtllm-ccache-seed,source=.,target=/tmp/trtllm-ccache-seed \
+    --mount=type=cache,id=trtllm-wheel-cache-${TARGETARCH}-${BASE_IMAGE},from=trtllm-wheel-cache-seed,source=.,target=/root/.cache/trtllm-wheels,sharing=locked \
+    --mount=type=cache,id=trtllm-ccache-${TARGETARCH}-${BASE_IMAGE},target=/root/.cache/ccache,sharing=locked \
     <<"EOF" bash -exu -o pipefail
 read -r TRTLLM_URL TRTLLM_REF < <(python3 -c 'import tomllib; t = tomllib.load(open("3rdparty/TensorRT-LLM-workspace/pyproject.toml", "rb"))["tool"]["trtllm"]; print(t["url"], t["ref"])')
-# A full build is ~9.8k objects; ccache's 5G default would thrash.
-CCACHE_DIR=/root/.cache/ccache ccache -M 20G
-CCACHE_DIR=/root/.cache/ccache bash tools/build-custom-trtllm.sh "${TRTLLM_URL}" "${TRTLLM_REF}"
+
+# Content-addressed wheel cache: the key covers everything the compiled wheel
+# depends on beyond the base image (which already scopes the cache mount id):
+# source ref, (patched) build script, arch list, NIXL, and the torch/CUDA toolchain.
+WHEEL_KEY=$({
+    cat 3rdparty/TensorRT-LLM-workspace/pyproject.toml tools/build-custom-trtllm.sh /NIXL_VERSION.env
+    printf '%s\n' "${BUILD_CUSTOM_TRTLLM_ARCH}" "$(uname -m)"
+    python3 -c 'import sys, torch; print(sys.version_info[:2], torch.__version__, torch.version.cuda)'
+} | sha256sum | cut -c1-16)
+WHEEL_DIR=/root/.cache/trtllm-wheels/${WHEEL_KEY}
+mkdir -p /opt/trtllm_wheels
+
+if compgen -G "${WHEEL_DIR}/tensorrt_llm-*.whl" >/dev/null; then
+    echo "TRT-LLM wheel cache hit: ${WHEEL_DIR}"
+else
+    echo "TRT-LLM wheel cache miss: ${WHEEL_DIR}; building"
+    # COMPILERCHECK=content is robust to compiler timestamp changes between
+    # ephemeral CI runners. A full build is ~9.8k objects; the 5G default would thrash.
+    export CCACHE_DIR=/root/.cache/ccache CCACHE_COMPILERCHECK=content CCACHE_COMPRESS=true \
+        CCACHE_MAXSIZE="${TRTLLM_CCACHE_MAXSIZE}"
+    # Cache entries are content-addressed, so keep newer builder-local entries
+    # when merging the registry seed.
+    rsync -a --ignore-existing /tmp/trtllm-ccache-seed/ "${CCACHE_DIR}/"
+    WHEEL_OUTPUT_DIR="${WHEEL_DIR}" bash tools/build-custom-trtllm.sh "${TRTLLM_URL}" "${TRTLLM_REF}"
+fi
+# The cache mount is not part of this layer; copy the wheel into the layer for release.
+cp "${WHEEL_DIR}"/tensorrt_llm-*.whl /opt/trtllm_wheels/
 ls /opt/trtllm_wheels/tensorrt_llm-*.whl
 EOF
 
 ## Stage: release — the NeMo-RL venv, plus TE and TRT-LLM.
 FROM base AS release
 WORKDIR /opt/nemo-rl
-COPY --from=nemo-rl-src /opt/nemo-rl-src/ /opt/nemo-rl
+# Only what `uv lock`/`uv sync` read, so a source-only change reuses the venv layer below.
+# The root project's dynamic metadata needs README.md and nemo_rl.__version__.
+COPY --from=nemo-rl-src /opt/nemo-rl-src/pyproject.toml /opt/nemo-rl-src/uv.lock /opt/nemo-rl-src/README.md ./
+COPY --from=nemo-rl-src /opt/nemo-rl-src/nemo_rl/__init__.py /opt/nemo-rl-src/nemo_rl/package_info.py ./nemo_rl/
+COPY --from=nemo-rl-src --link /opt/nemo-rl-src/research/ ./research/
+COPY --from=nemo-rl-src --link /opt/nemo-rl-src/3rdparty/ ./3rdparty/
 
-ARG MAX_JOBS
-# sm_100 SASS runs on GB200/GB300. CUDA 13 keeps cub/thrust under include/cccl.
-ENV TORCH_CUDA_ARCH_LIST="10.0" CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl \
+ARG MAX_JOBS BASE_IMAGE TARGETARCH
+# sm_100 SASS runs on GB200/GB300; H100 builds pass 9.0. CUDA 13 keeps cub/thrust
+# under include/cccl.
+ARG TORCH_CUDA_ARCH_LIST="10.0"
+ENV TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}" CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl \
     UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 
-RUN <<"EOF" bash -exu -o pipefail
+# The uv cache is a builder-local mount (kept out of the image). CI seeds it from
+# the uv-cache-seed context and exports it back via the uv-cache target below. It is
+# separate from docker/Dockerfile's uv cache: source-built no-build-isolation wheels
+# here link against the base image's torch, not the lock's.
+RUN --mount=type=bind,from=uv-cache-seed,source=.,target=/tmp/uv-cache-seed \
+    --mount=type=cache,id=trtllm-uv-cache-${TARGETARCH}-${BASE_IMAGE},target=/root/.cache/uv,sharing=locked \
+    <<"EOF" bash -exu -o pipefail
+# TORCH_CUDA_ARCH_LIST: source-built wheels in the cache are compiled for it.
+CACHE_KEY=$(echo "${BASE_IMAGE}-$(uv --version)-$(uname -m)-${TORCH_CUDA_ARCH_LIST}" | md5sum | cut -c1-12)
+SEED_KEY=$(cat /tmp/uv-cache-seed/.cache-key 2>/dev/null || echo "")
+if [[ -n "${SEED_KEY}" && "${SEED_KEY}" != "${CACHE_KEY}" ]]; then
+    echo "uv cache key mismatch (base image, uv version, arch, or CUDA arch list changed); skipping stale seed"
+elif [[ -n "${SEED_KEY}" ]]; then
+    echo "Seeding uv cache (key=${CACHE_KEY})"
+    rsync -a --ignore-existing --exclude=.cache-key /tmp/uv-cache-seed/ /root/.cache/uv/
+fi
+
 # Upstream pins python 3.13; the base has 3.12.
 sed -i 's/requires-python = ">=3.13.14,<3.14"/requires-python = ">=3.12,<3.13"/' pyproject.toml
 sed -i "s/python_version == '3.13' and sys_platform/python_version == '3.12' and sys_platform/g" pyproject.toml
@@ -179,9 +259,18 @@ NO_INSTALL="--no-install-package tensorrt-llm --no-install-package nvidia-nvjitl
 # trtllm is declared conflicting with mcore/nemo_gym: sync it first, training last so it
 # owns any shared pin; --inexact keeps the earlier packages installed.
 uv sync --locked --inexact --extra trtllm --no-install-project ${NO_INSTALL}
-uv sync --locked --inexact --extra mcore --extra nemo_gym ${NO_INSTALL}
-rm -rf /root/.cache/uv
+# --group test: CI runs tests with UV_NO_SYNC=1 (a sync against the mounted,
+# unpatched pyproject.toml cannot find its Python 3.13), so pytest must be baked in.
+uv sync --locked --inexact --extra mcore --extra nemo_gym --group test ${NO_INSTALL}
+echo "${CACHE_KEY}" > /root/.cache/uv/.cache-key
 EOF
+
+# The rest of the source. The files patched above (and 3rdparty/, research/, already
+# copied in full) are excluded so the patched copies stay.
+COPY --from=nemo-rl-src \
+    --exclude=pyproject.toml --exclude=uv.lock --exclude=.python-version \
+    --exclude=3rdparty --exclude=3rdparty/** --exclude=research --exclude=research/** \
+    /opt/nemo-rl-src/ /opt/nemo-rl
 
 # --no-config: pyproject pins TE to a git URL. --no-deps: the base owns the CUDA-native
 # dependencies. cuDNN Frontend 1.29.0 fixes a VR200 break in the version the lock pins.
@@ -243,3 +332,129 @@ print(f"torch {torch.__version__}, tensorrt_llm {tensorrt_llm.__version__}")
 PY
 test -z "$(find /usr/local/lib/python3.12/dist-packages /opt/nemo_rl_venv -name 'libnvrtc.so*')"
 EOF
+
+# Export the builder-local ccache as a separate scratch image. CI builds this
+# target immediately after the release target with the same Buildx builder, so
+# it can read the cache mount without adding ccache data to the release image.
+FROM base AS trtllm-ccache-export
+ARG BASE_IMAGE
+ARG CCACHE_EXPORT_NONCE
+ARG CCACHE_EXPORT_MODE=full
+ARG TARGETARCH
+RUN --mount=type=bind,from=trtllm-ccache-seed,source=.,target=/tmp/trtllm-ccache-seed \
+    --mount=type=cache,id=trtllm-ccache-${TARGETARCH}-${BASE_IMAGE},target=/root/.cache/ccache,sharing=locked <<"EOF" bash -exu
+# Make this export run once per CI build instead of reusing an older layer.
+echo "Exporting TRT-LLM ccache for build ${CCACHE_EXPORT_NONCE:-local} (${CCACHE_EXPORT_MODE})"
+# build_trtllm may have been reused from BuildKit (or hit the wheel cache)
+# without compiling, leaving this builder-local mount empty. Restore the seed
+# only in that case; unconditionally merging it would resurrect entries ccache evicted.
+if [[ -z "$(find /root/.cache/ccache -mindepth 1 -print -quit)" ]]; then
+    rsync -a /tmp/trtllm-ccache-seed/ /root/.cache/ccache/
+fi
+echo "TRT-LLM ccache state before export:"
+CCACHE_DIR=/root/.cache/ccache ccache --show-stats
+mkdir -p /tmp/trtllm-ccache-export
+case "${CCACHE_EXPORT_MODE}" in
+    incremental)
+        # The output image inherits the seed layers, so copy only files whose
+        # content or metadata differs from the seed into the new top layer.
+        rsync -aH --checksum \
+            --compare-dest=/tmp/trtllm-ccache-seed/ \
+            /root/.cache/ccache/ /tmp/trtllm-ccache-export/
+        ;;
+    full)
+        cp -a /root/.cache/ccache/. /tmp/trtllm-ccache-export/
+        ;;
+    *)
+        echo "Unsupported CCACHE_EXPORT_MODE: ${CCACHE_EXPORT_MODE}" >&2
+        exit 1
+        ;;
+esac
+echo "TRT-LLM ccache export payload:"
+du -sh /tmp/trtllm-ccache-export
+CCACHE_HAS_DELTA=true
+if [[ "${CCACHE_EXPORT_MODE}" == "incremental" ]] && \
+    [[ -z "$(find /tmp/trtllm-ccache-export -mindepth 1 ! -type d -print -quit)" ]]; then
+    CCACHE_HAS_DELTA=false
+fi
+echo "TRT-LLM ccache export has delta: ${CCACHE_HAS_DELTA}"
+printf '%s\n' "${CCACHE_HAS_DELTA}" > /tmp/trtllm-ccache-export-has-delta
+EOF
+
+FROM trtllm-ccache-output-base AS trtllm-ccache
+COPY --link --from=trtllm-ccache-export /tmp/trtllm-ccache-export/ /
+LABEL com.nvidia.nemo-rl.cache-layout="incremental-v1"
+
+# Export only the custom TRT-LLM wheels (content-addressed by build_trtllm).
+FROM base AS trtllm-wheel-cache-export
+ARG BASE_IMAGE
+ARG TARGETARCH
+ARG WHEEL_CACHE_EXPORT_MODE=full
+ARG WHEEL_CACHE_EXPORT_NONCE
+RUN --mount=type=bind,from=trtllm-wheel-cache-seed,source=.,target=/tmp/trtllm-wheel-cache-seed \
+    --mount=type=cache,id=trtllm-wheel-cache-${TARGETARCH}-${BASE_IMAGE},from=trtllm-wheel-cache-seed,source=.,target=/root/.cache/trtllm-wheels,sharing=locked <<"EOF" bash -exu
+echo "Exporting TRT-LLM wheel cache for build ${WHEEL_CACHE_EXPORT_NONCE:-local} (${WHEEL_CACHE_EXPORT_MODE})"
+# If build_trtllm was a BuildKit cache hit, this builder-local mount is empty;
+# restore the seed before exporting it.
+if [[ -z "$(find /root/.cache/trtllm-wheels -mindepth 1 -print -quit)" ]]; then
+    rsync -a /tmp/trtllm-wheel-cache-seed/ /root/.cache/trtllm-wheels/
+fi
+mkdir -p /tmp/trtllm-wheel-cache-export
+case "${WHEEL_CACHE_EXPORT_MODE}" in
+    incremental)
+        rsync -aH --checksum \
+            --compare-dest=/tmp/trtllm-wheel-cache-seed/ \
+            /root/.cache/trtllm-wheels/ /tmp/trtllm-wheel-cache-export/
+        ;;
+    full)
+        cp -a /root/.cache/trtllm-wheels/. /tmp/trtllm-wheel-cache-export/
+        ;;
+    *)
+        echo "Unsupported WHEEL_CACHE_EXPORT_MODE: ${WHEEL_CACHE_EXPORT_MODE}" >&2
+        exit 1
+        ;;
+esac
+echo "TRT-LLM wheel cache export payload:"
+du -sh /tmp/trtllm-wheel-cache-export
+WHEEL_CACHE_HAS_DELTA=true
+if [[ "${WHEEL_CACHE_EXPORT_MODE}" == "incremental" ]] && \
+    [[ -z "$(find /tmp/trtllm-wheel-cache-export -mindepth 1 ! -type d -print -quit)" ]]; then
+    WHEEL_CACHE_HAS_DELTA=false
+fi
+echo "TRT-LLM wheel cache export has delta: ${WHEEL_CACHE_HAS_DELTA}"
+printf '%s\n' "${WHEEL_CACHE_HAS_DELTA}" > /tmp/trtllm-wheel-cache-export-has-delta
+EOF
+
+FROM trtllm-wheel-cache-output-base AS trtllm-wheel-cache
+COPY --link --from=trtllm-wheel-cache-export /tmp/trtllm-wheel-cache-export/ /
+LABEL com.nvidia.nemo-rl.cache-layout="incremental-v1"
+
+# Export only the delta decisions so CI can avoid pushing no-op incremental
+# cache layers. This target stays small even when the cache seeds are large.
+FROM scratch AS trtllm-cache-export-status
+COPY --from=trtllm-ccache-export /tmp/trtllm-ccache-export-has-delta /ccache-has-delta
+COPY --from=trtllm-wheel-cache-export /tmp/trtllm-wheel-cache-export-has-delta /wheel-has-delta
+
+# Export the builder-local uv cache as a scratch image. CI builds this target
+# right after the release target with the same Buildx builder (main only), and
+# feeds it back as the uv-cache-seed context on later builds.
+FROM base AS uv-cache-export
+ARG BASE_IMAGE
+ARG TARGETARCH
+ARG UV_CACHE_EXPORT_NONCE
+RUN --mount=type=bind,from=uv-cache-seed,source=.,target=/tmp/uv-cache-seed \
+    --mount=type=cache,id=trtllm-uv-cache-${TARGETARCH}-${BASE_IMAGE},target=/root/.cache/uv,sharing=locked <<"EOF" bash -exu
+# Make this export run once per CI build instead of reusing an older layer.
+echo "Exporting uv cache for build ${UV_CACHE_EXPORT_NONCE:-local}"
+# If the release venv layer was a BuildKit cache hit, this builder-local mount is
+# empty; re-export the seed rather than an empty cache.
+if [[ -z "$(find /root/.cache/uv -mindepth 1 -print -quit)" ]]; then
+    rsync -a /tmp/uv-cache-seed/ /root/.cache/uv/
+fi
+mkdir -p /tmp/uv-cache-export
+cp -a /root/.cache/uv/. /tmp/uv-cache-export/
+du -sh /tmp/uv-cache-export
+EOF
+
+FROM scratch AS uv-cache
+COPY --link --from=uv-cache-export /tmp/uv-cache-export/ /

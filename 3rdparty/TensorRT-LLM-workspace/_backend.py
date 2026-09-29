@@ -89,7 +89,9 @@ def _expanded_trtllm_url(env: dict[str, str]) -> str:
             an empty token would otherwise produce a URL that fails to
             authenticate with an opaque git error deep inside the build.
     """
-    missing = [name for name in re.findall(r"\$\{(\w+)\}", TRTLLM_URL) if not env.get(name)]
+    missing = [
+        name for name in re.findall(r"\$\{(\w+)\}", TRTLLM_URL) if not env.get(name)
+    ]
     if missing:
         raise RuntimeError(
             f"[tool.trtllm].url references {', '.join(missing)}, which "
@@ -122,9 +124,8 @@ _METADATA_WHEEL_TAG = "py3-none-any"
 # falls back to this same default. Folded into the wheel cache key below so
 # editing the arch list forces a rebuild instead of reusing a stale wheel.
 # Blackwell (sm_100) and Blackwell-Ultra (sm_103).
-# NOTE the nvshmem arch patch in build-custom-trtllm.sh carries its own copy of
-# this list in BARE form (100;103) -- nvshmem rejects the suffixed names
-# CMake generates, so the two lists are written differently on purpose.
+# The nvshmem arch patch in build-custom-trtllm.sh derives its BARE form
+# (100;103) from this list -- nvshmem rejects the suffixed names CMake generates.
 _DEFAULT_ARCH = "100-real;103-real"
 
 
