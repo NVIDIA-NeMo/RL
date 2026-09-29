@@ -147,6 +147,35 @@ class TestModelForward:
         assert "cu_seqlens_padded" not in call_kwargs
         assert "pixel_values" in call_kwargs
 
+    def test_model_forward_uses_processed_media_mask_not_rectangular_transport_copy(
+        self,
+    ):
+        """The packed/CP-selected mask must replace the original batch layout."""
+        from nemo_rl.models.megatron.train import model_forward
+
+        mock_model = MagicMock(return_value=torch.randn(1, 3, 100))
+        rectangular_mask = torch.tensor([[True, False, True]])
+        processed_mask = torch.tensor([True, False, True])
+        mock_data_dict = MagicMock()
+        mock_data_dict.get_multimodal_dict.return_value = {
+            "media_token_validity_mask": rectangular_mask,
+            "pixel_values": torch.randn(1, 3, 2, 2),
+        }
+
+        model_forward(
+            model=mock_model,
+            data_dict=mock_data_dict,
+            input_ids_cp_sharded=torch.tensor([[1, 2, 3]]),
+            position_ids=None,
+            attention_mask=None,
+            media_token_validity_mask=processed_mask,
+        )
+
+        call_kwargs = mock_model.call_args.kwargs
+        assert call_kwargs["media_token_validity_mask"] is processed_mask
+        assert call_kwargs["media_token_validity_mask"] is not rectangular_mask
+        assert "pixel_values" in call_kwargs
+
     def test_model_forward_passes_padding_mask(self):
         """Packed fake-token positions are forwarded to the MCore MoE router."""
         from nemo_rl.models.megatron.train import model_forward

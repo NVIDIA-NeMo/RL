@@ -847,7 +847,12 @@ def test_nemotron_video_datum_uses_dynamic_tubelet_inputs(monkeypatch, tmp_path)
                 "attention_mask": torch.ones(1, token_count, dtype=torch.long),
             }
 
+        def convert_tokens_to_ids(self, token):
+            assert token == "<image>"
+            return 0
+
     class NemotronNanoVLV2Processor:
+        image_token = "<image>"
         model_input_names = [
             "input_ids",
             "attention_mask",
@@ -896,10 +901,38 @@ def test_nemotron_video_datum_uses_dynamic_tubelet_inputs(monkeypatch, tmp_path)
     assert pixel_values.as_tensor(mode="patchify").shape == (1, 240, 768)
     assert user_message["imgs_sizes"].as_tensor().tolist() == [[96, 160]] * 4
     assert user_message["num_frames"].as_tensor().tolist() == [4]
+    assert (
+        user_message["media_token_validity_mask"].shape
+        == user_message["token_ids"].shape
+    )
+    assert user_message["media_token_validity_mask"].sum().item() == 1
     extra_body = json.loads(
         datum["extra_env_info"]["responses_create_params"]["metadata"]["extra_body"]
     )
     assert "mm_processor_kwargs" not in extra_body
+
+    filtered = nemo_gym_example_to_video_datum_spec(
+        example,
+        processor=NemotronNanoVLV2Processor(),
+        max_seq_length=4,
+        idx=3,
+        task_name="nemo_gym",
+        data_config=SimpleNamespace(
+            num_frames=4,
+            video_sampling_style="nemotron_vl",
+            video_temporal_patch_size=2,
+            video_target_num_patches=64,
+            video_maintain_aspect_ratio=True,
+            min_generation_tokens=16,
+        ),
+    )
+    filtered_message = filtered["message_log"][0]
+    assert filtered["loss_multiplier"] == 0.0
+    assert (
+        filtered_message["media_token_validity_mask"].shape
+        == filtered_message["token_ids"].shape
+    )
+    assert not filtered_message["media_token_validity_mask"].any()
 
 
 def test_nemotron_video_timestamps_match_vllm_integer_milliseconds():
@@ -915,6 +948,19 @@ def test_nemotron_video_timestamps_match_vllm_integer_milliseconds():
         "Frame 1 sampled at 0.00 seconds and frame 2 sampled at 0.99 seconds: "
         "<img><image><image></img>\nquestion"
     )
+
+
+def test_nemotron_video_single_expansion_aggregates_without_timestamps():
+    expanded = _expand_nemotron_video_placeholders(
+        "<image>\n<image>\n<image>\n<image>\nquestion",
+        embeddings_per_tubelet=[2, 3],
+        frame_indices=[0, 30, 60, 90],
+        fps=30.0,
+        temporal_patch_size=2,
+        expansion_mode="single",
+    )
+
+    assert expanded == "<img>" + "<image>" * 5 + "</img>\nquestion"
 
 
 def test_nemotron_cached_video_uses_native_lossless_manifest(monkeypatch, tmp_path):

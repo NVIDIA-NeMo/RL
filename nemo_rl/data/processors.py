@@ -934,7 +934,9 @@ def nemo_gym_data_processor(
 
     NeMo-Gym builds the real cumulative prompt server-side. Both LLM and VLM
     rows therefore use a placeholder here; VLM inputs are processed once after
-    the complete rollout has been collected.
+    the complete rollout has been collected. A configured video sampling style
+    enables specialized handling for rows that contain one recognized static
+    video; heterogeneous non-video rows retain the generic Gym representation.
     """
     extra_env_info = json.loads(datum_dict["extra_env_info"])
     if task_data_spec is not None and task_data_spec.video_sampling_style is not None:
@@ -958,11 +960,8 @@ def nemo_gym_data_processor(
             task_name=datum_dict["task_name"],
             data_config=task_data_spec,
         )
-        if video_output is None:
-            raise ValueError(
-                "Gym video data configuration requires a static video in every row"
-            )
-        return cast(DatumSpec, video_output)
+        if video_output is not None:
+            return cast(DatumSpec, video_output)
 
     output: DatumSpec = {
         # load to dict format here since `Dataset` cannot handle nested structure well in `NemoGymDataset`

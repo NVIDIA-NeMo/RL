@@ -389,6 +389,18 @@ class MegatronGenerationMixin:
             image_kwargs["vision_model_type"] = str(
                 generation_config["vision_model_type"]
             )
+        if "image_dynamic_resolution_model_length" in generation_config:
+            image_kwargs["dynamic_resolution_model_length"] = int(
+                generation_config["image_dynamic_resolution_model_length"]
+            )
+        if "image_dynamic_resolution_rounding_mode" in generation_config:
+            image_kwargs["dynamic_resolution_rounding_mode"] = str(
+                generation_config["image_dynamic_resolution_rounding_mode"]
+            )
+        if "image_dynamic_resolution_resize_mode" in generation_config:
+            image_kwargs["dynamic_resolution_resize_mode"] = str(
+                generation_config["image_dynamic_resolution_resize_mode"]
+            )
         return build_image_preprocessing_config(
             processor.image_processor,
             **image_kwargs,
@@ -491,6 +503,7 @@ class MegatronGenerationMixin:
         if self._inference_engine_initialized:
             return
 
+        from megatron.core.inference.config import MultimodalPromptConfig
         from megatron.core.inference.contexts.dynamic_context import (
             DynamicInferenceContext,
         )
@@ -566,6 +579,26 @@ class MegatronGenerationMixin:
             mcore_generation_config,
             frame_manifest_magic=CACHED_VIDEO_FRAME_MANIFEST_MAGIC,
         )
+        multimodal_prompt_config = None
+        prompt_config_overrides = mcore_generation_config.get(
+            "multimodal_prompt_config"
+        )
+        if prompt_config_overrides is not None:
+            if inference_wrapper_cls is None:
+                raise ValueError(
+                    "multimodal_prompt_config requires megatron_inference_wrapper."
+                )
+            wrapper_prompt_defaults = getattr(
+                inference_wrapper_cls, "multimodal_prompt_config", None
+            )
+            if wrapper_prompt_defaults is None:
+                raise ValueError(
+                    f"{inference_wrapper_cls.__name__} does not define a multimodal "
+                    "prompt contract to override."
+                )
+            multimodal_prompt_config = MultimodalPromptConfig.from_dict(
+                prompt_config_overrides, defaults=wrapper_prompt_defaults
+            )
 
         inference_config_kwargs: dict[str, Any] = {
             "block_size_tokens": block_size_tokens,
@@ -596,6 +629,7 @@ class MegatronGenerationMixin:
             "max_requests": max_requests,
             "image_preprocessing_config": image_preprocessing_config,
             "video_preprocessing_config": video_preprocessing_config,
+            "multimodal_prompt_config": multimodal_prompt_config,
         }
         _apply_optional_inference_config_kwargs(
             inference_config_kwargs, mcore_generation_config
@@ -1049,7 +1083,11 @@ class MegatronGenerationMixin:
             skip_prompt_log_probs=True,
             return_log_probs=True,
             num_tokens_to_generate=self.cfg["generation"]["max_new_tokens"],
-            termination_id=self.megatron_tokenizer.eod,
+            termination_id=(
+                None
+                if self.cfg["generation"].get("ignore_eos", False)
+                else self.megatron_tokenizer.eod
+            ),
             stop_words=stop_words,
             return_prompt_tokens=return_prompt_tokens,
             detokenize_stop_sequence=True,
