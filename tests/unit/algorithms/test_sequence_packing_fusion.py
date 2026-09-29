@@ -54,8 +54,8 @@ def test_prepare_packed_loss_input_preserves_prepacked_layout(monkeypatch):
             "cu_seqlens_padded": [torch.tensor([0, 4, 8], dtype=torch.int32)],
         }
     )
-    cu_seqlens = data["cu_seqlens"][0]
-    cu_seqlens_padded = data["cu_seqlens_padded"][0]
+    cu_seqlens_cpu = to_cpu_int_tuple(data["cu_seqlens"][0])
+    cu_seqlens_padded_cpu = to_cpu_int_tuple(data["cu_seqlens_padded"][0])
     expected = torch.arange(7, dtype=torch.float32).unsqueeze(0)
     call = {}
 
@@ -78,8 +78,8 @@ def test_prepare_packed_loss_input_preserves_prepacked_layout(monkeypatch):
         logits=torch.zeros(1, 8, 4),
         data=data,
         loss_fn=SimpleNamespace(input_type=LossInputType.LOGPROB),
-        cu_seqlens_q=cu_seqlens,
-        cu_seqlens_q_padded=cu_seqlens_padded,
+        cu_seqlens_q=cu_seqlens_cpu,
+        cu_seqlens_q_padded=cu_seqlens_padded_cpu,
         vocab_parallel_rank=0,
         vocab_parallel_group=object(),
     )
@@ -87,7 +87,7 @@ def test_prepare_packed_loss_input_preserves_prepacked_layout(monkeypatch):
     assert prepared_data is data
     assert torch.equal(loss_input["next_token_logprobs"], expected)
     assert torch.equal(call["target"], input_ids)
-    assert torch.equal(call["padded_boundaries"], cu_seqlens_padded)
+    assert call["padded_boundaries"] == cu_seqlens_padded_cpu
     assert call["unpacked_seqlen"] == input_ids.shape[1]
     assert call["kwargs"]["target_is_pre_rolled"] is False
     assert call["kwargs"]["return_packed_layout"] is True
