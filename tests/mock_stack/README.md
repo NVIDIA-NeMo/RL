@@ -61,6 +61,12 @@ Local macOS development used Python 3.13.14 and torch 2.10.0 because the
 repository's torch 2.11.0 dependency resolution required a Linux-only NCCL
 wheel. That validation does not cover the pinned Linux environment.
 
+Recorded validation: all 27 tests passed at `f4c5251` on parent `98b3b6c`.
+On updated parent `7ebf4aa`, 25 component/server/trace tests pass, but controller
+startup fails: it calls `bind_gym_acknowledgement_sink`, while the manager now
+exposes `bind_gym_acknowledgement_notifier`. The integration test keeps that
+failure visible. The example observed timeline belongs to the passing baseline.
+
 ## Recorded timelines
 
 Each `run()` writes `output/traces/<run-id>.jsonl` and returns its path as
