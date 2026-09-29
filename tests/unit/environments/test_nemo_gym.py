@@ -1270,9 +1270,7 @@ def test_nemo_gym_postprocess_uses_batch_decode():
                 },
                 {
                     "type": "message",
-                    "content": [
-                        {"type": "output_text", "text": "final answer"}
-                    ],
+                    "content": [{"type": "output_text", "text": "final answer"}],
                     "prompt_token_ids": [1, 2, 3, 4, 5],
                     "generation_token_ids": [6, 7],
                     "generation_log_probs": [-0.2, -0.3],

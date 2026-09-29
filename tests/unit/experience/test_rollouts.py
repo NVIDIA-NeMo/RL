@@ -2232,15 +2232,12 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
     assert rollout_result.rollout_metrics["reward_score_raw/mean"] == 1.5
     assert rollout_result.rollout_metrics["zero_advantage_group_pct"] == 0.0
     assert (
-        rollout_result.rollout_metrics[
-            "reward_score_raw/all_equal_in_group_pct"
-        ]
-        == 0.0
+        rollout_result.rollout_metrics["reward_score_raw/all_equal_in_group_pct"] == 0.0
     )
     assert rollout_result.rollout_metrics["reward_score_raw/pairwise_tie_pct"] == 0.0
-    assert rollout_result.rollout_metrics["reward_score_raw/std_in_group"] == pytest.approx(
-        2**-0.5
-    )
+    assert rollout_result.rollout_metrics[
+        "reward_score_raw/std_in_group"
+    ] == pytest.approx(2**-0.5)
     assert rollout_result.rollout_metrics["reasoning_tokens_per_sample/mean"] == 0.5
     assert rollout_result.rollout_metrics["reasoning_tokens_per_sample/p05"] == 0.0
     assert rollout_result.rollout_metrics["reasoning_tokens_per_sample/p95"] == 1.0
@@ -2254,13 +2251,13 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
     assert rollout_result.rollout_metrics["reward_rubric_mean_clean/mean"] == 1.0
     assert rollout_result.rollout_metrics["reward_overall_raw/mean"] == 1.5
     assert (
-        rollout_result.rollout_metrics[
-            "reward_overall_raw/all_equal_in_group_pct"
-        ]
+        rollout_result.rollout_metrics["reward_overall_raw/all_equal_in_group_pct"]
         == 0.0
     )
     assert rollout_result.rollout_metrics["reward_overall_raw/pairwise_tie_pct"] == 0.0
-    assert rollout_result.rollout_metrics["reward_overall_len_adjusted/mean"] == pytest.approx(1.6)
+    assert rollout_result.rollout_metrics[
+        "reward_overall_len_adjusted/mean"
+    ] == pytest.approx(1.6)
     assert rollout_result.rollout_metrics["reward_length_adjustment/mean"] == 0.1
     assert (
         rollout_result.rollout_metrics["genrm_rubric_parse_failure_rate_per_group/mean"]

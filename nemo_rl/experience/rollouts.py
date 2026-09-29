@@ -2922,7 +2922,9 @@ def _postprocess_single_nemo_gym_group(
             ("response_tokens_per_sample", response_token_values),
         ):
             if values:
-                rollout_metrics.update(calculate_single_metric(values, len(values), key))
+                rollout_metrics.update(
+                    calculate_single_metric(values, len(values), key)
+                )
                 rollout_metrics[f"{key}/p05"] = pct(values, 5)
                 rollout_metrics[f"{key}/p95"] = pct(values, 95)
         for key in shared_genrm_metrics:
