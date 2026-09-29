@@ -35,9 +35,14 @@ import torch
 from nemo_rl.data_plane.schema import (
     ROUTE_ENCODING_ENVELOPE,
     ROUTE_ENCODING_LIST,
+    ROUTE_ENCODING_TENSOR,
     ROUTED_EXPERTS_FIELD,
 )
 from nemo_rl.experience.route_plan import RouteAssemblyPlan
+from nemo_rl.utils.routed_experts_codec import (
+    encode_routed_experts,
+    routed_experts_tensor_metadata,
+)
 
 # Gym's router-replay missing-route wire sentinel (== nemo_gym
 # MISSING_ROUTE_SENTINEL, restated so this module imports without the
@@ -84,8 +89,6 @@ def verify_route_fragment_integrity(
         compute_extras_digest,
     )
 
-    from nemo_rl.utils.routed_experts_codec import encode_routed_experts
-
     if extras_digest_version != EXTRAS_DIGEST_VERSION:
         return False
     try:
@@ -96,7 +99,11 @@ def verify_route_fragment_integrity(
             extras = decoded
         else:
             return False
-        if fragment.encoding == ROUTE_ENCODING_ENVELOPE:
+        if fragment.encoding == ROUTE_ENCODING_TENSOR:
+            extras[ROUTED_EXPERTS_FIELD] = routed_experts_tensor_metadata(
+                fragment.routes
+            )
+        elif fragment.encoding == ROUTE_ENCODING_ENVELOPE:
             extras[ROUTED_EXPERTS_FIELD] = encode_routed_experts(fragment.routes)
         elif fragment.encoding == ROUTE_ENCODING_LIST:
             extras[ROUTED_EXPERTS_FIELD] = fragment.routes.tolist()

@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -55,6 +56,7 @@ from nemo_rl.data_plane.schema import (
     ROUTE_ENCODING_ENVELOPE,
     ROUTE_ENCODING_LIST,
     ROUTE_ENCODING_NONE,
+    ROUTE_ENCODING_TENSOR,
     ROUTED_EXPERTS_ENCODING_FIELD,
     ROUTED_EXPERTS_FIELD,
     ROUTED_EXTRAS_METADATA_FIELD,
@@ -197,12 +199,16 @@ class TQTokenSink:
     def __init__(self, dp_client: Any, *, staging_partition: str) -> None:
         self._store = TQStagingStore(dp_client, staging_partition=staging_partition)
 
-    def stage(self, record: StagedCallRecord) -> StageResult:
+    def stage(
+        self, record: StagedCallRecord, *, attachments: Mapping[str, Any] | None = None
+    ) -> StageResult:
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.staging.records import StageResult
 
         key = record.staging_key
         try:
+            if attachments and set(attachments) != {ROUTED_EXPERTS_FIELD}:
+                raise ValueError("TQTokenSink only accepts routed_experts attachments")
             field_dict = {
                 "token_ids_delta": torch.tensor(
                     [record.token_ids_delta], dtype=torch.int64
@@ -274,9 +280,23 @@ class TQTokenSink:
             )
             routed_len = 0
             routed_encoding = ROUTE_ENCODING_NONE
+            attached_routes = (attachments or {}).get(ROUTED_EXPERTS_FIELD)
+            if attachments and not isinstance(attached_routes, torch.Tensor):
+                raise ValueError("routed_experts attachment must be a tensor")
+            if attached_routes is not None and not isinstance(routed, dict):
+                raise ValueError(
+                    "routed_experts attachment requires its capture metadata"
+                )
             if routed is not None:
                 delta_len = len(record.token_ids_delta)
-                if isinstance(routed, str):
+                if isinstance(routed, dict):
+                    if not isinstance(attached_routes, torch.Tensor):
+                        raise ValueError(
+                            "routed_experts metadata requires a tensor attachment"
+                        )
+                    experts = attached_routes
+                    routed_encoding = ROUTE_ENCODING_TENSOR
+                elif isinstance(routed, str):
                     from nemo_rl.utils.routed_experts_codec import (
                         decode_routed_experts,
                     )
@@ -573,6 +593,7 @@ def _row_to_base_snapshot(row: Any) -> StagedCallBaseSnapshot:
         ROUTE_ENCODING_NONE,
         ROUTE_ENCODING_ENVELOPE,
         ROUTE_ENCODING_LIST,
+        ROUTE_ENCODING_TENSOR,
     ):
         raise ValueError(f"unknown routed_experts_encoding {routed_encoding}")
 

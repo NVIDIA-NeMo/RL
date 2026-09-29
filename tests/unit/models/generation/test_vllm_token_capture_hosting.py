@@ -28,6 +28,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 
 nemo_gym = pytest.importorskip("nemo_gym.token_id_capture.staging")
 
@@ -53,9 +54,16 @@ pytestmark = pytest.mark.nemo_gym
 class _MemorySink:
     def __init__(self) -> None:
         self.records: list[StagedCallRecord] = []
+        self.attachments: list[dict[str, torch.Tensor] | None] = []
 
-    def stage(self, record: StagedCallRecord) -> StageResult:
+    def stage(
+        self,
+        record: StagedCallRecord,
+        *,
+        attachments: dict[str, torch.Tensor] | None = None,
+    ) -> StageResult:
         self.records.append(record)
+        self.attachments.append(attachments)
         return StageResult(ok=True, staging_key=record.staging_key)
 
 
@@ -280,7 +288,7 @@ def test_request_capture_round_trip_stages_and_rides_coords(
             generation_log_probs=[-0.1, -0.2],
         )
     if with_routed_experts:
-        message["routed_experts"] = [[[0]]] * 5
+        message["routed_experts"] = torch.zeros((5, 1, 1), dtype=torch.int16)
     content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
         worker, request, content
     )
@@ -296,9 +304,16 @@ def test_request_capture_round_trip_stages_and_rides_coords(
         -0.2,
     ]
     if with_routed_experts:
-        assert sink.records[0].extras["routed_experts"]
+        metadata = sink.records[0].extras["routed_experts"]
+        assert metadata["dtype"] == "int16"
+        assert metadata["shape"] == [5, 1, 1]
+        torch.testing.assert_close(
+            sink.attachments[0]["routed_experts"],
+            torch.zeros((5, 1, 1), dtype=torch.int16),
+        )
     else:
         assert sink.records[0].extras is None
+        assert sink.attachments[0] is None
     coords = content["ng_commit_coords"]
     assert coords["disposition"] == "staged"
     assert (coords["delta_len"], coords["cum_len"]) == (5, 5)
@@ -313,7 +328,17 @@ def test_request_capture_round_trip_stages_and_rides_coords(
     assert worker._capture_calls == {}
 
 
-def test_request_capture_token_in_prev_len_chains():
+@pytest.mark.parametrize("dtype", [torch.int8, torch.int16, torch.int32])
+def test_request_capture_token_in_prev_len_chains_without_codec(monkeypatch, dtype):
+    def reject_codec(*args, **kwargs):
+        pytest.fail("worker-owned capture must not encode or decode route envelopes")
+
+    monkeypatch.setattr(
+        "nemo_rl.utils.routed_experts_codec.encode_routed_experts", reject_codec
+    )
+    monkeypatch.setattr(
+        "nemo_rl.utils.routed_experts_codec.decode_routed_experts", reject_codec
+    )
     sink = _MemorySink()
     worker = _worker_with_capture(sink)
     request = _FakeRequest(
@@ -332,13 +357,47 @@ def test_request_capture_token_in_prev_len_chains():
     VllmAsyncGenerationWorkerImpl._begin_request_capture(
         worker, request, spliced_prompt
     )
+    content = _served_content([22], [-0.5])
+    routes = torch.arange(12, dtype=dtype).reshape(6, 1, 2)
+    content["choices"][0]["message"]["routed_experts"] = routes
     content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
-        worker, request, _served_content([22], [-0.5])
+        worker, request, content
     )
     coords = content["ng_commit_coords"]
     assert coords["parent_call_id"] == "c1"
     assert (coords["delta_len"], coords["cum_len"]) == (3, 6)
     assert sink.records[0].token_ids_delta == [20, 21, 22]
+    staged_routes = sink.attachments[0]["routed_experts"]
+    torch.testing.assert_close(staged_routes, routes[3:])
+    # Staging reuses the slice, preserving the compact dtype without a copy.
+    assert staged_routes.data_ptr() == routes[3:].data_ptr()
+    assert sink.records[0].extras["routed_experts"]["shape"] == [3, 1, 2]
+    assert "routed_experts" not in content["choices"][0]["message"]
+
+
+@pytest.mark.parametrize(
+    "routes",
+    [torch.zeros(3, dtype=torch.int16), torch.zeros((2, 1, 1), dtype=torch.int16)],
+)
+def test_request_capture_drops_routes_with_wrong_rank_or_length(routes, caplog):
+    sink = _MemorySink()
+    worker = _worker_with_capture(sink)
+    request = _FakeRequest(
+        ng_capture={"rollout_id": "r", "model_call_id": "c", "mode": "text"},
+        stream=False,
+    )
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [1, 2])
+    content = _served_content([3], [-0.1])
+    content["choices"][0]["message"]["routed_experts"] = routes
+
+    content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+        worker, request, content
+    )
+
+    assert content["ng_commit_coords"]["disposition"] == "staged"
+    assert sink.records[0].extras is None
+    assert sink.attachments[0] is None
+    assert "dropping invalid routed_experts" in caplog.text
 
 
 def _staging_chain_request(prev_len: int = 3) -> _FakeRequest:
