@@ -198,6 +198,7 @@ def resolve_critic_pretrain_config(
     # is a fresh permutation seeded with (seed + e), so raising this on a
     # finished run EXTENDS its frozen stream rather than rewriting it.
     cfg.setdefault("num_epochs", 1)
+    cfg.setdefault("repeat_forever", False)
     cfg.setdefault("seed", ppo_config.get("seed", 42))
     # Eval/dump mode: no training — load a specific checkpoint, score the
     # held-out groups, and dump per-token values aligned to message spans for
@@ -557,6 +558,7 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
     assert all_files, f"No group files found under {cp_config['shards_dir']}"
     verify_shard_meta(cp_config["shards_dir"], master_config, tokenizer)
     num_epochs = cp_config["num_epochs"]
+    repeat_forever = bool(cp_config["repeat_forever"])
     groups_per_step = cp_config["groups_per_step"]
 
     def complete_last_step(files: list[Path]) -> list[Path]:
@@ -635,7 +637,7 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
     )
     # A finished run relaunched unchanged used to fall straight through the
     # train loop and exit having done nothing. Say so instead of exiting silently.
-    if step >= planned_steps:
+    if step >= planned_steps and not repeat_forever:
         print(
             f"\n✅ Nothing to do: {step} steps already completed and this config "
             f"plans {planned_steps} (num_epochs={num_epochs}, "
@@ -649,7 +651,11 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
     if critic_train_epochs < 1:
         raise ValueError("ppo.critic_train_epochs must be at least 1")
     if value_config.get("megatron_cfg", {}).get("enabled", False):
-        value_config["megatron_cfg"]["train_iters"] = planned_steps * critic_train_epochs
+        value_config["megatron_cfg"]["train_iters"] = (
+            value_config["megatron_cfg"]["scheduler"]["lr_decay_iters"]
+            if repeat_forever
+            else planned_steps * critic_train_epochs
+        )
 
     # ------------------------------------------------------------------
     # Cluster + value model (mirrors ppo.setup()'s init_value resume probe).
@@ -681,15 +687,14 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
         value_optimizer_path = None
         print(f"  ✓ Eval mode: loading critic from {value_weights_path}")
     elif last_checkpoint_path:
-        _value_weights = _Path(last_checkpoint_path) / "value" / "weights"
-        _value_optim = _Path(last_checkpoint_path) / "value" / "optimizer"
-        value_weights_path = _value_weights if _value_weights.exists() else None
-        value_optimizer_path = _value_optim if _value_optim.exists() else None
+        value_weights_path, value_optimizer_path = checkpointer.get_resume_paths(
+            last_checkpoint_path, model_component="value"
+        )
         if value_weights_path is not None and master_config.checkpointing[
             "save_optimizer"
         ] and value_optimizer_path is None:
             raise FileNotFoundError(
-                f"Cannot resume critic without optimizer checkpoint: {_value_optim}"
+                f"Cannot resume critic without optimizer state in {value_weights_path}"
             )
         if value_weights_path is not None:
             print(f"  ✓ Resuming value model from: {value_weights_path}")
@@ -755,13 +760,19 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
     heldout_eval_files = heldout_files[: cp_config["heldout_max_groups"]]
 
     # ------------------------------------------------------------------
-    # Train loop: one pass over the frozen file order.
+    # Train loop: cycle the frozen order when monitoring determines the stop.
     # ------------------------------------------------------------------
-    while step < planned_steps:
+    while repeat_forever or step < planned_steps:
         step_start = time.perf_counter()
-        print(f"\n{'=' * 25} Critic step {step + 1}/{planned_steps} {'=' * 25}")
+        epoch, step_in_epoch = divmod(step, planned_steps)
+        print(
+            f"\n{'=' * 25} Critic step {step + 1} "
+            f"(epoch {epoch + 1}, batch {step_in_epoch + 1}/{planned_steps}) {'=' * 25}"
+        )
 
-        step_files = train_files[step * groups_per_step : (step + 1) * groups_per_step]
+        step_files = train_files[
+            step_in_epoch * groups_per_step : (step_in_epoch + 1) * groups_per_step
+        ]
         groups = [load_group(p) for p in step_files]
         train_data, repeated_batch = build_value_train_data(
             groups, tokenizer, master_config
@@ -825,6 +836,7 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
             )
         metrics["num_samples"] = float(train_data["input_ids"].shape[0])
         metrics["critic/num_updates"] = float(critic_train_epochs)
+        metrics["critic/data_epoch"] = float(epoch + 1)
         metrics["total_step_time"] = time.perf_counter() - step_start
         logger.log_metrics(metrics, step + 1, prefix="train")
         print(
@@ -835,7 +847,7 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
         )
 
         # ---- Held-out eval ----
-        is_last_step = step + 1 == planned_steps
+        is_last_step = not repeat_forever and step + 1 == planned_steps
         if heldout_eval_files and (
             (eval_period > 0 and (step + 1) % eval_period == 0) or is_last_step
         ):
