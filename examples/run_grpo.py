@@ -165,6 +165,14 @@ def main() -> None:
                     policy_factory=make_policy_factory(config.data_plane),
                 )
 
+            # ``setup`` owns NeMo-Gym spinup because it must bind Gym to the
+            # generation endpoints reserved during worker initialization.  The
+            # rollout APIs consume that actor through the canonical
+            # ``"nemo_gym"`` route, rather than through a dataset task name.
+            if _nemo_gym is not None:
+                task_to_env["nemo_gym"] = _nemo_gym
+                val_task_to_env["nemo_gym"] = _nemo_gym
+
             rl_init_timer.record("total", time.perf_counter() - main_start)
 
         rl_init_metrics = rl_init_timer.get_timing_metrics(reduction_op="sum")
