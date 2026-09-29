@@ -17,7 +17,12 @@ def test_collective_refit_calls_recompute_active_requests():
     model.modules.return_value = []
     model_loader = MagicMock()
     engine = MagicMock()
-    engine.model_engine = SimpleNamespace(model=model, model_loader=model_loader)
+    engine.model_engine = SimpleNamespace(
+        model=model,
+        model_loader=model_loader,
+        unwrap_compiled_model_for_refit=MagicMock(),
+        restore_compiled_model_after_refit=MagicMock(),
+    )
     engine.control_action.return_value = nullcontext()
 
     extension.engine = engine

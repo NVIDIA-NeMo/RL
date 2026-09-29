@@ -31,7 +31,12 @@ def _extension(backend):
     model = MagicMock()
     model.modules.return_value = [module]
     model_loader = MagicMock()
-    model_engine = SimpleNamespace(model=model, model_loader=model_loader)
+    model_engine = SimpleNamespace(
+        model=model,
+        model_loader=model_loader,
+        unwrap_compiled_model_for_refit=MagicMock(),
+        restore_compiled_model_after_refit=MagicMock(),
+    )
     engine = MagicMock()
     engine.model_engine = model_engine
     engine.control_action.side_effect = lambda **_: contextlib.nullcontext()
@@ -288,7 +293,7 @@ def test_ipc_zmq_streams_chunk_and_reloads_with_aligned_offsets(monkeypatch, fp8
     model_loader.begin_update_weights.assert_called_once_with()
     model_loader.finalize_update_weights.assert_called_once_with()
     model_loader.abort_update_weights.assert_not_called()
-    engine.reset_prefix_cache.assert_called_once_with()
+    engine.recompute_active_requests.assert_called_once_with()
     # COMPLETE is ACKed after the final chunk.
     assert extension.zmq_socket.send.call_count == 2
 
@@ -357,7 +362,7 @@ def test_ipc_zmq_offset_mismatch_returns_false_without_reload(monkeypatch):
     model_loader.begin_update_weights.assert_called_once_with()
     model_loader.finalize_update_weights.assert_not_called()
     model_loader.abort_update_weights.assert_called_once_with()
-    engine.reset_prefix_cache.assert_not_called()
+    engine.recompute_active_requests.assert_not_called()
 
 
 def test_zmq_address_and_cleanup_are_per_gpu_and_idempotent():
