@@ -36,6 +36,12 @@ policy:
     context_parallel_size: 1
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 8
+    # CuTeDSL grouped-MLP layout controls. Keep disabled/null unless enabling
+    # the corresponding routed- or shared-expert fused path.
+    moe_mlp_glu_interleave_size: null
+    use_grouped_gemm_for_shared_expert: false
+    moe_shared_expert_glu_interleave_size: null
+    use_transformer_engine_op_fuser: false
     sequence_parallel: True
     pipeline_dtype: ${policy.precision}
 

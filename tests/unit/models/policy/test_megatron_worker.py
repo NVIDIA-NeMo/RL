@@ -1383,25 +1383,653 @@ def test_megatron_refit_quantized_source_dequantizes_once_per_layer(
     monkeypatch.setattr(worker_module, "_dequantize_refit_source", dequantize)
 
     gate_spec = worker._local_refit_source_spec(
-        quantized_source, LocalHFParamSpec("gate", -2, 0, 2)
+        quantized_source,
+        LocalHFParamSpec("gate", -2, 0, 2),
+        mapping=None,
+        param_name="weight",
     )
     up_spec = worker._local_refit_source_spec(
-        quantized_source, LocalHFParamSpec("up", -2, 1, 2)
+        quantized_source,
+        LocalHFParamSpec("up", -2, 1, 2),
+        mapping=None,
+        param_name="weight",
     )
     grouped_spec = worker_module.LocalParamSpec(
         base=worker_module._GroupedRefitSource((gate_spec, up_spec))
     )
-    logical_source_cache = {}
+    source_cache = {}
 
-    gate = worker._materialize_local_refit_spec(gate_spec, logical_source_cache).buf
-    grouped = worker._materialize_local_refit_spec(
-        grouped_spec, logical_source_cache
-    ).buf
+    gate = worker._materialize_local_refit_spec(gate_spec, source_cache).buf
+    grouped = worker._materialize_local_refit_spec(grouped_spec, source_cache).buf
 
     assert gate.is_contiguous()
     assert torch.equal(grouped[0], logical_weight[:, :2])
     assert torch.equal(grouped[1], logical_weight[:, 2:])
     dequantize.assert_called_once_with(quantized_source)
+
+
+def test_canonicalize_refit_glu_weight_restores_gate_up_layout():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _canonicalize_refit_glu_weight,
+    )
+
+    gate = torch.arange(16).reshape(4, 4)
+    up = torch.arange(100, 116).reshape(4, 4)
+    interleaved = torch.cat((gate[:2], up[:2], gate[2:], up[2:]), dim=0)
+
+    result = _canonicalize_refit_glu_weight(
+        interleaved,
+        interleave_size=2,
+        param_name="decoder.layers.0.mlp.experts.linear_fc1.weight0",
+    )
+
+    assert torch.equal(result, torch.cat((gate, up), dim=0))
+
+
+def test_verify_cutedsl_grouped_mlp_execution_plan_reports_realized_ops(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    fused_op_type = type("GroupedMLP_CuTeGEMMUnary", (), {})
+    fused_op = fused_op_type()
+    group = SimpleNamespace(
+        # Unary/SReLU plans are not required to use the same basic-op span as
+        # SwiGLU.  Detection is based on the realized fused op class, not an
+        # assumed number of covered indices.
+        _forward_ops=[(fused_op, [0, 1])],
+        _backward_ops=[(fused_op, [0, 1])],
+    )
+    sequential = SimpleNamespace(_module_groups=[group])
+    te_grouped_mlp_type = type("TEGroupedMLP", (), {})
+    grouped_mlp = te_grouped_mlp_type()
+    grouped_mlp._with_fused_impl = True
+    grouped_mlp._fused_ops = (sequential,)
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = SimpleNamespace(modules=lambda: [grouped_mlp])
+    worker.rank = 3
+    monkeypatch.setenv("NRL_VERIFY_CUTEDSL_GROUPED_MLP", "1")
+
+    worker._verify_cutedsl_grouped_mlp_execution_plan()
+    worker._verify_cutedsl_grouped_mlp_execution_plan()
+
+    output = capsys.readouterr().out
+    assert output.count("[cutedsl-plan] verified") == 1
+    assert "GroupedMLP_CuTeGEMMUnary(0, 1)" in output
+
+
+def test_verify_cutedsl_grouped_mlp_execution_plan_rejects_basic_ops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    basic_op_type = type("BasicGroupedLinear", (), {})
+    basic_op = basic_op_type()
+    group = SimpleNamespace(
+        _forward_ops=[(basic_op, [0])],
+        _backward_ops=[(basic_op, [0])],
+    )
+    sequential = SimpleNamespace(_module_groups=[group])
+    te_grouped_mlp_type = type("TEGroupedMLP", (), {})
+    grouped_mlp = te_grouped_mlp_type()
+    grouped_mlp._with_fused_impl = True
+    grouped_mlp._fused_ops = (sequential,)
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = SimpleNamespace(modules=lambda: [grouped_mlp])
+    worker.rank = 0
+    monkeypatch.setenv("NRL_VERIFY_CUTEDSL_GROUPED_MLP", "1")
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"failed_modules=1.*BasicGroupedLinear.*\(0,\).*diagnostics=",
+    ):
+        worker._verify_cutedsl_grouped_mlp_execution_plan()
+
+
+def test_canonicalize_refit_glu_weight_handles_grouped_expert_dimension():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _canonicalize_refit_glu_weight,
+    )
+
+    gate = torch.arange(16).reshape(2, 4, 2)
+    up = torch.arange(100, 116).reshape(2, 4, 2)
+    interleaved = torch.cat(
+        (gate[:, :2], up[:, :2], gate[:, 2:], up[:, 2:]), dim=1
+    )
+
+    result = _canonicalize_refit_glu_weight(
+        interleaved,
+        interleave_size=2,
+        param_name="decoder.layers.0.mlp.experts.linear_fc1.weight",
+    )
+
+    assert torch.equal(result, torch.cat((gate, up), dim=1))
+
+
+def test_canonicalize_refit_glu_weight_handles_grouped_expert_bias():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _canonicalize_refit_glu_weight,
+    )
+
+    gate = torch.arange(8).reshape(2, 4)
+    up = torch.arange(100, 108).reshape(2, 4)
+    interleaved = torch.cat(
+        (gate[:, :2], up[:, :2], gate[:, 2:], up[:, 2:]), dim=1
+    )
+
+    result = _canonicalize_refit_glu_weight(
+        interleaved,
+        interleave_size=2,
+        param_name="decoder.layers.0.mlp.experts.linear_fc1.bias",
+    )
+
+    assert torch.equal(result, torch.cat((gate, up), dim=1))
+
+
+def test_canonicalize_refit_glu_weight_rejects_invalid_shape():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _canonicalize_refit_glu_weight,
+    )
+
+    with pytest.raises(ValueError, match="projection-row dimension must be divisible"):
+        _canonicalize_refit_glu_weight(
+            torch.zeros(12, 4),
+            interleave_size=4,
+            param_name="decoder.layers.0.mlp.experts.linear_fc1.weight0",
+        )
+
+
+def test_interleaved_refit_mapping_dequantizes_before_bridge_export(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+    class FakeMapping:
+        megatron_param = "decoder.layers.0.mlp.experts.linear_fc1.weight0"
+        marker = "delegated"
+
+        def megatron_to_hf(self, tensor, module):
+            self.exported_tensor = tensor
+            return {"gate_up": tensor}
+
+    gate = torch.arange(8).reshape(4, 2)
+    up = torch.arange(100, 108).reshape(4, 2)
+    interleaved = torch.cat((gate[:2], up[:2], gate[2:], up[2:]), dim=0)
+    quantized_interleaved = torch.zeros_like(interleaved, dtype=torch.uint8)
+    dequantize = MagicMock(return_value=interleaved)
+    monkeypatch.setattr(worker_module, "_dequantize_refit_source", dequantize)
+    base_mapping = FakeMapping()
+    mapping = worker_module._InterleavedGatedMLPRefitMapping(
+        base_mapping, interleave_size=2
+    )
+
+    result = mapping.megatron_to_hf(quantized_interleaved, None)
+
+    expected = torch.cat((gate, up), dim=0)
+    assert torch.equal(base_mapping.exported_tensor, expected)
+    assert torch.equal(result["gate_up"], expected)
+    assert mapping.marker == "delegated"
+    dequantize.assert_called_once_with(quantized_interleaved)
+
+
+def test_refit_task_wrapping_uses_finalized_model_config_and_skips_dense_mlp(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from megatron.bridge.models.conversion.model_bridge import WeightConversionTask
+    from megatron.bridge.models.conversion.param_mapping import GatedMLPMapping
+
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _InterleavedGatedMLPRefitMapping,
+        _wrap_interleaved_refit_tasks,
+    )
+
+    monkeypatch.delenv("USE_ACT_FUSION_FOR_DENSE", raising=False)
+    model_cfg = SimpleNamespace(
+        moe_mlp_glu_interleave_size=32,
+        moe_shared_expert_glu_interleave_size=None,
+    )
+    expert_mapping = GatedMLPMapping(
+        megatron_param="decoder.layers.0.mlp.experts.linear_fc1.weight0",
+        gate="model.layers.0.mlp.experts.0.gate_proj.weight",
+        up="model.layers.0.mlp.experts.0.up_proj.weight",
+    )
+    dense_mapping = GatedMLPMapping(
+        megatron_param="decoder.layers.0.mlp.linear_fc1.weight",
+        gate="model.layers.0.mlp.gate_proj.weight",
+        up="model.layers.0.mlp.up_proj.weight",
+    )
+    tasks = [
+        WeightConversionTask(
+            param_name=mapping.megatron_param,
+            global_param_name=mapping.megatron_param,
+            mapping=mapping,
+            param_weight=torch.zeros(64, 2),
+        )
+        for mapping in (expert_mapping, dense_mapping)
+    ]
+
+    wrapped = _wrap_interleaved_refit_tasks(tasks, model_cfg)
+
+    assert isinstance(wrapped[0].mapping, _InterleavedGatedMLPRefitMapping)
+    assert wrapped[0].mapping.interleave_size == 32
+    assert wrapped[1] is tasks[1]
+    assert wrapped[1].mapping is dense_mapping
+
+
+def test_refit_task_wrapping_handles_dense_mlp_activation_fusion(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from megatron.bridge.models.conversion.model_bridge import WeightConversionTask
+    from megatron.bridge.models.conversion.param_mapping import GatedMLPMapping
+
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _InterleavedGatedMLPRefitMapping,
+        _wrap_interleaved_refit_tasks,
+    )
+
+    monkeypatch.setenv("USE_ACT_FUSION_FOR_DENSE", "1")
+    model_cfg = SimpleNamespace(
+        moe_mlp_glu_interleave_size=2,
+        moe_shared_expert_glu_interleave_size=None,
+    )
+    mapping = GatedMLPMapping(
+        megatron_param="decoder.layers.0.mlp.linear_fc1.weight",
+        gate="model.layers.0.mlp.gate_proj.weight",
+        up="model.layers.0.mlp.up_proj.weight",
+    )
+    task = WeightConversionTask(
+        param_name=mapping.megatron_param,
+        global_param_name=mapping.megatron_param,
+        mapping=mapping,
+        param_weight=torch.zeros(8, 2),
+    )
+
+    wrapped = _wrap_interleaved_refit_tasks([task], model_cfg)
+
+    assert isinstance(wrapped[0].mapping, _InterleavedGatedMLPRefitMapping)
+    assert wrapped[0].mapping.interleave_size == 2
+
+
+def test_build_refit_conversion_tasks_reads_finalized_model_config(monkeypatch):
+    from contextlib import nullcontext
+
+    from megatron.bridge.models.conversion.model_bridge import WeightConversionTask
+    from megatron.bridge.models.conversion.param_mapping import GatedMLPMapping
+
+    from nemo_rl.models.megatron import draft
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+        _InterleavedGatedMLPRefitMapping,
+    )
+
+    model_cfg = SimpleNamespace(
+        moe_mlp_glu_interleave_size=2,
+        moe_shared_expert_glu_interleave_size=None,
+    )
+    mapping = GatedMLPMapping(
+        megatron_param="decoder.layers.0.mlp.experts.linear_fc1.weight0",
+        gate="model.layers.0.mlp.experts.0.gate_proj.weight",
+        up="model.layers.0.mlp.experts.0.up_proj.weight",
+    )
+    task = WeightConversionTask(
+        param_name=mapping.megatron_param,
+        global_param_name=mapping.megatron_param,
+        mapping=mapping,
+        param_weight=torch.zeros(8, 2),
+    )
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = SimpleNamespace(config=model_cfg)
+    worker.fp8_cfg = {
+        "enabled": True,
+        "fp8_param": False,
+        "fp8_recipe": "mxfp8",
+    }
+    worker.megatron_bridge = SimpleNamespace(
+        get_conversion_tasks=lambda _models: [task]
+    )
+    monkeypatch.setattr(
+        draft,
+        "draft_model_detached",
+        lambda _models: nullcontext(),
+    )
+
+    wrapped_task = worker._build_refit_conversion_tasks()[0]
+
+    assert isinstance(wrapped_task.mapping, _InterleavedGatedMLPRefitMapping)
+    assert wrapped_task.mapping.interleave_size == 2
+
+
+def test_sglang_lazy_refit_uses_common_conversion_task_builder(monkeypatch):
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    weight = torch.ones(2, 2)
+    tasks = [object()]
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.refit_conversion_tasks = None
+    worker._build_refit_conversion_tasks = MagicMock(return_value=tasks)
+    worker._iter_params_with_optional_kv_scales = MagicMock(
+        return_value=iter([("weight", weight)])
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.utils.iter_named_tensor_buckets",
+        lambda iterator, *, buffer_size_bytes: iterator,
+    )
+
+    buckets = list(
+        worker._iter_sglang_hf_weight_buckets(
+            target_precision="bf16",
+            sglang_quantization_cfg={"scheme": "bf16"},
+            buffer_size_bytes=1024,
+        )
+    )
+
+    assert worker.refit_conversion_tasks is tasks
+    assert len(buckets) == 1
+    assert buckets[0][0] == "weight"
+    assert buckets[0][1] is weight
+    worker._build_refit_conversion_tasks.assert_called_once_with()
+    worker._iter_params_with_optional_kv_scales.assert_called_once_with(
+        include_draft=False
+    )
+
+
+def test_refit_task_wrapping_handles_fused_and_shared_expert_mappings():
+    from megatron.bridge.models.conversion.model_bridge import WeightConversionTask
+    from megatron.bridge.models.conversion.param_mapping import (
+        FusedGatedExpertMapping,
+        GatedMLPMapping,
+    )
+
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _InterleavedGatedMLPRefitMapping,
+        _wrap_interleaved_refit_tasks,
+    )
+
+    model_cfg = SimpleNamespace(
+        moe_mlp_glu_interleave_size=2,
+        moe_shared_expert_glu_interleave_size=4,
+        use_grouped_gemm_for_shared_expert=True,
+    )
+    fused_mapping = FusedGatedExpertMapping(
+        megatron_param="decoder.layers.0.mlp.experts.linear_fc1.weight0",
+        hf_param="model.layers.0.mlp.experts.gate_up_proj",
+    )
+    shared_mapping = GatedMLPMapping(
+        megatron_param="decoder.layers.0.mlp.shared_experts.linear_fc1.weight",
+        gate="model.layers.0.mlp.shared_expert.gate_proj.weight",
+        up="model.layers.0.mlp.shared_expert.up_proj.weight",
+    )
+    tasks = [
+        WeightConversionTask(
+            param_name=mapping.megatron_param,
+            global_param_name=mapping.megatron_param,
+            mapping=mapping,
+            param_weight=torch.zeros(8, 2),
+        )
+        for mapping in (fused_mapping, shared_mapping)
+    ]
+
+    wrapped = _wrap_interleaved_refit_tasks(tasks, model_cfg)
+
+    assert isinstance(wrapped[0].mapping, _InterleavedGatedMLPRefitMapping)
+    assert wrapped[0].mapping.interleave_size == 2
+    assert isinstance(wrapped[1].mapping, _InterleavedGatedMLPRefitMapping)
+    assert wrapped[1].mapping.interleave_size == 4
+
+
+def test_refit_rejects_shared_interleave_without_grouped_gemm():
+    from megatron.bridge.models.conversion.model_bridge import WeightConversionTask
+    from megatron.bridge.models.conversion.param_mapping import GatedMLPMapping
+
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _wrap_interleaved_refit_tasks,
+    )
+
+    model_cfg = SimpleNamespace(
+        moe_mlp_glu_interleave_size=None,
+        moe_shared_expert_glu_interleave_size=4,
+        use_grouped_gemm_for_shared_expert=False,
+    )
+    mapping = GatedMLPMapping(
+        megatron_param="decoder.layers.0.mlp.shared_experts.linear_fc1.weight",
+        gate="model.layers.0.mlp.shared_expert.gate_proj.weight",
+        up="model.layers.0.mlp.shared_expert.up_proj.weight",
+    )
+    task = WeightConversionTask(
+        param_name=mapping.megatron_param,
+        global_param_name=mapping.megatron_param,
+        mapping=mapping,
+        param_weight=torch.zeros(8, 2),
+    )
+
+    with pytest.raises(
+        ValueError, match="requires use_grouped_gemm_for_shared_expert=True"
+    ):
+        _wrap_interleaved_refit_tasks([task], model_cfg)
+
+
+def test_refit_rejects_physical_fp8_parameter_export_with_glu_interleaving():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _validate_refit_fp8_param_interleave,
+    )
+
+    model_cfg = SimpleNamespace(
+        moe_mlp_glu_interleave_size=32,
+        moe_shared_expert_glu_interleave_size=None,
+    )
+
+    with pytest.raises(NotImplementedError, match="scale tensors"):
+        _validate_refit_fp8_param_interleave(
+            model_cfg,
+            {"enabled": True, "fp8_param": True, "fp8_recipe": "blockwise"},
+            "hf_export",
+        )
+
+
+def test_refit_allows_blockwise_fp8_with_logical_weight_payload():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _validate_refit_fp8_param_interleave,
+    )
+
+    model_cfg = SimpleNamespace(
+        moe_mlp_glu_interleave_size=32,
+        moe_shared_expert_glu_interleave_size=None,
+    )
+
+    _validate_refit_fp8_param_interleave(
+        model_cfg,
+        {"enabled": True, "fp8_param": True, "fp8_recipe": "blockwise"},
+        "logical_weights",
+    )
+
+
+def test_refit_allows_mxfp8_parameter_storage_with_glu_interleaving():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _validate_refit_fp8_param_interleave,
+    )
+
+    model_cfg = SimpleNamespace(
+        moe_mlp_glu_interleave_size=32,
+        moe_shared_expert_glu_interleave_size=None,
+    )
+
+    _validate_refit_fp8_param_interleave(
+        model_cfg,
+        {"enabled": True, "fp8_param": True, "fp8_recipe": "mxfp8"},
+        "hf_export",
+    )
+
+
+def test_refit_allows_bf16_parameter_storage_with_mxfp8_compute():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _validate_refit_fp8_param_interleave,
+    )
+
+    model_cfg = SimpleNamespace(
+        moe_mlp_glu_interleave_size=32,
+        moe_shared_expert_glu_interleave_size=None,
+    )
+
+    _validate_refit_fp8_param_interleave(
+        model_cfg,
+        {"enabled": True, "fp8_param": False, "fp8_recipe": "mxfp8"},
+        "hf_export",
+    )
+
+
+def test_local_refit_shards_deinterleave_grouped_expert_fc1_once_per_layer(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from megatron.bridge.models.conversion.model_bridge import WeightConversionTask
+    from megatron.bridge.models.conversion.param_mapping import GatedMLPMapping
+
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+        _InterleavedGatedMLPRefitMapping,
+        _wrap_interleaved_refit_tasks,
+    )
+    from nemo_rl.weight_sync.nccl_reshard_utils import LocalParamSpec
+
+    gate = torch.arange(8).reshape(4, 2)
+    up = torch.arange(100, 108).reshape(4, 2)
+    interleaved = torch.cat((gate[:2], up[:2], gate[2:], up[2:]), dim=0)
+    base_mapping = GatedMLPMapping(
+        megatron_param="decoder.layers.0.mlp.experts.linear_fc1.weight0",
+        gate="model.layers.0.mlp.experts.0.gate_proj.weight",
+        up="model.layers.0.mlp.experts.0.up_proj.weight",
+    )
+    task = WeightConversionTask(
+        param_name="decoder.layers.0.mlp.experts.linear_fc1.weight0",
+        global_param_name="decoder.layers.0.mlp.experts.linear_fc1.weight0",
+        mapping=base_mapping,
+        param_weight=interleaved,
+    )
+    model_cfg = SimpleNamespace(
+        moe_mlp_glu_interleave_size=2,
+        moe_shared_expert_glu_interleave_size=None,
+    )
+    wrapped_task = _wrap_interleaved_refit_tasks([task], model_cfg)[0]
+    assert isinstance(wrapped_task.mapping, _InterleavedGatedMLPRefitMapping)
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = SimpleNamespace(config=model_cfg)
+    worker.refit_conversion_tasks = [wrapped_task]
+    worker.refit_payload_mode = "hf_export"
+    worker.is_refit_destination = False
+    worker.my_pp_stage = 0
+
+    canonicalize = MagicMock(wraps=worker_module._canonicalize_refit_glu_weight)
+    monkeypatch.setattr(
+        worker_module, "_canonicalize_refit_glu_weight", canonicalize
+    )
+
+    result = dict(worker._iter_local_hf_param_shards())
+
+    gate_spec = result[base_mapping.hf_param["gate"]]
+    up_spec = result[base_mapping.hf_param["up"]]
+    assert isinstance(gate_spec, LocalParamSpec)
+    assert isinstance(up_spec, LocalParamSpec)
+    assert gate_spec.base.tensor is interleaved
+    assert up_spec.base.tensor is interleaved
+
+    source_cache = {}
+    materialized_gate = worker._materialize_local_refit_spec(
+        gate_spec, source_cache
+    ).buf
+    materialized_up = worker._materialize_local_refit_spec(up_spec, source_cache).buf
+
+    assert torch.equal(materialized_gate, gate)
+    assert torch.equal(materialized_up, up)
+    canonicalize.assert_called_once()
+
+    # The source map is built once but must read current parameter values on
+    # every refit, after later optimizer steps have updated them in place.
+    interleaved.add_(1000)
+    next_refit_cache = {}
+    assert torch.equal(
+        worker._materialize_local_refit_spec(gate_spec, next_refit_cache).buf,
+        gate + 1000,
+    )
+    assert torch.equal(
+        worker._materialize_local_refit_spec(up_spec, next_refit_cache).buf,
+        up + 1000,
+    )
+    assert canonicalize.call_count == 2
+
+    grouped_name = "model.layers.0.mlp.experts.gate_proj.weight"
+    refit_info = {
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {
+            "model.layers.0": [
+                {
+                    "name": grouped_name,
+                    "global_shape": [1, 4, 2],
+                    "grouped_expert_proj": "gate_proj",
+                }
+            ]
+        },
+    }
+    grouped_spec = worker.build_hf_to_local_param_map(refit_info).get(grouped_name)
+    assert grouped_spec is not None
+    assert torch.equal(
+        worker._materialize_local_refit_spec(grouped_spec, {}).buf,
+        (gate + 1000).unsqueeze(0),
+    )
+
+
+def test_local_refit_shards_dequantize_before_deinterleaving_once_per_layer(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from megatron.bridge.models.conversion.param_mapping import (
+        GatedMLPMapping,
+        LocalHFParamSpec,
+    )
+
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+    worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+    quantized_interleaved = torch.zeros((8, 2), dtype=torch.uint8)
+    gate = torch.arange(8, dtype=torch.bfloat16).reshape(4, 2)
+    up = torch.arange(100, 108, dtype=torch.bfloat16).reshape(4, 2)
+    logical_interleaved = torch.cat((gate[:2], up[:2], gate[2:], up[2:]), dim=0)
+    dequantize = MagicMock(return_value=logical_interleaved)
+    monkeypatch.setattr(worker_module, "_dequantize_refit_source", dequantize)
+
+    base_mapping = GatedMLPMapping(
+        megatron_param="decoder.layers.0.mlp.experts.linear_fc1.weight0",
+        gate="model.layers.0.mlp.experts.0.gate_proj.weight",
+        up="model.layers.0.mlp.experts.0.up_proj.weight",
+    )
+    mapping = worker_module._InterleavedGatedMLPRefitMapping(base_mapping, 2)
+    gate_spec = worker._local_refit_source_spec(
+        quantized_interleaved,
+        LocalHFParamSpec(base_mapping.hf_param["gate"], -2, 0, 2),
+        mapping=mapping,
+        param_name=base_mapping.megatron_param,
+    )
+    up_spec = worker._local_refit_source_spec(
+        quantized_interleaved,
+        LocalHFParamSpec(base_mapping.hf_param["up"], -2, 1, 2),
+        mapping=mapping,
+        param_name=base_mapping.megatron_param,
+    )
+
+    source_cache = {}
+    materialized_gate = worker._materialize_local_refit_spec(gate_spec, source_cache).buf
+    materialized_up = worker._materialize_local_refit_spec(up_spec, source_cache).buf
+
+    assert torch.equal(materialized_gate, gate)
+    assert torch.equal(materialized_up, up)
+    dequantize.assert_called_once_with(quantized_interleaved)
 
 
 def test_qwen3vl_type_fallback_still_delegates_packing():
@@ -1524,6 +2152,51 @@ def test_megatron_offload_before_refit_finalizes_async_save_first(monkeypatch):
 
     assert events[0] == "finalize_async_save"
     assert events.index("finalize_async_save") < events.index(("move_model", True))
+
+
+def test_log_gpu_mem_env_flag_emits_interval_peak(monkeypatch, capfd):
+    from nemo_rl.models.policy.workers import megatron_policy_worker
+
+    gib = 1024**3
+    worker = object.__new__(megatron_policy_worker.MegatronPolicyWorkerImpl)
+    worker.rank = 7
+    reset_peak = MagicMock()
+
+    monkeypatch.setenv("NRL_LOG_GPU_MEM", "1")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 2)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _dev: (20 * gib, 100 * gib))
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda _dev: 10 * gib)
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda _dev: 30 * gib)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda _dev: 40 * gib)
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda _dev: 50 * gib)
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", reset_peak)
+
+    worker._log_gpu_mem("train_prep_exit")
+
+    assert capfd.readouterr().out.strip() == (
+        "[gpumem] tag=train_prep_exit rank=7 alloc=10.00 max_alloc=30.00 "
+        "reserved=40.00 max_reserved=50.00 driver_used=80.00 total=100.00"
+    )
+    reset_peak.assert_called_once_with(2)
+
+
+def test_log_gpu_mem_disabled_does_not_touch_peak_counters(monkeypatch):
+    from nemo_rl.models.policy.workers import megatron_policy_worker
+
+    worker = object.__new__(megatron_policy_worker.MegatronPolicyWorkerImpl)
+    memory_allocated = MagicMock()
+
+    monkeypatch.delenv("NRL_LOG_GPU_MEM", raising=False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        megatron_policy_worker.log, "isEnabledFor", lambda _level: False
+    )
+    monkeypatch.setattr(torch.cuda, "memory_allocated", memory_allocated)
+
+    worker._log_gpu_mem("disabled")
+
+    memory_allocated.assert_not_called()
 
 
 @pytest.mark.parametrize("hooks_enabled", [True, False])
