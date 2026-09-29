@@ -25,7 +25,7 @@ jobs:
     with:
       target-branch: main
       trigger-label: cherry-pick-to-main
-      notify-mention: "@nemo_rl_oncall"
+      notify-mention: "<!subteam^S0C1W14AHS7>"
       default-cicd-label: ""
       app-id: ${{ vars.BOT_ID }}
     secrets:
