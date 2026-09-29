@@ -2378,7 +2378,8 @@ async def run_async_nemo_gym_rollout(
             heterogeneous group. This requires ``num_generations`` to equal the
             batch size and is used by synchronous callers.
         reward_group_size: Actual generations per prompt when a synchronous
-            caller combines multiple prompt groups into one returned batch.
+            caller combines multiple prompt groups into one returned batch;
+            used only to compute per-prompt reward diagnostics correctly.
         sampling_params: Sampling profile stamped onto every NeMo-Gym row.
             ``None`` uses the train profile from ``generation_config``;
             validation passes its own profile explicitly.

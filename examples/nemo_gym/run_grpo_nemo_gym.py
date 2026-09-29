@@ -99,6 +99,8 @@ def collect_trajectories(
             generation_config=generation_config,
             # This utility consumes the Tables below to write its trajectory JSONL.
             log_full_result_tables=True,
+            # Postprocessing requires the actual diagnostic group size;
+            # trajectory collection produces one row per prompt.
             num_generations_per_prompt=1,
             max_rollout_turns=None,
             greedy=False,

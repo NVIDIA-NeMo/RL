@@ -847,7 +847,7 @@ Depending on your data shape, you may want to change these values."""
 
         # Head server
         initial_global_config_dict[HEAD_SERVER_KEY_NAME] = {
-            # Remote RLHF workers need a routable address, not 0.0.0.0.
+            # Remote NeMo-Gym processes need a routable address, not 0.0.0.0.
             "host": self.node_ip,
             "port": self.head_server_port,
         }
