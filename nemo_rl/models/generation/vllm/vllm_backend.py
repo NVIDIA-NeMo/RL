@@ -15,7 +15,7 @@ import gc
 import logging
 import re
 import socket
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from typing import Any, Literal, Optional, Protocol
 
@@ -305,6 +305,53 @@ def _filter_gemma4_unified_multimodal_weights(
     )
 
 
+def _tied_embedding_aliases(model: torch.nn.Module | None) -> dict[str, str]:
+    """Return vLLM's ``{alias qualname: canonical qualname}`` for tied embeddings.
+
+    Uses vLLM's own detector so this set is exactly what ``AutoWeightsLoader``
+    skips. Empty on a vLLM without the helper, which also has no alias check,
+    so the filter below becomes a no-op there. Also empty for a stand-in that
+    is not a module tree (a bare ``load_weights`` callable), which has no tied
+    embeddings for the detector to walk.
+    """
+    if model is None or not hasattr(model, "named_modules"):
+        return {}
+    try:
+        from vllm.model_executor.models.utils import _get_tied_embedding_params
+    except ImportError:
+        return {}
+    return _get_tied_embedding_params(model)
+
+
+def _drop_tied_embedding_aliases(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    aliases: Mapping[str, str],
+    mapper: Any | None,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Drop checkpoint weights that vLLM would skip as tied-embedding aliases.
+
+    vLLM 0.29's ``AutoWeightsLoader`` skips e.g. ``lm_head.weight`` when it is
+    tied to the input embedding and then asserts that the canonical embedding
+    weight was loaded in the *same* ``load_weights`` call
+    (vllm-project/vllm#51665). Refit streams weights in transport-sized
+    batches, so the two routinely arrive in different calls and every refit of
+    a tied-embedding model died with ``'lm_head.weight' was skipped because it
+    is tied to 'model.embed_tokens.weight' ... was not found in the
+    checkpoint``. The alias never loads anything, so dropping it up front is
+    lossless. ``mapper`` is the model's ``hf_to_vllm_mapper`` (if any): the
+    alias set is keyed by vLLM parameter names while refit sends checkpoint
+    names, and the loader applies the same mapper before its check.
+    """
+    if not aliases:
+        yield from weights
+        return
+    for name, weight in weights:
+        mapped = mapper._map_name(name) if mapper is not None else name
+        if mapped is not None and mapped in aliases:
+            continue
+        yield name, weight
+
+
 def _read_mtp_layer_weights_from_checkpoint(
     model_path: str, mtp_layer_indices: set[int]
 ) -> list[tuple[str, torch.Tensor]]:
@@ -361,6 +408,13 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
     # False for a checkpoint-loaded static MTP drafter; True only when the
     # trainer exports MTP weights in every policy refit stream.
     _mtp_drafter_weights_from_refit: bool = True
+    # vLLM's legacy GPUModelRunner keeps the speculative proposer as ``drafter``;
+    # the v2 model runner (vllm/v1/worker/gpu/model_runner.py, the default since
+    # vLLM 0.29) keeps it as ``speculator``. Both expose the draft nn.Module as
+    # ``.model``. Checked in this order so a legacy runner is never shadowed.
+    _DRAFTER_OWNER_ATTRS: tuple[str, ...] = ("drafter", "speculator")
+    # Each worker reports a missing drafter for a co-trained MTP head at most once.
+    _warned_missing_mtp_drafter: bool = False
     # Each worker logs the Gemma 4 Unified multimodal filtering at most once.
     _logged_gemma4_unified_drop: bool = False
     _sparse_delta_applier: Any = None
@@ -434,6 +488,29 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             return
         self._load_full_hf_weights(policy_weights)
 
+    def _without_tied_embedding_aliases(
+        self, policy_weights: list[tuple[str, torch.Tensor]]
+    ) -> list[tuple[str, torch.Tensor]]:
+        """Drop the tied-embedding aliases vLLM would skip (see module helper)."""
+        model = getattr(self.model_runner, "model", None)
+        aliases = _tied_embedding_aliases(model)
+        if not aliases:
+            return policy_weights
+        kept = list(
+            _drop_tied_embedding_aliases(
+                policy_weights, aliases, getattr(model, "hf_to_vllm_mapper", None)
+            )
+        )
+        dropped = len(policy_weights) - len(kept)
+        if dropped and not getattr(self, "_logged_tied_alias_drop", False):
+            self._logged_tied_alias_drop = True  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
+            logger.info(
+                "Refit dropped %d tied-embedding alias weight(s); vLLM ties %s",
+                dropped,
+                ", ".join(f"{a} -> {c}" for a, c in sorted(aliases.items())),
+            )
+        return kept
+
     def _prepare_reload_weight_iterator(
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterable[tuple[str, torch.Tensor]]:
@@ -446,6 +523,12 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             )
         if _is_gemma4_unified_text_only(model_config):
             weights = _filter_gemma4_unified_multimodal_weights(weights)
+        model = getattr(self.model_runner, "model", None)
+        aliases = _tied_embedding_aliases(model)
+        if aliases:
+            weights = _drop_tied_embedding_aliases(
+                weights, aliases, getattr(model, "hf_to_vllm_mapper", None)
+            )
 
         from nemo_rl.models.generation.vllm.quantization import fp8
 
@@ -746,12 +829,20 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         """Return the vLLM drafter's underlying model, or None if absent.
 
         The drafter holds the speculative-decoding draft model (Eagle3 or MTP),
-        which vLLM keeps as a module separate from the main model. Typed ``Any``
-        because these are dynamic vLLM model classes whose ``load_weights`` /
+        which vLLM keeps as a module separate from the main model, under
+        ``model_runner.drafter`` (legacy runner) or ``model_runner.speculator``
+        (v2 runner); see ``_DRAFTER_OWNER_ATTRS``. Typed ``Any`` because these
+        are dynamic vLLM model classes whose ``load_weights`` /
         ``mtp_start_layer_idx`` members are not visible through ``nn.Module``.
         """
-        draft_owner = getattr(self.model_runner, "drafter", None)
-        return getattr(draft_owner, "model", None) if draft_owner else None
+        for owner_attr in self._DRAFTER_OWNER_ATTRS:
+            draft_owner = getattr(self.model_runner, owner_attr, None)
+            draft_model = (
+                getattr(draft_owner, "model", None) if draft_owner is not None else None
+            )
+            if draft_model is not None:
+                return draft_model
+        return None
 
     def configure_mtp_drafter_weight_source(self, weights_from_refit: bool) -> None:
         """Record whether the trainer owns and refreshes the MTP weights."""
@@ -791,7 +882,21 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         method = getattr(spec_config, "method", None) if spec_config else None
         if method not in ("deepseek_mtp", "mtp"):
             return False
-        return self._get_drafter_model() is not None
+        if self._get_drafter_model() is None:
+            # Silently skipping here is how vLLM 0.29's runner rename went
+            # unnoticed: the drafter kept its dummy load-time weights and MTP
+            # acceptance sat at 0% while every golden still passed.
+            if not self._warned_missing_mtp_drafter:
+                self._warned_missing_mtp_drafter = True
+                logger.warning(
+                    "[mtp] The policy refit carries co-trained MTP drafter weights "
+                    "but vLLM exposes no drafter model (looked for model_runner.%s); "
+                    "the drafter keeps its load-time weights, so speculative "
+                    "acceptance will collapse.",
+                    " / model_runner.".join(self._DRAFTER_OWNER_ATTRS),
+                )
+            return False
+        return True
 
     def _maybe_refit_mtp_drafter(self, weights: list[tuple[str, torch.Tensor]]) -> None:
         """Load refit weights into an MTP drafter co-trained with the policy.
@@ -946,7 +1051,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 )
 
         policy_weights, draft_weights = self._split_policy_and_draft_weights(weights)
-        self._load_hf_weights(policy_weights)
+        self._load_hf_weights(self._without_tied_embedding_aliases(policy_weights))
         # Eagle3 draft weights are exported with the `draft.` prefix.
         self._load_draft_weights(draft_weights)
         # MTP drafters co-trained with the policy receive their weights from the
@@ -1113,9 +1218,11 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 else _unquantized_flashinfer_trtllm_modules(model)
             )
             reloaded_module_ids = _reload_target_module_ids(reload_targets)
-            added_skip_tensors: set[str] = set()
+            added_skip_tensors: Any = None
             if use_deepseek_v4_fp8:
                 from nemo_rl.models.generation.vllm.quantization import deepseek_v4_fp8
+
+                added_skip_tensors = deepseek_v4_fp8.SkipNames()
 
             def finalize() -> None:
                 with torch.device(self.device):
@@ -1145,7 +1252,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             finally:
                 self._nrl_layerwise_reload_active = False
                 if use_deepseek_v4_fp8:
-                    deepseek_v4_fp8.restore_refit(added_skip_tensors)
+                    deepseek_v4_fp8.restore_refit(added_skip_tensors, model)
 
             return
 
@@ -1566,7 +1673,10 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         applier = self._get_sparse_delta_applier()
         return applier.update_weights_from_decoded_sparse_payload(*payloads)
 
-    def synchronize_device(self) -> None:
+    def synchronize_sparse_refit_device(self) -> None:
+        # Not named ``synchronize_device``: vLLM 0.29 added that method to
+        # ``WorkerBase`` (vllm-project/vllm#52914) and asserts at init that a
+        # worker extension never shadows a ``Worker`` attribute.
         self._get_sparse_delta_applier().synchronize_device()
 
     def finish_sparse_delta_refit(self) -> dict[str, Any]:
