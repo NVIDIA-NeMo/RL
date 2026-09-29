@@ -2295,8 +2295,8 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
             assert num_returns == "streaming"
             return self
 
-        def remote(self, inputs, timer_prefix):
-            del inputs, timer_prefix
+        def remote(self, inputs, timer_prefix, per_prompt=False):
+            del inputs, timer_prefix, per_prompt
             return _Stream()
 
     manager = object.__new__(AsyncNemoGymRolloutImpl)
@@ -2429,8 +2429,8 @@ def test_rollout_manager_rejects_duplicate_stream_rows():
             assert num_returns == "streaming"
             return self
 
-        def remote(self, inputs, timer_prefix):
-            del inputs, timer_prefix
+        def remote(self, inputs, timer_prefix, per_prompt=False):
+            del inputs, timer_prefix, per_prompt
             return _DuplicateStream()
 
     manager = object.__new__(AsyncNemoGymRolloutImpl)
@@ -2565,8 +2565,8 @@ def test_rollout_manager_attributes_awaited_stream_failure_to_instance():
             assert num_returns == "streaming"
             return self
 
-        def remote(self, inputs, timer_prefix):
-            del inputs, timer_prefix
+        def remote(self, inputs, timer_prefix, per_prompt=False):
+            del inputs, timer_prefix, per_prompt
             return _FailedStream()
 
     manager = object.__new__(AsyncNemoGymRolloutImpl)

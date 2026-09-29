@@ -75,8 +75,10 @@ dependencies = [
   # venv; `telemetry.enabled` in the config is the on/off switch. Sourced from
   # git in [tool.uv.sources] — see the note there; the floor is above the
   # newest PyPI release so a dropped pin fails to resolve instead of silently
-  # falling back to 0.1.0.
-  "nemo-lens[sdk]>=0.2.0",
+  # falling back to 0.1.0. The aiohttp extra is what stamps a traceparent on
+  # the HTTP calls NeMo-Gym's client makes, so a Gym rollout continues the
+  # run's trace rather than starting its own.
+  "nemo-lens[sdk,aiohttp]>=0.2.0",
   "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'", # for transformer-engine no build isolation
   # tilelang — required by fused DSA TileLang kernels on Blackwell and by the
   # replacement Triton kernel mamba-ssm requires when Triton >= 3.4.0 on Hopper;
@@ -122,17 +124,6 @@ dependencies = [
 
 
 [project.optional-dependencies]
-fsdp = [
-  "transformers==5.12.1",
-  # +cu13 wheels from GitHub match torch cu130; PyPI often resolves to +cu12 (libcudart.so.12).
-  # https://github.com/Dao-AILab/flash-attention/releases/tag/v2.8.1
-  "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
-  "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
-  "flash-attn==2.8.1 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
-  "mamba-ssm",
-  "causal-conv1d",
-  "tilelang==0.1.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
-]
 automodel = [
   "nemo-automodel[moe]",
   # Automodel's FLA kernels require this TileLang version on Hopper.
@@ -312,11 +303,14 @@ megatron-bridge = { path = "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge",
 # makes the RL vLLM + base Gym worker environment impossible to select.
 nemo_gym = { path = "3rdparty/Gym-workspace/Gym", editable = true }
 nemo_run = { git = "https://github.com/NVIDIA-NeMo/Run", rev = "414f0077c648fde2c71bb1186e97ccbf96d6844c" }
-# Must stay on the rev megatron-core pins for its dev/otel extras: the workspace
-# resolves a single nemo-lens, and PyPI's newest release (0.1.0) is older than
-# that rev, so declaring this dependency without the pin downgrades lens for
-# megatron-core too.
-nemo-lens = { git = "https://github.com/NVIDIA-NeMo/Lens.git", rev = "b85578fc2b736a1804705e537001b5f45e9c715d" }
+# Deliberately ahead of the v0.2.0 rev megatron-core pins: this rev carries the
+# SpanRegistry that `span_groups` registers into and the metric registry the
+# `rl` group is declared through, neither of which exists in v0.2.0. Keep in
+# sync with the matching [tool.uv] override-dependencies entry, which is what
+# actually reconciles the two revs; the floor in [dependencies] stays above the
+# newest PyPI release so dropping either one fails to resolve instead of
+# falling back to 0.1.0.
+nemo-lens = { git = "https://github.com/NVIDIA-NeMo/Lens.git", rev = "b0f977d414b2f89938604a0b7eaa78ee08bc8700" }
 sglang = { git = "https://github.com/sgl-project/sglang.git", rev = "3003d70f680d41c59d1b7acbf65cb47795dfd19e", subdirectory = "python" }
 # torch/torchvision/triton all come from the torch index in order to pick up aarch64 wheels
 torch = [
@@ -350,6 +344,7 @@ members = [
   # nemo-rl's uv.lock you'll see it's 1.X b/c megatron mandates 1.X in the optional dependencies, so
   # globally we must choose 1.X otherwise we run into pickle issues from ray.
   "research/template_project",
+  "research/flow_grpo",
 ]
 
 [[tool.uv.index]]
@@ -462,6 +457,13 @@ override-dependencies = [
   # decord2 is pulled transitively by sglang → qwen-vl-utils[decord] on aarch64 Linux.
   # NeMo-RL no longer calls any decord API (replaced by torchvision/torchaudio).
   "decord2; sys_platform == 'never'",
+  # megatron-core still pins lens v0.2.0 in its own [tool.uv.sources]; without an
+  # override the two git URLs are a hard conflict, since the workspace resolves a
+  # single nemo-lens. We need the newer rev for `SpanRegistry` (which replaced the
+  # shipped `SpanGroup` class) and the consumer-driven metric registry
+  # (`MetricSpec`/`register_metric_group`), both of which landed after v0.2.0. Drop
+  # this once Megatron-LM bumps to the same or newer rev.
+  "nemo-lens[sdk,aiohttp] @ git+https://github.com/NVIDIA-NeMo/Lens.git@b0f977d414b2f89938604a0b7eaa78ee08bc8700",
 ]
 
 # CVE fixes
@@ -502,11 +504,9 @@ constraint-dependencies = [
 ]
 
 conflicts = [
-  [{ extra = "fsdp" }, { extra = "sglang" }],
   [{ extra = "automodel" }, { extra = "sglang" }],
   [{ extra = "mcore" }, { extra = "sglang" }],
   [{ extra = "vllm" }, { extra = "sglang" }],
-  [{ extra = "automodel" }, { extra = "fsdp" }],
   [{ extra = "automodel" }, { extra = "mcore" }],
   [{ extra = "automodel" }, { extra = "vllm" }],
   [{ extra = "vllm" }, { extra = "mcore" }],
@@ -514,7 +514,6 @@ conflicts = [
   [{ extra = "trtllm" }, { extra = "sglang" }],
   [{ extra = "trtllm" }, { extra = "automodel" }],
   [{ extra = "trtllm" }, { extra = "mcore" }],
-  [{ extra = "trtllm" }, { extra = "fsdp" }],
   [{ extra = "trtllm" }, { extra = "modelopt" }],
   [{ extra = "trtllm" }, { extra = "nvrx" }],
   [{ extra = "trtllm" }, { extra = "nemo_gym" }],
@@ -738,6 +737,7 @@ convention = "google"
 [tool.ruff.lint.per-file-ignores]
 # Ignore all directories named `tests`.
 "tests/**" = ["D"]
+"research/*/tests/**" = ["D"]
 # Ignore all files that end in `_test.py`.
 "*_test.py" = ["D"]
 # Ignore F401 (import but unused) in __init__.py

@@ -1030,40 +1030,6 @@ def _load_opd_full_teacher_lm_heads(
         )
 
 
-_MINF_CAPTURE_HOOK_PROTOCOLS = ("RequestPayloadStager", "RequestPromptPreparer")
-
-
-def _require_minf_capture_hooks() -> None:
-    """Fail at setup if the pinned megatron-core lacks the MInf capture hooks.
-
-    Megatron token capture installs a ``RequestPayloadStager`` and a
-    ``RequestPromptPreparer`` on ``DynamicInferenceEngine`` (NVIDIA/Megatron-LM
-    PR #7015). Both protocols live in ``megatron.core.inference.inference_request``,
-    so their presence can be checked at config time without building an engine.
-    """
-    try:
-        # Deferred import: megatron-core is a heavy, optional dependency that the
-        # driver venv may not carry at all.
-        from megatron.core.inference import inference_request
-    except ImportError:
-        # The worker-side guard in MegatronGenerationMixin.setup_token_capture
-        # still fails loudly when the engine lacks the hooks.
-        return
-    missing = [
-        name
-        for name in _MINF_CAPTURE_HOOK_PROTOCOLS
-        if not hasattr(inference_request, name)
-    ]
-    if missing:
-        raise NotImplementedError(
-            "Megatron token capture requires the MInf capture hooks from "
-            "NVIDIA/Megatron-LM PR #7015; the pinned megatron-core lacks "
-            f"{', '.join(missing)}. Bump 3rdparty/Megatron-Bridge-workspace/"
-            "Megatron-Bridge to a revision that includes it, or use "
-            "policy.generation.backend=vllm."
-        )
-
-
 _MINF_MEDIA_PAYLOAD_FIELDS = ("media_tensors", "compact_prompt_token_ids")
 
 
@@ -1358,7 +1324,6 @@ def setup_single_controller(
                     "Megatron token capture does not yet support router replay: "
                     "the canonical MInf stager does not yet normalize routed experts"
                 )
-            _require_minf_capture_hooks()
             if capture_media:
                 _require_minf_media_payload_fields()
 

@@ -124,12 +124,39 @@ class IPCProtocol(Enum):
 # worker classes.
 POLICY_WORKER_OVERRIDES = {
     "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker": "nemo_rl.modelopt.models.policy.workers.megatron_quant_policy_worker.MegatronQuantPolicyWorker",
-    "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker": "nemo_rl.modelopt.models.policy.workers.dtensor_quant_policy_worker.DTensorQuantPolicyWorker",
     "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2": "nemo_rl.modelopt.models.policy.workers.dtensor_quant_policy_worker_v2.DTensorQuantPolicyWorkerV2",
 }
 
 _NEMOTRON_H_MODEL_TYPES = frozenset({"nemotron_h"})
 _NEMOTRON_H_ARCHITECTURES = frozenset({"NemotronHForCausalLM"})
+
+
+def reject_dtensor_v1(
+    dtensor_cfg: dict[str, Any],
+    config_path: str,
+    *,
+    suggest_megatron: bool = True,
+) -> None:
+    """Fail at setup when a config still selects the DTensor v1 backend.
+
+    Args:
+        dtensor_cfg: The resolved dtensor_cfg mapping to inspect.
+        config_path: Dotted path used in the error message, e.g. policy.dtensor_cfg.
+        suggest_megatron: Whether to offer Megatron-Core as an alternative. Callers whose
+            config has no megatron_cfg, or that require DTensor, pass False.
+    """
+    if dtensor_cfg.get("_v2") is False:
+        message = (
+            f"{config_path}._v2=false selects the DTensor v1 backend, which has been "
+            f"removed. Set {config_path}._v2=true (v2 is the only supported DTensor "
+            f"backend)"
+        )
+        if suggest_megatron:
+            message += (
+                f", or set {config_path.rsplit('.', 1)[0]}.megatron_cfg.enabled=true "
+                f"together with {config_path}.enabled=false to train with Megatron-Core"
+            )
+        raise ValueError(message + ".")
 
 
 def resolve_policy_worker_cls(default_cls: str, config: dict) -> str:

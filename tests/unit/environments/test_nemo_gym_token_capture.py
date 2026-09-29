@@ -285,6 +285,51 @@ def test_receipt_assembly_heuristic_masks_invalid_manifest_rows() -> None:
     assert receipt["terminal_model_call_id"] is None
     assert receipt["capture_poisoned"] is True
     assert receipt["failure_reason"] == "invalid_manifest_row"
+    assert receipt["manifest"] == []
+
+
+def test_receipt_assembly_ships_only_rows_that_parse() -> None:
+    """One bad row masks the rollout but must not drop the good rows: the
+    finalizer needs their staging keys to clean the staged TQ rows."""
+    env = _capture_env()
+    good = _manifest_record("c1")
+    bad = _manifest_record("c2", parent="c1")
+    bad["delta_len"] = 0  # violates the CallRecord length contract
+    manifest = {"rollout_id": "r0", "records": [good, bad], "failures": []}
+    receipt = env._assemble_receipt(
+        "r0", manifest, terminal_response_id=None, reward=0.0
+    )
+    assert receipt["failure_reason"] == "invalid_manifest_row"
+    assert receipt["terminal_model_call_id"] is None
+    assert receipt["manifest"] == [good]
+
+
+def test_finalizer_cleans_good_rows_when_a_manifest_row_is_invalid() -> None:
+    """End to end through finalize_rollout: the receipt assembled from a
+    manifest with one bad row must reject as rollout_failed (not
+    invalid_receipt) and carry the good row's staging key."""
+    from nemo_rl.experience.rollout_reassembler import RolloutReassembler
+
+    env = _capture_env()
+    good = _manifest_record("c1")
+    bad = _manifest_record("c2", parent="c1")
+    del bad["chain_hash"]
+    manifest = {"rollout_id": "r0", "records": [good, bad], "failures": []}
+    receipt = env._assemble_receipt(
+        "r0", manifest, terminal_response_id=None, reward=0.0
+    )
+    # Rejection happens before any staging read, so no TQ client is needed.
+    finalizer = RolloutReassembler(
+        dp_client=None,
+        partition_id="canonical",
+        staging_partition="staging",
+        pad_token_id=0,
+        max_seq_len=64,
+    )
+    row = finalizer.finalize_rollout("r0", receipt, reward=0.0)
+    assert row.valid is False
+    assert row.rejection_reason == "rollout_failed:invalid_manifest_row"
+    assert row.staging_keys == [good["staging_key"]]
 
 
 def test_receipt_assembly_keeps_dead_branch_siblings_in_the_manifest() -> None:
@@ -375,6 +420,7 @@ def test_receipt_assembly_leaves_terminal_selection_unset_on_invalid_row() -> No
     # method (a "heuristic" label here would inflate that bucket's fraction).
     assert receipt["terminal_selection"] is None
     assert receipt["terminal_attribution_reason"] is None
+    assert [row["model_call_id"] for row in receipt["manifest"]] == ["c1"]
 
 
 def test_declared_and_response_id_witnesses_corroborate() -> None:

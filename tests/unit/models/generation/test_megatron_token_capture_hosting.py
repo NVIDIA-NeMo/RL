@@ -3,7 +3,8 @@
 
 from __future__ import annotations
 
-import inspect
+import asyncio
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -12,9 +13,6 @@ nemo_gym = pytest.importorskip("nemo_gym.token_id_capture.staging")
 # megatron_worker imports megatron.core at module level; skip when it is absent.
 pytest.importorskip("megatron.core")
 
-from nemo_rl.algorithms.single_controller_utils.setup import (  # noqa: E402
-    _require_minf_capture_hooks,
-)
 from nemo_rl.models.generation.megatron.megatron_generation import (  # noqa: E402
     MegatronGeneration,
 )
@@ -24,6 +22,18 @@ from nemo_rl.models.generation.megatron.megatron_worker import (  # noqa: E402
 )
 
 pytestmark = pytest.mark.nemo_gym
+
+
+@pytest.fixture
+def inference_loop():
+    """Run an asyncio loop on a background thread, mirroring the worker's setup."""
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    yield loop, thread
+    loop.call_soon_threadsafe(loop.stop)
+    thread.join(timeout=5)
+    loop.close()
 
 
 class _WorkerGroup:
@@ -97,7 +107,7 @@ def test_worker_rejects_invalid_rollout_weight_versions(monkeypatch, version) ->
 
 
 def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
-    monkeypatch,
+    monkeypatch, inference_loop
 ):
     installed_sinks = []
     installed_sources = []
@@ -128,10 +138,12 @@ def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
     monkeypatch.setattr("nemo_rl.data_plane.tq_token_sink.TQTokenSink", _Sink)
     monkeypatch.setattr("nemo_rl.data_plane.tq_token_sink.TQTokenSource", _Source)
     monkeypatch.setattr(
-        "nemo_rl.data_plane.tq_token_sink.TQMegatronPromptPreparer", _Preparer
+        "nemo_rl.models.generation.megatron.token_capture.TQMegatronPromptPreparer",
+        _Preparer,
     )
     monkeypatch.setattr(
-        "nemo_rl.data_plane.tq_token_sink.TQMegatronTokenStager", _Stager
+        "nemo_rl.models.generation.megatron.token_capture.TQMegatronTokenStager",
+        _Stager,
     )
     monkeypatch.setattr(
         "nemo_rl.models.generation.megatron.megatron_worker.torch.distributed.get_rank",
@@ -144,9 +156,13 @@ def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
         prompt_preparer=None,
         is_mp_coordinator=True,
     )
+    loop, loop_thread = inference_loop
+    worker._inference_loop = loop
     epochs = []
     worker.inference_client = SimpleNamespace(
-        set_generation_epoch=lambda version: epochs.append(version)
+        set_generation_epoch=lambda version: epochs.append(
+            (version, threading.current_thread())
+        )
     )
     worker._token_capture_enabled = False
     worker._request_payload_stager = None
@@ -164,7 +180,9 @@ def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
     assert installed_sources == [("dp", "rollout_staging", False)]
 
     worker.set_rollout_weight_version(7)
-    assert epochs == [7]
+    # The client's ZMQ socket is not thread safe and its listener task runs on
+    # the inference loop thread, so the epoch send must happen on that thread.
+    assert epochs == [(7, loop_thread)]
 
     follower = object.__new__(MegatronGenerationMixin)
     follower.dynamic_inference_engine = SimpleNamespace(
@@ -261,35 +279,3 @@ def test_worker_requires_minf_payload_stager_protocol() -> None:
 
     with pytest.raises(RuntimeError, match="RequestPayloadStager"):
         worker.setup_token_capture({}, "rollout_staging")
-
-
-def test_setup_capture_hook_gate_matches_pinned_dynamic_engine() -> None:
-    """The driver-side #7015 gate must agree with the pinned engine's hooks.
-
-    The pinned megatron-core may or may not carry the MInf capture hooks
-    (NVIDIA/Megatron-LM PR #7015). This does not assert either way; it asserts
-    that ``_require_minf_capture_hooks`` reaches the same verdict as inspecting
-    ``DynamicInferenceEngine`` itself, so it fails only when the detection logic
-    and reality diverge, and stays green across the pin bump.
-    """
-    dynamic_engine = pytest.importorskip(
-        "megatron.core.inference.engines.dynamic_engine"
-    )
-    engine_cls = dynamic_engine.DynamicInferenceEngine
-    init_source = inspect.getsource(engine_cls.__init__)
-    has_hooks = all(
-        hasattr(engine_cls, name)
-        or name in getattr(engine_cls, "__annotations__", {})
-        or name in init_source
-        for name in ("payload_stager", "prompt_preparer")
-    )
-
-    try:
-        _require_minf_capture_hooks()
-    except NotImplementedError as exc:
-        assert "7015" in str(exc)
-        gate_passes = False
-    else:
-        gate_passes = True
-
-    assert gate_passes == has_hooks

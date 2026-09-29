@@ -18,6 +18,8 @@ These tests verify basic functionality of helper utilities and do NOT
 require a running SGLang server or GPU.
 """
 
+from multiprocessing.reduction import ForkingPickler
+
 import pytest
 import torch
 from torch.multiprocessing import reductions
@@ -75,16 +77,11 @@ def test_serializer_roundtrip():
     assert deserialized == obj
 
 
-def test_reduce_tensor_modified_preserves_cpu_reduction(monkeypatch):
+def test_reduce_tensor_modified_preserves_cpu_reduction():
     """The CUDA UUID patch must leave the shorter CPU reducer protocol intact."""
     tensor = torch.tensor([1, 2, 3])
-    monkeypatch.setattr(
-        reductions,
-        "_reduce_tensor_original",
-        getattr(reductions, "_reduce_tensor_original", reductions.reduce_tensor),
-        raising=False,
-    )
-
+    # No substitution needed: the module global is captured before any patching,
+    # so it is the stock reducer whether or not this process has been patched.
     output_fn, output_args = train_utils._reduce_tensor_modified(tensor)
 
     assert output_fn is reductions.rebuild_tensor
@@ -96,13 +93,12 @@ def test_reduce_tensor_modified_converts_cuda_device_to_uuid(monkeypatch):
     """The dense CUDA reducer still converts its device argument to a UUID."""
     cuda_output_args = tuple(range(15))
     monkeypatch.setattr(
-        reductions,
-        "_reduce_tensor_original",
+        train_utils,
+        "_REDUCE_TENSOR_ORIGINAL",
         lambda *_args, **_kwargs: (
             train_utils._rebuild_cuda_tensor_modified,
             cuda_output_args,
         ),
-        raising=False,
     )
     monkeypatch.setattr(
         train_utils,
@@ -116,3 +112,83 @@ def test_reduce_tensor_modified_converts_cuda_device_to_uuid(monkeypatch):
     assert output_args[:6] == cuda_output_args[:6]
     assert output_args[6] == "cuda-uuid-6"
     assert output_args[7:] == cuda_output_args[7:]
+
+
+# ---------------------------------------------------------------------------
+# torch.multiprocessing reduction patch
+# ---------------------------------------------------------------------------
+class _ReducedCudaTensorStandIn:
+    """Pickles the way the patched CUDA reducer emits its payload.
+
+    Building the payload explicitly keeps this test off a real GPU. The reducer
+    that produces this shape is covered by
+    ``test_reduce_tensor_modified_converts_cuda_device_to_uuid``.
+    """
+
+    def __reduce__(self):
+        # Index 6 is the device slot; an int keeps _device_from_maybe_uuid off CUDA.
+        return (train_utils._rebuild_cuda_tensor_modified, tuple(range(15)))
+
+
+def _rebuild_in_unpatched_child(payload, result_queue):
+    """Runs in a fresh interpreter that never calls monkey_patch_torch_reductions().
+
+    nvidia_resiliency_ext's spawned async-checkpoint worker does exactly this: it
+    unpickles tensors reduced by the patched parent, so the rebuild wrapper has to
+    work without any state that only the patch installs.
+    """
+    try:
+        report = {
+            "patched": hasattr(reductions, "_reduce_tensor_original"),
+            "original_is_stock": (
+                train_utils._REBUILD_CUDA_TENSOR_ORIGINAL
+                is reductions.rebuild_cuda_tensor
+            ),
+        }
+        # Stand in for the native rebuild so what the assertions exercise is the
+        # wrapper's own lookup, not CUDA IPC.
+        train_utils._REBUILD_CUDA_TENSOR_ORIGINAL = lambda *args: ("rebuilt", args)
+        report["rebuilt"] = ForkingPickler.loads(payload)
+        result_queue.put(("ok", report))
+    except BaseException as exc:  # noqa: BLE001 - the failure itself is the result
+        result_queue.put(("error", repr(exc)))
+
+
+def test_rebuild_cuda_tensor_runs_in_unpatched_spawn():
+    """A reduced CUDA tensor must rebuild in a process that never applied the patch.
+
+    The wrapper used to delegate to ``reductions._rebuild_cuda_tensor_original``,
+    an attribute only the patching process holds, so the spawned
+    async-checkpoint worker died with AttributeError and the run hung until the
+    scheduler timed it out.
+    """
+    ctx = torch.multiprocessing.get_context("spawn")
+    result_queue = ctx.Queue()
+    payload = bytes(ForkingPickler.dumps(_ReducedCudaTensorStandIn()))
+    child = ctx.Process(
+        target=_rebuild_in_unpatched_child, args=(payload, result_queue)
+    )
+    child.start()
+    try:
+        status, detail = result_queue.get(timeout=180)
+    finally:
+        child.join(timeout=30)
+        if child.is_alive():
+            child.terminate()
+            child.join(timeout=30)
+        if child.is_alive():
+            child.kill()
+            child.join(timeout=30)
+        result_queue.close()
+        result_queue.join_thread()
+
+    # Reporting "ok" is not the same as exiting cleanly: a child that hangs
+    # afterwards gets terminated above, and a negative exitcode is the only
+    # thing left that still says so.
+    assert child.exitcode == 0, f"child exited with {child.exitcode}"
+    assert status == "ok", f"child raised: {detail}"
+    assert not detail["patched"], "child must model a process that never patched"
+    assert detail["original_is_stock"]
+    rebuilt_marker, rebuilt_args = detail["rebuilt"]
+    assert rebuilt_marker == "rebuilt"
+    assert rebuilt_args[6] == 6

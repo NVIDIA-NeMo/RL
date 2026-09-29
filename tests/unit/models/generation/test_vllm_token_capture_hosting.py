@@ -449,7 +449,7 @@ def test_staging_chain_cache_fetches_only_uncached_suffix():
 
 
 def test_staging_chain_prefix_length_mismatch_is_rejected_by_begin_call():
-    """prev_len enforcement lives in Gym's begin_call, not in the worker."""
+    """Gym's begin_call rejects a fetched prefix whose length is not prev_len."""
     worker = _worker_with_capture(_MemorySink())
     worker._staging_source = _MemoryPrefixSource({"r0/c1": [10, 11], "r0/c2": []})
     request = _staging_chain_request(prev_len=3)
