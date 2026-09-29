@@ -762,6 +762,14 @@ class MegatronGenerationMixin:
         if "http_server_num_replicas" in gen_cfg:
             server_kwargs["num_replicas"] = int(gen_cfg["http_server_num_replicas"])
 
+        # Sampling fields a chat request omits (Gym never sends top_k) fall back
+        # to these server defaults. Left unset, newer Megatron-LM fills them
+        # from the model's generation_config.json (e.g. Qwen3's top_k=20)
+        # and sample off-policy with respect to the training logprobs.
+        sampling_cfg = self.cfg["generation"]
+        top_p = sampling_cfg["top_p"]
+        top_k = sampling_cfg["top_k"]
+
         start_text_gen_server(
             coordinator_addr=self.coordinator_addr,
             tokenizer=self.megatron_tokenizer,
@@ -777,6 +785,9 @@ class MegatronGenerationMixin:
             # granularity and must match the engine's.
             block_size_tokens=gen_cfg["block_size_tokens"],
             prefix_caching_coordinator_policy=coordinator_policy,
+            default_temperature=float(sampling_cfg["temperature"]),
+            default_top_p=float(top_p) if top_p is not None else 1.0,
+            default_top_k=int(top_k) if top_k is not None else 0,
             **server_kwargs,
         )
 

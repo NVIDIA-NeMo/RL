@@ -322,11 +322,14 @@ def test_http_server_port_reservation(monkeypatch):
             rank=0,
             cfg={
                 "generation": {
+                    "temperature": 1.0,
+                    "top_p": 1.0,
+                    "top_k": None,
                     "mcore_generation_config": {
                         "block_size_tokens": 64,
                         "enable_prefix_caching": False,
                         "parsers": [],
-                    }
+                    },
                 }
             },
             _reserved_http_server_port=reserved_port,
@@ -383,6 +386,46 @@ def test_http_server_num_replicas_is_forwarded_only_when_set(
     monkeypatch, gen_cfg_extra, expected_num_replicas
 ):
     """Replica count reaches MCore, and stays absent when unconfigured."""
+    started = _start_stubbed_http_server(monkeypatch, gen_cfg_extra=gen_cfg_extra)
+
+    if expected_num_replicas is None:
+        assert "num_replicas" not in started
+    else:
+        assert started["num_replicas"] == expected_num_replicas
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize(
+    ("sampling_cfg", "expected_defaults"),
+    [
+        (
+            {"temperature": 0.7, "top_p": None, "top_k": None},
+            {"default_temperature": 0.7, "default_top_p": 1.0, "default_top_k": 0},
+        ),
+        (
+            {"temperature": 1.0, "top_p": 0.9, "top_k": 50},
+            {"default_temperature": 1.0, "default_top_p": 0.9, "default_top_k": 50},
+        ),
+    ],
+)
+def test_http_server_sampling_defaults_follow_policy_config(
+    monkeypatch, sampling_cfg, expected_defaults
+):
+    """The server defaults for fields a chat request omits come from the policy
+    config, so MCore never falls back to the model's generation_config.json
+    (e.g. Qwen3's top_k=20), which would sample off-policy."""
+    started = _start_stubbed_http_server(monkeypatch, sampling_cfg=sampling_cfg)
+
+    assert {key: started[key] for key in expected_defaults} == expected_defaults
+
+
+def _start_stubbed_http_server(
+    monkeypatch,
+    *,
+    gen_cfg_extra: dict | None = None,
+    sampling_cfg: dict | None = None,
+) -> dict:
+    """Run ``_setup_openai_api_server`` against a stubbed MCore server; return its kwargs."""
     started = {}
     monkeypatch.setattr(
         mlm_text_gen_server,
@@ -412,12 +455,13 @@ def test_http_server_num_replicas_is_forwarded_only_when_set(
         rank=0,
         cfg={
             "generation": {
+                **(sampling_cfg or {"temperature": 1.0, "top_p": 1.0, "top_k": None}),
                 "mcore_generation_config": {
                     "block_size_tokens": 64,
                     "enable_prefix_caching": False,
                     "parsers": [],
-                    **gen_cfg_extra,
-                }
+                    **(gen_cfg_extra or {}),
+                },
             }
         },
         _reserved_http_server_port=None,
@@ -425,11 +469,7 @@ def test_http_server_num_replicas_is_forwarded_only_when_set(
     )
 
     MegatronGenerationMixin._setup_openai_api_server(worker)
-
-    if expected_num_replicas is None:
-        assert "num_replicas" not in started
-    else:
-        assert started["num_replicas"] == expected_num_replicas
+    return started
 
 
 @pytest.mark.mcore
