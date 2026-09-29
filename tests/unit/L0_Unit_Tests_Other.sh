@@ -32,8 +32,10 @@ uv run --no-sync bash -x ./tests/run_unit.sh "unit/" "test_mxfp8_rollout_recipes
 # Skip research tests in fast mode
 if [[ "${FAST:-0}" != "1" ]]; then
     for i in research/*/tests/unit; do
-        project_dir=$(dirname $(dirname $i))
-        pushd $project_dir
+        [[ -d "$i" ]] || continue
+        project_dir=$(dirname "$(dirname "$i")")
+        pushd "$project_dir"
+        uv sync --locked --inexact --group test
         uv run --no-sync pytest tests/unit
         popd
     done
