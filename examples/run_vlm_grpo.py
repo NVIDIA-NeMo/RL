@@ -29,6 +29,7 @@ from nemo_rl.data_plane.factory import (
 )
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.models.generation import configure_generation_config
+from nemo_rl.models.generation.vllm.config import materialize_vllm_video_config
 from nemo_rl.utils.config import (
     load_config,
     parse_hydra_overrides,
@@ -73,6 +74,10 @@ def main() -> None:
 
         config = OmegaConf.to_container(config, resolve=True)
         config = MasterConfig(**config)
+        # Materialize the video sampling contract before constructing the
+        # processor or vLLM workers.  In particular, this overrides vLLM
+        # VideoMediaIO's independent 32-frame default for 64-frame recipes.
+        materialize_vllm_video_config(config.policy, config.data)
         print("Applied CLI overrides")
 
     # Print config

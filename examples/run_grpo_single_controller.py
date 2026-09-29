@@ -46,6 +46,7 @@ from nemo_rl.models.generation import (
     configure_generation_config,
     maybe_configure_engine_reaping_env,
 )
+from nemo_rl.models.generation.vllm.config import materialize_vllm_video_config
 from nemo_rl.models.policy.draft_config import draft_refit_enabled
 from nemo_rl.telemetry.instrumentation import setup_span, startup_span
 from nemo_rl.telemetry.setup import init_telemetry_driver, shutdown_telemetry
@@ -96,6 +97,10 @@ def main() -> None:
 
     config = OmegaConf.to_container(config, resolve=True)
     config = MasterConfig(**config)
+    # Keep the processor, dataset and vLLM MediaIO on one frame-count contract.
+    # Without this, vLLM's VideoMediaIO silently falls back to 32 frames even
+    # when a video recipe requests (and caches) 64 frames.
+    materialize_vllm_video_config(config.policy, config.data)
     print("Applied CLI overrides")
 
     if is_ppo_run(config):
