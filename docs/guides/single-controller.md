@@ -416,10 +416,11 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   replacement, including video's timestamp-separated visual-token spans.
   Capture requests use vLLM's `skip_mm_cache=True` path to obtain concrete
   processor tensors. vLLM can still reuse its processor-only cache; this does
-  not guarantee fresh preprocessing. With caching disabled, the current text
-  and images share the token budget. The processor-only cache preprocesses
-  missing images using dummy text, so warm and fresh caches can also produce
-  different geometry when images compete for a tight budget. If that changes retained geometry or placeholder tokens, the worker
+  not guarantee fresh preprocessing. vLLM tiles images from a dummy prompt, so
+  the request text never changes geometry, but the images of one request share
+  the token budget: adding an image under a tight budget can re-tile a retained
+  one, and a warm processor-only cache can keep a geometry a fresh processor
+  would not reproduce. If that changes retained geometry or placeholder tokens, the worker
   rejects the continuation before inference with HTTP 400 and error code
   `retained_media_changed` (other capture-time validation failures use
   `media_capture_rejected`). Gym's current exception middleware wraps the

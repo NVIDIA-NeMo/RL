@@ -1210,11 +1210,11 @@ def test_real_vllm_retained_image_budget_and_cache(
     first_pixels = first["mm_kwargs"]["image"][0].get_data()["pixel_values_flat"]
     second_pixels = second["mm_kwargs"]["image"][0].get_data()["pixel_values_flat"]
 
-    # A cold processor cache preprocesses missing images using dummy text.
-    # A warm cache reuses A; with caching disabled, real text consumes budget.
-    changed = budget == "tight" and (
-        cache_state == "disabled"
-        or (cache_state == "restart" and continuation == "image")
+    # vLLM (>= 0.29) runs the HF processor on dummy text, so the request's own
+    # text never changes image geometry; only the images of one request share
+    # the token budget. A warm processor-only cache reuses A as staged.
+    changed = (
+        budget == "tight" and continuation == "image" and cache_state != "warm"
     )
     if changed:
         assert first_pixels.shape != second_pixels.shape
