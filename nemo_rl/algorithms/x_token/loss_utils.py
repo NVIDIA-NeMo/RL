@@ -1044,10 +1044,9 @@ def prepare_xtoken_cross_tokenizer_loss_input(
         mesh = logits.device_mesh
         mesh_names = mesh.mesh_dim_names or ()
         tp_group = mesh.get_group("tp") if "tp" in mesh_names else None
-        cp_group = context_parallel_group
     else:
-        cp_group = context_parallel_group
         tp_group = vocab_parallel_group
+    cp_group = context_parallel_group
 
     device = torch.cuda.current_device()
 

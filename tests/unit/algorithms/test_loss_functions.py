@@ -2538,7 +2538,7 @@ def _ct_gold_data(student_chunk_id, teacher_chunk_id, pair_valid, sample_mask):
 
 def _ct_gold_prep(logits, teacher_logits, data):
     """Mirror ``prepare_loss_input``'s shared prep for the single-rank (no-CP)
-    gold path: CP-relaid student logits + localized, next-token-shifted align."""
+    gold path: student logits + localized, next-token-shifted align."""
     student_logits = logits
     align = localize_alignment(
         data, teacher_seq_len=teacher_logits.shape[1], cp_group=None
