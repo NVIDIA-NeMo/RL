@@ -649,14 +649,14 @@ class LossPostProcessor:
         )
         # Wrap loss function for sequence packing if needed
         if self.enable_seq_packing:
-            cu_seqlens_q = to_cpu_int_tuple(
+            cu_seqlens_q_cpu = to_cpu_int_tuple(
                 processed_inputs.flash_attn_kwargs.cu_seqlens_q
             )
             loss_fn = SequencePackingLossWrapper(
                 loss_fn=self.loss_fn,
                 prepare_fn=prepare_loss_input_wrapped,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_q_padded=cu_seqlens_q,
+                cu_seqlens_q=cu_seqlens_q_cpu,
+                cu_seqlens_q_padded=cu_seqlens_q_cpu,
             )
             loss, loss_metrics = loss_fn(
                 logits,
@@ -771,13 +771,13 @@ class LogprobsPostProcessor:
                 dtype=token_logprobs.dtype,
                 device=token_logprobs.device,
             )
-            cu_seqlens = to_cpu_int_tuple(
+            cu_seqlens_cpu = to_cpu_int_tuple(
                 processed_inputs.flash_attn_kwargs.cu_seqlens_q
             )
             input_lengths_cpu = to_cpu_int_tuple(input_lengths)
             for i in range(original_batch_size):
-                start = cu_seqlens[i] + 1
-                end = cu_seqlens[i + 1]
+                start = cu_seqlens_cpu[i] + 1
+                end = cu_seqlens_cpu[i + 1]
                 seq_len_actual = input_lengths_cpu[i]
                 unpacked_logprobs[i, 1:seq_len_actual] = token_logprobs[0, start:end]
             token_logprobs = unpacked_logprobs
@@ -983,14 +983,14 @@ class TopkLogitsPostProcessor:
                 device=idx.device,
             )
 
-            cu_seqlens = to_cpu_int_tuple(
+            cu_seqlens_cpu = to_cpu_int_tuple(
                 processed_inputs.flash_attn_kwargs.cu_seqlens_q
             )
             input_lengths_cpu = to_cpu_int_tuple(input_lengths)
 
             for i in range(original_batch_size):
-                start = cu_seqlens[i]
-                end = cu_seqlens[i + 1]
+                start = cu_seqlens_cpu[i]
+                end = cu_seqlens_cpu[i + 1]
                 seq_len_actual = input_lengths_cpu[i]
 
                 # Extract the corresponding portion from packed results

@@ -674,17 +674,17 @@ class LossPostProcessor:
                 wrapper_cls = SequencePackingLossWrapper
                 prepare_fn = prepare_loss_input_wrapped
 
-            cu_seqlens_q = to_cpu_int_tuple(packed_seq_params.cu_seqlens_q)
-            cu_seqlens_q_padded = (
+            cu_seqlens_q_cpu = to_cpu_int_tuple(packed_seq_params.cu_seqlens_q)
+            cu_seqlens_q_padded_cpu = (
                 to_cpu_int_tuple(packed_seq_params.cu_seqlens_q_padded)
                 if packed_seq_params.cu_seqlens_q_padded is not None
-                else cu_seqlens_q
+                else cu_seqlens_q_cpu
             )
             loss_fn_wrapped = wrapper_cls(
                 loss_fn=self.loss_fn,
                 prepare_fn=prepare_fn,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_q_padded=cu_seqlens_q_padded,
+                cu_seqlens_q=cu_seqlens_q_cpu,
+                cu_seqlens_q_padded=cu_seqlens_q_padded_cpu,
                 vocab_parallel_rank=get_tensor_model_parallel_rank(),
                 vocab_parallel_group=get_tensor_model_parallel_group(),
                 context_parallel_group=get_context_parallel_group(),
@@ -909,7 +909,7 @@ class TeacherFullPayloadPostProcessor:
         self,
         data_dict: BatchedDataDict[Any],
         input_ids: torch.Tensor,
-        cu_seqlens_padded: torch.Tensor,
+        cu_seqlens_padded: Optional[torch.Tensor | CpuIntTuple],
         original_seq_length: int,
         hidden_states: Optional[torch.Tensor] = None,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
@@ -927,17 +927,23 @@ class TeacherFullPayloadPostProcessor:
             Callable mapping the model output to ``(dummy_loss, {"logprobs":
             [B, S], "teacher_full_payload": [B, S, D]})``.
         """
+        pack = self.cfg["sequence_packing"]["enabled"]
+        cu_seqlens_padded_cpu = None
+        seq_lengths_cpu = None
+        if pack:
+            assert cu_seqlens_padded is not None
+            cu_seqlens_padded_cpu = to_cpu_int_tuple(cu_seqlens_padded)
+            seq_lengths_cpu = to_cpu_int_tuple(data_dict["input_lengths"])
+
         logprobs_fn = self._logprobs_post_processor(
             data_dict=data_dict,
             input_ids=input_ids,
-            cu_seqlens_padded=cu_seqlens_padded,
+            cu_seqlens_padded=cu_seqlens_padded_cpu,
             original_seq_length=original_seq_length,
         )
-        pack = self.cfg["sequence_packing"]["enabled"]
         cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
         batch_size = data_dict["input_ids"].shape[0]
         unpacked_seqlen = data_dict["input_ids"].shape[1]
-        seq_lengths = data_dict["input_lengths"]
 
         def processor_fn_inner(output_tensor):
             _, logprob_outputs = logprobs_fn(output_tensor)
@@ -972,19 +978,20 @@ class TeacherFullPayloadPostProcessor:
             if cp_size > 1:
                 cp_grp = get_context_parallel_group()
                 if pack:
+                    assert cu_seqlens_padded_cpu is not None
                     # Per-sequence CP allgather. CP uses a load-balanced
                     # (2 x CP interleaved) layout per sequence, so gathering the
                     # packed buffer as one contiguous shard would misplace tokens
                     # at every sequence boundary.
-                    total_packed_len = int(cu_seqlens_padded[-1].item())
+                    total_packed_len = cu_seqlens_padded_cpu[-1]
                     payload_full = torch.zeros(
                         (1, total_packed_len, payload_local.shape[-1]),
                         dtype=payload_local.dtype,
                         device=payload_local.device,
                     )
                     for i in range(batch_size):
-                        start_idx = int(cu_seqlens_padded[i].item())
-                        end_idx = int(cu_seqlens_padded[i + 1].item())
+                        start_idx = cu_seqlens_padded_cpu[i]
+                        end_idx = cu_seqlens_padded_cpu[i + 1]
                         if end_idx > start_idx:
                             local_slice = payload_local[
                                 :, start_idx // cp_size : end_idx // cp_size, :
@@ -1012,14 +1019,16 @@ class TeacherFullPayloadPostProcessor:
                 payload_full = payload_local
 
             if pack:
+                assert cu_seqlens_padded_cpu is not None
+                assert seq_lengths_cpu is not None
                 unpacked_payload = torch.zeros(
                     (batch_size, unpacked_seqlen, payload_full.shape[-1]),
                     dtype=payload_full.dtype,
                     device=payload_full.device,
                 )
                 for i in range(batch_size):
-                    seq_len = min(int(seq_lengths[i].item()), unpacked_seqlen)
-                    start_idx = int(cu_seqlens_padded[i].item())
+                    seq_len = min(seq_lengths_cpu[i], unpacked_seqlen)
+                    start_idx = cu_seqlens_padded_cpu[i]
                     if seq_len > 0:
                         unpacked_payload[i, :seq_len, :] = payload_full[
                             0, start_idx : start_idx + seq_len, :
