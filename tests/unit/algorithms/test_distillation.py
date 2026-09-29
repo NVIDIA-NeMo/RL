@@ -1175,6 +1175,8 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch, vllm_start_
             "policy": {
                 "model_name": "test-policy",
                 "tokenizer": {"name": "test-policy", "use_fastokens": False},
+                "offload_policy_before_refit": False,
+                "offload_optimizer_for_refit": True,
                 "generation": {
                     "temperature": 1.0,
                     "top_p": 1.0,
@@ -1413,6 +1415,8 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
     master_config = MasterConfig.model_construct(
         **{
             "policy": {
+                "offload_policy_before_refit": False,
+                "offload_optimizer_for_refit": True,
                 "generation": {
                     "temperature": 1.0,
                     "top_p": 1.0,
