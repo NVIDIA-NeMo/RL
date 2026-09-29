@@ -40,7 +40,9 @@ async_rl:
     warmup_lookahead_versions: null
   # Recompute generation KV caches after each weight update.
   recompute_kv_cache_after_weight_updates: false
-  # Min ready groups the streaming trainer waits for before dispatching a batch.
+  # Full-batch default. Reduce this to stream forwards, GAE, and policy backward;
+  # requires ppo_epochs=1. normalize_advantages=true then normalizes per chunk.
+  # Value training stays full batch.
   min_groups_for_streaming_train: ${ppo.num_prompts_per_step}
   # Cap on in-flight generate_and_push calls in the rollout pump.
   max_inflight_prompts: ${ppo.num_prompts_per_step}
