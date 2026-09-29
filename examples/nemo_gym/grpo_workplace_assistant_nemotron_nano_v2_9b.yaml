@@ -219,6 +219,8 @@ policy:
   make_sequence_length_divisible_by: 1
   max_grad_norm: 1.0
   offload_optimizer_for_logprob: false # Only useful for non-colocated generation since colocated generation will always offload optimizer to cuda before refit
+  offload_policy_before_refit: false
+  offload_optimizer_for_refit: true
 
   optimizer: null
 

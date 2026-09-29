@@ -59,7 +59,7 @@ single `ValueError` listing every violation. The current requirements are:
   stays GPU-resident across refit so
   persistent DDP/autograd views remain valid; ordinary gradient buffers and
   optimizer state are offloaded only when
-  `policy.generation.mcore_generation_config.offload_policy_before_refit` is true.
+  `policy.offload_policy_before_refit` is true.
 * **The wire format is always BF16, even for MXFP8 train → MXFP8 gen.** This is
   forced by the upstream API, not a shortcut, and is worth stating because it
   means an MXFP8 trainer does *not* get a smaller refit (expect ~2x the

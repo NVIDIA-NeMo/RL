@@ -194,6 +194,8 @@ policy:
   # The only thing on the SC path that takes the policy optimizer off the GPU.
   # Without it the critic's forward and train stages run on top of it.
   offload_optimizer_for_logprob: true
+  offload_policy_before_refit: false
+  offload_optimizer_for_refit: true
 
   dtensor_cfg:
     enabled: false
