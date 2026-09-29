@@ -29,7 +29,9 @@ pytestmark = pytest.mark.nemo_gym
 
 def _capture_env() -> NemoGym:
     env_cls = NemoGym.__ray_metadata__.modified_class
-    return object.__new__(env_cls)
+    env = object.__new__(env_cls)
+    env._context_compaction = False
+    return env
 
 
 def _digest(label: str) -> str:
