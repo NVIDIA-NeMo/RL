@@ -113,6 +113,7 @@ def execute_route_plan(
     *,
     dims: tuple[int, int],
     canonical_len: int,
+    backpatch_predecessor_tail: bool = False,
 ) -> tuple[Optional[torch.Tensor], Optional[str]]:
     """Assemble one canonical route tensor from staged fragments.
 
@@ -125,6 +126,9 @@ def execute_route_plan(
             direct-mode finalizer supplies dims learned from the fetched
             fragments.
         canonical_len: The published row's token length.
+        backpatch_predecessor_tail: CC requires complete delta routes and the
+            committed continuation route for the preceding final token. Each
+            plan is one segment, so no patch can cross a compaction root.
 
     Returns:
         ``(tensor, None)`` on success — ``[canonical_len, num_moe_layers,
@@ -150,6 +154,8 @@ def execute_route_plan(
             generation_len=span.generation_len,
             staged_route_len=span.staged_route_len,
         )
+        if backpatch_predecessor_tail and mode != "full":
+            return None, ROUTE_FAILURE_MISSING_FRAGMENT
         if mode != "sentinel":
             fragment = fragments.get(span.staging_key)
             if fragment is None:
@@ -167,6 +173,29 @@ def execute_route_plan(
                 return None, ROUTE_FAILURE_LENGTH
             if tuple(routes.shape[1:]) != (num_moe_layers, top_k):
                 return None, ROUTE_FAILURE_MODEL_SHAPE
+            if backpatch_predecessor_tail:
+                # Integrity was checked above over this exact metadata too.
+                metadata = json.loads(fragment.extras_metadata_json)
+                tail = (metadata or {}).get("predecessor_tail_route")
+                if position == 0:
+                    if tail is not None:
+                        return None, "unexpected_predecessor_tail"
+                else:
+                    if (
+                        not isinstance(tail, list)
+                        or len(tail) != num_moe_layers
+                        or any(
+                            not isinstance(layer, list)
+                            or len(layer) != top_k
+                            or any(
+                                type(expert) is not int or not 0 <= expert <= 32767
+                                for expert in layer
+                            )
+                            for layer in tail
+                        )
+                    ):
+                        return None, "invalid_predecessor_tail"
+                    routed[position - 1] = torch.tensor(tail, dtype=torch.int16)
             if mode == "full":
                 routed[position : position + contribution] = routes.to(torch.int16)
             else:

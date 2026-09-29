@@ -295,6 +295,10 @@ def _receipt_staging_keys(receipt: Optional[dict[str, Any]]) -> list[str]:
     """Validate a terminal Gate receipt and return its ordered staging keys."""
     if receipt is None:
         return []
+    if receipt.get("pending_call_ids"):
+        raise ValueError(
+            "Capture acknowledgement is unresolved; preserve staging until reconciliation"
+        )
     manifest = receipt.get("manifest")
     if not isinstance(manifest, list):
         raise ValueError("sealed rollout receipt must contain a manifest list")
@@ -306,7 +310,12 @@ def _receipt_staging_keys(receipt: Optional[dict[str, Any]]) -> list[str]:
                 "staging_key values"
             )
         staging_keys.append(entry["staging_key"])
-    return staging_keys
+    owner = receipt.get("rollout_id")
+    for call_id in receipt.get("attempted_call_ids", []):
+        if not isinstance(call_id, str) or not call_id or "/" in call_id:
+            raise ValueError("Invalid attempted capture call identity")
+        staging_keys.append(f"{owner}/{call_id}")
+    return list(dict.fromkeys(staging_keys))
 
 
 class RolloutRecoveryLedger:
