@@ -323,14 +323,11 @@ def localize_alignment(
     *,
     teacher_seq_len: int,
     alignment_prefix: str = "alignment_",
-    cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> LocalizedAlignment:
-    """Localize the chunk-alignment data-dict fields for the local CP shard.
+    """Unwrap the chunk-alignment data-dict fields from DTensor to local tensors.
 
-    Unwraps the ``{alignment_prefix}*`` / ``sample_mask`` entries from DTensor to
-    their local tensors. The teacher-seq ``teacher_chunk_id`` is full, so it is
-    sliced contiguously to this CP rank's ``teacher_seq_len`` window to match the
-    IPC consumer's contiguous teacher-logit slice.
+    The teacher-seq ``teacher_chunk_id`` is full, so it is trimmed to
+    ``teacher_seq_len`` to match the IPC consumer's teacher-logit slice.
 
     Args:
         alignment_prefix: Data-dict key prefix for this teacher's alignment
@@ -338,17 +335,8 @@ def localize_alignment(
             teacher in the multi-teacher trainer / collator). ``sample_mask`` is
             student-level and stays unprefixed.
     """
-    teacher_chunk_id_full = to_local_if_dtensor(
-        data[f"{alignment_prefix}teacher_chunk_id"]
-    )
-    cp_rank = (
-        torch.distributed.get_rank(cp_group)
-        if cp_group is not None and torch.distributed.get_world_size(cp_group) > 1
-        else 0
-    )
-    teacher_seq_start = cp_rank * teacher_seq_len
-    teacher_chunk_id = teacher_chunk_id_full[
-        :, teacher_seq_start : teacher_seq_start + teacher_seq_len
+    teacher_chunk_id = to_local_if_dtensor(data[f"{alignment_prefix}teacher_chunk_id"])[
+        :, :teacher_seq_len
     ]
     return LocalizedAlignment(
         sample_mask=to_local_if_dtensor(data["sample_mask"]),
@@ -1142,7 +1130,6 @@ def prepare_xtoken_cross_tokenizer_loss_input(
                 data,
                 teacher_seq_len=teacher_full_logits.shape[1],
                 alignment_prefix=alignment_prefix,
-                cp_group=cp_group,
             )
             align.student_chunk_id = cp_shift_next(
                 align.student_chunk_id, cp_group, fill=-1

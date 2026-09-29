@@ -2540,9 +2540,7 @@ def _ct_gold_prep(logits, teacher_logits, data):
     """Mirror ``prepare_loss_input``'s shared prep for the single-rank (no-CP)
     gold path: student logits + localized, next-token-shifted align."""
     student_logits = logits
-    align = localize_alignment(
-        data, teacher_seq_len=teacher_logits.shape[1], cp_group=None
-    )
+    align = localize_alignment(data, teacher_seq_len=teacher_logits.shape[1])
     align.student_chunk_id = cp_shift_next(align.student_chunk_id, None, fill=-1)
     align.teacher_chunk_id = cp_shift_next(align.teacher_chunk_id, None, fill=-1)
     return student_logits, align
