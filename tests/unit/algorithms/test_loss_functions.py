@@ -2978,10 +2978,27 @@ class TestMetricNormalizationAdvertisement:
         assert norms["num_unmasked_tokens"] is MetricNormalizer.NONE
         assert norms["num_valid_samples"] is MetricNormalizer.NONE
 
-    def test_minimal_metrics_preserve_loss_and_drop_diagnostics(self):
+    @pytest.mark.parametrize(
+        "token_level_loss,sequence_level_importance_ratios",
+        [(True, False), (False, False), (False, True)],
+    )
+    @pytest.mark.parametrize(
+        "correction", [None, "untruncated", "tis", "icepop", "seq-mask-tis"]
+    )
+    def test_minimal_metrics_preserve_loss_and_drop_diagnostics(
+        self,
+        token_level_loss: bool,
+        sequence_level_importance_ratios: bool,
+        correction: str | None,
+    ) -> None:
+        if correction == "seq-mask-tis" and sequence_level_importance_ratios:
+            pytest.skip("seq-mask-tis requires token-level importance ratios")
+        torch.manual_seed(42)
         data, batch_size, seq_len, _ = _setup_clipped_pg_test_data(
             batch_size=2, seq_len=6, device="cpu"
         )
+        data["token_mask"][0, -2:] = 0
+        data["sample_mask"][1] = 0
         data["advantages"] = torch.randn(batch_size, seq_len)
         data["prev_logprobs"] = -torch.rand(batch_size, seq_len)
         data["generation_logprobs"] = -torch.rand(batch_size, seq_len)
@@ -2993,20 +3010,26 @@ class TestMetricNormalizationAdvertisement:
             .float()
         )
 
-        full_loss, full_metrics = ClippedPGLossFn(
-            ClippedPGLossConfig(reference_policy_kl_penalty=0.0)
-        )(
+        config = ClippedPGLossConfig(
+            reference_policy_kl_penalty=0.0,
+            token_level_loss=token_level_loss,
+            sequence_level_importance_ratios=sequence_level_importance_ratios,
+            use_importance_sampling_correction=correction is not None,
+        )
+        if correction in ("tis", "icepop", "seq-mask-tis"):
+            config.truncated_importance_sampling_type = correction
+            config.truncated_importance_sampling_ratio = 2.0
+            config.truncated_importance_sampling_ratio_min = 0.5
+        full_loss, full_metrics = ClippedPGLossFn(config)(
             curr_logprobs,
             data,
             global_valid_seqs,
             global_valid_toks,
         )
-        minimal_loss, minimal_metrics = ClippedPGLossFn(
-            ClippedPGLossConfig(
-                reference_policy_kl_penalty=0.0,
-                metrics_level="minimal",
-            )
-        )(
+        minimal_loss_fn = ClippedPGLossFn(
+            config.model_copy(update={"metrics_level": "minimal"})
+        )
+        minimal_loss, minimal_metrics = minimal_loss_fn(
             curr_logprobs,
             data,
             global_valid_seqs,
@@ -3016,12 +3039,42 @@ class TestMetricNormalizationAdvertisement:
         torch.testing.assert_close(full_loss, minimal_loss)
         assert "gen_kl_error" in full_metrics
         assert "gen_kl_error" not in minimal_metrics
-        assert set(minimal_metrics) == {
-            "loss",
-            "kl_penalty",
-            "num_valid_samples",
-            "positive_nll_loss",
+        grad_normalizer = (
+            MetricNormalizer.TOKENS if token_level_loss else MetricNormalizer.SEQUENCES
+        )
+        expected_normalizations = {
+            "loss": grad_normalizer,
+            "kl_penalty": grad_normalizer,
+            "num_valid_samples": MetricNormalizer.NONE,
+            "positive_nll_loss": MetricNormalizer.NONE,
+            "token_mult_prob_error": MetricNormalizer.TOKENS,
         }
+        if correction is not None:
+            expected_normalizations["sampling_importance_ratio"] = (
+                MetricNormalizer.SEQUENCES
+                if sequence_level_importance_ratios
+                else MetricNormalizer.TOKENS
+            )
+        if correction in ("tis", "icepop", "seq-mask-tis"):
+            expected_normalizations["is_oob_ratio"] = (
+                MetricNormalizer.SEQUENCES
+                if correction == "seq-mask-tis"
+                else MetricNormalizer.TOKENS
+            )
+        assert minimal_metrics.keys() == minimal_loss_fn.metric_normalizations.keys()
+        assert minimal_loss_fn.metric_normalizations == expected_normalizations
+        for name, value in minimal_metrics.items():
+            assert value == pytest.approx(full_metrics[name])
+        # Only the first sample's first three next-token positions are valid.
+        expected_mismatch = (
+            (data["generation_logprobs"][0, 1:4] - data["prev_logprobs"][0, 1:4])
+            .abs()
+            .exp()
+            .mean()
+        )
+        assert minimal_metrics["token_mult_prob_error"] == pytest.approx(
+            expected_mismatch.item()
+        )
 
     def test_clipped_pg_metrics_use_one_host_transfer(self, monkeypatch):
         stacked_values = ()
@@ -3058,7 +3111,7 @@ class TestMetricNormalizationAdvertisement:
             .float(),
         )
 
-        assert len(stacked_values) == 4
+        assert len(stacked_values) == 5
         assert cpu_calls == 1
 
     @pytest.mark.parametrize("metrics_level", ["full", "minimal"])

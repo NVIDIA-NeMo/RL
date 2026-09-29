@@ -190,6 +190,7 @@ def test_clipped_pg_minimal_preserves_backward_compatible_loss_and_gradients(
         "kl_penalty",
         "num_valid_samples",
         "positive_nll_loss",
+        "token_mult_prob_error",
     }
     if case["config"].get("use_importance_sampling_correction", False):
         expected_metric_names.add("sampling_importance_ratio")

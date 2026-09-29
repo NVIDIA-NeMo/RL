@@ -42,8 +42,8 @@ def test_draft_loss_wrapper_combines_policy_and_draft_loss(mock_draft_loss_cls):
     """DraftLossWrapper should add the weighted draft loss to the policy loss."""
     from nemo_rl.algorithms.loss.wrapper import DraftLossWrapper
 
-    policy_loss = torch.tensor(3.0)
-    draft_loss = torch.tensor(2.0)
+    policy_loss = torch.tensor(3.0, requires_grad=True)
+    draft_loss = torch.tensor(2.0, requires_grad=True)
     metrics = {"loss": policy_loss.item(), "policy_metric": 1.0}
     next_token_logits = torch.randn(1, 2, 3)
     data = BatchedDataDict({})
@@ -69,9 +69,13 @@ def test_draft_loss_wrapper_combines_policy_and_draft_loss(mock_draft_loss_cls):
     )
 
     assert combined_loss.item() == 4.0
-    assert combined_metrics["loss"] == combined_loss.item()
+    assert combined_metrics["loss"] == policy_loss.item()
+    assert combined_metrics["total_loss"] == combined_loss.item()
     assert combined_metrics["draft_loss"] == draft_loss.item()
     assert combined_metrics["policy_metric"] == metrics["policy_metric"]
+    combined_loss.backward()
+    assert policy_loss.grad.item() == 1.0
+    assert draft_loss.grad.item() == 0.5
 
 
 @patch("nemo_rl.algorithms.loss.wrapper.DraftCrossEntropyLossFn")
@@ -107,7 +111,8 @@ def test_draft_loss_wrapper_reports_draft_loss_when_weight_is_zero(
     )
 
     assert combined_loss.item() == policy_loss.item()
-    assert metrics["loss"] == combined_loss.item()
+    assert metrics["loss"] == policy_loss.item()
+    assert metrics["total_loss"] == combined_loss.item()
     assert metrics["draft_loss"] == draft_loss.item()
 
 
@@ -228,6 +233,9 @@ def test_draft_loss_wrapper_defers_raw_stats_for_split_step(
 
     assert combined_loss.item() == pytest.approx(11.0)
     assert metrics["draft_loss"] == pytest.approx(12.0)
+    # The split worker forms total_loss once policy and draft denominators
+    # are known; combining their raw numerators here would misreport it.
+    assert "total_loss" not in metrics
     assert metrics[DRAFT_STEP_PAYLOAD_KEY] is payload
     step_state_module.DraftStepState.metric_payload.assert_called_once_with(stats)
     draft_loss_fn.assert_not_called()
@@ -372,6 +380,9 @@ def test_packed_draft_loss_matches_unpacked(draft_vocab_size, d2t):
         reference_metrics["draft_loss"], rel=1e-5
     )
     assert packed_metrics["draft_loss"] > 0.0
+    assert reference_metrics["loss"] == packed_metrics["loss"] == 0.0
+    assert reference_metrics["total_loss"] == pytest.approx(reference_loss.item())
+    assert packed_metrics["total_loss"] == pytest.approx(packed_loss.item())
 
 
 def test_packed_mode_rejects_deferred_normalization():

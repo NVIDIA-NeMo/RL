@@ -494,9 +494,18 @@ class ClippedPGLossFn(LossFunction):
                 "kl_penalty",
                 "num_valid_samples",
                 "positive_nll_loss",
+                "token_mult_prob_error",
             }
             if self.use_importance_sampling_correction:
                 minimal_metrics.add("sampling_importance_ratio")
+            if self.seq_logprob_error_in_loss:
+                minimal_metrics.update(
+                    {
+                        "seq_logprob_error_valid_tokens",
+                        "seq_logprob_error_valid_seqs",
+                        "num_masked_seqs_by_logprob_error",
+                    }
+                )
             self.metric_normalizations = {
                 name: normalizer
                 for name, normalizer in self.metric_normalizations.items()
@@ -887,6 +896,13 @@ class ClippedPGLossFn(LossFunction):
         # by either sequence or token count, depending on particular metric.
         # To get the true metric, you'll need to sum over the microbatch.
         metric_tensors = {"loss": loss.detach()}
+        with torch.no_grad():
+            lp_error = torch.abs(generation_logprobs - prev_logprobs)
+            metric_tensors["token_mult_prob_error"] = masked_mean(
+                torch.exp(lp_error * mask),
+                mask,
+                global_normalization_factor=global_valid_toks,
+            )
         if full_metrics:
             metric_tensors.update(
                 clipped_pg_diagnostic_metrics(

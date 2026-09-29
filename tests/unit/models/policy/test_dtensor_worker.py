@@ -30,8 +30,6 @@ from nemo_rl.utils.flops_tracker import FLOPTracker, get_hf_config
 from tests.unit.test_utils import SimpleLossFn, UnitSequenceLossFn
 
 
-
-
 def create_test_config(
     model_name: str,
     tp: int = 1,

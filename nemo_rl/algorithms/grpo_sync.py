@@ -1378,7 +1378,7 @@ def grpo_train_sync(
                 del log_data
 
             timing_metrics: dict = timer.get_timing_metrics(reduction_op="sum")  # type: ignore
-            if metrics.get("token_mult_prob_error", 0.0) > 1.05:
+            if metrics["token_mult_prob_error"] > 1.05:
                 logger.log_plot_token_mult_prob_error(
                     {
                         "prompt_lengths": length,
@@ -1415,7 +1415,7 @@ def grpo_train_sync(
                 + (
                     f"{generation_kl_error:.4f}"
                     if generation_kl_error is not None
-                    else "N/A"
+                    else "not reported"
                 )
             )
             if master_config.grpo.use_dynamic_sampling:

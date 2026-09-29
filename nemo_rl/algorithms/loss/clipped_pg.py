@@ -47,13 +47,7 @@ def clipped_pg_diagnostic_metrics(
     global_valid_toks: torch.Tensor,
     reference_policy_kl_type: str,
 ) -> dict[str, torch.Tensor]:
-    """Compute metrics that do not contribute to the actor objective."""
-    lp_error = torch.abs(generation_logprobs - prev_logprobs)
-    mult_prob_error = masked_mean(
-        torch.exp(lp_error * mask),
-        mask,
-        global_normalization_factor=global_valid_toks,
-    )
+    """Compute optional diagnostics for the full metric set."""
     gen_kl_error = masked_mean(
         calculate_kl(
             logprobs=generation_logprobs,
@@ -112,7 +106,6 @@ def clipped_pg_diagnostic_metrics(
         "probs_ratio_clamped_max": torch.where(
             valid_mask, ratios_clamped, neg_inf
         ).max(),
-        "token_mult_prob_error": mult_prob_error,
         "gen_kl_error": gen_kl_error,
         "policy_kl_error": policy_kl_error,
         "js_divergence_error": js_divergence_error,
