@@ -54,7 +54,8 @@ jobs:
           SHA=$(git rev-list --no-merges -n 1 HEAD)
           MESSAGE=$(git log -n 1 --pretty=format:%s $SHA)
           PR_ID=$(echo $MESSAGE | awk -F'#' '{print $2}' | awk -F')' '{print $1}')
-          USERNAME=$(git log -n 1 --pretty=format:%ae $SHA | awk -F'@' '{print $1}')
+          AUTHOR_EMAIL=$(git log -n 1 --pretty=format:%ae $SHA)
+          USERNAME=$(echo "$AUTHOR_EMAIL" | awk -F'@' '{print $1}')
 
           PR=$(curl -L \
             -H "Accept: application/vnd.github+json" \
@@ -154,7 +155,7 @@ jobs:
           else
             URL="https://github.com/$REPOSITORY/pull/$PR_ID"
 
-            SLACK_TEXT="beep boop 🤖: Hey <@$USERNAME>: Cherry-pick of <$URL|#$PR_ID> from \`$RELEASE_BRANCH\` into \`main\` failed (3-way merge impossible).\n\nPlease resolve manually and create a PR.\n\ncc: $SLACK_WEBHOOK_ADMIN @nemo_rl_oncall"
+            SLACK_TEXT="beep boop 🤖: Hey <@$USERNAME> ($AUTHOR_EMAIL): Cherry-pick of <$URL|#$PR_ID> from \`$RELEASE_BRANCH\` into \`main\` failed (3-way merge impossible).\n\nPlease resolve manually and create a PR.\n\ncc: $SLACK_WEBHOOK_ADMIN @nemo_rl_oncall"
 
             SLACK_MESSAGE=$(jq -cn \
               --arg message "$SLACK_TEXT" \
