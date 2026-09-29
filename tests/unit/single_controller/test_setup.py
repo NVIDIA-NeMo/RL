@@ -681,6 +681,24 @@ class TestSetup:
         patched_factories["setup_response_data"].assert_not_called()
         patched_factories["_build_clusters"].assert_not_called()
 
+    def test_vlm_token_capture_rejects_non_vllm_backend(self, patched_factories):
+        # Media capture is only implemented in the vLLM worker: a VLM run (any
+        # processor) with token capture must fail loudly on other backends.
+        mc = _make_master_config(
+            backend="megatron",
+            megatron_enabled=True,
+            env={"should_use_nemo_gym": True},
+        )
+        mc.token_capture.enabled = True
+
+        with pytest.raises(NotImplementedError, match="only implemented for the vLLM"):
+            setup_single_controller(
+                mc, MagicMock(pad_token_id=0), processor=MagicMock()
+            )
+
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
+
     def test_resolves_and_passes_reward_penalties(self, patched_factories):
         mc = _make_master_config()
         tokenizer = MagicMock(pad_token_id=0)
