@@ -20,7 +20,7 @@ ppo:
   max_num_steps: 100000
   ppo_epochs: 1
   critic_ppo_epochs: 1
-  policy_training_start_step: 100
+  policy_training_start_step: 400
   skip_reference_policy_logprobs_calculation: false
   # Validation is not supported by the current SingleController PPO path.
   val_period: 0
