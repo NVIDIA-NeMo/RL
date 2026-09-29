@@ -1622,6 +1622,8 @@ def get_basic_megatron_test_config(
         "logprob_batch_size": 2,
         "precision": precision,
         "offload_optimizer_for_logprob": False,
+        "offload_policy_before_refit": False,
+        "offload_optimizer_for_refit": True,
         "dtensor_cfg": {
             "enabled": False,  # Disabled for Megatron tests
         },

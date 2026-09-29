@@ -1258,15 +1258,25 @@ class TestFactory:
             )
 
     @pytest.mark.parametrize(
-        ("generation_backend", "colocated", "refit_transport"),
+        ("generation_backend", "colocated", "refit_transport", "error_match"),
         [
-            (VLLM_BACKEND, True, None),
-            (VLLM_BACKEND, False, "http"),
-            (SGLANG_BACKEND, False, None),
+            (VLLM_BACKEND, True, None, "applies only to non-colocated refit"),
+            (
+                VLLM_BACKEND,
+                False,
+                "http",
+                "requires non-colocated vLLM or Megatron",
+            ),
+            (
+                SGLANG_BACKEND,
+                False,
+                None,
+                "requires non-colocated vLLM or Megatron",
+            ),
         ],
     )
     def test_refit_memory_release_rejects_unsupported_transport(
-        self, generation_backend, colocated, refit_transport
+        self, generation_backend, colocated, refit_transport, error_match
     ):
         policy = _mock_policy()
         policy.cfg["megatron_cfg"]["enabled"] = True
@@ -1274,7 +1284,7 @@ class TestFactory:
         generation = _mock_generation()
         generation.cfg["refit_transport"] = refit_transport
 
-        with pytest.raises(ValueError, match="requires non-colocated"):
+        with pytest.raises(ValueError, match=error_match):
             create_weight_synchronizer(
                 policy=policy,
                 generation=generation,
