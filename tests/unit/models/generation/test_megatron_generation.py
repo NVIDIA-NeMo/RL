@@ -1576,3 +1576,61 @@ def test_frontend_ranks_matches_is_mp_coordinator(tp, cp, pp, world_size):
     assert MegatronGeneration.frontend_ranks(cluster, config) == _mp_coordinator_ranks(
         tp, pp, world_size
     )
+
+
+@pytest.mark.mcore
+def test_finish_generation_clears_router_replay_record_state(monkeypatch):
+    """A colocated hand-off must leave no MInf record state on the routers.
+
+    MInf puts every registered router in RECORD and attaches its fixed-size
+    route buffer. Without a dedicated inference model these are the training
+    model's routers, and a following forward that does not replay (the
+    reference-policy pass) would record into that buffer and overflow it.
+    """
+    from megatron.core.transformer.moe.router_replay import (
+        RouterReplay,
+        RouterReplayAction,
+    )
+
+    from nemo_rl.models.generation.megatron import megatron_worker as worker_module
+
+    RouterReplay.clear_global_router_replay_instances()
+    try:
+        replay = RouterReplay()
+        replay.set_router_replay_action(RouterReplayAction.RECORD)
+        replay.set_static_buffer(torch.zeros(16, 2, dtype=torch.long))
+        assert replay.router_replay_action is RouterReplayAction.RECORD
+        assert replay.static_buffer is not None
+
+        worker = object.__new__(MegatronGenerationMixin)
+        worker.rank = 0
+        worker.cfg = {
+            "generation": {
+                "mcore_generation_config": {
+                    "cuda_graph_impl": "none",
+                    "async_sched_mode": "legacy",
+                }
+            }
+        }
+        worker.is_generation_colocated = True
+        worker._router_replay_enabled = True
+        # The engine was already put to sleep by an earlier call: the clear
+        # must not hide behind the sleep path.
+        worker._inference_engine_initialized = True
+        worker._inference_engine_asleep = True
+        worker.inference_model = None
+        worker._sleep = lambda: pytest.fail("engine was already asleep")
+        worker._inference_model_and_media_parts = lambda: (
+            torch.nn.Module(),
+            None,
+        )
+        monkeypatch.setattr(worker_module, "log_gpu_memory", lambda tag: None)
+
+        worker.finish_generation()
+
+        assert replay.router_replay_action is None
+        assert replay.static_buffer is None
+        # The router list itself is left alone: MInf reads it on every step.
+        assert RouterReplay.global_router_replay_instances == [replay]
+    finally:
+        RouterReplay.clear_global_router_replay_instances()

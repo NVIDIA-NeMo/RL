@@ -866,6 +866,14 @@ class MegatronGenerationMixin:
         if self.is_generation_colocated:
             if self._inference_engine_initialized and not self._inference_engine_asleep:
                 self._sleep()
+            if self._router_replay_enabled:
+                # MInf leaves RECORD and its route buffer on these routers; a
+                # non-replaying forward (the reference pass) would record into
+                # that buffer. MInf sets both again before its next step.
+                from megatron.core.transformer.moe.router_replay import RouterReplay
+
+                RouterReplay.clear_global_router_replay_action()
+                RouterReplay.clear_global_static_buffers()
             cuda_graph_impl = self.cfg["generation"]["mcore_generation_config"][
                 "cuda_graph_impl"
             ]

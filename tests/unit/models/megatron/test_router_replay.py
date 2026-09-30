@@ -61,7 +61,10 @@ def test_validate_router_replay_config_allows_megatron_generation():
 
     config = {
         "router_replay": {"enabled": True},
-        "generation": {"backend": "megatron"},
+        "generation": {
+            "backend": "megatron",
+            "mcore_generation_config": {"async_sched_mode": "legacy"},
+        },
         "megatron_cfg": {"enabled": True},
     }
 
@@ -91,7 +94,10 @@ def test_validate_router_replay_config_allows_generation_pp_override_to_one():
         "router_replay": {"enabled": True},
         "generation": {
             "backend": "megatron",
-            "mcore_generation_config": {"pipeline_model_parallel_size": 1},
+            "mcore_generation_config": {
+                "pipeline_model_parallel_size": 1,
+                "async_sched_mode": "legacy",
+            },
         },
         "megatron_cfg": {"enabled": True, "pipeline_model_parallel_size": 4},
     }
@@ -109,6 +115,21 @@ def test_validate_router_replay_config_rejects_async_sched_mode():
             "backend": "megatron",
             "mcore_generation_config": {"async_sched_mode": "async"},
         },
+        "megatron_cfg": {"enabled": True},
+    }
+
+    with pytest.raises(ValueError, match="async_sched_mode='legacy'"):
+        validate_router_replay_config(config)
+
+
+@pytest.mark.mcore
+def test_validate_router_replay_config_rejects_unset_async_sched_mode():
+    """MCore defaults async_sched_mode to async, so leaving the key out is not safe."""
+    from nemo_rl.models.megatron.router_replay import validate_router_replay_config
+
+    config = {
+        "router_replay": {"enabled": True},
+        "generation": {"backend": "megatron", "mcore_generation_config": {}},
         "megatron_cfg": {"enabled": True},
     }
 
@@ -1486,6 +1507,54 @@ def test_reset_global_router_replay_instances_for_model_requires_routers():
 
 
 @pytest.mark.mcore
+def test_reset_global_router_replay_instances_for_model_skips_mtp_routers(monkeypatch):
+    """MInf sizes its route buffer from the registry; MTP routers would add a
+    layer column that router_replay_dimensions_for_model does not count."""
+    from megatron.core.transformer.moe.router_replay import RouterReplay
+
+    from nemo_rl.models.megatron.router_replay import (
+        reset_global_router_replay_instances_for_model,
+        router_replay_dimensions_for_model,
+    )
+
+    RouterReplay.clear_global_router_replay_instances()
+    monkeypatch.delenv("NRL_ROUTER_REPLAY_EXCLUDE_MTP", raising=False)
+
+    class DummyRouter(torch.nn.Module):
+        def __init__(self, layer_number):
+            super().__init__()
+            self.router_replay = RouterReplay()
+            self.layer_number = layer_number
+
+    class DummyMTPStack(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.is_mtp_layer = True
+            self.router = DummyRouter(layer_number=1)
+
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(
+                num_layers=1, moe_layer_freq=[1], moe_router_topk=2
+            )
+            self.decoder_router = DummyRouter(layer_number=1)
+            self.mtp = DummyMTPStack()
+
+    try:
+        model = DummyModel()
+        reset_global_router_replay_instances_for_model(model)
+
+        assert RouterReplay.global_router_replay_instances == [
+            model.decoder_router.router_replay
+        ]
+        num_layers, _ = router_replay_dimensions_for_model(model)
+        assert len(RouterReplay.global_router_replay_instances) == num_layers
+    finally:
+        RouterReplay.clear_global_router_replay_instances()
+
+
+@pytest.mark.mcore
 def test_global_moe_layer_numbers_follow_hybrid_layer_pattern():
     """Nemotron-H places MoE layers by 'E' in the hybrid pattern, not moe_layer_freq."""
     from nemo_rl.models.megatron.router_replay import (
@@ -1541,3 +1610,39 @@ def test_global_moe_layer_numbers_without_hybrid_pattern_uses_moe_layer_freq():
     config = SimpleNamespace(num_layers=4, moe_layer_freq=[0, 1, 0, 1])
 
     assert _global_moe_layer_numbers(config) == [2, 4]
+
+
+@pytest.mark.mcore
+def test_router_replay_layout_carries_moe_layers_and_total_layer_count():
+    """The deferred executor needs the MoE layer numbers and the total layer
+    count, not just the MoE count, to accept vLLM's full-layer route axis."""
+    from nemo_rl.experience.route_assembly import RouteLayout
+    from nemo_rl.models.megatron.router_replay import router_replay_layout
+
+    config = SimpleNamespace(
+        num_layers=6,
+        moe_layer_freq=1,
+        moe_router_topk=3,
+        hybrid_layer_pattern="MEM*EE",
+    )
+
+    layout = router_replay_layout(config)
+
+    assert layout == RouteLayout(
+        moe_layer_numbers=(2, 5, 6), total_num_layers=6, top_k=3
+    )
+    assert layout.num_moe_layers == 3
+    assert layout.dims == (3, 3)
+
+
+@pytest.mark.mcore
+def test_route_layout_column_indices_accept_moe_only_and_full_layer_payloads():
+    """One rule for both replay paths: a MoE-only payload maps layer i to
+    column i, a full-layer payload maps layer n to column n-1, else None."""
+    from nemo_rl.experience.route_assembly import RouteLayout
+
+    layout = RouteLayout(moe_layer_numbers=(2, 5, 6), total_num_layers=6, top_k=3)
+
+    assert layout.moe_column_indices(3) == (0, 1, 2)
+    assert layout.moe_column_indices(6) == (1, 4, 5)
+    assert layout.moe_column_indices(4) is None

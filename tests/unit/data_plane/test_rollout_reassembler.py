@@ -57,6 +57,7 @@ from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
 )
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin  # noqa: E402
 from nemo_rl.experience.rollout_reassembler import RolloutReassembler  # noqa: E402
+from nemo_rl.experience.route_assembly import RouteLayout  # noqa: E402
 from nemo_rl.experience.route_plan import decode_route_plan  # noqa: E402
 from nemo_rl.models.generation.megatron.token_capture import (  # noqa: E402
     TQMegatronTokenStager,
@@ -769,8 +770,8 @@ class _DeferredRouteWorker(TQWorkerMixin):
         self._dp_client = client
         self._route_fallback_counts = Counter()
 
-    def _routed_experts_dimensions(self) -> tuple[int, int]:
-        return 2, 2
+    def _routed_experts_layout(self) -> RouteLayout:
+        return RouteLayout.compressed(num_moe_layers=2, top_k=2)
 
 
 def test_deferred_finalizer_publishes_plans_and_worker_replays_routes(
@@ -889,7 +890,7 @@ def test_direct_and_deferred_build_identical_plans_and_tensors(
 ):
     """Both modes construct byte-identical plans; the shared executor driven
     from the worker's inputs reproduces the direct-mode tensor exactly."""
-    from nemo_rl.experience.route_assembly import execute_route_plan
+    from nemo_rl.experience.route_assembly import RouteLayout, execute_route_plan
     from nemo_rl.experience.route_plan import encode_route_plan
 
     rollout_id = "unified_g0"
@@ -934,7 +935,7 @@ def test_direct_and_deferred_build_identical_plans_and_tensors(
     tensor, reason = execute_route_plan(
         deferred_row.route_plan,
         fragments,
-        dims=(2, 2),
+        layout=RouteLayout.compressed(num_moe_layers=2, top_k=2),
         canonical_len=len(expected.token_ids),
     )
     assert reason is None

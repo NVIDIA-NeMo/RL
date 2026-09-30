@@ -57,6 +57,85 @@ ROUTE_FAILURE_ASSEMBLED_LENGTH = "assembled_length_mismatch"
 
 
 @dataclass(frozen=True)
+class RouteLayout:
+    """Which columns of a staged route fragment belong to the trained MoE layers.
+
+    A fragment's layer axis comes in one of two layouts. MInf stages one
+    column per MoE layer (``num_moe_layers`` columns). vLLM stages one column
+    per transformer layer (``total_num_layers`` columns), so for a hybrid
+    Mamba/attention/MoE stack the executor must pick out the MoE columns by
+    ``moe_layer_numbers``. Both counts coincide for a stack where every layer
+    is MoE, in which case no selection happens.
+    """
+
+    moe_layer_numbers: tuple[int, ...]
+    """1-based global layer numbers of the MoE layers, ascending."""
+    total_num_layers: int
+    top_k: int
+
+    def __post_init__(self) -> None:
+        if not self.moe_layer_numbers or self.top_k <= 0:
+            raise ValueError(
+                "route layout requires at least one MoE layer and top_k > 0, got "
+                f"moe_layer_numbers={self.moe_layer_numbers}, top_k={self.top_k}"
+            )
+        if self.total_num_layers < len(self.moe_layer_numbers) or any(
+            not 1 <= n <= self.total_num_layers for n in self.moe_layer_numbers
+        ):
+            raise ValueError(
+                f"MoE layer numbers {self.moe_layer_numbers} do not fit in "
+                f"{self.total_num_layers} layers"
+            )
+
+    @classmethod
+    def compressed(cls, *, num_moe_layers: int, top_k: int) -> "RouteLayout":
+        """A MoE-only layout for callers that know only ``(num_moe_layers, top_k)``.
+
+        Direct mode learns these from the fetched fragments themselves and has
+        no model config, so it can never need column selection.
+        """
+        return cls(
+            moe_layer_numbers=tuple(range(1, num_moe_layers + 1)),
+            total_num_layers=num_moe_layers,
+            top_k=top_k,
+        )
+
+    @property
+    def num_moe_layers(self) -> int:
+        return len(self.moe_layer_numbers)
+
+    @property
+    def dims(self) -> tuple[int, int]:
+        """The published ``(num_moe_layers, top_k)`` route tensor dims."""
+        return self.num_moe_layers, self.top_k
+
+    def moe_column_indices(self, num_payload_layers: int) -> Optional[tuple[int, ...]]:
+        """Payload column for each MoE layer, in ``moe_layer_numbers`` order.
+
+        This is the one rule both replay paths share. A MoE-only payload
+        (MInf) maps the i-th MoE layer to column i; a full-layer payload
+        (vLLM) maps layer number ``n`` to column ``n - 1``. Any other width
+        is unsupported and returns None.
+        """
+        if num_payload_layers == self.num_moe_layers:
+            return tuple(range(self.num_moe_layers))
+        if num_payload_layers == self.total_num_layers:
+            return tuple(n - 1 for n in self.moe_layer_numbers)
+        return None
+
+    def select_moe_columns(self, routes: torch.Tensor) -> Optional[torch.Tensor]:
+        """Return ``routes`` as ``[T, num_moe_layers, top_k]`` or None if it fits neither layout."""
+        if int(routes.shape[2]) != self.top_k:
+            return None
+        columns = self.moe_column_indices(int(routes.shape[1]))
+        if columns is None:
+            return None
+        if len(columns) == int(routes.shape[1]):
+            return routes
+        return routes[:, list(columns), :]
+
+
+@dataclass(frozen=True)
 class RouteFragment:
     """One staged route payload plus the metadata its extras digest binds.
 
@@ -111,7 +190,7 @@ def execute_route_plan(
     plan: RouteAssemblyPlan,
     fragments: Mapping[str, RouteFragment],
     *,
-    dims: tuple[int, int],
+    layout: RouteLayout,
     canonical_len: int,
 ) -> tuple[Optional[torch.Tensor], Optional[str]]:
     """Assemble one canonical route tensor from staged fragments.
@@ -120,10 +199,11 @@ def execute_route_plan(
         plan: The verified assembly plan built by the finalizer.
         fragments: Fetched fragments keyed by staging key. Sentinel spans
             need no entry.
-        dims: Model-owned ``(num_moe_layers, topk)``. The policy worker
-            supplies real model dims (the authoritative shape check); the
-            direct-mode finalizer supplies dims learned from the fetched
-            fragments.
+        layout: Which fragment columns are the trained MoE layers. The
+            policy worker supplies the real model layout (the authoritative
+            shape check, accepting both MoE-only and full-layer fragments);
+            the direct-mode finalizer supplies a compressed layout learned
+            from the fetched fragments.
         canonical_len: The published row's token length.
 
     Returns:
@@ -136,7 +216,7 @@ def execute_route_plan(
 
     if canonical_len != plan.expected_token_length:
         return None, ROUTE_FAILURE_CANONICAL_LENGTH
-    num_moe_layers, top_k = dims
+    num_moe_layers, top_k = layout.dims
     routed = torch.full(
         (canonical_len, num_moe_layers, top_k),
         ROUTE_MISSING_SENTINEL,
@@ -165,7 +245,8 @@ def execute_route_plan(
                 return None, ROUTE_FAILURE_RANK
             if int(routes.shape[0]) != span.staged_route_len:
                 return None, ROUTE_FAILURE_LENGTH
-            if tuple(routes.shape[1:]) != (num_moe_layers, top_k):
+            routes = layout.select_moe_columns(routes)
+            if routes is None:
                 return None, ROUTE_FAILURE_MODEL_SHAPE
             if mode == "full":
                 routed[position : position + contribution] = routes.to(torch.int16)

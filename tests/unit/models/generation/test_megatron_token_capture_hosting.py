@@ -13,6 +13,7 @@ nemo_gym = pytest.importorskip("nemo_gym.token_id_capture.staging")
 # megatron_worker imports megatron.core at module level; skip when it is absent.
 pytest.importorskip("megatron.core")
 
+from nemo_rl.models.generation.megatron import megatron_worker  # noqa: E402
 from nemo_rl.models.generation.megatron.megatron_generation import (  # noqa: E402
     MegatronGeneration,
 )
@@ -219,3 +220,66 @@ def test_worker_requires_minf_payload_stager_protocol() -> None:
 
     with pytest.raises(RuntimeError, match="RequestPayloadStager"):
         worker.setup_token_capture({}, "rollout_staging")
+
+
+@pytest.mark.parametrize("router_replay_enabled", [True, False])
+def test_initialize_inference_engine_repoints_router_registry_before_engine_setup(
+    monkeypatch, router_replay_enabled
+):
+    """A colocated reference-model build empties MInf's router registry; the
+    worker must repoint it at the served model before building the engine."""
+
+    class _StopBeforeEngine(Exception):
+        pass
+
+    gen_model = object()
+    calls = []
+
+    def _engine_setup(*_a, **_k):
+        calls.append("engine_setup")
+        raise _StopBeforeEngine
+
+    monkeypatch.setattr(
+        "nemo_rl.models.megatron.router_replay.reset_global_router_replay_instances_for_model",
+        lambda model: calls.append(("reset", model)),
+    )
+    monkeypatch.setattr(
+        "megatron.core.utils.get_attr_wrapped_model", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        megatron_worker,
+        "MambaInferenceStateConfig",
+        SimpleNamespace(from_model=_engine_setup),
+    )
+    monkeypatch.setattr(MegatronGenerationMixin, "_gen_model", lambda self: gen_model)
+    monkeypatch.setattr(
+        MegatronGenerationMixin,
+        "_get_megatron_inference_wrapper_cls",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        MegatronGenerationMixin,
+        "_inference_model_and_media_parts",
+        lambda self, _cls: (SimpleNamespace(config=SimpleNamespace()), None),
+    )
+    worker = object.__new__(MegatronGenerationMixin)
+    worker._inference_engine_initialized = False
+    worker._router_replay_enabled = router_replay_enabled
+
+    with pytest.raises(_StopBeforeEngine):
+        worker._initialize_inference_engine(
+            {
+                "buffer_size_gb": 1,
+                "num_cuda_graphs": 1,
+                "block_size_tokens": 16,
+                "enable_chunked_prefill": False,
+                "use_cuda_graphs_for_non_decode_steps": False,
+                "max_tokens": 16,
+                "kv_cache_management_mode": "persist",
+                "materialize_only_last_token_logits": True,
+                "num_speculative_tokens": 0,
+            }
+        )
+
+    expected = [("reset", gen_model)] if router_replay_enabled else []
+    assert calls == expected + ["engine_setup"]

@@ -22,6 +22,7 @@ from typing import Any, Optional
 
 import torch
 
+from nemo_rl.experience.route_assembly import RouteLayout
 from nemo_rl.models.generation.interfaces import (
     ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
 )
@@ -90,8 +91,8 @@ def _validate_megatron_generation_router_replay_config(config: PolicyConfig) -> 
 
     # MInf records routes into RouterReplay.global_router_replay_instances, which
     # is rank-local, and only ever all-gathers them across TP. With inference
-    # PP > 1 the payload's layer axis covers one pipeline stage, and
-    # _payload_indices_for_moe_layers rejects it a full rollout later. Inference
+    # PP > 1 the payload's layer axis covers one pipeline stage, and the
+    # RouteLayout column check rejects it a full rollout later. Inference
     # PP defaults to training PP, so this is not opt-in.
     inference_pp = merged_inference_megatron_cfg(config).get(
         "pipeline_model_parallel_size", 1
@@ -105,11 +106,13 @@ def _validate_megatron_generation_router_replay_config(config: PolicyConfig) -> 
             "mcore_generation_config.pipeline_model_parallel_size=1."
         )
     # mcore raises the same rejection from DynamicInferenceEngine.__init__, but
-    # only after cluster build and weight load.
+    # only after cluster build and weight load. MCore's InferenceConfig defaults
+    # async_sched_mode to ASYNC, so an unset key needs rejecting too, not only
+    # an explicit "async".
     async_sched_mode = (generation.get("mcore_generation_config") or {}).get(
-        "async_sched_mode"
+        "async_sched_mode", "async"
     )
-    if async_sched_mode == "async":
+    if async_sched_mode != "legacy":
         raise ValueError(
             "router_replay.enabled requires policy.generation."
             "mcore_generation_config.async_sched_mode='legacy'; mcore async "
@@ -242,6 +245,22 @@ def router_replay_dimensions(model_config: Any) -> tuple[int, int]:
     return num_moe_layers, top_k
 
 
+def router_replay_layout(model_config: Any) -> RouteLayout:
+    """Return the model-owned route layout: MoE layer numbers, total layers, top-k.
+
+    This is what the deferred route executor needs to accept a vLLM fragment
+    with one column per transformer layer next to a MInf fragment with one
+    column per MoE layer; :func:`router_replay_dimensions` is its
+    ``(num_moe_layers, top_k)`` projection.
+    """
+    num_moe_layers, top_k = router_replay_dimensions(model_config)
+    return RouteLayout(
+        moe_layer_numbers=tuple(_global_moe_layer_numbers(model_config)),
+        total_num_layers=int(getattr(model_config, "num_layers")),
+        top_k=top_k,
+    )
+
+
 def router_replay_dimensions_for_model(model: Any) -> tuple[int, int]:
     """``router_replay_dimensions`` for a possibly wrapped (DDP/Float16) model."""
     model_config = _unwrap_model_config(model)
@@ -297,30 +316,6 @@ def _normalize_routed_experts_for_mcore(routed_experts: torch.Tensor) -> torch.T
     raise ValueError(
         "routed_experts must have shape [1, T, L, K], [B, S, L, K], or [T, L, K]; "
         f"got {tuple(routed_experts.shape)}"
-    )
-
-
-def _payload_indices_for_moe_layers(
-    *,
-    global_moe_layers: list[int],
-    num_payload_layers: int,
-    total_num_layers: int,
-) -> dict[int, int]:
-    if num_payload_layers == len(global_moe_layers):
-        return {
-            layer_number: payload_idx
-            for payload_idx, layer_number in enumerate(global_moe_layers)
-        }
-
-    if num_payload_layers == total_num_layers:
-        return {layer_number: layer_number - 1 for layer_number in global_moe_layers}
-
-    raise ValueError(
-        "routed_experts layer axis does not match a supported payload layout: "
-        f"payload={num_payload_layers}, moe_layers={len(global_moe_layers)}, "
-        f"total_layers={total_num_layers}. Expected exactly "
-        f"{len(global_moe_layers)} layers for compressed MoE-layer layout or "
-        f"{total_num_layers} layers for vLLM full-transformer-layer layout."
     )
 
 
@@ -561,14 +556,19 @@ def build_router_replay_assignments(
     local_routed_experts = _split_for_sequence_parallel(
         model_config, local_routed_experts
     )
-    global_moe_layers = _global_moe_layer_numbers(model_config)
-    total_num_layers = int(getattr(model_config, "num_layers"))
-    num_payload_layers = local_routed_experts.shape[1]
-    moe_layer_to_payload_idx = _payload_indices_for_moe_layers(
-        global_moe_layers=global_moe_layers,
-        num_payload_layers=num_payload_layers,
-        total_num_layers=total_num_layers,
-    )
+    layout = router_replay_layout(model_config)
+    global_moe_layers = list(layout.moe_layer_numbers)
+    num_payload_layers = int(local_routed_experts.shape[1])
+    payload_columns = layout.moe_column_indices(num_payload_layers)
+    if payload_columns is None:
+        raise ValueError(
+            "routed_experts layer axis does not match a supported payload layout: "
+            f"payload={num_payload_layers}, moe_layers={layout.num_moe_layers}, "
+            f"total_layers={layout.total_num_layers}. Expected exactly "
+            f"{layout.num_moe_layers} layers for compressed MoE-layer layout or "
+            f"{layout.total_num_layers} layers for vLLM full-transformer-layer layout."
+        )
+    moe_layer_to_payload_idx = dict(zip(global_moe_layers, payload_columns))
     model_instances = _router_replay_instances_for_model(model)
     if len(model_instances) == 0:
         local_moe_layers = _local_layer_numbers_for_model(model).intersection(
