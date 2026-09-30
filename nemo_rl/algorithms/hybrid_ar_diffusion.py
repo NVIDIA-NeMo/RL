@@ -45,22 +45,20 @@ needs an attention mask that is block-bidirectional on the noisy half and causal
 on the clean half; that lives in the model/worker, not here.
 """
 
-import math
 from collections.abc import Mapping
-from typing import Any, Literal
+from typing import Any
 
 import torch
-from pydantic import BaseModel, model_validator
 
-from nemo_rl.algorithms.diffu_grpo_logprobs import (
-    NoisyTailMode,
-    build_fully_masked_completion_batch,
-)
+from nemo_rl.algorithms.diffu_grpo_logprobs import build_fully_masked_completion_batch
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.policy import (
+    HybridARDiffusionLogprobEstimationConfig,
+    NoisyTailMode,
+)
 
 __all__ = [
     "HYBRID_SEED_STEP_STRIDE",
-    "HybridARDiffusionLogprobEstimationConfig",
     "build_hybrid_ar_diffusion_batch",
     "draw_hybrid_noisy_mask",
     "get_hybrid_ar_diffusion_cfg",
@@ -72,62 +70,6 @@ __all__ = [
 # long as the batch size stays below this stride one step's seeds cannot alias
 # the next step's block.
 HYBRID_SEED_STEP_STRIDE = 1_000_003
-
-
-class HybridARDiffusionLogprobEstimationConfig(BaseModel, extra="allow"):
-    """Score both halves of the asymmetric layout in one forward pass.
-
-    Trains the checkpoint's two generation modes together: the clean half of
-    the ``[noisy | clean]`` layout is an ordinary causal (AR) forward and
-    carries the GRPO clipped policy-gradient term, while the noisy half holds
-    the response with a random subset masked and carries a plain masked
-    cross-entropy term. The total loss is
-    ``pg_loss_weight * pg_loss + ce_loss_weight * ce_loss``.
-    """
-
-    type: Literal["hybrid_ar_diffusion"]
-    # Token id of the model's MASK token.
-    mask_token_id: int
-    # Weight on the cross-entropy term. 0.0 recovers the RL-only baseline. The
-    # two terms have different natural magnitudes; log both (``pg_loss`` /
-    # ``ce_loss``) and set this so they land within an order of magnitude.
-    ce_loss_weight: float
-    # Weight on the policy-gradient term. 0.0 trains on the CE term alone,
-    # isolating what the diffusion objective contributes.
-    pg_loss_weight: float = 1.0
-    # The per-sample masking ratio ``t`` is drawn from U(min, max) and must
-    # satisfy ``0 < min <= max < 1``. Bounding away from the extremes avoids
-    # degenerate conditioning and a high-variance CE estimate.
-    mask_ratio_min: float = 0.2
-    mask_ratio_max: float = 0.8
-    # Base offset folded into the per-row mask seed (the GRPO step and row
-    # index are added). Only affects reproducibility -- correctness does not
-    # depend on the mask realization.
-    seed_base: int = 0
-    # Scale each sample's CE term by 1/t, recovering the masked-diffusion
-    # ELBO. False gives the unweighted cross-entropy.
-    elbo_weight_ce: bool = False
-    # How the final block-padding tail of the noisy side is filled; see
-    # ``nemo_rl.algorithms.diffu_grpo_logprobs.NoisyTailMode``.
-    noisy_tail_mode: NoisyTailMode = "mask"
-
-    @model_validator(mode="after")
-    def _check_bounds(self) -> "HybridARDiffusionLogprobEstimationConfig":
-        for name, weight in (
-            ("ce_loss_weight", self.ce_loss_weight),
-            ("pg_loss_weight", self.pg_loss_weight),
-        ):
-            if not (math.isfinite(weight) and weight >= 0):
-                raise ValueError(
-                    f"{name} must be a finite, non-negative number; got {weight}"
-                )
-        if not 0.0 < self.mask_ratio_min <= self.mask_ratio_max < 1.0:
-            raise ValueError(
-                "mask_ratio bounds must satisfy 0 < mask_ratio_min <= "
-                f"mask_ratio_max < 1; got min={self.mask_ratio_min}, "
-                f"max={self.mask_ratio_max}"
-            )
-        return self
 
 
 def get_hybrid_ar_diffusion_cfg(

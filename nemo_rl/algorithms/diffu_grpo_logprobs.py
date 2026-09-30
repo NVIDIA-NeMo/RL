@@ -21,30 +21,29 @@ predicts the token at its own position; the clean half is ordinary
 teacher-forced context.
 
 This module builds that layout from a standard GRPO rollout batch. It is pure
-tensor manipulation with no Megatron or Ray dependency.
+tensor manipulation; the only distributed hook is the per-segment padding that
+block-aware context parallelism needs (see
+``nemo_rl.models.megatron.cp_block_aware``), which is a no-op unless that mode
+is enabled inside a context-parallel Megatron worker.
 """
 
-from typing import Any, Literal
+from typing import Any, get_args
 
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.megatron.cp_block_aware import block_aware_cp_padding, round_up
+from nemo_rl.models.policy import NoisyTailMode
 
 __all__ = [
     "NOISY_RESPONSE_OFFSET",
-    "NoisyTailMode",
     "build_fully_masked_completion_batch",
 ]
 
 # The noisy response always starts at the head of the sequence.
 NOISY_RESPONSE_OFFSET = 0
 
-# How the final block-padding tail of the noisy side is filled:
-#   mask = pad to a whole block with MASK (matches generation);
-#   eos  = pad to a whole block with EOS (matches SFT padding);
-#   none = no block padding, the final block may be partial.
-NoisyTailMode = Literal["mask", "eos", "none"]
-_NOISY_TAIL_MODES = ("mask", "eos", "none")
+_NOISY_TAIL_MODES: tuple[str, ...] = get_args(NoisyTailMode)
 
 
 def _completion_score_mask(
@@ -165,6 +164,18 @@ def _build_completion_only_tensors(
     noisy_length = int(noisy_valid_lengths.max().item()) if batch_size else 0
     clean_length = int(clean_lengths.max().item()) if batch_size else 0
 
+    # Block-aware CP zigzags each segment on its own, so EACH segment -- not
+    # just the total -- has to satisfy its own divisibility. Rounding here, in
+    # the batch builder, is what places the noisy|clean boundary on a chunk
+    # grid; the global round below cannot do it. The extra tokens are pure
+    # padding: the mask excludes them, so this costs masked compute, not
+    # correctness.
+    cp_pad = block_aware_cp_padding(block_size)
+    if cp_pad is not None:
+        noisy_multiple, clean_multiple = cp_pad
+        noisy_length = round_up(noisy_length, noisy_multiple)
+        clean_length = round_up(clean_length, clean_multiple)
+
     total_length = noisy_length + clean_length
     if sequence_length_round is not None and sequence_length_round > 0:
         rounded_total_length = (
@@ -172,8 +183,16 @@ def _build_completion_only_tensors(
             // sequence_length_round
             * sequence_length_round
         )
-        clean_length += rounded_total_length - total_length
-        total_length = rounded_total_length
+        if cp_pad is not None:
+            # Absorb the slack into the clean segment WITHOUT knocking it off
+            # its own grid, then let the total follow.
+            clean_length = round_up(
+                clean_length + (rounded_total_length - total_length), cp_pad[1]
+            )
+            total_length = noisy_length + clean_length
+        else:
+            clean_length += rounded_total_length - total_length
+            total_length = rounded_total_length
 
     layout_input_ids = torch.full(
         (batch_size, total_length),

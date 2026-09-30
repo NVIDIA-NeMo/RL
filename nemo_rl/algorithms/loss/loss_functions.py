@@ -63,10 +63,8 @@ if TYPE_CHECKING:
     # Import-time only: nemo_rl.algorithms.opd imports the data plane, which
     # would pull a heavy dependency chain into every loss-function consumer.
     # The hybrid estimator config is likewise only needed as an annotation.
-    from nemo_rl.algorithms.hybrid_ar_diffusion import (
-        HybridARDiffusionLogprobEstimationConfig,
-    )
     from nemo_rl.algorithms.opd import OnPolicyDistillationFullConfig
+    from nemo_rl.models.policy import HybridARDiffusionLogprobEstimationConfig
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
 

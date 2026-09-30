@@ -21,12 +21,15 @@ alignment of advantages / prev_logprobs matches the token each position
 predicts.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+from nemo_rl.algorithms import diffu_grpo_logprobs
 from nemo_rl.algorithms.diffu_grpo_logprobs import build_fully_masked_completion_batch
+from nemo_rl.algorithms.grpo import _validate_hybrid_ar_diffusion_setup
 from nemo_rl.algorithms.hybrid_ar_diffusion import (
-    HybridARDiffusionLogprobEstimationConfig,
     build_hybrid_ar_diffusion_batch,
     draw_hybrid_noisy_mask,
     get_hybrid_ar_diffusion_cfg,
@@ -34,6 +37,7 @@ from nemo_rl.algorithms.hybrid_ar_diffusion import (
     unscatter_clean_aligned,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.policy import HybridARDiffusionLogprobEstimationConfig
 
 MASK_TOKEN_ID = 200
 PAD_TOKEN_ID = 0
@@ -438,3 +442,97 @@ def test_get_cfg_validates_and_applies_defaults():
     assert cfg.elbo_weight_ce is False
     # An already-validated config (as produced by MasterConfig) is accepted too.
     assert get_hybrid_ar_diffusion_cfg({"logprob_estimation": cfg}) == cfg
+
+
+# cp=3, block_size=4: noisy segments pad to 2*cp*block = 24, clean to 2*cp = 6.
+_CP3_BLOCK4_PADDING = (24, 6)
+
+
+def test_block_aware_cp_pads_each_segment_to_its_own_grid(monkeypatch):
+    # Under block-aware CP each segment is zigzagged on its own, so the noisy and
+    # clean segments must each land on their own multiple -- a single global pad
+    # would leave the noisy|clean boundary off the chunk grid.
+    monkeypatch.setattr(
+        diffu_grpo_logprobs,
+        "block_aware_cp_padding",
+        lambda block_size: _CP3_BLOCK4_PADDING,
+    )
+    batch = _build(_make_data(), block_size=4)
+    # Unpadded: noisy 8 (longest response 5 -> 2 blocks), clean 8.
+    assert _noisy_length(batch) == 24
+    assert int(batch["diffu_grpo_clean_padded_lengths"][0].item()) == 12
+    assert batch["input_ids"].shape[1] == 36
+    # Padding is masked out: the scored positions are unchanged.
+    assert batch["hybrid_pg_mask"].sum() == sum(r for _, r in LAYOUT)
+    assert not bool((batch["hybrid_ce_mask"][:, 8:24] > 0.5).any())
+
+
+def test_block_aware_cp_keeps_clean_segment_on_grid_after_global_round(monkeypatch):
+    monkeypatch.setattr(
+        diffu_grpo_logprobs,
+        "block_aware_cp_padding",
+        lambda block_size: _CP3_BLOCK4_PADDING,
+    )
+    batch = build_fully_masked_completion_batch(
+        _make_data(),
+        mask_token_id=MASK_TOKEN_ID,
+        pad_token_id=PAD_TOKEN_ID,
+        noisy_tail_mode="mask",
+        block_size=4,
+        pad_to_length=10,
+    )
+    # 24 + 12 = 36 rounds to 40; the 4 slack tokens go to the clean segment,
+    # which is then re-rounded to its own multiple of 6 (12 + 4 -> 18).
+    assert _noisy_length(batch) == 24
+    assert int(batch["diffu_grpo_clean_padded_lengths"][0].item()) == 18
+    assert batch["input_ids"].shape[1] == 42
+
+
+def test_block_aware_cp_padding_is_off_by_default():
+    # Outside a context-parallel Megatron worker the layout is untouched.
+    assert diffu_grpo_logprobs.block_aware_cp_padding(4) is None
+
+
+def _grpo_master_config(policy_overrides=None, data_plane=None) -> SimpleNamespace:
+    policy = {
+        "logprob_estimation": _estimation_cfg(),
+        "worker_extension_cls_fqn": "my_pkg.HybridWorker",
+    }
+    policy.update(policy_overrides or {})
+    return SimpleNamespace(policy=policy, data_plane=data_plane)
+
+
+def test_grpo_setup_guard_accepts_a_configured_hybrid_run():
+    _validate_hybrid_ar_diffusion_setup(
+        _grpo_master_config(), use_fused_linear_logprobs=False
+    )
+
+
+def test_grpo_setup_guard_is_a_noop_without_the_estimator():
+    _validate_hybrid_ar_diffusion_setup(
+        SimpleNamespace(policy={}, data_plane={"enabled": True}),
+        use_fused_linear_logprobs=True,
+    )
+
+
+def test_grpo_setup_guard_requires_a_hybrid_worker():
+    with pytest.raises(ValueError, match="worker_extension_cls_fqn"):
+        _validate_hybrid_ar_diffusion_setup(
+            _grpo_master_config({"worker_extension_cls_fqn": None}),
+            use_fused_linear_logprobs=False,
+        )
+
+
+def test_grpo_setup_guard_rejects_fused_linear_logprobs():
+    with pytest.raises(ValueError, match="use_fused_linear_logprobs"):
+        _validate_hybrid_ar_diffusion_setup(
+            _grpo_master_config(), use_fused_linear_logprobs=True
+        )
+
+
+def test_grpo_setup_guard_rejects_the_data_plane():
+    with pytest.raises(ValueError, match="data_plane"):
+        _validate_hybrid_ar_diffusion_setup(
+            _grpo_master_config(data_plane={"enabled": True}),
+            use_fused_linear_logprobs=False,
+        )

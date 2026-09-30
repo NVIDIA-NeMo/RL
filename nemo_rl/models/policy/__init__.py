@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from typing import Any, Literal, NotRequired, TypedDict, Union
 
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
@@ -653,6 +654,71 @@ class OnPolicyDistillationFullTransport(TypedDict):
     teacher_index_field: str | None
 
 
+# How the final block-padding tail of the noisy side of the diffusion
+# ``[noisy | clean]`` layout is filled:
+#   mask = pad to a whole block with MASK (matches generation);
+#   eos  = pad to a whole block with EOS (matches SFT padding);
+#   none = no block padding, the final block may be partial.
+NoisyTailMode = Literal["mask", "eos", "none"]
+
+
+class HybridARDiffusionLogprobEstimationConfig(BaseModel, extra="allow"):
+    """Score both halves of the asymmetric layout in one forward pass.
+
+    Trains a block-diffusion checkpoint's two generation modes together: the
+    clean half of the ``[noisy | clean]`` layout is an ordinary causal (AR)
+    forward and carries the GRPO clipped policy-gradient term, while the noisy
+    half holds the response with a random subset masked and carries a plain
+    masked cross-entropy term. The total loss is
+    ``pg_loss_weight * pg_loss + ce_loss_weight * ce_loss``. Because the clean
+    half never attends to the noisy half, the mask may be redrawn freely each
+    step without invalidating ``prev_logprobs``.
+    """
+
+    type: Literal["hybrid_ar_diffusion"]
+    # Token id of the model's MASK token.
+    mask_token_id: int
+    # Weight on the cross-entropy term. 0.0 recovers the RL-only baseline. The
+    # two terms have different natural magnitudes; log both (``pg_loss`` /
+    # ``ce_loss``) and set this so they land within an order of magnitude.
+    ce_loss_weight: float
+    # Weight on the policy-gradient term. 0.0 trains on the CE term alone,
+    # isolating what the diffusion objective contributes.
+    pg_loss_weight: float = 1.0
+    # The per-sample masking ratio ``t`` is drawn from U(min, max) and must
+    # satisfy ``0 < min <= max < 1``. Bounding away from the extremes avoids
+    # degenerate conditioning and a high-variance CE estimate.
+    mask_ratio_min: float = 0.2
+    mask_ratio_max: float = 0.8
+    # Base offset folded into the per-row mask seed (the GRPO step and row
+    # index are added). Only affects reproducibility -- correctness does not
+    # depend on the mask realization.
+    seed_base: int = 0
+    # Scale each sample's CE term by 1/t, recovering the masked-diffusion
+    # ELBO. False gives the unweighted cross-entropy.
+    elbo_weight_ce: bool = False
+    # How the final block-padding tail of the noisy side is filled.
+    noisy_tail_mode: NoisyTailMode = "mask"
+
+    @model_validator(mode="after")
+    def _check_bounds(self) -> "HybridARDiffusionLogprobEstimationConfig":
+        for name, weight in (
+            ("ce_loss_weight", self.ce_loss_weight),
+            ("pg_loss_weight", self.pg_loss_weight),
+        ):
+            if not (math.isfinite(weight) and weight >= 0):
+                raise ValueError(
+                    f"{name} must be a finite, non-negative number; got {weight}"
+                )
+        if not 0.0 < self.mask_ratio_min <= self.mask_ratio_max < 1.0:
+            raise ValueError(
+                "mask_ratio bounds must satisfy 0 < mask_ratio_min <= "
+                f"mask_ratio_max < 1; got min={self.mask_ratio_min}, "
+                f"max={self.mask_ratio_max}"
+            )
+        return self
+
+
 class PolicyConfig(TypedDict):
     model_name: str
     tokenizer: TokenizerConfig
@@ -679,6 +745,11 @@ class PolicyConfig(TypedDict):
     on_policy_distillation_full: NotRequired[OnPolicyDistillationFullTransport]
     router_replay: NotRequired[RouterReplayConfig | RouterReplayConfigDisabled]
     hf_config_overrides: NotRequired[dict[str, Any]]
+    # Alternative logprob estimator for block-diffusion policies. Absent means
+    # the standard autoregressive next-token logprobs. Setting it switches GRPO
+    # to HybridARDiffusionLossFn and requires a policy worker that builds the
+    # [noisy | clean] batch (see nemo_rl.algorithms.hybrid_ar_diffusion).
+    logprob_estimation: NotRequired[HybridARDiffusionLogprobEstimationConfig]
     dynamic_batching: DynamicBatchingConfig | DynamicBatchingConfigDisabled
     sequence_packing: NotRequired[SequencePackingConfig | SequencePackingConfigDisabled]
     make_sequence_length_divisible_by: int

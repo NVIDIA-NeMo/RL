@@ -23,11 +23,9 @@ import math
 import pytest
 import torch
 
-from nemo_rl.algorithms.hybrid_ar_diffusion import (
-    HybridARDiffusionLogprobEstimationConfig,
-)
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, HybridARDiffusionLossFn
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.policy import HybridARDiffusionLogprobEstimationConfig
 
 # Every test uses a 4-position layout: positions 0,1 are the noisy half (CE),
 # positions 2,3 the clean half (PG).

@@ -37,6 +37,10 @@ from nemo_rl.algorithms.advantage_estimator import (
     OPDAdvantageEstimator,
     ReinforcePlusPlusAdvantageEstimator,
 )
+from nemo_rl.algorithms.hybrid_ar_diffusion import (
+    get_hybrid_ar_diffusion_cfg,
+    maybe_set_hybrid_mask_seed,
+)
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
     need_top_k_or_top_p_filtering,
@@ -45,6 +49,7 @@ from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
     ClippedPGLossDataDict,
     ClippedPGLossFn,
+    HybridARDiffusionLossFn,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.metric_utils import (
@@ -506,6 +511,43 @@ def _validate_seq_logprob_error_in_loss(master_config: MasterConfig) -> None:
         )
 
 
+def _validate_hybrid_ar_diffusion_setup(
+    master_config: MasterConfig, *, use_fused_linear_logprobs: bool
+) -> None:
+    """Reject configurations the hybrid AR + diffusion estimator cannot train with.
+
+    Setting ``policy.logprob_estimation`` switches the loss to
+    ``HybridARDiffusionLossFn``, which reads the ``[noisy | clean]`` batch built
+    by ``build_hybrid_ar_diffusion_batch``. Only a policy worker can build that
+    batch -- it needs the tokenizer's pad/EOS ids and the model's diffusion
+    block size -- and none of the built-in workers do, so a missing worker would
+    otherwise surface as a ``KeyError`` only after the first rollout.
+    """
+    policy = master_config.policy
+    if policy.get("logprob_estimation") is None:
+        return
+    if not policy.get("worker_extension_cls_fqn"):
+        raise ValueError(
+            "policy.logprob_estimation (hybrid_ar_diffusion) needs a policy worker "
+            "that builds the [noisy | clean] batch with "
+            "nemo_rl.algorithms.hybrid_ar_diffusion.build_hybrid_ar_diffusion_batch; "
+            "the built-in workers do not. Set policy.worker_extension_cls_fqn to "
+            "such a worker."
+        )
+    if use_fused_linear_logprobs:
+        raise ValueError(
+            "policy.logprob_estimation is incompatible with "
+            "policy.megatron_cfg.use_fused_linear_logprobs: the fused forward "
+            "gathers logprobs at the next input token, not at hybrid_target_ids."
+        )
+    if (master_config.data_plane or {}).get("enabled", False):
+        raise ValueError(
+            "policy.logprob_estimation is not yet supported with "
+            "data_plane.enabled=true: the data-plane rollout path does not attach "
+            "the per-step hybrid_mask_seed the batch builder needs."
+        )
+
+
 def _validate_multimodal_dedup_capability(master_config: MasterConfig) -> None:
     """Reject configurations whose media transfer path is not qualified."""
     if not master_config.grpo.deduplicate_multimodal_data:
@@ -575,7 +617,7 @@ def setup(
     tuple[RayVirtualCluster, RayVirtualCluster],
     StatefulDataLoader | MultipleDataloaderWrapper,
     Optional[StatefulDataLoader],
-    ClippedPGLossFn,
+    ClippedPGLossFn | HybridARDiffusionLossFn,
     Logger,
     CheckpointManager,
     GRPOSaveState,
@@ -837,11 +879,23 @@ def setup(
             "policy.generation.top_p=1.0)."
         )
 
-    loss_fn = ClippedPGLossFn(
-        loss_config,
-        use_fused_linear_logprobs=use_fused_linear_logprobs,
-        seq_logprob_error_threshold=grpo_config.seq_logprob_error_threshold,
+    _validate_hybrid_ar_diffusion_setup(
+        master_config, use_fused_linear_logprobs=use_fused_linear_logprobs
     )
+    loss_fn: ClippedPGLossFn | HybridARDiffusionLossFn
+    if policy_config.get("logprob_estimation") is not None:
+        # The hybrid AR + diffusion estimator scores a [noisy | clean] batch: a
+        # clipped policy gradient on the clean half plus a masked cross-entropy
+        # on the noisy half, so it needs its own loss.
+        loss_fn = HybridARDiffusionLossFn(
+            loss_config, get_hybrid_ar_diffusion_cfg(policy_config)
+        )
+    else:
+        loss_fn = ClippedPGLossFn(
+            loss_config,
+            use_fused_linear_logprobs=use_fused_linear_logprobs,
+            seq_logprob_error_threshold=grpo_config.seq_logprob_error_threshold,
+        )
 
     # Validate force_on_policy_ratio
     if loss_config.force_on_policy_ratio:
@@ -3554,6 +3608,13 @@ def _grpo_train_impl(
                     _preserve_router_replay_routed_experts(
                         train_data, flat_messages, master_config.policy
                     )
+                    # Hybrid AR + diffusion: attach this step's noisy-mask seed
+                    # (no-op for other estimators). It only makes the mask
+                    # reproducible; the clean half that feeds prev_logprobs does
+                    # not depend on it.
+                    maybe_set_hybrid_mask_seed(
+                        train_data, master_config.policy, total_steps
+                    )
                     train_data.to("cpu")
 
                     metrics_logging_data["content"] = flat_messages["content"]
@@ -3600,6 +3661,12 @@ def _grpo_train_impl(
                     _preserve_router_replay_routed_experts(
                         logprob_data, flat_messages, master_config.policy
                     )
+                    # The hybrid worker builds the [noisy | clean] batch for the
+                    # prev-logprobs forward too, and the builder needs a seed.
+                    if "hybrid_mask_seed" in train_data:
+                        logprob_data["hybrid_mask_seed"] = train_data[
+                            "hybrid_mask_seed"
+                        ]
 
                     if not skip_prev_logprobs:
                         train_data["prev_logprobs"] = policy.get_logprobs(
@@ -5365,6 +5432,10 @@ def async_grpo_train(
                         repeated_batch,
                         master_config.policy,
                     )
+                    # Async feeds train_data straight to the logprob and training
+                    # passes, so the hybrid noisy-mask seed is attached once here
+                    # (no-op for other estimators).
+                    maybe_set_hybrid_mask_seed(train_data, master_config.policy, step)
                     print_multimodal_payload_metrics(
                         collect_multimodal_payload_metrics(
                             train_data,
