@@ -42,6 +42,10 @@ from nemo_rl.algorithms.single_controller import (
     SingleControllerActor,
     _pooled_opd_metrics,
 )
+from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
+    AdvantageComputer,
+    AdvantageStageConfig,
+)
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     AsyncRLConfig,
@@ -180,6 +184,44 @@ def _init_controller(master_config, actor_args):
         actor_args=actor_args,
         setup_timing_metrics=SetupTimingMetrics(),
     )
+
+
+def _stamp_advantage_stage_config(ctrl, *, shardable: bool = True) -> None:
+    """Mirror the advantage-stage half of ``__init__`` onto a hand-built stub.
+
+    The stubs below construct the controller with ``object.__new__`` and assign
+    the individual gates directly, but the stage reads them off
+    ``_advantage_stage_config`` and runs through ``_advantage_computer``, both
+    of which only ``__init__`` assigns. Deriving them here from the attributes
+    the caller just set keeps the two descriptions from disagreeing, so adding
+    a field to the stage config does not need an edit at every stub.
+
+    ``_advantage_actors`` is empty because these tests exercise the in-process
+    path. That also makes the shard split decline, leaving one whole-batch call.
+    """
+    penalties_enabled = ctrl._message_level_advantage_penalties_enabled
+    ctrl._advantage_actors = []
+    ctrl._advantage_stage_config = AdvantageStageConfig(
+        advantage=ctrl._advantage_cfg,
+        algo=ctrl._algo_cfg,
+        is_ppo=ctrl._is_ppo,
+        policy_logprobs_required=ctrl._policy_logprobs_required,
+        reference_logprobs_required=ctrl._reference_logprobs_required,
+        teacher_logprobs_required=ctrl._teacher_logprobs_required,
+        message_level_advantage_penalties_enabled=penalties_enabled,
+        shardable=shardable,
+    )
+    ctrl._advantage_computer = AdvantageComputer(
+        ctrl._dp_client,
+        config=ctrl._advantage_stage_config,
+        advantage_estimator=ctrl._advantage_estimator,
+    )
+    # _absorb_advantage_outcome accumulates into these unconditionally, so they
+    # have to exist even for the non-OPD tests. Tests that assert on them set
+    # their own values after this call.
+    ctrl._opd_stat_sum = 0.0
+    ctrl._opd_stat_sumsq = 0.0
+    ctrl._opd_stat_count = 0
 
 
 def test_resumed_mooncake_init_restores_without_partition_registration(
@@ -818,6 +860,7 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = True
+    _stamp_advantage_stage_config(ctrl)
     ctrl._step_log_dict = {
         "reward_partials": [],
         "advantage_partials": [],
@@ -912,6 +955,7 @@ def test_advantage_stage_writes_each_sample_filter_without_seq_threshold(
         seq_logprob_error_threshold=None,
         overlong_filtering=overlong_filtering,
     )
+    _stamp_advantage_stage_config(ctrl)
     ctrl._step_log_dict = {
         "reward_partials": [],
         "advantage_partials": [],
@@ -976,6 +1020,7 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
+    _stamp_advantage_stage_config(ctrl)
     ctrl._step_log_dict = {
         "reward_partials": [],
         "advantage_partials": [],
@@ -1045,6 +1090,7 @@ def test_advantage_stage_clips_training_values_and_metrics() -> None:
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
+    _stamp_advantage_stage_config(ctrl)
     ctrl._step_log_dict = {
         "reward_partials": [],
         "advantage_partials": [],
@@ -1108,6 +1154,7 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
+    _stamp_advantage_stage_config(ctrl)
     ctrl._step_log_dict = {
         "reward_partials": [],
         "advantage_partials": [],
@@ -1169,6 +1216,7 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
+    _stamp_advantage_stage_config(ctrl)
     ctrl._step_log_dict = {
         "reward_partials": [],
         "advantage_partials": [],
@@ -1253,6 +1301,7 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
+    _stamp_advantage_stage_config(ctrl)
     ctrl._step_log_dict = {
         "reward_partials": [],
         "advantage_partials": [],
@@ -2566,6 +2615,8 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     )
     ctrl._algo_cfg = ctrl._master_config.ppo
     ctrl._message_level_advantage_penalties_enabled = False
+    # gae normalizes over the whole batch, so it is not shard-invariant.
+    _stamp_advantage_stage_config(ctrl, shardable=False)
     ctrl._step_log_dict = {
         "reward_partials": [],
         "advantage_partials": [],
