@@ -1252,6 +1252,55 @@ def test_megatron_prompt_preparer_rejects_malformed_eos_ids(eos):
         )
 
 
+def test_megatron_prompt_preparer_text_mode_drops_endpoint_media_count(
+    prefix_stitching_fields,
+):
+    """A text admission splices nothing, so no prefix media count may remain.
+
+    The chat endpoint reports the history's media count whenever an assistant
+    turn preceded by media exists (e.g. a dataset-provided turn); left in place
+    without an expanded-prefix count the engine rejects the request, and an
+    expanded count of 0 would still miscount this request's media. Only
+    omitting the key makes the engine expand every placeholder itself.
+    """
+    media_count_field, expanded_count_field = prefix_stitching_fields
+    admission = nemo_gym.CaptureAdmission(
+        rollout_id="minf-r0", model_call_id="c1", mode="text"
+    )
+    capture_payload = admission.model_dump(mode="json")
+    prompt = [80, 99, 81, 13, 2, 20, 99, 21]
+    offload_params = {
+        "ng_capture": capture_payload,
+        PREFIX_TEMPLATE_TOKEN_IDS_FIELD: [80, 99, 81, 13, 2],
+        PREFIX_EOS_TOKEN_ID_FIELD: [2],
+        media_count_field: 1,
+    }
+    original_offload_params = dict(offload_params)
+    preparer = TQMegatronPromptPreparer(MagicMock(spec=TQTokenSource))
+
+    result = preparer.prepare_prompt(prompt, offload_params=offload_params)
+
+    assert result.prompt == prompt
+    assert media_count_field not in result.offload_params
+    assert expanded_count_field not in result.offload_params
+    assert result.offload_params["ng_capture"] == capture_payload
+    assert result.offload_params[PREFIX_TEMPLATE_TOKEN_IDS_FIELD] == [80, 99, 81, 13, 2]
+    assert result.offload_params[PREFIX_EOS_TOKEN_ID_FIELD] == [2]
+    assert offload_params == original_offload_params
+
+    without_count = {
+        "ng_capture": capture_payload,
+        PREFIX_TEMPLATE_TOKEN_IDS_FIELD: [80, 99, 81, 13, 2],
+        PREFIX_EOS_TOKEN_ID_FIELD: [2],
+    }
+    unchanged = preparer.prepare_prompt(prompt, offload_params=without_count)
+
+    assert unchanged.prompt == prompt
+    assert unchanged.offload_params == without_count
+    assert media_count_field not in unchanged.offload_params
+    assert expanded_count_field not in unchanged.offload_params
+
+
 def test_megatron_stager_stamps_admission_epoch_when_request_spans_refit(
     tq_client, staging_partition, caplog
 ):

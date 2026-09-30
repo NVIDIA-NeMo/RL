@@ -77,7 +77,10 @@ class TQMegatronPromptPreparer:
         """Resolve the admission's staged prefix and splice it into the prompt.
 
         Returns the prompt unchanged when ``offload_params`` carries no
-        ``ng_capture`` admission or the admission is text mode. Otherwise the
+        ``ng_capture`` admission or the admission is text mode; a text-mode
+        return also drops the endpoint's ``_prefix_media_count`` (if any), since
+        nothing was spliced and the engine must expand every media placeholder
+        itself. Otherwise the
         admission's ``staging_chain`` (or inline prefix) is resolved through the
         worker-local ``ChainPrefixCache`` into expanded token ids plus the number
         of media items the parent chain staged. Those ids are spliced over the
@@ -140,6 +143,17 @@ class TQMegatronPromptPreparer:
 
         admission = CaptureAdmission.model_validate(capture_payload)
         if admission.mode == "text":
+            # The chat endpoint reports the history's media count whenever an
+            # assistant turn preceded by media exists, whether or not a staged
+            # prefix is spliced here. With nothing spliced the engine must
+            # expand every placeholder itself, and the stitching contract has
+            # no "no prefix" value other than omitting the media-count key.
+            media_count_field = getattr(
+                inference_request, "PREFIX_MEDIA_COUNT_FIELD", None
+            )
+            if media_count_field and media_count_field in offload_params:
+                offload_params = dict(offload_params)
+                offload_params.pop(media_count_field)
             return RequestPromptPreparationResult(
                 prompt=prompt, offload_params=offload_params
             )
