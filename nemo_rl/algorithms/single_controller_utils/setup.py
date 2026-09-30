@@ -1311,7 +1311,11 @@ def setup_single_controller(
                 "token_capture.enabled supports vllm or megatron; got "
                 f"{generation_config['backend']!r}"
             )
-        if capture_media and master_config.grpo.deduplicate_multimodal_data:
+        if (
+            capture_media
+            and not is_ppo_run(master_config)
+            and master_config.grpo.deduplicate_multimodal_data
+        ):
             raise ValueError(
                 "token_capture.enabled does not support "
                 "grpo.deduplicate_multimodal_data=true: capture rows carry "

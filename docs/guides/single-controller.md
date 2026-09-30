@@ -456,10 +456,13 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   metric that reports the fraction of learner rows built from captured media.
   The vLLM path needs no new Megatron-LM pin. The Megatron Inference path
   requires a Megatron-LM pin with `media_tensors` on the offloaded payload and
-  expanded-prefix stitching (NVIDIA/Megatron-LM#7598); setup refuses a
-  multimodal Megatron capture run on an older pin.
+  expanded-prefix stitching (NVIDIA/Megatron-LM#7598); when the driver
+  environment can import megatron-core, setup refuses a multimodal Megatron
+  capture run on an older pin (otherwise the first multi-turn media call fails
+  in the worker's prompt preparer).
   Compaction, mixed image/video conversations, native audio,
   video token pruning, static tiling (`image_num_patches`), other processor families,
+  datasets that mix text-only and media prompts (every all-text group is dropped),
   and `token_capture.defer_routed_experts_to_policy: true` are not supported.
 - Multi-Teacher On-Policy Distillation (MOPD) is supported for text-only NeMo
   Gym rollouts; multimodal/VLM MOPD is not yet supported. See

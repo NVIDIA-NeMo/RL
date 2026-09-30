@@ -74,7 +74,47 @@ class TQMegatronPromptPreparer:
         *,
         offload_params: dict[str, Any] | None = None,
     ) -> RequestPromptPreparationResult:
-        """Fetch a chained prefix, splice it into the prompt, and update admission."""
+        """Resolve the admission's staged prefix and splice it into the prompt.
+
+        Returns the prompt unchanged when ``offload_params`` carries no
+        ``ng_capture`` admission or the admission is text mode. Otherwise the
+        admission's ``staging_chain`` (or inline prefix) is resolved through the
+        worker-local ``ChainPrefixCache`` into expanded token ids plus the number
+        of media items the parent chain staged. Those ids are spliced over the
+        endpoint's re-rendered history with ``replace_prefix_tokens``, using the
+        template prefix tokens and EOS ids the endpoint placed in
+        ``offload_params``; the splice metadata is skipped only when the
+        endpoint sent none and the admission has no ``staging_chain``.
+
+        The returned ``offload_params`` copy is updated with:
+
+        - ``ng_capture.required_prefix_token_ids``: the expanded prefix Gym
+          verifies the engine's prompt against.
+        - ``ng_capture_minf.media_prev_count``: media items the parent chain
+          staged; the stager slices the engine's whole-conversation
+          ``media_tensors`` there so each row carries only this call's media.
+        - ``_prefix_expanded_token_count``: written only when the endpoint
+          reported ``_prefix_media_count``; tells the engine where the
+          already-expanded prefix ends so it expands only the media
+          placeholders after it.
+
+        Args:
+            prompt: The endpoint's rendered prompt. Must be a token-id list
+                when a token-in admission is present.
+            offload_params: Request metadata the endpoint attached; may carry
+                the Gym admission and the prompt splice metadata.
+
+        Returns:
+            The (possibly spliced) prompt and the updated ``offload_params``.
+
+        Raises:
+            ValueError: The resolved prefix length differs from the admission's
+                ``prev_len``, the splice metadata is malformed or missing for a
+                chained admission, the splice did not yield the authorized
+                prefix, or the endpoint's prefix media count disagrees with the
+                chain's.
+            TypeError: The prompt is not a token-id list.
+        """
         # Deferred because the prompt preparer is optional and requires
         # Megatron-LM's inference capture hooks. The two field names
         # are the request-metadata keys the Megatron chat endpoint writes when
@@ -198,9 +238,15 @@ def slice_media_tensors(
     columns are per-call deltas like the token columns.
 
     Item boundaries come from the tensors themselves: ``num_frames`` (frames per
-    video) when present, else one row of ``imgs_sizes`` per image. For packed
-    patches (``imgs`` as ``[1, total_patches, C*P*P]``) the patch count per row
-    is ``h*w/P**2`` with ``P**2`` recovered from the totals.
+    video) when present, else one row of ``imgs_sizes`` per image. ``imgs`` must
+    be packed patches ``[1, total_patches, C*P*P]`` (the only layout
+    ``validate_media_tensors`` accepts); the patch count per row is
+    ``h*w/P**2`` with ``P**2`` recovered from the totals.
+
+    Raises:
+        ValueError: ``imgs_sizes`` is missing, ``prev_count`` exceeds the items
+            present, ``imgs`` is not packed patches, or the geometry does not
+            tile into whole patches at the parent boundary.
     """
     if not media_tensors or prev_count <= 0:
         return media_tensors
@@ -247,8 +293,10 @@ def slice_media_tensors(
             raise ValueError("parent media does not end on a patch boundary")
         sliced["imgs"] = imgs[:, prev_area // patch_area :, :]
     else:
-        # Padded pixels [N, C, H, W]: one row per frame.
-        sliced["imgs"] = imgs[prev_rows:]
+        raise ValueError(
+            "media imgs must be packed patches [1, total_patches, F], "
+            f"got shape {tuple(imgs.shape)}"
+        )
     sliced["imgs_sizes"] = imgs_sizes.reshape(-1, 2)[prev_rows:]
     if num_frames is not None:
         sliced["num_frames"] = num_frames.reshape(-1)[prev_count:]
@@ -259,6 +307,9 @@ def slice_media_tensors(
 class _MegatronCapturePayload:
     """The MInf offloaded payload plus the worker-side context Gym's adapter reads."""
 
+    # Copied raw off the engine payload (nominally list[int] / list[float] or
+    # None); Gym's MegatronCaptureAdapter validates element types so a
+    # malformed payload poisons the call instead of being coerced here.
     prompt_token_ids: Any
     generated_token_ids: Any
     generated_log_probs: Any
@@ -269,6 +320,27 @@ class _MegatronCapturePayload:
     def from_offloaded(
         cls, payload: Any, minf_params: Any
     ) -> "_MegatronCapturePayload":
+        """Build the adapter-facing view of one finished MInf payload.
+
+        Copies the ``prompt_token_ids`` / ``generated_token_ids`` /
+        ``generated_log_probs`` attributes Gym's ``MegatronCaptureAdapter``
+        reads (missing ones become ``None``) and slices
+        ``payload.media_tensors`` at ``minf_params["media_prev_count"]`` so
+        only the media new to this call remains.
+
+        Args:
+            payload: The engine's ``OffloadedRequestPayload`` (or equivalent).
+            minf_params: The ``ng_capture_minf`` mapping the prompt preparer
+                wrote, or ``None`` for requests it did not touch.
+
+        Raises:
+            TypeError: ``minf_params`` is not a dict or ``media_tensors`` is not
+                a mapping.
+            ValueError: ``media_prev_count`` is not a non-negative int, or the
+                media geometry cannot be sliced there.
+
+        The stager maps both to ``capture_failed`` coordinates.
+        """
         if minf_params is not None and not isinstance(minf_params, dict):
             raise TypeError(
                 f"MInf capture params must be a dict, got {type(minf_params).__name__}"

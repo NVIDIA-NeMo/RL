@@ -168,10 +168,12 @@ only one token space is ever staged.
   a drift in either preprocessor fails loudly at the first media stage.
 - `RolloutReassembler.finalize_group` drops a group in which no valid rollout
   carried media when `capture_media` is set (`media capture on, no valid
-  rollout carried media`; the controller sources a replacement). TQ answers a
-  batch fetch with only the fields every requested key produced, so a train
-  shard mixing such keys with VLM keys would lose `pixel_values` for the VLM
-  rows too.
+  rollout carried media`, reported as `finalize/group_dropped_no_media`
+  alongside the shared `finalize/group_dropped`). The controller then shrinks
+  the step or, under `on_dropped_prompt="replace"`, sources a replacement. TQ
+  answers a batch fetch with only the fields every requested key produced, so
+  a train shard mixing such keys with VLM keys would lose `pixel_values` for
+  the VLM rows too.
 
 Tensor contents are not bound to Gym's digest. A staging key written twice
 would go undetected by the media columns alone; Gym rejects a second

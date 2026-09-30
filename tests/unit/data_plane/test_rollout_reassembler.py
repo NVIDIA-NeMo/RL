@@ -1143,6 +1143,7 @@ def test_finalize_group_capture_media_drops_group_without_any_media_row(
     assert finalized.meta is None
     assert "media" in (finalized.drop_reason or "")
     assert finalized.metrics["finalize/group_dropped"] == 1.0
+    assert finalized.metrics["finalize/group_dropped_no_media"] == 1.0
     # Nothing was published, and the staged call rows were cleared.
     published = set(tq_client.list_sample_ids(MEDIA_CANONICAL_PARTITION))
     assert published.isdisjoint(rollout_ids)

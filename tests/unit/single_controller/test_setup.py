@@ -54,11 +54,13 @@ from nemo_rl.algorithms.grpo import (
 )
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.loss.interfaces import LossInputType
+from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig
 from nemo_rl.algorithms.opd import (
     OnPolicyDistillationConfig,
     get_opd_full_config,
     opd_full_teacher_index_field,
 )
+from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.single_controller_utils import (
     AsyncRLConfig,
     MasterConfig,
@@ -3109,6 +3111,41 @@ def test_token_capture_rejects_deduplicated_media(patched_factories):
     mock_gate.assert_not_called()
     patched_factories["setup_response_data"].assert_not_called()
     patched_factories["_build_clusters"].assert_not_called()
+
+
+def test_token_capture_media_dedup_guard_skips_ppo_run(patched_factories):
+    """A PPO run has no ``grpo`` block; the dedup guard must not read it.
+
+    The guard is the last check before the MInf media-payload gate, so
+    reaching that gate proves the guard let the PPO config through.
+    """
+
+    class _ReachedMediaGate(Exception):
+        pass
+
+    mc = _make_gym_megatron_capture_config()
+    mc.ppo = PPOConfig.model_construct(**dict(mc.grpo))
+    mc.grpo = None
+    # The minimum the PPO-path validation reads: a Megatron critic whose
+    # global batch equals num_prompts_per_step * num_generations_per_prompt.
+    mc.value = {"megatron_cfg": {"enabled": True}, "train_global_batch_size": 8}
+    mc.value_loss_fn = MseValueLossConfig()
+
+    with (
+        patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+        patch.object(sc_setup_mod, "uses_image_placeholder", return_value=True),
+        patch.object(
+            sc_setup_mod,
+            "_require_minf_media_payload_fields",
+            side_effect=_ReachedMediaGate,
+        ) as mock_gate,
+        pytest.raises(_ReachedMediaGate),
+    ):
+        setup_single_controller(
+            mc, MagicMock(pad_token_id=0), processor=MagicMock(name="processor")
+        )
+
+    mock_gate.assert_called_once()
 
 
 @pytest.mark.parametrize("multimodal", [False, True], ids=["text", "multimodal"])

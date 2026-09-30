@@ -1717,20 +1717,8 @@ def test_payload_keys_match_gym_constants():
                 "num_frames": torch.tensor([1]),
             },
         ),
-        # Padded pixels [N, C, H, W]: one row per image.
-        (
-            {
-                "imgs": torch.arange(2 * 3 * 4 * 4.0).reshape(2, 3, 4, 4),
-                "imgs_sizes": torch.tensor([[4, 4], [4, 4]]),
-            },
-            1,
-            {
-                "imgs": torch.arange(48.0, 96.0).reshape(1, 3, 4, 4),
-                "imgs_sizes": torch.tensor([[4, 4]]),
-            },
-        ),
     ],
-    ids=["patches", "none-staged", "all-staged", "video", "padded-pixels"],
+    ids=["patches", "none-staged", "all-staged", "video"],
 )
 def test_slice_media_tensors_keeps_only_new_items(media_tensors, prev_count, expected):
     sliced = slice_media_tensors(media_tensors, prev_count)
@@ -1770,8 +1758,17 @@ def test_slice_media_tensors_keeps_only_new_items(media_tensors, prev_count, exp
             1,
             "patch boundary",
         ),
+        # Padded pixels [N, C, H, W] are not the packed layout the sink accepts.
+        (
+            {
+                "imgs": torch.ones(2, 3, 4, 4),
+                "imgs_sizes": torch.tensor([[4, 4], [4, 4]]),
+            },
+            1,
+            "packed patches",
+        ),
     ],
-    ids=["exceeds", "no-geometry", "non-dividing", "mid-patch"],
+    ids=["exceeds", "no-geometry", "non-dividing", "mid-patch", "padded-pixels"],
 )
 def test_slice_media_tensors_rejects_inconsistent_geometry(
     media_tensors, prev_count, error

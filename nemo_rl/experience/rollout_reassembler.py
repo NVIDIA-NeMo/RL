@@ -757,6 +757,9 @@ class RolloutReassembler:
             )
             self._clear_staging(staging_keys)
             metrics["finalize/group_dropped"] = 1.0
+            # Distinct from the router-replay drop above so dashboards can
+            # tell the two apart.
+            metrics["finalize/group_dropped_no_media"] = 1.0
             return FinalizedGroup(
                 meta=None,
                 group_min_wv=group_min_wv,
