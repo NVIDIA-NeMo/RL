@@ -216,61 +216,57 @@ def _capture_ready_worker() -> MegatronGenerationMixin:
     return worker
 
 
-def test_worker_media_capture_requires_image_preprocessing(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("capture_media", "image_preprocessing", "expected_sink"),
+    [
+        pytest.param(False, None, (False, None), id="text-ignores-text-only-wrapper"),
+        pytest.param(
+            True,
+            SimpleNamespace(patch_dim=16),
+            (True, MINF_MEDIA_PIXEL_DTYPE),
+            id="media-pins-minf-pixel-dtype",
+        ),
+        pytest.param(True, None, None, id="media-requires-image-preprocessing"),
+    ],
+)
+def test_worker_media_capture_requires_image_preprocessing(
+    monkeypatch, capture_media, image_preprocessing, expected_sink
+) -> None:
     """A text-only inference wrapper never yields media tensors, so a media-enabled
-    partition must be refused at setup rather than filled with text sentinels."""
+    partition must be refused at setup rather than filled with text sentinels;
+    text capture ignores the wrapper, and media capture pins MInf's pixel dtype."""
+    installed = []
+
+    class _Sink:
+        def __init__(
+            self, client, *, staging_partition, capture_media, media_pixel_dtype
+        ):
+            installed.append((capture_media, media_pixel_dtype))
+
     monkeypatch.setattr(
         "nemo_rl.data_plane.build_data_plane_client", lambda *_a, **_k: "dp"
     )
+    monkeypatch.setattr("nemo_rl.data_plane.tq_token_sink.TQTokenSink", _Sink)
     worker = _capture_ready_worker()
     assert worker._image_preprocessing_config is None  # class default: text-only
+    if image_preprocessing is not None:
+        worker._image_preprocessing_config = image_preprocessing
 
-    with pytest.raises(ValueError, match="image-capable inference wrapper"):
-        worker.setup_token_capture({}, "rollout_staging", capture_media=True)
-    # Refused before any hook was installed.
-    assert worker.dynamic_inference_engine.payload_stager is None
-    assert worker._token_capture_enabled is False
+    if expected_sink is None:
+        with pytest.raises(ValueError, match="image-capable inference wrapper"):
+            worker.setup_token_capture(
+                {}, "rollout_staging", capture_media=capture_media
+            )
+        # Refused before any hook was installed.
+        assert installed == []
+        assert worker.dynamic_inference_engine.payload_stager is None
+        assert worker._token_capture_enabled is False
+        return
 
-
-def test_worker_text_capture_ignores_missing_image_preprocessing(
-    monkeypatch,
-) -> None:
-    installed = []
-
-    class _Sink:
-        def __init__(
-            self, client, *, staging_partition, capture_media, media_pixel_dtype
-        ):
-            installed.append((capture_media, media_pixel_dtype))
-
-    monkeypatch.setattr(
-        "nemo_rl.data_plane.build_data_plane_client", lambda *_a, **_k: "dp"
+    assert worker.setup_token_capture(
+        {}, "rollout_staging", capture_media=capture_media
     )
-    monkeypatch.setattr("nemo_rl.data_plane.tq_token_sink.TQTokenSink", _Sink)
-    worker = _capture_ready_worker()
-
-    assert worker.setup_token_capture({}, "rollout_staging", capture_media=False)
-    assert installed == [(False, None)]
-
-
-def test_worker_media_capture_pins_minf_pixel_dtype(monkeypatch) -> None:
-    installed = []
-
-    class _Sink:
-        def __init__(
-            self, client, *, staging_partition, capture_media, media_pixel_dtype
-        ):
-            installed.append((capture_media, media_pixel_dtype))
-
-    monkeypatch.setattr(
-        "nemo_rl.data_plane.build_data_plane_client", lambda *_a, **_k: "dp"
-    )
-    monkeypatch.setattr("nemo_rl.data_plane.tq_token_sink.TQTokenSink", _Sink)
-    worker = _capture_ready_worker()
-    worker._image_preprocessing_config = SimpleNamespace(patch_dim=16)
-
-    assert worker.setup_token_capture({}, "rollout_staging", capture_media=True)
-    assert installed == [(True, MINF_MEDIA_PIXEL_DTYPE)]
+    assert installed == [expected_sink]
 
 
 def test_worker_requires_minf_payload_stager_protocol() -> None:

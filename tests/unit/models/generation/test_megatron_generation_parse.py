@@ -376,47 +376,46 @@ def test_http_server_port_reservation(monkeypatch):
 
 @pytest.mark.mcore
 @pytest.mark.parametrize(
-    ("gen_cfg_extra", "expected_num_replicas"),
+    ("gen_cfg_extra", "sampling_cfg", "expected", "absent"),
     [
-        ({}, None),
-        ({"http_server_num_replicas": 8}, 8),
-    ],
-)
-def test_http_server_num_replicas_is_forwarded_only_when_set(
-    monkeypatch, gen_cfg_extra, expected_num_replicas
-):
-    """Replica count reaches MCore, and stays absent when unconfigured."""
-    started = _start_stubbed_http_server(monkeypatch, gen_cfg_extra=gen_cfg_extra)
-
-    if expected_num_replicas is None:
-        assert "num_replicas" not in started
-    else:
-        assert started["num_replicas"] == expected_num_replicas
-
-
-@pytest.mark.mcore
-@pytest.mark.parametrize(
-    ("sampling_cfg", "expected_defaults"),
-    [
-        (
+        # Replica count reaches MCore, and stays absent when unconfigured.
+        pytest.param({}, None, {}, ["num_replicas"], id="num-replicas-unset"),
+        pytest.param(
+            {"http_server_num_replicas": 8},
+            None,
+            {"num_replicas": 8},
+            [],
+            id="num-replicas-forwarded",
+        ),
+        # The server defaults for fields a chat request omits come from the
+        # policy config, so MCore never falls back to the model's
+        # generation_config.json (e.g. Qwen3's top_k=20), which would sample
+        # off-policy.
+        pytest.param(
+            {},
             {"temperature": 0.7, "top_p": None, "top_k": None},
             {"default_temperature": 0.7, "default_top_p": 1.0, "default_top_k": 0},
+            [],
+            id="sampling-defaults-unset",
         ),
-        (
+        pytest.param(
+            {},
             {"temperature": 1.0, "top_p": 0.9, "top_k": 50},
             {"default_temperature": 1.0, "default_top_p": 0.9, "default_top_k": 50},
+            [],
+            id="sampling-defaults-forwarded",
         ),
     ],
 )
-def test_http_server_sampling_defaults_follow_policy_config(
-    monkeypatch, sampling_cfg, expected_defaults
+def test_http_server_kwargs_follow_policy_config(
+    monkeypatch, gen_cfg_extra, sampling_cfg, expected, absent
 ):
-    """The server defaults for fields a chat request omits come from the policy
-    config, so MCore never falls back to the model's generation_config.json
-    (e.g. Qwen3's top_k=20), which would sample off-policy."""
-    started = _start_stubbed_http_server(monkeypatch, sampling_cfg=sampling_cfg)
+    started = _start_stubbed_http_server(
+        monkeypatch, gen_cfg_extra=gen_cfg_extra, sampling_cfg=sampling_cfg
+    )
 
-    assert {key: started[key] for key in expected_defaults} == expected_defaults
+    assert {key: started[key] for key in expected} == expected
+    assert not set(absent) & set(started)
 
 
 def _start_stubbed_http_server(

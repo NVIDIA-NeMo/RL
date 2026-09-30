@@ -269,68 +269,55 @@ _PREFIX_STITCHING_FIELDS = {
 }
 
 
-def test_require_minf_media_payload_fields_rejects_payload_without_media_tensors(
-    monkeypatch,
-) -> None:
-    _stub_megatron_inference_request(
-        monkeypatch,
-        types.SimpleNamespace(
-            OffloadedRequestPayload=_stub_offloaded_payload("prompt_token_ids"),
-            **_PREFIX_STITCHING_FIELDS,
-        ),
-    )
-
-    with pytest.raises(
-        NotImplementedError,
-        match=r"lacks: OffloadedRequestPayload\.media_tensors\. Bump",
-    ):
-        sc_setup_mod._require_minf_media_payload_fields()
-
-
-def test_require_minf_media_payload_fields_rejects_core_without_prefix_stitching(
-    monkeypatch,
-) -> None:
-    """A pin without expanded-prefix stitching would expand every later turn's
-    spliced media prefix twice, so it is refused at setup."""
-    _stub_megatron_inference_request(
-        monkeypatch,
-        types.SimpleNamespace(
-            OffloadedRequestPayload=_stub_offloaded_payload(
-                "prompt_token_ids", "media_tensors"
-            )
-        ),
-    )
-
-    with pytest.raises(
-        NotImplementedError,
-        match="lacks: PREFIX_MEDIA_COUNT_FIELD, PREFIX_EXPANDED_TOKEN_COUNT_FIELD",
-    ):
-        sc_setup_mod._require_minf_media_payload_fields()
-
-
-def test_require_minf_media_payload_fields_accepts_payload_with_media_fields(
-    monkeypatch,
-) -> None:
-    _stub_megatron_inference_request(
-        monkeypatch,
-        types.SimpleNamespace(
-            OffloadedRequestPayload=_stub_offloaded_payload(
-                "prompt_token_ids", "media_tensors"
+@pytest.mark.parametrize(
+    ("inference_request", "error"),
+    [
+        # None in sys.modules makes the import raise ModuleNotFoundError.
+        pytest.param(None, None, id="no-megatron-core-defers-to-worker"),
+        pytest.param(
+            types.SimpleNamespace(
+                OffloadedRequestPayload=_stub_offloaded_payload(
+                    "prompt_token_ids", "media_tensors"
+                ),
+                **_PREFIX_STITCHING_FIELDS,
             ),
-            **_PREFIX_STITCHING_FIELDS,
+            None,
+            id="media-fields-present",
         ),
-    )
-
-    assert sc_setup_mod._require_minf_media_payload_fields() is None
-
-
-def test_require_minf_media_payload_fields_defers_to_worker_without_megatron_core(
-    monkeypatch,
+        pytest.param(
+            types.SimpleNamespace(
+                OffloadedRequestPayload=_stub_offloaded_payload("prompt_token_ids"),
+                **_PREFIX_STITCHING_FIELDS,
+            ),
+            r"lacks: OffloadedRequestPayload\.media_tensors\. Bump",
+            id="payload-without-media-tensors",
+        ),
+        # A pin without expanded-prefix stitching would expand every later
+        # turn's spliced media prefix twice, so it is refused at setup.
+        pytest.param(
+            types.SimpleNamespace(
+                OffloadedRequestPayload=_stub_offloaded_payload(
+                    "prompt_token_ids", "media_tensors"
+                )
+            ),
+            "lacks: PREFIX_MEDIA_COUNT_FIELD, PREFIX_EXPANDED_TOKEN_COUNT_FIELD",
+            id="core-without-prefix-stitching",
+        ),
+    ],
+)
+def test_require_minf_media_payload_fields(
+    monkeypatch, inference_request, error
 ) -> None:
-    # None in sys.modules makes the import raise ModuleNotFoundError.
-    monkeypatch.setitem(sys.modules, "megatron", None)
+    if inference_request is None:
+        monkeypatch.setitem(sys.modules, "megatron", None)
+    else:
+        _stub_megatron_inference_request(monkeypatch, inference_request)
 
-    assert sc_setup_mod._require_minf_media_payload_fields() is None
+    if error is None:
+        assert sc_setup_mod._require_minf_media_payload_fields() is None
+        return
+    with pytest.raises(NotImplementedError, match=error):
+        sc_setup_mod._require_minf_media_payload_fields()
 
 
 @pytest.fixture
@@ -3093,43 +3080,31 @@ def _make_gym_megatron_capture_config() -> MasterConfig:
     return mc
 
 
-def test_token_capture_rejects_deduplicated_media(patched_factories):
-    """Capture rows carry their own media, so dedup has nothing to share."""
-    mc = _make_gym_megatron_capture_config()
-    mc.grpo.deduplicate_multimodal_data = True
-
-    with (
-        patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
-        patch.object(sc_setup_mod, "uses_image_placeholder", return_value=True),
-        patch.object(sc_setup_mod, "_require_minf_media_payload_fields") as mock_gate,
-        pytest.raises(ValueError, match="deduplicate_multimodal_data"),
-    ):
-        setup_single_controller(
-            mc, MagicMock(pad_token_id=0), processor=MagicMock(name="processor")
-        )
-
-    mock_gate.assert_not_called()
-    patched_factories["setup_response_data"].assert_not_called()
-    patched_factories["_build_clusters"].assert_not_called()
-
-
-def test_token_capture_media_dedup_guard_skips_ppo_run(patched_factories):
-    """A PPO run has no ``grpo`` block; the dedup guard must not read it.
-
-    The guard is the last check before the MInf media-payload gate, so
-    reaching that gate proves the guard let the PPO config through.
+@pytest.mark.parametrize("algorithm", ["grpo", "ppo"])
+def test_token_capture_media_dedup_guard_reads_only_the_grpo_config(
+    patched_factories, algorithm
+):
+    """Capture rows carry their own media, so dedup has nothing to share: a GRPO
+    run asking for it is rejected. A PPO run has no ``grpo`` block; the guard
+    must not read it. The guard is the last check before the MInf media-payload
+    gate, so reaching that gate proves the guard let the PPO config through.
     """
 
     class _ReachedMediaGate(Exception):
         pass
 
     mc = _make_gym_megatron_capture_config()
-    mc.ppo = PPOConfig.model_construct(**dict(mc.grpo))
-    mc.grpo = None
-    # The minimum the PPO-path validation reads: a Megatron critic whose
-    # global batch equals num_prompts_per_step * num_generations_per_prompt.
-    mc.value = {"megatron_cfg": {"enabled": True}, "train_global_batch_size": 8}
-    mc.value_loss_fn = MseValueLossConfig()
+    if algorithm == "grpo":
+        mc.grpo.deduplicate_multimodal_data = True
+        expectation = pytest.raises(ValueError, match="deduplicate_multimodal_data")
+    else:
+        mc.ppo = PPOConfig.model_construct(**dict(mc.grpo))
+        mc.grpo = None
+        # The minimum the PPO-path validation reads: a Megatron critic whose
+        # global batch equals num_prompts_per_step * num_generations_per_prompt.
+        mc.value = {"megatron_cfg": {"enabled": True}, "train_global_batch_size": 8}
+        mc.value_loss_fn = MseValueLossConfig()
+        expectation = pytest.raises(_ReachedMediaGate)
 
     with (
         patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
@@ -3139,13 +3114,18 @@ def test_token_capture_media_dedup_guard_skips_ppo_run(patched_factories):
             "_require_minf_media_payload_fields",
             side_effect=_ReachedMediaGate,
         ) as mock_gate,
-        pytest.raises(_ReachedMediaGate),
+        expectation,
     ):
         setup_single_controller(
             mc, MagicMock(pad_token_id=0), processor=MagicMock(name="processor")
         )
 
-    mock_gate.assert_called_once()
+    if algorithm == "grpo":
+        mock_gate.assert_not_called()
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
+    else:
+        mock_gate.assert_called_once()
 
 
 @pytest.mark.parametrize("multimodal", [False, True], ids=["text", "multimodal"])

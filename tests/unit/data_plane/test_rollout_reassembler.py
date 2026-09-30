@@ -1109,18 +1109,27 @@ def test_finalize_group_publishes_media_with_empty_rows_for_text_siblings(
     _assert_staging_cleared(tq_client, [receipt["manifest"][0]["staging_key"]])
 
 
-@pytest.mark.parametrize("case", ["all-placeholders", "valid-text-row"])
-def test_finalize_group_capture_media_drops_group_without_any_media_row(
-    tq_client, media_partitions, case
+@pytest.mark.parametrize(
+    ("case", "capture_media"),
+    [
+        ("all-placeholders", True),
+        ("valid-text-row", True),
+        ("all-placeholders", False),
+    ],
+    ids=["media-all-placeholders", "media-valid-text-row", "text-all-placeholders"],
+)
+def test_finalize_group_drops_group_without_any_media_row_only_in_media_runs(
+    tq_client, media_partitions, case, capture_media
 ):
     """A media capture run never publishes a group whose valid rows carry no media.
 
     Such a group would land in the canonical partition without the media columns;
     TransferQueue answers a batch fetch with only the fields every requested key
     produced, so a train shard mixing its keys with media keys would lose
-    ``pixel_values`` for the media rows too and run image-blind.
+    ``pixel_values`` for the media rows too and run image-blind. Text-only runs
+    (``capture_media=False``) keep publishing placeholder-only groups.
     """
-    group_id = f"mm-drop-{case}"
+    group_id = f"mm-drop-{case}-{capture_media}"
     rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
     if case == "valid-text-row":
         # A staged rollout whose engine payload carried no media: valid, but text.
@@ -1129,7 +1138,7 @@ def test_finalize_group_capture_media_drops_group_without_any_media_row(
     else:
         receipts = [None, None]  # every rollout poisoned -> placeholders only
 
-    finalized = _media_finalizer(tq_client, capture_media=True).finalize_group(
+    finalized = _media_finalizer(tq_client, capture_media=capture_media).finalize_group(
         group_id,
         rollout_ids,
         receipts,
@@ -1138,6 +1147,13 @@ def test_finalize_group_capture_media_drops_group_without_any_media_row(
         fallback_weight_version=4,
         prompt_idx=3,
     )
+
+    if not capture_media:
+        assert not finalized.dropped
+        assert finalized.meta is not None
+        assert finalized.meta.sample_ids == rollout_ids
+        assert set(finalized.meta.fields).isdisjoint(WIRE_MULTIMODAL_FIELDS)
+        return
 
     assert finalized.dropped
     assert finalized.meta is None
@@ -1151,24 +1167,3 @@ def test_finalize_group_capture_media_drops_group_without_any_media_row(
         _assert_staging_cleared(
             tq_client, [r["staging_key"] for r in receipts[0]["manifest"]]
         )
-
-
-def test_finalize_group_default_still_publishes_group_without_media(
-    tq_client, media_partitions
-):
-    """Text-only runs (``capture_media=False``) keep publishing placeholder-only groups."""
-    group_id = "text-keep"
-    rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
-    finalized = _media_finalizer(tq_client, capture_media=False).finalize_group(
-        group_id,
-        rollout_ids,
-        [None, None],
-        [0.0, 0.0],
-        mask_sample=[False, False],
-        fallback_weight_version=4,
-        prompt_idx=3,
-    )
-    assert not finalized.dropped
-    assert finalized.meta is not None
-    assert finalized.meta.sample_ids == rollout_ids
-    assert set(finalized.meta.fields).isdisjoint(WIRE_MULTIMODAL_FIELDS)

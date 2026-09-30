@@ -678,8 +678,24 @@ def test_megatron_stager_writes_canonical_row_and_returns_coords(
     assert media.num_frames is None
 
 
-def test_megatron_stager_passes_media_tensors_as_attachments():
-    """The stager hands MInf's media tensors to Gym as attachments; nothing is parked on the sink."""
+@pytest.mark.parametrize(
+    "media_tensors",
+    [
+        pytest.param(
+            {
+                "imgs": torch.zeros(1, 4, 768, dtype=torch.bfloat16),
+                "imgs_sizes": torch.tensor([[32, 32]], dtype=torch.int32),
+            },
+            id="media",
+        ),
+        pytest.param(None, id="text"),
+        pytest.param({}, id="empty-media-mapping"),
+    ],
+)
+def test_megatron_stager_passes_media_tensors_as_attachments(media_tensors):
+    """The stager hands MInf's media tensors to Gym as attachments (nothing is
+    parked on the sink); a call without media tensors (absent or empty) reaches
+    Gym with attachments=None."""
     sink = MagicMock(spec=TQTokenSink)
     stager = TQMegatronTokenStager(sink)
     capture = MagicMock()
@@ -687,13 +703,10 @@ def test_megatron_stager_passes_media_tensors_as_attachments():
         model_dump=lambda mode: {"disposition": "staged"}
     )
     stager._capture = capture
-    imgs = torch.zeros(1, 4, 768, dtype=torch.bfloat16)
-    sizes = torch.tensor([[32, 32]], dtype=torch.int32)
-    payload = SimpleNamespace(
-        prompt_token_ids=[80, 99, 99, 99, 99, 81],
-        generated_token_ids=[12, 2],
-        generated_log_probs=[-0.1, -0.2],
-        media_tensors={"imgs": imgs, "imgs_sizes": sizes},
+    payload = (
+        _minf_payload(multimodal=False)
+        if media_tensors is None
+        else _minf_payload(multimodal=True, media_tensors=media_tensors)
     )
     admission = nemo_gym.CaptureAdmission(
         rollout_id="r0", model_call_id="c1", mode="text"
@@ -705,9 +718,12 @@ def test_megatron_stager_passes_media_tensors_as_attachments():
         minf_params={MEDIA_PREV_COUNT_KEY: 0},
     )
     assert result.response_metadata == {"ng_commit_coords": {"disposition": "staged"}}
-    kwargs = capture.complete_call_from_response.call_args.kwargs
-    assert kwargs["attachments"]["imgs"] is imgs
-    assert kwargs["attachments"]["imgs_sizes"] is sizes
+    attachments = capture.complete_call_from_response.call_args.kwargs["attachments"]
+    if not media_tensors:
+        assert attachments is None
+        return
+    assert attachments["imgs"] is media_tensors["imgs"]
+    assert attachments["imgs_sizes"] is media_tensors["imgs_sizes"]
 
 
 def _split_delta(record) -> tuple[list[int], list[int], list[float]]:
@@ -915,35 +931,6 @@ def test_backend_capture_glue_reproduces_the_gym_worked_example(
     assert [row.model_dump() for row in rows] == [
         record.model_dump(exclude={"extras"}) for record in records
     ]
-
-
-@pytest.mark.parametrize(
-    "payload",
-    [
-        pytest.param(_minf_payload(multimodal=False), id="text"),
-        pytest.param(
-            _minf_payload(multimodal=True, media_tensors={}), id="empty-media-mapping"
-        ),
-    ],
-)
-def test_megatron_stager_passes_no_attachments_for_text_calls(payload):
-    """A call without media tensors (absent or empty) reaches Gym with attachments=None."""
-    sink = MagicMock(spec=TQTokenSink)
-    stager = TQMegatronTokenStager(sink)
-    capture = MagicMock()
-    capture.complete_call_from_response.return_value = MagicMock(
-        model_dump=lambda mode: {"disposition": "staged"}
-    )
-    stager._capture = capture
-    admission = nemo_gym.CaptureAdmission(
-        rollout_id="r0", model_call_id="c1", mode="text"
-    ).model_dump(mode="json")
-    stager._stage_admitted(
-        payload,
-        capture_payload=admission,
-        finished_metadata=SimpleNamespace(policy_epoch=[(0, 0)]),
-    )
-    assert capture.complete_call_from_response.call_args.kwargs["attachments"] is None
 
 
 def test_fetch_prefix_chains_counts_media_items_from_columns(
@@ -1252,8 +1239,11 @@ def test_megatron_prompt_preparer_rejects_malformed_eos_ids(eos):
         )
 
 
+@pytest.mark.parametrize(
+    "endpoint_reports_count", [True, False], ids=["with-count", "without-count"]
+)
 def test_megatron_prompt_preparer_text_mode_drops_endpoint_media_count(
-    prefix_stitching_fields,
+    prefix_stitching_fields, endpoint_reports_count
 ):
     """A text admission splices nothing, so no prefix media count may remain.
 
@@ -1261,20 +1251,21 @@ def test_megatron_prompt_preparer_text_mode_drops_endpoint_media_count(
     turn preceded by media exists (e.g. a dataset-provided turn); left in place
     without an expanded-prefix count the engine rejects the request, and an
     expanded count of 0 would still miscount this request's media. Only
-    omitting the key makes the engine expand every placeholder itself.
+    omitting the key makes the engine expand every placeholder itself. Without
+    a reported count the params pass through unchanged.
     """
     media_count_field, expanded_count_field = prefix_stitching_fields
     admission = nemo_gym.CaptureAdmission(
         rollout_id="minf-r0", model_call_id="c1", mode="text"
     )
-    capture_payload = admission.model_dump(mode="json")
     prompt = [80, 99, 81, 13, 2, 20, 99, 21]
     offload_params = {
-        "ng_capture": capture_payload,
+        "ng_capture": admission.model_dump(mode="json"),
         PREFIX_TEMPLATE_TOKEN_IDS_FIELD: [80, 99, 81, 13, 2],
         PREFIX_EOS_TOKEN_ID_FIELD: [2],
-        media_count_field: 1,
     }
+    if endpoint_reports_count:
+        offload_params[media_count_field] = 1
     original_offload_params = dict(offload_params)
     preparer = TQMegatronPromptPreparer(MagicMock(spec=TQTokenSource))
 
@@ -1283,22 +1274,10 @@ def test_megatron_prompt_preparer_text_mode_drops_endpoint_media_count(
     assert result.prompt == prompt
     assert media_count_field not in result.offload_params
     assert expanded_count_field not in result.offload_params
-    assert result.offload_params["ng_capture"] == capture_payload
-    assert result.offload_params[PREFIX_TEMPLATE_TOKEN_IDS_FIELD] == [80, 99, 81, 13, 2]
-    assert result.offload_params[PREFIX_EOS_TOKEN_ID_FIELD] == [2]
+    expected_params = dict(original_offload_params)
+    expected_params.pop(media_count_field, None)
+    assert result.offload_params == expected_params
     assert offload_params == original_offload_params
-
-    without_count = {
-        "ng_capture": capture_payload,
-        PREFIX_TEMPLATE_TOKEN_IDS_FIELD: [80, 99, 81, 13, 2],
-        PREFIX_EOS_TOKEN_ID_FIELD: [2],
-    }
-    unchanged = preparer.prepare_prompt(prompt, offload_params=without_count)
-
-    assert unchanged.prompt == prompt
-    assert unchanged.offload_params == without_count
-    assert media_count_field not in unchanged.offload_params
-    assert expanded_count_field not in unchanged.offload_params
 
 
 def test_megatron_stager_stamps_admission_epoch_when_request_spans_refit(
@@ -1336,144 +1315,86 @@ def test_megatron_stager_stamps_admission_epoch_when_request_spans_refit(
     assert any("spans policy epochs [7, 8, 9]" in r.message for r in caplog.records)
 
 
-@pytest.mark.parametrize(
-    "missing_field",
-    ["prompt_token_ids", "generated_token_ids", "generated_log_probs"],
-)
-def test_megatron_stager_poisons_malformed_payloads_with_capture_failed(
-    tq_client, staging_partition, missing_field
-):
-    """Extraction errors return ``capture_failed`` coords, not ``None``.
-
-    Gym maps returned failed coords to ``worker_capture_failed`` (as for
-    vLLM); a ``None`` result would instead surface as
-    ``worker_response_missing_commit_coordinates``.
-    """
-    stager = TQMegatronTokenStager(_megatron_sink(tq_client, staging_partition))
+def _minf_payload_without(field: str):
     fields = {
         "prompt_token_ids": [10, 11],
         "generated_token_ids": [12, 13],
         "generated_log_probs": [-0.25, -0.5],
     }
-    del fields[missing_field]
-    admission = nemo_gym.CaptureAdmission(
-        rollout_id="minf-r0",
-        model_call_id="c1",
-        mode="text",
-    )
-
-    result = stager.stage(
-        "minf-response-1",
-        SimpleNamespace(**fields),
-        finished_metadata=SimpleNamespace(policy_epoch=[(0, 7)]),
-        offload_params={"ng_capture": admission.model_dump(mode="json")},
-    )
-
-    assert result is not None
-    coords = result.response_metadata["ng_commit_coords"]
-    assert coords["disposition"] == "capture_failed"
-    assert coords["weight_version"] == 7
-    with pytest.raises(KeyError):
-        TQTokenSource(tq_client, staging_partition=staging_partition).fetch(
-            ["minf-r0/c1"]
-        )
-
-
-def test_megatron_stager_poisons_payload_view_failures_with_capture_failed(
-    tq_client, staging_partition
-):
-    """Errors while deriving the media delta poison the call, not drop its coords.
-
-    ``_MegatronCapturePayload.from_offloaded`` runs after ``begin_call`` and
-    before Gym's extraction; a ``media_prev_count`` the engine's media cannot
-    satisfy must still surface as ``capture_failed`` (``worker_capture_failed``
-    in Gym), never as a ``None`` result, which Gym records as
-    ``worker_response_missing_commit_coordinates``.
-    """
-    stager = TQMegatronTokenStager(_megatron_sink(tq_client, staging_partition))
-    admission = nemo_gym.CaptureAdmission(
-        rollout_id="minf-r0", model_call_id="c1", mode="text"
-    )
-
-    result = stager.stage(
-        "minf-response-1",
-        _minf_payload(multimodal=True),  # the engine saw one image
-        finished_metadata=SimpleNamespace(policy_epoch=[(0, 7)]),
-        offload_params={
-            "ng_capture": admission.model_dump(mode="json"),
-            # The parent chain claims two images were already staged.
-            MINF_CAPTURE_PARAMS_FIELD: {MEDIA_PREV_COUNT_KEY: 2},
-        },
-    )
-
-    assert result is not None
-    coords = result.response_metadata["ng_commit_coords"]
-    assert coords["disposition"] == "capture_failed"
-    assert coords["weight_version"] == 7
-    with pytest.raises(KeyError):
-        TQTokenSource(tq_client, staging_partition=staging_partition).fetch(
-            ["minf-r0/c1"]
-        )
+    del fields[field]
+    return SimpleNamespace(**fields)
 
 
 @pytest.mark.parametrize(
-    ("payload", "minf_params", "match"),
+    ("payload", "minf_params", "view_error"),
     [
+        *(
+            pytest.param(_minf_payload_without(field), None, None, id=f"no-{field}")
+            for field in (
+                "prompt_token_ids",
+                "generated_token_ids",
+                "generated_log_probs",
+            )
+        ),
+        # The engine saw one image but the parent chain claims two were staged.
+        pytest.param(
+            _minf_payload(multimodal=True),
+            {MEDIA_PREV_COUNT_KEY: 2},
+            (ValueError, "exceeds"),
+            id="media-prev-count-exceeds",
+        ),
         pytest.param(
             _minf_payload(multimodal=True, media_tensors=[torch.zeros(1, 4, 12)]),
             {MEDIA_PREV_COUNT_KEY: 1},
-            "media_tensors must be a mapping, got list",
+            (TypeError, "media_tensors must be a mapping, got list"),
             id="media-tensors-list",
         ),
         pytest.param(
             _minf_payload(multimodal=False),
             ["not", "a", "dict"],
-            "capture params must be a dict, got list",
+            (TypeError, "capture params must be a dict, got list"),
             id="minf-params-list",
         ),
-    ],
-)
-def test_megatron_payload_view_rejects_non_mapping_inputs(payload, minf_params, match):
-    """Structural payload errors surface as TypeError, which the stager's poison path catches."""
-    with pytest.raises(TypeError, match=match):
-        _MegatronCapturePayload.from_offloaded(payload, minf_params)
-
-
-@pytest.mark.parametrize(
-    ("payload", "minf_params"),
-    [
+        # Media attachments against a text-only partition.
         pytest.param(
-            _minf_payload(multimodal=True, media_tensors=[torch.zeros(1, 4, 12)]),
-            {MEDIA_PREV_COUNT_KEY: 1},
-            id="media-tensors-list",
-        ),
-        pytest.param(
-            _minf_payload(multimodal=False), ["not", "a", "dict"], id="minf-params-list"
+            _minf_payload(multimodal=True), None, None, id="media-on-text-partition"
         ),
     ],
 )
-def test_megatron_stager_poisons_non_mapping_payload_inputs_with_capture_failed(
-    tq_client, staging_partition, payload, minf_params
+def test_megatron_stager_poisons_malformed_payloads_with_capture_failed(
+    tq_client, staging_partition, payload, minf_params, view_error
 ):
-    """A non-mapping ``media_tensors`` or non-dict capture params poison the call.
+    """Extraction and payload-view errors return ``capture_failed`` coords, not ``None``.
 
-    Without the explicit type checks these escape ``from_offloaded`` as
-    ``AttributeError`` (``slice_media_tensors`` calls ``.get``) or are silently
-    treated as empty, instead of returning ``capture_failed`` coordinates.
+    Gym maps returned failed coords to ``worker_capture_failed`` (as for
+    vLLM); a ``None`` result would instead surface as
+    ``worker_response_missing_commit_coordinates``. That covers
+    ``_MegatronCapturePayload.from_offloaded``, which runs after ``begin_call``
+    and before Gym's extraction: a ``media_prev_count`` the engine's media
+    cannot satisfy, a non-mapping ``media_tensors`` or non-dict capture params
+    (which without the explicit type checks would escape as ``AttributeError``
+    or be silently treated as empty), and media staged against a text-only
+    partition all poison the call rather than the server.
     """
+    if view_error is not None:
+        error_type, match = view_error
+        with pytest.raises(error_type, match=match):
+            _MegatronCapturePayload.from_offloaded(payload, minf_params)
     stager = TQMegatronTokenStager(_megatron_sink(tq_client, staging_partition))
     admission = nemo_gym.CaptureAdmission(
-        rollout_id="minf-r0", model_call_id="c1", mode="text"
+        rollout_id="minf-r0",
+        model_call_id="c1",
+        mode="text",
     )
+    offload_params = {"ng_capture": admission.model_dump(mode="json")}
+    if minf_params is not None:
+        offload_params[MINF_CAPTURE_PARAMS_FIELD] = minf_params
 
     result = stager.stage(
         "minf-response-1",
         payload,
         finished_metadata=SimpleNamespace(policy_epoch=[(0, 7)]),
-        offload_params={
-            "ng_capture": admission.model_dump(mode="json"),
-            MINF_CAPTURE_PARAMS_FIELD: minf_params,
-        },
+        offload_params=offload_params,
     )
 
     assert result is not None
@@ -1484,25 +1405,6 @@ def test_megatron_stager_poisons_non_mapping_payload_inputs_with_capture_failed(
         TQTokenSource(tq_client, staging_partition=staging_partition).fetch(
             ["minf-r0/c1"]
         )
-
-
-def test_megatron_stager_reports_media_on_text_partition_as_capture_failed(
-    tq_client, staging_partition
-):
-    """Media attachments against a text-only partition poison the call, not the server."""
-    stager = TQMegatronTokenStager(_megatron_sink(tq_client, staging_partition))
-    admission = nemo_gym.CaptureAdmission(
-        rollout_id="minf-r0", model_call_id="c1", mode="text"
-    )
-    result = stager.stage(
-        "minf-response-1",
-        _minf_payload(multimodal=True),
-        finished_metadata=SimpleNamespace(policy_epoch=[(0, 7)]),
-        offload_params={"ng_capture": admission.model_dump(mode="json")},
-    )
-    assert result is not None
-    coords = result.response_metadata["ng_commit_coords"]
-    assert coords["disposition"] == "capture_failed"
 
 
 @pytest.mark.parametrize(
@@ -1540,11 +1442,8 @@ def test_megatron_stager_declines_ineligible_requests(
     assert result is None
 
 
-class _RecordingSource:
-    """Stand-in for TQTokenSource that records fetched keys.
-
-    Serves two tokens and one media item per key.
-    """
+class _FlatSource:
+    """Stand-in for a token-only TQTokenSource: records fetched keys, serves two tokens per key."""
 
     def __init__(self):
         self.calls = []
@@ -1553,20 +1452,30 @@ class _RecordingSource:
         self.calls.append(list(keys))
         return [int(k[1:]) * 10 + i for k in keys for i in range(2)]
 
+
+class _RecordingSource(_FlatSource):
+    """Stand-in for TQTokenSource that also serves one media item per key."""
+
     def fetch_prefix_chains(self, keys):
         return PrefixChains(
             expanded=self.fetch_prefix_token_ids(keys), media_count=len(keys)
         )
 
 
-def test_chain_prefix_cache_fetches_only_uncached_suffix():
-    source = _RecordingSource()
+@pytest.mark.parametrize("flat", [False, True], ids=["fetch_chains", "fetch"])
+def test_chain_prefix_cache_fetches_only_uncached_suffix(flat):
+    """``fetch_chains`` serves the Megatron preparer; the vLLM worker's flat
+    ``fetch`` path uses ``fetch_prefix_token_ids`` alone."""
+    source = _FlatSource() if flat else _RecordingSource()
     cache = ChainPrefixCache(source)
+    fetch = cache.fetch if flat else (lambda keys: cache.fetch_chains(keys).expanded)
 
-    assert cache.fetch_chains(["k1", "k2"]).expanded == [10, 11, 20, 21]
-    assert cache.fetch_chains(["k1", "k2", "k3"]).expanded == [10, 11, 20, 21, 30, 31]
-    assert cache.fetch_chains(["k1", "k2"]).expanded == [10, 11, 20, 21]
+    assert fetch(["k1", "k2"]) == [10, 11, 20, 21]
+    assert fetch(["k1", "k2", "k3"]) == [10, 11, 20, 21, 30, 31]
+    assert fetch(["k1", "k2"]) == [10, 11, 20, 21]
     assert source.calls == [["k1", "k2"], ["k3"]]
+    if flat:
+        return
     assert cache.fetch_chains(["k1", "k2", "k3"]) == PrefixChains(
         expanded=[10, 11, 20, 21, 30, 31], media_count=3
     )
@@ -1595,44 +1504,22 @@ def test_chain_prefix_cache_evicts_oldest_insertion_past_256_entries():
     assert len(source.calls) == calls_before + 1
 
 
-def test_chain_prefix_cache_flat_fetch_reads_only_expanded_token_ids():
-    """The vLLM worker's flat path uses ``fetch_prefix_token_ids`` alone."""
-
-    class _FlatSource:
-        def __init__(self):
-            self.calls = []
-
-        def fetch_prefix_token_ids(self, keys):
-            self.calls.append(list(keys))
-            return [int(k[1:]) * 10 + i for k in keys for i in range(2)]
-
-    source = _FlatSource()
-    cache = ChainPrefixCache(source)
-
-    assert cache.fetch(["k1", "k2"]) == [10, 11, 20, 21]
-    assert cache.fetch(["k1", "k2", "k3"]) == [10, 11, 20, 21, 30, 31]
-    assert cache.fetch(["k1", "k2"]) == [10, 11, 20, 21]
-    assert source.calls == [["k1", "k2"], ["k3"]]
-
-
-def test_resolve_admission_prefix_dispatches_like_the_vllm_worker():
-    source = _RecordingSource()
-    cache = ChainPrefixCache(source)
-    text = SimpleNamespace(mode="text", staging_chain=[], required_prefix_token_ids=[])
-    inline = SimpleNamespace(
-        mode="token_in", staging_chain=[], required_prefix_token_ids=[7, 8]
-    )
-    chained = SimpleNamespace(
-        mode="token_in", staging_chain=["k1"], required_prefix_token_ids=[]
-    )
-
-    assert resolve_admission_prefix(text, cache) == []
-    assert resolve_admission_prefix(inline, cache) == [7, 8]
-    assert resolve_admission_prefix(chained, cache) == [10, 11]
-    assert source.calls == [["k1"]]
-
-
-def test_resolve_admission_prefix_chains_dispatches_on_admission_shape():
+@pytest.mark.parametrize(
+    ("resolve", "wrap"),
+    [
+        pytest.param(
+            resolve_admission_prefix, lambda ids, media_count: ids, id="vllm-flat"
+        ),
+        pytest.param(
+            resolve_admission_prefix_chains,
+            lambda ids, media_count: PrefixChains(
+                expanded=ids, media_count=media_count
+            ),
+            id="megatron-chains",
+        ),
+    ],
+)
+def test_resolve_admission_prefix_dispatches_on_admission_shape(resolve, wrap):
     """Text -> empty; inline prefix -> its ids, no media; chain -> cache fetch."""
     source = _RecordingSource()
     cache = ChainPrefixCache(source)
@@ -1644,13 +1531,9 @@ def test_resolve_admission_prefix_chains_dispatches_on_admission_shape():
         mode="token_in", staging_chain=["k1"], required_prefix_token_ids=[]
     )
 
-    assert resolve_admission_prefix_chains(text, cache) == PrefixChains(expanded=[])
-    assert resolve_admission_prefix_chains(inline, cache) == PrefixChains(
-        expanded=[7, 8]
-    )
-    assert resolve_admission_prefix_chains(chained, cache) == PrefixChains(
-        expanded=[10, 11], media_count=1
-    )
+    assert resolve(text, cache) == wrap([], 0)
+    assert resolve(inline, cache) == wrap([7, 8], 0)
+    assert resolve(chained, cache) == wrap([10, 11], 1)
     assert source.calls == [["k1"]]
 
 
