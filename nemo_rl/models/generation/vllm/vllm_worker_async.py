@@ -1001,6 +1001,13 @@ class VllmAsyncGenerationWorkerImpl(
                 # once in chat_completion_full_generator.
                 import os as _os
                 if (
+                    _os.environ.get("NRL_VLLM_FLAT_LOGPROBS") == "1"
+                    and getattr(sp, "logprobs", None) is not None
+                ):
+                    # Note: sp.logprobs == 0 is valid (sampled-token logprob
+                    # only, no top_logprobs) — test `is not None`.
+                    sp.flat_logprobs = True
+                if (
                     _os.environ.get("NRL_VLLM_HTTP_NO_DETOKENIZE") == "1"
                     and not sp.stop
                     and not self.stream
