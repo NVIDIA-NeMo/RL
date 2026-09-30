@@ -1628,7 +1628,10 @@ def test_cc_rejects_invalid_committed_media_occurrences(dp, monkeypatch, damage)
     assert row.rejection_reason.startswith("invalid_media_evidence:")
 
 
-def test_worker_rejects_uncommitted_retained_offsets_before_splice(dp):
+@pytest.mark.parametrize("reseal_metadata", [False, True])
+def test_worker_rejects_uncommitted_retained_offsets_before_splice(dp, reseal_metadata):
+    import hashlib
+
     from nemo_rl.data_plane.tq_token_sink import ROUTED_EXTRAS_METADATA_FIELD
 
     root, _ = stage(
@@ -1636,6 +1639,12 @@ def test_worker_rejects_uncommitted_retained_offsets_before_splice(dp):
     )
     stored = dp._partitions["staging"].rows[root.staging_key]
     stored[ROUTED_EXTRAS_METADATA_FIELD] = torch.tensor(list(b"{}"), dtype=torch.uint8)
+    if reseal_metadata:
+        # Pass the transport checksum to exercise the independent capture
+        # commitment; otherwise verify that the earlier checksum guard rejects.
+        stored[MEDIA_METADATA_DIGEST_FIELD] = torch.tensor(
+            list(hashlib.sha256(b"{}").digest()), dtype=torch.uint8
+        )
     worker = SimpleNamespace(
         _capture_media=True,
         _capture_image_token_id=18,
@@ -1653,7 +1662,8 @@ def test_worker_rejects_uncommitted_retained_offsets_before_splice(dp):
         parent_chain_hash=root.chain_hash,
         staging_chain=[root.staging_key],
     )
-    with pytest.raises(ValueError, match="extras commitment"):
+    expected = "extras commitment" if reseal_metadata else "metadata checksum mismatch"
+    with pytest.raises(ValueError, match=expected):
         VllmAsyncGenerationWorkerImpl._capture_request_media(
             worker,
             engine_prompt(
