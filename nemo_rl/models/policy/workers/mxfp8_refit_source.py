@@ -91,9 +91,9 @@ def _validate_e4m3_format(metadata: Mapping[str, Any]) -> None:
     if "fp8_dtype" not in metadata:
         raise ValueError("Native MXFP8 refit metadata must include fp8_dtype")
     try:
-        expected_dtype = importlib.import_module(
-            "transformer_engine_torch"
-        ).DType.kFloat8E4M3
+        expected_dtypes = [
+            importlib.import_module("transformer_engine_torch").DType.kFloat8E4M3
+        ]
     except ModuleNotFoundError as error:
         if error.name != "transformer_engine_torch":
             raise
@@ -106,10 +106,27 @@ def _validate_e4m3_format(metadata: Mapping[str, Any]) -> None:
             "Native MXFP8 refit cannot validate fp8_dtype because "
             "transformer_engine_torch.DType.kFloat8E4M3 is unavailable"
         ) from error
-    if metadata["fp8_dtype"] is not expected_dtype:
+
+    try:
+        expected_dtypes.append(
+            importlib.import_module(
+                "transformer_engine.pytorch.constants"
+            ).DType.kFloat8E4M3
+        )
+    except ModuleNotFoundError as error:
+        if error.name not in {
+            "transformer_engine",
+            "transformer_engine.pytorch",
+            "transformer_engine.pytorch.constants",
+        }:
+            raise
+    except AttributeError:
+        pass
+
+    if not any(metadata["fp8_dtype"] is dtype for dtype in expected_dtypes):
         raise ValueError(
-            "Native MXFP8 refit fp8_dtype must be "
-            "transformer_engine_torch.DType.kFloat8E4M3"
+            "Native MXFP8 refit fp8_dtype must be an E4M3 dtype provided by "
+            "Transformer Engine"
         )
 
 
