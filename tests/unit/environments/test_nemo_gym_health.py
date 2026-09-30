@@ -39,7 +39,12 @@ NemoGymClass = NemoGym.__ray_metadata__.modified_class
 def _unspun() -> NemoGymClass:
     """A NemoGym exactly as Ray would recreate it after a restart."""
     return NemoGymClass(
-        {"model_name": "m", "base_urls": [], "initial_global_config_dict": {}}
+        {
+            "model_name": "m",
+            "base_urls": [],
+            "initial_global_config_dict": {},
+            "turn_recovery_enabled": False,
+        }
     )
 
 

@@ -100,7 +100,7 @@ class _InitRolloutManager:
     ) -> None:
         self.checkpoint_barrier = barrier
 
-    def bind_gym_acknowledgement_sink(
+    def bind_gym_acknowledgement_notifier(
         self, on_ready: Callable[[], None] | None
     ) -> None:
         self.gym_acknowledgements_ready = on_ready
@@ -1647,6 +1647,9 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._timer = Timer()
     ctrl._trainer_version = 0
     ctrl._train_steps = 0
+    ctrl._optimizer_commit_in_progress = False
+    ctrl._optimizer_commit_started = asyncio.Event()
+    ctrl._optimizer_commit_started.set()
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._batch_shortfall = {}
     ctrl._batch_replacements = {}

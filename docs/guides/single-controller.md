@@ -165,10 +165,113 @@ protocol:
 rollout_checkpointing:
   snapshot_attempt_interval_s: 120
   gym:
-    capability_discovery_enabled: true
-    participant_checkpointing_enabled: true
+    mode: turn_recovery
     prepare_timeout_s: 300
 ```
+
+#### Choosing a checkpoint level
+
+The current configuration has no single `rollout_recovery.target_level`
+setting. Choose the recovery behavior by combining
+`rollout_recovery.default_granularity` with
+`rollout_checkpointing.gym.mode`:
+
+| Recovery goal | `rollout_recovery.default_granularity` | `rollout_checkpointing.gym.mode` | Behavior after restart |
+| --- | --- | --- | --- |
+| Rerun incomplete prompt groups | `prompt_group` | `disabled` | Fully completed TQ groups are restored. If any sibling in an unfinished group is missing, every sibling in that group is regenerated. |
+| Reuse completed siblings | `sibling` | `disabled` | Sealed siblings are reused. Each unfinished sibling restarts from its original prompt. |
+| Resume unfinished Gym turns | `sibling` | `turn_recovery` | Sealed siblings are reused. Gym continuations resume from their last committed turn when their resource dependencies support recovery; otherwise those continuations restart from the original prompt. |
+
+Using `prompt_group` together with `mode: turn_recovery` is valid, but the
+prompt-group policy still discards sibling-level progress when the group is
+retried. It therefore does not provide turn-level work reuse for incomplete
+groups.
+
+All three choices require the following settings for durable periodic rollout
+snapshots:
+
+| Setting | Required value or constraint |
+| --- | --- |
+| `checkpointing.enabled` | `true` |
+| `checkpointing.save_data_plane` | `true` |
+| `checkpointing.save_period` | `1` is recommended; otherwise snapshot attempts are skipped until the matching trainer checkpoint exists |
+| `rollout_checkpointing.snapshot_attempt_interval_s` | A positive interval |
+| `rollout_checkpointing.restore_mode` | Use `latest` to recover the newest periodic rollout snapshot; `trainer_checkpoint` deliberately ignores newer periodic progress |
+| `token_capture.enabled` | `true` |
+| `async_rl.rollout_failure.nemo_gym.max_row_attempts` | `1`; the recovery ledger, rather than row redispatch, creates replacement attempts |
+| `data_plane.backend` | `simple` or `mooncake_cpu` |
+| `async_rl.sampler` | A built-in sampler, or a custom sampler declaring both `supports_buffer_checkpoint` and `supports_training_claims` |
+
+Turn-level recovery adds these requirements:
+
+- Configure exactly one NeMo-Gym actor. With `env.nemo_gym.shards`, the sum of
+  all shard replicas must be one.
+- The selected Gym agent must support checkpoint continuations. Gym's
+  `simple_agent` does.
+- A resources server advertising `stateless` is reconstructed by replaying the
+  saved request. A server advertising `export_restore` restores its saved
+  state. A server advertising `restart_only` causes every saved continuation
+  that depends on it to be discarded and rerun from the original prompt.
+- `prepare_timeout_s` must be long enough for active agents to reach a
+  checkpoint boundary and for every participating server to prepare. A timeout
+  leaves the previous snapshot authoritative and the periodic checkpoint pump
+  retries later.
+
+`task_source_granularity_overrides` and
+`agent_granularity_overrides` may select a different policy for one environment.
+Task-source keys must exactly match `extra_env_info.task_source`. Agent keys
+must exactly match `extra_env_info.agent_ref.name`; an agent match takes
+precedence over a task-source match. An unmatched or misspelled key does not
+change the policy and the global default is used. The resolved policy is saved
+with the prompt group, so changing the configuration on restart does not
+reinterpret work that was already checkpointed.
+
+##### Group-scored environments
+
+A group scorer such as GenRM compare holds every sibling in `/verify` until the
+whole prompt group arrives. NeMo-RL reads the group-scoring capability during
+setup and rejects configurations that cannot make progress:
+
+- Gym's `num_rollouts_per_prompt` must equal
+  `grpo.num_generations_per_prompt`.
+- Either `async_rl.rollout_failure.nemo_gym.rollout_timeout_s` or Gym's
+  `cohort_collection_timeout_s` must be set, so a missing cohort member cannot
+  wait forever.
+- With `mode: turn_recovery`, the agent must set
+  `checkpoint_replayable_verify: true` and the scorer must advertise replayable
+  verification. Production `genrm_compare` advertises `stateless`, so its
+  process-local cohort is rebuilt by replaying every saved `/verify` request
+  after restore.
+
+The group-scoring capability does not override
+`rollout_recovery.default_granularity`. Use `prompt_group` when every retry must
+regenerate one weight-consistent group. Use `sibling` with turn recovery when
+preserving and resuming long-running sibling turns is more important; resumed
+siblings retain the policy version recorded when their saved tokens were
+generated.
+
+##### Invalid or lossy combinations
+
+| Combination | Result |
+| --- | --- |
+| Group scorer size differs from `num_generations_per_prompt` | Setup rejects the run. |
+| Group scorer has neither a rollout timeout nor a cohort timeout | Setup rejects the run because a partial cohort could wait forever. |
+| Group-scored agent has `checkpoint_replayable_verify: false` with turn recovery | Setup rejects the run because a checkpoint could strand an active `/verify`. |
+| Turn recovery configures more than one Gym actor | Setup rejects the run; participant checkpointing is not shard-aware yet. |
+| A continuation depends on a `restart_only` resources server | Restore succeeds, but that continuation is discarded and rerun from its original prompt. |
+| `restore_mode: trainer_checkpoint` while newer periodic snapshots exist | The newer rollout progress is intentionally ignored. If only bootstrap snapshots exist and no trainer checkpoint exists, startup fails safely. |
+| An override key does not match the row's task source or agent | The override has no effect and the global granularity is used. |
+
+Restore outcomes are reported under `timing/rollout_recovery`, including
+`groups_complete_restored`, `groups_unfinished_found`, `siblings_reused`, and
+`siblings_rerun`. See the
+[Single-Controller rollout recovery metrics](../observability/metrics.md#single-controller-rollout-recovery-metrics)
+for details.
+
+There is no separate discovery-only mode. Single Controller performs a
+read-only NeMo-Gym capability preflight for group-scoring contracts during
+setup; only `mode: turn_recovery` enables execution fencing, retained
+completion receipts, participant snapshots, and restore.
 
 Single Controller first closes new rollout admission, acknowledges completed
 Gym executions that are already owned by canonical TQ rows, and asks Gym to
@@ -192,9 +295,13 @@ that Gym reports the same sidecar digests and that every indexed TQ row exists.
 The continuation and external-storage indexes are required; checkpoints that
 omit either sidecar fail closed instead of making NeMo-RL inspect Gym's private
 lineage format.
-Use `restore_mode: latest`: full trainer checkpoints do not yet contain Gym
-participant state, so startup fails safely if no compatible periodic rollout
-snapshot exists for the selected trainer anchor.
+
+Use `restore_mode: latest`. Every trainer checkpoint first writes a
+`gym_restart_fallback.json` marker and then tries to publish a coordinated Gym
+rollout snapshot. On restart, NeMo-RL restores the newest compatible snapshot.
+If the trainer checkpoint has no snapshot but still has the marker, NeMo-RL
+keeps completed rollouts and restarts unfinished Gym executions from their
+original task. Startup fails only if neither exists.
 
 `snapshot_attempt_interval_s` is the cadence at which Single-Controller attempts
 a rollout snapshot. It is not a guarantee that a snapshot is written at every

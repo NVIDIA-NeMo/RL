@@ -92,6 +92,9 @@ def _init_recovery_telemetry(controller: Any, *, train_steps: int = 0) -> None:
     controller._train_steps = train_steps
     controller._logger = MagicMock()
     controller._gym_restart_unfinished = False
+    controller._restored_gym_checkpoint_continuations = ()
+    controller._restart_only_gym_continuations = set()
+    controller._stale_gym_acknowledgements_dropped = 0
 
 
 async def _wait_for_event_or_pump(
@@ -270,7 +273,7 @@ class _BlockingRolloutManager:
         """Accept the controller-owned barrier used by the production manager."""
         del barrier
 
-    def bind_gym_acknowledgement_sink(self, sink: Any) -> None:
+    def bind_gym_acknowledgement_notifier(self, sink: Any) -> None:
         """Accept the optional Gym ACK collaborator used by the controller."""
         del sink
 
@@ -985,6 +988,8 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(tmp_path) -> None
         assert recovery_metrics["groups_unfinished_found"] == 1.0
         assert recovery_metrics["siblings_reused"] == 0.0
         assert recovery_metrics["siblings_rerun"] == 2.0
+        assert recovery_metrics["siblings_continued"] == 0
+        assert recovery_metrics["siblings_restarted_no_saved_turn"] == 2
         assert "groups_redispatched" not in recovery_metrics
 
     asyncio.run(exercise())

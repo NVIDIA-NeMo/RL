@@ -22,6 +22,7 @@ runtime_envs and breaks Ray's resource resolution (see the PR #2692 follow-up).
 from __future__ import annotations
 
 import os
+import secrets
 import time
 import uuid
 import warnings
@@ -110,6 +111,7 @@ from nemo_rl.environments.gym_checkpoint import (
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import (
     NemoGymShardSet,
+    as_nemo_gym_shard_set,
     build_nemo_gym_actors,
     should_use_nemo_gym,
     sole_nemo_gym_checkpoint_actor,
@@ -187,8 +189,8 @@ class SingleControllerActorArgs:
     partition_includes_multimodal_fields: bool = False
     bootstrap_identity: Optional[BootstrapCompatibilityIdentity] = None
     rollout_checkpoint_load_metrics: Optional[dict[str, float]] = None
-    # Discovered only when Gym capability discovery is enabled. Dynamic phases,
-    # addresses, and credentials are excluded from this identity.
+    # Retained only for turn recovery. Dynamic phases, addresses, and
+    # credentials are excluded from this identity.
     gym_checkpoint_topology: Optional[GymCheckpointTopology] = None
     gym_checkpoint_restore_operation_id: Optional[str] = None
     gym_checkpoint_staging_keys: tuple[str, ...] = ()
@@ -780,6 +782,11 @@ def _spinup_gym(
     policy_config = master_config.policy
     generation_config = policy_config["generation"]
     enable_router_replay = router_replay_enabled(policy_config)
+    checkpoint_control_auth_token: Optional[str] = None
+    if master_config.rollout_checkpointing.gym.participant_checkpointing_enabled:
+        checkpoint_control_auth_token = os.environ.get(
+            "NEMO_GYM_CHECKPOINT_CONTROL_TOKEN"
+        ) or secrets.token_hex(32)
     shard_set = build_nemo_gym_actors(
         master_config.env,
         base_urls=base_urls,
@@ -787,14 +794,75 @@ def _spinup_gym(
         tokenizer=tokenizer,
         enable_router_replay=enable_router_replay,
         use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
+        turn_recovery_enabled=(
+            master_config.rollout_checkpointing.gym.participant_checkpointing_enabled
+        ),
         # Ledger config rides into Gym's policy model server.
         token_capture=(
             master_config.token_capture.model_dump()
             if master_config.token_capture.enabled
             else None
         ),
+        checkpoint_control_auth_token=checkpoint_control_auth_token,
     )
     return shard_set, time.perf_counter() - t0
+
+
+def _preflight_nemo_gym_capabilities(
+    environment: Any,
+    *,
+    expected_group_size: int,
+    rollout_timeout_s: Optional[float],
+    turn_recovery_enabled: bool,
+    agent_granularity_override_names: frozenset[str],
+) -> Optional[GymCheckpointTopology]:
+    """Validate Gym routing and group-scoring contracts before dispatch.
+
+    Gym's capability route is always available, even when the dedicated
+    checkpoint bearer is absent. For ordinary Gym runs, inspect one replica
+    per shard and validate agent override names plus the group-scoring contract.
+    Turn recovery is currently single-actor, so additionally retain and validate
+    that actor's complete checkpoint topology.
+    """
+    shard_set = as_nemo_gym_shard_set(environment)
+    if turn_recovery_enabled:
+        actors = [sole_nemo_gym_checkpoint_actor(shard_set)]
+    else:
+        actors = [replicas[0] for replicas in shard_set.handles.values()]
+
+    topologies = [
+        GymCheckpointTopology.model_validate(
+            ray.get(actor.discover_checkpoint_capabilities.remote())
+        )
+        for actor in actors
+    ]
+    discovered_agent_routes = {
+        contract.participant.server_name
+        for topology in topologies
+        for contract in topology.participants
+        if contract.participant.component == "responses_api_agents"
+    }
+    unknown_override_names = agent_granularity_override_names - discovered_agent_routes
+    if unknown_override_names:
+        raise ValueError(
+            "rollout_recovery.agent_granularity_overrides contains Gym agent "
+            "routing names that were not discovered: "
+            f"{sorted(unknown_override_names)!r}. Discovered agent routes: "
+            f"{sorted(discovered_agent_routes)!r}. Override keys must match "
+            "extra_env_info.agent_ref.name."
+        )
+    for topology in topologies:
+        topology.validate_group_scoring_capabilities(
+            expected_group_size=expected_group_size,
+            rollout_timeout_s=rollout_timeout_s,
+            require_checkpoint_replayability=turn_recovery_enabled,
+        )
+
+    if not turn_recovery_enabled:
+        return None
+    topology = topologies[0]
+    topology.validate_turn_recovery_capabilities()
+    return topology
 
 
 def _generation_max_seq_len(generation_config) -> int:
@@ -1102,14 +1170,18 @@ def setup_single_controller(
         )
     data_plane_checkpointing_supported = data_plane_supports_checkpointing(dp_config)
     rollout_checkpoint_cfg = master_config.rollout_checkpointing
-    if rollout_checkpoint_cfg.gym.capability_discovery_enabled:
+    if rollout_checkpoint_cfg.gym.participant_checkpointing_enabled:
+        if generation_config["backend"] != "vllm":
+            raise NotImplementedError(
+                "rollout_checkpointing.gym.mode='turn_recovery' supports the vllm "
+                "generation backend only (it needs token capture); "
+                f"got {generation_config['backend']!r}"
+            )
         if not should_use_nemo_gym(master_config):
             raise ValueError(
-                f"rollout_checkpointing.gym.mode={rollout_checkpoint_cfg.gym.mode!r} "
-                "requires the NeMo-Gym rollout path "
-                "(env.should_use_nemo_gym=true)"
+                "rollout_checkpointing.gym.mode='turn_recovery' requires the "
+                "NeMo-Gym rollout path (env.should_use_nemo_gym=true)"
             )
-    if rollout_checkpoint_cfg.gym.participant_checkpointing_enabled:
         if rollout_checkpoint_cfg.snapshot_attempt_interval_s is None:
             raise ValueError(
                 "rollout_checkpointing.gym.mode='turn_recovery' requires "
@@ -1294,9 +1366,6 @@ def setup_single_controller(
         # per-run control-plane bearer token and the process-shared capture
         # directory used by every Gym worker.
         if token_capture_cfg.control_auth_token is None:
-            # Deferred import: only needed on the capture path.
-            import secrets
-
             token_capture_cfg.control_auth_token = secrets.token_hex(32)
         if token_capture_cfg.capture_dir is None:
             token_capture_cfg.capture_dir = os.path.abspath(
@@ -1869,13 +1938,29 @@ def setup_single_controller(
     setup_timing_metrics.generation_init_time_s = gen_reserve_time + gen_load_time
 
     gym_checkpoint_topology: Optional[GymCheckpointTopology] = None
-    if rollout_checkpoint_cfg.gym.capability_discovery_enabled:
-        gym_actor = sole_nemo_gym_checkpoint_actor(env_handles["nemo_gym"])
-        discovered = ray.get(gym_actor.discover_checkpoint_capabilities.remote())
-        gym_checkpoint_topology = GymCheckpointTopology.model_validate(discovered)
-        if rollout_checkpoint_cfg.gym.participant_checkpointing_enabled:
-            gym_checkpoint_topology.validate_turn_recovery_capabilities()
-        if resolved_snapshot is not None:
+    if use_nemo_gym:
+        try:
+            gym_checkpoint_topology = _preflight_nemo_gym_capabilities(
+                env_handles["nemo_gym"],
+                expected_group_size=algo_cfg.num_generations_per_prompt,
+                rollout_timeout_s=(
+                    master_config.async_rl.rollout_failure.nemo_gym.rollout_timeout_s
+                ),
+                turn_recovery_enabled=(
+                    rollout_checkpoint_cfg.gym.participant_checkpointing_enabled
+                ),
+                agent_granularity_override_names=frozenset(
+                    master_config.rollout_recovery.agent_granularity_overrides
+                ),
+            )
+        except BaseException:
+            as_nemo_gym_shard_set(env_handles["nemo_gym"]).shutdown()
+            raise
+        if (
+            rollout_checkpoint_cfg.gym.participant_checkpointing_enabled
+            and resolved_snapshot is not None
+        ):
+            assert gym_checkpoint_topology is not None
             saved_topology_fingerprint = (
                 resolved_snapshot.manifest.gym_topology_fingerprint
             )
@@ -1899,8 +1984,7 @@ def setup_single_controller(
     ):
         raise ValueError(
             "the selected rollout snapshot contains Gym participant state; "
-            "enable rollout_checkpointing.gym.participant_checkpointing_enabled "
-            "to restore it"
+            "set rollout_checkpointing.gym.mode='turn_recovery' to restore it"
         )
     if (
         resolved_snapshot is not None

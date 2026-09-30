@@ -896,10 +896,11 @@ def test_request_deadlines_pause_while_the_engine_is_stood_down():
         loop = asyncio.get_running_loop()
         async with _Deadline(1.0, "generation turn", registry=registry) as live:
             await asyncio.sleep(0.2)
-            registry.suspend()
+            registry.suspend("weight_sync")
             assert live._timeout is not None and live._timeout.when() is None
             banked = live._remaining
             assert banked is not None and 0.0 < banked <= 0.8
+            registry.suspend("gym_checkpoint")
             async with _Deadline(0.2, "generation turn", registry=registry) as late:
                 # Entered while suspended: disarmed, full budget banked.
                 assert late._timeout is not None and late._timeout.when() is None
@@ -908,7 +909,12 @@ def test_request_deadlines_pause_while_the_engine_is_stood_down():
                     assert off._remaining is None  # disabled: nothing to bank
                 # Wall clock far past both budgets: nothing fires while frozen.
                 await asyncio.sleep(1.2)
-                registry.resume()
+                registry.resume("weight_sync")
+                assert registry.suspended
+                assert live._timeout.when() is None
+                assert late._timeout.when() is None
+                registry.resume("gym_checkpoint")
+                assert not registry.suspended
                 assert live._timeout.when() == pytest.approx(
                     loop.time() + banked, abs=0.05
                 )

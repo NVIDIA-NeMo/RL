@@ -746,18 +746,18 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
 class GymRolloutCheckpointConfig(BaseModel, extra="forbid"):
     """Configure the experimental NeMo-Gym checkpoint protocol.
 
-    ``disabled`` skips protocol discovery. ``discover`` validates and
-    fingerprints the Gym checkpoint topology without saving participant state.
-    ``turn_recovery`` also saves Gym participant state and enables durable
-    completion acknowledgements.
+    ``disabled`` leaves Gym checkpoint participation off. ``turn_recovery``
+    discovers and validates the checkpoint topology, saves participant state,
+    and enables durable completion acknowledgements.
     """
 
-    mode: Literal["disabled", "discover", "turn_recovery"] = "disabled"
+    mode: Literal["disabled", "turn_recovery"] = "disabled"
+    # Time limit in seconds for each Gym checkpoint step: prepare, commit,
+    # resume/abort, restore, discard. Every step gets its own full limit, shared
+    # by all Gym servers in that step, so one snapshot can hold Gym for up to
+    # about 3x this (prepare + commit + resume). Prepare must drain accepted
+    # policy calls within it, so size it above your longest single generation.
     prepare_timeout_s: Annotated[float, Field(gt=0)] = 300.0
-
-    @property
-    def capability_discovery_enabled(self) -> bool:
-        return self.mode != "disabled"
 
     @property
     def participant_checkpointing_enabled(self) -> bool:
@@ -1295,7 +1295,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         )
     _validate_algo_settings(master_config)
 
-    if master_config.rollout_checkpointing.gym.mode != "disabled":
+    if master_config.rollout_checkpointing.gym.participant_checkpointing_enabled:
         nemo_gym_config = master_config.env.get("nemo_gym", {})
         shard_plan = parse_shard_plan(nemo_gym_config)
         gym_actor_count = (

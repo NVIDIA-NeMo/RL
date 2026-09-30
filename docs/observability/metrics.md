@@ -50,17 +50,23 @@ The rollout checkpoint benchmark focuses on the following questions:
 |---|---|---|
 | `rollout/throughput` | `generation_output_tokens_per_second`, `committed_output_tokens_per_second`, `committed_groups_per_second` | Raw backend decoding throughput compared with output committed for training. The raw metric is absent when the backend does not expose compatible cumulative counters. With token capture, committed tokens are counted exactly from valid staged rows; without token capture, they are estimated by multiplying the reported per-sample mean by the number of completions, so compare like-for-like runs. |
 | `rollout/throughput` | `checkpoint_blocked_mutations`, `checkpoint_mutation_wait_seconds_p95`, `checkpoint_mutation_wait_seconds_max` | Number and latency of live data-plane mutations delayed by an exclusive checkpoint. |
-| `timing/rollout_checkpoint` | `total_save_seconds`, `tq_save_seconds`, `barrier_wait_seconds`, `exclusive_hold_seconds`, `sidecar_save_seconds`, `snapshot_commit_seconds` | End-to-end save latency and its storage, fencing, controller-sidecar, and atomic-publication components. |
+| `timing/rollout_checkpoint` | `total_save_seconds`, `tq_save_seconds`, `barrier_wait_seconds`, `exclusive_hold_seconds`, `sidecar_save_seconds`, `snapshot_commit_seconds`, `gym_prepare_seconds`, `gym_commit_seconds` | End-to-end save latency and its storage, fencing, controller-sidecar, atomic-publication, and Gym participant phases. Gym phase timings are emitted for every attempted participant checkpoint, including attempts later discarded because trainer state advanced or the snapshot failed. |
 | `timing/rollout_checkpoint` | `snapshot_rows`, `replay_rows`, `staging_rows`, `replay_groups`, `ledger_groups`, `controller_sidecar_bytes` | Logical volume captured by the snapshot. `controller_sidecar_bytes` excludes the native TQ payload because the current TQ checkpoint API does not report bytes written. NeMo-RL deliberately does not recursively scan the shared checkpoint directory because that scan would perturb the benchmark. |
-| `rollout/checkpoint_outcome` | `completed`, `skipped`, `failed`, `published_release_pending`, `reason_*`, `seconds_since_previous_success`, `seconds_since_last_success` | Result, actionable reason, and effective cadence of every scheduled checkpoint attempt. `published_release_pending` means the snapshot is durable but Gym admission remains closed until participant release succeeds. |
+| `rollout/checkpoint_outcome` | `completed`, `skipped`, `failed`, `published_release_pending`, `reason_*`, `seconds_since_previous_success`, `seconds_since_last_success` | Result, actionable reason, and effective cadence of every periodic or trainer-boundary checkpoint attempt. `published_release_pending` means the snapshot is durable but Gym admission remains closed until participant release succeeds. |
 | `timing/rollout_recovery` | `snapshot_resolution_seconds`, `dataloader_load_seconds`, `tq_load_seconds`, `replay_metadata_load_seconds`, `recovery_prepare_seconds`, `total_load_seconds` | Rollout-state restore latency. `total_load_seconds` is the sum of these non-overlapping restore phases. |
-| `timing/rollout_recovery` | `groups_complete_restored`, `groups_unfinished_found`, `siblings_reused`, `siblings_rerun`, `redispatch_schedule_seconds` | Training-ready groups restored without generation, unfinished groups found for redispatch, and sibling work preserved or rerun after restart. |
+| `timing/rollout_recovery` | `groups_complete_restored`, `groups_unfinished_found`, `siblings_reused`, `siblings_rerun`, `siblings_continued`, `siblings_restarted_restart_only_resource`, `siblings_restarted_gym_snapshot_missing`, `siblings_restarted_no_saved_turn`, `siblings_restarted_prompt_group`, `stale_acks_dropped`, `redispatch_schedule_seconds` | Training-ready groups restored without generation, unfinished groups found for redispatch, and exact dispositions for sibling work. `siblings_continued` resumed from a saved Gym turn. The `siblings_restarted_*` fields partition work that started over because a resource cannot restore, the exact Gym snapshot was unavailable, no saved turn existed, or prompt-group atomicity required the whole group to restart. `stale_acks_dropped` counts completion acknowledgements discarded when their owning Gym process was not restored. |
 
 Recovery counters describe work reconstructed at restore time, not a promise
 that every restored group will eventually train. After recovery, the configured
 sampler may still evict a restored group under its normal staleness rules (for
 example, when a `windowed` sampler finds that the group's policy version has
 fallen outside its valid window).
+
+The current Gym continuation index identifies the last committed model call but
+does not expose the number of preceding turns. Recovery therefore reports exact
+sibling dispositions instead of estimating `turns_kept` or `turns_redone`. Turn
+counts can be added once that value becomes part of Gym's committed continuation
+contract.
 
 `barrier_wait_seconds` and mutation wait latency measure opposite sides of the
 same fence. The former is how long the checkpoint waits for already-running

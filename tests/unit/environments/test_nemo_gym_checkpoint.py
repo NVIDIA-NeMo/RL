@@ -93,6 +93,7 @@ def _checkpoint_env():
         },
     )()
     env._gym_checkpoint_participants = ()
+    env._turn_recovery_enabled = True
     env._control_timeout_s = 60.0
     env._active_gym_checkpoint_id = None
     env._gym_execution_registry = GymActorExecutionRegistry()
@@ -271,6 +272,26 @@ def test_checkpoint_capability_discovery_requires_policy_model() -> None:
 
     with pytest.raises(RuntimeError, match="no policy model participant"):
         asyncio.run(env.discover_checkpoint_capabilities(["tools"]))
+
+
+def test_read_only_preflight_does_not_require_checkpoint_compatible_topology() -> None:
+    env = _checkpoint_env()
+    env._turn_recovery_enabled = False
+    env._control = AsyncMock(
+        return_value=_capability(
+            "resources_servers",
+            "tools",
+            multi_process={"mode": "unmanaged", "num_workers": 4},
+        )
+    )
+
+    discovered = asyncio.run(env.discover_checkpoint_capabilities(["tools"]))
+
+    assert [
+        item["participant"]["server_name"] for item in discovered["participants"]
+    ] == ["tools"]
+    with pytest.raises(RuntimeError, match="turn recovery is disabled"):
+        env._checkpoint_participants()
 
 
 def test_discard_restored_agent_continuations_fans_out_before_resume() -> None:

@@ -369,6 +369,10 @@ class NemoGymConfig(TypedDict):
     model_name: str
     base_urls: List[str]
     initial_global_config_dict: Dict[str, Any]
+    # Internal NeMo-RL runtime switch. Capability discovery may populate the
+    # participant topology, but only turn recovery may retain/ACK completions,
+    # reconcile ambiguous executions, or fence rollout admission.
+    turn_recovery_enabled: bool
     # Port range for Gym HTTP servers (head server + subprocess servers).
     # Defaults to DEFAULT_GYM_PORT_RANGE_LOW/HIGH (5000-5999) from
     # nemo_rl.distributed.virtual_cluster.  See the port layout there.
@@ -401,6 +405,10 @@ class NemoGymConfig(TypedDict):
     # server, switches run_rollouts to receipt mode, and assembles receipts
     # from the manifest control route. None/absent = legacy token-echo path.
     token_capture: NotRequired[NemoGymTokenCaptureConfig | None]
+    # Dedicated bearer for Gym participant checkpoint routes. This is present
+    # only for coordinated turn recovery; token capture must not implicitly
+    # install state-retaining checkpoint participants.
+    checkpoint_control_auth_token: NotRequired[str]
 
 
 # Gym control-plane server name (the model server hosting the ledger) and the
@@ -415,6 +423,7 @@ _NG_AGENT_REQUEST_FAILED = "agent_request_failed"
 _NG_AGENT_RUN_ERROR = "agent_run_error"
 _TOKEN_CAPTURE_CONTROL_PREFIX = "/training-token-capture/control"
 _TOKEN_CAPTURE_CONTROL_ENV = "NEMO_GYM_TOKEN_CAPTURE_CONTROL_TOKEN"
+_CHECKPOINT_CONTROL_ENV = "NEMO_GYM_CHECKPOINT_CONTROL_TOKEN"
 
 
 class GymControlRequestError(RuntimeError):
@@ -565,6 +574,13 @@ class NemoGym(EnvironmentInterface):
 
     def __init__(self, cfg: NemoGymConfig):
         self.cfg = cfg
+        self._turn_recovery_enabled = cfg["turn_recovery_enabled"]
+        checkpoint_control_token = cfg.get("checkpoint_control_auth_token")
+        if self._turn_recovery_enabled != (checkpoint_control_token is not None):
+            raise ValueError(
+                "turn_recovery_enabled and checkpoint_control_auth_token must "
+                "be configured together"
+            )
         # Populated by _spinup. Declared here so a restarted actor -- Ray recreates it
         # through __init__, which does not start the Gym servers -- reports what
         # actually happened instead of an AttributeError from deep inside a rollout.
@@ -719,10 +735,17 @@ Depending on your data shape, you may want to change these values."""
             token_capture and token_capture.get("enabled")
         )
         self._server_client = None
-        # Gym is available in this actor environment but not on the SC driver.
-        from nemo_gym._checkpoint import CHECKPOINT_CONTROL_TOKEN_ENV
-
-        checkpoint_control_token = os.environ.get(CHECKPOINT_CONTROL_TOKEN_ENV)
+        checkpoint_control_token = self.cfg.get("checkpoint_control_auth_token")
+        if checkpoint_control_token is not None:
+            # Gym resolves the credential inside each serving process. Keep it
+            # out of serialized Gym config and expose it only in this actor and
+            # the child servers it launches.
+            os.environ[_CHECKPOINT_CONTROL_ENV] = checkpoint_control_token
+        else:
+            # Ray may inherit the driver's environment. An unrelated or stale
+            # shell variable must not install checkpoint participants unless
+            # turn recovery explicitly enabled them for this actor.
+            os.environ.pop(_CHECKPOINT_CONTROL_ENV, None)
         self._token_capture_control_headers = {}
         self._checkpoint_control_headers = (
             {"Authorization": f"Bearer {checkpoint_control_token}"}
@@ -762,12 +785,6 @@ Depending on your data shape, you may want to change these values."""
             self._token_capture_control_headers = {
                 "Authorization": f"Bearer {token_capture['control_auth_token']}"
             }
-            # Gym's checkpoint routes reuse the token-capture bearer only when
-            # no dedicated checkpoint bearer is configured.
-            if not checkpoint_control_token:
-                self._checkpoint_control_headers = dict(
-                    self._token_capture_control_headers
-                )
             self._control_timeout_s = float(
                 token_capture.get("control_timeout_s") or 60.0
             )
@@ -901,9 +918,11 @@ Depending on your data shape, you may want to change these values."""
         self,
         server_names: Optional[list[str]] = None,
     ) -> dict[str, Any]:
-        """Discover and validate checkpoint capabilities without enabling saves.
+        """Discover Gym capabilities for setup preflight and turn recovery.
 
-        The result is cached for later explicit control calls on this actor.
+        Every run may use the topology for read-only group-scoring validation.
+        Checkpoint-specific compatibility checks and later control calls are
+        enabled only when this actor was created for turn recovery.
         """
         # Gym is available in this actor environment but not on the SC driver.
         from nemo_gym._checkpoint import CONTROL_URL_PREFIX, ControlCapabilities
@@ -935,7 +954,10 @@ Depending on your data shape, you may want to change these values."""
                     f"Gym checkpoint participant {server_name!r} reports unsupported "
                     f"schema_version={capabilities.schema_version!r}"
                 )
-            if capabilities.component == "responses_api_models":
+            if (
+                self._turn_recovery_enabled
+                and capabilities.component == "responses_api_models"
+            ):
                 if capabilities.instance_role is None:
                     raise RuntimeError(
                         f"Gym model participant {server_name!r} did not declare "
@@ -955,12 +977,15 @@ Depending on your data shape, you may want to change these values."""
                         "or reward model), or RL will pause it during every checkpoint "
                         "prepare."
                     )
-            elif capabilities.instance_role is not None:
+            elif self._turn_recovery_enabled and capabilities.instance_role is not None:
                 raise RuntimeError(
                     f"non-model Gym participant {server_name!r} unexpectedly "
                     f"declared instance_role={capabilities.instance_role!r}"
                 )
-            if capabilities.multi_process.mode == "unmanaged":
+            if (
+                self._turn_recovery_enabled
+                and capabilities.multi_process.mode == "unmanaged"
+            ):
                 raise RuntimeError(
                     f"Gym checkpoint participant {server_name!r} runs "
                     f"{capabilities.multi_process.num_workers} unmanaged workers"
@@ -982,7 +1007,7 @@ Depending on your data shape, you may want to change these values."""
                     capabilities=capabilities,
                 )
             )
-        if not any(
+        if self._turn_recovery_enabled and not any(
             item.capabilities.component == "responses_api_models"
             and item.capabilities.instance_role == "policy"
             for item in participants
@@ -1003,6 +1028,8 @@ Depending on your data shape, you may want to change these values."""
         return self._gym_checkpoint_topology.model_dump(mode="json")
 
     def _checkpoint_participants(self) -> tuple[GymDiscoveredParticipant, ...]:
+        if not self._turn_recovery_enabled:
+            raise RuntimeError("Gym turn recovery is disabled for this actor")
         if not self._gym_checkpoint_participants:
             raise RuntimeError(
                 "discover_checkpoint_capabilities must succeed before Gym "
@@ -1983,7 +2010,7 @@ Depending on your data shape, you may want to change these values."""
         maybe_patch_fastokens(bool(self.cfg.get("use_fastokens")))
 
         registered_executions: list[GymExecutionIdentity] = []
-        if self._gym_checkpoint_participants:
+        if self._turn_recovery_enabled:
             executions = [
                 GymExecutionIdentity(
                     rollout_id=row[_NG_ROLLOUT_ID_BODY_KEY],
@@ -2001,7 +2028,7 @@ Depending on your data shape, you may want to change these values."""
 
         timer = Timer()
         timer.start("_run_rollouts_total")
-        if self._gym_checkpoint_participants:
+        if self._turn_recovery_enabled:
             # Preserve the input row beside an ambiguous transport failure so
             # reconciliation can address the exact (rollout_id, attempt_index).
             nemo_gym_result_iterator = self.rch.run_examples_with_metadata(
@@ -2026,7 +2053,7 @@ Depending on your data shape, you may want to change these values."""
             with timer.time(label=f"{timer_prefix}/await_results"):
                 try:
                     completed = await task
-                    if self._gym_checkpoint_participants:
+                    if self._turn_recovery_enabled:
                         (
                             nemo_gym_row,
                             nemo_gym_result,
@@ -2055,7 +2082,7 @@ Depending on your data shape, you may want to change these values."""
                     continue
 
             execution: GymExecutionIdentity | None = None
-            if self._gym_checkpoint_participants:
+            if self._turn_recovery_enabled:
                 execution = GymExecutionIdentity(
                     rollout_id=nemo_gym_row[_NG_ROLLOUT_ID_BODY_KEY],
                     attempt_index=nemo_gym_row[_NG_ATTEMPT_INDEX_BODY_KEY],
@@ -2097,7 +2124,7 @@ Depending on your data shape, you may want to change these values."""
             try:
                 with timer.time(label=f"{timer_prefix}/postprocess_results"):
                     completion_receipt = None
-                    if self._gym_checkpoint_participants:
+                    if self._turn_recovery_enabled:
                         assert execution is not None
                         raw_completion_receipt = rollout_metadata.get(
                             "completion_receipt"
@@ -2136,7 +2163,7 @@ Depending on your data shape, you may want to change these values."""
                         )
                         if _has_nan_generation_logprobs(nemo_rl_result):
                             raise RuntimeError("Generation logprobs contain NaN")
-                    if self._gym_checkpoint_participants:
+                    if self._turn_recovery_enabled:
                         assert completion_receipt is not None
                         nemo_rl_result["gym_completion_receipt"] = (
                             completion_receipt.model_dump(mode="json")
@@ -2813,7 +2840,9 @@ def build_nemo_gym_config(
     model_name: str,
     enable_router_replay: bool,
     use_fastokens: bool,
+    turn_recovery_enabled: bool,
     token_capture: Optional[dict[str, Any]] = None,
+    checkpoint_control_auth_token: Optional[str] = None,
 ) -> NemoGymConfig:
     """Build the ``NemoGymConfig`` for a single, unsharded NeMo-Gym actor.
 
@@ -2831,6 +2860,10 @@ def build_nemo_gym_config(
             routed-experts carry dtype ("int8"/"int16"/"int32") for the model.
         use_fastokens: Forwarded from ``policy.tokenizer.use_fastokens`` so the
             actor patches its tokenizer the same way the driver does.
+        turn_recovery_enabled: Enables Gym execution fencing, completion
+            receipts, and durable completion acknowledgements.
+        checkpoint_control_auth_token: Dedicated bearer for Gym participant
+            checkpoint routes. ``None`` leaves participant checkpointing off.
 
     Returns:
         A ``NemoGymConfig`` with NeMo-RL fields at the top level and the
@@ -2857,7 +2890,9 @@ def build_nemo_gym_config(
         model_name=model_name,
         enable_router_replay=enable_router_replay,
         use_fastokens=use_fastokens,
+        turn_recovery_enabled=turn_recovery_enabled,
         token_capture=token_capture,
+        checkpoint_control_auth_token=checkpoint_control_auth_token,
     )
 
 
@@ -2868,7 +2903,9 @@ def _build_gym_actor_config(
     model_name: str,
     enable_router_replay: bool,
     use_fastokens: bool,
+    turn_recovery_enabled: bool,
     token_capture: Optional[dict[str, Any]] = None,
+    checkpoint_control_auth_token: Optional[str] = None,
 ) -> NemoGymConfig:
     """Turn one already-resolved Gym config mapping into a ``NemoGymConfig``.
 
@@ -2876,6 +2913,11 @@ def _build_gym_actor_config(
     same treatment of NeMo-RL-side keys regardless of how it was composed.
     """
     nemo_gym_dict = dict(nemo_gym_dict)
+    if turn_recovery_enabled != (checkpoint_control_auth_token is not None):
+        raise ValueError(
+            "turn_recovery_enabled and checkpoint_control_auth_token must be "
+            "configured together"
+        )
 
     # NeMo-RL-only keys are consumed here and must never reach Gym: the merged
     # config is serialized into every Gym child process, and unrecognized
@@ -2917,6 +2959,11 @@ def _build_gym_actor_config(
         else "int16"
     )
 
+    checkpoint_control = (
+        {"checkpoint_control_auth_token": checkpoint_control_auth_token}
+        if checkpoint_control_auth_token is not None
+        else {}
+    )
     return NemoGymConfig(
         model_name=model_name,
         base_urls=base_urls,
@@ -2926,8 +2973,10 @@ def _build_gym_actor_config(
         require_routed_experts=enable_router_replay,
         routed_experts_dtype=routed_experts_dtype,
         use_fastokens=use_fastokens,
+        turn_recovery_enabled=turn_recovery_enabled,
         initial_global_config_dict=nemo_gym_dict,
         token_capture=cast(NemoGymTokenCaptureConfig | None, token_capture),
+        **checkpoint_control,
         **port_range,
         **multimodal_flags,
     )
@@ -3149,7 +3198,9 @@ def build_nemo_gym_actors(
     tokenizer: PreTrainedTokenizerBase,
     enable_router_replay: bool,
     use_fastokens: bool,
+    turn_recovery_enabled: bool,
     token_capture: Optional[dict[str, Any]] = None,
+    checkpoint_control_auth_token: Optional[str] = None,
     pg_ready_timeout: float = DEFAULT_SHARD_PG_READY_TIMEOUT_SECONDS,
     spinup_timeout: float = DEFAULT_SHARD_SPINUP_TIMEOUT_SECONDS,
 ) -> NemoGymShardSet:
@@ -3164,6 +3215,10 @@ def build_nemo_gym_actors(
     Args:
         tokenizer: Installed on every actor once it is up, rather than passed
             per rollout call. See ``NemoGym.set_tokenizer`` for why.
+        turn_recovery_enabled: Enables Gym execution fencing, completion
+            receipts, and durable completion acknowledgements.
+        checkpoint_control_auth_token: Dedicated bearer for Gym participant
+            checkpoint routes. ``None`` leaves participant checkpointing off.
 
     Returns:
         A :class:`NemoGymShardSet` whose actors are all running and validated.
@@ -3184,7 +3239,9 @@ def build_nemo_gym_actors(
             tokenizer=tokenizer,
             enable_router_replay=enable_router_replay,
             use_fastokens=use_fastokens,
+            turn_recovery_enabled=turn_recovery_enabled,
             token_capture=token_capture,
+            checkpoint_control_auth_token=checkpoint_control_auth_token,
         )
 
     return _build_sharded_gym_actors(
@@ -3195,7 +3252,9 @@ def build_nemo_gym_actors(
         tokenizer=tokenizer,
         enable_router_replay=enable_router_replay,
         use_fastokens=use_fastokens,
+        turn_recovery_enabled=turn_recovery_enabled,
         token_capture=token_capture,
+        checkpoint_control_auth_token=checkpoint_control_auth_token,
         pg_ready_timeout=pg_ready_timeout,
         spinup_timeout=spinup_timeout,
     )
@@ -3209,7 +3268,9 @@ def _build_single_gym_actor(
     tokenizer: PreTrainedTokenizerBase,
     enable_router_replay: bool,
     use_fastokens: bool,
+    turn_recovery_enabled: bool,
     token_capture: Optional[dict[str, Any]],
+    checkpoint_control_auth_token: Optional[str],
 ) -> NemoGymShardSet:
     """The pre-sharding path: one actor, no placement group, no discovery.
 
@@ -3222,7 +3283,9 @@ def _build_single_gym_actor(
         model_name=model_name,
         enable_router_replay=enable_router_replay,
         use_fastokens=use_fastokens,
+        turn_recovery_enabled=turn_recovery_enabled,
         token_capture=token_capture,
+        checkpoint_control_auth_token=checkpoint_control_auth_token,
     )
 
     actor_options: dict[str, Any] = {
@@ -3257,7 +3320,9 @@ def _build_sharded_gym_actors(
     tokenizer: PreTrainedTokenizerBase,
     enable_router_replay: bool,
     use_fastokens: bool,
+    turn_recovery_enabled: bool,
     token_capture: Optional[dict[str, Any]],
+    checkpoint_control_auth_token: Optional[str],
     pg_ready_timeout: float,
     spinup_timeout: float,
 ) -> NemoGymShardSet:
@@ -3340,7 +3405,9 @@ def _build_sharded_gym_actors(
                     model_name=model_name,
                     enable_router_replay=enable_router_replay,
                     use_fastokens=use_fastokens,
+                    turn_recovery_enabled=turn_recovery_enabled,
                     token_capture=token_capture,
+                    checkpoint_control_auth_token=checkpoint_control_auth_token,
                 )
             )
             shard_set.handles.setdefault(shard.name, []).append(actor)
@@ -3495,6 +3562,7 @@ def spinup_nemo_gym_actor(
         tokenizer=tokenizer,
         enable_router_replay=enable_router_replay,
         use_fastokens=use_fastokens,
+        turn_recovery_enabled=False,
         token_capture=token_capture,
     ).sole_handle()
 

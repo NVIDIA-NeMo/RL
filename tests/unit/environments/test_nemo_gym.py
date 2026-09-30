@@ -112,6 +112,7 @@ def test_rollout_progress_counter_is_built_after_gym_resolves_task_source(
             head_server_config = object()
             _token_capture_enabled = False
             _gym_checkpoint_participants = ()
+            _turn_recovery_enabled = False
             _tokenizer = object()
 
             def _require_spinup(self):
@@ -141,6 +142,56 @@ def test_rollout_progress_counter_is_built_after_gym_resolves_task_source(
     captured = capsys.readouterr()
     assert "1. resolved_agent: 1" in captured.err
     assert "task-source:test_resources_server" not in captured.err
+
+
+def test_discovered_participants_do_not_enable_turn_recovery_runtime() -> None:
+    """Read-only preflight must not retain receipts or fence normal rollouts."""
+
+    async def _run() -> None:
+        row = {
+            "_rowidx": 0,
+            "agent_ref": {"name": "test-agent"},
+            "responses_create_params": {"input": []},
+        }
+
+        class _RolloutCollectionHelper:
+            def run_examples(self, examples, head_server_config):
+                del head_server_config
+
+                async def _completed_result():
+                    return examples[0], {"response": {"output": []}}
+
+                return [_completed_result()]
+
+            def run_examples_with_metadata(self, *args, **kwargs):
+                raise AssertionError("normal rollouts must not enter receipt mode")
+
+        class _MockSelf:
+            cfg = {}
+            rch = _RolloutCollectionHelper()
+            head_server_config = object()
+            _token_capture_enabled = False
+            # Capability preflight caches these even when recovery is disabled.
+            _gym_checkpoint_participants = (object(),)
+            _turn_recovery_enabled = False
+            _tokenizer = object()
+
+            def _require_spinup(self):
+                pass
+
+            def _postprocess_nemo_gym_to_nemo_rl_result(self, *args, **kwargs):
+                del self, args, kwargs
+                return {"message_log": []}
+
+        streamed = [
+            item
+            async for item in NemoGym.__ray_metadata__.modified_class.run_rollouts(
+                _MockSelf(), [row], "test"
+            )
+        ]
+        assert len(streamed) == 1
+
+    asyncio.run(_run())
 
 
 def test_run_rollouts_waits_when_checkpoint_freezes_before_actor_registration() -> None:
@@ -198,6 +249,7 @@ def test_run_rollouts_waits_when_checkpoint_freezes_before_actor_registration() 
             head_server_config = object()
             _token_capture_enabled = False
             _gym_checkpoint_participants = (object(),)
+            _turn_recovery_enabled = True
             _gym_execution_registry = registry
             _tokenizer = object()
 
@@ -307,6 +359,7 @@ def test_run_rollouts_rejects_missing_or_mismatched_inline_completion_receipt(
             head_server_config = object()
             _token_capture_enabled = False
             _gym_checkpoint_participants = (object(),)
+            _turn_recovery_enabled = True
             _gym_execution_registry = registry
             _tokenizer = object()
 
@@ -401,6 +454,7 @@ def test_run_rollouts_replays_same_attempt_after_lost_response() -> None:
             head_server_config = object()
             _token_capture_enabled = False
             _gym_checkpoint_participants = (object(),)
+            _turn_recovery_enabled = True
             _gym_execution_registry = GymActorExecutionRegistry()
             _tokenizer = object()
             _active_gym_checkpoint_id = None
@@ -509,6 +563,7 @@ def test_run_rollouts_retires_ambiguous_attempt_before_redispatch() -> None:
             head_server_config = object()
             _token_capture_enabled = False
             _gym_checkpoint_participants = (object(),)
+            _turn_recovery_enabled = True
             _gym_execution_registry = GymActorExecutionRegistry()
             _tokenizer = object()
             _active_gym_checkpoint_id = None
@@ -1936,6 +1991,7 @@ openai_model:
     config = NemoGymConfig(
         model_name=nemo_gym_vllm_generation.cfg["model_name"],
         base_urls=nemo_gym_vllm_generation.dp_openai_server_base_urls,
+        turn_recovery_enabled=False,
         initial_global_config_dict=safe_load(yaml_str),
     )
     env = NemoGym.options(
@@ -2413,6 +2469,7 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
             head_server_config = object()
             _token_capture_enabled = False
             _gym_checkpoint_participants = ()
+            _turn_recovery_enabled = False
 
             def _require_spinup(self):
                 pass
@@ -2478,6 +2535,7 @@ def test_nemo_gym_run_rollouts_drains_siblings_after_one_task_fails():
             _tokenizer = object()
             _token_capture_enabled = False
             _gym_checkpoint_participants = ()
+            _turn_recovery_enabled = False
 
             def _require_spinup(self):
                 pass
@@ -2578,6 +2636,7 @@ def test_nemo_gym_megatron_multimodal_response_round_trip(tmp_path, modality):
             _processor = None
             _token_capture_enabled = False
             _gym_checkpoint_participants = ()
+            _turn_recovery_enabled = False
             # Bind the real postprocess: the assertions below are about its
             # message_log output, not about run_rollouts' dispatch alone.
             _postprocess_nemo_gym_to_nemo_rl_result = NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result

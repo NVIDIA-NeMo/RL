@@ -174,6 +174,7 @@ def test_build_nemo_gym_config_splits_nemo_rl_keys(detected_uv_dirs):
         model_name="test-model",
         enable_router_replay=False,
         use_fastokens=False,
+        turn_recovery_enabled=False,
     )
 
     assert cfg["model_name"] == "test-model"
@@ -210,6 +211,7 @@ def test_build_nemo_gym_config_uv_dirs(detected_uv_dirs, configured, expected):
         model_name="test-model",
         enable_router_replay=False,
         use_fastokens=False,
+        turn_recovery_enabled=False,
     )
     global_config = cfg["initial_global_config_dict"]
     assert (global_config["uv_cache_dir"], global_config["uv_venv_dir"]) == expected
@@ -222,6 +224,7 @@ def test_build_nemo_gym_config_moves_port_range_to_actor_fields(detected_uv_dirs
         model_name="test-model",
         enable_router_replay=False,
         use_fastokens=False,
+        turn_recovery_enabled=False,
     )
 
     assert (cfg["port_range_low"], cfg["port_range_high"]) == (6000, 6999)
@@ -236,6 +239,7 @@ def test_build_nemo_gym_config_router_replay_off_uses_default_dtype(detected_uv_
         model_name="test-model",
         enable_router_replay=False,
         use_fastokens=False,
+        turn_recovery_enabled=False,
     )
     assert cfg["require_routed_experts"] is False
     assert cfg["routed_experts_dtype"] == "int16"
@@ -253,11 +257,33 @@ def test_build_nemo_gym_config_router_replay_resolves_dtype(detected_uv_dirs):
             model_name="test-model",
             enable_router_replay=True,
             use_fastokens=False,
+            turn_recovery_enabled=False,
         )
 
     mock_resolve.assert_called_once_with("test-model")
     assert cfg["require_routed_experts"] is True
     assert cfg["routed_experts_dtype"] == "int8"
+
+
+@pytest.mark.parametrize(
+    ("turn_recovery_enabled", "checkpoint_control_auth_token"),
+    [(True, None), (False, "checkpoint-secret")],
+)
+def test_build_nemo_gym_config_requires_recovery_flag_and_bearer_together(
+    detected_uv_dirs,
+    turn_recovery_enabled,
+    checkpoint_control_auth_token,
+):
+    with pytest.raises(ValueError, match="must be configured together"):
+        build_nemo_gym_config(
+            _env_configs(),
+            base_urls=[],
+            model_name="test-model",
+            enable_router_replay=False,
+            use_fastokens=False,
+            turn_recovery_enabled=turn_recovery_enabled,
+            checkpoint_control_auth_token=checkpoint_control_auth_token,
+        )
 
 
 @pytest.mark.parametrize("num_gpu_nodes", [0, 1], ids=["no-gpus", "colocated-gpus"])
@@ -288,6 +314,7 @@ def test_an_unsharded_job_gets_the_registry_runtime_env(
             tokenizer=_TOKENIZER,
             enable_router_replay=False,
             use_fastokens=True,
+            turn_recovery_enabled=False,
             token_capture=token_capture,
         )
 
@@ -308,6 +335,7 @@ def test_an_unsharded_job_gets_the_registry_runtime_env(
 
     cfg = mock_cls.options.return_value.remote.call_args.args[0]
     assert cfg["use_fastokens"] is True
+    assert cfg["turn_recovery_enabled"] is False
     # The ledger config must ride through to the actor; a refactor of this
     # wrapper once dropped it without any type or test catching it.
     assert cfg["token_capture"] == token_capture
@@ -432,7 +460,7 @@ def test_nemo_gym_shutdown_is_idempotent():
 def test_nemo_gym_shutdown_before_spinup_is_a_noop():
     cls = nemo_gym_mod.NemoGym.__ray_metadata__.modified_class
     actor = cls.__new__(cls)
-    actor.__init__({})
+    actor.__init__({"turn_recovery_enabled": False})
 
     actor.shutdown()  # must not raise
 
@@ -452,7 +480,7 @@ def _stub_gym_resolved_config(resolved):
 def _spun_up_actor():
     cls = nemo_gym_mod.NemoGym.__ray_metadata__.modified_class
     actor = cls.__new__(cls)
-    actor.__init__({})
+    actor.__init__({"turn_recovery_enabled": False})
     actor.rh = MagicMock()
     return actor
 
@@ -560,7 +588,7 @@ def test_list_entries_skips_an_entry_that_starts_no_server():
 def test_list_entries_before_spinup_raises():
     cls = nemo_gym_mod.NemoGym.__ray_metadata__.modified_class
     actor = cls.__new__(cls)
-    actor.__init__({})
+    actor.__init__({"turn_recovery_enabled": False})
 
     with pytest.raises(RuntimeError, match="call _spinup"):
         actor.list_entries()
@@ -753,6 +781,7 @@ def test_build_nemo_gym_actors_unsharded_makes_exactly_one_actor(detected_uv_dir
             tokenizer=_TOKENIZER,
             enable_router_replay=False,
             use_fastokens=False,
+            turn_recovery_enabled=False,
         )
 
     assert not shard_set.is_sharded
@@ -803,6 +832,7 @@ def test_build_nemo_gym_actors_spreads_every_replica_onto_its_own_node(
             tokenizer=_TOKENIZER,
             enable_router_replay=False,
             use_fastokens=False,
+            turn_recovery_enabled=False,
         )
 
     # Two shards, one with replicas: 2, so three actors on three nodes.
@@ -836,6 +866,7 @@ def test_shards_get_their_own_config_paths_and_log_directories(detected_uv_dirs)
             tokenizer=_TOKENIZER,
             enable_router_replay=False,
             use_fastokens=False,
+            turn_recovery_enabled=False,
         )
 
     gym_configs = [
@@ -875,6 +906,7 @@ def test_every_replica_gets_the_tokenizer_installed(detected_uv_dirs):
             tokenizer=_TOKENIZER,
             enable_router_replay=False,
             use_fastokens=False,
+            turn_recovery_enabled=False,
         )
 
     assert len(cluster.actors) == 3
@@ -899,6 +931,7 @@ def test_actor_cpus_override_sizes_that_shards_bundle(detected_uv_dirs):
             tokenizer=_TOKENIZER,
             enable_router_replay=False,
             use_fastokens=False,
+            turn_recovery_enabled=False,
         )
 
     (pg_kwargs,) = cluster.placement_group_calls
@@ -970,6 +1003,7 @@ def test_a_shard_that_fails_to_start_names_itself_and_tears_everything_down(
                 tokenizer=_TOKENIZER,
                 enable_router_replay=False,
                 use_fastokens=False,
+                turn_recovery_enabled=False,
             )
 
     # Gym names the offending entry; we add the shard it belongs to.
@@ -993,6 +1027,7 @@ def test_unsharded_startup_failure_tears_down_the_actor(detected_uv_dirs):
                 tokenizer=_TOKENIZER,
                 enable_router_replay=False,
                 use_fastokens=False,
+                turn_recovery_enabled=False,
             )
 
     cluster.shutdown_environments.assert_called_once()
@@ -1012,6 +1047,7 @@ def test_timed_out_shard_startup_is_drained_before_teardown(detected_uv_dirs):
                 tokenizer=_TOKENIZER,
                 enable_router_replay=False,
                 use_fastokens=False,
+                turn_recovery_enabled=False,
             )
 
     spinup_zero_calls = [
@@ -1040,6 +1076,7 @@ def test_wedged_shard_startup_cannot_block_forced_teardown(detected_uv_dirs):
                 tokenizer=_TOKENIZER,
                 enable_router_replay=False,
                 use_fastokens=False,
+                turn_recovery_enabled=False,
             )
 
     cluster.shutdown_environments.assert_called_once()
@@ -1068,6 +1105,7 @@ def test_tokenizer_timeout_reports_exhausted_shared_startup_budget(
                 tokenizer=_TOKENIZER,
                 enable_router_replay=False,
                 use_fastokens=False,
+                turn_recovery_enabled=False,
                 spinup_timeout=1.0,
             )
 
@@ -1086,6 +1124,7 @@ def test_unplaceable_bundles_fail_fast_and_release_the_group(detected_uv_dirs):
                 tokenizer=_TOKENIZER,
                 enable_router_replay=False,
                 use_fastokens=False,
+                turn_recovery_enabled=False,
             )
 
     assert cluster.actors == []
@@ -1109,6 +1148,7 @@ def test_duplicate_agent_across_shards_tears_the_set_down(detected_uv_dirs):
                 tokenizer=_TOKENIZER,
                 enable_router_replay=False,
                 use_fastokens=False,
+                turn_recovery_enabled=False,
             )
 
     cluster.shutdown_environments.assert_called_once()

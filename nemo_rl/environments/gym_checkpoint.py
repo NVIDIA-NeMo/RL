@@ -292,6 +292,21 @@ class GymMultiProcessCapability(_StrictWireModel):
     num_workers: PositiveInt
 
 
+class GymGroupScoringCapability(_StrictWireModel):
+    """Requirements for a Gym resources server that scores full cohorts."""
+
+    expected_group_size: Annotated[int, Field(strict=True, ge=2)]
+    verification_replayable: bool
+    collection_timeout_s: Annotated[float, Field(gt=0)] | None = None
+
+
+class GymVerificationCapability(_StrictWireModel):
+    """One agent's terminal-verification dependency."""
+
+    resources_server: str
+    replayable: bool
+
+
 class GymParticipantIdentity(_StrictWireModel):
     """NeMo-RL routing name and Gym-reported participant identity."""
 
@@ -371,6 +386,8 @@ class GymCheckpointParticipantContract(_StrictWireModel):
     multi_process: GymMultiProcessCapability
     instance_role: Literal["policy", "auxiliary"] | None = None
     features: list[str] = Field(default_factory=list)
+    group_scoring: GymGroupScoringCapability | None = None
+    verification: GymVerificationCapability | None = None
 
     @classmethod
     def from_discovered(
@@ -379,6 +396,8 @@ class GymCheckpointParticipantContract(_StrictWireModel):
     ) -> "GymCheckpointParticipantContract":
         """Project one dynamic capability response onto restore semantics."""
         capabilities = discovered.capabilities
+        group_scoring = getattr(capabilities, "group_scoring", None)
+        verification = getattr(capabilities, "verification", None)
         return cls(
             participant=discovered.participant,
             schema_version=capabilities.schema_version,
@@ -394,6 +413,20 @@ class GymCheckpointParticipantContract(_StrictWireModel):
             ),
             instance_role=capabilities.instance_role,
             features=sorted(capabilities.features),
+            group_scoring=(
+                GymGroupScoringCapability.model_validate(
+                    group_scoring.model_dump(mode="json")
+                )
+                if group_scoring is not None
+                else None
+            ),
+            verification=(
+                GymVerificationCapability.model_validate(
+                    verification.model_dump(mode="json")
+                )
+                if verification is not None
+                else None
+            ),
         )
 
 
@@ -433,7 +466,11 @@ class GymCheckpointTopology(_VersionedWireModel):
         compatibility_identity = {
             "schema_version": self.schema_version,
             "participants": [
-                participant.model_dump(mode="json", exclude={"features"})
+                participant.model_dump(
+                    mode="json",
+                    exclude={"features"},
+                    exclude_none=True,
+                )
                 for participant in self.participants
             ],
         }
@@ -600,6 +637,58 @@ class GymCheckpointTopology(_VersionedWireModel):
                 "or restart-only; "
                 f"unsupported={unsupported_auxiliary_export_restore!r}"
             )
+
+    def validate_group_scoring_capabilities(
+        self,
+        *,
+        expected_group_size: int,
+        rollout_timeout_s: float | None,
+        require_checkpoint_replayability: bool,
+    ) -> None:
+        """Reject Gym cohort contracts that cannot make progress or recover."""
+        contracts_by_server = {
+            contract.participant.server_name: contract for contract in self.participants
+        }
+        for agent in self.participants:
+            verification = agent.verification
+            if verification is None:
+                continue
+            resource = contracts_by_server.get(verification.resources_server)
+            if resource is None:
+                raise ValueError(
+                    f"Gym agent {agent.participant.server_name!r} verifies through "
+                    f"unknown resources server {verification.resources_server!r}"
+                )
+            group_scoring = resource.group_scoring
+            if group_scoring is None:
+                continue
+            if group_scoring.expected_group_size != expected_group_size:
+                raise ValueError(
+                    f"Gym group scorer {resource.participant.server_name!r} expects "
+                    f"{group_scoring.expected_group_size} rollouts per prompt, but "
+                    "NeMo-RL is configured with "
+                    f"num_generations_per_prompt={expected_group_size}"
+                )
+            if group_scoring.collection_timeout_s is None and rollout_timeout_s is None:
+                raise ValueError(
+                    f"Gym group scorer {resource.participant.server_name!r} has no "
+                    "cohort_collection_timeout_s and NeMo-RL has no "
+                    "async_rl.rollout_failure.nemo_gym.rollout_timeout_s; a missing "
+                    "cohort member could wait forever"
+                )
+            if not require_checkpoint_replayability:
+                continue
+            if not group_scoring.verification_replayable:
+                raise ValueError(
+                    f"Gym group scorer {resource.participant.server_name!r} cannot "
+                    "replay terminal verification after checkpoint restore"
+                )
+            if not verification.replayable:
+                raise ValueError(
+                    f"Gym agent {agent.participant.server_name!r} does not checkpoint "
+                    "its terminal verification wait; set "
+                    "checkpoint_replayable_verify=true"
+                )
 
 
 class GymAgentRetireResponse(_StrictWireModel):
@@ -814,12 +903,6 @@ class GymAgentPrepareResponse(_StrictWireModel):
     completed_unacknowledged_attempts: list[GymAgentExecutionStatus]
     selected_boundaries: list[GymAgentSelectedBoundary]
     executions: list[GymAgentExecutionStatus]
-
-
-class GymAgentStatusResponse(GymAgentPrepareResponse):
-    """Agent prepare state returned by the read-only status route."""
-
-    checkpoint_id: str = Field(min_length=1, pattern=_IDENTITY_PATTERN)
 
 
 class GymResourcesPrepareInventoryEntry(GymExecutionIdentity):

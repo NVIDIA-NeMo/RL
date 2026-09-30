@@ -26,6 +26,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from tests.functional._turn_recovery_token_evidence import verify_token_evidence
 
 _PROFILES = ("counter", "workplace", "genrm")
 _WORKPLACE_EVENT = {
@@ -184,6 +185,75 @@ def _read_agent_records(snapshot: Path, manifest_path: Path) -> list[dict[str, A
     return records
 
 
+def _read_model_lineage_records(
+    snapshot: Path,
+    manifest_path: Path,
+    capture_key: str,
+) -> list[dict[str, Any]]:
+    """Read one digest-bound model-lineage member from its checkpoint archive."""
+    manifest = _read_json(manifest_path)
+    indexed = _read_artifact(snapshot, manifest["lineage_index"])
+    matches = [row for row in indexed if row.get("capture_key") == capture_key]
+    if len(matches) != 1:
+        raise AssertionError(
+            f"model checkpoint has {len(matches)} lineage members for {capture_key!r}"
+        )
+    member = matches[0]
+    archives = manifest.get("archives")
+    if not isinstance(archives, list):
+        raise TypeError("model checkpoint archives must be a list")
+    archive_matches = [
+        row
+        for row in archives
+        if isinstance(row, dict) and row.get("name") == member.get("archive")
+    ]
+    if len(archive_matches) != 1:
+        raise AssertionError(
+            f"model lineage archive is missing or ambiguous for {capture_key!r}"
+        )
+    archive_reference = archive_matches[0]
+    archive_path = (manifest_path.parent / archive_reference["name"]).resolve()
+    archive_path.relative_to(snapshot.resolve())
+    if not archive_path.is_file():
+        raise FileNotFoundError(archive_path)
+    if archive_path.stat().st_size != archive_reference["bytes"]:
+        raise AssertionError(
+            f"model lineage archive byte count mismatch: {archive_path}"
+        )
+    if _digest(archive_path) != archive_reference["sha256"]:
+        raise AssertionError(f"model lineage archive digest mismatch: {archive_path}")
+
+    try:
+        with tarfile.open(archive_path, mode="r:") as archive:
+            info = archive.getmember(member["member"])
+            if not info.isfile() or info.size != member["bytes"]:
+                raise AssertionError(
+                    f"model lineage archive member is invalid: {member['member']}"
+                )
+            extracted = archive.extractfile(info)
+            if extracted is None:
+                raise AssertionError(
+                    f"model lineage archive member cannot be read: {member['member']}"
+                )
+            payload = extracted.read()
+    except (KeyError, tarfile.TarError) as error:
+        raise AssertionError(
+            f"model lineage archive cannot be read: {archive_path}"
+        ) from error
+    if hashlib.sha256(payload).hexdigest() != member["sha256"]:
+        raise AssertionError(
+            f"model lineage archive member is corrupted: {member['member']}"
+        )
+    records = [json.loads(line) for line in payload.splitlines() if line.strip()]
+    if len(records) != member["rows"] or not all(
+        isinstance(record, dict) for record in records
+    ):
+        raise AssertionError(
+            f"model lineage archive member has invalid rows: {member['member']}"
+        )
+    return records
+
+
 def _matching_recovery_attempt(
     recovery: dict[str, Any], rollout_id: str
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -200,12 +270,94 @@ def _matching_recovery_attempt(
     return matches[0]
 
 
+def _continued_rollout(
+    rollout_id: str,
+    attempt_index: int,
+    storage_reference_rows: list[dict[str, Any]],
+    lineage_records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Describe the snapshot-owned TQ rows and their pre-crash commitments."""
+    capture_key = rollout_id if attempt_index == 0 else f"{rollout_id}-a{attempt_index}"
+    staging_keys = [
+        row["key"]
+        for row in storage_reference_rows
+        if row.get("capture_key") == capture_key
+    ]
+    if not staging_keys:
+        raise AssertionError(
+            f"continued rollout {capture_key!r} has no snapshot storage references"
+        )
+    if len(set(staging_keys)) != len(staging_keys):
+        raise AssertionError(
+            f"continued rollout {capture_key!r} repeats a snapshot storage reference"
+        )
+
+    descriptors: dict[str, dict[str, Any]] = {}
+    for record in lineage_records:
+        candidates = []
+        if record.get("staging_key") is not None:
+            candidates.append(
+                {
+                    "staging_key": record["staging_key"],
+                    "staging_digest": record.get("staging_digest"),
+                    "prev_len": record.get("prev_len"),
+                    "cum_len": record.get("cum_len"),
+                }
+            )
+        for parent in record.get("parent_manifest") or []:
+            if not isinstance(parent, dict):
+                raise TypeError("model lineage parent manifest must contain objects")
+            candidates.append(
+                {
+                    "staging_key": parent.get("staging_key"),
+                    "staging_digest": parent.get("digest"),
+                    "prev_len": parent.get("prev_len"),
+                    "cum_len": parent.get("cum_len"),
+                }
+            )
+        for descriptor in candidates:
+            staging_key = descriptor["staging_key"]
+            if staging_key is None:
+                continue
+            if (
+                not isinstance(staging_key, str)
+                or not staging_key
+                or not isinstance(descriptor["staging_digest"], str)
+                or not descriptor["staging_digest"]
+                or isinstance(descriptor["prev_len"], bool)
+                or not isinstance(descriptor["prev_len"], int)
+                or isinstance(descriptor["cum_len"], bool)
+                or not isinstance(descriptor["cum_len"], int)
+            ):
+                raise AssertionError(
+                    f"model lineage has invalid staging metadata for {staging_key!r}"
+                )
+            previous = descriptors.setdefault(staging_key, descriptor)
+            if previous != descriptor:
+                raise AssertionError(
+                    f"model lineage has conflicting metadata for {staging_key!r}"
+                )
+
+    missing = [key for key in staging_keys if key not in descriptors]
+    if missing:
+        raise AssertionError(
+            "snapshot storage references have no pre-crash lineage commitment: "
+            f"capture_key={capture_key!r}, missing={missing!r}"
+        )
+    return {
+        "rollout_id": rollout_id,
+        "source_capture_key": capture_key,
+        "pre_cut_segments": [descriptors[key] for key in staging_keys],
+    }
+
+
 def _inspect_genrm_snapshot(
     snapshot: Path,
     dataset_rows: list[dict[str, Any]],
     gym_checkpoint: dict[str, Any],
     model: dict[str, Any],
     agent: dict[str, Any],
+    model_manifest_path: Path,
     agent_manifest_path: Path,
 ) -> dict[str, Any]:
     """Select a complete two-sibling GenRM cohort parked before verification."""
@@ -306,6 +458,23 @@ def _inspect_genrm_snapshot(
         "group_id": group["group_id"],
         "prompt_index": prompt_index,
         "completed_group_ids": sorted(item["group_id"] for item in replay["groups"]),
+        "continued_rollouts": [
+            _continued_rollout(
+                rollout_id,
+                record["attempt_index"],
+                storage_reference_rows,
+                _read_model_lineage_records(
+                    snapshot,
+                    model_manifest_path,
+                    (
+                        rollout_id
+                        if record["attempt_index"] == 0
+                        else f"{rollout_id}-a{record['attempt_index']}"
+                    ),
+                ),
+            )
+            for rollout_id, record in sorted(selected_records.items())
+        ],
         "rollouts": [
             {
                 "rollout_id": rollout_id,
@@ -348,7 +517,7 @@ def inspect_snapshot(
 
     model = _participant(gym_checkpoint, "responses_api_models")
     agent = _participant(gym_checkpoint, "responses_api_agents")
-    _validate_participant_manifest(snapshot, model)
+    model_manifest_path = _validate_participant_manifest(snapshot, model)
     agent_manifest_path = _validate_participant_manifest(snapshot, agent)
     if profile == "genrm":
         return _inspect_genrm_snapshot(
@@ -357,6 +526,7 @@ def inspect_snapshot(
             gym_checkpoint,
             model,
             agent,
+            model_manifest_path,
             agent_manifest_path,
         )
 
@@ -500,6 +670,22 @@ def inspect_snapshot(
         "group_id": group["group_id"],
         "prompt_index": prompt_index,
         "completed_group_ids": sorted(item["group_id"] for item in replay["groups"]),
+        "continued_rollouts": [
+            _continued_rollout(
+                boundary["rollout_id"],
+                boundary["attempt_index"],
+                storage_reference_rows,
+                _read_model_lineage_records(
+                    snapshot,
+                    model_manifest_path,
+                    (
+                        boundary["rollout_id"]
+                        if boundary["attempt_index"] == 0
+                        else f"{boundary['rollout_id']}-a{boundary['attempt_index']}"
+                    ),
+                ),
+            )
+        ],
     }
     state = resource_snapshot.get("state") or {}
     if profile == "counter":
@@ -565,8 +751,12 @@ def select_snapshot(args: argparse.Namespace) -> None:
         raise TypeError("counter dataset must contain JSON objects")
     deadline = time.monotonic() + args.timeout_s
     last_error = "no published bootstrap snapshot"
+    # A published snapshot never changes, so inspect and report each one once.
+    rejected: set[Path] = set()
     while time.monotonic() < deadline:
         for snapshot in _published_bootstrap_snapshots(args.checkpoint_dir):
+            if snapshot in rejected:
+                continue
             try:
                 selected = inspect_snapshot(
                     snapshot,
@@ -580,6 +770,7 @@ def select_snapshot(args: argparse.Namespace) -> None:
                 TypeError,
                 ValueError,
             ) as error:
+                rejected.add(snapshot)
                 last_error = f"{snapshot}: {type(error).__name__}: {error}"
                 print(f"snapshot candidate rejected: {last_error}", flush=True)
                 continue
@@ -610,6 +801,7 @@ def select_snapshot(args: argparse.Namespace) -> None:
 
 def verify_restore(args: argparse.Namespace) -> None:
     selected = _read_json(args.selection)
+    verify_token_evidence(selected, args.token_evidence_dir)
     events = [
         json.loads(line)
         for line in args.events.read_text().splitlines()
@@ -893,6 +1085,7 @@ def parse_args() -> argparse.Namespace:
     verify.add_argument("events", type=Path)
     verify.add_argument("--profile", choices=_PROFILES, default="counter")
     verify.add_argument("--audit-events", type=Path)
+    verify.add_argument("--token-evidence-dir", type=Path, required=True)
     return parser.parse_args()
 
 

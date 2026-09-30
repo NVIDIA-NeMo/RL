@@ -202,6 +202,10 @@ def _controller(
     controller._dp_client = client
     controller._partition_id = scenarios.PARTITION
     controller._rollout_manager = _manager(buffer, barrier, generation)
+    controller._gym_checkpoint_rollout_permitted = asyncio.Event()
+    controller._gym_checkpoint_rollout_permitted.set()
+    controller._gym_participant_checkpointing_enabled = False
+    controller._gym_restart_unfinished = False
     controller._teacher_coordinator = None
     controller._sampler = InOrderSampler(buffer, max_lookahead_versions=2)
     if dispatch_index is not None:

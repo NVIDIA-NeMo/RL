@@ -415,11 +415,18 @@ async def _gather_cancelling_siblings(coros: list[Any]) -> list[Any]:
 
 
 class RequestDeadlineRegistry:
-    """Live request deadlines, pausable while a colocated engine has switched to training."""
+    """Live request deadlines shared by independently pausable subsystems."""
+
+    _DEFAULT_HOLDER = "generation_stand_down"
 
     def __init__(self) -> None:
         self._live: set["_Deadline"] = set()
-        self.suspended = False
+        self._suspension_holders: set[str] = set()
+
+    @property
+    def suspended(self) -> bool:
+        """Whether at least one subsystem still owns the deadline pause."""
+        return bool(self._suspension_holders)
 
     def add(self, deadline: "_Deadline") -> None:
         self._live.add(deadline)
@@ -429,17 +436,24 @@ class RequestDeadlineRegistry:
     def discard(self, deadline: "_Deadline") -> None:
         self._live.discard(deadline)
 
-    def suspend(self) -> None:
-        if self.suspended:
+    def suspend(self, holder: str = _DEFAULT_HOLDER) -> None:
+        """Pause all deadline clocks for one idempotent owner."""
+        if holder in self._suspension_holders:
             return
-        self.suspended = True
+        already_suspended = self.suspended
+        self._suspension_holders.add(holder)
+        if already_suspended:
+            return
         for deadline in self._live:
             deadline.suspend()
 
-    def resume(self) -> None:
-        if not self.suspended:
+    def resume(self, holder: str = _DEFAULT_HOLDER) -> None:
+        """Release one owner and resume clocks after the final owner leaves."""
+        if holder not in self._suspension_holders:
             return
-        self.suspended = False
+        self._suspension_holders.remove(holder)
+        if self.suspended:
+            return
         for deadline in self._live:
             deadline.resume()
 
@@ -1747,13 +1761,19 @@ class RolloutManager:
             )
         self._gym_acknowledgement_notifier.bind(on_ready)
 
-    def suspend_request_deadlines(self) -> None:
-        """Pause live request-deadline clocks while a colocated engine is in training mode."""
-        self._request_deadlines.suspend()
+    def suspend_request_deadlines(
+        self,
+        holder: str = RequestDeadlineRegistry._DEFAULT_HOLDER,
+    ) -> None:
+        """Pause live request-deadline clocks for one idempotent owner."""
+        self._request_deadlines.suspend(holder)
 
-    def resume_request_deadlines(self) -> None:
-        """Resume live request-deadline clocks when a colocated engine exits training mode."""
-        self._request_deadlines.resume()
+    def resume_request_deadlines(
+        self,
+        holder: str = RequestDeadlineRegistry._DEFAULT_HOLDER,
+    ) -> None:
+        """Resume live clocks after one owner releases its pause."""
+        self._request_deadlines.resume(holder)
 
     @property
     def recovery_ledger(self) -> RolloutRecoveryLedger:

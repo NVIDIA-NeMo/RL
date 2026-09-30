@@ -57,7 +57,6 @@ from nemo_rl.environments.gym_checkpoint import (
     GymAgentPrepareResponse,
     GymAgentRestoreResponse,
     GymAgentResumeResponse,
-    GymAgentStatusResponse,
     GymCheckpointParticipantContract,
     GymCompletionReceipt,
     GymModelCommitResponse,
@@ -320,14 +319,6 @@ async def test_real_gym_routes_produce_rl_compatible_checkpoint_replies(
                 {"checkpoint_id": checkpoint_id, "deadline_ts": deadline},
             )
         )
-        GymAgentStatusResponse.model_validate(
-            await _get(
-                agent,
-                f"{AGENT_CHECKPOINT_URL_PREFIX}/status",
-                {"checkpoint_id": checkpoint_id},
-            )
-        )
-
         commit = {**prepare, "checkpoint_dir": str(checkpoint_dir)}
         agent_commit_payload = await _post(
             agent,

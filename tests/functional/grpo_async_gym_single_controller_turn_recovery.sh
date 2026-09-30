@@ -1,8 +1,8 @@
 #!/bin/bash
 # Full-process recovery test for one Gym turn boundary plus the matching TQ cut.
 #
-# This test intentionally uses an opt-in Gym source checkout until the Gym
-# checkpoint stack lands in NeMo-RL's submodule. Example:
+# Uses the pinned Gym submodule by default. To test against a different Gym
+# checkout, set NEMO_GYM_SOURCE_DIR. Example:
 #   NEMO_GYM_SOURCE_DIR=~/projects/Gym-turn-level-recovery \
 #     uv run --no-sync bash tests/functional/grpo_async_gym_single_controller_turn_recovery.sh
 
@@ -32,6 +32,7 @@ PHASE2_EVENTS=$TEST_DIR/phase2-events.jsonl
 SELECTION_FILE=$TEST_DIR/selected_snapshot.json
 TEST_DATA=$TEST_DIR/test_data.jsonl
 AUDIT_EVENTS=$TEST_DIR/resource-audit.jsonl
+TOKEN_EVIDENCE_DIR=$TEST_DIR/token-evidence
 PHASE1_PID=""
 
 GYM_ROOT=${NEMO_GYM_SOURCE_DIR:-$PROJECT_ROOT/3rdparty/Gym-workspace/Gym}
@@ -51,8 +52,9 @@ NUM_GENERATIONS=${SC_GYM_TURN_RECOVERY_NUM_GENERATIONS:-2}
 TRAIN_GLOBAL_BATCH_SIZE=$((NUM_PROMPTS * NUM_GENERATIONS))
 
 if [[ ! -f "$GYM_ROOT/nemo_gym/_checkpoint/agent.py" ]]; then
-    echo "[ERROR] $GYM_ROOT does not contain the Gym turn-checkpoint stack."
-    echo "Set NEMO_GYM_SOURCE_DIR to a checkout containing Gym PRs #2939-#2946."
+    echo "[ERROR] $GYM_ROOT is missing the Gym checkpoint stack."
+    echo "Run 'git submodule update --init' to initialize the pinned Gym checkout."
+    echo "To use another checkout, set NEMO_GYM_SOURCE_DIR."
     exit 2
 fi
 
@@ -160,8 +162,7 @@ COMMON_OVERRIDES=(
     ++rollout_checkpointing.snapshot_attempt_interval_s="$SNAPSHOT_INTERVAL_S"
     ++rollout_checkpointing.keep_latest_k=8
     ++rollout_checkpointing.restore_mode=latest
-    ++rollout_checkpointing.gym.capability_discovery_enabled=true
-    ++rollout_checkpointing.gym.participant_checkpointing_enabled=true
+    ++rollout_checkpointing.gym.mode=turn_recovery
     ++env.nemo_gym.nemo_gym_log_dir="$TEST_DIR/gym_logs"
     ++rollout_checkpointing.gym.prepare_timeout_s=180
     async_rl.sampler.name=in_order
@@ -189,6 +190,8 @@ command -v setsid >/dev/null
 setsid env \
     SC_TEST_ENTRYPOINT="$RECOVERY_HOOK" \
     SC_SIBLING_RECOVERY_TEST_EVENTS="$PHASE1_EVENTS" \
+    SC_GYM_TURN_RECOVERY_SELECTION="$SELECTION_FILE" \
+    SC_GYM_TURN_RECOVERY_TOKEN_EVIDENCE_DIR="$TOKEN_EVIDENCE_DIR" \
     "$PHASE1_BOUNDARY_HOOK" \
     NEMO_GYM_CHECKPOINT_TEST_PHASE=phase1 \
     NEMO_GYM_CHECKPOINT_TEST_EVENTS="$AUDIT_EVENTS" \
@@ -234,6 +237,8 @@ timeout --signal=TERM --kill-after=30s "${PHASE2_TIMEOUT_S}s" \
     env \
         SC_TEST_ENTRYPOINT="$RECOVERY_HOOK" \
         SC_SIBLING_RECOVERY_TEST_EVENTS="$PHASE2_EVENTS" \
+        SC_GYM_TURN_RECOVERY_SELECTION="$SELECTION_FILE" \
+        SC_GYM_TURN_RECOVERY_TOKEN_EVIDENCE_DIR="$TOKEN_EVIDENCE_DIR" \
         RUN_CONVERGENCE_CHECKS=0 \
         NEMO_GYM_SOURCE_DIR="$GYM_ROOT" \
         NEMO_GYM_CHECKPOINT_CONTROL_TOKEN="$NEMO_GYM_CHECKPOINT_CONTROL_TOKEN" \
@@ -252,7 +257,8 @@ grep -q "train step $MAX_STEPS/$MAX_STEPS" "$PHASE2_LOG"
 uv run --directory "$PROJECT_ROOT" --no-sync python "$SNAPSHOT_HELPER" \
     verify-restore "$SELECTION_FILE" "$PHASE2_EVENTS" \
     --profile "$PROFILE" \
-    --audit-events "$AUDIT_EVENTS"
+    --audit-events "$AUDIT_EVENTS" \
+    --token-evidence-dir "$TOKEN_EVIDENCE_DIR"
 
 uv run --directory "$PROJECT_ROOT" --no-sync python - \
     "$CHECKPOINT_DIR/step_$MAX_STEPS/training_info.json" \

@@ -357,10 +357,10 @@ class RolloutSnapshotManifest:
 class GymRestartFallbackManifest:
     """Marks a trainer checkpoint that can restart unfinished Gym work.
 
-    The marker is written only when the trainer/data-plane checkpoint is
-    complete but its coordinated Gym participant snapshot could not be
-    published. It prevents an older trainer checkpoint with no Gym state from
-    being mistaken for a deliberately recoverable fallback.
+    The marker is written with every trainer/data-plane checkpoint before its
+    coordinated Gym participant snapshot is attempted, and removed once that
+    snapshot is durable. It prevents an older trainer checkpoint with no Gym
+    state from being mistaken for a deliberately recoverable fallback.
     """
 
     schema_version: int

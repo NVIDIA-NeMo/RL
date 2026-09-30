@@ -35,6 +35,58 @@ from nemo_rl.environments.gym_checkpoint import (
 )
 
 
+def _group_scoring_topology(
+    *,
+    group_size: int = 2,
+    collection_timeout_s: float | None = 30.0,
+    resource_replayable: bool = True,
+    agent_replayable: bool = True,
+) -> GymCheckpointTopology:
+    return GymCheckpointTopology.model_validate(
+        {
+            "participants": [
+                {
+                    "participant": {
+                        "server_name": "agent",
+                        "component": "responses_api_agents",
+                        "participant_name": "agent",
+                    },
+                    "admission_states": ["accepting"],
+                    "checkpoint_mode": "export_restore",
+                    "concurrency_contract": "serialized_per_session",
+                    "multi_process": {
+                        "mode": "single_worker",
+                        "num_workers": 1,
+                    },
+                    "verification": {
+                        "resources_server": "genrm",
+                        "replayable": agent_replayable,
+                    },
+                },
+                {
+                    "participant": {
+                        "server_name": "genrm",
+                        "component": "resources_servers",
+                        "participant_name": "genrm",
+                    },
+                    "admission_states": ["accepting"],
+                    "checkpoint_mode": "stateless",
+                    "concurrency_contract": "stateless",
+                    "multi_process": {
+                        "mode": "single_worker",
+                        "num_workers": 1,
+                    },
+                    "group_scoring": {
+                        "expected_group_size": group_size,
+                        "verification_replayable": resource_replayable,
+                        "collection_timeout_s": collection_timeout_s,
+                    },
+                },
+            ]
+        }
+    )
+
+
 def _capabilities(**overrides):
     payload = {
         "component": "responses_api_models",
@@ -161,6 +213,67 @@ def test_topology_fingerprint_canonicalizes_capability_ordering() -> None:
     second_topology = GymCheckpointTopology.from_discovered([second])
 
     assert first_topology.fingerprint() == second_topology.fingerprint()
+
+
+def test_group_scoring_contract_accepts_matching_bounded_replayable_setup() -> None:
+    _group_scoring_topology().validate_group_scoring_capabilities(
+        expected_group_size=2,
+        rollout_timeout_s=None,
+        require_checkpoint_replayability=True,
+    )
+
+
+def test_group_scoring_contract_rejects_mismatched_group_size() -> None:
+    with pytest.raises(ValueError, match="num_generations_per_prompt=4"):
+        _group_scoring_topology().validate_group_scoring_capabilities(
+            expected_group_size=4,
+            rollout_timeout_s=60.0,
+            require_checkpoint_replayability=True,
+        )
+
+
+def test_group_scoring_contract_accepts_rl_timeout_as_fallback() -> None:
+    _group_scoring_topology(
+        collection_timeout_s=None
+    ).validate_group_scoring_capabilities(
+        expected_group_size=2,
+        rollout_timeout_s=60.0,
+        require_checkpoint_replayability=True,
+    )
+
+
+def test_group_scoring_contract_rejects_unbounded_wait() -> None:
+    with pytest.raises(ValueError, match="could wait forever"):
+        _group_scoring_topology(
+            collection_timeout_s=None
+        ).validate_group_scoring_capabilities(
+            expected_group_size=2,
+            rollout_timeout_s=None,
+            require_checkpoint_replayability=False,
+        )
+
+
+@pytest.mark.parametrize(
+    ("resource_replayable", "agent_replayable", "message"),
+    [
+        (False, True, "cannot replay terminal verification"),
+        (True, False, "checkpoint_replayable_verify=true"),
+    ],
+)
+def test_group_scoring_contract_rejects_non_replayable_verification(
+    resource_replayable: bool,
+    agent_replayable: bool,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        _group_scoring_topology(
+            resource_replayable=resource_replayable,
+            agent_replayable=agent_replayable,
+        ).validate_group_scoring_capabilities(
+            expected_group_size=2,
+            rollout_timeout_s=None,
+            require_checkpoint_replayability=True,
+        )
 
 
 def test_model_prepare_accepts_additive_coordinator_evidence() -> None:
