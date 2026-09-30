@@ -110,13 +110,8 @@ class _VllmModelRunner(Protocol):
     vllm_config: object
 
 
-class Vllm0251RefitAdapter:
-    """Pinned-vLLM lifecycle adapter using layerwise checkpoint reload.
-
-    This adapter supports the vLLM 0.25.1 contract pinned by NeMo-RL. Later
-    APIs are reported by :func:`probe_vllm_refit_capabilities` only; they are
-    not selected as a runtime implementation here.
-    """
+class VllmLayerwiseRefitAdapter:
+    """Capability-selected adapter using vLLM layerwise checkpoint reload."""
 
     _model_runner: _VllmModelRunner
     _model_config: object
@@ -539,7 +534,7 @@ class Vllm0251RefitAdapter:
         )
         if not _accepts_arguments(make_online_process_loader, (owner, parameter_name)):
             raise VllmRefitCompatibilityError(
-                "vLLM 0.25.1 local-shard refit requires "
+                "vLLM layerwise local-shard refit requires "
                 "make_online_process_loader(layer, param_name)"
             )
         assert callable(make_online_process_loader)
@@ -678,13 +673,13 @@ def create_vllm_refit_adapter(
     model_config: object,
     device: torch.device,
 ) -> VllmRefitAdapter:
-    """Create the pinned adapter using APIs rather than a vLLM version string."""
+    """Create an adapter selected by APIs rather than a vLLM version string."""
     capabilities = probe_vllm_refit_capabilities()
     if not capabilities.layerwise_reload:
         raise VllmRefitCompatibilityError(
             "vLLM does not expose the required layerwise reload APIs for native refit"
         )
-    return Vllm0251RefitAdapter(
+    return VllmLayerwiseRefitAdapter(
         model_runner=model_runner,
         model_config=model_config,
         device=device,

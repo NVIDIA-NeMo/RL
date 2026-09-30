@@ -81,7 +81,7 @@ def _detach_pending_layerwise_weights(
 ) -> None:
     """Clone deferred reload weights that still alias a transport buffer.
 
-    vLLM 0.25.1 replays deferred weight-loader arguments during layerwise
+    vLLM replays deferred weight-loader arguments during layerwise
     finalization, after NeMo-RL may have reused the source transport buffer.
     """
     if not source_storage_ptrs:
@@ -104,7 +104,7 @@ def _refresh_hpc_modules_after_layerwise_reload(model: torch.nn.Module) -> None:
     """Rebuild kernel-specific state omitted by vLLM's layerwise finalizer.
 
     ``HpcModule`` implementations derive runtime state from loaded weights via
-    ``process_weights_after_loading``. vLLM 0.25.1 runs that model-wide pass on
+    ``process_weights_after_loading``. vLLM runs that model-wide pass on
     normal loads, but not after a layerwise reload.
     """
     from vllm.model_executor.layers.hpc import HpcModule
