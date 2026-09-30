@@ -4,6 +4,14 @@
 # a dedicated model, resharded into on every post-step wake. The SC pump
 # sleeps the engine for each train step (whole-step phases); Gym spinup
 # overlaps the trainer + engine init via the held-socket reservation.
+#
+# Router replay is on, so the run also covers MInf routing-index capture
+# through the canonical stager, the finalizer's route assembly, and the
+# trainer replaying those routes. That needs MoE routers, which no small
+# pretrained checkpoint provides, so the served model is a tiny random-init
+# Qwen3 MoE built below with Qwen3-0.6B's tokenizer and chat template. Random
+# weights earn no reward; the gates are engine/trainer parity plus route
+# coverage, which hold regardless of what the model has learned.
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 PROJECT_ROOT=$(realpath $SCRIPT_DIR/../..)
@@ -57,10 +65,51 @@ VALIDATION_PATH=$DATA_DIR/workplace_assistant_validation.jsonl
 jq -c '.responses_create_params.tools |= (.[0:1])' 3rdparty/Gym-workspace/Gym/data/workplace_assistant/train.jsonl > $TRAIN_PATH
 jq -c '.responses_create_params.tools |= (.[0:1])' 3rdparty/Gym-workspace/Gym/data/workplace_assistant/validation.jsonl > $VALIDATION_PATH
 
+# Tiny random-init Qwen3 MoE (2 layers, 4 experts, top-2) sharing Qwen3-0.6B's
+# tokenizer. Sized so TP2 training and TP1 inference both divide evenly and
+# TE grouped GEMM alignment holds.
+MODEL_DIR=$DATA_DIR/tiny_qwen3_moe
+uv run python - "$MODEL_DIR" <<'PY'
+import sys
+
+import torch
+from transformers import AutoConfig, AutoTokenizer, Qwen3MoeConfig, Qwen3MoeForCausalLM
+
+model_dir = sys.argv[1]
+base = "Qwen/Qwen3-0.6B"
+base_config = AutoConfig.from_pretrained(base)
+tokenizer = AutoTokenizer.from_pretrained(base)
+config = Qwen3MoeConfig(
+    vocab_size=base_config.vocab_size,
+    hidden_size=128,
+    intermediate_size=256,
+    moe_intermediate_size=128,
+    num_hidden_layers=2,
+    num_attention_heads=4,
+    num_key_value_heads=2,
+    head_dim=32,
+    num_experts=4,
+    num_experts_per_tok=2,
+    decoder_sparse_step=1,
+    mlp_only_layers=[],
+    norm_topk_prob=True,
+    max_position_embeddings=base_config.max_position_embeddings,
+    tie_word_embeddings=False,
+    bos_token_id=base_config.bos_token_id,
+    eos_token_id=base_config.eos_token_id,
+)
+torch.manual_seed(0)
+model = Qwen3MoeForCausalLM(config).to(torch.bfloat16)
+model.save_pretrained(model_dir)
+tokenizer.save_pretrained(model_dir)
+print(f"tiny Qwen3 MoE written to {model_dir}")
+PY
+
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
     $PROJECT_ROOT/examples/run_grpo_single_controller.py \
     --config $PROJECT_ROOT/examples/nemo_gym/grpo_qwen3_30ba3b_instruct.yaml \
-    policy.model_name=Qwen/Qwen3-0.6B \
+    policy.model_name=$MODEL_DIR \
+    ++policy.router_replay.enabled=true \
     policy.dtensor_cfg.enabled=false \
     policy.megatron_cfg.enabled=true \
     policy.megatron_cfg.tensor_model_parallel_size=2 \
@@ -74,6 +123,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     ++policy.generation.mcore_generation_config.transformer_impl=inference_optimized \
     ++policy.generation.mcore_generation_config.tensor_model_parallel_size=1 \
     policy.generation.mcore_generation_config.refit_backend=nccl \
+    ++policy.generation.mcore_generation_config.async_sched_mode=legacy \
     policy.generation.max_new_tokens=128 \
     policy.max_total_sequence_length=512 \
     policy.generation.colocated.enabled=true \
@@ -100,6 +150,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     ++checkpointing.save_data_plane=true \
     data.train.data_path=$TRAIN_PATH \
     data.validation.data_path=$VALIDATION_PATH \
+    ++token_capture.enabled=true \
     ++data_plane.enabled=true \
     ++data_plane.impl=transfer_queue \
     ++data_plane.backend=simple \
@@ -121,7 +172,11 @@ fi
 
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
+# Parity gates hold for random weights. Route coverage of exactly 1 means every
+# finalized row carried MInf-recorded routes: the capture, staging, and route
+# assembly path ran end to end rather than falling back to the trainer's router.
 uv run tests/check_metrics.py $JSON_METRICS \
     'max(data["train/token_mult_prob_error"]) < 1.05' \
     'median(data["train/gen_kl_error"]) < 1.3' \
-    'max(data["train/reward"]) > 0'
+    'min(data["train/finalize/routed_experts_row_coverage"]) == 1' \
+    'max(data["train/finalize/capture_poisoned_rollouts"]) == 0'
