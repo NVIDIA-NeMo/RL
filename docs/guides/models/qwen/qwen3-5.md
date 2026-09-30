@@ -247,8 +247,8 @@ FP8 noise.
 
 ### Limitations
 
-- Dense and grouped-MoE Qwen3.5 MXFP8 rollout have not yet completed recurring
-  end-to-end validation.
+- MXFP8 is not yet supported; tracked in
+  [#3694](https://github.com/NVIDIA-NeMo/RL/issues/3694).
 
 ## `flash-linear-attention` Performance
 
