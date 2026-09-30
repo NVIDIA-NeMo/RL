@@ -1416,7 +1416,7 @@ def test_layerwise_native_cuda_dense_and_routed_refit_preserves_runtime_pointers
     if torch.cuda.get_device_capability() < (10, 0):
         pytest.skip("native MXFP8 refit integration requires SM100+")
 
-    from unittest.mock import patch
+    from unittest.mock import MagicMock, patch
 
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.model_executor.layers.fused_moe import FusedMoEFactory
@@ -1581,7 +1581,13 @@ def test_layerwise_native_cuda_dense_and_routed_refit_preserves_runtime_pointers
             parameter_value.fill_(1)
         first_load(model, vllm_config)
 
-        runner = SimpleNamespace(model=model, vllm_config=vllm_config)
+        runner = SimpleNamespace(
+            model=model,
+            vllm_config=vllm_config,
+            reset_lora_state=MagicMock(),
+            reset_encoder_cache=MagicMock(),
+            reset_mm_cache=MagicMock(),
+        )
         adapter = refit_adapter.VllmLayerwiseRefitAdapter(
             model_runner=runner,
             model_config=vllm_config.model_config,
@@ -1678,3 +1684,6 @@ def test_layerwise_native_cuda_dense_and_routed_refit_preserves_runtime_pointers
             for before, after in zip(snapshots, snapshots[1:])
             for name in tracked_names
         )
+        assert runner.reset_lora_state.call_count == 3
+        assert runner.reset_encoder_cache.call_count == 3
+        assert runner.reset_mm_cache.call_count == 3
