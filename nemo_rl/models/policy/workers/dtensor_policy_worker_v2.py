@@ -28,7 +28,10 @@ from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_n
 from torch import nn
 from torch.distributed.tensor import DTensor
 
-from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    need_top_k_or_top_p_filtering,
+)
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.metric_utils import LEARNING_RATE_KEY
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
@@ -86,6 +89,7 @@ from nemo_rl.telemetry.setup import (
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+from nemo_rl.utils.tensor_ops import pad_and_concat
 from nemo_rl.utils.timer import Timer
 
 
@@ -664,24 +668,14 @@ class DTensorPolicyWorkerV2Impl(
         # Concatenate all batches
         return_data = BatchedDataDict[LogprobOutputSpec]()
 
-        def _pad_and_concat(
-            tensors_list: list[torch.Tensor], pad_value: float
-        ) -> torch.Tensor:
-            padded = []
-            for t in tensors_list:
-                padding_needed = seq_dim_size - t.shape[1]
-                if padding_needed > 0:
-                    t = torch.nn.functional.pad(
-                        t, (0, padding_needed), mode="constant", value=pad_value
-                    )
-                padded.append(t)
-            return torch.cat(padded, dim=0)
-
-        return_data["logprobs"] = _pad_and_concat(all_log_probs, pad_value=0.0).cpu()
-        if all_token_masks:
+        return_data["logprobs"] = pad_and_concat(
+            all_log_probs, target_len=seq_dim_size
+        ).cpu()
+        # Taken from config so every DP rank emits the same keys.
+        if need_top_k_or_top_p_filtering(self.sampling_params):
             # Pad token_mask with 0 so padded positions are excluded from the loss.
-            return_data["token_mask"] = _pad_and_concat(
-                all_token_masks, pad_value=0.0
+            return_data["token_mask"] = pad_and_concat(
+                all_token_masks, target_len=seq_dim_size
             ).cpu()
 
         self.timer.stop("get_logprobs")
@@ -833,31 +827,11 @@ class DTensorPolicyWorkerV2Impl(
 
         ret = BatchedDataDict[Any]()
         # Pad each micro-batch result on sequence dim to common length (S), similar to get_logprobs
-        all_topk_vals_padded = []
-        all_topk_idx_padded = []
-        target_seq_len = seq_dim_size
-        for vals, idx in zip(out_topk_vals, out_topk_idx):
-            pad_needed = target_seq_len - vals.shape[1]
-            if pad_needed > 0:
-                # pad along sequence dimension (second dim): (last_dim_pad_left, last_dim_pad_right, seq_pad_left, seq_pad_right, batch_pad_left, batch_pad_right)
-                vals = torch.nn.functional.pad(
-                    vals, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0.0
-                )
-                idx = torch.nn.functional.pad(
-                    idx, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0
-                )
-            all_topk_vals_padded.append(vals)
-            all_topk_idx_padded.append(idx)
-
-        ret["topk_logits"] = (
-            torch.cat(all_topk_vals_padded, dim=0)
-            if len(all_topk_vals_padded) > 1
-            else all_topk_vals_padded[0]
+        ret["topk_logits"] = pad_and_concat(
+            out_topk_vals, target_len=seq_dim_size
         ).cpu()
-        ret["topk_indices"] = (
-            torch.cat(all_topk_idx_padded, dim=0)
-            if len(all_topk_idx_padded) > 1
-            else all_topk_idx_padded[0]
+        ret["topk_indices"] = pad_and_concat(
+            out_topk_idx, target_len=seq_dim_size
         ).cpu()
         return ret
 

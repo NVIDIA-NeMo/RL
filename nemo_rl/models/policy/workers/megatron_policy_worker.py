@@ -154,6 +154,7 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 from nemo_rl.utils.r3_trace import maybe_r3_trace_stage
+from nemo_rl.utils.tensor_ops import pad_and_concat
 from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.nccl_reshard_utils import (
     _INDIVIDUAL_EXPERT_RE,
@@ -2372,29 +2373,16 @@ class MegatronPolicyWorkerImpl(
         # Taken from config; every PP rank must build the same mask for the broadcast below.
         has_token_mask = need_top_k_or_top_p_filtering(self.sampling_params)
 
-        def _pad_and_concat(
-            tensors_list: list[torch.Tensor], pad_value: float
-        ) -> torch.Tensor:
-            padded: list[torch.Tensor] = []
-            for t in tensors_list:
-                padding_needed = seq_length - t.shape[1]
-                if padding_needed > 0:
-                    t = torch.nn.functional.pad(
-                        t, (0, padding_needed), mode="constant", value=pad_value
-                    )
-                padded.append(t)
-            return torch.cat(padded, dim=0)
-
         if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
             tensors: dict[str, Optional[torch.Tensor]] = {
-                "logprobs": _pad_and_concat(
-                    [l["logprobs"] for l in list_of_logprobs], pad_value=0.0
+                "logprobs": pad_and_concat(
+                    [l["logprobs"] for l in list_of_logprobs], target_len=seq_length
                 )
             }
             if has_token_mask:
                 # Pad token_mask with 0 so padded positions are excluded from the loss.
-                tensors["token_mask"] = _pad_and_concat(
-                    [l["token_mask"] for l in list_of_logprobs], pad_value=0.0
+                tensors["token_mask"] = pad_and_concat(
+                    [l["token_mask"] for l in list_of_logprobs], target_len=seq_length
                 )
         else:
             tensors = {"logprobs": None}
@@ -2699,29 +2687,18 @@ class MegatronPolicyWorkerImpl(
 
         teacher_full_payload = None
         if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
-            padded_logprobs = []
-            padded_payloads = []
-            for microbatch_output in list_of_outputs:
-                logprobs_mb = microbatch_output["logprobs"]
-                payload_mb = microbatch_output["teacher_full_payload"]
-                padding_needed = seq_length - logprobs_mb.shape[1]
-                if padding_needed > 0:
-                    logprobs_mb = torch.nn.functional.pad(
-                        logprobs_mb, (0, padding_needed), mode="constant", value=0.0
-                    )
-                    payload_mb = torch.nn.functional.pad(
-                        payload_mb,
-                        (0, 0, 0, padding_needed),
-                        mode="constant",
-                        value=0.0,
-                    )
-                padded_logprobs.append(logprobs_mb)
-                padded_payloads.append(payload_mb)
-            tensors = {"logprobs": torch.cat(padded_logprobs, dim=0)}
+            tensors = {
+                "logprobs": pad_and_concat(
+                    [o["logprobs"] for o in list_of_outputs], target_len=seq_length
+                )
+            }
             # Already on CPU: the post-processor moves each microbatch off the
             # device as it is produced, so this pad-and-concatenate never puts
             # the payload back on the GPU.
-            teacher_full_payload = torch.cat(padded_payloads, dim=0)
+            teacher_full_payload = pad_and_concat(
+                [o["teacher_full_payload"] for o in list_of_outputs],
+                target_len=seq_length,
+            )
         else:
             tensors = {"logprobs": None}
         logprobs = broadcast_tensors_from_last_stage(tensors)["logprobs"]
@@ -2917,20 +2894,12 @@ class MegatronPolicyWorkerImpl(
         )
 
         if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
-            logits_chunks = []
-            indices_chunks = []
-            for out in list_of_outputs:
-                tk = out["topk_logits"]
-                ti = out["topk_indices"]
-                pad_len = seq_length - tk.shape[1]
-                if pad_len > 0:
-                    tk = torch.nn.functional.pad(tk, (0, 0, 0, pad_len), value=0.0)
-                    ti = torch.nn.functional.pad(ti, (0, 0, 0, pad_len), value=0)
-                logits_chunks.append(tk)
-                indices_chunks.append(ti)
-
-            topk_logits = torch.cat(logits_chunks, dim=0)
-            topk_indices = torch.cat(indices_chunks, dim=0)
+            topk_logits = pad_and_concat(
+                [o["topk_logits"] for o in list_of_outputs], target_len=seq_length
+            )
+            topk_indices = pad_and_concat(
+                [o["topk_indices"] for o in list_of_outputs], target_len=seq_length
+            )
 
             tensors_to_broadcast = {
                 "topk_logits": topk_logits,

@@ -28,9 +28,11 @@ class LogprobOutputSpec(TypedDict):
 
     token_mask: Optional. Present only when top-k/top-p filtering is enabled. The input
     data["token_mask"] AND-ed with the finite-position mask returned by
-    mask_out_neg_inf_logprobs. Callers (e.g. GRPO) MUST write this back into
-    train_data["token_mask"] so the loss skips positions where the training-policy
-    logits gave -inf for the vLLM-sampled token (top-k/top-p mismatch).
+    mask_out_neg_inf_logprobs. Callers MUST write this back where the loss reads
+    token_mask from: train_data["token_mask"] (GRPO/PPO drivers) or the TQ token_mask
+    column (TQWorkerMixin.get_logprobs_presharded), so the loss skips positions where
+    the training-policy logits gave -inf for the vLLM-sampled token (top-k/top-p
+    mismatch).
     """
 
     logprobs: torch.Tensor
