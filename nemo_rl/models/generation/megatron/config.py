@@ -61,6 +61,9 @@ class MCoreGenerationSpecificArgs(TypedDict):
     ]
     # Token ceiling for captured prefill/mixed CUDA graphs. MCore default: 512.
     cuda_graph_max_tokens: NotRequired[int]
+    # Layer spec used by Megatron generation.
+    # Options are "transformer_engine" and "inference_optimized".
+    transformer_impl: NotRequired[Literal["transformer_engine", "inference_optimized"]]
     # Inference CUDA-graph scope. Options:
     # - 'none': inference runs in eager mode (no CUDA graphs).
     # - 'layer': graphs are owned at the per-layer boundary (TransformerLayer / MambaLayer).
@@ -96,6 +99,11 @@ class MCoreGenerationSpecificArgs(TypedDict):
     # refit when extra GPU headroom is needed for transfer staging. The
     # recommended default is False.
     offload_policy_before_refit: bool
+
+    # Generation log-probs: "processed_logprobs" (sampling-filtered, default)
+    # or "raw_logprobs" (F.log_softmax of model logits). Zero-KL forces raw.
+    logprobs_mode: NotRequired[Literal["processed_logprobs", "raw_logprobs"]]
+
     num_speculative_tokens: int
 
     mamba_inference_ssm_states_dtype: NotRequired[str]
@@ -173,6 +181,30 @@ def merged_inference_megatron_cfg(policy_config: PolicyConfig) -> dict[str, Any]
         **overrides,
         "activation_checkpointing": False,
         "context_parallel_size": 1,
+        # Train-only, like activation_checkpointing above: it routes the
+        # *training* MoE forward through the megakernel and takes the backward
+        # from a recompute pass. Generation has no backward and reaches the same
+        # kernel through inference_grouped_gemm_backend on its own. Inherited
+        # from training it would also make MCore reject the generation model
+        # outright, since local CUDA graphs disable the MoE-layer recompute this
+        # flag needs.
+        "moe_mega_training_forward": False,
+        # The backend-agnostic spelling of the flag above, and cleared for
+        # exactly the same reasons. Both are needed: MCore resolves the mega one
+        # into this one in __post_init__, so clearing only the alias leaves this
+        # set and the generation model still fails validation -- which is how
+        # the squared-ReLU vLLM arm broke while the mega arms were fine.
+        "moe_inference_training_forward": False,
+        # Cleared with it, not independently: MCore rejects the opt-in when the
+        # flag it relaxes is off, so inheriting it from a quantized training
+        # config would fail the generation model at config validation while the
+        # training side was perfectly valid.
+        "moe_mega_training_straight_through": False,
+        # The dedicated generation workers receive this merge as their
+        # megatron_cfg, so the zero-KL resolver and validator cannot otherwise
+        # tell a generation config from a training one, and would apply and
+        # check train-side knobs against generation values.
+        "is_inference_model": True,
     }
     # inference_optimized layers hard-require SP with TP>1. Raise with the
     # config key: the colocated build bypasses validate_and_set_config, so this

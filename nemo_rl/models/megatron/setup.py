@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import enum
 import hashlib
 import json
 import os
@@ -328,6 +329,11 @@ from nemo_rl.models.megatron.router_replay import (
     router_replay_enabled,
     validate_router_replay_config,
 )
+from nemo_rl.models.megatron.zero_train_gen_mismatch import (
+    configure_zero_train_gen_mismatch,
+    enable_batch_invariant_kernels,
+    validate_batch_invariant_mode,
+)
 from nemo_rl.models.policy import (
     Fp4Config,
     MegatronConfig,
@@ -433,6 +439,136 @@ def _resolve_optimizer_dtype_kwargs(optimizer_cfg: dict[str, Any]) -> dict[str, 
     return resolved
 
 
+def enable_batch_invariant_mode(config: PolicyConfig) -> None:
+    """Enable Megatron-Core batch-invariant kernels before CUDA initialization.
+
+    The mode is deliberately limited to the topology for which Megatron
+    generation and policy scoring can execute the same arithmetic.
+    Megatron-Core performs the remaining model-specific validation when the
+    provider is finalized. Sampling parameters do not affect this validation:
+    generation samples from the processed distribution while generation and
+    policy scoring both report raw model logprobs.
+
+    Args:
+        config: Policy configuration for this Megatron worker.
+
+    Raises:
+        ValueError: If batch-invariant mode is requested with an unsupported
+            NeMo-RL topology, generation backend, or precision.
+        AssertionError: If the installed Transformer Engine cannot pin the
+            requested FlashAttention version.
+    """
+    if not config.get("megatron_cfg", {}).get("batch_invariant_mode"):
+        return
+
+    result = validate_batch_invariant_mode(config)
+    result.raise_if_invalid("batch_invariant_mode=True failed validation:")
+    enable_batch_invariant_kernels(config)
+
+
+def enable_zero_train_gen_kl(
+    config: PolicyConfig, *, apply_kernels: bool = True
+) -> None:
+    """Resolve zero_train_gen_mismatch into sub-knobs and enable batch-invariant mode.
+
+    Applies the zero train/gen KL defaults below. A recipe value that differs is
+    overridden with a warning. Generation may be colocated or not and may use
+    either ``transformer_engine`` or ``inference_optimized``. Call with
+    ``apply_kernels=True`` before CUDA initialization so Megatron-Core
+    batch-invariant kernels are active for the worker lifetime.
+
+    Raises:
+        ValueError: If batch-invariant mode validation fails after defaults are
+            applied.
+    """
+    configure_zero_train_gen_mismatch(
+        config,
+        apply_kernels=apply_kernels,
+        register_moe_bi_fp8_skip=_skip_megatron_moe_bi_fp8_assert,
+    )
+
+
+_MOE_BI_FP8_ASSERT_SKIPPED = False
+
+
+def _coerce_mcore_config_enums_to_strings(config: Any) -> None:
+    """Reset MCore enum config fields to strings before __post_init__ reruns.
+
+    Bridge ``finalize()`` and ``ConfigContainer.validate()`` both call MCore
+    ``TransformerConfig.__post_init__``. Some inference_optimized checks compare
+    against string literals (e.g. ``"vllm"``) before converting to enums, so a
+    second pass fails with ``InferenceGroupedGemmBackend.VLLM`` even when the
+    YAML value is correct.
+    """
+    backend = getattr(config, "inference_grouped_gemm_backend", None)
+    if isinstance(backend, enum.Enum):
+        config.inference_grouped_gemm_backend = backend.value
+
+
+def _skip_megatron_moe_bi_fp8_assert() -> None:
+    """Allow training-path MoE+BI+FP8 to bypass Megatron's inference-only FP8 gate.
+
+    Megatron ``TransformerConfig.__post_init__`` rejects MoE + batch_invariant_mode
+    + FP8 unless ``te_mxfp8_inference`` is true (``inference_optimized`` +
+    ``inference_grouped_gemm_backend=te`` + mxfp8 + te_native + SwiGLU/squared-ReLU).
+
+    Zero-KL wiring intentionally splits this across workers:
+
+    - **Training** (``MegatronPolicyWorker`` on the train node): ``megatron_cfg`` has
+      FP8 + ``batch_invariant_backend=te_native`` but no ``inference_optimized`` /
+      ``inference_grouped_gemm_backend`` — TE grouped GEMM is generation-only.
+    - **Generation** (non-colocated dedicated policy): ``merged_inference_megatron_cfg``
+      overlays ``mcore_generation_config`` (``inference_optimized``, backend ``te``,
+      NVLS dispatcher, etc.) and must satisfy the upstream gate unchanged.
+
+    Idempotent.
+    """
+    global _MOE_BI_FP8_ASSERT_SKIPPED
+    if _MOE_BI_FP8_ASSERT_SKIPPED:
+        return
+
+    orig_post_init = TransformerConfig.__post_init__
+
+    def _post_init_allow_te_moe_bi_fp8(self: Any) -> None:
+        _coerce_mcore_config_enums_to_strings(self)
+        try:
+            orig_post_init(self)
+        except AssertionError as e:
+            msg = str(e)
+            is_moe_bi_fp8_gate = msg.startswith(
+                "Batch-invariant MoE supports bf16"
+            ) or ("Batch-invariant MoE is bf16-only" in msg)
+            if not is_moe_bi_fp8_gate:
+                raise
+            # Keep Megatron's rule for inference_optimized MoE+BI+FP8; training
+            # workers use te_native without inference_optimized/TE grouped GEMM.
+            if getattr(self, "transformer_impl", None) == "inference_optimized":
+                raise
+            # Finish BI MoE checks that follow the bf16-only assert upstream.
+            if self.moe_permute_fusion or getattr(
+                self, "moe_permute_fusion_into_hybridep", False
+            ):
+                raise AssertionError(
+                    "Batch-invariant MoE requires the unfused permute/unpermute "
+                    "path so top-k reductions use the fixed batch-invariant add "
+                    "tree."
+                ) from e
+            if getattr(self, "moe_pad_expert_input_to_capacity", False) or getattr(
+                self, "moe_pad_experts_for_cuda_graph_inference", False
+            ):
+                raise AssertionError(
+                    "Batch-invariant MoE supports dynamic dropless routing only. "
+                    "Disable MoE capacity/expert padding."
+                ) from e
+            # Remaining __post_init__ body is packing-only; recipes that use
+            # packing with MoE+BI+FP8 must clear FP8 or extend this skip.
+            if getattr(self, "sequence_packing_scheduler", None) is not None:
+                raise
+
+    TransformerConfig.__post_init__ = _post_init_allow_te_moe_bi_fp8  # type: ignore[method-assign]
+    _MOE_BI_FP8_ASSERT_SKIPPED = True
+
+
 def destroy_parallel_state():
     """Safely destroy parallel state and reset async call tracking.
 
@@ -530,6 +666,10 @@ def validate_and_set_config(
             "with TP>1: set policy.megatron_cfg.sequence_parallel=true."
         )
 
+    # Resolve zero-KL config knobs before sampling_params so batch_invariant_mode
+    # is visible when deciding whether to recompute raw training logprobs.
+    enable_zero_train_gen_kl(config, apply_kernels=False)
+
     # Handle generation configuration
     is_generation_colocated = None
     sampling_params = None
@@ -537,12 +677,15 @@ def validate_and_set_config(
         generation_cfg = config["generation"]
         # set generation colocated
         is_generation_colocated = generation_cfg["colocated"]["enabled"]
-        # set sampling params
-        sampling_params = TrainingSamplingParams(
-            top_k=generation_cfg["top_k"],
-            top_p=generation_cfg["top_p"],
-            temperature=generation_cfg["temperature"],
-        )
+        # Batch-invariant Megatron inference returns raw model logprobs even
+        # when token sampling uses temperature, top-k, or top-p. Match
+        # Megatron-RL by recomputing raw training logprobs as well.
+        if not config["megatron_cfg"].get("batch_invariant_mode"):
+            sampling_params = TrainingSamplingParams(
+                top_k=generation_cfg["top_k"],
+                top_p=generation_cfg["top_p"],
+                temperature=generation_cfg["temperature"],
+            )
 
     # Setup data types
     dtype_map = {
@@ -1092,14 +1235,6 @@ def setup_model_config(
     # Validate chunking configuration
     _validate_chunking_config(config)
 
-    # Reconstructed providers must be finalized so derived fields reflect the
-    # merged config. Without overrides, preserve the existing checkpoint-load
-    # behavior: only HF-derived providers need finalization here.
-    if derive_provider_from_hf or model_overrides:
-        model_cfg.finalize()
-
-    model_cfg.__post_init__()
-
     # Derive fp8_param_enabled once from the config dict so that load_main_params_from_ckpt
     # and _create_megatron_config both use the same canonical check (fp8 enabled AND fp8_param).
     fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
@@ -1131,6 +1266,11 @@ def setup_model_config(
 
     # Validate training configuration
     _validate_training_config(config, model_cfg)
+
+    # Finalize once after NeMo-RL fields are applied. Bridge configs defer MCore
+    # __post_init__ to finalize(); megatron_cfg.validate() may call it again.
+    if derive_provider_from_hf or model_overrides:
+        model_cfg.finalize()
 
     # Create final megatron config
     megatron_cfg = _create_megatron_config(
@@ -1335,6 +1475,42 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
         model_cfg.inference_grouped_gemm_backend = config["megatron_cfg"][
             "inference_grouped_gemm_backend"
         ]
+    # FlashInfer megakernel settings, used when
+    # inference_grouped_gemm_backend='flashinfer_mega'. max_tokens_per_rank is a
+    # hard workspace cap, not a hint: the kernel rejects a forward with more
+    # local tokens than this, so it has to cover the widest prefill each EP rank
+    # can see, not just the decode width.
+    for key in (
+        "inference_mega_precision",
+        "inference_mega_max_tokens_per_rank",
+        # Train-side: run the training MoE forward through the megakernel so it
+        # matches generation bit for bit, taking the backward from the TE
+        # recompute pass. Requires selective 'moe' recompute, which is why it
+        # sits with the other recompute settings in _apply_recompute_config.
+        "moe_mega_training_forward",
+        # The same thing for the non-mega backends, which is what a squared-ReLU
+        # model has to use: the megakernel implements only SwiGLU. Both spellings
+        # have to be forwarded -- MCore resolves the mega one into this one, so a
+        # recipe that set this and was not forwarded would lose its training
+        # forward silently, leaving TE on one side and the inference kernel on
+        # the other with nothing to report the mismatch but the KL.
+        "moe_inference_training_forward",
+        # Bound on the tokens one rank feeds that training forward. The NVLS
+        # dispatcher's symmetric buffers are allocated once and cannot grow, so
+        # without it they are sized from the first microbatch and the first
+        # larger one fails. Not forwarded means silently back to that.
+        "moe_inference_training_max_tokens_per_rank",
+        # Accepts the straight-through gradient a quantized mega training
+        # forward implies. MCore rejects the pairing without it, and rejects the
+        # flag itself at bf16, so it has to reach TransformerConfig either way.
+        "moe_mega_training_straight_through",
+        # Mamba/SSM training path: False takes the training forward off the
+        # fused mamba_split_conv1d_scan_combined and onto the unfused
+        # mamba_chunk_scan_combined. Inert for models with no SSM layers.
+        "use_mamba_mem_eff_path",
+    ):
+        if key in config["megatron_cfg"]:
+            setattr(model_cfg, key, config["megatron_cfg"][key])
     if "moe_router_num_groups" in config["megatron_cfg"]:
         model_cfg.moe_router_num_groups = config["megatron_cfg"][
             "moe_router_num_groups"
@@ -1749,6 +1925,50 @@ def _apply_precision_config(
         )
 
 
+def _inference_optimized_gpt_layer_spec(provider: Any, vp_stage: Any = None) -> Any:
+    """Return the inference-optimized GPT layer spec for a finalized provider.
+
+    Bridge ``GPTModelProvider.default_layer_spec`` only selects TE specs, so
+    ``transformer_impl=inference_optimized`` would otherwise build TE modules.
+    Callable form resolves against provider fields at ``provide()`` time.
+
+    Args:
+        provider: Finalized Megatron-Bridge GPT model provider.
+        vp_stage: Virtual-pipeline stage forwarded by Bridge; unused by this spec.
+    """
+    del vp_stage
+    # Megatron-Core is imported only when an infopt worker builds the model.
+    from megatron.core.models.gpt.gpt_layer_specs import (
+        get_gpt_layer_with_inference_spec,
+    )
+
+    return get_gpt_layer_with_inference_spec(
+        qk_layernorm=getattr(provider, "qk_layernorm", False),
+        multi_latent_attention=getattr(provider, "multi_latent_attention", False),
+        qk_l2_norm=getattr(provider, "qk_l2_norm", False),
+        num_experts=getattr(provider, "num_moe_experts", None),
+        moe_grouped_gemm=getattr(provider, "moe_grouped_gemm", False),
+    )
+
+
+def _apply_transformer_impl_config(
+    model_cfg: Any, megatron_cfg: Mapping[str, Any]
+) -> None:
+    """Apply the transformer implementation and its matching Bridge layer spec."""
+    if "transformer_impl" not in megatron_cfg:
+        return
+
+    model_cfg.transformer_impl = megatron_cfg["transformer_impl"]
+    # Bridge GPTModelProvider.default_layer_spec only branches on
+    # use_transformer_engine_full_layer_spec (both branches TE), so
+    # transformer_impl=inference_optimized would otherwise still build TE
+    # modules. Assign the infopt GPT spec through the provider override
+    # (same hook the modelopt path uses). Callable so it resolves against
+    # finalized provider fields at provide() time.
+    if model_cfg.transformer_impl == "inference_optimized":
+        model_cfg.transformer_layer_spec = _inference_optimized_gpt_layer_spec
+
+
 def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     """Apply performance optimization configuration."""
     model_cfg.parallel_output = True
@@ -1815,9 +2035,23 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
                 f"Available backends are: {list(AttnBackend.__members__.keys())}"
             )
 
+    flash_attention_version = config["megatron_cfg"].get("flash_attention_version")
+    if flash_attention_version is not None:
+        model_cfg.flash_attention_version = flash_attention_version
+
+    if "batch_invariant_mode" in config["megatron_cfg"]:
+        model_cfg.batch_invariant_mode = config["megatron_cfg"]["batch_invariant_mode"]
+    if "batch_invariant_backend" in config["megatron_cfg"]:
+        model_cfg.batch_invariant_backend = config["megatron_cfg"][
+            "batch_invariant_backend"
+        ]
+    if "batch_invariant_collective" in config["megatron_cfg"]:
+        model_cfg.batch_invariant_collective = config["megatron_cfg"][
+            "batch_invariant_collective"
+        ]
+
     # These overrides need to be applied before the workers spawn.
-    if "transformer_impl" in config["megatron_cfg"]:
-        model_cfg.transformer_impl = config["megatron_cfg"]["transformer_impl"]
+    _apply_transformer_impl_config(model_cfg, config["megatron_cfg"])
     if "cuda_graph_impl" in config["megatron_cfg"]:
         model_cfg.cuda_graph_impl = config["megatron_cfg"]["cuda_graph_impl"]
         if model_cfg.cuda_graph_impl != "none":
@@ -2228,10 +2462,7 @@ def build_inference_model(
     train_pipeline_model_parallel_size = inference_provider.pipeline_model_parallel_size
     _apply_parallelism_config(inference_provider, policy_cfg)
     _apply_moe_config(inference_provider, policy_cfg)
-    if "transformer_impl" in policy_cfg["megatron_cfg"]:
-        inference_provider.transformer_impl = policy_cfg["megatron_cfg"][
-            "transformer_impl"
-        ]
+    _apply_transformer_impl_config(inference_provider, policy_cfg["megatron_cfg"])
     # CUDA graph config needs to be set correctly before init.
     if "cuda_graph_impl" in policy_cfg["megatron_cfg"]:
         cuda_graph_impl = policy_cfg["megatron_cfg"]["cuda_graph_impl"]
@@ -2264,6 +2495,10 @@ def build_inference_model(
     inference_provider.recompute_granularity = None
     inference_provider.recompute_method = None
     inference_provider.recompute_num_layers = None
+    # The parity training-forward flags are cleared upstream of here, in
+    # merged_inference_megatron_cfg, which is where generation's megatron_cfg is
+    # assembled. Deliberately not repeated: two places that both clear them
+    # means neither is the one that has to be right.
     if inference_provider.transformer_impl == "inference_optimized":
         inference_provider.moe_pad_experts_for_cuda_graph_inference = False
     # Re-run the deferred MCore post-init (virtual, idempotent).
