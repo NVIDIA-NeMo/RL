@@ -28,7 +28,10 @@ import torch
 from omegaconf import OmegaConf
 
 import nemo_rl.algorithms.single_controller_utils.setup as sc_setup_mod
-from nemo_rl.algorithms.advantage_estimator import AdvEstimatorConfig
+from nemo_rl.algorithms.advantage_estimator import (
+    AdvEstimatorConfig,
+    OPDAdvantageEstimator,
+)
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     DATA_PLANE_CHECKPOINT_DIR,
     LEGACY_REPLAY_BUFFER_FILENAME,
@@ -467,6 +470,35 @@ def test_single_controller_mopd_recipe_resolves_to_runtime_contract(monkeypatch)
         config.on_policy_distillation.teacher_model_by_agent_name["default_teacher"]
         == config.policy["model_name"]
     )
+
+
+def test_single_controller_mopd_recipe_builds_tropd_estimator(monkeypatch):
+    """TROPD knobs reach the SC advantage estimator from the recipe YAML."""
+    monkeypatch.setenv("HF_HOME", "/tmp/nemo-rl-test-hf")
+    register_omegaconf_resolvers()
+    repo_root = Path(__file__).resolve().parents[3]
+    recipe = repo_root / (
+        "examples/configs/recipes/llm/"
+        "mopd-qwen3-1.7b-3n8g-megatron-pack-single-controller.yaml"
+    )
+    overrides = OmegaConf.from_dotlist(
+        [
+            "grpo.adv_estimator.proximal_teacher_alpha=0.5",
+            "grpo.adv_estimator.subtract_global_baseline=true",
+        ]
+    )
+    resolved = OmegaConf.to_container(
+        OmegaConf.merge(load_config(recipe), overrides), resolve=True
+    )
+
+    assert isinstance(resolved, dict)
+    config = MasterConfig.model_validate(resolved)
+    validate_single_controller_config(config)
+    estimator = sc_setup_mod._build_advantage_estimator(config)
+
+    assert isinstance(estimator, OPDAdvantageEstimator)
+    assert estimator.proximal_teacher_alpha == 0.5
+    assert estimator.subtract_global_baseline is True
 
 
 def test_single_controller_ppo_recipe_inherits_overlong_filtering():
