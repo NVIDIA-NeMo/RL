@@ -994,6 +994,21 @@ class VllmAsyncGenerationWorkerImpl(
             # attaches (rollout_id, call_id, parent_call_id, prev_len, mode).
             ng_capture: Optional[dict[str, Any]] = None
 
+            def to_sampling_params(self, *args: Any, **kwargs: Any) -> Any:
+                sp = super().to_sampling_params(*args, **kwargs)
+                # opt1: skip incremental detokenization for requests that do
+                # not need text during generation; the final text is restored
+                # once in chat_completion_full_generator.
+                import os as _os
+                if (
+                    _os.environ.get("NRL_VLLM_HTTP_NO_DETOKENIZE") == "1"
+                    and not sp.stop
+                    and not self.stream
+                    and not getattr(self, "include_stop_str_in_output", False)
+                ):
+                    sp.detokenize = False
+                return sp
+
         # vLLM 0.25 routes both /v1/chat/completions and /tokenize through
         # OnlineRenderer.preprocess_chat, so the prefix-token override
         # belongs on the renderer subclass.
@@ -1027,8 +1042,19 @@ class VllmAsyncGenerationWorkerImpl(
 
                 async def capture_result_generator():
                     nonlocal final_res
+                    import os as _os
+                    _nodetok = _os.environ.get("NRL_VLLM_HTTP_NO_DETOKENIZE") == "1"
                     async for res in result_generator:
                         final_res = res
+                        # opt1: restore the text once at the end when
+                        # incremental detokenization was skipped.
+                        if _nodetok and getattr(res, "finished", False):
+                            _tok = self.renderer.tokenizer
+                            for _o in res.outputs:
+                                if not _o.text and _o.token_ids:
+                                    _o.text = _tok.decode(
+                                        list(_o.token_ids), skip_special_tokens=True
+                                    )
                         yield res
 
                 response = await super().chat_completion_full_generator(
