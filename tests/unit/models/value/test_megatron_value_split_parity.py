@@ -38,12 +38,14 @@ pytestmark = [pytest.mark.mcore, pytest.mark.hf_gated]
 
 @pytest.mark.timeout(600)
 @pytest.mark.parametrize(
-    "tp,pp,cp,updates",
+    "num_gpus,tp,pp,cp,updates",
     [
-        (1, 1, 1, {}),
-        (2, 1, 1, {"sequence_parallel": True}),
-        (1, 2, 1, {"sequence_packing": True}),
+        pytest.param(1, 1, 1, 1, {}, id="single_gpu"),
+        (2, 1, 1, 1, {}),
+        (2, 2, 1, 1, {"sequence_parallel": True}),
+        (2, 1, 2, 1, {"sequence_packing": True}),
         (
+            2,
             1,
             1,
             2,
@@ -53,15 +55,17 @@ pytestmark = [pytest.mark.mcore, pytest.mark.hf_gated]
                 "precision": "bfloat16",
             },
         ),
-        (1, 1, 1, {"dynamic_batching": True}),
+        (2, 1, 1, 1, {"dynamic_batching": True}),
     ],
 )
-def test_value_split_parity(tiny_qwen2_model_path, tmp_path, tp, pp, cp, updates):
+def test_value_split_parity(
+    tiny_qwen2_model_path, tmp_path, num_gpus, tp, pp, cp, updates
+):
     cluster = RayVirtualCluster(
         name="value-split-parity",
-        bundle_ct_per_node_list=[2],
+        bundle_ct_per_node_list=[num_gpus],
         use_gpus=True,
-        num_gpus_per_node=2,
+        num_gpus_per_node=num_gpus,
         max_colocated_worker_groups=1,
     )
     model = None
@@ -85,6 +89,42 @@ def test_value_split_parity(tiny_qwen2_model_path, tmp_path, tp, pp, cp, updates
         data["token_mask"][:, :8] = 0
         data["token_mask"][0, -8:] = 0
         loss_fn = MseValueLossFn(MseValueLossConfig(cliprange=0.5))
+        # Aborting a partial update must leave predictions unchanged, and the
+        # following whole-batch / split steps must still be trainable.
+        model.prepare_for_inference()
+        before_abort = model.get_values(data)["values"].cpu()
+        model.finish_inference()
+        model.prepare_for_training()
+        wg = model.worker_group
+        ray.get(
+            wg.run_all_workers_single_data(
+                "begin_train_step_presharded", loss_fn=loss_fn, gbs=8, mbs=2
+            )
+        )
+        # The plain layout additionally exercises abort after backward.
+        abort_data = BatchedDataDict({key: tensor[:4] for key, tensor in data.items()})
+        if not updates:
+            shards = abort_data.shard_by_batch_size(
+                model.sharding_annotations.get_axis_size("data_parallel")
+            )
+            axes = ["tensor_parallel", "pipeline_parallel", "context_parallel"]
+            wg.get_all_worker_results(
+                wg.run_all_workers_sharded_data(
+                    "train_microbatch",
+                    data=shards,
+                    in_sharded_axes=["data_parallel"],
+                    replicate_on_axes=axes,
+                    output_is_replicated=axes,
+                )
+            )
+        ray.get(wg.run_all_workers_single_data("abort_train_step_presharded"))
+        ray.get(wg.run_all_workers_single_data("abort_train_step_presharded"))
+        model.finish_training()
+        model.prepare_for_inference()
+        torch.testing.assert_close(
+            model.get_values(data)["values"].cpu(), before_abort, rtol=0, atol=0
+        )
+        model.finish_inference()
         weights = str(tmp_path / "initial" / "weights")
         model.prepare_for_training()
         model.save_checkpoint(weights_path=weights)
