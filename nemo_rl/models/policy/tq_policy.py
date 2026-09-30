@@ -64,6 +64,7 @@ from nemo_rl.data_plane.schema import (
     fields_with_optional_routed_experts,
 )
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.telemetry.instrumentation import trace_context_kwargs
 from nemo_rl.utils.flops_tracker import get_theoretical_tflops
 from nemo_rl.utils.timer import Timer
 
@@ -84,6 +85,8 @@ def _aggregate_train_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         out["moe_metrics"] = results[0]["moe_metrics"]
     if "mtp_metrics" in results[0]:
         out["mtp_metrics"] = results[0]["mtp_metrics"]
+    if "draft_grad_norm" in results[0]:
+        out["draft_grad_norm"] = results[0]["draft_grad_norm"]
     all_mb_metrics: dict[str, list[Any]] = defaultdict(list)
     for r in results:
         for k, v in r["all_mb_metrics"].items():
@@ -434,7 +437,7 @@ class TQPolicy(TQDriverMixin, Policy):
                     "tensor_parallel",
                     "pipeline_parallel",
                 ],
-                common_kwargs=common_kwargs,
+                common_kwargs={**common_kwargs, **trace_context_kwargs()},
             )
         # Wait for completion; per-rank returns are None.
         self.worker_group.get_all_worker_results(futures)
@@ -563,6 +566,7 @@ class TQPolicy(TQDriverMixin, Policy):
                     "eval_mode": eval_mode,
                     "gbs": batch_size,
                     "mbs": micro_batch_size,
+                    **trace_context_kwargs(),
                 },
             )
         results = self.worker_group.get_all_worker_results(futures)
@@ -618,6 +622,7 @@ class TQPolicy(TQDriverMixin, Policy):
             loss_fn=loss_fn,
             gbs=batch_size,
             mbs=micro_batch_size,
+            **trace_context_kwargs(),
         )
         ray.get(futures)
 
@@ -771,6 +776,7 @@ class TQPolicy(TQDriverMixin, Policy):
                     "tensor_parallel",
                     "pipeline_parallel",
                 ],
+                common_kwargs=trace_context_kwargs(),
             )
         # Wait for completion only — workers return None (metrics
         # accumulate in their open-step state until finish_train_step).
@@ -785,6 +791,7 @@ class TQPolicy(TQDriverMixin, Policy):
         """
         futures = self.worker_group.run_all_workers_single_data(
             "finish_train_step_presharded",
+            **trace_context_kwargs(),
         )
         results = ray.get(futures)
         # Filter to DP-replica leaders only. ``run_all_workers_single_data``
@@ -807,6 +814,7 @@ class TQPolicy(TQDriverMixin, Policy):
         """Drop partial step state on every worker. No optimizer.step."""
         futures = self.worker_group.run_all_workers_single_data(
             "abort_train_step_presharded",
+            **trace_context_kwargs(),
         )
         ray.get(futures)
 

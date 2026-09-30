@@ -78,6 +78,7 @@ from nemo_rl.data_plane.schema import (
     OPD_FULL_TEACHER_INDEX_FIELD,
     SC_ROLLOUT_SCHEMA_FIELDS,
 )
+from nemo_rl.data_plane.tq_token_sink import MEDIA_STAGING_FIELDS
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 from nemo_rl.experience.rollouts import EffortLevelsConfig
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
@@ -676,6 +677,24 @@ class TestSetup:
             NotImplementedError, match="token-capture finalizer does not emit"
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
+
+    def test_vlm_token_capture_rejects_non_vllm_backend(self, patched_factories):
+        # Media capture is only implemented in the vLLM worker: a VLM run (any
+        # processor) with token capture must fail loudly on other backends.
+        mc = _make_master_config(
+            backend="megatron",
+            megatron_enabled=True,
+            env={"should_use_nemo_gym": True},
+        )
+        mc.token_capture.enabled = True
+
+        with pytest.raises(NotImplementedError, match="only implemented for the vLLM"):
+            setup_single_controller(
+                mc, MagicMock(pad_token_id=0), processor=MagicMock()
+            )
 
         patched_factories["setup_response_data"].assert_not_called()
         patched_factories["_build_clusters"].assert_not_called()
@@ -1759,8 +1778,13 @@ class TestSetup:
         ]
         assert WIRE_MULTIMODAL_FIELDS <= set(warmup_fields)
 
-    def test_token_capture_always_creates_finalizer_actor_pool(self, patched_factories):
-        mc = _make_master_config(backend="vllm")
+    @pytest.mark.parametrize("with_processor", [True, False])
+    def test_token_capture_always_creates_finalizer_actor_pool(
+        self, patched_factories, with_processor
+    ):
+        # A VLM processor turns media capture on (Omni placeholder processor,
+        # Megatron learner); text-only runs get capture_media=False.
+        mc = _make_master_config(backend="vllm", megatron_enabled=with_processor)
         mc.policy["generation"].update(
             {
                 "model_name": "test-model",
@@ -1781,15 +1805,16 @@ class TestSetup:
         )
         fake_actors = [MagicMock(name=f"finalizer_{index}") for index in range(3)]
         tokenizer = MagicMock(pad_token_id=9)
-        processor = MagicMock(tokenizer=tokenizer)
+        processor = MagicMock(tokenizer=tokenizer) if with_processor else None
 
         with (
             patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
             patch.object(
                 sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
-            ),
+            ) as mock_spinup,
             patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
             patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+            patch.object(sc_setup_mod, "uses_image_placeholder", return_value=True),
             patch(
                 "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
                 return_value=fake_actors,
@@ -1804,12 +1829,27 @@ class TestSetup:
         assert actor_config.partition_id == "rollout_data"
         assert actor_config.staging_partition == mc.token_capture.staging_partition
         assert actor_config.pad_token_id == 9
+        assert actor_config.capture_media is with_processor
         assert actor_kwargs == {"num_workers": 3}
         assert actor_args.finalizer_actors == fake_actors
         assert not hasattr(actor_args.rollout_manager, "_finalizer")
         partition_calls = actor_args.dp_client.register_partition.call_args_list
-        assert WIRE_MULTIMODAL_FIELDS <= set(partition_calls[0].kwargs["fields"])
-        assert WIRE_MULTIMODAL_FIELDS.isdisjoint(partition_calls[1].kwargs["fields"])
+        staging_fields = set(partition_calls[1].kwargs["fields"])
+        assert WIRE_MULTIMODAL_FIELDS.isdisjoint(staging_fields)
+        if with_processor:
+            assert WIRE_MULTIMODAL_FIELDS <= set(partition_calls[0].kwargs["fields"])
+            # The staging partition carries the media columns the sink writes.
+            assert set(MEDIA_STAGING_FIELDS) <= staging_fields
+        else:
+            assert set(MEDIA_STAGING_FIELDS).isdisjoint(staging_fields)
+        assert mc.token_capture.generation_backend == "vllm"
+        assert mock_spinup.call_args.kwargs["token_capture"]["generation_backend"] == (
+            "vllm"
+        )
+        # The worker fan-out receives the same capability bit.
+        generation, _ = patched_factories["_build_generation"].return_value
+        _, setup_kwargs = generation.setup_token_capture.call_args
+        assert setup_kwargs["capture_media"] is with_processor
 
     def test_nemo_gym_coverage_failure_shuts_down_shards(self, patched_factories):
         mc = _make_master_config(colocated=False, backend="vllm")
@@ -2243,6 +2283,84 @@ class TestSetup:
             # Reserve/load split and setup-time sync exist on the gym-on path only.
             assert metrics.generation_init_reserve_time_s is None
             assert metrics.weight_sync_time_s is None
+
+    def _make_megatron_token_capture_config(self) -> MasterConfig:
+        """Gym-on Megatron config with token capture enabled (expose_http_server=true)."""
+        mc = self._make_gym_megatron_config()
+        # Extend, don't replace: setup_single_controller also indexes the
+        # wandb keys that _make_master_config populates.
+        mc.logger = {**mc.logger, "log_dir": "/tmp/test-megatron-token-capture"}
+        mc.token_capture.enabled = True
+        return mc
+
+    def test_megatron_token_capture_propagates_backend(self, patched_factories):
+        """Megatron token capture derives generation_backend and rides into Gym."""
+        mc = self._make_megatron_token_capture_config()
+        patched_factories["setup_response_data"].return_value = (
+            list(range(8)),
+            None,
+        )
+        fake_gym_actor = MagicMock(name="nemo_gym_actor")
+        reserved_urls = ["http://10.0.0.1:5555/v1"]
+        port_holders = [MagicMock(name="port_holder_rank_0")]
+
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(
+                sc_setup_mod, "build_nemo_gym_actors", return_value=fake_gym_actor
+            ) as mock_spinup,
+            patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
+            patch.object(sc_setup_mod, "MegatronGeneration") as mock_megatron,
+            patch.object(sc_setup_mod, "ray"),
+            patch(
+                "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
+                return_value=[MagicMock(name="finalizer_0")],
+            ) as mock_create_finalizer_actors,
+        ):
+            mock_megatron.reserve_http_server_addresses.return_value = (
+                reserved_urls,
+                {0: 5555},
+                port_holders,
+            )
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert mc.token_capture.generation_backend == "megatron"
+        assert mock_spinup.call_args.kwargs["token_capture"]["generation_backend"] == (
+            "megatron"
+        )
+        mock_create_finalizer_actors.assert_called_once()
+        assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
+
+    def test_megatron_token_capture_requires_exposed_http_server(
+        self, patched_factories
+    ):
+        mc = self._make_megatron_token_capture_config()
+        mc.policy["generation"]["mcore_generation_config"]["expose_http_server"] = False
+
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            pytest.raises(ValueError, match="expose_http_server=true"),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert mc.token_capture.generation_backend is None
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
+
+    def test_megatron_token_capture_rejects_router_replay(self, patched_factories):
+        mc = self._make_megatron_token_capture_config()
+        # The real router_replay_enabled predicate reads policy.router_replay.enabled.
+        mc.policy["router_replay"] = {"enabled": True}
+
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            pytest.raises(NotImplementedError, match="router replay"),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert mc.token_capture.generation_backend is None
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
 
     @pytest.mark.parametrize("backend", ["sglang"])
     def test_nemo_gym_rejects_non_vllm_backend(self, patched_factories, backend):

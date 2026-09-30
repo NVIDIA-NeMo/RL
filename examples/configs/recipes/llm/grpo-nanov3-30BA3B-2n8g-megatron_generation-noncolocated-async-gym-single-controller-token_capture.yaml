@@ -1,0 +1,58 @@
+# SingleController + token-capture sibling of the Megatron-inference async Gym
+# nightly. Capture is only wired up on the SingleController path, so this is
+# the nightly that exercises Megatron capture over a real run: refits with
+# requests in flight, the chained-prefix cache under load, and finalizer health.
+# Launch with:
+#   uv run examples/run_grpo_single_controller.py \
+#     --config examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-megatron_generation-noncolocated-async-gym-single-controller-token_capture.yaml
+defaults: ./grpo-nanov3-30BA3B-2n8g-megatron_generation-noncolocated-async-gym.yaml
+
+grpo:
+  # SC requires one optimizer step per RL step:
+  # num_prompts_per_step * num_generations_per_prompt == policy.train_global_batch_size
+  num_prompts_per_step: 8
+  # SC does not support validation yet.
+  val_period: 0
+  # SC reads async_rl instead; the entrypoint raises if this block is set.
+  async_grpo: null
+
+policy:
+  train_global_batch_size: 128
+
+checkpointing:
+  checkpoint_dir: results/grpo-nanov3-30BA3B-2n8g-megatron_generation-noncolocated-async-gym-single-controller-token_capture
+  # No validation, so no validation metric to rank checkpoints by.
+  metric_name: null
+
+# The gym family sets no data_plane block. TransferQueue is mandatory for the
+# SingleController path; only keys without a schema default are set here (see
+# nemo_rl/data_plane/interfaces.py).
+data_plane:
+  enabled: true
+  impl: transfer_queue
+  backend: simple
+  claim_meta_poll_interval_s: 0.5
+  simple:
+    num_storage_units: ${mul:2, ${cluster.num_nodes}}  # TQ wants >= 2 per node
+
+# Every Megatron-inference completion is staged into TQ by the engine hooks and
+# the finalizer publishes the training rows from Gym's receipts.
+token_capture:
+  enabled: true
+
+async_rl:
+  generation_fleet_health:
+    # Native MCore refit has no worker-side abort hook for a deadline.
+    refit_timeout_s: null
+  sampler:
+    name: in_order
+    # Lag-1, matching the legacy recipe's max_trajectory_age_steps.
+    max_lookahead_versions: 1
+  min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
+  max_inflight_prompts: ${grpo.num_prompts_per_step}
+  max_buffered_rollouts: ${grpo.num_prompts_per_step}
+
+logger:
+  log_dir: logs/grpo-nanov3-30BA3B-2n8g-megatron_generation-noncolocated-async-gym-single-controller-token_capture
+  wandb:
+    name: grpo-nanov3-30BA3B-2n8g-megatron_generation-noncolocated-async-gym-single-controller-token_capture

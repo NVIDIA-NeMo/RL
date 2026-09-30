@@ -205,7 +205,7 @@ class DTensorConfig(TypedDict):
     tensor_parallel_size: int
     context_parallel_size: int
     expert_parallel_size: NotRequired[int]
-    # Size of the HSDP replicate dimension within the data-parallel axis (DTensor v2 only).
+    # Size of the HSDP replicate dimension within the data-parallel axis.
     dp_replicate_size: NotRequired[int]
     # Distributed config options (mirrors Automodel's FSDP2Config)
     sequence_parallel: bool
@@ -262,6 +262,9 @@ class MegatronPeftConfig(TypedDict):
     lora_B_init_method: str
     a2a_experimental: bool
     lora_dtype: str | None
+    # Share one adapter across grouped MoE experts on each EP rank. Set to
+    # False to create one adapter per local expert.
+    share_expert_adapters: NotRequired[bool]
     # Warm start: path to a native Megatron-Bridge PEFT checkpoint (an
     # iter_XXXXXXX directory, or a checkpoint root resolving to one) whose
     # adapter weights initialize this run's LoRA modules. The donor checkpoint
@@ -398,6 +401,7 @@ class MegatronConfig(TypedDict):
     context_parallel_size: int
     # Nemotron Omni RADIO/provider booleans. Omit any field to retain the model
     # provider's checkpoint/default value.
+    radio_force_eval_mode: NotRequired[bool]
     radio_force_cpe_eval_mode: NotRequired[bool]
     # Nemotron Omni tower freeze booleans. Omit any field to retain the model
     # provider's checkpoint/default value.
@@ -405,6 +409,12 @@ class MegatronConfig(TypedDict):
     freeze_vision_projection: NotRequired[bool]
     freeze_sound_encoder: NotRequired[bool]
     freeze_sound_projection: NotRequired[bool]
+    # Nemotron Omni vision-tower activation recomputation controls. Omit any
+    # field to retain the model provider's checkpoint/default value.
+    recompute_vision: NotRequired[bool]
+    vision_recompute_granularity: NotRequired[str | None]
+    vision_recompute_method: NotRequired[str | None]
+    vision_recompute_num_layers: NotRequired[int | None]
     pipeline_dtype: str
     sequence_parallel: bool
     freeze_moe_router: bool
