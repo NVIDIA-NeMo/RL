@@ -31,4 +31,3 @@ jobs:
       BOT_KEY: ${{ secrets.BOT_KEY }}
       SLACK_WEBHOOK_ADMIN: ${{ secrets.SLACK_WEBHOOK_ADMIN }}
       SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
-      SLACK_WEBHOOK_SECONDARY: ${{ secrets.SLACK_WEBHOOK_RL_ALERTS }}
