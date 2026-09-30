@@ -32,9 +32,10 @@ epochs. Both modes train the critic on
 
 1. For each chunk: value forward, policy/reference forward as needed, GAE, then
    policy backward. Policy weights and pre-update value predictions stay fixed.
-2. Preserve accumulated policy gradients on CPU across policy/value switches.
-   Normalize accumulated gradients by the full step's actual valid-token or
-   sequence count, then perform one policy optimizer/scheduler update.
+2. Keep accumulated policy gradients on GPU across policy/value switches while
+   offloading policy parameters and optimizer state. Normalize gradients by the
+   full step's actual valid-token or sequence count, then perform one policy
+   optimizer/scheduler update.
 3. Publish/refit the policy before full-batch critic training. Every critic epoch
    uses the assembled original batch and frozen GAE returns.
 4. Release consumed replay rows after both updates finish. Checkpoint exclusion
@@ -74,6 +75,7 @@ gradient/loss normalization still uses the full update's valid count.
 Streaming requires one policy epoch, in-order sampling, separate generation GPUs,
 and classic Megatron DDP (including expert gradient buffers). Megatron FSDP and
 MXFP8 parameter gathering that shares gradient storage are rejected during setup.
+GPU memory must fit resident policy gradients alongside value inference.
 Chunks and the full batch must satisfy both models' data-parallel alignment and,
 without packing, static microbatch alignment. No samples are duplicated or dropped;
 the existing no-short-batch PPO guard remains. The recipe's `noncolocated` suffix

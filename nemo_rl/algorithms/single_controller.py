@@ -2928,8 +2928,8 @@ class SingleControllerActor:
                     # ---- 2. Prepare the batch ----
                     if self._is_ppo:
                         # Value first keeps each chunk to one visit per model.
-                        # A pending policy step must survive freeing its GPU
-                        # gradient buffers to make room for the colocated critic.
+                        # Keep accumulated policy gradients resident while
+                        # offloading policy parameters/optimizer for the critic.
                         if not value_inference_prepared:
                             with (
                                 self._timer.time("value_inference_prep"),

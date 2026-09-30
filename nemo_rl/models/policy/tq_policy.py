@@ -629,12 +629,12 @@ class TQPolicy(TQDriverMixin, Policy):
         ray.get(futures)
 
     def offload_train_step(self) -> None:
-        """Park an open policy step on CPU without discarding its gradients.
+        """Offload policy parameters/optimizer, keeping gradients on GPU.
 
         Used by colocated PPO between streaming chunks while the value model
-        occupies the training GPUs. ``prepare_for_training`` restores the
-        accumulated gradients before the next policy chunk. Only the Megatron
-        DDP worker supports this lifecycle.
+        occupies the training GPUs alongside the accumulated policy gradients.
+        ``prepare_for_training`` reloads parameters and optimizer state before
+        the next policy chunk. Only the Megatron DDP worker supports this lifecycle.
         """
         futures = self.worker_group.run_all_workers_single_data(
             "offload_train_step", **trace_context_kwargs()

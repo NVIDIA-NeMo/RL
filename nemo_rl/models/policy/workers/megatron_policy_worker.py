@@ -1581,9 +1581,9 @@ class MegatronPolicyWorkerImpl(
             # streaming chunks the controller has fed into this optimizer step
             # so far.
             "num_chunks": 0,
-            # CPU copies of dense/expert gradients while PPO lends the GPUs
-            # to the critic. None means gradients are resident.
-            "offloaded_grads": None,
+            # Policy parameters/optimizer may be offloaded between PPO chunks;
+            # accumulated gradients remain resident until the step closes.
+            "offloaded": False,
             "draft_step_state": DraftStepState(),
             # Saved across the step so we can restore at finish/abort.
             "saved_grad_sync_func": None,
@@ -1751,7 +1751,7 @@ class MegatronPolicyWorkerImpl(
         regular ``train`` path.
         """
         state = self._assert_step_open()
-        if state.get("offloaded_grads") is not None:
+        if state.get("offloaded", False):
             raise RuntimeError("prepare_for_training must restore the offloaded step")
         try:
             self._train_microbatch_body(state, data)
@@ -1946,7 +1946,7 @@ class MegatronPolicyWorkerImpl(
     @wrap_with_nvtx_name("megatron_policy_worker/finish_train_step")
     def finish_train_step(self) -> dict[str, Any]:
         state = self._assert_step_open()
-        if state.get("offloaded_grads") is not None:
+        if state.get("offloaded", False):
             raise RuntimeError("prepare_for_training must restore the offloaded step")
         try:
             return self._finish_train_step_body(state)
@@ -2282,11 +2282,8 @@ class MegatronPolicyWorkerImpl(
             self._set_mtp_grad_scale_func(None)
         finally:
             self._restore_saved_mcore_hooks(state)
-            # Offloaded grad views point at freed storage. Drop the CPU copies;
-            # the next reload/begin will allocate and zero fresh buffers.
-            if state.get("offloaded_grads") is None:
-                self.model.zero_grad_buffer()
-                self.optimizer.zero_grad()
+            self.model.zero_grad_buffer()
+            self.optimizer.zero_grad()
             self._train_step_state = None
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs")
@@ -4329,15 +4326,14 @@ class MegatronPolicyWorkerImpl(
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/offload_train_step")
     def offload_train_step(self) -> None:
-        """Preserve an open step's gradients while freeing GPU model storage.
+        """Offload policy parameters/optimizer while keeping gradients on GPU.
 
-        Megatron's buffer offload discards gradients, and its reload zeroes
-        them. Save independent CPU copies before invoking that lifecycle so
-        policy gradients survive each colocated value-forward detour. Counts,
-        metrics and disabled reduction hooks stay in the open step unchanged.
+        The colocated critic runs alongside the open step's dense and expert
+        gradient buffers. Counts, metrics and disabled reduction hooks stay
+        unchanged until training resumes.
         """
         state = self._assert_step_open()
-        if state.get("offloaded_grads") is not None:
+        if state.get("offloaded", False):
             raise RuntimeError("the open train step is already offloaded")
         if not isinstance(self.model, DistributedDataParallel):
             raise ValueError("PPO streaming offload requires Megatron DDP")
@@ -4346,15 +4342,24 @@ class MegatronPolicyWorkerImpl(
                 "PPO streaming offload does not support shared MXFP8 param/grad buffers"
             )
 
+        for buffer in (*self.model.buffers, *self.model.expert_parallel_buffers):
+            if (
+                buffer.param_data is not None
+                and buffer.grad_data is not None
+                and buffer.param_data.untyped_storage().nbytes() > 0
+                and buffer.param_data.untyped_storage().data_ptr()
+                == buffer.grad_data.untyped_storage().data_ptr()
+            ):
+                raise ValueError(
+                    "PPO streaming offload requires separate param/grad storage"
+                )
+
         self.finalize_async_save()
-        buffers = [*self.model.buffers, *self.model.expert_parallel_buffers]
-        state["offloaded_grads"] = [
-            buffer.grad_data.detach().to(device="cpu", copy=True) for buffer in buffers
-        ]
         # eval may materialize model-specific caches; do it before CPU offload.
         self.model.eval()
+        state["offloaded"] = True
         self.model = self.move_model(
-            self.model, "cpu", move_params=True, move_grads=True
+            self.model, "cpu", move_params=True, move_grads=False
         )
         if self.optimizer is not None and not self.optimizer_cpu_offload:
             self.move_optimizer("cpu")
@@ -4362,31 +4367,11 @@ class MegatronPolicyWorkerImpl(
         gc.collect()
         torch.cuda.empty_cache()
 
-    def _restore_offloaded_train_grads(self) -> None:
-        """Restore saved gradients after Megatron reload recreates their storage."""
-        state = self._train_step_state
-        if state is None or state.get("offloaded_grads") is None:
-            return
-        buffers = [*self.model.buffers, *self.model.expert_parallel_buffers]
-        saved_grads = state["offloaded_grads"]
-        if len(buffers) != len(saved_grads) or any(
-            buffer.grad_data.shape != saved.shape
-            or buffer.grad_data.dtype != saved.dtype
-            for buffer, saved in zip(buffers, saved_grads)
-        ):
-            raise RuntimeError(
-                "policy gradient buffers changed while the step was offloaded"
-            )
-        for buffer, saved in zip(buffers, saved_grads):
-            buffer.grad_data.copy_(saved)
-        state["offloaded_grads"] = None
-
     def prepare_for_training(self, *args, **kwargs):
         # onload models and optimizer state to cuda
         self.model = self.move_model(
             self.model, "cuda", move_grads=True, move_params=True
         )
-        self._restore_offloaded_train_grads()
         self.model.train()
 
         # The opd_full teacher LM head follows the model: the loss projects the
@@ -4401,6 +4386,9 @@ class MegatronPolicyWorkerImpl(
             and not self.optimizer_cpu_offload
         ):
             self.move_optimizer("cuda")
+
+        if self._train_step_state is not None:
+            self._train_step_state["offloaded"] = False
 
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
             torch.cuda.empty_cache()
