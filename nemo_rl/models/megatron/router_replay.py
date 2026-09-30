@@ -127,6 +127,28 @@ def _unwrap_model_config(model: Any) -> Optional[Any]:
 
 def _global_moe_layer_numbers(model_config: Any) -> list[int]:
     num_layers = int(getattr(model_config, "num_layers"))
+
+    # Hybrid Nemotron providers describe MoE blocks in the layer pattern;
+    # their default moe_layer_freq=1 does not mean every block is MoE.
+    # Only backbone layers occupy the capture tensor: ignore PP separators
+    # and any MTP pattern following the first '/'.
+    hybrid_pattern = getattr(model_config, "hybrid_layer_pattern", None)
+    if hybrid_pattern is None:
+        hybrid_pattern = getattr(model_config, "hybrid_override_pattern", None)
+    if hybrid_pattern:
+        main_pattern = str(hybrid_pattern).split("/", 1)[0].replace("|", "")
+        if len(main_pattern) != num_layers:
+            raise ValueError(
+                "hybrid layer pattern has "
+                f"{len(main_pattern)} main-decoder layers but num_layers={num_layers}: "
+                f"{hybrid_pattern!r}"
+            )
+        return [
+            layer_idx + 1
+            for layer_idx, layer_type in enumerate(main_pattern)
+            if layer_type == "E"
+        ]
+
     moe_layer_freq = getattr(model_config, "moe_layer_freq", 1)
 
     if isinstance(moe_layer_freq, int):
