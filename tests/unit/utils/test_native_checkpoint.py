@@ -56,7 +56,7 @@ simple_policy_config = {
     },
     "dtensor_cfg": {
         "enabled": True,
-        "_v2": False,
+        "_v2": True,
         "cpu_offload": False,
         "sequence_parallel": False,
         "activation_checkpointing": False,
@@ -127,23 +127,15 @@ def tokenizer():
 
 @pytest.fixture(scope="function")
 def policy(cluster, tokenizer, request):
-    """Initialize the policy with dtensor v1/v2."""
-    use_v2 = bool(getattr(request, "param", False))
+    """Initialize the policy with dtensor."""
     config = {
         **simple_policy_config,
         "dtensor_cfg": {
             **simple_policy_config["dtensor_cfg"],
-            "_v2": use_v2,
-            **(
-                {
-                    "checkpoint": {
-                        "model_save_format": "torch_save",
-                        "save_consolidated": "false",
-                    }
-                }
-                if use_v2
-                else {}
-            ),
+            "checkpoint": {
+                "model_save_format": "torch_save",
+                "save_consolidated": "false",
+            },
         },
     }
     policy = Policy(
@@ -373,7 +365,6 @@ def test_save_and_load_model_and_optimizer(mock_experiment):
 
 
 @pytest.mark.parametrize("num_gpus", [1, 2], ids=["1gpu", "2gpu"])
-@pytest.mark.parametrize("policy", [False, True], ids=["v1", "v2"], indirect=True)
 def test_convert_dcp_to_hf(policy, num_gpus, request):
     ## warm up with a forward pass
     ## this is needed before saving a checkpoint because FSDP does some lazy initialization
@@ -390,7 +381,6 @@ def test_convert_dcp_to_hf(policy, num_gpus, request):
         }
     )
     policy.train(dummy_fwd_dict, SimpleLossFn())
-    policy_version_is_v2 = request.node.callspec.params["policy"]
 
     with TemporaryDirectory() as tmp_dir:
         policy.save_checkpoint(
@@ -403,11 +393,7 @@ def test_convert_dcp_to_hf(policy, num_gpus, request):
         expected_distcp_files = {f"__{rank}_0.distcp" for rank in range(num_gpus)}
         expected_files = expected_distcp_files.union({".metadata"})
 
-        ckpt_path = (
-            os.path.join(tmp_dir, "test_hf_and_dcp", "model")
-            if policy_version_is_v2
-            else os.path.join(tmp_dir, "test_hf_and_dcp")
-        )
+        ckpt_path = os.path.join(tmp_dir, "test_hf_and_dcp", "model")
 
         ## make sure we save both HF and DCP checkpoints
         assert set(os.listdir(ckpt_path)) == expected_files

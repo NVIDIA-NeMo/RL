@@ -82,6 +82,17 @@ from nemo_rl.models.generation.interfaces import (
     should_use_async_rollouts,
 )
 from nemo_rl.models.policy import PolicyConfig, TokenizerConfig
+from nemo_rl.telemetry.instrumentation import (
+    accepts_trace_context,
+    is_span_group_enabled,
+    streaming_umbrella_span,
+)
+from nemo_rl.telemetry.setup import (
+    init_telemetry_worker,
+    instrument_aiohttp_client,
+    shutdown_telemetry,
+)
+from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
 from nemo_rl.utils.timer import Timer
 from nemo_rl.utils.venvs import make_actor_runtime_env
@@ -342,6 +353,19 @@ _TOKEN_CAPTURE_CONTROL_PREFIX = "/training-token-capture/control"
 _TOKEN_CAPTURE_CONTROL_ENV = "NEMO_GYM_TOKEN_CAPTURE_CONTROL_TOKEN"
 
 
+def _external_staging_backend(token_capture: Dict[str, Any]) -> str:
+    """Map the setup-derived generation backend to Gym's capture backend."""
+    generation_backend = token_capture.get("generation_backend")
+    if generation_backend == "vllm":
+        return "vllm_worker"
+    if generation_backend == "megatron":
+        return "megatron_worker"
+    raise ValueError(
+        "token_capture.enabled requires setup-derived generation_backend to be "
+        f"'vllm' or 'megatron'; got {generation_backend!r}"
+    )
+
+
 def _detect_invalid_tool_call_and_malformed_thinking(
     output_item_dict: dict[str, Any],
     invalid_tool_call_patterns: list[str] | None = None,
@@ -434,6 +458,13 @@ class NemoGym(EnvironmentInterface):
     """This environment class isn't really used for training. It's really meant as an integration wrapper around NeMo-Gym that hooks into the existing NeMo RL resource management via ray. So there is still one source of truth for resource management in NeMo RL."""
 
     def __init__(self, cfg: NemoGymConfig):
+        # Named explicitly: built from the environment registry rather than
+        # by RayWorkerGroup, so nothing sets NRL_WORKER_GROUP for it.
+        init_telemetry_worker(worker_group="nemo_gym")
+        # Before _spinup: the instrumentor patches the session class, so a
+        # session built earlier is not traced.
+        if is_span_group_enabled(RLSpanGroup.PER_PROMPT):
+            instrument_aiohttp_client()
         self.cfg = cfg
         # Populated by _spinup. Declared here so a restarted actor -- Ray recreates it
         # through __init__, which does not start the Gym servers -- reports what
@@ -584,6 +615,7 @@ Depending on your data shape, you may want to change these values."""
         self._control_headers: Dict[str, str] = {}
         self._control_timeout_s = 60.0
         if self._token_capture_enabled:
+            assert token_capture is not None
             policy_overrides = (
                 initial_global_config_dict.setdefault("policy_model", {})
                 .setdefault("responses_api_models", {})
@@ -603,6 +635,7 @@ Depending on your data shape, you may want to change these values."""
                 "lineage_store": ("nemo_gym.token_id_capture.lineage:FileLineageStore"),
                 "lineage_store_kwargs": {"root": os.path.join(capture_dir, "lineage")},
                 "external_staging": True,
+                "external_staging_backend": _external_staging_backend(token_capture),
                 "control_auth_token_env": _TOKEN_CAPTURE_CONTROL_ENV,
             }
             # Gym resolves the credential inside each serving process. Keep
@@ -739,13 +772,81 @@ Depending on your data shape, you may want to change these values."""
                 entries[str(name)] = types
         return entries
 
+    @accepts_trace_context
     async def run_rollouts(
         self,
         nemo_gym_examples: list[dict],
         timer_prefix: str,
         deduplicate_multimodal_data: bool = False,
+        per_prompt: bool = False,
     ) -> AsyncGenerator[tuple[int, dict, dict, dict | None], None]:
-        """Stream postprocessed rollouts as NeMo-Gym tasks complete."""
+        """Stream postprocessed rollouts as NeMo-Gym tasks complete.
+
+        A thin span-opening wrapper over :meth:`_stream_rollouts`, which holds
+        the logic. Split so the span covers the whole stream without indenting
+        the body under a ``with``.
+
+        The decorator parents this batch to the caller's span, and everything
+        below inherits it -- including the HTTP requests Gym's own client
+        makes, which are instrumented at the library level (see
+        :func:`instrument_aiohttp_client`) and read the ambient context rather
+        than anything passed here.
+
+        An umbrella span either way, so it carries no ``rl.bucket``: several
+        of these are in flight at once, and their durations would sum past the
+        wall clock they happened in.
+
+        Args:
+            per_prompt: Whether the caller dispatches this once per prompt.
+                Decided by the caller because ``in_per_prompt_scope`` reads a
+                ``ContextVar`` in the calling process, and this is a separate
+                Ray actor. On the single-controller path a step issues one of
+                these per prompt, so the span belongs in ``per_prompt`` rather
+                than ``per_step``, whose count is meant to scale with steps.
+
+        Yields:
+            One ``(rowidx, resolved_agent_ref, result, timing_metrics)`` tuple
+            per completed task, in completion order rather than input order.
+            ``rowidx`` echoes back the ``_rowidx`` the caller stamped on the
+            example, which is how the caller maps a result to its slot.
+            ``timing_metrics`` is ``None`` on every tuple but the last, which
+            carries the batch totals.
+        """
+        attributes = {"rl.gym.batch_size": len(nemo_gym_examples)}
+        # Two branches rather than a group variable, so the drift test can read
+        # the group/helper pairing at the call site.
+        if per_prompt:
+            span = streaming_umbrella_span(
+                RLSpanGroup.U_PER_PROMPT, "rl.gym.run_rollouts", **attributes
+            )
+        else:
+            span = streaming_umbrella_span(
+                RLSpanGroup.U_ROLLOUT, "rl.gym.run_rollouts", **attributes
+            )
+        with span as activate:
+            inner = self._stream_rollouts(
+                nemo_gym_examples,
+                timer_prefix,
+                deduplicate_multimodal_data,
+            )
+            try:
+                while True:
+                    with activate():
+                        try:
+                            item = await inner.__anext__()
+                        except StopAsyncIteration:
+                            return
+                    yield item
+            finally:
+                await inner.aclose()
+
+    async def _stream_rollouts(
+        self,
+        nemo_gym_examples: list[dict],
+        timer_prefix: str,
+        deduplicate_multimodal_data: bool = False,
+    ) -> AsyncGenerator[tuple[int, dict, dict, dict | None], None]:
+        """Body of :meth:`run_rollouts`; see there for the tracing wrapper."""
         self._require_spinup()
         if not nemo_gym_examples:
             raise ValueError("NeMo-Gym rollout batch must not be empty")
@@ -931,8 +1032,12 @@ Depending on your data shape, you may want to change these values."""
 
         The receipt records the resolving stage in ``terminal_selection``
         (``declared``/``response_id``/``content``/``heuristic`` — failed
-        selections stamp the last stage attempted) and the witness trail in
-        ``terminal_attribution_reason``. Retry duplicates are dead-branch
+        selections stamp the last stage attempted; ``None`` when no stage ran
+        because a manifest row failed to parse) and the witness trail in
+        ``terminal_attribution_reason``. A row that fails ``CallRecord``
+        validation masks the rollout (``invalid_manifest_row``) and is
+        dropped from the shipped manifest, so the finalizer can still
+        enumerate and clean the rows that did parse. Retry duplicates are dead-branch
         rows: they stay in the manifest (their staged rows are fetched,
         verified, and cleaned) but never join the terminal chain —
         ``verify_and_linearize`` tolerates rows unreferenced by the terminal
@@ -947,9 +1052,10 @@ Depending on your data shape, you may want to change these values."""
         Such rows are structurally off-chain and do not poison; if the
         *terminal* request itself died this way, the missing-terminal-row
         check below still masks the rollout. Every other failure reason
-        (``worker_capture_failed``, ``invalid_worker_commit_coordinates``)
-        marks a call whose completion WAS served — a hole in the chain —
-        and poisons.
+        (for example ``worker_capture_failed``,
+        ``invalid_worker_commit_coordinates``, or ``unresolved_parent``; a
+        reason-less failure row poisons as ``capture_failed``) marks a call
+        whose completion WAS served — a hole in the chain — and poisons.
         """
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture import UNCOMMITTED_CALL_REASON
@@ -965,15 +1071,21 @@ Depending on your data shape, you may want to change these values."""
         terminal_record = None
         selection_reason = None
         attribution_reason = None
-        terminal_selection = "heuristic"
-        parsed_records = None
-        try:
-            parsed_records = [
-                CallRecord.model_validate(record) for record in deduped.values()
-            ]
-        except ValueError:
-            selection_reason = "invalid_manifest_row"
-        if parsed_records is not None:
+        terminal_selection = None
+        # Validate row by row so one malformed row masks the rollout without
+        # taking the good rows' staging keys with it: the finalizer re-runs
+        # RolloutReceipt validation and would otherwise reject the whole
+        # receipt as invalid_receipt with no keys to clean.
+        parsed_records: list[CallRecord] = []
+        valid_rows: list[dict] = []
+        for record in deduped.values():
+            try:
+                parsed_records.append(CallRecord.model_validate(record))
+            except ValueError:
+                selection_reason = "invalid_manifest_row"
+            else:
+                valid_rows.append(record)
+        if selection_reason is None:
             attribution = resolve_terminal(
                 parsed_records,
                 scored_response,
@@ -989,6 +1101,7 @@ Depending on your data shape, you may want to change these values."""
                 terminal_selection = "declared"
                 selection_reason = None
             else:
+                terminal_selection = "heuristic"
                 selection = select_terminal_call(parsed_records)
                 if selection.terminal_model_call_id is not None:
                     terminal_record = deduped[selection.terminal_model_call_id]
@@ -1014,7 +1127,7 @@ Depending on your data shape, you may want to change these values."""
                 if terminal_record is not None
                 else None
             ),
-            "manifest": list(deduped.values()),
+            "manifest": valid_rows,
             "capture_poisoned": failure_reason is not None,
             "failure_reason": failure_reason,
             "terminal_selection": terminal_selection,
@@ -1306,9 +1419,14 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
         it is used. A failure therefore cannot leave a live handle that a later
         cleanup attempt invokes again.
         """
-        rh, self.rh = self.rh, None
-        if rh is not None:
-            rh.shutdown()
+        try:
+            rh, self.rh = self.rh, None
+            if rh is not None:
+                rh.shutdown()
+        finally:
+            # Ray reaps this actor, so no atexit handler runs: whatever the span
+            # processor is still holding is dropped unless it is flushed here.
+            shutdown_telemetry()
 
     def step(self, message_log_batch, metadata):
         # This is not used since NeMo-Gym will handle the rollouts entirely.
@@ -1397,16 +1515,19 @@ def validate_reward_components_match_scalar(nemo_gym_results: List[dict]) -> Non
 def setup_nemo_gym_config(config, tokenizer) -> None:
     generation_config = config.policy["generation"]
 
-    backend = generation_config.get("backend")
-    if backend == "vllm":
-        # Enable the http server. Requires both async engine and the expose_http_server flag
+    # Enable the backend's OpenAI-compatible server.
+    if generation_config["backend"] == "vllm":
         generation_config["vllm_cfg"]["async_engine"] = True
         generation_config["vllm_cfg"]["expose_http_server"] = True
-    elif backend == "megatron":
-        # Enable the http server for Gym dispatch over the Megatron generation backend.
+    elif generation_config["backend"] == "megatron":
+        # Megatron Inference is always async; should_use_async_rollouts rejects
+        # an explicit mcore_generation_config.async_engine key.
         generation_config["mcore_generation_config"]["expose_http_server"] = True
     else:
-        raise ValueError(f"NeMo Gym does not support generation backend {backend!r}.")
+        raise ValueError(
+            "NeMo-Gym setup supports vllm or megatron generation; got "
+            f"{generation_config['backend']!r}"
+        )
 
     # Stop strings or token ids are not supported
     generation_config["stop_strings"] = None

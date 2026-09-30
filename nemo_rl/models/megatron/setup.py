@@ -401,9 +401,6 @@ def destroy_parallel_state():
     # Also reset the Megatron async calls queue if it exists
     try:
         import megatron.training.async_utils as megatron_async_utils
-        from megatron.core.dist_checkpointing.strategies.async_utils import (
-            AsyncCallsQueue,
-        )
 
         # Clean up any existing async callers first
         old_call_idx = getattr(
@@ -421,8 +418,9 @@ def destroy_parallel_state():
             megatron_async_utils._async_calls_queue.close()
         except:
             pass  # Ignore errors during cleanup
-        # Reset the Megatron global async calls queue as well
-        megatron_async_utils._async_calls_queue = AsyncCallsQueue()
+        # Reset the Megatron global async calls queue as well. Mcore rebuilds it
+        # lazily in _get_async_calls_queue() using flags from the run's args.
+        megatron_async_utils._async_calls_queue = None
         print(
             f"[DEBUG] Reset Megatron async calls queue (old call_idx: {old_call_idx})"
         )
@@ -698,9 +696,9 @@ def _validate_peft_restore_config(
                 "donor to target the same modules; train a new adapter instead."
             )
     # These megatron-bridge LoRA fields change the adapter shape/key layout
-    # for MoE expert layers. NeMo RL never sets them (a run always uses the
-    # bridge defaults), but a native Megatron-Bridge donor checkpoint may
-    # have; a mismatch would restore onto a different adapter layout.
+    # for MoE expert layers. Compare configured values when NeMo RL exposes
+    # them and bridge defaults otherwise; a mismatch would restore onto a
+    # different adapter layout.
     lora_field_defaults = {field.name: field.default for field in fields(LoRA)}
     for key in (
         "normalize_moe_lora",
@@ -1741,21 +1739,11 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.use_fused_weighted_squared_relu = config["megatron_cfg"][
         "use_fused_weighted_squared_relu"
     ]
-    # NeMo-RL can pack multiple expanded Omni examples into one THD tensor.
-    # Flash attention does not support the resulting padded multi-row layout,
-    # so the canonical expanded-sequence contract must use backend dispatch.
     attention_backend = config["megatron_cfg"].get("attention_backend")
     if (
         getattr(model_cfg, "nemotron_omni_contract", None)
         == _NEMOTRON_OMNI_EXPANDED_SEQUENCE_CONTRACT
     ):
-        if attention_backend == "flash":
-            raise ValueError(
-                "Nemotron Omni's expanded-sequence contract does not support "
-                "attention_backend='flash' in NeMo-RL because packed batches can "
-                "contain multiple padded THD rows. Use attention_backend='auto' "
-                "or omit the setting."
-            )
         if attention_backend is None:
             attention_backend = "auto"
 
@@ -2435,6 +2423,11 @@ def setup_model_and_optimizer(
             a2a_experimental=peft_cfg["a2a_experimental"],
             lora_dtype=peft_cfg["lora_dtype"],
         )
+        if "share_expert_adapters" in peft_cfg:
+            peft = replace(
+                peft,
+                share_expert_adapters=peft_cfg["share_expert_adapters"],
+            )
         # Resolve and validate the warm-start donor checkpoint up front so a
         # bad path or mismatched donor fails before any model construction.
         peft_restore_dir = None
@@ -2767,6 +2760,11 @@ def setup_reference_model_state(
             a2a_experimental=peft_cfg["a2a_experimental"],
             lora_dtype=peft_cfg["lora_dtype"],
         )
+        if "share_expert_adapters" in peft_cfg:
+            peft = replace(
+                peft,
+                share_expert_adapters=peft_cfg["share_expert_adapters"],
+            )
     else:
         peft = None
 
