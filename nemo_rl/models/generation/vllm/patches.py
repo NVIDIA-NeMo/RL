@@ -21,9 +21,11 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import torch
 
-from nemo_rl.models.generation.vllm.config import (
-    VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
-)
+# Keep this module free of top-level NeMo RL imports:
+# tools/external_gym_vllm/serve_vllm_on_ray.py loads it by path in serving
+# containers that do not install NeMo RL's training dependency stack.
+
+VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR = "NRL_VLLM_FP32_LM_HEAD"
 
 
 def _get_vllm_file(relative_path: str) -> str:
