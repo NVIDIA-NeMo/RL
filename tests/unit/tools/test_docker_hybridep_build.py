@@ -66,20 +66,26 @@ def test_docker_images_build_deepep_with_multinode_hybridep() -> None:
         )
 
         if uses_uv_cache_seed:
-            cache_key_line = next(
+            # The uv download cache lives on a BuildKit cache mount (never part of
+            # any image layer); its `id=` is the cache's identity, so it must
+            # incorporate BASE_IMAGE/UV_VERSION/HYBRID_EP_MULTINODE the same way
+            # the old CACHE_KEY computation did, or a single-node-built DeepEP
+            # wheel could get silently reused for a multi-node build.
+            cache_mount_line = next(
                 (
                     line
                     for line in lines
-                    if line.startswith("CACHE_KEY=")
-                    and "BASE_IMAGE" in line
-                    and "UV_VERSION" in line
+                    if "--mount=type=cache" in line
+                    and "id=uv-cache-" in line
+                    and "${BASE_IMAGE}" in line
+                    and "${UV_VERSION}" in line
                 ),
                 None,
             )
-            assert cache_key_line is not None, (
-                f"{dockerfile} does not define the uv seed cache key"
+            assert cache_mount_line is not None, (
+                f"{dockerfile} does not define a uv cache mount keyed on the base image and uv version"
             )
-            assert "HYBRID_EP_MULTINODE" in cache_key_line, (
+            assert "${HYBRID_EP_MULTINODE}" in cache_mount_line, (
                 f"{dockerfile} can reuse a single-node DeepEP wheel"
             )
             actor_prefetch_end = "done < /opt/actor_venvs.tsv"

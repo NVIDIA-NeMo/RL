@@ -188,12 +188,60 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "TRT-LLM caches use $BASE_IMAGE on $ARCH (key $CACHE_KEY)"
 
-      - name: Resolve uv cache seed
-        id: uv_cache_seed
+      - name: Resolve uv cache configuration
+        id: uv_cache
         if: inputs.uv-cache-tag != ''
         shell: bash
         env:
-          UV_CACHE_TAG: ${{ inputs.uv-cache-tag }}
+          BUILD_ARGS: ${{ inputs.build-args }}
+          TAG_PREFIX: ${{ inputs.uv-cache-tag }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          PLATFORM: ${{ inputs.platform }}
+        run: |
+          set -euo pipefail
+
+          # A stale seed is only safe to import if it was built from the same
+          # BASE_IMAGE/UV_VERSION/HYBRID_EP_MULTINODE combination -- otherwise the
+          # registry-pulled native wheels can be ABI-incompatible with this build's
+          # CUDA/compiler environment. Key the seed tag by all three, mirroring how
+          # the TRT-LLM ccache/wheel-cache tags are keyed by BASE_IMAGE above.
+          resolve_arg() {
+            local name="$1"
+            local value
+            value=$(printf '%s\n' "$BUILD_ARGS" | sed -nE "s/^[[:space:]]*${name}[[:space:]]*=[[:space:]]*(.+)[[:space:]]*\$/\1/p" | tail -1)
+            if [[ -z "$value" ]]; then
+              value=$(sed -nE "s/^[[:space:]]*ARG[[:space:]]+${name}[[:space:]]*=[[:space:]]*(.+)[[:space:]]*\$/\1/p" "$DOCKERFILE" | tail -1)
+            fi
+            printf '%s' "$value"
+          }
+
+          BASE_IMAGE=$(resolve_arg BASE_IMAGE)
+          UV_VERSION=$(resolve_arg UV_VERSION)
+          HYBRID_EP_MULTINODE=$(resolve_arg HYBRID_EP_MULTINODE)
+          for name_value in "BASE_IMAGE=$BASE_IMAGE" "UV_VERSION=$UV_VERSION" "HYBRID_EP_MULTINODE=$HYBRID_EP_MULTINODE"; do
+            if [[ -z "${name_value#*=}" ]]; then
+              echo "Could not resolve ${name_value%%=*} from build args or $DOCKERFILE" >&2
+              exit 1
+            fi
+          done
+
+          ARCH="${PLATFORM#*/}"
+          ARCH="${ARCH%%/*}"
+          if [[ -z "$ARCH" || "$PLATFORM" != */* || "$PLATFORM" == *,* ]]; then
+            echo "Expected a single OS/architecture platform, got: $PLATFORM" >&2
+            exit 1
+          fi
+
+          CACHE_KEY=$(printf '%s' "${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE}" | sha256sum | cut -c1-12)
+          echo "tag=${TAG_PREFIX}-${ARCH}-${CACHE_KEY}" >> "$GITHUB_OUTPUT"
+          echo "uv cache uses $BASE_IMAGE / uv $UV_VERSION / HYBRID_EP_MULTINODE=$HYBRID_EP_MULTINODE on $ARCH (key $CACHE_KEY)"
+
+      - name: Resolve uv cache seed
+        id: uv_cache_seed
+        if: steps.uv_cache.outputs.tag != ''
+        shell: bash
+        env:
+          UV_CACHE_TAG: ${{ steps.uv_cache.outputs.tag }}
         run: |
           set -euo pipefail
 
@@ -504,7 +552,7 @@ jobs:
         # image itself. Replaces the old post-build docker-cp extraction, which
         # was also main-only; keep that restriction so PR builds don't refresh
         # the shared cache from build-arg variations (SKIP_*_BUILD, etc.).
-        if: ${{ always() && !cancelled() && inputs.uv-cache-tag != '' && github.ref == 'refs/heads/main' }}
+        if: ${{ always() && !cancelled() && steps.uv_cache.outputs.tag != '' && github.ref == 'refs/heads/main' }}
         uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
           file: ${{ inputs.dockerfile }}
@@ -522,5 +570,5 @@ jobs:
             ${{ steps.recent_pr_cache_refs.outputs.cache-from }}
           no-cache: false
           provenance: false
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.uv-cache-tag }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.uv_cache.outputs.tag }}
           target: uv-cache

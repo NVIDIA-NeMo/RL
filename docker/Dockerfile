@@ -26,6 +26,11 @@
 #   --build-arg BUILD_DYNAMO=1
 
 ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.05-cuda13.2-devel-ubuntu24.04
+# Global so every stage's uv cache mount id (BASE_IMAGE-UV_VERSION-HYBRID_EP_MULTINODE)
+# can redeclare it bare and stay in sync -- a single-node-built DeepEP wheel is not
+# safe to reuse for a multi-node build, so this must be part of the cache identity,
+# not just a fixed hermetic-stage ENV.
+ARG HYBRID_EP_MULTINODE=1
 FROM scratch AS nemo-rl
 ARG NRL_GIT_REF=main
 ADD --keep-git-dir=true https://github.com/NVIDIA-NeMo/RL.git#${NRL_GIT_REF} /
@@ -173,6 +178,7 @@ ARG SKIP_SGLANG_BUILD
 ARG SKIP_TRTLLM_BUILD
 ARG BASE_IMAGE
 ARG UV_VERSION
+ARG HYBRID_EP_MULTINODE
 ARG TARGETARCH
 ARG TRTLLM_CCACHE_MAXSIZE=20G
 ARG TRTLLM_BUILD_JOBS=24
@@ -226,7 +232,7 @@ COPY --from=nemo-rl --link \
     3rdparty/ ./3rdparty/
 
 RUN --mount=type=ssh \
-    --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
+    --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
 # /root/.uv-cache-store is a BuildKit cache mount: durable across builds on
 # this id (seeded from the :uv-cache registry image on first-ever use), but
 # never part of this or any layer's diff by construction. uv's installs below
@@ -342,7 +348,7 @@ RUN --mount=type=ssh \
     --mount=type=bind,from=trtllm-ccache-seed,source=.,target=/tmp/trtllm-ccache-seed \
     --mount=type=cache,id=trtllm-wheel-cache-${TARGETARCH}-${BASE_IMAGE},from=trtllm-wheel-cache-seed,source=.,target=/root/.cache/trtllm-wheels,sharing=locked \
     --mount=type=cache,id=trtllm-ccache-${TARGETARCH}-${BASE_IMAGE},target=/root/.cache/ccache,sharing=locked \
-    --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
+    --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
 # Same materialize/sync-back/delete dance as the dependency-install RUN above,
 # repeated here because a BuildKit cache mount only applies to the RUN
 # instruction it's declared on -- this RUN's own uv sync calls below
@@ -471,6 +477,7 @@ FROM hermetic AS release
 # Re-declare build args for this stage
 ARG BASE_IMAGE
 ARG UV_VERSION
+ARG HYBRID_EP_MULTINODE
 ARG BUILD_DYNAMO
 ARG DYNAMO_PYTHON_VERSION=3.12.11
 ARG ETCD_VERSION=v3.5.21
@@ -508,7 +515,7 @@ COPY --from=nemo-rl --exclude=pyproject.toml --exclude=uv.lock . /opt/nemo-rl
 
 # Keep Dynamo's Python 3.12 dependency graph isolated from NeMo-RL's normal
 # Ray/vLLM environments. Default image builds do not create this environment.
-RUN --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu -o pipefail
+RUN --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu -o pipefail
 if [[ "${BUILD_DYNAMO:-0}" != "1" ]]; then
     echo "BUILD_DYNAMO is not 1; skipping the managed Dynamo runtime"
     exit 0
@@ -526,7 +533,7 @@ EOF
 # Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),
 # so do a quick check before trying to unshallow.
 RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
-RUN --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
+RUN --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
 # Same materialize/sync-back/delete dance as the dependency-install and
 # TRT-LLM RUNs -- this RUN's uv run/prefetch_venvs.py call below also needs
 # the plain, same-filesystem /root/.cache/uv to hardlink installs from.
@@ -571,7 +578,7 @@ EOF
 # RL's torch/nvidia stack. UV_TORCH_BACKEND keeps torch on the same CUDA backend.
 ARG NEMO_GYM_CUDA=cu130
 ARG NEMO_GYM_VLLM_VERSION=0.25.1
-RUN --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
+RUN --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
 if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
     # Same materialize/sync-back/delete dance as the other uv-writing RUNs.
     # The outer `uv run` here is symlink-mode (safe across the mount), but
@@ -632,9 +639,10 @@ FROM base AS uv-cache-export
 ARG BASE_IMAGE
 ARG TARGETARCH
 ARG UV_VERSION
+ARG HYBRID_EP_MULTINODE
 ARG UV_CACHE_EXPORT_NONCE
 RUN --mount=type=bind,from=uv-cache-seed,source=.,target=/tmp/uv-cache-seed \
-    --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
+    --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
 echo "Exporting uv cache for build ${UV_CACHE_EXPORT_NONCE:-local}"
 # The hermetic layer may have been reused from BuildKit without executing its
 # RUN command, leaving this builder-local mount empty. Restore the seed only in
