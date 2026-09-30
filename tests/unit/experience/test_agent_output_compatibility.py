@@ -220,14 +220,14 @@ def test_simple_actual_run_returns_common_history(
     captured: Any, compact: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     oracle = []
-    original_finish = ContextManagedResponsesClient.finish
+    original_create = ContextManagedResponsesClient.create
 
-    def observe_finish(client: Any, *args: Any, **kwargs: Any) -> Any:
-        result = original_finish(client, *args, **kwargs)
-        oracle.append(result)
-        return result
+    async def observe_create(client: Any, *args: Any, **kwargs: Any) -> Any:
+        response = await original_create(client, *args, **kwargs)
+        oracle.append(response.id)
+        return response
 
-    monkeypatch.setattr(ContextManagedResponsesClient, "finish", observe_finish)
+    monkeypatch.setattr(ContextManagedResponsesClient, "create", observe_create)
     captured.queue.extend(
         [tool_message(1), tool_message(2), {"role": "assistant", "content": "done"}]
     )
@@ -250,11 +250,9 @@ def test_simple_actual_run_returns_common_history(
     ordinary = deepcopy(result)
     assert "context_compaction_result" not in ordinary
     manifest = captured.harness.manifest("dispatch_g0")
-    # Membership is computed before consulting the old dedicated result oracle.
+    # Compare reconstructed membership to independently observed accepted calls.
     selected = selected_response_ids(manifest.records, ordinary["response"])
-    assert selected == tuple(
-        action.response_id for action in oracle[0].selected_actions
-    )
+    assert selected == tuple(oracle)
     assert sum(r.parent_call_id is None for r in manifest.records) == (
         2 if compact else 1
     )

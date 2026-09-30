@@ -157,9 +157,11 @@ def test_twenty_turn_shared_client_to_replay_and_advantages(
                 ),
             )
             selected = []
+            accepted_ids = []
             accepted_output = []
             for turn in range(20):
                 response = await client.create()
+                accepted_ids.append(response.id)
                 accepted_output.extend(response.model_dump(mode="json")["output"])
                 selected.append(1000 + len(harness.worker_calls))
                 if turn < 19:
@@ -172,8 +174,8 @@ def test_twenty_turn_shared_client_to_replay_and_advantages(
                             }
                         ]
                     )
-            result = client.finish(response)
-            assert len(result.selected_actions) == 20
+            client.finish(response)
+            assert len(accepted_ids) == 20
             manifest = RolloutManifest.model_validate(
                 await harness.ledger.manifest(f"group_g{owner}")
             )
@@ -188,6 +190,7 @@ def test_twenty_turn_shared_client_to_replay_and_advantages(
                 },
             )
             receipts.append(processed["receipt"])
+            assert processed["logical_selection"].response_ids == tuple(accepted_ids)
             selections.append(processed["logical_selection"])
             rewards.append(processed["full_result"]["reward"])
             expected_tokens.append(selected)
