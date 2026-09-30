@@ -711,7 +711,8 @@ def create_vllm_refit_adapter(
         if not capabilities.local_shard_loader:
             missing.append("make_online_process_loader(layer, param_name)")
         raise VllmRefitCompatibilityError(
-            "vLLM does not expose the required native refit APIs: " + ", ".join(missing)
+            "vLLM does not expose the required layerwise reload/native refit APIs: "
+            + ", ".join(missing)
         )
     return VllmLayerwiseRefitAdapter(
         model_runner=model_runner,
