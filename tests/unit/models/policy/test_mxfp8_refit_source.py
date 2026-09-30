@@ -312,9 +312,7 @@ def test_extract_native_mxfp8_components_accepts_canonical_te_e4m3_dtype() -> No
 
 def test_extract_native_mxfp8_components_rejects_canonical_te_e5m2_dtype() -> None:
     with pytest.raises(ValueError, match="E4M3"):
-        extract_native_mxfp8_components(
-            _source(fp8_dtype=CanonicalDType.kFloat8E5M2)
-        )
+        extract_native_mxfp8_components(_source(fp8_dtype=CanonicalDType.kFloat8E5M2))
 
 
 def test_extract_native_mxfp8_components_requires_te_binding(
