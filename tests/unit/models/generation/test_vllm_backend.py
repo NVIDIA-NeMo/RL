@@ -300,9 +300,7 @@ def test_refresh_hpc_modules_after_layerwise_reload(monkeypatch):
 def test_batched_bf16_trtllm_layout_matches_vllm_expertwise_converter(
     monkeypatch, is_gated_act_gemm
 ):
-    from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
-        convert_moe_weights_to_flashinfer_trtllm_block_layout,
-    )
+    from vllm.model_executor.layers.fused_moe.oracle import unquantized
 
     from nemo_rl.models.generation.vllm import vllm_backend
 
@@ -334,8 +332,10 @@ def test_batched_bf16_trtllm_layout_matches_vllm_expertwise_converter(
         get_w2_perm,
     )
 
-    expected_w13, expected_w2 = convert_moe_weights_to_flashinfer_trtllm_block_layout(
-        {}, w13, w2, is_gated_act_gemm=is_gated_act_gemm
+    expected_w13, expected_w2 = (
+        unquantized.convert_moe_weights_to_flashinfer_trtllm_block_layout(
+            {}, w13, w2, is_gated_act_gemm=is_gated_act_gemm
+        )
     )
     actual_w13, actual_w2 = (
         vllm_backend._convert_bf16_moe_weights_to_trtllm_block_layout_batched(
