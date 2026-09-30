@@ -6,9 +6,10 @@
 #
 # Memory is the open risk: the training state, the generation weights, the KV
 # buffer and the CUDA graphs now live on one set of GPUs. The optimizer is
-# offloaded to host for that reason. If generation OOMs, lower
+# offloaded to host for that reason. Run length, batch sizes and sequence length
+# are inherited from the non-colocated nightly recipe. If generation OOMs, lower
 # policy.generation.mcore_generation_config.buffer_size_gb first.
-defaults: ./grpo_qwen3_30ba3b_megatron_zero_train_gen_kl.yaml
+defaults: ./recipes/llm/grpo-qwen3-30ba3b-2n4g-megatron_generation-noncolocated-zero-kl.yaml
 
 policy:
   megatron_cfg:
@@ -30,3 +31,11 @@ policy:
 cluster:
   gpus_per_node: 4
   num_nodes: 1
+
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-1n4g-megatron_generation-colocated-zero-kl
+
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-1n4g-megatron_generation-colocated-zero-kl
+  wandb:
+    name: grpo-qwen3-30ba3b-1n4g-megatron_generation-colocated-zero-kl

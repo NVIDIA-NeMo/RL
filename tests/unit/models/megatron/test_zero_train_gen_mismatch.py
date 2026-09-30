@@ -24,7 +24,7 @@ from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 CONFIGS_DIR = Path(__file__).resolve().parents[4] / "examples" / "configs"
 
 ZERO_KL_EXEMPLARS = [
-    "grpo_qwen3_30ba3b_megatron_zero_train_gen_kl.yaml",
+    "recipes/llm/grpo-qwen3-30ba3b-2n4g-megatron_generation-noncolocated-zero-kl.yaml",
     "grpo_qwen3_30ba3b_megatron_zero_train_gen_kl_colocated.yaml",
 ]
 

@@ -1,13 +1,78 @@
-defaults: ../../grpo_qwen3_30ba3b_megatron_zero_train_gen_kl.yaml
+# Qwen3-30B-A3B (bf16) GRPO with zero train/generation KL.
+# Non-colocated Megatron inference, 2 nodes x 4 GPUs (one training node, one
+# dedicated generation node). Only the zero-KL deltas on top of the Qwen3-30B
+# base config live here.
+defaults: ../../grpo_math_qwen30ba3b_megatron.yaml
+
 grpo:
-  max_num_steps: 3
+  max_num_steps: 5
   num_prompts_per_step: 8
   num_generations_per_prompt: 4
+
 checkpointing:
   checkpoint_dir: results/grpo-qwen3-30ba3b-2n4g-megatron_generation-noncolocated-zero-kl
+
 policy:
   train_global_batch_size: 32
   max_total_sequence_length: 2048
+  # Packing / dynamic batching make a token's numerics depend on its neighbours.
+  sequence_packing:
+    enabled: false
+  dynamic_batching:
+    enabled: false
+
+  megatron_cfg:
+    # Resolves batch_invariant_mode, flash attention 4, te_native backend,
+    # ordered collective, unfused MoE permute, raw logprobs and no chunked
+    # prefill. The values below that the base config sets differently are
+    # restated so the resolver does not warn about overriding them.
+    zero_train_gen_mismatch: true
+    moe_permute_fusion: false
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1 # batch-invariant mode rejects CP
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 4
+    sequence_parallel: true
+    moe_token_dispatcher_type: alltoall
+    moe_router_dtype: fp32 # matches generation; the base default is fp64
+    defer_fp32_logits: true
+    activation_checkpointing: true # memory only: 30B on one 4-GPU node
+    cuda_graph_impl: none # training side
+
+  generation:
+    backend: megatron
+    refit_transport: mcore # required for mcore_generation_config.refit_backend
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: ${cluster.gpus_per_node}
+        num_nodes: 1
+    mcore_generation_config:
+      transformer_impl: inference_optimized
+      moe_router_dtype: fp32
+      # Raw (unprocessed) logprobs, matching the raw log_softmax used for scoring.
+      logprobs_mode: raw_logprobs
+      enable_chunked_prefill: false
+      enable_prefix_caching: false
+      # vLLM fused MoE pairs with training's TE grouped GEMM (te_native).
+      inference_grouped_gemm_backend: vllm
+      inference_moe_token_dispatcher_type: nvls
+      refit_backend: nccl
+
+      # Generation CUDA graphs.
+      cuda_graph_impl: local
+      inference_cuda_graph_scope: block
+      cuda_graph_sizing_distribution: hybrid
+      cuda_graph_max_tokens: 512
+      num_cuda_graphs: -1
+      use_cuda_graphs_for_non_decode_steps: true
+      moe_pad_experts_for_cuda_graph_inference: false
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 2
+
 logger:
   log_dir: logs/grpo-qwen3-30ba3b-2n4g-megatron_generation-noncolocated-zero-kl
   wandb:
