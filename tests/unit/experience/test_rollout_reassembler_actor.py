@@ -124,6 +124,33 @@ def test_finalizer_forwards_mooncake_checkpoint_commands(
     dispatch.assert_called_once_with(command)
 
 
+@pytest.mark.parametrize("capture_media", [False, True])
+def test_actor_forwards_capture_media_to_the_reassembler(
+    capture_media: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The media capability is an explicit constructor value end to end:
+    setup -> actor config -> RolloutReassembler -> its TQ source/sink."""
+    actor_cls = RolloutReassemblerActor.__ray_metadata__.modified_class
+    monkeypatch.setattr(
+        actor_module, "build_data_plane_client", lambda cfg, bootstrap: MagicMock()
+    )
+    config = RolloutReassemblerActorConfig(
+        partition_id="canonical",
+        staging_partition="staging",
+        pad_token_id=0,
+        router_replay_enabled=False,
+        defer_routed_experts_to_policy=False,
+        max_seq_len=4096,
+        capture_media=capture_media,
+    )
+    actor = object.__new__(actor_cls)
+    actor.__init__({"enabled": True, "impl": "transfer_queue"}, config)
+    finalizer = actor._finalizer
+    assert finalizer._capture_media is capture_media
+    assert finalizer._source._capture_media is capture_media
+    assert finalizer._staging._capture_media is capture_media
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -196,6 +223,7 @@ def test_factory_selects_gym_environment_and_waits_for_dependencies(
         router_replay_enabled=False,
         defer_routed_experts_to_policy=False,
         max_seq_len=4096,
+        capture_media=False,
     )
     dp_config = {"enabled": True, "impl": "transfer_queue", "backend": "simple"}
     actors = [MagicMock(), MagicMock()]
