@@ -279,6 +279,7 @@ def test_request_capture_round_trip_stages_and_rides_coords(
     )
     VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11, 12])
     content = _served_content([13, 14], [-0.1, -0.2])
+    content["choices"][0]["routed_experts"] = None  # vLLM's choice-level field
     message = content["choices"][0]["message"]
     if with_message_tokens:
         # The HTTP serializer preserves these dynamic fields on the message.

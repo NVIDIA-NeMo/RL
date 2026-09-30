@@ -682,6 +682,7 @@ class VllmAsyncGenerationWorkerImpl(
         )
         for choice in content.get("choices") or []:
             choice.pop("logprobs", None)
+            choice.pop("routed_experts", None)
             # Token arrays and delta-aligned routes were staged to TQ above;
             # remove the serializer's message fields before the worker->gate hop.
             message = choice.get("message")
@@ -1020,11 +1021,20 @@ class VllmAsyncGenerationWorkerImpl(
                     )
 
                 final_res = None
+                capture_routes = id(request) in worker_self._capture_calls
 
                 async def capture_result_generator():
                     nonlocal final_res
                     async for res in result_generator:
                         final_res = res
+                        if capture_routes:
+                            # vLLM encodes choice-level routes in its response.
+                            # Keep engine arrays for our native capture, and
+                            # hide them only in the superclass's shallow view.
+                            res = copy.copy(res)
+                            res.outputs = [copy.copy(output) for output in res.outputs]
+                            for output in res.outputs:
+                                output.routed_experts = None
                         yield res
 
                 response = await super().chat_completion_full_generator(
@@ -1052,7 +1062,7 @@ class VllmAsyncGenerationWorkerImpl(
                         device=torch.device("cpu"),
                         logger=LOGGER,
                         routed_experts_dtype=worker_self.routed_experts_dtype,
-                        encode_for_wire=id(request) not in worker_self._capture_calls,
+                        encode_for_wire=not capture_routes,
                     )
 
                 return response
