@@ -1,5 +1,5 @@
 #!/bin/bash
-# Three-step GB200 test for zero train/generation KL on Qwen3-30B-A3B: Megatron
+# Five-step GB200 test for zero train/generation KL on Qwen3-30B-A3B: Megatron
 # training (TP1, EP4) against non-colocated Megatron inference with the
 # batch-invariant kernel stack (te_native GEMMs, ordered collectives, FA4).
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
@@ -8,10 +8,10 @@ source $SCRIPT_DIR/common.env
 # ===== BEGIN CONFIG =====
 NUM_NODES=2
 GPUS_PER_NODE=4
-STEPS_PER_RUN=3
-MAX_STEPS=3
+STEPS_PER_RUN=5
+MAX_STEPS=5
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=15
+NUM_MINUTES=90
 SNAPSHOT_MEGATRON_BRIDGE=1
 # ===== END CONFIG =====
 
