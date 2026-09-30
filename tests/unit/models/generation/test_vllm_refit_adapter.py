@@ -1419,7 +1419,7 @@ def test_layerwise_native_cuda_dense_and_routed_refit_preserves_runtime_pointers
     from unittest.mock import patch
 
     from vllm.config import VllmConfig, set_current_vllm_config
-    from vllm.model_executor.layers.fused_moe import FusedMoE
+    from vllm.model_executor.layers.fused_moe import FusedMoEFactory
     from vllm.model_executor.layers.linear import MergedColumnParallelLinear
     from vllm.model_executor.layers.quantization.modelopt import (
         ModelOptMxFp8Config,
@@ -1459,7 +1459,7 @@ def test_layerwise_native_cuda_dense_and_routed_refit_preserves_runtime_pointers
                 prefix="model.layers.0.mlp.gate_up_proj",
                 disable_tp=True,
             )
-            mlp.experts = FusedMoE(
+            mlp.experts = FusedMoEFactory(
                 num_experts=2,
                 top_k=1,
                 hidden_size=hidden_size,
