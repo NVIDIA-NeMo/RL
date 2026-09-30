@@ -68,3 +68,42 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 uv run tests/check_metrics.py $JSON_METRICS \
   'data["train/loss"]["3"] < 5'
+
+# Step 3: native chat with a distinct SmolLM2 student vocabulary. The ChatML
+# history override preserves reasoning and tools on both sides, while their
+# different token boundaries exercise many-to-one and one-to-many alignment.
+CHAT_DIR="$EXP_DIR/native_chat"
+CHAT_DATA_PATH="$CHAT_DIR/train.jsonl"
+CHAT_PROJ_DIR="$CHAT_DIR/projection"
+CHAT_PROJ_PATH="$CHAT_PROJ_DIR/smol_qwen_special.pt"
+CHAT_LOG_DIR="$CHAT_DIR/logs"
+CHAT_METRICS="$CHAT_DIR/metrics.json"
+mkdir -p "$CHAT_PROJ_DIR" "$CHAT_LOG_DIR"
+
+uv run tests/functional/xtoken_native_chat.py "$CHAT_DATA_PATH"
+# Qwen3-1.7B uses the same vocabulary as the pinned Qwen3-4B tokenizer in the
+# chat config. SmolLM2 has its own, substantially smaller vocabulary.
+uv run python -m tools.x_token.minimal_projection_via_multitoken \
+    --student-model HuggingFaceTB/SmolLM2-135M-Instruct \
+    --teacher-model Qwen/Qwen3-4B \
+    --top-k 4 \
+    --enable-special-token-mapping \
+    --enable-exact-match \
+    --disable-reverse-pass \
+    --disable-scale-trick \
+    --output-filename smol_qwen \
+    --output-dir "$CHAT_PROJ_DIR"
+
+uv run coverage run -a --data-file="$PROJECT_ROOT/tests/.coverage" --source="$PROJECT_ROOT/nemo_rl" \
+    examples/run_xtoken_off_policy_distillation.py \
+    --config tests/functional/xtoken_native_chat.yaml \
+    teachers.0.aligner.projection_matrix_path="$CHAT_PROJ_PATH" \
+    data.train.data_path="$CHAT_DATA_PATH" \
+    logger.log_dir="$CHAT_LOG_DIR" \
+    "$@" \
+    2>&1 | tee "$CHAT_DIR/run.log"
+
+uv run tests/json_dump_tb_logs.py "$CHAT_LOG_DIR" --output_path "$CHAT_METRICS"
+uv run tests/check_metrics.py "$CHAT_METRICS" \
+    'len(data["train/loss"]) >= 3' \
+    'all_finite(data["train/loss"])'
