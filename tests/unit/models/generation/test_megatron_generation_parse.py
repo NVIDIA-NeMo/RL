@@ -387,10 +387,6 @@ def test_http_server_port_reservation(monkeypatch):
             [],
             id="num-replicas-forwarded",
         ),
-        # The server defaults for fields a chat request omits come from the
-        # policy config, so MCore never falls back to the model's
-        # generation_config.json (e.g. Qwen3's top_k=20), which would sample
-        # off-policy.
         pytest.param(
             {},
             {"temperature": 0.7, "top_p": None, "top_k": None},

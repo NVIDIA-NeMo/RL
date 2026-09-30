@@ -94,8 +94,6 @@ def test_replace_prefix_tokens_without_tokenizer_uses_explicit_eos():
 @pytest.mark.parametrize(
     ("model_prefix", "template_prefix", "template", "eos_token_id", "expected"),
     [
-        # splice_prefix_tokens accepts eos_token_id itself, not only via
-        # replace_prefix_tokens.
         pytest.param(
             [100, 2],
             [9, 2],
@@ -106,8 +104,6 @@ def test_replace_prefix_tokens_without_tokenizer_uses_explicit_eos():
             ),
             id="single-eos-id",
         ),
-        # Megatron-LM ships the model's full EOS set; any member marks a turn
-        # boundary. Here the model stopped on the template's own terminator ...
         pytest.param(
             [100, 2],
             [9, 2],
@@ -118,8 +114,6 @@ def test_replace_prefix_tokens_without_tokenizer_uses_explicit_eos():
             ),
             id="eos-set",
         ),
-        # ... and here on a different declared EOS: its exact id survives the
-        # splice, so the prompt still starts with the model's tokens.
         pytest.param(
             [100, 11],
             [9, 2],

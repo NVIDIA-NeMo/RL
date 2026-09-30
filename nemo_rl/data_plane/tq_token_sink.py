@@ -107,8 +107,6 @@ _MEDIA_INDEX_DTYPES = (torch.int32, torch.int64)
 
 # offload_params sub-dict the Megatron preparer writes and the stager reads.
 MINF_CAPTURE_PARAMS_FIELD = "ng_capture_minf"
-# How many media items the parent chain already staged; the stager slices
-# MInf's media_tensors at that boundary so each row holds only new media.
 MEDIA_PREV_COUNT_KEY = "media_prev_count"
 
 STAGING_FIELDS = [
@@ -642,8 +640,6 @@ def _media_columns(
     for name, column in MEDIA_TENSOR_COLUMNS.items():
         tensor = tensors[name]
         if tensor is None:
-            # Only absent media or optional frame counts use sentinels; a
-            # missing required tensor was rejected by validate_media_tensors.
             columns[column] = sentinels[name].unsqueeze(0)
         else:
             columns[column] = tensor.detach().cpu().contiguous().unsqueeze(0)
@@ -774,11 +770,7 @@ class TQTokenSource:
     ) -> None:
         self._store = TQStagingStore(dp_client, staging_partition=staging_partition)
         self._staging_partition = staging_partition
-        # Mirrors the partition schema: only a media-enabled partition has the
-        # flag/tensor columns, so selection is gated rather than probed. Must
-        # match the sink's ``capture_media`` for the same partition: the
-        # ``media_count`` this source reports (and so the Megatron preparer's
-        # ``media_prev_count``) is only computed when it is True.
+        # Must match the sink's ``capture_media`` for the same partition.
         self._capture_media = capture_media
 
     def fetch(self, staging_keys: list[str]) -> list[StagedCallBaseSnapshot]:

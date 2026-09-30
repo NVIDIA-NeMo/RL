@@ -1029,8 +1029,6 @@ def _load_opd_full_teacher_lm_heads(
 
 
 _MINF_MEDIA_PAYLOAD_FIELDS = ("media_tensors",)
-# Request-metadata keys of Megatron-LM's expanded-prefix stitching contract,
-# which the Megatron prompt preparer fills in.
 _MINF_PREFIX_STITCHING_FIELDS = (
     "PREFIX_MEDIA_COUNT_FIELD",
     "PREFIX_EXPANDED_TOKEN_COUNT_FIELD",
@@ -1049,12 +1047,9 @@ def _require_minf_media_payload_fields() -> None:
     than training image-blind or failing mid-rollout.
     """
     try:
-        # Deferred import: megatron-core is a heavy, optional dependency that the
-        # driver venv may not carry at all.
+        # Deferred import: megatron-core is a heavy, optional dependency.
         from megatron.core.inference import inference_request
     except ImportError:
-        # The worker-side guard in MegatronGenerationMixin.setup_token_capture
-        # still fails loudly when the engine lacks the capture hooks.
         return
     present = {
         field.name
@@ -1989,8 +1984,6 @@ def setup_single_controller(
             include_multimodal_fields=processor is not None,
         )
     if token_capture_cfg.enabled:
-        # Both active backends stage canonical Gym rows, and captured media
-        # beside them (capture_media), in serving workers.
         generation.setup_token_capture(
             dp_config,
             token_capture_cfg.staging_partition,

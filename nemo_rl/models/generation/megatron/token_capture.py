@@ -118,10 +118,7 @@ class TQMegatronPromptPreparer:
                 chain's.
             TypeError: The prompt is not a token-id list.
         """
-        # Deferred because the prompt preparer is optional and requires
-        # Megatron-LM's inference capture hooks. The two field names
-        # are the request-metadata keys the Megatron chat endpoint writes when
-        # it defers the prefix splice to this preparer.
+        # Deferred import: megatron-core is a heavy, optional dependency.
         from megatron.core.inference import inference_request
         from megatron.core.inference.inference_request import (
             PREFIX_EOS_TOKEN_ID_FIELD,
@@ -143,11 +140,6 @@ class TQMegatronPromptPreparer:
 
         admission = CaptureAdmission.model_validate(capture_payload)
         if admission.mode == "text":
-            # The chat endpoint reports the history's media count whenever an
-            # assistant turn preceded by media exists, whether or not a staged
-            # prefix is spliced here. With nothing spliced the engine must
-            # expand every placeholder itself, and the stitching contract has
-            # no "no prefix" value other than omitting the media-count key.
             media_count_field = getattr(
                 inference_request, "PREFIX_MEDIA_COUNT_FIELD", None
             )
@@ -176,8 +168,6 @@ class TQMegatronPromptPreparer:
         updated_offload_params[NG_CAPTURE_FIELD] = updated_admission.model_dump(
             mode="json"
         )
-        # The stager slices MInf's whole-conversation media_tensors at this
-        # count so each row stages only the media new to this call.
         updated_offload_params[MINF_CAPTURE_PARAMS_FIELD] = {
             **(updated_offload_params.get(MINF_CAPTURE_PARAMS_FIELD) or {}),
             MEDIA_PREV_COUNT_KEY: chains.media_count,
@@ -200,10 +190,6 @@ class TQMegatronPromptPreparer:
                 or any(type(token_id) is not int for token_id in eos_token_ids)
             ):
                 raise ValueError("MInf capture request carries no valid EOS token ids")
-            # Same splice as the vLLM worker (vllm_worker_async.py), with the
-            # exact expanded prefix: for a multimodal prefix the engine splits
-            # it back off at _prefix_expanded_token_count (set below) and
-            # expands only the media placeholders after it.
             prompt = replace_prefix_tokens(
                 tokenizer=None,
                 model_prefix_token_ids=prefix_token_ids,
@@ -218,10 +204,6 @@ class TQMegatronPromptPreparer:
 
         if prompt[: len(prefix_token_ids)] != prefix_token_ids:
             raise ValueError("MInf failed to apply the authorized token prefix")
-        # When earlier turns carried media, the endpoint reports how many and
-        # the engine expands only what follows the expanded prefix. Megatron-LM
-        # pins without expanded-prefix stitching define neither key; setup
-        # refuses media capture on them.
         media_count_field = getattr(inference_request, "PREFIX_MEDIA_COUNT_FIELD", None)
         endpoint_media_count = (
             updated_offload_params.get(media_count_field) if media_count_field else None
@@ -321,9 +303,6 @@ def slice_media_tensors(
 class _MegatronCapturePayload:
     """The MInf offloaded payload plus the worker-side context Gym's adapter reads."""
 
-    # Copied raw off the engine payload (nominally list[int] / list[float] or
-    # None); Gym's MegatronCaptureAdapter validates element types so a
-    # malformed payload poisons the call instead of being coerced here.
     prompt_token_ids: Any
     generated_token_ids: Any
     generated_log_probs: Any
@@ -512,15 +491,6 @@ class TQMegatronTokenStager:
         )
         from nemo_gym.token_id_capture import NG_COMMIT_COORDS_FIELD
 
-        # Gym's MegatronCaptureAdapter reads prompt/generated ids and log
-        # probs off the offloaded payload; this call's media delta rides
-        # beside them as attachments. A malformed payload poisons
-        # the call with ``capture_failed`` coordinates (surfacing in Gym as
-        # ``worker_capture_failed``, matching vLLM) instead of raising here,
-        # which would leave Gym with no coordinates at all. The payload view
-        # is derived before Gym's extraction (media delta slicing and the
-        # preparer's counts), so its failures are routed through the same
-        # poison path explicitly.
         try:
             capture_payload_view = _MegatronCapturePayload.from_offloaded(
                 payload, minf_params
@@ -534,9 +504,6 @@ class TQMegatronTokenStager:
                     NG_COMMIT_COORDS_FIELD: coords.model_dump(mode="json")
                 }
             )
-        # Gym's record cannot carry tensors; they ride beside it as opaque
-        # attachments and land in the same put as the token columns
-        # (TQTokenSink.stage). None means a text call.
         coords = self._capture.complete_call_from_response(
             call,
             capture_payload_view,

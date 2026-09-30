@@ -181,8 +181,6 @@ def splice_prefix_tokens(
             )
         raise AssertionError(message)
 
-    # The template's boundary EOS stands in for the model's. With several EOS
-    # ids they can differ, so keep the one the model actually emitted.
     boundary = (
         [model_prefix_token_ids[model_cut_end]]
         if model_ended_on_eos

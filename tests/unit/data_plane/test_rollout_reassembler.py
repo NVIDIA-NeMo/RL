@@ -906,17 +906,9 @@ def test_deferred_chain_hash_corruption_rejects_the_row(
 
 
 # ── media rows ──────────────────────────────────────────────────────────────
-#
-# A media-enabled capture run (setup's ``token_capture.enabled and processor
-# is not None``) stages the engine's media beside each call's tokens through
-# ``TQTokenSink(capture_media=True)`` and publishes it on the canonical wire
-# fields. These tests drive that layer directly with the golden token fixtures
-# and hand-built packed patches; the per-backend workers are covered elsewhere.
 
 MEDIA_CANONICAL_PARTITION = "rollout_data_media_fin_test"
 MEDIA_STAGING_PARTITION = "rollout_staging_media_fin_test"
-# Pinned per partition (TQ keeps one dtype per field); bf16 like the vLLM
-# worker's engine dtype so the sentinels of text calls share the column.
 MEDIA_PIXEL_DTYPE = torch.bfloat16
 MEDIA_PATCH = 2
 
@@ -1021,8 +1013,6 @@ def _assert_staging_cleared(tq_client, staging_keys: list[str]) -> None:
 @pytest.mark.parametrize(
     ("case", "pixel_dtype"),
     [
-        # Both backends' pinned pixel dtypes round-trip the finalizer read-back
-        # and pack_payload unchanged.
         ("attached", torch.bfloat16),
         ("attached", torch.float32),
         ("two-call-chain", torch.bfloat16),

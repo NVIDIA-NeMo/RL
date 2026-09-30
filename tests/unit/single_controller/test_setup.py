@@ -292,8 +292,6 @@ _PREFIX_STITCHING_FIELDS = {
             r"lacks: OffloadedRequestPayload\.media_tensors\. Bump",
             id="payload-without-media-tensors",
         ),
-        # A pin without expanded-prefix stitching would expand every later
-        # turn's spliced media prefix twice, so it is refused at setup.
         pytest.param(
             types.SimpleNamespace(
                 OffloadedRequestPayload=_stub_offloaded_payload(
@@ -3100,8 +3098,6 @@ def test_token_capture_media_dedup_guard_reads_only_the_grpo_config(
     else:
         mc.ppo = PPOConfig.model_construct(**dict(mc.grpo))
         mc.grpo = None
-        # The minimum the PPO-path validation reads: a Megatron critic whose
-        # global batch equals num_prompts_per_step * num_generations_per_prompt.
         mc.value = {"megatron_cfg": {"enabled": True}, "train_global_batch_size": 8}
         mc.value_loss_fn = MseValueLossConfig()
         expectation = pytest.raises(_ReachedMediaGate)
@@ -3183,18 +3179,11 @@ def test_token_capture_megatron_registers_media_columns_only_for_multimodal(
         assert set(MEDIA_STAGING_FIELDS) <= fields
     else:
         assert set(MEDIA_STAGING_FIELDS).isdisjoint(fields)
-    # The finalizer learns whether a group without media may be published:
-    # in a media run it must be dropped (see RolloutReassembler.finalize_group).
     finalizer_config = mock_finalizers.call_args.args[1]
     assert finalizer_config.capture_media is multimodal
-    # The workers build their sink/source against the same schema; the handle
-    # setup hands the actor is the backend it configured, whichever factory
-    # (colocated MegatronGeneration or _build_generation) produced it.
     actor_args.gen_handle.setup_token_capture.assert_called_once_with(
         ANY, mc.token_capture.staging_partition, capture_media=multimodal
     )
-    # Only a media run consults the MInf payload fields; a text run never
-    # touches them (its stager reads token columns only).
     assert mock_media_gate.call_count == (1 if multimodal else 0)
 
 
@@ -3240,8 +3229,7 @@ def test_token_capture_megatron_media_requires_minf_media_payload_fields(
 def test_offloaded_payload_exposes_multimodal_capture_fields():
     """Pin the engine payload field the multimodal stager reads with getattr
     defaults and the prefix-stitching keys the Megatron preparer writes."""
-    # Deferred import: megatron-core is a heavy, optional dependency that the
-    # driver venv may not carry at all.
+    # Deferred import: megatron-core is a heavy, optional dependency.
     from megatron.core.inference import inference_request
 
     if not hasattr(inference_request, "RequestPayloadStager"):
@@ -3262,8 +3250,7 @@ def test_minf_image_preprocessing_emits_pinned_pixel_dtype():
     """Pin the premise behind MINF_MEDIA_PIXEL_DTYPE: MInf's wire image path
     hands the payload stager float32 packed patches, whatever the model's
     params dtype, so the Megatron worker's media column must match it."""
-    # Deferred imports: megatron-core (and its torchvision dependency for the
-    # image path) are heavy, optional dependencies of the mcore lane only.
+    # Deferred import: megatron-core is a heavy, optional dependency.
     Image = pytest.importorskip("PIL.Image")
     pytest.importorskip("torchvision")
     from megatron.core.inference.config import ImageProcessingConfig

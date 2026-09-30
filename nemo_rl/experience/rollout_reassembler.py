@@ -732,14 +732,6 @@ class RolloutReassembler:
         # (pack_payload encodes PackedTensor fields and mints row-shape tags).
         media_fields = _media_fields_for_group(rows)
         if self._capture_media and not media_fields:
-            # No valid row carried media, so this group would publish without
-            # the media columns. TQ answers a batch fetch with only the fields
-            # every requested key produced, so a train shard mixing these keys
-            # with VLM keys would lose pixel_values for the VLM rows too and
-            # run image-blind. Drop the group; only the caller can source a
-            # replacement.
-            # Distinct from the router-replay drop above so dashboards can
-            # tell the two apart.
             metrics["finalize/group_dropped_no_media"] = 1.0
             return self._drop_group(
                 group_id,

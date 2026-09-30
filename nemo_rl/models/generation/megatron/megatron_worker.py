@@ -112,12 +112,6 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
     restore_refit_info_placements,
 )
 
-# Pixel dtype of the media tensors MInf hands the payload stager. The HTTP
-# server's image/video preprocessing builds packed patches with torchvision's
-# ToTensor + Normalize (float32) and only moves them across devices before the
-# engine records them as the request's media_tensors; the vision encoder casts
-# to its weight dtype internally, so the staged copy stays float32 regardless
-# of the model's params dtype.
 MINF_MEDIA_PIXEL_DTYPE = torch.float32
 
 
@@ -293,8 +287,6 @@ class MegatronGenerationMixin:
     processor: Optional[Any] = None
     inference_model = None
     _colocated_reshard_plan = None
-    # Raw-image preprocessing the engine was built with; None when the
-    # inference wrapper is text-only (see _build_image_preprocessing_config).
     _image_preprocessing_config: Optional[Any] = None
 
     def _gen_model(self) -> MegatronModule:
@@ -762,10 +754,6 @@ class MegatronGenerationMixin:
         if "http_server_num_replicas" in gen_cfg:
             server_kwargs["num_replicas"] = int(gen_cfg["http_server_num_replicas"])
 
-        # Sampling fields a chat request omits (Gym never sends top_k) fall back
-        # to these server defaults. Left unset, newer Megatron-LM fills them
-        # from the model's generation_config.json (e.g. Qwen3's top_k=20)
-        # and sample off-policy with respect to the training logprobs.
         sampling_cfg = self.cfg["generation"]
         top_p = sampling_cfg["top_p"]
         top_k = sampling_cfg["top_k"]
@@ -1005,9 +993,6 @@ class MegatronGenerationMixin:
                 "Megatron token capture requires an initialized inference engine"
             )
         if capture_media and self._image_preprocessing_config is None:
-            # Without image preprocessing the engine never produces media
-            # tensors, so a media-enabled partition would only ever receive
-            # text sentinels; fail at setup instead of training image-blind.
             raise ValueError(
                 "Megatron media capture requires an image-capable inference wrapper "
                 "(mcore_generation_config.megatron_inference_wrapper)"

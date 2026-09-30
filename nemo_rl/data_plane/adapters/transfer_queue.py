@@ -1299,13 +1299,6 @@ class TQDataPlaneClient(DataPlaneClient):
             partition_id=partition_id,
             select_fields=select_fields,
         )
-        # TQ answers a batch fetch with only the fields *every* requested key
-        # produced and drops the rest without error (``kv_retrieve_meta``
-        # narrows to the intersection; ``select_fields`` ignores unknown
-        # names). One key that never wrote a column would therefore silently
-        # strip it from every other row of the batch -- a media-less group
-        # fetched alongside VLM groups removes their ``pixel_values``, and the
-        # forward runs image-blind. Fail here instead.
         missing = [name for name in select_fields if name not in td.keys()]
         if missing:
             raise KeyError(

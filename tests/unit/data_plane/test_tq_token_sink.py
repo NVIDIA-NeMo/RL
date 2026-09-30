@@ -661,8 +661,6 @@ def test_megatron_stager_writes_canonical_row_and_returns_coords(
         return
 
     assert fetched.snapshot.token_ids_delta == [80, 99, 99, 99, 81, 12, 2]
-    # Mask and log probs are aligned with the *expanded* delta: every media
-    # token is prompt (mask 0); only the two generated tokens train.
     assert fetched.snapshot.token_mask_delta == [0.0] * 5 + [1.0, 1.0]
     assert fetched.snapshot.generation_log_probs_delta == [0.0] * 5 + [-0.25, -0.5]
     assert (coords["prev_len"], coords["delta_len"]) == (0, 7)
@@ -1044,12 +1042,6 @@ _PREPARER_CASES = {
         0,
         None,
     ),
-    # Turn 2 of a VLM rollout: the chat endpoint renders the history in compact form
-    # (one media token per image, "a cat" retokenized as 13 not 12) and reports one
-    # image in it. The preparer splices the exact *expanded* chain, tells the engine
-    # it is 7 tokens long so only the new turn's placeholder gets expanded, and tells
-    # the stager how many media items the chain already staged. The new turn adds a
-    # second image.
     "multimodal_chain": (
         _minf_payload(multimodal=True),
         7,
@@ -1135,9 +1127,6 @@ def test_megatron_prompt_preparer_splices_resolved_prefix(
 
     if not media:
         return
-    # The engine splits the prompt at the expanded prefix, expands only image 2's
-    # placeholder, and hands the stager pixels for both images; the stager keeps
-    # only image 2's pixels (media_prev_count), and Gym verifies the expanded prefix.
     two_images = _minf_two_image_tensors()
     turn2 = stager.stage(
         "minf-response-2",
