@@ -1225,14 +1225,13 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             and fp8_config.get("enabled")
             and fp8_config.get("fp8_param")
             and fp8_config.get("fp8_recipe") == "mxfp8"
-            and ddp_config is not None
-            and ddp_config.get("overlap_param_gather")
+            and policy_megatron_cfg["optimizer"]["use_distributed_optimizer"]
         ):
             raise ValueError(
                 "Streaming PPO does not support MXFP8 parameters with "
-                "overlap_param_gather: parameter gathering shares the accumulated "
-                "gradient buffer. Disable policy.megatron_cfg."
-                "distributed_data_parallel_config.overlap_param_gather."
+                "the distributed optimizer: parameters and accumulated gradients "
+                "share storage even when overlap_param_gather=false. Disable "
+                "policy.megatron_cfg.fp8_cfg.fp8_param or use full-batch PPO."
             )
         if algo_cfg.adv_estimator.normalize_advantages:
             warnings.warn(

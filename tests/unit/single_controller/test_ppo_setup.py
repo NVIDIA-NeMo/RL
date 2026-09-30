@@ -351,9 +351,18 @@ class TestPPOValidation:
         with pytest.raises(ValueError, match="classic Megatron DDP"):
             validate_single_controller_config(mc)
 
-    @pytest.mark.parametrize("overlap_param_gather", [False, True])
+    @pytest.mark.parametrize(
+        ("use_distributed_optimizer", "overlap_param_gather", "fp8_param"),
+        [
+            (True, False, True),
+            (True, True, True),
+            (False, False, True),
+            (True, True, False),
+        ],
+        ids=["shared", "shared-overlap", "unsharded", "compute-only"],
+    )
     def test_streaming_mxfp8_guard_only_rejects_shared_gradient_buffers(
-        self, overlap_param_gather
+        self, use_distributed_optimizer, overlap_param_gather, fp8_param
     ):
         mc = _ppo_master_config(min_groups_for_streaming_train=1, megatron_enabled=True)
         mc.ppo.ppo_epochs = 1
@@ -361,14 +370,17 @@ class TestPPOValidation:
         mc.policy["megatron_cfg"]["distributed_data_parallel_config"] = {
             "overlap_param_gather": overlap_param_gather
         }
+        mc.policy["megatron_cfg"]["optimizer"] = {
+            "use_distributed_optimizer": use_distributed_optimizer
+        }
         mc.policy["megatron_cfg"]["fp8_cfg"] = {
             "enabled": True,
-            "fp8_param": True,
+            "fp8_param": fp8_param,
             "fp8_recipe": "mxfp8",
         }
 
-        if overlap_param_gather:
-            with pytest.raises(ValueError, match="MXFP8"):
+        if use_distributed_optimizer and fp8_param:
+            with pytest.raises(ValueError, match="MXFP8.*distributed optimizer"):
                 validate_single_controller_config(mc)
         else:
             validate_single_controller_config(mc)

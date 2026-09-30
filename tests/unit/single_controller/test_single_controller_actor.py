@@ -1449,6 +1449,9 @@ class _NoOpTrainer:
     def offload_train_step(self) -> None:
         pass
 
+    def sync_params_before_refit(self) -> None:
+        pass
+
 
 class _LpRecordingTrainer(_NoOpTrainer):
     """Records ``keep_train_buffers`` flags and the per-chunk call order.
@@ -1521,6 +1524,9 @@ class _OrderRecordingTrainer(_NoOpTrainer):
 
     def offload_to_cpu(self) -> None:
         self.calls.append("policy.offload_to_cpu")
+
+    def sync_params_before_refit(self) -> None:
+        self.calls.append("policy.sync_params_before_refit")
 
 
 class _EpochRecordingTrainer(_OrderRecordingTrainer):
@@ -2341,6 +2347,7 @@ def test_train_pump_offloads_only_for_the_two_critic_residencies(monkeypatch) ->
 
     assert calls.count("policy.offload_to_cpu") == 2
     assert "policy.finish_inference" not in calls
+    assert "policy.sync_params_before_refit" not in calls
     policy_forward = calls.index("policy.get_logprobs_from_meta")
     policy_training = calls.index("policy.prepare_for_training")
     assert "policy.offload_to_cpu" not in calls[policy_forward:policy_training]
@@ -2421,6 +2428,7 @@ def test_train_pump_freezes_the_policy_during_critic_warmup(
     trainer.prepare_for_training.assert_not_called()
     trainer.begin_train_step.assert_not_called()
     trainer.finish_train_step.assert_not_called()
+    trainer.sync_params_before_refit.assert_not_called()
     if engine_blocks_training:
         # Stood down once per step (not per epoch), with the gate already
         # closed; the sync (mocked -- the real one reopens the gate) is the wake.
@@ -3037,6 +3045,24 @@ def test_full_batch_ppo_keeps_shared_generation_asleep_until_critic_finishes(
 
     assert calls[0] == "generation_sleep"
     assert calls[-1] == "generation_wake"
+    # Colocated generation can retain policy parameters after offload_to_cpu.
+    # Release them before both critic residencies while generation is asleep.
+    assert calls.count("policy.finish_inference") == 2
+    assert calls.count("policy.sync_params_before_refit") == 1
+    gather_index = calls.index("policy.sync_params_before_refit")
+    assert calls.index("policy.finish_train_step") < gather_index
+    assert calls[gather_index : gather_index + 4] == [
+        "policy.sync_params_before_refit",
+        "policy.offload_to_cpu",
+        "policy.finish_inference",
+        "critic.prepare_for_training",
+    ]
+    for prepare in ("critic.prepare_for_inference", "critic.prepare_for_training"):
+        index = calls.index(prepare)
+        assert calls[index - 2 : index] == [
+            "policy.offload_to_cpu",
+            "policy.finish_inference",
+        ]
     ctrl._sync_weights.assert_awaited_once()
 
 
@@ -3130,22 +3156,26 @@ def test_streaming_ppo_accumulates_policy_then_trains_full_batch_critic(
         "policy_dp",
         "value_dp",
         "generations",
-        "batching",
+        "policy_batching",
+        "value_batching",
         "value_inference_mbs",
         "expected_multiple",
     ),
     [
-        (8, 4, 1, "dynamic_batching", None, 8),
-        (8, 4, 2, "dynamic_batching", None, 4),
-        (8, 4, 3, "dynamic_batching", None, 8),
-        (6, 4, 8, "dynamic_batching", None, 3),
-        (8, 4, 2, "sequence_packing", None, 4),
+        (8, 4, 1, "dynamic_batching", "dynamic_batching", None, 8),
+        (8, 4, 2, "dynamic_batching", "dynamic_batching", None, 4),
+        (8, 4, 3, "dynamic_batching", "dynamic_batching", None, 8),
+        (6, 4, 8, "dynamic_batching", "dynamic_batching", None, 3),
+        (8, 4, 2, "sequence_packing", "sequence_packing", None, 4),
         # Static policy microbatches require 4*2 and 4*3 samples; value
         # inference falls back to its 2*5 train microbatch size: LCM=120.
-        (4, 2, 1, "static", None, 120),
-        (4, 2, 5, "static", None, 24),
+        (4, 2, 1, "static", "static", None, 120),
+        (4, 2, 5, "static", "static", None, 24),
         # Explicit value inference mbs=2 reduces the sample alignment to24.
-        (4, 2, 1, "static", 2, 24),
+        (4, 2, 1, "static", "static", 2, 24),
+        # Packing only one model leaves the other model's static constraint.
+        (4, 2, 1, "dynamic_batching", "static", None, 20),
+        (4, 2, 1, "static", "sequence_packing", None, 24),
     ],
 )
 def test_streaming_ppo_aligns_complete_groups_to_both_model_dp_sizes(
@@ -3153,7 +3183,8 @@ def test_streaming_ppo_aligns_complete_groups_to_both_model_dp_sizes(
     policy_dp: int,
     value_dp: int,
     generations: int,
-    batching: str,
+    policy_batching: str,
+    value_batching: str,
     value_inference_mbs: int | None,
     expected_multiple: int,
 ) -> None:
@@ -3165,13 +3196,13 @@ def test_streaming_ppo_aligns_complete_groups_to_both_model_dp_sizes(
     ctrl._master_config.policy = {
         "train_micro_batch_size": 2,
         "logprob_batch_size": 3,
-        "dynamic_batching": {"enabled": batching == "dynamic_batching"},
-        "sequence_packing": {"enabled": batching == "sequence_packing"},
+        "dynamic_batching": {"enabled": policy_batching == "dynamic_batching"},
+        "sequence_packing": {"enabled": policy_batching == "sequence_packing"},
     }
     ctrl._master_config.value = {
         "train_micro_batch_size": 5,
-        "dynamic_batching": {"enabled": batching == "dynamic_batching"},
-        "sequence_packing": {"enabled": batching == "sequence_packing"},
+        "dynamic_batching": {"enabled": value_batching == "dynamic_batching"},
+        "sequence_packing": {"enabled": value_batching == "sequence_packing"},
     }
     if value_inference_mbs is not None:
         ctrl._master_config.value["logprob_batch_size"] = value_inference_mbs

@@ -193,8 +193,9 @@ policy:
     # Opt-in Rust-backed BPE tokenizer (~10x faster encode); requires the fastokens wheel.
     # NRL_USE_FASTOKENS overrides at runtime.
     use_fastokens: false
-  # The only thing on the SC path that takes the policy optimizer off the GPU.
-  # Without it the critic's forward and train stages run on top of it.
+  # Offload optimizer state for policy logprob computation.
+  # PPO's pre-critic offload is handled separately by offload_to_cpu or
+  # offload_train_step.
   offload_optimizer_for_logprob: true
 
   dtensor_cfg:

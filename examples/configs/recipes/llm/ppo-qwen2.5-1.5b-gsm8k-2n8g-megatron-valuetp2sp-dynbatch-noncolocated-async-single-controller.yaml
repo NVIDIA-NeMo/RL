@@ -28,8 +28,9 @@ checkpointing:
   metric_name: null
 
 policy:
-  # The only thing on the SC path that takes the policy optimizer off the GPU,
-  # which the critic needs before its forward and train stages.
+  # Offload optimizer state for policy logprob computation.
+  # PPO's pre-critic offload is handled separately by offload_to_cpu or
+  # offload_train_step.
   offload_optimizer_for_logprob: true
 
   draft:

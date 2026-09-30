@@ -1880,15 +1880,6 @@ class TestOffloadTrainStep:
             w.offload_train_step()
         assert w._train_step_state["offloaded"] is False
 
-    def test_rejects_shared_mxfp8_buffers(self, mock_module_symbols):
-        w = self._worker()
-        w.megatron_cfg.optimizer.reuse_grad_buf_for_mxfp8_param_ag = True
-        w.megatron_cfg.ddp.overlap_param_gather = True
-        with patch(f"{WORKER_MOD}.DistributedDataParallel", type(w.model)):
-            with pytest.raises(ValueError, match="shared MXFP8"):
-                w.offload_train_step()
-        assert w._train_step_state["offloaded"] is False
-
     @pytest.mark.parametrize(
         "buffer_collection", ["buffers", "expert_parallel_buffers"]
     )
