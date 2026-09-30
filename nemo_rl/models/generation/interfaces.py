@@ -621,7 +621,11 @@ class GenerationInterface(ABC):
         )
 
     def setup_token_capture(
-        self, dp_cfg: "DataPlaneConfig", staging_partition: str
+        self,
+        dp_cfg: "DataPlaneConfig",
+        staging_partition: str,
+        *,
+        capture_media: bool = False,
     ) -> None:
         """Install token capture in the serving workers (``token_capture.enabled``).
 
@@ -632,6 +636,8 @@ class GenerationInterface(ABC):
         Args:
             dp_cfg: Data-plane config the workers use to build their in-worker client.
             staging_partition: Data-plane partition that captured rows are staged in.
+            capture_media: Also stage the processed VLM media each call ran on
+                beside its token delta (vLLM only; see ``MEDIA_STAGING_FIELDS``).
         """
         raise NotImplementedError(
             f"token_capture.enabled is not supported for {type(self).__name__}"
