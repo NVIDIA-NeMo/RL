@@ -16,6 +16,7 @@
 
 import sys
 from collections.abc import Mapping
+from enum import IntEnum
 from types import ModuleType
 
 import pytest
@@ -40,6 +41,13 @@ DType.__module__ = "transformer_engine_torch"
 DType.kFloat8E4M3 = PINNED_TE_E4M3
 
 
+class CanonicalDType(IntEnum):
+    """Stand-in for the canonical TE 2.18 Python dtype enum."""
+
+    kFloat8E4M3 = 5
+    kFloat8E5M2 = 6
+
+
 class ForgedDType:
     """Matches the old structural predicate without being the TE binding."""
 
@@ -58,6 +66,16 @@ def transformer_engine_torch_binding(monkeypatch: pytest.MonkeyPatch) -> ModuleT
     module = ModuleType("transformer_engine_torch")
     module.DType = DType
     monkeypatch.setitem(sys.modules, "transformer_engine_torch", module)
+
+    package = ModuleType("transformer_engine")
+    package.__path__ = []  # type: ignore[attr-defined]
+    pytorch_package = ModuleType("transformer_engine.pytorch")
+    pytorch_package.__path__ = []  # type: ignore[attr-defined]
+    constants = ModuleType("transformer_engine.pytorch.constants")
+    constants.DType = CanonicalDType
+    monkeypatch.setitem(sys.modules, "transformer_engine", package)
+    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch", pytorch_package)
+    monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.constants", constants)
     return module
 
 
@@ -282,6 +300,21 @@ def test_extract_native_mxfp8_components_accepts_pinned_te_e4m3_dtype(
     result = extract_native_mxfp8_components(_source(fp8_dtype=PINNED_TE_E4M3))
 
     assert result.weight.dtype == torch.float8_e4m3fn
+
+
+def test_extract_native_mxfp8_components_accepts_canonical_te_e4m3_dtype() -> None:
+    result = extract_native_mxfp8_components(
+        _source(fp8_dtype=CanonicalDType.kFloat8E4M3)
+    )
+
+    assert result.weight.dtype == torch.float8_e4m3fn
+
+
+def test_extract_native_mxfp8_components_rejects_canonical_te_e5m2_dtype() -> None:
+    with pytest.raises(ValueError, match="E4M3"):
+        extract_native_mxfp8_components(
+            _source(fp8_dtype=CanonicalDType.kFloat8E5M2)
+        )
 
 
 def test_extract_native_mxfp8_components_requires_te_binding(
