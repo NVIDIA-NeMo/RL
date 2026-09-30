@@ -736,9 +736,9 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 MoE backend while a co-trained MTP drafter is enabled (unsupported
                 by the native layerwise refit lifecycle).
         """
+        self._validate_native_layerwise_refit()
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
         self._prepare_model_update_manifest(state_dict_info)
-        self._validate_native_layerwise_refit()
 
     def _prepare_model_update_manifest(self, state_dict_info: dict[str, Any]) -> None:
         """Bind target and draft metadata to the live speculative runtime."""
