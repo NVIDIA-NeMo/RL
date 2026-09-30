@@ -37,7 +37,6 @@ from nemo_rl.models.megatron.alignment import (
     get_fp8_token_alignment,
     get_parallel_token_alignment,
 )
-from nemo_rl.models.megatron.batch_invariant import batch_invariant_token_multiple
 from nemo_rl.models.megatron.common import _round_up_to_multiple
 from nemo_rl.models.megatron.hybridep import (
     get_packed_seq_padding_mask,
@@ -321,17 +320,6 @@ def get_microbatch_iterator(
             cfg["make_sequence_length_divisible_by"],
             pack_seq_dim_size,
         )
-        if cfg["megatron_cfg"].get("batch_invariant_mode"):
-            # Packed scoring only needs its total token dimension aligned; padding
-            # every constituent sequence to the inference bucket size wastes work.
-            pad_packed_seq_to_multiple_of = batch_invariant_token_multiple(
-                pad_packed_seq_to_multiple_of,
-                cfg["megatron_cfg"]["tensor_model_parallel_size"],
-            )
-            if pad_full_seq_to is not None:
-                pad_full_seq_to = _round_up_to_multiple(
-                    pad_full_seq_to, pad_packed_seq_to_multiple_of
-                )
         micro_batch_size = 1
     else:
         raw_iterator = data.make_microbatch_iterator(mbs)

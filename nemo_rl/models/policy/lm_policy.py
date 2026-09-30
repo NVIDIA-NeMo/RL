@@ -247,7 +247,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             ) and not config["sequence_packing"]["enabled"]:
                 # Native TE kernels are invariant when eager policy scoring uses
                 # the same aligned token dimension as MCore generation buckets.
-                # Sequence packing aligns its total token count in megatron.data.
+                # Sequence packing is rejected by batch-invariant validation.
                 # Also key off zero_train_gen_mismatch: the driver constructs
                 # Policy before workers call enable_zero_train_gen_kl().
                 tp_size = config["megatron_cfg"]["tensor_model_parallel_size"]
