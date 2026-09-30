@@ -717,7 +717,7 @@ def load_weights(
         weights, model_runner, refit_with_reload_api=False
     )
     if model_load_weights is not None:
-        model_load_weights(weights=quantized_weights)
+        model_load_weights(quantized_weights)
         return
 
     from nemo_rl.models.generation.vllm.vllm_backend import load_weights_maybe_cached
