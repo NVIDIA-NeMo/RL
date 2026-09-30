@@ -147,6 +147,7 @@ def _install_fake_vllm(monkeypatch):
         ServingTokenization=_ServingTokenization,
     )
     module("vllm.renderers.online_renderer", OnlineRenderer=_OnlineRenderer)
+    module("vllm.renderers.hf", HfRenderer=placeholder("HfRenderer"))
     module(
         "vllm.exceptions",
         VLLMValidationError=type("VLLMValidationError", (Exception,), {}),
