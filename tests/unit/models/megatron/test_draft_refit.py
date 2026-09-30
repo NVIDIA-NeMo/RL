@@ -425,6 +425,7 @@ def _draft_refit_worker(*, draft_model: object | None) -> Any:
     return worker
 
 
+@pytest.mark.mcore
 def test_ipc_refit_preflights_and_caches_draft_before_zmq(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -463,6 +464,7 @@ def test_ipc_refit_preflights_and_caches_draft_before_zmq(
     assert calls == ["preflight", "init_zmq", "stream", "params"]
 
 
+@pytest.mark.mcore
 def test_ipc_refit_preflight_failure_stops_before_zmq(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
