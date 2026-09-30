@@ -425,6 +425,66 @@ def _draft_refit_worker(*, draft_model: object | None) -> Any:
     return worker
 
 
+def test_ipc_refit_preflights_and_caches_draft_before_zmq(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nemo_rl.models.policy import utils as policy_utils
+
+    worker = _draft_refit_worker(draft_model=None)
+    worker.rank = 0
+    worker.zmq_socket = object()
+    calls: list[str] = []
+    cached_draft = (("draft.model.weight", torch.ones(1)),)
+
+    def preflight() -> tuple[tuple[tuple[str, torch.Tensor], ...], None]:
+        calls.append("preflight")
+        return cached_draft, None
+
+    def params(*, kv_scales: object, draft_weights: object):
+        calls.append("params")
+        assert kv_scales == {"scale": 1.0}
+        assert draft_weights is cached_draft
+        return iter(())
+
+    def stream(**kwargs: object) -> None:
+        calls.append("stream")
+        list(kwargs["params_generator"])
+
+    worker._preflight_draft_weights_for_refit = preflight
+    worker.maybe_init_zmq = lambda: calls.append("init_zmq")
+    worker._iter_params_with_optional_kv_scales = params
+    monkeypatch.setattr(policy_utils, "stream_weights_via_ipc_zmq_impl", stream)
+
+    worker.stream_weights_via_ipc_zmq(
+        buffer_size_bytes=123,
+        kv_scales={"scale": 1.0},
+    )
+
+    assert calls == ["preflight", "init_zmq", "stream", "params"]
+
+
+def test_ipc_refit_preflight_failure_stops_before_zmq(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nemo_rl.models.policy import utils as policy_utils
+
+    worker = _draft_refit_worker(draft_model=None)
+    calls: list[str] = []
+    failure = RuntimeError("draft preflight failed")
+    worker._preflight_draft_weights_for_refit = lambda: ((), failure)
+    worker.maybe_init_zmq = lambda: calls.append("init_zmq")
+    monkeypatch.setattr(
+        policy_utils,
+        "stream_weights_via_ipc_zmq_impl",
+        lambda **_kwargs: calls.append("stream"),
+    )
+
+    with pytest.raises(RuntimeError, match="draft preflight failed"):
+        worker.stream_weights_via_ipc_zmq()
+
+    assert calls == []
+
+
 def _run_tp2_pp2_cp2_worker_draft_refit(rank: int, world_size: int) -> None:
     from megatron.core import parallel_state
 
