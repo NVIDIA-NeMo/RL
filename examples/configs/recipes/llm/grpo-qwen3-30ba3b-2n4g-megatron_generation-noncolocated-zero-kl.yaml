@@ -1,0 +1,14 @@
+defaults: ../../grpo_qwen3_30ba3b_megatron_zero_train_gen_kl.yaml
+grpo:
+  max_num_steps: 3
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 4
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-2n4g-megatron_generation-noncolocated-zero-kl
+policy:
+  train_global_batch_size: 32
+  max_total_sequence_length: 2048
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-2n4g-megatron_generation-noncolocated-zero-kl
+  wandb:
+    name: grpo-qwen3-30ba3b-2n4g-megatron_generation-noncolocated-zero-kl
