@@ -597,7 +597,13 @@ def _make_adapter(
         },
     )
     model = SimpleNamespace(parameter=parameter)
-    runner = SimpleNamespace(model=model, vllm_config=object())
+    runner = SimpleNamespace(
+        model=model,
+        vllm_config=object(),
+        reset_lora_state=lambda: events.append("reset_lora_state"),
+        reset_encoder_cache=lambda: events.append("reset_encoder_cache"),
+        reset_mm_cache=lambda: events.append("reset_mm_cache"),
+    )
     adapter = refit_adapter.VllmLayerwiseRefitAdapter(
         model_runner=runner,
         model_config=object(),
