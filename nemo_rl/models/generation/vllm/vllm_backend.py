@@ -40,7 +40,10 @@ from nemo_rl.models.policy.utils import (
     rebuild_cuda_tensor_from_ipc,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
-from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
+from nemo_rl.utils.packed_tensor import (
+    packed_broadcast_consumer,
+    packed_broadcast_preflight_consumer,
+)
 from nemo_rl.weight_sync.nccl_reshard_utils import (
     _STR_TO_DTYPE,
     HFToLocalParamMap,
@@ -733,8 +736,12 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 MoE backend while a co-trained MTP drafter is enabled (unsupported
                 by the native layerwise refit lifecycle).
         """
-        self._validate_native_layerwise_refit()
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
+        self._prepare_model_update_manifest(state_dict_info)
+        self._validate_native_layerwise_refit()
+
+    def _prepare_model_update_manifest(self, state_dict_info: dict[str, Any]) -> None:
+        """Bind target and draft metadata to the live speculative runtime."""
         pp_group = get_pp_group()
         pp_rank = int(getattr(pp_group, "rank_in_group", 0))
         pp_size = int(getattr(pp_group, "world_size", 1))
@@ -1818,8 +1825,6 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         Done once ahead of refit; the cached mapping is reused by every
         ``nccl_reshard_refit`` call.
         """
-        self._validate_native_layerwise_refit("nccl_reshard")
-
         from nemo_rl.weight_sync.nccl_reshard_utils import (
             restore_refit_info_placements,
         )
@@ -1827,6 +1832,25 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         self.nccl_reshard_refit_info = (  # pyrefly: ignore[implicitly-defined-attribute]
             restore_refit_info_placements(refit_info)
         )
+        state_dict_info = {
+            param["name"]: (
+                tuple(param["global_shape"]),
+                _STR_TO_DTYPE[param["dtype"]],
+            )
+            for layer_name in self.nccl_reshard_refit_info["layer_names"]
+            for param in self.nccl_reshard_refit_info["per_layer_params"][layer_name]
+        }
+        state_dict_info.update(
+            {
+                name: (tuple(meta["shape"]), _STR_TO_DTYPE[meta["dtype"]])
+                for name, meta in self.nccl_reshard_refit_info.get(
+                    "misc_meta", {}
+                ).items()
+            }
+        )
+        self._prepare_model_update_manifest(state_dict_info)
+        self._validate_native_layerwise_refit("nccl_reshard")
+
         if self._uses_unquantized_flashinfer_trtllm() and not self.pp_comm_groups:
             # The TRTLLM expert map needs the per-PP-stage communicator ranks,
             # which init_nccl_reshard_comm_group establishes after prepare.
@@ -2276,10 +2300,25 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             *(self.pp_comm_groups or {}).values(),
             self.model_update_group,
         ]
-        with RefitAbortWatchdog(groups, refit_timeout_s) as guard:
-            hold_refit_for_fault_injection()
-            with self._weight_update_lifecycle("nccl_reshard") as finalize:
-                result = self._nccl_reshard_refit_impl(finalize)
+        try:
+            with RefitAbortWatchdog(groups, refit_timeout_s) as guard:
+                hold_refit_for_fault_injection()
+                with self._weight_update_lifecycle("nccl_reshard") as finalize:
+                    result = self._nccl_reshard_refit_impl(finalize)
+        except Exception as error:
+            if guard.fired:
+                raise RefitAborted(
+                    f"refit nccl_reshard receive exceeded {refit_timeout_s}s and "
+                    "was aborted; this engine now holds partial weights and must "
+                    "not serve until refit"
+                ) from error
+            if self._weight_update_errors_are_fatal():
+                raise
+            logger.exception(
+                "Error in VllmInternalWorkerExtension.nccl_reshard_refit: %s",
+                error,
+            )
+            return False
         if guard.fired:
             raise RefitAborted(
                 f"refit nccl_reshard receive exceeded {refit_timeout_s}s and was "
@@ -2330,6 +2369,11 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             )
             if spec.post is not None:
                 spec.post(ctx)
+
+        # Consume the train-side readiness token before any bulk receive. This
+        # keeps all generation ranks on the same collective schedule when draft
+        # export fails before payload transfer begins.
+        packed_broadcast_preflight_consumer(self.model_update_group, 0)
 
         # Group params by PP stage so different stages' bulk reshards run
         # concurrently on their own streams.  Non-PP = single stage 0 (params
@@ -2411,6 +2455,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             group=self.model_update_group,
             src=0,
             post_unpack_func=self._load_weights,
+            preflight_checked=True,
         )
 
     def cleanup(self) -> None:
