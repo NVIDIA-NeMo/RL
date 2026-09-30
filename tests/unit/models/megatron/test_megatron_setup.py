@@ -2222,11 +2222,11 @@ class TestApplyPerformanceConfig:
         for variable in ("NVTE_FUSED_ATTN", "NVTE_FLASH_ATTN", "NVTE_UNFUSED_ATTN"):
             assert variable not in os.environ
 
-    @pytest.mark.parametrize("attention_backend", ["auto", "unfused"])
+    @pytest.mark.parametrize("attention_backend", ["auto", "flash", "unfused"])
     def test_expanded_omni_preserves_supported_explicit_attention_backend(
         self, attention_backend
     ):
-        """Expanded Omni preserves an explicitly selected compatible backend."""
+        """Expanded Omni preserves an explicitly selected attention backend."""
         from megatron.core.transformer.enums import AttnBackend
 
         from nemo_rl.models.megatron.setup import _apply_performance_config
@@ -2241,22 +2241,6 @@ class TestApplyPerformanceConfig:
         )
 
         assert model_cfg.attention_backend is AttnBackend[attention_backend]
-
-    def test_expanded_omni_rejects_flash_attention(self):
-        """Flash cannot represent expanded Omni's padded multi-row THD batches."""
-        from nemo_rl.models.megatron.setup import _apply_performance_config
-
-        model_cfg = SimpleNamespace(
-            gated_linear_unit=True,
-            nemotron_omni_contract="expanded_sequence_v1",
-        )
-        with pytest.raises(
-            ValueError,
-            match="does not support attention_backend='flash'",
-        ):
-            _apply_performance_config(
-                model_cfg, self._config(attention_backend="flash")
-            )
 
     @pytest.mark.parametrize(
         "model_contract",
