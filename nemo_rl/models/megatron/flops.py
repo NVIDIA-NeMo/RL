@@ -9,7 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Bridge FLOPs estimates for a worker's unsharded, local data batch."""
+"""Bridge decoder FLOPs and model-specific vision work for a local data batch."""
 
 import math
 from collections.abc import Mapping
@@ -19,6 +19,7 @@ import torch
 
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.megatron.omni_flops import qwen25_omni_vision_flops
 
 if TYPE_CHECKING:
     from megatron.bridge.training.config import ConfigContainer
@@ -59,6 +60,18 @@ def _has_grid_rows(grid: torch.Tensor | PackedTensor | None) -> bool:
     """Check for vision work, including packed batches with empty media rows."""
     grids = grid.tensors if isinstance(grid, PackedTensor) else [grid]
     return any(value is not None and value.numel() > 0 for value in grids)
+
+
+def uses_omni_vision_correction(
+    config: "ConfigContainer", data: BatchedDataDict[Any]
+) -> bool:
+    """Identify batches whose vision work uses NeMo-RL's Omni correction."""
+    vision = getattr(config.model, "vision_config", None) or getattr(
+        getattr(config.model, "thinker_config", None), "vision_config", None
+    )
+    return getattr(vision, "model_type", None) == "qwen2_5_omni_vision_encoder" and any(
+        _has_grid_rows(data.get(key)) for key in ("image_grid_thw", "video_grid_thw")
+    )
 
 
 def compute_bridge_batch_flops(
@@ -133,7 +146,14 @@ def compute_bridge_batch_flops(
         )
         if vision_config is None:
             raise NotImplementedError("Bridge vision FLOPs require a vision config")
-        total += flop_utils.vit_flops_from_grid_thw(config, grid)
+        if getattr(vision_config, "model_type", None) == "qwen2_5_omni_vision_encoder":
+            pixels = data.get(pixels_key)
+            tensors = pixels.tensors if isinstance(pixels, PackedTensor) else [pixels]
+            if any(value is not None and value.requires_grad for value in tensors):
+                raise NotImplementedError("Omni FLOPs for differentiable pixel inputs")
+            total += qwen25_omni_vision_flops(vision_config, grid)
+        else:
+            total += flop_utils.vit_flops_from_grid_thw(config, grid)
     total = float(total)
     if not math.isfinite(total) or total < 0:
         raise ValueError(f"Bridge returned invalid training FLOPs: {total}")

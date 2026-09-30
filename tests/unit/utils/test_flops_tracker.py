@@ -35,11 +35,30 @@ def test_bridge_flops_take_priority_over_fallback():
     ) == {"total_flops": 28.0, "flops_from_bridge": 1.0}
 
 
+def test_corrected_omni_total_is_not_labeled_bridge_only():
+    assert resolve_flops_metrics(
+        [
+            {"local_flops": 11.0, "local_flops_vision_corrected": True},
+            {"local_flops": 17.0, "local_flops_vision_corrected": False},
+        ],
+        fallback_flops=999.0,
+    ) == {
+        "total_flops": 28.0,
+        "flops_from_bridge": 0.0,
+        "flops_with_omni_vision_correction": 1.0,
+    }
+
+
 @pytest.mark.parametrize("fallback", [None, 123.0])
-def test_unsupported_bridge_uses_only_complete_fallback(fallback):
+@pytest.mark.parametrize("corrected", [False, True])
+def test_unsupported_bridge_uses_only_complete_fallback(fallback, corrected):
     with pytest.warns(UserWarning, match="unsupported"):
         metrics = resolve_flops_metrics(
-            [{"local_flops": 11.0}, {"local_flops": None}], fallback_flops=fallback
+            [
+                {"local_flops": 11.0, "local_flops_vision_corrected": corrected},
+                {"local_flops": None},
+            ],
+            fallback_flops=fallback,
         )
     assert metrics == (
         {} if fallback is None else {"total_flops": fallback, "flops_from_bridge": 0.0}

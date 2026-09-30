@@ -671,6 +671,27 @@ class TestTrainMicrobatch:
 
 
 class TestFinish:
+    @pytest.mark.parametrize("abort", [False, True])
+    def test_omni_source_label_resets_between_steps(self, mock_module_symbols, abort):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        worker = _make_worker(LossType.TOKEN_LEVEL)
+        with patch(
+            f"{WORKER_MOD}.uses_omni_vision_correction", side_effect=[True, False]
+        ):
+            worker.begin_train_step(loss_fn=worker._test_loss_fn)
+            worker.train_microbatch(_fake_batch())
+            assert worker._train_step_state["local_flops_vision_corrected"] is True
+            if abort:
+                worker.abort_train_step()
+            else:
+                assert (
+                    worker.finish_train_step()["local_flops_vision_corrected"] is True
+                )
+            worker.begin_train_step(loss_fn=worker._test_loss_fn)
+            worker.train_microbatch(_fake_batch())
+            assert worker.finish_train_step()["local_flops_vision_corrected"] is False
+
     def test_flops_accumulate_and_reset_after_finish_and_abort(
         self, mock_module_symbols
     ):

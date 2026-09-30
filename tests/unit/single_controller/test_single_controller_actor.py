@@ -2373,7 +2373,8 @@ def test_train_pump_mfu_counts_all_policy_epochs(monkeypatch, ppo_epochs: int) -
     assert train_metrics["train_fp_utilization"] == pytest.approx(0.5)
 
 
-def test_train_pump_logs_mfu_on_a_grpo_run(monkeypatch) -> None:
+@pytest.mark.parametrize("corrected", [False, True])
+def test_train_pump_logs_mfu_on_a_grpo_run(monkeypatch, corrected) -> None:
     meta = _single_group_meta()
     ctrl = _train_pump_controller(sampler=_OneThenEmptySampler(meta))
     ctrl._master_config.grpo.num_prompts_per_step = 1
@@ -2382,8 +2383,12 @@ def test_train_pump_logs_mfu_on_a_grpo_run(monkeypatch) -> None:
         "loss": 1.0,
         "total_flops": 1e15,
         "theoretical_tflops": 500.0,
-        "flops_from_bridge": 1.0,
+        "flops_from_bridge": float(not corrected),
     }
+    if corrected:
+        ctrl._trainer.finish_train_step.return_value[
+            "flops_with_omni_vision_correction"
+        ] = 1.0
     ctrl._advantage_stage = AsyncMock(return_value=(meta, True))
     ctrl._sync_weights = AsyncMock(return_value=1)
     ctrl._logger = MagicMock()
@@ -2398,7 +2403,9 @@ def test_train_pump_logs_mfu_on_a_grpo_run(monkeypatch) -> None:
 
     metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
     assert metrics["total_flops"] == 1e15
-    assert metrics["flops_from_bridge"] == 1.0
+    assert metrics["flops_from_bridge"] == float(not corrected)
+    if corrected:
+        assert metrics["flops_with_omni_vision_correction"] == 1.0
     assert metrics["train_fp_utilization"] == pytest.approx(0.5)
 
 

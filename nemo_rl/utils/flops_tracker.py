@@ -244,6 +244,8 @@ def resolve_flops_metrics(
 
     local_flops=None explicitly means unsupported. A missing result on only
     some shards is an error, not permission to report a partial estimate.
+    Corrected Omni vision totals use Bridge for the decoder but are not labeled
+    Bridge-only: flops_with_omni_vision_correction identifies that mixed source.
     """
     if any("local_flops" in result for result in results):
         if not all("local_flops" in result for result in results):
@@ -252,6 +254,14 @@ def resolve_flops_metrics(
             values = [float(result["local_flops"]) for result in results]
             if any(not math.isfinite(value) or value < 0 for value in values):
                 raise ValueError("Invalid Bridge FLOPs result on a training shard")
+            if any(
+                result.get("local_flops_vision_corrected", False) for result in results
+            ):
+                return {
+                    "total_flops": sum(values),
+                    "flops_from_bridge": 0.0,
+                    "flops_with_omni_vision_correction": 1.0,
+                }
             return {"total_flops": sum(values), "flops_from_bridge": 1.0}
         warnings.warn(
             "Bridge FLOPs unsupported for this step; "

@@ -328,6 +328,7 @@ class SFTSingleControllerActor:
             "num_ranks",
             "theoretical_tflops",
             "flops_from_bridge",
+            "flops_with_omni_vision_correction",
         ):
             if key in train_results:
                 metrics[key] = train_results[key]

@@ -92,7 +92,10 @@ from nemo_rl.models.megatron.draft.step_state import (
     DraftStepPayload,
     DraftStepState,
 )
-from nemo_rl.models.megatron.flops import compute_bridge_batch_flops
+from nemo_rl.models.megatron.flops import (
+    compute_bridge_batch_flops,
+    uses_omni_vision_correction,
+)
 from nemo_rl.models.megatron.pipeline_parallel import (
     broadcast_loss_metrics_from_last_stage,
     broadcast_obj_from_pp_rank,
@@ -1132,6 +1135,7 @@ class MegatronPolicyWorkerImpl(
             losses = []
             total_num_microbatches = 0
             local_flops: float | None = 0.0
+            local_flops_vision_corrected = False
             for gb_idx in range(num_global_batches):
                 gb_result = process_global_batch(
                     data,
@@ -1141,6 +1145,9 @@ class MegatronPolicyWorkerImpl(
                     batch_size=local_gbs,
                 )
                 batch = gb_result["batch"]
+                local_flops_vision_corrected |= uses_omni_vision_correction(
+                    self.mcore_state.cfg, batch
+                )
                 if local_flops is not None:
                     batch_flops = self._batch_flops(batch)
                     local_flops = (
@@ -1429,6 +1436,7 @@ class MegatronPolicyWorkerImpl(
             metrics["draft_grad_norm"] = torch.tensor([draft_grad_norm])
 
         metrics["local_flops"] = local_flops
+        metrics["local_flops_vision_corrected"] = local_flops_vision_corrected
         self.timer.stop("train")
         return metrics
 
@@ -1575,6 +1583,7 @@ class MegatronPolicyWorkerImpl(
             "mb_losses": [],
             "total_num_microbatches": 0,
             "local_flops": 0.0,
+            "local_flops_vision_corrected": False,
             # One increment per train_microbatch call, i.e. the number of
             # streaming chunks the controller has fed into this optimizer step
             # so far.
@@ -1775,6 +1784,9 @@ class MegatronPolicyWorkerImpl(
         data: BatchedDataDict[Any],
     ) -> None:
         state["num_chunks"] += 1
+        state["local_flops_vision_corrected"] = state.get(
+            "local_flops_vision_corrected", False
+        ) or uses_omni_vision_correction(self.mcore_state.cfg, data)
         if state["local_flops"] is not None:
             batch_flops = self._batch_flops(data)
             state["local_flops"] = (
@@ -2265,6 +2277,7 @@ class MegatronPolicyWorkerImpl(
         )
 
         metrics["local_flops"] = state["local_flops"]
+        metrics["local_flops_vision_corrected"] = state["local_flops_vision_corrected"]
         self._train_step_state = None
         return metrics
 

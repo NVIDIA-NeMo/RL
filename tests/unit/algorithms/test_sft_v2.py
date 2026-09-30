@@ -177,7 +177,8 @@ def test_train_step_omits_mfu_for_unsupported_model() -> None:
     assert "train_fp_utilization" not in _controller()._run_train_step()
 
 
-def test_run_logs_mfu_at_the_optimizer_step() -> None:
+@pytest.mark.parametrize("corrected", [False, True])
+def test_run_logs_mfu_at_the_optimizer_step(corrected) -> None:
     controller = _controller()
     controller._max_steps = 1
     controller._logger = MagicMock()
@@ -188,8 +189,14 @@ def test_run_logs_mfu_at_the_optimizer_step() -> None:
     controller._close_loaders = MagicMock()
     controller._checkpointer = MagicMock()
     controller._trainer.finish_train_step.return_value.update(
-        total_flops=1e15, theoretical_tflops=500.0, flops_from_bridge=1.0
+        total_flops=1e15,
+        theoretical_tflops=500.0,
+        flops_from_bridge=float(not corrected),
     )
+    if corrected:
+        controller._trainer.finish_train_step.return_value[
+            "flops_with_omni_vision_correction"
+        ] = 1.0
     with patch(
         "nemo_rl.algorithms.sft_v2.time.monotonic",
         side_effect=[0.0, 10.0, 14.0, 20.0, 20.0],
@@ -198,7 +205,9 @@ def test_run_logs_mfu_at_the_optimizer_step() -> None:
     logged, step = controller._logger.log_metrics.call_args.args
     assert step == 1
     assert logged["train_fp_utilization"] == pytest.approx(0.5)
-    assert logged["flops_from_bridge"] == 1.0
+    assert logged["flops_from_bridge"] == float(not corrected)
+    if corrected:
+        assert logged["flops_with_omni_vision_correction"] == 1.0
 
 
 def _save_controller(**checkpointing: Any) -> object:

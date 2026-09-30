@@ -48,6 +48,44 @@ def _config():
     return SimpleNamespace(peft=None, model=SimpleNamespace(seq_length=4096))
 
 
+@pytest.mark.parametrize("grid_key", ["image_grid_thw", "video_grid_thw"])
+@pytest.mark.parametrize("pixels_require_grad", [False, True])
+def test_omni_adapter_counts_windowed_encoder_work(
+    calculator, grid_key, pixels_require_grad
+):
+    from transformers import Qwen2_5OmniVisionEncoderConfig
+    from nemo_rl.models.megatron.flops import uses_omni_vision_correction
+
+    config, data = _config(), _batch()
+    vision = Qwen2_5OmniVisionEncoderConfig(
+        depth=2,
+        hidden_size=8,
+        intermediate_size=16,
+        num_heads=2,
+        patch_size=2,
+        temporal_patch_size=1,
+        in_channels=3,
+        spatial_merge_size=2,
+        out_hidden_size=16,
+        window_size=8,
+        fullatt_block_indexes=[1],
+    )
+    config.model.thinker_config = SimpleNamespace(vision_config=vision)
+    assert not uses_omni_vision_correction(config, data)
+    data[grid_key] = torch.tensor([[1, 8, 8]])
+    pixels_key = (
+        "pixel_values" if grid_key == "image_grid_thw" else "pixel_values_videos"
+    )
+    data[pixels_key] = torch.zeros(64, 12, requires_grad=pixels_require_grad)
+    assert uses_omni_vision_correction(config, data)
+    if pixels_require_grad:
+        with pytest.raises(NotImplementedError, match="differentiable pixel"):
+            compute_bridge_batch_flops(config, data)
+        return
+    # Independent operator-counted encoder fixture plus the decoder result.
+    assert compute_bridge_batch_flops(config, data) == 120 + 1155072
+
+
 def test_real_lengths_not_context_limit_padding_or_loss_mask(calculator):
     config = _config()
     assert compute_bridge_batch_flops(config, _batch()) == 120
@@ -305,11 +343,11 @@ def test_real_bridge_adds_exact_variable_image_work(nested):
 @pytest.mark.mcore
 @pytest.mark.parametrize("family", ["qwen3", "qwen25_omni"])
 @pytest.mark.parametrize("lengths", [[607, 607], [220, 236]])
-def test_model_flops_match_megatron_lm_and_bridge_vision(family, lengths):
+def test_model_flops_match_megatron_lm_and_vision_reference(family, lengths):
     """Compare real upstream calculators without loading weights or downloading models."""
-    from megatron.bridge.training.utils.flop_utils import vit_flops_from_grid_thw
     from megatron.training.training import num_floating_point_operations
     from transformers import Qwen2_5OmniConfig, Qwen3Config
+    from nemo_rl.models.megatron.omni_flops import qwen25_omni_vision_flops
 
     hf = Qwen3Config() if family == "qwen3" else Qwen2_5OmniConfig()
     text = hf if family == "qwen3" else hf.thinker_config.text_config
@@ -352,7 +390,9 @@ def test_model_flops_match_megatron_lm_and_bridge_vision(family, lengths):
         model.thinker_config = hf.thinker_config
         grids = torch.tensor([[1, 22, 34], [1, 16, 24]])
         data["image_grid_thw"] = PackedTensor([grids[:1], grids[1:]], dim_to_pack=0)
-        vision = float(vit_flops_from_grid_thw(config, grids))
+        # The Omni reference is independently checked against executed HF
+        # encoder operators in test_omni_vision_flops_audit.py.
+        vision = qwen25_omni_vision_flops(hf.thinker_config.vision_config, grids)
         assert vision > 0
         assert compute_bridge_batch_flops(config, data) == pytest.approx(
             decoder + vision, rel=1e-12
