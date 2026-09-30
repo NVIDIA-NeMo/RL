@@ -271,7 +271,7 @@ def test_shared_client_same_evidence(
                 partition_id="canonical",
                 select_fields=meta.fields,
             )
-            ctrl = _controller(meta, data, grpo={"baseline_population": "all_owners"})
+            ctrl = _controller(meta, data)
             _, valid = asyncio.run(ctrl._advantage_stage(meta))
             assert valid
             generated = [

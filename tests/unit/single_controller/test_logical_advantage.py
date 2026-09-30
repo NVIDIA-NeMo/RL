@@ -20,7 +20,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from pydantic import ValidationError
 from tensordict import TensorDict
 
 from nemo_rl.algorithms.advantage_estimator import (
@@ -143,10 +142,9 @@ def _controller(meta, data, *, grpo=None, loss=None):
     return ctrl
 
 
-@pytest.mark.parametrize("population", ["valid_owners", "all_owners"])
 @pytest.mark.parametrize("reorder", [False, True])
 def test_deduplicates_unequal_segments_without_pooling_identical_prompts_across_groups(
-    population, reorder
+    reorder,
 ):
     meta, data = _batch(
         [("a", [(0.0, 2), (0.0, 1)]), ("b", [(1.0, 3), (1.0, 1)])], padding=True
@@ -155,7 +153,7 @@ def test_deduplicates_unequal_segments_without_pooling_identical_prompts_across_
         order = [4, 1, 6, 0, 7, 5, 3, 2]
         meta = meta.subset(order)
         data = data[order]
-    ctrl = _controller(meta, data, grpo={"baseline_population": population})
+    ctrl = _controller(meta, data)
     result, valid = asyncio.run(ctrl._advantage_stage(meta))
     assert valid and "advantages" in result.fields
     assert len(ctrl._dp_client.puts) == 1
@@ -164,11 +162,10 @@ def test_deduplicates_unequal_segments_without_pooling_identical_prompts_across_
     assert data["advantages"].count_nonzero() == 0
 
 
-@pytest.mark.parametrize("population", ["valid_owners", "all_owners"])
 @pytest.mark.parametrize("reorder", [False, True])
 @pytest.mark.parametrize("leave_one_out", [False, True])
 def test_sibling_rollouts_with_distinct_prompts_share_baseline(
-    population: str, reorder: bool, leave_one_out: bool
+    reorder: bool, leave_one_out: bool
 ) -> None:
     meta, data = _batch([("a", [(0.0, 3), (1.0, 2)])], padding=True)
     data["prompt_ids_for_adv"][3:5] = torch.tensor([42, 17])
@@ -179,7 +176,6 @@ def test_sibling_rollouts_with_distinct_prompts_share_baseline(
         meta,
         data,
         grpo={
-            "baseline_population": population,
             "adv_estimator": {
                 "normalize_rewards": False,
                 "use_leave_one_out_baseline": leave_one_out,
@@ -311,22 +307,16 @@ def test_overlong_filter_flag_is_respected_for_all_owner_segments(filtering):
     assert data["sample_mask"].tolist() == ([0, 0, 1] if filtering else [1, 1, 1])
 
 
-@pytest.mark.parametrize(
-    "population,expected", [("valid_owners", [-1.0, 1.0]), ("all_owners", [-4.0, -2.0])]
-)
 @pytest.mark.parametrize("filter_field", ["sample_mask", "mask_sample", "truncated"])
 @pytest.mark.parametrize("ordinary", [False, True])
-def test_masked_owner_participation_never_revives_its_segments(
-    population, expected, filter_field, ordinary
-):
+def test_masked_owner_is_excluded_from_baseline_and_loss(filter_field, ordinary):
+    expected = [-1.0, 1.0]
     counts = [1, 1, 1] if ordinary else [2, 1, 2]
     meta, data = _batch([("a", list(zip([0.0, 2.0, 10.0], counts)))])
     if ordinary:
         meta.tags = None
     data[filter_field][-1] = 0 if filter_field == "sample_mask" else 1
-    ctrl = _controller(
-        meta, data, grpo={"baseline_population": population, "overlong_filtering": True}
-    )
+    ctrl = _controller(meta, data, grpo={"overlong_filtering": True})
     _, valid = asyncio.run(ctrl._advantage_stage(meta))
     assert valid
     torch.testing.assert_close(data["advantages"][0], torch.full((3,), expected[0]))
@@ -342,24 +332,21 @@ def test_masked_owner_participation_never_revives_its_segments(
 def test_all_invalid_owners_take_existing_no_training_path():
     meta, data = _batch([("a", [(0.0, 2), (1.0, 1)])], padding=True)
     data["mask_sample"][:] = True
-    ctrl = _controller(meta, data, grpo={"baseline_population": "all_owners"})
+    ctrl = _controller(meta, data)
     _, valid = asyncio.run(ctrl._advantage_stage(meta))
     assert not valid
     assert data["advantages"].count_nonzero() == 0
     assert data["sample_mask"].count_nonzero() == 0
 
 
-@pytest.mark.parametrize(
-    "population,first_advantage", [("valid_owners", -1.0), ("all_owners", -4.0)]
-)
-def test_failed_owner_single_placeholder_stays_loss_masked(population, first_advantage):
+def test_failed_owner_single_placeholder_is_excluded_from_baseline_and_loss():
     meta, data = _batch([("a", [(0.0, 2), (2.0, 1), (10.0, 1)])])
     data["sample_mask"][-1] = 0
     data["token_mask"][-1] = 0
-    ctrl = _controller(meta, data, grpo={"baseline_population": population})
+    ctrl = _controller(meta, data)
     _, valid = asyncio.run(ctrl._advantage_stage(meta))
     assert valid
-    assert data["advantages"][0, 1].item() == first_advantage
+    assert data["advantages"][0, 1].item() == -1.0
     assert data["sample_mask"][-1].item() == 0
     assert data["token_mask"][-1].count_nonzero() == 0
 
@@ -466,9 +453,3 @@ def test_unsupported_cc_estimator_or_objective_is_rejected(grpo, loss):
     with pytest.raises(ValueError, match="CC"):
         asyncio.run(ctrl._advantage_stage(meta))
     assert not ctrl._dp_client.puts
-
-
-def test_baseline_population_default_and_invalid_value():
-    assert GRPOConfig().baseline_population == "valid_owners"
-    with pytest.raises(ValidationError):
-        GRPOConfig(baseline_population="segments")

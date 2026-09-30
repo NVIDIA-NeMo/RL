@@ -83,7 +83,6 @@ async def ready_controller(
 ) -> Any:
     data = plane.get_samples(meta.sample_ids, "train", meta.fields)
     ctrl, _ = _setup(monkeypatch, batches=[(meta, data)], plane=plane)
-    ctrl._algo_cfg.baseline_population = "all_owners"
     buffer = TQReplayBuffer(
         plane,
         "train",
@@ -358,7 +357,9 @@ def test_mixed_failed_owner_padding_replay_and_controller(
                 for index in range(6):
                     mask = data["token_mask"][index].bool()
                     if index < 3:
-                        assert torch.all(data["advantages"][index][mask] == -0.5)
+                        # Only the healthy owner votes: reward and baseline are
+                        # both 1, regardless of its three physical segments.
+                        assert torch.all(data["advantages"][index][mask] == 0.0)
                     else:
                         assert not mask.any()
 
