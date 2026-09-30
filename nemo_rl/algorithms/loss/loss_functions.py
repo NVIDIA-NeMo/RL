@@ -598,6 +598,31 @@ class ClippedPGLossFn(LossFunction):
                     mask.bool(), data["reference_policy_logprobs"][:, 1:], 0.0
                 )
 
+        # Reference KL uses the unfiltered policy and retains its own token set.
+        # Actor support mismatches must not discard otherwise valid KL terms.
+        kl_token_mask = token_mask
+        kl_sample_mask = sample_mask
+        kl_mask = mask
+        kl_generation_logprobs = torch.where(kl_mask.bool(), generation_logprobs, 0.0)
+
+        # Keep support information until all three policy distributions are
+        # available. Replacing -inf with zero earlier turns an impossible token
+        # into log-probability one in token/sequence importance ratios.
+        policy_valid = (
+            torch.isfinite(curr_logprobs)
+            & torch.isfinite(prev_logprobs)
+            & torch.isfinite(generation_logprobs)
+        )
+        token_mask = token_mask * policy_valid.to(token_mask.dtype)
+        sample_mask = sample_mask * token_mask.bool().any(dim=-1).to(sample_mask.dtype)
+        mask = token_mask * sample_mask.unsqueeze(-1)
+        curr_logprobs = torch.where(mask.bool(), curr_logprobs, 0.0)
+        prev_logprobs = torch.where(mask.bool(), prev_logprobs, 0.0)
+        generation_logprobs = torch.where(mask.bool(), generation_logprobs, 0.0)
+        if self.seq_logprob_error_in_loss:
+            seq_error_metrics["seq_logprob_error_valid_tokens"] = mask.sum().item()
+            seq_error_metrics["seq_logprob_error_valid_seqs"] = sample_mask.sum().item()
+
         # token_mult_prob_error
         # See more details and other metrics in docs/guides/grpo.md#metrics
         lp_error = torch.abs(generation_logprobs - prev_logprobs)  # noqa: F841  (precommit ignore for now)
@@ -679,7 +704,7 @@ class ClippedPGLossFn(LossFunction):
             if self.use_on_policy_kl_approximation:
                 # See: docs/guides/grpo.md#on-policy-kl-approximation
                 kl_importance_weights = torch.exp(
-                    curr_logprobs_unfiltered - generation_logprobs
+                    curr_logprobs_unfiltered - kl_generation_logprobs
                 )
             else:
                 kl_importance_weights = torch.exp(
@@ -702,12 +727,12 @@ class ClippedPGLossFn(LossFunction):
             # Reduce KL loss
             if self.loss_type == LossType.TOKEN_LEVEL:
                 kl = masked_mean(
-                    kl, mask, global_normalization_factor=global_valid_toks
+                    kl, kl_mask, global_normalization_factor=global_valid_toks
                 )
             else:
                 kl = masked_mean(
-                    masked_mean(kl, token_mask, dim=-1),
-                    sample_mask,
+                    masked_mean(kl, kl_token_mask, dim=-1),
+                    kl_sample_mask,
                     global_normalization_factor=global_valid_seqs,
                 )
         else:
