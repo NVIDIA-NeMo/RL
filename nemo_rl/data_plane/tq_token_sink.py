@@ -519,25 +519,25 @@ class TQTokenSink:
                 )
             routed_len = 0
             routed_encoding = ROUTE_ENCODING_NONE
-            attached_routes = (attachments or {}).get(ROUTED_EXPERTS_FIELD)
+            router_attachment = (attachments or {}).get(ROUTED_EXPERTS_FIELD)
             if (
                 attachments is not None
                 and ROUTED_EXPERTS_FIELD in attachments
-                and not isinstance(attached_routes, torch.Tensor)
+                and not isinstance(router_attachment, torch.Tensor)
             ):
                 raise ValueError("routed_experts attachment must be a tensor")
-            if attached_routes is not None and not isinstance(routed, dict):
+            if router_attachment is not None and not isinstance(routed, dict):
                 raise ValueError(
                     "routed_experts attachment requires its capture metadata"
                 )
             if routed is not None:
                 delta_len = len(record.token_ids_delta)
                 if isinstance(routed, dict):
-                    if not isinstance(attached_routes, torch.Tensor):
+                    if not isinstance(router_attachment, torch.Tensor):
                         raise ValueError(
                             "routed_experts metadata requires a tensor attachment"
                         )
-                    experts = attached_routes
+                    experts = router_attachment
                     routed_encoding = ROUTE_ENCODING_TENSOR
                 elif isinstance(routed, str):
                     from nemo_rl.utils.routed_experts_codec import (
