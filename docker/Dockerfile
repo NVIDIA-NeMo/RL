@@ -189,8 +189,13 @@ ENV UV_LINK_MODE=copy
 # Ensure DeepEP is built for H100 and B200 (also mcore inference unified memory API now invokes a torch API that requires these to be set)
 ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
 
-# Build HybridEP with inter-node transport support.
-ENV HYBRID_EP_MULTINODE=1
+# Build HybridEP with inter-node transport support. Derived from the ARG (not
+# hardcoded) so a non-default --build-arg HYBRID_EP_MULTINODE=0 is reflected
+# consistently in this stage's cache mount IDs and in uv-cache-export's --
+# an ENV literal here would silently override the ARG for ${...} expansion
+# in this stage and its descendants, while uv-cache-export (FROM base, no
+# such ENV) would expand the real ARG value, desyncing the two cache IDs.
+ENV HYBRID_EP_MULTINODE=${HYBRID_EP_MULTINODE}
 
 # Ensure HybridEP/DeepEP JIT compilation can find nvcc at runtime
 ENV CUDA_HOME=/usr/local/cuda
