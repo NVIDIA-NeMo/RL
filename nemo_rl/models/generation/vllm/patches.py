@@ -818,6 +818,147 @@ def _patch_vllm_routed_experts_capture_router_fallback(
     return True
 
 
+def _compact_routed_experts_capturer_source(content: str) -> str:
+    """Compact the known vLLM 0.29 allocation and layer-indexing blocks."""
+    replacements = (
+        (
+            "layer-count resolver",
+            """def _get_routed_experts_shape(vllm_config: VllmConfig) -> tuple[int, int, int]:
+    model_config = vllm_config.model_config
+    num_layers = model_config.get_total_num_hidden_layers()
+""",
+            """def _get_routed_experts_layer_indices(
+    vllm_config: VllmConfig,
+) -> tuple[int, ...] | None:
+    # NeMo-RL: compact explicit hybrid backbone MoE layers, excluding MTP.
+    layer_types = getattr(vllm_config.model_config.hf_text_config, "layers_block_type", None)
+    if isinstance(layer_types, (list, tuple)) and layer_types:
+        layer_ids = tuple(
+            index for index, kind in enumerate(layer_types)
+            if str(kind).lower() == "moe"
+        )
+        if layer_ids:
+            return layer_ids
+    # Models without an explicit MoE block list retain vLLM's full layer axis.
+    return None
+
+
+def _get_routed_experts_shape(vllm_config: VllmConfig) -> tuple[int, int, int]:
+    model_config = vllm_config.model_config
+    layer_ids = _get_routed_experts_layer_indices(vllm_config)
+    num_layers = (
+        len(layer_ids) if layer_ids is not None
+        else model_config.get_total_num_hidden_layers()
+    )
+""",
+        ),
+        (
+            "capturer layer map",
+            """        self.dp_rank = vllm_config.parallel_config.data_parallel_rank
+        self.tp_size = vllm_config.parallel_config.tensor_parallel_size
+""",
+            """        layer_ids = _get_routed_experts_layer_indices(vllm_config)
+        self.layer_id_to_capture_index = (
+            {layer_id: index for index, layer_id in enumerate(layer_ids)}
+            if layer_ids is not None else None
+        )
+        self.dp_rank = vllm_config.parallel_config.data_parallel_rank
+        self.tp_size = vllm_config.parallel_config.tensor_parallel_size
+""",
+        ),
+        (
+            "capture layer lookup",
+            """        ctx = get_forward_context()
+        if ctx.dp_metadata is None:  # single dp
+""",
+            """        capture_index = layer_id
+        if self.layer_id_to_capture_index is not None:
+            capture_index = self.layer_id_to_capture_index.get(layer_id)
+            if capture_index is None:
+                # Non-MoE backbone blocks and MTP routers have no payload slot.
+                return
+
+        ctx = get_forward_context()
+        if ctx.dp_metadata is None:  # single dp
+""",
+        ),
+        (
+            "capture buffer write",
+            """        if layer_id >= self.device_buffer.shape[1]:
+            raise IndexError(
+                f"routed-experts layer {layer_id} exceeds capture buffer "
+                f"layer count {self.device_buffer.shape[1]}"
+            )
+
+        self.device_buffer[:token_num_per_dp, layer_id, :] = topk_ids[
+""",
+            """        if capture_index >= self.device_buffer.shape[1]:
+            raise IndexError(
+                f"routed-experts layer {layer_id} exceeds capture buffer "
+                f"layer count {self.device_buffer.shape[1]}"
+            )
+
+        self.device_buffer[:token_num_per_dp, capture_index, :] = topk_ids[
+""",
+        ),
+    )
+    allocation_anchors = (
+        "num_layers, _, num_experts_per_tok = _get_routed_experts_shape(vllm_config)",
+        "num_layers, num_experts, num_experts_per_tok = _get_routed_experts_shape(\n"
+        "            vllm_config\n        )",
+        "                max_num_batched_tokens,\n"
+        "                num_layers,\n                num_experts_per_tok,",
+        "                max_num_slots,\n"
+        "                num_layers,\n                num_experts_per_tok,",
+    )
+    if any(content.count(anchor) != 1 for anchor in allocation_anchors):
+        raise ValueError("expected the vLLM 0.29 GPU and scheduler allocation blocks")
+    states = [
+        (content.replace(new, "").count(old), content.count(new))
+        for _, old, new in replacements
+    ]
+    if all(state == (0, 1) for state in states):
+        return content
+    if not all(state == (1, 0) for state in states):
+        raise ValueError(
+            "expected the complete stock or compact vLLM 0.29 capture blocks; "
+            f"found {dict(zip((item[0] for item in replacements), states))}"
+        )
+    for _, old, new in replacements:
+        content = content.replace(old, new, 1)
+    return content
+
+
+def _patch_vllm_routed_experts_compact_layers(
+    logger, *, required: bool = False
+) -> bool:
+    """Use only explicit backbone MoE layers in both vLLM capture buffers.
+
+    GPU capturer and scheduler share ``_get_routed_experts_shape`` in vLLM
+    0.29. Patch its layer count and the capturer's global-layer lookup together
+    before engine processes start. Exact source anchors allow the independent
+    router-fallback patch above in either order, but reject partial or unknown
+    allocation/indexing implementations without writing the file.
+    """
+    try:
+        file_to_patch = _get_vllm_file(
+            "model_executor/layers/fused_moe/routed_experts_capturer.py"
+        )
+        with _locked_file_patch(file_to_patch) as (content, write_back):
+            patched = _compact_routed_experts_capturer_source(content)
+            compile(patched, file_to_patch, "exec")
+            if patched != content:
+                write_back(patched)
+    except (RuntimeError, ValueError, SyntaxError) as error:
+        message = f"Could not apply compact routed-experts capture: {error}"
+        if required:
+            raise RuntimeError(message) from error
+        logger.warning(message)
+        return False
+    logger.info("Compact routed-experts capture buffers are enabled.")
+    return True
+
+
 def _patch_vllm_nemotron_h_fp32_lm_head(logger) -> bool:
     """Compute NemotronH logits with an fp32 LM head (MiniMax-M1-style).
 
@@ -1105,3 +1246,5 @@ def _apply_vllm_patches(
     _patch_vllm_routed_experts_capture_router_fallback(
         patch_logger, required=require_moe_routed_experts_capture
     )
+    if require_moe_routed_experts_capture:
+        _patch_vllm_routed_experts_compact_layers(patch_logger, required=True)

@@ -153,6 +153,59 @@ def test_build_router_replay_tensors_maps_full_layer_payload_to_moe_layers():
 
 @pytest.mark.mcore
 @pytest.mark.parametrize(
+    "pattern_field", ["hybrid_layer_pattern", "hybrid_override_pattern"]
+)
+@pytest.mark.parametrize("compact", [False, True], ids=["full_layers", "moe_layers"])
+def test_hybrid_replay_maps_compact_and_full_payloads(pattern_field, compact):
+    from megatron.core.transformer.moe.router_replay import RouterReplay
+
+    from nemo_rl.models.megatron.router_replay import (
+        build_router_replay_tensors,
+        router_replay_dimensions,
+    )
+
+    class DummyRouter(torch.nn.Module):
+        def __init__(self, layer_number):
+            super().__init__()
+            self.router_replay = RouterReplay()
+            self.layer_number = layer_number
+
+    RouterReplay.clear_global_router_replay_instances()
+    try:
+        model = torch.nn.Module()
+        model.config = SimpleNamespace(
+            num_layers=6,
+            moe_layer_freq=1,
+            moe_router_topk=2,
+            **{pattern_field: "MEM|*E-/ME/ME"},
+        )
+        # Reverse traversal order to ensure payload columns follow global layer
+        # IDs, not module order. Pipeline delimiters and MTP do not add columns.
+        model.routers = torch.nn.ModuleList([DummyRouter(5), DummyRouter(2)])
+        full_routes = torch.arange(3 * 6 * 2, dtype=torch.int16).reshape(3, 6, 2)
+        routes = full_routes[:, [1, 4]].contiguous() if compact else full_routes
+
+        assert router_replay_dimensions(model.config) == (2, 2)
+        replay_tensors = build_router_replay_tensors(model, routes)
+        torch.testing.assert_close(replay_tensors[0], full_routes[:, 4].long())
+        torch.testing.assert_close(replay_tensors[1], full_routes[:, 1].long())
+    finally:
+        RouterReplay.clear_global_router_replay_instances()
+
+
+@pytest.mark.mcore
+def test_hybrid_replay_rejects_inconsistent_backbone_length():
+    from nemo_rl.models.megatron.router_replay import router_replay_dimensions
+
+    config = SimpleNamespace(
+        num_layers=4, hybrid_layer_pattern="ME|M/ME", moe_router_topk=2
+    )
+    with pytest.raises(ValueError, match="3 main-decoder layers but num_layers=4"):
+        router_replay_dimensions(config)
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize(
     ("env_value", "expected"),
     [
         (None, True),
