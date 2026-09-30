@@ -23,10 +23,9 @@ This module provides different advantage estimation strategies:
 - OPDAdvantageEstimator: Multi-Teacher On-Policy Distillation (MOPD) token-level distillation advantages
 
 Every group-relative estimator (GRPO, GDPO, Reinforce++) accepts ``valid_mask``
-and must honor it. SingleController's default ``valid_owners`` population
-excludes masked rows from baselines; ``all_owners`` explicitly restores their
-reward participation without changing loss masks. CC deduplicates segments
-before estimation so each logical owner contributes at most one reward.
+and must honor it: masked rollouts do not contribute to group baselines.
+CC deduplicates segments before estimation so each logical rollout contributes
+at most one reward, using the same validity rule as ordinary rollouts.
 
 Reference papers:
 - ProRLv2: https://developer.nvidia.com/blog/scaling-llm-reinforcement-learning-with-prolonged-training-using-prorl-v2/

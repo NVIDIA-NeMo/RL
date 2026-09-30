@@ -149,7 +149,7 @@ def test_same_calls_as_segments_preserve_loss_and_gradients(
             partition_id="canonical",
             select_fields=meta.fields,
         )
-        ctrl = _controller(meta, canonical, grpo={"baseline_population": "all_owners"})
+        ctrl = _controller(meta, canonical)
         _, valid = asyncio.run(ctrl._advantage_stage(meta))
         assert valid
     finally:

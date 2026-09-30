@@ -90,6 +90,7 @@ def select_captured_calls(
     by_call: dict[str, CallRecord] = {r.model_call_id: r for r in records}
     if len(by_response) != len(records) or len(by_call) != len(records):
         raise ValueError("Capture contains reused call or response identities")
+    terminal = by_response.get((result.get("response") or {}).get("id") or "")
     selected = []
     referenced: list[CallRecord] | None = None
     turns = (result.get("ng_trajectory") or {}).get("turns") or []
@@ -144,7 +145,6 @@ def select_captured_calls(
         # Exact later identities can disambiguate an earlier retry through a
         # verified parent. They never add unreturned actions to the selection.
         required = set()
-        terminal = by_response.get((result.get("response") or {}).get("id") or "")
         identified = {terminal.model_call_id} if terminal is not None else set()
         identified.update(record.model_call_id for record in terminals.values())
         for item in items:
@@ -230,7 +230,6 @@ def select_captured_calls(
     indexes = [positions[r.model_call_id] for r in selected]
     if indexes != sorted(set(indexes)):
         raise ValueError("Accepted generations are duplicated or out of capture order")
-    terminal = by_response.get((result.get("response") or {}).get("id") or "")
     if terminal is not None and terminal != selected[-1]:
         raise ValueError("Selected terminal differs from the scored response")
     declared = result.get("terminal_response_id")
