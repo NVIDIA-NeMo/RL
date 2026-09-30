@@ -14,8 +14,7 @@
 
 """Zero train/generation KL (batch-invariant Megatron) resolve, validate, and enable.
 
-Precision gate (4) is BF16 vs MXFP8 from ``policy.precision`` and ``fp8_cfg`` only.
-``te_precision_config_file`` is out of scope here (``setup._apply_precision_config``).
+Only BF16 (no FP8) is supported.
 """
 
 from __future__ import annotations
@@ -24,27 +23,22 @@ import subprocess
 import warnings
 from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, version
-from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
 from packaging.version import Version
 
 if TYPE_CHECKING:
     from nemo_rl.models.policy import PolicyConfig
 
-# Batch-invariant inference kernels and the batch_invariant_backend/collective
-# knobs this mode configures.
-#
-# Has to be a commit on main. The previous value came from Megatron-LM PR #6933
-# (TE MXFP8 grouped MoE inference), which is still an open PR, so it exists only
-# on that branch -- no main-based checkout can satisfy it, whatever its date.
+# Minimum Megatron-Core commit providing the batch-invariant inference kernels
+# and the batch_invariant_backend/collective knobs this mode configures. Has to
+# be a commit on main.
 MEGATRON_CORE_MIN_COMMIT_SHA = "b005bf14c46b62169533e755ca2d4e62fe6b7e0a"
 
 TRANSFORMER_ENGINE_MIN_VERSION = Version("2.18")
 FLASH_ATTN_MIN_VERSION = Version("2.8.1")
 FLASH_ATTN_4_MIN_VERSION = Version("4.0.0b20")
 CUTEDSL_MIN_VERSION = Version("4.6.0.dev0")
-
-PrecisionKind = Literal["bf16", "mxfp8"]
 
 _ZERO_KL_MEGATRON_DEFAULTS: dict[str, Any] = {
     "batch_invariant_mode": True,
@@ -59,74 +53,6 @@ _ZERO_KL_GENERATION_DEFAULTS: dict[str, Any] = {
     "logprobs_mode": "raw_logprobs",
     "enable_chunked_prefill": False,
 }
-
-# Applied on top of the above only when generation selects the FlashInfer
-# megakernel. batch_invariant_backend/collective are unchanged and still come
-# from _ZERO_KL_MEGATRON_DEFAULTS: mega replaces the expert compute alone, so
-# te_native still patches qkv/proj/attention and still swaps the inference
-# router onto training's eager top-k, which is what makes per-token log-probs
-# match. The 'ordered' collective is inert here -- it configures the NVLS
-# dispatcher's cross-rank combine, and mega owns EP transport -- but is kept
-# set because validate_batch_invariant_mode requires the field on both sides.
-_ZERO_KL_MEGA_MEGATRON_DEFAULTS: dict[str, Any] = {
-    # The megakernel hangs off InferenceGroupedMLP, which only the
-    # inference_optimized layer spec builds, so a training side left on the
-    # default transformer_engine has nothing to call. Set here rather than in
-    # the recipe so it cannot come apart from moe_mega_training_forward below.
-    "transformer_impl": "inference_optimized",
-    # The backend is what selects the megakernel within that expert module, and
-    # MCore validates it against moe_mega_training_forward, so the
-    # generation-side value under mcore_generation_config is not enough.
-    "inference_grouped_gemm_backend": "flashinfer_mega",
-}
-
-# Applied only to a training megatron_cfg. A dedicated generation model runs on
-# merged_inference_megatron_cfg, which is also a megatron_cfg and is also
-# resolved by this module, but has no backward for any of these to serve.
-_ZERO_KL_MEGA_TRAIN_ONLY_DEFAULTS: dict[str, Any] = {
-    # Without this the training forward runs TE while generation runs the
-    # megakernel. They agree only to ~6e-3 relative, which is the mismatch this
-    # whole mode exists to remove, so it is forced rather than defaulted.
-    "moe_mega_training_forward": True,
-    # The mega forward saves no intermediates, so the backward is built from a
-    # recompute pass through the ordinary TE path.
-    "activation_checkpointing": True,
-    "recompute_granularity": "selective",
-}
-# The mega precisions that can hold zero-KL. Both build the kernel's weights
-# themselves, which is what lets a refit reach the kernel instead of leaving
-# generation on weights snapshotted at construction, and both run the same
-# kernel on the training side, which is what keeps the two forwards bitwise.
-# nvfp4 and fp8_fp4 have neither property: FlashInfer preprocesses and snapshots
-# their weights, so a refit never lands.
-#
-# They differ in the backward. bf16 also matches TransformerEngine's gradient to
-# rounding. mxfp8 does not -- its gradient comes from the bf16 recompute pass, a
-# straight-through estimator -- so it additionally requires
-# moe_mega_training_straight_through, which is the recipe saying it accepts that.
-_ZERO_KL_MEGA_PRECISIONS: tuple[str, ...] = ("bf16", "mxfp8")
-_ZERO_KL_MEGA_DEFAULT_PRECISION = "bf16"
-
-
-def _requested_mega_precision(config: PolicyConfig) -> str:
-    """The megakernel precision the recipe asked for, on either side.
-
-    Read from one place and pushed to both, because the two sides being bitwise
-    depends on them running the same kernel at the same precision -- and a
-    recipe that set only the generation value would look correct while training
-    silently ran bf16.
-    """
-    from nemo_rl.models.generation.megatron.config import merged_inference_megatron_cfg
-
-    if config.get("generation") is None:
-        # A merged generation config is resolved as a megatron_cfg of its own,
-        # and a colocated policy has no generation section; both carry it inline.
-        precision = config["megatron_cfg"].get("inference_mega_precision")
-    else:
-        precision = merged_inference_megatron_cfg(config).get(
-            "inference_mega_precision"
-        )
-    return precision or _ZERO_KL_MEGA_DEFAULT_PRECISION
 
 
 @dataclass
@@ -165,48 +91,6 @@ def resolve_zero_train_gen_mismatch(config: PolicyConfig) -> None:
                 _ZERO_KL_GENERATION_DEFAULTS,
             )
         )
-    if mega_backend_selected(config):
-        precision = _requested_mega_precision(config)
-        defaults.append((mc, "policy.megatron_cfg", _ZERO_KL_MEGA_MEGATRON_DEFAULTS))
-        # Pushed to the training side as well as the generation side. MCore
-        # validates moe_mega_training_forward against the training config's own
-        # precision, so a training side left at the bf16 default would run a
-        # different kernel from generation and quietly lose parity.
-        defaults.append(
-            (mc, "policy.megatron_cfg", {"inference_mega_precision": precision})
-        )
-        # Guarded like the generation block above: a colocated config, or the
-        # merged config a dedicated generation worker is resolved against, may
-        # carry no generation section at all.
-        if generation is not None:
-            defaults.append(
-                (
-                    generation["mcore_generation_config"],
-                    "policy.generation.mcore_generation_config",
-                    {"inference_mega_precision": precision},
-                )
-            )
-        if not mc.get("is_inference_model"):
-            defaults.append(
-                (mc, "policy.megatron_cfg", _ZERO_KL_MEGA_TRAIN_ONLY_DEFAULTS)
-            )
-            if precision != _ZERO_KL_MEGA_DEFAULT_PRECISION:
-                # MCore rejects a quantized mega training forward without this,
-                # and rejects the flag itself at bf16, so it cannot be a blanket
-                # default on either side.
-                defaults.append(
-                    (
-                        mc,
-                        "policy.megatron_cfg",
-                        {"moe_mega_training_straight_through": True},
-                    )
-                )
-            # Appended rather than assigned: recompute_modules is a list the
-            # recipe may already use for memory, and dropping its entries to add
-            # ours would silently raise activation memory.
-            modules = list(mc.get("recompute_modules") or [])
-            if "moe" not in modules:
-                mc["recompute_modules"] = modules + ["moe"]
     for cfg, config_path, values in defaults:
         for key, value in values.items():
             if key in cfg and cfg[key] != value:
@@ -234,7 +118,7 @@ def validate_zero_train_gen_mismatch(
     _validate_backend(config, out)
     _validate_platform(config, out, check_device=check_platform)
     if check_packages:
-        _validate_packages(out, mega=mega_backend_selected(config))
+        _validate_packages(out)
     _validate_model_architecture(config, out)
     _validate_precision(config, out)
     return out
@@ -270,6 +154,12 @@ def validate_batch_invariant_mode(config: PolicyConfig) -> ZeroTrainGenValidatio
         out.violations.append(
             "batch_invariant_mode=True currently requires training context "
             "parallel size 1."
+        )
+    if (config.get("sequence_packing") or {}).get("enabled"):
+        out.violations.append(
+            "batch_invariant_mode=True requires sequence_packing.enabled=False: "
+            "packing changes microbatch composition and the packed log-prob path "
+            "does not share generation's fused log-softmax."
         )
     if megatron_cfg.get("use_fused_linear_logprobs"):
         out.violations.append(
@@ -350,15 +240,12 @@ def configure_zero_train_gen_mismatch(
     config: PolicyConfig,
     *,
     apply_kernels: bool,
-    register_moe_bi_fp8_skip: Callable[[], None],
 ) -> None:
-    """Resolve, register Megatron config patch, validate, optionally enable kernels."""
+    """Resolve, validate, and optionally enable batch-invariant kernels."""
     if not config.get("megatron_cfg", {}).get("zero_train_gen_mismatch"):
         return
 
     resolve_zero_train_gen_mismatch(config)
-    register_moe_bi_fp8_skip()
-
     result = validate_zero_train_gen_mismatch(
         config,
         check_packages=apply_kernels,
@@ -377,111 +264,6 @@ def configure_zero_train_gen_mismatch(
         return
 
     enable_batch_invariant_kernels(config)
-
-
-def mega_backend_selected(config: PolicyConfig) -> bool:
-    """Whether generation runs the FlashInfer expert-parallel megakernel."""
-    from nemo_rl.models.generation.megatron.config import merged_inference_megatron_cfg
-
-    generation = config.get("generation")
-    if generation is None or generation.get("backend") != "megatron":
-        return False
-    backend = merged_inference_megatron_cfg(config).get(
-        "inference_grouped_gemm_backend"
-    )
-    return getattr(backend, "value", backend) == "flashinfer_mega"
-
-
-def _validate_mega_backend(
-    config: PolicyConfig,
-    inference_cfg: Mapping[str, Any],
-    out: ZeroTrainGenValidation,
-) -> None:
-    """Gates specific to inference_grouped_gemm_backend='flashinfer_mega'."""
-    megatron_cfg = config["megatron_cfg"]
-    # A dedicated generation model is built from merged_inference_megatron_cfg
-    # and its workers validate that merge as their megatron_cfg. Reading the
-    # train-side knobs off it compares generation values against training
-    # requirements, which rejects a correct setup: the merge legitimately
-    # carries the generation cuda_graph_impl and no backward at all.
-    trains = not megatron_cfg.get("is_inference_model")
-
-    # resolve_zero_train_gen_mismatch forces these, so reaching here with them
-    # unset means the caller validated a config it never resolved.
-    if trains and not megatron_cfg.get("moe_mega_training_forward"):
-        out.violations.append(
-            "generation uses inference_grouped_gemm_backend='flashinfer_mega' but "
-            "policy.megatron_cfg.moe_mega_training_forward is not set. The training "
-            "forward would run TransformerEngine while generation runs the "
-            "megakernel; the two agree only to ~6e-3 relative, which is the "
-            "train/generation mismatch this mode removes."
-        )
-    precision = inference_cfg.get("inference_mega_precision")
-    if precision not in _ZERO_KL_MEGA_PRECISIONS:
-        out.violations.append(
-            "zero_train_gen_mismatch requires inference_mega_precision in "
-            f"{list(_ZERO_KL_MEGA_PRECISIONS)} (got {precision!r}). FlashInfer "
-            "preprocesses and snapshots the other precisions' weights, so a refit "
-            "never reaches the kernel and generation keeps sampling from the "
-            "previous step's policy with nothing to show for it."
-        )
-    elif trains:
-        # Both sides must run the same kernel at the same precision or the
-        # forwards are not bitwise, which is the entire point of this mode.
-        train_precision = (
-            megatron_cfg.get("inference_mega_precision")
-            or _ZERO_KL_MEGA_DEFAULT_PRECISION
-        )
-        if train_precision != precision:
-            out.violations.append(
-                "policy.megatron_cfg.inference_mega_precision="
-                f"{train_precision!r} does not match generation's {precision!r}. "
-                "The training forward and generation would run the megakernel at "
-                "different precisions, so their outputs would not be bitwise equal."
-            )
-        # A quantized forward with a bf16 recomputed backward is a
-        # straight-through estimator. The forward stays bitwise, so parity holds;
-        # what is given up is gradient fidelity, which belongs in the recipe.
-        if precision != _ZERO_KL_MEGA_DEFAULT_PRECISION and not megatron_cfg.get(
-            "moe_mega_training_straight_through"
-        ):
-            out.violations.append(
-                f"inference_mega_precision={precision!r} requires policy."
-                "megatron_cfg.moe_mega_training_straight_through=true. The mega "
-                "forward runs quantized while the backward comes from the bf16 "
-                "recompute pass, so the gradient is that of the bf16 function -- a "
-                "straight-through estimator, with the convergence consequences "
-                "that implies."
-            )
-    if trains and (
-        megatron_cfg.get("recompute_granularity") != "selective"
-        or "moe" not in (megatron_cfg.get("recompute_modules") or [])
-    ):
-        out.violations.append(
-            "moe_mega_training_forward requires policy.megatron_cfg."
-            "recompute_granularity='selective' with 'moe' in recompute_modules: the "
-            "mega forward saves no intermediates, so the backward is built from the "
-            "recompute pass."
-        )
-    # Local CUDA graphs capture the MoE layer as one graph, which disables the
-    # layer-level recompute the backward is built from. Generation is free to
-    # graph: it has no backward, and its megakernel weights are repacked in
-    # place on refit so replay sees them.
-    if trains and megatron_cfg.get("cuda_graph_impl") == "local":
-        out.violations.append(
-            "moe_mega_training_forward is incompatible with "
-            "policy.megatron_cfg.cuda_graph_impl='local'; use 'none' on the "
-            "training side."
-        )
-    # The kernel raises instead of falling back when a rank exceeds the cap, so
-    # an unset value is a latent prefill-time crash rather than a slow path.
-    if not inference_cfg.get("inference_mega_max_tokens_per_rank"):
-        out.violations.append(
-            "inference_grouped_gemm_backend='flashinfer_mega' requires "
-            "inference_mega_max_tokens_per_rank. It is a hard workspace cap: the "
-            "kernel rejects a forward with more local tokens per EP rank, so it "
-            "must cover the widest prefill, not just the decode width."
-        )
 
 
 def _validate_backend(config: PolicyConfig, out: ZeroTrainGenValidation) -> None:
@@ -508,24 +290,6 @@ def _validate_backend(config: PolicyConfig, out: ZeroTrainGenValidation) -> None
             "'transformer_engine'; use 'inference_optimized' on the generation "
             "worker for better performance."
         )
-
-    fp8_cfg = inference_cfg.get("fp8_cfg") or {}
-    grouped_gemm_backend = inference_cfg.get("inference_grouped_gemm_backend")
-    grouped_gemm_backend = getattr(grouped_gemm_backend, "value", grouped_gemm_backend)
-    if (
-        impl == "inference_optimized"
-        and grouped_gemm_backend == "flashinfer"
-        and fp8_cfg.get("enabled")
-        and fp8_cfg.get("fp8_recipe") == "mxfp8"
-    ):
-        out.violations.append(
-            "zero_train_gen_mismatch does not support "
-            "inference_grouped_gemm_backend='flashinfer' with MXFP8: the FlashInfer "
-            "kernel is batch-invariant but not bitwise identical to TE training. "
-            "Use the Torch or vLLM MXFP8 exact-parity path."
-        )
-    if grouped_gemm_backend == "flashinfer_mega":
-        _validate_mega_backend(config, inference_cfg, out)
 
 
 def _validate_platform(
@@ -640,27 +404,8 @@ def _first_package_version(dist_names: tuple[str, ...]) -> Version | None:
     return None
 
 
-def _validate_packages(out: ZeroTrainGenValidation, *, mega: bool = False) -> None:
+def _validate_packages(out: ZeroTrainGenValidation) -> None:
     _validate_megatron_core_commit(MEGATRON_CORE_MIN_COMMIT_SHA, out)
-    if mega:
-        # No second commit gate for mega. The integration is not upstream yet,
-        # so any SHA to pin would be a local one, which passes trivially on the
-        # tree it was read from and fails everywhere else. The import check
-        # below is what actually establishes the kernel is available.
-        #
-        # flashinfer.moe_ep ships in no published flashinfer release; the mcore
-        # extra takes it from a git rev. Checked by import rather than by
-        # version because the git build reports whatever version it was cut
-        # from, which says nothing about whether the module is present.
-        try:
-            import flashinfer.moe_ep  # noqa: F401
-        except ImportError as exc:
-            out.violations.append(
-                "inference_grouped_gemm_backend='flashinfer_mega' requires "
-                f"flashinfer.moe_ep, which failed to import ({exc}). No released "
-                "flashinfer wheel contains it; install the git rev pinned by the "
-                "mcore extra in pyproject.toml."
-            )
 
     te_ver = _package_version("transformer_engine")
     if te_ver is None:
@@ -721,45 +466,21 @@ def _deny_if_true(
         )
 
 
-def _effective_train_precision(config: PolicyConfig) -> PrecisionKind | None:
-    """Classify train or merged-gen config as bf16 vs mxfp8 for zero-KL parity."""
-    megatron_cfg = config["megatron_cfg"]
-    fp8_cfg = megatron_cfg.get("fp8_cfg") or {}
-    if fp8_cfg.get("enabled"):
-        if fp8_cfg.get("fp8_recipe") != "mxfp8":
-            return None
-        return "mxfp8"
-    if config.get("precision") == "bfloat16":
-        return "bf16"
-    return None
-
-
 def _validate_precision(config: PolicyConfig, out: ZeroTrainGenValidation) -> None:
-    """Gate (4): allowed modes are BF16 or MXFP8; train and generation must agree."""
-    train_kind = _effective_train_precision(config)
-    if train_kind is None:
-        fp8_cfg = config["megatron_cfg"].get("fp8_cfg") or {}
-        if fp8_cfg.get("enabled"):
-            out.violations.append(
-                "zero_train_gen_mismatch supports mxfp8 (fp8_recipe='mxfp8') or "
-                f"policy.precision='bfloat16' without FP8 (got fp8_recipe="
-                f"{fp8_cfg.get('fp8_recipe')!r}, precision={config.get('precision')!r})."
-            )
-        else:
-            out.violations.append(
-                "zero_train_gen_mismatch requires policy.precision='bfloat16' "
-                f"(got {config.get('precision')!r})."
-            )
-        return
+    """Only BF16 without FP8 is supported, on both the train and generation side."""
+    if config.get("precision") != "bfloat16":
+        out.violations.append(
+            "zero_train_gen_mismatch requires policy.precision='bfloat16' "
+            f"(got {config.get('precision')!r})."
+        )
 
     from nemo_rl.models.generation.megatron.config import merged_inference_megatron_cfg
 
-    inference_cfg = merged_inference_megatron_cfg(config)
-    gen_kind = _effective_train_precision(
-        {"megatron_cfg": inference_cfg, "precision": config.get("precision")}
-    )
-    if gen_kind != train_kind:
-        out.violations.append(
-            "zero_train_gen_mismatch requires matching train/generation precision "
-            f"(train={train_kind!r}, generation={gen_kind!r})."
-        )
+    for label, cfg in (
+        ("policy.megatron_cfg", config["megatron_cfg"]),
+        ("generation", merged_inference_megatron_cfg(config)),
+    ):
+        if (cfg.get("fp8_cfg") or {}).get("enabled"):
+            out.violations.append(
+                f"zero_train_gen_mismatch does not support FP8 ({label}.fp8_cfg.enabled=true)."
+            )
