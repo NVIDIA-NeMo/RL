@@ -166,6 +166,7 @@ def model_forward(
     use_fused_linear_logprobs: bool = False,
     media_token_validity_mask: Optional[torch.Tensor] = None,
     model_slices_context_parallel_inputs: bool = False,
+    compute_mtp_loss: Optional[bool] = None,
 ) -> torch.Tensor:
     """Perform a single forward pass through the model.
 
@@ -233,6 +234,8 @@ def model_forward(
         # Only pass this kwarg when linear CE fusion is enabled. Older Megatron-LM
         # GPTModel.forward signatures do not accept it.
         additional_kwargs["return_logprobs_for_linear_ce_fusion"] = True
+    if compute_mtp_loss is not None:
+        additional_kwargs["compute_mtp_loss"] = compute_mtp_loss
 
     with straggler_timer() if straggler_timer is not None else nullcontext():
         output_tensor = model(
@@ -288,6 +291,7 @@ def forward_with_post_processing_fn(
     use_router_replay: bool = False,
     router_replay_train: bool = False,
     model_slices_context_parallel_inputs: bool = False,
+    compute_mtp_loss: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, Callable]:
     """Perform forward pass with pre-processed microbatch and return output tensor and post-processing function.
 
@@ -367,6 +371,7 @@ def forward_with_post_processing_fn(
                 use_fused_linear_logprobs=use_fused_linear_logprobs,
                 media_token_validity_mask=media_token_validity_mask,
                 model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
+                compute_mtp_loss=compute_mtp_loss,
             )
     except Exception:
         # The forward above armed the router-replay action (set_router_replay_forward);
@@ -497,6 +502,7 @@ def megatron_forward_backward(
     use_router_replay: bool = False,
     router_replay_train: bool = False,
     model_slices_context_parallel_inputs: bool = False,
+    compute_mtp_loss: Optional[bool] = None,
 ) -> Any:
     """Execute forward and backward passes using Megatron's utilities.
 
@@ -541,6 +547,7 @@ def megatron_forward_backward(
         use_router_replay=use_router_replay,
         router_replay_train=router_replay_train,
         model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
+        compute_mtp_loss=compute_mtp_loss,
     )
     forward_backward_func = get_forward_backward_func()
     if use_router_replay:

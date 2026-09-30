@@ -94,6 +94,12 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
+def _has_mtp_process(model: torch.nn.Module) -> bool:
+    while hasattr(model, "module"):
+        model = model.module
+    return hasattr(model, "mtp_process")
+
+
 def _install_value_head_load_skip(chunk: GPTModel) -> None:
     """Give the chunk a ``hide_loss_modules`` context manager that drops ``output_layer.*``.
 
@@ -583,6 +589,9 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
                         defer_fp32_logits=self.defer_fp32_logits,
                         global_valid_seqs=global_valid_seqs,
                         global_valid_toks=global_valid_toks,
+                        compute_mtp_loss=(
+                            False if _has_mtp_process(self.model) else None
+                        ),
                     )
 
                 # Empty unused memory
@@ -757,6 +766,10 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
             additional_kwargs = {}
             if packed_seq_params is not None:
                 additional_kwargs["packed_seq_params"] = packed_seq_params
+
+            # The value head uses the backbone hidden states, not MTP outputs.
+            if _has_mtp_process(model):
+                additional_kwargs["compute_mtp_loss"] = False
 
             output_tensor = model(
                 input_ids=input_ids_cp_sharded,
@@ -1007,10 +1020,10 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
 
     def finish_training(self) -> None:
         """Offload model, gradients, and optimizer to CPU after training."""
+        self.model.eval()
         self.model = self.move_model(
             self.model, "cpu", move_params=True, move_grads=True
         )
-        self.model.eval()
 
         if (
             hasattr(self, "optimizer")
