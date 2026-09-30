@@ -607,45 +607,6 @@ class TQTokenSink:
         self._store.clear(staging_keys)
 
 
-def _media_columns(
-    media: StagedMediaTensors | None, sentinels: dict[str, torch.Tensor]
-) -> dict[str, torch.Tensor]:
-    """Encode one row's media columns for a media-enabled partition.
-
-    Tensors are written with TQ's row dimension prepended and otherwise native:
-    ``imgs`` drops its own leading 1 so the row is ``[total_patches, F]`` and
-    the patch dim is the row's leading (ragged) dim, exactly like
-    ``token_ids_delta`` / ``routed_experts``, which is what a batched nested
-    read requires. ``fetch_media`` restores ``[1, total_patches, F]``. Integer
-    geometry is written as int32 (validated to fit) so each column has one
-    dtype across real rows and ``sentinels``.
-    """
-    present = media is not None
-    has_frames = present and media.num_frames is not None
-    columns: dict[str, torch.Tensor] = {
-        MEDIA_PRESENT_FIELD: torch.tensor([present], dtype=torch.bool),
-        MEDIA_HAS_FRAMES_FIELD: torch.tensor([has_frames], dtype=torch.bool),
-    }
-    tensors: dict[str, torch.Tensor | None] = (
-        {"imgs": None, "imgs_sizes": None, "num_frames": None}
-        if media is None
-        else {
-            "imgs": media.imgs.reshape(media.imgs.shape[1], media.imgs.shape[2]),
-            "imgs_sizes": media.imgs_sizes.to(torch.int32),
-            "num_frames": None
-            if media.num_frames is None
-            else media.num_frames.to(torch.int32),
-        }
-    )
-    for name, column in MEDIA_TENSOR_COLUMNS.items():
-        tensor = tensors[name]
-        if tensor is None:
-            columns[column] = sentinels[name].unsqueeze(0)
-        else:
-            columns[column] = tensor.detach().cpu().contiguous().unsqueeze(0)
-    return columns
-
-
 @dataclass(frozen=True)
 class PrefixChains:
     """One resolved ``staging_chain``: its tokens plus how much media it staged.
@@ -749,6 +710,47 @@ def resolve_admission_prefix_chains(
     if admission.staging_chain:
         return chain_prefix.fetch_chains(list(admission.staging_chain))
     return PrefixChains(expanded=list(admission.required_prefix_token_ids))
+
+
+def _media_columns(
+    media: StagedMediaTensors | None, sentinels: dict[str, torch.Tensor]
+) -> dict[str, torch.Tensor]:
+    """Encode one row's media columns for a media-enabled partition.
+
+    Tensors are written with TQ's row dimension prepended and otherwise native:
+    ``imgs`` drops its own leading 1 so the row is ``[total_patches, F]`` and
+    the patch dim is the row's leading (ragged) dim, exactly like
+    ``token_ids_delta`` / ``routed_experts``, which is what a batched nested
+    read requires. ``fetch_media`` restores ``[1, total_patches, F]``. Integer
+    geometry is written as int32 (validated to fit) so each column has one
+    dtype across real rows and ``sentinels``.
+    """
+    present = media is not None
+    has_frames = present and media.num_frames is not None
+    columns: dict[str, torch.Tensor] = {
+        MEDIA_PRESENT_FIELD: torch.tensor([present], dtype=torch.bool),
+        MEDIA_HAS_FRAMES_FIELD: torch.tensor([has_frames], dtype=torch.bool),
+    }
+    tensors: dict[str, torch.Tensor | None] = (
+        {"imgs": None, "imgs_sizes": None, "num_frames": None}
+        if media is None
+        else {
+            "imgs": media.imgs.reshape(media.imgs.shape[1], media.imgs.shape[2]),
+            "imgs_sizes": media.imgs_sizes.to(torch.int32),
+            "num_frames": None
+            if media.num_frames is None
+            else media.num_frames.to(torch.int32),
+        }
+    )
+    for name, column in MEDIA_TENSOR_COLUMNS.items():
+        tensor = tensors[name]
+        if tensor is None:
+            # Only absent media or optional frame counts use sentinels; a
+            # missing required tensor was rejected by validate_media_tensors.
+            columns[column] = sentinels[name].unsqueeze(0)
+        else:
+            columns[column] = tensor.detach().cpu().contiguous().unsqueeze(0)
+    return columns
 
 
 class TQTokenSource:
