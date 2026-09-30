@@ -506,6 +506,34 @@ def _validate_seq_logprob_error_in_loss(master_config: MasterConfig) -> None:
         )
 
 
+def _validate_generation_logprob_mode(master_config: MasterConfig) -> None:
+    """Reject raw Megatron logprobs when training recomputes a processed policy."""
+    generation = master_config.policy["generation"]
+    if generation is None or generation["backend"] != "megatron":
+        return
+    mode = generation.get("mcore_generation_config", {}).get(
+        "logprobs_mode", "processed_logprobs"
+    )
+    if mode != "raw_logprobs":
+        return
+    sampling_params = TrainingSamplingParams(
+        top_k=generation.get("top_k"),
+        top_p=generation.get("top_p"),
+        temperature=generation.get("temperature", 1.0),
+    )
+    if sampling_params.temperature != 1.0 or need_top_k_or_top_p_filtering(
+        sampling_params
+    ):
+        raise ValueError(
+            "Megatron GRPO requires processed_logprobs when temperature != 1 "
+            "or top-k/top-p filtering is enabled: training recomputes processed "
+            "logprobs, so raw generation logprobs would give inconsistent "
+            "importance ratios. Set policy.generation.mcore_generation_config."
+            "logprobs_mode=processed_logprobs, or use temperature=1, top_k=null "
+            "and top_p=1."
+        )
+
+
 def _validate_multimodal_dedup_capability(master_config: MasterConfig) -> None:
     """Reject configurations whose media transfer path is not qualified."""
     if not master_config.grpo.deduplicate_multimodal_data:
@@ -630,6 +658,7 @@ def setup(
         )
         generation_config = DynamoConfig.model_validate(generation_config).model_dump()
         policy_config["generation"] = generation_config
+    _validate_generation_logprob_mode(master_config)
     _validate_multimodal_dedup_capability(master_config)
     _validate_seq_logprob_error_in_loss(master_config)
 
