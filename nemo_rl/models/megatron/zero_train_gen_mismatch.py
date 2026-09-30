@@ -37,7 +37,6 @@ MEGATRON_CORE_MIN_COMMIT_SHA = "b005bf14c46b62169533e755ca2d4e62fe6b7e0a"
 
 TRANSFORMER_ENGINE_MIN_VERSION = Version("2.18")
 FLASH_ATTN_MIN_VERSION = Version("2.8.1")
-FLASH_ATTN_4_MIN_VERSION = Version("4.0.0b20")
 CUTEDSL_MIN_VERSION = Version("4.6.0.dev0")
 
 _ZERO_KL_MEGATRON_DEFAULTS: dict[str, Any] = {
@@ -218,9 +217,31 @@ def validate_batch_invariant_mode(config: PolicyConfig) -> ZeroTrainGenValidatio
     return out
 
 
+def allow_installed_flash_attn_4() -> None:
+    """Make MCore use an installed ``flash-attn-4`` older than its version gate.
+
+    ``megatron.core.transformer.attention`` only sets ``HAVE_FA4`` for
+    ``flash-attn-4>=4.0.0b20``, but the pinned mcore extra ships b19 (b20+ need
+    ``apache-tvm-ffi>=0.1.12``). The FA4 call signature is identical, so when the
+    distribution is installed but gated out, flip the module flags here instead
+    of requiring a Megatron-LM change. The flags are read at call time.
+    """
+    import megatron.core.transformer.attention as mcore_attention
+
+    if getattr(mcore_attention, "HAVE_FA4", False):
+        return
+    if _first_package_version(("flash-attn-4", "flash_attn_4")) is None:
+        return
+    from flash_attn.cute import flash_attn_varlen_func
+
+    mcore_attention.flash_attn4_varlen_func = flash_attn_varlen_func
+    mcore_attention.HAVE_FA4 = True
+
+
 def enable_batch_invariant_kernels(config: PolicyConfig) -> None:
     """Pin TE FA support and call MCore ``enable_batch_invariant_mode``."""
     megatron_cfg = config["megatron_cfg"]
+    allow_installed_flash_attn_4()
     collective = megatron_cfg["batch_invariant_collective"]
 
     from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
@@ -425,10 +446,8 @@ def _validate_packages(out: ZeroTrainGenValidation) -> None:
         )
 
     fa4 = _first_package_version(("flash-attn-4", "flash_attn_4"))
-    if fa4 is None or fa4 < FLASH_ATTN_4_MIN_VERSION:
-        out.violations.append(
-            f"flash-attn-4>={FLASH_ATTN_4_MIN_VERSION} required (got {fa4})."
-        )
+    if fa4 is None:
+        out.violations.append("flash-attn-4 is not installed (mcore extra).")
     cutedsl = _package_version("nvidia-cutlass-dsl")
     if cutedsl is None or cutedsl < CUTEDSL_MIN_VERSION:
         out.violations.append(
