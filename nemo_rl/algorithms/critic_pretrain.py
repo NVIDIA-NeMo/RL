@@ -510,7 +510,7 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
     """
     from pathlib import Path as _Path
 
-    from nemo_rl.algorithms.loss.loss_functions import MseValueLossFn
+    from nemo_rl.algorithms.loss.loss_functions import make_value_loss_fn
     from nemo_rl.algorithms.ppo import (
         _compute_critic_metrics,
         _compute_rollout_critic_metrics,
@@ -714,7 +714,9 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
     value_model.finish_training()  # block init, offload until first use
     print("  ✓ Value model initialized")
 
-    value_loss_fn = MseValueLossFn(master_config.value_loss_fn)
+    value_loss_fn = make_value_loss_fn(
+        master_config.value_loss_fn, value_config.get("value_head")
+    )
     adv_estimator = _create_advantage_estimator(master_config)
 
     if eval_only:
