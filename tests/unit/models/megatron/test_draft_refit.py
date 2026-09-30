@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from types import SimpleNamespace
 from typing import Any
 
@@ -441,11 +441,13 @@ def test_ipc_refit_preflights_and_caches_draft_before_zmq(
         calls.append("preflight")
         return cached_draft, None
 
-    def params(*, kv_scales: object, draft_weights: object):
+    def params(
+        *, kv_scales: object, draft_weights: object
+    ) -> Iterator[tuple[str, torch.Tensor]]:
         calls.append("params")
         assert kv_scales == {"scale": 1.0}
         assert draft_weights is cached_draft
-        return iter(())
+        yield from ()
 
     def stream(**kwargs: object) -> None:
         calls.append("stream")
