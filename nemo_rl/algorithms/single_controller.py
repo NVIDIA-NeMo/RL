@@ -35,6 +35,9 @@ Data flow:
                      Trainer → dp_client.get_samples(...)   (via its own client)
                  → dp_client.clear_samples(...)             ← SC clears after train
   _sync_weights  → WeightSynchronizer.sync_weights()
+
+With PPO Early Refit, policy training and _sync_weights run before
+_value_train_epochs so generation can overlap the critic update.
 """
 
 from __future__ import annotations
@@ -2767,7 +2770,8 @@ class SingleControllerActor:
                     buffer wrote them that way at rollout time.
                 c. One _buffer_capacity permit is released per group that left the buffer.
             2. Prepare the batch.
-                a. Policy and reference logprobs.
+                a. Policy and reference logprobs (after the value forward when
+                    PPO Early Refit is active).
                 b. Value model forward (PPO only), with the policy parked on CPU
                     so the critic never shares the training GPUs with it.
                 c. _advantage_stage.
@@ -2777,7 +2781,8 @@ class SingleControllerActor:
                     chunk -- the value workers have no split train API yet (#2625).
                 b. Policy model: train_microbatches_from_meta, which only
                     accumulates gradients.
-                c. PPO only: all critic updates run before all policy updates.
+                c. PPO only: critic updates precede policy updates by default;
+                    Early Refit runs policy updates and refit before critic updates.
                     Their counts are ppo.critic_ppo_epochs and ppo.ppo_epochs,
                     respectively. Each policy optimizer step closes here rather
                     than in 5 -- a PPO step is one chunk, so there is nothing to
@@ -2789,7 +2794,8 @@ class SingleControllerActor:
                 accumulated gradients, rescales, and runs optimizer.step. Then
                 _cleanup_consumed_metas clears every consumed canonical row and its
                 staged capture deltas.
-            6. Refit the model. Sync the new policy weights to generation.
+            6. Refit the model. Sync the new policy weights to generation unless
+                PPO Early Refit already published them during 3.
 
         PPO critic warmup (ppo.policy_training_start_step > 0) changes which of those
         run. For the first N steps 3a still trains the critic every step, but 3b and 6

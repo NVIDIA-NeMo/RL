@@ -1266,20 +1266,11 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                 "async_rl.sampler.max_lookahead_versions>=1 so publishing policy "
                 "v+1 can admit a rollout batch while critic v is training."
             )
-        policy_dtensor_cfg = master_config.policy.get("dtensor_cfg", {})  # type: ignore
-        uses_megatron = bool(policy_megatron_cfg.get("enabled"))
-        uses_supported_dtensor = bool(
-            policy_dtensor_cfg.get("enabled")
-            and policy_dtensor_cfg.get("_v2")
-            and not policy_dtensor_cfg.get("cpu_offload", False)
-        )
-        if not (uses_megatron or uses_supported_dtensor):
+        if not policy_megatron_cfg.get("enabled"):
             raise ValueError(
-                "async_rl.early_refit=true requires a policy backend with the "
-                "parameter-residency contract: policy.megatron_cfg.enabled=true, "
-                "or policy.dtensor_cfg.enabled=true with _v2=true and "
-                "cpu_offload=false. DTensor v1 and DTensor v2 CPU offload cannot "
-                "retain and verify policy parameters across inference and training."
+                "async_rl.early_refit=true requires policy.megatron_cfg.enabled=true. "
+                "SingleController's split training API is not implemented by the "
+                "DTensor policy workers."
             )
         if generation_config["colocated"]["enabled"]:
             raise ValueError(

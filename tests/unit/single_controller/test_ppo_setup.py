@@ -277,29 +277,16 @@ class TestPPOValidation:
 
         validate_single_controller_config(mc)
 
-    def test_accepts_early_refit_with_dtensor_v2_without_cpu_offload(self):
-        mc = _ppo_master_config(
-            megatron_enabled=False,
-            value=_value_config(megatron_enabled=True),
-        )
-        mc.policy["dtensor_cfg"] = {
-            "enabled": True,
-            "_v2": True,
-            "cpu_offload": False,
-        }
-        mc.async_rl.early_refit = True
-
-        validate_single_controller_config(mc)
-
     @pytest.mark.parametrize(
         "dtensor_cfg",
         [
             {"enabled": True, "_v2": False, "cpu_offload": False},
+            {"enabled": True, "_v2": True, "cpu_offload": False},
             {"enabled": True, "_v2": True, "cpu_offload": True},
         ],
-        ids=["dtensor-v1", "dtensor-v2-cpu-offload"],
+        ids=["dtensor-v1", "dtensor-v2", "dtensor-v2-cpu-offload"],
     )
-    def test_rejects_early_refit_without_param_residency_backend(self, dtensor_cfg):
+    def test_rejects_early_refit_with_dtensor_policy(self, dtensor_cfg):
         mc = _ppo_master_config(
             megatron_enabled=False,
             value=_value_config(megatron_enabled=True),
@@ -307,7 +294,9 @@ class TestPPOValidation:
         mc.policy["dtensor_cfg"] = dtensor_cfg
         mc.async_rl.early_refit = True
 
-        with pytest.raises(ValueError, match="parameter-residency contract"):
+        with pytest.raises(
+            ValueError, match="requires policy.megatron_cfg.enabled=true"
+        ):
             validate_single_controller_config(mc)
 
     def test_rejects_early_refit_without_lookahead(self):
