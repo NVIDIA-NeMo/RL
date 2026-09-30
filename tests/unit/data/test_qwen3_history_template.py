@@ -21,22 +21,24 @@ from pathlib import Path
 
 import pytest
 from omegaconf import OmegaConf
+from transformers import PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.xtoken_off_policy_distillation import MasterConfig
-from nemo_rl.utils.config import register_omegaconf_resolvers, load_config
-from nemo_rl.data.utils import setup_response_data
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.algorithms.x_token.token_aligner import TokenAligner
+from nemo_rl.algorithms.xtoken_off_policy_distillation import MasterConfig
 from nemo_rl.data.cross_tokenizer_collate import (
     CrossTokenizerCollator,
     CrossTokenizerCollatorConfig,
 )
-from nemo_rl.data.native_chat import _render_and_tokenize_chat
 from nemo_rl.data.datasets.response_datasets.oai_format_dataset import (
     OpenAIFormatDataset,
 )
 from nemo_rl.data.interfaces import TaskDataSpec
+from nemo_rl.data.native_chat import _render_and_tokenize_chat
 from nemo_rl.data.processors import chat_kd_processor
+from nemo_rl.data.utils import setup_response_data
+from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
+from tests.functional.xtoken_native_chat import write_dataset
 
 ROOT = Path(__file__).resolve().parents[3]
 FIXTURES = Path(__file__).parent / "fixtures/xtoken"
@@ -74,6 +76,16 @@ def conversation(inline: bool = False) -> list[dict]:
                     + message["content"]
                 )
     return messages
+
+
+@pytest.fixture(scope="module")
+def stock_qwen_tokenizer() -> PreTrainedTokenizerBase:
+    return get_tokenizer(
+        {
+            "name": "Qwen/Qwen3-4B",
+            "tokenizer_kwargs": {"revision": REVISION},
+        }
+    )
 
 
 @pytest.fixture(scope="module")
@@ -137,7 +149,9 @@ def test_flag_precedence(qwen_tokenizer, flags, earlier):
 
 @pytest.mark.parametrize("enable_thinking", [None, False, True])
 def test_stock_generation_prompt_and_tool_serialization(
-    qwen_tokenizer, enable_thinking
+    qwen_tokenizer,
+    stock_qwen_tokenizer: PreTrainedTokenizerBase,
+    enable_thinking,
 ):
     messages = conversation()
     messages[1]["tool_calls"] = [
@@ -171,7 +185,7 @@ def test_stock_generation_prompt_and_tool_serialization(
     stock = render(
         qwen_tokenizer,
         messages,
-        chat_template=(FIXTURES / "qwen3_4b_stock.jinja").read_text(),
+        chat_template=stock_qwen_tokenizer.chat_template,
         tools=tools,
         tokenize=False,
         add_generation_prompt=True,
@@ -374,9 +388,10 @@ def test_real_qwen_dataset_tools_to_collator(qwen_tokenizer, tmp_path):
     assert batch["alignment_0_pair_valid"].any()
 
 
-def test_stock_qwen_dropped_history_fails_with_sample_context(qwen_tokenizer):
-    student = copy.deepcopy(qwen_tokenizer)
-    student.chat_template = (FIXTURES / "qwen3_4b_stock.jinja").read_text()
+def test_stock_qwen_dropped_history_fails_with_sample_context(
+    stock_qwen_tokenizer: PreTrainedTokenizerBase,
+):
+    student = copy.deepcopy(stock_qwen_tokenizer)
     with pytest.raises(
         ValueError, match="student, sample idx=71.*(reasoning|historical)"
     ):
@@ -418,17 +433,21 @@ def test_native_collator_rejects_configured_history_truncation(flags):
         )
 
 
-def test_native_recipe_loads_exact_tokenizers_and_dataset():
+def test_native_functional_config_loads_exact_tokenizers_and_dataset(
+    tmp_path: Path,
+) -> None:
+    data_path = tmp_path / "native_chat.jsonl"
+    write_dataset(data_path)
     register_omegaconf_resolvers()
-    path = (
-        ROOT
-        / "examples/configs/recipes/llm/distillation-xtoken-qwen3-4b-to-qwen3-0.6b-1n8g-fsdp2tp1-native-chat.yaml"
-    )
+    path = ROOT / "tests/functional/xtoken_native_chat.yaml"
+    raw_config = load_config(path)
+    OmegaConf.update(raw_config, "data.train.data_path", str(data_path))
     config = MasterConfig.model_validate(
-        OmegaConf.to_container(load_config(path), resolve=True)
+        OmegaConf.to_container(raw_config, resolve=True)
     )
     student = get_tokenizer(config.policy["tokenizer"])
     teacher = get_tokenizer(config.teachers[0].policy_config()["tokenizer"])
+    assert student.get_vocab() != teacher.get_vocab()
     train, validation = setup_response_data(student, config.data, env_configs=None)
     assert validation is None
     rows = [train[index] for index in range(len(train))]
@@ -446,3 +465,10 @@ def test_native_recipe_loads_exact_tokenizers_and_dataset():
     assert batch["input_ids"].shape[0] == 8
     assert batch["alignment_0_pair_valid"].any(dim=1).all()
     assert batch["token_mask"].sum(dim=1).min() > 0
+    student_chunks = batch["alignment_0_student_chunk_id"]
+    teacher_chunks = batch["alignment_0_teacher_chunk_id"]
+    assert any(
+        (student_chunks[sample] == chunk).sum().item()
+        != (teacher_chunks[sample] == chunk).sum().item()
+        for sample, chunk in batch["alignment_0_pair_valid"].nonzero().tolist()
+    )
