@@ -506,20 +506,18 @@ def _validate_seq_logprob_error_in_loss(master_config: MasterConfig) -> None:
         )
 
 
-def _validate_generation_logprob_mode(master_config: MasterConfig) -> None:
+def _validate_generation_logprob_mode(policy_config: PolicyConfig) -> None:
     """Reject raw Megatron logprobs when training recomputes a processed policy."""
-    generation = master_config.policy["generation"]
+    generation = policy_config["generation"]
     if generation is None or generation["backend"] != "megatron":
         return
-    mode = generation.get("mcore_generation_config", {}).get(
-        "logprobs_mode", "processed_logprobs"
-    )
+    mode = generation["mcore_generation_config"]["logprobs_mode"]
     if mode != "raw_logprobs":
         return
     sampling_params = TrainingSamplingParams(
         top_k=generation.get("top_k"),
         top_p=generation.get("top_p"),
-        temperature=generation.get("temperature", 1.0),
+        temperature=generation["temperature"],
     )
     if sampling_params.temperature != 1.0 or need_top_k_or_top_p_filtering(
         sampling_params
@@ -658,7 +656,7 @@ def setup(
         )
         generation_config = DynamoConfig.model_validate(generation_config).model_dump()
         policy_config["generation"] = generation_config
-    _validate_generation_logprob_mode(master_config)
+    _validate_generation_logprob_mode(master_config.policy)
     _validate_multimodal_dedup_capability(master_config)
     _validate_seq_logprob_error_in_loss(master_config)
 
