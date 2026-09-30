@@ -456,10 +456,9 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   metric that reports the fraction of learner rows built from captured media.
   The vLLM path needs no new Megatron-LM pin. The Megatron Inference path
   requires a Megatron-LM pin with `media_tensors` on the offloaded payload and
-  expanded-prefix stitching (NVIDIA/Megatron-LM#7598); when the driver
-  environment can import megatron-core, setup refuses a multimodal Megatron
-  capture run on an older pin (otherwise the first multi-turn media call fails
-  in the worker's prompt preparer).
+  expanded-prefix stitching (NVIDIA/Megatron-LM#7598); on an older pin the
+  worker's prompt preparer fails its first capture call with an `ImportError`
+  naming the missing stitching field.
   Compaction, mixed image/video conversations, native audio,
   video token pruning, static tiling (`image_num_patches`), other processor families,
   datasets that mix text-only and media prompts (every all-text group is dropped),

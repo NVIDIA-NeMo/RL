@@ -119,9 +119,10 @@ class TQMegatronPromptPreparer:
             TypeError: The prompt is not a token-id list.
         """
         # Deferred import: megatron-core is a heavy, optional dependency.
-        from megatron.core.inference import inference_request
         from megatron.core.inference.inference_request import (
             PREFIX_EOS_TOKEN_ID_FIELD,
+            PREFIX_EXPANDED_TOKEN_COUNT_FIELD,
+            PREFIX_MEDIA_COUNT_FIELD,
             PREFIX_TEMPLATE_TOKEN_IDS_FIELD,
             RequestPromptPreparationResult,
         )
@@ -140,12 +141,9 @@ class TQMegatronPromptPreparer:
 
         admission = CaptureAdmission.model_validate(capture_payload)
         if admission.mode == "text":
-            media_count_field = getattr(
-                inference_request, "PREFIX_MEDIA_COUNT_FIELD", None
-            )
-            if media_count_field and media_count_field in offload_params:
+            if PREFIX_MEDIA_COUNT_FIELD in offload_params:
                 offload_params = dict(offload_params)
-                offload_params.pop(media_count_field)
+                offload_params.pop(PREFIX_MEDIA_COUNT_FIELD)
             return RequestPromptPreparationResult(
                 prompt=prompt, offload_params=offload_params
             )
@@ -204,10 +202,7 @@ class TQMegatronPromptPreparer:
 
         if prompt[: len(prefix_token_ids)] != prefix_token_ids:
             raise ValueError("MInf failed to apply the authorized token prefix")
-        media_count_field = getattr(inference_request, "PREFIX_MEDIA_COUNT_FIELD", None)
-        endpoint_media_count = (
-            updated_offload_params.get(media_count_field) if media_count_field else None
-        )
+        endpoint_media_count = updated_offload_params.get(PREFIX_MEDIA_COUNT_FIELD)
         if (endpoint_media_count or 0) != chains.media_count:
             raise ValueError(
                 "MInf capture prefix media count mismatch: the chat request's history "
@@ -215,9 +210,9 @@ class TQMegatronPromptPreparer:
                 f"{chains.media_count}"
             )
         if endpoint_media_count is not None:
-            updated_offload_params[
-                inference_request.PREFIX_EXPANDED_TOKEN_COUNT_FIELD
-            ] = len(prefix_token_ids)
+            updated_offload_params[PREFIX_EXPANDED_TOKEN_COUNT_FIELD] = len(
+                prefix_token_ids
+            )
         return RequestPromptPreparationResult(
             prompt=prompt, offload_params=updated_offload_params
         )

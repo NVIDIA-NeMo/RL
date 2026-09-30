@@ -25,7 +25,7 @@ import os
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, fields as dataclass_fields
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Optional, cast
@@ -1028,53 +1028,6 @@ def _load_opd_full_teacher_lm_heads(
         )
 
 
-_MINF_MEDIA_PAYLOAD_FIELDS = ("media_tensors",)
-_MINF_PREFIX_STITCHING_FIELDS = (
-    "PREFIX_MEDIA_COUNT_FIELD",
-    "PREFIX_EXPANDED_TOKEN_COUNT_FIELD",
-)
-
-
-def _require_minf_media_payload_fields() -> None:
-    """Fail at setup if the pinned megatron-core cannot capture media.
-
-    Megatron media capture stages ``OffloadedRequestPayload.media_tensors``,
-    and multi-turn media prompts need the engine to expand only the media after
-    an already-expanded prefix (expanded-prefix stitching). Without the first the
-    stager would hand TQ a text sentinel for every VLM call and the finalizer
-    would drop every group; without the second every later turn would expand
-    its spliced prefix twice and be rejected. Check both at config time rather
-    than training image-blind or failing mid-rollout.
-    """
-    try:
-        # Deferred import: megatron-core is a heavy, optional dependency.
-        from megatron.core.inference import inference_request
-    except ImportError:
-        return
-    present = {
-        field.name
-        for field in dataclass_fields(inference_request.OffloadedRequestPayload)
-    }
-    missing = [
-        f"OffloadedRequestPayload.{name}"
-        for name in _MINF_MEDIA_PAYLOAD_FIELDS
-        if name not in present
-    ]
-    missing += [
-        name
-        for name in _MINF_PREFIX_STITCHING_FIELDS
-        if not hasattr(inference_request, name)
-    ]
-    if missing:
-        raise NotImplementedError(
-            "Megatron media token capture requires OffloadedRequestPayload."
-            "media_tensors and expanded-prefix stitching; "
-            f"the pinned Megatron-LM lacks: {', '.join(missing)}. Bump "
-            "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge to a revision that "
-            "includes it, or use policy.generation.backend=vllm."
-        )
-
-
 def setup_single_controller(
     master_config: MasterConfig,
     tokenizer: PreTrainedTokenizerBase,
@@ -1337,8 +1290,6 @@ def setup_single_controller(
                     "Megatron token capture does not yet support router replay: "
                     "the canonical MInf stager does not yet normalize routed experts"
                 )
-            if capture_media:
-                _require_minf_media_payload_fields()
 
         # Fill the derived ledger-hosting fields (see TokenCaptureConfig): a
         # per-run control-plane bearer token, the process-shared capture

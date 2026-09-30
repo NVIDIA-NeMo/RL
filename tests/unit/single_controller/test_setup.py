@@ -18,9 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
-import sys
 import threading
-import types
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -238,84 +236,6 @@ def _save_state(
     state.current_epoch = epoch
     state.trainer_version = trainer_version
     return state
-
-
-def _stub_megatron_inference_request(
-    monkeypatch: pytest.MonkeyPatch, inference_request: types.SimpleNamespace
-) -> None:
-    """Make ``from megatron.core.inference import inference_request`` resolve to a stub.
-
-    Stubs the parent packages too, so the check does not depend on whether the
-    driver venv carries megatron-core (unit tests run without it).
-    """
-    for name in ("megatron", "megatron.core", "megatron.core.inference"):
-        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
-    monkeypatch.setitem(
-        sys.modules, "megatron.core.inference.inference_request", inference_request
-    )
-
-
-def _stub_offloaded_payload(*field_names: str) -> type:
-    """Build a stand-in ``OffloadedRequestPayload`` dataclass with the given fields."""
-    return dataclasses.make_dataclass(
-        "OffloadedRequestPayload", [(name, object) for name in field_names]
-    )
-
-
-# Megatron-LM's expanded-prefix stitching keys, as module attributes.
-_PREFIX_STITCHING_FIELDS = {
-    "PREFIX_MEDIA_COUNT_FIELD": "_prefix_media_count",
-    "PREFIX_EXPANDED_TOKEN_COUNT_FIELD": "_prefix_expanded_token_count",
-}
-
-
-@pytest.mark.parametrize(
-    ("inference_request", "error"),
-    [
-        # None in sys.modules makes the import raise ModuleNotFoundError.
-        pytest.param(None, None, id="no-megatron-core-defers-to-worker"),
-        pytest.param(
-            types.SimpleNamespace(
-                OffloadedRequestPayload=_stub_offloaded_payload(
-                    "prompt_token_ids", "media_tensors"
-                ),
-                **_PREFIX_STITCHING_FIELDS,
-            ),
-            None,
-            id="media-fields-present",
-        ),
-        pytest.param(
-            types.SimpleNamespace(
-                OffloadedRequestPayload=_stub_offloaded_payload("prompt_token_ids"),
-                **_PREFIX_STITCHING_FIELDS,
-            ),
-            r"lacks: OffloadedRequestPayload\.media_tensors\. Bump",
-            id="payload-without-media-tensors",
-        ),
-        pytest.param(
-            types.SimpleNamespace(
-                OffloadedRequestPayload=_stub_offloaded_payload(
-                    "prompt_token_ids", "media_tensors"
-                )
-            ),
-            "lacks: PREFIX_MEDIA_COUNT_FIELD, PREFIX_EXPANDED_TOKEN_COUNT_FIELD",
-            id="core-without-prefix-stitching",
-        ),
-    ],
-)
-def test_require_minf_media_payload_fields(
-    monkeypatch, inference_request, error
-) -> None:
-    if inference_request is None:
-        monkeypatch.setitem(sys.modules, "megatron", None)
-    else:
-        _stub_megatron_inference_request(monkeypatch, inference_request)
-
-    if error is None:
-        assert sc_setup_mod._require_minf_media_payload_fields() is None
-        return
-    with pytest.raises(NotImplementedError, match=error):
-        sc_setup_mod._require_minf_media_payload_fields()
 
 
 @pytest.fixture
@@ -3084,11 +3004,12 @@ def test_token_capture_media_dedup_guard_reads_only_the_grpo_config(
 ):
     """Capture rows carry their own media, so dedup has nothing to share: a GRPO
     run asking for it is rejected. A PPO run has no ``grpo`` block; the guard
-    must not read it. The guard is the last check before the MInf media-payload
-    gate, so reaching that gate proves the guard let the PPO config through.
+    must not read it. The guard is the last check in the token-capture block,
+    so reaching the OPD lookup that follows it proves the guard let the PPO
+    config through.
     """
 
-    class _ReachedMediaGate(Exception):
+    class _PassedTokenCaptureBlock(Exception):
         pass
 
     mc = _make_gym_megatron_capture_config()
@@ -3100,15 +3021,15 @@ def test_token_capture_media_dedup_guard_reads_only_the_grpo_config(
         mc.grpo = None
         mc.value = {"megatron_cfg": {"enabled": True}, "train_global_batch_size": 8}
         mc.value_loss_fn = MseValueLossConfig()
-        expectation = pytest.raises(_ReachedMediaGate)
+        expectation = pytest.raises(_PassedTokenCaptureBlock)
 
     with (
         patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
         patch.object(sc_setup_mod, "uses_image_placeholder", return_value=True),
         patch.object(
-            sc_setup_mod,
-            "_require_minf_media_payload_fields",
-            side_effect=_ReachedMediaGate,
+            sc_setup_mod.opd_module,
+            "get_opd_full_config",
+            side_effect=_PassedTokenCaptureBlock,
         ) as mock_gate,
         expectation,
     ):
@@ -3143,9 +3064,6 @@ def test_token_capture_megatron_registers_media_columns_only_for_multimodal(
             sc_setup_mod, "build_nemo_gym_actors", return_value=fake_gym_actor
         ) as mock_spinup,
         patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
-        patch.object(
-            sc_setup_mod, "_require_minf_media_payload_fields"
-        ) as mock_media_gate,
         patch.object(sc_setup_mod, "MegatronGeneration") as mock_megatron,
         patch.object(sc_setup_mod, "ray"),
         patch(
@@ -3184,39 +3102,6 @@ def test_token_capture_megatron_registers_media_columns_only_for_multimodal(
     actor_args.gen_handle.setup_token_capture.assert_called_once_with(
         ANY, mc.token_capture.staging_partition, capture_media=multimodal
     )
-    assert mock_media_gate.call_count == (1 if multimodal else 0)
-
-
-def test_token_capture_megatron_media_requires_minf_media_payload_fields(
-    patched_factories, monkeypatch
-):
-    """A multimodal Megatron capture run fails at setup, before any factory
-    runs, when the pinned megatron-core payload lacks ``media_tensors``
-    (otherwise every VLM call would stage a text sentinel and the finalizer
-    would drop every group)."""
-    mc = _make_gym_megatron_capture_config()
-    _stub_megatron_inference_request(
-        monkeypatch,
-        types.SimpleNamespace(
-            RequestPayloadStager=object,
-            RequestPromptPreparer=object,
-            OffloadedRequestPayload=_stub_offloaded_payload("prompt_token_ids"),
-            **_PREFIX_STITCHING_FIELDS,
-        ),
-    )
-
-    with (
-        patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
-        patch.object(sc_setup_mod, "uses_image_placeholder", return_value=True),
-        pytest.raises(NotImplementedError, match="media_tensors"),
-    ):
-        setup_single_controller(
-            mc, MagicMock(pad_token_id=0), processor=MagicMock(name="processor")
-        )
-
-    assert mc.token_capture.generation_backend is None
-    patched_factories["setup_response_data"].assert_not_called()
-    patched_factories["_build_clusters"].assert_not_called()
 
 
 @pytest.mark.mcore
@@ -3241,7 +3126,7 @@ def test_offloaded_payload_exposes_multimodal_capture_fields():
         for field in dataclasses.fields(inference_request.OffloadedRequestPayload)
     }
     assert "media_tensors" in names
-    for name in sc_setup_mod._MINF_PREFIX_STITCHING_FIELDS:
+    for name in ("PREFIX_MEDIA_COUNT_FIELD", "PREFIX_EXPANDED_TOKEN_COUNT_FIELD"):
         assert hasattr(inference_request, name), name
 
 
