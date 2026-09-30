@@ -1,0 +1,61 @@
+# Nemotron-3-Nano-30B-A3B (bf16) GRPO with zero train/generation KL.
+# Non-colocated Megatron inference, 2 nodes x 4 GPUs. Only the zero-KL deltas
+# on top of the Nano base recipe live here.
+#
+# Launch with MAMBA_DETERMINISTIC=1 (read at SSM Triton import time, so it
+# cannot be set from this file) and data.{train,validation}.data_path set.
+defaults: ./recipes/llm/grpo-nanov3-30BA3B-2n8g-megatron_generation-noncolocated-async-gym.yaml
+
+grpo:
+  async_grpo:
+    # Every rollout must be scored by the weights that produced it.
+    enabled: false
+    in_flight_weight_updates: false
+
+policy:
+  # Packing / dynamic batching make a token's numerics depend on its neighbours.
+  sequence_packing:
+    enabled: false
+  dynamic_batching:
+    enabled: false
+
+  megatron_cfg:
+    # Resolves batch_invariant_mode, flash attention 4, te_native backend,
+    # ordered collective, raw logprobs and no chunked prefill.
+    zero_train_gen_mismatch: true
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1 # batch-invariant mode rejects CP
+    expert_model_parallel_size: 4
+    # Must match the batch-invariant inference kernel (fused weighted squared ReLU).
+    use_fused_weighted_squared_relu: true
+    # Fused mamba_split_conv1d_scan_combined; false takes the unfused path.
+    use_mamba_mem_eff_path: true
+    cuda_graph_impl: none # training side
+
+  generation:
+    backend: megatron
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 1
+    mcore_generation_config:
+      tensor_model_parallel_size: 1
+      expert_model_parallel_size: 4
+      moe_router_dtype: fp32
+      # vLLM fused MoE pairs with training's TE grouped GEMM (te_native).
+      inference_grouped_gemm_backend: vllm
+      inference_moe_token_dispatcher_type: nvls
+      enable_prefix_caching: false
+
+      # Generation CUDA graphs.
+      cuda_graph_impl: local
+      inference_cuda_graph_scope: block
+      num_cuda_graphs: -1
+      use_cuda_graphs_for_non_decode_steps: true
+      moe_pad_experts_for_cuda_graph_inference: false
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 2
