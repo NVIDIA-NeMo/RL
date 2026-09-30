@@ -77,6 +77,7 @@ def test_rejected_first_and_middle_responses_never_enter_selected_traces(
         )
         accepted_tokens, rejected_tokens, rejected_ids = [], [], []
         accepted_output = []
+        selected_ids = []
         for turn in range(20):
             attempts = 0
 
@@ -90,20 +91,20 @@ def test_rejected_first_and_middle_responses_never_enter_selected_traces(
                 return True
 
             response = await client.create(select_response=select)
+            selected_ids.append(response.id)
             accepted_output.extend(response.model_dump(mode="json")["output"])
             accepted_tokens.append(1000 + len(harness.worker_calls))
             if turn < 19:
                 client.append_observation(
                     [{"role": "user", "content": f"observation {turn}"}]
                 )
-        result = client.finish(response)
+        client.finish(response)
         manifest = RolloutManifest.model_validate(
             await harness.ledger.manifest("group_g0")
         )
         assert len(manifest.records) == len(harness.worker_calls) == 22
-        assert len(result.selected_actions) == 20
+        assert len(selected_ids) == 20
         assert not manifest.failures and not manifest.pending_call_ids
-        selected_ids = [action.response_id for action in result.selected_actions]
         by_id = {record.response_id: record for record in manifest.records}
         for index, response_id in enumerate(selected_ids):
             record = by_id[response_id]
@@ -128,6 +129,7 @@ def test_rejected_first_and_middle_responses_never_enter_selected_traces(
                 "response": {"id": response.id, "output": accepted_output},
             },
         )
+        assert processed["logical_selection"].response_ids == tuple(selected_ids)
         finalized = finalizer.finalize_group(
             "group",
             ["group_g0"],

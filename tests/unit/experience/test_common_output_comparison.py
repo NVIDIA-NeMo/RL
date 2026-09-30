@@ -10,13 +10,15 @@ executed unchanged as the migration oracle; generation is never repeated.
 
 import asyncio
 import os
+import sys
 from copy import deepcopy
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import torch
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 import nemo_rl.environments.nemo_gym as gym_environment
 
@@ -30,6 +32,7 @@ from nemo_gym.context_management import (
 from nemo_gym.openai_utils import (
     NeMoGymAsyncOpenAI,
     NeMoGymResponseCreateParamsNonStreaming,
+    NeMoGymResponseOutputItem,
 )
 from nemo_gym.server_utils import ServerClient
 from nemo_gym.token_id_capture.fingerprint import (
@@ -92,6 +95,25 @@ def test_shared_client_same_evidence(
             if not key.startswith("__")
         },
     )
+    # Load the schema from the same frozen checkout as the historical consumer.
+    # The new production client no longer constructs or imports this object.
+    schema_path = (
+        Path(baseline_root)
+        / "3rdparty/Gym-workspace/Gym/nemo_gym/context_management/result.py"
+    )
+    assert schema_path.is_file(), schema_path
+    legacy_schema = load_source_definitions(
+        schema_path,
+        {"SelectedAction": None, "LogicalCCResult": None},
+        {
+            "Literal": Literal,
+            "BaseModel": BaseModel,
+            "ConfigDict": ConfigDict,
+            "Field": Field,
+            "model_validator": model_validator,
+            "NeMoGymResponseOutputItem": NeMoGymResponseOutputItem,
+        },
+    )
     receipts, common_receipts, oracle, common = [], [], [], []
     owners = ["group_g0", "group_g1"]
 
@@ -136,8 +158,10 @@ def test_shared_client_same_evidence(
                     }
                 ),
             )
+            accepted_responses = []
             for turn in range(20):
                 response = await client.create()
+                accepted_responses.append(response.model_dump(mode="json"))
                 if turn != 19:
                     client.append_observation(
                         [
@@ -154,7 +178,7 @@ def test_shared_client_same_evidence(
             manifest = RolloutManifest.model_validate(
                 await harness.ledger.manifest(owner)
             )
-            # Compute the candidate before constructing the dedicated result.
+            # Compute the candidate independently of the historical fixture.
             candidate = selection_with_observed_metadata(
                 manifest.records, ordinary, observed
             )
@@ -168,25 +192,44 @@ def test_shared_client_same_evidence(
             )
             with pytest.raises(ValueError, match="completion metadata"):
                 selection_with_observed_metadata(manifest.records, ordinary, {})
-            legacy_result = client.finish(response).model_dump(mode="json")
+            client.finish(response)
+            # This scenario contains only completed responses. Record membership
+            # at the acceptance boundary, never infer the oracle from capture.
+            assert all(not r["incomplete_details"] for r in accepted_responses)
+            legacy_result = {
+                "logical_rollout_id": owner,
+                "selected_actions": [
+                    {
+                        "response_id": r["id"],
+                        "finish_reason": "stop",
+                        "last_output_item": r["output"][-1],
+                    }
+                    for r in accepted_responses
+                ],
+                "outcome": "completed",
+            }
             processed = await env._postprocess_receipt_mode(
                 {"_ng_rollout_id": owner},
                 {
                     "response": ordinary,
                     "reward": float(owners.index(owner) + 1),
-                    "context_compaction_result": legacy_result,
                 },
             )
             assert candidate == processed["logical_selection"]
-            previous = await baseline.NemoGym._postprocess_cc_receipt_mode(
-                env,
-                {"_ng_rollout_id": owner},
-                {
-                    "response": ordinary,
-                    "reward": float(owners.index(owner) + 1),
-                    "context_compaction_result": legacy_result,
-                },
-            )
+            # Only the unchanged historical consumer sees the old schema import.
+            with monkeypatch.context() as legacy_import:
+                legacy_import.setitem(
+                    sys.modules, "nemo_gym.context_management.result", legacy_schema
+                )
+                previous = await baseline.NemoGym._postprocess_cc_receipt_mode(
+                    env,
+                    {"_ng_rollout_id": owner},
+                    {
+                        "response": ordinary,
+                        "reward": float(owners.index(owner) + 1),
+                        "context_compaction_result": legacy_result,
+                    },
+                )
             assert previous == processed
             receipts.append(previous["receipt"])
             oracle.append(previous["logical_selection"])
