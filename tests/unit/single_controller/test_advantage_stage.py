@@ -13,6 +13,7 @@
 # limitations under the License.
 """The advantage stage's boundary: what it fetches and what it hands back."""
 
+from collections.abc import Sequence
 from dataclasses import fields
 
 import pytest
@@ -23,6 +24,8 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     AdvantageOutcome,
     AdvantageRequest,
     AdvantageStageConfig,
+    group_index_column,
+    row_group_ids,
     split_meta_by_prompt_group,
 )
 from nemo_rl.algorithms.single_controller_utils.config import AdvantageConfig
@@ -30,7 +33,9 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
     AdvantagePartial,
     RewardPartial,
 )
+from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.schema import GROUP_ID_TAG
 from nemo_rl.utils.rpc_guard import assert_metadata_only
 
 
@@ -53,7 +58,6 @@ class TestInputFields:
     def test_only_the_always_present_columns_by_default(self) -> None:
         adv = AdvantageConfig()
         assert _config().input_fields() == [
-            adv.prompt_ids_field,
             adv.reward_field,
             adv.token_mask_field,
             adv.sample_mask_field,
@@ -135,28 +139,42 @@ class TestRpcBoundaryStaysMetadataOnly:
             assert_metadata_only(outcome)
 
 
-def _grouped_meta(num_groups: int, per_group: int) -> KVBatchMeta:
-    """Rows for ``num_groups`` contiguous prompt groups.
+def _meta_for_group_sizes(sizes: Sequence[int]) -> KVBatchMeta:
+    """Rows for one contiguous prompt group per entry in ``sizes``.
 
     Tags carry no ``dataset_source``, matching a dataset whose rows have no
-    ``dataset`` key -- the case that made the tag-keyed splitter decline every
-    time.
+    ``dataset`` key -- the case that made an even earlier, tag-keyed splitter
+    decline every time.
     """
-    total = num_groups * per_group
+    sample_ids: list[str] = []
+    tags: list[dict[str, object]] = []
+    for group, size in enumerate(sizes):
+        for generation in range(size):
+            sample_ids.append(f"group-{group}_g{generation}")
+            tags.append({"weight_version": 1, GROUP_ID_TAG: f"group-{group}"})
     return KVBatchMeta(
         partition_id="rollout_data",
         task_name="train",
-        sample_ids=[f"sample-{i}" for i in range(total)],
+        sample_ids=sample_ids,
         fields=["total_reward"],
-        sequence_lengths=[8] * total,
-        tags=[{"weight_version": 1} for _ in range(total)],
+        sequence_lengths=[8] * len(sample_ids),
+        tags=tags,
     )
+
+
+def _grouped_meta(num_groups: int, per_group: int) -> KVBatchMeta:
+    """Rows for ``num_groups`` contiguous prompt groups of equal size."""
+    return _meta_for_group_sizes([per_group] * num_groups)
+
+
+def _shard_group_ids(shard: KVBatchMeta) -> list[str]:
+    return [tag[GROUP_ID_TAG] for tag in shard.tags]
 
 
 class TestSplitMetaByPromptGroup:
     def test_shards_cover_every_row_in_original_order(self):
         meta = _grouped_meta(num_groups=8, per_group=4)
-        shards = split_meta_by_prompt_group(meta, 4, 4)
+        shards = split_meta_by_prompt_group(meta, 4)
         assert shards is not None and len(shards) == 4
         rejoined = [sid for shard in shards for sid in shard.sample_ids]
         assert rejoined == meta.sample_ids
@@ -166,40 +184,219 @@ class TestSplitMetaByPromptGroup:
 
     def test_every_shard_holds_whole_groups(self):
         meta = _grouped_meta(num_groups=8, per_group=4)
-        shards = split_meta_by_prompt_group(meta, 3, 4)
+        shards = split_meta_by_prompt_group(meta, 3)
         assert shards is not None
         assert all(len(shard.sample_ids) % 4 == 0 for shard in shards)
 
     def test_splits_without_any_dataset_source_tag(self):
-        """Regression: the tag-keyed version declined here and measured nothing."""
+        """Regression: an earlier tag-keyed version declined here and measured
+        nothing."""
         meta = _grouped_meta(num_groups=2048, per_group=16)
-        shards = split_meta_by_prompt_group(meta, 8, 16)
+        shards = split_meta_by_prompt_group(meta, 8)
         assert shards is not None
         assert [len(shard.sample_ids) for shard in shards] == [4096] * 8
 
     def test_never_returns_more_shards_than_requested(self):
         meta = _grouped_meta(num_groups=7, per_group=2)
-        shards = split_meta_by_prompt_group(meta, 4, 2)
+        shards = split_meta_by_prompt_group(meta, 4)
         assert shards is not None and len(shards) <= 4
         assert [s for sh in shards for s in sh.sample_ids] == meta.sample_ids
 
+    def test_groups_of_unequal_size_are_never_cut(self):
+        """The group-size version assumed every group had
+        num_generations_per_prompt rows, so a feature like Never Give Up that
+        produces variable-size groups was cut silently."""
+        meta = _meta_for_group_sizes([4, 12, 4])
+        shards = split_meta_by_prompt_group(meta, 3)
+        assert shards is not None
+        assert [len(shard.sample_ids) for shard in shards] == [4, 12, 4]
+        assert [_shard_group_ids(s)[0] for s in shards] == [
+            "group-0",
+            "group-1",
+            "group-2",
+        ]
+        assert all(len(set(_shard_group_ids(s))) == 1 for s in shards)
+
+    def test_unequal_groups_pack_whole_into_fewer_shards(self):
+        meta = _meta_for_group_sizes([4, 12, 4, 8, 4, 4])
+        shards = split_meta_by_prompt_group(meta, 3)
+        assert shards is not None and len(shards) <= 3
+        assert [s for sh in shards for s in sh.sample_ids] == meta.sample_ids
+        # Every group's rows land wholly inside one shard.
+        placements = {
+            group_id: i
+            for i, shard in enumerate(shards)
+            for group_id in _shard_group_ids(shard)
+        }
+        for i, shard in enumerate(shards):
+            assert all(placements[g] == i for g in _shard_group_ids(shard))
+
     def test_declines_when_groups_are_fewer_than_two(self):
-        assert split_meta_by_prompt_group(_grouped_meta(1, 16), 8, 16) is None
+        assert split_meta_by_prompt_group(_grouped_meta(1, 16), 8) is None
 
     def test_declines_without_a_pool_to_spread_across(self):
         meta = _grouped_meta(num_groups=8, per_group=4)
-        assert split_meta_by_prompt_group(meta, 1, 4) is None
-        assert split_meta_by_prompt_group(meta, 0, 4) is None
+        assert split_meta_by_prompt_group(meta, 1) is None
+        assert split_meta_by_prompt_group(meta, 0) is None
 
-    def test_declines_on_a_partial_group(self):
-        """A row count that is not a whole multiple of the group size is not
-        the layout this assumes, so it must not cut blind."""
-        meta = _grouped_meta(num_groups=8, per_group=4)
-        assert split_meta_by_prompt_group(meta.slice(0, 30), 4, 4) is None
+    def test_declines_when_groups_are_interleaved(self):
+        """An interleaved layout has no contiguous whole-group cut, so it must
+        decline rather than reorder rows behind the caller's back."""
+        meta = _grouped_meta(num_groups=2, per_group=2)
+        interleaved = meta.tags[:]
+        interleaved[1], interleaved[2] = interleaved[2], interleaved[1]
+        meta = KVBatchMeta(
+            partition_id=meta.partition_id,
+            task_name=meta.task_name,
+            sample_ids=meta.sample_ids,
+            fields=meta.fields,
+            sequence_lengths=meta.sequence_lengths,
+            tags=interleaved,
+        )
+        assert split_meta_by_prompt_group(meta, 2) is None
 
-    def test_declines_on_a_nonsense_group_size(self):
-        meta = _grouped_meta(num_groups=8, per_group=4)
-        assert split_meta_by_prompt_group(meta, 4, 0) is None
+    def test_a_partial_group_still_shards_the_groups_it_has(self):
+        """The group-size version declined on any row count that was not a
+        whole multiple, because it could not tell a trimmed group from a
+        different layout. Real boundaries make the first groups shardable."""
+        meta = _grouped_meta(num_groups=8, per_group=4).slice(0, 30)
+        shards = split_meta_by_prompt_group(meta, 4)
+        assert shards is not None
+        assert [s for sh in shards for s in sh.sample_ids] == meta.sample_ids
+
+
+class TestGroupIdIsMandatory:
+    """A missing key must raise: falling back to prompt tokens is the bug."""
+
+    def test_untagged_meta_raises(self):
+        meta = KVBatchMeta(
+            partition_id="rollout_data",
+            task_name="train",
+            sample_ids=["sample-0"],
+        )
+        with pytest.raises(ValueError, match="carry no tags"):
+            row_group_ids(meta)
+
+    def test_a_row_without_the_tag_raises_and_names_it(self):
+        meta = _grouped_meta(num_groups=2, per_group=2)
+        stripped = [dict(tag) for tag in meta.tags]
+        del stripped[2][GROUP_ID_TAG]
+        meta = KVBatchMeta(
+            partition_id=meta.partition_id,
+            task_name=meta.task_name,
+            sample_ids=meta.sample_ids,
+            tags=stripped,
+        )
+        with pytest.raises(ValueError, match="group-1_g0"):
+            row_group_ids(meta)
+
+
+def _baseline(prompt_key: torch.Tensor, rewards: torch.Tensor) -> torch.Tensor:
+    baseline, _, _ = calculate_baseline_and_std_per_prompt(
+        prompt_key, rewards, torch.ones_like(rewards)
+    )
+    return baseline
+
+
+class TestGroupIdIsTheBaselineKey:
+    """Two groups can share prompt text; keying on tokens merges them.
+
+    DAPO-Math-17k stores each of its prompts 100 times, so a 512-prompt chunk
+    carries roughly seven same-prompt pairs.
+    """
+
+    # Groups 0 and 2 are different groups that happen to carry identical
+    # prompt tokens. Their reward means differ, so merging them is visible.
+    GROUP_SIZE = 4
+    TOKENS = {0: [1, 2, 3], 1: [4, 5, 6], 2: [1, 2, 3], 3: [7, 8, 9]}
+    # Groups 0 and 2 have different reward means, so a merged baseline is not
+    # the same number as either group's own.
+    REWARDS = {
+        0: [1.0, 0.0, 0.0, 0.0],
+        1: [1.0, 1.0, 0.0, 0.0],
+        2: [1.0, 1.0, 1.0, 0.0],
+        3: [0.0, 0.0, 0.0, 1.0],
+    }
+
+    @property
+    def meta(self) -> KVBatchMeta:
+        return _meta_for_group_sizes([self.GROUP_SIZE] * len(self.TOKENS))
+
+    @property
+    def token_key(self) -> torch.Tensor:
+        return torch.tensor(
+            [
+                self.TOKENS[g]
+                for g in sorted(self.TOKENS)
+                for _ in range(self.GROUP_SIZE)
+            ]
+        )
+
+    @property
+    def rewards(self) -> torch.Tensor:
+        return torch.tensor([r for g in sorted(self.REWARDS) for r in self.REWARDS[g]])
+
+    def test_the_token_key_merges_groups_that_share_prompt_text(self) -> None:
+        # The same batch keyed so that groups 0 and 2 are deliberately one
+        # group. If the token key matches this, it merged them.
+        merged = group_index_column(
+            [
+                f"group-{0 if g == 2 else g}"
+                for g in sorted(self.TOKENS)
+                for _ in range(self.GROUP_SIZE)
+            ]
+        )
+        assert torch.equal(
+            _baseline(self.token_key, self.rewards),
+            _baseline(merged, self.rewards),
+        )
+
+    def test_the_group_id_key_gives_each_group_its_own_baseline(self) -> None:
+        group_key = group_index_column(row_group_ids(self.meta))
+        per_group = torch.cat(
+            [
+                _baseline(
+                    group_index_column([f"group-{g}"] * self.GROUP_SIZE),
+                    torch.tensor(self.REWARDS[g]),
+                )
+                for g in sorted(self.REWARDS)
+            ]
+        )
+        assert torch.equal(_baseline(group_key, self.rewards), per_group)
+        # And that is not what the token key produced.
+        assert not torch.equal(
+            _baseline(self.token_key, self.rewards),
+            _baseline(group_key, self.rewards),
+        )
+
+    def _shardwise(self, key_for) -> torch.Tensor:
+        """Baselines computed one shard at a time, rejoined in row order."""
+        shards = split_meta_by_prompt_group(self.meta, 2)
+        assert shards is not None
+        rewards = self.rewards
+        pieces, start = [], 0
+        for shard in shards:
+            stop = start + len(shard.sample_ids)
+            pieces.append(_baseline(key_for(shard, start, stop), rewards[start:stop]))
+            start = stop
+        return torch.cat(pieces)
+
+    def test_sharding_is_exact_under_the_group_id_key(self) -> None:
+        """What SHARD_INVARIANT_ESTIMATORS claims, as an equality."""
+        whole = _baseline(group_index_column(row_group_ids(self.meta)), self.rewards)
+        shardwise = self._shardwise(
+            lambda shard, start, stop: group_index_column(row_group_ids(shard))
+        )
+        assert torch.equal(shardwise, whole)
+
+    def test_sharding_was_not_exact_under_the_token_key(self) -> None:
+        """Groups 0 and 2 fall in different shards, so the merge the token key
+        performs on the whole batch cannot happen shard by shard -- which made
+        grpo's advantages a function of num_advantage_workers."""
+        token_key = self.token_key
+        whole = _baseline(token_key, self.rewards)
+        shardwise = self._shardwise(lambda shard, start, stop: token_key[start:stop])
+        assert not torch.equal(shardwise, whole)
 
 
 class TestShardInvariantEstimators:
@@ -226,9 +423,11 @@ class TestShardInvariantEstimators:
     def test_only_the_row_and_group_local_estimators_are_shardable(self) -> None:
         """Membership is opt-in, so a new estimator defaults to unshardable.
 
-        grpo's baseline is per prompt group, which the split preserves, and
-        opd's advantage is a per-token teacher/student difference that reads no
-        other row. Everything else has to be checked before it is added here.
+        grpo's baseline is per prompt group, which the split preserves now that
+        the key is GROUP_ID_TAG rather than the prompt tokens two groups can
+        share, and opd's advantage is a per-token teacher/student difference
+        that reads no other row. Everything else has to be checked before it is
+        added here.
         """
         assert SHARD_INVARIANT_ESTIMATORS == {"grpo", "opd"}
 

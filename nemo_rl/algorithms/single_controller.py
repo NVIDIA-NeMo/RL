@@ -104,6 +104,7 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     AdvantageOutcome,
     AdvantageRequest,
     AdvantageStageConfig,
+    row_group_ids,
     split_meta_by_prompt_group,
 )
 from nemo_rl.algorithms.single_controller_utils.config import (
@@ -1942,19 +1943,15 @@ class SingleControllerActor:
 
     @staticmethod
     def _group_ids_from_meta(meta: KVBatchMeta) -> list[str]:
-        """Return stable prompt-group IDs in canonical sample order."""
-        group_ids: list[str] = []
-        seen_group_ids: set[str] = set()
-        for sample_id in meta.sample_ids:
-            group_id = sample_id
-            if "_g" in sample_id:
-                candidate, generation_index = sample_id.rsplit("_g", 1)
-                if candidate and generation_index.isdigit():
-                    group_id = candidate
-            if group_id not in seen_group_ids:
-                group_ids.append(group_id)
-                seen_group_ids.add(group_id)
-        return group_ids
+        """Return stable prompt-group IDs in canonical sample order.
+
+        Reads the same tag the advantage stage keys its baseline on rather than
+        parsing the ``_g{i}`` suffix back off the sample ids, so the two do not
+        disagree about what a group is. The stage would raise on a batch whose
+        tag is missing anyway; doing it here fails one stage earlier in the
+        same iteration.
+        """
+        return list(dict.fromkeys(row_group_ids(meta)))
 
     # ── the three pumps + the inline advantage stage ───────────────────────
 
@@ -5196,11 +5193,7 @@ class SingleControllerActor:
         # than refused, because the pool is still correct one call at a time.
         stage_cfg = self._advantage_stage_config
         shards = (
-            split_meta_by_prompt_group(
-                meta,
-                len(self._advantage_actors),
-                self._algo_cfg.num_generations_per_prompt,
-            )
+            split_meta_by_prompt_group(meta, len(self._advantage_actors))
             if stage_cfg.shardable
             else None
         )

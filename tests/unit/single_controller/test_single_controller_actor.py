@@ -53,7 +53,11 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 )
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
-from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, ROLLOUT_METRICS
+from nemo_rl.data_plane.schema import (
+    DP_TRAIN_FIELDS,
+    GROUP_ID_TAG,
+    ROLLOUT_METRICS,
+)
 from nemo_rl.data_plane.tq_token_sink import STAGING_FIELDS
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -184,6 +188,16 @@ def _init_controller(master_config, actor_args):
         actor_args=actor_args,
         setup_timing_metrics=SetupTimingMetrics(),
     )
+
+
+def _one_group_tags(count: int) -> list[dict[str, object]]:
+    """Tags for one prompt group of ``count`` generations.
+
+    The stage keys its baseline on GROUP_ID_TAG, so a meta without it raises
+    rather than quietly grouping by prompt tokens -- which is what let two
+    distinct groups sharing prompt text share one baseline.
+    """
+    return [{"weight_version": 0, GROUP_ID_TAG: "group-0"} for _ in range(count)]
 
 
 def _stamp_advantage_stage_config(ctrl, *, shardable: bool = True) -> None:
@@ -873,6 +887,7 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
         task_name="train",
         sample_ids=[f"sample-{i}" for i in range(batch_size)],
         fields=list(data.keys()),
+        tags=_one_group_tags(batch_size),
     )
 
     result_meta, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
@@ -968,6 +983,7 @@ def test_advantage_stage_writes_each_sample_filter_without_seq_threshold(
         task_name="train",
         sample_ids=[f"sample-{i}" for i in range(batch_size)],
         fields=list(data.keys()),
+        tags=_one_group_tags(batch_size),
     )
 
     _, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
@@ -1033,6 +1049,7 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
         task_name="train",
         sample_ids=[f"sample-{i}" for i in range(batch_size)],
         fields=list(data.keys()),
+        tags=_one_group_tags(batch_size),
     )
 
     _, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
@@ -1103,6 +1120,7 @@ def test_advantage_stage_clips_training_values_and_metrics() -> None:
         task_name="train",
         sample_ids=[f"sample-{i}" for i in range(batch_size)],
         fields=list(data.keys()),
+        tags=_one_group_tags(batch_size),
     )
 
     asyncio.run(ctrl._advantage_stage(meta))
@@ -1167,6 +1185,7 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
         task_name="train",
         sample_ids=[f"sample-{i}" for i in range(batch_size)],
         fields=list(data.keys()),
+        tags=_one_group_tags(batch_size),
     )
 
     result_meta, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
@@ -1229,6 +1248,7 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
         task_name="train",
         sample_ids=[f"sample-{i}" for i in range(batch_size)],
         fields=list(data.keys()),
+        tags=_one_group_tags(batch_size),
     )
 
     result_meta, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
@@ -1318,6 +1338,7 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
         sample_ids=["a", "b"],
         fields=[],
         sequence_lengths=[3, 3],
+        tags=_one_group_tags(2),
     )
 
     enriched, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
@@ -2635,6 +2656,7 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
         task_name="train",
         sample_ids=[f"sample-{i}" for i in range(batch_size)],
         fields=list(data.keys()),
+        tags=_one_group_tags(batch_size),
     )
 
     result_meta, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))

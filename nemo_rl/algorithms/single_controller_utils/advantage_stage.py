@@ -52,6 +52,7 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 )
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.async_utils import call_data_plane
+from nemo_rl.data_plane.schema import GROUP_ID_TAG
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 if TYPE_CHECKING:
@@ -62,11 +63,15 @@ if TYPE_CHECKING:
 
 # Estimators whose advantages for a row depend only on that row and the rest
 # of its prompt group, so a whole-group shard produces the same numbers as the
-# whole batch. Everything else reachable from _build_advantage_estimator also
-# reduces over the entire batch -- gdpo and reinforce_plus_plus always, gae and
-# raw_reward whenever normalize_advantages is set -- and a shard is not that
-# batch. Membership is opt-in for exactly that reason: a new estimator counts
-# as unshardable until someone checks it.
+# whole batch. That holds because the baseline keys on GROUP_ID_TAG: while it
+# keyed on prompt tokens, two groups sharing prompt text merged into one
+# baseline when they landed in the same call and separated when a shard split
+# them, which made grpo's advantages a function of num_advantage_workers.
+# Everything else reachable from _build_advantage_estimator reduces over the
+# entire batch -- gdpo and reinforce_plus_plus always, gae and raw_reward
+# whenever normalize_advantages is set -- and a shard is not that batch.
+# Membership is opt-in for exactly that reason: a new estimator counts as
+# unshardable until someone checks it.
 SHARD_INVARIANT_ESTIMATORS = frozenset({"grpo", "opd"})
 
 
@@ -129,7 +134,6 @@ class AdvantageStageConfig:
         """Return the advantage input columns to fetch, in a stable order."""
         adv_cfg = self.advantage
         fields = [
-            adv_cfg.prompt_ids_field,
             adv_cfg.reward_field,
             adv_cfg.token_mask_field,
             adv_cfg.sample_mask_field,
@@ -167,8 +171,46 @@ class AdvantageRequest:
     meta: KVBatchMeta
 
 
+def row_group_ids(meta: KVBatchMeta) -> list[str]:
+    """Return the prompt-group id of every row, in row order.
+
+    This is the key the group-relative estimators reduce over, so a missing
+    tag has to raise rather than fall back to prompt tokens: the token key is
+    what merged two same-text groups into one baseline in the first place, and
+    a silent fallback would reintroduce exactly that.
+    """
+    if meta.tags is None:
+        raise ValueError(
+            f"advantage stage: {len(meta.sample_ids)} row(s) of partition "
+            f"{meta.partition_id!r} carry no tags, so the {GROUP_ID_TAG!r} "
+            "baseline key is unavailable"
+        )
+    untagged = [
+        meta.sample_ids[i] for i, tag in enumerate(meta.tags) if GROUP_ID_TAG not in tag
+    ]
+    if untagged:
+        raise ValueError(
+            f"advantage stage: {len(untagged)} row(s) carry no {GROUP_ID_TAG!r} "
+            f"tag (first: {untagged[0]!r}); pack_payload stamps it on every row, "
+            "so this batch was written by a producer that predates it"
+        )
+    return [tag[GROUP_ID_TAG] for tag in meta.tags]
+
+
+def group_index_column(group_ids: list[str]) -> torch.Tensor:
+    """Turn per-row group ids into the ``[N, 1]`` column the baseline compares.
+
+    ``calculate_baseline_and_std_per_prompt`` only calls ``torch.unique(...,
+    dim=0)`` and compares rows for equality, so one integer per distinct group
+    carries everything it needs. The trailing dimension is load-bearing: the
+    helper does ``.all(1)``, so a flat ``[N]`` tensor would not work.
+    """
+    index = {group_id: i for i, group_id in enumerate(dict.fromkeys(group_ids))}
+    return torch.tensor([[index[group_id]] for group_id in group_ids])
+
+
 def split_meta_by_prompt_group(
-    meta: KVBatchMeta, num_shards: int, group_size: int
+    meta: KVBatchMeta, num_shards: int
 ) -> Optional[list[KVBatchMeta]]:
     """Split ``meta`` into at most ``num_shards`` metas of whole prompt groups.
 
@@ -178,35 +220,39 @@ def split_meta_by_prompt_group(
     group layout cannot be established, and the caller falls back to one
     whole-batch call.
 
-    Boundaries come from ``group_size`` (``num_generations_per_prompt``), since
-    every chunk reaching this stage holds whole groups laid out contiguously.
-    An earlier version read them from ``DATASET_SOURCE_TAG`` instead, which
-    ``TQReplayBuffer.commit`` only stamps when the dataset row carries a
-    ``dataset`` key; on a dataset without one the tag is absent, every split
-    declined, and the fallback was silent enough that a whole 256-node run
-    measured nothing. A row count that is not a whole multiple of
-    ``group_size`` means the layout is not what this assumes, so it declines
-    rather than cutting blind.
+    Boundaries come from where ``GROUP_ID_TAG`` changes, so groups of unequal
+    size are cut correctly. Deriving them from ``num_generations_per_prompt``
+    instead assumed every group had exactly that many rows, which silently
+    mis-cut any feature that produces variable-size groups. An even earlier
+    version read ``DATASET_SOURCE_TAG``, which ``TQReplayBuffer.commit`` only
+    stamps when the dataset row carries a ``dataset`` key; on a dataset without
+    one the tag was absent, every split declined, and the fallback was silent
+    enough that a whole 256-node run measured nothing.
 
     Chunks are contiguous, so concatenating the shards reproduces the original
-    row order and the caller never has to rebuild a permutation.
+    row order and the caller never has to rebuild a permutation. A layout that
+    interleaves groups has no contiguous whole-group cut, so it declines rather
+    than reordering rows behind the caller's back.
     """
-    if num_shards <= 1 or group_size <= 0:
+    if num_shards <= 1:
         return None
-    num_rows = len(meta.sample_ids)
-    if num_rows % group_size != 0:
-        return None
-    num_groups = num_rows // group_size
+    group_ids = row_group_ids(meta)
+    starts = [0] + [
+        i for i in range(1, len(group_ids)) if group_ids[i] != group_ids[i - 1]
+    ]
+    num_groups = len(starts)
     if num_groups < 2:
         return None
-    # Groups carry a fixed number of generations, so equal group counts are
-    # already equal row counts; balancing by tokens would cost the
-    # order-preserving property for a second-order gain.
+    if num_groups != len(set(group_ids)):
+        return None
+    # Balanced by group count rather than by row count: groups are equal-sized
+    # in every current producer, and balancing by rows would buy a second-order
+    # gain on the variable-size case only.
     groups_per_shard = -(-num_groups // num_shards)
-    rows_per_shard = groups_per_shard * group_size
+    bounds = starts + [len(group_ids)]
     shards = [
-        meta.slice(begin, min(begin + rows_per_shard, num_rows))
-        for begin in range(0, num_rows, rows_per_shard)
+        meta.slice(bounds[begin], bounds[min(begin + groups_per_shard, num_groups)])
+        for begin in range(0, num_groups, groups_per_shard)
     ]
     return shards if len(shards) > 1 else None
 
@@ -267,7 +313,12 @@ class AdvantageComputer:
             select_fields=cfg.input_fields(),
         )
 
-        prompt_ids = tensor_field(data, adv_cfg.prompt_ids_field)
+        # Group by the group a row was generated in, not by its prompt tokens.
+        # Two groups can carry identical prompt text -- DAPO-Math-17k stores
+        # each prompt 100 times -- and the token key gave them one shared
+        # baseline whenever they landed in the same call, so the result moved
+        # with chunk boundaries and with how the shards fell.
+        prompt_ids = group_index_column(row_group_ids(meta))
         rewards = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.reward_field)
         ).float()

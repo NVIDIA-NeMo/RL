@@ -30,6 +30,11 @@ GLOBAL_FORWARD_PAD_SEQLEN = "global_forward_pad_seqlen"
 # same string with a flat-dict shape, so this constant is not a drop-in there.
 ROLLOUT_METRICS = "rollout_metrics"
 
+# Per-row key in `KVBatchMeta.tags` naming the prompt group a row was generated
+# in. The group-relative estimators key their baseline on this rather than on
+# prompt tokens, which two distinct groups can share.
+GROUP_ID_TAG = "group_id"
+
 # Skeleton field names from `shard_meta_for_dp`.
 INPUT_IDS = "input_ids"
 INPUT_LENGTHS = "input_lengths"
