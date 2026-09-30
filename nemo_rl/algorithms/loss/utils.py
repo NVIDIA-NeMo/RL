@@ -118,7 +118,47 @@ def prepare_loss_input(
                 )
 
         loss_input = {"next_token_logprobs": logprobs}
-
+        
+    elif loss_fn.input_type == LossInputType.DWRL:
+        curr_logprobs = get_next_token_logprobs_from_logits(
+            input_ids=data["input_ids"],
+            next_token_logits=logits,
+            seq_index=data.get("seq_index", None),
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
+            sampling_params=sampling_params,
+            chunk_size=chunk_size,
+        )
+        
+        # slice off to the correct length to remove potential CP padding
+        curr_logprobs = curr_logprobs[:, : data["input_ids"].shape[1] - 1]
+        
+        input_ids_clone = data["input_ids"].clone()
+        input_ids_clone[torch.arange(data["input_ids"].shape[0]), data["input_lengths"] - 1] = data["no_position"].item()
+        
+        curr_logprobs_w_no = get_next_token_logprobs_from_logits(
+            input_ids=input_ids_clone,
+            next_token_logits=logits,
+            seq_index=data.get("seq_index", None),
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
+            sampling_params=sampling_params,
+            chunk_size=chunk_size,
+        )
+        
+        # slice off to the correct length to remove potential CP padding
+        curr_logprobs_w_no = curr_logprobs_w_no[:, : data["input_ids"].shape[1] - 1]
+        
+        answer_mask = data["answer_mask"][:, 1:]
+        
+        final_logprobs_no = curr_logprobs_w_no[answer_mask.bool()]
+        final_logprobs = curr_logprobs[answer_mask.bool()]
+        assert torch.equal(final_logprobs, curr_logprobs.gather(-1, (data["input_lengths"] - 2).unsqueeze(-1)).squeeze(-1)), "final_logprobs from answer_mask don't match gather on input_lengths"
+        
+        loss_input = {"next_token_logprobs": curr_logprobs, "final_logprobs": final_logprobs, "final_logprobs_no": final_logprobs_no}
+        
     elif loss_fn.input_type == LossInputType.DISTILLATION:
         calculate_entropy = loss_fn.zero_outside_topk and loss_fn.kl_type != "forward"
         student_topk_logprobs, teacher_topk_logprobs, H_all = (

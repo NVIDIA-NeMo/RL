@@ -55,6 +55,7 @@ class LossInputType(enum.Enum):
     DISTILLATION = "distillation"
     DISTILLATION_CROSS_TOKENIZER = "distillation_cross_tokenizer"
     DRAFT = "draft"
+    DWRL = "dwrl"
 
 
 class LossFunction(Protocol):
