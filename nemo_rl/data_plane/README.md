@@ -107,7 +107,7 @@ and policy methods. `_apply_dynamic_sampling` still takes a raw
              ▼
 ┌─ DRIVER (reward + advantage, on driver_carry only) ──────────────────┐
 │ ③ scale_rewards / apply_reward_shaping (legacy parity)               │
-│ ④ baseline, std = calculate_baseline_and_std_per_prompt(...)         │
+│ ④ baseline, std, _ = calculate_baseline_and_std_per_prompt(...)      │
 │   meta.stamp_tags({"std": …, "baseline": …})                         │
 │      → filter-without-fetch primitive on meta                        │
 │ ⑤ [optional] _apply_dynamic_sampling(meta, driver_carry, …)          │
@@ -234,7 +234,7 @@ meta, driver_carry, rollout_metrics, gen_metrics = ray.get(
 driver_carry = scale_rewards(driver_carry, cfg["grpo"]["reward_scaling"])
 if cfg["grpo"]["reward_shaping"]["enabled"]:
     driver_carry = apply_reward_shaping(driver_carry, cfg["grpo"]["reward_shaping"])
-driver_carry["baseline"], driver_carry["std"] = (
+driver_carry["baseline"], driver_carry["std"], _ = (
     calculate_baseline_and_std_per_prompt(
         driver_carry["prompt_ids_for_adv"],
         driver_carry["total_reward"],

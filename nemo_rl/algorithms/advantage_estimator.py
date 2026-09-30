@@ -106,7 +106,11 @@ class GRPOAdvantageEstimator:
         Returns:
             Advantages tensor of shape [batch_size, seq_len].
         """
-        baseline, std = calculate_baseline_and_std_per_prompt(
+        (
+            baseline,
+            std,
+            is_trivial_distribution,
+        ) = calculate_baseline_and_std_per_prompt(
             prompt_ids,
             rewards,
             torch.ones_like(rewards) if valid_mask is None else valid_mask.float(),
@@ -117,9 +121,9 @@ class GRPOAdvantageEstimator:
         if self.normalize_rewards:
             # don't sharpen the ones with no variation
             epsilon = 1e-6
-            non_zero_std_mask = std > 0
-            advantages[non_zero_std_mask] = advantages[non_zero_std_mask] / (
-                std.unsqueeze(-1)[non_zero_std_mask] + epsilon
+            normalize_mask = (std > 0) & ~is_trivial_distribution
+            advantages[normalize_mask] = advantages[normalize_mask] / (
+                std.unsqueeze(-1)[normalize_mask] + epsilon
             )
 
         return advantages.expand(mask.shape)
@@ -195,7 +199,11 @@ class GDPOAdvantageEstimator:
         advantage_parts = []
         for key in reward_component_keys:
             r = repeated_batch[key]
-            base, std_k = calculate_baseline_and_std_per_prompt(
+            (
+                base,
+                std_k,
+                is_trivial_distribution,
+            ) = calculate_baseline_and_std_per_prompt(
                 prompt_ids,
                 r,
                 valid,
@@ -204,9 +212,9 @@ class GDPOAdvantageEstimator:
             adv_k = (r - base).unsqueeze(-1)
             if self.normalize_rewards:
                 epsilon = 1e-6
-                non_zero_std_mask = std_k > 0
-                adv_k[non_zero_std_mask] = adv_k[non_zero_std_mask] / (
-                    std_k.unsqueeze(-1)[non_zero_std_mask] + epsilon
+                normalize_mask = (std_k > 0) & ~is_trivial_distribution
+                adv_k[normalize_mask] = adv_k[normalize_mask] / (
+                    std_k.unsqueeze(-1)[normalize_mask] + epsilon
                 )
 
             advantage_parts.append(adv_k)
@@ -273,7 +281,7 @@ class ReinforcePlusPlusAdvantageEstimator:
         """
         # minus baseline
         if self.minus_baseline:
-            mean, _ = calculate_baseline_and_std_per_prompt(
+            mean, _, _ = calculate_baseline_and_std_per_prompt(
                 prompt_ids,
                 rewards,
                 torch.ones_like(rewards) if valid_mask is None else valid_mask.float(),

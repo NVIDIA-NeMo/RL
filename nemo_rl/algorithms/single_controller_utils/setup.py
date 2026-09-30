@@ -97,7 +97,12 @@ from nemo_rl.distributed.virtual_cluster import (
     prepare_segment_topology,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.environments.nemo_gym import should_use_nemo_gym, spinup_nemo_gym_actor
+from nemo_rl.environments.nemo_gym import (
+    NemoGymShardSet,
+    build_nemo_gym_actors,
+    should_use_nemo_gym,
+    validate_dataset_agent_coverage,
+)
 from nemo_rl.experience.rollout_manager import (
     RolloutManager,
     RolloutRetryPolicy,
@@ -191,6 +196,7 @@ def _maybe_restore_native_data_plane_checkpoint(
     save_state: GRPOSaveState,
     partition_id: str,
     sampler_name: str,
+    opd_full_teacher_checkpoints: Optional[list[str]] = None,
 ) -> Optional[DataPlaneCheckpointMetadata]:
     """Load and validate an authoritative native TQ checkpoint when present.
 
@@ -261,6 +267,16 @@ def _maybe_restore_native_data_plane_checkpoint(
         raise ValueError(
             "Native TQ checkpoint metadata does not match the trainer "
             f"checkpoint: {mismatches}"
+        )
+    # The buffered rows carry a teacher_index each, and nothing re-tags them on
+    # restore: a config that renumbers the teachers would silently project them
+    # through the wrong LM head.
+    if opd_full_teacher_checkpoints != metadata.get("opd_full_teacher_checkpoints"):
+        raise ValueError(
+            "Native TQ checkpoint was written under a different opd_full "
+            "teacher set: its rows are tagged with "
+            f"{metadata.get('opd_full_teacher_checkpoints')!r}, this run would "
+            f"number them {opd_full_teacher_checkpoints!r}."
         )
     manifest_digest = metadata.get("replay_manifest_digest")
     if not isinstance(manifest_digest, str) or not manifest_digest:
@@ -728,8 +744,8 @@ def _spinup_gym(
     master_config: MasterConfig,
     base_urls: list[str],
     tokenizer: PreTrainedTokenizerBase,
-) -> tuple[Any, float]:
-    """Spin up the NeMo-Gym actor against the reserved vLLM URLs.
+) -> tuple[NemoGymShardSet, float]:
+    """Spin up the NeMo-Gym shard set against the reserved vLLM URLs.
 
     Args:
         master_config: SC MasterConfig.
@@ -738,14 +754,14 @@ def _spinup_gym(
             call. See NemoGym.set_tokenizer.
 
     Returns:
-        A tuple of (NeMo-Gym actor, wall time spent in this call).
+        A tuple of (NeMo-Gym shard set, wall time spent in this call).
     """
     t0 = time.perf_counter()
     policy_config = master_config.policy
     generation_config = policy_config["generation"]
     enable_router_replay = router_replay_enabled(policy_config)
-    actor = spinup_nemo_gym_actor(
-        env_configs=master_config.env,
+    shard_set = build_nemo_gym_actors(
+        master_config.env,
         base_urls=base_urls,
         model_name=generation_config["model_name"],
         tokenizer=tokenizer,
@@ -758,7 +774,7 @@ def _spinup_gym(
             else None
         ),
     )
-    return actor, time.perf_counter() - t0
+    return shard_set, time.perf_counter() - t0
 
 
 def _generation_max_seq_len(generation_config) -> int:
@@ -961,7 +977,13 @@ def _load_opd_full_teacher_lm_heads(
     trainer: Any,
     teacher_worker_groups: dict[str, Any],
 ) -> None:
-    """Load the teacher LM head onto every student worker for full-vocabulary MOPD.
+    """Load every unique teacher's LM head onto each student worker.
+
+    One RPC per unique checkpoint (``TeacherWorkerGroup.teacher_index``,
+    assigned by ``create_teacher_worker_groups``), so the student ends up with
+    one LM-head shard per teacher, keyed by that same index -- the key every
+    row's ``OPD_FULL_TEACHER_INDEX_FIELD`` tag resolves against at training
+    time (see ``reconstruct_opd_full_teacher_logits``).
 
     Callers gate this on the ``hidden_states`` payload; the ``logits`` payload
     ships the projected distribution and needs no teacher LM head.
@@ -969,33 +991,31 @@ def _load_opd_full_teacher_lm_heads(
     Args:
         trainer: The driver-side policy whose workers hold the student model.
         teacher_worker_groups: Deduplicated teacher groups, keyed by primary alias.
-
-    Raises:
-        ValueError: If the run does not resolve to exactly one teacher checkpoint.
     """
-    teacher_checkpoints = {
-        teacher.model_name for teacher in teacher_worker_groups.values()
+    # teacher_worker_groups already holds one entry per physical teacher
+    # (aliases sharing a checkpoint were deduplicated upstream), so this only
+    # re-keys it by the index rows are tagged with, to walk the teachers in a
+    # stable index order below.
+    teachers_by_index: dict[int, Any] = {
+        teacher.teacher_index: teacher for teacher in teacher_worker_groups.values()
     }
-    if len(teacher_checkpoints) != 1:
-        raise ValueError(
-            "on_policy_distillation.full currently supports exactly one teacher "
-            f"checkpoint, got {sorted(teacher_checkpoints)}."
+    for teacher_index in sorted(teachers_by_index):
+        teacher = teachers_by_index[teacher_index]
+        # Resolution happens on the student workers, not here: validate_model_paths
+        # imports megatron.bridge at module scope, and only the Megatron worker
+        # actors get the mcore extra.
+        results = ray.get(
+            trainer.worker_group.run_all_workers_single_data(
+                "load_opd_full_teacher_lm_head",
+                teacher_path_config=cast(PolicyConfig, teacher.cfg),
+                teacher_index=teacher_index,
+            )
         )
-
-    teacher = next(iter(teacher_worker_groups.values()))
-    # Resolution happens on the student workers, not here: validate_model_paths
-    # imports megatron.bridge at module scope, and only the Megatron worker
-    # actors get the mcore extra.
-    results = ray.get(
-        trainer.worker_group.run_all_workers_single_data(
-            "load_opd_full_teacher_lm_head",
-            teacher_path_config=cast(PolicyConfig, teacher.cfg),
+        print(
+            f"  ✓ Loaded opd_full teacher LM head [index={teacher_index}, "
+            f"alias={teacher.alias!r}] from {results[0]}",
+            flush=True,
         )
-    )
-    print(
-        f"  ✓ Loaded opd_full teacher LM head from {results[0]}",
-        flush=True,
-    )
 
 
 def setup_single_controller(
@@ -1166,10 +1186,11 @@ def setup_single_controller(
         policy_config["pretrained_checkpoint"] = checkpointing_pretrained
 
     # Token capture: validate the supported combination loudly at setup
-    # (NeMo-Gym rollout path, vLLM backend, async_engine=true). The vLLM
-    # worker venv always carries nemo_gym (see VLLM_EXECUTABLE in
-    # ray_actor_environment_registry.py), so nothing here needs to change the
-    # worker's environment.
+    # (NeMo-Gym rollout path; vLLM with async_engine=true, or Megatron with
+    # expose_http_server=true). The serving worker's venv already carries
+    # nemo_gym for both backends (see ACTOR_ENVIRONMENTS in
+    # nemo_rl/distributed/actor_environments.py), so nothing here needs to
+    # change the worker's environment.
     token_capture_cfg = master_config.token_capture
     if rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None:
         if not master_config.checkpointing["enabled"]:
@@ -1211,22 +1232,39 @@ def setup_single_controller(
                 "(env.should_use_nemo_gym=true) — the ledger lives in Gym's "
                 "policy model server"
             )
-        if generation_config["backend"] != "vllm":
+        if generation_config["backend"] not in ("vllm", "megatron"):
             raise NotImplementedError(
-                "token_capture.enabled supports the vllm backend only; got "
+                "token_capture.enabled supports vllm or megatron; got "
                 f"{generation_config['backend']!r}"
             )
-        vllm_cfg = cast(dict[str, Any], generation_config)["vllm_cfg"]
-        if not vllm_cfg["async_engine"]:
+        generation_config_dict = cast(dict[str, Any], generation_config)
+        if (
+            generation_config["backend"] == "vllm"
+            and not generation_config_dict["vllm_cfg"]["async_engine"]
+        ):
             raise ValueError(
                 "token_capture.enabled requires "
                 "policy.generation.vllm_cfg.async_engine=true (the capture "
                 "host is the worker's in-process HTTP server)"
             )
+        if generation_config["backend"] == "megatron":
+            if not generation_config_dict["mcore_generation_config"][
+                "expose_http_server"
+            ]:
+                raise ValueError(
+                    "Megatron token capture requires policy.generation."
+                    "mcore_generation_config.expose_http_server=true"
+                )
+            if router_replay_enabled(master_config.policy):
+                raise NotImplementedError(
+                    "Megatron token capture does not yet support router replay: "
+                    "the canonical MInf stager does not yet normalize routed experts"
+                )
 
         # Fill the derived ledger-hosting fields (see TokenCaptureConfig): a
-        # per-run control-plane bearer token and the process-shared capture
-        # directory used by every Gym worker.
+        # per-run control-plane bearer token, the process-shared capture
+        # directory used by every Gym worker, and the capture-host backend.
+        token_capture_cfg.generation_backend = generation_config["backend"]
         if token_capture_cfg.control_auth_token is None:
             # Deferred import: only needed on the capture path.
             import secrets
@@ -1254,6 +1292,9 @@ def setup_single_controller(
             {
                 **opd_full_config.model_dump(),
                 "payload_field": opd_module.opd_full_payload_field(opd_full_config),
+                "teacher_index_field": opd_module.opd_full_teacher_index_field(
+                    opd_full_config
+                ),
             },
         )
 
@@ -1275,14 +1316,23 @@ def setup_single_controller(
     if is_ppo_run(master_config):
         # Only a fresh run reads this; a resume ignores it and restores the critic
         # from its own checkpoint, so the key can stay in the config.
-        warm_start = master_config.ppo.warm_start_value_checkpoint
-        if trainer_checkpoint_path is None and warm_start is not None:
+        warm_start = (
+            master_config.ppo.warm_start_value_checkpoint
+            if trainer_checkpoint_path is None
+            else None
+        )
+        if warm_start is not None:
             validate_warm_start_checkpoint(warm_start)
-            print(f"🔥 Warm-starting the value model from {warm_start}")
+            print(f"🔥 Warm-starting the value model from {warm_start} (weights only)")
         value_weights_path, value_optimizer_path = checkpointer.get_resume_paths(
             trainer_checkpoint_path or warm_start,
             model_component="value",
         )
+        if warm_start is not None:
+            # The seed's Adam state and LR-scheduler step count belong to the run
+            # that produced it, so the critic rebuilds both -- only the weights
+            # carry over.
+            value_optimizer_path = None
 
     restore_mode = rollout_checkpoint_cfg.restore_mode
     recovery_checkpoint_path = trainer_checkpoint_path
@@ -1690,6 +1740,8 @@ def setup_single_controller(
         build_tasks["trainer"] = _build_trainer_and_value
 
     # Submit build tasks and get results
+    submitted: dict[str, Any] = {}
+    nemo_gym_shards = None
     try:
         with ThreadPoolExecutor(max_workers=len(build_tasks)) as executor:
             submitted = {k: executor.submit(fn) for k, fn in build_tasks.items()}
@@ -1725,8 +1777,23 @@ def setup_single_controller(
                 weight_synchronizer.sync_weights()
                 setup_timing_metrics.weight_sync_time_s = time.perf_counter() - t0
             if use_nemo_gym:
-                env_handles["nemo_gym"], gym_time = submitted["nemo_gym"].result()
+                nemo_gym_shards, gym_time = submitted["nemo_gym"].result()
+                validate_dataset_agent_coverage(
+                    nemo_gym_shards,
+                    {"training": dataset, "validation": _val_dataset},
+                )
+                env_handles["nemo_gym"] = cast(EnvironmentInterface, nemo_gym_shards)
                 setup_timing_metrics.nemo_gym_init_time_s = gym_time
+    except BaseException:
+        if use_nemo_gym:
+            if nemo_gym_shards is None and "nemo_gym" in submitted:
+                try:
+                    nemo_gym_shards, _ = submitted["nemo_gym"].result()
+                except BaseException:
+                    pass
+            if nemo_gym_shards is not None:
+                nemo_gym_shards.shutdown()
+        raise
     finally:
         for megatron_port_holder in megatron_port_holders:
             # The frontend ranks adopted (or will never adopt) the held sockets;
@@ -1753,6 +1820,9 @@ def setup_single_controller(
             save_state=save_state,
             partition_id=partition_id,
             sampler_name=master_config.async_rl.sampler.name,
+            opd_full_teacher_checkpoints=(
+                opd_module.opd_full_teacher_checkpoints_by_index(master_config)
+            ),
         )
         if rollout_checkpoint_load_metrics is not None:
             rollout_checkpoint_load_metrics["tq_load_seconds"] = (
@@ -1835,9 +1905,7 @@ def setup_single_controller(
             include_multimodal_fields=processor is not None,
         )
     if token_capture_cfg.enabled:
-        # Host Gym's capture core in every vLLM DP leader (in-worker DP
-        # client + TQTokenSink + the single install_capture call), and give
-        # workers the initial weight version to stamp on captured calls.
+        # Both active backends stage canonical Gym rows in serving workers.
         generation.setup_token_capture(dp_config, token_capture_cfg.staging_partition)
         generation.set_rollout_weight_version(0)
 

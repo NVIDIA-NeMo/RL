@@ -37,7 +37,6 @@ from nemo_rl.algorithms.x_token.loss_utils import (
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
-    cp_load_balanced_to_contiguous,
     cp_shift_next,
     vocab_parallel_gather_columns,
 )
@@ -2539,16 +2538,10 @@ def _ct_gold_data(student_chunk_id, teacher_chunk_id, pair_valid, sample_mask):
 
 def _ct_gold_prep(logits, teacher_logits, data):
     """Mirror ``prepare_loss_input``'s shared prep for the single-rank (no-CP)
-    gold path: CP-relaid student logits + localized, next-token-shifted align."""
-    student_logits = cp_load_balanced_to_contiguous(logits, cp_group=None)
-    align = localize_alignment(
-        data, teacher_seq_len=teacher_logits.shape[1], cp_group=None
-    )
-    align.student_chunk_id = cp_shift_next(
-        cp_load_balanced_to_contiguous(align.student_chunk_id, cp_group=None),
-        None,
-        fill=-1,
-    )
+    gold path: student logits + localized, next-token-shifted align."""
+    student_logits = logits
+    align = localize_alignment(data, teacher_seq_len=teacher_logits.shape[1])
+    align.student_chunk_id = cp_shift_next(align.student_chunk_id, None, fill=-1)
     align.teacher_chunk_id = cp_shift_next(align.teacher_chunk_id, None, fill=-1)
     return student_logits, align
 
@@ -2739,11 +2732,11 @@ def test_cross_tokenizer_prepare_loss_input_partitions_canonical_ce(
     )
 
     monkeypatch.setattr(
-        "nemo_rl.algorithms.loss.utils.prepare_xtoken_cross_tokenizer_loss_input",
+        "nemo_rl.algorithms.loss.loss_input.prepare_xtoken_cross_tokenizer_loss_input",
         lambda *args, **kwargs: (torch.empty(0), {}, {}, None, cp_group),
     )
     monkeypatch.setattr(
-        "nemo_rl.algorithms.loss.utils.get_cp_sharded_next_token_logprobs",
+        "nemo_rl.algorithms.loss.loss_input.get_cp_sharded_next_token_logprobs",
         lambda *args, **kwargs: full_logprobs,
     )
     monkeypatch.setattr("torch.distributed.get_world_size", lambda group: 2)
@@ -2786,11 +2779,11 @@ def test_cross_tokenizer_prepare_loss_input_rejects_nondivisible_cp_window(
     )
 
     monkeypatch.setattr(
-        "nemo_rl.algorithms.loss.utils.prepare_xtoken_cross_tokenizer_loss_input",
+        "nemo_rl.algorithms.loss.loss_input.prepare_xtoken_cross_tokenizer_loss_input",
         lambda *args, **kwargs: (torch.empty(0), {}, {}, None, cp_group),
     )
     monkeypatch.setattr(
-        "nemo_rl.algorithms.loss.utils.get_cp_sharded_next_token_logprobs",
+        "nemo_rl.algorithms.loss.loss_input.get_cp_sharded_next_token_logprobs",
         lambda *args, **kwargs: next_token_logprobs,
     )
     monkeypatch.setattr("torch.distributed.get_world_size", lambda group: 4)
