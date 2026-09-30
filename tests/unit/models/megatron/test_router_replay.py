@@ -1246,6 +1246,238 @@ def test_router_replay_backward_queue_is_fifo_across_replayed_microbatches():
         RouterReplay.clear_global_router_replay_instances()
 
 
+@pytest.fixture
+def two_layer_replay_model():
+    from megatron.core.transformer.moe.router_replay import RouterReplay
+
+    from nemo_rl.models.megatron.router_replay import clear_router_replay
+
+    class DummyRouter(torch.nn.Module):
+        def __init__(self, layer_number):
+            super().__init__()
+            self.router_replay = RouterReplay()
+            self.layer_number = layer_number
+
+    model = torch.nn.Module()
+    model.config = SimpleNamespace(num_layers=2, moe_layer_freq=[1, 1])
+    model.routers = torch.nn.ModuleList([DummyRouter(1), DummyRouter(2)])
+    try:
+        yield model
+    finally:
+        clear_router_replay(model)
+        for router in model.routers:
+            RouterReplay.global_router_replay_instances.remove(router.router_replay)
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="CUDA not available"
+            ),
+        ),
+    ],
+)
+def test_router_replay_prepared_masks_preserve_microbatch_fifo(
+    two_layer_replay_model, monkeypatch, device
+):
+    from nemo_rl.models.megatron.router_replay import (
+        set_router_replay_backward,
+        set_router_replay_forward,
+    )
+
+    model = two_layer_replay_model
+    scores = torch.tensor([[0.1, 0.9, 0.2], [0.4, 0.2, 0.8]], device=device)
+    # The layer requiring fallback changes between microbatches. Backward must
+    # use each forward's effective routes, not the latest microbatch's mask.
+    targets = [
+        torch.tensor([[[0, 1], [1, 2]], [[2, 1], [-1, -1]]], device=device),
+        torch.tensor([[[-1, -1], [0, 2]], [[1, 0], [2, 1]]], device=device),
+    ]
+    default_indices = scores.topk(2, dim=1).indices
+    expected = [
+        torch.where(
+            target.eq(-1).all(dim=-1, keepdim=True), default_indices[:, None], target
+        )
+        for target in targets
+    ]
+    default_calls = []
+
+    def default_compute_topk(scores, topk, num_groups=None, group_topk=None):
+        default_calls.append((num_groups, group_topk))
+        return scores.topk(topk, dim=1)
+
+    def unexpected_scalar_read(*args, **kwargs):
+        raise AssertionError("routing must not synchronize through Tensor.item()")
+
+    for target, expected_routes in zip(targets, expected, strict=True):
+        set_router_replay_forward(model, target)
+        with monkeypatch.context() as no_scalar_reads:
+            no_scalar_reads.setattr(torch.Tensor, "item", unexpected_scalar_read)
+            results = [
+                router.router_replay.get_replay_topk(
+                    scores,
+                    2,
+                    num_groups=3,
+                    group_topk=2,
+                    default_compute_topk=default_compute_topk,
+                )
+                for router in model.routers
+            ]
+        for layer_idx, (probs, indices) in enumerate(results):
+            torch.testing.assert_close(indices, expected_routes[:, layer_idx])
+            torch.testing.assert_close(probs, scores.gather(1, indices))
+    # Only the one missing-route layer per microbatch computes native top-k.
+    assert default_calls == [(3, 2), (3, 2)]
+
+    set_router_replay_backward(model)
+    for expected_routes in expected:
+        with monkeypatch.context() as no_scalar_reads:
+            no_scalar_reads.setattr(torch.Tensor, "item", unexpected_scalar_read)
+            results = [
+                router.router_replay.get_replay_topk(
+                    scores, 2, default_compute_topk=default_compute_topk
+                )
+                for router in model.routers
+            ]
+        for layer_idx, (_, indices) in enumerate(results):
+            torch.testing.assert_close(indices, expected_routes[:, layer_idx])
+    assert default_calls == [(3, 2), (3, 2)]
+    assert all(
+        router.router_replay.replay_backward_list == [] for router in model.routers
+    )
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize("clear_all", [False, True])
+def test_router_replay_clear_discards_prepared_masks(two_layer_replay_model, clear_all):
+    from megatron.core.transformer.moe.router_replay import RouterReplayAction
+
+    from nemo_rl.models.megatron.router_replay import (
+        clear_router_replay,
+        set_router_replay_forward,
+    )
+
+    model = two_layer_replay_model
+    set_router_replay_forward(model, torch.tensor([[[0, 1], [-1, -1]]]))
+    clear_router_replay(None if clear_all else model)
+
+    scores = torch.tensor([[0.1, 0.9, 0.2]])
+    for router in model.routers:
+        replay = router.router_replay
+        # A direct caller after cleanup must not inherit the previous mask or
+        # its explicit no-fallback marker.
+        replay.set_target_indices(torch.tensor([[-1, -1]]))
+        replay.set_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+        _, indices = replay.get_replay_topk(
+            scores,
+            2,
+            default_compute_topk=lambda scores, topk, **kwargs: scores.topk(
+                topk, dim=1
+            ),
+        )
+        torch.testing.assert_close(indices, scores.topk(2, dim=1).indices)
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize("supply_callback", [False, True])
+def test_unprepared_valid_routes_do_not_require_native_topk(
+    two_layer_replay_model, supply_callback
+):
+    from megatron.core.transformer.moe.router_replay import RouterReplayAction
+
+    from nemo_rl.models.megatron.router_replay import (
+        _install_missing_route_fallback_patch,
+    )
+
+    def unexpected_topk(*args, **kwargs):
+        pytest.fail("valid replay indices must not invoke native top-k")
+
+    _install_missing_route_fallback_patch()
+    replay = two_layer_replay_model.routers[0].router_replay
+    targets = torch.tensor([[0, 2]])
+    scores = torch.tensor([[0.1, 0.9, 0.2]])
+    replay.set_target_indices(targets)
+    replay.set_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+    probs, indices = replay.get_replay_topk(
+        scores, 2, default_compute_topk=unexpected_topk if supply_callback else None
+    )
+    torch.testing.assert_close(indices, targets)
+    torch.testing.assert_close(probs, scores.gather(1, targets))
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="CUDA not available"
+            ),
+        ),
+    ],
+)
+def test_prepared_missing_route_recompute_preserves_gradients(
+    two_layer_replay_model, device
+):
+    from torch.utils.checkpoint import checkpoint
+
+    from nemo_rl.models.megatron.router_replay import (
+        set_router_replay_backward,
+        set_router_replay_forward,
+    )
+
+    model = two_layer_replay_model
+    logits_data = torch.tensor([[0.1, 0.9, 0.2], [0.4, 0.2, 0.8]], device=device)
+    target = torch.tensor([[[0, 1], [-1, -1]], [[-1, -1], [1, 0]]], device=device)
+    default_indices = logits_data.topk(2, dim=1).indices
+    expected = torch.where(
+        target.eq(-1).all(dim=-1, keepdim=True), default_indices[:, None], target
+    )
+    weights = torch.tensor([[0.3, -0.4], [1.2, 0.5]], device=device)
+    baseline_logits = logits_data.clone().requires_grad_()
+    baseline_loss = sum(
+        (baseline_logits.gather(1, expected[:, layer_idx]) * weights).sum()
+        for layer_idx in range(2)
+    )
+    baseline_loss.backward()
+    default_calls = []
+
+    def default_compute_topk(scores, topk, num_groups=None, group_topk=None):
+        default_calls.append(1)
+        return scores.topk(topk, dim=1)
+
+    def route_loss(scores):
+        return sum(
+            (
+                router.router_replay.get_replay_topk(
+                    scores, 2, default_compute_topk=default_compute_topk
+                )[0]
+                * weights
+            ).sum()
+            for router in model.routers
+        )
+
+    replay_logits = logits_data.clone().requires_grad_()
+    set_router_replay_forward(model, target)
+    replay_loss = checkpoint(route_loss, replay_logits, use_reentrant=True)
+    set_router_replay_backward(model)
+    replay_loss.backward()
+
+    assert len(default_calls) == 2
+    torch.testing.assert_close(replay_loss, baseline_loss)
+    torch.testing.assert_close(replay_logits.grad, baseline_logits.grad)
+    assert all(
+        router.router_replay.replay_backward_list == [] for router in model.routers
+    )
+
+
 @pytest.mark.mcore
 def test_router_replay_validation_allows_all_negative_fallback_rows(monkeypatch):
     from nemo_rl.models.megatron.router_replay import _validate_replay_tensor
