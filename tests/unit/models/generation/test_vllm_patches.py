@@ -148,9 +148,6 @@ _CAPTURER_PATCH_FN = "_patch_vllm_routed_experts_capture_router_fallback"
 _CAPTURER_MARKER = (
     "NeMo-RL patch (router fallback for monolithic routed-experts capture)"
 )
-_COMPACT_CAPTURER_FIXTURE = (
-    Path(__file__).parent / "fixtures" / "routed_experts_capturer_v029.py.txt"
-)
 
 
 @pytest.fixture
@@ -542,13 +539,33 @@ def patched_capturer_source(tmp_path, monkeypatch):
 
 @pytest.fixture
 def compact_capturer_source(tmp_path, monkeypatch):
-    """Pinned v0.29.0 upstream source; the fixture retains its Apache header.
-
-    Source: https://github.com/vllm-project/vllm/blob/v0.29.0/vllm/
-    model_executor/layers/fused_moe/routed_experts_capturer.py
-    """
-    copied = tmp_path / "routed_experts_capturer.py"
-    copied.write_text(_COMPACT_CAPTURER_FIXTURE.read_text())
+    """Copy installed vLLM, undoing patches so tests are order-independent."""
+    copied = write_unpatched_copy(
+        _CAPTURER_SOURCE, _CAPTURER_PATCH_FN, tmp_path / "routed_experts_capturer.py"
+    )
+    # Like patch_snippets(), read the replacements from the patch itself.
+    # Generation workers may already have patched the installed source.
+    tree = ast.parse(Path(patches.__file__).read_text())
+    patch_function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_compact_routed_experts_capturer_source"
+    )
+    replacements = next(
+        ast.literal_eval(node.value)
+        for node in patch_function.body
+        if isinstance(node, ast.Assign)
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id == "replacements"
+    )
+    content = copied.read_text()
+    for name, old, new in replacements:
+        content = content.replace(new, old, 1)
+        assert new not in content and content.count(old) == 1, (
+            f"Installed vLLM has an unrecognized {name} block"
+        )
+    copied.write_text(content)
     monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
     return copied
 
@@ -575,6 +592,7 @@ def _execute_capturer_source(content, device="cpu"):
     return namespace
 
 
+@pytest.mark.vllm
 @pytest.mark.parametrize("expert_count", [256, 512])
 @pytest.mark.parametrize("dp_rank", [0, 1])
 @pytest.mark.parametrize(
@@ -656,6 +674,7 @@ def test_compact_capturer_allocates_and_preserves_global_layer_routes(
     assert torch.equal(snapshot.routing_data, expected)
 
 
+@pytest.mark.vllm
 @pytest.mark.parametrize("layer_types", [None, [], ["attention"] * 4])
 def test_compact_capturer_keeps_full_width_without_explicit_moe_layers(
     compact_capturer_source, layer_types
@@ -690,6 +709,7 @@ def test_compact_capturer_keeps_full_width_without_explicit_moe_layers(
         capturer.capture(4, routes)
 
 
+@pytest.mark.vllm
 @pytest.mark.parametrize("fallback_first", [False, True])
 def test_compact_capturer_patch_composes_with_router_fallback_and_is_idempotent(
     compact_capturer_source, fallback_first
@@ -709,6 +729,7 @@ def test_compact_capturer_patch_composes_with_router_fallback_and_is_idempotent(
     ast.parse(content)
 
 
+@pytest.mark.vllm
 @pytest.mark.parametrize(
     "old,new",
     [
@@ -729,6 +750,7 @@ def test_compact_capturer_patch_refuses_unknown_source_without_writing(
     assert compact_capturer_source.read_text() == content
 
 
+@pytest.mark.vllm
 def test_compact_capturer_patch_refuses_partial_patch(compact_capturer_source):
     patched = patches._compact_routed_experts_capturer_source(
         compact_capturer_source.read_text()
@@ -743,16 +765,6 @@ def test_compact_capturer_patch_refuses_partial_patch(compact_capturer_source):
             logging.getLogger(__name__), required=True
         )
     assert compact_capturer_source.read_text() == partial
-
-
-@pytest.mark.vllm
-def test_compact_capturer_patch_matches_installed_vllm(tmp_path, monkeypatch):
-    copied = tmp_path / "routed_experts_capturer.py"
-    copied.write_text(Path(patches._get_vllm_file(_CAPTURER_SOURCE)).read_text())
-    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
-    assert patches._patch_vllm_routed_experts_compact_layers(
-        logging.getLogger(__name__), required=True
-    )
 
 
 @pytest.mark.vllm
