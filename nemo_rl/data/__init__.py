@@ -51,6 +51,7 @@ class ResponseDatasetConfig(TypedDict):
     video_temporal_patch_size: NotRequired[int]
     video_maintain_aspect_ratio: NotRequired[bool]
     min_generation_tokens: NotRequired[int]
+    max_samples: NotRequired[int | None]
 
 
 class PreferenceDatasetConfig(TypedDict):
@@ -218,6 +219,7 @@ class MMAUEvalDataConfig(TypedDict):
     prompt_file: NotRequired[str | None]
     system_prompt_file: NotRequired[str | None]
     env_name: NotRequired[str]
+    max_samples: NotRequired[int | None]
 
 
 class DailyOmniEvalDataConfig(TypedDict):
@@ -236,6 +238,8 @@ class DailyOmniEvalDataConfig(TypedDict):
         prompt_file: Optional prompt template path.
         system_prompt_file: Optional system prompt path.
         env_name: Reward/eval environment name (e.g. ``"vlm"``).
+        max_samples: Cap on the number of rows evaluated. None evaluates the
+            whole split.
     """
 
     max_input_seq_length: int
@@ -244,6 +248,7 @@ class DailyOmniEvalDataConfig(TypedDict):
     prompt_file: NotRequired[str | None]
     system_prompt_file: NotRequired[str | None]
     env_name: NotRequired[str]
+    max_samples: NotRequired[int | None]
 
 
 # Union type for all eval dataset configs

@@ -84,6 +84,7 @@ def load_eval_dataset(data_config):
         base_dataset = MMAUDataset(
             dataset_name="TwinkStart/MMAU",
             split=split,
+            max_samples=data_config.get("max_samples"),
         )
     # daily-omni
     elif dataset_name == "daily-omni":
@@ -92,6 +93,7 @@ def load_eval_dataset(data_config):
             split=split,
             prompt_file=data_config.get("prompt_file"),
             system_prompt_file=data_config.get("system_prompt_file"),
+            max_samples=data_config.get("max_samples"),
         )
     # fall back to local dataset
     else:

@@ -1,0 +1,14 @@
+python-version = "3.13.14"
+search-path = [".", "../.."]
+project-includes = ["flow_grpo/**/*.py", "run_flow_grpo.py"]
+# Match core's treatment of optional libraries and untyped actor APIs.
+replace-imports-with-any = [
+  "nemo_automodel.*",
+  "ray.*",
+  "numpy.*",
+  "datasets.*",
+  "transformers.*",
+]
+
+[errors]
+missing-attribute = false

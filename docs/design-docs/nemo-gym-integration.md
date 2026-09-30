@@ -49,6 +49,55 @@ Gym result payloads are needed for a short debugging run.
 
 For complete examples, see `examples/nemo_gym/run_grpo_nemo_gym.py`, `examples/nemo_gym/run_distillation_nemo_gym.py`, and their associated configs under `examples/nemo_gym/`.
 
+### Shard NeMo Gym across nodes
+
+NeMo RL normally starts one NeMo Gym actor for a job. That actor runs every configured Gym server on one node. Use `env.nemo_gym.shards` when the combined environments need more capacity than one node can provide.
+
+Each shard defines a self-contained Gym configuration. NeMo RL starts one actor for each shard replica and routes every prompt group to the shard that hosts its agent or task source.
+
+```yaml
+env:
+  nemo_gym:
+    config_paths: null
+    shards:
+      - name: tools
+        port_range_low: 5000
+        port_range_high: 5499
+        config_paths:
+          - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+          - resources_servers/workplace_assistant/configs/workplace_assistant.yaml
+      - name: math
+        port_range_low: 5500
+        port_range_high: 5999
+        config_paths:
+          - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+          - resources_servers/math_with_judge/configs/math_with_judge.yaml
+    common_inherited_overlays:
+      - policy_model
+    allowed_duplicate_entries:
+      - policy_model
+```
+
+Set the inherited top-level `config_paths` to `null` when the shard list replaces it. Each shard can also set `inherited_overlays` to claim inherited Gym entries, `overrides` to add shard-specific configuration, `replicas` to start identical actor instances, `actor_cpus` to reserve CPU capacity, and a non-overlapping port range.
+
+Use `common_inherited_overlays` for inherited entries that every shard needs. List an entry in `allowed_duplicate_entries` when it may appear in more than one shard. NeMo RL rejects unclaimed inherited entries, duplicate routable entries, and overlapping port ranges during setup.
+
+#### Choose actor placement
+
+The default `placement_strategy` is `STRICT_SPREAD`, which requires Ray to place each actor on a different node. This provides the capacity isolation that sharding is designed for.
+
+For a single-node test, set:
+
+```yaml
+env:
+  nemo_gym:
+    placement_strategy: PACK
+```
+
+`PACK` validates configuration, routing, and teardown on one machine, but it does not provide node-level capacity isolation. The other supported Ray strategies are `SPREAD` and `STRICT_PACK`. Shards with `replicas > 1` require the default `STRICT_SPREAD`; replicas share one merged configuration and port range, so any other strategy could place them on the same node.
+
+See `examples/nemo_gym/grpo_sharded_gym_smoke.yaml` for a complete manual smoke configuration.
+
 ### Version Requirements
 
 NeMo Gym runs as a Ray actor within NeMo RL's Ray cluster, so the same Ray and Python versions must be used in both environments.

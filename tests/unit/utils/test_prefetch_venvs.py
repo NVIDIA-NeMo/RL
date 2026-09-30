@@ -28,7 +28,7 @@ def mock_registry():
     """Create a mock registry with various actor types."""
     return {
         "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker": "uv run --group vllm",
-        "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker": "uv run --group vllm",
+        "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2": "uv run --group vllm",
         "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker": "uv run --group mcore",
         "nemo_rl.environments.math_environment.MathEnvironment": "python",
         "nemo_rl.environments.code_environment.CodeEnvironment": "python",
@@ -67,7 +67,7 @@ class TestPrefetchVenvs:
                 in actor_fqns
             )
             assert (
-                "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker"
+                "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2"
                 in actor_fqns
             )
             assert (
@@ -158,7 +158,7 @@ class TestPrefetchVenvs:
             actor_fqns = [args[1] for args in call_args]
 
             assert (
-                "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker"
+                "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2"
                 in actor_fqns
             )
             assert (

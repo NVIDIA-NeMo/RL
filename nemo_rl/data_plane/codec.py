@@ -44,7 +44,7 @@ import numpy as np
 import torch
 from tensordict import TensorDict, TensorDictBase
 
-from nemo_rl.data_plane.schema import Layout
+from nemo_rl.data_plane.schema import OPD_FULL_FIELDS, Layout
 from nemo_rl.utils.timer import ThreadSafeTimer
 
 # Pad/unpad cost, which the per-op metrics cannot see: packing runs in the
@@ -426,6 +426,19 @@ def materialize(
         # which skip ``to_padded_tensor`` above) and must not be padded
         # anyway — their dim 1 is patch/image count, not seqlen, so
         # extending it to a token seqlen inflates pixel_values ~40x.
+        #
+        # opd_full's teacher payload columns skip this for a different
+        # reason: they never feed the model's forward (only
+        # ``pad_to_seqlen``'s own consumer, the microbatch iterator, needs
+        # every row aligned to the *forward* pad target), so there is no
+        # correctness need to pad them past their own natural width.
+        # SequencePackingLossWrapper (loss/wrapper.py) slices each sequence
+        # out by its own real length regardless of how far the tensor is
+        # padded, so this only ever discarded slack -- but discarding it at
+        # 98304 tokens x hidden_size wide, times every sequence in the whole
+        # DP-rank's batch (not just one training microbatch -- see
+        # train_microbatches_from_meta's docstring), is what turned a normal
+        # per-token payload into a single 100+ GiB allocation.
         if (
             pad_to_seqlen > 0
             and isinstance(padded, torch.Tensor)
@@ -433,6 +446,7 @@ def materialize(
             and padded.dim() >= 2
             and padded.shape[1] < pad_to_seqlen
             and key not in PACKED_MULTIMODAL_FIELDS
+            and key not in OPD_FULL_FIELDS
         ):
             pad_spec = [0, 0] * (padded.dim() - 2) + [
                 0,

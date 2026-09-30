@@ -382,7 +382,7 @@ class SFTSingleControllerActor:
                 else None
             ),
             tokenizer_path=os.path.join(checkpoint_path, "policy", "tokenizer"),
-            checkpointing_cfg=self._master_config.checkpointing,
+            is_final_checkpoint=step == self._max_steps,
         )
         torch.save(loader_states, os.path.join(checkpoint_path, "sft_v2_loaders.pt"))
         self._checkpointer.begin_finalization(
