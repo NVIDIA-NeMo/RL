@@ -39,6 +39,28 @@ pytestmark = pytest.mark.mcore
 class TestModelForward:
     """Tests for model_forward function."""
 
+    @pytest.mark.parametrize("compute_mtp_loss", [None, False, True])
+    def test_model_forward_only_passes_explicit_mtp_override(self, compute_mtp_loss):
+        from nemo_rl.models.megatron.train import model_forward
+
+        model = MagicMock()
+        data = MagicMock()
+        data.get_multimodal_dict.return_value = {}
+        model_forward(
+            model=model,
+            data_dict=data,
+            input_ids_cp_sharded=SimpleNamespace(device="cpu"),
+            position_ids=None,
+            attention_mask=None,
+            compute_mtp_loss=compute_mtp_loss,
+        )
+
+        kwargs = model.call_args.kwargs
+        if compute_mtp_loss is None:
+            assert "compute_mtp_loss" not in kwargs
+        else:
+            assert kwargs["compute_mtp_loss"] is compute_mtp_loss
+
     def test_model_forward_basic(self):
         """Test basic model_forward without multimodal data."""
         from nemo_rl.models.megatron.train import model_forward

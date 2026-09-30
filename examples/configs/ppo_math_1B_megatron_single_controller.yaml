@@ -43,6 +43,9 @@ async_rl:
   # PPO only: publish policy weights before critic training to overlap rollout
   # generation with the critic update. Requires disaggregated generation,
   # max_lookahead_versions >= 1, and a Megatron policy backend.
+  # With one lookahead version, reserve max_buffered_rollouts >=
+  # 3 * ppo.num_prompts_per_step for a full new-policy batch during critic
+  # training. A smaller buffer can defer dispatch until the critic finishes.
   early_refit: false
   # Min ready groups the streaming trainer waits for before dispatching a batch.
   min_groups_for_streaming_train: ${ppo.num_prompts_per_step}

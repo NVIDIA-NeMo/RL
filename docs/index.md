@@ -200,7 +200,7 @@ Run async GRPO or PPO via the SingleController path: TransferQueue data plane, p
 
 :::{grid-item-card} {octicon}`sync` PPO Early Refit
 
-Set `async_rl.early_refit=true` with a Megatron policy backend and disaggregated generation to publish the updated PPO policy before critic training and overlap new-policy rollout generation with the critic update.
+Set `async_rl.early_refit=true` with a Megatron policy backend and disaggregated generation to publish the updated PPO policy before critic training. Rollout overlap also needs spare buffer capacity: with one lookahead version, allow `max_buffered_rollouts >= 3 * ppo.num_prompts_per_step` to hold the current training batch, the buffered lookahead batch, and a full new-policy batch. Smaller buffers remain supported, but can delay new-policy dispatch until the critic finishes.
 :::
 
 ::::

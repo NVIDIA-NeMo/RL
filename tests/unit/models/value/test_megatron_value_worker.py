@@ -28,6 +28,7 @@ They cover the PPO-specific value-worker behavior:
 Modeled after `tests/unit/models/policy/test_megatron_worker.py`.
 """
 
+import inspect
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -50,6 +51,68 @@ from nemo_rl.models.value.lm_value import Value
 from nemo_rl.utils.checkpoint import CheckpointManager
 
 pytestmark = pytest.mark.mcore
+
+
+@pytest.mark.parametrize("hybrid", [False, True])
+@pytest.mark.parametrize("mtp_process", [False, True])
+@pytest.mark.parametrize("wrapper_depth", [0, 2])
+def test_critic_mtp_keyword_matches_backbone_forward_signature(
+    hybrid: bool, mtp_process: bool, wrapper_depth: int
+) -> None:
+    from megatron.core.models.gpt.gpt_model import GPTModel
+    from megatron.core.models.hybrid.hybrid_model import HybridModel
+
+    from nemo_rl.models.value.workers.megatron_value_worker import _is_hybrid_model
+
+    model_cls = HybridModel if hybrid else GPTModel
+    model = object.__new__(model_cls)
+    # Both backbone classes define this attribute; it is not a capability flag.
+    object.__setattr__(model, "mtp_process", mtp_process)
+    wrapped = model
+    for _ in range(wrapper_depth):
+        wrapped = SimpleNamespace(module=wrapped)
+
+    assert _is_hybrid_model(wrapped) is hybrid
+    kwargs = {"compute_mtp_loss": False} if _is_hybrid_model(wrapped) else {}
+    inspect.signature(model_cls.forward).bind(
+        model, input_ids=None, position_ids=None, attention_mask=None, **kwargs
+    )
+
+
+@pytest.mark.parametrize("optimizer_cpu_offload", [False, True])
+def test_finish_training_enters_eval_before_offloading(
+    optimizer_cpu_offload: bool,
+) -> None:
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        MegatronValueWorkerImpl,
+    )
+
+    events = []
+    model = SimpleNamespace(eval=lambda: events.append("eval"))
+    worker = object.__new__(MegatronValueWorkerImpl)
+    worker.model = model
+    worker.optimizer = object()
+    worker.optimizer_cpu_offload = optimizer_cpu_offload
+
+    def move_model(model, device, *, move_params, move_grads):
+        assert events == ["eval"]
+        assert (device, move_params, move_grads) == ("cpu", True, True)
+        events.append("model_offload")
+        return model
+
+    worker.move_model = move_model
+    worker.move_optimizer = lambda device: events.append("optimizer_offload")
+    with (
+        patch("nemo_rl.models.value.workers.megatron_value_worker.gc.collect"),
+        patch(
+            "nemo_rl.models.value.workers.megatron_value_worker.torch.cuda.empty_cache"
+        ),
+    ):
+        worker.finish_training()
+
+    assert events == ["eval", "model_offload"] + (
+        [] if optimizer_cpu_offload else ["optimizer_offload"]
+    )
 
 
 def test_get_values_suspends_activation_offload() -> None:

@@ -21,17 +21,22 @@ import pytest
 
 
 def _megatron_worker_impl():
-    module = pytest.importorskip("nemo_rl.models.policy.workers.megatron_policy_worker")
-    return module.MegatronPolicyWorkerImpl
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    return MegatronPolicyWorkerImpl
 
 
 def _dtensor_worker_impl():
-    module = pytest.importorskip(
-        "nemo_rl.models.policy.workers.dtensor_policy_worker_v2"
+    from nemo_rl.models.policy.workers.dtensor_policy_worker_v2 import (
+        DTensorPolicyWorkerV2Impl,
     )
-    return module.DTensorPolicyWorkerV2Impl
+
+    return DTensorPolicyWorkerV2Impl
 
 
+@pytest.mark.mcore
 def test_megatron_residency_checks_buffer_storage_not_only_parameter_device():
     class FakeDistributedDataParallel:
         def __init__(self):
@@ -59,6 +64,7 @@ def test_megatron_residency_checks_buffer_storage_not_only_parameter_device():
     assert result == {"params_resident_on_cuda": False, "checked_units": 2}
 
 
+@pytest.mark.mcore
 def test_megatron_residency_falls_back_when_ddp_has_no_param_buffer():
     class FakeDistributedDataParallel:
         def __init__(self):
@@ -84,6 +90,7 @@ def test_megatron_residency_falls_back_when_ddp_has_no_param_buffer():
     assert result == {"params_resident_on_cuda": True, "checked_units": 1}
 
 
+@pytest.mark.mcore
 @pytest.mark.parametrize("keep_params_for_training", [False, True])
 def test_megatron_finish_inference_optionally_retains_params(
     keep_params_for_training,
@@ -127,6 +134,7 @@ def test_megatron_finish_inference_optionally_retains_params(
 
 
 @pytest.mark.parametrize("keep_params_for_training", [False, True])
+@pytest.mark.automodel
 def test_dtensor_finish_inference_optionally_retains_params(
     keep_params_for_training,
 ):

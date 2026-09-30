@@ -39,6 +39,7 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallelV2,
 )
 from megatron.core.models.gpt import GPTModel
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.parallel_state import (
     get_context_parallel_group,
@@ -94,10 +95,10 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
-def _has_mtp_process(model: torch.nn.Module) -> bool:
+def _is_hybrid_model(model: torch.nn.Module) -> bool:
     while hasattr(model, "module"):
         model = model.module
-    return hasattr(model, "mtp_process")
+    return isinstance(model, HybridModel)
 
 
 def _install_value_head_load_skip(chunk: GPTModel) -> None:
@@ -590,7 +591,7 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
                         global_valid_seqs=global_valid_seqs,
                         global_valid_toks=global_valid_toks,
                         compute_mtp_loss=(
-                            False if _has_mtp_process(self.model) else None
+                            False if _is_hybrid_model(self.model) else None
                         ),
                     )
 
@@ -768,7 +769,7 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
                 additional_kwargs["packed_seq_params"] = packed_seq_params
 
             # The value head uses the backbone hidden states, not MTP outputs.
-            if _has_mtp_process(model):
+            if _is_hybrid_model(model):
                 additional_kwargs["compute_mtp_loss"] = False
 
             output_tensor = model(
