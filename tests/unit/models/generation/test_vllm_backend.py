@@ -314,7 +314,7 @@ def test_nccl_reshard_preflight_failure_is_fail_closed_and_nonfatal(monkeypatch)
         vllm_backend.VllmInternalWorkerExtension
     )
     ext.model_runner = SimpleNamespace(
-        model=object(), vllm_config=SimpleNamespace(speculative_config=None)
+        model=torch.nn.Module(), vllm_config=SimpleNamespace(speculative_config=None)
     )
     ext.model_config = object()
     ext.device = object()
