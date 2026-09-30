@@ -46,7 +46,6 @@ from torch.distributed.tensor import DTensor
 
 from nemo_rl.algorithms.x_token.token_aligner import AlignmentBatch
 from nemo_rl.distributed.model_utils import (
-    cp_load_balanced_to_contiguous,
     cp_shift_next,
     get_logprobs_from_vocab_parallel_logits,
     group_all_reduce_sum_with_grad,
@@ -324,19 +323,11 @@ def localize_alignment(
     *,
     teacher_seq_len: int,
     alignment_prefix: str = "alignment_",
-    cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> LocalizedAlignment:
-    """Localize the chunk-alignment data-dict fields for the local CP shard.
+    """Unwrap the chunk-alignment data-dict fields from DTensor to local tensors.
 
-    Unwraps the ``{alignment_prefix}*`` / ``sample_mask`` entries from DTensor to
-    their local tensors. Student-seq fields (``student_chunk_id``) come from
-    ``cp_buffers`` in PyTorch's *load-balanced* (``2*cp`` interleaved) CP layout,
-    not contiguous — the caller
-    (:func:`prepare_xtoken_cross_tokenizer_loss_input`) must relayout them to this
-    rank's contiguous window via :func:`cp_load_balanced_to_contiguous` before use.
-    The teacher-seq ``teacher_chunk_id`` is full, so it is sliced contiguously to
-    this CP rank's ``teacher_seq_len`` window to match the IPC consumer's
-    contiguous teacher-logit slice.
+    The teacher-seq ``teacher_chunk_id`` is full, so it is trimmed to
+    ``teacher_seq_len`` to match the IPC consumer's teacher-logit slice.
 
     Args:
         alignment_prefix: Data-dict key prefix for this teacher's alignment
@@ -344,17 +335,8 @@ def localize_alignment(
             teacher in the multi-teacher trainer / collator). ``sample_mask`` is
             student-level and stays unprefixed.
     """
-    teacher_chunk_id_full = to_local_if_dtensor(
-        data[f"{alignment_prefix}teacher_chunk_id"]
-    )
-    cp_rank = (
-        torch.distributed.get_rank(cp_group)
-        if cp_group is not None and torch.distributed.get_world_size(cp_group) > 1
-        else 0
-    )
-    teacher_seq_start = cp_rank * teacher_seq_len
-    teacher_chunk_id = teacher_chunk_id_full[
-        :, teacher_seq_start : teacher_seq_start + teacher_seq_len
+    teacher_chunk_id = to_local_if_dtensor(data[f"{alignment_prefix}teacher_chunk_id"])[
+        :, :teacher_seq_len
     ]
     return LocalizedAlignment(
         sample_mask=to_local_if_dtensor(data["sample_mask"]),
@@ -1031,15 +1013,17 @@ def prepare_xtoken_cross_tokenizer_loss_input(
     localized, next-token-shifted chunk alignment from its ``alignment_{i}_*``
     keys; a same-tokenizer teacher (``None`` path) gets a thin alignment carrying
     only the shared student fields (identity 1:1 token alignment, no chunks).
-    TP/CP groups come from the student ``logits``' device mesh, falling back to
-    the passed groups for non-DTensor logits.
+    The TP group comes from the student ``logits``' device mesh, falling back to
+    ``vocab_parallel_group`` for non-DTensor logits; the CP group is always the
+    passed ``context_parallel_group``.
 
     Args:
         projection_matrix_paths: Per-teacher projection paths. Its length is the
             teacher count and drives the ``teacher_{i}_*`` / ``alignment_{i}_*``
             keys read here; a ``None`` entry marks a same-tokenizer teacher.
-        cp_sharder: Automodel's model-owned sequence layout. When provided, it
-            replaces the legacy load-balanced CP relayout for student tensors.
+        cp_sharder: Automodel's model-owned sequence layout, set only when
+            context_parallel_size > 1. It relays the student tensors to this
+            rank's contiguous window.
 
     Returns:
         ``(student_logits_contig, teacher_full_logits_by_idx, aligns_by_idx, tp_group, cp_group)``.
@@ -1048,21 +1032,15 @@ def prepare_xtoken_cross_tokenizer_loss_input(
         mesh = logits.device_mesh
         mesh_names = mesh.mesh_dim_names or ()
         tp_group = mesh.get_group("tp") if "tp" in mesh_names else None
-        cp_group = (
-            context_parallel_group
-            if cp_sharder is not None
-            else (mesh.get_group("cp") if "cp" in mesh_names else None)
-        )
     else:
-        cp_group = context_parallel_group
         tp_group = vocab_parallel_group
+    cp_group = context_parallel_group
 
     device = torch.cuda.current_device()
 
     # Student CP relay is computed once and shared by every teacher's KD term.
     # Automodel restores its own model layout before NeMo RL selects the
-    # contiguous IPC-consumer window. Legacy callers retain the existing
-    # load-balanced-to-contiguous conversion.
+    # contiguous IPC-consumer window.
     if cp_sharder is not None:
         # Keep the student-logit autograd graph intact: to_local_if_dtensor()
         # runs DTensor.to_local() under torch.no_grad(), which would detach the
@@ -1096,15 +1074,9 @@ def prepare_xtoken_cross_tokenizer_loss_input(
             :, student_seq_start : student_seq_start + student_seq_len
         ].contiguous()
     else:
-        student_logits_contig = cp_load_balanced_to_contiguous(
-            logits, cp_group=cp_group
-        )
-        student_input_ids = cp_load_balanced_to_contiguous(
-            data["input_ids"], cp_group=cp_group
-        )
-        student_token_mask = cp_load_balanced_to_contiguous(
-            data["token_mask"], cp_group=cp_group
-        )
+        student_logits_contig = logits
+        student_input_ids = data["input_ids"]
+        student_token_mask = data["token_mask"]
     sample_mask = to_local_if_dtensor(data["sample_mask"])
 
     teacher_full_logits_by_idx: Dict[int, torch.Tensor] = {}
@@ -1158,14 +1130,9 @@ def prepare_xtoken_cross_tokenizer_loss_input(
                 data,
                 teacher_seq_len=teacher_full_logits.shape[1],
                 alignment_prefix=alignment_prefix,
-                cp_group=cp_group,
             )
             align.student_chunk_id = cp_shift_next(
-                cp_load_balanced_to_contiguous(
-                    align.student_chunk_id, cp_group=cp_group
-                ),
-                cp_group,
-                fill=-1,
+                align.student_chunk_id, cp_group, fill=-1
             )
             align.teacher_chunk_id = cp_shift_next(
                 align.teacher_chunk_id, cp_group, fill=-1
