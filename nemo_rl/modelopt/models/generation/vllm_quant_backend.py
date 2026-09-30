@@ -34,11 +34,15 @@ from nemo_rl.modelopt.models.generation.nvfp4_refit import (
     serialize_bf16_nvfp4_group,
     validate_nvfp4_routed_expert_selection,
 )
+from nemo_rl.modelopt.models.generation.vllm_quant_moe_amax import (
+    route_moe_input_quantizer_amax,
+)
 from nemo_rl.modelopt.utils import (
     MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS,
     matches_quant_ignore_pattern,
 )
 from nemo_rl.models.generation.vllm.checkpoint_engine import VllmCheckpointEngineMixin
+from nemo_rl.models.generation.vllm.patches import modelopt_moe_amax_aliases
 from nemo_rl.models.generation.vllm.vllm_backend import (
     IPCWeightManifestError,
     VllmInternalWorkerExtension,
@@ -301,10 +305,10 @@ def _batch_fused_modelopt_moe_weights(
     loader still requires an expert id, so only the tiny per-expert global
     scales are exposed as scalar views.
 
-    Gated ``w13`` payloads are the exception on vLLM >= 0.25: they are emitted
-    as per-expert 2-D shards instead, because ``RoutedExperts.load_weights``'
-    fused-3D branch mis-transposes packed NVFP4. See the comment at the
-    emission site below.
+    ``w13`` payloads are the exception on vLLM >= 0.25: both the gated and the
+    non-gated layouts are emitted as per-expert 2-D shards instead, because
+    ``RoutedExperts.load_weights``' fused-3D branch mis-transposes packed
+    NVFP4. See the comments at the emission sites below.
     """
     batched: list[tuple[str, torch.Tensor]] = []
     for name, tensor in weights:
@@ -323,11 +327,27 @@ def _batch_fused_modelopt_moe_weights(
         if target in {"w13_weight", "w13_weight_scale"}:
             target_suffix = "weight" if target == "w13_weight" else "weight_scale"
             if w13_num_shards_by_prefix.get(prefix) == 1:
-                batched.append(
-                    (
-                        f"{prefix}.experts.0.up_proj.{target_suffix}",
-                        tensor,
+                # Non-gated experts (e.g. Nemotron-H) have a single w13
+                # projection, but the payload is still batched [E, N, K/2].
+                # vLLM 0.26 routes it into RoutedExperts.load_weights' fused
+                # branch -- which keys off `loaded_weight.dim() == 3` alone --
+                # so it transposes and `chunk(2, dim=1)`s a dimension that was
+                # never a fused gate/up pair, and the copy shapes disagree.
+                # vLLM <= 0.25.1 escaped this only because Nemotron-H shipped
+                # its own load_weights; 0.26 deleted it in favour of
+                # AutoWeightsLoader. Emit per-expert 2-D shards for the same
+                # reason the gated branch below does.
+                if tensor.ndim != 3:
+                    raise ValueError(
+                        f"Expected a batched [E, N, K] non-gated W13 tensor for "
+                        f"{name}, got {tuple(tensor.shape)}"
                     )
+                batched.extend(
+                    (
+                        f"{prefix}.experts.{expert_id}.up_proj.{target_suffix}",
+                        expert_weight,
+                    )
+                    for expert_id, expert_weight in enumerate(tensor.unbind(0))
                 )
                 continue
             if tensor.ndim < 2 or tensor.shape[1] % 2 != 0:
@@ -1016,14 +1036,17 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
     def _attach_input_quantizer_amax_loaders(self, model):
         """Eagerly attach weight_loaders to input_quantizer amax buffers.
 
-        vLLM >= 0.25 loads refit weights through per-module
-        ``load_weights`` (e.g. ``LinearBase.load_weights``), which resolves
-        targets via ``getattr`` and calls ``param.weight_loader(param,
-        loaded_weight, shard_id)`` directly — it never iterates
+        vLLM's per-module refit loaders (e.g.
+        ``MergedColumnParallelLinear.load_weights``) resolve
+        targets via ``getattr`` and call ``param.weight_loader(param,
+        loaded_weight, shard_id)`` directly — they never iterate
         ``model.named_parameters()``, so the lazy attach in
         ``_patch_named_parameters_to_include_buffers`` no longer fires and
         quantizer amax buffers arrive without a loader (AttributeError:
         'Tensor' object has no attribute 'weight_loader').
+
+        The scoped MoE alias workaround is owned by ``patches.py``;
+        ``modelopt_moe_amax_aliases`` applies it around this refit.
         """
 
         def input_amax_loader(param, loaded_weight, *args, **kwargs):
@@ -1037,7 +1060,8 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                 buf.weight_loader = input_amax_loader
                 attached.append(buf)
         try:
-            yield
+            with modelopt_moe_amax_aliases(model):
+                yield
         finally:
             for buf in attached:
                 del buf.weight_loader
@@ -1090,6 +1114,19 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                         self._get_modelopt_reload_roots(),
                         source_storage_ptrs,
                     )
+
+        # vLLM 0.28 routes every ``experts.*`` name through
+        # ``RoutedExperts.load_weights``, which resolves the rewritten name with a
+        # single ``getattr`` and therefore cannot reach the dotted quantizer
+        # buffers (``w13_input_quantizer._amax``). Fan the per-expert amax values
+        # into the fused quantizers here and keep them away from vLLM's loader.
+        # Checkpoint names (e.g. Nemotron-H's ``backbone.*``) only turn into the
+        # module's vLLM ``layer_name`` through the model's hf_to_vllm_mapper.
+        weights = route_moe_input_quantizer_amax(
+            self.model_runner.model,
+            weights,
+            mapper=getattr(self.model_runner.model, "hf_to_vllm_mapper", None),
+        )
 
         # MBridge exports K/V amax with the HF-semantic attention path, such as
         # ``self_attn.k_bmm_quantizer._amax``. ModelOpt installs these quantizers

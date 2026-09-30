@@ -22,6 +22,7 @@ import numpy as np
 import torch
 from tensordict import TensorDict
 
+from nemo_rl.algorithms.metric_utils import REWARD_KEY
 from nemo_rl.data_plane import KVBatchMeta
 
 # Reduction rules for all_mb_metrics. Mirror grpo.py / grpo_sync.py.
@@ -68,6 +69,11 @@ def aggregate_step_metrics(train_result: dict[str, Any]) -> dict[str, Any]:
         metrics["grad_norm"] = grad_norm.detach().mean().item()
     elif grad_norm is not None:
         metrics["grad_norm"] = float(grad_norm)
+    draft_grad_norm = train_result.get("draft_grad_norm")
+    if isinstance(draft_grad_norm, torch.Tensor):
+        metrics["draft_grad_norm"] = draft_grad_norm.detach().mean().item()
+    elif draft_grad_norm is not None:
+        metrics["draft_grad_norm"] = float(draft_grad_norm)
     if "total_flops" in train_result:
         metrics["total_flops"] = float(train_result["total_flops"])
     if "num_ranks" in train_result:
@@ -148,7 +154,7 @@ def reduce_advantage_pump_metrics(
         if sample_masks:
             cat_masks = torch.cat([m.flatten() for m in sample_masks])
             mask_sum = cat_masks.sum()
-            out["reward"] = (
+            out[REWARD_KEY] = (
                 float((cat_rewards * cat_masks).sum() / mask_sum)
                 if mask_sum > 0
                 else 0.0

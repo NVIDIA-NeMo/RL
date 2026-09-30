@@ -52,6 +52,72 @@ class NoSurvivingShards(RuntimeError):
     """Every generation shard is gone, so there is nothing to rebuild onto."""
 
 
+def desired_membership(
+    *,
+    absent_shards: Sequence[int],
+    dp_size: int,
+    total_gen_workers: int,
+    train_world_size: int,
+) -> RefitMembership:
+    """The membership the refit communicator *should* have, given who is absent.
+
+    Phrased as "what it should be" rather than "what changed", so the same call answers
+    both directions: a shard leaving and a restarted shard rejoining are both just a
+    different desired set. Comparing this against what was actually built is what lets a
+    recovered engine be re-admitted -- keyed off the absent set alone, an empty absent set
+    is indistinguishable from "nothing to do", and a restarted shard would stay excluded
+    forever.
+    """
+    absent = set(absent_shards)
+    return plan_refit_membership(
+        surviving_shards=[idx for idx in range(dp_size) if idx not in absent],
+        dp_size=dp_size,
+        total_gen_workers=total_gen_workers,
+        train_world_size=train_world_size,
+    )
+
+
+def should_rebuild(
+    *,
+    desired: RefitMembership,
+    built: RefitMembership,
+    absent_shards: Sequence[int],
+    force: bool,
+) -> bool:
+    """Whether the refit communicator has to be rebuilt before the next transfer.
+
+    Here rather than in each synchronizer because both hardened transports need the same
+    answer and had the same ten lines, byte for byte. Same reason ``desired_membership``
+    is here: the arithmetic is what has to be exactly right, and two copies of a rule is
+    the bug class this stack keeps hitting.
+
+    Compared against what was **built**, not against "is anything absent". Keyed off the
+    absent set alone this returns False the moment a restarted shard comes back, leaving
+    it permanently excluded from a communicator it should rejoin.
+
+    ``force`` is how the recovery path says the communicator is GONE rather than merely
+    unchanged: after an abort the membership is identical and the communicator is dead, so
+    skipping would retry over nothing.
+
+    It only overrides the skip when something IS absent. Forcing a rebuild with an empty
+    absent set would produce a communicator that still contains the rank that just went
+    silent, and the retry would hang on it exactly as the first attempt did. That case --
+    a frozen-but-alive rank, which never becomes absent -- must fall through to False so
+    the caller reports "no generation shard could be identified as absent" and stops.
+
+    Args:
+        desired: what the membership should be, given who is absent now.
+        built: what the live communicator was actually built over. Callers treat an
+            unrecorded membership as the full fleet: ``init_communicator`` builds over
+            everything, so "not recorded" is not "unknown", and calling it a difference
+            would rebuild pointlessly on the first refit of every run.
+        absent_shards: shards currently absent, as the caller sees them.
+        force: the caller knows the communicator is gone rather than stale.
+    """
+    unchanged = desired.shard_prefixes == built.shard_prefixes
+    return not (unchanged and not (force and absent_shards))
+
+
 def plan_refit_membership(
     *,
     surviving_shards: Sequence[int],

@@ -34,6 +34,7 @@ from tests.unit.single_controller._checkpoint_scenarios import (
     ROLLOUTS_PER_GROUP,
     S_ALL_COMPLETE,
     S_LAG2,
+    S_LONG_STALLED_PARTIAL,
     S_ZERO_LAG_ALL_COMPLETE,
     SAMPLERS,
     WITH_IN_FLIGHT,
@@ -62,6 +63,7 @@ SELECTABLE_CASES = [
 SEALED_SIBLING_CASES = [
     Case(scenario, sampler) for sampler in SAMPLERS for scenario in WITH_SEALED_SIBLINGS
 ]
+LONG_STALLED_CASES = [Case(S_LONG_STALLED_PARTIAL, sampler) for sampler in SAMPLERS]
 
 
 @pytest.fixture(autouse=True)
@@ -113,6 +115,35 @@ def test_sealed_siblings_survive_and_only_missing_siblings_redispatch(case, tmp_
         assert result.redispatched[group_id] == expected_missing
     assert result.staging_rows_before
     assert result.staging_rows_after_restore == result.staging_rows_before
+
+
+@pytest.mark.parametrize("case", LONG_STALLED_CASES, ids=lambda case: case.id)
+def test_long_stalled_partial_group_is_selected_or_deliberately_evicted(case, tmp_path):
+    """A restored straggler follows the configured sampler's stale-data policy."""
+    result = round_trip(
+        case.scenario,
+        case.sampler,
+        tmp_path,
+        select_current_train_weight=8,
+        select_min_prompt_groups=1,
+        select_max_prompt_groups=len(case.scenario.groups),
+    )
+
+    stalled_group = "g12"
+    fresh_groups = {"g13", "g14", "g15"}
+    assert stalled_group in result.recovered
+    assert result.sealed_before[stalled_group] == (0,)
+    assert result.sealed_after[stalled_group] == (0,)
+    assert result.redispatched[stalled_group] == (1,)
+
+    if case.sampler == "ready_first":
+        assert result.evicted_after_restore == set()
+        assert result.evicted_count_after_restore == 0
+        assert result.selected == fresh_groups | {stalled_group}
+    else:
+        assert result.evicted_after_restore == {stalled_group}
+        assert result.evicted_count_after_restore == 1
+        assert result.selected == fresh_groups
 
 
 @pytest.mark.parametrize("case", ALL_CASES, ids=lambda case: case.id)
