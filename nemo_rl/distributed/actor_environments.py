@@ -55,18 +55,28 @@ ACTOR_ENVIRONMENTS: dict[str, list[str] | None] = {
     ],
     "nemo_rl.models.generation.sglang.sglang_worker.SGLangGenerationWorker": ["sglang"],
     "nemo_rl.models.generation.dynamo.dynamo_worker.DynamoVllmWorker": None,
-    "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker": ["fsdp"],
     "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2": [
         "automodel"
     ],
     "nemo_rl.models.value.workers.dtensor_value_worker_v2.DTensorValueWorkerV2": [
         "automodel"
     ],
+    # MegatronPolicyWorker also gets nemo_gym: Megatron token capture
+    # (token_capture.enabled with backend=megatron) imports nemo_gym inside the
+    # worker process via TQMegatronTokenStager / TQMegatronPromptPreparer, and the
+    # cached venv is reused as-is, so the extra has to be fixed here. The SFT
+    # worker subclasses MegatronPolicyWorker and must resolve to the same venv
+    # (tests/unit/data/test_energon_sft_v2.py); the value worker never hosts
+    # capture and stays on plain "mcore".
     "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker": [
-        "mcore"
+        "mcore",
+        "nemo_gym",
     ],
     "nemo_rl.models.value.workers.megatron_value_worker.MegatronValueWorker": ["mcore"],
-    "nemo_rl.data.energon.sft_worker.SFTMegatronPolicyWorker": ["mcore"],
+    "nemo_rl.data.energon.sft_worker.SFTMegatronPolicyWorker": [
+        "mcore",
+        "nemo_gym",
+    ],
     "nemo_rl.models.generation.trtllm.trtllm_worker_async.TrtllmAsyncGenerationWorker": [
         "trtllm"
     ],
@@ -89,6 +99,10 @@ ACTOR_ENVIRONMENTS: dict[str, list[str] | None] = {
     # flattened tensors to TQ via dp_client.put_samples; (2) same-node colocation
     # with VllmGenerationWorker avoids duplicate venv caches.
     "nemo_rl.experience.sync_rollout_actor.SyncRolloutActor": ["vllm"],
+    # Captured rollout finalization imports Gym's staging/rebuild package.
+    "nemo_rl.experience.rollout_reassembler_actor.RolloutReassemblerActor": [
+        "nemo_gym"
+    ],
     "nemo_rl.environments.tools.retriever.RAGEnvironment": None,
     "nemo_rl.environments.nemo_gym.NemoGym": ["nemo_gym"],
     # ModelOpt quantization-aware workers
@@ -99,10 +113,6 @@ ACTOR_ENVIRONMENTS: dict[str, list[str] | None] = {
     "nemo_rl.modelopt.models.generation.vllm_quant_worker.VllmQuantAsyncGenerationWorker": [
         "modelopt",
         "vllm",
-    ],
-    "nemo_rl.modelopt.models.policy.workers.dtensor_quant_policy_worker.DTensorQuantPolicyWorker": [
-        "modelopt",
-        "automodel",
     ],
     "nemo_rl.modelopt.models.policy.workers.dtensor_quant_policy_worker_v2.DTensorQuantPolicyWorkerV2": [
         "modelopt",
