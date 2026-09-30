@@ -203,7 +203,10 @@ WORKDIR /opt/nemo-rl
 # Only what `uv lock`/`uv sync` read, so a source-only change reuses the venv layer below.
 # The root project's dynamic metadata needs README.md and nemo_rl.__version__.
 COPY --from=nemo-rl-src /opt/nemo-rl-src/pyproject.toml /opt/nemo-rl-src/uv.lock /opt/nemo-rl-src/README.md ./
-COPY --from=nemo-rl-src /opt/nemo-rl-src/nemo_rl/__init__.py /opt/nemo-rl-src/nemo_rl/package_info.py ./nemo_rl/
+# transformers_compat.py too: nemo_rl/__init__.py imports from it at module
+# scope, and setuptools executes __init__ to resolve the dynamic version, so
+# a two-file copy fails with ModuleNotFoundError during the uv build.
+COPY --from=nemo-rl-src /opt/nemo-rl-src/nemo_rl/__init__.py /opt/nemo-rl-src/nemo_rl/package_info.py /opt/nemo-rl-src/nemo_rl/transformers_compat.py ./nemo_rl/
 COPY --from=nemo-rl-src --link /opt/nemo-rl-src/research/ ./research/
 COPY --from=nemo-rl-src --link /opt/nemo-rl-src/3rdparty/ ./3rdparty/
 
@@ -239,6 +242,11 @@ sed -i 's/cp313-cp313/cp312-cp312/g' pyproject.toml
 sed -i '\#^\[tool\.uv\.extra-build-dependencies\]#,\#^\[#{/match-runtime[[:space:]]*=[[:space:]]*true/d}' pyproject.toml
 # The TRT-LLM wheel is built here for the venv's own interpreter, so cp312 is fine.
 sed -i 's/requires-python = ">=3.13"/requires-python = ">=3.12"/' 3rdparty/TensorRT-LLM-workspace/pyproject.toml
+# research/flow_grpo is a uv workspace member too, and pins the upper bound
+# form; without this uv venv aborts with "Found conflicting Python
+# requirements: flow-grpo >=3.13.14, <3.14 vs nemo-rl >=3.12, <3.13".
+sed -i 's/requires-python = ">=3.13.14,<3.14"/requires-python = ">=3.12,<3.13"/' \
+    research/flow_grpo/pyproject.toml
 sed -i 's/requires-python = ">=3.13.14"/requires-python = ">=3.12"/' \
     research/template_project/pyproject.toml \
     3rdparty/Gym-workspace/Gym/pyproject.toml \
@@ -255,7 +263,7 @@ uv lock
 # Packages the lock must not replace: base-provided ones, the CUTLASS DSL pairing from the
 # base stage, and the two engines installed below into the system layer (tensorrt-llm,
 # flash-attn-4). The trtllm extra stays in the resolution so its ~90 deps are lock-pinned.
-NO_INSTALL="--no-install-package tensorrt-llm --no-install-package nvidia-nvjitlink --no-install-package torch --no-install-package torchvision --no-install-package torchaudio --no-install-package torchcodec --no-install-package triton --no-install-package triton-kernels --no-install-package nvidia-cublas --no-install-package nvidia-cuda-cupti --no-install-package nvidia-cuda-nvrtc --no-install-package nvidia-cuda-runtime --no-install-package nvidia-cudnn-cu13 --no-install-package nvidia-cudnn-frontend --no-install-package nvidia-cufft --no-install-package nvidia-cufile --no-install-package nvidia-curand --no-install-package nvidia-cusolver --no-install-package nvidia-cusparse --no-install-package nvidia-cusparselt-cu13 --no-install-package nvidia-nccl-cu13 --no-install-package vllm --no-install-package flash-attn --no-install-package flash-attn-4 --no-install-package numpy --no-install-package nixl --no-install-package nixl-cu13 --no-install-package nixl-cu12 --no-install-package cuda-bindings --no-install-package cuda-python --no-install-package transformer-engine --no-install-package transformer-engine-torch --no-install-package nvidia-cutlass-dsl --no-install-package nvidia-cutlass-dsl-libs-base --no-install-package nvidia-cutlass-dsl-libs-cu12 --no-install-package nvidia-cutlass-dsl-libs-cu13 --no-install-package apache-tvm-ffi --no-install-package flashinfer-python --no-install-package flashinfer-cubin --no-install-package flashinfer-jit-cache --no-install-package quack-kernels"
+NO_INSTALL="--no-install-package tensorrt-llm --no-install-package nvidia-nvjitlink --no-install-package torch --no-install-package torchvision --no-install-package torchaudio --no-install-package torchcodec --no-install-package triton --no-install-package triton-kernels --no-install-package nvidia-cublas --no-install-package nvidia-cuda-cupti --no-install-package nvidia-cuda-nvrtc --no-install-package nvidia-cuda-runtime --no-install-package nvidia-cudnn-cu13 --no-install-package nvidia-cudnn-frontend --no-install-package nvidia-cufft --no-install-package nvidia-cufile --no-install-package nvidia-curand --no-install-package nvidia-cusolver --no-install-package nvidia-cusparse --no-install-package nvidia-cusparselt-cu13 --no-install-package nvidia-nccl-cu13 --no-install-package vllm --no-install-package flash-attn --no-install-package flash-attn-4 --no-install-package numpy --no-install-package nixl --no-install-package nixl-cu13 --no-install-package nixl-cu12 --no-install-package cuda-bindings --no-install-package cuda-python --no-install-package transformer-engine --no-install-package transformer-engine-torch --no-install-package transformer-engine-cu12 --no-install-package transformer-engine-cu13 --no-install-package nvidia-cutlass-dsl --no-install-package nvidia-cutlass-dsl-libs-base --no-install-package nvidia-cutlass-dsl-libs-cu12 --no-install-package nvidia-cutlass-dsl-libs-cu13 --no-install-package apache-tvm-ffi --no-install-package flashinfer-python --no-install-package flashinfer-cubin --no-install-package flashinfer-jit-cache --no-install-package quack-kernels"
 # trtllm is declared conflicting with mcore/nemo_gym: sync it first, training last so it
 # owns any shared pin; --inexact keeps the earlier packages installed.
 uv sync --locked --inexact --extra trtllm --no-install-project ${NO_INSTALL}
