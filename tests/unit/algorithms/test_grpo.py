@@ -42,6 +42,7 @@ from nemo_rl.algorithms.grpo import (
     RewardPenaltyConfig,
     RewardScalingConfig,
     _apply_configured_message_level_advantage_penalties,
+    _apply_async_sample_masks,
     _apply_mask_sample_filter,
     _apply_message_level_advantage_penalties,
     _get_grpo_save_state,
@@ -367,6 +368,85 @@ class TestMaskSampleFilter:
         assert torch.equal(
             repeated_batch["loss_multiplier"], torch.tensor([1.0, 0.5, 1.0])
         )
+
+
+class TestAsyncSampleMasks:
+    def test_overlapping_masks_attributed_once_and_legacy_count_kept(self):
+        # Row 0: kept. Row 1: zero loss multiplier and mask_sample.
+        # Row 2: truncated and mask_sample. Row 3: mask_sample only.
+        repeated_batch = BatchedDataDict(
+            {
+                "loss_multiplier": torch.tensor([1.0, 0.0, 0.5, 1.0]),
+                "truncated": [False, False, True, False],
+                "mask_sample": torch.tensor([False, True, True, True]),
+            }
+        )
+
+        metrics, num_mask_sample_filtered = _apply_async_sample_masks(
+            repeated_batch, overlong_filtering=True
+        )
+
+        assert torch.equal(
+            repeated_batch["loss_multiplier"],
+            torch.tensor([1.0, 0.0, 0.0, 0.0]),
+        )
+        assert metrics == {
+            "num_masked_seqs_by_loss_multiplier": 1,
+            "num_masked_seqs_by_overlong_filtering": 1,
+            "num_masked_seqs_by_rollout": 1,
+            "num_masked_seqs_total": 3,
+        }
+        # Legacy metric keeps its overlap-inclusive meaning.
+        assert num_mask_sample_filtered == 3
+
+    def test_overlong_filtering_disabled_keeps_truncated_rows(self):
+        repeated_batch = BatchedDataDict(
+            {
+                "loss_multiplier": torch.tensor([1.0, 0.5]),
+                "truncated": torch.tensor([True, True]),
+            }
+        )
+
+        metrics, num_mask_sample_filtered = _apply_async_sample_masks(
+            repeated_batch, overlong_filtering=False
+        )
+
+        assert torch.equal(repeated_batch["loss_multiplier"], torch.tensor([1.0, 0.5]))
+        assert metrics["num_masked_seqs_by_overlong_filtering"] == 0
+        assert metrics["num_masked_seqs_total"] == 0
+        assert num_mask_sample_filtered == 0
+
+    def test_overlong_filtering_requires_truncated(self):
+        repeated_batch = BatchedDataDict({"loss_multiplier": torch.tensor([1.0])})
+
+        with pytest.raises(KeyError, match="truncated"):
+            _apply_async_sample_masks(repeated_batch, overlong_filtering=True)
+
+    def test_rejects_misaligned_mask(self):
+        repeated_batch = BatchedDataDict(
+            {
+                "loss_multiplier": torch.tensor([1.0, 1.0]),
+                "mask_sample": torch.tensor([True, False, True]),
+            }
+        )
+
+        with pytest.raises(ValueError, match="mask_sample has 3 rows; expected 2"):
+            _apply_async_sample_masks(repeated_batch, overlong_filtering=False)
+
+    def test_keeps_historical_timer_labels(self):
+        timer = Timer()
+        repeated_batch = BatchedDataDict(
+            {
+                "loss_multiplier": torch.tensor([1.0]),
+                "truncated": torch.tensor([False]),
+            }
+        )
+
+        _apply_async_sample_masks(repeated_batch, overlong_filtering=False, timer=timer)
+
+        timing = timer.get_timing_metrics("sum")
+        assert "overlong_filter" in timing
+        assert "mask_sample_filter" in timing
 
 
 def test_initial_policy_generation_stale() -> None:
@@ -2056,6 +2136,60 @@ def test_initial_refit_completes_before_async_collection_starts(
         )
 
     assert events[:3] == ["refit", "set_weight_version", "start_collection"]
+
+
+def test_async_grpo_logs_per_reason_sample_mask_metrics(
+    mock_grpo_components,
+) -> None:
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = False
+    master_config.grpo.overlong_filtering = True
+    master_config.env["should_log_nemo_gym_responses"] = True
+
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_batch["truncated"] = torch.tensor([True])
+    mock_batch["mask_sample"] = torch.tensor([True])
+
+    with mock_async_grpo_infrastructure(
+        mock_batch,
+        {"mean_gen_tokens_per_sample": 2.0},
+    ):
+        async_grpo_train(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    train_data = mock_grpo_components["policy"].train.call_args.args[0]
+    assert train_data["sample_mask"].tolist() == [0.0]
+
+    metrics = _logged_train_metrics_with_key(
+        mock_grpo_components["logger"],
+        "num_masked_seqs_by_overlong_filtering",
+    )
+    assert metrics["num_masked_seqs_by_loss_multiplier"] == 0
+    assert metrics["num_masked_seqs_by_overlong_filtering"] == 1
+    assert metrics["num_masked_seqs_by_rollout"] == 0
+    assert metrics["num_masked_seqs_by_logprob_error"] == 0
+    assert metrics["num_masked_seqs_total"] == 1
+    # Legacy metric is retained with its overlap-inclusive meaning: the row is
+    # attributed to overlong filtering but is still counted as mask_sample.
+    assert metrics["num_mask_sample_filtered"] == 1
+    assert "num_masked_seqs_by_empty_response_output" not in metrics
 
 
 def test_async_grpo_awaits_resume_after_refit_failure(mock_grpo_components) -> None:
@@ -6068,6 +6202,28 @@ class TestComputeAndApplySeqLogprobErrorMasking:
         assert torch.allclose(train_data["sample_mask"], expected_mask), (
             "Should mask sequences 2 and 3"
         )
+
+    def test_masked_count_is_rows_for_fractional_sample_mask(self):
+        """Masked count is a row count, not the sum of fractional mask weights."""
+        batch_size, seq_length = 3, 10
+        prev_logprobs = torch.zeros(batch_size, seq_length)
+        generation_logprobs = torch.zeros(batch_size, seq_length)
+        generation_logprobs[1:, 1:5] = 1.0
+        train_data = self._create_train_data(
+            batch_size,
+            seq_length,
+            prev_logprobs,
+            generation_logprobs,
+            sample_mask=torch.tensor([1.0, 0.5, 0.5]),
+        )
+
+        result = compute_and_apply_seq_logprob_error_masking(
+            train_data, torch.tensor([1.0, 1.0, 0.0]), seq_logprob_error_threshold=1.2
+        )
+
+        assert result["num_masked_seqs"] == 2
+        assert result["masked_correct_pct"] == 0.5
+        assert torch.equal(train_data["sample_mask"], torch.tensor([1.0, 0.0, 0.0]))
 
     def test_no_sequences_masked_when_all_below_threshold(self):
         """Test that no sequences are masked when all are below threshold."""
