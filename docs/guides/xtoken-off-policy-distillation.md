@@ -319,14 +319,17 @@ one canonical nonempty content key on both sides and follows logical turn order.
 Content tokens that also absorb surrounding whitespace retain CE supervision;
 their full decoded strings still determine exact-match correctness.
 
-The runnable
-[`distillation-xtoken-qwen3-4b-to-qwen3-0.6b-1n8g-fsdp2tp1-native-chat.yaml`](../../examples/configs/recipes/llm/distillation-xtoken-qwen3-4b-to-qwen3-0.6b-1n8g-fsdp2tp1-native-chat.yaml)
-recipe uses the local multi-turn JSONL fixture and Qwen3-0.6B student with the
-shared pinned Qwen vocabulary. Its matching nightly driver creates a projection
-to exercise native region alignment. With a null projection, this pair instead
-uses the existing same-tokenizer teacher bypass. The recipe is a smoke test,
-not a convergence benchmark. DP alignment, native student-only SFT, sequence
-packing, and backend/loss changes are outside this port.
+The [`xtoken_off_policy_distillation.sh`](../../tests/functional/xtoken_off_policy_distillation.sh)
+functional test covers raw text and native chat. Its
+[`chat configuration`](../../tests/functional/xtoken_native_chat.yaml)
+uses a SmolLM2-135M-Instruct student and Qwen3-1.7B teacher with distinct
+tokenizer vocabularies and token boundaries. Both use the history-preserving
+ChatML override so the test retains reasoning, tool calls, and end-of-turn
+supervision. The script generates its multi-turn arithmetic JSONL and projection
+matrix at runtime, then checks that three training steps produce finite losses.
+The chat scenario is functional coverage, not a nightly convergence benchmark.
+DP alignment, native student-only SFT, sequence packing, and backend/loss changes
+are outside this port.
 
 ### Loss-mode knobs
 
