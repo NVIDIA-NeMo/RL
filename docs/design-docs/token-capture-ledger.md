@@ -116,6 +116,75 @@ conversion is involved in the active path.
 
 ![Token capture custody](../assets/token-capture-ledger-queue-data-flow.png)
 
+### Multimodal rollouts on Megatron Inference
+
+The media transport is shared with the vLLM backend and is described in
+`docs/guides/single-controller.md` (media columns `MEDIA_STAGING_FIELDS`:
+`media_present`, `media_has_frames`, `media_imgs`, `media_imgs_sizes`,
+`media_num_frames`; `TQTokenSink.stage(record, attachments=...)`;
+`validate_media_tensors` on write and read; batched
+`TQTokenSource.fetch_media`; `RolloutReassembler._resolve_media`). This
+section covers only what Megatron Inference adds.
+
+A vision-language engine has two token spaces. The chat endpoint tokenizes the
+render in *compact* form (one media token per image or video); the engine
+expands every media token into one token per projected embedding and runs on
+the *expanded* form. The trainer needs the expanded ids, and they are also what
+the next turn splices in: the engine splits an already-expanded prefix back off
+and expands only the media placeholders after it (NVIDIA/Megatron-LM#7598), so
+only one token space is ever staged.
+
+- MInf's `OffloadedRequestPayload` carries `media_tensors` (`imgs` as packed
+  patches, `imgs_sizes`, optional `num_frames`). The pixel tensors travel beside
+  the record as `complete_call_from_response(..., attachments=...)` and land in
+  the same put as the token columns.
+- `TQMegatronPromptPreparer` resolves a `staging_chain`
+  (`TQTokenSource.fetch_prefix_chains`) to its expanded tokens and the number
+  of media items its rows staged. It splices the expanded chain into the
+  compact render with the shared `replace_prefix_tokens` (counting any of the
+  EOS ids the endpoint ships, keeping the EOS the model emitted), hands Gym the
+  same chain as `required_prefix_token_ids`, and records `media_prev_count` in
+  `offload_params["ng_capture_minf"]`. When earlier turns carried media, the
+  endpoint writes `_prefix_media_count`; the preparer checks it against the
+  chain's count and answers with `_prefix_expanded_token_count` (the chain's
+  length), which tells the engine where the expanded prefix ends.
+  `media_prev_count` is counted from the parent rows' small media columns
+  (`media_present`, `media_has_frames`, `media_imgs_sizes`, `media_num_frames`),
+  never from pixels, and only when the source was built with
+  `capture_media=True`; setup sets the source's and the sink's `capture_media`
+  from the same flag.
+- `TQMegatronTokenStager` slices the payload's `media_tensors` at
+  `media_prev_count` (`slice_media_tensors`) so each row holds only the media
+  new to that call (every chat request carries the whole conversation, so the
+  engine hands over pixels for every image in the prompt), and passes the
+  remainder to Gym as attachments (`None` for text calls). A malformed payload
+  poisons the call with `capture_failed` coordinates instead of raising.
+- The Megatron worker pins the staging column dtype to
+  `MINF_MEDIA_PIXEL_DTYPE` (`torch.float32`): MInf's image preprocessing
+  emits torchvision `ToTensor` + `Normalize` patches uncast, and nothing
+  downstream recasts them before the stager takes custody. vLLM pins the
+  engine model dtype instead. The vision encoder casts pixels to its weight
+  dtype, so both train identically; the sink rejects any other pixel dtype, so
+  a drift in either preprocessor fails loudly at the first media stage.
+- `RolloutReassembler.finalize_group` drops a group in which no valid rollout
+  carried media when `capture_media` is set (`media capture on, no valid
+  rollout carried media`, reported as `finalize/group_dropped_no_media`
+  alongside the shared `finalize/group_dropped`). The controller then shrinks
+  the step or, under `on_dropped_prompt="replace"`, sources a replacement. TQ
+  answers a batch fetch with only the fields every requested key produced, so
+  a train shard mixing such keys with VLM keys would lose `pixel_values` for
+  the VLM rows too.
+
+Tensor contents are not bound to Gym's digest. A staging key written twice
+would go undetected by the media columns alone; Gym rejects a second
+completion of the same call at admission, so this is defence against a bug,
+not a live path. `num_tiles` is not staged: the capture path rejects static
+tiling (`nemo_rl/data/captured_media.py`) and both backends assume the
+packed-patch layout. Setup accepts `token_capture.enabled` with a multimodal
+policy on both the vLLM and Megatron generation backends and rejects
+`grpo.deduplicate_multimodal_data=true` with capture enabled (capture rows
+carry their own media).
+
 ## Framework-owned receipt and cleanup
 
 NeMo RL fetches the manifest at rollout end and assembles the receipt locally.

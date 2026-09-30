@@ -15,7 +15,11 @@
 
 import pytest
 
-from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
+from nemo_rl.models.generation.openai_server_utils import (
+    PrefixSplice,
+    replace_prefix_tokens,
+    splice_prefix_tokens,
+)
 
 
 def test_replace_prefix_tokens_empty_model_prefix_returns_template():
@@ -85,6 +89,83 @@ def test_replace_prefix_tokens_without_tokenizer_uses_explicit_eos():
         eos_token_id=2,
     )
     assert result == [100, 2, 77, 88]
+
+
+@pytest.mark.parametrize(
+    ("model_prefix", "template_prefix", "template", "eos_token_id", "expected"),
+    [
+        # splice_prefix_tokens accepts eos_token_id itself, not only via
+        # replace_prefix_tokens.
+        pytest.param(
+            [100, 2],
+            [9, 2],
+            [9, 2, 77, 88],
+            2,
+            PrefixSplice(
+                token_ids=[100, 2, 77, 88], model_cut_end=1, template_cut_start=1
+            ),
+            id="single-eos-id",
+        ),
+        # Megatron-LM ships the model's full EOS set; any member marks a turn
+        # boundary. Here the model stopped on the template's own terminator ...
+        pytest.param(
+            [100, 2],
+            [9, 2],
+            [9, 2, 77, 88],
+            [2, 11],
+            PrefixSplice(
+                token_ids=[100, 2, 77, 88], model_cut_end=1, template_cut_start=1
+            ),
+            id="eos-set",
+        ),
+        # ... and here on a different declared EOS: its exact id survives the
+        # splice, so the prompt still starts with the model's tokens.
+        pytest.param(
+            [100, 11],
+            [9, 2],
+            [9, 2, 77, 88],
+            [2, 11],
+            PrefixSplice(
+                token_ids=[100, 11, 77, 88], model_cut_end=1, template_cut_start=1
+            ),
+            id="eos-set-other-member",
+        ),
+        # A template prefix whose turns end on different EOS ids counts all of them.
+        pytest.param(
+            [5, 11, 6, 2],
+            [5, 11, 7, 2],
+            [5, 11, 7, 2, 77],
+            [2, 11],
+            PrefixSplice(
+                token_ids=[5, 11, 6, 2, 77], model_cut_end=3, template_cut_start=3
+            ),
+            id="eos-set-counts-every-member",
+        ),
+        # A prefix cut by max_tokens has no EOS to keep; the template's boundary is used.
+        pytest.param(
+            [100, 101],
+            [9, 2],
+            [9, 2, 77],
+            [2, 11],
+            PrefixSplice(
+                token_ids=[100, 101, 2, 77], model_cut_end=2, template_cut_start=1
+            ),
+            id="no-trailing-eos",
+        ),
+    ],
+)
+def test_splice_prefix_tokens_without_tokenizer_honors_explicit_eos_ids(
+    model_prefix, template_prefix, template, eos_token_id, expected
+):
+    result = splice_prefix_tokens(
+        tokenizer=None,
+        model_prefix_token_ids=model_prefix,
+        template_prefix_token_ids=template_prefix,
+        template_token_ids=template,
+        eos_token_id=eos_token_id,
+    )
+    assert result == expected
+    assert result.token_ids[: len(model_prefix)] == model_prefix
 
 
 def test_replace_prefix_tokens_without_tokenizer_reports_missing_eos_without_decoding():

@@ -43,11 +43,18 @@ from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
     StagedCallRecord,
 )
 
+from nemo_rl.data.multimodal_utils import (  # noqa: E402
+    WIRE_MULTIMODAL_FIELDS,
+    PackedTensor,
+    reassemble_packed_multimodal,
+    row_shapes_key,
+)
 from nemo_rl.data_plane.schema import (  # noqa: E402
     ROUTE_PASSTHROUGH_FLAG,
     ROUTE_PLAN_TAG,
 )
 from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
+    MEDIA_STAGING_FIELDS,
     STAGING_FIELDS,
     TQTokenSink,
     TQTokenSource,
@@ -896,3 +903,267 @@ def test_deferred_chain_hash_corruption_rejects_the_row(
     )
     assert not row.valid
     assert (row.rejection_reason or "").startswith("rebuild_failed:chain_hash_mismatch")
+
+
+# ── media rows ──────────────────────────────────────────────────────────────
+#
+# A media-enabled capture run (setup's ``token_capture.enabled and processor
+# is not None``) stages the engine's media beside each call's tokens through
+# ``TQTokenSink(capture_media=True)`` and publishes it on the canonical wire
+# fields. These tests drive that layer directly with the golden token fixtures
+# and hand-built packed patches; the per-backend workers are covered elsewhere.
+
+MEDIA_CANONICAL_PARTITION = "rollout_data_media_fin_test"
+MEDIA_STAGING_PARTITION = "rollout_staging_media_fin_test"
+# Pinned per partition (TQ keeps one dtype per field); bf16 like the vLLM
+# worker's engine dtype so the sentinels of text calls share the column.
+MEDIA_PIXEL_DTYPE = torch.bfloat16
+MEDIA_PATCH = 2
+
+
+@pytest.fixture()
+def media_partitions(tq_client):
+    tq_client.register_partition(
+        partition_id=MEDIA_STAGING_PARTITION,
+        fields=list(STAGING_FIELDS) + list(MEDIA_STAGING_FIELDS),
+        num_samples=64,
+        consumer_tasks=["finalize"],
+    )
+    tq_client.register_partition(
+        partition_id=MEDIA_CANONICAL_PARTITION,
+        fields=[
+            "input_ids",
+            "input_lengths",
+            "generation_logprobs",
+            "token_mask",
+            "sample_mask",
+            "prompt_ids_for_adv",
+            "total_reward",
+            "mask_sample",
+            "truncated",
+            # Mirrors _register_single_controller_partitions(include_multimodal_fields).
+            *sorted(WIRE_MULTIMODAL_FIELDS),
+        ],
+        num_samples=64,
+        consumer_tasks=["train"],
+    )
+    yield
+    tq_client.clear_samples(sample_ids=None, partition_id=MEDIA_STAGING_PARTITION)
+    tq_client.clear_samples(sample_ids=None, partition_id=MEDIA_CANONICAL_PARTITION)
+
+
+def _still_images(
+    *sizes: tuple[int, int], seed: int, dtype: torch.dtype = MEDIA_PIXEL_DTYPE
+) -> dict[str, torch.Tensor]:
+    """MInf packed patches for ``sizes`` (h, w) still images: ``[1, patches, 3*P*P]``."""
+    sizes_t = torch.tensor(sizes, dtype=torch.int32)
+    patches = int((sizes_t[:, 0] * sizes_t[:, 1]).sum()) // MEDIA_PATCH**2
+    generator = torch.Generator().manual_seed(seed)
+    imgs = torch.randn(1, patches, 3 * MEDIA_PATCH**2, generator=generator)
+    return {"imgs": imgs.to(dtype), "imgs_sizes": sizes_t}
+
+
+def _stage_media_rollout(
+    tq_client,
+    rollout_id: str,
+    *,
+    media: bool = True,
+    second_turn: bool = False,
+    pixel_dtype: torch.dtype = MEDIA_PIXEL_DTYPE,
+):
+    """Stage a rollout on the media partition; each call carries only its new image.
+
+    Returns ``(receipt_dict, expected_row, [per-call bundle or None])``. With
+    ``second_turn`` the chain is the two-call golden fixture, and the second
+    call carries a second image, so the finalizer must concatenate the two
+    calls' pixels in chain order. ``pixel_dtype`` is the partition's pinned
+    pixel dtype (bf16 for the vLLM worker, float32 for the Megatron worker).
+    """
+    records, receipt, row = build_fixture_artifacts(
+        "worked_example" if second_turn else "single_call", rollout_id=rollout_id
+    )
+    sink = TQTokenSink(
+        tq_client,
+        staging_partition=MEDIA_STAGING_PARTITION,
+        capture_media=True,
+        media_pixel_dtype=pixel_dtype,
+    )
+    bundles = [
+        _still_images((4, 4), seed=index, dtype=pixel_dtype) if media else None
+        for index in range(len(records))
+    ]
+    for record, bundle in zip(records, bundles, strict=True):
+        assert sink.stage(record, attachments=bundle).ok
+    return receipt.model_dump(), row, bundles
+
+
+def _media_finalizer(tq_client, **overrides) -> RolloutReassembler:
+    kwargs = dict(
+        partition_id=MEDIA_CANONICAL_PARTITION,
+        staging_partition=MEDIA_STAGING_PARTITION,
+        pad_token_id=PAD,
+        max_seq_len=4096,
+        capture_media=True,
+    )
+    kwargs.update(overrides)
+    return RolloutReassembler(tq_client, **kwargs)
+
+
+def _assert_staging_cleared(tq_client, staging_keys: list[str]) -> None:
+    source = TQTokenSource(
+        tq_client, staging_partition=MEDIA_STAGING_PARTITION, capture_media=True
+    )
+    for key in staging_keys:
+        with pytest.raises(KeyError):
+            source.fetch_for_finalization([key])
+
+
+@pytest.mark.parametrize(
+    ("case", "pixel_dtype"),
+    [
+        # Both backends' pinned pixel dtypes round-trip the finalizer read-back
+        # and pack_payload unchanged.
+        ("attached", torch.bfloat16),
+        ("attached", torch.float32),
+        ("two-call-chain", torch.bfloat16),
+        ("no-media-tensors", torch.bfloat16),
+    ],
+    ids=["attached-bf16", "attached-f32", "two-call-chain", "no-media-tensors"],
+)
+def test_finalize_rollout_media(tq_client, media_partitions, case, pixel_dtype):
+    """Media on the call rows: each call's row says whether it carries media,
+    the per-call deltas are concatenated along the chain, and the packed-patch
+    layout (and dtype) is handed to the trainer unchanged (one frame per still
+    image)."""
+    receipt, expected, bundles = _stage_media_rollout(
+        tq_client,
+        "mm",
+        media=case != "no-media-tensors",
+        second_turn=case == "two-call-chain",
+        pixel_dtype=pixel_dtype,
+    )
+
+    row = _media_finalizer(tq_client).finalize_rollout("mm", receipt, reward=1.0)
+
+    assert row.valid, row.rejection_reason
+    assert row.token_ids == expected.token_ids
+    # Media rides the call rows: no extra staging key to clean up.
+    assert row.staging_keys == [r["staging_key"] for r in receipt["manifest"]]
+    if case == "no-media-tensors":
+        assert row.media is None  # text rollout on a media partition
+        return
+    assert set(row.media) == {"pixel_values", "imgs_sizes", "num_frames"}
+    expected_pixels = torch.cat([bundle["imgs"] for bundle in bundles], dim=1)
+    pixels = row.media["pixel_values"].as_tensor()
+    # [1, total_patches, F] squeezed to [total_patches, F]; 4 patches per image.
+    assert pixels.shape == (4 * len(bundles), 3 * MEDIA_PATCH**2)
+    assert pixels.dtype == pixel_dtype
+    assert torch.equal(pixels, expected_pixels.squeeze(0))
+    assert row.media["imgs_sizes"].as_tensor().tolist() == [[4, 4]] * len(bundles)
+    assert row.media["num_frames"].as_tensor().tolist() == [1] * len(bundles)
+
+
+def test_finalize_group_publishes_media_with_empty_rows_for_text_siblings(
+    tq_client, media_partitions
+):
+    group_id = "mmgrp"
+    rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
+    receipt, _, [bundle] = _stage_media_rollout(tq_client, rollout_ids[0])
+
+    finalized = _media_finalizer(tq_client).finalize_group(
+        group_id,
+        rollout_ids,
+        [receipt, None],  # sibling lost its receipt -> placeholder without media
+        [1.0, 0.0],
+        mask_sample=[False, False],
+        fallback_weight_version=4,
+        prompt_idx=3,
+    )
+
+    assert not finalized.dropped
+    assert finalized.meta is not None
+    assert finalized.metrics["finalize/media_row_rate"] == 1.0
+    assert {"pixel_values", "imgs_sizes", "num_frames"} <= set(finalized.meta.fields)
+    tags = finalized.meta.tags
+    assert tags[0][row_shapes_key("pixel_values")]["shapes"] == [[4, 12]]
+    # Text siblings still carry the companion tag, with no segments to rebuild.
+    assert tags[1][row_shapes_key("pixel_values")]["shapes"] == []
+
+    rows = tq_client.get_samples(
+        sample_ids=rollout_ids,
+        partition_id=MEDIA_CANONICAL_PARTITION,
+        select_fields=["input_ids", "pixel_values", "imgs_sizes", "num_frames"],
+    )
+    fields = {
+        name: rows.get(name) for name in ("pixel_values", "imgs_sizes", "num_frames")
+    }
+    reassemble_packed_multimodal(fields, tags)
+    pixels = fields["pixel_values"]
+    assert isinstance(pixels, PackedTensor)
+    assert pixels.logical_segment_counts_by_row() == [1, 0]
+    assert torch.equal(pixels.as_tensor(), bundle["imgs"].squeeze(0))
+    assert fields["imgs_sizes"].as_tensor().tolist() == [[4, 4]]
+    assert fields["num_frames"].as_tensor().tolist() == [1]
+
+    # The call row (tokens and media columns alike) was cleared after publishing.
+    _assert_staging_cleared(tq_client, [receipt["manifest"][0]["staging_key"]])
+
+
+@pytest.mark.parametrize(
+    ("case", "capture_media"),
+    [
+        ("all-placeholders", True),
+        ("valid-text-row", True),
+        ("all-placeholders", False),
+    ],
+    ids=["media-all-placeholders", "media-valid-text-row", "text-all-placeholders"],
+)
+def test_finalize_group_drops_group_without_any_media_row_only_in_media_runs(
+    tq_client, media_partitions, case, capture_media
+):
+    """A media capture run never publishes a group whose valid rows carry no media.
+
+    Such a group would land in the canonical partition without the media columns;
+    TransferQueue answers a batch fetch with only the fields every requested key
+    produced, so a train shard mixing its keys with media keys would lose
+    ``pixel_values`` for the media rows too and run image-blind. Text-only runs
+    (``capture_media=False``) keep publishing placeholder-only groups.
+    """
+    group_id = f"mm-drop-{case}-{capture_media}"
+    rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
+    if case == "valid-text-row":
+        # A staged rollout whose engine payload carried no media: valid, but text.
+        receipt, _, _ = _stage_media_rollout(tq_client, rollout_ids[0], media=False)
+        receipts = [receipt, None]
+    else:
+        receipts = [None, None]  # every rollout poisoned -> placeholders only
+
+    finalized = _media_finalizer(tq_client, capture_media=capture_media).finalize_group(
+        group_id,
+        rollout_ids,
+        receipts,
+        [1.0, 0.0],
+        mask_sample=[False, False],
+        fallback_weight_version=4,
+        prompt_idx=3,
+    )
+
+    if not capture_media:
+        assert not finalized.dropped
+        assert finalized.meta is not None
+        assert finalized.meta.sample_ids == rollout_ids
+        assert set(finalized.meta.fields).isdisjoint(WIRE_MULTIMODAL_FIELDS)
+        return
+
+    assert finalized.dropped
+    assert finalized.meta is None
+    assert "media" in (finalized.drop_reason or "")
+    assert finalized.metrics["finalize/group_dropped"] == 1.0
+    assert finalized.metrics["finalize/group_dropped_no_media"] == 1.0
+    # Nothing was published, and the staged call rows were cleared.
+    published = set(tq_client.list_sample_ids(MEDIA_CANONICAL_PARTITION))
+    assert published.isdisjoint(rollout_ids)
+    if case == "valid-text-row":
+        _assert_staging_cleared(
+            tq_client, [r["staging_key"] for r in receipts[0]["manifest"]]
+        )

@@ -1299,6 +1299,21 @@ class TQDataPlaneClient(DataPlaneClient):
             partition_id=partition_id,
             select_fields=select_fields,
         )
+        # TQ answers a batch fetch with only the fields *every* requested key
+        # produced and drops the rest without error (``kv_retrieve_meta``
+        # narrows to the intersection; ``select_fields`` ignores unknown
+        # names). One key that never wrote a column would therefore silently
+        # strip it from every other row of the batch -- a media-less group
+        # fetched alongside VLM groups removes their ``pixel_values``, and the
+        # forward runs image-blind. Fail here instead.
+        missing = [name for name in select_fields if name not in td.keys()]
+        if missing:
+            raise KeyError(
+                f"TransferQueue returned no {missing} column(s) for a fetch of "
+                f"{len(sample_ids)} keys on partition {partition_id!r}: at least "
+                "one requested key never produced them, and TQ narrows a batch "
+                "fetch to the fields shared by every key instead of failing"
+            )
         return _from_wire(td)
 
     def list_sample_ids(self, partition_id: str) -> list[str]:

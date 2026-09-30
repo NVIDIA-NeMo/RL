@@ -17,6 +17,7 @@ from nemo_rl.models.generation.megatron.megatron_generation import (  # noqa: E4
     MegatronGeneration,
 )
 from nemo_rl.models.generation.megatron.megatron_worker import (  # noqa: E402
+    MINF_MEDIA_PIXEL_DTYPE,
     MegatronGenerationMixin,
 )
 
@@ -60,7 +61,11 @@ def test_generation_setup_token_capture_fans_tq_config_to_workers(monkeypatch):
     assert worker_group.calls == [
         (
             "setup_token_capture",
-            {"dp_cfg": dp_cfg, "staging_partition": "rollout_staging"},
+            {
+                "dp_cfg": dp_cfg,
+                "staging_partition": "rollout_staging",
+                "capture_media": False,
+            },
         )
     ]
 
@@ -108,12 +113,16 @@ def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
     installed_sources = []
 
     class _Sink:
-        def __init__(self, client, *, staging_partition):
-            installed_sinks.append((client, staging_partition))
+        def __init__(
+            self, client, *, staging_partition, capture_media, media_pixel_dtype
+        ):
+            installed_sinks.append(
+                (client, staging_partition, capture_media, media_pixel_dtype)
+            )
 
     class _Source:
-        def __init__(self, client, *, staging_partition):
-            installed_sources.append((client, staging_partition))
+        def __init__(self, client, *, staging_partition, capture_media):
+            installed_sources.append((client, staging_partition, capture_media))
 
     class _Preparer:
         def __init__(self, source):
@@ -167,8 +176,8 @@ def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
         worker.dynamic_inference_engine.prompt_preparer
         is worker._request_prompt_preparer
     )
-    assert installed_sinks == [("dp", "rollout_staging")]
-    assert installed_sources == [("dp", "rollout_staging")]
+    assert installed_sinks == [("dp", "rollout_staging", False, None)]
+    assert installed_sources == [("dp", "rollout_staging", False)]
 
     worker.set_rollout_weight_version(7)
     # The client's ZMQ socket is not thread safe and its listener task runs on
@@ -189,8 +198,75 @@ def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
     assert follower._token_capture_enabled is True
     assert follower.dynamic_inference_engine.payload_stager is None
     assert follower.dynamic_inference_engine.prompt_preparer is None
-    assert installed_sinks == [("dp", "rollout_staging")]
-    assert installed_sources == [("dp", "rollout_staging")]
+    assert installed_sinks == [("dp", "rollout_staging", False, None)]
+    assert installed_sources == [("dp", "rollout_staging", False)]
+
+
+def _capture_ready_worker() -> MegatronGenerationMixin:
+    """A coordinator worker whose engine already exposes the MInf capture hooks."""
+    worker = object.__new__(MegatronGenerationMixin)
+    worker.dynamic_inference_engine = SimpleNamespace(
+        payload_stager=None,
+        prompt_preparer=None,
+        is_mp_coordinator=True,
+    )
+    worker._token_capture_enabled = False
+    worker._request_payload_stager = None
+    worker._request_prompt_preparer = None
+    return worker
+
+
+@pytest.mark.parametrize(
+    ("capture_media", "image_preprocessing", "expected_sink"),
+    [
+        pytest.param(False, None, (False, None), id="text-ignores-text-only-wrapper"),
+        pytest.param(
+            True,
+            SimpleNamespace(patch_dim=16),
+            (True, MINF_MEDIA_PIXEL_DTYPE),
+            id="media-pins-minf-pixel-dtype",
+        ),
+        pytest.param(True, None, None, id="media-requires-image-preprocessing"),
+    ],
+)
+def test_worker_media_capture_requires_image_preprocessing(
+    monkeypatch, capture_media, image_preprocessing, expected_sink
+) -> None:
+    """A text-only inference wrapper never yields media tensors, so a media-enabled
+    partition must be refused at setup rather than filled with text sentinels;
+    text capture ignores the wrapper, and media capture pins MInf's pixel dtype."""
+    installed = []
+
+    class _Sink:
+        def __init__(
+            self, client, *, staging_partition, capture_media, media_pixel_dtype
+        ):
+            installed.append((capture_media, media_pixel_dtype))
+
+    monkeypatch.setattr(
+        "nemo_rl.data_plane.build_data_plane_client", lambda *_a, **_k: "dp"
+    )
+    monkeypatch.setattr("nemo_rl.data_plane.tq_token_sink.TQTokenSink", _Sink)
+    worker = _capture_ready_worker()
+    assert worker._image_preprocessing_config is None  # class default: text-only
+    if image_preprocessing is not None:
+        worker._image_preprocessing_config = image_preprocessing
+
+    if expected_sink is None:
+        with pytest.raises(ValueError, match="image-capable inference wrapper"):
+            worker.setup_token_capture(
+                {}, "rollout_staging", capture_media=capture_media
+            )
+        # Refused before any hook was installed.
+        assert installed == []
+        assert worker.dynamic_inference_engine.payload_stager is None
+        assert worker._token_capture_enabled is False
+        return
+
+    assert worker.setup_token_capture(
+        {}, "rollout_staging", capture_media=capture_media
+    )
+    assert installed == [expected_sink]
 
 
 def test_worker_requires_minf_payload_stager_protocol() -> None:

@@ -25,7 +25,7 @@ import os
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, fields as dataclass_fields
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Optional, cast
@@ -306,8 +306,8 @@ def _register_single_controller_partitions(
     """Warm all SingleController partitions before concurrent data-plane use.
 
     VLM token capture (``include_multimodal_fields`` with capture enabled) adds
-    the media columns the vLLM worker stages beside each captured call to the
-    staging partition.
+    the media columns the generation workers (vLLM or Megatron Inference) stage
+    beside each captured call to the staging partition.
     """
     algo_cfg = algo_config(master_config)
     policy_config = master_config.policy
@@ -1028,6 +1028,58 @@ def _load_opd_full_teacher_lm_heads(
         )
 
 
+_MINF_MEDIA_PAYLOAD_FIELDS = ("media_tensors",)
+# Request-metadata keys of Megatron-LM's expanded-prefix stitching contract,
+# which the Megatron prompt preparer fills in.
+_MINF_PREFIX_STITCHING_FIELDS = (
+    "PREFIX_MEDIA_COUNT_FIELD",
+    "PREFIX_EXPANDED_TOKEN_COUNT_FIELD",
+)
+
+
+def _require_minf_media_payload_fields() -> None:
+    """Fail at setup if the pinned megatron-core cannot capture media.
+
+    Megatron media capture stages ``OffloadedRequestPayload.media_tensors``,
+    and multi-turn media prompts need the engine to expand only the media after
+    an already-expanded prefix (expanded-prefix stitching). Without the first the
+    stager would hand TQ a text sentinel for every VLM call and the finalizer
+    would drop every group; without the second every later turn would expand
+    its spliced prefix twice and be rejected. Check both at config time rather
+    than training image-blind or failing mid-rollout.
+    """
+    try:
+        # Deferred import: megatron-core is a heavy, optional dependency that the
+        # driver venv may not carry at all.
+        from megatron.core.inference import inference_request
+    except ImportError:
+        # The worker-side guard in MegatronGenerationMixin.setup_token_capture
+        # still fails loudly when the engine lacks the capture hooks.
+        return
+    present = {
+        field.name
+        for field in dataclass_fields(inference_request.OffloadedRequestPayload)
+    }
+    missing = [
+        f"OffloadedRequestPayload.{name}"
+        for name in _MINF_MEDIA_PAYLOAD_FIELDS
+        if name not in present
+    ]
+    missing += [
+        name
+        for name in _MINF_PREFIX_STITCHING_FIELDS
+        if not hasattr(inference_request, name)
+    ]
+    if missing:
+        raise NotImplementedError(
+            "Megatron media token capture requires OffloadedRequestPayload."
+            "media_tensors and expanded-prefix stitching; "
+            f"the pinned Megatron-LM lacks: {', '.join(missing)}. Bump "
+            "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge to a revision that "
+            "includes it, or use policy.generation.backend=vllm."
+        )
+
+
 def setup_single_controller(
     master_config: MasterConfig,
     tokenizer: PreTrainedTokenizerBase,
@@ -1204,11 +1256,6 @@ def setup_single_controller(
     token_capture_cfg = master_config.token_capture
     capture_media = token_capture_cfg.enabled and processor is not None
     if capture_media:
-        if generation_config["backend"] != "vllm":
-            raise NotImplementedError(
-                "VLM media token capture is only implemented for the vLLM "
-                f"generation backend; got {generation_config['backend']!r}"
-            )
         if not uses_image_placeholder(processor):
             raise ValueError(
                 "VLM token capture currently supports Omni dynamic images and native video"
@@ -1264,16 +1311,24 @@ def setup_single_controller(
                 "token_capture.enabled supports vllm or megatron; got "
                 f"{generation_config['backend']!r}"
             )
-        generation_config_dict = cast(dict[str, Any], generation_config)
         if (
-            generation_config["backend"] == "vllm"
-            and not generation_config_dict["vllm_cfg"]["async_engine"]
+            capture_media
+            and not is_ppo_run(master_config)
+            and master_config.grpo.deduplicate_multimodal_data
         ):
             raise ValueError(
-                "token_capture.enabled requires "
-                "policy.generation.vllm_cfg.async_engine=true (the capture "
-                "host is the worker's in-process HTTP server)"
+                "token_capture.enabled does not support "
+                "grpo.deduplicate_multimodal_data=true: capture rows carry "
+                "their own media"
             )
+        generation_config_dict = cast(dict[str, Any], generation_config)
+        if generation_config["backend"] == "vllm":
+            if not generation_config_dict["vllm_cfg"]["async_engine"]:
+                raise ValueError(
+                    "token_capture.enabled requires "
+                    "policy.generation.vllm_cfg.async_engine=true (the capture "
+                    "host is the worker's in-process HTTP server)"
+                )
         if generation_config["backend"] == "megatron":
             if not generation_config_dict["mcore_generation_config"][
                 "expose_http_server"
@@ -1287,6 +1342,8 @@ def setup_single_controller(
                     "Megatron token capture does not yet support router replay: "
                     "the canonical MInf stager does not yet normalize routed experts"
                 )
+            if capture_media:
+                _require_minf_media_payload_fields()
 
         # Fill the derived ledger-hosting fields (see TokenCaptureConfig): a
         # per-run control-plane bearer token, the process-shared capture
@@ -1932,8 +1989,8 @@ def setup_single_controller(
             include_multimodal_fields=processor is not None,
         )
     if token_capture_cfg.enabled:
-        # Both active backends stage canonical Gym rows in serving workers;
-        # only vLLM workers stage captured media beside them (capture_media).
+        # Both active backends stage canonical Gym rows, and captured media
+        # beside them (capture_media), in serving workers.
         generation.setup_token_capture(
             dp_config,
             token_capture_cfg.staging_partition,

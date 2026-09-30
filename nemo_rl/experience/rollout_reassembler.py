@@ -714,35 +714,42 @@ class RolloutReassembler:
                 # group before the first healthy rollout. Dropping loses no
                 # training signal (no valid rows or routes) and keeps the
                 # partition schema consistent for groups that do publish.
-                print(
-                    f"  finalize: group {group_id} dropped — router replay on "
-                    "but no rollout carried routed_experts and (L, K) is "
-                    "unknown yet",
-                    flush=True,
-                )
-                self._clear_staging(staging_keys)
-                metrics["finalize/group_dropped"] = 1.0
-                return FinalizedGroup(
-                    meta=None,
-                    group_min_wv=group_min_wv,
-                    group_max_wv=group_max_wv,
-                    staging_keys=[],
-                    canonical_output_tokens=0,
-                    metrics=metrics,
-                    dropped=True,
-                    drop_reason=(
+                return self._drop_group(
+                    group_id,
+                    reason=(
                         "router replay on, no rollout carried routed_experts, "
                         "and (L, K) is unknown yet"
                     ),
-                    valid_row_count=0,
-                    total_row_count=0,
+                    staging_keys=staging_keys,
+                    group_min_wv=group_min_wv,
+                    group_max_wv=group_max_wv,
+                    metrics=metrics,
                 )
             train_batch["routed_experts"] = self._build_routed_experts_tensor(
                 rows, max_len=max_len, metrics=metrics
             )
         # Media rides the same packed/tagged transport as the token-echo path
         # (pack_payload encodes PackedTensor fields and mints row-shape tags).
-        train_batch.update(_media_fields_for_group(rows))
+        media_fields = _media_fields_for_group(rows)
+        if self._capture_media and not media_fields:
+            # No valid row carried media, so this group would publish without
+            # the media columns. TQ answers a batch fetch with only the fields
+            # every requested key produced, so a train shard mixing these keys
+            # with VLM keys would lose pixel_values for the VLM rows too and
+            # run image-blind. Drop the group; only the caller can source a
+            # replacement.
+            # Distinct from the router-replay drop above so dashboards can
+            # tell the two apart.
+            metrics["finalize/group_dropped_no_media"] = 1.0
+            return self._drop_group(
+                group_id,
+                reason="media capture on, no valid rollout carried media",
+                staging_keys=staging_keys,
+                group_min_wv=group_min_wv,
+                group_max_wv=group_max_wv,
+                metrics=metrics,
+            )
+        train_batch.update(media_fields)
         sample_ids, fields, tags = pack_payload(
             train_batch,
             weight_version=group_min_wv,
@@ -895,6 +902,38 @@ class RolloutReassembler:
                 sentinel_tokens / covered_tokens
             )
         return routed
+
+    def _drop_group(
+        self,
+        group_id: str,
+        *,
+        reason: str,
+        staging_keys: list[str],
+        group_min_wv: int,
+        group_max_wv: int,
+        metrics: dict[str, float],
+    ) -> FinalizedGroup:
+        """Reject a whole group and hand the caller a ``dropped`` result.
+
+        Logs the drop, releases the group's staging rows, marks the
+        ``finalize/group_dropped`` metric, and carries ``reason`` through as
+        ``drop_reason`` for the caller's log line.
+        """
+        print(f"  finalize: group {group_id} dropped — {reason}", flush=True)
+        self._clear_staging(staging_keys)
+        metrics["finalize/group_dropped"] = 1.0
+        return FinalizedGroup(
+            meta=None,
+            group_min_wv=group_min_wv,
+            group_max_wv=group_max_wv,
+            staging_keys=[],
+            canonical_output_tokens=0,
+            metrics=metrics,
+            dropped=True,
+            drop_reason=reason,
+            valid_row_count=0,
+            total_row_count=0,
+        )
 
     def _clear_staging(self, staging_keys: list[str]) -> None:
         if not staging_keys:

@@ -642,11 +642,6 @@ class MegatronGeneration(GenerationInterface):
         capture_media: bool = False,
     ) -> None:
         """Install MInf's canonical prompt and completion capture hooks."""
-        if capture_media:
-            raise NotImplementedError(
-                "Media token capture is only implemented for the vLLM generation "
-                "backend; the MInf stager writes text-only rows"
-            )
         if not self.cfg["mcore_generation_config"]["expose_http_server"]:
             raise ValueError(
                 "Megatron token capture requires mcore_generation_config."
@@ -656,6 +651,7 @@ class MegatronGeneration(GenerationInterface):
             "setup_token_capture",
             dp_cfg=dp_cfg,
             staging_partition=staging_partition,
+            capture_media=capture_media,
         )
         ray.get(futures)
 
