@@ -204,9 +204,30 @@ class _PendingLedger:
                         "sample_id": str(group.prompt_payload.get("idx", "unknown")),
                         "task_name": group.prompt_payload.get("task_name"),
                     },
+                    "task_source": None,
+                    "resolved_agent_name": None,
+                    "recovery_granularity": RecoveryGranularity.SIBLING.value,
                     "expected_generations": 2,
                     "start_weight_version": 7,
+                    "status": "generating",
                     "phase": ("reserved" if group.target_step is None else "admitted"),
+                    "siblings": [
+                        {
+                            "generation_index": generation_index,
+                            "attempts": [
+                                {
+                                    "attempt_index": 0,
+                                    "status": "reserved",
+                                    "receipt": None,
+                                    "completion_receipt": None,
+                                    "reward": None,
+                                    "mask_sample": None,
+                                    "staging_keys": [],
+                                }
+                            ],
+                        }
+                        for generation_index in range(2)
+                    ],
                 }
                 for group in self._groups
             ],
@@ -1048,7 +1069,14 @@ def test_recovery_readmits_one_reserved_batch_only_once(tmp_path) -> None:
                     admitted=False,
                 )
         recovery_path = tmp_path / ROLLOUT_RECOVERY_STATE_FILENAME
-        torch.save(saved_ledger.state_dict(), recovery_path)
+        torch.save(
+            build_rollout_recovery_state(
+                saved_ledger,
+                batch_shortfall={},
+                sampler_stamps_target_steps=True,
+            ),
+            recovery_path,
+        )
 
         sampler = _CountingInOrderSampler()
         sampler.restore_dispatch_index(6)
@@ -1208,7 +1236,14 @@ def test_recovery_load_does_not_require_every_unfinished_group_to_fit_at_once(
                     admitted=True,
                 )
         recovery_path = tmp_path / ROLLOUT_RECOVERY_STATE_FILENAME
-        torch.save(saved_ledger.state_dict(), recovery_path)
+        torch.save(
+            build_rollout_recovery_state(
+                saved_ledger,
+                batch_shortfall={},
+                sampler_stamps_target_steps=True,
+            ),
+            recovery_path,
+        )
 
         rollout_manager = _RecoveryRolloutManager(RolloutRecoveryLedger())
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class

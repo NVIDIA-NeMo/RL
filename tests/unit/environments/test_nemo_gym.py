@@ -2072,7 +2072,7 @@ def test_run_rollouts_requires_an_installed_tokenizer():
     # Constructed through __init__ rather than object.__new__ so the None comes from
     # the declaration itself: an attribute set only in _spinup would leave a second
     # spinup free to wipe an installed tokenizer.
-    gym = gym_cls({})
+    gym = gym_cls({"turn_recovery_enabled": False})
     assert gym._tokenizer is None
     gym.rh = object()  # satisfies _require_spinup
 

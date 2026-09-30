@@ -109,12 +109,13 @@ from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
 from nemo_rl.environments.gym_checkpoint import (
     GymCheckpointContinuation,
     GymCheckpointTopology,
+    GymCompletedExecution,
+    GymCompletionReceipt,
 )
 from nemo_rl.environments.nemo_gym import GymControlRequestError, NemoGymShardSet
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
-    PendingCompletedExecutionAcknowledgement,
     RecoveryGranularity,
     RolloutAttemptStatus,
     RolloutRecoveryLedger,
@@ -167,6 +168,25 @@ def _agent_checkpoint_topology() -> GymCheckpointTopology:
                 }
             ],
         }
+    )
+
+
+def _completed_execution(
+    rollout_id: str,
+    *,
+    result_digest: str,
+    agent_name: str = "test-agent",
+) -> GymCompletedExecution:
+    """Build one acknowledgement obligation in the current durable schema."""
+    return GymCompletedExecution(
+        receipt=GymCompletionReceipt(
+            rollout_id=rollout_id,
+            attempt_index=0,
+            execution_generation=1,
+            result_identity=f"result-{rollout_id}-0",
+            result_digest=result_digest,
+        ),
+        agent_name=agent_name,
     )
 
 
@@ -1837,14 +1857,9 @@ class TestPeriodicRolloutCheckpoint:
             "schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
             "groups": [],
             "pending_completed_execution_acknowledgements": [
-                {
-                    "rollout_id": "group-7_g0",
-                    "attempt_index": 0,
-                    "agent_name": "test-agent",
-                    "execution_generation": 1,
-                    "result_identity": "result-group-7_g0-0",
-                    "result_digest": "1" * 64,
-                }
+                _completed_execution("group-7_g0", result_digest="1" * 64).model_dump(
+                    mode="json"
+                )
             ],
         }
 
@@ -1966,14 +1981,9 @@ class TestPeriodicRolloutCheckpoint:
             "schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
             "groups": [],
             "pending_completed_execution_acknowledgements": [
-                {
-                    "rollout_id": "group-8_g0",
-                    "attempt_index": 0,
-                    "agent_name": "test-agent",
-                    "execution_generation": 1,
-                    "result_identity": "result-group-8_g0-0",
-                    "result_digest": "2" * 64,
-                }
+                _completed_execution("group-8_g0", result_digest="2" * 64).model_dump(
+                    mode="json"
+                )
             ],
         }
 
@@ -2308,42 +2318,13 @@ class TestPeriodicRolloutCheckpoint:
                 acknowledge_completed_executions=_AsyncRemoteMethod(acknowledge)
             )
         }
-        pending = [
-            PendingCompletedExecutionAcknowledgement(
-                rollout_id="group-7_g0",
-                attempt_index=0,
-                agent_name="test-agent",
-                execution_generation=1,
-                result_identity="result-group-7_g0-0",
-                result_digest="1" * 64,
-            )
-        ]
-        expected_payload = [
-            {
-                "receipt": {
-                    "rollout_id": "group-7_g0",
-                    "attempt_index": 0,
-                    "execution_generation": 1,
-                    "result_identity": "result-group-7_g0-0",
-                    "result_digest": "1" * 64,
-                    "manifest_capture_key": None,
-                    "terminal_model_call_id": None,
-                },
-                "agent_name": "test-agent",
-            }
-        ]
+        pending = [_completed_execution("group-7_g0", result_digest="1" * 64)]
+        expected_payload = [pending[0].model_dump(mode="json")]
         state = {
             "schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
             "groups": [],
             "pending_completed_execution_acknowledgements": [
-                {
-                    "rollout_id": pending[0].rollout_id,
-                    "attempt_index": pending[0].attempt_index,
-                    "agent_name": pending[0].agent_name,
-                    "execution_generation": pending[0].execution_generation,
-                    "result_identity": pending[0].result_identity,
-                    "result_digest": pending[0].result_digest,
-                }
+                pending[0].model_dump(mode="json")
             ],
         }
 
@@ -3348,14 +3329,9 @@ class TestDataPlaneCheckpoint:
             "schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
             "groups": [],
             "pending_completed_execution_acknowledgements": [
-                {
-                    "rollout_id": "group-7_g0",
-                    "attempt_index": 0,
-                    "agent_name": "test-agent",
-                    "execution_generation": 1,
-                    "result_identity": "result-group-7_g0-0",
-                    "result_digest": "1" * 64,
-                }
+                _completed_execution("group-7_g0", result_digest="1" * 64).model_dump(
+                    mode="json"
+                )
             ],
             "batch_shortfall": {},
             "sampler_stamps_target_steps": False,

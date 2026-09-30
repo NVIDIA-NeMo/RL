@@ -26,6 +26,7 @@ import asyncio
 import hashlib
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any, cast
 
@@ -42,7 +43,12 @@ from nemo_rl.experience.rollout_reassembler_actor import assert_metadata_only
 from nemo_rl.experience.rollout_manager import RolloutCompletionCallback, RolloutManager
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 from nemo_rl.utils.venvs import make_actor_runtime_env
-from tests.functional._turn_recovery_token_evidence import (
+
+_FUNCTIONAL_TEST_DIR = str(Path(__file__).resolve().parent)
+if _FUNCTIONAL_TEST_DIR not in sys.path:
+    sys.path.insert(0, _FUNCTIONAL_TEST_DIR)
+
+from _turn_recovery_token_evidence import (  # noqa: E402
     build_rollout_token_evidence,
 )
 

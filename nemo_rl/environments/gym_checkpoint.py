@@ -750,6 +750,7 @@ class GymCompletedExecutionAcknowledgementResponse(_StrictWireModel):
 class GymCheckpointArtifactReference(_StrictWireModel):
     """Digest-bound coordinate for a Gym-owned checkpoint sidecar."""
 
+    schema_version: GymCheckpointSchemaVersion = GYM_CHECKPOINT_SCHEMA_VERSION
     relative_path: str = Field(min_length=1)
     sha256: Sha256Digest
     records: NonNegativeInt

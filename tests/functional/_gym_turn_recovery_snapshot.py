@@ -20,13 +20,18 @@ import argparse
 import hashlib
 import json
 import os
+import sys
 import tarfile
 import time
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from tests.functional._turn_recovery_token_evidence import verify_token_evidence
+_FUNCTIONAL_TEST_DIR = str(Path(__file__).resolve().parent)
+if _FUNCTIONAL_TEST_DIR not in sys.path:
+    sys.path.insert(0, _FUNCTIONAL_TEST_DIR)
+
+from _turn_recovery_token_evidence import verify_token_evidence  # noqa: E402
 
 _PROFILES = ("counter", "workplace", "genrm")
 _WORKPLACE_EVENT = {

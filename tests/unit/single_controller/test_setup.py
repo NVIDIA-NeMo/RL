@@ -983,6 +983,10 @@ class TestSetup:
 
     def test_gym_turn_recovery_requires_periodic_snapshots(self):
         mc = _make_master_config(env={"should_use_nemo_gym": True})
+        mc.policy["generation"]["vllm_cfg"] = {
+            "async_engine": True,
+            "expose_http_server": True,
+        }
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             gym={"mode": "turn_recovery"}
         )

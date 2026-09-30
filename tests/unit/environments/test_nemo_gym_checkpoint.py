@@ -124,8 +124,13 @@ def _discovered_env():
             admission_states=["accepting", "draining", "paused"],
             concurrency_contract="stateless",
             instance_role="policy",
+            features=["external_storage_reference_index_v1"],
         ),
-        "agent": _capability("responses_api_agents", "agent"),
+        "agent": _capability(
+            "responses_api_agents",
+            "agent",
+            features=["agent_continuation_index_v1"],
+        ),
         "tools": _capability("resources_servers", "tools"),
     }
 
@@ -139,6 +144,16 @@ def _discovered_env():
 
 def test_checkpoint_participation_and_order_are_phase_specific() -> None:
     env = _checkpoint_env()
+    env._server_client.global_config_dict.update(
+        {
+            name: {
+                "responses_api_models": {
+                    "vllm_model": {"base_url": ["http://policy/v1"]}
+                }
+            }
+            for name in ("policy-stateful", "policy-drain-only")
+        }
+    )
     capabilities = {
         "policy-stateful": _capability(
             "responses_api_models",
