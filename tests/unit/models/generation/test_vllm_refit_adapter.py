@@ -373,6 +373,9 @@ class _BindingModel(torch.nn.Module):
         mlp.down_proj = torch.nn.Module()
         mlp.experts = torch.nn.Module()
         mlp.experts.routed_experts = torch.nn.Module()
+        mlp.experts.routed_experts.expert_map_manager = SimpleNamespace(
+            placement_strategy="linear"
+        )
 
         self._register_runtime_pair(
             mlp.gate_up_proj,
@@ -519,7 +522,13 @@ def _make_binding_adapter(
             "vllm.model_executor.model_loader.reload.layerwise": layerwise_module,
         },
     )
-    runner = SimpleNamespace(model=model, vllm_config=object())
+    runner = SimpleNamespace(
+        model=model,
+        vllm_config=object(),
+        reset_lora_state=lambda: events.append("reset_lora_state"),
+        reset_encoder_cache=lambda: events.append("reset_encoder_cache"),
+        reset_mm_cache=lambda: events.append("reset_mm_cache"),
+    )
     return (
         refit_adapter.VllmLayerwiseRefitAdapter(
             model_runner=runner,
@@ -785,6 +794,9 @@ def test_layerwise_adapter_loads_each_component_through_wrapped_weight_loader(
         "load:3",
         "load:4",
         "finalize",
+        "reset_lora_state",
+        "reset_encoder_cache",
+        "reset_mm_cache",
         "exit_config",
     ]
     assert torch.equal(parameter, torch.full((2, 2), 4.0))
@@ -953,12 +965,39 @@ def test_factory_requires_layerwise_reload_capability(
         )
 
 
+def test_factory_requires_local_shard_loader_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reload_module = ModuleType("vllm.model_executor.model_loader.reload")
+    reload_module.initialize_layerwise_reload = lambda _model: None
+    reload_module.finalize_layerwise_reload = lambda _model, _config: None
+    config_module = ModuleType("vllm.config")
+    config_module.set_current_vllm_config = lambda _config: _ConfigContext([])
+    _fake_importer(
+        monkeypatch,
+        {
+            "vllm.config": config_module,
+            "vllm.model_executor.model_loader.reload": reload_module,
+        },
+    )
+    runner = SimpleNamespace(model=SimpleNamespace(), vllm_config=object())
+
+    with pytest.raises(RuntimeError, match="make_online_process_loader"):
+        refit_adapter.create_vllm_refit_adapter(
+            model_runner=runner,
+            model_config=object(),
+            device=torch.device("cpu"),
+        )
+
+
 def test_capability_probe_records_later_engine_api_without_selecting_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     reload_module = ModuleType("vllm.model_executor.model_loader.reload")
     reload_module.initialize_layerwise_reload = lambda _model: None
     reload_module.finalize_layerwise_reload = lambda _model, _config: None
+    layerwise_module = ModuleType("vllm.model_executor.model_loader.reload.layerwise")
+    layerwise_module.make_online_process_loader = lambda _layer, _param_name: None
     config_module = ModuleType("vllm.config")
     config_module.set_current_vllm_config = lambda _config: _ConfigContext([])
     factory_module = ModuleType("vllm.distributed.weight_transfer.factory")
@@ -997,6 +1036,7 @@ def test_capability_probe_records_later_engine_api_without_selecting_it(
         {
             "vllm.config": config_module,
             "vllm.model_executor.model_loader.reload": reload_module,
+            "vllm.model_executor.model_loader.reload.layerwise": layerwise_module,
             "vllm.distributed.weight_transfer.factory": factory_module,
             "vllm.distributed.weight_transfer.base": base_module,
         },
@@ -1005,6 +1045,7 @@ def test_capability_probe_records_later_engine_api_without_selecting_it(
     capabilities = refit_adapter.probe_vllm_refit_capabilities()
     assert capabilities == refit_adapter.VllmRefitCapabilities(
         layerwise_reload=True,
+        local_shard_loader=True,
         weight_transfer_engine_registry=True,
         trainer_weight_transfer=True,
     )
@@ -1119,6 +1160,17 @@ def test_layerwise_adapter_binds_dense_and_routed_checkpoint_components(
             assert torch.equal(payload.view(torch.uint8), payload_bytes)
         elif logical_name.endswith(("gate_proj.weight", "up_proj.weight")):
             assert bound.arguments["loaded_shard_id"] in {0, 1}
+
+
+def test_layerwise_adapter_rejects_round_robin_grouped_expert_placement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, model, _retained_loads = _make_binding_adapter(monkeypatch, [])
+    routed_experts = model.model.layers[0].mlp.experts.routed_experts
+    routed_experts.expert_map_manager.placement_strategy = "round_robin"
+
+    with pytest.raises(RuntimeError, match="linear expert placement"):
+        adapter.prepare(_native_binding_refit_info())
 
 
 def test_layerwise_adapter_rejects_consistent_dense_metadata_that_misses_fused_target(
