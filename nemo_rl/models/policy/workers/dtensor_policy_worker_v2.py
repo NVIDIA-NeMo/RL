@@ -30,6 +30,7 @@ from torch.distributed.tensor import DTensor
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.metric_utils import LEARNING_RATE_KEY
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.automodel.checkpoint import (
@@ -78,7 +79,10 @@ from nemo_rl.models.policy.workers.checkpoint_engine import (
 from nemo_rl.models.policy.workers.patches import (
     apply_transformer_engine_patch,
 )
-from nemo_rl.telemetry.setup import init_telemetry_worker
+from nemo_rl.telemetry.setup import (
+    init_telemetry_worker,
+    traced_worker_init,
+)
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
@@ -211,6 +215,7 @@ class DTensorPolicyWorkerV2Impl(
             "context_parallel": self.device_mesh["cp"].get_local_rank(),
         }
 
+    @traced_worker_init("rl.policy.load_model", **{"rl.backend": "dtensor_v2"})
     def __init__(
         self,
         config: PolicyConfig,
@@ -517,7 +522,9 @@ class DTensorPolicyWorkerV2Impl(
                     # Only process valid (non-dummy) batches for metrics
                     if mb_idx < iterator_len:
                         num_valid_samples = loss_metrics["num_valid_samples"]
-                        loss_metrics["lr"] = self.optimizer.param_groups[0]["lr"]
+                        loss_metrics[LEARNING_RATE_KEY] = self.optimizer.param_groups[
+                            0
+                        ]["lr"]
                         loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
                         loss_metrics["global_valid_toks"] = global_valid_toks.item()
 

@@ -65,6 +65,7 @@ from nemo_rl.models.generation.vllm.config import (
 )
 from nemo_rl.models.policy import MegatronConfig, PolicyConfig
 from nemo_rl.models.value import ValueConfig
+from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 
 # ── User-facing SingleController configs ────────────────────────────────────
@@ -643,6 +644,9 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # derived at setup
     # under the run's log dir.
     capture_dir: Optional[str] = None
+    # Generation backend hosting token capture. This is derived from
+    # policy.generation.backend during setup; users should not set it separately.
+    generation_backend: Optional[Literal["vllm", "megatron"]] = None
     # Keep routed_experts out of canonical rows and assemble them on policy
     # workers from strict staged-fragment plans.
     defer_routed_experts_to_policy: bool = False
@@ -830,6 +834,7 @@ class MasterConfig(BaseModel, extra="allow"):
         default_factory=RolloutCheckpointConfig
     )
     on_policy_distillation: Optional[OnPolicyDistillationConfig] = None
+    telemetry: Optional[TelemetryConfig] = None
     token_capture: TokenCaptureConfig = Field(default_factory=TokenCaptureConfig)
 
     @model_validator(mode="after")

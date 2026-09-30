@@ -401,9 +401,6 @@ def destroy_parallel_state():
     # Also reset the Megatron async calls queue if it exists
     try:
         import megatron.training.async_utils as megatron_async_utils
-        from megatron.core.dist_checkpointing.strategies.async_utils import (
-            AsyncCallsQueue,
-        )
 
         # Clean up any existing async callers first
         old_call_idx = getattr(
@@ -421,8 +418,9 @@ def destroy_parallel_state():
             megatron_async_utils._async_calls_queue.close()
         except:
             pass  # Ignore errors during cleanup
-        # Reset the Megatron global async calls queue as well
-        megatron_async_utils._async_calls_queue = AsyncCallsQueue()
+        # Reset the Megatron global async calls queue as well. Mcore rebuilds it
+        # lazily in _get_async_calls_queue() using flags from the run's args.
+        megatron_async_utils._async_calls_queue = None
         print(
             f"[DEBUG] Reset Megatron async calls queue (old call_idx: {old_call_idx})"
         )
@@ -1741,21 +1739,11 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.use_fused_weighted_squared_relu = config["megatron_cfg"][
         "use_fused_weighted_squared_relu"
     ]
-    # NeMo-RL can pack multiple expanded Omni examples into one THD tensor.
-    # Flash attention does not support the resulting padded multi-row layout,
-    # so the canonical expanded-sequence contract must use backend dispatch.
     attention_backend = config["megatron_cfg"].get("attention_backend")
     if (
         getattr(model_cfg, "nemotron_omni_contract", None)
         == _NEMOTRON_OMNI_EXPANDED_SEQUENCE_CONTRACT
     ):
-        if attention_backend == "flash":
-            raise ValueError(
-                "Nemotron Omni's expanded-sequence contract does not support "
-                "attention_backend='flash' in NeMo-RL because packed batches can "
-                "contain multiple padded THD rows. Use attention_backend='auto' "
-                "or omit the setting."
-            )
         if attention_backend is None:
             attention_backend = "auto"
 
