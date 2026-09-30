@@ -1,0 +1,32 @@
+# EXPERIMENTAL / UNVERIFIED: Qwen3-30B-A3B zero-KL with colocated Megatron
+# inference. Training and generation share the same GPUs (1 node x 4 GPUs) and
+# weights move by native MCore refit between phases. Parallelism is unchanged
+# from the non-colocated recipe (TP1, EP4 on both sides), so the arithmetic
+# being compared is the same; only placement and memory pressure differ.
+#
+# Memory is the open risk: the training state, the generation weights, the KV
+# buffer and the CUDA graphs now live on one set of GPUs. The optimizer is
+# offloaded to host for that reason. If generation OOMs, lower
+# policy.generation.mcore_generation_config.buffer_size_gb first.
+defaults: ./grpo_qwen3_30ba3b_megatron_zero_train_gen_kl.yaml
+
+policy:
+  megatron_cfg:
+    optimizer:
+      optimizer_cpu_offload: true
+      optimizer_offload_fraction: 1.0
+
+  generation:
+    refit_transport: mcore
+    colocated:
+      enabled: true
+      # Only read when enabled is false.
+      resources:
+        gpus_per_node: null
+        num_nodes: null
+    mcore_generation_config:
+      refit_backend: nccl
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 1

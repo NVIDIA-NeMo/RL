@@ -19,9 +19,9 @@ Only BF16 (no FP8) is supported.
 
 from __future__ import annotations
 
-import subprocess
+import os
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING, Any, Mapping
 
@@ -30,10 +30,15 @@ from packaging.version import Version
 if TYPE_CHECKING:
     from nemo_rl.models.policy import PolicyConfig
 
-# Minimum Megatron-Core commit providing the batch-invariant inference kernels
-# and the batch_invariant_backend/collective knobs this mode configures. Has to
-# be a commit on main.
-MEGATRON_CORE_MIN_COMMIT_SHA = "b005bf14c46b62169533e755ca2d4e62fe6b7e0a"
+# TransformerConfig fields the installed Megatron-Core must define for this mode.
+# Probed instead of pinning a commit: the vendored checkout can be shallow (no
+# ancestry to walk) and the container may not trust its git directory.
+MEGATRON_CORE_REQUIRED_CONFIG_FIELDS = (
+    "batch_invariant_mode",
+    "batch_invariant_backend",
+    "batch_invariant_collective",
+    "flash_attention_version",
+)
 
 TRANSFORMER_ENGINE_MIN_VERSION = Version("2.18")
 FLASH_ATTN_MIN_VERSION = Version("2.8.1")
@@ -255,6 +260,14 @@ def enable_batch_invariant_kernels(config: PolicyConfig) -> None:
     enable_mcore_batch_invariant_mode(
         backend=megatron_cfg["batch_invariant_backend"], collective=collective
     )
+    print(
+        "[zero_train_gen_mismatch] batch-invariant kernels enabled: "
+        f"backend={megatron_cfg['batch_invariant_backend']} "
+        f"collective={collective} "
+        f"flash_attention_version={megatron_cfg['flash_attention_version']} "
+        f"CUTE_DSL_LIBS={os.environ.get('CUTE_DSL_LIBS')}",
+        flush=True,
+    )
 
 
 def configure_zero_train_gen_mismatch(
@@ -350,63 +363,20 @@ def _validate_platform(
         )
 
 
-def _megatron_core_source_root() -> str | None:
+def _validate_megatron_core_features(out: ZeroTrainGenValidation) -> None:
     try:
-        import megatron.core as mcore
+        from megatron.core.transformer.transformer_config import TransformerConfig
     except ImportError:
-        return None
-    from pathlib import Path
-
-    return str(Path(mcore.__file__).resolve().parent.parent.parent)
-
-
-def _git_is_ancestor(ancestor_sha: str, head_sha: str, repo_root: str) -> bool:
-    proc = subprocess.run(
-        ["git", "merge-base", "--is-ancestor", ancestor_sha, head_sha],
-        cwd=repo_root,
-        capture_output=True,
-        check=False,
-    )
-    return proc.returncode == 0
-
-
-def _installed_megatron_core_commit() -> str | None:
-    repo_root = _megatron_core_source_root()
-    if repo_root is None:
-        return None
-    proc = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if proc.returncode != 0:
-        return None
-    return proc.stdout.strip()
-
-
-def _validate_megatron_core_commit(min_sha: str, out: ZeroTrainGenValidation) -> None:
-    repo_root = _megatron_core_source_root()
-    if repo_root is None:
         out.violations.append(
-            "Megatron-Core is not importable; cannot verify minimum commit "
-            f"(required ancestor {min_sha})."
+            "Megatron-Core is not importable (required for zero_train_gen_mismatch)."
         )
         return
-    head = _installed_megatron_core_commit()
-    if head is None:
+    defined = {f.name for f in fields(TransformerConfig)}
+    missing = [f for f in MEGATRON_CORE_REQUIRED_CONFIG_FIELDS if f not in defined]
+    if missing:
         out.violations.append(
-            "Could not read Megatron-Core git HEAD; install from a git checkout "
-            f"at or after {min_sha}."
-        )
-        return
-    if min_sha == head:
-        return
-    if not _git_is_ancestor(min_sha, head, repo_root):
-        out.violations.append(
-            f"Megatron-Core commit {head} is not at or after required "
-            f"zero_train_gen_mismatch minimum {min_sha}."
+            "Installed Megatron-Core lacks TransformerConfig fields required for "
+            f"zero_train_gen_mismatch: {', '.join(missing)}."
         )
 
 
@@ -426,7 +396,7 @@ def _first_package_version(dist_names: tuple[str, ...]) -> Version | None:
 
 
 def _validate_packages(out: ZeroTrainGenValidation) -> None:
-    _validate_megatron_core_commit(MEGATRON_CORE_MIN_COMMIT_SHA, out)
+    _validate_megatron_core_features(out)
 
     te_ver = _package_version("transformer_engine")
     if te_ver is None:
@@ -495,10 +465,13 @@ def _validate_precision(config: PolicyConfig, out: ZeroTrainGenValidation) -> No
 
     from nemo_rl.models.generation.megatron.config import merged_inference_megatron_cfg
 
-    for label, cfg in (
-        ("policy.megatron_cfg", config["megatron_cfg"]),
-        ("generation", merged_inference_megatron_cfg(config)),
-    ):
+    sides = [("policy.megatron_cfg", config["megatron_cfg"])]
+    generation = config.get("generation")
+    # A missing or non-megatron generation backend is already reported by
+    # _validate_backend; there is no inference config to inspect in that case.
+    if generation is not None and generation.get("backend") == "megatron":
+        sides.append(("generation", merged_inference_megatron_cfg(config)))
+    for label, cfg in sides:
         if (cfg.get("fp8_cfg") or {}).get("enabled"):
             out.violations.append(
                 f"zero_train_gen_mismatch does not support FP8 ({label}.fp8_cfg.enabled=true)."
