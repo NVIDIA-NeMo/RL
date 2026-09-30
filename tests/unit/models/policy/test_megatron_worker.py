@@ -322,6 +322,45 @@ def test_mxfp8_param_storage_refit_sends_logical_bf16_to_vllm() -> None:
     assert not isinstance(forwarded, list)
 
 
+def test_mxfp8_param_storage_exports_without_prepared_refit_tasks() -> None:
+    """Remote sparse refit never runs prepare_refit_info, so tasks stay None.
+
+    MXFP8 storage must still export every weight rather than hand Bridge a
+    logical-materializing generator over ``None``.
+    """
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    weight = torch.ones(4, 2, dtype=torch.bfloat16)
+    task = SimpleNamespace(
+        param_weight=weight, megatron_module=None, param_name="linear_fc1.weight"
+    )
+
+    def export_hf_weights(models, show_progress=False, conversion_tasks=None):
+        # Like AutoBridge: build its own tasks only when none are passed in.
+        for t in [task] if conversion_tasks is None else conversion_tasks:
+            yield "model.layers.0.mlp.up_proj.weight", t.param_weight
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.fp8_cfg = {"fp8_param": True, "fp8_recipe": "mxfp8"}
+    worker.model = object()
+    worker.draft_model = None
+    worker.refit_conversion_tasks = None
+    worker.refit_payload_mode = "hf_export"
+    worker.cfg = {"generation": {"backend": "vllm", "vllm_cfg": {}}}
+    worker.megatron_bridge = SimpleNamespace(
+        export_hf_weights=export_hf_weights,
+        get_conversion_tasks=MagicMock(return_value=[task]),
+        get_export_fp8_tasks=MagicMock(),
+    )
+
+    exported = dict(worker._iter_params_with_optional_kv_scales())
+
+    assert list(exported) == ["model.layers.0.mlp.up_proj.weight"]
+    assert exported["model.layers.0.mlp.up_proj.weight"] is weight
+
+
 def test_local_hf_shards_follow_bridge_specs() -> None:
     from megatron.bridge.models.conversion.param_mapping import LocalHFParamSpec
 

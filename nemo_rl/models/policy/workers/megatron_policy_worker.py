@@ -3294,8 +3294,10 @@ class MegatronPolicyWorkerImpl(
         # MXFP8 training storage is also sent as logical BF16 (it has no physical
         # export path) and re-quantized by the receiver. Other backends keep
         # Bridge's physical blockwise FP8 payload and scale_inv sibling; mixing
-        # that scale with BF16 would corrupt the imported weight.
-        if self._uses_logical_refit_payload():
+        # that scale with BF16 would corrupt the imported weight. Transports that
+        # skip prepare_refit_info (remote sparse) have no cached tasks; passing
+        # None through lets Bridge build its own and dequantize TE storage.
+        if conversion_tasks is not None and self._uses_logical_refit_payload():
             conversion_tasks = self._iter_logical_refit_conversion_tasks(
                 conversion_tasks
             )
