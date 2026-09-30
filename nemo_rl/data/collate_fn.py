@@ -16,7 +16,11 @@ from typing import Any, Union
 import torch
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 
-from nemo_rl.data.interfaces import DatumSpec, PreferenceDatumSpec
+from nemo_rl.data.interfaces import (
+    DatumSpec,
+    PreferenceDatumSpec,
+    TrajectoryValueDatumSpec,
+)
 from nemo_rl.data.llm_message_utils import (
     add_loss_mask_to_message_log,
     batched_message_log_to_flat_message,
@@ -218,3 +222,162 @@ def preference_collate_fn(
         data["token_mask"] = cat_and_padded["token_loss_mask"]
 
     return data
+
+
+def trajectory_value_collate_fn(
+    data_batch: list[TrajectoryValueDatumSpec],
+    tokenizer: TokenizerType,
+    make_sequence_length_divisible_by: int,
+) -> BatchedDataDict[Any]:
+    """Collate unit-weight scalar targets at arbitrary token states."""
+    if tokenizer.pad_token_id is None:
+        raise ValueError("trajectory-value collation requires tokenizer.pad_token_id")
+
+    message_log = [datum["message_log"] for datum in data_batch]
+    cat_and_padded, input_lengths = batched_message_log_to_flat_message(
+        message_log,
+        pad_value_dict={"token_ids": tokenizer.pad_token_id},
+        make_sequence_length_divisible_by=make_sequence_length_divisible_by,
+    )
+    input_ids = cat_and_padded["token_ids"]
+    sample_mask = torch.tensor(
+        [datum["loss_multiplier"] for datum in data_batch], dtype=torch.float32
+    )
+    if not torch.all(torch.isfinite(sample_mask)) or torch.any(sample_mask < 0):
+        raise ValueError("loss_multiplier values must be finite and nonnegative")
+
+    positions_by_sample: list[torch.Tensor] = []
+    values_by_sample: list[torch.Tensor] = []
+    points_by_sample: list[list[bool]] = []
+    definitions_by_sample: list[list[int]] = []
+    evaluation_positions_by_sample: list[torch.Tensor] = []
+    evaluation_values_by_sample: list[torch.Tensor] = []
+    evaluation_definitions_by_sample: list[list[int]] = []
+    for sample_index, datum in enumerate(data_batch):
+        if "target_positions" in datum:
+            positions = datum["target_positions"].to(dtype=torch.long)
+            values = datum["target_values"].to(dtype=torch.float32)
+            points = list(datum["target_is_point"])
+            definitions = list(datum["target_definition_indices"])
+        else:
+            # Compatibility for callers constructing the original v1 datum
+            # directly rather than going through trajectory_value_processor.
+            positions = torch.tensor([datum["length"] - 1], dtype=torch.long)
+            values = torch.tensor([datum["value_target"]], dtype=torch.float32)
+            points = [True]
+            definitions = [0]
+
+        target_count = len(positions)
+        if not (
+            positions.ndim == 1
+            and values.ndim == 1
+            and len(values) == target_count
+            and len(points) == target_count
+            and len(definitions) == target_count
+        ):
+            raise ValueError(
+                f"trajectory-value target vectors disagree in sample {sample_index}"
+            )
+        if sample_mask[sample_index] > 0 and target_count == 0:
+            raise ValueError(f"unmasked sample {sample_index} has no value targets")
+        if target_count:
+            if torch.any(positions < 1) or torch.any(
+                positions >= input_lengths[sample_index]
+            ):
+                raise ValueError(
+                    f"target position is outside sample {sample_index}'s sequence"
+                )
+            if len(torch.unique(positions)) != target_count:
+                raise ValueError(
+                    f"sample {sample_index} has duplicate target positions"
+                )
+            if not torch.all(torch.isfinite(values)):
+                raise ValueError(f"sample {sample_index} has non-finite targets")
+        positions_by_sample.append(positions)
+        values_by_sample.append(values)
+        points_by_sample.append(points)
+        definitions_by_sample.append(definitions)
+
+        evaluation_positions = datum.get(
+            "evaluation_positions", torch.empty(0, dtype=torch.long)
+        ).to(dtype=torch.long)
+        evaluation_values = datum.get(
+            "evaluation_values", torch.empty(0, dtype=torch.float32)
+        ).to(dtype=torch.float32)
+        evaluation_definitions = list(datum.get("evaluation_definition_indices", []))
+        evaluation_count = len(evaluation_positions)
+        if not (
+            evaluation_positions.ndim == 1
+            and evaluation_values.ndim == 1
+            and len(evaluation_values) == evaluation_count
+            and len(evaluation_definitions) == evaluation_count
+        ):
+            raise ValueError(
+                f"trajectory-value evaluation vectors disagree in sample {sample_index}"
+            )
+        if evaluation_count:
+            if torch.any(evaluation_positions < 1) or torch.any(
+                evaluation_positions >= input_lengths[sample_index]
+            ):
+                raise ValueError(
+                    f"evaluation position is outside sample {sample_index}'s sequence"
+                )
+            if not torch.all(torch.isfinite(evaluation_values)):
+                raise ValueError(
+                    f"sample {sample_index} has non-finite evaluation targets"
+                )
+        evaluation_positions_by_sample.append(evaluation_positions)
+        evaluation_values_by_sample.append(evaluation_values)
+        evaluation_definitions_by_sample.append(evaluation_definitions)
+
+    token_mask = torch.zeros(input_ids.shape, dtype=torch.float32)
+    returns = torch.zeros(input_ids.shape, dtype=torch.float32)
+    for sample_index, (positions, values) in enumerate(
+        zip(positions_by_sample, values_by_sample)
+    ):
+        token_mask[sample_index, positions] = 1.0
+        returns[sample_index, positions] = values
+
+    output = BatchedDataDict(
+        input_ids=input_ids,
+        input_lengths=input_lengths,
+        token_mask=token_mask,
+        sample_mask=sample_mask,
+        returns=returns,
+        target_positions=positions_by_sample,
+        target_values=values_by_sample,
+        target_is_point=points_by_sample,
+        target_definition_indices=definitions_by_sample,
+        target_definitions=[
+            datum.get("target_definitions", []) for datum in data_batch
+        ],
+        evaluation_positions=evaluation_positions_by_sample,
+        evaluation_values=evaluation_values_by_sample,
+        evaluation_definition_indices=evaluation_definitions_by_sample,
+        evaluation_definitions=[
+            datum.get("evaluation_definitions", []) for datum in data_batch
+        ],
+        trajectory_id=[
+            datum.get("trajectory_id", datum.get("pivot_id", ""))
+            for datum in data_batch
+        ],
+        experiment_id=[
+            datum.get("experiment_id", "trajectory_value_v1") for datum in data_batch
+        ],
+        untruncated_length=torch.tensor(
+            [datum["untruncated_length"] for datum in data_batch], dtype=torch.long
+        ),
+        pivot_id=[datum.get("pivot_id") for datum in data_batch],
+        instance_id=[datum["instance_id"] for datum in data_batch],
+        label_source=[
+            datum.get("label_source", "multi_target") for datum in data_batch
+        ],
+        group_metadata=[datum["group_metadata"] for datum in data_batch],
+        pass_count=[datum.get("pass_count") for datum in data_batch],
+        rollout_count=[datum.get("rollout_count") for datum in data_batch],
+        idx=[datum["idx"] for datum in data_batch],
+    )
+    if all(len(positions) == 1 for positions in positions_by_sample):
+        output["query_positions"] = torch.stack(positions_by_sample).flatten()
+        output["value_targets"] = torch.stack(values_by_sample).flatten()
+    return output
