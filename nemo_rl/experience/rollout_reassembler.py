@@ -1327,12 +1327,8 @@ class RolloutReassembler:
                     for _ in segments
                 ]
             for ordinal, row in enumerate(rebuilt):
-                flag_segments = [segments[ordinal]]
-                flags = [
-                    flag
-                    for segment in flag_segments
-                    for flag in segment.action_flags or ()
-                ]
+                segment = segments[ordinal]
+                flags = segment.action_flags or ()
                 prepared.rows.append(replace(row, rollout_id=f"{owner_id}_s{ordinal}"))
                 prepared.prompt_ids.append(original_prompt)
                 prepared.mask_sample.append(owner_mask)
@@ -1354,10 +1350,7 @@ class RolloutReassembler:
                         "num_malformed_thinking": sum(
                             flag.malformed_thinking for flag in flags
                         ),
-                        "num_assistant_messages": sum(
-                            len(segment.selected_response_ids)
-                            for segment in flag_segments
-                        ),
+                        "num_assistant_messages": len(segment.selected_response_ids),
                     }
                 )
         prepared.staging_keys = list(dict.fromkeys(prepared.staging_keys))

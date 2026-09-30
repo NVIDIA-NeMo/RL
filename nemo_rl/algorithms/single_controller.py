@@ -5340,12 +5340,6 @@ class SingleControllerActor:
             )
             final_sample_mask = owner_batch.fanout(owner_batch.valid_mask)
         mask = token_mask * final_sample_mask.unsqueeze(-1)
-        baseline_mask = final_sample_mask
-        if (
-            isinstance(self._algo_cfg, GRPOConfig)
-            and self._algo_cfg.baseline_population == "all_owners"
-        ):
-            baseline_mask = torch.ones_like(final_sample_mask)
 
         repeated_batch: dict[str, torch.Tensor] = {
             "total_reward": rewards,
@@ -5387,7 +5381,7 @@ class SingleControllerActor:
                 prompt_ids=owner_batch.group_ids,
                 rewards=rewards[rows],
                 mask=owner_batch.valid_mask.unsqueeze(-1),
-                valid_mask=baseline_mask[rows],
+                valid_mask=owner_batch.valid_mask,
             )
             if (
                 owner_advantages.shape != (len(rows), 1)
@@ -5403,9 +5397,8 @@ class SingleControllerActor:
                 rewards=rewards,
                 mask=mask,
                 repeated_batch=repeated_batch,
-                # One controller-wide policy for ordinary and CC populations.
-                # Loss validity remains authoritative under either policy.
-                valid_mask=baseline_mask,
+                # Masked rollouts do not contribute to the group baseline.
+                valid_mask=final_sample_mask,
                 **kwargs,
             )
             if self._is_ppo:
