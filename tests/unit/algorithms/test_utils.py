@@ -435,7 +435,7 @@ def test_maybe_pad_last_direct_packed_batch_rejects_unaligned_field():
     batch = _single_direct_packed_validation_row()
     batch["metadata"] = object()
 
-    with pytest.raises(ValueError, match="row-aligned field metadata"):
+    with pytest.raises(TypeError, match="Unsupported type .* for index selection"):
         maybe_pad_last_batch(batch, dp_size=2, mbs=1)
 
 

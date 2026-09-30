@@ -84,6 +84,9 @@ class _MegatronConfig:
         self.tokenizer = tokenizer
         self.sequence_length = sequence_length
         self.context_parallel_size = context_parallel_size
+        self.hybrid_context_parallel = False
+        self.data_parallel_size = 1
+        self.sequence_parallel_size = 0
         self.reset_position_ids = False
         self.create_attention_mask = False
         self.reset_attention_mask = False
@@ -248,6 +251,7 @@ def _megatron_preprocess(
         sequence_length=max_seq_length,
         context_parallel_size=context_parallel_size,
     )
+    dataset.padding_divisor = dataset._calculate_padding_divisor()
     return dataset[0]
 
 
