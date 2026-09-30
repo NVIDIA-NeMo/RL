@@ -16,7 +16,7 @@ name: Create PR to main with cherry-pick from release
 on:
   push:
     branches:
-      - "r*"
+      - "r[0-9]*.[0-9]*.[0-9]*"
 
 jobs:
   cherry-pick:
