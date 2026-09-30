@@ -100,6 +100,9 @@ from nemo_rl.models.megatron.memory_saver import (
     pause_inference_weights,
     resume_inference_weights,
 )
+from nemo_rl.models.megatron.zero_train_gen_mismatch import (
+    allow_installed_flash_attn_4,
+)
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
 from nemo_rl.weight_sync.nccl_reshard_utils import (
@@ -565,6 +568,9 @@ class MegatronGenerationMixin:
         # lose the dtype guard above.
         if getattr(model_config, "batch_invariant_mode", False):
             use_flashinfer_fused_rope = False
+            # Batch-invariant decode calls FA4; allow an installed flash-attn-4
+            # below MCore's version gate (see allow_installed_flash_attn_4).
+            allow_installed_flash_attn_4()
 
         image_preprocessing_config = self._build_image_preprocessing_config(
             mcore_generation_config
