@@ -100,6 +100,11 @@ checkpointing:
   save_period: 10
   checkpoint_must_save_by: null
   save_optimizer: true
+  ft_keep_latest_k: null
+  ft_save_period: null
+  pretrained_checkpoint: null
+  save_data_plane: false
+  load_replay_buffer: null
 
 policy:
   model_name: "Qwen/Qwen2.5-1.5B"
