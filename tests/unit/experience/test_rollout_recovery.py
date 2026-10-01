@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any, TypeVar
 
 import pytest
@@ -29,6 +30,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 )
 from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
 from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.experience.rollout_reassembler import ActionOutputFlags, RolloutSelection
 from nemo_rl.experience.rollout_recovery import (
     _ATTEMPT_STATE_FIELDS,
     _GROUP_STATE_FIELDS,
@@ -49,6 +51,165 @@ from nemo_rl.experience.rollout_recovery import (
 )
 
 _T = TypeVar("_T")
+
+
+def _cc_sealed_ledger() -> RolloutRecoveryLedger:
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(
+        ledger,
+        group_id="g7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=2,
+        target_step=7,
+        start_weight_version=6,
+    )
+    _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
+    owner = group.gate_rollout_id(0)
+    _mutate(
+        lambda cut: ledger.mark_sibling_sealed(
+            cut,
+            "g7",
+            generation_index=0,
+            gate_rollout_id=owner,
+            receipt={
+                "rollout_id": owner,
+                "manifest": [
+                    {"model_call_id": f"call{i}", "staging_key": f"{owner}/call{i}"}
+                    for i in range(3)
+                ],
+                "attempted_call_ids": ["call0", "call1", "call2", "failed"],
+            },
+            reward=0.5,
+            mask_sample=True,
+            logical_selection=RolloutSelection(
+                ("response0", "response2"),
+                (ActionOutputFlags(True, False), ActionOutputFlags(False, True)),
+                truncated=True,
+            ),
+        )
+    )
+    return ledger
+
+
+def test_cc_recovery_disk_round_trip_retains_completed_evidence(tmp_path: Path) -> None:
+    ledger = _cc_sealed_ledger()
+    state = ledger.state_dict()
+    path = tmp_path / "recovery.pt"
+    torch.save(state, path)
+    restored = RolloutRecoveryLedger.from_state_dict(
+        torch.load(path, weights_only=True)
+    )
+    _bind(restored, "g7", _prompt())
+    assert restored.state_dict() == state
+    owner = ledger.get_group("g7").gate_rollout_id(0)
+    # Unselected and failed calls remain cleanup-owned, but aren't selected for loss.
+    assert restored.expected_staging_keys() == {
+        f"{owner}/{call}" for call in ("call0", "call1", "call2", "failed")
+    }
+    before = ledger.get_group("g7").siblings[0].current_attempt
+    _mutate(lambda cut: restored.prepare_for_restart(cut))
+    retried = _mutate(lambda cut: restored.prepare_incomplete_retry(cut, "g7"))
+    assert retried.siblings[0].current_attempt == before
+    assert (
+        retried.siblings[1].current_attempt.attempt_id
+        != ledger.get_group("g7").siblings[1].current_attempt.attempt_id
+    )
+    assert retried.siblings[1].current_attempt.logical_selection is None
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "missing_field",
+        "foreign_receipt",
+        "foreign_staging",
+        "wrong_call",
+        "missing_call",
+        "staging",
+        "duplicate",
+        "unsealed",
+        "unknown_field",
+        "missing_descriptor_field",
+        "tensor",
+        "flags",
+        "duplicate_selection",
+        "pending",
+    ],
+)
+def test_cc_recovery_rejects_malformed_saved_ownership(damage: str) -> None:
+    state = _cc_sealed_ledger().state_dict()
+    attempt = state["groups"][0]["siblings"][0]["attempts"][0]
+    selection, receipt = attempt["logical_selection"], attempt["receipt"]
+    if damage == "missing_field":
+        del attempt["logical_selection"]
+    elif damage == "foreign_receipt":
+        receipt["rollout_id"] = "foreign"
+    elif damage in {"foreign_staging", "wrong_call", "missing_call"}:
+        entry = receipt["manifest"][0]
+        if damage == "foreign_staging":
+            entry["staging_key"] = "foreign/call0"
+        elif damage == "wrong_call":
+            entry["model_call_id"] = "other"
+        else:
+            del entry["model_call_id"]
+        attempt["staging_keys"][0] = entry["staging_key"]
+    elif damage == "staging":
+        attempt["staging_keys"] = []
+    elif damage == "duplicate":
+        receipt["manifest"].append(dict(receipt["manifest"][0]))
+    elif damage == "unsealed":
+        attempt["status"] = "abandoned"
+    elif damage == "missing_descriptor_field":
+        del selection["action_flags"]
+    elif damage == "tensor":
+        selection["truncated"] = torch.tensor(True)
+    elif damage == "flags":
+        selection["action_flags"][0]["invalid_tool_call"] = 1
+    elif damage == "duplicate_selection":
+        selection["response_ids"] = ("response0", "response0")
+    elif damage == "pending":
+        receipt["pending_call_ids"] = ["inflight"]
+    else:
+        selection["unknown"] = 1
+    with pytest.raises((ValueError, TypeError)):
+        RolloutRecoveryLedger.from_state_dict(state)
+
+
+@pytest.mark.parametrize("schema", [2, 3])
+def test_legacy_ordinary_recovery_still_loads(schema: int) -> None:
+    ledger = RolloutRecoveryLedger()
+    _reserve(
+        ledger,
+        group_id="g7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=1,
+        target_step=7,
+        start_weight_version=6,
+    )
+    state = ledger.state_dict()
+    state["schema_version"] = schema
+    attempt = state["groups"][0]["siblings"][0]["attempts"][0]
+    del attempt["logical_selection"]
+    if schema == 3:
+        attempt["logical_segments"] = None
+    restored = RolloutRecoveryLedger.from_state_dict(state)
+    assert (
+        restored.get_group("g7").siblings[0].current_attempt.logical_selection is None
+    )
+
+
+def test_obsolete_cc_snapshot_has_explicit_error() -> None:
+    state = _cc_sealed_ledger().state_dict()
+    state["schema_version"] = 3
+    for sibling in state["groups"][0]["siblings"]:
+        for attempt in sibling["attempts"]:
+            attempt["logical_segments"] = (
+                [{}] if attempt.pop("logical_selection") else None
+            )
+    with pytest.raises(ValueError, match="Obsolete CC snapshots"):
+        RolloutRecoveryLedger.from_state_dict(state)
 
 
 def _mutate(callback: Callable[[DataPlaneMutationCut], _T]) -> _T:
@@ -831,7 +992,7 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
     assert rewards == [0.0, 1.0]
     assert mask_sample == [True, False]
 
-    state["schema_version"] = 3
+    state["schema_version"] = ROLLOUT_RECOVERY_SCHEMA_VERSION + 1
     with pytest.raises(ValueError, match="Unsupported rollout-recovery schema version"):
         RolloutRecoveryLedger.from_state_dict(state)
 

@@ -113,7 +113,7 @@ With `checkpointing.save_data_plane: true`, each Single-Controller checkpoint co
 - A native TQ snapshot containing rollout tensor payloads and TQ state.
 - A metadata-only replay index describing the completed rollout groups stored in TQ.
 - A `rollout_recovery.pt` ownership ledger describing unfinished prompt groups that must be redispatched after a restart.
-- A `replacement_reserve.pt` sidecar containing prompts held for dropped-rollout replacement, when applicable.
+- A `replacement_reserve.pt` sidecar containing prompts held for dropped-rollout replacement, including an empty list when none are held. Legacy recovery-schema-2 checkpoints may omit this file.
 - The sampler dispatch position needed to continue scheduling from the correct point.
 
 The TQ snapshot and replay index are captured under the same checkpoint barrier. Generation may continue while the snapshot is written, but completed-group commits and destructive TQ clears wait at the barrier. This ensures that the TQ snapshot and replay index describe the same set of groups.
@@ -121,6 +121,34 @@ The TQ snapshot and replay index are captured under the same checkpoint barrier.
 On resume, Single-Controller validates the TQ snapshot against the trainer checkpoint, restores the replay index, and makes completed, committed, unconsumed groups available to the sampler before training resumes.
 
 Replay recovery is supported by all built-in samplers: `in_order`, `weight_fifo`, `ready_first`, and `windowed`. Custom samplers must explicitly declare `supports_buffer_checkpoint = True`. Otherwise, setup emits a warning and completed buffered groups are not restored.
+
+### Context-compaction recovery
+
+[Context-compaction runs](./context-compaction.md) use these same checkpoint
+settings and defaults, including buffered replay, unfinished groups and periodic
+rollout snapshots. No separate CC save-data option or buffer drain is required.
+
+The recovery ledger saves the ordinary attempt receipt and RL's `RolloutSelection`,
+not a segment plan. On restart, the existing planner reconstructs unfinished
+groups from that evidence and captured tokens/media in TQ. Already-published
+training rows restore directly, including their logical-owner metadata and masked
+execution padding. Replay capacity and advantages count logical groups/owners,
+not physical segments.
+
+Recovery schema 4 is required for CC. Obsolete CC snapshots using per-segment
+capture identities are rejected, including empty old recovery ledgers; there is
+no migration. Ordinary schema-2/3 recovery remains readable. The independent
+capture schema and its paired Gym/RL requirements are unchanged.
+
+Existing sibling/prompt-group policies apply to controller retries and cold
+restart. The default sibling policy preserves sealed siblings and regenerates
+only unfinished ones. This does not resume an in-progress Gym tool or guarantee
+exactly-once external side effects. A receipt reporting unresolved capture
+acknowledgements stops the run without retrying or clearing uncertain writes;
+other retries use a fresh attempt identity, never replay the old HTTP request.
+Megatron training resume
+loads policy RNG and preserves it across reference-model/wrapper initialization;
+fresh initialization is unchanged.
 
 ### Periodic rollout snapshots
 
