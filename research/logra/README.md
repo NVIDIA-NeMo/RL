@@ -1,7 +1,7 @@
 # LoGRA: low-rank gradient sketches for NeMo RL
 
 Independent research worker for **native GRPO**, without predicted-KL step control.
-Implementation and validation are in progress. No performance claims yet.
+Validated on Qwen2.5-Math-7B with two paired 100-update runs per method.
 
 ## What this shows
 
@@ -81,8 +81,41 @@ environment; it is not the repository's Python 3.13.14 locked environment.
 The workspace lock is checked separately with the repository-pinned uv 0.11.28.
 `analysis/environment.py` records the actual versions and imported source paths.
 
-Results will be recorded after both paired runs finish. Earlier smoke tests are
-excluded from the comparison.
+## Measured results
+
+Fresh native GRPO runs, seeds 42 and 43, 100 updates each. Values below are
+mean ± sample standard deviation across seeds. Earlier smoke tests and historical
+implementations are excluded.
+
+| Metric | Native Dense AdamW | Native GRPO + LoGRA |
+|---|---:|---:|
+| Mean update peak, GiB per training GPU | 36.13 ± 0.03 | 19.36 ± 0.03 |
+| Maximum update peak, GiB per training GPU | 37.28 ± 0.19 | 20.15 ± 0.03 |
+| Final GSM8K subset accuracy, % | 85.35 ± 5.25 | 88.48 ± 1.93 |
+
+The first memory row averages each update's mean GPU peak over all 100 updates;
+the second takes its maximum over updates. These measurements exclude rollout
+GPUs and are not time-averaged or whole-node memory. The mean update peak falls
+by **46.40%**.
+
+| Training seed | Dense final accuracy, % | LoGRA final accuracy, % |
+|---|---:|---:|
+| 42 | 89.06 | 87.11 |
+| 43 | 81.64 | 89.84 |
+
+Both methods improve from 42.97% initial accuracy. LoGRA's final mean is 3.13
+percentage points higher, but two seeds on 256 evaluation questions do not
+establish superiority or equivalence. Dense seed 43 falls from 91.02% at step 90
+to 81.64% at step 100; Dense's best observed accuracy is higher than LoGRA's in
+both seeds. Report the full curves, not only the final point. No smoothing is used.
+
+All 100 training batches match between methods within each seed, and evaluation
+questions match across all steps and seeds. Results and plots are kept outside
+Git; the analysis commands below regenerate them from native TensorBoard logs.
+
+Validation passed: 11 unit tests; two-GPU FSDP numerical equivalence; 7B save/resume
+in both modes; a final-source 7B smoke run; type, lint, format and workspace-lock
+checks; and native test-recipe registration checks.
 
 ## Update rule
 
