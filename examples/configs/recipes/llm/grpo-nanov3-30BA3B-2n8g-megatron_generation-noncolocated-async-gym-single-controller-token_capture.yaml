@@ -50,7 +50,7 @@ async_rl:
     max_lookahead_versions: 1
   min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
   max_inflight_prompts: ${grpo.num_prompts_per_step}
-  max_buffered_rollouts: ${grpo.num_prompts_per_step}
+  max_buffered_rollouts: ${mul:${grpo.num_prompts_per_step}, 2}
 
 logger:
   log_dir: logs/grpo-nanov3-30BA3B-2n8g-megatron_generation-noncolocated-async-gym-single-controller-token_capture
