@@ -116,6 +116,76 @@ def call(index: int, items: list[dict], *, parent: int | None = None) -> CallRec
     )
 
 
+@pytest.mark.parametrize(
+    "item_type",
+    [
+        "custom_tool_call",
+        "computer_call",
+        "local_shell_call",
+        "apply_patch_call",
+        "shell_call",
+        "tool_search_call",
+        "web_search_call",
+        "file_search_call",
+        "code_interpreter_call",
+        "image_generation_call",
+        "mcp_call",
+        "mcp_approval_request",
+        "mcp_list_tools",
+    ],
+)
+@pytest.mark.parametrize("transitions", [False, True])
+@pytest.mark.parametrize("references", [False, True])
+def test_unsupported_generated_item_cannot_be_hidden_by_matching_calls(
+    item_type: str, transitions: bool, references: bool
+) -> None:
+    final = message("final") | {"id": "final"}
+    records = [call(1, [final])]
+    output = [{"type": item_type, "id": "unsupported"}, final]
+    result = {
+        "response": {
+            "id": "response-1",
+            "output": [output] if transitions else output,
+            "contains_transitions": transitions,
+        }
+    }
+    if references:
+        result["ng_trajectory"] = {
+            "turns": [{"model_calls": [{"model_call_id": records[0].model_call_id}]}]
+        }
+    with pytest.raises(
+        ValueError, match=f"Unsupported generated output item.*{item_type}"
+    ):
+        select_captured_calls(records, result)
+
+
+def test_refusal_and_tool_results_keep_supported_selection() -> None:
+    refusal = message("unused") | {
+        "id": "refusal",
+        "content": [{"type": "refusal", "refusal": "I cannot do that."}],
+    }
+    tool_call = {
+        "type": "function_call",
+        "id": "function",
+        "call_id": "tool",
+        "name": "step",
+        "arguments": "{}",
+    }
+    records = [call(1, [tool_call]), call(2, [refusal], parent=1)]
+    result = {
+        "response": {
+            "id": "response-2",
+            "output": [
+                {"role": "user", "content": "task"},
+                tool_call,
+                {"type": "function_call_output", "call_id": "tool", "output": "ok"},
+                refusal,
+            ],
+        }
+    }
+    assert select_captured_calls(records, result) == records
+
+
 def test_exact_ids_distinguish_equal_text_across_reset_and_ignore_old_contract() -> (
     None
 ):
