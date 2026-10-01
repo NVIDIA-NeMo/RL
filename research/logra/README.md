@@ -39,7 +39,7 @@ The 7B smoke configuration is also used to check save/resume with the same DP si
 
 ## Reproduction
 
-Run both commands on separate eight-GPU nodes, from this directory. Repeat with
+Run both commands from this directory on allocated eight-GPU nodes. Repeat with
 `grpo.seed=43` and distinct output directories for the second paired seed.
 
 ```bash
@@ -56,11 +56,11 @@ uv run --locked run_grpo.py --config configs/grpo_logra_7b.yaml \
 | Model | Qwen2.5-Math-7B |
 | Algorithm and reward | Native synchronous GRPO and `hf_math_verify` |
 | Training data | GSM8K training split |
-| Evaluation | First 256 GSM8K test questions, one response per question, every 10 steps |
+| Evaluation | First 256 GSM8K test questions, one response per question, every 10 steps; temperature 1.0, top-p 1.0 |
 | Run length | 100 updates, training seeds 42 and 43 |
 | Batch | 16 prompts × 8 responses; global batch 128, microbatch 1 |
 | Context | 2,048 tokens including the prompt |
-| Hardware per run | 8 GPUs: 4 FSDP2 training ranks and 4 rollout workers |
+| Hardware per run | 8 A100 80GB GPUs: 4 FSDP2 training ranks and 4 rollout workers |
 | Precision | FP32 parameter storage, BF16 computation |
 | Memory options | Activation checkpointing and sequence packing |
 | Learning rate | 5e-6; 50-step linear warmup from 10% of this rate, then constant |
@@ -69,7 +69,8 @@ uv run --locked run_grpo.py --config configs/grpo_logra_7b.yaml \
 
 Dense uses native AdamW. LoGRA uses rank 256, refreshed Rademacher projections,
 projection seed 42, and RowAdam (`beta2=0.95`, `epsilon=1e-8`) on attention and MLP
-linear weights. Other parameters use native AdamW. This experiment does not enable
+linear weights. The selected weights are still updated: only their dense autograd
+gradient buffers are disabled. Other parameters use native AdamW. This experiment does not enable
 predicted-KL step control; the reference-policy KL penalty above belongs to the
 native GRPO loss and is identical in both methods.
 
@@ -132,8 +133,13 @@ memory. Reserved allocator memory and allocation after the update are also logge
 ```bash
 uv run analysis/export_events.py /path/to/results --output /path/to/comparison.csv
 uv run analysis/plot_comparison.py /path/to/comparison.csv --output /path/to/comparison
+uv run analysis/summarize_comparison.py /path/to/comparison.csv --output /path/to/summary.json
 ```
 
 Plotting uses NumPy and Matplotlib. Raw results remain outside the source tree.
 Missing evaluations are left missing; curves are not smoothed. Bands use sample
 standard deviation across seeds where multiple seeds are available.
+
+The summary command requires all 100 update measurements and all scheduled evaluations
+for both seeds. It reports final accuracy separately from the best observed accuracy
+and refuses to compare incomplete runs.

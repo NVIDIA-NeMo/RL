@@ -62,8 +62,8 @@ def main():
     for ax, metric, title, ylabel in zip(
         axes,
         ("memory_gib", "accuracy"),
-        ("Training memory", "Held-out performance"),
-        ("Mean per-GPU update peak (GiB)", "GSM8K accuracy (%)"),
+        ("Policy-training memory", "GSM8K (256 test questions)"),
+        ("Mean per-GPU update peak (GiB)", "Accuracy (%)"),
     ):
         for method, color in colors.items():
             steps = sorted(k[2] for k in measurements if k[:2] == (method, metric))
