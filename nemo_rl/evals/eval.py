@@ -346,7 +346,7 @@ async def _run_env_eval_impl(
                 prompts.append(prompt_dict)
                 prompts_for_display.append(prompt_display)
             elif multi_modal_data:
-                # Placeholder-style processors pass prompt_token_ids with media.
+                # Fallback for custom processors supplying media without text.
                 prompt_token_ids = []
                 for message in message_log:
                     token_ids = message["token_ids"]
