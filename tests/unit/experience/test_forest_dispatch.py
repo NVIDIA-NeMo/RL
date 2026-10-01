@@ -227,8 +227,10 @@ def test_actor_creation_preserves_foundation_no_replay_defaults(
         tokenizer=None,
         enable_router_replay=False,
         use_fastokens=False,
+        turn_checkpointing_enabled=False,
         token_capture={
             "enabled": True,
+            "capture_dir": "/capture",
             "forest_training": forest_training,
             "selection_policy": "returned_history",
         },
