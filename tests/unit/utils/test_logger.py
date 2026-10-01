@@ -26,6 +26,10 @@ import pytest
 import torch
 
 from nemo_rl.utils.logger import (
+    LoggerConfig,
+    MLflowConfig,
+    SwanlabConfig,
+    WandbConfig,
     TELEMETRY_WALL_TIME_METRIC,
     WANDB_CALLER_STEP_METRIC,
     Logger,
@@ -136,9 +140,10 @@ class TestFlattenDict:
 )
 def test_should_log_nemo_gym_full_result_tables(wandb_enabled, table_flag, expected):
     """Full-result Tables require both an active W&B logger and explicit opt-in."""
-    wandb_config = {}
+    kwargs = {}
     if table_flag is not None:
-        wandb_config["log_nemo_gym_full_result_tables"] = table_flag
+        kwargs["log_nemo_gym_full_result_tables"] = table_flag
+    wandb_config = WandbConfig.model_construct(**kwargs)
 
     assert (
         should_log_nemo_gym_full_result_tables(
@@ -405,7 +410,7 @@ class TestWandbLogger:
             "tags": ["tag1", "tag2"],
             "log_nemo_gym_full_result_tables": True,
         }
-        WandbLogger(cfg, log_dir=temp_dir)
+        WandbLogger(WandbConfig.model_construct(**cfg), log_dir=temp_dir)
 
         mock_wandb.init.assert_called_once_with(
             project="custom-project",
@@ -420,7 +425,7 @@ class TestWandbLogger:
     def test_log_metrics(self, mock_wandb):
         """Test logging metrics to WandbLogger."""
         cfg = {}
-        logger = WandbLogger(cfg)
+        logger = WandbLogger(WandbConfig.model_construct(**cfg))
 
         metrics = {"loss": 0.5, "accuracy": 0.8}
         step = 10
@@ -436,7 +441,7 @@ class TestWandbLogger:
     def test_log_metrics_with_prefix(self, mock_wandb):
         """Test logging metrics with a prefix to WandbLogger."""
         cfg = {}
-        logger = WandbLogger(cfg)
+        logger = WandbLogger(WandbConfig.model_construct(**cfg))
 
         metrics = {"loss": 0.5, "accuracy": 0.8}
         step = 10
@@ -456,7 +461,7 @@ class TestWandbLogger:
     def test_log_metrics_with_step_metric(self, mock_wandb):
         """Test logging metrics with a step metric to WandbLogger."""
         cfg = {}
-        logger = WandbLogger(cfg)
+        logger = WandbLogger(WandbConfig.model_construct(**cfg))
 
         # Define step metric
         step_metric = "iteration"
@@ -478,7 +483,7 @@ class TestWandbLogger:
     def test_log_metrics_with_prefix_and_step_metric(self, mock_wandb):
         """Test logging metrics with both prefix and step metric."""
         cfg = {}
-        logger = WandbLogger(cfg)
+        logger = WandbLogger(WandbConfig.model_construct(**cfg))
 
         # Define prefix and step metric
         prefix = "train"
@@ -505,7 +510,7 @@ class TestWandbLogger:
     @patch("nemo_rl.utils.logger.wandb")
     def test_independent_events_do_not_reuse_wandb_internal_step(self, mock_wandb):
         """Telemetry commits must not make a later trainer step stale."""
-        logger = WandbLogger({})
+        logger = WandbLogger(WandbConfig.model_construct())
 
         logger.log_metrics({"loss": 1.0}, step=1, prefix="train")
         logger.log_metrics({"seconds": 5.0}, step=1, prefix="timing/train")
@@ -547,7 +552,7 @@ class TestWandbLogger:
     def test_define_metric(self, mock_wandb):
         """Test defining a metric with a custom step metric."""
         cfg = {}
-        logger = WandbLogger(cfg)
+        logger = WandbLogger(WandbConfig.model_construct(**cfg))
 
         # Define metric pattern and step metric
         logger.define_metric("ray/*", step_metric="ray/ray_step")
@@ -583,7 +588,7 @@ class TestWandbLogger:
 
     @patch("nemo_rl.utils.logger.wandb")
     def test_define_metric_rejects_conflicting_registration(self, mock_wandb):
-        logger = WandbLogger({})
+        logger = WandbLogger(WandbConfig.model_construct())
         logger.define_metric("ray/*", step_metric="ray/ray_step")
 
         with pytest.raises(ValueError, match="already registered"):
@@ -591,14 +596,14 @@ class TestWandbLogger:
 
     @patch("nemo_rl.utils.logger.wandb")
     def test_define_metric_rejects_non_terminal_wildcard(self, mock_wandb):
-        logger = WandbLogger({})
+        logger = WandbLogger(WandbConfig.model_construct())
 
         with pytest.raises(ValueError, match="exactly one trailing"):
             logger.define_metric("ray/*/util", step_metric="ray/ray_step")
 
     @patch("nemo_rl.utils.logger.wandb")
     def test_log_metrics_requires_registered_step_metric(self, mock_wandb):
-        logger = WandbLogger({})
+        logger = WandbLogger(WandbConfig.model_construct())
         logger.define_metric(
             "rollout/throughput/*",
             step_metric=TELEMETRY_WALL_TIME_METRIC,
@@ -612,7 +617,7 @@ class TestWandbLogger:
 
     @patch("nemo_rl.utils.logger.wandb")
     def test_define_metric_uses_longest_matching_prefix(self, mock_wandb):
-        logger = WandbLogger({})
+        logger = WandbLogger(WandbConfig.model_construct())
         logger.define_metric("rollout/*", step_metric="rollout/step")
         logger.define_metric(
             "rollout/throughput/*",
@@ -636,7 +641,7 @@ class TestWandbLogger:
     @patch("nemo_rl.utils.logger.wandb")
     def test_does_not_define_catch_all_metric(self, mock_wandb):
         """Overlapping W&B globs must not choose axes nondeterministically."""
-        WandbLogger({})
+        WandbLogger(WandbConfig.model_construct())
 
         mock_run = mock_wandb.init.return_value
         assert call("*", step_metric=WANDB_CALLER_STEP_METRIC) not in (
@@ -647,7 +652,7 @@ class TestWandbLogger:
     @patch("nemo_rl.utils.logger.wandb")
     def test_registers_teardown_flush(self, mock_wandb, mock_atexit_register):
         """Driver entrypoints flush the final pending row at process exit."""
-        logger = WandbLogger({})
+        logger = WandbLogger(WandbConfig.model_construct())
         logger.log_metrics({"loss": 0.5}, step=7, prefix="train")
 
         mock_atexit_register.assert_called_once_with(logger.finish)
@@ -663,7 +668,7 @@ class TestWandbLogger:
     @patch("nemo_rl.utils.logger.wandb")
     def test_finish_flushes_pending_trainer_row(self, mock_wandb):
         """A final incomplete step is not lost during logger teardown."""
-        logger = WandbLogger({})
+        logger = WandbLogger(WandbConfig.model_construct())
         logger.log_metrics({"loss": 0.5}, step=7, prefix="train")
 
         mock_run = mock_wandb.init.return_value
@@ -683,7 +688,7 @@ class TestWandbLogger:
         histogram_value = MagicMock(name="histogram_value")
         plot_value = MagicMock(name="plot_value")
         mock_wandb.Histogram.return_value = histogram_value
-        logger = WandbLogger({})
+        logger = WandbLogger(WandbConfig.model_construct())
 
         logger.log_metrics({"loss": 0.5}, step=7, prefix="train")
         logger.log_histogram([1.0, 2.0], step=7, name="train/reward_histogram")
@@ -707,7 +712,7 @@ class TestWandbLogger:
     def test_log_hyperparams(self, mock_wandb):
         """Test logging hyperparameters to WandbLogger."""
         cfg = {}
-        logger = WandbLogger(cfg)
+        logger = WandbLogger(WandbConfig.model_construct(**cfg))
 
         params = {"lr": 0.001, "batch_size": 32, "model": {"hidden_size": 128}}
         logger.log_hyperparams(params)
@@ -737,7 +742,7 @@ class TestSwanlabLogger:
             "group": "custom-group",
             "tags": ["tag1", "tag2"],
         }
-        SwanlabLogger(cfg, log_dir=temp_dir)
+        SwanlabLogger(SwanlabConfig.model_construct(**cfg), log_dir=temp_dir)
 
         mock_swanlab.init.assert_called_once_with(
             project="custom-project",
@@ -752,7 +757,7 @@ class TestSwanlabLogger:
     def test_log_metrics(self, mock_swanlab):
         """Test logging metrics to SwanlabLogger."""
         cfg = {}
-        logger = SwanlabLogger(cfg)
+        logger = SwanlabLogger(SwanlabConfig.model_construct(**cfg))
 
         metrics = {"loss": 0.5, "accuracy": 0.8}
         step = 10
@@ -766,7 +771,7 @@ class TestSwanlabLogger:
     def test_log_metrics_with_prefix(self, mock_swanlab):
         """Test logging metrics with a prefix to SwanlabLogger."""
         cfg = {}
-        logger = SwanlabLogger(cfg)
+        logger = SwanlabLogger(SwanlabConfig.model_construct(**cfg))
 
         metrics = {"loss": 0.5, "accuracy": 0.8}
         step = 10
@@ -782,7 +787,7 @@ class TestSwanlabLogger:
     def test_log_metrics_with_step_metric(self, mock_swanlab):
         """Test logging metrics with a step metric to SwanlabLogger."""
         cfg = {}
-        logger = SwanlabLogger(cfg)
+        logger = SwanlabLogger(SwanlabConfig.model_construct(**cfg))
 
         # Define step metric
         step_metric = "iteration"
@@ -801,7 +806,7 @@ class TestSwanlabLogger:
     def test_log_metrics_with_prefix_and_step_metric(self, mock_swanlab):
         """Test logging metrics with both prefix and step metric."""
         cfg = {}
-        logger = SwanlabLogger(cfg)
+        logger = SwanlabLogger(SwanlabConfig.model_construct(**cfg))
 
         # Define prefix and step metric
         prefix = "train"
@@ -826,7 +831,7 @@ class TestSwanlabLogger:
     def test_log_hyperparams(self, mock_swanlab):
         """Test logging hyperparameters to SwanlabLogger."""
         cfg = {}
-        logger = SwanlabLogger(cfg)
+        logger = SwanlabLogger(SwanlabConfig.model_construct(**cfg))
 
         params = {"lr": 0.001, "batch_size": 32, "model": {"hidden_size": 128}}
         logger.log_hyperparams(params)
@@ -857,7 +862,7 @@ class TestMLflowLogger:
             "run_name": "test-run",
             "tracking_uri": None,
         }
-        MLflowLogger(cfg, log_dir=temp_dir)
+        MLflowLogger(MLflowConfig.model_construct(**cfg), log_dir=temp_dir)
 
         mock_mlflow.set_experiment.assert_called_once_with("test-experiment")
         mock_mlflow.start_run.assert_called_once_with(run_name="test-run")
@@ -875,7 +880,7 @@ class TestMLflowLogger:
             "run_name": "test-run",
             "tracking_uri": "http://localhost:5000",
         }
-        MLflowLogger(cfg, log_dir=temp_dir)
+        MLflowLogger(MLflowConfig.model_construct(**cfg), log_dir=temp_dir)
 
         mock_mlflow.set_tracking_uri.assert_called_once_with("http://localhost:5000")
         mock_mlflow.set_experiment.assert_called_once_with("test-experiment")
@@ -889,7 +894,7 @@ class TestMLflowLogger:
             "run_name": "test-run",
             "tracking_uri": None,
         }
-        logger = MLflowLogger(cfg, log_dir=temp_dir)
+        logger = MLflowLogger(MLflowConfig.model_construct(**cfg), log_dir=temp_dir)
 
         metrics = {"loss": 0.5, "accuracy": 0.8}
         step = 10
@@ -909,7 +914,7 @@ class TestMLflowLogger:
             "run_name": "test-run",
             "tracking_uri": None,
         }
-        logger = MLflowLogger(cfg, log_dir=temp_dir)
+        logger = MLflowLogger(MLflowConfig.model_construct(**cfg), log_dir=temp_dir)
 
         metrics = {"loss": 0.5, "accuracy": 0.8}
         step = 10
@@ -937,7 +942,7 @@ class TestMLflowLogger:
             "run_name": "test-run",
             "tracking_uri": None,
         }
-        logger = MLflowLogger(cfg, log_dir=temp_dir)
+        logger = MLflowLogger(MLflowConfig.model_construct(**cfg), log_dir=temp_dir)
 
         metrics = {
             "generation_logger_metrics": {
@@ -983,7 +988,7 @@ class TestMLflowLogger:
             "run_name": "test-run",
             "tracking_uri": None,
         }
-        logger = MLflowLogger(cfg, log_dir=temp_dir)
+        logger = MLflowLogger(MLflowConfig.model_construct(**cfg), log_dir=temp_dir)
 
         params = {"lr": 0.001, "batch_size": 32, "model": {"hidden_size": 128}}
         logger.log_hyperparams(params)
@@ -1007,7 +1012,7 @@ class TestMLflowLogger:
             "run_name": "test-run",
             "tracking_uri": None,
         }
-        logger = MLflowLogger(cfg, log_dir=temp_dir)
+        logger = MLflowLogger(MLflowConfig.model_construct(**cfg), log_dir=temp_dir)
 
         # Mock the figure
         mock_figure = mock_plt.Figure.return_value
@@ -1027,7 +1032,7 @@ class TestMLflowLogger:
             "run_name": "test-run",
             "tracking_uri": None,
         }
-        logger = MLflowLogger(cfg, log_dir=temp_dir)
+        logger = MLflowLogger(MLflowConfig.model_construct(**cfg), log_dir=temp_dir)
 
         # Reset mocks to avoid counting calls from init
         mock_mlflow.end_run.reset_mock()
@@ -1051,7 +1056,7 @@ class TestMLflowLogger:
         }
         mock_mlflow.get_experiment_by_name.return_value = None
 
-        MLflowLogger(cfg, log_dir=None)
+        MLflowLogger(MLflowConfig.model_construct(**cfg), log_dir=None)
 
         # Verify create_experiment was called without artifact_location
         mock_mlflow.create_experiment.assert_called_once_with(
@@ -1072,7 +1077,7 @@ class TestMLflowLogger:
         }
         mock_mlflow.get_experiment_by_name.return_value = None
 
-        MLflowLogger(cfg, log_dir="/custom/path")
+        MLflowLogger(MLflowConfig.model_construct(**cfg), log_dir="/custom/path")
 
         # Verify create_experiment was called with artifact_location
         mock_mlflow.create_experiment.assert_called_once_with(
@@ -1096,7 +1101,7 @@ class TestMLflowLogger:
         }
         mock_mlflow.get_experiment_by_name.return_value = None
 
-        MLflowLogger(cfg, log_dir="/fallback/path")
+        MLflowLogger(MLflowConfig.model_construct(**cfg), log_dir="/fallback/path")
 
         # Verify create_experiment was called with artifact_location from config
         mock_mlflow.create_experiment.assert_called_once_with(
@@ -1121,7 +1126,7 @@ class TestMLflowLogger:
         }
         mock_mlflow.get_experiment_by_name.return_value = None
 
-        MLflowLogger(cfg, log_dir="/fallback/path")
+        MLflowLogger(MLflowConfig.model_construct(**cfg), log_dir="/fallback/path")
 
         # Verify create_experiment was called with log_dir since config is None
         mock_mlflow.create_experiment.assert_called_once_with(
@@ -1146,7 +1151,7 @@ class TestMLflowLogger:
         mock_mlflow.get_experiment_by_name.return_value = None
 
         log_dir = "/fallback/path"
-        MLflowLogger(cfg, log_dir=log_dir)
+        MLflowLogger(MLflowConfig.model_construct(**cfg), log_dir=log_dir)
 
         # Verify create_experiment was called with log_dir as artifact_location
         mock_mlflow.create_experiment.assert_called_once_with(
@@ -1673,7 +1678,7 @@ ray_node_gram_used{{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"}} {80.0 * 1024}
             "tensorboard": {"log_dir": "test_logs"},
             "log_dir": temp_dir,
         }
-        logger = Logger(cfg)
+        logger = Logger(LoggerConfig.model_validate(**cfg))
 
         # Check that regular loggers were initialized
         assert len(logger.loggers) == 2
@@ -1719,7 +1724,7 @@ ray_node_gram_used{{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"}} {80.0 * 1024}
             "tensorboard": {"log_dir": "test_logs"},
             "log_dir": temp_dir,
         }
-        logger = Logger(cfg)
+        logger = Logger(LoggerConfig.model_validate(**cfg))
 
         # Check that only tensorboard logger was initialized
         assert len(logger.loggers) == 1
@@ -1758,7 +1763,7 @@ ray_node_gram_used{{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"}} {80.0 * 1024}
             },
             "log_dir": temp_dir,
         }
-        logger = Logger(cfg)
+        logger = Logger(LoggerConfig.model_validate(**cfg))
 
         # Check that regular loggers were NOT initialized
         assert len(logger.loggers) == 0
@@ -1807,7 +1812,7 @@ class TestLogger:
             "monitor_gpus": False,
             "log_dir": temp_dir,
         }
-        logger = Logger(cfg)
+        logger = Logger(LoggerConfig.model_validate(**cfg))
 
         assert len(logger.loggers) == 0
         mock_tb_logger.assert_not_called()
@@ -1826,7 +1831,7 @@ class TestLogger:
             "wandb": {"project": "test-project"},
             "log_dir": temp_dir,
         }
-        logger = Logger(cfg)
+        logger = Logger(LoggerConfig.model_validate(**cfg))
 
         assert len(logger.loggers) == 1
         mock_wandb_logger.assert_called_once()
@@ -1848,7 +1853,7 @@ class TestLogger:
             "swanlab": {"project": "test-project"},
             "log_dir": temp_dir,
         }
-        logger = Logger(cfg)
+        logger = Logger(LoggerConfig.model_validate(**cfg))
 
         assert len(logger.loggers) == 1
         mock_swanlab_logger.assert_called_once()
@@ -1869,7 +1874,7 @@ class TestLogger:
             "tensorboard": {"log_dir": "test_logs"},
             "log_dir": temp_dir,
         }
-        logger = Logger(cfg)
+        logger = Logger(LoggerConfig.model_validate(**cfg))
 
         assert len(logger.loggers) == 1
         mock_tb_logger.assert_called_once()
@@ -1891,7 +1896,7 @@ class TestLogger:
             "tensorboard": {"log_dir": "test_logs"},
             "log_dir": temp_dir,
         }
-        logger = Logger(cfg)
+        logger = Logger(LoggerConfig.model_validate(**cfg))
 
         assert len(logger.loggers) == 2
         mock_wandb_logger.assert_called_once()
@@ -1916,7 +1921,7 @@ class TestLogger:
             "tensorboard": {"log_dir": "test_logs"},
             "log_dir": temp_dir,
         }
-        logger = Logger(cfg)
+        logger = Logger(LoggerConfig.model_validate(**cfg))
 
         # Create mock logger instances
         mock_wandb_instance = mock_wandb_logger.return_value
@@ -1953,7 +1958,7 @@ class TestLogger:
             "tensorboard": {"log_dir": "test_logs"},
             "log_dir": temp_dir,
         }
-        logger = Logger(cfg)
+        logger = Logger(LoggerConfig.model_validate(**cfg))
 
         metrics = {
             "loss": 0.5,
@@ -1999,7 +2004,7 @@ class TestLogger:
             "wandb": {"project": "test-project"},
             "log_dir": temp_dir,
         }
-        logger = Logger(cfg)
+        logger = Logger(LoggerConfig.model_validate(**cfg))
 
         logger.log_metrics(
             {"agent/reward/histogram": [0.1, 0.2]}, step=10, prefix="train"
@@ -2022,7 +2027,7 @@ class TestLogger:
             "wandb": {"project": "test-project"},
             "log_dir": temp_dir,
         }
-        logger = Logger(cfg)
+        logger = Logger(LoggerConfig.model_validate(**cfg))
 
         logger.log_metrics(
             {"histogram/gen_tokens_length": [10, 20]},
@@ -2051,7 +2056,7 @@ class TestLogger:
             "tensorboard": {"log_dir": "test_logs"},
             "log_dir": temp_dir,
         }
-        logger = Logger(cfg)
+        logger = Logger(LoggerConfig.model_validate(**cfg))
 
         logger.define_metric(
             "rollout/throughput/*",
@@ -2078,7 +2083,7 @@ class TestLogger:
             "tensorboard": {"log_dir": "test_logs"},
             "log_dir": temp_dir,
         }
-        logger = Logger(cfg)
+        logger = Logger(LoggerConfig.model_validate(**cfg))
 
         # Create mock logger instances
         mock_wandb_instance = mock_wandb_logger.return_value
@@ -2112,7 +2117,7 @@ class TestLogger:
             "tensorboard": {"log_dir": "test_logs"},
             "log_dir": temp_dir,
         }
-        logger = Logger(cfg)
+        logger = Logger(LoggerConfig.model_validate(**cfg))
 
         # Check that regular loggers were initialized
         assert len(logger.loggers) == 2
@@ -2154,7 +2159,7 @@ class TestLogger:
             "tensorboard": {"log_dir": "test_logs"},
             "log_dir": temp_dir,
         }
-        logger = Logger(cfg)
+        logger = Logger(LoggerConfig.model_validate(**cfg))
 
         # Create mock logger instances
         mock_wandb_instance = mock_wandb_logger.return_value
@@ -2193,7 +2198,7 @@ class TestLogger:
             "tensorboard": {"log_dir": "test_logs"},
             "log_dir": temp_dir,
         }
-        logger = Logger(cfg)
+        logger = Logger(LoggerConfig.model_validate(**cfg))
 
         # Create mock logger instances
         mock_wandb_instance = mock_wandb_logger.return_value
@@ -2254,7 +2259,7 @@ class TestLogger:
             },
             "log_dir": temp_dir,
         }
-        logger = Logger(cfg)
+        logger = Logger(LoggerConfig.model_validate(**cfg))
 
         assert len(logger.loggers) == 1
         mock_wandb_logger.assert_not_called()
@@ -2290,7 +2295,7 @@ class TestLogger:
             },
             "log_dir": temp_dir,
         }
-        logger = Logger(cfg)
+        logger = Logger(LoggerConfig.model_validate(**cfg))
 
         assert len(logger.loggers) == 4
         mock_wandb_logger.assert_called_once()
@@ -2327,7 +2332,7 @@ class TestLogger:
             },
             "log_dir": temp_dir,
         }
-        logger = Logger(cfg)
+        logger = Logger(LoggerConfig.model_validate(**cfg))
 
         # Create mock logger instances
         mock_wandb_instance = mock_wandb_logger.return_value
@@ -2378,7 +2383,7 @@ class TestLogger:
             "mlflow": {"experiment_name": "test-experiment"},
             "log_dir": temp_dir,
         }
-        logger = Logger(cfg)
+        logger = Logger(LoggerConfig.model_validate(**cfg))
 
         # Create mock logger instances
         mock_wandb_instance = mock_wandb_logger.return_value

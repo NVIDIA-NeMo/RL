@@ -35,7 +35,7 @@ import wandb
 from matplotlib import pyplot as plt
 from prometheus_client.parser import text_string_to_metric_families
 from prometheus_client.samples import Sample
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from rich.box import ROUNDED
 from rich.console import Console
 from rich.logging import RichHandler
@@ -61,19 +61,19 @@ TELEMETRY_WALL_TIME_METRIC = "telemetry/wall_time_seconds"
 
 
 class WandbConfig(BaseModel, extra="allow"):
-    project: Optional[str] = None
-    name: Optional[str] = None
+    project: str
+    name: str
     entity: Optional[str] = None
     id: Optional[str] = None
     resume: Optional[str] = None
     # Log complete NeMo Gym result payloads as W&B Tables. These payloads can be
     # very large, so the recommended default is false.
-    log_nemo_gym_full_result_tables: Optional[bool] = None
+    log_nemo_gym_full_result_tables: bool = False
 
 
 class SwanlabConfig(BaseModel, extra="allow"):
-    project: Optional[str] = None
-    name: Optional[str] = None
+    project: str
+    name: str
 
 
 class TensorboardConfig(BaseModel, extra="allow"):
@@ -89,30 +89,44 @@ class MLflowConfig(BaseModel, extra="allow"):
 
 
 class GPUMonitoringConfig(BaseModel, extra="allow"):
-    collection_interval: int | float
-    flush_interval: int | float
+    collection_interval: float = 10
+    flush_interval: float = 10
 
 
 class LoggerConfig(BaseModel, extra="allow"):
     log_dir: str
-    wandb_enabled: bool
-    swanlab_enabled: bool
-    tensorboard_enabled: bool
-    mlflow_enabled: bool
-    wandb: WandbConfig
+    wandb_enabled: bool = False
+    swanlab_enabled: bool = False
+    tensorboard_enabled: bool = False
+    mlflow_enabled: bool = False
+    wandb: Optional[WandbConfig] = None
     tensorboard: Optional[TensorboardConfig] = None
     swanlab: Optional[SwanlabConfig] = None
     mlflow: Optional[MLflowConfig] = None
-    monitor_gpus: bool
+    monitor_gpus: bool = True
     gpu_monitoring: GPUMonitoringConfig
-    num_val_samples_to_print: Optional[int] = None
+    num_val_samples_to_print: int = 0
+
+    @model_validator(mode="after")
+    def _require_block_for_enabled_backends(self) -> "LoggerConfig":
+        for flag, block in (
+            ("wandb", self.wandb),
+            ("swanlab", self.swanlab),
+            ("tensorboard", self.tensorboard),
+            ("mlflow", self.mlflow),
+        ):
+            if getattr(self, f"{flag}_enabled") and block is None:
+                raise ValueError(
+                    f"logger.{flag}_enabled=true requires a logger.{flag} block."
+                )
+        return self
 
 
 def should_log_nemo_gym_full_result_tables(
     *, wandb_enabled: bool, wandb_config: WandbConfig
 ) -> bool:
     """Return whether complete NeMo Gym results should become W&B Tables."""
-    return wandb_enabled and bool(wandb_config.log_nemo_gym_full_result_tables)
+    return wandb_enabled and wandb_config.log_nemo_gym_full_result_tables
 
 
 class LoggerInterface(ABC):
@@ -1216,20 +1230,12 @@ class Logger(LoggerInterface):
         if cfg.swanlab_enabled:
             swanlab_log_dir = os.path.join(self.base_log_dir, "swanlab")
             os.makedirs(swanlab_log_dir, exist_ok=True)
-            if cfg.swanlab is None:
-                raise ValueError(
-                    "logger.swanlab_enabled=true requires a logger.swanlab block."
-                )
             self.swanlab_logger = SwanlabLogger(cfg.swanlab, log_dir=swanlab_log_dir)
             self.loggers.append(self.swanlab_logger)
 
         if cfg.tensorboard_enabled:
             tensorboard_log_dir = os.path.join(self.base_log_dir, "tensorboard")
             os.makedirs(tensorboard_log_dir, exist_ok=True)
-            if cfg.tensorboard is None:
-                raise ValueError(
-                    "logger.tensorboard_enabled=true requires a logger.tensorboard block."
-                )
             tensorboard_logger = TensorboardLogger(
                 cfg.tensorboard, log_dir=tensorboard_log_dir
             )
@@ -1240,10 +1246,6 @@ class Logger(LoggerInterface):
             if mlflow_log_dir:
                 mlflow_log_dir = os.path.join(mlflow_log_dir, "mlflow")
                 os.makedirs(mlflow_log_dir, exist_ok=True)
-            if cfg.mlflow is None:
-                raise ValueError(
-                    "logger.mlflow_enabled=true requires a logger.mlflow block."
-                )
             mlflow_logger = MLflowLogger(cfg.mlflow, log_dir=mlflow_log_dir)
             self.loggers.append(mlflow_logger)
 

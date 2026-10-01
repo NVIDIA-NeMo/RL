@@ -67,7 +67,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     _warn_unsupported_in_flight_refit_pause_once,
 )
-from nemo_rl.utils.logger import LoggerConfig
+from nemo_rl.utils.logger import WandbConfig, LoggerConfig
 
 
 @ray.remote(num_cpus=0)
@@ -2437,7 +2437,9 @@ class TestAsyncTrajectoryCollector:
             logger=LoggerConfig.model_construct(
                 **{
                     "wandb_enabled": False,
-                    "wandb": {"log_nemo_gym_full_result_tables": False},
+                    "wandb": WandbConfig.model_construct(
+                        log_nemo_gym_full_result_tables=False
+                    ),
                 }
             ),
         )

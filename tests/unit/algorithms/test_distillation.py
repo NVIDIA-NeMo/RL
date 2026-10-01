@@ -34,7 +34,7 @@ from nemo_rl.algorithms.loss import DistillationLossConfig, DistillationLossFn
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
-from nemo_rl.utils.logger import LoggerConfig
+from nemo_rl.utils.logger import WandbConfig, LoggerConfig
 
 
 @pytest.fixture
@@ -180,7 +180,9 @@ def mock_components():
                 **{
                     "num_val_samples_to_print": 5,
                     "wandb_enabled": False,
-                    "wandb": {"log_nemo_gym_full_result_tables": False},
+                    "wandb": WandbConfig.model_construct(
+                        log_nemo_gym_full_result_tables=False
+                    ),
                 }
             ),
             "cluster": ClusterConfig(num_nodes=1, gpus_per_node=2),

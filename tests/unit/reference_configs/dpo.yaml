@@ -305,7 +305,7 @@ logger:
     entity: null
     id: null
     resume: null
-    log_nemo_gym_full_result_tables: null
+    log_nemo_gym_full_result_tables: false
   swanlab:
     project: "dpo-dev"
     name: "dpo"
