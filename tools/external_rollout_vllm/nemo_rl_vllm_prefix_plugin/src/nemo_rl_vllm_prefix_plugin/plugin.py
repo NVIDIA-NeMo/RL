@@ -1,6 +1,7 @@
 """vLLM endpoint plugin for NeMo RL multi-turn prefix-token preservation."""
 
 import asyncio
+import os
 from argparse import Namespace
 from http import HTTPStatus
 from importlib.metadata import version
@@ -34,7 +35,29 @@ from .route_override import (
 )
 
 PLUGIN_NAME = "nemo_rl_prefix_api"
-PLUGIN_VERSION = "0.2.0"
+
+_EXECUTOR_READY = False
+
+
+def _ensure_executor() -> None:
+    """Widen the event loop's default thread pool once.
+
+    Prefix fetches and commits run in ``asyncio.to_thread``; the default pool
+    (min(32, cpus + 4)) caps how many bridge calls an engine can have in flight
+    and queues every other request behind them under RL load.
+    """
+    global _EXECUTOR_READY
+    if _EXECUTOR_READY:
+        return
+    _EXECUTOR_READY = True
+    workers = int(os.environ.get("NEMO_RL_PREFIX_PLUGIN_THREADS", "128"))
+    if workers > 0:
+        from concurrent.futures import ThreadPoolExecutor
+
+        asyncio.get_running_loop().set_default_executor(
+            ThreadPoolExecutor(max_workers=workers, thread_name_prefix="nrl-prefix")
+        )
+PLUGIN_VERSION = "0.3.0"
 SUPPORTED_VLLM_VERSIONS = ("0.29.0", "0.30.0")
 SUPPORTED_VLLM_VERSION = SUPPORTED_VLLM_VERSIONS[-1]  # newest verified; kept for tooling
 CAPABILITY_PATH = "/v1/nemo-rl/prefix-token-capability"
@@ -101,6 +124,7 @@ class NeMoRLPrefixEndpointPlugin:
             request: NeMoRLChatCompletionRequest,
             raw_request: Request,
         ):
+            _ensure_executor()
             handler = raw_request.app.state.openai_serving_chat
             if handler is None:
                 raise NotImplementedError(

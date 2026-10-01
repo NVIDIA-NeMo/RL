@@ -57,36 +57,55 @@ def set_remote_token_capture_weight_version(
     version: int,
     timeout_s: float = 30.0,
 ) -> None:
-    """Rotate the bridge version without carrying its live server across Ray."""
+    """Rotate the bridge version without carrying its live server across Ray.
+
+    ``bridge_url`` may be a comma-separated list (a bridge worker pool); every
+    endpoint is rotated so commits stamp the same version regardless of which
+    worker serves them.
+    """
     if type(version) is not int or version < 0:
         raise ValueError(f"weight version must be a non-negative int, got {version!r}")
-    request = urllib.request.Request(
-        f"{bridge_url.rstrip('/')}{WEIGHT_VERSION_PATH}",
-        data=json.dumps({"weight_version": version}).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {auth_token}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout_s) as response:
-            response.read()
-    except urllib.error.HTTPError as error:
-        detail = error.read(2048).decode("utf-8", errors="replace")
-        raise RuntimeError(
-            f"Token-capture bridge returned HTTP {error.code} for "
-            f"{request.full_url}: {detail}"
-        ) from error
-    except urllib.error.URLError as error:
-        raise RuntimeError(
-            f"Could not reach token-capture bridge at {request.full_url}: "
-            f"{error.reason}"
-        ) from error
+    urls = [part.strip() for part in bridge_url.split(",") if part.strip()]
+    if not urls:
+        raise ValueError("bridge_url must name at least one endpoint")
+    for url in urls:
+        request = urllib.request.Request(
+            f"{url.rstrip('/')}{WEIGHT_VERSION_PATH}",
+            data=json.dumps({"weight_version": version}).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {auth_token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout_s) as response:
+                response.read()
+        except urllib.error.HTTPError as error:
+            detail = error.read(2048).decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"Token-capture bridge returned HTTP {error.code} for "
+                f"{request.full_url}: {detail}"
+            ) from error
+        except urllib.error.URLError as error:
+            raise RuntimeError(
+                f"Could not reach token-capture bridge at {request.full_url}: "
+                f"{error.reason}"
+            ) from error
 
 
 class RemoteVllmTokenCaptureBridge:
-    """Serve token-prefix reads and staged-call commits to external vLLM."""
+    """Serve token-prefix reads and staged-call commits to external vLLM.
+
+    With ``num_workers=0`` the bridge runs as a thread in this process. That
+    shares the SingleController's GIL with the training loop, and at ~1k model
+    calls/min (a prefix fetch plus a commit each) it saturates. With
+    ``num_workers > 0`` the bridge instead starts that many Ray actors, each
+    serving the same staging partition through its own data-plane client
+    (built from ``dp_cfg`` with ``bootstrap=False``), and advertises them as one
+    comma-joined ``base_url``. The serving plugin (>= 0.2.2) round-robins
+    across the endpoints, so any worker can serve any call.
+    """
 
     def __init__(
         self,
@@ -94,7 +113,19 @@ class RemoteVllmTokenCaptureBridge:
         dp_client: Any,
         staging_partition: str,
         auth_token: str,
+        num_workers: int = 0,
+        dp_cfg: dict[str, Any] | None = None,
     ) -> None:
+        if type(num_workers) is not int or num_workers < 0:
+            raise ValueError(
+                f"num_workers must be a non-negative int, got {num_workers!r}"
+            )
+        if num_workers > 0 and dp_cfg is None:
+            raise ValueError("dp_cfg is required when num_workers > 0")
+        self._num_workers = num_workers
+        self._dp_cfg = dict(dp_cfg) if dp_cfg is not None else None
+        self._staging_partition = staging_partition
+        self._workers: list[Any] = []
         self._source = TQTokenSource(
             dp_client,
             staging_partition=staging_partition,
@@ -123,6 +154,11 @@ class RemoteVllmTokenCaptureBridge:
             )
         with self._weight_version_lock:
             self._weight_version = version
+        if self._workers:
+            ray.get(
+                [worker.set_weight_version.remote(version) for worker in self._workers],
+                timeout=60,
+            )
 
     def _authorize(self, request: Request) -> None:
         if request.headers.get("Authorization") != f"Bearer {self._auth_token}":
@@ -246,8 +282,11 @@ class RemoteVllmTokenCaptureBridge:
 
     def start(self) -> None:
         """Start the bridge on the controller node and wait until it is ready."""
-        if self._thread is not None:
+        if self._thread is not None or self._workers:
             raise RuntimeError("token-capture bridge is already running")
+        if self._num_workers > 0:
+            self._start_workers()
+            return
         bind_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         bind_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         bind_socket.bind(("0.0.0.0", 0))
@@ -281,8 +320,44 @@ class RemoteVllmTokenCaptureBridge:
             self.stop()
             raise RuntimeError("token-capture bridge did not start within 30 seconds")
 
+    def _start_workers(self) -> None:
+        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+        # Prefer the controller node, but any node with a spare CPU will do.
+        strategy = NodeAffinitySchedulingStrategy(
+            node_id=ray.get_runtime_context().get_node_id(), soft=True
+        )
+        workers = [
+            _BridgeWorker.options(scheduling_strategy=strategy).remote(
+                self._dp_cfg,
+                self._staging_partition,
+                self._auth_token,
+                self._current_weight_version(),
+            )
+            for _ in range(self._num_workers)
+        ]
+        try:
+            urls = ray.get(
+                [worker.base_url.remote() for worker in workers], timeout=300
+            )
+        except Exception:
+            for worker in workers:
+                ray.kill(worker, no_restart=True)
+            raise
+        self._workers = workers
+        self.base_url = ",".join(urls)
+        LOGGER.info("token-capture bridge: %d workers at %s", len(urls), self.base_url)
+
     def stop(self) -> None:
-        """Stop the bridge and release its listening socket."""
+        """Stop the bridge and release its listening socket(s)."""
+        workers, self._workers = self._workers, []
+        if workers:
+            try:
+                ray.get([worker.stop.remote() for worker in workers], timeout=30)
+            except Exception:  # pragma: no cover - shutdown best effort
+                LOGGER.warning("token-capture bridge workers did not stop cleanly")
+            for worker in workers:
+                ray.kill(worker, no_restart=True)
         server = self._server
         thread = self._thread
         if server is not None:
@@ -295,3 +370,35 @@ class RemoteVllmTokenCaptureBridge:
         self._server = None
         self._thread = None
         self.base_url = None
+
+
+@ray.remote(num_cpus=1)
+class _BridgeWorker:
+    """One in-process bridge in its own Ray actor (see ``num_workers``)."""
+
+    def __init__(
+        self,
+        dp_cfg: dict[str, Any],
+        staging_partition: str,
+        auth_token: str,
+        weight_version: int,
+    ) -> None:
+        from nemo_rl.data_plane.factory import build_data_plane_client
+
+        self._bridge = RemoteVllmTokenCaptureBridge(
+            dp_client=build_data_plane_client(dp_cfg, bootstrap=False),
+            staging_partition=staging_partition,
+            auth_token=auth_token,
+        )
+        self._bridge.set_weight_version(weight_version)
+        self._bridge.start()
+
+    def base_url(self) -> str:
+        assert self._bridge.base_url is not None
+        return self._bridge.base_url
+
+    def set_weight_version(self, version: int) -> None:
+        self._bridge.set_weight_version(version)
+
+    def stop(self) -> None:
+        self._bridge.stop()

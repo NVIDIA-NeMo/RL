@@ -16,7 +16,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent
 PACKAGE_ROOT = PROJECT_ROOT / "src/nemo_rl_vllm_prefix_plugin"
 DISTRIBUTION = "nemo_rl_vllm_prefix_plugin"
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 DIST_INFO = f"{DISTRIBUTION}-{VERSION}.dist-info"
 WHEEL_NAME = f"{DISTRIBUTION}-{VERSION}-py3-none-any.whl"
 

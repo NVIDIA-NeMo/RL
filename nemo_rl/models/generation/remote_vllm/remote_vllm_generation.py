@@ -14,6 +14,7 @@
 
 """GenerationInterface facade for a vLLM server outside NeMo-RL's Ray cluster."""
 
+import os
 import secrets
 from typing import TYPE_CHECKING, Any
 
@@ -129,17 +130,20 @@ class RemoteVllmGeneration(GenerationInterface):
         dp_client: Any,
     ) -> None:
         """Bridge external serving processes to controller-owned token staging."""
-        del dp_cfg
         if (
             self._token_capture_bridge is not None
             or self._token_capture_bridge_url is not None
         ):
             raise RuntimeError("remote vLLM token capture is already configured")
         auth_token = secrets.token_hex(32)
+        # NRL_REMOTE_VLLM_BRIDGE_WORKERS > 0 serves the bridge from that many
+        # Ray actors; 0 keeps it as a thread in this process.
         bridge = RemoteVllmTokenCaptureBridge(
             dp_client=dp_client,
             staging_partition=staging_partition,
             auth_token=auth_token,
+            num_workers=int(os.environ.get("NRL_REMOTE_VLLM_BRIDGE_WORKERS", "8")),
+            dp_cfg=dp_cfg,
         )
         bridge.start()
         assert bridge.base_url is not None

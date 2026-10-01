@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
+from array import array
+from collections import OrderedDict
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -17,39 +20,68 @@ def _service_url(base_url: str, path: str) -> str:
 
 
 class CaptureBridgeClient:
-    """Blocking stdlib client for the controller-side staging bridge."""
+    """Blocking stdlib client for the controller-side staging bridge.
+
+    ``base_url`` may name several bridge endpoints separated by commas (the
+    controller runs a pool of bridge workers); calls round-robin across them
+    and fall over to the next endpoint when one is unreachable.
+    """
 
     def __init__(self, *, base_url: str, auth_token: str) -> None:
-        if not base_url.startswith(("http://", "https://")):
-            raise ValueError("bridge_url must start with http:// or https://")
+        urls = [part.strip().rstrip("/") for part in base_url.split(",") if part.strip()]
+        if not urls or any(not url.startswith(("http://", "https://")) for url in urls):
+            raise ValueError("bridge_url must be one or more http(s):// URLs separated by commas")
         if not auth_token:
             raise ValueError("auth_token must be non-empty")
-        self._base_url = base_url.rstrip("/")
+        self._base_urls = urls
+        self._base_url = urls[0]
         self._auth_token = auth_token
+        self._rr_lock = threading.Lock()
+        self._rr_index = 0
+
+    @property
+    def base_urls(self) -> list[str]:
+        return list(self._base_urls)
+
+    def _next_base_url(self) -> str:
+        with self._rr_lock:
+            url = self._base_urls[self._rr_index % len(self._base_urls)]
+            self._rr_index += 1
+        return url
 
     def _post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
-        request = urllib.request.Request(
-            _service_url(self._base_url, path),
-            data=json.dumps(body).encode("utf-8"),
-            headers={
-                "Accept": "application/json",
-                "Authorization": f"Bearer {self._auth_token}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=1800.0) as response:
-                payload = response.read()
-        except urllib.error.HTTPError as error:
-            detail = error.read(2048).decode("utf-8", errors="replace")
+        data = json.dumps(body).encode("utf-8")
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {self._auth_token}",
+            "Content-Type": "application/json",
+        }
+        attempts = len(self._base_urls)
+        last_error: Exception | None = None
+        payload = b""
+        for _ in range(attempts):
+            base_url = self._next_base_url()
+            request = urllib.request.Request(
+                _service_url(base_url, path), data=data, headers=headers, method="POST"
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=1800.0) as response:
+                    payload = response.read()
+                last_error = None
+                break
+            except urllib.error.HTTPError as error:
+                detail = error.read(2048).decode("utf-8", errors="replace")
+                raise RuntimeError(
+                    f"token-capture bridge returned HTTP {error.code}: {detail}"
+                ) from error
+            except urllib.error.URLError as error:
+                # Connection-level failure: try the next endpoint in the pool.
+                last_error = error
+                continue
+        if last_error is not None:
             raise RuntimeError(
-                f"token-capture bridge returned HTTP {error.code}: {detail}"
-            ) from error
-        except urllib.error.URLError as error:
-            raise RuntimeError(
-                f"could not reach token-capture bridge: {error.reason}"
-            ) from error
+                f"could not reach token-capture bridge: {getattr(last_error, 'reason', last_error)}"
+            ) from last_error
         decoded = json.loads(payload)
         if not isinstance(decoded, dict):
             raise RuntimeError("token-capture bridge returned a non-object response")
@@ -91,6 +123,39 @@ class CaptureRuntime:
         self._lock = threading.Lock()
         self._bridge: CaptureBridgeClient | None = None
         self._pending: dict[int, _PendingCapture] = {}
+        # Local copy of the token deltas this engine staged, keyed by staging
+        # key. A rollout's next turn arrives with staging_chain = its parents'
+        # keys; when every key is here the exact prefix is rebuilt locally and
+        # the bridge round-trip is skipped (the load balancer pins a rollout to
+        # one engine, so this is the common case).
+        self._delta_cache: OrderedDict[str, array] = OrderedDict()
+        self._delta_cache_max = int(os.environ.get("NEMO_RL_PREFIX_CACHE_ENTRIES", "50000"))
+        self.cache_hits = 0
+        self.cache_misses = 0
+
+    def _cache_delta(self, staging_key: str, delta: list[int]) -> None:
+        if self._delta_cache_max <= 0 or not staging_key:
+            return
+        packed = array("i", delta)
+        with self._lock:
+            self._delta_cache[staging_key] = packed
+            self._delta_cache.move_to_end(staging_key)
+            while len(self._delta_cache) > self._delta_cache_max:
+                self._delta_cache.popitem(last=False)
+
+    def _prefix_from_cache(self, staging_chain: list[str]) -> list[int] | None:
+        prefix: list[int] = []
+        with self._lock:
+            for key in staging_chain:
+                packed = self._delta_cache.get(key)
+                if packed is None:
+                    self.cache_misses += 1
+                    return None
+                prefix.extend(packed.tolist())
+            for key in staging_chain:
+                self._delta_cache.move_to_end(key)
+            self.cache_hits += 1
+        return prefix
 
     def configure(self, *, bridge_url: str, auth_token: str) -> None:
         """Replace the staging bridge used for subsequent requests."""
@@ -136,7 +201,11 @@ class CaptureRuntime:
                     "token_in admission must carry required_prefix_token_ids "
                     "or a non-empty staging_chain"
                 )
-            prefix = self._require_bridge().fetch_prefix(staging_chain)
+            cached = self._prefix_from_cache([str(key) for key in staging_chain])
+            if cached is not None and len(cached) == prev_len:
+                prefix = cached
+            else:
+                prefix = self._require_bridge().fetch_prefix(staging_chain)
         if len(prefix) != prev_len:
             raise ValueError(
                 f"resolved prefix length {len(prefix)} does not equal prev_len {prev_len}"
@@ -206,6 +275,12 @@ class CaptureRuntime:
                 "extras": extras,
             }
         )
+        if coords.get("disposition") == "staged" and coords.get("staging_key"):
+            prev_len = len(pending.prefix_token_ids)
+            self._cache_delta(
+                str(coords["staging_key"]),
+                list(pending.prompt_token_ids[prev_len:]) + list(generated_ids),
+            )
         for choice in content.get("choices") or []:
             if not isinstance(choice, dict):
                 continue

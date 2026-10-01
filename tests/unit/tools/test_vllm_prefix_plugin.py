@@ -252,11 +252,82 @@ async def test_renderer_patch_resolves_ng_capture_and_records_engine_prompt():
     ]
 
 
+def test_capture_bridge_client_round_robins_and_fails_over(monkeypatch):
+    import urllib.error
+
+    from nemo_rl_vllm_prefix_plugin.capture_runtime import CaptureBridgeClient
+
+    client = CaptureBridgeClient(
+        base_url="http://a:1/, http://b:2", auth_token="t"
+    )
+    assert client.base_urls == ["http://a:1", "http://b:2"]
+    seen = []
+
+    class _Resp:
+        def __init__(self, body):
+            self._body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return self._body
+
+    def fake_urlopen(request, timeout):
+        seen.append(request.full_url)
+        if request.full_url.startswith("http://a:1"):
+            raise urllib.error.URLError("down")
+        return _Resp(b'{"prefix_token_ids": [1, 2]}')
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    assert client.fetch_prefix(["k"]) == [1, 2]
+    assert client.fetch_prefix(["k"]) == [1, 2]
+    # First call tried a (down) then b; second call went to b directly (round robin
+    # continued past a) or retried a then b — either way every call succeeded.
+    assert all(url.startswith("http://") for url in seen)
+    assert any(url.startswith("http://b:2") for url in seen)
+
+
+def test_capture_runtime_prefix_cache_skips_bridge_for_known_chain():
+    from nemo_rl_vllm_prefix_plugin.capture_runtime import CaptureRuntime
+
+    runtime = CaptureRuntime()
+
+    class _Bridge:
+        calls = 0
+
+        def fetch_prefix(self, chain):
+            self.calls += 1
+            return [9, 9, 9]
+
+        def commit(self, body):
+            return {"disposition": "staged", "staging_key": "k1"}
+
+    bridge = _Bridge()
+    runtime._bridge = bridge
+    # Turn 1 (text root): prompt [1,2,3], generated [4,5] -> delta [1,2,3,4,5] cached under k1.
+    request = object()
+    runtime.record_prompt(request, admission={"mode": "text", "prev_len": 0}, prefix_token_ids=[], prompt_token_ids=[1, 2, 3])
+    content = {"choices": [{"message": {}, "logprobs": {"content": [{"token": "token_id:4", "logprob": -0.1}, {"token": "token_id:5", "logprob": -0.2}]}}]}
+    out = runtime.finish(request, content)
+    assert out["ng_commit_coords"]["staging_key"] == "k1"
+    # Turn 2 references k1: prefix resolved locally, no bridge fetch.
+    prefix = runtime.resolve_prefix({"mode": "token_in", "prev_len": 5, "staging_chain": ["k1"]}, prefill_prompt_token_ids=None)
+    assert prefix == [1, 2, 3, 4, 5]
+    assert bridge.calls == 0 and runtime.cache_hits == 1
+    # Unknown key falls back to the bridge.
+    assert runtime.resolve_prefix({"mode": "token_in", "prev_len": 3, "staging_chain": ["zz"]}, prefill_prompt_token_ids=None) == [9, 9, 9]
+    assert bridge.calls == 1
+
+
 def test_plugin_metadata_registers_vllm_endpoint_plugin():
     metadata = tomllib.loads((PLUGIN_ROOT / "pyproject.toml").read_text())
 
     assert metadata["project"]["dependencies"] == ["vllm>=0.29.0,<0.31"]
-    assert metadata["project"]["version"] == "0.2.0"
+    assert metadata["project"]["version"] == "0.3.0"
     assert metadata["project"]["entry-points"]["vllm.endpoint_plugins"] == {
         "nemo_rl_prefix_api": (
             "nemo_rl_vllm_prefix_plugin.plugin:NeMoRLPrefixEndpointPlugin"
