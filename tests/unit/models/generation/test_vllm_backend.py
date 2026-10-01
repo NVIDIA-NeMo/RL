@@ -400,7 +400,6 @@ def test_mixed_mxfp8_native_refit_processes_each_module_once(monkeypatch, transp
     )
 
     from nemo_rl.models.generation.vllm import vllm_backend
-    from nemo_rl.models.generation.vllm.quantization import fp8
 
     call_order = []
     model = torch.nn.Module()
@@ -430,11 +429,6 @@ def test_mixed_mxfp8_native_refit_processes_each_module_once(monkeypatch, transp
     ext._mtp_drafter_refit_enabled = lambda: False
     ext._maybe_process_mtp_drafter_after_loading = lambda: call_order.append("mtp")
     ext._maybe_process_fp8_kv_cache = MagicMock()
-
-    scratch_buffers = {
-        ("w13", (1,), torch.device("cpu")): torch.empty(1, dtype=torch.uint8)
-    }
-    monkeypatch.setattr(fp8, "mxfp8_shuffle_scratch_buffers", scratch_buffers)
 
     monkeypatch.setattr(
         vllm_backend,
@@ -508,7 +502,6 @@ def test_mixed_mxfp8_native_refit_processes_each_module_once(monkeypatch, transp
         "mtp",
         "config_exit",
     ]
-    assert scratch_buffers == {}
     ext._maybe_process_fp8_kv_cache.assert_not_called()
 
 
@@ -793,7 +786,7 @@ def test_fp8_flashinfer_trtllm_keeps_existing_refit_lifecycle(monkeypatch):
 
 
 @pytest.mark.vllm
-def test_fp8_refit_finalization_releases_mxfp8_shuffle_scratch(monkeypatch):
+def test_fp8_refit_preserves_weight_pool_shuffle_scratch(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
     from nemo_rl.models.generation.vllm.quantization import fp8
 
@@ -810,25 +803,9 @@ def test_fp8_refit_finalization_releases_mxfp8_shuffle_scratch(monkeypatch):
     ext.device = torch.device("cpu")
     ext._maybe_process_mtp_drafter_after_loading = MagicMock()
 
-    scratch_buffers = {
-        ("w13", (1,), torch.device("cpu")): torch.empty(1, dtype=torch.uint8)
-    }
+    scratch = torch.empty(1, dtype=torch.uint8)
+    scratch_buffers = {("w13", (1,), torch.device("cpu")): scratch}
     monkeypatch.setattr(fp8, "mxfp8_shuffle_scratch_buffers", scratch_buffers)
-    call_order = []
-    monkeypatch.setattr(
-        torch.cuda, "synchronize", lambda: call_order.append("synchronize")
-    )
-    release_scratch = fp8.release_mxfp8_shuffle_scratch_buffers
-
-    def release_scratch_after_device_fence():
-        call_order.append("release")
-        release_scratch()
-
-    monkeypatch.setattr(
-        fp8,
-        "release_mxfp8_shuffle_scratch_buffers",
-        release_scratch_after_device_fence,
-    )
     monkeypatch.setattr(
         "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
     )
@@ -840,8 +817,9 @@ def test_fp8_refit_finalization_releases_mxfp8_shuffle_scratch(monkeypatch):
     with ext._weight_update_lifecycle("collective") as finalize:
         finalize()
 
-    assert call_order == ["synchronize", "release"]
-    assert scratch_buffers == {}
+    assert scratch_buffers == {
+        ("w13", (1,), torch.device("cpu")): scratch,
+    }
 
 
 @pytest.mark.vllm

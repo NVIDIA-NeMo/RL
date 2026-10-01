@@ -1383,22 +1383,17 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 added_skip_tensors = deepseek_v4_fp8.SkipNames()
 
             def finalize() -> None:
-                from nemo_rl.models.generation.vllm.quantization import fp8
-
-                try:
-                    with torch.device(self.device):
-                        finalize_layerwise_reload(model, self.model_config)
-                        if use_deepseek_v4_fp8:
-                            deepseek_v4_fp8.finalize_refit(model)
-                        else:
-                            _process_mxfp8_modules_after_native_reload(
-                                model, reloaded_module_ids
-                            )
-                        _refresh_hpc_modules_after_layerwise_reload(model)
-                        self._maybe_process_mtp_drafter_after_loading()
-                    torch.cuda.synchronize()
-                finally:
-                    fp8.release_mxfp8_shuffle_scratch_buffers()
+                with torch.device(self.device):
+                    finalize_layerwise_reload(model, self.model_config)
+                    if use_deepseek_v4_fp8:
+                        deepseek_v4_fp8.finalize_refit(model)
+                    else:
+                        _process_mxfp8_modules_after_native_reload(
+                            model, reloaded_module_ids
+                        )
+                    _refresh_hpc_modules_after_layerwise_reload(model)
+                    self._maybe_process_mtp_drafter_after_loading()
+                torch.cuda.synchronize()
 
             try:
                 with set_current_vllm_config(self.model_runner.vllm_config):
@@ -1425,17 +1420,11 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         )
 
         def finalize() -> None:
-            from nemo_rl.models.generation.vllm.quantization import fp8
-
-            try:
-                with set_current_vllm_config(self.model_runner.vllm_config):
-                    process_weights_after_loading(
-                        self.model_runner.model, self.model_config, self.device
-                    )
-                self._maybe_process_mtp_drafter_after_loading()
-                torch.cuda.synchronize()
-            finally:
-                fp8.release_mxfp8_shuffle_scratch_buffers()
+            with set_current_vllm_config(self.model_runner.vllm_config):
+                process_weights_after_loading(
+                    self.model_runner.model, self.model_config, self.device
+                )
+            self._maybe_process_mtp_drafter_after_loading()
 
         yield finalize
         # KV-cache scales are covered by the full process_weights_after_loading
