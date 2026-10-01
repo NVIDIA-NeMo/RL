@@ -29,10 +29,10 @@ test_suites_dir = os.path.join(project_root, "tests", "test_suites")
 
 nightly_test_suite_path = os.path.join(test_suites_dir, "nightly.txt")
 release_test_suite_path = os.path.join(test_suites_dir, "release.txt")
+performance_test_suite_path = os.path.join(test_suites_dir, "performance.txt")
 nightly_gb200_test_suite_path = os.path.join(test_suites_dir, "nightly_gb200.txt")
 release_gb200_test_suite_path = os.path.join(test_suites_dir, "release_gb200.txt")
-h100_performance_test_suite_path = os.path.join(test_suites_dir, "performance.txt")
-gb200_performance_test_suite_path = os.path.join(
+performance_gb200_test_suite_path = os.path.join(
     test_suites_dir, "performance_gb200.txt"
 )
 disabled_test_suite_path = os.path.join(test_suites_dir, "disabled.txt")
@@ -68,7 +68,7 @@ ALLOWED_ADDITIONAL_CONFIG_KEYS = ["policy.draft", "policy.generation.vllm_kwargs
 #
 # `runs_per_week` mirrors the nemo-ci pipeline schedules. Keep these in sync if
 # a schedule changes:
-#   "NeMo RL Nightly tests"          0 2 * * *  -> nightly, nightly_gb200
+#   "NeMo RL Nightly tests"          0 2 * * *  -> nightly(_gb200)
 #   "NeMo RL Weekly Release Tests"   0 4 * * 6  -> release(_gb200)
 #   "NeMo RL Weekly Perf Tests"      0 4 * * 6  -> performance(_gb200)
 #
@@ -149,6 +149,11 @@ def release_test_suite():
 
 
 @pytest.fixture
+def performance_test_suite():
+    return _read_test_suite(performance_test_suite_path)
+
+
+@pytest.fixture
 def nightly_gb200_test_suite():
     return _read_test_suite(nightly_gb200_test_suite_path)
 
@@ -159,10 +164,8 @@ def release_gb200_test_suite():
 
 
 @pytest.fixture
-def performance_test_suite():
-    return _read_test_suite(h100_performance_test_suite_path) + _read_test_suite(
-        gb200_performance_test_suite_path
-    )
+def performance_gb200_test_suite():
+    return _read_test_suite(performance_gb200_test_suite_path)
 
 
 @pytest.fixture
@@ -174,17 +177,19 @@ def disabled_test_suite():
 def all_test_suites(
     nightly_test_suite,
     release_test_suite,
+    performance_test_suite,
     nightly_gb200_test_suite,
     release_gb200_test_suite,
-    performance_test_suite,
+    performance_gb200_test_suite,
     disabled_test_suite,
 ):
     return (
         nightly_test_suite
         + release_test_suite
+        + performance_test_suite
         + nightly_gb200_test_suite
         + release_gb200_test_suite
-        + performance_test_suite
+        + performance_gb200_test_suite
         + disabled_test_suite
     )
 
@@ -229,19 +234,19 @@ def all_recipe_yaml_rel_paths():
     [
         nightly_test_suite_path,
         release_test_suite_path,
+        performance_test_suite_path,
         nightly_gb200_test_suite_path,
         release_gb200_test_suite_path,
-        h100_performance_test_suite_path,
-        gb200_performance_test_suite_path,
+        performance_gb200_test_suite_path,
         disabled_test_suite_path,
     ],
     ids=[
         "nightly_test_suite",
         "release_test_suite",
+        "performance_test_suite",
         "nightly_gb200_test_suite",
         "release_gb200_test_suite",
-        "h100_performance_test_suite",
-        "gb200_performance_test_suite",
+        "performance_gb200_test_suite",
         "disabled_test_suite",
     ],
 )
