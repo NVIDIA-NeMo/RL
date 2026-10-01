@@ -966,6 +966,43 @@ class TestApplyMoeConfig:
 
         assert getattr(model_cfg, padding_attr) is True
 
+    @pytest.mark.parametrize(
+        ("model_overrides", "config_overrides"),
+        [
+            ({"cuda_graph_impl": "none"}, {"cuda_graph_impl": "local"}),
+            ({"enable_cuda_graph": True}, {}),
+            ({"external_cuda_graph": True}, {}),
+            ({"cuda_graph_modules": ["full_iteration"]}, {}),
+        ],
+        ids=[
+            "modern-cuda-graph-impl",
+            "legacy-enable-cuda-graph",
+            "legacy-external-cuda-graph",
+            "legacy-full-iteration-scope",
+        ],
+    )
+    def test_hybridep_dispatch_padding_rejects_training_cuda_graphs(
+        self, model_overrides, config_overrides
+    ):
+        from nemo_rl.models.megatron.hybridep import (
+            configure_hybridep_packed_input_padding,
+        )
+
+        model_cfg = SimpleNamespace(
+            moe_hybridep_pad_uneven_dispatch_inputs=False,
+            **model_overrides,
+        )
+        config = self._base_moe_cfg(
+            expert_model_parallel_size=8,
+            moe_flex_dispatcher_backend="hybridep",
+            moe_hybridep_prepad_packed_inputs=False,
+            **config_overrides,
+        )
+        config["sequence_packing"] = {"enabled": True}
+
+        with pytest.raises(RuntimeError, match="not capture-safe"):
+            configure_hybridep_packed_input_padding(model_cfg, config)
+
     def test_hybridep_packed_inputs_require_mcore_padding_support(self):
         from nemo_rl.models.megatron.hybridep import (
             configure_hybridep_packed_input_padding,
