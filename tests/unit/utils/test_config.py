@@ -11,13 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 import tempfile
+import warnings
 from pathlib import Path
 
 import pytest
 from omegaconf import OmegaConf
 
-from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
+from nemo_rl.utils.config import (
+    load_config,
+    register_omegaconf_resolvers,
+    warn_if_config_path_overridden,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 ULTRA_CONFIG_PATHS = [
@@ -419,3 +425,56 @@ def test_parse_hydra_overrides():
     assert updated_cfg.model.num_layers == 12
     assert updated_cfg.model.type == "transformer"
     assert "batch_size" not in updated_cfg.training
+
+
+def test_warn_if_config_path_overridden_reports_both_paths_and_reason():
+    with pytest.warns(UserWarning) as record:
+        warn_if_config_path_overridden(
+            "env.nemo_gym.nemo_gym_log_dir",
+            configured="logs/nemo_gym",
+            effective="results/run/exp_001/nemo_gym",
+            reason="kept with the run's logs",
+        )
+
+    assert [str(warning.message) for warning in record] == [
+        "Config value env.nemo_gym.nemo_gym_log_dir='logs/nemo_gym' is overridden; "
+        "using 'results/run/exp_001/nemo_gym' (kept with the run's logs)."
+    ]
+    # stacklevel=2 attributes the warning to the code that replaced the path.
+    assert record[0].filename == __file__
+
+
+@pytest.mark.parametrize(
+    ("configured", "effective"),
+    [
+        pytest.param(None, "results/run", id="unset"),
+        pytest.param("", "results/run", id="empty"),
+        pytest.param("results/run", "results/run", id="unchanged"),
+        pytest.param("results/./run/", "results/run", id="respelled"),
+    ],
+)
+def test_warn_if_config_path_overridden_is_silent_without_a_new_location(
+    configured, effective
+):
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        warn_if_config_path_overridden(
+            "logger.log_dir",
+            configured=configured,
+            effective=effective,
+            reason="unused",
+        )
+
+
+def test_warn_if_config_path_overridden_matches_relative_and_absolute_paths(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        warn_if_config_path_overridden(
+            "logger.log_dir",
+            configured=os.path.join(tmp_path, "results", "run"),
+            effective="results/run",
+            reason="unused",
+        )

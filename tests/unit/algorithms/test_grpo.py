@@ -14,6 +14,7 @@
 
 import math
 import os
+import warnings
 from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -3181,7 +3182,10 @@ def test_dynamo_rejects_colocated_inference_before_setup_side_effects(
     assert master_config.policy["generation"]["vllm_kwargs"]["hf_overrides"] == {}
 
 
-def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> None:
+@pytest.mark.parametrize("configured_gym_log_dir", [None, "logs/nemo_gym"])
+def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(
+    monkeypatch, configured_gym_log_dir
+) -> None:
     from nemo_rl.algorithms import grpo as grpo_mod
 
     repo_root = Path(__file__).resolve().parents[3]
@@ -3205,6 +3209,10 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
         "num_nodes": 1,
     }
     config["env"]["should_use_nemo_gym"] = True
+    if configured_gym_log_dir is not None:
+        config["env"].setdefault("nemo_gym", {})["nemo_gym_log_dir"] = (
+            configured_gym_log_dir
+        )
     tokenizer = MagicMock()
     tokenizer.pad_token_id = 0
     tokenizer.eos_token_id = 1
@@ -3261,7 +3269,9 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
     # agent-coverage check take its early return instead of scanning a mock dataset.
     nemo_gym_shard_set = MagicMock(is_sharded=False)
     build_nemo_gym_actors = MagicMock(return_value=nemo_gym_shard_set)
-    monkeypatch.setattr(grpo_mod, "Logger", lambda *_args, **_kwargs: MagicMock())
+    dummy_logger = MagicMock()
+    dummy_logger.base_log_dir = "/tmp/grpo-test-results"
+    monkeypatch.setattr(grpo_mod, "Logger", lambda *_args, **_kwargs: dummy_logger)
     monkeypatch.setattr(
         grpo_mod, "CheckpointManager", lambda *_args, **_kwargs: DummyCheckpointer()
     )
@@ -3287,7 +3297,9 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
 
     dataset = MagicMock()
     dataset.__len__.return_value = 2
-    result = setup(master_config, tokenizer, dataset, None)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = setup(master_config, tokenizer, dataset, None)
 
     train_cluster, inference_cluster = cluster_instances
     assert train_cluster.kwargs["bundle_ct_per_node_list"] == [4]
@@ -3298,6 +3310,21 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
     assert inference_cluster.kwargs["node_resource_constraints"] is None
     assert result[1].dp_openai_server_base_urls == ["http://dynamo-wrapper.example/v1"]
     assert result[2] is nemo_gym_shard_set
+    assert master_config.env["nemo_gym"]["nemo_gym_log_dir"] == (
+        "/tmp/grpo-test-results/nemo_gym"
+    )
+    log_dir_warnings = [
+        str(warning.message)
+        for warning in caught
+        if "nemo_gym_log_dir" in str(warning.message)
+    ]
+    if configured_gym_log_dir is None:
+        assert log_dir_warnings == []
+    else:
+        # A configured log dir is still replaced, but no longer silently.
+        assert len(log_dir_warnings) == 1
+        assert "'logs/nemo_gym'" in log_dir_warnings[0]
+        assert "'/tmp/grpo-test-results/nemo_gym'" in log_dir_warnings[0]
     dynamo_config = dynamo_init.call_args.kwargs["config"]
     assert dynamo_init.call_args.kwargs["cluster"] is inference_cluster
     assert DynamoConfig.model_validate(dynamo_config).engine_world_size == 4
@@ -3421,6 +3448,8 @@ def test_setup_auto_enables_skip_reference_logprobs_with_policy_factory(
     from nemo_rl.algorithms import grpo as grpo_mod
 
     class DummyLogger:
+        base_log_dir = "/tmp/grpo-test-results"
+
         def log_hyperparams(self, *_args, **_kwargs):
             pass
 
@@ -3575,6 +3604,8 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
     from nemo_rl.algorithms import grpo as grpo_mod
 
     class DummyLogger:
+        base_log_dir = "/tmp/grpo-test-results"
+
         def log_hyperparams(self, *_args, **_kwargs):
             pass
 
