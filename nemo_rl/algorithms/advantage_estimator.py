@@ -744,6 +744,7 @@ class OPDAdvantageEstimator:
             distill_advantages,
             torch.zeros_like(distill_advantages),
         )
+        advantages = advantages * mask.to(device=advantages.device)
 
         # Metrics
         self._compute_metrics(teacher_student_gap, advantages, effective_mask)

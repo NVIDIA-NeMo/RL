@@ -119,7 +119,7 @@ def test_opd_teacher_mask_is_nonfinite_safe_and_drives_metrics(all_invalid):
     teacher_lp = torch.tensor([[1.0, float("nan"), float("inf"), -3.0]])
     student_lp = torch.zeros_like(teacher_lp)
     # This represents the token-mask/sample-mask intersection supplied by GRPO.
-    mask = torch.tensor([[1.0, 1.0, 0.0, 1.0]])
+    mask = torch.tensor([[0.25, 0.5, 0.0, 1.0]])
     teacher_mask = torch.zeros_like(mask)
     if not all_invalid:
         teacher_mask[0, 0] = 1.0
@@ -133,24 +133,27 @@ def test_opd_teacher_mask_is_nonfinite_safe_and_drives_metrics(all_invalid):
         prev_logprobs=student_lp,
     )
 
-    expected = torch.tensor([[0.0 if all_invalid else 1.0, 0.0, 0.0, 0.0]])
+    expected = torch.tensor([[0.0 if all_invalid else 0.25, 0.0, 0.0, 0.0]])
     torch.testing.assert_close(advantages, expected)
     assert torch.isfinite(advantages).all()
     assert estimator.last_metrics[
         "on_policy_distillation/teacher_student_logprob_gap_mean"
     ] == pytest.approx(0.0 if all_invalid else 1.0)
     assert estimator.last_metrics["on_policy_distillation/adv_mean"] == pytest.approx(
-        0.0 if all_invalid else 1.0
+        0.0 if all_invalid else 0.25
     )
 
 
-def test_opd_proximal_reward_disabled_is_bitwise_legacy_opd():
+@pytest.mark.parametrize("with_teacher_mask", [False, True])
+def test_opd_proximal_reward_disabled_is_bitwise_legacy_opd(
+    with_teacher_mask: bool,
+) -> None:
     # A disabled transform ignores its otherwise-invalid scale and remains the
     # legacy OPD calculation bit-for-bit.
     estimator = _make_estimator(proximal_reward_alpha=None, proximal_reward_scale=0.0)
     teacher_lp = torch.tensor([[0.25, -3.0, 1.5, -0.75]])
     student_lp = torch.tensor([[-0.5, -2.0, 0.25, -1.25]])
-    mask = torch.tensor([[1.0, 1.0, 0.0, 1.0]])
+    mask = torch.tensor([[0.25, 0.5, 0.0, 1.0]])
     expected = (teacher_lp - student_lp).detach() * mask
 
     advantages = estimator.compute_advantage(
@@ -158,6 +161,9 @@ def test_opd_proximal_reward_disabled_is_bitwise_legacy_opd():
         torch.zeros(1),
         mask,
         teacher_logprobs=teacher_lp,
+        teacher_logprobs_mask=torch.ones_like(mask, dtype=torch.bool)
+        if with_teacher_mask
+        else None,
         prev_logprobs=student_lp,
     )
 
