@@ -10,8 +10,6 @@ tests/test_suites/llm/grpo-nanov3-30BA3B-2n8g-megatron_generation-colocated-resh
 # Functional VLM run
 tests/test_suites/vlm/vlm_grpo-qwen2.5-vl-3b-instruct-clevr-1n8g-megatrontp2.v1.sh
 
-# Nano-v2
-
 # Super v3 functional
 tests/test_suites/llm/grpo-nemotron3-super-120BA12B-16n8g-megatron.sh
 
