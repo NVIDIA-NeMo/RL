@@ -11,26 +11,52 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import re
+import ast
 from pathlib import Path
 
 import pytest
 
 from nemo_rl.utils.outdated_config_checks import check_outdated_config
 
-EXAMPLES_DIR = Path(__file__).resolve().parents[3] / "examples"
-entrypoints = sorted(EXAMPLES_DIR.rglob("run_*.py"))
-assert entrypoints, "No entrypoints found"
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
-# Matches both construction styles in use: MasterConfig(**resolved) and
-# MasterConfig.model_validate(resolved).
-_BUILDS_MASTER_CONFIG = re.compile(r"MasterConfig(\(\*\*|\.model_validate)")
+# The entrypoints under test are every file under ENTRYPOINTS_DIRS that imports
+# MasterConfig, plus ENTRYPOINTS_EXTRA_FILES.
+ENTRYPOINTS_DIRS = ["examples", "research"]
+ENTRYPOINTS_EXTRA_FILES = [REPO_ROOT / "tools" / "refit_verifier.py"]
 
-# Eval configs have a different structure from training configs, so the entrypoint checks
-# do not apply to them.
-_EXEMPT = {
-    "run_eval.py": "eval configs have a different structure from training configs"
-}
+
+def _entrypoints() -> list[Path]:
+    """Every module under ENTRYPOINTS_DIRS that imports MasterConfig, plus the extras."""
+    found = []
+    for directory in ENTRYPOINTS_DIRS:
+        for path in sorted((REPO_ROOT / directory).rglob("*.py")):
+            if "tests" in path.parts:
+                continue
+            # Importing it, not defining it
+            if any(
+                alias.name == "MasterConfig"
+                for node in ast.walk(ast.parse(path.read_text()))
+                if isinstance(node, ast.ImportFrom)
+                for alias in node.names
+            ):
+                found.append(path)
+    assert found, "No entrypoints found"
+    return found + ENTRYPOINTS_EXTRA_FILES
+
+
+def _call_lines(tree: ast.AST, name: str) -> list[int]:
+    """Lines calling name, as name(...) or name.anything(...)."""
+    lines = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute):
+            func = func.value
+        if isinstance(func, ast.Name) and func.id == name:
+            lines.append(node.lineno)
+    return sorted(lines)
 
 
 # ============================================================================
@@ -38,31 +64,39 @@ _EXEMPT = {
 # ============================================================================
 
 
-@pytest.mark.parametrize("entrypoint", entrypoints, ids=lambda p: p.name)
+@pytest.mark.parametrize(
+    "entrypoint", _entrypoints(), ids=lambda p: str(p.relative_to(REPO_ROOT))
+)
 def test_every_entrypoint_checks_outdated_config(entrypoint):
-    """An entrypoint that builds a MasterConfig must also reject outdated config.
+    """An entrypoint that resolves a user config must reject outdated config first.
 
-    Without this, a new run_*.py silently skips the check and a stale config gets as far
-    as worker startup before failing.
+    Without this, a stale config gets as far as worker startup before failing.
     """
-    if entrypoint.name in _EXEMPT:
-        pytest.skip(f"{entrypoint.name}: {_EXEMPT[entrypoint.name]}")
+    if entrypoint == REPO_ROOT / "examples" / "run_eval.py":
+        pytest.skip("eval configs have a different structure")
 
-    source = entrypoint.read_text()
-    if not _BUILDS_MASTER_CONFIG.search(source):
-        pytest.skip(f"{entrypoint.name} does not build a MasterConfig")
+    tree = ast.parse(entrypoint.read_text())
+    rel = entrypoint.relative_to(REPO_ROOT)
 
-    assert "check_outdated_config(" in source, (
-        f"{entrypoint.name} builds a MasterConfig but never calls "
-        "check_outdated_config(). Add the call just before the config is built."
+    check_lines = _call_lines(tree, "check_outdated_config")
+    assert check_lines, (
+        f"{rel} resolves a config but never calls check_outdated_config(). Add the "
+        "call just after OmegaConf.to_container, before the config is used."
     )
-    assert (
-        source.index("check_outdated_config(")
-        < _BUILDS_MASTER_CONFIG.search(source).start()
-    ), (
-        f"{entrypoint.name} calls check_outdated_config() after building the "
-        "MasterConfig. Validation rejects a missing required key first, so the "
-        "migration message would never be reached; move the call before the build."
+    # The rest is about ordering against the MasterConfig build, which this one has not.
+    if entrypoint == REPO_ROOT / "tools" / "refit_verifier.py":
+        return
+
+    build_lines = _call_lines(tree, "MasterConfig")
+    assert build_lines, (
+        f"{rel} mentions MasterConfig but this test sees no call that builds one, so "
+        "it cannot check the ordering. Build it by calling MasterConfig directly, or "
+        "teach _call_lines the new form."
+    )
+    assert check_lines[0] < build_lines[0], (
+        f"{rel} calls check_outdated_config() after building the MasterConfig. "
+        "Validation rejects a missing required key first, so the migration message "
+        "would never be reached; move the call before the build."
     )
 
 
