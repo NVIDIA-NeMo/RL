@@ -22,7 +22,7 @@ policy:
       store_param_remainders: true
       exp_avg_dtype: torch.bfloat16
       exp_avg_sq_dtype: torch.bfloat16
-  dtensor_cfg:
+  automodel_cfg:
     activation_checkpointing: true
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True

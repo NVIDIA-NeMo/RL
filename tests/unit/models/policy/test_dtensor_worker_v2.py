@@ -184,7 +184,7 @@ def create_test_config(
                 },
             },
         },
-        "dtensor_cfg": {
+        "automodel_cfg": {
             "enabled": True,
             "checkpoint": {
                 "model_save_format": "safetensors",
@@ -230,7 +230,7 @@ def create_test_config(
         "max_grad_norm": 1.0,
     }
     if automodel_kwargs is not None:
-        config["dtensor_cfg"]["automodel_kwargs"] = automodel_kwargs
+        config["automodel_cfg"]["automodel_kwargs"] = automodel_kwargs
     return config
 
 
@@ -847,7 +847,7 @@ def _init_v2_worker_mocked(
     config = {
         "model_name": "base-model",
         "tokenizer": {},
-        "dtensor_cfg": {
+        "automodel_cfg": {
             "checkpoint": {
                 "model_save_format": "safetensors",
                 "save_consolidated": "false",

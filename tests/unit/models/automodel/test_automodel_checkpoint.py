@@ -123,7 +123,7 @@ def test_build_checkpoint_config_forwards_explicit_settings():
 
 @pytest.mark.automodel
 def test_build_checkpoint_config_rejects_null_model_save_format():
-    with pytest.raises(ValueError, match="dtensor_cfg.checkpoint.model_save_format"):
+    with pytest.raises(ValueError, match="automodel_cfg.checkpoint.model_save_format"):
         build_checkpoint_config(
             {"checkpoint": {"model_save_format": None}},
             model_repo_id="org/model",
