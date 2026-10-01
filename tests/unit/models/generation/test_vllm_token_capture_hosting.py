@@ -587,10 +587,16 @@ def test_uncaptured_inference_does_not_expose_routes_without_token_bundle():
     message["routed_experts"] = "opaque-route-payload"
     assert not any(
         field in message
-        for field in ("prompt_token_ids", "generation_token_ids", "generation_log_probs")
+        for field in (
+            "prompt_token_ids",
+            "generation_token_ids",
+            "generation_log_probs",
+        )
     )
 
-    out = VllmAsyncGenerationWorkerImpl._finish_request_capture(worker, request, content)
+    out = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+        worker, request, content
+    )
 
     assert "routed_experts" not in out["choices"][0]["message"]
     assert "ng_commit_coords" not in out
