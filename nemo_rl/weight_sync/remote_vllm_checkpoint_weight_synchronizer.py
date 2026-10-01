@@ -34,6 +34,10 @@ class RemoteVllmCheckpointWeightSynchronizer(WeightSynchronizer):
         ).expanduser()
         self._next_version = 1
         self._stale = True
+        # Retain only the newest exports (each is a full HF copy of the policy).
+        self._keep_versions = int(
+            getattr(generation.remote_config.refit, "keep_versions", 2)
+        )
 
     @property
     def is_stale(self) -> bool:
@@ -101,6 +105,34 @@ class RemoteVllmCheckpointWeightSynchronizer(WeightSynchronizer):
 
         self._next_version += 1
         self._stale = False
+        self._prune_old_versions(keep=self._keep_versions, current=version)
+
+    def _prune_old_versions(self, *, keep: int, current: int) -> None:
+        """Delete published exports older than the newest ``keep`` (never the current one).
+
+        vLLM has finished ``reload_weights`` on the current version when this runs, so
+        older directories are no longer read by anyone. ``keep <= 0`` disables pruning.
+        """
+        if keep <= 0:
+            return
+        import shutil
+
+        versions = []
+        for path in self._checkpoint_root.iterdir():
+            if not path.name.startswith("version_"):
+                continue
+            try:
+                versions.append((int(path.name.removeprefix("version_")), path))
+            except ValueError:
+                continue
+        versions.sort()
+        for number, path in versions[:-keep] if len(versions) > keep else []:
+            if number >= current:
+                continue
+            try:
+                shutil.rmtree(path)
+            except OSError as exc:  # never fail a training step over cleanup
+                print(f"[remote_vllm refit] could not prune {path}: {exc!r}", flush=True)
 
     def shutdown(self) -> None:
         return None

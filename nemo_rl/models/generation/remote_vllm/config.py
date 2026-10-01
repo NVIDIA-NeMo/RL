@@ -26,6 +26,9 @@ class RemoteVllmRefitConfig(BaseModel, extra="forbid"):
     checkpoint_dir: str = Field(min_length=1)
     inflight_policy: Literal["abort", "wait", "keep"] = "keep"
     timeout_s: PositiveFloat = 1800.0
+    # Published HF exports to retain under checkpoint_dir (each is a full model copy);
+    # older ones are removed after the engine has reloaded a newer version. 0 keeps all.
+    keep_versions: int = Field(default=2, ge=0)
 
     @model_validator(mode="after")
     def validate_checkpoint_dir(self) -> "RemoteVllmRefitConfig":

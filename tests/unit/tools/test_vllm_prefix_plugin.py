@@ -255,7 +255,7 @@ async def test_renderer_patch_resolves_ng_capture_and_records_engine_prompt():
 def test_plugin_metadata_registers_vllm_endpoint_plugin():
     metadata = tomllib.loads((PLUGIN_ROOT / "pyproject.toml").read_text())
 
-    assert metadata["project"]["dependencies"] == ["vllm==0.29.0"]
+    assert metadata["project"]["dependencies"] == ["vllm>=0.29.0,<0.31"]
     assert metadata["project"]["version"] == "0.2.0"
     assert metadata["project"]["entry-points"]["vllm.endpoint_plugins"] == {
         "nemo_rl_prefix_api": (
