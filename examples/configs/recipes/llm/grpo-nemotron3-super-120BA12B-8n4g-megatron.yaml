@@ -55,6 +55,9 @@ policy:
       enable_chunked_prefill: true
       max_num_batched_tokens: 8480
       mamba_cache_mode: align
+      # vLLM's default BF16 MoE backend on Blackwell is FlashInfer TRTLLM, whose
+      # refit path does not support a co-trained MTP drafter yet.
+      moe_backend: triton
       speculative_config:
         num_speculative_tokens: 5
         method: mtp
