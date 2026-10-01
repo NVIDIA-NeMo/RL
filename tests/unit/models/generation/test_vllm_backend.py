@@ -814,6 +814,21 @@ def test_fp8_refit_finalization_releases_mxfp8_shuffle_scratch(monkeypatch):
         ("w13", (1,), torch.device("cpu")): torch.empty(1, dtype=torch.uint8)
     }
     monkeypatch.setattr(fp8, "mxfp8_shuffle_scratch_buffers", scratch_buffers)
+    call_order = []
+    monkeypatch.setattr(
+        torch.cuda, "synchronize", lambda: call_order.append("synchronize")
+    )
+    release_scratch = fp8.release_mxfp8_shuffle_scratch_buffers
+
+    def release_scratch_after_device_fence():
+        call_order.append("release")
+        release_scratch()
+
+    monkeypatch.setattr(
+        fp8,
+        "release_mxfp8_shuffle_scratch_buffers",
+        release_scratch_after_device_fence,
+    )
     monkeypatch.setattr(
         "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
     )
@@ -825,6 +840,7 @@ def test_fp8_refit_finalization_releases_mxfp8_shuffle_scratch(monkeypatch):
     with ext._weight_update_lifecycle("collective") as finalize:
         finalize()
 
+    assert call_order == ["synchronize", "release"]
     assert scratch_buffers == {}
 
 

@@ -1433,6 +1433,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                         self.model_runner.model, self.model_config, self.device
                     )
                 self._maybe_process_mtp_drafter_after_loading()
+                torch.cuda.synchronize()
             finally:
                 fp8.release_mxfp8_shuffle_scratch_buffers()
 
