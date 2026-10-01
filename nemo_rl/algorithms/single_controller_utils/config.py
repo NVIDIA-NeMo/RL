@@ -759,6 +759,13 @@ class GymRolloutCheckpointConfig(BaseModel, extra="forbid"):
     # Stage an in-flight call's accumulated tokens once its unstaged segment
     # reaches this many tokens. 0 disables periodic chunk flushing.
     generation_chunk_flush_tokens: Annotated[int, Field(ge=0)] = 0
+    # Checkpoint-triggered prefix PUTs per generation owner. 1 retains the
+    # single-row path. Periodic chunk flushing is unchanged.
+    generation_prefix_batch_size: Annotated[int, Field(gt=0)] = 256
+    # Aggregate staged tokens per batch (~64 MiB of base tensors at default).
+    # Not a total-memory bound: metadata/copies add overhead; one oversized
+    # record is allowed alone, since a record cannot be split here.
+    generation_prefix_batch_max_tokens: Annotated[int, Field(gt=0)] = 4_194_304
     prepare_timeout_s: Annotated[float, Field(gt=0)] = 300.0
 
     @property

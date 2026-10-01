@@ -767,6 +767,8 @@ class VllmAsyncGenerationWorkerImpl(
         generation_prefix_cuts_enabled: bool = False,
         generation_cut_control_token: str | None = None,
         generation_chunk_flush_tokens: int = 0,
+        generation_prefix_batch_size: int,
+        generation_prefix_batch_max_tokens: int,
     ) -> bool:
         """Host ledger-authoritative token capture in this worker.
 
@@ -793,6 +795,10 @@ class VllmAsyncGenerationWorkerImpl(
             )
         if generation_chunk_flush_tokens < 0:
             raise ValueError("generation_chunk_flush_tokens must not be negative")
+        self._configure_generation_prefix_batching(
+            max_rows=generation_prefix_batch_size,
+            max_tokens=generation_prefix_batch_max_tokens,
+        )
         if generation_chunk_flush_tokens and not generation_prefix_cuts_enabled:
             raise ValueError(
                 "generation_chunk_flush_tokens requires generation-prefix cuts; "
