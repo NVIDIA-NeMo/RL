@@ -30,12 +30,20 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Optional, Self, TypeAlias
 
+from nemo_rl.experience.reward_penalties import (
+    CaptureRewardSettings,
+    FinalizedReward,
+    RewardChecks,
+    RewardLogContext,
+    parse_reward_log_context,
+)
+
 if TYPE_CHECKING:
     from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneMutationCut
     from nemo_rl.data.interfaces import DatumSpec
 
-ROLLOUT_RECOVERY_SCHEMA_VERSION = 2
-_SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {ROLLOUT_RECOVERY_SCHEMA_VERSION}
+ROLLOUT_RECOVERY_SCHEMA_VERSION = 6
+SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {2, ROLLOUT_RECOVERY_SCHEMA_VERSION}
 ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
 RolloutRecoveryState: TypeAlias = dict[str, Any]
 
@@ -44,6 +52,9 @@ _SIDECAR_STATE_FIELDS = frozenset(
     {
         *_LEDGER_STATE_FIELDS,
         "batch_shortfall",
+        "finalizer_metrics_by_group",
+        "finalizer_rewards_by_group",
+        "reward_settings",
         "sampler_stamps_target_steps",
     }
 )
@@ -72,6 +83,8 @@ _ATTEMPT_STATE_FIELDS = frozenset(
         "receipt",
         "reward",
         "mask_sample",
+        "reward_checks",
+        "reward_log_context",
         "staging_keys",
     }
 )
@@ -177,6 +190,8 @@ class RolloutAttemptRecord:
     receipt: Optional[dict[str, Any]] = None
     reward: Optional[float] = None
     mask_sample: Optional[bool] = None
+    reward_checks: RewardChecks | None = None
+    reward_log_context: RewardLogContext | None = None
     staging_keys: list[str] = field(default_factory=list)
 
     @property
@@ -270,6 +285,9 @@ class ParsedRolloutRecoveryState:
     ledger_state: RolloutRecoveryState
     batch_shortfall: dict[int, int]
     sampler_stamps_target_steps: Optional[bool]
+    finalizer_metrics_by_group: dict[str, dict[str, float]]
+    finalizer_rewards_by_group: dict[str, list[FinalizedReward]]
+    reward_settings: CaptureRewardSettings | None
 
 
 @dataclass(frozen=True)
@@ -282,6 +300,8 @@ class SiblingSealResult:
     receipt: Optional[dict[str, Any]]
     reward: float
     mask_sample: bool
+    reward_checks: RewardChecks | None = None
+    reward_log_context: RewardLogContext | None = None
 
 
 def _new_attempt() -> RolloutAttemptRecord:
@@ -448,6 +468,9 @@ class RolloutRecoveryLedger:
             attempt.status = RolloutAttemptStatus.ABANDONED
             attempt.receipt = None
             attempt.reward = None
+            attempt.mask_sample = None
+            attempt.reward_checks = None
+            attempt.reward_log_context = None
             attempt.staging_keys.clear()
         record.status = PromptGroupStatus.GENERATING
 
@@ -578,6 +601,8 @@ class RolloutRecoveryLedger:
         receipt: Optional[dict[str, Any]],
         reward: float,
         mask_sample: bool,
+        reward_checks: RewardChecks | None = None,
+        reward_log_context: RewardLogContext | None = None,
     ) -> None:
         """Record one streamed sibling receipt as soon as the row arrives."""
         cut.require_live()
@@ -605,6 +630,8 @@ class RolloutRecoveryLedger:
                 attempt.receipt == receipt
                 and attempt.reward == float(reward)
                 and attempt.mask_sample is mask_sample
+                and attempt.reward_checks == reward_checks
+                and attempt.reward_log_context == reward_log_context
                 and attempt.staging_keys == staging_keys
             ):
                 return
@@ -622,6 +649,8 @@ class RolloutRecoveryLedger:
         attempt.receipt = copy.deepcopy(receipt)
         attempt.reward = float(reward)
         attempt.mask_sample = mask_sample
+        attempt.reward_checks = reward_checks
+        attempt.reward_log_context = reward_log_context
         attempt.staging_keys = staging_keys
         attempt.status = RolloutAttemptStatus.SEALED
         if all(
@@ -691,6 +720,8 @@ class RolloutRecoveryLedger:
             attempt.receipt = copy.deepcopy(result.receipt)
             attempt.reward = float(result.reward)
             attempt.mask_sample = result.mask_sample
+            attempt.reward_checks = result.reward_checks
+            attempt.reward_log_context = result.reward_log_context
             attempt.staging_keys = staging_keys
             attempt.status = RolloutAttemptStatus.SEALED
         record.status = PromptGroupStatus.READY_TO_FINALIZE
@@ -734,6 +765,8 @@ class RolloutRecoveryLedger:
         list[Optional[dict[str, Any]]],
         list[float],
         list[bool],
+        list[RewardChecks | None],
+        list[RewardLogContext | None],
     ]:
         """Return sealed finalization inputs in stable sibling order."""
         record = self._require_group(group_id)
@@ -744,6 +777,8 @@ class RolloutRecoveryLedger:
         receipts: list[Optional[dict[str, Any]]] = []
         rewards: list[float] = []
         mask_sample: list[bool] = []
+        checks: list[RewardChecks | None] = []
+        log_contexts: list[RewardLogContext | None] = []
         for sibling in record.siblings:
             attempt = sibling.current_attempt
             if (
@@ -759,12 +794,16 @@ class RolloutRecoveryLedger:
             receipts.append(copy.deepcopy(attempt.receipt))
             rewards.append(attempt.reward)
             mask_sample.append(attempt.mask_sample)
+            checks.append(attempt.reward_checks)
+            log_contexts.append(attempt.reward_log_context)
         return (
             record.gate_rollout_ids,
             record.logical_rollout_ids,
             receipts,
             rewards,
             mask_sample,
+            checks,
+            log_contexts,
         )
 
     def mark_finalization_started(
@@ -866,6 +905,16 @@ class RolloutRecoveryLedger:
                                     "receipt": copy.deepcopy(attempt.receipt),
                                     "reward": attempt.reward,
                                     "mask_sample": attempt.mask_sample,
+                                    "reward_checks": dataclasses.asdict(
+                                        attempt.reward_checks
+                                    )
+                                    if attempt.reward_checks is not None
+                                    else None,
+                                    "reward_log_context": dataclasses.asdict(
+                                        attempt.reward_log_context
+                                    )
+                                    if attempt.reward_log_context is not None
+                                    else None,
                                     "staging_keys": list(attempt.staging_keys),
                                 }
                                 for attempt in sibling.attempts
@@ -897,7 +946,7 @@ class RolloutRecoveryLedger:
         if (
             isinstance(schema_version, bool)
             or not isinstance(schema_version, int)
-            or schema_version not in _SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS
+            or schema_version not in SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS
         ):
             raise ValueError(
                 f"Unsupported rollout-recovery schema version: {schema_version!r}"
@@ -1053,6 +1102,17 @@ class RolloutRecoveryLedger:
                 receipt = attempt_state.get("receipt")
                 reward = attempt_state.get("reward")
                 mask_sample = attempt_state.get("mask_sample")
+                raw_checks = attempt_state.get("reward_checks")
+                if raw_checks is not None and (
+                    not isinstance(raw_checks, dict)
+                    or set(raw_checks)
+                    != {"duplicated_reasoning", "empty_final_answer", "low_effort"}
+                ):
+                    raise ValueError("invalid reward_checks record")
+                checks = RewardChecks(**raw_checks) if raw_checks is not None else None
+                log_context = parse_reward_log_context(
+                    attempt_state.get("reward_log_context")
+                )
                 staging_keys = attempt_state.get("staging_keys")
                 if not isinstance(staging_keys, list) or not all(
                     isinstance(key, str) for key in staging_keys
@@ -1083,6 +1143,8 @@ class RolloutRecoveryLedger:
                     receipt is not None
                     or reward is not None
                     or mask_sample is not None
+                    or checks is not None
+                    or log_context is not None
                     or staging_keys
                 ):
                     raise ValueError("only sealed attempts may retain receipt data")
@@ -1093,6 +1155,8 @@ class RolloutRecoveryLedger:
                         receipt=copy.deepcopy(receipt),
                         reward=float(reward) if reward is not None else None,
                         mask_sample=mask_sample,
+                        reward_checks=checks,
+                        reward_log_context=log_context,
                         staging_keys=list(staging_keys),
                     )
                 )
@@ -1218,11 +1282,50 @@ def _validate_batch_shortfall(value: object) -> dict[int, int]:
     return batch_shortfall
 
 
+def _validate_finalizer_metrics(value: object) -> dict[str, dict[str, float]]:
+    """Copy checkpoint-owned statistics; old checkpoints have no pending counts."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("finalizer_metrics_by_group must be a mapping")
+    result: dict[str, dict[str, float]] = {}
+    for group_id, metrics in value.items():
+        if not isinstance(group_id, str) or not isinstance(metrics, dict):
+            raise ValueError("invalid finalizer metrics group")
+        result[group_id] = {}
+        for name, number in metrics.items():
+            if not isinstance(name, str) or type(number) not in (int, float):
+                raise ValueError("invalid finalizer metric name or value")
+            result[group_id][name] = float(number)
+    return result
+
+
+def _validate_finalizer_rewards(value: object) -> dict[str, list[FinalizedReward]]:
+    """Validate per-group observations without retaining checkpoint aliases."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("finalizer_rewards_by_group must be a mapping")
+    result: dict[str, list[FinalizedReward]] = {}
+    for group_id, rows in value.items():
+        if not isinstance(group_id, str) or not isinstance(rows, list):
+            raise ValueError("invalid finalized reward group")
+        observations = [FinalizedReward.from_state(row) for row in rows]
+        if len({row.sample_id for row in observations}) != len(observations):
+            raise ValueError("duplicate finalized reward sample")
+        result[group_id] = observations
+    return result
+
+
 def build_rollout_recovery_state(
     ledger: RolloutRecoveryLedger,
     *,
     batch_shortfall: dict[int, int],
     sampler_stamps_target_steps: bool,
+    finalizer_metrics_by_group: dict[str, dict[str, float]] | None = None,
+    finalizer_rewards_by_group: dict[str, list[FinalizedReward]] | None = None,
+    reward_settings: CaptureRewardSettings | None = None,
+    canonical_group_ids: set[str] | None = None,
 ) -> RolloutRecoveryState:
     """Build the complete versioned sidecar from ledger and controller state."""
     if not isinstance(sampler_stamps_target_steps, bool):
@@ -1232,6 +1335,30 @@ def build_rollout_recovery_state(
     state = ledger.state_dict()
     state["batch_shortfall"] = _validate_batch_shortfall(batch_shortfall)
     state["sampler_stamps_target_steps"] = sampler_stamps_target_steps
+    state["finalizer_metrics_by_group"] = _validate_finalizer_metrics(
+        finalizer_metrics_by_group
+    )
+    state["reward_settings"] = (
+        reward_settings.to_state() if reward_settings is not None else None
+    )
+    state["finalizer_rewards_by_group"] = {
+        group_id: [dataclasses.asdict(row) for row in rows]
+        for group_id, rows in (finalizer_rewards_by_group or {}).items()
+    }
+    if canonical_group_ids is not None:
+        state["groups"] = [
+            group
+            for group in state["groups"]
+            if group["group_id"] not in canonical_group_ids
+        ]
+        for key in ("finalizer_metrics_by_group", "finalizer_rewards_by_group"):
+            state[key] = {
+                group_id: value
+                for group_id, value in state[key].items()
+                if group_id in canonical_group_ids
+            }
+    # Run the same validation seam used by readers before writing a sidecar.
+    parse_rollout_recovery_state(state)
     return state
 
 
@@ -1251,12 +1378,12 @@ def parse_rollout_recovery_state(state: object) -> ParsedRolloutRecoveryState:
     if (
         isinstance(schema_version, bool)
         or not isinstance(schema_version, int)
-        or schema_version not in _SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS
+        or schema_version not in SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS
     ):
         raise ValueError(
             "unsupported rollout recovery schema_version="
             f"{schema_version!r}; supported versions are "
-            f"{sorted(_SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS)}"
+            f"{sorted(SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS)}"
         )
     groups = state.get("groups")
     if not isinstance(groups, list):
@@ -1272,8 +1399,33 @@ def parse_rollout_recovery_state(state: object) -> ParsedRolloutRecoveryState:
         "schema_version": schema_version,
         "groups": groups,
     }
+    reward_settings = (
+        CaptureRewardSettings.from_state(state["reward_settings"])
+        if state.get("reward_settings") is not None
+        else None
+    )
+    finalizer_metrics = _validate_finalizer_metrics(
+        state.get("finalizer_metrics_by_group")
+    )
+    finalizer_rewards = _validate_finalizer_rewards(
+        state.get("finalizer_rewards_by_group")
+    )
+    if reward_settings is not None:
+        if set(finalizer_rewards) - set(finalizer_metrics):
+            raise ValueError(
+                "finalized reward observations require matching group metrics"
+            )
+        for group_id, metrics in finalizer_metrics.items():
+            count = metrics.get("finalize/reward_count")
+            if count is not None and count != len(finalizer_rewards.get(group_id, [])):
+                raise ValueError(
+                    f"finalized reward observations do not match valid-row count for {group_id!r}"
+                )
     return ParsedRolloutRecoveryState(
         ledger_state=ledger_state,
         batch_shortfall=_validate_batch_shortfall(state.get("batch_shortfall", {})),
         sampler_stamps_target_steps=raw_sampler_stamps,
+        finalizer_metrics_by_group=finalizer_metrics,
+        finalizer_rewards_by_group=finalizer_rewards,
+        reward_settings=reward_settings,
     )

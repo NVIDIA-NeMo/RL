@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Literal, Mapping, Optional, get_args
 
 from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
+from nemo_rl.experience.reward_penalties import CaptureRewardSettings
 
 ROLLOUT_SNAPSHOT_SCHEMA_VERSION = 3
 BOOTSTRAP_COMPATIBILITY_SCHEMA_VERSION = 7
@@ -345,6 +346,24 @@ def bootstrap_compatibility_identity(
 ) -> BootstrapCompatibilityIdentity:
     """Remove explicitly operational paths from the fail-closed run identity."""
     dumped = master_config.model_dump(mode="json")
+    capture = dumped.get("token_capture")
+    if capture is not None and capture["enabled"]:
+        # Use the same semantic contract as sidecar restore; otherwise the
+        # bootstrap fingerprint would reject harmless reward-config extras first.
+        gym = dumped["env"].get("nemo_gym")
+        settings = CaptureRewardSettings.from_state(
+            {
+                "penalties": dumped["reward_penalties"],
+                "effort": gym.get("effort_levels") if gym is not None else None,
+            }
+        ).to_state()
+        dumped["reward_penalties"] = settings["penalties"]
+        if gym is not None:
+            gym.pop("effort_levels", None)
+            if settings["effort"] is not None:
+                gym["effort_levels"] = settings["effort"]
+            if not gym:
+                dumped["env"].pop("nemo_gym")
     rollout_checkpointing = dumped.get("rollout_checkpointing", {})
     if not isinstance(rollout_checkpointing, Mapping):
         raise TypeError("rollout_checkpointing config must be a mapping")

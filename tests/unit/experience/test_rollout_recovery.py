@@ -821,17 +821,24 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
 
     state = ledger.state_dict()
     restored = RolloutRecoveryLedger.from_state_dict(state)
-    physical_ids, _, restored_receipts, rewards, mask_sample = (
-        restored.finalization_inputs("g7")
-    )
+    (
+        physical_ids,
+        _,
+        restored_receipts,
+        rewards,
+        mask_sample,
+        evidence,
+        log_contexts,
+    ) = restored.finalization_inputs("g7")
 
     assert physical_ids == gate_ids
     assert restored_receipts[0] is None
     assert restored_receipts[1] == receipts[1]
     assert rewards == [0.0, 1.0]
     assert mask_sample == [True, False]
+    assert log_contexts == [None, None]
 
-    state["schema_version"] = 3
+    state["schema_version"] = ROLLOUT_RECOVERY_SCHEMA_VERSION + 1
     with pytest.raises(ValueError, match="Unsupported rollout-recovery schema version"):
         RolloutRecoveryLedger.from_state_dict(state)
 
@@ -1097,3 +1104,181 @@ def test_restore_rejects_inconsistent_shared_admission_state() -> None:
 
     with pytest.raises(ValueError, match="disagree on phase or target_step"):
         _load(RolloutRecoveryLedger(), state)
+
+
+@pytest.mark.parametrize("granularity", list(RecoveryGranularity))
+def test_reward_checks_seals_and_survives_checkpoint(granularity):
+    from nemo_rl.experience.reward_penalties import RewardChecks, RewardLogContext
+
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(
+        ledger,
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=1,
+        target_step=0,
+        start_weight_version=4,
+        group_id="g7",
+        recovery_granularity=granularity,
+    )
+    _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
+    rollout_id = group.gate_rollout_ids[0]
+    evidence = RewardChecks(True, True, True)
+    context = RewardLogContext("agent", '{"answer":"ok"}')
+    result = SiblingSealResult(
+        rollout_id,
+        {"rollout_id": rollout_id, "manifest": []},
+        -2.0,
+        False,
+        evidence,
+        context,
+    )
+    if granularity == RecoveryGranularity.SIBLING:
+
+        def seal(e):
+            _mutate(
+                lambda cut: ledger.mark_sibling_sealed(
+                    cut,
+                    "g7",
+                    generation_index=0,
+                    gate_rollout_id=rollout_id,
+                    receipt=result.receipt,
+                    reward=result.reward,
+                    mask_sample=False,
+                    reward_checks=e,
+                    reward_log_context=context,
+                )
+            )
+
+        seal(evidence)
+        seal(evidence)
+        for field in dataclasses.fields(evidence):
+            with pytest.raises(ValueError, match="conflicting duplicate"):
+                seal(dataclasses.replace(evidence, **{field.name: False}))
+    else:
+        _mutate(lambda cut: ledger.mark_group_sealed(cut, "g7", {0: result}))
+    state = ledger.state_dict()
+    restored = RolloutRecoveryLedger.from_state_dict(state)
+    _bind(restored, "g7", _prompt())
+    assert restored.state_dict() == state
+    assert restored.finalization_inputs("g7")[3] == [-2.0]
+    assert restored.finalization_inputs("g7")[5] == [evidence]
+    assert restored.finalization_inputs("g7")[6] == [context]
+    attempt = state["groups"][0]["siblings"][0]["attempts"][0]
+    attempt["reward_checks"]["low_effort"] = "false"
+    with pytest.raises(ValueError, match="reward checks must be booleans"):
+        RolloutRecoveryLedger.from_state_dict(state)
+
+
+def test_checkpoint_preserves_pending_finalizer_metrics_independently_of_sealed_groups():
+    metrics = {
+        "canonical_group": {
+            "finalize/reward_count": 2.0,
+            "finalize/penalty_count/empty_final_answer": 1.0,
+        }
+    }
+    state = build_rollout_recovery_state(
+        RolloutRecoveryLedger(),
+        batch_shortfall={},
+        sampler_stamps_target_steps=True,
+        finalizer_metrics_by_group=metrics,
+    )
+    parsed = parse_rollout_recovery_state(state)
+    assert parsed.finalizer_metrics_by_group == metrics
+    metrics["canonical_group"]["finalize/reward_count"] = 99.0
+    assert (
+        parsed.finalizer_metrics_by_group["canonical_group"]["finalize/reward_count"]
+        == 2.0
+    )
+    del state["finalizer_metrics_by_group"]
+    assert parse_rollout_recovery_state(state).finalizer_metrics_by_group == {}
+
+
+@pytest.mark.parametrize(
+    "raw_checks",
+    [
+        "not-a-mapping",
+        {"duplicated_reasoning": True, "empty_final_answer": True},
+        {
+            "duplicated_reasoning": True,
+            "empty_final_answer": True,
+            "low_effort": True,
+            "extra": True,
+        },
+    ],
+)
+def test_restore_rejects_malformed_reward_checks(raw_checks):
+    from nemo_rl.experience.reward_penalties import RewardChecks
+
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(
+        ledger,
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=1,
+        target_step=0,
+        start_weight_version=4,
+        group_id="g7",
+        recovery_granularity=RecoveryGranularity.PROMPT_GROUP,
+    )
+    _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
+    rollout_id = group.gate_rollout_ids[0]
+    result = SiblingSealResult(
+        rollout_id,
+        {"rollout_id": rollout_id, "manifest": []},
+        1.0,
+        False,
+        RewardChecks(False, False, False),
+    )
+    _mutate(lambda cut: ledger.mark_group_sealed(cut, "g7", {0: result}))
+    state = ledger.state_dict()
+    state["groups"][0]["siblings"][0]["attempts"][0]["reward_checks"] = raw_checks
+    with pytest.raises(ValueError):
+        RolloutRecoveryLedger.from_state_dict(state)
+
+
+def test_checkpoint_validates_reward_settings_and_observations():
+    from nemo_rl.algorithms.grpo import RewardPenaltyConfig
+    from nemo_rl.experience.reward_penalties import (
+        CaptureRewardSettings,
+        FinalizedReward,
+        RewardLogContext,
+    )
+
+    settings = CaptureRewardSettings.from_configs(
+        RewardPenaltyConfig(penalize_empty_final_answer=True), None
+    )
+    observation = FinalizedReward(
+        "sample", "attempt", 0.0, RewardLogContext("agent", '{"answer":"empty"}')
+    )
+    state = build_rollout_recovery_state(
+        RolloutRecoveryLedger(),
+        batch_shortfall={},
+        sampler_stamps_target_steps=True,
+        reward_settings=settings,
+        finalizer_rewards_by_group={"kept": [observation], "stale": [observation]},
+        finalizer_metrics_by_group={
+            "kept": {"finalize/reward_count": 1.0},
+            "stale": {"finalize/reward_count": 1.0},
+        },
+        canonical_group_ids={"kept"},
+    )
+    parsed = parse_rollout_recovery_state(state)
+    assert parsed.reward_settings == settings
+    assert parsed.finalizer_rewards_by_group == {"kept": [observation]}
+    assert set(parsed.finalizer_metrics_by_group) == {"kept"}
+    state["finalizer_rewards_by_group"]["kept"][0]["reward"] = "bad"
+    with pytest.raises(ValueError, match="reward must be numeric"):
+        parse_rollout_recovery_state(state)
+    state["finalizer_rewards_by_group"] = {}
+    with pytest.raises(ValueError, match="valid-row count"):
+        parse_rollout_recovery_state(state)
+    state["reward_settings"]["version"] = 999
+    with pytest.raises(ValueError, match="unsupported capture reward_settings"):
+        parse_rollout_recovery_state(state)
+
+
+def test_schema_2_noncapture_sidecar_remains_readable():
+    parsed = parse_rollout_recovery_state({"schema_version": 2, "groups": []})
+    assert parsed.reward_settings is None
+    assert parsed.finalizer_rewards_by_group == {}
