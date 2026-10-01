@@ -328,6 +328,8 @@ project-includes = [
   "nemo_rl/weight_sync/vllm_remote_sparse_weight_synchronizer.py",
   "nemo_rl/weight_sync/xferdtensor.py",
   "nemo_rl/weight_sync/xferdtensor_python.py",
+  "tools/benchmark_tq_prefix_writes.py",
+  "tools/benchmark_prefix_checkpoint_proxy.py",
   "tools/external_gym_vllm/serve_vllm_on_ray.py",
   "tools/external_gym_vllm/vllm_pool_lb.py",
   "tools/model_diagnostics/1.max_model_len_respected.py",

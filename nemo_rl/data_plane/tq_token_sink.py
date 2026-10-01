@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -53,6 +54,7 @@ if TYPE_CHECKING:
         StageResult,
     )
 
+from nemo_rl.data_plane.codec import stack_or_nest
 from nemo_rl.data_plane.schema import (
     ROUTE_ENCODING_ENVELOPE,
     ROUTE_ENCODING_LIST,
@@ -240,124 +242,7 @@ class TQTokenSink:
         from nemo_gym.token_id_capture.staging.records import StageResult
 
         try:
-            field_dict = {
-                "token_ids_delta": torch.tensor(
-                    [record.token_ids_delta], dtype=torch.int64
-                ),
-                "token_mask_delta": torch.tensor(
-                    [record.token_mask_delta], dtype=torch.float32
-                ),
-                "generation_logprobs_delta": torch.tensor(
-                    [record.generation_log_probs_delta], dtype=torch.float32
-                ),
-                "schema_version": torch.tensor(
-                    [record.schema_version], dtype=torch.int64
-                ),
-                "digest_version": torch.tensor(
-                    [record.digest_version], dtype=torch.int64
-                ),
-                "extras_digest_version": torch.tensor(
-                    [record.extras_digest_version], dtype=torch.int64
-                ),
-                "rollout_id_utf8": _bytes_tensor(record.rollout_id.encode("utf-8")),
-                "model_call_id_utf8": _bytes_tensor(
-                    record.model_call_id.encode("utf-8")
-                ),
-                "parent_call_id_utf8": _bytes_tensor(
-                    (record.parent_call_id or "\0").encode("utf-8")
-                ),
-                "parent_call_id_present": torch.tensor(
-                    [record.parent_call_id is not None], dtype=torch.bool
-                ),
-                "capture_mode": torch.tensor(
-                    [_MODE_TO_CODE[record.mode]], dtype=torch.int64
-                ),
-                "prev_len": torch.tensor([record.prev_len], dtype=torch.int64),
-                "delta_len": torch.tensor([record.delta_len], dtype=torch.int64),
-                "cum_len": torch.tensor([record.cum_len], dtype=torch.int64),
-                "weight_version": torch.tensor(
-                    [record.weight_version], dtype=torch.int64
-                ),
-                "digest_bytes": _bytes_tensor(bytes.fromhex(record.digest)),
-                "extras_digest_bytes": _bytes_tensor(
-                    bytes.fromhex(record.extras_digest)
-                ),
-            }
-            chain_hash, chain_hash_present = _optional_digest_fields(record.chain_hash)
-            cumulative_hash, cumulative_hash_present = _optional_digest_fields(
-                record.cumulative_hash
-            )
-            field_dict.update(
-                {
-                    "chain_hash_bytes": chain_hash,
-                    "chain_hash_present": chain_hash_present,
-                    "cumulative_hash_bytes": cumulative_hash,
-                    "cumulative_hash_present": cumulative_hash_present,
-                }
-            )
-            extras_metadata = dict(record.extras) if record.extras is not None else None
-            routed = (
-                extras_metadata.pop("routed_experts", None)
-                if extras_metadata is not None
-                else None
-            )
-            field_dict[ROUTED_EXTRAS_METADATA_FIELD] = _bytes_tensor(
-                json.dumps(
-                    extras_metadata,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    ensure_ascii=False,
-                ).encode("utf-8")
-            )
-            routed_len = 0
-            routed_encoding = ROUTE_ENCODING_NONE
-            if routed is not None:
-                delta_len = len(record.token_ids_delta)
-                if isinstance(routed, str):
-                    from nemo_rl.utils.routed_experts_codec import (
-                        decode_routed_experts,
-                    )
-
-                    dtype_name = routed.split(":", 3)[1]
-                    dtype = {
-                        "int8": torch.int8,
-                        "int16": torch.int16,
-                        "int32": torch.int32,
-                    }.get(dtype_name)
-                    if dtype is None:
-                        raise ValueError(
-                            f"unsupported routed_experts dtype {dtype_name!r}"
-                        )
-                    experts = decode_routed_experts(routed, dtype)
-                    routed_encoding = ROUTE_ENCODING_ENVELOPE
-                else:
-                    experts = torch.tensor(routed, dtype=torch.int16)
-                    routed_encoding = ROUTE_ENCODING_LIST
-                if experts.dim() != 3 or experts.shape[0] != delta_len:
-                    raise ValueError(
-                        "routed_experts must already be delta-aligned: "
-                        f"got shape {tuple(experts.shape)} for delta_len={delta_len}"
-                    )
-                field_dict[ROUTED_EXPERTS_FIELD] = experts.unsqueeze(0)
-                routed_len = int(experts.shape[0])
-            field_dict[ROUTED_EXPERTS_ENCODING_FIELD] = torch.tensor(
-                [routed_encoding], dtype=torch.int64
-            )
-            field_dict[ROUTED_LEN_FIELD] = torch.tensor([routed_len], dtype=torch.int64)
-            fields = TensorDict(field_dict, batch_size=[1])
-            tags = [
-                {
-                    "rollout_id": record.rollout_id,
-                    "model_call_id": record.model_call_id,
-                    "parent_call_id": record.parent_call_id,
-                    "prev_len": record.prev_len,
-                    "delta_len": record.delta_len,
-                    "cum_len": record.cum_len,
-                    "weight_version": record.weight_version,
-                    "digest": record.digest,
-                    "schema_version": record.schema_version,
-                }
-            ]
+            fields, tags = self._encode_record(record)
             _call_dp(
                 self._dp_client,
                 "put_samples",
@@ -380,6 +265,208 @@ class TQTokenSink:
                 ok=False, staging_key=key, error=f"{type(error).__name__}: {error}"
             )
         return StageResult(ok=True, staging_key=key)
+
+    @staticmethod
+    def _encode_record(
+        record: StagedCallRecord,
+    ) -> tuple[TensorDict, list[dict[str, Any]]]:
+        """Encode one row without publishing it."""
+        field_dict = {
+            "token_ids_delta": torch.tensor(
+                [record.token_ids_delta], dtype=torch.int64
+            ),
+            "token_mask_delta": torch.tensor(
+                [record.token_mask_delta], dtype=torch.float32
+            ),
+            "generation_logprobs_delta": torch.tensor(
+                [record.generation_log_probs_delta], dtype=torch.float32
+            ),
+            "schema_version": torch.tensor([record.schema_version], dtype=torch.int64),
+            "digest_version": torch.tensor([record.digest_version], dtype=torch.int64),
+            "extras_digest_version": torch.tensor(
+                [record.extras_digest_version], dtype=torch.int64
+            ),
+            "rollout_id_utf8": _bytes_tensor(record.rollout_id.encode("utf-8")),
+            "model_call_id_utf8": _bytes_tensor(record.model_call_id.encode("utf-8")),
+            "parent_call_id_utf8": _bytes_tensor(
+                (record.parent_call_id or "\0").encode("utf-8")
+            ),
+            "parent_call_id_present": torch.tensor(
+                [record.parent_call_id is not None], dtype=torch.bool
+            ),
+            "capture_mode": torch.tensor(
+                [_MODE_TO_CODE[record.mode]], dtype=torch.int64
+            ),
+            "prev_len": torch.tensor([record.prev_len], dtype=torch.int64),
+            "delta_len": torch.tensor([record.delta_len], dtype=torch.int64),
+            "cum_len": torch.tensor([record.cum_len], dtype=torch.int64),
+            "weight_version": torch.tensor([record.weight_version], dtype=torch.int64),
+            "digest_bytes": _bytes_tensor(bytes.fromhex(record.digest)),
+            "extras_digest_bytes": _bytes_tensor(bytes.fromhex(record.extras_digest)),
+        }
+        chain_hash, chain_hash_present = _optional_digest_fields(record.chain_hash)
+        cumulative_hash, cumulative_hash_present = _optional_digest_fields(
+            record.cumulative_hash
+        )
+        field_dict.update(
+            {
+                "chain_hash_bytes": chain_hash,
+                "chain_hash_present": chain_hash_present,
+                "cumulative_hash_bytes": cumulative_hash,
+                "cumulative_hash_present": cumulative_hash_present,
+            }
+        )
+        extras_metadata = dict(record.extras) if record.extras is not None else None
+        routed = (
+            extras_metadata.pop("routed_experts", None)
+            if extras_metadata is not None
+            else None
+        )
+        field_dict[ROUTED_EXTRAS_METADATA_FIELD] = _bytes_tensor(
+            json.dumps(
+                extras_metadata,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        )
+        routed_len = 0
+        routed_encoding = ROUTE_ENCODING_NONE
+        if routed is not None:
+            delta_len = len(record.token_ids_delta)
+            if isinstance(routed, str):
+                from nemo_rl.utils.routed_experts_codec import (
+                    decode_routed_experts,
+                )
+
+                dtype_name = routed.split(":", 3)[1]
+                dtype = {
+                    "int8": torch.int8,
+                    "int16": torch.int16,
+                    "int32": torch.int32,
+                }.get(dtype_name)
+                if dtype is None:
+                    raise ValueError(f"unsupported routed_experts dtype {dtype_name!r}")
+                experts = decode_routed_experts(routed, dtype)
+                routed_encoding = ROUTE_ENCODING_ENVELOPE
+            else:
+                experts = torch.tensor(routed, dtype=torch.int16)
+                routed_encoding = ROUTE_ENCODING_LIST
+            if experts.dim() != 3 or experts.shape[0] != delta_len:
+                raise ValueError(
+                    "routed_experts must already be delta-aligned: "
+                    f"got shape {tuple(experts.shape)} for delta_len={delta_len}"
+                )
+            field_dict[ROUTED_EXPERTS_FIELD] = experts.unsqueeze(0)
+            routed_len = int(experts.shape[0])
+        field_dict[ROUTED_EXPERTS_ENCODING_FIELD] = torch.tensor(
+            [routed_encoding], dtype=torch.int64
+        )
+        field_dict[ROUTED_LEN_FIELD] = torch.tensor([routed_len], dtype=torch.int64)
+        fields = TensorDict(field_dict, batch_size=[1])
+        tags = [
+            {
+                "rollout_id": record.rollout_id,
+                "model_call_id": record.model_call_id,
+                "parent_call_id": record.parent_call_id,
+                "prev_len": record.prev_len,
+                "delta_len": record.delta_len,
+                "cum_len": record.cum_len,
+                "weight_version": record.weight_version,
+                "digest": record.digest,
+                "schema_version": record.schema_version,
+            }
+        ]
+        return fields, tags
+
+    def stage_generation_prefix_batch(
+        self,
+        records: Sequence[StagedCallRecord],
+        *,
+        checkpoint_id: str,
+        chunk_sequences: Sequence[int],
+    ) -> list[StageResult]:
+        """Synchronously publish prefixes, preserving one result per input row.
+
+        Success is returned only after TQ acknowledges the whole compatible
+        batch. A failed write reports failure for every member of that batch;
+        callers must not publish its lineage. Optional route columns and route
+        shapes are grouped separately so missing routes never become fabricated
+        payloads. Variable token and identity lengths remain jagged.
+        """
+        # Gym is an optional dependency outside capture-enabled runs.
+        from nemo_gym.token_id_capture.staging.records import StageResult
+
+        if len(records) != len(chunk_sequences):
+            raise ValueError("records and chunk_sequences must have equal lengths")
+        keys = [
+            generation_cut_staging_key(
+                checkpoint_id,
+                record.rollout_id,
+                record.model_call_id,
+                chunk_sequence=sequence,
+            )
+            for record, sequence in zip(records, chunk_sequences, strict=True)
+        ]
+        if len(set(keys)) != len(keys):
+            raise ValueError("generation-prefix batch contains duplicate staging keys")
+        if not records:
+            return []
+
+        results = [
+            StageResult(ok=False, staging_key=key, error="not written") for key in keys
+        ]
+        groups: dict[tuple[Any, ...], list[tuple[int, TensorDict, dict[str, Any]]]] = {}
+        for index, record in enumerate(records):
+            try:
+                fields, tags = self._encode_record(record)
+                signature = tuple(
+                    (name, fields[name].dtype, tuple(fields[name].shape[2:]))
+                    for name in sorted(fields.keys())
+                )
+                groups.setdefault(signature, []).append((index, fields, tags[0]))
+            except Exception as error:  # Encoding failures must fail closed.
+                results[index] = StageResult(
+                    ok=False,
+                    staging_key=keys[index],
+                    error=f"{type(error).__name__}: {error}",
+                )
+
+        for group in groups.values():
+            indices = [item[0] for item in group]
+            try:
+                fields = TensorDict(
+                    {
+                        name: stack_or_nest([item[1][name][0] for item in group])
+                        for name in group[0][1].keys()
+                    },
+                    batch_size=[len(group)],
+                )
+                _call_dp(
+                    self._dp_client,
+                    "put_samples",
+                    sample_ids=[keys[index] for index in indices],
+                    partition_id=self._staging_partition,
+                    fields=fields,
+                    tags=[item[2] for item in group],
+                )
+            except Exception as error:  # Batch failures must fail closed.
+                logging.getLogger(__name__).warning(
+                    "TQ generation-prefix batch failed for %d rows: %s: %s",
+                    len(group),
+                    type(error).__name__,
+                    error,
+                )
+                for index in indices:
+                    results[index] = StageResult(
+                        ok=False,
+                        staging_key=keys[index],
+                        error=f"{type(error).__name__}: {error}",
+                    )
+            else:
+                for index in indices:
+                    results[index] = StageResult(ok=True, staging_key=keys[index])
+        return results
 
     def clear(self, staging_keys: list[str]) -> None:
         """Drop staged rows (finalizer / eviction cleanup)."""

@@ -18,7 +18,7 @@ import asyncio
 import logging
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Generator
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -702,7 +702,34 @@ class GenerationCutCaptureMixin:
         state: _RequestCaptureState,
         checkpoint_id: str,
     ) -> Any | None:
-        """Cut one live call, or return ``None`` if abort won the race."""
+        """Single-row compatibility path using the freeze/seal transaction."""
+        transaction = self._generation_cut_transaction(prefix, state, checkpoint_id)
+        try:
+            try:
+                record, sequence = next(transaction)
+            except StopIteration as finished:
+                return finished.value
+            result = self._capture_sink.stage_generation_prefix(
+                record, checkpoint_id=checkpoint_id, chunk_sequence=sequence
+            )
+            acknowledgement = transaction.send(result)
+            try:
+                transaction.send(None)
+            except StopIteration:
+                return acknowledgement
+            raise RuntimeError("generation-cut transaction did not seal")
+        finally:
+            transaction.close()
+
+    def _generation_cut_transaction(
+        self, prefix: Any, state: _RequestCaptureState, checkpoint_id: str
+    ) -> Generator[Any, Any, Any]:
+        """Own lifecycle until a staged row and acknowledgement are validated.
+
+        Yield ``(record, sequence)``, receive a ``StageResult``, then yield a
+        validated acknowledgement. The caller resumes once more to seal, or
+        closes to roll back. Calls needing no new row return immediately.
+        """
         from nemo_gym._checkpoint.model_control_contracts import (
             GenerationCutPrefixAck,
         )
@@ -772,6 +799,11 @@ class GenerationCutCaptureMixin:
                     disposition="durable_failure",
                 )
             if effective_output_limit is None:
+                with state.lock:
+                    state.rollback_frozen_buffer(checkpoint_id)
+                    state.refresh_periodic_flush_due(
+                        self._generation_chunk_flush_tokens
+                    )
                 raise RuntimeError(
                     f"cannot cut model call {prefix.model_call_id!r}: "
                     "vLLM did not resolve its effective output limit"
@@ -795,11 +827,7 @@ class GenerationCutCaptureMixin:
                             generated_logprobs=chunk_logprobs,
                         )
                     )
-                    result = sink.stage_generation_prefix(
-                        chunk_record,
-                        checkpoint_id=checkpoint_id,
-                        chunk_sequence=chunk_sequence,
-                    )
+                    result = yield chunk_record, chunk_sequence
                     staged_key = result.staging_key
                     if not result.ok:
                         raise RuntimeError(
@@ -827,6 +855,10 @@ class GenerationCutCaptureMixin:
                         terminal_finish_reason=terminal_finish_reason,
                         terminal_stop_reason=terminal_stop_reason,
                     )
+                if chunk_token_ids:
+                    # Every row in a batch must validate before any row seals.
+                    yield acknowledgement
+                with state.lock:
                     # Validate the complete acknowledgement before adopting the
                     # staged chunk. A failed acknowledgement must leave the
                     # frozen buffer available for rollback.
@@ -836,7 +868,9 @@ class GenerationCutCaptureMixin:
                     state.refresh_periodic_flush_due(
                         self._generation_chunk_flush_tokens
                     )
-            except Exception:
+            except BaseException:
+                # Generator.close() injects GeneratorExit when a batch fails.
+                # Roll back the detached state without hiding the root failure.
                 with state.lock:
                     frozen = state.frozen_buffer
                     if frozen is not None and frozen.checkpoint_id == checkpoint_id:
@@ -855,6 +889,141 @@ class GenerationCutCaptureMixin:
                 raise
             return acknowledgement
 
+    def _checkpoint_generation_cut_batched(self, inventory: Any) -> list[Any]:
+        """Batch independently per owner, retaining lifecycle locks until seal."""
+        from nemo_rl.data_plane.tq_token_sink import generation_cut_staging_key
+
+        if (
+            self._generation_prefix_batch_size is None
+            or self._generation_prefix_batch_max_tokens is None
+        ):
+            raise RuntimeError(
+                "generation-prefix batch limits require token capture setup"
+            )
+        call_ids = [prefix.model_call_id for prefix in inventory.active_prefixes]
+        if len(set(call_ids)) != len(call_ids):
+            raise ValueError(
+                "generation-cut inventory contains duplicate model-call identities"
+            )
+
+        sink = self._capture_sink
+        acknowledgements: list[Any] = []
+        pending: list[tuple[Generator[Any, Any, Any], Any, int]] = []
+        pending_tokens = 0
+
+        def flush() -> None:
+            nonlocal pending_tokens
+            if not pending:
+                return
+            keys = [
+                generation_cut_staging_key(
+                    inventory.checkpoint_id,
+                    record.rollout_id,
+                    record.model_call_id,
+                    chunk_sequence=sequence,
+                )
+                for _, record, sequence in pending
+            ]
+            sealed_keys: set[str] = set()
+            try:
+                results = sink.stage_generation_prefix_batch(
+                    [record for _, record, _ in pending],
+                    checkpoint_id=inventory.checkpoint_id,
+                    chunk_sequences=[sequence for _, _, sequence in pending],
+                )
+                if len(results) != len(pending):
+                    raise RuntimeError(
+                        "generation-prefix batch returned an incorrect result count"
+                    )
+                for result, key in zip(results, keys, strict=True):
+                    if not result.ok or result.staging_key != key:
+                        raise RuntimeError(
+                            "generation-prefix batch staging failed: "
+                            f"{result.error}; key={key}"
+                        )
+                batch_acks = [
+                    transaction.send(result)
+                    for (transaction, _, _), result in zip(
+                        pending, results, strict=True
+                    )
+                ]
+                for (transaction, _, _), key in zip(pending, keys, strict=True):
+                    try:
+                        transaction.send(None)
+                    except StopIteration:
+                        sealed_keys.add(key)
+                    else:
+                        raise RuntimeError("generation-cut transaction did not seal")
+                acknowledgements.extend(batch_acks)
+            except BaseException:
+                # A transport error may happen after TQ accepted some rows.
+                # These are new chunk keys, never earlier sealed prefix keys.
+                rejected = [key for key in keys if key not in sealed_keys]
+                if rejected:
+                    try:
+                        sink.clear(rejected)
+                    except Exception:
+                        LOGGER.exception(
+                            "Failed to clear rejected generation-prefix batch"
+                        )
+                raise
+            finally:
+                for transaction, _, _ in pending:
+                    transaction.close()
+                pending.clear()
+                pending_tokens = 0
+
+        try:
+            for prefix in inventory.active_prefixes:
+                with self._capture_registry_lock:
+                    state = self._capture_calls_by_model_call_id.get(
+                        prefix.model_call_id
+                    )
+                if state is None:
+                    acknowledgement = self._completed_generation_cut_ack(
+                        prefix, inventory.checkpoint_id
+                    )
+                    acknowledgements.append(acknowledgement)
+                    continue
+                transaction = self._generation_cut_transaction(
+                    prefix, state, inventory.checkpoint_id
+                )
+                try:
+                    try:
+                        record, sequence = next(transaction)
+                    except StopIteration as finished:
+                        acknowledgement = finished.value
+                        if acknowledgement is None:
+                            acknowledgement = self._completed_generation_cut_ack(
+                                prefix, inventory.checkpoint_id
+                            )
+                        acknowledgements.append(acknowledgement)
+                        continue
+                    tokens = len(record.token_ids_delta)
+                    if (
+                        pending
+                        and pending_tokens + tokens
+                        > self._generation_prefix_batch_max_tokens
+                    ):
+                        flush()
+                    pending.append((transaction, record, sequence))
+                except BaseException:
+                    transaction.close()
+                    raise
+                pending_tokens += tokens
+                if (
+                    len(pending) >= self._generation_prefix_batch_size
+                    or pending_tokens >= self._generation_prefix_batch_max_tokens
+                ):
+                    # An oversized single row is written alone, never split.
+                    flush()
+            flush()
+        finally:
+            for transaction, _, _ in pending:
+                transaction.close()
+        by_ticket = {ack.ticket_id: ack for ack in acknowledgements}
+        return [by_ticket[prefix.ticket_id] for prefix in inventory.active_prefixes]
+
     def _checkpoint_generation_cut(self, inventory: Any) -> Any:
         """Stage a stable prefix for every call named by Gym's frozen inventory."""
         from nemo_gym._checkpoint.model_control_contracts import (
@@ -871,7 +1040,15 @@ class GenerationCutCaptureMixin:
         if cached_receipt is not None:
             return cached_receipt
         acknowledgements = []
-        for prefix in inventory.active_prefixes:
+        single_prefixes = inventory.active_prefixes
+        if self._generation_prefix_batch_size is None:
+            raise RuntimeError(
+                "generation-prefix batch limits require token capture setup"
+            )
+        if self._generation_prefix_batch_size > 1:
+            acknowledgements = self._checkpoint_generation_cut_batched(inventory)
+            single_prefixes = ()
+        for prefix in single_prefixes:
             with self._capture_registry_lock:
                 state = self._capture_calls_by_model_call_id.get(prefix.model_call_id)
             if state is None:
