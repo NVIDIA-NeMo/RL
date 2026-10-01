@@ -1,0 +1,384 @@
+# Mixed teachers use Gym prompt construction and upstream engine-media capture.
+# Disable the static-video-only data contract for this image/frame manifest.
+defaults: ./vlm_grpo-nemotron-super-omni-120ba12b-32n4g-megatron-tp2ep16cp1-async-gym.v1.yaml
+cluster:
+  num_nodes: 32
+  gpus_per_node: 4
+  segment_size: 8
+grpo:
+  num_prompts_per_step: 128
+  num_generations_per_prompt: 16
+  max_num_epochs: 1
+  max_num_steps: 125
+  max_rollout_turns: 1
+  overlong_filtering: true
+  seq_logprob_error_threshold: 2
+  skip_reference_policy_logprobs_calculation: true
+  deduplicate_multimodal_data: false
+  advantage_clip_low: -50
+  advantage_clip_high: 50
+  zero_variance_prompt_filtering: false
+  use_dynamic_sampling: false
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  async_grpo: null
+  adv_estimator:
+    name: grpo
+    normalize_rewards: true
+    use_leave_one_out_baseline: true
+    minus_baseline: true
+    subtract_global_baseline: false
+    proximal_teacher_alpha: 1.0
+    reward_weights: null
+  reward_scaling:
+    enabled: false
+  reward_shaping:
+    enabled: false
+loss_fn:
+  disable_ppo_ratio: false
+  force_on_policy_ratio: false
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  ratio_clip_c: null
+  reference_policy_kl_penalty: 0.0
+  reference_policy_kl_type: k3
+  kl_input_clamp_value: null
+  kl_output_clamp_value: null
+  token_level_loss: false
+  sequence_level_importance_ratios: false
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 5.0
+  truncated_importance_sampling_ratio_min: 0.2
+  use_importance_sampling_correction: true
+  use_on_policy_kl_approximation: true
+  use_kl_in_reward: false
+  use_cispo: false
+  positive_example_nll_weight: 0.0
+policy:
+  is_vlm: true
+  model_name: ${oc.env:MM_TRAINER_MODEL_PATH}
+  train_global_batch_size: 2048
+  train_micro_batch_size: 1
+  max_total_sequence_length: 65536
+  logprob_batch_size: 1
+  logprob_chunk_size: 2048
+  make_sequence_length_divisible_by: 8
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template: ${policy.model_name}/chat_template.jinja
+    chat_template_kwargs:
+      enable_thinking: true
+      truncate_history_thinking: false
+    video:
+      num_frames: 64
+  hf_config_overrides:
+    video_temporal_patch_size: 2
+    video_target_num_patches: 1024
+    video_maintain_aspect_ratio: false
+  sequence_packing:
+    enabled: true
+    algorithm: modified_first_fit_decreasing
+    train_mb_tokens: 65536
+    logprob_mb_tokens: 65536
+    sequence_length_round: 64
+    microbatch_order: largest_first
+    fuse_loss: true
+  router_replay:
+    enabled: true
+    transport: ray
+  megatron_cfg:
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 16
+    expert_tensor_parallel_size: 1
+    context_parallel_size: 2
+    sequence_parallel: true
+    activation_checkpointing: true
+    recompute_granularity: full
+    bias_activation_fusion: false
+    defer_fp32_logits: true
+    fp32_lm_head: true
+    empty_unused_memory_level: 2
+    mtp_num_layers: 0
+    mtp_loss_scaling_factor: 0.0
+    mtp_use_repeated_layer: false
+    mtp_detach_heads: true
+    freeze_vision_model: true
+    freeze_vision_projection: true
+    freeze_sound_encoder: true
+    freeze_sound_projection: true
+    radio_force_cpe_eval_mode: true
+    freeze_moe_router: true
+    moe_router_load_balancing_type: none
+    moe_router_bias_update_rate: 0.001
+    moe_router_dtype: fp32
+    moe_router_enable_expert_bias: true
+    moe_aux_loss_coeff: 0.0
+    moe_token_dispatcher_type: alltoall
+    moe_enable_deepep: false
+    moe_shared_expert_overlap: false
+    moe_per_layer_logging: false
+    gradient_accumulation_fusion: false
+    distributed_data_parallel_config:
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+      grad_reduce_in_fp32: false
+      average_in_collective: false
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: optim_grads_params
+    optimizer:
+      optimizer: adam
+      lr: 3.0e-06
+      min_lr: 5.0e-07
+      weight_decay: 0.0
+      adam_beta1: 0.9
+      adam_beta2: 0.99
+      adam_eps: 1.0e-08
+      bf16: true
+      fp16: false
+      params_dtype: float32
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+      exp_avg_dtype: float32
+      exp_avg_sq_dtype: float32
+      store_param_remainders: false
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+      overlap_cpu_optimizer_d2h_h2d: false
+      clip_grad: 1.0
+    scheduler:
+      lr_decay_style: cosine
+      lr_decay_iters: 60
+      lr_warmup_iters: 10
+      lr_warmup_init: 3.0e-08
+      start_weight_decay: 0.0
+      end_weight_decay: 0.0
+      weight_decay_incr_style: constant
+    checkpoint:
+      async_save: true
+  generation:
+    backend: vllm
+    max_new_tokens: 32768
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_strings: null
+    stop_token_ids: null
+    bad_words:
+    - <image>
+    - <img>
+    - </img>
+    - <so_embedding>
+    - <so_start>
+    - <so_end>
+    refit_transport: null
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 16
+        gpus_per_node: 4
+    vllm_cfg:
+      async_engine: true
+      expose_http_server: true
+      skip_tokenizer_init: false
+      tensor_parallel_size: 4
+      pipeline_parallel_size: 1
+      expert_parallel_size: 4
+      max_model_len: 65536
+      gpu_memory_utilization: 0.8
+      enforce_eager: false
+      enable_prefix_caching: false
+      logprobs_mode: raw_logprobs
+      fp32_lm_head: true
+      video:
+        sampling_style: nemotron_vl
+        num_frames: 64
+        temporal_patch_size: 2
+      env_vars:
+        VLLM_TRITON_FORCE_FIRST_CONFIG: '1'
+      cap_max_tokens_to_context: true
+    vllm_kwargs:
+      limit_mm_per_prompt:
+        image: 64
+        video:
+          count: 1
+          num_frames: 64
+      media_io_kwargs:
+        video:
+          num_frames: 64
+      max_num_batched_tokens: 65536
+      max_num_seqs: 128
+      mamba_ssm_cache_dtype: float32
+      skip_mm_profiling: true
+      kernel_config:
+        enable_flashinfer_autotune: false
+        moe_backend: flashinfer_cutlass
+      mm_processor_cache_gb: 0
+      enable_chunked_prefill: true
+      disable_custom_all_reduce: true
+      attention_backend: FLASHINFER
+      mm_encoder_attn_backend: FLASH_ATTN
+      allowed_local_media_path: /lustre
+      enable_return_routed_experts: true
+      compilation_config:
+        backend: eager
+        cudagraph_mode: PIECEWISE
+data:
+  max_input_seq_length: 65536
+  num_workers: 1
+  shuffle: false
+  use_multiple_dataloader: false
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    processor: nemo_gym_data_processor
+    prompt_file: null
+    system_prompt_file: null
+  train:
+    data_path: ${oc.env:MM_TRAINER_DATA_PATH}
+  validation: null
+  _override_: true
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: true
+  should_mask_flagged_samples: true
+  nemo_gym:
+    port_range_low: 5000
+    port_range_high: 5999
+    uv_venv_dir: ${oc.env:MM_TRAINER_GYM_VENV_DIR}
+    skip_venv_if_present: true
+    nemo_gym_log_dir: ${oc.env:MM_TRAINER_RESULTS_DIR}/logs/nemo_gym
+    policy_max_input_tokens: 65536
+    pad_dynamic_image_shapes: true
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/gui_coordinate/configs/gui_coordinate.yaml
+    - resources_servers/math_with_judge/configs/math_with_judge.yaml
+    - resources_servers/mcqa/configs/mcqa.yaml
+    - resources_servers/string_match/configs/string_match.yaml
+    - responses_api_agents/image_tools_agent/configs/image_tools_agent.yaml
+    - resources_servers/sav_tracks/configs/sav_tracks.yaml
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: true
+          extra_body:
+            bad_words:
+            - <image>
+            - <img>
+            - </img>
+            - <so_embedding>
+            - <so_start>
+            - <so_end>
+            chat_template_kwargs:
+              enable_thinking: true
+    math_with_judge:
+      resources_servers:
+        math_with_judge:
+          judge_model_server:
+            name: policy_model
+          should_use_judge: false
+    code_gen:
+      resources_servers:
+        code_gen:
+          num_processes: 1024
+          unit_test_timeout_secs: 10
+          debug: false
+    gui_coordinate_simple_agent:
+      responses_api_agents:
+        simple_agent:
+          max_steps: 1
+    math_with_judge_simple_agent:
+      responses_api_agents:
+        simple_agent:
+          max_steps: 1
+    mcqa_simple_agent:
+      responses_api_agents:
+        simple_agent:
+          max_steps: 1
+    string_match_simple_agent:
+      responses_api_agents:
+        simple_agent:
+          max_steps: 1
+    sav_pt_tracks_agent:
+      responses_api_agents:
+        simple_agent:
+          max_steps: 1
+    sav_box_tracks_agent:
+      responses_api_agents:
+        simple_agent:
+          max_steps: 1
+    sav_ref_tracks_agent:
+      responses_api_agents:
+        simple_agent:
+          max_steps: 1
+    image_tools_simple_agent:
+      responses_api_agents:
+        image_tools_agent:
+          max_steps: 8
+          max_tool_calls: 6
+          max_tool_calls_per_turn: 1
+          max_output_tokens: 4096
+          tool_success_reward: 0.02
+          tool_success_reward_cap: 0.2
+          invalid_tool_call_penalty: -0.05
+          duplicate_tool_call_penalty: -0.02
+          force_final_after_duplicate: true
+          terminate_on_invalid_tool_call: true
+          duplicate_iou_threshold: 0.5
+          crop_dir: ${oc.env:MM_TRAINER_RESULTS_DIR}/image_tool_outputs
+    is_trajectory_collection: false
+  _override_: true
+checkpointing:
+  enabled: true
+  checkpoint_dir: ${oc.env:MM_TRAINER_RESULTS_DIR}/checkpoints
+  checkpoint_must_save_by: 00:03:45:00
+  metric_name: null
+  higher_is_better: true
+  save_period: 10
+  keep_top_k: 20
+  save_optimizer: true
+  save_replay_buffer: false
+  load_replay_buffer: false
+  save_data_plane: true
+logger:
+  log_dir: ${oc.env:MM_TRAINER_RESULTS_DIR}/logs
+  wandb_enabled: true
+  tensorboard_enabled: true
+  monitor_gpus: true
+  num_val_samples_to_print: 0
+  wandb:
+    entity: ${oc.env:MM_TRAINER_WANDB_ENTITY,nvidia}
+    project: ${oc.env:MM_TRAINER_WANDB_PROJECT,grpo-superv3omni}
+    name: ${oc.env:MM_TRAINER_WANDB_NAME}
+    id: ${oc.env:MM_TRAINER_WANDB_ID}
+    resume: allow
+    log_nemo_gym_full_result_tables: false
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+reward_penalties:
+  penalize_duplicated_reasoning: false
+  penalize_empty_final_answer: false
+  penalize_malformed_think_tag: false
+  penalize_unwanted_tokens: false
+  token_ids: null
+token_capture:
+  enabled: true
+  staging_partition: rollout_staging
+  defer_routed_experts_to_policy: false
+async_rl:
+  sampler:
+    name: in_order
+    max_lookahead_versions: 1
+  max_inflight_prompts: 128
+  max_buffered_rollouts: 256
+  recompute_kv_cache_after_weight_updates: false
+data_plane:
+  enabled: true
+  impl: transfer_queue
+  backend: simple
+  claim_meta_poll_interval_s: 0.5
+  simple:
+    num_storage_units: 64
