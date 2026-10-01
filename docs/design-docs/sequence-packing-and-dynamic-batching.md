@@ -267,7 +267,10 @@ path does not currently support pipeline parallelism or MTP. NeMo-RL rejects
 unsupported combinations during setup. When the option is omitted or `false`,
 NeMo-RL enables Megatron-Core's per-layer uneven-input padding instead. This
 fallback supports layouts that cannot use the one-time pre-padding path and
-ensures that HybridEP collectives always receive aligned input lengths.
+ensures that HybridEP collectives always receive aligned input lengths in eager
+execution. The per-layer fallback performs host-visible scalar synchronization,
+so NeMo-RL rejects it when training CUDA graphs are enabled. Use one-time input
+pre-padding or disable training CUDA graphs for that configuration.
 
 ## Dynamic Batching
 

@@ -30,6 +30,30 @@ _HYBRIDEP_DISPATCH_PADDING_FIELDS = (
 )
 
 
+def _uses_training_cuda_graphs(
+    model_cfg: Any, megatron_cfg: Mapping[str, object]
+) -> bool:
+    cuda_graph_impl = megatron_cfg.get(
+        "cuda_graph_impl", getattr(model_cfg, "cuda_graph_impl", "none")
+    )
+    if cuda_graph_impl not in (None, "none"):
+        return True
+
+    if getattr(model_cfg, "enable_cuda_graph", False) or getattr(
+        model_cfg, "external_cuda_graph", False
+    ):
+        return True
+
+    for field in ("cuda_graph_modules", "cuda_graph_scope"):
+        scopes = megatron_cfg.get(field, getattr(model_cfg, field, ()))
+        if isinstance(scopes, str):
+            scopes = (scopes,)
+        if scopes and "full_iteration" in scopes:
+            return True
+
+    return False
+
+
 def uses_hybridep_flex_dispatcher(megatron_cfg: Mapping[str, object]) -> bool:
     return (
         megatron_cfg.get("moe_token_dispatcher_type") == "flex"
@@ -85,6 +109,14 @@ def configure_hybridep_packed_input_padding(
 
     if not (sequence_packing_enabled and uses_hybridep_flex_dispatcher(megatron_cfg)):
         return
+
+    if _uses_training_cuda_graphs(model_cfg, megatron_cfg):
+        raise RuntimeError(
+            "Megatron-Core's per-layer HybridEP uneven-input padding is not "
+            "capture-safe with training CUDA graphs. Enable "
+            "policy.megatron_cfg.moe_hybridep_prepad_packed_inputs or disable "
+            "training CUDA graphs."
+        )
 
     set_hybridep_dispatch_padding(model_cfg, enabled=True)
 
