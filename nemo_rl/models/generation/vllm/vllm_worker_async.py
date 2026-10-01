@@ -1690,6 +1690,7 @@ class VllmAsyncGenerationWorkerImpl(
             """Process a single sample and return the result."""
             current_input_actual_length = input_lengths_batch[sample_idx].item()
             prompt = format_prompt_for_vllm_generation(data, sample_idx)
+            prompt = self._tokenize_prompt_with_bos(prompt)
 
             per_sample_stop_strings = None
             if batch_specific_stop_strings_list and sample_idx < len(
@@ -1971,7 +1972,7 @@ class VllmAsyncGenerationWorkerImpl(
         # Create tasks for each prompt
         async def process_single_prompt(prompt_idx):
             """Process a single prompt and return the result."""
-            prompt = prompts[prompt_idx]
+            prompt = self._tokenize_prompt_with_bos(prompts[prompt_idx])
 
             # Get stop strings for this specific prompt
             per_prompt_stop_strings = None

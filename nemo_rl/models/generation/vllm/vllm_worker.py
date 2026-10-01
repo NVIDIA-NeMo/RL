@@ -804,6 +804,32 @@ class BaseVllmGenerationWorker:
         """Check if the worker is alive."""
         return True
 
+    def _tokenize_prompt_with_bos(
+        self, prompt: str | dict[str, Any]
+    ) -> str | dict[str, Any]:
+        """Tokenize an explicit BOS once, before vLLM expands media placeholders."""
+        if isinstance(prompt, dict):
+            if "prompt_token_ids" in prompt or "prompt_embeds" in prompt:
+                return prompt
+            text = prompt.get("prompt")
+        else:
+            text = prompt
+        if not isinstance(text, str):
+            return prompt
+
+        tokenizer = self.llm.renderer.get_tokenizer()
+        bos = tokenizer.bos_token
+        if not bos or not text.startswith(bos):
+            return prompt
+
+        # Per-prompt tokenization preserves mixed batches: vLLM's generate()
+        # tokenization_kwargs apply to the entire synchronous batch.
+        fields = {"prompt": text} if isinstance(prompt, str) else prompt
+        return {
+            **fields,
+            "prompt_token_ids": tokenizer.encode(text, add_special_tokens=False),
+        }
+
     def _merge_stop_strings(self, batch_stop_strings):
         stop_set: set[str] = set()
 
@@ -1138,6 +1164,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
 
         # Convert inputs to vLLM format and generate outputs.
         prompts = format_prompt_for_vllm_generation(data)
+        prompts = [self._tokenize_prompt_with_bos(prompt) for prompt in prompts]
         use_tqdm = self.cfg["vllm_cfg"].get("use_tqdm", True)
         outputs = self.llm.generate(prompts, sampling_params, use_tqdm=use_tqdm)
 
@@ -1340,7 +1367,8 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             "Attempting to generate with either an uninitialized vLLM or non-model-owner"
         )
         use_tqdm = self.cfg["vllm_cfg"].get("use_tqdm", True)
-        outputs = self.llm.generate(data["prompts"], sampling_params, use_tqdm=use_tqdm)
+        prompts = [self._tokenize_prompt_with_bos(prompt) for prompt in data["prompts"]]
+        outputs = self.llm.generate(prompts, sampling_params, use_tqdm=use_tqdm)
         texts = [output.outputs[0].text for output in outputs]
 
         # Convert to BatchedDataDict
