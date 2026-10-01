@@ -86,6 +86,13 @@ Fresh native GRPO runs, seeds 42 and 43, 100 updates each. Values below are
 mean ± sample standard deviation across seeds. Earlier smoke tests and historical
 implementations are excluded.
 
+![Native GRPO with Dense AdamW versus LoGRA: training memory and GSM8K accuracy](assets/grpo-7b-comparison.png)
+
+Qwen2.5-Math-7B trained for 100 GRPO updates. Lines show the mean across two
+seeds; shaded bands show sample standard deviation, without smoothing. Left:
+mean per-GPU update peak memory on the policy-training GPUs (rollout GPUs
+excluded). Right: accuracy on 256 fixed GSM8K test questions.
+
 | Metric | Native Dense AdamW | Native GRPO + LoGRA |
 |---|---:|---:|
 | Mean update peak, GiB per training GPU | 36.13 ± 0.03 | 19.36 ± 0.03 |
@@ -109,8 +116,9 @@ to 81.64% at step 100; Dense's best observed accuracy is higher than LoGRA's in
 both seeds. Report the full curves, not only the final point. No smoothing is used.
 
 All 100 training batches match between methods within each seed, and evaluation
-questions match across all steps and seeds. Results and plots are kept outside
-Git; the analysis commands below regenerate them from native TensorBoard logs.
+questions match across all steps and seeds. Raw results remain outside Git;
+the comparison figure is included here for reference. The analysis commands below
+regenerate it from native TensorBoard logs.
 
 Validation passed: 11 unit tests; two-GPU FSDP numerical equivalence; 7B save/resume
 in both modes; a final-source 7B smoke run; type, lint, format and workspace-lock
