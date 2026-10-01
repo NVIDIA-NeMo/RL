@@ -472,8 +472,6 @@ class VllmAsyncGenerationWorkerImpl(
         # Periodic chunk flushing. 0 disables it, leaving checkpoint cuts as the
         # only thing that makes an in-flight generation durable.
         self._generation_chunk_flush_tokens = 0
-        self._generation_prefix_batch_size: int | None = None
-        self._generation_prefix_batch_max_tokens: int | None = None
         self._generation_chunk_flush_thread: threading.Thread | None = None
         self._generation_chunk_flush_stop = threading.Event()
         self._generation_chunk_flush_sequence = 0
@@ -797,10 +795,10 @@ class VllmAsyncGenerationWorkerImpl(
             )
         if generation_chunk_flush_tokens < 0:
             raise ValueError("generation_chunk_flush_tokens must not be negative")
-        if generation_prefix_batch_size < 1 or generation_prefix_batch_max_tokens < 1:
-            raise ValueError(
-                "generation-prefix batch row and token limits must be positive"
-            )
+        self._configure_generation_prefix_batching(
+            max_rows=generation_prefix_batch_size,
+            max_tokens=generation_prefix_batch_max_tokens,
+        )
         if generation_chunk_flush_tokens and not generation_prefix_cuts_enabled:
             raise ValueError(
                 "generation_chunk_flush_tokens requires generation-prefix cuts; "
@@ -810,8 +808,6 @@ class VllmAsyncGenerationWorkerImpl(
         self._generation_prefix_cuts_enabled = generation_prefix_cuts_enabled
         self._generation_cut_control_token = generation_cut_control_token
         self._generation_chunk_flush_tokens = generation_chunk_flush_tokens
-        self._generation_prefix_batch_size = generation_prefix_batch_size
-        self._generation_prefix_batch_max_tokens = generation_prefix_batch_max_tokens
         self._staging_source = TQTokenSource(
             dp_client, staging_partition=staging_partition
         )

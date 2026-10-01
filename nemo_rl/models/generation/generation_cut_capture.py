@@ -31,6 +31,20 @@ LOGGER = logging.getLogger(__name__)
 _COMPLETED_CAPTURE_RETENTION_S = 60.0 * 60.0
 
 
+@dataclass(frozen=True)
+class GenerationPrefixBatchLimits:
+    """Backend-neutral limits for one worker's generation-prefix TQ writes."""
+
+    max_rows: int
+    max_tokens: int
+
+    def __post_init__(self) -> None:
+        if self.max_rows < 1 or self.max_tokens < 1:
+            raise ValueError(
+                "generation-prefix batch row and token limits must be positive"
+            )
+
+
 @dataclass
 class _RequestCaptureBuffer:
     """One append-only generation segment owned by an in-flight request."""
@@ -242,6 +256,27 @@ class GenerationCutCaptureMixin:
     Methods are written against the host attributes listed in the module docstring
     and against ``_RequestCaptureState``; nothing here touches an engine.
     """
+
+    _generation_prefix_batch_limits: GenerationPrefixBatchLimits | None = None
+
+    def _configure_generation_prefix_batching(
+        self, *, max_rows: int, max_tokens: int
+    ) -> None:
+        """Install validated per-worker limits for backend-neutral cut batching."""
+        self._generation_prefix_batch_limits = GenerationPrefixBatchLimits(
+            max_rows=max_rows,
+            max_tokens=max_tokens,
+        )
+
+    def _require_generation_prefix_batch_limits(
+        self,
+    ) -> GenerationPrefixBatchLimits:
+        limits = self._generation_prefix_batch_limits
+        if limits is None:
+            raise RuntimeError(
+                "generation-prefix batch limits require token capture setup"
+            )
+        return limits
 
     def _pop_request_capture(self, request: Any) -> _RequestCaptureState | None:
         with self._capture_registry_lock:
@@ -893,13 +928,7 @@ class GenerationCutCaptureMixin:
         """Batch independently per owner, retaining lifecycle locks until seal."""
         from nemo_rl.data_plane.tq_token_sink import generation_cut_staging_key
 
-        if (
-            self._generation_prefix_batch_size is None
-            or self._generation_prefix_batch_max_tokens is None
-        ):
-            raise RuntimeError(
-                "generation-prefix batch limits require token capture setup"
-            )
+        batch_limits = self._require_generation_prefix_batch_limits()
         call_ids = [prefix.model_call_id for prefix in inventory.active_prefixes]
         if len(set(call_ids)) != len(call_ids):
             raise ValueError(
@@ -1000,11 +1029,7 @@ class GenerationCutCaptureMixin:
                         acknowledgements.append(acknowledgement)
                         continue
                     tokens = len(record.token_ids_delta)
-                    if (
-                        pending
-                        and pending_tokens + tokens
-                        > self._generation_prefix_batch_max_tokens
-                    ):
+                    if pending and pending_tokens + tokens > batch_limits.max_tokens:
                         flush()
                     pending.append((transaction, record, sequence))
                 except BaseException:
@@ -1012,8 +1037,8 @@ class GenerationCutCaptureMixin:
                     raise
                 pending_tokens += tokens
                 if (
-                    len(pending) >= self._generation_prefix_batch_size
-                    or pending_tokens >= self._generation_prefix_batch_max_tokens
+                    len(pending) >= batch_limits.max_rows
+                    or pending_tokens >= batch_limits.max_tokens
                 ):
                     # An oversized single row is written alone, never split.
                     flush()
@@ -1041,11 +1066,8 @@ class GenerationCutCaptureMixin:
             return cached_receipt
         acknowledgements = []
         single_prefixes = inventory.active_prefixes
-        if self._generation_prefix_batch_size is None:
-            raise RuntimeError(
-                "generation-prefix batch limits require token capture setup"
-            )
-        if self._generation_prefix_batch_size > 1:
+        batch_limits = self._require_generation_prefix_batch_limits()
+        if batch_limits.max_rows > 1:
             acknowledgements = self._checkpoint_generation_cut_batched(inventory)
             single_prefixes = ()
         for prefix in single_prefixes:

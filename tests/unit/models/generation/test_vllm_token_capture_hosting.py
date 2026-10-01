@@ -49,6 +49,10 @@ from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
     StageResult,
 )
 
+from nemo_rl.models.generation.generation_cut_capture import (  # noqa: E402
+    GenerationCutCaptureMixin,
+    GenerationPrefixBatchLimits,
+)
 from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration  # noqa: E402
 from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
     VllmAsyncGenerationWorkerImpl,
@@ -176,9 +180,13 @@ class _FailModelCallOncePrefixSink(_MemorySink):
         )
 
 
-def _fake_worker(*, is_model_owner: bool = True) -> SimpleNamespace:
+class _FakeWorker(GenerationCutCaptureMixin, SimpleNamespace):
+    """Minimal host for shared capture logic plus vLLM setup seams."""
+
+
+def _fake_worker(*, is_model_owner: bool = True) -> _FakeWorker:
     """The attribute surface setup_token_capture touches, minus the engine."""
-    worker = SimpleNamespace(
+    worker = _FakeWorker(
         is_model_owner=is_model_owner,
         token_capture=None,
         _rollout_weight_version=0,
@@ -192,8 +200,6 @@ def _fake_worker(*, is_model_owner: bool = True) -> SimpleNamespace:
         _generation_cut_control_token=None,
         _generation_chunk_flush_tokens=0,
         _start_generation_chunk_flusher=MagicMock(),
-        _generation_prefix_batch_size=1,
-        _generation_prefix_batch_max_tokens=4_194_304,
         _generation_checkpoint_gate=_CheckpointCaptureGate(),
         _staging_source=None,
         _prefix_cache={},
@@ -229,8 +235,10 @@ def test_setup_token_capture_installs_capture_with_vllm_adapter(monkeypatch):
 
     assert installed is True
     worker._start_generation_chunk_flusher.assert_called_once_with()
-    assert worker._generation_prefix_batch_size == 256
-    assert worker._generation_prefix_batch_max_tokens == 4_194_304
+    assert worker._generation_prefix_batch_limits == GenerationPrefixBatchLimits(
+        max_rows=256,
+        max_tokens=4_194_304,
+    )
     assert isinstance(worker.token_capture, RolloutTokenCapture)
     assert worker.token_capture.adapter is not None
     # The adapter is the vLLM one (prefix ids enter via the worker's field).
@@ -252,6 +260,18 @@ def test_setup_token_capture_skips_non_model_owners(monkeypatch):
     assert installed is False
     worker._start_generation_chunk_flusher.assert_not_called()
     assert worker.token_capture is None
+
+
+@pytest.mark.parametrize("max_rows,max_tokens", [(0, 1), (1, 0), (-1, 1), (1, -1)])
+def test_shared_generation_prefix_batch_limits_require_positive_values(
+    max_rows: int, max_tokens: int
+) -> None:
+    worker = _fake_worker()
+    with pytest.raises(ValueError, match="row and token limits must be positive"):
+        worker._configure_generation_prefix_batching(
+            max_rows=max_rows,
+            max_tokens=max_tokens,
+        )
 
 
 def test_weight_version_is_stamped_from_worker_state(monkeypatch):
@@ -689,6 +709,10 @@ def _worker_with_capture(sink: _MemorySink):
     from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
 
     worker = _fake_worker()
+    worker._configure_generation_prefix_batching(
+        max_rows=1,
+        max_tokens=4_194_304,
+    )
     worker._capture_calls = {}
     worker._capture_calls_by_model_call_id = {}
     worker._completed_capture_calls = {}
@@ -706,16 +730,8 @@ def _worker_with_capture(sink: _MemorySink):
         "_fetch_chain_prefix",
         "_capture_admission",
         "_resolve_admission_prefix",
-        "_resolve_generation_cut",
         "_enter_request_prefix",
-        "_get_request_capture",
         "_observe_request_capture",
-        "_pop_request_capture",
-        "_remember_completed_capture",
-        "_completed_generation_cut_ack",
-        "_checkpoint_active_generation_cut",
-        "_generation_cut_transaction",
-        "_checkpoint_generation_cut_batched",
         "_finish_request_capture_after_checkpoint_gate",
         "_finish_request_capture_with_lifecycle_owned",
     ):
@@ -764,8 +780,10 @@ class _BatchPrefixSink(_MemorySink):
 def _batch_worker_fixture(lengths, *, batch_size=256, max_tokens=4_194_304):
     sink = _BatchPrefixSink()
     worker = _worker_with_capture(sink)
-    worker._generation_prefix_batch_size = batch_size
-    worker._generation_prefix_batch_max_tokens = max_tokens
+    worker._configure_generation_prefix_batching(
+        max_rows=batch_size,
+        max_tokens=max_tokens,
+    )
     requests, prefixes = [], []
     for i, length in enumerate(lengths):
         request = _FakeRequest(
@@ -801,25 +819,20 @@ def _batch_worker_fixture(lengths, *, batch_size=256, max_tokens=4_194_304):
 
 def test_worker_batches_1000_prefixes_and_caches_receipt():
     worker, sink, requests, inventory = _batch_worker_fixture([2] * 1000)
-    receipt = VllmAsyncGenerationWorkerImpl._checkpoint_generation_cut(
-        worker, inventory
-    )
+    receipt = worker._checkpoint_generation_cut(inventory)
     assert [len(batch) for batch in sink.batches] == [256, 256, 256, 232]
     assert [ack.ticket_id for ack in receipt.prefixes] == [
         p.ticket_id for p in inventory.active_prefixes
     ]
     assert all(ack.prefix_token_count == 2 for ack in receipt.prefixes)
     assert all(worker._capture_calls[id(r)].frozen_buffer is None for r in requests)
-    assert (
-        VllmAsyncGenerationWorkerImpl._checkpoint_generation_cut(worker, inventory)
-        is receipt
-    )
+    assert worker._checkpoint_generation_cut(inventory) is receipt
     assert len(sink.batches) == 4
 
 
 def test_worker_batch_token_limit_ragged_and_oversized_rows():
     worker, sink, _, inventory = _batch_worker_fixture([1, 2, 8, 1], max_tokens=5)
-    VllmAsyncGenerationWorkerImpl._checkpoint_generation_cut(worker, inventory)
+    worker._checkpoint_generation_cut(inventory)
     assert sink.batches == [[2, 3], [9], [2]]  # First chunk includes prompt.
 
 
@@ -828,7 +841,7 @@ def test_worker_batch_failure_rolls_back_every_unsealed_row(failure):
     worker, sink, requests, inventory = _batch_worker_fixture([2, 3, 4])
     sink.failure = failure
     with pytest.raises(RuntimeError):
-        VllmAsyncGenerationWorkerImpl._checkpoint_generation_cut(worker, inventory)
+        worker._checkpoint_generation_cut(inventory)
     assert not worker._generation_cut_receipts
     assert set(sink.generation_prefix_keys) <= set(sink.cleared_generation_prefix_keys)
     for request, length in zip(requests, [2, 3, 4], strict=True):
@@ -840,9 +853,7 @@ def test_worker_batch_failure_rolls_back_every_unsealed_row(failure):
         assert state.lifecycle_lock.acquire(blocking=False)
         state.lifecycle_lock.release()
     sink.failure = None
-    receipt = VllmAsyncGenerationWorkerImpl._checkpoint_generation_cut(
-        worker, inventory
-    )
+    receipt = worker._checkpoint_generation_cut(inventory)
     assert [ack.prefix_token_count for ack in receipt.prefixes] == [2, 3, 4]
 
 
@@ -861,7 +872,7 @@ def test_worker_batch_ack_validation_is_all_before_seal(monkeypatch):
         model_control_contracts, "GenerationCutPrefixAck", reject_second
     )
     with pytest.raises(ValueError, match="injected ack failure"):
-        VllmAsyncGenerationWorkerImpl._checkpoint_generation_cut(worker, inventory)
+        worker._checkpoint_generation_cut(inventory)
     for request in requests:
         state = worker._capture_calls[id(request)]
         assert state.frozen_buffer is None and not state.sealed_generated_token_ids
@@ -878,7 +889,7 @@ def test_worker_batch_retains_earlier_success_on_later_batch_failure():
 
     sink.before_write = fail_second
     with pytest.raises(RuntimeError):
-        VllmAsyncGenerationWorkerImpl._checkpoint_generation_cut(worker, inventory)
+        worker._checkpoint_generation_cut(inventory)
     earlier_keys = set(sink.generation_prefix_keys[:2])
     assert earlier_keys.isdisjoint(sink.cleared_generation_prefix_keys)
     sink.failure = None
@@ -887,9 +898,7 @@ def test_worker_batch_retains_earlier_success_on_later_batch_failure():
         state = worker._capture_calls[id(request)]
         with state.lock:
             state.observe([99], [-0.2])
-    receipt = VllmAsyncGenerationWorkerImpl._checkpoint_generation_cut(
-        worker, inventory
-    )
+    receipt = worker._checkpoint_generation_cut(inventory)
     assert [ack.prefix_token_count for ack in receipt.prefixes] == [3, 3, 3]
     assert [len(ack.staging_keys) for ack in receipt.prefixes] == [2, 2, 1]
     assert earlier_keys.isdisjoint(sink.cleared_generation_prefix_keys)
@@ -910,9 +919,7 @@ def test_worker_batch_observation_continues_but_lifecycle_waits():
 
     sink.before_write = block_write
     with ThreadPoolExecutor(max_workers=2) as executor:
-        cut = executor.submit(
-            VllmAsyncGenerationWorkerImpl._checkpoint_generation_cut, worker, inventory
-        )
+        cut = executor.submit(worker._checkpoint_generation_cut, inventory)
         assert write_started.wait(5)
 
         def terminal_operation():
@@ -938,15 +945,13 @@ def test_worker_batch_consecutive_cuts_reuse_then_append(batch_size):
     worker, sink, requests, inventory = _batch_worker_fixture(
         [2, 3], batch_size=batch_size
     )
-    first = VllmAsyncGenerationWorkerImpl._checkpoint_generation_cut(worker, inventory)
+    first = worker._checkpoint_generation_cut(inventory)
     second_inventory = GenerationCutInventory.build(
         checkpoint_id="second-cut",
         server_name="policy",
         active_prefixes=inventory.active_prefixes,
     )
-    second = VllmAsyncGenerationWorkerImpl._checkpoint_generation_cut(
-        worker, second_inventory
-    )
+    second = worker._checkpoint_generation_cut(second_inventory)
     assert [ack.staging_keys for ack in second.prefixes] == [
         ack.staging_keys for ack in first.prefixes
     ]
@@ -960,9 +965,7 @@ def test_worker_batch_consecutive_cuts_reuse_then_append(batch_size):
         server_name="policy",
         active_prefixes=inventory.active_prefixes,
     )
-    third = VllmAsyncGenerationWorkerImpl._checkpoint_generation_cut(
-        worker, third_inventory
-    )
+    third = worker._checkpoint_generation_cut(third_inventory)
     assert [ack.prefix_token_count for ack in third.prefixes] == [3, 4]
     assert all(len(ack.staging_keys) == 2 for ack in third.prefixes)
     assert [
@@ -975,7 +978,7 @@ def test_worker_batch_preparation_failure_releases_pending_calls():
     worker, sink, requests, inventory = _batch_worker_fixture([2, 3])
     worker._capture_calls[id(requests[1])].effective_output_limit = None
     with pytest.raises(RuntimeError):
-        VllmAsyncGenerationWorkerImpl._checkpoint_generation_cut(worker, inventory)
+        worker._checkpoint_generation_cut(inventory)
     assert not sink.batches
     for request in requests:
         state = worker._capture_calls[id(request)]
@@ -987,9 +990,7 @@ def test_worker_batch_preparation_failure_releases_pending_calls():
 
 def test_worker_batch_mixed_zero_token_and_active_calls():
     worker, sink, _, inventory = _batch_worker_fixture([2, 0, 3])
-    receipt = VllmAsyncGenerationWorkerImpl._checkpoint_generation_cut(
-        worker, inventory
-    )
+    receipt = worker._checkpoint_generation_cut(inventory)
     assert [len(batch) for batch in sink.batches] == [2]
     assert [ack.disposition for ack in receipt.prefixes] == [
         "durable_prefix",
