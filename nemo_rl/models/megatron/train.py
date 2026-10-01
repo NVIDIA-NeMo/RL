@@ -61,7 +61,7 @@ from nemo_rl.distributed.model_utils import (
     from_parallel_logits_to_logprobs_packed_sequences,
 )
 from nemo_rl.models.megatron.config import MegatronModule
-from nemo_rl.models.megatron.data import ProcessedMicrobatch
+from nemo_rl.models.megatron.data import PackedSequenceMetadata, ProcessedMicrobatch
 from nemo_rl.models.megatron.draft.hidden_capture import (
     get_capture_context,
 )
@@ -72,6 +72,7 @@ from nemo_rl.models.megatron.router_replay import (
     set_router_replay_forward,
 )
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.utils.sequence_lengths import CpuIntTuple, to_cpu_int_tuple
 
 # Union type for any post-processing function (defined after classes below)
 PostProcessingFunction = Union[
@@ -331,6 +332,7 @@ def forward_with_post_processing_fn(
     routed_experts_cp_sharded = processed_mb.routed_experts_cp_sharded
     original_seq_length = processed_mb.original_seq_length
     media_token_validity_mask = processed_mb.media_token_validity_mask
+    packed_sequence_metadata = processed_mb.packed_sequence_metadata
 
     if use_router_replay:
         if routed_experts_cp_sharded is None:
@@ -396,8 +398,8 @@ def forward_with_post_processing_fn(
             with torch.no_grad():
                 shifted_input_ids = _pack_input_ids(
                     data_dict["input_ids"],
-                    packed_seq_params.cu_seqlens_q,
-                    packed_seq_params.cu_seqlens_q_padded,
+                    to_cpu_int_tuple(packed_seq_params.cu_seqlens_q),
+                    to_cpu_int_tuple(packed_seq_params.cu_seqlens_q_padded),
                     roll_shift=-1,
                 )
                 shifted_input_embeds = capture.model.embedding(
@@ -438,6 +440,7 @@ def forward_with_post_processing_fn(
         post_processing_fn_wrapped = post_processing_fn(
             data_dict=data_dict,
             packed_seq_params=packed_seq_params,
+            packed_sequence_metadata=packed_sequence_metadata,
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
         )
@@ -446,7 +449,11 @@ def forward_with_post_processing_fn(
         post_processing_fn_wrapped = post_processing_fn(
             data_dict=data_dict,
             input_ids=input_ids,
-            cu_seqlens_padded=cu_seqlens_padded,
+            cu_seqlens_padded=(
+                packed_sequence_metadata.cu_seqlens_padded
+                if packed_sequence_metadata is not None
+                else cu_seqlens_padded
+            ),
             original_seq_length=original_seq_length,
         )
     elif isinstance(post_processing_fn, TeacherFullPayloadPostProcessor):
@@ -618,6 +625,7 @@ class LossPostProcessor:
         self,
         data_dict: BatchedDataDict[Any],
         packed_seq_params: Optional[PackedSeqParams] = None,
+        packed_sequence_metadata: Optional[PackedSequenceMetadata] = None,
         global_valid_seqs: Optional[torch.Tensor] = None,
         global_valid_toks: Optional[torch.Tensor] = None,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, Any]]]:
@@ -630,6 +638,8 @@ class LossPostProcessor:
         Args:
             data_dict: Batched data dictionary for the current microbatch
             packed_seq_params: Parameters for packed sequences (optional)
+            packed_sequence_metadata: CPU cumulative sequence boundaries retained
+                during input packing.
             global_valid_seqs: Global valid sequence count for loss normalization
             global_valid_toks: Global valid token count for loss normalization
 
@@ -656,12 +666,13 @@ class LossPostProcessor:
             if fuse_loss:
                 # The fused path prepares loss via prepare_packed_loss_input and
                 # cannot honor a custom prepare_fn (e.g. the value model's); guard
-                # rather than silently bypass it.
+                # before reading packed metadata so misconfiguration fails clearly.
                 assert self.prepare_fn is None, (
                     "sequence_packing.fuse_loss=true does not support a custom "
                     "prepare_fn (e.g. the value model's value-specific prep). "
                     "Disable fuse_loss for the value model."
                 )
+
                 wrapper_cls = SequencePackingFusionLossWrapper
                 prepare_fn = partial(
                     prepare_packed_loss_input,
@@ -672,11 +683,21 @@ class LossPostProcessor:
                 wrapper_cls = SequencePackingLossWrapper
                 prepare_fn = prepare_loss_input_wrapped
 
+            if packed_sequence_metadata is not None:
+                cu_seqlens_q_cpu = packed_sequence_metadata.cu_seqlens
+                cu_seqlens_q_padded_cpu = packed_sequence_metadata.cu_seqlens_padded
+            else:
+                cu_seqlens_q_cpu = to_cpu_int_tuple(packed_seq_params.cu_seqlens_q)
+                cu_seqlens_q_padded_cpu = (
+                    to_cpu_int_tuple(packed_seq_params.cu_seqlens_q_padded)
+                    if packed_seq_params.cu_seqlens_q_padded is not None
+                    else cu_seqlens_q_cpu
+                )
             loss_fn_wrapped = wrapper_cls(
                 loss_fn=self.loss_fn,
                 prepare_fn=prepare_fn,
-                cu_seqlens_q=packed_seq_params.cu_seqlens_q,
-                cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
+                cu_seqlens_q=cu_seqlens_q_cpu,
+                cu_seqlens_q_padded=cu_seqlens_q_padded_cpu,
                 vocab_parallel_rank=get_tensor_model_parallel_rank(),
                 vocab_parallel_group=get_tensor_model_parallel_group(),
                 context_parallel_group=get_context_parallel_group(),
@@ -784,7 +805,7 @@ class LogprobsPostProcessor:
         self,
         data_dict: BatchedDataDict[Any],
         input_ids: torch.Tensor,
-        cu_seqlens_padded: torch.Tensor,
+        cu_seqlens_padded: Optional[torch.Tensor | CpuIntTuple],
         original_seq_length: int,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         """Create a post-processing function that computes token log probabilities.
@@ -802,19 +823,24 @@ class LogprobsPostProcessor:
             Callable: Function that takes output tensor and returns (dummy_loss, {"logprobs": token_logprobs})
         """
         unpacked_input_ids = data_dict["input_ids"]
+        cu_seqlens_padded_cpu = None
+        if self.cfg["sequence_packing"]["enabled"]:
+            assert cu_seqlens_padded is not None
+            cu_seqlens_padded_cpu = to_cpu_int_tuple(cu_seqlens_padded)
 
         def processor_fn_inner(output_tensor):
             if self.use_fused_linear_logprobs:
                 token_logprobs = output_tensor.to(torch.float32)
                 token_logprobs = token_logprobs[:, : original_seq_length - 1]
             elif self.cfg["sequence_packing"]["enabled"]:
+                assert cu_seqlens_padded_cpu is not None
                 tp_grp = get_tensor_model_parallel_group()
                 tp_rank = get_tensor_model_parallel_rank()
                 logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
                 token_logprobs = from_parallel_logits_to_logprobs_packed_sequences(
                     output_tensor,
                     target=input_ids,
-                    cu_seqlens_padded=cu_seqlens_padded,
+                    cu_seqlens_padded=cu_seqlens_padded_cpu,
                     unpacked_seqlen=original_seq_length,
                     vocab_start_index=tp_rank * output_tensor.shape[-1],
                     vocab_end_index=(tp_rank + 1) * output_tensor.shape[-1],
@@ -896,7 +922,7 @@ class TeacherFullPayloadPostProcessor:
         self,
         data_dict: BatchedDataDict[Any],
         input_ids: torch.Tensor,
-        cu_seqlens_padded: torch.Tensor,
+        cu_seqlens_padded: Optional[torch.Tensor | CpuIntTuple],
         original_seq_length: int,
         hidden_states: Optional[torch.Tensor] = None,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
@@ -914,17 +940,23 @@ class TeacherFullPayloadPostProcessor:
             Callable mapping the model output to ``(dummy_loss, {"logprobs":
             [B, S], "teacher_full_payload": [B, S, D]})``.
         """
+        pack = self.cfg["sequence_packing"]["enabled"]
+        cu_seqlens_padded_cpu = None
+        seq_lengths_cpu = None
+        if pack:
+            assert cu_seqlens_padded is not None
+            cu_seqlens_padded_cpu = to_cpu_int_tuple(cu_seqlens_padded)
+            seq_lengths_cpu = to_cpu_int_tuple(data_dict["input_lengths"])
+
         logprobs_fn = self._logprobs_post_processor(
             data_dict=data_dict,
             input_ids=input_ids,
-            cu_seqlens_padded=cu_seqlens_padded,
+            cu_seqlens_padded=cu_seqlens_padded_cpu,
             original_seq_length=original_seq_length,
         )
-        pack = self.cfg["sequence_packing"]["enabled"]
         cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
         batch_size = data_dict["input_ids"].shape[0]
         unpacked_seqlen = data_dict["input_ids"].shape[1]
-        seq_lengths = data_dict["input_lengths"]
 
         def processor_fn_inner(output_tensor):
             _, logprob_outputs = logprobs_fn(output_tensor)
@@ -959,19 +991,20 @@ class TeacherFullPayloadPostProcessor:
             if cp_size > 1:
                 cp_grp = get_context_parallel_group()
                 if pack:
+                    assert cu_seqlens_padded_cpu is not None
                     # Per-sequence CP allgather. CP uses a load-balanced
                     # (2 x CP interleaved) layout per sequence, so gathering the
                     # packed buffer as one contiguous shard would misplace tokens
                     # at every sequence boundary.
-                    total_packed_len = int(cu_seqlens_padded[-1].item())
+                    total_packed_len = cu_seqlens_padded_cpu[-1]
                     payload_full = torch.zeros(
                         (1, total_packed_len, payload_local.shape[-1]),
                         dtype=payload_local.dtype,
                         device=payload_local.device,
                     )
                     for i in range(batch_size):
-                        start_idx = int(cu_seqlens_padded[i].item())
-                        end_idx = int(cu_seqlens_padded[i + 1].item())
+                        start_idx = cu_seqlens_padded_cpu[i]
+                        end_idx = cu_seqlens_padded_cpu[i + 1]
                         if end_idx > start_idx:
                             local_slice = payload_local[
                                 :, start_idx // cp_size : end_idx // cp_size, :
@@ -999,14 +1032,16 @@ class TeacherFullPayloadPostProcessor:
                 payload_full = payload_local
 
             if pack:
+                assert cu_seqlens_padded_cpu is not None
+                assert seq_lengths_cpu is not None
                 unpacked_payload = torch.zeros(
                     (batch_size, unpacked_seqlen, payload_full.shape[-1]),
                     dtype=payload_full.dtype,
                     device=payload_full.device,
                 )
                 for i in range(batch_size):
-                    seq_len = min(int(seq_lengths[i].item()), unpacked_seqlen)
-                    start_idx = int(cu_seqlens_padded[i].item())
+                    seq_len = min(seq_lengths_cpu[i], unpacked_seqlen)
+                    start_idx = cu_seqlens_padded_cpu[i]
                     if seq_len > 0:
                         unpacked_payload[i, :seq_len, :] = payload_full[
                             0, start_idx : start_idx + seq_len, :
@@ -1036,7 +1071,7 @@ class TopkLogitsPostProcessor:
     def __call__(
         self,
         data_dict: BatchedDataDict[Any],
-        cu_seqlens_padded: torch.Tensor,
+        cu_seqlens_padded: Optional[torch.Tensor | CpuIntTuple],
         original_seq_length: int,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         """Create a post-processing function that computes top-k logits and indices.
@@ -1057,7 +1092,12 @@ class TopkLogitsPostProcessor:
         pack = self.cfg["sequence_packing"]["enabled"]
         cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
         unpacked_seqlen = data_dict["input_ids"].shape[1]
-        seq_lengths = data_dict["input_lengths"]
+        cu_seqlens_padded_cpu = None
+        seq_lengths_cpu = None
+        if pack:
+            assert cu_seqlens_padded is not None
+            cu_seqlens_padded_cpu = to_cpu_int_tuple(cu_seqlens_padded)
+            seq_lengths_cpu = to_cpu_int_tuple(data_dict["input_lengths"])
 
         def processor_fn_inner(output_tensor):
             tp_grp = get_tensor_model_parallel_group()
@@ -1081,9 +1121,10 @@ class TopkLogitsPostProcessor:
             if self.cfg["megatron_cfg"]["context_parallel_size"] > 1:
                 cp_grp = get_context_parallel_group()
                 if pack:
+                    assert cu_seqlens_padded_cpu is not None
                     # Per-sequence CP allgather following packed-sequence logic
                     batch_size = data_dict["input_ids"].shape[0]
-                    total_packed_len = int(cu_seqlens_padded[-1].item())
+                    total_packed_len = cu_seqlens_padded_cpu[-1]
 
                     topk_vals_full = torch.zeros(
                         (1, total_packed_len, self.k),
@@ -1097,8 +1138,8 @@ class TopkLogitsPostProcessor:
                     )
 
                     for i in range(batch_size):
-                        start_idx = int(cu_seqlens_padded[i].item())
-                        end_idx = int(cu_seqlens_padded[i + 1].item())
+                        start_idx = cu_seqlens_padded_cpu[i]
+                        end_idx = cu_seqlens_padded_cpu[i + 1]
                         if end_idx > start_idx:
                             local_vals_slice = topk_vals_local[
                                 :, start_idx // cp_size : end_idx // cp_size, :
@@ -1141,6 +1182,8 @@ class TopkLogitsPostProcessor:
                 topk_idx_full = topk_idx_local
 
             if pack:
+                assert cu_seqlens_padded_cpu is not None
+                assert seq_lengths_cpu is not None
                 batch_size = data_dict["input_ids"].shape[0]
                 out_vals = torch.zeros(
                     (batch_size, unpacked_seqlen, self.k),
@@ -1153,8 +1196,8 @@ class TopkLogitsPostProcessor:
                     device=topk_idx_full.device,
                 )
                 for i in range(batch_size):
-                    seq_len = int(seq_lengths[i].item())
-                    start_idx = int(cu_seqlens_padded[i].item())
+                    seq_len = seq_lengths_cpu[i]
+                    start_idx = cu_seqlens_padded_cpu[i]
                     if seq_len > 0:
                         out_vals[i, :seq_len, :] = topk_vals_full[
                             0, start_idx : start_idx + seq_len, :
