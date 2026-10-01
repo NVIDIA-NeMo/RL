@@ -18,6 +18,13 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from nemo_rl.algorithms.advantage_estimator import (
+    AdvEstimatorConfig,
+    GAEConfig,
+    GeneralizedAdvantageEstimator,
+    OPDAdvantageEstimator,
+    ReinforcePlusPlusAdvantageEstimator,
+)
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.loss.loss_input import prepare_loss_input
@@ -203,3 +210,91 @@ def test_packed_support_mismatch_retains_valid_token_gradient(tmp_path):
     finally:
         if initialized_here:
             torch.distributed.destroy_process_group()
+
+
+@pytest.mark.automodel
+def test_automodel_prev_logprobs_keep_support_only_on_valid_tokens():
+    from nemo_rl.models.automodel.data import ProcessedInputs
+    from nemo_rl.models.automodel.train import LogprobsPostProcessor
+
+    processor = LogprobsPostProcessor(
+        cfg={"logprob_chunk_size": None},
+        sampling_params=TrainingSamplingParams(top_k=1),
+    )
+    # Token 0 is the only token in the top-1 support at every position.
+    logits = torch.tensor([5.0, 0.0, 0.0]).expand(2, 4, 3).clone()
+    input_ids = torch.tensor([[0, 1, 0, 1], [0, 0, 1, 1]])
+    data = BatchedDataDict(
+        {
+            "input_lengths": torch.tensor([4, 3]),
+            "token_mask": torch.tensor([[0.0, 0.0, 1.0, 1.0], [0.0, 1.0, 1.0, 0.0]]),
+            "sample_mask": torch.ones(2),
+        }
+    )
+
+    logprobs = processor(
+        logits,
+        data,
+        ProcessedInputs(input_ids=input_ids, seq_len=4),
+        original_batch_size=2,
+        original_seq_len=4,
+        cp_sharder=None,
+    )
+
+    # Prompt (row 0, pos 1) and padding (row 1, pos 3) are zeroed instead of
+    # carrying -inf/NaN; valid out-of-support tokens keep -inf for the loss.
+    expected = torch.tensor([[0.0, 0.0, 0.0, -torch.inf], [0.0, 0.0, -torch.inf, 0.0]])
+    torch.testing.assert_close(logprobs, expected, rtol=0, atol=0)
+
+
+def _kl_in_reward_loss_config():
+    return ClippedPGLossConfig(
+        use_kl_in_reward=True,
+        reference_policy_kl_penalty=0.1,
+        reference_policy_kl_type="k3",
+    )
+
+
+@pytest.mark.parametrize("estimator", ["reinforce_plus_plus", "gae"])
+def test_kl_in_reward_ignores_tokens_outside_policy_support(estimator):
+    if estimator == "gae":
+        est = GeneralizedAdvantageEstimator(GAEConfig(), _kl_in_reward_loss_config())
+    else:
+        est = ReinforcePlusPlusAdvantageEstimator(
+            AdvEstimatorConfig.model_construct(minus_baseline=True),
+            _kl_in_reward_loss_config(),
+        )
+    reference = torch.tensor([[-1.0, -0.5, -0.7], [-0.2, -0.9, -0.3]])
+
+    def run(policy):
+        return est.compute_advantage(
+            prompt_ids=torch.tensor([[0], [0]]),
+            rewards=torch.tensor([0.0, 1.0]),
+            mask=torch.ones(2, 3),
+            values=torch.zeros(2, 3),
+            logprobs_policy=policy,
+            logprobs_reference=reference,
+        )
+
+    policy = torch.tensor([[-0.8, -torch.inf, -0.6], [-0.4, -0.9, -0.1]])
+    actual = run(policy)
+    # An excluded token contributes no KL penalty, same as a zero-KL token.
+    expected = run(torch.where(torch.isinf(policy), reference, policy))
+    if estimator == "gae":  # GAE returns (advantages, returns).
+        actual, expected = torch.stack(actual), torch.stack(expected)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_opd_advantage_ignores_tokens_outside_student_support():
+    est = OPDAdvantageEstimator({"name": "opd"}, {})
+    advantages = est.compute_advantage(
+        prompt_ids=None,
+        rewards=None,
+        mask=torch.tensor([[0.0, 1.0, 1.0]]),
+        teacher_logprobs=torch.tensor([[0.0, -0.5, -0.2]]),
+        prev_logprobs=torch.tensor([[0.0, -torch.inf, -0.7]]),
+    )
+
+    torch.testing.assert_close(advantages, torch.tensor([[0.0, 0.0, 0.5]]))
+    assert all(math.isfinite(v) for v in est.last_metrics.values())

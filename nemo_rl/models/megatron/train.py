@@ -39,6 +39,7 @@ from megatron.core.utils import (
 
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
+    need_top_k_or_top_p_filtering,
 )
 from nemo_rl.algorithms.loss import (
     DraftLossWrapper,
@@ -51,6 +52,7 @@ from nemo_rl.algorithms.loss import (
 from nemo_rl.algorithms.loss.draft import DEFAULT_DRAFT_TOKEN_CHUNK_SIZE
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.utils import _pack_input_ids
+from nemo_rl.algorithms.utils import mask_filtered_logprobs_outside_tokens
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
@@ -842,8 +844,13 @@ class LogprobsPostProcessor:
                 [torch.zeros_like(token_logprobs[:, :1]), token_logprobs], dim=1
             )
 
-            # Preserve -inf for tokens outside the policy support. The actor loss
-            # must exclude these positions before sanitizing logprobs.
+            # Preserve -inf only on valid tokens outside the policy support. The
+            # actor loss excludes these positions before sanitizing logprobs.
+            if need_top_k_or_top_p_filtering(self.sampling_params):
+                mask = data_dict["token_mask"] * data_dict["sample_mask"].unsqueeze(-1)
+                token_logprobs = mask_filtered_logprobs_outside_tokens(
+                    token_logprobs, mask
+                )
 
             token_logprobs = token_logprobs[:, :original_seq_length]
 
