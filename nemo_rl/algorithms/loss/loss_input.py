@@ -43,6 +43,7 @@ from nemo_rl.distributed.model_utils import (
     get_distillation_topk_logprobs_from_logits,
     get_next_token_logprobs_from_logits,
 )
+from nemo_rl.utils.sequence_lengths import CpuIntTuple
 
 if TYPE_CHECKING:
     from nemo_automodel.components.distributed.context_parallel import (
@@ -442,8 +443,8 @@ def prepare_packed_loss_input(
     logits: torch.Tensor,
     data: BatchedDataDict[Any],
     loss_fn: LossFunction,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_q_padded: torch.Tensor,
+    cu_seqlens_q: CpuIntTuple,
+    cu_seqlens_q_padded: CpuIntTuple,
     vocab_parallel_rank: Optional[int] = None,
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -462,8 +463,10 @@ def prepare_packed_loss_input(
         logits: Packed logits from the model [1, T_packed // CP, V // TP].
         data: Microbatch data (unpacked, [B, S]).
         loss_fn: Loss function (must have input_type == LossInputType.LOGPROB).
-        cu_seqlens_q: Unpadded cumulative sequence lengths [B+1].
-        cu_seqlens_q_padded: Padded cumulative sequence lengths [B+1].
+        cu_seqlens_q: Unpadded cumulative sequence lengths [B+1]. CPU-resident
+            integer tuples are required at this host-side loss boundary.
+        cu_seqlens_q_padded: Padded cumulative sequence lengths [B+1]. CPU-resident
+            integer tuples are required at this host-side loss boundary.
         vocab_parallel_rank: Vocab parallel rank.
         vocab_parallel_group: Vocab parallel group.
         context_parallel_group: Context parallel group.
