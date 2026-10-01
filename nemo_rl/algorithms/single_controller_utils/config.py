@@ -504,7 +504,12 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     # holds a whole cohort's advantage inputs in the controller's heap and
     # blocks the controller's event loop for the duration of the computation --
     # long enough at Ultra scale to miss Ray's actor liveness ping. A positive
-    # value moves both costs onto dedicated CPU actors.
+    # value moves both costs onto dedicated CPU actors. Only grpo and opd are
+    # sharded across the pool; other estimators run as one call on one actor.
+    # Under data_plane.backend=mooncake_cpu each worker is its own TQ client and
+    # mounts a full global_segment_size + local_buffer_size, like each
+    # token-capture finalizer; budget it on top of
+    # gpus_per_node x (segment + buffer).
     num_advantage_workers: NonNegativeInt = 0
 
     @model_validator(mode="after")
@@ -1121,6 +1126,20 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             f"{names} not supported on the SingleController path, which "
             "implements none of them -- the run would silently skip the "
             "shaping. Disable them."
+        )
+
+    # Rejected here rather than at the first advantage call, which is a whole
+    # round of rollouts and logprobs later: gdpo needs one reward column per
+    # component and SC's payload writes a single total_reward, with
+    # AdvantageConfig.repeated_batch_fields never populated.
+    if algo_cfg.adv_estimator.name == "gdpo":
+        raise NotImplementedError(
+            "adv_estimator 'gdpo' is not supported on the SingleController "
+            "path. It needs per-component reward columns (reward/<name>), and "
+            "the SC payload writes only total_reward, so the first advantage "
+            "call would raise 'GDPO requires multiple reward components' after "
+            "the run had already paid for a full step of rollouts. Set "
+            "adv_estimator.name to 'grpo'."
         )
 
     async_config = master_config.async_rl
