@@ -25,6 +25,7 @@ from ray.exceptions import ActorDiedError
 from tensordict import TensorDict
 
 import nemo_rl.algorithms.single_controller as single_controller
+from nemo_rl.algorithms.advantage_estimator import OPDAdvantageEstimator
 from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
 from nemo_rl.algorithms.async_utils.staleness_sampler import BaseSampler
 from nemo_rl.algorithms.grpo import GRPOConfig, _initial_grpo_save_state
@@ -181,12 +182,13 @@ def test_logs_hyperparameters_and_concrete_weight_synchronizer(
     actor_args = _actor_args_for_init()
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
 
-    controller_cls(
+    ctrl = controller_cls(
         master_config=master_config,
         actor_args=actor_args,
         setup_timing_metrics=SetupTimingMetrics(),
     )
 
+    assert ctrl._opd_gap_sum == 0.0
     expected_hparams = master_config.model_dump()
     expected_hparams["token_capture"]["control_auth_token"] = "<redacted>"
     logger.log_hyperparams.assert_called_once_with(expected_hparams)
@@ -1033,6 +1035,7 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
         "seq_logprob_error_metrics": [],
         "num_mask_sample_filtered": [],
     }
+    ctrl._opd_gap_sum = 0.0
     ctrl._opd_stat_sum = 0.0
     ctrl._opd_stat_sumsq = 0.0
     ctrl._opd_stat_count = 0
@@ -1061,6 +1064,7 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
         torch.full((2, 3), 0.25),
     )
     assert "advantages" in (enriched.fields or [])
+    assert ctrl._opd_gap_sum == pytest.approx(1.0)
     assert ctrl._opd_stat_sum == pytest.approx(1.0)
     assert ctrl._opd_stat_sumsq == pytest.approx(0.25)
     assert ctrl._opd_stat_count == 4
@@ -1076,9 +1080,11 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
 
 def test_pooled_opd_metrics_weight_unequal_chunks_by_valid_token_count() -> None:
     """A small streaming chunk cannot receive the same weight as a large one."""
-    # Chunk 1 has values [0, 2]; chunk 2 has [4]. Averaging chunk means
-    # would incorrectly produce 2.5. Exact pooling produces mean=2, std=2.
+    # Chunk 1 has advantages [0, 2]; chunk 2 has [4]. Averaging chunk means
+    # would incorrectly produce 2.5. Exact pooling produces mean=2, std=2,
+    # while the distinct raw gaps [-10, 0] and [1] have pooled mean=-3.
     metrics = _pooled_opd_metrics(
+        gap_sum=-9.0,
         stat_sum=6.0,
         stat_sumsq=20.0,
         count=3,
@@ -1086,9 +1092,22 @@ def test_pooled_opd_metrics_weight_unequal_chunks_by_valid_token_count() -> None
 
     assert metrics == pytest.approx(
         {
-            "on_policy_distillation/teacher_student_logprob_gap_mean": 2.0,
+            "on_policy_distillation/teacher_student_logprob_gap_mean": -3.0,
             "on_policy_distillation/adv_mean": 2.0,
             "on_policy_distillation/adv_std": 2.0,
+        }
+    )
+
+
+def test_pooled_opd_metrics_handles_empty_and_single_token_steps() -> None:
+    assert _pooled_opd_metrics(gap_sum=0.0, stat_sum=0.0, stat_sumsq=0.0, count=0) == {}
+    assert _pooled_opd_metrics(
+        gap_sum=-10.0, stat_sum=-0.25, stat_sumsq=0.0625, count=1
+    ) == pytest.approx(
+        {
+            "on_policy_distillation/teacher_student_logprob_gap_mean": -10.0,
+            "on_policy_distillation/adv_mean": -0.25,
+            "on_policy_distillation/adv_std": 0.0,
         }
     )
 
@@ -1425,6 +1444,7 @@ def _train_pump_controller(*, sampler) -> object:
         "num_mask_sample_filtered": [],
         "seq_logprob_error_metrics": [],
     }
+    ctrl._opd_gap_sum = 0.0
     ctrl._opd_stat_sum = 0.0
     ctrl._opd_stat_sumsq = 0.0
     ctrl._opd_stat_count = 0
@@ -1438,6 +1458,116 @@ def test_train_pump_stops_after_rollout_exhaustion_and_buffer_drain() -> None:
     asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
     assert ctrl._train_steps == 0
+
+
+@pytest.mark.parametrize("proximal_reward_alpha", [None, 0.2])
+def test_train_pump_pools_raw_opd_gaps_and_advantages_and_resets_each_step(
+    monkeypatch: pytest.MonkeyPatch,
+    proximal_reward_alpha: float | None,
+) -> None:
+    # Each step has unequal chunks (two valid tokens, then one). Fractional
+    # sample weights affect advantages, but not the raw teacher-student gap.
+    chunks = [([-10.0, 0.0], 0.25), ([2.0], 1.0), ([4.0, 6.0], 0.5), ([-4.0], 0.75)]
+    batches = {}
+    metas = []
+    for index, (gaps, weight) in enumerate(chunks):
+        sample_id = f"sample-{index}"
+        length = len(gaps) + 2
+        batches[sample_id] = TensorDict(
+            {
+                "prompt_ids_for_adv": torch.zeros(1, length, dtype=torch.long),
+                "total_reward": torch.zeros(1),
+                "token_mask": torch.tensor([[0.0, *([1.0] * len(gaps)), 0.0]]),
+                "sample_mask": torch.tensor([weight]),
+                "mask_sample": torch.zeros(1, dtype=torch.bool),
+                "truncated": torch.zeros(1, dtype=torch.bool),
+                "generation_logprobs": torch.zeros(1, length),
+                "prev_logprobs": torch.zeros(1, length),
+                # Nonfinite prompt/padding values must never enter the sums.
+                "teacher_reference_logprobs": torch.tensor(
+                    [[float("nan"), *gaps, float("inf")]]
+                ),
+            },
+            batch_size=(1,),
+        )
+        metas.append(
+            KVBatchMeta(
+                partition_id="rollout_data",
+                task_name="train",
+                sample_ids=[sample_id],
+                fields=[],
+                sequence_lengths=[length],
+                tags=[{"weight_version": index // 2}],
+            )
+        )
+
+    class FakeDataPlane(_NoOpDataPlane):
+        def get_samples(self, *, sample_ids: list[str], **kwargs: object) -> TensorDict:
+            del kwargs
+            return batches[sample_ids[0]]
+
+        def put_samples(self, **kwargs: object) -> None:
+            del kwargs
+
+    ctrl = _train_pump_controller(sampler=_SequenceSampler(metas))
+    ctrl._algo_cfg.max_num_steps = 2
+    ctrl._policy_logprobs_required = True
+    ctrl._teacher_logprobs_required = True
+    ctrl._advantage_estimator = OPDAdvantageEstimator(
+        {"name": "opd", "proximal_reward_alpha": proximal_reward_alpha}, {}
+    )
+    ctrl._train_fields = single_controller._train_fields_for_step(
+        policy_logprobs_required=True,
+        reference_logprobs_required=False,
+    )
+    ctrl._dp_client = FakeDataPlane()
+    ctrl._trainer = _LogprobRecordingTrainer()
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=5.0))
+
+    train_calls = [
+        call
+        for call in ctrl._logger.log_metrics.call_args_list
+        if call.kwargs["prefix"] == "train"
+    ]
+    assert len(train_calls) == 2
+    for step, call in enumerate(train_calls):
+        step_chunks = chunks[2 * step : 2 * step + 2]
+        raw_gaps = torch.tensor(
+            [gap for gaps, _ in step_chunks for gap in gaps], dtype=torch.float64
+        )
+        expected_advantages = torch.tensor(
+            [
+                weight
+                * (
+                    gap
+                    if proximal_reward_alpha is None
+                    else math.log(0.8 + 0.2 * math.exp(gap))
+                )
+                for gaps, weight in step_chunks
+                for gap in gaps
+            ],
+            dtype=torch.float64,
+        )
+        metrics = call.args[0]
+        assert call.kwargs["step"] == step + 1
+        assert metrics[
+            "on_policy_distillation/teacher_student_logprob_gap_mean"
+        ] == pytest.approx(raw_gaps.mean().item())
+        assert metrics["on_policy_distillation/adv_mean"] == pytest.approx(
+            expected_advantages.mean().item()
+        )
+        assert metrics["on_policy_distillation/adv_std"] == pytest.approx(
+            expected_advantages.std().item()
+        )
+
+    assert ctrl._opd_gap_sum == 0.0
+    assert ctrl._opd_stat_sum == 0.0
+    assert ctrl._opd_stat_sumsq == 0.0
+    assert ctrl._opd_stat_count == 0
 
 
 def test_train_pump_fails_if_rollout_exhausts_during_partial_step() -> None:

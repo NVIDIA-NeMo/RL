@@ -232,7 +232,7 @@ def _percentile(values: list[float], quantile: float) -> float:
 
 
 def _pooled_opd_metrics(
-    stat_sum: float, stat_sumsq: float, count: int
+    *, gap_sum: float, stat_sum: float, stat_sumsq: float, count: int
 ) -> dict[str, float]:
     """Compute whole-step OPD metrics from exact pooled sufficient statistics."""
     if count <= 0:
@@ -241,7 +241,7 @@ def _pooled_opd_metrics(
     # OPDAdvantageEstimator uses torch.std's default unbiased estimator.
     variance = (stat_sumsq - count * mean * mean) / (count - 1) if count > 1 else 0.0
     return {
-        "on_policy_distillation/teacher_student_logprob_gap_mean": mean,
+        "on_policy_distillation/teacher_student_logprob_gap_mean": gap_sum / count,
         "on_policy_distillation/adv_mean": mean,
         "on_policy_distillation/adv_std": math.sqrt(max(variance, 0.0)),
     }
@@ -586,6 +586,7 @@ class SingleControllerActor:
             "seq_logprob_error_metrics": [],
             **{key: [] for key in VIOLATION_TAG_KEYS},
         }
+        self._opd_gap_sum = 0.0
         self._opd_stat_sum = 0.0
         self._opd_stat_sumsq = 0.0
         self._opd_stat_count = 0
@@ -2891,11 +2892,13 @@ class SingleControllerActor:
                 self._step_log_dict = {k: [] for k in self._step_log_dict}
                 step_metrics.update(
                     _pooled_opd_metrics(
-                        self._opd_stat_sum,
-                        self._opd_stat_sumsq,
-                        self._opd_stat_count,
+                        gap_sum=self._opd_gap_sum,
+                        stat_sum=self._opd_stat_sum,
+                        stat_sumsq=self._opd_stat_sumsq,
+                        count=self._opd_stat_count,
                     )
                 )
+                self._opd_gap_sum = 0.0
                 self._opd_stat_sum = 0.0
                 self._opd_stat_sumsq = 0.0
                 self._opd_stat_count = 0
@@ -4987,6 +4990,9 @@ class SingleControllerActor:
         self._step_log_dict["rewards"].append(rewards.detach().cpu())
         self._step_log_dict["sample_masks"].append(final_sample_mask.detach().cpu())
         if self._teacher_logprobs_required:
+            raw_gap = kwargs["teacher_logprobs"] - kwargs["prev_logprobs"]
+            valid_gap = torch.masked_select(raw_gap, mask.bool()).detach().double()
+            self._opd_gap_sum += float(valid_gap.sum())
             valid = response_advantages.detach().double()
             self._opd_stat_sum += float(valid.sum())
             self._opd_stat_sumsq += float((valid * valid).sum())
