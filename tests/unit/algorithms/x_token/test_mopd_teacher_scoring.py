@@ -62,6 +62,41 @@ class _CharTokenizer:
         return "".join(str(message.get("content") or "") for message in messages)
 
 
+class _PieceTokenizer(_CharTokenizer):
+    def __init__(self, pieces: list[str]) -> None:
+        self.pieces = dict(enumerate(pieces, start=1))
+        self.ids = {piece: token_id for token_id, piece in self.pieces.items()}
+
+    def __call__(
+        self, text: str, return_offsets_mapping: bool = False, **kwargs
+    ) -> dict[str, list[int] | list[tuple[int, int]]]:
+        del kwargs
+        ids = []
+        offsets = []
+        cursor = 0
+        while cursor < len(text):
+            piece = max(
+                (piece for piece in self.ids if text.startswith(piece, cursor)),
+                key=len,
+            )
+            ids.append(self.ids[piece])
+            offsets.append((cursor, cursor + len(piece)))
+            cursor += len(piece)
+        result: dict[str, list[int] | list[tuple[int, int]]] = {"input_ids": ids}
+        if return_offsets_mapping:
+            result["offset_mapping"] = offsets
+        return result
+
+    def decode(
+        self, ids: list[int] | torch.Tensor, skip_special_tokens: bool = False
+    ) -> str:
+        del skip_special_tokens
+        return "".join(self.pieces[int(token_id)] for token_id in ids if int(token_id))
+
+    def convert_ids_to_tokens(self, ids: list[int]) -> list[str]:
+        return [self.pieces[int(token_id)] for token_id in ids]
+
+
 class _Sharding:
     def get_axis_size(self, axis):
         assert axis == "data_parallel"
@@ -72,12 +107,16 @@ class _TeacherGroup:
     cfg = {"max_total_sequence_length": 512}
     sharding_annotations = _Sharding()
 
-    def __init__(self):
+    def __init__(self, logprobs: torch.Tensor | None = None) -> None:
         self.calls = 0
+        self.logprobs = logprobs
 
     def get_logprobs(self, batch):
         self.calls += 1
         self.last_batch = batch
+        if self.logprobs is not None:
+            assert self.logprobs.shape == batch["input_ids"].shape
+            return {"reference_logprobs": self.logprobs.clone()}
         return {
             "reference_logprobs": torch.full(
                 batch["input_ids"].shape, -2.0, dtype=torch.float32
@@ -98,6 +137,52 @@ def _cross_tokenizer_config():
         "exclude_proven_template_only_teacher_tokens": False,
         "missing_think_close_policy": "mask",
     }
+
+
+def test_cross_token_scorer_projects_nonconstant_scores_with_real_aligner() -> None:
+    from nemo_rl.algorithms.x_token import mopd_teacher_scoring as scoring
+
+    student_tokenizer = _PieceTokenizer(["q", "a", "b", "c", "d"])
+    teacher_tokenizer = _PieceTokenizer(["q", "ab", "cd"])
+    # The prompt score must be excluded; the two answer scores differ.
+    teacher_group = _TeacherGroup(logprobs=torch.tensor([[-7.0, -2.0, -3.0]]))
+    scorer = scoring.build_mopd_teacher_scorer(
+        student_tokenizer=student_tokenizer,
+        teacher_group=teacher_group,
+        cross_tokenizer_config=_cross_tokenizer_config(),
+        teacher_tokenizer=teacher_tokenizer,
+    )
+
+    result = scorer.score(
+        input_ids=torch.tensor([[1, 2, 3, 4, 5]]),
+        input_lengths=torch.tensor([5]),
+        message_logs=[
+            [
+                {"role": "user", "content": "q", "token_ids": [1]},
+                {
+                    "role": "assistant",
+                    "content": "abcd",
+                    "token_ids": [2, 3, 4, 5],
+                    "generation_logprobs": [0.0] * 4,
+                },
+            ]
+        ],
+    )
+
+    # The real aligner maps [a, b] to [ab] and [c, d] to [cd].
+    torch.testing.assert_close(
+        result.logprobs, torch.tensor([[0.0, -1.0, -1.0, -1.5, -1.5]])
+    )
+    assert torch.equal(
+        result.valid_mask, torch.tensor([[False, True, True, True, True]])
+    )
+    assert teacher_group.calls == 1
+    torch.testing.assert_close(
+        teacher_group.last_batch["input_ids"], torch.tensor([[1, 2, 3]])
+    )
+    torch.testing.assert_close(
+        teacher_group.last_batch["input_lengths"], torch.tensor([3])
+    )
 
 
 @pytest.mark.parametrize(
