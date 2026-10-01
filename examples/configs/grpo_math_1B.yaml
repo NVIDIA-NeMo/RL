@@ -150,7 +150,6 @@ policy:
   worker_extension_cls_fqn: null # optional registered policy-worker subclass; mutually exclusive with quant_cfg
 
   dtensor_cfg:
-    _v2: true
     enabled: true
     checkpoint:
       model_save_format: "safetensors"
