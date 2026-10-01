@@ -1272,6 +1272,10 @@ class TestSetup:
 
         patched_factories["_build_clusters"].assert_not_called()
 
+        # Only the global baseline needs the whole step; plain MOPD may stream.
+        mc.grpo.adv_estimator = AdvEstimatorConfig(name="opd")
+        validate_single_controller_config(mc)
+
     def test_mopd_reserves_before_models_and_initializes_teacher_last(
         self, patched_factories, monkeypatch
     ):
