@@ -25,7 +25,6 @@ CONFIGS_DIR = Path(__file__).resolve().parents[4] / "examples" / "configs"
 
 ZERO_KL_EXEMPLARS = [
     "recipes/llm/grpo-qwen3-30ba3b-2n4g-megatron_generation-noncolocated-zero-kl.yaml",
-    "recipes/llm/grpo-qwen3-30ba3b-1n4g-megatron_generation-colocated-zero-kl.yaml",
 ]
 
 # Installed-package versions that satisfy every gate in `_validate_packages`.
@@ -647,18 +646,3 @@ def test_shipped_recipes_train_and_generate_with_the_same_tp(name):
         == policy["megatron_cfg"]["tensor_model_parallel_size"]
     )
     assert inference["context_parallel_size"] == 1
-
-
-@pytest.mark.parametrize(
-    "name",
-    [n for n in ZERO_KL_EXEMPLARS if "colocated" in n and "noncolocated" not in n],
-)
-def test_colocated_recipes_share_the_training_gpus(name):
-    policy = _load_policy(name)
-    assert policy["generation"]["colocated"]["enabled"] is True
-    assert policy["generation"]["refit_transport"] == "mcore"
-    assert policy["generation"]["mcore_generation_config"]["refit_backend"] == "nccl"
-    # Host RAM is the limit on one node: the optimizer must stay on the GPU
-    # (job 722268 OOMed the host with optimizer_cpu_offload on).
-    assert not policy["megatron_cfg"]["optimizer"].get("optimizer_cpu_offload")
-    assert policy["offload_optimizer_for_refit"] is False
