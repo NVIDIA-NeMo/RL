@@ -612,15 +612,21 @@ class StagedPrefix:
     Gym's capture core verifies. ``media_count`` is how many media items
     (images, or videos) the chain's rows staged, so the next call can stage
     only the media new to it and the engine expands only the media after it.
+    ``media_sizes`` gives each of those items' ``(height, width)`` rows (one for
+    a still, one per frame for a video) so the next call can check that the
+    engine saw the retained media at the staged geometry, not just as many
+    items.
     """
 
     expanded: list[int]
     media_count: int = 0
+    media_sizes: tuple[tuple[tuple[int, int], ...], ...] = ()
 
     def __add__(self, other: "StagedPrefix") -> "StagedPrefix":
         return StagedPrefix(
             expanded=self.expanded + other.expanded,
             media_count=self.media_count + other.media_count,
+            media_sizes=self.media_sizes + other.media_sizes,
         )
 
 
@@ -663,7 +669,9 @@ class ChainPrefixCache:
                     miss_start = i + 1
             miss_keys = staging_chain[miss_start:]
         if not miss_keys:
-            return StagedPrefix(list(cached.expanded), cached.media_count)
+            return StagedPrefix(
+                list(cached.expanded), cached.media_count, cached.media_sizes
+            )
         if source is None:
             raise RuntimeError(
                 "staging source not initialized; call setup_token_capture() first"
@@ -676,7 +684,9 @@ class ChainPrefixCache:
             cache[last_key] = result
             if len(cache) > 256:
                 del cache[next(iter(cache))]
-        return StagedPrefix(list(result.expanded), result.media_count)
+        return StagedPrefix(
+            list(result.expanded), result.media_count, result.media_sizes
+        )
 
 
 def resolve_admission_prefix(
@@ -773,10 +783,10 @@ class TQTokenSource:
         return self.fetch_prefix_chains(staging_keys).expanded
 
     def fetch_prefix_chains(self, staging_keys: list[str]) -> StagedPrefix:
-        """Bulk-fetch the ordered delta chain and count the media it staged.
+        """Bulk-fetch the ordered delta chain and describe the media it staged.
 
-        ``media_count`` is read off the small media columns (never the pixels)
-        and is only computed when this source was built with
+        ``media_count`` and ``media_sizes`` are read off the small media
+        columns (never the pixels) and are only computed when this source was built with
         ``capture_media=True``; otherwise it is 0 regardless of what the rows
         staged. The Megatron preparer's ``media_prev_count`` therefore depends
         on the source's ``capture_media`` matching the sink's -- both are set
@@ -788,7 +798,7 @@ class TQTokenSource:
             raise KeyError("prefix fetch: staging_keys contains duplicates")
         select_fields = ["token_ids_delta"]
         if self._capture_media:
-            # Small media columns only: enough to count items, never pixels.
+            # Small media columns only: enough to count and size items, never pixels.
             select_fields += [
                 MEDIA_PRESENT_FIELD,
                 MEDIA_HAS_FRAMES_FIELD,
@@ -808,12 +818,17 @@ class TQTokenSource:
                 f"prefix fetch incomplete: requested {len(staging_keys)} keys, got {n_rows}"
             )
         expanded: list[int] = []
-        media_count = 0
+        media_sizes: list[tuple[tuple[int, int], ...]] = []
         for index in range(n_rows):
             row = _select_row(rows, index)
             expanded.extend(int(t) for t in row["token_ids_delta"].squeeze(0).tolist())
-            media_count += _row_media_item_count(row) if self._capture_media else 0
-        return StagedPrefix(expanded=expanded, media_count=media_count)
+            if self._capture_media:
+                media_sizes.extend(_row_media_item_sizes(row))
+        return StagedPrefix(
+            expanded=expanded,
+            media_count=len(media_sizes),
+            media_sizes=tuple(media_sizes),
+        )
 
     def fetch_media(self, items: list[FetchedStagedCall]) -> list[StagedMediaTensors]:
         """One batched read of the media tensor columns for rows known to carry media.
@@ -1148,14 +1163,29 @@ def _row_scalar_bool(row: Any, field_name: str) -> bool:
     return bool(flattened[0].item())
 
 
-def _row_media_item_count(row: Any) -> int:
-    """Items (images or videos) one media-enabled row staged, from its small columns.
+def _row_media_item_sizes(row: Any) -> tuple[tuple[tuple[int, int], ...], ...]:
+    """The ``(height, width)`` rows of each item one media-enabled row staged.
 
-    Mirrors ``slice_media_tensors``: a video counts once (one ``num_frames``
-    entry), a still image counts once (one ``imgs_sizes`` row).
+    Mirrors ``slice_media_tensors``: a video is one item spanning its
+    ``num_frames`` rows of ``imgs_sizes``, a still image one item of one row.
+
+    Raises:
+        ValueError: ``num_frames`` does not tile the ``imgs_sizes`` rows.
     """
     if not _row_scalar_bool(row, MEDIA_PRESENT_FIELD):
-        return 0
-    if _row_scalar_bool(row, MEDIA_HAS_FRAMES_FIELD):
-        return int(row[MEDIA_NUM_FRAMES_FIELD].reshape(-1).numel())
-    return int(row[MEDIA_IMGS_SIZES_FIELD].reshape(-1, 2).shape[0])
+        return ()
+    sizes = [
+        (int(h), int(w)) for h, w in row[MEDIA_IMGS_SIZES_FIELD].reshape(-1, 2).tolist()
+    ]
+    if not _row_scalar_bool(row, MEDIA_HAS_FRAMES_FIELD):
+        return tuple((size,) for size in sizes)
+    frames = [int(f) for f in row[MEDIA_NUM_FRAMES_FIELD].reshape(-1).tolist()]
+    if any(f <= 0 for f in frames) or sum(frames) != len(sizes):
+        raise ValueError(
+            f"media_num_frames {frames} does not tile the {len(sizes)} media_imgs_sizes rows"
+        )
+    items, start = [], 0
+    for count in frames:
+        items.append(tuple(sizes[start : start + count]))
+        start += count
+    return tuple(items)

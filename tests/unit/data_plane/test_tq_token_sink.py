@@ -61,6 +61,7 @@ from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
 )
 from nemo_rl.models.generation.megatron.token_capture import (  # noqa: E402
     MEDIA_PREV_COUNT_KEY,
+    MEDIA_PREV_SIZES_KEY,
     MINF_CAPTURE_PARAMS_FIELD,
     TQMegatronPromptPreparer,
     TQMegatronTokenStager,
@@ -676,7 +677,7 @@ def test_megatron_stager_passes_media_tensors_as_attachments(media_tensors):
         payload,
         capture_payload=admission,
         finished_metadata=SimpleNamespace(policy_epoch=[(0, 0)]),
-        minf_params={MEDIA_PREV_COUNT_KEY: 0},
+        minf_params={MEDIA_PREV_COUNT_KEY: 0, MEDIA_PREV_SIZES_KEY: []},
     )
     assert result.response_metadata == {"ng_commit_coords": {"disposition": "staged"}}
     attachments = capture.complete_call_from_response.call_args.kwargs["attachments"]
@@ -937,6 +938,8 @@ def test_fetch_prefix_chains_counts_media_items_from_columns(
     chains = source.fetch_prefix_chains(["r0/c1", "r0/c2", "r0/c3"])
     assert chains.expanded == [1, 2] * 3
     assert chains.media_count == 2
+    # Per item, the (h, w) rows it staged: one for the still, three for the video.
+    assert chains.media_sizes == (((32, 32),), ((32, 32), (32, 32), (32, 32)))
     # The token-only reader never selects media columns.
     text_source = TQTokenSource(tq_client, staging_partition=media_partition)
     assert text_source.fetch_prefix_chains(["r0/c1", "r0/c3"]).media_count == 0
@@ -1056,6 +1059,8 @@ def test_megatron_prompt_preparer_splices_resolved_prefix(
     )
     assert result.offload_params[MINF_CAPTURE_PARAMS_FIELD] == {
         MEDIA_PREV_COUNT_KEY: expected_media_prev_count,
+        # Sizes of the staged items, so the stager can re-check them.
+        MEDIA_PREV_SIZES_KEY: [[[4, 4]]] * expected_media_prev_count,
     }
     assert result.offload_params.get(expanded_count_field) == expected_expanded_count
 
@@ -1088,6 +1093,67 @@ def test_megatron_prompt_preparer_splices_resolved_prefix(
     [media2] = source.fetch_media([fetched2])
     assert torch.equal(media2.imgs, two_images["imgs"][:, 4:, :])
     assert media2.imgs_sizes.tolist() == [[4, 4]]
+
+
+def test_megatron_stager_rejects_a_resized_retained_image(
+    tq_client, media_partition, prefix_stitching_fields
+):
+    """Turn 2 resends image 1 at a new size with the same patch count. A
+    count-only check passes and the trainer would get turn 1's pixels; the
+    stager must fail the call instead, as the vLLM worker does."""
+    media_count_field, _ = prefix_stitching_fields
+    stager, root_coords = _stage_root(
+        tq_client, media_partition, _minf_payload(multimodal=True), media=True
+    )
+    admission = nemo_gym.CaptureAdmission(
+        rollout_id="minf-r0",
+        model_call_id="c2",
+        parent_call_id="c1",
+        prev_len=7,
+        mode="token_in",
+        staging_chain=[root_coords["staging_key"]],
+        parent_chain_hash=root_coords["chain_hash"],
+    )
+    preparer = TQMegatronPromptPreparer(
+        TQTokenSource(tq_client, staging_partition=media_partition, capture_media=True)
+    )
+    prepared = preparer.prepare_prompt(
+        [80, 99, 81, 13, 2, 20, 99, 21],
+        offload_params={
+            "ng_capture": admission.model_dump(mode="json"),
+            PREFIX_TEMPLATE_TOKEN_IDS_FIELD: [80, 99, 81, 13, 2],
+            PREFIX_EOS_TOKEN_ID_FIELD: [2],
+            media_count_field: 1,
+        },
+    )
+    assert prepared.offload_params[MINF_CAPTURE_PARAMS_FIELD] == {
+        MEDIA_PREV_COUNT_KEY: 1,
+        MEDIA_PREV_SIZES_KEY: [[[4, 4]]],
+    }
+    resized = _minf_two_image_tensors()
+    resized["imgs_sizes"] = torch.tensor([[2, 8], [4, 4]], dtype=torch.int32)
+    payload = SimpleNamespace(
+        prompt_token_ids=[80, 99, 99, 99, 81, 12, 2, 20, 99, 99, 99, 21],
+        generated_token_ids=[30],
+        generated_log_probs=[-0.1],
+        media_tensors=resized,
+    )
+    with pytest.raises(ValueError, match="retained media geometry changed"):
+        _MegatronCapturePayload.from_offloaded(
+            payload, prepared.offload_params[MINF_CAPTURE_PARAMS_FIELD]
+        )
+    result = stager.stage(
+        "minf-response-2",
+        payload,
+        finished_metadata=SimpleNamespace(policy_epoch=[(0, 7)]),
+        offload_params=prepared.offload_params,
+    )
+    coords = result.response_metadata["ng_commit_coords"]
+    assert coords["disposition"] == "capture_failed"
+    with pytest.raises(KeyError):
+        TQTokenSource(tq_client, staging_partition=media_partition).fetch(
+            ["minf-r0/c2"]
+        )
 
 
 @pytest.mark.parametrize(
@@ -1262,13 +1328,33 @@ def _minf_payload_without(field: str):
         # The engine saw one image but the parent chain claims two were staged.
         pytest.param(
             _minf_payload(multimodal=True),
-            {MEDIA_PREV_COUNT_KEY: 2},
+            {MEDIA_PREV_COUNT_KEY: 2, MEDIA_PREV_SIZES_KEY: [[[4, 4]], [[4, 4]]]},
             (ValueError, "exceeds"),
             id="media-prev-count-exceeds",
         ),
+        # The chain staged image 1 at 4x4; the engine re-saw it at 2x8.
+        pytest.param(
+            _minf_payload(multimodal=True),
+            {MEDIA_PREV_COUNT_KEY: 1, MEDIA_PREV_SIZES_KEY: [[[2, 8]]]},
+            (ValueError, "retained media geometry changed"),
+            id="media-prev-sizes-changed",
+        ),
+        # Count and sizes disagree: the preparer never writes that.
+        pytest.param(
+            _minf_payload(multimodal=True),
+            {MEDIA_PREV_COUNT_KEY: 1, MEDIA_PREV_SIZES_KEY: []},
+            (ValueError, "media_prev_sizes"),
+            id="media-prev-sizes-count-mismatch",
+        ),
+        pytest.param(
+            _minf_payload(multimodal=True),
+            {MEDIA_PREV_COUNT_KEY: 1, MEDIA_PREV_SIZES_KEY: [[[4]]]},
+            (ValueError, "media_prev_sizes"),
+            id="media-prev-sizes-malformed",
+        ),
         pytest.param(
             _minf_payload(multimodal=True, media_tensors=[torch.zeros(1, 4, 12)]),
-            {MEDIA_PREV_COUNT_KEY: 1},
+            {MEDIA_PREV_COUNT_KEY: 1, MEDIA_PREV_SIZES_KEY: [[[4, 4]]]},
             (TypeError, "media_tensors must be a mapping, got list"),
             id="media-tensors-list",
         ),

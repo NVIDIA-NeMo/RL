@@ -53,6 +53,9 @@ if TYPE_CHECKING:
 # offload_params sub-dict the Megatron preparer writes and the stager reads.
 MINF_CAPTURE_PARAMS_FIELD = "ng_capture_minf"
 MEDIA_PREV_COUNT_KEY = "media_prev_count"
+# ``(height, width)`` rows per staged item (``StagedPrefix.media_sizes`` as
+# nested lists): the stager checks the engine's retained media against them.
+MEDIA_PREV_SIZES_KEY = "media_prev_sizes"
 
 
 class TQMegatronPromptPreparer:
@@ -95,9 +98,12 @@ class TQMegatronPromptPreparer:
 
         - ``ng_capture.required_prefix_token_ids``: the expanded prefix Gym
           verifies the engine's prompt against.
-        - ``ng_capture_minf.media_prev_count``: media items the parent chain
-          staged; the stager slices the engine's whole-conversation
-          ``media_tensors`` there so each row carries only this call's media.
+        - ``ng_capture_minf.media_prev_count`` and ``media_prev_sizes``: the
+          media items the parent chain staged and their geometry; the stager
+          checks the leading items of the engine's whole-conversation
+          ``media_tensors`` against the sizes (a resent image at a new size
+          fails the call) and slices at the count so each row carries only
+          this call's media.
         - ``_prefix_expanded_token_count``: written only when the endpoint
           reported ``_prefix_media_count``; tells the engine where the
           already-expanded prefix ends so it expands only the media
@@ -171,6 +177,9 @@ class TQMegatronPromptPreparer:
         updated_offload_params[MINF_CAPTURE_PARAMS_FIELD] = {
             **(updated_offload_params.get(MINF_CAPTURE_PARAMS_FIELD) or {}),
             MEDIA_PREV_COUNT_KEY: chains.media_count,
+            MEDIA_PREV_SIZES_KEY: [
+                [list(size) for size in item] for item in chains.media_sizes
+            ],
         }
 
         template_prefix_token_ids = updated_offload_params.get(
@@ -218,6 +227,69 @@ class TQMegatronPromptPreparer:
         return RequestPromptPreparationResult(
             prompt=prompt, offload_params=updated_offload_params
         )
+
+
+def media_item_sizes(
+    media_tensors: dict[str, Any] | None, count: int
+) -> list[list[list[int]]]:
+    """``(height, width)`` rows of the first ``count`` items in the engine's media.
+
+    Same item boundaries as ``slice_media_tensors``: a video spans its
+    ``num_frames`` rows of ``imgs_sizes``, a still image one row.
+
+    Raises:
+        ValueError: ``imgs_sizes`` is missing, or the engine saw fewer than
+            ``count`` items.
+    """
+    if count <= 0:
+        return []
+    imgs_sizes = (media_tensors or {}).get("imgs_sizes")
+    if imgs_sizes is None:
+        raise ValueError("media delta requires imgs_sizes to locate items")
+    sizes = [[int(h), int(w)] for h, w in imgs_sizes.reshape(-1, 2).tolist()]
+    num_frames = (media_tensors or {}).get("num_frames")
+    frames = (
+        [1] * len(sizes)
+        if num_frames is None
+        else [int(f) for f in num_frames.reshape(-1).tolist()]
+    )
+    if count > len(frames):
+        raise ValueError(
+            f"media_prev_count {count} exceeds the {len(frames)} media items "
+            "the engine saw"
+        )
+    items, start = [], 0
+    for item_frames in frames[:count]:
+        items.append(sizes[start : start + item_frames])
+        start += item_frames
+    return items
+
+
+def _prev_sizes(minf_params: Any, prev_count: int) -> list[list[list[int]]]:
+    """Validate ``media_prev_sizes``: one list of ``[h, w]`` rows per counted item."""
+    value = minf_params.get(MEDIA_PREV_SIZES_KEY) if minf_params is not None else None
+    if value is None:
+        value = []
+    if (
+        not isinstance(value, list)
+        or len(value) != prev_count
+        or any(
+            not isinstance(item, list)
+            or not item
+            or any(
+                not isinstance(size, list)
+                or len(size) != 2
+                or any(type(v) is not int or v <= 0 for v in size)
+                for size in item
+            )
+            for item in value
+        )
+    ):
+        raise ValueError(
+            f"MInf capture request carries an invalid {MEDIA_PREV_SIZES_KEY} for "
+            f"{prev_count} staged media items: {value!r}"
+        )
+    return value
 
 
 def slice_media_tensors(
@@ -314,9 +386,11 @@ class _MegatronCapturePayload:
 
         Copies the ``prompt_token_ids`` / ``generated_token_ids`` /
         ``generated_log_probs`` attributes Gym's ``MegatronCaptureAdapter``
-        reads (missing ones become ``None``) and slices
-        ``payload.media_tensors`` at ``minf_params["media_prev_count"]`` so
-        only the media new to this call remains.
+        reads (missing ones become ``None``), checks the first
+        ``minf_params["media_prev_count"]`` items of ``payload.media_tensors``
+        against ``minf_params["media_prev_sizes"]`` (the geometry the parent
+        chain staged), and slices the tensors there so only the media new to
+        this call remains.
 
         Args:
             payload: The engine's ``OffloadedRequestPayload`` (or equivalent).
@@ -326,8 +400,10 @@ class _MegatronCapturePayload:
         Raises:
             TypeError: ``minf_params`` is not a dict or ``media_tensors`` is not
                 a mapping.
-            ValueError: ``media_prev_count`` is not a non-negative int, or the
-                media geometry cannot be sliced there.
+            ValueError: ``media_prev_count`` is not a non-negative int,
+                ``media_prev_sizes`` is malformed or does not have one entry per
+                counted item, a retained item's geometry differs from the
+                staged one, or the media cannot be sliced at the count.
 
         The stager maps both to ``capture_failed`` coordinates.
         """
@@ -355,7 +431,19 @@ class _MegatronCapturePayload:
         media: dict[str, Any] | None = (
             None if media_tensors is None else dict(media_tensors)
         )
-        media = slice_media_tensors(media, _count(MEDIA_PREV_COUNT_KEY))
+        prev_count = _count(MEDIA_PREV_COUNT_KEY)
+        staged_sizes = _prev_sizes(minf_params, prev_count)
+        if prev_count:
+            engine_sizes = media_item_sizes(media, prev_count)
+            for index, (staged, seen) in enumerate(
+                zip(staged_sizes, engine_sizes, strict=True)
+            ):
+                if staged != seen:
+                    raise ValueError(
+                        f"MInf retained media geometry changed: item {index} was "
+                        f"staged at {staged}, the engine saw {seen}"
+                    )
+        media = slice_media_tensors(media, prev_count)
         return cls(
             prompt_token_ids=getattr(payload, "prompt_token_ids", None),
             generated_token_ids=getattr(payload, "generated_token_ids", None),

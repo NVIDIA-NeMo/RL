@@ -442,7 +442,9 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   (required tensors, patch geometry, frame grouping); malformed or missing
   columns reject the rollout as `invalid_media_columns`, incompatible parts
   along a chain as `media_chain_incompatible`. Tensor contents are not hashed;
-  retained occurrences are checked by geometry and placeholder tokens. Media
+  retained occurrences are checked by geometry on both backends and
+  additionally by placeholder tokens on vLLM, the only engine that reports
+  them. Media
   must remain immutable for the rollout's lifetime and preprocessing must be
   deterministic. Same-shape pixel changes and corruption of stored pixel values
   are outside this check's coverage. Call

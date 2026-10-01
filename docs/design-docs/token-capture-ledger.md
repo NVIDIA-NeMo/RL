@@ -148,17 +148,23 @@ only one token space is ever staged.
   endpoint writes `_prefix_media_count`; the preparer checks it against the
   chain's count and answers with `_prefix_expanded_token_count` (the chain's
   length), which tells the engine where the expanded prefix ends.
-  `media_prev_count` is counted from the parent rows' small media columns
-  (`media_present`, `media_has_frames`, `media_imgs_sizes`, `media_num_frames`),
-  never from pixels, and only when the source was built with
-  `capture_media=True`; setup sets the source's and the sink's `capture_media`
-  from the same flag.
-- `TQMegatronTokenStager` slices the payload's `media_tensors` at
-  `media_prev_count` (`slice_media_tensors`) so each row holds only the media
-  new to that call (every chat request carries the whole conversation, so the
-  engine hands over pixels for every image in the prompt), and passes the
-  remainder to Gym as attachments (`None` for text calls). A malformed payload
-  poisons the call with `capture_failed` coordinates instead of raising.
+  `media_prev_count`, and the per-item `(height, width)` rows recorded next
+  to it as `media_prev_sizes`, are read from the parent rows' small media
+  columns (`media_present`, `media_has_frames`, `media_imgs_sizes`,
+  `media_num_frames`), never from pixels, and only when the source was built
+  with `capture_media=True`; setup sets the source's and the sink's
+  `capture_media` from the same flag.
+- `TQMegatronTokenStager` checks the first `media_prev_count` items of the
+  payload's `media_tensors` against `media_prev_sizes`, so a later turn that
+  resends an earlier image at a different size fails the call instead of
+  staging the earlier turn's pixels (vLLM makes the same geometry check on its
+  placeholder items; placeholder-token checks stay vLLM-only since MInf
+  reports no spans). It then slices the tensors at `media_prev_count`
+  (`slice_media_tensors`) so each row holds only the media new to that call
+  (every chat request carries the whole conversation, so the engine hands over
+  pixels for every image in the prompt), and passes the remainder to Gym as
+  attachments (`None` for text calls). A malformed payload poisons the call
+  with `capture_failed` coordinates instead of raising.
 - The Megatron worker pins the staging column dtype to
   `MINF_MEDIA_PIXEL_DTYPE` (`torch.float32`): MInf's image preprocessing
   emits torchvision `ToTensor` + `Normalize` patches uncast, and nothing
