@@ -171,7 +171,9 @@ from nemo_rl.experience.rollout_manager import RolloutOutcome
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
+    SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS,
     PromptGroupPhase,
+    RolloutAttemptStatus,
     RolloutRecoveryState,
     build_rollout_recovery_state,
     parse_rollout_recovery_state,
@@ -1067,13 +1069,19 @@ class SingleControllerActor:
         expected_schema_version = metadata.get("rollout_recovery_schema_version")
         if (
             isinstance(expected_schema_version, bool)
-            or expected_schema_version != ROLLOUT_RECOVERY_SCHEMA_VERSION
+            or not isinstance(expected_schema_version, int)
+            or expected_schema_version not in SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS
         ):
             raise ValueError(
                 "native TQ checkpoint rollout recovery schema mismatch: "
                 f"checkpoint={expected_schema_version!r}, "
                 f"expected={ROLLOUT_RECOVERY_SCHEMA_VERSION}"
             )
+        if (
+            expected_schema_version < 4
+            and self._master_config.token_capture.context_compaction
+        ):
+            raise ValueError("Obsolete CC snapshots are unsupported; start a fresh run")
         expected_group_count = metadata.get("rollout_recovery_group_count")
         if (
             isinstance(expected_group_count, bool)
@@ -1104,6 +1112,10 @@ class SingleControllerActor:
             weights_only=True,
         )
         parsed_state = parse_rollout_recovery_state(state)
+        if parsed_state.ledger_state["schema_version"] != expected_schema_version:
+            raise ValueError(
+                "rollout recovery sidecar schema disagrees with native TQ metadata"
+            )
         if len(parsed_state.ledger_state["groups"]) != expected_group_count:
             raise ValueError(
                 "rollout recovery sidecar group count does not match native "
@@ -1115,7 +1127,19 @@ class SingleControllerActor:
             "recovery_restore"
         ) as cut:
             recovery_ledger.load_state_dict(cut, parsed_state.ledger_state)
-            recovery_ledger.prepare_for_restart(cut)
+            recovery_ledger.assert_checkpoint_safe()
+            if self._master_config.token_capture.enabled:
+                for group in recovery_ledger.groups():
+                    for sibling in group.siblings:
+                        attempt = sibling.current_attempt
+                        if (
+                            attempt.status is RolloutAttemptStatus.SEALED
+                            and (attempt.logical_selection is not None)
+                            != self._master_config.token_capture.context_compaction
+                        ):
+                            raise ValueError(
+                                "recovery selection disagrees with context_compaction mode"
+                            )
             self._batch_shortfall = parsed_state.batch_shortfall
             canonical_state = self._buffer.metadata_state_dict(
                 saved_capacity=self._async_cfg.max_buffered_rollouts
@@ -1124,6 +1148,12 @@ class SingleControllerActor:
                 group["group_id"] for group in canonical_state["groups"]
             }
             recovery_ledger.discard_canonical_groups(cut, canonical_group_ids)
+            if self._master_config.token_capture.enabled:
+                # Validate saved custody before restart normalization can discard it.
+                await self._validate_rollout_recovery_inventory(
+                    cut, replay_metadata=canonical_state, clear_unreferenced=False
+                )
+            recovery_ledger.prepare_for_restart(cut)
             if self._master_config.token_capture.enabled:
                 await self._validate_rollout_recovery_inventory(
                     cut,
@@ -1471,14 +1501,19 @@ class SingleControllerActor:
         """Validate staging ownership while the caller holds a stable cut."""
         cut.require_live()
         expected_staging_keys = self._rollout_recovery_ledger.expected_staging_keys()
+        required_staging_keys = self._rollout_recovery_ledger.expected_staging_keys(
+            required_only=True
+        )
         if replay_metadata is not None:
             for group in replay_metadata["groups"]:
                 for tag in group["meta"].tags or []:
                     encoded_plan = tag.get(ROUTE_PLAN_TAG)
                     if encoded_plan is not None:
-                        expected_staging_keys.update(
-                            decode_route_plan(encoded_plan).cleanup_staging_keys
-                        )
+                        route_keys = decode_route_plan(
+                            encoded_plan
+                        ).cleanup_staging_keys
+                        expected_staging_keys.update(route_keys)
+                        required_staging_keys.update(route_keys)
 
         staging_partition = self._master_config.token_capture.staging_partition
         actual_staging_keys = set(
@@ -1487,7 +1522,7 @@ class SingleControllerActor:
                 partition_id=staging_partition,
             )
         )
-        missing = sorted(expected_staging_keys - actual_staging_keys)
+        missing = sorted(required_staging_keys - actual_staging_keys)
         if missing:
             raise RuntimeError(
                 "rollout-recovery ownership references staging rows missing "
@@ -1508,10 +1543,10 @@ class SingleControllerActor:
             )
         print(
             "📦 Rollout-recovery staging inventory validated: "
-            f"referenced={len(expected_staging_keys)}",
+            f"referenced={len(expected_staging_keys & actual_staging_keys)}",
             flush=True,
         )
-        return len(expected_staging_keys)
+        return len(expected_staging_keys & actual_staging_keys)
 
     async def _maybe_restore_replacement_reserve(self) -> None:
         """Restore spare prompts diverted before the previous run's checkpoint.
@@ -1532,10 +1567,12 @@ class SingleControllerActor:
         reserve_path = os.path.join(
             self._last_checkpoint_path, REPLACEMENT_RESERVE_FILENAME
         )
-        # Absent for every run that never diverted a batch, which is every run that
-        # does not use "replace" -- so silence here rather than the buffer restore's
-        # warning, since this is the ordinary case rather than a lost artifact.
+        # New checkpoints write even an empty reserve; legacy absence remains valid.
         if not os.path.exists(reserve_path):
+            if (self._data_plane_checkpoint_metadata or {}).get(
+                "rollout_recovery_schema_version", 0
+            ) >= 3:
+                raise FileNotFoundError(f"checkpoint is missing {reserve_path}")
             return
         # weights_only=False: spares are pickled DatumSpecs, and the checkpoint is a
         # trusted same-job artifact (the replay buffer restore loads on the same terms).
@@ -4236,14 +4273,11 @@ class SingleControllerActor:
             dataloader_path,
         )
         written_paths.append(dataloader_path)
-        if cut.replacement_reserve:
-            replacement_reserve_path = checkpoint_path / REPLACEMENT_RESERVE_FILENAME
-            await asyncio.to_thread(
-                torch.save,
-                cut.replacement_reserve,
-                replacement_reserve_path,
-            )
-            written_paths.append(replacement_reserve_path)
+        replacement_reserve_path = checkpoint_path / REPLACEMENT_RESERVE_FILENAME
+        await asyncio.to_thread(
+            torch.save, cut.replacement_reserve, replacement_reserve_path
+        )
+        written_paths.append(replacement_reserve_path)
         if cut.replay_metadata is not None:
             replay_metadata_path = checkpoint_path / REPLAY_BUFFER_METADATA_FILENAME
             await asyncio.to_thread(
@@ -4929,12 +4963,11 @@ class SingleControllerActor:
             dataloader_state,
             os.path.join(checkpoint_path, "train_dataloader.pt"),
         )
-        if reserve_state:
-            await asyncio.to_thread(
-                torch.save,
-                reserve_state,
-                os.path.join(checkpoint_path, REPLACEMENT_RESERVE_FILENAME),
-            )
+        await asyncio.to_thread(
+            torch.save,
+            reserve_state,
+            os.path.join(checkpoint_path, REPLACEMENT_RESERVE_FILENAME),
+        )
         if replay_metadata is not None:
             await asyncio.to_thread(
                 torch.save,
