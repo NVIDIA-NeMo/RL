@@ -83,8 +83,10 @@ def reject_outdated_dataset_config(config: dict[str, Any]) -> None:
     if isinstance(data, dict) and "train" not in data:
         raise ValueError(
             "data has no train section. The dataset config structure changed: datasets "
-            "now live under data.train and data.validation. See "
-            "https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/grpo.md#dataset and "
+            "now live under data.train and data.validation. See the dataset section of "
+            "your algorithm's guide (https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/grpo.md#dataset, "
+            "https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/sft.md#datasets, "
+            "https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/dpo.md#datasets) and "
             "the migration guides in https://github.com/NVIDIA-NeMo/RL/pull/1649 "
             "(response datasets) and https://github.com/NVIDIA-NeMo/RL/pull/1763 "
             "(preference datasets)."
@@ -108,7 +110,9 @@ def reject_outdated_metric_name_format(config: dict[str, Any]) -> None:
     raise ValueError(
         f"checkpointing.metric_name={metric_name!r} must start with 'train:' or 'val:', "
         f"followed by the name in the matching metrics dictionary. The bare-name format "
-        f"is gone, e.g. 'val_loss' is now 'val:val_loss'."
+        f"is gone, and the name after the prefix depends on the algorithm: SFT "
+        f"'val:val_loss', DPO/RM 'val:validation-<dataset>_loss' (default "
+        f"'val:validation-default_loss'), GRPO/PPO/distillation 'val:accuracy'."
     )
 
 
