@@ -167,12 +167,13 @@ def _broadcast_batched_data_dict(
                 dtype = getattr(torch, dtype_str.split(".")[-1])
                 tensor = torch.empty(shape, dtype=dtype, device=bcast_device)
                 out[key] = tensor
-            # NCCL has no int16 ("Short") type; ship as int32 and narrow back
-            # (routed_experts rides TQ as int16).
+            # NCCL has no int16 ("Short") type. Broadcast the same bytes
+            # without allocating widened and narrowed copies of route payloads.
             if tensor.dtype == torch.int16:
-                wire = tensor.to(torch.int32)
-                torch.distributed.broadcast(wire, src=src, group=group)
-                tensor = wire.to(torch.int16)
+                tensor = tensor.contiguous()
+                torch.distributed.broadcast(
+                    tensor.reshape(-1).view(torch.uint8), src=src, group=group
+                )
                 out[key] = tensor
             else:
                 torch.distributed.broadcast(tensor, src=src, group=group)
@@ -209,10 +210,9 @@ def _broadcast_batched_data_dict(
                 tensor = torch.empty(numel, dtype=dtype, device=bcast_device)
             if tensor.numel():
                 if tensor.dtype == torch.int16:
-                    wire = tensor.to(torch.int32)
-                    torch.distributed.broadcast(wire, src=src, group=group)
-                    tensor = wire.to(torch.int16)
-                    del wire
+                    torch.distributed.broadcast(
+                        tensor.view(torch.uint8), src=src, group=group
+                    )
                 else:
                     torch.distributed.broadcast(tensor, src=src, group=group)
             if not is_leader:
