@@ -62,6 +62,11 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_free_port_local,
     _get_node_ip_local,
 )
+from nemo_rl.environments.gym_checkpoint_adapter import (
+    GymCheckpointAdapter,
+    GymCheckpointInstance,
+    GymCheckpointParticipantSummary,
+)
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym_multimodal import (
     _has_image_before_first_trainable_output,
@@ -475,6 +480,10 @@ class NemoGymConfig(TypedDict):
     # server, switches run_rollouts to receipt mode, and assembles receipts
     # from the manifest control route. None/absent = legacy token-echo path.
     token_capture: NotRequired[Dict[str, Any] | None]
+    # Internal checkpoint topology. These are derived by the actor builder,
+    # never read from user YAML.
+    checkpoint_instance: GymCheckpointInstance
+    turn_checkpointing_enabled: bool
 
 
 # Gym control-plane server name (the model server hosting the ledger) and the
@@ -859,6 +868,10 @@ class NemoGym(EnvironmentInterface):
         self.head_server_config: Any = None
         self.node_ip: Optional[str] = None
         self.head_server_port: Optional[int] = None
+        self._checkpoint_adapter: Optional[GymCheckpointAdapter] = None
+        self._server_client: Any = None
+        self._control_headers: Dict[str, str] = {}
+        self._control_timeout_s = 60.0
         # Installed by set_tokenizer at spinup, not passed per rollout call. Declared
         # here rather than in _spinup so a second spinup cannot wipe an installed
         # tokenizer and then report that set_tokenizer was never called.
@@ -1010,7 +1023,8 @@ Depending on your data shape, you may want to change these values."""
             token_capture and token_capture.get("enabled")
         )
         self._server_client = None
-        self._control_headers: Dict[str, str] = {}
+        self._checkpoint_adapter = None
+        self._control_headers = {}
         self._control_timeout_s = 60.0
         if self._token_capture_enabled:
             assert token_capture is not None
@@ -1113,6 +1127,26 @@ Depending on your data shape, you may want to change these values."""
                 self.head_server_config
             )
         return self._server_client
+
+    async def initialize_checkpoint_adapter(
+        self,
+    ) -> GymCheckpointParticipantSummary:
+        """Discover this actor's Gym v2 checkpoint participants once."""
+        self._require_spinup()
+        if not self.cfg["turn_checkpointing_enabled"]:
+            raise RuntimeError("Gym checkpoint coordination is not enabled")
+        if self._checkpoint_adapter is None:
+            token_capture = self.cfg.get("token_capture")
+            if token_capture is None:
+                raise RuntimeError(
+                    "Gym checkpoint coordination has no token-capture credentials"
+                )
+            self._checkpoint_adapter = GymCheckpointAdapter(
+                instance=self.cfg["checkpoint_instance"],
+                client=self._control_client(),
+                auth_token=token_capture["control_auth_token"],
+            )
+        return await self._checkpoint_adapter.discover()
 
     async def _control(self, method: str, path: str, **kwargs: Any) -> dict:
         headers = {**kwargs.pop("headers", {}), **self._control_headers}
@@ -2355,6 +2389,7 @@ def build_nemo_gym_config(
     model_name: str,
     enable_router_replay: bool,
     use_fastokens: bool,
+    turn_checkpointing_enabled: bool,
     token_capture: Optional[dict[str, Any]] = None,
     policy_api_key: Optional[str] = None,
 ) -> NemoGymConfig:
@@ -2374,6 +2409,8 @@ def build_nemo_gym_config(
             routed-experts carry dtype ("int8"/"int16"/"int32") for the model.
         use_fastokens: Forwarded from ``policy.tokenizer.use_fastokens`` so the
             actor patches its tokenizer the same way the driver does.
+        turn_checkpointing_enabled: Install Gym v2 checkpoint participants and
+            validate their discovery during actor startup.
         policy_api_key: The bearer token the generation server requires on its
             OpenAI routes (VllmGeneration.http_server_api_key), or None when it
             checks none.
@@ -2403,6 +2440,11 @@ def build_nemo_gym_config(
         model_name=model_name,
         enable_router_replay=enable_router_replay,
         use_fastokens=use_fastokens,
+        checkpoint_instance=GymCheckpointInstance(
+            shard_name=DEFAULT_SHARD_NAME,
+            replica_index=0,
+        ),
+        turn_checkpointing_enabled=turn_checkpointing_enabled,
         token_capture=token_capture,
         policy_api_key=policy_api_key,
     )
@@ -2415,6 +2457,8 @@ def _build_gym_actor_config(
     model_name: str,
     enable_router_replay: bool,
     use_fastokens: bool,
+    checkpoint_instance: GymCheckpointInstance,
+    turn_checkpointing_enabled: bool,
     token_capture: Optional[dict[str, Any]] = None,
     policy_api_key: Optional[str] = None,
 ) -> NemoGymConfig:
@@ -2466,6 +2510,41 @@ def _build_gym_actor_config(
         else "int16"
     )
 
+    instance_token_capture = None
+    if token_capture is not None:
+        instance_token_capture = dict(token_capture)
+        if instance_token_capture.get("enabled"):
+            capture_root = instance_token_capture.get("capture_dir")
+            if not isinstance(capture_root, str) or not capture_root:
+                raise ValueError(
+                    "enabled token capture requires a non-empty capture_dir before "
+                    "building NeMo-Gym actors"
+                )
+            instance_token_capture["capture_dir"] = str(
+                checkpoint_instance.live_capture_dir(capture_root)
+            )
+
+    if turn_checkpointing_enabled:
+        if instance_token_capture is None or not instance_token_capture.get("enabled"):
+            raise ValueError(
+                "Gym checkpoint coordination requires token capture to be enabled"
+            )
+        control_auth_token = instance_token_capture.get("control_auth_token")
+        if not isinstance(control_auth_token, str) or not control_auth_token:
+            raise ValueError(
+                "Gym checkpoint coordination requires a token-capture control token"
+            )
+        nemo_gym_dict["checkpoint"] = {
+            "enabled": True,
+            "control_auth_token": control_auth_token,
+        }
+        policy_overrides = (
+            nemo_gym_dict.setdefault("policy_model", {})
+            .setdefault("responses_api_models", {})
+            .setdefault("vllm_model", {})
+        )
+        policy_overrides["checkpoint_policy"] = True
+
     return NemoGymConfig(
         model_name=model_name,
         base_urls=base_urls,
@@ -2478,7 +2557,9 @@ def _build_gym_actor_config(
         use_fastokens=use_fastokens,
         external_service_readiness=external_service_readiness,
         initial_global_config_dict=nemo_gym_dict,
-        token_capture=token_capture,
+        token_capture=instance_token_capture,
+        checkpoint_instance=checkpoint_instance,
+        turn_checkpointing_enabled=turn_checkpointing_enabled,
         **port_range,
         **multimodal_flags,
     )
@@ -2679,6 +2760,7 @@ def build_nemo_gym_actors(
     tokenizer: PreTrainedTokenizerBase,
     enable_router_replay: bool,
     use_fastokens: bool,
+    turn_checkpointing_enabled: bool,
     token_capture: Optional[dict[str, Any]] = None,
     policy_api_key: Optional[str] = None,
     pg_ready_timeout: float = DEFAULT_SHARD_PG_READY_TIMEOUT_SECONDS,
@@ -2695,6 +2777,8 @@ def build_nemo_gym_actors(
     Args:
         tokenizer: Installed on every actor once it is up, rather than passed
             per rollout call. See ``NemoGym.set_tokenizer`` for why.
+        turn_checkpointing_enabled: Install and discover one Gym v2 checkpoint
+            coordinator per actor without triggering checkpoint saves.
 
     Returns:
         A :class:`NemoGymShardSet` whose actors are all running and validated.
@@ -2715,6 +2799,7 @@ def build_nemo_gym_actors(
             tokenizer=tokenizer,
             enable_router_replay=enable_router_replay,
             use_fastokens=use_fastokens,
+            turn_checkpointing_enabled=turn_checkpointing_enabled,
             token_capture=token_capture,
             policy_api_key=policy_api_key,
         )
@@ -2727,6 +2812,7 @@ def build_nemo_gym_actors(
         tokenizer=tokenizer,
         enable_router_replay=enable_router_replay,
         use_fastokens=use_fastokens,
+        turn_checkpointing_enabled=turn_checkpointing_enabled,
         token_capture=token_capture,
         policy_api_key=policy_api_key,
         pg_ready_timeout=pg_ready_timeout,
@@ -2742,13 +2828,14 @@ def _build_single_gym_actor(
     tokenizer: PreTrainedTokenizerBase,
     enable_router_replay: bool,
     use_fastokens: bool,
+    turn_checkpointing_enabled: bool,
     token_capture: Optional[dict[str, Any]],
     policy_api_key: Optional[str] = None,
 ) -> NemoGymShardSet:
-    """The pre-sharding path: one actor, no placement group, no discovery.
+    """The pre-sharding path: one actor and no placement group.
 
-    Discovery is skipped rather than merely unused. Its checks compare entry
-    names *between* shards, so with one shard there is nothing they could find.
+    Cross-shard route discovery is skipped because there is only one shard.
+    Gym checkpoint-participant discovery still runs when turn recovery is enabled.
     """
     actor_config = _build_gym_actor_config(
         nemo_gym_dict,
@@ -2756,6 +2843,11 @@ def _build_single_gym_actor(
         model_name=model_name,
         enable_router_replay=enable_router_replay,
         use_fastokens=use_fastokens,
+        checkpoint_instance=GymCheckpointInstance(
+            shard_name=DEFAULT_SHARD_NAME,
+            replica_index=0,
+        ),
+        turn_checkpointing_enabled=turn_checkpointing_enabled,
         token_capture=token_capture,
         policy_api_key=policy_api_key,
     )
@@ -2774,6 +2866,8 @@ def _build_single_gym_actor(
     try:
         ray.get(actor._spinup.remote())
         ray.get(actor.set_tokenizer.remote(tokenizer))
+        if turn_checkpointing_enabled:
+            ray.get(actor.initialize_checkpoint_adapter.remote())
     except BaseException:
         shard_set.shutdown(
             timeout=NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S,
@@ -2792,6 +2886,7 @@ def _build_sharded_gym_actors(
     tokenizer: PreTrainedTokenizerBase,
     enable_router_replay: bool,
     use_fastokens: bool,
+    turn_checkpointing_enabled: bool,
     token_capture: Optional[dict[str, Any]],
     policy_api_key: Optional[str] = None,
     pg_ready_timeout: float,
@@ -2876,6 +2971,11 @@ def _build_sharded_gym_actors(
                     model_name=model_name,
                     enable_router_replay=enable_router_replay,
                     use_fastokens=use_fastokens,
+                    checkpoint_instance=GymCheckpointInstance(
+                        shard_name=shard.name,
+                        replica_index=replica,
+                    ),
+                    turn_checkpointing_enabled=turn_checkpointing_enabled,
                     token_capture=token_capture,
                     policy_api_key=policy_api_key,
                 )
@@ -2883,6 +2983,11 @@ def _build_sharded_gym_actors(
             shard_set.handles.setdefault(shard.name, []).append(actor)
 
         _spinup_shards_concurrently(shard_set, spinup_timeout, tokenizer=tokenizer)
+        if turn_checkpointing_enabled:
+            _initialize_checkpoint_adapters_concurrently(
+                shard_set,
+                timeout=spinup_timeout,
+            )
         shard_set.route_to_shard = _discover_route_shard_map(shard_set, plan)
     except BaseException:
         # A ray.get timeout does not cancel the actor-side work, so a
@@ -2969,6 +3074,28 @@ def _spinup_shards_concurrently(
             ) from error
 
 
+def _initialize_checkpoint_adapters_concurrently(
+    shard_set: NemoGymShardSet,
+    *,
+    timeout: float,
+) -> None:
+    """Discover each actor's independent Gym checkpoint deployment."""
+    deadline = monotonic() + timeout
+    pending = [
+        (shard_name, replica, handle.initialize_checkpoint_adapter.remote())
+        for shard_name, replicas in shard_set.handles.items()
+        for replica, handle in enumerate(replicas)
+    ]
+    for shard_name, replica, reference in pending:
+        try:
+            ray.get(reference, timeout=max(0.0, deadline - monotonic()))
+        except BaseException as error:
+            raise ShardSetupError(
+                f"NeMo-Gym shard '{shard_name}' (replica {replica}) could not "
+                f"discover its Gym v2 checkpoint participants: {error}"
+            ) from error
+
+
 def _discover_route_shard_map(
     shard_set: NemoGymShardSet, plan: ShardPlan
 ) -> Dict[str, str]:
@@ -2992,6 +3119,7 @@ def spinup_nemo_gym_actor(
     tokenizer: PreTrainedTokenizerBase,
     enable_router_replay: bool,
     use_fastokens: bool,
+    turn_checkpointing_enabled: bool,
     token_capture: Optional[dict[str, Any]] = None,
     policy_api_key: Optional[str] = None,
 ) -> Any:
@@ -3009,6 +3137,8 @@ def spinup_nemo_gym_actor(
         token_capture: Dumped ``TokenCaptureConfig`` when ledger-authoritative
             token capture is enabled, else ``None``. Forwarded to
             ``build_nemo_gym_config``.
+        turn_checkpointing_enabled: Install and discover Gym v2 checkpoint
+            participants. This helper still returns one unsharded actor.
         policy_api_key: The bearer token the generation server requires on its
             OpenAI routes (VllmGeneration.http_server_api_key), or None when it
             checks none.
@@ -3036,6 +3166,7 @@ def spinup_nemo_gym_actor(
         tokenizer=tokenizer,
         enable_router_replay=enable_router_replay,
         use_fastokens=use_fastokens,
+        turn_checkpointing_enabled=turn_checkpointing_enabled,
         token_capture=token_capture,
         policy_api_key=policy_api_key,
     ).sole_handle()
