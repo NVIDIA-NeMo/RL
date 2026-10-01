@@ -38,6 +38,7 @@ from nemo_rl.algorithms.advantage_estimator import (
     ReinforcePlusPlusAdvantageEstimator,
 )
 from nemo_rl.algorithms.hybrid_ar_diffusion import (
+    HYBRID_AR_DIFFUSION_WORKER_FQN,
     get_hybrid_ar_diffusion_cfg,
     maybe_set_hybrid_mask_seed,
 )
@@ -520,7 +521,7 @@ def _validate_hybrid_ar_diffusion_setup(
     ``HybridARDiffusionLossFn``, which reads the ``[noisy | clean]`` batch built
     by ``build_hybrid_ar_diffusion_batch``. Only a policy worker can build that
     batch -- it needs the tokenizer's pad/EOS ids and the model's diffusion
-    block size -- and none of the built-in workers do, so a missing worker would
+    block size -- and the default workers do not, so a missing worker would
     otherwise surface as a ``KeyError`` only after the first rollout.
     """
     policy = master_config.policy
@@ -531,8 +532,8 @@ def _validate_hybrid_ar_diffusion_setup(
             "policy.logprob_estimation (hybrid_ar_diffusion) needs a policy worker "
             "that builds the [noisy | clean] batch with "
             "nemo_rl.algorithms.hybrid_ar_diffusion.build_hybrid_ar_diffusion_batch; "
-            "the built-in workers do not. Set policy.worker_extension_cls_fqn to "
-            "such a worker."
+            "the default workers do not. Set policy.worker_extension_cls_fqn to "
+            f"{HYBRID_AR_DIFFUSION_WORKER_FQN}."
         )
     if use_fused_linear_logprobs:
         raise ValueError(
@@ -545,6 +546,20 @@ def _validate_hybrid_ar_diffusion_setup(
             "policy.logprob_estimation is not yet supported with "
             "data_plane.enabled=true: the data-plane rollout path does not attach "
             "the per-step hybrid_mask_seed the batch builder needs."
+        )
+    if policy.get("sequence_packing", {}).get("enabled", False):
+        raise ValueError(
+            "policy.logprob_estimation requires policy.sequence_packing.enabled="
+            "false: packing would break the fixed [noisy | clean] split that the "
+            "attention metadata and both loss masks depend on."
+        )
+    if policy.get("megatron_cfg", {}).get("context_parallel_size", 1) != 1:
+        raise ValueError(
+            "policy.logprob_estimation requires "
+            "policy.megatron_cfg.context_parallel_size=1: the hybrid batch runs "
+            "unpacked, and Megatron's unpacked microbatch path does not "
+            "context-parallel-shard its inputs, so a CP-sharded logprob re-gather "
+            "would silently read the wrong tokens."
         )
 
 

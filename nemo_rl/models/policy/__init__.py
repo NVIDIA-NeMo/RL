@@ -699,6 +699,15 @@ class HybridARDiffusionLogprobEstimationConfig(BaseModel, extra="allow"):
     elbo_weight_ce: bool = False
     # How the final block-padding tail of the noisy side is filled.
     noisy_tail_mode: NoisyTailMode = "mask"
+    # Drop the MASK column from the scored logits (set it to -inf) before the
+    # log-softmax, renormalizing over the remaining vocabulary. MASK is never a
+    # legitimate target on either half -- the noisy half scores the true
+    # response token and the clean half scores the next clean token -- so
+    # excluding it uniformly keeps the training logprobs consistent with
+    # prev_logprobs, which take the same path. Note this is a real numerical
+    # change, not a no-op: it shifts every scored logprob up by
+    # -log1p(-p_mask).
+    exclude_mask_token_from_logits: bool = True
 
     @model_validator(mode="after")
     def _check_bounds(self) -> "HybridARDiffusionLogprobEstimationConfig":

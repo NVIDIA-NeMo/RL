@@ -43,6 +43,28 @@ The loss that consumes this batch is
 ``nemo_rl.algorithms.loss.HybridARDiffusionLossFn``. The forward pass itself
 needs an attention mask that is block-bidirectional on the noisy half and causal
 on the clean half; that lives in the model/worker, not here.
+
+**Usage.** Add these two blocks to any Megatron GRPO config. Setting
+``logprob_estimation`` is what switches the loss; the worker is what builds the
+batch, and GRPO refuses to start without it::
+
+    policy:
+      worker_extension_cls_fqn: nemo_rl.models.policy.workers.hybrid_ar_diffusion_megatron_policy_worker.HybridARDiffusionMegatronPolicyWorker
+      logprob_estimation:
+        type: hybrid_ar_diffusion
+        mask_token_id: <the model's MASK id>
+        ce_loss_weight: 0.1        # 0.0 recovers the RL-only baseline
+        pg_loss_weight: 1.0        # 0.0 trains on CE alone
+        mask_ratio_min: 0.2
+        mask_ratio_max: 0.8
+        elbo_weight_ce: true
+        noisy_tail_mode: mask
+        exclude_mask_token_from_logits: true
+        seed_base: 0
+
+The worker requires ``policy.sequence_packing.enabled=false`` and
+``policy.megatron_cfg.context_parallel_size=1``; both are rejected at config
+time rather than mid-rollout.
 """
 
 from collections.abc import Mapping
@@ -58,6 +80,7 @@ from nemo_rl.models.policy import (
 )
 
 __all__ = [
+    "HYBRID_AR_DIFFUSION_WORKER_FQN",
     "HYBRID_SEED_STEP_STRIDE",
     "build_hybrid_ar_diffusion_batch",
     "draw_hybrid_noisy_mask",
@@ -65,6 +88,15 @@ __all__ = [
     "maybe_set_hybrid_mask_seed",
     "unscatter_clean_aligned",
 ]
+
+# The one shipped policy worker that builds this batch; set it on
+# ``policy.worker_extension_cls_fqn``. Spelled out here rather than imported
+# from the worker module so config validation does not pull Megatron into the
+# driver process.
+HYBRID_AR_DIFFUSION_WORKER_FQN = (
+    "nemo_rl.models.policy.workers.hybrid_ar_diffusion_megatron_policy_worker"
+    ".HybridARDiffusionMegatronPolicyWorker"
+)
 
 # Stride between per-step seed blocks. The per-row offset spans ``[0, N)``, so as
 # long as the batch size stays below this stride one step's seeds cannot alias
