@@ -70,6 +70,7 @@ from nemo_rl.experience.rollout_manager import (
 )
 from nemo_rl.experience.rollout_recovery import (
     RecoveryGranularity,
+    RecoveryTargetLevel,
     RolloutRecoveryLedger,
 )
 from nemo_rl.experience.rollouts import (
@@ -360,6 +361,8 @@ def _make_manager(
     mgr._tokenizer = None
     mgr._num_generations_per_prompt = 1
     mgr._rollout_recovery_config = RolloutRecoveryConfig()
+    mgr._group_scored_agent_names = frozenset()
+    mgr._group_scored_task_source_names = frozenset()
     mgr._gym_acknowledgement_notifier = None
     mgr._tq_buffer = buffer
     mgr._recovery_ledger = RolloutRecoveryLedger()
@@ -654,8 +657,8 @@ class TestGenerateAndPushFlow:
         buf = _FakeBuffer()
         mgr = _make_manager(buf, _FakeImpl())
         mgr._rollout_recovery_config = RolloutRecoveryConfig(
-            task_source_granularity_overrides={
-                "genrm_compare": RecoveryGranularity.PROMPT_GROUP
+            task_source_target_level_overrides={
+                "genrm_compare": RecoveryTargetLevel.PROMPT_GROUP
             }
         )
         prompt = {
@@ -673,6 +676,31 @@ class TestGenerateAndPushFlow:
 
         assert group.task_source == "genrm_compare"
         assert group.recovery_granularity is RecoveryGranularity.PROMPT_GROUP
+        assert group.restore_level is RecoveryTargetLevel.PROMPT_GROUP
+
+    def test_group_scored_task_source_forces_only_live_prompt_group_retry(self):
+        buf = _FakeBuffer()
+        mgr = _make_manager(buf, _FakeImpl())
+        mgr._rollout_recovery_config = RolloutRecoveryConfig(
+            target_level=RecoveryTargetLevel.TURN
+        )
+        mgr._group_scored_task_source_names = frozenset({"genrm_resources"})
+        prompt = {
+            "idx": 0,
+            "message_log": [],
+            "task_name": "nemo_gym",
+            "extra_env_info": {"task_source": "genrm_resources"},
+        }
+
+        group_id = _with_cut(
+            buf,
+            lambda cut: mgr.reserve_prompt_group(cut, prompt, target_step=0),
+        )
+        group = mgr.recovery_ledger.get_group(group_id)
+
+        assert group.task_source == "genrm_resources"
+        assert group.recovery_granularity is RecoveryGranularity.PROMPT_GROUP
+        assert group.restore_level is RecoveryTargetLevel.TURN
 
     def test_recovery_mutation_requires_the_controller_barrier(self):
         mgr = _make_manager(_FakeBuffer(), _FakeImpl())
@@ -2020,6 +2048,8 @@ def _make_capture_manager(
     mgr._tokenizer = None
     mgr._num_generations_per_prompt = num_generations
     mgr._rollout_recovery_config = recovery_config or RolloutRecoveryConfig()
+    mgr._group_scored_agent_names = frozenset()
+    mgr._group_scored_task_source_names = frozenset()
     mgr._gym_acknowledgement_notifier = gym_acknowledgement_notifier
     mgr._tq_buffer = buf
     mgr._weight_version = 7
@@ -2318,7 +2348,7 @@ class TestGenerateForFinalizationFlow:
         mgr = _make_capture_manager(
             buf,
             recovery_config=RolloutRecoveryConfig(
-                default_granularity=RecoveryGranularity.PROMPT_GROUP
+                target_level=RecoveryTargetLevel.PROMPT_GROUP
             ),
             gym_acknowledgement_notifier=acknowledgement_notifier,
         )
@@ -2401,6 +2431,17 @@ class TestGenerateForFinalizationFlow:
             RecoveryGranularity.PROMPT_GROUP,
             RecoveryGranularity.PROMPT_GROUP,
         ]
+        assert mgr.stats.gym_prompt_group_retries == 1
+        assert mgr.stats.gym_sealed_siblings_discarded == 1
+        assert (
+            mgr.stats.as_metrics()["rollout/gym_prompt_group_retry_total"] == 1.0
+        )
+        assert (
+            mgr.stats.as_metrics()[
+                "rollout/gym_sealed_siblings_discarded_total"
+            ]
+            == 1.0
+        )
         first_ids, second_ids = buf.reserve_rollout_ids
         assert first_ids is not None and second_ids is not None
         assert second_ids[0] != first_ids[0]
@@ -2421,7 +2462,7 @@ class TestGenerateForFinalizationFlow:
 
     def test_prompt_group_restore_redispatches_every_sibling(self):
         recovery_config = RolloutRecoveryConfig(
-            default_granularity=RecoveryGranularity.PROMPT_GROUP
+            target_level=RecoveryTargetLevel.PROMPT_GROUP
         )
         first = _make_capture_manager(
             _FakeCaptureBuffer(), recovery_config=recovery_config
@@ -2440,7 +2481,7 @@ class TestGenerateForFinalizationFlow:
             _FakeCaptureBuffer(),
             # The saved group policy wins over the new process configuration.
             recovery_config=RolloutRecoveryConfig(
-                default_granularity=RecoveryGranularity.SIBLING
+                target_level=RecoveryTargetLevel.SIBLING
             ),
         )
         _with_cut(

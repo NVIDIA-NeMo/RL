@@ -267,6 +267,11 @@ class RolloutStats:
     # redoing the whole thing, so they never reached the counters above and gym could
     # retry rows all run with redispatch_total sitting flat.
     gym_row_redispatches: int = 0
+    # Capability-constrained live recovery can require replacing an entire cohort,
+    # even when some siblings already completed. Keep that cost visible separately
+    # from ordinary row redispatches.
+    gym_prompt_group_retries: int = 0
+    gym_sealed_siblings_discarded: int = 0
 
     def record_redispatch(self, reason: str) -> None:
         self.redispatches_by_reason[reason] = (
@@ -294,6 +299,12 @@ class RolloutStats:
     def record_gym_row_redispatch(self, rows: int = 1) -> None:
         self.gym_row_redispatches += rows
 
+    def record_gym_prompt_group_retry(self) -> None:
+        self.gym_prompt_group_retries += 1
+
+    def record_gym_sealed_siblings_discarded(self, siblings: int) -> None:
+        self.gym_sealed_siblings_discarded += max(0, siblings)
+
     def as_metrics(self) -> dict[str, float]:
         """Flatten into a metric dict for the SingleController logger."""
         # Every family gets an aggregate, not just per-exception series: alerting on
@@ -311,6 +322,12 @@ class RolloutStats:
                 sum(self.data_failures_by_reason.values())
             ),
             "rollout/gym_row_redispatch_total": float(self.gym_row_redispatches),
+            "rollout/gym_prompt_group_retry_total": float(
+                self.gym_prompt_group_retries
+            ),
+            "rollout/gym_sealed_siblings_discarded_total": float(
+                self.gym_sealed_siblings_discarded
+            ),
             "rollout/infra_drops_total": float(
                 sum(self.infra_drops_by_reason.values())
             ),
@@ -1663,6 +1680,8 @@ class RolloutManager:
         retry_policy: Optional[RolloutRetryPolicy] = None,
         effort_config: Optional[EffortLevelsConfig] = None,
         log_full_result_tables: bool = False,
+        group_scored_agent_names: frozenset[str] = frozenset(),
+        group_scored_task_source_names: frozenset[str] = frozenset(),
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
@@ -1719,6 +1738,8 @@ class RolloutManager:
         self._tokenizer = tokenizer
         self._num_generations_per_prompt = num_generations_per_prompt
         self._rollout_recovery_config = rollout_recovery_config
+        self._group_scored_agent_names = group_scored_agent_names
+        self._group_scored_task_source_names = group_scored_task_source_names
         self._gym_acknowledgement_notifier = gym_acknowledgement_notifier
         self._tq_buffer = tq_buffer
         self._recovery_ledger = RolloutRecoveryLedger()
@@ -1855,7 +1876,11 @@ class RolloutManager:
                 "rollout recovery requires every dataloader sample to contain "
                 f"a stable integer idx, got {prompt_idx!r}"
             )
-        recovery_policy = self._rollout_recovery_config.resolve_for_prompt(input_sample)
+        recovery_policy = self._rollout_recovery_config.resolve_for_prompt(
+            input_sample,
+            group_scored_agent_names=self._group_scored_agent_names,
+            group_scored_task_source_names=self._group_scored_task_source_names,
+        )
         record = self._recovery_ledger.reserve_group(
             cut,
             prompt_id=str(prompt_idx),
@@ -1865,6 +1890,7 @@ class RolloutManager:
             start_weight_version=self._weight_version,
             task_source=recovery_policy.task_source,
             recovery_granularity=recovery_policy.granularity,
+            restore_level=recovery_policy.restore_level,
             admitted=admitted,
             admission_id=admission_id,
         )
@@ -2315,9 +2341,23 @@ class RolloutManager:
         async with self._recovery_mutation() as cut:
             recovery_group = self._recovery_ledger.get_group(recovery_group_id)
             if recovery_group.status == PromptGroupStatus.GENERATING:
+                retrying_prompt_group = (
+                    recovery_group.recovery_granularity
+                    is RecoveryGranularity.PROMPT_GROUP
+                    and any(
+                        sibling.current_attempt.status
+                        in {
+                            RolloutAttemptStatus.ABANDONED,
+                            RolloutAttemptStatus.FAILED,
+                        }
+                        for sibling in recovery_group.siblings
+                    )
+                )
                 recovery_group = self._recovery_ledger.prepare_incomplete_retry(
                     cut, recovery_group_id
                 )
+                if retrying_prompt_group:
+                    self._stats.record_gym_prompt_group_retry()
         pending_indices = [
             sibling.generation_index
             for sibling in recovery_group.siblings
@@ -2545,6 +2585,19 @@ class RolloutManager:
                 # cancelling this task. Preserve the original cancellation rather
                 # than replacing it with "unknown group" during cleanup.
                 if group_id in self._recovery_ledger:
+                    failed_group = self._recovery_ledger.get_group(group_id)
+                    if (
+                        failed_group.status is PromptGroupStatus.GENERATING
+                        and failed_group.recovery_granularity
+                        is RecoveryGranularity.PROMPT_GROUP
+                    ):
+                        self._stats.record_gym_sealed_siblings_discarded(
+                            sum(
+                                sibling.current_attempt.status
+                                is RolloutAttemptStatus.SEALED
+                                for sibling in failed_group.siblings
+                            )
+                        )
                     self._recovery_ledger.abandon_unsealed(cut, group_id)
             # The capture ledger has no per-rollout fail endpoint. Rows from
             # abandoned attempts are unreferenced and are swept with the

@@ -117,6 +117,7 @@ from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
     RecoveryGranularity,
+    RecoveryTargetLevel,
     RolloutAttemptStatus,
     RolloutRecoveryLedger,
 )
@@ -934,6 +935,7 @@ def test_restart_only_resources_discard_only_dependent_continuations() -> None:
         controller._rollout_recovery_ledger = SimpleNamespace(
             groups=lambda: [
                 SimpleNamespace(
+                    restore_level=RecoveryTargetLevel.TURN,
                     siblings=[
                         SimpleNamespace(
                             generation_index=0,
@@ -1002,6 +1004,7 @@ def test_restart_only_resources_discard_only_dependent_continuations() -> None:
             "stage/legacy",
         }
         controller._restart_only_gym_continuations = set()
+        controller._policy_discarded_gym_continuations = set()
         controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
         controller._call_dp = AsyncMock()
         controller._master_config = SimpleNamespace(
@@ -1847,7 +1850,6 @@ class TestPeriodicRolloutCheckpoint:
         actor = self._actor(tmp_path)
         events: list[str] = []
         actor._gym_participant_checkpointing_enabled = True
-        actor._master_config.rollout_checkpointing.gym.mode = "turn_recovery"
         gym_actor = _FakeGymCheckpointActor(events)
         actor._env_handles = {
             "nemo_gym": NemoGymShardSet(handles={"default": [gym_actor]})
@@ -1975,7 +1977,6 @@ class TestPeriodicRolloutCheckpoint:
     ) -> None:
         actor = self._actor(tmp_path)
         actor._gym_participant_checkpointing_enabled = True
-        actor._master_config.rollout_checkpointing.gym.mode = "turn_recovery"
         actor._gym_checkpoint_topology = _agent_checkpoint_topology()
         pending_state = {
             "schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
@@ -2097,7 +2098,6 @@ class TestPeriodicRolloutCheckpoint:
         actor._logger = MagicMock()
         events: list[str] = []
         actor._gym_participant_checkpointing_enabled = True
-        actor._master_config.rollout_checkpointing.gym.mode = "turn_recovery"
         actor._env_handles = {"nemo_gym": _FakeGymCheckpointActor(events)}
         actor._gym_checkpoint_topology = _agent_checkpoint_topology()
         actor._train_steps = 1
@@ -2153,7 +2153,6 @@ class TestPeriodicRolloutCheckpoint:
         actor._logger = MagicMock()
         events: list[str] = []
         actor._gym_participant_checkpointing_enabled = True
-        actor._master_config.rollout_checkpointing.gym.mode = "turn_recovery"
         actor._env_handles = {
             "nemo_gym": _FakeGymCheckpointActor(events, fail_commit=True)
         }
@@ -2245,7 +2244,6 @@ class TestPeriodicRolloutCheckpoint:
         actor = self._actor(tmp_path)
         events: list[str] = []
         actor._gym_participant_checkpointing_enabled = True
-        actor._master_config.rollout_checkpointing.gym.mode = "turn_recovery"
         gym_actor = _FakeGymCheckpointActor(events, **gym_kwargs)
         actor._env_handles = {"nemo_gym": gym_actor}
         actor._gym_checkpoint_topology = _agent_checkpoint_topology()
@@ -2424,7 +2422,6 @@ class TestPeriodicRolloutCheckpoint:
         actor = self._actor(tmp_path)
         events: list[str] = []
         actor._gym_participant_checkpointing_enabled = True
-        actor._master_config.rollout_checkpointing.gym.mode = "turn_recovery"
         gym_actor = _FakeGymCheckpointActor(events, fail_resume_attempts=1)
         actor._env_handles = {"nemo_gym": gym_actor}
         actor._gym_checkpoint_topology = _agent_checkpoint_topology()
@@ -2481,7 +2478,6 @@ class TestPeriodicRolloutCheckpoint:
         actor = self._actor(tmp_path)
         events: list[str] = []
         actor._gym_participant_checkpointing_enabled = True
-        actor._master_config.rollout_checkpointing.gym.mode = "turn_recovery"
         gym_actor = _FakeGymCheckpointActor(events, **failure_kwargs)
         actor._env_handles = {"nemo_gym": gym_actor}
         try:
@@ -2504,7 +2500,6 @@ class TestPeriodicRolloutCheckpoint:
         actor = self._actor(tmp_path)
         events: list[str] = []
         actor._gym_participant_checkpointing_enabled = True
-        actor._master_config.rollout_checkpointing.gym.mode = "turn_recovery"
         gym_actor = _FakeGymCheckpointActor(
             events,
             fail_commit=True,
@@ -2560,7 +2555,6 @@ class TestPeriodicRolloutCheckpoint:
         actor = self._actor(tmp_path)
         events: list[str] = []
         actor._gym_participant_checkpointing_enabled = True
-        actor._master_config.rollout_checkpointing.gym.mode = "turn_recovery"
         gym_actor = _FakeGymCheckpointActor(events)
         actor._env_handles = {"nemo_gym": gym_actor}
         actor._gym_checkpoint_topology = _agent_checkpoint_topology()
@@ -2596,7 +2590,6 @@ class TestPeriodicRolloutCheckpoint:
         actor = self._actor(tmp_path)
         events: list[str] = []
         actor._gym_participant_checkpointing_enabled = True
-        actor._master_config.rollout_checkpointing.gym.mode = "turn_recovery"
         actor._env_handles = {"nemo_gym": _FakeGymCheckpointActor(events)}
         actor._gym_checkpoint_topology = _agent_checkpoint_topology()
 
@@ -2622,7 +2615,6 @@ class TestPeriodicRolloutCheckpoint:
         actor._logger = MagicMock()
         events: list[str] = []
         actor._gym_participant_checkpointing_enabled = True
-        actor._master_config.rollout_checkpointing.gym.mode = "turn_recovery"
         actor._env_handles = {"nemo_gym": _FakeGymCheckpointActor(events)}
         actor._gym_checkpoint_topology = _agent_checkpoint_topology()
 
@@ -2667,7 +2659,6 @@ class TestPeriodicRolloutCheckpoint:
         actor = self._actor(tmp_path)
         events: list[str] = []
         actor._gym_participant_checkpointing_enabled = True
-        actor._master_config.rollout_checkpointing.gym.mode = "turn_recovery"
         gym_actor = _FakeGymCheckpointActor(events)
         actor._env_handles = {"nemo_gym": gym_actor}
         actor._gym_checkpoint_topology = _agent_checkpoint_topology()
@@ -2855,9 +2846,14 @@ class TestPeriodicRolloutCheckpoint:
         )
         actor._restart_only_gym_continuations = {("restart-only_g0", 1)}
 
-        def group(name: str, granularity: RecoveryGranularity) -> Any:
+        def group(name: str, restore_level: RecoveryTargetLevel) -> Any:
             return SimpleNamespace(
-                recovery_granularity=granularity,
+                recovery_granularity=(
+                    RecoveryGranularity.PROMPT_GROUP
+                    if restore_level is RecoveryTargetLevel.PROMPT_GROUP
+                    else RecoveryGranularity.SIBLING
+                ),
+                restore_level=restore_level,
                 siblings=[
                     SimpleNamespace(
                         generation_index=0,
@@ -2875,15 +2871,15 @@ class TestPeriodicRolloutCheckpoint:
         try:
             metrics = actor._rollout_recovery_disposition_metrics(
                 [
-                    group("continued", RecoveryGranularity.SIBLING),
-                    group("restart-only", RecoveryGranularity.SIBLING),
-                    group("no-turn", RecoveryGranularity.SIBLING),
-                    group("atomic", RecoveryGranularity.PROMPT_GROUP),
+                    group("continued", RecoveryTargetLevel.TURN),
+                    group("restart-only", RecoveryTargetLevel.TURN),
+                    group("no-turn", RecoveryTargetLevel.SIBLING),
+                    group("atomic", RecoveryTargetLevel.PROMPT_GROUP),
                 ]
             )
             actor._gym_restart_unfinished = True
             missing_snapshot = actor._rollout_recovery_disposition_metrics(
-                [group("missing", RecoveryGranularity.SIBLING)]
+                [group("missing", RecoveryTargetLevel.TURN)]
             )
         finally:
             actor._checkpointer.shutdown()
@@ -3083,7 +3079,6 @@ class TestPeriodicRolloutCheckpoint:
         prepare_started = asyncio.Event()
         cancel_prepare = asyncio.Event()
         actor._gym_participant_checkpointing_enabled = True
-        actor._master_config.rollout_checkpointing.gym.mode = "turn_recovery"
         gym_actor = _FakeGymCheckpointActor(events)
 
         async def blocking_prepare(

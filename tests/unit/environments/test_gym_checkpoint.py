@@ -216,10 +216,16 @@ def test_topology_fingerprint_canonicalizes_capability_ordering() -> None:
 
 
 def test_group_scoring_contract_accepts_matching_bounded_replayable_setup() -> None:
-    _group_scoring_topology().validate_group_scoring_capabilities(
+    topology = _group_scoring_topology()
+    topology.validate_group_scoring_capabilities(
         expected_group_size=2,
         rollout_timeout_s=None,
         require_checkpoint_replayability=True,
+    )
+    assert topology.group_scored_agent_names() == frozenset({"agent"})
+    assert topology.task_source_names() == frozenset({"agent", "genrm"})
+    assert topology.group_scored_task_source_names() == frozenset(
+        {"agent", "genrm"}
     )
 
 

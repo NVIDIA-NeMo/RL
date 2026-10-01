@@ -82,7 +82,7 @@ from nemo_rl.environments.gym_checkpoint import GymCheckpointTopology
 from nemo_rl.environments.nemo_gym import NemoGymShardSet
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_STATE_FILENAME,
-    RecoveryGranularity,
+    RecoveryTargetLevel,
 )
 from nemo_rl.experience.rollouts import EffortLevelsConfig
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
@@ -291,7 +291,7 @@ def _configure_gym_snapshot_restore(
     mc: MasterConfig,
     tmp_path: Path,
     *,
-    gym_mode: str = "turn_recovery",
+    target_level: RecoveryTargetLevel = RecoveryTargetLevel.TURN,
 ) -> None:
     """Configure the minimum supported vLLM/Gym periodic restore path."""
     mc.checkpointing.update(
@@ -317,10 +317,10 @@ def _configure_gym_snapshot_restore(
     mc.logger["log_dir"] = str(tmp_path / "logs")
     mc.token_capture.enabled = True
     mc.async_rl.rollout_failure.nemo_gym.max_row_attempts = 1
+    mc.rollout_recovery.target_level = target_level
     mc.rollout_checkpointing = RolloutCheckpointConfig(
         snapshot_attempt_interval_s=1.0,
         restore_mode="latest",
-        gym={"mode": gym_mode},
     )
 
 
@@ -407,7 +407,11 @@ def patched_factories():
             side_effect=lambda environment, **kwargs: (
                 _REAL_PREFLIGHT_NEMO_GYM_CAPABILITIES(environment, **kwargs)
                 if isinstance(environment, NemoGymShardSet)
-                else None
+                else sc_setup_mod._GymCapabilityPreflight(
+                    checkpoint_topology=None,
+                    group_scored_agent_names=frozenset(),
+                    group_scored_task_source_names=frozenset(),
+                )
             ),
         ) as mock_gym_preflight,
         patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
@@ -686,7 +690,7 @@ def test_rollout_recovery_functional_config_resolves_to_runtime_contract(
         "++data_plane.claim_meta_poll_interval_s=0.5",
         "++token_capture.enabled=true",
         "++async_rl.rollout_failure.nemo_gym.max_row_attempts=1",
-        "++rollout_recovery.default_granularity=prompt_group",
+        "++rollout_recovery.target_level=prompt_group",
         "++async_rl.sampler.name=in_order",
         "++async_rl.sampler.max_lookahead_versions=1",
         "++async_rl.min_groups_for_streaming_train=4",
@@ -710,8 +714,8 @@ def test_rollout_recovery_functional_config_resolves_to_runtime_contract(
     assert master_config.checkpointing["save_data_plane"] is True
     assert master_config.token_capture.enabled is True
     assert (
-        master_config.rollout_recovery.default_granularity
-        is RecoveryGranularity.PROMPT_GROUP
+        master_config.rollout_recovery.target_level
+        is RecoveryTargetLevel.PROMPT_GROUP
     )
     assert master_config.async_rl.rollout_failure.native.generation_timeout_s is None
     assert master_config.async_rl.rollout_failure.nemo_gym.rollout_timeout_s == 120
@@ -974,10 +978,10 @@ class TestSetup:
         with pytest.raises(ValueError, match="requires checkpointing.enabled=true"):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
-    def test_gym_discovery_mode_is_rejected(self):
+    def test_removed_gym_mode_is_rejected(self):
         with pytest.raises(
             ValueError,
-            match="Input should be 'disabled' or 'turn_recovery'",
+            match="Extra inputs are not permitted",
         ):
             RolloutCheckpointConfig(gym={"mode": "discover"})
 
@@ -987,13 +991,12 @@ class TestSetup:
             "async_engine": True,
             "expose_http_server": True,
         }
-        mc.rollout_checkpointing = RolloutCheckpointConfig(
-            gym={"mode": "turn_recovery"}
-        )
+        mc.rollout_recovery.target_level = RecoveryTargetLevel.TURN
+        mc.rollout_checkpointing = RolloutCheckpointConfig()
 
         with pytest.raises(
             ValueError,
-            match="mode='turn_recovery' requires.*snapshot_attempt_interval_s",
+            match="target_level='turn' requires.*snapshot_attempt_interval_s",
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
@@ -1003,13 +1006,12 @@ class TestSetup:
             megatron_enabled=True,
             env={"should_use_nemo_gym": True},
         )
-        mc.rollout_checkpointing = RolloutCheckpointConfig(
-            gym={"mode": "turn_recovery"}
-        )
+        mc.rollout_recovery.target_level = RecoveryTargetLevel.TURN
+        mc.rollout_checkpointing = RolloutCheckpointConfig()
 
         with pytest.raises(
             NotImplementedError,
-            match="mode='turn_recovery'.*vllm generation backend only.*'megatron'",
+            match="target_level='turn'.*vllm generation backend only.*'megatron'",
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
@@ -1021,14 +1023,14 @@ class TestSetup:
         }
         mc.checkpointing["enabled"] = True
         mc.checkpointing["save_data_plane"] = True
+        mc.rollout_recovery.target_level = RecoveryTargetLevel.TURN
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0,
-            gym={"mode": "turn_recovery"},
         )
 
         with pytest.raises(
             ValueError,
-            match="mode='turn_recovery'.*requires token_capture.enabled=true",
+            match="target_level='turn'.*requires token_capture.enabled=true",
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
@@ -1042,10 +1044,10 @@ class TestSetup:
         mc.checkpointing["save_data_plane"] = True
         mc.token_capture = TokenCaptureConfig(enabled=True)
         mc.async_rl.rollout_failure.nemo_gym.max_row_attempts = 1
+        mc.rollout_recovery.target_level = RecoveryTargetLevel.TURN
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0,
             restore_mode="trainer_checkpoint",
-            gym={"mode": "turn_recovery"},
         )
 
         with pytest.raises(
@@ -1077,9 +1079,9 @@ class TestSetup:
                 "nemo_gym": {"shards": shards},
             }
         )
+        mc.rollout_recovery.target_level = RecoveryTargetLevel.TURN
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0,
-            gym={"mode": "turn_recovery"},
         )
 
         with pytest.raises(
@@ -1097,9 +1099,9 @@ class TestSetup:
                 },
             }
         )
+        mc.rollout_recovery.target_level = RecoveryTargetLevel.TURN
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0,
-            gym={"mode": "turn_recovery"},
         )
 
         validate_single_controller_config(mc)
@@ -1155,9 +1157,9 @@ class TestSetup:
         mc.logger["log_dir"] = str(tmp_path / "logs")
         mc.token_capture.enabled = True
         mc.async_rl.rollout_failure.nemo_gym.max_row_attempts = 1
+        mc.rollout_recovery.target_level = RecoveryTargetLevel.TURN
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0,
-            gym={"mode": "turn_recovery"},
         )
         topology = _gym_checkpoint_topology_payload()
         topology_ref = object()
@@ -1222,10 +1224,13 @@ class TestSetup:
                 expected_group_size=2,
                 rollout_timeout_s=60.0,
                 turn_recovery_enabled=False,
-                agent_granularity_override_names=frozenset({"agent-route"}),
+                agent_target_level_override_names=frozenset({"agent-route"}),
+                task_source_target_level_override_names=frozenset(),
             )
 
-        assert result is None
+        assert result.checkpoint_topology is None
+        assert result.group_scored_agent_names == frozenset()
+        assert result.group_scored_task_source_names == frozenset()
         first.discover_checkpoint_capabilities.remote.assert_called_once_with()
         first_replica.discover_checkpoint_capabilities.remote.assert_not_called()
         second.discover_checkpoint_capabilities.remote.assert_called_once_with()
@@ -1246,7 +1251,7 @@ class TestSetup:
             pytest.raises(
                 ValueError,
                 match=(
-                    r"agent_granularity_overrides contains Gym agent routing names "
+                    r"agent_target_level_overrides contains Gym routing names "
                     r"that were not discovered: \['missing-agent'\]"
                 ),
             ),
@@ -1256,8 +1261,83 @@ class TestSetup:
                 expected_group_size=2,
                 rollout_timeout_s=60.0,
                 turn_recovery_enabled=False,
-                agent_granularity_override_names=frozenset({"missing-agent"}),
+                agent_target_level_override_names=frozenset({"missing-agent"}),
+                task_source_target_level_override_names=frozenset(),
             )
+
+    def test_normal_gym_preflight_rejects_unknown_task_source_override(self):
+        topology = _gym_checkpoint_topology_payload()
+        topology_ref = object()
+        actor = MagicMock(name="gym_actor")
+        actor.discover_checkpoint_capabilities.remote.return_value = topology_ref
+        shard_set = NemoGymShardSet(handles={"default": [actor]})
+
+        with (
+            patch.object(
+                sc_setup_mod.ray,
+                "get",
+                side_effect=lambda ref: topology if ref is topology_ref else ref,
+            ),
+            pytest.raises(
+                ValueError,
+                match=(
+                    r"task_source_target_level_overrides contains Gym routing "
+                    r"names that were not discovered: \['missing-task-source'\]"
+                ),
+            ),
+        ):
+            _REAL_PREFLIGHT_NEMO_GYM_CAPABILITIES(
+                shard_set,
+                expected_group_size=2,
+                rollout_timeout_s=60.0,
+                turn_recovery_enabled=False,
+                agent_target_level_override_names=frozenset(),
+                task_source_target_level_override_names=frozenset(
+                    {"missing-task-source"}
+                ),
+            )
+
+    @pytest.mark.parametrize("task_source", ["agent-route", "task-source-route"])
+    def test_normal_gym_preflight_accepts_discovered_task_source_override(
+        self, task_source: str
+    ):
+        topology = _gym_checkpoint_topology_payload()
+        topology["participants"].append(
+            {
+                "participant": {
+                    "server_name": "task-source-route",
+                    "component": "resources_servers",
+                    "participant_name": "task-source-route",
+                },
+                "schema_version": 1,
+                "admission_states": ["accepting"],
+                "checkpoint_mode": "stateless",
+                "concurrency_contract": "stateless",
+                "multi_process": {"mode": "single_worker", "num_workers": 1},
+                "instance_role": None,
+                "features": [],
+            }
+        )
+        topology_ref = object()
+        actor = MagicMock(name="gym_actor")
+        actor.discover_checkpoint_capabilities.remote.return_value = topology_ref
+        shard_set = NemoGymShardSet(handles={"default": [actor]})
+
+        with patch.object(
+            sc_setup_mod.ray,
+            "get",
+            side_effect=lambda ref: topology if ref is topology_ref else ref,
+        ):
+            result = _REAL_PREFLIGHT_NEMO_GYM_CAPABILITIES(
+                shard_set,
+                expected_group_size=2,
+                rollout_timeout_s=60.0,
+                turn_recovery_enabled=False,
+                agent_target_level_override_names=frozenset(),
+                task_source_target_level_override_names=frozenset({task_source}),
+            )
+
+        assert result.checkpoint_topology is None
 
     def test_gym_restore_rejects_missing_snapshot_and_fallback_marker(
         self,
@@ -1497,7 +1577,9 @@ class TestSetup:
             backend="vllm",
             env={"should_use_nemo_gym": True},
         )
-        _configure_gym_snapshot_restore(mc, tmp_path, gym_mode="disabled")
+        _configure_gym_snapshot_restore(
+            mc, tmp_path, target_level=RecoveryTargetLevel.SIBLING
+        )
         trainer_checkpoint = tmp_path / "checkpoints" / "step_3"
         snapshot_path = trainer_checkpoint / "rollout_snapshots" / "snapshot_000001"
         checkpointer = _restore_checkpointer(
@@ -1529,7 +1611,7 @@ class TestSetup:
             ),
             pytest.raises(
                 ValueError,
-                match="contains Gym participant state.*mode='turn_recovery'",
+                match="contains Gym participant state.*target_level='turn'",
             ),
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
@@ -2115,16 +2197,16 @@ class TestSetup:
             mc = _make_master_config(colocated=False, backend="sglang")
         elif invalid_case == "prompt_group_recovery_without_capture":
             mc = _make_master_config()
-            mc.rollout_recovery.default_granularity = RecoveryGranularity.PROMPT_GROUP
+            mc.rollout_recovery.target_level = RecoveryTargetLevel.PROMPT_GROUP
         elif invalid_case == "recovery_override_without_capture":
             mc = _make_master_config()
-            mc.rollout_recovery.task_source_granularity_overrides = {
-                "genrm": RecoveryGranularity.PROMPT_GROUP
+            mc.rollout_recovery.task_source_target_level_overrides = {
+                "genrm": RecoveryTargetLevel.PROMPT_GROUP
             }
         elif invalid_case == "legacy_agent_recovery_override_without_capture":
             mc = _make_master_config()
-            mc.rollout_recovery.agent_granularity_overrides = {
-                "genrm_agent": RecoveryGranularity.PROMPT_GROUP
+            mc.rollout_recovery.agent_target_level_overrides = {
+                "genrm_agent": RecoveryTargetLevel.PROMPT_GROUP
             }
         else:  # pragma: no cover
             raise AssertionError(f"unknown test case {invalid_case}")
@@ -2512,7 +2594,11 @@ class TestSetup:
         assert preflight.call_args.kwargs["expected_group_size"] == 2
         assert preflight.call_args.kwargs["turn_recovery_enabled"] is False
         assert (
-            preflight.call_args.kwargs["agent_granularity_override_names"]
+            preflight.call_args.kwargs["agent_target_level_override_names"]
+            == frozenset()
+        )
+        assert (
+            preflight.call_args.kwargs["task_source_target_level_override_names"]
             == frozenset()
         )
         assert actor_args.env_handles["nemo_gym"] is fake_gym_shards
@@ -2522,21 +2608,21 @@ class TestSetup:
         assert WIRE_MULTIMODAL_FIELDS <= set(warmup_fields)
 
     @pytest.mark.parametrize(
-        ("gym_mode", "expected_token"),
+        ("target_level", "expected_token"),
         [
-            ("disabled", None),
-            ("turn_recovery", "checkpoint-secret"),
+            (RecoveryTargetLevel.SIBLING, None),
+            (RecoveryTargetLevel.TURN, "checkpoint-secret"),
         ],
     )
     def test_gym_checkpoint_bearer_is_scoped_to_turn_recovery(
         self,
-        gym_mode,
+        target_level,
         expected_token,
         monkeypatch,
     ):
         mc = _make_master_config(backend="vllm")
         mc.policy["generation"]["model_name"] = "test-model"
-        mc.rollout_checkpointing = RolloutCheckpointConfig(gym={"mode": gym_mode})
+        mc.rollout_recovery.target_level = target_level
         monkeypatch.delenv("NEMO_GYM_CHECKPOINT_CONTROL_TOKEN", raising=False)
         monkeypatch.setattr(
             sc_setup_mod.secrets, "token_hex", lambda _: "checkpoint-secret"
@@ -2555,7 +2641,7 @@ class TestSetup:
             == expected_token
         )
         assert build_gym.call_args.kwargs["turn_recovery_enabled"] == (
-            gym_mode == "turn_recovery"
+            target_level is RecoveryTargetLevel.TURN
         )
 
     def test_token_capture_always_creates_finalizer_actor_pool(self, patched_factories):

@@ -176,7 +176,7 @@ from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
     PromptGroupPhase,
-    RecoveryGranularity,
+    RecoveryTargetLevel,
     RolloutAttemptStatus,
     RolloutRecoveryState,
     build_rollout_recovery_state,
@@ -675,6 +675,7 @@ class SingleControllerActor:
             actor_args.gym_checkpoint_continuations
         )
         self._restart_only_gym_continuations: set[tuple[str, int]] = set()
+        self._policy_discarded_gym_continuations: set[tuple[str, int]] = set()
         self._stale_gym_acknowledgements_dropped = 0
         self._gym_restart_unfinished = actor_args.gym_restart_unfinished
         self._rollout_checkpoint_stop_requested = asyncio.Event()
@@ -698,7 +699,7 @@ class SingleControllerActor:
         self._gym_checkpoint_rollout_permitted.set()
         self._gym_admission_closed_at: Optional[float] = None
         self._gym_participant_checkpointing_enabled = (
-            master_config.rollout_checkpointing.gym.participant_checkpointing_enabled
+            master_config.rollout_recovery.participant_checkpointing_enabled
         )
         self._gym_completed_acknowledgement_lock = asyncio.Lock()
         self._gym_completed_acknowledgement_task: Optional[asyncio.Task[None]] = None
@@ -1529,6 +1530,7 @@ class SingleControllerActor:
             "siblings_restarted_restart_only_resource": 0,
             "siblings_restarted_gym_snapshot_missing": 0,
             "siblings_restarted_no_saved_turn": 0,
+            "siblings_restarted_policy": 0,
             "siblings_restarted_prompt_group": 0,
         }
         continuations = {
@@ -1543,12 +1545,16 @@ class SingleControllerActor:
                     group.logical_rollout_id(sibling.generation_index),
                     sibling.current_attempt.attempt_index + 1,
                 )
-                if group.recovery_granularity is RecoveryGranularity.PROMPT_GROUP:
+                if group.restore_level is RecoveryTargetLevel.PROMPT_GROUP:
                     key = "siblings_restarted_prompt_group"
                 elif self._gym_restart_unfinished:
                     key = "siblings_restarted_gym_snapshot_missing"
                 elif identity in self._restart_only_gym_continuations:
                     key = "siblings_restarted_restart_only_resource"
+                elif identity in getattr(
+                    self, "_policy_discarded_gym_continuations", set()
+                ):
+                    key = "siblings_restarted_policy"
                 elif identity in continuations:
                     key = "siblings_continued"
                 else:
@@ -1866,25 +1872,24 @@ class SingleControllerActor:
         return sole_nemo_gym_checkpoint_actor(environment)
 
     async def _discard_restart_only_gym_continuations(self) -> None:
-        """Make interrupted attempts start fresh when resource state cannot restore."""
+        """Discard continuations forbidden by policy or resource capabilities."""
         checkpoint_id = self._gym_checkpoint_restore_operation_id
         topology = self._gym_checkpoint_topology
         if checkpoint_id is None or topology is None:
             return
         restart_only_resources = topology.restart_only_resources()
-        if not restart_only_resources:
-            return
-
         candidates = {
             (
                 group.logical_rollout_id(sibling.generation_index),
                 sibling.current_attempt.attempt_index + 1,
-            )
+            ): group.restore_level
             for group in self._rollout_recovery_ledger.groups()
             for sibling in group.siblings
             if sibling.current_attempt.status is not RolloutAttemptStatus.SEALED
         }
         executions = []
+        policy_discards: set[tuple[str, int]] = set()
+        restart_only_discards: set[tuple[str, int]] = set()
         staging_keys: set[str] = set()
         restart_only = set(restart_only_resources)
         resource_modes = {
@@ -1897,20 +1902,27 @@ class SingleControllerActor:
                 continuation.rollout_id,
                 continuation.replacement_attempt_index,
             )
-            if execution not in candidates:
+            restore_level = candidates.get(execution)
+            if restore_level is None:
                 continue
-            resource_revisions = continuation.resource_state_revisions
-            if resource_revisions is not None:
-                dependencies = {name for name, _revision in resource_revisions}
-                unknown = dependencies - set(resource_modes)
-                if unknown:
-                    raise RuntimeError(
-                        "restored Gym continuation refers to undiscovered resources: "
-                        f"rollout_id={continuation.rollout_id!r}, "
-                        f"resources={sorted(unknown)!r}"
-                    )
-                if not dependencies.intersection(restart_only):
+            if restore_level is not RecoveryTargetLevel.TURN:
+                policy_discards.add(execution)
+            else:
+                resource_revisions = continuation.resource_state_revisions
+                if resource_revisions is not None:
+                    dependencies = {name for name, _revision in resource_revisions}
+                    unknown = dependencies - set(resource_modes)
+                    if unknown:
+                        raise RuntimeError(
+                            "restored Gym continuation refers to undiscovered "
+                            f"resources: rollout_id={continuation.rollout_id!r}, "
+                            f"resources={sorted(unknown)!r}"
+                        )
+                    if not dependencies.intersection(restart_only):
+                        continue
+                elif not restart_only:
                     continue
+                restart_only_discards.add(execution)
             executions.append(
                 {
                     "rollout_id": continuation.rollout_id,
@@ -1921,10 +1933,8 @@ class SingleControllerActor:
         if not executions:
             return
 
-        self._restart_only_gym_continuations.update(
-            (execution["rollout_id"], execution["attempt_index"])
-            for execution in executions
-        )
+        self._policy_discarded_gym_continuations.update(policy_discards)
+        self._restart_only_gym_continuations.update(restart_only_discards)
 
         result = await self._nemo_gym_checkpoint_actor().discard_restored_agent_continuations.remote(
             checkpoint_id,

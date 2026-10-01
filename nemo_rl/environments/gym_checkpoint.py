@@ -490,6 +490,48 @@ class GymCheckpointTopology(_VersionedWireModel):
             and contract.checkpoint_mode == "restart_only"
         )
 
+    def task_source_names(self) -> frozenset[str]:
+        """Return entries that may identify the source of a collated Gym row."""
+        return frozenset(
+            contract.participant.server_name
+            for contract in self.participants
+            if contract.participant.component
+            in {"resources_servers", "responses_api_agents"}
+        )
+
+    def group_scored_task_source_names(self) -> frozenset[str]:
+        """Return task sources whose verifier requires a complete prompt cohort."""
+        group_scored_resources = frozenset(
+            contract.participant.server_name
+            for contract in self.participants
+            if contract.participant.component == "resources_servers"
+            and contract.group_scoring is not None
+        )
+        group_scored_agents = frozenset(
+            contract.participant.server_name
+            for contract in self.participants
+            if contract.participant.component == "responses_api_agents"
+            and contract.verification is not None
+            and contract.verification.resources_server in group_scored_resources
+        )
+        return group_scored_resources | group_scored_agents
+
+    def group_scored_agent_names(self) -> frozenset[str]:
+        """Return agent routes whose verifier requires a complete prompt cohort."""
+        group_scored_resources = frozenset(
+            contract.participant.server_name
+            for contract in self.participants
+            if contract.participant.component == "resources_servers"
+            and contract.group_scoring is not None
+        )
+        return frozenset(
+            contract.participant.server_name
+            for contract in self.participants
+            if contract.participant.component == "responses_api_agents"
+            and contract.verification is not None
+            and contract.verification.resources_server in group_scored_resources
+        )
+
     def validate_checkpoint_participants(
         self,
         checkpoint: "GymCheckpointCommitResult",

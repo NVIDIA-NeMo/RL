@@ -43,6 +43,7 @@ from nemo_rl.experience.rollout_recovery import (
     PromptRef,
     PromptRefState,
     RecoveryGranularity,
+    RecoveryTargetLevel,
     RolloutAttemptRecord,
     RolloutAttemptState,
     RolloutAttemptStatus,
@@ -673,13 +674,13 @@ def test_checkpoint_cut_can_guard_a_ledger_mutation() -> None:
 
 def test_recovery_config_resolves_agent_then_task_source_then_default() -> None:
     config = RolloutRecoveryConfig(
-        default_granularity=RecoveryGranularity.SIBLING,
-        task_source_granularity_overrides={
-            "genrm_compare": RecoveryGranularity.PROMPT_GROUP,
+        target_level=RecoveryTargetLevel.TURN,
+        task_source_target_level_overrides={
+            "genrm_compare": RecoveryTargetLevel.PROMPT_GROUP,
         },
-        agent_granularity_overrides={
-            "legacy_genrm_agent": RecoveryGranularity.PROMPT_GROUP,
-            "sibling_agent": RecoveryGranularity.SIBLING,
+        agent_target_level_overrides={
+            "legacy_genrm_agent": RecoveryTargetLevel.PROMPT_GROUP,
+            "sibling_agent": RecoveryTargetLevel.SIBLING,
         },
     )
 
@@ -714,12 +715,66 @@ def test_recovery_config_resolves_agent_then_task_source_then_default() -> None:
 
     assert source_policy.task_source == "genrm_compare"
     assert source_policy.granularity is RecoveryGranularity.PROMPT_GROUP
+    assert source_policy.restore_level is RecoveryTargetLevel.PROMPT_GROUP
     assert agent_policy.task_source == "genrm_compare"
     assert agent_policy.granularity is RecoveryGranularity.SIBLING
+    assert agent_policy.restore_level is RecoveryTargetLevel.SIBLING
     assert default_policy.task_source == "other"
     assert default_policy.granularity is RecoveryGranularity.SIBLING
+    assert default_policy.restore_level is RecoveryTargetLevel.TURN
     assert legacy_policy.task_source is None
     assert legacy_policy.granularity is RecoveryGranularity.PROMPT_GROUP
+    assert legacy_policy.restore_level is RecoveryTargetLevel.PROMPT_GROUP
+
+
+@pytest.mark.parametrize(
+    ("extra_env_info", "group_scored_agent_names", "group_scored_task_sources"),
+    [
+        (
+            {"agent_ref": {"name": "genrm_agent"}},
+            frozenset({"genrm_agent"}),
+            frozenset(),
+        ),
+        (
+            {"task_source": "genrm_resources"},
+            frozenset(),
+            frozenset({"genrm_resources"}),
+        ),
+    ],
+)
+def test_group_scored_route_retries_whole_group_but_keeps_turn_restore(
+    extra_env_info: dict[str, Any],
+    group_scored_agent_names: frozenset[str],
+    group_scored_task_sources: frozenset[str],
+) -> None:
+    config = RolloutRecoveryConfig(target_level=RecoveryTargetLevel.TURN)
+
+    if "task_source" in extra_env_info:
+        policy = config.resolve_for_prompt(
+            {"extra_env_info": extra_env_info},
+            group_scored_agent_names=group_scored_agent_names,
+            group_scored_task_source_names=group_scored_task_sources,
+        )
+    else:
+        with pytest.warns(FutureWarning, match="legacy agent_ref"):
+            policy = config.resolve_for_prompt(
+                {"extra_env_info": extra_env_info},
+                group_scored_agent_names=group_scored_agent_names,
+                group_scored_task_source_names=group_scored_task_sources,
+            )
+
+    assert policy.granularity is RecoveryGranularity.PROMPT_GROUP
+    assert policy.restore_level is RecoveryTargetLevel.TURN
+
+
+def test_recovery_overrides_may_only_make_the_target_coarser() -> None:
+    with pytest.raises(ValueError, match="may only force a coarser recovery level"):
+        RolloutRecoveryConfig(
+            target_level=RecoveryTargetLevel.SIBLING,
+            agent_target_level_overrides={
+                "too-fine": RecoveryTargetLevel.TURN,
+            },
+        )
 
 
 @pytest.mark.parametrize(
@@ -747,7 +802,7 @@ def test_recovery_config_rejects_malformed_prompt_identity(
 
 
 def test_recovery_config_rejects_removed_task_name_override() -> None:
-    with pytest.raises(ValueError, match="task_source_granularity_overrides"):
+    with pytest.raises(ValueError, match="target_level"):
         RolloutRecoveryConfig(
             **{
                 "task_granularity_overrides": {
@@ -1263,6 +1318,7 @@ def test_prompt_group_restart_clears_sealed_only_attempt_state() -> None:
     # a completed sibling next to an unfinished one.
     state = ledger.state_dict()
     state["groups"][0]["recovery_granularity"] = "prompt_group"
+    state["groups"][0]["restore_level"] = "prompt_group"
     restored = RolloutRecoveryLedger.from_state_dict(state)
 
     _mutate(lambda cut: restored.prepare_for_restart(cut))
@@ -1453,7 +1509,8 @@ def test_restore_rejects_unsupported_schema_version() -> None:
         ValueError,
         match=(
             "Unsupported rollout-recovery schema version: 2; this build supports "
-            "only schema version 3.*start from a fresh checkpoint"
+            rf"only schema version {ROLLOUT_RECOVERY_SCHEMA_VERSION}.*"
+            "start from a fresh checkpoint"
         ),
     ):
         _load(RolloutRecoveryLedger(), state)  # type: ignore[arg-type]

@@ -158,34 +158,27 @@ async_rl:
 ```
 
 To include NeMo-Gym's model lineage, parked agent boundaries, and resource
-snapshots in the same outer snapshot, enable the experimental participant
-protocol:
+snapshots in the same outer snapshot, request turn-level recovery:
 
 ```yaml
 rollout_checkpointing:
   snapshot_attempt_interval_s: 120
   gym:
-    mode: turn_recovery
     prepare_timeout_s: 300
+
+rollout_recovery:
+  target_level: turn
 ```
 
 #### Choosing a checkpoint level
 
-The current configuration has no single `rollout_recovery.target_level`
-setting. Choose the recovery behavior by combining
-`rollout_recovery.default_granularity` with
-`rollout_checkpointing.gym.mode`:
+Set one `rollout_recovery.target_level`, from finest to coarsest:
 
-| Recovery goal | `rollout_recovery.default_granularity` | `rollout_checkpointing.gym.mode` | Behavior after restart |
-| --- | --- | --- | --- |
-| Rerun incomplete prompt groups | `prompt_group` | `disabled` | Fully completed TQ groups are restored. If any sibling in an unfinished group is missing, every sibling in that group is regenerated. |
-| Reuse completed siblings | `sibling` | `disabled` | Sealed siblings are reused. Each unfinished sibling restarts from its original prompt. |
-| Resume unfinished Gym turns | `sibling` | `turn_recovery` | Sealed siblings are reused. Gym continuations resume from their last committed turn when their resource dependencies support recovery; otherwise those continuations restart from the original prompt. |
-
-Using `prompt_group` together with `mode: turn_recovery` is valid, but the
-prompt-group policy still discards sibling-level progress when the group is
-retried. It therefore does not provide turn-level work reuse for incomplete
-groups.
+| Target | Behavior after restart |
+| --- | --- |
+| `turn` | Sealed siblings are reused and unfinished Gym executions resume from their last saved turn when their dependencies support recovery. Turn participant checkpointing is enabled automatically. |
+| `sibling` | Sealed siblings are reused; unfinished siblings restart from their original prompts. |
+| `prompt_group` | Every sibling in an unfinished group restarts from its original prompt. |
 
 All three choices require the following settings for durable periodic rollout
 snapshots:
@@ -217,14 +210,14 @@ Turn-level recovery adds these requirements:
   leaves the previous snapshot authoritative and the periodic checkpoint pump
   retries later.
 
-`task_source_granularity_overrides` and
-`agent_granularity_overrides` may select a different policy for one environment.
+`task_source_target_level_overrides` and
+`agent_target_level_overrides` may force a coarser policy for one environment.
 Task-source keys must exactly match `extra_env_info.task_source`. Agent keys
 must exactly match `extra_env_info.agent_ref.name`; an agent match takes
-precedence over a task-source match. An unmatched or misspelled key does not
-change the policy and the global default is used. The resolved policy is saved
-with the prompt group, so changing the configuration on restart does not
-reinterpret work that was already checkpointed.
+precedence over a task-source match. Setup rejects unmatched or misspelled keys
+after reading Gym's routing capabilities. The resolved policy is saved with the
+prompt group, so changing the configuration on restart does not reinterpret work
+that was already checkpointed.
 
 ##### Group-scored environments
 
@@ -237,18 +230,18 @@ setup and rejects configurations that cannot make progress:
 - Either `async_rl.rollout_failure.nemo_gym.rollout_timeout_s` or Gym's
   `cohort_collection_timeout_s` must be set, so a missing cohort member cannot
   wait forever.
-- With `mode: turn_recovery`, the agent must set
+- With `target_level: turn`, the agent must set
   `checkpoint_replayable_verify: true` and the scorer must advertise replayable
   verification. Production `genrm_compare` advertises `stateless`, so its
   process-local cohort is rebuilt by replaying every saved `/verify` request
   after restore.
 
-The group-scoring capability does not override
-`rollout_recovery.default_granularity`. Use `prompt_group` when every retry must
-regenerate one weight-consistent group. Use `sibling` with turn recovery when
-preserving and resuming long-running sibling turns is more important; resumed
-siblings retain the policy version recorded when their saved tokens were
-generated.
+Group-scored agents always retry the complete cohort after a live sibling
+failure, because retrying one `/verify` request alone would create an incomplete
+cohort. This does not unnecessarily lower restart recovery: with
+`target_level: turn`, every unfinished cohort member still resumes from its saved
+turn and reaches `/verify` again together. Resumed siblings retain the policy
+version recorded when their saved tokens were generated.
 
 ##### Invalid or lossy combinations
 
@@ -260,7 +253,8 @@ generated.
 | Turn recovery configures more than one Gym actor | Setup rejects the run; participant checkpointing is not shard-aware yet. |
 | A continuation depends on a `restart_only` resources server | Restore succeeds, but that continuation is discarded and rerun from its original prompt. |
 | `restore_mode: trainer_checkpoint` while newer periodic snapshots exist | The newer rollout progress is intentionally ignored. If only bootstrap snapshots exist and no trainer checkpoint exists, startup fails safely. |
-| An override key does not match the row's task source or agent | The override has no effect and the global granularity is used. |
+| An override requests a finer level than the global target | Configuration validation rejects it; overrides may only make recovery coarser. |
+| An override key does not match a discovered Gym route | Setup rejects the run instead of silently using the global target. |
 
 Restore outcomes are reported under `timing/rollout_recovery`, including
 `groups_complete_restored`, `groups_unfinished_found`, `siblings_reused`, and
@@ -270,7 +264,7 @@ for details.
 
 There is no separate discovery-only mode. Single Controller performs a
 read-only NeMo-Gym capability preflight for group-scoring contracts during
-setup; only `mode: turn_recovery` enables execution fencing, retained
+setup; only `target_level: turn` enables execution fencing, retained
 completion receipts, participant snapshots, and restore.
 
 Single Controller first closes new rollout admission, acknowledges completed
@@ -393,21 +387,16 @@ checkpoint exists.
 
 :::{note}
 Completed groups are restored directly from the TQ snapshot. For unfinished
-token-capture groups, `rollout_recovery.default_granularity` controls both live
-failure and restart behavior:
+token-capture groups, the resolved target and capability-derived live retry
+granularity are persisted separately. This lets a group-scored environment
+retry its whole cohort after a live failure while still resuming all of its
+members at saved turn boundaries after a process restart.
 
-- `sibling` preserves each sealed sibling and redispatches only unfinished ones.
-- `prompt_group` retries every sibling in the group when any sibling is unfinished.
-
-`sibling` is the default and avoids regenerating completed work. Use
-`prompt_group` when every generation in a recovered group must come from the
-policy weights live at redispatch.
-
-`task_source_granularity_overrides` can select the policy using the Gym
+`task_source_target_level_overrides` can coarsen the policy using the Gym
 `task_source` embedded in the raw rollout row. Unlike `agent_ref`, this identity
 is available before Gym resolves the concrete agent and SC reserves the recovery
 group. When a row already carries an `agent_ref`, a matching
-`agent_granularity_overrides` entry wins over a matching task-source entry,
+`agent_target_level_overrides` entry wins over a matching task-source entry,
 mirroring Gym's concrete-route precedence. Otherwise the task-source override,
 then the global default, applies. The agent map also keeps datasets collated
 before Gym recorded `task_source` working, although re-collating them is

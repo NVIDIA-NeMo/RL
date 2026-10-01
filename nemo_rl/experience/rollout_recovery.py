@@ -48,7 +48,7 @@ if TYPE_CHECKING:
 # only this version, so bump it whenever a saved field is added, removed, renamed,
 # or changes meaning, then regenerate
 # tests/unit/single_controller/checkpoint_schema_lock.json.
-ROLLOUT_RECOVERY_SCHEMA_VERSION = 3
+ROLLOUT_RECOVERY_SCHEMA_VERSION = 4
 _SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {ROLLOUT_RECOVERY_SCHEMA_VERSION}
 ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
 RolloutRecoveryState: TypeAlias = dict[str, Any]
@@ -71,8 +71,16 @@ class PromptGroupPhase(StrEnum):
 
 
 class RecoveryGranularity(StrEnum):
-    """Unit of completed work reused after a live failure or process restart."""
+    """Unit retried after a live rollout failure."""
 
+    SIBLING = "sibling"
+    PROMPT_GROUP = "prompt_group"
+
+
+class RecoveryTargetLevel(StrEnum):
+    """Finest recovery boundary requested for an unfinished rollout."""
+
+    TURN = "turn"
     SIBLING = "sibling"
     PROMPT_GROUP = "prompt_group"
 
@@ -137,6 +145,7 @@ class PromptGroupRecoveryState(_SavedState):
     task_source: Optional[str]
     resolved_agent_name: Optional[str]
     recovery_granularity: RecoveryGranularity
+    restore_level: RecoveryTargetLevel
     expected_generations: PositiveInt
     target_step: Optional[NonNegativeInt]
     start_weight_version: NonNegativeInt
@@ -148,7 +157,7 @@ class PromptGroupRecoveryState(_SavedState):
 class RolloutRecoveryLedgerState(_SavedState):
     """Exact persisted schema owned by :class:`RolloutRecoveryLedger`."""
 
-    schema_version: Literal[3]
+    schema_version: Literal[4]
     groups: list[PromptGroupRecoveryState]
     pending_completed_execution_acknowledgements: list[GymCompletedExecution]
 
@@ -243,6 +252,7 @@ class PromptGroupRecoveryRecord:
     prompt_ref: PromptRef
     task_source: Optional[str]
     recovery_granularity: RecoveryGranularity
+    restore_level: RecoveryTargetLevel
     runtime_prompt_payload: Optional[DatumSpec]
     expected_generations: int
     target_step: Optional[int]
@@ -398,6 +408,7 @@ class RolloutRecoveryLedger:
         start_weight_version: int,
         task_source: Optional[str] = None,
         recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
+        restore_level: Optional[RecoveryTargetLevel] = None,
         admitted: bool = True,
         group_id: Optional[str] = None,
         admission_id: Optional[str] = None,
@@ -425,6 +436,12 @@ class RolloutRecoveryLedger:
         admission_id = admission_id or group_id
         if not admission_id:
             raise ValueError("admission_id must not be empty")
+        if restore_level is None:
+            restore_level = (
+                RecoveryTargetLevel.PROMPT_GROUP
+                if recovery_granularity is RecoveryGranularity.PROMPT_GROUP
+                else RecoveryTargetLevel.SIBLING
+            )
 
         siblings = []
         for generation_index in range(expected_generations):
@@ -442,6 +459,7 @@ class RolloutRecoveryLedger:
             task_source=task_source,
             resolved_agent_name=None,
             recovery_granularity=recovery_granularity,
+            restore_level=restore_level,
             # Retain the immutable dataloader sample by reference instead of copying
             # a potentially 131k-token payload. This cache is never serialized and
             # is released as soon as canonical rows take over recovery ownership.
@@ -498,7 +516,7 @@ class RolloutRecoveryLedger:
         self.assert_checkpoint_safe()
         for record in self._groups.values():
             if record.status is PromptGroupStatus.GENERATING:
-                if record.recovery_granularity is RecoveryGranularity.PROMPT_GROUP:
+                if record.restore_level is RecoveryTargetLevel.PROMPT_GROUP:
                     self._abandon_entire_group(record)
                 else:
                     self.abandon_unsealed(cut, record.group_id)
@@ -1232,6 +1250,7 @@ class RolloutRecoveryLedger:
                     "task_source": record.task_source,
                     "resolved_agent_name": record.resolved_agent_name,
                     "recovery_granularity": record.recovery_granularity.value,
+                    "restore_level": record.restore_level.value,
                     "expected_generations": record.expected_generations,
                     "target_step": record.target_step,
                     "start_weight_version": record.start_weight_version,
@@ -1478,6 +1497,7 @@ class RolloutRecoveryLedger:
             task_source=group.task_source,
             resolved_agent_name=group.resolved_agent_name,
             recovery_granularity=group.recovery_granularity,
+            restore_level=group.restore_level,
             runtime_prompt_payload=None,
             expected_generations=group.expected_generations,
             target_step=group.target_step,

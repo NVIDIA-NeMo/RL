@@ -207,6 +207,7 @@ class _PendingLedger:
                     "task_source": None,
                     "resolved_agent_name": None,
                     "recovery_granularity": RecoveryGranularity.SIBLING.value,
+                    "restore_level": "sibling",
                     "expected_generations": 2,
                     "start_weight_version": 7,
                     "status": "generating",

@@ -187,11 +187,7 @@ rollout_checkpointing:
   # Every config path not excluded here or by NeMo-RL's built-in denylist must
   # match before a bootstrap rollout snapshot can be restored.
   extra_fingerprint_excluded_paths: []
-  # Set to turn_recovery to save and restore NeMo-Gym participant state with
-  # rollout snapshots. Ordinary Gym setup still validates group-scoring
-  # contracts without enabling recovery behavior.
   gym:
-    mode: disabled
     # Time limit in seconds for each Gym checkpoint step: prepare, commit,
     # resume/abort, restore, discard. Every step gets its own full limit, shared
     # by all Gym servers in that step, so one snapshot can hold Gym for up to
@@ -278,20 +274,17 @@ token_capture:
   enabled: false
   staging_partition: rollout_staging
 
-# Retry and restore policy for unfinished token-capture groups. "sibling" reuses
-# already sealed generations; "prompt_group" regenerates every sibling when any
-# sibling fails in-process or was unfinished at a checkpoint.
+# Target recovery boundary for unfinished token-capture groups. "turn" enables
+# coordinated Gym participant snapshots; "sibling" preserves sealed siblings;
+# "prompt_group" regenerates every sibling in an unfinished group.
 rollout_recovery:
-  default_granularity: sibling
+  target_level: sibling
   # Per-Gym-task-source override, keyed on extra_env_info.task_source.
-  #   task_source_granularity_overrides:
-  #     genrm_compare_resources_server: prompt_group
-  task_source_granularity_overrides: {}
+  task_source_target_level_overrides: {}
   # Agent-specific override for rows already carrying extra_env_info.agent_ref.
   # A matching agent entry wins over a matching task-source entry and also
   # provides compatibility for legacy datasets without task_source.
-  #   agent_granularity_overrides: {genrm_simple_agent: prompt_group}
-  agent_granularity_overrides: {}
+  agent_target_level_overrides: {}
 
 # Leaving either map above non-empty requires the top-level token_capture section
 # to set enabled: true.

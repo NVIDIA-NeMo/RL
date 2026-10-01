@@ -90,6 +90,7 @@
         "task_source",
         "resolved_agent_name",
         "recovery_granularity",
+        "restore_level",
         "expected_generations",
         "target_step",
         "start_weight_version",
@@ -122,7 +123,7 @@
         "attempts"
       ]
     },
-    "schema_version": 3
+    "schema_version": 4
   },
   "rollout_snapshot_manifest": {
     "fields": [

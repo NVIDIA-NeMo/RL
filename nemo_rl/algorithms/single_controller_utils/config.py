@@ -18,7 +18,7 @@ import math
 import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Annotated, Any, Literal, Optional, cast
+from typing import AbstractSet, Annotated, Any, Literal, Optional, cast
 
 from pydantic import (
     BaseModel,
@@ -59,7 +59,10 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.environments.nemo_gym_shards import parse_shard_plan
-from nemo_rl.experience.rollout_recovery import RecoveryGranularity
+from nemo_rl.experience.rollout_recovery import (
+    RecoveryGranularity,
+    RecoveryTargetLevel,
+)
 from nemo_rl.models.generation.vllm.config import (
     VllmConfig,
     parse_nvfp4_pertoken_rollout,
@@ -653,61 +656,94 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
 
 @dataclass(frozen=True)
 class TaskSourceRecoveryGranularity:
-    """Recovery granularity selected for a prompt-group reservation.
+    """Resolved live-retry and restart policy for a prompt-group reservation.
 
-    ``task_source`` is copied from the raw Gym row when present. ``granularity``
-    is selected from an explicit agent override, a task-source override, or the
-    global default.
+    ``task_source`` is copied from the raw Gym row when present. ``restore_level``
+    is the user-selected restart target, while ``granularity`` is the live retry
+    policy after applying environment capability constraints.
     """
 
     task_source: Optional[str]
     granularity: RecoveryGranularity
+    restore_level: RecoveryTargetLevel
+
+
+_RECOVERY_TARGET_RANK = {
+    RecoveryTargetLevel.TURN: 0,
+    RecoveryTargetLevel.SIBLING: 1,
+    RecoveryTargetLevel.PROMPT_GROUP: 2,
+}
 
 
 class RolloutRecoveryConfig(BaseModel, extra="allow"):
     """Retry and restore policy for unfinished token-capture prompt groups.
 
-    ``sibling`` (the default) preserves completed generations and retries only
-    the missing ones. Prefer it when reusing work and avoiding repeated long-tail
-    generations matters more than keeping a group on one policy version.
-
-    ``prompt_group`` discards and regenerates every sibling when any generation
-    is unfinished. It costs a full group per recovery, but keeps the regenerated
-    group on the policy weights live at redispatch instead of mixing those results
-    with older sealed siblings.
-
-    The resolved value is persisted on each ledger group, so restoring a saved
-    group does not reinterpret it using a newer configuration. The same
-    granularity governs failures handled in-process and after a process restart.
+    ``turn`` resumes unfinished Gym executions from their last saved turn,
+    ``sibling`` preserves sealed siblings but restarts unfinished siblings, and
+    ``prompt_group`` restarts every sibling in an unfinished group. Environment
+    capability constraints may make live retries coarser than the restore target;
+    group-scored environments, for example, retry the whole group live even when
+    their saved turns can be resumed together after a process restart.
     """
 
-    default_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING
+    target_level: RecoveryTargetLevel = RecoveryTargetLevel.SIBLING
     # Keyed by ``extra_env_info.task_source``, which is available before Gym
     # resolves the concrete agent used to execute the row.
-    task_source_granularity_overrides: dict[str, RecoveryGranularity] = Field(
+    task_source_target_level_overrides: dict[str, RecoveryTargetLevel] = Field(
         default_factory=dict
     )
     # Keyed by ``extra_env_info.agent_ref.name`` when the input row already has
     # a concrete Gym route. A matching agent override wins over task_source.
-    agent_granularity_overrides: dict[str, RecoveryGranularity] = Field(
+    agent_target_level_overrides: dict[str, RecoveryTargetLevel] = Field(
         default_factory=dict
     )
 
     @model_validator(mode="after")
-    def _reject_removed_override_keys(self) -> "RolloutRecoveryConfig":
-        """Reject the removed task-name map instead of silently ignoring it."""
-        removed = {"task_granularity_overrides"}.intersection(self.model_extra or {})
+    def _validate_target_overrides(self) -> "RolloutRecoveryConfig":
+        """Reject removed keys and overrides finer than the global target."""
+        removed = {
+            "default_granularity",
+            "task_granularity_overrides",
+            "task_source_granularity_overrides",
+            "agent_granularity_overrides",
+        }.intersection(self.model_extra or {})
         if removed:
             raise ValueError(
                 f"rollout_recovery fields {sorted(removed)!r} were replaced by "
-                "task_source_granularity_overrides"
+                "target_level and *_target_level_overrides"
             )
+        for mapping_name, overrides in (
+            (
+                "task_source_target_level_overrides",
+                self.task_source_target_level_overrides,
+            ),
+            ("agent_target_level_overrides", self.agent_target_level_overrides),
+        ):
+            finer = sorted(
+                name
+                for name, level in overrides.items()
+                if _RECOVERY_TARGET_RANK[level]
+                < _RECOVERY_TARGET_RANK[self.target_level]
+            )
+            if finer:
+                raise ValueError(
+                    f"{mapping_name} may only force a coarser recovery level than "
+                    f"target_level={self.target_level.value!r}; invalid={finer!r}"
+                )
         return self
 
+    @property
+    def participant_checkpointing_enabled(self) -> bool:
+        return self.target_level is RecoveryTargetLevel.TURN
+
     def resolve_for_prompt(
-        self, prompt: Mapping[str, Any]
+        self,
+        prompt: Mapping[str, Any],
+        *,
+        group_scored_agent_names: AbstractSet[str] = frozenset(),
+        group_scored_task_source_names: AbstractSet[str] = frozenset(),
     ) -> TaskSourceRecoveryGranularity:
-        """Resolve using matching agent, matching task source, then default."""
+        """Resolve user target and capability-constrained live retry behavior."""
         extra_env_info = prompt.get("extra_env_info")
         task_source: Optional[str] = None
         agent_name: Optional[str] = None
@@ -724,6 +760,7 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
                 if raw_agent_name is not None and not isinstance(raw_agent_name, str):
                     raise TypeError("prompt agent_ref.name must be a string or None")
                 agent_name = raw_agent_name
+        target_level = self.target_level
         if agent_name is not None:
             if task_source is None:
                 warnings.warn(
@@ -733,25 +770,39 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
                     FutureWarning,
                     stacklevel=2,
                 )
-            override = self.agent_granularity_overrides.get(agent_name)
+            override = self.agent_target_level_overrides.get(agent_name)
             if override is not None:
-                return TaskSourceRecoveryGranularity(task_source, override)
-        if task_source is not None:
-            override = self.task_source_granularity_overrides.get(task_source)
-            if override is not None:
-                return TaskSourceRecoveryGranularity(task_source, override)
-        return TaskSourceRecoveryGranularity(task_source, self.default_granularity)
+                target_level = override
+            elif task_source is not None:
+                target_level = self.task_source_target_level_overrides.get(
+                    task_source, target_level
+                )
+        elif task_source is not None:
+            target_level = self.task_source_target_level_overrides.get(
+                task_source, target_level
+            )
+        granularity = (
+            RecoveryGranularity.PROMPT_GROUP
+            if target_level is RecoveryTargetLevel.PROMPT_GROUP
+            or (
+                agent_name is not None
+                and agent_name in group_scored_agent_names
+            )
+            or (
+                task_source is not None
+                and task_source in group_scored_task_source_names
+            )
+            else RecoveryGranularity.SIBLING
+        )
+        return TaskSourceRecoveryGranularity(
+            task_source=task_source,
+            granularity=granularity,
+            restore_level=target_level,
+        )
 
 
 class GymRolloutCheckpointConfig(BaseModel, extra="forbid"):
-    """Configure the experimental NeMo-Gym checkpoint protocol.
-
-    ``disabled`` leaves Gym checkpoint participation off. ``turn_recovery``
-    discovers and validates the checkpoint topology, saves participant state,
-    and enables durable completion acknowledgements.
-    """
-
-    mode: Literal["disabled", "turn_recovery"] = "disabled"
+    """Configure the experimental NeMo-Gym checkpoint protocol."""
     # Time limit in seconds for each Gym checkpoint step: prepare, commit,
     # resume/abort, restore, discard. Every step gets its own full limit, shared
     # by all Gym servers in that step, so one snapshot can hold Gym for up to
@@ -759,9 +810,6 @@ class GymRolloutCheckpointConfig(BaseModel, extra="forbid"):
     # policy calls within it, so size it above your longest single generation.
     prepare_timeout_s: Annotated[float, Field(gt=0)] = 300.0
 
-    @property
-    def participant_checkpointing_enabled(self) -> bool:
-        return self.mode == "turn_recovery"
 
 
 class RolloutCheckpointConfig(BaseModel, extra="forbid"):
@@ -1295,7 +1343,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         )
     _validate_algo_settings(master_config)
 
-    if master_config.rollout_checkpointing.gym.participant_checkpointing_enabled:
+    if master_config.rollout_recovery.participant_checkpointing_enabled:
         nemo_gym_config = master_config.env.get("nemo_gym", {})
         shard_plan = parse_shard_plan(nemo_gym_config)
         gym_actor_count = (
@@ -1308,7 +1356,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 "Gym participant checkpointing currently supports exactly one "
                 f"NeMo-Gym actor, but env.nemo_gym.shards configures "
                 f"{gym_actor_count}. Configure one shard with replicas=1, or "
-                "set rollout_checkpointing.gym.mode='disabled'."
+                "set rollout_recovery.target_level='sibling'."
             )
 
     async_config = master_config.async_rl
@@ -1396,10 +1444,14 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "Gym execution. Higher-level rollout recovery creates a new tracked "
             "attempt instead."
         )
-    if not token_capture_config.enabled and (
-        recovery_config.default_granularity is not RecoveryGranularity.SIBLING
-        or recovery_config.task_source_granularity_overrides
-        or recovery_config.agent_granularity_overrides
+    if (
+        not token_capture_config.enabled
+        and not recovery_config.participant_checkpointing_enabled
+        and (
+            recovery_config.target_level is not RecoveryTargetLevel.SIBLING
+            or recovery_config.task_source_target_level_overrides
+            or recovery_config.agent_target_level_overrides
+        )
     ):
         raise ValueError(
             "non-default rollout_recovery policies require "
