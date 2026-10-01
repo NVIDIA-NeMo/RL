@@ -2064,18 +2064,8 @@ class SingleControllerActor:
                                 self._credit_shortfall(target_step)
                                 return
                             finalized = await self._finalize_with_actor(request)
-                            if finalized is None:
-                                # Finalizer dropped the group as a structural
-                                # outcome (e.g. router replay with no routed
-                                # data yet); ownership was already cleaned up,
-                                # so like the dropped-prompt path above the
-                                # train pump will never release this permit
-                                # and the step must be allowed to close short.
-                                self._buffer_capacity.release()
-                                self._credit_shortfall(target_step)
-                                return
                             min_valid_fraction = self._master_config.token_capture.min_valid_fraction_per_group
-                            below_threshold = (
+                            below_threshold = finalized is None or (
                                 min_valid_fraction is not None
                                 and finalized.total_row_count > 0
                                 and finalized.valid_row_count
@@ -2086,21 +2076,24 @@ class SingleControllerActor:
                                 self._rollout_manager.stats.committed += 1
                                 ownership_transferred = True
                                 break
-                            # Enough rows verified to publish, but too few to
-                            # be worth training on. Unlike the finalizer's own
-                            # structural drops above, this is a policy call
-                            # only the controller can act on: it is the one
-                            # component that can source a replacement.
-                            # _finalize_with_actor already rejected and cleaned
-                            # this group before making it visible to the trainer.
-                            print(
-                                f"  finalize: group {request.group_id} below "
-                                "min_valid_fraction_per_group "
-                                f"({finalized.valid_row_count}/"
-                                f"{finalized.total_row_count} < "
-                                f"{min_valid_fraction}); seeking a replacement",
-                                flush=True,
-                            )
+                            # Structural and quality rejections were cleaned before
+                            # publication. Both can use the configured spare pool
+                            # to preserve the step's full prompt-group count.
+                            if finalized is None:
+                                print(
+                                    f"  finalize: group {request.group_id} dropped; "
+                                    "seeking a replacement",
+                                    flush=True,
+                                )
+                            else:
+                                print(
+                                    f"  finalize: group {request.group_id} below "
+                                    "min_valid_fraction_per_group "
+                                    f"({finalized.valid_row_count}/"
+                                    f"{finalized.total_row_count} < "
+                                    f"{min_valid_fraction}); seeking a replacement",
+                                    flush=True,
+                                )
                             replacement = self._take_replacement(
                                 target_step, replacements
                             )
