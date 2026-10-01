@@ -786,6 +786,42 @@ def test_fp8_flashinfer_trtllm_keeps_existing_refit_lifecycle(monkeypatch):
 
 
 @pytest.mark.vllm
+def test_fp8_refit_finalization_releases_mxfp8_shuffle_scratch(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.quantization import fp8
+
+    model = SimpleNamespace(modules=lambda: [])
+    vllm_config = SimpleNamespace(
+        kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm"),
+        quant_config=object(),
+    )
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(model=model, vllm_config=vllm_config)
+    ext.model_config = object()
+    ext.device = torch.device("cpu")
+    ext._maybe_process_mtp_drafter_after_loading = MagicMock()
+
+    scratch_buffers = {
+        ("w13", (1,), torch.device("cpu")): torch.empty(1, dtype=torch.uint8)
+    }
+    monkeypatch.setattr(fp8, "mxfp8_shuffle_scratch_buffers", scratch_buffers)
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
+        MagicMock(),
+    )
+
+    with ext._weight_update_lifecycle("collective") as finalize:
+        finalize()
+
+    assert scratch_buffers == {}
+
+
+@pytest.mark.vllm
 def test_extension_capability_can_disable_unquantized_reload():
     from nemo_rl.models.generation.vllm import vllm_backend
 
