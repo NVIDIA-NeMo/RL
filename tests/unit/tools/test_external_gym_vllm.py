@@ -938,7 +938,7 @@ def test_pool_registration_rejects_partial_nodes_and_unsafe_group_id():
     )
 
     assert partial.returncode == 2
-    assert "must be divisible by GPUS_PER_NODE=4" in partial.stderr
+    assert "must be a multiple of GPUS_PER_NODE=4" in partial.stderr
     assert unsafe_group.returncode == 2
     assert "TEST_GROUP_ID may contain only" in unsafe_group.stderr
 
@@ -1053,6 +1053,45 @@ def test_pool_registration_supports_native_vllm_image_without_nemo_python():
         "executable=/usr/local/bin/vllm",
         "nodes=4",
     ]
+
+
+def test_pool_registration_packs_subnode_native_replicas():
+    script = REPO_ROOT / "tools/external_gym_vllm/pool_config.sh"
+    program = textwrap.dedent(
+        f"""
+        source {script}
+        export GPUS_PER_NODE=4
+        register_external_vllm_pool ROLLOUT \
+          --model model --container image --launch-mode native \
+          --replicas 16 --tensor-parallel-size 1 \
+          --lb-port 9210 --url-placeholder __ROLLOUT_URL__
+        printf 'nodes=%s\n' "$EXTERNAL_VLLM_NUM_NODES"
+        """
+    )
+
+    result = subprocess.run(["bash", "-c", program], capture_output=True, text=True)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().splitlines()[-1] == "nodes=4"
+
+
+def test_pool_registration_rejects_partial_node_native_pack():
+    script = REPO_ROOT / "tools/external_gym_vllm/pool_config.sh"
+    program = textwrap.dedent(
+        f"""
+        source {script}
+        export GPUS_PER_NODE=4
+        register_external_vllm_pool ROLLOUT \
+          --model model --container image --launch-mode native \
+          --replicas 5 --tensor-parallel-size 1 \
+          --lb-port 9210 --url-placeholder __ROLLOUT_URL__
+        """
+    )
+
+    result = subprocess.run(["bash", "-c", program], capture_output=True, text=True)
+
+    assert result.returncode == 2
+    assert "must fill whole nodes" in result.stderr
 
 
 def test_pool_registration_rejects_multinode_native_replica():
@@ -1195,4 +1234,4 @@ def test_lightning_launcher_rejects_invalid_external_pool_tp():
     result = _run_lightning_launcher(GENRM_TENSOR_PARALLEL_SIZE="6")
 
     assert result.returncode == 2
-    assert "must be divisible by GPUS_PER_NODE=4" in result.stderr
+    assert "must be a multiple of GPUS_PER_NODE=4" in result.stderr

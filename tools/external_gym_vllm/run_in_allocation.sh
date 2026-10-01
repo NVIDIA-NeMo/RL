@@ -128,6 +128,7 @@ declare -A tensor_parallel_sizes=()
 declare -A data_parallel_sizes=()
 declare -A prefill_replicas=()
 declare -A nodes_per_replica=()
+declare -A replicas_per_node=()
 declare -A node_offsets=()
 declare -A node_counts=()
 declare -A served_model_names=()
@@ -238,8 +239,14 @@ for pool in "${pool_names[@]}"; do
         echo "[FATAL] ${pool}_VLLM_EXECUTABLE is required in native mode" >&2
         exit 1
       fi
-      if (( tensor_parallel_sizes[${pool}] != GPUS_PER_NODE || data_parallel_sizes[${pool}] != 1 )); then
-        echo "[FATAL] ${pool} native mode requires one full node per replica and data parallel size 1" >&2
+      if (( data_parallel_sizes[${pool}] != 1 )); then
+        echo "[FATAL] ${pool} native mode requires data parallel size 1" >&2
+        exit 1
+      fi
+      # One whole node per replica, or several replicas packed on one node when
+      # TP divides GPUS_PER_NODE (each on its own GPU slice; see PACKED_REPLICA).
+      if (( tensor_parallel_sizes[${pool}] > GPUS_PER_NODE || GPUS_PER_NODE % tensor_parallel_sizes[${pool}] != 0 )); then
+        echo "[FATAL] ${pool} native mode requires TP == GPUS_PER_NODE or a TP that divides GPUS_PER_NODE" >&2
         exit 1
       fi
       ;;
@@ -262,8 +269,9 @@ for pool in "${pool_names[@]}"; do
       exit 1
     fi
   fi
-  if (( tensor_parallel_sizes[${pool}] % GPUS_PER_NODE != 0 )); then
-    echo "[FATAL] ${pool}_TENSOR_PARALLEL_SIZE must be divisible by GPUS_PER_NODE" >&2
+  if [[ "${launch_modes[${pool}]}" != "native" ]] &&
+    (( tensor_parallel_sizes[${pool}] % GPUS_PER_NODE != 0 )); then
+    echo "[FATAL] ${pool}_TENSOR_PARALLEL_SIZE must be divisible by GPUS_PER_NODE in nemo-rl-ray mode" >&2
     exit 1
   fi
   if [[ -n "${seen_lb_ports[${lb_ports[${pool}]}]-}" ]]; then
@@ -306,8 +314,22 @@ for pool in "${pool_names[@]}"; do
 
   # Each private Ray cluster owns whole nodes. This makes its fixed Ray port safe
   # to reuse across replicas because no two replicas ever share a host.
-  nodes_per_replica["${pool}"]=$((tensor_parallel_sizes[${pool}] * data_parallel_sizes[${pool}] / GPUS_PER_NODE))
-  node_counts["${pool}"]=$((replicas[${pool}] * nodes_per_replica[${pool}]))
+  gpus_per_replica=$((tensor_parallel_sizes[${pool}] * data_parallel_sizes[${pool}]))
+  if (( gpus_per_replica < GPUS_PER_NODE )); then
+    # Packed native replicas: several single-host servers share one node, each
+    # on its own GPU slice with port offsets (see LOCAL_REPLICA_INDEX below).
+    if (( GPUS_PER_NODE % gpus_per_replica != 0 || (replicas[${pool}] * gpus_per_replica) % GPUS_PER_NODE != 0 )); then
+      echo "[FATAL] ${display_names[${pool}]}: TP x DP=${gpus_per_replica} must divide GPUS_PER_NODE=${GPUS_PER_NODE} and replicas must fill whole nodes" >&2
+      exit 1
+    fi
+    replicas_per_node["${pool}"]=$((GPUS_PER_NODE / gpus_per_replica))
+    nodes_per_replica["${pool}"]=1
+    node_counts["${pool}"]=$((replicas[${pool}] / replicas_per_node[${pool}]))
+  else
+    replicas_per_node["${pool}"]=1
+    nodes_per_replica["${pool}"]=$((gpus_per_replica / GPUS_PER_NODE))
+    node_counts["${pool}"]=$((replicas[${pool}] * nodes_per_replica[${pool}]))
+  fi
   node_offsets["${pool}"]="${total_external_nodes}"
   total_external_nodes=$((total_external_nodes + node_counts[${pool}]))
   if (( startup_timeouts[${pool}] > max_startup_timeout )); then
@@ -504,6 +526,20 @@ DISPLAY_NAME=$(pool_value DISPLAY_NAME)
 [[ -n "${LAUNCH_MODE}" ]] || LAUNCH_MODE=nemo-rl-ray
 [[ -n "${VLLM_EXECUTABLE}" ]] || VLLM_EXECUTABLE=vllm
 
+LOCAL_REPLICA_INDEX="${LOCAL_REPLICA_INDEX:-0}"
+REPLICAS_PER_NODE="${REPLICAS_PER_NODE:-1}"
+PACKED_REPLICA=0
+if (( REPLICAS_PER_NODE > 1 )); then
+  # Packed native replica: pin this server to its GPU slice and offset every
+  # per-host port so the co-resident replicas do not collide.
+  PACKED_REPLICA=1
+  gpus_per_replica=$((TENSOR_PARALLEL_SIZE * DATA_PARALLEL_SIZE))
+  first_gpu=$((LOCAL_REPLICA_INDEX * gpus_per_replica))
+  export CUDA_VISIBLE_DEVICES=$(seq -s, "${first_gpu}" $((first_gpu + gpus_per_replica - 1)))
+  VLLM_HTTP_PORT=$((VLLM_HTTP_PORT + LOCAL_REPLICA_INDEX))
+  export VLLM_NIXL_SIDE_CHANNEL_PORT="${VLLM_NIXL_SIDE_CHANNEL_PORT:-$((5557 + LOCAL_REPLICA_INDEX * TENSOR_PARALLEL_SIZE))}"
+  echo "[${REPLICA_ID}] Packed replica ${LOCAL_REPLICA_INDEX}/${REPLICAS_PER_NODE}: CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} http port ${VLLM_HTTP_PORT}"
+fi
 BACKEND_ROLE=standard
 if (( PREFILL_REPLICAS > 0 )); then
   if (( REPLICA_INDEX < PREFILL_REPLICAS )); then
@@ -585,7 +621,12 @@ if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
   # Keep vLLM's TCPStore and MessageQueue ports inside the reserved
   # 7000-7999 band. serve_vllm_on_ray.py applies the NeMo RL compatibility
   # patch that offsets the TCPStore search within this per-engine window.
-  export VLLM_PORT="${VLLM_ENGINE_PORT}"
+  if (( PACKED_REPLICA )); then
+    # Co-resident engines must not share the fixed base; let vLLM pick free ports.
+    unset VLLM_PORT
+  else
+    export VLLM_PORT="${VLLM_ENGINE_PORT}"
+  fi
 
   vllm_args=()
   while IFS= read -r argument; do
@@ -752,7 +793,8 @@ done
 for pool in "${pool_names[@]}"; do
   echo "[INFO] Launching ${display_names[${pool}]} replicas"
   for (( replica_index = 0; replica_index < replicas[${pool}]; replica_index++ )); do
-    first_node_index=$((node_offsets[${pool}] + replica_index * nodes_per_replica[${pool}]))
+    first_node_index=$((node_offsets[${pool}] + replica_index / replicas_per_node[${pool}] * nodes_per_replica[${pool}]))
+    local_replica_index=$((replica_index % replicas_per_node[${pool}]))
     replica_node_count="${nodes_per_replica[${pool}]}"
     replica_nodes=("${external_nodes[@]:first_node_index:replica_node_count}")
     replica_nodelist=$(IFS=,; echo "${replica_nodes[*]}")
@@ -774,7 +816,7 @@ for pool in "${pool_names[@]}"; do
       --nodes="${nodes_per_replica[${pool}]}" \
       --ntasks="${nodes_per_replica[${pool}]}" \
       --ntasks-per-node=1 \
-      --export="ALL,POOL_PREFIX=${pool},REPLICA_ID=${replica_id},REPLICA_INDEX=${replica_index},EXTERNAL_VLLM_TOOLS_DIR=${EXTERNAL_VLLM_TOOLS_DIR_HOST},EXTERNAL_VLLM_STATE_DIR=${state_dirs[${pool}]},EXTERNAL_VLLM_GROUP_ID=${group_ids[${pool}]},HEAD_IP_FILE=${head_ip_file},LOG_FILE=${vllm_log}" \
+      --export="ALL,POOL_PREFIX=${pool},REPLICA_ID=${replica_id},REPLICA_INDEX=${replica_index},EXTERNAL_VLLM_TOOLS_DIR=${EXTERNAL_VLLM_TOOLS_DIR_HOST},EXTERNAL_VLLM_STATE_DIR=${state_dirs[${pool}]},EXTERNAL_VLLM_GROUP_ID=${group_ids[${pool}]},HEAD_IP_FILE=${head_ip_file},LOG_FILE=${vllm_log},LOCAL_REPLICA_INDEX=${local_replica_index},REPLICAS_PER_NODE=${replicas_per_node[${pool}]}" \
       --output="${pool_log_dirs[${pool}]}/replica_${replica_index}_%t.log" \
       bash -c "${VLLM_SERVER_BODY}" &
     service_step_pids+=("$!")

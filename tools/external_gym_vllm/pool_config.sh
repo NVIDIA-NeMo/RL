@@ -83,7 +83,8 @@ _external_vllm_recompute_node_count() {
     replicas_var="${pool}_REPLICAS"
     tensor_parallel_size_var="${pool}_TENSOR_PARALLEL_SIZE"
     data_parallel_size_var="${pool}_DATA_PARALLEL_SIZE"
-    total=$((total + ${!replicas_var} * ${!tensor_parallel_size_var} * ${!data_parallel_size_var} / gpus_per_node))
+    # Ceil so packed sub-node pools that do not fill the last node still count it.
+    total=$((total + (${!replicas_var} * ${!tensor_parallel_size_var} * ${!data_parallel_size_var} + gpus_per_node - 1) / gpus_per_node))
   done
   EXTERNAL_VLLM_NUM_NODES="${total}"
   export EXTERNAL_VLLM_NUM_NODES
@@ -214,13 +215,25 @@ register_external_vllm_pool() {
   _external_vllm_require_port "${pool}_VLLM_PORT" "${vllm_port}" || return
   _external_vllm_require_positive_integer \
     "${pool}_STARTUP_TIMEOUT" "${startup_timeout}" || return
-  if (( tensor_parallel_size % gpus_per_node != 0 )); then
-    echo "ERROR: ${pool}_TENSOR_PARALLEL_SIZE must be divisible by GPUS_PER_NODE=${gpus_per_node}" >&2
-    return 2
-  fi
-  if [[ "${launch_mode}" == "native" ]] &&
-    (( tensor_parallel_size != gpus_per_node || data_parallel_size != 1 )); then
-    echo "ERROR: ${pool} native mode requires one full node per replica and data parallel size 1" >&2
+  local gpus_per_replica=$((tensor_parallel_size * data_parallel_size))
+  if [[ "${launch_mode}" == "native" ]]; then
+    # Native replicas are single-host `vllm serve` processes: either one whole
+    # node (TP == GPUS_PER_NODE) or several replicas packed on one node when
+    # TP divides GPUS_PER_NODE (each gets its own GPU slice and port offset).
+    if (( data_parallel_size != 1 )); then
+      echo "ERROR: ${pool} native mode requires data parallel size 1" >&2
+      return 2
+    fi
+    if (( tensor_parallel_size > gpus_per_node || gpus_per_node % tensor_parallel_size != 0 )); then
+      echo "ERROR: ${pool} native mode requires one full node per replica (TP == GPUS_PER_NODE=${gpus_per_node}) or a TP that divides GPUS_PER_NODE" >&2
+      return 2
+    fi
+    if (( (replicas * tensor_parallel_size) % gpus_per_node != 0 )); then
+      echo "ERROR: ${pool}_REPLICAS x TP must fill whole nodes (GPUS_PER_NODE=${gpus_per_node})" >&2
+      return 2
+    fi
+  elif (( gpus_per_replica % gpus_per_node != 0 )); then
+    echo "ERROR: ${pool}_TENSOR_PARALLEL_SIZE x DATA_PARALLEL_SIZE must be a multiple of GPUS_PER_NODE=${gpus_per_node} in nemo-rl-ray mode" >&2
     return 2
   fi
   if (( prefill_replicas > 0 )); then
