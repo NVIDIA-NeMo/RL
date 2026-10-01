@@ -1320,12 +1320,17 @@ def process_weights_after_loading_moe(self, layer) -> None:
         )
 
 
-# Shared gather destinations keyed by (tag, shape, device). They persist across
-# refits so the batched shuffle allocates nothing after the first pass; their
-# contents are rewritten on every call, so a sleep-mode discard is harmless.
+# Shared gather destinations keyed by (tag, shape, device). Layers reuse them
+# within one refit; the weight-update lifecycle releases them before vLLM wakes
+# so these large temporary tensors do not compete with the runtime weight pool.
 mxfp8_shuffle_scratch_buffers: dict[
     tuple[str, tuple[int, ...], torch.device], torch.Tensor
 ] = {}
+
+
+def release_mxfp8_shuffle_scratch_buffers() -> None:
+    """Drop batched-shuffle temporaries after refit finalization."""
+    mxfp8_shuffle_scratch_buffers.clear()
 
 
 def _mxfp8_scratch(tag: str, shape: torch.Size, device: torch.device) -> torch.Tensor:

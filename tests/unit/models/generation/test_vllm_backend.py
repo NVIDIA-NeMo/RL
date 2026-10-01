@@ -400,6 +400,7 @@ def test_mixed_mxfp8_native_refit_processes_each_module_once(monkeypatch, transp
     )
 
     from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.quantization import fp8
 
     call_order = []
     model = torch.nn.Module()
@@ -429,6 +430,11 @@ def test_mixed_mxfp8_native_refit_processes_each_module_once(monkeypatch, transp
     ext._mtp_drafter_refit_enabled = lambda: False
     ext._maybe_process_mtp_drafter_after_loading = lambda: call_order.append("mtp")
     ext._maybe_process_fp8_kv_cache = MagicMock()
+
+    scratch_buffers = {
+        ("w13", (1,), torch.device("cpu")): torch.empty(1, dtype=torch.uint8)
+    }
+    monkeypatch.setattr(fp8, "mxfp8_shuffle_scratch_buffers", scratch_buffers)
 
     monkeypatch.setattr(
         vllm_backend,
@@ -502,6 +508,7 @@ def test_mixed_mxfp8_native_refit_processes_each_module_once(monkeypatch, transp
         "mtp",
         "config_exit",
     ]
+    assert scratch_buffers == {}
     ext._maybe_process_fp8_kv_cache.assert_not_called()
 
 
