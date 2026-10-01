@@ -105,22 +105,14 @@ def create_advantage_actors(
     for index in range(num_workers):
         options: dict[str, Any] = {}
         if node_ids:
-            # Round-robin so a pool larger than the cluster still spreads
-            # evenly. Soft for the same reason SPREAD is below: steering off
-            # the head is an optimization, not a requirement. A hard pin
-            # deadlocks the untimed readiness wait with no diagnostic whenever
-            # the chosen node cannot fit num_cpus=1 -- drained, or its CPUs
-            # already taken by the GPU worker actors.
+            # Round-robin, and soft because a hard pin deadlocks the untimed
+            # readiness wait below when the node cannot fit num_cpus=1.
             options["scheduling_strategy"] = NodeAffinitySchedulingStrategy(
                 node_id=node_ids[index % len(node_ids)], soft=True
             )
         else:
-            # No head to steer away from, but Ray's hybrid default packs to 50%
-            # of a node before spreading and a CPU-only actor sits far below
-            # that, so every worker would land on the driver's node and stack
-            # its host-memory peak beside the controller. SPREAD is soft, which
-            # is what we want here: placement is an optimization, not a
-            # requirement, and a pool larger than the cluster must still start.
+            # Without a strategy Ray's hybrid default packs a CPU-only actor
+            # onto the driver's node -- beside the controller it is relieving.
             options["scheduling_strategy"] = "SPREAD"
         actors.append(
             AdvantageActor.options(**options).remote(

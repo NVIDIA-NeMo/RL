@@ -5180,27 +5180,19 @@ class SingleControllerActor:
         if self._advantage_estimator is None:
             return meta, True
 
-        # One call hands a single actor the whole batch, which leaves the rest
-        # of the pool idle for the duration. Splitting on prompt-group
-        # boundaries keeps every shard valid for the group-relative estimators
-        # while letting the pool work the step in parallel.
-        #
-        # Only estimators whose numerics survive the cut may be split. gdpo and
-        # reinforce_plus_plus normalize over the whole batch unconditionally,
-        # and gae and raw_reward do whenever normalize_advantages is set, so a
-        # shard would silently produce different advantages than the same run
-        # at num_advantage_workers: 1. Sharding is skipped for those rather
-        # than refused, because the pool is still correct one call at a time.
+        # Split on prompt-group boundaries so the pool works a chunk in
+        # parallel. SHARD_INVARIANT_ESTIMATORS says which estimators allow it.
         stage_cfg = self._advantage_stage_config
+        num_actors = len(self._advantage_actors)
         shards = (
-            split_meta_by_prompt_group(meta, len(self._advantage_actors))
+            split_meta_by_prompt_group(meta, num_actors)
             if stage_cfg.shardable
             else None
         )
-        # Say which path was taken, and why when it is the unsharded one. Both
-        # declines are silent by construction, and an unlogged decline is
+        # Every decline is silent by construction, so an unlogged one is
         # indistinguishable from a shard that bought nothing -- which is how one
-        # 256-node run was spent measuring a no-op.
+        # 256-node run was spent measuring a no-op. Name the reason too: the
+        # default pool of 0 would otherwise report a layout it never examined.
         if shards is not None:
             decline = ""
         elif not stage_cfg.shardable:
@@ -5208,6 +5200,10 @@ class SingleControllerActor:
                 f" (estimator {stage_cfg.algo.adv_estimator.name!r} is not "
                 "shard-invariant)"
             )
+        elif num_actors <= 1:
+            decline = " (pool has fewer than 2 actors)"
+        elif len(set(row_group_ids(meta))) < 2:
+            decline = " (chunk has fewer than 2 prompt groups)"
         else:
             decline = " (prompt-group layout not recoverable)"
         log.info(
@@ -5221,12 +5217,8 @@ class SingleControllerActor:
             AdvantageRequest(meta=shard)
             for shard in (shards if shards is not None else [meta])
         ]
-        # The writeback and the metadata the controller derives from it have to
-        # land in one mutation cut, so a snapshot cannot capture the advantages
-        # without the replay-index state that describes them. Holding the cut
-        # across the remote calls deliberately makes checkpoint acquisition wait
-        # for the tail of every in-flight advantage RPC, exactly as group_commits
-        # already does for the finalizer.
+        # Each actor writes advantages inside its RPC, so the cut must cover
+        # the whole call or a snapshot could land mid-write.
         async with self._data_plane_checkpoint_barrier.mutation("advantage_writeback"):
             outcomes = await asyncio.gather(
                 *(self._run_advantage_stage(request) for request in requests)
@@ -5252,11 +5244,8 @@ class SingleControllerActor:
         try:
             outcome = await actor.run.remote(request)
         except BaseException:
-            # The actor writes advantages before returning, so a failed RPC
-            # leaves the writeback outcome unknown. There is no correct way to
-            # continue a step from an unknown writeback, so this propagates
-            # instead of retrying elsewhere, and the actor is never handed back
-            # to the pool.
+            # The writeback is half-done and unreadable from here, so this
+            # propagates rather than retrying, and the actor is not handed back.
             print(
                 "FATAL: advantage actor RPC failed after submission; the "
                 f"writeback outcome is unknown for {len(request.meta.sample_ids)} "
