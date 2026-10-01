@@ -6,7 +6,7 @@ grpo:
   max_rollout_turns: 1
   max_num_epochs: 1
   max_num_steps: 1000000
-  normalize_rewards: false
+  normalize_rewards: true
   use_leave_one_out_baseline: true
   val_period: 5
   val_start_at: -1  # First step eligible for periodic validation; -1 disables the delay
@@ -70,10 +70,9 @@ grpo:
     recompute_kv_cache_after_weight_updates: false # Set to true to recompute kv cache after weight updates
 
   dwrl:
-    bt_prompt: "Based on your evaluation, is the original response good? Answer with only a single word: yes or no"
-    score_token: "yes"
-    opposite_token: "no"
-    use_env_rewards: false
+    bt_prompt: "Based on your evaluation, which response is better? Answer with only a single character: 1 or 2"
+    score_token: "1"
+    opposite_token: "2"
 
 # Reward-zeroing penalties applied to NeMo-Gym rollout results.
 reward_penalties:
@@ -119,6 +118,7 @@ loss_fn:
   # 0.0 disables it. VAPO paper recommends 0.1.
   positive_example_nll_weight: 0.0
   ce_penalty: 0.001
+  bt_alpha: 1.0
 
 checkpointing:
   enabled: true
@@ -497,10 +497,10 @@ data:
 env:
   should_use_nemo_gym: false
   genrm_dwrl:
-    reward_design: rb0
     num_workers: 8
     score_weight: 1.0
     ranking_weight: 1.0
+    use_binary_reward: false
 
 # Logger configuration
 logger:

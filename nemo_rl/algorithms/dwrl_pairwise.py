@@ -216,1293 +216,6 @@ from nemo_rl.algorithms.grpo import (
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 # ===============================================================================
-# Setup & Initialization
-# ===============================================================================
-
-def setup(
-    master_config: MasterConfig,
-    tokenizer: TokenizerType,
-    dataset: AllTaskProcessedDataset | dict[str, AllTaskProcessedDataset],
-    val_dataset: Optional[AllTaskProcessedDataset],
-    processor: Optional[AutoProcessor] = None,
-    policy_factory: Optional[Callable[..., ColocatablePolicyInterface]] = None,
-) -> tuple[
-    ColocatablePolicyInterface,
-    Optional[GenerationInterface],
-    Optional[EnvironmentInterface],
-    tuple[RayVirtualCluster, RayVirtualCluster],
-    StatefulDataLoader | MultipleDataloaderWrapper,
-    Optional[StatefulDataLoader],
-    DWRLLossFn,
-    Logger,
-    CheckpointManager,
-    GRPOSaveState,
-    MasterConfig,
-    dict[str, Any],
-    dict[str, str],
-]:
-    """Main entry point for running GRPO algorithm.
-
-    Returns:
-        A 13-tuple, in order:
-            policy, policy_generation, nemo_gym (the NeMo-Gym env actor, or None
-            when not enabled), cluster, dataloader, val_dataloader, loss_fn,
-            logger, checkpointer, grpo_save_state, master_config,
-            teacher_worker_groups, alias_to_group_alias.
-    """
-    # Start timing the entire setup process
-    setup_start_time = time.perf_counter()
-
-    # Extract individual configs for easier access
-    policy_config = master_config.policy
-    generation_config = policy_config["generation"]
-    loss_config: ClippedPGLossConfig = master_config.loss_fn
-    env_configs = master_config.env
-    data_config = master_config.data
-    grpo_config = master_config.grpo
-    logger_config = master_config.logger
-    cluster_config = master_config.cluster
-    checkpointing_config = master_config.checkpointing
-
-    checkpointing_pretrained = checkpointing_config.get("pretrained_checkpoint")
-    if checkpointing_pretrained is not None:
-        policy_config["pretrained_checkpoint"] = checkpointing_pretrained
-
-    assert generation_config is not None, (
-        "A generation config in the PolicyConfig is required for GRPO"
-    )
-    if generation_config["backend"] == "vllm":
-        normalize_vllm_refit_config(cast(VllmConfig, generation_config))
-    elif generation_config["backend"] == "dynamo":
-        # Validate the complete managed-Dynamo boundary before allocating Ray
-        # placement groups or starting any external services.
-        if grpo_config.async_grpo.in_flight_weight_updates:
-            raise ValueError(
-                "grpo.async_grpo.in_flight_weight_updates must be false when "
-                "policy.generation.backend='dynamo'; managed Dynamo drains "
-                "rollouts before layerwise weight refit"
-            )
-        generation_config.setdefault("vllm_kwargs", {})["hf_overrides"] = (
-            policy_config.get("hf_config_overrides") or {}
-        )
-        generation_config = DynamoConfig.model_validate(generation_config).model_dump()
-        policy_config["generation"] = generation_config
-    _validate_multimodal_dedup_capability(master_config)
-    enable_nemo_gym = should_use_nemo_gym(master_config)
-    validate_router_replay_transport_path(
-        policy_config,
-        data_plane_enabled=bool((master_config.data_plane or {}).get("enabled", False)),
-        async_grpo_enabled=bool(
-            grpo_config.async_grpo and grpo_config.async_grpo.enabled
-        ),
-        nemo_gym_enabled=enable_nemo_gym,
-        load_replay_buffer=checkpointing_config.get("load_replay_buffer"),
-    )
-
-    # Validation-only sampling is honored only on the NeMo-Gym vLLM rollout
-    # path; everywhere else validation must sample exactly like training.
-    val_sampling_overridden = (
-        generation_config["val_temperature"] != generation_config["temperature"]
-        or generation_config["val_top_p"] != generation_config["top_p"]
-        or generation_config["val_top_k"] != generation_config["top_k"]
-    )
-    if val_sampling_overridden:
-        assert generation_config["backend"] == "vllm" and should_use_nemo_gym(
-            master_config
-        ), (
-            "generation.val_temperature/val_top_p/val_top_k differing from the "
-            "train sampling params is only supported for vLLM NeMo-Gym rollouts."
-        )
-        # The NeMo-Gym path only stamps temperature/top_p onto requests and
-        # rejects any top_k at rollout time, so a val_top_k override can never
-        # be honored — fail here instead of at the first validation step.
-        assert not generation_config["val_top_k"], (
-            "generation.val_top_k is not supported: the NeMo-Gym rollout path "
-            "only honors val_temperature/val_top_p. Leave val_top_k null."
-        )
-    assert grpo_config.val_num_generations_per_prompt >= 1, (
-        "grpo.val_num_generations_per_prompt must be >= 1"
-    )
-    # pass_k is only reported when k > 1; catch the mismatch here instead of
-    # at the first validation step.
-    assert not (
-        grpo_config.stop_at_validation_metric == "pass_k"
-        and grpo_config.val_num_generations_per_prompt <= 1
-    ), (
-        "grpo.stop_at_validation_metric='pass_k' requires "
-        "grpo.val_num_generations_per_prompt > 1"
-    )
-
-    # Set seed for all random number generators
-    set_seed(grpo_config.seed)
-
-    # ==========================
-    #         Logger
-    # ==========================
-    logger = Logger(logger_config)
-    if enable_nemo_gym:
-        env_configs.setdefault("nemo_gym", {})["nemo_gym_log_dir"] = os.path.join(
-            logger.base_log_dir, "nemo_gym"
-        )
-    logger.log_hyperparams(master_config.model_dump())
-
-    # ==========================
-    #      Checkpointing
-    # ==========================
-    checkpointer = CheckpointManager(checkpointing_config)
-    last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
-    loaded_state = checkpointer.load_training_info(last_checkpoint_path)
-    grpo_save_state = _get_grpo_save_state(loaded_state)
-
-    # ==========================
-    #           Data
-    # ==========================
-    # num_prompts_per_step and dataloader_batch_size will be different when using multiple dataloaders
-    num_prompts_per_step = grpo_config.num_prompts_per_step
-    if data_config["use_multiple_dataloader"]:
-        dataloader_batch_size = data_config["num_prompts_per_dataloader"]
-    else:
-        dataloader_batch_size = num_prompts_per_step
-
-    # Validate batch_multiplier
-    batch_multiplier = grpo_config.batch_multiplier
-    if grpo_config.use_dynamic_sampling:
-        num_prompts_per_step = int(num_prompts_per_step * batch_multiplier)
-        dataloader_batch_size = int(dataloader_batch_size * batch_multiplier)
-    else:
-        assert batch_multiplier == 1, (
-            "batch_multiplier>1 can only be used if use_dynamic_sampling=True"
-        )
-
-    # Validate the early-stop pairing
-    if grpo_config.stop_at_validation_metric is not None:
-        assert grpo_config.stop_at_validation_threshold is not None, (
-            "grpo.stop_at_validation_threshold must be set when "
-            "grpo.stop_at_validation_metric is set"
-        )
-
-    # Validate number of prompts per step
-    if data_config["use_multiple_dataloader"]:
-        assert num_prompts_per_step % dataloader_batch_size == 0, (
-            "Expected num_prompts_per_step to be a multiple of num_prompts_per_dataloader, "
-            f"but got {num_prompts_per_step} and {dataloader_batch_size}. "
-            "Please check the configuration of num_prompts_per_step and num_prompts_per_dataloader. "
-            "If use_dynamic_sampling is enabled and batch_multiplier is used, please also check the configuration of batch_multiplier."
-        )
-
-    # Load train dataset
-    def init_train_dataloader(dataset, suffix: str = ""):
-        dataloader = StatefulDataLoader(
-            dataset,
-            batch_size=dataloader_batch_size,
-            shuffle=data_config["shuffle"],
-            collate_fn=functools.partial(preference_collate_fn,
-                                     tokenizer=tokenizer,
-                                     make_sequence_length_divisible_by=1,
-                                     add_loss_mask=False,
-                                     return_batch_only=True
-                                     ),
-            drop_last=True,
-            num_workers=data_config["num_workers"],
-        )
-        if last_checkpoint_path is not None:
-            load_dataloader_state(dataloader, last_checkpoint_path, data_config, suffix)
-        return dataloader
-
-    if data_config["use_multiple_dataloader"]:
-        # Initialize dataloaders
-        dataloaders = {}
-        for task_name, task_dataset in dataset.items():
-            dataloaders[task_name] = init_train_dataloader(
-                task_dataset, f"_{task_name}"
-            )
-            print(
-                f"  ✓ Training dataloader {task_name} loaded with {len(task_dataset)} samples",
-                flush=True,
-            )
-
-        train_sample_count = sum(
-            len(task_dataloader) for task_dataloader in dataloaders.values()
-        )
-
-        # Wrap dataloader
-        dataloader = MultipleDataloaderWrapper(
-            expected_num_prompts=num_prompts_per_step,
-            data_config=data_config,
-            dataloaders=dataloaders,
-        )
-    else:
-        dataloader = init_train_dataloader(dataset)
-        train_sample_count = len(dataloader)
-        print(
-            f"  ✓ Training dataloader loaded with {train_sample_count} samples",
-            flush=True,
-        )
-
-    # Load validation dataset if provided
-    val_dataloader: Optional[StatefulDataLoader] = None
-    # If validation is enabled, load the validation dataloader
-    if grpo_config.val_period > 0 or grpo_config.val_at_start or grpo_config.val_at_end:
-        assert val_dataset is not None, (
-            "Validation dataset is required if validation is enabled"
-        )
-        val_dataloader = StatefulDataLoader(
-            val_dataset,
-            batch_size=grpo_config.val_batch_size,
-            shuffle=False,
-            collate_fn=functools.partial(preference_collate_fn,
-                                         tokenizer=tokenizer,
-                                         make_sequence_length_divisible_by=1,
-                                         add_loss_mask=False,
-                                         return_batch_only=True
-                                         ),
-            num_workers=data_config["num_workers"],
-        )
-        print(
-            f"  ✓ Validation dataloader loaded with {len(val_dataset)} samples",
-            flush=True,
-        )
-
-    # ==========================
-    #        Loss Function
-    # ==========================
-    # Fused linear logprobs compute next-token logprobs directly from hidden states
-    # (chunked over the sequence) and never materialize the full
-    # [batch, seq_len, vocab_size] logit tensor, which significantly reduces peak
-    # memory. It is only available on the Megatron backend.
-    # Both megatron_cfg and use_fused_linear_logprobs are NotRequired, and many
-    # configs (e.g. nemo_gym, modelopt, non-megatron) omit them -- use .get() with
-    # a {} fallback to avoid a KeyError.
-    megatron_cfg = policy_config.get("megatron_cfg", {})
-    use_fused_linear_logprobs = bool(
-        megatron_cfg.get("enabled") and megatron_cfg.get("use_fused_linear_logprobs")
-    )
-    if use_fused_linear_logprobs:
-        # Sequence packing is not yet validated with the fused path: the fused
-        # forward rolls labels over the whole (packed) sequence and would mix
-        # tokens across packed-sequence boundaries.
-        assert not policy_config["sequence_packing"]["enabled"], (
-            "Linear CE fusion loss is not supported with sequence packing for GRPO. "
-            "The fused path has not been validated with cu_seqlens-based logprob "
-            "aggregation. Set policy.megatron_cfg.use_fused_linear_logprobs=false "
-            "or policy.sequence_packing.enabled=false."
-        )
-        # The fused forward gathers the logprob of the realized token from the raw
-        # (unfiltered) logits, so top-k/top-p training-time filtering cannot be
-        # applied. This also keeps prev/reference logprobs (computed via the fused
-        # get_logprobs path) consistent with the actor logprobs.
-        assert not need_top_k_or_top_p_filtering(
-            TrainingSamplingParams(
-                top_k=generation_config["top_k"],
-                top_p=generation_config["top_p"],
-            )
-        ), (
-            "Linear CE fusion loss is not supported with top-k/top-p training-time "
-            "filtering for GRPO. The fused path computes logprobs from unfiltered "
-            "logits. Set policy.megatron_cfg.use_fused_linear_logprobs=false, or "
-            "disable filtering (policy.generation.top_k=null, "
-            "policy.generation.top_p=1.0)."
-        )
-
-    loss_fn = DWRLLossFn(
-        loss_config, use_fused_linear_logprobs=use_fused_linear_logprobs
-    )
-
-    # Validate force_on_policy_ratio
-    if loss_config.force_on_policy_ratio:
-        assert (
-            grpo_config.num_prompts_per_step * grpo_config.num_generations_per_prompt
-            == policy_config["train_global_batch_size"]
-        ), (
-            "force_on_policy_ratio requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt"
-        )
-        os.environ["NRL_IGNORE_TP_ACCURACY_CHECK"] = "1"
-        print("  ✓ force_on_policy_ratio enabled")
-
-    # Validate skip_reference_policy_logprobs_calculation
-    if grpo_config.skip_reference_policy_logprobs_calculation:
-        assert loss_config.reference_policy_kl_penalty == 0, (
-            "grpo.skip_reference_policy_logprobs_calculation=True requires "
-            "loss_fn.reference_policy_kl_penalty == 0"
-        )
-        print(
-            "Reference policy logprob calculation will be skipped since `grpo.skip_reference_policy_logprobs_calculation` is set to True and `loss_fn.reference_policy_kl_penalty` is 0."
-        )
-
-    _validate_use_kl_in_reward_compat(master_config)
-
-    # ==========================
-    #          Cluster
-    # ==========================
-    print("\n▶ Setting up compute cluster...", flush=True)
-    colocated_inference = generation_config["colocated"]["enabled"]
-
-    env_name_list = extract_necessary_env_names(data_config)
-    rm_env_enabled = "reward_model" in env_name_list
-
-    # NeMo Gym is initialized inside setup() (rather than by the caller) so its
-    # spinup can overlap with vLLM model loading via deferred model load.
-    _raise_if_reward_penalties_enabled_without_nemo_gym(
-        master_config, enable_nemo_gym=enable_nemo_gym
-    )
-    nemo_gym_actor = None
-
-    def _spinup_nemo_gym(base_urls, model_name):
-        """Spin up the NeMo Gym actor against the given generation server URLs."""
-        t0 = time.perf_counter()
-        enable_router_replay = router_replay_enabled(policy_config)
-        routed_experts_dtype = (
-            resolve_routed_experts_dtype_name_for_model(model_name)
-            if enable_router_replay
-            else "int16"
-        )
-        actor = spinup_nemo_gym_actor(
-            env_configs=env_configs,
-            base_urls=base_urls,
-            model_name=model_name,
-            tokenizer=tokenizer,
-            enable_router_replay=enable_router_replay,
-            routed_experts_dtype=routed_experts_dtype,
-            use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
-        )
-        return actor, time.perf_counter() - t0
-
-    total_nodes = cluster_config["num_nodes"]
-    segment_size = cluster_config.get("segment_size")
-    # Topology of nodes left over after policy/inference placement; non-colocated
-    # OPD teachers are placed within it so their collectives stay on NVLink.
-    teacher_segment_topology: Optional[dict[str, tuple[str, int]]] = None
-    if rm_env_enabled:
-        rm_resource = env_configs["reward_model"]["resources"]
-        rm_nodes = rm_resource["num_nodes"]
-        rm_gpus_per_node = rm_resource["gpus_per_node"]
-    else:
-        rm_nodes = 0
-        rm_gpus_per_node = 0
-
-    if total_nodes == 1:
-        policy_nodes = total_nodes
-    else:
-        policy_nodes = total_nodes - rm_nodes
-        assert policy_nodes > 0, (
-            "policy_nodes must be > 0, but got "
-            f"policy_nodes:{policy_nodes} + rm_nodes:{rm_nodes} = total_nodes:{total_nodes}"
-        )
-
-    # Reserve nodes for non-colocated OPD teachers so training doesn't claim them.
-    opd_teacher_nodes = 0
-    enable_opd_teachers = opd_module.is_non_colocated_teachers_enabled(master_config)
-    if enable_opd_teachers:
-        assert should_use_async_rollouts(generation_config), (
-            "Non-colocated OPD teachers require async GRPO (vLLM backend with async_engine enabled)."
-        )
-        from nemo_rl.models.policy.teacher_worker_group import (
-            create_teacher_configs_from_opd_config,
-        )
-
-        opd_cfg = opd_module._opd_cfg(master_config)
-        teacher_configs = create_teacher_configs_from_opd_config(opd_cfg)
-        for tcfg in teacher_configs:
-            assert tcfg.gpus_per_node <= cluster_config["gpus_per_node"], (
-                f"OPD teacher '{tcfg.alias}' requests gpus_per_node={tcfg.gpus_per_node} > "
-                f"cluster.gpus_per_node={cluster_config['gpus_per_node']}; "
-                "each teacher placement group must fit on one node."
-            )
-            opd_teacher_nodes += tcfg.num_nodes
-        policy_nodes -= opd_teacher_nodes
-        assert policy_nodes > 0, (
-            "policy_nodes must be > 0 after reserving OPD teacher nodes, but got "
-            f"policy_nodes:{policy_nodes} + rm_nodes:{rm_nodes} + opd_teacher_nodes:{opd_teacher_nodes} = total_nodes:{total_nodes}"
-        )
-        print(
-            f"policy_nodes:{policy_nodes} + rm_nodes:{rm_nodes} + opd_teacher_nodes:{opd_teacher_nodes} = total_nodes:{total_nodes}",
-            flush=True,
-        )
-
-    if colocated_inference:
-        if total_nodes == 1:
-            policy_gpus_per_node = cluster_config["gpus_per_node"] - rm_gpus_per_node
-            assert policy_gpus_per_node > 0, (
-                "policy.generation.colocated.resources.gpus_per_node must be > 0 "
-                "when cluster.num_nodes = 1, "
-                f"but got {policy_gpus_per_node}."
-            )
-        else:
-            policy_gpus_per_node = cluster_config["gpus_per_node"]
-
-        node_resource_constraints, policy_remaining_ids, policy_topology = (
-            prepare_segment_topology(segment_size, policy_nodes)
-        )
-        if segment_size is not None:
-            teacher_segment_topology = {
-                nid: policy_topology[nid] for nid in policy_remaining_ids
-            }
-        cluster = RayVirtualCluster(
-            name="grpo_policy_cluster",
-            bundle_ct_per_node_list=[policy_gpus_per_node] * policy_nodes,
-            use_gpus=True,
-            num_gpus_per_node=policy_gpus_per_node,
-            max_colocated_worker_groups=1
-            if generation_config["backend"] == "megatron"
-            else 2,
-            port_range_low=cluster_config.get("master_port_range_low"),
-            port_range_high=cluster_config.get("master_port_range_high"),
-            segment_size=segment_size,
-            node_resource_constraints=node_resource_constraints,
-        )
-        train_cluster = cluster
-        inference_cluster = cluster
-        # Colocated generation reuses the policy's cluster; need to decide topology here.
-        if (
-            node_resource_constraints is not None
-            and generation_config["backend"] == "megatron"
-        ):
-            MegatronGeneration.init_cluster_placement_groups(cluster, policy_config)
-        print(
-            f"  ✓ Ray cluster for policy initialized with {policy_nodes} nodes",
-            flush=True,
-        )
-
-    else:
-        # train resources will be updated through overall and inference resources below
-        train_gpus_per_node = cluster_config["gpus_per_node"]
-        train_nodes = policy_nodes
-
-        inference_resources = generation_config["colocated"]["resources"]
-        inference_gpus_per_node = inference_resources["gpus_per_node"]
-        inference_nodes = inference_resources["num_nodes"]
-
-        # validate and configure resources
-        if policy_nodes == 1:
-            # When policy_nodes == 1, train and inference are on the same node
-            assert (
-                inference_gpus_per_node is not None and inference_gpus_per_node > 0
-            ), (
-                "policy.generation.colocated.resources.gpus_per_node must be explicitly set to a value > 0 "
-                "when policy_nodes = 1 and inference is non-colocated, "
-                f"but got {inference_gpus_per_node}."
-            )
-            assert inference_nodes is None or inference_nodes == 1, (
-                "policy.generation.colocated.resources.num_nodes must be 1 or set to null "
-                "when policy_nodes = 1 and inference is non-colocated, "
-                f"but got {inference_nodes}."
-            )
-
-            inference_nodes = 1
-            # If total_nodes == 1, reward model is also on the same node; otherwise it's on a different node
-            reward_gpus_to_subtract = (
-                rm_gpus_per_node if total_nodes == 1 and rm_env_enabled else 0
-            )
-            train_gpus_per_node -= inference_gpus_per_node + reward_gpus_to_subtract
-            assert train_gpus_per_node > 0, (
-                "No enough GPUs for training, "
-                f"train_gpus_per_node:{train_gpus_per_node} = cluster_config['gpus_per_node']:{cluster_config['gpus_per_node']} - inference_gpus_per_node:{inference_gpus_per_node}"
-                + (
-                    f" - rm_gpus_per_node:{rm_gpus_per_node}"
-                    if total_nodes == 1 and rm_env_enabled
-                    else ""
-                )
-            )
-        else:
-            # train, inference, and reward model are all on different nodes
-            assert inference_nodes > 0, (
-                "policy.generation.colocated.resources.num_nodes must be > 0 "
-                "when cluster.num_nodes > 1 and inference is non-colocated, "
-                f"but got {inference_nodes}."
-            )
-            assert (
-                inference_gpus_per_node is not None
-                and inference_gpus_per_node == cluster_config["gpus_per_node"]
-            ), (
-                "policy.generation.colocated.resources.gpus_per_node must be explicitly set and equal to cluster.gpus_per_node "
-                "when cluster.num_nodes > 1 and inference is non-colocated, "
-                f"but got inference_gpus_per_node={inference_gpus_per_node}, cluster.gpus_per_node={cluster_config['gpus_per_node']}."
-            )
-            train_nodes -= inference_nodes
-
-        assert train_nodes > 0 and inference_nodes > 0, (
-            f"Non-colocated mode requires train_nodes > 0 and inference_nodes > 0, "
-            f"got train_nodes={train_nodes}, inference_nodes={inference_nodes}"
-        )
-
-        # Build topology-aware domain constraints for placement groups.
-        # Each selected node's bundles are pinned to a specific NVLink domain so
-        # that EP groups stay within high-bandwidth switch fabrics.
-        #
-        # NOTE: segment_size is also passed to RayVirtualCluster and used later
-        # by _sort_bundle_indices_by_topology to trim incomplete domain segments
-        # when ordering ranks. When constraints successfully pin nodes to
-        # complete segments, that post-placement trimming is a no-op. It serves
-        # as defense-in-depth for the fallback path where constraints are absent.
-        node_resource_constraints = None
-        inference_node_resource_constraints = None
-        inference_segment_size = None
-        if segment_size is not None:
-            topology = get_ray_cluster_topology()
-            num_alive_nodes = len(topology)
-            required_nodes = train_nodes + inference_nodes
-            assert num_alive_nodes >= required_nodes, (
-                f"Not enough alive Ray nodes for all roles: "
-                f"need {required_nodes} (train={train_nodes} + inference={inference_nodes}), "
-                f"but only {num_alive_nodes} alive nodes found"
-            )
-            node_resource_constraints, remaining_node_ids, topology = (
-                prepare_segment_topology(
-                    segment_size, train_nodes, topology=topology, role="training"
-                )
-            )
-            # Teachers default to the nodes left after training; narrowed further
-            # below if a non-colocated inference cluster is also pinned.
-            teacher_segment_topology = {
-                nid: topology[nid] for nid in remaining_node_ids
-            }
-            # Warn if any selected training node lacks topo_rank — domain pinning
-            # still works but intra-domain rank ordering will be arbitrary.
-            if node_resource_constraints is not None:
-                training_node_ids = set(topology) - set(remaining_node_ids)
-                nodes_missing_topo_rank = [
-                    nid
-                    for nid in training_node_ids
-                    if topology[nid][1] == TOPO_RANK_UNKNOWN
-                ]
-                if nodes_missing_topo_rank:
-                    print(
-                        f"  ⚠ {len(nodes_missing_topo_rank)} selected training nodes have NVLink domain "
-                        f"info but no topo_rank; intra-domain rank ordering may be suboptimal",
-                        flush=True,
-                    )
-
-                # Inference topology: each inference instance spans
-                # nodes_per_instance nodes; keep those within one domain
-                # so cross-node all-reduce uses NVLink, not InfiniBand.
-                #
-                # For vLLM: total GPUs per instance = TP * PP (separate dimensions).
-                # For SGLang: gpus_per_server already includes all parallelism
-                #   dimensions (TP, DP-attention, PP are internal subdivisions),
-                #   so we use it directly without multiplying by pp_size.
-                # For Megatron: the NVLink-domain span of the parallelism the
-                #   generation workers actually run with.
-                if generation_config["backend"] == "megatron":
-                    gpus_per_instance = MegatronGeneration.nvlink_domain_span(
-                        policy_config
-                    )
-                elif generation_config["backend"] == "vllm":
-                    vllm_cfg = generation_config.get("vllm_cfg", {})
-                    gpus_per_instance = vllm_cfg["tensor_parallel_size"] * vllm_cfg.get(
-                        "pipeline_parallel_size", 1
-                    )
-                elif generation_config["backend"] == "trtllm":
-                    trtllm_cfg = generation_config.get("trtllm_cfg", {})
-                    gpus_per_instance = trtllm_cfg[
-                        "tensor_parallel_size"
-                    ] * trtllm_cfg.get("pipeline_parallel_size", 1)
-                elif generation_config["backend"] == "dynamo":
-                    gpus_per_instance = DynamoConfig.model_validate(
-                        generation_config
-                    ).engine_world_size
-                else:
-                    sglang_cfg = generation_config.get("sglang_cfg", {})
-                    gpus_per_instance = sglang_cfg.get("gpus_per_server", 1)
-                nodes_per_instance = (
-                    gpus_per_instance + inference_gpus_per_node - 1
-                ) // inference_gpus_per_node
-                if nodes_per_instance > 1 and inference_nodes % nodes_per_instance == 0:
-                    remaining_topology = {
-                        nid: topology[nid] for nid in remaining_node_ids
-                    }
-                    (
-                        inference_node_resource_constraints,
-                        inference_remaining_ids,
-                        _,
-                    ) = prepare_segment_topology(
-                        nodes_per_instance,
-                        inference_nodes,
-                        topology=remaining_topology,
-                        role="inference",
-                    )
-                    inference_segment_size = nodes_per_instance
-                    teacher_segment_topology = {
-                        nid: topology[nid] for nid in inference_remaining_ids
-                    }
-                elif nodes_per_instance > 1:
-                    print(
-                        f"  ⚠ inference_nodes={inference_nodes} is not divisible by "
-                        f"nodes_per_instance={nodes_per_instance} (gpus_per_instance={gpus_per_instance}); "
-                        f"skipping inference topology constraints",
-                        flush=True,
-                    )
-
-        # initialize train cluster
-        train_cluster = RayVirtualCluster(
-            name="grpo_train_cluster",
-            bundle_ct_per_node_list=[train_gpus_per_node] * train_nodes,
-            use_gpus=True,
-            num_gpus_per_node=train_gpus_per_node,
-            max_colocated_worker_groups=1,
-            port_range_low=cluster_config.get("master_port_range_low"),
-            port_range_high=cluster_config.get("master_port_range_high"),
-            segment_size=segment_size,
-            node_resource_constraints=node_resource_constraints,
-        )
-        # When domain constraints are set, eagerly create placement groups
-        # so training claims the constrained nodes before inference can grab them.
-        if node_resource_constraints is not None:
-            train_cluster.get_placement_groups()
-        print(
-            f"  ✓ Ray train cluster initialized with {train_nodes} nodes with {train_gpus_per_node} GPUs per node",
-            flush=True,
-        )
-
-        # Create inference cluster with topology constraints so TP groups
-        # stay within NVLink domains. Eagerly initialize PGs when constraints
-        # are set so inference claims domain-aligned nodes first.
-        inference_cluster = RayVirtualCluster(
-            name="grpo_inference_cluster",
-            bundle_ct_per_node_list=[inference_gpus_per_node] * inference_nodes,
-            use_gpus=True,
-            num_gpus_per_node=inference_gpus_per_node,
-            max_colocated_worker_groups=1,
-            port_range_low=cluster_config.get("master_port_range_low"),
-            port_range_high=cluster_config.get("master_port_range_high"),
-            segment_size=inference_segment_size,
-            node_resource_constraints=inference_node_resource_constraints,
-        )
-        if inference_node_resource_constraints is not None:
-            if generation_config["backend"] == "megatron":
-                # Megatron inference reuses the training parallelism config.
-                MegatronGeneration.init_cluster_placement_groups(
-                    inference_cluster, policy_config
-                )
-            elif generation_config["backend"] == "dynamo":
-                # Managed Dynamo creates one single-node engine per placement
-                # group and does not need a backend-specific PG strategy.
-                inference_cluster.get_placement_groups()
-            else:
-                {
-                    "vllm": VllmGeneration,
-                    "trtllm": TrtllmGeneration,
-                }[generation_config["backend"]].init_cluster_placement_groups(
-                    inference_cluster,
-                    generation_config,
-                )
-        print(
-            f"  ✓ Ray inference cluster initialized with {inference_nodes} nodes with {inference_gpus_per_node} GPUs per node",
-            flush=True,
-        )
-
-    # Reserve topology-aware teacher placement groups before NeMo Gym starts
-    # opportunistically placing its GPU-backed services. Worker creation and
-    # model loading remain deferred until the policy is ready to avoid racing
-    # Megatron-Bridge checkpoint conversion.
-    teacher_clusters: dict[str, RayVirtualCluster] = {}
-    teacher_reservation_time = 0.0
-    if enable_opd_teachers:
-        t0 = time.perf_counter()
-        teacher_clusters = opd_module.reserve_teacher_clusters(
-            master_config,
-            segment_size=segment_size,
-            teacher_segment_topology=teacher_segment_topology,
-        )
-        teacher_reservation_time = time.perf_counter() - t0
-
-    # ==========================
-    #   Training and Inference
-    # ==========================
-    print("\n▶ Setting up model and training...", flush=True)
-
-    # vllm model loading prefers clean environment, initialize policy_generation before policy in colocated mode
-    backend = generation_config["backend"]
-    gen_init_time_key = (
-        "megatron_generation_init_time_s"
-        if backend == "megatron"
-        else f"{backend}_init_time_s"
-    )
-    generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
-    generation_config["_debug_payload_metrics"] = grpo_config.debug_payload_metrics
-    remote_transport = None
-    remote_synchronizer_cls = None
-    remote_baseline_init_refs: list[Any] = []
-    checkpoint_engine_config = None
-
-    # Worker initialization timing stats — populated as each phase completes.
-    setup_timing_metrics = SetupTimingMetrics()
-    if teacher_reservation_time:
-        setup_timing_metrics.teacher_reservation_time_s = teacher_reservation_time
-
-    weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
-
-    if policy_config.get("megatron_cfg", {}).get("enabled", False):
-        ## NOTE: this is equal to the total number of scheduler steps
-        total_train_iters = min(
-            grpo_config.max_num_steps,
-            grpo_config.max_num_epochs * train_sample_count,
-        )
-        policy_config["megatron_cfg"]["train_iters"] = total_train_iters
-
-        # When the user opts into recompute-after-refit on the megatron side,
-        # override mcore's kv_cache_management_mode to "recompute" directly.
-        async_grpo_config = grpo_config.async_grpo
-        if async_grpo_config.recompute_kv_cache_after_weight_updates:
-            mcore_cfg = policy_config["generation"]["mcore_generation_config"]
-            prior_mode = mcore_cfg.get("kv_cache_management_mode", "persist")
-            if prior_mode != "recompute":
-                print(
-                    f"kv_cache_management_mode overridden '{prior_mode}' -> 'recompute' by "
-                    f"grpo.async_grpo.recompute_kv_cache_after_weight_updates=True."
-                )
-            mcore_cfg["kv_cache_management_mode"] = "recompute"
-
-    # Define initialization functions that will be used in all paths
-    init_reference_model = loss_config.reference_policy_kl_penalty > 0
-
-    # Auto-enable skip_reference_policy_logprobs_calculation when the reference model is not loaded.
-    if (
-        not init_reference_model
-        and not grpo_config.skip_reference_policy_logprobs_calculation
-    ):
-        grpo_config.skip_reference_policy_logprobs_calculation = True
-        print(
-            "Auto-enabling `grpo.skip_reference_policy_logprobs_calculation=True` "
-            "because `loss_fn.reference_policy_kl_penalty == 0` "
-            "(reference model is not loaded)."
-        )
-
-    # Caller-supplied factory lets the sync trainer swap in a TQ-mediated
-    # Policy subclass without this shared setup needing to know the data
-    # plane exists. Default is the plain Policy class — legacy behavior.
-    _make_policy = policy_factory if policy_factory is not None else Policy
-
-    def init_policy():
-        """Initialize policy training workers."""
-        t0 = time.perf_counter()
-        p = _make_policy(
-            cluster=train_cluster,
-            config=policy_config,
-            tokenizer=tokenizer,
-            processor=processor,
-            weights_path=weights_path,
-            optimizer_path=optimizer_path,
-            init_optimizer=True,
-            init_reference_model=init_reference_model,
-        )
-        # Keep custom policy_factory call signatures backward compatible.
-        p.debug_payload_metrics = grpo_config.debug_payload_metrics
-        if remote_transport is not None:
-            assert remote_synchronizer_cls is not None
-            remote_baseline_init_refs.extend(
-                remote_synchronizer_cls.start_baseline(p, remote_transport)
-            )
-        return p, time.perf_counter() - t0
-
-    def init_vllm():
-        """Initialize vLLM generation workers."""
-        t0 = time.perf_counter()
-        pg = VllmGeneration(cluster=inference_cluster, config=generation_config)
-        pg.finish_generation()
-        return pg, time.perf_counter() - t0
-
-    def init_sglang():
-        """Initialize SGLang generation workers."""
-        t0 = time.perf_counter()
-        pg = SGLangGeneration(
-            cluster=inference_cluster,
-            sglang_cfg=generation_config,
-        )
-        pg.finish_generation()
-        return pg, time.perf_counter() - t0
-
-    def init_megatron_generation(policy=None):
-        """Initialize Megatron generation."""
-        t0 = time.perf_counter()
-        mg = MegatronGeneration(
-            config=policy_config,
-            tokenizer=tokenizer,
-            cluster=None if colocated_inference else inference_cluster,
-            policy=policy if colocated_inference else None,
-            processor=processor,
-            weights_path=weights_path,
-            skip_weight_load=not colocated_inference,
-        )
-        return mg, time.perf_counter() - t0
-
-    def initialize_generation_with_policy(
-        init_generation_fn,
-        colocated_inference: bool,
-        setup_timing_metrics: SetupTimingMetrics,
-    ):
-        """Initialize a generation engine along with policy, sequentially or in parallel.
-
-        Args:
-            init_generation_fn: Function that initializes the generation engine (init_vllm, ...).
-            colocated_inference: Whether inference is colocated with training.
-            setup_timing_metrics: SetupTimingMetrics to store timings on.
-
-        Returns:
-            Tuple of (policy_generation, policy).
-        """
-        # Determine if parallel initialization is possible (non-colocated mode)
-        use_parallel_init = not colocated_inference
-
-        if use_parallel_init:
-            # Parallel initialization: Generation engine and Policy can initialize simultaneously
-            print(
-                "  ⚡ Using parallel worker initialization (non-colocated mode)",
-                flush=True,
-            )
-
-            # Execute both initializations in parallel
-            parallel_start_time = time.perf_counter()
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                generation_future = executor.submit(init_generation_fn)
-                policy_future = executor.submit(init_policy)
-                policy_generation, generation_time = generation_future.result()
-                policy, policy_time = policy_future.result()
-            parallel_wall_time = time.perf_counter() - parallel_start_time
-
-            # Store timing metrics
-            setattr(setup_timing_metrics, gen_init_time_key, generation_time)
-            setup_timing_metrics.policy_init_time_s = policy_time
-            setup_timing_metrics.parallel_wall_time_s = parallel_wall_time
-            setup_timing_metrics.parallel_init_enabled = 1.0
-
-        else:
-            # Sequential initialization: colocated mode (GPU memory requires generation engine first)
-            print(
-                "  ⚙️  Using sequential worker initialization (colocated mode)",
-                flush=True,
-            )
-
-            # Initialize generation engine first (clean GPU memory), then policy
-            policy_generation, generation_time = init_generation_fn()
-            setattr(setup_timing_metrics, gen_init_time_key, generation_time)
-
-            policy, policy_time = init_policy()
-            setup_timing_metrics.policy_init_time_s = policy_time
-            setup_timing_metrics.parallel_init_enabled = 0.0
-
-        return policy_generation, policy
-
-    # Handle generation-specific setup
-    if backend == "megatron":
-        # Initialize training first so checkpoint conversion completes before inference starts.
-        policy, policy_time = init_policy()
-        setup_timing_metrics.policy_init_time_s = policy_time
-
-        # Colocated wraps the training policy; non-colocated builds a dedicated inference policy.
-        policy_generation, megatron_gen_time = init_megatron_generation(policy)
-        setup_timing_metrics.megatron_generation_init_time_s = megatron_gen_time
-
-        if enable_nemo_gym:
-            # The Megatron inference engine must be up before its server URLs exist.
-            nemo_gym_actor, nemo_gym_time = _spinup_nemo_gym(
-                policy_generation.dp_openai_server_base_urls,
-                generation_config["model_name"],
-            )
-            setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time
-
-        print(
-            f"  ✓ Using {backend} backend for generation with {policy_config['model_name']}",
-            flush=True,
-        )
-
-    elif backend == "vllm":
-        # vLLM generation: setup config, then initialize with policy
-        generation_config = cast(VllmConfig, generation_config)
-        refit_transport = generation_config.get("refit_transport")
-        if refit_transport in VLLM_SPARSE_REFIT_TRANSPORTS:
-            # Keep optional remote transport dependencies off the default path.
-            from nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer import (
-                VllmRemoteSparseWeightSynchronizer,
-                validate_vllm_remote_sparse_refit,
-            )
-
-            remote_transport = validate_vllm_remote_sparse_refit(
-                generation_config,
-                colocated=colocated_inference,
-                megatron_enabled=policy_config["megatron_cfg"]["enabled"],
-            )
-            assert remote_transport is not None
-            remote_synchronizer_cls = VllmRemoteSparseWeightSynchronizer
-        elif refit_transport is not None and refit_transport != "nccl_reshard":
-            # nccl_reshard is handled below via nccl_reshard_refit_enabled,
-            # not via checkpoint-engine.
-            checkpoint_engine_config = checkpoint_engine_refit_config(generation_config)
-            assert checkpoint_engine_config is not None
-
-        if generation_config["vllm_cfg"]["precision"] == "fp8":
-            assert loss_config.use_importance_sampling_correction, (
-                "Importance sampling must be enabled for vLLM FP8 generation for good convergence!"
-            )
-        if generation_config["vllm_cfg"]["kv_cache_dtype"].startswith("fp8"):
-            # FP8 KV cache requires FP8 model precision
-            assert generation_config["vllm_cfg"]["precision"] == "fp8", (
-                f"kv_cache_dtype='{generation_config['vllm_cfg']['kv_cache_dtype']}' requires precision='fp8'. "
-                "FP8 KV cache can only be used together with FP8 model weights."
-            )
-            # FP8 KV cache compatibility checks
-            assert policy_config["dtensor_cfg"]["enabled"] == False, (
-                "DTensor backend is not supported with kv cache fp8 enabled."
-            )
-            assert not should_use_async_rollouts(generation_config), (
-                "Async rollouts is not supported with kv cache fp8 enabled."
-            )
-            assert policy_config["megatron_cfg"]["pipeline_model_parallel_size"] == 1, (
-                "Currently when using FP8 KV cache in generation, then in megatron we only support pipeline_model_parallel_size=1. We will add more support in future."
-            )
-
-        configure_vllm_for_router_replay(policy_config)
-        vllm_kwargs = generation_config.setdefault("vllm_kwargs", {})
-
-        ## make vllm hf overrides match the training policy
-        vllm_kwargs["hf_overrides"] = policy_config.get("hf_config_overrides", {})
-
-        if enable_nemo_gym:
-            # ---- NeMo Gym: reserve vLLM ports up-front so we can hand the
-            # server URLs to NeMo Gym and spin it up while vLLM loads weights.
-            print(
-                "  ⚡ Deferred model load: reserving vLLM ports for overlapped NeMo Gym init",
-                flush=True,
-            )
-            vllm_reserve_t0 = time.perf_counter()
-            deferred_vllm = VllmGeneration(
-                cluster=inference_cluster,
-                config=generation_config,
-                defer_model_load=True,
-            )
-            vllm_reserve_time = time.perf_counter() - vllm_reserve_t0
-            print(
-                f"  ✓ Reserved {len(deferred_vllm.dp_openai_server_base_urls)} vLLM server URLs: "
-                f"{deferred_vllm.dp_openai_server_base_urls}",
-                flush=True,
-            )
-
-            def init_vllm_deferred():
-                """Complete the deferred vLLM model load started above."""
-                t0 = time.perf_counter()
-                deferred_vllm.load_and_start()
-                deferred_vllm.finish_generation()
-                return deferred_vllm, time.perf_counter() - t0
-
-            def init_nemo_gym():
-                """Spin up NeMo Gym servers with the pre-assigned vLLM URLs."""
-                return _spinup_nemo_gym(
-                    deferred_vllm.dp_openai_server_base_urls,
-                    generation_config["model_name"],
-                )
-
-            # Colocated: vLLM + policy share GPUs -> sequential; otherwise parallel.
-            init_tasks = {}
-            if colocated_inference:
-
-                def init_vllm_then_policy():
-                    pg, vllm_t = init_vllm_deferred()
-                    p, policy_t = init_policy()
-                    return pg, vllm_t, p, policy_t
-
-                init_tasks["vllm_policy"] = init_vllm_then_policy
-            else:
-                init_tasks["vllm"] = init_vllm_deferred
-                init_tasks["policy"] = init_policy
-            init_tasks["nemo_gym"] = init_nemo_gym
-
-            print(
-                f"  ⚡ Init tasks: {', '.join(init_tasks.keys())}",
-                flush=True,
-            )
-            with ThreadPoolExecutor(max_workers=len(init_tasks)) as executor:
-                submitted = {k: executor.submit(fn) for k, fn in init_tasks.items()}
-                results = {k: f.result() for k, f in submitted.items()}
-
-            if colocated_inference:
-                policy_generation, vllm_load_time, policy, policy_time = results[
-                    "vllm_policy"
-                ]
-            else:
-                policy_generation, vllm_load_time = results["vllm"]
-                policy, policy_time = results["policy"]
-            nemo_gym_actor, nemo_gym_time = results["nemo_gym"]
-            setup_timing_metrics.vllm_init_time_s = vllm_reserve_time + vllm_load_time
-            setup_timing_metrics.policy_init_time_s = policy_time
-            setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time
-        else:
-            policy_generation, policy = initialize_generation_with_policy(
-                init_generation_fn=init_vllm,
-                colocated_inference=colocated_inference,
-                setup_timing_metrics=setup_timing_metrics,
-            )
-
-        print(
-            f"  ✓ Using vLLM backend for generation with {policy_config['model_name']}",
-            flush=True,
-        )
-
-    elif backend == "sglang":
-        generation_config = cast(SGLangConfig, generation_config)
-
-        # Set model_path if not already set
-        if "model_path" not in generation_config["sglang_cfg"]:
-            generation_config["sglang_cfg"]["model_path"] = policy_config["model_name"]
-
-        policy_generation, policy = initialize_generation_with_policy(
-            init_generation_fn=init_sglang,
-            colocated_inference=colocated_inference,
-            setup_timing_metrics=setup_timing_metrics,
-        )
-
-        # Capture rollout TP size on the policy once; refit calls no longer need it.
-        policy.set_rollout_num_gpus_per_engine(policy_generation.num_gpus_per_engine)
-
-        print(
-            f"  ✓ Using SGLang backend for generation with {policy_config['model_name']}",
-            flush=True,
-        )
-
-    elif backend == "trtllm":
-        generation_config = cast(TrtllmConfig, generation_config)
-
-        def init_trtllm():
-            """Initialize TRT-LLM generation workers."""
-            t0 = time.perf_counter()
-            pg = TrtllmGeneration(cluster=inference_cluster, config=generation_config)
-            pg.finish_generation()
-            return pg, time.perf_counter() - t0
-
-        policy_generation, policy = initialize_generation_with_policy(
-            init_generation_fn=init_trtllm,
-            colocated_inference=colocated_inference,
-            setup_timing_metrics=setup_timing_metrics,
-        )
-
-        print(
-            f"  ✓ Using TRT-LLM backend for generation with {policy_config['model_name']}",
-            flush=True,
-        )
-
-        if enable_nemo_gym:
-            nemo_gym_actor, nemo_gym_time = _spinup_nemo_gym(
-                policy_generation.dp_openai_server_base_urls,
-                generation_config["model_name"],
-            )
-            setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time
-
-    elif backend == "dynamo":
-        # Managed Dynamo owns a fixed worker fleet on the inference virtual cluster.
-
-        def init_dynamo():
-            t0 = time.perf_counter()
-            generation = DynamoGeneration(
-                cluster=inference_cluster,
-                config=generation_config,
-                tokenizer=tokenizer,
-                tokenizer_config=policy_config["tokenizer"],
-            )
-            return generation, time.perf_counter() - t0
-
-        policy_generation, policy = initialize_generation_with_policy(
-            init_generation_fn=init_dynamo,
-            colocated_inference=False,
-            setup_timing_metrics=setup_timing_metrics,
-        )
-
-        if enable_nemo_gym:
-            nemo_gym_actor, nemo_gym_time = _spinup_nemo_gym(
-                policy_generation.dp_openai_server_base_urls,
-                generation_config["model_name"],
-            )
-            setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time
-
-        print(
-            f"  ✓ Using Dynamo backend (frontend: {policy_generation.frontend_url})",
-            flush=True,
-        )
-
-    # Record when worker initialization completes (for calculating other setup time)
-    worker_init_complete_time = time.perf_counter() - setup_start_time
-
-    # print the node IP and GPU ID of the policy workers for debugging
-    policy.print_node_ip_and_gpu_id()
-
-    nccl_reshard_refit_enabled = (
-        generation_config.get("refit_transport") == "nccl_reshard"
-    )
-    if nccl_reshard_refit_enabled:
-        from nemo_rl.weight_sync.nccl_reshard_utils import (
-            check_nccl_reshard_refit_support,
-        )
-
-        check_nccl_reshard_refit_support(master_config)
-
-    if generation_config.get("refit_transport") is not None and backend != "vllm":
-        raise NotImplementedError(
-            "Non-default refit transports are only supported for the vLLM "
-            f"generation backend, but policy.generation.backend={backend!r}. "
-            "Set policy.generation.refit_transport=null. Support for other "
-            "generation backends is tracked in "
-            "https://github.com/NVIDIA-NeMo/RL/issues/3288."
-        )
-
-    if backend == "megatron":
-        t0 = time.perf_counter()
-        policy_generation.weight_synchronizer = create_weight_synchronizer(
-            policy=policy,
-            generation=policy_generation,
-            generation_backend=backend,
-            colocated=colocated_inference,
-            train_cluster=train_cluster,
-            inference_cluster=None if colocated_inference else inference_cluster,
-        )
-        policy_generation.weight_synchronizer.init_communicator()
-        setup_timing_metrics.collective_init_time_s = time.perf_counter() - t0
-        if not colocated_inference:
-            # Load the model weights now.
-            t0 = time.perf_counter()
-            policy_generation.weight_synchronizer.sync_weights()
-            setup_timing_metrics.generation_init_load_time_s = time.perf_counter() - t0
-    # if it is not colocated inference, initialize collective communication for update weights
-    elif (
-        not colocated_inference
-        and remote_transport is None
-        and checkpoint_engine_config is None
-    ):
-        t0 = time.perf_counter()
-        # init collective
-        if nccl_reshard_refit_enabled or backend == "dynamo":
-            policy_generation.weight_synchronizer = create_weight_synchronizer(
-                policy=policy,
-                generation=policy_generation,
-                generation_backend=backend,
-                colocated=False,
-                train_cluster=train_cluster,
-                inference_cluster=inference_cluster,
-            )
-            policy_generation.weight_synchronizer.init_communicator()
-        else:
-            ip, port = train_cluster.get_master_address_and_port()
-            print(
-                f"Using ip: {ip}, port: {port} for collective communication",
-                flush=True,
-            )
-            train_world_size = train_cluster.world_size()
-            inference_world_size = inference_nodes * inference_gpus_per_node
-            world_size = train_world_size + inference_world_size
-            futures_train = policy.init_collective(
-                ip, port, world_size, train_world_size=train_world_size
-            )
-            futures_inference = policy_generation.init_collective(
-                ip, port, world_size, train_world_size=train_world_size
-            )  # type: ignore
-            ray.get(futures_train + futures_inference)
-        setup_timing_metrics.collective_init_time_s = time.perf_counter() - t0
-
-    if remote_transport is not None:
-        t0 = time.perf_counter()
-        assert isinstance(policy_generation, VllmGeneration)
-        assert remote_synchronizer_cls is not None
-        refit_config = generation_config["refit_cfg"]
-        assert refit_config is not None
-        policy_generation.weight_synchronizer = remote_synchronizer_cls(
-            policy,
-            policy_generation,
-            transport=remote_transport,
-            api_key_env_var=generation_config["vllm_cfg"].get(
-                "http_refit_api_key_env_var"
-            ),
-            request_timeout_s=refit_config.sparse.request_timeout_s,
-            baseline_init_refs=remote_baseline_init_refs,
-        )
-        policy_generation.weight_synchronizer.init_communicator()
-        setup_timing_metrics.extras[f"vllm_{remote_transport}_sparse_init_time_s"] = (
-            time.perf_counter() - t0
-        )
-    elif checkpoint_engine_config is not None:
-        t0 = time.perf_counter()
-        assert isinstance(policy_generation, VllmGeneration)
-        policy_generation.weight_synchronizer = create_weight_synchronizer(
-            policy=policy,
-            generation=policy_generation,
-            generation_backend=backend,
-            colocated=colocated_inference,
-            train_cluster=train_cluster,
-            inference_cluster=inference_cluster,
-        )
-        policy_generation.weight_synchronizer.init_communicator()
-        setup_timing_metrics.vllm_checkpoint_engine_init_time_s = (
-            time.perf_counter() - t0
-        )
-        print(
-            f"Using checkpoint-engine refit backend: {checkpoint_engine_config['backend']}",
-            flush=True,
-        )
-    else:
-        if getattr(
-            policy_generation, "weight_synchronizer", None
-        ) is None and _needs_hf_refit_handshake(
-            backend, nccl_reshard_refit_enabled, colocated_inference
-        ):
-            state_dict_info = policy.prepare_refit_info()
-            if policy_generation is not None:
-                policy_generation.prepare_refit_info(state_dict_info)
-
-    # Spin up non-colocated OPD teacher worker groups AFTER policy / vLLM are
-    # ready. Parallelizing with policy init races on Megatron-Bridge's HF->mcore
-    # cache (shared key when student == teacher) — both workers write to the
-    # same iter_0000000/ path and the second reader gets a truncated file.
-    teacher_worker_groups: dict[str, Any] = {}
-    alias_to_group_alias: dict[str, str] = {}
-    if enable_opd_teachers:
-        t0 = time.perf_counter()
-        teacher_worker_groups, alias_to_group_alias = (
-            opd_module.create_teacher_worker_groups(
-                master_config,
-                policy_config,
-                tokenizer,
-                teacher_clusters=teacher_clusters,
-            )
-        )
-        teacher_model_init_time = time.perf_counter() - t0
-        setup_timing_metrics.teacher_model_init_time_s = teacher_model_init_time
-        # Preserve the existing metric's end-to-end meaning while exposing the
-        # newly separated reservation and model-initialization phases.
-        setup_timing_metrics.teacher_init_time_s = (
-            teacher_reservation_time + teacher_model_init_time
-        )
-
-    # Calculate total setup time
-    total_setup_time = time.perf_counter() - setup_start_time
-    setup_timing_metrics.total_setup_time_s = total_setup_time
-    setup_timing_metrics.other_setup_time_s = (
-        total_setup_time - worker_init_complete_time
-    )
-
-    # Log worker initialization timing metrics to logger
-    print_setup_timing_summary(setup_timing_metrics, gen_init_time_key)
-    logger.log_metrics(
-        setup_timing_metrics.to_metrics_dict(), step=0, prefix="timing/setup"
-    )
-
-    print("\n" + "=" * 60)
-    print(" " * 18 + "SETUP COMPLETE")
-    print(f"  Total setup time: {total_setup_time:.1f}s")
-    print("=" * 60 + "\n", flush=True)
-
-    return (
-        policy,
-        policy_generation,
-        nemo_gym_actor,
-        (train_cluster, inference_cluster),
-        dataloader,
-        val_dataloader,
-        loss_fn,
-        logger,
-        checkpointer,
-        grpo_save_state,
-        master_config,
-        teacher_worker_groups,
-        alias_to_group_alias,
-    )
-
-
-# ===============================================================================
 # Core Algorithm Functions
 # ===============================================================================
 
@@ -1541,72 +254,6 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
                 message["generation_logprobs"] = torch.zeros_like(
                     token_ids, dtype=torch.float32
                 )
-
-def compute_dwrl_weights(
-    answer_logprobs: torch.Tensor,
-    n_thoughts: int,
-    num_pairs: int,
-    normalize_rewards: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute the three DWRL weighting tensors from verdict log-probs.
-
-    The batch is assumed to be ordered as:
-        [pair0_chosen_t0, …, pair0_chosen_{n−1},
-         pair0_rejected_t0, …, pair0_rejected_{n−1},
-         pair1_chosen_t0, …]
-    i.e. shape [num_pairs × 2 × n_thoughts] with chosen before rejected per pair.
-
-    Args:
-        answer_logprobs: [B_total] — log πφ(a | x, y, oᵢ) from the rollout,
-                          where a is the "Yes" / positive verdict token.
-        n_thoughts:        Number of thoughts sampled per response.
-        num_pairs:         Number of preference pairs in the batch.
-        normalize_rewards: Not currently used
-
-    Returns:
-        misalignment_weights: [B_total] — p̂(y⁺≺y⁻|x) broadcast to every entry.
-        group_weights:        [B_total] — ω̃ᵢ for each entry.
-        response_sign:        [B_total] — +1.0 for chosen, −1.0 for rejected.
-    """
-    # Reshape to [num_pairs, 2, n_thoughts]:
-    #   dim 1 = 0 → chosen (y⁺)
-    #   dim 1 = 1 → rejected (y⁻)
-    logprobs = answer_logprobs.view(num_pairs, 2, n_thoughts)
-
-    # ------------------------------------------------------------------
-    # Misalignment weight (Eq. 9)
-    # p̂(y⁺≺y⁻|x) = Σᵢ s⁺ᵢ / (Σᵢ s⁺ᵢ + Σᵢ s⁻ᵢ)
-    # High when chosen receives lower predicted preference than rejected.
-    # ------------------------------------------------------------------
-    r_bar = torch.logsumexp(logprobs.detach(), dim=-1, keepdim=True)
-    pref_weight = 1 - torch.sigmoid(r_bar[:, 0, :] - r_bar[:, 1, :])
-
-    # Broadcast to [num_pairs, 2, n_thoughts]
-    #misalignment_bcast = misalignment.unsqueeze(-1).unsqueeze(-1).expand(
-    #    num_pairs, 2, n_thoughts
-    #)
-    misalignment_bcast = pref_weight.unsqueeze(-1).expand(-1, 2, n_thoughts).reshape(-1)
-
-    # ------------------------------------------------------------------
-    # Group weights (Eq. 11)
-    # ω̃ᵢ = πφ(a | x, y, oᵢ) / Σⱼ πφ(a | x, y, oⱼ)
-    # Computed *separately* for chosen and rejected (each group of n).
-    # Using probabilities (not log-probs) for numerically stable softmax.
-    # ------------------------------------------------------------------
-    omega = logprobs.softmax(dim=-1)     # [num_pairs, 2, n_thoughts]
-
-    # ------------------------------------------------------------------
-    # Response sign
-    # +1 for chosen (maximise verdict logprob), −1 for rejected (minimise).
-    # ------------------------------------------------------------------
-    response_sign = torch.ones_like(logprobs)
-    response_sign[:,1,:] = -response_sign[:,1,:]
-    
-    adv = omega - omega.mean(dim=-1, keepdim=True)
-    adv = adv * n_thoughts
-
-    return misalignment_bcast, omega.view(-1), response_sign.view(-1), adv.view(-1)
-
 
 def build_thought_and_answer_masks(
     seq_len: int,
@@ -1650,7 +297,7 @@ def build_thought_and_answer_masks(
 # Training & Validation
 # ===============================================================================
 
-def dwrl_train(
+def dwrl_train_pairwise(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
     wrapped_dataloader: StatefulDataLoader | MultipleDataloaderWrapper,
@@ -2047,7 +694,110 @@ def dwrl_train(
                 policy_generation.finish_generation()
                 print("*** REPEATED_BATCH_2_CHK_MSG_LOG_CHECK: ", [x['content'] for x in repeated_batch_2_chk['message_log'][0]], flush=True)
                 raise RuntimeError("all stop")
-                '''                
+                '''
+                
+                # Calculate rewards & advantages
+                memory_tracker.snapshot_start_of_stage("Processing rewards", dir())
+                print("â–¶ Processing rewards...,", flush=True)
+                with timer.time("reward_calculation"):
+                    # Extract rewards from final_batch
+                    rewards = repeated_batch["total_reward"]
+
+                    print("â–¶ Computing advantages...", flush=True)
+                    # For DAPO with reward shaping, compute std on the raw
+                    # pre-shaping reward so dynamic sampling filters prompt
+                    # groups on the raw task metric (e.g. acc) instead of on
+                    # length-dependent shaped reward variance. Baseline
+                    # (which drives advantages) stays on the shaped reward.
+                    std_rewards = (
+                        repeated_batch["unshaped_total_reward"]
+                        if master_config.grpo.use_dynamic_sampling
+                        and "unshaped_total_reward" in repeated_batch
+                        else None
+                    )
+                    reward_group_ids = build_rollout_group_ids(
+                        repeated_batch.size,
+                        master_config.grpo.num_generations_per_prompt,
+                        start_group_id=next_rollout_group_id,
+                    )
+                    next_rollout_group_id += (
+                        repeated_batch.size
+                        // master_config.grpo.num_generations_per_prompt
+                    )
+                    # Dynamic sampling may cache and concatenate survivors from
+                    # multiple generation batches. Carry the explicit identity
+                    # through those transformations instead of rebuilding it.
+                    repeated_batch["rollout_group_ids"] = reward_group_ids
+                    if master_config.grpo.calculate_advantages_on_gpu:
+                        print("Computing advantages on GPU!")
+                        # Just fix the device id for now
+                        device_id = 0
+                        baseline, std = calculate_baseline_and_std_per_prompt(
+                            reward_group_ids.cuda(device_id),
+                            rewards.cuda(device_id),
+                            torch.ones_like(rewards).cuda(device_id),
+                            leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
+                            std_rewards=(
+                                std_rewards.cuda(device_id)
+                                if std_rewards is not None
+                                else None
+                            ),
+                        )
+                        baseline = baseline.cpu()
+                        std = std.cpu()
+                    else:
+                        baseline, std = calculate_baseline_and_std_per_prompt(
+                            reward_group_ids,
+                            rewards,
+                            torch.ones_like(rewards),
+                            leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
+                            std_rewards=std_rewards,
+                        )
+
+                    # Apply dynamic sampling to filter prompts with non-zero std (DAPO algorithm)
+                    repeated_batch, is_batch_complete, batch_cache, ds_metrics = (
+                        dynamic_sampling(
+                            repeated_batch,
+                            std,
+                            baseline,
+                            dynamic_sampling_num_gen_batches,
+                            master_config,
+                            timer,
+                            batch_cache,
+                        )
+                    )
+                    if ds_metrics:
+                        ds_metrics["dynamic_sampling_num_gen_batches"] = (
+                            dynamic_sampling_num_gen_batches
+                        )
+                    # Get the updated rewards and baselines. For DAPO, these rewards and baselines only correspond to the prompts with non-zero std.
+                    rewards = (
+                        repeated_batch["total_reward"]
+                        if not master_config.grpo.use_dynamic_sampling
+                        else repeated_batch["filtered_reward"]
+                    )
+                    baseline = repeated_batch["baseline"]
+                    std = repeated_batch["std"]
+
+                    # If the current batch is not enough to fill the buffer during dynamic sampling, we update the cache and process the next batch.
+                    if not is_batch_complete:
+                        continue
+
+                    gen_step_metrics = {}
+                    if hasattr(policy_generation, "get_step_metrics"):
+                        gen_step_metrics = policy_generation.get_step_metrics()
+
+                    # Save baseline for logging (before deletion)
+                    baseline_for_log = baseline.clone()
+
+                    # Backfill before flattening the full rollout for training.
+                    backfill_missing_routed_experts(repeated_batch["message_log"])
+
+                    # Use the sampling group itself as the GRPO identity. Distinct
+                    # media-conditioned prompts can have identical text tokens.
+                    prompt_ids_for_adv = repeated_batch.pop("rollout_group_ids")
+                    del baseline
+                    del std
 
                 with timer.time("data_processing"):
                     use_overlong_filtering = master_config.grpo.overlong_filtering
@@ -2092,6 +842,7 @@ def dwrl_train(
                             "generation_logprobs": torch.cat([flat_messages["generation_logprobs"], torch.ones(flat_messages["generation_logprobs"].shape[0], 1) * -0.69315], dim=-1),
                             "token_mask": flat_token_mask,
                             "sample_mask": repeated_batch_2["loss_multiplier"],
+                            "metadata": repeated_batch["extra_env_info"],
                             "no_position": torch.ones_like(repeated_batch_2["loss_multiplier"]).long() * no_position,
                         }
                     )
@@ -2199,117 +950,7 @@ def dwrl_train(
                 with timer.time("reward_calculation"):
                     # Extract rewards from final_batch
                     final_logprobs = train_data["prev_logprobs"].gather(-1, input_lengths.unsqueeze(-1)).squeeze(-1)
-                    bt_probs = final_logprobs.exp()
-                    if not master_config.grpo.dwrl.get("use_env_rewards", False):
-                        rewards = bt_probs
-                        repeated_batch["total_reward"] = rewards
-                    else:
-                        rewards = repeated_batch["total_reward"]
-
-                    '''
-                    print("▶ Computing advantages...", flush=True)
-                    # For DAPO with reward shaping, compute std on the raw
-                    # pre-shaping reward so dynamic sampling filters prompt
-                    # groups on the raw task metric (e.g. acc) instead of on
-                    # length-dependent shaped reward variance. Baseline
-                    # (which drives advantages) stays on the shaped reward.
-                    std_rewards = (
-                        repeated_batch["unshaped_total_reward"]
-                        if master_config.grpo.use_dynamic_sampling
-                        and "unshaped_total_reward" in repeated_batch
-                        else None
-                    )
-                    reward_group_ids = build_rollout_group_ids(
-                        repeated_batch.size,
-                        master_config.grpo.num_generations_per_prompt,
-                        start_group_id=next_rollout_group_id,
-                    )
-                    next_rollout_group_id += (
-                        repeated_batch.size
-                        // master_config.grpo.num_generations_per_prompt
-                    )
-                    # Dynamic sampling may cache and concatenate survivors from
-                    # multiple generation batches. Carry the explicit identity
-                    # through those transformations instead of rebuilding it.
-                    repeated_batch["rollout_group_ids"] = reward_group_ids
-                    if master_config.grpo.calculate_advantages_on_gpu:
-                        print("Computing advantages on GPU!")
-                        # Just fix the device id for now
-                        device_id = 0
-                        baseline, std = calculate_baseline_and_std_per_prompt(
-                            reward_group_ids.cuda(device_id),
-                            rewards.cuda(device_id),
-                            torch.ones_like(rewards).cuda(device_id),
-                            leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
-                            std_rewards=(
-                                std_rewards.cuda(device_id)
-                                if std_rewards is not None
-                                else None
-                            ),
-                        )
-                        baseline = baseline.cpu()
-                        std = std.cpu()
-                    else:
-                        baseline, std = calculate_baseline_and_std_per_prompt(
-                            reward_group_ids,
-                            rewards,
-                            torch.ones_like(rewards),
-                            leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
-                            std_rewards=std_rewards,
-                        )
-
-                    # Apply dynamic sampling to filter prompts with non-zero std (DAPO algorithm)
-                    repeated_batch, is_batch_complete, batch_cache, ds_metrics = (
-                        dynamic_sampling(
-                            repeated_batch,
-                            std,
-                            baseline,
-                            dynamic_sampling_num_gen_batches,
-                            master_config,
-                            timer,
-                            batch_cache,
-                        )
-                    )
-                    if ds_metrics:
-                        ds_metrics["dynamic_sampling_num_gen_batches"] = (
-                            dynamic_sampling_num_gen_batches
-                        )
-                    # Get the updated rewards and baselines. For DAPO, these rewards and baselines only correspond to the prompts with non-zero std.
-                    rewards = (
-                        repeated_batch["total_reward"]
-                        if not master_config.grpo.use_dynamic_sampling
-                        else repeated_batch["filtered_reward"]
-                    )
-                    baseline = repeated_batch["baseline"]
-                    std = repeated_batch["std"]
-
-                    # If the current batch is not enough to fill the buffer during dynamic sampling, we update the cache and process the next batch.
-                    if not is_batch_complete:
-                        continue
-
-                    # Save baseline for logging (before deletion)
-                    baseline_for_log = baseline.clone()
-
-                    # Backfill before flattening the full rollout for training.
-                    backfill_missing_routed_experts(repeated_batch["message_log"])
-
-                    # Use the sampling group itself as the GRPO identity. Distinct
-                    # media-conditioned prompts can have identical text tokens.
-                    prompt_ids_for_adv = repeated_batch.pop("rollout_group_ids")
-                    del baseline
-                    del std
-                    '''
-                    
-                    gen_step_metrics = {}
-                    if hasattr(policy_generation, "get_step_metrics"):
-                        gen_step_metrics = policy_generation.get_step_metrics()
-                
-                    misalignment_weights, omega, response_sign, advantages_1d = compute_dwrl_weights(
-                        answer_logprobs=rewards if master_config.grpo.dwrl.get("use_env_rewards", False) else final_logprobs,
-                        n_thoughts=master_config.grpo.num_generations_per_prompt,
-                        num_pairs=len(batch['length']) // 2,
-                        normalize_rewards=master_config.grpo.normalize_rewards,
-                    )
+                    #bt_probs = final_logprobs.exp()
                     
                     _, input_lengths_rb_1 = batched_message_log_to_flat_message(
                         [[y for y in x if y['role'] != 'environment'] for x in repeated_batch["message_log"]],
@@ -2328,19 +969,14 @@ def dwrl_train(
                     
                     ### calculate bt accuracy
                     sample_mask = repeated_batch_2["loss_multiplier"]
-                    n_thoughts = master_config.grpo.num_generations_per_prompt
+                    gt = torch.tensor([x['preference'] for x in train_data['metadata']], dtype=torch.int16, device=final_logprobs.device)
                     if sample_mask.sum() > 0:
-                        #bt_accuracy = (torch.where(final_logprobs.detach().exp() >= 0.5, 1, -1) == response_sign).sum().item() / sample_mask.sum().item()
-                        bt_accuracy = ((bt_probs.view(-1,2,n_thoughts) * sample_mask.view(-1,2,n_thoughts) * response_sign.view(-1,2,n_thoughts)).sum(dim=-2).view(-1) > 0).sum().item() / sample_mask.view(-1,2,n_thoughts).prod(dim=-2).view(-1).sum().item()
+                        bt_accuracy = (torch.where(final_logprobs.detach().exp() >= 0.5, 0, 1) == gt).sum().item() / sample_mask.sum().item()
                     else:
                         bt_accuracy = 0.0
                     
-                    train_data["misalignment_weights"] = misalignment_weights
-                    train_data["omega"] = omega
-                    train_data["response_sign"] = response_sign
                     train_data["thought_mask"] = thought_mask
                     train_data["answer_mask"] = answer_mask
-                    train_data["final_logprobs"] = final_logprobs
 
                 # Seq-level logprob error metrics/masking require real prev_logprobs
                 if skip_prev_logprobs:
@@ -2365,9 +1001,11 @@ def dwrl_train(
                     token_mask = train_data["token_mask"]
                     sample_mask = train_data["sample_mask"]
                     mask = token_mask * sample_mask.unsqueeze(-1)
-                    train_data["advantages"] = advantages_1d.unsqueeze(-1).expand(mask.shape)
+                    if not master_config.grpo.dwrl.get("use_env_rewards", True):
+                        final_probs = final_logprobs.detach().exp()
+                        rewards = torch.where(gt.bool(), 1.0 - final_probs, final_probs)
 
-                    '''
+                    
                     train_data["advantages"] = adv_estimator.compute_advantage(
                         prompt_ids=prompt_ids_for_adv,
                         rewards=rewards,
@@ -2387,18 +1025,17 @@ def dwrl_train(
                         advantages=train_data["advantages"],
                     )
                     del baseline_for_log
-                    '''
 
                     penalty_metrics = (
                         _apply_configured_message_level_advantage_penalties(
-                            train_data, repeated_batch_2["message_log"], master_config
+                            train_data, repeated_batch["message_log"], master_config
                         )
                     )
 
                     # Clip advantages to prevent extreme values from small std normalization
-                    #train_data["advantages"] = _clip_grpo_advantages(
-                    #    train_data["advantages"], master_config.grpo
-                    #)
+                    train_data["advantages"] = _clip_grpo_advantages(
+                        train_data["advantages"], master_config.grpo
+                    )
 
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
                 print("▶ Preparing for training...", flush=True)
@@ -2846,7 +1483,7 @@ def dwrl_train(
             memory_tracker.snapshot_start_of_stage("After CPU memory clear", dir())
 
             # processing rewards
-            del repeated_batch, repeated_batch_2, thought_mask, answer_mask, misalignment_weights, omega, response_sign, advantages_1d, bt_accuracy
+            del repeated_batch, repeated_batch_2, thought_mask, answer_mask, bt_accuracy
             del rewards, new_msg_log, new_fmt_list, yes_position, no_position, yes_tensor, list_with_yes, input_ids_with_yes, flat_token_mask, input_lengths_rb_1
             # train_data already deleted after logging above
             # logging
@@ -2914,10 +1551,10 @@ def validate(
         )
 
         total_rewards = []
-        total_rewards_env = []
+        bt_probs = []
         total_lengths = []
         all_message_logs = []  # Collect all message logs
-        processed_batches = []
+        results = []
 
         max_batches = (
             master_config.grpo.max_val_samples // master_config.grpo.val_batch_size
@@ -3062,8 +1699,8 @@ def validate(
             actual_rewards = prev_logprobs_with_yes.gather(-1, input_lengths.unsqueeze(-1)).squeeze(-1)
             del logprob_data, prev_logprobs_with_yes
 
-            total_rewards.extend(actual_rewards.exp().tolist())
-            total_rewards_env.extend(val_batch["total_reward"].tolist())
+            total_rewards.extend(val_batch["total_reward"].tolist())
+            bt_probs.extend(actual_rewards.exp().tolist())
             total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
 
             # Collect message logs for later display
@@ -3076,21 +1713,10 @@ def validate(
 
             all_message_logs.extend(to_env)
             
-            val_batch['rewards'] = actual_rewards.exp().cpu().tolist()
-            for sub_idx in active_indices.split(2):
-                sub = val_batch.select_indices(sub_idx)
-                processed_batches.append(sub)
+            for eei, pred in zip(val_batch["extra_env_info"], actual_rewards.exp().cpu().tolist()):
+                gt = eei["preference"]
                 
-        results = []
-        for pb in processed_batches:
-            assert len(set(pb['idx'])) == 1, "ID check failed"
-            assert len(pb['message_log']) == 2, "wrong length, should be 2"
-            assert pb["extra_env_info"][0]["preference"] == pb["extra_env_info"][-1]["preference"], "mismatched preference scores"
-
-            score_1 = pb['rewards'][0]
-            score_2 = pb['rewards'][-1]
-            
-            results.append( int(score_1 > score_2) )
+                results.append( int((pred >= 0.5 and gt == 0) or (pred < 0.5 and gt == 1)) )
 
         # Calculate validation metrics. accuracy is the mean reward over all
         # rollouts; grouped validation (val_num_generations_per_prompt > 1)
@@ -3099,7 +1725,7 @@ def validate(
         pass_k = None
         if num_samples > 0:
             rewards_t = torch.tensor(total_rewards, dtype=torch.float32)
-            reward_accuracy = rewards_t.mean().item()
+            rewards_mean = rewards_t.mean().item()
             if val_num_generations_per_prompt > 1:
                 assert num_samples % val_num_generations_per_prompt == 0, (
                     "Validation rewards must be divisible by "
@@ -3113,14 +1739,14 @@ def validate(
                     .item()
                 )
         else:
-            reward_accuracy = 0.0
+            rewards_mean = 0.0
         
-        num_samples_env = len(total_rewards_env)
+        num_samples_env = len(bt_probs)
         if num_samples_env > 0:
-            rewards_t_env = torch.tensor(total_rewards_env, dtype=torch.float32)
-            rewards_env = rewards_t_env.mean().item()
+            bt_probs_t = torch.tensor(bt_probs, dtype=torch.float32)
+            bt_probs_mean = bt_probs_t.mean().item()
         else:
-            rewards_env = 0.0
+            bt_probs_mean = 0.0
             
         if len(results) > 0:
             results_t = torch.tensor(results, dtype=torch.float32)
@@ -3134,8 +1760,8 @@ def validate(
 
         val_metrics = {
             "accuracy": accuracy,
-            "rewards": reward_accuracy,
-            "rewards_env": rewards_env,
+            "rewards": rewards_mean,
+            "bt_probs": bt_probs_mean,
             "avg_length": avg_length,
             **additional_metrics_to_report,
         }
@@ -3164,7 +1790,7 @@ def validate(
     # Print summary of validation results
     print("\n📊 Validation Results:")
     print(f"    • Accuracy: {accuracy:.4f}")
-    print(f"    • Rewards: {rewards_env:.4f}")
+    print(f"    • Rewards: {rewards_mean:.4f}")
     print(f"    • Average response length: {avg_length:.1f} tokens")
     print(f"    • Samples processed: {len(total_rewards)}", flush=True)
 
@@ -3177,8 +1803,9 @@ def validate(
     if logger is not None:
         val_log_data = {
             "content": all_message_logs,
+            "accuracy": results,
             "rewards": total_rewards,
-            "rewards_env": total_rewards_env,
+            "bt_probs": bt_probs,
         }
         logger.log_batched_dict_as_jsonl(val_log_data, f"val_data_step{step}.jsonl")
 
@@ -3271,7 +1898,7 @@ def _startup_pipeline_ready(
     )
 
 
-def async_dwrl_train(
+def async_dwrl_train_pairwise(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
     dataloader: StatefulDataLoader,

@@ -997,7 +997,7 @@ class DWRLLossFn(LossFunction):
                 if self.truncated_importance_sampling_type == "seq-mask-tis"
                 else MetricNormalizer.TOKENS
             )
-        self.ce_penalty = cfg.get("ce_penalty", 0)
+        self.ce_penalty = cfg.ce_penalty
         if self.ce_penalty is None:
             self.ce_penalty = 0
 
@@ -1656,10 +1656,10 @@ class DWRLPairwiseLossFn(LossFunction):
                 if self.truncated_importance_sampling_type == "seq-mask-tis"
                 else MetricNormalizer.TOKENS
             )
-        self.ce_penalty = cfg.get("ce_penalty", 0)
+        self.ce_penalty = cfg.ce_penalty
         if self.ce_penalty is None:
             self.ce_penalty = 0
-        self.bt_alpha = cfg.get("bt_alpha", 1.0)
+        self.bt_alpha = cfg.bt_alpha
 
     def __call__(
         self,
