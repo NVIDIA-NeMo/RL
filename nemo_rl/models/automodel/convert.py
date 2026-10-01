@@ -47,16 +47,30 @@ def convert_dcp_to_hf(
     Raises:
         FileExistsError: If HF checkpoint already exists and overwrite is False
     """
+    # Checkpoints are written at <ckpt_dir>/model. Check the input before creating
+    # the output dir, so a bad path does not leave an empty dir that blocks a rerun.
+    model_dir = os.path.join(dcp_ckpt_path, "model")
+    if not os.path.exists(os.path.join(model_dir, ".metadata")):
+        if os.path.exists(os.path.join(dcp_ckpt_path, ".metadata")):
+            raise FileNotFoundError(
+                f"{dcp_ckpt_path} holds DCP shards directly instead of under 'model/'. "
+                "This is the DTensor v1 layout (NeMo RL v0.7 and older, with _v2 unset "
+                "or false), which this converter no longer reads. Convert it with "
+                "examples/converters/convert_dcp_to_hf.py from NeMo RL v0.7.x."
+            )
+        raise FileNotFoundError(
+            f"No DCP .metadata file found in {model_dir}. Only checkpoints saved with "
+            "model_save_format='torch_save' can be converted. 'safetensors' checkpoints "
+            "are already Hugging Face format: use <dcp_ckpt_path>/model/consolidated "
+            "(written when save_consolidated is 'final' or 'every')."
+        )
+    dcp_ckpt_path = model_dir
+
     if os.path.exists(hf_ckpt_path) and not overwrite:
         raise FileExistsError(
             f"HF checkpoint already exists at {hf_ckpt_path}. Delete it to run or set overwrite=True."
         )
     os.makedirs(hf_ckpt_path, exist_ok=True)
-
-    # Checkpoints are written at <ckpt_dir>/model.
-    dcp_ckpt_path = os.path.join(dcp_ckpt_path, "model")
-    if not os.path.exists(os.path.join(dcp_ckpt_path, ".metadata")):
-        raise FileNotFoundError(f"No metadata file found in {dcp_ckpt_path}.")
 
     weights_path = os.path.join(hf_ckpt_path, "pytorch_model.bin")
     dcp_to_torch_save(dcp_ckpt_path, weights_path)
