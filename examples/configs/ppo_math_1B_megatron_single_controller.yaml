@@ -200,6 +200,8 @@ rollout_checkpointing:
     # reaches this many tokens, rather than only when a checkpoint cut fires.
     # Bounds crash exposure independently of checkpoint cadence; 0 disables it.
     generation_chunk_flush_tokens: 0
+    generation_prefix_batch_size: 256  # Checkpoint PUT rows per generation owner; 1 disables batching.
+    generation_prefix_batch_max_tokens: 4194304  # Aggregate tokens; one oversized row goes alone.
     prepare_timeout_s: 300
 
 policy:

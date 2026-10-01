@@ -28,6 +28,10 @@ import pytest
 
 nemo_gym = pytest.importorskip("nemo_gym.token_id_capture.staging")
 
+from nemo_gym.token_id_capture.staging.digest import (  # noqa: E402
+    compute_extras_digest,
+    compute_staging_digest,
+)
 from nemo_gym.token_id_capture.staging.protocols import (  # noqa: E402
     StagingSink as TokenSinkProtocol,
 )
@@ -44,6 +48,12 @@ from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
 from tests.unit.data_plane.token_capture_test_fixtures import (  # noqa: E402
     build_fixture_artifacts,
     fixture_names,
+)
+from tools.benchmark_tq_prefix_writes import (  # noqa: E402
+    BenchmarkConfig,
+    _data_plane_config,
+    _write_ranges,
+    run_prefix_write_benchmark,
 )
 
 STAGING_PARTITION = "rollout_staging_test"
@@ -258,3 +268,222 @@ def test_fetch_prefix_token_ids_rejects_duplicates(tq_client, staging_partition)
     source = TQTokenSource(tq_client, staging_partition=staging_partition)
     with pytest.raises(KeyError, match="duplicates"):
         source.fetch_prefix_token_ids(["r/c", "r/c"])
+
+
+def test_tq_prefix_write_benchmark_exercises_live_unbatched_path(tq_client):
+    partition_id = "rollout_staging_prefix_write_benchmark_test"
+    result = run_prefix_write_benchmark(
+        tq_client,
+        BenchmarkConfig(
+            rows=8,
+            prefix_tokens=4,
+            writers_per_client=2,
+            num_storage_units=1,
+            verify_rows=3,
+            verify_batch_size=2,
+            partition_id=partition_id,
+            checkpoint_id="benchmark-test",
+        ),
+    )
+
+    assert result["put_calls"] == 8
+    assert result["stored_keys"] == 8
+    assert result["verified_rows"] == 3
+    assert result["writers_used"] == 2
+    assert result["rows_per_second"] > 0
+    assert result["cleanup_seconds"] is not None
+    assert tq_client.list_sample_ids(partition_id) == []
+
+
+@pytest.mark.parametrize("batch_size,expected_calls", [(1, 8), (3, 4)])
+def test_tq_prefix_write_benchmark_uses_process_isolated_clients(
+    tq_client, batch_size, expected_calls
+):
+    partition_id = "rollout_staging_prefix_write_multi_client_test"
+    config = BenchmarkConfig(
+        rows=8,
+        prefix_tokens=4,
+        clients=2,
+        writers_per_client=1,
+        batch_size=batch_size,
+        num_storage_units=1,
+        verify_rows=3,
+        verify_batch_size=2,
+        partition_id=partition_id,
+        checkpoint_id="multi-client-benchmark-test",
+    )
+    result = run_prefix_write_benchmark(
+        tq_client,
+        config,
+        dp_config=_data_plane_config(config),
+    )
+
+    assert result["put_calls"] == expected_calls
+    assert result["stored_keys"] == 8
+    assert result["verified_rows"] == 3
+    assert result["clients_used"] == 2
+    assert result["writers_used"] == 2
+    assert result["client_setup_seconds"] > 0
+    assert result["rows_per_second"] > 0
+    assert result["cleanup_seconds"] is not None
+    assert tq_client.list_sample_ids(partition_id) == []
+
+
+def test_generation_prefix_batch_round_trips_ragged_rows(tq_client, staging_partition):
+    class RecordingClient:
+        def __init__(self):
+            self.calls = []
+
+        def put_samples(self, **kwargs):
+            self.calls.append(kwargs)
+            return tq_client.put_samples(**kwargs)
+
+    client = RecordingClient()
+    sink = TQTokenSink(client, staging_partition=staging_partition)
+    records, _, _ = build_fixture_artifacts("worked_example")
+    more_records, _, _ = build_fixture_artifacts(
+        "single_call", rollout_id="a-different-length-rollout-id"
+    )
+    records.extend(more_records)
+    results = sink.stage_generation_prefix_batch(
+        records, checkpoint_id="batch-checkpoint", chunk_sequences=[0, 2, 3]
+    )
+    assert all(result.ok for result in results)
+    assert len(client.calls) == 1
+    assert client.calls[0]["sample_ids"] == [result.staging_key for result in results]
+    assert [tag["digest"] for tag in client.calls[0]["tags"]] == [
+        record.digest for record in records
+    ]
+    source = TQTokenSource(tq_client, staging_partition=staging_partition)
+    restored = source.fetch([result.staging_key for result in results])
+    assert [row.model_dump() for row in restored] == [
+        record.model_dump(exclude={"extras"}) for record in records
+    ]
+
+
+def test_generation_prefix_batch_rejects_bad_inventory_before_writing():
+    class UnexpectedClient:
+        def put_samples(self, **kwargs):
+            pytest.fail("invalid inventory must not reach TQ")
+
+    sink = TQTokenSink(UnexpectedClient(), staging_partition="test")
+    records, _, _ = build_fixture_artifacts("single_call")
+    assert (
+        sink.stage_generation_prefix_batch(
+            [], checkpoint_id="checkpoint", chunk_sequences=[]
+        )
+        == []
+    )
+    with pytest.raises(ValueError, match="equal lengths"):
+        sink.stage_generation_prefix_batch(
+            records, checkpoint_id="checkpoint", chunk_sequences=[]
+        )
+    with pytest.raises(ValueError, match="duplicate"):
+        sink.stage_generation_prefix_batch(
+            records * 2, checkpoint_id="checkpoint", chunk_sequences=[0, 0]
+        )
+
+
+def test_generation_prefix_batch_preserves_optional_routes(
+    tq_client, staging_partition
+):
+    class RecordingClient:
+        def __init__(self):
+            self.calls = []
+
+        def put_samples(self, **kwargs):
+            self.calls.append(kwargs)
+            return tq_client.put_samples(**kwargs)
+
+    records, _, _ = build_fixture_artifacts("worked_example")
+    values = records[0].model_dump(exclude={"digest"})
+    values["extras"] = {"routed_experts": [[[1, 2]]] * records[0].delta_len}
+    values["extras_digest"] = compute_extras_digest(values["extras"])
+    values["digest"] = compute_staging_digest(
+        **{key: value for key, value in values.items() if key != "extras"}
+    )
+    records[0] = type(records[0]).model_validate(values)
+    client = RecordingClient()
+    sink = TQTokenSink(client, staging_partition=staging_partition)
+    results = sink.stage_generation_prefix_batch(
+        records, checkpoint_id="routes", chunk_sequences=[0, 0]
+    )
+    assert all(result.ok for result in results)
+    assert len(client.calls) == 2
+    assert "routed_experts" in client.calls[0]["fields"]
+    assert "routed_experts" not in client.calls[1]["fields"]
+    source = TQTokenSource(tq_client, staging_partition=staging_partition)
+    routed = source.fetch_for_finalization(
+        [results[0].staging_key], include_route_fragments=True
+    )[0]
+    assert routed.fragment is not None
+    assert routed.routed_len == records[0].delta_len
+    assert routed.snapshot.model_dump() == records[0].model_dump(exclude={"extras"})
+    plain = source.fetch([results[1].staging_key])[0]
+    assert plain.model_dump() == records[1].model_dump(exclude={"extras"})
+
+
+def test_generation_prefix_batch_failure_does_not_advertise_success():
+    class FailingClient:
+        def __init__(self):
+            self.calls = 0
+
+        def put_samples(self, **kwargs):
+            self.calls += 1
+            raise RuntimeError("injected partial batch write")
+
+    client = FailingClient()
+    sink = TQTokenSink(client, staging_partition="test")
+    records, _, _ = build_fixture_artifacts("worked_example")
+    results = sink.stage_generation_prefix_batch(
+        records, checkpoint_id="checkpoint", chunk_sequences=[0, 1]
+    )
+    assert client.calls == 1
+    assert len(results) == len(records)
+    assert all(not result.ok for result in results)
+    assert all(result.staging_key for result in results)
+    assert all("injected partial batch write" in result.error for result in results)
+
+
+def test_prefix_batch_benchmark_1000_rows_issue_four_puts():
+    class RecordingClient:
+        def __init__(self):
+            self.batches = []
+
+        def put_samples(self, **kwargs):
+            self.batches.append(list(kwargs["sample_ids"]))
+
+    client = RecordingClient()
+    sink = TQTokenSink(client, staging_partition="test")
+    timings = _write_ranges(
+        sink,
+        range(1000),
+        checkpoint_id="checkpoint",
+        prefix_tokens=4,
+        writers=1,
+        batch_size=256,
+    )
+    assert [len(batch) for batch in client.batches] == [256, 256, 256, 232]
+    assert len({key for batch in client.batches for key in batch}) == 1000
+    assert sum(timing.put_calls for timing in timings) == 4
+
+
+@pytest.mark.parametrize("batch_size,expected_calls", [(1, 11), (4, 3), (256, 1)])
+def test_tq_prefix_write_benchmark_batches_and_flushes_tail(
+    tq_client, batch_size, expected_calls
+):
+    partition_id = f"prefix_batch_benchmark_{batch_size}"
+    result = run_prefix_write_benchmark(
+        tq_client,
+        BenchmarkConfig(
+            rows=11,
+            prefix_tokens=4,
+            batch_size=batch_size,
+            partition_id=partition_id,
+            verify_rows=11,
+        ),
+    )
+    assert result["put_calls"] == expected_calls
+    assert result["stored_keys"] == 11
+    assert result["verified_rows"] == 11
+    assert tq_client.list_sample_ids(partition_id) == []
