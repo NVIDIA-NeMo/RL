@@ -16,12 +16,18 @@ name: Create PR to main with cherry-pick from release
 on:
   push:
     branches:
-      - main
+      - "r[0-9]*.[0-9]*.[0-9]*"
 
 jobs:
   cherry-pick:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cherry_pick.yml@8ebb3aec4c246c944a25adc7b09107cbd6a76976 # v0.63.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cherry_pick.yml@7eff97bbc707dfb2d66637ec61953fd6b98cd4ee # v1.12.0
+    with:
+      target-branch: main
+      trigger-label: cherry-pick-to-main
+      notify-mention: "<!subteam^S0C1W14AHS7>"
+      default-cicd-label: ""
+      app-id: ${{ vars.BOT_ID }}
     secrets:
-      PAT: ${{ secrets.PAT }}
+      BOT_KEY: ${{ secrets.BOT_KEY }}
       SLACK_WEBHOOK_ADMIN: ${{ secrets.SLACK_WEBHOOK_ADMIN }}
       SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
