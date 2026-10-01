@@ -3306,6 +3306,7 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(monkeypatch) -> Non
         tokenizer=tokenizer,
         enable_router_replay=False,
         use_fastokens=False,
+        turn_checkpointing_enabled=False,
     )
 
 
@@ -3687,6 +3688,7 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
         tokenizer=tokenizer,
         enable_router_replay=False,
         use_fastokens=False,
+        turn_checkpointing_enabled=False,
     )
 
 

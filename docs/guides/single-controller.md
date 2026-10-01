@@ -237,9 +237,10 @@ checkpoint exists.
 
 :::{note}
 Completed groups are restored directly from the TQ snapshot. For unfinished
-token-capture groups, `rollout_recovery.default_granularity` controls both live
-failure and restart behavior:
+token-capture groups, `rollout_recovery.target_level` selects the requested
+restart boundary:
 
+- `turn` requests coordinated Gym participant recovery from the last saved turn.
 - `sibling` preserves each sealed sibling and redispatches only unfinished ones.
 - `prompt_group` retries every sibling in the group when any sibling is unfinished.
 
@@ -247,16 +248,19 @@ failure and restart behavior:
 `prompt_group` when every generation in a recovered group must come from the
 policy weights live at redispatch.
 
-`task_source_granularity_overrides` can select the policy using the Gym
+`task_source_target_level_overrides` can coarsen the target using the Gym
 `task_source` embedded in the raw rollout row. Unlike `agent_ref`, this identity
 is available before Gym resolves the concrete agent and SC reserves the recovery
 group. When a row already carries an `agent_ref`, a matching
-`agent_granularity_overrides` entry wins over a matching task-source entry,
+`agent_target_level_overrides` entry wins over a matching task-source entry,
 mirroring Gym's concrete-route precedence. Otherwise the task-source override,
 then the global default, applies. The agent map also keeps datasets collated
 before Gym recorded `task_source` working, although re-collating them is
-recommended. Non-default policies require `token_capture.enabled: true`. The
-task source and resolved policy are persisted in `rollout_recovery.pt`, so
+recommended. Overrides may only select a coarser level than the global target.
+Until Gym advertises group-scoring capabilities, configure group-scored routes
+such as GenRM explicitly as `prompt_group`. Non-default policies require
+`token_capture.enabled: true`. The task source and resolved policy are persisted
+in `rollout_recovery.pt`, so
 recovery does not reinterpret an existing group using changed configuration. A
 generation that already finished keeps its tokens in the token-capture staging
 area, so `sibling` reuses them unchanged; a redispatched sibling produces a new

@@ -39,6 +39,7 @@ from nemo_rl.experience.rollout_recovery import (
     PromptGroupRecoveryRecord,
     PromptRef,
     RecoveryGranularity,
+    RecoveryTargetLevel,
     RolloutAttemptRecord,
     RolloutAttemptStatus,
     RolloutRecoveryLedger,
@@ -424,13 +425,13 @@ def test_checkpoint_cut_can_guard_a_ledger_mutation() -> None:
 
 def test_recovery_config_resolves_agent_then_task_source_then_default() -> None:
     config = RolloutRecoveryConfig(
-        default_granularity=RecoveryGranularity.SIBLING,
-        task_source_granularity_overrides={
-            "genrm_compare": RecoveryGranularity.PROMPT_GROUP,
+        target_level=RecoveryTargetLevel.TURN,
+        task_source_target_level_overrides={
+            "genrm_compare": RecoveryTargetLevel.PROMPT_GROUP,
         },
-        agent_granularity_overrides={
-            "legacy_genrm_agent": RecoveryGranularity.PROMPT_GROUP,
-            "sibling_agent": RecoveryGranularity.SIBLING,
+        agent_target_level_overrides={
+            "legacy_genrm_agent": RecoveryTargetLevel.PROMPT_GROUP,
+            "sibling_agent": RecoveryTargetLevel.SIBLING,
         },
     )
 
@@ -465,12 +466,26 @@ def test_recovery_config_resolves_agent_then_task_source_then_default() -> None:
 
     assert source_policy.task_source == "genrm_compare"
     assert source_policy.granularity is RecoveryGranularity.PROMPT_GROUP
+    assert source_policy.restore_level is RecoveryTargetLevel.PROMPT_GROUP
     assert agent_policy.task_source == "genrm_compare"
     assert agent_policy.granularity is RecoveryGranularity.SIBLING
+    assert agent_policy.restore_level is RecoveryTargetLevel.SIBLING
     assert default_policy.task_source == "other"
     assert default_policy.granularity is RecoveryGranularity.SIBLING
+    assert default_policy.restore_level is RecoveryTargetLevel.TURN
     assert legacy_policy.task_source is None
     assert legacy_policy.granularity is RecoveryGranularity.PROMPT_GROUP
+    assert legacy_policy.restore_level is RecoveryTargetLevel.PROMPT_GROUP
+
+
+def test_recovery_overrides_may_only_make_the_target_coarser() -> None:
+    with pytest.raises(ValueError, match="may only force a coarser recovery level"):
+        RolloutRecoveryConfig(
+            target_level=RecoveryTargetLevel.SIBLING,
+            agent_target_level_overrides={
+                "too-fine": RecoveryTargetLevel.TURN,
+            },
+        )
 
 
 @pytest.mark.parametrize(
@@ -498,7 +513,7 @@ def test_recovery_config_rejects_malformed_prompt_identity(
 
 
 def test_recovery_config_rejects_removed_task_name_override() -> None:
-    with pytest.raises(ValueError, match="task_source_granularity_overrides"):
+    with pytest.raises(ValueError, match="target_level"):
         RolloutRecoveryConfig(
             **{
                 "task_granularity_overrides": {
@@ -831,7 +846,7 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
     assert rewards == [0.0, 1.0]
     assert mask_sample == [True, False]
 
-    state["schema_version"] = 3
+    state["schema_version"] = ROLLOUT_RECOVERY_SCHEMA_VERSION + 1
     with pytest.raises(ValueError, match="Unsupported rollout-recovery schema version"):
         RolloutRecoveryLedger.from_state_dict(state)
 
@@ -856,6 +871,7 @@ def test_prompt_group_restart_retries_every_sibling_when_one_is_unfinished() -> 
     state = ledger.state_dict()
     assert state["groups"][0]["task_source"] == "genrm_compare"
     assert state["groups"][0]["recovery_granularity"] == "prompt_group"
+    assert state["groups"][0]["restore_level"] == "prompt_group"
 
     restored = RolloutRecoveryLedger.from_state_dict(state)
     _mutate(lambda cut: restored.prepare_for_restart(cut))
@@ -863,6 +879,7 @@ def test_prompt_group_restart_retries_every_sibling_when_one_is_unfinished() -> 
 
     assert recovered.task_source == "genrm_compare"
     assert recovered.recovery_granularity is RecoveryGranularity.PROMPT_GROUP
+    assert recovered.restore_level is RecoveryTargetLevel.PROMPT_GROUP
     assert [sibling.current_attempt.status for sibling in recovered.siblings] == [
         RolloutAttemptStatus.ABANDONED,
         RolloutAttemptStatus.ABANDONED,
@@ -874,6 +891,31 @@ def test_prompt_group_restart_retries_every_sibling_when_one_is_unfinished() -> 
         RolloutAttemptStatus.RESERVED,
         RolloutAttemptStatus.RESERVED,
     ]
+
+
+def test_turn_restore_target_is_persisted_separately_from_live_retry() -> None:
+    ledger = RolloutRecoveryLedger()
+    _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=2,
+        target_step=7,
+        start_weight_version=6,
+        recovery_granularity=RecoveryGranularity.SIBLING,
+        restore_level=RecoveryTargetLevel.TURN,
+        admitted=True,
+    )
+
+    state = ledger.state_dict()
+    assert state["groups"][0]["recovery_granularity"] == "sibling"
+    assert state["groups"][0]["restore_level"] == "turn"
+
+    restored = RolloutRecoveryLedger.from_state_dict(state).get_group("g7")
+    assert restored.recovery_granularity is RecoveryGranularity.SIBLING
+    assert restored.restore_level is RecoveryTargetLevel.TURN
 
 
 def test_prompt_group_restart_keeps_a_fully_sealed_group() -> None:
@@ -1006,6 +1048,8 @@ def test_checkpoint_rejects_ambiguous_finalization_state(
     [
         ("recovery_granularity", "banana", "invalid recovery_granularity"),
         ("recovery_granularity", None, "recovery_granularity must be a string"),
+        ("restore_level", "banana", "invalid restore_level"),
+        ("restore_level", None, "restore_level must be a string"),
         ("task_source", 123, "task_source must be a string or None"),
     ],
 )
