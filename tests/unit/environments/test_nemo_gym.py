@@ -42,6 +42,7 @@ from nemo_rl.environments.nemo_gym import (
     ExternalServiceReadinessConfig,
     NemoGym,
     NemoGymConfig,
+    _count_structured_response_tokens,
     _wait_for_external_services,
     build_reward_component_columns,
     extract_external_service_readiness,
@@ -71,10 +72,37 @@ from nemo_rl.models.generation.vllm import VllmGeneration
 from tests.unit.models.generation.test_vllm_generation import (
     basic_vllm_test_config,
     cluster,  # noqa: F401
-)
-from tests.unit.models.generation.test_vllm_generation import (
     tokenizer as nemo_gym_tokenizer,  # noqa: F401
 )
+
+
+class _WhitespaceTokenizer:
+    def __init__(self):
+        self.encoded = []
+
+    def encode(self, text, add_special_tokens=False):
+        assert add_special_tokens is False
+        self.encoded.append(text)
+        return text.split()
+
+
+def test_count_structured_response_tokens_strips_text():
+    tokenizer = _WhitespaceTokenizer()
+
+    assert _count_structured_response_tokens(
+        "  think carefully  ", "  final answer\n", tokenizer
+    ) == (2, 2)
+    assert tokenizer.encoded == ["think carefully", "final answer"]
+
+
+def test_count_structured_response_tokens_allows_one_empty_component():
+    assert _count_structured_response_tokens(
+        "", "answer only", _WhitespaceTokenizer()
+    ) == (0, 2)
+
+
+def test_count_structured_response_tokens_rejects_missing_text():
+    assert _count_structured_response_tokens("", "", _WhitespaceTokenizer()) is None
 
 
 def test_multimodal_content_types_cover_responses_media_aliases():
@@ -1219,20 +1247,30 @@ def test_nemo_gym_postprocess_uses_batch_decode():
         def __init__(self):
             self.batch_decode_calls = []
 
+        def encode(self, text, add_special_tokens=False):
+            assert add_special_tokens is False
+            return text.split()
+
         def batch_decode(self, batch):
             self.batch_decode_calls.append([list(token_ids) for token_ids in batch])
             return [" ".join(map(str, token_ids)) for token_ids in batch]
 
     tokenizer = _Tokenizer()
     nemo_gym_result = {
+        "reasoning_text": "think carefully",
+        "answer_text": "final answer",
         "response": {
             "output": [
                 {
+                    "type": "reasoning",
+                    "summary": [{"text": "think carefully"}],
                     "prompt_token_ids": [1, 2],
                     "generation_token_ids": [3],
                     "generation_log_probs": [-0.1],
                 },
                 {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "final answer"}],
                     "prompt_token_ids": [1, 2, 3, 4, 5],
                     "generation_token_ids": [6, 7],
                     "generation_log_probs": [-0.2, -0.3],
@@ -1259,6 +1297,9 @@ def test_nemo_gym_postprocess_uses_batch_decode():
     assert result["message_log"][1]["token_ids"].tolist() == [3]
     assert result["message_log"][2]["token_ids"].tolist() == [4, 5]
     assert result["message_log"][3]["token_ids"].tolist() == [6, 7]
+    assert result["reasoning_token_count"] == 2
+    assert result["response_token_count"] == 2
+    assert result["token_extraction_valid"] is True
     assert nemo_gym_result["response"]["output"][0]["prompt_str"] == "1 2"
     assert nemo_gym_result["response"]["output"][0]["generation_str"] == "3"
     assert nemo_gym_result["response"]["output"][1]["prompt_str"] == "1 2 3 4 5"
@@ -1782,6 +1823,9 @@ def test_nemo_gym_sanity(
     def _standardize_single_result(d: dict):
         d = deepcopy(d)
         d.pop("full_result", None)
+        d.pop("reasoning_token_count", None)
+        d.pop("response_token_count", None)
+        d.pop("token_extraction_valid", None)
 
         # We remove these fields and message from comparison since we cannot guarantee exact generation reproducibility
         d["message_log"] = d["message_log"][:2]

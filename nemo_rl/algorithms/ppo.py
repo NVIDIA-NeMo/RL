@@ -1402,6 +1402,9 @@ def ppo_train(
                                 wandb_enabled=master_config.logger["wandb_enabled"],
                                 wandb_config=master_config.logger["wandb"],
                             ),
+                            num_generations_per_prompt=(
+                                master_config.ppo.num_generations_per_prompt
+                            ),
                             max_rollout_turns=None,
                             greedy=False,
                         )

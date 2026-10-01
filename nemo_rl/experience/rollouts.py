@@ -25,6 +25,7 @@ from collections.abc import AsyncGenerator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
 
+import numpy as np
 import ray
 import torch
 from pydantic import BaseModel
@@ -2339,6 +2340,7 @@ async def run_async_nemo_gym_rollout(
     thinking_tags: list[str] | tuple[str, ...] | None = None,
     mask_env_flagged_samples: bool = True,
     returns_entire_batch: bool = False,
+    reward_group_size: int | None = None,
     sampling_params: Optional[GenerationSamplingParams] = None,
     deduplicate_multimodal_data: bool = False,
     debug_payload_metrics: bool = False,
@@ -2375,6 +2377,9 @@ async def run_async_nemo_gym_rollout(
         returns_entire_batch: Whether to treat the input as one potentially
             heterogeneous group. This requires ``num_generations`` to equal the
             batch size and is used by synchronous callers.
+        reward_group_size: Actual generations per prompt when a synchronous
+            caller combines multiple prompt groups into one returned batch;
+            used only to compute per-prompt reward diagnostics correctly.
         sampling_params: Sampling profile stamped onto every NeMo-Gym row.
             ``None`` uses the train profile from ``generation_config``;
             validation passes its own profile explicitly.
@@ -2454,6 +2459,10 @@ async def run_async_nemo_gym_rollout(
         raise ValueError(
             "returns_entire_batch requires num_generations to equal the batch size"
         )
+    if reward_group_size is not None and (
+        reward_group_size <= 0 or len(nemo_gym_rows) % reward_group_size != 0
+    ):
+        raise ValueError("reward_group_size must evenly divide the rollout batch")
     # Media is restored by row index: result[0] uses message_log[0], result[1]
     # uses message_log[1], and so on. Reject mismatches instead of attaching a
     # video's tensors to the wrong prompt.
@@ -2554,6 +2563,7 @@ async def run_async_nemo_gym_rollout(
                         length_penalty_config=length_penalty_config,
                         thinking_tags=thinking_tags,
                         mask_env_flagged_samples=mask_env_flagged_samples,
+                        reward_group_size=reward_group_size,
                     )
                     if accumulator.is_complete:
                         final_rollout_result = rollout_result
@@ -2584,6 +2594,7 @@ def run_nemo_gym_rollout_sync(
     task_to_env: dict[str, EnvironmentInterface],
     generation_config: GenerationConfig,
     log_full_result_tables: bool,
+    num_generations_per_prompt: int,
     max_seq_len: Optional[int] = None,
     max_rollout_turns: Optional[int] = None,
     greedy: bool = False,
@@ -2612,6 +2623,8 @@ def run_nemo_gym_rollout_sync(
         generation_config: Sampling parameters forwarded to every NeMo-Gym row.
         log_full_result_tables: Whether to include complete per-agent result
             payloads as W&B Tables in the rollout metrics.
+        num_generations_per_prompt: Number of adjacent rows belonging to each
+            prompt; used only to compute per-group diagnostics.
         max_seq_len: Policy sequence-length limit used for compatibility validation.
         max_rollout_turns: Must be ``None`` because NeMo-Gym owns turn limits.
         greedy: Must be ``False`` because this path does not support greedy mode.
@@ -2658,6 +2671,7 @@ def run_nemo_gym_rollout_sync(
             thinking_tags=thinking_tags,
             mask_env_flagged_samples=mask_env_flagged_samples,
             returns_entire_batch=True,
+            reward_group_size=num_generations_per_prompt,
             sampling_params=sampling_params,
             deduplicate_multimodal_data=deduplicate_multimodal_data,
             debug_payload_metrics=debug_payload_metrics,
@@ -2668,6 +2682,67 @@ def run_nemo_gym_rollout_sync(
         return rollout_result
 
     return asyncio.run(_consume_rollout())
+
+
+def _single_group_reward_diagnostics(results: list[dict]) -> dict[str, float]:
+    """Summarize reward variation within one prompt's generations."""
+    metrics: dict[str, float] = {}
+    total_rewards = [float(result["full_result"]["reward"]) for result in results]
+    if total_rewards:
+        metrics["zero_advantage_group_pct"] = (
+            100.0 if len(set(total_rewards)) == 1 else 0.0
+        )
+        if len(total_rewards) > 1:
+            metrics["total_reward/std_in_group"] = statistics.stdev(total_rewards)
+
+    # Require every response to have a numeric raw score; parse failures must
+    # not be silently counted as zeros or ties.
+    for key in ("reward_score_raw", "reward_overall_raw"):
+        values = [result["full_result"].get(key) for result in results]
+        if not values or not all(
+            isinstance(value, (int, float)) and not isinstance(value, bool)
+            for value in values
+        ):
+            continue
+        numeric_values = [float(value) for value in values]
+        pair_count = len(numeric_values) * (len(numeric_values) - 1) // 2
+        tie_count = sum(
+            left == right
+            for index, left in enumerate(numeric_values)
+            for right in numeric_values[index + 1 :]
+        )
+        metrics[f"{key}/all_equal_in_group_pct"] = (
+            100.0 if len(set(numeric_values)) == 1 else 0.0
+        )
+        if pair_count:
+            metrics[f"{key}/pairwise_tie_pct"] = 100.0 * tie_count / pair_count
+            metrics[f"{key}/std_in_group"] = statistics.stdev(numeric_values)
+    return metrics
+
+
+def _group_reward_diagnostics(
+    results: list[dict], group_size: int | None = None
+) -> dict[str, float]:
+    """Compute diagnostics over the actual prompt groups in ``results``."""
+    if group_size is None or group_size == len(results):
+        return _single_group_reward_diagnostics(results)
+    if group_size <= 0 or len(results) % group_size:
+        raise ValueError("group_size must evenly divide results")
+
+    per_group = [
+        _single_group_reward_diagnostics(results[start : start + group_size])
+        for start in range(0, len(results), group_size)
+    ]
+    metrics: dict[str, float] = {}
+    for key in set().union(*(group.keys() for group in per_group)):
+        values = [group[key] for group in per_group if key in group]
+        if key.endswith("/std_in_group"):
+            metrics[f"{key}/mean"] = sum(values) / len(values)
+            metrics[f"{key}/p05"] = float(np.percentile(values, 5))
+            metrics[f"{key}/p95"] = float(np.percentile(values, 95))
+        else:
+            metrics[key] = sum(values) / len(values)
+    return metrics
 
 
 def _postprocess_single_nemo_gym_group(
@@ -2684,6 +2759,7 @@ def _postprocess_single_nemo_gym_group(
     length_penalty_config: dict[str, Any] | BaseModel | None = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
     mask_env_flagged_samples: bool = True,
+    reward_group_size: int | None = None,
 ) -> NemoGymRolloutResult:
     """Postprocess one complete prompt group from the NeMo-Gym stream."""
     # Length-based reward shaping for low-effort prompts
@@ -2697,6 +2773,26 @@ def _postprocess_single_nemo_gym_group(
         reward_penalty_config, tokenizer, thinking_tags=thinking_tags
     )
     penalty_counts = apply_reward_penalties(results, resolved_reward_penalty_config)
+    shared_genrm_metrics = (
+        "reward_score_raw",  # Selected score source before length/style shaping.
+        "reward_rubric_mean_clean",  # Rubric mean, omitted when any rubric comparison failed.
+        "reward_overall_raw",  # GenRM overall score before shaping.
+        "reward_overall_len_adjusted",  # Overall score after length/style shaping.
+        "reward_length_adjustment",  # Difference between adjusted and raw overall scores.
+        "genrm_parse_failure_rate_per_group",  # Overall-score parse failures.
+        "genrm_rubric_parse_failure_rate_per_group",  # Rubric-score parse failures.
+        "genrm_api_error_rate_per_group",  # GenRM request failures.
+        "genrm_input_tokens_per_comparison_mean",
+        "genrm_input_tokens_per_comparison_p50",
+        "genrm_input_tokens_per_comparison_p95",
+        "genrm_output_tokens_per_comparison_mean",
+        "genrm_output_tokens_per_comparison_p50",
+        "genrm_output_tokens_per_comparison_p95",
+        "genrm_output_tokens_total_per_group",
+        "genrm_max_output_tokens_hit_rate_per_group",
+    )
+
+    group_reward_metrics = _group_reward_diagnostics(results, reward_group_size)
 
     if length_penalty_config is not None:
         grpo_config = (
@@ -2759,18 +2855,25 @@ def _postprocess_single_nemo_gym_group(
                     ),
                     default=0,
                 ),
+                "reasoning_tokens": r["reasoning_token_count"],
+                "response_tokens": r["response_token_count"],
+                "token_extraction_valid": r["token_extraction_valid"],
             }
             for r in results
         ]
-
     # Aggregate metrics across all samples
     with timer.time(f"{timer_prefix}/aggregate_metrics"):
         turn_counts = [m["turn_count"] for m in all_sample_metrics]
         max_gen_tokens_per_turn_values = [
             m["max_gen_tokens_per_turn"] for m in all_sample_metrics
         ]
-
+        valid_token_counts = [
+            m for m in all_sample_metrics if m["token_extraction_valid"]
+        ]
+        reasoning_token_values = [m["reasoning_tokens"] for m in valid_token_counts]
+        response_token_values = [m["response_tokens"] for m in valid_token_counts]
         rollout_metrics = {
+            **group_reward_metrics,
             **calculate_single_metric(
                 turn_counts,
                 batch_size,
@@ -2805,6 +2908,8 @@ def _postprocess_single_nemo_gym_group(
             / batch_size,
             "truncation_rate": sum(m["hit_max_tokens"] for m in all_sample_metrics)
             / batch_size,
+            "reasoning_response_token_extraction_failure_rate": 1
+            - len(valid_token_counts) / batch_size,
             # TODO enable this metric. We don't have a clear handle on which tokens are user or tool role.
             # We would probably need to re-tokenize the messages post-hoc to kind of figure this out.
             # "mean_env_tokens_per_sample": sum(
@@ -2812,6 +2917,26 @@ def _postprocess_single_nemo_gym_group(
             # )
             # / batch_size,
         }
+        for key, values in (
+            ("reasoning_tokens_per_sample", reasoning_token_values),
+            ("response_tokens_per_sample", response_token_values),
+        ):
+            if values:
+                rollout_metrics.update(
+                    calculate_single_metric(values, len(values), key)
+                )
+                rollout_metrics[f"{key}/p05"] = pct(values, 5)
+                rollout_metrics[f"{key}/p95"] = pct(values, 95)
+        for key in shared_genrm_metrics:
+            values = [
+                float(result["full_result"][key])
+                for result in results
+                if isinstance(result["full_result"].get(key), (bool, int, float))
+            ]
+            if values:
+                rollout_metrics.update(
+                    calculate_single_metric(values, len(values), key)
+                )
 
     # Per-agent misc metrics
     with timer.time(f"{timer_prefix}/per_agent_misc_metrics"):
@@ -2834,8 +2959,10 @@ def _postprocess_single_nemo_gym_group(
                 agent_truncations
             ) / len(agent_truncations)
 
-            keys = agent_results[0].keys()
+            keys = set().union(*(result.keys() for result in agent_results))
             for key in keys:
+                if key in shared_genrm_metrics:
+                    continue
                 values = [
                     float(r[key])
                     for r in agent_results
@@ -2844,7 +2971,7 @@ def _postprocess_single_nemo_gym_group(
                 if values:
                     per_agent_metrics.update(
                         calculate_single_metric(
-                            values, len(agent_results), f"{agent_name}/{key}"
+                            values, len(values), f"{agent_name}/{key}"
                         )
                     )
 

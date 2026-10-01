@@ -253,6 +253,7 @@ class SyncRolloutActor:
                     wandb_enabled=cfg.logger["wandb_enabled"],
                     wandb_config=cfg.logger["wandb"],
                 ),
+                num_generations_per_prompt=group_size,
                 effort_config=EffortLevelsConfig.model_validate(
                     cfg.env["nemo_gym"].get("effort_levels")
                 )
