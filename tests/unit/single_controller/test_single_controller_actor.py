@@ -1244,7 +1244,11 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs(tmp_path) -> Non
                 {
                     "input_ids": torch.tensor([[10, 11, 12], [20, 21, 22]]),
                     "input_lengths": torch.tensor([3, 3]),
-                    "prompt_ids_for_adv": torch.zeros(2, 3, dtype=torch.long),
+                    # Prompts of different lengths come back from TQ jagged.
+                    "prompt_ids_for_adv": torch.nested.as_nested_tensor(
+                        [torch.tensor([10, 11]), torch.tensor([20])],
+                        layout=torch.jagged,
+                    ),
                     "total_reward": torch.zeros(2),
                     "token_mask": torch.tensor([[1.0, 1.0, 1.0], [1.0, 0.0, 0.0]]),
                     "sample_mask": torch.ones(2),
@@ -1311,6 +1315,8 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs(tmp_path) -> Non
         "repeated_batch",
     }
     assert "logprobs_policy" not in captured_kwargs
+    # The estimator keeps the dense, zero-padded prompt matrix it groups on.
+    assert captured_kwargs["prompt_ids"].tolist() == [[10, 11], [20, 0]]
     assert torch.allclose(
         captured_kwargs["teacher_logprobs"] - captured_kwargs["prev_logprobs"],
         torch.full((2, 3), 0.25),
@@ -1342,6 +1348,8 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs(tmp_path) -> Non
         torch.testing.assert_close(torch.tensor(row["advantages"][0]), written_row)
     assert dumped[0]["teacher_logprobs"] == [[0.75, 0.75, 0.75]]
     assert dumped[0]["prev_logprobs"] == [[0.5, 0.5, 0.5]]
+    # The dump writes each row's real prompt, without the estimator's padding.
+    assert [row["prompt_ids"] for row in dumped] == [[[10, 11]], [[20]]]
 
 
 def test_pooled_opd_metrics_weight_unequal_chunks_by_valid_token_count() -> None:

@@ -25,7 +25,9 @@ import torch
 class TrainDataDump:
     """Write chunks to a partial file, publishing only a completed optimizer step.
 
-    Sequence columns are trimmed to input_lengths (padding only). Masked rows
+    Sequence columns are trimmed to input_lengths (padding only). Scalar
+    columns are written per row as given, so variable-length values such as
+    prompt_ids must be passed as jagged tensors rather than padded. Masked rows
     are retained. Values use the legacy train_data JSONL singleton-batch shape.
     A failed step leaves a .partial file, never a completed-looking JSONL file.
     """
@@ -48,15 +50,19 @@ class TrainDataDump:
         if self.step is not None and self.step != step:
             raise RuntimeError("Training dump has an unpublished previous step")
         lengths = input_lengths.detach().cpu().reshape(-1).tolist()
-        columns = {k: v.detach().cpu() for k, v in {**sequences, **scalars}.items()}
+        # unbind() splits dense and jagged columns alike into per-row tensors.
+        columns = {
+            k: list(v.detach().cpu().unbind())
+            for k, v in {**sequences, **scalars}.items()
+        }
         if (
             len(lengths) != len(sample_ids)
             or any(len(v) != len(sample_ids) for v in columns.values())
             or (tags is not None and len(tags) != len(sample_ids))
         ):
             raise ValueError("Training dump column lengths do not match sample ids")
-        for length in lengths:
-            if length < 0 or any(length > columns[k].shape[1] for k in sequences):
+        for i, length in enumerate(lengths):
+            if length < 0 or any(length > columns[k][i].shape[0] for k in sequences):
                 raise ValueError("Training dump input length exceeds a sequence column")
         self.log_dir.mkdir(parents=True, exist_ok=True)
         partial = self.log_dir / f"train_data_step{step + 1}.jsonl.partial"
@@ -72,7 +78,7 @@ class TrainDataDump:
                     "metadata": [tags[i] if tags is not None else {}],
                 }
                 for key in sequences:
-                    row[key] = [columns[key][i, :length].tolist()]
+                    row[key] = [columns[key][i][:length].tolist()]
                 for key in scalars:
                     row[key] = [columns[key][i].tolist()]
                 stream.write(json.dumps(row) + "\n")

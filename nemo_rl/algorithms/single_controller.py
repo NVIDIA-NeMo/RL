@@ -5387,7 +5387,9 @@ class SingleControllerActor:
                         "sample_loss_mask": final_sample_mask,
                         "pre_seq_error_sample_loss_mask": pre_seq_error_sample_mask,
                         "rewards": rewards,
-                        "prompt_ids": prompt_ids,
+                        # Raw column: jagged when the chunk mixes prompt
+                        # lengths, so rows carry no zero padding.
+                        "prompt_ids": data[adv_cfg.prompt_ids_field],
                     },
                 )
 

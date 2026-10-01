@@ -82,7 +82,7 @@ def chunk() -> dict[str, Any]:
             "sample_loss_mask": torch.tensor([1, 0]),
             "pre_seq_error_sample_loss_mask": torch.tensor([1, 1]),
             "rewards": torch.tensor([0.5, -1.0]),
-            "prompt_ids": torch.tensor([7, 8]),
+            "prompt_ids": torch.tensor([[7, 8], [7, 8]]),
         },
     }
 
@@ -166,6 +166,36 @@ def test_invalid_chunk_leaves_dump_unchanged(
     assert {p.name: p.read_bytes() for p in tmp_path.iterdir()} == before
     assert writer.rows == (2 if existing_chunk else 0)
     assert writer.step == (0 if existing_chunk else None)
+
+
+def test_jagged_columns_dump_real_rows_without_padding(tmp_path: Path) -> None:
+    # Two prompt groups with different prompt lengths: the data plane returns
+    # prompt_ids jagged, and padding them would append fake 0 tokens.
+    def jagged(rows: list[list[int]]) -> torch.Tensor:
+        return torch.nested.as_nested_tensor(
+            [torch.tensor(row) for row in rows], layout=torch.jagged
+        )
+
+    prompts = [[5, 6, 7], [5, 6, 7], [9, 8], [9, 8]]
+    tokens = [[5, 6, 7, 1, 2], [5, 6, 7, 3], [9, 8, 4], [9, 8, 5, 6]]
+    args = dict(
+        sample_ids=["p0_g0", "p0_g1", "p1_g0", "p1_g1"],
+        tags=None,
+        sequences={"token_ids": jagged(tokens)},
+        scalars={"prompt_ids": jagged(prompts)},
+    )
+    writer = TrainDataDump(str(tmp_path))
+    with pytest.raises(ValueError, match="input length"):
+        # Validation is per row: 5 fits row 0 but exceeds jagged row 3.
+        writer.add_chunk(step=0, input_lengths=torch.tensor([5, 4, 3, 5]), **args)
+    writer.add_chunk(step=0, input_lengths=torch.tensor([5, 4, 3, 4]), **args)
+    writer.finish_step(0)
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "train_data_step1.jsonl").read_text().splitlines()
+    ]
+    assert [row["prompt_ids"] for row in rows] == [[p] for p in prompts]
+    assert [row["token_ids"] for row in rows] == [[t] for t in tokens]
 
 
 def test_zero_length_and_missing_optional_columns(
