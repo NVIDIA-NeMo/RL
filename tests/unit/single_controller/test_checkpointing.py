@@ -1805,7 +1805,11 @@ class TestPeriodicRolloutCheckpoint:
             actor._train_steps = 1
             actor._trainer_version = 1
             try:
-                asyncio.run(actor._save_checkpoint({}, is_policy_training_step=True))
+                asyncio.run(
+                    actor._save_checkpoint(
+                        {}, is_policy_training_step=True, is_final_checkpoint=False
+                    )
+                )
             finally:
                 actor._checkpointer.shutdown()
             snapshot = tmp_path / "checkpoints" / "step_1"
