@@ -171,6 +171,45 @@ class StagedMediaTensors:
     def patch_size(self) -> int:
         return int(math.isqrt(int(self.imgs.shape[-1]) // 3))
 
+    @property
+    def item_sizes(self) -> MediaItemSizes:
+        """The ``(height, width)`` rows of each media item, see ``media_item_sizes``."""
+        return media_item_sizes(self.imgs_sizes, self.num_frames)
+
+
+# One entry per media item; each item is its ``(height, width)`` rows (one for
+# a still image, one per frame for a video).
+MediaItemSizes = tuple[tuple[tuple[int, int], ...], ...]
+
+
+def media_item_sizes(
+    imgs_sizes: torch.Tensor, num_frames: torch.Tensor | None
+) -> MediaItemSizes:
+    """Group ``imgs_sizes`` rows into media items.
+
+    The one definition of an item boundary: a video is one item spanning its
+    ``num_frames`` rows of ``imgs_sizes``, a still image one item of one row.
+    The sink's prefix reader (``media_count`` / ``media_sizes``) and the
+    Megatron stager's media slicing both use it, so the count the preparer
+    carries forward and the slice point the stager cuts at cannot disagree.
+
+    Raises:
+        ValueError: ``num_frames`` does not tile the ``imgs_sizes`` rows.
+    """
+    sizes = [(int(h), int(w)) for h, w in imgs_sizes.reshape(-1, 2).tolist()]
+    if num_frames is None:
+        return tuple((size,) for size in sizes)
+    frames = [int(f) for f in num_frames.reshape(-1).tolist()]
+    if any(f <= 0 for f in frames) or sum(frames) != len(sizes):
+        raise ValueError(
+            f"num_frames {frames} does not tile the {len(sizes)} imgs_sizes rows"
+        )
+    items, start = [], 0
+    for count in frames:
+        items.append(tuple(sizes[start : start + count]))
+        start += count
+    return tuple(items)
+
 
 def _media_sentinels(pixel_dtype: torch.dtype) -> dict[str, torch.Tensor]:
     """Placeholders for absent media, one per tensor column, in that column's dtype.
@@ -620,7 +659,7 @@ class StagedPrefix:
 
     expanded: list[int]
     media_count: int = 0
-    media_sizes: tuple[tuple[tuple[int, int], ...], ...] = ()
+    media_sizes: MediaItemSizes = ()
 
     def __add__(self, other: "StagedPrefix") -> "StagedPrefix":
         return StagedPrefix(
@@ -777,10 +816,6 @@ class TQTokenSource:
     def fetch(self, staging_keys: list[str]) -> list[StagedCallBaseSnapshot]:
         """Gym ``StagingSource`` conformance: base snapshots only, in order."""
         return [item.snapshot for item in self.fetch_for_finalization(staging_keys)]
-
-    def fetch_prefix_token_ids(self, staging_keys: list[str]) -> list[int]:
-        """Bulk-fetch ordered delta chain and concatenate token_ids_delta into a prefix."""
-        return self.fetch_prefix_chains(staging_keys).expanded
 
     def fetch_prefix_chains(self, staging_keys: list[str]) -> StagedPrefix:
         """Bulk-fetch the ordered delta chain and describe the media it staged.
@@ -1163,29 +1198,20 @@ def _row_scalar_bool(row: Any, field_name: str) -> bool:
     return bool(flattened[0].item())
 
 
-def _row_media_item_sizes(row: Any) -> tuple[tuple[tuple[int, int], ...], ...]:
+def _row_media_item_sizes(row: Any) -> MediaItemSizes:
     """The ``(height, width)`` rows of each item one media-enabled row staged.
 
-    Mirrors ``slice_media_tensors``: a video is one item spanning its
-    ``num_frames`` rows of ``imgs_sizes``, a still image one item of one row.
+    Item boundaries come from ``media_item_sizes``, shared with the Megatron
+    stager's slicing.
 
     Raises:
         ValueError: ``num_frames`` does not tile the ``imgs_sizes`` rows.
     """
     if not _row_scalar_bool(row, MEDIA_PRESENT_FIELD):
         return ()
-    sizes = [
-        (int(h), int(w)) for h, w in row[MEDIA_IMGS_SIZES_FIELD].reshape(-1, 2).tolist()
-    ]
-    if not _row_scalar_bool(row, MEDIA_HAS_FRAMES_FIELD):
-        return tuple((size,) for size in sizes)
-    frames = [int(f) for f in row[MEDIA_NUM_FRAMES_FIELD].reshape(-1).tolist()]
-    if any(f <= 0 for f in frames) or sum(frames) != len(sizes):
-        raise ValueError(
-            f"media_num_frames {frames} does not tile the {len(sizes)} media_imgs_sizes rows"
-        )
-    items, start = [], 0
-    for count in frames:
-        items.append(tuple(sizes[start : start + count]))
-        start += count
-    return tuple(items)
+    return media_item_sizes(
+        row[MEDIA_IMGS_SIZES_FIELD],
+        row[MEDIA_NUM_FRAMES_FIELD]
+        if _row_scalar_bool(row, MEDIA_HAS_FRAMES_FIELD)
+        else None,
+    )

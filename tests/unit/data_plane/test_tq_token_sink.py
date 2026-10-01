@@ -58,6 +58,7 @@ from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     TQTokenSource,
     resolve_admission_prefix,
     resolve_admission_prefix_chains,
+    validate_media_tensors,
 )
 from nemo_rl.models.generation.megatron.token_capture import (  # noqa: E402
     MEDIA_PREV_COUNT_KEY,
@@ -303,8 +304,6 @@ def test_malformed_media_fails_before_any_put(tq_client, media_partition, mutate
 
 
 def test_validate_media_tensors_preserves_dtypes():
-    from nemo_rl.data_plane.tq_token_sink import validate_media_tensors
-
     assert validate_media_tensors(None) is None
     for dtype in (torch.float16, torch.bfloat16, torch.float32):
         media = validate_media_tensors(_still(dtype=dtype))
@@ -480,45 +479,47 @@ def test_sink_clear_drops_rows(tq_client, staging_partition):
         source.fetch(keys)
 
 
-def test_fetch_prefix_token_ids_empty(tq_client, staging_partition):
+def test_fetch_prefix_chains_expanded_empty(tq_client, staging_partition):
     source = TQTokenSource(tq_client, staging_partition=staging_partition)
-    assert source.fetch_prefix_token_ids([]) == []
+    assert source.fetch_prefix_chains([]).expanded == []
 
 
-def test_fetch_prefix_token_ids_single_key(tq_client, staging_partition):
+def test_fetch_prefix_chains_expanded_single_key(tq_client, staging_partition):
     sink = TQTokenSink(tq_client, staging_partition=staging_partition)
     source = TQTokenSource(tq_client, staging_partition=staging_partition)
     records, _, _ = build_fixture_artifacts("single_call")
     record = records[0]
     assert sink.stage(record).ok
-    result = source.fetch_prefix_token_ids([record.staging_key])
+    result = source.fetch_prefix_chains([record.staging_key]).expanded
     assert result == record.token_ids_delta
 
 
-def test_fetch_prefix_token_ids_three_keys_concatenates(tq_client, staging_partition):
+def test_fetch_prefix_chains_expanded_three_keys_concatenates(
+    tq_client, staging_partition
+):
     sink = TQTokenSink(tq_client, staging_partition=staging_partition)
     source = TQTokenSource(tq_client, staging_partition=staging_partition)
     records, _, _ = build_fixture_artifacts("worked_example")
     for record in records:
         assert sink.stage(record).ok
     keys = [record.staging_key for record in records]
-    result = source.fetch_prefix_token_ids(keys)
+    result = source.fetch_prefix_chains(keys).expanded
     expected = [t for record in records for t in record.token_ids_delta]
     assert result == expected
 
 
-def test_fetch_prefix_token_ids_missing_key_raises_keyerror(
+def test_fetch_prefix_chains_expanded_missing_key_raises_keyerror(
     tq_client, staging_partition
 ):
     source = TQTokenSource(tq_client, staging_partition=staging_partition)
     with pytest.raises(KeyError):
-        source.fetch_prefix_token_ids(["ghost_rollout/ghost_call"])
+        source.fetch_prefix_chains(["ghost_rollout/ghost_call"]).expanded
 
 
-def test_fetch_prefix_token_ids_rejects_duplicates(tq_client, staging_partition):
+def test_fetch_prefix_chains_expanded_rejects_duplicates(tq_client, staging_partition):
     source = TQTokenSource(tq_client, staging_partition=staging_partition)
     with pytest.raises(KeyError, match="duplicates"):
-        source.fetch_prefix_token_ids(["r/c", "r/c"])
+        source.fetch_prefix_chains(["r/c", "r/c"]).expanded
 
 
 # ── Megatron stager / preparer ───────────────────────────────────────────────
@@ -610,7 +611,6 @@ def test_megatron_stager_writes_canonical_row_and_returns_coords(
     )
     [fetched] = source.fetch_for_finalization(["minf-r0/c1"])
     chains = source.fetch_prefix_chains(["minf-r0/c1"])
-    assert source.fetch_prefix_token_ids(["minf-r0/c1"]) == chains.expanded
 
     if not multimodal:
         assert fetched.snapshot.token_ids_delta == [10, 11, 12, 13]
@@ -1655,7 +1655,7 @@ def test_payload_keys_match_gym_constants():
     ids=["patches", "none-staged", "all-staged", "video"],
 )
 def test_slice_media_tensors_keeps_only_new_items(media_tensors, prev_count, expected):
-    sliced = slice_media_tensors(media_tensors, prev_count)
+    sliced = slice_media_tensors(validate_media_tensors(media_tensors), prev_count)
     if expected is None:
         assert sliced is None
         return
@@ -1673,24 +1673,24 @@ def test_slice_media_tensors_keeps_only_new_items(media_tensors, prev_count, exp
             "exceeds",
         ),
         # No per-item geometry at all: nothing says where image 1 ends.
-        ({"imgs": torch.ones(1, 4, 12)}, 1, "requires imgs_sizes"),
-        # 5 patches cannot tile two 4x4 images (area 32).
+        ({"imgs": torch.ones(1, 4, 12)}, 1, "require 'imgs_sizes'"),
+        # 5 patches cannot tile two 4x4 images (8 patches of size 2).
         (
             {
                 "imgs": torch.ones(1, 5, 12),
                 "imgs_sizes": torch.tensor([[4, 4], [4, 4]]),
             },
             1,
-            "do not divide",
+            "describe 8 patches but imgs holds 5",
         ),
-        # Area 18 over 2 patches -> 9 per patch; image 1 (area 6) ends mid-patch.
+        # Rows that do not divide into whole patches of size 2.
         (
             {
                 "imgs": torch.ones(1, 2, 12),
                 "imgs_sizes": torch.tensor([[2, 3], [3, 4]]),
             },
             1,
-            "patch boundary",
+            "divisible by the patch size",
         ),
         # Padded pixels [N, C, H, W] are not the packed layout the sink accepts.
         (
@@ -1699,13 +1699,32 @@ def test_slice_media_tensors_keeps_only_new_items(media_tensors, prev_count, exp
                 "imgs_sizes": torch.tensor([[4, 4], [4, 4]]),
             },
             1,
-            "packed patches",
+            r"must be \[1, total_patches, 3\*P\*P\]",
+        ),
+        # num_frames that does not partition the imgs_sizes rows.
+        (
+            {
+                "imgs": torch.ones(1, 8, 12),
+                "imgs_sizes": torch.tensor([[4, 4], [4, 4]]),
+                "num_frames": torch.tensor([3]),
+            },
+            1,
+            "does not partition",
         ),
     ],
-    ids=["exceeds", "no-geometry", "non-dividing", "mid-patch", "padded-pixels"],
+    ids=[
+        "exceeds",
+        "no-geometry",
+        "non-dividing",
+        "mid-patch",
+        "padded-pixels",
+        "frames-do-not-tile",
+    ],
 )
 def test_slice_media_tensors_rejects_inconsistent_geometry(
     media_tensors, prev_count, error
 ):
+    """The layout checks are the sink's (``validate_media_tensors``); the
+    slicer only adds the item-count bound."""
     with pytest.raises(ValueError, match=error):
-        slice_media_tensors(media_tensors, prev_count)
+        slice_media_tensors(validate_media_tensors(media_tensors), prev_count)

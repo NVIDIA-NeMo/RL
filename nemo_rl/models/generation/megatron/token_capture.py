@@ -38,9 +38,11 @@ import torch
 
 from nemo_rl.data_plane.tq_token_sink import (
     ChainPrefixCache,
+    StagedMediaTensors,
     TQTokenSink,
     TQTokenSource,
     resolve_admission_prefix_chains,
+    validate_media_tensors,
 )
 from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
 
@@ -229,42 +231,6 @@ class TQMegatronPromptPreparer:
         )
 
 
-def media_item_sizes(
-    media_tensors: dict[str, Any] | None, count: int
-) -> list[list[list[int]]]:
-    """``(height, width)`` rows of the first ``count`` items in the engine's media.
-
-    Same item boundaries as ``slice_media_tensors``: a video spans its
-    ``num_frames`` rows of ``imgs_sizes``, a still image one row.
-
-    Raises:
-        ValueError: ``imgs_sizes`` is missing, or the engine saw fewer than
-            ``count`` items.
-    """
-    if count <= 0:
-        return []
-    imgs_sizes = (media_tensors or {}).get("imgs_sizes")
-    if imgs_sizes is None:
-        raise ValueError("media delta requires imgs_sizes to locate items")
-    sizes = [[int(h), int(w)] for h, w in imgs_sizes.reshape(-1, 2).tolist()]
-    num_frames = (media_tensors or {}).get("num_frames")
-    frames = (
-        [1] * len(sizes)
-        if num_frames is None
-        else [int(f) for f in num_frames.reshape(-1).tolist()]
-    )
-    if count > len(frames):
-        raise ValueError(
-            f"media_prev_count {count} exceeds the {len(frames)} media items "
-            "the engine saw"
-        )
-    items, start = [], 0
-    for item_frames in frames[:count]:
-        items.append(sizes[start : start + item_frames])
-        start += item_frames
-    return items
-
-
 def _prev_sizes(minf_params: Any, prev_count: int) -> list[list[list[int]]]:
     """Validate ``media_prev_sizes``: one list of ``[h, w]`` rows per counted item."""
     value = minf_params.get(MEDIA_PREV_SIZES_KEY) if minf_params is not None else None
@@ -293,78 +259,51 @@ def _prev_sizes(minf_params: Any, prev_count: int) -> list[list[list[int]]]:
 
 
 def slice_media_tensors(
-    media_tensors: dict[str, Any] | None, prev_count: int
-) -> dict[str, Any] | None:
-    """Drop the first ``prev_count`` media items from the engine's media tensors.
+    media: StagedMediaTensors, prev_count: int
+) -> dict[str, torch.Tensor] | None:
+    """Drop the first ``prev_count`` media items from the engine's media.
 
     Every chat request carries the whole conversation, so the engine hands the
     stager pixels for every image in the prompt. The parent chain already
     staged the first ``prev_count`` of them; this keeps only the rest so media
     columns are per-call deltas like the token columns.
 
-    Item boundaries come from the tensors themselves: ``num_frames`` (frames per
-    video) when present, else one row of ``imgs_sizes`` per image. ``imgs`` must
-    be packed patches ``[1, total_patches, C*P*P]`` (the only layout
-    ``validate_media_tensors`` accepts); the patch count per row is
-    ``h*w/P**2`` with ``P**2`` recovered from the totals.
+    ``media`` must already have passed ``validate_media_tensors``, which
+    pins the packed-patch layout and gives ``patch_size``; item boundaries
+    come from ``StagedMediaTensors.item_sizes``, the same rule the sink uses
+    to count a chain's staged items. Returns the remaining media as the
+    attachments mapping Gym's capture core takes, or ``None`` when every item
+    was already staged.
 
     Raises:
-        ValueError: ``imgs_sizes`` is missing, ``prev_count`` exceeds the items
-            present, ``imgs`` is not packed patches, or the geometry does not
-            tile into whole patches at the parent boundary.
+        ValueError: ``prev_count`` exceeds the items present.
     """
-    if not media_tensors or prev_count <= 0:
-        return media_tensors
-    imgs = media_tensors.get("imgs")
-    imgs_sizes = media_tensors.get("imgs_sizes")
-    num_frames = media_tensors.get("num_frames")
-    if imgs is None:
-        return media_tensors
-    if imgs_sizes is None:
-        raise ValueError("media delta requires imgs_sizes to locate items")
-
-    if num_frames is not None:
-        total_items = int(num_frames.numel())
-    else:
-        total_items = int(imgs_sizes.reshape(-1, 2).shape[0])
-    if prev_count > total_items:
+    items = media.item_sizes
+    if prev_count > len(items):
         raise ValueError(
-            f"media_prev_count {prev_count} exceeds the {total_items} media items "
+            f"media_prev_count {prev_count} exceeds the {len(items)} media items "
             "the engine saw"
         )
-    if prev_count == total_items:
+    if prev_count == len(items):
         return None
+    sliced: dict[str, torch.Tensor] = {
+        "imgs": media.imgs,
+        "imgs_sizes": media.imgs_sizes,
+    }
+    if media.num_frames is not None:
+        sliced["num_frames"] = media.num_frames
+    if prev_count <= 0:
+        return sliced
 
-    # Rows of imgs_sizes / imgs covered by the parent chain.
-    if num_frames is not None:
-        prev_rows = int(num_frames.reshape(-1)[:prev_count].sum().item())
-    else:
-        prev_rows = prev_count
-
-    sliced: dict[str, Any] = {}
-    if imgs.ndim == 3 and imgs.shape[0] == 1:
-        # Packed patches: recover patches-per-row from sizes and the total.
-        sizes = imgs_sizes.reshape(-1, 2).to(torch.int64)
-        areas = sizes[:, 0] * sizes[:, 1]
-        total_area = int(areas.sum().item())
-        total_patches = int(imgs.shape[1])
-        if total_patches == 0 or total_area % total_patches:
-            raise ValueError(
-                f"packed patches {total_patches} do not divide the media area {total_area}"
-            )
-        patch_area = total_area // total_patches
-        prev_area = int(areas[:prev_rows].sum().item())
-        if prev_area % patch_area:
-            raise ValueError("parent media does not end on a patch boundary")
-        sliced["imgs"] = imgs[:, prev_area // patch_area :, :]
-    else:
-        raise ValueError(
-            "media imgs must be packed patches [1, total_patches, F], "
-            f"got shape {tuple(imgs.shape)}"
-        )
-    sliced["imgs_sizes"] = imgs_sizes.reshape(-1, 2)[prev_rows:]
-    if num_frames is not None:
-        sliced["num_frames"] = num_frames.reshape(-1)[prev_count:]
+    prev_rows = sum(len(item) for item in items[:prev_count])
+    patch_area = media.patch_size**2
+    prev_patches = sum(h * w for item in items[:prev_count] for h, w in item)
+    # validate_media_tensors checked every row divides into whole patches.
+    prev_patches //= patch_area
+    sliced["imgs"] = media.imgs[:, prev_patches:, :]
+    sliced["imgs_sizes"] = media.imgs_sizes[prev_rows:]
+    if media.num_frames is not None:
+        sliced["num_frames"] = media.num_frames[prev_count:]
     return sliced
 
 
@@ -390,7 +329,8 @@ class _MegatronCapturePayload:
         ``minf_params["media_prev_count"]`` items of ``payload.media_tensors``
         against ``minf_params["media_prev_sizes"]`` (the geometry the parent
         chain staged), and slices the tensors there so only the media new to
-        this call remains.
+        this call remains. ``media_tensors`` is validated against the sink's
+        media contract (``validate_media_tensors``) first.
 
         Args:
             payload: The engine's ``OffloadedRequestPayload`` (or equivalent).
@@ -398,9 +338,10 @@ class _MegatronCapturePayload:
                 wrote, or ``None`` for requests it did not touch.
 
         Raises:
-            TypeError: ``minf_params`` is not a dict or ``media_tensors`` is not
-                a mapping.
-            ValueError: ``media_prev_count`` is not a non-negative int,
+            TypeError: ``minf_params`` is not a dict, ``media_tensors`` is not
+                a mapping, or a media tensor is not a ``torch.Tensor``.
+            ValueError: ``media_tensors`` violates the media contract,
+                ``media_prev_count`` is not a non-negative int,
                 ``media_prev_sizes`` is malformed or does not have one entry per
                 counted item, a retained item's geometry differs from the
                 staged one, or the media cannot be sliced at the count.
@@ -428,22 +369,29 @@ class _MegatronCapturePayload:
                 "MInf payload media_tensors must be a mapping, got "
                 f"{type(media_tensors).__name__}"
             )
-        media: dict[str, Any] | None = (
-            None if media_tensors is None else dict(media_tensors)
-        )
         prev_count = _count(MEDIA_PREV_COUNT_KEY)
         staged_sizes = _prev_sizes(minf_params, prev_count)
-        if prev_count:
-            engine_sizes = media_item_sizes(media, prev_count)
-            for index, (staged, seen) in enumerate(
-                zip(staged_sizes, engine_sizes, strict=True)
-            ):
-                if staged != seen:
-                    raise ValueError(
-                        f"MInf retained media geometry changed: item {index} was "
-                        f"staged at {staged}, the engine saw {seen}"
-                    )
-        media = slice_media_tensors(media, prev_count)
+        # The sink's contract check runs here, before slicing, so the layout
+        # is known good and a malformed bundle fails this call, not the write.
+        validated = validate_media_tensors(media_tensors or None)
+        items = () if validated is None else validated.item_sizes
+        if prev_count > len(items):
+            raise ValueError(
+                f"media_prev_count {prev_count} exceeds the {len(items)} media "
+                "items the engine saw"
+            )
+        for index, (staged, item) in enumerate(
+            zip(staged_sizes, items[:prev_count], strict=True)
+        ):
+            seen = [list(size) for size in item]
+            if staged != seen:
+                raise ValueError(
+                    f"MInf retained media geometry changed: item {index} was "
+                    f"staged at {staged}, the engine saw {seen}"
+                )
+        media = (
+            None if validated is None else slice_media_tensors(validated, prev_count)
+        )
         return cls(
             prompt_token_ids=getattr(payload, "prompt_token_ids", None),
             generated_token_ids=getattr(payload, "generated_token_ids", None),
