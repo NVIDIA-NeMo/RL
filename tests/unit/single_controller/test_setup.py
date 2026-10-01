@@ -80,6 +80,7 @@ from nemo_rl.data_plane.schema import (
     SC_ROLLOUT_SCHEMA_FIELDS,
 )
 from nemo_rl.data_plane.tq_token_sink import MEDIA_STAGING_FIELDS
+from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 from nemo_rl.experience.rollouts import EffortLevelsConfig
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
@@ -196,7 +197,7 @@ def _make_master_config(
             "save_optimizer": False,
         },
         logger={"wandb_enabled": False, "wandb": {}},
-        cluster={"num_nodes": 2, "gpus_per_node": 8, "segment_size": None},
+        cluster=ClusterConfig(num_nodes=2, gpus_per_node=8),
         loss_fn=loss_cfg if loss_cfg is not None else ClippedPGLossConfig(),
         env=env if env is not None else {},
         async_rl=AsyncRLConfig(
@@ -345,7 +346,7 @@ def test_build_generation_passes_sglang_config():
 def test_build_clusters_rejects_unsupported_topology_backend(monkeypatch):
     """Topology planning reports the supported SC backends instead of KeyError."""
     master_config = _make_master_config(colocated=False, backend="trtllm")
-    master_config.cluster = {"num_nodes": 2, "gpus_per_node": 8, "segment_size": 1}
+    master_config.cluster = ClusterConfig(num_nodes=2, gpus_per_node=8, segment_size=1)
     master_config.policy["generation"]["colocated"]["resources"] = {
         "gpus_per_node": 8,
         "num_nodes": 1,
@@ -373,7 +374,7 @@ def test_build_clusters_rejects_unsupported_topology_backend(monkeypatch):
 def test_build_clusters_leaves_dedicated_teacher_nodes(monkeypatch):
     """Teacher nodes are removed before the student train/inference split."""
     master_config = _make_master_config(colocated=False)
-    master_config.cluster = {"num_nodes": 3, "gpus_per_node": 8}
+    master_config.cluster = ClusterConfig(num_nodes=3, gpus_per_node=8)
     master_config.policy["generation"]["colocated"]["resources"] = {
         "gpus_per_node": 8,
         "num_nodes": 1,
@@ -403,7 +404,7 @@ def test_build_clusters_leaves_dedicated_teacher_nodes(monkeypatch):
 def test_build_clusters_supports_two_node_shared_student_layout(monkeypatch):
     """One student node can split train/inference while node two hosts teacher."""
     master_config = _make_master_config(colocated=False)
-    master_config.cluster = {"num_nodes": 2, "gpus_per_node": 8}
+    master_config.cluster = ClusterConfig(num_nodes=2, gpus_per_node=8)
     master_config.policy["generation"]["colocated"]["resources"] = {
         "gpus_per_node": 4,
         "num_nodes": 1,
@@ -1288,7 +1289,7 @@ class TestSetup:
         self, patched_factories, monkeypatch
     ):
         mc = _make_master_config(env={"should_use_nemo_gym": True})
-        mc.cluster = {"num_nodes": 3, "gpus_per_node": 8}
+        mc.cluster = ClusterConfig(num_nodes=3, gpus_per_node=8)
         mc.policy["generation"]["vllm_cfg"] = {
             "async_engine": True,
             "expose_http_server": True,
@@ -1555,7 +1556,7 @@ class TestSetup:
         self, patched_factories
     ):
         mc = _make_master_config(colocated=False)
-        mc.cluster = {"num_nodes": 2, "gpus_per_node": 8, "segment_size": 1}
+        mc.cluster = ClusterConfig(num_nodes=2, gpus_per_node=8, segment_size=1)
         mc.policy["generation"]["colocated"]["resources"] = {
             "gpus_per_node": 4,
             "num_nodes": 1,
