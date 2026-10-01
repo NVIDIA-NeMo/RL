@@ -1,5 +1,5 @@
 # Mixed teachers use Gym prompt construction and upstream engine-media capture.
-# Disable the static-video-only data contract for this image/frame manifest.
+# Native vLLM preprocessing uses checkpoint settings; clear legacy per-row kwargs.
 defaults: ./vlm_grpo-nemotron-super-omni-120ba12b-32n4g-megatron-tp2ep16cp1-async-gym.v1.yaml
 cluster:
   num_nodes: 32
@@ -273,6 +273,8 @@ env:
             - <so_end>
             chat_template_kwargs:
               enable_thinking: true
+          sampling_overrides:
+            mm_processor_kwargs: {}
     math_with_judge:
       resources_servers:
         math_with_judge:
