@@ -1446,7 +1446,7 @@ class _NoOpTrainer:
     def offload_to_cpu(self) -> None:
         pass
 
-    def offload_train_step(self) -> None:
+    def pause_train_step_with_offloading(self) -> None:
         pass
 
     def sync_params_before_refit(self) -> None:
@@ -2581,11 +2581,11 @@ class _StreamingPPOTrainer(_EpochRecordingTrainer):
         self.step_open = False
         return super().finish_train_step()
 
-    def offload_train_step(self) -> None:
+    def pause_train_step_with_offloading(self) -> None:
         assert self.step_open
         assert not self.gradients_offloaded, "pending step was offloaded twice"
         self.gradients_offloaded = True
-        self.calls.append("policy.offload_train_step")
+        self.calls.append("policy.pause_train_step_with_offloading")
 
     def prepare_for_training(self) -> None:
         self.gradients_offloaded = False
@@ -2754,7 +2754,7 @@ def test_streaming_ppo_prepares_critic_before_waiting_for_next_chunk(
         assert "policy.begin_train_step" not in calls
         assert "policy.train_microbatches_from_meta" not in calls
         assert "policy.finish_train_step" not in calls
-        assert "policy.offload_train_step" not in calls
+        assert "policy.pause_train_step_with_offloading" not in calls
         assert ctrl._trainer.optimizer_gradient_sums == []
         ctrl._sync_weights.assert_not_awaited()
     else:
@@ -2763,7 +2763,7 @@ def test_streaming_ppo_prepares_critic_before_waiting_for_next_chunk(
         assert [meta.sample_ids for meta in ctrl._trainer.trained_metas] == [
             meta.sample_ids for meta, valid in zip(metas, valid_chunks) if valid
         ]
-        assert calls.count("policy.offload_train_step") == sum(
+        assert calls.count("policy.pause_train_step_with_offloading") == sum(
             any(valid_chunks[: index + 1]) for index in range(len(metas) - 1)
         )
         assert ctrl._trainer.optimizer_gradient_sums == [
@@ -2881,7 +2881,7 @@ def test_streaming_ppo_tail_aware_wait_preserves_prep_and_full_batch_update(
             assert ctrl._value.inference_prepared
             assert ctrl._trainer.gradients_offloaded
             assert calls.count("critic.prepare_for_inference") == 2
-            assert calls.count("policy.offload_train_step") == 1
+            assert calls.count("policy.pause_train_step_with_offloading") == 1
             assert buffer.claim_sizes == [88]
             assert len(buffer.owned) == 88
             assert ctrl._trainer_version == ctrl._train_steps == 0
@@ -2905,7 +2905,7 @@ def test_streaming_ppo_tail_aware_wait_preserves_prep_and_full_batch_update(
     assert not buffer.owned
     assert not buffer.meta_list
     assert calls.count("critic.prepare_for_inference") == 2
-    assert calls.count("policy.offload_train_step") == 1
+    assert calls.count("policy.pause_train_step_with_offloading") == 1
     assert calls.count("policy.begin_train_step") == 1
     assert calls.count("policy.finish_train_step") == 1
     assert ctrl._trainer.optimizer_gradient_sums == [sum(range(1, 129))]
@@ -3128,7 +3128,7 @@ def test_streaming_ppo_accumulates_policy_then_trains_full_batch_critic(
     assert calls.count("policy.begin_train_step") == 1
     assert calls.count("policy.finish_train_step") == 1
     # Every handoff to another critic forward must save the partial policy step.
-    assert calls.count("policy.offload_train_step") == len(metas) - 1
+    assert calls.count("policy.pause_train_step_with_offloading") == len(metas) - 1
     assert calls.index("policy.finish_train_step") < calls.index("refit")
     assert calls.index("refit") < calls.index("critic.prepare_for_training")
     assert calls.count("critic.prepare_for_training") == 1

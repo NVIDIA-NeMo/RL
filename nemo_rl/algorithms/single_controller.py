@@ -2981,7 +2981,7 @@ class SingleControllerActor:
                             ):
                                 if step_open:
                                     await asyncio.to_thread(
-                                        self._trainer.offload_train_step
+                                        self._trainer.pause_train_step_with_offloading
                                     )
                                 else:
                                     await asyncio.to_thread(
@@ -3233,7 +3233,7 @@ class SingleControllerActor:
                         ):
                             if step_open:
                                 await asyncio.to_thread(
-                                    self._trainer.offload_train_step
+                                    self._trainer.pause_train_step_with_offloading
                                 )
                             else:
                                 await asyncio.to_thread(self._trainer.offload_to_cpu)

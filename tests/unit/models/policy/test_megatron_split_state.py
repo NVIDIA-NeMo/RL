@@ -1647,7 +1647,7 @@ class _DiscardingGradBuffer:
             self.grad_bytes = 0
 
 
-class TestOffloadTrainStep:
+class TestPauseTrainStepWithOffloading:
     @staticmethod
     def _worker():
         from nemo_rl.algorithms.loss.interfaces import LossType
@@ -1810,7 +1810,7 @@ class TestOffloadTrainStep:
                     saved = [p.grad.clone() for p in parameters]
                     grad_views = [p.grad for p in parameters]
                     storage_ids = [p.grad.data_ptr() for p in parameters]
-                    w.offload_train_step()
+                    w.pause_train_step_with_offloading()
                     assert state["offloaded"] is True
                     for parameter, expected, pointer in zip(
                         parameters, saved, storage_ids
@@ -1870,14 +1870,14 @@ class TestOffloadTrainStep:
         w = self._worker()
         w._train_step_state = None
         with pytest.raises(RuntimeError, match="no train step open"):
-            w.offload_train_step()
+            w.pause_train_step_with_offloading()
 
     def test_rejects_unsupported_model_without_mutating_state(
         self, mock_module_symbols
     ):
         w = self._worker()
         with pytest.raises(ValueError, match="requires Megatron DDP"):
-            w.offload_train_step()
+            w.pause_train_step_with_offloading()
         assert w._train_step_state["offloaded"] is False
 
     @pytest.mark.parametrize(
@@ -1893,7 +1893,7 @@ class TestOffloadTrainStep:
         expected = buffer.grad_data.clone()
         with patch(f"{WORKER_MOD}.DistributedDataParallel", type(w.model)):
             with pytest.raises(ValueError, match="separate param/grad storage"):
-                w.offload_train_step()
+                w.pause_train_step_with_offloading()
         assert w._train_step_state["offloaded"] is False
         torch.testing.assert_close(buffer.grad_data, expected)
         assert buffer.calls == []
@@ -1907,9 +1907,9 @@ class TestOffloadTrainStep:
         w = self._worker()
         w.optimizer_cpu_offload = optimizer_cpu_offload
         with patch(f"{WORKER_MOD}.DistributedDataParallel", type(w.model)):
-            w.offload_train_step()
+            w.pause_train_step_with_offloading()
             with pytest.raises(RuntimeError, match="already offloaded"):
-                w.offload_train_step()
+                w.pause_train_step_with_offloading()
             with pytest.raises(RuntimeError, match="prepare_for_training"):
                 w.train_microbatch({})
             with pytest.raises(RuntimeError, match="prepare_for_training"):

@@ -4324,13 +4324,12 @@ class MegatronPolicyWorkerImpl(
         self._colocated_reshard_plan = None
 
     @torch.no_grad()
-    @wrap_with_nvtx_name("megatron_policy_worker/offload_train_step")
-    def offload_train_step(self) -> None:
-        """Offload policy parameters/optimizer while keeping gradients on GPU.
+    @wrap_with_nvtx_name("megatron_policy_worker/pause_train_step_with_offloading")
+    def pause_train_step_with_offloading(self) -> None:
+        """Pause the step, offloading parameters and optimizer state to CPU.
 
-        The colocated critic runs alongside the open step's dense and expert
-        gradient buffers. Counts, metrics and disabled reduction hooks stay
-        unchanged until training resumes.
+        Pending dense/expert gradients stay on GPU. Counts, metrics and disabled
+        reduction hooks are preserved until ``prepare_for_training`` resumes it.
         """
         state = self._assert_step_open()
         if state.get("offloaded", False):

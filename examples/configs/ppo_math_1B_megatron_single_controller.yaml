@@ -195,7 +195,7 @@ policy:
     use_fastokens: false
   # Offload optimizer state for policy logprob computation.
   # PPO's pre-critic offload is handled separately by offload_to_cpu or
-  # offload_train_step.
+  # pause_train_step_with_offloading.
   offload_optimizer_for_logprob: true
 
   dtensor_cfg:

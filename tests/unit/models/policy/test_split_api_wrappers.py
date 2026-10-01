@@ -138,7 +138,7 @@ def _make_tq_policy() -> tuple[TQPolicy, MagicMock]:
 
 
 class TestTQPolicySplitFanout:
-    def test_offload_waits_for_all_workers(self):
+    def test_pause_with_offloading_waits_for_all_workers(self):
         p, wg = _make_tq_policy()
         with (
             patch("nemo_rl.models.policy.tq_policy.ray") as mock_ray,
@@ -147,9 +147,9 @@ class TestTQPolicySplitFanout:
                 return_value={"trace_context": "parent-span"},
             ),
         ):
-            assert p.offload_train_step() is None
+            assert p.pause_train_step_with_offloading() is None
         wg.run_all_workers_single_data.assert_called_once_with(
-            "offload_train_step", trace_context="parent-span"
+            "pause_train_step_with_offloading", trace_context="parent-span"
         )
         mock_ray.get.assert_called_once_with(["f0", "f1"])
 
