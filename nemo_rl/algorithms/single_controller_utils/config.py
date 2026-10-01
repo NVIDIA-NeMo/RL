@@ -59,8 +59,13 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
+from nemo_rl.models.generation.vllm.config import (
+    VllmConfig,
+    parse_nvfp4_pertoken_rollout,
+)
 from nemo_rl.models.policy import MegatronConfig, PolicyConfig
 from nemo_rl.models.value import ValueConfig
+from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 
 # ── User-facing SingleController configs ────────────────────────────────────
@@ -636,6 +641,9 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # derived at setup
     # under the run's log dir.
     capture_dir: Optional[str] = None
+    # Generation backend hosting token capture. This is derived from
+    # policy.generation.backend during setup; users should not set it separately.
+    generation_backend: Optional[Literal["vllm", "megatron"]] = None
     # Keep routed_experts out of canonical rows and assemble them on policy
     # workers from strict staged-fragment plans.
     defer_routed_experts_to_policy: bool = False
@@ -823,6 +831,7 @@ class MasterConfig(BaseModel, extra="allow"):
         default_factory=RolloutCheckpointConfig
     )
     on_policy_distillation: Optional[OnPolicyDistillationConfig] = None
+    telemetry: Optional[TelemetryConfig] = None
     token_capture: TokenCaptureConfig = Field(default_factory=TokenCaptureConfig)
 
     @model_validator(mode="after")
@@ -893,9 +902,8 @@ def _validate_opd_full_config(
     Raises:
         ValueError: If ``opd_full`` is enabled with an unsupported backend, an
             incompatible logprob path, a fused packing path that never reaches
-            the opd_full branch, more than one teacher checkpoint, a student
-            pipeline-parallel size the teacher LM-head load cannot support, or a
-            sampling temperature the hidden-state payload cannot honor.
+            the opd_full branch, or a sampling temperature the hidden-state
+            payload cannot honor.
     """
     full_cfg = opd_module.get_opd_full_config(master_config)
     if full_cfg is None:
@@ -931,32 +939,6 @@ def _validate_opd_full_config(
             "Without this check the run fails inside the first training forward, "
             "after the whole cluster and every teacher have already come up. "
             "Set sequence_packing.fuse_loss=false."
-        )
-
-    unique_teacher_checkpoints = sorted(
-        set(opd_config.teacher_model_by_agent_name.values())
-    )
-    if len(unique_teacher_checkpoints) != 1:
-        raise ValueError(
-            "on_policy_distillation.full currently supports exactly one unique "
-            f"teacher checkpoint, got {len(unique_teacher_checkpoints)}: "
-            f"{unique_teacher_checkpoints}. Multi-teacher full-vocabulary "
-            "distillation needs one LM head and one payload column per teacher."
-        )
-
-    if (
-        full_cfg.teacher_payload == "hidden_states"
-        and megatron_cfg["pipeline_model_parallel_size"] > 1
-    ):
-        raise ValueError(
-            "on_policy_distillation.full.teacher_payload='hidden_states' does not "
-            "support policy.megatron_cfg.pipeline_model_parallel_size > 1 yet. "
-            "Megatron builds output_layer only on the last pipeline stage, but resolving "
-            "the teacher checkpoint iteration goes through Megatron-Bridge's "
-            "read_train_state, whose broadcast_object_list spans the whole student "
-            "world, so earlier stages would fail while the last stage hangs in that "
-            "broadcast. Use pipeline_model_parallel_size=1, or "
-            "teacher_payload='logits', which needs no teacher LM head."
         )
 
     generation_config = policy_config.get("generation")
@@ -1136,6 +1118,17 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
 
     async_config = master_config.async_rl
     generation_config = master_config.policy["generation"]
+    if (
+        generation_config["backend"] == "vllm"
+        and parse_nvfp4_pertoken_rollout(cast(VllmConfig, generation_config))
+        is not None
+    ):
+        raise ValueError(
+            "SingleController does not support generation.nvfp4_pertoken_rollout: "
+            "the mode requires colocated vLLM rollout, while SingleController "
+            "requires non-colocated vLLM rollout. Disable nvfp4_pertoken_rollout "
+            "or use the supported GRPO entry point examples/run_grpo.py."
+        )
     if generation_config["colocated"]["enabled"]:
         if generation_config["backend"] != "megatron":
             raise ValueError(
@@ -1273,6 +1266,12 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
 
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
+    if master_config.loss_fn.seq_logprob_error_in_loss:
+        raise ValueError(
+            "loss_fn.seq_logprob_error_in_loss is not supported by SingleController: "
+            "its advantage baselines depend on the pre-training sequence mask. "
+            "Use the non-streaming GRPO trainer."
+        )
     _validate_algo_settings(master_config)
 
     async_config = master_config.async_rl

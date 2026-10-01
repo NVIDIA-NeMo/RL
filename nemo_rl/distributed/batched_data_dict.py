@@ -39,6 +39,7 @@ from nemo_rl.data.multimodal_utils import (
     PackedTensor,
 )
 from nemo_rl.data.packing import get_packer
+from nemo_rl.data_plane.schema import OPD_FULL_FIELDS
 from nemo_rl.distributed.collectives import (
     gather_jagged_object_lists,
     rebalance_nd_tensor,
@@ -141,6 +142,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         as_tensors: bool = False,
         device: Optional[torch.device] = None,
         pixel_dtype: Optional[torch.dtype] = None,
+        pixel_preprocess_mode: Optional[str] = None,
     ) -> dict[str, Any]:
         """Return the multimodal fields as a dict.
 
@@ -191,7 +193,8 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 # unwrapping via as_tensor).
                 if pixel_dtype is not None and k in self._PIXEL_DTYPE_CAST_KEYS:
                     v = v.to_dtype(pixel_dtype)
-                result[k] = v.as_tensor(device=device) if as_tensors else v
+                preprocess_mode = pixel_preprocess_mode if k == "pixel_values" else None
+                result[k] = v.as_tensor(device, preprocess_mode) if as_tensors else v
             elif k in PER_TOKEN_MULTIMODAL_FIELDS:
                 # Plain per-token tensor: emit as-is.
                 result[k] = v
@@ -1038,7 +1041,12 @@ class BatchedDataDict(UserDict, Generic[DictT]):
             if k in PACKED_MULTIMODAL_FIELDS:
                 continue
             if torch.is_tensor(v) and len(v.shape) >= dim + 1:
-                self.data[k] = torch.narrow(v, dim=dim, start=0, length=truncated_len)
+                length = truncated_len
+                if k in OPD_FULL_FIELDS:
+                    # materialize() leaves the payload at its natural width,
+                    # which can already be shorter than this microbatch's seqlen.
+                    length = min(truncated_len, int(v.shape[dim]))
+                self.data[k] = torch.narrow(v, dim=dim, start=0, length=length)
 
     def make_microbatch_iterator_with_dynamic_shapes(
         self,
