@@ -21,6 +21,7 @@ parents and the existing finalizer continue to determine physical rows.
 from collections import defaultdict
 from typing import Any
 
+from nemo_gym.responses_converter import _RESPONSE_OUTPUT_BOUNDARY_TYPES
 from nemo_gym.token_id_capture.completion import output_item_fingerprint
 from nemo_gym.token_id_capture.staging.records import CallRecord
 
@@ -62,12 +63,22 @@ def _output_items(
             response_items.extend(output)
         if any(not isinstance(item, dict) for item in response_items):
             raise ValueError("Malformed ordinary output item")
-        authored = [
-            item
-            for item in response_items
-            if item.get("role") == "assistant"
-            or item.get("type") in ("reasoning", "function_call")
-        ]
+        authored = []
+        for position, item in enumerate(response_items):
+            item_type = item.get("type")
+            if (
+                item.get("role") == "assistant"
+                or item_type in _RESPONSE_OUTPUT_BOUNDARY_TYPES
+            ):
+                # Gym's generation boundary includes types that capture cannot
+                # yet fingerprint. Never silently discard these from history.
+                if item_type not in (None, "message", "reasoning", "function_call"):
+                    raise ValueError(
+                        "Unsupported generated output item: "
+                        f"type={item_type!r}, item_id={item.get('id')!r}, "
+                        f"output_index={position}"
+                    )
+                authored.append(item)
         native_id = response.get("id")
         if native_id in captured_response_ids and not authored:
             raise ValueError("No accepted captured generations in response output")
