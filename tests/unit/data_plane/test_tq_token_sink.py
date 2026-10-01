@@ -46,27 +46,22 @@ from nemo_gym.token_id_capture.staging.protocols import (  # noqa: E402
 from nemo_gym.token_id_capture.staging.protocols import (  # noqa: E402
     StagingSource as TokenSourceProtocol,
 )
-from nemo_gym.token_id_capture.staging.digest import (  # noqa: E402
-    compute_extras_digest,
-    compute_staging_digest,
-)
-from nemo_gym.token_id_capture.staging.records import StagedCallRecord  # noqa: E402
 
 from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     MEDIA_METADATA_FIELDS,
-    MEDIA_PREV_COUNT_KEY,
     MEDIA_STAGING_FIELDS,
     MEDIA_TENSOR_COLUMNS,
-    MINF_CAPTURE_PARAMS_FIELD,
     STAGING_FIELDS,
     ChainPrefixCache,
-    PrefixChains,
+    StagedPrefix,
     TQTokenSink,
     TQTokenSource,
     resolve_admission_prefix,
     resolve_admission_prefix_chains,
 )
 from nemo_rl.models.generation.megatron.token_capture import (  # noqa: E402
+    MEDIA_PREV_COUNT_KEY,
+    MINF_CAPTURE_PARAMS_FIELD,
     TQMegatronPromptPreparer,
     TQMegatronTokenStager,
     _MegatronCapturePayload,
@@ -469,38 +464,6 @@ def test_stage_failure_reports_not_raises(staging_partition):
     assert not result.ok
     assert result.staging_key == records[0].staging_key
     assert "controller down" in (result.error or "")
-
-
-def _with_extras(record: StagedCallRecord, extras: dict) -> StagedCallRecord:
-    """Rebuild a fixture record carrying ``extras`` with both digests recomputed."""
-    values = record.model_dump()
-    values["extras"] = extras
-    values["extras_digest"] = compute_extras_digest(extras)
-    values["digest"] = compute_staging_digest(
-        **{
-            name: values[name]
-            for name in (
-                "schema_version",
-                "digest_version",
-                "extras_digest_version",
-                "rollout_id",
-                "model_call_id",
-                "parent_call_id",
-                "mode",
-                "prev_len",
-                "delta_len",
-                "cum_len",
-                "weight_version",
-                "token_ids_delta",
-                "token_mask_delta",
-                "generation_log_probs_delta",
-                "extras_digest",
-                "chain_hash",
-                "cumulative_hash",
-            )
-        }
-    )
-    return StagedCallRecord(**values)
 
 
 def test_sink_clear_drops_rows(tq_client, staging_partition):
@@ -979,35 +942,6 @@ def test_fetch_prefix_chains_counts_media_items_from_columns(
     assert text_source.fetch_prefix_chains(["r0/c1", "r0/c3"]).media_count == 0
 
 
-@pytest.fixture
-def prefix_stitching_fields(monkeypatch):
-    """Megatron-LM's expanded-prefix stitching keys, as (media count, token count).
-
-    Megatron-LM pins that predate the change lack them; install the upstream
-    names so the preparer's multimodal path runs on either pin.
-    """
-    from megatron.core.inference import inference_request
-
-    fields = (
-        getattr(inference_request, "PREFIX_MEDIA_COUNT_FIELD", "_prefix_media_count"),
-        getattr(
-            inference_request,
-            "PREFIX_EXPANDED_TOKEN_COUNT_FIELD",
-            "_prefix_expanded_token_count",
-        ),
-    )
-    monkeypatch.setattr(
-        inference_request, "PREFIX_MEDIA_COUNT_FIELD", fields[0], raising=False
-    )
-    monkeypatch.setattr(
-        inference_request,
-        "PREFIX_EXPANDED_TOKEN_COUNT_FIELD",
-        fields[1],
-        raising=False,
-    )
-    return fields
-
-
 _PREPARER_CASES = {
     # (root payload or None for an inline prefix, prev_len, prompt, template prefix,
     #  eos ids, media count the chat endpoint reports (None: text history),
@@ -1439,7 +1373,7 @@ class _RecordingSource:
 
     def fetch_prefix_chains(self, keys):
         self.calls.append(list(keys))
-        return PrefixChains(
+        return StagedPrefix(
             expanded=[int(k[1:]) * 10 + i for k in keys for i in range(2)],
             media_count=len(keys),
         )
@@ -1458,7 +1392,7 @@ def test_chain_prefix_cache_fetches_only_uncached_suffix(flat):
     assert fetch(["k1", "k2", "k3"]) == [10, 11, 20, 21, 30, 31]
     assert fetch(["k1", "k2"]) == [10, 11, 20, 21]
     assert source.calls == [["k1", "k2"], ["k3"]]
-    assert cache.fetch_chains(["k1", "k2", "k3"]) == PrefixChains(
+    assert cache.fetch_chains(["k1", "k2", "k3"]) == StagedPrefix(
         expanded=[10, 11, 20, 21, 30, 31], media_count=3
     )
     assert source.calls == [["k1", "k2"], ["k3"]]
@@ -1494,7 +1428,7 @@ def test_chain_prefix_cache_evicts_oldest_insertion_past_256_entries():
         ),
         pytest.param(
             resolve_admission_prefix_chains,
-            lambda ids, media_count: PrefixChains(
+            lambda ids, media_count: StagedPrefix(
                 expanded=ids, media_count=media_count
             ),
             id="megatron-chains",

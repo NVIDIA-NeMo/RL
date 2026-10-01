@@ -112,6 +112,8 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
     restore_refit_info_placements,
 )
 
+# MInf's HTTP preprocessing emits float32 patches and the vision encoder casts
+# internally, so staged media stays float32 regardless of the params dtype.
 MINF_MEDIA_PIXEL_DTYPE = torch.float32
 
 
@@ -754,6 +756,8 @@ class MegatronGenerationMixin:
         if "http_server_num_replicas" in gen_cfg:
             server_kwargs["num_replicas"] = int(gen_cfg["http_server_num_replicas"])
 
+        # Server defaults for fields a chat request omits (Gym never sends top_k);
+        # unset, newer Megatron-LM reads generation_config.json and samples off-policy.
         sampling_cfg = self.cfg["generation"]
         top_p = sampling_cfg["top_p"]
         top_k = sampling_cfg["top_k"]

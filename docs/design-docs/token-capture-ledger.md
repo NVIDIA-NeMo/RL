@@ -168,9 +168,10 @@ only one token space is ever staged.
   a drift in either preprocessor fails loudly at the first media stage.
 - `RolloutReassembler.finalize_group` drops a group in which no valid rollout
   carried media when `capture_media` is set (`media capture on, no valid
-  rollout carried media`, reported as `finalize/group_dropped_no_media`
-  alongside the shared `finalize/group_dropped`). The controller then shrinks
-  the step or, under `on_dropped_prompt="replace"`, sources a replacement. TQ
+  rollout carried media`, printed in the finalizer log line). The controller
+  does not replace a finalizer-dropped group, even under
+  `on_dropped_prompt="replace"`: the step closes one group short and the drop
+  is counted in that step's `dropped_prompt_groups`. TQ
   answers a batch fetch with only the fields every requested key produced, so
   a train shard mixing such keys with VLM keys would lose `pixel_values` for
   the VLM rows too.

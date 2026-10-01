@@ -29,6 +29,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -40,6 +41,8 @@ from nemo_gym.token_id_capture.staging.digest import (  # noqa: E402
     compute_staging_digest,
 )
 from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
+    CallRecord,
+    RolloutReceipt,
     StagedCallRecord,
 )
 
@@ -1053,6 +1056,123 @@ def test_finalize_rollout_media(tq_client, media_partitions, case, pixel_dtype):
     assert row.media["num_frames"].as_tensor().tolist() == [1] * len(bundles)
 
 
+def test_megatron_capture_two_turn_media_finalizes_to_the_engine_pixels(
+    tq_client, media_partitions, prefix_stitching_fields
+):
+    """Stager -> preparer -> stager -> finalizer with real media: each call
+    stages only the images new to it, and the finalized row carries the
+    engine's pixels once each, in prompt order. Images differ in size so a
+    fixed per-image cut in the slicer would also fail."""
+    # Deferred import: megatron-core is a heavy, optional dependency.
+    from megatron.core.inference.inference_request import (
+        PREFIX_EOS_TOKEN_ID_FIELD,
+        PREFIX_TEMPLATE_TOKEN_IDS_FIELD,
+    )
+
+    from nemo_rl.models.generation.megatron.token_capture import (
+        TQMegatronPromptPreparer,
+        TQMegatronTokenStager,
+    )
+
+    media_count_field, _ = prefix_stitching_fields
+    rollout_id = "minf-mm-e2e"
+    image1_patches, image2_patches = 4, 2  # 4x4 and 2x4 images, patch 2
+    engine_imgs = torch.arange(
+        (image1_patches + image2_patches) * 12, dtype=torch.float32
+    ).reshape(1, image1_patches + image2_patches, 12)
+    engine_sizes = torch.tensor([[4, 4], [2, 4]], dtype=torch.int32)
+    sink = TQTokenSink(
+        tq_client,
+        staging_partition=MEDIA_STAGING_PARTITION,
+        capture_media=True,
+        media_pixel_dtype=torch.float32,
+    )
+    stager = TQMegatronTokenStager(sink)
+    preparer = TQMegatronPromptPreparer(
+        TQTokenSource(
+            tq_client, staging_partition=MEDIA_STAGING_PARTITION, capture_media=True
+        )
+    )
+
+    def stage(call_id, prompt, generated, media_tensors, offload_params):
+        result = stager.stage(
+            f"minf-{call_id}",
+            SimpleNamespace(
+                prompt_token_ids=prompt,
+                generated_token_ids=generated,
+                generated_log_probs=[-0.5] * len(generated),
+                media_tensors=media_tensors,
+            ),
+            finished_metadata=SimpleNamespace(policy_epoch=[(0, 3)]),
+            offload_params=offload_params,
+        )
+        coords = result.response_metadata["ng_commit_coords"]
+        assert coords["disposition"] == "staged", coords
+        return coords
+
+    root = nemo_gym.CaptureAdmission(
+        rollout_id=rollout_id, model_call_id="c1", mode="text"
+    )
+    c1 = stage(
+        "c1",
+        [80, 99, 99, 99, 81],
+        [12, 2],
+        {"imgs": engine_imgs[:, :image1_patches], "imgs_sizes": engine_sizes[:1]},
+        {"ng_capture": root.model_dump(mode="json")},
+    )
+    child = nemo_gym.CaptureAdmission(
+        rollout_id=rollout_id,
+        model_call_id="c2",
+        parent_call_id="c1",
+        prev_len=c1["cum_len"],
+        mode="token_in",
+        staging_chain=[c1["staging_key"]],
+        parent_chain_hash=c1["chain_hash"],
+    )
+    prepared = preparer.prepare_prompt(
+        [80, 99, 81, 13, 2, 20, 99, 21],
+        offload_params={
+            "ng_capture": child.model_dump(mode="json"),
+            PREFIX_TEMPLATE_TOKEN_IDS_FIELD: [80, 99, 81, 13, 2],
+            PREFIX_EOS_TOKEN_ID_FIELD: [2],
+            media_count_field: 1,
+        },
+    )
+    c2 = stage(
+        "c2",
+        [80, 99, 99, 99, 81, 12, 2, 20, 99, 99, 21],
+        [30, 2],
+        {"imgs": engine_imgs, "imgs_sizes": engine_sizes},
+        prepared.offload_params,
+    )
+
+    manifest = [
+        CallRecord(
+            **{name: c[name] for name in CallRecord.model_fields if name in c},
+            mode="text" if c["parent_call_id"] is None else "token_in",
+            response_id=f"chatcmpl-{c['model_call_id']}",
+        )
+        for c in (c1, c2)
+    ]
+    receipt = RolloutReceipt(
+        rollout_id=rollout_id,
+        terminal_model_call_id="c2",
+        manifest=manifest,
+        terminal_selection="declared",
+    )
+    row = _media_finalizer(tq_client).finalize_rollout(
+        rollout_id, receipt.model_dump(), reward=1.0
+    )
+
+    assert row.valid, row.rejection_reason
+    assert row.token_ids == [80, 99, 99, 99, 81, 12, 2, 20, 99, 99, 21, 30, 2]
+    pixels = row.media["pixel_values"].as_tensor()
+    assert pixels.dtype == torch.float32
+    assert torch.equal(pixels, engine_imgs.squeeze(0))
+    assert row.media["imgs_sizes"].as_tensor().tolist() == [[4, 4], [2, 4]]
+    assert row.media["num_frames"].as_tensor().tolist() == [1, 1]
+
+
 def test_finalize_group_publishes_media_with_empty_rows_for_text_siblings(
     tq_client, media_partitions
 ):
@@ -1149,7 +1269,6 @@ def test_finalize_group_drops_group_without_any_media_row_only_in_media_runs(
     assert finalized.meta is None
     assert "media" in (finalized.drop_reason or "")
     assert finalized.metrics["finalize/group_dropped"] == 1.0
-    assert finalized.metrics["finalize/group_dropped_no_media"] == 1.0
     # Nothing was published, and the staged call rows were cleared.
     published = set(tq_client.list_sample_ids(MEDIA_CANONICAL_PARTITION))
     assert published.isdisjoint(rollout_ids)

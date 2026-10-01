@@ -37,8 +37,6 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from nemo_rl.data_plane.tq_token_sink import (
-    MEDIA_PREV_COUNT_KEY,
-    MINF_CAPTURE_PARAMS_FIELD,
     ChainPrefixCache,
     TQTokenSink,
     TQTokenSource,
@@ -51,6 +49,10 @@ if TYPE_CHECKING:
         RequestPayloadStageResult,
         RequestPromptPreparationResult,
     )
+
+# offload_params sub-dict the Megatron preparer writes and the stager reads.
+MINF_CAPTURE_PARAMS_FIELD = "ng_capture_minf"
+MEDIA_PREV_COUNT_KEY = "media_prev_count"
 
 
 class TQMegatronPromptPreparer:

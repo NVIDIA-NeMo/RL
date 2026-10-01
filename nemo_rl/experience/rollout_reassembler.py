@@ -732,7 +732,6 @@ class RolloutReassembler:
         # (pack_payload encodes PackedTensor fields and mints row-shape tags).
         media_fields = _media_fields_for_group(rows)
         if self._capture_media and not media_fields:
-            metrics["finalize/group_dropped_no_media"] = 1.0
             return self._drop_group(
                 group_id,
                 reason="media capture on, no valid rollout carried media",

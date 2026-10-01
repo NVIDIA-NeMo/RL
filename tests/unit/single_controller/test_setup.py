@@ -3107,6 +3107,7 @@ def test_token_capture_megatron_registers_media_columns_only_for_multimodal(
 @pytest.mark.mcore
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason=(
         "pending Megatron-Bridge pin carrying Megatron-LM expanded-prefix stitching"
     ),

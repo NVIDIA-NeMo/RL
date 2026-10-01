@@ -44,7 +44,7 @@ from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
 
 from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     ChainPrefixCache,
-    PrefixChains,
+    StagedPrefix,
 )
 from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration  # noqa: E402
 from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
@@ -247,10 +247,10 @@ class _MemoryPrefixSource:
         self.deltas = deltas
         self.calls: list[list[str]] = []
 
-    def fetch_prefix_chains(self, staging_keys: list[str]) -> PrefixChains:
+    def fetch_prefix_chains(self, staging_keys: list[str]) -> StagedPrefix:
         """Text-only chains: the vLLM worker never stages media through this source."""
         self.calls.append(list(staging_keys))
-        return PrefixChains(
+        return StagedPrefix(
             expanded=[token for key in staging_keys for token in self.deltas[key]]
         )
 
