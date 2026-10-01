@@ -88,10 +88,10 @@ ALLOWED_ADDITIONAL_CONFIG_KEYS = ["policy.draft", "policy.generation.vllm_kwargs
 # its ceiling with the same formula, not to pick a round number.
 #
 # The nightly, release and release_gb200 ceilings carry recipes that exist to
-# back user guides -- the DAPO and Muon guides, the audio and audio-visual
-# guides, and the README model table -- rather than to catch regressions. Once
-# those can be marked as documentation-only and stop running, these three lanes
-# can come down further.
+# back user guides -- the DAPO and Muon guides (plus the DAPO GB200 mirror), the
+# audio and audio-visual guides, and a README news entry -- rather than to catch
+# regressions. Once those can be marked as documentation-only and stop running,
+# these three lanes can come down further.
 SUITE_BUDGETS = {
     ("nightly", "h100"): {
         "runs_per_week": 7,
