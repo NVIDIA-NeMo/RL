@@ -29,8 +29,14 @@ policy:
     context_parallel_size: 4
     sequence_parallel: true
     apply_rope_fusion: false
-    moe_enable_deepep: true
+    # HybridEP rather than classic DeepEP: the pinned DeepEP (hybrid-ep branch)
+    # predates DeepEP#564, so its classic cross-node kernels time out under
+    # NVSHMEM >= 3.5.
     moe_token_dispatcher_type: flex
+    moe_flex_dispatcher_backend: hybridep
+    moe_hybridep_num_sms: 32
+    hybridep_num_ranks_per_nvlink_domain: 8
+    hybridep_use_mnnvl: false
     optimizer:
       lr: 5.0e-07
       min_lr: 5.0e-08
