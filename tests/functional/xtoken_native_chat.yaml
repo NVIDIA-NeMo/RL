@@ -1,0 +1,106 @@
+defaults: ../../examples/configs/xtoken_off_policy_distillation.yaml
+cluster:
+  gpus_per_node: 2
+distillation:
+  num_prompts_per_step: 8
+  max_num_steps: 3
+  max_num_epochs: 3
+collator:
+  mode: chat
+  include_thinking_in_loss: true
+  native_thinking_alignment: true
+  kd_alignment_regions:
+  - reasoning
+  - close
+  - answer
+  - eot
+policy:
+  model_name: HuggingFaceTB/SmolLM2-135M-Instruct
+  tokenizer:
+    name: HuggingFaceTB/SmolLM2-135M-Instruct
+    tokenizer_kwargs:
+      revision: 12fd25f77366fa6b3b4b768ec3050bf629380bac
+    # SmolLM2 also uses ChatML; retain supplied reasoning with this override.
+    chat_template: examples/chat_templates/qwen3_history.jinja
+    chat_template_kwargs:
+      enable_thinking: true
+      preserve_thinking: true
+      truncate_history_thinking: false
+  train_global_batch_size: 8
+  max_total_sequence_length: 1024
+  scheduler:
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 3
+teachers:
+- model_name: Qwen/Qwen3-1.7B
+  aligner:
+    projection_matrix_path: null
+    drop_first_assistant_chunk_kl: false
+  weight: 1.0
+  tokenizer:
+    name: Qwen/Qwen3-4B
+    tokenizer_kwargs:
+      revision: 1cfa9a7208912126459214e8b04321603b3df60c
+    chat_template: examples/chat_templates/qwen3_history.jinja
+    chat_template_kwargs:
+      enable_thinking: true
+      preserve_thinking: true
+      truncate_history_thinking: false
+  train_global_batch_size: 8
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 1024
+  make_sequence_length_divisible_by: 1
+  precision: bfloat16
+  logprob_chunk_size: null
+  offload_optimizer_for_logprob: false
+  dtensor_cfg:
+    enabled: true
+    _v2: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+  max_grad_norm: 1.0
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: 2048
+    logprob_mb_tokens: 2048
+    sequence_length_round: 64
+  sequence_packing:
+    enabled: false
+    train_mb_tokens: 2048
+    logprob_mb_tokens: 2048
+    algorithm: modified_first_fit_decreasing
+    microbatch_order: packer
+    sequence_length_round: 64
+  optimizer:
+    name: torch.optim.AdamW
+    kwargs:
+      lr: 5.0e-05
+      weight_decay: 0.001
+      betas:
+      - 0.9
+      - 0.95
+      eps: 1.0e-08
+      foreach: false
+      fused: false
+data:
+  _override_: true
+  max_input_seq_length: 1024
+  shuffle: true
+  num_workers: 4
+  train:
+    dataset_name: openai_format
+    processor: chat_kd_processor
+    data_path: ???
+    use_preserving_dataset: true
+  validation: null
+logger:
+  log_dir: logs/xtoken_native_chat
+  wandb_enabled: false
+  tensorboard_enabled: true
