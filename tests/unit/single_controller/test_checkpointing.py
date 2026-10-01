@@ -171,6 +171,9 @@ class _FakeTrainer:
     def prepare_for_training(self) -> None:
         pass
 
+    def sync_params_before_refit(self) -> None:
+        pass
+
     def begin_train_step(self, loss_fn: Any) -> None:
         pass
 

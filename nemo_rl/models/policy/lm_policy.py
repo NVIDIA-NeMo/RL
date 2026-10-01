@@ -41,6 +41,7 @@ from nemo_rl.models.generation.interfaces import (
     RefitPayloadMode,
 )
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy.draft_config import coerce_draft_config
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
@@ -150,7 +151,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         megatron_enable = bool(config.get("megatron_cfg", {}).get("enabled", False))
         dtensor_enable = bool(config.get("dtensor_cfg", {}).get("enabled", False))
-        draft_enabled = bool(config.get("draft", {}).get("enabled", False))
+        # Normalize in place: every downstream reader (workers, setup, train)
+        # accesses draft config by attribute, so a hand-built PolicyConfig has
+        # to be validated here rather than only inside MasterConfig.
+        draft_config = coerce_draft_config(config.get("draft"))
+        if draft_config is not None:
+            config["draft"] = draft_config
+        draft_enabled = bool(draft_config is not None and draft_config.enabled)
         if megatron_enable and dtensor_enable:
             raise ValueError(
                 "Configure either Megatron (policy.megatron_cfg.enabled=true) or "
@@ -1335,6 +1342,17 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         """Materialize the latest parameters on every policy worker before refit."""
         futures = self.worker_group.run_all_workers_single_data(
             "sync_params_before_refit"
+        )
+        ray.get(futures)
+
+    def export_hf_checkpoint(self, output_path: str) -> None:
+        """Collectively export the live Megatron model as an HF checkpoint."""
+        if not self.cfg.get("megatron_cfg", {}).get("enabled"):
+            raise NotImplementedError(
+                "Live HF checkpoint export currently requires a Megatron policy"
+            )
+        futures = self.worker_group.run_all_workers_single_data(
+            "export_hf_checkpoint", output_path=output_path
         )
         ray.get(futures)
 

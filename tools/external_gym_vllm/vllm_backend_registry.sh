@@ -27,12 +27,12 @@ _ensure_registry() {
 }
 
 registry_add() {
-  local backend_id="$1" ip="$2" port="$3"
+  local backend_id="$1" ip="$2" port="$3" role="${4:-standard}"
   _ensure_registry
   (
     flock -w 10 200
     grep -v "^${backend_id} " "${REGISTRY_FILE}" > "${REGISTRY_FILE}.tmp" 2>/dev/null || true
-    echo "${backend_id} ${ip} ${port} $(date +%s) ready" >> "${REGISTRY_FILE}.tmp"
+    echo "${backend_id} ${ip} ${port} $(date +%s) ready ${role}" >> "${REGISTRY_FILE}.tmp"
     mv "${REGISTRY_FILE}.tmp" "${REGISTRY_FILE}"
   ) 200>"${REGISTRY_LOCK}"
 }

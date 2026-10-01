@@ -1,0 +1,164 @@
+# Single Controller SWE1 prototype for Nemotron 3.5 Lightning,
+# with rollout generation hosted outside the training Ray cluster.
+#
+# The first parent contributes the Single Controller/data-plane configuration.
+# The second contributes the model-specific Megatron settings validated by the
+# Nemotron 3.5 Lightning RLVR workload. This file then replaces generation with
+# the remote-vLLM adapter and narrows NeMo Gym to the SWE1 pivot task.
+defaults:
+  - ../../configs/grpo_math_1B_megatron_single_controller.yaml
+  - ./rlvr.yaml
+
+grpo:
+  # Single Controller uses async_rl; the legacy async block must be absent.
+  async_grpo: null
+  # Single Controller validation is not implemented yet.
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  max_rollout_turns: 1
+  invalid_tool_call_advantage: -5.0
+  malformed_thinking_advantage: -5.0
+
+policy:
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs:
+      enable_thinking: true
+
+  generation:
+    backend: remote_vllm
+    # These local-engine blocks are inherited from the two reference configs
+    # but are intentionally inactive for an externally managed rollout engine.
+    mcore_generation_config: null
+    vllm_cfg: null
+    vllm_kwargs: null
+    refit_cfg: null
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    val_temperature: ${.temperature}
+    val_top_p: ${.top_p}
+    val_top_k: ${.top_k}
+    stop_token_ids: null
+    stop_strings: null
+    remote_vllm_cfg:
+      # The external-vLLM launcher publishes an OpenAI base URL ending in /v1.
+      # Absolute control paths are resolved against the same URL origin.
+      base_url: ${oc.env:EXTERNAL_ROLLOUT_VLLM_URL}
+      served_model_name: policy
+      max_model_len: 73728
+      health_path: /health
+      models_path: /v1/models
+      server_info_path: /server_info
+      pause_path: /pause
+      resume_path: /resume
+      collective_rpc_path: /collective_rpc
+      reset_prefix_cache_path: /reset_prefix_cache
+      request_timeout_s: 7200.0
+      connect_timeout_s: 5.0
+      api_key_env_var: null
+      refit:
+        checkpoint_dir: ${oc.env:EXTERNAL_ROLLOUT_HF_EXPORT_DIR}
+        inflight_policy: keep
+        timeout_s: 1800.0
+
+    # The external service owns its GPUs, so the training Ray cluster allocates
+    # no inference resources.
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: null
+        num_nodes: null
+
+data:
+  _override_: true
+  max_input_seq_length: null
+  shuffle: false
+  num_workers: 1
+  use_multiple_dataloader: false
+  train:
+    data_path: ${oc.env:HF_HOME}/superv3_data/swe1/train-split.jsonl
+  validation:
+    data_path: ${oc.env:HF_HOME}/superv3_data/swe1/val-split.jsonl
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    prompt_file: null
+    system_prompt_file: null
+    processor: nemo_gym_data_processor
+
+env:
+  _override_: true
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: false
+  should_mask_flagged_samples: true
+  nemo_gym:
+    skip_venv_if_present: true
+    num_gpu_nodes: 0
+    port_range_low: 5000
+    port_range_high: 5999
+    invalid_tool_call_patterns:
+      - <tool_call>
+      - </tool_call>
+      - <function_call>
+      - </function_call>
+    thinking_tags:
+      - <think>
+      - </think>
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - resources_servers/single_step_tool_use_with_argument_comparison/configs/swe_pivot_single_step_tool_use_with_argument_comparison.yaml
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          chat_template_kwargs:
+            enable_thinking: true
+            force_nonempty_content: true
+    single_step_tool_use_with_argument_comparison_swe:
+      responses_api_agents:
+        tool_simulation_agent:
+          entrypoint: app.py
+          resources_server:
+            type: resources_servers
+            name: swe_pivot_single_step_tool_use_with_argument_comparison_resources_server
+          model_server:
+            type: responses_api_models
+            name: policy_model
+    use_absolute_ip: true
+
+# The exact Lightning workload uses 32 four-GPU nodes for Megatron training.
+# Rollout GPUs are intentionally excluded and allocated by the launch script.
+cluster:
+  gpus_per_node: 4
+  num_nodes: 32
+  segment_size: 2
+
+async_rl:
+  sampler:
+    name: in_order
+    max_lookahead_versions: 1
+  generation_fleet_health:
+    enabled: false
+    # The HTTP refit client applies remote_vllm_cfg.refit.timeout_s. The local
+    # collective watchdog does not own this transport.
+    refit_timeout_s: null
+  generation_router:
+    enabled: false
+
+checkpointing:
+  checkpoint_dir: results/nemotron-3.5-lightning-swe1-external-vllm-single-controller
+  # No validation metrics are emitted by Single Controller yet.
+  metric_name: null
+
+logger:
+  log_dir: logs/nemotron-3.5-lightning-swe1-external-vllm-single-controller
+  wandb:
+    project: nemo-rl-swe
+    name: nemotron-3.5-lightning-swe1-external-vllm-single-controller
+  swanlab:
+    name: nemotron-3.5-lightning-swe1-external-vllm-single-controller
+  mlflow:
+    experiment_name: nemo-rl-swe
+    run_name: nemotron-3.5-lightning-swe1-external-vllm-single-controller

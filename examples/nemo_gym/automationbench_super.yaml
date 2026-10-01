@@ -1,0 +1,427 @@
+# AutomationBench Nemotron 3.5 *Super* — the recipe launch_super.sh runs.
+#
+# `workload` is flattened into Hydra overrides by launch.sh. Deployment paths,
+# cluster profiles, Slurm allocation, datasets, and smoke-only overrides stay
+# in the launcher so the behavior-defining GRPO recipe remains reviewable here.
+#
+# Forked from automationbench_lightning.yaml on 2026-09-10. The `recipe` block
+# (base config, source pins, profiles, datasets, corpora) is a verbatim mirror
+# of that file and must move with it: launch.sh reads corpus digests and panel
+# registrations from whichever recipe file it is given, and there is no
+# include. The `workload` block is where the two differ -- Super's optimizer
+# peak, checkpoint retention, advantage normalisation, and a validation cadence
+# sized for the 600-row AB600 panel rather than dev60. launch_super.sh still
+# recomputes the training parallelism per shape and applies the async-only
+# loss settings on top.
+
+schema_version: 1
+
+recipe:
+  base_config: examples/nemo_gym/grpo_automationbench_lightning.yaml
+  base_config_sha256: e7388a2bf44d32b15ba7da9bfec98e59b003305be8691c1fee1c5f00b3b3b92f
+  source_commit: fae99da2a788b4b593b119e41a255814d1f64320
+  source_note: Shared critical runtime files are pinned here; cluster-specific differences are pinned per profile
+  source_files:
+    pyproject:
+      path: pyproject.toml
+      sha256: 80e94b53f5e3dc05c1c71d3917496a658956167ea3756cc46d9633933a830daa
+    uv_lock:
+      path: uv.lock
+      sha256: 1061840534001eeac8c75f2937c828e3ad89ef47e092269bad523b96bd6827cc
+    runner:
+      path: examples/nemo_gym/run_grpo_nemo_gym.py
+      sha256: 303da1378e68a74f5e7dd6f0de48c57d516953096297b64672c7428fe020467b
+    base_config:
+      path: examples/nemo_gym/grpo_automationbench_lightning.yaml
+      sha256: e7388a2bf44d32b15ba7da9bfec98e59b003305be8691c1fee1c5f00b3b3b92f
+    grpo:
+      path: nemo_rl/algorithms/grpo.py
+      sha256: 4b5539a7ea2abb4dfb1ffa553e3213a96c303fa179a5534fa6d672b76dfea5fc
+    logger:
+      path: nemo_rl/utils/logger.py
+      sha256: 8fb1e6d572f7d18c36709569b743789becfab580737d7436b84b8827d76a48c5
+    nemo_gym:
+      path: nemo_rl/environments/nemo_gym.py
+      sha256: 95d53652345608985a4507f190b3eb09b9f041b3b12e8aec919940031e7fe100
+    rollouts:
+      path: nemo_rl/experience/rollouts.py
+      sha256: aa3346d6db51ee6a5868e0d739d4170047ac7d7c3101a879c53faa13baee04fd
+    vllm_worker_async:
+      path: nemo_rl/models/generation/vllm/vllm_worker_async.py
+      sha256: aa8bf10543b92469ec4712151a69740f9bb3e7c54eeb998cb9e34bd1fe9d03b0
+    megatron_worker:
+      path: nemo_rl/models/policy/workers/megatron_policy_worker.py
+      sha256: e3360efb1bd0a6359c6cd016555ff2b3cedfedac6b6e88836009b076f1484001
+    worker_groups:
+      path: nemo_rl/distributed/worker_groups.py
+      sha256: 23da12e2eeea0105a8fbe2d1031ad8d3aaf1fee628105fc9f701744926bc91e4
+    nemogym_dataset:
+      path: nemo_rl/data/datasets/response_datasets/nemogym_dataset.py
+      sha256: d284e02281dd25f4de82c763bb9bc2968858f0df72694788e29b660cc3f54528
+    processors:
+      path: nemo_rl/data/processors.py
+      sha256: 2bc95127cb464eed11b67e21f3b12d3299f9baff2a0d16087f7ad10f80728882
+  model_files:
+    config:
+      path: config.json
+    weights_index:
+      path: model.safetensors.index.json
+      sha256: 67f21da80ce245a3e24967f54eef3fa10e67a63eba16ef19a2d0569f06103f50
+    tokenizer:
+      path: tokenizer.json
+      sha256: 623c34567aebb18582765289fbe23d901c62704d6518d71866e0e58db892b5b7
+  profiles:
+    prenyx:
+      # Super-v3.5 stack, like every other profile -- but on the x86_64 build
+      # rl-gym.pipe.63959419-x86, because Prenyx is the only x86 cluster and the
+      # ARM64 pipe.64391373 the other four share cannot run here. That build is
+      # older than their pin; no newer -x86 image exists in the registry.
+      #
+      # The old-stack rl-ultra-internal.pipe.51132285 (18293891072 bytes,
+      # a986894d48ed4cf3c36417633d4f7202a79324185584af75729204a42cb99e01) is no
+      # longer the profile default: it is cp312 and cannot resolve the ab-evals
+      # Gym. Pass CONTAINER= explicitly to reach it for the legacy/V1 arms, at
+      # which point launch.sh treats the image as custom and this pin does not
+      # apply (CONTAINER_SIZE_BYTES/CONTAINER_SHA256 override it).
+      #
+      # Digest recorded rather than `unrecorded`: the four super-v3.5 profiles
+      # leave it blank because their images are imported per cluster by enroot
+      # and the packing is not reproducible, but this one is a single staged
+      # file, so hashing it once is meaningful. VERIFY_CONTAINER_SHA256=1 now
+      # works on Prenyx and nowhere else.
+      model_config_sha256: 30e3596edd698d89f21d5cac9f125615206663a59108d1a0b3d923056f581ddf
+      container:
+        size_bytes: 36701622272
+        sha256: 757ab4f61e0debdc0ec2010a6661ff10d695fa5dd704880a4e05e04ac163068b
+    cmh:
+      # Super-v3.5 stack: native Nemotron-H checkpoint (no transformers-v4
+      # sidecar) inside the rl-gym:pipe.64391373 pipeline image, staged into
+      # this user's containers directory on CMH.
+      model_config_sha256: a3827a0f5e311547b40943dc081e3ff2f8a277466e8c1a3df2291e8db8a7617c
+      container:
+        size_bytes: 80795996160
+        sha256: unrecorded
+    lyris:
+      # Super-v3.5 stack, same as hsg/cmh: native Nemotron-H checkpoint (no
+      # transformers-v4 sidecar) inside rl-gym:pipe.64391373, imported from the
+      # registry onto this cluster.
+      #
+      # Same image, DIFFERENT size, deliberately. hsg/cmh use a squashfs built
+      # upstream; this one is packed by `enroot import` with its own default
+      # compression, which is 27.8 GB against their 80.8 GB. Size is a property
+      # of the packing, not of the contents: the extracted
+      # megatron/bridge/models/{nemotron_omni/nemotron_omni_bridge,conversion/
+      # auto_bridge}.py are byte-identical to the hsg/cmh image and to the host
+      # submodule (c8bb2da6.../f6eadfae...), and /opt/nemo_rl_venv and
+      # /opt/ray_venvs are both fully present. Do not "correct" this back to
+      # the hsg/cmh number.
+      model_config_sha256: a3827a0f5e311547b40943dc081e3ff2f8a277466e8c1a3df2291e8db8a7617c
+      container:
+        size_bytes: 27840778240
+        sha256: unrecorded
+    ptyche:
+      # Super-v3.5 stack, same image as hsg/cmh/lyris, imported from the
+      # registry on an aarch64 compute node. enroot packs it to the same
+      # 27.8 GB as the Lyris import (both differ from the 80.8 GB upstream
+      # squashfs hsg/cmh use; size is a property of the packing, and content
+      # identity was established from the bridge file hashes instead).
+      # This cluster's Lightning checkpoint is the prenyx-style copy, not the
+      # native one hsg/cmh/lyris carry, so its config hash differs.
+      model_config_sha256: 30e3596edd698d89f21d5cac9f125615206663a59108d1a0b3d923056f581ddf
+      container:
+        size_bytes: 27840778240
+        sha256: unrecorded
+    hsg:
+      # Super-v3.5 stack: native Nemotron-H checkpoint (no transformers-v4
+      # sidecar) inside the pipeline-pinned rl-gym:pipe.64391373 image.
+      model_config_sha256: a3827a0f5e311547b40943dc081e3ff2f8a277466e8c1a3df2291e8db8a7617c
+      extra_source_files:
+        sidecar_helper:
+          path: automationbench-synth53/scripts/prepare_nemotron_h_v4_sidecar.sh
+          sha256: 3b3b5d577314e2e1bd8fb6fd1c6950e50a9eed2456dfd870304a78082c6eab01
+        model_runtime_preflight:
+          path: automationbench-synth53/scripts/model_runtime_preflight.py
+          sha256: 3f516b99f8b6072ab71dbf19a0fba3dcbaa54cdeba89bd5e901aeb4d16d24f3a
+      container:
+        size_bytes: 80795996160
+        sha256: unrecorded
+  workspace_fingerprint_sha256: unrecorded
+  ray_cluster_waiter_sha256: 72d2fb605a2b6eabe6275d52532e06f80fcbd8d9d06703b2b066a0ad45fe1125
+  run_sbatch_sha256: 2a66aa3d97cf6924af883266aefdd1ed500b742bde3bce974312403a2df9c1bb
+  datasets:
+    # ay1: 2,200 tasks generated at seed 11, split by officegen into 2,000 train
+    # rows and a 200-row holdout (validation.jsonl). Rows arrive already routed at
+    # automationbench_env / agent `automationbench`, so nothing re-routes them.
+    abg2200_easy_ay1:
+      filename: automationbench-ay1/abg2200-easy-ay1/tasks.jsonl
+      sha256: 2b69c97fcfecdf78a2dde548798188244762f82f21aab78679e3193b8d4874e6
+      rows: 2000
+    # Medium tier, seed 12: same generator and split, longer and dirtier tasks.
+    abg2200_medium_ay1:
+      filename: automationbench-ay1/abg2200-medium-ay1/tasks.jsonl
+      sha256: 8ae38bc7b9d1bdcdf35096cdf55d4986c42fc17436496e6fe399253a62d26a93
+      rows: 2000
+    # ay1 contract, ax1 sampler: continuation_share 0.15, short_roster_share 0.25.
+    abg2200_medium_ax1:
+      filename: automationbench-ay1/abg2200-medium-ax1/tasks.jsonl
+      sha256: cb7390a7d685a809c012a962de2bbc4b98d7e073d6c2bf0915fad578292fb057
+      rows: 2000
+  corpora:
+    abg2200-easy-ay1:
+      # AB300: 50 tasks from each of the 6 public AutomationBench domains
+      # (finance, hr, marketing, operations, sales, support), sampled seed 300
+      # from the 600-task public set via the environment's own loader, so it is
+      # the real benchmark rather than anything officegen generated. Zero
+      # overlap with the training corpus by example_id and by task_name.
+      #
+      # example_id is namespaced by domain here on purpose: the public set
+      # scopes it PER DOMAIN, so marketing 1008 and sales 1008 are different
+      # tasks and a naive merge produces 9 duplicate ids across 300 rows.
+      ab300:
+        filename: automationbench-ay1/abg2200-easy-ay1/ab300.jsonl
+        sha256: 81b141e24d35a527835fa764d9a4ad9319e104d5312d1f362db2c4c221c1c4c6
+        rows: 300
+      validation:
+        filename: automationbench-ay1/abg2200-easy-ay1/validation.jsonl
+        sha256: 5f375c4a820cc7d1f67c7c9e2437a591110e81092123fa56aaa902cd760153e4
+        rows: 200
+    abg2200-medium-ay1:
+      validation:
+        filename: automationbench-ay1/abg2200-medium-ay1/validation.jsonl
+        sha256: 2f520a7f32e30ce5f12a80d5daf08e0800dbad5e81f2e4611e92a510789e09c5
+        rows: 200
+    abg2200-medium-ax1:
+      validation:
+        filename: automationbench-ay1/abg2200-medium-ax1/validation.jsonl
+        sha256: 86ccda72e1d9eb031be3f90494ae74d3a101ce1ab461e2c1436d0d37ae93afdb
+        rows: 200
+      # AB300, byte-identical to the abg2200-easy-ay1 copy (same sha, same 300
+      # rows). The panel is the public benchmark and carries the environment's
+      # own prompts, so it is corpus-independent; it is registered per corpus
+      # only because launch.sh mounts the SELECTED corpus dir at
+      # /data/automationbench-ay1/active, and a panel outside that dir is not
+      # visible to the container. So the file is copied into this corpus rather
+      # than referenced across corpora.
+      #
+      # Holding the digest identical is the point: the ay1 aa/partial nano
+      # ablation scores this exact file, so a Super number on it is comparable
+      # to those runs directly, not merely "also AB300".
+      ab300:
+        filename: automationbench-ay1/abg2200-medium-ax1/ab300.jsonl
+        sha256: 81b141e24d35a527835fa764d9a4ad9319e104d5312d1f362db2c4c221c1c4c6
+        rows: 300
+      # The full public AutomationBench 600, reshaped from the v107 V1 task tree
+      # into v0 rows by build_ay1_ab600_panel.py. Routed at `automationbench_aa`,
+      # so it is only usable with the split agent config -- the row validator
+      # rejects these rows anywhere else. Carries this corpus's system prompt,
+      # not AB600's staged one, so it is read on the same instructions the
+      # policy trains under and is NOT byte-comparable to earlier AB600 V1 runs.
+      ab600:
+        filename: automationbench-ay1/abg2200-medium-ax1/ab600.jsonl
+        sha256: 1f6c71ed99deac0e633cc4ccdfc7c66b267ffb72f00520032805ca856e880e82
+        rows: 600
+workload:
+  data:
+    shuffle: true
+
+  checkpointing:
+    save_period: 10
+    checkpoint_must_save_by: "00:03:00:00"
+    # A Super checkpoint with optimizer state is ~1.6 TB. The base config's
+    # keep_top_k: 1000000 (never prune) is coherent for a 30B policy and is
+    # 32 TB per ten saves here.
+    keep_top_k: 5
+
+  grpo:
+    # GPP=8 at fixed GBS 512: 64 distinct tasks per step instead of 8. The
+    # group is smaller, but AutomationBench reward variance is dominated by
+    # task difficulty rather than within-task sampling, so prompt diversity
+    # buys more than group depth here.
+    num_prompts_per_step: 64
+    num_generations_per_prompt: 8
+    # One rollout per held-out row makes dev6/dev60 true pass@1 panels. The
+    # inherited base otherwise repeats every validation task four times.
+    # (super-v3.5 stack renamed num_val_generations_per_prompt.)
+    val_num_generations_per_prompt: 1
+    # Keep the policy forward enabled and mask only divergent sequences. Setting
+    # this to null with force_on_policy_ratio would persist fake all-zero prev LPs.
+    # Held at 2.0 even off-policy: cmunley's async reference config runs the
+    # same threshold at max_trajectory_age_steps=16.
+    seq_logprob_error_threshold: 2.0
+    # The binding cap is the agent's own verifiers.agent.max_turns=50, which
+    # launch.sh pins and validates; the Gym rollout path passes this key
+    # through as None (validation) and its async impl asserts it must be 1, so
+    # nothing here has ever governed a rollout. Measured on 64 completed
+    # Super rollouts: p50=19, p90=29, max=42 agent steps — the 50-turn cap is
+    # never reached. Held at 50 so that the two numbers agree and any path
+    # that does start reading it enforces the AB-aligned cap.
+    max_rollout_turns: 50
+    max_num_steps: 100
+    max_num_epochs: 100000
+    # Every 20 steps. With VAL_SET=ab600 (the Super wrapper's training default)
+    # one validation pass is 600 rollouts at one generation each, and on the
+    # 64-node async shape it tracked toward ~45 min (0910-abmx64c head: 320/600
+    # rows 28 min in, 0 aborts, 2026-09-10). The Lightning recipe's 5 was sized
+    # for dev60 and would have spent roughly a third of this campaign's wall
+    # clock validating. nemo-rl merges all validation rows into one dataset and
+    # reports a single blended accuracy, with no per-task breakdown; split by
+    # task_idx from the persisted val_data_step*.jsonl to read panels separately.
+    val_period: 20
+    # Off. Measuring step 0 on the curve was cheap on dev60 x two arms (120
+    # rollouts, under half a step at GBS 512). On AB600 it is 600 rollouts
+    # before the first optimizer step, ~45 min of a 4h segment, and the base
+    # checkpoint's AB600 number is available from the standalone evals
+    # (ab600_eval_*.sh). Turn back on for a new policy family.
+    val_at_start: false
+    val_at_end: true
+    # No group advantage normalisation: advantages stay (reward - baseline)
+    # rather than divided by the in-group std. The live knob is
+    # grpo.adv_estimator.normalize_rewards, set under hydra_overrides below
+    # because the base config declares no adv_estimator block; this top-level
+    # flag is read by nothing at runtime and is set so the declared and
+    # effective values cannot disagree. Deliberately diverges from the
+    # pipeline's Super RLVR configs (normalize_rewards: true): dividing by the
+    # in-group std lets easy prompts push as hard as hard ones, and on a dense
+    # partial-credit reward group spread tracks task difficulty.
+    normalize_rewards: false
+    async_grpo:
+      enabled: false
+
+  policy:
+    train_global_batch_size: 512
+    # 127k. At 65536 the medium-ah1 episodes ran the context out: 569 events
+    # of "Prompt length (65,6xx) fills or exceeds max_model_len (65537)" on
+    # CMH and 1426 on Lyris, each costing three agent retries and then killing
+    # the rollout — 140 and 372 dead rollouts respectively. Turns were never
+    # the cause (max 42 of 50); full-history replay at ~61 tool calls is.
+    # 130048 = 127*1024 and is divisible by make_sequence_length_divisible_by
+    # (TP8*CP4*2 = 64).
+    max_total_sequence_length: 130048
+    megatron_cfg:
+      # Colocated Super shape: TP8 x CP4 (DP over the rest), EP16 x ETP1, PP1.
+      # launch_super.sh recomputes all of these per shape -- CP8 / EP64 on the
+      # disaggregated async split -- validates the geometry against the
+      # training GPU count, and passes them as overrides, so these are the
+      # documented colocated values rather than the only ones that run.
+      tensor_model_parallel_size: 8
+      expert_model_parallel_size: 16
+      context_parallel_size: 4
+      pipeline_model_parallel_size: 1
+      sequence_parallel: true
+      empty_unused_memory_level: 2
+      freeze_moe_router: true
+      moe_router_dtype: fp32
+      moe_router_load_balancing_type: none
+      moe_router_enable_expert_bias: true
+      moe_aux_loss_coeff: 0.0
+      moe_shared_expert_overlap: false
+      mtp_loss_scaling_factor: 0.3
+      mtp_use_repeated_layer: true
+      mtp_num_layers: 5
+      mtp_detach_heads: true
+      first_last_layers_bf16: true
+      num_layers_at_start_in_bf16: 1
+      num_layers_at_end_in_bf16: 1
+      optimizer:
+        # The pipeline's own Super RLVR value, agreed by all four of its Super
+        # configs (super35_rlvr_134n, super35_rlvr_pipeclean_64n,
+        # super35_rlvr_blend28_fp32_lmhead_120n, grpo_superv3_5_rlvr_blend28-
+        # oci-hsg-20260902-r1): lr 4.0e-6, min_lr 4.0e-6, warmup_init 4e-7,
+        # warmup 10 iters, constant decay. Lightning's 2.0e-6 belongs to that
+        # checkpoint. SUPER_LR / SUPER_MIN_LR / SUPER_LR_WARMUP_INIT in
+        # launch_super.sh re-point these for one run.
+        lr: 4.0e-6
+        min_lr: 4.0e-6
+      scheduler:
+        lr_warmup_iters: 10
+        # lr/10, the ratio the pipeline and the base config both use.
+        lr_warmup_init: 4.0e-7
+        lr_decay_style: constant
+        lr_decay_iters: 1000000
+      distributed_data_parallel_config:
+        overlap_grad_reduce: false
+    generation:
+      max_new_tokens: 130048
+      vllm_cfg:
+        max_model_len: 130048
+        # 0.60, not 0.80. At 0.80 vLLM holds ~143 GiB of a B200's 178 GiB, and
+        # the colocated Megatron half OOMs inside the MTP loss head:
+        #
+        #   multi_token_prediction.py -> compute_language_model_loss ->
+        #   fused_vocab_parallel_cross_entropy
+        #   buf = empty_strided_cuda((s10, 1, 32768), torch.float32)
+        #   torch.OutOfMemoryError: Tried to allocate 3.20 GiB;
+        #   178.35 GiB total, 3.13 GiB free, vLLM process holding 145.37 GiB
+        #
+        # 32768 is the vocab-parallel logits width (131072 / TP4) and it is
+        # materialized in fp32, once per `calculate_logits_max` and again per
+        # `calculate_predicted_logits`, for each of the 5 mtp_num_layers heads.
+        # The buffer scales with sequence length: 3.20 GiB is ~26k tokens, and
+        # the per-CP-rank ceiling here is 130048/CP4 = 32,512 tokens (~4.3 GiB
+        # per buffer). So the requirement is ~10 GiB of headroom and 0.80 left
+        # ~3 GiB -- short episodes fit and long ones do not, which is why this
+        # presents as a random mid-run failure rather than a startup error.
+        #
+        # Observed 2026-09-09 on prenyx: BOTH ablation arms lost a segment to
+        # it (2457719 after 3:24:12, 2457739 after 1:52:57, both exit 1:0) on
+        # identical config. Host memory is not involved -- MaxRSS was 27 MB
+        # against a 16 TB request and no OOM-killer fired.
+        #
+        # 0.60 frees ~36 GiB per GPU, well past the ~10 GiB needed. It is also
+        # what launch_super.sh already pins via VLLM_GPU_MEM_UTIL for the Super
+        # policy, so the two arms now agree. Raising this back to 0.80 requires
+        # either shorter episodes or fewer MTP heads, and both change what is
+        # being trained.
+        gpu_memory_utilization: 0.60
+        http_server_serving_chat_kwargs:
+          tool_parser: qwen3_coder
+          reasoning_parser: deepseek_r1
+      colocated:
+        enabled: true
+
+  logger:
+    wandb_enabled: false
+
+  env:
+    # False means write train_data_step*.jsonl in this source lineage. The smoke
+    # audit uses those persisted trajectories to verify multi-turn tool use.
+    should_log_nemo_gym_responses: false
+    nemo_gym:
+      config_paths:
+        - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+        - environments/automationbench/config.yaml
+
+# Keys needing Hydra add/delete syntax remain explicit.
+hydra_overrides:
+  # Each AB sample launches its own tool-server subprocess. Bound the complete
+  # episode lifecycle so a 512-rollout GRPO batch cannot create a process-startup
+  # storm before Verifiers' port-discovery deadline. `++` supports parent configs
+  # both with and without this key. The bound must also keep every vLLM engine
+  # busy: fleet automation reaps allocations whose GPUs idle for 30 minutes
+  # (HSG 6662118 died with "11/32 GPUs idle for 30m" at the original value 16,
+  # which starved 8 engines to ~2 in-flight rollouts each). Tuned on the
+  # 8-node HSG smoke shape: 16 -> reaped; 64 -> 29:36; 128 -> 21:10 (dev60
+  # validation 152s); 256 -> 21:57 with no further gain. 128 = 16 in-flight
+  # rollouts per TP4 engine at that shape.
+  - "++env.nemo_gym.num_samples_in_parallel=128"
+  # Fault-tolerance saves every step. This is the resume granularity, so it is
+  # also the loss when a segment dies, and on this arm segments die for reasons
+  # that have nothing to do with the step: preemption at the QOS exemption
+  # boundary, host OOM, a Gym transport fault. At 2 the chain gave back up to
+  # two steps per death, and at ~15 min/step across a 20-segment chain that is
+  # the difference between a chain that converges and one that treads water.
+  #
+  # The cost is one extra async save per step against a save_period=10 real
+  # checkpoint, and ft_keep_latest_k=1 means it never accumulates.
+  # Smoke/preflight modes already forced 1; this makes train agree with them
+  # instead of being the one mode that loses work.
+  # (`++` because the super-v3.5 base config declares these keys natively;
+  # the old stack's math agents are gone from the base, so the former
+  # `~env.nemo_gym.*` deletions are no longer needed.)
+  - "++checkpointing.ft_save_period=1"
+  - "++policy.megatron_cfg.scheduler.override_opt_param_scheduler=true"
+  - "++policy.megatron_cfg.gradient_accumulation_fusion=false"
+  # The knob the advantage estimator actually reads (see grpo.normalize_rewards
+  # above). `++` because the base config declares no adv_estimator block; the
+  # estimator otherwise runs on its dataclass defaults.
+  - "++grpo.adv_estimator.normalize_rewards=false"

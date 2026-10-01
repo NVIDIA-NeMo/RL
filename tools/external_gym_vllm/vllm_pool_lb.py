@@ -41,6 +41,7 @@ import os
 import signal
 import sys
 import time
+import uuid
 from pathlib import Path
 
 MAX_RSS_MB = 4096
@@ -72,6 +73,24 @@ log = logging.getLogger("vllm_pool_lb")
 # one until the next health probe clears it.
 RETRYABLE_UPSTREAM_STATUSES = {500, 502, 503, 504}
 
+# vLLM can stop passing its normal health probe while generation is paused.
+# Refit control requests must still reach a registered backend so it can reload
+# weights and resume. The rollout preflight currently requires exactly one
+# independent backend, so routing these paths to any registered backend is
+# unambiguous (native TP/PP/DP workers remain behind that one backend).
+REFIT_CONTROL_PATHS = {
+    "/pause",
+    "/collective_rpc",
+    "/v1/nemo-rl/token-capture/configure",
+    "/reset_prefix_cache",
+    "/resume",
+}
+
+DISAGGREGATED_GENERATION_PATHS = {
+    "/v1/chat/completions",
+    "/v1/completions",
+}
+
 
 def _read_current_rss_mb() -> float | None:
     """Read the process's current resident memory from procfs."""
@@ -95,12 +114,23 @@ class UpstreamRetryableStatus(Exception):
 
 
 class Backend:
-    __slots__ = ("job_id", "host", "port", "healthy", "inflight", "last_check")
+    __slots__ = (
+        "job_id",
+        "host",
+        "port",
+        "role",
+        "healthy",
+        "inflight",
+        "last_check",
+    )
 
-    def __init__(self, job_id: str, host: str, port: int) -> None:
+    def __init__(
+        self, job_id: str, host: str, port: int, role: str = "standard"
+    ) -> None:
         self.job_id = job_id
         self.host = host
         self.port = port
+        self.role = role
         self.healthy = True
         self.inflight = 0
         self.last_check = 0.0
@@ -111,7 +141,10 @@ class Backend:
 
     def __repr__(self) -> str:
         status = "UP" if self.healthy else "DOWN"
-        return f"Backend({self.job_id}, {self.host}:{self.port}, {status}, inflight={self.inflight})"
+        return (
+            f"Backend({self.job_id}, {self.host}:{self.port}, role={self.role}, "
+            f"{status}, inflight={self.inflight})"
+        )
 
 
 class BackendPool:
@@ -137,9 +170,9 @@ class BackendPool:
         if self._session:
             await self._session.close()
 
-    def _read_registry(self) -> dict[str, tuple[str, int]] | None:
-        """Read registry file. Returns {job_id: (host, port)}."""
-        result: dict[str, tuple[str, int]] = {}
+    def _read_registry(self) -> dict[str, tuple[str, int, str]] | None:
+        """Read registry file. Returns {job_id: (host, port, role)}."""
+        result: dict[str, tuple[str, int, str]] = {}
         if not self.registry_file.exists():
             return result
         try:
@@ -152,7 +185,10 @@ class BackendPool:
             parts = line.split()
             if len(parts) >= 5 and parts[4] == "ready":
                 try:
-                    result[parts[0]] = (parts[1], int(parts[2]))
+                    role = parts[5] if len(parts) >= 6 else "standard"
+                    if role not in {"standard", "prefill", "decode"}:
+                        raise ValueError(f"unknown backend role {role!r}")
+                    result[parts[0]] = (parts[1], int(parts[2]), role)
                 except ValueError:
                     log.warning("Skipping malformed registry entry: %s", line)
         return result
@@ -164,9 +200,9 @@ class BackendPool:
                 registered = self._read_registry()
                 if registered is not None:
                     # Add new backends
-                    for job_id, (host, port) in registered.items():
+                    for job_id, (host, port, role) in registered.items():
                         if job_id not in self.backends:
-                            b = Backend(job_id, host, port)
+                            b = Backend(job_id, host, port, role)
                             self.backends[job_id] = b
                             log.info("Discovered new backend: %s", b)
                     # Remove gone backends
@@ -212,45 +248,57 @@ class BackendPool:
             await asyncio.sleep(self.health_interval)
 
     def pick(
-        self, exclude: set[str] | None = None, affinity_key: str | None = None
+        self,
+        exclude: set[str] | None = None,
+        affinity_key: str | None = None,
+        *,
+        allow_unhealthy: bool = False,
+        role: str | None = None,
     ) -> Backend | None:
-        """Pick a healthy backend.
+        """Pick an eligible backend.
 
         If affinity_key is set, use consistent hashing to prefer the same backend
         for requests with the same prefix (enables vLLM prefix caching).
         Falls back to least-outstanding-requests if the preferred backend is
-        excluded or unhealthy.
+        excluded or unhealthy. ``allow_unhealthy`` is reserved for refit control
+        requests that must reach a backend while vLLM generation is paused.
         """
         exclude = exclude or set()
-        healthy = [
-            b for b in self.backends.values() if b.healthy and b.job_id not in exclude
+        eligible = [
+            b
+            for b in self.backends.values()
+            if (allow_unhealthy or b.healthy)
+            and b.job_id not in exclude
+            and (role is None or b.role == role)
         ]
-        if not healthy:
+        if not eligible:
             return None
 
-        if affinity_key and len(healthy) > 1:
+        if affinity_key and len(eligible) > 1:
             # Consistent hash: sort by hash(affinity_key + job_id) to get a
             # stable preference order. Pick the first one (preferred), but if
             # it's heavily loaded compared to the least-loaded, fall back.
             h = hashlib.md5(affinity_key.encode()).hexdigest()
             ranked = sorted(
-                healthy, key=lambda b: hashlib.md5((h + b.job_id).encode()).hexdigest()
+                eligible,
+                key=lambda b: hashlib.md5((h + b.job_id).encode()).hexdigest(),
             )
             preferred = ranked[0]
-            least_loaded = min(healthy, key=lambda b: b.inflight)
+            least_loaded = min(eligible, key=lambda b: b.inflight)
             # Use preferred backend unless it has 2x+ more inflight than the
             # least loaded — avoids hotspots when one prefix dominates.
             if preferred.inflight <= least_loaded.inflight * 2 + 10:
                 return preferred
             return least_loaded
 
-        return min(healthy, key=lambda b: b.inflight)
+        return min(eligible, key=lambda b: b.inflight)
 
     def summary(self) -> list[dict[str, str | bool | int]]:
         return [
             {
                 "job_id": b.job_id,
                 "url": b.base_url,
+                "role": b.role,
                 "healthy": b.healthy,
                 "inflight": b.inflight,
             }
@@ -259,9 +307,12 @@ class BackendPool:
 
 
 class LoadBalancer:
-    def __init__(self, pool: BackendPool, port: int) -> None:
+    def __init__(
+        self, pool: BackendPool, port: int, mode: str = "load-balance"
+    ) -> None:
         self.pool = pool
         self.port = port
+        self.mode = mode
         self._proxy_session: aiohttp.ClientSession | None = None
 
     async def start(self) -> None:
@@ -281,11 +332,21 @@ class LoadBalancer:
     async def handle_health(self, request: web.Request) -> web.Response:
         backends = self.pool.summary()
         healthy_count = sum(1 for b in backends if b["healthy"])
+        role_counts = {
+            role: sum(1 for backend in backends if backend["role"] == role)
+            for role in ("standard", "prefill", "decode")
+        }
         return web.json_response(
             {
                 "status": "ok" if healthy_count > 0 else "no_healthy_backends",
                 "healthy_backends": healthy_count,
                 "total_backends": len(backends),
+                "role_counts": role_counts,
+                "control_fanout": self.mode
+                in {
+                    "control-fanout",
+                    "disaggregated-prefill",
+                },
                 "backends": backends,
             }
         )
@@ -384,6 +445,148 @@ class LoadBalancer:
             backend.inflight -= 1
         raise RuntimeError("Upstream request exited without producing a response")
 
+    async def _request_json(
+        self,
+        backend: Backend,
+        path_qs: str,
+        headers: dict[str, str],
+        payload: dict[str, object],
+    ) -> dict[str, object]:
+        """Send a non-streaming JSON request to one backend."""
+        if self._proxy_session is None:
+            raise RuntimeError("Load balancer has not been started")
+        backend.inflight += 1
+        try:
+            async with self._proxy_session.post(
+                f"{backend.base_url}{path_qs}",
+                headers=headers,
+                json=payload,
+            ) as response:
+                body = await response.read()
+                if response.status >= 400:
+                    raise UpstreamRetryableStatus(response.status, body, {})
+                decoded = json.loads(body)
+                if not isinstance(decoded, dict):
+                    raise RuntimeError("prefill response is not a JSON object")
+                return decoded
+        finally:
+            backend.inflight -= 1
+
+    async def _handle_control_fanout(
+        self,
+        request: web.Request,
+        body: bytes,
+        headers: dict[str, str],
+    ) -> web.Response:
+        """Apply a refit control request to every P/D engine."""
+        backends = list(self.pool.backends.values())
+        if not backends:
+            return web.json_response({"error": "No registered backends"}, status=503)
+        results = await asyncio.gather(
+            *(
+                self._proxy_once(
+                    backend,
+                    request.method,
+                    request.path_qs,
+                    headers,
+                    body,
+                    request,
+                )
+                for backend in backends
+            ),
+            return_exceptions=True,
+        )
+        failures = []
+        for backend, result in zip(backends, results, strict=True):
+            if isinstance(result, Exception):
+                failures.append(f"{backend.job_id}: {type(result).__name__}: {result}")
+            elif result.status >= 400:
+                failures.append(f"{backend.job_id}: HTTP {result.status}")
+        if failures:
+            return web.json_response(
+                {"error": "Control request failed", "failures": failures}, status=502
+            )
+        return web.json_response({"status": "ok", "fanout_backends": len(backends)})
+
+    async def _handle_disaggregated_generation(
+        self,
+        request: web.Request,
+        body: bytes,
+        headers: dict[str, str],
+    ) -> web.StreamResponse:
+        """Run the official NIXL prefill handshake, then stream from decode."""
+        try:
+            payload = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return web.json_response({"error": "Request body must be JSON"}, status=400)
+        if not isinstance(payload, dict):
+            return web.json_response(
+                {"error": "Request body must be an object"}, status=400
+            )
+
+        affinity_key = self._extract_affinity_key(body)
+        prefill = self.pool.pick(affinity_key=affinity_key, role="prefill")
+        decode = self.pool.pick(affinity_key=affinity_key, role="decode")
+        if prefill is None or decode is None:
+            return web.json_response(
+                {"error": "No healthy prefill/decode backend pair is available"},
+                status=503,
+            )
+
+        request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
+        pd_headers = dict(headers)
+        pd_headers["X-Request-Id"] = request_id
+        prefill_payload = dict(payload)
+        prefill_payload.update(
+            {
+                "max_tokens": 1,
+                "stream": False,
+                "kv_transfer_params": {
+                    "do_remote_decode": True,
+                    "do_remote_prefill": False,
+                    "remote_engine_id": None,
+                    "remote_block_ids": None,
+                    "remote_host": None,
+                    "remote_port": None,
+                },
+            }
+        )
+        for key in ("stream_options", "min_tokens", "min_completion_tokens"):
+            prefill_payload.pop(key, None)
+        try:
+            prefill_response = await self._request_json(
+                prefill, request.path_qs, pd_headers, prefill_payload
+            )
+        except UpstreamRetryableStatus as error:
+            return web.Response(status=error.status, body=error.body)
+        except Exception as error:
+            prefill.healthy = False
+            log.exception("Disaggregated prefill failed via %s", prefill)
+            return web.json_response({"error": str(error)}, status=502)
+
+        kv_transfer_params = prefill_response.get("kv_transfer_params")
+        if not isinstance(kv_transfer_params, dict):
+            return web.json_response(
+                {"error": "Prefill response has no kv_transfer_params object"},
+                status=502,
+            )
+        decode_payload = dict(payload)
+        decode_payload["kv_transfer_params"] = kv_transfer_params
+        decode_body = json.dumps(decode_payload).encode()
+        try:
+            return await self._proxy_once(
+                decode,
+                request.method,
+                request.path_qs,
+                pd_headers,
+                decode_body,
+                request,
+            )
+        except Exception as error:
+            decode.healthy = False
+            log.exception("Disaggregated decode failed via %s", decode)
+            return web.json_response({"error": str(error)}, status=502)
+
     @staticmethod
     def _extract_affinity_key(body: bytes) -> str | None:
         """Extract a prefix-affinity key from the request body.
@@ -412,13 +615,29 @@ class LoadBalancer:
         headers = {
             k: v
             for k, v in request.headers.items()
-            if k.lower() not in ("host", "transfer-encoding")
+            if k.lower() not in ("host", "transfer-encoding", "content-length")
         }
+
+        request_path = request.path_qs.partition("?")[0]
+        if (
+            self.mode in {"control-fanout", "disaggregated-prefill"}
+            and request_path in REFIT_CONTROL_PATHS
+        ):
+            return await self._handle_control_fanout(request, body, headers)
+        if self.mode == "disaggregated-prefill":
+            if (
+                request.method == "POST"
+                and request_path in DISAGGREGATED_GENERATION_PATHS
+            ):
+                return await self._handle_disaggregated_generation(
+                    request, body, headers
+                )
 
         # Extract affinity key for prefix-cache-aware routing
         affinity_key = (
             self._extract_affinity_key(body) if request.method == "POST" else None
         )
+        allow_unhealthy = request_path in REFIT_CONTROL_PATHS
 
         tried: set[str] = set()
         last_error: Exception | None = None
@@ -431,7 +650,11 @@ class LoadBalancer:
         # of a wedged backend.
         MAX_RETRIES = 5
         for attempt in range(1, MAX_RETRIES + 1):
-            backend = self.pool.pick(exclude=tried, affinity_key=affinity_key)
+            backend = self.pool.pick(
+                exclude=tried,
+                affinity_key=affinity_key,
+                allow_unhealthy=allow_unhealthy,
+            )
             if backend is None:
                 log.warning(
                     "[proxy %s %s] no more healthy untried backends after %d attempt(s); giving up",
@@ -555,6 +778,12 @@ def main() -> None:
         help="Directory containing the registry file",
     )
     parser.add_argument(
+        "--mode",
+        choices=("load-balance", "control-fanout", "disaggregated-prefill"),
+        default="load-balance",
+        help="Proxy topology",
+    )
+    parser.add_argument(
         "--group-id",
         default=os.environ.get("EXTERNAL_VLLM_GROUP_ID", "default"),
         help="Server group ID",
@@ -568,13 +797,14 @@ def main() -> None:
     args = parser.parse_args()
 
     pool = BackendPool(args.registry_dir, args.group_id, args.health_interval)
-    lb = LoadBalancer(pool, args.port)
+    lb = LoadBalancer(pool, args.port, args.mode)
     app = lb.make_app()
 
     log.info(
-        "Starting external vLLM load balancer on port %d (group=%s)",
+        "Starting external vLLM load balancer on port %d (group=%s, mode=%s)",
         args.port,
         args.group_id,
+        args.mode,
     )
     log.info("Registry: %s", pool.registry_file)
 

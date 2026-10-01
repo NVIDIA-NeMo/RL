@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextlib
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Optional
 from unittest.mock import MagicMock, patch
 
@@ -81,6 +82,34 @@ from nemo_rl.utils.config import (
 
 # Captured at import, before the patched_factories fixture swaps it for a mock.
 _REAL_BUILD_GENERATION = sc_setup_mod._build_generation
+
+
+def test_spinup_gym_uses_remote_vllm_served_model_name(monkeypatch):
+    """Gym must address the remote service alias, not its checkpoint path."""
+    spinup = MagicMock(return_value=object())
+    monkeypatch.setattr(sc_setup_mod, "spinup_nemo_gym_actor", spinup)
+    master_config = SimpleNamespace(
+        policy={
+            "model_name": "/checkpoints/policy",
+            "tokenizer": {"use_fastokens": False},
+            "generation": {
+                "backend": "remote_vllm",
+                "model_name": "/checkpoints/policy",
+                "remote_vllm_cfg": {"served_model_name": "policy"},
+            },
+        },
+        env={"nemo_gym": {}},
+        token_capture=SimpleNamespace(enabled=False),
+    )
+
+    actor, _ = sc_setup_mod._spinup_gym(
+        master_config,
+        ["http://rollout.example/v1"],
+        MagicMock(),
+    )
+
+    assert actor is spinup.return_value
+    assert spinup.call_args.kwargs["model_name"] == "policy"
 
 
 class _CheckpointingCustomSampler(WindowedSampler):

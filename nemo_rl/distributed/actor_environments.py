@@ -89,6 +89,10 @@ ACTOR_ENVIRONMENTS: dict[str, list[str] | None] = {
     # flattened tensors to TQ via dp_client.put_samples; (2) same-node colocation
     # with VllmGenerationWorker avoids duplicate venv caches.
     "nemo_rl.experience.sync_rollout_actor.SyncRolloutActor": ["vllm"],
+    # Captured rollout finalization imports Gym's staging/rebuild package.
+    "nemo_rl.experience.rollout_reassembler_actor.RolloutReassemblerActor": [
+        "nemo_gym"
+    ],
     "nemo_rl.environments.tools.retriever.RAGEnvironment": None,
     "nemo_rl.environments.nemo_gym.NemoGym": ["nemo_gym"],
     # ModelOpt quantization-aware workers

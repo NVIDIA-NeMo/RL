@@ -1,0 +1,414 @@
+# =============================================================================
+# AutomationBench — Nemotron 3.5 Lightning base config (super-v3.5 stack)
+# =============================================================================
+# Port of the dmolinari/autobench recipe base
+# (examples/nemo_gym/grpo_nanov3_baseline_pure_grpo.yaml, resolved chain root
+# grpo_nanov3_recoverability_probe_pass_rate_all_10pct.yaml) onto the
+# super-v3.5-posttraining stack. Schema and stack-mandated values follow
+# examples/nemo_gym/nemotron-3.5-lightning/rlvr.yaml; AutomationBench training
+# semantics follow the old resolved base:
+#   - synchronous GRPO, colocated generation, no external judge pools
+#   - no leave-one-out baseline, normalize_rewards, overlong_filtering on
+#   - no TIS truncation, no forced on-policy ratio, no advantage clipping
+#   - reward penalties and invalid-tool-call penalties off (metrics only)
+#   - deepseek_r1 reasoning parser + qwen3_coder tool parser
+#
+# The AutomationBench recipe (scripts/dmolinari-autobench/configs/
+# automationbench_lightning.yaml) overlays workload-specific values (batch
+# geometry, 200-turn rollouts, 65536 sequence length, TP4/EP16/CP4/PP1, the
+# verifiers_agent env) at launch; the launcher supplies paths and cluster
+# sizing.
+# =============================================================================
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 8
+  segment_size: 2
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/automationbench_lightning"
+  metric_name: "val:total_reward/mean"
+  higher_is_better: true
+  keep_top_k: 1000000
+  save_period: 10
+  ft_keep_latest_k: 1
+  ft_save_period: 1
+  checkpoint_must_save_by: "00:03:40:00"
+  model_save_format: "safetensors"
+  save_consolidated: false
+  save_optimizer: true
+
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 8
+  val_num_generations_per_prompt: 4
+  max_rollout_turns: 1
+  max_num_epochs: 1
+  max_num_steps: 80
+  normalize_rewards: true
+  use_leave_one_out_baseline: false
+  val_period: 5
+  val_start_at: -1
+  val_at_start: false
+  val_at_end: false
+  overlong_filtering: true
+  max_val_samples: null
+  val_batch_size: 256
+  seed: 42
+
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 10
+  batch_multiplier: 1
+
+  # Old-stack parity: invalid tool calls are flagged in metrics but never
+  # penalized in the loss.
+  penalize_invalid_tool_call: false
+
+  reward_shaping:
+    enabled: false
+  reward_scaling:
+    enabled: false
+
+  async_grpo:
+    enabled: false
+    max_trajectory_age_steps: 1
+
+  seq_logprob_error_threshold: 2
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  reference_policy_kl_type: "k3"
+  kl_input_clamp_value: null
+  kl_output_clamp_value: null
+
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  ratio_clip_c: null
+  use_on_policy_kl_approximation: true
+  use_importance_sampling_correction: true
+  # Old-stack parity: no truncated importance sampling, no forced on-policy
+  # ratio (the recipe keeps the policy forward pass enabled and masks only
+  # divergent sequences via grpo.seq_logprob_error_threshold).
+  # On this schema TIS is gated by truncated_importance_sampling_type, not by
+  # the ratio: ClippedPGLossFn only enters the TIS block when type is non-null,
+  # and then asserts the ratio is positive. Leaving type at lightning's `tis`
+  # while nulling the ratio is the one combination that cannot run, so TIS-off
+  # must be expressed as type=null (the old base had no type key at all).
+  truncated_importance_sampling_ratio: null
+  truncated_importance_sampling_ratio_min: null
+  truncated_importance_sampling_type: null
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  force_on_policy_ratio: false
+  use_kl_in_reward: false
+
+policy:
+  model_name: "/path/to/lightning-model"
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs: null
+    use_fastokens: true
+  hf_config_overrides: {}
+
+  train_global_batch_size: 256
+  train_micro_batch_size: 1
+  generation_batch_size: 64
+  logprob_batch_size: 1
+  max_total_sequence_length: 49152
+  precision: "bfloat16"
+  logprob_chunk_size: 2048
+  offload_optimizer_for_logprob: false
+
+  dtensor_cfg:
+    _v2: true
+    enabled: false
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 2
+    activation_checkpointing: true
+
+    tensor_model_parallel_size: 4
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 16
+    pipeline_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    context_parallel_size: 4
+    pipeline_dtype: ${policy.precision}
+    sequence_parallel: true
+
+    # MoE
+    freeze_moe_router: true
+    moe_router_dtype: "fp32"
+    moe_router_load_balancing_type: "none"
+    moe_router_bias_update_rate: 1.0e-3
+    moe_router_enable_expert_bias: true
+    moe_permute_fusion: true
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "alltoall"
+    moe_aux_loss_coeff: 0.0
+    moe_shared_expert_overlap: false
+
+    # Compute
+    apply_rope_fusion: true
+    use_fused_weighted_squared_relu: true
+    bias_activation_fusion: false
+    defer_fp32_logits: true
+
+    # Logging
+    track_moe_metrics: true
+    moe_per_layer_logging: true
+
+    # MTP training heads
+    mtp_loss_scaling_factor: 0.3
+    mtp_use_repeated_layer: true
+    mtp_num_layers: 5
+    mtp_detach_heads: true
+
+    optimizer:
+      optimizer: "adam"
+      lr: 3.0e-6
+      min_lr: 3.0e-6
+      weight_decay: 0.0
+      bf16: true
+      fp16: false
+      params_dtype: "float32"
+
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_eps: 1e-8
+
+      sgd_momentum: 0.9
+
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+
+      clip_grad: ${policy.max_grad_norm}
+
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+      overlap_cpu_optimizer_d2h_h2d: false
+
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: "constant"
+      lr_decay_style: "constant"
+      lr_decay_iters: null
+      lr_warmup_iters: 10
+      lr_warmup_init: 3.0e-7
+      override_opt_param_scheduler: true
+
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: false
+      overlap_param_gather: true
+      average_in_collective: false
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: "optim_grads_params"
+
+    gradient_accumulation_fusion: false
+
+    fp8_cfg:
+      enabled: false
+      fp8: "e4m3"
+      fp8_recipe: "mxfp8"
+      fp8_param: false
+
+    first_last_layers_bf16: true
+    num_layers_at_start_in_bf16: 1
+    num_layers_at_end_in_bf16: 1
+
+    use_gloo_process_groups: false
+
+    checkpoint:
+      async_save: true
+      ckpt_assume_constant_structure: true
+      fully_parallel_save_process_group: "ep_dp"
+      fully_parallel_load_process_group: "ep_dp"
+      fully_parallel_load_exchange_algo: "broadcast"
+
+    env_vars: null
+
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+    fuse_loss: true
+
+  make_sequence_length_divisible_by: ${mul:${mul:${policy.megatron_cfg.tensor_model_parallel_size}, ${policy.megatron_cfg.context_parallel_size}}, 2}
+  max_grad_norm: 1.0
+  optimizer: null
+  scheduler: null
+
+  # ---------------------------------------------------------------------------
+  # Generation (vLLM) — colocated, async engine + HTTP server for Gym
+  # ---------------------------------------------------------------------------
+  generation:
+    port_range_low: 3000
+    port_range_high: 4999
+    backend: "vllm"
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    val_temperature: ${.temperature}
+    val_top_p: ${.top_p}
+    val_top_k: ${.top_k}
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      async_engine: true
+      precision: ${policy.precision}
+      kv_cache_dtype: "auto"
+      tensor_parallel_size: 4
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.5
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: false
+      use_deep_gemm: false
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 0.5
+      expose_http_server: true
+      skip_tokenizer_init: false
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: qwen3_coder
+        reasoning_parser: deepseek_r1
+
+    vllm_kwargs:
+      # Stack-validated backend settings from nemotron-3.5-lightning/rlvr.yaml;
+      # flashinfer_cutlass remains compatible with repeated refits.
+      moe_backend: flashinfer_cutlass
+      attention_backend: FLASH_ATTN
+      max_num_seqs: 64
+      mamba_ssm_cache_dtype: "float32"
+      compilation_config:
+        cudagraph_capture_sizes: [1,2,4,8,16,32,64]
+        cudagraph_mode: PIECEWISE
+        pass_config:
+          fuse_allreduce_rms: false
+
+    colocated:
+      enabled: true
+      resources:
+        gpus_per_node: null
+        num_nodes: null
+
+data:
+  max_input_seq_length: null
+  shuffle: false
+  num_workers: 1
+  use_multiple_dataloader: false
+  train:
+    data_path: "/path/to/automationbench-train.jsonl"
+  validation:
+    data_path: "/path/to/automationbench-validation.jsonl"
+  default:
+    dataset_name: NemoGymDataset
+    env_name: "nemo_gym"
+    prompt_file: null
+    system_prompt_file: null
+    processor: "nemo_gym_data_processor"
+
+env:
+  should_use_nemo_gym: true
+  # false: write the per-step train_data_step*.jsonl dump (the AutomationBench
+  # smoke audit reads those persisted trajectories to verify multi-turn tool use).
+  should_log_nemo_gym_responses: false
+  nemo_gym:
+    nemo_gym_log_dir: "logs/nemo_gym"
+    skip_venv_if_present: true
+    port_range_low: 5000
+    port_range_high: 5999
+    # NeMo-RL-owned rollout-concurrency cap (null = unlimited); the recipe
+    # overrides this per cluster shape.
+    num_samples_in_parallel: null
+    invalid_tool_call_patterns:
+      - "<tool_call>"
+      - "</tool_call>"
+      - "<function_call>"
+      - "</function_call>"
+    thinking_tags:
+      - "<think>"
+      - "</think>"
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - responses_api_agents/verifiers_agent/configs/automationbench.yaml
+
+    # Gym global-config key (NemoGym passes this whole env.nemo_gym block
+    # through as initial_global_config_dict, same as policy_model below).
+    # The V1 agent component runs openai==2.54.0 (pinned in
+    # agent_v1/overrides.txt) because verifiers requires openai>=2.9.0.
+    # nemo-gym's own constraint is openai<=2.7.2, so it refuses to pin the
+    # parent's version into the server venvs and fails closed unless this is
+    # set. The agent and Gym's servers only exchange OpenAI REST calls over
+    # HTTP, so they can carry different client versions; downgrading the agent
+    # instead is not possible without breaking verifiers.
+    allow_openai_version_skew: true
+
+    # The public Gym revision pinned by this branch defines only the base
+    # policy model in vllm_model_for_training.yaml. Supply the training
+    # variant the old internal Gym baked in.
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          num_workers: 16
+          chat_template_kwargs:
+            enable_thinking: true
+            truncate_history_thinking: false
+          sequential_reasoning_allowed: false
+
+data_plane:
+  enabled: false
+  impl: transfer_queue
+  backend: "simple"
+  claim_meta_poll_interval_s: 0.5
+  simple:
+    storage_capacity: 1000000
+    num_storage_units: ${mul:2, ${cluster.num_nodes}}
+
+# Ledger-authoritative token capture. External-vLLM launchers enable this so
+# Gym sends ng_capture admissions and the rollout plugin stages exact deltas.
+token_capture:
+  enabled: false
+  staging_partition: rollout_staging
+
+logger:
+  log_dir: "logs"
+  num_val_samples_to_print: 0
+  wandb_enabled: false
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  monitor_gpus: true
+  swanlab_enabled: false
+  wandb:
+    project: "automationbench"
+    name: "automationbench-lightning"
+    log_nemo_gym_full_result_tables: false
+  tensorboard: {}
+  mlflow:
+    experiment_name: "automationbench"
+    run_name: "automationbench-lightning"
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10

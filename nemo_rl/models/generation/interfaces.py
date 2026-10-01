@@ -236,6 +236,11 @@ class GenerationConfig(TypedDict):
     port_range_low: NotRequired[int]
     port_range_high: NotRequired[int]
     use_async_rollouts: NotRequired[bool]
+    # Controller-only connection and checkpoint-refit settings for an external
+    # stock vLLM deployment. Managed backends may set this to null to remove
+    # an inherited external-vLLM block; the remote_vllm backend validates a
+    # concrete mapping before constructing its client.
+    remote_vllm_cfg: NotRequired[dict[str, Any] | None]
     # This isn't meant to be passed by the user, but is populated by nemo_rl.models.generation.__init__.configure_generation_config
     _pad_token_id: NotRequired[int]
     # Eagle draft weights arrive via refit when policy.draft.enabled=true.
@@ -256,6 +261,10 @@ def should_use_async_rollouts(
     backend = generation_config.get("backend", "")
 
     if backend == "dynamo":
+        return True
+
+    if backend == "remote_vllm":
+        # Rollouts run through the external server's asynchronous HTTP API.
         return True
 
     if backend == "sglang":
@@ -490,6 +499,49 @@ class GenerationInterface(ABC):
     def continue_generation(self) -> None:
         """Resume previously paused generation on the backend."""
         raise NotImplementedError
+
+    def restart_shard(self, shard_idx: int) -> Optional[str]:
+        """Rebuild one data-parallel shard's workers and bring its engine back up.
+
+        Declared here because ``EngineSupervisor`` calls it by name on whatever backend it
+        was handed. Undeclared, a backend that does not implement it -- or one that loses
+        the method to a merge, which has happened once already -- degrades to an
+        ``AttributeError`` swallowed by the supervisor's ``except``, and the shard is
+        recorded as a failed restart rather than as an unsupported one. Raising here says
+        which it is.
+
+        Blocking and slow -- it reloads the model -- so callers run it off the control
+        loop.
+
+        Returns:
+            The replacement's OpenAI base URL, or None for an engine that exposes no HTTP
+            server. The URL is expected to differ from the old one: the new engine binds
+            its own port, so callers must publish it rather than assume the fleet's URL
+            list is still accurate.
+        """
+        raise NotImplementedError
+
+    def shard_liveness_ref(self, shard_idx: int) -> ray.ObjectRef:
+        """Liveness of the worker leading one data-parallel shard.
+
+        Which Ray worker leads shard N depends on how shards are laid out across workers,
+        which is the backend's business. Asking for it by shard index keeps that here
+        rather than in the control loop, where the same arithmetic had a second copy that
+        also assumed every backend has a ``worker_group`` -- an assumption that has already
+        broken a lane once (``'DynamoGeneration' object has no attribute 'worker_group'``).
+        """
+        raise NotImplementedError
+
+    def log_shard_gpu_state(
+        self, shard_idx: int, *, label: str, timeout_s: float = 30.0
+    ) -> None:
+        """Print the state of the GPU one shard holds, from that shard's own node.
+
+        A no-op by default rather than ``NotImplementedError``, unlike ``restart_shard``
+        above: this is a diagnostic taken on the restart path, and a backend that cannot
+        provide it should cost the caller nothing. Failing a restart over a missing log
+        line would be worse than the missing log line.
+        """
 
     @property
     def requires_kv_scale_sync(self) -> bool:

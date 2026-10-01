@@ -203,6 +203,20 @@ def test_build_nemo_gym_config_uv_dirs(detected_uv_dirs, configured, expected):
     assert (global_config["uv_cache_dir"], global_config["uv_venv_dir"]) == expected
 
 
+def test_build_nemo_gym_config_moves_port_range_to_actor_fields(detected_uv_dirs):
+    cfg = build_nemo_gym_config(
+        _env_configs(port_range_low=6000, port_range_high=6999),
+        base_urls=[],
+        model_name="test-model",
+        enable_router_replay=False,
+        use_fastokens=False,
+    )
+
+    assert (cfg["port_range_low"], cfg["port_range_high"]) == (6000, 6999)
+    assert "port_range_low" not in cfg["initial_global_config_dict"]
+    assert "port_range_high" not in cfg["initial_global_config_dict"]
+
+
 def test_build_nemo_gym_config_router_replay_off_uses_default_dtype(detected_uv_dirs):
     cfg = build_nemo_gym_config(
         _env_configs(),
@@ -494,3 +508,40 @@ def test_list_entries_before_spinup_raises():
 
     with pytest.raises(RuntimeError, match="call _spinup"):
         actor.list_entries()
+
+
+class TestUnresolvedAgentRefsAreDiagnosable:
+    """A Gym older than the checkout that prepared the data must say so.
+
+    ``task_source`` routing is new. A current Gym strips ``agent_ref`` from collated rows
+    and stamps ``task_source`` instead, then resolves it back inside ``run_examples``. An
+    older Gym has no resolver, so the same dataset arrives unroutable -- and the first
+    thing that touched it was an unguarded ``row["agent_ref"]``, which surfaced as a bare
+    KeyError inside a Ray TaskError inside an ExceptionGroup.
+    """
+
+    def test_resolved_rows_pass_through(self):
+        rows = [{"agent_ref": {"name": "a"}}, {"agent_ref": {"name": "b"}}]
+        nemo_gym_mod._require_resolved_agent_refs(rows)  # must not raise
+
+    def test_a_stale_gym_is_named_along_with_the_remedy(self):
+        rows = [
+            {"agent_ref": {"name": "a"}},
+            {"task_source": "workplace_assistant_simple_agent"},
+        ]
+        with pytest.raises(RuntimeError) as excinfo:
+            nemo_gym_mod._require_resolved_agent_refs(rows)
+        message = str(excinfo.value)
+        assert "1 of 2" in message
+        assert "workplace_assistant_simple_agent" in message
+        assert "NRL_FORCE_REBUILD_VENVS" in message
+
+    def test_a_row_with_no_routing_at_all_says_that_instead(self):
+        """Different cause, different fix: rebuilding venvs would not help here."""
+        with pytest.raises(RuntimeError, match="no task_source either"):
+            nemo_gym_mod._require_resolved_agent_refs([{"id": "x"}])
+
+    def test_an_empty_agent_ref_counts_as_unresolved(self):
+        """Gym writes {"name": ...}; a bare {} routes nowhere."""
+        with pytest.raises(RuntimeError):
+            nemo_gym_mod._require_resolved_agent_refs([{"agent_ref": {}}])
