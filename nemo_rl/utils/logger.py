@@ -35,7 +35,7 @@ import wandb
 from matplotlib import pyplot as plt
 from prometheus_client.parser import text_string_to_metric_families
 from prometheus_client.samples import Sample
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
 from rich.box import ROUNDED
 from rich.console import Console
 from rich.logging import RichHandler
@@ -104,7 +104,7 @@ class LoggerConfig(BaseModel, extra="allow"):
     swanlab: Optional[SwanlabConfig] = None
     mlflow: Optional[MLflowConfig] = None
     monitor_gpus: bool = True
-    gpu_monitoring: GPUMonitoringConfig
+    gpu_monitoring: GPUMonitoringConfig = Field(default_factory=GPUMonitoringConfig)
     num_val_samples_to_print: int = 0
 
     @model_validator(mode="after")
