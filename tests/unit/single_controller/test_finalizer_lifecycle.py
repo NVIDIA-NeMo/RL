@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import ANY, AsyncMock, MagicMock
@@ -112,7 +113,9 @@ def _controller(actor: object) -> Any:
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._partition_id = "canonical"
     ctrl._master_config = SimpleNamespace(
-        token_capture=SimpleNamespace(staging_partition="staging"),
+        token_capture=SimpleNamespace(
+            staging_partition="staging", min_valid_fraction_per_group=None
+        ),
         grpo=SimpleNamespace(num_prompts_per_step=1),
     )
     ctrl._trainer_version = 3
@@ -310,3 +313,53 @@ def test_known_outcome_cleanup_runs_sync_clears_off_the_event_loop() -> None:
     assert ctrl._dp_client.clear_thread_ids
     assert all(tid != loop_thread_id for tid in ctrl._dp_client.clear_thread_ids)
     ctrl._buffer.abort.assert_called_once_with("group")
+
+
+@pytest.mark.parametrize(
+    ("valid_rows", "threshold", "rejected"),
+    [(0, 1.0, True), (1, 1.0, True), (2, 1.0, False), (1, 0.5, False)],
+)
+def test_quality_rejection_never_publishes_deleted_rows(
+    valid_rows, threshold, rejected
+):
+    sample_ids = ("group_g0", "group_g1")
+    request = replace(
+        _request(),
+        rollout_ids=sample_ids,
+        canonical_sample_ids=sample_ids,
+        receipts=({}, {}),
+        rewards=(1.0, 1.0),
+        mask_sample=(False, False),
+    )
+    meta = KVBatchMeta(
+        partition_id="canonical",
+        task_name="train",
+        sample_ids=list(sample_ids),
+        fields=["input_ids"],
+        sequence_lengths=[3, 3],
+    )
+    result = FinalizedGroup(
+        meta=meta,
+        group_min_wv=3,
+        group_max_wv=3,
+        staging_keys=[],
+        valid_row_count=valid_rows,
+        total_row_count=2,
+    )
+    actor = SimpleNamespace(finalize=_RemoteFinalize(result=result))
+    ctrl = _controller(actor)
+    ctrl._master_config.token_capture.min_valid_fraction_per_group = threshold
+
+    outcome = asyncio.run(ctrl._finalize_with_actor(request))
+
+    assert outcome is result
+    if rejected:
+        ctrl._buffer.commit_finalized.assert_not_awaited()
+        ctrl._buffer.abort.assert_called_once_with("group")
+        assert ctrl._dp_client.clear_calls == [
+            {"sample_ids": list(sample_ids), "partition_id": "canonical"}
+        ]
+    else:
+        ctrl._buffer.commit_finalized.assert_awaited_once()
+        assert not ctrl._dp_client.clear_calls
+    assert ctrl._available_finalizers.get_nowait() is actor

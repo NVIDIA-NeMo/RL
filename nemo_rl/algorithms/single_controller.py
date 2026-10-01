@@ -1719,13 +1719,11 @@ class SingleControllerActor:
     ) -> Optional["FinalizedGroup"]:
         """Finalize and index one group atomically with respect to TQ saves.
 
-        Returns the committed FinalizedGroup once the group is committed to
-        the replay buffer (callers may read valid_row_count/total_row_count
-        off it to decide whether the group is worth keeping), or None when
-        the finalizer itself dropped it as a structural outcome (ownership
-        already cleaned up; the caller credits the step short). A low
-        valid-row fraction is no longer a finalizer-side drop -- the caller
-        decides that, since only the caller can source a replacement.
+        Returns a FinalizedGroup after either committing it to the replay
+        buffer or cleaning it up for failing the valid-row threshold. The
+        caller reads its valid-row counts to source a replacement for the
+        latter; rejected groups are never visible to the train pump. Returns
+        None for a structural finalizer drop, with ownership already cleaned.
         """
         self._finalizer_waiters += 1
         queue_depth = max(
@@ -1805,6 +1803,22 @@ class SingleControllerActor:
                         "finalizer returned no metadata for non-dropped group "
                         f"{request.group_id}"
                     )
+                elif (
+                    (
+                        min_valid_fraction
+                        := self._master_config.token_capture.min_valid_fraction_per_group
+                    )
+                    is not None
+                    and finalized.total_row_count > 0
+                    and finalized.valid_row_count / finalized.total_row_count
+                    < min_valid_fraction
+                ):
+                    # The train pump can consume a group immediately after commit.
+                    # Reject and clean it before exposing any replay metadata.
+                    await self._cleanup_known_finalization_request_unlocked(
+                        cut, request
+                    )
+                    return finalized
                 else:
                     try:
                         await self._buffer.commit_finalized(
@@ -2077,15 +2091,8 @@ class SingleControllerActor:
                             # structural drops above, this is a policy call
                             # only the controller can act on: it is the one
                             # component that can source a replacement.
-                            try:
-                                await self._cleanup_known_finalization_request(request)
-                            except BaseException as cleanup_error:
-                                raise RuntimeError(
-                                    "finalizer group fell below "
-                                    "min_valid_fraction_per_group and "
-                                    "known-key cleanup failed for group "
-                                    f"{request.group_id}"
-                                ) from cleanup_error
+                            # _finalize_with_actor already rejected and cleaned
+                            # this group before making it visible to the trainer.
                             print(
                                 f"  finalize: group {request.group_id} below "
                                 "min_valid_fraction_per_group "
