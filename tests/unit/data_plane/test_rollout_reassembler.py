@@ -18,8 +18,10 @@ Drives the S1 golden call sequences end to end: stage the fixture's delta
 rows via TQTokenSink, hand the fixture receipt to the finalizer, and require
 the published canonical rows to match the fixture's frozen training row.
 Every rejection path (missing rows, digest corruption, poisoned receipts)
-must yield a masked placeholder — always N rows — and the group publisher's
-min/max weight versions and staging cleanup must hold.
+must yield a masked placeholder — always N canonical rows — and the group
+publisher's min/max weight versions and staging cleanup must hold. The
+segment-row section at the bottom drives the multi-chain publish path
+(token_capture.segment_rows) with a fake Gym linearizer.
 
 Marked nemo_gym (run with ``--nemo-gym-only``): the finalizer delegates
 rebuild semantics to Gym's staging package.
@@ -123,7 +125,10 @@ def _stage_fixture(tq_client, name: str, *, rollout_id: str | None = None):
 def test_finalize_rollout_reproduces_the_golden_row(tq_client, partitions):
     receipt, expected = _stage_fixture(tq_client, "worked_example")
     finalizer = _finalizer(tq_client)
-    row = finalizer.finalize_rollout("g7_r0", receipt, reward=1.0)
+    rows = finalizer.finalize_rollout("g7_r0", receipt, reward=1.0)
+    # Without segment_rows a rollout is exactly one row.
+    assert len(rows) == 1
+    row = rows[0]
     assert row.valid, row.rejection_reason
     assert row.token_ids == expected.token_ids
     assert row.token_mask == [f32(m) for m in expected.token_mask]
@@ -136,14 +141,14 @@ def test_finalize_rollout_reproduces_the_golden_row(tq_client, partitions):
 def test_finalize_rollout_rejections(tq_client, partitions):
     finalizer = _finalizer(tq_client)
     assert (
-        finalizer.finalize_rollout("r", None, reward=0.0).rejection_reason
+        finalizer.finalize_rollout("r", None, reward=0.0)[0].rejection_reason
         == "missing_receipt"
     )
 
     receipt, _ = _stage_fixture(tq_client, "single_call", rollout_id="rej_a")
     poisoned = dict(receipt, capture_poisoned=True)
     assert (
-        finalizer.finalize_rollout("rej_a", poisoned, reward=0.0).rejection_reason
+        finalizer.finalize_rollout("rej_a", poisoned, reward=0.0)[0].rejection_reason
         == "capture_poisoned"
     )
     # Gym (since #2823) rejects an unpoisoned receipt with no terminal call, so
@@ -165,10 +170,10 @@ def test_finalize_rollout_rejections(tq_client, partitions):
         failure_reason="missing_terminal_row",
     )
     assert (
-        finalizer.finalize_rollout("rej_a", empty, reward=0.0).rejection_reason
+        finalizer.finalize_rollout("rej_a", empty, reward=0.0)[0].rejection_reason
         == "rollout_failed:missing_terminal_row"
     )
-    wrong_identity = finalizer.finalize_rollout("someone_else", receipt, reward=0.0)
+    wrong_identity = finalizer.finalize_rollout("someone_else", receipt, reward=0.0)[0]
     assert (wrong_identity.rejection_reason or "").startswith("identity_mismatch")
 
     # A manifest naming rows that were never staged.
@@ -176,7 +181,7 @@ def test_finalize_rollout_rejections(tq_client, partitions):
     ghost["manifest"] = [
         {**entry, "staging_key": "ghost/row"} for entry in receipt["manifest"]
     ]
-    missing = finalizer.finalize_rollout("rej_a", ghost, reward=0.0)
+    missing = finalizer.finalize_rollout("rej_a", ghost, reward=0.0)[0]
     assert (missing.rejection_reason or "").startswith("missing_staging_row")
 
     # Digest corruption: break the manifest digest. Gym's verifier owns the
@@ -185,7 +190,7 @@ def test_finalize_rollout_rejections(tq_client, partitions):
     corrupted["manifest"] = [
         {**entry, "digest": "0" * 64} for entry in receipt["manifest"]
     ]
-    bad = finalizer.finalize_rollout("rej_a", corrupted, reward=0.0)
+    bad = finalizer.finalize_rollout("rej_a", corrupted, reward=0.0)[0]
     assert (bad.rejection_reason or "").startswith("rebuild_failed:wrong_digest")
 
 
@@ -728,7 +733,7 @@ def test_deferred_finalizer_rejects_invalid_routed_len(
             return fetched
 
     finalizer._source = _InjectedSource()
-    row = finalizer.finalize_rollout(rollout_id, receipt, reward=0.0)
+    row = finalizer.finalize_rollout(rollout_id, receipt, reward=0.0)[0]
 
     assert not row.valid
     assert (row.rejection_reason or "").startswith("routed_len_mismatch")
@@ -764,10 +769,10 @@ def test_direct_and_deferred_build_identical_plans_and_tensors(
 
     direct_row = _mode_finalizer(tq_client, deferred=False).finalize_rollout(
         rollout_id, receipt, reward=1.0
-    )
+    )[0]
     deferred_row = _mode_finalizer(tq_client, deferred=True).finalize_rollout(
         rollout_id, receipt, reward=1.0
-    )
+    )[0]
     assert direct_row.valid, direct_row.rejection_reason
     assert deferred_row.valid, deferred_row.rejection_reason
 
@@ -836,7 +841,7 @@ def test_direct_extras_corruption_rejects_before_publication(
             return fetched
 
     finalizer._source = _InjectedSource()
-    row = finalizer.finalize_rollout(rollout_id, receipt, reward=0.0)
+    row = finalizer.finalize_rollout(rollout_id, receipt, reward=0.0)[0]
 
     assert not row.valid
     assert row.rejection_reason == "route_assembly:fragment_integrity"
@@ -893,6 +898,606 @@ def test_deferred_chain_hash_corruption_rejects_the_row(
 
     row = _mode_finalizer(tq_client, deferred=True).finalize_rollout(
         rollout_id, receipt.model_dump(), reward=0.0
-    )
+    )[0]
     assert not row.valid
     assert (row.rejection_reason or "").startswith("rebuild_failed:chain_hash_mismatch")
+
+
+# ---------------------------------------------------------------------------
+# Segment rows (token_capture.segment_rows): one row per verified chain
+# ---------------------------------------------------------------------------
+#
+# Gym's ``verify_and_linearize_all`` is replaced by a fake that returns the
+# real terminal chain (still verified by ``verify_and_linearize`` against the
+# staged rows) plus synthetic extra chains, so these tests pin the finalizer's
+# row layout, ids, tags, replicated columns, cap and cleanup behaviour without
+# depending on how Gym derives the extra chains.
+
+import types  # noqa: E402
+
+import nemo_gym.token_id_capture.staging.rebuild as _rebuild_mod  # noqa: E402
+
+_CHAIN_FIELDS = (
+    "rollout_id",
+    "token_ids",
+    "token_mask",
+    "logprobs",
+    "model_call_ids",
+    "prompt_len",
+    "weight_versions",
+    "weight_version_spans",
+    "link_spans",
+    "extras_commitments",
+)
+
+
+def _chain_view(row, **overrides):
+    """Duck-typed copy of a LinearizedRow with segment placement fields."""
+    values = {name: getattr(row, name) for name in _CHAIN_FIELDS}
+    values.update(
+        terminal_model_call_id=row.model_call_ids[-1],
+        chain_index=0,
+        chain_kind="terminal",
+        segment_index=0,
+        boundary_parent_call_id=None,
+    )
+    values.update(overrides)
+    return types.SimpleNamespace(**values)
+
+
+def _synthetic_segment(terminal, *, chain_index: int, kind: str, tokens: list[int]):
+    """An extra chain that shares nothing with the terminal chain's tokens."""
+    prompt_len = 2
+    return _chain_view(
+        terminal,
+        token_ids=list(tokens),
+        token_mask=[0.0] * prompt_len + [1.0] * (len(tokens) - prompt_len),
+        logprobs=[0.0] * prompt_len + [-0.5] * (len(tokens) - prompt_len),
+        model_call_ids=[f"seg{chain_index}"],
+        prompt_len=prompt_len,
+        link_spans=[(f"seg{chain_index}", prompt_len, len(tokens) - prompt_len)],
+        extras_commitments=[],
+        terminal_model_call_id=f"seg{chain_index}",
+        chain_index=chain_index,
+        chain_kind=kind,
+        segment_index=chain_index,
+        boundary_parent_call_id=("c1" if kind == "compaction_segment" else None),
+    )
+
+
+def _install_fake_linearize_all(monkeypatch, *, extras_by_rollout, skipped=1):
+    """Patch Gym's verify_and_linearize_all with a fake building on the real verifier.
+
+    ``extras_by_rollout`` maps rollout_id -> list of (kind, tokens) extra
+    chains appended after the (real) terminal chain.
+    """
+    calls: list[str] = []
+
+    def fake(receipt, snapshots):
+        calls.append(receipt.rollout_id)
+        terminal = _rebuild_mod.verify_and_linearize(receipt, snapshots)
+        rows = [_chain_view(terminal)]
+        for idx, (kind, tokens) in enumerate(
+            extras_by_rollout.get(receipt.rollout_id, []), start=1
+        ):
+            rows.append(
+                _synthetic_segment(terminal, chain_index=idx, kind=kind, tokens=tokens)
+            )
+        return types.SimpleNamespace(
+            rows=rows,
+            skipped=[
+                types.SimpleNamespace(root_call_id=f"amb{i}", reason="ambiguous_leaf")
+                for i in range(skipped)
+            ],
+            num_roots=len(rows) + skipped,
+            num_boundary_roots=sum(
+                1 for row in rows if row.boundary_parent_call_id is not None
+            ),
+        )
+
+    monkeypatch.setattr(_rebuild_mod, "verify_and_linearize_all", fake)
+    return calls
+
+
+def _segment_finalizer(tq_client, **overrides) -> RolloutReassembler:
+    kwargs = dict(segment_rows_enabled=True, max_rows_per_rollout=3)
+    kwargs.update(overrides)
+    return _finalizer(tq_client, **kwargs)
+
+
+def test_segment_rows_config_is_validated():
+    with pytest.raises(ValueError, match="max_rows_per_rollout >= 2"):
+        RolloutReassembler(
+            object(),
+            partition_id=CANONICAL_PARTITION,
+            staging_partition=STAGING_PARTITION,
+            pad_token_id=PAD,
+            max_seq_len=16,
+            segment_rows_enabled=True,
+            max_rows_per_rollout=1,
+        )
+
+
+def test_finalize_rollout_returns_terminal_plus_segments(
+    tq_client, partitions, monkeypatch
+):
+    rollout_id = "seg_r0"
+    receipt, expected = _stage_fixture(tq_client, "worked_example", rollout_id=rollout_id)
+    calls = _install_fake_linearize_all(
+        monkeypatch,
+        extras_by_rollout={
+            rollout_id: [("compaction_segment", [30, 31, 32, 33, 34])]
+        },
+    )
+    rows = _segment_finalizer(tq_client).finalize_rollout(
+        rollout_id, receipt, reward=1.0
+    )
+
+    assert calls == [rollout_id]
+    assert [row.trace_in_rollout_idx for row in rows] == [0, 1]
+    terminal, segment = rows
+    assert terminal.valid and segment.valid
+    assert terminal.token_ids == expected.token_ids
+    assert terminal.trace_kind == "terminal"
+    assert segment.token_ids == [30, 31, 32, 33, 34]
+    assert segment.trace_kind == "compaction_segment"
+    assert segment.segment_index == 1
+    assert segment.boundary_parent_call_id == "c1"
+    assert segment.chain_index == 1
+    # Cleanup ownership rides the canonical row only.
+    assert set(terminal.staging_keys) == {
+        entry["staging_key"] for entry in receipt["manifest"]
+    }
+    assert segment.staging_keys == []
+    # Rollout-level diagnostics ride the canonical row.
+    assert terminal.num_chains == 2
+    assert terminal.chains_skipped_ambiguous == 1
+    assert terminal.boundary_roots == 1
+    assert terminal.segments_dropped_by_cap == 0
+    # The shared reward is replicated.
+    assert (terminal.reward, segment.reward) == (1.0, 1.0)
+
+
+def test_finalize_rollout_caps_segment_rows(tq_client, partitions, monkeypatch):
+    rollout_id = "cap_r0"
+    receipt, _ = _stage_fixture(tq_client, "worked_example", rollout_id=rollout_id)
+    _install_fake_linearize_all(
+        monkeypatch,
+        extras_by_rollout={
+            rollout_id: [
+                ("compaction_segment", [40, 41, 42]),
+                ("compaction_segment", [50, 51, 52, 53]),
+                ("subagent", [60, 61, 62]),
+            ]
+        },
+        skipped=0,
+    )
+    rows = _segment_finalizer(tq_client, max_rows_per_rollout=2).finalize_rollout(
+        rollout_id, receipt, reward=0.0
+    )
+    assert len(rows) == 2
+    # Gym order is kept: the first extra chain survives the cap.
+    assert rows[1].token_ids == [40, 41, 42]
+    assert rows[0].segments_dropped_by_cap == 2
+    assert rows[0].num_chains == 2
+
+
+def test_finalize_rollout_rejection_yields_single_placeholder_row(
+    tq_client, partitions, monkeypatch
+):
+    rollout_id = "rej_seg"
+    receipt, _ = _stage_fixture(tq_client, "single_call", rollout_id=rollout_id)
+    _install_fake_linearize_all(
+        monkeypatch, extras_by_rollout={rollout_id: [("subagent", [70, 71, 72])]}
+    )
+    finalizer = _segment_finalizer(tq_client)
+    assert finalizer.finalize_rollout(rollout_id, None, reward=0.0) == [
+        finalizer.finalize_rollout(rollout_id, None, reward=0.0)[0]
+    ]
+    poisoned = dict(receipt, capture_poisoned=True)
+    rows = finalizer.finalize_rollout(rollout_id, poisoned, reward=0.0)
+    assert len(rows) == 1
+    assert rows[0].rejection_reason == "capture_poisoned"
+
+
+def test_finalize_rollout_falls_back_without_verify_and_linearize_all(
+    tq_client, partitions, monkeypatch
+):
+    rollout_id = "nofn_r0"
+    receipt, expected = _stage_fixture(tq_client, "worked_example", rollout_id=rollout_id)
+    monkeypatch.delattr(_rebuild_mod, "verify_and_linearize_all", raising=False)
+    finalizer = _segment_finalizer(tq_client)
+    with pytest.warns(RuntimeWarning, match="verify_and_linearize_all"):
+        rows = finalizer.finalize_rollout(rollout_id, receipt, reward=1.0)
+    assert len(rows) == 1
+    assert rows[0].valid and rows[0].token_ids == expected.token_ids
+    # Warned once per finalizer, not per rollout.
+    receipt2, _ = _stage_fixture(tq_client, "worked_example", rollout_id="nofn_r1")
+    import warnings as _warnings
+
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("error")
+        assert len(finalizer.finalize_rollout("nofn_r1", receipt2, reward=1.0)) == 1
+
+
+def test_finalize_group_publishes_segment_rows_after_canonical_block(
+    tq_client, partitions, monkeypatch
+):
+    group_id = "seggrp"
+    rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
+    receipt, expected = _stage_fixture(
+        tq_client, "worked_example", rollout_id=rollout_ids[0]
+    )
+    segment_tokens = [30, 31, 32, 33, 34]
+    _install_fake_linearize_all(
+        monkeypatch,
+        extras_by_rollout={rollout_ids[0]: [("compaction_segment", segment_tokens)]},
+    )
+    # max_seq_len pinned to the segment row's length: only that row may read
+    # truncated (the canonical row is a different length, the placeholder is 1).
+    assert len(segment_tokens) != len(expected.token_ids)
+    finalizer = _segment_finalizer(tq_client, max_seq_len=len(segment_tokens))
+
+    finalized = finalizer.finalize_group(
+        group_id,
+        rollout_ids,
+        [receipt, None],  # rollout 1 lost its receipt -> placeholder, no extras
+        [1.0, 0.0],
+        mask_sample=[True, False],
+        fallback_weight_version=9,
+        prompt_idx=17,
+        loss_multiplier=0.25,
+    )
+
+    assert not finalized.dropped
+    assert finalized.meta is not None
+    # Canonical block first (N rows under the canonical ids), extras after.
+    extra_id = f"{group_id}_g0_t1"
+    assert finalized.meta.sample_ids == rollout_ids + [extra_id]
+    assert finalized.meta.sequence_lengths == [
+        len(expected.token_ids),
+        1,
+        len(segment_tokens),
+    ]
+    # Rollout counts stay rollout counts; extras are reported separately.
+    assert finalized.valid_row_count == 1
+    assert finalized.total_row_count == 2
+    assert finalized.extra_row_count == 1
+    # Per-row placement tags.
+    tags = finalized.meta.tags
+    assert [tag["rollout_local_idx"] for tag in tags] == [0, 1, 0]
+    assert [tag["trace_in_rollout_idx"] for tag in tags] == [0, 0, 1]
+    assert [tag["trace_kind"] for tag in tags] == [
+        "terminal",
+        "placeholder",
+        "compaction_segment",
+    ]
+    assert [tag["segment_index"] for tag in tags] == [0, 0, 1]
+    assert [tag["prompt_idx"] for tag in tags] == [17, 17, 17]
+    assert [tag["weight_version"] for tag in tags] == [4, 4, 4]
+    # canonical_output_tokens covers every published row.
+    assert finalized.canonical_output_tokens == sum(expected.token_mask) + 3
+    # Metrics.
+    m = finalized.metrics
+    assert m["finalize/invalid_row_rate"] == 0.5
+    assert m["finalize/rows_per_rollout_mean"] == 1.5
+    assert m["finalize/rows_per_rollout_max"] == 2.0
+    assert m["finalize/rollouts_with_segments"] == 1.0
+    assert m["finalize/segment_rows"] == 1.0
+    assert m["finalize/segment_rows_by_kind_compaction_segment"] == 1.0
+    assert m["finalize/chains_skipped_ambiguous"] == 1.0
+    assert m["finalize/boundary_roots"] == 1.0
+    assert m["finalize/segments_dropped_by_cap"] == 0.0
+
+    rows = _fetch_rows(tq_client, rollout_ids + [extra_id])
+    # Extra row copies reward / mask_sample / sample_mask from its rollout.
+    assert torch.as_tensor(rows["total_reward"]).flatten().tolist() == [1.0, 0.0, 1.0]
+    assert torch.as_tensor(rows["mask_sample"]).flatten().tolist() == [
+        True,
+        False,
+        True,
+    ]
+    assert torch.as_tensor(rows["sample_mask"]).flatten().tolist() == [0.25, 0.0, 0.25]
+    # prompt_ids_for_adv is the same group prompt on every row.
+    prompt = expected.token_ids[: expected.prompt_len]
+    for r in range(3):
+        assert torch.as_tensor(rows["prompt_ids_for_adv"][r]).flatten().tolist() == prompt
+    # Tokens / masks / logprobs are per row.
+    seg_ids = torch.as_tensor(rows["input_ids"][2]).flatten()
+    assert seg_ids[: len(segment_tokens)].tolist() == segment_tokens
+    seg_mask = torch.as_tensor(rows["token_mask"][2]).flatten()
+    assert seg_mask[: len(segment_tokens)].tolist() == [0.0, 0.0, 1.0, 1.0, 1.0]
+    seg_lp = torch.as_tensor(rows["generation_logprobs"][2]).flatten()
+    assert seg_lp[2:5].tolist() == [-0.5, -0.5, -0.5]
+    assert torch.as_tensor(rows["input_lengths"]).flatten().tolist() == [
+        len(expected.token_ids),
+        1,
+        len(segment_tokens),
+    ]
+    # truncated is per row: only the segment row hits max_seq_len.
+    assert torch.as_tensor(rows["truncated"]).flatten().tolist() == [
+        False,
+        False,
+        True,
+    ]
+
+    # Staging cleared exactly once for the rollout's manifest (shared by both rows).
+    with pytest.raises(KeyError):
+        finalizer._source.fetch([receipt["manifest"][0]["staging_key"]])
+
+
+def test_finalize_group_segment_rows_disabled_publishes_exactly_n_rows(
+    tq_client, partitions, monkeypatch
+):
+    """With segment_rows off the fake is never consulted and the group is the
+    classic N-row publish (same ids, same tensors as the single-chain path)."""
+    group_id = "segoff"
+    rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
+    receipt, expected = _stage_fixture(
+        tq_client, "worked_example", rollout_id=rollout_ids[0]
+    )
+    calls = _install_fake_linearize_all(
+        monkeypatch,
+        extras_by_rollout={rollout_ids[0]: [("compaction_segment", [30, 31, 32])]},
+    )
+    finalizer = _finalizer(tq_client)  # segment rows disabled (default)
+    finalized = finalizer.finalize_group(
+        group_id,
+        rollout_ids,
+        [receipt, None],
+        [1.0, 0.0],
+        mask_sample=[True, False],
+        fallback_weight_version=9,
+        prompt_idx=17,
+        loss_multiplier=0.25,
+    )
+    assert calls == []
+    assert finalized.meta.sample_ids == rollout_ids
+    assert finalized.extra_row_count == 0
+    assert (finalized.valid_row_count, finalized.total_row_count) == (1, 2)
+    assert finalized.metrics["finalize/rows_per_rollout_max"] == 1.0
+    assert finalized.metrics["finalize/segment_rows"] == 0.0
+    assert [tag["trace_kind"] for tag in finalized.meta.tags] == [
+        "terminal",
+        "placeholder",
+    ]
+    rows = _fetch_rows(tq_client, rollout_ids)
+    valid_len = len(expected.token_ids)
+    assert torch.as_tensor(rows["input_ids"][0]).flatten()[:valid_len].tolist() == (
+        expected.token_ids
+    )
+    assert torch.as_tensor(rows["sample_mask"]).flatten().tolist() == [0.25, 0.0]
+    assert torch.as_tensor(rows["total_reward"]).flatten().tolist() == [1.0, 0.0]
+    assert torch.as_tensor(rows["mask_sample"]).flatten().tolist() == [True, False]
+    assert finalized.canonical_output_tokens == sum(expected.token_mask)
+
+
+def test_finalize_group_all_placeholders_publish_one_row_each_with_segments_on(
+    tq_client, partitions, monkeypatch
+):
+    group_id = "segph"
+    rollout_ids = [f"{group_id}_g0", f"{group_id}_g1", f"{group_id}_g2"]
+    _install_fake_linearize_all(monkeypatch, extras_by_rollout={})
+    finalized = _segment_finalizer(tq_client).finalize_group(
+        group_id,
+        rollout_ids,
+        [None, None, None],
+        [0.0, 0.0, 0.0],
+        mask_sample=[False] * 3,
+        fallback_weight_version=3,
+        prompt_idx=17,
+    )
+    assert finalized.meta.sample_ids == rollout_ids
+    assert finalized.extra_row_count == 0
+    assert (finalized.valid_row_count, finalized.total_row_count) == (0, 3)
+    assert [tag["trace_kind"] for tag in finalized.meta.tags] == ["placeholder"] * 3
+    assert [tag["rollout_local_idx"] for tag in finalized.meta.tags] == [0, 1, 2]
+    assert finalized.metrics["finalize/rows_per_rollout_mean"] == 1.0
+
+
+def test_finalize_group_segment_rows_cap_metric(tq_client, partitions, monkeypatch):
+    group_id = "segcap"
+    rollout_ids = [f"{group_id}_g0"]
+    receipt, _ = _stage_fixture(tq_client, "worked_example", rollout_id=rollout_ids[0])
+    _install_fake_linearize_all(
+        monkeypatch,
+        extras_by_rollout={
+            rollout_ids[0]: [
+                ("compaction_segment", [40, 41, 42]),
+                ("subagent", [50, 51, 52]),
+                ("subagent", [60, 61, 62]),
+            ]
+        },
+        skipped=0,
+    )
+    finalized = _segment_finalizer(tq_client, max_rows_per_rollout=3).finalize_group(
+        group_id,
+        rollout_ids,
+        [receipt],
+        [1.0],
+        mask_sample=[False],
+        fallback_weight_version=4,
+        prompt_idx=17,
+    )
+    assert finalized.meta.sample_ids == [
+        f"{group_id}_g0",
+        f"{group_id}_g0_t1",
+        f"{group_id}_g0_t2",
+    ]
+    assert finalized.extra_row_count == 2
+    assert finalized.metrics["finalize/segments_dropped_by_cap"] == 1.0
+    assert finalized.metrics["finalize/segment_rows_by_kind_compaction_segment"] == 1.0
+    assert finalized.metrics["finalize/segment_rows_by_kind_subagent"] == 1.0
+    assert [tag["trace_in_rollout_idx"] for tag in finalized.meta.tags] == [0, 1, 2]
+
+
+def test_finalize_group_segment_rows_with_stable_canonical_ids(
+    tq_client, partitions, monkeypatch
+):
+    """Physical attempt ids map to canonical ids; extras extend the canonical id."""
+    group_id = "segstable"
+    physical_id = f"{group_id}_g0_aattempt"
+    canonical_id = f"{group_id}_g0"
+    receipt, _ = _stage_fixture(tq_client, "worked_example", rollout_id=physical_id)
+    _install_fake_linearize_all(
+        monkeypatch,
+        extras_by_rollout={physical_id: [("compaction_segment", [30, 31, 32])]},
+    )
+    finalized = _segment_finalizer(tq_client).finalize_group(
+        group_id,
+        [physical_id],
+        [receipt],
+        [1.0],
+        mask_sample=[False],
+        fallback_weight_version=4,
+        prompt_idx=17,
+        canonical_sample_ids=[canonical_id],
+    )
+    assert finalized.meta.sample_ids == [canonical_id, f"{canonical_id}_t1"]
+
+
+# ── summary rows, Gym row order, rows_in_rollout ──────────────────────────
+#
+# A compaction yields three chains per boundary: the pre-compaction segment
+# (compaction_segment), the summary call as a one-call chain
+# (compaction_summary) and the post-compaction chain. Gym orders the chains on
+# the terminal's compaction sequence first (segment order), then other roots.
+# The finalizer keeps that order, drops summary rows first when they are not
+# wanted, and applies the cap to what remains.
+
+
+def _three_chain_extras():
+    return [
+        ("compaction_segment", [30, 31, 32, 33, 34]),
+        ("compaction_summary", [40, 41, 42, 43]),
+        ("subagent", [50, 51, 52]),
+    ]
+
+
+def test_finalize_rollout_keeps_gym_order_and_caps_after_it(
+    tq_client, partitions, monkeypatch
+):
+    rollout_id = "order_r0"
+    receipt, _ = _stage_fixture(tq_client, "worked_example", rollout_id=rollout_id)
+    _install_fake_linearize_all(
+        monkeypatch, extras_by_rollout={rollout_id: _three_chain_extras()}, skipped=0
+    )
+    rows = _segment_finalizer(tq_client, max_rows_per_rollout=3).finalize_rollout(
+        rollout_id, receipt, reward=1.0
+    )
+    # Default include_summary_rows=True: Gym's order, cap drops the trailing
+    # subagent chain (not the summary).
+    assert [row.trace_kind for row in rows] == [
+        "terminal",
+        "compaction_segment",
+        "compaction_summary",
+    ]
+    assert [row.trace_in_rollout_idx for row in rows] == [0, 1, 2]
+    assert rows[2].token_ids == [40, 41, 42, 43]
+    assert rows[0].segments_dropped_by_cap == 1
+    assert rows[0].segments_skipped_summary == 0
+
+
+def test_finalize_rollout_skips_summary_rows_before_the_cap_when_disabled(
+    tq_client, partitions, monkeypatch
+):
+    rollout_id = "nosum_r0"
+    receipt, _ = _stage_fixture(tq_client, "worked_example", rollout_id=rollout_id)
+    _install_fake_linearize_all(
+        monkeypatch, extras_by_rollout={rollout_id: _three_chain_extras()}, skipped=0
+    )
+    rows = _segment_finalizer(
+        tq_client, max_rows_per_rollout=3, include_summary_rows=False
+    ).finalize_rollout(rollout_id, receipt, reward=1.0)
+    # The summary is dropped first, so the cap budget goes to the subagent chain.
+    assert [row.trace_kind for row in rows] == ["terminal", "compaction_segment", "subagent"]
+    assert [row.trace_in_rollout_idx for row in rows] == [0, 1, 2]
+    assert rows[2].token_ids == [50, 51, 52]
+    assert rows[0].segments_skipped_summary == 1
+    assert rows[0].segments_dropped_by_cap == 0
+    assert rows[0].num_chains == 3
+
+
+def test_finalize_group_stamps_rows_in_rollout_and_summary_metrics(
+    tq_client, partitions, monkeypatch
+):
+    group_id = "sumgrp"
+    rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
+    receipt, _ = _stage_fixture(tq_client, "worked_example", rollout_id=rollout_ids[0])
+    _install_fake_linearize_all(
+        monkeypatch, extras_by_rollout={rollout_ids[0]: _three_chain_extras()}, skipped=0
+    )
+    finalized = _segment_finalizer(tq_client, max_rows_per_rollout=4).finalize_group(
+        group_id,
+        rollout_ids,
+        [receipt, None],
+        [1.0, 0.0],
+        mask_sample=[False, False],
+        fallback_weight_version=4,
+        prompt_idx=17,
+    )
+    assert finalized.meta.sample_ids == rollout_ids + [
+        f"{rollout_ids[0]}_t1",
+        f"{rollout_ids[0]}_t2",
+        f"{rollout_ids[0]}_t3",
+    ]
+    tags = finalized.meta.tags
+    assert [tag["trace_kind"] for tag in tags] == [
+        "terminal",
+        "placeholder",
+        "compaction_segment",
+        "compaction_summary",
+        "subagent",
+    ]
+    # Every row of a rollout carries the rollout's total row count; the
+    # placeholder rollout has exactly one row.
+    assert [tag["rows_in_rollout"] for tag in tags] == [4, 1, 4, 4, 4]
+    assert [tag["rollout_local_idx"] for tag in tags] == [0, 1, 0, 0, 0]
+    m = finalized.metrics
+    assert m["finalize/segment_rows"] == 3.0
+    assert m["finalize/segment_rows_by_kind_compaction_segment"] == 1.0
+    assert m["finalize/segment_rows_by_kind_compaction_summary"] == 1.0
+    assert m["finalize/segment_rows_by_kind_subagent"] == 1.0
+    assert m["finalize/segment_rows_skipped_summary"] == 0.0
+    assert m["finalize/segments_dropped_by_cap"] == 0.0
+    assert m["finalize/rows_per_rollout_max"] == 4.0
+
+
+def test_finalize_group_counts_skipped_summary_rows(tq_client, partitions, monkeypatch):
+    group_id = "sumoff"
+    rollout_ids = [f"{group_id}_g0"]
+    receipt, _ = _stage_fixture(tq_client, "worked_example", rollout_id=rollout_ids[0])
+    _install_fake_linearize_all(
+        monkeypatch, extras_by_rollout={rollout_ids[0]: _three_chain_extras()}, skipped=0
+    )
+    finalized = _segment_finalizer(
+        tq_client, max_rows_per_rollout=4, include_summary_rows=False
+    ).finalize_group(
+        group_id,
+        rollout_ids,
+        [receipt],
+        [1.0],
+        mask_sample=[False],
+        fallback_weight_version=4,
+        prompt_idx=17,
+    )
+    tags = finalized.meta.tags
+    assert [tag["trace_kind"] for tag in tags] == ["terminal", "compaction_segment", "subagent"]
+    assert [tag["rows_in_rollout"] for tag in tags] == [3, 3, 3]
+    m = finalized.metrics
+    assert m["finalize/segment_rows"] == 2.0
+    assert m["finalize/segment_rows_skipped_summary"] == 1.0
+    assert "finalize/segment_rows_by_kind_compaction_summary" not in m
+    # Disabled segment rows never consult the switch: exactly one row, no tag
+    # beyond rows_in_rollout == 1.
+    plain = _finalizer(tq_client, include_summary_rows=False).finalize_group(
+        group_id + "_plain",
+        [f"{group_id}_plain_g0"],
+        [None],
+        [0.0],
+        mask_sample=[False],
+        fallback_weight_version=4,
+        prompt_idx=17,
+    )
+    assert [tag["rows_in_rollout"] for tag in plain.meta.tags] == [1]
+    assert plain.metrics["finalize/segment_rows_skipped_summary"] == 0.0

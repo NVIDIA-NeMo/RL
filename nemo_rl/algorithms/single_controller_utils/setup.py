@@ -323,6 +323,15 @@ def _register_single_controller_partitions(
     capture_media = token_capture_cfg.enabled and include_multimodal_fields
     group_size = algo_cfg.num_generations_per_prompt
     num_rollout_samples = master_config.async_rl.max_buffered_rollouts * group_size
+    # Segment rows: each rollout may publish up to max_per_rollout rows in the
+    # canonical partition (canonical + extras). Staging is per call and
+    # unaffected.
+    segment_rows_cfg = token_capture_cfg.segment_rows
+    rows_per_rollout = (
+        int(segment_rows_cfg.max_per_rollout)
+        if token_capture_cfg.enabled and segment_rows_cfg.enabled
+        else 1
+    )
 
     if not token_capture_cfg.enabled:
         partition_fields = fields_with_optional_routed_experts(
@@ -345,7 +354,7 @@ def _register_single_controller_partitions(
     dp_client.register_partition(
         partition_id=partition_id,
         fields=partition_fields,
-        num_samples=num_rollout_samples,
+        num_samples=num_rollout_samples * rows_per_rollout,
         consumer_tasks=["prev_lp", "ref_lp", "train"],
         grpo_group_size=group_size,
     )
@@ -2007,6 +2016,15 @@ def setup_single_controller(
                 defer_routed_experts_to_policy=token_capture_cfg.defer_routed_experts_to_policy,
                 max_seq_len=_generation_max_seq_len(generation_config),
                 capture_media=capture_media,
+                segment_rows_enabled=token_capture_cfg.segment_rows.enabled,
+                max_rows_per_rollout=(
+                    int(token_capture_cfg.segment_rows.max_per_rollout)
+                    if token_capture_cfg.segment_rows.enabled
+                    else 1
+                ),
+                include_summary_rows=bool(
+                    token_capture_cfg.segment_rows.include_summary_rows
+                ),
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,
         )

@@ -170,3 +170,72 @@ def test_chunks_accumulate_across_calls_and_empty_is_empty():
         empty, prompt_ids=[1, 1], rewards=[1, 0], sample_mask=[0, 0], gen_tokens=[2, 4]
     )
     assert reduce_rollout_stats(empty) == {}
+
+
+def test_segment_rows_keep_row_distributions_but_vote_once_in_reward_and_groups():
+    acc = new_rollout_stats_accumulator()
+    # Group 7: rollout A = canonical (pass, 10 tokens) + segment (pass, 30
+    # tokens); rollout B = canonical (fail, 20 tokens). Group 8: two rollouts,
+    # the second with a segment row.
+    width = 32
+    token_mask = torch.zeros(6, width)
+    for row, count in enumerate([10, 30, 20, 5, 5, 7]):
+        token_mask[row, 1 : 1 + count] = 1.0
+    accumulate_rollout_stats(
+        acc,
+        prompt_ids=torch.tensor([7, 7, 7, 8, 8, 8]),
+        rewards=torch.tensor([1.0, 1.0, 0.0, 1.0, 1.0, 1.0]),
+        sample_mask=torch.ones(6),
+        token_mask=token_mask,
+        truncated=torch.tensor([False, True, False, False, False, False]),
+        seq_lens=torch.tensor([100.0, 300.0, 200.0, 50.0, 50.0, 70.0]),
+        is_canonical=torch.tensor([True, False, True, True, True, False]),
+    )
+    out = reduce_rollout_stats(acc, max_seq_len=1000)
+    # Per-row distributions include the segment rows (each is a trained sequence).
+    assert math.isclose(out["gen_tokens/mean"], 77 / 6, rel_tol=1e-6)
+    assert out["gen_tokens/max"] == 30
+    assert math.isclose(out["truncated_frac"], 1 / 6, rel_tol=1e-6)
+    assert out["seq_len/max"] == 300
+    # Reward / group statistics: rollouts only (A pass, B fail, 8: pass, pass).
+    assert out["reward/pass_frac"] == 0.75  # not 5/6
+    assert out["groups/count"] == 2
+    assert out["groups/mixed_count"] == 1
+    assert out["groups/mixed_frac"] == 0.5
+    assert out["groups/all_pass_frac"] == 0.5
+    # Two of the four rollouts (group 8) sit in a non-mixed group.
+    assert out["groups/zero_advantage_sample_frac"] == 0.5
+
+
+def test_no_valid_canonical_row_keeps_row_metrics_and_drops_group_metrics():
+    acc = new_rollout_stats_accumulator()
+    _fill(
+        acc,
+        prompt_ids=[1, 1],
+        rewards=[1, 0],
+        sample_mask=[0, 1],
+        gen_tokens=[4, 8],
+    )
+    # The only valid row is a segment row whose canonical row was masked.
+    acc["canonical"][-1] = torch.tensor([True, False])
+    out = reduce_rollout_stats(acc)
+    assert out["gen_tokens/mean"] == 8
+    assert "reward/pass_frac" not in out and "groups/count" not in out
+
+
+def test_is_canonical_default_matches_explicit_all_true():
+    plain = new_rollout_stats_accumulator()
+    explicit = new_rollout_stats_accumulator()
+    for acc, extra in ((plain, {}), (explicit, {"is_canonical": torch.ones(4, dtype=torch.bool)})):
+        width = 8
+        token_mask = torch.zeros(4, width)
+        token_mask[:, 1:3] = 1.0
+        accumulate_rollout_stats(
+            acc,
+            prompt_ids=torch.tensor([1, 1, 2, 2]),
+            rewards=torch.tensor([1.0, 0.0, 1.0, 1.0]),
+            sample_mask=torch.ones(4),
+            token_mask=token_mask,
+            **extra,
+        )
+    assert reduce_rollout_stats(plain) == reduce_rollout_stats(explicit)

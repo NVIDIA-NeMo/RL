@@ -82,6 +82,13 @@ class RolloutReassemblerActorConfig:
     max_seq_len: int
     # Whether the staging partition carries media columns (VLM capture).
     capture_media: bool
+    # token_capture.segment_rows: publish one row per verified chain segment
+    # (canonical terminal row + up to max_rows_per_rollout-1 extras).
+    segment_rows_enabled: bool = False
+    max_rows_per_rollout: int = 1
+    # token_capture.segment_rows.include_summary_rows: publish the single-call
+    # compaction_summary chains (the harness's summary request) as rows too.
+    include_summary_rows: bool = True
 
 
 def assert_metadata_only(value: Any, *, path: str = "rpc") -> None:
@@ -137,6 +144,9 @@ class RolloutReassemblerActor:  # pragma: no cover
             defer_routed_experts_to_policy=config.defer_routed_experts_to_policy,
             max_seq_len=config.max_seq_len,
             capture_media=config.capture_media,
+            segment_rows_enabled=config.segment_rows_enabled,
+            max_rows_per_rollout=config.max_rows_per_rollout,
+            include_summary_rows=config.include_summary_rows,
         )
 
     def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:

@@ -36,13 +36,25 @@ placeholder rows are reported but do not dilute the fractions.
   ``masking/reinstated_rows``: incomplete rows kept in the baseline by
   ``grpo.masked_sample_rewards_in_baseline``.
 * ``masking/reward_mean_{trained,env_flag,truncated,masked}``: mean reward of
-  each population, omitted when the population is empty, so the effect of
-  masking on the reward signal is visible.
+  each population (canonical rows, i.e. rollouts), omitted when the population
+  is empty, so the effect of masking on the reward signal is visible.
 * ``masking/groups``, ``masking/groups_lt2_trained_frac``: GRPO groups in the
-  step and the fraction left with fewer than two trained rows (no gradient).
+  step and the fraction left with fewer than two trained rollouts (canonical
+  rows; no gradient from the group baseline).
+* ``masking/rollouts``: rollouts (canonical rows) in the step;
+  ``masking/fully_masked_rollouts``: rollouts that delivered tokens on at least
+  one row but train on none of their rows.
+
+Segment rows (``token_capture.segment_rows``): a rollout may publish extra
+rows next to its canonical one. Pass ``is_canonical`` / ``rollout_key`` so the
+rollout-level numbers above are computed per rollout; the row counts and the
+``*_frac`` values stay honest per-row numbers. Without them every row is its
+own canonical rollout and nothing changes.
 """
 
 from __future__ import annotations
+
+from typing import Optional
 
 import torch
 
@@ -55,6 +67,8 @@ MASKING_STATS_KEYS: tuple[str, ...] = (
     "truncated_masked",
     "final_mask",
     "baseline_mask",
+    "canonical",
+    "rollout_ids",
 )
 
 
@@ -73,8 +87,15 @@ def accumulate_masking_stats(
     overlong_filtering: bool,
     final_sample_mask: torch.Tensor,
     baseline_mask: torch.Tensor,
+    is_canonical: Optional[torch.Tensor] = None,
+    rollout_key: Optional[torch.Tensor] = None,
 ) -> None:
-    """Append one chunk (all tensors moved to CPU, rows keyed by prompt group)."""
+    """Append one chunk (all tensors moved to CPU, rows keyed by prompt group).
+
+    ``is_canonical`` (``(B,)`` bool; default all True) marks the canonical row
+    of each rollout; ``rollout_key`` (``(B,)`` chunk-local rollout ids; default
+    one per row) ties a rollout's rows together for ``fully_masked_rollouts``.
+    """
     batch = rewards.shape[0]
     if batch == 0:
         return
@@ -82,9 +103,22 @@ def accumulate_masking_stats(
         prompt_ids.detach().reshape(batch, -1), dim=0, return_inverse=True
     )
     offset = int(acc["group_ids"][-1].max()) + 1 if acc["group_ids"] else 0
+    rollout_offset = int(acc["rollout_ids"][-1].max()) + 1 if acc["rollout_ids"] else 0
     env_flag = mask_sample.detach().bool().reshape(batch)
     trunc = truncated.detach().bool().reshape(batch)
+    canonical = (
+        torch.ones(batch, dtype=torch.bool)
+        if is_canonical is None
+        else is_canonical.detach().bool().reshape(batch).cpu()
+    )
+    rollouts = (
+        torch.arange(batch, dtype=torch.long)
+        if rollout_key is None
+        else rollout_key.detach().long().reshape(batch).cpu()
+    )
     acc["group_ids"].append(local_groups.reshape(batch).long().cpu() + offset)
+    acc["canonical"].append(canonical)
+    acc["rollout_ids"].append(rollouts + rollout_offset)
     acc["rewards"].append(rewards.detach().float().reshape(batch).cpu())
     acc["sample_mask"].append(sample_mask.detach().float().reshape(batch).cpu())
     acc["env_flag"].append(env_flag.cpu())
@@ -138,14 +172,30 @@ def reduce_masking_stats(acc: dict[str, list[torch.Tensor]]) -> dict[str, float]
         "masking/baseline_rows": float(in_baseline.sum()),
         "masking/reinstated_rows": float(reinstated.sum()),
     }
-    _set_mean(out, "masking/reward_mean_trained", rewards[trained])
-    _set_mean(out, "masking/reward_mean_env_flag", rewards[env_flag])
-    _set_mean(out, "masking/reward_mean_truncated", rewards[truncated])
-    _set_mean(out, "masking/reward_mean_masked", rewards[masked])
+    # Rollout-level views: one vote per rollout (its canonical row), so a
+    # rollout with several segment rows does not weigh more than one without.
+    canonical = torch.cat(acc["canonical"])
+    _set_mean(out, "masking/reward_mean_trained", rewards[trained & canonical])
+    _set_mean(out, "masking/reward_mean_env_flag", rewards[env_flag & canonical])
+    _set_mean(out, "masking/reward_mean_truncated", rewards[truncated & canonical])
+    _set_mean(out, "masking/reward_mean_masked", rewards[masked & canonical])
+
+    rollout_ids = torch.cat(acc["rollout_ids"])
+    num_rollout_slots = int(rollout_ids.max()) + 1
+    rollout_has_tokens = torch.bincount(
+        rollout_ids[has_tokens], minlength=num_rollout_slots
+    )
+    rollout_trained = torch.bincount(rollout_ids[trained], minlength=num_rollout_slots)
+    out["masking/rollouts"] = float(canonical.sum())
+    out["masking/fully_masked_rollouts"] = float(
+        ((rollout_has_tokens > 0) & (rollout_trained == 0)).sum()
+    )
 
     group_ids = torch.cat(acc["group_ids"])
     num_groups = int(group_ids.max()) + 1
-    trained_per_group = torch.bincount(group_ids[trained], minlength=num_groups)
+    trained_per_group = torch.bincount(
+        group_ids[trained & canonical], minlength=num_groups
+    )
     out["masking/groups"] = float(num_groups)
     out["masking/groups_lt2_trained_frac"] = (
         float((trained_per_group < 2).sum()) / num_groups if num_groups else 0.0

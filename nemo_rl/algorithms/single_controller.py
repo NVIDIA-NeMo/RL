@@ -73,6 +73,7 @@ import torch
 from ray.exceptions import RayActorError
 
 from nemo_rl.algorithms import opd as opd_module
+from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     CHECKPOINT_MUTATION_KINDS,
     DATA_PLANE_CHECKPOINT_DIR,
@@ -147,6 +148,16 @@ from nemo_rl.algorithms.single_controller_utils.rollout_stats import (
 from nemo_rl.algorithms.single_controller_utils.sample_masks import (
     baseline_valid_mask,
 )
+from nemo_rl.algorithms.single_controller_utils.segment_stats import (
+    accumulate_segment_stats,
+    broadcast_rollout_advantages,
+    check_chunk_completeness,
+    new_segment_stats_accumulator,
+    reduce_segment_stats,
+    resolve_row_identity,
+    rollout_vote_mask,
+    subset_rows,
+)
 from nemo_rl.algorithms.single_controller_utils.setup import (
     SingleControllerActorArgs,
     _maybe_restore_native_data_plane_checkpoint,
@@ -201,6 +212,10 @@ from nemo_rl.experience.rollout_recovery import (
     parse_rollout_recovery_state,
 )
 from nemo_rl.experience.route_plan import decode_route_plan
+from nemo_rl.experience.sample_ids import (
+    extra_sample_ids_for,
+    group_ids_in_order,
+)
 from nemo_rl.models.generation.engine_supervisor import EngineSupervisor
 from nemo_rl.models.generation.fleet_health import ShardState
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
@@ -811,6 +826,9 @@ class SingleControllerActor:
             "num_mask_sample_filtered": [],
             "sequence_lengths": [],
             "seq_logprob_error_metrics": [],
+            # 1.0 on the canonical row of each rollout, 0.0 on token-capture
+            # segment rows; weights the step reward mean per rollout.
+            "canonical_masks": [],
             **{key: [] for key in VIOLATION_TAG_KEYS},
         }
         self._opd_gap_sum = 0.0
@@ -818,6 +836,9 @@ class SingleControllerActor:
         # group reward mix, context use); see single_controller_utils/rollout_stats.py.
         self._rollout_stats_acc = new_rollout_stats_accumulator()
         self._masking_stats_acc = new_masking_stats_accumulator()
+        # Segment-row composition and by-kind logprob-error diagnostics; see
+        # single_controller_utils/segment_stats.py.
+        self._segment_stats_acc = new_segment_stats_accumulator()
         self._opd_stat_sum = 0.0
         self._opd_stat_sumsq = 0.0
         self._opd_stat_count = 0
@@ -1928,6 +1949,40 @@ class SingleControllerActor:
                 )
             )
             errors[-1].__cause__ = error
+        # Segment rows: the finalizer may have published up to
+        # max_per_rollout-1 extra ``_t{j}`` rows per canonical id (e.g. when a
+        # committed group is discarded for a low valid fraction). Their ids are
+        # deterministic, but TQ's kv_clear is all-or-nothing on absent keys
+        # (a single missing key makes the whole call a silent no-op), so clear
+        # only the subset that actually exists in the partition.
+        segment_rows_cfg = self._master_config.token_capture.segment_rows
+        if segment_rows_cfg.enabled and segment_rows_cfg.max_per_rollout >= 2:
+            try:
+                candidate_extra_ids = extra_sample_ids_for(
+                    list(request.canonical_sample_ids),
+                    int(segment_rows_cfg.max_per_rollout),
+                )
+                present_ids = set(
+                    await self._call_dp(
+                        "list_sample_ids", partition_id=self._partition_id
+                    )
+                )
+                extra_ids = [sid for sid in candidate_extra_ids if sid in present_ids]
+                if extra_ids:
+                    await self._call_dp(
+                        "clear_samples",
+                        sample_ids=extra_ids,
+                        partition_id=self._partition_id,
+                    )
+            except Exception as error:
+                errors.append(
+                    RuntimeError(
+                        "pre-publication segment-row cleanup failed for "
+                        f"group={request.group_id!r}, "
+                        f"canonical_ids={request.canonical_sample_ids!r}"
+                    )
+                )
+                errors[-1].__cause__ = error
         staging_keys = self._request_staging_keys(request)
         if staging_keys:
             try:
@@ -2178,19 +2233,13 @@ class SingleControllerActor:
 
     @staticmethod
     def _group_ids_from_meta(meta: KVBatchMeta) -> list[str]:
-        """Return stable prompt-group IDs in canonical sample order."""
-        group_ids: list[str] = []
-        seen_group_ids: set[str] = set()
-        for sample_id in meta.sample_ids:
-            group_id = sample_id
-            if "_g" in sample_id:
-                candidate, generation_index = sample_id.rsplit("_g", 1)
-                if candidate and generation_index.isdigit():
-                    group_id = candidate
-            if group_id not in seen_group_ids:
-                group_ids.append(group_id)
-                seen_group_ids.add(group_id)
-        return group_ids
+        """Return stable prompt-group IDs in canonical sample order.
+
+        Parses ``{group}_g{i}`` and ``{group}_g{i}_t{j}`` (segment rows) with
+        the shared grammar in ``nemo_rl.experience.sample_ids``; an id outside
+        that grammar is its own group id (historical lenient behaviour).
+        """
+        return group_ids_in_order(meta.sample_ids)
 
     # ── the three pumps + the inline advantage stage ───────────────────────
 
@@ -3049,6 +3098,22 @@ class SingleControllerActor:
                         )
                         if train_meta is not None:
                             selected_group_ids = self._group_ids_from_meta(train_meta)
+                            if (
+                                self._segment_rows_enabled()
+                                and len(selected_group_ids) != num_groups
+                            ):
+                                # With segment rows the chunk's row count is no
+                                # longer groups x N, so the only shape check
+                                # left is group identity: the sampler's group
+                                # count must equal the distinct group ids the
+                                # rows carry (the advantage stage then checks
+                                # groups x N rollouts and whole rollouts).
+                                raise RuntimeError(
+                                    "sampler selection group count does not match "
+                                    f"the selected rows: sampler reported {num_groups} "
+                                    f"group(s), rows carry {len(selected_group_ids)} "
+                                    f"distinct group id(s): {selected_group_ids!r}"
+                                )
                             if new_training_claim_ids:
                                 if set(selected_group_ids) != new_training_claim_ids:
                                     raise RuntimeError(
@@ -3504,6 +3569,21 @@ class SingleControllerActor:
                 except Exception as error:  # metrics must never fail a step
                     log.warning("Skipping masking_stats metrics: %s", error)
                 try:
+                    step_metrics.update(reduce_segment_stats(self._segment_stats_acc))
+                except Exception as error:  # metrics must never fail a step
+                    log.warning("Skipping segment_stats metrics: %s", error)
+                # Without the sequence-logprob gate (no prev_logprobs forward)
+                # nothing is masked between the loss's token_mult_prob_error
+                # and its pre-gate value, so the loss metric is both.
+                if (
+                    not self._policy_logprobs_required
+                    and "token_mult_prob_error_premask" not in step_metrics
+                    and "token_mult_prob_error" in step_metrics
+                ):
+                    step_metrics["token_mult_prob_error_premask"] = step_metrics[
+                        "token_mult_prob_error"
+                    ]
+                try:
                     step_metrics.update(self._rollout_manager.pop_mask_rule_metrics())
                 except Exception as error:  # metrics must never fail a step
                     log.warning("Skipping mask_rules metrics: %s", error)
@@ -3540,6 +3620,7 @@ class SingleControllerActor:
                 self._step_log_dict = {k: [] for k in self._step_log_dict}
                 self._rollout_stats_acc = new_rollout_stats_accumulator()
                 self._masking_stats_acc = new_masking_stats_accumulator()
+                self._segment_stats_acc = new_segment_stats_accumulator()
                 step_metrics.update(
                     _pooled_opd_metrics(
                         self._opd_stat_sum,
@@ -5707,6 +5788,44 @@ class SingleControllerActor:
             return meta, True
         adv_cfg = self._advantage_cfg
 
+        # Row identity: with token_capture.segment_rows a rollout publishes
+        # extra rows ({group}_g{i}_t{j}) next to its canonical row. Tags carry
+        # rollout_local_idx / trace_in_rollout_idx / trace_kind; the sample-id
+        # grammar is the fallback. Without segment rows every row is canonical
+        # and the stage below is exactly the single-row path.
+        identity = resolve_row_identity(meta.sample_ids, meta.tags)
+        has_extra_rows = identity.has_extra_rows
+        if has_extra_rows and (
+            self._is_ppo
+            or not isinstance(self._advantage_estimator, GRPOAdvantageEstimator)
+        ):
+            raise NotImplementedError(
+                "token_capture.segment_rows published "
+                f"{int((~identity.is_canonical).sum().item())} extra row(s) in "
+                "this chunk, but rollout-level advantages (computed on the "
+                "canonical rows and broadcast to the segment rows) are only "
+                "implemented for the GRPO advantage estimator; got "
+                f"{type(self._advantage_estimator).__name__}"
+                f"{' (PPO)' if self._is_ppo else ''}. Disable segment_rows or "
+                "switch to grpo.adv_estimator.name=grpo."
+            )
+        if has_extra_rows and identity.orphan_rows:
+            raise RuntimeError(
+                f"{identity.orphan_rows} segment row(s) in this chunk have no "
+                "canonical row; the finalizer must publish a rollout's rows "
+                "together and the sampler must keep groups whole."
+            )
+        if self._segment_rows_enabled():
+            # Whole groups (groups x N rollouts) and whole rollouts (the
+            # rows_in_rollout tag) per chunk; a row-level split upstream would
+            # otherwise shrink a baseline or split a rollout across chunks.
+            check_chunk_completeness(
+                identity,
+                num_generations_per_prompt=int(
+                    self._algo_cfg.num_generations_per_prompt
+                ),
+            )
+
         data = await call_data_plane(
             self._dp_client,
             "get_samples",
@@ -5747,6 +5866,9 @@ class SingleControllerActor:
 
         seq_logprob_error_threshold = self._algo_cfg.seq_logprob_error_threshold
         seq_error_tensors: dict[str, torch.Tensor] = {}
+        # Mask right before the sequence-logprob gate (env flag / overlong
+        # applied); the by-kind premask diagnostics are computed over it.
+        pre_gate_sample_mask = final_sample_mask.clone()
         # Match the legacy path: whenever real policy logprobs are available,
         # report sequence-level generation/training mismatch. A threshold adds
         # masking; leaving it unset keeps this metrics-only.
@@ -5840,12 +5962,16 @@ class SingleControllerActor:
                 overlong_filtering=bool(self._algo_cfg.overlong_filtering),
                 final_sample_mask=final_sample_mask,
                 baseline_mask=baseline_mask,
+                is_canonical=identity.is_canonical,
+                rollout_key=identity.rollout_key,
             )
         except Exception as error:  # metrics must never fail a step
             log.warning("Skipping masking_stats accumulation: %s", error)
 
         # Training predicts token t from position t - 1, so token_mask[:, 1:]
         # is the exact mask used when global_valid_toks and the loss are built.
+        # All rows count: a rollout whose canonical row is masked can still
+        # train through one of its segment rows.
         has_valid_training_tokens = bool(mask[:, 1:].bool().any().item())
         # Value-model estimators (GAE) hand back the regression target alongside
         # the advantages; the group-relative ones return a bare tensor.
@@ -5858,7 +5984,33 @@ class SingleControllerActor:
             if getattr(self._advantage_estimator, "normalize_over", None) == "all_rows"
             else mask
         )
-        if has_valid_training_tokens:
+        if has_valid_training_tokens and has_extra_rows:
+            # Rollout-level advantages: the estimator sees one row per rollout
+            # (the canonical rows, in row order) so segment rows never count
+            # as extra siblings; each rollout's advantage is then broadcast to
+            # all of its rows. Every row keeps its own loss mask (`mask`). The
+            # rollout's vote in the baseline/std is derived from ALL its rows
+            # (amax of baseline_mask): a rollout that trains through a segment
+            # row while its canonical row is gate-masked still votes, so the
+            # leave-one-out baseline it receives is the honest one; a rollout
+            # with every row masked still does not vote. With one row per
+            # rollout this is exactly baseline_mask on the canonical rows.
+            canonical_index = identity.canonical_index
+            rollout_votes = rollout_vote_mask(
+                baseline_mask, identity.rollout_key, canonical_index
+            )
+            canonical_advantages = self._advantage_estimator.compute_advantage(
+                prompt_ids=prompt_ids.index_select(0, canonical_index),
+                rewards=rewards.index_select(0, canonical_index),
+                mask=mask.index_select(0, canonical_index),
+                repeated_batch=subset_rows(repeated_batch, canonical_index),
+                valid_mask=rollout_votes,
+                **subset_rows(kwargs, canonical_index),
+            )
+            advantages = broadcast_rollout_advantages(
+                canonical_advantages, identity.row_to_canonical
+            )
+        elif has_valid_training_tokens:
             result = self._advantage_estimator.compute_advantage(
                 prompt_ids=prompt_ids,
                 rewards=rewards,
@@ -5905,6 +6057,9 @@ class SingleControllerActor:
         response_advantages = torch.masked_select(advantages, mask.bool())
         self._step_log_dict["rewards"].append(rewards.detach().cpu())
         self._step_log_dict["sample_masks"].append(final_sample_mask.detach().cpu())
+        self._step_log_dict.setdefault("canonical_masks", []).append(
+            identity.is_canonical.float().cpu()
+        )
         try:
             accumulate_rollout_stats(
                 self._rollout_stats_acc,
@@ -5923,9 +6078,33 @@ class SingleControllerActor:
                     ),
                     INPUT_LENGTHS,
                 ),
+                is_canonical=identity.is_canonical,
             )
         except Exception as error:  # metrics must never fail a step
             log.warning("Skipping rollout_stats accumulation: %s", error)
+        try:
+            accumulate_segment_stats(
+                self._segment_stats_acc,
+                rollout_key=identity.rollout_key,
+                trace_kind=identity.trace_kind,
+                final_sample_mask=final_sample_mask,
+                sample_mask=sample_mask,
+                token_mask=token_mask,
+                generation_logprobs=(
+                    tensor_field(data, adv_cfg.generation_logprobs_field)
+                    if self._policy_logprobs_required
+                    else None
+                ),
+                prev_logprobs=(
+                    tensor_field(data, adv_cfg.policy_logprobs_field)
+                    if self._policy_logprobs_required
+                    else None
+                ),
+                pre_gate_sample_mask=pre_gate_sample_mask,
+                is_canonical=identity.is_canonical,
+            )
+        except Exception as error:  # metrics must never fail a step
+            log.warning("Skipping segment_stats accumulation: %s", error)
         if self._teacher_logprobs_required:
             valid = response_advantages.detach().double()
             self._opd_stat_sum += float(valid.sum())
@@ -6021,6 +6200,12 @@ class SingleControllerActor:
         )
 
     # ── utility helpers ────────────────────────────────────────────────────
+
+    def _segment_rows_enabled(self) -> bool:
+        """``token_capture.segment_rows.enabled``; False on configs without the block."""
+        token_capture = getattr(self._master_config, "token_capture", None)
+        segment_rows = getattr(token_capture, "segment_rows", None)
+        return bool(getattr(segment_rows, "enabled", False))
 
     def _advantage_input_fields(self) -> list[str]:
         adv_cfg = self._advantage_cfg

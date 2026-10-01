@@ -1615,6 +1615,7 @@ class TestTQReplayBufferLoadPreflight:
         self._assert_rejected(_make_metadata_envelope([group]), match="misaligned")
 
     def test_group_size_mismatch(self):
+        # Fewer rows than rollouts can never be a finalized group.
         state = _make_metadata_envelope([_make_group_entry("g0", weight=1, n=2)])
         self._assert_rejected(state, match="misaligned", expected_group_size=3)
 
@@ -1638,6 +1639,72 @@ class TestTQReplayBufferLoadPreflight:
             _make_metadata_envelope([group]),
             match="misaligned",
             expected_group_size=None,
+        )
+
+    def test_group_with_more_canonical_rows_than_expected_is_rejected(self):
+        # 3 canonical rows for N=2: extra rows must be _t{j} segment rows,
+        # never additional rollouts.
+        state = _make_metadata_envelope([_make_group_entry("g0", weight=1, n=3)])
+        self._assert_rejected(state, match="misaligned", expected_group_size=2)
+
+    def test_group_with_segment_rows_is_accepted(self):
+        # token_capture.segment_rows: N canonical rows first, then extras.
+        # Rollout indices cover range(N) exactly and (i, j) pairs are unique.
+        state = _make_metadata_envelope(
+            [
+                _make_group_entry(
+                    "g0",
+                    weight=1,
+                    sample_ids=["g0_g0", "g0_g1", "g0_g0_t1", "g0_g1_t1", "g0_g1_t2"],
+                )
+            ]
+        )
+        buf = _make_buffer(FakeDataPlaneClient())
+
+        assert _load(buf, state, expected_group_size=2) == 1
+        assert buf.meta_list[0].sample_ids == [
+            "g0_g0",
+            "g0_g1",
+            "g0_g0_t1",
+            "g0_g1_t1",
+            "g0_g1_t2",
+        ]
+
+    def test_group_with_segment_rows_but_missing_rollout_is_rejected(self):
+        # 3 rows for N=2 but the rollout indices are {0, 5}: misaligned.
+        state = _make_metadata_envelope(
+            [
+                _make_group_entry(
+                    "g0", weight=1, sample_ids=["g0_g0", "g0_g5", "g0_g0_t1"]
+                )
+            ]
+        )
+        self._assert_rejected(state, match="misaligned", expected_group_size=2)
+
+    def test_group_with_orphan_segment_row_is_rejected(self):
+        state = _make_metadata_envelope(
+            [
+                _make_group_entry(
+                    "g0", weight=1, sample_ids=["g0_g0", "g0_g1", "g0_g7_t1"]
+                )
+            ]
+        )
+        self._assert_rejected(state, match="misaligned", expected_group_size=2)
+
+    def test_group_with_duplicate_segment_row_is_rejected(self):
+        state = _make_metadata_envelope(
+            [
+                _make_group_entry(
+                    "g0",
+                    weight=1,
+                    sample_ids=["g0_g0", "g0_g1", "g0_g0_t1", "g0_g0_t1"],
+                )
+            ]
+        )
+        # Duplicate ids are caught either by the segment validator or the
+        # cross-group duplicate check; both are ValueErrors before any write.
+        self._assert_rejected(
+            state, match="misaligned|duplicate", expected_group_size=2
         )
 
     def test_duplicate_sample_ids_across_groups(self):

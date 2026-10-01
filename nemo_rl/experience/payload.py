@@ -14,7 +14,7 @@
 
 """Producer-side payload helpers for the async-RL TQ path."""
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any, cast
 
 import numpy as np
@@ -212,6 +212,7 @@ def pack_payload(
     weight_version: int,
     group_id: str,
     prompt_idx: int,
+    sample_ids: Sequence[str] | None = None,
 ) -> tuple[list[str], TensorDict, list[dict[str, Any]]]:
     """Pack a producer batch into (sample_ids, fields, tags) for put_samples.
 
@@ -220,16 +221,29 @@ def pack_payload(
         weight_version: Trainer weight version stamped on every row's tag.
         group_id: Per-group identifier used as the sample_id prefix; the caller owns uniqueness.
         prompt_idx: Stable dataset prompt index stamped on every row's tag.
+        sample_ids: Optional explicit per-row ids (one per row of
+            ``train_batch``). Defaults to minting ``{group_id}_g{i}`` for row
+            ``i``; the token-capture finalizer passes its own list when a
+            group publishes segment rows (``{group_id}_g{i}_t{j}``) in
+            addition to the canonical block.
 
     Returns:
-        Sample IDs of the form ``{group_id}_g{i}``, a jagged-packed TensorDict
-        containing tensor fields and encoded multimodal wire fields, and
-        per-row tags. Tags carry the weight version, prompt index, violation
-        counts, and ``<field>__row_shapes`` metadata required to reconstruct
-        packed multimodal rows.
+        Sample IDs (``{group_id}_g{i}`` unless overridden), a jagged-packed
+        TensorDict containing tensor fields and encoded multimodal wire
+        fields, and per-row tags. Tags carry the weight version, prompt
+        index, violation counts, and ``<field>__row_shapes`` metadata required
+        to reconstruct packed multimodal rows.
     """
     lengths = train_batch["input_lengths"]
     n = int(lengths.shape[0])
+    if sample_ids is not None:
+        sample_ids = [str(sid) for sid in sample_ids]
+        if len(sample_ids) != n:
+            raise ValueError(
+                f"pack_payload: {len(sample_ids)} sample_ids for {n} rows"
+            )
+        if len(set(sample_ids)) != n:
+            raise ValueError("pack_payload: sample_ids must be unique")
     tensor_fields: dict[str, torch.Tensor | np.ndarray] = {
         k: v
         for k, v in train_batch.items()
@@ -244,7 +258,8 @@ def pack_payload(
     fields_td = pack_jagged_fields(
         tensor_fields, lengths=lengths, token_aligned_fields=TOKEN_ALIGNED_FIELDS
     )
-    sample_ids = [f"{group_id}_g{i}" for i in range(n)]
+    if sample_ids is None:
+        sample_ids = [f"{group_id}_g{i}" for i in range(n)]
     violations = train_batch.get(_VIOLATION_COUNTS_KEY, [{}] * n)
     rollout_debug = train_batch.get(_ROLLOUT_DEBUG_KEY)
     multimodal_tags = multimodal_row_tags(multimodal, n) or [{} for _ in range(n)]

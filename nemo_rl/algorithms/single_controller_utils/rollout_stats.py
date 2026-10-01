@@ -48,6 +48,14 @@ Metrics (logged under the ``train/`` prefix):
 Rows with ``sample_mask == 0`` (token-capture placeholders, environment
 mask_sample, overlong filter, sequence-logprob-error masking) are excluded
 from every statistic, matching what the advantage estimator trains on.
+
+Segment rows (``token_capture.segment_rows``): a rollout may publish extra
+rows (pre-compaction segments, subagent sessions) next to its canonical row.
+``gen_tokens/*``, ``turns/*``, ``seq_len/*`` and ``truncated_frac`` stay
+per-row distributions (each row is one trained sequence); ``reward/*`` and
+``groups/*`` are computed over canonical rows only (one vote per rollout,
+exactly what the advantage baseline sees). Pass ``is_canonical`` to
+:func:`accumulate_rollout_stats`; without it every row counts as a rollout.
 """
 
 from __future__ import annotations
@@ -64,6 +72,7 @@ ROLLOUT_STATS_KEYS: tuple[str, ...] = (
     "turns",
     "truncated",
     "seq_lens",
+    "canonical",
 )
 
 _PERCENTILES = (0.5, 0.75, 0.9)
@@ -111,6 +120,7 @@ def accumulate_rollout_stats(
     token_mask: torch.Tensor,
     truncated: Optional[torch.Tensor] = None,
     seq_lens: Optional[torch.Tensor] = None,
+    is_canonical: Optional[torch.Tensor] = None,
 ) -> None:
     """Append one advantage-stage chunk to ``acc`` (all tensors moved to CPU).
 
@@ -120,7 +130,9 @@ def accumulate_rollout_stats(
     estimator groups them within a chunk; each chunk's groups get ids that
     continue from the previous chunk's, so the reducer can concatenate them.
     ``truncated`` / ``seq_lens`` are optional; the reducer skips the metrics
-    that depend on them when any chunk lacks them.
+    that depend on them when any chunk lacks them. ``is_canonical`` (``(B,)``
+    bool, default all True) marks the one row per rollout that votes in the
+    reward / group statistics.
     """
     batch = rewards.shape[0]
     if batch == 0:
@@ -133,6 +145,11 @@ def accumulate_rollout_stats(
     acc["group_ids"].append(local_groups.reshape(batch).long().cpu() + offset)
     acc["rewards"].append(rewards.detach().float().reshape(batch).cpu())
     acc["sample_masks"].append(sample_mask.detach().float().reshape(batch).cpu())
+    acc["canonical"].append(
+        torch.ones(batch, dtype=torch.bool)
+        if is_canonical is None
+        else is_canonical.detach().bool().reshape(batch).cpu()
+    )
     acc["gen_tokens"].append(stats["gen_tokens"])
     acc["turns"].append(stats["turns"])
     if truncated is not None:
@@ -204,6 +221,16 @@ def reduce_rollout_stats(
     if len(acc["truncated"]) == num_chunks:
         out["truncated_frac"] = float(torch.cat(acc["truncated"])[valid].mean())
 
+    # Reward / group statistics: one vote per rollout (its canonical row).
+    # Segment rows share their rollout's reward, so counting them would weight
+    # compacted rollouts by their row count.
+    canonical = torch.cat(acc["canonical"])
+    votes = valid & canonical
+    if int(votes.sum()) == 0:
+        return out
+    rewards = torch.cat(acc["rewards"])[votes]
+    passed = rewards >= _PASS_THRESHOLD
+
     out["reward/std"] = (
         float(rewards.std(unbiased=False)) if rewards.numel() > 1 else 0.0
     )
@@ -213,7 +240,7 @@ def reduce_rollout_stats(
     # made unique across chunks at accumulation time; compact them after
     # dropping invalid rows).
     _, group_index = torch.unique(
-        torch.cat(acc["group_ids"])[valid], return_inverse=True
+        torch.cat(acc["group_ids"])[votes], return_inverse=True
     )
     group_index = group_index.reshape(-1)
     num_groups = int(group_index.max()) + 1

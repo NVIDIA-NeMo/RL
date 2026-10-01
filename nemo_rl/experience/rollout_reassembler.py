@@ -17,27 +17,45 @@ Orchestration only:
 per rollout, apply the rollout-level receipt guards, fetch the staged base
 rows the receipt manifest names through the ``TokenSource`` (normally
 validated ``StagedCallBaseSnapshot`` values), and delegate all token, digest,
-lineage, and terminal-chain semantics to Gym's ``verify_and_linearize``. Any
-rejection becomes a masked placeholder row — the group always publishes
-exactly N rows so GRPO group shape survives; validity folds into
-``sample_mask`` (no new train field) and placeholders copy
-``prompt_ids_for_adv`` from a valid sibling so per-prompt baselines stay
-well-formed.
+lineage, and terminal-chain semantics to Gym's ``verify_and_linearize`` (or,
+with ``token_capture.segment_rows.enabled``, ``verify_and_linearize_all``).
+Any rejection becomes a masked placeholder row — the group always publishes
+at least N rows (one canonical row per rollout, canonical block first) so GRPO
+group shape survives; validity folds into ``sample_mask`` (no new train
+field) and placeholders copy ``prompt_ids_for_adv`` from a valid sibling so
+per-prompt baselines stay well-formed.
+
+Segment rows (``token_capture.segment_rows``): a rollout whose receipt
+verifies to several chains — pre-compaction segments and compaction summary
+calls joined by context-rewrite boundaries, or subagent sessions — publishes
+its terminal chain as the canonical row ``{group}_g{i}`` and each additional
+chain as an extra row ``{group}_g{i}_t{j}`` (``j >= 1``) appended after the
+canonical block. Extra rows keep Gym's row order (the chains on the
+terminal's compaction sequence in segment order, then other roots by
+admission time); ``include_summary_rows=False`` drops the
+``compaction_summary`` chains first, then the ``max_per_rollout - 1`` cap
+applies to what remains. Extra rows copy the rollout's reward,
+``mask_sample``, ``prompt_ids_for_adv`` and ``sample_mask``; ``truncated`` is
+per row. Per-row tags (``rollout_local_idx``, ``trace_in_rollout_idx``,
+``trace_kind``, ``segment_index``, ``rows_in_rollout``) let the advantage
+stage dedup rewards back to rollouts and assert it received whole rollouts.
+Staging cleanup ownership stays on the canonical row only.
 
 Router replay runs one unified flow: both modes construct the same
-``RouteAssemblyPlan`` from Gym's link spans and extras commitments. Deferred
-mode publishes the encoded plan beside the canonical row and leaves staged
-route fragments live until policy consumption; direct mode executes the plan
-eagerly with fragments fetched in the same batch — any executor failure is a
-pre-publication ``route_assembly:<reason>`` rejection.
+``RouteAssemblyPlan`` from Gym's link spans and extras commitments, per
+chain. Deferred mode publishes the encoded plan beside each row and leaves
+staged route fragments live until policy consumption; direct mode executes
+the plan eagerly with fragments fetched in the same batch — any executor
+failure is a pre-publication ``route_assembly:<reason>`` rejection.
 """
 
 from __future__ import annotations
 
 import time
+import warnings
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Optional, cast
+from typing import Any, Callable, Optional, cast
 
 import torch
 
@@ -64,11 +82,34 @@ from nemo_rl.experience.route_plan import (
     encoded_route_plan_size_bytes,
     validate_route_plan,
 )
+from nemo_rl.experience.sample_ids import make_sample_id, try_parse_sample_id
+
+# ``trace_kind`` tag values. The first three mirror Gym's
+# ``LinearizedRow.chain_kind``; ``placeholder`` marks a rejected rollout's
+# masked row.
+TRACE_KIND_TERMINAL = "terminal"
+TRACE_KIND_COMPACTION_SEGMENT = "compaction_segment"
+TRACE_KIND_COMPACTION_SUMMARY = "compaction_summary"
+TRACE_KIND_SUBAGENT = "subagent"
+TRACE_KIND_PLACEHOLDER = "placeholder"
+
+# Gym's ``SkippedChain.reason`` for an ambiguous leaf (fork inside a
+# non-terminal chain); the only skip reason surfaced as its own metric.
+_SKIP_AMBIGUOUS_LEAF = "ambiguous_leaf"
 
 
 @dataclass(frozen=True)
 class FinalizedRollout:
-    """One rollout's canonical row, or its rejection."""
+    """One verified chain of a rollout (a training row), or the rollout's rejection.
+
+    ``finalize_rollout`` returns a list of these per rollout: index 0 is the
+    canonical row (the receipt's terminal chain, or the placeholder for a
+    rejected rollout); indices >= 1 are extra segment rows and only exist
+    when ``segment_rows`` is enabled and the rollout verified to more than
+    one chain. Rollout-level diagnostics (``num_chains``, ``chains_skipped_*``,
+    ``boundary_roots``, ``segments_dropped_by_cap``, ``segments_rejected``)
+    are carried on index 0 only.
+    """
 
     rollout_id: str
     valid: bool
@@ -78,6 +119,8 @@ class FinalizedRollout:
     logprobs: list[float]
     prompt_len: int
     reward: float
+    # Staging cleanup ownership: the whole receipt manifest on the canonical
+    # row, empty on extra rows (they share the same staged calls).
     staging_keys: list[str]
     min_wv: Optional[int] = None
     max_wv: Optional[int] = None
@@ -90,6 +133,25 @@ class FinalizedRollout:
     # media columns (staged in the same put as each call's tokens) and
     # structurally validated. None for text rollouts.
     media: Optional[dict[str, PackedTensor]] = None
+    # Segment placement (token_capture.segment_rows). Defaults describe the
+    # single canonical row of the classic one-row-per-rollout path.
+    trace_in_rollout_idx: int = 0
+    trace_kind: str = TRACE_KIND_TERMINAL
+    segment_index: int = 0
+    boundary_parent_call_id: Optional[str] = None
+    chain_index: int = 0
+    # This row's (call_id, carry_len, generation_len) spans from Gym; the
+    # route plan above is built from exactly these.
+    link_spans: tuple[tuple[str, int, int], ...] = ()
+    # Rollout-level diagnostics (canonical row only).
+    num_chains: int = 1
+    chains_skipped_ambiguous: int = 0
+    chains_skipped_other: int = 0
+    boundary_roots: int = 0
+    segments_dropped_by_cap: int = 0
+    segments_rejected: int = 0
+    # compaction_summary chains dropped because include_summary_rows is off.
+    segments_skipped_summary: int = 0
 
 
 @dataclass
@@ -110,10 +172,16 @@ class FinalizedGroup:
     dropped: bool = False
     # Which policy dropped the group, for the caller's log line.
     drop_reason: Optional[str] = None
-    # Rows that verified vs. total rows in the group. 0/0 on a dropped group
-    # (the caller does not read these when dropped is True).
+    # ROLLOUT counts (not published-row counts): rollouts whose canonical row
+    # verified vs. rollouts in the group. 0/0 on a dropped group (the caller
+    # does not read these when dropped is True). The controller's
+    # min_valid_fraction_per_group policy reads exactly these, so segment
+    # rows never inflate a group's apparent validity.
     valid_row_count: int = 0
     total_row_count: int = 0
+    # Extra segment rows published after the canonical block
+    # (``len(meta.sample_ids) == total_row_count + extra_row_count``).
+    extra_row_count: int = 0
 
 
 def _concat_media(parts: list[StagedMediaTensors]) -> StagedMediaTensors:
@@ -204,7 +272,7 @@ def _media_fields_for_group(rows: list[FinalizedRollout]) -> dict[str, PackedTen
 
 
 class RolloutReassembler:
-    """Receipts -> verified rows -> N-row publish, off the generation hot path."""
+    """Receipts -> verified rows -> N(+segments)-row publish, off the generation hot path."""
 
     def __init__(
         self,
@@ -217,6 +285,9 @@ class RolloutReassembler:
         router_replay_enabled: bool = False,
         defer_routed_experts_to_policy: bool = False,
         capture_media: bool = False,
+        segment_rows_enabled: bool = False,
+        max_rows_per_rollout: int = 1,
+        include_summary_rows: bool = True,
     ) -> None:
         self._dp_client = dp_client
         self._partition_id = partition_id
@@ -232,6 +303,19 @@ class RolloutReassembler:
             raise ValueError(
                 "defer_routed_experts_to_policy requires router replay to be enabled"
             )
+        self._segment_rows_enabled = bool(segment_rows_enabled)
+        self._max_rows_per_rollout = int(max_rows_per_rollout)
+        if self._max_rows_per_rollout < 1:
+            raise ValueError(
+                f"max_rows_per_rollout must be >= 1, got {max_rows_per_rollout}"
+            )
+        if self._segment_rows_enabled and self._max_rows_per_rollout < 2:
+            raise ValueError(
+                "segment_rows_enabled requires max_rows_per_rollout >= 2 "
+                f"(canonical row plus at least one segment), got {max_rows_per_rollout}"
+            )
+        self._include_summary_rows = bool(include_summary_rows)
+        self._warned_missing_linearize_all = False
         self._staging_partition = staging_partition
         # (num_moe_layers, topk), learned from the first rebuilt row that
         # carries routes; placeholder-only groups need it to shape their
@@ -248,14 +332,41 @@ class RolloutReassembler:
 
     # ── per rollout ─────────────────────────────────────────────────────────
 
+    def _resolve_linearize_all(self) -> Optional[Callable[..., Any]]:
+        """Return Gym's ``verify_and_linearize_all`` when segment rows are on.
+
+        Looked up at call time (not import time) so a Gym without the function
+        degrades to single-chain behaviour with a warning instead of failing
+        the finalizer, and so tests can monkeypatch the module attribute.
+        """
+        if not self._segment_rows_enabled:
+            return None
+        import nemo_gym.token_id_capture.staging.rebuild as rebuild_module
+
+        linearize_all = getattr(rebuild_module, "verify_and_linearize_all", None)
+        if linearize_all is None and not self._warned_missing_linearize_all:
+            self._warned_missing_linearize_all = True
+            message = (
+                "token_capture.segment_rows.enabled=true but the installed "
+                "nemo_gym has no verify_and_linearize_all "
+                "(nemo_gym.token_id_capture.staging.rebuild); falling back to "
+                "single-chain finalization -- no segment rows will be published."
+            )
+            warnings.warn(message, RuntimeWarning, stacklevel=2)
+            print(f"  finalize: WARNING {message}", flush=True)
+        return linearize_all
+
     def finalize_rollout(
         self, rollout_id: str, receipt: Optional[dict[str, Any]], *, reward: float
-    ) -> FinalizedRollout:
-        """Verify one receipt against its staged rows and linearize the main chain.
+    ) -> list[FinalizedRollout]:
+        """Verify one receipt against its staged rows and linearize its chain(s).
 
-        Never raises for rollout-level problems: every rejection returns an
-        invalid row whose reason feeds the metrics; the group publisher
-        substitutes a placeholder.
+        Returns one ``FinalizedRollout`` per published row: the canonical row
+        first (the receipt's terminal chain), then -- only with segment rows
+        enabled -- up to ``max_rows_per_rollout - 1`` extra chains in Gym's
+        order. Never raises for rollout-level problems: every rejection
+        returns exactly one invalid row (no extras) whose reason feeds the
+        metrics; the group publisher substitutes a placeholder.
         """
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.staging.rebuild import (
@@ -265,18 +376,20 @@ class RolloutReassembler:
         )
         from nemo_gym.token_id_capture.staging.records import RolloutReceipt
 
-        def rejected(reason: str, staging_keys: list[str]) -> FinalizedRollout:
-            return FinalizedRollout(
-                rollout_id=rollout_id,
-                valid=False,
-                rejection_reason=reason,
-                token_ids=[],
-                token_mask=[],
-                logprobs=[],
-                prompt_len=0,
-                reward=reward,
-                staging_keys=staging_keys,
-            )
+        def rejected(reason: str, staging_keys: list[str]) -> list[FinalizedRollout]:
+            return [
+                FinalizedRollout(
+                    rollout_id=rollout_id,
+                    valid=False,
+                    rejection_reason=reason,
+                    token_ids=[],
+                    token_mask=[],
+                    logprobs=[],
+                    prompt_len=0,
+                    reward=reward,
+                    staging_keys=staging_keys,
+                )
+            ]
 
         if receipt is None:
             return rejected("missing_receipt", [])
@@ -329,8 +442,22 @@ class RolloutReassembler:
 
         # All base token/digest/lineage/terminal semantics belong to Gym; the
         # finalizer never re-verifies them.
+        snapshots = [item.snapshot for item in fetched]
+        linearize_all = self._resolve_linearize_all()
+        chain_rows: list[Any]
+        skipped_reasons: list[str] = []
+        boundary_roots = 0
         try:
-            row = verify_and_linearize(parsed, [item.snapshot for item in fetched])
+            if linearize_all is not None:
+                linearized = linearize_all(parsed, snapshots)
+                chain_rows = list(linearized.rows)
+                skipped_reasons = [
+                    str(getattr(chain, "reason", ""))
+                    for chain in (getattr(linearized, "skipped", None) or [])
+                ]
+                boundary_roots = int(getattr(linearized, "num_boundary_roots", 0))
+            else:
+                chain_rows = [verify_and_linearize(parsed, snapshots)]
         except (
             KeyError,
             ValueError,
@@ -340,18 +467,116 @@ class RolloutReassembler:
             NotImplementedError,
         ) as error:
             return rejected(f"rebuild_failed:{error}", staging_keys)
+        if not chain_rows:
+            return rejected("rebuild_failed:no_terminal_chain", staging_keys)
         weight_versions = [record.weight_version for record in parsed.manifest]
         min_wv, max_wv = min(weight_versions), max(weight_versions)
 
-        # Media: the presence flags fetched with the base columns say which
-        # terminal-chain calls carry pixels; one batched read pulls them,
-        # after token verification so a rejected rollout never moves pixels.
-        media, media_failure = self._resolve_media(row, fetched_by_call)
-        if media_failure is not None:
-            return rejected(media_failure, staging_keys)
+        # Summary rows: drop the compaction_summary chains before the cap when
+        # they are not wanted, so the cap budget goes to the other chains.
+        segments_skipped_summary = 0
+        if self._segment_rows_enabled and not self._include_summary_rows:
+            kept = [chain_rows[0]]
+            for chain in chain_rows[1:]:
+                if getattr(chain, "chain_kind", None) == TRACE_KIND_COMPACTION_SUMMARY:
+                    segments_skipped_summary += 1
+                else:
+                    kept.append(chain)
+            chain_rows = kept
+        # Cap: the canonical row plus at most max_rows_per_rollout-1 extras,
+        # in Gym's order (terminal first, then the chains on the terminal's
+        # compaction sequence in segment order, then other roots by admission
+        # time).
+        max_extra = self._max_rows_per_rollout - 1 if self._segment_rows_enabled else 0
+        segments_dropped_by_cap = max(0, len(chain_rows) - 1 - max_extra)
+        chain_rows = chain_rows[: 1 + max_extra]
 
+        rows: list[FinalizedRollout] = []
+        segments_rejected = 0
+        for trace_idx, chain in enumerate(chain_rows):
+            built, failure = self._build_chain_row(
+                rollout_id=rollout_id,
+                chain=chain,
+                trace_idx=trace_idx,
+                reward=reward,
+                staging_keys=staging_keys,
+                records_by_call=records_by_call,
+                fetched=fetched,
+                fetched_by_call=fetched_by_call,
+                min_wv=min_wv,
+                max_wv=max_wv,
+            )
+            if built is None:
+                if trace_idx == 0:
+                    # The terminal chain is the rollout's canonical row; its
+                    # rejection is the rollout's rejection (placeholder).
+                    return rejected(failure or "route_assembly:unknown", staging_keys)
+                segments_rejected += 1
+                print(
+                    f"  finalize: rollout {rollout_id} segment row {trace_idx} "
+                    f"rejected ({failure}) -- dropped",
+                    flush=True,
+                )
+                continue
+            rows.append(built)
+        # Extra rows are numbered by publication order so the ids are dense.
+        renumbered: list[FinalizedRollout] = []
+        for publish_idx, row in enumerate(rows):
+            if publish_idx == 0:
+                renumbered.append(
+                    _replace_dataclass(
+                        row,
+                        num_chains=len(rows),
+                        chains_skipped_ambiguous=sum(
+                            1 for r in skipped_reasons if r == _SKIP_AMBIGUOUS_LEAF
+                        ),
+                        chains_skipped_other=sum(
+                            1 for r in skipped_reasons if r != _SKIP_AMBIGUOUS_LEAF
+                        ),
+                        boundary_roots=boundary_roots,
+                        segments_dropped_by_cap=segments_dropped_by_cap,
+                        segments_rejected=segments_rejected,
+                        segments_skipped_summary=segments_skipped_summary,
+                    )
+                )
+            else:
+                renumbered.append(
+                    _replace_dataclass(row, trace_in_rollout_idx=publish_idx)
+                )
+        return renumbered
+
+    def _build_chain_row(
+        self,
+        *,
+        rollout_id: str,
+        chain: Any,
+        trace_idx: int,
+        reward: float,
+        staging_keys: list[str],
+        records_by_call: dict[str, Any],
+        fetched: list[Any],
+        fetched_by_call: dict[str, Any],
+        min_wv: int,
+        max_wv: int,
+    ) -> tuple[Optional[FinalizedRollout], Optional[str]]:
+        """Turn one verified Gym chain into a row; ``(None, reason)`` on failure."""
+        # Media: the presence flags fetched with the base columns say which
+        # of this chain's calls carry pixels; one batched read pulls them,
+        # after token verification so a rejected rollout never moves pixels.
+        media, media_failure = self._resolve_media(chain, fetched_by_call)
+        if media_failure is not None:
+            return None, media_failure
         route_plan = None
         routed_experts: Optional[torch.Tensor] = None
+        link_spans = tuple(
+            (str(call_id), int(carry_len), int(generation_len))
+            for call_id, carry_len, generation_len in (
+                getattr(chain, "link_spans", None) or []
+            )
+        )
+        # Cleanup ownership (staging keys / plan cleanup keys) rides the
+        # canonical row only; extra rows share the same staged calls.
+        owns_cleanup = trace_idx == 0
         if self._router_replay_enabled:
             # One plan construction for both modes: join Gym's link spans and
             # extras commitments with the fetch's staging keys and route
@@ -359,29 +584,25 @@ class RolloutReassembler:
             # stay cleanup-owned but produce no spans.
             commitments_by_call = {
                 commitment.model_call_id: commitment
-                for commitment in row.extras_commitments
+                for commitment in chain.extras_commitments
             }
             route_spans: list[RouteSpan] = []
             seen_span_call_ids: set[str] = set()
-            for call_id, carry_len, generation_len in row.link_spans:
+            for call_id, carry_len, generation_len in link_spans:
                 if call_id in seen_span_call_ids:
-                    return rejected(f"duplicate_route_span:{call_id}", staging_keys)
+                    return None, f"duplicate_route_span:{call_id}"
                 seen_span_call_ids.add(call_id)
                 record = records_by_call.get(call_id)
                 item = fetched_by_call.get(call_id)
                 commitment = commitments_by_call.get(call_id)
                 if record is None or item is None or commitment is None:
-                    return rejected(f"route_span_identity:{call_id}", staging_keys)
+                    return None, f"route_span_identity:{call_id}"
                 if item.routed_len not in (0, record.delta_len):
-                    return rejected(f"routed_len_mismatch:{call_id}", staging_keys)
+                    return None, f"routed_len_mismatch:{call_id}"
                 if generation_len < 0 or generation_len > record.delta_len:
-                    return rejected(
-                        f"route_generation_span_mismatch:{call_id}", staging_keys
-                    )
+                    return None, f"route_generation_span_mismatch:{call_id}"
                 if carry_len < 0:
-                    return rejected(
-                        f"route_carry_span_mismatch:{call_id}", staging_keys
-                    )
+                    return None, f"route_carry_span_mismatch:{call_id}"
                 route_spans.append(
                     RouteSpan(
                         staging_key=record.staging_key,
@@ -393,44 +614,53 @@ class RolloutReassembler:
                     )
                 )
             if sum(span.carry_len + span.generation_len for span in route_spans) != len(
-                row.token_ids
+                chain.token_ids
             ):
-                return rejected("route_span_length_mismatch", staging_keys)
+                return None, "route_span_length_mismatch"
             plan = RouteAssemblyPlan(
                 schema_version=ROUTE_PLAN_SCHEMA_VERSION,
                 staging_partition=self._staging_partition,
                 spans=tuple(route_spans),
-                cleanup_staging_keys=tuple(staging_keys),
-                expected_token_length=len(row.token_ids),
+                cleanup_staging_keys=tuple(staging_keys) if owns_cleanup else (),
+                expected_token_length=len(chain.token_ids),
             )
             try:
                 validate_route_plan(plan)
             except (TypeError, ValueError) as error:
-                return rejected(f"invalid_route_plan:{error}", staging_keys)
-            # Both modes carry the constructed plan on the rollout; only
-            # deferred mode publishes it (direct mode executes it eagerly and
-            # the published row carries the assembled tensor instead).
+                return None, f"invalid_route_plan:{error}"
+            # Both modes carry the constructed plan on the row; only deferred
+            # mode publishes it (direct mode executes it eagerly and the
+            # published row carries the assembled tensor instead).
             route_plan = plan
             if not self._defer_routed_experts_to_policy:
                 routed_experts, failure = self._execute_direct_plan(plan, fetched)
                 if failure is not None:
-                    return rejected(f"route_assembly:{failure}", staging_keys)
+                    return None, f"route_assembly:{failure}"
 
-        return FinalizedRollout(
-            rollout_id=rollout_id,
-            valid=True,
-            rejection_reason=None,
-            token_ids=row.token_ids,
-            token_mask=row.token_mask,
-            logprobs=row.logprobs,
-            prompt_len=row.prompt_len,
-            reward=reward,
-            staging_keys=staging_keys,
-            min_wv=min_wv,
-            max_wv=max_wv,
-            routed_experts=routed_experts,
-            route_plan=route_plan,
-            media=media,
+        return (
+            FinalizedRollout(
+                rollout_id=rollout_id,
+                valid=True,
+                rejection_reason=None,
+                token_ids=list(chain.token_ids),
+                token_mask=list(chain.token_mask),
+                logprobs=list(chain.logprobs),
+                prompt_len=int(chain.prompt_len),
+                reward=reward,
+                staging_keys=list(staging_keys) if owns_cleanup else [],
+                min_wv=min_wv,
+                max_wv=max_wv,
+                routed_experts=routed_experts,
+                route_plan=route_plan,
+                trace_in_rollout_idx=trace_idx,
+                trace_kind=str(getattr(chain, "chain_kind", TRACE_KIND_TERMINAL)),
+                segment_index=int(getattr(chain, "segment_index", 0)),
+                boundary_parent_call_id=getattr(chain, "boundary_parent_call_id", None),
+                chain_index=int(getattr(chain, "chain_index", trace_idx)),
+                link_spans=link_spans,
+                media=media,
+            ),
+            None,
         )
 
     def _resolve_media(
@@ -522,21 +752,28 @@ class RolloutReassembler:
         loss_multiplier: float = 1.0,
         canonical_sample_ids: Optional[list[str]] = None,
     ) -> FinalizedGroup:
-        """Publish exactly N canonical rows for one prompt group.
+        """Publish the N canonical rows (plus any segment rows) for one prompt group.
+
+        Row layout: positions ``0..N-1`` are the canonical rows of rollouts
+        ``0..N-1`` under ``canonical_sample_ids`` (one per rollout, placeholder
+        when rejected); positions ``N..`` are extra segment rows in
+        ``(rollout, trace)`` order under ``{canonical_id}_t{j}``. Without
+        ``segment_rows`` exactly N rows are published, as before.
 
         Blocking (TQ round trips); run via ``asyncio.to_thread`` from the
         dispatch task. ``fallback_weight_version`` stamps a group none of
         whose rollouts produced a valid row (placeholder-only groups still
         need a staleness tag). ``mask_sample`` is the per-rollout
         advantage-stage flag the native ``pack_payload`` path emits from each
-        ``Completion``; it rides along unchanged so the train pump's
-        environment masking reads the same field on both paths (placeholder
-        rows already train nothing through ``sample_mask`` 0).
-        ``loss_multiplier`` supplies the dataset-level weight for every valid
-        row, matching the ordinary ``record_to_train_batch`` path. ``truncated``
-        is not carried from the dispatcher -- the receipt path has no real
-        tokens to measure it from at dispatch time -- so it is computed here
-        instead, from each row's rebuilt length against ``max_seq_len``.
+        ``Completion``; it rides along unchanged (replicated to a rollout's
+        extra rows) so the train pump's environment masking reads the same
+        field on both paths (placeholder rows already train nothing through
+        ``sample_mask`` 0). ``loss_multiplier`` supplies the dataset-level
+        weight for every valid row, matching the ordinary
+        ``record_to_train_batch`` path. ``truncated`` is not carried from the
+        dispatcher -- the receipt path has no real tokens to measure it from
+        at dispatch time -- so it is computed here instead, per row, from the
+        rebuilt length against ``max_seq_len``.
         """
         assert len(rollout_ids) == len(receipts) == len(rewards) == len(mask_sample), (
             "rollout_ids, receipts, rewards, and mask_sample must be parallel"
@@ -547,17 +784,28 @@ class RolloutReassembler:
             "canonical_sample_ids must be one per rollout"
         )
         _group_t0 = time.perf_counter()
-        rows = [
+        per_rollout = [
             self.finalize_rollout(rollout_id, receipt, reward=reward)
             for rollout_id, receipt, reward in zip(rollout_ids, receipts, rewards)
         ]
         _rollouts_ms = (time.perf_counter() - _group_t0) * 1000.0
-        valid_rows = [row for row in rows if row.valid]
+        n_rollouts = len(per_rollout)
+        canonical_rows = [rows[0] for rows in per_rollout]
+        extra_entries = [
+            (rollout_idx, row)
+            for rollout_idx, rows in enumerate(per_rollout)
+            for row in rows[1:]
+        ]
+        # Canonical block first, then extras in (rollout, trace) order.
+        rows: list[FinalizedRollout] = canonical_rows + [row for _, row in extra_entries]
+        row_rollout_idx = list(range(n_rollouts)) + [i for i, _ in extra_entries]
+        valid_rows = [row for row in canonical_rows if row.valid]
+        all_valid_rows = [row for row in rows if row.valid]
         staging_keys = [key for row in rows for key in row.staging_keys]
         metrics = {
-            "finalize/invalid_row_rate": 1.0 - len(valid_rows) / len(rows),
+            "finalize/invalid_row_rate": 1.0 - len(valid_rows) / n_rollouts,
             "finalize/calls_per_rollout": (
-                sum(len(row.staging_keys) for row in rows) / len(rows)
+                sum(len(row.staging_keys) for row in canonical_rows) / n_rollouts
             ),
             # Fraction of valid rows that carry captured media. 1.0 on a VLM
             # run is the signal that the learner trains on captured pixels
@@ -568,6 +816,31 @@ class RolloutReassembler:
                 else 0.0
             ),
         }
+        # Segment-row accounting (all zeros / 1.0 without segment_rows).
+        rows_per_rollout = [len(chain_rows) for chain_rows in per_rollout]
+        metrics["finalize/rows_per_rollout_mean"] = sum(rows_per_rollout) / n_rollouts
+        metrics["finalize/rows_per_rollout_max"] = float(max(rows_per_rollout))
+        metrics["finalize/rollouts_with_segments"] = float(
+            sum(1 for count in rows_per_rollout if count > 1)
+        )
+        metrics["finalize/segment_rows"] = float(len(extra_entries))
+        for kind, count in Counter(row.trace_kind for _, row in extra_entries).items():
+            metrics[f"finalize/segment_rows_by_kind_{kind}"] = float(count)
+        metrics["finalize/chains_skipped_ambiguous"] = float(
+            sum(row.chains_skipped_ambiguous for row in canonical_rows)
+        )
+        metrics["finalize/boundary_roots"] = float(
+            sum(row.boundary_roots for row in canonical_rows)
+        )
+        metrics["finalize/segments_dropped_by_cap"] = float(
+            sum(row.segments_dropped_by_cap for row in canonical_rows)
+        )
+        metrics["finalize/segment_rows_rejected"] = float(
+            sum(row.segments_rejected for row in canonical_rows)
+        )
+        metrics["finalize/segment_rows_skipped_summary"] = float(
+            sum(row.segments_skipped_summary for row in canonical_rows)
+        )
         # Ledger-derived admission counters (per group): each manifest row
         # carries its admission mode. token_in_rate near 1.0 is the capture
         # health signal (a text root only opens each chain); this replaces the
@@ -643,7 +916,7 @@ class RolloutReassembler:
             witness_disagreements
         )
         rejection_reasons: Counter[str] = Counter()
-        for row in rows:
+        for row in canonical_rows:
             if not row.valid:
                 reason_bucket = (row.rejection_reason or "unknown").split(":", 1)[0]
                 rejection_reasons[reason_bucket] += 1
@@ -669,7 +942,10 @@ class RolloutReassembler:
         _tensorize_t0 = time.perf_counter()
         # Placeholders borrow a valid sibling's prompt ids so per-prompt
         # baselines group correctly; an all-placeholder group uses a single
-        # pad token (its rows all carry sample_mask 0 and never train).
+        # pad token (its rows all carry sample_mask 0 and never train). Extra
+        # segment rows carry the same group prompt as their rollout's
+        # canonical row (identical tensor), so grouping by prompt tokens
+        # keeps the whole group -- canonical and segment rows -- together.
         sibling_prompt = (
             valid_rows[0].token_ids[: valid_rows[0].prompt_len] if valid_rows else []
         ) or [self._pad_token_id]
@@ -683,15 +959,19 @@ class RolloutReassembler:
         prompt_ids_for_adv = torch.tensor([sibling_prompt] * n, dtype=torch.int64)
         sample_mask = torch.zeros(n, dtype=torch.float32)
         lengths = torch.tensor(seq_lens, dtype=torch.long)
-        rewards_t = torch.tensor([row.reward for row in rows], dtype=torch.float32)
-        for i, row in enumerate(rows):
+        # Extra rows carry their rollout's reward / mask_sample verbatim.
+        rewards_t = torch.tensor(
+            [rewards[i] for i in row_rollout_idx], dtype=torch.float32
+        )
+        mask_sample_rows = [bool(mask_sample[i]) for i in row_rollout_idx]
+        for r, row in enumerate(rows):
             if not row.valid:
                 continue
             length = len(row.token_ids)
-            input_ids[i, :length] = torch.tensor(row.token_ids, dtype=torch.int64)
-            token_mask[i, :length] = torch.tensor(row.token_mask, dtype=torch.float32)
-            logprobs[i, :length] = torch.tensor(row.logprobs, dtype=torch.float32)
-            sample_mask[i] = float(loss_multiplier)
+            input_ids[r, :length] = torch.tensor(row.token_ids, dtype=torch.int64)
+            token_mask[r, :length] = torch.tensor(row.token_mask, dtype=torch.float32)
+            logprobs[r, :length] = torch.tensor(row.logprobs, dtype=torch.float32)
+            sample_mask[r] = float(loss_multiplier)
 
         train_batch: dict[str, Any] = {
             "input_ids": input_ids,
@@ -701,7 +981,7 @@ class RolloutReassembler:
             "sample_mask": sample_mask,
             "prompt_ids_for_adv": prompt_ids_for_adv,
             "total_reward": rewards_t,
-            MASK_SAMPLE: torch.tensor(mask_sample, dtype=torch.bool),
+            MASK_SAMPLE: torch.tensor(mask_sample_rows, dtype=torch.bool),
             TRUNCATED: torch.tensor(
                 [seq_len == self._max_seq_len for seq_len in seq_lens],
                 dtype=torch.bool,
@@ -736,6 +1016,7 @@ class RolloutReassembler:
                     ),
                     valid_row_count=0,
                     total_row_count=0,
+                    extra_row_count=0,
                 )
             train_batch["routed_experts"] = self._build_routed_experts_tensor(
                 rows, max_len=max_len, metrics=metrics
@@ -743,12 +1024,30 @@ class RolloutReassembler:
         # Media rides the same packed/tagged transport as the token-echo path
         # (pack_payload encodes PackedTensor fields and mints row-shape tags).
         train_batch.update(_media_fields_for_group(rows))
+        # Canonical ids for the canonical block; ``{canonical}_t{j}`` for the
+        # extras (== make_sample_id(group, i, j) when the canonical id is
+        # ``{group}_g{i}``).
+        expected_sample_ids = list(canonical_sample_ids) + [
+            f"{canonical_sample_ids[i]}_t{row.trace_in_rollout_idx}"
+            for i, row in extra_entries
+        ]
         sample_ids, fields, tags = pack_payload(
             train_batch,
             weight_version=group_min_wv,
             group_id=group_id,
             prompt_idx=prompt_idx,
+            sample_ids=expected_sample_ids,
         )
+        # Per-row placement tags for the advantage stage / stats.
+        # rows_in_rollout is the rollout's total published rows (canonical
+        # included, 1 on placeholders) so a consumer can assert it holds the
+        # whole rollout, not merely no orphan.
+        for tag, row, rollout_idx in zip(tags, rows, row_rollout_idx):
+            tag["rollout_local_idx"] = int(rollout_idx)
+            tag["trace_in_rollout_idx"] = int(row.trace_in_rollout_idx)
+            tag["trace_kind"] = row.trace_kind if row.valid else TRACE_KIND_PLACEHOLDER
+            tag["segment_index"] = int(row.segment_index)
+            tag["rows_in_rollout"] = int(rows_per_rollout[rollout_idx])
         if self._defer_routed_experts_to_policy:
             encoded_sizes = 0
             span_count = 0
@@ -769,16 +1068,31 @@ class RolloutReassembler:
             metrics["finalize/route_plan_span_count"] = float(span_count)
             metrics["finalize/route_plan_encoded_bytes"] = float(encoded_sizes)
             valid_route_rows = sum(
-                1 for row in valid_rows if row.route_plan and row.route_plan.spans
+                1 for row in all_valid_rows if row.route_plan and row.route_plan.spans
             )
-            if valid_rows:
+            if all_valid_rows:
                 metrics["finalize/routed_experts_row_coverage"] = (
-                    valid_route_rows / len(valid_rows)
+                    valid_route_rows / len(all_valid_rows)
                 )
-        assert sample_ids == canonical_sample_ids, (
+        assert sample_ids[:n_rollouts] == list(canonical_sample_ids), (
             "canonical sample ids must equal the stable logical rollout ids: "
-            f"{sample_ids} != {canonical_sample_ids}"
+            f"{sample_ids[:n_rollouts]} != {canonical_sample_ids}"
         )
+        for sample_id, rollout_idx in zip(
+            sample_ids[n_rollouts:], row_rollout_idx[n_rollouts:]
+        ):
+            canonical = canonical_sample_ids[rollout_idx]
+            assert sample_id.startswith(f"{canonical}_t"), (
+                f"segment row id {sample_id!r} does not extend its canonical id "
+                f"{canonical!r}"
+            )
+            parsed = try_parse_sample_id(sample_id)
+            parsed_canonical = try_parse_sample_id(canonical)
+            if parsed is not None and parsed_canonical is not None:
+                assert (
+                    make_sample_id(parsed[0], parsed[1]) == canonical
+                    and parsed[2] >= 1
+                ), f"segment row id {sample_id!r} does not parse back to {canonical!r}"
         _tensorize_ms = (time.perf_counter() - _tensorize_t0) * 1000.0
         _put_t0 = time.perf_counter()
         self._call_dp(
@@ -815,11 +1129,12 @@ class RolloutReassembler:
             group_max_wv=group_max_wv,
             staging_keys=(staging_keys if self._defer_routed_experts_to_policy else []),
             canonical_output_tokens=sum(
-                int(mask) for row in valid_rows for mask in row.token_mask
+                int(mask) for row in all_valid_rows for mask in row.token_mask
             ),
             metrics=metrics,
             valid_row_count=len(valid_rows),
-            total_row_count=len(rows),
+            total_row_count=n_rollouts,
+            extra_row_count=len(extra_entries),
         )
 
     # ── internals ───────────────────────────────────────────────────────────
@@ -831,10 +1146,11 @@ class RolloutReassembler:
         max_len: int,
         metrics: dict[str, float],
     ) -> torch.Tensor:
-        """[n, max_len, L, K] int16 routes for the group; sentinel elsewhere.
+        """[n, max_len, L, K] int16 routes for every published row; sentinel elsewhere.
 
-        Padding, placeholder rows, and valid rows whose rebuild carried no
-        routes are all-sentinel: Megatron's replay falls back to its own
+        ``rows`` is the full publication order (canonical block, then segment
+        rows). Padding, placeholder rows, and valid rows whose rebuild carried
+        no routes are all-sentinel: Megatron's replay falls back to its own
         router for exactly those positions. (L, K) is learned from the first
         rebuilt row that carries routes and cached for placeholder-only
         groups; a group arriving before any routed row has been seen cannot
@@ -880,7 +1196,7 @@ class RolloutReassembler:
                     "rebuilt routed_experts shape "
                     f"{tuple(row_routes.shape)} does not match "
                     f"({len(row.token_ids)}, {num_moe_layers}, {topk}) for "
-                    f"rollout {row.rollout_id}"
+                    f"rollout {row.rollout_id} (trace {row.trace_in_rollout_idx})"
                 )
             routed[i, : row_routes.shape[0]] = row_routes
             sentinel_tokens += int(
@@ -915,3 +1231,10 @@ class RolloutReassembler:
         if remote is not None:
             return ray.get(remote(**kwargs))
         return method(**kwargs)
+
+
+def _replace_dataclass(row: FinalizedRollout, **changes: Any) -> FinalizedRollout:
+    """``dataclasses.replace`` spelled out (keeps the frozen row immutable)."""
+    from dataclasses import replace
+
+    return replace(row, **changes)

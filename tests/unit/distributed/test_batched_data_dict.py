@@ -1496,3 +1496,77 @@ def test_truncate_tensors_narrows_opd_full_payloads_but_never_widens_them():
     assert batch[OPD_FULL_LOGITS_FIELD].shape == (2, 3, 5)
     assert torch.equal(batch[OPD_FULL_LOGITS_FIELD], logits_before)
     assert batch[OPD_FULL_TEACHER_INDEX_FIELD].shape == (2,)
+
+
+@pytest.mark.parametrize(("num_rows", "shards"), [(5, 2), (7, 4), (9, 4), (3, 2)])
+def test_sequence_packing_whole_batch_balances_uneven_row_counts(num_rows, shards):
+    """Packed whole-batch sharding (``batch_size=None``) must not require
+    ``num_rows % shards == 0``: bins are minted as a multiple of ``shards`` and
+    dealt round-robin, so every shard gets the same number of microbatches and
+    every row appears exactly once. This is the shape a token-capture step
+    chunk takes when rollouts publish extra segment rows.
+    """
+    torch.manual_seed(0)
+    lengths = torch.randint(4, 40, (num_rows,))
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.zeros((num_rows, 40), dtype=torch.long),
+            "input_lengths": lengths,
+            "row_id": torch.arange(num_rows),
+        }
+    )
+    packing_args = SequencePackingArgs(
+        max_tokens_per_microbatch=64,
+        input_key="input_ids",
+        input_lengths_key="input_lengths",
+        algorithm="modified_first_fit_decreasing",
+        sequence_length_pad_multiple=1,
+    )
+
+    sharded, sorted_indices = batch.shard_by_batch_size(
+        shards=shards, batch_size=None, sequence_packing_args=packing_args
+    )
+
+    assert len(sharded) == shards
+    assert sorted(sorted_indices) == list(range(num_rows))
+    # Equal microbatch counts per shard (the only thing DP collectives need),
+    # even though the per-shard row counts differ.
+    microbatch_counts = [
+        sum(len(chunk) for chunk in shard.micro_batch_indices) for shard in sharded
+    ]
+    assert len(set(microbatch_counts)) == 1, microbatch_counts
+    assert microbatch_counts[0] >= 1
+    seen_rows = sorted(
+        int(row_id) for shard in sharded for row_id in shard["row_id"].tolist()
+    )
+    assert seen_rows == list(range(num_rows))
+    # Row counts per shard sum to the batch and are not required to be equal.
+    assert sum(len(shard["row_id"]) for shard in sharded) == num_rows
+
+
+def test_sequence_packing_with_explicit_batch_size_still_requires_divisibility():
+    """The relaxation is scoped to ``batch_size=None``; chunked packing keeps
+    the historical assertion so sync GBS chunking stays exact."""
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.zeros((6, 8), dtype=torch.long),
+            "input_lengths": torch.full((6,), 4),
+        }
+    )
+    packing_args = SequencePackingArgs(
+        max_tokens_per_microbatch=16,
+        input_key="input_ids",
+        input_lengths_key="input_lengths",
+        algorithm="modified_first_fit_decreasing",
+        sequence_length_pad_multiple=1,
+    )
+    with pytest.raises(AssertionError, match="not a multiple of shards"):
+        batch.shard_by_batch_size(
+            shards=4, batch_size=6, sequence_packing_args=packing_args
+        )
+
+
+def test_plain_split_still_requires_divisibility():
+    batch = BatchedDataDict({"x": torch.arange(5)})
+    with pytest.raises(AssertionError, match="not a multiple of shards"):
+        batch.shard_by_batch_size(shards=2)

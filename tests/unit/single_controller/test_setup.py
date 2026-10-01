@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import threading
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -67,8 +68,10 @@ from nemo_rl.algorithms.single_controller_utils import (
 )
 from nemo_rl.algorithms.single_controller_utils.config import (
     RolloutCheckpointConfig,
+    SegmentRowsConfig,
     TokenCaptureConfig,
     _validate_opd_full_config,
+    _validate_segment_rows_config,
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
@@ -3103,3 +3106,117 @@ def test_load_opd_full_teacher_lm_heads_loads_one_head_per_unique_teacher(monkey
         "Qwen/teacher-a",
         "Qwen/teacher-b",
     ]
+
+
+class TestSegmentRowsValidation:
+    """token_capture.segment_rows cross-checks (config.py::_validate_segment_rows_config)."""
+
+    @staticmethod
+    def _segment_config(
+        *,
+        capture_enabled: bool = True,
+        max_per_rollout: int = 2,
+        packing_enabled: bool = True,
+        rebase_flag: bool | None = True,
+    ) -> MasterConfig:
+        env: dict = {"should_use_nemo_gym": True, "nemo_gym": {}}
+        if rebase_flag is not None:
+            env["nemo_gym"]["token_id_capture"] = {
+                "rebase_on_output_match": rebase_flag
+            }
+        mc = _make_master_config(env=env)
+        mc.token_capture = TokenCaptureConfig(
+            enabled=capture_enabled,
+            segment_rows=SegmentRowsConfig(
+                enabled=True, max_per_rollout=max_per_rollout
+            ),
+        )
+        mc.policy["sequence_packing"] = {"enabled": packing_enabled}
+        return mc
+
+    def test_segment_rows_config_defaults_are_dormant(self):
+        cfg = TokenCaptureConfig()
+        assert cfg.segment_rows.enabled is False
+        assert cfg.segment_rows.max_per_rollout == 1
+        assert cfg.segment_rows.include_summary_rows is True
+        # Dormant segment rows never trip the validator, whatever else is set.
+        mc = _make_master_config()
+        _validate_segment_rows_config(mc)
+
+    def test_max_per_rollout_must_be_positive(self):
+        with pytest.raises(ValueError):
+            SegmentRowsConfig(max_per_rollout=0)
+
+    def test_requires_token_capture(self):
+        mc = self._segment_config(capture_enabled=False)
+        with pytest.raises(ValueError, match="requires token_capture.enabled=true"):
+            _validate_segment_rows_config(mc)
+
+    def test_requires_token_capture_through_setup(self, patched_factories):
+        """The check is wired into validate_single_controller_config."""
+        mc = self._segment_config(capture_enabled=False)
+        with pytest.raises(ValueError, match="requires token_capture.enabled=true"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
+
+    def test_requires_at_least_two_rows_per_rollout(self):
+        mc = self._segment_config(max_per_rollout=1)
+        with pytest.raises(ValueError, match="max_per_rollout >= 2"):
+            _validate_segment_rows_config(mc)
+
+    def test_requires_sequence_packing(self):
+        mc = self._segment_config(packing_enabled=False)
+        with pytest.raises(ValueError, match="sequence_packing.enabled=true"):
+            _validate_segment_rows_config(mc)
+
+    def test_missing_sequence_packing_block_counts_as_disabled(self):
+        mc = self._segment_config()
+        del mc.policy["sequence_packing"]
+        with pytest.raises(ValueError, match="sequence_packing.enabled=true"):
+            _validate_segment_rows_config(mc)
+
+    @pytest.mark.parametrize("rebase_flag", [None, False])
+    def test_warns_when_rebase_on_output_match_is_not_set(self, rebase_flag):
+        mc = self._segment_config(rebase_flag=rebase_flag)
+        with pytest.warns(UserWarning, match="rebase_on_output_match"):
+            _validate_segment_rows_config(mc)
+
+    def test_valid_configuration_is_silent(self):
+        mc = self._segment_config()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            _validate_segment_rows_config(mc)
+
+    def test_include_summary_rows_is_a_plain_switch(self):
+        mc = self._segment_config()
+        mc.token_capture.segment_rows.include_summary_rows = False
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            _validate_segment_rows_config(mc)
+
+    @pytest.mark.parametrize(
+        "knob",
+        ["grpo.use_dynamic_sampling", "grpo.reward_shaping.enabled", "grpo.reward_scaling.enabled"],
+    )
+    def test_rejects_group_statistics_computed_over_rows(self, knob):
+        """Dynamic sampling / reward shaping / scaling would count a rollout once per row."""
+        mc = self._segment_config()
+        if knob == "grpo.use_dynamic_sampling":
+            mc.grpo.use_dynamic_sampling = True
+        elif knob == "grpo.reward_shaping.enabled":
+            mc.grpo.reward_shaping.enabled = True
+        else:
+            mc.grpo.reward_scaling.enabled = True
+        with pytest.raises(ValueError, match="incompatible with " + knob.replace(".", r"\.")):
+            _validate_segment_rows_config(mc)
+        # The same knobs are fine when segment rows are off.
+        mc.token_capture.segment_rows.enabled = False
+        _validate_segment_rows_config(mc)
+
+    def test_group_statistics_check_tolerates_a_missing_grpo_block(self):
+        mc = self._segment_config()
+        mc.grpo = None
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            _validate_segment_rows_config(mc)

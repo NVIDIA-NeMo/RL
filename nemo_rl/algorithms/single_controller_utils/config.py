@@ -622,6 +622,46 @@ class AsyncRLConfig(BaseModel, extra="allow"):
         return self
 
 
+class SegmentRowsConfig(BaseModel):
+    """Publish one training row per verified chain segment of a rollout.
+
+    Off by default: the finalizer publishes exactly one canonical row per
+    rollout (``{group}_g{i}``). When enabled, a rollout whose Gym receipt
+    verifies to several chains -- pre-compaction segments joined by a
+    context-rewrite boundary, or subagent sessions -- publishes its terminal
+    chain as the canonical row plus one extra row per additional chain
+    (``{group}_g{i}_t{j}``, ``j >= 1``), all sharing the rollout's reward,
+    ``mask_sample`` and ``prompt_ids_for_adv``. Extra rows are capped at
+    ``max_per_rollout - 1`` per rollout in Gym's row order (the chains on the
+    terminal's compaction sequence first, then other roots); the drop is
+    reported as ``finalize/segments_dropped_by_cap``.
+
+    A compaction yields three chains per boundary: the pre-compaction
+    segment (``compaction_segment``), the summary call itself as a one-call
+    chain (``compaction_summary``) and the post-compaction chain. The
+    advantage stage treats every row of a rollout alike (the rollout's reward
+    and advantage, its own loss mask); ``include_summary_rows`` decides
+    whether the summary rows are published at all.
+
+    Segments only appear when Gym admits rebased roots
+    (``env.nemo_gym.token_id_capture.rebase_on_output_match: true``); the
+    validator warns when that flag is missing. Group statistics computed over
+    rows outside the canonical-row estimator (dynamic sampling, reward
+    shaping/scaling) would count a rollout once per row, so the validator
+    rejects them with segment rows until audited.
+    """
+
+    enabled: bool = False
+    # Total rows a rollout may publish, canonical row included. Sizes the
+    # canonical TQ partition (``max_buffered_rollouts * N * max_per_rollout``)
+    # and the deterministic cleanup id set; must be >= 2 when enabled.
+    max_per_rollout: int = Field(default=1, ge=1)
+    # Publish the compaction summary calls (``trace_kind: compaction_summary``)
+    # as training rows. False drops them before the cap and counts them in
+    # ``finalize/segment_rows_skipped_summary``.
+    include_summary_rows: bool = True
+
+
 class TokenCaptureConfig(BaseModel, extra="allow"):
     """Ledger-authoritative token capture (token-in/token-out via NeMo-Gym).
 
@@ -631,6 +671,9 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     """
 
     enabled: bool = False
+    # Multi-row publication for compaction/subagent segments (see
+    # SegmentRowsConfig). Dormant unless ``segment_rows.enabled``.
+    segment_rows: SegmentRowsConfig = Field(default_factory=SegmentRowsConfig)
     # TQ partition holding per-call staged token deltas (cleared by the
     # finalizer; distinct from the canonical rollout partition).
     staging_partition: str = "rollout_staging"
@@ -1365,6 +1408,93 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         )
 
 
+def _user_token_id_capture_block(env_config: Any) -> Mapping[str, Any]:
+    """Return the user-supplied ``env.nemo_gym.token_id_capture`` mapping (or {})."""
+    if not isinstance(env_config, Mapping):
+        return {}
+    nemo_gym_block = env_config.get("nemo_gym")
+    if not isinstance(nemo_gym_block, Mapping):
+        return {}
+    block = nemo_gym_block.get("token_id_capture")
+    return block if isinstance(block, Mapping) else {}
+
+
+def _validate_segment_rows_config(master_config: MasterConfig) -> None:
+    """Cross-check ``token_capture.segment_rows`` against the rest of the config.
+
+    Segment rows only make sense on the capture path (they come from Gym's
+    multi-chain receipts), need room for at least one extra row, and rely on
+    sequence packing: a step chunk with extra rows has a row count that is
+    generally not divisible by the DP world size, and only the packed path
+    balances per-rank microbatch counts regardless of row count.
+    """
+    token_capture_config = master_config.token_capture
+    segment_rows = token_capture_config.segment_rows
+    if not segment_rows.enabled:
+        return
+    if not token_capture_config.enabled:
+        raise ValueError(
+            "token_capture.segment_rows.enabled requires token_capture.enabled=true: "
+            "segment rows are built from Gym token-capture receipts"
+        )
+    if segment_rows.max_per_rollout < 2:
+        raise ValueError(
+            "token_capture.segment_rows.enabled requires "
+            "token_capture.segment_rows.max_per_rollout >= 2 (the canonical row "
+            f"plus at least one segment row); got {segment_rows.max_per_rollout}"
+        )
+    policy_config = master_config.policy
+    sequence_packing_config = (
+        policy_config.get("sequence_packing", {}) if isinstance(policy_config, Mapping) else {}
+    ) or {}
+    if not sequence_packing_config.get("enabled", False):
+        raise ValueError(
+            "token_capture.segment_rows.enabled requires "
+            "policy.sequence_packing.enabled=true: a training chunk with segment "
+            "rows has a row count that is not a multiple of the DP world size, "
+            "and only the sequence-packing shard path balances per-rank "
+            "microbatch counts independently of the row count"
+        )
+    algo_cfg = getattr(master_config, "grpo", None)
+    if algo_cfg is not None:
+        # Each of these computes a statistic over the rows of a group outside
+        # the canonical-row estimator and would count a rollout once per row.
+        double_counting = [
+            name
+            for name, enabled in (
+                ("grpo.use_dynamic_sampling", getattr(algo_cfg, "use_dynamic_sampling", False)),
+                (
+                    "grpo.reward_shaping.enabled",
+                    getattr(getattr(algo_cfg, "reward_shaping", None), "enabled", False),
+                ),
+                (
+                    "grpo.reward_scaling.enabled",
+                    getattr(getattr(algo_cfg, "reward_scaling", None), "enabled", False),
+                ),
+            )
+            if enabled
+        ]
+        if double_counting:
+            raise ValueError(
+                "token_capture.segment_rows.enabled is incompatible with "
+                f"{', '.join(double_counting)}: these compute group statistics "
+                "over rows, and with segment rows a rollout publishes several "
+                "rows, so its reward would be counted once per row. Disable "
+                "them or disable segment rows."
+            )
+    user_capture = _user_token_id_capture_block(master_config.env)
+    if user_capture.get("rebase_on_output_match") is not True:
+        warnings.warn(
+            "token_capture.segment_rows.enabled=true but "
+            "env.nemo_gym.token_id_capture.rebase_on_output_match is not true: "
+            "Gym will not admit post-compaction roots as rebased chains, so "
+            "compaction segments will never appear (only subagent chains can "
+            "produce extra rows). Set env.nemo_gym.token_id_capture."
+            "rebase_on_output_match=true to train pre-compaction segments.",
+            stacklevel=2,
+        )
+
+
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
     if master_config.loss_fn.seq_logprob_error_in_loss:
@@ -1465,6 +1595,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "token_capture.defer_routed_experts_to_policy requires "
             "token_capture.enabled=true"
         )
+    _validate_segment_rows_config(master_config)
     if (
         token_capture_config.enabled
         and token_capture_config.num_reassembler_workers

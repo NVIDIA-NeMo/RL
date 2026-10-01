@@ -28,16 +28,38 @@ no environment change::
         - name: harness_unfinished     # agent harness hit sandbox_timeout or an exec error
           field: opencode_finished
           equals: false
+        - name: too_many_compactions   # optional: drop rollouts that compacted more than 3 times
+          field: opencode_num_compactions
+          gt: 3
 
-A rule matches when the dotted ``field`` exists in the rollout's Gym response
-and equals ``equals`` (type-strict for booleans, so ``false`` does not match
-``0``). A match sets the same ``instance_config.mask_sample`` flag an
+A rule carries a dotted ``field`` and exactly one operator key:
+
+* ``equals`` matches when the field's value equals the operand. This is
+  type-strict for booleans, so ``equals: false`` does not match ``0``, ``""``
+  or ``null``.
+* ``gt`` / ``ge`` / ``lt`` / ``le`` compare numerically. They match only when
+  the field's value is an ``int`` or ``float`` that is not a ``bool`` (``true``
+  never satisfies ``gt: 0``); a string, ``null``, list or mapping in the
+  field never matches. The operand itself must be a non-bool number.
+
+A rule with zero or several operator keys, or any other key besides ``name``
+and ``field``, is a config error. A missing field never matches, whatever the
+operator. A match sets the same ``instance_config.mask_sample`` flag an
 environment would, so everything downstream is unchanged: the finalizer's
 ``mask_sample`` column, the advantage stage's ``final_sample_mask``, the
-baseline's ``valid_mask`` and ``train/num_mask_sample_filtered``. A missing
-field never matches. Per-group match rates are logged as
-``mask_rules/<name>_rate`` (with ``mask_rules/<name>_reward_mean`` and
-``mask_rules/any_rate``).
+baseline's ``valid_mask`` and ``train/num_mask_sample_filtered``. Per-group
+match rates are logged as ``mask_rules/<name>_rate`` (with
+``mask_rules/<name>_reward_mean`` and ``mask_rules/any_rate``); the metric
+names do not depend on the operator.
+
+The ``too_many_compactions`` example above is a policy choice, not a
+requirement: in the v1 compaction runs Gerald kept rollouts that hit the
+compaction cap (the fork's ``max_compaction`` termination) in the loss with
+their verifier reward, i.e. scored rather than masked them, so that running
+out of compaction budget was a trained outcome rather than a free one. Use a
+comparator rule only when you want the opposite policy; the numeric fields
+(``opencode_num_compactions``, ``opencode_num_compaction_attempts``,
+``opencode_num_model_calls``, ...) are reported by the agent either way.
 
 The rules run after the ``env.should_mask_flagged_samples`` gate: that gate
 drops the environment's own (possibly too coarse) flags, while these rules
@@ -47,7 +69,8 @@ default, leaves every code path exactly as before.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import operator as _op
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -56,14 +79,56 @@ from nemo_rl.data_plane.schema import MASK_SAMPLE
 ENV_MASK_SAMPLE_RULES_KEY = "mask_sample_rules"
 _SCALAR_TYPES = (bool, int, float, str, type(None))
 
+EQUALS = "equals"
+# Operator key -> numeric predicate (field value, operand). ``equals`` is handled
+# separately because it is type-strict rather than numeric.
+_COMPARATORS: dict[str, Callable[[Any, Any], bool]] = {
+    "gt": _op.gt,
+    "ge": _op.ge,
+    "lt": _op.lt,
+    "le": _op.le,
+}
+OPERATORS: tuple[str, ...] = (EQUALS, *_COMPARATORS)
+_RULE_KEYS = frozenset({"name", "field", *OPERATORS})
+
+
+def _is_number(value: Any) -> bool:
+    """True for int/float operands; bools are numbers in Python but never here."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
 
 @dataclass(frozen=True)
 class MaskSampleRule:
-    """Mask a sample when ``field`` in the Gym response equals ``equals``."""
+    """Mask a sample when ``field`` in the Gym response satisfies the rule.
+
+    ``operator`` is one of :data:`OPERATORS`; ``equals`` holds the operand for
+    every operator (the value to equal, or the numeric threshold to compare
+    against). The field is named for the original, equality-only form so
+    existing positional constructors ``MaskSampleRule(name, field, value)``
+    keep meaning "equals".
+    """
 
     name: str
     field: str
     equals: Any
+    operator: str = EQUALS
+
+    def __post_init__(self) -> None:
+        if self.operator not in OPERATORS:
+            raise ValueError(
+                f"MaskSampleRule {self.name!r}: unknown operator {self.operator!r}; "
+                f"expected one of {list(OPERATORS)}"
+            )
+        if self.operator != EQUALS and not _is_number(self.equals):
+            raise ValueError(
+                f"MaskSampleRule {self.name!r}: `{self.operator}` needs a numeric "
+                f"operand, got {type(self.equals).__name__}"
+            )
+
+    @property
+    def operand(self) -> Any:
+        """The value ``field`` is compared against (alias of ``equals``)."""
+        return self.equals
 
     @property
     def metric_key(self) -> str:
@@ -83,35 +148,38 @@ def parse_mask_sample_rules(
         )
     rules: list[MaskSampleRule] = []
     for index, entry in enumerate(raw):
+        prefix = f"env.{ENV_MASK_SAMPLE_RULES_KEY}[{index}]"
         if not isinstance(entry, Mapping):
             raise ValueError(
-                f"env.{ENV_MASK_SAMPLE_RULES_KEY}[{index}] must be a mapping, got {type(entry).__name__}"
+                f"{prefix} must be a mapping, got {type(entry).__name__}"
             )
         field = entry.get("field")
         if not isinstance(field, str) or not field.strip() or field != field.strip():
-            raise ValueError(
-                f"env.{ENV_MASK_SAMPLE_RULES_KEY}[{index}].field must be a non-empty dotted path"
-            )
-        if "equals" not in entry:
-            raise ValueError(
-                f"env.{ENV_MASK_SAMPLE_RULES_KEY}[{index}] needs an `equals` value"
-            )
-        equals = entry["equals"]
-        if not isinstance(equals, _SCALAR_TYPES):
-            raise ValueError(
-                f"env.{ENV_MASK_SAMPLE_RULES_KEY}[{index}].equals must be a scalar, got {type(equals).__name__}"
-            )
-        unknown = set(entry) - {"name", "field", "equals"}
+            raise ValueError(f"{prefix}.field must be a non-empty dotted path")
+        unknown = set(entry) - _RULE_KEYS
         if unknown:
+            raise ValueError(f"{prefix} has unknown keys: {sorted(unknown)}")
+        present = [key for key in OPERATORS if key in entry]
+        if len(present) != 1:
             raise ValueError(
-                f"env.{ENV_MASK_SAMPLE_RULES_KEY}[{index}] has unknown keys: {sorted(unknown)}"
+                f"{prefix} needs exactly one of {list(OPERATORS)}, got {present or 'none'}"
+            )
+        op = present[0]
+        operand = entry[op]
+        if op == EQUALS:
+            if not isinstance(operand, _SCALAR_TYPES):
+                raise ValueError(
+                    f"{prefix}.equals must be a scalar, got {type(operand).__name__}"
+                )
+        elif not _is_number(operand):
+            raise ValueError(
+                f"{prefix}.{op} must be a number (int or float, not bool), "
+                f"got {type(operand).__name__}"
             )
         name = entry.get("name") or field.replace(".", "_")
         if not isinstance(name, str) or not name.strip():
-            raise ValueError(
-                f"env.{ENV_MASK_SAMPLE_RULES_KEY}[{index}].name must be a non-empty string"
-            )
-        rules.append(MaskSampleRule(name=name, field=field, equals=equals))
+            raise ValueError(f"{prefix}.name must be a non-empty string")
+        rules.append(MaskSampleRule(name=name, field=field, equals=operand, operator=op))
     names = [rule.name for rule in rules]
     if len(set(names)) != len(names):
         raise ValueError(
@@ -130,11 +198,21 @@ def _lookup(result: Mapping[str, Any], dotted: str) -> tuple[bool, Any]:
     return True, node
 
 
-def _matches(value: Any, equals: Any) -> bool:
+def _equals(value: Any, equals: Any) -> bool:
     # Type-strict for booleans: `equals: false` must not match a 0 or an empty string.
     if isinstance(value, bool) or isinstance(equals, bool):
         return isinstance(value, bool) and isinstance(equals, bool) and value == equals
     return value == equals
+
+
+def _matches(value: Any, rule: MaskSampleRule) -> bool:
+    if rule.operator == EQUALS:
+        return _equals(value, rule.equals)
+    # Comparators only look at real numbers: a bool, str, None, list or mapping
+    # in the field is "not comparable" and never matches (NaN compares False too).
+    if not _is_number(value):
+        return False
+    return bool(_COMPARATORS[rule.operator](value, rule.equals))
 
 
 def matching_rules(
@@ -144,7 +222,7 @@ def matching_rules(
     matched: list[str] = []
     for rule in rules:
         found, value = _lookup(full_result, rule.field)
-        if found and _matches(value, rule.equals):
+        if found and _matches(value, rule):
             matched.append(rule.name)
     return matched
 

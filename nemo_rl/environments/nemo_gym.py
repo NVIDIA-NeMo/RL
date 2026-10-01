@@ -670,21 +670,49 @@ Depending on your data shape, you may want to change these values."""
             )
             policy_overrides["return_token_id_information"] = False
             capture_dir = os.path.abspath(token_capture["capture_dir"])
-            initial_global_config_dict["token_id_capture"] = {
-                "enabled": True,
-                "all_agents": True,
-                "rebuild_response": False,
-                "dir": capture_dir,
-                # The lineage store is process-shared and doubles as the
-                # per-rollout capture ledger. Every uvicorn worker builds its
-                # own handle over the same root, so token-in ancestry remains
-                # valid when consecutive calls land on different workers.
-                "lineage_store": ("nemo_gym.token_id_capture.lineage:FileLineageStore"),
-                "lineage_store_kwargs": {"root": os.path.join(capture_dir, "lineage")},
-                "external_staging": True,
-                "external_staging_backend": _external_staging_backend(token_capture),
-                "control_auth_token_env": _TOKEN_CAPTURE_CONTROL_ENV,
-            }
+            # User-supplied ``env.nemo_gym.token_id_capture.*`` (forwarded
+            # verbatim into initial_global_config_dict by build_nemo_gym_config)
+            # is merged UNDER the keys NeMo-RL owns: an overlay may set Gym
+            # knobs such as rebase_on_output_match /
+            # max_context_rewrites_per_rollout / unresolved_as_root, but can
+            # never override enabled / external_staging / lineage_store / dir.
+            # The block is replaced in place, so it is forwarded exactly once.
+            user_capture_block = initial_global_config_dict.pop(
+                "token_id_capture", None
+            )
+            merged_capture: dict[str, Any] = {}
+            if user_capture_block is not None:
+                if not isinstance(user_capture_block, Mapping):
+                    raise TypeError(
+                        "env.nemo_gym.token_id_capture must be a mapping, got "
+                        f"{type(user_capture_block).__name__}"
+                    )
+                merged_capture.update(dict(user_capture_block))
+            merged_capture.update(
+                {
+                    "enabled": True,
+                    "all_agents": True,
+                    "rebuild_response": False,
+                    "dir": capture_dir,
+                    # The lineage store is process-shared and doubles as the
+                    # per-rollout capture ledger. Every uvicorn worker builds
+                    # its own handle over the same root, so token-in ancestry
+                    # remains valid when consecutive calls land on different
+                    # workers.
+                    "lineage_store": (
+                        "nemo_gym.token_id_capture.lineage:FileLineageStore"
+                    ),
+                    "lineage_store_kwargs": {
+                        "root": os.path.join(capture_dir, "lineage")
+                    },
+                    "external_staging": True,
+                    "external_staging_backend": _external_staging_backend(
+                        token_capture
+                    ),
+                    "control_auth_token_env": _TOKEN_CAPTURE_CONTROL_ENV,
+                }
+            )
+            initial_global_config_dict["token_id_capture"] = merged_capture
             # Gym resolves the credential inside each serving process. Keep
             # only the variable name in serialized config and inherit the
             # secret through the server process environment.

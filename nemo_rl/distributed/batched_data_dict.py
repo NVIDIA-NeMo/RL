@@ -560,6 +560,16 @@ class BatchedDataDict(UserDict, Generic[DictT]):
             + f"[{','.join(str(size) for size in batch_sizes)}]"
         )
         total_batch_size = batch_sizes.pop()
+        # Sequence packing over the whole batch (``batch_size=None``) does not
+        # need the row count to divide ``shards``: the packer is built with
+        # ``min_bin_count=shards, bin_count_multiple=shards`` and bins are
+        # dealt round-robin (``shard_idx::shards``), so every shard receives
+        # exactly ``bins / shards`` microbatches whatever the row count (the
+        # packer raises if there are fewer rows than shards). Row-count
+        # divisibility only matters for the plain contiguous split below.
+        # Needed by the token-capture segment-row path, where a step chunk
+        # holds N canonical rows plus a variable number of extra rows.
+        packed_whole_batch = sequence_packing_args is not None and batch_size is None
         if batch_size is None:
             batch_size = total_batch_size
 
@@ -567,7 +577,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         assert total_batch_size % batch_size == 0, (
             f"Total batch size ({total_batch_size}) is not a multiple of batch_size ({batch_size})"
         )
-        if not allow_uneven_shards:
+        if not allow_uneven_shards and not packed_whole_batch:
             assert batch_size % shards == 0, (
                 f"Batch size ({batch_size}) is not a multiple of shards ({shards})"
             )

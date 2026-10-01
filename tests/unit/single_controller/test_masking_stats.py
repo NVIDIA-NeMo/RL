@@ -121,3 +121,97 @@ def test_groups_with_fewer_than_two_trained_rows_and_multi_chunk_ids():
     # Two chunks of different prompt widths -> two groups; the first has one trained row.
     assert out["masking/groups"] == 2 and out["masking/groups_lt2_trained_frac"] == 0.5
     assert reduce_masking_stats(new_masking_stats_accumulator()) == {}
+
+
+def test_segment_rows_vote_once_per_rollout():
+    """Token-capture segment rows: row counts stay rows, reward means / groups
+    / rollouts are per canonical row, fully_masked needs every row masked."""
+    acc = new_masking_stats_accumulator()
+    # One group, three rollouts:
+    #  A: r0 canonical trained (reward 1), r1 segment dropped by seq-logprob
+    #  B: r2 canonical env-flagged, r3 segment env-flagged (shares mask_sample)
+    #  C: r4 canonical trained (reward 0)
+    accumulate_masking_stats(
+        acc,
+        prompt_ids=torch.tensor([1, 1, 1, 1, 1]),
+        rewards=torch.tensor([1.0, 1.0, 0.0, 0.0, 0.0]),
+        sample_mask=torch.ones(5),
+        mask_sample=torch.tensor([False, False, True, True, False]),
+        truncated=torch.zeros(5, dtype=torch.bool),
+        overlong_filtering=True,
+        final_sample_mask=torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0]),
+        baseline_mask=torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0]),
+        is_canonical=torch.tensor([True, False, True, False, True]),
+        rollout_key=torch.tensor([0, 0, 1, 1, 2]),
+    )
+    out = reduce_masking_stats(acc)
+    # Row-level counts are honest per-row numbers.
+    assert out["masking/rows"] == 5 and out["masking/placeholder_rows"] == 0
+    assert out["masking/env_flag_rows"] == 2
+    assert out["masking/seq_logprob_error_rows"] == 1
+    assert out["masking/masked_rows"] == 3 and out["masking/trained_rows"] == 2
+    # Reward means over canonical rows only: r1 (reward 1, masked) is a
+    # segment row and must not lift reward_mean_masked.
+    assert out["masking/reward_mean_trained"] == 0.5  # r0, r4
+    assert out["masking/reward_mean_env_flag"] == 0.0  # r2
+    assert out["masking/reward_mean_masked"] == 0.0  # r2 (not r1, r3)
+    assert "masking/reward_mean_truncated" not in out
+    # Rollout-level: A trains through r0, B is fully masked, C trains.
+    assert out["masking/rollouts"] == 3
+    assert out["masking/fully_masked_rollouts"] == 1
+    assert out["masking/groups"] == 1
+    assert out["masking/groups_lt2_trained_frac"] == 0.0  # A and C trained
+
+
+def test_segment_rollout_counts_fewer_than_two_trained_rollouts_per_group():
+    acc = new_masking_stats_accumulator()
+    # One rollout with two trained rows must NOT count as a healthy group.
+    accumulate_masking_stats(
+        acc,
+        prompt_ids=torch.tensor([3, 3, 3]),
+        rewards=torch.tensor([1.0, 1.0, 0.0]),
+        sample_mask=torch.ones(3),
+        mask_sample=torch.tensor([False, False, True]),
+        truncated=torch.zeros(3, dtype=torch.bool),
+        overlong_filtering=False,
+        final_sample_mask=torch.tensor([1.0, 1.0, 0.0]),
+        baseline_mask=torch.tensor([1.0, 1.0, 0.0]),
+        is_canonical=torch.tensor([True, False, True]),
+        rollout_key=torch.tensor([0, 0, 1]),
+    )
+    out = reduce_masking_stats(acc)
+    assert out["masking/trained_rows"] == 2
+    assert out["masking/groups_lt2_trained_frac"] == 1.0
+    assert out["masking/rollouts"] == 2 and out["masking/fully_masked_rollouts"] == 1
+
+
+def test_defaults_treat_every_row_as_its_own_rollout_and_offset_rollout_ids():
+    rows = dict(
+        prompt_ids=torch.tensor([1, 1, 2, 2]),
+        rewards=torch.tensor([1.0, 0.0, 1.0, 0.0]),
+        sample_mask=torch.tensor([1.0, 1.0, 1.0, 0.0]),
+        mask_sample=torch.tensor([False, True, False, False]),
+        truncated=torch.zeros(4, dtype=torch.bool),
+        overlong_filtering=False,
+        final_sample_mask=torch.tensor([1.0, 0.0, 1.0, 0.0]),
+        baseline_mask=torch.tensor([1.0, 0.0, 1.0, 0.0]),
+    )
+    plain = new_masking_stats_accumulator()
+    accumulate_masking_stats(plain, **rows)
+    accumulate_masking_stats(plain, **rows)
+    explicit = new_masking_stats_accumulator()
+    explicit_rows = dict(
+        rows,
+        is_canonical=torch.ones(4, dtype=torch.bool),
+        rollout_key=torch.arange(4),
+    )
+    accumulate_masking_stats(explicit, **explicit_rows)
+    accumulate_masking_stats(explicit, **explicit_rows)
+    out_plain = reduce_masking_stats(plain)
+    assert out_plain == reduce_masking_stats(explicit)
+    # Without segment rows: rollouts == rows and fully masked == masked rows
+    # with tokens (the placeholder row has none); rollout ids were offset
+    # across chunks, so the second chunk did not alias the first.
+    assert out_plain["masking/rollouts"] == out_plain["masking/rows"] == 8
+    assert out_plain["masking/fully_masked_rollouts"] == out_plain["masking/masked_rows"]
+    assert out_plain["masking/fully_masked_rollouts"] == 2

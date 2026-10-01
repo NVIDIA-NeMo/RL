@@ -61,6 +61,15 @@ def shard_meta_for_dp(
     shard's ``extra_info`` so the ``*_presharded`` worker can reattach
     packing as it does on the legacy fan-out path.
 
+    Row-count divisibility: with ``sequence_packing_args`` and
+    ``batch_size=None`` (the SC train / logprob dispatch), the row count need
+    not be a multiple of ``dp_world`` -- ``shard_by_batch_size`` packs the
+    rows into ``bin_count_multiple=dp_world`` bins and deals them round-robin,
+    so every rank still receives the same number of microbatches. Only the
+    plain contiguous split (no packing args) requires ``n % dp_world == 0``.
+    This is what lets a token-capture step chunk carry a variable number of
+    segment rows on top of its N canonical rows per group.
+
     Args:
         meta: Full-batch ``KVBatchMeta`` with ``sequence_lengths`` populated.
         dp_world: Number of DP ranks.

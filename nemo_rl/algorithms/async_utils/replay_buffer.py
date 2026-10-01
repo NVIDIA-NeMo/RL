@@ -58,6 +58,7 @@ from nemo_rl.experience.interfaces import (
     PromptGroupRecord,
 )
 from nemo_rl.experience.payload import pack_payload, record_to_train_batch
+from nemo_rl.experience.sample_ids import validate_group_sample_ids
 from nemo_rl.utils.r3_trace import trace_rollout_payload
 
 DATA_PLANE_CHECKPOINT_DIR = "data_plane"
@@ -1781,10 +1782,13 @@ class TQReplayBuffer:
             expected_partition_id: Partition this buffer writes to; must
                 match the envelope.
             expected_group_size: num_generations_per_prompt; every group must
-                hold exactly this many rows (a changed group size silently
-                breaks the group-relative baseline). None for multi-trace runs,
-                whose groups hold one row per agent session segment: any
-                nonzero count is accepted, still aligned with tags and lengths.
+                hold exactly this many canonical rows (a changed group size
+                silently breaks the group-relative baseline). Groups may carry
+                additional ``{group}_g{i}_t{j}`` segment rows on top of the N
+                canonical rows (token_capture.segment_rows). None for echo-path
+                multi-trace runs, whose groups hold one row per agent session
+                segment: any nonzero count is accepted, still aligned with tags
+                and lengths.
             expected_manifest_digest: Digest returned by the matching native
                 TQ checkpoint load. It must match the replay metadata file.
 
@@ -1860,15 +1864,40 @@ class TQReplayBuffer:
             num_lengths = (
                 len(meta.sequence_lengths) if meta.sequence_lengths is not None else -1
             )
-            group_size = (
-                expected_group_size
-                if expected_group_size is not None
-                else max(len(meta.sample_ids), 1)
-            )
-            if not (len(meta.sample_ids) == num_tags == num_lengths == group_size):
+            num_rows = len(meta.sample_ids)
+            aligned = num_rows == num_tags == num_lengths
+            if aligned and expected_group_size is None and num_rows > 0:
+                # Echo-path multi-trace: one row per agent session segment.
+                pass
+            elif aligned and num_rows == expected_group_size:
+                # Canonical shape: exactly one row per rollout.
+                pass
+            elif (
+                aligned
+                and expected_group_size is not None
+                and num_rows > expected_group_size
+            ):
+                # Segment-row shape (token_capture.segment_rows): the N
+                # canonical rows plus ``_t{j}`` extras. Accept only when the
+                # parsed rollout indices cover exactly range(N) and every
+                # (rollout, trace) pair is unique; anything else is a
+                # genuinely misaligned group.
+                try:
+                    validate_group_sample_ids(
+                        meta.sample_ids, expected_group_size=expected_group_size
+                    )
+                except ValueError as error:
+                    raise ValueError(
+                        "Replay buffer checkpoint group misaligned: "
+                        f"sample_ids={num_rows}, tags={num_tags}, "
+                        f"sequence_lengths={num_lengths}, "
+                        f"expected_group_size={expected_group_size} "
+                        f"(segment-row validation failed: {error})"
+                    ) from error
+            else:
                 raise ValueError(
                     "Replay buffer checkpoint group misaligned: "
-                    f"sample_ids={len(meta.sample_ids)}, tags={num_tags}, "
+                    f"sample_ids={num_rows}, tags={num_tags}, "
                     f"sequence_lengths={num_lengths}, "
                     f"expected_group_size={expected_group_size}"
                 )

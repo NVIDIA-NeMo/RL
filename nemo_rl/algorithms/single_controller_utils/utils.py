@@ -122,6 +122,7 @@ def reduce_advantage_pump_metrics(
     num_malformed_thinking: list[int] | None = None,
     num_assistant_messages: list[int] | None = None,
     num_routed_experts_backfilled: list[int] | None = None,
+    canonical_masks: list[torch.Tensor] | None = None,
 ) -> dict[str, float]:
     """Reduce per-step accumulators from _advantage_stage into step scalars.
 
@@ -134,6 +135,11 @@ def reduce_advantage_pump_metrics(
             0). Weights ``reward`` so it averages over trained rows only,
             matching what the advantage estimator's baseline already excludes.
             None keeps the legacy unweighted mean.
+        canonical_masks: Per-row 1.0 for the canonical row of each rollout
+            (0.0 for token-capture segment rows, which repeat their rollout's
+            reward). Multiplied into the ``reward`` weights so a rollout with
+            several rows still counts once. None (or a length mismatch with
+            ``rewards``) keeps the ``sample_masks`` weighting.
         seq_logprob_error_metrics: Sequence-error metrics and their aggregation
             counts, one record per streaming chunk.
         num_mask_sample_filtered: Environment-flagged sample counts, one per
@@ -153,6 +159,10 @@ def reduce_advantage_pump_metrics(
         cat_rewards = torch.cat([r.flatten() for r in rewards])
         if sample_masks:
             cat_masks = torch.cat([m.flatten() for m in sample_masks])
+            if canonical_masks:
+                cat_canonical = torch.cat([c.flatten() for c in canonical_masks])
+                if cat_canonical.numel() == cat_masks.numel():
+                    cat_masks = cat_masks * cat_canonical.to(cat_masks.dtype)
             mask_sum = cat_masks.sum()
             out[REWARD_KEY] = (
                 float((cat_rewards * cat_masks).sum() / mask_sum)
@@ -244,6 +254,29 @@ def _reduce_seq_logprob_error_metrics(
         if masked_count
         else 0.0
     )
+
+    # Pre-gate token_mult_prob_error: each chunk reports a token-weighted mean
+    # and its token weight (``_premask_token_weight``), so the step value is
+    # the token-weighted mean over the whole step, not a mean of chunk means.
+    # Absent from records produced by older gate versions -> key omitted.
+    premask_records = [
+        record for record in records if "token_mult_prob_error_premask" in record
+    ]
+    if premask_records:
+        total_weight = sum(
+            float(record.get("_premask_token_weight", 0.0))
+            for record in premask_records
+        )
+        reduced["token_mult_prob_error_premask"] = (
+            sum(
+                float(record["token_mult_prob_error_premask"])
+                * float(record.get("_premask_token_weight", 0.0))
+                for record in premask_records
+            )
+            / total_weight
+            if total_weight > 0
+            else 0.0
+        )
     return reduced
 
 
