@@ -13,7 +13,10 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
 )
-from vllm.entrypoints.openai.sse_keep_alive import with_sse_keep_alive
+try:  # vLLM >= 0.30 moved the SSE keep-alive helper under entrypoints.serve
+    from vllm.entrypoints.serve.utils.sse_keep_alive import with_sse_keep_alive
+except ImportError:  # vLLM 0.29
+    from vllm.entrypoints.openai.sse_keep_alive import with_sse_keep_alive
 from vllm.entrypoints.serve.engine.protocol import ErrorResponse
 from vllm.entrypoints.serve.utils.api_utils import (
     load_aware_call,
@@ -32,7 +35,8 @@ from .route_override import (
 
 PLUGIN_NAME = "nemo_rl_prefix_api"
 PLUGIN_VERSION = "0.2.0"
-SUPPORTED_VLLM_VERSION = "0.29.0"
+SUPPORTED_VLLM_VERSIONS = ("0.29.0", "0.30.0")
+SUPPORTED_VLLM_VERSION = SUPPORTED_VLLM_VERSIONS[-1]  # newest verified; kept for tooling
 CAPABILITY_PATH = "/v1/nemo-rl/prefix-token-capability"
 
 
@@ -151,10 +155,10 @@ class NeMoRLPrefixEndpointPlugin:
     ) -> None:
         del engine_client, args
         installed_vllm_version = version("vllm")
-        if installed_vllm_version != SUPPORTED_VLLM_VERSION:
+        if installed_vllm_version not in SUPPORTED_VLLM_VERSIONS:
             raise RuntimeError(
-                f"{PLUGIN_NAME} supports vLLM {SUPPORTED_VLLM_VERSION}, but "
-                f"the server has {installed_vllm_version}"
+                f"{PLUGIN_NAME} supports vLLM {', '.join(SUPPORTED_VLLM_VERSIONS)}, "
+                f"but the server has {installed_vllm_version}"
             )
 
         serving_chat = getattr(state, "openai_serving_chat", None)
