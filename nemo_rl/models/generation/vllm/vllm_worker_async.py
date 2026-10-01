@@ -1093,6 +1093,115 @@ class VllmAsyncGenerationWorkerImpl(
 
                 return response
 
+        # --- issue #625: flat-aware chat logprobs (nemo-rl-side override) ---
+        # vLLM's _create_chat_logprobs re-expands FlatLogprobs per position via
+        # the compatibility __getitem__ (fresh dict + Logprob per token),
+        # defeating the flat format. Read the primitive arrays directly.
+        def _create_chat_logprobs_flat(
+            self, token_ids, top_logprobs, tokenizer,
+            num_output_top_logprobs=None, logprob_token_ids=None,
+            return_as_token_id=None,
+        ):
+            from vllm.entrypoints.openai.chat_completion.protocol import (
+                ChatCompletionLogProb,
+                ChatCompletionLogProbs,
+                ChatCompletionLogProbsContent,
+            )
+            from vllm.entrypoints.openai.chat_completion.serving import (
+                format_token_id_placeholder,
+            )
+
+            logprobs_content = []
+            as_token_id = (
+                return_as_token_id
+                if return_as_token_id is not None
+                else self.return_tokens_as_token_ids
+            )
+            starts = top_logprobs.start_indices
+            ends = top_logprobs.end_indices
+            tids = top_logprobs.token_ids
+            lps = top_logprobs.logprobs
+            decs = top_logprobs.decoded_tokens
+            for i, token_id in enumerate(token_ids):
+                s, e = starts[i], ends[i]
+                j = -1
+                for k in range(s, e):
+                    if tids[k] == token_id:
+                        j = k
+                        break
+                if j < 0:
+                    token = (
+                        format_token_id_placeholder(token_id)
+                        if as_token_id
+                        else tokenizer.decode(token_id)
+                    )
+                    logprobs_content.append(
+                        ChatCompletionLogProbsContent(
+                            token=token,
+                            bytes=list(token.encode("utf-8", errors="replace")),
+                        )
+                    )
+                    continue
+                decoded = decs[j]
+                token = (
+                    format_token_id_placeholder(token_id)
+                    if as_token_id
+                    else (decoded if decoded is not None else tokenizer.decode(token_id))
+                )
+                count = e - s
+                if logprob_token_ids or num_output_top_logprobs == -1:
+                    limit = count
+                else:
+                    limit = min(count, num_output_top_logprobs or 0)
+                tops = []
+                for k in range(s, s + limit):
+                    dtok = decs[k]
+                    tstr = (
+                        format_token_id_placeholder(tids[k])
+                        if as_token_id
+                        else (dtok if dtok is not None else tokenizer.decode(tids[k]))
+                    )
+                    tops.append(
+                        ChatCompletionLogProb(
+                            token=tstr,
+                            logprob=max(lps[k], -9999.0),
+                            bytes=list(tstr.encode("utf-8", errors="replace")),
+                        )
+                    )
+                logprobs_content.append(
+                    ChatCompletionLogProbsContent(
+                        token=token,
+                        logprob=max(lps[j], -9999.0),
+                        bytes=(
+                            None
+                            if decoded is None
+                            else list(decoded.encode("utf-8", errors="replace"))
+                        ),
+                        top_logprobs=tops,
+                    )
+                )
+            return ChatCompletionLogProbs(content=logprobs_content)
+
+        def _create_chat_logprobs(
+            self, token_ids, top_logprobs, tokenizer,
+            num_output_top_logprobs=None, logprob_token_ids=None,
+            return_as_token_id=None,
+        ):
+            try:
+                from vllm.logprobs import FlatLogprobs
+            except Exception:
+                FlatLogprobs = ()
+            if FlatLogprobs and isinstance(top_logprobs, FlatLogprobs):
+                return self._create_chat_logprobs_flat(
+                    token_ids, top_logprobs, tokenizer,
+                    num_output_top_logprobs, logprob_token_ids,
+                    return_as_token_id,
+                )
+            return super()._create_chat_logprobs(
+                token_ids, top_logprobs, tokenizer,
+                num_output_top_logprobs, logprob_token_ids, return_as_token_id,
+            )
+
         class NeMoRLOpenAIServingChat(NeMoRLOpenAIServingChatMixin, OpenAIServingChat):
             pass
 
