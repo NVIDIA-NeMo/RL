@@ -56,6 +56,10 @@ inputs:
     description: "Override container image tag. If set, infers FAST=1 and prefetches venvs + regenerates fingerprint at startup."
     required: false
     default: ""
+  tag-suffix:
+    description: "Suffix appended to the image tag (image-tag or the run ID), e.g. -trtllm. Does not imply FAST=1."
+    required: false
+    default: ""
   test-commit-sha:
     description: "Commit SHA to use for test"
     required: false
@@ -85,7 +89,7 @@ runs:
     - name: Docker pull image
       shell: bash
       run: |
-        docker pull ${{ inputs.registry }}/${{ inputs.image }}:${{ inputs.image-tag || github.run_id }}
+        docker pull ${{ inputs.registry }}/${{ inputs.image }}:${{ inputs.image-tag || github.run_id }}${{ inputs.tag-suffix }}
 
     - name: Create UUID
       id: uuid
@@ -141,7 +145,7 @@ runs:
         echo -e "\033[1;34m┌─ launching test ─────────────────────────────────────────────────────────┐\033[0m"
         echo -e "\033[1;34m│  script    : ${{ inputs.script }}\033[0m"
         echo -e "\033[1;34m│  runner    : ${{ inputs.runner }}\033[0m"
-        echo -e "\033[1;34m│  container : ${{ inputs.registry }}/${{ inputs.image }}:${{ inputs.image-tag || github.run_id }}\033[0m"
+        echo -e "\033[1;34m│  container : ${{ inputs.registry }}/${{ inputs.image }}:${{ inputs.image-tag || github.run_id }}${{ inputs.tag-suffix }}\033[0m"
         # Expose the host's RDMA devices so mooncake_cpu tests exercise the real
         # transport instead of finding no verbs device and skipping. A container
         # sees the host's /sys/class/infiniband but does NOT inherit
@@ -184,6 +188,7 @@ runs:
           --env HF_DATASETS_CACHE=/home/TestData/nemo-rl/hf_datasets_cache \
           --env NEMO_RL_REPO_DIR=/opt/nemo-rl \
           --env HF_TOKEN \
+          --env UV_NO_SYNC \
           ${{ inputs.is_fork_pr == 'true' && '--env HF_HUB_OFFLINE=1' || '' }} \
           ${{ inputs.image-tag != '' && '--env FAST=1' || '' }} \
           --volume $(pwd)/${{ github.run_id }}/${{steps.uuid.outputs.id }}/nemo-rl:/opt/nemo-rl \
@@ -192,7 +197,7 @@ runs:
           --volume ${{ inputs.test_data_path }}/nemo-rl/checkpoints:/home/TestData/nemo-rl/checkpoints:ro \
           --volume ${{ inputs.test_data_path }}/nemo-rl/hf_home/hub:/home/TestData/nemo-rl/hf_home/hub \
           --volume ${{ inputs.test_data_path }}/nemo-rl/hf_datasets_cache:/home/TestData/nemo-rl/hf_datasets_cache \
-          ${{ inputs.registry }}/${{ inputs.image }}:${{ inputs.image-tag || github.run_id }} bash -eux -o pipefail -c '\
+          ${{ inputs.registry }}/${{ inputs.image }}:${{ inputs.image-tag || github.run_id }}${{ inputs.tag-suffix }} bash -eux -o pipefail -c '\
             git config --global --add safe.directory /opt/nemo-rl
             git config --global --add safe.directory /opt/nemo-rl/3rdparty/Gym-workspace/Gym
             # This is needed since we create virtualenvs in the workspace, so this allows it to be cleaned up if necessary

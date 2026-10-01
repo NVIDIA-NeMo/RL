@@ -35,6 +35,11 @@ on:
         required: true
         description: Name of the image to build and push.
         type: string
+      tag-suffix:
+        required: false
+        default: ""
+        description: Suffix appended to the run/PR/main image tags and their -buildcache refs (e.g. -trtllm), so a second image variant can share image-name without clobbering the first. Explicit cache tags (trtllm-*-cache-tag, uv-cache-tag) are not suffixed.
+        type: string
       build-args:
         required: false
         default: ""
@@ -54,6 +59,11 @@ on:
         required: false
         default: ""
         description: Prefix for the TRT-LLM wheel cache image tag; the target architecture and a hash of the effective base image are appended automatically. Empty disables the cache.
+        type: string
+      uv-cache-tag:
+        required: false
+        default: ""
+        description: Tag of this image's uv cache image, for Dockerfiles that keep the uv cache in a builder-local mount. If it exists it seeds the Dockerfile's uv-cache-seed context (otherwise the build starts with an empty cache), and builds of main export the Dockerfile's uv-cache target to it. Empty disables.
         type: string
       dockerfile:
         required: true
@@ -91,6 +101,7 @@ jobs:
     env:
       REGISTRY: ${{ inputs.registry }}
       IMAGE_NAME: ${{ inputs.image-name }}
+      TAG_SUFFIX: ${{ inputs.tag-suffix }}
       GH_REF: ${{ github.ref }}
       RUN_ID: ${{ github.run_id }}
     steps:
@@ -264,6 +275,22 @@ jobs:
             configure_export wheel "$WHEEL_SEED_REF" trtllm-wheel-cache-output-base "wheel cache"
           fi
 
+      - name: Resolve uv cache seed
+        id: uv_cache_seed
+        if: inputs.uv-cache-tag != ''
+        shell: bash
+        env:
+          UV_CACHE_TAG: ${{ inputs.uv-cache-tag }}
+        run: |
+          set -euo pipefail
+          ref="$REGISTRY/$IMAGE_NAME:$UV_CACHE_TAG"
+          if docker buildx imagetools inspect "$ref" >/dev/null 2>&1; then
+            echo "Using uv cache seed $ref"
+            echo "context=uv-cache-seed=docker-image://$ref" >> "$GITHUB_OUTPUT"
+          else
+            echo "No uv cache image found at $ref; starting with an empty cache"
+          fi
+
       - name: Get recently merged PR cache refs
         id: recent_pr_cache_refs
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
@@ -286,7 +313,7 @@ jobs:
             `, { owner, repo });
 
             const refs = result.repository.pullRequests.nodes
-              .map(({ number }) => `type=registry,ref=${process.env.REGISTRY}/${process.env.IMAGE_NAME}:${number}-buildcache,mode=max`)
+              .map(({ number }) => `type=registry,ref=${process.env.REGISTRY}/${process.env.IMAGE_NAME}:${number}${process.env.TAG_SUFFIX}-buildcache,mode=max`)
               .join("\n");
 
             core.setOutput("cache-from", refs);
@@ -303,13 +330,13 @@ jobs:
             PR_NUMBER="${BASH_REMATCH[1]}"
           fi
 
-          TAGS=("$REGISTRY/$IMAGE_NAME:$RUN_ID")
+          TAGS=("$REGISTRY/$IMAGE_NAME:$RUN_ID$TAG_SUFFIX")
           if [[ "$GH_REF" == "refs/heads/main" ]]; then
             CACHE_KEY="main"
-            TAGS+=("$REGISTRY/$IMAGE_NAME:main")
+            TAGS+=("$REGISTRY/$IMAGE_NAME:main$TAG_SUFFIX")
           elif [[ -n "$PR_NUMBER" ]]; then
             CACHE_KEY="$PR_NUMBER"
-            TAGS+=("$REGISTRY/$IMAGE_NAME:$PR_NUMBER")
+            TAGS+=("$REGISTRY/$IMAGE_NAME:$PR_NUMBER$TAG_SUFFIX")
           else
             CACHE_KEY=$(printf '%s' "${GITHUB_REF_NAME:-$RUN_ID}" | tr '/' '-' | tr -cd '[:alnum:]._-')
             if [[ -z "$CACHE_KEY" ]]; then
@@ -318,10 +345,10 @@ jobs:
           fi
 
           CACHE_FROM=(
-            "type=registry,ref=$REGISTRY/$IMAGE_NAME:main-buildcache,mode=max"
+            "type=registry,ref=$REGISTRY/$IMAGE_NAME:main$TAG_SUFFIX-buildcache,mode=max"
           )
           if [[ "$CACHE_KEY" != "main" ]]; then
-            CACHE_FROM+=("type=registry,ref=$REGISTRY/$IMAGE_NAME:$CACHE_KEY-buildcache,mode=max")
+            CACHE_FROM+=("type=registry,ref=$REGISTRY/$IMAGE_NAME:$CACHE_KEY$TAG_SUFFIX-buildcache,mode=max")
           fi
 
           {
@@ -331,7 +358,7 @@ jobs:
             echo "cache-from<<EOF"
             printf '%s\n' "${CACHE_FROM[@]}"
             echo "EOF"
-            echo "cache-to=type=registry,ref=$REGISTRY/$IMAGE_NAME:$CACHE_KEY-buildcache,mode=max"
+            echo "cache-to=type=registry,ref=$REGISTRY/$IMAGE_NAME:$CACHE_KEY$TAG_SUFFIX-buildcache,mode=max"
           } >> "$GITHUB_OUTPUT"
 
       - name: Build and push
@@ -345,6 +372,7 @@ jobs:
             ${{ inputs.build-contexts }}
             ${{ steps.trtllm_cache_seed.outputs.ccache_context }}
             ${{ steps.trtllm_cache_seed.outputs.wheel_context }}
+            ${{ steps.uv_cache_seed.outputs.context }}
           build-args: ${{ inputs.build-args }}
           cache-from: |
             ${{ steps.build_meta.outputs.cache-from }}
@@ -354,6 +382,32 @@ jobs:
           tags: |
             ${{ steps.build_meta.outputs.tags }}
           target: ${{ inputs.target }}
+
+      - name: Update uv cache image
+        # Main only, so PR builds see a stable seed (the seed is bound into the
+        # venv layer, so a new seed invalidates that layer's BuildKit cache).
+        # TEMP: also on PR branches to bootstrap the trtllm uv cache images; restore
+        # `&& github.ref == 'refs/heads/main'` after the first run.
+        if: inputs.uv-cache-tag != ''
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
+        with:
+          file: ${{ inputs.dockerfile }}
+          push: true
+          context: .
+          platforms: ${{ inputs.platform }}
+          build-contexts: |
+            ${{ inputs.build-contexts }}
+            ${{ steps.uv_cache_seed.outputs.context }}
+          build-args: |
+            ${{ inputs.build-args }}
+            UV_CACHE_EXPORT_NONCE=${{ github.run_id }}-${{ github.run_attempt }}
+          cache-from: |
+            ${{ steps.build_meta.outputs.cache-from }}
+            ${{ steps.recent_pr_cache_refs.outputs.cache-from }}
+          no-cache: false
+          provenance: false
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.uv-cache-tag }}
+          target: uv-cache
 
       - name: Probe TRT-LLM incremental cache exports
         id: trtllm_cache_export_status
