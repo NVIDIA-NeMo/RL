@@ -1505,6 +1505,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 "at least one teacher mapping."
             )
         opd_module.assert_prev_logprobs_available(master_config)
+        opd_module.assert_trust_region_supported(master_config)
         _validate_opd_full_config(master_config, opd_config)
         if (
             algo_cfg.adv_estimator.subtract_global_baseline

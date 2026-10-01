@@ -501,6 +501,20 @@ def test_single_controller_mopd_recipe_builds_tropd_estimator(monkeypatch):
     assert estimator.subtract_global_baseline is True
 
 
+@pytest.mark.parametrize(
+    "tropd_override",
+    [{"proximal_teacher_alpha": 0.2}, {"subtract_global_baseline": True}],
+)
+def test_fullvocab_recipe_rejects_tropd_before_allocation(tropd_override):
+    """Full-vocab MOPD ignores advantages, so SC rejects TROPD before allocating."""
+    config = _load_fullvocab_master_config()
+    config.grpo.adv_estimator = config.grpo.adv_estimator.model_copy(
+        update=tropd_override
+    )
+    with pytest.raises(ValueError, match="ignores advantages"):
+        validate_single_controller_config(config)
+
+
 def test_single_controller_ppo_recipe_inherits_overlong_filtering():
     """The SC nightly exercises the overlong filtering inherited from its parent."""
     register_omegaconf_resolvers()
