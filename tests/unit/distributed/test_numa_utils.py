@@ -348,6 +348,32 @@ class TestSetNumaMembind:
         cpus = os.sched_getaffinity(0)
         assert _set_numa_membind(cpus) is True
 
+    def test_membind_prefers_local_node_instead_of_binding(self, monkeypatch):
+        # A hard bind (MPOL_BIND) OOM-kills a worker once its node is full even
+        # when other nodes have free memory; MPOL_PREFERRED spills over instead.
+        import ctypes
+
+        monkeypatch.delenv("NRL_DISABLE_NUMA_MEMBIND", raising=False)
+        libnuma = _load_libnuma()
+        libnuma.get_mempolicy.argtypes = [
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+        ]
+        libnuma.get_mempolicy.restype = ctypes.c_int
+        libnuma.numa_preferred.restype = ctypes.c_int
+        cpus = os.sched_getaffinity(0)
+        try:
+            assert _set_numa_membind(cpus) is True
+            mode = ctypes.c_int(-1)
+            assert libnuma.get_mempolicy(ctypes.byref(mode), None, 0, None, 0) == 0
+            assert mode.value == 1  # MPOL_PREFERRED; MPOL_BIND would be 2
+            assert libnuma.numa_preferred() == _get_numa_node(libnuma, cpus)
+        finally:
+            libnuma.numa_set_localalloc()
+
     def test_get_numa_node_valid(self):
         libnuma = _load_libnuma()
         node = _get_numa_node(libnuma, {0})
