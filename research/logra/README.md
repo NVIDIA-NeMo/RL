@@ -23,7 +23,6 @@ uv run run_grpo.py --config configs/grpo_logra_smoke.yaml logra.enabled=false
 
 Dense HF linear layers, FSDP2, TP=CP=1, synchronous GRPO. No PEFT, MoE,
 quantization, or CPU parameter offload. Resume initially requires the same DP size.
-The inherited main version is `910773917e7efc8822370409d029d47bca3a2bbb`.
 
 ## Testing
 
