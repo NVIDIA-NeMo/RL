@@ -66,7 +66,8 @@ def test_checkpoint_manager_rejects_top_level_automodel_fields(checkpoint_config
     checkpoint_config.update(legacy_fields)
 
     with pytest.raises(ValueError) as error:
-        CheckpointManager(OmegaConf.create(checkpoint_config))
+        # Legacy keys arrive through extra="allow" on the validated model.
+        CheckpointManager(CheckpointingConfig.model_validate(checkpoint_config))
 
     for field in legacy_fields:
         assert field in str(error.value)
