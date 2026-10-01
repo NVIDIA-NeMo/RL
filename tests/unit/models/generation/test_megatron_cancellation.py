@@ -26,6 +26,8 @@ from megatron.core.inference.sampling_params import SamplingParams
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.megatron.megatron_worker import MegatronGenerationMixin
 
+pytestmark = pytest.mark.mcore
+
 
 def _client():
     messages = []
