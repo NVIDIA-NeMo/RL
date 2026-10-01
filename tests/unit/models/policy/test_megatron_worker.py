@@ -1447,8 +1447,9 @@ def test_sync_params_before_refit_gathers_pending_bf16_params(
     the updated shards into the DDP param buffer, and the MXFP8-only staging
     helper must not be involved.
     """
-    from nemo_rl.models.policy.workers import megatron_policy_worker
     from megatron.core.distributed.param_and_grad_buffer import _ParamAndGradBuffer
+
+    from nemo_rl.models.policy.workers import megatron_policy_worker
 
     events = []
     # Exercise MCore's real storage lifecycle without constructing a CUDA model.

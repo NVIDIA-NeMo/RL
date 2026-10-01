@@ -1211,6 +1211,7 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                 "(policy.megatron_cfg.enabled=true) to preserve accumulated "
                 "gradients across policy/value model switches."
             )
+        policy_megatron_cfg = cast(MegatronConfig, policy_megatron_cfg)
         ddp_config = policy_megatron_cfg.get("distributed_data_parallel_config")
         if ddp_config is not None and (
             ddp_config.get("use_custom_fsdp") or ddp_config.get("use_megatron_fsdp")
