@@ -64,4 +64,3 @@ tests/test_suites/llm/distillation-qwen3-32b-to-4b-base-2n8g-automodel-tp2cp2-lo
 tests/test_suites/llm/distillation-qwen3-32b-to-4b-base-1n8g-automodel-tp2-dynamicbatch.v1.sh
 tests/test_suites/llm/distillation-qwen3-32b-to-4b-base-2n8g-automodel-tp8-noncolocated.v1.sh
 tests/test_suites/llm/distillation-qwen3-32b-to-4b-base-2n8g-automodel-tp2-seqpack.v1.sh
-
