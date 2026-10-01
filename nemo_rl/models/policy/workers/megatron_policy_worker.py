@@ -4336,17 +4336,14 @@ class MegatronPolicyWorkerImpl(
             raise RuntimeError("the open train step is already offloaded")
         if not isinstance(self.model, DistributedDataParallel):
             raise ValueError("PPO streaming offload requires Megatron DDP")
-        for buffer in (*self.model.buffers, *self.model.expert_parallel_buffers):
-            if (
-                buffer.param_data is not None
-                and buffer.grad_data is not None
-                and buffer.param_data.untyped_storage().nbytes() > 0
-                and buffer.param_data.untyped_storage().data_ptr()
-                == buffer.grad_data.untyped_storage().data_ptr()
-            ):
-                raise ValueError(
-                    "PPO streaming offload requires separate param/grad storage"
-                )
+        if (
+            self.megatron_cfg.ddp.use_distributed_optimizer
+            and self.megatron_cfg.ddp.reuse_grad_buf_for_mxfp8_param_ag
+        ):
+            raise ValueError(
+                "PPO streaming offload with the distributed optimizer requires "
+                "reuse_grad_buf_for_mxfp8_param_ag=False"
+            )
 
         self.finalize_async_save()
         # eval may materialize model-specific caches; do it before CPU offload.
@@ -4355,6 +4352,8 @@ class MegatronPolicyWorkerImpl(
         self.model = self.move_model(
             self.model, "cpu", move_params=True, move_grads=False
         )
+        # optimizer_cpu_offload offloads optimizer computation to CPU. Here we
+        # only park GPU optimizer state on CPU while another RL model runs.
         if self.optimizer is not None and not self.optimizer_cpu_offload:
             self.move_optimizer("cpu")
         self._release_opd_full_teacher_lm_head()

@@ -2770,6 +2770,7 @@ class SingleControllerActor:
             policy_result: Optional[dict[str, Any]] = None
             value_result: Optional[dict[str, Any]] = None
             value_train_metas: list[KVBatchMeta] = []
+            # PPO requires at least one chunk with valid training tokens per step.
             step_has_valid_training_tokens = False
             early_refit_done = False
             aborted_stale_inflight_groups = 0
@@ -3215,7 +3216,6 @@ class SingleControllerActor:
                     if (
                         self._is_ppo
                         and self._streaming_ppo
-                        and not self._gen.blocks_training()
                         and groups_dispatched
                         < self._target_groups_for_step(version_during_step)
                     ):

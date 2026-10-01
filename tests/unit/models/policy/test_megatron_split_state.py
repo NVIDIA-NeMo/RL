@@ -153,7 +153,11 @@ def _make_worker(loss_type):
     }
     w.megatron_cfg = SimpleNamespace(
         optimizer=SimpleNamespace(reuse_grad_buf_for_mxfp8_param_ag=False),
-        ddp=SimpleNamespace(overlap_param_gather=False),
+        ddp=SimpleNamespace(
+            overlap_param_gather=False,
+            use_distributed_optimizer=True,
+            reuse_grad_buf_for_mxfp8_param_ag=False,
+        ),
     )
     w.dp_size = 2
     w.cp_size = 1
@@ -1881,24 +1885,51 @@ class TestPauseTrainStepWithOffloading:
         assert w._train_step_state["offloaded"] is False
 
     @pytest.mark.parametrize(
-        "buffer_collection", ["buffers", "expert_parallel_buffers"]
+        "use_distributed_optimizer,reuse_grad_buf,expected_error",
+        [
+            (False, False, None),
+            (False, True, None),
+            (True, False, None),
+            (True, True, "reuse_grad_buf_for_mxfp8_param_ag=False"),
+        ],
     )
-    def test_rejects_shared_param_grad_storage(
-        self, mock_module_symbols, buffer_collection
-    ):
+    def test_offload_checks_distributed_grad_buffer_reuse(
+        self,
+        mock_module_symbols: dict[str, MagicMock],
+        use_distributed_optimizer: bool,
+        reuse_grad_buf: bool,
+        expected_error: str | None,
+    ) -> None:
         w = self._worker()
-        buffer = getattr(w.model, buffer_collection)[0]
-        # MXFP8 can share this allocation even without overlap_param_gather.
-        buffer.param_data = buffer.grad_data.view(torch.bfloat16)
-        expected = buffer.grad_data.clone()
+        w.megatron_cfg.ddp.use_distributed_optimizer = use_distributed_optimizer
+        w.megatron_cfg.ddp.reuse_grad_buf_for_mxfp8_param_ag = reuse_grad_buf
+        # The reuse flag is also enabled for unsharded MXFP8, where MCore does
+        # not allocate shared parameter storage. Neither case requires overlap.
+        buffers = (*w.model.buffers, *w.model.expert_parallel_buffers)
+        if not use_distributed_optimizer:
+            for buffer in buffers:
+                buffer.param_data = None
+        expected = [buffer.grad_data.clone() for buffer in buffers]
         with patch(f"{WORKER_MOD}.DistributedDataParallel", type(w.model)):
-            with pytest.raises(ValueError, match="separate param/grad storage"):
+            if expected_error is not None:
+                with pytest.raises(ValueError, match=expected_error):
+                    w.pause_train_step_with_offloading()
+            else:
                 w.pause_train_step_with_offloading()
-        assert w._train_step_state["offloaded"] is False
-        torch.testing.assert_close(buffer.grad_data, expected)
-        assert buffer.calls == []
-        w.finalize_async_save.assert_not_called()
-        w.move_optimizer.assert_not_called()
+        assert w._train_step_state["offloaded"] is (expected_error is None)
+        for buffer, gradient in zip(buffers, expected):
+            torch.testing.assert_close(buffer.grad_data, gradient)
+            assert buffer.calls == (
+                [] if expected_error is not None else [("offload", True, False)]
+            )
+        if expected_error is not None:
+            w.finalize_async_save.assert_not_called()
+            w.model.eval.assert_not_called()
+            w.move_optimizer.assert_not_called()
+        else:
+            w.finalize_async_save.assert_called_once()
+            w.model.eval.assert_called_once()
+            w.move_optimizer.assert_called_once_with("cpu")
 
     @pytest.mark.parametrize("optimizer_cpu_offload", [False, True])
     def test_offloaded_step_rejects_double_offload_train_and_finish(
