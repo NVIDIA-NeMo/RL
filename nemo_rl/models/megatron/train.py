@@ -852,9 +852,9 @@ class LogprobsPostProcessor:
                 token_logprobs, finite_mask = mask_out_neg_inf_logprobs(
                     token_logprobs, mask, "prev_logprobs"
                 )
-                result_dict["token_mask"] = (data_dict["token_mask"] * finite_mask)[
-                    :, :original_seq_length
-                ]
+                result_dict["token_mask"] = (data_dict["token_mask"] * finite_mask).to(
+                    data_dict["token_mask"].dtype
+                )[:, :original_seq_length]
 
             token_logprobs = token_logprobs[:, :original_seq_length]
             result_dict["logprobs"] = token_logprobs

@@ -275,7 +275,7 @@ def prepare_loss_input(
             logprobs, curr_finite_mask = mask_out_neg_inf_logprobs(
                 logprobs, mask[:, 1:], "curr_logprobs"
             )
-            # Propagate the neg-inf mask so the loss reduction skips these positions.
+            # Propagate the neg-inf mask so the loss reduction and KL skips these positions.
             # Without this change, the IS weight exp(prev-gen) becomes exp(-gen).
             data["token_mask"] = data["token_mask"].clone()
             data["token_mask"][:, 1:] = data["token_mask"][:, 1:] * curr_finite_mask
@@ -548,6 +548,7 @@ def prepare_packed_loss_input(
 
     # Match prepare_loss_input behavior for top-k/top-p filtered training:
     # use filtered curr_logprobs for actor loss, but keep unfiltered values for KL.
+    # Note that `-inf` positions are dropped from `token_mask`, so terms like KL skip them.
     if need_top_k_or_top_p_filtering(sampling_params):
         mask = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
         logprobs, curr_finite_mask = mask_out_neg_inf_logprobs(

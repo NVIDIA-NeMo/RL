@@ -90,6 +90,7 @@ class PolicyInterface(ABC):
         Returns:
             BatchedDataDict containing:
                 - ``logprobs``: Tensor of logprobs of actions
+                - ``token_mask``: only for top-k/top-p filtering; masked out -inf positions.
         """
         pass
 
