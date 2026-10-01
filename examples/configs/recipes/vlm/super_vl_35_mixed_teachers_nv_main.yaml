@@ -62,6 +62,7 @@ policy:
   train_micro_batch_size: 1
   max_total_sequence_length: 65536
   logprob_batch_size: 1
+  offload_optimizer_for_logprob: true
   logprob_chunk_size: 2048
   make_sequence_length_divisible_by: 8
   tokenizer:
