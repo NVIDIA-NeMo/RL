@@ -1769,6 +1769,7 @@ class RolloutManager:
             start_weight_version=self._weight_version,
             task_source=recovery_policy.task_source,
             recovery_granularity=recovery_policy.granularity,
+            restore_level=recovery_policy.restore_level,
             admitted=admitted,
             admission_id=admission_id,
         )

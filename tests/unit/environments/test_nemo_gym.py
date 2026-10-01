@@ -39,6 +39,7 @@ from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
+from nemo_rl.environments.gym_checkpoint_adapter import GymCheckpointInstance
 from nemo_rl.environments.nemo_gym import (
     NemoGym,
     NemoGymConfig,
@@ -1161,6 +1162,8 @@ openai_model:
         model_name=nemo_gym_vllm_generation.cfg["model_name"],
         base_urls=nemo_gym_vllm_generation.dp_openai_server_base_urls,
         initial_global_config_dict=safe_load(yaml_str),
+        checkpoint_instance=GymCheckpointInstance("nemo_gym", 0),
+        turn_checkpointing_enabled=False,
     )
     env = NemoGym.options(
         runtime_env={

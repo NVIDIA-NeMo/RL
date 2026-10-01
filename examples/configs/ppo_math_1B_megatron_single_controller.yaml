@@ -265,20 +265,21 @@ token_capture:
   enabled: false
   staging_partition: rollout_staging
 
-# Retry and restore policy for unfinished token-capture groups. "sibling" reuses
-# already sealed generations; "prompt_group" regenerates every sibling when any
-# sibling fails in-process or was unfinished at a checkpoint.
+# Target recovery boundary for unfinished token-capture groups. "turn" enables
+# coordinated Gym participant snapshots; "sibling" preserves sealed siblings;
+# "prompt_group" regenerates every sibling in an unfinished group.
 rollout_recovery:
-  default_granularity: sibling
-  # Per-Gym-task-source override, keyed on extra_env_info.task_source.
-  #   task_source_granularity_overrides:
+  target_level: sibling
+  # Per-Gym-task-source coarsening override, keyed on extra_env_info.task_source.
+  # Until Gym advertises group-scoring capability, configure GenRM explicitly:
+  #   task_source_target_level_overrides:
   #     genrm_compare_resources_server: prompt_group
-  task_source_granularity_overrides: {}
+  task_source_target_level_overrides: {}
   # Agent-specific override for rows already carrying extra_env_info.agent_ref.
   # A matching agent entry wins over a matching task-source entry and also
   # provides compatibility for legacy datasets without task_source.
-  #   agent_granularity_overrides: {genrm_agent: prompt_group}
-  agent_granularity_overrides: {}
+  #   agent_target_level_overrides: {genrm_agent: prompt_group}
+  agent_target_level_overrides: {}
 
 # Leaving either map above non-empty requires the top-level token_capture section
 # to set enabled: true.
