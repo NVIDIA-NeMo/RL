@@ -37,6 +37,7 @@ from nemo_rl.utils.config import (
     register_omegaconf_resolvers,
 )
 from nemo_rl.utils.logger import get_next_experiment_dir
+from nemo_rl.utils.outdated_config_checks import check_outdated_config
 
 
 def parse_args():
@@ -176,6 +177,7 @@ def main(is_vlm: bool = False):
         config = parse_hydra_overrides(config, overrides)
 
     config = OmegaConf.to_container(config, resolve=True)
+    check_outdated_config(config)
     config = MasterConfig(**config)
     print("Applied CLI overrides")
 
