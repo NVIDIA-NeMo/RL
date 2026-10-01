@@ -94,6 +94,15 @@ class VllmSpecificArgs(TypedDict):
     # Collect vLLM request, cache, and cumulative token counters in a model-owner
     # background thread for performance diagnostics.
     enable_vllm_metrics_logger: NotRequired[bool]
+    # How the HTTP server splices the exact model prefix into multi-turn prompts
+    # (token echo / token capture). "legacy" (also when absent) renders and
+    # tokenizes the conversation twice. "single" renders once and derives the
+    # splice boundary from the prefix. "incremental" renders once and tokenizes
+    # only the turns after the prefix. "verify" serves the legacy splice and
+    # logs any request where the incremental splice would differ.
+    prefix_splice_mode: NotRequired[
+        Literal["legacy", "incremental", "verify"]
+    ]
     # Sampling cadence for the optional vLLM metrics logger.
     vllm_metrics_logger_interval: NotRequired[float]
     # Whether to show a tqdm progress bar during generation. Defaults to vLLM's own default (True) when absent. Only applies when async_engine is False.

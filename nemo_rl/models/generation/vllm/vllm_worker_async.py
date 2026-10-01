@@ -21,6 +21,9 @@ import time
 import uuid
 import warnings
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
+from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Optional, cast
 
 import ray
@@ -56,13 +59,115 @@ from nemo_rl.models.generation.vllm.utils import (
     model_dump_chat_response_with_dynamic_message_fields,
     pad_and_align_routed_expert_indices,
 )
+from nemo_rl.models.generation.vllm.metric_names import (
+    SPLICE_FALLBACKS_RAW,
+    SPLICE_VERIFY_MISMATCHES_RAW,
+    SPLICE_VERIFY_REQUESTS_RAW,
+)
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 from nemo_rl.models.generation.openai_server_utils import (
+    assert_splice_tokenizer_invariants,
     replace_prefix_tokens,
+    splice_prefix_into_rendered_prompt,
 )
 from nemo_rl.telemetry.setup import shutdown_telemetry
 
 LOGGER = logging.getLogger(__name__)
+
+# Token-bundle fields Gym attaches to assistant messages. Chat templates never
+# read them, so the prefix render does not need to copy them.
+_TOKEN_FIELDS = frozenset(
+    {
+        "prompt_token_ids",
+        "generation_token_ids",
+        "generation_log_probs",
+        "routed_experts",
+    }
+)
+
+
+@dataclass
+class _IncrementalSplice:
+    """Per-request state shared between preprocess_chat and the tokenize hook."""
+
+    model_prefix_token_ids: list[int]
+    # "verify" mode: compute the splice but serve the legacy result.
+    verify: bool
+    # Set between the full and prefix renders so the hook records the prefix.
+    capture_prefix: bool = False
+    # Filled by the tokenize hook; None when the hook took vLLM's normal path.
+    full_text: Optional[str] = None
+    prefix_text: Optional[str] = None
+
+
+_INCREMENTAL_SPLICE: ContextVar[Optional[_IncrementalSplice]] = ContextVar(
+    "nemo_rl_incremental_splice", default=None
+)
+
+
+def _copy_messages_for_prefix_render(messages: list[Any]) -> list[Any]:
+    """Deep-copy messages for the prefix render without their token-id payloads.
+
+    With the legacy token echo every assistant message carries its cumulative
+    ``prompt_token_ids``, so a full deepcopy is quadratic in the rollout length.
+    """
+    return [
+        {k: deepcopy(v) for k, v in message.items() if k not in _TOKEN_FIELDS}
+        for message in messages
+    ]
+
+
+def _prefix_belongs_to_last_assistant(messages: list[Any], admission: Any) -> bool:
+    """Whether the request's last assistant message produced the required prefix.
+
+    Only then does the preserved prefix cover the conversation through the
+    last assistant turn, so the prefix render and the prefix ids describe the
+    same history.
+    """
+    if admission is not None and admission.mode == "token_in":
+        # Gym's ledger matched the full assistant history to the parent call.
+        return True
+    for message in reversed(messages):
+        if message.get("role") == "assistant":
+            return "prompt_token_ids" in message
+    return False
+
+
+def _install_incremental_splice_hook(renderer: Any) -> None:
+    """Capture rendered prompts in vLLM's tokenize step; tokenize only the suffix.
+
+    vLLM renders the chat template to text, then tokenizes the whole text. When
+    preprocess_chat marks a request (``_INCREMENTAL_SPLICE``), this hook records
+    the rendered text -- the full prompt, then the prefix render -- and skips
+    both tokenizations: the splice boundary is counted on the prefix text, so
+    the only tokenization left is the turns after the model prefix, which the
+    caller encodes once the prefix render is in. Unmarked requests (including
+    /tokenize and requests without a prefix) take vLLM's normal path.
+    """
+    # The incremental splice counts EOS strings where the legacy splice counts
+    # EOS ids; fail here, not per request, when the tokenizer breaks that.
+    assert_splice_tokenizer_invariants(renderer.get_tokenizer())
+
+    original_tokenize = renderer._tokenize_prompt_async
+
+    async def tokenize_prompt_async(prompt: Any, params: Any) -> Any:
+        state = _INCREMENTAL_SPLICE.get()
+        if (
+            state is None
+            or params.truncate_prompt_tokens is not None
+            or renderer._wants_offsets(prompt, params)
+        ):
+            return await original_tokenize(prompt, params)
+
+        if state.capture_prefix:
+            state.prefix_text = prompt["prompt"]
+        else:
+            state.full_text = prompt["prompt"]
+        # Placeholder ids: preprocess_chat's caller overwrites prompt_token_ids
+        # with the spliced ones before the request reaches the engine.
+        return renderer._build_tokens_prompt([], prompt)
+
+    renderer._tokenize_prompt_async = tokenize_prompt_async
 
 
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_abort
@@ -235,6 +340,18 @@ class VllmAsyncGenerationWorkerImpl(
         from nemo_rl.data_plane.tq_token_sink import ChainPrefixCache
 
         self._chain_prefix = ChainPrefixCache()
+
+        # NotRequired vllm_cfg key; absent keeps the legacy two-render splice.
+        self._prefix_splice_mode = config["vllm_cfg"].get("prefix_splice_mode")
+        if self._prefix_splice_mode not in (None, "legacy", "incremental", "verify"):
+            raise ValueError(
+                f"vllm_cfg.prefix_splice_mode={self._prefix_splice_mode!r} is not "
+                "supported; choose from legacy, incremental, verify."
+            )
+        # "verify" mode counters: [requests compared, mismatches].
+        self._splice_verify_counts = [0, 0]
+        # Incremental-splice fallbacks to the legacy path, by kind.
+        self._splice_fallback_counts: dict[str, int] = {}
 
         super().__init__(
             config,
@@ -714,6 +831,65 @@ class VllmAsyncGenerationWorkerImpl(
         content["ng_commit_coords"] = coords.model_dump()
         return content
 
+    def _record_splice_fallback(self, kind: str) -> None:
+        """Count an incremental-splice fallback to the legacy path."""
+        self._splice_fallback_counts[kind] = (
+            self._splice_fallback_counts.get(kind, 0) + 1
+        )
+        n = self._splice_fallback_counts[kind]
+        if n <= 5 or n % 100 == 0:
+            LOGGER.warning(
+                "prefix_splice fallback #%d (%s): using legacy path; counters=%s",
+                n,
+                kind,
+                dict(self._splice_fallback_counts),
+            )
+
+    def _record_splice_verification(
+        self, reference: list[int], candidate: Optional[list[int]]
+    ) -> None:
+        """Compare the incremental splice against the legacy splice ("verify" mode)."""
+        self._splice_verify_counts[0] += 1
+        if candidate == reference:
+            return
+        self._splice_verify_counts[1] += 1
+        if candidate is None:
+            first_diff = -1
+        else:
+            first_diff = next(
+                (
+                    i
+                    for i, (ref, cand) in enumerate(zip(reference, candidate))
+                    if ref != cand
+                ),
+                min(len(reference), len(candidate)),
+            )
+        LOGGER.warning(
+            "prefix_splice_mode=verify: incremental splice differs from legacy "
+            "(%d/%d requests): legacy_len=%d incremental_len=%s first_diff=%d",
+            self._splice_verify_counts[1],
+            self._splice_verify_counts[0],
+            len(reference),
+            None if candidate is None else len(candidate),
+            first_diff,
+        )
+
+    def _get_raw_spec_counters(self) -> dict[str, float | list[float]]:
+        """Add the splice counters to the engine's Prometheus snapshot.
+
+        Cumulative counts; the generation side reports per-step deltas.
+        """
+        metrics = super()._get_raw_spec_counters()
+        if self._prefix_splice_mode in ("incremental", "verify"):
+            metrics[SPLICE_FALLBACKS_RAW] = float(
+                sum(self._splice_fallback_counts.values())
+            )
+            metrics[SPLICE_VERIFY_REQUESTS_RAW] = float(self._splice_verify_counts[0])
+            metrics[SPLICE_VERIFY_MISMATCHES_RAW] = float(
+                self._splice_verify_counts[1]
+            )
+        return metrics
+
     def _abort_request_capture(self, request: Any, *, reason: str) -> None:
         """Drop the in-flight capture state for a request that errored."""
         state = self._capture_calls.pop(id(request), None)
@@ -723,7 +899,6 @@ class VllmAsyncGenerationWorkerImpl(
     # ruff: noqa
     def _setup_vllm_openai_api_server(self, app: FastAPI) -> FastAPI:
         worker_self = self
-        from copy import deepcopy
         from logging import Filter as LoggingFilter
         from logging import LogRecord
         from typing import List, Optional, Union
@@ -855,7 +1030,15 @@ class VllmAsyncGenerationWorkerImpl(
                     if message.get("tool_calls"):
                         message["tool_calls"] = list(message["tool_calls"])
 
-                messages_for_replace_prefix_tokens = deepcopy(messages)
+                # Prefix splice strategy (vllm_cfg.prefix_splice_mode); absent
+                # keeps the legacy two-render splice.
+                splice_mode = worker_self._prefix_splice_mode
+                if splice_mode is None or splice_mode == "legacy":
+                    messages_for_replace_prefix_tokens = deepcopy(messages)
+                else:
+                    messages_for_replace_prefix_tokens = (
+                        _copy_messages_for_prefix_render(messages)
+                    )
 
                 # Temporarily set to 1 so vLLM's pre-tokenization length check passes;
                 # the actual value will be set through _clamp_max_tokens later.
@@ -870,6 +1053,47 @@ class VllmAsyncGenerationWorkerImpl(
                     # So we don't need to set the request's max output tokens to 1 here.
                     if actual_request_max_tokens is not None:
                         self._set_max_tokens(request, 1)
+
+                # Token capture: build the admission once, before branching,
+                # and resolve its prefix from it (staging_chain -> cached TQ
+                # read, inline ids, or nothing for a text root). The
+                # ``ng_capture`` dict is never mutated. Off-loop: the chain
+                # fetch is a blocking TQ read, and Gym's staging protocol
+                # requires the serving host to move blocking staging I/O off
+                # its event loop explicitly. The adapter then attaches the
+                # prefix to the request, so the inline-prefix branch below is
+                # the single splice path for staged and inline prefixes.
+                # Resolved before rendering so the incremental splice knows
+                # the prefix when vLLM tokenizes.
+                admission = worker_self._capture_admission(request)
+                capture_prefix_token_ids: list[int] | None = None
+                if admission is not None and admission.mode == "token_in":
+                    capture_prefix_token_ids = await asyncio.to_thread(
+                        worker_self._resolve_admission_prefix, admission
+                    )
+                    worker_self._enter_request_prefix(request, capture_prefix_token_ids)
+
+                has_prefix = (
+                    getattr(request, "required_prefix_token_ids", None) is not None
+                )
+                # The non-legacy modes reuse the echoed prefix verbatim and
+                # take the splice boundary from a second render of the
+                # conversation through the last assistant turn; both are only
+                # valid when the last assistant message produced the prefix.
+                # Anything else takes the legacy splice.
+                fast_splice = (
+                    has_prefix
+                    and splice_mode in ("incremental", "verify")
+                    and _prefix_belongs_to_last_assistant(messages, admission)
+                )
+                incremental = None
+                splice_token = None
+                if fast_splice:
+                    incremental = _IncrementalSplice(
+                        model_prefix_token_ids=list(request.required_prefix_token_ids),
+                        verify=splice_mode == "verify",
+                    )
+                    splice_token = _INCREMENTAL_SPLICE.set(incremental)
 
                 try:
                     res = await super().preprocess_chat(
@@ -890,28 +1114,11 @@ class VllmAsyncGenerationWorkerImpl(
                             "Prompt exceeds max_model_len: %s", e
                         )
                     raise
+                finally:
+                    if splice_token is not None:
+                        _INCREMENTAL_SPLICE.reset(splice_token)
 
-                # Token capture: build the admission once, before branching,
-                # and resolve its prefix from it (staging_chain -> cached TQ
-                # read, inline ids, or nothing for a text root). The
-                # ``ng_capture`` dict is never mutated. Off-loop: the chain
-                # fetch is a blocking TQ read, and Gym's staging protocol
-                # requires the serving host to move blocking staging I/O off
-                # its event loop explicitly. The adapter then attaches the
-                # prefix to the request, so the inline-prefix branch below is
-                # the single splice path for staged and inline prefixes.
-                admission = worker_self._capture_admission(request)
-                capture_prefix_token_ids: list[int] | None = None
-                if admission is not None and admission.mode == "token_in":
-                    capture_prefix_token_ids = await asyncio.to_thread(
-                        worker_self._resolve_admission_prefix, admission
-                    )
-                    worker_self._enter_request_prefix(request, capture_prefix_token_ids)
-
-                if (
-                    not hasattr(request, "required_prefix_token_ids")
-                    or request.required_prefix_token_ids is None
-                ):
+                if not has_prefix:
                     # Clamp the request's max output tokens so that input + output <= max_model_len.
                     if actual_request_max_tokens is not None:
                         self._clamp_max_tokens(
@@ -927,8 +1134,11 @@ class VllmAsyncGenerationWorkerImpl(
                     return res
 
                 model_prefix_token_ids = list(request.required_prefix_token_ids)
+                engine_prompt = res[1][0]
 
-                # Token-in splice path — shared by staging_chain and direct prefix.
+                # The legacy splice (also the verify reference and the
+                # fallback) renders the messages up to the last assistant turn
+                # a second time to count its EOS tokens.
                 last_assistant_message_idx = None
                 for i in reversed(range(len(messages_for_replace_prefix_tokens))):
                     if messages_for_replace_prefix_tokens[i]["role"] == "assistant":
@@ -950,28 +1160,92 @@ class VllmAsyncGenerationWorkerImpl(
                     update={"add_generation_prompt": False}
                 )
 
-                corresponding_res = await super().preprocess_chat(
-                    request=modified_request,
-                    messages=messages_to_last_assistant_message,
-                    default_template=default_template,
-                    default_template_content_format=default_template_content_format,
-                    default_template_kwargs=default_template_kwargs,
-                    tool_dicts=tool_dicts,
-                    parser=parser,
-                    skip_mm_cache=skip_mm_cache,
+                captured = (
+                    incremental is not None and incremental.full_text is not None
                 )
-                actual_corresponding_token_ids = corresponding_res[1][0][
-                    "prompt_token_ids"
-                ]
+                if captured:
+                    # The hook recorded the full render without tokenizing it;
+                    # record the prefix render the same way.
+                    incremental.capture_prefix = True
+                    splice_token = _INCREMENTAL_SPLICE.set(incremental)
+                    try:
+                        await super().preprocess_chat(
+                            request=modified_request,
+                            messages=messages_to_last_assistant_message,
+                            default_template=default_template,
+                            default_template_content_format=default_template_content_format,
+                            default_template_kwargs=default_template_kwargs,
+                            tool_dicts=tool_dicts,
+                            parser=parser,
+                            skip_mm_cache=skip_mm_cache,
+                        )
+                    finally:
+                        _INCREMENTAL_SPLICE.reset(splice_token)
+                    captured = incremental.prefix_text is not None
 
-                engine_prompt = res[1][0]
+                if captured:
+                    # Both renders captured: count the boundary on the prefix
+                    # text and tokenize only the turns after the model prefix.
+                    tokenizer = self.renderer.tokenizer
+                    full_text = incremental.full_text
+                    prefix_text = incremental.prefix_text
+                    verify = incremental.verify
 
-                final_prompt_token_ids = replace_prefix_tokens(
-                    tokenizer=self.renderer.tokenizer,
-                    model_prefix_token_ids=model_prefix_token_ids,
-                    template_prefix_token_ids=actual_corresponding_token_ids,
-                    template_token_ids=engine_prompt["prompt_token_ids"],
-                )
+                    def splice_from_captures():
+                        encode = lambda text: tokenizer(
+                            text, add_special_tokens=False
+                        )["input_ids"]
+                        spliced = splice_prefix_into_rendered_prompt(
+                            model_prefix_token_ids,
+                            full_text,
+                            prefix_text=prefix_text,
+                            eos_token=tokenizer.eos_token,
+                            eos_token_id=tokenizer.eos_token_id,
+                            encode=encode,
+                        )
+                        legacy = None
+                        if spliced is None or verify:
+                            legacy = replace_prefix_tokens(
+                                tokenizer=tokenizer,
+                                model_prefix_token_ids=model_prefix_token_ids,
+                                template_prefix_token_ids=encode(prefix_text),
+                                template_token_ids=encode(full_text),
+                            )
+                        return spliced, legacy
+
+                    spliced, legacy_ids = await asyncio.get_running_loop(
+                    ).run_in_executor(
+                        self.renderer._executor, splice_from_captures
+                    )
+                    if spliced is None:
+                        worker_self._record_splice_fallback("no_boundary")
+                    if verify:
+                        worker_self._record_splice_verification(legacy_ids, spliced)
+                    final_prompt_token_ids = (
+                        legacy_ids if (verify or spliced is None) else spliced
+                    )
+                else:
+                    # Legacy splice: the second render is tokenized in full.
+                    corresponding_res = await super().preprocess_chat(
+                        request=modified_request,
+                        messages=messages_to_last_assistant_message,
+                        default_template=default_template,
+                        default_template_content_format=default_template_content_format,
+                        default_template_kwargs=default_template_kwargs,
+                        tool_dicts=tool_dicts,
+                        parser=parser,
+                        skip_mm_cache=skip_mm_cache,
+                    )
+                    actual_corresponding_token_ids = corresponding_res[1][0][
+                        "prompt_token_ids"
+                    ]
+
+                    final_prompt_token_ids = replace_prefix_tokens(
+                        tokenizer=self.renderer.tokenizer,
+                        model_prefix_token_ids=model_prefix_token_ids,
+                        template_prefix_token_ids=actual_corresponding_token_ids,
+                        template_token_ids=engine_prompt["prompt_token_ids"],
+                    )
 
                 engine_prompt["prompt_token_ids"] = final_prompt_token_ids
 
@@ -981,6 +1255,20 @@ class VllmAsyncGenerationWorkerImpl(
                         request,
                         actual_request_max_tokens,
                         final_prompt_token_ids,
+                    )
+                elif len(final_prompt_token_ids) >= self.model_config.max_model_len:
+                    # No clamp when max tokens is unset, and the capture-only
+                    # tokenize path never saw the real length; check it here.
+                    message = (
+                        f"Prompt length ({len(final_prompt_token_ids)}) fills or exceeds "
+                        f"this model's maximum context length ({self.model_config.max_model_len}). "
+                        "No room for output tokens."
+                    )
+                    LOGGER.warning("Prompt exceeds max_model_len: %s", message)
+                    raise VLLMValidationError(
+                        message,
+                        parameter="input_tokens",
+                        value=len(final_prompt_token_ids),
                     )
 
                 # Token capture, token-in mode: the spliced prompt is the
@@ -1282,6 +1570,8 @@ class VllmAsyncGenerationWorkerImpl(
             # here keeps the two endpoints rendering identical prompts.
             default_chat_template_kwargs=default_chat_template_kwargs,
         )
+        if self._prefix_splice_mode in ("incremental", "verify"):
+            _install_incremental_splice_hook(engine_client.renderer)
         serving_chat_kwargs.update(
             dict(
                 engine_client=engine_client,

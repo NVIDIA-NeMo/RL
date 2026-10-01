@@ -55,6 +55,22 @@ GENERATION_LENGTH_MEAN_KEY = "vllm/generation_length_mean"
 GENERATIONS_OK_KEY = "vllm/generations_ok"
 GENERATIONS_FAILED_KEY = "vllm/generations_failed"
 
+# NeMo-RL-side splice counters. The async worker reports these cumulative
+# counts alongside the engine snapshot (they are not vLLM engine series, so
+# test_engine_metric_names_match_vllm does not cover them);
+# compute_engine_step_metrics turns them into per-step deltas.
+SPLICE_FALLBACKS_RAW = "nemo_rl:splice_fallbacks"
+SPLICE_VERIFY_REQUESTS_RAW = "nemo_rl:splice_verify_requests"
+SPLICE_VERIFY_MISMATCHES_RAW = "nemo_rl:splice_verify_mismatches"
+SPLICE_COUNTERS = (
+    SPLICE_FALLBACKS_RAW,
+    SPLICE_VERIFY_REQUESTS_RAW,
+    SPLICE_VERIFY_MISMATCHES_RAW,
+)
+SPLICE_FALLBACKS_KEY = "vllm/splice_fallbacks"
+SPLICE_VERIFY_REQUESTS_KEY = "vllm/splice_verify_requests"
+SPLICE_VERIFY_MISMATCHES_KEY = "vllm/splice_verify_mismatches"
+
 # Distinct from the driver-side ``gen_ai.*`` series, which are derived from the
 # tensors a generate() call returns: these are the engine's own accounting, and
 # the sequence-length and abort counts cannot be reconstructed driver-side at
@@ -100,6 +116,27 @@ VLLM_TEED_METRICS = (
         kind="counter",
         unit="{generation}",
         description="Generations the engine aborted rather than finished.",
+    ),
+    TeedMetric(
+        SPLICE_FALLBACKS_KEY,
+        "rl.vllm.splice_fallbacks",
+        kind="counter",
+        unit="{request}",
+        description="Requests the incremental prefix splice fell back to the legacy path.",
+    ),
+    TeedMetric(
+        SPLICE_VERIFY_REQUESTS_KEY,
+        "rl.vllm.splice_verify_requests",
+        kind="counter",
+        unit="{request}",
+        description="Requests compared against the legacy splice in verify mode.",
+    ),
+    TeedMetric(
+        SPLICE_VERIFY_MISMATCHES_KEY,
+        "rl.vllm.splice_verify_mismatches",
+        kind="counter",
+        unit="{request}",
+        description="Verify-mode requests where the incremental splice differed from legacy.",
     ),
 )
 

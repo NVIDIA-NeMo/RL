@@ -502,6 +502,10 @@ policy:
       num_last_layers_in_bf16: 0
       num_first_layers_in_bf16: 0
       enable_vllm_metrics_logger: true # Set to true to enable vLLM internal metrics logger, turn off for better performance
+      # Multi-turn prefix splice on the HTTP server: legacy (render + tokenize twice),
+      # incremental (render twice, tokenize only the new turns; boundary counted on the
+      # prefix render), verify (incremental, but serve legacy and log mismatches).
+      prefix_splice_mode: legacy
       vllm_metrics_logger_interval: 0.5 # Interval in seconds to collect vLLM logger metrics
       http_refit_api_key_env_var: null # Optional env var containing the internal refit API key.
       reset_encoder_cache_after_weight_update: false # Invalidate cached multimodal encoder outputs after a successful async refit. Only safe when generation is quiesced (grpo.async_grpo.in_flight_weight_updates=false).

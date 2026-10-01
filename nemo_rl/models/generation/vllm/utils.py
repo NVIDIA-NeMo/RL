@@ -42,6 +42,13 @@ from nemo_rl.models.generation.vllm.metric_names import (
     PROMPT_TOKEN_COUNTERS,
     PROMPT_TOKENS_KEY,
     REQUEST_SUCCESS_COUNTERS,
+    SPLICE_COUNTERS,
+    SPLICE_FALLBACKS_KEY,
+    SPLICE_FALLBACKS_RAW,
+    SPLICE_VERIFY_MISMATCHES_KEY,
+    SPLICE_VERIFY_MISMATCHES_RAW,
+    SPLICE_VERIFY_REQUESTS_KEY,
+    SPLICE_VERIFY_REQUESTS_RAW,
 )
 from nemo_rl.utils.routed_experts_codec import encode_routed_experts
 
@@ -548,6 +555,7 @@ _KEPT_COUNTER_NAMES: tuple[str, ...] = (
     + PROMPT_LENGTH_HISTOGRAMS
     + GENERATION_LENGTH_HISTOGRAMS
     + REQUEST_SUCCESS_COUNTERS
+    + SPLICE_COUNTERS
 )
 
 
@@ -692,6 +700,15 @@ def compute_engine_step_metrics(
     if saw_any:
         metrics[GENERATIONS_OK_KEY] = ok
         metrics[GENERATIONS_FAILED_KEY] = failed
+
+    for raw_name, key in (
+        (SPLICE_FALLBACKS_RAW, SPLICE_FALLBACKS_KEY),
+        (SPLICE_VERIFY_REQUESTS_RAW, SPLICE_VERIFY_REQUESTS_KEY),
+        (SPLICE_VERIFY_MISMATCHES_RAW, SPLICE_VERIFY_MISMATCHES_KEY),
+    ):
+        value = _first_delta(delta, (raw_name,))
+        if value is not None:
+            metrics[key] = value
 
     return metrics
 

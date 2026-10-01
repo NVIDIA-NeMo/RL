@@ -22,6 +22,7 @@ token-in/token-out via ``generate(input_ids)`` and never re-templates messages,
 so it has no retokenization drift to correct.
 """
 
+from collections.abc import Callable
 from typing import Any
 
 
@@ -139,3 +140,84 @@ def replace_prefix_tokens(
     return (
         model_prefix_token_ids[:model_cut_end] + template_token_ids[template_cut_start:]
     )
+
+
+def find_nth_eos_offset(rendered_prompt: str, eos_token: str, n: int) -> int | None:
+    """Return the character offset of the ``n``-th EOS string in a rendered prompt."""
+    if n < 1:
+        return None
+    offset = -1
+    for _ in range(n):
+        offset = rendered_prompt.find(eos_token, offset + 1)
+        if offset < 0:
+            return None
+    return offset
+
+
+def assert_splice_tokenizer_invariants(tokenizer: Any) -> None:
+    """Verify the tokenizer properties the prefix splice relies on.
+
+    The incremental splice counts EOS strings in rendered text where the
+    legacy splice counts EOS ids. The two agree only when the tokenizer maps
+    every occurrence of the EOS string to the EOS id (special tokens match
+    before the model) and treats it as a hard boundary (no BPE merge across
+    it). Check both once at startup against the ACTIVE backend -- a fastokens
+    shim or a stock HF fast tokenizer -- so a tokenizer that breaks the
+    invariant fails at startup rather than mis-splicing requests.
+    """
+    eos_token_id = tokenizer.eos_token_id
+    eos_token = tokenizer.eos_token
+    encode = lambda text: tokenizer(text, add_special_tokens=False)["input_ids"]
+    if encode(eos_token) != [eos_token_id]:
+        raise RuntimeError(
+            f"prefix_splice: encode(eos_token) must be [{eos_token_id}], got "
+            f"{encode(eos_token)}; the incremental splice requires the EOS string "
+            "to tokenize to exactly the EOS id (special token, not split)."
+        )
+    if encode("x" + eos_token + "y") != encode("x") + [eos_token_id] + encode("y"):
+        raise RuntimeError(
+            "prefix_splice: the EOS string is not a hard tokenization boundary "
+            "(BPE merges across it); the incremental splice requires special-token "
+            "splitting."
+        )
+
+
+def splice_prefix_into_rendered_prompt(
+    model_prefix_token_ids: list[int],
+    rendered_prompt: str,
+    *,
+    prefix_text: str,
+    eos_token: str,
+    eos_token_id: int,
+    encode: Callable[[str], list[int]],
+) -> list[int] | None:
+    """Incremental variant of :func:`replace_prefix_tokens`.
+
+    The boundary EOS count comes from ``prefix_text`` -- the chat-template
+    render of the conversation through the last assistant turn, i.e. exactly
+    the text :func:`replace_prefix_tokens` tokenizes to derive the same count.
+    Counting the rendered text rather than the model prefix ids keeps the
+    boundary correct when the model spelled the EOS token with ordinary
+    tokens: the render holds the literal string either way, the ids do not.
+
+    Only the text from the boundary EOS onward is tokenized; the exact model
+    prefix is prepended. The boundary is a special token, so tokenization does
+    not merge across it and the suffix tokens equal the corresponding slice of
+    the full tokenization. Cost is one extra template render plus the new
+    turns' tokenization, rather than two full tokenizations.
+
+    ``encode`` must tokenize without adding special tokens (no BOS). Returns
+    ``None`` when the rendered prompt has fewer EOS strings than the prefix
+    render; callers fall back to :func:`replace_prefix_tokens`.
+    """
+    if not model_prefix_token_ids:
+        return None
+    offset = find_nth_eos_offset(
+        rendered_prompt, eos_token, prefix_text.count(eos_token)
+    )
+    if offset is None:
+        return None
+    model_cut_end = len(model_prefix_token_ids)
+    if model_prefix_token_ids[-1] == eos_token_id:
+        model_cut_end -= 1
+    return model_prefix_token_ids[:model_cut_end] + encode(rendered_prompt[offset:])
