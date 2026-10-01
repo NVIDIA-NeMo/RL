@@ -13,14 +13,26 @@
 # limitations under the License.
 """The advantage stage's boundary: what it fetches and what it hands back."""
 
+import asyncio
 from collections.abc import Sequence
 from dataclasses import fields
+from types import SimpleNamespace
 
 import pytest
 import torch
+from tensordict import TensorDict
 
+from nemo_rl.algorithms.advantage_estimator import (
+    AdvEstimatorConfig,
+    GRPOAdvantageEstimator,
+    OPDAdvantageEstimator,
+)
+from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
+from nemo_rl.algorithms.grpo import GRPOConfig
+from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     SHARD_INVARIANT_ESTIMATORS,
+    AdvantageComputer,
     AdvantageOutcome,
     AdvantageRequest,
     AdvantageStageConfig,
@@ -32,6 +44,7 @@ from nemo_rl.algorithms.single_controller_utils.config import AdvantageConfig
 from nemo_rl.algorithms.single_controller_utils.utils import (
     AdvantagePartial,
     RewardPartial,
+    reduce_advantage_pump_metrics,
 )
 from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
 from nemo_rl.data_plane import KVBatchMeta
@@ -436,9 +449,9 @@ def test_rpc_dataclass_fields_are_classified() -> None:
     """A new field on either RPC dataclass must be a deliberate choice.
 
     assert_metadata_only cannot tell a heavy list[int] of token ids from a short
-    list of metadata, so FORBIDDEN_RPC_KEYS is maintained by hand. Pinning the
-    inventory makes a new field fail here until someone decides whether it is
-    light enough to cross the wire.
+    list of metadata, so FORBIDDEN_RPC_KEYS only covers the names it knows.
+    Pinning the inventory makes a new field fail here until someone decides
+    whether it is light enough to cross the wire.
     """
     assert {f.name for f in fields(AdvantageRequest)} == {"meta"}
     assert {f.name for f in fields(AdvantageOutcome)} == {
@@ -454,3 +467,222 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "opd_stat_sumsq",
         "opd_stat_count",
     }
+
+
+# ── The pool against the in-process path ─────────────────────────────────
+#
+# Everything above tests the stage's boundary in isolation. These drive the
+# controller's own _advantage_stage so the sharded pool and the in-process
+# path are compared on the one thing that matters: identical advantages,
+# metrics and writeback. A split that cut a prompt group in half passes every
+# test above.
+
+NUM_GROUPS, GROUP_SIZE, SEQ = 6, 4, 5
+
+
+class _RowStore:
+    """In-memory DataPlane keyed by sample id, so shards read and write their own rows."""
+
+    def __init__(self, rows: dict[str, dict[str, torch.Tensor]]) -> None:
+        self.rows = rows
+
+    def get_samples(self, *, sample_ids, select_fields, **kwargs) -> TensorDict:
+        return TensorDict(
+            {
+                name: torch.stack([self.rows[sid][name] for sid in sample_ids])
+                for name in select_fields
+            },
+            batch_size=[len(sample_ids)],
+        )
+
+    def put_samples(self, *, sample_ids, fields, **kwargs) -> None:
+        for row, sid in enumerate(sample_ids):
+            for name in fields.keys():
+                self.rows[sid][name] = fields[name][row].clone()
+
+
+def _rows() -> dict[str, dict[str, torch.Tensor]]:
+    """One distinct prompt group per NUM_GROUPS, with varied rewards.
+
+    Rewards have to vary inside a group and across groups, or a mis-cut shard
+    would still produce the same baseline and the comparison would pass.
+    """
+    gen = torch.Generator().manual_seed(0)
+    rows: dict[str, dict[str, torch.Tensor]] = {}
+    for group in range(NUM_GROUPS):
+        for member in range(GROUP_SIZE):
+            rows[f"s{group * GROUP_SIZE + member}"] = {
+                "total_reward": torch.rand((), generator=gen).round(),
+                "token_mask": torch.ones(SEQ),
+                "sample_mask": torch.tensor(1.0),
+                "mask_sample": torch.tensor(False),
+                "truncated": torch.tensor(False),
+                "prev_logprobs": -torch.rand(SEQ, generator=gen),
+                "generation_logprobs": -torch.rand(SEQ, generator=gen),
+                "teacher_reference_logprobs": -torch.rand(SEQ, generator=gen),
+            }
+    return rows
+
+
+def _pool_meta() -> KVBatchMeta:
+    """NUM_GROUPS contiguous whole groups, each tagged with its own group id."""
+    return KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=[f"s{i}" for i in range(NUM_GROUPS * GROUP_SIZE)],
+        fields=["total_reward"],
+        tags=[
+            {"weight_version": 0, GROUP_ID_TAG: f"group-{i // GROUP_SIZE}"}
+            for i in range(NUM_GROUPS * GROUP_SIZE)
+        ],
+    )
+
+
+class _InlineActor:
+    """Stands in for an AdvantageActor handle: ``run.remote`` returns an awaitable.
+
+    Runs the computer in this process rather than mocking it, so the shard
+    really does read and write its own rows through the shared store.
+    """
+
+    def __init__(self, computer: AdvantageComputer, *, fail: bool = False) -> None:
+        self.calls: list[int] = []
+
+        async def _run(request: AdvantageRequest) -> AdvantageOutcome:
+            self.calls.append(len(request.meta.sample_ids))
+            if fail:
+                raise RuntimeError("actor died")
+            # The real boundary is Ray, which these tests bypass; assert the
+            # metadata-only contract here so bypassing it proves nothing less.
+            assert_metadata_only(request)
+            outcome = await computer.run(request)
+            assert_metadata_only(outcome)
+            return outcome
+
+        self.run = SimpleNamespace(remote=_run)
+
+
+def _controller(
+    estimator_name: str, num_actors: int, store: _RowStore, *, fail: bool = False
+):
+    """Build the controller stub _advantage_stage needs, and nothing more.
+
+    Every attribute assigned here is one the stage path actually reads -- the
+    set is enumerated from the source rather than guessed, because the two
+    previous versions of these stubs each shipped missing one.
+    """
+    algo = GRPOConfig(
+        num_generations_per_prompt=GROUP_SIZE,
+        adv_estimator=AdvEstimatorConfig(name=estimator_name),
+        seq_logprob_error_threshold=None,
+    )
+    is_opd = estimator_name == "opd"
+    estimator = (
+        OPDAdvantageEstimator({"name": "opd"}, None)
+        if is_opd
+        # Deliberately a GRPO estimator for every other name: these tests read
+        # `shardable` and the call distribution, never the numerics of an
+        # estimator whose own constructor needs a real loss config.
+        else GRPOAdvantageEstimator(algo.adv_estimator, None)
+    )
+    config = AdvantageStageConfig(
+        advantage=AdvantageConfig(),
+        algo=algo,
+        is_ppo=False,
+        policy_logprobs_required=is_opd,
+        reference_logprobs_required=False,
+        teacher_logprobs_required=is_opd,
+        message_level_advantage_penalties_enabled=False,
+        shardable=estimator_name in SHARD_INVARIANT_ESTIMATORS,
+    )
+    ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
+    ctrl._advantage_estimator = estimator
+    ctrl._advantage_stage_config = config
+    ctrl._advantage_computer = AdvantageComputer(
+        store, config=config, advantage_estimator=estimator
+    )
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+    ctrl._advantage_actors = [
+        _InlineActor(
+            AdvantageComputer(store, config=config, advantage_estimator=estimator),
+            fail=fail,
+        )
+        for _ in range(num_actors)
+    ]
+    ctrl._available_advantage_actors = asyncio.Queue()
+    for actor in ctrl._advantage_actors:
+        ctrl._available_advantage_actors.put_nowait(actor)
+    ctrl._opd_stat_sum = ctrl._opd_stat_sumsq = 0.0
+    ctrl._opd_stat_count = 0
+    ctrl._step_log_dict = {
+        "reward_partials": [],
+        "advantage_partials": [],
+        "num_mask_sample_filtered": [],
+        "seq_logprob_error_metrics": [],
+    }
+    return ctrl
+
+
+def _run(estimator_name: str, num_actors: int):
+    """Drive one advantage stage and return everything the step close reads."""
+    store = _RowStore(_rows())
+    ctrl = _controller(estimator_name, num_actors, store)
+    _, has_valid = asyncio.run(ctrl._advantage_stage(_pool_meta()))
+    advantages = torch.stack(
+        [store.rows[f"s{i}"]["advantages"] for i in range(NUM_GROUPS * GROUP_SIZE)]
+    )
+    metrics = reduce_advantage_pump_metrics(
+        reward_partials=ctrl._step_log_dict["reward_partials"],
+        advantage_partials=ctrl._step_log_dict["advantage_partials"],
+        sequence_lengths=[],
+        num_mask_sample_filtered=ctrl._step_log_dict["num_mask_sample_filtered"],
+        # opd turns these on; they reduce count-weighted across calls, so a
+        # shard that got them wrong would only show up here.
+        seq_logprob_error_metrics=ctrl._step_log_dict["seq_logprob_error_metrics"],
+    )
+    opd = (ctrl._opd_stat_sum, ctrl._opd_stat_sumsq, ctrl._opd_stat_count)
+    return ctrl, advantages, metrics, has_valid, opd
+
+
+@pytest.mark.parametrize("estimator_name", sorted(SHARD_INVARIANT_ESTIMATORS))
+def test_sharded_pool_matches_in_process(estimator_name: str) -> None:
+    """num_advantage_workers=3 must write and log what the in-process path does.
+
+    Exactly, for every row -- that is what SHARD_INVARIANT_ESTIMATORS claims,
+    and nothing else in this file checks it end to end. It holds for groups
+    that share prompt text too, now that the baseline keys on GROUP_ID_TAG
+    rather than on the prompt tokens.
+    """
+    _, adv_local, metrics_local, valid_local, opd_local = _run(estimator_name, 0)
+    ctrl, adv_pool, metrics_pool, valid_pool, opd_pool = _run(estimator_name, 3)
+    # 6 groups over 3 actors: every actor got exactly 2 whole groups.
+    assert [actor.calls for actor in ctrl._advantage_actors] == [[8], [8], [8]]
+    torch.testing.assert_close(adv_pool, adv_local)
+    assert metrics_pool == pytest.approx(metrics_local)
+    assert valid_pool == valid_local
+    assert opd_pool == pytest.approx(opd_local)
+
+
+def test_unshardable_estimator_sends_the_whole_batch_to_one_actor() -> None:
+    """A pool buys concurrency across calls, never a split, when shardable is False."""
+    store = _RowStore(_rows())
+    ctrl = _controller("reinforce_plus_plus", 3, store)
+    asyncio.run(ctrl._advantage_stage(_pool_meta()))
+    assert sorted(len(actor.calls) for actor in ctrl._advantage_actors) == [0, 0, 1]
+    assert [call for actor in ctrl._advantage_actors for call in actor.calls] == [
+        NUM_GROUPS * GROUP_SIZE
+    ]
+
+
+def test_failed_actor_rpc_raises_and_retires_the_actor(capsys) -> None:
+    """A half-finished writeback cannot be retried, so the actor is not reused."""
+    store = _RowStore(_rows())
+    ctrl = _controller("grpo", 1, store, fail=True)
+    with pytest.raises(RuntimeError, match="actor died"):
+        asyncio.run(ctrl._advantage_stage(_pool_meta()))
+    assert "FATAL: advantage actor RPC failed" in capsys.readouterr().out
+    # Not handed back: a later step must not reuse an actor whose writeback is
+    # unknown.
+    assert ctrl._available_advantage_actors.qsize() == 0
+    # The mutation cut is released even on failure.
+    assert ctrl._data_plane_checkpoint_barrier.mutation_version == 1
