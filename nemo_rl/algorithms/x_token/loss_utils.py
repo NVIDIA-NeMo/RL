@@ -353,19 +353,15 @@ def student_next_token_ce(
     logits: torch.Tensor,
     *,
     input_ids: torch.Tensor,
-    seq_index: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Per-token next-token cross-entropy ``[B, T-1]`` on the student.
 
-    DTensor (TP/CP) logits route through the vocab-parallel log-prob helper
-    (which also handles the CP roll); plain logits use a local shifted
-    ``cross_entropy``. The next-token shift (drop the last predictor) matches the
-    convention the KL terms use.
+    DTensor (TP) logits route through the vocab-parallel log-prob helper; plain
+    logits use a local shifted ``cross_entropy``. The next-token shift (drop the
+    last predictor) matches the convention the KL terms use.
     """
     if isinstance(logits, DTensor):
-        next_token_logprobs = get_logprobs_from_vocab_parallel_logits(
-            logits, input_ids, seq_index=seq_index
-        )
+        next_token_logprobs = get_logprobs_from_vocab_parallel_logits(logits, input_ids)
         return -next_token_logprobs
     shift_logits = logits[:, :-1].contiguous()
     shift_labels = input_ids[:, 1:].contiguous()
