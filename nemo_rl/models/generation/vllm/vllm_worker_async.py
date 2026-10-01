@@ -837,6 +837,20 @@ class VllmAsyncGenerationWorkerImpl(
         """
         state = self._capture_calls.pop(id(request), None)
         if state is None:
+            if self.token_capture is not None:
+                # Auxiliary inference calls have no capture admission or token
+                # bundle. Standalone routes violate Gym's metadata contract.
+                for choice in content.get("choices") or []:
+                    message = choice.get("message")
+                    if isinstance(message, dict) and not all(
+                        message.get(field) is not None
+                        for field in (
+                            "prompt_token_ids",
+                            "generation_token_ids",
+                            "generation_log_probs",
+                        )
+                    ):
+                        message.pop("routed_experts", None)
             return content
         call, prompt_token_ids = state.call, state.prompt_token_ids
         payload = dict(content)
