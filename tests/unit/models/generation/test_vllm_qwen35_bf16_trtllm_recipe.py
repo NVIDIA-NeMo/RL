@@ -27,7 +27,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[4]
 RECIPE_NAME = "grpo-qwen3.5-35ba3b-6n4g-async-1off-bf16-trtllm.yaml"
 TEXT_RECIPE_NAMES = (
     RECIPE_NAME,
+    "grpo-qwen3.5-9b-1n8g-megatron.yaml",
+    "grpo-qwen3.5-9b-1n8g-megatron-fp8.yaml",
     "grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2-fp8.yaml",
+    "grpo-qwen3.5-397ba17b-32n8g-megatron.v2.yaml",
 )
 
 
