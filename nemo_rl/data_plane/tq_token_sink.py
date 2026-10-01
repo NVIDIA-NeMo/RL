@@ -52,6 +52,7 @@ if TYPE_CHECKING:
     )
 
 from nemo_rl.data_plane.schema import (
+    PER_TOKEN_STAGING_FIELDS,
     ROUTE_ENCODING_ENVELOPE,
     ROUTE_ENCODING_LIST,
     ROUTE_ENCODING_NONE,
@@ -69,9 +70,7 @@ from nemo_rl.experience.route_assembly import RouteFragment
 # optional field Gym adds that this sink never stages will default identically
 # on both sides and pass that check silently.
 STAGING_FIELDS = [
-    "token_ids_delta",
-    "token_mask_delta",
-    "generation_logprobs_delta",
+    *PER_TOKEN_STAGING_FIELDS,
     "schema_version",
     "digest_version",
     "extras_digest_version",

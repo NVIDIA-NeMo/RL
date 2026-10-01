@@ -26,26 +26,40 @@ from typing import Any
 
 import torch
 
+from nemo_rl.data_plane.column_io import TOKEN_ALIGNED_FIELDS
+from nemo_rl.data_plane.schema import PER_TOKEN_STAGING_FIELDS
+
 # Field names whose values are per-token and therefore large, but whose Python
 # type is indistinguishable from metadata -- a list[int] of token ids looks just
 # like a short list of ids. assert_metadata_only() below already rejects tensors
-# and unrecognised types; this list is only for heavy values that would otherwise
-# pass it. Add a name here whenever a new per-token field could reach an RPC
-# boundary, and update the dataclass inventory test that guards this file.
-FORBIDDEN_RPC_KEYS = frozenset(
-    {
-        "input_ids",
-        "token_ids",
-        "token_ids_delta",
-        "token_mask",
-        "token_mask_delta",
-        "generation_logprobs",
-        "generation_logprobs_delta",
-        "generation_log_probs_delta",
-        "logprobs",
-        "logprobs_delta",
-        "routed_experts",
-    }
+# and unrecognised types; this set is only for heavy values that would otherwise
+# pass it.
+#
+# Built from the lists that own these names so a column added to the codec or
+# to the staging sink cannot escape the guard, which is how the hand-kept
+# version came to be missing prev_logprobs, advantages and the rest of what the
+# advantage actor reads and writes. Only names with no owning list are spelled
+# out below. Widening is safe because nothing crossing these RPCs is keyed by a
+# column name: row tags carry weight_version, prompt_idx, GROUP_ID_TAG,
+# violation counts and row_shapes_key(...) names, and extra_info carries
+# padding and micro-batch keys.
+FORBIDDEN_RPC_KEYS = (
+    TOKEN_ALIGNED_FIELDS
+    | frozenset(PER_TOKEN_STAGING_FIELDS)
+    | frozenset(
+        {
+            "token_ids",  # message-log key (payload.py)
+            # Gym's spelling of generation_logprobs_delta. nemo_gym is not
+            # installed on the driver and cannot be imported here, so
+            # test_forbidden_keys_cover_gym_staging_fields pins it in the Gym
+            # lane instead.
+            "generation_log_probs_delta",
+            # The generation backends' spelling (rollouts.py, worker_mixin.py).
+            # No DataPlane column owns it, but the value it names is still a
+            # per-token float list.
+            "logprobs",
+        }
+    )
 )
 
 

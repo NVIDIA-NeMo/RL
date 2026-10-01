@@ -35,6 +35,16 @@ ROLLOUT_METRICS = "rollout_metrics"
 # prompt tokens, which two distinct groups can share.
 GROUP_ID_TAG = "group_id"
 
+# The per-token members of `tq_token_sink.STAGING_FIELDS` (Gym's
+# `StagedCallRecord` deltas, under the names `stage()` renames them to). Named
+# here rather than inside the sink so `nemo_rl.utils.rpc_guard` can build its
+# forbidden-key set from the list that owns these names instead of a copy.
+PER_TOKEN_STAGING_FIELDS = (
+    "token_ids_delta",
+    "token_mask_delta",
+    "generation_logprobs_delta",
+)
+
 # Skeleton field names from `shard_meta_for_dp`.
 INPUT_IDS = "input_ids"
 INPUT_LENGTHS = "input_lengths"
