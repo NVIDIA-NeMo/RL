@@ -77,9 +77,9 @@ ALLOWED_ADDITIONAL_CONFIG_KEYS = ["policy.draft", "policy.generation.vllm_kwargs
 #   "NeMo RL Weekly Release Tests"   0 4 * * 6  -> release(_gb200)
 #   "NeMo RL Weekly Perf Tests"      0 4 * * 6  -> performance(_gb200)
 #
-# The nightly_mcore lanes are deliberately absent. They are subsets of the
-# nightly lanes, so bounding nightly bounds them transitively; giving them their
-# own ceiling would mean two numbers to retune every time a nightly test lands.
+# The nightly_mcore lanes are deliberately absent: they run when a Megatron-Core
+# or Megatron-Bridge bump triggers them, not on a weekly schedule. Apart from the
+# megatron_generation -quick smoke legs, every entry also runs in a nightly lane.
 #
 # Budgets are per SKU because H100 and GB200 capacity are separate pools. A
 # ceiling is current usage plus `suggested_room`, rounded up to the next 100.
