@@ -44,6 +44,10 @@ policy:
     moe_token_dispatcher_type: allgather
     apply_rope_fusion: false
     defer_fp32_logits: true
+    freeze_config:
+      freeze_vision_model: true
+      freeze_vision_projection: true
+      freeze_language_model: false
     optimizer:
       lr: 1.0e-06
       min_lr: 1.0e-06
