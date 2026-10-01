@@ -1043,6 +1043,7 @@ def setup(
             enable_router_replay=router_replay_enabled(policy_config),
             use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
             policy_api_key=policy_api_key,
+            turn_checkpointing_enabled=False,
         )
         train_splits = (
             {f"train[{name}]": split for name, split in dataset.items()}

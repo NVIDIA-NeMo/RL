@@ -67,6 +67,7 @@ _GROUP_STATE_FIELDS = frozenset(
         "task_source",
         "resolved_agent_name",
         "recovery_granularity",
+        "restore_level",
         "expected_generations",
         "target_step",
         "start_weight_version",
@@ -113,8 +114,16 @@ class PromptGroupPhase(StrEnum):
 
 
 class RecoveryGranularity(StrEnum):
-    """Unit of completed work reused after a live failure or process restart."""
+    """Unit retried after a live rollout failure."""
 
+    SIBLING = "sibling"
+    PROMPT_GROUP = "prompt_group"
+
+
+class RecoveryTargetLevel(StrEnum):
+    """Finest requested restart boundary for an unfinished rollout."""
+
+    TURN = "turn"
     SIBLING = "sibling"
     PROMPT_GROUP = "prompt_group"
 
@@ -227,6 +236,7 @@ class PromptGroupRecoveryRecord:
     prompt_ref: PromptRef
     task_source: Optional[str]
     recovery_granularity: RecoveryGranularity
+    restore_level: RecoveryTargetLevel
     runtime_prompt_payload: Optional[DatumSpec]
     expected_generations: int
     target_step: Optional[int]
@@ -358,6 +368,7 @@ class RolloutRecoveryLedger:
         start_weight_version: int,
         task_source: Optional[str] = None,
         recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
+        restore_level: Optional[RecoveryTargetLevel] = None,
         admitted: bool = True,
         group_id: Optional[str] = None,
         admission_id: Optional[str] = None,
@@ -385,6 +396,12 @@ class RolloutRecoveryLedger:
         admission_id = admission_id or group_id
         if not admission_id:
             raise ValueError("admission_id must not be empty")
+        if restore_level is None:
+            restore_level = (
+                RecoveryTargetLevel.PROMPT_GROUP
+                if recovery_granularity is RecoveryGranularity.PROMPT_GROUP
+                else RecoveryTargetLevel.SIBLING
+            )
 
         siblings = []
         for generation_index in range(expected_generations):
@@ -401,6 +418,7 @@ class RolloutRecoveryLedger:
             prompt_ref=prompt_ref,
             task_source=task_source,
             recovery_granularity=recovery_granularity,
+            restore_level=restore_level,
             # Retain the immutable dataloader sample by reference instead of copying
             # a potentially 131k-token payload. This cache is never serialized and
             # is released as soon as canonical rows take over recovery ownership.
@@ -920,6 +938,7 @@ class RolloutRecoveryLedger:
                     "task_source": record.task_source,
                     "resolved_agent_name": record.resolved_agent_name,
                     "recovery_granularity": record.recovery_granularity.value,
+                    "restore_level": record.restore_level.value,
                     "expected_generations": record.expected_generations,
                     "target_step": record.target_step,
                     "start_weight_version": record.start_weight_version,
@@ -1041,6 +1060,7 @@ class RolloutRecoveryLedger:
         task_source = raw_group.get("task_source")
         resolved_agent_name = raw_group.get("resolved_agent_name")
         raw_recovery_granularity = raw_group.get("recovery_granularity")
+        raw_restore_level = raw_group.get("restore_level")
         expected_generations = raw_group.get("expected_generations")
         siblings_state = raw_group.get("siblings")
         if not isinstance(group_id, str) or not group_id:
@@ -1063,6 +1083,12 @@ class RolloutRecoveryLedger:
             raise ValueError(
                 f"invalid recovery_granularity={raw_recovery_granularity!r}"
             ) from error
+        if not isinstance(raw_restore_level, str):
+            raise ValueError("restore_level must be a string")
+        try:
+            restore_level = RecoveryTargetLevel(raw_restore_level)
+        except ValueError as error:
+            raise ValueError(f"invalid restore_level={raw_restore_level!r}") from error
         if not isinstance(expected_generations, int) or expected_generations < 1:
             raise ValueError("expected_generations must be a positive integer")
         if (
@@ -1247,6 +1273,7 @@ class RolloutRecoveryLedger:
             prompt_ref=PromptRef(sample_id=sample_id, task_name=task_name),
             task_source=task_source,
             recovery_granularity=recovery_granularity,
+            restore_level=restore_level,
             runtime_prompt_payload=None,
             expected_generations=expected_generations,
             target_step=target_step,
