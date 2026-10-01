@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import glob
+import math
 import os
-import re
 import subprocess
 from pathlib import Path
 
@@ -81,23 +81,48 @@ ALLOWED_ADDITIONAL_CONFIG_KEYS = ["policy.draft", "policy.generation.vllm_kwargs
 # nightly lanes, so bounding nightly bounds them transitively; giving them their
 # own ceiling would mean two numbers to retune every time a nightly test lands.
 #
-# Budgets are per SKU because H100 and GB200 capacity are separate pools and
-# cannot be traded against one another. Ceilings sit roughly 15% above current
-# usage so that a legitimate new test has somewhere to land; if a lane is at its
-# ceiling the right response is to retire a test, not to raise the number.
+# Budgets are per SKU because H100 and GB200 capacity are separate pools. A
+# ceiling is current usage plus `suggested_room`, rounded up to the next 100.
+# The GB200 rooms are half their H100 twin: a node there is 4 GPUs, not 8, so the
+# same test costs half the GPU-hours. A lane going over is a prompt to re-derive
+# its ceiling with the same formula, not to pick a round number.
 #
-# The nightly, release and release_gb200 ceilings currently carry five recipes
-# that exist to back user guides (the DAPO guide, the audio and audio-visual
-# guides, and the README model table) rather than to catch regressions. Once
-# those can be marked as documentation-only and stop running, roughly 1,300
-# GPU-hours/week leaves these three lanes and their ceilings should come down.
+# The nightly, release and release_gb200 ceilings carry recipes that exist to
+# back user guides -- the DAPO and Muon guides, the audio and audio-visual
+# guides, and the README model table -- rather than to catch regressions. Once
+# those can be marked as documentation-only and stop running, these three lanes
+# can come down further.
 SUITE_BUDGETS = {
-    ("nightly", "h100"): {"runs_per_week": 7, "max_gpu_hours_per_week": 26_500},
-    ("nightly", "gb200"): {"runs_per_week": 7, "max_gpu_hours_per_week": 2_600},
-    ("release", "h100"): {"runs_per_week": 1, "max_gpu_hours_per_week": 7_400},
-    ("release", "gb200"): {"runs_per_week": 1, "max_gpu_hours_per_week": 3_100},
-    ("performance", "h100"): {"runs_per_week": 1, "max_gpu_hours_per_week": 13_800},
-    ("performance", "gb200"): {"runs_per_week": 1, "max_gpu_hours_per_week": 4_800},
+    ("nightly", "h100"): {
+        "runs_per_week": 7,
+        "max_gpu_hours_per_week": 29_700,
+        "suggested_room": 224,  # 32 GPU-hours x 7 runs
+    },
+    ("nightly", "gb200"): {
+        "runs_per_week": 7,
+        "max_gpu_hours_per_week": 6_300,
+        "suggested_room": 112,  # 16 GPU-hours x 7 runs
+    },
+    ("release", "h100"): {
+        "runs_per_week": 1,
+        "max_gpu_hours_per_week": 9_600,
+        "suggested_room": 128,  # 128 GPU-hours x 1 run
+    },
+    ("release", "gb200"): {
+        "runs_per_week": 1,
+        "max_gpu_hours_per_week": 2_800,
+        "suggested_room": 64,  # 64 GPU-hours x 1 run
+    },
+    ("performance", "h100"): {
+        "runs_per_week": 1,
+        "max_gpu_hours_per_week": 12_100,
+        "suggested_room": 128,  # 128 GPU-hours x 1 run
+    },
+    ("performance", "gb200"): {
+        "runs_per_week": 1,
+        "max_gpu_hours_per_week": 6_700,
+        "suggested_room": 64,  # 64 GPU-hours x 1 run
+    },
 }
 
 
@@ -337,26 +362,15 @@ def test_suite_weekly_gpu_hours_within_budget(suite, sku, tracker):
     tracker.track(f"gpu_hours_per_week_{suite}_{sku}", per_week)
 
     if per_week > budget["max_gpu_hours_per_week"]:
-        # Surface the most expensive tests so the author can see what to trade
-        # away, rather than only being told the lane is full.
-        costs = sorted(
-            (
-                (int(hours), script)
-                for hours, script in re.findall(
-                    r"^\[INFO\]: (\d+) GPUhrs to run (\S+)$", result.stdout, re.M
-                )
-            ),
-            reverse=True,
-        )
-        worst = "\n".join(
-            f"  {hours:>6} GPU-h/run  {script}" for hours, script in costs[:10]
-        )
+        room = budget["suggested_room"]
+        rebaselined = int(math.ceil((per_week + room) / 100) * 100)
         raise AssertionError(
             f"{suite} ({sku}) needs {per_week:.0f} GPU-hours/week "
-            f"({per_run:.0f} per run x {budget['runs_per_week']} runs/week), over its "
-            f"{budget['max_gpu_hours_per_week']} budget.\n"
-            f"Retire or shrink a test rather than raising the budget. "
-            f"Most expensive tests in this lane:\n{worst}"
+            f"({per_run:.0f} per run x {budget['runs_per_week']} runs/week), "
+            f"over its {budget['max_gpu_hours_per_week']} budget.\n"
+            f"Set max_gpu_hours_per_week to {rebaselined} "
+            f"(usage + {room} room, rounded up to the next 100), "
+            f"or shrink the test you are adding to fit under the current ceiling."
         )
 
 
