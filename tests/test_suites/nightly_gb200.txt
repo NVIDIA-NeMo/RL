@@ -5,8 +5,6 @@
 # Short 1N/1B runs (go past 200 steps - usually divergence happens by now) -- going to 4 nodes doesn't help that much
 tests/test_suites/llm/grpo-qwen2.5-math-1.5b-instruct-1n4g-fsdp2tp1.v3.sh
 
-# Dtensor (Qwen/Qwen2.5-7B-Instruct)
-
 # Megatron
 tests/test_suites/llm/grpo-llama3.2-1b-instruct-1n4g-megatron.sh
 tests/test_suites/llm/grpo-qwen3-1.7b-1n4g-megatron-eagle3.sh
@@ -43,8 +41,6 @@ tests/test_suites/llm/grpo-deepscaler-1.5b-1n4g-8K.sh
 # Non-colocated
 tests/test_suites/llm/grpo-llama3.1-8b-instruct-2n4g-fsdp2tp1-noncolocated.sh
 
-# Nano-v2
-
 # Nemotron 3 Super 120B-A12B
 tests/test_suites/llm/grpo-nemotron3-super-120BA12B-8n4g-megatron.sh
 
@@ -58,13 +54,6 @@ tests/test_suites/llm/grpo-qwen2.5-math-1.5b-instruct-1n4g-megatron_generation-s
 # SFT #
 #######
 
-# 1N 1B/8B runs
-
-# Megatron
-# validate TP/DP
-
-# gpt-oss 20b DeepEP test
-
 # Nemotron 3 Nano 30B A3B Base BF16 tests
 tests/test_suites/llm/sft-nanov3-30BA3B-2n4g-fsdp2.sh
 tests/test_suites/llm/sft-nanov3-30BA3B-2n4g-fsdp2-lora.sh
@@ -72,8 +61,6 @@ tests/test_suites/llm/sft-nanov3-30BA3B-2n4g-fsdp2-lora.sh
 #######
 # DPO #
 #######
-
-# 1N dtensor
 
 # Short dtensor + automodel EP
 tests/test_suites/llm/dpo-nanov3-30B3AB-1n4g-fsdp4ep4-automodel.sh
