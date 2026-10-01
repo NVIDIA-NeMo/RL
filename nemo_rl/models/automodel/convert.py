@@ -34,18 +34,20 @@ def convert_dcp_to_hf(
     and using this utility to convert to HF format.
 
     Args:
-        dcp_ckpt_path (str): Path to DCP checkpoint
-        hf_ckpt_path (str): Path to save HF checkpoint
-        model_name_or_path (str): Model name or path for config
-        tokenizer_name_or_path (str, optional): Tokenizer name or path.
-                                               Defaults to model_name_or_path if None.
-        overwrite (bool, optional): Whether to overwrite existing checkpoint. Defaults to False.
+        dcp_ckpt_path: Checkpoint dir that contains model/, for example
+            step_N/policy/weights. The DCP shards are read from <dcp_ckpt_path>/model.
+        hf_ckpt_path: Path to save HF checkpoint.
+        model_name_or_path: Model name or path for config.
+        tokenizer_name_or_path: Tokenizer name or path.
+        overwrite: Whether to overwrite existing checkpoint. Defaults to False.
+        hf_overrides: Extra keyword arguments forwarded to AutoConfig.from_pretrained.
 
     Returns:
-        str: Path to the saved HF checkpoint
+        Path to the saved HF checkpoint.
 
     Raises:
-        FileExistsError: If HF checkpoint already exists and overwrite is False
+        FileExistsError: If HF checkpoint already exists and overwrite is False.
+        FileNotFoundError: If <dcp_ckpt_path>/model/.metadata does not exist.
     """
     # Checkpoints are written at <ckpt_dir>/model. Check the input before creating
     # the output dir, so a bad path does not leave an empty dir that blocks a rerun.
