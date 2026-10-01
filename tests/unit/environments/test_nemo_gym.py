@@ -1187,6 +1187,13 @@ example_multi_step_simple_agent:
       model_server:
         type: responses_api_models
         name: openai_model
+example_multi_step_environment_server:
+  environment_servers:
+    legacy_agent:
+      entrypoint: app.py
+      agent_server:
+        type: responses_api_agents
+        name: example_multi_step_simple_agent
 openai_model:
   responses_api_models:
     vllm_model:
