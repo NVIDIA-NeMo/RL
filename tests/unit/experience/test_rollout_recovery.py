@@ -548,16 +548,24 @@ def test_recovery_config_rejects_malformed_prompt_identity(
 
 
 @pytest.mark.parametrize(
+    "target_level", [RecoveryTargetLevel.TURN, RecoveryTargetLevel.PREFIX]
+)
+@pytest.mark.parametrize(
     "overrides",
     [
         {"task_source_target_level_overrides": {"genrm_compare": "prompt_group"}},
         {"agent_target_level_overrides": {"genrm_agent": "prompt_group"}},
+        {"task_source_target_level_overrides": {"restart-call": "turn"}},
     ],
 )
-def test_turn_recovery_rejects_target_overrides(overrides: dict[str, Any]) -> None:
+def test_gym_state_recovery_rejects_target_overrides(
+    target_level: RecoveryTargetLevel, overrides: dict[str, Any]
+) -> None:
     """A coarser route on a checkpointing Gym would fall outside the commit scope."""
-    with pytest.raises(ValueError, match="not supported with target_level='turn'"):
-        RolloutRecoveryConfig(target_level=RecoveryTargetLevel.TURN, **overrides)
+    with pytest.raises(
+        ValueError, match=f"not supported with target_level='{target_level.value}'"
+    ):
+        RolloutRecoveryConfig(target_level=target_level, **overrides)
 
 
 @pytest.mark.parametrize("timeout_s", [0.0, -1.0])
@@ -816,7 +824,12 @@ def test_restart_preserves_sealed_sibling_and_retries_only_interrupted_one() -> 
     assert retry.siblings[1].current_attempt.status is RolloutAttemptStatus.RESERVED
 
 
-def test_turn_restart_preserves_sealed_sibling_and_restores_other_from_gym() -> None:
+@pytest.mark.parametrize(
+    "restore_level", [RecoveryTargetLevel.PREFIX, RecoveryTargetLevel.TURN]
+)
+def test_gym_state_restart_preserves_sealed_sibling_and_restores_other_from_gym(
+    restore_level: RecoveryTargetLevel,
+) -> None:
     ledger = RolloutRecoveryLedger()
     group = _reserve(
         ledger,
@@ -827,7 +840,7 @@ def test_turn_restart_preserves_sealed_sibling_and_restores_other_from_gym() -> 
         expected_generations=2,
         target_step=7,
         start_weight_version=6,
-        restore_level=RecoveryTargetLevel.TURN,
+        restore_level=restore_level,
         admitted=True,
     )
     _mutate(
@@ -1729,6 +1742,40 @@ def _dispatched_turn_group(
         )
     )
     return group
+
+
+@pytest.mark.parametrize(
+    ("restore_level", "expected"),
+    [(RecoveryTargetLevel.PREFIX, True), (RecoveryTargetLevel.TURN, False)],
+)
+def test_only_a_dispatched_prefix_attempt_grows_a_recoverable_prefix(
+    restore_level: RecoveryTargetLevel, expected: bool
+) -> None:
+    """Decoding advances only dispatched prefix-level attempts between mutations."""
+    ledger = RolloutRecoveryLedger()
+    _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=2,
+        target_step=7,
+        start_weight_version=6,
+        restore_level=restore_level,
+        admitted=True,
+    )
+    assert not ledger.has_dispatched_generation_prefix()
+
+    _mutate(
+        lambda cut: ledger.mark_group_dispatched(
+            cut, "g7", gym_instance_id="tools/replica-0"
+        )
+    )
+    assert ledger.has_dispatched_generation_prefix() is expected
+
+    _mutate(lambda cut: ledger.abandon_unsealed(cut, "g7"))
+    assert not ledger.has_dispatched_generation_prefix()
 
 
 def test_refused_fresh_dispatch_keeps_identity_and_leaves_gym_inventory() -> None:

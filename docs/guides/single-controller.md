@@ -380,7 +380,7 @@ another crash does not lose the saved turn boundary.
 
 If no rollout snapshot follows the newest trainer checkpoint, SC restores that
 checkpoint on its own: completed groups come back from TQ and unfinished
-turn-level rollouts restart from their tasks. A rollout snapshot without its
+turn- and prefix-level rollouts restart from their tasks. A rollout snapshot without its
 `gym_checkpoint.json` is refused.
 
 The `turn` target currently requires vLLM generation, NeMo Gym, token capture,
@@ -397,7 +397,7 @@ mirroring Gym's concrete-route precedence. Otherwise the task-source override,
 then the global default, applies. The agent map also keeps datasets collated
 before Gym recorded `task_source` working, although re-collating them is
 recommended. Overrides may only select a coarser level than the global target,
-and are not supported with `turn` yet: a checkpointing Gym deployment exports
+and are not supported with `turn` or `prefix` yet: a checkpointing Gym deployment exports
 every live episode, so a coarser route on it would fall outside the commit
 scope. Until Gym advertises group-scoring capabilities, configure group-scored routes
 such as GenRM explicitly as `prompt_group`. Non-default policies require
