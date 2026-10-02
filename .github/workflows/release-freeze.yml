@@ -35,7 +35,7 @@ on:
 jobs:
   code-freeze:
     # TODO(kajalj): repin to a released tag once NVIDIA-NeMo/FW-CI-templates#586 merges.
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_code_freeze.yml@50bd10c4e8b512ed5184cfe89fd9a8dc4d8ecc11
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_code_freeze.yml@72aa99de4599aed63abae8f5a03bf2e4b5a501dd
     with:
       library-name: NeMo-RL
       python-package: nemo_rl
