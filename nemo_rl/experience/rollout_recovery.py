@@ -63,7 +63,7 @@ _GROUP_STATE_FIELDS = frozenset(
         "siblings",
     }
 )
-_PROMPT_REF_STATE_FIELDS = frozenset({"sample_id", "task_name"})
+_PROMPT_REF_STATE_FIELDS = frozenset({"sample_id", "task_name", "sampling_seed"})
 _SIBLING_STATE_FIELDS = frozenset({"generation_index", "attempts"})
 _ATTEMPT_STATE_FIELDS = frozenset(
     {
@@ -135,8 +135,13 @@ class PromptRef:
 
     sample_id: str
     task_name: Optional[str] = None
+    sampling_seed: Optional[int] = None
 
     def __post_init__(self) -> None:
+        if self.sampling_seed is not None and (
+            type(self.sampling_seed) is not int or not 0 <= self.sampling_seed < 2**63
+        ):
+            raise ValueError("prompt sampling_seed must be a nonnegative int64")
         if not self.sample_id:
             raise ValueError("prompt sample_id must not be empty")
 
@@ -148,6 +153,8 @@ def _validate_prompt_identity(
     group_id: str,
 ) -> None:
     """Require a runtime prompt to resolve the ledger's durable dataset key."""
+    if prompt_payload.get("sampling_seed") != prompt_ref.sampling_seed:
+        raise ValueError(f"recovery group {group_id!r} sampling seed does not match")
     sample_id = prompt_payload.get("idx")
     if isinstance(sample_id, bool) or not isinstance(sample_id, int):
         raise ValueError(
@@ -346,7 +353,11 @@ class RolloutRecoveryLedger:
             task_name = prompt_payload.get("task_name")
             if task_name is not None and not isinstance(task_name, str):
                 raise TypeError("prompt task_name must be a string or None")
-            prompt_ref = PromptRef(sample_id=prompt_id, task_name=task_name)
+            prompt_ref = PromptRef(
+                sample_id=prompt_id,
+                task_name=task_name,
+                sampling_seed=prompt_payload.get("sampling_seed"),
+            )
         if prompt_ref.sample_id != prompt_id:
             raise ValueError(
                 "dataset prompt reference must match prompt_id: "
@@ -848,6 +859,11 @@ class RolloutRecoveryLedger:
                     "prompt_ref": {
                         "sample_id": record.prompt_ref.sample_id,
                         "task_name": record.prompt_ref.task_name,
+                        **(
+                            {"sampling_seed": record.prompt_ref.sampling_seed}
+                            if record.prompt_ref.sampling_seed is not None
+                            else {}
+                        ),
                     },
                     "task_source": record.task_source,
                     "recovery_granularity": record.recovery_granularity.value,
@@ -1145,7 +1161,11 @@ class RolloutRecoveryLedger:
             group_id=group_id,
             admission_id=admission_id,
             prompt_id=prompt_id,
-            prompt_ref=PromptRef(sample_id=sample_id, task_name=task_name),
+            prompt_ref=PromptRef(
+                sample_id=sample_id,
+                task_name=task_name,
+                sampling_seed=raw_prompt_ref.get("sampling_seed"),
+            ),
             task_source=task_source,
             recovery_granularity=recovery_granularity,
             runtime_prompt_payload=None,

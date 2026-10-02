@@ -1266,6 +1266,16 @@ class SingleControllerActor:
                             f"{type(prompt_batch).__name__}, expected a mapping"
                         )
                 resolved_prompts[sample_id] = cast(DatumSpec, prompt)
+            # The dataset cache is shared across epochs; sampling identity belongs
+            # to this particular logical prompt group, not the dataset row.
+            prompt = dict(prompt)
+            if group.prompt_ref.sampling_seed is not None:
+                prompt["sampling_seed"] = group.prompt_ref.sampling_seed
+            elif self._async_cfg.seeded_rollouts:
+                raise ValueError(
+                    "Cannot enable seeded_rollouts while restoring an unseeded "
+                    "unfinished prompt group"
+                )
             recovery_ledger.bind_runtime_prompt(
                 cut,
                 group.group_id,
@@ -2329,6 +2339,7 @@ class SingleControllerActor:
             while max_epochs is None or self._current_epoch < max_epochs:
                 if not self._rollout_recovery_enabled:
                     for prompt_batch in self._dataloader:
+                        self._seed_prompt_batch(prompt_batch)
                         if self._divert_batch_to_reserve(prompt_batch):
                             continue
                         target_step = await self._sampler.admit(
@@ -2356,6 +2367,7 @@ class SingleControllerActor:
                         except StopIteration:
                             self._current_epoch += 1
                             break
+                        self._seed_prompt_batch(prompt_batch)
                         if self._divert_batch_to_reserve(prompt_batch):
                             continue
                         admission_id = str(uuid.uuid4())
@@ -2394,6 +2406,17 @@ class SingleControllerActor:
 
         self._rollout_exhausted.set()
         print(f"rollout_pump: completed {self._current_epoch} epoch(s)", flush=True)
+
+    def _seed_prompt_batch(self, prompt_batch: BatchedDataDict[DatumSpec]) -> None:
+        """Assign identities before admission, replacement reservation, or dispatch."""
+        if not self._async_cfg.seeded_rollouts:
+            return
+        from nemo_rl.utils.sampling_seed import derive_sampling_seed
+
+        prompt_batch["sampling_seed"] = [
+            derive_sampling_seed(self._algo_cfg.seed, self._current_epoch, int(idx))
+            for idx in prompt_batch["idx"]
+        ]
 
     def _divert_batch_to_reserve(
         self, prompt_batch: BatchedDataDict[DatumSpec]

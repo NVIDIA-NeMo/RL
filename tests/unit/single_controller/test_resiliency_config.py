@@ -790,3 +790,38 @@ class TestADropBudgetNeedsASamplerThatStamps:
             rollout_failure={"max_consecutive_dropped_prompts": 2},
         )
         validate_single_controller_config(cfg)
+
+
+def test_seeded_rollouts_reject_native_environment():
+    config = _master_config(seeded_rollouts=True)
+    config.env["should_use_nemo_gym"] = False
+    with pytest.raises(ValueError, match="requires the NeMo Gym SWE path"):
+        validate_single_controller_config(config)
+
+
+@pytest.mark.parametrize("sampling_backend", [None, "flashinfer"])
+def test_seeded_megatron_rollouts_require_torch(sampling_backend):
+    config = _master_config(seeded_rollouts=True)
+    config.policy["generation"].update(
+        backend="megatron",
+        mcore_generation_config={}
+        if sampling_backend is None
+        else {"sampling_backend": sampling_backend},
+    )
+    config.policy["generation"]["mcore_generation_config"]["expose_http_server"] = True
+    with pytest.raises(ValueError, match="sampling_backend=torch"):
+        validate_single_controller_config(config)
+
+
+def test_seeded_megatron_rollouts_reject_speculation():
+    config = _master_config(seeded_rollouts=True)
+    config.policy["generation"].update(
+        backend="megatron",
+        mcore_generation_config={
+            "sampling_backend": "torch",
+            "num_speculative_tokens": 1,
+        },
+    )
+    config.policy["generation"]["mcore_generation_config"]["expose_http_server"] = True
+    with pytest.raises(ValueError, match="speculative decoding"):
+        validate_single_controller_config(config)

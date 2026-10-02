@@ -454,6 +454,7 @@ def _rehydration_controller(
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     controller = object.__new__(controller_cls)
     controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+    controller._async_cfg = SimpleNamespace(seeded_rollouts=False)
     controller._rollout_manager = SimpleNamespace(recovery_ledger=restored_ledger)
     controller._dataloader = SimpleNamespace(
         dataset={7: dataset_prompt},
@@ -514,11 +515,12 @@ def _reserve_controller() -> Any:
     controller._sampler_stamps_target_steps = True
     controller._rollout_recovery_enabled = True
     controller._async_cfg = SimpleNamespace(
+        seeded_rollouts=False,
         rollout_failure=SimpleNamespace(
             on_dropped_prompt="replace",
             replacement_reserve_prompts=2,
             max_replacement_attempts=1,
-        )
+        ),
     )
     controller._algo_cfg = SimpleNamespace(num_prompts_per_step=2)
     controller._rollout_manager = _LedgerFacade()
@@ -940,6 +942,7 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(tmp_path) -> None
             "rollout_recovery_group_count": 1,
         }
         controller._async_cfg = SimpleNamespace(
+            seeded_rollouts=False,
             max_buffered_rollouts=4,
             max_inflight_prompts=2,
         )
@@ -1059,6 +1062,7 @@ def test_recovery_readmits_one_reserved_batch_only_once(tmp_path) -> None:
             "rollout_recovery_group_count": 2,
         }
         controller._async_cfg = SimpleNamespace(
+            seeded_rollouts=False,
             max_buffered_rollouts=4,
             max_inflight_prompts=2,
         )
@@ -1215,7 +1219,9 @@ def test_recovery_load_does_not_require_every_unfinished_group_to_fit_at_once(
             ).hexdigest(),
             "rollout_recovery_group_count": 2,
         }
-        controller._async_cfg = SimpleNamespace(max_buffered_rollouts=4)
+        controller._async_cfg = SimpleNamespace(
+            max_buffered_rollouts=4, seeded_rollouts=False
+        )
         controller._dataloader = SimpleNamespace(
             dataset={
                 prompt_idx: {"idx": prompt_idx, "message_log": []}
@@ -1426,3 +1432,35 @@ def test_recovery_rejects_a_missing_advertised_ledger_sidecar(tmp_path) -> None:
         asyncio.run(
             controller._maybe_restore_rollout_recovery(restored_replay_groups=0)
         )
+
+
+def test_rehydration_keeps_distinct_seeded_occurrences_of_same_dataset_row():
+    controller, ledger = _rehydration_controller(_identity_dict_collator)
+    saved = RolloutRecoveryLedger()
+    for group_id, seed in [("epoch0", 123), ("epoch1", 456)]:
+        _with_mutation_cut(
+            lambda cut, group_id=group_id, seed=seed: saved.reserve_group(
+                cut,
+                group_id=group_id,
+                prompt_id="7",
+                prompt_payload={**_reserve_prompt(7), "sampling_seed": seed},
+                expected_generations=2,
+                target_step=7,
+                start_weight_version=7,
+            )
+        )
+    ledger = RolloutRecoveryLedger()
+    controller._rollout_manager.recovery_ledger = ledger
+    _with_mutation_cut(lambda cut: ledger.load_state_dict(cut, saved.state_dict()))
+    controller._async_cfg.seeded_rollouts = True
+    _run_rehydration(controller)
+    assert ledger.get_group("epoch0").prompt_payload["sampling_seed"] == 123
+    assert ledger.get_group("epoch1").prompt_payload["sampling_seed"] == 456
+    assert "sampling_seed" not in controller._dataloader.dataset[7]
+
+
+def test_rehydration_rejects_enabling_seeding_for_old_unfinished_groups():
+    controller, _ = _rehydration_controller(_identity_dict_collator)
+    controller._async_cfg.seeded_rollouts = True
+    with pytest.raises(ValueError, match="unseeded unfinished"):
+        _run_rehydration(controller)

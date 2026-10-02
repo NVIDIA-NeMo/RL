@@ -2607,3 +2607,24 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     )
     assert "returns" in (result_meta.fields or [])
     assert "advantages" in (result_meta.fields or [])
+
+
+def test_prompt_sampling_seeds_ignore_batch_order_and_distinguish_epochs():
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    controller = object.__new__(controller_cls)
+    controller._async_cfg = AsyncRLConfig(seeded_rollouts=True)
+    controller._algo_cfg = SimpleNamespace(seed=42)
+    controller._current_epoch = 0
+    first = BatchedDataDict({"idx": [7, 3]})
+    controller._seed_prompt_batch(first)
+    reordered = BatchedDataDict({"idx": [3, 7]})
+    controller._seed_prompt_batch(reordered)
+    assert first["sampling_seed"] == list(reversed(reordered["sampling_seed"]))
+    controller._current_epoch = 1
+    next_epoch = BatchedDataDict({"idx": [7, 3]})
+    controller._seed_prompt_batch(next_epoch)
+    assert set(first["sampling_seed"]).isdisjoint(next_epoch["sampling_seed"])
+    controller._async_cfg = AsyncRLConfig()
+    unseeded = BatchedDataDict({"idx": [7]})
+    controller._seed_prompt_batch(unseeded)
+    assert "sampling_seed" not in unseeded
