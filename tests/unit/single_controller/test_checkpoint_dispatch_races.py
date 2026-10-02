@@ -65,13 +65,16 @@ from nemo_rl.environments.gym_checkpoint_coordinator import (
     GYM_CHECKPOINT_SCHEMA_VERSION,
     GymCheckpointCommitResult,
     GymCheckpointManifest,
+    GymCheckpointNotReady,
     load_gym_checkpoint_manifest,
     staging_keys_of,
     write_gym_checkpoint_manifest,
 )
 from nemo_rl.experience.rollout_manager import (
+    RequestDeadlineRegistry,
     RolloutDispatchAdmissionGate,
     RolloutOutcome,
+    _Deadline,
 )
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
@@ -293,6 +296,15 @@ class _RestoringGymCoordinator:
         manifest: GymCheckpointManifest,
     ) -> None:
         self.discarded.append((restore_id, manifest))
+
+
+def _deadline_pausing_manager() -> SimpleNamespace:
+    """Rollout-manager stand-in for the deadline pause a Gym checkpoint takes."""
+    registry = RequestDeadlineRegistry()
+    return SimpleNamespace(
+        suspend_request_deadlines=registry.suspend,
+        resume_request_deadlines=registry.resume,
+    )
 
 
 class _SavingGymCoordinator:
@@ -814,6 +826,7 @@ def test_turn_checkpoint_drains_on_wire_reply_before_tq_cut(tmp_path: Path) -> N
         controller = object.__new__(controller_cls)
         controller._gym_checkpoint_coordinator = coordinator
         controller._rollout_dispatch_admission_gate = RolloutDispatchAdmissionGate()
+        controller._rollout_manager = _deadline_pausing_manager()
         controller._rollout_recovery_ledger = ledger
 
         async def complete_on_wire_reply() -> None:
@@ -896,6 +909,7 @@ def test_completion_callback_can_run_while_gym_commit_is_pending(
         controller = object.__new__(controller_cls)
         controller._gym_checkpoint_coordinator = coordinator
         controller._rollout_dispatch_admission_gate = RolloutDispatchAdmissionGate()
+        controller._rollout_manager = _deadline_pausing_manager()
         controller._rollout_recovery_ledger = ledger
 
         async def checkpoint() -> GymCheckpointCommitResult:
@@ -1017,6 +1031,7 @@ def test_turn_checkpoint_aborts_when_candidate_is_neither_exported_nor_drained(
         controller = object.__new__(controller_cls)
         controller._gym_checkpoint_coordinator = coordinator
         controller._rollout_dispatch_admission_gate = RolloutDispatchAdmissionGate()
+        controller._rollout_manager = _deadline_pausing_manager()
         controller._rollout_recovery_ledger = ledger
 
         with pytest.raises(TimeoutError, match="neither|classify every candidate"):
@@ -1069,6 +1084,7 @@ def test_turn_checkpoint_fails_fast_on_parked_session_without_an_owner(
         controller = object.__new__(controller_cls)
         controller._gym_checkpoint_coordinator = coordinator
         controller._rollout_dispatch_admission_gate = RolloutDispatchAdmissionGate()
+        controller._rollout_manager = _deadline_pausing_manager()
         controller._rollout_recovery_ledger = ledger
 
         async def checkpoint() -> None:
@@ -1119,6 +1135,7 @@ def _controller_for(
     controller = object.__new__(controller_cls)
     controller._gym_checkpoint_coordinator = coordinator
     controller._rollout_dispatch_admission_gate = RolloutDispatchAdmissionGate()
+    controller._rollout_manager = _deadline_pausing_manager()
     controller._rollout_recovery_ledger = ledger
     return controller
 
@@ -1236,6 +1253,7 @@ def test_turn_checkpoint_rejects_missing_gym_staging_key(tmp_path: Path) -> None
         controller = object.__new__(controller_cls)
         controller._gym_checkpoint_coordinator = coordinator
         controller._rollout_dispatch_admission_gate = RolloutDispatchAdmissionGate()
+        controller._rollout_manager = _deadline_pausing_manager()
         controller._rollout_recovery_ledger = ledger
         controller._dp_client = NoOpDataPlaneClient()
         controller._master_config = SimpleNamespace(
@@ -1765,6 +1783,7 @@ def test_turn_checkpoint_commits_owned_gym_episode_before_tq_cut(
         controller = object.__new__(controller_cls)
         controller._gym_checkpoint_coordinator = coordinator
         controller._rollout_dispatch_admission_gate = RolloutDispatchAdmissionGate()
+        controller._rollout_manager = _deadline_pausing_manager()
         controller._rollout_recovery_ledger = ledger
 
         async with controller._prepared_gym_checkpoint(
@@ -2232,6 +2251,101 @@ def test_recovery_rejects_a_missing_advertised_ledger_sidecar(tmp_path) -> None:
         asyncio.run(
             controller._maybe_restore_rollout_recovery(restored_replay_groups=0)
         )
+
+
+class _NotReadyGymCoordinator(_SavingGymCoordinator):
+    @asynccontextmanager
+    async def prepared(self, checkpoint_id: str):
+        self.events.append(("prepare", checkpoint_id))
+        raise GymCheckpointNotReady({"tools/replica-0": {"agent": ("rollout-1",)}})
+        yield
+
+
+def _gym_checkpoint_controller(
+    coordinator: _SavingGymCoordinator, registry: RequestDeadlineRegistry
+) -> Any:
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    controller = object.__new__(controller_cls)
+    controller._gym_checkpoint_coordinator = coordinator
+    controller._rollout_dispatch_admission_gate = RolloutDispatchAdmissionGate()
+    controller._rollout_recovery_ledger = RolloutRecoveryLedger()
+    controller._rollout_manager = SimpleNamespace(
+        suspend_request_deadlines=registry.suspend,
+        resume_request_deadlines=registry.resume,
+    )
+    return controller
+
+
+class TestGymCheckpointPausesRolloutDeadlines:
+    """Parked rollouts cannot progress, so a checkpoint must not use up their budget."""
+
+    def test_a_parked_rollout_outlives_a_checkpoint_longer_than_its_budget(
+        self, tmp_path: Path
+    ) -> None:
+        registry = RequestDeadlineRegistry()
+        controller = _gym_checkpoint_controller(
+            _SavingGymCoordinator(exported_episodes=()), registry
+        )
+
+        async def exercise() -> None:
+            entered = asyncio.Event()
+            checkpoint_done = asyncio.Event()
+
+            async def parked_rollout() -> None:
+                async with _Deadline(0.2, "NeMo-Gym prompt group", registry=registry):
+                    entered.set()
+                    await checkpoint_done.wait()
+                    await asyncio.sleep(0.05)
+
+            rollout = asyncio.create_task(parked_rollout())
+            await entered.wait()
+            async with controller._prepared_gym_checkpoint(
+                tmp_path, checkpoint_id="save-1"
+            ):
+                assert registry.suspended
+                # Twice the rollout's whole budget.
+                await asyncio.sleep(0.4)
+            checkpoint_done.set()
+            # Raises RolloutTimeout if the checkpoint was charged to the rollout.
+            await rollout
+            assert not registry.suspended
+
+        asyncio.run(exercise())
+
+    def test_ending_a_checkpoint_keeps_a_generation_stand_down_pause(
+        self, tmp_path: Path
+    ) -> None:
+        registry = RequestDeadlineRegistry()
+        controller = _gym_checkpoint_controller(
+            _SavingGymCoordinator(exported_episodes=()), registry
+        )
+
+        async def exercise() -> None:
+            # The colocated engine is training; its own pause must outlast ours.
+            registry.suspend()
+            async with controller._prepared_gym_checkpoint(
+                tmp_path, checkpoint_id="save-1"
+            ):
+                pass
+            assert registry.suspended
+            registry.resume()
+            assert not registry.suspended
+
+        asyncio.run(exercise())
+
+    def test_a_checkpoint_that_cannot_park_releases_its_pause(
+        self, tmp_path: Path
+    ) -> None:
+        registry = RequestDeadlineRegistry()
+        controller = _gym_checkpoint_controller(_NotReadyGymCoordinator(), registry)
+
+        async def exercise() -> None:
+            with pytest.raises(GymCheckpointNotReady):
+                async with controller._prepared_gym_checkpoint(
+                    tmp_path, checkpoint_id="save-1"
+                ):
+                    raise AssertionError("unreachable")
+            assert not registry.suspended
 
 
 class _DiskLiveSessionGymCoordinator(_LiveSessionGymCoordinator):
