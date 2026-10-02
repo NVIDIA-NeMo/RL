@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,9 @@ import ray.exceptions
 from nemo_rl.environments.gym_checkpoint_adapter import (
     GymCheckpointCommitSummary,
     GymCheckpointEpisode,
+    GymCheckpointParticipantCommitSummary,
+    GymCheckpointParticipantManifest,
+    GymCheckpointParticipantRecord,
     GymCheckpointPrepareSummary,
     GymCheckpointUnavailable,
 )
@@ -59,8 +63,10 @@ class _FakeGymActor:
         staging_keys_by_episode: dict[GymCheckpointEpisode, tuple[str, ...]]
         | None = None,
         hang: frozenset[str] = frozenset(),
+        participants: tuple[GymCheckpointParticipantCommitSummary, ...] = (),
     ) -> None:
         self.prepared = prepared
+        self.participants = participants
         # Operations whose call is accepted but never answered, like an actor
         # whose event loop is stuck.
         self.hang = hang
@@ -100,7 +106,7 @@ class _FakeGymActor:
                     {k for keys in self.staging_keys_by_episode.values() for k in keys}
                 )
             ),
-            participants=(),
+            participants=self.participants,
             staging_keys_by_episode=self.staging_keys_by_episode,
         )
 
@@ -132,6 +138,7 @@ def test_manifest_rejects_duplicate_episode_identity() -> None:
             checkpoint_id="save-1",
             instances={"tools/replica-0": (episode, episode)},
             staging_keys={"tools/replica-0": ()},
+            participants={"tools/replica-0": ()},
         )
 
 
@@ -347,6 +354,10 @@ def test_restore_failure_discards_every_actor_under_uncertain_outcome() -> None:
             "tools/replica-0": (),
             "tools/replica-1": (),
         },
+        participants={
+            "tools/replica-0": (),
+            "tools/replica-1": (),
+        },
     )
 
     with pytest.raises(GymCheckpointOperationError, match="restore failed"):
@@ -441,6 +452,7 @@ def test_every_control_operation_is_bounded(operation: str, tmp_path: Path) -> N
         checkpoint_id="save-1",
         instances=episodes,
         staging_keys={"tools/replica-0": ()},
+        participants={"tools/replica-0": ()},
     )
     calls = {
         "commit": lambda: coordinator.commit("save-1", tmp_path, episodes),
@@ -500,3 +512,147 @@ def test_failures_that_leave_nothing_behind_are_transient(error) -> None:
 )
 def test_broken_invariants_are_not_transient(error) -> None:
     assert not is_transient_gym_checkpoint_failure(error)
+
+
+def _committed_participant(
+    server_name: str, kind: str, digest: str
+) -> GymCheckpointParticipantCommitSummary:
+    return GymCheckpointParticipantCommitSummary(
+        server_name=server_name,
+        kind=kind,
+        phase="committed",
+        episode_keys=(),
+        manifest=GymCheckpointParticipantManifest(
+            schema_version=1,
+            kind=kind,
+            instance=f"{server_name}-state",
+            checkpoint_id="save-1",
+            records_file="records.jsonl",
+            records_sha256=digest,
+            record_count=0,
+        ),
+        staging_keys=(),
+    )
+
+
+def test_commit_records_each_instance_participant_topology(tmp_path: Path) -> None:
+    """Restore needs it: a participant missing later must not be silently skipped."""
+    first = _FakeGymActor(
+        participants=(
+            _committed_participant("tools-environment", "environment", "a" * 64),
+            _committed_participant("tools-resources", "resources", "b" * 64),
+        )
+    )
+    second = _FakeGymActor(
+        participants=(_committed_participant("tools-env", "environment", "c" * 64),)
+    )
+    coordinator = _coordinator(first, second)
+    inventory = {"tools/replica-0": (), "tools/replica-1": ()}
+
+    result = asyncio.run(coordinator.commit("save-1", tmp_path, inventory))
+
+    expected = {
+        "tools/replica-0": (
+            GymCheckpointParticipantRecord(
+                "tools-environment", "environment", "tools-environment-state", "a" * 64
+            ),
+            GymCheckpointParticipantRecord(
+                "tools-resources", "resources", "tools-resources-state", "b" * 64
+            ),
+        ),
+        "tools/replica-1": (
+            GymCheckpointParticipantRecord(
+                "tools-env", "environment", "tools-env-state", "c" * 64
+            ),
+        ),
+    }
+    assert result.manifest.participants == expected
+    assert load_gym_checkpoint_manifest(tmp_path).participants == expected
+
+
+def test_restore_hands_each_instance_its_recorded_participants() -> None:
+    first = _FakeGymActor()
+    second = _FakeGymActor()
+    coordinator = _coordinator(first, second)
+    recorded = {
+        "tools/replica-0": (
+            GymCheckpointParticipantRecord("a-env", "environment", "a-env", "a" * 64),
+        ),
+        "tools/replica-1": (
+            GymCheckpointParticipantRecord("b-env", "environment", "b-env", "b" * 64),
+        ),
+    }
+    manifest = GymCheckpointManifest(
+        schema_version=GYM_CHECKPOINT_SCHEMA_VERSION,
+        checkpoint_id="save-1",
+        instances={"tools/replica-0": (), "tools/replica-1": ()},
+        staging_keys={"tools/replica-0": (), "tools/replica-1": ()},
+        participants=recorded,
+    )
+
+    asyncio.run(coordinator.restore("restore-1", "/unused", manifest))
+
+    for actor, instance_id in ((first, "tools/replica-0"), (second, "tools/replica-1")):
+        (restore_call,) = [call for call in actor.calls if call[0] == "restore"]
+        assert restore_call[2]["participants"] == recorded[instance_id]
+
+
+def test_a_manifest_without_participant_topology_is_rejected(tmp_path: Path) -> None:
+    manifest = GymCheckpointManifest(
+        schema_version=GYM_CHECKPOINT_SCHEMA_VERSION,
+        checkpoint_id="save-1",
+        instances={"tools/replica-0": ()},
+        staging_keys={"tools/replica-0": ()},
+        participants={"tools/replica-0": ()},
+    )
+    raw = manifest.to_dict()
+    del raw["participants"]
+    (tmp_path / "gym_checkpoint.json").write_text(json.dumps(raw))
+
+    with pytest.raises(ValueError, match="participants must be a mapping"):
+        load_gym_checkpoint_manifest(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("participants", "match"),
+    [
+        ({}, "participant topology must match"),
+        (
+            {
+                "tools/replica-0": (
+                    GymCheckpointParticipantRecord("a", "environment", "a", "a" * 64),
+                    GymCheckpointParticipantRecord("a", "model", "a2", "b" * 64),
+                )
+            },
+            "duplicate participants",
+        ),
+        (
+            {
+                "tools/replica-0": (
+                    GymCheckpointParticipantRecord("a", "judge", "a", "a" * 64),
+                )
+            },
+            "unknown kind",
+        ),
+        (
+            {
+                "tools/replica-0": (
+                    GymCheckpointParticipantRecord("a", "environment", "a", "nope"),
+                )
+            },
+            "invalid records_sha256",
+        ),
+    ],
+    ids=["missing-instance", "duplicate", "unknown-kind", "bad-digest"],
+)
+def test_manifest_rejects_a_malformed_participant_topology(
+    participants, match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        GymCheckpointManifest(
+            schema_version=GYM_CHECKPOINT_SCHEMA_VERSION,
+            checkpoint_id="save-1",
+            instances={"tools/replica-0": ()},
+            staging_keys={"tools/replica-0": ()},
+            participants=participants,
+        )
