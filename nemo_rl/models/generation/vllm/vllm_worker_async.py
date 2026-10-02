@@ -14,15 +14,17 @@
 
 import asyncio
 import copy
+import functools
 import gc
 import logging
 import threading
 import time
 import uuid
 import warnings
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
+from collections.abc import Awaitable, Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from typing import Any, AsyncGenerator, Literal, Optional, cast
 
 import ray
 import torch
@@ -45,6 +47,13 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
 )
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
+from nemo_rl.models.generation.generation_cut_capture import (
+    GenerationCutCaptureMixin,
+    _CompletedCaptureState,
+    _remaining_generation_limits_after_prefix,
+    _RequestCaptureState,
+    _TokenCaptureSnapshotGate,
+)
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
@@ -60,6 +69,7 @@ from nemo_rl.models.generation.vllm.config import parse_nvfp4_pertoken_rollout
 from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
+    extract_selected_token_logprobs,
     format_prompt_for_vllm_generation,
     validate_rollout_prompt,
     model_dump_chat_response_with_dynamic_message_fields,
@@ -73,18 +83,233 @@ from nemo_rl.models.generation.openai_server_utils import (
 from nemo_rl.telemetry.setup import shutdown_telemetry
 
 LOGGER = logging.getLogger(__name__)
+_RESTORED_PREFIX_TERMINAL_PROMPT_KEY = "__nemo_rl_restored_prefix_terminal__"
 
-if TYPE_CHECKING:
-    from nemo_gym.token_id_capture.staging.capture import ActiveCall
+
+@dataclass(frozen=True)
+class _RestoredPrefixTerminal:
+    """A restored call whose durable output already reached a terminal limit."""
+
+    prompt_token_ids: tuple[int, ...]
+    generation_token_count: int
+    reason: str
+    finish_reason: Literal["stop", "length"]
+    stop_reason: str | int | None = None
+
+    @property
+    def original_prompt_token_count(self) -> int:
+        return len(self.prompt_token_ids) - self.generation_token_count
+
+
+def _classify_restored_prefix_terminal(
+    *,
+    prompt_token_ids: list[int],
+    generation_token_count: int,
+    requested_output_tokens: int | None,
+    model_max_tokens: int,
+    terminal_finish_reason: Literal["stop", "length"] | None = None,
+    terminal_stop_reason: str | int | None = None,
+) -> _RestoredPrefixTerminal | None:
+    """Classify an exact terminal prefix or reject an incompatible restore."""
+    prompt_token_count = len(prompt_token_ids)
+    if generation_token_count < 0:
+        raise ValueError("generation_token_count must be non-negative")
+    if generation_token_count > prompt_token_count:
+        raise ValueError(
+            "Durable generation prefix contains more generated tokens than the "
+            "restored engine prompt."
+        )
+    if (
+        requested_output_tokens is not None
+        and generation_token_count > requested_output_tokens
+    ):
+        raise ValueError(
+            "Durable generation prefix token count "
+            f"({generation_token_count}) exceeds the restored request output "
+            f"budget ({requested_output_tokens})."
+        )
+    if prompt_token_count > model_max_tokens:
+        raise ValueError(
+            "Durable generation prefix prompt length "
+            f"({prompt_token_count}) exceeds restored model capacity "
+            f"({model_max_tokens})."
+        )
+    if terminal_stop_reason is not None and terminal_finish_reason is None:
+        raise ValueError("terminal_stop_reason requires terminal_finish_reason")
+    if terminal_finish_reason is not None:
+        return _RestoredPrefixTerminal(
+            prompt_token_ids=tuple(prompt_token_ids),
+            generation_token_count=generation_token_count,
+            reason=f"observed_{terminal_finish_reason}",
+            finish_reason=terminal_finish_reason,
+            stop_reason=terminal_stop_reason,
+        )
+    reached_output_limit = (
+        requested_output_tokens is not None
+        and generation_token_count == requested_output_tokens
+    )
+    reached_model_capacity = prompt_token_count == model_max_tokens
+    if not reached_output_limit and not reached_model_capacity:
+        return None
+    return _RestoredPrefixTerminal(
+        prompt_token_ids=tuple(prompt_token_ids),
+        generation_token_count=generation_token_count,
+        reason=(
+            "output_and_model_limit"
+            if reached_output_limit and reached_model_capacity
+            else "output_limit"
+            if reached_output_limit
+            else "model_limit"
+        ),
+        finish_reason="length",
+    )
+
+
+def _build_restored_prefix_terminal_output(
+    request_id: str, terminal: _RestoredPrefixTerminal
+) -> Any:
+    """Build the final vLLM output for a prefix that needs no more decoding."""
+    from vllm.outputs import CompletionOutput, RequestOutput
+
+    return RequestOutput(
+        request_id=request_id,
+        prompt=None,
+        prompt_token_ids=list(terminal.prompt_token_ids),
+        prompt_logprobs=None,
+        outputs=[
+            CompletionOutput(
+                index=0,
+                text="",
+                token_ids=[],
+                cumulative_logprob=0.0,
+                logprobs=[],
+                finish_reason=terminal.finish_reason,
+                stop_reason=terminal.stop_reason,
+            )
+        ],
+        finished=True,
+    )
+
+
+@dataclass(frozen=True)
+class _RestoredPrefixParser:
+    """Give vLLM's parser the complete output while capture keeps tail deltas."""
+
+    delegate: Any
+    prefix_token_ids: tuple[int, ...]
+
+    def parse(
+        self,
+        model_output: str,
+        request: Any,
+        *,
+        enable_auto_tools: bool,
+        model_output_token_ids: list[int],
+    ) -> Any:
+        return self.delegate.parse(
+            model_output,
+            request,
+            enable_auto_tools=enable_auto_tools,
+            model_output_token_ids=[
+                *self.prefix_token_ids,
+                *model_output_token_ids,
+            ],
+        )
+
+    def count_reasoning_tokens(self, token_ids: Sequence[int]) -> int:
+        return self.delegate.count_reasoning_tokens(
+            [*self.prefix_token_ids, *token_ids]
+        )
 
 
 @dataclass
-class CapturedRequest:
-    """Request-local ownership of tokens and processed-media snapshots."""
+class _CompletionOutputDeltaAccumulator:
+    """Linear-time accumulator for one vLLM completion index."""
 
-    call: "ActiveCall"
-    prompt_token_ids: list[int]
-    media: CapturedMedia | None
+    template: Any | None = None
+    text_parts: list[str] = field(default_factory=list)
+    token_ids: list[int] = field(default_factory=list)
+    logprobs: list[Any] | None = None
+    routed_expert_chunks: list[Any] = field(default_factory=list)
+
+    def append(self, output: Any) -> None:
+        if self.template is None:
+            self.template = copy.copy(output)
+        else:
+            for name in (
+                "cumulative_logprob",
+                "finish_reason",
+                "stop_reason",
+                "lora_request",
+            ):
+                if hasattr(output, name):
+                    setattr(self.template, name, getattr(output, name))
+        self.text_parts.append(str(getattr(output, "text", "")))
+        self.token_ids.extend(list(getattr(output, "token_ids", ()) or ()))
+        delta_logprobs = getattr(output, "logprobs", None)
+        if delta_logprobs is not None:
+            if self.logprobs is None:
+                self.logprobs = []
+            self.logprobs.extend(list(delta_logprobs))
+        routed = getattr(output, "routed_experts", None)
+        if routed is not None:
+            self.routed_expert_chunks.append(copy.deepcopy(routed))
+
+    def build(self) -> Any:
+        if self.template is None:
+            raise RuntimeError("cannot build an empty completion output")
+        self.template.text = "".join(self.text_parts)
+        self.template.token_ids = self.token_ids
+        self.template.logprobs = self.logprobs
+        if self.routed_expert_chunks:
+            self.template.routed_experts = torch.cat(
+                [torch.as_tensor(chunk) for chunk in self.routed_expert_chunks],
+                dim=0,
+            )
+        return self.template
+
+
+@dataclass
+class _RequestOutputDeltaAccumulator:
+    """Reconstruct one final RequestOutput from immutable engine deltas."""
+
+    template: Any | None = None
+    completions: dict[int, _CompletionOutputDeltaAccumulator] = field(
+        default_factory=dict
+    )
+
+    def append(self, delta: Any) -> None:
+        if self.template is None:
+            self.template = copy.copy(delta)
+        else:
+            previous = self.template
+            self.template = copy.copy(delta)
+            for name in (
+                "prompt",
+                "prompt_token_ids",
+                "prompt_logprobs",
+                "encoder_prompt",
+                "encoder_prompt_token_ids",
+                "lora_request",
+                "num_cached_tokens",
+                "prompt_routed_experts",
+            ):
+                if getattr(self.template, name, None) is None and hasattr(
+                    previous, name
+                ):
+                    setattr(self.template, name, getattr(previous, name))
+        for output in getattr(delta, "outputs", ()):
+            self.completions.setdefault(
+                output.index, _CompletionOutputDeltaAccumulator()
+            ).append(output)
+
+    def build(self) -> Any:
+        if self.template is None:
+            raise RuntimeError("cannot build an empty request output")
+        self.template.outputs = [
+            self.completions[index].build() for index in sorted(self.completions)
+        ]
+        return self.template
 
 
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_abort
@@ -132,6 +357,15 @@ class _AsyncLLMHTTPClient:
         request_id: str,
         kwargs: dict[str, Any],
     ) -> AsyncGenerator[Any, None]:
+        terminal = (
+            prompt.get(_RESTORED_PREFIX_TERMINAL_PROMPT_KEY)
+            if isinstance(prompt, dict)
+            else None
+        )
+        if isinstance(terminal, _RestoredPrefixTerminal):
+            yield _build_restored_prefix_terminal_output(request_id, terminal)
+            return
+
         iterator = None
         completed = False
 
@@ -186,7 +420,9 @@ class _AsyncLLMHTTPClient:
 
 
 class VllmAsyncGenerationWorkerImpl(
-    VllmAsyncCheckpointEngineRpcMixin, BaseVllmGenerationWorker
+    GenerationCutCaptureMixin,
+    VllmAsyncCheckpointEngineRpcMixin,
+    BaseVllmGenerationWorker,
 ):
     def __init__(
         self,
@@ -234,10 +470,32 @@ class VllmAsyncGenerationWorkerImpl(
         # the set_rollout_weight_version fan-out from the SC's _sync_weights.
         self.token_capture = None
         self._rollout_weight_version = 0
-        # In-flight captured calls keyed by id(request): the ActiveCall, the
-        # exact engine prompt ids recorded at preprocess time, and the media
-        # snapshot the engine ran on (see CapturedRequest).
-        self._capture_calls: dict[int, CapturedRequest] = {}
+        # In-flight calls are indexed by both the request object and Gym's
+        # stable model-call ID. The second index is what a checkpoint inventory
+        # uses while the original HTTP request remains active.
+        self._capture_calls: dict[int, _RequestCaptureState] = {}
+        self._capture_calls_by_model_call_id: dict[str, _RequestCaptureState] = {}
+        self._completed_capture_calls: dict[str, _CompletedCaptureState] = {}
+        self._generation_cut_receipts: dict[tuple[str, str], Any] = {}
+        self._capture_registry_lock = threading.Lock()
+        self._capture_sink: Any | None = None
+        self._generation_prefix_cuts_enabled = False
+        self._generation_cut_control_token: str | None = None
+        self._generation_cut_control_timeout_s: float | None = None
+        self._generation_cut_tokenizer: Any | None = None
+        self._token_capture_snapshot_gate = _TokenCaptureSnapshotGate()
+        # A dedicated executor prevents completions waiting on the closed gate
+        # from consuming all threads needed to create the checkpoint cut.
+        self._generation_cut_control_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="nrl-generation-cut-control",
+        )
+        # Fence closes get their own thread so a stale cut still staging rows
+        # cannot delay the next checkpoint's fence past the driver's timeout.
+        self._token_capture_fence_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="nrl-token-capture-fence",
+        )
         self._capture_media = False
         self._capture_patch_size: int | None = None
         self._capture_image_token_id: int | None = None
@@ -529,6 +787,9 @@ class VllmAsyncGenerationWorkerImpl(
         staging_partition: str,
         *,
         capture_media: bool = False,
+        generation_prefix_cuts_enabled: bool = False,
+        generation_cut_control_token: str | None = None,
+        generation_cut_control_timeout_s: float | None = None,
     ) -> bool:
         """Host ledger-authoritative token capture in this worker.
 
@@ -558,6 +819,14 @@ class VllmAsyncGenerationWorkerImpl(
             capture_media=capture_media,
             media_pixel_dtype=pixel_dtype,
         )
+        if generation_prefix_cuts_enabled and not generation_cut_control_token:
+            raise ValueError(
+                "generation-prefix cuts require a non-empty control bearer token"
+            )
+        if generation_prefix_cuts_enabled and capture_media:
+            raise ValueError(
+                "generation-prefix recovery does not yet support multimodal capture"
+            )
         if capture_media:
             # Omni-only: a new processor family must also change setup.py (driver
             # checks), captured_media.py (_processed_omni_tensors, pack_images,
@@ -589,6 +858,13 @@ class VllmAsyncGenerationWorkerImpl(
             self._capture_image_token_id = int(context_ids[0])
             self._capture_patch_size = int(info.get_hf_config().patch_size)
         self._capture_media = capture_media
+        self._capture_sink = sink
+        self._generation_prefix_cuts_enabled = generation_prefix_cuts_enabled
+        self._generation_cut_control_token = generation_cut_control_token
+        self._generation_cut_control_timeout_s = generation_cut_control_timeout_s
+        if generation_prefix_cuts_enabled:
+            # Cuts must land on character boundaries; see _ends_inside_character.
+            self._generation_cut_tokenizer = self.llm.renderer.get_tokenizer()
         source = TQTokenSource(
             dp_client, staging_partition=staging_partition, capture_media=capture_media
         )
@@ -633,6 +909,8 @@ class VllmAsyncGenerationWorkerImpl(
         admission: Any | None = None,
         prefix_token_ids: list[int] | None = None,
         media: CapturedMedia | None = None,
+        generation_cut: Any | None = None,
+        resumed_generation_token_ids: list[int] | None = None,
     ) -> None:
         """Admit one ledger-forwarded call into the capture layer.
 
@@ -656,11 +934,116 @@ class VllmAsyncGenerationWorkerImpl(
         call = capture.begin_call(
             admission,
             prefix_token_ids=prefix_token_ids,
+            generation_cut=generation_cut,
+            generation_cut_staging_keys=(
+                admission.generation_cut.staging_keys
+                if admission.generation_cut is not None
+                else None
+            ),
             stream=bool(getattr(request, "stream", False)),
         )
-        self._capture_calls[id(request)] = CapturedRequest(
-            call, list(prompt_token_ids), media
+        state = _RequestCaptureState(
+            call=call,
+            prompt_token_ids=list(prompt_token_ids),
+            media=media,
+            resumed_generation_token_ids=list(resumed_generation_token_ids or ()),
+            effective_output_limit=(
+                admission.generation_cut.effective_output_limit
+                if admission.generation_cut is not None
+                else None
+            ),
+            generation_cut_staging_keys=(
+                list(admission.generation_cut.staging_keys)
+                if admission.generation_cut is not None
+                else []
+            ),
         )
+        with self._capture_registry_lock:
+            if call.model_call_id in self._capture_calls_by_model_call_id:
+                raise RuntimeError(
+                    f"model call {call.model_call_id!r} is already active in token capture"
+                )
+            self._capture_calls[id(request)] = state
+            self._capture_calls_by_model_call_id[call.model_call_id] = state
+
+    def _observe_request_capture(self, request: Any, request_output: Any) -> None:
+        """Append one request's immutable vLLM output delta."""
+        state = self._get_request_capture(request)
+        if state is None:
+            return
+        outputs = getattr(request_output, "outputs", None)
+        if not outputs:
+            return
+        try:
+            output = outputs[0]
+            generation_token_ids = list(getattr(output, "token_ids", ()) or ())
+            generation_logprobs = extract_selected_token_logprobs(output)
+            finish_reason = getattr(output, "finish_reason", None)
+            stop_reason = getattr(output, "stop_reason", None)
+        except (RuntimeError, TypeError, ValueError) as error:
+            with state.lock:
+                state.observation_error = f"{type(error).__name__}: {error}"
+            return
+        with state.lock:
+            state.observe(generation_token_ids, generation_logprobs)
+            if finish_reason is not None:
+                if finish_reason not in ("stop", "length"):
+                    state.observation_error = (
+                        f"unsupported terminal finish_reason {finish_reason!r}"
+                    )
+                elif (
+                    state.terminal_finish_reason is not None
+                    and state.terminal_finish_reason != finish_reason
+                ):
+                    state.observation_error = (
+                        "conflicting terminal finish reasons: "
+                        f"{state.terminal_finish_reason!r} and {finish_reason!r}"
+                    )
+                elif not isinstance(stop_reason, (str, int, type(None))):
+                    state.observation_error = (
+                        "terminal stop_reason must be a string, integer, or None"
+                    )
+                else:
+                    state.terminal_finish_reason = finish_reason
+                    state.terminal_stop_reason = stop_reason
+
+    def _restore_response_prefix(
+        self, request: Any, request_output: Any, *, tokenizer: Any
+    ) -> None:
+        """Prepend the durable assistant prefix before vLLM parses the response."""
+        state = self._get_request_capture(request)
+        if state is None or not state.resumed_generation_token_ids:
+            return
+        outputs = getattr(request_output, "outputs", None)
+        if not outputs:
+            return
+        output = outputs[0]
+        # vLLM already detokenized the tail with the request's settings and
+        # stripped EOS and any matched stop string from it. Re-decoding the
+        # whole sequence would restore both, so decode only the prefix, with
+        # the same settings, and prepend it to the processed tail.
+        with state.lock:
+            prefix_text = tokenizer.decode(
+                state.resumed_generation_token_ids,
+                skip_special_tokens=getattr(request, "skip_special_tokens", True),
+                spaces_between_special_tokens=getattr(
+                    request, "spaces_between_special_tokens", True
+                ),
+            )
+        output.text = prefix_text + (getattr(output, "text", None) or "")
+
+    def _record_request_effective_output_limit(
+        self, request: Any, effective_output_limit: int
+    ) -> None:
+        """Remember vLLM's resolved total output budget for future cuts."""
+        if effective_output_limit <= 0:
+            raise ValueError("effective output limit must be positive")
+        state = self._get_request_capture(request)
+        if state is None:
+            return
+        with state.lock:
+            if state.effective_output_limit is None:
+                state.effective_output_limit = effective_output_limit
 
     def _capture_request_media(
         self,
@@ -828,17 +1211,47 @@ class VllmAsyncGenerationWorkerImpl(
         payload["choices"] = [choice]
 
     def _finish_request_capture(self, request: Any, content: dict) -> dict:
-        """Stage the finished call and ride its coords on the response.
+        """Run terminal token staging outside an active checkpoint cut."""
+        self._token_capture_snapshot_gate.enter()
+        try:
+            return self._finish_request_capture_after_snapshot_fence(request, content)
+        finally:
+            self._token_capture_snapshot_gate.exit()
 
-        Tokens and the call's new media tensors go to TQ in one write (the
-        media ride as opaque attachments beside the record), so ``staged``
-        coords vouch for both and any failure is ``capture_failed`` at call
-        time. Token ids, logprobs, and routes are stripped after staging, so
-        the worker->gate hop carries the completion and coords only.
-        """
-        state = self._capture_calls.pop(id(request), None)
+    def _finish_request_capture_after_snapshot_fence(
+        self, request: Any, content: dict
+    ) -> dict:
+        """Stage one canonical terminal row and retire its prefix chunks."""
+        state = self._get_request_capture(request)
         if state is None:
             return content
+        with state.lifecycle_lock:
+            if state.terminal_started:
+                raise RuntimeError(
+                    f"model call {state.call.model_call_id!r} already started "
+                    "terminal token capture"
+                )
+            state.terminal_started = True
+            content, obsolete_staging_keys = (
+                self._finish_request_capture_with_lifecycle_owned(
+                    state, request, content
+                )
+            )
+        sink = self._capture_sink
+        if obsolete_staging_keys and sink is not None:
+            try:
+                sink.clear(list(obsolete_staging_keys))
+            except Exception:  # noqa: BLE001 - completion is already durable
+                LOGGER.exception(
+                    "failed to clear obsolete generation chunks for model call %s",
+                    state.call.model_call_id,
+                )
+        return content
+
+    def _finish_request_capture_with_lifecycle_owned(
+        self, state: _RequestCaptureState, request: Any, content: dict
+    ) -> tuple[dict, tuple[str, ...]]:
+        """Stage a terminal call while owning ``state.lifecycle_lock``."""
         call, prompt_token_ids = state.call, state.prompt_token_ids
         payload = dict(content)
         # vLLM's OpenAI response carries no prompt ids; the adapter reads the
@@ -853,6 +1266,7 @@ class VllmAsyncGenerationWorkerImpl(
             # digest-covered extras; the pixels themselves are attachments.
             payload[MEDIA_SPANS_FIELD] = [item.to_dict() for item in state.media.items]
         adapter = self.token_capture.adapter
+        generated_token_ids: list[int] = []
         if adapter is not None:
             try:
                 generated_token_ids, _ = adapter.extract_generation(payload)
@@ -869,6 +1283,47 @@ class VllmAsyncGenerationWorkerImpl(
             payload,
             attachments=state.media.tensors if state.media is not None else None,
         )
+        total_generation_token_count = len(generated_token_ids)
+        if call.generation_cut is not None:
+            prefix_tokens = sum(
+                mask == 1.0 for mask in call.generation_cut.token_mask_delta
+            )
+            total_generation_token_count += prefix_tokens
+            LOGGER.info(
+                "generation prefix completed: rollout_id=%s model_call_id=%s "
+                "source_model_call_id=%s prefix_tokens=%d tail_tokens=%d "
+                "total_generation_tokens=%d",
+                call.rollout_id,
+                call.model_call_id,
+                call.generation_cut.model_call_id,
+                prefix_tokens,
+                len(generated_token_ids),
+                total_generation_token_count,
+            )
+        with state.lock:
+            effective_output_limit = state.effective_output_limit
+            terminal_finish_reason = state.terminal_finish_reason
+            terminal_stop_reason = state.terminal_stop_reason
+        if terminal_finish_reason is None:
+            choices = content.get("choices") or []
+            finish_reason = choices[0].get("finish_reason") if choices else None
+            if finish_reason in ("stop", "length"):
+                terminal_finish_reason = finish_reason
+                terminal_stop_reason = choices[0].get("stop_reason")
+        self._remember_completed_capture(
+            call.model_call_id,
+            coords,
+            total_generation_token_count,
+            effective_output_limit=effective_output_limit,
+            terminal_finish_reason=terminal_finish_reason,
+            terminal_stop_reason=terminal_stop_reason,
+        )
+        self._pop_request_capture(request)
+        obsolete_staging_keys = (
+            tuple(state.generation_cut_staging_keys)
+            if coords.disposition == "staged"
+            else ()
+        )
         for choice in content.get("choices") or []:
             choice.pop("logprobs", None)
             # Token arrays and delta-aligned routes were staged to TQ above;
@@ -883,13 +1338,7 @@ class VllmAsyncGenerationWorkerImpl(
                 ):
                     message.pop(field, None)
         content["ng_commit_coords"] = coords.model_dump()
-        return content
-
-    def _abort_request_capture(self, request: Any, *, reason: str) -> None:
-        """Drop the in-flight capture state for a request that errored."""
-        state = self._capture_calls.pop(id(request), None)
-        if state is not None and self.token_capture is not None:
-            self.token_capture.fail_call(state.call, reason=reason)
+        return content, obsolete_staging_keys
 
     # ruff: noqa
     def _setup_vllm_openai_api_server(self, app: FastAPI) -> FastAPI:
@@ -899,8 +1348,9 @@ class VllmAsyncGenerationWorkerImpl(
         from logging import LogRecord
         from typing import List, Optional, Union
 
-        from fastapi import Request
+        from fastapi import Header, HTTPException, Request
         from fastapi.responses import JSONResponse, StreamingResponse
+        from pydantic import PrivateAttr
         from vllm.entrypoints.chat_utils import load_chat_template
         from vllm.entrypoints.openai.chat_completion.protocol import (
             ChatCompletionRequest,
@@ -923,6 +1373,7 @@ class VllmAsyncGenerationWorkerImpl(
             ServingTokenization,
         )
         from vllm.renderers.online_renderer import OnlineRenderer
+        from vllm.sampling_params import RequestOutputKind
         from vllm.exceptions import VLLMValidationError
         from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
         from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
@@ -1080,11 +1531,56 @@ class VllmAsyncGenerationWorkerImpl(
                 # the single splice path for staged and inline prefixes.
                 admission = worker_self._capture_admission(request)
                 capture_prefix_token_ids: list[int] | None = None
-                if admission is not None and admission.mode == "token_in":
+                generation_cut = None
+                resumed_generation_token_ids: list[int] = []
+                restored_request_output_tokens: int | None = None
+                if admission is not None:
                     capture_prefix_token_ids = await asyncio.to_thread(
                         worker_self._resolve_admission_prefix, admission
                     )
-                    worker_self._enter_request_prefix(request, capture_prefix_token_ids)
+                    generation_cut = await asyncio.to_thread(
+                        worker_self._resolve_generation_cut,
+                        admission,
+                        capture_prefix_token_ids,
+                    )
+                    engine_prefix_token_ids = list(capture_prefix_token_ids)
+                    if generation_cut is not None:
+                        restored_request_output_tokens = (
+                            admission.generation_cut.effective_output_limit
+                        )
+                        engine_prefix_token_ids.extend(generation_cut.token_ids_delta)
+                        resumed_generation_token_ids = [
+                            token_id
+                            for token_id, mask in zip(
+                                generation_cut.token_ids_delta,
+                                generation_cut.token_mask_delta,
+                            )
+                            if mask == 1.0
+                        ]
+                        request._restored_generation_token_ids = tuple(
+                            resumed_generation_token_ids
+                        )
+                        (
+                            remaining_output_tokens,
+                            remaining_min_tokens,
+                        ) = _remaining_generation_limits_after_prefix(
+                            max_tokens=restored_request_output_tokens,
+                            min_tokens=getattr(request, "min_tokens", None),
+                            generation_token_count=(
+                                admission.generation_cut.generation_token_count
+                            ),
+                        )
+                        if (
+                            remaining_output_tokens is not None
+                            and remaining_output_tokens > 0
+                        ):
+                            actual_request_max_tokens = remaining_output_tokens
+                        if remaining_min_tokens is not None:
+                            request.min_tokens = remaining_min_tokens
+                    if engine_prefix_token_ids:
+                        worker_self._enter_request_prefix(
+                            request, engine_prefix_token_ids
+                        )
 
                 if (
                     not hasattr(request, "required_prefix_token_ids")
@@ -1108,7 +1604,10 @@ class VllmAsyncGenerationWorkerImpl(
                         request,
                         res[1][0]["prompt_token_ids"],
                         admission=admission,
+                        prefix_token_ids=capture_prefix_token_ids,
                         media=media,
+                        generation_cut=generation_cut,
+                        resumed_generation_token_ids=resumed_generation_token_ids,
                     )
                     return res
 
@@ -1152,23 +1651,57 @@ class VllmAsyncGenerationWorkerImpl(
 
                 engine_prompt = res[1][0]
 
-                splice = splice_prefix_tokens(
-                    tokenizer=self.renderer.tokenizer,
-                    model_prefix_token_ids=model_prefix_token_ids,
-                    template_prefix_token_ids=actual_corresponding_token_ids,
-                    template_token_ids=engine_prompt["prompt_token_ids"],
-                )
-                final_prompt_token_ids = splice.token_ids
-                media = await asyncio.to_thread(
-                    worker_self._capture_request_media,
-                    engine_prompt,
-                    admission=admission,
-                    splice=splice,
-                )
+                splice = None
+                if generation_cut is not None:
+                    # The durable prefix is the exact engine prompt at the cut;
+                    # rendering/splicing it again could add or drop tokens.
+                    final_prompt_token_ids = model_prefix_token_ids
+                    media = None
+                else:
+                    splice = splice_prefix_tokens(
+                        tokenizer=self.renderer.tokenizer,
+                        model_prefix_token_ids=model_prefix_token_ids,
+                        template_prefix_token_ids=actual_corresponding_token_ids,
+                        template_token_ids=engine_prompt["prompt_token_ids"],
+                    )
+                    final_prompt_token_ids = splice.token_ids
+                    media = await asyncio.to_thread(
+                        worker_self._capture_request_media,
+                        engine_prompt,
+                        admission=admission,
+                        splice=splice,
+                    )
                 engine_prompt["prompt_token_ids"] = final_prompt_token_ids
 
+                restored_prefix_terminal = None
+                if generation_cut is not None:
+                    try:
+                        restored_prefix_terminal = _classify_restored_prefix_terminal(
+                            prompt_token_ids=final_prompt_token_ids,
+                            generation_token_count=(
+                                admission.generation_cut.generation_token_count
+                            ),
+                            requested_output_tokens=restored_request_output_tokens,
+                            model_max_tokens=self.model_config.max_model_len,
+                            terminal_finish_reason=(
+                                admission.generation_cut.terminal_finish_reason
+                            ),
+                            terminal_stop_reason=(
+                                admission.generation_cut.terminal_stop_reason
+                            ),
+                        )
+                    except ValueError as error:
+                        raise VLLMValidationError(
+                            str(error),
+                            parameter="generation_prefix",
+                            value=admission.generation_cut.generation_token_count,
+                        ) from error
+
                 # Clamp after prefix replacement since the prompt length may have changed.
-                if actual_request_max_tokens is not None:
+                if (
+                    restored_prefix_terminal is None
+                    and actual_request_max_tokens is not None
+                ):
                     self._clamp_max_tokens(
                         request,
                         actual_request_max_tokens,
@@ -1184,7 +1717,27 @@ class VllmAsyncGenerationWorkerImpl(
                     admission=admission,
                     prefix_token_ids=capture_prefix_token_ids,
                     media=media,
+                    generation_cut=generation_cut,
+                    resumed_generation_token_ids=resumed_generation_token_ids,
                 )
+
+                if restored_prefix_terminal is not None:
+                    request.min_tokens = 0
+                    self._set_max_tokens(request, 1)
+                    engine_prompt[_RESTORED_PREFIX_TERMINAL_PROMPT_KEY] = (
+                        restored_prefix_terminal
+                    )
+                    if len(final_prompt_token_ids) == self.model_config.max_model_len:
+                        engine_prompt["prompt_token_ids"] = final_prompt_token_ids[:-1]
+                    request._restored_prefix_terminal = restored_prefix_terminal
+                    LOGGER.info(
+                        "generation prefix already terminal: "
+                        "rollout_id=%s model_call_id=%s prefix_tokens=%d reason=%s",
+                        admission.rollout_id,
+                        admission.model_call_id,
+                        restored_prefix_terminal.generation_token_count,
+                        restored_prefix_terminal.reason,
+                    )
 
                 return res
 
@@ -1200,11 +1753,62 @@ class VllmAsyncGenerationWorkerImpl(
             # Ledger-authoritative token capture: the call identity the ledger
             # attaches (rollout_id, call_id, parent_call_id, prev_len, mode).
             ng_capture: Optional[dict[str, Any]] = None
+            _restored_prefix_terminal: _RestoredPrefixTerminal | None = PrivateAttr(
+                default=None
+            )
+            _restored_generation_token_ids: tuple[int, ...] = PrivateAttr(default=())
+
+            def to_sampling_params(self, *args, **kwargs):
+                sampling_params = super().to_sampling_params(*args, **kwargs)
+                if (
+                    worker_self._generation_prefix_cuts_enabled
+                    and self.ng_capture is not None
+                ):
+                    sampling_params.output_kind = RequestOutputKind.DELTA
+                    worker_self._record_request_effective_output_limit(
+                        self, int(sampling_params.max_tokens)
+                    )
+                return sampling_params
 
         # vLLM 0.25 routes both /v1/chat/completions and /tokenize through
         # OnlineRenderer.preprocess_chat, so the prefix-token override
         # belongs on the renderer subclass.
         worker_self = self
+
+        @app.post("/ng-control/v1/generation-cut")
+        async def checkpoint_generation_cut(
+            inventory: dict[str, Any],
+            authorization: str | None = Header(default=None),
+        ):
+            """Persist one checkpoint's frozen active-call prefixes to TQ."""
+            import secrets
+
+            from nemo_gym._checkpoint.generation_cut import GenerationCutInventory
+
+            expected = worker_self._generation_cut_control_token
+            supplied = (
+                authorization.removeprefix("Bearer ")
+                if authorization is not None and authorization.startswith("Bearer ")
+                else ""
+            )
+            if not worker_self._generation_prefix_cuts_enabled or expected is None:
+                raise HTTPException(
+                    status_code=404, detail="generation-prefix cuts are disabled"
+                )
+            if not secrets.compare_digest(supplied, expected):
+                raise HTTPException(status_code=401, detail="invalid control bearer")
+            typed_inventory = GenerationCutInventory.model_validate(inventory)
+            # Measured from arrival so time queued behind a stale cut counts.
+            timeout_s = worker_self._generation_cut_control_timeout_s
+            deadline = None if timeout_s is None else time.monotonic() + timeout_s
+            receipt = await worker_self._run_generation_cut_control(
+                functools.partial(
+                    worker_self._checkpoint_generation_cut,
+                    typed_inventory,
+                    deadline=deadline,
+                )
+            )
+            return receipt.model_dump(mode="json")
 
         class NeMoRLOpenAIServingChatMixin:
             async def chat_completion_full_generator(
@@ -1230,13 +1834,53 @@ class VllmAsyncGenerationWorkerImpl(
                         parameter="top_logprobs",
                     )
 
+                aggregate_deltas = bool(
+                    worker_self._generation_prefix_cuts_enabled
+                    and request.ng_capture is not None
+                )
                 final_res = None
+                delta_accumulator = _RequestOutputDeltaAccumulator()
 
                 async def capture_result_generator():
                     nonlocal final_res
                     async for res in result_generator:
-                        final_res = res
-                        yield res
+                        worker_self._observe_request_capture(request, res)
+                        if not aggregate_deltas:
+                            final_res = res
+                            worker_self._restore_response_prefix(
+                                request,
+                                res,
+                                tokenizer=self.renderer.tokenizer,
+                            )
+                            yield res
+                            continue
+                        delta_accumulator.append(res)
+
+                    if not aggregate_deltas or delta_accumulator.template is None:
+                        return
+                    final_res = delta_accumulator.build()
+                    worker_self._restore_response_prefix(
+                        request,
+                        final_res,
+                        tokenizer=self.renderer.tokenizer,
+                    )
+                    yield final_res
+
+                restored_parser_prefix = request._restored_generation_token_ids
+                if restored_parser_prefix:
+                    if len(args) >= 6 and args[5] is not None:
+                        mutable_args = list(args)
+                        mutable_args[5] = _RestoredPrefixParser(
+                            delegate=args[5],
+                            prefix_token_ids=restored_parser_prefix,
+                        )
+                        args = tuple(mutable_args)
+                    elif kwargs.get("parser") is not None:
+                        kwargs = dict(kwargs)
+                        kwargs["parser"] = _RestoredPrefixParser(
+                            delegate=kwargs["parser"],
+                            prefix_token_ids=restored_parser_prefix,
+                        )
 
                 response = await super().chat_completion_full_generator(
                     request,
@@ -1249,6 +1893,32 @@ class VllmAsyncGenerationWorkerImpl(
                     or final_res is None
                 ):
                     return response
+
+                restored_prefix_terminal = request._restored_prefix_terminal
+                if (
+                    isinstance(restored_prefix_terminal, _RestoredPrefixTerminal)
+                    and response.usage is not None
+                ):
+                    response.usage.prompt_tokens = (
+                        restored_prefix_terminal.original_prompt_token_count
+                    )
+                    response.usage.completion_tokens = (
+                        restored_prefix_terminal.generation_token_count
+                    )
+                    response.usage.total_tokens = (
+                        response.usage.prompt_tokens + response.usage.completion_tokens
+                    )
+                    if response.prompt_token_ids is not None:
+                        response.prompt_token_ids = list(
+                            restored_prefix_terminal.prompt_token_ids[
+                                : restored_prefix_terminal.original_prompt_token_count
+                            ]
+                        )
+                    request_metadata = (
+                        args[4] if len(args) >= 5 else kwargs.get("request_metadata")
+                    )
+                    if request_metadata is not None:
+                        request_metadata.final_usage_info = response.usage
 
                 if request.logprobs and return_as_token_id:
                     response = attach_token_information_to_chat_response_choices(
@@ -2270,6 +2940,21 @@ class VllmAsyncGenerationWorkerImpl(
         await self.llm.pause_generation(mode="keep", clear_cache=clear_cache)
         return True
 
+    async def begin_token_capture_snapshot_fence_async(self) -> bool:
+        """Fence terminal staging without pausing vLLM decoding."""
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "begin_token_capture_snapshot_fence_async requires async_engine=True"
+            )
+        gate = self._token_capture_snapshot_gate
+        # Take the epoch on the loop, in call order with the matching end: if
+        # the driver times out and releases first, the late close is a no-op.
+        epoch = gate.begin_epoch()
+        await asyncio.get_running_loop().run_in_executor(
+            self._token_capture_fence_executor, gate.close_and_wait, epoch
+        )
+        return True
+
     async def resume_generation_async(self) -> bool:
         """Resume vLLM generation after an in-flight weight update."""
         assert self.llm is not None, (
@@ -2282,6 +2967,15 @@ class VllmAsyncGenerationWorkerImpl(
             )
 
         await self.llm.resume_generation()
+        return True
+
+    async def end_token_capture_snapshot_fence_async(self) -> bool:
+        """Release terminal token staging after the TQ snapshot is durable."""
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "end_token_capture_snapshot_fence_async requires async_engine=True"
+            )
+        self._token_capture_snapshot_gate.reopen()
         return True
 
     async def sleep_async(self):
@@ -2330,6 +3024,22 @@ class VllmAsyncGenerationWorkerImpl(
     async def shutdown(self) -> bool:
         """Clean up vLLM resources."""
         try:
+            # A terminal write may be waiting at the TQ snapshot fence when the
+            # actor is asked to stop. Release it before retiring the isolated
+            # cut-control and fence executors; waiting for a wedged TQ write
+            # here would otherwise make actor shutdown hang indefinitely.
+            token_capture_snapshot_gate = getattr(
+                self, "_token_capture_snapshot_gate", None
+            )
+            if token_capture_snapshot_gate is not None:
+                token_capture_snapshot_gate.reopen()
+            for executor_name in (
+                "_generation_cut_control_executor",
+                "_token_capture_fence_executor",
+            ):
+                executor = getattr(self, executor_name, None)
+                if executor is not None:
+                    executor.shutdown(wait=False, cancel_futures=True)
             if self.server_thread is not None:
                 self.http_server.should_exit = True
                 await asyncio.to_thread(self.server_thread.join)

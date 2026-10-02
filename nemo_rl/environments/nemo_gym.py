@@ -1927,6 +1927,8 @@ def _build_gym_actor_config(
             .setdefault("vllm_model", {})
         )
         policy_overrides["checkpoint_policy"] = True
+        if instance_token_capture.get("generation_prefix_cuts_enabled", False):
+            policy_overrides["checkpoint_generation_cuts"] = True
 
     return NemoGymConfig(
         model_name=model_name,

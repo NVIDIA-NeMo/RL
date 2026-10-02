@@ -106,6 +106,7 @@ from nemo_rl.environments.gym_checkpoint_coordinator import (
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
+    RecoveryTargetLevel,
     RolloutRecoveryLedger,
 )
 from nemo_rl.experience.route_plan import (
@@ -1748,6 +1749,70 @@ class TestPeriodicRolloutCheckpoint:
         assert not result.saved
         assert result.reason == "no_data_plane_mutations"
         assert actor._dp_client.save_calls == []
+
+    @pytest.mark.parametrize(
+        ("prefix_cuts_enabled", "restore_level", "expect_save"),
+        [
+            (True, RecoveryTargetLevel.PREFIX, True),
+            (False, RecoveryTargetLevel.PREFIX, False),
+            (True, RecoveryTargetLevel.TURN, False),
+        ],
+    )
+    def test_unchanged_data_plane_still_cuts_a_decoding_prefix(
+        self,
+        tmp_path: Path,
+        prefix_cuts_enabled: bool,
+        restore_level: RecoveryTargetLevel,
+        expect_save: bool,
+    ) -> None:
+        """Decoding grows a recoverable prefix without mutating the data plane."""
+
+        class _SaveStarted(Exception):
+            pass
+
+        actor = self._actor(tmp_path)
+        actor._generation_prefix_cuts_enabled = prefix_cuts_enabled
+        ledger = actor._rollout_recovery_ledger
+
+        async def dispatch() -> None:
+            async with actor._data_plane_checkpoint_barrier.mutation() as cut:
+                ledger.reserve_group(
+                    cut,
+                    group_id="g7",
+                    admission_id="batch-7",
+                    prompt_id="7",
+                    prompt_payload={"idx": 7, "message_log": []},
+                    expected_generations=2,
+                    target_step=0,
+                    start_weight_version=0,
+                    restore_level=restore_level,
+                    admitted=True,
+                )
+                ledger.mark_group_dispatched(
+                    cut, "g7", gym_instance_id="tools/replica-0"
+                )
+
+        asyncio.run(dispatch())
+        actor._last_rollout_snapshot_mutation_version = (
+            actor._data_plane_checkpoint_barrier.mutation_version
+        )
+        result = None
+        try:
+            with patch.object(
+                actor._checkpointer, "finalize_pending", side_effect=_SaveStarted
+            ):
+                try:
+                    result = asyncio.run(actor._save_rollout_checkpoint())
+                except _SaveStarted:
+                    pass
+        finally:
+            actor._checkpointer.shutdown()
+
+        if expect_save:
+            assert result is None
+        else:
+            assert result is not None
+            assert result.reason == "no_data_plane_mutations"
 
     def test_periodic_pump_reports_each_consecutive_failure(
         self,

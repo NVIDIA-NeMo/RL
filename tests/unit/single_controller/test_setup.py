@@ -67,6 +67,7 @@ from nemo_rl.algorithms.single_controller_utils import (
 )
 from nemo_rl.algorithms.single_controller_utils.config import (
     RolloutCheckpointConfig,
+    RolloutRecoveryConfig,
     TokenCaptureConfig,
     _validate_opd_full_config,
     validate_single_controller_config,
@@ -684,6 +685,35 @@ def test_rollout_recovery_functional_config_resolves_to_runtime_contract(
     assert master_config.async_rl.rollout_failure.nemo_gym.rollout_timeout_s == 120
 
 
+@pytest.mark.parametrize(
+    ("target_level", "turn_checkpointing", "generation_prefix_cuts"),
+    [
+        (RecoveryTargetLevel.PREFIX, True, True),
+        (RecoveryTargetLevel.TURN, True, False),
+        (RecoveryTargetLevel.SIBLING, False, False),
+        (RecoveryTargetLevel.PROMPT_GROUP, False, False),
+    ],
+)
+def test_recovery_target_enables_required_checkpoint_capabilities(
+    target_level: RecoveryTargetLevel,
+    turn_checkpointing: bool,
+    generation_prefix_cuts: bool,
+):
+    config = RolloutRecoveryConfig(target_level=target_level)
+
+    assert config.turn_checkpointing_enabled is turn_checkpointing
+    assert config.generation_prefix_cuts_enabled is generation_prefix_cuts
+
+
+@pytest.mark.parametrize(
+    "removed_field",
+    ["preserve_generation_prefixes", "generation_chunk_flush_tokens"],
+)
+def test_recovery_config_rejects_removed_prefix_fields(removed_field: str):
+    with pytest.raises(ValueError, match=removed_field):
+        RolloutRecoveryConfig.model_validate({removed_field: True})
+
+
 class TestSetup:
     """setup arg validation + actor_args assembly."""
 
@@ -1042,18 +1072,26 @@ class TestSetup:
 
         assert mock_spinup.call_args.kwargs["turn_checkpointing_enabled"] is False
 
-    def test_turn_recovery_requires_periodic_snapshots(self):
+    @pytest.mark.parametrize(
+        "target_level", [RecoveryTargetLevel.TURN, RecoveryTargetLevel.PREFIX]
+    )
+    def test_gym_state_recovery_requires_periodic_snapshots(
+        self, target_level: RecoveryTargetLevel
+    ):
         mc = _make_master_config(env={"should_use_nemo_gym": True})
         mc.policy["generation"]["vllm_cfg"] = {
             "async_engine": True,
             "expose_http_server": True,
         }
         mc.token_capture.enabled = True
-        mc.rollout_recovery.target_level = RecoveryTargetLevel.TURN
+        mc.rollout_recovery.target_level = target_level
 
         with pytest.raises(
             ValueError,
-            match="target_level='turn' requires.*snapshot_attempt_interval_s",
+            match=(
+                f"target_level='{target_level.value}' requires.*"
+                "snapshot_attempt_interval_s"
+            ),
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
@@ -1991,6 +2029,11 @@ class TestSetup:
         generation, _ = patched_factories["_build_generation"].return_value
         _, setup_kwargs = generation.setup_token_capture.call_args
         assert setup_kwargs["capture_media"] is with_processor
+        # Workers bound a generation cut by Gym's control timeout, counted
+        # from when the cut request reaches them.
+        assert setup_kwargs["generation_cut_control_timeout_s"] == (
+            mc.token_capture.control_timeout_s
+        )
 
     def test_nemo_gym_coverage_failure_shuts_down_shards(self, patched_factories):
         mc = _make_master_config(colocated=False, backend="vllm")

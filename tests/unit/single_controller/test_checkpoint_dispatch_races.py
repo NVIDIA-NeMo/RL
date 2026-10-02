@@ -830,6 +830,7 @@ def test_turn_checkpoint_drains_on_wire_reply_before_tq_cut(tmp_path: Path) -> N
         controller._rollout_manager = _deadline_pausing_manager()
         controller._rollout_recovery_ledger = ledger
         controller._data_plane_checkpoint_barrier = barrier
+        controller._generation_prefix_cuts_enabled = False
 
         async def complete_on_wire_reply() -> None:
             while not any(
@@ -914,6 +915,7 @@ def test_completion_callback_can_run_while_gym_commit_is_pending(
         controller._rollout_manager = _deadline_pausing_manager()
         controller._rollout_recovery_ledger = ledger
         controller._data_plane_checkpoint_barrier = barrier
+        controller._generation_prefix_cuts_enabled = False
 
         async def checkpoint() -> GymCheckpointCommitResult:
             async with controller._prepared_gym_checkpoint(
@@ -1037,6 +1039,7 @@ def test_turn_checkpoint_aborts_when_candidate_is_neither_exported_nor_drained(
         controller._rollout_manager = _deadline_pausing_manager()
         controller._rollout_recovery_ledger = ledger
         controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+        controller._generation_prefix_cuts_enabled = False
 
         with pytest.raises(TimeoutError, match="neither|classify every candidate"):
             async with controller._prepared_gym_checkpoint(
@@ -1090,6 +1093,7 @@ def test_turn_checkpoint_fails_fast_on_parked_session_without_an_owner(
         controller._rollout_dispatch_admission_gate = RolloutDispatchAdmissionGate()
         controller._rollout_manager = _deadline_pausing_manager()
         controller._rollout_recovery_ledger = ledger
+        controller._generation_prefix_cuts_enabled = False
 
         async def checkpoint() -> None:
             async with controller._prepared_gym_checkpoint(
@@ -1141,6 +1145,7 @@ def _controller_for(
     controller._rollout_dispatch_admission_gate = RolloutDispatchAdmissionGate()
     controller._rollout_manager = _deadline_pausing_manager()
     controller._rollout_recovery_ledger = ledger
+    controller._generation_prefix_cuts_enabled = False
     return controller
 
 
@@ -1259,6 +1264,7 @@ def test_turn_checkpoint_rejects_missing_gym_staging_key(tmp_path: Path) -> None
         controller._rollout_dispatch_admission_gate = RolloutDispatchAdmissionGate()
         controller._rollout_manager = _deadline_pausing_manager()
         controller._rollout_recovery_ledger = ledger
+        controller._generation_prefix_cuts_enabled = False
         controller._dp_client = NoOpDataPlaneClient()
         controller._master_config = SimpleNamespace(
             token_capture=SimpleNamespace(staging_partition="rollout_staging")
@@ -1790,6 +1796,7 @@ def test_turn_checkpoint_commits_owned_gym_episode_before_tq_cut(
         controller._rollout_dispatch_admission_gate = RolloutDispatchAdmissionGate()
         controller._rollout_manager = _deadline_pausing_manager()
         controller._rollout_recovery_ledger = ledger
+        controller._generation_prefix_cuts_enabled = False
 
         async with controller._prepared_gym_checkpoint(
             tmp_path,
@@ -1809,6 +1816,57 @@ def test_turn_checkpoint_commits_owned_gym_episode_before_tq_cut(
             ),
             "tq-cut",
             ("resume", "save-1"),
+        ]
+
+    asyncio.run(exercise())
+
+
+def test_prefix_checkpoint_fences_terminal_writes_through_tq_cut(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        ledger = RolloutRecoveryLedger()
+        coordinator = _SavingGymCoordinator()
+
+        class FakeGeneration:
+            def begin_token_capture_snapshot_fence(self, *, timeout_s=None):
+                coordinator.events.append(("generation-fence", timeout_s))
+                return True
+
+            def end_token_capture_snapshot_fence(self, *, timeout_s=None):
+                coordinator.events.append(("generation-release", timeout_s))
+                return True
+
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        controller = object.__new__(controller_cls)
+        controller._gym_checkpoint_coordinator = coordinator
+        controller._rollout_dispatch_admission_gate = RolloutDispatchAdmissionGate()
+        controller._rollout_manager = _deadline_pausing_manager()
+        controller._rollout_recovery_ledger = ledger
+        controller._generation_prefix_cuts_enabled = True
+        controller._gen = FakeGeneration()
+        controller._master_config = SimpleNamespace(
+            token_capture=SimpleNamespace(control_timeout_s=17.0)
+        )
+
+        async with controller._prepared_gym_checkpoint(
+            tmp_path,
+            checkpoint_id="save-prefix-1",
+        ):
+            coordinator.events.append("tq-cut")
+
+        assert coordinator.events == [
+            ("generation-fence", 17.0),
+            ("prepare", "save-prefix-1"),
+            (
+                "commit",
+                "save-prefix-1",
+                tmp_path,
+                {"tools/replica-0": ()},
+            ),
+            "tq-cut",
+            ("resume", "save-prefix-1"),
+            ("generation-release", 17.0),
         ]
 
     asyncio.run(exercise())
@@ -2278,6 +2336,7 @@ def _gym_checkpoint_controller(
         suspend_request_deadlines=registry.suspend,
         resume_request_deadlines=registry.resume,
     )
+    controller._generation_prefix_cuts_enabled = False
     return controller
 
 
@@ -2710,6 +2769,67 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
             saved = load_gym_checkpoint_manifest(tmp_path)
             assert set(saved.instances["tools/replica-0"]) == {row_0}
             assert saved.staging_keys == {"tools/replica-0": (key_0,)}
+
+        asyncio.run(exercise())
+
+    def test_the_tq_capture_expects_only_the_kept_episodes_rows(
+        self, tmp_path: Path
+    ) -> None:
+        """The TQ capture must not expect the rows of an episode RL dropped."""
+
+        async def exercise() -> None:
+            barrier = DataPlaneCheckpointBarrier()
+            ledger = RolloutRecoveryLedger()
+            async with barrier.mutation() as cut:
+                group = _dispatched_two_sibling_group(ledger, cut)
+            row_0, row_1 = (
+                GymCheckpointEpisode(*group.gym_episode(index)) for index in (0, 1)
+            )
+            key_0 = f"{row_0.rollout_id}/call-0"
+            key_1 = f"{row_1.rollout_id}/call-0"
+            coordinator = _DiskLiveSessionGymCoordinator(
+                live={row_0, row_1},
+                while_prepared=lambda: self._drop(ledger, barrier, group.group_id, [1]),
+            )
+            coordinator.staging_keys_by_episode = {row_0: (key_0,), row_1: (key_1,)}
+            controller = _controller_for(coordinator, ledger)
+            controller._data_plane_checkpoint_barrier = barrier
+            controller._master_config = SimpleNamespace(
+                token_capture=SimpleNamespace(staging_partition="rollout_staging")
+            )
+
+            async def list_sample_ids(method: str, *, partition_id: str) -> list[str]:
+                assert (method, partition_id) == ("list_sample_ids", "rollout_staging")
+                return [key_0]
+
+            controller._call_dp = list_sample_ids
+            expected_by_capture: list[set[str]] = []
+
+            async def capture(
+                cut, checkpoint_path, *, additional_expected_staging_keys
+            ):
+                expected_by_capture.append(set(additional_expected_staging_keys))
+                return "captured"
+
+            controller._capture_rollout_checkpoint_cut = capture
+
+            async def save() -> None:
+                async with controller._prepared_gym_checkpoint(
+                    tmp_path, checkpoint_id="save-1"
+                ) as gym_commit:
+                    assert gym_commit is not None
+                    async with barrier.checkpoint() as cut:
+                        assert (
+                            await controller._capture_coordinated_rollout_checkpoint_cut(
+                                cut, tmp_path, gym_commit=gym_commit
+                            )
+                            == "captured"
+                        )
+
+            await asyncio.wait_for(save(), _ASYNC_TEST_TIMEOUT_S)
+
+            # The dropped row's staging is gone; expecting it would fail the cut.
+            assert expected_by_capture == [{key_0}]
 
         asyncio.run(exercise())
 
