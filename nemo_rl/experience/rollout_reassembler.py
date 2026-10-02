@@ -41,6 +41,7 @@ from typing import Any, Optional, cast
 
 import torch
 
+from nemo_rl.data.captured_media import MediaColumnSpec
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import MASK_SAMPLE, ROUTE_PLAN_TAG, TRUNCATED
@@ -180,6 +181,29 @@ def _trainer_media(staged: StagedMediaTensors) -> dict[str, PackedTensor]:
     return media
 
 
+def _empty_trainer_media(
+    spec: MediaColumnSpec, num_rows: int
+) -> dict[str, PackedTensor]:
+    """Media fields for a group in which no rollout carried media.
+
+    Each logical row gets a zero-row segment in ``_trainer_media``'s layout
+    (``[0, 3*P*P]`` pixels, ``[0, 2]`` sizes, ``[0]`` frames) rather than no
+    segment at all: a segment-less row ships nothing, so the group would
+    publish without the media columns and TransferQueue would narrow any
+    train fetch that mixes its keys with media keys. A zero-row segment
+    keeps the column present, in the pinned dtype, and rebuilds on the
+    trainer as a ``[0, 3*P*P]`` tensor the Omni model treats as "no images".
+    """
+    pixels = torch.empty(0, spec.pixel_feature_dim, dtype=spec.pixel_dtype)
+    sizes = torch.empty(0, 2, dtype=torch.int32)
+    frames = torch.empty(0, dtype=torch.int32)
+    return {
+        "pixel_values": PackedTensor([pixels] * num_rows, dim_to_pack=0),
+        "imgs_sizes": PackedTensor([sizes] * num_rows, dim_to_pack=0),
+        "num_frames": PackedTensor([frames] * num_rows, dim_to_pack=0),
+    }
+
+
 def _media_fields_for_group(rows: list[FinalizedRollout]) -> dict[str, PackedTensor]:
     """Stack per-rollout media into group-level PackedTensors, one logical row each.
 
@@ -217,6 +241,7 @@ class RolloutReassembler:
         router_replay_enabled: bool = False,
         defer_routed_experts_to_policy: bool = False,
         capture_media: bool = False,
+        media_columns: Optional[MediaColumnSpec] = None,
     ) -> None:
         self._dp_client = dp_client
         self._partition_id = partition_id
@@ -224,6 +249,12 @@ class RolloutReassembler:
         # ``token_capture.enabled and processor is not None``). Text-only runs
         # never read media columns; media-enabled runs must find them.
         self._capture_media = capture_media
+        if capture_media and media_columns is None:
+            raise ValueError(
+                "media capture requires media_columns (the pixel dtype and patch "
+                "size the serving workers pinned the staging column to)"
+            )
+        self._media_columns = media_columns
         self._pad_token_id = int(pad_token_id)
         self._max_seq_len = int(max_seq_len)
         self._router_replay_enabled = router_replay_enabled
@@ -732,14 +763,11 @@ class RolloutReassembler:
         # (pack_payload encodes PackedTensor fields and mints row-shape tags).
         media_fields = _media_fields_for_group(rows)
         if self._capture_media and not media_fields:
-            return self._drop_group(
-                group_id,
-                reason="media capture on, no valid rollout carried media",
-                staging_keys=staging_keys,
-                group_min_wv=group_min_wv,
-                group_max_wv=group_max_wv,
-                metrics=metrics,
-            )
+            # No valid rollout carried media (an all-text prompt, or every
+            # rollout a placeholder). Publish empty media rows so the group
+            # keeps the partition's media columns; see _empty_trainer_media.
+            assert self._media_columns is not None
+            media_fields = _empty_trainer_media(self._media_columns, len(rows))
         train_batch.update(media_fields)
         sample_ids, fields, tags = pack_payload(
             train_batch,

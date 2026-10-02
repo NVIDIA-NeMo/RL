@@ -3208,6 +3208,11 @@ def test_token_capture_megatron_registers_media_columns_only_for_multimodal(
     actor_args.gen_handle.setup_token_capture.assert_called_once_with(
         ANY, mc.token_capture.staging_partition, capture_media=multimodal
     )
+    # What the workers pinned the media column to is what the finalizers get.
+    assert (
+        finalizer_config.media_columns
+        is actor_args.gen_handle.setup_token_capture.return_value
+    )
 
 
 @pytest.mark.mcore

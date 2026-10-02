@@ -46,6 +46,7 @@ from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
     StagedCallRecord,
 )
 
+from nemo_rl.data.captured_media import MediaColumnSpec  # noqa: E402
 from nemo_rl.data.multimodal_utils import (  # noqa: E402
     WIRE_MULTIMODAL_FIELDS,
     PackedTensor,
@@ -914,6 +915,7 @@ MEDIA_CANONICAL_PARTITION = "rollout_data_media_fin_test"
 MEDIA_STAGING_PARTITION = "rollout_staging_media_fin_test"
 MEDIA_PIXEL_DTYPE = torch.bfloat16
 MEDIA_PATCH = 2
+MEDIA_COLUMNS = MediaColumnSpec(pixel_dtype=MEDIA_PIXEL_DTYPE, patch_size=MEDIA_PATCH)
 
 
 @pytest.fixture()
@@ -1002,7 +1004,16 @@ def _media_finalizer(tq_client, **overrides) -> RolloutReassembler:
         capture_media=True,
     )
     kwargs.update(overrides)
+    if kwargs["capture_media"]:
+        kwargs.setdefault("media_columns", MEDIA_COLUMNS)
     return RolloutReassembler(tq_client, **kwargs)
+
+
+def test_media_finalizer_requires_the_media_column_spec(tq_client, media_partitions):
+    """The spec is what empty media rows are minted from, so a media run
+    cannot be built without it (the sink refuses a missing dtype the same way)."""
+    with pytest.raises(ValueError, match="media_columns"):
+        _media_finalizer(tq_client, media_columns=None)
 
 
 def _assert_staging_cleared(tq_client, staging_keys: list[str]) -> None:
@@ -1229,18 +1240,21 @@ def test_finalize_group_publishes_media_with_empty_rows_for_text_siblings(
     ],
     ids=["media-all-placeholders", "media-valid-text-row", "text-all-placeholders"],
 )
-def test_finalize_group_drops_group_without_any_media_row_only_in_media_runs(
+def test_finalize_group_without_any_media_row_publishes_empty_media_rows(
     tq_client, media_partitions, case, capture_media
 ):
-    """A media capture run never publishes a group whose valid rows carry no media.
+    """A media capture run publishes a group whose valid rows carry no media
+    with empty media rows in the partition's pinned geometry.
 
-    Such a group would land in the canonical partition without the media columns;
-    TransferQueue answers a batch fetch with only the fields every requested key
-    produced, so a train shard mixing its keys with media keys would lose
-    ``pixel_values`` for the media rows too and run image-blind. Text-only runs
-    (``capture_media=False``) keep publishing placeholder-only groups.
+    Without them the group would land in the canonical partition without the
+    media columns; TransferQueue answers a batch fetch with only the fields
+    every requested key produced, so a train shard mixing its keys with media
+    keys would lose ``pixel_values`` for the media rows too and run
+    image-blind. The empty rows are zero-row segments, not segment-less rows:
+    the latter ship nothing, so the column would still be absent. Text-only
+    runs (``capture_media=False``) publish no media columns at all.
     """
-    group_id = f"mm-drop-{case}-{capture_media}"
+    group_id = f"mm-empty-{case}-{capture_media}"
     rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
     if case == "valid-text-row":
         # A staged rollout whose engine payload carried no media: valid, but text.
@@ -1259,21 +1273,82 @@ def test_finalize_group_drops_group_without_any_media_row_only_in_media_runs(
         prompt_idx=3,
     )
 
+    assert not finalized.dropped
+    assert finalized.meta is not None
+    assert finalized.meta.sample_ids == rollout_ids
+    assert "finalize/group_dropped" not in finalized.metrics
     if not capture_media:
-        assert not finalized.dropped
-        assert finalized.meta is not None
-        assert finalized.meta.sample_ids == rollout_ids
         assert set(finalized.meta.fields).isdisjoint(WIRE_MULTIMODAL_FIELDS)
         return
 
-    assert finalized.dropped
-    assert finalized.meta is None
-    assert "media" in (finalized.drop_reason or "")
-    assert finalized.metrics["finalize/group_dropped"] == 1.0
-    # Nothing was published, and the staged call rows were cleared.
-    published = set(tq_client.list_sample_ids(MEDIA_CANONICAL_PARTITION))
-    assert published.isdisjoint(rollout_ids)
+    assert finalized.metrics["finalize/media_row_rate"] == 0.0
+    assert {"pixel_values", "imgs_sizes", "num_frames"} <= set(finalized.meta.fields)
+    feature_dim = 3 * MEDIA_PATCH**2
+    tags = finalized.meta.tags
+    for tag in tags:
+        assert tag[row_shapes_key("pixel_values")]["shapes"] == [[0, feature_dim]]
     if case == "valid-text-row":
+        # Published like any other group: the staged call rows are released.
         _assert_staging_cleared(
             tq_client, [r["staging_key"] for r in receipts[0]["manifest"]]
         )
+
+    rows = tq_client.get_samples(
+        sample_ids=rollout_ids,
+        partition_id=MEDIA_CANONICAL_PARTITION,
+        select_fields=["input_ids", "pixel_values", "imgs_sizes", "num_frames"],
+    )
+    fields = {
+        name: rows.get(name) for name in ("pixel_values", "imgs_sizes", "num_frames")
+    }
+    reassemble_packed_multimodal(fields, tags)
+    pixels = fields["pixel_values"]
+    assert isinstance(pixels, PackedTensor)
+    assert pixels.logical_segment_counts_by_row() == [1, 1]
+    # Rebuilds as a zero-row tensor in the pinned dtype and patch width, which
+    # the Omni model treats as "no images" (``images.numel() > 0`` gate).
+    dense = pixels.as_tensor()
+    assert dense.shape == (0, feature_dim)
+    assert dense.dtype == MEDIA_PIXEL_DTYPE
+    assert fields["imgs_sizes"].as_tensor().shape == (0, 2)
+    assert fields["num_frames"].as_tensor().shape == (0,)
+
+
+def test_all_text_group_shares_a_train_fetch_with_a_media_group(
+    tq_client, media_partitions
+):
+    """The point of the empty rows: keys of an all-text group and a media
+    group fetched together return every media column (no TQ narrowing), and
+    the rebuilt ``pixel_values`` carries exactly the media group's pixels."""
+    text_ids = ["mm-mixed-text_g0", "mm-mixed-text_g1"]
+    media_ids = ["mm-mixed-media_g0", "mm-mixed-media_g1"]
+    text_receipt, _, _ = _stage_media_rollout(tq_client, text_ids[0], media=False)
+    media_receipt, _, bundles = _stage_media_rollout(tq_client, media_ids[0])
+    finalizer = _media_finalizer(tq_client)
+    finalize = dict(mask_sample=[False, False], fallback_weight_version=4, prompt_idx=3)
+    text_group = finalizer.finalize_group(
+        "mm-mixed-text", text_ids, [text_receipt, None], [1.0, 0.0], **finalize
+    )
+    media_group = finalizer.finalize_group(
+        "mm-mixed-media", media_ids, [media_receipt, None], [1.0, 0.0], **finalize
+    )
+    assert not text_group.dropped and not media_group.dropped
+
+    sample_ids = text_ids + media_ids
+    rows = tq_client.get_samples(
+        sample_ids=sample_ids,
+        partition_id=MEDIA_CANONICAL_PARTITION,
+        select_fields=["input_ids", "pixel_values", "imgs_sizes", "num_frames"],
+    )
+    fields = {
+        name: rows.get(name) for name in ("pixel_values", "imgs_sizes", "num_frames")
+    }
+    tags = list(text_group.meta.tags) + list(media_group.meta.tags)
+    reassemble_packed_multimodal(fields, tags)
+    pixels = fields["pixel_values"]
+    # Empty rows hold one zero-row segment; the media row one image; the media
+    # group's placeholder sibling none (padded by _media_fields_for_group).
+    assert pixels.logical_segment_counts_by_row() == [1, 1, 1, 0]
+    assert torch.equal(pixels.as_tensor(), bundles[0]["imgs"].squeeze(0))
+    assert fields["imgs_sizes"].as_tensor().tolist() == [[4, 4]]
+    assert fields["num_frames"].as_tensor().tolist() == [1]

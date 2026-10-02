@@ -37,6 +37,7 @@ from nemo_gym.token_id_capture.staging.records import (
 
 from nemo_rl.data.captured_media import (
     MediaCaptureRejected,
+    MediaColumnSpec,
     pack_images,
 )
 from nemo_rl.data.captured_media import (
@@ -220,6 +221,10 @@ def receipt(*records, rollout_id="r0", terminal=None):
 
 def finalizer(dp, **kwargs):
     kwargs.setdefault("capture_media", True)
+    if kwargs["capture_media"]:
+        kwargs.setdefault(
+            "media_columns", MediaColumnSpec(pixel_dtype=torch.float32, patch_size=1)
+        )
     return RolloutReassembler(
         dp,
         partition_id="train",
@@ -1354,3 +1359,26 @@ async def test_retained_media_rejection_precedes_inference_and_survives_gym(
     )
     assert isinstance(failure, GymTransportError)
     assert "retained_media_changed" in str(failure)
+
+
+def test_media_column_spec_feature_dim_matches_pack_images_width() -> None:
+    """One packed patch row is ``3*P*P`` wide, the width ``pack_images`` emits."""
+    spec = MediaColumnSpec(pixel_dtype=torch.bfloat16, patch_size=2)
+    pixels = torch.zeros(3, 4, 4)
+    packed = pack_images(pixels.unsqueeze(0), torch.tensor([[4, 4]]), patch_size=2)
+    assert spec.pixel_feature_dim == packed.shape[-1] == 12
+
+
+@pytest.mark.parametrize(
+    ("pixel_dtype", "patch_size", "error"),
+    [
+        ("bfloat16", 2, TypeError),
+        (torch.bfloat16, 0, ValueError),
+        (torch.bfloat16, 2.0, ValueError),
+    ],
+)
+def test_media_column_spec_rejects_malformed_geometry(
+    pixel_dtype, patch_size, error
+) -> None:
+    with pytest.raises(error):
+        MediaColumnSpec(pixel_dtype=pixel_dtype, patch_size=patch_size)

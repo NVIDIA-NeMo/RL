@@ -14,6 +14,7 @@ nemo_gym = pytest.importorskip("nemo_gym.token_id_capture.staging")
 # megatron_worker imports megatron.core at module level; skip when it is absent.
 pytest.importorskip("megatron.core")
 
+from nemo_rl.data.captured_media import MediaColumnSpec  # noqa: E402
 from nemo_rl.models.generation.megatron.megatron_generation import (  # noqa: E402
     MegatronGeneration,
 )
@@ -37,12 +38,13 @@ def inference_loop():
 
 
 class _WorkerGroup:
-    def __init__(self) -> None:
+    def __init__(self, replies=(None, None)) -> None:
         self.calls: list[tuple[str, dict]] = []
+        self.replies = list(replies)
 
     def run_all_workers_single_data(self, method_name: str, **kwargs):
         self.calls.append((method_name, kwargs))
-        return [True, False]
+        return self.replies
 
 
 def test_generation_setup_token_capture_fans_tq_config_to_workers(monkeypatch):
@@ -56,7 +58,7 @@ def test_generation_setup_token_capture_fans_tq_config_to_workers(monkeypatch):
     )
 
     dp_cfg = {"backend": "simple"}
-    generation.setup_token_capture(dp_cfg, "rollout_staging")
+    assert generation.setup_token_capture(dp_cfg, "rollout_staging") is None
 
     assert worker_group.calls == [
         (
@@ -68,6 +70,26 @@ def test_generation_setup_token_capture_fans_tq_config_to_workers(monkeypatch):
             },
         )
     ]
+
+
+def test_generation_setup_token_capture_returns_the_coordinators_media_spec(
+    monkeypatch,
+) -> None:
+    """Followers report nothing; the one spec the coordinators pinned comes back."""
+    spec = MediaColumnSpec(pixel_dtype=torch.float16, patch_size=16)
+    generation = object.__new__(MegatronGeneration)
+    generation.cfg = {"mcore_generation_config": {"expose_http_server": True}}
+    generation._policy = SimpleNamespace(worker_group=_WorkerGroup([spec, None]))
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.megatron.megatron_generation.ray.get",
+        lambda value: value,
+    )
+    assert (
+        generation.setup_token_capture(
+            {"backend": "simple"}, "rollout_staging", capture_media=True
+        )
+        is spec
+    )
 
 
 def test_generation_setup_token_capture_requires_exposed_http_server() -> None:
@@ -168,7 +190,7 @@ def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
     worker._request_payload_stager = None
     worker._request_prompt_preparer = None
 
-    assert worker.setup_token_capture({}, "rollout_staging")
+    assert worker.setup_token_capture({}, "rollout_staging") is None  # text-only
     assert (
         worker.dynamic_inference_engine.payload_stager is worker._request_payload_stager
     )
@@ -193,7 +215,7 @@ def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
     follower._token_capture_enabled = False
     follower._request_payload_stager = None
     follower._request_prompt_preparer = None
-    assert not follower.setup_token_capture({}, "rollout_staging")
+    assert follower.setup_token_capture({}, "rollout_staging") is None
     # Followers accept weight-version stamps even though they host no hooks.
     assert follower._token_capture_enabled is True
     assert follower.dynamic_inference_engine.payload_stager is None
@@ -284,10 +306,18 @@ def test_worker_media_capture_requires_image_preprocessing(
         assert worker._token_capture_enabled is False
         return
 
-    assert worker.setup_token_capture(
+    spec = worker.setup_token_capture(
         {}, "rollout_staging", capture_media=capture_media
     )
     assert installed == [expected_sink]
+    # Media capture reports the pinned dtype with the wrapper's patch size, so
+    # the reassembler mints empty media rows in the staged column's geometry.
+    _, pinned_dtype = expected_sink
+    assert spec == (
+        MediaColumnSpec(pixel_dtype=pinned_dtype, patch_size=16)
+        if capture_media
+        else None
+    )
 
 
 def test_worker_media_capture_requires_vision_encoder_on_coordinator(

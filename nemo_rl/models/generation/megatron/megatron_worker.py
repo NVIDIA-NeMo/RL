@@ -76,6 +76,7 @@ from torch.distributed.distributed_c10d import (
     _world,
 )
 
+from nemo_rl.data.captured_media import MediaColumnSpec
 from nemo_rl.data.multimodal_utils import CACHED_VIDEO_FRAME_MANIFEST_MAGIC
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.held_port import receive_held_socket
@@ -995,12 +996,14 @@ class MegatronGenerationMixin:
         staging_partition: str,
         *,
         capture_media: bool = False,
-    ) -> bool:
+    ) -> MediaColumnSpec | None:
         """Install canonical TQ capture on each MInf model-parallel leader.
 
         ``capture_media`` builds the sink/source against the media-enabled
         staging schema so the stager can hand the engine's media tensors to
-        TQ beside each call's tokens.
+        TQ beside each call's tokens. Returns the media column spec the
+        coordinator pinned the staging column to (``None`` for text-only
+        capture and on followers, which host no hooks).
         """
         engine = self.dynamic_inference_engine
         if engine is None:
@@ -1024,7 +1027,7 @@ class MegatronGenerationMixin:
             )
         self._token_capture_enabled = True
         if not engine.is_mp_coordinator:
-            return False
+            return None
 
         from nemo_rl.data_plane import build_data_plane_client
         from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
@@ -1057,7 +1060,13 @@ class MegatronGenerationMixin:
         )
         engine.payload_stager = stager
         self._request_payload_stager = stager
-        return True
+        if not capture_media:
+            return None
+        assert pixel_dtype is not None
+        return MediaColumnSpec(
+            pixel_dtype=pixel_dtype,
+            patch_size=int(self._image_preprocessing_config.patch_dim),
+        )
 
     def set_rollout_weight_version(self, version: int) -> None:
         """Stamp subsequent MInf requests with the trainer weight version."""

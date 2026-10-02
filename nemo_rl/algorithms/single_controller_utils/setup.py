@@ -1934,12 +1934,18 @@ def setup_single_controller(
             partition_id=partition_id,
             include_multimodal_fields=processor is not None,
         )
+    media_columns = None
     if token_capture_cfg.enabled:
-        generation.setup_token_capture(
+        media_columns = generation.setup_token_capture(
             dp_config,
             token_capture_cfg.staging_partition,
             capture_media=capture_media,
         )
+        if capture_media and media_columns is None:
+            raise RuntimeError(
+                "media capture is enabled but no serving worker reported the "
+                "media column spec it pinned the staging column to"
+            )
         generation.set_rollout_weight_version(0)
 
     if weight_synchronizer is None:
@@ -2003,6 +2009,7 @@ def setup_single_controller(
                 defer_routed_experts_to_policy=token_capture_cfg.defer_routed_experts_to_policy,
                 max_seq_len=_generation_max_seq_len(generation_config),
                 capture_media=capture_media,
+                media_columns=media_columns,
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,
         )
