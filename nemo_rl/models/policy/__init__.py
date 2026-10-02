@@ -299,6 +299,13 @@ class MegatronOptimizerConfig(TypedDict):
     optimizer_offload_fraction: float
     # overlap optimizer state transfers with CPU optimizer updates
     overlap_cpu_optimizer_d2h_h2d: NotRequired[bool]
+    # Keep optimizer tensor state and master weights in pinned CPU memory between updates
+    # while the update runs on GPU in chunks. Mutually exclusive with optimizer_cpu_offload.
+    chunked_optimizer_state_offload: NotRequired[bool]
+    # Target GPU staging-window size per optimizer state chunk in MiB (0 = one full window).
+    optimizer_state_offload_chunk_size_mb: NotRequired[int]
+    # Approximate byte fraction of optimizer parameter bundles to offload (0 disables).
+    optimizer_state_offload_fraction: NotRequired[float]
     # Precision-aware Adam moment / remainder dtypes (YAML strings resolved in setup).
     exp_avg_dtype: NotRequired[str]
     exp_avg_sq_dtype: NotRequired[str]
