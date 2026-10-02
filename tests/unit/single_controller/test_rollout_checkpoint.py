@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import Mock, call
@@ -178,6 +179,8 @@ def test_bootstrap_anchor_mismatch_names_redacted_config_paths(tmp_path: Path) -
 
 def test_bootstrap_fingerprint_ignores_default_operational_paths() -> None:
     base = {
+        "env": {},
+        "reward_penalties": {},
         "policy": {
             "model_name": "model-a",
             "optimizer": {"lr": 1.0e-6},
@@ -385,6 +388,8 @@ def test_bootstrap_fingerprint_rejects_rollout_semantic_changes(
     changed: dict[str, Any],
 ) -> None:
     base = {
+        "env": {},
+        "reward_penalties": {},
         "policy": {
             "model_name": "model-a",
             "tokenizer": {"name": "tokenizer-a"},
@@ -948,3 +953,55 @@ def test_manifest_rejects_dispatch_index_below_initial_state():
 
     with pytest.raises(ValueError, match="sampler_dispatch_index.*at least -1"):
         RolloutSnapshotManifest.from_mapping(raw)
+
+
+def test_capture_bootstrap_uses_semantic_reward_settings(tmp_path: Path) -> None:
+    base = {
+        "token_capture": {"enabled": True},
+        "reward_penalties": {
+            "penalize_unwanted_tokens": True,
+            "token_ids": {"unwanted": [42, 7, 42]},
+        },
+        "env": {
+            "nemo_gym": {"effort_levels": {"low_weight": 1, "low_string": "budget"}}
+        },
+    }
+    identity = bootstrap_compatibility_identity(
+        cast(Any, _DumpedConfig(deepcopy(base)))
+    )
+    anchor = ensure_bootstrap_anchor(tmp_path, identity=identity)
+    equivalent = deepcopy(base)
+    equivalent["reward_penalties"]["experiment_note"] = "retry"
+    equivalent["reward_penalties"]["token_ids"] = {
+        "unwanted": [7, 42],
+        "note": "unused",
+    }
+    equivalent["env"]["nemo_gym"]["effort_levels"].update(
+        low_ub=64000, low_penalty=1, note="unused"
+    )
+    validate_bootstrap_anchor(
+        anchor,
+        identity=bootstrap_compatibility_identity(cast(Any, _DumpedConfig(equivalent))),
+    )
+    changed = deepcopy(base)
+    changed["env"]["nemo_gym"]["effort_levels"]["low_weight"] = 2
+    with pytest.raises(ValueError, match="low_weight"):
+        validate_bootstrap_anchor(
+            anchor,
+            identity=bootstrap_compatibility_identity(
+                cast(Any, _DumpedConfig(changed))
+            ),
+        )
+
+
+def test_capture_bootstrap_normalizes_disabled_effort() -> None:
+    base = {"token_capture": {"enabled": True}, "reward_penalties": {}, "env": {}}
+    changed = {
+        **base,
+        "env": {
+            "nemo_gym": {"effort_levels": {"low_weight": 0, "low_string": "unused"}}
+        },
+    }
+    assert bootstrap_fingerprint(
+        cast(Any, _DumpedConfig(base))
+    ) == bootstrap_fingerprint(cast(Any, _DumpedConfig(changed)))
