@@ -27,6 +27,7 @@ from nemo_rl.experience.rollout_reassembler import (
     RolloutReassembler,
     RolloutSelection,
 )
+from nemo_rl.experience.rollout_recovery import _receipt_staging_keys
 from nemo_rl.utils.rpc_guard import assert_metadata_only
 from nemo_rl.utils.venvs import make_actor_runtime_env
 
@@ -72,18 +73,18 @@ class ReassemblyRequest:
         ):
             raise ValueError("Canonical owners must match dispatch slots")
         if any(
-            not selection.response_ids
-            or len(set(selection.response_ids)) != len(selection.response_ids)
+            len(set(selection.response_ids)) != len(selection.response_ids)
             or len(selection.action_flags) != len(selection.response_ids)
             for selection in self.logical_selections
         ):
-            raise ValueError(
-                "Selection must be nonempty, unique and parallel to action flags"
-            )
-        for owner, receipt in zip(self.rollout_ids, self.receipts, strict=True):
+            raise ValueError("Selection must be unique and parallel to action flags")
+        for owner, receipt, selection in zip(
+            self.rollout_ids, self.receipts, self.logical_selections, strict=True
+        ):
             parsed = RolloutReceipt.model_validate(receipt)
-            if parsed.pending_call_ids:
-                raise ValueError("Unresolved capture acknowledgement; preserve staging")
+            _receipt_staging_keys(receipt)
+            if not selection.response_ids and not parsed.capture_poisoned:
+                raise ValueError("Trainable capture requires a nonempty selection")
             if parsed.rollout_id != owner or any(
                 record.staging_key != staging_key(owner, record.model_call_id)
                 for record in parsed.manifest
