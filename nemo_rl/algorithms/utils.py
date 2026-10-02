@@ -298,37 +298,24 @@ def masked_mean(
     return torch.sum(values * mask, dim=dim) / (normalization_factor + 1e-8)
 
 
-def mask_out_neg_inf_logprobs(
-    logprobs: torch.Tensor, mask: torch.Tensor, logprobs_name: str
+def mask_filtered_logprobs_outside_tokens(
+    logprobs: torch.Tensor, mask: torch.Tensor
 ) -> torch.Tensor:
-    """Mask out negative infinity log probabilities.
+    """Zero top-k/top-p filtered log probabilities outside ``mask``.
 
-    Handling sampling mask mismatch:
-    vLLM samples token X from top-k/p filtered distribution -> generation_logprobs[X] is always finite (e.g., -5.41)
-    during training: policy computes logprobs with same top-k/p settings, but the distribution can be slightly different
-    token X may fall outside the training policy's top-k/p set -> curr_logprobs[X] = -inf, prev_logprobs[X] = -inf
-    Detect positions with -inf in any logprobs (generation_logprobs is always finite for valid tokens)
+    Prompt and padding tokens are often outside the filtered support and would
+    otherwise carry -inf (or NaN after multiplying by a mask) to every consumer.
+    Valid tokens keep -inf so the actor loss can exclude policy support
+    mismatches instead of treating them as log-probability zero.
 
     Args:
-        logprobs: Log probabilities.
-        mask: Mask.
-        logprobs_name: Name of the logprobs tensor. Used for printing warning messages.
+        logprobs: Filtered log probabilities.
+        mask: Valid-token mask (token_mask * sample_mask).
 
     Returns:
-        Masked log probabilities.
+        Log probabilities with zeros outside ``mask``.
     """
-    is_neginf = torch.isinf(logprobs)
-    neginf_count = (is_neginf & mask.bool()).sum().item()
-    if neginf_count > 0:
-        print(
-            f"[WARNING]: {neginf_count}/{int(mask.sum().item())} valid tokens have -inf in {logprobs_name} "
-            "(policy top-k/top-p mismatch). Masking out these positions."
-        )
-
-    mask = mask * (~is_neginf).float()
-    logprobs = torch.where(mask.bool(), logprobs, 0.0)
-
-    return logprobs
+    return torch.where(mask.bool(), logprobs, 0.0)
 
 
 def masked_var(
