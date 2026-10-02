@@ -26,11 +26,17 @@ uv run examples/run_vlm_grpo.py \
     logger.tensorboard_enabled=True \
     checkpointing.enabled=True \
     checkpointing.checkpoint_dir=$CKPT_DIR \
+    policy.megatron_cfg.optimizer.optimizer_cpu_offload=True \
+    policy.megatron_cfg.optimizer.optimizer_offload_fraction=1.0 \
     $@ \
     2>&1 | tee $RUN_LOG
 
 # Convert tensorboard logs to json
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
+
+# Require ten completed steps before accepting the nightly's metric checks.
+uv run tests/check_metrics.py $JSON_METRICS \
+    'sorted(map(int, data["train/loss"].keys()))[-1] >= 10'
 
 # Only run metrics if the target step is reached
 # Logprob gate matches vlm_grpo-gemma4-e4b-geo3k-1n8g-automodel.sh, the VLM

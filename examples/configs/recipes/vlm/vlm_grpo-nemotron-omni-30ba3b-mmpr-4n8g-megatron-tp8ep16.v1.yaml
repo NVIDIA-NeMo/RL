@@ -14,7 +14,6 @@ checkpointing:
   checkpoint_must_save_by: 00:03:45:00
 policy:
   train_global_batch_size: 2048
-  logprob_chunk_size: 1024
   megatron_cfg:
     empty_unused_memory_level: 2
     expert_model_parallel_size: 16
@@ -34,7 +33,7 @@ policy:
       load_format: auto
       enforce_eager: false
       max_model_len: ${policy.max_total_sequence_length}
-      gpu_memory_utilization: 0.75
+      gpu_memory_utilization: 0.6
     vllm_kwargs:
       max_num_batched_tokens: 32768
       max_num_seqs: 512

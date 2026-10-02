@@ -9,10 +9,12 @@ policy:
   model_name: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
   train_global_batch_size: 8
   logprob_batch_size: 1
+  logprob_chunk_size: 1024
   max_total_sequence_length: 8192
   sequence_packing:
     enabled: true
   megatron_cfg:
+    defer_fp32_logits: true
     env_vars:
       TORCH_CUDA_ARCH_LIST: '9.0'
     tensor_model_parallel_size: 8
