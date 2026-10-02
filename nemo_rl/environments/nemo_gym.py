@@ -1177,14 +1177,27 @@ Depending on your data shape, you may want to change these values."""
         that never returned a completion (the ledger commit precedes the
         response leaving the server) and can never be a lineage parent (an
         uncommitted call has no row to resolve against) — e.g. the doomed
-        final call of a rollout that exhausted the model's context window.
-        Such rows are structurally off-chain and do not poison; if the
-        *terminal* request itself died this way, the missing-terminal-row
-        check below still masks the rollout. Every other failure reason
-        (for example ``worker_capture_failed``,
+        final call of a rollout that exhausted the model's context window,
+        or a call cancelled mid-flight when the harness ends the session at
+        its budget. Such rows are structurally off-chain and do not poison;
+        if the *terminal* request itself died this way, the
+        missing-terminal-row check below still masks the rollout. Every
+        other failure reason (for example ``worker_capture_failed``,
         ``invalid_worker_commit_coordinates``, or ``unresolved_parent``; a
         reason-less failure row poisons as ``capture_failed``) marks a call
         whose completion WAS served — a hole in the chain — and poisons.
+
+        The ledger keeps every failed call's intent pending (ambiguous
+        custody: the worker may have staged tokens whose acknowledgement was
+        lost). At rollout end that ambiguity is resolvable here: the attempt
+        admits no further calls after a failure, so no commit can ever
+        arrive, and the seal derives a cleanup staging key for every
+        attempted call (``_receipt_staging_keys``), which covers a staged
+        but unacknowledged row. The receipt therefore drops pending ids that
+        carry a failure row; without this, one budget-killed in-flight call
+        makes the terminal receipt unsealable and aborts the run. A pending
+        id with no failure row means the request may still be executing, so
+        it stays pending and the seal keeps refusing the receipt.
         """
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture import UNCOMMITTED_CALL_REASON
@@ -1248,11 +1261,19 @@ Depending on your data shape, you may want to change these values."""
             )
         elif terminal_record is None:
             failure_reason = selection_reason or "missing_terminal_row"
+        failed_call_ids = {
+            str(failure.get("model_call_id")) for failure in failures
+        }
+        pending_call_ids = [
+            call_id
+            for call_id in manifest.get("pending_call_ids", [])
+            if str(call_id) not in failed_call_ids
+        ]
         return {
             "rollout_id": rollout_id,
             "reward": reward,
             "attempted_call_ids": manifest.get("attempted_call_ids", []),
-            "pending_call_ids": manifest.get("pending_call_ids", []),
+            "pending_call_ids": pending_call_ids,
             "terminal_model_call_id": (
                 terminal_record.get("model_call_id")
                 if terminal_record is not None
