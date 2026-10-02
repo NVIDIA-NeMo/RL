@@ -7,6 +7,10 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from nemo.lens import NemoLensConfig, setup_telemetry
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+    InMemorySpanExporter,
+)
 
 from nemo_rl.algorithms.sft_v2 import (
     SFT_V2_TEED_METRICS,
@@ -16,14 +20,6 @@ from nemo_rl.algorithms.sft_v2 import (
 from nemo_rl.telemetry.instrumentation import umbrella_span
 from nemo_rl.telemetry.metrics import map_teed_scalars
 from nemo_rl.telemetry.span_groups import RLSpanGroup
-
-try:
-    from nemo.lens import NemoLensConfig, setup_telemetry
-    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
-        InMemorySpanExporter,
-    )
-except ImportError:
-    NemoLensConfig = None
 
 
 def test_sft_v2_step_metrics_have_otel_series() -> None:
@@ -37,7 +33,6 @@ def test_sft_v2_step_metrics_have_otel_series() -> None:
     assert mapped == {row.key: values[row.logger_key] for row in SFT_V2_TEED_METRICS}
 
 
-@pytest.mark.skipif(NemoLensConfig is None, reason="nemo-lens is not installed")
 @pytest.mark.parametrize(("groups", "expected"), [("per_step", True), ("setup", False)])
 def test_sft_v2_step_spans_follow_the_enabled_groups(
     groups: str, expected: bool

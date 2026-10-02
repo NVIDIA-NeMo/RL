@@ -33,6 +33,8 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.telemetry.instrumentation import (
     dispatch_with_trace_context,
+    setup_span,
+    startup_span,
     umbrella_span,
 )
 from nemo_rl.telemetry.setup import init_telemetry_driver, shutdown_telemetry
@@ -82,11 +84,14 @@ def main() -> None:
 
     try:
         with umbrella_span(RLSpanGroup.U_JOB, "rl.sft_v2.driver"):
-            init_ray()
-            processor = get_tokenizer(
-                master_config.policy["tokenizer"], get_processor=True
-            )
-            actor_args = setup_sft_v2(master_config, processor)
+            with startup_span():
+                init_ray()
+                with setup_span("tokenizer"):
+                    processor = get_tokenizer(
+                        master_config.policy["tokenizer"], get_processor=True
+                    )
+                with setup_span("workers"):
+                    actor_args = setup_sft_v2(master_config, processor)
             controller = SFTSingleControllerActor.remote(master_config, actor_args)
             try:
                 result = ray.get(

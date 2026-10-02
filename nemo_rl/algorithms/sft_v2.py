@@ -69,27 +69,32 @@ from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import Logger, LoggerConfig
 from nemo_rl.utils.timer import TimeoutChecker
 
+LOADER_LATENCY_MAX_KEY = "loader_latency_max"
+POLICY_TIME_KEY = "policy_time"
+TOTAL_STEP_TIME_KEY = "total_step_time"
+VALID_TOKENS_PER_SECOND_KEY = "valid_tokens_per_second"
+
 SFT_V2_TEED_METRICS = (
     TeedMetric(
-        "loader_latency_max",
+        LOADER_LATENCY_MAX_KEY,
         "rl.sft_v2.loader.latency.max",
         unit="s",
         description="Slowest data-loader rank per SFT v2 step.",
     ),
     TeedMetric(
-        "policy_time",
+        POLICY_TIME_KEY,
         "rl.sft_v2.policy.duration",
         unit="s",
         description="Controller policy update duration per SFT v2 step.",
     ),
     TeedMetric(
-        "total_step_time",
+        TOTAL_STEP_TIME_KEY,
         "rl.sft_v2.step.duration",
         unit="s",
         description="Wall-clock duration of an SFT v2 step.",
     ),
     TeedMetric(
-        "valid_tokens_per_second",
+        VALID_TOKENS_PER_SECOND_KEY,
         "rl.sft_v2.valid_tokens_per_second",
         unit="{token}/s",
         description="Supervised token throughput per SFT v2 step.",
@@ -345,17 +350,17 @@ class SFTSingleControllerActor:
         loader_seconds = [envelope.load_seconds for envelope in envelopes]
         loader_latency_max = max(loader_seconds)
         metrics: dict[str, Any] = {
-            "loader_latency_max": loader_latency_max,
+            LOADER_LATENCY_MAX_KEY: loader_latency_max,
             "loader_latency_mean": statistics.fmean(loader_seconds),
             "loader_copy_imbalance": loader_latency_max - min(loader_seconds),
-            "policy_time": policy_seconds,
-            "total_step_time": time.monotonic() - started,
+            POLICY_TIME_KEY: policy_seconds,
+            TOTAL_STEP_TIME_KEY: time.monotonic() - started,
             "valid_tokens": valid_tokens,
             "source_samples": sum(len(envelope.source_ids) for envelope in envelopes),
             "physical_packs": sum(
                 len(envelope.meta.sample_ids) for envelope in envelopes
             ),
-            "valid_tokens_per_second": valid_tokens
+            VALID_TOKENS_PER_SECOND_KEY: valid_tokens
             / max(time.monotonic() - started, 1e-12),
         }
         metrics.update(self._policy_metrics(train_results))

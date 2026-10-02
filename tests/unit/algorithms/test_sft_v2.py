@@ -23,6 +23,7 @@ from unittest.mock import MagicMock, create_autospec, patch
 import pytest
 
 from nemo_rl.algorithms.sft_v2 import (
+    SFT_V2_TEED_METRICS,
     SFTSingleControllerActor,
     SFTV2SaveState,
     _max_train_steps,
@@ -133,6 +134,7 @@ def test_train_step_orders_split_policy_lifecycle_and_commit() -> None:
     assert metrics["valid_tokens"] == 8
     assert metrics["source_samples"] == 3
     assert metrics["physical_packs"] == 2
+    assert {row.logger_key for row in SFT_V2_TEED_METRICS} <= set(metrics)
 
 
 def test_train_step_aborts_policy_and_loader_on_training_failure() -> None:
