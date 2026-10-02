@@ -25,7 +25,6 @@ from functools import lru_cache
 from pathlib import Path
 from time import monotonic
 from typing import Any, Dict, List, NotRequired, Optional, Protocol, TypedDict
-from uuid import uuid4
 
 import ray
 import torch
@@ -212,7 +211,7 @@ def _prepare_native_nemo_gym_rows(
     attach the agent reference that RL uses for metrics and teacher selection.
     """
     # Gym is an optional worker dependency, unavailable in the training driver.
-    from nemo_gym.episode_types import EpisodeId, TaskId
+    from nemo_gym.episode_types import TaskId
 
     for row in rows:
         if not is_nemo_gym_task(row):
@@ -243,34 +242,6 @@ def _prepare_native_nemo_gym_rows(
         row["_ng_environment_server"] = server_name
         row["agent_ref"] = dict(agent_ref)
 
-        # Native dispatch sends only task_id/task_input. Cohort verifiers need
-        # the same RL group coordinates that legacy /run received at top level.
-        task_data = get_nemo_gym_task_input(row).get("task_data")
-        if not isinstance(task_data, dict):
-            raise TypeError("NeMo-Gym native task_input.task_data must be a dict")
-        for key in ("_ng_group_id", "_ng_group_attempt", "_ng_rollout_index"):
-            if key in row:
-                task_data[key] = row[key]
-
-        # Explicit capture IDs belong to the caller (the token-capture path uses
-        # its staging ID). Otherwise keep a prompt group's siblings distinct and
-        # its retries attached to the same logical rollout.
-        if "_ng_rollout_id" not in row:
-            group_id = row.get("_ng_group_id")
-            rollout_index = row.get("_ng_rollout_index")
-            row["_ng_rollout_id"] = (
-                f"{group_id}-{rollout_index}"
-                if group_id is not None and rollout_index is not None
-                else uuid4().hex
-            )
-            row["_ng_attempt_index"] = row.get("_ng_group_attempt", 0)
-        EpisodeId.model_validate(
-            {
-                "rollout_id": row["_ng_rollout_id"],
-                "attempt": row.get("_ng_attempt_index", 0),
-            }
-        )
-
 
 def _normalize_nemo_gym_episode_result(row: dict, reply: Any) -> dict:
     """Validate a native episode reply and retain its training result and IDs.
@@ -283,7 +254,8 @@ def _normalize_nemo_gym_episode_result(row: dict, reply: Any) -> dict:
         return reply
 
     # Gym is only installed in the rollout worker's optional environment.
-    from nemo_gym.episode_types import BaseEpisodeResponse, EpisodeId
+    from nemo_gym.episode_types import BaseEpisodeResponse
+    from nemo_gym.rollout_correlation import maybe_rollout_id_from_run_body
 
     # Environment protocols may extend EpisodeFailure (single_agent_turn adds
     # stage and partial_response). Validate the common contract without rejecting
@@ -300,12 +272,10 @@ def _normalize_nemo_gym_episode_result(row: dict, reply: Any) -> dict:
             },
         }
     response = BaseEpisodeResponse[dict[str, Any]].model_validate(envelope)
-    expected_episode = EpisodeId(
-        rollout_id=row["_ng_rollout_id"], attempt=row.get("_ng_attempt_index", 0)
-    )
+    expected_capture_key = maybe_rollout_id_from_run_body(row)
     if response.task_id.model_dump() != row["task_id"]:
         raise RolloutDataFailure("NeMo-Gym episode reply has a mismatched task_id")
-    if response.episode_id != expected_episode:
+    if response.episode_id.capture_key != expected_capture_key:
         raise RolloutDataFailure("NeMo-Gym episode reply has a mismatched episode_id")
     if response.failure is not None:
         failure = response.failure
@@ -1161,7 +1131,6 @@ Depending on your data shape, you may want to change these values."""
         assert isinstance(nemo_gym_result, dict), (
             f"Hit a non-successful response when querying NeMo Gym for rollouts: {nemo_gym_result}"
         )
-        rollout_id = nemo_gym_row[_NG_ROLLOUT_ID_BODY_KEY]
         if is_nemo_gym_task(nemo_gym_row):
             # Native episode capture includes its attempt suffix. Read the same
             # identity the Environment Server used when calling the model.
@@ -1170,6 +1139,8 @@ Depending on your data shape, you may want to change these values."""
             rollout_id = EpisodeId.model_validate(
                 nemo_gym_result["_ng_episode_id"]
             ).capture_key
+        else:
+            rollout_id = nemo_gym_row[_NG_ROLLOUT_ID_BODY_KEY]
         # Gym's TERMINAL_RESPONSE_ID_KEY: the served response envelope id the
         # harness kept (``response.id``), not the logical-request header.
         terminal_response_id = nemo_gym_result.get("terminal_response_id")
