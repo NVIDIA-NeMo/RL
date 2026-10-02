@@ -548,6 +548,7 @@ def _make_gym_impl(
 
     impl = object.__new__(AsyncNemoGymRolloutImpl)
     impl._forest_training = False
+    impl._dispatch_admission_gate = None
     impl._tokenizer = _FakeTokenizer()
     impl._task_to_env = {"nemo_gym": type("Env", (), {"run_rollouts": gym_method})()}
     impl._num_generations_per_prompt = num_generations

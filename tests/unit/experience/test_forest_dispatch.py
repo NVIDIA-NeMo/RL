@@ -362,7 +362,7 @@ def test_forest_retry_and_restart_reuse_durable_selection(
         manager = _make_capture_manager(
             _FakeCaptureBuffer(),
             retry_policy=policy,
-            recovery_config=RolloutRecoveryConfig(default_granularity=granularity),
+            recovery_config=RolloutRecoveryConfig(target_level=granularity),
         )
         manager._forest_training = True
         manager._execution_row_multiple = 1
@@ -372,7 +372,14 @@ def test_forest_retry_and_restart_reuse_durable_selection(
     calls, observed = [], {}
 
     async def run(
-        _sample, *, rollout_ids, generation_indices, on_completion, recovery_granularity
+        _sample,
+        *,
+        rollout_ids,
+        generation_indices,
+        on_completion,
+        recovery_granularity,
+        gym_instance_id=None,
+        dispatch_recorder=None,
     ):
         calls.append((list(rollout_ids), list(generation_indices)))
         for index in generation_indices:
@@ -469,13 +476,20 @@ def test_forest_unsafe_custody_never_reaches_cleanup(
     harness, plane, _ = recovery_stack
     buffer = _FakeCaptureBuffer()
     manager = _make_capture_manager(
-        buffer, recovery_config=RolloutRecoveryConfig(default_granularity=granularity)
+        buffer, recovery_config=RolloutRecoveryConfig(target_level=granularity)
     )
     manager._forest_training = True
     calls = []
 
     async def run(
-        _sample, *, rollout_ids, generation_indices, on_completion, recovery_granularity
+        _sample,
+        *,
+        rollout_ids,
+        generation_indices,
+        on_completion,
+        recovery_granularity,
+        gym_instance_id=None,
+        dispatch_recorder=None,
     ):
         calls.append(rollout_ids)
         for index in generation_indices:
