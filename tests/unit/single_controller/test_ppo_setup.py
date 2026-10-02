@@ -22,6 +22,7 @@ training cluster after the policy has stepped off it.
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -286,15 +287,103 @@ class TestPPOValidation:
         with pytest.raises(ValueError, match="the `ppo` block is absent"):
             validate_single_controller_config(mc)
 
-    def test_rejects_multi_chunk_streaming(self):
-        """PPO cannot spread one full-batch optimizer epoch across chunks."""
-        mc = _ppo_master_config(min_groups_for_streaming_train=1)
+    @pytest.mark.parametrize("critic_epochs", [1, 2])
+    def test_accepts_streaming_with_one_policy_epoch(self, critic_epochs):
+        mc = _ppo_master_config(min_groups_for_streaming_train=1, megatron_enabled=True)
+        mc.ppo.ppo_epochs = 1
+        mc.ppo.critic_ppo_epochs = critic_epochs
+        mc.ppo.adv_estimator.normalize_advantages = False
 
-        with pytest.raises(
-            ValueError,
-            match=r"min_groups_for_streaming_train \(1\) == "
-            rf"num_prompts_per_step \({_NUM_PROMPTS_PER_STEP}\)",
-        ):
+        validate_single_controller_config(mc)
+
+    def test_rejects_streaming_with_multiple_policy_epochs(self):
+        mc = _ppo_master_config(min_groups_for_streaming_train=1, megatron_enabled=True)
+        mc.ppo.ppo_epochs = 2
+        mc.ppo.adv_estimator.normalize_advantages = False
+
+        with pytest.raises(ValueError, match=r"ppo\.ppo_epochs.*1"):
+            validate_single_controller_config(mc)
+
+    def test_full_batch_retains_multiple_policy_epochs(self):
+        mc = _ppo_master_config()
+        mc.ppo.ppo_epochs = 2
+
+        validate_single_controller_config(mc)
+
+    @pytest.mark.parametrize(
+        ("min_groups", "normalize_advantages", "expect_warning"),
+        [(1, True, True), (1, False, False), (_NUM_PROMPTS_PER_STEP, True, False)],
+        ids=["streaming-normalized", "streaming-unnormalized", "full-batch"],
+    )
+    def test_chunk_normalization_warning(
+        self, min_groups: int, normalize_advantages: bool, expect_warning: bool
+    ) -> None:
+        mc = _ppo_master_config(
+            min_groups_for_streaming_train=min_groups, megatron_enabled=True
+        )
+        mc.ppo.ppo_epochs = 1
+        mc.ppo.adv_estimator.normalize_advantages = normalize_advantages
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            validate_single_controller_config(mc)
+
+        assert len(caught) == int(expect_warning)
+        if expect_warning:
+            assert caught[0].category is UserWarning
+            assert "normalizes GAE advantages per chunk" in str(caught[0].message)
+            assert "instead of across the full batch" in str(caught[0].message)
+
+    def test_rejects_streaming_without_megatron_policy(self):
+        mc = _ppo_master_config(min_groups_for_streaming_train=1)
+        mc.ppo.ppo_epochs = 1
+        mc.ppo.adv_estimator.normalize_advantages = False
+
+        with pytest.raises(ValueError, match="Megatron"):
+            validate_single_controller_config(mc)
+
+    @pytest.mark.parametrize("fsdp_key", ["use_custom_fsdp", "use_megatron_fsdp"])
+    def test_rejects_streaming_with_megatron_fsdp(self, fsdp_key):
+        mc = _ppo_master_config(min_groups_for_streaming_train=1, megatron_enabled=True)
+        mc.ppo.ppo_epochs = 1
+        mc.ppo.adv_estimator.normalize_advantages = False
+        mc.policy["megatron_cfg"]["distributed_data_parallel_config"] = {fsdp_key: True}
+
+        with pytest.raises(ValueError, match="classic Megatron DDP"):
+            validate_single_controller_config(mc)
+
+    @pytest.mark.parametrize(
+        ("use_distributed_optimizer", "overlap_param_gather", "fp8_param"),
+        [
+            (True, False, True),
+            (True, True, True),
+            (False, False, True),
+            (True, True, False),
+        ],
+        ids=["shared", "shared-overlap", "unsharded", "compute-only"],
+    )
+    def test_streaming_mxfp8_guard_only_rejects_shared_gradient_buffers(
+        self, use_distributed_optimizer, overlap_param_gather, fp8_param
+    ):
+        mc = _ppo_master_config(min_groups_for_streaming_train=1, megatron_enabled=True)
+        mc.ppo.ppo_epochs = 1
+        mc.ppo.adv_estimator.normalize_advantages = False
+        mc.policy["megatron_cfg"]["distributed_data_parallel_config"] = {
+            "overlap_param_gather": overlap_param_gather
+        }
+        mc.policy["megatron_cfg"]["optimizer"] = {
+            "use_distributed_optimizer": use_distributed_optimizer
+        }
+        mc.policy["megatron_cfg"]["fp8_cfg"] = {
+            "enabled": True,
+            "fp8_param": fp8_param,
+            "fp8_recipe": "mxfp8",
+        }
+
+        if use_distributed_optimizer and fp8_param:
+            with pytest.raises(ValueError, match="MXFP8.*distributed optimizer"):
+                validate_single_controller_config(mc)
+        else:
             validate_single_controller_config(mc)
 
     def test_rejects_value_global_batch_size_mismatch(self):

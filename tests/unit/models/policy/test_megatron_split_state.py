@@ -13,8 +13,9 @@
 # limitations under the License.
 """CPU state-machine tests for MegatronPolicyWorkerImpl's split-API.
 
-These tests cover the lifecycle and call-order invariants — they do NOT
-exercise real distributed comms, the mcore scheduler, or the optimizer.
+These tests cover lifecycle and call-order invariants, including a CPU
+autograd/SGD regression for gradient preservation across model switches.
+They do not exercise real distributed comms or the mcore scheduler.
 Numerical equivalence vs sync ``train()`` lives in the GPU parity tests.
 
 The bugs these catch:
@@ -152,7 +153,11 @@ def _make_worker(loss_type):
     }
     w.megatron_cfg = SimpleNamespace(
         optimizer=SimpleNamespace(reuse_grad_buf_for_mxfp8_param_ag=False),
-        ddp=SimpleNamespace(overlap_param_gather=False),
+        ddp=SimpleNamespace(
+            overlap_param_gather=False,
+            use_distributed_optimizer=True,
+            reuse_grad_buf_for_mxfp8_param_ag=False,
+        ),
     )
     w.dp_size = 2
     w.cp_size = 1
@@ -1621,6 +1626,338 @@ class TestChunkRecordIsGuarded:
 
 
 # ── prepare_for_lp_inference ─────────────────────────────────────────────
+
+
+class _DiscardingGradBuffer:
+    """Reproduce Megatron offload/reload's destructive storage lifecycle on CPU."""
+
+    def __init__(self, values):
+        self.grad_data = torch.tensor(values, dtype=torch.float32)
+        self.param_data = torch.zeros_like(self.grad_data)
+        self.grad_bytes = 0
+        self.calls = []
+
+    def offload_to_cpu(self, *, move_params, move_grads):
+        self.calls.append(("offload", move_params, move_grads))
+        if move_grads:
+            self.grad_bytes = self.grad_data.untyped_storage().nbytes()
+            self.grad_data.untyped_storage().resize_(0)
+
+    def reload_from_cpu(self, *, move_params, move_grads):
+        self.calls.append(("reload", move_params, move_grads))
+        if move_grads and self.grad_bytes:
+            self.grad_data.untyped_storage().resize_(self.grad_bytes)
+            self.grad_data.zero_()
+            self.grad_bytes = 0
+
+
+class TestPauseTrainStepWithOffloading:
+    @staticmethod
+    def _worker():
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.model.buffers = [_DiscardingGradBuffer([1.0, 2.0, 3.0])]
+        w.model.expert_parallel_buffers = [_DiscardingGradBuffer([4.0, 5.0])]
+        w.model.zero_grad_buffer.side_effect = lambda: [
+            buffer.grad_data.zero_()
+            for buffer in (*w.model.buffers, *w.model.expert_parallel_buffers)
+        ]
+        w.finalize_async_save = MagicMock()
+        w.move_optimizer = MagicMock()
+        w.optimizer_cpu_offload = False
+        w.offload_optimizer_for_logprob = True
+        w._train_step_state = {
+            "offloaded": False,
+            "local_valid_toks": torch.tensor(7.0),
+            "num_chunks": 1,
+            "saved_grad_sync_func": "ORIGINAL_GRAD_SYNC_FUNC",
+            "saved_no_sync_func": "ORIGINAL_NO_SYNC_FUNC",
+            "saved_finalize_model_grads_func": "ORIGINAL_FINALIZE",
+        }
+        w.model.config.grad_sync_func = None
+        w.model.config.finalize_model_grads_func = None
+        return w
+
+    def test_uneven_chunks_match_full_batch_gradient_and_update(
+        self, mock_module_symbols: dict[str, MagicMock]
+    ) -> None:
+        """Real backward/SGD uses one token denominator across two detours.
+
+        The distributed backend and CUDA device operations are replaced.
+        The production begin/chunk/offload/prepare/finish methods drive the
+        lifecycle, including their accumulated token counts and normalization.
+        """
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        inputs = torch.arange(36, dtype=torch.float32).reshape(6, 3, 2) / 10
+        targets = torch.linspace(-1.0, 2.0, 18).reshape(6, 3)
+        sample_mask = torch.tensor([1, 1, 0, 1, 1, 1], dtype=torch.float32)
+        token_mask = torch.tensor(
+            [
+                [0, 1, 1, 1],
+                [0, 1, 0, 1],
+                [0, 1, 1, 1],
+                [0, 1, 0, 0],
+                [0, 1, 1, 0],
+                [0, 1, 1, 1],
+            ],
+            dtype=torch.float32,
+        )
+        mask = token_mask[:, 1:] * sample_mask.unsqueeze(-1)
+        chunk_slices = (slice(0, 1), slice(1, 3), slice(3, 6))
+        assert [mask[part].sum().item() for part in chunk_slices] == [3, 2, 6]
+
+        reference_weight = torch.nn.Parameter(torch.tensor([0.25, -0.5]))
+        reference_bias = torch.nn.Parameter(torch.tensor([0.125]))
+        reference_parameters = (reference_weight, reference_bias)
+        reference_optimizer = torch.optim.SGD(reference_parameters, lr=0.05)
+        prediction = inputs @ reference_weight + reference_bias
+        full_loss = ((prediction - targets).square() * mask).sum() / mask.sum()
+        full_loss.backward()
+        reference_gradients = [p.grad.clone() for p in reference_parameters]
+        reference_optimizer.step()
+
+        weight = torch.nn.Parameter(torch.tensor([0.25, -0.5]))
+        bias = torch.nn.Parameter(torch.tensor([0.125]))
+        parameters = (weight, bias)
+        buffers = (_DiscardingGradBuffer([0, 0]), _DiscardingGradBuffer([0]))
+        # Parameter gradient views alias the persistent buffers, matching
+        # MCore's param.main_grad ownership.
+        for parameter, buffer in zip(parameters, buffers):
+            parameter.grad = buffer.grad_data.view_as(parameter)
+        optimizer = torch.optim.SGD(parameters, lr=0.05)
+        gradients_at_step: list[torch.Tensor] = []
+
+        def optimizer_step() -> tuple[bool, float, int]:
+            gradients_at_step.extend(p.grad.clone() for p in parameters)
+            norm = torch.cat([p.grad.flatten() for p in parameters]).norm().item()
+            optimizer.step()
+            return True, norm, 0
+
+        def zero_grad_buffers() -> None:
+            for buffer in buffers:
+                buffer.grad_data.zero_()
+
+        def scale_gradients(scale: float) -> None:
+            for buffer in buffers:
+                buffer.grad_data.mul_(scale)
+
+        def forward_backward(
+            *, data_iterator: Any, **kwargs: Any
+        ) -> list[dict[str, float]]:
+            data = next(data_iterator)
+            chunk_mask = data["token_mask"][:, 1:] * data["sample_mask"].unsqueeze(-1)
+            prediction = data["inputs"] @ weight + bias
+            # Production split training supplies N=1 and normalizes once at
+            # finish. A per-chunk mean would incorrectly weight these 3/2/6
+            # valid-token chunks equally.
+            assert kwargs["global_valid_toks"].item() == 1
+            loss = ((prediction - data["targets"]).square() * chunk_mask).sum()
+            loss.backward()
+            return [{"loss": loss.detach().item()}]
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.model.buffers = [buffers[0]]
+        w.model.expert_parallel_buffers = [buffers[1]]
+        w.model.zero_grad_buffer.side_effect = zero_grad_buffers
+        w.model.scale_gradients.side_effect = scale_gradients
+        w.optimizer.zero_grad.side_effect = lambda: optimizer.zero_grad(
+            set_to_none=False
+        )
+        w.optimizer.step.side_effect = optimizer_step
+        w.optimizer.param_groups = optimizer.param_groups
+        w.finalize_async_save = MagicMock()
+        w.move_optimizer = MagicMock()
+        w.optimizer_cpu_offload = False
+        w.offload_optimizer_for_logprob = True
+        finalize_gradients = w.model.config.finalize_model_grads_func
+        mock_module_symbols["gmi"].side_effect = lambda data, *args, **kwargs: (
+            iter([data]),
+            1,
+            len(data["sample_mask"]),
+            4,
+            4,
+        )
+        mock_module_symbols["mfb"].side_effect = forward_backward
+
+        # Keep the worker's explicit CUDA scalar allocations on CPU. Buffer
+        # offload/reload itself uses the real production move_model branch.
+        original_zeros, original_tensor = torch.zeros, torch.tensor
+
+        def cpu_zeros(*args: Any, **kwargs: Any) -> torch.Tensor:
+            return original_zeros(*args, **{**kwargs, "device": "cpu"})
+
+        def cpu_tensor(*args: Any, **kwargs: Any) -> torch.Tensor:
+            return original_tensor(*args, **{**kwargs, "device": "cpu"})
+
+        with (
+            patch(f"{WORKER_MOD}.DistributedDataParallel", type(w.model)),
+            patch("torch.zeros", side_effect=cpu_zeros),
+            patch("torch.tensor", side_effect=cpu_tensor),
+            patch("torch.cuda.synchronize"),
+            patch("torch.randn"),
+        ):
+            w.begin_train_step(loss_fn=w._test_loss_fn, gbs=6, mbs=1)
+            state = w._train_step_state
+            no_sync_func = w.model.config.no_sync_func
+            for index, part in enumerate(chunk_slices):
+                w.train_microbatch(
+                    {
+                        "inputs": inputs[part],
+                        "targets": targets[part],
+                        "sample_mask": sample_mask[part],
+                        "token_mask": token_mask[part],
+                    }
+                )
+                if index < len(chunk_slices) - 1:
+                    saved = [p.grad.clone() for p in parameters]
+                    grad_views = [p.grad for p in parameters]
+                    storage_ids = [p.grad.data_ptr() for p in parameters]
+                    w.pause_train_step_with_offloading()
+                    assert state["offloaded"] is True
+                    for parameter, expected, pointer in zip(
+                        parameters, saved, storage_ids
+                    ):
+                        assert parameter.grad.data_ptr() == pointer
+                        torch.testing.assert_close(parameter.grad, expected)
+                    assert w._train_step_state is state
+                    w.prepare_for_training()
+                    w.prepare_for_lp_inference(keep_train_buffers=True)
+                    assert state["offloaded"] is False
+                    for parameter, expected, grad_view, pointer in zip(
+                        parameters, saved, grad_views, storage_ids
+                    ):
+                        assert parameter.grad is grad_view
+                        assert parameter.grad.data_ptr() == pointer
+                        torch.testing.assert_close(parameter.grad, expected)
+                    assert all(buffer.grad_bytes == 0 for buffer in buffers)
+                    assert w.model.config.grad_sync_func is None
+                    assert w.model.config.no_sync_func is no_sync_func
+                    assert w.model.config.finalize_model_grads_func is None
+                    w.model.zero_grad_buffer.assert_called_once()
+                    w.optimizer.step.assert_not_called()
+                    w.scheduler.step.assert_not_called()
+            assert state["num_chunks"] == 3
+            assert state["local_valid_toks"].item() == 11
+            assert [call.args[0] for call in w.move_optimizer.call_args_list] == [
+                "cpu",
+                "cuda",
+                "cpu",
+                "cuda",
+            ]
+            w.finish_train_step()
+
+        for buffer in buffers:
+            assert (
+                buffer.calls
+                == [
+                    ("offload", True, False),
+                    ("reload", True, True),
+                    ("reload", True, False),
+                ]
+                * 2
+            )
+        for gradient, reference in zip(gradients_at_step, reference_gradients):
+            torch.testing.assert_close(gradient, reference)
+        for parameter, reference in zip(parameters, reference_parameters):
+            torch.testing.assert_close(parameter, reference)
+        assert len(gradients_at_step) == len(reference_gradients)
+        w.model.scale_gradients.assert_called_once_with(1 / 11)
+        assert w.model.no_sync.call_count == 3
+        w.optimizer.step.assert_called_once()
+        finalize_gradients.assert_called_once_with([w.model], None)
+        w.scheduler.step.assert_called_once_with(increment=6)
+        assert w._train_step_state is None
+
+    def test_requires_open_step(self, mock_module_symbols):
+        w = self._worker()
+        w._train_step_state = None
+        with pytest.raises(RuntimeError, match="no train step open"):
+            w.pause_train_step_with_offloading()
+
+    def test_rejects_unsupported_model_without_mutating_state(
+        self, mock_module_symbols
+    ):
+        w = self._worker()
+        with pytest.raises(ValueError, match="requires Megatron DDP"):
+            w.pause_train_step_with_offloading()
+        assert w._train_step_state["offloaded"] is False
+
+    @pytest.mark.parametrize(
+        "use_distributed_optimizer,reuse_grad_buf,expected_error",
+        [
+            (False, False, None),
+            (False, True, None),
+            (True, False, None),
+            (True, True, "reuse_grad_buf_for_mxfp8_param_ag=False"),
+        ],
+    )
+    def test_offload_checks_distributed_grad_buffer_reuse(
+        self,
+        mock_module_symbols: dict[str, MagicMock],
+        use_distributed_optimizer: bool,
+        reuse_grad_buf: bool,
+        expected_error: str | None,
+    ) -> None:
+        w = self._worker()
+        w.megatron_cfg.ddp.use_distributed_optimizer = use_distributed_optimizer
+        w.megatron_cfg.ddp.reuse_grad_buf_for_mxfp8_param_ag = reuse_grad_buf
+        # The reuse flag is also enabled for unsharded MXFP8, where MCore does
+        # not allocate shared parameter storage. Neither case requires overlap.
+        buffers = (*w.model.buffers, *w.model.expert_parallel_buffers)
+        if not use_distributed_optimizer:
+            for buffer in buffers:
+                buffer.param_data = None
+        expected = [buffer.grad_data.clone() for buffer in buffers]
+        with patch(f"{WORKER_MOD}.DistributedDataParallel", type(w.model)):
+            if expected_error is not None:
+                with pytest.raises(ValueError, match=expected_error):
+                    w.pause_train_step_with_offloading()
+            else:
+                w.pause_train_step_with_offloading()
+        assert w._train_step_state["offloaded"] is (expected_error is None)
+        for buffer, gradient in zip(buffers, expected):
+            torch.testing.assert_close(buffer.grad_data, gradient)
+            assert buffer.calls == (
+                [] if expected_error is not None else [("offload", True, False)]
+            )
+        if expected_error is not None:
+            w.finalize_async_save.assert_not_called()
+            w.model.eval.assert_not_called()
+            w.move_optimizer.assert_not_called()
+        else:
+            w.finalize_async_save.assert_called_once()
+            w.model.eval.assert_called_once()
+            w.move_optimizer.assert_called_once_with("cpu")
+
+    @pytest.mark.parametrize("optimizer_cpu_offload", [False, True])
+    def test_offloaded_step_rejects_double_offload_train_and_finish(
+        self, mock_module_symbols, optimizer_cpu_offload
+    ):
+        w = self._worker()
+        w.optimizer_cpu_offload = optimizer_cpu_offload
+        with patch(f"{WORKER_MOD}.DistributedDataParallel", type(w.model)):
+            w.pause_train_step_with_offloading()
+            with pytest.raises(RuntimeError, match="already offloaded"):
+                w.pause_train_step_with_offloading()
+            with pytest.raises(RuntimeError, match="prepare_for_training"):
+                w.train_microbatch({})
+            with pytest.raises(RuntimeError, match="prepare_for_training"):
+                w.finish_train_step()
+            # Gradients stay allocated, so abort can clear them immediately.
+            w.abort_train_step()
+        assert w._train_step_state is None
+        assert w.model.config.grad_sync_func == "ORIGINAL_GRAD_SYNC_FUNC"
+        w.model.zero_grad_buffer.assert_called_once()
+        w.optimizer.zero_grad.assert_called_once()
+        for buffer in (*w.model.buffers, *w.model.expert_parallel_buffers):
+            assert buffer.calls == [("offload", True, False)]
+            assert torch.count_nonzero(buffer.grad_data) == 0
+        if optimizer_cpu_offload:
+            w.move_optimizer.assert_not_called()
+        else:
+            w.move_optimizer.assert_called_once_with("cpu")
 
 
 class TestPrepareForLpInference:
