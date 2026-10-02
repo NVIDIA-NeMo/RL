@@ -335,7 +335,7 @@ def prepare_loss_input(
         # does the per-teacher projection / chunk-average / KL reductions and
         # aggregates them by ``kd_loss_mode``. ``projection_matrix_paths`` drives
         # the teacher count and which teachers are same-tokenizer (``None``). The
-        # TP/CP groups are derived from the student logits' own device mesh.
+        # TP group is derived from the student logits' own device mesh.
         (
             student_logits_contig,
             teacher_full_logits_by_idx,
