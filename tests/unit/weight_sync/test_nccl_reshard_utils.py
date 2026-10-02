@@ -90,7 +90,9 @@ def test_check_nccl_reshard_refit_support_collects_without_vllm_cfg() -> None:
     with pytest.raises(ValueError) as exc_info:
         check_nccl_reshard_refit_support(config)
 
-    assert "policy.generation.backend must be 'vllm'" in str(exc_info.value)
+    assert "policy.generation.backend must be 'vllm' or 'megatron'" in str(
+        exc_info.value
+    )
 
 
 def test_check_nccl_reshard_refit_support_accepts_bf16_to_mxfp8() -> None:
