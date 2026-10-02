@@ -40,6 +40,13 @@ async_rl:
     warmup_lookahead_versions: null
   # Recompute generation KV caches after each weight update.
   recompute_kv_cache_after_weight_updates: false
+  # PPO only: publish policy weights before critic training to overlap rollout
+  # generation with the critic update. Requires disaggregated generation,
+  # max_lookahead_versions >= 1, and a Megatron policy backend.
+  # With one lookahead version, reserve max_buffered_rollouts >=
+  # 3 * ppo.num_prompts_per_step for a full new-policy batch during critic
+  # training. A smaller buffer can defer dispatch until the critic finishes.
+  early_refit: false
   # Min ready groups the streaming trainer waits for before dispatching a batch.
   min_groups_for_streaming_train: ${ppo.num_prompts_per_step}
   # Cap on in-flight generate_and_push calls in the rollout pump.

@@ -491,6 +491,9 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     )
     # Recompute generation KV caches after each weight update.
     recompute_kv_cache_after_weight_updates: bool = False
+    # PPO only: publish updated policy weights before critic training so the next
+    # rollout batch can be generated while critic training uses the training GPUs.
+    early_refit: bool = False
     # Min ready groups the streaming trainer waits for before dispatching a batch.
     min_groups_for_streaming_train: int = 32
     # Cap on in-flight generate_and_push calls in the rollout pump.
@@ -1164,6 +1167,11 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         )
 
     if not is_ppo_run(master_config):
+        if async_config.early_refit:
+            raise ValueError(
+                "async_rl.early_refit=true is only supported for PPO; a GRPO run "
+                "has no critic phase to hide behind rollout generation."
+            )
         # A value block without `ppo` is inert -- nothing builds the critic --
         # and a config carrying one is asking for PPO by every reading except
         # the one the code uses. Say so rather than training GRPO silently.
@@ -1250,6 +1258,26 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "Other samplers are not supported yet (in particular during critic "
             "warmup) (#2625)."
         )
+
+    if async_config.early_refit:
+        if async_config.sampler.max_lookahead_versions < 1:
+            raise ValueError(
+                "async_rl.early_refit=true requires "
+                "async_rl.sampler.max_lookahead_versions>=1 so publishing policy "
+                "v+1 can admit a rollout batch while critic v is training."
+            )
+        if not policy_megatron_cfg.get("enabled"):
+            raise ValueError(
+                "async_rl.early_refit=true requires policy.megatron_cfg.enabled=true. "
+                "SingleController's split training API is not implemented by the "
+                "DTensor policy workers."
+            )
+        if generation_config["colocated"]["enabled"]:
+            raise ValueError(
+                "async_rl.early_refit=true requires disaggregated generation "
+                "(policy.generation.colocated.enabled=false) so rollout can overlap "
+                "the post-publication critic phase."
+            )
 
     rl_step_samples = (
         algo_cfg.num_prompts_per_step * algo_cfg.num_generations_per_prompt

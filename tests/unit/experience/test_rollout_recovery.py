@@ -71,6 +71,16 @@ def _mark(ledger: RolloutRecoveryLedger, group_id: str, **kwargs: Any) -> None:
     _mutate(lambda cut: ledger.mark_group_admitted(cut, group_id, **kwargs))
 
 
+def _restamp(ledger: RolloutRecoveryLedger, group_id: str, version: int) -> None:
+    _mutate(
+        lambda cut: ledger.restamp_group_for_dispatch(
+            cut,
+            group_id,
+            start_weight_version=version,
+        )
+    )
+
+
 def _bind(ledger: RolloutRecoveryLedger, group_id: str, prompt: DatumSpec) -> None:
     _mutate(lambda cut: ledger.bind_runtime_prompt(cut, group_id, prompt))
 
@@ -134,6 +144,55 @@ def test_ledger_round_trip_preserves_group_ownership() -> None:
 
     assert restored.state_dict() == state
     assert restored.get_group("g7").phase is PromptGroupPhase.ADMITTED
+
+
+def test_newly_admitted_group_can_be_restamped_at_dispatch_boundary() -> None:
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=2,
+        target_step=None,
+        start_weight_version=6,
+        admitted=False,
+    )
+    _mark(
+        ledger,
+        group.group_id,
+        target_step=7,
+        start_weight_version=6,
+    )
+
+    _restamp(ledger, group.group_id, 7)
+
+    assert ledger.get_group(group.group_id).start_weight_version == 7
+
+
+def test_dispatched_group_cannot_be_restamped() -> None:
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=1,
+        target_step=7,
+        start_weight_version=6,
+    )
+    _mutate(
+        lambda cut: ledger.mark_group_dispatched(
+            cut,
+            group.group_id,
+            generation_indices=[0],
+        )
+    )
+
+    with pytest.raises(ValueError, match="already started physical dispatch"):
+        _restamp(ledger, group.group_id, 7)
 
 
 def test_serialized_state_fields_match_recovery_dataclasses() -> None:

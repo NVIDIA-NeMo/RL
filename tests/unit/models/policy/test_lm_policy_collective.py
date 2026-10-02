@@ -12,8 +12,98 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
+
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
+
+
+def test_policy_finish_inference_forwards_param_residency_flag(monkeypatch):
+    calls = []
+
+    class WorkerGroup:
+        def run_all_workers_single_data(self, method_name, **kwargs):
+            calls.append((method_name, kwargs))
+            return ["future"]
+
+    policy = Policy.__new__(Policy)
+    policy.worker_group = WorkerGroup()
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.lm_policy.ray.get",
+        lambda _: [
+            {"params_resident_on_cuda": True, "checked_units": 4},
+            {"params_resident_on_cuda": True, "checked_units": 4},
+        ],
+    )
+
+    verified_worker_count = policy.finish_inference(keep_params_for_training=True)
+
+    assert calls == [("finish_inference", {"keep_params_for_training": True})]
+    assert verified_worker_count == 2
+
+
+@pytest.mark.parametrize(
+    "results",
+    [
+        [],
+        [{"params_resident_on_cuda": False, "checked_units": 4}],
+        [{"params_resident_on_cuda": True, "checked_units": 0}],
+    ],
+    ids=["empty", "nonresident", "no-checked-storage"],
+)
+def test_policy_finish_inference_fails_closed_on_invalid_residency(
+    monkeypatch, results
+):
+    class WorkerGroup:
+        def run_all_workers_single_data(self, method_name, **kwargs):
+            return ["future"]
+
+    policy = Policy.__new__(Policy)
+    policy.worker_group = WorkerGroup()
+    monkeypatch.setattr("nemo_rl.models.policy.lm_policy.ray.get", lambda _: results)
+
+    with pytest.raises(RuntimeError, match="residency"):
+        policy.finish_inference(keep_params_for_training=True)
+
+
+def test_policy_prepare_for_training_verifies_preexisting_param_residency(
+    monkeypatch,
+):
+    calls = []
+
+    class WorkerGroup:
+        def run_all_workers_single_data(self, method_name, **kwargs):
+            calls.append((method_name, kwargs))
+            return ["future"]
+
+    policy = Policy.__new__(Policy)
+    policy.worker_group = WorkerGroup()
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.lm_policy.ray.get",
+        lambda _: [{"params_resident_on_cuda": True, "checked_units": 4}],
+    )
+
+    verified_worker_count = policy.prepare_for_training(verify_params_resident=True)
+
+    assert calls == [("prepare_for_training", {"verify_params_resident": True})]
+    assert verified_worker_count == 1
+
+
+def test_policy_residency_flags_default_to_legacy_worker_calls(monkeypatch):
+    calls = []
+
+    class WorkerGroup:
+        def run_all_workers_single_data(self, method_name, **kwargs):
+            calls.append((method_name, kwargs))
+            return ["future"]
+
+    policy = Policy.__new__(Policy)
+    policy.worker_group = WorkerGroup()
+    monkeypatch.setattr("nemo_rl.models.policy.lm_policy.ray.get", lambda _: [None])
+
+    assert policy.finish_inference() is None
+    assert policy.prepare_for_training() is None
+    assert calls == [("finish_inference", {}), ("prepare_for_training", {})]
 
 
 def test_policy_waits_for_param_sync_before_refit(monkeypatch):

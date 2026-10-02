@@ -115,6 +115,7 @@ def _make_controller(
     )
     ctrl._rollout_permitted = asyncio.Event()
     ctrl._rollout_permitted.set()
+    ctrl._rollout_admission_lock = asyncio.Lock()
 
     monitor = None
     if with_monitor:
