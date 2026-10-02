@@ -16,7 +16,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -140,6 +141,28 @@ class GymCheckpointPrepareSummary:
     blockers: dict[str, tuple[str, ...]]
 
 
+class GymCheckpointUnavailable(RuntimeError):
+    """Gym's control plane could not complete one live checkpoint call.
+
+    Raised in place of Gym's ``CoordinationError``, which cannot be pickled and
+    so reaches the driver as an untyped ``UnserializableException``. The
+    participants' failures arrive as text, so this says only that the call
+    failed, not why; nothing RL holds changed, and a later checkpoint may
+    succeed.
+    """
+
+
+@contextmanager
+def _live_checkpoint_call() -> Iterator[None]:
+    """Type a Gym coordination failure before it crosses the Ray boundary."""
+    from nemo_gym._checkpoint.coordination import CoordinationError
+
+    try:
+        yield
+    except CoordinationError as error:
+        raise GymCheckpointUnavailable(str(error)) from error
+
+
 class GymCheckpointAdapter:
     """Delegate checkpoint operations for exactly one Gym deployment to Gym."""
 
@@ -181,16 +204,18 @@ class GymCheckpointAdapter:
     async def prepare(self, checkpoint_id: str, *, deadline_ts: float) -> PrepareResult:
         from nemo_gym._checkpoint.coordination import prepare
 
-        return await prepare(
-            self._require_participants(), checkpoint_id, deadline_ts=deadline_ts
-        )
+        with _live_checkpoint_call():
+            return await prepare(
+                self._require_participants(), checkpoint_id, deadline_ts=deadline_ts
+            )
 
     async def renew(self, checkpoint_id: str, *, deadline_ts: float) -> None:
         from nemo_gym._checkpoint.coordination import renew
 
-        await renew(
-            self._require_participants(), checkpoint_id, deadline_ts=deadline_ts
-        )
+        with _live_checkpoint_call():
+            await renew(
+                self._require_participants(), checkpoint_id, deadline_ts=deadline_ts
+            )
 
     @staticmethod
     def _episode_ids(episodes: Iterable[GymCheckpointEpisode]) -> list[Any]:
@@ -467,12 +492,13 @@ class GymCheckpointAdapter:
     ) -> None:
         from nemo_gym._checkpoint.coordination import retire
 
-        await retire(
-            self._require_participants(),
-            checkpoint_id,
-            self._episode_ids(episodes),
-            deadline_ts=deadline_ts,
-        )
+        with _live_checkpoint_call():
+            await retire(
+                self._require_participants(),
+                checkpoint_id,
+                self._episode_ids(episodes),
+                deadline_ts=deadline_ts,
+            )
 
     async def commit(
         self,
@@ -486,13 +512,14 @@ class GymCheckpointAdapter:
 
         episode_ids = self._episode_ids(episodes)
         checkpoint_dir = self._instance.checkpoint_dir(checkpoint_root)
-        replies = await commit(
-            self._require_participants(),
-            checkpoint_id,
-            str(checkpoint_dir),
-            episode_ids,
-            deadline_ts=deadline_ts,
-        )
+        with _live_checkpoint_call():
+            replies = await commit(
+                self._require_participants(),
+                checkpoint_id,
+                str(checkpoint_dir),
+                episode_ids,
+                deadline_ts=deadline_ts,
+            )
         # Reads committed agent records from disk, so keep it off the event loop.
         return await asyncio.to_thread(
             self._commit_summary,
@@ -548,6 +575,7 @@ class GymCheckpointAdapter:
     async def resume(self, checkpoint_id: str, *, deadline_ts: float) -> None:
         from nemo_gym._checkpoint.coordination import resume
 
-        await resume(
-            self._require_participants(), checkpoint_id, deadline_ts=deadline_ts
-        )
+        with _live_checkpoint_call():
+            await resume(
+                self._require_participants(), checkpoint_id, deadline_ts=deadline_ts
+            )

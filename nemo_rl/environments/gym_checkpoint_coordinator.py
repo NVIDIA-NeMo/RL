@@ -26,15 +26,23 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+import ray
+
 from nemo_rl.environments.gym_checkpoint_adapter import (
     GymCheckpointCommitSummary,
     GymCheckpointEpisode,
     GymCheckpointPrepareSummary,
+    GymCheckpointUnavailable,
 )
 from nemo_rl.environments.nemo_gym import NemoGymShardSet
+from nemo_rl.experience.failures import FailureClass, classify_rollout_failure
 
 GYM_CHECKPOINT_MANIFEST_FILENAME = "gym_checkpoint.json"
 GYM_CHECKPOINT_SCHEMA_VERSION = 2
+# Upper bound on how long past a call's deadline RL waits for Gym's reply. Gym
+# answers by the deadline once it runs the call, so this only covers the reply
+# crossing Ray; a call still unanswered after it was never run.
+_MAX_REPLY_GRACE_S = 5.0
 
 
 class GymCheckpointOperationError(RuntimeError):
@@ -67,6 +75,26 @@ class GymCheckpointNotReady(RuntimeError):
         super().__init__(
             f"Gym checkpoint participants are not ready: {self.blockers!r}"
         )
+
+
+def is_transient_gym_checkpoint_failure(error: BaseException) -> bool:
+    """Whether a failed Gym checkpoint may succeed if it is simply tried again.
+
+    Participants that could not park in time, calls that went unanswered, and
+    actors or control planes that failed a call leave nothing behind: the
+    coordinator resumes Gym, and Gym's lease reopens it if that resume is lost
+    too. Anything else, such as a malformed reply or an ownership or topology
+    mismatch, is a broken invariant that a retry would only hide.
+    """
+    if isinstance(error, GymCheckpointNotReady):
+        return True
+    if isinstance(error, GymCheckpointOperationError):
+        return bool(error.failures) and all(
+            isinstance(failure, GymCheckpointUnavailable)
+            or classify_rollout_failure(failure) is FailureClass.INFRA
+            for failure in error.failures.values()
+        )
+    return False
 
 
 @dataclass(frozen=True)
@@ -267,20 +295,46 @@ class GymCheckpointCoordinator:
         self,
         operation: str,
         references: Mapping[str, Any],
+        *,
+        deadline_ts: float,
     ) -> dict[str, Any]:
-        ordered = list(references)
-        results = await asyncio.gather(
-            *(references[instance_id] for instance_id in ordered),
-            return_exceptions=True,
-        )
-        failures = {
-            instance_id: result
-            for instance_id, result in zip(ordered, results, strict=True)
-            if isinstance(result, BaseException)
+        """Wait for every actor's reply, but never past the call's deadline.
+
+        Gym enforces ``deadline_ts`` only once it runs the call. An actor whose
+        event loop is stuck, or a call Ray never schedules, would otherwise be
+        waited on forever. Giving up is safe: a Gym deployment left parked
+        reopens by itself when its checkpoint lease expires.
+        """
+        tasks = {
+            instance_id: asyncio.ensure_future(reference)
+            for instance_id, reference in references.items()
         }
+        grace_s = min(self._control_timeout_s, _MAX_REPLY_GRACE_S)
+        timeout_s = max(0.0, deadline_ts - time.time()) + grace_s
+        try:
+            await asyncio.wait(tasks.values(), timeout=timeout_s)
+        except BaseException:
+            for task in tasks.values():
+                task.cancel()
+            raise
+        results: dict[str, Any] = {}
+        failures: dict[str, BaseException] = {}
+        for instance_id, task in tasks.items():
+            if not task.done():
+                task.cancel()
+                _cancel_remote(references[instance_id])
+                failures[instance_id] = TimeoutError(
+                    f"no reply within {timeout_s:.1f}s of the {operation} call"
+                )
+            elif task.cancelled():
+                failures[instance_id] = asyncio.CancelledError()
+            elif task.exception() is not None:
+                failures[instance_id] = task.exception()
+            else:
+                results[instance_id] = task.result()
         if failures:
             raise GymCheckpointOperationError(operation, failures)
-        return dict(zip(ordered, results, strict=True))
+        return results
 
     async def prepare(
         self,
@@ -296,6 +350,7 @@ class GymCheckpointCoordinator:
                 )
                 for instance_id, handle in self._handles.items()
             },
+            deadline_ts=deadline_ts,
         )
         summaries = {instance_id: result for instance_id, result in results.items()}
         blockers = {
@@ -318,6 +373,7 @@ class GymCheckpointCoordinator:
                 )
                 for instance_id, handle in self._handles.items()
             },
+            deadline_ts=deadline_ts,
         )
 
     def _validate_inventory(
@@ -356,6 +412,7 @@ class GymCheckpointCoordinator:
                 )
                 for instance_id, episodes in inventory.items()
             },
+            deadline_ts=deadline_ts,
         )
         summaries: dict[str, GymCheckpointCommitSummary] = {}
         for instance_id, summary in raw_summaries.items():
@@ -415,6 +472,7 @@ class GymCheckpointCoordinator:
                 )
                 for instance_id, episodes in inventory.items()
             },
+            deadline_ts=deadline_ts,
         )
 
     async def discard_restored(
@@ -452,6 +510,7 @@ class GymCheckpointCoordinator:
                     )
                     for instance_id, episodes in inventory.items()
                 },
+                deadline_ts=deadline_ts,
             )
         except GymCheckpointOperationError as error:
             # Gym makes one deployment's restore atomic. RL must extend that
@@ -462,6 +521,7 @@ class GymCheckpointCoordinator:
             # coordinator.
             cleanup_errors: list[BaseException] = []
             try:
+                cleanup_deadline_ts = self._deadline()
                 await self._collect(
                     "restore_cleanup",
                     {
@@ -473,10 +533,11 @@ class GymCheckpointCoordinator:
                                 episode.next_attempt()
                                 for episode in inventory[instance_id]
                             ),
-                            deadline_ts=self._deadline(),
+                            deadline_ts=cleanup_deadline_ts,
                         )
                         for instance_id in inventory
                     },
+                    deadline_ts=cleanup_deadline_ts,
                 )
             except BaseException as cleanup_error:
                 cleanup_errors.append(cleanup_error)
@@ -502,6 +563,7 @@ class GymCheckpointCoordinator:
                 )
                 for instance_id, handle in self._handles.items()
             },
+            deadline_ts=deadline_ts,
         )
 
     async def _renew_until_stopped(
@@ -561,3 +623,14 @@ class GymCheckpointCoordinator:
             raise
         else:
             await self.resume(checkpoint_id)
+
+
+def _cancel_remote(reference: Any) -> None:
+    """Ask Ray to stop a control call RL stopped waiting for; best effort."""
+    if not isinstance(reference, ray.ObjectRef):
+        return
+    try:
+        ray.cancel(reference)
+    except Exception:
+        # The lease still reopens Gym; a failed cancel only leaves the call queued.
+        pass

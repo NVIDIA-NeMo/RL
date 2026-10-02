@@ -42,6 +42,7 @@ ROLLOUT_CHECKPOINT_ATTEMPT_OUTCOMES: tuple[RolloutCheckpointAttemptOutcome, ...]
 
 RolloutCheckpointAttemptReason = Literal[
     "completed",
+    "gym_unavailable",
     "invariant_error",
     "io_error",
     "missing_trainer_anchor",

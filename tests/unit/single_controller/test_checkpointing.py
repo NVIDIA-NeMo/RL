@@ -99,6 +99,10 @@ from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.environments.gym_checkpoint_coordinator import (
+    GymCheckpointNotReady,
+    GymCheckpointOperationError,
+)
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
@@ -517,11 +521,11 @@ class _FakeRolloutManager:
     def set_weight_version(self, version: int) -> None:
         self.weight_versions.append(version)
 
-    def suspend_request_deadlines(self) -> None:
+    def suspend_request_deadlines(self, holder: str = "generation_stand_down") -> None:
         if self._events is not None:
             self._events.append("suspend_deadlines")
 
-    def resume_request_deadlines(self) -> None:
+    def resume_request_deadlines(self, holder: str = "generation_stand_down") -> None:
         if self._events is not None:
             self._events.append("resume_deadlines")
 
@@ -1503,6 +1507,7 @@ class TestPeriodicRolloutCheckpoint:
         outcome_keys = {"completed", "failed", "skipped"}
         reason_keys = {
             "reason_completed",
+            "reason_gym_unavailable",
             "reason_invariant_error",
             "reason_io_error",
             "reason_missing_trainer_anchor",
@@ -1820,6 +1825,89 @@ class TestPeriodicRolloutCheckpoint:
 
         output = capsys.readouterr().out
         assert output.count("Periodic rollout checkpoint failed") == 2
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            GymCheckpointNotReady({"tools/replica-0": {"agent": ("rollout-1",)}}),
+            GymCheckpointOperationError(
+                "prepare", {"tools/replica-0": TimeoutError("no reply")}
+            ),
+        ],
+        ids=["not-ready", "unanswered"],
+    )
+    def test_periodic_pump_retries_a_gym_checkpoint_that_could_not_run(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        error: Exception,
+    ):
+        actor = self._actor(tmp_path)
+        actor._logger = MagicMock()
+        actor._master_config.rollout_checkpointing.snapshot_attempt_interval_s = 0.001
+        actor._train_steps = 1
+
+        async def _main() -> None:
+            two_failures = asyncio.Event()
+            calls = 0
+
+            async def _failing_save(*, force: bool = False) -> bool:
+                nonlocal calls
+                del force
+                calls += 1
+                if calls == 2:
+                    two_failures.set()
+                raise error
+
+            actor._save_rollout_checkpoint = _failing_save
+            pump = asyncio.create_task(actor._rollout_checkpoint_pump())
+            await asyncio.wait_for(two_failures.wait(), timeout=1.0)
+            pump.cancel()
+            await asyncio.gather(pump, return_exceptions=True)
+
+        try:
+            asyncio.run(_main())
+        finally:
+            actor._checkpointer.shutdown()
+
+        output = capsys.readouterr().out
+        assert "retaining the previous committed snapshot" in output
+        assert "consecutive_failures=2" in output
+        logged = actor._logger.log_metrics.call_args.args[0]
+        assert logged["reason_gym_unavailable"] == 1.0
+
+    def test_periodic_pump_does_not_retry_a_broken_gym_reply(self, tmp_path: Path):
+        actor = self._actor(tmp_path)
+        actor._logger = MagicMock()
+        actor._master_config.rollout_checkpointing.snapshot_attempt_interval_s = 0.001
+        actor._train_steps = 1
+        calls = 0
+
+        async def _main() -> None:
+            async def _failing_save(*, force: bool = False) -> bool:
+                nonlocal calls
+                del force
+                calls += 1
+                raise GymCheckpointOperationError(
+                    "commit",
+                    {"tools/replica-0": RuntimeError("unexpected participant set")},
+                )
+
+            actor._save_rollout_checkpoint = _failing_save
+            with pytest.raises(GymCheckpointOperationError, match="participant set"):
+                await asyncio.wait_for(
+                    actor._rollout_checkpoint_pump(),
+                    timeout=1.0,
+                )
+
+        try:
+            asyncio.run(_main())
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert calls == 1
+        logged = actor._logger.log_metrics.call_args.args[0]
+        assert logged["reason_invariant_error"] == 1.0
 
     def test_periodic_pump_does_not_retry_invariant_failure(self, tmp_path: Path):
         actor = self._actor(tmp_path)
