@@ -77,6 +77,12 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
 
 def main() -> None:
     """Main entry point."""
+    # The training loop runs in SingleControllerActor, whose flush=True prints only
+    # reach this driver: Ray forwards actor output here without flushing. When the
+    # driver's stdout is redirected (ray.sub -> ray-driver.log), Python
+    # block-buffers it, so step and coordination logs would arrive in bursts or
+    # only at exit. Line-buffer the driver so they show up as they are printed.
+    sys.stdout.reconfigure(line_buffering=True)
     register_omegaconf_resolvers()
     args, overrides = parse_args()
 
