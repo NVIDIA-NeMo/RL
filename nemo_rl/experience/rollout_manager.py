@@ -1809,9 +1809,11 @@ class RolloutManager:
     def _group_agent_name(
         record: Optional[PromptGroupRecord], input_sample: DatumSpec
     ) -> Optional[str]:
-        """The group's Gym agent entry: Gym's resolved ``agent_ref`` when this
-        attempt dispatched rows, else the prompt's own route name (a group
-        restored with every sibling sealed). ``None`` when neither names one.
+        """The group's Gym agent entry.
+
+        Gym's resolved ``agent_ref`` when this attempt dispatched rows, else the
+        prompt's own route name (a group restored with every sibling sealed).
+        ``None`` when neither names one.
         """
         resolved = getattr(record, "extra_env_info", None)
         agent_ref = resolved.get("agent_ref") if isinstance(resolved, Mapping) else None

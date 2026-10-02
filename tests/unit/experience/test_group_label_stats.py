@@ -63,7 +63,10 @@ def _summed(*groups):
 
 def test_each_harness_reports_only_its_own_trained_rollouts():
     claude = _group(
-        [(HARNESS_SCOPE, CLAUDE), (AGENT_SCOPE, "swe_rebench_claude_code_sandboxed_agent")],
+        [
+            (HARNESS_SCOPE, CLAUDE),
+            (AGENT_SCOPE, "swe_rebench_claude_code_sandboxed_agent"),
+        ],
         [1.0, 0.0, 1.0, 0.0],
         valid=[True, True, True, False],  # rollout 3: capture placeholder
         mask_sample=[False, True, False, False],  # rollout 1: masked by a rule
@@ -74,7 +77,10 @@ def test_each_harness_reports_only_its_own_trained_rollouts():
         calls=[5, 6, 7, 1],
     )
     opencode = _group(
-        [(HARNESS_SCOPE, OPENCODE), (AGENT_SCOPE, "swe_rebench_opencode_sandboxed_agent")],
+        [
+            (HARNESS_SCOPE, OPENCODE),
+            (AGENT_SCOPE, "swe_rebench_opencode_sandboxed_agent"),
+        ],
         [0.0, 0.0],
         gen_tokens=[4, 6],
         turns=[1, 1],
@@ -133,7 +139,10 @@ def test_groups_of_one_harness_pool_their_rollouts():
 
 def test_result_fields_are_means_over_reporting_rollouts_for_the_harness_scope():
     group = _group(
-        [(HARNESS_SCOPE, CLAUDE), (AGENT_SCOPE, "swe_next_claude_code_sandboxed_agent")],
+        [
+            (HARNESS_SCOPE, CLAUDE),
+            (AGENT_SCOPE, "swe_next_claude_code_sandboxed_agent"),
+        ],
         [1.0, 0.0],
         result_stats=[("claude_code_finished", 1.0, 1), ("harness_finished", 1.0, 2)],
     )
