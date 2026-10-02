@@ -124,7 +124,7 @@ def _packed_policy_config() -> PolicyConfig:
 
 
 def _cluster_config() -> ClusterConfig:
-    return {"num_nodes": 1, "gpus_per_node": 4}
+    return ClusterConfig(num_nodes=1, gpus_per_node=4)
 
 
 def test_mpo_validates_pair_safe_sequence_packing():
@@ -253,7 +253,7 @@ def test_nemotron_omni_nopack_parity_config_matches_legacy_run():
     assert train_config["split_validation_size"] == 2000
     assert train_config["legacy_validation_split"] is True
     assert master_config.data["num_workers"] == 0
-    assert master_config.cluster["num_nodes"] == 4
+    assert master_config.cluster.num_nodes == 4
     assert not master_config.logger["wandb_enabled"]
 
 
@@ -291,8 +291,8 @@ def test_nemotron_super_omni_mpo_parity_configs(
     assert master_config.policy["train_global_batch_size"] == 256
     assert master_config.policy["max_total_sequence_length"] == sequence_length
     assert master_config.data["max_input_seq_length"] == sequence_length
-    assert master_config.cluster["num_nodes"] == 4
-    assert master_config.cluster["gpus_per_node"] == 8
+    assert master_config.cluster.num_nodes == 4
+    assert master_config.cluster.gpus_per_node == 8
     expected_divisibility = 32 if context_parallel_size == 2 else 8
     assert (
         master_config.policy["make_sequence_length_divisible_by"]
