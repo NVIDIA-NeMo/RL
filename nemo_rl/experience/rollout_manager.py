@@ -28,7 +28,6 @@ from typing import TYPE_CHECKING, Any, Optional
 import ray.exceptions
 import torch
 from transformers import PreTrainedTokenizerBase
-from wandb import Table
 
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     CheckpointMutationKind,
@@ -1564,6 +1563,10 @@ class AsyncNemoGymRolloutImpl:
                     calculate_single_metric(values, n, f"{agent_name}/{key}")
                 )
         if self._log_full_result_tables:
+            # W&B is optional. Keep the import behind the same runtime gate as
+            # table construction so a disabled backend has no import side effect.
+            from wandb import Table
+
             rollout_metrics[f"{agent_name}/full_result"] = Table(
                 data=[[json.dumps(r, separators=(",", ":"))] for r in agent_extras],
                 columns=["Full result"],

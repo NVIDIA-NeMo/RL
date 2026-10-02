@@ -25,6 +25,7 @@ Two groups:
 from __future__ import annotations
 
 import asyncio
+import builtins
 import json
 import tempfile
 import uuid
@@ -1125,6 +1126,40 @@ def test_nemo_gym_full_result_tables_are_opt_in(log_full_result_tables):
     metrics = impl._compute_rollout_metrics([completion], "agent")
 
     assert ("agent/full_result" in metrics) is log_full_result_tables
+
+
+@pytest.mark.parametrize("log_full_result_tables", [False, True])
+def test_rollout_metrics_import_wandb_only_for_full_result_tables(
+    monkeypatch, log_full_result_tables
+):
+    """Disabled W&B tables must have neither a metric nor an import side effect."""
+    imports = []
+    real_import = builtins.__import__
+
+    class FakeTable:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    def recording_import(name, *args, **kwargs):
+        imports.append(name)
+        if name == "wandb":
+            return SimpleNamespace(Table=FakeTable)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", recording_import)
+    completion = Completion(
+        message_log=[{"role": "assistant", "token_ids": [1, 2]}],
+        env_extras={"reward": 1.0},
+        truncated=False,
+        reward=1.0,
+    )
+
+    metrics = _nemo_gym_impl(
+        True, log_full_result_tables=log_full_result_tables
+    )._compute_rollout_metrics([completion], "agent")
+
+    assert ("agent/full_result" in metrics) is log_full_result_tables
+    assert ("wandb" in imports) is log_full_result_tables
 
 
 def _reward_penalty_result(output, assistant_overrides=None, assistant_tokens=None):
