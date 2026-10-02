@@ -300,11 +300,13 @@ class _SavingGymCoordinator:
         exported_episodes: tuple[GymCheckpointEpisode, ...] | None = None,
         staging_keys_by_episode: dict[GymCheckpointEpisode, tuple[str, ...]]
         | None = None,
+        unowned_live_episodes: tuple[GymCheckpointEpisode, ...] = (),
     ) -> None:
         self.instance_ids = frozenset({"tools/replica-0"})
         self.control_timeout_s = 1.0
         self.exported_episodes = exported_episodes
         self.staging_keys_by_episode = staging_keys_by_episode or {}
+        self.unowned_live_episodes = unowned_live_episodes
         self.events: list[object] = []
 
     @asynccontextmanager
@@ -336,6 +338,7 @@ class _SavingGymCoordinator:
                 )
             ),
             participants=(),
+            unowned_live_episodes=self.unowned_live_episodes,
             staging_keys_by_episode=self.staging_keys_by_episode,
         )
         return GymCheckpointCommitResult(
@@ -966,6 +969,61 @@ def test_turn_checkpoint_aborts_when_candidate_is_neither_exported_nor_drained(
                 checkpoint_id="save-1",
             ):
                 raise AssertionError("unreachable")
+
+        assert coordinator.events[-1] == ("resume", "save-1")
+
+    asyncio.run(exercise())
+
+
+def test_turn_checkpoint_fails_fast_on_parked_session_without_an_owner(
+    tmp_path: Path,
+) -> None:
+    """A session Gym parks but cannot export never drains; do not wait for it."""
+
+    async def exercise() -> None:
+        ledger = RolloutRecoveryLedger()
+        async with DataPlaneCheckpointBarrier().mutation() as cut:
+            group = ledger.reserve_group(
+                cut,
+                group_id="batch-7-prompt-0",
+                admission_id="batch-7",
+                prompt_id="70",
+                prompt_payload={"idx": 70, "message_log": []},
+                expected_generations=1,
+                target_step=7,
+                start_weight_version=7,
+                restore_level=RecoveryTargetLevel.TURN,
+                admitted=True,
+            )
+            ledger.mark_group_dispatched(
+                cut,
+                group.group_id,
+                gym_instance_id="tools/replica-0",
+            )
+
+        (stranded,) = ledger.gym_checkpoint_inventory(frozenset({"tools/replica-0"}))[
+            "tools/replica-0"
+        ]
+        coordinator = _SavingGymCoordinator(
+            exported_episodes=(),
+            unowned_live_episodes=(GymCheckpointEpisode(*stranded),),
+        )
+        coordinator.control_timeout_s = 60.0
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        controller = object.__new__(controller_cls)
+        controller._gym_checkpoint_coordinator = coordinator
+        controller._rollout_dispatch_admission_gate = RolloutDispatchAdmissionGate()
+        controller._rollout_recovery_ledger = ledger
+
+        async def checkpoint() -> None:
+            async with controller._prepared_gym_checkpoint(
+                tmp_path,
+                checkpoint_id="save-1",
+            ):
+                raise AssertionError("unreachable")
+
+        with pytest.raises(RuntimeError, match="parked sessions"):
+            await asyncio.wait_for(checkpoint(), timeout=5.0)
 
         assert coordinator.events[-1] == ("resume", "save-1")
 

@@ -4357,6 +4357,20 @@ class SingleControllerActor:
         }
         if not any(pending.values()):
             return
+        # Only an episode whose reply is already on the wire can resolve here. A
+        # session Gym still holds is parked by prepare, so waiting would only time out.
+        stranded = {
+            instance_id: pending[instance_id].intersection(
+                commit.instances[instance_id].unowned_live_episodes
+            )
+            for instance_id in coordinator.instance_ids
+        }
+        if any(stranded.values()):
+            raise RuntimeError(
+                "Gym checkpoint holds parked sessions that no environment or legacy "
+                "agent participant exported, so they can neither be restored nor "
+                f"finish while the deployment is prepared: stranded={stranded!r}"
+            )
 
         deadline = time.monotonic() + coordinator.control_timeout_s
         while True:
