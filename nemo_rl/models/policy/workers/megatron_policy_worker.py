@@ -103,6 +103,7 @@ from nemo_rl.models.megatron.router_replay import (
 )
 from nemo_rl.models.megatron.setup import (
     build_inference_model,
+    chunked_optimizer_state_offload_enabled,
     finalize_megatron_setup,
     handle_model_import,
     load_teacher_output_layer_weight,
@@ -697,6 +698,14 @@ class MegatronPolicyWorkerImpl(
             _configure_inference_optimized_layer_spec(self.megatron_cfg.model)
         self.dtype = runtime_config.dtype
         self.optimizer_cpu_offload = runtime_config.optimizer_cpu_offload
+        self.chunked_optimizer_state_offload = chunked_optimizer_state_offload_enabled(
+            self.cfg["megatron_cfg"]["optimizer"]
+        )
+        # Both modes manage their own host/device placement of optimizer state, so
+        # NeMo-RL's move_optimizer() must leave the optimizer alone.
+        self.optimizer_self_managed_offload = (
+            self.optimizer_cpu_offload or self.chunked_optimizer_state_offload
+        )
         self.offload_optimizer_for_logprob = (
             runtime_config.offload_optimizer_for_logprob
         )
@@ -753,6 +762,8 @@ class MegatronPolicyWorkerImpl(
         # Set the param sync function for the model if needed
         if param_sync_func is not None:
             get_model_config(self.model).param_sync_func = param_sync_func
+
+        self._install_chunked_offload_finalize_hook()
 
         # Step 5: Setup reference model if needed
         if init_reference_model:
@@ -958,6 +969,78 @@ class MegatronPolicyWorkerImpl(
         for optim_instance in optimizers:
             if hasattr(optim_instance, "_copy_main_params_to_param_buffer"):
                 optim_instance._copy_main_params_to_param_buffer()
+
+    def _install_chunked_offload_finalize_hook(self) -> None:
+        """Prefetch offloaded optimizer state while gradients are finalized.
+
+        Wraps ``model_config.finalize_model_grads_func`` once so the H2D copy of
+        masters and the first state chunk overlaps gradient finalization. Both train
+        paths (``train`` and the split ``begin_train_step`` flow) read this function
+        from the model config, so one wrapper covers them.
+        """
+        if not self.chunked_optimizer_state_offload or self.optimizer is None:
+            return
+        model_config = get_model_config(self.model)
+        current = model_config.finalize_model_grads_func
+        if (
+            getattr(current, "_chunked_optimizer_state_offload_wrapped_optimizer", None)
+            is self.optimizer
+        ):
+            return
+        base = getattr(
+            current, "_chunked_optimizer_state_offload_base_finalize_model_grads_func", None
+        )
+        if base is None:
+            base = current
+        optimizer = self.optimizer
+
+        def finalize_model_grads_with_state_reload(*args, **kwargs):
+            optimizer.prefetch_optimizer_state_for_gradient_finalization()
+            return base(*args, **kwargs)
+
+        finalize_model_grads_with_state_reload._chunked_optimizer_state_offload_wrapped_optimizer = optimizer
+        finalize_model_grads_with_state_reload._chunked_optimizer_state_offload_base_finalize_model_grads_func = base
+        model_config.finalize_model_grads_func = finalize_model_grads_with_state_reload
+
+    def _chunked_offload_pre_forward_param_sync(self) -> bool:
+        return (
+            self.chunked_optimizer_state_offload
+            and self.optimizer.optimizer_state_offload_requires_pre_forward_param_sync()
+        )
+
+    def _chunked_offload_delays_master_offload(self) -> bool:
+        return (
+            self.chunked_optimizer_state_offload
+            and self._uses_mxfp8_overlap_shared_param_buffer()
+        )
+
+    def _chunked_offload_before_zero_grad(self) -> None:
+        """Start D2H of optimizer state before gradients are zeroed.
+
+        In the MXFP8 staging path masters stay readable until
+        ``_chunked_offload_after_param_buffer_copy`` offloads them.
+        """
+        if (
+            self.chunked_optimizer_state_offload
+            and not self._chunked_offload_pre_forward_param_sync()
+        ):
+            self.optimizer.offload_optimizer_state_for_forward(
+                offload_master=not self._chunked_offload_delays_master_offload()
+            )
+
+    def _chunked_offload_after_zero_grad(self) -> None:
+        """Compact LayerWise fp8 gather consumes fp32 masters: sync it, then offload."""
+        if self._chunked_offload_pre_forward_param_sync():
+            self.optimizer.ensure_master_weights_for_pre_forward_param_sync()
+            self.optimizer.start_param_sync_for_bucket_group_subset(force_sync=True)
+            self.optimizer.offload_optimizer_state_for_forward(
+                offload_master=not self._chunked_offload_delays_master_offload()
+            )
+
+    def _chunked_offload_after_param_buffer_copy(self) -> None:
+        """Delayed master D2H once the MXFP8 param-buffer staging copy is done."""
+        if self._chunked_offload_delays_master_offload():
+            self.optimizer.offload_optimizer_state_for_forward()
 
     def _uses_mxfp8_overlap_shared_param_buffer(self) -> bool:
         return getattr(
@@ -1193,9 +1276,12 @@ class MegatronPolicyWorkerImpl(
                     if not (
                         eval_mode and self._uses_mxfp8_overlap_shared_param_buffer()
                     ):
+                        self._chunked_offload_before_zero_grad()
                         self.model.zero_grad_buffer()
                         self.optimizer.zero_grad()
+                        self._chunked_offload_after_zero_grad()
                         self._copy_main_params_to_param_buffer()
+                        self._chunked_offload_after_param_buffer_copy()
 
                     # Set moe_grad_scale_func for MoE aux-loss gradient scaling.
                     # With calculate_per_token_loss=True, the router pre-multiplies
@@ -1672,8 +1758,13 @@ class MegatronPolicyWorkerImpl(
                 module._inference_key_value_memory = None
 
         self.model.train()
+        self._chunked_offload_before_zero_grad()
         self.model.zero_grad_buffer()
         self.optimizer.zero_grad()
+        self._chunked_offload_after_zero_grad()
+        # MXFP8 param-buffer staging already ran in prepare_for_training, so delayed
+        # master offload can start here.
+        self._chunked_offload_after_param_buffer_copy()
 
         state = self._split_step_state_init(loss_fn=loss_fn, gbs=gbs, mbs=mbs)
 
@@ -4281,7 +4372,7 @@ class MegatronPolicyWorkerImpl(
             not keep_train_buffers
             and hasattr(self, "optimizer")
             and self.optimizer is not None
-            and not self.optimizer_cpu_offload
+            and not self.optimizer_self_managed_offload
             and self.offload_optimizer_for_logprob
         ):
             self.move_optimizer("cpu")
@@ -4339,7 +4430,7 @@ class MegatronPolicyWorkerImpl(
         if (
             hasattr(self, "optimizer")
             and self.optimizer is not None
-            and not self.optimizer_cpu_offload
+            and not self.optimizer_self_managed_offload
         ):
             self.move_optimizer("cuda")
 
@@ -4509,7 +4600,7 @@ class MegatronPolicyWorkerImpl(
         if (
             hasattr(self, "optimizer")
             and self.optimizer is not None
-            and not self.optimizer_cpu_offload
+            and not self.optimizer_self_managed_offload
             and self.offload_optimizer_for_refit
         ):
             self.move_optimizer("cpu")
@@ -4663,6 +4754,13 @@ class MegatronPolicyWorkerImpl(
 
         original_save_path = self.mcore_state.cfg.checkpoint.save
         is_async = self.mcore_state.cfg.checkpoint.async_save
+        if self.chunked_optimizer_state_offload and optimizer_path is not None and is_async:
+            raise ValueError(
+                "chunked_optimizer_state_offload does not support async checkpoint save "
+                "when optimizer state is saved: the background writer can retain pinned "
+                "CPU buffers that the next optimizer update reuses. Set "
+                "checkpoint.async_save=false or save_optimizer=false."
+            )
         if is_async and self._requires_nvrx_cuda_cache_release():
             # Set this before saving so an exception path can still tear down a
             # writer that may already have received CUDA IPC handles.
@@ -4684,9 +4782,16 @@ class MegatronPolicyWorkerImpl(
             if (
                 optimizer_path is not None
                 and self.optimizer is not None
-                and not self.optimizer_cpu_offload
+                and not self.optimizer_self_managed_offload
             ):
                 self.move_optimizer("cuda")
+            if (
+                self.chunked_optimizer_state_offload
+                and optimizer_path is not None
+                and self.optimizer is not None
+            ):
+                # Host readers of offloaded optimizer state must wait for in-flight D2H.
+                self.optimizer.synchronize_optimizer_state_for_checkpoint()
             torch.cuda.synchronize()
 
             self.mcore_state.cfg.checkpoint.save = weights_path

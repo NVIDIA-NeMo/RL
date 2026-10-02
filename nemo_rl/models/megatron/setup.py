@@ -1829,11 +1829,45 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
         model_cfg.offload_modules = offload_modules
 
 
+def chunked_optimizer_state_offload_enabled(optimizer_config: Mapping[str, Any]) -> bool:
+    """Whether MCore's chunked optimizer-state offload is active (flag set and fraction > 0)."""
+    return bool(optimizer_config.get("chunked_optimizer_state_offload", False)) and (
+        optimizer_config.get("optimizer_state_offload_fraction", 1.0) > 0.0
+    )
+
+
 def _validate_optimizer_config(config: PolicyConfig) -> None:
     """Validate optimizer configuration."""
     optimizer_config = config["megatron_cfg"]["optimizer"]
     optimizer_cpu_offload = optimizer_config["optimizer_cpu_offload"]
     optimizer_offload_fraction = optimizer_config["optimizer_offload_fraction"]
+
+    if optimizer_config.get("chunked_optimizer_state_offload", False):
+        state_offload_fraction = optimizer_config.get(
+            "optimizer_state_offload_fraction", 1.0
+        )
+        if not 0.0 <= state_offload_fraction <= 1.0:
+            raise ValueError(
+                "optimizer_state_offload_fraction must be in [0, 1], "
+                f"got {state_offload_fraction}"
+            )
+        if optimizer_config.get("optimizer_state_offload_chunk_size_mb", 0) < 0:
+            raise ValueError("optimizer_state_offload_chunk_size_mb must be >= 0")
+        if chunked_optimizer_state_offload_enabled(optimizer_config):
+            if optimizer_cpu_offload:
+                raise ValueError(
+                    "chunked_optimizer_state_offload and optimizer_cpu_offload are "
+                    "mutually exclusive"
+                )
+            if not optimizer_config["use_distributed_optimizer"]:
+                raise ValueError(
+                    "chunked_optimizer_state_offload requires "
+                    "use_distributed_optimizer=True"
+                )
+            if optimizer_config["optimizer"] != "adam":
+                raise ValueError(
+                    "chunked_optimizer_state_offload is only wired for the adam optimizer"
+                )
 
     if optimizer_cpu_offload and not 0 < optimizer_offload_fraction <= 1:
         raise ValueError(
@@ -2009,6 +2043,12 @@ def _create_megatron_config(
         "overlap_param_gather": overlap_param_gather,
         "reuse_grad_buf_for_mxfp8_param_ag": reuse_grad_buf_for_mxfp8_param_ag,
     }
+    # optimizer_cpu_chunk_size is a HybridDeviceOptimizer knob; MCore stacks without that
+    # patch (e.g. chunked optimizer-state offload) have no such OptimizerConfig field.
+    if "optimizer_cpu_chunk_size" in optimizer_kwargs and "optimizer_cpu_chunk_size" not in {
+        f.name for f in fields(OptimizerConfig)
+    }:
+        optimizer_kwargs.pop("optimizer_cpu_chunk_size")
     # Fused linear logprobs run the decoder but read output_layer.weight directly
     # instead of calling output_layer.forward(). Megatron's distributed-optimizer
     # overlap_param_gather prefetch chain assumes every param-gather bucket
