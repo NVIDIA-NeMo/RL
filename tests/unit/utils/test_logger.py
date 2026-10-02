@@ -513,9 +513,7 @@ class TestWandbLogger:
     @patch("nemo_rl.utils.logger.wandb")
     def test_independent_events_do_not_reuse_wandb_internal_step(self, mock_wandb):
         """Telemetry commits must not make a later trainer step stale."""
-        logger = WandbLogger(
-            WandbConfig.model_construct(project="test-project", name="test-run")
-        )
+        logger = WandbLogger(WandbConfig(project="test-project", name="test-run"))
 
         logger.log_metrics({"loss": 1.0}, step=1, prefix="train")
         logger.log_metrics({"seconds": 5.0}, step=1, prefix="timing/train")
@@ -593,9 +591,7 @@ class TestWandbLogger:
 
     @patch("nemo_rl.utils.logger.wandb")
     def test_define_metric_rejects_conflicting_registration(self, mock_wandb):
-        logger = WandbLogger(
-            WandbConfig.model_construct(project="test-project", name="test-run")
-        )
+        logger = WandbLogger(WandbConfig(project="test-project", name="test-run"))
         logger.define_metric("ray/*", step_metric="ray/ray_step")
 
         with pytest.raises(ValueError, match="already registered"):
@@ -603,18 +599,14 @@ class TestWandbLogger:
 
     @patch("nemo_rl.utils.logger.wandb")
     def test_define_metric_rejects_non_terminal_wildcard(self, mock_wandb):
-        logger = WandbLogger(
-            WandbConfig.model_construct(project="test-project", name="test-run")
-        )
+        logger = WandbLogger(WandbConfig(project="test-project", name="test-run"))
 
         with pytest.raises(ValueError, match="exactly one trailing"):
             logger.define_metric("ray/*/util", step_metric="ray/ray_step")
 
     @patch("nemo_rl.utils.logger.wandb")
     def test_log_metrics_requires_registered_step_metric(self, mock_wandb):
-        logger = WandbLogger(
-            WandbConfig.model_construct(project="test-project", name="test-run")
-        )
+        logger = WandbLogger(WandbConfig(project="test-project", name="test-run"))
         logger.define_metric(
             "rollout/throughput/*",
             step_metric=TELEMETRY_WALL_TIME_METRIC,
@@ -628,9 +620,7 @@ class TestWandbLogger:
 
     @patch("nemo_rl.utils.logger.wandb")
     def test_define_metric_uses_longest_matching_prefix(self, mock_wandb):
-        logger = WandbLogger(
-            WandbConfig.model_construct(project="test-project", name="test-run")
-        )
+        logger = WandbLogger(WandbConfig(project="test-project", name="test-run"))
         logger.define_metric("rollout/*", step_metric="rollout/step")
         logger.define_metric(
             "rollout/throughput/*",
@@ -654,9 +644,7 @@ class TestWandbLogger:
     @patch("nemo_rl.utils.logger.wandb")
     def test_does_not_define_catch_all_metric(self, mock_wandb):
         """Overlapping W&B globs must not choose axes nondeterministically."""
-        WandbLogger(
-            WandbConfig.model_construct(project="test-project", name="test-run")
-        )
+        WandbLogger(WandbConfig(project="test-project", name="test-run"))
 
         mock_run = mock_wandb.init.return_value
         assert call("*", step_metric=WANDB_CALLER_STEP_METRIC) not in (
@@ -667,9 +655,7 @@ class TestWandbLogger:
     @patch("nemo_rl.utils.logger.wandb")
     def test_registers_teardown_flush(self, mock_wandb, mock_atexit_register):
         """Driver entrypoints flush the final pending row at process exit."""
-        logger = WandbLogger(
-            WandbConfig.model_construct(project="test-project", name="test-run")
-        )
+        logger = WandbLogger(WandbConfig(project="test-project", name="test-run"))
         logger.log_metrics({"loss": 0.5}, step=7, prefix="train")
 
         mock_atexit_register.assert_called_once_with(logger.finish)
@@ -685,9 +671,7 @@ class TestWandbLogger:
     @patch("nemo_rl.utils.logger.wandb")
     def test_finish_flushes_pending_trainer_row(self, mock_wandb):
         """A final incomplete step is not lost during logger teardown."""
-        logger = WandbLogger(
-            WandbConfig.model_construct(project="test-project", name="test-run")
-        )
+        logger = WandbLogger(WandbConfig(project="test-project", name="test-run"))
         logger.log_metrics({"loss": 0.5}, step=7, prefix="train")
 
         mock_run = mock_wandb.init.return_value
@@ -707,9 +691,7 @@ class TestWandbLogger:
         histogram_value = MagicMock(name="histogram_value")
         plot_value = MagicMock(name="plot_value")
         mock_wandb.Histogram.return_value = histogram_value
-        logger = WandbLogger(
-            WandbConfig.model_construct(project="test-project", name="test-run")
-        )
+        logger = WandbLogger(WandbConfig(project="test-project", name="test-run"))
 
         logger.log_metrics({"loss": 0.5}, step=7, prefix="train")
         logger.log_histogram([1.0, 2.0], step=7, name="train/reward_histogram")
