@@ -1,0 +1,91 @@
+defaults: ./ppo-qwen2.5-1.5b-gsm8k-2n8g-megatron-valuetp2sp-dynbatch-noncolocated-async-single-controller.yaml
+logger:
+  log_dir: logs/ppo-deepseek-r1-distill-qwen-7b-8n4g-megatron-noncolocated-async-single-controller
+  wandb_enabled: true
+  wandb:
+    project: nemo-rl-single-controller-example
+    name: ppo-deepseek-r1-distill-qwen-7b-8n4g-megatron-noncolocated-async-single-controller
+ppo:
+  num_prompts_per_step: 2048
+  max_num_epochs: 100000
+  ppo_epochs: 1
+  critic_ppo_epochs: 1
+  policy_training_start_step: 400
+  skip_reference_policy_logprobs_calculation: false
+loss_fn:
+  reference_policy_kl_penalty: 0.001
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 5
+policy:
+  model_name: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+  tokenizer:
+    name: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+  train_global_batch_size: 2048
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  logprob_chunk_size: 2048
+  max_total_sequence_length: 18432
+  make_sequence_length_divisible_by: 1
+  dynamic_batching:
+    train_mb_tokens: 18432
+    logprob_mb_tokens: 18432
+  sequence_packing:
+    train_mb_tokens: 18432
+    logprob_mb_tokens: 18432
+  megatron_cfg:
+    tensor_model_parallel_size: 1
+    context_parallel_size: 1
+    sequence_parallel: false
+    defer_fp32_logits: true
+  generation:
+    max_new_tokens: 18432
+    colocated:
+      resources:
+        num_nodes: 4
+        gpus_per_node: 4
+    vllm_cfg:
+      gpu_memory_utilization: 0.8
+      max_model_len: 18432
+value:
+  model_name: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+  tokenizer:
+    name: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+  train_global_batch_size: 2048
+  train_micro_batch_size: 1
+  max_total_sequence_length: 18432
+  make_sequence_length_divisible_by: 1
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: 18432
+    logprob_mb_tokens: 18432
+  megatron_cfg:
+    tensor_model_parallel_size: 1
+    sequence_parallel: false
+    optimizer:
+      lr: 2.0e-05
+    scheduler:
+      start_weight_decay: 0.01
+      end_weight_decay: 0.01
+data:
+  max_input_seq_length: 2048
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    system_prompt_file: null
+env:
+  math:
+    math_verify_impl: dapo_math_verify
+cluster:
+  num_nodes: 8
+  gpus_per_node: 4
+async_rl:
+  sampler:
+    warmup_lookahead_versions: 2
+  max_inflight_prompts: ${mul:${ppo.num_prompts_per_step}, 3}
+  max_buffered_rollouts: ${mul:${ppo.num_prompts_per_step}, 3}
+checkpointing:
+  enabled: true
+  checkpoint_dir: results/ppo-deepseek-r1-distill-qwen-7b-8n4g-megatron-noncolocated-async-single-controller
+  save_data_plane: true
