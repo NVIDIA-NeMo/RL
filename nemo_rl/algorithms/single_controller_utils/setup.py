@@ -1304,6 +1304,11 @@ def setup_single_controller(
                     "gym_token_capture",
                 )
             )
+    trajectory_log_cfg = master_config.trajectory_log
+    if trajectory_log_cfg.enabled and trajectory_log_cfg.dir is None:
+        trajectory_log_cfg.dir = os.path.abspath(
+            os.path.join(master_config.logger["log_dir"], "trajectories")
+        )
 
     # Resolved once here so the student workers and the teacher worker group
     # (which deep-copies this config) read the same settings. Absent means the

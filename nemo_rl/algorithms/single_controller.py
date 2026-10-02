@@ -204,6 +204,7 @@ from nemo_rl.utils.timer import TimeoutChecker, Timer
 if TYPE_CHECKING:
     from nemo_rl.experience.rollout_reassembler import FinalizedGroup
     from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
+    from nemo_rl.experience.trajectory_logger import TrajectoryLogWriter
 
 Generation = Union[VllmGeneration, SGLangGeneration, MegatronGeneration]
 
@@ -465,6 +466,15 @@ class SingleControllerActor:
         # when Ray deserializes rollout_manager and tq_buffer separately.
         self._rollout_manager._tq_buffer = self._buffer
         self._rollout_recovery_ledger = self._rollout_manager.recovery_ledger
+        self._trajectory_log: Optional[TrajectoryLogWriter] = None
+        if master_config.trajectory_log.enabled:
+            assert master_config.trajectory_log.dir is not None
+            # PyArrow is only needed when logging is enabled.
+            from nemo_rl.experience.trajectory_logger import TrajectoryLogWriter
+
+            self._trajectory_log = TrajectoryLogWriter(
+                root_dir=master_config.trajectory_log.dir
+            )
 
         # Direct access, deliberately. A getattr default here reads as defensive but
         # buys a silent failure mode: rename or drop the field and
@@ -2973,7 +2983,10 @@ class SingleControllerActor:
                         (
                             train_meta,
                             has_valid_training_tokens,
-                        ) = await self._advantage_stage(train_meta)
+                        ) = await self._advantage_stage(
+                            train_meta,
+                            trajectory_chunk_index=chunks_dispatched,
+                        )
 
                     # A PPO step is this one chunk, so a chunk with nothing left
                     # after filtering is a step that trains neither model.
@@ -3181,6 +3194,10 @@ class SingleControllerActor:
                 ) as cut:
                     await self._cleanup_consumed_metas_unlocked(cut, consumed_metas)
                     self._buffer.release_training_claims(consumed_training_claim_ids)
+                if self._logs_trajectory_step(self._train_steps + 1):
+                    assert self._trajectory_log is not None
+                    with self._timer.time("trajectory_log_time", should_log=False):
+                        self._trajectory_log.commit_step(self._train_steps + 1)
                 for _ in range(consumed_group_count):
                     self._buffer_capacity.release()
                 step_metrics.update(
@@ -5159,7 +5176,16 @@ class SingleControllerActor:
         assert result is not None
         return result
 
-    async def _advantage_stage(self, meta: KVBatchMeta) -> tuple[KVBatchMeta, bool]:
+    def _logs_trajectory_step(self, step: int) -> bool:
+        period = self._master_config.trajectory_log.log_period
+        return self._trajectory_log is not None and (step == 1 or step % period == 0)
+
+    async def _advantage_stage(
+        self,
+        meta: KVBatchMeta,
+        *,
+        trajectory_chunk_index: int = 0,
+    ) -> tuple[KVBatchMeta, bool]:
         """Fetch advantage inputs, compute advantages, and write them back.
 
         SC owns the prompt-group-scoped advantage stage because the selected
@@ -5180,12 +5206,20 @@ class SingleControllerActor:
             return meta, True
         adv_cfg = self._advantage_cfg
 
+        fields = self._advantage_input_fields()
+        if self._logs_trajectory_step(self._train_steps + 1):
+            assert self._trajectory_log is not None
+            fields.extend(
+                field
+                for field in self._trajectory_log.FETCH_FIELDS
+                if field in (meta.fields or ()) and field not in fields
+            )
         data = await call_data_plane(
             self._dp_client,
             "get_samples",
             sample_ids=meta.sample_ids,
             partition_id=meta.partition_id,
-            select_fields=self._advantage_input_fields(),
+            select_fields=fields,
         )
 
         prompt_ids = tensor_field(data, adv_cfg.prompt_ids_field)
@@ -5357,6 +5391,20 @@ class SingleControllerActor:
         self._step_log_dict["masked_advantages"].append(
             response_advantages.detach().cpu()
         )
+
+        if self._logs_trajectory_step(self._train_steps + 1):
+            assert self._trajectory_log is not None
+            with self._timer.time("trajectory_log_time", should_log=False):
+                self._trajectory_log.record(
+                    meta,
+                    data,
+                    advantages=advantages,
+                    final_sample_mask=final_sample_mask,
+                    step=self._train_steps + 1,
+                    chunk_index=trajectory_chunk_index,
+                    values=kwargs.get("values"),
+                    returns=returns,
+                )
 
         fields_to_put = {adv_cfg.output_field: advantages}
         if not torch.equal(final_sample_mask, sample_mask):

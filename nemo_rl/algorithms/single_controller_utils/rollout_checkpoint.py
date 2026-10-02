@@ -90,6 +90,7 @@ _BOOTSTRAP_FINGERPRINT_EXCLUDED_PATHS = frozenset(
         "token_capture.control_auth_token",
         "token_capture.control_timeout_s",
         "token_capture.num_reassembler_workers",
+        "trajectory_log",
         "**.api_key",
         "**.apikey",
         "**.password",
