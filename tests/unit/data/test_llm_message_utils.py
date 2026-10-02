@@ -640,6 +640,30 @@ def test_formatted_message_log_empty_message():
             )
 
 
+def test_formatted_message_log_skips_chat_template_for_preformatted_turns() -> None:
+    class RawTokenizer:
+        def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
+            assert not add_special_tokens
+            return [ord(character) for character in text]
+
+    result = get_formatted_message_log(
+        [
+            {"role": "user", "content": "ab"},
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "cd"}],
+            },
+        ],
+        RawTokenizer(),  # type: ignore[arg-type]
+        TaskDataSpec(task_name="test"),
+        skip_chat_template=True,
+    )
+
+    assert [message["content"] for message in result] == ["ab", "cd"]
+    assert torch.equal(result[0]["token_ids"], torch.tensor([97, 98]))
+    assert torch.equal(result[1]["token_ids"], torch.tensor([99, 100]))
+
+
 def test_add_loss_mask_to_chat_message_log(
     tokenized_chat_message_log: list[LLMMessageLogType],
 ):
