@@ -2304,6 +2304,39 @@ class TestGenerateForFinalizationFlow:
         # actor-pool path; the manager leaves the reservation unready.
         assert buf.commit_calls == []
 
+    def test_a_row_resent_under_a_fresh_attempt_seals_under_its_new_id(self):
+        """A row re-sent after a broken stream reports the re-minted ID, not the first one."""
+        buf = _FakeCaptureBuffer()
+        mgr = _make_capture_manager(buf)
+        base_run = mgr._impl.run_rollout
+
+        async def resend_row_1(sample, *, rollout_ids, generation_indices, **kwargs):
+            # What _replace_unreturned_rows and the re-send's submitting() record.
+            (group_id,) = buf._slots
+            async with mgr._recovery_mutation() as cut:
+                mgr._recovery_ledger.replace_dropped_dispatch(
+                    cut, group_id, generation_indices=[1]
+                )
+                mgr._recovery_ledger.mark_group_dispatched(
+                    cut, group_id, generation_indices=[1]
+                )
+            fresh = mgr._recovery_ledger.get_group(group_id).gate_rollout_ids
+            assert fresh[1] != rollout_ids[1]
+            return await base_run(
+                sample,
+                rollout_ids=fresh,
+                generation_indices=generation_indices,
+                **kwargs,
+            )
+
+        mgr._impl.run_rollout = resend_row_1
+
+        request = _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
+
+        first_ids = buf.reserve_rollout_ids[0]
+        assert request.rollout_ids[0] == first_ids[0]
+        assert request.rollout_ids[1] != first_ids[1]
+
     def test_failed_dispatch_aborts_the_reservation(self):
         buf = _FakeCaptureBuffer()
 

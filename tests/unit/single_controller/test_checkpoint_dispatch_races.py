@@ -2519,12 +2519,12 @@ class TestGymCheckpointPausesRolloutDeadlines:
 
 
 class TestARowDroppedDuringACheckpointDoesNotFailIt:
-    """RL can drop rows while Gym is prepared; the checkpoint must hold.
+    """A broken stream can drop rows while Gym is prepared; the checkpoint must hold.
 
-    The drop marks the rows abandoned at once, but Gym refuses a retire until it
-    resumes, so it still holds and exports them. Restore requires the saved Gym
-    manifest to equal RL's inventory, so the saved checkpoint must leave the
-    dropped episodes out, and they stay queued for the retire after resume.
+    The drop marks the rows abandoned at once, but only the next checkpoint
+    retires them, so Gym still holds and exports them. Restore requires the
+    saved Gym manifest to equal RL's inventory, so the saved checkpoint must
+    leave the dropped episodes out, and they stay queued for that retire.
     """
 
     @staticmethod
@@ -2532,10 +2532,13 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
         ledger: RolloutRecoveryLedger,
         barrier: DataPlaneCheckpointBarrier,
         group_id: str,
+        generation_indices: list[int],
     ) -> None:
-        # A cancelled group task queues its retire for the next checkpoint.
+        # What _replace_unreturned_rows records before the rows are re-sent.
         async with barrier.mutation() as cut:
-            ledger.abandon_unsealed(cut, group_id)
+            ledger.replace_dropped_dispatch(
+                cut, group_id, generation_indices=generation_indices
+            )
 
     @staticmethod
     async def _save(
@@ -2575,7 +2578,9 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
             coordinator = gym_coordinator(
                 FakeGymActor(
                     live={row_0, row_1},
-                    while_prepared=lambda: self._drop(ledger, barrier, group.group_id),
+                    while_prepared=lambda: self._drop(
+                        ledger, barrier, group.group_id, [1]
+                    ),
                 )
             )
             controller = _controller_for(coordinator, ledger)
@@ -2585,15 +2590,15 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
                 self._save(controller, barrier, tmp_path), _ASYNC_TEST_TIMEOUT_S
             )
 
-            self._assert_restorable(controller, coordinator, tmp_path, kept=set())
+            self._assert_restorable(controller, coordinator, tmp_path, kept={row_0})
             assert ledger.gym_checkpoint_retirements({"tools/replica-0"}) == {
-                "tools/replica-0": tuple(sorted((row_0, row_1)))
+                "tools/replica-0": (row_1,)
             }
 
         asyncio.run(exercise())
 
     def test_a_drop_while_the_commit_drains(self, tmp_path: Path) -> None:
-        """The group is dropped while its on-wire reply drains, with a row Gym exported."""
+        """A failed on-wire reply ends the stream, dropping a row Gym exported."""
 
         async def exercise() -> None:
             barrier = DataPlaneCheckpointBarrier()
@@ -2610,7 +2615,7 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
             async def fail_the_on_wire_reply() -> None:
                 while "commit" not in actor.operations():
                     await asyncio.sleep(0)
-                await self._drop(ledger, barrier, group.group_id)
+                await self._drop(ledger, barrier, group.group_id, [0, 1])
 
             failing = asyncio.create_task(fail_the_on_wire_reply())
             await asyncio.wait_for(
@@ -2636,14 +2641,15 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
             async with barrier.mutation() as cut:
                 group = _dispatched_turn_group(ledger, cut)
             row_0, row_1 = (group.gym_episode(index) for index in (0, 1))
+            key_0 = f"{row_0.rollout_id}/call-0"
+            key_1 = f"{row_1.rollout_id}/call-0"
             coordinator = gym_coordinator(
                 FakeGymActor(
                     live={row_0, row_1},
-                    while_prepared=lambda: self._drop(ledger, barrier, group.group_id),
-                    staging_keys_by_episode={
-                        row_0: (f"{row_0.rollout_id}/call-0",),
-                        row_1: (f"{row_1.rollout_id}/call-0",),
-                    },
+                    while_prepared=lambda: self._drop(
+                        ledger, barrier, group.group_id, [1]
+                    ),
+                    staging_keys_by_episode={row_0: (key_0,), row_1: (key_1,)},
                 )
             )
             controller = _controller_for(coordinator, ledger)
@@ -2654,8 +2660,8 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
 
             async def list_sample_ids(method: str, *, partition_id: str) -> list[str]:
                 assert (method, partition_id) == ("list_sample_ids", "rollout_staging")
-                # The dropped group's staging is gone by the time the cut looks.
-                return []
+                # The dropped row's staging is gone by the time the cut looks.
+                return [key_0]
 
             controller._call_dp = list_sample_ids
 
@@ -2664,8 +2670,8 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
             )
 
             saved = load_gym_checkpoint_manifest(tmp_path)
-            assert saved.instances == {"tools/replica-0": ()}
-            assert saved.staging_keys == {"tools/replica-0": ()}
+            assert set(saved.instances["tools/replica-0"]) == {row_0}
+            assert saved.staging_keys == {"tools/replica-0": (key_0,)}
 
         asyncio.run(exercise())
 
@@ -2688,8 +2694,8 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
                 tmp_path, checkpoint_id="save-1"
             ) as gym_commit:
                 assert gym_commit is not None
-                await self._drop(ledger, barrier, group.group_id)
-                # As if the drop's retire had already been acknowledged.
+                await self._drop(ledger, barrier, group.group_id, [0])
+                # Take the drop off the retire queue, as if RL never queued it.
                 ledger.mark_gym_retired({"tools/replica-0": [row_0]})
                 async with barrier.checkpoint() as cut:
                     with pytest.raises(RuntimeError, match="ownership changed"):
