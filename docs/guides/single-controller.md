@@ -177,8 +177,10 @@ With `checkpointing.save_data_plane: true`, each Single-Controller checkpoint co
 - A native TQ snapshot containing rollout tensor payloads and TQ state.
 - A metadata-only replay index describing the completed rollout groups stored in TQ.
 - A `rollout_recovery.pt` ownership ledger describing unfinished prompt groups that must be redispatched after a restart.
-- With `rollout_recovery.target_level: turn`, a `gym_restart_fallback.json`
-  marker: Gym state is saved only in the rollout snapshots taken after it.
+- With `rollout_recovery.target_level: turn` or `prefix`, a
+  `gym_restart_fallback.json` marker: Gym state, and for `prefix` the decoded
+  tokens staged from active model calls, are saved only in the rollout
+  snapshots taken after it.
 - A `replacement_reserve.pt` sidecar containing prompts held for dropped-rollout replacement, when applicable.
 - The sampler dispatch position needed to continue scheduling from the correct point.
 
@@ -356,7 +358,7 @@ another crash does not lose the saved turn boundary.
 
 If no rollout snapshot follows the newest trainer checkpoint, SC restores that
 checkpoint on its own: completed groups come back from TQ and unfinished
-turn-level rollouts restart from their tasks. A checkpoint with neither Gym
+turn- and prefix-level rollouts restart from their tasks. A checkpoint with neither Gym
 state nor the `gym_restart_fallback.json` marker is refused.
 
 The `turn` target currently requires vLLM generation, NeMo Gym, token capture,
@@ -373,7 +375,7 @@ mirroring Gym's concrete-route precedence. Otherwise the task-source override,
 then the global default, applies. The agent map also keeps datasets collated
 before Gym recorded `task_source` working, although re-collating them is
 recommended. Overrides may only select a coarser level than the global target,
-and are not supported with `turn` yet: a checkpointing Gym deployment exports
+and are not supported with `turn` or `prefix` yet: a checkpointing Gym deployment exports
 every live episode, so a coarser route on it would fall outside the commit
 scope. Until Gym advertises group-scoring capabilities, configure group-scored routes
 such as GenRM explicitly as `prompt_group`. Non-default policies require

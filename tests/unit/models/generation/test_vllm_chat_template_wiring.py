@@ -148,6 +148,10 @@ def _install_fake_vllm(monkeypatch):
     )
     module("vllm.renderers.online_renderer", OnlineRenderer=_OnlineRenderer)
     module(
+        "vllm.sampling_params",
+        RequestOutputKind=type("RequestOutputKind", (), {"DELTA": "delta"}),
+    )
+    module(
         "vllm.exceptions",
         VLLMValidationError=type("VLLMValidationError", (Exception,), {}),
     )
