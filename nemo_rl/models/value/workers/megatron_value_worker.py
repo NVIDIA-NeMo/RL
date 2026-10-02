@@ -401,6 +401,11 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         self.megatron_cfg = runtime_config.megatron_cfg
         self.dtype = runtime_config.dtype
         self.optimizer_cpu_offload = runtime_config.optimizer_cpu_offload
+        if config["megatron_cfg"]["optimizer"].get("chunked_optimizer_state_offload", False):
+            raise NotImplementedError(
+                "chunked_optimizer_state_offload is only wired into MegatronPolicyWorker; "
+                "the value worker's train loop has no offload hooks."
+            )
         self.offload_optimizer_for_logprob = (
             runtime_config.offload_optimizer_for_logprob
         )
