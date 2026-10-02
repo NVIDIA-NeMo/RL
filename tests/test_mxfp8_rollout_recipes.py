@@ -150,6 +150,7 @@ MXFP8_CASES = {
         "gpus_per_node": 4,
         "segment_size": 4,
         "async_engine": True,
+        "optimizer_lr": 1.0e-7,
         "moe_backend": "flashinfer_trtllm",
         "ignore_patterns": [
             "model.layers.*.self_attn.*",
@@ -266,6 +267,11 @@ def test_mxfp8_rollout_recipe_matrix(case_name: str, expected: dict) -> None:
         assert (
             config["policy"]["train_global_batch_size"]
             == expected["train_global_batch_size"]
+        )
+    if expected.get("optimizer_lr") is not None:
+        assert (
+            config["policy"]["megatron_cfg"]["optimizer"]["lr"]
+            == expected["optimizer_lr"]
         )
 
     expected_async = "-async-1off-" in case_name

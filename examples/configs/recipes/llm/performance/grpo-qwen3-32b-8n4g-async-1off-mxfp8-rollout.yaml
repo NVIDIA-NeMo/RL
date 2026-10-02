@@ -2,6 +2,9 @@ defaults: ./grpo-qwen3-32b-8n4g-async-1off.yaml
 checkpointing:
   checkpoint_dir: results/grpo-qwen3-32b-8n4g-async-1off-mxfp8-rollout
 policy:
+  megatron_cfg:
+    optimizer:
+      lr: 1.0e-7
   generation:
     vllm_cfg:
       async_engine: true
