@@ -113,8 +113,14 @@ def _initial_gym_image_batch() -> BatchedDataDict:
     )
 
 
-def test_attach_initial_nemo_gym_image_payloads_attaches_once(monkeypatch):
+@pytest.mark.parametrize("native", [False, True])
+def test_attach_initial_nemo_gym_image_payloads_attaches_once(monkeypatch, native):
     batch = _initial_gym_image_batch()
+    if native:
+        batch["extra_env_info"][0] = {
+            "task_id": {"taskset": "vision:train", "task_id": "image-1"},
+            "task_input": batch["extra_env_info"][0],
+        }
     attached = PackedTensor(torch.ones(1, 3, 2, 3), dim_to_pack=0)
 
     class _Processor:
@@ -2474,6 +2480,42 @@ def test_prepare_nemo_gym_rows_stamps_distinct_legacy_prompt_groups():
     assert [row[NEMO_GYM_GROUP_ATTEMPT_KEY] for row in rows] == [0, 0, 0, 0]
     assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [0, 1, 0, 1]
     assert [row["_rowidx"] for row in rows] == [0, 1, 2, 3]
+
+
+def test_prepare_nemo_gym_rows_updates_mixed_native_and_legacy_inputs():
+    native = {
+        "task_id": {"taskset": "workplace:train", "task_id": "17"},
+        "task_input": {
+            "responses_create_params": {
+                "input": [{"role": "user", "content": "Check my meetings."}],
+                "max_output_tokens": 128,
+                "metadata": {"extra_body": '{"seed": 8}'},
+            },
+            "task_data": {"state": ["meeting-1"]},
+        },
+    }
+    rows = [
+        {"agent_ref": {"name": "legacy"}, "responses_create_params": {}},
+        native,
+    ]
+    rollouts_mod._prepare_nemo_gym_rows(
+        rows,
+        generation_config={"max_new_tokens": 64},
+        sampling_params=SimpleNamespace(temperature=0.7, top_p=0.9),
+        num_generations=1,
+    )
+
+    assert native["task_id"] == {"taskset": "workplace:train", "task_id": "17"}
+    assert native["task_input"]["task_data"] == {"state": ["meeting-1"]}
+    assert "responses_create_params" not in native
+    native_params = native["task_input"]["responses_create_params"]
+    assert native_params["metadata"] == {"extra_body": '{"seed": 8}'}
+    for params in (rows[0]["responses_create_params"], native_params):
+        assert params["temperature"] == 0.7
+        assert params["top_p"] == 0.9
+        assert params["max_output_tokens"] == 64
+    assert [row["_rowidx"] for row in rows] == [0, 1]
+    assert rows[0][NEMO_GYM_GROUP_ID_KEY] != rows[1][NEMO_GYM_GROUP_ID_KEY]
 
 
 def test_rollout_manager_rotates_replicas_and_reports_group_share():
