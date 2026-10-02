@@ -246,7 +246,9 @@ with migration instructions when posted as an exact command by an
 owner, member, or collaborator. Other commenters, bots, and quoted mentions
 do not trigger a notice. These commands never run or automatically request a review.
 
-The repository policy lives in `skills/pr-review/SKILL.md`. The review service
-must load this rubric from protected `main`, not the pull-request branch.
-Before relying on repository-specific reviews, publish the rubric, register
-its repository profile, and verify a Ready plugin snapshot containing it.
+Repository review guidance remains in AGENTS.md and
+[the existing team-review skill](.agents/contributor-skills/review-pr-team/SKILL.md).
+The local `/review-pr` and `/review-pr-team` workflows are unchanged.
+Before relying on repository-specific formal reviews, verify the service's
+profile registration and a Ready snapshot of the protected-main guidance.
+This migration does not register or activate that integration.

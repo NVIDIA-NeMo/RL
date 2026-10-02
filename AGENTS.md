@@ -28,8 +28,8 @@ skill keyword — infer it from the artifact you read.
 ## Code Review
 
 For formal GitHub reviews, comment `/review` or `/review mode=strict` on the PR.
-The protected-branch rubric is `skills/pr-review/SKILL.md`; see CONTRIBUTING.md
-for profile activation prerequisites. The local interactive commands below are unchanged.
+See CONTRIBUTING.md for service integration prerequisites. The existing
+repository review guidance and local interactive commands below are unchanged.
 
 Use `/review-pr <pr-number>` for interactive local PR review.
 
