@@ -20,7 +20,7 @@ import threading
 import time
 import warnings
 from collections import Counter, OrderedDict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional
 
 import requests
@@ -1042,7 +1042,19 @@ class MegatronGenerationMixin:
             0.0 if greedy else (float(top_p_cfg) if top_p_cfg is not None else 0.0)
         )
 
+        stop_token_ids = self.cfg["generation"].get("stop_token_ids")
+        supports_stop_tokens = any(
+            field.name == "stop_token_ids" for field in fields(SamplingParams)
+        )
+        if stop_token_ids and not supports_stop_tokens:
+            raise NotImplementedError(
+                "Megatron stop_token_ids requires a Megatron-Core version with "
+                "SamplingParams.stop_token_ids support. Upgrade Megatron-Core "
+                "before requesting custom token stops."
+            )
+
         return SamplingParams(
+            **({"stop_token_ids": stop_token_ids} if supports_stop_tokens else {}),
             temperature=self.cfg["generation"]["temperature"] if not greedy else 0,
             top_k=top_k_val,
             top_p=top_p_val,
