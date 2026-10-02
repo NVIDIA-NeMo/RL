@@ -25,7 +25,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import uuid
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Optional, Self, TypeAlias
@@ -349,6 +349,10 @@ class RolloutRecoveryLedger:
 
     def __init__(self) -> None:
         self._groups: dict[str, PromptGroupRecoveryRecord] = {}
+        # Gym episodes RL dropped after Gym may have admitted them, by owning
+        # Gym instance. In memory only: they belong to this process's Gym
+        # executions and must be retired before the next checkpoint commit.
+        self._gym_retirements: dict[str, set[tuple[str, int]]] = {}
 
     def groups(self) -> list[PromptGroupRecoveryRecord]:
         return [self._copy_group(group) for group in self._groups.values()]
@@ -605,6 +609,52 @@ class RolloutRecoveryLedger:
             instance_id: tuple(sorted(episodes))
             for instance_id, episodes in inventory.items()
         }
+
+    def _record_gym_retirements(self, record: PromptGroupRecoveryRecord) -> None:
+        """Remember each current attempt Gym may still be running for this group.
+
+        A dispatched attempt can have an admitted episode, and a reserved
+        restored attempt has restored Gym state. Dropping either from the ledger
+        does not stop it in Gym, which would export it at the next commit.
+        """
+        for sibling in record.siblings:
+            attempt = sibling.current_attempt
+            holds_gym_state = attempt.status is RolloutAttemptStatus.DISPATCHED or (
+                attempt.status is RolloutAttemptStatus.RESERVED
+                and attempt.gym_attempt > 0
+            )
+            if not holds_gym_state or attempt.gym_instance_id is None:
+                continue
+            self._gym_retirements.setdefault(attempt.gym_instance_id, set()).add(
+                record.gym_episode(sibling.generation_index)
+            )
+
+    def gym_checkpoint_retirements(
+        self,
+        instance_ids: set[str] | frozenset[str],
+    ) -> dict[str, tuple[tuple[str, int], ...]]:
+        """Return dropped Gym episodes to retire before the next commit."""
+        unknown = set(self._gym_retirements) - set(instance_ids)
+        if unknown:
+            raise RuntimeError(
+                f"dropped rollouts reference unavailable Gym instances {sorted(unknown)!r}"
+            )
+        return {
+            instance_id: tuple(sorted(self._gym_retirements.get(instance_id, ())))
+            for instance_id in instance_ids
+        }
+
+    def mark_gym_retired(
+        self, retired: Mapping[str, Iterable[tuple[str, int]]]
+    ) -> None:
+        """Forget episodes Gym has retired; later drops stay pending."""
+        for instance_id, episodes in retired.items():
+            pending = self._gym_retirements.get(instance_id)
+            if pending is None:
+                continue
+            pending.difference_update(episodes)
+            if not pending:
+                del self._gym_retirements[instance_id]
 
     def prepare_incomplete_retry(
         self,
@@ -882,6 +932,7 @@ class RolloutRecoveryLedger:
             raise ValueError(
                 f"cannot abandon group {group_id!r} from {record.status.value!r}"
             )
+        self._record_gym_retirements(record)
         if (
             record.recovery_granularity is RecoveryGranularity.PROMPT_GROUP
             and record.status is PromptGroupStatus.GENERATING
@@ -974,7 +1025,7 @@ class RolloutRecoveryLedger:
     def discard_group(self, cut: DataPlaneMutationCut, group_id: str) -> None:
         """Drop a group only after its external TQ/Gate ownership is cleaned."""
         cut.require_live()
-        self._require_group(group_id)
+        self._record_gym_retirements(self._require_group(group_id))
         del self._groups[group_id]
 
     def discard_canonical_groups(

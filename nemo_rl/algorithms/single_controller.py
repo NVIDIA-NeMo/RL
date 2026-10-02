@@ -55,7 +55,7 @@ import uuid
 import warnings
 from collections import deque
 from collections.abc import AsyncIterator, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 from typing import (
@@ -167,6 +167,8 @@ from nemo_rl.environments.gym_checkpoint_coordinator import (
     GymCheckpointCommitResult,
     GymCheckpointCoordinator,
     load_gym_checkpoint_manifest,
+    staging_keys_of,
+    write_gym_checkpoint_manifest,
 )
 from nemo_rl.environments.nemo_gym import (
     as_nemo_gym_shard_set,
@@ -4325,7 +4327,9 @@ class SingleControllerActor:
     ) -> _RolloutCheckpointCut:
         """Validate the prepared Gym cut, then capture matching TQ state."""
         if gym_commit is not None:
-            await self._validate_gym_checkpoint_cut(cut, gym_commit)
+            await self._validate_gym_checkpoint_cut(
+                cut, gym_commit, checkpoint_path=checkpoint_path
+            )
         return await self._capture_rollout_checkpoint_cut(cut, checkpoint_path)
 
     def _gym_checkpoint_inventory(
@@ -4342,6 +4346,51 @@ class SingleControllerActor:
             )
             for instance_id, episodes in raw_inventory.items()
         }
+
+    def _queued_gym_retirements(
+        self, coordinator: GymCheckpointCoordinator
+    ) -> dict[str, frozenset[GymCheckpointEpisode]]:
+        """Return dropped episodes Gym may still hold, awaiting their retire."""
+        raw = self._rollout_recovery_ledger.gym_checkpoint_retirements(
+            coordinator.instance_ids
+        )
+        return {
+            instance_id: frozenset(
+                GymCheckpointEpisode(rollout_id, attempt)
+                for rollout_id, attempt in episodes
+            )
+            for instance_id, episodes in raw.items()
+        }
+
+    async def _retire_dropped_gym_episodes(
+        self,
+        coordinator: GymCheckpointCoordinator,
+        checkpoint_id: str,
+    ) -> None:
+        """Retire episodes RL dropped while Gym may still be running them.
+
+        Abandoning or discarding a group leaves an admitted episode running in
+        Gym, which would export it at commit, outside the candidate set. Gym
+        accepts a retire only while idle, so this runs before prepare. A drop
+        recorded after it stays queued: this checkpoint commits it in scope but
+        leaves it out of the saved manifest, and a later retire stops it.
+        """
+        ledger = self._rollout_recovery_ledger
+        raw = ledger.gym_checkpoint_retirements(coordinator.instance_ids)
+        if not any(raw.values()):
+            return
+        await coordinator.retire(
+            checkpoint_id,
+            {
+                instance_id: tuple(
+                    GymCheckpointEpisode(rollout_id, attempt)
+                    for rollout_id, attempt in episodes
+                )
+                for instance_id, episodes in raw.items()
+            },
+        )
+        # Only what was retired: a drop recorded meanwhile stays for next time.
+        ledger.mark_gym_retired(raw)
 
     async def _drain_non_exported_gym_candidates(
         self,
@@ -4393,8 +4442,17 @@ class SingleControllerActor:
         self,
         cut: DataPlaneMutationCut,
         commit: GymCheckpointCommitResult,
+        *,
+        checkpoint_path: PathLike,
     ) -> None:
-        """Require Gym ownership and referenced staging rows to match this cut."""
+        """Require Gym ownership and referenced staging rows to match this cut.
+
+        Gym may have exported episodes RL dropped while it was prepared: it
+        refuses their retire until resume, so they are still queued for one.
+        They and their staged rows are left out of the saved manifest, since
+        restore requires it to match RL's inventory and RL no longer continues
+        them; a dropped group may already have cleaned those rows up.
+        """
         cut.require_live()
         coordinator = self._gym_checkpoint_coordinator
         if coordinator is None:
@@ -4402,23 +4460,39 @@ class SingleControllerActor:
 
         actual = self._gym_checkpoint_inventory(coordinator)
         expected = commit.manifest.instances
-        mismatches = {
-            instance_id: {
-                "expected": sorted(expected[instance_id], key=repr),
-                "actual": sorted(actual[instance_id], key=repr),
-            }
-            for instance_id in coordinator.instance_ids
-            if set(actual[instance_id]) != set(expected[instance_id])
-        }
+        dropped = self._queued_gym_retirements(coordinator)
+        mismatches = {}
+        kept: dict[str, tuple[GymCheckpointEpisode, ...]] = {}
+        for instance_id in coordinator.instance_ids:
+            owned = set(actual[instance_id])
+            exported = set(expected[instance_id])
+            if owned - exported or not exported - owned <= dropped[instance_id]:
+                mismatches[instance_id] = {
+                    "expected": sorted(exported, key=repr),
+                    "actual": sorted(owned, key=repr),
+                }
+            kept[instance_id] = tuple(
+                episode for episode in expected[instance_id] if episode in owned
+            )
         if mismatches:
             raise RuntimeError(
                 "Gym episode ownership changed after commit and before the TQ cut: "
                 f"{mismatches!r}"
             )
-
-        expected_staging_keys = {
-            key for keys in commit.manifest.staging_keys.values() for key in keys
+        staging_keys = {
+            instance_id: staging_keys_of(
+                commit.instances[instance_id], kept[instance_id]
+            )
+            for instance_id in coordinator.instance_ids
         }
+        if kept != expected:
+            await asyncio.to_thread(
+                write_gym_checkpoint_manifest,
+                Path(checkpoint_path),
+                replace(commit.manifest, instances=kept, staging_keys=staging_keys),
+            )
+
+        expected_staging_keys = {key for keys in staging_keys.values() for key in keys}
         if not expected_staging_keys:
             return
         actual_staging_keys = set(
@@ -4454,12 +4528,29 @@ class SingleControllerActor:
             )
 
         async with gate.closed():
+            # Gym refuses a retire once a checkpoint is open, so retire while it
+            # is still idle; dispatch is already closed, so nothing new races in.
+            await self._retire_dropped_gym_episodes(coordinator, checkpoint_id)
             async with coordinator.prepared(checkpoint_id):
                 candidates = self._gym_checkpoint_inventory(coordinator)
+                # A row dropped since that retire is still running in Gym, which
+                # exports it; naming it keeps the export in scope, and the cut
+                # leaves it out of the saved manifest.
+                dropped = self._queued_gym_retirements(coordinator)
+                scope = {
+                    instance_id: episodes
+                    + tuple(
+                        sorted(
+                            dropped[instance_id] - set(episodes),
+                            key=lambda episode: (episode.rollout_id, episode.attempt),
+                        )
+                    )
+                    for instance_id, episodes in candidates.items()
+                }
                 commit = await coordinator.commit(
                     checkpoint_id,
                     Path(checkpoint_path),
-                    candidates,
+                    scope,
                 )
                 await self._drain_non_exported_gym_candidates(
                     coordinator,
@@ -5095,7 +5186,9 @@ class SingleControllerActor:
 
                 if save_data_plane:
                     if gym_commit is not None:
-                        await self._validate_gym_checkpoint_cut(cut, gym_commit)
+                        await self._validate_gym_checkpoint_cut(
+                            cut, gym_commit, checkpoint_path=checkpoint_path
+                        )
                     training_owned_groups = self._buffer.training_owned_replay_groups()
                     if training_owned_groups:
                         raise RuntimeError(
