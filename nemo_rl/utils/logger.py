@@ -123,7 +123,7 @@ class LoggerConfig(BaseModel, extra="allow"):
 
 
 def should_log_nemo_gym_full_result_tables(
-    *, wandb_enabled: bool, wandb_config: WandbConfig
+    *, wandb_enabled: bool, wandb_config: Optional[WandbConfig]
 ) -> bool:
     """Return whether complete NeMo Gym results should become W&B Tables."""
     return wandb_enabled and wandb_config.log_nemo_gym_full_result_tables
