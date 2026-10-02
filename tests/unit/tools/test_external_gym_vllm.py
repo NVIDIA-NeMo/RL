@@ -1077,12 +1077,11 @@ def test_inline_job_routes_pools_and_gates_nemo_rl_on_their_readiness(tmp_path):
         assert "--nodelist=ray-a" in step
         assert f"--container-workdir={tmp_path}" in step
         assert any(arg.startswith("--container-mounts=/data:/data,") for arg in step)
-    assert not (log_dir / "external_vllm_services.tsv").exists()
 
 
 def test_services_only_job_serves_pools_to_separately_submitted_nemo_rl(tmp_path):
     log_dir = tmp_path / "logs/4242-logs"
-    manifest = log_dir / "external_vllm_services.tsv"
+    wrapper_log_path = tmp_path / "wrapper.log"
     env = _fake_slurm_env(tmp_path)
     # No hetgroups, COMMAND, MOUNTS, or ray.sub: the pools own the allocation.
     env.update(
@@ -1091,7 +1090,7 @@ def test_services_only_job_serves_pools_to_separately_submitted_nemo_rl(tmp_path
             "SLURM_JOB_NODELIST": "svc-d,svc-c,svc-b,svc-a",
         }
     )
-    with open(tmp_path / "wrapper.log", "w") as wrapper_log:
+    with open(wrapper_log_path, "w") as wrapper_log:
         process = subprocess.Popen(
             ["bash", str(tmp_path / "tools/run_in_allocation.sh")],
             env=env,
@@ -1102,33 +1101,19 @@ def test_services_only_job_serves_pools_to_separately_submitted_nemo_rl(tmp_path
     try:
         deadline = time.monotonic() + 30
         while (
-            not manifest.exists()
+            "External vLLM services are ready" not in wrapper_log_path.read_text()
             and process.poll() is None
             and time.monotonic() < deadline
         ):
             time.sleep(0.05)
-        assert manifest.exists(), (tmp_path / "wrapper.log").read_text()
+        wrapper_output = wrapper_log_path.read_text()
+        assert "External vLLM services are ready" in wrapper_output, wrapper_output
 
-        assert [
-            line.split("\t")
-            for line in manifest.read_text().splitlines()
-            if not line.startswith("#")
-        ] == [
-            [
-                "GENRM",
-                "http://10.0.1.1:9213/v1",
-                "http://10.0.1.1:9213/health",
-                "2",
-                "genrm",
-            ],
-            [
-                "JUDGE",
-                "http://10.0.1.1:9214/v1",
-                "http://10.0.1.1:9214/health",
-                "1",
-                "model",
-            ],
-        ]
+        # Each URL is logged in the form the recipe launchers take it.
+        assert "GENRM_BASE_URL=http://10.0.1.1:9213/v1" in wrapper_output
+        assert "JUDGE_BASE_URL=http://10.0.1.1:9214/v1" in wrapper_output
+        assert (log_dir / "genrm_url").read_text() == "http://10.0.1.1:9213/v1\n"
+        assert (log_dir / "judge_url").read_text() == "http://10.0.1.1:9214/v1\n"
         replica_steps, lb_steps = _recorded_srun_steps(tmp_path)
         assert sorted(
             arg
@@ -1144,36 +1129,24 @@ def test_services_only_job_serves_pools_to_separately_submitted_nemo_rl(tmp_path
             assert "--nodelist=svc-a" in step
         assert not (tmp_path / "ray_sub_command").exists()
 
-        # A NeMo RL launcher that uses only some of the pools attaches to them.
+        # A NeMo RL job given a logged URL gates rollouts on that load balancer.
         attach = subprocess.run(
             [
                 "bash",
                 "-c",
-                textwrap.dedent(
-                    f"""\
-                    set -euo pipefail
-                    source {tmp_path}/tools/pool_config.sh
-                    register_external_vllm_pool GENRM \\
-                      --model genrm-model-id --container vllm.sqsh \\
-                      --python /opt/vllm/bin/python --replicas 2 \\
-                      --tensor-parallel-size 4 --lb-port 9213 \\
-                      --served-model-name genrm --startup-timeout 600 \\
-                      --url-placeholder __GENRM_URL__
-                    resolve_external_vllm_services 'run genrm=__GENRM_URL__' {log_dir}
-                    """
-                ),
+                f"source {tmp_path}/tools/pool_config.sh && "
+                f'external_vllm_running_pools_override 600 GENRM "$(cat {log_dir}/genrm_url)"',
             ],
             capture_output=True,
             text=True,
         )
         assert attach.returncode == 0, attach.stderr
-        assert attach.stdout.startswith("run genrm=http://10.0.1.1:9213/v1 ")
         assert _parse_readiness_override(attach.stdout) == {
             "services": [
                 {
                     "name": "GENRM",
                     "url": "http://10.0.1.1:9213/health",
-                    "expected_backends": 2,
+                    "expected_backends": 1,
                 }
             ],
             "timeout_seconds": 600,
@@ -1181,10 +1154,8 @@ def test_services_only_job_serves_pools_to_separately_submitted_nemo_rl(tmp_path
             "request_timeout_seconds": 10,
         }
 
-        # Stopping the job withdraws the manifest so no new job attaches.
         process.send_signal(signal.SIGTERM)
         assert process.wait(timeout=10) == 143
-        assert not manifest.exists()
         assert (log_dir / "ENDED").exists()
     finally:
         if process.poll() is None:
@@ -1214,49 +1185,59 @@ def test_services_only_mode_rejects_a_heterogeneous_allocation():
     assert "requires a single-component allocation, got 2 hetgroups" in result.stderr
 
 
-_GENRM_SERVICE = "GENRM\thttp://10.0.1.1:9213/v1\thttp://10.0.1.1:9213/health"
+def _run_running_pools_override(arguments: str) -> subprocess.CompletedProcess:
+    program = (
+        f"source {REPO_ROOT}/tools/external_gym_vllm/pool_config.sh && "
+        f"external_vllm_running_pools_override {arguments}"
+    )
+    return subprocess.run(["bash", "-c", program], capture_output=True, text=True)
+
+
+def test_running_pools_override_waits_for_a_healthy_backend_per_pool():
+    result = _run_running_pools_override(
+        "900 GENRM http://10.0.1.1:9213/v1/ NL2BASH https://judge.example:9214/v1"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert _parse_readiness_override(result.stdout) == {
+        "services": [
+            {
+                "name": "GENRM",
+                "url": "http://10.0.1.1:9213/health",
+                "expected_backends": 1,
+            },
+            {
+                "name": "NL2BASH",
+                "url": "https://judge.example:9214/health",
+                "expected_backends": 1,
+            },
+        ],
+        "timeout_seconds": 900,
+        "poll_interval_seconds": 5,
+        "request_timeout_seconds": 10,
+    }
 
 
 @pytest.mark.parametrize(
-    ("manifest", "expected_error"),
+    ("arguments", "expected_error"),
     [
-        (None, "external_vllm_services.tsv does not exist"),
         (
-            "JUDGE\thttp://10.0.1.1:9214/v1\thttp://10.0.1.1:9214/health\t1\tmodel\n",
-            "do not include pool GENRM",
+            "600 GENRM http://10.0.1.1:9213",
+            "GENRM URL must be an external vLLM load balancer's /v1 URL",
         ),
         (
-            f"{_GENRM_SERVICE}\t2\tother\n",
-            "pool GENRM serves model name 'other', but GENRM_SERVED_MODEL_NAME='genrm'",
+            "600 GENRM http://10.0.1.1:9213/health",
+            "GENRM URL must be an external vLLM load balancer's /v1 URL",
         ),
+        ("600 GENRM", "needs NAME BASE_URL pairs"),
         (
-            "GENRM\t10.0.1.1:9213/v1\thttp://10.0.1.1:9213/health\t2\tgenrm\n",
-            "malformed GENRM entry",
-        ),
-        (
-            f"{_GENRM_SERVICE}\t0\tgenrm\n",
-            "GENRM expected backends must be a positive integer",
+            "0 GENRM http://10.0.1.1:9213/v1",
+            "external readiness timeout must be a positive integer",
         ),
     ],
 )
-def test_resolve_external_vllm_services_rejects_unusable_services(
-    tmp_path, manifest, expected_error
-):
-    if manifest is not None:
-        (tmp_path / "external_vllm_services.tsv").write_text(manifest)
-    program = textwrap.dedent(
-        f"""\
-        source {REPO_ROOT}/tools/external_gym_vllm/pool_config.sh
-        register_external_vllm_pool GENRM \\
-          --model genrm-model-id --container vllm.sqsh \\
-          --python /opt/vllm/bin/python --replicas 2 \\
-          --tensor-parallel-size 4 --lb-port 9213 \\
-          --served-model-name genrm --url-placeholder __GENRM_URL__
-        resolve_external_vllm_services 'run genrm=__GENRM_URL__' {tmp_path}
-        """
-    )
-
-    result = subprocess.run(["bash", "-c", program], capture_output=True, text=True)
+def test_running_pools_override_rejects_unusable_arguments(arguments, expected_error):
+    result = _run_running_pools_override(arguments)
 
     assert result.returncode == 2
     assert expected_error in result.stderr
@@ -1345,52 +1326,81 @@ def test_lightning_launcher_dry_run_submits_only_the_external_pools():
     assert "--- TRAIN_CMD ---" not in result.stdout
 
 
-def test_lightning_launcher_dry_run_attaches_to_running_services(tmp_path):
-    (tmp_path / "external_vllm_services.tsv").write_text(
-        "# External vLLM services from Slurm job 4242\n"
-        "GENRM\thttp://10.0.1.1:9213/v1\thttp://10.0.1.1:9213/health\t8\tmodel\n"
-        "NL2BASH\thttp://10.0.1.1:9214/v1\thttp://10.0.1.1:9214/health\t4\tmodel\n"
+def test_lightning_launcher_dry_run_uses_already_running_pools():
+    # Judge models are not needed when the pools run elsewhere.
+    result = _run_lightning_launcher(
+        GENRM_BASE_URL="http://10.0.1.1:9213/v1",
+        NL2BASH_BASE_URL="http://10.0.1.1:9214/v1",
+        GENRM_MODEL="",
+        NL2BASH_JUDGE_MODEL="",
     )
-
-    result = _run_lightning_launcher(EXTERNAL_VLLM_SERVICES_DIR=str(tmp_path))
 
     assert result.returncode == 0, result.stderr
     assert "Nodes:       66 total" in result.stdout
     assert "Hetgroup" not in result.stdout
-    assert f"External services: {tmp_path}" in result.stdout
+    assert "GenRM:     http://10.0.1.1:9213/v1  (already running)" in result.stdout
     batch_script_line = next(
         line for line in result.stdout.splitlines() if "Batch script:" in line
     )
     assert batch_script_line.endswith("/ray.sub")
+    assert "--- EXTERNAL VLLM POOL ARGS ---" in result.stdout
+    assert "--enable-expert-parallel" not in result.stdout
     train_cmd = result.stdout.split("--- TRAIN_CMD ---\n")[1].split("\n--- end ---")[0]
-    assert "__GENRM_BASE_URL__" not in train_cmd
-    assert "__NL2BASH_BASE_URL__" not in train_cmd
     assert "genrm_model.base_url=http://10.0.1.1:9213/v1" in train_cmd
+    assert "genrm_model.model=model" in train_cmd
     assert "local_vllm_model.base_url=http://10.0.1.1:9214/v1" in train_cmd
-    assert _parse_readiness_override(train_cmd)["services"] == [
-        {
-            "name": "GENRM",
-            "url": "http://10.0.1.1:9213/health",
-            "expected_backends": 8,
-        },
-        {
-            "name": "NL2BASH",
-            "url": "http://10.0.1.1:9214/health",
-            "expected_backends": 4,
-        },
-    ]
+    assert "local_vllm_model.model=model" in train_cmd
+    assert _parse_readiness_override(train_cmd) == {
+        "services": [
+            {
+                "name": "GENRM",
+                "url": "http://10.0.1.1:9213/health",
+                "expected_backends": 1,
+            },
+            {
+                "name": "NL2BASH",
+                "url": "http://10.0.1.1:9214/health",
+                "expected_backends": 1,
+            },
+        ],
+        "timeout_seconds": 3600,
+        "poll_interval_seconds": 5,
+        "request_timeout_seconds": 10,
+    }
 
 
-def test_lightning_launcher_rejects_unusable_external_services_modes(tmp_path):
-    missing = _run_lightning_launcher(EXTERNAL_VLLM_SERVICES_DIR=str(tmp_path))
-    both = _run_lightning_launcher(
-        EXTERNAL_VLLM_SERVICES_ONLY="1", EXTERNAL_VLLM_SERVICES_DIR=str(tmp_path)
-    )
+@pytest.mark.parametrize(
+    ("overrides", "expected_error"),
+    [
+        (
+            {"GENRM_BASE_URL": "http://10.0.1.1:9213/v1"},
+            "set both GENRM_BASE_URL and NL2BASH_BASE_URL, or neither",
+        ),
+        (
+            {
+                "EXTERNAL_VLLM_SERVICES_ONLY": "1",
+                "GENRM_BASE_URL": "http://10.0.1.1:9213/v1",
+                "NL2BASH_BASE_URL": "http://10.0.1.1:9214/v1",
+            },
+            "EXTERNAL_VLLM_SERVICES_ONLY=1 launches the pools",
+        ),
+        (
+            {
+                "GENRM_BASE_URL": "http://10.0.1.1:9213/health",
+                "NL2BASH_BASE_URL": "http://10.0.1.1:9214/v1",
+            },
+            "GENRM URL must be an external vLLM load balancer's /v1 URL",
+        ),
+        ({"GENRM_MODEL": ""}, "GENRM_MODEL is required unless GENRM_BASE_URL is set"),
+    ],
+)
+def test_lightning_launcher_rejects_unusable_judge_pool_settings(
+    overrides, expected_error
+):
+    result = _run_lightning_launcher(**overrides)
 
-    assert missing.returncode == 2
-    assert "external_vllm_services.tsv does not exist" in missing.stderr
-    assert both.returncode == 2
-    assert "mutually exclusive" in both.stderr
+    assert result.returncode != 0
+    assert expected_error in result.stderr
 
 
 def _run_ultra_launcher(**overrides):
@@ -1454,21 +1464,16 @@ def test_ultra_launcher_dry_run_submits_only_the_judge_pools():
     assert "--- TRAIN_CMD ---" not in result.stdout
 
 
-def test_ultra_launcher_dry_run_attaches_to_running_services(tmp_path):
-    # The services job may serve more pools than a stage uses.
-    (tmp_path / "external_vllm_services.tsv").write_text(
-        "GENRM\thttp://10.0.1.1:9213/v1\thttp://10.0.1.1:9213/health\t16\tmodel\n"
-        "NL2BASH\thttp://10.0.1.1:9214/v1\thttp://10.0.1.1:9214/health\t4\tmodel\n"
-    )
-
+def test_ultra_launcher_dry_run_uses_an_already_running_judge_pool():
+    # The stage uses only GenRM, which runs in a services-only job.
     result = _run_ultra_launcher(
-        EXTERNAL_VLLM_SERVICES_DIR=str(tmp_path), NL2BASH_JUDGE_MODEL=""
+        GENRM_BASE_URL="http://10.0.1.1:9213/v1", NL2BASH_JUDGE_MODEL=""
     )
 
     assert result.returncode == 0, result.stderr
     assert "Nodes:       256 total" in result.stdout
     assert "Hetgroup" not in result.stdout
-    assert f"External services: {tmp_path}" in result.stdout
+    assert "GenRM:     http://10.0.1.1:9213/v1  (already running)" in result.stdout
     train_cmd = result.stdout.split("--- TRAIN_CMD ---\n")[1].split("\n--- end ---")[0]
     assert "genrm_model.base_url=http://10.0.1.1:9213/v1" in train_cmd
     assert "genrm_model.model=model" in train_cmd
@@ -1477,15 +1482,48 @@ def test_ultra_launcher_dry_run_attaches_to_running_services(tmp_path):
         {
             "name": "GENRM",
             "url": "http://10.0.1.1:9213/health",
-            "expected_backends": 16,
+            "expected_backends": 1,
         }
     ]
 
 
-def test_ultra_launcher_external_services_modes_require_external_judges(tmp_path):
+def test_ultra_launcher_remote_judge_without_external_judges_has_no_readiness_gate():
+    # EXTERNAL_JUDGES=0 keeps the arbitrary-endpoint meaning of GENRM_BASE_URL.
     result = _run_ultra_launcher(
-        EXTERNAL_JUDGES="0", EXTERNAL_VLLM_SERVICES_DIR=str(tmp_path)
+        EXTERNAL_JUDGES="0",
+        GENRM_BASE_URL="http://genrm.example:8000/v1",
+        NL2BASH_JUDGE_MODEL="",
     )
 
+    assert result.returncode == 0, result.stderr
+    assert "genrm_model.base_url=http://genrm.example:8000/v1" in result.stdout
+    assert "genrm_model.model=test-genrm-model" in result.stdout
+    assert "external_service_readiness" not in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_error"),
+    [
+        (
+            {"EXTERNAL_JUDGES": "0", "EXTERNAL_VLLM_SERVICES_ONLY": "1"},
+            "EXTERNAL_VLLM_SERVICES_ONLY=1 requires EXTERNAL_JUDGES=1",
+        ),
+        (
+            {"GENRM_BASE_URL": "http://10.0.1.1:9213/v1"},
+            "either every judge in use has a *_BASE_URL or none does",
+        ),
+        (
+            {
+                "EXTERNAL_VLLM_SERVICES_ONLY": "1",
+                "GENRM_BASE_URL": "http://10.0.1.1:9213/v1",
+                "NL2BASH_BASE_URL": "http://10.0.1.1:9214/v1",
+            },
+            "EXTERNAL_VLLM_SERVICES_ONLY=1 launches the judge pools",
+        ),
+    ],
+)
+def test_ultra_launcher_rejects_unusable_judge_pool_settings(overrides, expected_error):
+    result = _run_ultra_launcher(**overrides)
+
     assert result.returncode == 1
-    assert "require EXTERNAL_JUDGES=1" in result.stderr
+    assert expected_error in result.stderr

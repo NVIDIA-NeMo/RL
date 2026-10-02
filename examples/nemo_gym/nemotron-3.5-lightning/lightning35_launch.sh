@@ -46,9 +46,10 @@ set -euo pipefail
 #   NL2BASH_TENSOR_PARALLEL_SIZE=4          TP per external judge server
 #   EXTERNAL_VLLM_SERVICES_ONLY=0          1 to submit only the GenRM and
 #                                          NL2Bash pools as a standalone job
-#   EXTERNAL_VLLM_SERVICES_DIR=            Log dir of a running services-only
-#                                          job; submit only NeMo RL and use
-#                                          its pools
+#   GENRM_BASE_URL=, NL2BASH_BASE_URL=     Load-balancer /v1 URLs of GenRM and
+#                                          NL2Bash pools that already run, e.g.
+#                                          from EXTERNAL_VLLM_SERVICES_ONLY=1;
+#                                          submits only NeMo RL. Set both.
 #   BATCH_SCRIPT=ray.sub                    Slurm entrypoint; external services
 #                                          may wrap ray.sub
 #   ENABLE_MTP_INFERENCE=0                 1 to enable MTP speculative decoding
@@ -108,11 +109,36 @@ if [[ "${RESULTS_DIR}" != "${EXTERNAL_VLLM_SHARED_ROOT}" && "${RESULTS_DIR}" != 
   exit 2
 fi
 
-: "${GENRM_MODEL:?GENRM_MODEL is required}"
-: "${NL2BASH_JUDGE_MODEL:?NL2BASH_JUDGE_MODEL is required}"
+# GenRM and NL2Bash normally run as external vLLM pools in this job's second
+# hetgroup. EXTERNAL_VLLM_SERVICES_ONLY=1 submits only those pools, as a
+# standalone job. GENRM_BASE_URL and NL2BASH_BASE_URL instead point this job at
+# pools that already run, so a pool startup failure never costs a training
+# allocation.
+EXTERNAL_VLLM_SERVICES_ONLY="${EXTERNAL_VLLM_SERVICES_ONLY:-0}"
+GENRM_BASE_URL="${GENRM_BASE_URL:-}"
+NL2BASH_BASE_URL="${NL2BASH_BASE_URL:-}"
+USE_RUNNING_JUDGE_POOLS=0
+if [[ "${EXTERNAL_VLLM_SERVICES_ONLY}" != "0" && "${EXTERNAL_VLLM_SERVICES_ONLY}" != "1" ]]; then
+  echo "ERROR: EXTERNAL_VLLM_SERVICES_ONLY must be 0 or 1 (got '${EXTERNAL_VLLM_SERVICES_ONLY}')" >&2
+  exit 2
+fi
+if [[ -n "${GENRM_BASE_URL}" || -n "${NL2BASH_BASE_URL}" ]]; then
+  # One NeMo Gym readiness gate covers either running or launched pools, not both.
+  if [[ -z "${GENRM_BASE_URL}" || -z "${NL2BASH_BASE_URL}" ]]; then
+    echo "ERROR: set both GENRM_BASE_URL and NL2BASH_BASE_URL, or neither." >&2
+    exit 2
+  fi
+  if [[ "${EXTERNAL_VLLM_SERVICES_ONLY}" == "1" ]]; then
+    echo "ERROR: EXTERNAL_VLLM_SERVICES_ONLY=1 launches the pools; do not also set GENRM_BASE_URL or NL2BASH_BASE_URL." >&2
+    exit 2
+  fi
+  USE_RUNNING_JUDGE_POOLS=1
+else
+  : "${GENRM_MODEL:?GENRM_MODEL is required unless GENRM_BASE_URL is set}"
+  : "${NL2BASH_JUDGE_MODEL:?NL2BASH_JUDGE_MODEL is required unless NL2BASH_BASE_URL is set}"
+fi
 : "${SAFETY_JUDGE_MODEL:?SAFETY_JUDGE_MODEL is required}"
 
-GENRM_BASE_URL="__GENRM_BASE_URL__"
 GENRM_REPLICAS="${GENRM_REPLICAS:-8}"
 GENRM_TENSOR_PARALLEL_SIZE="${GENRM_TENSOR_PARALLEL_SIZE:-8}"
 GENRM_SERVED_MODEL_NAME="${GENRM_SERVED_MODEL_NAME:-model}"
@@ -127,7 +153,6 @@ GENRM_TOOL_CALL_PARSER="${GENRM_TOOL_CALL_PARSER:-qwen3_coder}"
 GENRM_ENABLE_EXPERT_PARALLEL="${GENRM_ENABLE_EXPERT_PARALLEL:-1}"
 GENRM_COMPILATION_CONFIG="${GENRM_COMPILATION_CONFIG:-{\"pass_config\":{\"fuse_allreduce_rms\":false}}}"
 GENRM_MODEL_LOADER_EXTRA_CONFIG="${GENRM_MODEL_LOADER_EXTRA_CONFIG:-{\"enable_multithread_load\":true,\"num_threads\":96}}"
-NL2BASH_BASE_URL="__NL2BASH_BASE_URL__"
 NL2BASH_REPLICAS="${NL2BASH_REPLICAS:-4}"
 NL2BASH_TENSOR_PARALLEL_SIZE="${NL2BASH_TENSOR_PARALLEL_SIZE:-4}"
 NL2BASH_SERVED_MODEL_NAME="${NL2BASH_SERVED_MODEL_NAME:-model}"
@@ -148,90 +173,80 @@ source "${PROJECT_ROOT}/tools/external_gym_vllm/pool_config.sh"
 EXTERNAL_VLLM_POOLS=""
 EXTERNAL_VLLM_TOOLS_DIR_HOST="${EXTERNAL_VLLM_TOOLS_DIR_HOST:-${PROJECT_ROOT}/tools/external_gym_vllm}"
 EXTERNAL_VLLM_LB_PYTHON="${EXTERNAL_VLLM_LB_PYTHON:-/opt/nemo_rl_venv/bin/python}"
-register_external_vllm_pool GENRM \
-  --display-name GenRM \
-  --model "${GENRM_MODEL}" \
-  --container "${GENRM_CONTAINER}" \
-  --python "${GENRM_VLLM_PYTHON}" \
-  --replicas "${GENRM_REPLICAS}" \
-  --tensor-parallel-size "${GENRM_TENSOR_PARALLEL_SIZE}" \
-  --served-model-name "${GENRM_SERVED_MODEL_NAME}" \
-  --vllm-port "${GENRM_VLLM_PORT}" \
-  --lb-port "${GENRM_LB_PORT}" \
-  --startup-timeout "${GENRM_STARTUP_TIMEOUT}" \
-  --url-placeholder "${GENRM_BASE_URL}"
-external_vllm_pool_env GENRM \
-  "FLASHINFER_WORKSPACE_BASE=/tmp" \
-  "VLLM_FLASHINFER_ALLREDUCE_BACKEND=trtllm" \
-  "VLLM_ALLREDUCE_USE_SYMM_MEM=0"
-genrm_vllm_args=(
-  --trust-remote-code
-  --dtype bfloat16
-  --kv-cache-dtype fp8
-  --max-num-seqs 256
-  --gpu-memory-utilization 0.95
-  --enable-prefix-caching
-  --reasoning-parser "${GENRM_REASONING_PARSER_NAME}"
-  --enable-auto-tool-choice
-  --tool-call-parser "${GENRM_TOOL_CALL_PARSER}"
-  --compilation-config "${GENRM_COMPILATION_CONFIG}"
-  --model-loader-extra-config "${GENRM_MODEL_LOADER_EXTRA_CONFIG}"
-)
-[[ "${GENRM_ENABLE_EXPERT_PARALLEL}" == "1" ]] && genrm_vllm_args+=(--enable-expert-parallel)
-external_vllm_pool_args GENRM "${genrm_vllm_args[@]}"
+if [[ "${USE_RUNNING_JUDGE_POOLS}" == "0" ]]; then
+  GENRM_BASE_URL="__GENRM_BASE_URL__"
+  NL2BASH_BASE_URL="__NL2BASH_BASE_URL__"
+  register_external_vllm_pool GENRM \
+    --display-name GenRM \
+    --model "${GENRM_MODEL}" \
+    --container "${GENRM_CONTAINER}" \
+    --python "${GENRM_VLLM_PYTHON}" \
+    --replicas "${GENRM_REPLICAS}" \
+    --tensor-parallel-size "${GENRM_TENSOR_PARALLEL_SIZE}" \
+    --served-model-name "${GENRM_SERVED_MODEL_NAME}" \
+    --vllm-port "${GENRM_VLLM_PORT}" \
+    --lb-port "${GENRM_LB_PORT}" \
+    --startup-timeout "${GENRM_STARTUP_TIMEOUT}" \
+    --url-placeholder "${GENRM_BASE_URL}"
+  external_vllm_pool_env GENRM \
+    "FLASHINFER_WORKSPACE_BASE=/tmp" \
+    "VLLM_FLASHINFER_ALLREDUCE_BACKEND=trtllm" \
+    "VLLM_ALLREDUCE_USE_SYMM_MEM=0"
+  genrm_vllm_args=(
+    --trust-remote-code
+    --dtype bfloat16
+    --kv-cache-dtype fp8
+    --max-num-seqs 256
+    --gpu-memory-utilization 0.95
+    --enable-prefix-caching
+    --reasoning-parser "${GENRM_REASONING_PARSER_NAME}"
+    --enable-auto-tool-choice
+    --tool-call-parser "${GENRM_TOOL_CALL_PARSER}"
+    --compilation-config "${GENRM_COMPILATION_CONFIG}"
+    --model-loader-extra-config "${GENRM_MODEL_LOADER_EXTRA_CONFIG}"
+  )
+  [[ "${GENRM_ENABLE_EXPERT_PARALLEL}" == "1" ]] && genrm_vllm_args+=(--enable-expert-parallel)
+  external_vllm_pool_args GENRM "${genrm_vllm_args[@]}"
 
-register_external_vllm_pool NL2BASH \
-  --display-name NL2Bash \
-  --model "${NL2BASH_JUDGE_MODEL}" \
-  --container "${NL2BASH_CONTAINER}" \
-  --python "${NL2BASH_VLLM_PYTHON}" \
-  --replicas "${NL2BASH_REPLICAS}" \
-  --tensor-parallel-size "${NL2BASH_TENSOR_PARALLEL_SIZE}" \
-  --served-model-name "${NL2BASH_SERVED_MODEL_NAME}" \
-  --vllm-port "${NL2BASH_VLLM_PORT}" \
-  --lb-port "${NL2BASH_LB_PORT}" \
-  --startup-timeout "${NL2BASH_STARTUP_TIMEOUT}" \
-  --url-placeholder "${NL2BASH_BASE_URL}"
-external_vllm_pool_env NL2BASH \
-  "FLASHINFER_WORKSPACE_BASE=/tmp" \
-  "VLLM_USE_FLASHINFER_MOE_FP16=0" \
-  "VLLM_USE_FLASHINFER_MOE_FP8=0" \
-  "VLLM_USE_DEEP_GEMM=0" \
-  "VLLM_MOE_USE_DEEP_GEMM=0" \
-  "NCCL_MNNVL_ENABLE=1"
-nl2bash_vllm_args=(
-  --dtype bfloat16
-  --pipeline-parallel-size 1
-  --max-model-len 131072
-  --max-num-seqs 256
-  --gpu-memory-utilization 0.85
-  --enable-prefix-caching
-  --enable-chunked-prefill
-  --enable-auto-tool-choice
-  --tool-call-parser "${NL2BASH_TOOL_CALL_PARSER}"
-  --attention-backend "${NL2BASH_ATTENTION_BACKEND}"
-  --compilation-config "${NL2BASH_COMPILATION_CONFIG}"
-  --model-loader-extra-config "${NL2BASH_MODEL_LOADER_EXTRA_CONFIG}"
-)
-[[ "${NL2BASH_ENABLE_EXPERT_PARALLEL}" == "1" ]] && nl2bash_vllm_args+=(--enable-expert-parallel)
-external_vllm_pool_args NL2BASH "${nl2bash_vllm_args[@]}"
-
-# By default the pools share one heterogeneous job with NeMo RL. They can also
-# run as a standalone services job that separately submitted NeMo RL jobs use,
-# so a pool startup failure never costs a training allocation.
-EXTERNAL_VLLM_SERVICES_ONLY="${EXTERNAL_VLLM_SERVICES_ONLY:-0}"
-EXTERNAL_VLLM_SERVICES_DIR="${EXTERNAL_VLLM_SERVICES_DIR:-}"
-if [[ "${EXTERNAL_VLLM_SERVICES_ONLY}" != "0" && "${EXTERNAL_VLLM_SERVICES_ONLY}" != "1" ]]; then
-  echo "ERROR: EXTERNAL_VLLM_SERVICES_ONLY must be 0 or 1 (got '${EXTERNAL_VLLM_SERVICES_ONLY}')" >&2
-  exit 2
-fi
-if [[ "${EXTERNAL_VLLM_SERVICES_ONLY}" == "1" && -n "${EXTERNAL_VLLM_SERVICES_DIR}" ]]; then
-  echo "ERROR: EXTERNAL_VLLM_SERVICES_ONLY=1 and EXTERNAL_VLLM_SERVICES_DIR are mutually exclusive." >&2
-  exit 2
+  register_external_vllm_pool NL2BASH \
+    --display-name NL2Bash \
+    --model "${NL2BASH_JUDGE_MODEL}" \
+    --container "${NL2BASH_CONTAINER}" \
+    --python "${NL2BASH_VLLM_PYTHON}" \
+    --replicas "${NL2BASH_REPLICAS}" \
+    --tensor-parallel-size "${NL2BASH_TENSOR_PARALLEL_SIZE}" \
+    --served-model-name "${NL2BASH_SERVED_MODEL_NAME}" \
+    --vllm-port "${NL2BASH_VLLM_PORT}" \
+    --lb-port "${NL2BASH_LB_PORT}" \
+    --startup-timeout "${NL2BASH_STARTUP_TIMEOUT}" \
+    --url-placeholder "${NL2BASH_BASE_URL}"
+  external_vllm_pool_env NL2BASH \
+    "FLASHINFER_WORKSPACE_BASE=/tmp" \
+    "VLLM_USE_FLASHINFER_MOE_FP16=0" \
+    "VLLM_USE_FLASHINFER_MOE_FP8=0" \
+    "VLLM_USE_DEEP_GEMM=0" \
+    "VLLM_MOE_USE_DEEP_GEMM=0" \
+    "NCCL_MNNVL_ENABLE=1"
+  nl2bash_vllm_args=(
+    --dtype bfloat16
+    --pipeline-parallel-size 1
+    --max-model-len 131072
+    --max-num-seqs 256
+    --gpu-memory-utilization 0.85
+    --enable-prefix-caching
+    --enable-chunked-prefill
+    --enable-auto-tool-choice
+    --tool-call-parser "${NL2BASH_TOOL_CALL_PARSER}"
+    --attention-backend "${NL2BASH_ATTENTION_BACKEND}"
+    --compilation-config "${NL2BASH_COMPILATION_CONFIG}"
+    --model-loader-extra-config "${NL2BASH_MODEL_LOADER_EXTRA_CONFIG}"
+  )
+  [[ "${NL2BASH_ENABLE_EXPERT_PARALLEL}" == "1" ]] && nl2bash_vllm_args+=(--enable-expert-parallel)
+  external_vllm_pool_args NL2BASH "${nl2bash_vllm_args[@]}"
 fi
 
 RAY_SUB="${RAY_SUB:-${PROJECT_ROOT}/ray.sub}"
-if [[ -n "${EXTERNAL_VLLM_SERVICES_DIR}" ]]; then
+if [[ "${USE_RUNNING_JUDGE_POOLS}" == "1" ]]; then
   BATCH_SCRIPT="${BATCH_SCRIPT:-${RAY_SUB}}"
 else
   BATCH_SCRIPT="${BATCH_SCRIPT:-${PROJECT_ROOT}/tools/external_gym_vllm/run_in_allocation.sh}"
@@ -432,10 +447,9 @@ fi
 # Job shape. Reference defaults are selected above and can be overridden through
 # NUM_TRAIN_NODES / NUM_GEN_NODES / NUM_GYM_NODES.
 # =============================================================================
-NUM_EXTERNAL_SERVICE_NODES="${EXTERNAL_VLLM_NUM_NODES}"
-if [[ -n "${EXTERNAL_VLLM_SERVICES_DIR}" ]]; then
-  # The pools already run in their own job.
-  NUM_EXTERNAL_SERVICE_NODES=0
+NUM_EXTERNAL_SERVICE_NODES=0
+if [[ "${USE_RUNNING_JUDGE_POOLS}" == "0" ]]; then
+  NUM_EXTERNAL_SERVICE_NODES="${EXTERNAL_VLLM_NUM_NODES}"
 fi
 
 NUM_ACTOR_NODES=$((NUM_TRAIN_NODES + NUM_GEN_NODES))
@@ -842,8 +856,13 @@ ${NRL_MAX_STEPS:+grpo.max_num_steps=${NRL_MAX_STEPS}} \
 ${MTP_EXTRA_ARGS} \
 ${*}"
 
-if [[ -n "${EXTERNAL_VLLM_SERVICES_DIR}" ]]; then
-  TRAIN_CMD="$(resolve_external_vllm_services "${TRAIN_CMD}" "${EXTERNAL_VLLM_SERVICES_DIR}")"
+if [[ "${USE_RUNNING_JUDGE_POOLS}" == "1" ]]; then
+  # Gym starts rollouts only once both load balancers report a healthy backend.
+  RUNNING_POOLS_OVERRIDE="$(external_vllm_running_pools_override \
+    "$(( GENRM_STARTUP_TIMEOUT > NL2BASH_STARTUP_TIMEOUT ? GENRM_STARTUP_TIMEOUT : NL2BASH_STARTUP_TIMEOUT ))" \
+    GENRM "${GENRM_BASE_URL}" \
+    NL2BASH "${NL2BASH_BASE_URL}")"
+  TRAIN_CMD+=" ${RUNNING_POOLS_OVERRIDE}"
 fi
 export COMMAND="${TRAIN_CMD}"
 if [[ "${EXTERNAL_VLLM_SERVICES_ONLY}" == "1" ]]; then
@@ -883,8 +902,9 @@ if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
 echo "      GenRM:    ${GENRM_REPLICAS} independent TP=${GENRM_TENSOR_PARALLEL_SIZE}, DP=1 servers; LB port=${GENRM_LB_PORT}"
 echo "      NL2Bash:  ${NL2BASH_REPLICAS} independent TP=${NL2BASH_TENSOR_PARALLEL_SIZE}, DP=1 servers; LB port=${NL2BASH_LB_PORT}"
 fi
-if [[ -n "${EXTERNAL_VLLM_SERVICES_DIR}" ]]; then
-echo "    External services: ${EXTERNAL_VLLM_SERVICES_DIR}"
+if [[ "${USE_RUNNING_JUDGE_POOLS}" == "1" ]]; then
+echo "    GenRM:     ${GENRM_BASE_URL}  (already running)"
+echo "    NL2Bash:   ${NL2BASH_BASE_URL}  (already running)"
 fi
 echo "  Walltime:    ${WALLTIME}"
 echo "  Batch script: ${BATCH_SCRIPT}"
@@ -984,7 +1004,7 @@ if [[ "${EXTERNAL_VLLM_SERVICES_ONLY}" == "1" ]]; then
       ${SLURM_RESERVATION:+--reservation="${SLURM_RESERVATION}"} \
       "${SLURM_COMMENT_ARGS[@]}" \
       "${BATCH_SCRIPT}")
-elif [[ -n "${EXTERNAL_VLLM_SERVICES_DIR}" ]]; then
+elif [[ "${USE_RUNNING_JUDGE_POOLS}" == "1" ]]; then
   SBATCH_OUTPUT=$(sbatch \
       --nodes="${NUM_RAY_NODES}" \
       --account="${SLURM_ACCOUNT}" \
@@ -1043,9 +1063,9 @@ JOB_ID=$(echo "${SBATCH_OUTPUT}" | grep -oP '\d+$') || true
 if [[ -n "${JOB_ID}" ]]; then
   echo ""
   if [[ "${EXTERNAL_VLLM_SERVICES_ONLY}" == "1" ]]; then
-    echo "  Services dir: ${BASE_LOG_DIR}/${JOB_ID}-logs"
-    echo "  Once the job log reports the services ready, submit NeMo RL jobs with"
-    echo "  EXTERNAL_VLLM_SERVICES_DIR=${BASE_LOG_DIR}/${JOB_ID}-logs"
+    echo "  Services log: ${SLURM_LOG_DIR}/${JOB_ID}.out"
+    echo "  Once it reports 'External vLLM services are ready', submit NeMo RL jobs"
+    echo "  with the GENRM_BASE_URL and NL2BASH_BASE_URL values it prints."
   else
     echo "  Ray logs:    ${BASE_LOG_DIR}/${JOB_ID}-logs/"
   fi

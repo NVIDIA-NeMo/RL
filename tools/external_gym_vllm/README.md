@@ -257,49 +257,46 @@ EXTERNAL_VLLM_SERVICES_ONLY=1 sbatch \
 ```
 
 The job does not use `COMMAND` or `ray.sub`. Once every pool passes the same
-registry and end-to-end `/models` checks as a heterogeneous job, it writes a
-manifest to `$BASE_LOG_DIR/<job-id>[-<restart-count>]-logs/external_vllm_services.tsv`
-and logs that directory:
+registry and end-to-end `/models` checks as a heterogeneous job, it logs each
+pool's load-balancer URL in the form the recipe launchers take it, and also
+writes it to `<pool-name-lowercase>_url` in
+`$BASE_LOG_DIR/<job-id>[-<restart-count>]-logs`:
 
 ```text
-# External vLLM services from Slurm job <job-id>
-# pool	base_url	health_url	expected_backends	served_model_name
-GENRM	http://<lb-ip>:9213/v1	http://<lb-ip>:9213/health	8	model
+[INFO] External vLLM services are ready. Pass these URLs to NeMo RL jobs:
+[INFO]   GENRM_BASE_URL=http://<lb-ip>:9213/v1  # GenRM: 8 replicas, served model name 'model'
 ```
 
-The manifest exists only while the job serves every pool; the job removes it
-when it exits. As in a heterogeneous job, the job exits when any replica or
-load balancer exits. Otherwise it serves until `scancel` or walltime, so size
-`--time` for every NeMo RL job that will use it.
+As in a heterogeneous job, the job exits when any replica or load balancer
+exits. Otherwise it serves until `scancel` or walltime, so size `--time` for
+every NeMo RL job that will use it.
 
-### Attaching NeMo RL jobs
+### Using the pools from NeMo RL jobs
 
-A NeMo RL launcher registers the same pools and builds `COMMAND` with their URL
-placeholders as usual. Instead of submitting a heterogeneous job, it resolves
-`COMMAND` against the services job's log directory and submits plain `ray.sub`
-with only the NeMo RL nodes:
+A NeMo RL job uses running pools through ordinary Gym overrides: set each Gym
+server's `base_url` to the pool's URL and its `model` to the pool's served model
+name (`model` unless `--served-model-name` was set). It neither registers those
+pools nor needs their allocation, so it submits plain `ray.sub` with only the
+NeMo RL nodes. It needs no access to the services job's files.
+
+To keep the startup check that a heterogeneous job gets, append the readiness
+gate built from the same URLs:
 
 ```bash
-COMMAND="$(resolve_external_vllm_services "$COMMAND" "$EXTERNAL_VLLM_SERVICES_DIR")"
+COMMAND+=" $(external_vllm_running_pools_override 3600 \
+  GENRM "$GENRM_BASE_URL" NL2BASH "$NL2BASH_BASE_URL")"
 ```
 
-`resolve_external_vllm_services` fails before submission when the manifest is
-missing, lacks a registered pool, or reports a served model name other than the
-pool's `POOL_SERVED_MODEL_NAME`. It replaces each registered pool's placeholder
-with the service URL and appends the same
-`++env.nemo_gym.external_service_readiness` gate as a heterogeneous job, using
-the manifest's backend counts and the largest registered
-`POOL_STARTUP_TIMEOUT`. If the services job exits before a NeMo RL job starts,
-the NeMo RL job therefore stops at startup when that gate times out, rather than
-during rollouts. Pools that the services job serves but the launcher does not
-register are ignored, so one services job can back stages that use different
-subsets of its pools.
+The NeMo Gym actor then waits, up to the given number of seconds, until each load
+balancer's `/health` reports a healthy backend, and fails at startup rather than
+during rollouts if one never does. Each URL must be a load balancer's `/v1` URL,
+since the gate reads that load balancer's `/health` report.
 
 The URLs point at the services job's first node. A queued NeMo RL job keeps the
-URLs it was submitted with, so after restarting the services job, resolve and
-submit the NeMo RL jobs again.
+URLs it was submitted with, so after restarting the services job, submit the
+NeMo RL jobs again with the new URLs.
 
 The Nemotron 3 Ultra (with `EXTERNAL_JUDGES=1`) and Nemotron 3.5 Lightning
 launchers expose both steps: `EXTERNAL_VLLM_SERVICES_ONLY=1` submits the
-services job, and `EXTERNAL_VLLM_SERVICES_DIR=<services-log-dir>` submits a
-NeMo RL job that uses it.
+services job, and `GENRM_BASE_URL` / `NL2BASH_BASE_URL` submit a NeMo RL job
+that uses its pools.

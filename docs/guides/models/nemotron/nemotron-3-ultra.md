@@ -248,9 +248,10 @@ required service exits, the training job is stopped.
 
 In this mode `GENRM_MODEL` and `NL2BASH_JUDGE_MODEL` are the checkpoints the
 pools serve, and Gym addresses them by `GENRM_SERVED_MODEL_NAME` /
-`NL2BASH_SERVED_MODEL_NAME` (both `model` by default). Setting
-`GENRM_BASE_URL` or `NL2BASH_BASE_URL` by hand is rejected, since the wrapper
-supplies those.
+`NL2BASH_SERVED_MODEL_NAME` (both `model` by default). With
+`EXTERNAL_JUDGES=1`, setting `GENRM_BASE_URL` or `NL2BASH_BASE_URL` instead
+names a judge pool that is already running; see
+[Standalone judge services](#standalone-judge-services).
 
 Each pool is registered only when its model variable is set, so set at least
 one of them. Stages declare only the judges they use — `rlhf_teacher` has no
@@ -273,7 +274,7 @@ because the wrapper bind-mounts that root into the service containers. Since
 | `NL2BASH_REPLICAS`, `NL2BASH_TENSOR_PARALLEL_SIZE` | `4`, `4` | Independent DP=1 NL2Bash servers and TP per server |
 | `EXTERNAL_VLLM_SEGMENT_SIZE` | `4` | SLURM `--segment` for the external component |
 | `EXTERNAL_VLLM_SERVICES_ONLY` | `0` | `1` submits only the judge pools, as a standalone services job |
-| `EXTERNAL_VLLM_SERVICES_DIR` | _unset_ | Log directory of a running services job; submits only the NeMo RL nodes and uses its pools |
+| `GENRM_BASE_URL`, `NL2BASH_BASE_URL` | _unset_ | Load-balancer URLs of judge pools that already run; submits only the NeMo RL nodes and uses those pools |
 
 Node counts are derived from the replica shapes, not set directly:
 `nodes = REPLICAS × TENSOR_PARALLEL_SIZE / GPUS_PER_NODE` per pool. The two
@@ -283,8 +284,8 @@ must be a multiple of `EXTERNAL_VLLM_SEGMENT_SIZE`. With both judges external,
 `NUM_GYM_NODES` only has to cover the safety judge. Model paths, the parser
 plugin, and `BASE_LOG_DIR` must live under `EXTERNAL_VLLM_SHARED_ROOT`
 (`/lustre` by default), which is mounted into the service containers.
-`INTERACTIVE=1` is not supported in this mode, except with
-`EXTERNAL_VLLM_SERVICES_DIR`.
+`INTERACTIVE=1` is not supported in this mode, except with already-running
+judge pools.
 
 Building on the [Phase 1](#phase-1--49k-context-128-steps) invocation, add:
 
@@ -331,20 +332,26 @@ NL2BASH_REPLICAS=4 \
 bash examples/nemo_gym/nemotron-3-ultra/ultra_launch.sh
 ```
 
-This submits only the 20 judge nodes and prints the services job's log
-directory. Once that job logs `External vLLM services are ready`, submit each
-training job with `EXTERNAL_JUDGES=1`, the same judge models, and
-`EXTERNAL_VLLM_SERVICES_DIR=<that directory>`. Each training job allocates only
-its NeMo RL nodes, routes Gym to the running judges, and still waits at startup
-until every judge reports all of its replicas healthy. The launcher rejects the
-submission if the services job is not ready or does not serve a judge that the
-stage uses under the same model name. A services job that serves both judges can
-back stages that use only one of them.
+This submits only the 20 judge nodes. Once its Slurm log reports
+`External vLLM services are ready`, it lists each pool's URL:
+
+```text
+[INFO]   GENRM_BASE_URL=http://<lb-ip>:9213/v1  # GenRM: 16 replicas, served model name 'model'
+[INFO]   NL2BASH_BASE_URL=http://<lb-ip>:9214/v1  # NL2Bash: 4 replicas, served model name 'model'
+```
+
+Submit each training job with `EXTERNAL_JUDGES=1` and those `GENRM_BASE_URL`
+and `NL2BASH_BASE_URL` values in place of the judge models; set only the URLs
+for the judges the stage uses. Each training job allocates only its NeMo RL
+nodes, routes Gym to the running judges under their served model name, and
+waits at startup until every judge's load balancer reports a healthy backend.
+One services job that serves both judges can back stages that use only one of
+them.
 
 The services job exits when any judge replica or load balancer exits, and its
 URLs point at its first node. After restarting it, resubmit the training jobs
-with its new log directory; queued training jobs keep the URLs they were
-submitted with. See
+with its new URLs; queued training jobs keep the URLs they were submitted with.
+See
 [Standalone services job](https://github.com/NVIDIA-NeMo/RL/blob/main/tools/external_gym_vllm/README.md#standalone-services-job)
 for the full contract.
 

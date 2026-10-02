@@ -57,9 +57,11 @@ set -euo pipefail
 #   EXTERNAL_VLLM_SERVICES_ONLY=0          With EXTERNAL_JUDGES=1, 1 to submit
 #                                          only the judge pools as a standalone
 #                                          job
-#   EXTERNAL_VLLM_SERVICES_DIR=            With EXTERNAL_JUDGES=1, log dir of a
-#                                          running services-only job; submit
-#                                          only NeMo RL and use its pools
+#   GENRM_BASE_URL=, NL2BASH_BASE_URL=     With EXTERNAL_JUDGES=1, load-balancer
+#                                          /v1 URLs of judge pools that already
+#                                          run, e.g. from
+#                                          EXTERNAL_VLLM_SERVICES_ONLY=1; submit
+#                                          only NeMo RL
 #   BATCH_SCRIPT=ray.sub                   Slurm entrypoint; external services
 #                                          wrap ray.sub
 #   ENABLE_MTP_INFERENCE=0                 1 to enable MTP speculative decoding
@@ -148,23 +150,19 @@ cd "${PROJECT_ROOT}"
 # =============================================================================
 EXTERNAL_JUDGES="${EXTERNAL_JUDGES:-0}"
 NUM_EXTERNAL_SERVICE_NODES=0
-# The pools can also run as a standalone services job that separately submitted
-# NeMo RL jobs use, so a pool startup failure never costs a training allocation.
+# The pools can also run as a standalone services job
+# (EXTERNAL_VLLM_SERVICES_ONLY=1). Training jobs then keep EXTERNAL_JUDGES=1 and
+# set GENRM_BASE_URL / NL2BASH_BASE_URL to its load balancers, so a pool startup
+# failure never costs a training allocation.
 EXTERNAL_VLLM_SERVICES_ONLY="${EXTERNAL_VLLM_SERVICES_ONLY:-0}"
-EXTERNAL_VLLM_SERVICES_DIR="${EXTERNAL_VLLM_SERVICES_DIR:-}"
+USE_RUNNING_JUDGE_POOLS=0
 if [[ "${EXTERNAL_VLLM_SERVICES_ONLY}" != "0" && "${EXTERNAL_VLLM_SERVICES_ONLY}" != "1" ]]; then
   echo "ERROR: EXTERNAL_VLLM_SERVICES_ONLY must be 0 or 1 (got '${EXTERNAL_VLLM_SERVICES_ONLY}')" >&2
   exit 1
 fi
-if [[ "${EXTERNAL_VLLM_SERVICES_ONLY}" == "1" || -n "${EXTERNAL_VLLM_SERVICES_DIR}" ]]; then
-  if [[ "${EXTERNAL_JUDGES}" != "1" ]]; then
-    echo "ERROR: EXTERNAL_VLLM_SERVICES_ONLY and EXTERNAL_VLLM_SERVICES_DIR require EXTERNAL_JUDGES=1." >&2
-    exit 1
-  fi
-  if [[ "${EXTERNAL_VLLM_SERVICES_ONLY}" == "1" && -n "${EXTERNAL_VLLM_SERVICES_DIR}" ]]; then
-    echo "ERROR: EXTERNAL_VLLM_SERVICES_ONLY=1 and EXTERNAL_VLLM_SERVICES_DIR are mutually exclusive." >&2
-    exit 1
-  fi
+if [[ "${EXTERNAL_VLLM_SERVICES_ONLY}" == "1" && "${EXTERNAL_JUDGES}" != "1" ]]; then
+  echo "ERROR: EXTERNAL_VLLM_SERVICES_ONLY=1 requires EXTERNAL_JUDGES=1." >&2
+  exit 1
 fi
 export EXTERNAL_VLLM_SERVICES_ONLY
 # Pool sizing divides replica GPUs by GPUS_PER_NODE, so resolve it before
@@ -172,20 +170,30 @@ export EXTERNAL_VLLM_SERVICES_ONLY
 export GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
 if [[ "${EXTERNAL_JUDGES}" == "1" ]]; then
   # Stages declare only the judges they use: rlhf_teacher has no NL2Bash block,
-  # reasoning_teacher has no GenRM block, swe_teacher has neither. Each pool is
-  # registered only when its model is set, so a stage never receives an override
-  # for a judge its config does not declare.
-  if [[ -z "${GENRM_MODEL}" && -z "${NL2BASH_JUDGE_MODEL}" ]]; then
-    echo "ERROR: EXTERNAL_JUDGES=1 requires GENRM_MODEL, NL2BASH_JUDGE_MODEL, or both." >&2
+  # reasoning_teacher has no GenRM block, swe_teacher has neither. Each judge is
+  # used only when its model or URL is set, so a stage never receives an
+  # override for a judge its config does not declare.
+  if [[ -z "${GENRM_MODEL}${GENRM_BASE_URL}${NL2BASH_JUDGE_MODEL}${NL2BASH_BASE_URL}" ]]; then
+    echo "ERROR: EXTERNAL_JUDGES=1 requires GENRM_MODEL, NL2BASH_JUDGE_MODEL, or both (or their *_BASE_URL)." >&2
     exit 1
   fi
-  if [[ -n "${GENRM_BASE_URL}" ]]; then
-    echo "ERROR: GENRM_BASE_URL and EXTERNAL_JUDGES=1 are mutually exclusive." >&2
-    exit 1
-  fi
-  if [[ -n "${NL2BASH_BASE_URL}" ]]; then
-    echo "ERROR: NL2BASH_BASE_URL and EXTERNAL_JUDGES=1 are mutually exclusive." >&2
-    exit 1
+  # A *_BASE_URL names a judge pool that already runs, typically in a job
+  # submitted with EXTERNAL_VLLM_SERVICES_ONLY=1.
+  if [[ -n "${GENRM_BASE_URL}${NL2BASH_BASE_URL}" ]]; then
+    if [[ "${EXTERNAL_VLLM_SERVICES_ONLY}" == "1" ]]; then
+      echo "ERROR: EXTERNAL_VLLM_SERVICES_ONLY=1 launches the judge pools; do not also set GENRM_BASE_URL or NL2BASH_BASE_URL." >&2
+      exit 1
+    fi
+    # One NeMo Gym readiness gate covers either running or launched pools, not both.
+    if [[ ( -n "${GENRM_MODEL}" && -z "${GENRM_BASE_URL}" ) \
+          || ( -n "${NL2BASH_JUDGE_MODEL}" && -z "${NL2BASH_BASE_URL}" ) ]]; then
+      echo "ERROR: with EXTERNAL_JUDGES=1, either every judge in use has a *_BASE_URL or none does." >&2
+      exit 1
+    fi
+    USE_RUNNING_JUDGE_POOLS=1
+    # Gym addresses a running pool by its served model name, as when launched here.
+    GENRM_API_MODEL_NAME="${GENRM_API_MODEL_NAME:-${GENRM_SERVED_MODEL_NAME:-model}}"
+    NL2BASH_API_MODEL_NAME="${NL2BASH_API_MODEL_NAME:-${NL2BASH_SERVED_MODEL_NAME:-model}}"
   fi
 
   # Deployment-specific service definitions stay in this launcher; the
@@ -196,7 +204,7 @@ if [[ "${EXTERNAL_JUDGES}" == "1" ]]; then
   EXTERNAL_VLLM_LB_PYTHON="${EXTERNAL_VLLM_LB_PYTHON:-/opt/nemo_rl_venv/bin/python}"
 fi
 
-if [[ "${EXTERNAL_JUDGES}" == "1" && -n "${GENRM_MODEL}" ]]; then
+if [[ "${EXTERNAL_JUDGES}" == "1" && -n "${GENRM_MODEL}" && "${USE_RUNNING_JUDGE_POOLS}" == "0" ]]; then
   GENRM_BASE_URL="__GENRM_BASE_URL__"
   GENRM_REPLICAS="${GENRM_REPLICAS:-4}"
   GENRM_TENSOR_PARALLEL_SIZE="${GENRM_TENSOR_PARALLEL_SIZE:-4}"
@@ -219,7 +227,7 @@ if [[ "${EXTERNAL_JUDGES}" == "1" && -n "${GENRM_MODEL}" ]]; then
 
 fi
 
-if [[ "${EXTERNAL_JUDGES}" == "1" && -n "${NL2BASH_JUDGE_MODEL}" ]]; then
+if [[ "${EXTERNAL_JUDGES}" == "1" && -n "${NL2BASH_JUDGE_MODEL}" && "${USE_RUNNING_JUDGE_POOLS}" == "0" ]]; then
   NL2BASH_BASE_URL="__NL2BASH_BASE_URL__"
   NL2BASH_REPLICAS="${NL2BASH_REPLICAS:-4}"
   NL2BASH_TENSOR_PARALLEL_SIZE="${NL2BASH_TENSOR_PARALLEL_SIZE:-4}"
@@ -239,7 +247,7 @@ if [[ "${EXTERNAL_JUDGES}" == "1" && -n "${NL2BASH_JUDGE_MODEL}" ]]; then
   NL2BASH_MODEL_LOADER_EXTRA_CONFIG="${NL2BASH_MODEL_LOADER_EXTRA_CONFIG:-{\"enable_multithread_load\":true,\"num_threads\":112}}"
 fi
 
-if [[ "${EXTERNAL_JUDGES}" == "1" && -n "${GENRM_MODEL}" ]]; then
+if [[ "${EXTERNAL_JUDGES}" == "1" && -n "${GENRM_MODEL}" && "${USE_RUNNING_JUDGE_POOLS}" == "0" ]]; then
   register_external_vllm_pool GENRM \
     --display-name GenRM \
     --model "${GENRM_MODEL}" \
@@ -275,7 +283,7 @@ if [[ "${EXTERNAL_JUDGES}" == "1" && -n "${GENRM_MODEL}" ]]; then
   external_vllm_pool_args GENRM "${genrm_vllm_args[@]}"
 fi
 
-if [[ "${EXTERNAL_JUDGES}" == "1" && -n "${NL2BASH_JUDGE_MODEL}" ]]; then
+if [[ "${EXTERNAL_JUDGES}" == "1" && -n "${NL2BASH_JUDGE_MODEL}" && "${USE_RUNNING_JUDGE_POOLS}" == "0" ]]; then
   register_external_vllm_pool NL2BASH \
     --display-name NL2Bash \
     --model "${NL2BASH_JUDGE_MODEL}" \
@@ -314,10 +322,8 @@ if [[ "${EXTERNAL_JUDGES}" == "1" && -n "${NL2BASH_JUDGE_MODEL}" ]]; then
 fi
 
 if [[ "${EXTERNAL_JUDGES}" == "1" ]]; then
-  NUM_EXTERNAL_SERVICE_NODES="${EXTERNAL_VLLM_NUM_NODES}"
-  if [[ -n "${EXTERNAL_VLLM_SERVICES_DIR}" ]]; then
-    # The judge pools already run in their own job.
-    NUM_EXTERNAL_SERVICE_NODES=0
+  if [[ "${USE_RUNNING_JUDGE_POOLS}" == "0" ]]; then
+    NUM_EXTERNAL_SERVICE_NODES="${EXTERNAL_VLLM_NUM_NODES}"
   fi
   export EXTERNAL_VLLM_LB_PYTHON EXTERNAL_VLLM_POOLS EXTERNAL_VLLM_TOOLS_DIR_HOST
 fi
@@ -931,8 +937,18 @@ ${MTP_EXTRA_ARGS} \
 ${MOPD_OVERRIDES} \
 ${*}"
 
-if [[ -n "${EXTERNAL_VLLM_SERVICES_DIR}" ]]; then
-  TRAIN_CMD="$(resolve_external_vllm_services "${TRAIN_CMD}" "${EXTERNAL_VLLM_SERVICES_DIR}")"
+if [[ "${USE_RUNNING_JUDGE_POOLS}" == "1" ]]; then
+  # Gym starts rollouts only once every running pool reports a healthy backend.
+  _running_pools=()
+  [[ -n "${GENRM_BASE_URL}" ]] && _running_pools+=(GENRM "${GENRM_BASE_URL}")
+  [[ -n "${NL2BASH_BASE_URL}" ]] && _running_pools+=(NL2BASH "${NL2BASH_BASE_URL}")
+  _readiness_timeout="${GENRM_STARTUP_TIMEOUT:-3600}"
+  if (( ${NL2BASH_STARTUP_TIMEOUT:-3600} > _readiness_timeout )); then
+    _readiness_timeout="${NL2BASH_STARTUP_TIMEOUT:-3600}"
+  fi
+  RUNNING_POOLS_OVERRIDE="$(external_vllm_running_pools_override \
+    "${_readiness_timeout}" "${_running_pools[@]}")"
+  TRAIN_CMD+=" ${RUNNING_POOLS_OVERRIDE}"
 fi
 export COMMAND="${TRAIN_CMD}"
 if [[ "${EXTERNAL_VLLM_SERVICES_ONLY}" == "1" ]]; then
@@ -978,8 +994,9 @@ for _pool in ${EXTERNAL_VLLM_POOLS}; do
   echo "      ${!_label}: ${!_replicas} independent TP=${!_tp}, DP=1 servers; LB port=${!_lb}"
 done
 fi
-if [[ -n "${EXTERNAL_VLLM_SERVICES_DIR}" ]]; then
-echo "    External services: ${EXTERNAL_VLLM_SERVICES_DIR}"
+if [[ "${USE_RUNNING_JUDGE_POOLS}" == "1" ]]; then
+[[ -n "${GENRM_BASE_URL}" ]] && echo "    GenRM:     ${GENRM_BASE_URL}  (already running)"
+[[ -n "${NL2BASH_BASE_URL}" ]] && echo "    NL2Bash:   ${NL2BASH_BASE_URL}  (already running)"
 fi
 echo "  Walltime:    ${WALLTIME}"
 echo "  Batch script: ${BATCH_SCRIPT}"
@@ -1202,9 +1219,9 @@ JOB_ID=$(echo "${SBATCH_OUTPUT}" | grep -oP '\d+$')
 if [[ -n "${JOB_ID}" ]]; then
   echo ""
   if [[ "${EXTERNAL_VLLM_SERVICES_ONLY}" == "1" ]]; then
-    echo "  Services dir: ${BASE_LOG_DIR}/${JOB_ID}-logs"
-    echo "  Once the job log reports the services ready, submit NeMo RL jobs with"
-    echo "  EXTERNAL_JUDGES=1 EXTERNAL_VLLM_SERVICES_DIR=${BASE_LOG_DIR}/${JOB_ID}-logs"
+    echo "  Services log: ${SLURM_LOG_DIR}/${JOB_ID}.out"
+    echo "  Once it reports 'External vLLM services are ready', submit NeMo RL jobs"
+    echo "  with EXTERNAL_JUDGES=1 and the *_BASE_URL values it prints."
   else
     echo "  Ray logs:    ${BASE_LOG_DIR}/${JOB_ID}-logs/"
   fi

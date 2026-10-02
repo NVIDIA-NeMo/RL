@@ -72,7 +72,7 @@ for required_file in pool_config.sh vllm_backend_registry.sh vllm_pool_lb.py lb_
     exit 1
   fi
 done
-# Shares the readiness override and services manifest name with launchers.
+# Shares the NeMo Gym readiness override with launchers.
 source "${EXTERNAL_VLLM_TOOLS_DIR_HOST}/pool_config.sh"
 if [[ ! "${GPUS_PER_NODE}" =~ ^[0-9]+$ ]] || (( GPUS_PER_NODE <= 0 )); then
   echo "[FATAL] GPUS_PER_NODE must be a positive integer" >&2
@@ -283,12 +283,7 @@ else
   LOG_DIR="${BASE_LOG_DIR}/${SLURM_JOB_ID}-logs"
 fi
 mkdir -p "${LOG_DIR}"
-services_manifest=""
 rm_args=()
-if [[ "${EXTERNAL_VLLM_SERVICES_ONLY}" == "1" ]]; then
-  services_manifest="${LOG_DIR}/${EXTERNAL_VLLM_SERVICES_MANIFEST}"
-  rm_args+=("${services_manifest}")
-fi
 for pool in "${pool_names[@]}"; do
   pool_key="${pool,,}"
   pool_log_dirs["${pool}"]="${LOG_DIR}/external_${pool_key}"
@@ -341,10 +336,6 @@ cleanup() {
   local status=$?
   trap - EXIT TERM INT
 
-  # Withdraw the services first so no new NeMo RL job attaches during teardown.
-  if [[ -n "${services_manifest}" ]]; then
-    rm -f "${services_manifest}" 2>/dev/null || true
-  fi
   touch "${LOG_DIR}/ENDED" 2>/dev/null || true
   if [[ -n "${ray_sub_pid}" ]] && kill -0 "${ray_sub_pid}" 2>/dev/null; then
     kill "${ray_sub_pid}" 2>/dev/null || true
@@ -725,28 +716,13 @@ for pool in "${pool_names[@]}"; do
 done
 
 if [[ "${EXTERNAL_VLLM_SERVICES_ONLY}" == "1" ]]; then
-  # Publish atomically: launchers treat the manifest as "every pool is ready".
-  {
-    echo "# External vLLM services from Slurm job ${SLURM_JOB_ID}"
-    printf '# pool\tbase_url\thealth_url\texpected_backends\tserved_model_name\n'
-    for pool in "${pool_names[@]}"; do
-      printf '%s\t%s\t%s\t%s\t%s\n' \
-        "${pool}" \
-        "${pool_urls[${pool}]}" \
-        "${health_urls[${pool}]}" \
-        "${replicas[${pool}]}" \
-        "${served_model_names[${pool}]}"
-    done
-  } > "${services_manifest}.tmp"
-  mv "${services_manifest}.tmp" "${services_manifest}"
-
-  echo "[INFO] External vLLM services are ready:"
+  # The recipe launchers take each pool's URL as <POOL>_BASE_URL.
+  echo "[INFO] External vLLM services are ready. Pass these URLs to NeMo RL jobs:"
   for pool in "${pool_names[@]}"; do
-    echo "[INFO]   ${display_names[${pool}]}: ${pool_urls[${pool}]} (${replicas[${pool}]} replicas, model name '${served_model_names[${pool}]}')"
+    echo "[INFO]   ${pool}_BASE_URL=${pool_urls[${pool}]}  # ${display_names[${pool}]}: ${replicas[${pool}]} replicas, served model name '${served_model_names[${pool}]}'"
   done
-  echo "[INFO] Attach NeMo RL jobs with EXTERNAL_VLLM_SERVICES_DIR=${LOG_DIR}"
   # Serve until walltime or scancel. Like the inline path, any replica or load
-  # balancer exit ends the job; cleanup withdraws the manifest.
+  # balancer exit ends the job.
   while check_service_steps; do
     sleep 5
   done
