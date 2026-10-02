@@ -20,7 +20,7 @@ import threading
 import time
 import warnings
 from collections import Counter, OrderedDict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional
 
 import requests
@@ -35,6 +35,7 @@ from megatron.core.inference.config import (
     PrefixCachingEvictionPolicy,
 )
 from megatron.core.inference.engines.dynamic_engine import EngineState
+from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 from megatron.core.inference.quantization.utils import (
     quantize_params_to_mxfp8,
@@ -490,6 +491,15 @@ class MegatronGenerationMixin:
         # TODO: Switch to standardized Megatron API.
         if self._inference_engine_initialized:
             return
+
+        if not any(
+            field.name == "finish_reason" for field in fields(DynamicInferenceRequest)
+        ):
+            raise RuntimeError(
+                "Megatron generation requires engine-provided finish_reason metadata "
+                "to report truncation correctly. Upgrade Megatron-Core to a version "
+                "with DynamicInferenceRequest.finish_reason support."
+            )
 
         from megatron.core.inference.contexts.dynamic_context import (
             DynamicInferenceContext,
@@ -1196,7 +1206,18 @@ class MegatronGenerationMixin:
                 )
             )
 
+        finish_reasons = [getattr(request, "finish_reason", None) for request in result]
+        if any(reason not in ("stop", "length") for reason in finish_reasons):
+            raise RuntimeError(
+                "Megatron returned missing or unsupported finish_reason metadata: "
+                f"{finish_reasons}. Expected 'stop' or 'length' for completed generation."
+            )
         out_dict = {
+            "truncated": torch.tensor(
+                [reason == "length" for reason in finish_reasons],
+                dtype=torch.bool,
+                device=input_ids.device,
+            ),
             "output_ids": output_ids_padded,
             "logprobs": logprobs_padded,
             "generation_lengths": generation_lengths,
