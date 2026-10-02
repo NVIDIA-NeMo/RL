@@ -944,9 +944,11 @@ def test_batched_moe_shuffle_matches_per_expert(
         assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
 
 
+@pytest.mark.parametrize("load_format", ["dummy", "safetensors"])
 def test_process_mxfp8_linear_separates_checkpoint_and_runtime_scales(
-    fp8_module, monkeypatch
+    fp8_module, monkeypatch, load_format
 ):
+    import vllm.config
     from vllm.model_executor import parameter as vllm_parameter
     from vllm.model_executor.layers.quantization.utils import mxfp8_utils
 
@@ -956,6 +958,16 @@ def test_process_mxfp8_linear_separates_checkpoint_and_runtime_scales(
         torch.nn.Parameter(torch.zeros(2, 64), requires_grad=False),
     )
     checkpoint_scale = torch.arange(4, dtype=torch.uint8).reshape(2, 2)
+    if load_format == "dummy":
+        # Model an uninitialized uint8 scale buffer containing E8M0 NaNs.
+        checkpoint_scale.fill_(255)
+    monkeypatch.setattr(
+        vllm.config,
+        "get_current_vllm_config",
+        lambda: types.SimpleNamespace(
+            load_config=types.SimpleNamespace(load_format=load_format)
+        ),
+    )
     layer.register_parameter(
         "weight_scale",
         torch.nn.Parameter(checkpoint_scale.clone(), requires_grad=False),
@@ -978,9 +990,21 @@ def test_process_mxfp8_linear_separates_checkpoint_and_runtime_scales(
     runtime_parameter = layer.weight_scale
     runtime_ptr = runtime_parameter.data_ptr()
     assert runtime_parameter is not layer.weight_scale_from_checkpoint
-    torch.testing.assert_close(layer.weight_scale_from_checkpoint, checkpoint_scale)
-    torch.testing.assert_close(runtime_parameter, checkpoint_scale + 1)
+    expected_scale = (
+        torch.full_like(checkpoint_scale, 127)
+        if load_format == "dummy"
+        else checkpoint_scale
+    )
+    torch.testing.assert_close(layer.weight_scale_from_checkpoint, expected_scale)
+    torch.testing.assert_close(runtime_parameter, expected_scale + 1)
 
+    # Refit runs outside the load context and must keep the real model scales.
+    def unexpected_config_lookup():
+        raise AssertionError("Refit must not reinitialize dummy scales")
+
+    monkeypatch.setattr(
+        vllm.config, "get_current_vllm_config", unexpected_config_lookup
+    )
     layer.weight_scale_from_checkpoint.fill_(4)
     fp8_module.process_weights_after_loading_mxfp8_linear(method, layer)
 
@@ -1119,7 +1143,11 @@ def test_process_mxfp8_moe_refit_rejects_non_flashinfer_backend(fp8_module):
         fp8_module.process_weights_after_loading_mxfp8_moe(quant_method, object())
 
 
-def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
+@pytest.mark.parametrize("load_format", ["dummy", "safetensors"])
+def test_process_mxfp8_moe_initializes_kernel_once(
+    fp8_module, monkeypatch, load_format
+):
+    import vllm.config
     from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
 
     fp8 = fp8_module
@@ -1132,11 +1160,14 @@ def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
     layer = torch.nn.Module()
     layer.w13_weight = torch.nn.Parameter(torch.zeros(2, 128, 512), requires_grad=False)
     layer.w2_weight = torch.nn.Parameter(torch.zeros(2, 512, 128), requires_grad=False)
+    initial_scale = 255 if load_format == "dummy" else 3
     layer.w13_weight_scale = torch.nn.Parameter(
-        torch.zeros(2, 128, 16), requires_grad=False
+        torch.full((2, 128, 16), initial_scale, dtype=torch.uint8),
+        requires_grad=False,
     )
     layer.w2_weight_scale = torch.nn.Parameter(
-        torch.zeros(2, 512, 4), requires_grad=False
+        torch.full((2, 512, 4), initial_scale, dtype=torch.uint8),
+        requires_grad=False,
     )
     layer.w13_weight_scale.weight_loader = object()
     layer.w2_weight_scale.weight_loader = object()
@@ -1181,8 +1212,23 @@ def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
         return kernel
 
     monkeypatch.setattr(vllm_fp8, "make_fp8_moe_kernel", make_kernel)
+    monkeypatch.setattr(
+        vllm.config,
+        "get_current_vllm_config",
+        lambda: types.SimpleNamespace(
+            load_config=types.SimpleNamespace(load_format=load_format)
+        ),
+    )
 
     fp8.process_weights_after_loading_mxfp8_moe(quant_method, layer)
+
+    expected_checkpoint_scale = 127 if load_format == "dummy" else initial_scale
+    assert torch.all(
+        layer.w13_weight_scale_from_checkpoint == expected_checkpoint_scale
+    )
+    assert torch.all(
+        layer.w2_weight_scale_from_checkpoint == expected_checkpoint_scale
+    )
 
     runtime_parameters = (
         layer.w13_weight,
@@ -1193,6 +1239,11 @@ def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
     parameter_ids = tuple(id(parameter) for parameter in runtime_parameters)
     storage_ptrs = tuple(parameter.data_ptr() for parameter in runtime_parameters)
 
+    monkeypatch.setattr(
+        vllm.config,
+        "get_current_vllm_config",
+        lambda: pytest.fail("Refit must not reinitialize dummy scales"),
+    )
     layer.w13_weight_scale_from_checkpoint.data.fill_(2)
     layer.w2_weight_scale_from_checkpoint.data.fill_(2)
     fp8.process_weights_after_loading_mxfp8_moe(quant_method, layer)
@@ -1225,6 +1276,7 @@ def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
 def test_process_mxfp8_moe_padding_preserves_refit_tensors(
     fp8_module, monkeypatch, is_gated, tp_size
 ):
+    import vllm.config
     from vllm.model_executor import parameter as vllm_parameter
     from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
 
@@ -1237,6 +1289,13 @@ def test_process_mxfp8_moe_padding_preserves_refit_tensors(
     monkeypatch.setattr(vllm_parameter, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(
         vllm_parameter, "get_tensor_model_parallel_world_size", lambda: tp_size
+    )
+    monkeypatch.setattr(
+        vllm.config,
+        "get_current_vllm_config",
+        lambda: types.SimpleNamespace(
+            load_config=types.SimpleNamespace(load_format="safetensors")
+        ),
     )
 
     def make_parameter(value):
