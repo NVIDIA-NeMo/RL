@@ -97,7 +97,8 @@ class _InstrumentedNemoGymRolloutImpl:
         }
 
         def _record_submission(event: str, submitted: list[int]) -> None:
-            refreshed = find_group(self._recovery_ledger, rollout_ids, hook="turn")
+            # By group ID: a row re-sent after a broken stream has a new rollout ID.
+            refreshed = self._recovery_ledger.get_group(group.group_id)
             append_event(
                 self._events_path,
                 event,
@@ -109,7 +110,7 @@ class _InstrumentedNemoGymRolloutImpl:
 
         async def _record_completion(generation_index: int, completion: Any) -> None:
             await on_completion(generation_index, completion)
-            refreshed = find_group(self._recovery_ledger, rollout_ids, hook="turn")
+            refreshed = self._recovery_ledger.get_group(group.group_id)
             append_event(
                 self._events_path,
                 "completion",
@@ -162,6 +163,12 @@ class _RecordingDispatchRecorder:
     async def refused(self, generation_index: int) -> None:
         await self._delegate.refused(generation_index)
         self._record("refused", [generation_index])
+
+    async def dropped(self, generation_indices: Sequence[int], *, replace: bool) -> Any:
+        return await self._delegate.dropped(generation_indices, replace=replace)
+
+    def retired(self, episodes: Sequence[Any]) -> None:
+        self._delegate.retired(episodes)
 
 
 _original_setup_single_controller = run_grpo_single_controller.setup_single_controller
