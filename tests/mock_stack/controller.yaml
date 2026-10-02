@@ -1,0 +1,61 @@
+defaults: ../../examples/configs/grpo_math_1B.yaml
+grpo:
+  num_prompts_per_step: 1
+  max_num_epochs: 1
+  async_grpo: null
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  calculate_advantages_on_gpu: false
+loss_fn:
+  force_on_policy_ratio: false
+  use_importance_sampling_correction: true
+  reference_policy_kl_penalty: 0
+policy:
+  model_name: cpu
+  sequence_packing: {enabled: false}
+  generation:
+    backend: vllm
+    model_name: cpu
+    colocated: {enabled: false}
+    vllm_cfg:
+      async_engine: true
+      expose_http_server: true
+      max_model_len: 512
+data:
+  shuffle: false
+  num_workers: 0
+  use_multiple_dataloader: false
+async_rl:
+  sampler: {name: ready_first, max_staleness_versions: 4}
+  max_inflight_prompts: 4
+  max_buffered_rollouts: 8
+  min_groups_for_streaming_train: 1
+  rollout_failure:
+    nemo_gym: {max_row_attempts: 1}
+  stall_watchdog:
+    interval_s: 10
+    stall_timeout_s: 180
+    stall_action: abort
+checkpointing:
+  enabled: true
+  metric_name: null
+  keep_top_k: 2
+  save_period: 2
+  save_data_plane: true
+token_capture:
+  enabled: true
+  num_reassembler_workers: 1
+rollout_recovery: {default_granularity: sibling}
+rollout_checkpointing:
+  snapshot_attempt_interval_s: 3600
+  restore_mode: latest
+  gym:
+    mode: turn_recovery
+    prepare_timeout_s: 30
+logger:
+  monitor_gpus: false
+data_plane:
+  enabled: true
+  backend: simple
+  simple: {num_storage_units: 1, storage_capacity: 4096}
