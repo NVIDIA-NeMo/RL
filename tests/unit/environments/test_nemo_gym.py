@@ -225,15 +225,21 @@ def test_external_service_readiness_times_out_with_last_observation():
         request_timeout_seconds=1,
     )
 
+    now = 0.0
+
+    def advance(seconds: float) -> None:
+        nonlocal now
+        now += seconds
+
+    # Probes return instantly and only sleep advances the clock, so the last
+    # sleep ends exactly at the deadline, as it does in a real run.
     with (
         patch(
             "nemo_rl.environments.nemo_gym.urllib.request.urlopen",
-            side_effect=OSError("connection refused"),
+            side_effect=[OSError("connection refused")],
         ),
-        patch(
-            "nemo_rl.environments.nemo_gym.monotonic",
-            side_effect=[0, 0, 2],
-        ),
+        patch("nemo_rl.environments.nemo_gym.monotonic", side_effect=lambda: now),
+        patch("nemo_rl.environments.nemo_gym.sleep", side_effect=advance),
     ):
         with pytest.raises(TimeoutError, match="GENRM: request failed"):
             _wait_for_external_services(config)

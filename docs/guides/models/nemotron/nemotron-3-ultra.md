@@ -240,10 +240,11 @@ The launcher registers both pools through the
 [external Gym vLLM pool helpers](https://github.com/NVIDIA-NeMo/RL/blob/main/tools/external_gym_vllm/README.md)
 and submits `tools/external_gym_vllm/run_in_allocation.sh` instead of `ray.sub`.
 That wrapper starts every replica in its own private Ray cluster, brings up one
-OpenAI-compatible load balancer per pool, waits for all backends to become
-healthy, substitutes the resolved URLs into the driver command, and only then
-starts `ray.sub` on the training component. If a required service exits, the
-training job is stopped.
+OpenAI-compatible load balancer per pool, substitutes the load-balancer URLs
+into the driver command, and starts `ray.sub` on the training component while
+the models are still loading. The NeMo Gym actor waits until every load
+balancer reports all of its replicas healthy before rollouts begin. If a
+required service exits, the training job is stopped.
 
 In this mode `GENRM_MODEL` and `NL2BASH_JUDGE_MODEL` are the checkpoints the
 pools serve, and Gym addresses them by `GENRM_SERVED_MODEL_NAME` /

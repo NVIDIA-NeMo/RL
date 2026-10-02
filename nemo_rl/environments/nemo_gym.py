@@ -507,6 +507,11 @@ def _wait_for_external_services(
             previous_problems = problems
 
         remaining_seconds = deadline - monotonic()
+        if remaining_seconds > 0:
+            sleep(min(config.poll_interval_seconds, remaining_seconds))
+            remaining_seconds = deadline - monotonic()
+        # Raise now rather than next round: a round that starts at the
+        # deadline cannot probe, and would overwrite these observations.
         if remaining_seconds <= 0:
             details = "; ".join(
                 f"{name}: {problem}" for name, problem in problems.items()
@@ -515,7 +520,6 @@ def _wait_for_external_services(
                 "Timed out waiting for external NeMo-Gym services after "
                 f"{config.timeout_seconds:g}s. Last observations: {details}"
             )
-        sleep(min(config.poll_interval_seconds, remaining_seconds))
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
