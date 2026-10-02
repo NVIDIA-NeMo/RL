@@ -1361,3 +1361,107 @@ def test_restore_rejects_inconsistent_shared_admission_state() -> None:
 
     with pytest.raises(ValueError, match="disagree on phase or target_step"):
         _load(RolloutRecoveryLedger(), state)
+
+
+def _dispatched_turn_group(ledger: RolloutRecoveryLedger) -> PromptGroupRecoveryRecord:
+    group = _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=2,
+        target_step=7,
+        start_weight_version=6,
+        recovery_granularity=RecoveryGranularity.SIBLING,
+        restore_level=RecoveryTargetLevel.TURN,
+        admitted=True,
+    )
+    _mutate(
+        lambda cut: ledger.mark_group_dispatched(
+            cut, "g7", gym_instance_id="tools/replica-0"
+        )
+    )
+    return group
+
+
+def test_refused_fresh_dispatch_keeps_identity_and_leaves_gym_inventory() -> None:
+    """Gym recorded nothing for a refused /run, so a checkpoint must not wait on it."""
+    ledger = RolloutRecoveryLedger()
+    group = _dispatched_turn_group(ledger)
+    refused_attempt_id = group.siblings[1].current_attempt.attempt_id
+    refused_rollout_id = group.gate_rollout_id(1)
+    assert (
+        len(ledger.gym_checkpoint_inventory({"tools/replica-0"})["tools/replica-0"])
+        == 2
+    )
+
+    _mutate(lambda cut: ledger.release_refused_dispatch(cut, "g7", generation_index=1))
+
+    released = ledger.get_group("g7")
+    attempt = released.siblings[1].current_attempt
+    assert attempt.status is RolloutAttemptStatus.RESERVED
+    assert attempt.attempt_id == refused_attempt_id
+    assert released.gate_rollout_id(1) == refused_rollout_id
+    assert (
+        released.siblings[0].current_attempt.status is RolloutAttemptStatus.DISPATCHED
+    )
+    (remaining,) = ledger.gym_checkpoint_inventory({"tools/replica-0"})[
+        "tools/replica-0"
+    ]
+    assert remaining == group.gym_episode(0)
+
+    # The same attempt is re-sent once admission reopens.
+    _mutate(
+        lambda cut: ledger.mark_group_dispatched(
+            cut, "g7", generation_indices=[1], gym_instance_id="tools/replica-0"
+        )
+    )
+    assert (
+        ledger.get_group("g7").siblings[1].current_attempt.status
+        is RolloutAttemptStatus.DISPATCHED
+    )
+
+
+def test_refused_restored_turn_stays_gym_owned() -> None:
+    """A restored turn waiting to be re-sent must keep its committed continuation."""
+    ledger = RolloutRecoveryLedger()
+    _dispatched_turn_group(ledger)
+    restored = RolloutRecoveryLedger.from_state_dict(ledger.state_dict())
+    episodes = restored.gym_checkpoint_inventory({"tools/replica-0"})["tools/replica-0"]
+    _mutate(
+        lambda cut: restored.prepare_for_restart(
+            cut,
+            restored_gym_episodes={
+                ("tools/replica-0", *episode) for episode in episodes
+            },
+        )
+    )
+    _mutate(
+        lambda cut: restored.mark_group_dispatched(
+            cut, "g7", gym_instance_id="tools/replica-0"
+        )
+    )
+
+    _mutate(
+        lambda cut: restored.release_refused_dispatch(cut, "g7", generation_index=1)
+    )
+
+    attempt = restored.get_group("g7").siblings[1].current_attempt
+    assert attempt.status is RolloutAttemptStatus.RESERVED
+    assert attempt.gym_attempt == 1
+    assert (
+        restored.get_group("g7").gym_episode(1)
+        in restored.gym_checkpoint_inventory({"tools/replica-0"})["tools/replica-0"]
+    )
+
+
+def test_refusal_requires_a_dispatched_attempt() -> None:
+    ledger = RolloutRecoveryLedger()
+    _dispatched_turn_group(ledger)
+    _mutate(lambda cut: ledger.release_refused_dispatch(cut, "g7", generation_index=0))
+
+    with pytest.raises(ValueError, match="only a dispatched rollout attempt"):
+        _mutate(
+            lambda cut: ledger.release_refused_dispatch(cut, "g7", generation_index=0)
+        )
