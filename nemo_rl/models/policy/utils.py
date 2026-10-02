@@ -30,6 +30,8 @@ from transformers import (
     AutoModelForTextToWaveform,
 )
 
+from nemo_rl.utils.cuda_ipc import normalize_cuda_ipc_handle
+
 # Try to import nemo_automodel classes, fallback to None if not available
 try:
     from nemo_automodel._transformers.auto_model import (
@@ -124,7 +126,6 @@ class IPCProtocol(Enum):
 # worker classes.
 POLICY_WORKER_OVERRIDES = {
     "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker": "nemo_rl.modelopt.models.policy.workers.megatron_quant_policy_worker.MegatronQuantPolicyWorker",
-    "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker": "nemo_rl.modelopt.models.policy.workers.dtensor_quant_policy_worker.DTensorQuantPolicyWorker",
     "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2": "nemo_rl.modelopt.models.policy.workers.dtensor_quant_policy_worker_v2.DTensorQuantPolicyWorkerV2",
 }
 
@@ -148,9 +149,9 @@ def reject_dtensor_v1(
     """
     if dtensor_cfg.get("_v2") is False:
         message = (
-            f"{config_path}._v2=false selects the DTensor v1 backend, which is being "
-            f"removed and no longer accepts new configs. Set {config_path}._v2=true "
-            f"(v2 is the only supported DTensor backend)"
+            f"{config_path}._v2=false selects the DTensor v1 backend, which has been "
+            f"removed. Set {config_path}._v2=true (v2 is the only supported DTensor "
+            f"backend)"
         )
         if suggest_megatron:
             message += (
@@ -735,14 +736,27 @@ def stream_weights_via_ipc_zmq_impl(
         release_staging_buffers()
 
 
+# Positions in ``torch.multiprocessing.reductions.rebuild_cuda_tensor``'s
+# argument tuple (unchanged since torch 1.x; see its signature).
+_REBUILD_CUDA_TENSOR_ARG_DEVICE_INDEX = 6
+_REBUILD_CUDA_TENSOR_ARG_STORAGE_HANDLE_INDEX = 7
+
+
 def rebuild_cuda_tensor_from_ipc(
     cuda_ipc_handle: tuple, device_id: int
 ) -> torch.Tensor:
     """Rebuild a CUDA tensor from an IPC handle."""
     func = rebuild_cuda_tensor
     args = cuda_ipc_handle[0]
-    list_args = list(args)
-    list_args[6] = device_id
+    list_args: list[Any] = list(args)
+    list_args[_REBUILD_CUDA_TENSOR_ARG_DEVICE_INDEX] = device_id
+    # The producer (training venv) may run a newer torch than this consumer;
+    # see nemo_rl.utils.cuda_ipc for the version-byte compatibility rewrite.
+    list_args[_REBUILD_CUDA_TENSOR_ARG_STORAGE_HANDLE_INDEX] = (
+        normalize_cuda_ipc_handle(
+            list_args[_REBUILD_CUDA_TENSOR_ARG_STORAGE_HANDLE_INDEX]
+        )
+    )
     return func(*list_args)
 
 
@@ -1232,9 +1246,9 @@ def broadcast_hf_buckets_via_distributed_impl(
     ``dist.broadcast`` per tensor over the NCCL group, then waits for the Ray
     refs to confirm engines finished loading the bucket.
 
-    The rollout-engine lock wraps each bucket's broadcast so concurrent SGLang
-    NCCL operations (e.g. health-check pings) cannot collide with the
-    weight-update broadcast.
+    Trainer rank 0 acquires the rollout-engine lock for each bucket to serialize
+    weight-update broadcasts. The generation side does not acquire it; pausing
+    the health monitor keeps serving probes out of the refit phase.
     """
     import time as _time
 

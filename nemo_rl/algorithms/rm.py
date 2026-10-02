@@ -40,7 +40,12 @@ from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import PolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.telemetry.config import TelemetryConfig
-from nemo_rl.telemetry.instrumentation import managed_span, trace_fn
+from nemo_rl.telemetry.instrumentation import (
+    evaluate_span,
+    managed_span,
+    umbrella_span,
+    umbrella_trace_fn,
+)
 from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.utils.checkpoint import (
@@ -227,17 +232,17 @@ def setup(
     #          Cluster
     # ==========================
     print("\n▶ Setting up compute cluster...")
-    num_nodes = cluster_config["num_nodes"]
-    segment_size = cluster_config.get("segment_size")
+    num_nodes = cluster_config.num_nodes
+    segment_size = cluster_config.segment_size
     node_resource_constraints, _, _ = prepare_segment_topology(segment_size, num_nodes)
     cluster = RayVirtualCluster(
         name="rm_cluster",
-        bundle_ct_per_node_list=[cluster_config["gpus_per_node"]] * num_nodes,
+        bundle_ct_per_node_list=[cluster_config.gpus_per_node] * num_nodes,
         use_gpus=True,
-        num_gpus_per_node=cluster_config["gpus_per_node"],
+        num_gpus_per_node=cluster_config.gpus_per_node,
         max_colocated_worker_groups=1,
-        port_range_low=cluster_config.get("master_port_range_low"),
-        port_range_high=cluster_config.get("master_port_range_high"),
+        port_range_low=cluster_config.master_port_range_low,
+        port_range_high=cluster_config.master_port_range_high,
         segment_size=segment_size,
         node_resource_constraints=node_resource_constraints,
     )
@@ -368,16 +373,9 @@ def validate_one_dataset(
         return
 
     timer = Timer()
-    _telemetry = get_telemetry_handle()
-    _tracer = _telemetry.tracer if _telemetry is not None else None
-
     with (
         timer.time("total_validation_time"),
-        managed_span(
-            RLSpanGroup.EVALUATE,
-            "rl.rm.evaluate",
-            tracer=_tracer,
-        ),
+        evaluate_span("rm"),
     ):
         print(f"▶ Starting validation at step {step} for `{dataset_name}` set..")
 
@@ -483,7 +481,7 @@ def validate_one_dataset(
     return val_metrics, timing_metrics
 
 
-@trace_fn(RLSpanGroup.JOB, "rl.rm.job")
+@umbrella_trace_fn(RLSpanGroup.U_JOB, "rl.rm.job")
 def rm_train(
     policy,
     train_dataloader,
@@ -551,8 +549,8 @@ def rm_train(
 
             with (
                 timer.time("total_step_time"),
-                managed_span(
-                    RLSpanGroup.STEP,
+                umbrella_span(
+                    RLSpanGroup.U_STEP,
                     "rl.rm.step",
                     tracer=_tracer,
                     **{"rl.iteration": total_steps + 1},
@@ -743,8 +741,7 @@ def rm_train(
                     print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
 
             total_num_gpus = (
-                master_config.cluster["num_nodes"]
-                * master_config.cluster["gpus_per_node"]
+                master_config.cluster.num_nodes * master_config.cluster.gpus_per_node
             )
             timing_metrics["valid_tokens_per_sec_per_gpu"] = (
                 metrics["global_valid_toks"] / total_time / total_num_gpus

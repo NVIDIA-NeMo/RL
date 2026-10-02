@@ -46,6 +46,7 @@ from nemo_rl.algorithms.loss import (
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig, MseValueLossFn
+from nemo_rl.algorithms.metric_utils import SETUP_TIMING_PREFIX
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
     apply_reward_shaping,
@@ -99,13 +100,14 @@ from nemo_rl.models.value import Value, ValueConfig
 from nemo_rl.models.value.interfaces import ValueInterface
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.instrumentation import (
-    Bucket,
-    bucket_scope,
+    evaluate_span,
     managed_span,
-    trace_fn,
+    umbrella_span,
+    umbrella_trace_fn,
 )
 from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.span_groups import RLSpanGroup
+from nemo_rl.telemetry.vocabulary import TeedMetric, register_teed_metrics
 from nemo_rl.utils.checkpoint import (
     CheckpointingConfig,
     CheckpointManager,
@@ -353,6 +355,12 @@ def setup(
     logger_config = master_config.logger
     cluster_config = master_config.cluster
 
+    if loss_config.seq_logprob_error_in_loss:
+        raise ValueError(
+            "loss_fn.seq_logprob_error_in_loss is not supported by PPO. "
+            "Use the non-streaming GRPO trainer."
+        )
+
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for PPO"
     )
@@ -518,9 +526,9 @@ def setup(
         )
 
     reward_model_enabled = "reward_model" in extract_necessary_env_names(data_config)
-    segment_size = cluster_config.get("segment_size")
+    segment_size = cluster_config.segment_size
 
-    total_nodes = cluster_config["num_nodes"]
+    total_nodes = cluster_config.num_nodes
     if reward_model_enabled:
         rm_resource = env_configs["reward_model"]["resources"]
         rm_nodes = rm_resource["num_nodes"]
@@ -540,14 +548,14 @@ def setup(
 
     if colocated_inference:
         if total_nodes == 1:
-            policy_gpus_per_node = cluster_config["gpus_per_node"] - rm_gpus_per_node
+            policy_gpus_per_node = cluster_config.gpus_per_node - rm_gpus_per_node
             assert policy_gpus_per_node > 0, (
                 "policy.generation.colocated.resources.gpus_per_node must be > 0 "
                 "when cluster.num_nodes = 1, "
                 f"but got {policy_gpus_per_node}."
             )
         else:
-            policy_gpus_per_node = cluster_config["gpus_per_node"]
+            policy_gpus_per_node = cluster_config.gpus_per_node
 
         cluster = RayVirtualCluster(
             name="ppo_policy_cluster",
@@ -563,7 +571,7 @@ def setup(
             flush=True,
         )
     else:
-        train_gpus_per_node = cluster_config["gpus_per_node"]
+        train_gpus_per_node = cluster_config.gpus_per_node
         train_nodes = policy_nodes
 
         inference_resources = generation_config["colocated"]["resources"]
@@ -592,7 +600,7 @@ def setup(
                 "Not enough GPUs for PPO training after reserving non-colocated "
                 "generation resources: "
                 f"train_gpus_per_node={train_gpus_per_node}, "
-                f"cluster.gpus_per_node={cluster_config['gpus_per_node']}, "
+                f"cluster.gpus_per_node={cluster_config.gpus_per_node}, "
                 f"inference_gpus_per_node={inference_gpus_per_node}, "
                 f"reward_gpus_per_node={reward_gpus_to_subtract}."
             )
@@ -604,12 +612,12 @@ def setup(
             )
             assert (
                 inference_gpus_per_node is not None
-                and inference_gpus_per_node == cluster_config["gpus_per_node"]
+                and inference_gpus_per_node == cluster_config.gpus_per_node
             ), (
                 "policy.generation.colocated.resources.gpus_per_node must be explicitly set and equal to cluster.gpus_per_node "
                 "when cluster.num_nodes > 1 and inference is non-colocated, "
                 f"but got inference_gpus_per_node={inference_gpus_per_node}, "
-                f"cluster.gpus_per_node={cluster_config['gpus_per_node']}."
+                f"cluster.gpus_per_node={cluster_config.gpus_per_node}."
             )
             train_nodes -= inference_nodes
 
@@ -702,8 +710,8 @@ def setup(
             use_gpus=True,
             num_gpus_per_node=train_gpus_per_node,
             max_colocated_worker_groups=2,
-            port_range_low=cluster_config.get("master_port_range_low"),
-            port_range_high=cluster_config.get("master_port_range_high"),
+            port_range_low=cluster_config.master_port_range_low,
+            port_range_high=cluster_config.master_port_range_high,
             segment_size=segment_size,
             node_resource_constraints=node_resource_constraints,
         )
@@ -716,8 +724,8 @@ def setup(
             use_gpus=True,
             num_gpus_per_node=inference_gpus_per_node,
             max_colocated_worker_groups=1,
-            port_range_low=cluster_config.get("master_port_range_low"),
-            port_range_high=cluster_config.get("master_port_range_high"),
+            port_range_low=cluster_config.master_port_range_low,
+            port_range_high=cluster_config.master_port_range_high,
             segment_size=inference_segment_size,
             node_resource_constraints=inference_node_resource_constraints,
         )
@@ -1017,7 +1025,9 @@ def setup(
         print(f"  Total setup: {total_setup:.1f}s")
 
         # Log all metrics to the logger for analysis
-        logger.log_metrics(worker_init_timing_metrics, step=0, prefix="timing/setup")
+        logger.log_metrics(
+            worker_init_timing_metrics, step=0, prefix=SETUP_TIMING_PREFIX
+        )
 
     print("\n" + "=" * 60)
     print(" " * 18 + "SETUP COMPLETE")
@@ -1217,12 +1227,27 @@ def _create_advantage_estimator(master_config: MasterConfig):
     return adv_estimator
 
 
+CRITIC_LOSS_KEY = "critic/loss"
+
+#: Teed row for the value-model loss _compute_critic_metrics builds below.
+#: PPO-only, so it is declared here and a GRPO run never sees it.
+CRITIC_TEED_METRICS = (
+    TeedMetric(
+        CRITIC_LOSS_KEY,
+        "rl.value.loss",
+        description="Value/critic training loss (PPO).",
+    ),
+)
+
+register_teed_metrics(CRITIC_TEED_METRICS)
+
+
 def _compute_critic_metrics(value_results: dict[str, Any]) -> dict[str, Any]:
     """Aggregate value-model metrics under the ``critic/`` namespace."""
     value_mb_metrics = value_results.get("all_mb_metrics", {})
     critic_metrics: dict[str, Any] = {
         "critic/grad_norm": value_results["grad_norm"].numpy(),
-        "critic/loss": value_results["loss"].numpy(),
+        CRITIC_LOSS_KEY: value_results["loss"].numpy(),
     }
     for key, value in value_mb_metrics.items():
         metric_name = f"critic/{key}"
@@ -1251,7 +1276,7 @@ def _compute_critic_metrics(value_results: dict[str, Any]) -> dict[str, Any]:
 # ===============================================================================
 
 
-@trace_fn(RLSpanGroup.JOB, "rl.ppo.job")
+@umbrella_trace_fn(RLSpanGroup.U_JOB, "rl.ppo.job")
 def ppo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
@@ -1376,8 +1401,8 @@ def ppo_train(
 
             with (
                 timer.time("total_step_time"),
-                managed_span(
-                    RLSpanGroup.STEP,
+                umbrella_span(
+                    RLSpanGroup.U_STEP,
                     "rl.ppo.step",
                     tracer=_tracer,
                     **{"rl.iteration": total_steps + 1, "rl.epoch": current_epoch + 1},
@@ -1461,8 +1486,8 @@ def ppo_train(
 
                 with (
                     timer.time("generation"),
-                    managed_span(
-                        RLSpanGroup.ROLLOUT,
+                    umbrella_span(
+                        RLSpanGroup.U_ROLLOUT,
                         "rl.ppo.generation",
                         tracer=_tracer,
                     ),
@@ -2082,8 +2107,7 @@ def ppo_train(
                 * master_config.ppo.num_generations_per_prompt
             )
             total_num_gpus = (
-                master_config.cluster["num_nodes"]
-                * master_config.cluster["gpus_per_node"]
+                master_config.cluster.num_nodes * master_config.cluster.gpus_per_node
             )
 
             print(f"  • Total step time: {total_time:.2f}s", flush=True)
@@ -3089,8 +3113,7 @@ def async_ppo_train(
 
             total_time = timing_metrics.get("total_step_time", 0)
             total_num_gpus = (
-                master_config.cluster["num_nodes"]
-                * master_config.cluster["gpus_per_node"]
+                master_config.cluster.num_nodes * master_config.cluster.gpus_per_node
             )
             if total_time > 0 and "global_valid_toks" in metrics:
                 timing_metrics["valid_tokens_per_sec_per_gpu"] = (
@@ -3180,18 +3203,9 @@ def validate(
         return {}, {}
 
     timer = Timer()
-    _telemetry = get_telemetry_handle()
-    _tracer = _telemetry.tracer if _telemetry is not None else None
     with (
         timer.time("total_validation_time"),
-        managed_span(
-            RLSpanGroup.EVALUATE,
-            "rl.ppo.evaluate",
-            tracer=_tracer,
-        ),
-        # Scored-and-discarded generation: overhead, not goodput. See the same
-        # scope in nemo_rl/algorithms/grpo.py::validate.
-        bucket_scope(Bucket.OVERHEAD),
+        evaluate_span("ppo"),
     ):
         print(f"▶ Starting validation at step {step}...", flush=True)
 

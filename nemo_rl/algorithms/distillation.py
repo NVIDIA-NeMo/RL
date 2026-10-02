@@ -73,7 +73,12 @@ from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.telemetry.config import TelemetryConfig
-from nemo_rl.telemetry.instrumentation import managed_span, trace_fn
+from nemo_rl.telemetry.instrumentation import (
+    evaluate_span,
+    managed_span,
+    umbrella_span,
+    umbrella_trace_fn,
+)
 from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.utils.checkpoint import (
@@ -345,23 +350,23 @@ def setup(
     colocated_inference = generation_config["colocated"]["enabled"]
     enable_nemo_gym = bool(env_configs) and should_use_nemo_gym(master_config)
     nemo_gym_actor: Optional[EnvironmentInterface] = None
-    segment_size = cluster_config.get("segment_size")
+    segment_size = cluster_config.segment_size
 
     if colocated_inference:
-        num_nodes = cluster_config["num_nodes"]
+        num_nodes = cluster_config.num_nodes
         node_resource_constraints, _, _ = prepare_segment_topology(
             segment_size, num_nodes
         )
         cluster = RayVirtualCluster(
             name="distillation_cluster",
-            bundle_ct_per_node_list=[cluster_config["gpus_per_node"]] * num_nodes,
+            bundle_ct_per_node_list=[cluster_config.gpus_per_node] * num_nodes,
             use_gpus=True,
-            num_gpus_per_node=cluster_config["gpus_per_node"],
+            num_gpus_per_node=cluster_config.gpus_per_node,
             max_colocated_worker_groups=1
             if generation_config["backend"] == "megatron"
             else 3,
-            port_range_low=cluster_config.get("master_port_range_low"),
-            port_range_high=cluster_config.get("master_port_range_high"),
+            port_range_low=cluster_config.master_port_range_low,
+            port_range_high=cluster_config.master_port_range_high,
             segment_size=segment_size,
             node_resource_constraints=node_resource_constraints,
         )
@@ -378,15 +383,15 @@ def setup(
         )
 
         # train resources will be updated through overall and inference resources below
-        train_gpus_per_node = cluster_config["gpus_per_node"]
-        train_nodes = cluster_config["num_nodes"]
+        train_gpus_per_node = cluster_config.gpus_per_node
+        train_nodes = cluster_config.num_nodes
 
         inference_resources = generation_config["colocated"]["resources"]
         inference_gpus_per_node = inference_resources["gpus_per_node"]
         inference_nodes = inference_resources["num_nodes"]
 
         # validate and configure resources
-        if cluster_config["num_nodes"] == 1:
+        if cluster_config.num_nodes == 1:
             assert (
                 inference_gpus_per_node is not None and inference_gpus_per_node > 0
             ), (
@@ -409,11 +414,11 @@ def setup(
             )
             assert (
                 inference_gpus_per_node is not None
-                and inference_gpus_per_node == cluster_config["gpus_per_node"]
+                and inference_gpus_per_node == cluster_config.gpus_per_node
             ), (
                 "policy.generation.colocated.resources.gpus_per_node must be explicitly set and equal to cluster.gpus_per_node "
                 "when cluster.num_nodes > 1 and inference is non-colocated, "
-                f"but got inference_gpus_per_node={inference_gpus_per_node}, cluster.gpus_per_node={cluster_config['gpus_per_node']}."
+                f"but got inference_gpus_per_node={inference_gpus_per_node}, cluster.gpus_per_node={cluster_config.gpus_per_node}."
             )
             train_nodes -= inference_nodes
 
@@ -426,8 +431,8 @@ def setup(
         )
         if node_resource_constraints is not None and inference_nodes > 0:
             nodes_per_instance = (
-                inference_gpus_per_node + cluster_config["gpus_per_node"] - 1
-            ) // cluster_config["gpus_per_node"]
+                inference_gpus_per_node + cluster_config.gpus_per_node - 1
+            ) // cluster_config.gpus_per_node
             if nodes_per_instance > 1 and inference_nodes % nodes_per_instance == 0:
                 remaining_topology = {nid: topology[nid] for nid in remaining_node_ids}
                 inference_node_resource_constraints, _, _ = prepare_segment_topology(
@@ -445,8 +450,8 @@ def setup(
             use_gpus=True,
             num_gpus_per_node=train_gpus_per_node,
             max_colocated_worker_groups=3,
-            port_range_low=cluster_config.get("master_port_range_low"),
-            port_range_high=cluster_config.get("master_port_range_high"),
+            port_range_low=cluster_config.master_port_range_low,
+            port_range_high=cluster_config.master_port_range_high,
             segment_size=segment_size,
             node_resource_constraints=node_resource_constraints,
         )
@@ -456,8 +461,8 @@ def setup(
             use_gpus=True,
             num_gpus_per_node=inference_gpus_per_node,
             max_colocated_worker_groups=3,
-            port_range_low=cluster_config.get("master_port_range_low"),
-            port_range_high=cluster_config.get("master_port_range_high"),
+            port_range_low=cluster_config.master_port_range_low,
+            port_range_high=cluster_config.master_port_range_high,
             segment_size=inference_segment_size,
             node_resource_constraints=inference_node_resource_constraints,
         )
@@ -772,8 +777,8 @@ def _distillation_train_impl(
 
             with (
                 timer.time("total_step_time"),
-                managed_span(
-                    RLSpanGroup.STEP,
+                umbrella_span(
+                    RLSpanGroup.U_STEP,
                     "rl.distillation.step",
                     tracer=_tracer,
                     **{"rl.iteration": total_steps + 1, "rl.epoch": current_epoch + 1},
@@ -815,8 +820,8 @@ def _distillation_train_impl(
 
                 with (
                     timer.time("generation"),
-                    managed_span(
-                        RLSpanGroup.ROLLOUT,
+                    umbrella_span(
+                        RLSpanGroup.U_ROLLOUT,
                         "rl.distillation.generation",
                         tracer=_tracer,
                     ),
@@ -1162,8 +1167,7 @@ def _distillation_train_impl(
             total_time = timing_metrics.get("total_step_time", 0)
 
             total_num_gpus = (
-                master_config.cluster["num_nodes"]
-                * master_config.cluster["gpus_per_node"]
+                master_config.cluster.num_nodes * master_config.cluster.gpus_per_node
             )
             metrics.update(
                 {
@@ -1221,7 +1225,7 @@ def _distillation_train_impl(
     checkpointer.shutdown()
 
 
-@trace_fn(RLSpanGroup.JOB, "rl.distillation.job")
+@umbrella_trace_fn(RLSpanGroup.U_JOB, "rl.distillation.job")
 def distillation_train(
     student_policy: ColocatablePolicyInterface,
     teacher_policy: ColocatablePolicyInterface,
@@ -1282,16 +1286,9 @@ def validate(
     use_nemo_gym = should_use_nemo_gym(master_config)
 
     timer = Timer()
-    _telemetry = get_telemetry_handle()
-    _tracer = _telemetry.tracer if _telemetry is not None else None
     with (
         timer.time("total_validation_time"),
-        managed_span(
-            RLSpanGroup.EVALUATE,
-            "rl.distillation.evaluate",
-            tracer=_tracer,
-            **{"rl.step": step},
-        ),
+        evaluate_span("distillation", **{"rl.step": step}),
     ):
         print(f"▶ Starting validation at step {step}...", flush=True)
 
