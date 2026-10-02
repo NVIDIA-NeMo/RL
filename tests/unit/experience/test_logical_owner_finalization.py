@@ -269,6 +269,12 @@ def test_unknown_capture_ack_is_not_cleanup_permission():
     )
     with pytest.raises(ValueError, match="unresolved"):
         _receipt_staging_keys(receipt)
+    receipt["capture_poisoned"] = True
+    assert _receipt_staging_keys(receipt) == []
+    receipt["manifest"] = [{"model_call_id": "c1", "staging_key": "attempt/c1"}]
+    with pytest.raises(ValueError, match="uncommitted"):
+        _receipt_staging_keys(receipt)
+    receipt["manifest"] = []
     receipt["pending_call_ids"] = []
     assert _receipt_staging_keys(receipt) == ["attempt/c1"]
 

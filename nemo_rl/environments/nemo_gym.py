@@ -1052,10 +1052,16 @@ Depending on your data shape, you may want to change these values."""
         parsed = RolloutManifest.model_validate(manifest)
         if parsed.rollout_id != owner:
             raise ValueError("Capture manifest belongs to another dispatched attempt")
-        try:
-            selected = select_captured_calls(parsed.records, result)
-        except ValueError as error:
-            raise ValueError(f"Rollout {owner!r}: {error}") from error
+        # A finished agent may have cancelled or lost its final model call. Its
+        # attempt is untrainable, not a controller failure. Keep pending IDs in
+        # the receipt: their writes may still arrive and must not be cleaned here.
+        capture_failed = bool(parsed.pending_call_ids or parsed.failures)
+        selected = []
+        if not capture_failed:
+            try:
+                selected = select_captured_calls(parsed.records, result)
+            except ValueError as error:
+                raise ValueError(f"Rollout {owner!r}: {error}") from error
         if any(
             r.response_status not in ("completed", "incomplete", "failed")
             for r in selected
@@ -1074,10 +1080,12 @@ Depending on your data shape, you may want to change these values."""
         receipt = self._assemble_receipt(
             owner,
             manifest,
-            terminal_response_id=selected[-1].response_id,
+            terminal_response_id=selected[-1].response_id if selected else None,
             reward=float(reward),
         )
-        if any(
+        if capture_failed:
+            receipt.update(capture_poisoned=True, failure_reason="capture_incomplete")
+        elif any(
             r.response_status == "failed"
             or (
                 r.response_status == "incomplete"

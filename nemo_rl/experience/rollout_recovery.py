@@ -295,7 +295,8 @@ def _receipt_staging_keys(receipt: Optional[dict[str, Any]]) -> list[str]:
     """Validate a terminal Gate receipt and return its ordered staging keys."""
     if receipt is None:
         return []
-    if receipt.get("pending_call_ids"):
+    pending = set(receipt.get("pending_call_ids", []))
+    if pending and not receipt.get("capture_poisoned"):
         raise ValueError(
             "Capture acknowledgement is unresolved; preserve staging until reconciliation"
         )
@@ -311,10 +312,18 @@ def _receipt_staging_keys(receipt: Optional[dict[str, Any]]) -> list[str]:
             )
         staging_keys.append(entry["staging_key"])
     owner = receipt.get("rollout_id")
+    if not pending.issubset(receipt.get("attempted_call_ids", [])) or any(
+        entry.get("model_call_id") in pending for entry in manifest
+    ):
+        raise ValueError("Pending calls must be attempted and uncommitted")
     for call_id in receipt.get("attempted_call_ids", []):
         if not isinstance(call_id, str) or not call_id or "/" in call_id:
             raise ValueError("Invalid attempted capture call identity")
-        staging_keys.append(f"{owner}/{call_id}")
+        # Abandoned calls remain isolated by the attempt UUID. A worker may
+        # still write them; leave those rows for staging-partition teardown,
+        # as on the existing abandoned-dispatch path.
+        if call_id not in pending:
+            staging_keys.append(f"{owner}/{call_id}")
     return list(dict.fromkeys(staging_keys))
 
 

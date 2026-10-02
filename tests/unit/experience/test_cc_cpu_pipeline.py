@@ -25,8 +25,9 @@ from nemo_gym.context_management import (
     ContextManagedResponsesClient,
 )
 from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
+from nemo_gym.openai_utils import NeMoGymAsyncOpenAI
 from nemo_gym.server_utils import ServerClient
-from nemo_gym.token_id_capture.staging.records import RolloutManifest
+from nemo_gym.token_id_capture.staging.records import RolloutManifest, StageResult
 from responses_api_agents.simple_agent_with_compaction.tests.test_client import (
     http_response,
 )
@@ -36,6 +37,8 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import InOrderSampler
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
 from nemo_rl.experience.rollout_reassembler import RolloutReassembler
+from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
+from nemo_rl.experience.rollout_recovery import _receipt_staging_keys
 from nemo_rl.models.generation.capture_context import decide_capture_input
 from tests.unit.experience.test_cc_dispatch import _env
 from tests.unit.experience.test_logical_owner_finalization import (
@@ -371,3 +374,127 @@ def test_mixed_failed_owner_padding_replay_and_controller(
         check.assert_called_once_with("validate_cc_execution_padding")
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("failure", ["engine", "cancel", "lost_ack", "late_write"])
+@pytest.mark.parametrize("prior_calls", [False, True])
+@pytest.mark.parametrize("healthy_sibling", [False, True])
+def test_failed_capture_masks_owner_and_preserves_unknown_writes(
+    pipeline: tuple,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    prior_calls: bool,
+    healthy_sibling: bool,
+) -> None:
+    harness, plane, finalizer = pipeline
+    env = _env(harness)
+    results = []
+    owners = ["attempt0", "attempt1"] if healthy_sibling else ["attempt0"]
+    if healthy_sibling:
+        healthy = capture_segment(harness, owners[0], child=True)
+        results.append(
+            {
+                "response": {"id": healthy["ids"][-1], "output": healthy["output"]},
+                "reward": 1.0,
+            }
+        )
+    failed_owner = owners[-1]
+    previous = (
+        capture_segment(harness, failed_owner, child=True) if prior_calls else None
+    )
+    stage = harness.sink.stage
+    deferred = []
+    with monkeypatch.context() as patch:
+        if failure in ("engine", "cancel"):
+
+            async def fail(client: Any, **body: Any) -> None:
+                if failure == "cancel":
+                    # Cancel a genuinely waiting coroutine, not a completed call.
+                    task = asyncio.create_task(asyncio.Event().wait())
+                    await asyncio.sleep(0)
+                    task.cancel()
+                    await task
+                raise RuntimeError("engine failed before staging")
+
+            patch.setattr(NeMoGymAsyncOpenAI, "create_chat_completion", fail)
+        else:
+
+            def unknown_write(record: Any) -> StageResult:
+                deferred.append(record.model_copy(deep=True))
+                if failure == "lost_ack":
+                    assert stage(record).ok
+                return StageResult(ok=False, error="staging acknowledgement lost")
+
+            patch.setattr(harness.sink, "stage", unknown_write)
+        response = harness.post(
+            failed_owner,
+            gym_harness.HISTORY
+            + (previous["output"] if previous else [])
+            + [{"role": "user", "content": "next"}],
+        )
+        assert response.status_code == 500
+    manifest = harness.manifest(failed_owner)
+    assert len(manifest.pending_call_ids) == 1
+    pending_key = f"{failed_owner}/{manifest.pending_call_ids[0]}"
+    results.append(
+        {"response": {"output": previous["output"] if previous else []}, "reward": 0.0}
+    )
+    processed = [
+        asyncio.run(env._postprocess_receipt_mode({"_ng_rollout_id": owner}, result))
+        for owner, result in zip(owners, results, strict=True)
+    ]
+    receipts = tuple(item["receipt"] for item in processed)
+    assert receipts[-1]["capture_poisoned"]
+    assert receipts[-1]["pending_call_ids"] == manifest.pending_call_ids
+    assert pending_key not in _receipt_staging_keys(receipts[-1])
+    assert not processed[-1]["logical_selection"].response_ids
+    request = ReassemblyRequest(
+        group_id="group",
+        rollout_ids=tuple(owners),
+        canonical_sample_ids=tuple(f"group_g{i}" for i in range(len(owners))),
+        receipts=receipts,
+        rewards=tuple(item["reward"] for item in results),
+        fallback_weight_version=7,
+        prompt_idx=99,
+        mask_sample=(False,) * len(owners),
+        logical_selections=tuple(item["logical_selection"] for item in processed),
+    )
+    assert request.capture_receipts == receipts
+    planned = request.cleanup_sample_ids
+    finalized = finalizer.finalize_group(
+        "group",
+        owners,
+        list(receipts),
+        list(request.rewards),
+        fallback_weight_version=7,
+        prompt_idx=99,
+        mask_sample=list(request.mask_sample),
+        canonical_sample_ids=list(request.canonical_sample_ids),
+        logical_selections=list(request.logical_selections),
+    )
+    if healthy_sibling:
+        assert finalized.valid_row_count == 1 and finalized.total_row_count == 2
+        assert tuple(finalized.meta.sample_ids) == planned
+        data = plane.get_samples(
+            finalized.meta.sample_ids, "train", finalized.meta.fields
+        )
+        assert data["sample_mask"].tolist() == [1, 0]
+        assert data["token_mask"][0].sum() == 2
+        assert data["token_mask"][1].sum() == 0
+        assert [tag["logical_rollout_id"] for tag in finalized.meta.tags] == [
+            "group_g0",
+            "group_g1",
+        ]
+    else:
+        assert finalized.dropped and finalized.meta is None
+        assert plane.list_sample_ids("train") == []
+    assert plane.list_sample_ids("staged") == (
+        [pending_key] if failure == "lost_ack" else []
+    )
+    if failure == "late_write":
+        assert stage(deferred[0]).ok
+        assert plane.list_sample_ids("staged") == [pending_key]
+    # A later fresh attempt remains usable; it cannot adopt the failed call.
+    following = capture_segment(harness, "fresh_attempt")
+    assert not following["manifest"].pending_call_ids
+    assert following["manifest"].records[0].parent_call_id is None

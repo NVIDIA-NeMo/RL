@@ -59,6 +59,7 @@ from nemo_rl.data_plane.tq_token_sink import (
     TQTokenSource,
 )
 from nemo_rl.experience.payload import pack_payload
+from nemo_rl.experience.rollout_recovery import _receipt_staging_keys
 from nemo_rl.experience.route_assembly import (
     ROUTE_MISSING_SENTINEL,
     RouteFragment,
@@ -677,8 +678,6 @@ class RolloutReassembler:
             )
             rows = logical.rows
             # Keep every captured call cleanup-owned, including unselected roots.
-            from nemo_rl.experience.rollout_recovery import _receipt_staging_keys
-
             logical.staging_keys = list(
                 dict.fromkeys(
                     key
@@ -840,7 +839,17 @@ class RolloutReassembler:
         real_row_count = len(rows)
         if logical is not None:
             if not valid_rows:
-                raise ValueError("CC group has no verified input layout for dummy rows")
+                self._clear_staging(staging_keys)
+                metrics["finalize/group_dropped"] = 1.0
+                return FinalizedGroup(
+                    meta=None,
+                    group_min_wv=fallback_weight_version,
+                    group_max_wv=fallback_weight_version,
+                    staging_keys=[],
+                    metrics=metrics,
+                    dropped=True,
+                    drop_reason="CC group has no verified input layout for dummy rows",
+                )
             padding_count = (-real_row_count) % execution_row_multiple
             dummy_layout = valid_rows[0]
             for ordinal in range(padding_count):
@@ -1096,8 +1105,7 @@ class RolloutReassembler:
             rollout_ids, receipts, selections, strict=True
         ):
             parsed = RolloutReceipt.model_validate(receipt)
-            if parsed.pending_call_ids:
-                raise ValueError("Unresolved capture acknowledgement; preserve staging")
+            _receipt_staging_keys(receipt)
             if parsed.rollout_id != owner or any(
                 record.staging_key != staging_key(owner, record.model_call_id)
                 for record in parsed.manifest
@@ -1105,13 +1113,20 @@ class RolloutReassembler:
                 raise ValueError("Foreign capture ownership in selected attempt")
             selected = selection.response_ids
             if (
-                not selected
+                (not selected and not parsed.capture_poisoned)
                 or len(set(selected)) != len(selected)
                 or len(selection.action_flags) != len(selected)
             ):
                 raise ValueError(
                     "Selected responses must be nonempty, unique, and have parallel action flags"
                 )
+            if parsed.capture_poisoned:
+                # One masked owner needs no accepted-response or initial-prompt
+                # witness. Never train its partial history, even if it is sound.
+                plans.append(
+                    [SegmentReceipt(owner, parsed.model_dump(), (), action_flags=())]
+                )
+                continue
             by_response = {record.response_id: record for record in parsed.manifest}
             if len(by_response) != len(parsed.manifest) or any(
                 response not in by_response for response in selected
@@ -1276,9 +1291,15 @@ class RolloutReassembler:
                 if parsed
                 else []
             )
-            if len(roots) != 1:
+            failed_capture = (
+                parsed is not None and parsed.capture_poisoned and not selected
+            )
+            if not failed_capture and len(roots) != 1:
                 raise ValueError(f"{owner_id}: missing initial prompt evidence")
-            if first.valid:
+            if failed_capture:
+                # Grouping uses dispatch identity, not these non-training tokens.
+                original_prompt = [self._pad_token_id]
+            elif first.valid:
                 if first.model_call_ids[0] != roots[0].model_call_id:
                     raise ValueError(
                         f"{owner_id}: selected initial root disagrees with receipt"
