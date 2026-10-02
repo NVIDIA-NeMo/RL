@@ -15,7 +15,7 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 
 EXP_NAME=$(basename "$0" .sh)
-EXP_DIR="${SCRIPT_DIR}/${EXP_NAME}"
+EXP_DIR="${NRL_RUN_DIR:-${SCRIPT_DIR}}/${EXP_NAME}"
 DATA_DIR="${EXP_DIR}/clevr-energon"
 LOG_DIR="${EXP_DIR}/logs"
 CKPT_DIR="${EXP_DIR}/checkpoints"
@@ -62,4 +62,10 @@ uv run --no-sync python examples/run_sft_v2.py \
 uv run --no-sync tests/json_dump_tb_logs.py \
     "${LOG_DIR}" --output_path "${JSON_METRICS}"
 uv run --no-sync tests/check_metrics.py "${JSON_METRICS}" \
-    'all_finite(data["loss"])'
+    'all_finite(data["loss"])' \
+    'all_finite(data["train_fp_utilization"])' \
+    'min(data["train_fp_utilization"]) > 0' \
+    'len(data["train_fp_utilization"]) == len(data["loss"])' \
+    'len(data["flops_from_bridge"]) == len(data["loss"])' \
+    'min(data["flops_from_bridge"]) == 1' \
+    'max(data["flops_from_bridge"]) == 1'

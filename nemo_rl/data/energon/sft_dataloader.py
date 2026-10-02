@@ -417,7 +417,7 @@ def build_energon_sft_loader(
     if "energon" not in data_config:
         raise ValueError("data.backend=energon requires a data.energon block.")
     if processor is None:
-        raise ValueError("data.backend=energon requires a multimodal processor.")
+        raise ValueError("data.backend=energon requires a tokenizer or processor.")
     if batch_size <= 0:
         raise ValueError("Energon SFT batch size must be positive.")
     if not placement_fingerprint:
@@ -443,7 +443,7 @@ def build_energon_sft_loader(
         max_sequences_per_bin=max_sequences_per_bin,
         max_sequence_length=max_sequence_length,
         sequence_length_pad_multiple=sequence_length_pad_multiple,
-        tokenizer=processor.tokenizer,
+        tokenizer=getattr(processor, "tokenizer", processor),
         only_unmask_final=only_unmask_final,
     )
     worker_config = _worker_config(

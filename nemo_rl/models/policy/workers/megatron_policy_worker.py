@@ -92,6 +92,10 @@ from nemo_rl.models.megatron.draft.step_state import (
     DraftStepPayload,
     DraftStepState,
 )
+from nemo_rl.models.megatron.flops import (
+    compute_bridge_batch_flops,
+    uses_omni_vision_correction,
+)
 from nemo_rl.models.megatron.pipeline_parallel import (
     broadcast_loss_metrics_from_last_stage,
     broadcast_obj_from_pp_rank,
@@ -1130,6 +1134,8 @@ class MegatronPolicyWorkerImpl(
             all_mb_metrics = []
             losses = []
             total_num_microbatches = 0
+            local_flops: float | None = 0.0
+            local_flops_vision_corrected = False
             for gb_idx in range(num_global_batches):
                 gb_result = process_global_batch(
                     data,
@@ -1139,6 +1145,14 @@ class MegatronPolicyWorkerImpl(
                     batch_size=local_gbs,
                 )
                 batch = gb_result["batch"]
+                local_flops_vision_corrected |= uses_omni_vision_correction(
+                    self.mcore_state.cfg, batch
+                )
+                if local_flops is not None:
+                    batch_flops = self._batch_flops(batch)
+                    local_flops = (
+                        local_flops + batch_flops if batch_flops is not None else None
+                    )
                 global_valid_seqs = gb_result["global_valid_seqs"]
                 global_valid_toks = gb_result["global_valid_toks"]
 
@@ -1421,33 +1435,24 @@ class MegatronPolicyWorkerImpl(
         if draft_grad_norm is not None:
             metrics["draft_grad_norm"] = torch.tensor([draft_grad_norm])
 
-        # Skip FLOPs estimation when sequence packing is enabled: gbs counts original
-        # samples but each packed sequence spans max_total_sequence_length tokens,
-        # so flops_per_sample * gbs would overcount by the packing factor.
-        if not self.cfg.get("sequence_packing", {}).get("enabled", False):
-            try:  # pragma: no cover
-                from megatron.bridge.training.utils import flop_utils as _mb_flop_utils
-
-                # cfg.model.seq_length is set from max_position_embeddings (model max context)
-                # via CONFIG_MAPPING, not from max_total_sequence_length. Override it with the
-                # actual training sequence length so FLOPs are not inflated.
-                _orig_seq = self.mcore_state.cfg.model.seq_length
-                self.mcore_state.cfg.model.seq_length = self.cfg[
-                    "max_total_sequence_length"
-                ]
-                try:
-                    flops_per_sample = _mb_flop_utils.num_floating_point_operations(
-                        self.mcore_state.cfg, batch_size=1
-                    )
-                finally:
-                    self.mcore_state.cfg.model.seq_length = _orig_seq
-
-                metrics["total_flops"] = flops_per_sample * gbs * num_global_batches
-                metrics["num_ranks"] = torch.distributed.get_world_size()
-            except Exception as e:
-                warnings.warn(f"Failed to compute FLOPs for MFU reporting: {e}")
+        metrics["local_flops"] = local_flops
+        metrics["local_flops_vision_corrected"] = local_flops_vision_corrected
         self.timer.stop("train")
         return metrics
+
+    def _batch_flops(self, data: BatchedDataDict[Any]) -> float | None:
+        """Use Bridge, explicitly marking unsupported cases for driver fallback."""
+        try:
+            return compute_bridge_batch_flops(
+                self.mcore_state.cfg,
+                data,
+                freeze_config=self.cfg["megatron_cfg"].get("freeze_config"),
+            )
+        except NotImplementedError as error:
+            warnings.warn(
+                f"{error}; using NeMo-RL FLOPs fallback if supported.", stacklevel=2
+            )
+            return None
 
     def _compute_moe_grad_scale(self, global_valid_toks):
         """Build a moe_grad_scale_func that normalizes the aux-loss gradient.
@@ -1577,6 +1582,8 @@ class MegatronPolicyWorkerImpl(
             "all_mb_metrics": [],
             "mb_losses": [],
             "total_num_microbatches": 0,
+            "local_flops": 0.0,
+            "local_flops_vision_corrected": False,
             # One increment per train_microbatch call, i.e. the number of
             # streaming chunks the controller has fed into this optimizer step
             # so far.
@@ -1777,6 +1784,14 @@ class MegatronPolicyWorkerImpl(
         data: BatchedDataDict[Any],
     ) -> None:
         state["num_chunks"] += 1
+        state["local_flops_vision_corrected"] = state.get(
+            "local_flops_vision_corrected", False
+        ) or uses_omni_vision_correction(self.mcore_state.cfg, data)
+        if state["local_flops"] is not None:
+            batch_flops = self._batch_flops(data)
+            state["local_flops"] = (
+                state["local_flops"] + batch_flops if batch_flops is not None else None
+            )
         self._log_gpu_mem("chunk_enter")
         loss_fn = state["loss_fn"]
 
@@ -2261,6 +2276,8 @@ class MegatronPolicyWorkerImpl(
             mtp_grad_norm,
         )
 
+        metrics["local_flops"] = state["local_flops"]
+        metrics["local_flops_vision_corrected"] = state["local_flops_vision_corrected"]
         self._train_step_state = None
         return metrics
 

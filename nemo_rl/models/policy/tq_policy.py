@@ -65,7 +65,7 @@ from nemo_rl.data_plane.schema import (
 )
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.telemetry.instrumentation import trace_context_kwargs
-from nemo_rl.utils.flops_tracker import get_theoretical_tflops
+from nemo_rl.utils.flops_tracker import get_theoretical_tflops, resolve_flops_metrics
 from nemo_rl.utils.timer import Timer
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -572,8 +572,15 @@ class TQPolicy(TQDriverMixin, Policy):
         results = self.worker_group.get_all_worker_results(futures)
         aggregated_results = _aggregate_train_results(results)
 
-        if self.flops_tracker is not None:
-            aggregated_results["total_flops"] = self.flops_tracker.total_flops
+        aggregated_results.update(
+            resolve_flops_metrics(
+                results,
+                fallback_flops=self.flops_tracker.total_flops
+                if self.flops_tracker is not None
+                else None,
+            )
+        )
+        if "total_flops" in aggregated_results:
             aggregated_results["num_ranks"] = self.worker_group.cluster.world_size()
             gpus_per_worker = self.worker_group.cluster.world_size() / max(
                 len(results), 1
@@ -804,9 +811,25 @@ class TQPolicy(TQDriverMixin, Policy):
         leader_results = [r for r in results if r.get("is_replica_leader", True)]
         aggregated_results = _aggregate_train_results(leader_results)
 
-        if self.flops_tracker is not None:
-            aggregated_results["total_flops"] = self.flops_tracker.total_flops
+        aggregated_results.update(
+            resolve_flops_metrics(
+                leader_results,
+                fallback_flops=self.flops_tracker.total_flops
+                if self.flops_tracker is not None
+                else None,
+            )
+        )
+        if "total_flops" in aggregated_results:
             aggregated_results["num_ranks"] = self.worker_group.cluster.world_size()
+            # This fanout returns every GPU, including TP/CP/PP replicas.
+            # Losses need deduplication above; hardware capacity does not.
+            try:
+                aggregated_results["theoretical_tflops"] = sum(
+                    get_theoretical_tflops(r["gpu_name"], r["model_dtype"])
+                    for r in results
+                )
+            except (KeyError, ValueError) as error:
+                warnings.warn(f"Error getting theoretical flops: {error}")
 
         return aggregated_results
 

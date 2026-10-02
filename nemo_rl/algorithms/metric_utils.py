@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
@@ -53,6 +54,29 @@ TRAINING_TEED_METRICS = (
 )
 
 register_teed_metrics(TRAINING_TEED_METRICS)
+
+
+def compute_mfu_metrics(
+    train_results: dict[str, Any], *, training_seconds: float
+) -> dict[str, float]:
+    """Return model FLOPs utilization as a fraction of training GPU capacity.
+
+    The duration must cover the training calls represented by total_flops,
+    excluding data loading, rollout waits, and checkpointing. Unsupported
+    models or GPUs omit MFU rather than reporting zero utilization.
+    """
+    total_flops = train_results.get("total_flops")
+    capacity = train_results.get("theoretical_tflops")
+    if total_flops is None or capacity is None:
+        return {}
+    if (
+        not all(math.isfinite(v) for v in (total_flops, capacity, training_seconds))
+        or total_flops < 0
+        or capacity <= 0
+        or training_seconds <= 0
+    ):
+        return {}
+    return {"train_fp_utilization": total_flops / training_seconds / 1e12 / capacity}
 
 
 @dataclass

@@ -22,6 +22,7 @@ from typing import Any, Protocol, cast
 
 import torch
 from megatron.energon import SampleDecoder, stateless
+from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.data.energon.multimodal.model_families import (
     ALL_MODEL_FAMILIES,
@@ -177,16 +178,19 @@ class HFMultimodalSFTProcessorAdapter:
         add_eos: bool,
         add_generation_prompt: bool,
     ) -> None:
-        if not hasattr(processor, "apply_chat_template") or not hasattr(
-            processor, "tokenizer"
+        if not hasattr(processor, "apply_chat_template") or not (
+            isinstance(processor, PreTrainedTokenizerBase)
+            or hasattr(processor, "tokenizer")
         ):
-            raise TypeError("Energon multimodal SFT requires a Hugging Face processor.")
+            raise TypeError(
+                "Energon SFT requires a Hugging Face tokenizer or processor."
+            )
         self.processor = processor
         self.max_sequence_length = max_sequence_length
         self.add_bos = add_bos
         self.add_eos = add_eos
         self.add_generation_prompt = add_generation_prompt
-        tokenizer = processor.tokenizer
+        tokenizer = getattr(processor, "tokenizer", processor)
         fingerprint_data = {
             "processor_class": type(processor).__name__,
             "processor_name": getattr(processor, "name_or_path", None),
@@ -209,7 +213,17 @@ class HFMultimodalSFTProcessorAdapter:
         return self._fingerprint
 
     def encode(self, sample: CanonicalSFTSample) -> EncodedSFTSample:
+        text_only = isinstance(self.processor, PreTrainedTokenizerBase)
+        if text_only and sample.media:
+            raise ValueError("Media samples require a multimodal processor.")
         messages = _normalize_messages(sample)
+        if text_only:
+            for message in messages:
+                if any(part.get("type") != "text" for part in message["content"]):
+                    raise ValueError("Media samples require a multimodal processor.")
+                message["content"] = "".join(
+                    part["text"] for part in message["content"]
+                )
         message_log = get_formatted_message_log(
             messages,
             self.processor,

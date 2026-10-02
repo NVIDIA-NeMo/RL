@@ -76,15 +76,14 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             return False
         if self._sft_loader is not None:
             raise RuntimeError("The SFT Energon loader is already configured.")
-        if self._sft_processor is None:
-            raise ValueError("SFTv2 requires a multimodal processor on policy workers.")
-
         logical_rank = parallel_state.get_data_parallel_rank()
         logical_world_size = parallel_state.get_data_parallel_world_size()
         self._sft_loader = build_energon_sft_loader(
             data_config=data_config,
             source=data_config["train"],
-            processor=self._sft_processor,
+            processor=self._sft_processor
+            if self._sft_processor is not None
+            else self.tokenizer,
             batch_size=batch_size,
             max_sequence_length=max_sequence_length,
             split_role="train",
