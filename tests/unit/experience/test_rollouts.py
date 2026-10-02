@@ -115,8 +115,14 @@ def _initial_gym_image_batch() -> BatchedDataDict:
     )
 
 
-def test_attach_initial_nemo_gym_image_payloads_attaches_once(monkeypatch):
+@pytest.mark.parametrize("native", [False, True])
+def test_attach_initial_nemo_gym_image_payloads_attaches_once(monkeypatch, native):
     batch = _initial_gym_image_batch()
+    if native:
+        batch["extra_env_info"][0] = {
+            "task_id": {"taskset": "vision:train", "task_id": "image-1"},
+            "task_input": batch["extra_env_info"][0],
+        }
     attached = PackedTensor(torch.ones(1, 3, 2, 3), dim_to_pack=0)
 
     class _Processor:
@@ -2377,6 +2383,97 @@ def test_postprocess_nemo_gym_group_returns_task_index(
     assert rollout_result.rollout_metrics["agent/truncation_rate"] == 0.0
 
 
+@pytest.mark.parametrize("log_full_result_tables", [False, True])
+@pytest.mark.parametrize("row_format", ["legacy", "flat_native", "canonical_native"])
+def test_postprocess_nemo_gym_group_reads_profile_metadata_from_task_rows(
+    log_full_result_tables: bool, row_format: str
+) -> None:
+    rows = []
+    for _ in range(2):
+        task_input = {
+            "responses_create_params": {
+                "input": [{"role": "user", "content": "prompt"}]
+            }
+        }
+        profile_metadata = {
+            "profiled_rewards": [1.0, 1.0],
+            "profiled_output_lengths": [2, 2],
+            "profile_band": {"total": {"a": 2, "b": 6, "f": 0.5}},
+        }
+        if row_format == "canonical_native":
+            task_input["task_data"] = profile_metadata
+        else:
+            task_input.update(profile_metadata)
+        row = {"agent_ref": {"name": "agent"}, "_ng_task_index": 42}
+        if row_format == "legacy":
+            row.update(task_input)
+        else:
+            row["task_id"] = {"taskset": "math:train", "task_id": "first"}
+            row["task_input"] = task_input
+        rows.append(row)
+    results = []
+    for reward in (1.0, 0.0):
+        input_message = {
+            "role": "user",
+            "content": "prompt",
+            "token_ids": torch.tensor([1]),
+        }
+        results.append(
+            {
+                "input_message_log": [input_message],
+                "message_log": [
+                    input_message,
+                    {
+                        "role": "assistant",
+                        "content": "answer",
+                        "token_ids": torch.tensor([2]),
+                        "generation_logprobs": torch.tensor([-0.1]),
+                    },
+                ],
+                "full_result": {
+                    "reward": reward,
+                    "response": {
+                        "output": [{"type": "message", "content": [{"text": "answer"}]}]
+                    },
+                },
+            }
+        )
+
+    rollout_result = rollouts_mod._postprocess_single_nemo_gym_group(
+        nemo_gym_rows=rows,
+        results=results,
+        timer=rollouts_mod.Timer(),
+        timer_prefix="timing/rollout",
+        policy_generation=type(
+            "_PolicyGeneration",
+            (),
+            {"cfg": {"vllm_cfg": {"max_model_len": 128}}},
+        )(),
+        input_batch=BatchedDataDict({"loss_multiplier": torch.ones(2)}),
+        tokenizer=type("_Tokenizer", (), {"pad_token_id": 0})(),
+        log_full_result_tables=log_full_result_tables,
+        length_penalty_config={
+            "default": {
+                "length_type": "chars",
+                "profiled_length_penalty": 0.2,
+                "profile_band_total": True,
+            }
+        },
+    )
+
+    assert rollout_result.task_index == 42
+    # The profiled budget subtracts 0.2, then the band halves the remaining reward.
+    assert rollout_result.final_batch["total_reward"].tolist() == pytest.approx(
+        [0.4, 0.0]
+    )
+    assert rollout_result.final_batch["env_reward"].tolist() == [1.0, 0.0]
+    assert rollout_result.final_batch["agent_ref"] == [{"name": "agent"}] * 2
+    assert (
+        "agent/full_result" in rollout_result.rollout_metrics
+    ) is log_full_result_tables
+    assert rollout_result.rollout_metrics["agent/truncation_rate"] == 0.0
+
+
 def test_postprocess_nemo_gym_group_reports_per_agent_live_metrics():
     agent_names = ["agent-a", "agent-a", "agent-b", "agent-b"]
     is_truncated = [True, False, True, True]
@@ -2924,6 +3021,42 @@ def test_prepare_nemo_gym_rows_stamps_distinct_legacy_prompt_groups():
     assert [row[NEMO_GYM_GROUP_ATTEMPT_KEY] for row in rows] == [0, 0, 0, 0]
     assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [0, 1, 0, 1]
     assert [row["_rowidx"] for row in rows] == [0, 1, 2, 3]
+
+
+def test_prepare_nemo_gym_rows_updates_mixed_native_and_legacy_inputs():
+    native = {
+        "task_id": {"taskset": "workplace:train", "task_id": "17"},
+        "task_input": {
+            "responses_create_params": {
+                "input": [{"role": "user", "content": "Check my meetings."}],
+                "max_output_tokens": 128,
+                "metadata": {"extra_body": '{"seed": 8}'},
+            },
+            "task_data": {"state": ["meeting-1"]},
+        },
+    }
+    rows = [
+        {"agent_ref": {"name": "legacy"}, "responses_create_params": {}},
+        native,
+    ]
+    rollouts_mod._prepare_nemo_gym_rows(
+        rows,
+        generation_config={"max_new_tokens": 64},
+        sampling_params=SimpleNamespace(temperature=0.7, top_p=0.9),
+        num_generations=1,
+    )
+
+    assert native["task_id"] == {"taskset": "workplace:train", "task_id": "17"}
+    assert native["task_input"]["task_data"] == {"state": ["meeting-1"]}
+    assert "responses_create_params" not in native
+    native_params = native["task_input"]["responses_create_params"]
+    assert native_params["metadata"] == {"extra_body": '{"seed": 8}'}
+    for params in (rows[0]["responses_create_params"], native_params):
+        assert params["temperature"] == 0.7
+        assert params["top_p"] == 0.9
+        assert params["max_output_tokens"] == 64
+    assert [row["_rowidx"] for row in rows] == [0, 1]
+    assert rows[0][NEMO_GYM_GROUP_ID_KEY] != rows[1][NEMO_GYM_GROUP_ID_KEY]
 
 
 def test_rollout_manager_rotates_replicas_and_reports_group_share():

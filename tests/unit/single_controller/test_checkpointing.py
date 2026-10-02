@@ -39,6 +39,7 @@ import hashlib
 import json
 import os
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -2213,9 +2214,11 @@ class TestPeriodicRolloutCheckpoint:
             await actor._log_rollout_throughput_metrics()
 
         try:
+            # Keep asyncio and background threads on the real clock.
             with patch(
-                "nemo_rl.algorithms.single_controller.time.monotonic",
-                new=_SteppingClock(start=10.0, step=10.0),
+                "nemo_rl.algorithms.single_controller.time",
+                wraps=time,
+                monotonic=_SteppingClock(start=10.0, step=10.0),
             ):
                 asyncio.run(sample_twice())
         finally:
