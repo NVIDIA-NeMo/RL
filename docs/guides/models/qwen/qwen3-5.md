@@ -23,7 +23,7 @@ Model support is tracked in two stages:
 | **Functionally Ready** | Runnable end-to-end and numerically validated with an initial training run. |
 | **Long-Run Convergence Validated** | Trains stably over a full-length run with a healthy, reproducible reward curve. |
 
-The Qwen3.5 family is supported on both the Megatron (MCore) and AutoModel (DTensor)
+The Qwen3.5 family is supported on both the Megatron (MCore) and Automodel
 backends. The specific configurations shipped as [example recipes](#example-recipes)
 below are the ones that have been **Long-Run Convergence Validated**. Other variants
 and configurations are runnable but have not all been validated for long-run
@@ -35,9 +35,9 @@ convergence.
 | --- | --- | --- | --- | --- |
 | `Qwen/Qwen3.5-9B-Base` | LLM (dense) | Megatron | TP | vLLM |
 | `Qwen/Qwen3.5-35B-A3B-Base` | LLM (MoE) | Megatron | TP + EP + PP + CP | vLLM |
-| `Qwen/Qwen3.5-35B-A3B-Base` | LLM (MoE) | AutoModel (DTensor) | EP + CP | vLLM |
+| `Qwen/Qwen3.5-35B-A3B-Base` | LLM (MoE) | Automodel | EP + CP | vLLM |
 | `Qwen/Qwen3.5-35B-A3B-Base` | VLM (MoE) | Megatron | TP + EP + PP + CP | vLLM |
-| `Qwen/Qwen3.5-35B-A3B-Base` | VLM (MoE) | AutoModel (DTensor) | EP | vLLM |
+| `Qwen/Qwen3.5-35B-A3B-Base` | VLM (MoE) | Automodel | EP | vLLM |
 | `Qwen/Qwen3.5-397B-A17B` | LLM (MoE) | Megatron | TP + EP + PP + CP | vLLM |
 
 Notes on backends and parallelism:
@@ -46,7 +46,7 @@ Notes on backends and parallelism:
   Parallel (TP), Expert Parallel (EP), Pipeline Parallel (PP), and Context Parallel
   (CP) for longer sequences — on both the LLM and the VLM (see
   [#2312](https://github.com/NVIDIA-NeMo/RL/pull/2312) for CP).
-- **AutoModel (DTensor)** supports Expert Parallel (EP), and Context Parallel for
+- **Automodel** supports Expert Parallel (EP), and Context Parallel for
   the MoE **LLM** only; CP on AutoModel requires the TE backend and
   `flash-linear-attention`. **Dense Qwen3.5 and the VLM do not support Context
   Parallel on AutoModel** (set `cp_size = 1`). See
@@ -255,7 +255,7 @@ FP8 noise.
 Qwen3.5 relies on `flash-linear-attention` (FLA) and `causal-conv1d` kernels for
 full speed. There are two distinct cases:
 
-- **Performance fallback on AutoModel and DTensor.** Several `nemo-automodel` kernels
+- **Performance fallback on Automodel.** Several `nemo-automodel` kernels
   dispatch to FLA if it is importable and otherwise fall back to slower PyTorch
   implementations. Without FLA, Qwen3.5 (dense or MoE) trains roughly **two times
   slower** on the AutoModel path, without raising an error. The `-megatron` recipes use Megatron Core

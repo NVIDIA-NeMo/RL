@@ -26,7 +26,7 @@ single `ValueError` listing every violation. The current requirements are:
 
 * **Non-colocated only** — `policy.generation.colocated.enabled=false`. The colocated
   path uses IPC and is unaffected by this feature.
-* **Megatron training backend** — `policy.megatron_cfg.enabled=true` (the DTensor
+* **Megatron training backend** — `policy.megatron_cfg.enabled=true` (the Automodel
   training backend is not supported yet.).
 * **vLLM or Megatron generation backend** — `policy.generation.backend` must be
   `vllm` or `megatron` (SGLang and TRTLLM are not supported yet).

@@ -215,13 +215,13 @@ These parameters can be adjusted in the config file or via command-line override
 
 ## LoRA Configuration
 
-DPO supports LoRA on both the DTensor and Megatron backends. To enable LoRA on the default DTensor backend:
+DPO supports LoRA on both the Automodel and Megatron backends. To enable LoRA on the default Automodel backend:
 
 ```bash
 uv run examples/run_dpo.py policy.dtensor_cfg.lora_cfg.enabled=true
 ```
 
-For the full reference — backend support, the DTensor vs Megatron schema comparison, config examples, parameter details, and example recipes — see the dedicated [LoRA guide](lora.md).
+For the full reference — backend support, the Automodel vs Megatron schema comparison, config examples, parameter details, and example recipes — see the dedicated [LoRA guide](lora.md).
 
 ## Optimizations
 

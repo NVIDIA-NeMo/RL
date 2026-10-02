@@ -572,7 +572,7 @@ loss_fn:
   reference_policy_kl_penalty: 0.0
 ```
 
-The default is `false`, retaining the existing pre-training check. This mode requires the `grpo` advantage estimator and one optimizer update per rollout batch (`force_on_policy_ratio`'s existing constraint). It supports synchronous and legacy asynchronous training, including synchronous data-plane training, sequence packing, and gradient accumulation. SingleController is rejected because its advantage baselines depend on the earlier filtering decision. DTensor, KL-in-reward, MTP, draft training, positive-example NLL, and distillation are not supported by this mode. A reference-model forward is still needed if reference KL is enabled; the example disables it. Existing recipes using MTP (such as the NeMo-Gym Nemotron recipes), distillation (`mopd`), or Automodel must first satisfy these constraints; setting the flag alone does not make them compatible.
+The default is `false`, retaining the existing pre-training check. This mode requires the `grpo` advantage estimator and one optimizer update per rollout batch (`force_on_policy_ratio`'s existing constraint). It supports synchronous and legacy asynchronous training, including synchronous data-plane training, sequence packing, and gradient accumulation. SingleController is rejected because its advantage baselines depend on the earlier filtering decision. Automodel, KL-in-reward, MTP, draft training, positive-example NLL, and distillation are not supported by this mode. A reference-model forward is still needed if reference KL is enabled; the example disables it. Existing recipes using MTP (such as the NeMo-Gym Nemotron recipes), distillation (`mopd`), or Automodel must first satisfy these constraints; setting the flag alone does not make them compatible.
 
 The [Qwen2.5-Math-1.5B single-forward recipe](../../examples/configs/recipes/llm/grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-single-forward.yaml) provides a complete configuration for one node with eight GPUs. The comparison below used two GB300 nodes with four GPUs each, with overrides `cluster.num_nodes=2 cluster.gpus_per_node=4 cluster.segment_size=2`. The reported step times therefore do not describe the recipe's default topology and also depend on the benchmark hardware and runtime.
 
@@ -841,15 +841,15 @@ The headline metric is per-reward convergence, not just aggregate reward. NeMo-R
 
 ## LoRA Configuration
 
-GRPO supports LoRA on both the DTensor and Megatron backends. To enable LoRA on the default DTensor backend:
+GRPO supports LoRA on both the Automodel and Megatron backends. To enable LoRA on the default Automodel backend:
 
 ```bash
 uv run examples/run_grpo.py policy.dtensor_cfg.lora_cfg.enabled=true
 ```
 
-The DTensor GRPO LoRA path uses a merge-weight approach: during generation, LoRA adapter weights are merged into the base linear weights. This improves performance, with a small training-inference mismatch that we consider acceptable. If you require strict training-inference parity, use the [split-weight variant branch](https://github.com/NVIDIA-NeMo/RL/tree/ruit/lora_grpo_async), which may trade off some performance. For a comparison between merge-weight and split-weight, see [PR 1797: Support lora in dtensor grpo workflow by merging weight](https://github.com/NVIDIA-NeMo/RL/pull/1797).
+The Automodel GRPO LoRA path uses a merge-weight approach: during generation, LoRA adapter weights are merged into the base linear weights. This improves performance, with a small training-inference mismatch that we consider acceptable. If you require strict training-inference parity, use the [split-weight variant branch](https://github.com/NVIDIA-NeMo/RL/tree/ruit/lora_grpo_async), which may trade off some performance. For a comparison between merge-weight and split-weight, see [PR 1797: Support lora in dtensor grpo workflow by merging weight](https://github.com/NVIDIA-NeMo/RL/pull/1797).
 
-For the full reference — backend support, the DTensor vs Megatron schema comparison, config examples, parameter details, and example recipes — see the dedicated [LoRA guide](lora.md).
+For the full reference — backend support, the Automodel vs Megatron schema comparison, config examples, parameter details, and example recipes — see the dedicated [LoRA guide](lora.md).
 
 ## Evaluate the Trained Model
 

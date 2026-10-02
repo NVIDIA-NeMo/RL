@@ -50,7 +50,7 @@ If you encounter timeout errors, the system will suggest doubling the current ti
 
 ## AutoModel Parameter Freezing (`freeze_config`)
 
-VLM/omni recipes on the AutoModel (DTensor) backend control which sub-towers
+VLM/omni recipes on the Automodel backend control which sub-towers
 train via a declarative `freeze_config` under
 `policy.model_kwargs.automodel_kwargs`:
 
