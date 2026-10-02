@@ -283,6 +283,13 @@ rollout_recovery:
 # Leaving either map above non-empty requires the top-level token_capture section
 # to set enabled: true.
 
+# Log token-level training data to Parquet under <dir>/step=NNNNNNNN/.
+# Rows carry attempt_start so restarted attempts can be distinguished.
+trajectory_log:
+  enabled: false
+  dir: null  # null = <logger.log_dir>/trajectories
+  log_period: 10  # record steps 1, 10, 20, ...
+
 cluster:
   # Master ports inherit the shared 1400-1999 band from ppo_math_1B.yaml.
   gpus_per_node: 2
