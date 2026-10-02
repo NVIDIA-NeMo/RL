@@ -1,0 +1,16 @@
+# Production mixed-teacher recipe through the V1 async_grpo loop.
+defaults: ./super_vl_35_mixed_teachers_nv_main.yaml
+grpo:
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    max_generation_failures: 0
+    in_flight_weight_updates: true
+    recompute_kv_cache_after_weight_updates: false
+policy:
+  router_replay:
+    enabled: false
+  generation:
+    vllm_kwargs:
+      async_scheduling: false
+      enable_return_routed_experts: false
