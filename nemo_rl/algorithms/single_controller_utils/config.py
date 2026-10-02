@@ -35,6 +35,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     ReadyFirstSamplerConfig,
     SamplerConfig,
     required_buffer_capacity_for_config,
+    sampler_supports_buffer_checkpoint,
 )
 from nemo_rl.algorithms.grpo import (
     _REWARD_PENALTY_FLAGS,
@@ -497,6 +498,12 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     max_inflight_prompts: int = 32
     # Cap on unconsumed rollout groups buffered in the DataPlane (backpressure).
     max_buffered_rollouts: int = 64
+    # Checkpoint completed, unconsumed rollout groups (and in-flight recovery
+    # state) for samplers that support replay recovery, so a resume continues
+    # them. False drops them: every resume starts with an empty buffer, the
+    # prompts they held are re-dispatched before new dataloader work, and
+    # checkpointing.save_data_plane is no longer required.
+    checkpoint_replay_buffer: bool = True
     # Enable per-rollout diagnostic prints (prompt content / completion previews).
     diagnostics: bool = False
 
@@ -871,6 +878,52 @@ def algo_config(master_config: MasterConfig) -> GRPOConfig | PPOConfig:
     return master_config.grpo  # type: ignore
 
 
+def replay_checkpoint_enabled(master_config: MasterConfig) -> bool:
+    """Whether checkpoints carry (and resumes restore) buffered rollout groups.
+
+    True only when the sampler supports replay recovery and
+    ``async_rl.checkpoint_replay_buffer`` has not opted out.
+    """
+    return (
+        sampler_supports_buffer_checkpoint(master_config.async_rl.sampler)
+        and master_config.async_rl.checkpoint_replay_buffer
+    )
+
+
+def multi_trace_enabled(master_config: MasterConfig) -> bool:
+    """Whether NeMo-Gym session traces each become a training sequence.
+
+    A prompt group then commits a variable number of rows (one per agent
+    session segment), so a step's row count varies around
+    num_prompts_per_step * num_generations_per_prompt.
+    """
+    # model_construct-based unit configs can omit the required `env` block.
+    env_config = getattr(master_config, "env", None) or {}
+    nemo_gym_cfg = env_config.get("nemo_gym") or {}
+    return bool(nemo_gym_cfg.get("train_on_all_session_traces"))
+
+
+def _validate_multi_trace(master_config: MasterConfig) -> None:
+    """Reject settings that assume exactly num_generations_per_prompt rows per group."""
+    if not multi_trace_enabled(master_config):
+        return
+    problems = []
+    if not is_ppo_run(master_config):
+        problems.append(
+            "it requires a `ppo` block (GRPO's group baseline assumes one row per "
+            "generation)"
+        )
+    if master_config.token_capture.enabled:
+        problems.append(
+            "token_capture.enabled must be false (capture reassembles one call "
+            "chain per rollout)"
+        )
+    if problems:
+        raise ValueError(
+            "env.nemo_gym.train_on_all_session_traces=true: " + "; ".join(problems)
+        )
+
+
 def validate_sampler_buffer_capacity(
     async_config: AsyncRLConfig,
     *,
@@ -1077,6 +1130,38 @@ def _validate_failure_settings(
         )
 
 
+def _validate_swe_privileged_critic(master_config: MasterConfig) -> None:
+    """Check the critic can hold the privileged sequences."""
+    from nemo_rl.algorithms.swe_privileged_critic import (
+        privilege_budget_tokens,
+        resolve_config,
+    )
+
+    value_cfg = master_config.value
+    privilege_cfg = resolve_config(value_cfg)
+    if privilege_cfg is None:
+        return
+    needed = master_config.policy["max_total_sequence_length"] + (
+        privilege_budget_tokens(privilege_cfg)
+    )
+    budgets = {
+        "value.max_total_sequence_length": value_cfg["max_total_sequence_length"]
+    }
+    for batching in ("sequence_packing", "dynamic_batching"):
+        batching_cfg = value_cfg.get(batching)
+        if batching_cfg is not None and batching_cfg["enabled"]:
+            for key in ("train_mb_tokens", "logprob_mb_tokens"):
+                budgets[f"value.{batching}.{key}"] = batching_cfg[key]
+    too_small = {name: size for name, size in budgets.items() if size < needed}
+    if too_small:
+        raise ValueError(
+            "value.swe_privileged_critic prefixes every critic row with up to "
+            f"{privilege_budget_tokens(privilege_cfg)} tokens, so the critic needs "
+            f"policy.max_total_sequence_length + that = {needed} tokens, but "
+            f"{too_small} is smaller."
+        )
+
+
 def _validate_algo_settings(master_config: MasterConfig) -> None:
     """Reject algorithm blocks the SingleController path cannot honour.
 
@@ -1163,6 +1248,8 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "Remove it, or add a `ppo` block with policy_training_start_step > 0."
         )
 
+    _validate_multi_trace(master_config)
+
     if not is_ppo_run(master_config):
         # A value block without `ppo` is inert -- nothing builds the critic --
         # and a config carrying one is asking for PPO by every reading except
@@ -1242,11 +1329,25 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "ppo.policy_training_start_step=0, or checkpointing.save_optimizer=false."
         )
 
+    _validate_swe_privileged_critic(master_config)
+
     sampler_name = async_config.sampler.name
-    if sampler_name != "in_order":
+    if sampler_name == "ready_first":
+        # ready_first never evicts, so critic warmup cannot make it drop frozen-
+        # policy rollouts as stale -- the hazard that rules out the others. The
+        # warmup lookahead widening is in_order-only, though, and ready_first has
+        # not been run through a warmup, so require none.
+        if algo_cfg.policy_training_start_step > 0:
+            raise ValueError(
+                "PPO with async_rl.sampler.name='ready_first' requires "
+                "ppo.policy_training_start_step=0: critic warmup is only "
+                "supported on the in_order sampler."
+            )
+    elif sampler_name != "in_order":
         raise ValueError(
             "PPO on the SingleController path only supports "
-            f"async_rl.sampler.name='in_order', but got '{sampler_name}'. "
+            "async_rl.sampler.name='in_order' (or 'ready_first' without critic "
+            f"warmup), but got '{sampler_name}'. "
             "Other samplers are not supported yet (in particular during critic "
             "warmup) (#2625)."
         )

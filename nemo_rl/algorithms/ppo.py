@@ -16,7 +16,7 @@ import os
 import time
 import traceback
 import warnings
-from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
+from typing import Any, Literal, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
 import ray
@@ -212,10 +212,32 @@ class PPOConfig(BaseModel, extra="allow"):
     # Nullable sequence-level multiplicative probability-error threshold.
     # None logs metrics without masking; values above the threshold are excluded.
     seq_logprob_error_threshold: float | None = None
+    # Rows a multi-trace step is padded with to reach the DP multiple. Pad rows
+    # carry no loss but stay in all_rows advantage whitening. ``row0`` (legacy
+    # async PPO) repeats the step's first row; ``cyclic`` takes rows 0, 1, 2...
+    multi_trace_pad_source: Literal["row0", "cyclic"] = "row0"
     # Advantage value assigned to invalid-tool-call tokens; None disables it.
     invalid_tool_call_advantage: float | None = None
     # Advantage value assigned to malformed-thinking tokens; None disables it.
     malformed_thinking_advantage: float | None = None
+
+    # SingleController diagnostics ported from legacy async PPO
+    # (nemo_rl/algorithms/single_controller_utils/legacy_diagnostics.py).
+    # Per-trace rollout_debug_step{N}.jsonl in the logger's log_dir every step.
+    log_rollout_debug: bool = True
+    # Driver-side critic / advantage diagnostics: pooled pre-update EV
+    # (critic/explained_var, critic/ev_res), early/mid/late critic/ev_*, ece,
+    # bias, mixed-group EV, abs/res return stats, residual/* (B_LOO, metrics
+    # only). The cheap multi-trace / log-prob-error breakdowns, adv_raw/* and
+    # trajectory ages are always on, as in legacy.
+    log_critic_diagnostics: bool = True
+    # One extra forward-only critic pass after the last critic update, for
+    # critic/explained_var_post_update and critic/loss_post_update.
+    log_post_update_critic_metrics: bool = False
+    # Packed per-token ppo_rollout_dump_step{N}.pt (values, advantages,
+    # logprobs, returns per response token) every rollout_dump_period steps.
+    log_rollout_dump: bool = False
+    rollout_dump_period: int = 1
 
     # Asynchronous PPO uses a replay buffer with non-colocated generation.
     # Legacy async config block; SC reads its async knobs from `async_rl` instead.

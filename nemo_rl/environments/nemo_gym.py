@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from time import monotonic
-from typing import Any, Dict, List, NotRequired, Optional, Protocol, TypedDict
+from typing import Any, Dict, List, Literal, NotRequired, Optional, Protocol, TypedDict
 
 import ray
 import torch
@@ -239,13 +239,50 @@ def should_use_nemo_gym(master_config: NemoGymCompatibleConfig) -> bool:
     return True
 
 
-def _has_nan_generation_logprobs(result: dict) -> bool:
-    """Return whether a postprocessed rollout contains NaN policy logprobs."""
+# Set on a postprocessed result (single trace) or on one of its session traces
+# when that trace must be masked from the loss whatever the Gym instance config
+# says: no generation data, or NaN policy logprobs.
+FORCED_MASK_SAMPLE_KEY = "forced_mask_sample"
+
+
+def _message_log_has_nan_logprobs(message_log: list[dict]) -> bool:
     return any(
         message.get("generation_logprobs") is not None
         and torch.isnan(message["generation_logprobs"]).any()
-        for message in result["message_log"]
+        for message in message_log
     )
+
+
+def _has_nan_generation_logprobs(result: dict) -> bool:
+    """Return whether any trace of a postprocessed rollout has NaN policy logprobs."""
+    if "session_traces" in result:
+        return any(
+            _message_log_has_nan_logprobs(trace["message_log"])
+            for trace in result["session_traces"]
+        )
+    return _message_log_has_nan_logprobs(result["message_log"])
+
+
+def _mask_nan_generation_logprobs(result: dict) -> int:
+    """Zero NaN policy logprobs in place and force-mask each affected trace.
+
+    Legacy async PPO kept such rows and its seq-logprob-error gate dropped them
+    (a NaN error fails any threshold). Zeroing keeps a masked row from turning
+    loss or metric reductions into NaN, and the forced mask drops it even when
+    no threshold is set. Returns the number of traces masked.
+    """
+    traces = result["session_traces"] if "session_traces" in result else [result]
+    num_masked = 0
+    for trace in traces:
+        if not _message_log_has_nan_logprobs(trace["message_log"]):
+            continue
+        for message in trace["message_log"]:
+            logprobs = message.get("generation_logprobs")
+            if logprobs is not None:
+                message["generation_logprobs"] = torch.nan_to_num(logprobs, nan=0.0)
+        trace[FORCED_MASK_SAMPLE_KEY] = True
+        num_masked += 1
+    return num_masked
 
 
 def _typed_gym_failure(error: Exception) -> Optional[Exception]:
@@ -341,6 +378,16 @@ class NemoGymConfig(TypedDict):
     # server, switches run_rollouts to receipt mode, and assembles receipts
     # from the manifest control route. None/absent = legacy token-echo path.
     token_capture: NotRequired[Dict[str, Any] | None]
+    # Multi-trace training: when true and Gym returns plural ``responses`` (one
+    # per agent session x compaction segment, e.g. opencode subagents), every
+    # session becomes its own training sequence sharing the rollout's reward.
+    # False/absent trains only the main session's final segment (``response``).
+    train_on_all_session_traces: NotRequired[bool]
+    # What a rollout trace with NaN policy logprobs does. ``mask`` (default,
+    # legacy async PPO's outcome) keeps the row, zeroes the NaNs and masks the
+    # trace from the loss; legacy kept the NaNs and its seq-logprob-error gate
+    # dropped the row. ``raise`` fails the rollout so the group is retried.
+    nan_generation_logprobs: NotRequired[Literal["mask", "raise"]]
 
 
 # Gym control-plane server name (the model server hosting the ledger) and the
@@ -905,14 +952,29 @@ Depending on your data shape, you may want to change these values."""
                         nemo_gym_row, nemo_gym_result
                     )
                 else:
-                    nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
-                        nemo_gym_row,
-                        nemo_gym_result,
-                        tokenizer,
-                        include_initial_multimodal_data=not deduplicate_multimodal_data,
-                    )
-                    if _has_nan_generation_logprobs(nemo_rl_result):
-                        raise RuntimeError("Generation logprobs contain NaN")
+                    try:
+                        nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
+                            nemo_gym_row,
+                            nemo_gym_result,
+                            tokenizer,
+                            include_initial_multimodal_data=not deduplicate_multimodal_data,
+                        )
+                    except ValueError as error:
+                        if "no generation data" not in str(error):
+                            raise
+                        nemo_rl_result = self._empty_rollout_result(
+                            nemo_gym_result, tokenizer, reason=str(error)
+                        )
+                    if self.cfg.get("nan_generation_logprobs", "mask") == "raise":
+                        if _has_nan_generation_logprobs(nemo_rl_result):
+                            raise RuntimeError("Generation logprobs contain NaN")
+                    elif num_nan := _mask_nan_generation_logprobs(nemo_rl_result):
+                        print(
+                            f"WARNING: masking {num_nan} trace(s) with NaN generation "
+                            "logprobs (nan_generation_logprobs=mask). Instance "
+                            f"{(nemo_gym_result.get('instance_config') or {}).get('name')}",
+                            file=sys.stderr,
+                        )
             num_results += 1
             timing_metrics = None
             if num_results == len(nemo_gym_examples):
@@ -1145,6 +1207,12 @@ Depending on your data shape, you may want to change these values."""
         assert isinstance(nemo_gym_result, dict), (
             f"Hit a non-successful response when querying NeMo Gym for rollouts: {nemo_gym_result}"
         )
+        if self.cfg.get("train_on_all_session_traces") and nemo_gym_result.get(
+            "responses"
+        ):
+            return self._postprocess_session_traces(
+                nemo_gym_row, nemo_gym_result, tokenizer
+            )
 
         processor = getattr(self, "_processor", None)
         response = nemo_gym_result["response"]
@@ -1411,6 +1479,127 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             result["_initial_multimodal_data_omitted"] = initial_multimodal_data_omitted
         return result
 
+    def _postprocess_session_traces(
+        self,
+        nemo_gym_row: dict,
+        nemo_gym_result: dict,
+        tokenizer: PreTrainedTokenizerBase,
+    ) -> dict:
+        """Convert every agent session segment in ``responses`` into a trace.
+
+        Each entry of Gym's plural ``responses`` (one per session x compaction
+        segment) goes through the single-response path, so contiguity and
+        tokenization checks are identical. Main-session segments come first; the
+        top-level ``message_log``/``input_message_log`` are the first trace's,
+        which is what the prompt group is keyed on. A segment that generated no
+        tokens is skipped rather than failing the rollout; a rollout with no
+        trainable segment at all still raises.
+
+        Returns:
+            The first trace's result dict plus ``session_traces``: a list of
+            ``{"message_log", "response", "trace_metadata"}``, main session first.
+        """
+        responses = nemo_gym_result["responses"]
+        ordered = sorted(
+            range(len(responses)),
+            key=lambda i: (
+                bool((responses[i].get("metadata") or {}).get("parent_session_id")),
+                i,
+            ),
+        )
+        traces: list[dict] = []
+        for response_idx in ordered:
+            segment = responses[response_idx]
+            segment_view = {**nemo_gym_result, "response": segment, "responses": None}
+            try:
+                converted = self._postprocess_nemo_gym_to_nemo_rl_result(
+                    nemo_gym_row, segment_view, tokenizer
+                )
+            except ValueError as error:
+                if "no generation data" not in str(error):
+                    raise
+                continue
+            metadata = segment.get("metadata") or {}
+            traces.append(
+                {
+                    "message_log": converted["message_log"],
+                    "response": segment,
+                    "trace_metadata": {
+                        "trace_in_rollout_idx": len(traces),
+                        "session_id": str(metadata.get("session_id", "")),
+                        "parent_session_id": str(
+                            metadata.get("parent_session_id") or ""
+                        ),
+                        "segment_index": str(metadata.get("segment_index", "0")),
+                        "segment_boundary_reason": str(
+                            metadata.get("segment_boundary_reason") or ""
+                        ),
+                    },
+                }
+            )
+        if not traces:
+            raise ValueError(
+                "NeMo Gym returned a result with no generation data in any of its "
+                f"{len(responses)} session segment(s)."
+            )
+        # The singular response duplicates one segment's token arrays; drop them
+        # so logging and the recovery ledger do not carry a second copy.
+        for item in (nemo_gym_result.get("response") or {}).get("output", []):
+            for key in (
+                "prompt_token_ids",
+                "generation_token_ids",
+                "generation_log_probs",
+                "routed_experts",
+            ):
+                item.pop(key, None)
+        return {
+            "message_log": traces[0]["message_log"],
+            "input_message_log": traces[0]["message_log"][:1],
+            "full_result": nemo_gym_result,
+            "session_traces": traces,
+        }
+
+    @staticmethod
+    def _empty_rollout_result(
+        nemo_gym_result: dict, tokenizer: PreTrainedTokenizerBase, *, reason: str
+    ) -> dict:
+        """Mask a rollout that came back with no generation data (legacy behaviour).
+
+        E.g. the agent died before its first model call, or the first prompt
+        exceeds max_model_len; raising would make it a data failure that ends the
+        run. Returns one force-masked placeholder trace with no trainable tokens
+        whose reward still counts in the rollout metrics. The Gym instance config
+        is left alone, so ``mask_sample_rate`` counts only Gym-flagged rollouts.
+        """
+        instance_config = nemo_gym_result.get("instance_config") or {}
+        nemo_gym_result["is_empty_rollout"] = True
+        pad_token_id = tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = tokenizer.eos_token_id or 0
+        message_log = [
+            {
+                "role": "user",
+                "content": "",
+                "token_ids": torch.tensor([pad_token_id], dtype=torch.int64),
+            }
+        ]
+        print(
+            "WARNING: NeMo Gym returned a rollout with no generation data; masking "
+            f"it (reward {nemo_gym_result.get('reward')} still logged). Instance "
+            f"{instance_config.get('name') or instance_config.get('instance_id')} "
+            f"agent_error_kind={nemo_gym_result.get('agent_error_kind')} "
+            f"agent_timed_out={nemo_gym_result.get('agent_timed_out')} "
+            f"oom_killed={nemo_gym_result.get('oom_killed')}. Cause: "
+            f"{reason.splitlines()[0]}",
+            flush=True,
+        )
+        return {
+            "message_log": message_log,
+            "input_message_log": message_log[:1],
+            "full_result": nemo_gym_result,
+            FORCED_MASK_SAMPLE_KEY: True,
+        }
+
     def shutdown(self) -> None:
         """Stop the Gym servers. Safe to call more than once, and before spinup.
 
@@ -1636,6 +1825,19 @@ def _build_gym_actor_config(
         _value = nemo_gym_dict.pop(_flag, None)
         if _value is not None:
             multimodal_flags[_flag] = bool(_value)
+    # Multi-trace training is consumed by the RL-side result conversion.
+    trace_flags: dict[str, Any] = {}
+    train_on_all_session_traces = nemo_gym_dict.pop("train_on_all_session_traces", None)
+    if train_on_all_session_traces is not None:
+        trace_flags["train_on_all_session_traces"] = bool(train_on_all_session_traces)
+    nan_generation_logprobs = nemo_gym_dict.pop("nan_generation_logprobs", None)
+    if nan_generation_logprobs is not None:
+        if nan_generation_logprobs not in ("mask", "raise"):
+            raise ValueError(
+                "env.nemo_gym.nan_generation_logprobs must be 'mask' or 'raise', "
+                f"got {nan_generation_logprobs!r}"
+            )
+        trace_flags["nan_generation_logprobs"] = nan_generation_logprobs
 
     # Pass prebuilt cache + venv dirs through the global config so the gym reuses
     # image-baked venvs instead of rebuilding them.
@@ -1665,6 +1867,7 @@ def _build_gym_actor_config(
         token_capture=token_capture,
         **port_range,
         **multimodal_flags,
+        **trace_flags,
     )
 
 

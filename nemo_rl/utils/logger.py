@@ -68,6 +68,11 @@ class WandbConfig(TypedDict):
     # Log complete NeMo Gym result payloads as W&B Tables. These payloads can be
     # very large, so the recommended default is false.
     log_nemo_gym_full_result_tables: NotRequired[bool]
+    # Make W&B's built-in step equal the trainer step (legacy behaviour): trainer
+    # rows are logged with step=<trainer step>, and custom-axis events (watchdog,
+    # telemetry, GPU monitoring) are merged into the open row instead of each
+    # advancing it. Default false keeps one W&B row per event, keyed by nemo_rl/step.
+    trainer_step_as_wandb_step: NotRequired[bool]
 
 
 class SwanlabConfig(TypedDict):
@@ -245,6 +250,9 @@ class WandbLogger(LoggerInterface):
         # NeMo RL logging controls are not valid wandb.init keyword arguments.
         wandb_init_config = dict(cfg)
         wandb_init_config.pop("log_nemo_gym_full_result_tables", None)
+        self._trainer_step_as_wandb_step = bool(
+            wandb_init_config.pop("trainer_step_as_wandb_step", False)
+        )
         self.run = wandb.init(**wandb_init_config, dir=log_dir)
         self._log_lock = threading.Lock()
         self._metric_step_patterns: dict[str, Optional[str]] = {}
@@ -510,7 +518,11 @@ class WandbLogger(LoggerInterface):
             return
         event_metrics = dict(self._pending_metrics)
         event_metrics[WANDB_CALLER_STEP_METRIC] = self._pending_step
-        self.run.log(event_metrics)
+        if self._trainer_step_as_wandb_step:
+            # W&B drops (with a warning) rows whose step is below its current step.
+            self.run.log(event_metrics, step=self._pending_step, commit=True)
+        else:
+            self.run.log(event_metrics)
         self._pending_step = None
         self._pending_metrics = {}
 
@@ -573,7 +585,12 @@ class WandbLogger(LoggerInterface):
                 )
                 # Custom-axis streams (rollout telemetry, GPU monitoring) are
                 # independent events and must not carry nemo_rl/step.
-                self.run.log(dict(metrics))
+                if self._trainer_step_as_wandb_step:
+                    # Merge into the open row so W&B's step keeps tracking the
+                    # trainer step; repeated keys keep the last value per step.
+                    self.run.log(dict(metrics), commit=False)
+                else:
+                    self.run.log(dict(metrics))
                 return
 
             self._buffer_step_metrics_locked(

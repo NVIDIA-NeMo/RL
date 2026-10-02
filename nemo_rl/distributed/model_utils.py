@@ -301,7 +301,22 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
         seq_size = int(vocab_parallel_logits.shape[1])
         num_chunks = (seq_size + chunk_size - 1) // chunk_size
 
-        grad_input: torch.Tensor = torch.zeros_like(vocab_parallel_logits)
+        # fp32 logits (an fp32 LM head) are a full [B, S, V/TP] fp32 activation, so a
+        # zeros_like grad doubles the largest tensor in the step (~12 GiB for a 98k-
+        # token CP shard). Each chunk reads its own logits before overwriting them,
+        # and the head's matmul backward needs only its inputs, so the grad can
+        # reuse the saved logits' storage. Any other node that saved these logits
+        # fails autograd's version check loudly rather than reading the grad. Leaf
+        # tensors belong to the caller and are never overwritten.
+        reuse_logits_storage = (
+            vocab_parallel_logits.dtype == torch.float32
+            and not vocab_parallel_logits.is_leaf
+        )
+        grad_input: torch.Tensor = (
+            vocab_parallel_logits
+            if reuse_logits_storage
+            else torch.zeros_like(vocab_parallel_logits)
+        )
 
         for chunk_idx in range(num_chunks):
             chunk_start = chunk_idx * chunk_size

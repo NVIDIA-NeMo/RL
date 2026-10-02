@@ -17,15 +17,21 @@ from __future__ import annotations
 
 import warnings
 from contextlib import nullcontext
+from dataclasses import replace
 from typing import Any, Optional
 
 import ray
+import torch
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta, build_data_plane_client
 from nemo_rl.data_plane.driver_mixin import TQDriverMixin
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
-from nemo_rl.data_plane.schema import DP_VALUE_TRAIN_FIELDS, VALUE_SEED_FIELDS
+from nemo_rl.data_plane.schema import (
+    DP_VALUE_TRAIN_FIELDS,
+    GLOBAL_FORWARD_PAD_SEQLEN,
+    VALUE_SEED_FIELDS,
+)
 from nemo_rl.models.value.lm_value import Value
 from nemo_rl.telemetry.instrumentation import trace_context_kwargs
 from nemo_rl.utils.timer import Timer
@@ -38,6 +44,8 @@ def _aggregate_train_results(results: list[dict[str, Any]]) -> dict[str, Any]:
     out: dict[str, Any] = {
         "loss": results[0]["global_loss"],
         "grad_norm": results[0]["grad_norm"],
+        # Already all-reduced over the model-parallel group in the worker.
+        "grad_norm_groups": results[0].get("grad_norm_groups") or {},
     }
     all_mb_metrics: dict[str, list[Any]] = {}
     for r in results:
@@ -91,6 +99,30 @@ class TQValue(TQDriverMixin, Value):
             warnings.warn(f"Error closing data-plane client: {e}")
         return super().shutdown()
 
+    # ── SWE privileged critic ──────────────────────────────────────────
+
+    def _privileged_dispatch(
+        self,
+        meta: KVBatchMeta,
+        privilege_prefixes: Optional[dict[str, torch.Tensor]],
+    ) -> tuple[KVBatchMeta, dict[str, Any]]:
+        """Re-plan ``meta`` for the critic layout and ship the batch's prefixes.
+
+        Sharding, packing and the forward pad target are all derived from
+        ``meta.sequence_lengths``, so they are re-minted from the critic lengths
+        (policy length + prefix). The prefixes go out as one object-store ref
+        that Ray resolves on every worker.
+        """
+        if privilege_prefixes is None:
+            return meta, {}
+        from nemo_rl.algorithms.swe_privileged_critic import critic_view_meta
+
+        extra_info = dict(meta.extra_info)
+        extra_info.pop(GLOBAL_FORWARD_PAD_SEQLEN, None)
+        critic_meta = replace(critic_view_meta(meta), extra_info=extra_info)
+        self._stamp_pad_seqlen(critic_meta)
+        return critic_meta, {"privilege_prefixes": ray.put(privilege_prefixes)}
+
     # ── 1-hop entrypoints (KVBatchMeta in, no re-fan-out) ──────────────────
 
     def get_values_from_meta(
@@ -98,6 +130,7 @@ class TQValue(TQDriverMixin, Value):
         meta: KVBatchMeta,
         micro_batch_size: Optional[int] = None,
         timer: Optional[Timer] = None,
+        privilege_prefixes: Optional[dict[str, torch.Tensor]] = None,
     ) -> None:
         """1-hop counterpart to get_values.
 
@@ -109,6 +142,9 @@ class TQValue(TQDriverMixin, Value):
             meta: Full-step batch metadata consumed by all DP ranks.
             micro_batch_size: Inference micro batch size; None uses the config default.
             timer: Optional timer for nested get_values measurements.
+            privilege_prefixes: SWE privileged critic only: reference-block token
+                ids keyed by the rows' privilege tags. Values still land in the
+                policy layout.
         """
         spa, dba = self._packing_args("logprob_mb_tokens")
         value_meta = self._isolated_meta(
@@ -119,6 +155,9 @@ class TQValue(TQDriverMixin, Value):
             # multimodal columns in would fetch and broadcast pixels this
             # forward discards.
             include_multimodal=False,
+        )
+        value_meta, privilege_kwargs = self._privileged_dispatch(
+            value_meta, privilege_prefixes
         )
         with timer.time("get_values/shard_meta") if timer else nullcontext():
             metas, _ = shard_meta_for_dp(
@@ -137,6 +176,7 @@ class TQValue(TQDriverMixin, Value):
                 output_is_replicated=_REPLICATED_AXES,
                 common_kwargs={
                     "micro_batch_size": micro_batch_size,
+                    **privilege_kwargs,
                     **trace_context_kwargs(),
                 },
             )
@@ -151,6 +191,7 @@ class TQValue(TQDriverMixin, Value):
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
         timer: Optional[Timer] = None,
+        privilege_prefixes: Optional[dict[str, torch.Tensor]] = None,
     ) -> dict[str, Any]:
         """1-hop counterpart to train. One call is one optimizer step.
 
@@ -161,6 +202,7 @@ class TQValue(TQDriverMixin, Value):
             gbs: Global batch size; defaults to the config's train_global_batch_size.
             mbs: Micro batch size; defaults to the config's train_micro_batch_size.
             timer: Optional timer for nested value_training measurements.
+            privilege_prefixes: SWE privileged critic only; see get_values_from_meta.
 
         Returns:
             Aggregated training-step output dict.
@@ -175,6 +217,9 @@ class TQValue(TQDriverMixin, Value):
             task_name="value_train",
             # See get_values: token-only inputs, so no multimodal union.
             include_multimodal=False,
+        )
+        train_meta, privilege_kwargs = self._privileged_dispatch(
+            train_meta, privilege_prefixes
         )
         with timer.time("value_training/shard_meta") if timer else nullcontext():
             dp_metas, _ = shard_meta_for_dp(
@@ -201,6 +246,7 @@ class TQValue(TQDriverMixin, Value):
                     "eval_mode": eval_mode,
                     "gbs": batch_size,
                     "mbs": micro_batch_size,
+                    **privilege_kwargs,
                     **trace_context_kwargs(),
                 },
             )

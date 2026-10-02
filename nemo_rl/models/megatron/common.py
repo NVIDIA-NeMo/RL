@@ -319,3 +319,44 @@ def get_mtp_metrics(loss_scale: float = 1.0) -> dict[str, Any]:
 
         MTPLossLoggingHelper.clean_metrics_in_tracker()
     return metrics
+
+
+def clear_transient_megatron_caches(model: torch.nn.Module) -> None:
+    """Release GPU tensors that outlive a step and pin memory across an offload.
+
+    - RotaryEmbedding's ``@lru_cache(maxsize=32)`` keeps one GPU sin/cos tensor per
+      unique (max_seq_len, offset, packed_seq); with variable-length training and
+      logprob passes it fills quickly and anchors large CUDA segments.
+    - MoE token dispatchers (plain Python objects reached via ``token_dispatcher``)
+      keep persistent routing tensors. Under activation recompute the dispatcher's
+      ``probs`` closes a reference cycle through the checkpoint context
+      (``_CheckpointFunctionBackward -> ctx.run_function=mlp -> token_dispatcher.probs
+      -> probs.grad_fn``), which also keeps that context's saved activations alive.
+      Nulling the attributes frees both.
+    """
+    try:
+        from megatron.core.models.common.embeddings.rotary_pos_embedding import (
+            RotaryEmbedding,
+        )
+
+        RotaryEmbedding.forward.cache_clear()
+    except Exception:
+        pass
+    try:
+        for module in model.modules():
+            if not hasattr(module, "token_dispatcher"):
+                continue
+            dispatcher = module.token_dispatcher
+            if dispatcher is None:
+                continue
+            for attr in (
+                "probs",  # AllToAll + AllGather
+                "routing_map",  # AllToAll
+                "reversed_local_input_permutation_mapping",  # AllToAll
+                "local_probs",  # AllGather
+                "local_map",  # AllGather
+            ):
+                if isinstance(getattr(dispatcher, attr, None), torch.Tensor):
+                    setattr(dispatcher, attr, None)
+    except Exception:
+        pass

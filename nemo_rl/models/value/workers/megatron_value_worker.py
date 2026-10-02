@@ -58,6 +58,7 @@ from nemo_rl.distributed.model_utils import allgather_cp_sharded_tensor
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.megatron.common import (
     broadcast_tensor,
+    clear_transient_megatron_caches,
     get_aux_loss_track_names,
     get_moe_metrics,
 )
@@ -84,6 +85,10 @@ from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.models.value.config import ValueConfig
+from nemo_rl.models.value.grad_norm_groups import (
+    hybrid_pattern_of,
+    pre_clip_grad_norms_by_group,
+)
 from nemo_rl.models.value.interfaces import ValueOutputSpec
 from nemo_rl.telemetry.setup import (
     init_telemetry_worker,
@@ -590,7 +595,14 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
                     torch.cuda.empty_cache()
 
                 # Update parameters
+                grad_norm_groups: dict[str, torch.Tensor] = {}
                 if not eval_mode:
+                    # Before step(), which clips: critic/gnorm/* (legacy parity).
+                    grad_norm_groups = pre_clip_grad_norms_by_group(
+                        self.model,
+                        hybrid_pattern_of(self.model),
+                        get_pg_collection(self.model).mp,
+                    )
                     update_successful, grad_norm, num_zeros_in_grad = (
                         self.optimizer.step()
                     )
@@ -678,6 +690,7 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
             "grad_norm": torch.tensor([grad_norm])
             if grad_norm is not None
             else torch.tensor([0.0]),
+            "grad_norm_groups": grad_norm_groups,
         }
 
         # Collect MoE aux metrics if applicable
@@ -1007,10 +1020,14 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
 
     def finish_training(self) -> None:
         """Offload model, gradients, and optimizer to CPU after training."""
+        # MambaMixer.eval() recomputes and caches a state transition decay,
+        # -torch.exp(self.A_log.float()), on the GPU. Switch modes before
+        # offloading the parameters (including A_log), as the policy worker does;
+        # after the offload that kernel reads released storage.
+        self.model.eval()
         self.model = self.move_model(
             self.model, "cpu", move_params=True, move_grads=True
         )
-        self.model.eval()
 
         if (
             hasattr(self, "optimizer")
@@ -1018,6 +1035,12 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
             and not self.optimizer_cpu_offload
         ):
             self.move_optimizer("cpu")
+
+        # The critic trains with activation recompute on variable-length
+        # sequences, so the RoPE cache and MoE dispatcher cycles described in
+        # clear_transient_megatron_caches would otherwise stay resident here.
+        if self.cfg["megatron_cfg"].get("clear_memory_caches_before_refit", False):
+            clear_transient_megatron_caches(self.model)
 
         gc.collect()
         torch.cuda.empty_cache()

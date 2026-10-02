@@ -46,7 +46,6 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     TQReplayBuffer,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
-    sampler_supports_buffer_checkpoint,
     sampler_supports_training_claims,
 )
 from nemo_rl.algorithms.grpo import (
@@ -67,6 +66,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     algo_config,
     is_ppo_run,
+    replay_checkpoint_enabled,
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
@@ -75,6 +75,10 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     bootstrap_compatibility_identity,
     resolve_latest_snapshot,
     validate_bootstrap_anchor,
+)
+from nemo_rl.algorithms.swe_privileged_critic import SwePrivilegePrefixStore
+from nemo_rl.algorithms.swe_privileged_critic import (
+    resolve_config as resolve_swe_privileged_critic_config,
 )
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
@@ -187,6 +191,8 @@ class SingleControllerActorArgs:
     # the MSE loss it trains under.
     value_handle: Optional[TQValue] = None
     value_loss_fn: Optional[LossFunction] = None
+    # SWE privileged critic (value.swe_privileged_critic.enabled); None otherwise.
+    privilege_store: Optional[SwePrivilegePrefixStore] = None
 
 
 def _maybe_restore_native_data_plane_checkpoint(
@@ -1116,9 +1122,7 @@ def setup_single_controller(
                 "checkpointing.save_data_plane=true, and "
                 "data_plane.backend='mooncake_cpu'."
             )
-        sampler_supports_replay_recovery = sampler_supports_buffer_checkpoint(
-            master_config.async_rl.sampler
-        )
+        sampler_supports_replay_recovery = replay_checkpoint_enabled(master_config)
         if sampler_supports_replay_recovery and not master_config.checkpointing.get(
             "save_data_plane"
         ):
@@ -1232,10 +1236,10 @@ def setup_single_controller(
             raise ValueError(
                 "rollout checkpointing currently requires token_capture.enabled=true"
             )
-        if not sampler_supports_buffer_checkpoint(master_config.async_rl.sampler):
+        if not replay_checkpoint_enabled(master_config):
             raise ValueError(
                 "rollout checkpointing requires a sampler that supports "
-                "replay-buffer recovery"
+                "replay-buffer recovery and async_rl.checkpoint_replay_buffer=true"
             )
         if not sampler_supports_training_claims(master_config.async_rl.sampler):
             raise ValueError(
@@ -2042,6 +2046,16 @@ def setup_single_controller(
     setup_timing_metrics.other_setup_time_s = total_setup_time - worker_setup_time
     print_setup_timing_summary(setup_timing_metrics)
 
+    # SWE privileged critic: the controller caches one reference-block prefix
+    # per instance and stamps it onto rows at commit.
+    # None on a GRPO run, which validation already kept free of a value block.
+    privilege_cfg = resolve_swe_privileged_critic_config(master_config.value)
+    privilege_store = (
+        SwePrivilegePrefixStore(tokenizer, privilege_cfg)
+        if privilege_cfg is not None
+        else None
+    )
+
     # Build actor args and return
     actor_args = SingleControllerActorArgs(
         gen_handle=generation,
@@ -2071,5 +2085,6 @@ def setup_single_controller(
         # PPO extras
         value_handle=value,
         value_loss_fn=value_loss_fn,
+        privilege_store=privilege_store,
     )
     return actor_args, setup_timing_metrics

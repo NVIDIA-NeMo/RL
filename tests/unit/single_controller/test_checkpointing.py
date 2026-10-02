@@ -2327,6 +2327,7 @@ def _ppo_save_actor(tmp_path: Path, calls: list[str]):
     actor._async_cfg = SimpleNamespace(
         sampler=SimpleNamespace(name="in_order"),
         max_buffered_rollouts=4,
+        checkpoint_replay_buffer=True,
     )
     actor._sampler = _FakeSampler()
     actor._master_config = SimpleNamespace(
@@ -2478,6 +2479,50 @@ class TestMetricName:
 
         with pytest.raises(ValueError, match="is not usable on the SingleController"):
             validate_single_controller_config(mc)
+
+
+class _DebugWriteOrderProbe:
+    """Stands in for LegacyPPODiagnostics: records the rollout manager's stamped
+    version at the moment the rollout-debug write (an event-loop yield) runs."""
+
+    post_update_enabled = False
+
+    def __init__(self, rollout_manager: _FakeRolloutManager) -> None:
+        self._rollout_manager = rollout_manager
+        self.seen: list[tuple[int, Optional[int]]] = []
+
+    def step_metrics(self, **_kwargs: Any) -> dict[str, float]:
+        return {}
+
+    def on_advantage_stage(self, **_kwargs: Any) -> None:
+        return None
+
+    def rollout_dump_due(self, _step: int) -> bool:
+        return False
+
+    def write_rollout_debug(
+        self, _logger: Any, *, step: int, trainer_weight_version: int
+    ) -> None:
+        versions = self._rollout_manager.weight_versions
+        self.seen.append((trainer_weight_version, versions[-1] if versions else None))
+
+
+def test_rollout_debug_write_runs_after_the_new_version_is_stamped(tmp_path):
+    # The write yields the event loop. Run between the version bump and the refit,
+    # it let the rollout pump launch the next batch on the old weights with the
+    # old version tag: trajectory age 2 where legacy async PPO had 1.
+    mc = _actor_master_config(tmp_path, max_num_steps=3, save_period=3)
+    rollout_manager = _FakeRolloutManager()
+    probe = _DebugWriteOrderProbe(rollout_manager)
+
+    def _install_probe(actor: Any) -> None:
+        actor._legacy_diag = probe
+
+    _run_train_pump(
+        mc, _make_actor_args(rollout_manager=rollout_manager), seed=_install_probe
+    )
+
+    assert probe.seen == [(1, 1), (2, 2), (3, 3)]
 
 
 # ── setup resume-path wiring ─────────────────────────────────────────────────

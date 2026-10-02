@@ -41,6 +41,12 @@ RETAINED_TASK_INDICES_KEY = "retained_task_indices"
 TRAINED_TASK_INDICES_KEY = "trained_task_indices"
 
 
+# Completion.env_extras key carrying a multi-trace completion's session identity
+# (trace_in_rollout_idx, session_id, parent_session_id, segment_index, ...).
+# Absent on single-trace completions. See NemoGym._postprocess_session_traces.
+TRACE_METADATA_KEY = "trace_metadata"
+
+
 @dataclass
 class Completion:
     """A single generated completion for one prompt."""

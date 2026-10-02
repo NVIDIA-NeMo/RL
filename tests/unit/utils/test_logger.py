@@ -544,6 +544,45 @@ class TestWandbLogger:
         assert all("step" not in kwargs for _, kwargs in mock_run.log.call_args_list)
 
     @patch("nemo_rl.utils.logger.wandb")
+    def test_trainer_step_as_wandb_step(self, mock_wandb):
+        """Opt-in legacy axis: W&B's step is the trainer step, events do not advance it."""
+        logger = WandbLogger({"project": "p", "trainer_step_as_wandb_step": True})
+        assert "trainer_step_as_wandb_step" not in mock_wandb.init.call_args.kwargs
+
+        logger.log_metrics({"loss": 1.0}, step=1, prefix="train")
+        logger.log_metrics(
+            {TELEMETRY_WALL_TIME_METRIC: 30.0, "tokens_per_second": 10.0},
+            step=1,
+            prefix="rollout/throughput",
+            step_metric=TELEMETRY_WALL_TIME_METRIC,
+        )
+        logger.log_metrics(
+            {"seconds": 5.0}, step=1, prefix="timing", step_finished=True
+        )
+        logger.log_metrics({"loss": 0.5}, step=2, prefix="train", step_finished=True)
+
+        mock_run = mock_wandb.init.return_value
+        assert mock_run.log.call_args_list == [
+            call(
+                {
+                    TELEMETRY_WALL_TIME_METRIC: 30.0,
+                    "rollout/throughput/tokens_per_second": 10.0,
+                },
+                commit=False,
+            ),
+            call(
+                {
+                    "train/loss": 1.0,
+                    "timing/seconds": 5.0,
+                    WANDB_CALLER_STEP_METRIC: 1,
+                },
+                step=1,
+                commit=True,
+            ),
+            call({"train/loss": 0.5, WANDB_CALLER_STEP_METRIC: 2}, step=2, commit=True),
+        ]
+
+    @patch("nemo_rl.utils.logger.wandb")
     def test_define_metric(self, mock_wandb):
         """Test defining a metric with a custom step metric."""
         cfg = {}

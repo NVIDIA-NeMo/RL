@@ -514,11 +514,12 @@ def _reserve_controller() -> Any:
     controller._sampler_stamps_target_steps = True
     controller._rollout_recovery_enabled = True
     controller._async_cfg = SimpleNamespace(
+        checkpoint_replay_buffer=True,
         rollout_failure=SimpleNamespace(
             on_dropped_prompt="replace",
             replacement_reserve_prompts=2,
             max_replacement_attempts=1,
-        )
+        ),
     )
     controller._algo_cfg = SimpleNamespace(num_prompts_per_step=2)
     controller._rollout_manager = _LedgerFacade()
@@ -942,6 +943,7 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(tmp_path) -> None
         controller._async_cfg = SimpleNamespace(
             max_buffered_rollouts=4,
             max_inflight_prompts=2,
+            checkpoint_replay_buffer=True,
         )
         controller._buffer_capacity = asyncio.Semaphore(4)
         controller._trainer_version = 7
@@ -1061,6 +1063,7 @@ def test_recovery_readmits_one_reserved_batch_only_once(tmp_path) -> None:
         controller._async_cfg = SimpleNamespace(
             max_buffered_rollouts=4,
             max_inflight_prompts=2,
+            checkpoint_replay_buffer=True,
         )
         controller._buffer_capacity = asyncio.Semaphore(4)
         controller._trainer_version = 7

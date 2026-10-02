@@ -1992,3 +1992,35 @@ def test_student_teacher_kernels_normalize_bf16_logits_in_fp32(
 
     expected_kl, _, _ = _student_teacher_reference(student, teacher)
     torch.testing.assert_close(reverse_kl, expected_kl, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("leaf", [False, True])
+def test_chunked_logprob_backward_fp32_grad_reuses_logits_storage(monkeypatch, leaf):
+    """fp32 activation logits take their grad in place; leaves are never overwritten.
+
+    TP=1, so the all-reduces are identities and run without a process group.
+    """
+    from nemo_rl.distributed.model_utils import ChunkedDistributedLogprob
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda t, **_kw: t)
+    monkeypatch.setattr(
+        torch.distributed.nn.functional, "all_reduce", lambda t, **_kw: t
+    )
+    torch.manual_seed(0)
+    batch, seq, vocab = 2, 7, 11
+    base = torch.randn(batch, seq, vocab, requires_grad=True)
+    target = torch.randint(0, vocab, (batch, seq))
+
+    expected = torch.log_softmax(base, dim=-1).gather(-1, target.unsqueeze(-1))
+    expected.sum().backward()
+    expected_grad = base.grad.clone()
+    base.grad = None
+
+    logits = base if leaf else base * 1.0  # non-leaf fp32 activation
+    before = logits.detach().clone()
+    logprobs = ChunkedDistributedLogprob.apply(logits, target, 0, vocab, 3, None, False)
+    logprobs.sum().backward()
+
+    torch.testing.assert_close(base.grad, expected_grad)
+    if leaf:
+        torch.testing.assert_close(logits.detach(), before)

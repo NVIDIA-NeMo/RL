@@ -68,6 +68,12 @@ class ValueConfig(TypedDict):
     make_sequence_length_divisible_by: int
     max_total_sequence_length: int
 
+    # SWE privileged critic: prefix the critic's input with a reference block
+    # (accepted fix + grading tests). Schema: SwePrivilegedCriticConfig in
+    # nemo_rl.algorithms.swe_privileged_critic. max_total_sequence_length and the
+    # packing token budgets must then cover policy length + the block budget.
+    swe_privileged_critic: NotRequired[dict[str, Any]]
+
     # Gradient clipping
     max_grad_norm: NotRequired[float | int | None]
 

@@ -48,7 +48,6 @@ from nemo_rl.models.generation.vllm.config import (
     parse_nvfp4_pertoken_rollout,
     resolve_vllm_video_config,
     validate_nvfp4_pertoken_model,
-    vllm_nemotron_h_fp32_lm_head_enabled,
 )
 from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
 from nemo_rl.models.generation.vllm.utils import (
@@ -501,7 +500,7 @@ class BaseVllmGenerationWorker:
         _apply_vllm_patches(
             self.py_executable,
             extra_env_vars=extra_env_vars,
-            nemotron_h_fp32_lm_head=vllm_nemotron_h_fp32_lm_head_enabled(vllm_cfg),
+            nemotron_h_fp32_lm_head=vllm_cfg.get("fp32_lm_head", False),
             require_moe_routed_experts_capture=bool(
                 (self.cfg.get("vllm_kwargs") or {}).get(
                     "enable_return_routed_experts", False

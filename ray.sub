@@ -26,6 +26,10 @@ set -eoux pipefail
 
 # Record job-start epoch so Python can measure pre-Python overhead
 export NRL_JOB_START_EPOCH=$(date +%s.%N)
+# Preserve the allocation ID for child processes before the generated Ray
+# launcher removes SLURM_* variables. The SWE gym's runtime_scratch_dir
+# (/raid/scratch/temp_swe_$NRL_SLURM_JOB_ID) resolves it via OmegaConf env interpolation.
+export NRL_SLURM_JOB_ID="${SLURM_JOB_ID}"
 
 # Log a timestamped, seconds-since-job-start marker at each phase boundary.
 log_phase() {

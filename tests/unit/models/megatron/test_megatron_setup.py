@@ -1254,6 +1254,47 @@ class TestApplyPrecisionConfig:
         with pytest.raises(ValueError, match="logit_dtype"):
             _apply_precision_config(model_cfg, config, torch.bfloat16)
 
+    def test_tf32_lm_head_leaves_logit_dtype_alone(self):
+        """ "tf32" upcasts in the worker (apply_tf32_lm_head), not via logit_dtype."""
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        model_cfg = SimpleNamespace(bf16=False, fp16=False, logit_dtype=None)
+        config = {
+            "megatron_cfg": {"pipeline_dtype": "bfloat16", "fp32_lm_head": "tf32"}
+        }
+
+        _apply_precision_config(model_cfg, config, torch.bfloat16)
+
+        assert model_cfg.logit_dtype is None
+
+    def test_apply_tf32_lm_head_upcasts_under_tf32(self):
+        from nemo_rl.models.megatron.setup import apply_tf32_lm_head
+
+        seen = []
+
+        class _OutputLayer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.ones(4, 2, dtype=torch.bfloat16))
+
+            def forward(self, input_, weight=None):
+                seen.append(
+                    (input_.dtype, weight.dtype, torch.backends.cuda.matmul.allow_tf32)
+                )
+                return input_ @ weight.t()
+
+        model = SimpleNamespace(module=SimpleNamespace(output_layer=_OutputLayer()))
+        torch.backends.cuda.matmul.allow_tf32 = False
+
+        apply_tf32_lm_head(model)
+        logits = model.module.output_layer.forward(
+            torch.ones(3, 2, dtype=torch.bfloat16)
+        )
+
+        assert seen == [(torch.float32, torch.float32, True)]
+        assert logits.dtype is torch.float32
+        assert torch.backends.cuda.matmul.allow_tf32 is False
+
     @patch("nemo_rl.models.megatron.setup.load_quantization_recipe")
     def test_loads_te_precision_config_when_configured(
         self, mock_load_recipe, tmp_path
@@ -5742,3 +5783,28 @@ class TestPeftWarmStart:
         # The hook receives the resolved donor iteration directory.
         assert mock_hook.call_args.args[2] == str(donor_iter_dir)
         assert mock_hook.call_args.args[0].peft.share_expert_adapters is False
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize("repeated_in_cfg", [False, True])
+def test_mtp_num_layers_zero_strips_repeated_layer_mtp(repeated_in_cfg):
+    """mtp_num_layers=0 must build no MTP module, even for repeated-layer checkpoints."""
+    from nemo_rl.models.megatron.setup import _apply_mtp_config
+
+    model_cfg = SimpleNamespace(
+        mtp_num_layers=None,
+        mtp_use_repeated_layer=True,
+        mtp_hybrid_override_pattern="*E",
+        hybrid_layer_pattern="MEMEM*E/*E",
+        hybrid_override_pattern=None,
+    )
+    megatron_cfg = {"mtp_num_layers": 0}
+    if repeated_in_cfg:
+        megatron_cfg["mtp_use_repeated_layer"] = True
+
+    _apply_mtp_config(model_cfg, {"megatron_cfg": megatron_cfg})
+
+    assert model_cfg.mtp_num_layers == 0
+    assert model_cfg.mtp_use_repeated_layer is False
+    assert model_cfg.mtp_hybrid_override_pattern is None
+    assert model_cfg.hybrid_layer_pattern == "MEMEM*E"

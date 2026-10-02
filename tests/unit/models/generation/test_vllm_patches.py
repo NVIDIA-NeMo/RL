@@ -705,6 +705,36 @@ def test_nemotron_h_fp32_lm_head_patch_is_env_gated(
     ast.parse(source)
 
 
+@pytest.mark.parametrize("env_value", ["1", "tf32"])
+def test_nemotron_h_fp32_lm_head_patch_tf32_mode(
+    patched_nemotron_h_source, monkeypatch, env_value
+):
+    """ "tf32" enables the fp32 head and toggles TF32 only around its GEMM."""
+    monkeypatch.setenv(VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR, env_value)
+    namespace = {}
+    source = patched_nemotron_h_source.read_text()
+    exec(compile(source, str(patched_nemotron_h_source), "exec"), namespace)
+    config = types.SimpleNamespace(vocab_size=16, hidden_size=8)
+    model = namespace["NemotronHForCausalLM"](config, "model")
+    seen_tf32 = []
+    real_matmul = torch.matmul
+
+    def _recording_matmul(a, b):
+        seen_tf32.append(torch.backends.cuda.matmul.allow_tf32)
+        return real_matmul(a, b)
+
+    monkeypatch.setattr(torch, "matmul", _recording_matmul)
+    torch.backends.cuda.matmul.allow_tf32 = False
+
+    logits = model.compute_logits(torch.ones(2, 8, dtype=torch.bfloat16))
+
+    assert model._nrl_fp32_lm_head is True
+    assert model._nrl_fp32_lm_head_tf32 is (env_value == "tf32")
+    assert logits.dtype is torch.float32
+    assert seen_tf32 == [env_value == "tf32"]
+    assert torch.backends.cuda.matmul.allow_tf32 is False
+
+
 def test_nemotron_h_fp32_lm_head_patch_is_idempotent(
     patched_nemotron_h_source, monkeypatch
 ):
@@ -844,6 +874,19 @@ def test_apply_vllm_patches_gates_nemotron_h_fp32_lm_head(
         assert captured_extra_env_vars == [["USER_VAR"]]
 
 
+def test_apply_vllm_patches_exports_tf32_mode(monkeypatch):
+    _install_fake_vllm_modules(monkeypatch)
+    monkeypatch.delenv(patches.VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR, raising=False)
+    captured_extra_env_vars = []
+    _stub_non_fp32_vllm_patches(monkeypatch, captured_extra_env_vars)
+    monkeypatch.setattr(patches, "_patch_vllm_nemotron_h_fp32_lm_head", lambda _l: True)
+
+    patches._apply_vllm_patches("py", nemotron_h_fp32_lm_head="tf32")
+
+    assert os.environ[patches.VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR] == "tf32"
+    assert captured_extra_env_vars == [[patches.VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR]]
+
+
 def test_apply_vllm_patches_ignores_ambient_fp32_lm_head_env_toggle(monkeypatch):
     _install_fake_vllm_modules(monkeypatch)
     monkeypatch.setenv(patches.VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR, "1")
@@ -882,6 +925,7 @@ def test_apply_vllm_patches_raises_when_nemotron_h_fp32_lm_head_patch_fails(
     ("vllm_cfg_overrides", "expected_nemotron_h_fp32_lm_head"),
     [
         ({"env_vars": {"USER_VAR": "value"}, "fp32_lm_head": True}, True),
+        ({"env_vars": {"USER_VAR": "value"}, "fp32_lm_head": "tf32"}, "tf32"),
         (
             {
                 "env_vars": {

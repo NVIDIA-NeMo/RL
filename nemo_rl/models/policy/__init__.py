@@ -535,8 +535,10 @@ class MegatronConfig(TypedDict):
     # generation.vllm_cfg.fp32_lm_head flag for vLLM generation: applying this
     # to only one engine makes the generation/training logprob mismatch worse.
     # No effect when use_fused_linear_logprobs is set, which bypasses the
-    # output layer's logits path.
-    fp32_lm_head: NotRequired[bool]
+    # output layer's logits path. "tf32" instead upcasts the head's input and
+    # weight to fp32 and runs the GEMM with TF32 tensor cores (pair with
+    # generation.vllm_cfg.fp32_lm_head="tf32").
+    fp32_lm_head: NotRequired[bool | Literal["tf32"]]
     # When mtp_num_layers=0, Multi-Token Prediction is disabled.
     mtp_num_layers: NotRequired[int]
     # MTP loss weight added to the main next-token loss (0.0 disables the MTP loss contribution).

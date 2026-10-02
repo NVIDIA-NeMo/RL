@@ -1,0 +1,625 @@
+# =============================================================================
+# SWE PPO on the SingleController (NeMo-RL v2) path -- nano, opencode + subagents,
+# SWE privileged critic. Ported from the legacy async-PPO recipe
+# examples/configs/ppo_nano_v3_5_swe_opencode_hsg.yaml with:
+#   - async_rl: ready_first sampler, lag 1; buffered groups are dropped on resume
+#     (checkpoint_replay_buffer=false, so no data-plane snapshot is saved).
+#   - value.swe_privileged_critic: reference block (fix + tests) prefixed to every
+#     critic row; value sequence budget = policy + 32768 + 256 slack.
+#   - fp32_lm_head: "tf32" on both engines (fp32-upcast head GEMM on TF32 cores).
+#   - async Megatron checkpointing off (known PPO bug), Gym thinking restored.
+# Multi-trace: every opencode session (main + subagents) is trained, as in legacy.
+# Cluster-specific values (model, container images, data) are ??? and must be
+# supplied as overrides.
+# =============================================================================
+cluster:
+  gpus_per_node: 4
+  num_nodes: 128
+  segment_size: 16
+checkpointing:
+  enabled: true
+  checkpoint_dir: results/ppo_ultra_e2e
+  metric_name: null
+  higher_is_better: true
+  keep_top_k: 1000000
+  save_period: 3
+  ft_keep_latest_k: 1
+  ft_save_period: 1
+  save_optimizer: true
+  checkpoint_must_save_by: 00:03:30:00
+  save_data_plane: false
+ppo:
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 32
+  max_rollout_turns: 1
+  # SC clamps max_num_steps to max_num_epochs x batches; legacy never enforced epochs.
+  max_num_epochs: 100000
+  max_num_steps: 1000000
+  ppo_epochs: 1
+  critic_ppo_epochs: null
+  # Legacy async-PPO diagnostics (single_controller_utils/legacy_diagnostics.py):
+  # rollout_debug_step*.jsonl, critic EV/ece/bias/residual/adv_raw metrics, the
+  # extra post-update critic forward, and the packed ppo_rollout_dump_step*.pt.
+  log_rollout_debug: true
+  log_critic_diagnostics: true
+  log_post_update_critic_metrics: true
+  log_rollout_dump: true
+  rollout_dump_period: 5
+  # ready_first requires no critic warmup.
+  policy_training_start_step: 0
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  overlong_filtering: false
+  max_val_samples: 256
+  val_batch_size: 256
+  seed: 42
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 10
+  batch_multiplier: 1
+  skip_reference_policy_logprobs_calculation: true
+  seq_logprob_error_threshold: 2
+  # Legacy: multi-trace DP pad rows all copy the step's first row (they stay in
+  # all_rows whitening). `cyclic` is upstream SC.
+  multi_trace_pad_source: row0
+  adv_estimator:
+    name: gae
+    gae_lambda: 1.0
+    gae_gamma: 1
+    normalize_advantages: true
+    # Legacy: whiten over every row's tokens (masked + pad rows included).
+    normalize_over: all_rows
+    gae_lambda_value: 1.0
+    gae_lambda_policy: 1
+    length_adaptive_alpha: null
+  reward_shaping:
+    enabled: false
+    overlong_buffer_length: 128
+    overlong_buffer_penalty: 1
+    max_response_length: ${policy.max_total_sequence_length}
+    stop_properly_penalty_coef: null
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
+  async_ppo: null
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  reference_policy_kl_type: k3
+  kl_input_clamp_value: null
+  kl_output_clamp_value: null
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  ratio_clip_c: 3
+  use_on_policy_kl_approximation: true
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_ratio: 5
+  truncated_importance_sampling_ratio_min: 0.2
+  truncated_importance_sampling_type: tis
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  force_on_policy_ratio: false
+  use_kl_in_reward: false
+value_loss_fn:
+  scale: 1.0
+  cliprange: 0.5
+policy:
+  model_name: ???
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs: null
+  hf_config_overrides: {}
+  train_global_batch_size: 512
+  train_micro_batch_size: 1
+  generation_batch_size: 64
+  logprob_batch_size: 1
+  max_total_sequence_length: 131072
+  precision: bfloat16
+  logprob_chunk_size: 2048
+  offload_optimizer_for_logprob: true
+  dtensor_cfg:
+    _v2: true
+    enabled: false
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 2
+    activation_checkpointing: true
+    tensor_model_parallel_size: 8
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 32
+    pipeline_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    context_parallel_size: 8
+    pipeline_dtype: ${policy.precision}
+    sequence_parallel: true
+    freeze_moe_router: true
+    moe_router_dtype: fp32
+    moe_router_load_balancing_type: none
+    moe_router_bias_update_rate: 0.001
+    moe_router_enable_expert_bias: true
+    moe_permute_fusion: true
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: alltoall
+    moe_flex_dispatcher_backend: hybridep
+    moe_hybridep_num_sms: 32
+    moe_aux_loss_coeff: 0.0
+    moe_shared_expert_overlap: false
+    use_gloo_process_groups: false
+    apply_rope_fusion: true
+    use_fused_weighted_squared_relu: true
+    bias_activation_fusion: false
+    gradient_accumulation_fusion: false
+    defer_fp32_logits: true
+    track_moe_metrics: true
+    moe_per_layer_logging: true
+    do_not_average_loss: true
+    cp_normalize: true
+    calculate_per_token_loss: true
+    scale_loss_by_dp_cp_size: false
+    mtp_loss_scaling_factor: 0.3
+    mtp_use_repeated_layer: true
+    mtp_num_layers: 5
+    mtp_detach_heads: true
+    optimizer:
+      optimizer: adam
+      lr: 3.0e-06
+      min_lr: 3.0e-06
+      weight_decay: 0.0
+      bf16: true
+      fp16: false
+      params_dtype: float32
+      adam_beta1: 0.9
+      adam_beta2: 0.95
+      adam_eps: 1e-10
+      sgd_momentum: 0.9
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+      clip_grad: ${policy.max_grad_norm}
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: constant
+      lr_decay_style: constant
+      lr_decay_iters: null
+      lr_warmup_iters: 10
+      lr_warmup_init: 3e-7
+      override_opt_param_scheduler: true
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+      average_in_collective: false
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: optim_grads_params
+    fp8_cfg:
+      enabled: false
+      fp8: e4m3
+      fp8_recipe: mxfp8
+      fp8_param: false
+    first_last_layers_bf16: true
+    num_layers_at_start_in_bf16: 1
+    num_layers_at_end_in_bf16: 1
+    checkpoint:
+      async_save: false
+      ckpt_assume_constant_structure: false
+    env_vars:
+      NCCL_NVLS_ENABLE: '0'
+      # The step-2 policy backward allocates a 12 GiB fp32 logits grad; with the
+      # default allocator ~14 GiB sat reserved-but-unused.
+      # Refit is an NCCL collective, so the expandable-segment IPC caveat is moot.
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    fp32_lm_head: tf32
+    clear_memory_caches_before_refit: true
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    sequence_length_round: 64
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: modified_first_fit_decreasing
+    sequence_length_round: 64
+    fuse_loss: true
+  make_sequence_length_divisible_by: ${mul:${mul:${policy.megatron_cfg.tensor_model_parallel_size}, ${policy.megatron_cfg.context_parallel_size}},
+    2}
+  max_grad_norm: 1.0
+  optimizer: null
+  scheduler: null
+  generation:
+    port_range_low: 11001
+    port_range_high: 15000
+    backend: vllm
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      async_engine: true
+      precision: ${policy.precision}
+      kv_cache_dtype: auto
+      tensor_parallel_size: 8
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.8
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: false
+      use_deep_gemm: false
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 0.5
+      expose_http_server: true
+      skip_tokenizer_init: false
+      reasoning_parser_plugin: nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: qwen3_coder
+        reasoning_parser: nano_v3
+      fp32_lm_head: tf32
+    vllm_kwargs:
+      attention_backend: FLASH_ATTN
+      moe_backend: triton
+      mamba_ssm_cache_dtype: float32
+      disable_custom_all_reduce: true
+      compilation_config:
+        cudagraph_mode: PIECEWISE
+        cudagraph_capture_sizes:
+        - 1
+        - 2
+        - 4
+        - 8
+        - 16
+        - 32
+        - 64
+        pass_config:
+          fuse_allreduce_rms: false
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 64
+    val_temperature: ${.temperature}
+    val_top_p: ${.top_p}
+    val_top_k: ${.top_k}
+  draft:
+    enabled: false
+    model_name: null
+    loss_weight: 0.1
+    num_layers: null
+    aux_layer_indices: null
+value:
+  model_name: ${policy.model_name}
+  tokenizer:
+    name: ${value.model_name}
+    chat_template_kwargs: null
+  hf_config_overrides: {}
+  train_global_batch_size: ${policy.train_global_batch_size}
+  train_micro_batch_size: ${policy.train_micro_batch_size}
+  logprob_batch_size: ${policy.logprob_batch_size}
+  max_total_sequence_length: ${add:${policy.max_total_sequence_length}, 33024}
+  precision: bfloat16
+  swe_privileged_critic:
+    enabled: true
+    max_total_tokens: 32768
+  reward_model_cfg:
+    enabled: false
+    reward_model_type: regression
+  dtensor_cfg:
+    _v2: true
+    enabled: false
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 2
+    activation_checkpointing: true
+    tensor_model_parallel_size: 8
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 32
+    pipeline_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    context_parallel_size: 8
+    pipeline_dtype: ${value.precision}
+    sequence_parallel: true
+    freeze_moe_router: true
+    moe_router_dtype: fp32
+    moe_router_load_balancing_type: none
+    moe_router_bias_update_rate: 0.001
+    moe_router_enable_expert_bias: true
+    moe_permute_fusion: true
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: alltoall
+    moe_flex_dispatcher_backend: hybridep
+    moe_hybridep_num_sms: 32
+    moe_aux_loss_coeff: 0.0
+    moe_shared_expert_overlap: false
+    use_gloo_process_groups: false
+    apply_rope_fusion: true
+    use_fused_weighted_squared_relu: true
+    bias_activation_fusion: false
+    gradient_accumulation_fusion: false
+    defer_fp32_logits: true
+    track_moe_metrics: true
+    moe_per_layer_logging: true
+    do_not_average_loss: true
+    cp_normalize: true
+    calculate_per_token_loss: true
+    scale_loss_by_dp_cp_size: false
+    mtp_loss_scaling_factor: 0.0
+    mtp_num_layers: 0
+    mtp_detach_heads: true
+    optimizer:
+      optimizer: adam
+      lr: 6.0e-06
+      min_lr: 6.0e-06
+      weight_decay: 0.0
+      bf16: true
+      fp16: false
+      params_dtype: float32
+      adam_beta1: 0.9
+      adam_beta2: 0.95
+      adam_eps: 1e-15
+      sgd_momentum: 0.9
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+      clip_grad: ${value.max_grad_norm}
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+    scheduler:
+      start_weight_decay: ${value.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${value.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: constant
+      lr_decay_style: constant
+      lr_decay_iters: null
+      lr_warmup_iters: 10
+      lr_warmup_init: 6.0e-07
+      override_opt_param_scheduler: true
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+      average_in_collective: false
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: optim_grads_params
+    fp8_cfg:
+      enabled: false
+      fp8: e4m3
+      fp8_recipe: mxfp8
+      fp8_param: false
+    first_last_layers_bf16: true
+    num_layers_at_start_in_bf16: 1
+    num_layers_at_end_in_bf16: 1
+    checkpoint:
+      async_save: false
+      ckpt_assume_constant_structure: false
+    env_vars:
+      NCCL_NVLS_ENABLE: '0'
+      # The step-2 policy backward allocates a 12 GiB fp32 logits grad; with the
+      # default allocator ~14 GiB sat reserved-but-unused.
+      # Refit is an NCCL collective, so the expandable-segment IPC caveat is moot.
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    clear_memory_caches_before_refit: true
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: ${mul:${value.max_total_sequence_length}, ${value.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${value.max_total_sequence_length}, ${value.train_micro_batch_size}}
+    sequence_length_round: 64
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: ${value.max_total_sequence_length}
+    logprob_mb_tokens: ${value.max_total_sequence_length}
+    algorithm: modified_first_fit_decreasing
+    sequence_length_round: 64
+  make_sequence_length_divisible_by: ${mul:${mul:${value.megatron_cfg.tensor_model_parallel_size}, ${value.megatron_cfg.context_parallel_size}},
+    2}
+  max_grad_norm: 1.0
+  optimizer: null
+  scheduler: null
+data:
+  max_input_seq_length: null
+  shuffle: false
+  num_workers: 1
+  use_multiple_dataloader: false
+  train:
+    data_path: null
+  validation:
+    data_path: null
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    prompt_file: null
+    system_prompt_file: null
+    processor: nemo_gym_data_processor
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: true
+  nemo_gym:
+    skip_venv_if_present: true
+    num_gpu_nodes: 0
+    port_range_low: 15001
+    port_range_high: 20000
+    invalid_tool_call_patterns:
+    - <tool_call>
+    - </tool_call>
+    - <function_call>
+    - </function_call>
+    thinking_tags:
+    - <think>
+    - </think>
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - responses_api_agents/swe_agents/configs/swebench_opencode_training.yaml
+    swe_agents_train:
+      responses_api_agents:
+        swe_agents:
+          agent_max_turns: 400
+          concurrency: ${mul:2, ${mul:${ppo.num_prompts_per_step}, ${ppo.num_generations_per_prompt}}}
+          swebench_agent_timeout: 3600
+          swebench_tests_timeout: 900
+          dataset_path: ${data.train.data_path}
+          apptainer_memory_limit_mb: 65536
+          container_formatter: ???
+    swe_agents_val:
+      responses_api_agents:
+        swe_agents:
+          agent_max_turns: 400
+          concurrency: ${mul:2, ${mul:${ppo.num_prompts_per_step}, ${ppo.num_generations_per_prompt}}}
+          swebench_agent_timeout: 3600
+          dataset_path: ${data.validation.data_path}
+          apptainer_memory_limit_mb: 65536
+          container_formatter: ${env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.container_formatter}
+    use_absolute_ip: true
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          chat_template_kwargs:
+            enable_thinking: true
+            truncate_history_thinking: false
+          sequential_reasoning_allowed: false
+          # Legacy Gym retried 429/502/503/504/520 without limit; upstream caps them at
+          # 3 tries. 7200 tries x 0.5 s ~ 1 h waits out transient vLLM overload instead
+          # of failing the rollout. Other retryable statuses (incl. 500) stay at 3.
+          max_rate_limit_attempts: 7200
+    train_on_all_session_traces: true
+    # Legacy: a trace with NaN policy logprobs is kept and masked from the loss.
+    # `raise` (upstream) fails the rollout and retries the whole group.
+    nan_generation_logprobs: mask
+logger:
+  log_dir: logs
+  num_val_samples_to_print: 0
+  wandb_enabled: true
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  monitor_gpus: true
+  swanlab_enabled: false
+  wandb:
+    project: ultra-v3-swe-e2e
+    name: ppo-ultra-e2e
+    # W&B "Step" = trainer step, so SC runs line up with legacy runs in shared panels.
+    trainer_step_as_wandb_step: true
+    # Off: per-step transcript tables were ~1.7 GB/step (5-20 MB strings) and stalled the W&B
+    # row; legacy never uploaded them (no such option in legacy NeMo-RL).
+    log_nemo_gym_full_result_tables: false
+  tensorboard: {}
+  mlflow:
+    experiment_name: ppo-ultra-e2e
+    run_name: ppo-ultra-e2e
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+effort_levels:
+  low_string: '{reasoning effort: efficient}'
+  low_weight: 0.1
+  low_penalty: 1
+  low_ub: 15000
+reward_penalties:
+  penalize_duplicated_reasoning: true
+  penalize_empty_final_answer: true
+  penalize_unwanted_tokens: true
+  penalize_malformed_think_tag: true
+  # Legacy: duplicated-reasoning / empty-final-answer checked once per rollout.
+  rollout_scoped_penalties_on_all_segments: false
+  token_ids:
+    unwanted:
+    - 2
+    think_open: 12
+    think_close: 13
+async_rl:
+  sampler:
+    name: ready_first
+    max_staleness_versions: 1
+  recompute_kv_cache_after_weight_updates: false
+  min_groups_for_streaming_train: ${ppo.num_prompts_per_step}
+  max_inflight_prompts: ${mul:2, ${ppo.num_prompts_per_step}}
+  max_buffered_rollouts: ${mul:2, ${ppo.num_prompts_per_step}}
+  diagnostics: false
+  rollout_failure:
+    max_infra_attempts_per_prompt: 5
+    max_data_attempts_per_prompt: 2
+    backoff_base_s: 1.0
+    max_backoff_s: 30.0
+    max_skipped_prompts: 0
+    max_consecutive_dropped_prompts: 0
+    min_step_batch_fraction: 0.9
+    on_dropped_prompt: shrink
+    max_replacement_attempts: 1
+    replacement_reserve_prompts: 1
+    native:
+      generation_timeout_s: null
+      env_timeout_s: null
+    nemo_gym:
+      rollout_timeout_s: null
+      max_row_attempts: 3
+  stall_watchdog:
+    interval_s: 30.0
+    stall_timeout_s: 3600.0
+    stall_action: warn
+    gym_subprocess_check: true
+  generation_fleet_health:
+    enabled: false
+    probe_interval_s: 5.0
+    probe_timeout_s: 2.0
+    unhealthy_threshold: 3
+    healthy_threshold: 2
+    selection: least_outstanding
+    max_restart_attempts_per_shard: 5
+    restart_dead_shards: false
+    restart_timeout_s: 1800.0
+    restart_backoff_s: 60.0
+    min_healthy_shards: 1
+    refit_timeout_s: 300.0
+  generation_router:
+    enabled: false
+    port_range_low: 1202
+    port_range_high: 1300
+    backend_timeout_s: 600.0
+    connect_timeout_s: 5.0
+    no_healthy_backend_status: 409
+  checkpoint_replay_buffer: false
+rollout_checkpointing:
+  snapshot_attempt_interval_s: null
+  telemetry_interval_s: null
+  max_consecutive_failures: 3
+  keep_latest_k: 2
+  restore_mode: latest
+  extra_fingerprint_excluded_paths: []
+data_plane:
+  enabled: true
+  impl: transfer_queue
+  backend: simple
+  claim_meta_poll_interval_s: 0.5
+  simple:
+    storage_capacity: 1000000
+    num_storage_units: ${mul:2, ${cluster.num_nodes}}
+  mooncake_cpu:
+    global_segment_size: 68719476736
+    local_buffer_size: 4294967296
+    reuse_registered_buffers: true
+    staging_buffer_size: 268435456
+token_capture:
+  enabled: false
+  staging_partition: rollout_staging
+rollout_recovery:
+  default_granularity: sibling
+  task_source_granularity_overrides: {}
+  agent_granularity_overrides: {}

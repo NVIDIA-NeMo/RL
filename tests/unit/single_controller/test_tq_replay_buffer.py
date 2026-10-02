@@ -1136,7 +1136,7 @@ def _load(
     *,
     max_groups: int = 8,
     expected_partition_id: str = "rollout_data",
-    expected_group_size: int = _N_GENS,
+    expected_group_size: int | None = _N_GENS,
     expected_manifest_digest: str | None = None,
 ) -> int:
     if expected_manifest_digest is None:
@@ -1617,6 +1617,28 @@ class TestTQReplayBufferLoadPreflight:
     def test_group_size_mismatch(self):
         state = _make_metadata_envelope([_make_group_entry("g0", weight=1, n=2)])
         self._assert_rejected(state, match="misaligned", expected_group_size=3)
+
+    def test_multi_trace_restore_accepts_variable_group_sizes(self):
+        # Multi-trace groups hold one row per agent session segment, so the
+        # controller passes no fixed size; rows must still align with tags.
+        state = _make_metadata_envelope(
+            [
+                _make_group_entry("g0", weight=1, n=1),
+                _make_group_entry("g1", weight=2, n=3),
+            ]
+        )
+        buf = _make_buffer(FakeDataPlaneClient())
+
+        assert _load(buf, state, expected_group_size=None) == 2
+        assert buf.size() == 2
+
+    def test_multi_trace_restore_still_rejects_misaligned_groups(self):
+        group = _make_group_entry("g0", weight=1, n=2, sequence_lengths=[3])
+        self._assert_rejected(
+            _make_metadata_envelope([group]),
+            match="misaligned",
+            expected_group_size=None,
+        )
 
     def test_duplicate_sample_ids_across_groups(self):
         g0 = _make_group_entry("g0", weight=1)

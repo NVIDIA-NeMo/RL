@@ -1031,6 +1031,22 @@ def test_result_to_completion_drops_mask_flag_when_gate_off():
     assert completion.env_extras["instance_config"]["other_key"] == "kept"
 
 
+def test_forced_mask_holds_even_when_the_env_mask_gate_is_off():
+    # Empty-rollout placeholders and NaN-logprob rows are masked regardless of
+    # should_mask_flagged_samples; the Gym instance config itself stays intact.
+    from nemo_rl.environments.nemo_gym import FORCED_MASK_SAMPLE_KEY
+
+    result = _mask_gate_result()
+    result["full_result"]["instance_config"] = {"other_key": "kept"}
+    result[FORCED_MASK_SAMPLE_KEY] = True
+    completion = _nemo_gym_impl(False)._results_to_completions([result])[0][0]
+    assert completion.env_extras["instance_config"] == {
+        "other_key": "kept",
+        "mask_sample": True,
+    }
+    assert result["full_result"]["instance_config"] == {"other_key": "kept"}
+
+
 def _mask_gate_receipt_result():
     return {
         "message_log": [],
@@ -2226,3 +2242,128 @@ class TestGenerateForFinalizationFlow:
         assert (
             restored._impl.seen_recovery_granularity is RecoveryGranularity.PROMPT_GROUP
         )
+
+
+def _session_trace(session_id, parent, idx, output):
+    return {
+        "message_log": [
+            {"role": "user", "token_ids": [1, 2]},
+            {"role": "assistant", "token_ids": [3], "generation_logprobs": [0.0]},
+        ],
+        "response": {"output": output},
+        "trace_metadata": {
+            "trace_in_rollout_idx": idx,
+            "session_id": session_id,
+            "parent_session_id": parent,
+            "segment_index": "0",
+            "segment_boundary_reason": "",
+        },
+    }
+
+
+def _multi_trace_result(subagent_output):
+    answer = [{"type": "message", "content": [{"text": "answer"}]}]
+    traces = [
+        _session_trace("root", "", 0, answer),
+        _session_trace("sub", "root", 1, subagent_output),
+    ]
+    return {
+        "message_log": traces[0]["message_log"],
+        "full_result": {"reward": 1.0, "response": {"output": answer}},
+        "session_traces": traces,
+    }
+
+
+def test_session_traces_become_completions_sharing_the_rollout_reward():
+    from nemo_rl.experience.interfaces import TRACE_METADATA_KEY
+
+    answer = [{"type": "message", "content": [{"text": "sub answer"}]}]
+    completions, _ = _nemo_gym_impl(True)._results_to_completions(
+        [_multi_trace_result(answer)]
+    )
+
+    assert [c.reward for c in completions] == [1.0, 1.0]
+    assert [c.env_extras[TRACE_METADATA_KEY]["session_id"] for c in completions] == [
+        "root",
+        "sub",
+    ]
+
+
+def test_forced_mask_on_one_session_trace_masks_only_that_completion():
+    from nemo_rl.environments.nemo_gym import FORCED_MASK_SAMPLE_KEY
+
+    answer = [{"type": "message", "content": [{"text": "sub answer"}]}]
+    result = _multi_trace_result(answer)
+    result["session_traces"][1][FORCED_MASK_SAMPLE_KEY] = True
+    completions, _ = _nemo_gym_impl(True)._results_to_completions([result])
+
+    flags = [
+        bool((c.env_extras.get("instance_config") or {}).get("mask_sample"))
+        for c in completions
+    ]
+    assert flags == [False, True]
+    assert "instance_config" not in result["full_result"]
+
+
+def test_rollout_scoped_penalties_check_only_the_aggregate_response_by_default():
+    # Legacy async PPO: empty-final-answer / duplicated-reasoning are checked once,
+    # on the rollout's aggregate response, so a subagent segment that ended empty
+    # does not zero a rollout whose root produced an answer.
+    impl = _nemo_gym_impl(True, {"penalize_empty_final_answer": True})
+    empty_answer = [{"type": "message", "content": [{"text": ""}]}]
+
+    completions, penalty_counts = impl._results_to_completions(
+        [_multi_trace_result(empty_answer)]
+    )
+
+    assert [c.reward for c in completions] == [1.0, 1.0]
+    assert penalty_counts["empty_final_answer"] == 0
+
+
+def test_rollout_scoped_penalty_on_the_aggregate_response_zeroes_every_trace():
+    impl = _nemo_gym_impl(True, {"penalize_empty_final_answer": True})
+    result = _multi_trace_result([{"type": "message", "content": [{"text": "a"}]}])
+    result["full_result"]["response"] = {
+        "output": [{"type": "message", "content": [{"text": ""}]}]
+    }
+
+    completions, penalty_counts = impl._results_to_completions([result])
+
+    assert [c.reward for c in completions] == [0.0, 0.0]
+    assert penalty_counts["empty_final_answer"] == 1
+
+
+def test_a_penalty_on_any_session_trace_zeroes_the_whole_rollout_when_opted_in():
+    impl = _nemo_gym_impl(
+        True,
+        {
+            "penalize_empty_final_answer": True,
+            "rollout_scoped_penalties_on_all_segments": True,
+        },
+    )
+    empty_answer = [{"type": "message", "content": [{"text": ""}]}]
+
+    completions, penalty_counts = impl._results_to_completions(
+        [_multi_trace_result(empty_answer)]
+    )
+
+    # Only the subagent trace ended empty, yet both traces lose the reward, and
+    # the rollout counts once so the rate stays per rollout.
+    assert [c.reward for c in completions] == [0.0, 0.0]
+    assert penalty_counts["empty_final_answer"] == 1
+
+
+def test_token_penalties_still_check_every_segment_by_default():
+    impl = _nemo_gym_impl(
+        True, {"penalize_unwanted_tokens": True, "token_ids": {"unwanted": [3]}}
+    )
+    answer = [{"type": "message", "content": [{"text": "sub answer"}]}]
+
+    completions, penalty_counts = impl._results_to_completions(
+        [_multi_trace_result(answer)]
+    )
+
+    # Every segment's assistant generation is token 3, so the unwanted-token
+    # penalty fires on the segments themselves and zeroes the shared reward.
+    assert [c.reward for c in completions] == [0.0, 0.0]
+    assert penalty_counts["unwanted_token"] == 1

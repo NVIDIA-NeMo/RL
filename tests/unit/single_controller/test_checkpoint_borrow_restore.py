@@ -212,6 +212,7 @@ def _controller(
         max_inflight_prompts=16,
         max_buffered_rollouts=_CAPACITY,
         diagnostics=False,
+        checkpoint_replay_buffer=True,
         sampler=SimpleNamespace(name="in_order"),
         rollout_failure=SimpleNamespace(
             on_dropped_prompt="replace",

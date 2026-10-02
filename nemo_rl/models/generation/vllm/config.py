@@ -75,8 +75,9 @@ class VllmSpecificArgs(TypedDict):
     logprobs_mode: NotRequired[Literal["processed_logprobs", "raw_logprobs"]]
     # Nemotron-H only: compute vLLM Nemotron-H logits with an fp32 LM head.
     # Pair this with policy.megatron_cfg.fp32_lm_head when using a Megatron
-    # trainer.
-    fp32_lm_head: NotRequired[bool]
+    # trainer. "tf32" runs the fp32 head GEMM with TF32 tensor cores (pair with
+    # policy.megatron_cfg.fp32_lm_head="tf32").
+    fp32_lm_head: NotRequired[bool | Literal["tf32"]]
     # Cap each request's generated tokens so the training prompt plus response
     # fits within max_model_len. This is needed when multimodal processing makes
     # the training prompt longer than its text-only representation.

@@ -490,7 +490,11 @@ class RayWorkerGroup:
             self.cluster.get_master_address_and_port()
         )
 
-        # Update env_vars with the current environment variables
+        # Update env_vars with the current environment variables. Copy first:
+        # callers pass their config's env_vars dict, and filling it in place
+        # wrote the whole launch environment (API keys included) into the
+        # saved checkpoint config and the W&B run config.
+        env_vars = dict(env_vars)
         for k, v in os.environ.items():
             if k not in env_vars:
                 env_vars[k] = v
