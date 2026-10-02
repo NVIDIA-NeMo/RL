@@ -27,6 +27,7 @@ silently shifts the advantage of every sibling in the group.
 """
 
 import asyncio
+import contextlib
 import uuid
 
 import pytest
@@ -37,6 +38,7 @@ from nemo_rl.environments.interfaces import EnvironmentReturn
 from nemo_rl.experience.failures import (
     FailureClass,
     GenerationUnavailable,
+    GymCheckpointParked,
     GymTransportError,
     RolloutDataFailure,
     RolloutFailure,
@@ -47,6 +49,7 @@ from nemo_rl.experience.failures import (
 from nemo_rl.experience.rollout_manager import (
     AsyncRolloutImpl,
     RequestDeadlineRegistry,
+    RolloutDispatchAdmissionGate,
     RolloutManager,
     RolloutRetryPolicy,
     RolloutStats,
@@ -54,6 +57,7 @@ from nemo_rl.experience.rollout_manager import (
     _classify_generation_failure,
     _Deadline,
     _gather_cancelling_siblings,
+    _LedgerDispatchRecorder,
 )
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 from nemo_rl.utils.timer import Timer
@@ -907,3 +911,219 @@ def test_request_deadlines_pause_while_the_engine_is_stood_down():
 
     with pytest.raises(RolloutTimeout, match="generation turn exceeded"):
         asyncio.run(expiry_still_fires())
+
+
+class _RecordingDispatchRecorder:
+    """RolloutDispatchRecorder stand-in that logs every ledger hook in order."""
+
+    def __init__(self, events: list[tuple]) -> None:
+        self.events = events
+
+    @contextlib.asynccontextmanager
+    async def submitting(self, generation_indices):
+        indices = list(generation_indices)
+        self.events.append(("submitting", indices))
+        yield lambda: self.events.append(("mark", indices))
+
+    async def refused(self, generation_index: int) -> None:
+        self.events.append(("refused", generation_index))
+
+
+class _ParkingGymMethod:
+    """Gym stream whose first dispatch refuses ``parked`` rows at checkpoint admission."""
+
+    def __init__(self, parked: set[int], events: list[tuple]) -> None:
+        self._parked = set(parked)
+        self.events = events
+        self.dispatched: list[list[int]] = []
+        self.release_admitted = asyncio.Event()
+        self.release_admitted.set()
+
+    def options(self, **kwargs):
+        del kwargs
+        return self
+
+    def remote(self, inputs, timer_prefix, per_prompt=False):
+        del timer_prefix, per_prompt
+        rows = [row["_rowidx"] for row in inputs]
+        self.dispatched.append(rows)
+        self.events.append(("remote", rows))
+        first = len(self.dispatched) == 1
+        return self._stream(rows, first)
+
+    async def _stream(self, rows, first):
+        refused = [row for row in rows if first and row in self._parked]
+        admitted = [row for row in rows if row not in refused]
+        # Gym answers a refusal immediately; admitted rows finish later.
+        for rowidx in refused:
+            yield self._parked_item(rowidx)
+        for rowidx in admitted:
+            yield self._admitted_item(rowidx)
+
+    @staticmethod
+    async def _parked_item(rowidx):
+        return GymCheckpointParked("checkpoint_parked", rowidx)
+
+    async def _admitted_item(self, rowidx):
+        await self.release_admitted.wait()
+        return await _row_result(rowidx)
+
+
+class TestGymCheckpointParkedRows:
+    """A row Gym refuses at checkpoint admission never ran: unwind it, re-send it."""
+
+    def test_refused_row_is_unwound_and_resent_without_spending_a_row_attempt(
+        self, monkeypatch
+    ):
+        from nemo_rl.experience import rollout_manager
+
+        monkeypatch.setattr(rollout_manager, "_PARKED_REDISPATCH_BACKOFF_S", 0.0)
+        events: list[tuple] = []
+        method = _ParkingGymMethod(parked={1}, events=events)
+        stats = RolloutStats()
+        # One row attempt: a refusal must not consume it.
+        impl = _make_gym_impl(method, num_generations=2, row_attempts=1, stats=stats)
+        impl._dispatch_admission_gate = RolloutDispatchAdmissionGate()
+
+        completions, _, _ = asyncio.run(
+            impl._run_rollouts(
+                _gym_rows(2),
+                Timer(),
+                "timing/rollout",
+                dispatch_recorder=_RecordingDispatchRecorder(events),
+            )
+        )
+
+        assert len(completions) == 2
+        assert method.dispatched == [[0, 1], [1]]
+        # Marked only after Ray accepted each submission; the refusal is unwound
+        # before the row is re-sent.
+        assert events == [
+            ("submitting", [0, 1]),
+            ("remote", [0, 1]),
+            ("mark", [0, 1]),
+            ("refused", 1),
+            ("submitting", [1]),
+            ("remote", [1]),
+            ("mark", [1]),
+        ]
+        assert stats.gym_checkpoint_parked_rows == 1
+        assert stats.gym_row_redispatches == 0
+        assert not stats.data_retries_by_reason
+
+    def test_nothing_is_submitted_or_marked_while_the_gate_is_closed(self):
+        events: list[tuple] = []
+        method = _ParkingGymMethod(parked=set(), events=events)
+        impl = _make_gym_impl(method, num_generations=2)
+        gate = RolloutDispatchAdmissionGate()
+        impl._dispatch_admission_gate = gate
+
+        async def exercise() -> None:
+            async with gate.closed():
+                task = asyncio.create_task(
+                    impl._run_rollouts(
+                        _gym_rows(2),
+                        Timer(),
+                        "timing/rollout",
+                        dispatch_recorder=_RecordingDispatchRecorder(events),
+                    )
+                )
+                await asyncio.sleep(0.05)
+                assert events == []
+            await asyncio.wait_for(task, timeout=5.0)
+
+        asyncio.run(exercise())
+        assert events[:3] == [
+            ("submitting", [0, 1]),
+            ("remote", [0, 1]),
+            ("mark", [0, 1]),
+        ]
+
+    def test_checkpoint_excludes_a_refused_row_and_does_not_deadlock(self, monkeypatch):
+        """The real recorder, ledger and barrier, with a checkpoint mid-flight.
+
+        Row 1 is refused while row 0 is still running in Gym. A checkpoint that
+        closes the gate must then see only row 0 as Gym-owned, and row 1's
+        re-send must wait at the gate instead of becoming DISPATCHED under it.
+        """
+        from nemo_rl.algorithms.async_utils.replay_buffer import (
+            DataPlaneCheckpointBarrier,
+        )
+        from nemo_rl.experience import rollout_manager
+        from nemo_rl.experience.rollout_recovery import (
+            RecoveryTargetLevel,
+            RolloutAttemptStatus,
+            RolloutRecoveryLedger,
+        )
+
+        # Long enough for the checkpoint below to close the gate before the re-send.
+        monkeypatch.setattr(rollout_manager, "_PARKED_REDISPATCH_BACKOFF_S", 0.2)
+        events: list[tuple] = []
+        method = _ParkingGymMethod(parked={1}, events=events)
+        method.release_admitted.clear()
+        impl = _make_gym_impl(method, num_generations=2, row_attempts=1)
+        gate = RolloutDispatchAdmissionGate()
+        impl._dispatch_admission_gate = gate
+
+        async def exercise() -> None:
+            barrier = DataPlaneCheckpointBarrier()
+            ledger = RolloutRecoveryLedger()
+            async with barrier.mutation() as cut:
+                group = ledger.reserve_group(
+                    cut,
+                    group_id="g7",
+                    admission_id="batch-7",
+                    prompt_id="7",
+                    prompt_payload={"idx": 7, "message_log": []},
+                    expected_generations=2,
+                    target_step=7,
+                    start_weight_version=7,
+                    restore_level=RecoveryTargetLevel.TURN,
+                    admitted=True,
+                )
+            manager = object.__new__(RolloutManager)
+            manager._recovery_ledger = ledger
+            manager._data_plane_checkpoint_barrier = barrier
+            recorder = _LedgerDispatchRecorder(
+                manager=manager, group_id="g7", gym_instance_id="tools/replica-0"
+            )
+
+            def status(index: int) -> RolloutAttemptStatus:
+                return ledger.get_group("g7").siblings[index].current_attempt.status
+
+            task = asyncio.create_task(
+                impl._run_rollouts(
+                    _gym_rows(2),
+                    Timer(),
+                    "timing/rollout",
+                    dispatch_recorder=recorder,
+                )
+            )
+            # Both rows start RESERVED and are marked together, so this only
+            # holds once Gym's refusal of row 1 has been unwound.
+            while not (
+                status(0) is RolloutAttemptStatus.DISPATCHED
+                and status(1) is RolloutAttemptStatus.RESERVED
+            ):
+                await asyncio.sleep(0.001)
+
+            async def checkpoint() -> tuple:
+                async with gate.closed():
+                    async with barrier.checkpoint():
+                        inventory = ledger.gym_checkpoint_inventory(
+                            {"tools/replica-0"}
+                        )["tools/replica-0"]
+                    await asyncio.sleep(0.05)
+                    return inventory, status(1)
+
+            inventory, held_status = await asyncio.wait_for(checkpoint(), timeout=5.0)
+            assert inventory == (group.gym_episode(0),)
+            assert held_status is RolloutAttemptStatus.RESERVED
+
+            method.release_admitted.set()
+            await asyncio.wait_for(task, timeout=5.0)
+            assert status(0) is RolloutAttemptStatus.DISPATCHED
+            assert status(1) is RolloutAttemptStatus.DISPATCHED
+            assert method.dispatched == [[0, 1], [1]]
+
+        asyncio.run(exercise())
