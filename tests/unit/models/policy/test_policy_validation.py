@@ -25,7 +25,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from nemo_rl.models.generation.vllm.config import (
+from nemo_rl.models.generation.vllm.patches import (
     VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
 )
 from nemo_rl.models.policy import PolicyConfig

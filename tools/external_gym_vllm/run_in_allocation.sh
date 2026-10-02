@@ -13,46 +13,67 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Run external Gym vLLM pools beside NeMo RL in a single, two-component
-# Slurm heterogeneous job. Pool definitions are supplied by the caller through
-# EXTERNAL_VLLM_POOLS and consistently named, exported environment variables.
+# Run external Gym vLLM pools for NeMo RL. By default the pools run beside
+# NeMo RL in a single, two-component Slurm heterogeneous job. With
+# EXTERNAL_VLLM_SERVICES_ONLY=1 they run alone in a single-component job and
+# serve NeMo RL jobs that are submitted separately. Pool definitions are
+# supplied by the caller through EXTERNAL_VLLM_POOLS and consistently named,
+# exported environment variables.
 
 set -euo pipefail
 
 : "${SLURM_JOB_ID:?This script must run inside a Slurm allocation}"
-: "${SLURM_HET_SIZE:?This script requires a Slurm heterogeneous job}"
-: "${SLURM_JOB_NODELIST_HET_GROUP_0:?Hetgroup 0 nodelist is required}"
-: "${SLURM_JOB_NODELIST_HET_GROUP_1:?Hetgroup 1 nodelist is required}"
-: "${SLURM_JOB_ACCOUNT:?SLURM_JOB_ACCOUNT is required}"
-: "${SLURM_JOB_PARTITION:?SLURM_JOB_PARTITION is required}"
-: "${SLURM_SUBMIT_DIR:?SLURM_SUBMIT_DIR is required}"
+EXTERNAL_VLLM_SERVICES_ONLY="${EXTERNAL_VLLM_SERVICES_ONLY:-0}"
+if [[ "${EXTERNAL_VLLM_SERVICES_ONLY}" == "1" ]]; then
+  if [[ -n "${SLURM_HET_SIZE:-}" ]]; then
+    echo "[FATAL] EXTERNAL_VLLM_SERVICES_ONLY=1 requires a single-component allocation, got ${SLURM_HET_SIZE} hetgroups" >&2
+    exit 1
+  fi
+  : "${SLURM_JOB_NODELIST:?SLURM_JOB_NODELIST is required}"
+elif [[ "${EXTERNAL_VLLM_SERVICES_ONLY}" == "0" ]]; then
+  : "${SLURM_HET_SIZE:?This script requires a Slurm heterogeneous job; set EXTERNAL_VLLM_SERVICES_ONLY=1 to run only the external pools}"
+  : "${SLURM_JOB_NODELIST_HET_GROUP_0:?Hetgroup 0 nodelist is required}"
+  : "${SLURM_JOB_NODELIST_HET_GROUP_1:?Hetgroup 1 nodelist is required}"
+  : "${SLURM_JOB_ACCOUNT:?SLURM_JOB_ACCOUNT is required}"
+  : "${SLURM_JOB_PARTITION:?SLURM_JOB_PARTITION is required}"
+  : "${SLURM_SUBMIT_DIR:?SLURM_SUBMIT_DIR is required}"
+  : "${MOUNTS:?MOUNTS is required}"
+  : "${COMMAND:?COMMAND is required}"
+else
+  echo "[FATAL] EXTERNAL_VLLM_SERVICES_ONLY must be 0 or 1 (got '${EXTERNAL_VLLM_SERVICES_ONLY}')" >&2
+  exit 1
+fi
 : "${BASE_LOG_DIR:?BASE_LOG_DIR is required}"
 : "${CONTAINER:?CONTAINER is required}"
-: "${MOUNTS:?MOUNTS is required}"
-: "${COMMAND:?COMMAND is required}"
 : "${EXTERNAL_VLLM_POOLS:?EXTERNAL_VLLM_POOLS is required}"
 : "${EXTERNAL_VLLM_TOOLS_DIR_HOST:?EXTERNAL_VLLM_TOOLS_DIR_HOST is required}"
 
-if [[ "${SLURM_HET_SIZE}" != "2" ]]; then
-  echo "[FATAL] Expected exactly two Slurm hetgroups, got ${SLURM_HET_SIZE}" >&2
-  exit 1
+if [[ "${EXTERNAL_VLLM_SERVICES_ONLY}" == "0" ]]; then
+  if [[ "${SLURM_HET_SIZE}" != "2" ]]; then
+    echo "[FATAL] Expected exactly two Slurm hetgroups, got ${SLURM_HET_SIZE}" >&2
+    exit 1
+  fi
+  RAY_SUB="${RAY_SUB:-${SLURM_SUBMIT_DIR}/ray.sub}"
+  if [[ ! -f "${RAY_SUB}" ]]; then
+    echo "[FATAL] ray.sub does not exist: ${RAY_SUB}" >&2
+    exit 1
+  fi
 fi
 
-RAY_SUB="${RAY_SUB:-${SLURM_SUBMIT_DIR}/ray.sub}"
 export GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
 EXTERNAL_VLLM_LB_PYTHON="${EXTERNAL_VLLM_LB_PYTHON:-/opt/nemo_rl_venv/bin/python}"
 EXTERNAL_VLLM_SHARED_ROOT="${EXTERNAL_VLLM_SHARED_ROOT:-/lustre}"
+EXTERNAL_VLLM_READINESS_POLL_INTERVAL_SECONDS="${EXTERNAL_VLLM_READINESS_POLL_INTERVAL_SECONDS:-5}"
+EXTERNAL_VLLM_READINESS_REQUEST_TIMEOUT_SECONDS="${EXTERNAL_VLLM_READINESS_REQUEST_TIMEOUT_SECONDS:-10}"
 
-if [[ ! -f "${RAY_SUB}" ]]; then
-  echo "[FATAL] ray.sub does not exist: ${RAY_SUB}" >&2
-  exit 1
-fi
-for required_file in vllm_backend_registry.sh vllm_pool_lb.py lb_watchdog.sh serve_vllm_on_ray.py; do
+for required_file in pool_config.sh vllm_backend_registry.sh vllm_pool_lb.py lb_watchdog.sh serve_vllm_on_ray.py; do
   if [[ ! -f "${EXTERNAL_VLLM_TOOLS_DIR_HOST}/${required_file}" ]]; then
     echo "[FATAL] Missing ${EXTERNAL_VLLM_TOOLS_DIR_HOST}/${required_file}" >&2
     exit 1
   fi
 done
+# Shares the readiness override and services manifest name with launchers.
+source "${EXTERNAL_VLLM_TOOLS_DIR_HOST}/pool_config.sh"
 if [[ ! "${GPUS_PER_NODE}" =~ ^[0-9]+$ ]] || (( GPUS_PER_NODE <= 0 )); then
   echo "[FATAL] GPUS_PER_NODE must be a positive integer" >&2
   exit 1
@@ -61,6 +82,15 @@ if [[ "${EXTERNAL_VLLM_SHARED_ROOT}" != /* ]]; then
   echo "[FATAL] EXTERNAL_VLLM_SHARED_ROOT must be absolute" >&2
   exit 1
 fi
+for readiness_variable in \
+  EXTERNAL_VLLM_READINESS_POLL_INTERVAL_SECONDS \
+  EXTERNAL_VLLM_READINESS_REQUEST_TIMEOUT_SECONDS; do
+  readiness_value="${!readiness_variable}"
+  if [[ ! "${readiness_value}" =~ ^[0-9]+$ ]] || (( readiness_value <= 0 )); then
+    echo "[FATAL] ${readiness_variable} must be a positive integer" >&2
+    exit 1
+  fi
+done
 
 read -r -a pool_names <<< "${EXTERNAL_VLLM_POOLS}"
 if (( ${#pool_names[@]} == 0 )); then
@@ -107,6 +137,7 @@ declare -A pool_log_dirs=()
 declare -A state_dirs=()
 declare -A lb_state_dirs=()
 declare -A pool_urls=()
+declare -A health_urls=()
 
 total_external_nodes=0
 max_startup_timeout=0
@@ -186,7 +217,7 @@ for pool in "${pool_names[@]}"; do
     exit 1
   fi
   seen_placeholders["${placeholders[${pool}]}"]="${pool}"
-  if [[ "${COMMAND}" != *"${placeholders[${pool}]}"* ]]; then
+  if [[ "${EXTERNAL_VLLM_SERVICES_ONLY}" == "0" && "${COMMAND}" != *"${placeholders[${pool}]}"* ]]; then
     echo "[FATAL] Driver command is missing ${placeholders[${pool}]} for ${display_names[${pool}]}" >&2
     exit 1
   fi
@@ -218,18 +249,27 @@ for shared_path in "${shared_paths[@]}"; do
   fi
 done
 
-mapfile -t ray_nodes < <(
-  scontrol show hostnames "${SLURM_JOB_NODELIST_HET_GROUP_0}" | sort
-)
-mapfile -t external_nodes < <(
-  scontrol show hostnames "${SLURM_JOB_NODELIST_HET_GROUP_1}" | sort
-)
-if (( ${#ray_nodes[@]} == 0 )); then
-  echo "[FATAL] Slurm hetgroup 0 contains no NeMo RL nodes" >&2
-  exit 1
+if [[ "${EXTERNAL_VLLM_SERVICES_ONLY}" == "1" ]]; then
+  ray_nodes=()
+  external_nodes_label="The Slurm allocation"
+  mapfile -t external_nodes < <(
+    scontrol show hostnames "${SLURM_JOB_NODELIST}" | sort
+  )
+else
+  external_nodes_label="Slurm hetgroup 1"
+  mapfile -t ray_nodes < <(
+    scontrol show hostnames "${SLURM_JOB_NODELIST_HET_GROUP_0}" | sort
+  )
+  mapfile -t external_nodes < <(
+    scontrol show hostnames "${SLURM_JOB_NODELIST_HET_GROUP_1}" | sort
+  )
+  if (( ${#ray_nodes[@]} == 0 )); then
+    echo "[FATAL] Slurm hetgroup 0 contains no NeMo RL nodes" >&2
+    exit 1
+  fi
 fi
 if (( ${#external_nodes[@]} != total_external_nodes )); then
-  echo "[FATAL] Slurm hetgroup 1 has ${#external_nodes[@]} nodes, expected ${total_external_nodes}" >&2
+  echo "[FATAL] ${external_nodes_label} has ${#external_nodes[@]} nodes, expected ${total_external_nodes}" >&2
   for pool in "${pool_names[@]}"; do
     echo "[FATAL]   ${display_names[${pool}]}: ${node_counts[${pool}]} nodes" >&2
   done
@@ -243,7 +283,12 @@ else
   LOG_DIR="${BASE_LOG_DIR}/${SLURM_JOB_ID}-logs"
 fi
 mkdir -p "${LOG_DIR}"
+services_manifest=""
 rm_args=()
+if [[ "${EXTERNAL_VLLM_SERVICES_ONLY}" == "1" ]]; then
+  services_manifest="${LOG_DIR}/${EXTERNAL_VLLM_SERVICES_MANIFEST}"
+  rm_args+=("${services_manifest}")
+fi
 for pool in "${pool_names[@]}"; do
   pool_key="${pool,,}"
   pool_log_dirs["${pool}"]="${LOG_DIR}/external_${pool_key}"
@@ -268,14 +313,22 @@ done
     count="${node_counts[${pool}]}"
     printf '%s\n' "${external_nodes[@]:offset:count}"
   done
-  echo "[nemo_rl_ray]"
-  printf '%s\n' "${ray_nodes[@]}"
+  if (( ${#ray_nodes[@]} > 0 )); then
+    echo "[nemo_rl_ray]"
+    printf '%s\n' "${ray_nodes[@]}"
+  fi
 } > "${LOG_DIR}/node-allocation.txt"
 
-echo "[INFO] Heterogeneous-job external-vLLM topology"
-echo "[INFO]   Hetgroup 0, NeMo RL Ray: ${#ray_nodes[@]} nodes (${SLURM_JOB_NODELIST_HET_GROUP_0})"
+if [[ "${EXTERNAL_VLLM_SERVICES_ONLY}" == "1" ]]; then
+  echo "[INFO] Services-only external-vLLM topology (${SLURM_JOB_NODELIST})"
+  external_component_label=""
+else
+  echo "[INFO] Heterogeneous-job external-vLLM topology"
+  echo "[INFO]   Hetgroup 0, NeMo RL Ray: ${#ray_nodes[@]} nodes (${SLURM_JOB_NODELIST_HET_GROUP_0})"
+  external_component_label="Hetgroup 1, "
+fi
 for pool in "${pool_names[@]}"; do
-  echo "[INFO]   Hetgroup 1, ${display_names[${pool}]}: ${node_counts[${pool}]} nodes, ${replicas[${pool}]} TP=${tensor_parallel_sizes[${pool}]} replicas"
+  echo "[INFO]   ${external_component_label}${display_names[${pool}]}: ${node_counts[${pool}]} nodes, ${replicas[${pool}]} TP=${tensor_parallel_sizes[${pool}]} replicas"
 done
 
 declare -a service_step_pids=()
@@ -288,6 +341,10 @@ cleanup() {
   local status=$?
   trap - EXIT TERM INT
 
+  # Withdraw the services first so no new NeMo RL job attaches during teardown.
+  if [[ -n "${services_manifest}" ]]; then
+    rm -f "${services_manifest}" 2>/dev/null || true
+  fi
   touch "${LOG_DIR}/ENDED" 2>/dev/null || true
   if [[ -n "${ray_sub_pid}" ]] && kill -0 "${ray_sub_pid}" 2>/dev/null; then
     kill "${ray_sub_pid}" 2>/dev/null || true
@@ -318,6 +375,25 @@ check_service_steps() {
       return 1
     fi
   done
+}
+
+check_ray_sub_step() {
+  local status
+  if [[ -n "${ray_sub_pid}" ]] && ! kill -0 "${ray_sub_pid}" 2>/dev/null; then
+    if wait "${ray_sub_pid}"; then
+      status=0
+    else
+      status=$?
+    fi
+    ray_sub_pid=""
+    echo "[FATAL] NeMo RL exited during external vLLM startup with status ${status}" >&2
+    return 1
+  fi
+}
+
+check_startup_steps() {
+  check_service_steps
+  check_ray_sub_step
 }
 
 resolve_node_ip() {
@@ -507,8 +583,26 @@ bash -n <(printf '%s' "${VLLM_SERVER_BODY}") || {
   exit 1
 }
 
-ray_head_node="${ray_nodes[0]}"
-lb_mounts="${MOUNTS},${EXTERNAL_VLLM_TOOLS_DIR_HOST}:/opt/external-vllm-tools:ro"
+# A heterogeneous job routes every step to an explicit component and hosts the
+# load balancers on the NeMo RL head node. A services-only job has one
+# component, which Slurm uses by default, and hosts them on its first node.
+if [[ "${EXTERNAL_VLLM_SERVICES_ONLY}" == "1" ]]; then
+  lb_node="${external_nodes[0]}"
+  replica_step_args=()
+  lb_step_args=()
+  lb_mounts="${MOUNTS:+${MOUNTS},}"
+else
+  lb_node="${ray_nodes[0]}"
+  replica_step_args=(--het-group=1)
+  lb_step_args=(
+    --het-group=0
+    --container-workdir="${SLURM_SUBMIT_DIR}"
+    -A "${SLURM_JOB_ACCOUNT}"
+    -p "${SLURM_JOB_PARTITION}"
+  )
+  lb_mounts="${MOUNTS},"
+fi
+lb_mounts+="${EXTERNAL_VLLM_TOOLS_DIR_HOST}:/opt/external-vllm-tools:ro"
 external_service_mount="${EXTERNAL_VLLM_SHARED_ROOT}:${EXTERNAL_VLLM_SHARED_ROOT}"
 for pool in "${pool_names[@]}"; do
   lb_mounts+=",${state_dirs[${pool}]}:${lb_state_dirs[${pool}]}"
@@ -526,8 +620,7 @@ for pool in "${pool_names[@]}"; do
     vllm_log="${pool_log_dirs[${pool}]}/vllm_${replica_index}.log"
 
     echo "[INFO] ${display_names[${pool}]} replica ${replica_index}: ${replica_nodelist}"
-    srun \
-      --het-group=1 \
+    srun "${replica_step_args[@]}" \
       --no-container-mount-home \
       --container-image="${containers[${pool}]}" \
       --container-mounts="${external_service_mount}" \
@@ -547,22 +640,19 @@ for pool in "${pool_names[@]}"; do
   done
 done
 
-ray_head_ip=$(resolve_node_ip "${ray_head_node}")
+lb_ip=$(resolve_node_ip "${lb_node}")
 for pool in "${pool_names[@]}"; do
-  pool_urls["${pool}"]="http://${ray_head_ip}:${lb_ports[${pool}]}/v1"
+  pool_urls["${pool}"]="http://${lb_ip}:${lb_ports[${pool}]}/v1"
+  health_urls["${pool}"]="http://${lb_ip}:${lb_ports[${pool}]}/health"
   echo "[INFO] Starting ${display_names[${pool}]} load balancer at ${pool_urls[${pool}]}"
-  srun \
-    --het-group=0 \
+  srun "${lb_step_args[@]}" \
     --no-container-mount-home \
     --container-name="external-vllm-lb-${pool,,}-${SLURM_JOB_ID}" \
     --container-image="${CONTAINER}" \
     --container-mounts="${lb_mounts}" \
-    --container-workdir="${SLURM_SUBMIT_DIR}" \
     --mpi=pmix \
-    -A "${SLURM_JOB_ACCOUNT}" \
-    -p "${SLURM_JOB_PARTITION}" \
     --overlap \
-    --nodelist="${ray_head_node}" \
+    --nodelist="${lb_node}" \
     --nodes=1 \
     --ntasks=1 \
     --cpus-per-task=2 \
@@ -571,6 +661,29 @@ for pool in "${pool_names[@]}"; do
   lb_step_pids+=("$!")
   lb_step_labels+=("${display_names[${pool}]} load balancer")
 done
+
+if [[ "${EXTERNAL_VLLM_SERVICES_ONLY}" == "0" ]]; then
+  readiness_targets=()
+  for pool in "${pool_names[@]}"; do
+    COMMAND="${COMMAND//${placeholders[${pool}]}/${pool_urls[${pool}]}}"
+    readiness_targets+=("${pool}" "${health_urls[${pool}]}" "${replicas[${pool}]}")
+  done
+  readiness_override=$(
+    external_vllm_readiness_override "${max_startup_timeout}" "${readiness_targets[@]}"
+  )
+  COMMAND+=" ${readiness_override}"
+  export COMMAND
+
+  echo "[INFO] Starting NeMo RL while external vLLM pools load"
+  # ray.sub predates hetjobs and consumes the unsuffixed allocation variables.
+  # Restrict those variables to component 0; srun also defaults to hetgroup 0.
+  # `env` execs bash directly, so ray_sub_pid is the process that owns its traps.
+  env \
+    SLURM_JOB_NODELIST="${SLURM_JOB_NODELIST_HET_GROUP_0}" \
+    SLURM_JOB_NUM_NODES="${#ray_nodes[@]}" \
+    bash "${RAY_SUB}" &
+  ray_sub_pid=$!
+fi
 
 deadline=$((SECONDS + max_startup_timeout))
 while true; do
@@ -591,7 +704,7 @@ while true; do
     fi
   done
   (( all_ready == 1 )) && break
-  check_service_steps
+  check_startup_steps
   if (( SECONDS >= deadline )); then
     echo "[FATAL] Timed out waiting for all external vLLM pools" >&2
     exit 1
@@ -601,7 +714,7 @@ done
 
 for pool in "${pool_names[@]}"; do
   until curl -sfm 10 "${pool_urls[${pool}]}/models" >/dev/null 2>&1; do
-    check_service_steps
+    check_startup_steps
     if (( SECONDS >= deadline )); then
       echo "[FATAL] ${display_names[${pool}]} load balancer failed its end-to-end /models probe" >&2
       exit 1
@@ -609,19 +722,37 @@ for pool in "${pool_names[@]}"; do
     sleep 5
   done
   echo "${pool_urls[${pool}]}" > "${LOG_DIR}/${pool,,}_url"
-  COMMAND="${COMMAND//${placeholders[${pool}]}/${pool_urls[${pool}]}}"
 done
-export COMMAND
 
-echo "[INFO] External vLLM pools are healthy; starting NeMo RL"
-# ray.sub predates hetjobs and consumes the unsuffixed allocation variables.
-# Restrict those variables to component 0; srun also defaults to hetgroup 0.
-# `env` execs bash directly, so ray_sub_pid is the process that owns its traps.
-env \
-  SLURM_JOB_NODELIST="${SLURM_JOB_NODELIST_HET_GROUP_0}" \
-  SLURM_JOB_NUM_NODES="${#ray_nodes[@]}" \
-  bash "${RAY_SUB}" &
-ray_sub_pid=$!
+if [[ "${EXTERNAL_VLLM_SERVICES_ONLY}" == "1" ]]; then
+  # Publish atomically: launchers treat the manifest as "every pool is ready".
+  {
+    echo "# External vLLM services from Slurm job ${SLURM_JOB_ID}"
+    printf '# pool\tbase_url\thealth_url\texpected_backends\tserved_model_name\n'
+    for pool in "${pool_names[@]}"; do
+      printf '%s\t%s\t%s\t%s\t%s\n' \
+        "${pool}" \
+        "${pool_urls[${pool}]}" \
+        "${health_urls[${pool}]}" \
+        "${replicas[${pool}]}" \
+        "${served_model_names[${pool}]}"
+    done
+  } > "${services_manifest}.tmp"
+  mv "${services_manifest}.tmp" "${services_manifest}"
+
+  echo "[INFO] External vLLM services are ready:"
+  for pool in "${pool_names[@]}"; do
+    echo "[INFO]   ${display_names[${pool}]}: ${pool_urls[${pool}]} (${replicas[${pool}]} replicas, model name '${served_model_names[${pool}]}')"
+  done
+  echo "[INFO] Attach NeMo RL jobs with EXTERNAL_VLLM_SERVICES_DIR=${LOG_DIR}"
+  # Serve until walltime or scancel. Like the inline path, any replica or load
+  # balancer exit ends the job; cleanup withdraws the manifest.
+  while check_service_steps; do
+    sleep 5
+  done
+  exit 1
+fi
+echo "[INFO] External vLLM pools are healthy; NeMo RL startup can proceed"
 
 while kill -0 "${ray_sub_pid}" 2>/dev/null; do
   if ! check_service_steps; then

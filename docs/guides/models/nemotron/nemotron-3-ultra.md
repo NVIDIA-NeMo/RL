@@ -240,10 +240,11 @@ The launcher registers both pools through the
 [external Gym vLLM pool helpers](https://github.com/NVIDIA-NeMo/RL/blob/main/tools/external_gym_vllm/README.md)
 and submits `tools/external_gym_vllm/run_in_allocation.sh` instead of `ray.sub`.
 That wrapper starts every replica in its own private Ray cluster, brings up one
-OpenAI-compatible load balancer per pool, waits for all backends to become
-healthy, substitutes the resolved URLs into the driver command, and only then
-starts `ray.sub` on the training component. If a required service exits, the
-training job is stopped.
+OpenAI-compatible load balancer per pool, substitutes the load-balancer URLs
+into the driver command, and starts `ray.sub` on the training component while
+the models are still loading. The NeMo Gym actor waits until every load
+balancer reports all of its replicas healthy before rollouts begin. If a
+required service exits, the training job is stopped.
 
 In this mode `GENRM_MODEL` and `NL2BASH_JUDGE_MODEL` are the checkpoints the
 pools serve, and Gym addresses them by `GENRM_SERVED_MODEL_NAME` /
@@ -271,6 +272,8 @@ because the wrapper bind-mounts that root into the service containers. Since
 | `GENRM_REASONING_PARSER` | _unset_ | Path to a reasoning-parser plugin `.py`, only for a checkpoint whose parser vLLM does not ship |
 | `NL2BASH_REPLICAS`, `NL2BASH_TENSOR_PARALLEL_SIZE` | `4`, `4` | Independent DP=1 NL2Bash servers and TP per server |
 | `EXTERNAL_VLLM_SEGMENT_SIZE` | `4` | SLURM `--segment` for the external component |
+| `EXTERNAL_VLLM_SERVICES_ONLY` | `0` | `1` submits only the judge pools, as a standalone services job |
+| `EXTERNAL_VLLM_SERVICES_DIR` | _unset_ | Log directory of a running services job; submits only the NeMo RL nodes and uses its pools |
 
 Node counts are derived from the replica shapes, not set directly:
 `nodes = REPLICAS × TENSOR_PARALLEL_SIZE / GPUS_PER_NODE` per pool. The two
@@ -280,7 +283,8 @@ must be a multiple of `EXTERNAL_VLLM_SEGMENT_SIZE`. With both judges external,
 `NUM_GYM_NODES` only has to cover the safety judge. Model paths, the parser
 plugin, and `BASE_LOG_DIR` must live under `EXTERNAL_VLLM_SHARED_ROOT`
 (`/lustre` by default), which is mounted into the service containers.
-`INTERACTIVE=1` is not supported in this mode.
+`INTERACTIVE=1` is not supported in this mode, except with
+`EXTERNAL_VLLM_SERVICES_DIR`.
 
 Building on the [Phase 1](#phase-1--49k-context-128-steps) invocation, add:
 
@@ -306,6 +310,43 @@ with Gym now hosting only the safety judge) plus 16 GenRM + 4 NL2Bash = 20
 external nodes. Set only `GENRM_MODEL` or only `NL2BASH_JUDGE_MODEL` to move
 just that judge out of Gym — useful for the teacher stages, which declare only
 the judges they use.
+
+#### Standalone judge services
+
+A judge that fails to start fails the whole heterogeneous job, training nodes
+included. To keep judge startup off the training allocation, run the judges as
+their own Slurm job and point one or more training jobs at it. Add
+`EXTERNAL_VLLM_SERVICES_ONLY=1` to the invocation above, with a `WALLTIME` that
+covers every training job that will use it:
+
+```bash
+EXTERNAL_VLLM_SERVICES_ONLY=1 \
+WALLTIME=24:00:00 \
+EXTERNAL_JUDGES=1 \
+GENRM_MODEL=/path/to/genrm-checkpoint \
+GENRM_REPLICAS=16 \
+NL2BASH_JUDGE_MODEL=/path/to/nl2bash-judge-checkpoint \
+NL2BASH_REPLICAS=4 \
+... \
+bash examples/nemo_gym/nemotron-3-ultra/ultra_launch.sh
+```
+
+This submits only the 20 judge nodes and prints the services job's log
+directory. Once that job logs `External vLLM services are ready`, submit each
+training job with `EXTERNAL_JUDGES=1`, the same judge models, and
+`EXTERNAL_VLLM_SERVICES_DIR=<that directory>`. Each training job allocates only
+its NeMo RL nodes, routes Gym to the running judges, and still waits at startup
+until every judge reports all of its replicas healthy. The launcher rejects the
+submission if the services job is not ready or does not serve a judge that the
+stage uses under the same model name. A services job that serves both judges can
+back stages that use only one of them.
+
+The services job exits when any judge replica or load balancer exits, and its
+URLs point at its first node. After restarting it, resubmit the training jobs
+with its new log directory; queued training jobs keep the URLs they were
+submitted with. See
+[Standalone services job](https://github.com/NVIDIA-NeMo/RL/blob/main/tools/external_gym_vllm/README.md#standalone-services-job)
+for the full contract.
 
 ## Stage 1 — Student RLVR
 

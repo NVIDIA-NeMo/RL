@@ -1,7 +1,8 @@
-# Heterogeneous-job external Gym vLLM pools
+# External Gym vLLM pools
 
-These helpers run arbitrary fixed-model vLLM pools beside NeMo RL in one
-two-component Slurm heterogeneous job:
+These helpers run arbitrary fixed-model vLLM pools for NeMo RL Gym servers. By
+default the pools run beside NeMo RL in one two-component Slurm heterogeneous
+job:
 
 ```text
 one Slurm heterogeneous job
@@ -9,17 +10,30 @@ one Slurm heterogeneous job
 └── hetgroup 1: independent private Ray/vLLM replicas
 ```
 
+The pools can instead run as a [standalone services job](#standalone-services-job)
+that one or more separately submitted NeMo RL jobs use, so a pool that fails to
+start never costs a NeMo RL allocation.
+
 `run_in_allocation.sh` is service-agnostic. A recipe launcher defines named
 pools such as GenRM, NL2Bash, or safety, including each model's environment and
-vLLM arguments. The wrapper then:
+vLLM arguments. In a heterogeneous job, the wrapper then:
 
 1. validates every pool and splits hetgroup 1 into disjoint node slices;
 2. starts every replica in its own private Ray cluster;
 3. starts one OpenAI-compatible load balancer per pool;
-4. waits for every backend and load balancer to become healthy;
-5. replaces each pool's URL placeholder in `COMMAND`;
-6. starts `ray.sub` on hetgroup 0 only; and
+4. replaces each pool's URL placeholder and injects an explicit backend-count
+   readiness contract into the NeMo Gym config;
+5. starts `ray.sub` on hetgroup 0 while the external models are still loading;
+6. lets the NeMo Gym actor start its local servers, then waits for every
+   external load balancer to report the required healthy backend count; and
 7. stops training if any required external service exits.
+
+This overlaps Ray, policy/trainer, and local Gym initialization with external
+model loading without letting rollout setup complete early. The load
+balancer's `/health` response must report `status: ok` and both
+`healthy_backends` and `total_backends` at or above the registered replica
+count. The Gym actor applies one shared, bounded deadline across all pools and
+shuts down its local servers if that deadline expires.
 
 Recipe launchers keep their concrete model and serving settings outside these
 helpers. A launcher can add another service without adding another server body
@@ -70,10 +84,10 @@ The generated fields are:
 |---|---:|---|---|
 | `POOL_MODEL` | yes | — | Checkpoint path under `EXTERNAL_VLLM_SHARED_ROOT` or Hugging Face model ID. |
 | `POOL_CONTAINER` | yes | — | Container used by this pool's replicas. |
-| `POOL_VLLM_PYTHON` | yes | — | Python executable containing vLLM, Ray, and NeMo RL's compatibility patch. |
+| `POOL_VLLM_PYTHON` | yes | — | Python executable containing vLLM and Ray. |
 | `POOL_REPLICAS` | yes | — | Number of independent DP=1 servers. |
 | `POOL_TENSOR_PARALLEL_SIZE` | yes | — | Tensor parallel size per server. |
-| `POOL_LB_PORT` | yes | — | Unique load-balancer port on the Ray head node. |
+| `POOL_LB_PORT` | yes | — | Unique load-balancer port on the NeMo RL head node, or on the first node of a services-only job. |
 | `POOL_URL_PLACEHOLDER` | yes | — | Token in `COMMAND` replaced by this pool's `/v1` URL. |
 | `POOL_GROUP_ID` | no | `inline-<pool>-<job-id>` | Registry namespace; set with `--group-id` only when an explicit stable namespace is needed. |
 | `POOL_DISPLAY_NAME` | no | pool name | Human-readable log label. |
@@ -89,7 +103,9 @@ ranges, TP divisibility, and duplicate ports/placeholders before `sbatch`.
 `EXTERNAL_VLLM_NUM_NODES` is exported as the node total computed from all
 registered pools. Call `validate_external_vllm_submission` after constructing
 `COMMAND` to check its placeholders, shared paths, tool files, and requested
-external node count before submitting the allocation.
+external node count before submitting the allocation. A services-only
+submission has no `COMMAND`; call `validate_external_vllm_services` with the
+node count instead, which runs every check except the placeholder check.
 
 The interface uses one-argument-per-line encoding internally, preserving JSON
 configs and paths containing spaces without `eval`. The wrapper itself supplies `--tensor-parallel-size`,
@@ -107,9 +123,9 @@ Required variables:
 | Variable | Purpose |
 |---|---|
 | `BASE_LOG_DIR` | Parent under `EXTERNAL_VLLM_SHARED_ROOT` for `<job-id>-logs`. |
-| `COMMAND` | NeMo RL command containing every pool's URL placeholder. |
+| `COMMAND` | NeMo RL command containing every pool's URL placeholder. Not used by a services-only job. |
 | `CONTAINER` | NeMo RL and load-balancer container. |
-| `MOUNTS` | Mount list required by `ray.sub` and `COMMAND`. |
+| `MOUNTS` | Mount list required by `ray.sub` and `COMMAND`. Optional for a services-only job, which adds it to the load-balancer containers when set. |
 | `EXTERNAL_VLLM_POOLS` | Ordered pool names; this order determines node slicing. |
 | `EXTERNAL_VLLM_TOOLS_DIR_HOST` | Path to this directory under `EXTERNAL_VLLM_SHARED_ROOT`. |
 
@@ -117,11 +133,14 @@ Optional globals:
 
 | Variable | Default | Purpose |
 |---|---|---|
+| `EXTERNAL_VLLM_SERVICES_ONLY` | `0` | `1` runs only the pools in a single-component allocation; see [Standalone services job](#standalone-services-job). |
 | `GPUS_PER_NODE` | `4` | GPUs claimed per node. Set this before registering pools; it sizes hetgroup 1 and is exported to `ray.sub`, so it must match the physical GPUs per node for both components. |
 | `NUM_EXTERNAL_SERVICE_NODES` | empty | Expected hetgroup 1 node count. Pass it to `validate_external_vllm_submission` to fail before `sbatch` on a topology mismatch; validation warns and skips this check when unset. |
 | `EXTERNAL_VLLM_LB_PYTHON` | `/opt/nemo_rl_venv/bin/python` | Python with `aiohttp` in `CONTAINER`. |
 | `RAY_SUB` | `$SLURM_SUBMIT_DIR/ray.sub` | Normal NeMo RL Slurm entrypoint. |
 | `EXTERNAL_VLLM_SHARED_ROOT` | `/lustre` | Shared host path mounted at the same path in every external-service container. |
+| `EXTERNAL_VLLM_READINESS_POLL_INTERVAL_SECONDS` | `5` | How often the NeMo Gym actor rechecks external load-balancer health. |
+| `EXTERNAL_VLLM_READINESS_REQUEST_TIMEOUT_SECONDS` | `10` | Per-request timeout for the NeMo Gym external-health probes. |
 | `DEDICATED_RAY_HEAD` | unset | Passed through to `ray.sub`. With `1`, include one extra node in hetgroup 0 while keeping `cluster.num_nodes` equal to the GPU worker-node count; the head node's GPUs remain allocated but idle. |
 
 The number of nodes in hetgroup 1 must equal:
@@ -165,11 +184,17 @@ also accepted.
 Each pool container must provide:
 
 - its configured `POOL_VLLM_PYTHON`;
-- importable `nemo_rl`, `ray`, and `vllm` packages in that environment; and
+- importable `ray` and `vllm` packages in that environment;
+- access to the matching NeMo RL source checkout, or an importable `nemo_rl`
+  package as a fallback; and
 - the `ray` command on `PATH`.
 
-`serve_vllm_on_ray.py` applies NeMo RL's vLLM compatibility patches before it
-imports the vLLM API server. `CONTAINER` must provide
+`serve_vllm_on_ray.py` loads NeMo RL's vLLM compatibility patch module directly
+from the matching source checkout and applies it before importing the vLLM API
+server. This avoids importing NeMo RL's policy modules and training dependency
+stack into a purpose-built serving container. If the source checkout is not
+available, the wrapper falls back to the installed `nemo_rl` package.
+`CONTAINER` must provide
 `EXTERNAL_VLLM_LB_PYTHON` with `aiohttp` installed.
 
 ## Slurm submission
@@ -197,7 +222,84 @@ sbatch \
 ```
 
 Slurm gang-schedules the two components. Replica `srun` steps explicitly use
-hetgroup 1 and load-balancer steps explicitly use hetgroup 0. Before starting
+hetgroup 1 and load-balancer steps explicitly use hetgroup 0. When starting
 `ray.sub`, the wrapper scopes its unsuffixed Slurm nodelist and node-count
 variables to component 0; Slurm then uses component 0 by default for its steps.
 External nodes therefore cannot accidentally join the training Ray cluster.
+
+## Standalone services job
+
+With `EXTERNAL_VLLM_SERVICES_ONLY=1`, the wrapper runs only the pools, in an
+ordinary single-component allocation, and serves NeMo RL jobs that are
+submitted separately. A pool that fails to start then fails only this job, and
+several NeMo RL jobs can share one set of pools.
+
+```text
+services job (EXTERNAL_VLLM_SERVICES_ONLY=1)
+├── first node: per-pool load balancers  <──  NeMo RL jobs (plain ray.sub)
+└── every node: independent private Ray/vLLM replicas
+```
+
+Register the pools exactly as for a heterogeneous job, then submit one
+component sized to them:
+
+```bash
+validate_external_vllm_services "$EXTERNAL_VLLM_NUM_NODES"
+EXTERNAL_VLLM_SERVICES_ONLY=1 sbatch \
+  --account=<account> \
+  --partition=<partition> \
+  --nodes="$EXTERNAL_VLLM_NUM_NODES" \
+  --exclusive \
+  --gres=gpu:4 \
+  --time=<service-lifetime> \
+  --export=ALL \
+  tools/external_gym_vllm/run_in_allocation.sh
+```
+
+The job does not use `COMMAND` or `ray.sub`. Once every pool passes the same
+registry and end-to-end `/models` checks as a heterogeneous job, it writes a
+manifest to `$BASE_LOG_DIR/<job-id>[-<restart-count>]-logs/external_vllm_services.tsv`
+and logs that directory:
+
+```text
+# External vLLM services from Slurm job <job-id>
+# pool	base_url	health_url	expected_backends	served_model_name
+GENRM	http://<lb-ip>:9213/v1	http://<lb-ip>:9213/health	8	model
+```
+
+The manifest exists only while the job serves every pool; the job removes it
+when it exits. As in a heterogeneous job, the job exits when any replica or
+load balancer exits. Otherwise it serves until `scancel` or walltime, so size
+`--time` for every NeMo RL job that will use it.
+
+### Attaching NeMo RL jobs
+
+A NeMo RL launcher registers the same pools and builds `COMMAND` with their URL
+placeholders as usual. Instead of submitting a heterogeneous job, it resolves
+`COMMAND` against the services job's log directory and submits plain `ray.sub`
+with only the NeMo RL nodes:
+
+```bash
+COMMAND="$(resolve_external_vllm_services "$COMMAND" "$EXTERNAL_VLLM_SERVICES_DIR")"
+```
+
+`resolve_external_vllm_services` fails before submission when the manifest is
+missing, lacks a registered pool, or reports a served model name other than the
+pool's `POOL_SERVED_MODEL_NAME`. It replaces each registered pool's placeholder
+with the service URL and appends the same
+`++env.nemo_gym.external_service_readiness` gate as a heterogeneous job, using
+the manifest's backend counts and the largest registered
+`POOL_STARTUP_TIMEOUT`. If the services job exits before a NeMo RL job starts,
+the NeMo RL job therefore stops at startup when that gate times out, rather than
+during rollouts. Pools that the services job serves but the launcher does not
+register are ignored, so one services job can back stages that use different
+subsets of its pools.
+
+The URLs point at the services job's first node. A queued NeMo RL job keeps the
+URLs it was submitted with, so after restarting the services job, resolve and
+submit the NeMo RL jobs again.
+
+The Nemotron 3 Ultra (with `EXTERNAL_JUDGES=1`) and Nemotron 3.5 Lightning
+launchers expose both steps: `EXTERNAL_VLLM_SERVICES_ONLY=1` submits the
+services job, and `EXTERNAL_VLLM_SERVICES_DIR=<services-log-dir>` submits a
+NeMo RL job that uses it.

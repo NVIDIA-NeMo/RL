@@ -15,6 +15,10 @@
 
 # Public shell interface for registering external Gym vLLM pools before sbatch.
 
+# A services-only job writes this file to its log directory once every pool is
+# healthy, and removes it on exit. NeMo RL jobs attach through it.
+EXTERNAL_VLLM_SERVICES_MANIFEST="external_vllm_services.tsv"
+
 _external_vllm_set() {
   local pool="$1" suffix="$2" value="$3"
   printf -v "${pool}_${suffix}" '%s' "${value}"
@@ -224,17 +228,13 @@ register_external_vllm_pool() {
   _external_vllm_recompute_node_count
 }
 
-validate_external_vllm_submission() {
-  local command="${1:-${COMMAND:-}}"
-  local expected_nodes="${2:-${NUM_EXTERNAL_SERVICE_NODES:-}}"
+# Check what the external pools themselves need: the node total, shared paths,
+# and tool files. A services-only submission has no NeMo RL command to check.
+validate_external_vllm_services() {
+  local expected_nodes="${1:-${NUM_EXTERNAL_SERVICE_NODES:-}}"
   local shared_root="${EXTERNAL_VLLM_SHARED_ROOT:-/lustre}"
-  local pool placeholder_var path variable_name required_file
-  local -a pools=()
+  local path variable_name required_file
 
-  if [[ -z "${command}" ]]; then
-    echo "ERROR: external vLLM submission command is empty" >&2
-    return 2
-  fi
   if [[ -z "${EXTERNAL_VLLM_POOLS:-}" ]]; then
     echo "ERROR: no external vLLM pools are registered" >&2
     return 2
@@ -247,17 +247,8 @@ validate_external_vllm_submission() {
       return 2
     fi
   else
-    echo "WARNING: NUM_EXTERNAL_SERVICE_NODES is unset; skipping external hetgroup node-count validation" >&2
+    echo "WARNING: NUM_EXTERNAL_SERVICE_NODES is unset; skipping external-service node-count validation" >&2
   fi
-
-  read -r -a pools <<< "${EXTERNAL_VLLM_POOLS}"
-  for pool in "${pools[@]}"; do
-    placeholder_var="${pool}_URL_PLACEHOLDER"
-    if [[ "${command}" != *"${!placeholder_var}"* ]]; then
-      echo "ERROR: submission command is missing ${!placeholder_var} for pool ${pool}" >&2
-      return 2
-    fi
-  done
 
   for variable_name in BASE_LOG_DIR EXTERNAL_VLLM_TOOLS_DIR_HOST; do
     path="${!variable_name-}"
@@ -267,7 +258,7 @@ validate_external_vllm_submission() {
     fi
     _external_vllm_require_shared_path "${variable_name}" "${path}" || return
   done
-  for required_file in vllm_backend_registry.sh vllm_pool_lb.py lb_watchdog.sh serve_vllm_on_ray.py; do
+  for required_file in pool_config.sh vllm_backend_registry.sh vllm_pool_lb.py lb_watchdog.sh serve_vllm_on_ray.py; do
     if [[ ! -f "${EXTERNAL_VLLM_TOOLS_DIR_HOST}/${required_file}" ]]; then
       echo "ERROR: missing ${EXTERNAL_VLLM_TOOLS_DIR_HOST}/${required_file}" >&2
       return 2
@@ -277,6 +268,131 @@ validate_external_vllm_submission() {
     echo "ERROR: EXTERNAL_VLLM_SHARED_ROOT must be absolute (got '${shared_root}')" >&2
     return 2
   fi
+}
+
+validate_external_vllm_submission() {
+  local command="${1:-${COMMAND:-}}"
+  local expected_nodes="${2:-${NUM_EXTERNAL_SERVICE_NODES:-}}"
+  local pool placeholder_var
+  local -a pools=()
+
+  if [[ -z "${command}" ]]; then
+    echo "ERROR: external vLLM submission command is empty" >&2
+    return 2
+  fi
+  validate_external_vllm_services "${expected_nodes}" || return
+
+  read -r -a pools <<< "${EXTERNAL_VLLM_POOLS}"
+  for pool in "${pools[@]}"; do
+    placeholder_var="${pool}_URL_PLACEHOLDER"
+    if [[ "${command}" != *"${!placeholder_var}"* ]]; then
+      echo "ERROR: submission command is missing ${!placeholder_var} for pool ${pool}" >&2
+      return 2
+    fi
+  done
+}
+
+# Print the Hydra override that makes the NeMo Gym actor wait for external
+# pools before rollouts start. Arguments after the shared timeout are repeated
+# NAME HEALTH_URL EXPECTED_BACKENDS triples, one per pool.
+external_vllm_readiness_override() {
+  local timeout_seconds="${1:?readiness timeout required}"
+  shift
+  local poll_interval="${EXTERNAL_VLLM_READINESS_POLL_INTERVAL_SECONDS:-5}"
+  local request_timeout="${EXTERNAL_VLLM_READINESS_REQUEST_TIMEOUT_SECONDS:-10}"
+  local services="" separator=""
+
+  if (( $# == 0 || $# % 3 != 0 )); then
+    echo "ERROR: external_vllm_readiness_override needs NAME HEALTH_URL EXPECTED_BACKENDS triples" >&2
+    return 2
+  fi
+  _external_vllm_require_positive_integer \
+    "external readiness timeout" "${timeout_seconds}" || return
+  _external_vllm_require_positive_integer \
+    EXTERNAL_VLLM_READINESS_POLL_INTERVAL_SECONDS "${poll_interval}" || return
+  _external_vllm_require_positive_integer \
+    EXTERNAL_VLLM_READINESS_REQUEST_TIMEOUT_SECONDS "${request_timeout}" || return
+  while (( $# > 0 )); do
+    _external_vllm_require_positive_integer "$1 expected backends" "$3" || return
+    services+="${separator}{name:$1,url:\"$2\",expected_backends:$3}"
+    separator=","
+    shift 3
+  done
+  printf "++env.nemo_gym.external_service_readiness='{services:[%s],timeout_seconds:%s,poll_interval_seconds:%s,request_timeout_seconds:%s}'" \
+    "${services}" "${timeout_seconds}" "${poll_interval}" "${request_timeout}"
+}
+
+# Point a NeMo RL command at the pools of a running services-only job and print
+# the result. SERVICES_DIR is that job's log directory. Every registered pool's
+# URL placeholder is replaced with the service's URL, and the NeMo Gym readiness
+# gate is appended so the job still waits for, or fails on, unhealthy pools.
+# The services job may serve pools this launcher does not register.
+resolve_external_vllm_services() {
+  local command="$1"
+  local services_dir="${2:?services directory required}"
+  local manifest="${services_dir}/${EXTERNAL_VLLM_SERVICES_MANIFEST}"
+  local pool base_url health_url expected_backends served_model_name extra
+  local placeholder_var served_model_name_var startup_timeout_var
+  local readiness_override
+  local max_startup_timeout=0
+  local -a pools=() readiness_targets=()
+  local -A base_urls=() health_urls=() backend_counts=() served_model_names=()
+
+  if [[ -z "${command}" ]]; then
+    echo "ERROR: external vLLM submission command is empty" >&2
+    return 2
+  fi
+  if [[ -z "${EXTERNAL_VLLM_POOLS:-}" ]]; then
+    echo "ERROR: no external vLLM pools are registered" >&2
+    return 2
+  fi
+  if [[ ! -f "${manifest}" ]]; then
+    echo "ERROR: ${manifest} does not exist; the external vLLM services job is still starting or has exited" >&2
+    return 2
+  fi
+
+  while IFS=$'\t' read -r pool base_url health_url expected_backends served_model_name extra; do
+    [[ -z "${pool}" || "${pool}" == \#* ]] && continue
+    if [[ -z "${served_model_name}" || -n "${extra}" ]] \
+      || [[ ! "${base_url}" =~ ^https?:// || ! "${health_url}" =~ ^https?:// ]]; then
+      echo "ERROR: malformed ${pool} entry in ${manifest}" >&2
+      return 2
+    fi
+    base_urls["${pool}"]="${base_url}"
+    health_urls["${pool}"]="${health_url}"
+    backend_counts["${pool}"]="${expected_backends}"
+    served_model_names["${pool}"]="${served_model_name}"
+  done < "${manifest}"
+
+  read -r -a pools <<< "${EXTERNAL_VLLM_POOLS}"
+  for pool in "${pools[@]}"; do
+    if [[ -z "${base_urls[${pool}]-}" ]]; then
+      echo "ERROR: the external vLLM services in ${services_dir} do not include pool ${pool}" >&2
+      return 2
+    fi
+    # Gym sends the registered name as the request's model field.
+    served_model_name_var="${pool}_SERVED_MODEL_NAME"
+    if [[ "${served_model_names[${pool}]}" != "${!served_model_name_var}" ]]; then
+      echo "ERROR: pool ${pool} serves model name '${served_model_names[${pool}]}', but ${served_model_name_var}='${!served_model_name_var}'" >&2
+      return 2
+    fi
+    placeholder_var="${pool}_URL_PLACEHOLDER"
+    if [[ "${command}" != *"${!placeholder_var}"* ]]; then
+      echo "ERROR: submission command is missing ${!placeholder_var} for pool ${pool}" >&2
+      return 2
+    fi
+    command="${command//${!placeholder_var}/${base_urls[${pool}]}}"
+    startup_timeout_var="${pool}_STARTUP_TIMEOUT"
+    if (( ${!startup_timeout_var} > max_startup_timeout )); then
+      max_startup_timeout="${!startup_timeout_var}"
+    fi
+    readiness_targets+=("${pool}" "${health_urls[${pool}]}" "${backend_counts[${pool}]}")
+  done
+
+  readiness_override=$(
+    external_vllm_readiness_override "${max_startup_timeout}" "${readiness_targets[@]}"
+  ) || return
+  printf '%s %s\n' "${command}" "${readiness_override}"
 }
 
 external_vllm_pool_env() {

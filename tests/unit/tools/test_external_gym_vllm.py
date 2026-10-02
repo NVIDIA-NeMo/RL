@@ -12,10 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ast
 import json
 import os
+import shlex
+import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import textwrap
 import time
@@ -24,7 +28,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import ClientPayloadError, web
+from omegaconf import OmegaConf
 
+from nemo_rl.utils.config import parse_hydra_overrides
 from tools.external_gym_vllm.vllm_pool_lb import (
     SHUTDOWN_TIMEOUT_SECONDS,
     Backend,
@@ -35,6 +41,53 @@ from tools.external_gym_vllm.vllm_pool_lb import (
 )
 
 REPO_ROOT = Path(__file__).parents[3]
+
+
+def test_serve_wrapper_loads_patches_without_importing_nemo_rl_package():
+    script = REPO_ROOT / "tools/external_gym_vllm/serve_vllm_on_ray.py"
+    program = textwrap.dedent(
+        f"""
+        import runpy
+        import sys
+        import types
+
+        sys.modules["ray"] = types.ModuleType("ray")
+        namespace = runpy.run_path({str(script)!r})
+        namespace["_load_apply_vllm_patches"]()
+        leaked = [m for m in sys.modules if m.partition(".")[0] == "nemo_rl"]
+        assert not leaked, leaked
+        """
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", program],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_vllm_patches_module_never_imports_nemo_rl():
+    """serve_vllm_on_ray.py runs patches.py by path, then calls _apply_vllm_patches.
+
+    Both happen in serving containers without NeMo RL, so an import of nemo_rl at
+    ANY level -- including lazily inside a patch function -- breaks them. Relative
+    imports break too: a module run by path has no parent package.
+    """
+    path = REPO_ROOT / "nemo_rl/models/generation/vllm/patches.py"
+    for node in ast.walk(ast.parse(path.read_text())):
+        if isinstance(node, ast.Import):
+            modules = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            modules = ["." * node.level + (node.module or "")]
+        else:
+            continue
+        for module in modules:
+            assert module.split(".")[0] not in ("", "nemo_rl"), (
+                f"patches.py:{node.lineno} imports {module!r}; serving containers "
+                "load this module by path without NeMo RL installed."
+            )
 
 
 def test_shutdown_timeout_bounds_watchdog_restart_outage():
@@ -553,31 +606,10 @@ def test_launcher_routes_generic_pools_to_explicit_hetgroups():
     script = REPO_ROOT / "tools/external_gym_vllm/run_in_allocation.sh"
     source = script.read_text()
 
-    srun_blocks = []
-    current_block = []
-    for line in source.splitlines():
-        if line.lstrip() == "srun \\":
-            current_block = [line]
-        elif current_block:
-            current_block.append(line)
-            if line.rstrip().endswith("&"):
-                srun_blocks.append("\n".join(current_block))
-                current_block = []
-
-    assert len(srun_blocks) == 2
-    replica_launch = next(block for block in srun_blocks if "VLLM_SERVER_BODY" in block)
-    lb_launch = next(
-        block
-        for block in srun_blocks
-        if "lb_watchdog.sh" in block and "--output=" in block
-    )
-
-    assert "--het-group=1" in replica_launch
-    assert '-A "${SLURM_JOB_ACCOUNT}"' not in replica_launch
-    assert '-p "${SLURM_JOB_PARTITION}"' not in replica_launch
-    assert "--het-group=0" in lb_launch
-    assert '-A "${SLURM_JOB_ACCOUNT}"' in lb_launch
-    assert '-p "${SLURM_JOB_PARTITION}"' in lb_launch
+    # The per-mode hetgroup, account, and partition routing of these two steps
+    # is asserted on recorded srun argv by the fake-Slurm tests below.
+    assert source.count('srun "${replica_step_args[@]}" \\') == 1
+    assert source.count('srun "${lb_step_args[@]}" \\') == 1
 
     assert "preflight" not in source.lower()
     assert "import ray, vllm" not in source
@@ -591,13 +623,25 @@ def test_launcher_routes_generic_pools_to_explicit_hetgroups():
     assert (
         'COMMAND="${COMMAND//${placeholders[${pool}]}/${pool_urls[${pool}]}}"' in source
     )
+    assert "external_vllm_readiness_override" in source
+    assert (
+        'readiness_targets+=("${pool}" "${health_urls[${pool}]}" "${replicas[${pool}]}")'
+        in source
+    )
+    assert "external_service_readiness_json" not in source
+    assert source.index('bash "${RAY_SUB}" &') < source.index(
+        "deadline=$((SECONDS + max_startup_timeout))"
+    )
+    assert source.count("check_startup_steps") == 3
     assert "genrm" not in source.lower()
     assert "nl2bash" not in source.lower()
     assert "safety" not in source.lower()
     assert "RAY_NODELIST" not in source
     assert "external-vllm-lb-preflight" not in source
     assert "if ! ready=$(" in source
-    assert 'env \\\n  SLURM_JOB_NODELIST="${SLURM_JOB_NODELIST_HET_GROUP_0}"' in source
+    assert (
+        'env \\\n    SLURM_JOB_NODELIST="${SLURM_JOB_NODELIST_HET_GROUP_0}"' in source
+    )
     assert 'if [[ -n "${SLURM_RESTART_COUNT:-}" ]]; then' in source
     assert (
         'LOG_DIR="${BASE_LOG_DIR}/${SLURM_JOB_ID}-${SLURM_RESTART_COUNT}-logs"'
@@ -818,6 +862,18 @@ def test_submission_validation_checks_placeholders_paths_and_node_total():
         capture_output=True,
         text=True,
     )
+    services_only = subprocess.run(
+        [
+            "bash",
+            "-c",
+            program.replace(
+                "validate_external_vllm_submission 'run __TEST_URL__' 2",
+                "validate_external_vllm_services 2",
+            ),
+        ],
+        capture_output=True,
+        text=True,
+    )
 
     assert valid.returncode == 0, valid.stderr
     assert wrong_nodes.returncode == 2
@@ -826,8 +882,385 @@ def test_submission_validation_checks_placeholders_paths_and_node_total():
     assert "submission command is missing __TEST_URL__" in missing_placeholder.stderr
     assert missing_node_count.returncode == 0, missing_node_count.stderr
     assert (
-        "skipping external hetgroup node-count validation" in missing_node_count.stderr
+        "skipping external-service node-count validation" in missing_node_count.stderr
     )
+    assert services_only.returncode == 0, services_only.stderr
+
+
+def _write_executable(path: Path, text: str) -> None:
+    path.write_text(textwrap.dedent(text))
+    path.chmod(0o755)
+
+
+def _fake_slurm_env(tmp_path: Path) -> dict[str, str]:
+    """Environment that runs run_in_allocation.sh against fake Slurm tools.
+
+    Each srun records its argv. A replica step registers its backend as ready, as
+    the real server body does once vLLM is healthy, then idles until killed.
+    Hostnames resolve through a fixed table, and every sleep is shortened.
+    """
+    tools_dir = tmp_path / "tools"
+    shutil.copytree(REPO_ROOT / "tools/external_gym_vllm", tools_dir)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (tmp_path / "hosts").write_text(
+        "ray-a 10.0.0.1\nray-b 10.0.0.2\n"
+        "svc-a 10.0.1.1\nsvc-b 10.0.1.2\nsvc-c 10.0.1.3\nsvc-d 10.0.1.4\n"
+    )
+    _write_executable(
+        bin_dir / "srun",
+        """\
+        #!/bin/bash
+        printf '%s\\0' "$@" > "${FAKE_SLURM_DIR}/srun.$$"
+        for argument in "$@"; do
+          [[ "${argument}" == --export=* ]] || continue
+          IFS=, read -r -a assignments <<< "${argument#--export=}"
+          for assignment in "${assignments[@]}"; do
+            case "${assignment}" in
+              REPLICA_ID=*|EXTERNAL_VLLM_STATE_DIR=*|EXTERNAL_VLLM_GROUP_ID=*)
+                export "${assignment}" ;;
+            esac
+          done
+        done
+        if [[ -n "${REPLICA_ID:-}" ]]; then
+          source "${EXTERNAL_VLLM_TOOLS_DIR_HOST}/vllm_backend_registry.sh"
+          registry_add "${REPLICA_ID}" 10.9.9.9 8000
+        fi
+        exec "${FAKE_SLEEP}" 60
+        """,
+    )
+    _write_executable(
+        bin_dir / "scontrol",
+        """\
+        #!/bin/bash
+        [[ "$1 $2" == "show hostnames" ]] && tr ',' '\\n' <<< "$3"
+        """,
+    )
+    _write_executable(
+        bin_dir / "getent",
+        """\
+        #!/bin/bash
+        awk -v host="$2" '$1 == host { print $2 " STREAM " host }' "${FAKE_SLURM_DIR}/hosts"
+        """,
+    )
+    _write_executable(bin_dir / "curl", "#!/bin/bash\nexit 0\n")
+    _write_executable(bin_dir / "sleep", '#!/bin/bash\nexec "${FAKE_SLEEP}" 0.01\n')
+    return {
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "FAKE_SLURM_DIR": str(tmp_path),
+        "FAKE_SLEEP": shutil.which("sleep"),
+        "SLURM_JOB_ID": "4242",
+        "BASE_LOG_DIR": str(tmp_path / "logs"),
+        "CONTAINER": "nemo-rl.sqsh",
+        "EXTERNAL_VLLM_SHARED_ROOT": str(tmp_path),
+        "EXTERNAL_VLLM_TOOLS_DIR_HOST": str(tools_dir),
+        "EXTERNAL_VLLM_POOLS": "GENRM JUDGE",
+        "GENRM_MODEL": "genrm-model-id",
+        "GENRM_CONTAINER": "vllm.sqsh",
+        "GENRM_VLLM_PYTHON": "/opt/vllm/bin/python",
+        "GENRM_REPLICAS": "2",
+        "GENRM_TENSOR_PARALLEL_SIZE": "4",
+        "GENRM_LB_PORT": "9213",
+        "GENRM_URL_PLACEHOLDER": "__GENRM_URL__",
+        "GENRM_SERVED_MODEL_NAME": "genrm",
+        "JUDGE_MODEL": "judge-model-id",
+        "JUDGE_CONTAINER": "vllm.sqsh",
+        "JUDGE_VLLM_PYTHON": "/opt/vllm/bin/python",
+        "JUDGE_REPLICAS": "1",
+        "JUDGE_TENSOR_PARALLEL_SIZE": "8",
+        "JUDGE_LB_PORT": "9214",
+        "JUDGE_URL_PLACEHOLDER": "__JUDGE_URL__",
+    }
+
+
+def _recorded_srun_steps(tmp_path: Path) -> tuple[list[list[str]], list[list[str]]]:
+    """Return the recorded (replica, load-balancer) srun argv lists."""
+    steps = [
+        path.read_text().rstrip("\0").split("\0")
+        for path in sorted(tmp_path.glob("srun.*"))
+    ]
+    replica_steps = [
+        step for step in steps if any("POOL_PREFIX=" in arg for arg in step)
+    ]
+    lb_steps = [step for step in steps if any("lb_watchdog.sh" in arg for arg in step)]
+    assert len(replica_steps) + len(lb_steps) == len(steps)
+    return replica_steps, lb_steps
+
+
+def _parse_readiness_override(command: str) -> dict:
+    """Apply a command's readiness override the way the NeMo RL driver does."""
+    prefix = "++env.nemo_gym.external_service_readiness="
+    overrides = [arg for arg in shlex.split(command) if arg.startswith(prefix)]
+    assert len(overrides) == 1, command
+    config = parse_hydra_overrides(
+        OmegaConf.create({"env": {"nemo_gym": {}}}), overrides
+    )
+    return OmegaConf.to_container(config.env.nemo_gym.external_service_readiness)
+
+
+def test_inline_job_routes_pools_and_gates_nemo_rl_on_their_readiness(tmp_path):
+    log_dir = tmp_path / "logs/4242-logs"
+    fake_ray_sub = tmp_path / "ray.sub"
+    _write_executable(
+        fake_ray_sub,
+        """\
+        #!/bin/bash
+        printf '%s' "${COMMAND}" > "${FAKE_SLURM_DIR}/ray_sub_command"
+        echo "${SLURM_JOB_NODELIST} ${SLURM_JOB_NUM_NODES}" > "${FAKE_SLURM_DIR}/ray_sub_nodes"
+        # Like a real driver, outlive the wrapper's external readiness checks.
+        for _ in $(seq 1 1000); do
+          [[ -f "${FAKE_RAY_SUB_WAIT_FOR}" ]] && exit 0
+          "${FAKE_SLEEP}" 0.01
+        done
+        exit 1
+        """,
+    )
+    env = _fake_slurm_env(tmp_path)
+    env.update(
+        {
+            "SLURM_HET_SIZE": "2",
+            "SLURM_JOB_NODELIST_HET_GROUP_0": "ray-b,ray-a",
+            "SLURM_JOB_NODELIST_HET_GROUP_1": "svc-a,svc-b,svc-c,svc-d",
+            "SLURM_JOB_ACCOUNT": "account",
+            "SLURM_JOB_PARTITION": "partition",
+            "SLURM_SUBMIT_DIR": str(tmp_path),
+            "MOUNTS": "/data:/data",
+            "COMMAND": "run genrm=__GENRM_URL__ judge=__JUDGE_URL__",
+            "RAY_SUB": str(fake_ray_sub),
+            "FAKE_RAY_SUB_WAIT_FOR": str(log_dir / "judge_url"),
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", str(tmp_path / "tools/run_in_allocation.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "ray_sub_nodes").read_text() == "ray-b,ray-a 2\n"
+    command = (tmp_path / "ray_sub_command").read_text()
+    assert command.startswith(
+        "run genrm=http://10.0.0.1:9213/v1 judge=http://10.0.0.1:9214/v1 "
+    )
+    assert _parse_readiness_override(command) == {
+        "services": [
+            {
+                "name": "GENRM",
+                "url": "http://10.0.0.1:9213/health",
+                "expected_backends": 2,
+            },
+            {
+                "name": "JUDGE",
+                "url": "http://10.0.0.1:9214/health",
+                "expected_backends": 1,
+            },
+        ],
+        "timeout_seconds": 3600,
+        "poll_interval_seconds": 5,
+        "request_timeout_seconds": 10,
+    }
+    replica_steps, lb_steps = _recorded_srun_steps(tmp_path)
+    assert sorted(
+        arg for step in replica_steps for arg in step if arg.startswith("--nodelist=")
+    ) == ["--nodelist=svc-a", "--nodelist=svc-b", "--nodelist=svc-c,svc-d"]
+    for step in replica_steps:
+        assert "--het-group=1" in step
+        assert "-A" not in step and "-p" not in step
+    assert len(lb_steps) == 2
+    for step in lb_steps:
+        assert "--het-group=0" in step
+        assert step[step.index("-A") + 1] == "account"
+        assert step[step.index("-p") + 1] == "partition"
+        assert "--nodelist=ray-a" in step
+        assert f"--container-workdir={tmp_path}" in step
+        assert any(arg.startswith("--container-mounts=/data:/data,") for arg in step)
+    assert not (log_dir / "external_vllm_services.tsv").exists()
+
+
+def test_services_only_job_serves_pools_to_separately_submitted_nemo_rl(tmp_path):
+    log_dir = tmp_path / "logs/4242-logs"
+    manifest = log_dir / "external_vllm_services.tsv"
+    env = _fake_slurm_env(tmp_path)
+    # No hetgroups, COMMAND, MOUNTS, or ray.sub: the pools own the allocation.
+    env.update(
+        {
+            "EXTERNAL_VLLM_SERVICES_ONLY": "1",
+            "SLURM_JOB_NODELIST": "svc-d,svc-c,svc-b,svc-a",
+        }
+    )
+    with open(tmp_path / "wrapper.log", "w") as wrapper_log:
+        process = subprocess.Popen(
+            ["bash", str(tmp_path / "tools/run_in_allocation.sh")],
+            env=env,
+            stdout=wrapper_log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    try:
+        deadline = time.monotonic() + 30
+        while (
+            not manifest.exists()
+            and process.poll() is None
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.05)
+        assert manifest.exists(), (tmp_path / "wrapper.log").read_text()
+
+        assert [
+            line.split("\t")
+            for line in manifest.read_text().splitlines()
+            if not line.startswith("#")
+        ] == [
+            [
+                "GENRM",
+                "http://10.0.1.1:9213/v1",
+                "http://10.0.1.1:9213/health",
+                "2",
+                "genrm",
+            ],
+            [
+                "JUDGE",
+                "http://10.0.1.1:9214/v1",
+                "http://10.0.1.1:9214/health",
+                "1",
+                "model",
+            ],
+        ]
+        replica_steps, lb_steps = _recorded_srun_steps(tmp_path)
+        assert sorted(
+            arg
+            for step in replica_steps
+            for arg in step
+            if arg.startswith("--nodelist=")
+        ) == ["--nodelist=svc-a", "--nodelist=svc-b", "--nodelist=svc-c,svc-d"]
+        assert len(lb_steps) == 2
+        for step in replica_steps + lb_steps:
+            assert not any(arg.startswith("--het-group") for arg in step)
+            assert "-A" not in step and "-p" not in step
+        for step in lb_steps:
+            assert "--nodelist=svc-a" in step
+        assert not (tmp_path / "ray_sub_command").exists()
+
+        # A NeMo RL launcher that uses only some of the pools attaches to them.
+        attach = subprocess.run(
+            [
+                "bash",
+                "-c",
+                textwrap.dedent(
+                    f"""\
+                    set -euo pipefail
+                    source {tmp_path}/tools/pool_config.sh
+                    register_external_vllm_pool GENRM \\
+                      --model genrm-model-id --container vllm.sqsh \\
+                      --python /opt/vllm/bin/python --replicas 2 \\
+                      --tensor-parallel-size 4 --lb-port 9213 \\
+                      --served-model-name genrm --startup-timeout 600 \\
+                      --url-placeholder __GENRM_URL__
+                    resolve_external_vllm_services 'run genrm=__GENRM_URL__' {log_dir}
+                    """
+                ),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert attach.returncode == 0, attach.stderr
+        assert attach.stdout.startswith("run genrm=http://10.0.1.1:9213/v1 ")
+        assert _parse_readiness_override(attach.stdout) == {
+            "services": [
+                {
+                    "name": "GENRM",
+                    "url": "http://10.0.1.1:9213/health",
+                    "expected_backends": 2,
+                }
+            ],
+            "timeout_seconds": 600,
+            "poll_interval_seconds": 5,
+            "request_timeout_seconds": 10,
+        }
+
+        # Stopping the job withdraws the manifest so no new job attaches.
+        process.send_signal(signal.SIGTERM)
+        assert process.wait(timeout=10) == 143
+        assert not manifest.exists()
+        assert (log_dir / "ENDED").exists()
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        # Reap any fake srun steps the wrapper left behind.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def test_services_only_mode_rejects_a_heterogeneous_allocation():
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / "tools/external_gym_vllm/run_in_allocation.sh")],
+        env={
+            "PATH": os.environ["PATH"],
+            "SLURM_JOB_ID": "123",
+            "SLURM_HET_SIZE": "2",
+            "EXTERNAL_VLLM_SERVICES_ONLY": "1",
+        },
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "requires a single-component allocation, got 2 hetgroups" in result.stderr
+
+
+_GENRM_SERVICE = "GENRM\thttp://10.0.1.1:9213/v1\thttp://10.0.1.1:9213/health"
+
+
+@pytest.mark.parametrize(
+    ("manifest", "expected_error"),
+    [
+        (None, "external_vllm_services.tsv does not exist"),
+        (
+            "JUDGE\thttp://10.0.1.1:9214/v1\thttp://10.0.1.1:9214/health\t1\tmodel\n",
+            "do not include pool GENRM",
+        ),
+        (
+            f"{_GENRM_SERVICE}\t2\tother\n",
+            "pool GENRM serves model name 'other', but GENRM_SERVED_MODEL_NAME='genrm'",
+        ),
+        (
+            "GENRM\t10.0.1.1:9213/v1\thttp://10.0.1.1:9213/health\t2\tgenrm\n",
+            "malformed GENRM entry",
+        ),
+        (
+            f"{_GENRM_SERVICE}\t0\tgenrm\n",
+            "GENRM expected backends must be a positive integer",
+        ),
+    ],
+)
+def test_resolve_external_vllm_services_rejects_unusable_services(
+    tmp_path, manifest, expected_error
+):
+    if manifest is not None:
+        (tmp_path / "external_vllm_services.tsv").write_text(manifest)
+    program = textwrap.dedent(
+        f"""\
+        source {REPO_ROOT}/tools/external_gym_vllm/pool_config.sh
+        register_external_vllm_pool GENRM \\
+          --model genrm-model-id --container vllm.sqsh \\
+          --python /opt/vllm/bin/python --replicas 2 \\
+          --tensor-parallel-size 4 --lb-port 9213 \\
+          --served-model-name genrm --url-placeholder __GENRM_URL__
+        resolve_external_vllm_services 'run genrm=__GENRM_URL__' {tmp_path}
+        """
+    )
+
+    result = subprocess.run(["bash", "-c", program], capture_output=True, text=True)
+
+    assert result.returncode == 2
+    assert expected_error in result.stderr
+    assert result.stdout == ""
 
 
 def _run_lightning_launcher(**overrides):
@@ -896,3 +1329,163 @@ def test_lightning_launcher_rejects_invalid_external_pool_tp():
 
     assert result.returncode == 2
     assert "must be divisible by GPUS_PER_NODE=4" in result.stderr
+
+
+def test_lightning_launcher_dry_run_submits_only_the_external_pools():
+    result = _run_lightning_launcher(EXTERNAL_VLLM_SERVICES_ONLY="1")
+
+    assert result.returncode == 0, result.stderr
+    assert "Job name:    lightning-launcher-test-services" in result.stdout
+    assert "Nodes:       20 total" in result.stdout
+    assert "Services only: 20 external-service nodes" in result.stdout
+    assert "GenRM:    8 independent TP=8, DP=1 servers" in result.stdout
+    assert "NL2Bash:  4 independent TP=4, DP=1 servers" in result.stdout
+    assert "Hetgroup" not in result.stdout
+    assert "Training:" not in result.stdout
+    assert "--- TRAIN_CMD ---" not in result.stdout
+
+
+def test_lightning_launcher_dry_run_attaches_to_running_services(tmp_path):
+    (tmp_path / "external_vllm_services.tsv").write_text(
+        "# External vLLM services from Slurm job 4242\n"
+        "GENRM\thttp://10.0.1.1:9213/v1\thttp://10.0.1.1:9213/health\t8\tmodel\n"
+        "NL2BASH\thttp://10.0.1.1:9214/v1\thttp://10.0.1.1:9214/health\t4\tmodel\n"
+    )
+
+    result = _run_lightning_launcher(EXTERNAL_VLLM_SERVICES_DIR=str(tmp_path))
+
+    assert result.returncode == 0, result.stderr
+    assert "Nodes:       66 total" in result.stdout
+    assert "Hetgroup" not in result.stdout
+    assert f"External services: {tmp_path}" in result.stdout
+    batch_script_line = next(
+        line for line in result.stdout.splitlines() if "Batch script:" in line
+    )
+    assert batch_script_line.endswith("/ray.sub")
+    train_cmd = result.stdout.split("--- TRAIN_CMD ---\n")[1].split("\n--- end ---")[0]
+    assert "__GENRM_BASE_URL__" not in train_cmd
+    assert "__NL2BASH_BASE_URL__" not in train_cmd
+    assert "genrm_model.base_url=http://10.0.1.1:9213/v1" in train_cmd
+    assert "local_vllm_model.base_url=http://10.0.1.1:9214/v1" in train_cmd
+    assert _parse_readiness_override(train_cmd)["services"] == [
+        {
+            "name": "GENRM",
+            "url": "http://10.0.1.1:9213/health",
+            "expected_backends": 8,
+        },
+        {
+            "name": "NL2BASH",
+            "url": "http://10.0.1.1:9214/health",
+            "expected_backends": 4,
+        },
+    ]
+
+
+def test_lightning_launcher_rejects_unusable_external_services_modes(tmp_path):
+    missing = _run_lightning_launcher(EXTERNAL_VLLM_SERVICES_DIR=str(tmp_path))
+    both = _run_lightning_launcher(
+        EXTERNAL_VLLM_SERVICES_ONLY="1", EXTERNAL_VLLM_SERVICES_DIR=str(tmp_path)
+    )
+
+    assert missing.returncode == 2
+    assert "external_vllm_services.tsv does not exist" in missing.stderr
+    assert both.returncode == 2
+    assert "mutually exclusive" in both.stderr
+
+
+def _run_ultra_launcher(**overrides):
+    launcher = REPO_ROOT / "examples/nemo_gym/nemotron-3-ultra/ultra_launch.sh"
+    with tempfile.TemporaryDirectory(dir=REPO_ROOT) as temp_dir:
+        root = Path(temp_dir)
+        env = {
+            "HOME": str(root),
+            "PATH": os.environ["PATH"],
+            "DRY_RUN": "1",
+            "USE_SNAPSHOT": "0",
+            "EXP_NAME": "ultra-launcher-test",
+            "CONFIG_PATH": "examples/nemo_gym/nemotron-3-ultra/student_rlvr1.yaml",
+            "MODEL_PATH": "test-policy-model",
+            "TRAIN_PATH": str(root / "train.jsonl"),
+            "VAL_PATH": str(root / "validation.jsonl"),
+            "CONTAINER": "test-container",
+            "SANDBOX_CONTAINER": "test-sandbox-container",
+            "PERSISTENT_CACHE": str(root / "cache"),
+            "RESULTS_DIR": str(root / "results"),
+            "EXTERNAL_VLLM_SHARED_ROOT": str(REPO_ROOT),
+            "SLURM_PARTITION": "test-partition",
+            "SLURM_ACCOUNT": "test-account",
+            "EXTERNAL_JUDGES": "1",
+            "GENRM_MODEL": "test-genrm-model",
+            "NL2BASH_JUDGE_MODEL": "test-nl2bash-model",
+            "SAFETY_JUDGE_MODEL": "test-safety-model",
+        }
+        env.update(overrides)
+        return subprocess.run(
+            ["bash", str(launcher)],
+            cwd=REPO_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+
+def test_ultra_launcher_dry_run_builds_inline_external_judges():
+    result = _run_ultra_launcher()
+
+    assert result.returncode == 0, result.stderr
+    assert "Nodes:       264 total" in result.stdout
+    assert "Hetgroup 0: 256 NeMo RL nodes" in result.stdout
+    assert "Hetgroup 1: 8 external-service nodes" in result.stdout
+    assert "genrm_model.base_url=__GENRM_BASE_URL__" in result.stdout
+    assert "local_vllm_model.base_url=__NL2BASH_BASE_URL__" in result.stdout
+
+
+def test_ultra_launcher_dry_run_submits_only_the_judge_pools():
+    result = _run_ultra_launcher(EXTERNAL_VLLM_SERVICES_ONLY="1")
+
+    assert result.returncode == 0, result.stderr
+    assert "Job name:    ultra-launcher-test-services" in result.stdout
+    assert "Nodes:       8 total" in result.stdout
+    assert "Services only: 8 external-service nodes" in result.stdout
+    assert "GenRM: 4 independent TP=4, DP=1 servers" in result.stdout
+    assert "NL2Bash: 4 independent TP=4, DP=1 servers" in result.stdout
+    assert "Hetgroup" not in result.stdout
+    assert "Training:" not in result.stdout
+    assert "--- TRAIN_CMD ---" not in result.stdout
+
+
+def test_ultra_launcher_dry_run_attaches_to_running_services(tmp_path):
+    # The services job may serve more pools than a stage uses.
+    (tmp_path / "external_vllm_services.tsv").write_text(
+        "GENRM\thttp://10.0.1.1:9213/v1\thttp://10.0.1.1:9213/health\t16\tmodel\n"
+        "NL2BASH\thttp://10.0.1.1:9214/v1\thttp://10.0.1.1:9214/health\t4\tmodel\n"
+    )
+
+    result = _run_ultra_launcher(
+        EXTERNAL_VLLM_SERVICES_DIR=str(tmp_path), NL2BASH_JUDGE_MODEL=""
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Nodes:       256 total" in result.stdout
+    assert "Hetgroup" not in result.stdout
+    assert f"External services: {tmp_path}" in result.stdout
+    train_cmd = result.stdout.split("--- TRAIN_CMD ---\n")[1].split("\n--- end ---")[0]
+    assert "genrm_model.base_url=http://10.0.1.1:9213/v1" in train_cmd
+    assert "genrm_model.model=model" in train_cmd
+    assert "nl2bash" not in train_cmd
+    assert _parse_readiness_override(train_cmd)["services"] == [
+        {
+            "name": "GENRM",
+            "url": "http://10.0.1.1:9213/health",
+            "expected_backends": 16,
+        }
+    ]
+
+
+def test_ultra_launcher_external_services_modes_require_external_judges(tmp_path):
+    result = _run_ultra_launcher(
+        EXTERNAL_JUDGES="0", EXTERNAL_VLLM_SERVICES_DIR=str(tmp_path)
+    )
+
+    assert result.returncode == 1
+    assert "require EXTERNAL_JUDGES=1" in result.stderr

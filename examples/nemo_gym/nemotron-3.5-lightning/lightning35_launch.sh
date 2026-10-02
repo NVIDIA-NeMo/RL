@@ -44,6 +44,11 @@ set -euo pipefail
 #                                          GENRM_SEGMENT_SIZE is also accepted
 #   NL2BASH_REPLICAS=4                      Independent external judge servers
 #   NL2BASH_TENSOR_PARALLEL_SIZE=4          TP per external judge server
+#   EXTERNAL_VLLM_SERVICES_ONLY=0          1 to submit only the GenRM and
+#                                          NL2Bash pools as a standalone job
+#   EXTERNAL_VLLM_SERVICES_DIR=            Log dir of a running services-only
+#                                          job; submit only NeMo RL and use
+#                                          its pools
 #   BATCH_SCRIPT=ray.sub                    Slurm entrypoint; external services
 #                                          may wrap ray.sub
 #   ENABLE_MTP_INFERENCE=0                 1 to enable MTP speculative decoding
@@ -211,8 +216,27 @@ nl2bash_vllm_args=(
 [[ "${NL2BASH_ENABLE_EXPERT_PARALLEL}" == "1" ]] && nl2bash_vllm_args+=(--enable-expert-parallel)
 external_vllm_pool_args NL2BASH "${nl2bash_vllm_args[@]}"
 
+# By default the pools share one heterogeneous job with NeMo RL. They can also
+# run as a standalone services job that separately submitted NeMo RL jobs use,
+# so a pool startup failure never costs a training allocation.
+EXTERNAL_VLLM_SERVICES_ONLY="${EXTERNAL_VLLM_SERVICES_ONLY:-0}"
+EXTERNAL_VLLM_SERVICES_DIR="${EXTERNAL_VLLM_SERVICES_DIR:-}"
+if [[ "${EXTERNAL_VLLM_SERVICES_ONLY}" != "0" && "${EXTERNAL_VLLM_SERVICES_ONLY}" != "1" ]]; then
+  echo "ERROR: EXTERNAL_VLLM_SERVICES_ONLY must be 0 or 1 (got '${EXTERNAL_VLLM_SERVICES_ONLY}')" >&2
+  exit 2
+fi
+if [[ "${EXTERNAL_VLLM_SERVICES_ONLY}" == "1" && -n "${EXTERNAL_VLLM_SERVICES_DIR}" ]]; then
+  echo "ERROR: EXTERNAL_VLLM_SERVICES_ONLY=1 and EXTERNAL_VLLM_SERVICES_DIR are mutually exclusive." >&2
+  exit 2
+fi
+
 RAY_SUB="${RAY_SUB:-${PROJECT_ROOT}/ray.sub}"
-BATCH_SCRIPT="${BATCH_SCRIPT:-${PROJECT_ROOT}/tools/external_gym_vllm/run_in_allocation.sh}"
+if [[ -n "${EXTERNAL_VLLM_SERVICES_DIR}" ]]; then
+  BATCH_SCRIPT="${BATCH_SCRIPT:-${RAY_SUB}}"
+else
+  BATCH_SCRIPT="${BATCH_SCRIPT:-${PROJECT_ROOT}/tools/external_gym_vllm/run_in_allocation.sh}"
+fi
+export EXTERNAL_VLLM_SERVICES_ONLY
 export \
   EXTERNAL_VLLM_LB_PYTHON \
   EXTERNAL_VLLM_POOLS \
@@ -409,10 +433,17 @@ fi
 # NUM_TRAIN_NODES / NUM_GEN_NODES / NUM_GYM_NODES.
 # =============================================================================
 NUM_EXTERNAL_SERVICE_NODES="${EXTERNAL_VLLM_NUM_NODES}"
+if [[ -n "${EXTERNAL_VLLM_SERVICES_DIR}" ]]; then
+  # The pools already run in their own job.
+  NUM_EXTERNAL_SERVICE_NODES=0
+fi
 
 NUM_ACTOR_NODES=$((NUM_TRAIN_NODES + NUM_GEN_NODES))
 NUM_RAY_NODES=$((NUM_ACTOR_NODES + NUM_GYM_NODES))
 NUM_TOTAL_NODES=$((NUM_RAY_NODES + NUM_EXTERNAL_SERVICE_NODES))
+if [[ "${EXTERNAL_VLLM_SERVICES_ONLY}" == "1" ]]; then
+  NUM_TOTAL_NODES="${NUM_EXTERNAL_SERVICE_NODES}"
+fi
 
 if (( NUM_TRAIN_NODES <= 0 )); then
   echo "ERROR: NUM_TRAIN_NODES must be > 0 (got ${NUM_TRAIN_NODES})" >&2; exit 1
@@ -811,8 +842,13 @@ ${NRL_MAX_STEPS:+grpo.max_num_steps=${NRL_MAX_STEPS}} \
 ${MTP_EXTRA_ARGS} \
 ${*}"
 
+if [[ -n "${EXTERNAL_VLLM_SERVICES_DIR}" ]]; then
+  TRAIN_CMD="$(resolve_external_vllm_services "${TRAIN_CMD}" "${EXTERNAL_VLLM_SERVICES_DIR}")"
+fi
 export COMMAND="${TRAIN_CMD}"
-if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
+if [[ "${EXTERNAL_VLLM_SERVICES_ONLY}" == "1" ]]; then
+  validate_external_vllm_services "${NUM_EXTERNAL_SERVICE_NODES}"
+elif (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
   validate_external_vllm_submission "${COMMAND}" "${NUM_EXTERNAL_SERVICE_NODES}"
 fi
 
@@ -823,9 +859,16 @@ echo ""
 echo "================================================================"
 echo "  Nemotron 3.5 Lightning — ${EXP_NAME} (${NUM_TOTAL_NODES}-node)"
 echo "================================================================"
+if [[ "${EXTERNAL_VLLM_SERVICES_ONLY}" == "1" ]]; then
+echo "  Job name:    ${JOB_NAME}-services"
+else
 echo "  Job name:    ${JOB_NAME}  (singleton — only one runs at a time)"
+fi
 echo "  Config:      ${CONFIG_PATH}"
 echo "  Nodes:       ${NUM_TOTAL_NODES} total"
+if [[ "${EXTERNAL_VLLM_SERVICES_ONLY}" == "1" ]]; then
+echo "    Services only: ${NUM_EXTERNAL_SERVICE_NODES} external-service nodes  (segment=${EXTERNAL_VLLM_SEGMENT_SIZE})"
+else
 if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
 echo "    Hetgroup 0: ${NUM_RAY_NODES} NeMo RL nodes  (segment=${SEGMENT_SIZE})"
 fi
@@ -834,8 +877,14 @@ echo "    vLLM gen:  ${NUM_GEN_NODES}  ($((NUM_GEN_NODES * GPUS_PER_NODE)) GPUs)
 echo "    Gym:       ${NUM_GYM_NODES}  ($((NUM_GYM_NODES * GPUS_PER_NODE)) GPUs)"
 if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
 echo "    Hetgroup 1: ${NUM_EXTERNAL_SERVICE_NODES} external-service nodes  (segment=${EXTERNAL_VLLM_SEGMENT_SIZE})"
+fi
+fi
+if (( NUM_EXTERNAL_SERVICE_NODES > 0 )); then
 echo "      GenRM:    ${GENRM_REPLICAS} independent TP=${GENRM_TENSOR_PARALLEL_SIZE}, DP=1 servers; LB port=${GENRM_LB_PORT}"
 echo "      NL2Bash:  ${NL2BASH_REPLICAS} independent TP=${NL2BASH_TENSOR_PARALLEL_SIZE}, DP=1 servers; LB port=${NL2BASH_LB_PORT}"
+fi
+if [[ -n "${EXTERNAL_VLLM_SERVICES_DIR}" ]]; then
+echo "    External services: ${EXTERNAL_VLLM_SERVICES_DIR}"
 fi
 echo "  Walltime:    ${WALLTIME}"
 echo "  Batch script: ${BATCH_SCRIPT}"
@@ -896,6 +945,9 @@ if [[ "${DRY_RUN}" == "1" ]]; then
     done <<< "${!pool_args_var}"
   done
   echo "--- end pool args ---"
+  if [[ "${EXTERNAL_VLLM_SERVICES_ONLY}" == "1" ]]; then
+    exit 0
+  fi
   echo ""
   echo "--- TRAIN_CMD ---"
   echo "${TRAIN_CMD}"
@@ -912,43 +964,90 @@ SLURM_DEPENDENCY="${SLURM_DEPENDENCY:-}"
 DEPENDENCY="singleton"
 [[ -n "${SLURM_DEPENDENCY}" ]] && DEPENDENCY="singleton,${SLURM_DEPENDENCY}"
 
-SBATCH_OUTPUT=$(sbatch \
-    --nodes="${NUM_RAY_NODES}" \
-    --account="${SLURM_ACCOUNT}" \
-    --job-name="${JOB_NAME}" \
-    --partition="${SLURM_PARTITION}" \
-    --time="${WALLTIME}" \
-    --gres=gpu:${GPUS_PER_NODE} \
-    --exclusive \
-    --mem=0 \
-    --dependency="${DEPENDENCY}" \
-    --segment="${SEGMENT_SIZE}" \
-    --output="${SLURM_LOG_DIR}/%j.out" \
-    --error="${SLURM_LOG_DIR}/%j.err" \
-    ${SLURM_QOS:+--qos="${SLURM_QOS}"} \
-    ${EXCLUDE_NODES:+--exclude="${EXCLUDE_NODES}"} \
-    ${SLURM_RESERVATION:+--reservation="${SLURM_RESERVATION}"} \
-    "${SLURM_COMMENT_ARGS[@]}" \
-    : \
-    --nodes="${NUM_EXTERNAL_SERVICE_NODES}" \
-    --account="${SLURM_ACCOUNT}" \
-    --job-name="${JOB_NAME}-services" \
-    --partition="${SLURM_PARTITION}" \
-    --time="${WALLTIME}" \
-    --gres=gpu:${GPUS_PER_NODE} \
-    --exclusive \
-    --mem=0 \
-    --segment="${EXTERNAL_VLLM_SEGMENT_SIZE}" \
-    ${SLURM_QOS:+--qos="${SLURM_QOS}"} \
-    ${EXCLUDE_NODES:+--exclude="${EXCLUDE_NODES}"} \
-    ${SLURM_RESERVATION:+--reservation="${SLURM_RESERVATION}"} \
-    "${BATCH_SCRIPT}")
+if [[ "${EXTERNAL_VLLM_SERVICES_ONLY}" == "1" ]]; then
+  # Not a singleton: services jobs are not resumed training runs.
+  SBATCH_OUTPUT=$(sbatch \
+      --nodes="${NUM_EXTERNAL_SERVICE_NODES}" \
+      --account="${SLURM_ACCOUNT}" \
+      --job-name="${JOB_NAME}-services" \
+      --partition="${SLURM_PARTITION}" \
+      --time="${WALLTIME}" \
+      --gres=gpu:${GPUS_PER_NODE} \
+      --exclusive \
+      --mem=0 \
+      ${SLURM_DEPENDENCY:+--dependency="${SLURM_DEPENDENCY}"} \
+      --segment="${EXTERNAL_VLLM_SEGMENT_SIZE}" \
+      --output="${SLURM_LOG_DIR}/%j.out" \
+      --error="${SLURM_LOG_DIR}/%j.err" \
+      ${SLURM_QOS:+--qos="${SLURM_QOS}"} \
+      ${EXCLUDE_NODES:+--exclude="${EXCLUDE_NODES}"} \
+      ${SLURM_RESERVATION:+--reservation="${SLURM_RESERVATION}"} \
+      "${SLURM_COMMENT_ARGS[@]}" \
+      "${BATCH_SCRIPT}")
+elif [[ -n "${EXTERNAL_VLLM_SERVICES_DIR}" ]]; then
+  SBATCH_OUTPUT=$(sbatch \
+      --nodes="${NUM_RAY_NODES}" \
+      --account="${SLURM_ACCOUNT}" \
+      --job-name="${JOB_NAME}" \
+      --partition="${SLURM_PARTITION}" \
+      --time="${WALLTIME}" \
+      --gres=gpu:${GPUS_PER_NODE} \
+      --exclusive \
+      --mem=0 \
+      --dependency="${DEPENDENCY}" \
+      --segment="${SEGMENT_SIZE}" \
+      --output="${SLURM_LOG_DIR}/%j.out" \
+      --error="${SLURM_LOG_DIR}/%j.err" \
+      ${SLURM_QOS:+--qos="${SLURM_QOS}"} \
+      ${EXCLUDE_NODES:+--exclude="${EXCLUDE_NODES}"} \
+      ${SLURM_RESERVATION:+--reservation="${SLURM_RESERVATION}"} \
+      "${SLURM_COMMENT_ARGS[@]}" \
+      "${BATCH_SCRIPT}")
+else
+  SBATCH_OUTPUT=$(sbatch \
+      --nodes="${NUM_RAY_NODES}" \
+      --account="${SLURM_ACCOUNT}" \
+      --job-name="${JOB_NAME}" \
+      --partition="${SLURM_PARTITION}" \
+      --time="${WALLTIME}" \
+      --gres=gpu:${GPUS_PER_NODE} \
+      --exclusive \
+      --mem=0 \
+      --dependency="${DEPENDENCY}" \
+      --segment="${SEGMENT_SIZE}" \
+      --output="${SLURM_LOG_DIR}/%j.out" \
+      --error="${SLURM_LOG_DIR}/%j.err" \
+      ${SLURM_QOS:+--qos="${SLURM_QOS}"} \
+      ${EXCLUDE_NODES:+--exclude="${EXCLUDE_NODES}"} \
+      ${SLURM_RESERVATION:+--reservation="${SLURM_RESERVATION}"} \
+      "${SLURM_COMMENT_ARGS[@]}" \
+      : \
+      --nodes="${NUM_EXTERNAL_SERVICE_NODES}" \
+      --account="${SLURM_ACCOUNT}" \
+      --job-name="${JOB_NAME}-services" \
+      --partition="${SLURM_PARTITION}" \
+      --time="${WALLTIME}" \
+      --gres=gpu:${GPUS_PER_NODE} \
+      --exclusive \
+      --mem=0 \
+      --segment="${EXTERNAL_VLLM_SEGMENT_SIZE}" \
+      ${SLURM_QOS:+--qos="${SLURM_QOS}"} \
+      ${EXCLUDE_NODES:+--exclude="${EXCLUDE_NODES}"} \
+      ${SLURM_RESERVATION:+--reservation="${SLURM_RESERVATION}"} \
+      "${BATCH_SCRIPT}")
+fi
 
 echo "${SBATCH_OUTPUT}"
 JOB_ID=$(echo "${SBATCH_OUTPUT}" | grep -oP '\d+$') || true
 
 if [[ -n "${JOB_ID}" ]]; then
   echo ""
-  echo "  Ray logs:    ${BASE_LOG_DIR}/${JOB_ID}-logs/"
+  if [[ "${EXTERNAL_VLLM_SERVICES_ONLY}" == "1" ]]; then
+    echo "  Services dir: ${BASE_LOG_DIR}/${JOB_ID}-logs"
+    echo "  Once the job log reports the services ready, submit NeMo RL jobs with"
+    echo "  EXTERNAL_VLLM_SERVICES_DIR=${BASE_LOG_DIR}/${JOB_ID}-logs"
+  else
+    echo "  Ray logs:    ${BASE_LOG_DIR}/${JOB_ID}-logs/"
+  fi
   echo ""
 fi
