@@ -57,6 +57,7 @@ from nemo_rl.environments.gym_checkpoint_adapter import (
     GymCheckpointCommitSummary,
     GymCheckpointEpisode,
     GymCheckpointInstance,
+    GymCheckpointParticipantRecord,
     GymCheckpointParticipantSummary,
     GymCheckpointPrepareSummary,
 )
@@ -865,6 +866,7 @@ Depending on your data shape, you may want to change these values."""
         checkpoint_root: str,
         episodes: tuple[GymCheckpointEpisode, ...],
         *,
+        participants: tuple[GymCheckpointParticipantRecord, ...],
         source_checkpoint_id: str,
         deadline_ts: float,
     ) -> None:
@@ -873,6 +875,7 @@ Depending on your data shape, you may want to change these values."""
             checkpoint_id,
             checkpoint_root,
             episodes,
+            participants=participants,
             source_checkpoint_id=source_checkpoint_id,
             deadline_ts=deadline_ts,
         )

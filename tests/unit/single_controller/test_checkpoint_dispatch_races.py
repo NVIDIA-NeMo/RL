@@ -352,6 +352,7 @@ class _SavingGymCoordinator:
                 checkpoint_id=checkpoint_id,
                 instances={"tools/replica-0": summary.exported_episodes},
                 staging_keys={"tools/replica-0": summary.staging_keys},
+                participants={"tools/replica-0": ()},
             ),
             instances={"tools/replica-0": summary},
         )
@@ -1674,6 +1675,7 @@ def test_turn_recovery_restores_gym_before_redispatch(tmp_path: Path) -> None:
                 "tools/replica-0": (GymCheckpointEpisode(rollout_id, attempt),),
             },
             staging_keys={"tools/replica-0": ()},
+            participants={"tools/replica-0": ()},
         )
         write_gym_checkpoint_manifest(tmp_path, manifest)
 
