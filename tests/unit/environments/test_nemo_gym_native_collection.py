@@ -6,6 +6,7 @@ collector/adapter integration without starting an agent or a policy model.
 
 import asyncio
 from copy import deepcopy
+from unittest.mock import AsyncMock, call
 
 import pytest
 from aiohttp import ClientSession, web
@@ -56,8 +57,10 @@ def _model_response(*, native: bool) -> gym_openai.NeMoGymResponse:
     )
 
 
+@pytest.mark.parametrize("token_capture", [False, True])
 def test_real_collector_streams_native_and_legacy_http_results(
     monkeypatch: pytest.MonkeyPatch,
+    token_capture: bool,
 ) -> None:
     async def run() -> None:
         received_native = []
@@ -159,14 +162,17 @@ def test_real_collector_streams_native_and_legacy_http_results(
                     **deepcopy(native_task),
                     "_rowidx": index,
                     "_ng_group_id": "native-group",
-                    "_ng_group_attempt": 2,
+                    "_ng_group_attempt": 3,
                     "_ng_rollout_index": index,
+                    "_ng_rollout_id": f"capture-native-{index}",
+                    "_ng_attempt_index": index * 2,
                 }
                 for index in range(2)
             ]
             rows.append(
                 {
                     "_rowidx": 2,
+                    "_ng_rollout_id": "capture-legacy",
                     "agent_ref": {"name": "legacy_agent"},
                     "responses_create_params": {
                         "input": [{"role": "user", "content": "Legacy weather request"}]
@@ -181,6 +187,38 @@ def test_real_collector_streams_native_and_legacy_http_results(
                 host=native_server.host, port=native_server.port
             )
             actor._tokenizer = _TokenDecoder()
+            actor._token_capture_enabled = token_capture
+
+            async def manifest(method: str, path: str) -> dict:
+                capture_key = path.split("/")[-2]
+                response_id = (
+                    "response-legacy"
+                    if capture_key == "capture-legacy"
+                    else "response-native"
+                )
+                return {
+                    "rollout_id": capture_key,
+                    "records": [
+                        {
+                            "model_call_id": "call-1",
+                            "parent_call_id": None,
+                            "prev_len": 0,
+                            "delta_len": 5,
+                            "cum_len": 5,
+                            "weight_version": 3,
+                            "digest": "a" * 64,
+                            "extras_digest": "b" * 64,
+                            "staging_key": f"{capture_key}/call-1",
+                            "mode": "text",
+                            "response_id": response_id,
+                            "chain_hash": "c" * 64,
+                            "cumulative_hash": "d" * 64,
+                        }
+                    ],
+                    "failures": [],
+                }
+
+            actor._control = AsyncMock(side_effect=manifest)
             streamed = [
                 item async for item in actor.run_rollouts(rows, "timing/integration")
             ]
@@ -188,21 +226,14 @@ def test_real_collector_streams_native_and_legacy_http_results(
         assert len(received_native) == 2
         assert len(received_legacy) == 1
         assert {body["episode_id"]["rollout_id"] for body in received_native} == {
-            "native-group-0",
-            "native-group-1",
+            "capture-native-0",
+            "capture-native-1",
         }
         for body in received_native:
             assert set(body) == {"episode_id", "task"}
-            assert body["episode_id"]["attempt"] == 2
-            expected_task = deepcopy(native_task)
-            expected_task["task_input"]["task_data"].update(
-                _ng_group_id="native-group",
-                _ng_group_attempt=2,
-                _ng_rollout_index=int(
-                    body["episode_id"]["rollout_id"].rsplit("-", 1)[1]
-                ),
-            )
-            assert body["task"] == expected_task
+            index = int(body["episode_id"]["rollout_id"].rsplit("-", 1)[1])
+            assert body["episode_id"]["attempt"] == index * 2
+            assert body["task"] == native_task
         assert "episode_id" not in received_legacy[0]
         assert received_legacy[0]["agent_ref"]["name"] == "legacy_agent"
 
@@ -217,25 +248,54 @@ def test_real_collector_streams_native_and_legacy_http_results(
             assert agent_ref == {"type": "responses_api_agents", "name": "native_agent"}
             assert result["full_result"]["reward"] == 0.75
             assert result["full_result"]["_ng_episode_id"] == {
-                "rollout_id": f"native-group-{index}",
-                "attempt": 2,
+                "rollout_id": f"capture-native-{index}",
+                "attempt": index * 2,
             }
             assert result["full_result"]["_ng_task_id"] == native_task["task_id"]
             assert (
                 result["full_result"]["_ng_environment_server"] == "native_environment"
             )
-            assert result["message_log"][0]["token_ids"].tolist() == [1, 2, 3]
-            assert result["message_log"][1]["token_ids"].tolist() == [11, 12]
-            assert result["message_log"][1][
-                "generation_logprobs"
-            ].tolist() == pytest.approx([-0.1, -0.2])
-            assert result["message_log"][1]["role"] == "assistant"
+            if not token_capture:
+                assert result["message_log"][0]["token_ids"].tolist() == [1, 2, 3]
+                assert result["message_log"][1]["token_ids"].tolist() == [11, 12]
+                assert result["message_log"][1][
+                    "generation_logprobs"
+                ].tolist() == pytest.approx([-0.1, -0.2])
+                assert result["message_log"][1]["role"] == "assistant"
         legacy_ref, legacy_result = by_index[2]
         assert legacy_ref["name"] == "legacy_agent"
         assert legacy_result["full_result"]["reward"] == 0.25
-        assert legacy_result["message_log"][1]["token_ids"].tolist() == [21]
-        assert legacy_result["message_log"][1][
-            "generation_logprobs"
-        ].tolist() == pytest.approx([-0.4])
+        if token_capture:
+            expected_captures = [
+                ("capture-native-0", 0.75),
+                ("capture-native-1-a2", 0.75),
+                ("capture-legacy", 0.25),
+            ]
+            actor._control.assert_has_awaits(
+                [
+                    call(
+                        "GET",
+                        f"/training-token-capture/control/rollouts/{capture_key}/manifest",
+                    )
+                    for capture_key, _ in expected_captures
+                ],
+                any_order=True,
+            )
+            assert actor._control.await_count == 3
+            for index, (capture_key, reward) in enumerate(expected_captures):
+                result = by_index[index][1]
+                assert result["message_log"] == []
+                assert result["rollout_id"] == capture_key
+                assert result["receipt"]["rollout_id"] == capture_key
+                assert result["receipt"]["reward"] == reward
+                assert result["receipt"]["terminal_model_call_id"] == "call-1"
+                assert result["receipt"]["terminal_selection"] == "response_id"
+                assert result["receipt"]["capture_poisoned"] is False
+        else:
+            actor._control.assert_not_awaited()
+            assert legacy_result["message_log"][1]["token_ids"].tolist() == [21]
+            assert legacy_result["message_log"][1][
+                "generation_logprobs"
+            ].tolist() == pytest.approx([-0.4])
 
     asyncio.run(run())
