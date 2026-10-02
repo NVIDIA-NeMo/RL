@@ -165,13 +165,16 @@ only one token space is ever staged.
   pixels for every image in the prompt), and passes the remainder to Gym as
   attachments (`None` for text calls). A malformed payload poisons the call
   with `capture_failed` coordinates instead of raising.
-- The Megatron worker pins the staging column dtype to
-  `MINF_MEDIA_PIXEL_DTYPE` (`torch.float32`): MInf's image preprocessing
-  emits torchvision `ToTensor` + `Normalize` patches uncast, and nothing
-  downstream recasts them before the stager takes custody. vLLM pins the
-  engine model dtype instead. The vision encoder casts pixels to its weight
-  dtype, so both train identically; the sink rejects any other pixel dtype, so
-  a drift in either preprocessor fails loudly at the first media stage.
+- Both workers pin the staging column dtype to the dtype the trainer's vision
+  encoder casts pixels to before encoding them (`_encode_images` reads it off
+  the encoder's parameters), so staging in that dtype changes no trained value
+  and halves the pixel bytes a float32 row would carry. vLLM reads it from the
+  engine model dtype, which the Omni processor already emits. MInf's image
+  preprocessing emits torchvision `ToTensor` + `Normalize` patches uncast
+  (float32), so the Megatron worker reads the vision tower's parameter dtype at
+  setup and the stager casts the sliced `imgs` to it before handing them to
+  Gym. The sink rejects any other pixel dtype, so a drift in either path fails
+  loudly at the first media stage.
 - `RolloutReassembler.finalize_group` drops a group in which no valid rollout
   carried media when `capture_media` is set (`media capture on, no valid
   rollout carried media`, printed in the finalizer log line). The controller

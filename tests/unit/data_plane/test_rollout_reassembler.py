@@ -972,7 +972,8 @@ def _stage_media_rollout(
     ``second_turn`` the chain is the two-call golden fixture, and the second
     call carries a second image, so the finalizer must concatenate the two
     calls' pixels in chain order. ``pixel_dtype`` is the partition's pinned
-    pixel dtype (bf16 for the vLLM worker, float32 for the Megatron worker).
+    pixel dtype (the vision encoder's weight dtype on both workers; fp32 covers
+    a config that keeps the vision tower in full precision).
     """
     records, receipt, row = build_fixture_artifacts(
         "worked_example" if second_turn else "single_call", rollout_id=rollout_id

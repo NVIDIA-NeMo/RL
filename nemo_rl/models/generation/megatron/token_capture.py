@@ -422,6 +422,10 @@ class TQMegatronTokenStager:
             weight_version_fn=lambda: 0,
             adapter=MegatronCaptureAdapter(),
         )
+        # MInf hands over float32 pixels; the sink's column is pinned to the
+        # vision encoder's weight dtype (the trainer casts pixels to it before
+        # encoding anyway), so cast once here and stage half the bytes.
+        self._media_pixel_dtype = sink.media_pixel_dtype
         # Requests that straddled a refit (more than one policy_epoch boundary).
         # Metered here because they are stamped, not masked; see _weight_version.
         self._epoch_span_count = 0
@@ -499,6 +503,21 @@ class TQMegatronTokenStager:
             )
             return None
 
+    def _cast_media_pixels(
+        self, media_tensors: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """Cast the sliced ``imgs`` to the sink's pinned pixel dtype.
+
+        Only the pixels change dtype; ``imgs_sizes`` / ``num_frames`` stay
+        int32. A no-op when the dtypes already agree or the sink is text-only.
+        """
+        if not media_tensors:
+            return None
+        imgs = media_tensors["imgs"]
+        if self._media_pixel_dtype is None or imgs.dtype == self._media_pixel_dtype:
+            return media_tensors
+        return {**media_tensors, "imgs": imgs.to(dtype=self._media_pixel_dtype)}
+
     def _stage_admitted(
         self,
         payload: Any,
@@ -540,7 +559,7 @@ class TQMegatronTokenStager:
         coords = self._capture.complete_call_from_response(
             call,
             capture_payload_view,
-            attachments=capture_payload_view.media_tensors or None,
+            attachments=self._cast_media_pixels(capture_payload_view.media_tensors),
         )
         return RequestPayloadStageResult(
             response_metadata={

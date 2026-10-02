@@ -3132,20 +3132,17 @@ def test_offloaded_payload_exposes_multimodal_capture_fields():
 
 
 @pytest.mark.mcore
-def test_minf_image_preprocessing_emits_pinned_pixel_dtype():
-    """Pin the premise behind MINF_MEDIA_PIXEL_DTYPE: MInf's wire image path
-    hands the payload stager float32 packed patches, whatever the model's
-    params dtype, so the Megatron worker's media column must match it."""
+def test_minf_image_preprocessing_emits_float32_pixels():
+    """Pin the premise behind the Megatron stager's pixel cast: MInf's wire
+    image path hands the payload stager float32 packed patches whatever the
+    model's params dtype, so the stager must cast them to the vision encoder's
+    weight dtype (the sink's pinned media column) rather than stage them as is."""
     # Deferred import: megatron-core is a heavy, optional dependency.
     Image = pytest.importorskip("PIL.Image")
     pytest.importorskip("torchvision")
     from megatron.core.inference.config import ImageProcessingConfig
     from megatron.core.inference.text_generation_server.dynamic_text_gen_server.image_preprocessing import (
         preprocess_image,
-    )
-
-    from nemo_rl.models.generation.megatron.megatron_worker import (
-        MINF_MEDIA_PIXEL_DTYPE,
     )
 
     # 4x4 RGB with 2x2 patches: dynamic resolution keeps it at a 2x2 patch grid.
@@ -3157,7 +3154,7 @@ def test_minf_image_preprocessing_emits_pinned_pixel_dtype():
     )
     imgs, imgs_sizes = preprocess_image(Image.new("RGB", (4, 4)), config)
 
-    assert imgs.dtype == MINF_MEDIA_PIXEL_DTYPE
+    assert imgs.dtype == torch.float32
     assert tuple(imgs.shape) == (1, 4, 3 * 2 * 2)
     assert imgs_sizes.dtype == torch.int32
     assert imgs_sizes.tolist() == [[4, 4]]

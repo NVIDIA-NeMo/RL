@@ -435,6 +435,11 @@ class TQTokenSink:
         # sentinels and real rows agree; see ``_media_sentinels``.
         self._media_pixel_dtype = media_pixel_dtype
 
+    @property
+    def media_pixel_dtype(self) -> torch.dtype | None:
+        """The pixel dtype this partition's media column is pinned to (``None`` for text)."""
+        return self._media_pixel_dtype
+
     def stage(
         self,
         record: StagedCallRecord,

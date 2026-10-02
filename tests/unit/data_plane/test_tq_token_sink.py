@@ -557,13 +557,18 @@ def _minf_payload(*, multimodal: bool, media_tensors=...):
     )
 
 
+# The Megatron worker pins the media column to the vision encoder's weight
+# dtype; MInf hands the stager float32 pixels, so every staged row is a cast.
+MEGATRON_PIXEL_DTYPE = torch.bfloat16
+
+
 def _megatron_sink(tq_client, partition, *, media: bool = False) -> TQTokenSink:
-    """A sink matching ``partition``'s schema (the MInf pixels are float32 here)."""
+    """A sink matching ``partition``'s schema, pinned to the vision weight dtype."""
     return TQTokenSink(
         tq_client,
         staging_partition=partition,
         capture_media=media,
-        media_pixel_dtype=torch.float32 if media else None,
+        media_pixel_dtype=MEGATRON_PIXEL_DTYPE if media else None,
     )
 
 
@@ -634,8 +639,9 @@ def test_megatron_stager_writes_canonical_row_and_returns_coords(
     assert not fetched.extras
     assert fetched.media_present is True and fetched.media_has_frames is False
     [media] = source.fetch_media([fetched])
-    assert torch.equal(media.imgs, _minf_media_tensors()["imgs"])
-    assert media.imgs.dtype == torch.float32
+    # MInf's float32 pixels reach TQ in the pinned vision weight dtype.
+    assert media.imgs.dtype == MEGATRON_PIXEL_DTYPE
+    assert torch.equal(media.imgs, _minf_media_tensors()["imgs"].to(media.imgs.dtype))
     assert media.imgs_sizes.tolist() == [[4, 4]]
     assert media.num_frames is None
 
@@ -650,15 +656,24 @@ def test_megatron_stager_writes_canonical_row_and_returns_coords(
             },
             id="media",
         ),
+        pytest.param(
+            {
+                "imgs": torch.arange(4 * 768, dtype=torch.float32).reshape(1, 4, 768),
+                "imgs_sizes": torch.tensor([[32, 32]], dtype=torch.int32),
+            },
+            id="media-float32-cast",
+        ),
         pytest.param(None, id="text"),
         pytest.param({}, id="empty-media-mapping"),
     ],
 )
 def test_megatron_stager_passes_media_tensors_as_attachments(media_tensors):
     """The stager hands MInf's media tensors to Gym as attachments (nothing is
-    parked on the sink); a call without media tensors (absent or empty) reaches
-    Gym with attachments=None."""
+    parked on the sink), casting only ``imgs`` to the sink's pinned pixel dtype
+    when MInf's float32 differs from it; a call without media tensors (absent
+    or empty) reaches Gym with attachments=None."""
     sink = MagicMock(spec=TQTokenSink)
+    sink.media_pixel_dtype = torch.bfloat16
     stager = TQMegatronTokenStager(sink)
     capture = MagicMock()
     capture.complete_call_from_response.return_value = MagicMock(
@@ -684,8 +699,16 @@ def test_megatron_stager_passes_media_tensors_as_attachments(media_tensors):
     if not media_tensors:
         assert attachments is None
         return
-    assert attachments["imgs"] is media_tensors["imgs"]
     assert attachments["imgs_sizes"] is media_tensors["imgs_sizes"]
+    if media_tensors["imgs"].dtype == torch.bfloat16:
+        assert attachments["imgs"] is media_tensors["imgs"]
+    else:
+        assert attachments["imgs"].dtype == torch.bfloat16
+        assert torch.equal(
+            attachments["imgs"], media_tensors["imgs"].to(torch.bfloat16)
+        )
+        # The payload view the adapter reads is left untouched.
+        assert media_tensors["imgs"].dtype == torch.float32
 
 
 def _split_delta(record) -> tuple[list[int], list[int], list[float]]:
@@ -1091,7 +1114,9 @@ def test_megatron_prompt_preparer_splices_resolved_prefix(
     [fetched2] = source.fetch_for_finalization([coords2["staging_key"]])
     assert fetched2.media_present is True
     [media2] = source.fetch_media([fetched2])
-    assert torch.equal(media2.imgs, two_images["imgs"][:, 4:, :])
+    assert torch.equal(
+        media2.imgs, two_images["imgs"][:, 4:, :].to(MEGATRON_PIXEL_DTYPE)
+    )
     assert media2.imgs_sizes.tolist() == [[4, 4]]
 
 

@@ -112,10 +112,6 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
     restore_refit_info_placements,
 )
 
-# MInf's HTTP preprocessing emits float32 patches and the vision encoder casts
-# internally, so staged media stays float32 regardless of the params dtype.
-MINF_MEDIA_PIXEL_DTYPE = torch.float32
-
 
 def _inference_optimized_transformer_layer_spec(config: Any) -> Any:
     """Build the generic GPT layer spec backed by MCore inference linears."""
@@ -372,6 +368,21 @@ class MegatronGenerationMixin:
         ):
             return model, None
         return model.language_model, model
+
+    def _vision_pixel_dtype(self) -> torch.dtype:
+        """The dtype the vision encoder casts pixels to before encoding them.
+
+        Read from the encoder's own parameters rather than the policy dtype:
+        a config may keep the vision tower in fp32 under a bf16 language model.
+        """
+        _, media_model = self._inference_model_and_media_parts()
+        vision_model = getattr(media_model, "vision_model", None)
+        if vision_model is None:
+            raise RuntimeError(
+                "Megatron media capture requires the vision encoder on the "
+                "coordinator's model-parallel stage"
+            )
+        return next(vision_model.parameters()).dtype
 
     def _build_image_preprocessing_config(self, generation_config: dict[str, Any]):
         """Build raw-image preprocessing settings."""
@@ -1023,8 +1034,10 @@ class MegatronGenerationMixin:
         )
 
         dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
-        # Pins the media column to what MInf emits (see MINF_MEDIA_PIXEL_DTYPE).
-        pixel_dtype = MINF_MEDIA_PIXEL_DTYPE if capture_media else None
+        # MInf emits float32 pixels and the trainer casts them to the vision
+        # encoder's weight dtype before encoding, so the stager casts first and
+        # the media column is pinned to that dtype (the rule vLLM follows).
+        pixel_dtype = self._vision_pixel_dtype() if capture_media else None
         prompt_preparer = TQMegatronPromptPreparer(
             TQTokenSource(
                 dp_client,

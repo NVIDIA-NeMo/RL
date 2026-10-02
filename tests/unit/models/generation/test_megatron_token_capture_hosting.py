@@ -8,6 +8,7 @@ import threading
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 nemo_gym = pytest.importorskip("nemo_gym.token_id_capture.staging")
 # megatron_worker imports megatron.core at module level; skip when it is absent.
@@ -17,7 +18,6 @@ from nemo_rl.models.generation.megatron.megatron_generation import (  # noqa: E4
     MegatronGeneration,
 )
 from nemo_rl.models.generation.megatron.megatron_worker import (  # noqa: E402
-    MINF_MEDIA_PIXEL_DTYPE,
     MegatronGenerationMixin,
 )
 
@@ -216,6 +216,19 @@ def _capture_ready_worker() -> MegatronGenerationMixin:
     return worker
 
 
+def _omni_model(vision_dtype: torch.dtype | None) -> SimpleNamespace:
+    """A multimodal parent whose vision tower holds one parameter of ``vision_dtype``
+    (``None``: the tower is absent, as on a stage without the encoder)."""
+    vision_model = (
+        None
+        if vision_dtype is None
+        else SimpleNamespace(
+            parameters=lambda: iter([torch.zeros(1, dtype=vision_dtype)])
+        )
+    )
+    return SimpleNamespace(language_model="lm", vision_model=vision_model)
+
+
 @pytest.mark.parametrize(
     ("capture_media", "image_preprocessing", "expected_sink"),
     [
@@ -223,8 +236,8 @@ def _capture_ready_worker() -> MegatronGenerationMixin:
         pytest.param(
             True,
             SimpleNamespace(patch_dim=16),
-            (True, MINF_MEDIA_PIXEL_DTYPE),
-            id="media-pins-minf-pixel-dtype",
+            (True, torch.float16),
+            id="media-pins-vision-weight-dtype",
         ),
         pytest.param(True, None, None, id="media-requires-image-preprocessing"),
     ],
@@ -234,7 +247,9 @@ def test_worker_media_capture_requires_image_preprocessing(
 ) -> None:
     """A text-only inference wrapper never yields media tensors, so a media-enabled
     partition must be refused at setup rather than filled with text sentinels;
-    text capture ignores the wrapper, and media capture pins MInf's pixel dtype."""
+    text capture ignores the wrapper, and media capture pins the media column to
+    the vision encoder's weight dtype (fp16 here, distinct from a bf16 policy)
+    because the trainer casts pixels to it before encoding."""
     installed = []
 
     class _Sink:
@@ -242,6 +257,8 @@ def test_worker_media_capture_requires_image_preprocessing(
             self, client, *, staging_partition, capture_media, media_pixel_dtype
         ):
             installed.append((capture_media, media_pixel_dtype))
+            # The real stager reads the pinned dtype back off the sink.
+            self.media_pixel_dtype = media_pixel_dtype
 
     monkeypatch.setattr(
         "nemo_rl.data_plane.build_data_plane_client", lambda *_a, **_k: "dp"
@@ -251,6 +268,10 @@ def test_worker_media_capture_requires_image_preprocessing(
     assert worker._image_preprocessing_config is None  # class default: text-only
     if image_preprocessing is not None:
         worker._image_preprocessing_config = image_preprocessing
+    worker._inference_model_and_media_parts = lambda: (
+        "lm",
+        _omni_model(torch.float16),
+    )
 
     if expected_sink is None:
         with pytest.raises(ValueError, match="image-capable inference wrapper"):
@@ -267,6 +288,29 @@ def test_worker_media_capture_requires_image_preprocessing(
         {}, "rollout_staging", capture_media=capture_media
     )
     assert installed == [expected_sink]
+
+
+def test_worker_media_capture_requires_vision_encoder_on_coordinator(
+    monkeypatch,
+) -> None:
+    """The media column dtype comes from the vision tower's parameters, so a
+    coordinator stage without the encoder cannot host media capture."""
+    installed = []
+    monkeypatch.setattr(
+        "nemo_rl.data_plane.build_data_plane_client", lambda *_a, **_k: "dp"
+    )
+    monkeypatch.setattr(
+        "nemo_rl.data_plane.tq_token_sink.TQTokenSink",
+        lambda *_a, **_k: installed.append(True),
+    )
+    worker = _capture_ready_worker()
+    worker._image_preprocessing_config = SimpleNamespace(patch_dim=16)
+    worker._inference_model_and_media_parts = lambda: ("lm", _omni_model(None))
+
+    with pytest.raises(RuntimeError, match="requires the vision encoder"):
+        worker.setup_token_capture({}, "rollout_staging", capture_media=True)
+    assert installed == []
+    assert worker.dynamic_inference_engine.payload_stager is None
 
 
 def test_worker_requires_minf_payload_stager_protocol() -> None:
