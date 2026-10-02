@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ast
 import json
 import os
 import signal
@@ -49,8 +50,8 @@ def test_serve_wrapper_loads_patches_without_importing_nemo_rl_package():
         sys.modules["ray"] = types.ModuleType("ray")
         namespace = runpy.run_path({str(script)!r})
         namespace["_load_apply_vllm_patches"]()
-        assert "nemo_rl.models.generation" not in sys.modules
-        assert "nemo_rl.models.policy" not in sys.modules
+        leaked = [m for m in sys.modules if m.partition(".")[0] == "nemo_rl"]
+        assert not leaked, leaked
         """
     )
 
@@ -61,6 +62,28 @@ def test_serve_wrapper_loads_patches_without_importing_nemo_rl_package():
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_vllm_patches_module_never_imports_nemo_rl():
+    """serve_vllm_on_ray.py runs patches.py by path, then calls _apply_vllm_patches.
+
+    Both happen in serving containers without NeMo RL, so an import of nemo_rl at
+    ANY level -- including lazily inside a patch function -- breaks them. Relative
+    imports break too: a module run by path has no parent package.
+    """
+    path = REPO_ROOT / "nemo_rl/models/generation/vllm/patches.py"
+    for node in ast.walk(ast.parse(path.read_text())):
+        if isinstance(node, ast.Import):
+            modules = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            modules = ["." * node.level + (node.module or "")]
+        else:
+            continue
+        for module in modules:
+            assert module.split(".")[0] not in ("", "nemo_rl"), (
+                f"patches.py:{node.lineno} imports {module!r}; serving containers "
+                "load this module by path without NeMo RL installed."
+            )
 
 
 def test_shutdown_timeout_bounds_watchdog_restart_outage():
