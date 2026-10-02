@@ -1014,6 +1014,10 @@ def _install_fake_vllm_openai_modules(monkeypatch):
     )
     make_module("vllm.exceptions", VLLMValidationError=VLLMValidationError)
     make_module(
+        "vllm.sampling_params",
+        RequestOutputKind=type("RequestOutputKind", (), {"DELTA": "delta"}),
+    )
+    make_module(
         "vllm.reasoning.abs_reasoning_parsers",
         ReasoningParserManager=ReasoningParserManager,
     )
@@ -1132,6 +1136,7 @@ def _setup_fake_vllm_chat_handler(
     worker.llm = MagicMock(model_config="model-config", renderer="renderer")
     worker._http_engine_client = worker.llm
     worker._capture_calls = {}
+    worker._capture_registry_lock = threading.Lock()
     worker.token_capture = None
     worker.llm_async_engine_args = MagicMock()
     worker.llm_async_engine_args.create_model_config.return_value = MagicMock(
@@ -1162,10 +1167,15 @@ def _fake_chat_request():
 
 
 def _track_request_capture(worker, request):
-    """Register in-flight capture state for request; return the fake capture sink."""
-    worker._capture_calls[id(request)] = types.SimpleNamespace(call="call")
+    """Register in-flight capture state for request; return the sink and its call."""
+    call = types.SimpleNamespace(model_call_id="call")
+    worker._capture_calls[id(request)] = types.SimpleNamespace(
+        call=call, lifecycle_lock=threading.Lock(), terminal_started=False
+    )
+    worker._capture_calls_by_model_call_id = {}
+    worker._completed_capture_calls = {}
     worker.token_capture = MagicMock()
-    return worker.token_capture
+    return worker.token_capture, call
 
 
 def _stalled_engine_generator(started: asyncio.Event, cancelled: asyncio.Event):
@@ -1252,7 +1262,7 @@ async def test_plain_value_error_context_overflow_returns_http_400(monkeypatch):
 
     serving_chat.create_chat_completion = create_chat_completion
     request = _fake_chat_request()
-    token_capture = _track_request_capture(worker, request)
+    token_capture, call = _track_request_capture(worker, request)
     response = await chat_handler(request, MagicMock())
 
     response_content = response.body.decode()
@@ -1267,7 +1277,7 @@ async def test_plain_value_error_context_overflow_returns_http_400(monkeypatch):
         "param": "input_tokens",
         "code": 400,
     }
-    token_capture.fail_call.assert_called_once_with("call", reason="context_length")
+    token_capture.fail_call.assert_called_once_with(call, reason="context_length")
 
 
 @pytest.mark.asyncio
@@ -1280,10 +1290,10 @@ async def test_unrelated_value_error_is_reraised(monkeypatch):
 
     serving_chat.create_chat_completion = create_chat_completion
     request = _fake_chat_request()
-    token_capture = _track_request_capture(worker, request)
+    token_capture, call = _track_request_capture(worker, request)
     with pytest.raises(ValueError, match="unexpected internal failure"):
         await chat_handler(request, MagicMock())
-    token_capture.fail_call.assert_called_once_with("call", reason="engine_error")
+    token_capture.fail_call.assert_called_once_with(call, reason="engine_error")
 
 
 @pytest.mark.asyncio

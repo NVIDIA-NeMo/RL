@@ -24,7 +24,7 @@ import warnings
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
-from unittest.mock import ANY, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -75,6 +75,7 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
 )
 from nemo_rl.algorithms.single_controller_utils.config import (
     RolloutCheckpointConfig,
+    RolloutRecoveryConfig,
     TokenCaptureConfig,
     _validate_opd_full_config,
     validate_single_controller_config,
@@ -692,6 +693,26 @@ def test_rollout_recovery_functional_config_resolves_to_runtime_contract(
     assert master_config.async_rl.rollout_failure.nemo_gym.rollout_timeout_s == 120
 
 
+@pytest.mark.parametrize(
+    ("target_level", "turn_checkpointing", "generation_prefix_cuts"),
+    [
+        (RecoveryTargetLevel.PREFIX, True, True),
+        (RecoveryTargetLevel.TURN, True, False),
+        (RecoveryTargetLevel.SIBLING, False, False),
+        (RecoveryTargetLevel.PROMPT_GROUP, False, False),
+    ],
+)
+def test_recovery_target_enables_required_checkpoint_capabilities(
+    target_level: RecoveryTargetLevel,
+    turn_checkpointing: bool,
+    generation_prefix_cuts: bool,
+):
+    config = RolloutRecoveryConfig(target_level=target_level)
+
+    assert config.turn_checkpointing_enabled is turn_checkpointing
+    assert config.generation_prefix_cuts_enabled is generation_prefix_cuts
+
+
 class TestSetup:
     """setup arg validation + actor_args assembly."""
 
@@ -1060,18 +1081,26 @@ class TestSetup:
 
         assert mock_spinup.call_args.kwargs["turn_checkpointing_enabled"] is False
 
-    def test_turn_recovery_requires_periodic_snapshots(self):
+    @pytest.mark.parametrize(
+        "target_level", [RecoveryTargetLevel.TURN, RecoveryTargetLevel.PREFIX]
+    )
+    def test_gym_state_recovery_requires_periodic_snapshots(
+        self, target_level: RecoveryTargetLevel
+    ):
         mc = _make_master_config(env={"should_use_nemo_gym": True})
         mc.policy["generation"]["vllm_cfg"] = {
             "async_engine": True,
             "expose_http_server": True,
         }
         mc.token_capture.enabled = True
-        mc.rollout_recovery.target_level = RecoveryTargetLevel.TURN
+        mc.rollout_recovery.target_level = target_level
 
         with pytest.raises(
             ValueError,
-            match="target_level='turn' requires.*snapshot_attempt_interval_s",
+            match=(
+                f"target_level='{target_level.value}' requires.*"
+                "snapshot_attempt_interval_s"
+            ),
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
@@ -2350,6 +2379,11 @@ class TestSetup:
         generation, _ = patched_factories["_build_generation"].return_value
         _, setup_kwargs = generation.setup_token_capture.call_args
         assert setup_kwargs["capture_media"] is with_processor
+        # Workers bound a generation cut by Gym's control timeout, counted
+        # from when the cut request reaches them.
+        assert setup_kwargs["generation_cut_control_timeout_s"] == (
+            mc.token_capture.control_timeout_s
+        )
 
     def test_nemo_gym_coverage_failure_shuts_down_shards(self, patched_factories):
         mc = _make_master_config(colocated=False, backend="vllm")
@@ -3694,9 +3728,10 @@ def test_token_capture_megatron_registers_media_columns_only_for_multimodal(
         assert set(MEDIA_STAGING_FIELDS).isdisjoint(fields)
     finalizer_config = mock_finalizers.call_args.args[1]
     assert finalizer_config.capture_media is multimodal
-    actor_args.gen_handle.setup_token_capture.assert_called_once_with(
-        ANY, mc.token_capture.staging_partition, capture_media=multimodal
-    )
+    actor_args.gen_handle.setup_token_capture.assert_called_once()
+    setup_args, setup_kwargs = actor_args.gen_handle.setup_token_capture.call_args
+    assert setup_args[1] == mc.token_capture.staging_partition
+    assert setup_kwargs["capture_media"] is multimodal
     # What the workers pinned the media column to is what the finalizers get.
     assert (
         finalizer_config.media_columns

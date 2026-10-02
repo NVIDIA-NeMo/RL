@@ -549,8 +549,8 @@ def _reject_typed_environment_servers(global_config: Mapping[str, Any]) -> None:
     )
     if typed:
         raise ValueError(
-            "rollout_recovery.target_level='turn' does not support environment "
-            f"servers with a typed episode protocol yet: {typed}; route these "
+            "rollout_recovery.target_level='turn' or 'prefix' does not support "
+            f"environment servers with a typed episode protocol yet: {typed}; route these "
             "rows through a legacy_agent environment server or use 'sibling'"
         )
 
@@ -2361,6 +2361,8 @@ def _build_gym_actor_config(
             .setdefault("vllm_model", {})
         )
         policy_overrides["checkpoint_policy"] = True
+        if instance_token_capture.get("generation_prefix_cuts_enabled", False):
+            policy_overrides["checkpoint_generation_cuts"] = True
 
     return NemoGymConfig(
         model_name=model_name,
