@@ -452,10 +452,13 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   transactional rollback: a failed combined write is discarded best-effort by
   the sink, and a failed discard is logged at ERROR.
   Upgrade the paired Gym and RL changes together. The GB200 functional shard
-  `L1_Functional_Tests_GB200_Vllm_Omni_Single_Controller.sh` smokes this path
-  end to end (CLEVR-style images through Gym `string_match`, native video
-  through Gym `mcqa`) and gates on `train/finalize/media_row_rate == 1`, the
-  metric that reports the fraction of learner rows built from captured media.
+  `L1_Functional_Tests_GB200_Vllm_Omni_Single_Controller.sh` smokes the vLLM
+  path end to end (CLEVR-style images through Gym `string_match`, native video
+  through Gym `mcqa`), and
+  `L1_Functional_Tests_GB200_Megatron_Omni_Single_Controller.sh` smokes the
+  Megatron Inference path on the same CLEVR-style images. Both gate on
+  `train/finalize/media_row_rate == 1`, the metric that reports the fraction
+  of learner rows built from captured media.
   The vLLM path needs no new Megatron-LM pin. The Megatron Inference path
   requires a Megatron-LM pin with `media_tensors` on the offloaded payload and
   expanded-prefix stitching (NVIDIA/Megatron-LM#7598); on an older pin the
