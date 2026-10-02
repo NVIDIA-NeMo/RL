@@ -21,6 +21,24 @@ from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 RECIPE_ROOT = Path(__file__).parents[2] / "examples/configs/recipes"
 
 
+@pytest.mark.parametrize(
+    "recipe_name",
+    [
+        "llm/sft-nanov3-30BA3B-2n8g-fsdp2.yaml",
+        "llm/sft-nanov3-30BA3B-2n4g-fsdp2.yaml",
+        "llm/sft-gpt-oss-20b-1n8g-fsdp8ep8-automodel.yaml",
+        "llm/sft-gpt-oss-20b-1n4g-fsdp4ep4-automodel.yaml",
+        "vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v2.yaml",
+        "vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-automodel-ep8.v1.yaml",
+    ],
+)
+def test_hybridep_regression_recipes_keep_legacy_deepep(recipe_name: str) -> None:
+    register_omegaconf_resolvers()
+    config = load_config(RECIPE_ROOT / recipe_name)
+    assert config.policy.dtensor_cfg.automodel_kwargs.backend.dispatcher == "deepep"
+    assert config.policy.make_sequence_length_divisible_by == 1
+
+
 @pytest.mark.parametrize("context_parallel_size", [2, 4])
 def test_gemma4_cp_keeps_local_hybridep_inputs_aligned(
     context_parallel_size: int,
@@ -53,12 +71,12 @@ def test_gemma4_cp_keeps_local_hybridep_inputs_aligned(
         ("llm/grpo-qwen3.5-35ba3b-dapo-4n8g-automodel.yaml", "hybridep", "gmm"),
         (
             "vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v2.yaml",
-            "hybridep",
+            "deepep",
             "torch_mm",
         ),
         (
             "vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-automodel-ep8.v1.yaml",
-            "hybridep",
+            "deepep",
             "torch_mm",
         ),
         (
