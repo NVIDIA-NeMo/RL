@@ -194,14 +194,17 @@ def _init_controller(master_config, actor_args):
     )
 
 
-def _one_group_tags(count: int) -> list[dict[str, object]]:
+def _one_group_tags(count: int, *, weight_version: int = 0) -> list[dict[str, object]]:
     """Tags for one prompt group of ``count`` generations.
 
     The stage keys its baseline on GROUP_ID_TAG, so a meta without it raises
     rather than quietly grouping by prompt tokens -- which is what let two
     distinct groups sharing prompt text share one baseline.
     """
-    return [{"weight_version": 0, GROUP_ID_TAG: "group-0"} for _ in range(count)]
+    return [
+        {"weight_version": weight_version, GROUP_ID_TAG: "group-0"}
+        for _ in range(count)
+    ]
 
 
 def _stamp_advantage_stage_config(ctrl, *, shardable: bool = True) -> None:
@@ -240,6 +243,7 @@ def _stamp_advantage_stage_config(ctrl, *, shardable: bool = True) -> None:
     ctrl._opd_stat_sum = 0.0
     ctrl._opd_stat_sumsq = 0.0
     ctrl._opd_stat_count = 0
+    ctrl._opd_gap_sum = 0.0
 
 
 def test_resumed_mooncake_init_restores_without_partition_registration(
@@ -1438,10 +1442,10 @@ def test_opd_advantage_stage_pools_raw_gap_separately_under_tropd() -> None:
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
+    _stamp_advantage_stage_config(ctrl)
     ctrl._step_log_dict = {
-        "rewards": [],
-        "sample_masks": [],
-        "masked_advantages": [],
+        "reward_partials": [],
+        "advantage_partials": [],
         "sequence_lengths": [],
         "seq_logprob_error_metrics": [],
         "num_mask_sample_filtered": [],
@@ -1456,6 +1460,7 @@ def test_opd_advantage_stage_pools_raw_gap_separately_under_tropd() -> None:
         sample_ids=["a", "b"],
         fields=[],
         sequence_lengths=[3, 3],
+        tags=_one_group_tags(2),
     )
 
     asyncio.run(ctrl._advantage_stage(meta))
@@ -1472,8 +1477,17 @@ def test_opd_advantage_stage_pools_raw_gap_separately_under_tropd() -> None:
     ] == pytest.approx(0.25)
     assert metrics["on_policy_distillation/adv_mean"] == pytest.approx(0.0, abs=1e-6)
     assert "advantages" in ctrl._dp_client.put_fields
-    trained = torch.cat(ctrl._step_log_dict["masked_advantages"])
+    # The stage reduces the trained advantages to moments rather than keeping
+    # the tensor, so read the spread off the column it wrote. That column is
+    # post-clip, which is what masked_advantages used to hold, and it crosses
+    # the data plane jagged, so compare against a flattened mask.
+    written = ctrl._dp_client.put_fields["advantages"]
+    trained = torch.masked_select(
+        written.values() if written.is_nested else written.reshape(-1),
+        token_mask.bool().reshape(-1),
+    )
     assert trained.numel() == 4
+    assert ctrl._step_log_dict["advantage_partials"][0].count == 4
     assert trained.mean().item() == pytest.approx(0.0, abs=1e-6)
     # Centered, not merely shrunk: the proximal advantages keep their spread.
     assert trained.std().item() > 0.1
@@ -1854,7 +1868,7 @@ def test_train_pump_fails_if_rollout_exhausts_during_partial_step() -> None:
         sample_ids=["sample-0"],
         fields=[],
         sequence_lengths=[1],
-        tags=[{"weight_version": 0}],
+        tags=_one_group_tags(1),
     )
     ctrl = _train_pump_controller(sampler=_OneThenEmptySampler(meta))
 
@@ -1913,7 +1927,7 @@ def _dropping_controller(*, credit_in_evict: bool):
         sample_ids=["sample-0"],
         fields=[],
         sequence_lengths=[1],
-        tags=[{"weight_version": 0}],
+        tags=_one_group_tags(1),
     )
     sampler = _DroppingSampler(meta, credit_in_evict=credit_in_evict)
     ctrl = _train_pump_controller(sampler=sampler)
@@ -1977,7 +1991,7 @@ def test_train_pump_prunes_stamps_older_than_the_step_that_just_closed(
         sample_ids=["sample-0"],
         fields=[],
         sequence_lengths=[1],
-        tags=[{"weight_version": 3}],
+        tags=_one_group_tags(1, weight_version=3),
     )
     ctrl = _train_pump_controller(sampler=_OneThenEmptySampler(meta))
     ctrl._async_cfg.rollout_failure.min_step_batch_fraction = 0.5
@@ -2019,7 +2033,7 @@ def test_train_pump_requests_and_fetches_only_required_logprobs(
         sample_ids=["sample-0", "sample-1"],
         fields=[],
         sequence_lengths=[1, 1],
-        tags=[{"weight_version": 0}, {"weight_version": 0}],
+        tags=_one_group_tags(2),
     )
     ctrl = _train_pump_controller(sampler=_FullStepSampler(meta))
     ctrl._policy_logprobs_required = policy_logprobs_required
@@ -2052,7 +2066,7 @@ def test_train_pump_rejects_step_with_no_valid_training_chunks() -> None:
         sample_ids=["sample-0"],
         fields=[],
         sequence_lengths=[1],
-        tags=[{"weight_version": 0}],
+        tags=_one_group_tags(1),
     )
     ctrl = _train_pump_controller(sampler=_OneThenEmptySampler(meta))
     ctrl._master_config.grpo.num_prompts_per_step = 1
@@ -2081,7 +2095,7 @@ def test_train_pump_skips_empty_chunk_and_trains_later_valid_chunk(
         sample_ids=["empty-sample"],
         fields=[],
         sequence_lengths=[1],
-        tags=[{"weight_version": 0}],
+        tags=_one_group_tags(1),
     )
     valid_meta = KVBatchMeta(
         partition_id="rollout_data",
@@ -2089,7 +2103,7 @@ def test_train_pump_skips_empty_chunk_and_trains_later_valid_chunk(
         sample_ids=["valid-sample"],
         fields=[],
         sequence_lengths=[1],
-        tags=[{"weight_version": 0}],
+        tags=_one_group_tags(1),
     )
     ctrl = _train_pump_controller(sampler=_SequenceSampler([empty_meta, valid_meta]))
     ctrl._advantage_stage = AsyncMock(
@@ -2123,7 +2137,7 @@ def test_train_pump_logs_nonzero_stale_group_metrics(monkeypatch) -> None:
         sample_ids=["sample-0", "sample-1"],
         fields=[],
         sequence_lengths=[1, 1],
-        tags=[{"weight_version": 0}, {"weight_version": 0}],
+        tags=_one_group_tags(2),
     )
     ctrl = _train_pump_controller(sampler=_EvictingSampler(meta))
     ctrl._sync_weights = AsyncMock(return_value=1)
@@ -2150,7 +2164,7 @@ def test_train_pump_aggregates_selected_rollout_metrics_across_chunks(
             fields=[],
             sequence_lengths=[1],
             extra_info={ROLLOUT_METRICS: [metrics]},
-            tags=[{"weight_version": 0}],
+            tags=_one_group_tags(1),
         )
         for index, metrics in enumerate(
             [
@@ -2207,7 +2221,7 @@ def test_train_pump_collects_generation_metrics_at_step_boundaries(
         sample_ids=["sample-0"],
         fields=[],
         sequence_lengths=[1],
-        tags=[{"weight_version": 0}],
+        tags=_one_group_tags(1),
     )
     events: list[str] = []
     ctrl = _train_pump_controller(sampler=_ChunkedSampler(meta, chunks=2))
@@ -2261,7 +2275,7 @@ def test_train_pump_chunked_step_by_engine_regime(
         sample_ids=["sample-0"],
         fields=[],
         sequence_lengths=[1],
-        tags=[{"weight_version": 0}],
+        tags=_one_group_tags(1),
     )
     # num_prompts_per_step is 2 in the harness: two single-group chunks close
     # the streaming step, one two-group chunk the blocking one.
@@ -2326,7 +2340,7 @@ def test_train_pump_does_not_offload_the_policy_on_a_grpo_run(monkeypatch) -> No
         sample_ids=["sample-0"],
         fields=[],
         sequence_lengths=[1],
-        tags=[{"weight_version": 0}],
+        tags=_one_group_tags(1),
     )
     calls: list[str] = []
     ctrl = _train_pump_controller(sampler=_ChunkedSampler(meta, chunks=2))
@@ -2423,7 +2437,7 @@ def _single_group_meta() -> KVBatchMeta:
         sample_ids=["sample-0"],
         fields=[],
         sequence_lengths=[1],
-        tags=[{"weight_version": 0}],
+        tags=_one_group_tags(1),
     )
 
 

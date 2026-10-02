@@ -466,6 +466,7 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "opd_stat_sum",
         "opd_stat_sumsq",
         "opd_stat_count",
+        "opd_gap_sum",
     }
 
 
@@ -578,7 +579,7 @@ def _controller(
     )
     is_opd = estimator_name == "opd"
     estimator = (
-        OPDAdvantageEstimator({"name": "opd"}, None)
+        OPDAdvantageEstimator(algo.adv_estimator, None)
         if is_opd
         # Deliberately a GRPO estimator for every other name: these tests read
         # `shardable` and the call distribution, never the numerics of an
@@ -614,6 +615,7 @@ def _controller(
         ctrl._available_advantage_actors.put_nowait(actor)
     ctrl._opd_stat_sum = ctrl._opd_stat_sumsq = 0.0
     ctrl._opd_stat_count = 0
+    ctrl._opd_gap_sum = 0.0
     ctrl._step_log_dict = {
         "reward_partials": [],
         "advantage_partials": [],
