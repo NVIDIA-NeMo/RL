@@ -34,6 +34,10 @@ policy:
     mtp_detach_heads: true
     mtp_use_repeated_layer: true
     mtp_loss_scaling_factor: 0.3
+    checkpoint:
+      # async_save disabled: the async save OOMs the GB200 training nodes'
+      # host memory (920 GiB) on this model; the synchronous save fits.
+      async_save: false
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
       NRL_REFIT_BUFFER_MEMORY_RATIO: "0.005"
