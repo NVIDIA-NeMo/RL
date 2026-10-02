@@ -103,6 +103,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     MasterConfig,
     algo_config,
+    evaluation_only_checkpoints,
     is_ppo_run,
 )
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
@@ -339,7 +340,10 @@ class SingleControllerActor:
 
         self._policy_logprobs_required = not (
             master_config.loss_fn.force_on_policy_ratio
-            and self._algo_cfg.seq_logprob_error_threshold is None
+            and (
+                self._algo_cfg.seq_logprob_error_threshold is None
+                or master_config.loss_fn.seq_logprob_error_in_loss
+            )
         )
         # _build_trainer initializes the reference model only for a positive KL
         # penalty, so the controller must use the same gate before requesting it.
@@ -546,6 +550,7 @@ class SingleControllerActor:
             self._master_config.checkpointing["enabled"]
             and self._sampler.supports_buffer_checkpoint
             and not self._master_config.checkpointing.get("save_data_plane")
+            and not evaluation_only_checkpoints(self._master_config)
         ):
             raise ValueError(
                 "SingleController checkpointing with a replay-checkpoint-capable "
@@ -2969,6 +2974,11 @@ class SingleControllerActor:
                         )
                     self._optimizer_commit_in_progress = True
 
+                # Offline evaluation attributes accuracy to the completed
+                # optimizer update, excluding subsequent refit/checkpoint I/O.
+                if is_policy_training_step:
+                    self._save_state.training_step_end_time_ms = int(time.time() * 1000)
+
                 # Aggregate step metrics
                 step_metrics = {}
                 if policy_result is not None:
@@ -3075,6 +3085,15 @@ class SingleControllerActor:
                         and self._train_steps % ft_save_period == 0
                     )
                 )
+                # Deferred evaluation retains exactly the requested first and
+                # final endpoints. Never silently alter max_num_steps, and avoid
+                # intervening periodic saves pruning the first endpoint.
+                deferred_eval = getattr(self._algo_cfg, "deferred_evaluation", None)
+                if deferred_eval and deferred_eval.get("enabled", False):
+                    should_save_by_step = (
+                        self._train_steps == int(deferred_eval["first_step"])
+                        or is_last_step
+                    )
                 # Call once per step and reuse the bool.
                 should_save_by_timeout = self._timeout.check_save()
                 will_save_checkpoint = self._master_config.checkpointing[
@@ -4523,6 +4542,8 @@ class SingleControllerActor:
         async with self._data_plane_checkpoint_barrier.checkpoint() as cut:
             save_state.current_step = self._train_steps
             save_state.total_steps = self._train_steps
+            if evaluation_only_checkpoints(self._master_config):
+                save_state.evaluation_only = True
             save_state.trainer_version = self._trainer_version
             save_state.current_epoch = self._current_epoch
             save_state.consumed_samples = self._consumed_samples
@@ -5078,7 +5099,14 @@ class SingleControllerActor:
                 # Real validity (token-capture placeholders carry sample_mask 0,
                 # and mask_sample/overlong/seq-logprob-error rows are folded in
                 # via final_sample_mask) instead of the hardwired all-ones.
-                valid_mask=final_sample_mask,
+                # Match legacy GRPO's all-response baseline only in the opt-in
+                # single-forward path. Its survivor mask becomes known in loss.
+                # Keep SC's existing survivor-based baseline when disabled.
+                valid_mask=(
+                    None
+                    if self._master_config.loss_fn.seq_logprob_error_in_loss
+                    else final_sample_mask
+                ),
                 **kwargs,
             )
             if self._is_ppo:

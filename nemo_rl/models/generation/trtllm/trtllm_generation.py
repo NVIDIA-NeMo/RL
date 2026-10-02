@@ -43,6 +43,44 @@ from nemo_rl.models.generation.trtllm.config import TrtllmConfig
 class TrtllmGeneration(GenerationInterface):
     """TRT-LLM generation backend (requires trtllm_cfg.async_engine=true)."""
 
+    @classmethod
+    def validate_settings(cls, master_config: Any) -> None:
+        """Reject SC options that require unsupported TRT-LLM lifecycle APIs.
+
+        SC can use the existing fixed-fleet PD HTTP and weight-update paths.
+        Per-replica quarantine/restart and token capture require additional
+        backend APIs and must fail before workers reserve any GPUs.
+        """
+        generation = master_config.policy["generation"]
+        trtllm_cfg = generation["trtllm_cfg"]
+        if not trtllm_cfg["async_engine"]:
+            raise ValueError("SC TRT-LLM requires trtllm_cfg.async_engine=true")
+        if generation["colocated"]["enabled"]:
+            raise ValueError("SC TRT-LLM requires non-colocated generation")
+        fleet = master_config.async_rl.generation_fleet_health
+        if fleet.enabled or fleet.restart_dead_shards:
+            raise NotImplementedError(
+                "SC TRT-LLM requires a fixed fleet: disable "
+                "async_rl.generation_fleet_health.enabled and restart_dead_shards"
+            )
+        reject_unenforceable_refit_deadline("SC TRT-LLM", fleet.refit_timeout_s)
+        if master_config.token_capture.enabled:
+            raise NotImplementedError("SC TRT-LLM does not support token_capture")
+        if master_config.async_rl.generation_router.enabled:
+            raise NotImplementedError(
+                "SC TRT-LLM uses its own PD frontends; disable async_rl.generation_router"
+            )
+        if (trtllm_cfg.get("disaggregation") or {}).get("enabled"):
+            if not master_config.env.get("should_use_nemo_gym"):
+                raise ValueError(
+                    "SC TRT-LLM PD requires the NeMo-Gym HTTP rollout path"
+                )
+        if (
+            master_config.env.get("should_use_nemo_gym")
+            and not trtllm_cfg["expose_http_server"]
+        ):
+            raise ValueError("SC NeMo-Gym requires trtllm_cfg.expose_http_server=true")
+
     @staticmethod
     def init_cluster_placement_groups(
         cluster: RayVirtualCluster,
