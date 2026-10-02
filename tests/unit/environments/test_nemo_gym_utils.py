@@ -521,6 +521,48 @@ def test_list_entries_before_spinup_raises():
         actor.list_entries()
 
 
+def test_agent_implementations_name_the_harness_of_each_started_agent():
+    resolved = DictConfig(
+        {
+            "swe_rebench_claude_code_sandboxed_agent": {
+                "responses_api_agents": {
+                    "claude_code_sandboxed_agent": {"entrypoint": "app.py"}
+                }
+            },
+            "swe_rebench_opencode_sandboxed_agent": {
+                "responses_api_agents": {
+                    "opencode_sandboxed_agent": {"entrypoint": "app.py"}
+                }
+            },
+            # Servers that are not agents, and agents Gym does not start.
+            "swe_rebench_resources_server": {
+                "resources_servers": {"swe_rebench": {"entrypoint": "app.py"}}
+            },
+            "remote_agent": {
+                "responses_api_agents": {"simple_agent": {"host": "10.0.0.1"}}
+            },
+            "port_range_low": 5000,
+        }
+    )
+
+    with _stub_gym_resolved_config(resolved):
+        implementations = _spun_up_actor().agent_implementations()
+
+    assert implementations == {
+        "swe_rebench_claude_code_sandboxed_agent": "claude_code_sandboxed_agent",
+        "swe_rebench_opencode_sandboxed_agent": "opencode_sandboxed_agent",
+    }
+
+
+def test_agent_implementations_before_spinup_raises():
+    cls = nemo_gym_mod.NemoGym.__ray_metadata__.modified_class
+    actor = cls.__new__(cls)
+    actor.__init__({})
+
+    with pytest.raises(RuntimeError, match="call _spinup"):
+        actor.agent_implementations()
+
+
 class TestUnresolvedAgentRefsAreDiagnosable:
     """A Gym older than the checkout that prepared the data must say so.
 

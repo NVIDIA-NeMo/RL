@@ -1894,6 +1894,9 @@ def _make_capture_manager(
     mgr._consecutive_infra_drops = 0
     mgr._recovery_ledger = RolloutRecoveryLedger()
     mgr._data_plane_checkpoint_barrier = buf.data_plane_checkpoint_barrier
+    mgr._agent_implementations = None
+    mgr._agent_implementations_lock = asyncio.Lock()
+    mgr._group_result_fields = {}
 
     class _CaptureImpl:
         def __init__(self):
@@ -2226,3 +2229,90 @@ class TestGenerateForFinalizationFlow:
         assert (
             restored._impl.seen_recovery_granularity is RecoveryGranularity.PROMPT_GROUP
         )
+
+
+class TestPerLabelGroupMetrics:
+    """Harness / agent labels and Gym result fields on finalization requests."""
+
+    @staticmethod
+    def _manager(implementations=None, error=None):
+        manager = object.__new__(RolloutManager)
+        manager._agent_implementations = None
+        manager._agent_implementations_lock = asyncio.Lock()
+        manager._group_result_fields = {}
+        lookups = []
+
+        class _AgentImplementations:
+            async def remote(self):
+                lookups.append(1)
+                if error is not None:
+                    raise error
+                return dict(implementations or {})
+
+        manager._env_handles = {
+            "nemo_gym": SimpleNamespace(agent_implementations=_AgentImplementations())
+        }
+        return manager, lookups
+
+    def test_labels_name_harness_and_agent_and_pool_result_fields(self):
+        agent = "swe_next_claude_code_sandboxed_agent"
+        manager, lookups = self._manager({agent: "claude_code_sandboxed_agent"})
+        manager._record_result_fields(
+            "g", 0, {"reward": 1.0, "harness_finished": True, "ng_rollout_id": "r0"}
+        )
+        manager._record_result_fields("g", 1, {"reward": 0.0, "harness_finished": False})
+        # A re-dispatched rollout replaces its earlier attempt.
+        manager._record_result_fields("g", 1, {"reward": 1.0, "harness_finished": True})
+
+        async def scenario():
+            return (
+                await manager._group_metric_labels("g", agent),
+                await manager._group_metric_labels("h", "unknown_agent"),
+                await manager._group_metric_labels("i", None),
+            )
+
+        (labels, stats), (other_labels, other_stats), (no_labels, _) = asyncio.run(
+            scenario()
+        )
+
+        assert labels == (
+            ("harness", "claude_code_sandboxed_agent"),
+            ("agent", agent),
+        )
+        assert stats == (("harness_finished", 2.0, 2), ("reward", 2.0, 2))
+        assert manager._group_result_fields == {}
+        assert other_labels == (("agent", "unknown_agent"),)
+        assert other_stats == ()
+        assert no_labels == ()
+        assert len(lookups) == 1  # Gym's config is read once
+
+    def test_a_failed_gym_lookup_only_drops_the_harness_label(self):
+        manager, lookups = self._manager(error=RuntimeError("actor died"))
+
+        async def scenario():
+            return (
+                await manager._group_metric_labels("g", "agent_a"),
+                await manager._group_metric_labels("h", "agent_a"),
+            )
+
+        (first, _), (second, _) = asyncio.run(scenario())
+
+        assert first == second == (("agent", "agent_a"),)
+        assert len(lookups) == 1
+
+    def test_group_agent_name_prefers_gyms_resolution(self):
+        sample = {"extra_env_info": {"agent_ref": {"name": "prompt_agent"}}}
+        resolved = SimpleNamespace(
+            extra_env_info={"agent_ref": {"name": "resolved_agent"}}
+        )
+
+        assert RolloutManager._group_agent_name(resolved, sample) == "resolved_agent"
+        assert RolloutManager._group_agent_name(None, sample) == "prompt_agent"
+        assert (
+            RolloutManager._group_agent_name(
+                None, {"extra_env_info": {"task_source": "source"}}
+            )
+            == "source"
+        )
+        assert RolloutManager._group_agent_name(None, {"extra_env_info": {}}) is None
+        assert RolloutManager._group_agent_name(None, {}) is None

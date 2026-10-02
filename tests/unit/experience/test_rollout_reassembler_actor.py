@@ -107,7 +107,32 @@ def test_finalize_forwards_loss_multiplier_to_reassembler() -> None:
         prompt_idx=17,
         loss_multiplier=0.25,
         canonical_sample_ids=["group_g0"],
+        group_labels=(),
+        result_stats=(),
     )
+
+
+def test_finalize_forwards_group_labels_and_result_stats() -> None:
+    """Per-harness metrics need the group's labels on the finalizer side."""
+    actor_cls = RolloutReassemblerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_cls)
+    actor._finalizer = MagicMock()
+    actor._finalizer.finalize_group.return_value = FinalizedGroup(
+        meta=None, group_min_wv=4, group_max_wv=4, staging_keys=[], dropped=True
+    )
+    labels = (
+        ("harness", "claude_code_sandboxed_agent"),
+        ("agent", "swe_rebench_claude_code_sandboxed_agent"),
+    )
+    stats = (("harness_finished", 1.0, 1),)
+    request = replace(_request(), group_labels=labels, result_stats=stats)
+    assert_metadata_only(request)
+
+    actor.finalize(request)
+
+    kwargs = actor._finalizer.finalize_group.call_args.kwargs
+    assert kwargs["group_labels"] == labels
+    assert kwargs["result_stats"] == stats
 
 
 def test_finalizer_forwards_mooncake_checkpoint_commands(
@@ -155,6 +180,10 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "prompt_idx",
         "mask_sample",
         "loss_multiplier",
+        # A few (scope, name) string pairs and one (field, sum, count) per
+        # numeric Gym result field: metadata, light enough for the wire.
+        "group_labels",
+        "result_stats",
     }
     assert {f.name for f in fields(FinalizedGroup)} == {
         "meta",

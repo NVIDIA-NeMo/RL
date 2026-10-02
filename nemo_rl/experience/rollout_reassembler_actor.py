@@ -68,6 +68,13 @@ class ReassemblyRequest:
     mask_sample: tuple[bool, ...]
     # Dataset-level loss weight shared by every completion in this prompt group.
     loss_multiplier: float = 1.0
+    # (scope, name) labels the group's metrics are also reported under, e.g.
+    # ("harness", "claude_code_sandboxed_agent") and ("agent", <agent_ref.name>);
+    # see nemo_rl.experience.group_label_stats. Empty: no per-label metrics.
+    group_labels: tuple[tuple[str, str], ...] = ()
+    # (field, sum, count) of the numeric Gym result fields of the group's
+    # rollouts that reached this process (per-label result/<field> means).
+    result_stats: tuple[tuple[str, float, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -179,6 +186,8 @@ class RolloutReassemblerActor:  # pragma: no cover
             prompt_idx=request.prompt_idx,
             loss_multiplier=request.loss_multiplier,
             canonical_sample_ids=list(request.canonical_sample_ids),
+            group_labels=request.group_labels,
+            result_stats=request.result_stats,
         )
         assert_metadata_only(result)
         return result

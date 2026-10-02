@@ -57,6 +57,11 @@ from nemo_rl.experience.failures import (
     RolloutTimeout,
     classify_rollout_failure,
 )
+from nemo_rl.experience.group_label_stats import (
+    AGENT_SCOPE,
+    HARNESS_SCOPE,
+    numeric_result_fields,
+)
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
@@ -1738,6 +1743,14 @@ class RolloutManager:
         # deliberately: the question it answers -- "is the fleet still answering
         # anyone?" -- is about the fleet, not about one prompt's history.
         self._consecutive_infra_drops: int = 0
+        # Per-label metrics on the token-capture path (group_label_stats): each
+        # Gym agent entry's implementation (its harness), read once from Gym's
+        # resolved config, and the numeric Gym result fields of each in-flight
+        # group's streamed rollouts, by generation index (a re-dispatched
+        # rollout replaces its earlier attempt).
+        self._agent_implementations: Optional[dict[str, str]] = None
+        self._agent_implementations_lock = asyncio.Lock()
+        self._group_result_fields: dict[str, dict[int, dict[str, float]]] = {}
 
     @property
     def stats(self) -> RolloutStats:
@@ -1756,6 +1769,88 @@ class RolloutManager:
         """Step-level ``mask_rules/*`` hits since the last call ({} on the native impl)."""
         pop = getattr(self._impl, "pop_mask_rule_metrics", None)
         return pop() if pop is not None else {}
+
+    async def _agent_implementation(self, agent_name: str) -> Optional[str]:
+        """Harness of a Gym agent entry: the implementation Gym's config runs for it.
+
+        Read once from every Gym actor (``NemoGym.agent_implementations``). A
+        failure only turns the harness labels off; metrics must never fail a
+        rollout.
+        """
+        async with self._agent_implementations_lock:
+            if self._agent_implementations is None:
+                implementations: dict[str, str] = {}
+                try:
+                    environment = self._env_handles.get("nemo_gym")
+                    if environment is not None:
+                        for handle in as_nemo_gym_shard_set(environment).all_handles:
+                            implementations.update(
+                                await handle.agent_implementations.remote()
+                            )
+                except Exception as error:
+                    print(
+                        "per-harness metrics are off: could not read the Gym agent "
+                        f"implementations ({type(error).__name__}: {error})",
+                        flush=True,
+                    )
+                    implementations = {}
+                self._agent_implementations = implementations
+        return self._agent_implementations.get(agent_name)
+
+    def _record_result_fields(
+        self, group_id: str, generation_index: int, result: Mapping[str, Any]
+    ) -> None:
+        """Keep a streamed rollout's numeric Gym result fields for its group."""
+        self._group_result_fields.setdefault(group_id, {})[generation_index] = (
+            numeric_result_fields(result)
+        )
+
+    @staticmethod
+    def _group_agent_name(
+        record: Optional[PromptGroupRecord], input_sample: DatumSpec
+    ) -> Optional[str]:
+        """The group's Gym agent entry: Gym's resolved ``agent_ref`` when this
+        attempt dispatched rows, else the prompt's own route name (a group
+        restored with every sibling sealed). ``None`` when neither names one.
+        """
+        resolved = getattr(record, "extra_env_info", None)
+        agent_ref = resolved.get("agent_ref") if isinstance(resolved, Mapping) else None
+        if isinstance(agent_ref, Mapping) and agent_ref.get("name"):
+            return str(agent_ref["name"])
+        prompt_row = input_sample.get("extra_env_info")
+        if not isinstance(prompt_row, Mapping):
+            return None
+        try:
+            return get_nemo_gym_route_name(prompt_row)
+        except ValueError:
+            return None
+
+    async def _group_metric_labels(
+        self,
+        group_id: str,
+        agent_name: Optional[str],
+    ) -> tuple[tuple[tuple[str, str], ...], tuple[tuple[str, float, int], ...]]:
+        """The ``(scope, name)`` labels and result stats of a group's request.
+
+        Labels are the group's harness (when Gym names one) and agent entry.
+        Result stats are ``(field, sum, count)`` over the group's rollouts that
+        streamed through this process; the group's entry is released first.
+        """
+        sums: dict[str, tuple[float, int]] = {}
+        for fields in self._group_result_fields.pop(group_id, {}).values():
+            for name, value in fields.items():
+                total, count = sums.get(name, (0.0, 0))
+                sums[name] = (total + value, count + 1)
+        result_stats = tuple(
+            (name, total, count) for name, (total, count) in sorted(sums.items())
+        )
+        if not agent_name:
+            return (), result_stats
+        labels: list[tuple[str, str]] = [(AGENT_SCOPE, agent_name)]
+        harness = await self._agent_implementation(agent_name)
+        if harness:
+            labels.insert(0, (HARNESS_SCOPE, harness))
+        return tuple(labels), result_stats
 
     @property
     def recovery_ledger(self) -> RolloutRecoveryLedger:
@@ -2365,6 +2460,14 @@ class RolloutManager:
                     )
                 )
             )
+            try:
+                self._record_result_fields(group_id, generation_index, env_extras)
+            except Exception as error:  # metrics must never fail a rollout
+                print(
+                    f"per-label result metrics skipped a rollout of {group_id}: "
+                    f"{type(error).__name__}: {error}",
+                    flush=True,
+                )
 
             if recovery_group.recovery_granularity is RecoveryGranularity.PROMPT_GROUP:
                 result = SiblingSealResult(
@@ -2408,6 +2511,7 @@ class RolloutManager:
                 current_task = asyncio.current_task()
                 assert current_task is not None
                 inflight_registry[group_id] = (current_task, start_version)
+            record: Optional[PromptGroupRecord] = None
             try:
                 if pending_indices:
                     async with self._recovery_mutation() as cut:
@@ -2416,7 +2520,7 @@ class RolloutManager:
                             group_id,
                             generation_indices=pending_indices,
                         )
-                    await self.run_rollout(
+                    record = await self.run_rollout(
                         attempt_input_sample,
                         rollout_ids=list(rollout_ids),
                         generation_indices=pending_indices,
@@ -2433,6 +2537,18 @@ class RolloutManager:
                 rewards,
                 mask_sample,
             ) = self._recovery_ledger.finalization_inputs(group_id)
+            group_labels: tuple[tuple[str, str], ...] = ()
+            result_stats: tuple[tuple[str, float, int], ...] = ()
+            try:
+                group_labels, result_stats = await self._group_metric_labels(
+                    group_id, self._group_agent_name(record, input_sample)
+                )
+            except Exception as error:  # metrics must never fail a rollout
+                print(
+                    f"per-label metrics are off for group {group_id}: "
+                    f"{type(error).__name__}: {error}",
+                    flush=True,
+                )
             request = ReassemblyRequest(
                 group_id=group_id,
                 rollout_ids=tuple(physical_rollout_ids),
@@ -2443,6 +2559,8 @@ class RolloutManager:
                 prompt_idx=int(recovery_group.prompt_id),
                 mask_sample=tuple(mask_sample),
                 loss_multiplier=float(input_sample.get("loss_multiplier", 1.0)),
+                group_labels=group_labels,
+                result_stats=result_stats,
             )
             from nemo_rl.experience.rollout_reassembler_actor import (
                 assert_metadata_only,
@@ -2484,3 +2602,4 @@ class RolloutManager:
         ]
         await self._tq_buffer.clear_staging_keys(cut, staging_keys)
         self._recovery_ledger.discard_group(cut, group_id)
+        self._group_result_fields.pop(group_id, None)
