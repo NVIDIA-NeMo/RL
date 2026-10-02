@@ -25,12 +25,15 @@ These tests drive the real _setup_vllm_openai_api_server against a fake vLLM
 module tree and inspect what each consumer was constructed with.
 """
 
+import asyncio
 import sys
 import types
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 
+from nemo_rl.models.generation.vllm import utils as vllm_utils
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
 )
@@ -169,7 +172,7 @@ def _install_fake_vllm(monkeypatch):
         built.clear()
 
 
-def _build_server(monkeypatch, serving_chat_kwargs):
+def _build_server(monkeypatch, serving_chat_kwargs, *, capture_requests=()):
     """Run the real server setup and hand back the three consumer stubs."""
     _install_fake_vllm(monkeypatch)
 
@@ -187,6 +190,8 @@ def _build_server(monkeypatch, serving_chat_kwargs):
     worker.llm_async_engine_args.create_model_config.return_value = MagicMock(
         served_model_name="served-model", model="model-path"
     )
+    worker._capture_calls = {id(request): None for request in capture_requests}
+    worker.routed_experts_dtype = torch.int16
 
     worker._setup_vllm_openai_api_server(_FakeApp())
     assert _BUILT["chat"][0].kwargs["engine_client"] is worker._http_engine_client
@@ -255,3 +260,130 @@ def test_absent_kwargs_render_as_empty_dict(monkeypatch):
 
     assert renderer[0].kwargs["default_chat_template_kwargs"] == {}
     assert tokenization[0].kwargs["default_chat_template_kwargs"] == {}
+
+
+@pytest.mark.vllm
+def test_capture_bypasses_upstream_route_encoding_without_changing_plain_requests(
+    monkeypatch,
+):
+    """Run the installed vLLM response generator with interleaved requests."""
+    # Optional runtime: the existing scaffold replaces server initialization,
+    # but this regression must execute vLLM's real superclass conversion.
+    serving = pytest.importorskip("vllm.entrypoints.openai.chat_completion.serving")
+    from vllm.entrypoints.openai.chat_completion.protocol import (
+        ChatCompletionRequest,
+        ChatCompletionResponse,
+    )
+    from vllm.outputs import CompletionOutput, RequestOutput
+
+    class ServingWithoutEngine(serving.OpenAIServingChat):
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            _BUILT["chat"].append(self)
+            self.response_role = "assistant"
+            self.return_tokens_as_token_ids = True
+            self.parser_cls = None
+            self.enable_auto_tools = False
+            self._include_reasoning_tokens_details = False
+            self.enable_prompt_tokens_details = False
+            self.enable_per_request_metrics = False
+            self.enable_log_outputs = False
+            self.system_fingerprint = None
+
+    real_install = _install_fake_vllm
+
+    def install_with_real_response_type(monkeypatch):
+        real_install(monkeypatch)
+        monkeypatch.setattr(
+            sys.modules["vllm.entrypoints.openai.chat_completion.protocol"],
+            "ChatCompletionResponse",
+            ChatCompletionResponse,
+        )
+
+    monkeypatch.setattr(
+        sys.modules[__name__], "_OpenAIServingChat", ServingWithoutEngine
+    )
+    monkeypatch.setattr(
+        sys.modules[__name__], "_install_fake_vllm", install_with_real_response_type
+    )
+    upstream_encode = MagicMock(wraps=serving.numpy2base64)
+    rl_encode = MagicMock(wraps=vllm_utils.encode_routed_experts)
+    monkeypatch.setattr(serving, "numpy2base64", upstream_encode)
+    monkeypatch.setattr(vllm_utils, "encode_routed_experts", rl_encode)
+
+    requests = [
+        ChatCompletionRequest(
+            model="model", messages=[{"role": "user", "content": "x"}], logprobs=False
+        )
+        for _ in range(2)
+    ]
+    _, chats, _ = _build_server(monkeypatch, {}, capture_requests=[requests[0]])
+    chat = chats[0]
+    results = []
+    for request_index in range(2):
+        per_request = []
+        for step in range(2):
+            routes = torch.tensor(
+                [[[request_index * 10 + step, request_index * 10 + step + 1]]],
+                dtype=torch.int16,
+            ).numpy()
+            output = CompletionOutput(
+                index=0,
+                text="answer",
+                token_ids=[22],
+                cumulative_logprob=None,
+                logprobs=None,
+                routed_experts=routes,
+                finish_reason="stop",
+            )
+            per_request.append(
+                RequestOutput(
+                    request_id=str(request_index),
+                    prompt="x",
+                    prompt_token_ids=[10],
+                    prompt_logprobs=None,
+                    outputs=[output],
+                    finished=True,
+                )
+            )
+        results.append(per_request)
+
+    async def respond(index):
+        async def generate():
+            for result in results[index]:
+                await asyncio.sleep(0)
+                yield result
+
+        return await chat.chat_completion_full_generator(
+            requests[index],
+            generate(),
+            str(index),
+            "model",
+            [],
+            None,
+            types.SimpleNamespace(),
+        )
+
+    async def respond_both():
+        return await asyncio.gather(respond(0), respond(1))
+
+    capture_response, plain_response = asyncio.run(respond_both())
+
+    # Both upstream's numpy codec and RL's envelope codec run only for the
+    # plain request, even though capture is installed on the shared worker.
+    upstream_encode.assert_called_once()
+    assert upstream_encode.call_args.args[0] is results[1][-1].outputs[0].routed_experts
+    rl_encode.assert_called_once()
+    assert capture_response.choices[0].routed_experts is None
+    native = capture_response.choices[0].message.routed_experts
+    torch.testing.assert_close(
+        native, torch.tensor([[[1, 2]], [[0, 1]]], dtype=torch.int16)
+    )
+    assert isinstance(plain_response.choices[0].routed_experts, str)
+    assert isinstance(plain_response.choices[0].message.routed_experts, str)
+    # The wrapper must not clear the engine's originals or copy their buffers.
+    for request_index, per_request in enumerate(results):
+        for step, result in enumerate(per_request):
+            assert result.outputs[0].routed_experts.tolist() == [
+                [[request_index * 10 + step, request_index * 10 + step + 1]]
+            ]

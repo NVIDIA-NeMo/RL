@@ -61,6 +61,7 @@ from nemo_rl.data_plane.schema import (
     ROUTE_ENCODING_ENVELOPE,
     ROUTE_ENCODING_LIST,
     ROUTE_ENCODING_NONE,
+    ROUTE_ENCODING_TENSOR,
     ROUTED_EXPERTS_ENCODING_FIELD,
     ROUTED_EXPERTS_FIELD,
     ROUTED_EXTRAS_METADATA_FIELD,
@@ -379,7 +380,8 @@ class TQTokenSink:
     ``capture_media`` mirrors the staging partition's schema: a media-enabled
     partition registers ``MEDIA_STAGING_FIELDS`` and every row written here
     carries them (flags False + sentinels for text calls); a text-only
-    partition rejects attachments outright.
+    partition rejects media attachments. Route attachments are supported on
+    both kinds of partition.
     """
 
     def __init__(
@@ -403,7 +405,7 @@ class TQTokenSink:
         *,
         attachments: Mapping[str, Any] | None = None,
     ) -> StageResult:
-        """Write the token row and its media attachments in one ``put``.
+        """Write the token row and its route/media attachments in one ``put``.
 
         Success is returned only after the combined write was acknowledged,
         so ``staged`` coordinates vouch for tokens and pixels together. TQ has
@@ -417,11 +419,18 @@ class TQTokenSink:
         key = record.staging_key
         write_started = False
         try:
-            if attachments is not None and not self._capture_media:
+            media_attachments = attachments
+            if attachments is not None and ROUTED_EXPERTS_FIELD in attachments:
+                media_attachments = {
+                    name: value
+                    for name, value in attachments.items()
+                    if name != ROUTED_EXPERTS_FIELD
+                } or None
+            if media_attachments is not None and not self._capture_media:
                 raise ValueError(
                     "media attachments require a media-enabled staging partition"
                 )
-            media = validate_media_tensors(attachments)
+            media = validate_media_tensors(media_attachments)
             media_columns: dict[str, torch.Tensor] | None = None
             if self._capture_media:
                 if self._media_pixel_dtype is None:
@@ -510,9 +519,27 @@ class TQTokenSink:
                 )
             routed_len = 0
             routed_encoding = ROUTE_ENCODING_NONE
+            router_attachment = (attachments or {}).get(ROUTED_EXPERTS_FIELD)
+            if (
+                attachments is not None
+                and ROUTED_EXPERTS_FIELD in attachments
+                and not isinstance(router_attachment, torch.Tensor)
+            ):
+                raise ValueError("routed_experts attachment must be a tensor")
+            if router_attachment is not None and not isinstance(routed, dict):
+                raise ValueError(
+                    "routed_experts attachment requires its capture metadata"
+                )
             if routed is not None:
                 delta_len = len(record.token_ids_delta)
-                if isinstance(routed, str):
+                if isinstance(routed, dict):
+                    if not isinstance(router_attachment, torch.Tensor):
+                        raise ValueError(
+                            "routed_experts metadata requires a tensor attachment"
+                        )
+                    experts = router_attachment
+                    routed_encoding = ROUTE_ENCODING_TENSOR
+                elif isinstance(routed, str):
                     from nemo_rl.utils.routed_experts_codec import (
                         decode_routed_experts,
                     )
@@ -963,6 +990,7 @@ def _row_to_base_snapshot(row: Any) -> StagedCallBaseSnapshot:
         ROUTE_ENCODING_NONE,
         ROUTE_ENCODING_ENVELOPE,
         ROUTE_ENCODING_LIST,
+        ROUTE_ENCODING_TENSOR,
     ):
         raise ValueError(f"unknown routed_experts_encoding {routed_encoding}")
 

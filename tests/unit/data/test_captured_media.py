@@ -61,6 +61,7 @@ from nemo_rl.data_plane.tq_token_sink import (
     TQTokenSource,
 )
 from nemo_rl.experience.rollout_reassembler import RolloutReassembler
+from nemo_rl.experience.route_assembly import verify_route_fragment_integrity
 from nemo_rl.models.generation.openai_server_utils import splice_prefix_tokens
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
@@ -671,8 +672,21 @@ def test_worker_restart_recovers_retained_geometry_without_fetching_pixels(
         )
 
 
-def test_worker_completion_stages_pixels_and_only_returns_capture_coordinates(dp):
+@pytest.mark.parametrize("with_routed_experts", [False, True])
+def test_worker_completion_stages_pixels_and_only_returns_capture_coordinates(
+    dp, monkeypatch, with_routed_experts
+):
     from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
+
+    def forbidden_codec(*args, **kwargs):
+        pytest.fail("captured routes must remain tensors alongside media")
+
+    for target in (
+        "nemo_rl.utils.routed_experts_codec.encode_routed_experts",
+        "nemo_rl.utils.routed_experts_codec.decode_routed_experts",
+        "nemo_rl.experience.route_assembly.encode_routed_experts",
+    ):
+        monkeypatch.setattr(target, forbidden_codec)
 
     worker = object.__new__(VllmAsyncGenerationWorkerImpl)
     worker._capture_calls = {}
@@ -705,12 +719,28 @@ def test_worker_completion_stages_pixels_and_only_returns_capture_coordinates(dp
             }
         ]
     }
+    routes = torch.arange(6, dtype=torch.int16).reshape(3, 1, 2)
+    if with_routed_experts:
+        content["choices"][0]["message"]["routed_experts"] = routes
     response = worker._finish_request_capture(request, content)
     assert response["ng_commit_coords"]["disposition"] == "staged"
     assert "media" not in response and MEDIA_SPANS_FIELD not in response
+    assert "routed_experts" not in response["choices"][0]["message"]
+    json.dumps(response)
     assert worker._capture_calls == {}
     [media] = staged_media(dp, "r0/c1")
     torch.testing.assert_close(media.imgs, torch.ones(1, 6, 3))
+    if with_routed_experts:
+        source = TQTokenSource(dp, staging_partition="staging", capture_media=True)
+        [fetched] = source.fetch_for_finalization(
+            ["r0/c1"], include_route_fragments=True
+        )
+        torch.testing.assert_close(fetched.fragment.routes, routes)
+        assert verify_route_fragment_integrity(
+            fetched.fragment,
+            extras_digest_version=fetched.snapshot.extras_digest_version,
+            expected_extras_digest=fetched.snapshot.extras_digest,
+        )
 
 
 def video_prompt(tokens, videos, images=()):

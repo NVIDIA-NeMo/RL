@@ -71,6 +71,7 @@ from nemo_rl.models.generation.openai_server_utils import (
     splice_prefix_tokens,
 )
 from nemo_rl.telemetry.setup import shutdown_telemetry
+from nemo_rl.utils.routed_experts_codec import routed_experts_tensor_metadata
 
 LOGGER = logging.getLogger(__name__)
 
@@ -784,55 +785,43 @@ class VllmAsyncGenerationWorkerImpl(
     @staticmethod
     def _delta_align_routed_experts(
         payload: dict[str, Any], *, prev_len: int, prompt_len: int, generated_len: int
-    ) -> None:
-        """Normalize optional vLLM routes to the exact staged token delta."""
+    ) -> torch.Tensor | None:
+        """Slice native routes and bind their attachment metadata to the delta."""
         choices = payload.get("choices") or []
         if len(choices) != 1 or not isinstance(choices[0], dict):
-            return
+            return None
         choice = dict(choices[0])
         message = dict(choice.get("message") or {})
         routed = message.get("routed_experts")
         if routed is None:
-            return
+            return None
         try:
-            from nemo_rl.utils.routed_experts_codec import (
-                decode_routed_experts,
-                encode_routed_experts,
-            )
-
-            if isinstance(routed, str):
-                dtype_name = routed.split(":", 3)[1]
-                dtype = {
-                    "int8": torch.int8,
-                    "int16": torch.int16,
-                    "int32": torch.int32,
-                }.get(dtype_name)
-                if dtype is None:
-                    raise ValueError(f"unsupported routed_experts dtype {dtype_name!r}")
-            else:
-                dtype = torch.int16
-            experts = decode_routed_experts(routed, dtype)
+            if not isinstance(routed, torch.Tensor):
+                raise TypeError("captured routed_experts must be a native tensor")
             expected_full_len = prompt_len + generated_len
-            if experts.dim() != 3 or experts.shape[0] != expected_full_len:
+            if routed.dim() != 3 or routed.shape[0] != expected_full_len:
                 raise ValueError(
-                    f"route length {experts.shape[0]} does not match engine sequence "
+                    f"route shape {tuple(routed.shape)} does not match engine sequence "
                     f"length {expected_full_len}"
                 )
-            message["routed_experts"] = encode_routed_experts(experts[prev_len:])
+            routed = routed[prev_len:]
+            message["routed_experts"] = routed_experts_tensor_metadata(routed)
         except (IndexError, TypeError, ValueError) as error:
             LOGGER.warning(
                 "dropping invalid routed_experts from staged capture: %s", error
             )
             message.pop("routed_experts", None)
+            routed = None
         choice["message"] = message
         payload["choices"] = [choice]
+        return routed
 
     def _finish_request_capture(self, request: Any, content: dict) -> dict:
         """Stage the finished call and ride its coords on the response.
 
-        Tokens and the call's new media tensors go to TQ in one write (the
-        media ride as opaque attachments beside the record), so ``staged``
-        coords vouch for both and any failure is ``capture_failed`` at call
+        Tokens, routes, and the call's new media tensors go to TQ in one write
+        (routes and media ride as opaque attachments beside the record), so
+        ``staged`` coords vouch for all and any failure is ``capture_failed`` at call
         time. Token ids, logprobs, and routes are stripped after staging, so
         the worker->gate hop carries the completion and coords only.
         """
@@ -853,24 +842,29 @@ class VllmAsyncGenerationWorkerImpl(
             # digest-covered extras; the pixels themselves are attachments.
             payload[MEDIA_SPANS_FIELD] = [item.to_dict() for item in state.media.items]
         adapter = self.token_capture.adapter
+        routed_experts = None
         if adapter is not None:
             try:
                 generated_token_ids, _ = adapter.extract_generation(payload)
             except Exception:  # capture core will report the authoritative failure
                 generated_token_ids = []
-            self._delta_align_routed_experts(
+            routed_experts = self._delta_align_routed_experts(
                 payload,
                 prev_len=call.admission.prev_len,
                 prompt_len=len(prompt_token_ids),
                 generated_len=len(generated_token_ids),
             )
+        attachments = state.media.tensors if state.media is not None else None
+        if routed_experts is not None:
+            attachments = {**(attachments or {}), "routed_experts": routed_experts}
         coords = self.token_capture.complete_call_from_response(
             call,
             payload,
-            attachments=state.media.tensors if state.media is not None else None,
+            attachments=attachments,
         )
         for choice in content.get("choices") or []:
             choice.pop("logprobs", None)
+            choice.pop("routed_experts", None)
             # Token arrays and delta-aligned routes were staged to TQ above;
             # remove the serializer's message fields before the worker->gate hop.
             message = choice.get("message")
@@ -1231,11 +1225,20 @@ class VllmAsyncGenerationWorkerImpl(
                     )
 
                 final_res = None
+                capture_routes = id(request) in worker_self._capture_calls
 
                 async def capture_result_generator():
                     nonlocal final_res
                     async for res in result_generator:
                         final_res = res
+                        if capture_routes:
+                            # vLLM encodes choice-level routes in its response.
+                            # Keep engine arrays for our native capture, and
+                            # hide them only in the superclass's shallow view.
+                            res = copy.copy(res)
+                            res.outputs = [copy.copy(output) for output in res.outputs]
+                            for output in res.outputs:
+                                output.routed_experts = None
                         yield res
 
                 response = await super().chat_completion_full_generator(
@@ -1263,6 +1266,7 @@ class VllmAsyncGenerationWorkerImpl(
                         device=torch.device("cpu"),
                         logger=LOGGER,
                         routed_experts_dtype=worker_self.routed_experts_dtype,
+                        encode_for_wire=not capture_routes,
                     )
 
                 return response

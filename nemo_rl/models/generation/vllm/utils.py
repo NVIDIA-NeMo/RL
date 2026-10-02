@@ -359,8 +359,9 @@ def attach_routed_experts_to_chat_response_choices(
     device: torch.device,
     logger: Any = None,
     routed_experts_dtype: torch.dtype = ROUTED_EXPERTS_FALLBACK_DTYPE,
+    encode_for_wire: bool = True,
 ) -> Any:
-    """Attach aligned routed experts to OpenAI chat response choices."""
+    """Attach aligned routes, retaining tensors for worker-local capture."""
     outputs_by_index = {
         output.index: output for output in getattr(final_request_output, "outputs", [])
     }
@@ -411,12 +412,11 @@ def attach_routed_experts_to_chat_response_choices(
                 r3_stats["actual_routes"],
                 r3_stats["expected_routes"],
             )
-        # Base64 envelope instead of .tolist(): nested JSON int lists cost
-        # ~1s of CPU per serialize/parse hop at long context lengths and get
-        # re-validated at every gym HTTP hop; a single string passes through
-        # the gym chain opaquely.
-        choice.message.routed_experts = encode_routed_experts(
-            routed_experts.to(dtype=routed_experts_dtype)
+        # Capture stages the native tensor before the response leaves this
+        # worker. Ordinary HTTP responses still need the compact wire envelope.
+        routed_experts = routed_experts.to(dtype=routed_experts_dtype)
+        choice.message.routed_experts = (
+            encode_routed_experts(routed_experts) if encode_for_wire else routed_experts
         )
 
     if len(attached_choice_indices) != len(choices):
