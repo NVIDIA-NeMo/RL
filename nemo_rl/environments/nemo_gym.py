@@ -54,8 +54,11 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.environments.gym_checkpoint_adapter import (
     GymCheckpointAdapter,
+    GymCheckpointCommitSummary,
+    GymCheckpointEpisode,
     GymCheckpointInstance,
     GymCheckpointParticipantSummary,
+    GymCheckpointPrepareSummary,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym_multimodal import (
@@ -735,6 +738,103 @@ Depending on your data shape, you may want to change these values."""
                 auth_token=token_capture["control_auth_token"],
             )
         return await self._checkpoint_adapter.discover()
+
+    def _require_checkpoint_adapter(self) -> GymCheckpointAdapter:
+        """Return the discovered actor-local adapter or fail before coordination."""
+        if self._checkpoint_adapter is None:
+            raise RuntimeError("Gym checkpoint adapter has not been initialized")
+        return self._checkpoint_adapter
+
+    async def checkpoint_prepare(
+        self,
+        checkpoint_id: str,
+        *,
+        deadline_ts: float,
+    ) -> GymCheckpointPrepareSummary:
+        """Park this actor's Gym deployment at one recoverable boundary."""
+        result = await self._require_checkpoint_adapter().prepare(
+            checkpoint_id,
+            deadline_ts=deadline_ts,
+        )
+        return GymCheckpointPrepareSummary(
+            prepared=result.prepared,
+            blockers={
+                server: tuple(blockers)
+                for server, blockers in result.blockers().items()
+            },
+        )
+
+    async def checkpoint_renew(
+        self,
+        checkpoint_id: str,
+        *,
+        deadline_ts: float,
+    ) -> None:
+        """Extend this actor's active Gym checkpoint lease."""
+        await self._require_checkpoint_adapter().renew(
+            checkpoint_id,
+            deadline_ts=deadline_ts,
+        )
+
+    async def checkpoint_retire(
+        self,
+        checkpoint_id: str,
+        episodes: tuple[GymCheckpointEpisode, ...],
+        *,
+        deadline_ts: float,
+    ) -> None:
+        """Discard selected episode attempts from this Gym deployment."""
+        await self._require_checkpoint_adapter().retire(
+            checkpoint_id,
+            episodes,
+            deadline_ts=deadline_ts,
+        )
+
+    async def checkpoint_commit(
+        self,
+        checkpoint_id: str,
+        checkpoint_root: str,
+        episodes: tuple[GymCheckpointEpisode, ...],
+        *,
+        deadline_ts: float,
+    ) -> GymCheckpointCommitSummary:
+        """Persist this actor's selected episode state under ``checkpoint_root``."""
+        return await self._require_checkpoint_adapter().commit(
+            checkpoint_id,
+            checkpoint_root,
+            episodes,
+            deadline_ts=deadline_ts,
+        )
+
+    async def checkpoint_restore(
+        self,
+        checkpoint_id: str,
+        checkpoint_root: str,
+        episodes: tuple[GymCheckpointEpisode, ...],
+        *,
+        source_checkpoint_id: str,
+        deadline_ts: float,
+    ) -> None:
+        """Restore and validate this actor's state from ``checkpoint_root``."""
+        await self._require_checkpoint_adapter().restore(
+            checkpoint_id,
+            checkpoint_root,
+            episodes,
+            source_checkpoint_id=source_checkpoint_id,
+            deadline_ts=deadline_ts,
+        )
+
+    async def checkpoint_resume(
+        self,
+        checkpoint_id: str,
+        *,
+        deadline_ts: float,
+    ) -> None:
+        """Release this actor's Gym participants after commit or abort."""
+        await self._require_checkpoint_adapter().resume(
+            checkpoint_id,
+            deadline_ts=deadline_ts,
+        )
 
     async def _control(self, method: str, path: str, **kwargs: Any) -> dict:
         headers = {**kwargs.pop("headers", {}), **self._control_headers}
@@ -1809,6 +1909,15 @@ class NemoGymShardSet:
         return [handle for replicas in self.handles.values() for handle in replicas]
 
     @property
+    def checkpoint_handles(self) -> Dict[str, Any]:
+        """Map every stable checkpoint instance ID to its actor handle."""
+        return {
+            GymCheckpointInstance(shard_name, replica).instance_id: handle
+            for shard_name, replicas in self.handles.items()
+            for replica, handle in enumerate(replicas)
+        }
+
+    @property
     def hosted_routes(self) -> frozenset[str]:
         """Agent and task-source entry names this set can route to."""
         return frozenset(self.route_to_shard)
@@ -1866,6 +1975,24 @@ class NemoGymShardSet:
                 if replica is handle:
                     return shard_name if len(replicas) == 1 else f"{shard_name}/{index}"
         raise ShardSetupError("Handle does not belong to this NeMo-Gym shard set")
+
+    def checkpoint_instance_for_handle(self, handle: Any) -> GymCheckpointInstance:
+        """Return the durable checkpoint identity of an actor handle."""
+        for shard_name, replicas in self.handles.items():
+            for replica, candidate in enumerate(replicas):
+                if candidate is handle:
+                    return GymCheckpointInstance(shard_name, replica)
+        raise ShardSetupError("Handle does not belong to this NeMo-Gym shard set")
+
+    def handle_for_checkpoint_instance(self, instance_id: str) -> Any:
+        """Resolve a persisted checkpoint instance ID back to its actor handle."""
+        try:
+            return self.checkpoint_handles[instance_id]
+        except KeyError:
+            raise ShardSetupError(
+                f"No NeMo-Gym actor has checkpoint instance {instance_id!r}; "
+                f"available={sorted(self.checkpoint_handles)!r}"
+            ) from None
 
     def sole_handle(self) -> Any:
         """The only actor, for callers that predate routing.

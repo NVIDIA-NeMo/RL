@@ -1233,6 +1233,24 @@ def test_a_replicated_shard_labels_each_instance_apart():
         shard_set.instance_label(MagicMock())
 
 
+def test_checkpoint_instance_identity_round_trips_to_the_same_replica():
+    first, second = MagicMock(), MagicMock()
+    shard_set = nemo_gym_mod.NemoGymShardSet(handles={"tools": [first, second]})
+
+    assert shard_set.checkpoint_instance_for_handle(first).instance_id == (
+        "tools/replica-0"
+    )
+    assert shard_set.checkpoint_instance_for_handle(second).instance_id == (
+        "tools/replica-1"
+    )
+    assert shard_set.handle_for_checkpoint_instance("tools/replica-0") is first
+    assert shard_set.handle_for_checkpoint_instance("tools/replica-1") is second
+    assert shard_set.checkpoint_handles == {
+        "tools/replica-0": first,
+        "tools/replica-1": second,
+    }
+
+
 def test_an_unreplicated_shard_is_labelled_by_its_name_alone():
     """Names a metric and its log directory the same way."""
     handle = MagicMock()

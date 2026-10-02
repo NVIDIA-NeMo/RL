@@ -69,6 +69,7 @@ from nemo_rl.experience.rollout_recovery import (
     PromptGroupPhase,
     PromptGroupStatus,
     RecoveryGranularity,
+    RecoveryTargetLevel,
     RolloutAttemptStatus,
     RolloutRecoveryLedger,
     SiblingSealResult,
@@ -115,6 +116,54 @@ def _contains_post_write_enrichment_error(error: BaseException) -> bool:
             _contains_post_write_enrichment_error(child) for child in error.exceptions
         )
     return False
+
+
+class RolloutDispatchAdmissionGate:
+    """Pause new Gym ``/run`` submissions without blocking live completions.
+
+    An admission is held only while the Ray streaming RPC is submitted. The
+    returned stream is consumed after the admission is released, so closing
+    this gate does not wait for generation, completion callbacks, finalization,
+    or TQ writes.
+    """
+
+    def __init__(self) -> None:
+        self._condition = asyncio.Condition()
+        self._closed = False
+        self._active_submissions = 0
+
+    @asynccontextmanager
+    async def admission(self) -> AsyncIterator[None]:
+        """Admit one Gym RPC submission after any checkpoint pause exits."""
+        async with self._condition:
+            await self._condition.wait_for(lambda: not self._closed)
+            self._active_submissions += 1
+        try:
+            yield
+        finally:
+            async with self._condition:
+                self._active_submissions -= 1
+                if self._active_submissions == 0:
+                    self._condition.notify_all()
+
+    @asynccontextmanager
+    async def closed(self) -> AsyncIterator[None]:
+        """Block new submissions after every admitted submission has crossed."""
+        async with self._condition:
+            await self._condition.wait_for(lambda: not self._closed)
+            self._closed = True
+            try:
+                await self._condition.wait_for(lambda: self._active_submissions == 0)
+            except BaseException:
+                self._closed = False
+                self._condition.notify_all()
+                raise
+        try:
+            yield
+        finally:
+            async with self._condition:
+                self._closed = False
+                self._condition.notify_all()
 
 
 def _nemo_gym_metric_namespace(row: Mapping[str, Any]) -> str:
@@ -522,6 +571,7 @@ class AsyncRolloutImpl:
         generation_indices: Optional[list[int]] = None,
         on_completion: Optional[RolloutCompletionCallback] = None,
         recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
+        gym_instance_id: Optional[str] = None,
     ) -> PromptGroupRecord:
         """Run num_generations_per_prompt rollouts for one prompt.
 
@@ -543,6 +593,9 @@ class AsyncRolloutImpl:
         )
         assert recovery_granularity is RecoveryGranularity.SIBLING, (
             "recovery granularity is only supported on the NeMo-Gym path"
+        )
+        assert gym_instance_id is None, (
+            "Gym checkpoint ownership is only supported on the NeMo-Gym path"
         )
         timer = Timer()
         timer_prefix = "timing/rollout"
@@ -968,8 +1021,17 @@ class AsyncNemoGymRolloutImpl:
         ).max_gym_row_attempts
         self._stats = stats
         self._effort_config = effort_config
+        self._dispatch_admission_gate: RolloutDispatchAdmissionGate | None = None
 
         self._validate_init_params()
+
+    def set_rollout_dispatch_admission_gate(
+        self, gate: RolloutDispatchAdmissionGate
+    ) -> None:
+        """Bind the controller-owned gate used by Gym checkpoint coordination."""
+        if self._dispatch_admission_gate is not None:
+            raise RuntimeError("Gym rollout dispatch admission gate is already bound")
+        self._dispatch_admission_gate = gate
 
     async def run_rollout(
         self,
@@ -979,6 +1041,7 @@ class AsyncNemoGymRolloutImpl:
         generation_indices: Optional[list[int]] = None,
         on_completion: Optional[RolloutCompletionCallback] = None,
         recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
+        gym_instance_id: Optional[str] = None,
     ) -> PromptGroupRecord:
         """Run num_generations_per_prompt rollouts for one prompt.
 
@@ -1007,6 +1070,7 @@ class AsyncNemoGymRolloutImpl:
             timer_prefix,
             on_completion=on_completion,
             recovery_granularity=recovery_granularity,
+            gym_instance_id=gym_instance_id,
         )
         # Token-capture receipt rows carry empty message logs by design — the
         # canonical row (and any media it needs) is rebuilt by the finalizer
@@ -1160,12 +1224,28 @@ class AsyncNemoGymRolloutImpl:
 
         # Read here, not in the actor: the scope is a ContextVar in this
         # process, and NemoGym is a separate Ray actor.
-        async for result_ref in dispatch_with_trace_context(
-            nemo_gym_env.run_rollouts.options(num_returns="streaming"),
-            pending,
-            timer_prefix,
-            per_prompt=in_per_prompt_scope(),
-        ):
+        remote_method = nemo_gym_env.run_rollouts.options(num_returns="streaming")
+        gate = self._dispatch_admission_gate
+        if gate is None:
+            result_refs = dispatch_with_trace_context(
+                remote_method,
+                pending,
+                timer_prefix,
+                per_prompt=in_per_prompt_scope(),
+            )
+        else:
+            # ``dispatch_with_trace_context`` calls ``.remote`` synchronously.
+            # Release admission immediately after Ray accepts the streaming RPC;
+            # consuming the returned stream must remain live during Gym prepare.
+            async with gate.admission():
+                result_refs = dispatch_with_trace_context(
+                    remote_method,
+                    pending,
+                    timer_prefix,
+                    per_prompt=in_per_prompt_scope(),
+                )
+
+        async for result_ref in result_refs:
             rowidx, resolved_agent_ref, result, timing_metrics = await result_ref
             # Validated against the original group, not the pending subset: on a
             # re-dispatch the row keeps its original index so results stay ordered.
@@ -1214,6 +1294,7 @@ class AsyncNemoGymRolloutImpl:
         *,
         on_completion: Optional[RolloutCompletionCallback] = None,
         recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
+        gym_instance_id: Optional[str] = None,
     ) -> tuple[list[Completion], LLMMessageLogType, dict[str, Any]]:
         """Dispatch rows to NeMo-Gym; return completions, prompt, and metrics.
 
@@ -1226,7 +1307,11 @@ class AsyncNemoGymRolloutImpl:
         # These rows are all one prompt's generations.
         # They share one Gym route and must stay on one instance.
         shard_set = as_nemo_gym_shard_set(self._task_to_env["nemo_gym"])
-        nemo_gym_env = shard_set.pick_handle(get_nemo_gym_route_name(inputs[0]))
+        nemo_gym_env = (
+            shard_set.pick_handle(get_nemo_gym_route_name(inputs[0]))
+            if gym_instance_id is None
+            else shard_set.handle_for_checkpoint_instance(gym_instance_id)
+        )
         instance_label = shard_set.instance_label(nemo_gym_env)
         instance_timer_prefix = f"{timer_prefix}/shard/{instance_label}"
         total_rows = self._num_generations_per_prompt
@@ -1385,6 +1470,15 @@ class AsyncNemoGymRolloutImpl:
         rollout_metrics[f"{timer_prefix}/routing/group_share/{instance_label}"] = 1
 
         return completions, prompt_message_log, rollout_metrics
+
+    def select_checkpoint_instance(self, input_sample: DatumSpec) -> str:
+        """Choose and return the durable Gym actor identity for one prompt group."""
+        extra_env_info = input_sample.get("extra_env_info")
+        if not isinstance(extra_env_info, Mapping):
+            raise ValueError("NeMo-Gym input must contain extra_env_info")
+        shard_set = as_nemo_gym_shard_set(self._task_to_env["nemo_gym"])
+        handle = shard_set.pick_handle(get_nemo_gym_route_name(extra_env_info))
+        return shard_set.checkpoint_instance_for_handle(handle).instance_id
 
     def _results_to_completions(
         self, results: list[dict]
@@ -1710,6 +1804,16 @@ class RolloutManager:
             )
         self._data_plane_checkpoint_barrier = barrier
 
+    def set_rollout_dispatch_admission_gate(
+        self, gate: RolloutDispatchAdmissionGate
+    ) -> None:
+        """Bind the narrow Gym RPC gate used while a checkpoint is prepared."""
+        if not isinstance(self._impl, AsyncNemoGymRolloutImpl):
+            raise RuntimeError(
+                "rollout dispatch admission is only supported on the NeMo-Gym path"
+            )
+        self._impl.set_rollout_dispatch_admission_gate(gate)
+
     @asynccontextmanager
     async def _recovery_mutation(
         self, kind: CheckpointMutationKind = "recovery_retries"
@@ -1814,19 +1918,25 @@ class RolloutManager:
         generation_indices: Optional[list[int]] = None,
         on_completion: Optional[RolloutCompletionCallback] = None,
         recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
+        gym_instance_id: Optional[str] = None,
     ) -> PromptGroupRecord:
         if rollout_ids is None:
             assert generation_indices is None
             assert on_completion is None
             assert recovery_granularity is RecoveryGranularity.SIBLING
+            assert gym_instance_id is None
             # Legacy path: keep the impl call signature byte-identical.
             return await self._impl.run_rollout(input_sample)
+        checkpoint_ownership = (
+            {"gym_instance_id": gym_instance_id} if gym_instance_id is not None else {}
+        )
         return await self._impl.run_rollout(
             input_sample,
             rollout_ids=rollout_ids,
             generation_indices=generation_indices,
             on_completion=on_completion,
             recovery_granularity=recovery_granularity,
+            **checkpoint_ownership,
         )
 
     async def generate_and_push(
@@ -2225,6 +2335,18 @@ class RolloutManager:
             for sibling in recovery_group.siblings
             if sibling.current_attempt.status != RolloutAttemptStatus.SEALED
         ]
+        pending_owners: set[str] = set()
+        for generation_index in pending_indices:
+            owner = recovery_group.siblings[
+                generation_index
+            ].current_attempt.gym_instance_id
+            if owner is not None:
+                pending_owners.add(owner)
+        if len(pending_owners) > 1:
+            raise RuntimeError(
+                f"recovery group {recovery_group.group_id!r} spans multiple Gym "
+                f"checkpoint instances: {sorted(pending_owners)!r}"
+            )
         group_id = recovery_group.group_id
         start_version = recovery_group.start_weight_version
         rollout_ids = tuple(recovery_group.gate_rollout_ids)
@@ -2234,6 +2356,19 @@ class RolloutManager:
             attempt_extra_env_info[NEMO_GYM_GROUP_ID_KEY] = group_id
             attempt_extra_env_info[NEMO_GYM_GROUP_ATTEMPT_KEY] = (
                 max(len(sibling.attempts) for sibling in recovery_group.siblings) - 1
+            )
+        gym_instance_id: Optional[str] = None
+        if pending_owners:
+            gym_instance_id = next(iter(pending_owners))
+        elif (
+            pending_indices and recovery_group.restore_level is RecoveryTargetLevel.TURN
+        ):
+            if not isinstance(self._impl, AsyncNemoGymRolloutImpl):
+                raise RuntimeError(
+                    "turn-level recovery requires the NeMo-Gym rollout path"
+                )
+            gym_instance_id = self._impl.select_checkpoint_instance(
+                attempt_input_sample
             )
         self._tq_buffer.reserve(
             weight_version=start_version,
@@ -2338,6 +2473,7 @@ class RolloutManager:
                             cut,
                             group_id,
                             generation_indices=pending_indices,
+                            gym_instance_id=gym_instance_id,
                         )
                     await self.run_rollout(
                         attempt_input_sample,
@@ -2345,6 +2481,7 @@ class RolloutManager:
                         generation_indices=pending_indices,
                         on_completion=_record_streamed_completion,
                         recovery_granularity=recovery_group.recovery_granularity,
+                        gym_instance_id=gym_instance_id,
                     )
             finally:
                 if inflight_registry is not None:
