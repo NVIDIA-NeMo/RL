@@ -955,6 +955,44 @@ class RolloutRecoveryLedger:
             )
         attempt.status = RolloutAttemptStatus.RESERVED
 
+    def replace_dropped_dispatch(
+        self,
+        cut: DataPlaneMutationCut,
+        group_id: str,
+        *,
+        generation_indices: Iterable[int],
+    ) -> None:
+        """Replace dispatched attempts whose Gym stream ended before they returned.
+
+        Gym runs every row of a ``/run`` as its own task, so a broken stream
+        stops none of them. Each Gym-owned attempt is queued for the next
+        checkpoint to retire, and its sibling gets a fresh attempt, so the
+        re-send runs under a new rollout ID and never overlaps the old episode.
+        Attempts that never reached Gym keep their identity.
+        """
+        cut.require_live()
+        record = self._require_group(group_id)
+        if record.status != PromptGroupStatus.GENERATING:
+            raise ValueError(
+                f"cannot drop dispatched attempts of group {group_id!r} from "
+                f"{record.status.value!r}"
+            )
+        if record.recovery_granularity is RecoveryGranularity.PROMPT_GROUP:
+            raise ValueError(
+                "prompt-group recovery replaces the whole cohort, not single siblings"
+            )
+        for generation_index in generation_indices:
+            sibling = self._require_sibling(record, generation_index)
+            attempt = sibling.current_attempt
+            if attempt.status is not RolloutAttemptStatus.DISPATCHED:
+                continue
+            if attempt.gym_instance_id is not None:
+                self._gym_retirements.setdefault(attempt.gym_instance_id, set()).add(
+                    record.gym_episode(generation_index)
+                )
+            attempt.status = RolloutAttemptStatus.ABANDONED
+            sibling.attempts.append(_new_attempt())
+
     def mark_sibling_sealed(
         self,
         cut: DataPlaneMutationCut,
