@@ -548,6 +548,152 @@ def test_staging_keys_gym_does_not_attribute_fail_the_commit(
         )
 
 
+def _commit_with_agent_records(
+    monkeypatch,
+    tmp_path,
+    *,
+    environment_keys: list[str],
+    agent_records: list[dict[str, object]],
+    tamper_agent_digest: bool = False,
+):
+    """Commit one episode against real agent records written by Gym's store."""
+    from nemo_gym._checkpoint import coordination
+    from nemo_gym._checkpoint.store import write_participant_state
+    from nemo_gym.episode_types import EpisodeId
+
+    instance = GymCheckpointInstance("deployment", 0)
+    checkpoint_root = tmp_path / "step-1"
+    agent_manifest = write_participant_state(
+        instance.checkpoint_dir(checkpoint_root),
+        kind="agent",
+        instance="workplace-agent",
+        checkpoint_id="save-1",
+        records=agent_records,
+    )
+    if tamper_agent_digest:
+        agent_manifest = {**agent_manifest, "records_sha256": "f" * 64}
+    agent_keys = sorted(
+        {
+            EpisodeId.model_validate(record["episode_id"]).capture_key
+            for record in agent_records
+        }
+    )
+    client = object()
+    participants = SimpleNamespace(
+        client=client,
+        members=(
+            SimpleNamespace(server_name="environment", kind="environment"),
+            SimpleNamespace(server_name="model", kind="model"),
+            SimpleNamespace(server_name="agent", kind="agent"),
+        ),
+    )
+    monkeypatch.setattr(coordination, "discover", AsyncMock(return_value=participants))
+    monkeypatch.setattr(
+        coordination,
+        "commit",
+        AsyncMock(
+            return_value={
+                "environment": _commit_reply(
+                    "deployment", "environment", environment_keys
+                ),
+                "model": _commit_reply(
+                    "deployment",
+                    "model",
+                    [],
+                    staging_keys=[],
+                    staging_keys_by_episode={},
+                ),
+                "agent": {
+                    "phase": "committed",
+                    "manifest": agent_manifest,
+                    "episode_ids": agent_keys,
+                },
+            }
+        ),
+    )
+    adapter = GymCheckpointAdapter(
+        instance=instance, client=client, auth_token="secret"
+    )
+
+    async def exercise():
+        await adapter.discover()
+        return await adapter.commit(
+            "save-1",
+            checkpoint_root,
+            [GymCheckpointEpisode("rollout-1", 0)],
+            deadline_ts=10.0,
+        )
+
+    return asyncio.run(exercise())
+
+
+def _agent_record(*, legacy: bool) -> dict[str, object]:
+    return {
+        "episode_id": {"rollout_id": "rollout-1", "attempt": 0},
+        "session_key": "session-1",
+        "session": {"messages": []},
+        "boundary": None,
+        "episode": {"next_step": 2} if legacy else None,
+    }
+
+
+def test_adapter_assigns_legacy_relay_episode_to_its_agent(
+    monkeypatch, tmp_path
+) -> None:
+    """A legacy_agent environment relays /run, so the agent session owns it."""
+    summary = _commit_with_agent_records(
+        monkeypatch,
+        tmp_path,
+        environment_keys=[],
+        agent_records=[_agent_record(legacy=True)],
+    )
+
+    assert summary.exported_episodes == (GymCheckpointEpisode("rollout-1", 0),)
+    assert summary.unowned_live_episodes == ()
+
+
+def test_adapter_keeps_environment_ownership_of_native_agent_session(
+    monkeypatch, tmp_path
+) -> None:
+    summary = _commit_with_agent_records(
+        monkeypatch,
+        tmp_path,
+        environment_keys=["rollout-1"],
+        agent_records=[_agent_record(legacy=False)],
+    )
+
+    assert summary.exported_episodes == (GymCheckpointEpisode("rollout-1", 0),)
+    assert summary.unowned_live_episodes == ()
+
+
+def test_adapter_reports_native_agent_session_without_an_owner(
+    monkeypatch, tmp_path
+) -> None:
+    """A parked session nobody can restore must not be mistaken for an export."""
+    summary = _commit_with_agent_records(
+        monkeypatch,
+        tmp_path,
+        environment_keys=[],
+        agent_records=[_agent_record(legacy=False)],
+    )
+
+    assert summary.exported_episodes == ()
+    assert summary.unowned_live_episodes == (GymCheckpointEpisode("rollout-1", 0),)
+
+
+def test_adapter_rejects_agent_records_that_differ_from_the_commit_reply(
+    monkeypatch, tmp_path
+) -> None:
+    with pytest.raises(RuntimeError, match="agent records on disk do not match"):
+        _commit_with_agent_records(
+            monkeypatch,
+            tmp_path,
+            environment_keys=[],
+            agent_records=[_agent_record(legacy=True)],
+            tamper_agent_digest=True,
+        )
+
+
 def test_adapter_rejects_restore_from_another_checkpoint(monkeypatch) -> None:
     from nemo_gym._checkpoint import coordination
 
