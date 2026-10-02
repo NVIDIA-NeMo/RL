@@ -72,7 +72,6 @@ from nemo_rl.experience.rollout_recovery import (
     PromptGroupPhase,
     PromptGroupStatus,
     RecoveryGranularity,
-    RecoveryTargetLevel,
     RolloutAttemptStatus,
     RolloutRecoveryLedger,
     SiblingSealResult,
@@ -2685,12 +2684,10 @@ class RolloutManager:
         gym_instance_id: Optional[str] = None
         if pending_owners:
             gym_instance_id = next(iter(pending_owners))
-        elif (
-            pending_indices and recovery_group.restore_level is RecoveryTargetLevel.TURN
-        ):
+        elif pending_indices and recovery_group.restore_level.requires_gym_checkpoint:
             if not isinstance(self._impl, AsyncNemoGymRolloutImpl):
                 raise RuntimeError(
-                    "turn-level recovery requires the NeMo-Gym rollout path"
+                    "turn/prefix recovery requires the NeMo-Gym rollout path"
                 )
             gym_instance_id = self._impl.select_checkpoint_instance(
                 attempt_input_sample

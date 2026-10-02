@@ -113,8 +113,10 @@ With `checkpointing.save_data_plane: true`, each Single-Controller checkpoint co
 - A native TQ snapshot containing rollout tensor payloads and TQ state.
 - A metadata-only replay index describing the completed rollout groups stored in TQ.
 - A `rollout_recovery.pt` ownership ledger describing unfinished prompt groups that must be redispatched after a restart.
-- With `rollout_recovery.target_level: turn`, a `gym_checkpoint.json` manifest
-  and per-Gym-instance participant snapshots for unfinished episodes.
+- With `rollout_recovery.target_level: turn` or `prefix`, a
+  `gym_checkpoint.json` manifest and per-Gym-instance participant snapshots for
+  unfinished episodes. `prefix` additionally stages decoded tokens from active
+  model calls at each coordinated checkpoint.
 - A `replacement_reserve.pt` sidecar containing prompts held for dropped-rollout replacement, when applicable.
 - The sampler dispatch position needed to continue scheduling from the correct point.
 

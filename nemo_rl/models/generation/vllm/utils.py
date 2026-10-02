@@ -51,6 +51,56 @@ VLLM_LOGPROB_FLOOR = -9999.0
 # The expert-id range vs carry dtype is model-constant, so it is verified on the
 # first non-empty routed-experts tensor per process and skipped afterwards.
 G_ROUTED_EXPERTS_RANGE_CHECKED = False
+
+
+def _extract_selected_token_logprobs(
+    generation_token_ids: list[int], generation_logprob_details: list[Any]
+) -> list[float]:
+    """Extract the sampled token's log probability at every output position."""
+    selected_logprobs: list[float] = []
+    for token_id, position_logprobs in zip(
+        generation_token_ids, generation_logprob_details, strict=True
+    ):
+        selected = position_logprobs.get(token_id)
+        if selected is None:
+            raise RuntimeError(
+                "vLLM generation log probabilities did not include the selected "
+                f"token: token_id={token_id}"
+            )
+        selected_logprobs.append(max(float(selected.logprob), VLLM_LOGPROB_FLOOR))
+    return selected_logprobs
+
+
+def _snapshot_generation_logprob_details(
+    generation_logprob_details: Any,
+) -> list[Any]:
+    """Copy only fully published positions from an append-only container."""
+    position_count = len(generation_logprob_details)
+    end_indices = getattr(generation_logprob_details, "end_indices", None)
+    if end_indices is not None:
+        position_count = min(position_count, len(end_indices))
+    return [generation_logprob_details[index] for index in range(position_count)]
+
+
+def extract_selected_token_logprobs(generation_details: Any) -> list[float]:
+    """Return the sampled log probability for each published output token."""
+    generation_token_ids = list(getattr(generation_details, "token_ids", ()) or ())
+    details = getattr(generation_details, "logprobs", None)
+    if details is None:
+        if generation_token_ids:
+            raise RuntimeError(
+                "vLLM generation output with token IDs did not include logprobs"
+            )
+        return []
+    details = _snapshot_generation_logprob_details(details)
+    if len(generation_token_ids) != len(details):
+        raise RuntimeError(
+            "vLLM returned mismatched generation token IDs and log probabilities: "
+            f"token_count={len(generation_token_ids)}, logprob_count={len(details)}"
+        )
+    return _extract_selected_token_logprobs(generation_token_ids, details)
+
+
 GROUPED_MOE_MXFP8_REFIT_ERROR = (
     "MXFP8 refit does not support grouped MoE expert weights."
 )
