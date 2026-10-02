@@ -47,6 +47,7 @@ from nemo_rl.environments.nemo_gym import (
     as_nemo_gym_shard_set,
     get_nemo_gym_route_name,
 )
+from nemo_rl.environments.nemo_gym_task import get_nemo_gym_task_input
 from nemo_rl.experience.failures import (
     FailureClass,
     GenerationUnavailable,
@@ -58,6 +59,7 @@ from nemo_rl.experience.failures import (
     RolloutRedispatchExhausted,
     RolloutTimeout,
     classify_rollout_failure,
+    is_terminal_gym_episode_failure,
 )
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
@@ -1235,7 +1237,13 @@ class AsyncNemoGymRolloutImpl:
 
         # We do not translate max_seq_len into row-level max_tokens here because that would
         # change semantics from "total sequence length" to "max new tokens".
-        responses_create_params = template_row["responses_create_params"]
+        responses_create_params = get_nemo_gym_task_input(template_row).get(
+            "responses_create_params"
+        )
+        if not isinstance(responses_create_params, dict):
+            raise TypeError(
+                "Each NeMo-Gym task input must contain a responses_create_params dict"
+            )
         responses_create_params["temperature"] = self._generation_config["temperature"]
         responses_create_params["top_p"] = self._generation_config["top_p"]
 
@@ -1587,11 +1595,19 @@ class AsyncNemoGymRolloutImpl:
         # These rows are all one prompt's generations.
         # They share one Gym route and must stay on one instance.
         shard_set = as_nemo_gym_shard_set(self._task_to_env["nemo_gym"])
-        nemo_gym_env = (
-            shard_set.pick_handle(get_nemo_gym_route_name(inputs[0]))
-            if gym_instance_id is None
-            else shard_set.handle_for_checkpoint_instance(gym_instance_id)
-        )
+        if gym_instance_id is not None:
+            nemo_gym_env = shard_set.handle_for_checkpoint_instance(gym_instance_id)
+        elif (
+            len(shard_set.all_handles) == 1
+            and not shard_set.environment_server_routes
+            and not shard_set.route_to_shard
+        ):
+            # A bare actor validates native taskset routes from its own Gym config.
+            nemo_gym_env = shard_set.sole_handle()
+        else:
+            nemo_gym_env = shard_set.pick_handle(
+                get_nemo_gym_route_name(inputs[0], shard_set.environment_server_routes)
+            )
         instance_label = shard_set.instance_label(nemo_gym_env)
         instance_timer_prefix = f"{timer_prefix}/shard/{instance_label}"
         total_rows = self._num_generations_per_prompt
@@ -1791,7 +1807,9 @@ class AsyncNemoGymRolloutImpl:
         if not isinstance(extra_env_info, Mapping):
             raise ValueError("NeMo-Gym input must contain extra_env_info")
         shard_set = as_nemo_gym_shard_set(self._task_to_env["nemo_gym"])
-        handle = shard_set.pick_handle(get_nemo_gym_route_name(extra_env_info))
+        handle = shard_set.pick_handle(
+            get_nemo_gym_route_name(extra_env_info, shard_set.environment_server_routes)
+        )
         return shard_set.checkpoint_instance_for_handle(handle).instance_id
 
     def _results_to_completions(
@@ -2606,7 +2624,10 @@ class RolloutManager:
                     continue
 
                 data_attempts += 1
-                if data_attempts >= policy.max_data_attempts:
+                if (
+                    is_terminal_gym_episode_failure(error)
+                    or data_attempts >= policy.max_data_attempts
+                ):
                     self._stats.record_data_failure(reason)
                     if self._skipped_prompts >= policy.max_skipped_prompts:
                         # At the default of 0 this fires on the first exhaustion and the
@@ -2778,7 +2799,10 @@ class RolloutManager:
                     continue
 
                 data_attempts += 1
-                if data_attempts >= policy.max_data_attempts:
+                if (
+                    is_terminal_gym_episode_failure(error)
+                    or data_attempts >= policy.max_data_attempts
+                ):
                     self._stats.record_data_failure(reason)
                     raise
                 self._stats.record_data_retry(reason)
