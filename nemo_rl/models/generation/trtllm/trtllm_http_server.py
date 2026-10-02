@@ -41,7 +41,9 @@ if TYPE_CHECKING:
     from fastapi import FastAPI
 
 from nemo_rl.models.generation.openai_server_utils import (
+    assert_splice_tokenizer_invariants,
     replace_prefix_tokens,
+    splice_prefix_into_rendered_prompt,
 )
 
 logger = logging.getLogger(__name__)
@@ -85,6 +87,46 @@ async def build_spliced_prompt_ids(
         )
 
     def _sync() -> list[int]:
+        mode = _prefix_splice_mode()
+        spliced: "list[int] | None" = None
+        attempted = False
+        if mode != "legacy":
+            required_prefix_ids = _required_prefix_ids(messages)
+            if required_prefix_ids:
+                attempted = True
+                template_kwargs_full: dict = {
+                    **template_kwargs,
+                    "tokenize": False,
+                    "add_generation_prompt": True,
+                }
+                if tools:
+                    template_kwargs_full["tools"] = tools
+                rendered = tokenizer.apply_chat_template(
+                    conversation, **template_kwargs_full
+                )
+                # The boundary EOS count comes from the prefix render -- the
+                # same text the legacy path tokenizes below -- so a generation
+                # that spelled the EOS token with ordinary tokens cannot move
+                # the boundary.
+                prefix_text = tokenizer.apply_chat_template(
+                    _conversation_to_last_assistant(conversation),
+                    **{**template_kwargs_full, "add_generation_prompt": False},
+                )
+                spliced = splice_prefix_into_rendered_prompt(
+                    required_prefix_ids,
+                    rendered,
+                    prefix_text=prefix_text,
+                    eos_token=tokenizer.eos_token,
+                    eos_token_id=tokenizer.eos_token_id,
+                    encode=lambda text: tokenizer(text, add_special_tokens=False)[
+                        "input_ids"
+                    ],
+                )
+                if spliced is not None and mode == "incremental":
+                    return spliced
+                # Boundary not found: fall back to legacy.
+                if spliced is None:
+                    _splice_guard_log("no_boundary")
         # Full retokenization avoids accumulating generation token IDs twice.
         prompt_token_ids = _build_prompt_token_ids(
             conversation,
@@ -100,12 +142,15 @@ async def build_spliced_prompt_ids(
             tools,
             template_kwargs,
         )
-        return replace_prefix_tokens(
+        legacy_ids = replace_prefix_tokens(
             tokenizer=tokenizer,
             model_prefix_token_ids=required_prefix_ids,
             template_prefix_token_ids=template_prefix_ids,
             template_token_ids=prompt_token_ids,
         )
+        if mode == "verify" and attempted:
+            _record_splice_verification(legacy_ids, spliced)
+        return legacy_ids
 
     return await asyncio.to_thread(_sync)
 
@@ -993,6 +1038,98 @@ def _build_prompt_token_ids(
     return _to_int_ids(tokenizer.apply_chat_template(messages, **template_kwargs))
 
 
+def _prefix_splice_mode() -> str:
+    """Prefix splice strategy for the prompt-build path.
+
+    ``legacy`` (default) renders and tokenizes the conversation twice per
+    turn; ``incremental`` renders twice but tokenizes only the new turns,
+    counting the splice boundary on the rendered prefix; ``verify`` serves
+    legacy and logs any incremental mismatch. Same env-var precedent as
+    ``NRL_TRTLLM_TOKENIZE_SHADOW_RATE`` so engine adapters and disagg
+    frontends share one setting.
+    """
+    mode = (os.environ.get("NRL_TRTLLM_PREFIX_SPLICE_MODE") or "legacy").strip()
+    if mode not in ("legacy", "incremental", "verify"):
+        raise ValueError(f"NRL_TRTLLM_PREFIX_SPLICE_MODE={mode!r} is not supported")
+    return mode
+
+
+_SPLICE_GUARD_COUNTERS: dict = {"stale_turn": 0, "no_boundary": 0}
+_SPLICE_VERIFY_COUNTS: list = [0, 0]  # [requests compared, mismatches]
+
+
+def _splice_guard_log(kind: str) -> None:
+    _SPLICE_GUARD_COUNTERS[kind] += 1
+    n = _SPLICE_GUARD_COUNTERS[kind]
+    if n <= 5 or n % 100 == 0:
+        logger.warning(
+            "prefix_splice fallback #%d (%s): using legacy path; counters=%s",
+            n,
+            kind,
+            dict(_SPLICE_GUARD_COUNTERS),
+        )
+
+
+def _record_splice_verification(
+    reference: list[int], candidate: "list[int] | None"
+) -> None:
+    """Compare the incremental splice against the legacy splice ("verify" mode)."""
+    _SPLICE_VERIFY_COUNTS[0] += 1
+    if candidate == reference:
+        return
+    _SPLICE_VERIFY_COUNTS[1] += 1
+    if candidate is None:
+        first_diff = -1
+    else:
+        first_diff = next(
+            (i for i, (a, b) in enumerate(zip(reference, candidate)) if a != b),
+            min(len(reference), len(candidate)),
+        )
+    logger.warning(
+        "prefix_splice_mode=verify: incremental splice differs from legacy "
+        "(%d/%d requests): legacy_len=%d incremental_len=%s first_diff=%d",
+        _SPLICE_VERIFY_COUNTS[1],
+        _SPLICE_VERIFY_COUNTS[0],
+        len(reference),
+        None if candidate is None else len(candidate),
+        first_diff,
+    )
+
+
+def _conversation_to_last_assistant(conversation: list[dict]) -> list[dict]:
+    """The conversation through the last assistant turn (the prefix render input)."""
+    idx = next(
+        (
+            i
+            for i in reversed(range(len(conversation)))
+            if conversation[i].get("role") == "assistant"
+        ),
+        None,
+    )
+    return conversation if idx is None else conversation[: idx + 1]
+
+
+def _required_prefix_ids(raw_messages: list[dict]) -> list[int]:
+    """The model-generated token prefix the next prompt must preserve.
+
+    Only the last assistant turn's echo qualifies: splicing an older turn's
+    prefix onto a newer conversation duplicates or drops content (the legacy
+    path heals this case by counting EOS turns on the rendered prefix).
+    """
+    for _m in reversed(raw_messages):
+        if _m.get("role") == "assistant":
+            prompt_ids = _m.get("prompt_token_ids")
+            if prompt_ids is None:
+                _splice_guard_log("stale_turn")
+                return []
+            # A double-counted echo (prompt ids already end with the
+            # generation ids) needs no guard here: the boundary count comes
+            # from the rendered prefix, so the splice matches legacy exactly,
+            # duplicated tokens and all.
+            return list(prompt_ids) + list(_m.get("generation_token_ids") or [])
+    return []
+
+
 def _compute_splice_inputs(
     raw_messages: list[dict[str, Any]],
     conversation: list[dict[str, Any]],
@@ -1009,19 +1146,7 @@ def _compute_splice_inputs(
             )
             break
 
-    _last_asst_idx = next(
-        (
-            i
-            for i in reversed(range(len(conversation)))
-            if conversation[i].get("role") == "assistant"
-        ),
-        None,
-    )
-    _msgs_to_last_asst = (
-        conversation[: _last_asst_idx + 1]
-        if _last_asst_idx is not None
-        else conversation
-    )
+    _msgs_to_last_asst = _conversation_to_last_assistant(conversation)
     _prefix_tkw: dict[str, Any] = {
         **default_template_kwargs,
         "tokenize": True,
@@ -1101,6 +1226,12 @@ def start_server(
         tool_parser=tool_parser,
         reasoning_parser=reasoning_parser,
     )
+
+    if _prefix_splice_mode() != "legacy":
+        # The incremental splice counts EOS strings where legacy counts EOS
+        # ids; fail at startup, not per request, when the active tokenizer
+        # backend breaks that equivalence.
+        assert_splice_tokenizer_invariants(tokenizer)
 
     config = uvicorn.Config(app, host=host, port=port, log_level="warning")
     server = uvicorn.Server(config)

@@ -460,13 +460,21 @@ def _build_frontend_tokenizer(
     import numpy as np
     from transformers import AutoConfig, AutoTokenizer
 
+    from nemo_rl.models.generation.openai_server_utils import (
+        assert_splice_tokenizer_invariants,
+    )
     from nemo_rl.models.generation.trtllm.trtllm_http_server import (
+        _prefix_splice_mode,
         build_spliced_prompt_ids,
     )
 
     from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    if _prefix_splice_mode() != "legacy":
+        # Same invariant the engine adapter asserts: the frontend runs the
+        # same splice code, and its ids must be bit-identical to the adapter's.
+        assert_splice_tokenizer_invariants(tokenizer)
     model_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
 
     async def _tokenize(payload: dict[str, Any]) -> str:
