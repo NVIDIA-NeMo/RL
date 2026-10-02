@@ -327,6 +327,11 @@ from nemo_rl.models.megatron.router_replay import (
     router_replay_enabled,
     validate_router_replay_config,
 )
+from nemo_rl.models.megatron.zero_train_gen_mismatch import (
+    configure_zero_train_gen_mismatch,
+    enable_batch_invariant_kernels,
+    validate_batch_invariant_mode,
+)
 from nemo_rl.models.policy import (
     Fp4Config,
     MegatronConfig,
@@ -376,6 +381,51 @@ def _resolve_optimizer_dtype_kwargs(optimizer_cfg: dict[str, Any]) -> dict[str, 
                     f"{', '.join(dtype_aliases)}"
                 ) from e
     return resolved
+
+
+def enable_batch_invariant_mode(config: PolicyConfig) -> None:
+    """Enable Megatron-Core batch-invariant kernels before CUDA initialization.
+
+    The mode is deliberately limited to the topology for which Megatron
+    generation and policy scoring can execute the same arithmetic.
+    Megatron-Core performs the remaining model-specific validation when the
+    provider is finalized. Sampling parameters do not affect this validation:
+    generation samples from the processed distribution while generation and
+    policy scoring both report raw model logprobs.
+
+    Args:
+        config: Policy configuration for this Megatron worker.
+
+    Raises:
+        ValueError: If batch-invariant mode is requested with an unsupported
+            NeMo-RL topology, generation backend, or precision.
+        AssertionError: If the installed Transformer Engine cannot pin the
+            requested FlashAttention version.
+    """
+    if not config.get("megatron_cfg", {}).get("batch_invariant_mode"):
+        return
+
+    result = validate_batch_invariant_mode(config)
+    result.raise_if_invalid("batch_invariant_mode=True failed validation:")
+    enable_batch_invariant_kernels(config)
+
+
+def enable_zero_train_gen_kl(
+    config: PolicyConfig, *, apply_kernels: bool = True
+) -> None:
+    """Resolve zero_train_gen_mismatch into sub-knobs and enable batch-invariant mode.
+
+    Applies the zero train/gen KL defaults below. A recipe value that differs is
+    overridden with a warning. Generation may be colocated or not and may use
+    either ``transformer_engine`` or ``inference_optimized``. Call with
+    ``apply_kernels=True`` before CUDA initialization so Megatron-Core
+    batch-invariant kernels are active for the worker lifetime.
+
+    Raises:
+        ValueError: If batch-invariant mode validation fails after defaults are
+            applied.
+    """
+    configure_zero_train_gen_mismatch(config, apply_kernels=apply_kernels)
 
 
 def destroy_parallel_state():
@@ -475,6 +525,10 @@ def validate_and_set_config(
             "with TP>1: set policy.megatron_cfg.sequence_parallel=true."
         )
 
+    # Resolve zero-KL config knobs before sampling_params so batch_invariant_mode
+    # is visible when deciding whether to recompute raw training logprobs.
+    enable_zero_train_gen_kl(config, apply_kernels=False)
+
     # Handle generation configuration
     is_generation_colocated = None
     sampling_params = None
@@ -482,12 +536,15 @@ def validate_and_set_config(
         generation_cfg = config["generation"]
         # set generation colocated
         is_generation_colocated = generation_cfg["colocated"]["enabled"]
-        # set sampling params
-        sampling_params = TrainingSamplingParams(
-            top_k=generation_cfg["top_k"],
-            top_p=generation_cfg["top_p"],
-            temperature=generation_cfg["temperature"],
-        )
+        # Batch-invariant Megatron inference returns raw model logprobs even
+        # when token sampling uses temperature, top-k, or top-p. Match
+        # Megatron-RL by recomputing raw training logprobs as well.
+        if not config["megatron_cfg"].get("batch_invariant_mode"):
+            sampling_params = TrainingSamplingParams(
+                top_k=generation_cfg["top_k"],
+                top_p=generation_cfg["top_p"],
+                temperature=generation_cfg["temperature"],
+            )
 
     # Setup data types
     dtype_map = {
@@ -1037,14 +1094,6 @@ def setup_model_config(
     # Validate chunking configuration
     _validate_chunking_config(config)
 
-    # Reconstructed providers must be finalized so derived fields reflect the
-    # merged config. Without overrides, preserve the existing checkpoint-load
-    # behavior: only HF-derived providers need finalization here.
-    if derive_provider_from_hf or model_overrides:
-        model_cfg.finalize()
-
-    model_cfg.__post_init__()
-
     # Derive fp8_param_enabled once from the config dict so that load_main_params_from_ckpt
     # and _create_megatron_config both use the same canonical check (fp8 enabled AND fp8_param).
     fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
@@ -1076,6 +1125,11 @@ def setup_model_config(
 
     # Validate training configuration
     _validate_training_config(config, model_cfg)
+
+    # Finalize once after NeMo-RL fields are applied. Bridge configs defer MCore
+    # __post_init__ to finalize(); megatron_cfg.validate() may call it again.
+    if derive_provider_from_hf or model_overrides:
+        model_cfg.finalize()
 
     # Create final megatron config
     megatron_cfg = _create_megatron_config(
@@ -1279,6 +1333,13 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     if "inference_grouped_gemm_backend" in config["megatron_cfg"]:
         model_cfg.inference_grouped_gemm_backend = config["megatron_cfg"][
             "inference_grouped_gemm_backend"
+        ]
+    # Mamba/SSM training path: False takes the training forward off the fused
+    # mamba_split_conv1d_scan_combined and onto the unfused
+    # mamba_chunk_scan_combined. Inert for models with no SSM layers.
+    if "use_mamba_mem_eff_path" in config["megatron_cfg"]:
+        model_cfg.use_mamba_mem_eff_path = config["megatron_cfg"][
+            "use_mamba_mem_eff_path"
         ]
     if "moe_router_num_groups" in config["megatron_cfg"]:
         model_cfg.moe_router_num_groups = config["megatron_cfg"][
@@ -1694,6 +1755,50 @@ def _apply_precision_config(
         )
 
 
+def _inference_optimized_gpt_layer_spec(provider: Any, vp_stage: Any = None) -> Any:
+    """Return the inference-optimized GPT layer spec for a finalized provider.
+
+    Bridge ``GPTModelProvider.default_layer_spec`` only selects TE specs, so
+    ``transformer_impl=inference_optimized`` would otherwise build TE modules.
+    Callable form resolves against provider fields at ``provide()`` time.
+
+    Args:
+        provider: Finalized Megatron-Bridge GPT model provider.
+        vp_stage: Virtual-pipeline stage forwarded by Bridge; unused by this spec.
+    """
+    del vp_stage
+    # Megatron-Core is imported only when an infopt worker builds the model.
+    from megatron.core.models.gpt.gpt_layer_specs import (
+        get_gpt_layer_with_inference_spec,
+    )
+
+    return get_gpt_layer_with_inference_spec(
+        qk_layernorm=getattr(provider, "qk_layernorm", False),
+        multi_latent_attention=getattr(provider, "multi_latent_attention", False),
+        qk_l2_norm=getattr(provider, "qk_l2_norm", False),
+        num_experts=getattr(provider, "num_moe_experts", None),
+        moe_grouped_gemm=getattr(provider, "moe_grouped_gemm", False),
+    )
+
+
+def _apply_transformer_impl_config(
+    model_cfg: Any, megatron_cfg: Mapping[str, Any]
+) -> None:
+    """Apply the transformer implementation and its matching Bridge layer spec."""
+    if "transformer_impl" not in megatron_cfg:
+        return
+
+    model_cfg.transformer_impl = megatron_cfg["transformer_impl"]
+    # Bridge GPTModelProvider.default_layer_spec only branches on
+    # use_transformer_engine_full_layer_spec (both branches TE), so
+    # transformer_impl=inference_optimized would otherwise still build TE
+    # modules. Assign the infopt GPT spec through the provider override
+    # (same hook the modelopt path uses). Callable so it resolves against
+    # finalized provider fields at provide() time.
+    if model_cfg.transformer_impl == "inference_optimized":
+        model_cfg.transformer_layer_spec = _inference_optimized_gpt_layer_spec
+
+
 def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     """Apply performance optimization configuration."""
     model_cfg.parallel_output = True
@@ -1760,9 +1865,23 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
                 f"Available backends are: {list(AttnBackend.__members__.keys())}"
             )
 
+    flash_attention_version = config["megatron_cfg"].get("flash_attention_version")
+    if flash_attention_version is not None:
+        model_cfg.flash_attention_version = flash_attention_version
+
+    if "batch_invariant_mode" in config["megatron_cfg"]:
+        model_cfg.batch_invariant_mode = config["megatron_cfg"]["batch_invariant_mode"]
+    if "batch_invariant_backend" in config["megatron_cfg"]:
+        model_cfg.batch_invariant_backend = config["megatron_cfg"][
+            "batch_invariant_backend"
+        ]
+    if "batch_invariant_collective" in config["megatron_cfg"]:
+        model_cfg.batch_invariant_collective = config["megatron_cfg"][
+            "batch_invariant_collective"
+        ]
+
     # These overrides need to be applied before the workers spawn.
-    if "transformer_impl" in config["megatron_cfg"]:
-        model_cfg.transformer_impl = config["megatron_cfg"]["transformer_impl"]
+    _apply_transformer_impl_config(model_cfg, config["megatron_cfg"])
     if "cuda_graph_impl" in config["megatron_cfg"]:
         model_cfg.cuda_graph_impl = config["megatron_cfg"]["cuda_graph_impl"]
         if model_cfg.cuda_graph_impl != "none":
@@ -2173,10 +2292,7 @@ def build_inference_model(
     train_pipeline_model_parallel_size = inference_provider.pipeline_model_parallel_size
     _apply_parallelism_config(inference_provider, policy_cfg)
     _apply_moe_config(inference_provider, policy_cfg)
-    if "transformer_impl" in policy_cfg["megatron_cfg"]:
-        inference_provider.transformer_impl = policy_cfg["megatron_cfg"][
-            "transformer_impl"
-        ]
+    _apply_transformer_impl_config(inference_provider, policy_cfg["megatron_cfg"])
     # CUDA graph config needs to be set correctly before init.
     if "cuda_graph_impl" in policy_cfg["megatron_cfg"]:
         cuda_graph_impl = policy_cfg["megatron_cfg"]["cuda_graph_impl"]
