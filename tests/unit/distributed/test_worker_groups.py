@@ -470,6 +470,35 @@ def test_custom_environment_variables(register_test_actor, virtual_cluster):
     worker_group.shutdown(force=True)
 
 
+def test_worker_group_does_not_mutate_callers_env_vars(
+    register_test_actor, virtual_cluster, monkeypatch
+):
+    """The caller's env_vars dict is usually a config's; it must not absorb os.environ.
+
+    Filling it in place wrote the whole launch environment (API keys included)
+    into the saved checkpoint config and the W&B run config.
+    """
+    monkeypatch.setenv("NRL_TEST_PROCESS_ONLY_VAR", "from_process")
+    caller_env_vars = {"CUSTOM_VAR_1": "test_value_1"}
+
+    worker_group = RayWorkerGroup(
+        cluster=virtual_cluster,
+        remote_worker_builder=RayWorkerBuilder(register_test_actor),
+        workers_per_node=2,
+        env_vars=caller_env_vars,
+    )
+
+    assert caller_env_vars == {"CUSTOM_VAR_1": "test_value_1"}
+    for worker in worker_group.workers:
+        assert ray.get(worker.get_env_var.remote("CUSTOM_VAR_1")) == "test_value_1"
+        assert (
+            ray.get(worker.get_env_var.remote("NRL_TEST_PROCESS_ONLY_VAR"))
+            == "from_process"
+        )
+
+    worker_group.shutdown(force=True)
+
+
 def test_custom_environment_variables_override_existing(
     register_test_actor, virtual_cluster
 ):

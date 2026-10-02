@@ -242,6 +242,37 @@ def test_policy_accepts_matched_vllm_and_megatron_fp32_lm_head():
     assert policy.worker_group is not None
 
 
+def test_policy_accepts_matched_tf32_lm_head():
+    config = create_megatron_config("test-model", tp=1)
+    config["megatron_cfg"]["fp32_lm_head"] = "tf32"
+    set_vllm_generation(config, {"fp32_lm_head": "tf32"})
+
+    policy = construct_policy_with_mocks(config)
+
+    assert policy.worker_group is not None
+
+
+@pytest.mark.parametrize(
+    ("trainer_fp32", "vllm_fp32"), [("tf32", True), (True, "tf32")]
+)
+def test_policy_rejects_mixed_tf32_and_fp32_lm_head_modes(trainer_fp32, vllm_fp32):
+    config = create_megatron_config("test-model", tp=1)
+    config["megatron_cfg"]["fp32_lm_head"] = trainer_fp32
+    set_vllm_generation(config, {"fp32_lm_head": vllm_fp32})
+
+    with (
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup") as worker_group,
+        pytest.raises(ValueError, match="mode must match on both engines"),
+    ):
+        Policy(
+            cluster=create_mock_cluster(world_size=1),
+            config=config,
+            tokenizer=create_mock_tokenizer(),
+        )
+
+    worker_group.assert_not_called()
+
+
 def test_policy_warns_when_vllm_fp32_lm_head_model_is_not_nemotron_h():
     config = create_megatron_config("test-model", tp=1)
     config["megatron_cfg"]["fp32_lm_head"] = True
@@ -385,12 +416,12 @@ def test_validate_fp32_lm_head_rejects_fused_logprobs_without_generation():
 
 def test_policy_rejects_non_bool_megatron_fp32_lm_head():
     config = create_megatron_config("test-model", tp=1)
-    config["megatron_cfg"]["fp32_lm_head"] = "tf32"
+    config["megatron_cfg"]["fp32_lm_head"] = "fp16"
     set_vllm_generation(config, {"fp32_lm_head": True})
 
     with (
         patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup") as worker_group,
-        pytest.raises(ValueError, match="true or false"),
+        pytest.raises(ValueError, match='true, false, or "tf32"'),
     ):
         Policy(
             cluster=create_mock_cluster(world_size=1),

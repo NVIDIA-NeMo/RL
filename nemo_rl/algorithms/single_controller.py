@@ -54,7 +54,7 @@ import time
 import uuid
 import warnings
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -107,6 +107,18 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     algo_config,
     is_ppo_run,
+    multi_trace_enabled,
+)
+from nemo_rl.algorithms.single_controller_utils.legacy_diagnostics import (
+    NULL_EFFICIENCY_CLOCK,
+    LegacyEfficiencyClock,
+    LegacyPPODiagnostics,
+    add_legacy_timing_aliases,
+    fetch_generation_logger_metrics,
+    is_pad_row,
+    legacy_performance_metrics,
+    legacy_setup_timing_metrics,
+    timer_kwargs,
 )
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     ROLLOUT_CHECKPOINT_ATTEMPT_OUTCOMES,
@@ -135,6 +147,7 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
     squeeze_trailing_unit_dim,
     tensor_field,
 )
+from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.multimodal_utils import present_multimodal_fields
 from nemo_rl.data_plane import (
@@ -160,6 +173,9 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lost
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.failures import RolloutStall
+from nemo_rl.experience.legacy_rollout_metrics import (
+    aggregate_rollout_metrics_with_sum_counts,
+)
 from nemo_rl.experience.payload import VIOLATION_TAG_KEYS
 from nemo_rl.experience.rollout_manager import RolloutOutcome
 from nemo_rl.experience.rollout_recovery import (
@@ -202,6 +218,7 @@ from nemo_rl.utils.logger import TELEMETRY_WALL_TIME_METRIC, Logger
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 if TYPE_CHECKING:
+    from nemo_rl.algorithms.swe_privileged_critic import SwePrivilegePrefixStore
     from nemo_rl.experience.rollout_reassembler import FinalizedGroup
     from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
 
@@ -215,6 +232,31 @@ log = logging.getLogger(__name__)
 # budget: at this point the run is over, so the only thing a completed restart buys is a
 # cleaner exit. Not configurable for the same reason.
 _SUPERVISOR_DRAIN_TIMEOUT_S = 30.0
+
+# Prompts drawn from the dataloader but not yet trained (in flight or buffered)
+# at a checkpoint whose replay buffer is dropped (checkpoint_replay_buffer=false).
+# The restored dataloader resumes past them, so they are re-dispatched on resume.
+PENDING_PROMPTS_FILENAME = "pending_prompts.pt"
+# SWE privileged critic prefix cache, saved with a checkpointed replay buffer so the
+# restored groups keep their reference blocks.
+PRIVILEGE_PREFIXES_FILENAME = "privilege_prefixes.pt"
+
+
+def _restorable_dispatch_index(
+    saved_dispatch_index: Optional[int], *, checkpoint_replay_buffer: bool
+) -> Optional[int]:
+    """The sampler cursor to restore, or None to seed it from the trainer version.
+
+    With checkpoint_replay_buffer=false the buffered and in-flight groups the saved
+    cursor counted are dropped. Restoring it would leave the gate closed
+    (dispatch_index >= trainer_version + window) with nothing left to train, so a
+    resumed run would never admit or train again. Seeding from the trainer version
+    reopens the gate; the dropped prompts are re-dispatched from
+    PENDING_PROMPTS_FILENAME.
+    """
+    if not checkpoint_replay_buffer:
+        return None
+    return saved_dispatch_index
 
 
 @dataclass(frozen=True)
@@ -331,6 +373,18 @@ class SingleControllerActor:
     # handle, so an instance built without running __init__ emits no spans
     # rather than raising out of the training loop.
     _tracer: Any = None
+
+    # Legacy async-PPO diagnostics (single_controller_utils/legacy_diagnostics.py),
+    # declared on the class for the same reason: an instance built without
+    # __init__ runs with them off (the null clock's hooks are no-ops).
+    _legacy_diag: Optional[LegacyPPODiagnostics] = None
+    _legacy_efficiency: LegacyEfficiencyClock = NULL_EFFICIENCY_CLOCK
+    # Likewise for the SWE PPO state: such an instance runs single-trace with a
+    # blind critic, tracks no pending prompts and has none to re-dispatch.
+    _multi_trace: bool = False
+    _privilege_store: Optional[SwePrivilegePrefixStore] = None
+    _pending_prompt_idx: Optional[set[int]] = None
+    _resume_pending_prompts: Sequence[DatumSpec] = ()
 
     def __init__(
         self,
@@ -496,6 +550,36 @@ class SingleControllerActor:
             self._buffer.set_post_write_enricher(self._teacher_coordinator.enrich)
         else:
             self._teacher_coordinator = None
+        # SWE privileged critic: stamp each group with its reference-block prefix
+        # before it becomes selectable. The buffer takes a single enricher.
+        self._privilege_store = getattr(actor_args, "privilege_store", None)
+        # Multi-trace: a prompt group commits one row per agent session segment,
+        # so steps are padded to a multiple every data-parallel shard divides.
+        self._multi_trace = multi_trace_enabled(master_config)
+        self._step_pad_rows = 0
+        # Legacy async-PPO W&B parity and rollout_debug jsonl (legacy_diagnostics.py).
+        self._legacy_diag: Optional[LegacyPPODiagnostics] = (
+            LegacyPPODiagnostics.from_algo_config(self._algo_cfg)
+            if self._is_ppo
+            else None
+        )
+        self._legacy_efficiency = LegacyEfficiencyClock()
+        if self._multi_trace:
+            shard_multiples = [
+                handle.sharding_annotations.get_axis_size("data_parallel")
+                * handle.cfg["train_micro_batch_size"]
+                for handle in (self._trainer, self._value)
+                if handle is not None
+            ]
+            self._multi_trace_row_multiple = math.lcm(*shard_multiples)
+        if self._privilege_store is not None:
+            if self._teacher_coordinator is not None:
+                raise ValueError(
+                    "value.swe_privileged_critic cannot be combined with "
+                    "on-policy distillation teachers: both need the replay "
+                    "buffer's single post-write enricher."
+                )
+            self._buffer.set_post_write_enricher(self._privilege_store.enrich)
         # Only with fleet health: without a ledger nothing ever reaches DEAD, so there
         # is nothing for a supervisor to restart.
         _fleet_health_cfg = master_config.async_rl.generation_fleet_health
@@ -519,7 +603,12 @@ class SingleControllerActor:
             hparams["token_capture"]["control_auth_token"] = "<redacted>"
         self._logger.log_hyperparams(hparams)
         self._logger.log_metrics(
-            setup_timing_metrics.to_metrics_dict(), step=0, prefix=SETUP_TIMING_PREFIX
+            legacy_setup_timing_metrics(
+                setup_timing_metrics.to_metrics_dict(),
+                master_config.policy["generation"].get("backend"),
+            ),
+            step=0,
+            prefix=SETUP_TIMING_PREFIX,
         )
         self._timer = Timer()
         self._throughput_sample_time: Optional[float] = None
@@ -569,7 +658,10 @@ class SingleControllerActor:
             self._async_cfg.sampler,
             min_groups_for_streaming_train=self._async_cfg.min_groups_for_streaming_train,
         )
-        restored_dispatch_index = actor_args.save_state.sampler_dispatch_index
+        restored_dispatch_index = _restorable_dispatch_index(
+            actor_args.save_state.sampler_dispatch_index,
+            checkpoint_replay_buffer=self._async_cfg.checkpoint_replay_buffer,
+        )
         if restored_dispatch_index is None:
             # Checkpoints predating exact sampler state reconstruct the original
             # fresh-step invariant from the restored trainer version.
@@ -578,7 +670,7 @@ class SingleControllerActor:
             self._sampler.restore_dispatch_index(restored_dispatch_index)
         if (
             self._master_config.checkpointing["enabled"]
-            and self._sampler.supports_buffer_checkpoint
+            and self._replay_checkpoint_enabled
             and not self._master_config.checkpointing.get("save_data_plane")
         ):
             raise ValueError(
@@ -587,7 +679,8 @@ class SingleControllerActor:
                 "completed, unconsumed rollouts are recoverable."
             )
         restoring_rollout_recovery = bool(
-            self._data_plane_checkpoint_metadata is not None
+            self._async_cfg.checkpoint_replay_buffer
+            and self._data_plane_checkpoint_metadata is not None
             and self._data_plane_checkpoint_metadata.get(
                 "rollout_recovery_payload_sha256"
             )
@@ -598,7 +691,7 @@ class SingleControllerActor:
             or (
                 self._master_config.checkpointing["enabled"]
                 and self._master_config.checkpointing.get("save_data_plane")
-                and self._sampler.supports_buffer_checkpoint
+                and self._replay_checkpoint_enabled
             )
         )
         # ── asyncio state ──────────────────────────────────────────────────
@@ -669,6 +762,10 @@ class SingleControllerActor:
         # hole with a later step's finished group counts a promotion, and the step it
         # borrowed from counts the replacement that repaid it.
         self._replacement_reserve: deque[DatumSpec] = deque()
+        # Dataset idx of every dispatched prompt not yet consumed by a train step,
+        # and the restored ones to re-dispatch (see PENDING_PROMPTS_FILENAME).
+        self._pending_prompt_idx = set()
+        self._resume_pending_prompts = []
         self._batch_replacements: dict[int, int] = {}
         self._batch_promotions: dict[int, int] = {}
         # Whether the sampler has ever handed back a target step. Only stamped prompts
@@ -749,12 +846,16 @@ class SingleControllerActor:
 
         replay_restore_started = time.monotonic()
         restored_replay_groups = await self._maybe_restore_replay_buffer()
+        await self._maybe_restore_privilege_prefixes(restored_replay_groups)
         replay_restore_seconds = time.monotonic() - replay_restore_started
         recovery_prepare_started = time.monotonic()
-        await self._maybe_restore_rollout_recovery(
-            restored_replay_groups=restored_replay_groups
-        )
+        # checkpoint_replay_buffer=false drops in-flight work on resume as well.
+        if self._async_cfg.checkpoint_replay_buffer:
+            await self._maybe_restore_rollout_recovery(
+                restored_replay_groups=restored_replay_groups
+            )
         await self._maybe_restore_replacement_reserve()
+        await self._maybe_restore_pending_prompts()
         self._validate_restored_sampler_cursor()
         recovery_prepare_seconds = time.monotonic() - recovery_prepare_started
         self._log_rollout_restore_metrics(
@@ -913,6 +1014,9 @@ class SingleControllerActor:
     ) -> None:
         """Record one committed group's queue and execution durations."""
         self._rollout_queue_wait_durations_s.append(dispatch_started - work_started)
+        self._legacy_efficiency.record_pre_dispatch_wait(
+            dispatch_started - work_started
+        )
         self._rollout_completion_durations_s.append(time.monotonic() - dispatch_started)
 
     def _log_rollout_restore_metrics(
@@ -945,6 +1049,14 @@ class SingleControllerActor:
 
     # ── internal helpers ───────────────────────────────────────────────────
 
+    @property
+    def _replay_checkpoint_enabled(self) -> bool:
+        """Whether checkpoints carry buffered groups (sampler capability + opt-out)."""
+        return (
+            self._sampler.supports_buffer_checkpoint
+            and self._async_cfg.checkpoint_replay_buffer
+        )
+
     async def _maybe_restore_replay_buffer(self) -> int:
         """Restore the local replay index for the native TQ checkpoint.
 
@@ -957,6 +1069,13 @@ class SingleControllerActor:
         metadata_path = os.path.join(
             self._last_checkpoint_path, REPLAY_BUFFER_METADATA_FILENAME
         )
+        if not self._async_cfg.checkpoint_replay_buffer:
+            print(
+                "⚠️ async_rl.checkpoint_replay_buffer=false: resuming with an "
+                "empty replay buffer.",
+                flush=True,
+            )
+            return 0
         if (
             os.path.exists(metadata_path)
             and not self._sampler.supports_buffer_checkpoint
@@ -1020,7 +1139,10 @@ class SingleControllerActor:
             buffer_state,
             max_groups=self._async_cfg.max_buffered_rollouts,
             expected_partition_id=self._partition_id,
-            expected_group_size=self._algo_cfg.num_generations_per_prompt,
+            # Multi-trace groups hold one row per agent session segment.
+            expected_group_size=(
+                None if self._multi_trace else self._algo_cfg.num_generations_per_prompt
+            ),
             expected_manifest_digest=expected_manifest_digest_value,
         )
         await self._validate_replay_inventory(buffer_state)
@@ -1542,6 +1664,108 @@ class SingleControllerActor:
             f"{reserve_path}",
             flush=True,
         )
+
+    async def _dataset_prompt(self, sample_index: int) -> DatumSpec:
+        """Rebuild one dataloader prompt from its dataset index."""
+        dataset = getattr(self._dataloader, "dataset", None)
+        if dataset is None:
+            raise RuntimeError(
+                "cannot re-dispatch pending prompts: the dataloader does not "
+                "expose its source dataset"
+            )
+        dataset_prompt = await asyncio.to_thread(dataset.__getitem__, sample_index)
+        collate_fn = getattr(self._dataloader, "collate_fn", None)
+        if collate_fn is None:
+            return cast(DatumSpec, dataset_prompt)
+        prompt_batch = await asyncio.to_thread(collate_fn, [dataset_prompt])
+        if isinstance(prompt_batch, BatchedDataDict):
+            return cast(
+                DatumSpec, {key: value[0] for key, value in prompt_batch.items()}
+            )
+        return cast(DatumSpec, prompt_batch)
+
+    async def _maybe_restore_privilege_prefixes(self, restored_groups: int) -> None:
+        """Re-cache the reference blocks the restored replay groups reference."""
+        privilege_store = self._privilege_store
+        if privilege_store is None or not restored_groups:
+            return
+        path = os.path.join(self._last_checkpoint_path, PRIVILEGE_PREFIXES_FILENAME)
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"Restored {restored_groups} replay group(s) for the SWE privileged "
+                f"critic, but the checkpoint has no {PRIVILEGE_PREFIXES_FILENAME}."
+            )
+        # weights_only=False: prefix tensors plus plain stats dicts, a trusted
+        # same-job artifact like the replay metadata.
+        state = await asyncio.to_thread(torch.load, path, weights_only=False)
+        metas = [meta for meta in self._buffer.meta_list if meta is not None]
+        privilege_store.restore(state, metas)
+        print(
+            f"📦 Restored {len(privilege_store)} privileged-critic prefix(es) for "
+            f"{len(metas)} restored replay group(s)",
+            flush=True,
+        )
+
+    async def _maybe_restore_pending_prompts(self) -> None:
+        """Load prompts the previous run drew but never trained (buffer dropped).
+
+        With the buffer restored instead, rollout recovery (on whenever the replay
+        buffer is checkpointed) relaunches the groups that were in flight.
+        """
+        self._resume_pending_prompts = []
+        if (
+            self._last_checkpoint_path is None
+            or self._async_cfg.checkpoint_replay_buffer
+        ):
+            return
+        pending_path = os.path.join(
+            self._last_checkpoint_path, PENDING_PROMPTS_FILENAME
+        )
+        if not os.path.exists(pending_path):
+            return
+        indices = await asyncio.to_thread(torch.load, pending_path, weights_only=True)
+        self._resume_pending_prompts = [
+            await self._dataset_prompt(int(index)) for index in indices
+        ]
+        print(
+            f"📦 Re-dispatching {len(self._resume_pending_prompts)} prompt(s) that the "
+            "previous run drew but never trained (replay buffer dropped on resume): "
+            f"{pending_path}",
+            flush=True,
+        )
+
+    async def _dispatch_resume_pending_prompts(self, launch: Any) -> None:
+        """Admit restored pending prompts, one num_prompts_per_step batch at a time.
+
+        Mirrors the rollout pump's dispatch without rollout recovery (pending
+        prompts exist only when the replay buffer is dropped, which also turns
+        recovery off), so each chunk takes one sampler admission like a
+        dataloader batch would.
+        """
+        prompts = self._resume_pending_prompts
+        self._resume_pending_prompts = []
+        batch_size = self._algo_cfg.num_prompts_per_step
+        remainder = len(prompts) % batch_size
+        if remainder and self._async_cfg.sampler.name == "in_order":
+            # in_order stamps each admission with a target step and waits for a
+            # full batch of groups for it, so a partial batch would never close.
+            # Pending prompts come in whole target batches unless a group was
+            # dropped; re-dispatch the whole batches and skip the remainder.
+            print(
+                f"WARNING: skipping {remainder} pending prompt(s) on resume: in_order "
+                f"needs whole batches of {batch_size}",
+                flush=True,
+            )
+            prompts = prompts[: len(prompts) - remainder]
+        for start in range(0, len(prompts), batch_size):
+            target_step = await self._sampler.admit(
+                trainer_version_fn=lambda: self._trainer_version
+            )
+            if target_step is not None:
+                self._sampler_stamps_target_steps = True
+            self._require_unoccupied_target_step(target_step)
+            for prompt in prompts[start : start + batch_size]:
+                await launch(prompt, target_step, None)
 
     async def _ray_get(self, obj_ref: Any) -> Any:
         """Await a Ray ObjectRef without blocking the asyncio event loop."""
@@ -2280,6 +2504,13 @@ class SingleControllerActor:
                     "recovery-enabled rollout dispatch requires a pre-reserved "
                     "prompt-group ID"
                 )
+            prompt_dataset_idx = prompt.get("idx")
+            if (
+                self._pending_prompt_idx is not None
+                and isinstance(prompt_dataset_idx, int)
+                and not isinstance(prompt_dataset_idx, bool)
+            ):
+                self._pending_prompt_idx.add(prompt_dataset_idx)
             work_started = time.monotonic()
             # check if buffer is full
             self._buffer_capacity_waiters += 1
@@ -2326,6 +2557,7 @@ class SingleControllerActor:
         async with asyncio.TaskGroup() as rollout_tasks:
             if self._rollout_recovery_enabled:
                 await self._redispatch_restored_rollouts(_launch)
+            await self._dispatch_resume_pending_prompts(_launch)
             while max_epochs is None or self._current_epoch < max_epochs:
                 if not self._rollout_recovery_enabled:
                     for prompt_batch in self._dataloader:
@@ -2841,6 +3073,7 @@ class SingleControllerActor:
                                 )
                                 starvation_polls = 0
                             starvation_polls += 1
+                            self._legacy_efficiency.starved()
                             await asyncio.sleep(0.005)
                             continue
 
@@ -2848,6 +3081,7 @@ class SingleControllerActor:
                         # here rather than after the loop keeps the span on the
                         # stall itself; the loop can go around again for the next
                         # chunk, which opens a fresh episode.
+                        self._legacy_efficiency.fed(self._timer)
                         if starvation_span is not None:
                             safe_set_span_attributes(
                                 starvation_span,
@@ -2888,6 +3122,16 @@ class SingleControllerActor:
                         self._rollout_manager.suspend_request_deadlines()
                         await asyncio.to_thread(self._gen.finish_generation)
 
+                    # Multi-trace steps carry a variable number of rows; pad them
+                    # to the data-parallel multiple the policy and critic shard by.
+                    if self._multi_trace:
+                        with self._timer.time("data_processing"):
+                            train_meta, pad_meta = await self._pad_rows_to_dp_multiple(
+                                train_meta
+                            )
+                        if pad_meta is not None:
+                            consumed_metas.append(pad_meta)
+
                     # ---- 2. Prepare the batch ----
                     # Compute prev_logprobs / ref_logprobs
                     if (
@@ -2922,7 +3166,12 @@ class SingleControllerActor:
                         ):
                             if self._policy_logprobs_required:
                                 await asyncio.to_thread(
-                                    self._trainer.get_logprobs_from_meta, train_meta
+                                    self._trainer.get_logprobs_from_meta,
+                                    train_meta,
+                                    **timer_kwargs(
+                                        self._trainer.get_logprobs_from_meta,
+                                        self._timer,
+                                    ),
                                 )
                             if self._reference_logprobs_required:
                                 await asyncio.to_thread(
@@ -3048,12 +3297,17 @@ class SingleControllerActor:
                                         await asyncio.to_thread(
                                             self._trainer.begin_train_step,
                                             self._loss_fn,
+                                            **self._dynamic_gbs_kwargs(train_meta),
                                         )
                                         step_open = True
                                     await asyncio.to_thread(
                                         self._trainer.train_microbatches_from_meta,
                                         train_meta,
                                         train_fields=self._train_fields,
+                                        **timer_kwargs(
+                                            self._trainer.train_microbatches_from_meta,
+                                            self._timer,
+                                        ),
                                     )
                                     # A PPO step is one chunk: nothing to
                                     # accumulate, so close every epoch here.
@@ -3126,6 +3380,7 @@ class SingleControllerActor:
                 # the run, where an unended span would stay open over the
                 # training that follows and never be exported. The other
                 # exits all end the run, so they are not covered.
+                self._legacy_efficiency.fed(self._timer)
                 if starvation_span is not None:
                     safe_set_span_attributes(
                         starvation_span, {RL_IDLE_POLLS_ATTR: starvation_polls}
@@ -3170,11 +3425,30 @@ class SingleControllerActor:
                     step_metrics.update(aggregate_step_metrics(policy_result))
                 if value_result is not None:
                     step_metrics.update(_compute_critic_metrics(value_result))
+                if self._privilege_store is not None:
+                    step_metrics.update(
+                        self._privilege_store.step_metrics(consumed_metas)
+                    )
+                    self._privilege_store.release(consumed_metas)
+                if self._multi_trace:
+                    step_metrics["multi_trace/pad_rows"] = float(self._step_pad_rows)
+                    step_metrics["multi_trace/rows"] = float(
+                        sum(len(m.sample_ids) for m in consumed_metas)
+                    )
+                    self._step_pad_rows = 0
                 async with self._data_plane_checkpoint_barrier.mutation(
                     "sample_clears"
                 ) as cut:
                     await self._cleanup_consumed_metas_unlocked(cut, consumed_metas)
                     self._buffer.release_training_claims(consumed_training_claim_ids)
+                    if self._pending_prompt_idx:
+                        for consumed_meta in consumed_metas:
+                            for tag in consumed_meta.tags or []:
+                                prompt_dataset_idx = tag.get("prompt_idx")
+                                if prompt_dataset_idx is not None:
+                                    self._pending_prompt_idx.discard(
+                                        int(prompt_dataset_idx)
+                                    )
                 for _ in range(consumed_group_count):
                     self._buffer_capacity.release()
                 step_metrics.update(
@@ -3194,7 +3468,9 @@ class SingleControllerActor:
                             value
                         )
                 step_metrics.update(
-                    aggregate_rollout_metrics(per_group_rollout_metrics)
+                    aggregate_rollout_metrics_with_sum_counts(
+                        per_group_rollout_metrics, aggregate_rollout_metrics
+                    )
                 )
                 try:
                     step_metrics.update(
@@ -3202,6 +3478,19 @@ class SingleControllerActor:
                     )
                 except RayActorError as error:
                     log.warning("Skipping generation step metrics: %s", error)
+                if self._legacy_diag is not None:
+                    step_metrics.update(
+                        self._legacy_diag.step_metrics(
+                            value_result=value_result,
+                            buffer_size=len(self._buffer),
+                            sc_reward=step_metrics.get("reward"),
+                        )
+                    )
+                    step_metrics.update(
+                        await asyncio.to_thread(
+                            fetch_generation_logger_metrics, self._gen
+                        )
+                    )
                 self._step_log_dict = {k: [] for k in self._step_log_dict}
                 step_metrics.update(
                     _pooled_opd_metrics(
@@ -3303,6 +3592,7 @@ class SingleControllerActor:
                         # same seconds are idle on both fleets.
                         with (
                             self._timer.time("weight_sync"),
+                            self._timer.time("idle/refit_bubble"),
                             efficiency_span("idle/refit_bubble", tracer=self._tracer),
                         ):
                             calibration_data = (
@@ -3315,6 +3605,28 @@ class SingleControllerActor:
                             )
                 self._retune_lookahead_versions()
                 self._rollout_manager.set_weight_version(self._trainer_version)
+                # Only after the refit: nothing may yield between the version bump
+                # above and _sync_weights closing the dispatch gate, or the rollout
+                # pump launches the next batch on the old weights and stamps it with
+                # the old version (trajectory age 2 instead of legacy's 1).
+                if self._legacy_diag is not None:
+                    await asyncio.to_thread(
+                        self._legacy_diag.write_rollout_debug,
+                        self._logger,
+                        step=self._train_steps,
+                        trainer_weight_version=self._trainer_version,
+                    )
+                    if self._legacy_diag.rollout_dump_due(self._train_steps):
+                        with self._timer.time("rollout_dump"):
+                            await asyncio.to_thread(
+                                self._legacy_diag.write_rollout_dump,
+                                self._logger.base_log_dir,
+                                step=self._train_steps,
+                                tokenizer_factory=partial(
+                                    get_tokenizer,
+                                    self._master_config.policy["tokenizer"],
+                                ),
+                            )
                 step_metrics.update(
                     {
                         "evicted_stale_prompt_groups": evicted_stale_prompt_groups,
@@ -3398,10 +3710,17 @@ class SingleControllerActor:
             # TODO: per-step train_data jsonl dump, vllm metrics logger,
             #   histogram log, pretty-print "Training Results" block,
             #   print_performance_metrics.
+            add_legacy_timing_aliases(timing_metrics)
+            if self._legacy_diag is not None:
+                self._log_legacy_performance_and_efficiency(
+                    policy_result if policy_result is not None else value_result,
+                    step_metrics,
+                    timing_metrics,
+                )
             printable_step_metrics = {
                 name: value
                 for name, value in step_metrics.items()
-                if not isinstance(value, list)
+                if not isinstance(value, (list, dict))
             }
             print(f"step_metrics={printable_step_metrics}", flush=True)
             self._logger.log_metrics(
@@ -4743,6 +5062,19 @@ class SingleControllerActor:
             # The spare pool and dataloader advance together under the same mutation
             # cut in recovery-enabled dispatch, so preserve them in this cut too.
             reserve_state = list(self._replacement_reserve)
+            # Dataset idx of the in-flight plus buffered prompts a dropped replay
+            # buffer loses; a kept one carries the privileged-critic prefixes.
+            checkpoint_replay_buffer = self._async_cfg.checkpoint_replay_buffer
+            pending_prompt_indices = (
+                []
+                if checkpoint_replay_buffer
+                else sorted(self._pending_prompt_idx or ())
+            )
+            privilege_state = (
+                self._privilege_store.state_dict()
+                if self._privilege_store is not None and checkpoint_replay_buffer
+                else None
+            )
 
             checkpoint_path: PathLike = await asyncio.to_thread(  # pyrefly: ignore[bad-assignment]  the PathLike alias resolves inconsistently under pyrefly's import-cycle breaking
                 self._checkpointer.init_tmp_checkpoint,
@@ -4758,7 +5090,7 @@ class SingleControllerActor:
                         "full trainer checkpoint still owns streamed training rows: "
                         f"groups={[group['group_id'] for group in training_owned_groups]!r}"
                     )
-                if self._sampler.supports_buffer_checkpoint:
+                if self._replay_checkpoint_enabled:
                     replay_metadata = self._buffer.metadata_state_dict(
                         saved_capacity=self._async_cfg.max_buffered_rollouts
                     )
@@ -4866,6 +5198,18 @@ class SingleControllerActor:
                 torch.save,
                 reserve_state,
                 os.path.join(checkpoint_path, REPLACEMENT_RESERVE_FILENAME),
+            )
+        if pending_prompt_indices:
+            await asyncio.to_thread(
+                torch.save,
+                pending_prompt_indices,
+                os.path.join(checkpoint_path, PENDING_PROMPTS_FILENAME),
+            )
+        if privilege_state is not None:
+            await asyncio.to_thread(
+                torch.save,
+                privilege_state,
+                os.path.join(checkpoint_path, PRIVILEGE_PREFIXES_FILENAME),
             )
         if replay_metadata is not None:
             await asyncio.to_thread(
@@ -5113,6 +5457,45 @@ class SingleControllerActor:
         self._rollout_manager.resume_request_deadlines()
         return aborted_stale_inflight_groups
 
+    def _log_legacy_performance_and_efficiency(
+        self,
+        train_result: Optional[dict[str, Any]],
+        step_metrics: dict[str, Any],
+        timing_metrics: dict[str, float],
+    ) -> None:
+        """Legacy performance/* and efficiency/* rows for this step.
+
+        Logged before the step-finishing timing row: W&B drops anything logged
+        against an already committed step. Diagnostics must never end a run.
+        """
+        try:
+            self._logger.log_metrics(
+                legacy_performance_metrics(
+                    train_result=train_result,
+                    step_metrics=step_metrics,
+                    timing_metrics=timing_metrics,
+                    master_config=self._master_config,
+                    num_prompts_per_step=self._algo_cfg.num_prompts_per_step,
+                    num_generations_per_prompt=(
+                        self._algo_cfg.num_generations_per_prompt
+                    ),
+                ),
+                step=self._train_steps,
+                prefix="performance",
+            )
+            self._logger.log_metrics(
+                self._legacy_efficiency.summary(
+                    self._timer,
+                    failed_trajectory_s=(
+                        self._rollout_manager.stats.failed_attempt_seconds
+                    ),
+                ),
+                step=self._train_steps,
+                prefix="",
+            )
+        except Exception as error:  # noqa: BLE001 - diagnostics only
+            log.warning("Skipping legacy performance/efficiency metrics: %r", error)
+
     async def _value_stage(self, meta: KVBatchMeta) -> KVBatchMeta:
         """Run the PPO value model's forward pass over the selected chunk.
 
@@ -5126,9 +5509,94 @@ class SingleControllerActor:
             The batch metadata with the ``values`` column recorded on it.
         """
         await asyncio.to_thread(self._value.prepare_for_inference)
-        await asyncio.to_thread(self._value.get_values_from_meta, meta)
+        await asyncio.to_thread(
+            self._value.get_values_from_meta,
+            meta,
+            **self._privilege_kwargs(meta),
+        )
         await asyncio.to_thread(self._value.finish_inference)
         return meta.with_fields([self._advantage_cfg.values_field])
+
+    def _dynamic_gbs_kwargs(self, meta: KVBatchMeta) -> dict[str, Any]:
+        """One optimizer step over every row of a multi-trace step.
+
+        A multi-trace step has as many rows as its rollouts produced session
+        traces (plus padding), not the configured train_global_batch_size, so
+        both models take the actual row count as their global batch size.
+        Empty otherwise, leaving the configured value in effect.
+        """
+        if not self._multi_trace:
+            return {}
+        return {"gbs": len(meta.sample_ids)}
+
+    async def _pad_rows_to_dp_multiple(
+        self, meta: KVBatchMeta
+    ) -> tuple[KVBatchMeta, Optional[KVBatchMeta]]:
+        """Pad ``meta`` to a multiple of the policy and critic DP sizes.
+
+        Pad rows are copies of real rows written under new sample IDs with
+        ``sample_mask`` zeroed, so they shard and pack like real rows but carry
+        no loss. ``ppo.multi_trace_pad_source`` picks the copied rows: all row 0
+        (legacy) or rows 0, 1, 2, ... (cyclic). Returns the padded meta and the
+        pad rows' own meta (for post-step cleanup), or ``(meta, None)`` when no
+        padding is needed.
+        """
+        multiple = self._multi_trace_row_multiple
+        num_rows = len(meta.sample_ids)
+        num_pad = (-num_rows) % multiple
+        if num_pad == 0:
+            return meta, None
+        if self._algo_cfg.multi_trace_pad_source == "row0":
+            source_positions = [0] * num_pad
+        else:
+            source_positions = [i % num_rows for i in range(num_pad)]
+        source_ids = [meta.sample_ids[i] for i in source_positions]
+        pad_ids = [f"{sid}_pad{i}" for i, sid in enumerate(source_ids)]
+        fields = await self._call_dp(
+            "get_samples",
+            sample_ids=source_ids,
+            partition_id=meta.partition_id,
+            select_fields=list(meta.fields or []),
+        )
+        fields["sample_mask"] = torch.zeros_like(fields["sample_mask"])
+        tags = (
+            [dict(meta.tags[i]) for i in source_positions]
+            if meta.tags is not None
+            else None
+        )
+        async with self._data_plane_checkpoint_barrier.mutation("other"):
+            await self._call_dp(
+                "put_samples",
+                sample_ids=pad_ids,
+                partition_id=meta.partition_id,
+                fields=fields,
+                tags=tags,
+            )
+        pad_meta = KVBatchMeta(
+            partition_id=meta.partition_id,
+            task_name=meta.task_name,
+            sample_ids=pad_ids,
+            fields=list(meta.fields or []),
+            sequence_lengths=(
+                [meta.sequence_lengths[i] for i in source_positions]
+                if meta.sequence_lengths is not None
+                else None
+            ),
+            extra_info={},
+            tags=tags,
+        )
+        self._step_pad_rows += num_pad
+        return meta.concat(pad_meta), pad_meta
+
+    def _privilege_kwargs(self, meta: KVBatchMeta) -> dict[str, Any]:
+        """Critic-call kwargs carrying the batch's reference-block prefixes.
+
+        Empty unless the critic is privileged, so a blind critic's calls are
+        unchanged.
+        """
+        if self._privilege_store is None:
+            return {}
+        return {"privilege_prefixes": self._privilege_store.prefixes_for(meta)}
 
     async def _value_train_epochs(
         self, meta: KVBatchMeta, *, num_epochs: int
@@ -5139,13 +5607,30 @@ class SingleControllerActor:
             The final epoch's ``train_from_meta`` output; earlier epochs'
             results are discarded.
         """
-        await asyncio.to_thread(self._value.prepare_for_training)
+        with self._timer.time("value_training_prep"):
+            await asyncio.to_thread(self._value.prepare_for_training)
+        train_kwargs = {
+            **self._privilege_kwargs(meta),
+            **self._dynamic_gbs_kwargs(meta),
+        }
         result: dict[str, Any] | None = None
         for _ in range(num_epochs):
             result = await asyncio.to_thread(
                 self._value.train_from_meta,
                 meta,
                 self._value_loss_fn,  # pyrefly: ignore
+                **timer_kwargs(self._value.train_from_meta, self._timer),
+                **train_kwargs,
+            )
+        if self._legacy_diag is not None and self._legacy_diag.post_update_enabled:
+            # Forward-only rescoring of the just-updated critic (legacy
+            # ppo.log_post_update_critic_metrics).
+            self._legacy_diag.post_value_result = await asyncio.to_thread(
+                self._value.train_from_meta,
+                meta,
+                self._value_loss_fn,  # pyrefly: ignore
+                eval_mode=True,
+                **train_kwargs,
             )
         await asyncio.to_thread(self._value.finish_training)
         assert result is not None
@@ -5195,13 +5680,18 @@ class SingleControllerActor:
             tensor_field(data, adv_cfg.truncated_field)
         ).bool()
 
-        num_mask_sample_filtered = int(mask_sample.sum().item())
+        # DP pad rows copy their source row's flag; count each real row once.
+        real_rows = torch.tensor(
+            [not is_pad_row(str(sid)) for sid in meta.sample_ids], dtype=torch.bool
+        )
+        num_mask_sample_filtered = int((mask_sample & real_rows).sum().item())
         self._step_log_dict["num_mask_sample_filtered"].append(num_mask_sample_filtered)
         final_sample_mask = sample_mask * (~mask_sample).to(sample_mask.dtype)
         if self._algo_cfg.overlong_filtering:
             final_sample_mask = final_sample_mask * (~truncated).to(sample_mask.dtype)
 
         seq_logprob_error_threshold = self._algo_cfg.seq_logprob_error_threshold
+        seq_error_tensors: dict[str, torch.Tensor] = {}
         # Match the legacy path: whenever real policy logprobs are available,
         # report sequence-level generation/training mismatch. A threshold adds
         # masking; leaving it unset keeps this metrics-only.
@@ -5229,6 +5719,7 @@ class SingleControllerActor:
                 train_data=masking_data,
                 rewards=rewards,
                 seq_logprob_error_threshold=seq_logprob_error_threshold,
+                tensor_out=seq_error_tensors,
             )
             final_sample_mask = masking_data["sample_mask"]
             num_valid_seqs_after = float(
@@ -5279,11 +5770,19 @@ class SingleControllerActor:
         # Value-model estimators (GAE) hand back the regression target alongside
         # the advantages; the group-relative ones return a bare tensor.
         returns: Optional[torch.Tensor] = None
+        # GAE's normalize_over="all_rows" (the legacy default) runs and whitens
+        # over every row's response tokens; the rows final_sample_mask drops still
+        # carry no loss because the trainers read final_sample_mask.
+        estimator_mask = (
+            token_mask
+            if getattr(self._advantage_estimator, "normalize_over", None) == "all_rows"
+            else mask
+        )
         if has_valid_training_tokens:
             result = self._advantage_estimator.compute_advantage(
                 prompt_ids=prompt_ids,
                 rewards=rewards,
-                mask=mask,
+                mask=estimator_mask,
                 repeated_batch=repeated_batch,
                 # Real validity (token-capture placeholders carry sample_mask 0,
                 # and mask_sample/overlong/seq-logprob-error rows are folded in
@@ -5344,6 +5843,54 @@ class SingleControllerActor:
             response_advantages.detach().cpu()
         )
 
+        if self._legacy_diag is not None:
+            # The packed .pt dump needs the token ids, which nothing else here reads.
+            dump_input_ids = (
+                tensor_field(
+                    await call_data_plane(
+                        self._dp_client,
+                        "get_samples",
+                        sample_ids=meta.sample_ids,
+                        partition_id=meta.partition_id,
+                        select_fields=["input_ids"],
+                    ),
+                    "input_ids",
+                )
+                if self._legacy_diag.rollout_dump_due(self._train_steps + 1)
+                else None
+            )
+            # Off the event loop: a few seconds of tensor work on a SWE step.
+            await asyncio.to_thread(
+                self._legacy_diag.on_advantage_stage,
+                sample_ids=meta.sample_ids,
+                tags=meta.tags,
+                sequence_lengths=meta.sequence_lengths,
+                trainer_version=self._trainer_version,
+                rewards=rewards,
+                token_mask=token_mask,
+                mask_sample=mask_sample,
+                final_sample_mask=final_sample_mask,
+                seq_error_tensors=seq_error_tensors,
+                generation_logprobs=(
+                    tensor_field(data, adv_cfg.generation_logprobs_field)
+                    if self._policy_logprobs_required
+                    else None
+                ),
+                policy_logprobs=(
+                    tensor_field(data, adv_cfg.policy_logprobs_field)
+                    if self._policy_logprobs_required
+                    else None
+                ),
+                values=kwargs.get("values"),
+                advantages=advantages,
+                returns=returns,
+                estimator_mask=estimator_mask,
+                advantage_estimator=self._advantage_estimator,
+                input_ids=dump_input_ids,
+                reference_logprobs=kwargs.get("logprobs_reference"),
+                truncated=truncated,
+            )
+
         fields_to_put = {adv_cfg.output_field: advantages}
         if not torch.equal(final_sample_mask, sample_mask):
             fields_to_put[adv_cfg.sample_mask_field] = final_sample_mask
@@ -5401,7 +5948,8 @@ class SingleControllerActor:
 
         Port of ppo.py's _async_ppo_generation_lead_steps.
         """
-        if not self._is_ppo:
+        # The lookahead knobs are in_order's; ready_first keeps its fixed gate.
+        if not self._is_ppo or self._async_cfg.sampler.name != "in_order":
             return
         steady = self._async_cfg.sampler.max_lookahead_versions
         warmup = self._async_cfg.sampler.warmup_lookahead_versions

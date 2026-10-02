@@ -16,7 +16,7 @@ import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from importlib.util import find_spec
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
     import torch
@@ -860,8 +860,12 @@ from torch import nn"""
             quant_config=self.quant_config,
             prefix=maybe_prefix(prefix, "lm_head"),
         )
+        _nrl_fp32_lm_head_mode = os.environ.get(
+            "{VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR}", "0"
+        )
+        self._nrl_fp32_lm_head_tf32 = _nrl_fp32_lm_head_mode == "tf32"
         self._nrl_fp32_lm_head = (
-            os.environ.get("{VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR}", "0") == "1"
+            _nrl_fp32_lm_head_mode in ("1", "tf32")
         )"""
     old_logits_processor_snippet = (
         "        self.logits_processor = LogitsProcessor(config.vocab_size)"
@@ -870,7 +874,10 @@ from torch import nn"""
         if self._nrl_fp32_lm_head:
 
             def _nrl_fp32_lm_head_forward(
-                input_, embedding_bias=None, _lm_head=self.lm_head
+                input_,
+                embedding_bias=None,
+                _lm_head=self.lm_head,
+                _use_tf32=self._nrl_fp32_lm_head_tf32,
             ):
                 if not getattr(_lm_head, "_nrl_fp32_lm_head_forward_logged", False):
                     print(
@@ -879,10 +886,17 @@ from torch import nn"""
                         flush=True,
                     )
                     _lm_head._nrl_fp32_lm_head_forward_logged = True
-                logits = torch.matmul(
-                    input_.to(dtype=torch.float32),
-                    _lm_head.weight.to(dtype=torch.float32).t(),
-                )
+                _prev_tf32 = torch.backends.cuda.matmul.allow_tf32
+                if _use_tf32:
+                    # bf16-exact inputs lose nothing to TF32's 10-bit mantissa.
+                    torch.backends.cuda.matmul.allow_tf32 = True
+                try:
+                    logits = torch.matmul(
+                        input_.to(dtype=torch.float32),
+                        _lm_head.weight.to(dtype=torch.float32).t(),
+                    )
+                finally:
+                    torch.backends.cuda.matmul.allow_tf32 = _prev_tf32
                 if embedding_bias is not None:
                     logits = logits + embedding_bias.to(dtype=torch.float32)
                 return logits
@@ -1030,7 +1044,7 @@ def _apply_vllm_patches(
     py_executable: str,
     *,
     extra_env_vars: list[str] | None = None,
-    nemotron_h_fp32_lm_head: bool | None = None,
+    nemotron_h_fp32_lm_head: bool | Literal["tf32"] | None = None,
     require_moe_routed_experts_capture: bool = False,
 ) -> None:
     # Import lazily so importing the worker module does not import vLLM.
@@ -1040,7 +1054,10 @@ def _apply_vllm_patches(
     patch_logger = init_logger("vllm_patch")
     nemotron_h_fp32_lm_head_enabled = bool(nemotron_h_fp32_lm_head)
     if nemotron_h_fp32_lm_head_enabled:
-        os.environ[VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR] = "1"
+        # "tf32" runs the fp32 head GEMM with TF32 tensor cores; "1" in full fp32.
+        os.environ[VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR] = (
+            "tf32" if nemotron_h_fp32_lm_head == "tf32" else "1"
+        )
         extra_env_vars = [
             *(extra_env_vars or []),
             VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,

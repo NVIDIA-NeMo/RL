@@ -19,6 +19,7 @@ import copy
 import enum
 import json
 import math
+import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
@@ -44,6 +45,7 @@ from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import (
+    FORCED_MASK_SAMPLE_KEY,
     as_nemo_gym_shard_set,
     get_nemo_gym_route_name,
 )
@@ -61,8 +63,13 @@ from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
+    TRACE_METADATA_KEY,
     Completion,
     PromptGroupRecord,
+)
+from nemo_rl.experience.legacy_rollout_metrics import (
+    legacy_rollout_group_metrics,
+    legacy_rollout_timing_aliases,
 )
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.experience.rollout_recovery import (
@@ -104,6 +111,81 @@ RolloutCompletionCallback = Callable[[int, Completion], Awaitable[None]]
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
     from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
+
+
+def _with_forced_mask(env_extras: dict[str, Any], forced: bool) -> dict[str, Any]:
+    """Completion extras whose instance config masks the sample when ``forced``.
+
+    Copies rather than mutates: session traces share one ``full_result``, and a
+    forced mask (no generation data, NaN logprobs) applies to one trace only.
+    Applied after the ``should_mask_flagged_samples`` gate, so it always holds.
+    """
+    if not forced:
+        return env_extras
+    instance_config = dict(env_extras.get("instance_config") or {})
+    instance_config[MASK_SAMPLE] = True
+    return {**env_extras, "instance_config": instance_config}
+
+
+_ROLLOUT_SCOPED_PENALTIES = (
+    "penalize_duplicated_reasoning",
+    "penalize_empty_final_answer",
+)
+_TRACE_SCOPED_PENALTIES = ("penalize_unwanted_tokens", "penalize_malformed_think_tag")
+
+
+def _penalty_config_with(
+    reward_penalty_config: Optional[dict[str, Any]], disabled: tuple[str, ...]
+) -> Optional[dict[str, Any]]:
+    """A copy of the penalty config with the given penalty flags turned off."""
+    if reward_penalty_config is None:
+        return None
+    return {**reward_penalty_config, **{flag: False for flag in disabled}}
+
+
+def _apply_session_trace_penalties(
+    result: dict[str, Any], reward_penalty_config: Optional[dict[str, Any]]
+) -> dict[str, int]:
+    """Apply reward penalties to the session traces of one multi-trace rollout.
+
+    The traces share one reward, zeroed for all of them by any penalty. Token
+    penalties are checked on every segment; the rollout-scoped ones (duplicated
+    reasoning, empty final answer) once on the aggregate response as legacy async
+    PPO did, or on every segment with ``rollout_scoped_penalties_on_all_segments``.
+    Counts are per rollout (0 or 1 per penalty).
+    """
+    full_result = result["full_result"]
+    all_segments = bool(
+        (reward_penalty_config or {}).get("rollout_scoped_penalties_on_all_segments")
+    )
+    per_segment_config = (
+        reward_penalty_config
+        if all_segments
+        else _penalty_config_with(reward_penalty_config, _ROLLOUT_SCOPED_PENALTIES)
+    )
+    views = [
+        {
+            "message_log": trace["message_log"],
+            "full_result": {**full_result, "response": trace["response"]},
+        }
+        for trace in result["session_traces"]
+    ]
+    counts = apply_reward_penalties(views, per_segment_config)
+    if not all_segments:
+        rollout_view = {
+            "message_log": result["session_traces"][0]["message_log"],
+            "full_result": {**full_result},
+        }
+        rollout_counts = apply_reward_penalties(
+            [rollout_view],
+            _penalty_config_with(reward_penalty_config, _TRACE_SCOPED_PENALTIES),
+        )
+        views.append(rollout_view)
+        for flag, count in rollout_counts.items():
+            counts[flag] = counts.get(flag, 0) + count
+    if any(float(view["full_result"]["reward"]) == 0.0 for view in views):
+        full_result["reward"] = 0.0
+    return {flag: min(count, 1) for flag, count in counts.items()}
 
 
 def _contains_post_write_enrichment_error(error: BaseException) -> bool:
@@ -242,6 +324,9 @@ class RolloutStats:
     # redoing the whole thing, so they never reached the counters above and gym could
     # retry rows all run with redispatch_total sitting flat.
     gym_row_redispatches: int = 0
+    # Wall seconds spent in rollout attempts that raised (legacy async PPO's
+    # efficiency/wasted/failed_trajectory_s). Run-cumulative; not in as_metrics.
+    failed_attempt_seconds: float = 0.0
 
     def record_redispatch(self, reason: str) -> None:
         self.redispatches_by_reason[reason] = (
@@ -1367,9 +1452,29 @@ class AsyncNemoGymRolloutImpl:
 
         # Compute rollout metrics.
         with timer.time(f"{timer_prefix}/compute_metrics"):
-            rollout_metrics = self._compute_rollout_metrics(
-                completions, _nemo_gym_metric_namespace(inputs[0])
-            )
+            # One sample per rollout: session traces beyond the main one repeat
+            # the rollout's reward and would re-weight every per-sample metric.
+            main_completions = [
+                completion
+                for completion in completions
+                if (getattr(completion, "env_extras", None) or {})
+                .get(TRACE_METADATA_KEY, {})
+                .get("trace_in_rollout_idx", 0)
+                == 0
+            ]
+            with timer.time(f"{timer_prefix}/per_agent_misc_metrics"):
+                rollout_metrics = self._compute_rollout_metrics(
+                    main_completions, _nemo_gym_metric_namespace(inputs[0])
+                )
+            # Keyed on the trace metadata rather than on extra traces being present,
+            # so single-trace groups report 1.0 instead of dropping out of the mean.
+            if any(
+                TRACE_METADATA_KEY in (getattr(completion, "env_extras", None) or {})
+                for completion in completions
+            ):
+                rollout_metrics["multi_trace/traces_per_rollout"] = len(
+                    completions
+                ) / max(len(main_completions), 1)
             # Same helper the batched path uses, so the two cannot drift apart.
             rollout_metrics.update(_effort_shaping_metrics(shaping))
             rollout_metrics.update(
@@ -1377,8 +1482,31 @@ class AsyncNemoGymRolloutImpl:
                     penalty_counts, len(completed_results)
                 )
             )
+            # Legacy async-PPO rollout breakdowns (termination/*, reward/by_*,
+            # turns_per_trace/*, compaction/*, think-tag counts, ...). Diagnostics
+            # only: a malformed result must not fail the rollout group.
+            try:
+                rollout_metrics.update(
+                    legacy_rollout_group_metrics(
+                        completed_results,
+                        getattr(self, "_reward_penalty_config", None),
+                        timer=timer,
+                        timer_prefix=timer_prefix,
+                    )
+                )
+            except Exception as error:  # noqa: BLE001 - metrics are advisory
+                print(
+                    "WARNING: legacy rollout metrics skipped for this group: "
+                    f"{type(error).__name__}: {error}",
+                    flush=True,
+                )
 
         rollout_metrics.update(env_timing_metrics)
+        rollout_metrics.update(
+            legacy_rollout_timing_aliases(
+                env_timing_metrics, instance_timer_prefix, timer_prefix
+            )
+        )
         for handle in shard_set.all_handles:
             label = shard_set.instance_label(handle)
             rollout_metrics[f"{timer_prefix}/routing/group_share/{label}"] = 0
@@ -1399,11 +1527,12 @@ class AsyncNemoGymRolloutImpl:
         """
         token_results = [r for r in results if "receipt" not in r]
         for result in token_results:
-            _tensorize_by_key(result["message_log"], "token_ids")
-            _tensorize_by_key(
-                [m for m in result["message_log"] if m["role"] == "assistant"],
-                "generation_logprobs",
-            )
+            for trace in result.get("session_traces", [result]):
+                _tensorize_by_key(trace["message_log"], "token_ids")
+                _tensorize_by_key(
+                    [m for m in trace["message_log"] if m["role"] == "assistant"],
+                    "generation_logprobs",
+                )
 
         # Same gate as the batched path: when masking is off, drop the env mask
         # flag so later batch building never sees it. Receipt rollouts take the
@@ -1415,9 +1544,22 @@ class AsyncNemoGymRolloutImpl:
                     "mask_sample", None
                 )
 
+        # Empty-rollout placeholders carry no response to check (legacy skipped them).
+        single_trace = [
+            r
+            for r in token_results
+            if "session_traces" not in r
+            and not r["full_result"].get("is_empty_rollout")
+        ]
         penalty_counts = apply_reward_penalties(
-            token_results, self._reward_penalty_config
+            single_trace, self._reward_penalty_config
         )
+        for result in token_results:
+            if "session_traces" in result:
+                for flag, hit in _apply_session_trace_penalties(
+                    result, self._reward_penalty_config
+                ).items():
+                    penalty_counts[flag] = penalty_counts.get(flag, 0) + hit
         completions = []
         for result in results:
             if "receipt" in result:
@@ -1436,6 +1578,29 @@ class AsyncNemoGymRolloutImpl:
                     )
                 )
                 continue
+            if "session_traces" in result:
+                # One training sequence per agent session segment; all share the
+                # rollout's (possibly penalty-zeroed) reward and result dict.
+                reward = float(result["full_result"]["reward"])
+                for trace in result["session_traces"]:
+                    completions.append(
+                        Completion(
+                            message_log=trace["message_log"],
+                            env_extras=_with_forced_mask(
+                                {
+                                    **result["full_result"],
+                                    TRACE_METADATA_KEY: trace["trace_metadata"],
+                                },
+                                bool(trace.get(FORCED_MASK_SAMPLE_KEY)),
+                            ),
+                            truncated=sum(
+                                len(m["token_ids"]) for m in trace["message_log"]
+                            )
+                            == self._max_seq_len,
+                            reward=reward,
+                        )
+                    )
+                continue
             truncated = (
                 sum(len(m["token_ids"]) for m in result["message_log"])
                 == self._max_seq_len
@@ -1443,7 +1608,10 @@ class AsyncNemoGymRolloutImpl:
             completions.append(
                 Completion(
                     message_log=result["message_log"],
-                    env_extras=result["full_result"],
+                    env_extras=_with_forced_mask(
+                        result["full_result"],
+                        bool(result.get(FORCED_MASK_SAMPLE_KEY)),
+                    ),
                     truncated=truncated,
                     reward=float(result["full_result"]["reward"]),
                 )
@@ -1930,6 +2098,7 @@ class RolloutManager:
                 target_step=target_step,
                 group_id=lineage_group_id,
             )
+            attempt_started = time.monotonic()
             try:
                 # Registered per active attempt so cancellation follows the slot that
                 # currently owns the stable recovery group ID.
@@ -1959,6 +2128,7 @@ class RolloutManager:
                     end_weight_version=end_version,
                 )
             except Exception as error:
+                self._stats.failed_attempt_seconds += time.monotonic() - attempt_started
                 # A failed rollout must not leave an unready slot that can block an
                 # in-order sampler. commit() rolls back any DataPlane rows it wrote.
                 # Cleanup failure must not mask the error that caused it.

@@ -300,6 +300,11 @@ class RewardPenaltyConfig(BaseModel, extra="allow"):
     penalize_empty_final_answer: bool = False
     penalize_unwanted_tokens: bool = False
     penalize_malformed_think_tag: bool = False
+    # Multi-trace rollouts only. False (legacy async PPO): the rollout-scoped
+    # penalties (duplicated reasoning, empty final answer) are checked once, on the
+    # rollout's aggregate response. True: they are checked on every session
+    # segment, subagents included, and any hit zeroes the shared reward.
+    rollout_scoped_penalties_on_all_segments: bool = False
     # Optional token IDs. token_ids.unwanted is required when
     # penalize_unwanted_tokens is true;
     # think-tag IDs are inferred from configured tag strings when possible.
@@ -2825,6 +2830,7 @@ def compute_and_apply_seq_logprob_error_masking(
     train_data: BatchedDataDict,
     rewards: torch.Tensor,
     seq_logprob_error_threshold: Optional[float],
+    tensor_out: Optional[dict] = None,
 ) -> dict:
     """Compute sequence-level logprob error metrics and optionally mask high-error sequences.
 
@@ -2839,6 +2845,10 @@ def compute_and_apply_seq_logprob_error_masking(
         rewards: Reward tensor for computing statistics on masked sequences.
         seq_logprob_error_threshold: If set, mask sequences with mult_prob_error
                                     exceeding this threshold. If None, only compute metrics.
+        tensor_out: Optional dict that receives the per-sequence tensors
+                    ``pre_seq_error_sample_loss_mask``, ``seq_mult_prob_error`` and
+                    ``masked_by_seq_logprob_error`` (rollout_debug jsonl and the
+                    per-trace diagnostics), without polluting the metrics dict.
 
     Returns:
         Dict with keys: max_seq_mult_prob_error, mean_seq_mult_prob_error,
@@ -2924,6 +2934,18 @@ def compute_and_apply_seq_logprob_error_masking(
                 f" → {masked_correct_pct:.2%}",
                 flush=True,
             )
+
+    if tensor_out is not None:
+        pre_mask = (
+            original_sample_mask
+            if seq_logprob_error_threshold is not None
+            else sample_mask.detach().clone()
+        )
+        tensor_out["pre_seq_error_sample_loss_mask"] = pre_mask
+        tensor_out["seq_mult_prob_error"] = seq_mult_prob_error.detach().clone()
+        tensor_out["masked_by_seq_logprob_error"] = (pre_mask > 0) & (
+            train_data["sample_mask"] <= 0
+        )
 
     return {
         "max_seq_mult_prob_error": max_seq_mult_prob_error,

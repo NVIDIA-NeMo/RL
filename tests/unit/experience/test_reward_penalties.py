@@ -893,6 +893,17 @@ class TestCrossCutting:
         assert r2["full_result"]["reward"] == 0.0
         assert counts["unwanted_token"] == 1
 
+    def test_resolve_keeps_rollout_scoped_penalties_on_all_segments(self):
+        for all_segments in (True, False):
+            cfg = resolve_reward_penalty_config(
+                {
+                    "penalize_duplicated_reasoning": True,
+                    "rollout_scoped_penalties_on_all_segments": all_segments,
+                },
+                _FakeTokenizer(),
+            )
+            assert cfg["rollout_scoped_penalties_on_all_segments"] is all_segments
+
 
 if __name__ == "__main__":
     import traceback

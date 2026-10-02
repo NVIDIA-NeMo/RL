@@ -39,6 +39,7 @@ from typing import Literal, Optional
 import torch
 from pydantic import BaseModel
 
+from nemo_rl.algorithms.legacy_ppo_diagnostics import raw_advantage_metrics
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
@@ -74,6 +75,12 @@ class GAEConfig(BaseModel, extra="allow"):
     gae_lambda_policy: Optional[float] = None
     # Length-adaptive λ_policy = 1 - 1/(α·l). 0 = disabled.
     length_adaptive_alpha: float = 0.0
+    # Which tokens GAE runs and whitens over on the SingleController path.
+    # "all_rows" (legacy async PPO): every row's response tokens, including rows
+    # later dropped from the loss by sample_mask (env mask_sample, overlong,
+    # sequence-logprob error, multi-trace pad rows). "kept_rows": only the rows
+    # that train. Rows excluded from the loss stay excluded either way.
+    normalize_over: Literal["all_rows", "kept_rows"] = "all_rows"
 
 
 class GRPOAdvantageEstimator:
@@ -376,6 +383,7 @@ class GeneralizedAdvantageEstimator:
     """
 
     def __init__(self, estimator_config: GAEConfig, loss_config: ClippedPGLossConfig):
+        self.normalize_over = estimator_config.normalize_over
         self.gae_lambda = estimator_config.gae_lambda
         self.gae_gamma = estimator_config.gae_gamma
         self.normalize_advantages = estimator_config.normalize_advantages
@@ -390,6 +398,9 @@ class GeneralizedAdvantageEstimator:
         self.use_kl_in_reward = loss_config.use_kl_in_reward
         self.kl_coef = loss_config.reference_policy_kl_penalty
         self.kl_type = loss_config.reference_policy_kl_type
+
+        # adv_raw/* of the last compute_advantage call (legacy async PPO parity).
+        self.last_metrics: dict[str, float] = {}
 
     def _reward_whiten(
         self,
@@ -538,6 +549,12 @@ class GeneralizedAdvantageEstimator:
                 mask,
                 gae_lambda=lam_value,
             )
+
+        # Pre-whitening advantage scale (critic-quality diagnostic), captured
+        # before normalize_advantages pins the std to 1.0.
+        self.last_metrics = raw_advantage_metrics(
+            advantages, mask, self.normalize_advantages
+        )
 
         # Whiten advantages (optional) and zero out masked positions (always)
         if self.normalize_advantages:

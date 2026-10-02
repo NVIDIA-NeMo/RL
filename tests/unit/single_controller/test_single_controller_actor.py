@@ -559,6 +559,7 @@ def _lookahead_controller(
     max_lookahead_versions: int = 1,
     warmup_lookahead_versions: int | None = None,
     is_ppo: bool = True,
+    sampler_name: str = "in_order",
 ):
     """Bare actor carrying only what the lookahead schedule reads."""
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
@@ -568,12 +569,13 @@ def _lookahead_controller(
     ctrl._algo_cfg = SimpleNamespace(
         policy_training_start_step=policy_training_start_step
     )
-    ctrl._async_cfg = SimpleNamespace(
-        sampler=SimpleNamespace(
+    sampler_fields = {"name": sampler_name}
+    if sampler_name == "in_order":
+        sampler_fields.update(
             max_lookahead_versions=max_lookahead_versions,
             warmup_lookahead_versions=warmup_lookahead_versions,
         )
-    )
+    ctrl._async_cfg = SimpleNamespace(sampler=SimpleNamespace(**sampler_fields))
     ctrl._sampler = MagicMock()
     return ctrl
 
@@ -584,6 +586,18 @@ class TestLookaheadSchedule:
     Generation may run further ahead while the policy is frozen, then the window
     has to converge back before warmup-era rollouts stop being trainable.
     """
+
+    def test_ready_first_keeps_its_fixed_gate(self):
+        """ReadyFirstSamplerConfig has no lookahead knobs to read."""
+        ctrl = _lookahead_controller(
+            trainer_version=3,
+            policy_training_start_step=0,
+            sampler_name="ready_first",
+        )
+
+        ctrl._retune_lookahead_versions()
+
+        ctrl._sampler.set_gate_window.assert_not_called()
 
     @pytest.mark.parametrize(
         ("trainer_version", "expected"),
@@ -864,6 +878,83 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
     assert metrics[0]["max_seq_mult_prob_error_after_mask"] == pytest.approx(1.0)
     assert "advantages" in (result_meta.fields or [])
     assert ctrl._data_plane_checkpoint_barrier.mutation_version == 1
+
+
+@pytest.mark.parametrize(
+    "normalize_over, expected_rows",
+    [("all_rows", [0, 1, 2, 3]), ("kept_rows", [0])],
+    ids=["legacy_all_rows", "kept_rows"],
+)
+def test_advantage_stage_estimator_mask_follows_normalize_over(
+    capsys: pytest.CaptureFixture[str], normalize_over: str, expected_rows: list[int]
+) -> None:
+    """GAE's normalize_over picks the token set the estimator runs and whitens over.
+
+    Legacy async PPO whitened over every row's response tokens; the filtered rows
+    are still dropped from training through the written sample_mask either way.
+    """
+    batch_size, sequence_length = 4, 5
+    generation_logprobs = torch.zeros(batch_size, sequence_length)
+    generation_logprobs[2, 1:] = 1.0  # row 2: sequence-logprob-error masked
+    data = TensorDict(
+        {
+            "prompt_ids_for_adv": torch.zeros(
+                batch_size, sequence_length, dtype=torch.long
+            ),
+            "total_reward": torch.tensor([0.0, 0.0, 1.0, 0.0]),
+            "token_mask": torch.ones(batch_size, sequence_length),
+            "sample_mask": torch.ones(batch_size),
+            "mask_sample": torch.tensor([False, True, False, False]),
+            "truncated": torch.tensor([False, False, False, True]),
+            "prev_logprobs": torch.zeros(batch_size, sequence_length),
+            "generation_logprobs": generation_logprobs,
+        },
+        batch_size=[batch_size],
+    )
+    data_plane = _AdvantageDataPlane(data)
+    estimator = _MaskRecordingAdvantageEstimator()
+    estimator.normalize_over = normalize_over
+
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._dp_client = data_plane
+    ctrl._advantage_cfg = AdvantageConfig()
+    ctrl._advantage_estimator = estimator
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+    ctrl._policy_logprobs_required = True
+    ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = False
+    ctrl._is_ppo = False
+    ctrl._master_config = SimpleNamespace(
+        grpo=GRPOConfig(seq_logprob_error_threshold=2.0, overlong_filtering=True)
+    )
+    ctrl._algo_cfg = ctrl._master_config.grpo
+    ctrl._message_level_advantage_penalties_enabled = False
+    ctrl._step_log_dict = {
+        "rewards": [],
+        "sample_masks": [],
+        "masked_advantages": [],
+        "sequence_lengths": [],
+        "num_mask_sample_filtered": [],
+        "seq_logprob_error_metrics": [],
+    }
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=[f"sample-{i}" for i in range(batch_size)],
+        fields=list(data.keys()),
+    )
+
+    asyncio.run(ctrl._advantage_stage(meta))
+    capsys.readouterr()
+
+    assert estimator.mask is not None
+    rows_seen = [i for i in range(batch_size) if estimator.mask[i].any()]
+    assert rows_seen == expected_rows
+    # Training exclusion is unchanged by normalize_over.
+    assert torch.equal(
+        data_plane.written_fields["sample_mask"], torch.tensor([1.0, 0.0, 0.0, 0.0])
+    )
 
 
 @pytest.mark.parametrize(
@@ -1599,6 +1690,7 @@ def _train_pump_controller(*, sampler) -> object:
         min_groups_for_streaming_train=1,
         rollout_failure=SimpleNamespace(min_step_batch_fraction=0.9),
         sampler=SimpleNamespace(
+            name="in_order",
             max_lookahead_versions=1,
             warmup_lookahead_versions=None,
         ),
@@ -2599,3 +2691,71 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     )
     assert "returns" in (result_meta.fields or [])
     assert "advantages" in (result_meta.fields or [])
+
+
+def _padding_controller(multiple: int, pad_source: str = "cyclic"):
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._algo_cfg = SimpleNamespace(multi_trace_pad_source=pad_source)
+    ctrl._multi_trace = True
+    ctrl._multi_trace_row_multiple = multiple
+    ctrl._step_pad_rows = 0
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+    puts = []
+
+    async def _call_dp(method_name, **kwargs):
+        if method_name == "get_samples":
+            n = len(kwargs["sample_ids"])
+            return {"sample_mask": torch.ones(n), "input_ids": torch.ones(n, 3)}
+        puts.append(kwargs)
+        return None
+
+    ctrl._call_dp = _call_dp
+    return ctrl, puts
+
+
+def _rows_meta(n: int) -> KVBatchMeta:
+    return KVBatchMeta(
+        partition_id="p",
+        task_name="train",
+        sample_ids=[f"grp{i}_g0" for i in range(n)],
+        fields=["input_ids", "sample_mask"],
+        sequence_lengths=[10 + i for i in range(n)],
+        extra_info={"k": 1},
+        tags=[{"weight_version": 0} for _ in range(n)],
+    )
+
+
+def test_multi_trace_rows_pad_to_the_shard_multiple_with_zero_sample_mask():
+    ctrl, puts = _padding_controller(multiple=4)
+
+    padded, pad_meta = asyncio.run(ctrl._pad_rows_to_dp_multiple(_rows_meta(5)))
+
+    assert len(padded.sample_ids) == 8
+    assert pad_meta.sample_ids == ["grp0_g0_pad0", "grp1_g0_pad1", "grp2_g0_pad2"]
+    assert pad_meta.sequence_lengths == [10, 11, 12]
+    assert padded.extra_info == {"k": 1}
+    assert puts[0]["sample_ids"] == pad_meta.sample_ids
+    assert puts[0]["fields"]["sample_mask"].tolist() == [0.0, 0.0, 0.0]
+    assert ctrl._step_pad_rows == 3
+    assert ctrl._dynamic_gbs_kwargs(padded) == {"gbs": 8}
+
+
+def test_multi_trace_pad_source_row0_repeats_the_first_row():
+    # Legacy async PPO padded with copies of row 0; they stay in all_rows whitening.
+    ctrl, puts = _padding_controller(multiple=4, pad_source="row0")
+
+    padded, pad_meta = asyncio.run(ctrl._pad_rows_to_dp_multiple(_rows_meta(5)))
+
+    assert len(padded.sample_ids) == 8
+    assert pad_meta.sample_ids == ["grp0_g0_pad0", "grp0_g0_pad1", "grp0_g0_pad2"]
+    assert pad_meta.sequence_lengths == [10, 10, 10]
+    assert puts[0]["fields"]["sample_mask"].tolist() == [0.0, 0.0, 0.0]
+
+
+def test_multi_trace_rows_already_on_the_multiple_are_not_padded():
+    ctrl, puts = _padding_controller(multiple=4)
+
+    padded, pad_meta = asyncio.run(ctrl._pad_rows_to_dp_multiple(_rows_meta(8)))
+
+    assert pad_meta is None and len(padded.sample_ids) == 8 and not puts

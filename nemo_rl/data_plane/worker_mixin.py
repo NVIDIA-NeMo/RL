@@ -46,6 +46,7 @@ from nemo_rl.data_plane.schema import (
     GLOBAL_FORWARD_PAD_SEQLEN,
     MICRO_BATCH_INDICES,
     MICRO_BATCH_LENGTHS,
+    PPO_VALUE_FIELDS,
     ROUTE_PASSTHROUGH_FLAG,
     ROUTE_PLAN_TAG,
     ROUTED_EXPERTS_ENCODING_FIELD,
@@ -900,9 +901,26 @@ class TQWorkerMixin:
         eval_mode: bool = False,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        privilege_prefixes: Optional[dict[str, torch.Tensor]] = None,
     ) -> dict[str, Any]:
-        """Per-rank training entrypoint. Fetch → packing prep → delegate."""
+        """Per-rank training entrypoint. Fetch → packing prep → delegate.
+
+        ``privilege_prefixes`` (SWE privileged critic only) switches the fetched
+        rows to the critic layout: ``meta`` carries critic lengths, and the
+        per-token targets are shifted past each row's reference-block prefix.
+        """
         data = self._fetch(meta)
+        if privilege_prefixes is not None:
+            from nemo_rl.algorithms.swe_privileged_critic import (
+                prepend_privilege_prefix,
+            )
+
+            data = prepend_privilege_prefix(
+                data,
+                meta,
+                privilege_prefixes,
+                shift_fields=tuple(f for f in PPO_VALUE_FIELDS if f in data),
+            )
         data = self._attach_or_repack_pack_metadata(data, meta)
         return self.train(  # type: ignore[attr-defined]
             data,
@@ -1085,20 +1103,41 @@ class TQWorkerMixin:
         self,
         meta: "KVBatchMeta",
         micro_batch_size: Optional[int] = None,
+        privilege_prefixes: Optional[dict[str, torch.Tensor]] = None,
     ) -> None:
         """Per-rank value-forward entrypoint. Fetch → packing prep → run → write back.
 
         Same contract as get_logprobs_presharded, and only the value workers
         mix it in: only the PPO critic implements get_values.
+
+        With ``privilege_prefixes`` (SWE privileged critic), ``meta`` carries
+        critic lengths: each row is prefixed with its reference block before the
+        forward, and the values are sliced back onto the policy's token positions
+        so ``values`` stays in the policy layout for GAE.
         """
         data = self._fetch(meta)
+        write_meta = meta
+        if privilege_prefixes is not None:
+            from nemo_rl.algorithms.swe_privileged_critic import (
+                policy_view_meta,
+                prepend_privilege_prefix,
+                values_to_policy_layout,
+            )
+
+            policy_lengths = data["input_lengths"].clone()
+            data = prepend_privilege_prefix(data, meta, privilege_prefixes)
+            write_meta = policy_view_meta(meta)
         data = self._attach_or_repack_pack_metadata(data, meta)
         result: BatchedDataDict[Any] = self.get_values(  # type: ignore[attr-defined]
             data=data,
             micro_batch_size=micro_batch_size,
         )
+        if privilege_prefixes is not None:
+            result["values"] = values_to_policy_layout(
+                result["values"], meta, policy_lengths
+            )
         self._write_back_result_field(
-            meta,
+            write_meta,
             result,
             result_key="values",
             tq_field="values",

@@ -36,7 +36,11 @@ from nemo_rl.data_plane.schema import (
     TRUNCATED,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.experience.interfaces import PromptGroupRecord
+from nemo_rl.experience.interfaces import TRACE_METADATA_KEY, PromptGroupRecord
+from nemo_rl.experience.legacy_rollout_metrics import (
+    ROLLOUT_DEBUG_TAG,
+    rollout_debug_tags,
+)
 
 VIOLATION_TAG_KEYS = (
     "num_invalid_tool_calls",
@@ -47,6 +51,8 @@ VIOLATION_TAG_KEYS = (
 # Per-row violation counts ride ``tags`` rather than the tensor fields, so this
 # key is carried on the train batch and consumed by pack_payload.
 _VIOLATION_COUNTS_KEY = "violation_counts"
+# Same pattern for the per-row legacy rollout_debug provenance (JSON strings).
+_ROLLOUT_DEBUG_KEY = "rollout_debug_tags"
 
 
 def _violation_counts(
@@ -137,7 +143,18 @@ def record_to_train_batch(
     prompt_token_count = sum(len(m["token_ids"]) for m in record.prompt)
     if include_message_violation_fields:
         _add_message_violation_masks(message_logs)
-    prompt_lengths = torch.full((n,), prompt_token_count, dtype=torch.long)
+    # A multi-trace completion (an agent session other than the prompt's) starts
+    # from its own prompt, which is its first message; the group prompt is the
+    # main session's first message, so both agree for the main trace.
+    prompt_lengths = torch.tensor(
+        [
+            len(c.message_log[0]["token_ids"])
+            if TRACE_METADATA_KEY in (c.env_extras or {})
+            else prompt_token_count
+            for c in completions
+        ],
+        dtype=torch.long,
+    )
 
     # Must precede the prompt extraction: it reuses the same message dicts, so
     # backfilling here also covers the prompt flatten below. Doing it only inside
@@ -177,6 +194,9 @@ def record_to_train_batch(
         "total_reward": total_reward,
         _VIOLATION_COUNTS_KEY: violation_counts,
     }
+    rollout_debug = rollout_debug_tags(completions)
+    if rollout_debug is not None:
+        train_data[_ROLLOUT_DEBUG_KEY] = rollout_debug
     if ROUTED_EXPERTS_FIELD in flat:
         train_data[ROUTED_EXPERTS_FIELD] = flat[ROUTED_EXPERTS_FIELD]
     if include_message_violation_fields:
@@ -226,6 +246,7 @@ def pack_payload(
     )
     sample_ids = [f"{group_id}_g{i}" for i in range(n)]
     violations = train_batch.get(_VIOLATION_COUNTS_KEY, [{}] * n)
+    rollout_debug = train_batch.get(_ROLLOUT_DEBUG_KEY)
     multimodal_tags = multimodal_row_tags(multimodal, n) or [{} for _ in range(n)]
     tags = [
         {
@@ -233,6 +254,7 @@ def pack_payload(
             "prompt_idx": prompt_idx,
             **violations[i],
             **multimodal_tags[i],
+            **({ROLLOUT_DEBUG_TAG: rollout_debug[i]} if rollout_debug else {}),
         }
         for i in range(n)
     ]

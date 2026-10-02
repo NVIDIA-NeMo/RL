@@ -51,6 +51,7 @@ from nemo_rl.algorithms.single_controller_utils import (
 )
 from nemo_rl.algorithms.single_controller_utils.config import (
     algo_config,
+    replay_checkpoint_enabled,
     validate_single_controller_config,
 )
 
@@ -307,7 +308,7 @@ class TestPPOValidation:
 
     @pytest.mark.parametrize(
         "sampler_config",
-        [WindowedSamplerConfig(), ReadyFirstSamplerConfig(), WeightFifoSamplerConfig()],
+        [WindowedSamplerConfig(), WeightFifoSamplerConfig()],
         ids=lambda cfg: cfg.name,
     )
     def test_rejects_samplers_that_drop_rollouts_by_weight_version(
@@ -318,11 +319,87 @@ class TestPPOValidation:
         mc = _ppo_master_config()
         mc.async_rl.sampler = sampler_config
 
-        with pytest.raises(
-            ValueError,
-            match=rf"sampler.name='in_order', but got '{sampler_config.name}'",
-        ):
+        with pytest.raises(ValueError, match=rf"but got '{sampler_config.name}'"):
             validate_single_controller_config(mc)
+
+    @staticmethod
+    def _ready_first_config() -> MasterConfig:
+        mc = _ppo_master_config()
+        mc.async_rl.sampler = ReadyFirstSamplerConfig()
+        mc.loss_fn.use_importance_sampling_correction = True
+        return mc
+
+    def test_accepts_ready_first_without_critic_warmup(self):
+        """ready_first never evicts, so the frozen-policy hazard cannot occur."""
+        validate_single_controller_config(self._ready_first_config())
+
+    def test_rejects_ready_first_during_critic_warmup(self):
+        mc = self._ready_first_config()
+        mc.ppo.policy_training_start_step = 2
+
+        with pytest.raises(ValueError, match="policy_training_start_step=0"):
+            validate_single_controller_config(mc)
+
+    @staticmethod
+    def _privileged_config(*, value_seq_len: int) -> MasterConfig:
+        mc = _ppo_master_config()
+        mc.value["max_total_sequence_length"] = value_seq_len
+        mc.value["swe_privileged_critic"] = {"enabled": True, "max_total_tokens": 64}
+        mc.async_rl.checkpoint_replay_buffer = False
+        return mc
+
+    def test_accepts_a_privileged_critic_with_room_for_the_block(self):
+        # policy 32 + budget (64 + 256 template slack)
+        validate_single_controller_config(self._privileged_config(value_seq_len=352))
+
+    def test_rejects_a_privileged_critic_without_room_for_the_block(self):
+        mc = self._privileged_config(value_seq_len=351)
+
+        with pytest.raises(ValueError, match="value.max_total_sequence_length"):
+            validate_single_controller_config(mc)
+
+    def test_accepts_a_privileged_critic_that_restores_buffered_groups(self):
+        # The prefix cache is checkpointed with the replay buffer and rebuilt
+        # for the restored groups (SwePrivilegePrefixStore.restore).
+        mc = self._privileged_config(value_seq_len=352)
+        mc.async_rl.sampler = ReadyFirstSamplerConfig()
+        mc.loss_fn.use_importance_sampling_correction = True
+        mc.async_rl.checkpoint_replay_buffer = True
+
+        validate_single_controller_config(mc)
+
+    @staticmethod
+    def _multi_trace_config() -> MasterConfig:
+        mc = _ppo_master_config()
+        mc.env = {"nemo_gym": {"train_on_all_session_traces": True}}
+        mc.async_rl.checkpoint_replay_buffer = False
+        return mc
+
+    def test_accepts_multi_trace_without_buffer_restore(self):
+        validate_single_controller_config(self._multi_trace_config())
+
+    def test_accepts_multi_trace_with_buffer_restore(self):
+        # Restored multi-trace groups are checked for alignment, not a fixed size.
+        mc = self._multi_trace_config()
+        mc.async_rl.sampler = ReadyFirstSamplerConfig()
+        mc.async_rl.checkpoint_replay_buffer = True
+        mc.loss_fn.use_importance_sampling_correction = True
+
+        validate_single_controller_config(mc)
+
+    def test_rejects_multi_trace_on_a_grpo_run(self):
+        """GRPO's group baseline assumes one row per generation."""
+        mc = _make_master_config()
+        mc.env = {"nemo_gym": {"train_on_all_session_traces": True}}
+
+        with pytest.raises(ValueError, match="requires a `ppo` block"):
+            validate_single_controller_config(mc)
+
+    def test_replay_checkpoint_opt_out(self):
+        mc = self._ready_first_config()
+        assert replay_checkpoint_enabled(mc)
+        mc.async_rl.checkpoint_replay_buffer = False
+        assert not replay_checkpoint_enabled(mc)
 
     @staticmethod
     def _warmup_ckpt_config(*, constant_structure: bool) -> MasterConfig:

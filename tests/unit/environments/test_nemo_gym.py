@@ -40,8 +40,12 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
 from nemo_rl.environments.nemo_gym import (
+    FORCED_MASK_SAMPLE_KEY,
     NemoGym,
     NemoGymConfig,
+    _build_gym_actor_config,
+    _has_nan_generation_logprobs,
+    _mask_nan_generation_logprobs,
     build_reward_component_columns,
     extract_reward_components,
     setup_nemo_gym_config,
@@ -1858,6 +1862,120 @@ def test_nemo_gym_postprocess_no_generation_data_raises():
     assert "1234 tokens" in msg
     # The error surfaces the response.output item types to help diagnose case (2).
     assert "['reasoning', 'function_call']" in msg
+
+
+def test_nemo_gym_empty_rollout_becomes_masked_placeholder():
+    """A rollout with no generation data is masked rather than failing the run."""
+
+    class _Tokenizer:
+        pad_token_id = 7
+        eos_token_id = 2
+
+    nemo_gym_result = {
+        "reward": 0.0,
+        "instance_config": {"name": "repo__issue-1"},
+        "agent_error_kind": "other",
+    }
+    result = NemoGym.__ray_metadata__.modified_class._empty_rollout_result(
+        nemo_gym_result, _Tokenizer(), reason="NeMo Gym returned no generation data"
+    )
+
+    assert result["full_result"] is nemo_gym_result
+    # Masked through the forced channel; the Gym instance config is untouched,
+    # so mask_sample_rate counts only Gym-flagged rollouts (as in legacy).
+    assert result[FORCED_MASK_SAMPLE_KEY] is True
+    assert nemo_gym_result["instance_config"] == {"name": "repo__issue-1"}
+    assert nemo_gym_result["is_empty_rollout"] is True
+    (message,) = result["message_log"]
+    assert message["role"] == "user"  # no assistant tokens -> nothing trainable
+    assert message["token_ids"].tolist() == [7]
+    assert message["token_ids"].dtype == torch.int64
+    assert result["input_message_log"] == result["message_log"]
+
+
+def test_nemo_gym_empty_rollout_placeholder_without_pad_token():
+    class _Tokenizer:
+        pad_token_id = None
+        eos_token_id = 2
+
+    result = NemoGym.__ray_metadata__.modified_class._empty_rollout_result(
+        {"instance_config": None}, _Tokenizer(), reason="no generation data"
+    )
+    assert result["message_log"][0]["token_ids"].tolist() == [2]
+    assert result[FORCED_MASK_SAMPLE_KEY] is True
+
+
+def _assistant(logprobs):
+    return {
+        "role": "assistant",
+        "token_ids": torch.tensor([1] * len(logprobs)),
+        "generation_logprobs": torch.tensor(logprobs),
+    }
+
+
+def _user():
+    return {"role": "user", "token_ids": torch.tensor([3])}
+
+
+def test_nan_generation_logprobs_are_detected_in_any_session_trace():
+    clean = [_user(), _assistant([-0.1, -0.2])]
+    nan = [_user(), _assistant([-0.1, float("nan")])]
+    multi = {
+        "message_log": clean,
+        "session_traces": [{"message_log": clean}, {"message_log": nan}],
+    }
+    assert _has_nan_generation_logprobs(multi)
+    assert not _has_nan_generation_logprobs({"message_log": clean})
+    assert _has_nan_generation_logprobs({"message_log": nan})
+
+
+def test_mask_nan_generation_logprobs_zeroes_and_masks_only_the_bad_trace():
+    clean = [_user(), _assistant([-0.1, -0.2])]
+    nan = [_user(), _assistant([-0.3, float("nan")]), _assistant([float("nan")])]
+    result = {
+        "message_log": clean,
+        "session_traces": [{"message_log": clean}, {"message_log": nan}],
+    }
+
+    assert _mask_nan_generation_logprobs(result) == 1
+
+    good, bad = result["session_traces"]
+    assert FORCED_MASK_SAMPLE_KEY not in good
+    assert bad[FORCED_MASK_SAMPLE_KEY] is True
+    assert bad["message_log"][1]["generation_logprobs"].tolist() == pytest.approx(
+        [-0.3, 0.0]
+    )
+    assert bad["message_log"][2]["generation_logprobs"].tolist() == [0.0]
+    assert not _has_nan_generation_logprobs(result)
+    assert FORCED_MASK_SAMPLE_KEY not in result
+
+
+def test_mask_nan_generation_logprobs_on_a_single_trace_result():
+    result = {"message_log": [_user(), _assistant([float("nan"), -0.5])]}
+
+    assert _mask_nan_generation_logprobs(result) == 1
+    assert result[FORCED_MASK_SAMPLE_KEY] is True
+    assert result["message_log"][1]["generation_logprobs"].tolist() == [0.0, -0.5]
+    assert _mask_nan_generation_logprobs({"message_log": [_user()]}) == 0
+
+
+def _actor_config(**nemo_gym_dict):
+    return _build_gym_actor_config(
+        nemo_gym_dict,
+        base_urls=["http://x"],
+        model_name="m",
+        enable_router_replay=False,
+        use_fastokens=False,
+    )
+
+
+def test_nan_generation_logprobs_knob_is_consumed_rl_side():
+    cfg = _actor_config(nan_generation_logprobs="raise")
+    assert cfg["nan_generation_logprobs"] == "raise"
+    assert "nan_generation_logprobs" not in cfg["initial_global_config_dict"]
+    assert "nan_generation_logprobs" not in _actor_config()
+    with pytest.raises(ValueError, match="nan_generation_logprobs"):
+        _actor_config(nan_generation_logprobs="drop")
 
 
 def test_nemo_gym_postprocess_no_generation_data_chat_template_failure():

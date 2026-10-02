@@ -781,6 +781,36 @@ def _create_peft_warm_start_hook(
     return peft_warm_start_hook
 
 
+def apply_tf32_lm_head(model: Any) -> None:
+    """Run the LM output-layer GEMM on fp32-upcast inputs with TF32 tensor cores.
+
+    The ``megatron_cfg.fp32_lm_head: "tf32"`` mode. Unlike ``true`` (bf16 GEMM
+    emitting fp32 logits), the head's input and weight are upcast to fp32 in the
+    autograd graph and the GEMM runs with TF32 on; exact bf16 inputs lose nothing
+    to TF32's 10-bit mantissa. use_fused_linear_logprobs bypasses
+    output_layer.forward and is unaffected.
+    """
+    module = model
+    while hasattr(module, "module"):
+        module = module.module
+    output_layer = getattr(module, "output_layer", None)
+    if output_layer is None:
+        return  # not the last pipeline stage
+    orig_forward = output_layer.forward
+
+    def _tf32_forward(input_, *args, weight=None, **kwargs):
+        w = weight if weight is not None else output_layer.weight
+        prev = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = True
+        try:
+            return orig_forward(input_.float(), *args, weight=w.float(), **kwargs)
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = prev
+
+    output_layer.forward = _tf32_forward
+    print("[fp32_lm_head] output layer computes logits in fp32 (tf32 tensor cores)")
+
+
 def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
     """Validate and setup model paths.
 
@@ -1388,9 +1418,30 @@ def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
         # mtp_use_repeated_layer is False) and the number of times the MTP layer
         # is repeated (when mtp_use_repeated_layer is True).
         model_cfg.mtp_num_layers = megatron_cfg["mtp_num_layers"]
+        if megatron_cfg["mtp_num_layers"] == 0:
+            # mtp_num_layers=0 means "do not build MTP at all". For checkpoints
+            # trained with a repeated MTP layer, HybridProvider.finalize() still
+            # appends one MTP section to the layer pattern (max(1, 0) copies)
+            # whenever mtp_use_repeated_layer/mtp_hybrid_override_pattern are
+            # set, and the forward then needs MTP inputs that a critic never
+            # passes. Strip every MTP source so the pattern stays main-decoder
+            # only. (Port of 3543f0215 from the super-v3.5 branches.)
+            if getattr(model_cfg, "mtp_hybrid_override_pattern", None):
+                model_cfg.mtp_hybrid_override_pattern = None
+            if getattr(model_cfg, "mtp_use_repeated_layer", False):
+                model_cfg.mtp_use_repeated_layer = False
+            for pattern_attr in ("hybrid_layer_pattern", "hybrid_override_pattern"):
+                pattern = getattr(model_cfg, pattern_attr, None)
+                if isinstance(pattern, str) and "/" in pattern:
+                    setattr(model_cfg, pattern_attr, pattern.split("/")[0])
     if "mtp_loss_scaling_factor" in megatron_cfg:
         model_cfg.mtp_loss_scaling_factor = megatron_cfg["mtp_loss_scaling_factor"]
-    if "mtp_use_repeated_layer" in megatron_cfg:
+    # An explicit mtp_num_layers=0 wins: re-enabling repeated layers here would
+    # make finalize() append the MTP section that the block above stripped.
+    if (
+        "mtp_use_repeated_layer" in megatron_cfg
+        and megatron_cfg.get("mtp_num_layers") != 0
+    ):
         model_cfg.mtp_use_repeated_layer = megatron_cfg["mtp_use_repeated_layer"]
     if "mtp_detach_heads" in megatron_cfg:
         model_cfg.mtp_detach_heads = megatron_cfg["mtp_detach_heads"]
@@ -1532,7 +1583,9 @@ def _apply_precision_config(
         "float16": torch.float16,
     }
     model_cfg.pipeline_dtype = dtype_map[config["megatron_cfg"]["pipeline_dtype"]]
-    if config["megatron_cfg"].get("fp32_lm_head"):
+    # "tf32" upcasts the head's input and weight instead (apply_tf32_lm_head,
+    # applied by the policy worker once the model exists).
+    if config["megatron_cfg"].get("fp32_lm_head") is True:
         if not hasattr(model_cfg, "logit_dtype"):
             raise ValueError(
                 "policy.megatron_cfg.fp32_lm_head requires a Megatron-Bridge "

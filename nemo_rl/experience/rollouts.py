@@ -59,6 +59,7 @@ from nemo_rl.environments.interfaces import (
 )
 from nemo_rl.environments.nemo_gym import (
     DEFAULT_THINKING_TAGS,
+    FORCED_MASK_SAMPLE_KEY,
     NemoGymShardSet,
     as_nemo_gym_shard_set,
     get_nemo_gym_route_name,
@@ -2053,6 +2054,7 @@ def resolve_reward_penalty_config(
         "penalize_empty_final_answer",
         "penalize_unwanted_tokens",
         "penalize_malformed_think_tag",
+        "rollout_scoped_penalties_on_all_segments",
     ):
         value = _get_reward_penalty_config_value(reward_penalty_config, flag)
         if value is not None:
@@ -3173,10 +3175,18 @@ def _postprocess_single_nemo_gym_group(
     )
     # Carry the raw env/agent flag downstream; the advantage stage composes it
     # into sample_mask. env.should_mask_flagged_samples=false skips this.
+    # Empty-rollout placeholders and NaN-logprob rows are masked either way.
+    forced_mask = torch.tensor(
+        [bool(result.get(FORCED_MASK_SAMPLE_KEY)) for result in results],
+        dtype=torch.bool,
+    )
     if mask_env_flagged_samples:
-        final_batch[MASK_SAMPLE] = _mask_sample_flags(
-            result["full_result"] for result in results
+        final_batch[MASK_SAMPLE] = (
+            _mask_sample_flags(result["full_result"] for result in results)
+            | forced_mask
         )
+    elif forced_mask.any():
+        final_batch[MASK_SAMPLE] = forced_mask
 
     rollout_metrics.update(_effort_shaping_metrics(shaping))
 

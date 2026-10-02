@@ -474,3 +474,40 @@ def test_pack_payload_stamps_violation_counts_on_tags() -> None:
             "num_routed_experts_backfilled": 1,
         },
     ]
+
+
+def test_record_to_train_batch_uses_each_session_traces_own_prompt() -> None:
+    from nemo_rl.experience.interfaces import TRACE_METADATA_KEY, Completion
+
+    def _trace_completion(prompt_ids, generation_ids, trace_idx):
+        return Completion(
+            message_log=[
+                {"role": "user", "content": "", "token_ids": torch.tensor(prompt_ids)},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "token_ids": torch.tensor(generation_ids),
+                    "generation_logprobs": torch.zeros(len(generation_ids)),
+                },
+            ],
+            env_extras={TRACE_METADATA_KEY: {"trace_in_rollout_idx": trace_idx}},
+            truncated=False,
+            reward=1.0,
+        )
+
+    record = _record(
+        [
+            _trace_completion([10, 11], [12], 0),  # main session: the group prompt
+            _trace_completion([20, 21, 22, 23], [24], 1),  # subagent: its own prompt
+        ]
+    )
+
+    train_batch = record_to_train_batch(
+        record,
+        pad_value_dict={"token_ids": 0, "input_ids": 0},
+        include_message_violation_fields=False,
+    )
+
+    prompt_ids = train_batch["prompt_ids_for_adv"]
+    assert prompt_ids[0, :2].tolist() == [10, 11]
+    assert prompt_ids[1, :4].tolist() == [20, 21, 22, 23]

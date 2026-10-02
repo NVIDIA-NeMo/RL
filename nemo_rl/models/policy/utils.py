@@ -235,8 +235,10 @@ def validate_fp32_lm_head_config(
         if megatron_enabled and megatron_cfg is not None
         else None
     )
-    if megatron_fp32_value not in (None, True, False):
-        raise ValueError("policy.megatron_cfg.fp32_lm_head must be true or false.")
+    if megatron_fp32_value not in (None, True, False, "tf32"):
+        raise ValueError(
+            'policy.megatron_cfg.fp32_lm_head must be true, false, or "tf32".'
+        )
     megatron_fp32 = bool(megatron_fp32_value)
 
     if (
@@ -278,6 +280,23 @@ def validate_fp32_lm_head_config(
             "policy.generation.vllm_cfg.fp32_lm_head=true is only supported "
             "with the Megatron trainer because DTensor has no matching "
             "policy.dtensor_cfg fp32 LM-head implementation."
+        )
+    vllm_fp32_value = vllm_cfg.get("fp32_lm_head")
+    if vllm_fp32_value not in (None, True, False, "tf32"):
+        raise ValueError(
+            'policy.generation.vllm_cfg.fp32_lm_head must be true, false, or "tf32".'
+        )
+    if (
+        megatron_enabled
+        and megatron_fp32
+        and vllm_fp32
+        and ((megatron_fp32_value == "tf32") != (vllm_fp32_value == "tf32"))
+    ):
+        raise ValueError(
+            'fp32 LM head mode must match on both engines: "tf32" upcasts the '
+            "head inputs to fp32 while true keeps a bf16 GEMM with fp32 output. "
+            f"Got policy.megatron_cfg.fp32_lm_head={megatron_fp32_value!r} and "
+            f"policy.generation.vllm_cfg.fp32_lm_head={vllm_fp32_value!r}."
         )
     if megatron_enabled and megatron_fp32 != vllm_fp32:
         raise ValueError(
