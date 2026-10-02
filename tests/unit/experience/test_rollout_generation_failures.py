@@ -1139,3 +1139,213 @@ class TestGymAdmissionClosedRows:
             assert method.dispatched == [[0, 1], [1]]
 
         asyncio.run(exercise())
+
+
+class _EarlyEndingGym:
+    """NemoGym actor whose first stream returns row 0, then dies with rows still running.
+
+    Gym runs every row of a dispatch as its own task, so the rows that never
+    came back are still executing there after the stream breaks. It has no
+    ``checkpoint_retire``: only the next checkpoint retires them.
+    """
+
+    def __init__(self) -> None:
+        self.events: list[tuple] = []
+        self.run_rollouts = self._RunRollouts(self)
+
+    class _RunRollouts:
+        def __init__(self, gym: "_EarlyEndingGym") -> None:
+            self._gym = gym
+
+        def options(self, **kwargs):
+            del kwargs
+            return self
+
+        def remote(self, inputs, timer_prefix, per_prompt=False):
+            del timer_prefix, per_prompt
+            first = not self._gym.events
+            self._gym.events.append(
+                {row["_rowidx"]: row["_ng_rollout_id"] for row in inputs}
+            )
+            return self._stream([row["_rowidx"] for row in inputs], first)
+
+        async def _stream(self, rows, first):
+            if first:
+                yield _row_result(rows[0])
+                raise ConnectionResetError("gym stream died mid-flight")
+            for rowidx in rows:
+                yield _row_result(rowidx)
+
+
+class _ShortCleanEndGym(_EarlyEndingGym):
+    """First stream returns row 0, refuses row 1 at admission, and ends cleanly without row 2."""
+
+    def __init__(self) -> None:
+        super().__init__()
+
+        async def stream(rows, first):
+            if first:
+                yield _row_result(rows[0])
+                yield _AdmissionClosedGymMethod._parked_item(rows[1])
+                return
+            for rowidx in rows:
+                yield _row_result(rowidx)
+
+        self.run_rollouts._stream = stream
+
+
+class TestGymEarlyStreamEnd:
+    """Rows still running in Gym when a stream breaks must not overlap their replacements."""
+
+    @staticmethod
+    def _dispatch(
+        gym: _EarlyEndingGym,
+        granularity: RecoveryGranularity,
+        row_attempts: int,
+    ):
+        from nemo_rl.experience.rollout_recovery import (
+            RecoveryTargetLevel,
+            RolloutRecoveryLedger,
+        )
+
+        impl = _make_gym_impl(None, num_generations=3, row_attempts=row_attempts)
+        impl._task_to_env = {"nemo_gym": gym}
+        impl._dispatch_admission_gate = DataPlaneCheckpointBarrier()
+        barrier = DataPlaneCheckpointBarrier()
+        ledger = RolloutRecoveryLedger()
+        manager = object.__new__(RolloutManager)
+        manager._recovery_ledger = ledger
+        manager._data_plane_checkpoint_barrier = barrier
+
+        async def reserve():
+            async with barrier.mutation() as cut:
+                return ledger.reserve_group(
+                    cut,
+                    group_id="g7",
+                    admission_id="batch-7",
+                    prompt_id="7",
+                    prompt_payload={"idx": 7, "message_log": []},
+                    expected_generations=3,
+                    target_step=7,
+                    start_weight_version=7,
+                    restore_level=(
+                        RecoveryTargetLevel.PROMPT_GROUP
+                        if granularity is RecoveryGranularity.PROMPT_GROUP
+                        else RecoveryTargetLevel.TURN
+                    ),
+                    admitted=True,
+                )
+
+        group = asyncio.run(reserve())
+        rows = [
+            {
+                "_rowidx": index,
+                "task_source": "workplace_assistant",
+                "_ng_rollout_id": group.gate_rollout_id(index),
+            }
+            for index in range(3)
+        ]
+        recorder = _LedgerDispatchRecorder(
+            manager=manager, group_id="g7", gym_instance_id="tools/replica-0"
+        )
+        episodes = {index: group.gym_episode(index) for index in range(3)}
+
+        async def run():
+            return await impl._run_rollouts(
+                rows,
+                Timer(),
+                "timing/rollout",
+                recovery_granularity=granularity,
+                dispatch_recorder=recorder,
+            )
+
+        async def abandon():
+            # What the group task does once _run_rollouts raises.
+            async with barrier.mutation() as cut:
+                ledger.abandon_unsealed(cut, "g7")
+
+        return run, abandon, episodes, ledger
+
+    @staticmethod
+    def _queued(ledger) -> set:
+        return set(
+            ledger.gym_checkpoint_retirements({"tools/replica-0"})["tools/replica-0"]
+        )
+
+    def test_rows_still_running_are_queued_for_retirement_and_resent_under_new_ids(
+        self,
+    ):
+        from nemo_rl.experience.rollout_recovery import RolloutAttemptStatus
+
+        gym = _EarlyEndingGym()
+        run, _, episodes, ledger = self._dispatch(
+            gym, RecoveryGranularity.SIBLING, row_attempts=3
+        )
+
+        completions, _, _ = asyncio.run(run())
+
+        assert len(completions) == 3
+        first, resent = gym.events
+        assert set(resent) == {1, 2}
+        assert set(resent.values()).isdisjoint(first.values())
+        group = ledger.get_group("g7")
+        for index in (1, 2):
+            sibling = group.siblings[index]
+            assert sibling.attempts[0].status is RolloutAttemptStatus.ABANDONED
+            assert sibling.current_attempt.status is RolloutAttemptStatus.DISPATCHED
+            assert group.gate_rollout_id(index) == resent[index]
+        # Rows 1 and 2 never came back, so Gym may still be running them.
+        assert self._queued(ledger) == {episodes[1], episodes[2]}
+
+    @pytest.mark.parametrize(
+        "granularity", [RecoveryGranularity.SIBLING, RecoveryGranularity.PROMPT_GROUP]
+    )
+    def test_a_short_clean_end_on_the_last_attempt_is_missing_rows_not_a_reused_id(
+        self, granularity: RecoveryGranularity
+    ):
+        """The admission re-send of the refused row must not take the lost row
+        along under the rollout ID Gym may still be running."""
+        gym = _ShortCleanEndGym()
+        run, abandon, episodes, ledger = self._dispatch(
+            gym, granularity, row_attempts=1
+        )
+
+        with pytest.raises(GymTransportError, match="missing rows"):
+            asyncio.run(run())
+
+        assert len(gym.events) == 1
+        asyncio.run(abandon())
+        assert episodes[2] in self._queued(ledger)
+
+    def test_a_short_clean_end_with_attempts_left_resends_the_lost_row_under_a_new_id(
+        self,
+    ):
+        gym = _ShortCleanEndGym()
+        run, _, episodes, ledger = self._dispatch(
+            gym, RecoveryGranularity.SIBLING, row_attempts=2
+        )
+
+        completions, _, _ = asyncio.run(run())
+
+        assert len(completions) == 3
+        first, resent = gym.events
+        assert set(resent) == {1, 2}
+        # The refused row never ran, so it keeps its ID; the lost row gets a new one.
+        assert resent[1] == first[1]
+        assert resent[2] != first[2]
+        assert ledger.get_group("g7").gate_rollout_id(2) == resent[2]
+        assert self._queued(ledger) == {episodes[2]}
+
+    def test_a_prompt_group_leaves_its_running_siblings_for_the_group_abandon(self):
+        gym = _EarlyEndingGym()
+        run, abandon, episodes, ledger = self._dispatch(
+            gym, RecoveryGranularity.PROMPT_GROUP, row_attempts=1
+        )
+
+        with pytest.raises(ConnectionResetError):
+            asyncio.run(run())
+
+        assert len(gym.events) == 1
+        asyncio.run(abandon())
+        # The prompt retry dispatches fresh attempts next; none may overlap these.
+        assert {episodes[1], episodes[2]} <= self._queued(ledger)

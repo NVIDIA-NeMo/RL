@@ -148,6 +148,17 @@ class RolloutDispatchRecorder(Protocol):
         """Unwind one attempt Gym refused because a checkpoint closed admission."""
         ...
 
+    async def replace_dropped(
+        self, generation_indices: Sequence[int]
+    ) -> Mapping[int, str]:
+        """Give rows a broken stream left running in Gym fresh attempts for their re-send.
+
+        Returns the replacement Gate rollout ID of each row, or nothing once the
+        group was discarded. The abandoned attempts wait for the next checkpoint
+        to retire them.
+        """
+        ...
+
 
 # First pause before re-sending rows Gym refused at checkpoint admission. Doubles
 # per consecutive refusal; the prompt group's rollout deadline bounds the total.
@@ -330,7 +341,7 @@ class RolloutStats:
                 sum(self.data_failures_by_reason.values())
             ),
             "rollout/gym_row_redispatch_total": float(self.gym_row_redispatches),
-            "rollout/gym_checkpoint_parked_rows_total": float(
+            "rollout/gym_admission_closed_rows_total": float(
                 self.gym_admission_closed_rows
             ),
             "rollout/infra_drops_total": float(
@@ -1371,6 +1382,39 @@ class AsyncNemoGymRolloutImpl:
 
         return env_timing_metrics
 
+    async def _replace_unreturned_rows(
+        self,
+        pending: list[dict],
+        results: list[Optional[dict]],
+        admission_closed_rows: set[int],
+        *,
+        dispatch_recorder: Optional[RolloutDispatchRecorder],
+    ) -> None:
+        """Re-stamp the rows a stream ended without with fresh rollout IDs.
+
+        Gym runs every row of a ``/run`` as its own task, and an ended stream
+        cancels none of them. A re-send under the same identity would run two
+        copies of one episode. The old episodes keep running until the next
+        checkpoint retires them.
+        """
+        if dispatch_recorder is None:
+            return
+        unreturned = [
+            row
+            for row in pending
+            if results[row["_rowidx"]] is None
+            and row["_rowidx"] not in admission_closed_rows
+        ]
+        if not unreturned:
+            return
+        rollout_ids = await dispatch_recorder.replace_dropped(
+            [row["_rowidx"] for row in unreturned]
+        )
+        for row in unreturned:
+            row["_ng_rollout_id"] = rollout_ids.get(
+                row["_rowidx"], row["_ng_rollout_id"]
+            )
+
     async def _run_rollouts(
         self,
         inputs: list[dict],
@@ -1483,18 +1527,42 @@ class AsyncNemoGymRolloutImpl:
                         last_error = error
                         # Only transport-shaped failures are worth another dispatch; a
                         # prompt NeMo-Gym cannot serve fails the same way every time.
-                        if (
-                            classify_rollout_failure(error) is not FailureClass.INFRA
-                            or attempt == max_row_attempts
-                        ):
+                        resend = (
+                            classify_rollout_failure(error) is FailureClass.INFRA
+                            and attempt < max_row_attempts
+                        )
+                        if not resend:
+                            # The group's abandon queues its unreturned rows for
+                            # the next checkpoint to retire.
                             error.add_note(
                                 f"NeMo-Gym instance '{instance_label}' failed during rollout collection"
                             )
                             raise
+                        await self._replace_unreturned_rows(
+                            pending,
+                            results,
+                            admission_closed_rows,
+                            dispatch_recorder=dispatch_recorder,
+                        )
                         stream_failed = True
                     else:
                         if timing_metrics is not None:
                             env_timing_metrics = timing_metrics
+                        if attempt < max_row_attempts:
+                            await self._replace_unreturned_rows(
+                                pending,
+                                results,
+                                admission_closed_rows,
+                                dispatch_recorder=dispatch_recorder,
+                            )
+                        # A short clean end lost rows like a stream error does. Spend
+                        # the attempt, so the admission re-send below cannot reuse an
+                        # abandoned rollout ID.
+                        stream_failed = any(
+                            results[row["_rowidx"]] is None
+                            and row["_rowidx"] not in admission_closed_rows
+                            for row in pending
+                        )
                     if admission_closed_rows:
                         if self._stats is not None:
                             self._stats.record_gym_admission_closed(
@@ -1865,8 +1933,8 @@ class _LedgerDispatchRecorder:
         ledger = self.manager._recovery_ledger
         async with self.manager._recovery_mutation() as cut:
             record = ledger.get_group(self.group_id)
-            # A transport re-send of a row Gym may still be running keeps its
-            # DISPATCHED attempt; only reserved attempts move.
+            # Rows a broken stream dropped were abandoned and re-minted, so a
+            # re-send, like a first send, only moves reserved attempts.
             reserved = [
                 index
                 for index in generation_indices
@@ -1892,6 +1960,20 @@ class _LedgerDispatchRecorder:
                 self.group_id,
                 generation_index=generation_index,
             )
+
+    async def replace_dropped(
+        self, generation_indices: Sequence[int]
+    ) -> Mapping[int, str]:
+        ledger = self.manager._recovery_ledger
+        async with self.manager._recovery_mutation() as cut:
+            if self.group_id not in ledger:
+                # Discarding the group already queued its Gym episodes.
+                return {}
+            ledger.replace_dropped_dispatch(
+                cut, self.group_id, generation_indices=generation_indices
+            )
+            record = ledger.get_group(self.group_id)
+        return {index: record.gate_rollout_id(index) for index in generation_indices}
 
 
 class RolloutManager:
@@ -2632,7 +2714,11 @@ class RolloutManager:
                     f"streamed generation index {generation_index} is outside "
                     f"prompt group {group_id!r}"
                 )
-            expected_gate_rollout_id = rollout_ids[generation_index]
+            # Read from the ledger: a row re-sent after a broken stream runs
+            # under a fresh attempt, not the ID this dispatch started with.
+            expected_gate_rollout_id = self._recovery_ledger.get_group(
+                group_id
+            ).gate_rollout_id(generation_index)
             if gate_rollout_id != expected_gate_rollout_id:
                 raise ValueError(
                     "streamed rollout identity mismatch: "
