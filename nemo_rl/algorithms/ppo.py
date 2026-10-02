@@ -291,10 +291,6 @@ def _apply_ppo_seq_logprob_error_masking(
     return advantage_mask, metrics
 
 
-class PPOLoggerConfig(LoggerConfig):
-    num_val_samples_to_print: int  # number of val samples to print to stdout
-
-
 class MasterConfig(BaseModel, extra="allow"):
     policy: PolicyConfig
     value: ValueConfig
@@ -303,7 +299,7 @@ class MasterConfig(BaseModel, extra="allow"):
     env: dict[str, Any]
     data: DataConfig
     ppo: PPOConfig
-    logger: PPOLoggerConfig
+    logger: LoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
     telemetry: Optional[TelemetryConfig] = None

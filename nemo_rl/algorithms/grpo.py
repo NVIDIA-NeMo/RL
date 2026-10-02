@@ -445,17 +445,13 @@ def _get_grpo_save_state(
     return GRPOSaveState(**state_values)
 
 
-class GRPOLoggerConfig(LoggerConfig):
-    num_val_samples_to_print: int  # number of val samples to print to stdout
-
-
 class MasterConfig(BaseModel, extra="allow"):
     policy: PolicyConfig
     loss_fn: ClippedPGLossConfig
     env: dict[str, Any]
     data: DataConfig
     grpo: GRPOConfig
-    logger: GRPOLoggerConfig
+    logger: LoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
     reward_penalties: RewardPenaltyConfig = Field(default_factory=RewardPenaltyConfig)
