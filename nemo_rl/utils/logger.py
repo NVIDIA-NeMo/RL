@@ -109,15 +109,15 @@ class LoggerConfig(BaseModel, extra="allow"):
 
     @model_validator(mode="after")
     def _require_block_for_enabled_backends(self) -> "LoggerConfig":
-        for flag, block in (
-            ("wandb", self.wandb),
-            ("swanlab", self.swanlab),
-            ("tensorboard", self.tensorboard),
-            ("mlflow", self.mlflow),
+        for name, enabled, block in (
+            ("wandb", self.wandb_enabled, self.wandb),
+            ("swanlab", self.swanlab_enabled, self.swanlab),
+            ("tensorboard", self.tensorboard_enabled, self.tensorboard),
+            ("mlflow", self.mlflow_enabled, self.mlflow),
         ):
-            if getattr(self, f"{flag}_enabled") and block is None:
+            if enabled and block is None:
                 raise ValueError(
-                    f"logger.{flag}_enabled=true requires a logger.{flag} block."
+                    f"logger.{name}_enabled=true requires a logger.{name} block."
                 )
         return self
 
