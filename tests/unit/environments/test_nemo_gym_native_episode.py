@@ -20,6 +20,7 @@ from nemo_rl.experience.failures import (
 pytest.importorskip(
     "nemo_gym.episode_types", reason="Requires Gym Environment Server contracts"
 )
+gym_rollouts = pytest.importorskip("nemo_gym.rollout_collection")
 pytestmark = pytest.mark.nemo_gym
 
 
@@ -36,6 +37,7 @@ def _row() -> dict:
         "_ng_group_id": "group-123",
         "_ng_rollout_index": 0,
         "_ng_group_attempt": 0,
+        "_ng_rollout_id": "caller-owned-rollout",
     }
 
 
@@ -68,10 +70,7 @@ def _prepare(rows):
 
 def _reply(row: dict) -> dict:
     return {
-        "episode_id": {
-            "rollout_id": row["_ng_rollout_id"],
-            "attempt": row.get("_ng_attempt_index", 0),
-        },
+        "episode_id": gym_rollouts._native_episode_request_body(row)["episode_id"],
         "task_id": deepcopy(row["task_id"]),
         "result": {
             "responses_create_params": deepcopy(
@@ -94,27 +93,21 @@ def test_native_preparation_preserves_payload_and_resolves_actual_agent():
     _prepare([row])
     assert row["_ng_environment_server"] == "weather_environment"
     assert row["agent_ref"] == {"type": "responses_api_agents", "name": "weather_agent"}
-    assert (
-        row["task_input"]["responses_create_params"]
-        == original_payload["responses_create_params"]
-    )
-    assert row["task_input"]["task_data"] == {
-        **original_payload["task_data"],
-        "_ng_group_id": "group-123",
-        "_ng_group_attempt": 0,
-        "_ng_rollout_index": 0,
-    }
+    assert row["task_input"] == original_payload
     assert "responses_create_params" not in row
 
 
-def test_siblings_and_group_retries_have_distinct_episode_identities():
-    rows = [_row(), _row(), _row()]
-    rows[1]["_ng_rollout_index"] = 1
-    rows[2]["_ng_group_attempt"] = 2
-    _prepare(rows)
-    assert rows[0]["_ng_rollout_id"] != rows[1]["_ng_rollout_id"]
-    assert rows[0]["_ng_rollout_id"] == rows[2]["_ng_rollout_id"]
-    assert rows[2]["_ng_attempt_index"] == 2
+def test_native_preparation_does_not_create_episode_identity():
+    row = _row()
+    del row["_ng_rollout_id"]
+    row["_ng_group_attempt"] = 2
+    original = deepcopy(row)
+    _prepare([row])
+    assert row == {
+        **original,
+        "_ng_environment_server": "weather_environment",
+        "agent_ref": {"type": "responses_api_agents", "name": "weather_agent"},
+    }
 
 
 def test_caller_owned_capture_identity_is_preserved():
@@ -123,7 +116,22 @@ def test_caller_owned_capture_identity_is_preserved():
     row["_ng_group_attempt"] = 3
     _prepare([row])
     assert row["_ng_rollout_id"] == "staged-sample-identity"
-    assert row.get("_ng_attempt_index", 0) == 0
+    assert "_ng_attempt_index" not in row
+
+
+@pytest.mark.parametrize("attempt", [0, 2])
+def test_native_reply_accepts_gyms_existing_index_identity_fallback(attempt):
+    row = _row()
+    del row["_ng_rollout_id"]
+    row["_ng_task_index"] = 17
+    row["_ng_rollout_index"] = 4
+    row["_ng_attempt_index"] = attempt
+    _prepare([row])
+    reply = _reply(row)
+    assert reply["episode_id"] == {"rollout_id": "17-4", "attempt": attempt}
+    result = _normalize_nemo_gym_episode_result(row, reply)
+    assert result["_ng_episode_id"] == reply["episode_id"]
+    assert "_ng_rollout_id" not in row
 
 
 def test_legacy_preparation_and_result_are_opaque():
@@ -225,16 +233,21 @@ def test_native_reply_cannot_contain_both_result_and_failure():
         _normalize_nemo_gym_episode_result(row, reply)
 
 
-def test_native_receipt_reads_attempt_qualified_capture_manifest():
+@pytest.mark.parametrize("explicit_id", [False, True])
+def test_native_receipt_reads_attempt_qualified_capture_manifest(explicit_id):
     row = _row()
-    row["_ng_group_attempt"] = 2
+    row["_ng_attempt_index"] = 2
+    capture_key = "caller-owned-rollout-a2"
+    if not explicit_id:
+        del row["_ng_rollout_id"]
+        row["_ng_task_index"] = 17
+        capture_key = "17-0-a2"
     _prepare([row])
     result = _normalize_nemo_gym_episode_result(row, _reply(row))
     env_class = NemoGym.__ray_metadata__.modified_class
     env = object.__new__(env_class)
     env._control = AsyncMock(return_value={"records": [], "failures": []})
     processed = asyncio.run(env._postprocess_receipt_mode(row, result))
-    capture_key = row["_ng_rollout_id"] + "-a2"
     env._control.assert_awaited_once_with(
         "GET", f"/training-token-capture/control/rollouts/{capture_key}/manifest"
     )
