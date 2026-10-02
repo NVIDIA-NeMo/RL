@@ -57,3 +57,12 @@ env:
           sandbox_timeout: 3600
           datasets: []
           auto_compact: false
+    # Gym reaches every agent through an environment server. The SWE agents declare theirs in
+    # their wiring configs; the Terminal Bench agent of opencode_sc.yaml gets it here.
+    tb_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: tb_opencode
