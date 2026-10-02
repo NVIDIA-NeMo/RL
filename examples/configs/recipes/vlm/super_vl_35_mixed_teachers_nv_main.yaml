@@ -14,7 +14,7 @@ grpo:
   overlong_filtering: true
   seq_logprob_error_threshold: 2
   skip_reference_policy_logprobs_calculation: true
-  deduplicate_multimodal_data: false
+  deduplicate_multimodal_data: true
   advantage_clip_low: -50
   advantage_clip_high: 50
   zero_variance_prompt_filtering: false
@@ -157,7 +157,7 @@ policy:
       end_weight_decay: 0.0
       weight_decay_incr_style: constant
     checkpoint:
-      async_save: true
+      async_save: false
   generation:
     backend: vllm
     max_new_tokens: 32768
