@@ -47,10 +47,7 @@ from nemo_rl.environments.nemo_gym import (
     as_nemo_gym_shard_set,
     get_nemo_gym_route_name,
 )
-from nemo_rl.environments.nemo_gym_task import (
-    get_nemo_gym_task_input,
-    is_nemo_gym_task,
-)
+from nemo_rl.environments.nemo_gym_task import get_nemo_gym_task_input
 from nemo_rl.experience.failures import (
     FailureClass,
     GenerationUnavailable,
@@ -1289,12 +1286,8 @@ class AsyncNemoGymRolloutImpl:
             max_row_attempts = (
                 1
                 if recovery_granularity is RecoveryGranularity.PROMPT_GROUP
-                or any(is_nemo_gym_task(row) for row in inputs)
                 else self._max_gym_row_attempts
             )
-            # Native episode retries need a new attempt or capture identity. The
-            # outer retry owner advances those; this inner loop would replay the
-            # same ID and could mix failed and successful generation captures.
             async with _Deadline(
                 self._timeouts.rollout_s,
                 "NeMo-Gym prompt group",
