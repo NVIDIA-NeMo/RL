@@ -640,8 +640,14 @@ class MegatronGeneration(GenerationInterface):
         staging_partition: str,
         *,
         capture_media: bool = False,
+        generation_prefix_cuts_enabled: bool = False,
+        generation_cut_control_token: str | None = None,
     ) -> None:
         """Install MInf's canonical prompt and completion capture hooks."""
+        if generation_prefix_cuts_enabled:
+            raise NotImplementedError(
+                "generation-prefix recovery is not implemented for Megatron inference"
+            )
         if capture_media:
             raise NotImplementedError(
                 "Media token capture is only implemented for the vLLM generation "

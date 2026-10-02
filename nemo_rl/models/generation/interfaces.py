@@ -618,6 +618,8 @@ class GenerationInterface(ABC):
         staging_partition: str,
         *,
         capture_media: bool = False,
+        generation_prefix_cuts_enabled: bool = False,
+        generation_cut_control_token: str | None = None,
     ) -> None:
         """Install token capture in the serving workers (``token_capture.enabled``).
 
@@ -630,6 +632,10 @@ class GenerationInterface(ABC):
             staging_partition: Data-plane partition that captured rows are staged in.
             capture_media: Also stage the processed VLM media each call ran on
                 beside its token delta (vLLM only; see ``MEDIA_STAGING_FIELDS``).
+            generation_prefix_cuts_enabled: Allow checkpoint-time cuts of active
+                model calls for prefix recovery.
+            generation_cut_control_token: Bearer token used by Gym's checkpoint
+                coordinator to authorize generation-cut requests.
         """
         raise NotImplementedError(
             f"token_capture.enabled is not supported for {type(self).__name__}"
@@ -684,6 +690,24 @@ class GenerationInterface(ABC):
         """
         _warn_unsupported_in_flight_refit_pause_once(type(self).__name__)
         return False
+
+    def begin_token_capture_snapshot_fence(
+        self, *, timeout_s: Optional[float] = None
+    ) -> bool:
+        """Fence terminal token writes while a coordinated TQ snapshot is taken."""
+        raise NotImplementedError(
+            "generation-prefix checkpointing is not supported for "
+            f"{type(self).__name__}"
+        )
+
+    def end_token_capture_snapshot_fence(
+        self, *, timeout_s: Optional[float] = None
+    ) -> bool:
+        """Release terminal token writes after the coordinated TQ snapshot."""
+        raise NotImplementedError(
+            "generation-prefix checkpointing is not supported for "
+            f"{type(self).__name__}"
+        )
 
     def blocks_training(self) -> bool:
         """Whether this engine must stand down before a training step.

@@ -15,6 +15,7 @@
 
 import inspect
 import json
+import threading
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -674,15 +675,25 @@ def test_worker_restart_recovers_retained_geometry_without_fetching_pixels(
 def test_worker_completion_stages_pixels_and_only_returns_capture_coordinates(dp):
     from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
 
+    from nemo_rl.models.generation.generation_cut_capture import (
+        _TokenCaptureSnapshotGate,
+    )
+
     worker = object.__new__(VllmAsyncGenerationWorkerImpl)
     worker._capture_calls = {}
+    worker._capture_calls_by_model_call_id = {}
+    worker._completed_capture_calls = {}
+    worker._capture_registry_lock = threading.Lock()
+    worker._token_capture_snapshot_gate = _TokenCaptureSnapshotGate()
+    sink = TQTokenSink(
+        dp,
+        staging_partition="staging",
+        capture_media=True,
+        media_pixel_dtype=torch.float32,
+    )
+    worker._capture_sink = sink
     worker.token_capture = RolloutTokenCapture(
-        sink=TQTokenSink(
-            dp,
-            staging_partition="staging",
-            capture_media=True,
-            media_pixel_dtype=torch.float32,
-        ),
+        sink=sink,
         weight_version_fn=lambda: 0,
         adapter=VLLMCaptureAdapter(),
     )
@@ -1273,6 +1284,9 @@ async def test_retained_media_rejection_precedes_inference_and_survives_gym(
     )
     worker.token_capture = MagicMock(adapter=VLLMCaptureAdapter())
     worker._capture_calls = {}
+    worker._capture_calls_by_model_call_id = {}
+    worker._completed_capture_calls = {}
+    worker._capture_registry_lock = threading.Lock()
     worker._http_engine_client = MagicMock()
     worker.llm_async_engine_args = MagicMock()
     worker.llm_async_engine_args.create_model_config.return_value = SimpleNamespace(

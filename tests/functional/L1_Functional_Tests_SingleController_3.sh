@@ -55,6 +55,10 @@ run_test fast env SC_SIBLING_RECOVERY_GENERATION_BACKEND=megatron uv run --no-sy
 # Periodic native-TQ snapshot while a streamed step owns only part of its
 # rollout batch, followed by SIGKILL and rollback to the durable trainer anchor.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_streaming_recovery.sh
+# Gym-v2 active-decode recovery: checkpoint a nonterminal vLLM prefix, restart
+# the process, restore that exact prefix, and generate only its remaining tail.
+# This is intentionally full-tier because it performs two long-generation runs.
+run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_prefix_recovery.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then

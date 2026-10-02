@@ -265,9 +265,10 @@ token_capture:
   enabled: false
   staging_partition: rollout_staging
 
-# Target recovery boundary for unfinished token-capture groups. "turn" enables
-# coordinated Gym participant snapshots; "sibling" preserves sealed siblings;
-# "prompt_group" regenerates every sibling in an unfinished group.
+# Target recovery boundary for unfinished token-capture groups. "prefix" also
+# preserves decoded tokens from an active model call; "turn" enables coordinated
+# Gym participant snapshots; "sibling" preserves sealed siblings; "prompt_group"
+# regenerates every sibling in an unfinished group.
 rollout_recovery:
   target_level: sibling
   # Per-Gym-task-source coarsening override, keyed on extra_env_info.task_source.

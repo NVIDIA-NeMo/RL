@@ -784,6 +784,31 @@ def test_unsharded_checkpointing_discovers_the_actor_at_startup(detected_uv_dirs
     assert token_capture["capture_dir"] == "/capture"
 
 
+def test_prefix_checkpointing_enables_generation_cuts_on_policy_model(
+    detected_uv_dirs,
+):
+    config = build_nemo_gym_config(
+        _env_configs(),
+        base_urls=["http://vllm-0"],
+        model_name="test-model",
+        enable_router_replay=False,
+        use_fastokens=False,
+        turn_checkpointing_enabled=True,
+        token_capture={
+            "enabled": True,
+            "capture_dir": "/capture",
+            "control_auth_token": "secret",
+            "generation_prefix_cuts_enabled": True,
+        },
+    )
+
+    model = config["initial_global_config_dict"]["policy_model"][
+        "responses_api_models"
+    ]["vllm_model"]
+    assert model["checkpoint_policy"] is True
+    assert model["checkpoint_generation_cuts"] is True
+
+
 def test_checkpointing_requires_token_capture(detected_uv_dirs):
     with pytest.raises(ValueError, match="requires token capture"):
         build_nemo_gym_config(

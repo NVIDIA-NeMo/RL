@@ -23,6 +23,9 @@ a mock worker group.
 from __future__ import annotations
 
 import asyncio
+import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -32,6 +35,10 @@ import torch
 
 nemo_gym = pytest.importorskip("nemo_gym.token_id_capture.staging")
 
+from nemo_gym._checkpoint.generation_cut import (  # noqa: E402
+    GenerationCutInventory,
+    GenerationCutPrefix,
+)
 from nemo_gym.token_id_capture.staging.capture import (  # noqa: E402
     CaptureError,
     RolloutTokenCapture,
@@ -43,9 +50,15 @@ from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
 )
 
 from nemo_rl.data_plane.tq_token_sink import ChainPrefixCache  # noqa: E402
+from nemo_rl.models.generation.generation_cut_capture import (  # noqa: E402
+    _remaining_generation_limits_after_prefix,
+    _TokenCaptureSnapshotGate,
+)
 from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration  # noqa: E402
 from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
     VllmAsyncGenerationWorkerImpl,
+    _RequestOutputDeltaAccumulator,
+    _classify_restored_prefix_terminal,
 )
 
 pytestmark = pytest.mark.nemo_gym
@@ -55,6 +68,9 @@ class _MemorySink:
     def __init__(self) -> None:
         self.records: list[StagedCallRecord] = []
         self.attachments: list[dict | None] = []
+        self.generation_prefix_records: list[tuple[str, StagedCallRecord]] = []
+        self.generation_prefix_keys: list[str] = []
+        self.cleared_generation_prefix_keys: list[str] = []
 
     def stage(
         self, record: StagedCallRecord, *, attachments: dict | None = None
@@ -62,6 +78,26 @@ class _MemorySink:
         self.records.append(record)
         self.attachments.append(attachments)
         return StageResult(ok=True, staging_key=record.staging_key)
+
+    def stage_generation_prefix(
+        self,
+        record: StagedCallRecord,
+        *,
+        checkpoint_id: str,
+        chunk_sequence: int,
+        attachments: dict | None = None,
+    ) -> StageResult:
+        assert attachments is None
+        self.generation_prefix_records.append((checkpoint_id, record))
+        key = (
+            f"__generation_cut__/{checkpoint_id}/{record.rollout_id}/"
+            f"{record.model_call_id}/{chunk_sequence}"
+        )
+        self.generation_prefix_keys.append(key)
+        return StageResult(ok=True, staging_key=key)
+
+    def clear(self, staging_keys: list[str]) -> None:
+        self.cleared_generation_prefix_keys.extend(staging_keys)
 
 
 def _fake_worker(*, is_model_owner: bool = True) -> SimpleNamespace:
@@ -71,6 +107,17 @@ def _fake_worker(*, is_model_owner: bool = True) -> SimpleNamespace:
         token_capture=None,
         _rollout_weight_version=0,
         _chain_prefix=ChainPrefixCache(),
+        _capture_calls={},
+        _capture_calls_by_model_call_id={},
+        _completed_capture_calls={},
+        _generation_cut_receipts={},
+        _capture_registry_lock=threading.Lock(),
+        _capture_sink=None,
+        _generation_prefix_cuts_enabled=False,
+        _generation_cut_control_token=None,
+        _token_capture_snapshot_gate=_TokenCaptureSnapshotGate(),
+        _staging_source=None,
+        _capture_media=False,
     )
     worker.install_token_capture = lambda capture: setattr(
         worker, "token_capture", capture
@@ -86,11 +133,9 @@ def test_setup_token_capture_installs_capture_with_vllm_adapter(monkeypatch):
     )
     monkeypatch.setattr(
         "nemo_rl.data_plane.tq_token_sink.TQTokenSink",
-        lambda dp_client,
-        *,
-        staging_partition,
-        capture_media,
-        media_pixel_dtype=None: sink,
+        lambda dp_client, *, staging_partition, capture_media, media_pixel_dtype=None: (
+            sink
+        ),
     )
     worker = _fake_worker()
 
@@ -129,11 +174,9 @@ def test_weight_version_is_stamped_from_worker_state(monkeypatch):
     )
     monkeypatch.setattr(
         "nemo_rl.data_plane.tq_token_sink.TQTokenSink",
-        lambda dp_client,
-        *,
-        staging_partition,
-        capture_media,
-        media_pixel_dtype=None: sink,
+        lambda dp_client, *, staging_partition, capture_media, media_pixel_dtype=None: (
+            sink
+        ),
     )
     worker = _fake_worker()
     asyncio.run(
@@ -180,6 +223,8 @@ def test_generation_setup_token_capture_fans_out(monkeypatch):
         dp_cfg={"backend": "simple"},
         staging_partition="rollout_staging",
         capture_media=False,
+        generation_prefix_cuts_enabled=False,
+        generation_cut_control_token=None,
         run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
     )
 
@@ -188,6 +233,166 @@ def test_generation_setup_token_capture_requires_async_engine():
     gen = _generation_with_mock_group(async_engine=False)
     with pytest.raises(AssertionError, match="async vLLM engine"):
         gen.setup_token_capture({}, "rollout_staging")
+
+
+@pytest.mark.parametrize(
+    ("operation", "worker_method"),
+    [
+        (
+            "begin_token_capture_snapshot_fence",
+            "begin_token_capture_snapshot_fence_async",
+        ),
+        (
+            "end_token_capture_snapshot_fence",
+            "end_token_capture_snapshot_fence_async",
+        ),
+    ],
+)
+def test_token_capture_snapshot_fence_control_fans_out(
+    monkeypatch, operation: str, worker_method: str
+):
+    gen = _generation_with_mock_group()
+    gen.worker_group.workers = [object()]
+    gen.worker_group.run_all_workers_single_data.return_value = [True]
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_generation.ray.get",
+        lambda futures, timeout=None: futures,
+    )
+
+    assert getattr(gen, operation)(timeout_s=17.0)
+    gen.worker_group.run_all_workers_single_data.assert_called_once_with(
+        worker_method,
+        run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+    )
+
+
+def test_prefix_capture_setup_requires_control_token_and_rejects_media(monkeypatch):
+    monkeypatch.setattr(
+        "nemo_rl.data_plane.build_data_plane_client",
+        lambda dp_cfg, bootstrap: MagicMock(),
+    )
+    worker = _fake_worker()
+    with pytest.raises(ValueError, match="control bearer token"):
+        asyncio.run(
+            VllmAsyncGenerationWorkerImpl.setup_token_capture(
+                worker,
+                {},
+                "rollout_staging",
+                generation_prefix_cuts_enabled=True,
+            )
+        )
+
+    worker = _fake_worker()
+    worker.llm = SimpleNamespace(model_config=SimpleNamespace(dtype=torch.bfloat16))
+    with pytest.raises(ValueError, match="does not yet support multimodal"):
+        asyncio.run(
+            VllmAsyncGenerationWorkerImpl.setup_token_capture(
+                worker,
+                {},
+                "rollout_staging",
+                capture_media=True,
+                generation_prefix_cuts_enabled=True,
+                generation_cut_control_token="secret",
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("max_tokens", "min_tokens", "generation_token_count", "expected"),
+    [
+        (10, 6, 3, (7, 3)),
+        (None, 6, 3, (None, 3)),
+        (10, None, 3, (7, None)),
+        (10, 2, 3, (7, 0)),
+    ],
+)
+def test_restored_prefix_reduces_remaining_output_limits(
+    max_tokens, min_tokens, generation_token_count, expected
+):
+    assert (
+        _remaining_generation_limits_after_prefix(
+            max_tokens=max_tokens,
+            min_tokens=min_tokens,
+            generation_token_count=generation_token_count,
+        )
+        == expected
+    )
+
+
+def test_restored_prefix_at_output_limit_is_terminal():
+    terminal = _classify_restored_prefix_terminal(
+        prompt_token_ids=[1, 2, 3, 4],
+        generation_token_count=2,
+        requested_output_tokens=2,
+        model_max_tokens=8,
+    )
+    assert terminal is not None
+    assert terminal.reason == "output_limit"
+    assert terminal.original_prompt_token_count == 2
+
+
+def test_request_output_deltas_are_assembled_without_mutating_inputs():
+    def output(text, token_ids):
+        return SimpleNamespace(
+            outputs=[
+                SimpleNamespace(
+                    index=0,
+                    text=text,
+                    token_ids=list(token_ids),
+                    logprobs=[f"lp-{token_id}" for token_id in token_ids],
+                )
+            ]
+        )
+
+    first = output("a", [1])
+    second = output("bc", [2, 3])
+    accumulator = _RequestOutputDeltaAccumulator()
+    accumulator.append(first)
+    accumulator.append(second)
+    accumulated = accumulator.build()
+    assert accumulated.outputs[0].text == "abc"
+    assert accumulated.outputs[0].token_ids == [1, 2, 3]
+    assert first.outputs[0].token_ids == [1]
+    assert second.outputs[0].token_ids == [2, 3]
+
+
+def test_token_capture_snapshot_fence_does_not_pause_decoding():
+    class FakeLLM:
+        pause_calls = 0
+
+        async def pause_generation(self, **kwargs):
+            self.pause_calls += 1
+
+    async def scenario():
+        worker = object.__new__(VllmAsyncGenerationWorkerImpl)
+        worker.cfg = {"vllm_cfg": {"async_engine": True}}
+        worker.llm = FakeLLM()
+        worker._token_capture_snapshot_gate = _TokenCaptureSnapshotGate()
+        worker._generation_cut_control_executor = ThreadPoolExecutor(max_workers=1)
+        try:
+            assert await worker.begin_token_capture_snapshot_fence_async()
+            assert worker.llm.pause_calls == 0
+            entered = threading.Event()
+            released = threading.Event()
+
+            def terminal_write():
+                entered.set()
+                worker._token_capture_snapshot_gate.enter()
+                released.set()
+                worker._token_capture_snapshot_gate.exit()
+
+            thread = threading.Thread(target=terminal_write)
+            thread.start()
+            assert entered.wait(timeout=5)
+            assert not released.wait(timeout=0.05)
+            assert await worker.end_token_capture_snapshot_fence_async()
+            assert released.wait(timeout=5)
+            thread.join(timeout=5)
+        finally:
+            worker._token_capture_snapshot_gate.reopen()
+            worker._generation_cut_control_executor.shutdown()
+
+    asyncio.run(scenario())
 
 
 def test_generation_set_rollout_weight_version_fans_out(monkeypatch):
@@ -217,8 +422,8 @@ def _worker_with_capture(sink: _MemorySink):
     from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
 
     worker = _fake_worker()
-    worker._capture_calls = {}
     worker._chain_prefix = ChainPrefixCache()
+    worker._capture_sink = sink
     worker._delta_align_routed_experts = (
         VllmAsyncGenerationWorkerImpl._delta_align_routed_experts
     )
@@ -226,7 +431,20 @@ def _worker_with_capture(sink: _MemorySink):
         "_fetch_chain_prefix",
         "_capture_admission",
         "_resolve_admission_prefix",
+        "_fetch_generation_cut_chunks",
+        "_rebuild_generation_cut_snapshot",
+        "_resolve_generation_cut",
         "_enter_request_prefix",
+        "_pop_request_capture",
+        "_get_request_capture",
+        "_remember_completed_capture",
+        "_abort_request_capture",
+        "_finish_request_capture_after_snapshot_fence",
+        "_finish_request_capture_with_lifecycle_owned",
+        "_restore_response_prefix",
+        "_checkpoint_active_generation_cut",
+        "_completed_generation_cut_ack",
+        "_checkpoint_generation_cut",
     ):
         setattr(
             worker, name, getattr(VllmAsyncGenerationWorkerImpl, name).__get__(worker)
@@ -240,13 +458,23 @@ def _worker_with_capture(sink: _MemorySink):
 
 
 class _MemoryPrefixSource:
-    def __init__(self, deltas: dict[str, list[int]]) -> None:
+    def __init__(
+        self,
+        deltas: dict[str, list[int]],
+        *,
+        records: dict[str, StagedCallRecord] | None = None,
+    ) -> None:
         self.deltas = deltas
+        self.records = records or {}
         self.calls: list[list[str]] = []
 
     def fetch_prefix_token_ids(self, staging_keys: list[str]) -> list[int]:
         self.calls.append(list(staging_keys))
         return [token for key in staging_keys for token in self.deltas[key]]
+
+    def fetch(self, staging_keys: list[str]) -> list[StagedCallRecord]:
+        self.calls.append(list(staging_keys))
+        return [self.records[key] for key in staging_keys]
 
 
 def _served_content(gen_ids, logprobs):
@@ -325,6 +553,288 @@ def test_request_capture_round_trip_stages_and_rides_coords(
         {"index": 0, "message": {"role": "assistant", "content": "x"}}
     ]
     assert worker._capture_calls == {}
+
+
+def test_generation_cut_stages_prefix_then_terminal_row_replaces_it():
+    sink = _MemorySink()
+    worker = _worker_with_capture(sink)
+    worker._generation_prefix_cuts_enabled = True
+    request = _FakeRequest(
+        ng_capture={
+            "rollout_id": "r0",
+            "model_call_id": "c1",
+            "parent_call_id": None,
+            "prev_len": 0,
+            "mode": "text",
+        },
+        stream=False,
+    )
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11])
+    state = worker._capture_calls[id(request)]
+    with state.lock:
+        state.effective_output_limit = 8
+        state.observe([20, 21], [-0.1, -0.2])
+
+    inventory = GenerationCutInventory.build(
+        checkpoint_id="checkpoint-1",
+        server_name="policy_model",
+        active_prefixes=[
+            GenerationCutPrefix(
+                ticket_id="ticket-1",
+                rollout_id="r0",
+                attempt_index=0,
+                model_call_id="c1",
+                admitted_at=1.0,
+            )
+        ],
+    )
+    receipt = worker._checkpoint_generation_cut(inventory)
+    replayed = worker._checkpoint_generation_cut(inventory)
+
+    assert replayed is receipt
+    assert len(sink.generation_prefix_records) == 1
+    assert receipt.prefixes[0].disposition == "durable_prefix"
+    assert receipt.prefixes[0].prefix_token_count == 2
+    assert sink.generation_prefix_records[0][1].token_ids_delta == [10, 11, 20, 21]
+    assert state.generation_cut_staging_keys == sink.generation_prefix_keys
+
+    content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+        worker,
+        request,
+        _served_content([20, 21, 22], [-0.1, -0.2, -0.3]),
+    )
+    assert content["ng_commit_coords"]["disposition"] == "staged"
+    assert sink.records[-1].token_ids_delta == [10, 11, 20, 21, 22]
+    assert sink.cleared_generation_prefix_keys == sink.generation_prefix_keys
+    assert worker._capture_calls == {}
+    assert worker._capture_calls_by_model_call_id == {}
+
+
+class _FailOncePrefixSink(_MemorySink):
+    def __init__(self) -> None:
+        super().__init__()
+        self._fail_next_prefix = True
+
+    def stage_generation_prefix(self, *args, **kwargs) -> StageResult:
+        if self._fail_next_prefix:
+            self._fail_next_prefix = False
+            raise RuntimeError("injected generation-prefix staging failure")
+        return super().stage_generation_prefix(*args, **kwargs)
+
+
+def test_generation_cut_rolls_back_tokens_after_staging_failure():
+    sink = _FailOncePrefixSink()
+    worker = _worker_with_capture(sink)
+    request = _FakeRequest(
+        ng_capture={
+            "rollout_id": "r0",
+            "model_call_id": "c1",
+            "mode": "text",
+        },
+        stream=False,
+    )
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10])
+    state = worker._capture_calls[id(request)]
+    with state.lock:
+        state.effective_output_limit = 8
+        state.observe([11, 12], [-0.1, -0.2])
+    inventory = GenerationCutInventory.build(
+        checkpoint_id="checkpoint-1",
+        server_name="policy_model",
+        active_prefixes=[
+            GenerationCutPrefix(
+                ticket_id="ticket-1",
+                rollout_id="r0",
+                attempt_index=0,
+                model_call_id="c1",
+                admitted_at=1.0,
+            )
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="injected generation-prefix"):
+        worker._checkpoint_generation_cut(inventory)
+    assert state.frozen_buffer is None
+    assert state.active_buffer.generated_token_ids == [11, 12]
+    assert state.sealed_generated_token_ids == []
+
+    receipt = worker._checkpoint_generation_cut(inventory)
+    assert receipt.prefixes[0].prefix_token_count == 2
+    assert sink.generation_prefix_records[-1][1].token_ids_delta == [10, 11, 12]
+
+
+def test_restored_generation_cut_is_extended_and_retired_on_completion(caplog):
+    caplog.set_level(logging.INFO)
+    sink = _MemorySink()
+    original_worker = _worker_with_capture(sink)
+    original_worker._rollout_weight_version = 7
+    original_request = _FakeRequest(
+        ng_capture={
+            "rollout_id": "r0",
+            "model_call_id": "c1",
+            "mode": "text",
+        },
+        stream=False,
+    )
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(
+        original_worker, original_request, [10, 11]
+    )
+    original_worker._capture_calls[id(original_request)].effective_output_limit = 128
+    VllmAsyncGenerationWorkerImpl._observe_request_capture(
+        original_worker,
+        original_request,
+        SimpleNamespace(
+            outputs=[
+                SimpleNamespace(
+                    token_ids=[12, 13],
+                    logprobs=[
+                        {12: SimpleNamespace(logprob=-0.1)},
+                        {13: SimpleNamespace(logprob=-0.2)},
+                    ],
+                )
+            ]
+        ),
+    )
+    inventory = GenerationCutInventory.build(
+        checkpoint_id="checkpoint-1",
+        server_name="policy_model",
+        active_prefixes=[
+            GenerationCutPrefix(
+                ticket_id="ticket-1",
+                rollout_id="r0",
+                attempt_index=0,
+                model_call_id="c1",
+                admitted_at=1.0,
+            )
+        ],
+    )
+    receipt = original_worker._checkpoint_generation_cut(inventory)
+    (cut_key,) = receipt.prefixes[0].staging_keys
+    cut_record = sink.generation_prefix_records[-1][1]
+
+    resumed_worker = _worker_with_capture(sink)
+    resumed_worker._rollout_weight_version = 9
+    resumed_worker._staging_source = _MemoryPrefixSource(
+        {}, records={cut_key: cut_record}
+    )
+    request = _FakeRequest(
+        ng_capture={
+            "rollout_id": "r0-a1",
+            "model_call_id": "c2",
+            "mode": "text",
+            "generation_cut": {
+                "source_capture_key": "r0",
+                "source_model_call_id": "c1",
+                "staging_keys": [cut_key],
+                "generation_token_count": 2,
+                "digest": cut_record.digest,
+                "effective_output_limit": receipt.prefixes[0].effective_output_limit,
+            },
+        },
+        stream=False,
+    )
+    admission = resumed_worker._capture_admission(request)
+    bad_count_admission = admission.model_copy(
+        update={
+            "generation_cut": admission.generation_cut.model_copy(
+                update={"generation_token_count": 3}
+            )
+        }
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="generation-cut token count mismatch: expected=3 actual=2",
+    ):
+        resumed_worker._resolve_generation_cut(bad_count_admission, [])
+    bad_digest_admission = admission.model_copy(
+        update={
+            "generation_cut": admission.generation_cut.model_copy(
+                update={"digest": "0" * 64}
+            )
+        }
+    )
+    with pytest.raises(RuntimeError, match="generation-cut digest mismatch"):
+        resumed_worker._resolve_generation_cut(bad_digest_admission, [])
+
+    cut = resumed_worker._resolve_generation_cut(admission, [])
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(
+        resumed_worker,
+        request,
+        [10, 11, 12, 13],
+        admission=admission,
+        prefix_token_ids=[],
+        generation_cut=cut,
+        resumed_generation_token_ids=[12, 13],
+    )
+    tokenizer = MagicMock()
+    tokenizer.decode.return_value = "partial tail"
+    output = SimpleNamespace(token_ids=[14], text=" tail")
+    resumed_worker._restore_response_prefix(
+        request,
+        SimpleNamespace(outputs=[output]),
+        tokenizer=tokenizer,
+    )
+    tokenizer.decode.assert_called_once_with([12, 13, 14])
+    assert output.text == "partial tail"
+
+    # A second checkpoint taken before the resumed call finishes must retain
+    # the original cut key and append the newly generated tail. Gym v2 stores
+    # this complete key list in the replacement attempt's model record.
+    VllmAsyncGenerationWorkerImpl._observe_request_capture(
+        resumed_worker,
+        request,
+        SimpleNamespace(
+            outputs=[
+                SimpleNamespace(
+                    token_ids=[14],
+                    logprobs=[{14: SimpleNamespace(logprob=-0.3)}],
+                )
+            ]
+        ),
+    )
+    second_receipt = resumed_worker._checkpoint_generation_cut(
+        GenerationCutInventory.build(
+            checkpoint_id="checkpoint-2",
+            server_name="policy_model",
+            active_prefixes=[
+                GenerationCutPrefix(
+                    ticket_id="ticket-2",
+                    rollout_id="r0",
+                    attempt_index=1,
+                    model_call_id="c2",
+                    admitted_at=2.0,
+                )
+            ],
+        )
+    )
+    assert second_receipt.prefixes[0].prefix_token_count == 3
+    assert second_receipt.prefixes[0].staging_keys[0] == cut_key
+    assert len(second_receipt.prefixes[0].staging_keys) == 2
+
+    content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+        resumed_worker,
+        request,
+        _served_content([14], [-0.3]),
+    )
+
+    final_record = sink.records[-1]
+    assert content["ng_commit_coords"]["rollout_id"] == "r0-a1"
+    assert final_record.token_ids_delta == [10, 11, 12, 13, 14]
+    assert final_record.token_mask_delta == [0.0, 0.0, 1.0, 1.0, 1.0]
+    assert final_record.generation_log_probs_delta == [
+        0.0,
+        0.0,
+        -0.1,
+        -0.2,
+        -0.3,
+    ]
+    assert final_record.weight_version == 7
+    assert content["ng_commit_coords"]["weight_version"] == 7
+    assert resumed_worker._completed_capture_calls["c2"].generation_token_count == 3
+    assert sink.cleared_generation_prefix_keys == list(
+        second_receipt.prefixes[0].staging_keys
+    )
+    assert "generation prefix restored:" in caplog.text
 
 
 def test_request_capture_token_in_prev_len_chains():
