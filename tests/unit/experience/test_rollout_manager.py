@@ -2332,7 +2332,9 @@ class TestPerLabelGroupMetrics:
         manager._record_result_fields(
             "g", 0, {"reward": 1.0, "harness_finished": True, "ng_rollout_id": "r0"}
         )
-        manager._record_result_fields("g", 1, {"reward": 0.0, "harness_finished": False})
+        manager._record_result_fields(
+            "g", 1, {"reward": 0.0, "harness_finished": False}
+        )
         # A re-dispatched rollout replaces its earlier attempt.
         manager._record_result_fields("g", 1, {"reward": 1.0, "harness_finished": True})
 
