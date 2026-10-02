@@ -43,7 +43,12 @@ import torch
 
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import MASK_SAMPLE, ROUTE_PLAN_TAG, TRUNCATED
+from nemo_rl.data_plane.schema import (
+    IS_ARTIFICIAL_INPUT,
+    MASK_SAMPLE,
+    ROUTE_PLAN_TAG,
+    TRUNCATED,
+)
 from nemo_rl.data_plane.tq_token_sink import (
     FetchedStagedCall,
     StagedMediaTensors,
@@ -749,6 +754,8 @@ class RolloutReassembler:
             group_id=group_id,
             prompt_idx=prompt_idx,
         )
+        for tag, row in zip(tags, rows, strict=True):
+            tag[IS_ARTIFICIAL_INPUT] = not row.valid
         if self._defer_routed_experts_to_policy:
             encoded_sizes = 0
             span_count = 0

@@ -44,7 +44,7 @@ import numpy as np
 import torch
 from tensordict import TensorDict, TensorDictBase
 
-from nemo_rl.data_plane.schema import OPD_FULL_FIELDS, Layout
+from nemo_rl.data_plane.schema import IS_ARTIFICIAL_INPUT, OPD_FULL_FIELDS, Layout
 from nemo_rl.utils.timer import ThreadSafeTimer
 
 # Pad/unpad cost, which the per-op metrics cannot see: packing runs in the
@@ -458,5 +458,11 @@ def materialize(
     # per-sample ``tags`` rows. The multimodal layer owns that encoding; the
     # codec only asks it to fix up its own fields so no raw nested value
     # reaches a BatchedDataDict consumer.
+    if tags is not None and any(IS_ARTIFICIAL_INPUT in tag for tag in tags):
+        if len(tags) != td.batch_size[0]:
+            raise ValueError("Artificial-input provenance must align with fetched rows")
+        out[IS_ARTIFICIAL_INPUT] = torch.tensor(
+            [tag.get(IS_ARTIFICIAL_INPUT, False) for tag in tags], dtype=torch.bool
+        )
     reassemble_packed_multimodal(out, tags)
     return BatchedDataDict(out)

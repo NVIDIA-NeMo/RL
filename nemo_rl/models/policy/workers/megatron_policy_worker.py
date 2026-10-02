@@ -1171,6 +1171,7 @@ class MegatronPolicyWorkerImpl(
                     delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
                     model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
                     mtp_enabled=self.mtp_enabled,
+                    model_config=self._get_model_config(),
                 )
                 # Track total microbatches for MoE aux-loss averaging
                 total_num_microbatches += int(num_microbatches)
@@ -1847,6 +1848,7 @@ class MegatronPolicyWorkerImpl(
             delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
             model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
             mtp_enabled=self.mtp_enabled,
+            model_config=self._get_model_config(),
         )
         state["total_num_microbatches"] += int(num_microbatches)
 
@@ -2331,6 +2333,7 @@ class MegatronPolicyWorkerImpl(
             delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
             model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
             mtp_enabled=self.mtp_enabled,
+            model_config=self._get_model_config(),
         )
 
         use_fused_linear_logprobs = self.cfg["megatron_cfg"].get(
@@ -2652,6 +2655,7 @@ class MegatronPolicyWorkerImpl(
             delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
             model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
             mtp_enabled=self.mtp_enabled,
+            model_config=self._get_model_config(),
         )
 
         list_of_outputs = megatron_forward_backward(
@@ -2877,6 +2881,7 @@ class MegatronPolicyWorkerImpl(
             delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
             model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
             mtp_enabled=self.mtp_enabled,
+            model_config=self._get_model_config(),
         )
 
         list_of_outputs = megatron_forward_backward(

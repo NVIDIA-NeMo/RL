@@ -647,6 +647,7 @@ def _run_pipeline_forward_contract(rank: int, world_size: int) -> None:
         mbs=2,
         straggler_timer=None,
         model_slices_context_parallel_inputs=True,
+        model_config=model.module.config,
     )
 
     results = megatron_forward_backward(
@@ -736,6 +737,7 @@ def _run_mtp_multimodal_forward_contract(rank: int, world_size: int) -> None:
         straggler_timer=None,
         model_slices_context_parallel_inputs=True,
         mtp_enabled=True,
+        model_config=model.module.config,
     )
 
     with torch.no_grad():

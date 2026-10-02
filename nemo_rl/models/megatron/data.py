@@ -15,7 +15,7 @@
 from contextlib import nullcontext
 from dataclasses import dataclass
 from math import lcm
-from typing import Any, Iterator, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Iterator, Optional, Tuple
 
 import torch
 from megatron.bridge.training.utils.packed_seq_utils import (
@@ -30,7 +30,7 @@ from megatron.core.utils import StragglerDetector
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
 from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS, PackedTensor
-from nemo_rl.data_plane.schema import OPD_FULL_FIELDS
+from nemo_rl.data_plane.schema import IS_ARTIFICIAL_INPUT, OPD_FULL_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
 from nemo_rl.models.megatron.alignment import (
@@ -43,10 +43,14 @@ from nemo_rl.models.megatron.hybridep import (
     pad_packed_seq_for_hybridep,
     uses_hybridep_flex_dispatcher,
 )
+from nemo_rl.models.megatron.router_mask import get_router_padding_mask
 from nemo_rl.utils.r3_trace import (
     r3_trace_verify_forward_enabled,
     trace_cp_routed_experts,
 )
+
+if TYPE_CHECKING:
+    from megatron.core.transformer.transformer_config import TransformerConfig
 
 
 @dataclass
@@ -125,6 +129,7 @@ def make_processed_microbatch_iterator(
     create_packed_seq_padding_mask: bool = False,
     prepad_packed_seq_for_hybridep: bool = False,
     mtp_enabled: bool = False,
+    create_router_padding_mask: bool = False,
 ) -> Iterator[ProcessedMicrobatch]:
     """Wrap a raw microbatch iterator to yield processed microbatches.
 
@@ -140,6 +145,8 @@ def make_processed_microbatch_iterator(
         pad_packed_seq_to_multiple_of: Padding multiple for packed sequences
         pad_full_seq_to: Target length for full sequence padding (optional)
         create_packed_seq_padding_mask: Whether to mask packed padding from MoE routing
+        create_router_padding_mask: Exclude physical padding and artificial rows
+            from active expert-bias statistics.
         prepad_packed_seq_for_hybridep: Whether to align packed inputs across the
             HybridEP group before model forward
         mtp_enabled: Whether the model uses multi-token prediction layers.
@@ -165,6 +172,7 @@ def make_processed_microbatch_iterator(
             delegate_mtp_loss_mask_to_model=delegate_mtp_loss_mask_to_model,
             model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
             straggler_timer=straggler_timer,
+            create_router_padding_mask=create_router_padding_mask,
             create_packed_seq_padding_mask=create_packed_seq_padding_mask,
             prepad_packed_seq_for_hybridep=prepad_packed_seq_for_hybridep,
             mtp_enabled=mtp_enabled,
@@ -241,6 +249,8 @@ def get_microbatch_iterator(
     delegate_mtp_loss_mask_to_model: bool = False,
     model_slices_context_parallel_inputs: bool = False,
     mtp_enabled: bool = False,
+    *,
+    model_config: "TransformerConfig",
 ) -> Tuple[Iterator[ProcessedMicrobatch], int, int, int, int]:
     """Create a processed microbatch iterator from a batch of data.
 
@@ -251,6 +261,7 @@ def get_microbatch_iterator(
     Args:
         data: The batch data to create microbatches from
         cfg: Configuration dictionary
+        model_config: Resolved model config, including checkpoint/provider defaults.
         mbs: Microbatch size
         seq_length_key: Key for sequence lengths in data dict (auto-detected if None)
         mtp_enabled: Whether the model uses multi-token prediction layers.
@@ -291,9 +302,7 @@ def get_microbatch_iterator(
         pad_factor = _get_non_packed_sequence_pad_factor(cfg)
 
     if prepacked:
-        create_packed_seq_padding_mask = bool(
-            cfg["megatron_cfg"].get("moe_router_enable_expert_bias", False)
-        )
+        create_packed_seq_padding_mask = model_config.moe_router_enable_expert_bias
         raw_iterator = data.make_microbatch_iterator(1)
         data_iterator_len = data.size
         micro_batch_size = 1
@@ -340,6 +349,10 @@ def get_microbatch_iterator(
         delegate_mtp_loss_mask_to_model=delegate_mtp_loss_mask_to_model,
         model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
         mtp_enabled=mtp_enabled,
+        create_router_padding_mask=(
+            model_config.moe_router_enable_expert_bias
+            and model_config.moe_router_bias_update_rate != 0
+        ),
     )
 
     # Compute padded sequence length for pipeline parallelism
@@ -518,6 +531,7 @@ def process_microbatch(
     delegate_mtp_loss_mask_to_model: bool = False,
     model_slices_context_parallel_inputs: bool = False,
     straggler_timer: Optional[StragglerDetector] = None,
+    create_router_padding_mask: bool = False,
     create_packed_seq_padding_mask: bool = False,
     prepad_packed_seq_for_hybridep: bool = False,
     mtp_enabled: bool = False,
@@ -536,6 +550,20 @@ def process_microbatch(
     if prepad_packed_seq_for_hybridep and delegate_pack_to_model:
         raise NotImplementedError(
             "HybridEP input prepadding requires NeMo-owned sequence packing."
+        )
+    if create_router_padding_mask and (
+        delegate_pack_to_model
+        or (
+            pack_sequences
+            and model_slices_context_parallel_inputs
+            and not prepacked
+            and get_context_parallel_world_size() > 1
+        )
+        or (not pack_sequences and get_context_parallel_world_size() > 1)
+    ):
+        raise NotImplementedError(
+            "Router exclusion supports dense CP1, NeMo-sharded packing, "
+            "or prepacked inputs."
         )
     ctx = straggler_timer(bdata=True) if straggler_timer is not None else nullcontext()
     with ctx:
@@ -999,6 +1027,52 @@ def process_microbatch(
                 media_token_validity_mask = data_dict[
                     "media_token_validity_mask"
                 ].bool()
+    if create_router_padding_mask:
+        if "input_lengths" not in data_dict:
+            raise ValueError("Router exclusion requires explicit input_lengths")
+        lengths = seq_lengths if pack_sequences else data_dict["input_lengths"]
+        artificial_inputs = data_dict.get(IS_ARTIFICIAL_INPUT)
+        if prepacked:
+            # A transported row is one physical pack, containing multiple sources.
+            cu = packed_seq_params.cu_seqlens_q
+            lengths = cu[1:] - cu[:-1]
+            if artificial_inputs is not None:
+                artificial_inputs = artificial_inputs.expand_as(lengths)
+        boundaries = cu_seqlens_padded
+        if pack_sequences and boundaries is None:
+            boundaries = cu_seqlens
+        physical_mask = get_router_padding_mask(
+            lengths, input_ids.shape[1], cu_seqlens_padded=boundaries
+        )
+        router_mask = get_router_padding_mask(
+            lengths,
+            input_ids.shape[1],
+            artificial_inputs=artificial_inputs,
+            cu_seqlens_padded=boundaries,
+        )
+        if (
+            pack_sequences
+            and get_context_parallel_world_size() > 1
+            and not model_slices_context_parallel_inputs
+        ):
+            if prepacked:
+                router_mask = _slice_prepacked_for_cp(router_mask, boundaries)
+                physical_mask = _slice_prepacked_for_cp(physical_mask, boundaries)
+            else:
+                indices = get_packed_seq_cp_partition_indices(
+                    packed_seq_params,
+                    total_tokens=input_ids.shape[1],
+                    cp_size=get_context_parallel_world_size(),
+                    cp_rank=get_context_parallel_rank(),
+                    device=input_ids.device,
+                )
+                router_mask = router_mask.index_select(1, indices).contiguous()
+                physical_mask = physical_mask.index_select(1, indices).contiguous()
+        padding_mask = router_mask
+        # Borrowed rows still need their image embeddings. Router participation
+        # must never become the model's fallback for media anchor validity.
+        if model_slices_context_parallel_inputs and media_token_validity_mask is None:
+            media_token_validity_mask = ~physical_mask
     return ProcessedInputs(
         input_ids=input_ids,
         input_ids_cp_sharded=input_ids_cp_sharded,

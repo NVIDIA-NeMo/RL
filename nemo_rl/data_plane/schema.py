@@ -34,6 +34,8 @@ ROLLOUT_METRICS = "rollout_metrics"
 INPUT_IDS = "input_ids"
 INPUT_LENGTHS = "input_lengths"
 SAMPLE_MASK = "sample_mask"
+# Row provenance in KVBatchMeta.tags; restored when the payload is materialized.
+IS_ARTIFICIAL_INPUT = "is_artificial_input"
 MASK_SAMPLE = "mask_sample"
 TRUNCATED = "truncated"
 META_IDX = "meta_idx"
