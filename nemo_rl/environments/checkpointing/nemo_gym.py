@@ -61,6 +61,35 @@ _GYM_CHECKPOINT_DEADLINE_HOLDER = "gym_checkpoint"
 _GYM_EPISODE_SAMPLE_SIZE = 5
 
 
+@dataclass(frozen=True)
+class GenerationCutFence:
+    """Holds terminal token-capture writes on every generation worker.
+
+    Decoding continues; only terminal staging waits, so the TQ cut and Gym's
+    generation cut see the same live calls.
+    """
+
+    generation: Any
+    timeout_s: Optional[float]
+
+    @contextlib.asynccontextmanager
+    async def held(self) -> AsyncIterator[None]:
+        try:
+            await asyncio.to_thread(
+                self.generation.begin_token_capture_snapshot_fence,
+                timeout_s=self.timeout_s,
+            )
+            yield
+        finally:
+            # Idempotent, so it also releases workers a failed begin had
+            # already fenced. A failed release keeps the error it interrupted
+            # as its __context__.
+            await asyncio.to_thread(
+                self.generation.end_token_capture_snapshot_fence,
+                timeout_s=self.timeout_s,
+            )
+
+
 def _summarize_gym_episodes(
     episodes_by_instance: Mapping[str, Iterable[Any]],
 ) -> str:
@@ -85,8 +114,13 @@ def build_gym_environment_checkpoint(
     env_handles: dict[str, Any],
     rollout_manager: RolloutManager,
     dp_client: Any,
+    generation: Any = None,
 ) -> GymEnvironmentCheckpoint:
-    """Build the Gym checkpoint and close Gym dispatch through its admission gate."""
+    """Build the Gym checkpoint and close Gym dispatch through its admission gate.
+
+    ``generation`` is required with prefix recovery: its workers' terminal
+    capture writes are fenced across each snapshot.
+    """
     staging_partition = master_config.token_capture.staging_partition
 
     async def list_staging_keys() -> list[str]:
@@ -97,6 +131,16 @@ def build_gym_environment_checkpoint(
             partition_id=staging_partition,
         )
 
+    generation_fence: Optional[GenerationCutFence] = None
+    if master_config.rollout_recovery.generation_prefix_cuts_enabled:
+        if generation is None:
+            raise ValueError(
+                "prefix rollout recovery needs the generation handle to fence "
+                "terminal token-capture writes across a snapshot"
+            )
+        generation_fence = GenerationCutFence(
+            generation, master_config.token_capture.control_timeout_s
+        )
     environment_checkpoint = GymEnvironmentCheckpoint(
         GymCheckpointCoordinator(
             as_nemo_gym_shard_set(env_handles["nemo_gym"]),
@@ -109,6 +153,7 @@ def build_gym_environment_checkpoint(
         allow_restart_only_servers=(
             master_config.rollout_recovery.allow_restart_only_gym_servers
         ),
+        generation_fence=generation_fence,
     )
     rollout_manager.set_rollout_dispatch_admission_gate(
         environment_checkpoint.admission_gate
@@ -128,7 +173,7 @@ class GymEnvironmentSnapshot:
     def restarted_rollouts(self) -> int:
         return sum(len(episodes) for episodes in self.commit.manifest.restarts.values())
 
-    async def check_against_cut(self, cut: DataPlaneMutationCut) -> None:
+    async def check_against_cut(self, cut: DataPlaneMutationCut) -> frozenset[str]:
         """Require Gym ownership and referenced staging rows to match this cut.
 
         Gym may have exported episodes RL dropped while it was prepared: it
@@ -136,6 +181,10 @@ class GymEnvironmentSnapshot:
         They and their staged rows are left out of the saved manifest, since
         restore requires it to match RL's inventory and RL no longer continues
         them; a dropped group may already have cleaned those rows up.
+
+        Returns the staging rows the saved manifest keeps, which the TQ capture
+        must hold. ``commit`` still names the dropped episodes' rows, so callers
+        must use these instead.
         """
         cut.require_live()
         checkpoint, commit = self.checkpoint, self.commit
@@ -191,9 +240,11 @@ class GymEnvironmentSnapshot:
                 ),
             )
 
-        expected_staging_keys = {key for keys in staging_keys.values() for key in keys}
+        expected_staging_keys = frozenset(
+            key for keys in staging_keys.values() for key in keys
+        )
         if not expected_staging_keys:
-            return
+            return expected_staging_keys
         actual_staging_keys = set(await checkpoint._list_staging_keys())
         missing = sorted(expected_staging_keys - actual_staging_keys)
         if missing:
@@ -201,6 +252,7 @@ class GymEnvironmentSnapshot:
                 "Gym checkpoint references staging rows missing from live TQ state: "
                 f"missing={missing[:10]!r} (total={len(missing)})"
             )
+        return expected_staging_keys
 
     def metrics(self, paused_seconds: float) -> dict[str, float]:
         return {
@@ -221,6 +273,7 @@ class GymEnvironmentCheckpoint:
         rollout_manager: Any,
         list_staging_keys: Callable[[], Awaitable[Iterable[str]]],
         allow_restart_only_servers: bool = False,
+        generation_fence: Optional[GenerationCutFence] = None,
     ) -> None:
         """Wrap ``coordinator``.
 
@@ -232,12 +285,15 @@ class GymEnvironmentCheckpoint:
                 to check the ones the committed episodes reference still exist.
             allow_restart_only_servers: Accept Gym servers whose rollouts start
                 over after a crash, with a warning, instead of refusing them.
+            generation_fence: Holds terminal capture writes from before Gym
+                parks until after it resumes; set with prefix recovery.
         """
         self.coordinator = coordinator
         self._ledger = ledger
         self._rollout_manager = rollout_manager
         self._list_staging_keys = list_staging_keys
         self._allow_restart_only_servers = allow_restart_only_servers
+        self._generation_fence = generation_fence
         # Separate from the data-plane barrier: it pauses only Gym /run
         # submissions while a Gym checkpoint is prepared.
         self.admission_gate = DataPlaneCheckpointBarrier()
@@ -444,7 +500,12 @@ class GymEnvironmentCheckpoint:
             else f"rollout-{uuid.uuid4().hex}"
         )
         coordinator = self.coordinator
-        async with self.admission_gate.checkpoint():
+        async with (
+            self._generation_fence.held()
+            if self._generation_fence is not None
+            else contextlib.nullcontext(),
+            self.admission_gate.checkpoint(),
+        ):
             # Gym parks every live rollout until resume, so the wait must not
             # count against their deadlines. A separate holder keeps a
             # colocated engine's own pause intact when this one ends.

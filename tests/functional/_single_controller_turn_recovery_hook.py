@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Test-only SC entrypoint that records turn-recovery ownership.
+"""Test-only SC entrypoint that records Gym-recovery ownership.
 
 Gym's policy calls go through ``_gym_policy_proxy``, which holds the first one
 carrying a tool result when ``SC_TURN_RECOVERY_HOLD_FIRST_TOOL_RESULT=1``, so
@@ -88,13 +88,13 @@ class _InstrumentedNemoGymRolloutImpl:
         dispatch_recorder: Any = None,
     ) -> Any:
         if rollout_ids is None or generation_indices is None or on_completion is None:
-            raise RuntimeError("turn recovery hook requires token capture")
+            raise RuntimeError("Gym recovery hook requires token capture")
         if environment_instance_id is None:
-            raise RuntimeError("turn recovery hook requires a Gym checkpoint owner")
+            raise RuntimeError("Gym recovery hook requires a Gym checkpoint owner")
         if dispatch_recorder is None:
-            raise RuntimeError("turn recovery hook requires a dispatch recorder")
+            raise RuntimeError("Gym recovery hook requires a dispatch recorder")
 
-        group = find_group(self._recovery_ledger, rollout_ids, hook="turn")
+        group = find_group(self._recovery_ledger, rollout_ids, hook="Gym")
         indices = list(generation_indices)
         common = {
             "group_id": group.group_id,
@@ -237,11 +237,14 @@ sc_setup._spinup_gym = _spinup_gym_behind_policy_proxy
 _original_setup_single_controller = run_grpo_single_controller.setup_single_controller
 
 
-def _setup_with_turn_recovery_hook(*args: Any, **kwargs: Any) -> Any:
+def _setup_with_gym_recovery_hook(*args: Any, **kwargs: Any) -> Any:
     actor_args, timing_metrics = _original_setup_single_controller(*args, **kwargs)
     manager = actor_args.rollout_manager
     impl = manager._impl
-    events_path = Path(os.environ["SC_TURN_RECOVERY_TEST_EVENTS"])
+    events_path = Path(
+        os.environ.get("SC_GYM_RECOVERY_TEST_EVENTS")
+        or os.environ["SC_TURN_RECOVERY_TEST_EVENTS"]
+    )
     instrumented = _InstrumentedNemoGymRolloutImpl(
         impl,
         recovery_ledger=manager.recovery_ledger,
@@ -252,13 +255,13 @@ def _setup_with_turn_recovery_hook(*args: Any, **kwargs: Any) -> Any:
         ledger, events_path=events_path
     ).prepare_for_restart
     # Patch the instance method rather than replacing ``_impl``: RolloutManager
-    # gates checkpoint admission and turn recovery on
+    # gates checkpoint admission and Gym recovery on
     # ``isinstance(self._impl, AsyncNemoGymRolloutImpl)``.
     impl.run_rollout = instrumented.run_rollout
     return actor_args, timing_metrics
 
 
-run_grpo_single_controller.setup_single_controller = _setup_with_turn_recovery_hook
+run_grpo_single_controller.setup_single_controller = _setup_with_gym_recovery_hook
 
 
 if __name__ == "__main__":

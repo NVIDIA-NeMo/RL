@@ -833,6 +833,19 @@ def _spinup_gym(
     policy_config = master_config.policy
     generation_config = policy_config["generation"]
     enable_router_replay = router_replay_enabled(policy_config)
+    # Capture transport config includes the generation request's candidate count.
+    token_capture = (
+        {
+            **master_config.token_capture.model_dump(),
+            "top_logprobs": generation_config["top_logprobs"],
+        }
+        if master_config.token_capture.enabled
+        else None
+    )
+    if token_capture is not None:
+        token_capture["generation_prefix_cuts_enabled"] = (
+            master_config.rollout_recovery.generation_prefix_cuts_enabled
+        )
     shard_set = build_nemo_gym_actors(
         master_config.env,
         base_urls=base_urls,
@@ -844,15 +857,8 @@ def _spinup_gym(
         turn_checkpointing_enabled=(
             master_config.rollout_recovery.turn_checkpointing_enabled
         ),
-        # Capture transport config includes the generation request's candidate count.
-        token_capture=(
-            {
-                **master_config.token_capture.model_dump(),
-                "top_logprobs": generation_config["top_logprobs"],
-            }
-            if master_config.token_capture.enabled
-            else None
-        ),
+        # Ledger config rides into Gym's policy model server.
+        token_capture=token_capture,
     )
     return shard_set, time.perf_counter() - t0
 
@@ -1203,15 +1209,18 @@ def setup_single_controller(
     rollout_checkpoint_cfg = master_config.rollout_checkpointing
     snapshots_enabled = rollout_snapshots_enabled(master_config)
     if master_config.rollout_recovery.turn_checkpointing_enabled:
+        recovery_target = master_config.rollout_recovery.target_level.value
         if generation_config["backend"] != "vllm":
             raise NotImplementedError(
-                "rollout_recovery.target_level='turn' currently supports only "
+                f"rollout_recovery.target_level={recovery_target!r} currently "
+                "supports only "
                 "the vllm generation backend; "
                 f"got {generation_config['backend']!r}"
             )
         if not should_use_nemo_gym(master_config):
             raise ValueError(
-                "rollout_recovery.target_level='turn' requires the NeMo-Gym "
+                f"rollout_recovery.target_level={recovery_target!r} requires "
+                "the NeMo-Gym "
                 "rollout path (env.should_use_nemo_gym=true)"
             )
         if (
@@ -1220,19 +1229,20 @@ def setup_single_controller(
             and master_config.checkpointing.get("checkpoint_must_save_by") is None
         ):
             raise ValueError(
-                "rollout_recovery.target_level='turn' would never save environment "
-                "state: set rollout_checkpointing.snapshot_on_trainer_checkpoint=true, "
+                f"rollout_recovery.target_level={recovery_target!r} would never save "
+                "environment state: set "
+                "rollout_checkpointing.snapshot_on_trainer_checkpoint=true, "
                 "rollout_checkpointing.snapshot_attempt_interval_s, or "
                 "checkpointing.checkpoint_must_save_by"
             )
         if not master_config.token_capture.enabled:
             raise ValueError(
-                "rollout_recovery.target_level='turn' requires "
+                f"rollout_recovery.target_level={recovery_target!r} requires "
                 "token_capture.enabled=true"
             )
         if rollout_checkpoint_cfg.restore_mode != "latest":
             raise ValueError(
-                "rollout_recovery.target_level='turn' requires "
+                f"rollout_recovery.target_level={recovery_target!r} requires "
                 "rollout_checkpointing.restore_mode='latest'"
             )
     if (
@@ -1363,6 +1373,23 @@ def setup_single_controller(
             "MInf routing indices can be joined with Gym lineage"
         )
     capture_media = token_capture_cfg.enabled and processor is not None
+    generation_prefix_cuts_enabled = (
+        master_config.rollout_recovery.generation_prefix_cuts_enabled
+    )
+    if generation_prefix_cuts_enabled:
+        if generation_config["backend"] != "vllm":
+            raise NotImplementedError(
+                "generation-prefix recovery currently supports only the vLLM "
+                f"generation backend; got {generation_config['backend']!r}"
+            )
+        if capture_media:
+            raise NotImplementedError(
+                "generation-prefix recovery does not yet support multimodal capture"
+            )
+        if router_replay_enabled(master_config.policy):
+            raise NotImplementedError(
+                "generation-prefix recovery does not yet support router replay"
+            )
     if capture_media:
         if not uses_image_placeholder(processor):
             raise ValueError(
@@ -2263,6 +2290,9 @@ def setup_single_controller(
             token_capture_cfg.staging_partition,
             capture_media=capture_media,
             top_logprobs=master_config.policy["generation"]["top_logprobs"],
+            generation_prefix_cuts_enabled=generation_prefix_cuts_enabled,
+            generation_cut_control_token=token_capture_cfg.control_auth_token,
+            generation_cut_control_timeout_s=token_capture_cfg.control_timeout_s,
         )
         if capture_media and media_columns is None:
             raise RuntimeError(

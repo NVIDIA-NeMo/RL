@@ -34,12 +34,14 @@ def build_environment_checkpoint(
     env_handles: dict[str, Any],
     rollout_manager: RolloutManager,
     dp_client: Any,
+    generation: Any = None,
 ) -> EnvironmentCheckpoint:
     """Return the environment checkpoint this run's config asks for.
 
-    Only turn-level recovery keeps environment state, and setup already
-    requires NeMo Gym for it. A new backend that keeps rollout state adds its
-    branch here.
+    Only turn- and prefix-level recovery keep environment state, and setup
+    already requires NeMo Gym for them. ``generation`` is the policy's
+    generation handle; prefix recovery fences its workers across each snapshot.
+    A new backend that keeps rollout state adds its branch here.
     """
     if not master_config.rollout_recovery.turn_checkpointing_enabled:
         return NoEnvironmentCheckpoint()
@@ -52,4 +54,5 @@ def build_environment_checkpoint(
         env_handles=env_handles,
         rollout_manager=rollout_manager,
         dp_client=dp_client,
+        generation=generation,
     )

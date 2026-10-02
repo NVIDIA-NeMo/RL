@@ -31,6 +31,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 from nemo_rl.environments.checkpointing import build_environment_checkpoint
 from nemo_rl.environments.checkpointing.interfaces import NoEnvironmentCheckpoint
 from nemo_rl.environments.checkpointing.nemo_gym import (
+    GenerationCutFence,
     GymEnvironmentCheckpoint,
     _summarize_gym_episodes,
 )
@@ -522,6 +523,59 @@ def test_turn_checkpoint_commits_owned_gym_episode_before_tq_cut(
     asyncio.run(exercise())
 
 
+def test_prefix_checkpoint_fences_terminal_writes_through_tq_cut(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        ledger = RolloutRecoveryLedger()
+        async with DataPlaneCheckpointBarrier().mutation() as cut:
+            group = _dispatched_turn_group(ledger, cut, generations=1)
+
+        actor = FakeGymActor()
+        fence_timeouts: list[float | None] = []
+
+        class FakeGeneration:
+            def begin_token_capture_snapshot_fence(self, *, timeout_s=None):
+                fence_timeouts.append(timeout_s)
+                actor.mark("generation-fence")
+                return True
+
+            def end_token_capture_snapshot_fence(self, *, timeout_s=None):
+                fence_timeouts.append(timeout_s)
+                actor.mark("generation-release")
+                return True
+
+        gym = gym_environment_checkpoint(
+            gym_coordinator(actor),
+            ledger,
+            generation_fence=GenerationCutFence(FakeGeneration(), 17.0),
+        )
+
+        async with snapshot_commit(gym, tmp_path, checkpoint_id="save-prefix-1"):
+            async with DataPlaneCheckpointBarrier().checkpoint():
+                actor.mark("tq-cut")
+
+        # Terminal writes stay fenced from before Gym parks until after it resumes.
+        assert actor.operations() == [
+            "generation-fence",
+            "prepare",
+            "renew",
+            "commit",
+            "tq-cut",
+            "resume",
+            "generation-release",
+        ]
+        assert fence_timeouts == [17.0, 17.0]
+        (commit_call,) = [call for call in actor.calls if call[0] == "commit"]
+        assert commit_call[1] == (
+            "save-prefix-1",
+            str(tmp_path),
+            (group.environment_episode(0),),
+        )
+
+    asyncio.run(exercise())
+
+
 class TestGymCheckpointPausesRolloutDeadlines:
     """Parked rollouts cannot progress, so a checkpoint must not use up their budget."""
 
@@ -891,6 +945,49 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
 
         asyncio.run(exercise())
 
+    def test_the_tq_capture_expects_only_the_kept_episodes_rows(
+        self, tmp_path: Path
+    ) -> None:
+        """The TQ capture must not expect the rows of an episode RL dropped."""
+
+        async def exercise() -> None:
+            barrier = DataPlaneCheckpointBarrier()
+            ledger = RolloutRecoveryLedger()
+            async with barrier.mutation() as cut:
+                group = _dispatched_turn_group(ledger, cut)
+            row_0, row_1 = (group.environment_episode(index) for index in (0, 1))
+            key_0 = f"{row_0.rollout_id}/call-0"
+            key_1 = f"{row_1.rollout_id}/call-0"
+            coordinator = gym_coordinator(
+                FakeGymActor(
+                    live={row_0, row_1},
+                    while_prepared=lambda: self._drop(
+                        ledger, barrier, group.group_id, [1]
+                    ),
+                    staging_keys_by_episode={row_0: (key_0,), row_1: (key_1,)},
+                )
+            )
+
+            async def list_staging_keys() -> list[str]:
+                return [key_0]
+
+            gym = gym_environment_checkpoint(
+                coordinator, ledger, list_staging_keys=list_staging_keys
+            )
+
+            async def save() -> frozenset[str]:
+                async with gym.snapshot(tmp_path, checkpoint_id="save-1") as snapshot:
+                    assert snapshot is not None
+                    async with barrier.checkpoint() as cut:
+                        return await snapshot.check_against_cut(cut)
+
+            kept = await asyncio.wait_for(save(), _ASYNC_TEST_TIMEOUT_S)
+
+            # The dropped row's staging is gone; expecting it would fail the cut.
+            assert kept == {key_0}
+
+        asyncio.run(exercise())
+
     def test_only_a_queued_drop_may_differ_from_the_saved_manifest(
         self, tmp_path: Path
     ) -> None:
@@ -980,10 +1077,11 @@ class _StagingClient:
         return ["staged-0"]
 
 
-def _builder_config(*, turn: bool) -> SimpleNamespace:
+def _builder_config(*, turn: bool, prefix: bool = False) -> SimpleNamespace:
     return SimpleNamespace(
         rollout_recovery=SimpleNamespace(
-            turn_checkpointing_enabled=turn,
+            turn_checkpointing_enabled=turn or prefix,
+            generation_prefix_cuts_enabled=prefix,
             gym_prepare_timeout_s=30.0,
             allow_restart_only_gym_servers=True,
         ),
@@ -991,6 +1089,31 @@ def _builder_config(*, turn: bool) -> SimpleNamespace:
             staging_partition="rollout_staging", control_timeout_s=5.0
         ),
     )
+
+
+def test_build_fences_the_generation_workers_for_prefix_recovery() -> None:
+    generation = object()
+
+    built = build_environment_checkpoint(
+        _builder_config(turn=False, prefix=True),  # type: ignore[arg-type]
+        env_handles={"nemo_gym": FakeGymActor()},
+        rollout_manager=_GateRecordingManager(),  # type: ignore[arg-type]
+        dp_client=_StagingClient(),
+        generation=generation,
+    )
+
+    assert isinstance(built, GymEnvironmentCheckpoint)
+    assert built._generation_fence == GenerationCutFence(generation, 5.0)
+
+
+def test_build_refuses_prefix_recovery_without_a_generation_handle() -> None:
+    with pytest.raises(ValueError, match="needs the generation handle"):
+        build_environment_checkpoint(
+            _builder_config(turn=False, prefix=True),  # type: ignore[arg-type]
+            env_handles={"nemo_gym": FakeGymActor()},
+            rollout_manager=_GateRecordingManager(),  # type: ignore[arg-type]
+            dp_client=_StagingClient(),
+        )
 
 
 def test_build_keeps_no_environment_state_without_turn_recovery() -> None:
@@ -1024,5 +1147,6 @@ def test_build_wires_gym_for_turn_recovery() -> None:
     assert manager.gates == [built.admission_gate]
     assert built._ledger is manager.recovery_ledger
     assert built._allow_restart_only_servers is True
+    assert built._generation_fence is None
     assert asyncio.run(built._list_staging_keys()) == ["staged-0"]
     assert client.partitions == ["rollout_staging"]

@@ -162,6 +162,10 @@ def _install_fake_vllm(monkeypatch):
     )
     module("vllm.renderers.online_renderer", OnlineRenderer=_OnlineRenderer)
     module("vllm.renderers.hf", HfRenderer=placeholder("HfRenderer"))
+    module(
+        "vllm.sampling_params",
+        RequestOutputKind=type("RequestOutputKind", (), {"DELTA": "delta"}),
+    )
 
     class ValidationError(ValueError):
         def __init__(self, message, **kwargs):
@@ -566,7 +570,9 @@ def test_prefix_splice_remaps_image_once(monkeypatch, capture_media):
     }
     captured = []
     admission = (
-        SimpleNamespace(mode="token_in", prev_len=4, request_replay=None)
+        SimpleNamespace(
+            mode="token_in", prev_len=4, request_replay=None, generation_cut=None
+        )
         if capture_media
         else None
     )

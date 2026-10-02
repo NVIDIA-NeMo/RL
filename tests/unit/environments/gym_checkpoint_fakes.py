@@ -29,7 +29,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
 
-from nemo_rl.environments.checkpointing.nemo_gym import GymEnvironmentCheckpoint
+from nemo_rl.environments.checkpointing.nemo_gym import (
+    GenerationCutFence,
+    GymEnvironmentCheckpoint,
+)
 from nemo_rl.environments.gym_checkpoint_adapter import (
     GymCheckpointCommitSummary,
     GymCheckpointEpisode,
@@ -245,6 +248,7 @@ def gym_environment_checkpoint(
     manager: Optional[Any] = None,
     list_staging_keys: Callable[[], Awaitable[list[str]]] = no_staging_keys,
     allow_restart_only_servers: bool = False,
+    generation_fence: Optional[GenerationCutFence] = None,
 ) -> GymEnvironmentCheckpoint:
     """Gym's checkpoint over ``coordinator``, with a stand-in rollout manager."""
     return GymEnvironmentCheckpoint(
@@ -253,6 +257,7 @@ def gym_environment_checkpoint(
         rollout_manager=manager if manager is not None else deadline_pausing_manager(),
         list_staging_keys=list_staging_keys,
         allow_restart_only_servers=allow_restart_only_servers,
+        generation_fence=generation_fence,
     )
 
 
