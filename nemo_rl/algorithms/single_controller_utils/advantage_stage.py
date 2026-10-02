@@ -276,6 +276,7 @@ class AdvantageOutcome:
     opd_stat_sum: float = 0.0
     opd_stat_sumsq: float = 0.0
     opd_stat_count: int = 0
+    opd_gap_sum: float = 0.0
 
 
 class AdvantageComputer:
@@ -460,11 +461,18 @@ class AdvantageComputer:
         opd_stat_sum = 0.0
         opd_stat_sumsq = 0.0
         opd_stat_count = 0
+        opd_gap_sum = 0.0
         if cfg.teacher_logprobs_required:
             valid = response_advantages.detach().double()
             opd_stat_sum = float(valid.sum())
             opd_stat_sumsq = float((valid * valid).sum())
             opd_stat_count = int(valid.numel())
+            # Pooled over the same tokens as the advantage; the gap metric must
+            # not change when TROPD or the global baseline reshapes the advantage.
+            raw_gap = torch.masked_select(
+                kwargs["teacher_logprobs"] - kwargs["prev_logprobs"], mask.bool()
+            )
+            opd_gap_sum = float(raw_gap.detach().double().sum())
 
         # OPD accumulates its statistics from the estimator output above. The
         # ordinary advantage metrics and policy training use the clipped values,
@@ -501,4 +509,5 @@ class AdvantageComputer:
             opd_stat_sum=opd_stat_sum,
             opd_stat_sumsq=opd_stat_sumsq,
             opd_stat_count=opd_stat_count,
+            opd_gap_sum=opd_gap_sum,
         )

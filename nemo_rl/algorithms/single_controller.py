@@ -270,16 +270,21 @@ def _percentile(values: list[float], quantile: float) -> float:
 
 
 def _pooled_opd_metrics(
-    stat_sum: float, stat_sumsq: float, count: int
+    stat_sum: float, stat_sumsq: float, count: int, gap_sum: float
 ) -> dict[str, float]:
-    """Compute whole-step OPD metrics from exact pooled sufficient statistics."""
+    """Compute whole-step OPD metrics from exact pooled sufficient statistics.
+
+    ``stat_*`` pool the advantage and ``gap_sum`` the raw teacher-student gap
+    over the same tokens. They differ once TROPD (proximal_teacher_alpha < 1)
+    or subtract_global_baseline reshapes the advantage.
+    """
     if count <= 0:
         return {}
     mean = stat_sum / count
     # OPDAdvantageEstimator uses torch.std's default unbiased estimator.
     variance = (stat_sumsq - count * mean * mean) / (count - 1) if count > 1 else 0.0
     return {
-        "on_policy_distillation/teacher_student_logprob_gap_mean": mean,
+        "on_policy_distillation/teacher_student_logprob_gap_mean": gap_sum / count,
         "on_policy_distillation/adv_mean": mean,
         "on_policy_distillation/adv_std": math.sqrt(max(variance, 0.0)),
     }
@@ -710,6 +715,7 @@ class SingleControllerActor:
             "seq_logprob_error_metrics": [],
             **{key: [] for key in VIOLATION_TAG_KEYS},
         }
+        self._opd_gap_sum = 0.0
         self._opd_stat_sum = 0.0
         self._opd_stat_sumsq = 0.0
         self._opd_stat_count = 0
@@ -3217,8 +3223,10 @@ class SingleControllerActor:
                         self._opd_stat_sum,
                         self._opd_stat_sumsq,
                         self._opd_stat_count,
+                        gap_sum=self._opd_gap_sum,
                     )
                 )
+                self._opd_gap_sum = 0.0
                 self._opd_stat_sum = 0.0
                 self._opd_stat_sumsq = 0.0
                 self._opd_stat_count = 0
@@ -5271,6 +5279,7 @@ class SingleControllerActor:
         self._opd_stat_sum += outcome.opd_stat_sum
         self._opd_stat_sumsq += outcome.opd_stat_sumsq
         self._opd_stat_count += outcome.opd_stat_count
+        self._opd_gap_sum += outcome.opd_gap_sum
 
     # ── utility helpers ────────────────────────────────────────────────────
 
