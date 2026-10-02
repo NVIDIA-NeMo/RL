@@ -196,9 +196,7 @@ def _make_master_config(
             "save_period": 10,
             "save_optimizer": False,
         },
-        logger=LoggerConfig.model_construct(
-            wandb_enabled=False, wandb=WandbConfig.model_construct()
-        ),
+        logger=LoggerConfig.model_construct(),
         cluster=ClusterConfig(num_nodes=2, gpus_per_node=8),
         loss_fn=loss_cfg if loss_cfg is not None else ClippedPGLossConfig(),
         env=env if env is not None else {},
@@ -1080,7 +1078,7 @@ class TestSetup:
                 "vllm_cfg": {"async_engine": True},
             }
         )
-        mc.logger = LoggerConfig.model_construct(log_dir=str(tmp_path / "logs"))
+        mc.logger = LoggerConfig(log_dir=str(tmp_path / "logs"))
         mc.token_capture.enabled = True
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0,

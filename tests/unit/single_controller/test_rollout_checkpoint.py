@@ -211,7 +211,7 @@ def test_bootstrap_fingerprint_ignores_default_operational_paths() -> None:
         "checkpointing": {"checkpoint_dir": "/run/one/checkpoints"},
         "rollout_checkpointing": {"snapshot_attempt_interval_s": 120},
         "cluster": {"num_nodes": 2},
-        "logger": LoggerConfig.model_construct(**{"log_dir": "/run/one"}),
+        "logger": LoggerConfig(log_dir="/run/one"),
     }
     operationally_changed = {
         **base,
@@ -240,7 +240,7 @@ def test_bootstrap_fingerprint_ignores_default_operational_paths() -> None:
         "checkpointing": {"checkpoint_dir": "/run/two/checkpoints"},
         "rollout_checkpointing": {"snapshot_attempt_interval_s": 300},
         "cluster": {"num_nodes": 8},
-        "logger": LoggerConfig.model_construct(**{"log_dir": "/run/two"}),
+        "logger": LoggerConfig(log_dir="/run/two"),
     }
 
     fingerprint = bootstrap_fingerprint(cast(Any, _DumpedConfig(base)))

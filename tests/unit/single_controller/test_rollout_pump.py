@@ -1387,16 +1387,7 @@ def test_rollout_pump_writes_expected_tq_data(
             max_inflight_prompts=num_prompts,
             max_buffered_rollouts=num_prompts,
         ),
-        logger=LoggerConfig.model_construct(
-            **{
-                "log_dir": str(tmp_path / "logs"),
-                "wandb_enabled": False,
-                "swanlab_enabled": False,
-                "tensorboard_enabled": False,
-                "mlflow_enabled": False,
-                "monitor_gpus": False,
-            }
-        ),
+        logger=LoggerConfig(log_dir=str(tmp_path / "logs"), monitor_gpus=False),
         # Actor __init__ builds a CheckpointManager + TimeoutChecker from
         # this block; enabled=False keeps the run write-free.
         checkpointing={

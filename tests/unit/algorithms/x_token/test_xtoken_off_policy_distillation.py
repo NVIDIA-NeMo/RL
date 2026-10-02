@@ -208,7 +208,7 @@ def _make_master_config(
                 "shuffle": False,
                 "num_workers": 0,
             },
-            "logger": LoggerConfig.model_construct(**{"log_dir": "/tmp/logger"}),
+            "logger": LoggerConfig(log_dir="/tmp/logger"),
             "cluster": ClusterConfig(num_nodes=1, gpus_per_node=1),
             "checkpointing": {
                 "enabled": save_enabled,

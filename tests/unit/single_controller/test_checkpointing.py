@@ -110,7 +110,7 @@ from nemo_rl.experience.route_plan import (
     encode_route_plan,
 )
 from nemo_rl.utils.checkpoint import CheckpointManager
-from nemo_rl.utils.logger import WandbConfig, TELEMETRY_WALL_TIME_METRIC, LoggerConfig
+from nemo_rl.utils.logger import TELEMETRY_WALL_TIME_METRIC, LoggerConfig
 
 # Reuse the factory patches from the setup tests (same cross-module fixture
 # import pattern as test_rollout_pump.py).
@@ -718,16 +718,7 @@ def _actor_master_config(
             num_generations_per_prompt=2,
             seed=42,
         ),
-        logger=LoggerConfig.model_construct(
-            **{
-                "log_dir": str(tmp_path / "logs"),
-                "wandb_enabled": False,
-                "swanlab_enabled": False,
-                "tensorboard_enabled": False,
-                "mlflow_enabled": False,
-                "monitor_gpus": False,
-            }
-        ),
+        logger=LoggerConfig(log_dir=str(tmp_path / "logs"), monitor_gpus=False),
         cluster=ClusterConfig(num_nodes=1, gpus_per_node=1),
         checkpointing={
             "enabled": enabled,
@@ -2577,9 +2568,7 @@ def _setup_master_config(checkpoint_dir: str) -> MasterConfig:
             val_at_start=False,
             val_at_end=False,
         ),
-        logger=LoggerConfig.model_construct(
-            wandb_enabled=False, wandb=WandbConfig.model_construct()
-        ),
+        logger=LoggerConfig.model_construct(),
         policy={
             "train_global_batch_size": 8,
             "max_total_sequence_length": 32,

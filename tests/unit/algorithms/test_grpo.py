@@ -543,11 +543,7 @@ def mock_grpo_components():
                 "save_period": 10,
             },
             "cluster": ClusterConfig(num_nodes=1, gpus_per_node=2),
-            "logger": LoggerConfig.model_construct(
-                **{
-                    "num_val_samples_to_print": 5,
-                }
-            ),
+            "logger": LoggerConfig.model_construct(num_val_samples_to_print=5),
             "data": {
                 "use_multiple_dataloader": False,
             },

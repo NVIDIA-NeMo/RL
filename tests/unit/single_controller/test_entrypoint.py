@@ -38,7 +38,7 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         },
         env={},
         data_plane={"enabled": True, "impl": "transfer_queue", "backend": "simple"},
-        logger=LoggerConfig.model_construct(**{"log_dir": "/tmp/logs"}),
+        logger=LoggerConfig(log_dir="/tmp/logs"),
         checkpointing={"enabled": False},
         async_rl=SimpleNamespace(
             stall_watchdog=SimpleNamespace(interval_s=30.0, stall_timeout_s=600.0),
