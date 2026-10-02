@@ -713,6 +713,37 @@ class RolloutRecoveryLedger:
                 attempt.gym_instance_id = gym_instance_id
             attempt.status = RolloutAttemptStatus.DISPATCHED
 
+    def release_refused_dispatch(
+        self,
+        cut: DataPlaneMutationCut,
+        group_id: str,
+        *,
+        generation_index: int,
+    ) -> None:
+        """Return one attempt Gym refused at admission to reserved.
+
+        Gym refuses a ``/run`` before recording anything for its episode, so the
+        attempt keeps its identity and is re-dispatched as-is. A fresh attempt
+        leaves the Gym checkpoint inventory until then. A restored turn
+        (``gym_attempt > 0``) stays Gym-owned while reserved, so the next
+        checkpoint carries its committed continuation forward.
+        """
+        cut.require_live()
+        record = self._require_group(group_id)
+        if record.status != PromptGroupStatus.GENERATING:
+            raise ValueError(
+                f"cannot release a refused dispatch of group {group_id!r} from "
+                f"{record.status.value!r}"
+            )
+        attempt = self._require_sibling(record, generation_index).current_attempt
+        if attempt.status != RolloutAttemptStatus.DISPATCHED:
+            raise ValueError(
+                "only a dispatched rollout attempt can be refused: "
+                f"{record.logical_rollout_id(generation_index)!r} is "
+                f"{attempt.status.value!r}"
+            )
+        attempt.status = RolloutAttemptStatus.RESERVED
+
     def mark_sibling_sealed(
         self,
         cut: DataPlaneMutationCut,

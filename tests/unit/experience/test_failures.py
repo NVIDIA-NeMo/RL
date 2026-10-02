@@ -28,10 +28,11 @@ from multidict import CIMultiDict, CIMultiDictProxy
 from ray import cloudpickle as ray_cloudpickle
 from yarl import URL
 
-from nemo_rl.environments.nemo_gym import _typed_gym_failure
+from nemo_rl.environments.nemo_gym import _gym_failure_row_error, _typed_gym_failure
 from nemo_rl.experience.failures import (
     FailureClass,
     GenerationUnavailable,
+    GymCheckpointParked,
     GymTransportError,
     NoHealthyShards,
     RolloutDataFailure,
@@ -282,3 +283,74 @@ class TestTheRayActorBoundary:
                 GymTransportError,
             )
             assert at_source is http_status_is_infra(status)
+
+
+def _gym_failure_row(
+    *,
+    status: int | None,
+    body: str | None = None,
+    failure_type: str = "ClientResponseError",
+) -> dict[str, object]:
+    """The ``result`` Gym's ``run_examples`` builds for a failed /run in sidecar mode."""
+    return {
+        "_ng_failure_class": "agent_run_error",
+        "_ng_failure_type": failure_type,
+        "_ng_failure_message": f"synthetic {status}",
+        "_ng_failure_http_status": status,
+        "_ng_failure_response_body": body,
+    }
+
+
+_PARKED_BODY = (
+    '{"error":{"code":"checkpoint_parked",'
+    '"detail":"agent admission is closed for a checkpoint"}}'
+)
+
+
+@pytest.mark.nemo_gym
+class TestGymFailureRowsKeepTheirRow:
+    """Sidecar failure rows map to the same typed failures, and a refusal names its row."""
+
+    def test_checkpoint_parked_names_its_row_and_survives_the_boundary(self):
+        failure = _gym_failure_row_error(
+            {"_rowidx": 3}, _gym_failure_row(status=409, body=_PARKED_BODY)
+        )
+
+        assert isinstance(failure, GymCheckpointParked)
+        restored = ray_cloudpickle.loads(ray_cloudpickle.dumps(failure))
+        assert isinstance(restored, GymCheckpointParked)
+        assert restored.rowidx == 3
+        assert "checkpoint_parked" in str(restored)
+        # A raise without a dispatch recorder is retried, never charged as data.
+        assert classify_rollout_failure(restored) is FailureClass.INFRA
+
+    def test_another_409_stays_a_data_failure(self):
+        body = '{"error":{"code":"stale_attempt","detail":"older attempt"}}'
+        failure = _gym_failure_row_error(
+            {"_rowidx": 0}, _gym_failure_row(status=409, body=body)
+        )
+        assert type(failure) is RolloutDataFailure
+
+    @pytest.mark.parametrize("status", [400, 404, 408, 429, 500, 503])
+    def test_http_failures_match_the_exception_path(self, status):
+        """Sidecar mode must not change how an ordinary /run failure is budgeted."""
+        failure = _gym_failure_row_error(
+            {"_rowidx": 0}, _gym_failure_row(status=status)
+        )
+        assert isinstance(failure, GymTransportError) is http_status_is_infra(status)
+        assert str(status) in str(failure)
+
+    def test_no_http_reply_is_transport_unless_the_reply_was_not_json(self):
+        transport = _gym_failure_row_error(
+            {"_rowidx": 0},
+            _gym_failure_row(status=None, failure_type="ServerDisconnectedError"),
+        )
+        undecodable = _gym_failure_row_error(
+            {"_rowidx": 0},
+            _gym_failure_row(status=None, failure_type="JSONDecodeError"),
+        )
+        assert isinstance(transport, GymTransportError)
+        assert type(undecodable) is RolloutDataFailure
+
+    def test_a_row_that_ran_is_not_a_failure(self):
+        assert _gym_failure_row_error({"_rowidx": 0}, {"reward": 1.0}) is None

@@ -69,9 +69,14 @@ class _TaskSourceResolvingRolloutHelper:
     """Mimic Gym's synchronous task_source-to-agent_ref resolution."""
 
     def run_examples(
-        self, examples: list[dict[str, Any]], head_server_config: str
+        self,
+        examples: list[dict[str, Any]],
+        head_server_config: str,
+        route_failures_to_sidecar: bool = False,
     ) -> list[Any]:
         assert head_server_config == "head-server"
+        # A failed /run must come back as its row so a refusal can name it.
+        assert route_failures_to_sidecar is True
         assert all("agent_ref" not in example for example in examples)
         for example in examples:
             example["agent_ref"] = {
@@ -83,9 +88,16 @@ class _TaskSourceResolvingRolloutHelper:
 
 class _TaskSourceResolvingRolloutHelperWithResult(_TaskSourceResolvingRolloutHelper):
     def run_examples(
-        self, examples: list[dict[str, Any]], head_server_config: str
+        self,
+        examples: list[dict[str, Any]],
+        head_server_config: str,
+        route_failures_to_sidecar: bool = False,
     ) -> list[Any]:
-        super().run_examples(examples, head_server_config)
+        super().run_examples(
+            examples,
+            head_server_config,
+            route_failures_to_sidecar=route_failures_to_sidecar,
+        )
 
         async def completed(example):
             return example, {}

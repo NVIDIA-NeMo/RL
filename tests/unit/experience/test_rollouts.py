@@ -2375,8 +2375,10 @@ def test_nemo_gym_rollout_record_persists_runtime_resolved_agent_ref():
         on_completion=None,
         recovery_granularity=RecoveryGranularity.SIBLING,
         gym_instance_id=None,
+        dispatch_recorder=None,
     ):
         del timer, timer_prefix, on_completion, recovery_granularity, gym_instance_id
+        del dispatch_recorder
         for row in inputs:
             row["agent_ref"] = resolved_agent_ref
         receipt_completion = SimpleNamespace(env_extras={"ng_receipt": {}})
@@ -2509,8 +2511,10 @@ def test_rollout_manager_rotates_replicas_and_reports_group_share():
         timer_prefix,
         *,
         on_completion,
+        dispatch_recorder=None,
+        parked_rows=None,
     ):
-        del total_rows, timer_prefix, on_completion
+        del total_rows, timer_prefix, on_completion, dispatch_recorder, parked_rows
         selected.append(environment)
         for row in pending:
             rowidx = row["_rowidx"]
