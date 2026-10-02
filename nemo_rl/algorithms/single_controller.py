@@ -173,6 +173,10 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lost
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.failures import RolloutStall
+from nemo_rl.experience.group_label_stats import (
+    GROUP_STATS_PREFIX,
+    reduce_group_label_stats,
+)
 from nemo_rl.experience.payload import VIOLATION_TAG_KEYS
 from nemo_rl.experience.rollout_manager import RolloutOutcome
 from nemo_rl.experience.rollout_recovery import (
@@ -3309,9 +3313,23 @@ class SingleControllerActor:
                     {
                         name: statistics.fmean(values)
                         for name, values in step_finalizer_metrics.items()
-                        if values
+                        if values and not name.startswith(GROUP_STATS_PREFIX)
                     }
                 )
+                # Per-harness / per-agent metrics: the groups' raw counts and sums
+                # add up over the step's groups before rates and means are taken.
+                try:
+                    step_metrics.update(
+                        reduce_group_label_stats(
+                            {
+                                name: math.fsum(values)
+                                for name, values in step_finalizer_metrics.items()
+                                if values and name.startswith(GROUP_STATS_PREFIX)
+                            }
+                        )
+                    )
+                except Exception as error:  # metrics must never fail a step
+                    log.warning("Skipping per-label group metrics: %s", error)
                 step_metrics.update(
                     reduce_advantage_pump_metrics(**self._step_log_dict)
                 )

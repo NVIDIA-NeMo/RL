@@ -504,6 +504,64 @@ def test_finalize_group_maps_physical_attempt_to_stable_canonical_id(
     assert _fetch_rows(tq_client, [canonical_id])["input_ids"] is not None
 
 
+def test_finalize_group_reports_per_label_group_stats(tq_client, partitions):
+    """Labelled groups carry raw per-harness / per-agent counts for the step."""
+    group_id = "grp_labels"
+    receipt, expected = _stage_fixture(
+        tq_client, "worked_example", rollout_id=f"{group_id}_g0"
+    )
+    receipt["rollout_id"] = f"{group_id}_g0"
+    finalizer = _finalizer(tq_client)
+    # Read-only rebuild of the same receipt, for the expected call count.
+    expected_calls = len(
+        finalizer.finalize_rollout(f"{group_id}_g0", receipt, reward=1.0).staging_keys
+    )
+    harness = ("harness", "claude_code_sandboxed_agent")
+    agent = ("agent", "swe_rebench_claude_code_sandboxed_agent")
+
+    finalized = finalizer.finalize_group(
+        group_id,
+        [f"{group_id}_g0", f"{group_id}_g1"],
+        [receipt, None],  # the second rollout lost its receipt -> placeholder
+        [1.0, 0.0],
+        mask_sample=[False, False],
+        fallback_weight_version=9,
+        prompt_idx=17,
+        group_labels=(harness, agent),
+        result_stats=(("harness_finished", 1.0, 2),),
+    )
+
+    metrics = finalized.metrics
+    prefix = "group_stats/harness/claude_code_sandboxed_agent/"
+    assert metrics[prefix + "groups"] == 1.0
+    assert metrics[prefix + "rollouts"] == 2.0
+    assert metrics[prefix + "trained"] == 1.0
+    assert metrics[prefix + "placeholders"] == 1.0
+    assert metrics[prefix + "reward_sum"] == 1.0
+    assert metrics[prefix + "all_reward_sum"] == 1.0
+    assert metrics[prefix + "gen_tokens_sum"] == sum(expected.token_mask)
+    assert metrics[prefix + "seq_len_sum"] == len(expected.token_ids)
+    assert metrics[prefix + "calls_sum"] == expected_calls
+    assert metrics[prefix + "result_sum/harness_finished"] == 1.0
+    assert metrics[prefix + "result_count/harness_finished"] == 2.0
+    agent_prefix = "group_stats/agent/swe_rebench_claude_code_sandboxed_agent/"
+    assert metrics[agent_prefix + "reward_sum"] == 1.0
+    assert not any(key.startswith(agent_prefix + "result_") for key in metrics)
+    # Unlabelled groups (every existing caller) add no such keys.
+    assert not any(
+        key.startswith("group_stats/")
+        for key in finalizer.finalize_group(
+            "grp_unlabelled",
+            ["grp_unlabelled_g0"],
+            [None],
+            [0.0],
+            mask_sample=[False],
+            fallback_weight_version=9,
+            prompt_idx=18,
+        ).metrics
+    )
+
+
 def test_finalize_group_reports_valid_and_total_row_counts(tq_client, partitions):
     """The finalizer reports validity; the controller owns replacement policy."""
     group_id = "grp2"

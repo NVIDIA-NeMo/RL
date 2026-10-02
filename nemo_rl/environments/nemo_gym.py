@@ -772,6 +772,41 @@ Depending on your data shape, you may want to change these values."""
                 entries[str(name)] = types
         return entries
 
+    def agent_implementations(self) -> Dict[str, str]:
+        """Map each agent entry Gym started to the agent implementation it runs.
+
+        An agent entry nests its server config under
+        ``responses_api_agents.<implementation>``; that key (for example
+        ``claude_code_sandboxed_agent``) is the harness every entry built on it
+        shares, which is what per-harness metrics group by. Read from Gym's
+        resolved config, as ``list_entries`` is, so entries loaded through
+        ``config_paths`` are included. An entry running several implementations
+        maps to their sorted names joined by ``+``.
+        """
+        if self.rh is None:
+            raise RuntimeError(
+                "agent_implementations() needs a running Gym stack; call _spinup() first."
+            )
+
+        from nemo_gym.global_config import get_global_config_dict
+        from omegaconf import DictConfig
+
+        implementations: Dict[str, str] = {}
+        for name, entry in get_global_config_dict().items():
+            if not isinstance(entry, (dict, DictConfig)):
+                continue
+            agents = entry.get("responses_api_agents")
+            if not isinstance(agents, (dict, DictConfig)):
+                continue
+            started = sorted(
+                str(key)
+                for key, server in agents.items()
+                if isinstance(server, (dict, DictConfig)) and "entrypoint" in server
+            )
+            if started:
+                implementations[str(name)] = "+".join(started)
+        return implementations
+
     @accepts_trace_context
     async def run_rollouts(
         self,

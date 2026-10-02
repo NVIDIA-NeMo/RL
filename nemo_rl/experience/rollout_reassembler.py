@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import time
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Optional, cast
 
@@ -56,6 +57,7 @@ from nemo_rl.data_plane.tq_token_sink import (
     TQTokenSink,
     TQTokenSource,
 )
+from nemo_rl.experience.group_label_stats import generated_runs, group_label_stats
 from nemo_rl.experience.payload import pack_payload
 from nemo_rl.experience.route_assembly import (
     ROUTE_MISSING_SENTINEL,
@@ -562,8 +564,15 @@ class RolloutReassembler:
         prompt_idx: int,
         loss_multiplier: float = 1.0,
         canonical_sample_ids: Optional[list[str]] = None,
+        group_labels: Sequence[tuple[str, str]] = (),
+        result_stats: Sequence[tuple[str, float, int]] = (),
     ) -> FinalizedGroup:
         """Publish exactly N canonical rows for one prompt group.
+
+        ``group_labels`` (``(scope, name)`` pairs, e.g. the group's harness and
+        agent) add the group's raw per-label counts and sums to the metrics of a
+        published group, and ``result_stats`` (``(field, sum, count)`` of its
+        numeric Gym result fields) ride along; see ``group_label_stats``.
 
         Blocking (TQ round trips); run via ``asyncio.to_thread`` from the
         dispatch task. ``fallback_weight_version`` stamps a group none of
@@ -853,6 +862,34 @@ class RolloutReassembler:
         metrics["row_assembly/tq_put_ms"] = _put_ms
         if not self._defer_routed_experts_to_policy:
             metrics["row_assembly/clear_staging_ms"] = _clear_ms
+        if group_labels:
+            # Placeholder rows have no tokens: their (0, 0) never enters a
+            # token statistic, which covers trained rows only. The rows are
+            # already published, so a metrics error must not fail the group.
+            try:
+                runs = [generated_runs(row.token_mask) for row in rows]
+                metrics.update(
+                    group_label_stats(
+                        group_labels,
+                        rewards=list(rewards),
+                        valid=[row.valid for row in rows],
+                        mask_sample=list(mask_sample),
+                        gen_tokens=[tokens for tokens, _ in runs],
+                        turns=[turns for _, turns in runs],
+                        seq_lens=[len(row.token_ids) for row in rows],
+                        truncated=[
+                            seq_len == self._max_seq_len for seq_len in seq_lens
+                        ],
+                        calls=[len(row.staging_keys) for row in rows],
+                        result_stats=result_stats,
+                    )
+                )
+            except Exception as error:
+                print(
+                    f"  finalize: group {group_id} per-label metrics skipped "
+                    f"({type(error).__name__}: {error})",
+                    flush=True,
+                )
         meta = KVBatchMeta(
             partition_id=self._partition_id,
             task_name="train",
