@@ -1,0 +1,2 @@
+# The exemplar explicitly sets grpo.masked_reward_policy: exclude.
+defaults: ../grpo_math_1B.yaml
