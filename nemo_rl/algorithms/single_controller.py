@@ -188,6 +188,7 @@ from nemo_rl.environments.gym_checkpoint_coordinator import (
     GYM_CHECKPOINT_MANIFEST_FILENAME,
     GymCheckpointCommitResult,
     GymCheckpointCoordinator,
+    is_transient_gym_checkpoint_failure,
     load_gym_checkpoint_manifest,
     staging_keys_of,
     write_gym_checkpoint_manifest,
@@ -280,6 +281,9 @@ log = logging.getLogger(__name__)
 # budget: at this point the run is over, so the only thing a completed restart buys is a
 # cleaner exit. Not configurable for the same reason.
 _SUPERVISOR_DRAIN_TIMEOUT_S = 30.0
+
+# Rollout-deadline pause owned by a Gym checkpoint while it holds rollouts parked.
+_GYM_CHECKPOINT_DEADLINE_HOLDER = "gym_checkpoint"
 
 
 @dataclass(frozen=True)
@@ -5140,36 +5144,51 @@ class SingleControllerActor:
             )
 
         async with gate.closed():
-            # Gym refuses a retire once a checkpoint is open, so retire while it
-            # is still idle; dispatch is already closed, so nothing new races in.
-            await self._retire_dropped_gym_episodes(coordinator, checkpoint_id)
-            async with coordinator.prepared(checkpoint_id):
-                candidates = self._gym_checkpoint_inventory(coordinator)
-                # A row dropped since that retire is still running in Gym, which
-                # exports it; naming it keeps the export in scope, and the cut
-                # leaves it out of the saved manifest.
-                dropped = self._queued_gym_retirements(coordinator)
-                scope = {
-                    instance_id: episodes
-                    + tuple(
-                        sorted(
-                            dropped[instance_id] - set(episodes),
-                            key=lambda episode: (episode.rollout_id, episode.attempt),
+            # Gym parks every live rollout until resume, so the wait must not
+            # count against their deadlines. A separate holder keeps a
+            # colocated engine's own pause intact when this one ends.
+            self._rollout_manager.suspend_request_deadlines(
+                _GYM_CHECKPOINT_DEADLINE_HOLDER
+            )
+            try:
+                # Gym refuses a retire once a checkpoint is open, so retire while
+                # it is still idle; dispatch is already closed, so nothing new
+                # races in.
+                await self._retire_dropped_gym_episodes(coordinator, checkpoint_id)
+                async with coordinator.prepared(checkpoint_id):
+                    candidates = self._gym_checkpoint_inventory(coordinator)
+                    # A row dropped since that retire is still running in Gym,
+                    # which exports it; naming it keeps the export in scope, and
+                    # the cut leaves it out of the saved manifest.
+                    dropped = self._queued_gym_retirements(coordinator)
+                    scope = {
+                        instance_id: episodes
+                        + tuple(
+                            sorted(
+                                dropped[instance_id] - set(episodes),
+                                key=lambda episode: (
+                                    episode.rollout_id,
+                                    episode.attempt,
+                                ),
+                            )
                         )
+                        for instance_id, episodes in candidates.items()
+                    }
+                    commit = await coordinator.commit(
+                        checkpoint_id,
+                        Path(checkpoint_path),
+                        scope,
                     )
-                    for instance_id, episodes in candidates.items()
-                }
-                commit = await coordinator.commit(
-                    checkpoint_id,
-                    Path(checkpoint_path),
-                    scope,
+                    await self._drain_non_exported_gym_candidates(
+                        coordinator,
+                        candidates,
+                        commit,
+                    )
+                    yield commit
+            finally:
+                self._rollout_manager.resume_request_deadlines(
+                    _GYM_CHECKPOINT_DEADLINE_HOLDER
                 )
-                await self._drain_non_exported_gym_candidates(
-                    coordinator,
-                    candidates,
-                    commit,
-                )
-                yield commit
 
     async def _write_rollout_checkpoint_sidecars(
         self,
@@ -5471,6 +5490,10 @@ class SingleControllerActor:
                     failure_reason: RolloutCheckpointAttemptReason = "timeout"
                 elif isinstance(error, OSError):
                     failure_reason = "io_error"
+                elif is_transient_gym_checkpoint_failure(error):
+                    # Gym was resumed, or its lease reopens it; nothing RL
+                    # holds changed, so the next attempt can simply retry.
+                    failure_reason = "gym_unavailable"
                 else:
                     failure_reason = "invariant_error"
                 self._log_rollout_checkpoint_outcome(
@@ -5478,7 +5501,7 @@ class SingleControllerActor:
                     reason=failure_reason,
                     attempt_duration_seconds=time.monotonic() - attempt_started,
                 )
-                if not isinstance(error, (OSError, TimeoutError)):
+                if failure_reason == "invariant_error":
                     raise
                 if deadline_due:
                     raise RuntimeError(
