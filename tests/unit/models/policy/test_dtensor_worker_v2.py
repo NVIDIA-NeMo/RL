@@ -61,6 +61,39 @@ class _FakeTrainableModel:
 
 @pytest.mark.automodel
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+def test_dtensor_v2_get_logprobs_uses_the_microbatch_hook(monkeypatch):
+    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+    worker.timer = MagicMock()
+    worker.cfg = {"logprob_batch_size": 2}
+    worker.model = MagicMock()
+    worker.enable_seq_packing = False
+    worker.sampling_params = None
+    worker.dp_mesh = MagicMock()
+    worker.tokenizer = MagicMock()
+    worker._make_logprobs_post_processor = MagicMock(return_value="postprocessor")
+    worker._logprobs_for_microbatch = MagicMock(return_value=torch.zeros(2, 3))
+    microbatch = object()
+    data = MagicMock()
+
+    monkeypatch.setattr(worker_mod, "check_sequence_dim", lambda _data: (1, 3))
+    monkeypatch.setattr(
+        worker_mod,
+        "get_microbatch_iterator",
+        lambda *args, **kwargs: ([microbatch], 1),
+    )
+
+    output = DTensorPolicyWorkerV2Impl.get_logprobs(worker, data)
+
+    worker._logprobs_for_microbatch.assert_called_once_with(
+        processed_mb=microbatch,
+        post_processing_fn="postprocessor",
+        sequence_dim=1,
+    )
+    torch.testing.assert_close(output["logprobs"], torch.zeros(2, 3))
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
 def test_dtensor_v2_prepare_for_training_restores_optimizer(monkeypatch):
     worker = object.__new__(DTensorPolicyWorkerV2Impl)
     model = _FakeTrainableModel()
