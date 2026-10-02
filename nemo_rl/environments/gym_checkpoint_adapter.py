@@ -20,7 +20,7 @@ from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, get_args
 
 if TYPE_CHECKING:
     from nemo_gym._checkpoint.coordination import Participants, PrepareResult
@@ -85,6 +85,22 @@ GymCheckpointParticipantKind = Literal[
     "agent",
     "resources",
 ]
+
+
+GYM_CHECKPOINT_PARTICIPANT_KINDS: frozenset[str] = frozenset(
+    get_args(GymCheckpointParticipantKind)
+)
+
+
+@dataclass(frozen=True)
+class GymCheckpointParticipantRecord:
+    """Durable identity of one Gym participant whose state a checkpoint holds."""
+
+    server_name: str
+    kind: GymCheckpointParticipantKind
+    # The participant's state directory under its kind, as Gym wrote it.
+    instance: str
+    records_sha256: str
 
 
 @dataclass(frozen=True)
@@ -579,21 +595,79 @@ class GymCheckpointAdapter:
             checkpoint_dir=checkpoint_dir,
         )
 
+    def _require_restorable_topology(
+        self,
+        recorded: Iterable[GymCheckpointParticipantRecord],
+        checkpoint_dir: Path,
+    ) -> None:
+        """Require this deployment to be exactly the one the checkpoint recorded.
+
+        Gym restores each live participant from its own state, so a participant
+        missing from this deployment would have its state silently dropped,
+        and one the checkpoint never saw would start empty. Each recorded
+        participant's state on disk must also be the state that was committed.
+        """
+        from nemo_gym._checkpoint.errors import CheckpointStateError
+        from nemo_gym._checkpoint.store import read_participant_state
+
+        expected = {record.server_name: record for record in recorded}
+        live = {
+            member.server_name: member.kind
+            for member in self._require_participants().members
+        }
+        missing = sorted(set(expected) - set(live))
+        unexpected = sorted(set(live) - set(expected))
+        changed_kind = sorted(
+            name
+            for name in set(expected) & set(live)
+            if expected[name].kind != live[name]
+        )
+        if missing or unexpected or changed_kind:
+            raise RuntimeError(
+                "Gym deployment does not match the participants this checkpoint "
+                f"recorded for instance {self._instance.instance_id!r}: "
+                f"missing={missing!r}, unexpected={unexpected!r}, "
+                f"changed_kind={changed_kind!r}"
+            )
+        for record in expected.values():
+            try:
+                stored, _ = read_participant_state(
+                    checkpoint_dir, kind=record.kind, instance=record.instance
+                )
+            except (CheckpointStateError, OSError, ValueError) as error:
+                raise RuntimeError(
+                    "Gym checkpoint state is unreadable for participant "
+                    f"{record.server_name!r}: {error}"
+                ) from error
+            if stored.get("records_sha256") != record.records_sha256:
+                raise RuntimeError(
+                    "Gym checkpoint state for participant "
+                    f"{record.server_name!r} is not the state that was committed: "
+                    f"expected records_sha256={record.records_sha256!r}, "
+                    f"found={stored.get('records_sha256')!r}"
+                )
+
     async def restore(
         self,
         checkpoint_id: str,
         checkpoint_root: str | Path,
         episodes: Iterable[GymCheckpointEpisode],
         *,
+        participants: Iterable[GymCheckpointParticipantRecord],
         source_checkpoint_id: str,
         deadline_ts: float,
     ) -> None:
         from nemo_gym._checkpoint.coordination import restore
 
+        checkpoint_dir = self._instance.checkpoint_dir(checkpoint_root)
+        # Checked before Gym installs anything, so a mismatch leaves it untouched.
+        await asyncio.to_thread(
+            self._require_restorable_topology, tuple(participants), checkpoint_dir
+        )
         replies = await restore(
             self._require_participants(),
             checkpoint_id,
-            str(self._instance.checkpoint_dir(checkpoint_root)),
+            str(checkpoint_dir),
             self._episode_ids(episodes),
             deadline_ts=deadline_ts,
         )
