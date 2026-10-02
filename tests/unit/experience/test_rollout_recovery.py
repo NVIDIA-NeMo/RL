@@ -1465,3 +1465,111 @@ def test_refusal_requires_a_dispatched_attempt() -> None:
         _mutate(
             lambda cut: ledger.release_refused_dispatch(cut, "g7", generation_index=0)
         )
+
+
+def test_dropping_a_dispatched_group_records_its_gym_episodes_for_retirement() -> None:
+    """Gym keeps running what it admitted, so the next checkpoint must retire it."""
+    abandoned_ledger = RolloutRecoveryLedger()
+    abandoned = _dispatched_turn_group(abandoned_ledger)
+    _mutate(lambda cut: abandoned_ledger.abandon_unsealed(cut, "g7"))
+
+    discarded_ledger = RolloutRecoveryLedger()
+    discarded = _dispatched_turn_group(discarded_ledger)
+    _mutate(lambda cut: discarded_ledger.discard_group(cut, "g7"))
+
+    for ledger, group in ((abandoned_ledger, abandoned), (discarded_ledger, discarded)):
+        assert ledger.gym_checkpoint_retirements({"tools/replica-0"}) == {
+            "tools/replica-0": tuple(
+                sorted(group.gym_episode(index) for index in (0, 1))
+            )
+        }
+    # Bookkeeping for this process's Gym executions, never persisted.
+    reloaded = RolloutRecoveryLedger.from_state_dict(abandoned_ledger.state_dict())
+    assert reloaded.gym_checkpoint_retirements({"tools/replica-0"}) == {
+        "tools/replica-0": ()
+    }
+
+
+def test_attempts_that_never_reached_gym_are_not_retired() -> None:
+    ledger = RolloutRecoveryLedger()
+    _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=2,
+        target_step=7,
+        start_weight_version=6,
+        recovery_granularity=RecoveryGranularity.SIBLING,
+        restore_level=RecoveryTargetLevel.TURN,
+        admitted=True,
+    )
+    _mutate(lambda cut: ledger.abandon_unsealed(cut, "g7"))
+
+    assert ledger.gym_checkpoint_retirements({"tools/replica-0"}) == {
+        "tools/replica-0": ()
+    }
+
+
+def test_dropping_a_restored_reserved_attempt_retires_its_restored_gym_state() -> None:
+    ledger = RolloutRecoveryLedger()
+    _dispatched_turn_group(ledger)
+    restored = RolloutRecoveryLedger.from_state_dict(ledger.state_dict())
+    episodes = restored.gym_checkpoint_inventory({"tools/replica-0"})["tools/replica-0"]
+    _mutate(
+        lambda cut: restored.prepare_for_restart(
+            cut,
+            restored_gym_episodes={
+                ("tools/replica-0", *episode) for episode in episodes
+            },
+        )
+    )
+    group = restored.get_group("g7")
+
+    _mutate(lambda cut: restored.discard_group(cut, "g7"))
+
+    retired = restored.gym_checkpoint_retirements({"tools/replica-0"})[
+        "tools/replica-0"
+    ]
+    assert set(retired) == {group.gym_episode(index) for index in (0, 1)}
+    assert {attempt for _, attempt in retired} == {1}
+
+
+def test_mark_gym_retired_keeps_drops_recorded_after_the_retire_was_sent() -> None:
+    ledger = RolloutRecoveryLedger()
+    first = _dispatched_turn_group(ledger)
+    _mutate(lambda cut: ledger.abandon_unsealed(cut, "g7"))
+    sent = ledger.gym_checkpoint_retirements({"tools/replica-0"})
+
+    later = _mutate(
+        lambda cut: ledger.reserve_group(
+            cut,
+            group_id="g8",
+            admission_id="batch-8",
+            prompt_id="8",
+            prompt_payload=_prompt(8),
+            expected_generations=1,
+            target_step=8,
+            start_weight_version=7,
+            restore_level=RecoveryTargetLevel.TURN,
+            admitted=True,
+        )
+    )
+    _mutate(
+        lambda cut: ledger.mark_group_dispatched(
+            cut, "g8", gym_instance_id="tools/replica-0"
+        )
+    )
+    later = ledger.get_group("g8")
+    _mutate(lambda cut: ledger.abandon_unsealed(cut, "g8"))
+
+    ledger.mark_gym_retired(sent)
+
+    assert ledger.gym_checkpoint_retirements({"tools/replica-0"}) == {
+        "tools/replica-0": (later.gym_episode(0),)
+    }
+    assert (
+        first.gym_episode(0)
+        not in ledger.gym_checkpoint_retirements({"tools/replica-0"})["tools/replica-0"]
+    )
