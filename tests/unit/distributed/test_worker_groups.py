@@ -512,6 +512,27 @@ def test_custom_environment_variables_override_existing(
     worker_group.shutdown(force=True)
 
 
+def test_env_vars_argument_is_not_modified(register_test_actor, virtual_cluster):
+    """The env_vars dict passed in must not pick up the driver environment."""
+    builder = RayWorkerBuilder(register_test_actor)
+    env_vars = {"CUSTOM_VAR_1": "test_value_1"}
+
+    worker_group = RayWorkerGroup(
+        cluster=virtual_cluster,
+        remote_worker_builder=builder,
+        workers_per_node=1,
+        env_vars=env_vars,
+    )
+
+    # Callers pass dicts owned by the run config (e.g. policy.dtensor_cfg.env_vars),
+    # which is saved with every checkpoint.
+    assert env_vars == {"CUSTOM_VAR_1": "test_value_1"}
+    worker = worker_group.workers[0]
+    assert ray.get(worker.get_env_var.remote("CUSTOM_VAR_1")) == "test_value_1"
+
+    worker_group.shutdown(force=True)
+
+
 def test_configure_worker_interaction(register_test_actor, virtual_cluster):
     actor_fqn = register_test_actor
     builder = RayWorkerBuilder(actor_fqn)
