@@ -4494,6 +4494,13 @@ class MegatronPolicyWorkerImpl(
             and self.offload_optimizer_for_logprob
         ):
             self.move_optimizer("cpu")
+        if (
+            self.chunked_optimizer_state_offload
+            and not keep_train_buffers
+            and self.optimizer is not None
+        ):
+            # MXFP8 parameter staging above has finished reading the masters.
+            self.optimizer.offload_optimizer_state_for_forward()
 
         # No teacher projection happens during logprob inference, so the head can
         # follow the configured offload policy here too.
@@ -4760,6 +4767,10 @@ class MegatronPolicyWorkerImpl(
         ):
             self.move_optimizer("cpu")
             _mark("move_optimizer")
+        if self.chunked_optimizer_state_offload and self.optimizer is not None:
+            # The controller materializes updated model parameters before refit.
+            # Release masters before export allocates its temporary buffers.
+            self.optimizer.offload_optimizer_state_for_forward()
 
         # gc.collect() over a trainer-sized Python heap costs 0.4-1.8 s per rank and
         # sits inside the refit bubble; see _offload_before_refit_release.
