@@ -134,6 +134,103 @@ def test_unsharded_dispatch_keeps_one_bucket_holding_the_whole_batch():
     assert bucket_rows == rows
 
 
+def _native_rows(tasksets, num_generations):
+    return [
+        {
+            "task_id": {"taskset": taskset, "task_id": str(group_index)},
+            "task_input": {"responses_create_params": {"input": []}},
+            "_rowidx": group_index * num_generations + offset,
+        }
+        for group_index, taskset in enumerate(tasksets)
+        for offset in range(num_generations)
+    ]
+
+
+def test_bare_actor_dispatches_native_rows_for_actor_side_route_resolution():
+    actor = _FakeActor("only")
+    rows = _native_rows(["workplace:train", "weather:train"], num_generations=2)
+
+    buckets = _bucket_nemo_gym_rows_by_instance(
+        rows, as_nemo_gym_shard_set(actor), num_generations=2
+    )
+
+    assert len(buckets) == 1
+    _, handle, bucket_rows = buckets[0]
+    assert handle is actor
+    assert bucket_rows == rows
+    assert all("agent_ref" not in row for row in rows)
+
+
+def test_empty_batch_does_not_dispatch_to_a_bare_actor():
+    assert (
+        _bucket_nemo_gym_rows_by_instance(
+            [], as_nemo_gym_shard_set(_FakeActor("only")), num_generations=2
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize(
+    "second_row",
+    [
+        {"task_id": {"taskset": "weather:train", "task_id": "1"}, "task_input": {}},
+        {"agent_ref": {"name": "workplace:train"}},
+    ],
+)
+def test_bare_actor_rejects_prompt_groups_mixing_native_routes_or_row_formats(
+    second_row,
+):
+    rows = _native_rows(["workplace:train"], num_generations=1) + [second_row]
+
+    with pytest.raises(ValueError, match="mixes routes"):
+        _bucket_nemo_gym_rows_by_instance(
+            rows, as_nemo_gym_shard_set(_FakeActor("only")), num_generations=2
+        )
+
+
+def test_native_groups_follow_environment_servers_and_keep_replicas_together():
+    first, second, right = (
+        _FakeActor("first"),
+        _FakeActor("second"),
+        _FakeActor("right"),
+    )
+    shard_set = _shard_set(
+        {"left": [first, second], "right": [right]},
+        {"workplace_environment": "left", "weather_environment": "right"},
+    )
+    shard_set.environment_server_routes = {
+        "workplace:train": "workplace_environment",
+        "weather:train": "weather_environment",
+    }
+    rows = _native_rows(
+        ["workplace:train", "weather:train", "workplace:train"], num_generations=2
+    )
+    # Agent attribution must not change the selected native Environment Server.
+    for row in rows:
+        row["agent_ref"] = {"name": "shared_agent"}
+
+    buckets = _bucket_nemo_gym_rows_by_instance(rows, shard_set, num_generations=2)
+
+    dispatched = {id(handle): bucket_rows for _, handle, bucket_rows in buckets}
+    assert [row["_rowidx"] for row in dispatched[id(first)]] == [0, 1]
+    assert [row["_rowidx"] for row in dispatched[id(right)]] == [2, 3]
+    assert [row["_rowidx"] for row in dispatched[id(second)]] == [4, 5]
+
+
+def test_native_sharded_dispatch_requires_an_explicit_taskset_route():
+    shard_set = _shard_set(
+        {"only": [_FakeActor("only")]}, {"workplace_environment": "only"}
+    )
+    with pytest.raises(
+        ValueError, match="No environment server route.*workplace:train"
+    ):
+        _bucket_nemo_gym_rows_by_instance(
+            _native_rows(["workplace:train"], num_generations=2),
+            shard_set,
+            num_generations=2,
+        )
+
+
 def test_groups_follow_their_agent_to_its_shard():
     left, right = _FakeActor("left"), _FakeActor("right")
     shard_set = _shard_set(

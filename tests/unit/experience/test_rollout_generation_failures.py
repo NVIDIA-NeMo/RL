@@ -658,6 +658,39 @@ class TestPartialGymRedispatch:
         assert method.dispatched == [[0, 1, 2, 3]]
         assert impl._stats.gym_row_redispatches == 0
 
+    @pytest.mark.parametrize("caller_capture_ids", [False, True])
+    def test_native_episode_retry_is_delegated_to_the_identity_owner(
+        self, caller_capture_ids
+    ):
+        method = _PartialGymMethod(fail_after_rows=1, failures_before_success=1)
+        impl = _make_gym_impl(method, num_generations=2, row_attempts=3)
+        rows = [
+            {
+                "task_id": {"taskset": "weather:train", "task_id": "task-0"},
+                "task_input": {
+                    "responses_create_params": {"input": []},
+                    "task_data": {},
+                },
+                "_rowidx": index,
+                "_ng_group_id": "group-0",
+                "_ng_group_attempt": 0,
+                "_ng_rollout_index": index,
+            }
+            for index in range(2)
+        ]
+        if caller_capture_ids:
+            for index, row in enumerate(rows):
+                row["_ng_rollout_id"] = f"registered-capture-{index}"
+
+        with pytest.raises(ConnectionResetError, match="gym stream died"):
+            asyncio.run(impl._run_rollouts(rows, Timer(), "timing/rollout"))
+
+        # The manager or capture recovery owner must mint the next attempt before
+        # this missing sibling is dispatched again. Legacy tests above retain
+        # their per-row transport retries.
+        assert method.dispatched == [[0, 1]]
+        assert impl._stats.gym_row_redispatches == 0
+
     def test_a_stale_echo_of_a_landed_row_is_rejected(self):
         """Re-dispatch narrows the stream; an echo of an already-landed row must not win.
 
