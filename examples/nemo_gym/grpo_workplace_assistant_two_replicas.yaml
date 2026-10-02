@@ -1,0 +1,25 @@
+# Two Workplace Assistant Gym replicas for checkpoint/recovery tests. Replicas
+# share one port range, so NeMo-RL intentionally places them on separate Ray
+# nodes with the default STRICT_SPREAD strategy. The training shape and model
+# are supplied by the functional launcher.
+
+defaults: "grpo_qwen3_30ba3b_instruct.yaml"
+
+env:
+  nemo_gym:
+    # Shards replace the inherited unsharded server list. Policy-model config is
+    # an RL-owned overlay duplicated into every otherwise-identical replica.
+    config_paths: null
+    code_gen: null
+    shards:
+      - name: workplace
+        replicas: 2
+        port_range_low: 5000
+        port_range_high: 5999
+        config_paths:
+          - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+          - responses_api_agents/checkpoint_test_agent/configs/workplace_assistant.yaml
+    common_inherited_overlays:
+      - policy_model
+    allowed_duplicate_entries:
+      - policy_model
