@@ -2759,7 +2759,11 @@ class SingleControllerActor:
                         target_groups = self._target_groups_for_step(
                             version_during_step
                         )
-                        max_prompt_groups = target_groups - groups_dispatched
+                        max_prompt_groups = min(
+                            target_groups - groups_dispatched,
+                            self._async_cfg.max_groups_for_streaming_train
+                            or self._async_cfg.min_groups_for_streaming_train,
+                        )
                         if max_prompt_groups <= 0:
                             break
                         # For a colocated engine this is max_prompt_groups, pinned inside setup.

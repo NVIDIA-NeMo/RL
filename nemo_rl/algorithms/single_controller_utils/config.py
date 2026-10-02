@@ -492,13 +492,28 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     # Recompute generation KV caches after each weight update.
     recompute_kv_cache_after_weight_updates: bool = False
     # Min ready groups the streaming trainer waits for before dispatching a batch.
-    min_groups_for_streaming_train: int = 32
+    min_groups_for_streaming_train: PositiveInt = 32
+    # Max groups per streaming chunk; None uses the configured minimum.
+    max_groups_for_streaming_train: Optional[PositiveInt] = None
     # Cap on in-flight generate_and_push calls in the rollout pump.
     max_inflight_prompts: int = 32
     # Cap on unconsumed rollout groups buffered in the DataPlane (backpressure).
     max_buffered_rollouts: int = 64
     # Enable per-rollout diagnostic prints (prompt content / completion previews).
     diagnostics: bool = False
+
+    @model_validator(mode="after")
+    def _check_streaming_chunk_bounds(self) -> "AsyncRLConfig":
+        if (
+            self.max_groups_for_streaming_train is not None
+            and self.max_groups_for_streaming_train
+            < self.min_groups_for_streaming_train
+        ):
+            raise ValueError(
+                "async_rl.max_groups_for_streaming_train must be >= "
+                "async_rl.min_groups_for_streaming_train"
+            )
+        return self
 
     @model_validator(mode="after")
     def _reject_renamed_blocks(self) -> "AsyncRLConfig":
