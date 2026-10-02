@@ -410,7 +410,7 @@ class TeacherWorkerGroup:
             common_kwargs={"micro_batch_size": mbs},
         )
         logprobs = BatchedDataDict.from_batches(
-            self.worker_group.get_all_worker_results(futures)
+            self.worker_group.get_all_worker_results(futures, fetch_returned_only=True)
         )
 
         result = BatchedDataDict[ReferenceLogprobOutputSpec](
