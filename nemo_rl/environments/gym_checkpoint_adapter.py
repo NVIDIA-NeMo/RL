@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -121,6 +122,10 @@ class GymCheckpointCommitSummary:
                 f"unattributed={sorted(set(self.staging_keys) - attributed)[:10]!r}, "
                 f"unlisted={sorted(attributed - set(self.staging_keys))[:10]!r}"
             )
+
+    # Parked agent sessions that no environment or legacy agent participant owns.
+    # They cannot be restored and cannot finish while the deployment is prepared.
+    unowned_live_episodes: tuple[GymCheckpointEpisode, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -290,11 +295,45 @@ class GymCheckpointAdapter:
             record_count=record_count,
         )
 
+    @staticmethod
+    def _legacy_agent_episode_keys(
+        checkpoint_dir: Path,
+        *,
+        participant: str,
+        manifest: GymCheckpointParticipantManifest,
+    ) -> frozenset[str]:
+        """Return the legacy ``/run`` episodes one agent participant committed.
+
+        An agent exports every parked session, but only a legacy ``/run`` session
+        (a record with a non-null ``episode`` step boundary) owns its episode. A
+        native session runs under an environment participant, which owns it.
+        """
+        from nemo_gym._checkpoint.store import read_participant_state
+        from nemo_gym.episode_types import EpisodeId
+
+        stored, records = read_participant_state(
+            checkpoint_dir, kind="agent", instance=manifest.instance
+        )
+        if stored.get("records_sha256") != manifest.records_sha256:
+            raise RuntimeError(
+                "Gym checkpoint agent records on disk do not match the commit "
+                f"reply: participant={participant!r}, "
+                f"expected={manifest.records_sha256!r}, "
+                f"actual={stored.get('records_sha256')!r}"
+            )
+        return frozenset(
+            EpisodeId.model_validate(record["episode_id"]).capture_key
+            for record in records
+            if record.get("episode") is not None
+        )
+
     def _commit_summary(
         self,
         checkpoint_id: str,
         episode_ids: list[Any],
         replies: dict[str, dict[str, Any]],
+        *,
+        checkpoint_dir: Path,
     ) -> GymCheckpointCommitSummary:
         """Convert participant replies into an actor-local ownership summary."""
         participants = self._require_participants()
@@ -310,6 +349,10 @@ class GymCheckpointAdapter:
 
         requested_keys = {episode_id.capture_key for episode_id in episode_ids}
         exported_environment_keys: set[str] = set()
+        # A legacy_agent environment server only relays /run, so it never holds
+        # the episode; the agent's legacy session owns it instead.
+        legacy_agent_keys: set[str] = set()
+        agent_session_keys: set[str] = set()
         staging_keys: set[str] = set()
         keys_by_capture_key: dict[str, set[str]] = {}
         participant_summaries: list[GymCheckpointParticipantCommitSummary] = []
@@ -347,6 +390,33 @@ class GymCheckpointAdapter:
                     f"requested scope: participant={member.server_name!r}, "
                     f"unexpected={sorted(unexpected)!r}"
                 )
+            manifest = self._participant_manifest(
+                reply.get("manifest"),
+                participant=member.server_name,
+                kind=member.kind,
+                checkpoint_id=checkpoint_id,
+            )
+            if member.kind == "agent" and episode_keys:
+                agent_session_keys.update(episode_keys)
+                legacy_keys = self._legacy_agent_episode_keys(
+                    checkpoint_dir,
+                    participant=member.server_name,
+                    manifest=manifest,
+                )
+                unreported = legacy_keys - set(episode_keys)
+                if unreported:
+                    raise RuntimeError(
+                        "Gym checkpoint agent records name episodes absent from its "
+                        f"commit reply: participant={member.server_name!r}, "
+                        f"unreported={sorted(unreported)!r}"
+                    )
+                duplicate_owners = legacy_agent_keys.intersection(legacy_keys)
+                if duplicate_owners:
+                    raise RuntimeError(
+                        "Gym checkpoint legacy episode was exported by multiple agent "
+                        f"participants: {sorted(duplicate_owners)!r}"
+                    )
+                legacy_agent_keys.update(legacy_keys)
             if member.kind == "environment":
                 duplicate_owners = exported_environment_keys.intersection(episode_keys)
                 if duplicate_owners:
@@ -403,27 +473,27 @@ class GymCheckpointAdapter:
                     kind=member.kind,
                     phase=phase,
                     episode_keys=episode_keys,
-                    manifest=self._participant_manifest(
-                        reply.get("manifest"),
-                        participant=member.server_name,
-                        kind=member.kind,
-                        checkpoint_id=checkpoint_id,
-                    ),
+                    manifest=manifest,
                     staging_keys=participant_keys,
                 )
             )
 
         from nemo_gym.episode_types import EpisodeId
 
-        exported_episodes = tuple(
-            GymCheckpointEpisode(parsed.rollout_id, parsed.attempt)
-            for parsed in (
-                EpisodeId.from_capture_key(capture_key)
-                for capture_key in sorted(exported_environment_keys)
+        def _episodes(capture_keys: set[str]) -> tuple[GymCheckpointEpisode, ...]:
+            return tuple(
+                GymCheckpointEpisode(parsed.rollout_id, parsed.attempt)
+                for parsed in (
+                    EpisodeId.from_capture_key(capture_key)
+                    for capture_key in sorted(capture_keys)
+                )
             )
-        )
+
+        # An environment participant owns every episode it exported; a legacy
+        # agent session owns its episode only when no environment does.
+        owned_keys = exported_environment_keys | legacy_agent_keys
         return GymCheckpointCommitSummary(
-            exported_episodes=exported_episodes,
+            exported_episodes=_episodes(owned_keys),
             staging_keys=tuple(sorted(staging_keys)),
             participants=tuple(participant_summaries),
             staging_keys_by_episode={
@@ -435,6 +505,7 @@ class GymCheckpointAdapter:
                     for capture_key, keys in keys_by_capture_key.items()
                 )
             },
+            unowned_live_episodes=_episodes(agent_session_keys - owned_keys),
         )
 
     async def retire(
@@ -464,15 +535,22 @@ class GymCheckpointAdapter:
         from nemo_gym._checkpoint.coordination import commit
 
         episode_ids = self._episode_ids(episodes)
+        checkpoint_dir = self._instance.checkpoint_dir(checkpoint_root)
         replies = await commit(
             self._require_participants(),
             checkpoint_id,
-            str(self._instance.checkpoint_dir(checkpoint_root)),
+            str(checkpoint_dir),
             episode_ids,
             deadline_ts=deadline_ts,
         )
-        summary = self._commit_summary(checkpoint_id, episode_ids, replies)
-        return summary
+        # Reads committed agent records from disk, so keep it off the event loop.
+        return await asyncio.to_thread(
+            self._commit_summary,
+            checkpoint_id,
+            episode_ids,
+            replies,
+            checkpoint_dir=checkpoint_dir,
+        )
 
     async def restore(
         self,
