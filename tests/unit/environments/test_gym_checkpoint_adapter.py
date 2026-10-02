@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import pickle
 import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -26,6 +27,7 @@ from nemo_rl.environments.gym_checkpoint_adapter import (
     GymCheckpointEpisode,
     GymCheckpointInstance,
     GymCheckpointParticipantManifest,
+    GymCheckpointUnavailable,
 )
 from nemo_rl.experience.rollout_recovery import (
     PromptGroupPhase,
@@ -743,3 +745,41 @@ def test_adapter_rejects_operations_before_discovery() -> None:
 
     with pytest.raises(RuntimeError, match="has not discovered"):
         asyncio.run(adapter.prepare("save-1", deadline_ts=10.0))
+
+
+@pytest.mark.parametrize(
+    "operation", ["prepare", "renew", "retire", "commit", "resume"]
+)
+def test_a_failed_live_checkpoint_call_crosses_ray_typed(
+    monkeypatch, operation: str
+) -> None:
+    """Gym's CoordinationError cannot be pickled and reaches RL untyped."""
+    from nemo_gym._checkpoint import coordination
+
+    failure = coordination.CoordinationError(
+        operation, {"actor-a-agent": "HTTP 409 deadline_exceeded"}
+    )
+    monkeypatch.setattr(coordination, operation, AsyncMock(side_effect=failure))
+    adapter = GymCheckpointAdapter(
+        instance=GymCheckpointInstance(shard_name="actor-a", replica_index=0),
+        client=object(),
+        auth_token="secret",
+    )
+    adapter._participants = _participants(object(), "actor-a")
+    episodes = [GymCheckpointEpisode("rollout-1", 0)]
+    calls = {
+        "prepare": lambda: adapter.prepare("save-1", deadline_ts=1.0),
+        "renew": lambda: adapter.renew("save-1", deadline_ts=1.0),
+        "retire": lambda: adapter.retire("save-1", episodes, deadline_ts=1.0),
+        "commit": lambda: adapter.commit(
+            "save-1", "/unused", episodes, deadline_ts=1.0
+        ),
+        "resume": lambda: adapter.resume("save-1", deadline_ts=1.0),
+    }
+
+    with pytest.raises(GymCheckpointUnavailable, match="deadline_exceeded") as raised:
+        asyncio.run(calls[operation]())
+
+    restored = pickle.loads(pickle.dumps(raised.value))
+    assert type(restored) is GymCheckpointUnavailable
+    assert str(restored) == str(raised.value)
