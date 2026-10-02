@@ -30,12 +30,16 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Optional, Self, TypeAlias
 
+from nemo_rl.experience.metric_utils import RolloutTelemetry
+
 if TYPE_CHECKING:
     from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneMutationCut
     from nemo_rl.data.interfaces import DatumSpec
 
-ROLLOUT_RECOVERY_SCHEMA_VERSION = 2
-_SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {ROLLOUT_RECOVERY_SCHEMA_VERSION}
+ROLLOUT_RECOVERY_SCHEMA_VERSION = 3
+SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = frozenset(
+    {2, ROLLOUT_RECOVERY_SCHEMA_VERSION}
+)
 ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
 RolloutRecoveryState: TypeAlias = dict[str, Any]
 
@@ -73,6 +77,7 @@ _ATTEMPT_STATE_FIELDS = frozenset(
         "reward",
         "mask_sample",
         "staging_keys",
+        "telemetry",
     }
 )
 
@@ -178,6 +183,7 @@ class RolloutAttemptRecord:
     reward: Optional[float] = None
     mask_sample: Optional[bool] = None
     staging_keys: list[str] = field(default_factory=list)
+    telemetry: Optional[RolloutTelemetry] = None
 
     @property
     def attempt_id(self) -> str:
@@ -282,6 +288,7 @@ class SiblingSealResult:
     receipt: Optional[dict[str, Any]]
     reward: float
     mask_sample: bool
+    telemetry: Optional[RolloutTelemetry] = None
 
 
 def _new_attempt() -> RolloutAttemptRecord:
@@ -578,6 +585,7 @@ class RolloutRecoveryLedger:
         receipt: Optional[dict[str, Any]],
         reward: float,
         mask_sample: bool,
+        telemetry: Optional[RolloutTelemetry] = None,
     ) -> None:
         """Record one streamed sibling receipt as soon as the row arrives."""
         cut.require_live()
@@ -606,6 +614,7 @@ class RolloutRecoveryLedger:
                 and attempt.reward == float(reward)
                 and attempt.mask_sample is mask_sample
                 and attempt.staging_keys == staging_keys
+                and attempt.telemetry == telemetry
             ):
                 return
             raise ValueError(
@@ -623,6 +632,7 @@ class RolloutRecoveryLedger:
         attempt.reward = float(reward)
         attempt.mask_sample = mask_sample
         attempt.staging_keys = staging_keys
+        attempt.telemetry = copy.deepcopy(telemetry)
         attempt.status = RolloutAttemptStatus.SEALED
         if all(
             item.current_attempt.status == RolloutAttemptStatus.SEALED
@@ -692,6 +702,7 @@ class RolloutRecoveryLedger:
             attempt.reward = float(result.reward)
             attempt.mask_sample = result.mask_sample
             attempt.staging_keys = staging_keys
+            attempt.telemetry = copy.deepcopy(result.telemetry)
             attempt.status = RolloutAttemptStatus.SEALED
         record.status = PromptGroupStatus.READY_TO_FINALIZE
 
@@ -867,6 +878,11 @@ class RolloutRecoveryLedger:
                                     "reward": attempt.reward,
                                     "mask_sample": attempt.mask_sample,
                                     "staging_keys": list(attempt.staging_keys),
+                                    "telemetry": (
+                                        dataclasses.asdict(attempt.telemetry)
+                                        if attempt.telemetry is not None
+                                        else None
+                                    ),
                                 }
                                 for attempt in sibling.attempts
                             ],
@@ -897,7 +913,7 @@ class RolloutRecoveryLedger:
         if (
             isinstance(schema_version, bool)
             or not isinstance(schema_version, int)
-            or schema_version not in _SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS
+            or schema_version not in SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS
         ):
             raise ValueError(
                 f"Unsupported rollout-recovery schema version: {schema_version!r}"
@@ -1054,6 +1070,12 @@ class RolloutRecoveryLedger:
                 reward = attempt_state.get("reward")
                 mask_sample = attempt_state.get("mask_sample")
                 staging_keys = attempt_state.get("staging_keys")
+                telemetry_state = attempt_state.get("telemetry")
+                telemetry = (
+                    RolloutTelemetry.from_state(telemetry_state)
+                    if telemetry_state is not None
+                    else None
+                )
                 if not isinstance(staging_keys, list) or not all(
                     isinstance(key, str) for key in staging_keys
                 ):
@@ -1084,6 +1106,7 @@ class RolloutRecoveryLedger:
                     or reward is not None
                     or mask_sample is not None
                     or staging_keys
+                    or telemetry is not None
                 ):
                     raise ValueError("only sealed attempts may retain receipt data")
                 attempts.append(
@@ -1094,6 +1117,7 @@ class RolloutRecoveryLedger:
                         reward=float(reward) if reward is not None else None,
                         mask_sample=mask_sample,
                         staging_keys=list(staging_keys),
+                        telemetry=telemetry,
                     )
                 )
             siblings.append(
@@ -1251,12 +1275,12 @@ def parse_rollout_recovery_state(state: object) -> ParsedRolloutRecoveryState:
     if (
         isinstance(schema_version, bool)
         or not isinstance(schema_version, int)
-        or schema_version not in _SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS
+        or schema_version not in SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS
     ):
         raise ValueError(
             "unsupported rollout recovery schema_version="
             f"{schema_version!r}; supported versions are "
-            f"{sorted(_SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS)}"
+            f"{sorted(SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS)}"
         )
     groups = state.get("groups")
     if not isinstance(groups, list):

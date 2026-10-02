@@ -387,6 +387,89 @@ Do not carry `max_num_epochs: -1` across either. [ppo.md](./ppo.md#asynchronous-
 | *(no legacy equivalent — matches legacy `max_trajectory_age + 1` batches in flight)* | `max_inflight_prompts: num_prompts_per_step × (max_lookahead_versions + 1)` |
 | *(no legacy equivalent — legacy sizes its buffer to `num_prompts_per_step × max_trajectory_age_steps × 2`)* | `max_buffered_rollouts: num_prompts_per_step × (max_lookahead_versions + 1)` (tight; see the [Config → behavior map](#config--behavior-map) for per-sampler values) |
 
+### Rollout telemetry and V1 parity
+
+The SC NeMo-Gym message-log path retains the non-single-controller GRPO rollout metrics and
+also reports them under `train/environment/<name>/`. They describe the completed
+prompt groups **selected for this training step**, not all prefetched or in-flight
+rollouts. Environment names use the resolved Gym route; unsafe path characters
+are sanitized with a stable hash suffix to avoid merging different names.
+
+| Metric family | Definition shared with V1 |
+| --- | --- |
+| `turns_per_sample` | Count of `user` messages in the completed message log. |
+| `gen_tokens_per_sample` | Sum of assistant-message token lengths. |
+| `total_tokens_per_sample` | Sum of all message token lengths. |
+| `max_gen_tokens_per_turn` | Largest assistant-message token length, or zero without an assistant message. |
+| `mean_prompt_length`, per-environment `prompt_tokens_per_sample` | First input-message token length, as logged by V1 NeMo-Gym; omitted when token-capture receipts lack input messages. |
+| `total_reward` | Rollout reward after configured shaping/penalties, before training filters. |
+| `truncation_rate`, `natural_termination_rate` | Length-cap termination and its complement for NeMo-Gym. |
+| `env_extra/<field>` | Numeric/bool Gym result fields, including task-specific timeout/failure diagnostics; original `<agent>/<field>` names remain available. |
+
+Raw rollout distributions include flagged samples. They have histograms,
+mean/min/max/median/stddev, p50 (median), and p95/p99. The shared V1/SC step reducer
+recomputes core and per-environment distributions from pooled observations rather
+than averaging group medians, percentiles, or standard deviations. p95/p99 use
+V1's discrete `pct` convention; singleton stddev is NaN. Optional numeric extras
+keep V1's mean denominator (all selected samples in that environment), while their
+histograms and distribution summaries use the observations present.
+
+Native (non-Gym) rollouts also retain every metric from V1's
+`_aggregate_multi_turn_rollout_metrics` reducer, including `total_turns`,
+`avg_turns_per_sample`, `max_turns_per_sample`, the `mean_*`/`min_*`/`max_*`
+reward/token aliases, per-turn token histograms, and per-worker token counts.
+Per-environment distributions additionally distinguish `gen_tokens_per_turn`,
+`input_tokens_per_turn`, and `total_tokens_per_turn` from per-sample token counts.
+Worker counts stay global and sum by worker. Native `natural_termination_rate`
+uses the environment's terminal signal, not the complement of truncation;
+`max_turns_reached_rate` remains separate. Native prompt length counts all input
+messages, matching its V1 path rather than Gym's first-message convention.
+
+The table describes message-log rollouts. Token-capture finalization retains
+numeric producer observations per logical sibling in the recovery ledger, then
+attaches them to the selected canonical group's metadata. Fully sealed restored
+groups keep their resolved environment without redispatch; partial retries retain
+sealed observations and replace only unfinished siblings. Recovery schema 3 reads
+schema 2 sidecars, which lack these observations: incomplete populations produce
+a warning and omit producer distributions rather than fabricate a partial result.
+Selected-row validity accounting is unaffected. No tokens or full-result tables
+are added to the recovery/RPC payload. Truncation telemetry uses the rebuilt row's
+length-cap flag, not the dispatcher's token-free placeholder.
+
+Capture is disabled by default and has no V1 message-log equivalent. Its
+manifest-derived diagnostics use distinct global and per-environment names:
+`capture/calls_per_sample`, `capture/deepest_chain_tokens_per_sample`,
+`capture/delta_tokens_per_sample`, and `capture/max_delta_tokens_per_call`.
+They are not published under V1's turn/token metric names. Missing input-message
+lengths are not reconstructed. Opt-in `<agent>/full_result` tables are retained
+on the ordinary message-log/replay path; capture's scalar-only recovery metadata
+does not carry those tables. Producer and training phase timings remain global
+and architecture-specific; their wall-clock values are not parity guarantees.
+
+The parity tests compare completed observations, not independently generated
+trajectories: `test_nemo_gym_telemetry_matches_v1_postprocessing` checks Gym
+metrics with masking enabled and disabled, and
+`test_native_telemetry_retains_every_v1_metric` enumerates V1's native output
+keys. Step reduction tests cover unequal groups and both global and environment
+namespaces. Controller, payload, replay, recovery, and logger tests separately
+check selected-step delivery, checkpoint preservation, and histogram routing.
+
+### Per-environment sample accounting
+
+`train/environment/<name>/` logs counts for the groups selected for each step:
+`num_samples` (before filtering), `num_mask_sample_filtered` (Gym flags),
+`num_valid_samples` (sum of final sample weights, matching the policy loss), and
+`num_valid_tokens` (weighted next-token targets after filtering). Counts sum across
+streaming chunks; overlapping filters are not added together. These are distinct
+from rollout reward/token distributions, which include flagged samples. Ordinary
+and token-capture rollouts carry environment tags; older replay rows without tags
+are reported under `unknown`. The flag count is independent of overlapping
+overlong/log-probability filters; it is not necessarily `num_samples` minus
+`num_valid_samples`. Dataset loss weights can make valid counts fractional.
+Logging does not change training masks, rewards, advantages, or rollout selection.
+Optimizer/loss/gradient and timing metrics retain their existing global scope;
+they are not assigned to environments that share a training batch.
+
 ## Known Missing Features
 
 The SC path is still under active development. Feature gaps are tracked in [issue #2625](https://github.com/NVIDIA-NeMo/RL/issues/2625). Notable items:
