@@ -113,6 +113,8 @@ With `checkpointing.save_data_plane: true`, each Single-Controller checkpoint co
 - A native TQ snapshot containing rollout tensor payloads and TQ state.
 - A metadata-only replay index describing the completed rollout groups stored in TQ.
 - A `rollout_recovery.pt` ownership ledger describing unfinished prompt groups that must be redispatched after a restart.
+- With `rollout_recovery.target_level: turn`, a `gym_checkpoint.json` manifest
+  and per-Gym-instance participant snapshots for unfinished episodes.
 - A `replacement_reserve.pt` sidecar containing prompts held for dropped-rollout replacement, when applicable.
 - The sampler dispatch position needed to continue scheduling from the correct point.
 
@@ -247,6 +249,35 @@ restart boundary:
 `sibling` is the default and avoids regenerating completed work. Use
 `prompt_group` when every generation in a recovered group must come from the
 policy weights live at redispatch.
+
+Turn recovery coordinates Gym and RL as one checkpoint cut. Each prompt group
+is pinned to the Gym shard replica that accepted it. SC first closes a narrow
+Gym `/run` admission gate; already-submitted requests, completion callbacks,
+finalization, and TQ writes remain live. Gym parks its participants and commits
+the subset of candidate episodes it still owns into the checkpoint's
+`gym-instances/` tree. Candidate replies already on the wire drain through the
+ordinary RL/TQ completion path. SC then acquires the exclusive data-plane
+barrier, verifies that the remaining Gym-owned episodes and their TQ staging
+keys match the Gym commit, and captures TQ plus the rollout ledger. If a
+candidate is neither exported by Gym nor drained before the deadline, the
+checkpoint aborts. Gym leases are renewed throughout and all deployments are
+resumed after the cut succeeds or aborts.
+
+On restart, SC validates that `gym_checkpoint.json` names exactly the episodes
+owned by the rollout ledger and that the saved Gym actor topology matches the
+live one. It restores Gym before starting rollout dispatch, advances each
+restored episode to its next attempt, and routes it back to the same Gym actor.
+If one shard replica fails restore, every replica conservatively retires its
+replacement attempts before the outer restore fails. This also covers a lost
+Ray reply where the remote restore may actually have succeeded, so a partially
+restored topology is never released for execution. A second checkpoint taken
+after restore but before redispatch includes the dormant restored attempt, so
+another crash does not lose the saved turn boundary.
+
+The `turn` target currently requires vLLM generation, NeMo Gym, token capture,
+periodic rollout snapshots, `restore_mode: latest`, and the same named Gym
+shards and replica counts on restart. Only checkpoints using the current rollout
+recovery schema are accepted.
 
 `task_source_target_level_overrides` can coarsen the target using the Gym
 `task_source` embedded in the raw rollout row. Unlike `agent_ref`, this identity

@@ -540,6 +540,7 @@ def _make_gym_impl(
     from nemo_rl.experience.rollout_manager import AsyncNemoGymRolloutImpl
 
     impl = object.__new__(AsyncNemoGymRolloutImpl)
+    impl._dispatch_admission_gate = None
     impl._tokenizer = _FakeTokenizer()
     impl._task_to_env = {"nemo_gym": type("Env", (), {"run_rollouts": gym_method})()}
     impl._num_generations_per_prompt = num_generations

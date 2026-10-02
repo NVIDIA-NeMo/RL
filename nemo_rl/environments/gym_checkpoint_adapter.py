@@ -18,11 +18,10 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from nemo_gym._checkpoint.coordination import Participants, PrepareResult
-    from nemo_gym.episode_types import EpisodeId
     from nemo_gym.server_utils import ServerClient
 
 
@@ -66,10 +65,75 @@ class GymCheckpointParticipantSummary:
 
 
 @dataclass(frozen=True)
-class GymCheckpointCommitSummary:
-    """Checkpoint-owned TQ rows reported by Gym's policy participants."""
+class GymCheckpointParticipantManifest:
+    """Integrity metadata for one Gym participant's committed state."""
 
+    schema_version: int
+    kind: str
+    instance: str
+    checkpoint_id: str
+    records_file: str
+    records_sha256: str
+    record_count: int
+
+
+GymCheckpointParticipantKind = Literal[
+    "environment",
+    "model",
+    "agent",
+    "resources",
+]
+
+
+@dataclass(frozen=True)
+class GymCheckpointParticipantCommitSummary:
+    """Validated commit reply from one discovered Gym participant."""
+
+    server_name: str
+    kind: GymCheckpointParticipantKind
+    phase: str
+    episode_keys: tuple[str, ...]
+    manifest: GymCheckpointParticipantManifest
     staging_keys: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class GymCheckpointCommitSummary:
+    """Actor-local Gym state selected by one checkpoint commit."""
+
+    exported_episodes: tuple[GymCheckpointEpisode, ...]
+    staging_keys: tuple[str, ...]
+    participants: tuple[GymCheckpointParticipantCommitSummary, ...]
+
+
+@dataclass(frozen=True)
+class GymCheckpointEpisode:
+    """Serializable identity of one physical Gym episode attempt."""
+
+    rollout_id: str
+    attempt: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.rollout_id, str) or not self.rollout_id:
+            raise ValueError("Gym checkpoint rollout_id must not be empty")
+        if (
+            not isinstance(self.attempt, int)
+            or isinstance(self.attempt, bool)
+            or self.attempt < 0
+        ):
+            raise ValueError("Gym checkpoint attempt must be non-negative")
+
+    def next_attempt(self) -> GymCheckpointEpisode:
+        """Return the physical episode Gym creates when this one is restored."""
+        return GymCheckpointEpisode(self.rollout_id, self.attempt + 1)
+
+
+@dataclass(frozen=True)
+class GymCheckpointPrepareSummary:
+    """Serializable result of preparing one actor's Gym deployment."""
+
+    prepared: bool
+    blockers: dict[str, tuple[str, ...]]
 
 
 class GymCheckpointAdapter:
@@ -124,10 +188,210 @@ class GymCheckpointAdapter:
             self._require_participants(), checkpoint_id, deadline_ts=deadline_ts
         )
 
+    @staticmethod
+    def _episode_ids(episodes: Iterable[GymCheckpointEpisode]) -> list[Any]:
+        """Convert the RL wire identity to Gym's validated API model."""
+        from nemo_gym.episode_types import EpisodeId
+
+        return [
+            EpisodeId(rollout_id=episode.rollout_id, attempt=episode.attempt)
+            for episode in episodes
+        ]
+
+    @staticmethod
+    def _participant_manifest(
+        raw: object,
+        *,
+        participant: str,
+        kind: GymCheckpointParticipantKind,
+        checkpoint_id: str,
+    ) -> GymCheckpointParticipantManifest:
+        """Validate Gym's participant manifest before it leaves the actor."""
+        if not isinstance(raw, Mapping):
+            raise RuntimeError(
+                "Gym checkpoint commit returned no manifest for participant "
+                f"{participant!r}"
+            )
+        schema_version = raw.get("schema_version")
+        manifest_kind = raw.get("kind")
+        instance = raw.get("instance")
+        manifest_checkpoint_id = raw.get("checkpoint_id")
+        records_file = raw.get("records_file")
+        records_sha256 = raw.get("records_sha256")
+        record_count = raw.get("record_count")
+        if not isinstance(schema_version, int) or isinstance(schema_version, bool):
+            raise RuntimeError(
+                "Gym checkpoint participant manifest has invalid schema_version: "
+                f"participant={participant!r}, schema_version={schema_version!r}"
+            )
+        if manifest_kind != kind:
+            raise RuntimeError(
+                "Gym checkpoint participant manifest has the wrong kind: "
+                f"participant={participant!r}, expected={kind!r}, "
+                f"actual={manifest_kind!r}"
+            )
+        if not isinstance(instance, str) or not instance:
+            raise RuntimeError(
+                "Gym checkpoint participant manifest has invalid instance: "
+                f"participant={participant!r}, instance={instance!r}"
+            )
+        if (
+            not isinstance(manifest_checkpoint_id, str)
+            or manifest_checkpoint_id != checkpoint_id
+        ):
+            raise RuntimeError(
+                "Gym checkpoint participant manifest has the wrong checkpoint ID: "
+                f"participant={participant!r}, expected={checkpoint_id!r}, "
+                f"actual={manifest_checkpoint_id!r}"
+            )
+        if not isinstance(records_file, str) or not records_file:
+            raise RuntimeError(
+                "Gym checkpoint participant manifest has invalid records_file: "
+                f"participant={participant!r}, records_file={records_file!r}"
+            )
+        if not isinstance(records_sha256, str) or not records_sha256:
+            raise RuntimeError(
+                "Gym checkpoint participant manifest has invalid records_sha256: "
+                f"participant={participant!r}, records_sha256={records_sha256!r}"
+            )
+        if (
+            not isinstance(record_count, int)
+            or isinstance(record_count, bool)
+            or record_count < 0
+        ):
+            raise RuntimeError(
+                "Gym checkpoint participant manifest has invalid record_count: "
+                f"participant={participant!r}, record_count={record_count!r}"
+            )
+        return GymCheckpointParticipantManifest(
+            schema_version=schema_version,
+            kind=kind,
+            instance=instance,
+            checkpoint_id=manifest_checkpoint_id,
+            records_file=records_file,
+            records_sha256=records_sha256,
+            record_count=record_count,
+        )
+
+    def _commit_summary(
+        self,
+        checkpoint_id: str,
+        episode_ids: list[Any],
+        replies: dict[str, dict[str, Any]],
+    ) -> GymCheckpointCommitSummary:
+        """Convert participant replies into an actor-local ownership summary."""
+        participants = self._require_participants()
+        expected_participants = {
+            participant.server_name for participant in participants.members
+        }
+        if set(replies) != expected_participants:
+            raise RuntimeError(
+                "Gym checkpoint commit returned an unexpected participant set: "
+                f"expected={sorted(expected_participants)!r}, "
+                f"actual={sorted(replies)!r}"
+            )
+
+        requested_keys = {episode_id.capture_key for episode_id in episode_ids}
+        exported_environment_keys: set[str] = set()
+        staging_keys: set[str] = set()
+        participant_summaries: list[GymCheckpointParticipantCommitSummary] = []
+        for member in participants.members:
+            reply = replies.get(member.server_name)
+            if not isinstance(reply, Mapping):
+                raise RuntimeError(
+                    "Gym checkpoint commit returned an invalid reply for participant "
+                    f"{member.server_name!r}"
+                )
+            phase = reply.get("phase")
+            if phase != "committed":
+                raise RuntimeError(
+                    "Gym checkpoint participant did not enter committed phase: "
+                    f"participant={member.server_name!r}, phase={phase!r}"
+                )
+            exported = reply.get("episode_ids")
+            if not isinstance(exported, list) or not all(
+                isinstance(capture_key, str) for capture_key in exported
+            ):
+                raise RuntimeError(
+                    "Gym checkpoint commit returned invalid episode_ids for "
+                    f"participant {member.server_name!r}"
+                )
+            episode_keys = tuple(sorted(set(exported)))
+            if len(episode_keys) != len(exported):
+                raise RuntimeError(
+                    "Gym checkpoint commit returned duplicate episode IDs for "
+                    f"participant {member.server_name!r}"
+                )
+            unexpected = set(episode_keys) - requested_keys
+            if unexpected:
+                raise RuntimeError(
+                    "Gym checkpoint participant exported episodes outside the "
+                    f"requested scope: participant={member.server_name!r}, "
+                    f"unexpected={sorted(unexpected)!r}"
+                )
+            if member.kind == "environment":
+                duplicate_owners = exported_environment_keys.intersection(episode_keys)
+                if duplicate_owners:
+                    raise RuntimeError(
+                        "Gym checkpoint episode was exported by multiple environment "
+                        f"participants: {sorted(duplicate_owners)!r}"
+                    )
+                exported_environment_keys.update(episode_keys)
+
+            participant_keys: tuple[str, ...] = ()
+            if member.kind == "model":
+                raw_staging_keys = reply.get("staging_keys")
+                if not isinstance(raw_staging_keys, list) or not all(
+                    isinstance(key, str) for key in raw_staging_keys
+                ):
+                    raise RuntimeError(
+                        "Gym checkpoint policy model returned invalid staging_keys: "
+                        f"participant={member.server_name!r}, "
+                        f"staging_keys={raw_staging_keys!r}"
+                    )
+                participant_keys = tuple(sorted(set(raw_staging_keys)))
+                if len(participant_keys) != len(raw_staging_keys):
+                    raise RuntimeError(
+                        "Gym checkpoint policy model returned duplicate staging_keys: "
+                        f"participant={member.server_name!r}"
+                    )
+                staging_keys.update(participant_keys)
+
+            participant_summaries.append(
+                GymCheckpointParticipantCommitSummary(
+                    server_name=member.server_name,
+                    kind=member.kind,
+                    phase=phase,
+                    episode_keys=episode_keys,
+                    manifest=self._participant_manifest(
+                        reply.get("manifest"),
+                        participant=member.server_name,
+                        kind=member.kind,
+                        checkpoint_id=checkpoint_id,
+                    ),
+                    staging_keys=participant_keys,
+                )
+            )
+
+        from nemo_gym.episode_types import EpisodeId
+
+        exported_episodes = tuple(
+            GymCheckpointEpisode(parsed.rollout_id, parsed.attempt)
+            for parsed in (
+                EpisodeId.from_capture_key(capture_key)
+                for capture_key in sorted(exported_environment_keys)
+            )
+        )
+        return GymCheckpointCommitSummary(
+            exported_episodes=exported_episodes,
+            staging_keys=tuple(sorted(staging_keys)),
+            participants=tuple(participant_summaries),
+        )
+
     async def retire(
         self,
         checkpoint_id: str,
-        episode_ids: Iterable[EpisodeId],
+        episodes: Iterable[GymCheckpointEpisode],
         *,
         deadline_ts: float,
     ) -> None:
@@ -136,7 +400,7 @@ class GymCheckpointAdapter:
         await retire(
             self._require_participants(),
             checkpoint_id,
-            episode_ids,
+            self._episode_ids(episodes),
             deadline_ts=deadline_ts,
         )
 
@@ -144,12 +408,13 @@ class GymCheckpointAdapter:
         self,
         checkpoint_id: str,
         checkpoint_root: str | Path,
-        episode_ids: Iterable[EpisodeId],
+        episodes: Iterable[GymCheckpointEpisode],
         *,
         deadline_ts: float,
     ) -> GymCheckpointCommitSummary:
         from nemo_gym._checkpoint.coordination import commit
 
+        episode_ids = self._episode_ids(episodes)
         replies = await commit(
             self._require_participants(),
             checkpoint_id,
@@ -157,45 +422,51 @@ class GymCheckpointAdapter:
             episode_ids,
             deadline_ts=deadline_ts,
         )
-        staging_keys: set[str] = set()
-        for participant in self._require_participants().members:
-            if participant.kind != "model":
-                continue
-            reply = replies.get(participant.server_name)
-            if not isinstance(reply, Mapping):
-                raise RuntimeError(
-                    "Gym checkpoint commit returned no reply for policy model "
-                    f"participant {participant.server_name!r}"
-                )
-            participant_keys = reply.get("staging_keys")
-            if not isinstance(participant_keys, list) or not all(
-                isinstance(key, str) for key in participant_keys
-            ):
-                raise RuntimeError(
-                    "Gym checkpoint policy model returned invalid staging_keys: "
-                    f"participant={participant.server_name!r}, "
-                    f"staging_keys={participant_keys!r}"
-                )
-            staging_keys.update(participant_keys)
-        return GymCheckpointCommitSummary(staging_keys=tuple(sorted(staging_keys)))
+        summary = self._commit_summary(checkpoint_id, episode_ids, replies)
+        return summary
 
     async def restore(
         self,
         checkpoint_id: str,
         checkpoint_root: str | Path,
-        episode_ids: Iterable[EpisodeId],
+        episodes: Iterable[GymCheckpointEpisode],
         *,
+        source_checkpoint_id: str,
         deadline_ts: float,
-    ) -> dict[str, dict[str, Any]]:
+    ) -> None:
         from nemo_gym._checkpoint.coordination import restore
 
-        return await restore(
+        replies = await restore(
             self._require_participants(),
             checkpoint_id,
             str(self._instance.checkpoint_dir(checkpoint_root)),
-            episode_ids,
+            self._episode_ids(episodes),
             deadline_ts=deadline_ts,
         )
+        expected_participants = {
+            participant.server_name
+            for participant in self._require_participants().members
+        }
+        if set(replies) != expected_participants:
+            raise RuntimeError(
+                "Gym checkpoint restore returned an unexpected participant set: "
+                f"expected={sorted(expected_participants)!r}, "
+                f"actual={sorted(replies)!r}"
+            )
+        mismatched_sources: dict[str, object] = {}
+        for participant, reply in replies.items():
+            if not isinstance(reply, Mapping):
+                mismatched_sources[participant] = type(reply).__name__
+                continue
+            actual_source = reply.get("source_checkpoint_id")
+            if actual_source != source_checkpoint_id:
+                mismatched_sources[participant] = actual_source
+        if mismatched_sources:
+            raise RuntimeError(
+                "Gym checkpoint restore loaded participant state from the wrong "
+                f"checkpoint: expected={source_checkpoint_id!r}, "
+                f"actual={mismatched_sources!r}"
+            )
 
     async def resume(self, checkpoint_id: str, *, deadline_ts: float) -> None:
         from nemo_gym._checkpoint.coordination import resume

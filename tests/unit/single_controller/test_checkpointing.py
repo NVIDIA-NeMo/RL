@@ -2098,6 +2098,60 @@ class TestDataPlaneCheckpoint:
         assert dp_client.clear_calls == [(["orphan-key"], staging_partition)]
         assert sorted(dp_client.sample_ids) == [route_key, "sealed-key"]
 
+    def test_rollout_recovery_inventory_preserves_gym_manifest_staging_keys(self):
+        staging_partition = "rollout_staging"
+        dp_client = _StagingInventoryDPClient(
+            ["sealed-key", "gym-owned-key", "orphan-key"],
+            partition_id=staging_partition,
+        )
+        actor = object.__new__(_ACTOR_CLS)
+        actor._rollout_recovery_ledger = _sealed_recovery_ledger("sealed-key")
+        actor._master_config = SimpleNamespace(
+            token_capture=SimpleNamespace(staging_partition=staging_partition)
+        )
+        actor._dp_client = dp_client
+
+        async def validate_inventory() -> int:
+            async with DataPlaneCheckpointBarrier().mutation() as cut:
+                return await actor._validate_rollout_recovery_inventory(
+                    cut,
+                    replay_metadata=None,
+                    clear_unreferenced=True,
+                    additional_expected_staging_keys={"gym-owned-key"},
+                )
+
+        assert asyncio.run(validate_inventory()) == 2
+        assert dp_client.clear_calls == [(["orphan-key"], staging_partition)]
+        assert sorted(dp_client.sample_ids) == ["gym-owned-key", "sealed-key"]
+
+    def test_rollout_recovery_inventory_rejects_missing_gym_staging_key(self):
+        staging_partition = "rollout_staging"
+        dp_client = _StagingInventoryDPClient(
+            ["sealed-key"],
+            partition_id=staging_partition,
+        )
+        actor = object.__new__(_ACTOR_CLS)
+        actor._rollout_recovery_ledger = _sealed_recovery_ledger("sealed-key")
+        actor._master_config = SimpleNamespace(
+            token_capture=SimpleNamespace(staging_partition=staging_partition)
+        )
+        actor._dp_client = dp_client
+
+        async def validate_inventory() -> None:
+            async with DataPlaneCheckpointBarrier().mutation() as cut:
+                await actor._validate_rollout_recovery_inventory(
+                    cut,
+                    replay_metadata=None,
+                    clear_unreferenced=True,
+                    additional_expected_staging_keys={"missing-gym-key"},
+                )
+
+        with pytest.raises(RuntimeError, match="staging rows missing"):
+            asyncio.run(validate_inventory())
+
+        assert dp_client.clear_calls == []
+        assert dp_client.sample_ids == ["sealed-key"]
+
     def test_gated_sampler_writes_authoritative_tq_checkpoint(self, tmp_path):
         mc = _actor_master_config(
             tmp_path,
@@ -2338,6 +2392,8 @@ def _ppo_save_actor(tmp_path: Path, calls: list[str]):
     actor._checkpointer = MagicMock()
     actor._checkpointer.save_optimizer = True
     actor._checkpointer.init_tmp_checkpoint.return_value = str(checkpoint_path)
+    actor._gym_checkpoint_coordinator = None
+    actor._rollout_dispatch_admission_gate = None
     actor._is_ppo = True
     actor._trainer = _OrderRecordingPolicy(calls)
     actor._value = _OrderRecordingCritic(calls)
