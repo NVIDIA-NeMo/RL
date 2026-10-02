@@ -54,6 +54,7 @@ from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     xtoken_off_policy_distillation_train,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.virtual_cluster import ClusterConfig
 
 
 def has_gloo() -> bool:
@@ -157,7 +158,6 @@ def _make_master_config(
             "policy": {
                 "dtensor_cfg": {
                     "enabled": True,
-                    "_v2": True,
                     "tensor_parallel_size": 1,
                     "context_parallel_size": 1,
                 },
@@ -174,7 +174,6 @@ def _make_master_config(
                         "weight": 1.0,
                         "dtensor_cfg": {
                             "enabled": True,
-                            "_v2": True,
                             "tensor_parallel_size": 1,
                             "context_parallel_size": 1,
                         },
@@ -207,7 +206,7 @@ def _make_master_config(
                 "num_workers": 0,
             },
             "logger": {"log_dir": "/tmp/logger"},
-            "cluster": {"num_nodes": 1, "gpus_per_node": 1},
+            "cluster": ClusterConfig(num_nodes=1, gpus_per_node=1),
             "checkpointing": {
                 "enabled": save_enabled,
                 "checkpoint_must_save_by": None,
@@ -327,14 +326,14 @@ def test_empty_teachers_list_rejected_at_config_load():
     )
 
 
-def test_setup_requires_dtensor_v2_student():
+def test_setup_rejects_legacy_v2_key_on_student():
     cfg = _make_master_config()
     cfg.policy["dtensor_cfg"]["_v2"] = False
     with (
         patch.object(xt_mod, "RayVirtualCluster") as mock_cluster,
         pytest.raises(
             ValueError,
-            match=r"policy\.dtensor_cfg\._v2=false selects the DTensor v1 backend",
+            match=r"DTensor v1 \(policy\.dtensor_cfg\._v2=false\)",
         ),
     ):
         setup(
@@ -347,14 +346,14 @@ def test_setup_requires_dtensor_v2_student():
     assert mock_cluster.call_count == 0
 
 
-def test_setup_requires_dtensor_v2_teacher():
+def test_setup_rejects_legacy_v2_key_on_teacher():
     cfg = _make_master_config()
     cfg.teachers[0].dtensor_cfg["_v2"] = False
     with (
         patch.object(xt_mod, "RayVirtualCluster") as mock_cluster,
         pytest.raises(
             ValueError,
-            match=r"teachers\.0\.dtensor_cfg\._v2=false selects the DTensor v1 backend",
+            match=r"DTensor v1 \(teachers\.0\.dtensor_cfg\._v2=false\)",
         ),
     ):
         setup(
@@ -758,7 +757,6 @@ def test_setup_builds_one_policy_per_teacher():
                 "weight": 0.5,
                 "dtensor_cfg": {
                     "enabled": True,
-                    "_v2": True,
                     "tensor_parallel_size": 1,
                     "context_parallel_size": 1,
                 },

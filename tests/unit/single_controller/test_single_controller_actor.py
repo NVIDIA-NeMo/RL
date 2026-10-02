@@ -28,8 +28,10 @@ from tensordict import TensorDict
 
 import nemo_rl.algorithms.single_controller as single_controller
 from nemo_rl.algorithms.advantage_estimator import (
+    AdvEstimatorConfig,
     GAEConfig,
     GeneralizedAdvantageEstimator,
+    OPDAdvantageEstimator,
 )
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     DATA_PLANE_CHECKPOINT_DIR,
@@ -54,7 +56,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, ROLLOUT_METRICS
-from nemo_rl.data_plane.tq_token_sink import STAGING_FIELDS
+from nemo_rl.data_plane.tq_token_sink import MEDIA_STAGING_FIELDS, STAGING_FIELDS
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.rollout_reassembler_actor import RolloutReassemblerActor
@@ -265,8 +267,9 @@ def test_fresh_mooncake_init_registers_partition(
     assert controller._data_plane_checkpoint_metadata is None
 
 
+@pytest.mark.parametrize("multimodal", [False, True])
 def test_fresh_mooncake_init_preserves_token_capture_and_multimodal_partitions(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, multimodal
 ) -> None:
     monkeypatch.setattr(single_controller, "Logger", lambda _: MagicMock())
     monkeypatch.setattr(single_controller, "configure_checkpoint_workers", MagicMock())
@@ -276,7 +279,7 @@ def test_fresh_mooncake_init_preserves_token_capture_and_multimodal_partitions(
     master_config.token_capture.enabled = True
     actor_args = _actor_args_for_init(
         dp_client=dp_client,
-        partition_includes_multimodal_fields=True,
+        partition_includes_multimodal_fields=multimodal,
     )
 
     _init_controller(master_config, actor_args)
@@ -285,11 +288,18 @@ def test_fresh_mooncake_init_preserves_token_capture_and_multimodal_partitions(
     canonical_call, staging_call = dp_client.register_partition.call_args_list
     assert canonical_call.kwargs["partition_id"] == "rollout_data"
     assert set(DP_TRAIN_FIELDS).issubset(canonical_call.kwargs["fields"])
-    assert set(WIRE_MULTIMODAL_FIELDS).issubset(canonical_call.kwargs["fields"])
+    assert (
+        set(WIRE_MULTIMODAL_FIELDS).issubset(canonical_call.kwargs["fields"])
+        is multimodal
+    )
     assert staging_call.kwargs["partition_id"] == (
         master_config.token_capture.staging_partition
     )
-    assert staging_call.kwargs["fields"] == list(STAGING_FIELDS)
+    # The actor-side warm-up must register the same media columns the
+    # driver-side path does, or a Mooncake run would stage into missing fields.
+    # Media columns are derived from the multimodal bit, not passed separately.
+    expected_media = list(MEDIA_STAGING_FIELDS) if multimodal else []
+    assert staging_call.kwargs["fields"] == list(STAGING_FIELDS) + expected_media
 
 
 @pytest.mark.parametrize("token_capture", [False, True])
@@ -1270,6 +1280,7 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
         "seq_logprob_error_metrics": [],
         "num_mask_sample_filtered": [],
     }
+    ctrl._opd_gap_sum = 0.0
     ctrl._opd_stat_sum = 0.0
     ctrl._opd_stat_sumsq = 0.0
     ctrl._opd_stat_count = 0
@@ -1298,6 +1309,7 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
         torch.full((2, 3), 0.25),
     )
     assert "advantages" in (enriched.fields or [])
+    assert ctrl._opd_gap_sum == pytest.approx(1.0)
     assert ctrl._opd_stat_sum == pytest.approx(1.0)
     assert ctrl._opd_stat_sumsq == pytest.approx(0.25)
     assert ctrl._opd_stat_count == 4
@@ -1311,19 +1323,113 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
     torch.testing.assert_close(logged, torch.full((4,), 0.1))
 
 
+def test_opd_advantage_stage_pools_raw_gap_separately_under_tropd() -> None:
+    """TROPD and the global baseline reshape the advantage, not the gap metric."""
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    token_mask = torch.tensor([[1.0, 1.0, 1.0], [1.0, 0.0, 0.0]])
+    prev_logprobs = torch.tensor([[-1.0, -2.0, -0.5], [-1.5, -3.0, -3.0]])
+    teacher_logprobs = torch.tensor([[-0.5, -0.5, -2.0], [-1.0, -1.0, -1.0]])
+
+    class FakeDataPlane:
+        def __init__(self):
+            self.put_fields = None
+
+        def get_samples(self, sample_ids, partition_id, select_fields):
+            del sample_ids, partition_id, select_fields
+            return TensorDict(
+                {
+                    "prompt_ids_for_adv": torch.zeros(2, 3, dtype=torch.long),
+                    "total_reward": torch.zeros(2),
+                    "token_mask": token_mask,
+                    "sample_mask": torch.ones(2),
+                    "mask_sample": torch.zeros(2, dtype=torch.bool),
+                    "truncated": torch.zeros(2, dtype=torch.bool),
+                    "generation_logprobs": prev_logprobs,
+                    "prev_logprobs": prev_logprobs,
+                    "teacher_reference_logprobs": teacher_logprobs,
+                },
+                batch_size=(2,),
+            )
+
+        def put_samples(self, sample_ids, partition_id, fields):
+            del sample_ids, partition_id
+            self.put_fields = fields
+
+    ctrl._advantage_cfg = AdvantageConfig()
+    ctrl._advantage_estimator = OPDAdvantageEstimator(
+        AdvEstimatorConfig(
+            name="opd", proximal_teacher_alpha=0.2, subtract_global_baseline=True
+        ),
+        ClippedPGLossConfig(),
+    )
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+    ctrl._policy_logprobs_required = True
+    ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = True
+    ctrl._is_ppo = False
+    ctrl._dp_client = FakeDataPlane()
+    ctrl._master_config = SimpleNamespace(
+        grpo=GRPOConfig(seq_logprob_error_threshold=None)
+    )
+    ctrl._algo_cfg = ctrl._master_config.grpo
+    ctrl._message_level_advantage_penalties_enabled = False
+    ctrl._step_log_dict = {
+        "rewards": [],
+        "sample_masks": [],
+        "masked_advantages": [],
+        "sequence_lengths": [],
+        "seq_logprob_error_metrics": [],
+        "num_mask_sample_filtered": [],
+    }
+    ctrl._opd_gap_sum = 0.0
+    ctrl._opd_stat_sum = 0.0
+    ctrl._opd_stat_sumsq = 0.0
+    ctrl._opd_stat_count = 0
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["a", "b"],
+        fields=[],
+        sequence_lengths=[3, 3],
+    )
+
+    asyncio.run(ctrl._advantage_stage(meta))
+
+    metrics = _pooled_opd_metrics(
+        ctrl._opd_stat_sum,
+        ctrl._opd_stat_sumsq,
+        ctrl._opd_stat_count,
+        gap_sum=ctrl._opd_gap_sum,
+    )
+    # Raw valid-token gaps are [0.5, 1.5, -1.5, 0.5].
+    assert metrics[
+        "on_policy_distillation/teacher_student_logprob_gap_mean"
+    ] == pytest.approx(0.25)
+    assert metrics["on_policy_distillation/adv_mean"] == pytest.approx(0.0, abs=1e-6)
+    assert "advantages" in ctrl._dp_client.put_fields
+    trained = torch.cat(ctrl._step_log_dict["masked_advantages"])
+    assert trained.numel() == 4
+    assert trained.mean().item() == pytest.approx(0.0, abs=1e-6)
+    # Centered, not merely shrunk: the proximal advantages keep their spread.
+    assert trained.std().item() > 0.1
+
+
 def test_pooled_opd_metrics_weight_unequal_chunks_by_valid_token_count() -> None:
     """A small streaming chunk cannot receive the same weight as a large one."""
     # Chunk 1 has values [0, 2]; chunk 2 has [4]. Averaging chunk means
     # would incorrectly produce 2.5. Exact pooling produces mean=2, std=2.
+    # The raw gap is pooled over the same tokens but reported on its own.
     metrics = _pooled_opd_metrics(
         stat_sum=6.0,
         stat_sumsq=20.0,
         count=3,
+        gap_sum=9.0,
     )
 
     assert metrics == pytest.approx(
         {
-            "on_policy_distillation/teacher_student_logprob_gap_mean": 2.0,
+            "on_policy_distillation/teacher_student_logprob_gap_mean": 3.0,
             "on_policy_distillation/adv_mean": 2.0,
             "on_policy_distillation/adv_std": 2.0,
         }
@@ -1674,6 +1780,7 @@ def _train_pump_controller(*, sampler) -> object:
         "num_mask_sample_filtered": [],
         "seq_logprob_error_metrics": [],
     }
+    ctrl._opd_gap_sum = 0.0
     ctrl._opd_stat_sum = 0.0
     ctrl._opd_stat_sumsq = 0.0
     ctrl._opd_stat_count = 0
