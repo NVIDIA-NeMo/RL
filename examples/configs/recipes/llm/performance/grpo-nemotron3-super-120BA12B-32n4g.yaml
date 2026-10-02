@@ -49,6 +49,8 @@ policy:
       NRL_REFIT_BUFFER_MEMORY_RATIO: "0.005"
       NRL_REFIT_NUM_BUFFERS: "1"
   generation:
+    colocated:
+      discard_weights_on_sleep: true
     vllm_cfg:
       async_engine: true
       tensor_parallel_size: 4

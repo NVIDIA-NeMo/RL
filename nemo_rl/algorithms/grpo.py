@@ -1353,7 +1353,7 @@ def setup(
         """Initialize vLLM generation workers."""
         t0 = time.perf_counter()
         pg = VllmGeneration(cluster=inference_cluster, config=generation_config)
-        pg.finish_generation()
+        pg.finish_generation(discard_weights=True)
         return pg, time.perf_counter() - t0
 
     def init_sglang():
@@ -1647,7 +1647,7 @@ def setup(
                 """Complete the deferred vLLM model load started above."""
                 t0 = time.perf_counter()
                 deferred_vllm.load_and_start()
-                deferred_vllm.finish_generation()
+                deferred_vllm.finish_generation(discard_weights=True)
                 return deferred_vllm, time.perf_counter() - t0
 
             def init_nemo_gym():
@@ -3032,6 +3032,14 @@ def _grpo_train_impl(
     val_period = master_config.grpo.val_period
     val_start_at = master_config.grpo.val_start_at
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
+    discard_colocated_vllm_weights = (
+        master_config.policy["generation"]["backend"] == "vllm"
+        and colocated_inference
+        and master_config.policy["generation"]["colocated"].get(
+            "discard_weights_on_sleep"
+        )
+        is True
+    )
     refit_buffer_size_gb = master_config.policy.get("refit_buffer_size_gb")
     stop_at_validation_threshold = master_config.grpo.stop_at_validation_threshold
     stop_at_validation_metric = master_config.grpo.stop_at_validation_metric
@@ -3335,7 +3343,8 @@ def _grpo_train_impl(
                                 master_config.grpo.deduplicate_multimodal_data
                             ),
                         )
-                    policy_generation.finish_generation()
+                    if not discard_colocated_vllm_weights:
+                        policy_generation.finish_generation()
                     # Collect generation logger metrics for performance reporting after each generation step
                     # inflight batch sizes and num pending samples are collected from each worker
                     if policy_generation is not None:
@@ -3451,6 +3460,12 @@ def _grpo_train_impl(
                     )
                     baseline = repeated_batch["baseline"]
                     std = repeated_batch["std"]
+
+                    if discard_colocated_vllm_weights:
+                        with timer.time("generation_finalize"):
+                            policy_generation.finish_generation(
+                                discard_weights=is_batch_complete
+                            )
 
                     # If the current batch is not enough to fill the buffer during dynamic sampling, we update the cache and process the next batch.
                     if not is_batch_complete:
@@ -3783,7 +3798,13 @@ def _grpo_train_impl(
                         logger=logger,
                         processor=processor,
                     )
-                    policy_generation.finish_generation()
+                    if discard_colocated_vllm_weights:
+                        policy_generation.finish_generation(
+                            discard_weights=is_last_step,
+                            final_generation=is_last_step,
+                        )
+                    else:
+                        policy_generation.finish_generation()
                     logger.log_metrics(
                         validation_timings, total_steps + 1, prefix="timing/validation"
                     )
