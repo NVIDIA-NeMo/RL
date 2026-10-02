@@ -83,19 +83,47 @@ def _master_config(*, num_prompts_per_step: int = 8, **async_kwargs) -> MasterCo
     )
 
 
-@pytest.mark.parametrize("algorithm", ["grpo", "ppo"])
-def test_single_forward_threshold_rejected_before_streaming_setup(
-    algorithm: str,
-) -> None:
+def test_single_forward_threshold_supported_for_megatron_grpo() -> None:
     cfg = _master_config()
     cfg.loss_fn.seq_logprob_error_in_loss = True
     cfg.grpo.seq_logprob_error_threshold = 2.0
     cfg.loss_fn.force_on_policy_ratio = True
-    if algorithm == "ppo":
-        # The loss flag must be rejected even without a GRPO block.
-        cfg.ppo = PPOConfig.model_construct()
-        cfg.grpo = None
-    with pytest.raises(ValueError, match="advantage baselines"):
+    cfg.policy["megatron_cfg"] = {"enabled": True}
+    validate_single_controller_config(cfg)
+
+
+def test_single_forward_threshold_rejects_ppo_before_setup() -> None:
+    cfg = _master_config()
+    cfg.loss_fn.seq_logprob_error_in_loss = True
+    cfg.ppo = PPOConfig.model_construct()
+    cfg.grpo = None
+    with pytest.raises(ValueError, match="requires GRPO"):
+        validate_single_controller_config(cfg)
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    ["threshold", "force_on_policy", "token_level", "backend", "mtp", "kl_in_reward"],
+)
+def test_single_forward_threshold_preserves_legacy_restrictions(invalid) -> None:
+    cfg = _master_config()
+    cfg.loss_fn.seq_logprob_error_in_loss = True
+    cfg.loss_fn.force_on_policy_ratio = True
+    cfg.grpo.seq_logprob_error_threshold = 2.0
+    cfg.policy["megatron_cfg"] = {"enabled": True}
+    if invalid == "threshold":
+        cfg.grpo.seq_logprob_error_threshold = None
+    elif invalid == "force_on_policy":
+        cfg.loss_fn.force_on_policy_ratio = False
+    elif invalid == "token_level":
+        cfg.loss_fn.token_level_loss = False
+    elif invalid == "backend":
+        cfg.policy["megatron_cfg"]["enabled"] = False
+    elif invalid == "mtp":
+        cfg.policy["megatron_cfg"]["mtp_num_layers"] = 1
+    else:
+        cfg.loss_fn.use_kl_in_reward = True
+    with pytest.raises(ValueError):
         validate_single_controller_config(cfg)
 
 
