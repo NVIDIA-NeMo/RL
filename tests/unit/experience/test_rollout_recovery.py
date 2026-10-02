@@ -1573,3 +1573,73 @@ def test_mark_gym_retired_keeps_drops_recorded_after_the_retire_was_sent() -> No
         first.gym_episode(0)
         not in ledger.gym_checkpoint_retirements({"tools/replica-0"})["tools/replica-0"]
     )
+
+
+def test_a_dropped_dispatch_is_queued_for_retirement_and_replaced() -> None:
+    """A broken stream leaves the row running in Gym; its re-send needs a new ID."""
+    ledger = RolloutRecoveryLedger()
+    group = _dispatched_turn_group(ledger)
+
+    dropped = _mutate(
+        lambda cut: ledger.abandon_dropped_dispatch(
+            cut, "g7", generation_indices=[1], replace=True
+        )
+    )
+
+    assert dropped == (group.gym_episode(1),)
+    assert ledger.gym_checkpoint_retirements({"tools/replica-0"}) == {
+        "tools/replica-0": (group.gym_episode(1),)
+    }
+    replaced = ledger.get_group("g7")
+    assert replaced.siblings[1].attempts[0].status is RolloutAttemptStatus.ABANDONED
+    assert replaced.siblings[1].current_attempt.status is RolloutAttemptStatus.RESERVED
+    assert replaced.gate_rollout_id(1) != group.gate_rollout_id(1)
+    # The sibling that returned keeps its attempt and is not Gym-retired.
+    assert replaced.gate_rollout_id(0) == group.gate_rollout_id(0)
+    assert ledger.gym_checkpoint_inventory({"tools/replica-0"}) == {
+        "tools/replica-0": (group.gym_episode(0),)
+    }
+
+
+def test_a_dropped_attempt_that_never_reached_gym_keeps_its_identity() -> None:
+    ledger = RolloutRecoveryLedger()
+    group = _dispatched_turn_group(ledger)
+    _mutate(lambda cut: ledger.release_refused_dispatch(cut, "g7", generation_index=1))
+
+    dropped = _mutate(
+        lambda cut: ledger.abandon_dropped_dispatch(
+            cut, "g7", generation_indices=[1], replace=True
+        )
+    )
+
+    assert dropped == ()
+    assert ledger.get_group("g7").gate_rollout_id(1) == group.gate_rollout_id(1)
+
+
+def test_a_prompt_group_cannot_replace_one_dropped_sibling() -> None:
+    ledger = RolloutRecoveryLedger()
+    _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=2,
+        target_step=7,
+        start_weight_version=6,
+        recovery_granularity=RecoveryGranularity.PROMPT_GROUP,
+        restore_level=RecoveryTargetLevel.TURN,
+        admitted=True,
+    )
+    _mutate(
+        lambda cut: ledger.mark_group_dispatched(
+            cut, "g7", gym_instance_id="tools/replica-0"
+        )
+    )
+
+    with pytest.raises(ValueError, match="replaces the whole cohort"):
+        _mutate(
+            lambda cut: ledger.abandon_dropped_dispatch(
+                cut, "g7", generation_indices=[1], replace=True
+            )
+        )

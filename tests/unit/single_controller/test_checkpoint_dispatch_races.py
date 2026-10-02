@@ -2265,7 +2265,7 @@ class _DiskLiveSessionGymCoordinator(_LiveSessionGymCoordinator):
 
 
 class TestARowDroppedDuringACheckpointDoesNotFailIt:
-    """RL can drop rows while Gym is prepared; the checkpoint must hold.
+    """A broken stream can drop rows while Gym is prepared; the checkpoint must hold.
 
     The drop marks the rows abandoned at once, but Gym refuses a retire until it
     resumes, so it still holds and exports them. Restore requires the saved Gym
@@ -2278,10 +2278,13 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
         ledger: RolloutRecoveryLedger,
         barrier: DataPlaneCheckpointBarrier,
         group_id: str,
+        generation_indices: list[int],
     ) -> None:
-        # A cancelled group task queues its retire for the next checkpoint.
+        # What _drop_unreturned_rows records before its retire waits for resume.
         async with barrier.mutation() as cut:
-            ledger.abandon_unsealed(cut, group_id)
+            ledger.abandon_dropped_dispatch(
+                cut, group_id, generation_indices=generation_indices, replace=True
+            )
 
     @staticmethod
     async def _save(
@@ -2322,7 +2325,7 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
 
             coordinator = _DiskLiveSessionGymCoordinator(
                 live={row_0, row_1},
-                while_prepared=lambda: self._drop(ledger, barrier, group.group_id),
+                while_prepared=lambda: self._drop(ledger, barrier, group.group_id, [1]),
             )
             controller = _controller_for(coordinator, ledger)
             controller._data_plane_checkpoint_barrier = barrier
@@ -2331,20 +2334,15 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
                 self._save(controller, barrier, tmp_path), _ASYNC_TEST_TIMEOUT_S
             )
 
-            self._assert_restorable(controller, coordinator, tmp_path, kept=set())
+            self._assert_restorable(controller, coordinator, tmp_path, kept={row_0})
             assert ledger.gym_checkpoint_retirements({"tools/replica-0"}) == {
-                "tools/replica-0": tuple(
-                    sorted(
-                        (episode.rollout_id, episode.attempt)
-                        for episode in (row_0, row_1)
-                    )
-                )
+                "tools/replica-0": ((row_1.rollout_id, row_1.attempt),)
             }
 
         asyncio.run(exercise())
 
     def test_a_drop_while_the_commit_drains(self, tmp_path: Path) -> None:
-        """The group is dropped while its on-wire reply drains, with a row Gym exported."""
+        """A failed on-wire reply ends the stream, dropping a row Gym exported."""
 
         async def exercise() -> None:
             barrier = DataPlaneCheckpointBarrier()
@@ -2365,7 +2363,7 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
                     for event in coordinator.events
                 ):
                     await asyncio.sleep(0)
-                await self._drop(ledger, barrier, group.group_id)
+                await self._drop(ledger, barrier, group.group_id, [0, 1])
 
             failing = asyncio.create_task(fail_the_on_wire_reply())
             await asyncio.wait_for(
@@ -2398,14 +2396,13 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
             row_0, row_1 = (
                 GymCheckpointEpisode(*group.gym_episode(index)) for index in (0, 1)
             )
+            key_0 = f"{row_0.rollout_id}/call-0"
+            key_1 = f"{row_1.rollout_id}/call-0"
             coordinator = _DiskLiveSessionGymCoordinator(
                 live={row_0, row_1},
-                while_prepared=lambda: self._drop(ledger, barrier, group.group_id),
+                while_prepared=lambda: self._drop(ledger, barrier, group.group_id, [1]),
             )
-            coordinator.staging_keys_by_episode = {
-                row_0: (f"{row_0.rollout_id}/call-0",),
-                row_1: (f"{row_1.rollout_id}/call-0",),
-            }
+            coordinator.staging_keys_by_episode = {row_0: (key_0,), row_1: (key_1,)}
             controller = _controller_for(coordinator, ledger)
             controller._data_plane_checkpoint_barrier = barrier
             controller._master_config = SimpleNamespace(
@@ -2414,8 +2411,8 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
 
             async def list_sample_ids(method: str, *, partition_id: str) -> list[str]:
                 assert (method, partition_id) == ("list_sample_ids", "rollout_staging")
-                # The dropped group's staging is gone by the time the cut looks.
-                return []
+                # The dropped row's staging is gone by the time the cut looks.
+                return [key_0]
 
             controller._call_dp = list_sample_ids
 
@@ -2424,8 +2421,8 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
             )
 
             saved = load_gym_checkpoint_manifest(tmp_path)
-            assert saved.instances == {"tools/replica-0": ()}
-            assert saved.staging_keys == {"tools/replica-0": ()}
+            assert set(saved.instances["tools/replica-0"]) == {row_0}
+            assert saved.staging_keys == {"tools/replica-0": (key_0,)}
 
         asyncio.run(exercise())
 
@@ -2450,7 +2447,7 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
                 tmp_path, checkpoint_id="save-1"
             ) as gym_commit:
                 assert gym_commit is not None
-                await self._drop(ledger, barrier, group.group_id)
+                await self._drop(ledger, barrier, group.group_id, [0])
                 # As if the drop's retire had already been acknowledged.
                 ledger.mark_gym_retired(
                     {"tools/replica-0": [(row_0.rollout_id, row_0.attempt)]}

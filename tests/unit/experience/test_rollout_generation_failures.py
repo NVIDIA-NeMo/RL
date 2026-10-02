@@ -34,6 +34,7 @@ import pytest
 import ray.exceptions
 import torch
 
+from nemo_rl.environments.gym_checkpoint_adapter import GymCheckpointEpisode
 from nemo_rl.environments.interfaces import EnvironmentReturn
 from nemo_rl.experience.failures import (
     FailureClass,
@@ -1127,3 +1128,231 @@ class TestGymCheckpointParkedRows:
             assert method.dispatched == [[0, 1], [1]]
 
         asyncio.run(exercise())
+
+
+class _EarlyEndingGym:
+    """NemoGym actor whose first stream returns row 0, then dies with rows still running.
+
+    Gym runs every row of a dispatch as its own task, so the rows that never
+    came back are still executing there after the stream breaks.
+    """
+
+    def __init__(self) -> None:
+        self.events: list[tuple] = []
+        self.run_rollouts = self._RunRollouts(self)
+        self.checkpoint_retire = self._Retire(self)
+
+    class _RunRollouts:
+        def __init__(self, gym: "_EarlyEndingGym") -> None:
+            self._gym = gym
+
+        def options(self, **kwargs):
+            del kwargs
+            return self
+
+        def remote(self, inputs, timer_prefix, per_prompt=False):
+            del timer_prefix, per_prompt
+            first = not any(event[0] == "dispatch" for event in self._gym.events)
+            self._gym.events.append(
+                ("dispatch", {row["_rowidx"]: row["_ng_rollout_id"] for row in inputs})
+            )
+            return self._stream([row["_rowidx"] for row in inputs], first)
+
+        async def _stream(self, rows, first):
+            if first:
+                yield _row_result(rows[0])
+                raise ConnectionResetError("gym stream died mid-flight")
+            for rowidx in rows:
+                yield _row_result(rowidx)
+
+    class _Retire:
+        def __init__(self, gym: "_EarlyEndingGym") -> None:
+            self._gym = gym
+
+        def remote(self, checkpoint_id, episodes, *, deadline_ts):
+            del checkpoint_id, deadline_ts
+            self._gym.events.append(("retire", frozenset(episodes)))
+
+            async def _done() -> None:
+                return None
+
+            return _done()
+
+
+class _CuedEarlyEndingGym(_EarlyEndingGym):
+    """Like ``_EarlyEndingGym``, but the first stream breaks only on cue."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.break_stream = asyncio.Event()
+        stream = self.run_rollouts._stream
+
+        async def cued(rows, first):
+            async for result in stream(rows, first):
+                yield result
+                if first:
+                    await self.break_stream.wait()
+
+        self.run_rollouts._stream = cued
+
+
+class TestGymEarlyStreamEnd:
+    """Rows still running in Gym when a stream breaks must not overlap their replacements."""
+
+    @staticmethod
+    def _dispatch(
+        gym: _EarlyEndingGym,
+        granularity: RecoveryGranularity,
+        row_attempts: int,
+        gate: RolloutDispatchAdmissionGate | None = None,
+    ):
+        from nemo_rl.algorithms.async_utils.replay_buffer import (
+            DataPlaneCheckpointBarrier,
+        )
+        from nemo_rl.experience.rollout_recovery import (
+            RecoveryTargetLevel,
+            RolloutRecoveryLedger,
+        )
+
+        impl = _make_gym_impl(None, num_generations=3, row_attempts=row_attempts)
+        impl._task_to_env = {"nemo_gym": gym}
+        impl._dispatch_admission_gate = gate or RolloutDispatchAdmissionGate()
+        barrier = DataPlaneCheckpointBarrier()
+        ledger = RolloutRecoveryLedger()
+        manager = object.__new__(RolloutManager)
+        manager._recovery_ledger = ledger
+        manager._data_plane_checkpoint_barrier = barrier
+
+        async def reserve():
+            async with barrier.mutation() as cut:
+                return ledger.reserve_group(
+                    cut,
+                    group_id="g7",
+                    admission_id="batch-7",
+                    prompt_id="7",
+                    prompt_payload={"idx": 7, "message_log": []},
+                    expected_generations=3,
+                    target_step=7,
+                    start_weight_version=7,
+                    recovery_granularity=granularity,
+                    restore_level=RecoveryTargetLevel.TURN,
+                    admitted=True,
+                )
+
+        group = asyncio.run(reserve())
+        rows = [
+            {
+                "_rowidx": index,
+                "task_source": "workplace_assistant",
+                "_ng_rollout_id": group.gate_rollout_id(index),
+            }
+            for index in range(3)
+        ]
+        recorder = _LedgerDispatchRecorder(
+            manager=manager, group_id="g7", gym_instance_id="tools/replica-0"
+        )
+        episodes = {
+            index: GymCheckpointEpisode(*group.gym_episode(index)) for index in range(3)
+        }
+
+        async def run():
+            return await impl._run_rollouts(
+                rows,
+                Timer(),
+                "timing/rollout",
+                recovery_granularity=granularity,
+                dispatch_recorder=recorder,
+            )
+
+        return run, episodes, ledger
+
+    def test_rows_still_running_are_retired_before_they_are_resent_under_new_ids(self):
+        from nemo_rl.experience.rollout_recovery import RolloutAttemptStatus
+
+        gym = _EarlyEndingGym()
+        run, episodes, ledger = self._dispatch(
+            gym, RecoveryGranularity.SIBLING, row_attempts=3
+        )
+
+        completions, _, _ = asyncio.run(run())
+
+        assert len(completions) == 3
+        kinds = [event[0] for event in gym.events]
+        assert kinds == ["dispatch", "retire", "dispatch"], gym.events
+        first, retired, resent = (event[1] for event in gym.events)
+        # Rows 1 and 2 never came back, so Gym may still be running them.
+        assert retired == frozenset({episodes[1], episodes[2]})
+        assert set(resent) == {1, 2}
+        assert set(resent.values()).isdisjoint(first.values())
+        group = ledger.get_group("g7")
+        for index in (1, 2):
+            sibling = group.siblings[index]
+            assert sibling.attempts[0].status is RolloutAttemptStatus.ABANDONED
+            assert sibling.current_attempt.status is RolloutAttemptStatus.DISPATCHED
+            assert group.gate_rollout_id(index) == resent[index]
+        assert ledger.gym_checkpoint_retirements({"tools/replica-0"}) == {
+            "tools/replica-0": ()
+        }
+
+    def test_a_prompt_group_retires_its_running_siblings_before_giving_up(self):
+        gym = _EarlyEndingGym()
+        run, episodes, _ = self._dispatch(
+            gym, RecoveryGranularity.PROMPT_GROUP, row_attempts=1
+        )
+
+        with pytest.raises(ConnectionResetError):
+            asyncio.run(run())
+
+        assert [event[0] for event in gym.events] == ["dispatch", "retire"]
+        retired = gym.events[1][1]
+        # The prompt retry dispatches fresh attempts next; none may overlap these.
+        assert {episodes[1], episodes[2]} <= retired <= set(episodes.values())
+
+    def test_a_failed_retire_leaves_the_dropped_rows_for_the_next_checkpoint(self):
+        gym = _EarlyEndingGym()
+
+        def unreachable(checkpoint_id, episodes, *, deadline_ts):
+            del checkpoint_id, deadline_ts
+            gym.events.append(("retire", frozenset(episodes)))
+            raise ConnectionRefusedError("gym control plane is down")
+
+        gym.checkpoint_retire.remote = unreachable
+        run, episodes, ledger = self._dispatch(
+            gym, RecoveryGranularity.SIBLING, row_attempts=3
+        )
+
+        completions, _, _ = asyncio.run(run())
+
+        assert len(completions) == 3
+        assert [event[0] for event in gym.events] == ["dispatch", "retire", "dispatch"]
+        pending = ledger.gym_checkpoint_retirements({"tools/replica-0"})
+        assert set(pending["tools/replica-0"]) == {
+            (episodes[index].rollout_id, episodes[index].attempt) for index in (1, 2)
+        }
+
+    def test_a_dropped_row_is_not_retired_while_a_checkpoint_holds_dispatch_closed(
+        self,
+    ):
+        """Gym refuses a retire once a checkpoint is open, so it waits for resume."""
+        gym = _CuedEarlyEndingGym()
+        gate = RolloutDispatchAdmissionGate()
+        run, episodes, _ = self._dispatch(
+            gym, RecoveryGranularity.SIBLING, row_attempts=3, gate=gate
+        )
+
+        async def exercise() -> None:
+            rollout = asyncio.create_task(run())
+            while not gym.events:
+                await asyncio.sleep(0)
+            async with gate.closed():
+                # The stream breaks while the checkpoint holds Gym prepared.
+                gym.break_stream.set()
+                await asyncio.sleep(0.05)
+                assert [event[0] for event in gym.events] == ["dispatch"]
+            completions, _, _ = await asyncio.wait_for(rollout, timeout=5.0)
+            assert len(completions) == 3
+
+        asyncio.run(exercise())
+
+        assert [event[0] for event in gym.events] == ["dispatch", "retire", "dispatch"]
+        assert gym.events[1][1] == frozenset({episodes[1], episodes[2]})
