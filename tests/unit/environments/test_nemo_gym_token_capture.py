@@ -269,6 +269,78 @@ def test_a_truly_in_flight_pending_intent_keeps_the_receipt_unsealable() -> None
         _receipt_staging_keys(receipt)
 
 
+def test_an_undrained_receipt_masks_instead_of_wedging() -> None:
+    """When the drain budget lapses with the call still executing, the
+    receipt must become sealable as a masked rollout, not abort the run."""
+    from nemo_rl.environments.nemo_gym import _mask_undrained_receipt
+    from nemo_rl.experience.rollout_recovery import _receipt_staging_keys
+
+    env = _capture_env()
+    manifest = {
+        "rollout_id": "r0",
+        "records": [_manifest_record("c1")],
+        "failures": [],
+        "attempted_call_ids": ["c1", "c2"],
+        "pending_call_ids": ["c2"],
+    }
+    receipt = _mask_undrained_receipt(
+        env._assemble_receipt("r0", manifest, terminal_response_id="resp-c1", reward=0.0)
+    )
+    assert receipt["pending_call_ids"] == []
+    assert receipt["capture_poisoned"] is True
+    assert receipt["failure_reason"] == "capture_drain_timeout"
+    # Cleanup still covers the unresolved call's possible staging row.
+    assert "r0/c2" in _receipt_staging_keys(receipt)
+
+
+def test_the_terminal_manifest_read_drains_an_in_flight_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session ended at its budget can leave its last call executing in the
+    engine; the terminal manifest read polls until the call resolves."""
+    import nemo_rl.environments.nemo_gym as env_module
+
+    env = _capture_env()
+    pending = {
+        "rollout_id": "r0",
+        "records": [],
+        "failures": [],
+        "attempted_call_ids": ["c1"],
+        "pending_call_ids": ["c1"],
+    }
+    resolved = {
+        "rollout_id": "r0",
+        "records": [_manifest_record("c1")],
+        "failures": [],
+        "attempted_call_ids": ["c1"],
+        "pending_call_ids": [],
+    }
+    env._control = AsyncMock(side_effect=[pending, resolved])
+    monkeypatch.setattr(env_module, "_CAPTURE_DRAIN_POLL_S", 0.0)
+    manifest = asyncio.run(env._drained_manifest("r0"))
+    assert manifest["pending_call_ids"] == []
+    assert env._control.await_count == 2
+
+
+def test_the_drain_budget_bounds_the_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    import nemo_rl.environments.nemo_gym as env_module
+
+    env = _capture_env()
+    pending = {
+        "rollout_id": "r0",
+        "records": [],
+        "failures": [],
+        "attempted_call_ids": ["c1"],
+        "pending_call_ids": ["c1"],
+    }
+    env._control = AsyncMock(return_value=pending)
+    monkeypatch.setattr(env_module, "_CAPTURE_DRAIN_POLL_S", 0.0)
+    monkeypatch.setattr(env_module, "_CAPTURE_DRAIN_TIMEOUT_S", 0.0)
+    manifest = asyncio.run(env._drained_manifest("r0"))
+    assert manifest["pending_call_ids"] == ["c1"]
+    assert env._control.await_count == 1
+
+
 def test_receipt_assembly_poisons_when_the_terminal_row_is_missing() -> None:
     env = _capture_env()
     manifest = {
