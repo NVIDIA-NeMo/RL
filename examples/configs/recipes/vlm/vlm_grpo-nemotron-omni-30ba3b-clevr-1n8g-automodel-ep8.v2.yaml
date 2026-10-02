@@ -6,7 +6,6 @@ grpo:
 checkpointing:
   checkpoint_dir: results/vlm_grpo_nemotron_omni
 policy:
-  make_sequence_length_divisible_by: 64
   model_name: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
   train_global_batch_size: 32
   logprob_batch_size: 1
@@ -30,7 +29,7 @@ policy:
         attn: sdpa
         linear: torch
         rms_norm: torch_fp32
-        dispatcher: hybridep
+        dispatcher: deepep
         experts: torch_mm
         fake_balanced_gate: false
         rope_fusion: false
