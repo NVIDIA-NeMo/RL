@@ -1401,6 +1401,11 @@ class TestSetup:
         [
             ("min_groups", ValueError, "must be >="),
             (
+                "repeated_grpo_updates",
+                NotImplementedError,
+                "grpo.num_updates_per_rollout",
+            ),
+            (
                 "global_batch_size",
                 ValueError,
                 "must equal policy.train_global_batch_size",
@@ -1449,6 +1454,9 @@ class TestSetup:
         if invalid_case == "min_groups":
             mc = _make_master_config()
             mc.async_rl.min_groups_for_streaming_train = 5
+        elif invalid_case == "repeated_grpo_updates":
+            mc = _make_master_config()
+            mc.grpo.num_updates_per_rollout = 2
         elif invalid_case == "global_batch_size":
             mc = _make_master_config()
             mc.policy["train_global_batch_size"] = 7
