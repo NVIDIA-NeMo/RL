@@ -505,13 +505,14 @@ class SingleControllerActor:
         # it costs five minutes, not quietly at hour three of a run.
         self._env_handles = actor_args.env_handles
         # Rollout state the environment backend holds between turns. Only
-        # turn-level recovery keeps any; otherwise this is a no-op.
+        # turn- and prefix-level recovery keep any; otherwise this is a no-op.
         self._environment_checkpoint: EnvironmentCheckpoint = (
             build_environment_checkpoint(
                 master_config,
                 env_handles=self._env_handles,
                 rollout_manager=self._rollout_manager,
                 dp_client=self._dp_client,
+                generation=self._gen,
             )
         )
         # These two keep the getattr for a genuinely different reason: None is a
