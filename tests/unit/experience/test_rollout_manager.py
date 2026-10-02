@@ -2211,7 +2211,7 @@ class TestGenerateForFinalizationFlow:
         }
         first = _make_capture_manager(
             _FakeCaptureBuffer(),
-            recovery_config=RolloutRecoveryConfig(default_granularity=granularity),
+            recovery_config=RolloutRecoveryConfig(target_level=granularity),
         )
         request = _run(first.generate_for_finalization(prompt))
         assert request.resolved_agent_name == "resolved-agent"
