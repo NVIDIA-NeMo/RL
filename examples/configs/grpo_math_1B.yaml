@@ -37,7 +37,7 @@ grpo:
   # Advantage Estimator Configuration
   # Options: "grpo" (default) or "reinforce_plus_plus"
   adv_estimator:
-    name: "grpo"  # Use "reinforce_plus_plus" for Reinforce++ estimator
+    name: "grpo"  # Or "reinforce_plus_plus", "gdpo", "argmaxrl" (see docs/guides/grpo.md)
     normalize_rewards: ${grpo.normalize_rewards}
     use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
     minus_baseline: true  # Reinforce++-baseline specific: subtract per-prompt mean baseline
