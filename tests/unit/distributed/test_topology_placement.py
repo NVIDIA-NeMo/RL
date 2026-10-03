@@ -129,9 +129,10 @@ class TestTopoRankValues:
         assert topo_rank == 7
 
     def test_block_node_combined_value(self):
-        # block.node format: $(( 10#2 * 10000000000 + 10#15 )) = 20000000015
-        topo_rank = int(20000000015.0)
-        assert topo_rank == 20000000015
+        # Allocation index: sorted (block, hostname) -> 1..N.
+        # 1500-node job is still a small integer; must round-trip through Ray floats.
+        topo_rank = int(1500.0)
+        assert topo_rank == 1500
 
     def test_sorting_with_slurm_procid_ranks(self):
         # Nodes labelled by SLURM_PROCID (1..8) across two domains
@@ -160,10 +161,10 @@ class TestTopoRankValues:
         assert max(b_indices) < min(a_indices)
 
     def test_sorting_with_block_node_ranks(self):
-        # block.node: block 0 nodes 0..3, block 1 nodes 0..3
-        # block 0 has lower combined rank → should sort first
-        block0_ranks = [0 * 10000000000 + i for i in range(4)]
-        block1_ranks = [1 * 10000000000 + i for i in range(4)]
+        # 1..N ranks: block 0 nodes 1..4, block 1 nodes 5..8
+        # block 0 has lower rank → should sort first
+        block0_ranks = list(range(1, 5))
+        block1_ranks = list(range(5, 9))
         bundle_data = _make_bundle_data(
             {
                 "nvlink_domain_A": block1_ranks,
