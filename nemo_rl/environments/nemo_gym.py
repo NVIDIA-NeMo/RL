@@ -1126,13 +1126,11 @@ Depending on your data shape, you may want to change these values."""
             f"Hit a non-successful response when querying NeMo Gym for rollouts: {nemo_gym_result}"
         )
         if is_nemo_gym_task(nemo_gym_row):
-            # Native episode capture includes its attempt suffix. Read the same
-            # identity the Environment Server used when calling the model.
-            from nemo_gym.episode_types import EpisodeId
+            from nemo_gym.rollout_correlation import maybe_rollout_id_from_run_body
 
-            rollout_id = EpisodeId.model_validate(
-                nemo_gym_result["_ng_episode_id"]
-            ).capture_key
+            # Normalization already matched the reply to this request identity.
+            rollout_id = maybe_rollout_id_from_run_body(nemo_gym_row)
+            assert rollout_id is not None
         else:
             rollout_id = nemo_gym_row[_NG_ROLLOUT_ID_BODY_KEY]
         # Gym's TERMINAL_RESPONSE_ID_KEY: the served response envelope id the
