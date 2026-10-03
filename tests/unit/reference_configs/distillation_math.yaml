@@ -42,6 +42,10 @@ policy: &POLICY_BASE
     logprob_chunk_size: null
 
     offload_optimizer_for_logprob: false
+    # Run the policy offload lifecycle before non-colocated refit.
+    offload_policy_before_refit: false
+    # Move optimizer state to CPU when the refit offload lifecycle runs.
+    offload_optimizer_for_refit: true
 
     dtensor_cfg: &DTENSOR_BASE
         enabled: true

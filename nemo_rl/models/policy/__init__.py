@@ -685,6 +685,10 @@ class PolicyConfig(TypedDict):
     # This sets the clipping norm for the DTensorPolicyWorkers (Megatron's is called clip_grad)
     max_grad_norm: NotRequired[float | int | None]
     refit_buffer_size_gb: NotRequired[float | int]
+    # Run the policy offload lifecycle before non-colocated refit.
+    offload_policy_before_refit: bool
+    # Move optimizer state to CPU when offload_before_refit runs.
+    offload_optimizer_for_refit: bool
     optimizer: NotRequired[PytorchOptimizerConfig | None]
     scheduler: NotRequired[
         list[SinglePytorchSchedulerConfig | SinglePytorchMilestonesConfig]

@@ -519,6 +519,7 @@ def mock_grpo_components():
                 "precision": "bfloat16",
                 "train_global_batch_size": 1,
                 "train_micro_batch_size": 1,
+                "offload_policy_before_refit": False,
                 "max_total_sequence_length": 2048,
                 "make_sequence_length_divisible_by": 1,
                 "generation": {
@@ -3456,6 +3457,9 @@ def test_setup_auto_enables_skip_reference_logprobs_with_policy_factory(
             return "127.0.0.1", 1234
 
     class DummyPolicy:
+        def __init__(self, cfg):
+            self.cfg = cfg
+
         def print_node_ip_and_gpu_id(self):
             pass
 
@@ -3478,7 +3482,6 @@ def test_setup_auto_enables_skip_reference_logprobs_with_policy_factory(
     ):
         del (
             cluster,
-            config,
             tokenizer,
             processor,
             weights_path,
@@ -3486,7 +3489,7 @@ def test_setup_auto_enables_skip_reference_logprobs_with_policy_factory(
             init_optimizer,
             init_reference_model,
         )
-        return DummyPolicy()
+        return DummyPolicy(config)
 
     class DummySGLangGeneration:
         num_gpus_per_engine = 1
@@ -6605,6 +6608,30 @@ def test_train_fields_for_step(skip_prev_logprobs, expect_prev):
 )
 def test_needs_hf_refit_handshake(backend, nccl_reshard, colocated, expected):
     assert _needs_hf_refit_handshake(backend, nccl_reshard, colocated) is expected
+
+
+@pytest.mark.parametrize(
+    ("backend", "nccl_reshard", "offload_policy", "expected"),
+    [
+        ("vllm", False, False, False),
+        ("vllm", False, True, True),
+        ("vllm", True, False, True),
+        ("dynamo", False, False, True),
+    ],
+)
+def test_noncolocated_refit_synchronizer_selection(
+    backend, nccl_reshard, offload_policy, expected
+):
+    from nemo_rl.algorithms import grpo as grpo_mod
+
+    assert (
+        grpo_mod._uses_managed_noncolocated_refit(
+            generation_backend=backend,
+            nccl_reshard_refit_enabled=nccl_reshard,
+            offload_policy_before_refit=offload_policy,
+        )
+        is expected
+    )
 
 
 def test_grpo_train_shuts_down_environments_after_failure():
