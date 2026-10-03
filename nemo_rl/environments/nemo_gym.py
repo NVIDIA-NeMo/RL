@@ -1527,7 +1527,7 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
         # Megatron Inference is always async; should_use_async_rollouts rejects
         # an explicit mcore_generation_config.async_engine key.
         generation_config["mcore_generation_config"]["expose_http_server"] = True
-    elif backend == "sglang":
+    elif generation_config["backend"] == "sglang":
         if generation_config.get("sglang_cfg") is None:
             raise ValueError(
                 "NeMo Gym with the SGLang backend requires "
@@ -1538,7 +1538,7 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
         generation_config["use_async_rollouts"] = True
     else:
         raise ValueError(
-            "NeMo-Gym setup supports vllm or megatron generation; got "
+            "NeMo-Gym setup supports vllm, megatron or sglang generation; got "
             f"{generation_config['backend']!r}"
         )
 
@@ -1892,6 +1892,7 @@ def build_nemo_gym_actors(
     tokenizer: PreTrainedTokenizerBase,
     enable_router_replay: bool,
     use_fastokens: bool,
+    generation_backend: str = "vllm",
     token_capture: Optional[dict[str, Any]] = None,
     pg_ready_timeout: float = DEFAULT_SHARD_PG_READY_TIMEOUT_SECONDS,
     spinup_timeout: float = DEFAULT_SHARD_SPINUP_TIMEOUT_SECONDS,
@@ -1905,6 +1906,7 @@ def build_nemo_gym_actors(
     the slowest shard rather than the sum.
 
     Args:
+        generation_backend: Generation backend that produced ``base_urls``.
         tokenizer: Installed on every actor once it is up, rather than passed
             per rollout call. See ``NemoGym.set_tokenizer`` for why.
 
@@ -1916,6 +1918,9 @@ def build_nemo_gym_actors(
             start, or the shards' entries did not pass the startup checks. Any
             actors already created are torn down first.
     """
+    base_urls = _normalize_nemo_gym_base_urls(
+        base_urls, generation_backend=generation_backend
+    )
     nemo_gym_dict = dict(env_configs["nemo_gym"])
     plan = parse_shard_plan(nemo_gym_dict)
 
@@ -2195,7 +2200,7 @@ def spinup_nemo_gym_actor(
     *,
     base_urls: list[str],
     model_name: str,
-    generation_backend: str,
+    generation_backend: str = "vllm",
     tokenizer: PreTrainedTokenizerBase,
     enable_router_replay: bool,
     use_fastokens: bool,
@@ -2235,10 +2240,9 @@ def spinup_nemo_gym_actor(
 
     return build_nemo_gym_actors(
         env_configs,
-        base_urls=_normalize_nemo_gym_base_urls(
-            base_urls, generation_backend=generation_backend
-        ),
+        base_urls=base_urls,
         model_name=model_name,
+        generation_backend=generation_backend,
         tokenizer=tokenizer,
         enable_router_replay=enable_router_replay,
         use_fastokens=use_fastokens,
