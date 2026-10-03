@@ -213,6 +213,36 @@ class TestRebuildDispatch:
         # survivors really were called.
         assert [w.idx for w in workers if w.calls] == [0, 1, 3]
 
+    def test_metadata_uses_the_generation_payload_contract(self, monkeypatch):
+        monkeypatch.setattr("ray.get", lambda futures: futures)
+        sync, _, _ = _rebuildable(dead_shards=(2,))
+
+        sync.reconcile_communicator([2])
+
+        assert sync._policy.refit_payload_modes == ["hf_export"]
+
+    def test_rebuild_repeats_the_prequantization_handshake(self, monkeypatch):
+        monkeypatch.setattr("ray.get", lambda futures: futures)
+        sync, _, _ = _rebuildable(dead_shards=(2,))
+        initial_info = {"model.weight": {"dtype": "bfloat16"}}
+        updated_info = {"model.weight": {"dtype": "float8_e4m3fn"}}
+        pushed_info = []
+        enabled_names = []
+        sync._policy.cfg = {"megatron_cfg": {"enabled": True}}
+        sync._policy.prepare_refit_info = lambda *, refit_payload_mode: initial_info
+        sync._policy.enable_refit_prequantize = lambda names: (
+            enabled_names.extend(names) or updated_info
+        )
+        sync._generation.prepare_refit_info = lambda info: (
+            pushed_info.append(info)
+            or (["model.weight"] if len(pushed_info) == 1 else None)
+        )
+
+        sync.reconcile_communicator([2])
+
+        assert enabled_names == ["model.weight"]
+        assert pushed_info == [initial_info, updated_info]
+
     def test_refit_info_is_regenerated_in_the_backend_s_payload_mode(self, monkeypatch):
         """The rebuild asks the policy for refit metadata the way init_communicator does.
 
@@ -441,10 +471,9 @@ class TestControllerCallSite:
         _condemn(monitor, 1)
         calls = []
         synchronizer = SimpleNamespace(
-            reconcile_communicator=lambda absent, force=False: calls.append(
-                list(absent)
+            reconcile_communicator=lambda absent, force=False: (
+                calls.append(list(absent)) or False
             )
-            or False
         )
         ctrl = self._controller(monitor, synchronizer)
 

@@ -120,6 +120,8 @@ def pad_w13_intermediate(
         )
 
     intermediate_size = input_tensor.shape[1] // 2
+    if intermediate_size == padded_intermediate_size:
+        return input_tensor
     sharded = input_tensor.reshape(
         input_tensor.shape[0],
         2,
