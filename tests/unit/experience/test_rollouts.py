@@ -15,6 +15,7 @@
 import asyncio
 import gc
 import json
+import logging
 import tempfile
 from copy import deepcopy
 from dataclasses import asdict
@@ -3172,3 +3173,116 @@ def test_gym_rollout_reads_both_reliability_knobs_from_the_actor_config(monkeypa
     assert actor.health_calls == 2
     assert actor.dispatched_rows == [rows, [rows[1]]]
     assert results[0].rollout_metrics["nemo_gym_infra_redispatches"] == 1
+
+
+def test_nemo_gym_rollout_metrics_hook_resolves_by_import_path():
+    get = rollouts_mod.get_nemo_gym_rollout_metrics_hook
+    assert get({}) is None
+    assert get({"nemo_gym": {"rollout_metrics_hook": None}}) is None
+    path = "nemo_rl.experience.metric_utils.calculate_single_metric"
+    assert get({"nemo_gym": {"rollout_metrics_hook": path}}) is calculate_single_metric
+    with pytest.raises(ValueError, match="dotted import path"):
+        get({"nemo_gym": {"rollout_metrics_hook": "nodots"}})
+    with pytest.raises(ValueError, match="does not name a callable"):
+        get(
+            {
+                "nemo_gym": {
+                    "rollout_metrics_hook": (
+                        "nemo_rl.experience.rollouts.DEFAULT_MAX_INFRA_ATTEMPTS_PER_ROLLOUT"
+                    )
+                }
+            }
+        )
+    with pytest.raises(ModuleNotFoundError):
+        get({"nemo_gym": {"rollout_metrics_hook": "no.such.module.function"}})
+
+
+def _hook_group_result(reward, **full_result_extras):
+    input_message = {"role": "user", "content": "", "token_ids": torch.tensor([1])}
+    return {
+        "input_message_log": [input_message],
+        "message_log": [
+            input_message,
+            {
+                "role": "assistant",
+                "content": "",
+                "token_ids": torch.tensor([2]),
+                "generation_logprobs": torch.tensor([-0.1]),
+            },
+        ],
+        "full_result": {"reward": reward, **full_result_extras},
+    }
+
+
+def _postprocess_hook_group(results, hook=None):
+    rows = [{"agent_ref": {"name": "agent"}} for _ in results]
+    return rollouts_mod._postprocess_single_nemo_gym_group(
+        nemo_gym_rows=rows,
+        results=results,
+        timer=rollouts_mod.Timer(),
+        timer_prefix="timing/rollout",
+        policy_generation=type(
+            "_PolicyGeneration", (), {"cfg": {"vllm_cfg": {"max_model_len": 128}}}
+        )(),
+        input_batch=BatchedDataDict({"loss_multiplier": torch.ones(len(results))}),
+        tokenizer=type("_Tokenizer", (), {"pad_token_id": 0})(),
+        log_full_result_tables=False,
+        rollout_metrics_hook=hook,
+    )
+
+
+def test_nemo_gym_group_applies_the_rollout_metrics_hook(caplog):
+    """The configured hook sees the group's full results and its metrics are
+    merged; a hook that raises is reported and cannot fail the rollout."""
+
+    def results():
+        return [
+            _hook_group_result(1.0, response={"status": "completed"}),
+            _hook_group_result(0.0, response={"status": "completed"}),
+        ]
+
+    seen = []
+
+    def hook(full_results):
+        seen.append(full_results)
+        return {"reward_sum": sum(r["reward"] for r in full_results)}
+
+    metrics = _postprocess_hook_group(results(), hook).rollout_metrics
+    assert seen == [
+        [
+            {"reward": 1.0, "response": {"status": "completed"}},
+            {"reward": 0.0, "response": {"status": "completed"}},
+        ]
+    ]
+    assert metrics["reward_sum"] == 1.0
+    # The generic per-agent mean of every numeric field is there regardless.
+    assert metrics["agent/reward/mean"] == pytest.approx(0.5)
+
+    def broken(full_results):
+        raise KeyError("score")
+
+    with caplog.at_level(logging.WARNING):
+        metrics = _postprocess_hook_group(results(), broken).rollout_metrics
+    assert "reward_sum" not in metrics
+    assert any("rollout metrics hook" in r.message for r in caplog.records)
+    assert "reward_sum" not in _postprocess_hook_group(results()).rollout_metrics
+
+
+def test_nemo_gym_per_agent_metrics_cover_fields_present_on_some_rollouts_only():
+    """A numeric result field that only some rollouts of an agent carry is still
+    aggregated: the per-agent keys are the union over the rollouts, not the
+    first rollout's keys."""
+    metrics = _postprocess_hook_group(
+        [
+            _hook_group_result(1.0),
+            _hook_group_result(0.0, speedup=2.0),
+            _hook_group_result(1.0, speedup=4.0),
+        ]
+    ).rollout_metrics
+    assert metrics["agent/reward/mean"] == pytest.approx(2 / 3)
+    # calculate_single_metric divides by the agent's rollout count, so a field two
+    # of three rollouts carry averages over all three; max and the histogram
+    # cover the two observations.
+    assert metrics["agent/speedup/mean"] == pytest.approx(6.0 / 3)
+    assert metrics["agent/speedup/max"] == 4.0
+    assert metrics["agent/speedup/histogram"] == [2.0, 4.0]

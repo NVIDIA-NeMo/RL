@@ -356,13 +356,15 @@ class NemoGymConfig(TypedDict):
         bool
     ]  # Preserve heterogeneous shapes for native-resolution patchification
     # Read by the driver's rollout loop (nemo_rl/experience/rollouts.py), never by
-    # a Gym server: seconds between health checks while no row has arrived, and
-    # how many times one row may be dispatched before an infrastructure failure
-    # ends the step. ``_build_gym_actor_config`` moves them here from the
-    # env.nemo_gym mapping, out of Gym's global configuration, and
+    # a Gym server: seconds between health checks while no row has arrived, how
+    # many times one row may be dispatched before an infrastructure failure ends
+    # the step, and the dotted import path of the callable that derives step
+    # metrics from the full results. ``_build_gym_actor_config`` moves them here
+    # from the env.nemo_gym mapping, out of Gym's global configuration, and
     # ``NemoGym.rollout_config`` hands them back.
     health_check_interval_seconds: NotRequired[Optional[float]]
     max_infra_attempts_per_rollout: NotRequired[Optional[int]]
+    rollout_metrics_hook: NotRequired[Optional[str]]
     # Ledger-authoritative token capture (token_capture.enabled): the dumped
     # TokenCaptureConfig. Turns on external staging in Gym's policy model
     # server, switches run_rollouts to receipt mode, and assembles receipts
@@ -374,6 +376,7 @@ class NemoGymConfig(TypedDict):
 DRIVER_ROLLOUT_KEYS = (
     "health_check_interval_seconds",
     "max_infra_attempts_per_rollout",
+    "rollout_metrics_hook",
 )
 
 
@@ -1690,6 +1693,7 @@ def _build_gym_actor_config(
     max_infra_attempts_per_rollout = nemo_gym_dict.pop(
         "max_infra_attempts_per_rollout", None
     )
+    rollout_metrics_hook = nemo_gym_dict.pop("rollout_metrics_hook", None)
     port_range = {
         key: value
         for key in ("port_range_low", "port_range_high")
@@ -1733,6 +1737,7 @@ def _build_gym_actor_config(
         **port_range,
         health_check_interval_seconds=health_check_interval_seconds,
         max_infra_attempts_per_rollout=max_infra_attempts_per_rollout,
+        rollout_metrics_hook=rollout_metrics_hook,
         **multimodal_flags,
     )
 
