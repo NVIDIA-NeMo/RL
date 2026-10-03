@@ -78,7 +78,7 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
 )
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
-from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
+from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS, uses_image_placeholder
 from nemo_rl.data.utils import load_dataloader_state, setup_response_data
 from nemo_rl.data_plane import (
     DATA_PLANE_CHECKPOINT_SCHEMA_VERSION,
@@ -303,11 +303,17 @@ def _register_single_controller_partitions(
     partition_id: str,
     include_multimodal_fields: bool,
 ) -> None:
-    """Warm all SingleController partitions before concurrent data-plane use."""
+    """Warm all SingleController partitions before concurrent data-plane use.
+
+    VLM token capture (``include_multimodal_fields`` with capture enabled) adds
+    the media columns the vLLM worker stages beside each captured call to the
+    staging partition.
+    """
     algo_cfg = algo_config(master_config)
     policy_config = master_config.policy
     token_capture_cfg = master_config.token_capture
     r3_enabled = router_replay_enabled(policy_config)
+    capture_media = token_capture_cfg.enabled and include_multimodal_fields
     group_size = algo_cfg.num_generations_per_prompt
     num_rollout_samples = master_config.async_rl.max_buffered_rollouts * group_size
 
@@ -341,12 +347,16 @@ def _register_single_controller_partitions(
         from nemo_rl.data_plane.schema import (
             ROUTED_EXPERTS_FIELD as STAGING_ROUTED_EXPERTS_FIELD,
         )
-        from nemo_rl.data_plane.tq_token_sink import STAGING_FIELDS
+        from nemo_rl.data_plane.tq_token_sink import (
+            MEDIA_STAGING_FIELDS,
+            STAGING_FIELDS,
+        )
 
         dp_client.register_partition(
             partition_id=token_capture_cfg.staging_partition,
             fields=list(STAGING_FIELDS)
-            + ([STAGING_ROUTED_EXPERTS_FIELD] if r3_enabled else []),
+            + ([STAGING_ROUTED_EXPERTS_FIELD] if r3_enabled else [])
+            + (list(MEDIA_STAGING_FIELDS) if capture_media else []),
             num_samples=num_rollout_samples,
             consumer_tasks=["finalize", "prev_lp", "train"],
         )
@@ -366,7 +376,7 @@ def _non_colocated_teacher_node_count(master_config: MasterConfig) -> int:
     teacher_configs = create_teacher_configs_from_opd_config(
         opd_module._opd_cfg(master_config)
     )
-    cluster_gpus_per_node = master_config.cluster["gpus_per_node"]
+    cluster_gpus_per_node = master_config.cluster.gpus_per_node
     for teacher_config in teacher_configs:
         if teacher_config.gpus_per_node > cluster_gpus_per_node:
             raise ValueError(
@@ -393,11 +403,11 @@ def _build_clusters(
     generation_config = master_config.policy["generation"]
     colocated = generation_config["colocated"]["enabled"]
     backend = generation_config["backend"]
-    num_nodes = cluster_config["num_nodes"]
-    gpus_per_node = cluster_config["gpus_per_node"]
-    segment_size = cluster_config.get("segment_size")
-    port_range_low = cluster_config.get("master_port_range_low")
-    port_range_high = cluster_config.get("master_port_range_high")
+    num_nodes = cluster_config.num_nodes
+    gpus_per_node = cluster_config.gpus_per_node
+    segment_size = cluster_config.segment_size
+    port_range_low = cluster_config.master_port_range_low
+    port_range_high = cluster_config.master_port_range_high
     teacher_nodes = _non_colocated_teacher_node_count(master_config)
     policy_nodes = num_nodes - teacher_nodes
     if policy_nodes <= 0:
@@ -1192,6 +1202,23 @@ def setup_single_controller(
     # nemo_rl/distributed/actor_environments.py), so nothing here needs to
     # change the worker's environment.
     token_capture_cfg = master_config.token_capture
+    capture_media = token_capture_cfg.enabled and processor is not None
+    if capture_media:
+        if generation_config["backend"] != "vllm":
+            raise NotImplementedError(
+                "VLM media token capture is only implemented for the vLLM "
+                f"generation backend; got {generation_config['backend']!r}"
+            )
+        if not uses_image_placeholder(processor):
+            raise ValueError(
+                "VLM token capture currently supports Omni dynamic images and native video"
+            )
+        if not policy_config["megatron_cfg"]["enabled"]:
+            raise ValueError(
+                "Omni media token capture currently requires the Megatron learner"
+            )
+        if token_capture_cfg.defer_routed_experts_to_policy:
+            raise ValueError("VLM token capture requires direct router replay assembly")
     if rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None:
         if not master_config.checkpointing["enabled"]:
             raise ValueError(
@@ -1490,7 +1517,7 @@ def setup_single_controller(
         master_config
     )
     colocated = generation_config["colocated"]["enabled"]
-    segment_size = getattr(master_config, "cluster", {}).get("segment_size")
+    segment_size = master_config.cluster.segment_size
 
     # Claim constrained training nodes before unconstrained inference or Gym
     # tasks can consume them. This matters when inference topology alignment
@@ -1905,8 +1932,13 @@ def setup_single_controller(
             include_multimodal_fields=processor is not None,
         )
     if token_capture_cfg.enabled:
-        # Both active backends stage canonical Gym rows in serving workers.
-        generation.setup_token_capture(dp_config, token_capture_cfg.staging_partition)
+        # Both active backends stage canonical Gym rows in serving workers;
+        # only vLLM workers stage captured media beside them (capture_media).
+        generation.setup_token_capture(
+            dp_config,
+            token_capture_cfg.staging_partition,
+            capture_media=capture_media,
+        )
         generation.set_rollout_weight_version(0)
 
     if weight_synchronizer is None:
@@ -1969,6 +2001,7 @@ def setup_single_controller(
                 router_replay_enabled=router_replay_enabled(policy_config),
                 defer_routed_experts_to_policy=token_capture_cfg.defer_routed_experts_to_policy,
                 max_seq_len=_generation_max_seq_len(generation_config),
+                capture_media=capture_media,
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,
         )

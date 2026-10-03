@@ -27,6 +27,16 @@ Mirrored from the keys the algorithms already log, one row per series in `_TRAIN
 | `rl.grad_norm` | Gauge | `grad_norm` |
 | `rl.learning_rate` | Gauge | `lr` |
 
+SFT v2 logs from its controller actor, which initializes telemetry before its
+first metric is logged. The controller's fixed step measurements are also teed:
+
+| Metric | Type | Logger key |
+|---|---|---|
+| `rl.sft_v2.loader.latency.max` | Gauge (`s`) | `loader_latency_max` |
+| `rl.sft_v2.policy.duration` | Gauge (`s`) | `policy_time` |
+| `rl.sft_v2.step.duration` | Gauge (`s`) | `total_step_time` |
+| `rl.sft_v2.valid_tokens_per_second` | Gauge (`{token}/s`) | `valid_tokens_per_second` |
+
 `kl_penalty` is named for the penalty but holds the divergence — the coefficient is divided back out in `loss_functions.py` — which is why the metric is named `rl.kl.divergence`.
 
 Each row is declared in the module that logs its key, using the same constant the logging site uses, so a rename cannot leave a gauge silently reporting nothing.

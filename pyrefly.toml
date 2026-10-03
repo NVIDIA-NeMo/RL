@@ -24,6 +24,7 @@ replace-imports-with-any = [
   "zstandard.*",
 ]
 project-includes = [
+  "nemo_rl/data/captured_media.py",
   # TODO: enable these once we have 100 correctness
   #"nemo_rl/**/*.py",
   #"examples/**/*.py",
@@ -68,6 +69,7 @@ project-includes = [
   "nemo_rl/algorithms/single_controller.py",
   "nemo_rl/algorithms/single_controller_utils/__init__.py",
   "nemo_rl/algorithms/single_controller_utils/config.py",
+  "nemo_rl/utils/train_data_dump.py",
   "nemo_rl/algorithms/single_controller_utils/rollout_checkpoint.py",
   "nemo_rl/algorithms/single_controller_utils/setup.py",
   "nemo_rl/algorithms/single_controller_utils/utils.py",
@@ -207,6 +209,7 @@ project-includes = [
   "nemo_rl/modelopt/models/policy/workers/dtensor_quant_policy_worker_v2.py",
   "nemo_rl/models/__init__.py",
   "nemo_rl/models/automodel/__init__.py",
+  "nemo_rl/models/automodel/utils.py",
   "nemo_rl/models/generation/__init__.py",
   "nemo_rl/models/generation/constants.py",
   "nemo_rl/models/generation/dynamo/__init__.py",
