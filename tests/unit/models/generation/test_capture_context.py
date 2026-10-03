@@ -3,6 +3,7 @@
 
 """Source rewrites and unsupported replay must be distinguished before splice."""
 
+import logging
 from copy import deepcopy
 
 import pytest
@@ -77,14 +78,28 @@ def test_render_option_change_is_a_rewrite():
 
 
 @pytest.mark.parametrize("suffix", [[], [{"role": "assistant", "content": "prefill"}]])
-def test_no_supported_observation_or_appended_assistant_is_rejected(suffix):
-    with pytest.raises(ValueError, match="appended user/tool"):
-        decide_capture_input(candidate(HISTORY + suffix), messages=HISTORY + suffix)
+def test_no_supported_observation_or_appended_assistant_roots_a_new_segment(
+    suffix, caplog
+):
+    with caplog.at_level(
+        logging.WARNING, logger="nemo_rl.models.generation.capture_context"
+    ):
+        decision = decide_capture_input(
+            candidate(HISTORY + suffix), messages=HISTORY + suffix
+        )
+    assert decision.storage.mode == "text"
+    assert decision.storage.parent_call_id is None
+    assert decision.serving is None
+    assert decision.verify_retained_media
+    assert "rooting a new segment" in caplog.text
 
 
-def test_conversion_cannot_move_the_response_boundary():
-    with pytest.raises(ValueError, match="response boundary"):
-        decide_capture_input(candidate(), messages=HISTORY + [OBSERVATION, HISTORY[-1]])
+def test_an_unproven_response_boundary_roots_a_new_segment():
+    decision = decide_capture_input(
+        candidate(), messages=HISTORY + [OBSERVATION, HISTORY[-1]]
+    )
+    assert decision.storage.mode == "text"
+    assert decision.serving is None
 
 
 def test_ordinary_admission_is_unchanged():

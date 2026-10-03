@@ -152,6 +152,7 @@ def _make_impl(
     impl._policy_generation = generation
     impl._timeouts = timeouts if timeouts is not None else RolloutTimeouts()
     impl._deadline_registry = None
+    impl._context_compaction = False
     return impl
 
 
@@ -181,6 +182,7 @@ def _make_manager(buffer, impl, retry_policy=None) -> RolloutManager:
         else RolloutRetryPolicy.single_attempt()
     )
     manager._stats = RolloutStats()
+    manager._context_compaction = False
     manager._canonical_groups_finalized = 0
     manager._canonical_output_tokens = 0
     manager._recovery_siblings_reused = 0
@@ -549,6 +551,7 @@ def _make_gym_impl(
     impl._timeouts = timeouts if timeouts is not None else RolloutTimeouts()
     impl._deadline_registry = None
     impl._max_gym_row_attempts = row_attempts
+    impl._context_compaction = False
     # Real counters by default so row-level re-dispatches are observable; production
     # shares the owning RolloutManager's instance.
     impl._stats = stats if stats is not None else RolloutStats()
