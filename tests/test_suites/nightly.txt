@@ -256,7 +256,7 @@ tests/test_suites/llm/grpo-qwen3-30ba3b-2n8g-megatron_fused_linear_logprobs.sh
 # Issue with details: https://github.com/NVIDIA-NeMo/RL/issues/1571
 # tests/test_suites/llm/sft-nemotron-super-49b-8n8g-fsdp2tp4cp8-tulu-v3.sh
 
-# gpt-oss 20b DeepEP test
+# gpt-oss 20b HybridEP test
 tests/test_suites/llm/sft-gpt-oss-20b-1n8g-fsdp8ep8-automodel.sh
 
 # Nemotron 3 Nano 30B A3B Base BF16 tests
