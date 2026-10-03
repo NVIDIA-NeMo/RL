@@ -298,6 +298,7 @@ class TrtllmAsyncGenerationWorkerImpl:
                 "top_k": self.cfg["top_k"],
             },
             stop_token_ids=list(self.cfg.get("stop_token_ids") or []),
+            stop_strings=list(self.cfg.get("stop_strings") or []),
             default_chat_template_kwargs=self.cfg["trtllm_cfg"].get(
                 "default_chat_template_kwargs"
             ),
@@ -483,6 +484,7 @@ class TrtllmAsyncGenerationWorkerImpl:
                     "logprobs": torch.zeros((0, 0), dtype=torch.float),
                     "generation_lengths": torch.zeros(0, dtype=torch.long),
                     "unpadded_sequence_lengths": torch.zeros(0, dtype=torch.long),
+                    "truncated": torch.zeros(0, dtype=torch.bool),
                 }
             )
 
@@ -500,7 +502,10 @@ class TrtllmAsyncGenerationWorkerImpl:
             token_ids = input_ids[i, :length].tolist()
             prompts.append({"prompt_token_ids": token_ids})
 
-        sampling_params = self._build_sampling_params(greedy=greedy)
+        sampling_params = self._build_sampling_params(
+            greedy=greedy,
+            stop_strings=self._merge_stop_strings(data.get("stop_strings")),
+        )
 
         # Fan all prompts out concurrently; AsyncLLM batches them in-flight.
         outputs = await asyncio.gather(
@@ -514,6 +519,7 @@ class TrtllmAsyncGenerationWorkerImpl:
         logprobs_list = []
         generation_lengths = []
         unpadded_sequence_lengths = []
+        truncated_list = []
 
         max_gen_len = max(len(o.outputs[0].token_ids) for o in outputs)
 
@@ -549,6 +555,13 @@ class TrtllmAsyncGenerationWorkerImpl:
             generation_lengths.append(len(gen_tokens))
             unpadded_sequence_lengths.append(resp_len)
 
+            # "length" is how TRT-LLM reports hitting max_tokens without a stop
+            # token, the same condition the vLLM worker reads off finish_reason.
+            # Rollouts fold this into the batch's ``truncated`` column, which
+            # ``grpo.overlong_filtering`` uses to zero the loss for samples that
+            # ran out of budget; without it those samples train as if complete.
+            truncated_list.append(gen.finish_reason == "length")
+
         return BatchedDataDict[GenerationOutputSpec](
             {
                 "output_ids": torch.stack(output_ids_list),
@@ -556,6 +569,7 @@ class TrtllmAsyncGenerationWorkerImpl:
                 "generation_lengths": torch.tensor(
                     generation_lengths, dtype=torch.long
                 ),
+                "truncated": torch.tensor(truncated_list, dtype=torch.bool),
                 "unpadded_sequence_lengths": torch.tensor(
                     unpadded_sequence_lengths, dtype=torch.long
                 ),
@@ -566,7 +580,28 @@ class TrtllmAsyncGenerationWorkerImpl:
     #  Helpers
     # ------------------------------------------------------------------ #
 
-    def _build_sampling_params(self, *, greedy: bool):
+    def _merge_stop_strings(self, batch_stop_strings: Any) -> list[str] | None:
+        """Union the configured stop strings with the per-sample ones.
+
+        Mirrors ``BaseVllmGenerationWorker._merge_stop_strings``. One
+        ``SamplingParams`` is built per batch here, so a sample's stop strings
+        apply to the whole batch -- the same shape the vLLM backend has.
+        """
+        stop_set: set[str] = set()
+
+        if self.cfg.get("stop_strings"):
+            stop_set.update(self.cfg["stop_strings"])
+
+        if batch_stop_strings is not None:
+            for sample_stop_strings in batch_stop_strings:
+                if sample_stop_strings:
+                    stop_set.update(sample_stop_strings)
+
+        return sorted(stop_set) if stop_set else None
+
+    def _build_sampling_params(
+        self, *, greedy: bool, stop_strings: list[str] | None = None
+    ):
         top_k_cfg = self.cfg["top_k"]
         top_k_val = 1 if greedy else (top_k_cfg if top_k_cfg is not None else 0)
         temperature = 0.0 if greedy else self.cfg["temperature"]
@@ -579,6 +614,7 @@ class TrtllmAsyncGenerationWorkerImpl:
             top_k=top_k_val,
             max_tokens=self.cfg["max_new_tokens"],
             stop_token_ids=stop_ids or None,
+            stop=stop_strings or None,
             # Keep the EOS / stop token in the returned token_ids so that the
             # response sequence matches HF / vLLM behavior. Required for
             # logprob alignment with training-side Megatron.
