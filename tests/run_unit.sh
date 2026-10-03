@@ -41,7 +41,7 @@ else
 fi
 
 set +e
-pytest $pytest_args
+pytest --cov-config="$PROJECT_ROOT/pyproject.toml" $pytest_args
 exit_code=$?
 set -e
 if [[ $exit_code -eq 5 ]]; then
