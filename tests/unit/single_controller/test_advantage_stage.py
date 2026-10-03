@@ -14,8 +14,10 @@
 """The advantage stage's boundary: what it fetches and what it hands back."""
 
 import asyncio
+import json
 from collections.abc import Sequence
 from dataclasses import fields
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -50,6 +52,8 @@ from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import GROUP_ID_TAG
 from nemo_rl.utils.rpc_guard import assert_metadata_only
+from nemo_rl.utils.timer import Timer
+from nemo_rl.utils.train_data_dump import TrainDataDump
 
 
 def _config(**overrides) -> AdvantageStageConfig:
@@ -62,6 +66,7 @@ def _config(**overrides) -> AdvantageStageConfig:
         teacher_logprobs_required=False,
         message_level_advantage_penalties_enabled=False,
         shardable=True,
+        train_data_dump_dir=None,
     )
     base.update(overrides)
     return AdvantageStageConfig(**base)
@@ -453,7 +458,12 @@ def test_rpc_dataclass_fields_are_classified() -> None:
     Pinning the inventory makes a new field fail here until someone decides
     whether it is light enough to cross the wire.
     """
-    assert {f.name for f in fields(AdvantageRequest)} == {"meta"}
+    assert {f.name for f in fields(AdvantageRequest)} == {
+        "meta",
+        # A bare step number, not a payload: the stage writes the training
+        # dump and has no other way to learn which step it is writing.
+        "train_step",
+    }
     assert {f.name for f in fields(AdvantageOutcome)} == {
         "meta",
         "has_valid_training_tokens",
@@ -467,6 +477,8 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "opd_stat_sumsq",
         "opd_stat_count",
         "opd_gap_sum",
+        # A duration, not the rows: the dump itself went to disk shard-side.
+        "train_data_dump_s",
     }
 
 
@@ -521,6 +533,10 @@ def _rows() -> dict[str, dict[str, torch.Tensor]]:
                 "prev_logprobs": -torch.rand(SEQ, generator=gen),
                 "generation_logprobs": -torch.rand(SEQ, generator=gen),
                 "teacher_reference_logprobs": -torch.rand(SEQ, generator=gen),
+                # Only the training dump reads these three.
+                "input_ids": torch.arange(SEQ) + 100 * group + member,
+                "input_lengths": torch.tensor(SEQ),
+                "prompt_ids_for_adv": torch.tensor([group, member]),
             }
     return rows
 
@@ -564,7 +580,12 @@ class _InlineActor:
 
 
 def _controller(
-    estimator_name: str, num_actors: int, store: _RowStore, *, fail: bool = False
+    estimator_name: str,
+    num_actors: int,
+    store: _RowStore,
+    *,
+    fail: bool = False,
+    dump_dir: str | None = None,
 ):
     """Build the controller stub _advantage_stage needs, and nothing more.
 
@@ -595,6 +616,7 @@ def _controller(
         teacher_logprobs_required=is_opd,
         message_level_advantage_penalties_enabled=False,
         shardable=estimator_name in SHARD_INVARIANT_ESTIMATORS,
+        train_data_dump_dir=dump_dir,
     )
     ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
     ctrl._advantage_estimator = estimator
@@ -602,13 +624,23 @@ def _controller(
     ctrl._advantage_computer = AdvantageComputer(
         store, config=config, advantage_estimator=estimator
     )
+    ctrl._train_data_dump = TrainDataDump(dump_dir) if dump_dir is not None else None
+    ctrl._timer = Timer()
+    ctrl._train_steps = 0
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._advantage_actors = [
         _InlineActor(
-            AdvantageComputer(store, config=config, advantage_estimator=estimator),
+            AdvantageComputer(
+                store,
+                config=config,
+                advantage_estimator=estimator,
+                # Distinct per actor, as create_advantage_actors assigns them:
+                # one shared id would have the shards overwrite each other.
+                shard_id=str(index),
+            ),
             fail=fail,
         )
-        for _ in range(num_actors)
+        for index in range(num_actors)
     ]
     ctrl._available_advantage_actors = asyncio.Queue()
     for actor in ctrl._advantage_actors:
@@ -663,6 +695,42 @@ def test_sharded_pool_matches_in_process(estimator_name: str) -> None:
     assert metrics_pool == pytest.approx(metrics_local)
     assert valid_pool == valid_local
     assert opd_pool == pytest.approx(opd_local)
+
+
+@pytest.mark.parametrize("num_actors", [0, 3])
+def test_training_dump_is_complete_however_the_stage_was_split(
+    tmp_path: Path, num_actors: int
+) -> None:
+    """Sharding must not cost the dump a row, a column, or an index.
+
+    The pool writes one part file per shard and the controller merges them,
+    so this is the only place that proves the published step is the whole
+    cohort exactly once -- a shared part path would silently drop rows.
+    """
+    store = _RowStore(_rows())
+    ctrl = _controller("grpo", num_actors, store, dump_dir=str(tmp_path))
+    asyncio.run(ctrl._advantage_stage(_pool_meta()))
+    ctrl._train_data_dump.finish_step(0)
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "train_data_step1.jsonl").read_text().splitlines()
+    ]
+    total = NUM_GROUPS * GROUP_SIZE
+    assert [row["idx"] for row in rows] == list(range(total))
+    assert sorted(row["sample_id"][0] for row in rows) == sorted(
+        f"s{i}" for i in range(total)
+    )
+    # Every shard's rows carry the advantages that shard actually wrote back.
+    for row in rows:
+        torch.testing.assert_close(
+            torch.tensor(row["advantages"][0]),
+            store.rows[row["sample_id"][0]]["advantages"],
+        )
+    assert not list(tmp_path.glob("*.part-*"))
+    # The serialization is timed wherever it ran, and reported back as a
+    # number so the controller's metric survives the move onto the pool.
+    assert len(ctrl._timer.get_elapsed("train_data_dump")) == max(num_actors, 1)
 
 
 def test_unshardable_estimator_sends_the_whole_batch_to_one_actor() -> None:

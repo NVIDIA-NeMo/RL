@@ -45,11 +45,13 @@ class AdvantageActor:  # pragma: no cover
         dp_config: DataPlaneConfig,
         config: AdvantageStageConfig,
         advantage_estimator: Any,
+        shard_id: str = "0",
     ) -> None:
         self._computer = AdvantageComputer(
             build_data_plane_client(dp_config, bootstrap=False),
             config=config,
             advantage_estimator=advantage_estimator,
+            shard_id=shard_id,
         )
 
     def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:
@@ -116,7 +118,7 @@ def create_advantage_actors(
             options["scheduling_strategy"] = "SPREAD"
         actors.append(
             AdvantageActor.options(**options).remote(
-                dp_config, config, advantage_estimator
+                dp_config, config, advantage_estimator, str(index)
             )
         )
     try:

@@ -201,6 +201,7 @@ from nemo_rl.utils.checkpoint import (
 )
 from nemo_rl.utils.logger import TELEMETRY_WALL_TIME_METRIC, Logger
 from nemo_rl.utils.timer import TimeoutChecker, Timer
+from nemo_rl.utils.train_data_dump import TrainDataDump
 
 if TYPE_CHECKING:
     from nemo_rl.experience.rollout_reassembler import FinalizedGroup
@@ -719,6 +720,11 @@ class SingleControllerActor:
         self._opd_stat_sum = 0.0
         self._opd_stat_sumsq = 0.0
         self._opd_stat_count = 0
+        self._train_data_dump = (
+            TrainDataDump(self._logger.base_log_dir)
+            if self._async_cfg.log_full_train_data
+            else None
+        )
 
         # Seeded here rather than in run(): on resume _trainer_version is the
         # checkpoint's step, so a run resuming mid-warmup needs the widened
@@ -3233,6 +3239,12 @@ class SingleControllerActor:
                 if self._teacher_coordinator is not None:
                     step_metrics.update(self._teacher_coordinator.drain_metrics())
 
+                if self._train_data_dump is not None:
+                    with self._timer.time("train_data_dump"):
+                        await asyncio.to_thread(
+                            self._train_data_dump.finish_step, self._train_steps
+                        )
+
                 self._trainer_version += 1
                 self._train_steps += 1
                 self._optimizer_commit_in_progress = False
@@ -3412,7 +3424,7 @@ class SingleControllerActor:
                 percent = (v / total_time * 100) if total_time > 0 else 0.0
                 print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
 
-            # TODO: per-step train_data jsonl dump, vllm metrics logger,
+            # TODO: vllm metrics logger,
             #   histogram log, pretty-print "Training Results" block,
             #   print_performance_metrics.
             printable_step_metrics = {
@@ -5222,7 +5234,14 @@ class SingleControllerActor:
             decline,
         )
         requests = [
-            AdvantageRequest(meta=shard)
+            AdvantageRequest(
+                meta=shard,
+                # Only the stage still holds the untruncated tensors, so it
+                # writes the dump and needs the step to name the file by.
+                train_step=(
+                    self._train_steps if self._train_data_dump is not None else None
+                ),
+            )
             for shard in (shards if shards is not None else [meta])
         ]
         # Each actor writes advantages inside its RPC, so the cut must cover
@@ -5280,6 +5299,12 @@ class SingleControllerActor:
         self._opd_stat_sumsq += outcome.opd_stat_sumsq
         self._opd_stat_count += outcome.opd_stat_count
         self._opd_gap_sum += outcome.opd_gap_sum
+        if outcome.train_data_dump_s:
+            # Recorded rather than timed here: the serialization ran wherever
+            # the stage ran, which with a pool is not this process.
+            self._timer.record(
+                "train_data_dump", outcome.train_data_dump_s, should_log=False
+            )
 
     # ── utility helpers ────────────────────────────────────────────────────
 

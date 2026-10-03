@@ -31,6 +31,8 @@ paths cannot drift.
 
 from __future__ import annotations
 
+import asyncio
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -52,8 +54,9 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 )
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.async_utils import call_data_plane
-from nemo_rl.data_plane.schema import GROUP_ID_TAG
+from nemo_rl.data_plane.schema import GROUP_ID_TAG, INPUT_IDS, INPUT_LENGTHS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.utils.train_data_dump import TrainDataDump
 
 if TYPE_CHECKING:
     # Annotation-only: importing ppo at runtime here would close a cycle
@@ -87,6 +90,11 @@ class AdvantageStageConfig:
     teacher_logprobs_required: bool
     message_level_advantage_penalties_enabled: bool
     shardable: bool
+    # Where the per-step training dump writes, or None when it is disabled.
+    # The stage owns the dump because it is the only place that still holds
+    # the untruncated tensors: the controller stopped fetching them when the
+    # computation moved here.
+    train_data_dump_dir: Optional[str]
 
     @classmethod
     def from_master_config(cls, master_config: Any) -> AdvantageStageConfig:
@@ -128,6 +136,13 @@ class AdvantageStageConfig:
                 or algo_cfg.malformed_thinking_advantage is not None
             ),
             shardable=algo_cfg.adv_estimator.name in SHARD_INVARIANT_ESTIMATORS,
+            # logger is still a TypedDict, so this is the same value the
+            # Logger exposes as base_log_dir.
+            train_data_dump_dir=(
+                master_config.logger["log_dir"]
+                if master_config.async_rl.log_full_train_data
+                else None
+            ),
         )
 
     def input_fields(self) -> list[str]:
@@ -157,6 +172,18 @@ class AdvantageStageConfig:
             fields.append(adv_cfg.teacher_logprobs_field)
         if self.is_ppo:
             fields.append(adv_cfg.values_field)
+        if self.train_data_dump_dir is not None:
+            # The dump is the only remaining reader of the raw prompt tokens:
+            # the baseline keys on the group-id tag now, so prompt_ids is not
+            # otherwise fetched.
+            fields.extend(
+                [
+                    INPUT_IDS,
+                    INPUT_LENGTHS,
+                    adv_cfg.prompt_ids_field,
+                    adv_cfg.generation_logprobs_field,
+                ]
+            )
         return list(dict.fromkeys(fields))
 
 
@@ -169,6 +196,10 @@ class AdvantageRequest:
     """
 
     meta: KVBatchMeta
+    # Optimizer step these rows belong to, carried because the training dump
+    # names its file after it and the pool has no view of the controller's
+    # counter. Unset when the dump is off, which is the default.
+    train_step: Optional[int] = None
 
 
 def row_group_ids(meta: KVBatchMeta) -> list[str]:
@@ -277,6 +308,10 @@ class AdvantageOutcome:
     opd_stat_sumsq: float = 0.0
     opd_stat_count: int = 0
     opd_gap_sum: float = 0.0
+    # Seconds this call spent serializing the training dump. Reported back
+    # because the writing moved off the controller with the rest of the
+    # stage, and the controller still owns the timer the metric lands in.
+    train_data_dump_s: float = 0.0
 
 
 class AdvantageComputer:
@@ -295,10 +330,18 @@ class AdvantageComputer:
         *,
         config: AdvantageStageConfig,
         advantage_estimator: Any,
+        shard_id: str = "0",
     ) -> None:
         self._dp_client = dp_client
         self._config = config
         self._advantage_estimator = advantage_estimator
+        # One writer per shard: the pool runs these concurrently, so they must
+        # not share a file. The controller merges them on publish.
+        self._train_data_dump = (
+            TrainDataDump(config.train_data_dump_dir, shard_id=shard_id)
+            if config.train_data_dump_dir is not None
+            else None
+        )
 
     async def run(self, request: AdvantageRequest) -> AdvantageOutcome:
         """Run one call's advantage stage and return its reduced results."""
@@ -338,6 +381,8 @@ class AdvantageComputer:
         final_sample_mask = sample_mask * (~mask_sample).to(sample_mask.dtype)
         if cfg.algo.overlong_filtering:
             final_sample_mask = final_sample_mask * (~truncated).to(sample_mask.dtype)
+
+        pre_seq_error_sample_mask = final_sample_mask.clone()
 
         seq_error_metrics: Optional[dict[str, float]] = None
         # Match the legacy path: whenever real policy logprobs are available,
@@ -483,6 +528,43 @@ class AdvantageComputer:
             response_advantages = torch.masked_select(advantages, mask.bool())
         advantage_partial = AdvantagePartial.from_values(response_advantages)
 
+        train_data_dump_s = 0.0
+        if self._train_data_dump is not None:
+            assert request.train_step is not None
+            dump_started = time.perf_counter()
+            sequences = {
+                "token_ids": tensor_field(data, INPUT_IDS),
+                "token_loss_mask": token_mask,
+                "advantages": advantages,
+                "generation_logprobs": tensor_field(
+                    data, adv_cfg.generation_logprobs_field
+                ),
+            }
+            if cfg.policy_logprobs_required:
+                sequences["prev_logprobs"] = tensor_field(
+                    data, adv_cfg.policy_logprobs_field
+                )
+            if cfg.teacher_logprobs_required:
+                sequences["teacher_logprobs"] = kwargs["teacher_logprobs"]
+            await asyncio.to_thread(
+                self._train_data_dump.add_chunk,
+                step=request.train_step,
+                sample_ids=list(meta.sample_ids),
+                tags=meta.tags,
+                input_lengths=tensor_field(data, INPUT_LENGTHS),
+                sequences=sequences,
+                scalars={
+                    "sample_loss_mask": final_sample_mask,
+                    "pre_seq_error_sample_loss_mask": pre_seq_error_sample_mask,
+                    "rewards": rewards,
+                    # Raw column: jagged when the chunk mixes prompt
+                    # lengths, so rows carry no zero padding. Not the
+                    # group-index key the estimator reduces over.
+                    "prompt_ids": data[adv_cfg.prompt_ids_field],
+                },
+            )
+            train_data_dump_s = time.perf_counter() - dump_started
+
         fields_to_put = {adv_cfg.output_field: advantages}
         if not torch.equal(final_sample_mask, sample_mask):
             fields_to_put[adv_cfg.sample_mask_field] = final_sample_mask
@@ -510,4 +592,5 @@ class AdvantageComputer:
             opd_stat_sumsq=opd_stat_sumsq,
             opd_stat_count=opd_stat_count,
             opd_gap_sum=opd_gap_sum,
+            train_data_dump_s=train_data_dump_s,
         )

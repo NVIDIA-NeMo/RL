@@ -471,6 +471,9 @@ class WatchdogConfig(BaseModel, extra="allow"):
 
 
 class AsyncRLConfig(BaseModel, extra="allow"):
+    # Stream every consumed sample's untruncated token tensors to JSONL. Files
+    # are published only after the optimizer step completes; disabled by default.
+    log_full_train_data: bool = False
     # Staleness policy shared by the rollout and train pumps.
     sampler: SamplerConfig = Field(
         default_factory=InOrderSamplerConfig,
@@ -1610,3 +1613,7 @@ class AdvantageConfig:
     # regression target for it (output).
     values_field: str = "values"
     returns_field: str = "returns"
+    # Dump-only. The estimators key their baseline on the group-id tag now, so
+    # nothing else fetches the raw prompt tokens; the training dump still
+    # records them per row.
+    prompt_ids_field: str = "prompt_ids_for_adv"
