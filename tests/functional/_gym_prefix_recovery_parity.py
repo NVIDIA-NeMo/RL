@@ -26,7 +26,6 @@ from typing import Any
 
 import torch
 
-
 _EXACT_FIELDS = (
     "input_length",
     "token_ids",
@@ -36,9 +35,11 @@ _EXACT_FIELDS = (
 )
 _APPROXIMATE_FIELDS = (
     "advantages",
-    "generation_logprobs",
     "prev_logprobs",
 )
+# vLLM sampling logprobs are not batch-invariant: two runs that choose the same
+# tokens still differ by bf16 rounding on a few of them. They are gated in
+# aggregate (see _assert_generation_logprob_agreement), not elementwise.
 _TOKEN_FIELDS = {
     "input_ids": "token_ids",
     "token_mask": "token_loss_mask",
@@ -206,7 +207,14 @@ def _compare_training_rows(
     generations_per_prompt: int,
     rtol: float,
     atol: float,
+    excused: frozenset[tuple[int, int, int]] = frozenset(),
 ) -> None:
+    """Compare rows by logical identity.
+
+    ``excused`` rows diverged inside a restored prefix: the restore replayed
+    tokens phase one generated before the crash, so their difference from the
+    baseline is run-to-run sampling noise, not a recovery error.
+    """
     baseline = _rows_by_identity(baseline_records)
     recovery = _rows_by_identity(recovery_records)
     expected_count = steps * prompts_per_step * generations_per_prompt
@@ -242,6 +250,8 @@ def _compare_training_rows(
         )
 
     for identity in sorted(baseline):
+        if identity in excused:
+            continue
         left, right = baseline[identity], recovery[identity]
         for field in _EXACT_FIELDS:
             if left.get(field) != right.get(field):
@@ -284,6 +294,11 @@ def _compare_metrics(
             )
 
 
+def _selection_cuts(selection: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    # A selection written before multi-cut support describes exactly one cut.
+    return list(selection["cuts"]) if "cuts" in selection else [selection]
+
+
 def _assert_prefix_boundary(selection: Mapping[str, Any], recovery_log: str) -> None:
     completed = re.findall(
         r"generation prefix completed: rollout_id=(\S+) model_call_id=(\S+) "
@@ -291,44 +306,46 @@ def _assert_prefix_boundary(selection: Mapping[str, Any], recovery_log: str) -> 
         r"total_generation_tokens=(\d+)",
         recovery_log,
     )
-    matches = [
-        match
-        for match in completed
-        if match[2] == selection["model_call_id"]
-        and int(match[3]) == selection["generation_token_count"]
-    ]
-    if len(matches) != 1:
-        raise AssertionError(
-            "selected prefix did not complete exactly once: "
-            f"source={selection['model_call_id']!r}, matches={matches!r}"
-        )
-    _, _, _, prefix_tokens, tail_tokens, total_tokens = matches[0]
-    if int(tail_tokens) <= 0:
-        raise AssertionError("restored generation produced no suffix tokens")
-    if int(prefix_tokens) + int(tail_tokens) != int(total_tokens):
-        raise AssertionError(
-            "restored generation token accounting has a gap or overlap: "
-            f"prefix={prefix_tokens}, tail={tail_tokens}, total={total_tokens}"
-        )
+    for cut in _selection_cuts(selection):
+        matches = [
+            match
+            for match in completed
+            if match[2] == cut["model_call_id"]
+            and int(match[3]) == cut["generation_token_count"]
+        ]
+        if len(matches) != 1:
+            raise AssertionError(
+                "restored prefix did not complete exactly once: "
+                f"source={cut['model_call_id']!r}, matches={matches!r}"
+            )
+        _, _, _, prefix_tokens, tail_tokens, total_tokens = matches[0]
+        if int(tail_tokens) <= 0:
+            raise AssertionError("restored generation produced no suffix tokens")
+        if int(prefix_tokens) + int(tail_tokens) != int(total_tokens):
+            raise AssertionError(
+                "restored generation token accounting has a gap or overlap: "
+                f"prefix={prefix_tokens}, tail={tail_tokens}, total={total_tokens}"
+            )
 
 
 def _assert_selected_prefix_was_trained(
     selection: Mapping[str, Any],
     recovery_records: Sequence[Mapping[str, Any]],
 ) -> None:
-    matches = [
-        row
-        for batch in recovery_records
-        for row in batch["rows"]
-        if row["group_id"] == selection["group_id"]
-        and row["generation_index"] == selection["generation_index"]
-    ]
-    if len(matches) != 1:
-        raise AssertionError(
-            "selected recovered prefix was not trained exactly once: "
-            f"group={selection['group_id']!r}, "
-            f"generation={selection['generation_index']!r}, matches={len(matches)}"
-        )
+    for cut in _selection_cuts(selection):
+        matches = [
+            row
+            for batch in recovery_records
+            for row in batch["rows"]
+            if row["group_id"] == cut["group_id"]
+            and row["generation_index"] == cut["generation_index"]
+        ]
+        if len(matches) != 1:
+            raise AssertionError(
+                "recovered prefix was not trained exactly once: "
+                f"group={cut['group_id']!r}, "
+                f"generation={cut['generation_index']!r}, matches={len(matches)}"
+            )
 
 
 def _assert_retired_prefix_keys(
@@ -338,9 +355,14 @@ def _assert_retired_prefix_keys(
 ) -> None:
     """Require old prefix rows to be absent before the successor TQ snapshot."""
 
-    old_keys = set(selection.get("staging_keys", []))
-    if not old_keys:
-        raise AssertionError("selected prefix has no staging keys")
+    old_keys: set[str] = set()
+    for cut in _selection_cuts(selection):
+        keys = set(cut.get("staging_keys", []))
+        if not keys:
+            raise AssertionError(
+                f"restored prefix {cut['model_call_id']!r} has no staging keys"
+            )
+        old_keys |= keys
     for batch in recovery_records:
         leaked = old_keys.intersection(batch.get("staging_sample_ids", []))
         if leaked:
@@ -362,10 +384,466 @@ def _assert_retired_prefix_keys(
         )
 
 
+def _last_generated_segment_start(token_loss_mask: Sequence[float]) -> int | None:
+    start = None
+    for index, keep in enumerate(token_loss_mask):
+        if keep and (index == 0 or not token_loss_mask[index - 1]):
+            start = index
+    return start
+
+
+def _classify_token_divergence(
+    baseline_records: Sequence[Mapping[str, Any]],
+    recovery_records: Sequence[Mapping[str, Any]],
+    selection: Mapping[str, Any],
+) -> dict[tuple[int, int, int], dict[str, Any]]:
+    """Locate each row's first token difference relative to its restored prefix.
+
+    A cut is always the closing model call, the last generated segment of the
+    row. A difference before ``segment start + prefix tokens`` lies inside tokens
+    phase one generated before the crash (``pre_cut``); one after it was
+    generated by the restored continuation (``post_cut``). Rows without a cut
+    are ``unrestored``.
+    """
+
+    baseline = _rows_by_identity(baseline_records)
+    recovery = _rows_by_identity(recovery_records)
+    prefix_tokens = {
+        (cut["group_id"], int(cut["generation_index"])): int(
+            cut["generation_token_count"]
+        )
+        for cut in _selection_cuts(selection)
+    }
+    result: dict[tuple[int, int, int], dict[str, Any]] = {}
+    for identity in sorted(set(baseline) & set(recovery)):
+        left = baseline[identity]["token_ids"]
+        right = recovery[identity]["token_ids"]
+        first_diff = next(
+            (i for i, (x, y) in enumerate(zip(left, right)) if x != y),
+            None if len(left) == len(right) else min(len(left), len(right)),
+        )
+        row = recovery[identity]
+        cut_tokens = prefix_tokens.get((row["group_id"], int(row["generation_index"])))
+        prefix_end = None
+        if cut_tokens is not None:
+            segment_start = _last_generated_segment_start(row["token_loss_mask"])
+            if segment_start is not None:
+                prefix_end = segment_start + cut_tokens
+        if first_diff is None:
+            kind = "match"
+        elif prefix_end is None:
+            kind = "unrestored"
+        else:
+            kind = "pre_cut" if first_diff < prefix_end else "post_cut"
+        result[identity] = {
+            "kind": kind,
+            "first_diff": first_diff,
+            "restored_prefix_end": prefix_end,
+        }
+    return result
+
+
+def _assert_reward_signal(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Require rewards that can expose a mismatch, and report advantage support."""
+
+    rows = _rows_by_identity(records)
+    rewards = {identity: float(row["reward"]) for identity, row in rows.items()}
+    if len(set(rewards.values())) < 2:
+        raise AssertionError(
+            "baseline rewards are constant, so reward parity cannot detect a "
+            f"verifier divergence: rewards={sorted(set(rewards.values()))!r}"
+        )
+    nonzero_advantages = sum(
+        any(value != 0 for value in row["advantages"]) for row in rows.values()
+    )
+    return {
+        "rewards": {
+            repr(identity): reward for identity, reward in sorted(rewards.items())
+        },
+        "rows_with_nonzero_advantages": nonzero_advantages,
+        "rows": len(rows),
+    }
+
+
+def _average_ranks(values: Sequence[float]) -> list[float]:
+    order = sorted(range(len(values)), key=values.__getitem__)
+    ranks = [0.0] * len(values)
+    start = 0
+    while start < len(order):
+        end = start
+        while end + 1 < len(order) and values[order[end + 1]] == values[order[start]]:
+            end += 1
+        for position in range(start, end + 1):
+            ranks[order[position]] = (start + end) / 2.0
+        start = end + 1
+    return ranks
+
+
+def _pearson(left: Sequence[float], right: Sequence[float]) -> float | None:
+    count = len(left)
+    if count < 2:
+        return None
+    left_mean = sum(left) / count
+    right_mean = sum(right) / count
+    covariance = sum(
+        (x - left_mean) * (y - right_mean) for x, y in zip(left, right, strict=True)
+    )
+    left_norm = math.sqrt(sum((x - left_mean) ** 2 for x in left))
+    right_norm = math.sqrt(sum((y - right_mean) ** 2 for y in right))
+    if left_norm == 0 or right_norm == 0:
+        return None
+    return covariance / (left_norm * right_norm)
+
+
+def _percentile(values: Sequence[float], fraction: float) -> float:
+    ordered = sorted(values)
+    return ordered[min(len(ordered) - 1, int(fraction * (len(ordered) - 1) + 0.5))]
+
+
+def _generation_logprob_report(
+    baseline_records: Sequence[Mapping[str, Any]],
+    recovery_records: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Summarize generated-token logprob agreement over token-matched rows.
+
+    A row whose tokens diverged compares logprobs of different tokens after the
+    divergence, so it is listed in ``excluded_rows`` instead of pooled.
+    """
+
+    baseline = _rows_by_identity(baseline_records)
+    recovery = _rows_by_identity(recovery_records)
+    per_row: dict[str, Any] = {}
+    excluded: list[str] = []
+    pooled_left: list[float] = []
+    pooled_right: list[float] = []
+    for identity in sorted(set(baseline) & set(recovery)):
+        if baseline[identity]["token_ids"] != recovery[identity]["token_ids"]:
+            excluded.append(repr(identity))
+            continue
+        mask = baseline[identity]["token_loss_mask"]
+        left = [
+            float(value)
+            for value, keep in zip(
+                baseline[identity]["generation_logprobs"], mask, strict=True
+            )
+            if keep
+        ]
+        right = [
+            float(value)
+            for value, keep in zip(
+                recovery[identity]["generation_logprobs"], mask, strict=True
+            )
+            if keep
+        ]
+        if len(left) != len(right) or not left:
+            continue
+        absolute = [abs(x - y) for x, y in zip(left, right, strict=True)]
+        relative = [
+            100.0 * diff / max(abs(x), 1e-12)
+            for x, diff in zip(left, absolute, strict=True)
+        ]
+        per_row[repr(identity)] = {
+            "generated_tokens": len(left),
+            "spearman": _pearson(_average_ranks(left), _average_ranks(right)),
+            "pearson": _pearson(left, right),
+            "bit_identical_fraction": sum(d == 0 for d in absolute) / len(left),
+            "max_abs_diff": max(absolute),
+            "median_pct_diff": _percentile(relative, 0.5),
+            "p95_pct_diff": _percentile(relative, 0.95),
+            "sequence_logprob_baseline": sum(left),
+            "sequence_logprob_recovery": sum(right),
+        }
+        pooled_left.extend(left)
+        pooled_right.extend(right)
+    pooled: dict[str, Any] = {"generated_tokens": len(pooled_left)}
+    if pooled_left:
+        absolute = [abs(x - y) for x, y in zip(pooled_left, pooled_right, strict=True)]
+        uncertain = [
+            100.0 * diff / abs(x)
+            for x, diff in zip(pooled_left, absolute, strict=True)
+            if abs(x) > 0.1
+        ]
+        pooled.update(
+            spearman=_pearson(
+                _average_ranks(pooled_left), _average_ranks(pooled_right)
+            ),
+            pearson=_pearson(pooled_left, pooled_right),
+            bit_identical_fraction=sum(d == 0 for d in absolute) / len(absolute),
+            max_abs_diff=max(absolute),
+            median_abs_diff=_percentile(absolute, 0.5),
+            p95_abs_diff=_percentile(absolute, 0.95),
+            uncertain_tokens=len(uncertain),
+            uncertain_median_pct_diff=_percentile(uncertain, 0.5)
+            if uncertain
+            else None,
+            uncertain_p95_pct_diff=_percentile(uncertain, 0.95) if uncertain else None,
+        )
+    return {"pooled": pooled, "per_row": per_row, "excluded_rows": excluded}
+
+
+def _assert_generation_logprob_agreement(
+    pooled: Mapping[str, Any],
+    *,
+    min_bit_identical: float,
+    min_spearman: float,
+    max_abs_diff: float,
+) -> None:
+    """Gate vLLM sampling logprobs on aggregate agreement over matched tokens."""
+
+    if not pooled.get("generated_tokens"):
+        raise AssertionError("no token-matched rows to compare generation logprobs")
+    failures = []
+    if pooled["bit_identical_fraction"] < min_bit_identical:
+        failures.append(
+            f"bit_identical_fraction={pooled['bit_identical_fraction']} < {min_bit_identical}"
+        )
+    spearman = pooled["spearman"]
+    if spearman is None or spearman < min_spearman:
+        failures.append(f"spearman={spearman} < {min_spearman}")
+    if pooled["max_abs_diff"] > max_abs_diff:
+        failures.append(f"max_abs_diff={pooled['max_abs_diff']} > {max_abs_diff}")
+    if failures:
+        raise AssertionError(
+            "generation_logprobs disagree beyond bf16 noise: " + ", ".join(failures)
+        )
+
+
+def _completion_order(
+    events: Sequence[Mapping[str, Any]], *, event_name: str, steps: int
+) -> list[tuple[int, int, int]]:
+    """Return ``(target_step, prompt_idx, generation_index)`` in event order."""
+
+    order: list[tuple[int, int, int]] = []
+    for event in events:
+        if event.get("event") != event_name:
+            continue
+        target_step = event.get("target_step")
+        if not isinstance(target_step, int) or not 0 <= target_step < steps:
+            continue
+        generation_index = (
+            event["sibling"]["generation_index"]
+            if event_name == "completion"
+            else event["generation_index"]
+        )
+        order.append((target_step, int(event["prompt_idx"]), int(generation_index)))
+    return order
+
+
+def _effective_recovery_order(
+    phase1_order: Sequence[tuple[int, int, int]],
+    phase2_order: Sequence[tuple[int, int, int]],
+) -> list[tuple[int, int, int]]:
+    """Merge the two recovery processes into the order rows became available.
+
+    A phase-one completion that phase two did not repeat survived the crash in
+    the restored snapshot and was available before any phase-two completion. A
+    repeated identity was discarded with the crash, so its phase-two arrival is
+    the one training used.
+    """
+
+    redone = set(phase2_order)
+    retained = [identity for identity in phase1_order if identity not in redone]
+    return [*dict.fromkeys(retained), *phase2_order]
+
+
+def _prompt_group_ready_order(
+    completion_order: Sequence[tuple[int, int, int]],
+) -> list[tuple[int, int]]:
+    """Order prompt groups by the position of their last completed sibling."""
+
+    last_rank: dict[tuple[int, int], int] = {}
+    for rank, identity in enumerate(completion_order):
+        last_rank[identity[:2]] = rank
+    return sorted(last_rank, key=last_rank.__getitem__)
+
+
+def _within_step_rank_metrics(
+    baseline_order: Sequence[tuple[int, ...]],
+    recovery_order: Sequence[tuple[int, ...]],
+) -> dict[str, Any]:
+    """Kendall tau and inversions over pairs that share a target step."""
+
+    if set(baseline_order) != set(recovery_order):
+        raise AssertionError(
+            "rank parity requires identical logical identities: "
+            f"missing={sorted(set(baseline_order) - set(recovery_order))!r}, "
+            f"unexpected={sorted(set(recovery_order) - set(baseline_order))!r}"
+        )
+    recovery_rank = {identity: rank for rank, identity in enumerate(recovery_order)}
+    concordant = discordant = 0
+    per_step = []
+    for target_step in sorted({identity[0] for identity in baseline_order}):
+        baseline_step = [i for i in baseline_order if i[0] == target_step]
+        recovery_step = [i for i in recovery_order if i[0] == target_step]
+        step_discordant = 0
+        for index, left in enumerate(baseline_step):
+            for right in baseline_step[index + 1 :]:
+                if recovery_rank[left] < recovery_rank[right]:
+                    concordant += 1
+                else:
+                    discordant += 1
+                    step_discordant += 1
+        per_step.append(
+            {
+                "target_step": target_step,
+                "baseline_order": baseline_step,
+                "recovery_order": recovery_step,
+                "exact_match": baseline_step == recovery_step,
+                "discordant_pairs": step_discordant,
+            }
+        )
+    comparable = concordant + discordant
+    return {
+        "exact_match": all(step["exact_match"] for step in per_step),
+        "kendall_tau": (concordant - discordant) / comparable if comparable else None,
+        "inversion_rate": discordant / comparable if comparable else None,
+        "discordant_pairs": discordant,
+        "comparable_pairs": comparable,
+        "per_step": per_step,
+    }
+
+
+def _rollout_timeline(
+    events: Sequence[Mapping[str, Any]], *, steps: int
+) -> dict[str, dict[str, float]]:
+    """Seconds since the run's first dispatch at which each rollout moved."""
+
+    timed = [event for event in events if isinstance(event.get("time_s"), (int, float))]
+    if not timed:
+        return {}
+    origin = min(event["time_s"] for event in timed)
+    timeline: dict[str, dict[str, float]] = {}
+    for event in timed:
+        target_step = event.get("target_step")
+        if not isinstance(target_step, int) or not 0 <= target_step < steps:
+            continue
+        name = event["event"]
+        if name == "completion":
+            indices = [event["sibling"]["generation_index"]]
+        elif name == "completion_arrived":
+            indices = [event["generation_index"]]
+        else:
+            indices = event.get("generation_indices", [])
+        for generation_index in indices:
+            key = repr((target_step, int(event["prompt_idx"]), int(generation_index)))
+            # Keep the latest occurrence: a re-dispatch supersedes the original.
+            timeline.setdefault(key, {})[name] = round(event["time_s"] - origin, 3)
+    return dict(sorted(timeline.items()))
+
+
+def _ordering_report(
+    *,
+    baseline_events: Sequence[Mapping[str, Any]],
+    phase1_events: Sequence[Mapping[str, Any]],
+    recovery_events: Sequence[Mapping[str, Any]],
+    steps: int,
+) -> dict[str, Any]:
+    report: dict[str, Any] = {}
+    for label, event_name in (
+        ("sealed", "completion"),
+        ("arrived", "completion_arrived"),
+    ):
+        baseline = _completion_order(
+            baseline_events, event_name=event_name, steps=steps
+        )
+        recovery = _effective_recovery_order(
+            _completion_order(phase1_events, event_name=event_name, steps=steps),
+            _completion_order(recovery_events, event_name=event_name, steps=steps),
+        )
+        report[label] = {
+            "individual": _within_step_rank_metrics(baseline, recovery),
+            "prompt_group_ready": _within_step_rank_metrics(
+                _prompt_group_ready_order(baseline),
+                _prompt_group_ready_order(recovery),
+            ),
+        }
+    return report
+
+
 def compare(args: argparse.Namespace) -> None:
     baseline_records = _read_jsonl(args.baseline_training)
     recovery_records = _read_jsonl(args.recovery_training)
     selection = _read_json(args.selection)
+
+    # Write every diagnostic before the strict checks so a failing run still
+    # shows where ordering, timing, and logprobs landed.
+    baseline_events = _read_jsonl(args.baseline_events)
+    phase1_events = _read_jsonl(args.phase1_events)
+    recovery_events = _read_jsonl(args.recovery_events)
+    divergence = _classify_token_divergence(
+        baseline_records, recovery_records, selection
+    )
+    ordering = _ordering_report(
+        baseline_events=baseline_events,
+        phase1_events=phase1_events,
+        recovery_events=recovery_events,
+        steps=args.steps,
+    )
+    report = {
+        "ordering": ordering,
+        "timeline": {
+            "baseline": _rollout_timeline(baseline_events, steps=args.steps),
+            "phase1": _rollout_timeline(phase1_events, steps=args.steps),
+            "recovery": _rollout_timeline(recovery_events, steps=args.steps),
+        },
+        "generation_logprobs": _generation_logprob_report(
+            baseline_records, recovery_records
+        ),
+        "restored_prefixes": [
+            {
+                key: cut[key]
+                for key in ("group_id", "generation_index", "generation_token_count")
+            }
+            for cut in _selection_cuts(selection)
+        ],
+        "token_divergence": {
+            repr(identity): classification
+            for identity, classification in divergence.items()
+        },
+    }
+    args.report_output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+    for label, metrics in ordering.items():
+        for scope in ("individual", "prompt_group_ready"):
+            values = metrics[scope]
+            print(
+                f"{label} {scope} order: exact_match={values['exact_match']} "
+                f"kendall_tau={values['kendall_tau']} "
+                f"inversions={values['discordant_pairs']}/{values['comparable_pairs']}",
+                flush=True,
+            )
+    pooled = report["generation_logprobs"]["pooled"]
+    print(
+        "generation_logprobs: "
+        + " ".join(f"{key}={value}" for key, value in sorted(pooled.items())),
+        flush=True,
+    )
+    print(
+        f"restored prefixes: {len(report['restored_prefixes'])} "
+        + str(
+            sorted(cut["generation_token_count"] for cut in report["restored_prefixes"])
+        ),
+        flush=True,
+    )
+    for identity, classification in divergence.items():
+        if classification["kind"] != "match":
+            print(f"token divergence {identity!r}: {classification}", flush=True)
+    print(f"parity report written to {args.report_output}", flush=True)
+
+    reward_signal = _assert_reward_signal(baseline_records)
+    print(
+        "reward signal: rewards per row="
+        f"{reward_signal['rewards']}, rows with nonzero advantages="
+        f"{reward_signal['rows_with_nonzero_advantages']}/{reward_signal['rows']}",
+        flush=True,
+    )
+    if args.require_prompt_group_order:
+        for label, metrics in ordering.items():
+            if not metrics["prompt_group_ready"]["exact_match"]:
+                raise AssertionError(
+                    f"{label} prompt-group readiness order differs within a step: "
+                    f"{metrics['prompt_group_ready']['per_step']!r}"
+                )
+
     _compare_training_rows(
         baseline_records,
         recovery_records,
@@ -374,6 +852,17 @@ def compare(args: argparse.Namespace) -> None:
         generations_per_prompt=args.generations_per_prompt,
         rtol=args.rtol,
         atol=args.atol,
+        excused=frozenset(
+            identity
+            for identity, classification in divergence.items()
+            if classification["kind"] == "pre_cut"
+        ),
+    )
+    _assert_generation_logprob_agreement(
+        report["generation_logprobs"]["pooled"],
+        min_bit_identical=args.logprob_min_bit_identical,
+        min_spearman=args.logprob_min_spearman,
+        max_abs_diff=args.logprob_max_abs_diff,
     )
     _compare_metrics(
         _read_json(args.baseline_metrics),
@@ -404,6 +893,18 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--steps", type=int, required=True)
     parser.add_argument("--prompts-per-step", type=int, required=True)
     parser.add_argument("--generations-per-prompt", type=int, required=True)
+    parser.add_argument("--baseline-events", type=Path, required=True)
+    parser.add_argument("--phase1-events", type=Path, required=True)
+    parser.add_argument("--recovery-events", type=Path, required=True)
+    parser.add_argument("--report-output", type=Path, required=True)
+    # Prompt groups in this workload have schema-fixed lengths far apart, so
+    # their readiness order is deterministic; sibling order within a group is not.
+    parser.add_argument("--require-prompt-group-order", action="store_true")
+    # Calibrated on a Qwen3-1.7B run: 99.7% bit-identical, spearman 0.995,
+    # max |diff| 0.17 over 135k generated tokens.
+    parser.add_argument("--logprob-min-bit-identical", type=float, default=0.99)
+    parser.add_argument("--logprob-min-spearman", type=float, default=0.99)
+    parser.add_argument("--logprob-max-abs-diff", type=float, default=0.5)
     parser.add_argument("--rtol", type=float, default=1e-4)
     parser.add_argument("--atol", type=float, default=1e-5)
     return parser
