@@ -569,6 +569,7 @@ jobs:
         BUILD_DYNAMO=1
         TRTLLM_BUILD_JOBS=24
         NEMO_RL_COMMIT=${{ needs.pre-flight.outputs.test_sha }}
+        NEMO_GYM_PREFETCH_CONFIGS=examples/nemo_gym/prefetch_unit_test_envs.yaml
 
   build-container-gb200:
     name: Build GB200/GCP container

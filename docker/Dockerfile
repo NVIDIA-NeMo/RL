@@ -591,6 +591,11 @@ if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
     UV_OVERRIDE="${GYM_VLLM_OVERRIDE}" \
     UV_LINK_MODE=symlink uv run python examples/nemo_gym/prefetch_venvs.py $NEMO_GYM_PREFETCH_CONFIGS
     rm -f "${GYM_VLLM_OVERRIDE}"
+    # Hand the prefetched venvs and the cache entries this layer added (pip and the other
+    # seed packages included) to the runtime UID, so its Gym servers can re-seed and reuse
+    # them offline. Earlier entries already belong to it, so nothing is copied up.
+    find "${UV_CACHE_DIR}" "${NEMO_GYM_VENV_DIR}" -xdev -uid 0 \
+        -exec chown -h "${RUNTIME_UID}:${RUNTIME_GID}" {} +
 fi
 EOF
 # ray's bundled Java worker jar ships an outdated httpcore5 with a known CVE
@@ -636,6 +641,7 @@ done
 # `uv run --extra <backend>` does before it installs the extra from the cache.
 test "$(uv cache dir)" = "${UV_CACHE_DIR}"
 test -O "${UV_CACHE_DIR}"
+test -z "$(find "${NEMO_GYM_VENV_DIR}" -xdev ! -uid "${RUNTIME_UID}" -print -quit)"
 test -O "$("${UV_PROJECT_ENVIRONMENT}/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
 UV_OFFLINE=1 uv sync --frozen --inexact --no-install-project --no-install-workspace
 EOF
