@@ -225,7 +225,9 @@ meta, driver_carry, rollout_metrics, gen_metrics = ray.get(
 # driver_carry          : BatchedDataDict of per-row tensors
 #                         (total_reward, loss_multiplier, truncated,
 #                          length, input_lengths, prompt_ids_for_adv,
-#                          response_token_lengths, GDPO components)
+#                          response_token_lengths, GDPO components,
+#                          mask_sample on the NeMo Gym path unless
+#                          env.should_mask_flagged_samples is false)
 ```
 
 **2. Reward + dynamic sampling** (driver, on `driver_carry` only):
