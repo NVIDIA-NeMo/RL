@@ -36,6 +36,42 @@ tool / environment tokens contribute zero. Because the advantage subtracts a
 real `prev_logprobs`, MOPD requires the student log-probabilities to actually be
 computed — see [Configuration](#configuration).
 
+### Trust-region teacher (TROPD)
+
+Early in training the student and teacher can disagree sharply, and a token the
+teacher all but rules out produces a large negative advantage that dominates the
+update. TROPD replaces the teacher with a proximal teacher — a mixture of the
+teacher and the current student — so the target stays within a trust region of
+the student:
+
+```
+log π_prox(t) = log( α · π_teacher(t) + (1 − α) · π_student(t) )
+Â_t           = sg[ log π_prox(t) − log π_student(t) ]
+```
+
+The advantage is bounded below by `log(1 − α)`; `α = 1` is plain MOPD.
+Optionally, `subtract_global_baseline` then subtracts the mean advantage over
+every trained token in the step.
+
+```yaml
+grpo:
+  adv_estimator:
+    name: opd
+    proximal_teacher_alpha: 0.2      # in (0, 1]; 1.0 (default) is plain MOPD
+    subtract_global_baseline: true   # default false
+```
+
+`on_policy_distillation/teacher_student_logprob_gap_mean` always reports the raw
+`log π_teacher − log π_student` gap, so it stays comparable across α;
+`on_policy_distillation/adv_mean` and `adv_std` describe the advantage after
+TROPD and the global baseline, before `grpo.advantage_clip_low/high`.
+
+On the Single-Controller runtime the advantage stage runs once per streaming
+chunk, so `subtract_global_baseline: true` requires
+`async_rl.min_groups_for_streaming_train` to equal `grpo.num_prompts_per_step`
+(one chunk per step); setup rejects other values rather than centering each
+chunk on its own mean.
+
 ## Configuration
 
 Enable MOPD in two places: select the advantage estimator and add the
@@ -214,6 +250,9 @@ Rejected at construction rather than silently ignored:
   `positive_example_nll_weight`, `use_kl_in_reward`, and
   `use_on_policy_kl_approximation` (the base MOPD recipe sets this one to
   `true`, so a derived full-vocabulary recipe must override it to `false`).
+- The [TROPD](#trust-region-teacher-tropd) knobs only reshape `advantages`, which
+  this loss ignores: `proximal_teacher_alpha < 1` and
+  `subtract_global_baseline: true` are rejected.
 
 ## Running MOPD
 
