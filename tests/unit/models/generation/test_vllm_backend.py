@@ -691,12 +691,13 @@ def test_layerwise_reload_detaches_deferred_transport_weights(monkeypatch):
 
 @pytest.mark.vllm
 def test_padded_trtllm_reload_finalizes_at_logical_weight_size(monkeypatch):
-    from nemo_rl.models.generation.vllm import vllm_backend
     from vllm.model_executor.model_loader.reload.layerwise import (
         get_layerwise_info,
         initialize_layerwise_reload,
         record_metadata_for_reloading,
     )
+
+    from nemo_rl.models.generation.vllm import vllm_backend
 
     layer = torch.nn.Module()
     layer.moe_config = SimpleNamespace(
