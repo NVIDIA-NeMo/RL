@@ -98,7 +98,6 @@ policy:
   offload_optimizer_for_logprob: false
 
   dtensor_cfg:
-    _v2: true
     enabled: false
     cpu_offload: False
     sequence_parallel: false
