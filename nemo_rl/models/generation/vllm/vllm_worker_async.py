@@ -61,6 +61,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     verify_right_padding,
 )
+from nemo_rl.models.generation.prefix_read_batcher import PrefixReadBatcher
 from nemo_rl.models.generation.vllm.checkpoint_engine import (
     VllmAsyncCheckpointEngineRpcMixin,
 )
@@ -573,6 +574,7 @@ class VllmAsyncGenerationWorkerImpl(
         # parent-chain rows through it directly; prefix resolution goes through
         # the shared ChainPrefixCache below.
         self._staging_source: Any | None = None
+        self._generation_prefix_reader: PrefixReadBatcher | None = None
         # Resolved staging-chain prefixes, shared implementation with the Megatron
         # preparer. Installed by setup_token_capture; fetch runs on executor threads.
         # Deferred import: tq_token_sink pulls in the data-plane stack.
@@ -860,6 +862,8 @@ class VllmAsyncGenerationWorkerImpl(
         generation_prefix_cuts_enabled: bool = False,
         generation_cut_control_token: str | None = None,
         generation_cut_control_timeout_s: float | None = None,
+        generation_prefix_batch_size: int = 256,
+        generation_prefix_batch_max_tokens: int = 4_194_304,
     ) -> MediaColumnSpec | None:
         """Host ledger-authoritative token capture in this worker.
 
@@ -896,6 +900,11 @@ class VllmAsyncGenerationWorkerImpl(
             raise ValueError(
                 "generation-prefix cuts require a non-empty control bearer token"
             )
+        GenerationCutCaptureMixin._configure_generation_prefix_batching(
+            self,
+            max_rows=generation_prefix_batch_size,
+            max_tokens=generation_prefix_batch_max_tokens,
+        )
         if capture_media:
             # Omni-only: a new processor family must also change setup.py (driver
             # checks), captured_media.py (_processed_omni_tensors, pack_images,
@@ -946,6 +955,17 @@ class VllmAsyncGenerationWorkerImpl(
                     "router-replay prefix capture requires the vLLM HTTP client"
                 )
             self._http_engine_client.enable_active_route_capture()
+        if self._generation_prefix_reader is not None:
+            await self._generation_prefix_reader.aclose()
+        # Restores read routes and media with their prefix rows, so the
+        # batcher coalesces the same route- and media-aware fetch.
+        self._generation_prefix_reader = PrefixReadBatcher(
+            functools.partial(
+                GenerationCutCaptureMixin._fetch_generation_cut_rows, self
+            ),
+            max_rows=generation_prefix_batch_size,
+            max_tokens=generation_prefix_batch_max_tokens,
+        )
         self._chain_prefix.install(source)
         install_capture(
             self,
@@ -1800,12 +1820,22 @@ class VllmAsyncGenerationWorkerImpl(
                     )
                     cut_snapshots = None
                     if admission.generation_cut is not None:
-                        # Off-loop: the chunk fetch is a blocking TQ read. The
-                        # same chunks restore the call's media and its prefix.
-                        cut_snapshots = await asyncio.to_thread(
-                            worker_self._fetch_generation_cut_chunks,
-                            admission.generation_cut,
+                        if worker_self._generation_prefix_reader is None:
+                            raise RuntimeError(
+                                "generation prefix reader not initialized"
+                            )
+                        # Concurrent restores share bounded TQ reads. The same
+                        # chunks restore the call's media and its prefix.
+                        cut_snapshots = (
+                            await worker_self._generation_prefix_reader.fetch(
+                                list(admission.generation_cut.staging_keys),
+                                tokens_per_key=max(1, self.model_config.max_model_len),
+                            )
                         )
+                        if not cut_snapshots:
+                            raise RuntimeError(
+                                "generation-cut continuation has no staged chunks"
+                            )
                         restored_generation_media = (
                             worker_self._restore_generation_cut_media(cut_snapshots)
                         )
@@ -3382,6 +3412,9 @@ class VllmAsyncGenerationWorkerImpl(
     async def shutdown(self) -> bool:
         """Clean up vLLM resources."""
         try:
+            generation_prefix_reader = getattr(self, "_generation_prefix_reader", None)
+            if generation_prefix_reader is not None:
+                await generation_prefix_reader.aclose()
             # A terminal write may be waiting at the TQ snapshot fence when the
             # actor is asked to stop. Release it before retiring the isolated
             # cut-control and fence executors; waiting for a wedged TQ write
