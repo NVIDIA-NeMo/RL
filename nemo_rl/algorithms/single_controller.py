@@ -725,6 +725,8 @@ class SingleControllerActor:
             if self._async_cfg.log_full_train_data
             else None
         )
+        # Rows the stage reported writing this step, across every shard.
+        self._train_data_dump_rows = 0
 
         # Seeded here rather than in run(): on resume _trainer_version is the
         # checkpoint's step, so a run resuming mid-warmup needs the widened
@@ -3242,8 +3244,11 @@ class SingleControllerActor:
                 if self._train_data_dump is not None:
                     with self._timer.time("train_data_dump"):
                         await asyncio.to_thread(
-                            self._train_data_dump.finish_step, self._train_steps
+                            self._train_data_dump.finish_step,
+                            self._train_steps,
+                            self._train_data_dump_rows,
                         )
+                    self._train_data_dump_rows = 0
 
                 self._trainer_version += 1
                 self._train_steps += 1
@@ -5305,6 +5310,7 @@ class SingleControllerActor:
             self._timer.record(
                 "train_data_dump", outcome.train_data_dump_s, should_log=False
             )
+        self._train_data_dump_rows += outcome.train_data_dump_rows
 
     # ── utility helpers ────────────────────────────────────────────────────
 

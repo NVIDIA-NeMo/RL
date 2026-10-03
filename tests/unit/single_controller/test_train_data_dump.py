@@ -97,6 +97,35 @@ def test_shards_write_separate_parts_and_merge_in_order(tmp_path: Path) -> None:
     assert not list(tmp_path.glob("*.part-*"))
 
 
+def test_unreachable_shard_fails_instead_of_publishing_a_short_dump(
+    tmp_path: Path,
+) -> None:
+    """A pool off the controller's filesystem writes parts it cannot see.
+
+    Those shards still run and still report their row counts, so without the
+    count check the merge would publish whatever happened to be local and the
+    dump would look complete while silently missing a shard.
+    """
+    reachable = TrainDataDump(str(tmp_path), shard_id="0")
+    reachable.add_chunk(
+        step=0,
+        sample_ids=["here"],
+        tags=None,
+        input_lengths=torch.tensor([1]),
+        sequences={"token_ids": torch.tensor([[1]])},
+        scalars={},
+    )
+    controller = TrainDataDump(str(tmp_path))
+    # Two shards reported a row each; only one part landed on this filesystem.
+    with pytest.raises(RuntimeError, match="must share this filesystem"):
+        controller.finish_step(0, 2)
+    assert not list(tmp_path.glob("*.jsonl"))
+    assert not list(tmp_path.glob("*.partial"))
+    # The honest count still publishes.
+    controller.finish_step(0, 1)
+    assert (tmp_path / "train_data_step1.jsonl").exists()
+
+
 def test_controller_publishes_a_step_it_never_wrote(tmp_path: Path) -> None:
     """With a pool the controller holds a dump that only ever merges.
 

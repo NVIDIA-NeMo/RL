@@ -245,6 +245,7 @@ def _stamp_advantage_stage_config(ctrl, *, shardable: bool = True) -> None:
         advantage_estimator=ctrl._advantage_estimator,
     )
     ctrl._train_data_dump = dump
+    ctrl._train_data_dump_rows = 0
     # _absorb_advantage_outcome accumulates into these unconditionally, so they
     # have to exist even for the non-OPD tests. Tests that assert on them set
     # their own values after this call.
@@ -2874,6 +2875,9 @@ def test_train_pump_logs_dump_timing_after_optimizer_step(
         )
         # Seed chunk-write time to verify publication adds to the per-step sum.
         ctrl._timer.record("train_data_dump", 2.0)
+        # The chunk above stands in for the stage's write, so stand in for the
+        # row count it would have reported alongside it too.
+        ctrl._train_data_dump_rows = len(meta.sample_ids)
 
     def finish_training() -> dict:
         assert not final.exists()

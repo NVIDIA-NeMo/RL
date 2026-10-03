@@ -101,12 +101,18 @@ class TrainDataDump:
                 stream.write(json.dumps(row) + "\n")
                 self.rows += 1
 
-    def finish_step(self, step: int) -> None:
+    def finish_step(self, step: int, expected_rows: int | None = None) -> None:
         """Merge every shard's part file and publish the step atomically.
 
         Called on the controller, which may not itself have written anything:
         with a pool the rows come from the actors, so the parts on disk are the
         only record of what the step produced.
+
+        ``expected_rows`` is what the shards reported writing. A pool that does
+        not share this filesystem with the controller still runs and still
+        reports, and its parts are simply not here -- which would publish a
+        short dump that looks complete. Checking the count is what turns that
+        into a failure.
         """
         parts = sorted(self.log_dir.glob(f"train_data_step{step + 1}.jsonl.part-*"))
         if not parts:
@@ -125,6 +131,13 @@ class TrainDataDump:
         if not rows:
             partial.unlink()
             raise RuntimeError("Completed optimizer step has no training dump")
+        if expected_rows is not None and rows != expected_rows:
+            partial.unlink()
+            raise RuntimeError(
+                f"Training dump merged {rows} row(s) from {len(parts)} shard(s) "
+                f"but the stage reported writing {expected_rows}; the advantage "
+                "pool must share this filesystem with the controller"
+            )
         os.replace(partial, self.log_dir / f"train_data_step{step + 1}.jsonl")
         for part in parts:
             part.unlink()

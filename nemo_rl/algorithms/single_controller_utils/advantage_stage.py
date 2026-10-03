@@ -312,6 +312,9 @@ class AdvantageOutcome:
     # because the writing moved off the controller with the rest of the
     # stage, and the controller still owns the timer the metric lands in.
     train_data_dump_s: float = 0.0
+    # Rows this call wrote to its shard's part file, so the controller's merge
+    # can tell a missing part from an empty one.
+    train_data_dump_rows: int = 0
 
 
 class AdvantageComputer:
@@ -529,6 +532,7 @@ class AdvantageComputer:
         advantage_partial = AdvantagePartial.from_values(response_advantages)
 
         train_data_dump_s = 0.0
+        train_data_dump_rows = 0
         if self._train_data_dump is not None:
             assert request.train_step is not None
             dump_started = time.perf_counter()
@@ -564,6 +568,7 @@ class AdvantageComputer:
                 },
             )
             train_data_dump_s = time.perf_counter() - dump_started
+            train_data_dump_rows = len(meta.sample_ids)
 
         fields_to_put = {adv_cfg.output_field: advantages}
         if not torch.equal(final_sample_mask, sample_mask):
@@ -593,4 +598,5 @@ class AdvantageComputer:
             opd_stat_count=opd_stat_count,
             opd_gap_sum=opd_gap_sum,
             train_data_dump_s=train_data_dump_s,
+            train_data_dump_rows=train_data_dump_rows,
         )
