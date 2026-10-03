@@ -167,9 +167,7 @@ def test_patch_fails_loudly_if_transformers_target_signature_changed(monkeypatch
 
 
 def test_torch_fx_compat_patch_restores_removed_helper(monkeypatch):
-    monkeypatch.setattr(
-        transformers_compat, "distribution_version", lambda _: "5.12.1"
-    )
+    monkeypatch.setattr(transformers_compat, "distribution_version", lambda _: "5.12.1")
     monkeypatch.delattr(
         transformers_import_utils,
         "is_torch_fx_available",
@@ -186,9 +184,7 @@ def test_torch_fx_compat_patch_restores_removed_helper(monkeypatch):
 
 def test_torch_fx_compat_patch_preserves_existing_helper(monkeypatch):
     existing_helper = object()
-    monkeypatch.setattr(
-        transformers_compat, "distribution_version", lambda _: "4.57.1"
-    )
+    monkeypatch.setattr(transformers_compat, "distribution_version", lambda _: "4.57.1")
     monkeypatch.setattr(
         transformers_import_utils,
         "is_torch_fx_available",
