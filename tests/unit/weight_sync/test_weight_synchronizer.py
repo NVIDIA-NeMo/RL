@@ -790,7 +790,10 @@ class TestNcclReshardWeightSynchronizer:
                     "expert_model_parallel_size": 1,
                     "pipeline_model_parallel_size": 1,
                 },
-                "generation": {"vllm_cfg": {"tensor_parallel_size": 4}},
+                "generation": {
+                    "backend": "vllm",
+                    "vllm_cfg": {"tensor_parallel_size": 4},
+                },
             },
         )
         generation = _mock_generation()
