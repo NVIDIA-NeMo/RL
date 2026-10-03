@@ -1,0 +1,27 @@
+{
+  "borrowed_tensor_shapes": {
+    "embed_tokens.weight": [151936, 4096],
+    "lm_head.weight": [151936, 4096]
+  },
+  "config": {
+    "architectures": [
+      "Qwen3DSparkModel"
+    ],
+    "block_size": 7,
+    "confidence_head_with_markov": true,
+    "enable_confidence_head": true,
+    "hidden_size": 4096,
+    "markov_rank": 256,
+    "vocab_size": 151936
+  },
+  "config_sha256": "e470e70a553616f0dce8f783f42cfd25b7bd7dfdcd57ead680a0623040725611",
+  "head_tensor_shapes": {
+    "confidence_head.proj.bias": [1],
+    "confidence_head.proj.weight": [1, 4352],
+    "markov_head.markov_w1.weight": [151936, 256],
+    "markov_head.markov_w2.weight": [151936, 256]
+  },
+  "repository": "deepseek-ai/dspark_qwen3_8b_block7",
+  "revision": "03326e5043815da1f81b109078b2889737c26017",
+  "safetensors_header_sha256": "829c4dc1fa69cb97a40beaad8d8d00cbb477ce8d9061c33569678819a16cd3ae"
+}
