@@ -15,6 +15,7 @@
 import asyncio
 import gc
 import json
+import logging
 import tempfile
 from copy import deepcopy
 from dataclasses import asdict
@@ -2783,3 +2784,50 @@ def test_run_async_nemo_gym_rollout(
     1. In nemo_rl/experience/rollouts.py::run_async_nemo_gym_rollout, the sampling params are passed appropriately
     2. In nemo_rl/models/generation/vllm/vllm_worker_async.py::VllmAsyncGenerationWorker::_setup_vllm_server::create_chat_completion, the sampling params (like top_k) are set as appropriate
     """
+
+
+def test_aggregate_env_metrics_calls_every_env_hook_and_reports_a_failure_once(
+    caplog, monkeypatch
+):
+    """Opted-in environments' hooks run on their rows' metadata; an environment
+    without the ``aggregates_rollout_metadata`` marker is never called (its
+    hook expects the trained batch); a hook that raises contributes nothing and
+    is reported once, not on every step."""
+
+    class _Env:
+        def __init__(self):
+            self.batches = []
+
+        def aggregates_rollout_metadata(self):
+            return True
+
+        def global_post_process_and_metrics(self, batch):
+            self.batches.append(batch)
+            return batch, {"n": len(batch["metadata"])}
+
+    class _Broken:
+        def aggregates_rollout_metadata(self):
+            return True
+
+        def global_post_process_and_metrics(self, batch):
+            raise KeyError("rewards")
+
+    class _Upstream:
+        def global_post_process_and_metrics(self, batch):
+            raise AssertionError("an environment without the marker must not be called")
+
+    env, broken = _Env(), _Broken()
+    task_names = ["math", "math", "code", "text"]
+    metadata = [{"answer": 1}, {"answer": 2}, None, None]
+    task_to_env = {"math": env, "code": broken, "text": _Upstream()}
+    monkeypatch.setattr(rollouts_mod, "_ENV_METRICS_HOOK_WARNED", set())
+    metrics = {}
+    with caplog.at_level(logging.WARNING):
+        rollouts_mod._aggregate_env_metrics(metrics, task_names, metadata, task_to_env)
+        rollouts_mod._aggregate_env_metrics(metrics, task_names, metadata, task_to_env)
+    assert metrics == {"math/n": 2}
+    assert env.batches[0]["metadata"] == [{"answer": 1}, {"answer": 2}]
+    warnings_for_code = [r for r in caplog.records if "'code' env metrics" in r.message]
+    assert (
+        len(warnings_for_code) == 1 and "reported once" in warnings_for_code[0].message
+    )
