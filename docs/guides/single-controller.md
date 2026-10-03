@@ -465,3 +465,20 @@ The SC path is still under active development. Feature gaps are tracked in [issu
 - Reward shaping and sample filtering — `reward_shaping`, `reward_scaling`, and `use_dynamic_sampling` are implemented on neither algorithm block, so setup rejects them rather than silently skipping the shaping. Environment-flagged sample masking and `overlong_filtering` are supported; truncated completions are excluded from the loss through `sample_mask`, and a step in which every completion is filtered is rejected rather than skipped.
 - The `windowed` sampler has no `over_sampling_ratio` cap — over-produced groups aged past the window are evicted, wasting rollout compute.
 - The drain gate in refit is not yet supported.
+
+### Full training-data dumps
+
+Set `async_rl.log_full_train_data: true` to stream every consumed sample to
+`train_data_step<N>.jsonl` in the logger directory. This is independent of
+`env.should_log_nemo_gym_responses` and OPD diagnostics. Dumps retain masked
+samples and include full token IDs, token/sample loss masks, final clipped
+advantages, rewards, sample IDs and metadata, generation logprobs, and the
+student/teacher logprobs when computed. Only padding beyond `input_lengths`
+is removed; response content is not capped. Values follow the legacy
+singleton-batch JSONL shape. Chunks stream through `.jsonl.partial` files;
+the final name is published only after the optimizer step completes. A
+partial file is not proof of a completed training step.
+
+The per-step `timing/train/train_data_dump` metric reports wall-clock seconds
+summed across chunk preparation/writes and final-file publication. Chunk dump
+time is also included in `advantage_calculation`; these timings overlap.
