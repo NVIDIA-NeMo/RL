@@ -471,6 +471,9 @@ class WatchdogConfig(BaseModel, extra="allow"):
 
 
 class AsyncRLConfig(BaseModel, extra="allow"):
+    # Stream every consumed sample's untruncated token tensors to JSONL. Files
+    # are published only after the optimizer step completes; disabled by default.
+    log_full_train_data: bool = False
     # Staleness policy shared by the rollout and train pumps.
     sampler: SamplerConfig = Field(
         default_factory=InOrderSamplerConfig,
@@ -1505,7 +1508,22 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 "at least one teacher mapping."
             )
         opd_module.assert_prev_logprobs_available(master_config)
+        opd_module.assert_trust_region_supported(master_config)
         _validate_opd_full_config(master_config, opd_config)
+        if (
+            algo_cfg.adv_estimator.subtract_global_baseline
+            and async_config.min_groups_for_streaming_train
+            != algo_cfg.num_prompts_per_step
+        ):
+            # The advantage stage runs once per streaming chunk, so a smaller
+            # chunk would center each chunk on its own mean, not the step's.
+            raise ValueError(
+                "grpo.adv_estimator.subtract_global_baseline=true requires "
+                "async_rl.min_groups_for_streaming_train "
+                f"({async_config.min_groups_for_streaming_train}) == "
+                f"grpo.num_prompts_per_step ({algo_cfg.num_prompts_per_step}) "
+                "so the baseline covers the whole step."
+            )
 
     if (
         reference_policy_kl_penalty == 0
