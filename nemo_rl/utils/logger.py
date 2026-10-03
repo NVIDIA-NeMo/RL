@@ -1524,7 +1524,16 @@ class Logger(LoggerInterface):
         diff = (generation_logprobs - prev_logprobs).abs() * token_mask
         mask = token_mask * sample_mask.unsqueeze(-1)
 
-        mult_prob_error = (torch.exp(diff) * mask).sum(dim=-1) / mask.sum(dim=-1)
+        num_tokens = mask.sum(dim=-1)
+        if not (num_tokens > 0).any():
+            return
+        # Samples without loss tokens (e.g. filtered out) would be 0/0 = NaN, which argmax
+        # would pick; rank them last so the plot shows the real worst sample.
+        mult_prob_error = torch.where(
+            num_tokens > 0,
+            (torch.exp(diff) * mask).sum(dim=-1) / num_tokens.clamp(min=1),
+            float("-inf"),
+        )
 
         sample_idx = torch.argmax(mult_prob_error)
         sample_error = mult_prob_error[sample_idx]
