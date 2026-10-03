@@ -21,6 +21,9 @@ NEMO_GYM_TASK_INDEX_KEY = "_ng_task_index"
 NEMO_GYM_GROUP_ID_KEY = "_ng_group_id"
 NEMO_GYM_GROUP_ATTEMPT_KEY = "_ng_group_attempt"
 NEMO_GYM_ROLLOUT_INDEX_KEY = "_ng_rollout_index"
+NEMO_GYM_ROLLOUT_ID_KEY = "_ng_rollout_id"
+NEMO_GYM_ATTEMPT_INDEX_KEY = "_ng_attempt_index"
+NEMO_GYM_CAPTURE_ID_KEY = "_ng_capture_id"
 NEXT_NEMO_GYM_TASK_INDEX_KEY = "next_ng_task_index"
 # Unconsumed suffix of a gap-fill dataloader batch, carried in the async
 # collector's rollouts state so a checkpoint cannot strand yielded prompts.
@@ -39,6 +42,15 @@ RETAINED_TASK_INDICES_KEY = "retained_task_indices"
 # The resume folds them into the covered set so the re-yielded window drops
 # them instead of training them a second time.
 TRAINED_TASK_INDICES_KEY = "trained_task_indices"
+
+
+def nemo_gym_capture_key(logical_rollout_id: str, attempt_index: int) -> str:
+    """Return Gym's physical capture key for one logical rollout attempt."""
+    if attempt_index < 0:
+        raise ValueError("attempt_index must be non-negative")
+    if attempt_index == 0:
+        return logical_rollout_id
+    return f"{logical_rollout_id}-a{attempt_index}"
 
 
 @dataclass
