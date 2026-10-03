@@ -545,6 +545,95 @@ def test_fetch_prefix_token_ids_rejects_duplicates(tq_client, staging_partition)
         source.fetch_prefix_token_ids(["r/c", "r/c"])
 
 
+def test_generation_prefix_batch_round_trips_ragged_rows(tq_client, staging_partition):
+    class RecordingClient:
+        def __init__(self):
+            self.calls = []
+
+        def put_samples(self, **kwargs):
+            self.calls.append(kwargs)
+            return tq_client.put_samples(**kwargs)
+
+    client = RecordingClient()
+    sink = TQTokenSink(client, staging_partition=staging_partition)
+    records, _, _ = build_fixture_artifacts("worked_example")
+    more_records, _, _ = build_fixture_artifacts(
+        "single_call", rollout_id="a-different-length-rollout-id"
+    )
+    records.extend(more_records)
+    results = sink.stage_generation_prefix_batch(
+        records,
+        checkpoint_id="batch-checkpoint",
+        chunk_sequences=list(range(len(records))),
+    )
+
+    assert all(result.ok for result in results)
+    assert len(client.calls) == 1
+    assert client.calls[0]["sample_ids"] == [result.staging_key for result in results]
+    assert [tag["digest"] for tag in client.calls[0]["tags"]] == [
+        record.digest for record in records
+    ]
+    restored = TQTokenSource(tq_client, staging_partition=staging_partition).fetch(
+        [result.staging_key for result in results]
+    )
+    assert [row.model_dump() for row in restored] == [
+        record.model_dump(exclude={"extras"}) for record in records
+    ]
+
+
+def test_generation_prefix_batch_rejects_bad_inventory_before_writing():
+    class UnexpectedClient:
+        def put_samples(self, **kwargs):
+            pytest.fail("invalid inventory must not reach TQ")
+
+    sink = TQTokenSink(UnexpectedClient(), staging_partition="test")
+    records, _, _ = build_fixture_artifacts("single_call")
+    assert (
+        sink.stage_generation_prefix_batch(
+            [], checkpoint_id="checkpoint", chunk_sequences=[]
+        )
+        == []
+    )
+    with pytest.raises(ValueError, match="equal lengths"):
+        sink.stage_generation_prefix_batch(
+            records, checkpoint_id="checkpoint", chunk_sequences=[]
+        )
+    with pytest.raises(ValueError, match="duplicate"):
+        sink.stage_generation_prefix_batch(
+            records * 2, checkpoint_id="checkpoint", chunk_sequences=[0, 0]
+        )
+
+
+def test_generation_prefix_batch_failure_does_not_advertise_success():
+    class FailingClient:
+        def __init__(self):
+            self.calls = 0
+            self.cleared = []
+
+        def put_samples(self, **kwargs):
+            self.calls += 1
+            raise RuntimeError("injected partial batch write")
+
+        def clear_samples(self, **kwargs):
+            self.cleared.extend(kwargs["sample_ids"])
+
+    client = FailingClient()
+    sink = TQTokenSink(client, staging_partition="test")
+    records, _, _ = build_fixture_artifacts("worked_example")
+    results = sink.stage_generation_prefix_batch(
+        records,
+        checkpoint_id="checkpoint",
+        chunk_sequences=list(range(len(records))),
+    )
+
+    assert client.calls == 1
+    assert len(results) == len(records)
+    assert all(not result.ok for result in results)
+    assert all(result.staging_key for result in results)
+    assert all("injected partial batch write" in result.error for result in results)
+    assert client.cleared == [result.staging_key for result in results]
+
+
 def _split_delta(record) -> tuple[list[int], list[int], list[float]]:
     """Split a fixture record's delta into (prompt ids, generated ids, logprobs)."""
     generated_start = record.token_mask_delta.index(1.0)

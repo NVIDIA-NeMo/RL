@@ -688,6 +688,10 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
     """
 
     target_level: RecoveryTargetLevel = RecoveryTargetLevel.SIBLING
+    # Per-generation-owner bounds for checkpoint-time prefix TQ I/O. Rows are
+    # never split; one row larger than the token limit is processed alone.
+    generation_prefix_batch_size: Annotated[int, Field(gt=0)] = 256
+    generation_prefix_batch_max_tokens: Annotated[int, Field(gt=0)] = 4_194_304
     # Keyed by ``extra_env_info.task_source``, which is available before Gym
     # resolves the concrete agent used to execute the row.
     task_source_target_level_overrides: dict[str, RecoveryTargetLevel] = Field(

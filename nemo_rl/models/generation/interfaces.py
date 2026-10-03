@@ -620,6 +620,8 @@ class GenerationInterface(ABC):
         capture_media: bool = False,
         generation_prefix_cuts_enabled: bool = False,
         generation_cut_control_token: str | None = None,
+        generation_prefix_batch_size: int = 256,
+        generation_prefix_batch_max_tokens: int = 4_194_304,
     ) -> None:
         """Install token capture in the serving workers (``token_capture.enabled``).
 
@@ -636,6 +638,9 @@ class GenerationInterface(ABC):
                 model calls for prefix recovery.
             generation_cut_control_token: Bearer token used by Gym's checkpoint
                 coordinator to authorize generation-cut requests.
+            generation_prefix_batch_size: Maximum active calls per cut-time TQ put.
+            generation_prefix_batch_max_tokens: Maximum token rows accumulated in
+                one cut-time TQ put; a single larger row is not split.
         """
         raise NotImplementedError(
             f"token_capture.enabled is not supported for {type(self).__name__}"

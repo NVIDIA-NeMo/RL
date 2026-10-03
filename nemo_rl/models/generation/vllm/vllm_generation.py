@@ -642,6 +642,8 @@ class VllmGeneration(GenerationInterface):
         capture_media: bool = False,
         generation_prefix_cuts_enabled: bool = False,
         generation_cut_control_token: str | None = None,
+        generation_prefix_batch_size: int = 256,
+        generation_prefix_batch_max_tokens: int = 4_194_304,
     ) -> None:
         """Install ledger-authoritative token capture in every DP-leader worker.
 
@@ -660,6 +662,8 @@ class VllmGeneration(GenerationInterface):
             capture_media=capture_media,
             generation_prefix_cuts_enabled=generation_prefix_cuts_enabled,
             generation_cut_control_token=generation_cut_control_token,
+            generation_prefix_batch_size=generation_prefix_batch_size,
+            generation_prefix_batch_max_tokens=generation_prefix_batch_max_tokens,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
         ray.get(futures)

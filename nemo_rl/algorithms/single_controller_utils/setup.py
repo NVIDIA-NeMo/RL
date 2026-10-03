@@ -1995,6 +1995,12 @@ def setup_single_controller(
             capture_media=capture_media,
             generation_prefix_cuts_enabled=generation_prefix_cuts_enabled,
             generation_cut_control_token=token_capture_cfg.control_auth_token,
+            generation_prefix_batch_size=(
+                master_config.rollout_recovery.generation_prefix_batch_size
+            ),
+            generation_prefix_batch_max_tokens=(
+                master_config.rollout_recovery.generation_prefix_batch_max_tokens
+            ),
         )
         generation.set_rollout_weight_version(0)
 
