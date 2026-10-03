@@ -754,6 +754,7 @@ def _spinup_gym(
     master_config: MasterConfig,
     base_urls: list[str],
     tokenizer: PreTrainedTokenizerBase,
+    policy_api_key: Optional[str],
 ) -> tuple[NemoGymShardSet, float]:
     """Spin up the NeMo-Gym shard set against the reserved vLLM URLs.
 
@@ -762,6 +763,8 @@ def _spinup_gym(
         base_urls: Reserved vLLM OpenAI server URLs.
         tokenizer: Installed on the actor at spinup rather than passed per rollout
             call. See NemoGym.set_tokenizer.
+        policy_api_key: The bearer token the vLLM server requires on its OpenAI
+            routes (VllmGeneration.http_server_api_key), or None when it checks none.
 
     Returns:
         A tuple of (NeMo-Gym shard set, wall time spent in this call).
@@ -777,6 +780,7 @@ def _spinup_gym(
         tokenizer=tokenizer,
         enable_router_replay=enable_router_replay,
         use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
+        policy_api_key=policy_api_key,
         # Ledger config rides into Gym's policy model server.
         token_capture=(
             master_config.token_capture.model_dump()
@@ -1735,6 +1739,11 @@ def setup_single_controller(
             master_config=master_config,
             base_urls=cast(list[str], gym_spinup_base_urls),
             tokenizer=tokenizer,
+            # Only the deferred vLLM backend exists at this point and can carry a
+            # key; a Megatron generation server is built later and checks none.
+            policy_api_key=(
+                generation.http_server_api_key if generation is not None else None
+            ),
         )
 
     if megatron_backend and colocated:

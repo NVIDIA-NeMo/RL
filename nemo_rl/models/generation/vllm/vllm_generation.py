@@ -15,6 +15,7 @@
 import asyncio
 import logging
 import os
+import secrets
 import time
 import warnings
 from collections import defaultdict
@@ -76,6 +77,33 @@ if TYPE_CHECKING:
     from nemo_rl.data_plane.interfaces import DataPlaneConfig
 
 logger = logging.getLogger(__name__)
+
+
+def http_server_api_key_and_worker_config(
+    config: VllmConfig,
+) -> tuple[Optional[str], VllmConfig]:
+    """Generate the exposed HTTP server's bearer token and the worker config carrying it.
+
+    Reads ``vllm_cfg.expose_http_server`` and ``vllm_cfg.http_server_api_key_required``
+    from ``config``. When both are set, a random URL-safe key is generated and placed
+    as ``vllm_cfg.http_server_api_key`` in a shallow copy of ``config``; the workers
+    receive that copy and refuse OpenAI-route requests without the key. ``config``
+    itself is never modified, so the job's saved and logged configuration does not
+    carry the key. When either flag is off, no key exists and ``config`` is returned
+    as the worker config.
+
+    Returns:
+        ``(api_key, worker_config)``; ``api_key`` is None when no key is required.
+    """
+    vllm_cfg = config["vllm_cfg"]
+    if not (
+        vllm_cfg.get("expose_http_server")
+        and vllm_cfg.get("http_server_api_key_required")
+    ):
+        return None, config
+    api_key = secrets.token_urlsafe(32)
+    worker_config = {**config, "vllm_cfg": {**vllm_cfg, "http_server_api_key": api_key}}
+    return api_key, worker_config
 
 
 def _record_vllm_generation_metrics(
@@ -287,12 +315,19 @@ class VllmGeneration(GenerationInterface):
         worker_cls = resolve_generation_worker_cls(worker_cls, self.cfg)
         if extension_fqn is not None:
             worker_cls = extension_fqn
+        # The exposed HTTP server's per-job bearer token. Generated once here so
+        # every worker checks the same key, and kept on the instance so setup can
+        # hand it to the NeMo-Gym model server as policy_api_key. Only the copy of
+        # the config the workers receive carries it.
+        self.http_server_api_key, worker_config = http_server_api_key_and_worker_config(
+            config
+        )
         if self.cfg["vllm_cfg"]["async_engine"]:
             worker_builder = RayWorkerBuilder(
-                worker_cls, config, defer_model_load=defer_model_load
+                worker_cls, worker_config, defer_model_load=defer_model_load
             )
         else:
-            worker_builder = RayWorkerBuilder(worker_cls, config)
+            worker_builder = RayWorkerBuilder(worker_cls, worker_config)
 
         normalize_fastokens_env()
 

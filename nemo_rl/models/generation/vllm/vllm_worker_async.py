@@ -16,6 +16,7 @@ import asyncio
 import copy
 import gc
 import logging
+import secrets
 import threading
 import time
 import uuid
@@ -27,7 +28,8 @@ from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 import ray
 import torch
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse
 
 from nemo_rl.data.captured_media import (
     CapturedMedia,
@@ -85,6 +87,44 @@ class CapturedRequest:
     call: "ActiveCall"
     prompt_token_ids: list[int]
     media: CapturedMedia | None
+
+
+# Paths the bearer-token check protects: the OpenAI-compatible routes this module
+# registers, which NeMo-Gym's model server calls. The sparse-refit routes the
+# receiver registers on the same app carry their own header token
+# (vllm_sparse_refit.setup_api_server) and are not covered.
+HTTP_SERVER_PROTECTED_PATH_PREFIXES = ("/v1/", "/tokenize")
+
+
+def install_http_server_api_key_check(app: FastAPI, api_key: str) -> None:
+    """Refuse OpenAI-route requests that do not carry ``Authorization: Bearer <api_key>``.
+
+    Registers an HTTP middleware on ``app``. For a request whose path starts with one
+    of ``HTTP_SERVER_PROTECTED_PATH_PREFIXES``, the ``Authorization`` header is
+    compared in constant time with ``Bearer <api_key>``; a missing or different
+    value is answered with HTTP 401 in OpenAI's error envelope and never reaches the
+    route. Requests to other paths pass through unchanged.
+    """
+    expected = f"Bearer {api_key}".encode()
+
+    @app.middleware("http")
+    async def _require_bearer_token(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        if request.url.path.startswith(HTTP_SERVER_PROTECTED_PATH_PREFIXES):
+            supplied = (request.headers.get("Authorization") or "").encode()
+            if not secrets.compare_digest(supplied, expected):
+                return JSONResponse(
+                    status_code=401,
+                    content={
+                        "error": {
+                            "message": "missing or invalid bearer token",
+                            "type": "authentication_error",
+                            "code": 401,
+                        }
+                    },
+                )
+        return await call_next(request)
 
 
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_abort
@@ -1565,6 +1605,10 @@ class VllmAsyncGenerationWorkerImpl(
         app = self._setup_vllm_openai_api_server(app)
         if self._sparse_refit_receiver is not None:
             self._sparse_refit_receiver.setup_api_server(app)
+        # Present only when the driver generated a key (vllm_cfg.http_server_api_key_required).
+        http_server_api_key = self.cfg["vllm_cfg"].get("http_server_api_key")
+        if http_server_api_key:
+            install_http_server_api_key_check(app, http_server_api_key)
 
         ########################################
         # Server spinup
