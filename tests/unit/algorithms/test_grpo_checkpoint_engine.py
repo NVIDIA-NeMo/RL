@@ -44,7 +44,7 @@ def test_nixl_example_is_an_enabled_non_colocated_overlay():
     assert generation["refit_transport"] == "nixl"
     assert generation["refit_cfg"].nixl.update_weights_bucket_memory_ratio == 0.05
     assert not generation["colocated"]["enabled"]
-    assert config.cluster["num_nodes"] == 2
+    assert config.cluster.num_nodes == 2
 
 
 def test_reset_encoder_cache_flag_rejected_on_unsupported_refit_transports():
