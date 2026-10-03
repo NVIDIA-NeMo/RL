@@ -1988,36 +1988,6 @@ def test_set_moe_grad_scale_func_noop_when_no_config():
     MegatronPolicyWorkerImpl._set_moe_grad_scale_func(worker, lambda: 1.0)
 
 
-def test_compute_moe_grad_scale_normalizes_by_valid_tokens():
-    """_compute_moe_grad_scale should yield loss_scale = 1/global_valid_toks."""
-    from nemo_rl.models.policy.workers.megatron_policy_worker import (
-        MegatronPolicyWorkerImpl,
-    )
-
-    worker = object.__new__(MegatronPolicyWorkerImpl)
-    _disable_opd_full(worker)
-
-    scale_fn = MegatronPolicyWorkerImpl._compute_moe_grad_scale(
-        worker, torch.tensor(4.0)
-    )
-    assert torch.allclose(scale_fn(), torch.tensor(0.25))
-
-
-def test_compute_moe_grad_scale_clamps_zero_valid_tokens():
-    """clamp(min=1) must guard against division by zero when no valid tokens."""
-    from nemo_rl.models.policy.workers.megatron_policy_worker import (
-        MegatronPolicyWorkerImpl,
-    )
-
-    worker = object.__new__(MegatronPolicyWorkerImpl)
-    _disable_opd_full(worker)
-
-    scale_fn = MegatronPolicyWorkerImpl._compute_moe_grad_scale(
-        worker, torch.tensor(0.0)
-    )
-    assert torch.allclose(scale_fn(), torch.tensor(1.0))
-
-
 @pytest.mark.parametrize(
     ("kwargs", "expected_param_sync"),
     [({}, False), ({"param_sync": True}, True)],

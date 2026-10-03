@@ -1924,12 +1924,14 @@ def _validate_training_config(config: PolicyConfig, model_cfg: Any) -> None:
         "https://github.com/NVIDIA-NeMo/RL/blob/bccbc377705a81a1f4b3c31ad9767bcc15f735a8/nemo_rl/algorithms/sft.py#L175-L179."
     )
 
-    ## These settings are required for correct gradient computations in mcore
-    ## when calculate_per_token_loss is True, there is no scaling of the gradient in mcore,
-    ## so we handle the scaling in nemo-rl.
+    ## With calculate_per_token_loss=True there is no per-microbatch scaling in
+    ## mcore, so NeMo-RL handles the global-token normalization. With False,
+    ## mcore averages local microbatch means and DDP averages across DP/CP.
     ## perform_initialization = True is a workaround to ensure the correct tensor parallel attributes are set
     ## on the TP-sharded parameters.
-    model_cfg.calculate_per_token_loss = True
+    model_cfg.calculate_per_token_loss = config["megatron_cfg"].get(
+        "calculate_per_token_loss", False
+    )
     model_cfg.perform_initialization = True
 
     # MoE aux loss validation - disabled to support aux loss normalization in RL SFT.
@@ -2041,9 +2043,9 @@ def _create_megatron_config(
                 "distributed_data_parallel_config"
             ]["overlap_grad_reduce"],
             overlap_param_gather=overlap_param_gather,
-            # we need to set average_in_collective=False with calculate_per_token_loss=T
-            # otherwise, mcore throws an assertion error.
-            average_in_collective=False,  # Required with calculate_per_token_loss=True
+            # Required for calculate_per_token_loss=True. MCore also supports
+            # this setting in False mode by pre-scaling buffers by 1/dp_cp_size.
+            average_in_collective=False,
             use_distributed_optimizer=config["megatron_cfg"]["optimizer"][
                 "use_distributed_optimizer"
             ],

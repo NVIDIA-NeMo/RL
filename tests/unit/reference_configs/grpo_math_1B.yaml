@@ -191,6 +191,7 @@ policy:
 
   megatron_cfg:
     enabled: false
+    calculate_per_token_loss: true
     model_overrides: {}
     checkpoint:
       async_save: true

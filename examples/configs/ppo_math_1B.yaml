@@ -148,6 +148,8 @@ policy:
 
   megatron_cfg:
     enabled: false
+    # True: normalize by global valid tokens. False: average local microbatch means.
+    calculate_per_token_loss: true
     empty_unused_memory_level: 1
     activation_checkpointing: false
     # Module-level activation CPU offload; see docs/design-docs/training-backends.md.
