@@ -369,6 +369,20 @@ GRPO uses temperature, top-p (nucleus sampling), and top-k sampling during rollo
 
 RL generations typically produce highly variable sequence lengths, which result in a significant amount of padding if approached naively. We address this with Sequence Packing and Dynamic Batching, which are techniques to reduce the amount of padding required. You can read more about these in the [design doc](../design-docs/sequence-packing-and-dynamic-batching.md).
 
+### Diagnosing Trainer OOMs (`memory_snapshot`)
+
+A CUDA out-of-memory error names the failing allocation, not the tensors that filled the GPU. With the DTensor v2 backend, `policy.dtensor_cfg.memory_snapshot.enabled: true` records the allocator history with a stack per block and, when `train`, `get_logprobs` or `score` raises `torch.OutOfMemoryError`, prints the largest live blocks and writes a full snapshot (one pickle per rank) before re-raising. Load the pickle with PyTorch's memory visualizer (`torch.cuda._memory_viz` or https://pytorch.org/memory_viz) to see which code allocated each block. Recording costs a few percent of CPU time per allocation; leave it off in production runs.
+
+```yaml
+policy:
+  dtensor_cfg:
+    memory_snapshot:
+      enabled: true
+      directory: /path/to/snapshots   # default: <tmp>/nemo_rl_memory_snapshots
+      max_entries: 200000
+      record_history: true            # false: block sizes only, no stacks
+```
+
 ### Chunked Fused Linear Logprobs
 
 During standard GRPO training the model materializes a full logit tensor of shape `[batch_size, seq_length, vocab_size]` for the policy forward-backward pass as well as for the previous-policy and reference-policy logprob computations. This can cause out-of-memory (OOM) errors for long sequences or large vocabularies. The **chunked fused linear logprobs** path avoids this by computing the per-token log probabilities directly from the hidden states with a fused linear cross-entropy kernel: it chunks the sequence dimension, projects each chunk to logits on the fly, gathers the realized-token log probabilities, and discards the logits before moving to the next chunk. (GRPO uses the kernel only to read logprobs; it does not compute a cross-entropy loss.)
