@@ -51,6 +51,7 @@ from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
+    NEMO_GYM_TASK_INDEX_KEY,
     Completion,
     PromptGroupRecord,
 )
@@ -1240,8 +1241,9 @@ def test_nemo_gym_build_inputs_stamps_logical_group_coordinates():
     impl._num_generations_per_prompt = 3
     input_sample = {"extra_env_info": {"responses_create_params": {}}}
 
-    rows = impl._build_inputs(input_sample)
+    rows = impl._build_inputs(input_sample, task_index=7)
 
+    assert [row[NEMO_GYM_TASK_INDEX_KEY] for row in rows] == [7, 7, 7]
     assert len({row[NEMO_GYM_GROUP_ID_KEY] for row in rows}) == 1
     assert [row[NEMO_GYM_GROUP_ATTEMPT_KEY] for row in rows] == [0, 0, 0]
     assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [0, 1, 2]
@@ -1259,7 +1261,7 @@ def test_nemo_gym_build_inputs_preserves_explicit_group_identity():
         }
     }
 
-    rows = impl._build_inputs(input_sample)
+    rows = impl._build_inputs(input_sample, task_index=8)
 
     assert [row[NEMO_GYM_GROUP_ID_KEY] for row in rows] == [
         "stable-group",
@@ -1267,6 +1269,85 @@ def test_nemo_gym_build_inputs_preserves_explicit_group_identity():
     ]
     assert [row[NEMO_GYM_GROUP_ATTEMPT_KEY] for row in rows] == [2, 2]
     assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [0, 1]
+
+
+@pytest.mark.parametrize("dataset_task_index", [None, 99])
+def test_nemo_gym_attempt_ids_are_fresh_and_resume_from_counter(
+    monkeypatch: pytest.MonkeyPatch, dataset_task_index: int | None
+) -> None:
+    impl = _nemo_gym_impl(True)
+    impl._num_generations_per_prompt = 3
+    sample = {
+        "extra_env_info": {
+            "responses_create_params": {},
+            NEMO_GYM_GROUP_ID_KEY: "stable-group",
+            NEMO_GYM_GROUP_ATTEMPT_KEY: 2,
+        }
+    }
+    if dataset_task_index is not None:
+        sample["extra_env_info"][NEMO_GYM_TASK_INDEX_KEY] = dataset_task_index
+    original = deepcopy(sample)
+    dispatched = []
+
+    async def fail_rollouts(rows: list[dict], *args: object, **kwargs: object) -> None:
+        dispatched.append(deepcopy(rows))
+        raise RuntimeError("simulated attempt failure")
+
+    monkeypatch.setattr(impl, "_run_rollouts", fail_rollouts)
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="simulated attempt failure"):
+            asyncio.run(impl.run_rollout(sample))
+
+    assert impl.get_next_nemo_gym_task_index() == 2
+    assert [[row[NEMO_GYM_TASK_INDEX_KEY] for row in rows] for rows in dispatched] == [
+        [0, 0, 0],
+        [1, 1, 1],
+    ]
+
+    restored = _nemo_gym_impl(True)
+    restored._num_generations_per_prompt = 3
+    restored.set_next_nemo_gym_task_index(impl.get_next_nemo_gym_task_index())
+    monkeypatch.setattr(restored, "_run_rollouts", fail_rollouts)
+    with pytest.raises(RuntimeError, match="simulated attempt failure"):
+        asyncio.run(
+            restored.run_rollout(
+                sample, rollout_ids=["r0", "r1", "r2"], generation_indices=[1, 2]
+            )
+        )
+    assert [row[NEMO_GYM_TASK_INDEX_KEY] for row in dispatched[-1]] == [2, 2]
+    assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in dispatched[-1]] == [1, 2]
+    assert [row["_ng_rollout_id"] for row in dispatched[-1]] == ["r1", "r2"]
+    assert all(
+        row[NEMO_GYM_GROUP_ID_KEY] == "stable-group"
+        and row[NEMO_GYM_GROUP_ATTEMPT_KEY] == 2
+        for rows in dispatched
+        for row in rows
+    )
+    assert restored.get_next_nemo_gym_task_index() == 3
+    assert sample == original
+
+
+@pytest.mark.parametrize("value", [-1, True, 1.5, "1"])
+def test_nemo_gym_task_counter_rejects_invalid_restore(value: object) -> None:
+    with pytest.raises(ValueError, match="non-negative integer"):
+        _nemo_gym_impl(True).set_next_nemo_gym_task_index(value)
+
+
+@pytest.mark.parametrize("use_nemo_gym", [False, True])
+def test_rollout_manager_task_counter_only_applies_to_gym(use_nemo_gym: bool) -> None:
+    manager = RolloutManager(
+        tokenizer=None,
+        task_to_env={},
+        num_generations_per_prompt=1,
+        max_seq_len=1,
+        rollout_recovery_config=RolloutRecoveryConfig(),
+        policy_generation=object(),
+        generation_config={"stop_strings": None, "stop_token_ids": None, "top_k": None},
+        use_nemo_gym=use_nemo_gym,
+    )
+    assert manager.get_next_nemo_gym_task_index() == 0
+    manager.set_next_nemo_gym_task_index(42)
+    assert manager.get_next_nemo_gym_task_index() == (42 if use_nemo_gym else 0)
 
 
 # ---------------------------------------------------------------------------

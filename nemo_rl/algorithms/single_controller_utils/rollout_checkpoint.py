@@ -247,6 +247,8 @@ class RolloutSnapshotManifest:
     mutation_version: int
     rolled_back_train_group_count: int
     bootstrap_fingerprint: Optional[str]
+    # None preserves the trainer counter when loading an older snapshot.
+    next_nemo_gym_task_index: Optional[int] = None
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> RolloutSnapshotManifest:
@@ -271,6 +273,15 @@ class RolloutSnapshotManifest:
             raise ValueError(
                 "rollout snapshot bootstrap_fingerprint must be a string or null"
             )
+        next_nemo_gym_task_index = raw.get("next_nemo_gym_task_index")
+        if next_nemo_gym_task_index is not None and (
+            not isinstance(next_nemo_gym_task_index, int)
+            or isinstance(next_nemo_gym_task_index, bool)
+            or next_nemo_gym_task_index < 0
+        ):
+            raise ValueError(
+                "rollout snapshot next_nemo_gym_task_index must be a non-negative integer"
+            )
         manifest = cls(
             schema_version=raw["schema_version"],
             base_train_step=raw["base_train_step"],
@@ -280,6 +291,7 @@ class RolloutSnapshotManifest:
             mutation_version=raw["mutation_version"],
             rolled_back_train_group_count=raw["rolled_back_train_group_count"],
             bootstrap_fingerprint=fingerprint,
+            next_nemo_gym_task_index=next_nemo_gym_task_index,
         )
         if manifest.schema_version != ROLLOUT_SNAPSHOT_SCHEMA_VERSION:
             raise ValueError(

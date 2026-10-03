@@ -948,3 +948,41 @@ def test_manifest_rejects_dispatch_index_below_initial_state():
 
     with pytest.raises(ValueError, match="sampler_dispatch_index.*at least -1"):
         RolloutSnapshotManifest.from_mapping(raw)
+
+
+@pytest.mark.parametrize("counter", [None, 0, 123])
+def test_manifest_round_trips_optional_gym_counter(counter: int | None) -> None:
+    manifest = RolloutSnapshotManifest(
+        schema_version=ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
+        base_train_step=0,
+        trainer_version=0,
+        current_epoch=0,
+        sampler_dispatch_index=-1,
+        mutation_version=0,
+        rolled_back_train_group_count=0,
+        bootstrap_fingerprint="fingerprint-v1",
+        next_nemo_gym_task_index=counter,
+    )
+    raw = manifest.to_dict()
+    assert RolloutSnapshotManifest.from_mapping(raw) == manifest
+    raw.pop("next_nemo_gym_task_index")
+    assert RolloutSnapshotManifest.from_mapping(raw).next_nemo_gym_task_index is None
+
+
+@pytest.mark.parametrize("counter", [-1, True, 1.5, "1"])
+def test_manifest_rejects_invalid_gym_counter(counter: object) -> None:
+    raw = {
+        "schema_version": ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
+        "base_train_step": 0,
+        "trainer_version": 0,
+        "current_epoch": 0,
+        "sampler_dispatch_index": -1,
+        "mutation_version": 0,
+        "rolled_back_train_group_count": 0,
+        "bootstrap_fingerprint": "fingerprint-v1",
+        "next_nemo_gym_task_index": counter,
+    }
+    with pytest.raises(
+        ValueError, match="next_nemo_gym_task_index.*non-negative integer"
+    ):
+        RolloutSnapshotManifest.from_mapping(raw)
