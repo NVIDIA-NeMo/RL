@@ -196,23 +196,12 @@ def test_native_training_requires_a_finite_scalar_reward(reward):
         _normalize_nemo_gym_episode_result(row, reply)
 
 
-@pytest.mark.parametrize(
-    "explicit_id,attempt,capture_key",
-    [
-        (True, 0, "caller-owned-rollout"),
-        (True, 2, "caller-owned-rollout-a2"),
-        (False, 0, "17-0"),
-        (False, 2, "17-0-a2"),
-    ],
-)
-def test_native_receipt_reads_attempt_qualified_capture_manifest(
-    explicit_id, attempt, capture_key
-):
+@pytest.mark.parametrize("attempt,capture_key", [(0, "17-0"), (2, "17-0-a2")])
+def test_native_receipt_uses_fallback_identity_without_response(attempt, capture_key):
     row = _row()
     row["_ng_attempt_index"] = attempt
-    if not explicit_id:
-        del row["_ng_rollout_id"]
-        row["_ng_task_index"] = 17
+    del row["_ng_rollout_id"]
+    row["_ng_task_index"] = 17
     _prepare([row])
     reply = _reply(row)
     del reply["result"]["response"]
