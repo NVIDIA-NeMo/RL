@@ -61,6 +61,10 @@ from nemo_rl.models.automodel.data import (
     ProcessedMicrobatch,
     filter_multimodal_kwargs_for_model,
 )
+from nemo_rl.models.automodel.packing import (
+    _model_expects_native_packing_args,
+    _promote_flash_attn_kwargs_to_native_packing,
+)
 from nemo_rl.models.policy import PolicyConfig
 
 # Union type for any post-processing function
@@ -123,6 +127,14 @@ def _build_model_batch(
 
     if is_reward_model or not allow_flash_attn_args:
         model_batch.pop("flash_attn_kwargs", None)
+
+    # Automodel Nemotron TE reads top-level cu_seqlens / qkv_format; HF FA2 keeps
+    # nested flash_attn_kwargs. Translate only when the model expects the native
+    # packing contract so Gemma3 / multimodal / HF paths stay unchanged.
+    if "flash_attn_kwargs" in model_batch and _model_expects_native_packing_args(
+        model
+    ):
+        _promote_flash_attn_kwargs_to_native_packing(model_batch)
 
     if clone_model_tensors:
         # Automodel may pad or shard these tensors in place. Keep the loss-side
