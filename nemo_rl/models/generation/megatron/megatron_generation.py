@@ -635,9 +635,18 @@ class MegatronGeneration(GenerationInterface):
         return True
 
     def setup_token_capture(
-        self, dp_cfg: "DataPlaneConfig", staging_partition: str
+        self,
+        dp_cfg: "DataPlaneConfig",
+        staging_partition: str,
+        *,
+        capture_media: bool = False,
     ) -> None:
         """Install MInf's canonical prompt and completion capture hooks."""
+        if capture_media:
+            raise NotImplementedError(
+                "Media token capture is only implemented for the vLLM generation "
+                "backend; the MInf stager writes text-only rows"
+            )
         if not self.cfg["mcore_generation_config"]["expose_http_server"]:
             raise ValueError(
                 "Megatron token capture requires mcore_generation_config."

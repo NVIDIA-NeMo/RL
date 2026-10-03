@@ -28,7 +28,10 @@ import torch
 from omegaconf import OmegaConf
 
 import nemo_rl.algorithms.single_controller_utils.setup as sc_setup_mod
-from nemo_rl.algorithms.advantage_estimator import AdvEstimatorConfig
+from nemo_rl.algorithms.advantage_estimator import (
+    AdvEstimatorConfig,
+    OPDAdvantageEstimator,
+)
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     DATA_PLANE_CHECKPOINT_DIR,
     LEGACY_REPLAY_BUFFER_FILENAME,
@@ -78,6 +81,8 @@ from nemo_rl.data_plane.schema import (
     OPD_FULL_TEACHER_INDEX_FIELD,
     SC_ROLLOUT_SCHEMA_FIELDS,
 )
+from nemo_rl.data_plane.tq_token_sink import MEDIA_STAGING_FIELDS
+from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 from nemo_rl.experience.rollouts import EffortLevelsConfig
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
@@ -194,7 +199,7 @@ def _make_master_config(
             "save_optimizer": False,
         },
         logger={"wandb_enabled": False, "wandb": {}},
-        cluster={"num_nodes": 2, "gpus_per_node": 8, "segment_size": None},
+        cluster=ClusterConfig(num_nodes=2, gpus_per_node=8),
         loss_fn=loss_cfg if loss_cfg is not None else ClippedPGLossConfig(),
         env=env if env is not None else {},
         async_rl=AsyncRLConfig(
@@ -343,7 +348,7 @@ def test_build_generation_passes_sglang_config():
 def test_build_clusters_rejects_unsupported_topology_backend(monkeypatch):
     """Topology planning reports the supported SC backends instead of KeyError."""
     master_config = _make_master_config(colocated=False, backend="trtllm")
-    master_config.cluster = {"num_nodes": 2, "gpus_per_node": 8, "segment_size": 1}
+    master_config.cluster = ClusterConfig(num_nodes=2, gpus_per_node=8, segment_size=1)
     master_config.policy["generation"]["colocated"]["resources"] = {
         "gpus_per_node": 8,
         "num_nodes": 1,
@@ -371,7 +376,7 @@ def test_build_clusters_rejects_unsupported_topology_backend(monkeypatch):
 def test_build_clusters_leaves_dedicated_teacher_nodes(monkeypatch):
     """Teacher nodes are removed before the student train/inference split."""
     master_config = _make_master_config(colocated=False)
-    master_config.cluster = {"num_nodes": 3, "gpus_per_node": 8}
+    master_config.cluster = ClusterConfig(num_nodes=3, gpus_per_node=8)
     master_config.policy["generation"]["colocated"]["resources"] = {
         "gpus_per_node": 8,
         "num_nodes": 1,
@@ -401,7 +406,7 @@ def test_build_clusters_leaves_dedicated_teacher_nodes(monkeypatch):
 def test_build_clusters_supports_two_node_shared_student_layout(monkeypatch):
     """One student node can split train/inference while node two hosts teacher."""
     master_config = _make_master_config(colocated=False)
-    master_config.cluster = {"num_nodes": 2, "gpus_per_node": 8}
+    master_config.cluster = ClusterConfig(num_nodes=2, gpus_per_node=8)
     master_config.policy["generation"]["colocated"]["resources"] = {
         "gpus_per_node": 4,
         "num_nodes": 1,
@@ -469,6 +474,49 @@ def test_single_controller_mopd_recipe_resolves_to_runtime_contract(monkeypatch)
     )
 
 
+def test_single_controller_mopd_recipe_builds_tropd_estimator(monkeypatch):
+    """TROPD knobs reach the SC advantage estimator from the recipe YAML."""
+    monkeypatch.setenv("HF_HOME", "/tmp/nemo-rl-test-hf")
+    register_omegaconf_resolvers()
+    repo_root = Path(__file__).resolve().parents[3]
+    recipe = repo_root / (
+        "examples/configs/recipes/llm/"
+        "mopd-qwen3-1.7b-3n8g-megatron-pack-single-controller.yaml"
+    )
+    overrides = OmegaConf.from_dotlist(
+        [
+            "grpo.adv_estimator.proximal_teacher_alpha=0.5",
+            "grpo.adv_estimator.subtract_global_baseline=true",
+        ]
+    )
+    resolved = OmegaConf.to_container(
+        OmegaConf.merge(load_config(recipe), overrides), resolve=True
+    )
+
+    assert isinstance(resolved, dict)
+    config = MasterConfig.model_validate(resolved)
+    validate_single_controller_config(config)
+    estimator = sc_setup_mod._build_advantage_estimator(config)
+
+    assert isinstance(estimator, OPDAdvantageEstimator)
+    assert estimator.proximal_teacher_alpha == 0.5
+    assert estimator.subtract_global_baseline is True
+
+
+@pytest.mark.parametrize(
+    "tropd_override",
+    [{"proximal_teacher_alpha": 0.2}, {"subtract_global_baseline": True}],
+)
+def test_fullvocab_recipe_rejects_tropd_before_allocation(tropd_override):
+    """Full-vocab MOPD ignores advantages, so SC rejects TROPD before allocating."""
+    config = _load_fullvocab_master_config()
+    config.grpo.adv_estimator = config.grpo.adv_estimator.model_copy(
+        update=tropd_override
+    )
+    with pytest.raises(ValueError, match="ignores advantages"):
+        validate_single_controller_config(config)
+
+
 def test_single_controller_ppo_recipe_inherits_overlong_filtering():
     """The SC nightly exercises the overlong filtering inherited from its parent."""
     register_omegaconf_resolvers()
@@ -485,6 +533,39 @@ def test_single_controller_ppo_recipe_inherits_overlong_filtering():
     validate_single_controller_config(config)
     assert config.ppo is not None
     assert config.ppo.overlong_filtering is True
+
+
+def test_single_controller_token_capture_nightly_recipe_resolves_to_runtime_contract(
+    monkeypatch,
+):
+    """The token-capture nightly must pass the same validation the entrypoint runs.
+
+    Its in_order sampler keeps one dispatched batch in flight per lookahead
+    version plus the live one, so the buffer must hold two steps of prompt
+    groups; anything smaller fails validation before any GPU is allocated.
+    """
+    monkeypatch.setenv("HF_HOME", "/tmp/nemo-rl-test-hf")
+    register_omegaconf_resolvers()
+    repo_root = Path(__file__).resolve().parents[3]
+    recipe = repo_root / (
+        "examples/configs/recipes/llm/"
+        "grpo-nanov3-30BA3B-2n8g-megatron_generation-noncolocated-async-gym-"
+        "single-controller-token_capture.yaml"
+    )
+    resolved = OmegaConf.to_container(load_config(recipe), resolve=True)
+
+    assert isinstance(resolved, dict)
+    config = MasterConfig.model_validate(resolved)
+    validate_single_controller_config(config)
+    assert config.token_capture.enabled is True
+    assert config.async_rl.sampler.name == "in_order"
+    assert config.async_rl.max_buffered_rollouts == (
+        config.grpo.num_prompts_per_step
+        * (config.async_rl.sampler.max_lookahead_versions + 1)
+    )
+    assert config.policy["train_global_batch_size"] == (
+        config.grpo.num_prompts_per_step * config.grpo.num_generations_per_prompt
+    )
 
 
 @pytest.mark.parametrize(
@@ -676,6 +757,24 @@ class TestSetup:
             NotImplementedError, match="token-capture finalizer does not emit"
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
+
+    def test_vlm_token_capture_rejects_non_vllm_backend(self, patched_factories):
+        # Media capture is only implemented in the vLLM worker: a VLM run (any
+        # processor) with token capture must fail loudly on other backends.
+        mc = _make_master_config(
+            backend="megatron",
+            megatron_enabled=True,
+            env={"should_use_nemo_gym": True},
+        )
+        mc.token_capture.enabled = True
+
+        with pytest.raises(NotImplementedError, match="only implemented for the vLLM"):
+            setup_single_controller(
+                mc, MagicMock(pad_token_id=0), processor=MagicMock()
+            )
 
         patched_factories["setup_response_data"].assert_not_called()
         patched_factories["_build_clusters"].assert_not_called()
@@ -1204,11 +1303,37 @@ class TestSetup:
 
         patched_factories["_build_clusters"].assert_not_called()
 
+    def test_mopd_global_baseline_requires_one_streaming_chunk_per_step(
+        self, patched_factories
+    ):
+        mc = _make_master_config(env={"should_use_nemo_gym": True})
+        mc.grpo.adv_estimator = AdvEstimatorConfig(
+            name="opd", subtract_global_baseline=True
+        )
+        mc.on_policy_distillation = OnPolicyDistillationConfig(
+            enabled=True,
+            teacher_model_by_agent_name={"teacher": "/ckpt/teacher"},
+            default_teacher_alias="teacher",
+            non_colocated_teachers={"enabled": True},
+        )
+        # One chunk per step: the estimator's batch is the whole step.
+        validate_single_controller_config(mc)
+
+        mc.async_rl.min_groups_for_streaming_train = mc.grpo.num_prompts_per_step // 2
+        with pytest.raises(ValueError, match="subtract_global_baseline"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["_build_clusters"].assert_not_called()
+
+        # Only the global baseline needs the whole step; plain MOPD may stream.
+        mc.grpo.adv_estimator = AdvEstimatorConfig(name="opd")
+        validate_single_controller_config(mc)
+
     def test_mopd_reserves_before_models_and_initializes_teacher_last(
         self, patched_factories, monkeypatch
     ):
         mc = _make_master_config(env={"should_use_nemo_gym": True})
-        mc.cluster = {"num_nodes": 3, "gpus_per_node": 8}
+        mc.cluster = ClusterConfig(num_nodes=3, gpus_per_node=8)
         mc.policy["generation"]["vllm_cfg"] = {
             "async_engine": True,
             "expose_http_server": True,
@@ -1475,7 +1600,7 @@ class TestSetup:
         self, patched_factories
     ):
         mc = _make_master_config(colocated=False)
-        mc.cluster = {"num_nodes": 2, "gpus_per_node": 8, "segment_size": 1}
+        mc.cluster = ClusterConfig(num_nodes=2, gpus_per_node=8, segment_size=1)
         mc.policy["generation"]["colocated"]["resources"] = {
             "gpus_per_node": 4,
             "num_nodes": 1,
@@ -1759,8 +1884,13 @@ class TestSetup:
         ]
         assert WIRE_MULTIMODAL_FIELDS <= set(warmup_fields)
 
-    def test_token_capture_always_creates_finalizer_actor_pool(self, patched_factories):
-        mc = _make_master_config(backend="vllm")
+    @pytest.mark.parametrize("with_processor", [True, False])
+    def test_token_capture_always_creates_finalizer_actor_pool(
+        self, patched_factories, with_processor
+    ):
+        # A VLM processor turns media capture on (Omni placeholder processor,
+        # Megatron learner); text-only runs get capture_media=False.
+        mc = _make_master_config(backend="vllm", megatron_enabled=with_processor)
         mc.policy["generation"].update(
             {
                 "model_name": "test-model",
@@ -1781,7 +1911,7 @@ class TestSetup:
         )
         fake_actors = [MagicMock(name=f"finalizer_{index}") for index in range(3)]
         tokenizer = MagicMock(pad_token_id=9)
-        processor = MagicMock(tokenizer=tokenizer)
+        processor = MagicMock(tokenizer=tokenizer) if with_processor else None
 
         with (
             patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
@@ -1790,6 +1920,7 @@ class TestSetup:
             ) as mock_spinup,
             patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
             patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+            patch.object(sc_setup_mod, "uses_image_placeholder", return_value=True),
             patch(
                 "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
                 return_value=fake_actors,
@@ -1804,16 +1935,27 @@ class TestSetup:
         assert actor_config.partition_id == "rollout_data"
         assert actor_config.staging_partition == mc.token_capture.staging_partition
         assert actor_config.pad_token_id == 9
+        assert actor_config.capture_media is with_processor
         assert actor_kwargs == {"num_workers": 3}
         assert actor_args.finalizer_actors == fake_actors
         assert not hasattr(actor_args.rollout_manager, "_finalizer")
         partition_calls = actor_args.dp_client.register_partition.call_args_list
-        assert WIRE_MULTIMODAL_FIELDS <= set(partition_calls[0].kwargs["fields"])
-        assert WIRE_MULTIMODAL_FIELDS.isdisjoint(partition_calls[1].kwargs["fields"])
+        staging_fields = set(partition_calls[1].kwargs["fields"])
+        assert WIRE_MULTIMODAL_FIELDS.isdisjoint(staging_fields)
+        if with_processor:
+            assert WIRE_MULTIMODAL_FIELDS <= set(partition_calls[0].kwargs["fields"])
+            # The staging partition carries the media columns the sink writes.
+            assert set(MEDIA_STAGING_FIELDS) <= staging_fields
+        else:
+            assert set(MEDIA_STAGING_FIELDS).isdisjoint(staging_fields)
         assert mc.token_capture.generation_backend == "vllm"
         assert mock_spinup.call_args.kwargs["token_capture"]["generation_backend"] == (
             "vllm"
         )
+        # The worker fan-out receives the same capability bit.
+        generation, _ = patched_factories["_build_generation"].return_value
+        _, setup_kwargs = generation.setup_token_capture.call_args
+        assert setup_kwargs["capture_media"] is with_processor
 
     def test_nemo_gym_coverage_failure_shuts_down_shards(self, patched_factories):
         mc = _make_master_config(colocated=False, backend="vllm")
