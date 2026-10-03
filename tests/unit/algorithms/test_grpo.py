@@ -406,6 +406,11 @@ def mock_grpo_components():
         "unpadded_sequence_lengths": torch.tensor([12, 18]),
         "logprobs": torch.randn(2, 20),
     }
+    # Real prev_logprobs shaped like the batch: the driver computes token metrics
+    # (token_mult_prob_error_p999 and the spike count) from them.
+    policy.get_logprobs.side_effect = lambda data, **kwargs: {
+        "logprobs": torch.zeros(data["input_ids"].shape)
+    }
     policy.prepare_for_training.return_value = None
     # Mock sharding annotations for async GRPO
     policy.sharding_annotations.get_axis_size.return_value = 1  # data_parallel size
@@ -2164,7 +2169,8 @@ def _patched_logprob_phase(policy):
     ``TypeError: zeros_like(): argument 'input' must be Tensor, not MagicMock``
     when the surrounding inputs come straight from the bare ``mock_grpo_components``
     fixture. This helper swaps in real tensors for the duration of the test and
-    restores the original mock return values afterwards.
+    restores the original mock return values afterwards. (The fixture's
+    ``get_logprobs`` already returns real tensors shaped like the batch.)
     """
     fake_flat = BatchedDataDict(
         {
@@ -2176,9 +2182,7 @@ def _patched_logprob_phase(policy):
         }
     )
     fake_lengths = torch.tensor([2])
-    saved_lp = policy.get_logprobs.return_value
     saved_rlp = policy.get_reference_policy_logprobs.return_value
-    policy.get_logprobs.return_value = {"logprobs": torch.zeros(1, 2)}
     policy.get_reference_policy_logprobs.return_value = {
         "reference_logprobs": torch.zeros(1, 2)
     }
@@ -2189,7 +2193,6 @@ def _patched_logprob_phase(policy):
         try:
             yield
         finally:
-            policy.get_logprobs.return_value = saved_lp
             policy.get_reference_policy_logprobs.return_value = saved_rlp
 
 
@@ -3862,7 +3865,8 @@ def test_grpo_train_collects_generation_logger_and_seq_metrics(
             {
                 "token_ids": torch.tensor([[1, 2]]),
                 "advantages": torch.tensor([[0.5, 0.5]]),
-                "generation_logprobs": torch.tensor([[0.0, 0.0]]),
+                # The fixture's prev_logprobs are 0, so token 2 is off by 12 nats.
+                "generation_logprobs": torch.tensor([[0.0, -12.0]]),
                 "token_loss_mask": torch.tensor([[1, 1]]),
                 "content": ["ok"],
             }
@@ -3949,6 +3953,9 @@ def test_grpo_train_collects_generation_logger_and_seq_metrics(
     assert train_metrics["min_seq_mult_prob_error_after_mask"] == 1.0
     assert train_metrics["num_masked_seqs_by_logprob_error"] == 2
     assert train_metrics["masked_correct_pct"] == 0.5
+    # Of the two tokens (errors 0 and 12 nats) the 99.9th percentile is the 12-nat one.
+    assert train_metrics["token_mult_prob_error_p999"] == pytest.approx(math.exp(12))
+    assert train_metrics["num_tokens_logprob_error_above_10_nats"] == 1
     assert any(
         call.args[0] == {"delta/changed_pct": 4.0}
         and call.kwargs.get("prefix") == "refit"
@@ -4536,6 +4543,18 @@ def test_grpo_train_skips_prev_logprobs_when_force_on_policy_ratio(
         "This indicates a regression of PR #2177."
     )
     assert not policy.get_reference_policy_logprobs.called
+    # prev_logprobs are a zeros placeholder here, so no logprob-error tail metrics.
+    train_payloads = [
+        call.args[0]
+        for call in mock_grpo_components["logger"].log_metrics.call_args_list
+        if call.kwargs.get("prefix") == "train"
+    ]
+    assert any("token_mult_prob_error" in m for m in train_payloads)
+    assert not any(
+        "token_mult_prob_error_p999" in m
+        or "num_tokens_logprob_error_above_10_nats" in m
+        for m in train_payloads
+    )
 
 
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train, grpo_train_sync])
@@ -6501,6 +6520,53 @@ def test_single_forward_sync_dataplane_skips_logprob_dispatch(mock_grpo_componen
     policy.get_reference_policy_logprobs_from_meta.assert_not_called()
     policy.prepare_for_lp_inference.assert_not_called()
     policy.train_from_meta.assert_called_once()
+
+
+@pytest.mark.parametrize("skip_prev_logprobs", [False, True])
+def test_grpo_train_sync_logs_logprob_error_tail_metrics(
+    mock_grpo_components, skip_prev_logprobs
+):
+    """Tail metrics come from the real prev_logprobs, never the skip placeholder."""
+    config = mock_grpo_components["master_config"]
+    config.data_plane = {"enabled": True}
+    # force_on_policy_ratio without a seq-logprob threshold skips prev_logprobs.
+    config.loss_fn.force_on_policy_ratio = skip_prev_logprobs
+    config.grpo.skip_reference_policy_logprobs_calculation = True
+    config.loss_fn.reference_policy_kl_penalty = 0
+    config.grpo.max_num_steps = 1
+    config.grpo.val_period = 0
+    config.grpo.val_at_start = False
+    config.grpo.val_at_end = False
+    policy = mock_grpo_components["policy"]
+    with mock_sync_grpo_infrastructure(policy):
+        grpo_train_sync(
+            policy,
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            config,
+        )
+
+    train_payloads = [
+        call.args[0]
+        for call in mock_grpo_components["logger"].log_metrics.call_args_list
+        if call.kwargs.get("prefix") == "train"
+    ]
+    assert any("token_mult_prob_error" in m for m in train_payloads)
+    tail = [m for m in train_payloads if "token_mult_prob_error_p999" in m]
+    if skip_prev_logprobs:
+        assert tail == []
+    else:
+        # The stubbed data plane returns identical generation and prev logprobs.
+        assert tail[0]["token_mult_prob_error_p999"] == 1.0
+        assert tail[0]["num_tokens_logprob_error_above_10_nats"] == 0
 
 
 def test_in_loss_threshold_skips_policy_forward_without_disabling_threshold():

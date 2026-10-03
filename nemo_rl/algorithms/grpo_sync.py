@@ -76,6 +76,7 @@ from nemo_rl.algorithms.reward_functions import apply_reward_shaping
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
     calculate_trivial_reward_distributions,
+    compute_token_logprob_error_tail_metrics,
     get_gdpo_reward_component_keys,
     log_generation_metrics,
     print_performance_metrics,
@@ -1378,6 +1379,15 @@ def grpo_train_sync(
                 del log_data
 
             timing_metrics: dict = timer.get_timing_metrics(reduction_op="sum")  # type: ignore
+            if not skip_prev_logprobs:
+                metrics.update(
+                    compute_token_logprob_error_tail_metrics(
+                        generation_logprobs=generation_logprobs,
+                        prev_logprobs=prev_logprobs,
+                        token_mask=token_mask,
+                        sample_mask=sample_mask,
+                    )
+                )
             if metrics["token_mult_prob_error"] > 1.05:
                 logger.log_plot_token_mult_prob_error(
                     {
