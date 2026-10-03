@@ -2783,3 +2783,64 @@ def test_run_async_nemo_gym_rollout(
     1. In nemo_rl/experience/rollouts.py::run_async_nemo_gym_rollout, the sampling params are passed appropriately
     2. In nemo_rl/models/generation/vllm/vllm_worker_async.py::VllmAsyncGenerationWorker::_setup_vllm_server::create_chat_completion, the sampling params (like top_k) are set as appropriate
     """
+
+
+def _postprocess_two_rollouts(first_prompts):
+    """Postprocess one two-rollout group whose first prompts are the given token lists."""
+    rows = [{"agent_ref": {"name": "agent"}}, {"agent_ref": {"name": "agent"}}]
+    results = []
+    for reward, prompt in zip((1.0, 2.0), first_prompts):
+        input_message = {
+            "role": "user",
+            "content": "prompt",
+            "token_ids": torch.tensor(prompt),
+        }
+        results.append(
+            {
+                "input_message_log": [input_message],
+                "message_log": [
+                    input_message,
+                    {
+                        "role": "assistant",
+                        "content": "answer",
+                        "token_ids": torch.tensor([2]),
+                        "generation_logprobs": torch.tensor([-0.1]),
+                    },
+                ],
+                "full_result": {"reward": reward},
+            }
+        )
+    return rollouts_mod._postprocess_single_nemo_gym_group(
+        nemo_gym_rows=rows,
+        results=results,
+        timer=rollouts_mod.Timer(),
+        timer_prefix="timing/rollout",
+        policy_generation=type(
+            "_PolicyGeneration",
+            (),
+            {"cfg": {"vllm_cfg": {"max_model_len": 128}}},
+        )(),
+        input_batch=BatchedDataDict({"loss_multiplier": torch.ones(2)}),
+        tokenizer=type("_Tokenizer", (), {"pad_token_id": 0})(),
+        log_full_result_tables=False,
+    )
+
+
+def test_postprocess_nemo_gym_group_counts_distinct_first_prompts(caplog):
+    """The trainer groups the GRPO baseline by exact equality of the first prompt
+    token ids, so the postprocessing reports how many distinct first prompts the
+    group's rollouts carry and logs an error when every rollout has its own,
+    which zeroes every advantage without any other symptom."""
+    with caplog.at_level("ERROR", logger="nemo_rl.experience.rollouts"):
+        shared = _postprocess_two_rollouts([[1, 5, 7], [1, 5, 7]])
+    assert shared.rollout_metrics["baseline_groups/distinct_first_prompts"] == 1
+    assert shared.rollout_metrics["baseline_groups/samples"] == 2
+    assert not [r for r in caplog.records if "distinct first prompt" in r.getMessage()]
+
+    with caplog.at_level("ERROR", logger="nemo_rl.experience.rollouts"):
+        distinct = _postprocess_two_rollouts([[1, 5, 7], [1, 5, 9]])
+    assert distinct.rollout_metrics["baseline_groups/distinct_first_prompts"] == 2
+    [record] = [r for r in caplog.records if "distinct first prompt" in r.getMessage()]
+    assert (
+        record.levelname == "ERROR" and "every advantage is zero" in record.getMessage()
+    )

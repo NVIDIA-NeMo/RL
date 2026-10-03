@@ -18,6 +18,7 @@
 import asyncio
 import copy
 import json
+import logging
 import statistics
 import uuid
 import warnings
@@ -85,6 +86,8 @@ from nemo_rl.utils.multimodal_payload_metrics import (
     print_multimodal_payload_metrics,
 )
 from nemo_rl.utils.timer import Timer
+
+logger = logging.getLogger(__name__)
 
 TokenizerType = PreTrainedTokenizerBase
 
@@ -3148,6 +3151,23 @@ def _postprocess_single_nemo_gym_group(
         pad_value_dict={"token_ids": tokenizer.pad_token_id},
     )
     input_ids = batched_flat["token_ids"]
+    # The trainer forms the GRPO baseline groups by exact equality of these
+    # first-prompt token rows (calculate_baseline_and_std_per_prompt). An
+    # agent harness renders its own prompt, and a per-rollout string in it
+    # (an id, a URL, a timestamp) gives every rollout a group of one, a
+    # baseline equal to its reward, and an advantage of exactly zero, with
+    # no error anywhere. Count the distinct prompts so the condition is
+    # visible in the metrics, and say so in the log when it holds.
+    distinct_first_prompts = int(torch.unique(input_ids, dim=0).shape[0])
+    rollout_metrics["baseline_groups/distinct_first_prompts"] = distinct_first_prompts
+    rollout_metrics["baseline_groups/samples"] = len(results)
+    if len(results) > 1 and distinct_first_prompts == len(results):
+        logger.error(
+            "Every one of the %d NeMo-Gym rollouts in this batch has a distinct first prompt, so each "
+            "forms its own GRPO baseline group and every advantage is zero. The agent harness renders "
+            "a per-rollout string into its prompt; make the prompt identical across the rollouts of a row.",
+            len(results),
+        )
 
     final_batch = BatchedDataDict[DatumSpec](
         {
