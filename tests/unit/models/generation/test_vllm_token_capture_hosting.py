@@ -50,6 +50,7 @@ from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
 )
 
 from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration  # noqa: E402
+from nemo_rl.models.generation.prefix_read_batcher import PrefixReadBatcher  # noqa: E402
 from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
     VllmAsyncGenerationWorkerImpl,
     _AsyncLLMHTTPClient,
@@ -196,6 +197,7 @@ def _fake_worker(*, is_model_owner: bool = True) -> SimpleNamespace:
         _generation_prefix_batch_max_tokens=4_194_304,
         _generation_checkpoint_gate=_CheckpointCaptureGate(),
         _staging_source=None,
+        _generation_prefix_reader=None,
         _prefix_cache={},
         _prefix_cache_lock=threading.Lock(),
     )
@@ -1910,6 +1912,27 @@ def test_generation_cut_swaps_buffer_before_blocking_prefix_write():
     assert source.fetch_calls == [list(continuation.staging_keys)]
     assert restored.token_ids_delta == [10, 11, 12, 13, 14, 15]
     assert restored.token_mask_delta == [0.0, 0.0, 1.0, 1.0, 1.0, 1.0]
+
+    async def restore_coalesced():
+        reader = PrefixReadBatcher(source.fetch)
+        try:
+            chains = await asyncio.gather(
+                *(
+                    reader.fetch(list(continuation.staging_keys), tokens_per_key=16)
+                    for _ in range(8)
+                )
+            )
+            return [
+                resumed_worker._resolve_generation_cut(admission, [], snapshots)
+                for snapshots in chains
+            ]
+        finally:
+            await reader.aclose()
+
+    source.fetch_calls.clear()
+    coalesced = asyncio.run(restore_coalesced())
+    assert source.fetch_calls == [list(continuation.staging_keys)]
+    assert all(snapshot == restored for snapshot in coalesced)
 
 
 def test_generation_cut_restore_accepts_monotonic_mixed_policy_versions():

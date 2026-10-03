@@ -45,6 +45,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     verify_right_padding,
 )
+from nemo_rl.models.generation.prefix_read_batcher import PrefixReadBatcher
 from nemo_rl.models.generation.vllm.checkpoint_engine import (
     VllmAsyncCheckpointEngineRpcMixin,
 )
@@ -685,6 +686,7 @@ class VllmAsyncGenerationWorkerImpl(
             thread_name_prefix="nrl-generation-checkpoint",
         )
         self._staging_source: Any | None = None
+        self._generation_prefix_reader: PrefixReadBatcher | None = None
         # Guarded by _prefix_cache_lock: _fetch_chain_prefix runs on executor
         # threads (asyncio.to_thread), so lookups/evictions can be concurrent.
         self._prefix_cache: dict[str, list[int]] = {}
@@ -1015,6 +1017,9 @@ class VllmAsyncGenerationWorkerImpl(
         self._staging_source = TQTokenSource(
             dp_client, staging_partition=staging_partition
         )
+        if self._generation_prefix_reader is not None:
+            await self._generation_prefix_reader.aclose()
+        self._generation_prefix_reader = PrefixReadBatcher(self._staging_source.fetch)
         self._prefix_cache.clear()
         install_capture(
             self,
@@ -1276,7 +1281,10 @@ class VllmAsyncGenerationWorkerImpl(
         return list(admission.required_prefix_token_ids)
 
     def _resolve_generation_cut(
-        self, admission: Any, prefix_token_ids: list[int]
+        self,
+        admission: Any,
+        prefix_token_ids: list[int],
+        snapshots: list[Any] | None = None,
     ) -> Any | None:
         """Fetch and rebuild the cumulative staged prefix named by an admission."""
         continuation = admission.generation_cut
@@ -1287,7 +1295,8 @@ class VllmAsyncGenerationWorkerImpl(
                 "_staging_source not initialized; call setup_token_capture() first"
             )
         staging_keys = list(continuation.staging_keys)
-        snapshots = self._staging_source.fetch(staging_keys)
+        if snapshots is None:
+            snapshots = self._staging_source.fetch(staging_keys)
         if len(snapshots) != len(staging_keys):
             raise RuntimeError("generation-cut fetch did not return every staged chunk")
         if not snapshots:
@@ -2510,10 +2519,23 @@ class VllmAsyncGenerationWorkerImpl(
                     capture_prefix_token_ids = await asyncio.to_thread(
                         worker_self._resolve_admission_prefix, admission
                     )
+                    cut_snapshots = None
+                    if admission.generation_cut is not None:
+                        if worker_self._generation_prefix_reader is None:
+                            raise RuntimeError(
+                                "generation prefix reader not initialized"
+                            )
+                        cut_snapshots = (
+                            await worker_self._generation_prefix_reader.fetch(
+                                list(admission.generation_cut.staging_keys),
+                                tokens_per_key=max(1, self.model_config.max_model_len),
+                            )
+                        )
                     generation_cut = await asyncio.to_thread(
                         worker_self._resolve_generation_cut,
                         admission,
                         capture_prefix_token_ids,
+                        cut_snapshots,
                     )
                     engine_prefix_token_ids = list(capture_prefix_token_ids)
                     if generation_cut is not None:
@@ -3965,6 +3987,8 @@ class VllmAsyncGenerationWorkerImpl(
     async def shutdown(self) -> bool:
         """Clean up vLLM resources."""
         try:
+            if self._generation_prefix_reader is not None:
+                await self._generation_prefix_reader.aclose()
             if self.server_thread is not None:
                 self.http_server.should_exit = True
                 await asyncio.to_thread(self.server_thread.join)
