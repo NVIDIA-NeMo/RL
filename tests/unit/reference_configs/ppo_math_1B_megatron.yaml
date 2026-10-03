@@ -117,7 +117,6 @@ policy:
   offload_optimizer_for_logprob: false
 
   dtensor_cfg:
-    _v2: true
     enabled: false
     checkpoint:
       model_save_format: "safetensors"
@@ -318,7 +317,6 @@ value:
     reward_model_type: "regression"
 
   dtensor_cfg:
-    _v2: true
     enabled: false
     checkpoint:
       model_save_format: "safetensors"

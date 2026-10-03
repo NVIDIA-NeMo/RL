@@ -1271,14 +1271,55 @@ def test_create_advantage_estimator_opd_branch():
         truncated_importance_sampling_type="none",
     )
     master_config = SimpleNamespace(
-        grpo=GRPOConfig(adv_estimator=AdvEstimatorConfig(name="opd")),
+        grpo=GRPOConfig(
+            adv_estimator=AdvEstimatorConfig(
+                name="opd",
+                proximal_teacher_alpha=0.2,
+                subtract_global_baseline=True,
+            )
+        ),
         loss_fn=loss_fn,
     )
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         estimator = _create_advantage_estimator(master_config)
     assert isinstance(estimator, OPDAdvantageEstimator)
+    assert estimator.proximal_teacher_alpha == 0.2
+    assert estimator.subtract_global_baseline is True
     assert len(caught) == 3
+
+
+@pytest.mark.parametrize(
+    ("tropd_overrides", "match"),
+    [
+        ({"proximal_teacher_alpha": 0.2}, "proximal_teacher_alpha"),
+        ({"subtract_global_baseline": True}, "subtract_global_baseline"),
+    ],
+)
+def test_create_advantage_estimator_rejects_tropd_with_full_vocab_opd(
+    tropd_overrides, match
+):
+    from types import SimpleNamespace
+
+    from nemo_rl.algorithms.advantage_estimator import AdvEstimatorConfig
+    from nemo_rl.algorithms.grpo import GRPOConfig, _create_advantage_estimator
+    from nemo_rl.algorithms.opd import (
+        OnPolicyDistillationConfig,
+        OnPolicyDistillationFullConfig,
+    )
+
+    master_config = SimpleNamespace(
+        grpo=GRPOConfig(
+            adv_estimator=AdvEstimatorConfig(name="opd", **tropd_overrides)
+        ),
+        loss_fn=SimpleNamespace(force_on_policy_ratio=False),
+        on_policy_distillation=OnPolicyDistillationConfig(
+            enabled=True,
+            full=OnPolicyDistillationFullConfig(enabled=True),
+        ),
+    )
+    with pytest.raises(ValueError, match=match):
+        _create_advantage_estimator(master_config)
 
 
 def _meta_teacher_class():
