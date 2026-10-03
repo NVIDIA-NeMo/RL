@@ -116,6 +116,63 @@ conversion is involved in the active path.
 
 ![Token capture custody](../assets/token-capture-ledger-queue-data-flow.png)
 
+### MInf router replay
+
+When `policy.router_replay.enabled=true`, MInf records the selected top-k
+expert identities for every MoE layer. Its native payload has shape
+`[T - 1, L, K]`: the last sampled token has no row because it never enters a
+subsequent inference forward pass. Gym's staging contract instead requires
+one route row for each token in the call delta.
+
+The canonical MInf stager owns both that payload and Gym's admission, including
+`prev_len`. Before committing the call it appends an all-`-1` terminal row to
+form `[T, L, K]`, then slices `routes[prev_len:]`. The result has exactly
+`delta_len` rows and is committed as the call's digest-bound `routed_experts`
+extra. `-1` is the replay fallback sentinel: at that position the trainer lets
+its current router select experts. This deliberately differs from vLLM, which
+uses an in-range placeholder for its terminal row. All other positions normally
+reuse MInf's expert identities while still computing the current policy's
+router scores and probabilities for those experts. One multi-turn exception is
+the parent call's last sampled token: MInf records its real route while
+prefilling the child request at `prev_len - 1`, but the child's
+`routes[prev_len:]` delta slice drops that row, so the already-committed parent
+position remains `-1` and falls back to the current router.
+
+```mermaid
+flowchart LR
+    subgraph Serve["MInf serving worker"]
+        Forward["MoE forwards<br/>record top-k expert IDs"]
+        Native["OffloadedRequestPayload<br/>routes: [T-1, L, K]"]
+    end
+
+    subgraph Gym["Gym capture core"]
+        Admission["CaptureAdmission<br/>prev_len, parent, lineage"]
+        Commit["canonical CallRecord<br/>and rollout manifest"]
+    end
+
+    subgraph TQ["TransferQueue"]
+        Staged["canonical staged call delta<br/>tokens, logprobs, routes"]
+        Canonical["canonical training row<br/>routed_experts: [B, S, L, K]"]
+    end
+
+    subgraph Finalize["NeMo-RL CPU finalizer"]
+        Verify["digest verification<br/>route-plan execution<br/>chain linearization"]
+    end
+
+    Trainer["Megatron trainer<br/>replay expert IDs;<br/>compute current scores"]
+
+    Admission -->|"request metadata"| Native
+    Forward --> Native -->|"align with prev_len"| Staged
+    Native -->|"complete call"| Commit
+    Staged --> Verify
+    Commit --> Verify --> Canonical --> Trainer
+```
+
+MInf currently does not support
+`token_capture.defer_routed_experts_to_policy=true`. The default (`false`)
+executes the route plan in the finalizer and publishes the aligned tensor in
+the canonical training row.
+
 ## Framework-owned receipt and cleanup
 
 NeMo RL fetches the manifest at rollout end and assembles the receipt locally.

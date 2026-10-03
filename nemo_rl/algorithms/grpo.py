@@ -613,6 +613,14 @@ def setup(
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for GRPO"
     )
+    if (
+        router_replay_enabled(policy_config)
+        and generation_config["backend"] == "megatron"
+    ):
+        raise NotImplementedError(
+            "Megatron-generation router replay is only supported on the "
+            "SingleController token-capture path"
+        )
     if generation_config["backend"] == "vllm":
         normalize_nvfp4_pertoken_policy_config(policy_config, entry_point="grpo")
         normalize_vllm_refit_config(cast(VllmConfig, generation_config))

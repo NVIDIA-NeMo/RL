@@ -1415,6 +1415,16 @@ class TestSetup:
                 "min_groups_for_streaming_train",
             ),
             ("colocated_vllm", ValueError, "supported only with backend='megatron'"),
+            (
+                "megatron_routes_without_capture",
+                ValueError,
+                "router replay requires token_capture.enabled",
+            ),
+            (
+                "megatron_deferred_routes",
+                NotImplementedError,
+                "defer_routed_experts_to_policy",
+            ),
             ("gym_on_sglang", NotImplementedError, "vllm and megatron"),
             (
                 "deferred_routes_without_capture",
@@ -1445,7 +1455,7 @@ class TestSetup:
         match: str,
         patched_factories,
     ):
-        use_gym = invalid_case == "gym_on_sglang"
+        use_gym = invalid_case in ("megatron_deferred_routes", "gym_on_sglang")
         if invalid_case == "min_groups":
             mc = _make_master_config()
             mc.async_rl.min_groups_for_streaming_train = 5
@@ -1485,6 +1495,16 @@ class TestSetup:
         elif invalid_case == "colocated_vllm":
             # Colocated generation is rejected for every backend but megatron.
             mc = _make_master_config(colocated=True)
+        elif invalid_case == "megatron_routes_without_capture":
+            mc = _make_master_config(
+                colocated=False, backend="megatron", megatron_enabled=True
+            )
+            mc.policy["router_replay"] = {"enabled": True}
+        elif invalid_case == "megatron_deferred_routes":
+            mc = self._make_gym_megatron_config()
+            mc.token_capture.enabled = True
+            mc.token_capture.defer_routed_experts_to_policy = True
+            mc.policy["router_replay"] = {"enabled": True}
         elif invalid_case == "gym_on_sglang":
             mc = _make_master_config(colocated=False, backend="sglang")
         elif invalid_case == "prompt_group_recovery_without_capture":
@@ -2453,20 +2473,46 @@ class TestSetup:
         patched_factories["setup_response_data"].assert_not_called()
         patched_factories["_build_clusters"].assert_not_called()
 
-    def test_megatron_token_capture_rejects_router_replay(self, patched_factories):
+    def test_megatron_token_capture_accepts_router_replay(self, patched_factories):
+        """MInf router replay (defer_routed_experts_to_policy=false) wires routes end to end."""
         mc = self._make_megatron_token_capture_config()
         # The real router_replay_enabled predicate reads policy.router_replay.enabled.
         mc.policy["router_replay"] = {"enabled": True}
+        patched_factories["setup_response_data"].return_value = (
+            list(range(8)),
+            None,
+        )
 
         with (
             patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
-            pytest.raises(NotImplementedError, match="router replay"),
+            patch.object(
+                sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
+            ),
+            patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
+            patch.object(sc_setup_mod, "MegatronGeneration") as mock_megatron,
+            patch.object(sc_setup_mod, "ray"),
+            patch(
+                "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
+                return_value=[MagicMock(name="finalizer_0")],
+            ) as mock_create_finalizer_actors,
         ):
-            setup_single_controller(mc, MagicMock(pad_token_id=0))
+            mock_megatron.reserve_http_server_addresses.return_value = (
+                ["http://10.0.0.1:5555/v1"],
+                {0: 5555},
+                [MagicMock(name="port_holder_rank_0")],
+            )
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
-        assert mc.token_capture.generation_backend is None
-        patched_factories["setup_response_data"].assert_not_called()
-        patched_factories["_build_clusters"].assert_not_called()
+        # Both the training partition and the staging partition carry routes.
+        rollout_call, staging_call = (
+            actor_args.dp_client.register_partition.call_args_list
+        )
+        assert "routed_experts" in rollout_call.kwargs["fields"]
+        assert "routed_experts" in staging_call.kwargs["fields"]
+        (_, finalizer_config), _ = mock_create_finalizer_actors.call_args
+        assert finalizer_config.router_replay_enabled is True
+        assert finalizer_config.defer_routed_experts_to_policy is False
+        assert actor_args.tq_buffer._require_routed_experts is True
 
     @pytest.mark.parametrize("backend", ["sglang"])
     def test_nemo_gym_rejects_non_vllm_backend(self, patched_factories, backend):
