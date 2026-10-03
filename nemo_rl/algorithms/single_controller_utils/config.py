@@ -52,6 +52,7 @@ from nemo_rl.data_plane.schema import (
     INVALID_TOOL_CALL_MASK,
     MALFORMED_THINKING_MASK,
 )
+from nemo_rl.distributed.reference_placement import ReferencePlacementConfig
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH,
     DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW,
@@ -815,6 +816,7 @@ class MasterConfig(BaseModel, extra="allow"):
     grpo: Optional[GRPOConfig] = None
     ppo: Optional[PPOConfig] = None
     policy: PolicyConfig
+    reference: Optional[ReferencePlacementConfig] = None
     value: Optional[ValueConfig] = None  # PPO extras
     loss_fn: ClippedPGLossConfig
     value_loss_fn: Optional[MseValueLossConfig] = None  # PPO extras
@@ -1279,6 +1281,14 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
 
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)
+
+    if master_config.reference is not None and (
+        master_config.loss_fn.reference_policy_kl_penalty <= 0
+        or algo_cfg.skip_reference_policy_logprobs_calculation
+    ):
+        raise ValueError(
+            "Separate reference placement requires reference-policy logprobs"
+        )
 
     reward_penalties_enabled = any(
         getattr(master_config.reward_penalties, flag) for flag in _REWARD_PENALTY_FLAGS

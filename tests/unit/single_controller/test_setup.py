@@ -96,6 +96,89 @@ from nemo_rl.utils.config import (
 _REAL_BUILD_GENERATION = sc_setup_mod._build_generation
 
 
+def test_reference_loads_initial_weights_without_optimizer_or_second_reference(
+    monkeypatch,
+) -> None:
+    config = _make_master_config()
+    config.policy.update(
+        {
+            "model_name": "initial-checkpoint",
+            "dtensor_cfg": {"cpu_offload": True},
+            "draft": {"enabled": True},
+            "router_replay": {"enabled": True},
+            "megatron_cfg": {"enabled": True, "tensor_model_parallel_size": 2},
+        }
+    )
+    config.policy["generation"].update({"top_k": 10, "top_p": 0.9, "temperature": 0.7})
+    factory = MagicMock()
+    monkeypatch.setattr(sc_setup_mod, "TQPolicy", factory)
+    sc_setup_mod._build_reference(MagicMock(), config, "tokenizer", None)
+    kwargs = factory.call_args.kwargs
+    assert kwargs["init_optimizer"] is False
+    assert kwargs["init_reference_model"] is False
+    assert kwargs["reference_only"] is True
+    assert "weights_path" not in kwargs and "optimizer_path" not in kwargs
+    frozen = kwargs["config"]
+    assert frozen["model_name"] == "initial-checkpoint"
+    assert frozen["megatron_cfg"] == config.policy["megatron_cfg"]
+    assert frozen["generation"]["top_k"] is None
+    assert frozen["generation"]["top_p"] == 1.0
+    assert frozen["generation"]["temperature"] == 0.7
+    assert frozen["dtensor_cfg"]["cpu_offload"] is False
+    assert config.policy["generation"]["top_k"] == 10
+    assert config.policy["dtensor_cfg"]["cpu_offload"] is True
+
+
+def test_same_node_reference_pins_partial_policy_allocations_to_distinct_hosts(
+    monkeypatch,
+) -> None:
+    from nemo_rl.distributed.reference_placement import ReferencePlacementConfig
+
+    config = _make_master_config(colocated=True)
+    config.policy["generation"]["colocated"]["resources"] = {
+        "num_nodes": None,
+        "gpus_per_node": None,
+    }
+    config.reference = ReferencePlacementConfig(
+        placement="same_node", num_nodes=2, gpus_per_node=4
+    )
+    nodes = [
+        {
+            "Alive": True,
+            "NodeID": "a",
+            "NodeManagerAddress": "10.0.0.1",
+            "Resources": {"GPU": 8},
+        },
+        {
+            "Alive": True,
+            "NodeID": "b",
+            "NodeManagerAddress": "10.0.0.2",
+            "Resources": {"GPU": 8},
+        },
+        {
+            "Alive": True,
+            "NodeID": "head",
+            "NodeManagerAddress": "10.0.0.3",
+            "Resources": {},
+        },
+    ]
+    monkeypatch.setattr(sc_setup_mod.ray, "nodes", lambda: nodes)
+    monkeypatch.setattr(
+        sc_setup_mod,
+        "get_ray_cluster_topology",
+        lambda: {"a": ("unknown", 1), "b": ("unknown", 2), "head": ("unknown", 0)},
+    )
+    cluster_factory = MagicMock()
+    monkeypatch.setattr(sc_setup_mod, "RayVirtualCluster", cluster_factory)
+    sc_setup_mod._build_clusters(config)
+    kwargs = cluster_factory.call_args.kwargs
+    assert kwargs["bundle_ct_per_node_list"] == [4, 4]
+    assert kwargs["node_resource_constraints"] == [
+        {"node:10.0.0.1": 0.001},
+        {"node:10.0.0.2": 0.001},
+    ]
+
+
 class _CheckpointingCustomSampler(WindowedSampler):
     """Custom sampler whose static capability must be validated during setup."""
 
@@ -256,6 +339,8 @@ def patched_factories():
     fake_policy = MagicMock(name="policy")
 
     with (
+        patch.object(sc_setup_mod.VllmGeneration, "init_cluster_placement_groups"),
+        patch.object(sc_setup_mod.MegatronGeneration, "init_cluster_placement_groups"),
         patch.object(
             sc_setup_mod,
             "setup_response_data",
@@ -320,6 +405,42 @@ def patched_factories():
             "fake_gen": fake_gen,
             "fake_policy": fake_policy,
         }
+
+
+def test_same_node_reference_reserves_gpus_before_separate_generation(
+    patched_factories, monkeypatch
+) -> None:
+    from nemo_rl.distributed.reference_placement import ReferencePlacementConfig
+
+    config = _make_master_config(
+        loss_cfg=ClippedPGLossConfig(reference_policy_kl_penalty=0.01)
+    )
+    config.reference = ReferencePlacementConfig(
+        placement="same_node", num_nodes=1, gpus_per_node=4
+    )
+    events = []
+    reference_cluster = MagicMock()
+    reference_handle = MagicMock()
+    monkeypatch.setattr(
+        sc_setup_mod,
+        "_reserve_reference_cluster",
+        lambda *_: events.append("reference") or reference_cluster,
+    )
+    monkeypatch.setattr(
+        sc_setup_mod.VllmGeneration,
+        "init_cluster_placement_groups",
+        lambda *_: events.append("generation"),
+    )
+    monkeypatch.setattr(sc_setup_mod, "_build_reference", lambda *_: reference_handle)
+    monkeypatch.setattr(sc_setup_mod, "get_ray_cluster_topology", lambda: {})
+    monkeypatch.setattr(
+        sc_setup_mod.ray.util,
+        "placement_group_table",
+        lambda _: {"bundles_to_node_id": {}},
+    )
+    args, _ = setup_single_controller(config, MagicMock())
+    assert events == ["reference", "generation"]
+    assert args.reference_handle is reference_handle
 
 
 def test_build_generation_passes_sglang_config():

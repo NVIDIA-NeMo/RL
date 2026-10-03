@@ -50,11 +50,15 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     )
     configured_generation = {"backend": "vllm", "_mtp_weights_from_refit": True}
     configure_generation = MagicMock(return_value=configured_generation)
-    actor = SimpleNamespace(run=SimpleNamespace(remote=MagicMock(return_value="run")))
+    actor = SimpleNamespace(
+        run=SimpleNamespace(remote=MagicMock(return_value="run")),
+        ping=SimpleNamespace(remote=MagicMock(return_value="ping")),
+    )
     actor_args = SimpleNamespace(
         env_handles={},
         gen_handle=SimpleNamespace(shutdown=MagicMock()),
         trainer_handle=SimpleNamespace(shutdown=MagicMock()),
+        reference_handle=None,
         value_handle=None,
     )
     setup_single_controller = MagicMock(return_value=(actor_args, SetupTimingMetrics()))
@@ -67,7 +71,18 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     monkeypatch.setattr(
         run_grpo_single_controller,
         "parse_args",
-        lambda: (Namespace(config="config.yaml"), []),
+        lambda: (
+            Namespace(
+                config="config.yaml",
+                placement_full=False,
+                placement_host=None,
+                placement_domain=None,
+            ),
+            [],
+        ),
+    )
+    monkeypatch.setattr(
+        run_grpo_single_controller, "print_actor_placement", MagicMock()
     )
     monkeypatch.setattr(run_grpo_single_controller, "load_config", lambda _: {})
     monkeypatch.setattr(

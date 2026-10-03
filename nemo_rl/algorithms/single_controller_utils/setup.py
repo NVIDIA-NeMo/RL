@@ -24,6 +24,7 @@ from __future__ import annotations
 import os
 import time
 import warnings
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
@@ -90,11 +91,14 @@ from nemo_rl.data_plane.schema import (
     SC_ROLLOUT_SCHEMA_FIELDS,
     fields_with_optional_routed_experts,
 )
+from nemo_rl.distributed.reference_placement import plan_reference_placement
 from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
     _get_free_port_local,
     _get_node_ip_local,
+    get_ray_cluster_topology,
     prepare_segment_topology,
+    select_segment_nodes,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import (
@@ -187,6 +191,7 @@ class SingleControllerActorArgs:
     # the MSE loss it trains under.
     value_handle: Optional[TQValue] = None
     value_loss_fn: Optional[LossFunction] = None
+    reference_handle: Optional[TQPolicy] = None
 
 
 def _maybe_restore_native_data_plane_checkpoint(
@@ -410,6 +415,51 @@ def _build_clusters(
     port_range_high = cluster_config.master_port_range_high
     teacher_nodes = _non_colocated_teacher_node_count(master_config)
     policy_nodes = num_nodes - teacher_nodes
+    reference = master_config.reference
+    reference_plan = None
+    same_node_constraints = None
+    if reference is not None:
+        resources = generation_config["colocated"]["resources"]
+        reference_plan = plan_reference_placement(
+            total_nodes=num_nodes,
+            gpus_per_node=gpus_per_node,
+            teacher_nodes=teacher_nodes,
+            generation_colocated=colocated,
+            generation_nodes=resources["num_nodes"],
+            generation_gpus_per_node=resources["gpus_per_node"],
+            reference=reference,
+        )
+        if reference.placement == "separate_nodes":
+            policy_nodes -= reference.num_nodes
+        else:
+            node_info = {
+                node["NodeID"]: node
+                for node in ray.nodes()
+                if node["Alive"] and node["Resources"].get("GPU", 0) >= gpus_per_node
+            }
+            topology = {
+                node_id: location
+                for node_id, location in get_ray_cluster_topology().items()
+                if node_id in node_info
+            }
+            if segment_size is not None and any(
+                domain != "unknown" for domain, _ in topology.values()
+            ):
+                selected, _ = select_segment_nodes(
+                    topology, segment_size, reference.num_nodes
+                )
+            else:
+                selected = sorted(topology, key=lambda node_id: topology[node_id])[
+                    : reference.num_nodes
+                ]
+            if len(selected) != reference.num_nodes:
+                raise ValueError(
+                    "Not enough GPU hosts for same_node reference placement"
+                )
+            same_node_constraints = [
+                {f"node:{node_info[node_id]['NodeManagerAddress']}": 0.001}
+                for node_id in selected
+            ]
     if policy_nodes <= 0:
         raise ValueError(
             "cluster.num_nodes must leave at least one node for the student after "
@@ -422,6 +472,9 @@ def _build_clusters(
     train_worker_groups = 2 if is_ppo_run(master_config) else 1
 
     if colocated:
+        colocated_gpus = (
+            reference_plan.train_gpus_per_node if reference_plan else gpus_per_node
+        )
         # Policy (+ critic) + generation share GPUs — one cluster.
         node_constraints, remaining_ids, topology = prepare_segment_topology(
             segment_size,
@@ -435,9 +488,9 @@ def _build_clusters(
         )
         cluster = RayVirtualCluster(
             name="sc_policy_cluster",
-            bundle_ct_per_node_list=[gpus_per_node] * policy_nodes,
+            bundle_ct_per_node_list=[colocated_gpus] * policy_nodes,
             use_gpus=True,
-            num_gpus_per_node=gpus_per_node,
+            num_gpus_per_node=colocated_gpus,
             max_colocated_worker_groups=(
                 train_worker_groups
                 if backend == "megatron"
@@ -446,7 +499,7 @@ def _build_clusters(
             port_range_low=port_range_low,
             port_range_high=port_range_high,
             segment_size=segment_size,
-            node_resource_constraints=node_constraints,
+            node_resource_constraints=same_node_constraints or node_constraints,
         )
         return cluster, cluster, teacher_topology
 
@@ -471,6 +524,10 @@ def _build_clusters(
         assert train_nodes > 0, (
             f"train_nodes must be > 0: {policy_nodes} - {inference_nodes} = {train_nodes}"
         )
+
+    if reference_plan is not None:
+        train_nodes = reference_plan.train_nodes
+        train_gpus_per_node = reference_plan.train_gpus_per_node
 
     train_constraints = None
     inference_constraints = None
@@ -555,7 +612,7 @@ def _build_clusters(
         port_range_low=port_range_low,
         port_range_high=port_range_high,
         segment_size=train_segment_size,
-        node_resource_constraints=train_constraints,
+        node_resource_constraints=same_node_constraints or train_constraints,
     )
     inference_cluster = RayVirtualCluster(
         name="sc_inference_cluster",
@@ -569,6 +626,106 @@ def _build_clusters(
         node_resource_constraints=inference_constraints,
     )
     return train_cluster, inference_cluster, teacher_topology
+
+
+def _reserve_reference_cluster(
+    master_config: MasterConfig,
+    train_cluster: RayVirtualCluster,
+    inference_cluster: RayVirtualCluster,
+) -> Optional[RayVirtualCluster]:
+    """Reserve reference GPUs on exact hosts before Gym or teachers start."""
+    reference = master_config.reference
+    if reference is None:
+        return None
+    node_info = {node["NodeID"]: node for node in ray.nodes() if node["Alive"]}
+
+    def allocated_hosts(cluster: RayVirtualCluster) -> set[str]:
+        return {
+            node_id
+            for pg in cluster.get_placement_groups()
+            for node_id in ray.util.placement_group_table(pg)[
+                "bundles_to_node_id"
+            ].values()
+        }
+
+    train_hosts = allocated_hosts(train_cluster)
+    inference_hosts = (
+        allocated_hosts(inference_cluster)
+        if reference.placement == "separate_nodes"
+        else set()
+    )
+    topology = get_ray_cluster_topology()
+    if reference.placement == "same_node":
+        selected = sorted(train_hosts, key=lambda node_id: topology[node_id])
+        if len(selected) != reference.num_nodes:
+            raise ValueError(
+                "Reference host count differs from actual policy placement"
+            )
+    else:
+        candidates = {
+            node_id: location
+            for node_id, location in topology.items()
+            if node_id not in train_hosts | inference_hosts
+            and node_info[node_id]["Resources"].get("GPU", 0) >= reference.gpus_per_node
+        }
+        segment_size = master_config.cluster.segment_size
+        if segment_size is not None and any(
+            domain != "unknown" for domain, _ in candidates.values()
+        ):
+            selected, _ = select_segment_nodes(
+                candidates, segment_size, reference.num_nodes
+            )
+        else:
+            selected = sorted(candidates, key=lambda node_id: candidates[node_id])[
+                : reference.num_nodes
+            ]
+        if len(selected) != reference.num_nodes:
+            raise ValueError("Not enough separate GPU hosts for the reference")
+    constraints = [
+        {f"node:{node_info[node_id]['NodeManagerAddress']}": 0.001}
+        for node_id in selected
+    ]
+    cluster = RayVirtualCluster(
+        name="sc_reference_cluster",
+        bundle_ct_per_node_list=[reference.gpus_per_node] * reference.num_nodes,
+        num_gpus_per_node=reference.gpus_per_node,
+        node_resource_constraints=constraints,
+        segment_size=master_config.cluster.segment_size,
+        port_range_low=master_config.cluster.master_port_range_low,
+        port_range_high=master_config.cluster.master_port_range_high,
+    )
+    cluster.get_placement_groups()
+    return cluster
+
+
+def _build_reference(
+    cluster: RayVirtualCluster,
+    master_config: MasterConfig,
+    tokenizer: PreTrainedTokenizerBase,
+    processor: Optional[AutoProcessor],
+) -> TQPolicy:
+    """Load initial policy weights once, without training or a second reference copy."""
+    config = deepcopy(master_config.policy)
+    config["generation"]["colocated"]["enabled"] = False
+    config["generation"]["top_k"] = None
+    config["generation"]["top_p"] = 1.0
+    config["offload_optimizer_for_logprob"] = False
+    for key in ("draft", "router_replay"):
+        if config.get(key) is not None:
+            config[key]["enabled"] = False
+    config["dtensor_cfg"]["cpu_offload"] = False
+    reference = TQPolicy(
+        cluster=cluster,
+        config=config,
+        tokenizer=tokenizer,
+        processor=processor,
+        name_prefix="reference",
+        init_optimizer=False,
+        init_reference_model=False,
+        reference_only=True,
+        dp_cfg=master_config.data_plane,
+    )
+    return reference
 
 
 def _build_generation(
@@ -699,7 +856,9 @@ def _build_trainer(
     """
     t0 = time.perf_counter()
     loss_config = master_config.loss_fn
-    init_reference_model = loss_config.reference_policy_kl_penalty > 0
+    init_reference_model = (
+        loss_config.reference_policy_kl_penalty > 0 and master_config.reference is None
+    )
     trainer = TQPolicy(
         cluster=train_cluster,
         config=master_config.policy,
@@ -1516,6 +1675,54 @@ def setup_single_controller(
     train_cluster, inference_cluster, teacher_segment_topology = _build_clusters(
         master_config
     )
+
+    def reserve_generation() -> None:
+        if generation_config["backend"] == "megatron":
+            MegatronGeneration.init_cluster_placement_groups(
+                inference_cluster, master_config.policy
+            )
+        elif generation_config["backend"] == "vllm":
+            VllmGeneration.init_cluster_placement_groups(
+                inference_cluster, cast(VllmConfig, generation_config)
+            )
+        elif generation_config["backend"] == "sglang":
+            inference_cluster._init_placement_groups(
+                strategy="PACK", use_unified_pg=True
+            )
+
+    if train_cluster is inference_cluster:
+        reserve_generation()
+    else:
+        train_cluster.get_placement_groups()
+    same_node_reference = (
+        master_config.reference is not None
+        and master_config.reference.placement == "same_node"
+    )
+    reference_cluster = (
+        _reserve_reference_cluster(master_config, train_cluster, inference_cluster)
+        if same_node_reference
+        else None
+    )
+    if train_cluster is not inference_cluster:
+        reserve_generation()
+    if not same_node_reference:
+        reference_cluster = _reserve_reference_cluster(
+            master_config, train_cluster, inference_cluster
+        )
+    if reference_cluster is not None:
+        student_hosts = {
+            node_id
+            for cluster in (train_cluster, inference_cluster, reference_cluster)
+            for pg in cluster.get_placement_groups()
+            for node_id in ray.util.placement_group_table(pg)[
+                "bundles_to_node_id"
+            ].values()
+        }
+        teacher_segment_topology = {
+            node_id: location
+            for node_id, location in get_ray_cluster_topology().items()
+            if node_id not in student_hosts
+        }
     colocated = generation_config["colocated"]["enabled"]
     segment_size = master_config.cluster.segment_size
 
@@ -1536,6 +1743,16 @@ def setup_single_controller(
             teacher_segment_topology=teacher_segment_topology,
         )
         setup_timing_metrics.teacher_reservation_time_s = time.perf_counter() - t0
+
+    # Probes need free bundle resources, so capture placement before workers start.
+    for cluster in [
+        train_cluster,
+        inference_cluster,
+        reference_cluster,
+        *teacher_clusters.values(),
+    ]:
+        if cluster is not None:
+            cluster.capture_gpu_placement()
 
     # Create build tasks for generation / trainer / (nemo-gym) workers
     build_tasks: dict[str, Callable[[], Any]] = {}
@@ -1869,6 +2086,11 @@ def setup_single_controller(
     # Loading a teacher with the same checkpoint as the student must happen only
     # after student initialization finishes: both use the same HF-to-Megatron
     # cache path, and concurrent conversion can expose a partial checkpoint.
+    reference = (
+        _build_reference(reference_cluster, master_config, tokenizer, processor)
+        if reference_cluster is not None
+        else None
+    )
     teacher_worker_groups: dict[str, Any] = {}
     alias_to_group_alias: dict[str, str] = {}
     if teacher_clusters:
@@ -2071,5 +2293,6 @@ def setup_single_controller(
         # PPO extras
         value_handle=value,
         value_loss_fn=value_loss_fn,
+        reference_handle=reference,
     )
     return actor_args, setup_timing_metrics

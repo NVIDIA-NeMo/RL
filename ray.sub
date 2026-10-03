@@ -614,6 +614,31 @@ else
 fi
 RAY_RESOURCES+='}'
 export RAY_RESOURCES
+
+# Labels retain discovered hardware on the head without advertising compute resources.
+_report_domain="unknown"
+if [[ "\$CLUSTER_UUID" =~ ^[0-9a-fA-F-]+\$ ]]; then
+  _report_domain="\$CLUSTER_UUID"
+fi
+_report_gpu_name=\$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
+if [[ "\$_report_gpu_name" == *H100* ]]; then
+  _report_domain="host-local"
+fi
+_report_gpu_ids=\$(nvidia-smi --query-gpu=index,uuid --format=csv,noheader 2>/dev/null | awk -F', *' -v visible="\${CUDA_VISIBLE_DEVICES-unset}" '
+  BEGIN { n = split(visible, allowed, ",") }
+  {
+    include = visible == "unset"
+    for (i = 1; i <= n; i++) if (allowed[i] == \$1 || allowed[i] == \$2) include = 1
+    if (include) { printf "%s%s", separator, \$1; separator = "." }
+  }')
+RAY_REPORT_LABELS="nrl.nvidia.com/nvlink-domain=\$_report_domain"
+if [[ -n "\$TOPO_RANK" ]]; then
+  RAY_REPORT_LABELS+=",nrl.nvidia.com/topo-rank=\$TOPO_RANK"
+fi
+if [[ -n "\$_report_gpu_ids" ]]; then
+  RAY_REPORT_LABELS+=",nrl.nvidia.com/gpu-ids=\$_report_gpu_ids"
+fi
+export RAY_REPORT_LABELS
 TOPO_PROBE_EOF
 
 # Set up the sandbox ports/signal directory on the shared FS before building the
@@ -768,6 +793,7 @@ while [[ \$count -lt $num_retries ]]; do
 ray start --head \
     --disable-usage-stats \
     --resources="\$RAY_RESOURCES" \
+    --labels="\$RAY_REPORT_LABELS" \
     \$HEAD_RAY_RESOURCE_ARGS \
     --node-ip-address="$head_node_ip" \
     --port=${PORT} \
@@ -983,6 +1009,7 @@ while [[ \$count -lt $WORKER_NUM_RETRIES ]]; do
 ray start --address "$ip_head" \
           --disable-usage-stats \
           --resources="\$RAY_RESOURCES" \
+          --labels="\$RAY_REPORT_LABELS" \
           --min-worker-port=${MIN_WORKER_PORT} \
           --max-worker-port=${MAX_WORKER_PORT} \
           \

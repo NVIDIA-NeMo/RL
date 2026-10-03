@@ -39,6 +39,7 @@ from nemo_rl.algorithms.single_controller_utils import (
 )
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data_plane.factory import maybe_configure_data_plane_env
+from nemo_rl.distributed.placement_snapshot import print_actor_placement
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.nemo_gym import setup_nemo_gym_config
 from nemo_rl.environments.utils import shutdown_environments
@@ -70,6 +71,15 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     )
     parser.add_argument(
         "--config", type=str, default=None, help="Path to YAML config file"
+    )
+    parser.add_argument(
+        "--placement-full", action="store_true", help="Print one placement row per host"
+    )
+    parser.add_argument(
+        "--placement-host", help="Filter placement hosts with a shell pattern"
+    )
+    parser.add_argument(
+        "--placement-domain", help="Filter placement domains with a shell pattern"
     )
     args, overrides = parser.parse_known_args()
     return args, overrides
@@ -192,6 +202,14 @@ def main() -> None:
             actor_args=actor_args,
             setup_timing_metrics=setup_timing_metrics,
         )
+        ray.get(sc.ping.remote())
+        print_actor_placement(
+            actor_args,
+            config,
+            full=args.placement_full,
+            host_filter=args.placement_host,
+            domain_filter=args.placement_domain,
+        )
         result = _run_with_controller_liveness_watch(sc, config.async_rl.stall_watchdog)
         print(f"SC run complete: {result}")
     finally:
@@ -213,6 +231,7 @@ def main() -> None:
             for resource_name, resource in (
                 ("Generation", actor_args.gen_handle),
                 ("Trainer", actor_args.trainer_handle),
+                ("Reference", actor_args.reference_handle),
                 ("Value", actor_args.value_handle),
             ):
                 if resource is None:
