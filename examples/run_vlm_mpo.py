@@ -58,9 +58,7 @@ def main() -> None:
     )
     pprint.pprint(master_config.model_dump())
 
-    master_config.logger["log_dir"] = get_next_experiment_dir(
-        master_config.logger["log_dir"]
-    )
+    master_config.logger.log_dir = get_next_experiment_dir(master_config.logger.log_dir)
     init_ray()
 
     processor = get_tokenizer(master_config.policy["tokenizer"], get_processor=True)

@@ -118,8 +118,8 @@ def main() -> None:
     print("Final config:")
     pprint.pprint(config)
 
-    config.logger["log_dir"] = get_next_experiment_dir(config.logger["log_dir"])
-    print(f"📊 Using log directory: {config.logger['log_dir']}")
+    config.logger.log_dir = get_next_experiment_dir(config.logger.log_dir)
+    print(f"📊 Using log directory: {config.logger.log_dir}")
     if config.checkpointing["enabled"]:
         print(
             f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
