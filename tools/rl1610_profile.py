@@ -309,6 +309,7 @@ def plot(args: argparse.Namespace) -> int:
     }
     figure, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
     series = {}
+    nodes = {}
     for sample in samples:
         if "collection_error" in sample:
             continue
@@ -320,12 +321,11 @@ def plot(args: argparse.Namespace) -> int:
             series.setdefault(label, []).append(
                 (sample["timestamp"] - start, actor["pss_bytes"], actor["cpu_cores"])
             )
-        axes[2].scatter(
-            sample["timestamp"] - start,
-            sample["node_os_used_bytes"] / 2**30,
-            label=host,
-            s=8,
+        nodes.setdefault(host, []).append(
+            (sample["timestamp"] - start, sample["node_os_used_bytes"] / 2**30)
         )
+    for host, points in nodes.items():
+        axes[2].plot(*zip(*points), label=host)
     for label, points in series.items():
         axes[0].plot(
             [point[0] for point in points],
@@ -345,6 +345,7 @@ def plot(args: argparse.Namespace) -> int:
     axes[2].set_ylabel("Node OS used (GiB)")
     axes[2].set_xlabel("Seconds in measured window")
     axes[0].legend(fontsize=6, bbox_to_anchor=(1.02, 1), loc="upper left")
+    axes[2].legend(fontsize=6, bbox_to_anchor=(1.02, 1), loc="upper left")
     for axis in axes:
         axis.grid(alpha=0.2)
     figure.tight_layout()
