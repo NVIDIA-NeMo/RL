@@ -384,8 +384,9 @@ checkpoint on its own: completed groups come back from TQ and unfinished
 turn- and prefix-level rollouts restart from their tasks. A rollout snapshot without its
 `gym_checkpoint.json` is refused.
 
-The `prefix` target needs everything the `turn` target needs (listed below),
-and does not yet support multimodal capture or router replay. Each cut must
+The `prefix` target needs everything the `turn` target needs (listed below).
+With router replay on, each cut also stages the routes of the tokens it saves,
+and the resumed call trains on those routes for its restored prefix. Each cut must
 finish within `token_capture.control_timeout_s`; a call that is not cut in time
 restarts from its last saved turn. Calls using stop strings, `bad_words`, or a
 presence or frequency penalty are never cut, because a resumed call could not
