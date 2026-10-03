@@ -1061,7 +1061,7 @@ def _live_participants(
     if local is not None:
         participants[local.info.participant_id] = local.info
     for worker, response in zip(workers, responses, strict=True):
-        # Some generation ranks do not host token capture or a TQ client.
+        # Ranks without a TQ client, or that disowned storage, own nothing.
         if response is None:
             continue
         if not isinstance(response, Mapping) or response.get("ok") is not True:
@@ -1375,9 +1375,14 @@ class _CheckpointManagerMixin:
     def __init__(self, controller_info: Any, config: dict[str, Any]) -> None:
         if _checkpoint_enabled(config):
             config = dict(config)
-            if ray.get_runtime_context().get_actor_id() is None:
-                # A driver/task has no actor command endpoint. It may use
-                # Mooncake, but must not own otherwise unreachable payload.
+            if (
+                ray.get_runtime_context().get_actor_id() is None
+                or _DISOWN_STORAGE_IN_THIS_PROCESS
+            ):
+                # A driver/task has no actor command endpoint, and a process
+                # that called disown_storage_in_this_process() is not a save
+                # participant. Either may use Mooncake, but must not own
+                # otherwise unreachable payload.
                 # Keep the controller's published config unchanged so actors
                 # still mount their configured storage capacity.
                 config["global_segment_size"] = 0
@@ -1404,11 +1409,15 @@ class _CheckpointManagerMixin:
 
 
 def configure_checkpoint_workers(workers: list[Any]) -> None:
-    """Bind existing actor handles for this process's checkpoint coordinator.
+    """Bind the actors that own checkpointable storage for this coordinator.
 
     Call after all intended owners have attached, before save or restore. Do
     not include the calling actor: its shard is executed directly, including
     when restoring inside SingleController's constructor.
+
+    Candidates that own no segment -- ranks without a TQ client, or a
+    generation worker whose token-capture client disowned storage -- are
+    dropped here, once, so a save never waits on an actor with nothing to save.
     """
     # TransferQueue is optional outside this backend.
     import transfer_queue as tq
@@ -1417,6 +1426,21 @@ def configure_checkpoint_workers(workers: list[Any]) -> None:
     if not isinstance(manager, _CheckpointManagerMixin):
         raise RuntimeError("Mooncake checkpoint manager is not installed")
     manager._checkpoint_workers = list(workers)
+    _, owners = _live_participants(manager)
+    manager._checkpoint_workers = list(owners.values())
+
+
+# Set by processes that use Mooncake but must not own checkpointable payload,
+# before their client attaches. They get the driver's rule: no segment, so
+# their puts land in other processes' segments and they are not save
+# participants.
+_DISOWN_STORAGE_IN_THIS_PROCESS = False
+
+
+def disown_storage_in_this_process() -> None:
+    """Make this process's Mooncake client own no segment. Call before it attaches."""
+    global _DISOWN_STORAGE_IN_THIS_PROCESS
+    _DISOWN_STORAGE_IN_THIS_PROCESS = True
 
 
 def run_checkpoint_command(body: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -1460,6 +1484,7 @@ def install_tq_mooncake_checkpoint_plugin() -> None:
 
 __all__ = [
     "configure_checkpoint_workers",
+    "disown_storage_in_this_process",
     "install_tq_mooncake_checkpoint_plugin",
     "run_checkpoint_command",
 ]

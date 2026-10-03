@@ -35,7 +35,10 @@ from nemo_rl.data.captured_media import (
     MediaCaptureRejected,
     capture_processed_media,
 )
-from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
+from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import (
+    disown_storage_in_this_process,
+    run_checkpoint_command,
+)
 from nemo_rl.data_plane.tq_token_sink import MediaMetadataIntegrityError
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
@@ -547,6 +550,9 @@ class VllmAsyncGenerationWorkerImpl(
         from nemo_rl.data_plane import build_data_plane_client
         from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
 
+        # Own no segment: a save would otherwise wait on this actor, whose event
+        # loop is busy serving rollouts. Capture writes land in other segments.
+        disown_storage_in_this_process()
         dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
         # The Omni processor emits pixels in the engine's model dtype; the
         # sink pins its media column to it so text-call sentinels never
