@@ -833,6 +833,7 @@ class TestNcclReshardWeightSynchronizer:
     @patch("nemo_rl.weight_sync.nccl_reshard_weight_synchronizer.ray")
     def test_sync_weights_leaves_policy_param_sync_to_caller(self, mock_ray):
         mock_ray.get.return_value = [True]
+        mock_ray.wait.side_effect = _wait_in_input_order
         policy = _mock_policy()
         policy.nccl_reshard_refit.return_value = [MagicMock()]
         gen = _mock_generation(cfg={"backend": "vllm"})
