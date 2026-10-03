@@ -62,3 +62,6 @@ env:
 cluster:
   gpus_per_node: 1
   num_nodes: 1
+  master_port_range_low: null
+  master_port_range_high: null
+  segment_size: null
