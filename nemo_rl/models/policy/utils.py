@@ -18,43 +18,12 @@ import traceback
 import warnings
 from datetime import timedelta
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, cast
+from typing import TYPE_CHECKING, Any, Iterable, Optional, cast
 
 import torch
 import torch.distributed as dist
 import zmq
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
-from transformers import (
-    AutoModelForCausalLM,
-    AutoModelForImageTextToText,
-    AutoModelForTextToWaveform,
-)
-
-from nemo_rl.utils.cuda_ipc import normalize_cuda_ipc_handle
-
-# Try to import nemo_automodel classes, fallback to None if not available
-try:
-    from nemo_automodel._transformers.auto_model import (
-        NeMoAutoModelForCausalLM,
-        NeMoAutoModelForImageTextToText,
-        NeMoAutoModelForTextToWaveform,
-    )
-
-    # Side-effect import: installs the resolver hook that routes FP8-native
-    # Mistral 3.5 configs to Mistral3FP8VLM. Without it, HF's stock FP8Linear
-    # path runs and produces 0-d weight_scale_inv params that FSDP2 rejects.
-    try:
-        import nemo_automodel.components.models.mistral3_vlm  # noqa: F401
-    except ImportError:
-        pass
-
-    NEMO_AUTOMODEL_AVAILABLE = True
-except ImportError:
-    # nemo_automodel is not installed, classes will be None
-    NeMoAutoModelForCausalLM = None  # type: ignore
-    NeMoAutoModelForImageTextToText = None  # type: ignore
-    NeMoAutoModelForTextToWaveform = None  # type: ignore
-    NEMO_AUTOMODEL_AVAILABLE = False
 
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.generation.vllm.config import (
@@ -62,55 +31,10 @@ from nemo_rl.models.generation.vllm.config import (
     VllmSpecificArgs,
     vllm_nemotron_h_fp32_lm_head_enabled,
 )
+from nemo_rl.utils.cuda_ipc import normalize_cuda_ipc_handle
 
 if TYPE_CHECKING:
     from nemo_rl.models.policy import PolicyConfig
-
-# Plain Hugging Face classes remain separate from the NeMo AutoModel wrappers so
-# callers that manage distribution can request them when NeMo AutoModel is installed.
-# Add an entry here whenever a model's architecture isn't loadable via
-# AutoModelForCausalLM (e.g. VLMs using ForConditionalGeneration /
-# ForImageTextToText). Unlike AUTOMODEL_FACTORY below, this dict is also read on
-# the ``use_nemo_automodel=False`` path (DTensor V1), where no NeMo custom impl
-# intercepts from_pretrained -- so a model that has a custom NeMo automodel impl
-# still needs an entry here when its parent AutoModel class is not
-# AutoModelForCausalLM. Check MODEL_ARCH_MAPPING in the NeMo automodel registry
-# to see which architectures have custom impls:
-# https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/_transformers/registry.py#L32-L146
-HF_AUTOMODEL_FACTORY: Dict[str, Any] = {
-    "qwen2_5_vl": AutoModelForImageTextToText,
-    "qwen2_vl": AutoModelForImageTextToText,
-    "qwen2_5_omni": AutoModelForTextToWaveform,
-    "qwen3_5": AutoModelForImageTextToText,
-    "llava": AutoModelForImageTextToText,
-    "internvl": AutoModelForImageTextToText,
-    "gemma3": AutoModelForImageTextToText,
-    "gemma4": AutoModelForImageTextToText,
-    "gemma4_unified": AutoModelForImageTextToText,
-    "smolvlm": AutoModelForImageTextToText,
-    "mistral3": AutoModelForImageTextToText,
-    "llama4": AutoModelForImageTextToText,
-}
-
-AUTOMODEL_FACTORY: Dict[str, Any] = HF_AUTOMODEL_FACTORY
-
-if NEMO_AUTOMODEL_AVAILABLE:
-    AUTOMODEL_FACTORY = {
-        # NeMo wrappers — keep in sync with the vanilla HF dict above.
-        # See comment above for when to add entries.
-        "qwen2_5_vl": NeMoAutoModelForImageTextToText,
-        "qwen2_vl": NeMoAutoModelForImageTextToText,
-        "qwen2_5_omni": NeMoAutoModelForTextToWaveform,
-        "qwen3_5": NeMoAutoModelForImageTextToText,
-        "llava": NeMoAutoModelForImageTextToText,
-        "internvl": NeMoAutoModelForImageTextToText,
-        "gemma3": NeMoAutoModelForImageTextToText,
-        "gemma4": NeMoAutoModelForImageTextToText,
-        "gemma4_unified": NeMoAutoModelForImageTextToText,
-        "smolvlm": NeMoAutoModelForImageTextToText,
-        "mistral3": NeMoAutoModelForImageTextToText,
-        "llama4": NeMoAutoModelForImageTextToText,
-    }
 
 
 class IPCProtocol(Enum):
@@ -133,32 +57,21 @@ _NEMOTRON_H_MODEL_TYPES = frozenset({"nemotron_h"})
 _NEMOTRON_H_ARCHITECTURES = frozenset({"NemotronHForCausalLM"})
 
 
-def reject_dtensor_v1(
-    dtensor_cfg: dict[str, Any],
-    config_path: str,
-    *,
-    suggest_megatron: bool = True,
-) -> None:
-    """Fail at setup when a config still selects the DTensor v1 backend.
+def reject_legacy_dtensor_key(dtensor_cfg: dict[str, Any], config_path: str) -> None:
+    """Fail at setup when a config still carries the removed dtensor_cfg._v2 key.
 
     Args:
         dtensor_cfg: The resolved dtensor_cfg mapping to inspect.
         config_path: Dotted path used in the error message, e.g. policy.dtensor_cfg.
-        suggest_megatron: Whether to offer Megatron-Core as an alternative. Callers whose
-            config has no megatron_cfg, or that require DTensor, pass False.
     """
-    if dtensor_cfg.get("_v2") is False:
-        message = (
-            f"{config_path}._v2=false selects the DTensor v1 backend, which has been "
-            f"removed. Set {config_path}._v2=true (v2 is the only supported DTensor "
-            f"backend)"
-        )
-        if suggest_megatron:
-            message += (
-                f", or set {config_path.rsplit('.', 1)[0]}.megatron_cfg.enabled=true "
-                f"together with {config_path}.enabled=false to train with Megatron-Core"
-            )
-        raise ValueError(message + ".")
+    if "_v2" not in dtensor_cfg:
+        return
+
+    raise ValueError(
+        f"DTensor v1 ({config_path}._v2=false) and the _v2 key itself have been removed. "
+        f"DTensor is always the Automodel backend now, which is what _v2=true selected, "
+        f"so delete the key."
+    )
 
 
 def resolve_policy_worker_cls(default_cls: str, config: dict) -> str:
@@ -303,23 +216,6 @@ def validate_fp32_lm_head_config(
             UserWarning,
             stacklevel=2,
         )
-
-
-def resolve_model_class(
-    model_name: str,
-    *,
-    use_nemo_automodel: bool = True,
-) -> Any:
-    """Resolve the model class for a model type.
-
-    Args:
-        model_name: Model type to resolve.
-        use_nemo_automodel: Whether to prefer NeMo AutoModel wrappers when they
-            are available.
-    """
-    if use_nemo_automodel and NEMO_AUTOMODEL_AVAILABLE:
-        return AUTOMODEL_FACTORY.get(model_name.lower(), NeMoAutoModelForCausalLM)
-    return HF_AUTOMODEL_FACTORY.get(model_name.lower(), AutoModelForCausalLM)
 
 
 def is_vllm_v1_engine_enabled() -> bool:
