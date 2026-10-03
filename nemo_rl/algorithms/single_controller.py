@@ -315,6 +315,11 @@ class SingleControllerActor:
         except Exception:
             return
         write_train_step_file(log_dir, self._train_steps, self._trainer_version)
+        # NRL_TRAIN_STEP_DIR: an extra, job-unique copy for launchers whose chained jobs share a
+        # run dir (logger.log_dir then moves to the next exp_NNN per job).
+        extra_dir = os.environ.get("NRL_TRAIN_STEP_DIR")
+        if extra_dir:
+            write_train_step_file(extra_dir, self._train_steps, self._trainer_version)
 
     def __init__(
         self,
