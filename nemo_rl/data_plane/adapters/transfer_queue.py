@@ -137,9 +137,11 @@ def _mooncake_transport_config() -> dict:
     if not devices:
         raise RuntimeError(
             "data_plane.backend='mooncake_cpu' requires RDMA, but no usable "
-            "mlx5 device was found. Check that /dev/infiniband/uverbs* exists "
-            "(a container does not inherit it from the host even though it "
-            "does see /sys/class/infiniband) — name a device with "
+            "device was found: only devices under /sys/class/infiniband whose "
+            "port 1 reports ACTIVE are usable, since mooncake only checks port "
+            "1. Check that /dev/infiniband/uverbs* exists (a container does "
+            "not inherit it from the host even though it does see "
+            "/sys/class/infiniband) — name a device with "
             "MC_MOONCAKE_DEVICE=<dev>, or use data_plane.backend='simple'."
         )
     return {"protocol": "rdma", "device_name": devices}
