@@ -327,6 +327,26 @@ flowchart LR
 
 **Data flow**: DatumSpec is converted to Example Dict, which passes through to the Responses API with generation parameters (`temperature`, `top_p`) added for on-policy sampling. The Model Server translates Responses API ↔ Chat Completions (converting message formats, extracting reasoning content, attaching token IDs). Results flow back with token IDs and logprobs extracted into the final Result.
 
+### Agent-added multimodal observations
+
+For a multi-turn multimodal agent, each trainable response output can include
+the media introduced since the preceding policy call:
+
+- `prompt_multimodal_content`: the Responses API image content parts consumed
+  by that policy call. An explicitly empty list means that no new media was
+  consumed for the turn.
+- `prompt_mm_processor_kwargs`: the multimodal processor settings used for the
+  call. When `video_as_images` is enabled, include
+  `video_as_images_frame_counts` and `video_as_images_group_types` so NeMo RL
+  can distinguish temporal video-frame groups from independent tool images.
+
+NeMo RL keeps the generation backend's prompt token IDs unchanged and locally
+reconstructs only the processor-owned tensors for those media items. This is
+important for asynchronous GRPO: the completed conversation history alone does
+not preserve which images or image groups were present at each policy call.
+Agents that omit `prompt_multimodal_content` continue to use the legacy history
+inference path.
+
 ## Tokenization and On-Policy Corrections
 
 Token IDs are extracted at the NeMo RL vLLM layer via the `/tokenize` endpoint. This ensures:

@@ -1330,6 +1330,93 @@ def test_nemo_gym_postprocess_uses_batch_decode():
     assert nemo_gym_result["response"]["output"][1]["generation_str"] == "6 7"
 
 
+def test_nemo_gym_postprocess_uses_explicit_per_turn_prompt_media():
+    """Dynamic prompt media must retain the grouping used during generation."""
+
+    def _image_url(red: int) -> str:
+        return image_to_data_url(Image.new("RGB", (2, 3), color=(red, 0, 0)))
+
+    class _Tokenizer:
+        model_input_names = ["input_ids"]
+
+        @staticmethod
+        def batch_decode(batch):
+            return ["decoded"] * len(batch)
+
+    class _ImageProcessor:
+        model_input_names = ["pixel_values"]
+
+    class _Processor:
+        image_token = "<image>"
+        image_processor = _ImageProcessor()
+        tokenizer = _Tokenizer()
+        model_input_names = ["input_ids", "pixel_values", "imgs_sizes", "num_frames"]
+
+        def __init__(self):
+            self.video_flags = []
+
+        def __call__(self, *, text, images, return_tensors, video_flags):
+            assert text == "<image>" * len(images)
+            assert return_tensors == "pt"
+            self.video_flags.append(video_flags)
+            red_values = [image.getpixel((0, 0))[0] for image in images]
+            return {
+                "input_ids": torch.tensor([[1]]),
+                "pixel_values": torch.tensor(red_values, dtype=torch.float32).view(
+                    -1, 1
+                ),
+                "imgs_sizes": torch.tensor([[3, 2]] * len(images)),
+            }
+
+    processor = _Processor()
+
+    class _MockSelf:
+        cfg = {}
+        _processor = processor
+
+    def _trainable_item(
+        prompt: list[int], generation: int, colors: list[int], group_type: str
+    ) -> dict:
+        return {
+            "prompt_token_ids": prompt,
+            "generation_token_ids": [generation],
+            "generation_log_probs": [-0.1],
+            "prompt_multimodal_content": [
+                {"type": "image_url", "image_url": _image_url(color)}
+                for color in colors
+            ],
+            "prompt_mm_processor_kwargs": {
+                "video_as_images": True,
+                "video_as_images_frame_counts": [len(colors)],
+                "video_as_images_group_types": [group_type],
+            },
+        }
+
+    nemo_gym_result = {
+        "response": {
+            "output": [
+                _trainable_item([1], 2, [10, 11], "video"),
+                _trainable_item([1, 2, 3], 4, [20], "image"),
+            ]
+        },
+        "responses_create_params": {"input": []},
+    }
+
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(), {}, nemo_gym_result, _Tokenizer()
+        )
+    )
+
+    first_user, _, second_user, _ = result["message_log"]
+    assert first_user["pixel_values"].as_tensor().flatten().tolist() == [10.0, 11.0]
+    assert first_user["num_frames"].as_tensor().tolist() == [2]
+    assert second_user["pixel_values"].as_tensor().flatten().tolist() == [20.0]
+    assert second_user["num_frames"].as_tensor().tolist() == [1]
+    assert processor.video_flags == [[True, True], [False]]
+    assert "prompt_multimodal_content" not in nemo_gym_result["response"]["output"][0]
+
+
 @pytest.mark.parametrize("include_initial_multimodal_data", [False, True])
 def test_nemo_gym_dedup_redacts_initial_images_from_actor_return(
     include_initial_multimodal_data,
