@@ -1433,9 +1433,16 @@ def test_configure_and_command_reuse_the_existing_process_local_manager(
         pytest.fail("checkpoint RPC created another TQ client")
 
     monkeypatch.setattr(tq, "init", unexpected_init)
-    workers = [object(), object()]
-    checkpoint_plugin.configure_checkpoint_workers(workers)
-    assert list(manager._checkpoint_workers) == workers
+    # One candidate owns a segment; the other (e.g. a generation worker whose
+    # token-capture client disowned storage) describes as nothing to save.
+    other = _manager(_FakeStore(_FakeCluster({}, {}), "10.0.0.2:12302"), "manager-b")
+    _participant(other)
+    owner = SimpleNamespace(
+        mooncake_checkpoint=_RemoteMethod(other._checkpoint_participant._dispatch)
+    )
+    non_owner = SimpleNamespace(mooncake_checkpoint=_RemoteMethod(lambda _body: None))
+    checkpoint_plugin.configure_checkpoint_workers([owner, non_owner])
+    assert list(manager._checkpoint_workers) == [owner]
     response = checkpoint_plugin.run_checkpoint_command(
         checkpoint_plugin._request_body(manager, "DESCRIBE")
     )
@@ -1473,21 +1480,27 @@ def test_command_does_not_initialize_a_client_on_non_owner_ranks(
 
 
 @pytest.mark.parametrize(
-    ("actor_id", "enabled", "expected_capacity", "owns_segment"),
+    ("actor_id", "enabled", "disowned", "expected_capacity", "owns_segment"),
     [
-        (None, True, 0, False),
-        ("actor-id", True, 1024, True),
-        (None, False, 1024, False),
+        (None, True, False, 0, False),
+        ("actor-id", True, False, 1024, True),
+        (None, False, False, 1024, False),
+        # An actor that called disown_storage_in_this_process() gets the
+        # driver's rule: no segment, no participant.
+        ("actor-id", True, True, 0, False),
     ],
 )
 def test_installed_manager_keeps_non_actor_clients_out_of_the_storage_topology(
     monkeypatch: pytest.MonkeyPatch,
     actor_id: str | None,
     enabled: bool,
+    disowned: bool,
     expected_capacity: int,
     owns_segment: bool,
 ) -> None:
     import ray
+
+    monkeypatch.setattr(checkpoint_plugin, "_DISOWN_STORAGE_IN_THIS_PROCESS", disowned)
     from transfer_queue.storage.managers import mooncake_manager
     from transfer_queue.storage.managers.base import StorageManagerFactory
 
