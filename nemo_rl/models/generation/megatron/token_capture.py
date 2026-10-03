@@ -30,15 +30,19 @@ the Megatron analog of the capture glue in ``vllm_worker_async.py``.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
 
 from nemo_rl.data_plane.tq_token_sink import (
     ChainPrefixCache,
+    StagedMediaTensors,
     TQTokenSink,
     TQTokenSource,
-    resolve_admission_prefix,
+    resolve_admission_prefix_chains,
+    validate_media_tensors,
 )
 from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
 
@@ -48,14 +52,23 @@ if TYPE_CHECKING:
         RequestPromptPreparationResult,
     )
 
+# offload_params sub-dict the Megatron preparer writes and the stager reads.
+MINF_CAPTURE_PARAMS_FIELD = "ng_capture_minf"
+MEDIA_PREV_COUNT_KEY = "media_prev_count"
+# ``(height, width)`` rows per staged item (``StagedPrefix.media_sizes`` as
+# nested lists): the stager checks the engine's retained media against them.
+MEDIA_PREV_SIZES_KEY = "media_prev_sizes"
+
 
 class TQMegatronPromptPreparer:
     """Resolve a Gym-authorized staged prefix before MInf admits a request.
 
-    Mirrors the vLLM worker: ``prepare_prompt`` resolves the prefix through the
-    shared ``resolve_admission_prefix`` / ``ChainPrefixCache`` pair, then splices
-    it with the shared ``replace_prefix_tokens`` using the rendered prior-turn
-    tokens and EOS id the Megatron endpoint carried in ``offload_params``.
+    Same shape as the vLLM worker's ``_resolve_admission_prefix``:
+    ``prepare_prompt`` resolves the admission through
+    ``resolve_admission_prefix_chains`` over a worker-local ``ChainPrefixCache``,
+    then splices the result with the shared ``replace_prefix_tokens`` using the
+    rendered prior-turn tokens and EOS ids the Megatron endpoint carried in
+    ``offload_params``.
     """
 
     def __init__(self, source: TQTokenSource) -> None:
@@ -68,13 +81,58 @@ class TQMegatronPromptPreparer:
         *,
         offload_params: dict[str, Any] | None = None,
     ) -> RequestPromptPreparationResult:
-        """Fetch a chained prefix, splice it into the prompt, and update admission."""
-        # Deferred because the prompt preparer is optional and requires the
-        # Megatron-LM hooks from NVIDIA/Megatron-LM#7015. The two field names
-        # are the request-metadata keys the Megatron chat endpoint writes when
-        # it defers the prefix splice to this preparer.
+        """Resolve the admission's staged prefix and splice it into the prompt.
+
+        Returns the prompt unchanged when ``offload_params`` carries no
+        ``ng_capture`` admission or the admission is text mode; a text-mode
+        return also drops the endpoint's ``_prefix_media_count`` (if any), since
+        nothing was spliced and the engine must expand every media placeholder
+        itself. Otherwise the
+        admission's ``staging_chain`` (or inline prefix) is resolved through the
+        worker-local ``ChainPrefixCache`` into expanded token ids plus the number
+        of media items the parent chain staged. Those ids are spliced over the
+        endpoint's re-rendered history with ``replace_prefix_tokens``, using the
+        template prefix tokens and EOS ids the endpoint placed in
+        ``offload_params``; the splice metadata is skipped only when the
+        endpoint sent none and the admission has no ``staging_chain``.
+
+        The returned ``offload_params`` copy is updated with:
+
+        - ``ng_capture.required_prefix_token_ids``: the expanded prefix Gym
+          verifies the engine's prompt against.
+        - ``ng_capture_minf.media_prev_count`` and ``media_prev_sizes``: the
+          media items the parent chain staged and their geometry; the stager
+          checks the leading items of the engine's whole-conversation
+          ``media_tensors`` against the sizes (a resent image at a new size
+          fails the call) and slices at the count so each row carries only
+          this call's media.
+        - ``_prefix_expanded_token_count``: written only when the endpoint
+          reported ``_prefix_media_count``; tells the engine where the
+          already-expanded prefix ends so it expands only the media
+          placeholders after it.
+
+        Args:
+            prompt: The endpoint's rendered prompt. Must be a token-id list
+                when a token-in admission is present.
+            offload_params: Request metadata the endpoint attached; may carry
+                the Gym admission and the prompt splice metadata.
+
+        Returns:
+            The (possibly spliced) prompt and the updated ``offload_params``.
+
+        Raises:
+            ValueError: The resolved prefix length differs from the admission's
+                ``prev_len``, the splice metadata is malformed or missing for a
+                chained admission, the splice did not yield the authorized
+                prefix, or the endpoint's prefix media count disagrees with the
+                chain's.
+            TypeError: The prompt is not a token-id list.
+        """
+        # Deferred import: megatron-core is a heavy, optional dependency.
         from megatron.core.inference.inference_request import (
             PREFIX_EOS_TOKEN_ID_FIELD,
+            PREFIX_EXPANDED_TOKEN_COUNT_FIELD,
+            PREFIX_MEDIA_COUNT_FIELD,
             PREFIX_TEMPLATE_TOKEN_IDS_FIELD,
             RequestPromptPreparationResult,
         )
@@ -93,13 +151,17 @@ class TQMegatronPromptPreparer:
 
         admission = CaptureAdmission.model_validate(capture_payload)
         if admission.mode == "text":
+            if PREFIX_MEDIA_COUNT_FIELD in offload_params:
+                offload_params = dict(offload_params)
+                offload_params.pop(PREFIX_MEDIA_COUNT_FIELD)
             return RequestPromptPreparationResult(
                 prompt=prompt, offload_params=offload_params
             )
         if not isinstance(prompt, list):
             raise TypeError("MInf token-in capture requires a token-id list prompt")
 
-        prefix_token_ids = resolve_admission_prefix(admission, self._chain_prefix)
+        chains = resolve_admission_prefix_chains(admission, self._chain_prefix)
+        prefix_token_ids = chains.expanded
         if len(prefix_token_ids) != admission.prev_len:
             raise ValueError(
                 "MInf capture prefix length mismatch: "
@@ -107,44 +169,234 @@ class TQMegatronPromptPreparer:
             )
 
         updated_offload_params = dict(offload_params)
+        # Gym verifies the engine's prompt against this prefix.
         updated_admission = admission.model_copy(
             update={"required_prefix_token_ids": prefix_token_ids}
         )
         updated_offload_params[NG_CAPTURE_FIELD] = updated_admission.model_dump(
             mode="json"
         )
+        updated_offload_params[MINF_CAPTURE_PARAMS_FIELD] = {
+            **(updated_offload_params.get(MINF_CAPTURE_PARAMS_FIELD) or {}),
+            MEDIA_PREV_COUNT_KEY: chains.media_count,
+            MEDIA_PREV_SIZES_KEY: [
+                [list(size) for size in item] for item in chains.media_sizes
+            ],
+        }
 
         template_prefix_token_ids = updated_offload_params.get(
             PREFIX_TEMPLATE_TOKEN_IDS_FIELD
         )
-        eos_token_id = updated_offload_params.get(PREFIX_EOS_TOKEN_ID_FIELD)
-        if template_prefix_token_ids is not None or eos_token_id is not None:
+        eos_token_ids = updated_offload_params.get(PREFIX_EOS_TOKEN_ID_FIELD)
+        if template_prefix_token_ids is not None or eos_token_ids is not None:
             if not isinstance(template_prefix_token_ids, list) or any(
                 type(token_id) is not int for token_id in template_prefix_token_ids
             ):
                 raise ValueError(
                     "MInf capture request carries no valid template prefix tokens"
                 )
-            if type(eos_token_id) is not int:
-                raise ValueError("MInf capture request carries no valid EOS token id")
-            # Same splice as the vLLM worker (vllm_worker_async.py); the
-            # post-condition below verifies the result.
+            if type(eos_token_ids) is not int and (
+                not isinstance(eos_token_ids, list)
+                or not eos_token_ids
+                or any(type(token_id) is not int for token_id in eos_token_ids)
+            ):
+                raise ValueError("MInf capture request carries no valid EOS token ids")
             prompt = replace_prefix_tokens(
                 tokenizer=None,
                 model_prefix_token_ids=prefix_token_ids,
                 template_prefix_token_ids=template_prefix_token_ids,
                 template_token_ids=prompt,
-                eos_token_id=eos_token_id,
+                eos_token_id=eos_token_ids,
             )
         elif admission.staging_chain:
             raise ValueError(
                 "MInf staged-prefix request carries no prompt splice metadata"
             )
 
-        if prompt[: admission.prev_len] != prefix_token_ids:
+        if prompt[: len(prefix_token_ids)] != prefix_token_ids:
             raise ValueError("MInf failed to apply the authorized token prefix")
+        endpoint_media_count = updated_offload_params.get(PREFIX_MEDIA_COUNT_FIELD)
+        if (endpoint_media_count or 0) != chains.media_count:
+            raise ValueError(
+                "MInf capture prefix media count mismatch: the chat request's history "
+                f"carries {endpoint_media_count or 0}, the staged chain "
+                f"{chains.media_count}"
+            )
+        if endpoint_media_count is not None:
+            updated_offload_params[PREFIX_EXPANDED_TOKEN_COUNT_FIELD] = len(
+                prefix_token_ids
+            )
         return RequestPromptPreparationResult(
             prompt=prompt, offload_params=updated_offload_params
+        )
+
+
+def _prev_sizes(minf_params: Any, prev_count: int) -> list[list[list[int]]]:
+    """Validate ``media_prev_sizes``: one list of ``[h, w]`` rows per counted item."""
+    value = minf_params.get(MEDIA_PREV_SIZES_KEY) if minf_params is not None else None
+    if value is None:
+        value = []
+    if (
+        not isinstance(value, list)
+        or len(value) != prev_count
+        or any(
+            not isinstance(item, list)
+            or not item
+            or any(
+                not isinstance(size, list)
+                or len(size) != 2
+                or any(type(v) is not int or v <= 0 for v in size)
+                for size in item
+            )
+            for item in value
+        )
+    ):
+        raise ValueError(
+            f"MInf capture request carries an invalid {MEDIA_PREV_SIZES_KEY} for "
+            f"{prev_count} staged media items: {value!r}"
+        )
+    return value
+
+
+def slice_media_tensors(
+    media: StagedMediaTensors, prev_count: int
+) -> dict[str, torch.Tensor] | None:
+    """Drop the first ``prev_count`` media items from the engine's media.
+
+    Every chat request carries the whole conversation, so the engine hands the
+    stager pixels for every image in the prompt. The parent chain already
+    staged the first ``prev_count`` of them; this keeps only the rest so media
+    columns are per-call deltas like the token columns.
+
+    ``media`` must already have passed ``validate_media_tensors``, which
+    pins the packed-patch layout and gives ``patch_size``; item boundaries
+    come from ``StagedMediaTensors.item_sizes``, the same rule the sink uses
+    to count a chain's staged items. Returns the remaining media as the
+    attachments mapping Gym's capture core takes, or ``None`` when every item
+    was already staged.
+
+    Raises:
+        ValueError: ``prev_count`` exceeds the items present.
+    """
+    items = media.item_sizes
+    if prev_count > len(items):
+        raise ValueError(
+            f"media_prev_count {prev_count} exceeds the {len(items)} media items "
+            "the engine saw"
+        )
+    if prev_count == len(items):
+        return None
+    sliced: dict[str, torch.Tensor] = {
+        "imgs": media.imgs,
+        "imgs_sizes": media.imgs_sizes,
+    }
+    if media.num_frames is not None:
+        sliced["num_frames"] = media.num_frames
+    if prev_count <= 0:
+        return sliced
+
+    prev_rows = sum(len(item) for item in items[:prev_count])
+    patch_area = media.patch_size**2
+    prev_patches = sum(h * w for item in items[:prev_count] for h, w in item)
+    # validate_media_tensors checked every row divides into whole patches.
+    prev_patches //= patch_area
+    sliced["imgs"] = media.imgs[:, prev_patches:, :]
+    sliced["imgs_sizes"] = media.imgs_sizes[prev_rows:]
+    if media.num_frames is not None:
+        sliced["num_frames"] = media.num_frames[prev_count:]
+    return sliced
+
+
+@dataclass(frozen=True)
+class _MegatronCapturePayload:
+    """The MInf offloaded payload plus the worker-side context Gym's adapter reads."""
+
+    prompt_token_ids: Any
+    generated_token_ids: Any
+    generated_log_probs: Any
+    # The engine's media tensors minus what the parent chain already staged.
+    media_tensors: dict[str, Any] | None
+
+    @classmethod
+    def from_offloaded(
+        cls, payload: Any, minf_params: Any
+    ) -> "_MegatronCapturePayload":
+        """Build the adapter-facing view of one finished MInf payload.
+
+        Copies the ``prompt_token_ids`` / ``generated_token_ids`` /
+        ``generated_log_probs`` attributes Gym's ``MegatronCaptureAdapter``
+        reads (missing ones become ``None``), checks the first
+        ``minf_params["media_prev_count"]`` items of ``payload.media_tensors``
+        against ``minf_params["media_prev_sizes"]`` (the geometry the parent
+        chain staged), and slices the tensors there so only the media new to
+        this call remains. ``media_tensors`` is validated against the sink's
+        media contract (``validate_media_tensors``) first.
+
+        Args:
+            payload: The engine's ``OffloadedRequestPayload`` (or equivalent).
+            minf_params: The ``ng_capture_minf`` mapping the prompt preparer
+                wrote, or ``None`` for requests it did not touch.
+
+        Raises:
+            TypeError: ``minf_params`` is not a dict, ``media_tensors`` is not
+                a mapping, or a media tensor is not a ``torch.Tensor``.
+            ValueError: ``media_tensors`` violates the media contract,
+                ``media_prev_count`` is not a non-negative int,
+                ``media_prev_sizes`` is malformed or does not have one entry per
+                counted item, a retained item's geometry differs from the
+                staged one, or the media cannot be sliced at the count.
+
+        The stager maps both to ``capture_failed`` coordinates.
+        """
+        if minf_params is not None and not isinstance(minf_params, dict):
+            raise TypeError(
+                f"MInf capture params must be a dict, got {type(minf_params).__name__}"
+            )
+
+        def _count(key: str) -> int:
+            value = minf_params.get(key) if minf_params is not None else None
+            if value is None:
+                return 0
+            if type(value) is not int or value < 0:
+                raise ValueError(
+                    f"MInf capture request carries an invalid {key}: {value!r}"
+                )
+            return value
+
+        media_tensors = getattr(payload, "media_tensors", None)
+        if media_tensors is not None and not isinstance(media_tensors, Mapping):
+            raise TypeError(
+                "MInf payload media_tensors must be a mapping, got "
+                f"{type(media_tensors).__name__}"
+            )
+        prev_count = _count(MEDIA_PREV_COUNT_KEY)
+        staged_sizes = _prev_sizes(minf_params, prev_count)
+        # The sink's contract check runs here, before slicing, so the layout
+        # is known good and a malformed bundle fails this call, not the write.
+        validated = validate_media_tensors(media_tensors or None)
+        items = () if validated is None else validated.item_sizes
+        if prev_count > len(items):
+            raise ValueError(
+                f"media_prev_count {prev_count} exceeds the {len(items)} media "
+                "items the engine saw"
+            )
+        for index, (staged, item) in enumerate(
+            zip(staged_sizes, items[:prev_count], strict=True)
+        ):
+            seen = [list(size) for size in item]
+            if staged != seen:
+                raise ValueError(
+                    f"MInf retained media geometry changed: item {index} was "
+                    f"staged at {staged}, the engine saw {seen}"
+                )
+        media = (
+            None if validated is None else slice_media_tensors(validated, prev_count)
+        )
+        return cls(
+            prompt_token_ids=getattr(payload, "prompt_token_ids", None),
+            generated_token_ids=getattr(payload, "generated_token_ids", None),
+            generated_log_probs=getattr(payload, "generated_log_probs", None),
+            media_tensors=media,
         )
 
 
@@ -170,6 +422,10 @@ class TQMegatronTokenStager:
             weight_version_fn=lambda: 0,
             adapter=MegatronCaptureAdapter(),
         )
+        # MInf hands over float32 pixels; the sink's column is pinned to the
+        # vision encoder's weight dtype (the trainer casts pixels to it before
+        # encoding anyway), so cast once here and stage half the bytes.
+        self._media_pixel_dtype = sink.media_pixel_dtype
         # Requests that straddled a refit (more than one policy_epoch boundary).
         # Metered here because they are stamped, not masked; see _weight_version.
         self._epoch_span_count = 0
@@ -239,6 +495,7 @@ class TQMegatronTokenStager:
                 payload,
                 capture_payload=capture_payload,
                 finished_metadata=finished_metadata,
+                minf_params=(offload_params or {}).get(MINF_CAPTURE_PARAMS_FIELD),
             )
         except Exception:  # noqa: BLE001 — capture failure must not fail generation
             logging.getLogger(__name__).exception(
@@ -246,12 +503,28 @@ class TQMegatronTokenStager:
             )
             return None
 
+    def _cast_media_pixels(
+        self, media_tensors: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """Cast the sliced ``imgs`` to the sink's pinned pixel dtype.
+
+        Only the pixels change dtype; ``imgs_sizes`` / ``num_frames`` stay
+        int32. A no-op when the dtypes already agree or the sink is text-only.
+        """
+        if not media_tensors:
+            return None
+        imgs = media_tensors["imgs"]
+        if self._media_pixel_dtype is None or imgs.dtype == self._media_pixel_dtype:
+            return media_tensors
+        return {**media_tensors, "imgs": imgs.to(dtype=self._media_pixel_dtype)}
+
     def _stage_admitted(
         self,
         payload: Any,
         *,
         capture_payload: Any,
         finished_metadata: Any,
+        minf_params: Any = None,
     ) -> RequestPayloadStageResult:
         """Validate and stage traffic that carries a Gym capture admission."""
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
@@ -262,12 +535,6 @@ class TQMegatronTokenStager:
             admission,
             weight_version=self._weight_version(finished_metadata),
         )
-        # Gym's MegatronCaptureAdapter reads prompt/generated ids and log
-        # probs off the offloaded payload. A malformed payload poisons the
-        # call with ``capture_failed`` coordinates (surfacing in Gym as
-        # ``worker_capture_failed``, matching vLLM) instead of raising here,
-        # which would leave Gym with no coordinates at all.
-        coords = self._capture.complete_call_from_response(call, payload)
         # Deferred: Megatron-LM's inference hooks are only present on the
         # Megatron generation backend (see prepare_prompt); nemo_gym is an
         # optional extra absent in non-gym runs.
@@ -276,6 +543,24 @@ class TQMegatronTokenStager:
         )
         from nemo_gym.token_id_capture import NG_COMMIT_COORDS_FIELD
 
+        try:
+            capture_payload_view = _MegatronCapturePayload.from_offloaded(
+                payload, minf_params
+            )
+        except (TypeError, ValueError, RuntimeError) as error:
+            coords = self._capture.fail_call(
+                call, reason=f"{type(error).__name__}: {error}"
+            )
+            return RequestPayloadStageResult(
+                response_metadata={
+                    NG_COMMIT_COORDS_FIELD: coords.model_dump(mode="json")
+                }
+            )
+        coords = self._capture.complete_call_from_response(
+            call,
+            capture_payload_view,
+            attachments=self._cast_media_pixels(capture_payload_view.media_tensors),
+        )
         return RequestPayloadStageResult(
             response_metadata={
                 NG_COMMIT_COORDS_FIELD: coords.model_dump(mode="json"),

@@ -395,9 +395,13 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   `policy.is_vlm: true`; see the
   [CLEVR Single-Controller recipe](../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-8n4g-megatron-single-controller-async.v1.yaml).
 - NeMo-Gym token capture also supports Omni dynamic-resolution images and native video
-  rollouts with async vLLM generation and a Megatron learner. With
-  `token_capture.enabled: true` and the VLM processor configured, workers capture
-  the processed media used for inference together with each call's token delta.
+  rollouts with async vLLM generation and a Megatron learner, and with Megatron
+  Inference generation through the same media columns and finalizer (the
+  expanded-prefix splicing that backend adds is described in
+  [Token-capture ledger](../design-docs/token-capture-ledger.md#multimodal-rollouts-on-megatron-inference)).
+  With `token_capture.enabled: true` and the VLM processor configured, workers
+  capture the processed media used for inference together with each call's
+  token delta.
   RL hands the owned tensors (`imgs`, `imgs_sizes`, and optional `num_frames`)
   to Gym's `complete_call_from_response` as opaque attachments, and the TQ sink
   writes them in the same `put` as the token columns, so `staged` coordinates
@@ -438,7 +442,9 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   (required tensors, patch geometry, frame grouping); malformed or missing
   columns reject the rollout as `invalid_media_columns`, incompatible parts
   along a chain as `media_chain_incompatible`. Tensor contents are not hashed;
-  retained occurrences are checked by geometry and placeholder tokens. Media
+  retained occurrences are checked by geometry on both backends and
+  additionally by placeholder tokens on vLLM, the only engine that reports
+  them. Media
   must remain immutable for the rollout's lifetime and preprocessing must be
   deterministic. Same-shape pixel changes and corruption of stored pixel values
   are outside this check's coverage. Call
@@ -446,13 +452,22 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   transactional rollback: a failed combined write is discarded best-effort by
   the sink, and a failed discard is logged at ERROR.
   Upgrade the paired Gym and RL changes together. The GB200 functional shard
-  `L1_Functional_Tests_GB200_Vllm_Omni_Single_Controller.sh` smokes this path
-  end to end (CLEVR-style images through Gym `string_match`, native video
-  through Gym `mcqa`) and gates on `train/finalize/media_row_rate == 1`, the
-  metric that reports the fraction of learner rows built from captured media.
-  Media capture requires `policy.generation.backend: vllm`; Megatron inference
-  token capture is text-only. No new Megatron-LM pin is needed. Compaction,
-  mixed image/video conversations, native audio,
+  `L1_Functional_Tests_GB200_Vllm_Omni_Single_Controller.sh` smokes the vLLM
+  path end to end (CLEVR-style images through Gym `string_match`, native video
+  through Gym `mcqa`), and
+  `L1_Functional_Tests_GB200_Megatron_Omni_Single_Controller.sh` smokes the
+  Megatron Inference path on the same CLEVR-style images. Both gate on
+  `train/finalize/media_row_rate == 1`, the metric that reports the fraction
+  of learner rows built from captured media.
+  The vLLM path needs no new Megatron-LM pin. The Megatron Inference path
+  requires a Megatron-LM pin with `media_tensors` on the offloaded payload and
+  expanded-prefix stitching (NVIDIA/Megatron-LM#7598); on an older pin the
+  worker's prompt preparer fails its first capture call with an `ImportError`
+  naming the missing stitching field.
+  A group in which no rollout carried media (an all-text prompt in a mixed
+  dataset) is published with empty media rows in the partition's pinned pixel
+  dtype and patch width, so its keys can share a train fetch with media keys.
+  Compaction, mixed image/video conversations, native audio,
   video token pruning, static tiling (`image_num_patches`), other processor families,
   and `token_capture.defer_routed_experts_to_policy: true` are not supported.
 - Multi-Teacher On-Policy Distillation (MOPD) is supported for text-only NeMo

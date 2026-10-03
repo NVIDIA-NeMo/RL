@@ -105,7 +105,6 @@ _MEDIA_REQUIRED = ("imgs", "imgs_sizes")
 _MEDIA_PIXEL_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _MEDIA_INDEX_DTYPES = (torch.int32, torch.int64)
 
-
 STAGING_FIELDS = [
     "token_ids_delta",
     "token_mask_delta",
@@ -171,6 +170,45 @@ class StagedMediaTensors:
     @property
     def patch_size(self) -> int:
         return int(math.isqrt(int(self.imgs.shape[-1]) // 3))
+
+    @property
+    def item_sizes(self) -> MediaItemSizes:
+        """The ``(height, width)`` rows of each media item, see ``media_item_sizes``."""
+        return media_item_sizes(self.imgs_sizes, self.num_frames)
+
+
+# One entry per media item; each item is its ``(height, width)`` rows (one for
+# a still image, one per frame for a video).
+MediaItemSizes = tuple[tuple[tuple[int, int], ...], ...]
+
+
+def media_item_sizes(
+    imgs_sizes: torch.Tensor, num_frames: torch.Tensor | None
+) -> MediaItemSizes:
+    """Group ``imgs_sizes`` rows into media items.
+
+    The one definition of an item boundary: a video is one item spanning its
+    ``num_frames`` rows of ``imgs_sizes``, a still image one item of one row.
+    The sink's prefix reader (``media_count`` / ``media_sizes``) and the
+    Megatron stager's media slicing both use it, so the count the preparer
+    carries forward and the slice point the stager cuts at cannot disagree.
+
+    Raises:
+        ValueError: ``num_frames`` does not tile the ``imgs_sizes`` rows.
+    """
+    sizes = [(int(h), int(w)) for h, w in imgs_sizes.reshape(-1, 2).tolist()]
+    if num_frames is None:
+        return tuple((size,) for size in sizes)
+    frames = [int(f) for f in num_frames.reshape(-1).tolist()]
+    if any(f <= 0 for f in frames) or sum(frames) != len(sizes):
+        raise ValueError(
+            f"num_frames {frames} does not tile the {len(sizes)} imgs_sizes rows"
+        )
+    items, start = [], 0
+    for count in frames:
+        items.append(tuple(sizes[start : start + count]))
+        start += count
+    return tuple(items)
 
 
 def _media_sentinels(pixel_dtype: torch.dtype) -> dict[str, torch.Tensor]:
@@ -397,6 +435,11 @@ class TQTokenSink:
         # sentinels and real rows agree; see ``_media_sentinels``.
         self._media_pixel_dtype = media_pixel_dtype
 
+    @property
+    def media_pixel_dtype(self) -> torch.dtype | None:
+        """The pixel dtype this partition's media column is pinned to (``None`` for text)."""
+        return self._media_pixel_dtype
+
     def stage(
         self,
         record: StagedCallRecord,
@@ -604,58 +647,112 @@ class TQTokenSink:
         self._store.clear(staging_keys)
 
 
+@dataclass(frozen=True)
+class StagedPrefix:
+    """One resolved ``staging_chain``: its tokens plus how much media it staged.
+
+    ``expanded`` is the concatenated ``token_ids_delta`` chain: what the engine
+    prompt must start with, what the Megatron preparer splices in, and what
+    Gym's capture core verifies. ``media_count`` is how many media items
+    (images, or videos) the chain's rows staged, so the next call can stage
+    only the media new to it and the engine expands only the media after it.
+    ``media_sizes`` gives each of those items' ``(height, width)`` rows (one for
+    a still, one per frame for a video) so the next call can check that the
+    engine saw the retained media at the staged geometry, not just as many
+    items.
+    """
+
+    expanded: list[int]
+    media_count: int = 0
+    media_sizes: MediaItemSizes = ()
+
+    def __add__(self, other: "StagedPrefix") -> "StagedPrefix":
+        return StagedPrefix(
+            expanded=self.expanded + other.expanded,
+            media_count=self.media_count + other.media_count,
+            media_sizes=self.media_sizes + other.media_sizes,
+        )
+
+
 class ChainPrefixCache:
     """Worker-local cache of resolved ``staging_chain`` prefixes."""
 
-    def __init__(self, source: Any | None = None) -> None:
-        self._source = source
-        self._cache: dict[str, list[int]] = {}
+    def __init__(self, source: TQTokenSource | None = None) -> None:
+        self._source: TQTokenSource | None = source
+        self._cache: dict[str, StagedPrefix] = {}
         self._lock = threading.Lock()
 
-    def install(self, source: Any) -> None:
+    def install(self, source: TQTokenSource) -> None:
         """Attach (or replace) the ``TQTokenSource`` and drop cached chains."""
         with self._lock:
             self._source = source
             self._cache.clear()
 
     def fetch(self, staging_chain: list[str]) -> list[int]:
-        """Assemble prefix token ids from staging_chain, with a worker-local FIFO (256-entry) cache."""
+        """Assemble the flat (expanded) prefix token ids from staging_chain.
+
+        The vLLM worker's path. It goes through ``fetch_chains`` so both entry
+        points fill the one cache with the same entry: the media count is never
+        cached as 0 for a chain that staged media.
+        """
+        return self.fetch_chains(staging_chain).expanded
+
+    def fetch_chains(self, staging_chain: list[str]) -> StagedPrefix:
+        """Assemble the prefix and its media count from staging_chain.
+
+        Resolves through a worker-local FIFO (256-entry) cache.
+        """
         cache = self._cache
         with self._lock:
             source = self._source
-            cached_ids: list[int] = []
+            cached = StagedPrefix(expanded=[])
             miss_start = 0
             for i, key in enumerate(staging_chain):
                 if key in cache:
-                    cached_ids = cache[key]
+                    cached = cache[key]
                     miss_start = i + 1
             miss_keys = staging_chain[miss_start:]
         if not miss_keys:
-            return list(cached_ids)
+            return StagedPrefix(
+                list(cached.expanded), cached.media_count, cached.media_sizes
+            )
         if source is None:
             raise RuntimeError(
                 "staging source not initialized; call setup_token_capture() first"
             )
         # TQ read stays outside the lock so concurrent fetches overlap.
-        fetched = source.fetch_prefix_token_ids(miss_keys)
-        result = cached_ids + fetched
+        fetched = source.fetch_prefix_chains(miss_keys)
+        result = cached + fetched
         last_key = staging_chain[-1]
         with self._lock:
             cache[last_key] = result
             if len(cache) > 256:
                 del cache[next(iter(cache))]
-        return result
+        return StagedPrefix(
+            list(result.expanded), result.media_count, result.media_sizes
+        )
 
 
 def resolve_admission_prefix(
     admission: Any, chain_prefix: ChainPrefixCache
 ) -> list[int]:
     """Resolve a ``CaptureAdmission`` to the flat prefix the engine prompt starts with."""
+    return resolve_admission_prefix_chains(admission, chain_prefix).expanded
+
+
+def resolve_admission_prefix_chains(
+    admission: Any, chain_prefix: ChainPrefixCache
+) -> StagedPrefix:
+    """Resolve a ``CaptureAdmission`` to its prefix and staged media count.
+
+    An inline ``required_prefix_token_ids`` prefix carries no media: Gym only
+    inlines prefixes for text chains.
+    """
     if admission.mode == "text":
-        return []
+        return StagedPrefix(expanded=[])
     if admission.staging_chain:
-        return chain_prefix.fetch(list(admission.staging_chain))
-    return list(admission.required_prefix_token_ids)
+        return chain_prefix.fetch_chains(list(admission.staging_chain))
+    return StagedPrefix(expanded=list(admission.required_prefix_token_ids))
 
 
 def _media_columns(
@@ -718,25 +815,38 @@ class TQTokenSource:
     ) -> None:
         self._store = TQStagingStore(dp_client, staging_partition=staging_partition)
         self._staging_partition = staging_partition
-        # Mirrors the partition schema: only a media-enabled partition has the
-        # flag/tensor columns, so selection is gated rather than probed.
+        # Must match the sink's ``capture_media`` for the same partition.
         self._capture_media = capture_media
 
     def fetch(self, staging_keys: list[str]) -> list[StagedCallBaseSnapshot]:
         """Gym ``StagingSource`` conformance: base snapshots only, in order."""
         return [item.snapshot for item in self.fetch_for_finalization(staging_keys)]
 
-    def fetch_prefix_token_ids(self, staging_keys: list[str]) -> list[int]:
-        """Bulk-fetch ordered delta chain and concatenate token_ids_delta into a prefix."""
+    def fetch_prefix_chains(self, staging_keys: list[str]) -> StagedPrefix:
+        """Bulk-fetch the ordered delta chain and describe the media it staged.
+
+        ``media_count`` and ``media_sizes`` are read off the small media
+        columns (never the pixels) and are only computed when this source was built with
+        ``capture_media=True``; otherwise it is 0 regardless of what the rows
+        staged. The Megatron preparer's ``media_prev_count`` therefore depends
+        on the source's ``capture_media`` matching the sink's -- both are set
+        from setup's ``capture_media`` in ``megatron_worker.setup_token_capture``.
+        """
         if not staging_keys:
-            return []
+            return StagedPrefix(expanded=[])
         if len(set(staging_keys)) != len(staging_keys):
             raise KeyError("prefix fetch: staging_keys contains duplicates")
+        select_fields = ["token_ids_delta"]
+        if self._capture_media:
+            # Small media columns only: enough to count and size items, never pixels.
+            select_fields += [
+                MEDIA_PRESENT_FIELD,
+                MEDIA_HAS_FRAMES_FIELD,
+                MEDIA_IMGS_SIZES_FIELD,
+                MEDIA_NUM_FRAMES_FIELD,
+            ]
         try:
-            rows = self._store.get(
-                staging_keys,
-                select_fields=["token_ids_delta"],
-            )
+            rows = self._store.get(list(staging_keys), select_fields=select_fields)
         except Exception as error:  # noqa: BLE001 — protocol maps any miss to KeyError
             raise KeyError(
                 f"prefix fetch: staged rows for {len(staging_keys)} keys could "
@@ -747,12 +857,18 @@ class TQTokenSource:
             raise KeyError(
                 f"prefix fetch incomplete: requested {len(staging_keys)} keys, got {n_rows}"
             )
-        result: list[int] = []
+        expanded: list[int] = []
+        media_sizes: list[tuple[tuple[int, int], ...]] = []
         for index in range(n_rows):
             row = _select_row(rows, index)
-            delta = row["token_ids_delta"].squeeze(0).tolist()
-            result.extend(int(t) for t in delta)
-        return result
+            expanded.extend(int(t) for t in row["token_ids_delta"].squeeze(0).tolist())
+            if self._capture_media:
+                media_sizes.extend(_row_media_item_sizes(row))
+        return StagedPrefix(
+            expanded=expanded,
+            media_count=len(media_sizes),
+            media_sizes=tuple(media_sizes),
+        )
 
     def fetch_media(self, items: list[FetchedStagedCall]) -> list[StagedMediaTensors]:
         """One batched read of the media tensor columns for rows known to carry media.
@@ -1085,3 +1201,22 @@ def _row_scalar_bool(row: Any, field_name: str) -> bool:
             f"shape {tuple(value.shape)}"
         )
     return bool(flattened[0].item())
+
+
+def _row_media_item_sizes(row: Any) -> MediaItemSizes:
+    """The ``(height, width)`` rows of each item one media-enabled row staged.
+
+    Item boundaries come from ``media_item_sizes``, shared with the Megatron
+    stager's slicing.
+
+    Raises:
+        ValueError: ``num_frames`` does not tile the ``imgs_sizes`` rows.
+    """
+    if not _row_scalar_bool(row, MEDIA_PRESENT_FIELD):
+        return ()
+    return media_item_sizes(
+        row[MEDIA_IMGS_SIZES_FIELD],
+        row[MEDIA_NUM_FRAMES_FIELD]
+        if _row_scalar_bool(row, MEDIA_HAS_FRAMES_FIELD)
+        else None,
+    )

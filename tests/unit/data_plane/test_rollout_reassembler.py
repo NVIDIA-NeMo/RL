@@ -29,6 +29,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -40,14 +41,24 @@ from nemo_gym.token_id_capture.staging.digest import (  # noqa: E402
     compute_staging_digest,
 )
 from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
+    CallRecord,
+    RolloutReceipt,
     StagedCallRecord,
 )
 
+from nemo_rl.data.captured_media import MediaColumnSpec  # noqa: E402
+from nemo_rl.data.multimodal_utils import (  # noqa: E402
+    WIRE_MULTIMODAL_FIELDS,
+    PackedTensor,
+    reassemble_packed_multimodal,
+    row_shapes_key,
+)
 from nemo_rl.data_plane.schema import (  # noqa: E402
     ROUTE_PASSTHROUGH_FLAG,
     ROUTE_PLAN_TAG,
 )
 from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
+    MEDIA_STAGING_FIELDS,
     STAGING_FIELDS,
     TQTokenSink,
     TQTokenSource,
@@ -896,3 +907,448 @@ def test_deferred_chain_hash_corruption_rejects_the_row(
     )
     assert not row.valid
     assert (row.rejection_reason or "").startswith("rebuild_failed:chain_hash_mismatch")
+
+
+# ── media rows ──────────────────────────────────────────────────────────────
+
+MEDIA_CANONICAL_PARTITION = "rollout_data_media_fin_test"
+MEDIA_STAGING_PARTITION = "rollout_staging_media_fin_test"
+MEDIA_PIXEL_DTYPE = torch.bfloat16
+MEDIA_PATCH = 2
+MEDIA_COLUMNS = MediaColumnSpec(pixel_dtype=MEDIA_PIXEL_DTYPE, patch_size=MEDIA_PATCH)
+
+
+@pytest.fixture()
+def media_partitions(tq_client):
+    tq_client.register_partition(
+        partition_id=MEDIA_STAGING_PARTITION,
+        fields=list(STAGING_FIELDS) + list(MEDIA_STAGING_FIELDS),
+        num_samples=64,
+        consumer_tasks=["finalize"],
+    )
+    tq_client.register_partition(
+        partition_id=MEDIA_CANONICAL_PARTITION,
+        fields=[
+            "input_ids",
+            "input_lengths",
+            "generation_logprobs",
+            "token_mask",
+            "sample_mask",
+            "prompt_ids_for_adv",
+            "total_reward",
+            "mask_sample",
+            "truncated",
+            # Mirrors _register_single_controller_partitions(include_multimodal_fields).
+            *sorted(WIRE_MULTIMODAL_FIELDS),
+        ],
+        num_samples=64,
+        consumer_tasks=["train"],
+    )
+    yield
+    tq_client.clear_samples(sample_ids=None, partition_id=MEDIA_STAGING_PARTITION)
+    tq_client.clear_samples(sample_ids=None, partition_id=MEDIA_CANONICAL_PARTITION)
+
+
+def _still_images(
+    *sizes: tuple[int, int], seed: int, dtype: torch.dtype = MEDIA_PIXEL_DTYPE
+) -> dict[str, torch.Tensor]:
+    """MInf packed patches for ``sizes`` (h, w) still images: ``[1, patches, 3*P*P]``."""
+    sizes_t = torch.tensor(sizes, dtype=torch.int32)
+    patches = int((sizes_t[:, 0] * sizes_t[:, 1]).sum()) // MEDIA_PATCH**2
+    generator = torch.Generator().manual_seed(seed)
+    imgs = torch.randn(1, patches, 3 * MEDIA_PATCH**2, generator=generator)
+    return {"imgs": imgs.to(dtype), "imgs_sizes": sizes_t}
+
+
+def _stage_media_rollout(
+    tq_client,
+    rollout_id: str,
+    *,
+    media: bool = True,
+    second_turn: bool = False,
+    pixel_dtype: torch.dtype = MEDIA_PIXEL_DTYPE,
+):
+    """Stage a rollout on the media partition; each call carries only its new image.
+
+    Returns ``(receipt_dict, expected_row, [per-call bundle or None])``. With
+    ``second_turn`` the chain is the two-call golden fixture, and the second
+    call carries a second image, so the finalizer must concatenate the two
+    calls' pixels in chain order. ``pixel_dtype`` is the partition's pinned
+    pixel dtype (the vision encoder's weight dtype on both workers; fp32 covers
+    a config that keeps the vision tower in full precision).
+    """
+    records, receipt, row = build_fixture_artifacts(
+        "worked_example" if second_turn else "single_call", rollout_id=rollout_id
+    )
+    sink = TQTokenSink(
+        tq_client,
+        staging_partition=MEDIA_STAGING_PARTITION,
+        capture_media=True,
+        media_pixel_dtype=pixel_dtype,
+    )
+    bundles = [
+        _still_images((4, 4), seed=index, dtype=pixel_dtype) if media else None
+        for index in range(len(records))
+    ]
+    for record, bundle in zip(records, bundles, strict=True):
+        assert sink.stage(record, attachments=bundle).ok
+    return receipt.model_dump(), row, bundles
+
+
+def _media_finalizer(tq_client, **overrides) -> RolloutReassembler:
+    kwargs = dict(
+        partition_id=MEDIA_CANONICAL_PARTITION,
+        staging_partition=MEDIA_STAGING_PARTITION,
+        pad_token_id=PAD,
+        max_seq_len=4096,
+        capture_media=True,
+    )
+    kwargs.update(overrides)
+    if kwargs["capture_media"]:
+        kwargs.setdefault("media_columns", MEDIA_COLUMNS)
+    return RolloutReassembler(tq_client, **kwargs)
+
+
+def test_media_finalizer_requires_the_media_column_spec(tq_client, media_partitions):
+    """The spec is what empty media rows are minted from, so a media run
+    cannot be built without it (the sink refuses a missing dtype the same way)."""
+    with pytest.raises(ValueError, match="media_columns"):
+        _media_finalizer(tq_client, media_columns=None)
+
+
+def _assert_staging_cleared(tq_client, staging_keys: list[str]) -> None:
+    source = TQTokenSource(
+        tq_client, staging_partition=MEDIA_STAGING_PARTITION, capture_media=True
+    )
+    for key in staging_keys:
+        with pytest.raises(KeyError):
+            source.fetch_for_finalization([key])
+
+
+@pytest.mark.parametrize(
+    ("case", "pixel_dtype"),
+    [
+        ("attached", torch.bfloat16),
+        ("attached", torch.float32),
+        ("two-call-chain", torch.bfloat16),
+        ("no-media-tensors", torch.bfloat16),
+    ],
+    ids=["attached-bf16", "attached-f32", "two-call-chain", "no-media-tensors"],
+)
+def test_finalize_rollout_media(tq_client, media_partitions, case, pixel_dtype):
+    """Media on the call rows: each call's row says whether it carries media,
+    the per-call deltas are concatenated along the chain, and the packed-patch
+    layout (and dtype) is handed to the trainer unchanged (one frame per still
+    image)."""
+    receipt, expected, bundles = _stage_media_rollout(
+        tq_client,
+        "mm",
+        media=case != "no-media-tensors",
+        second_turn=case == "two-call-chain",
+        pixel_dtype=pixel_dtype,
+    )
+
+    row = _media_finalizer(tq_client).finalize_rollout("mm", receipt, reward=1.0)
+
+    assert row.valid, row.rejection_reason
+    assert row.token_ids == expected.token_ids
+    # Media rides the call rows: no extra staging key to clean up.
+    assert row.staging_keys == [r["staging_key"] for r in receipt["manifest"]]
+    if case == "no-media-tensors":
+        assert row.media is None  # text rollout on a media partition
+        return
+    assert set(row.media) == {"pixel_values", "imgs_sizes", "num_frames"}
+    expected_pixels = torch.cat([bundle["imgs"] for bundle in bundles], dim=1)
+    pixels = row.media["pixel_values"].as_tensor()
+    # [1, total_patches, F] squeezed to [total_patches, F]; 4 patches per image.
+    assert pixels.shape == (4 * len(bundles), 3 * MEDIA_PATCH**2)
+    assert pixels.dtype == pixel_dtype
+    assert torch.equal(pixels, expected_pixels.squeeze(0))
+    assert row.media["imgs_sizes"].as_tensor().tolist() == [[4, 4]] * len(bundles)
+    assert row.media["num_frames"].as_tensor().tolist() == [1] * len(bundles)
+
+
+def test_megatron_capture_two_turn_media_finalizes_to_the_engine_pixels(
+    tq_client, media_partitions, prefix_stitching_fields
+):
+    """Stager -> preparer -> stager -> finalizer with real media: each call
+    stages only the images new to it, and the finalized row carries the
+    engine's pixels once each, in prompt order. Images differ in size so a
+    fixed per-image cut in the slicer would also fail."""
+    # Deferred import: megatron-core is a heavy, optional dependency.
+    from megatron.core.inference.inference_request import (
+        PREFIX_EOS_TOKEN_ID_FIELD,
+        PREFIX_TEMPLATE_TOKEN_IDS_FIELD,
+    )
+
+    from nemo_rl.models.generation.megatron.token_capture import (
+        TQMegatronPromptPreparer,
+        TQMegatronTokenStager,
+    )
+
+    media_count_field, _ = prefix_stitching_fields
+    rollout_id = "minf-mm-e2e"
+    image1_patches, image2_patches = 4, 2  # 4x4 and 2x4 images, patch 2
+    engine_imgs = torch.arange(
+        (image1_patches + image2_patches) * 12, dtype=torch.float32
+    ).reshape(1, image1_patches + image2_patches, 12)
+    engine_sizes = torch.tensor([[4, 4], [2, 4]], dtype=torch.int32)
+    sink = TQTokenSink(
+        tq_client,
+        staging_partition=MEDIA_STAGING_PARTITION,
+        capture_media=True,
+        media_pixel_dtype=torch.float32,
+    )
+    stager = TQMegatronTokenStager(sink)
+    preparer = TQMegatronPromptPreparer(
+        TQTokenSource(
+            tq_client, staging_partition=MEDIA_STAGING_PARTITION, capture_media=True
+        )
+    )
+
+    def stage(call_id, prompt, generated, media_tensors, offload_params):
+        result = stager.stage(
+            f"minf-{call_id}",
+            SimpleNamespace(
+                prompt_token_ids=prompt,
+                generated_token_ids=generated,
+                generated_log_probs=[-0.5] * len(generated),
+                media_tensors=media_tensors,
+            ),
+            finished_metadata=SimpleNamespace(policy_epoch=[(0, 3)]),
+            offload_params=offload_params,
+        )
+        coords = result.response_metadata["ng_commit_coords"]
+        assert coords["disposition"] == "staged", coords
+        return coords
+
+    root = nemo_gym.CaptureAdmission(
+        rollout_id=rollout_id, model_call_id="c1", mode="text"
+    )
+    c1 = stage(
+        "c1",
+        [80, 99, 99, 99, 81],
+        [12, 2],
+        {"imgs": engine_imgs[:, :image1_patches], "imgs_sizes": engine_sizes[:1]},
+        {"ng_capture": root.model_dump(mode="json")},
+    )
+    child = nemo_gym.CaptureAdmission(
+        rollout_id=rollout_id,
+        model_call_id="c2",
+        parent_call_id="c1",
+        prev_len=c1["cum_len"],
+        mode="token_in",
+        staging_chain=[c1["staging_key"]],
+        parent_chain_hash=c1["chain_hash"],
+    )
+    prepared = preparer.prepare_prompt(
+        [80, 99, 81, 13, 2, 20, 99, 21],
+        offload_params={
+            "ng_capture": child.model_dump(mode="json"),
+            PREFIX_TEMPLATE_TOKEN_IDS_FIELD: [80, 99, 81, 13, 2],
+            PREFIX_EOS_TOKEN_ID_FIELD: [2],
+            media_count_field: 1,
+        },
+    )
+    c2 = stage(
+        "c2",
+        [80, 99, 99, 99, 81, 12, 2, 20, 99, 99, 21],
+        [30, 2],
+        {"imgs": engine_imgs, "imgs_sizes": engine_sizes},
+        prepared.offload_params,
+    )
+
+    manifest = [
+        CallRecord(
+            **{name: c[name] for name in CallRecord.model_fields if name in c},
+            mode="text" if c["parent_call_id"] is None else "token_in",
+            response_id=f"chatcmpl-{c['model_call_id']}",
+        )
+        for c in (c1, c2)
+    ]
+    receipt = RolloutReceipt(
+        rollout_id=rollout_id,
+        terminal_model_call_id="c2",
+        manifest=manifest,
+        terminal_selection="declared",
+    )
+    row = _media_finalizer(tq_client).finalize_rollout(
+        rollout_id, receipt.model_dump(), reward=1.0
+    )
+
+    assert row.valid, row.rejection_reason
+    assert row.token_ids == [80, 99, 99, 99, 81, 12, 2, 20, 99, 99, 21, 30, 2]
+    pixels = row.media["pixel_values"].as_tensor()
+    assert pixels.dtype == torch.float32
+    assert torch.equal(pixels, engine_imgs.squeeze(0))
+    assert row.media["imgs_sizes"].as_tensor().tolist() == [[4, 4], [2, 4]]
+    assert row.media["num_frames"].as_tensor().tolist() == [1, 1]
+
+
+def test_finalize_group_publishes_media_with_empty_rows_for_text_siblings(
+    tq_client, media_partitions
+):
+    group_id = "mmgrp"
+    rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
+    receipt, _, [bundle] = _stage_media_rollout(tq_client, rollout_ids[0])
+
+    finalized = _media_finalizer(tq_client).finalize_group(
+        group_id,
+        rollout_ids,
+        [receipt, None],  # sibling lost its receipt -> placeholder without media
+        [1.0, 0.0],
+        mask_sample=[False, False],
+        fallback_weight_version=4,
+        prompt_idx=3,
+    )
+
+    assert not finalized.dropped
+    assert finalized.meta is not None
+    assert finalized.metrics["finalize/media_row_rate"] == 1.0
+    assert {"pixel_values", "imgs_sizes", "num_frames"} <= set(finalized.meta.fields)
+    tags = finalized.meta.tags
+    assert tags[0][row_shapes_key("pixel_values")]["shapes"] == [[4, 12]]
+    # Text siblings still carry the companion tag, with no segments to rebuild.
+    assert tags[1][row_shapes_key("pixel_values")]["shapes"] == []
+
+    rows = tq_client.get_samples(
+        sample_ids=rollout_ids,
+        partition_id=MEDIA_CANONICAL_PARTITION,
+        select_fields=["input_ids", "pixel_values", "imgs_sizes", "num_frames"],
+    )
+    fields = {
+        name: rows.get(name) for name in ("pixel_values", "imgs_sizes", "num_frames")
+    }
+    reassemble_packed_multimodal(fields, tags)
+    pixels = fields["pixel_values"]
+    assert isinstance(pixels, PackedTensor)
+    assert pixels.logical_segment_counts_by_row() == [1, 0]
+    assert torch.equal(pixels.as_tensor(), bundle["imgs"].squeeze(0))
+    assert fields["imgs_sizes"].as_tensor().tolist() == [[4, 4]]
+    assert fields["num_frames"].as_tensor().tolist() == [1]
+
+    # The call row (tokens and media columns alike) was cleared after publishing.
+    _assert_staging_cleared(tq_client, [receipt["manifest"][0]["staging_key"]])
+
+
+@pytest.mark.parametrize(
+    ("case", "capture_media"),
+    [
+        ("all-placeholders", True),
+        ("valid-text-row", True),
+        ("all-placeholders", False),
+    ],
+    ids=["media-all-placeholders", "media-valid-text-row", "text-all-placeholders"],
+)
+def test_finalize_group_without_any_media_row_publishes_empty_media_rows(
+    tq_client, media_partitions, case, capture_media
+):
+    """A media capture run publishes a group whose valid rows carry no media
+    with empty media rows in the partition's pinned geometry.
+
+    Without them the group would land in the canonical partition without the
+    media columns; TransferQueue answers a batch fetch with only the fields
+    every requested key produced, so a train shard mixing its keys with media
+    keys would lose ``pixel_values`` for the media rows too and run
+    image-blind. The empty rows are zero-row segments, not segment-less rows:
+    the latter ship nothing, so the column would still be absent. Text-only
+    runs (``capture_media=False``) publish no media columns at all.
+    """
+    group_id = f"mm-empty-{case}-{capture_media}"
+    rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
+    if case == "valid-text-row":
+        # A staged rollout whose engine payload carried no media: valid, but text.
+        receipt, _, _ = _stage_media_rollout(tq_client, rollout_ids[0], media=False)
+        receipts = [receipt, None]
+    else:
+        receipts = [None, None]  # every rollout poisoned -> placeholders only
+
+    finalized = _media_finalizer(tq_client, capture_media=capture_media).finalize_group(
+        group_id,
+        rollout_ids,
+        receipts,
+        [1.0, 0.0],
+        mask_sample=[False, False],
+        fallback_weight_version=4,
+        prompt_idx=3,
+    )
+
+    assert not finalized.dropped
+    assert finalized.meta is not None
+    assert finalized.meta.sample_ids == rollout_ids
+    assert "finalize/group_dropped" not in finalized.metrics
+    if not capture_media:
+        assert set(finalized.meta.fields).isdisjoint(WIRE_MULTIMODAL_FIELDS)
+        return
+
+    assert finalized.metrics["finalize/media_row_rate"] == 0.0
+    assert {"pixel_values", "imgs_sizes", "num_frames"} <= set(finalized.meta.fields)
+    feature_dim = 3 * MEDIA_PATCH**2
+    tags = finalized.meta.tags
+    for tag in tags:
+        assert tag[row_shapes_key("pixel_values")]["shapes"] == [[0, feature_dim]]
+    if case == "valid-text-row":
+        # Published like any other group: the staged call rows are released.
+        _assert_staging_cleared(
+            tq_client, [r["staging_key"] for r in receipts[0]["manifest"]]
+        )
+
+    rows = tq_client.get_samples(
+        sample_ids=rollout_ids,
+        partition_id=MEDIA_CANONICAL_PARTITION,
+        select_fields=["input_ids", "pixel_values", "imgs_sizes", "num_frames"],
+    )
+    fields = {
+        name: rows.get(name) for name in ("pixel_values", "imgs_sizes", "num_frames")
+    }
+    reassemble_packed_multimodal(fields, tags)
+    pixels = fields["pixel_values"]
+    assert isinstance(pixels, PackedTensor)
+    assert pixels.logical_segment_counts_by_row() == [1, 1]
+    # Rebuilds as a zero-row tensor in the pinned dtype and patch width, which
+    # the Omni model treats as "no images" (``images.numel() > 0`` gate).
+    dense = pixels.as_tensor()
+    assert dense.shape == (0, feature_dim)
+    assert dense.dtype == MEDIA_PIXEL_DTYPE
+    assert fields["imgs_sizes"].as_tensor().shape == (0, 2)
+    assert fields["num_frames"].as_tensor().shape == (0,)
+
+
+def test_all_text_group_shares_a_train_fetch_with_a_media_group(
+    tq_client, media_partitions
+):
+    """The point of the empty rows: keys of an all-text group and a media
+    group fetched together return every media column (no TQ narrowing), and
+    the rebuilt ``pixel_values`` carries exactly the media group's pixels."""
+    text_ids = ["mm-mixed-text_g0", "mm-mixed-text_g1"]
+    media_ids = ["mm-mixed-media_g0", "mm-mixed-media_g1"]
+    text_receipt, _, _ = _stage_media_rollout(tq_client, text_ids[0], media=False)
+    media_receipt, _, bundles = _stage_media_rollout(tq_client, media_ids[0])
+    finalizer = _media_finalizer(tq_client)
+    finalize = dict(mask_sample=[False, False], fallback_weight_version=4, prompt_idx=3)
+    text_group = finalizer.finalize_group(
+        "mm-mixed-text", text_ids, [text_receipt, None], [1.0, 0.0], **finalize
+    )
+    media_group = finalizer.finalize_group(
+        "mm-mixed-media", media_ids, [media_receipt, None], [1.0, 0.0], **finalize
+    )
+    assert not text_group.dropped and not media_group.dropped
+
+    sample_ids = text_ids + media_ids
+    rows = tq_client.get_samples(
+        sample_ids=sample_ids,
+        partition_id=MEDIA_CANONICAL_PARTITION,
+        select_fields=["input_ids", "pixel_values", "imgs_sizes", "num_frames"],
+    )
+    fields = {
+        name: rows.get(name) for name in ("pixel_values", "imgs_sizes", "num_frames")
+    }
+    tags = list(text_group.meta.tags) + list(media_group.meta.tags)
+    reassemble_packed_multimodal(fields, tags)
+    pixels = fields["pixel_values"]
+    # Empty rows hold one zero-row segment; the media row one image; the media
+    # group's placeholder sibling none (padded by _media_fields_for_group).
+    assert pixels.logical_segment_counts_by_row() == [1, 1, 1, 0]
+    assert torch.equal(pixels.as_tensor(), bundles[0]["imgs"].squeeze(0))
+    assert fields["imgs_sizes"].as_tensor().tolist() == [[4, 4]]
+    assert fields["num_frames"].as_tensor().tolist() == [1]

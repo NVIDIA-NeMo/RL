@@ -1299,6 +1299,14 @@ class TQDataPlaneClient(DataPlaneClient):
             partition_id=partition_id,
             select_fields=select_fields,
         )
+        missing = [name for name in select_fields if name not in td.keys()]
+        if missing:
+            raise KeyError(
+                f"TransferQueue returned no {missing} column(s) for a fetch of "
+                f"{len(sample_ids)} keys on partition {partition_id!r}: at least "
+                "one requested key never produced them, and TQ narrows a batch "
+                "fetch to the fields shared by every key instead of failing"
+            )
         return _from_wire(td)
 
     def list_sample_ids(self, partition_id: str) -> list[str]:

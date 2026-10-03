@@ -29,6 +29,7 @@ RefitPayloadMode = Literal["hf_export", "logical_weights"]
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
+    from nemo_rl.data.captured_media import MediaColumnSpec
     from nemo_rl.data_plane.interfaces import DataPlaneConfig
 
 # Routed-expert index tensors ([seq, layers, topk]) are carried in the narrowest
@@ -411,6 +412,27 @@ class CollectiveSenderSpec:
     num_buffers: int | None = None
 
 
+def agreed_media_columns(
+    reported: list["Optional[MediaColumnSpec]"],
+) -> "Optional[MediaColumnSpec]":
+    """The one media column spec the capture workers pinned, or ``None``.
+
+    Each ``setup_token_capture`` fan-out target reports the spec it pinned its
+    staging media column to (``None`` from text-only workers and ranks that
+    host no capture). The reassembler mints empty media rows from this spec,
+    so two workers disagreeing would publish two pixel dtypes or widths into
+    one column; that is refused here, at setup, rather than found by
+    TransferQueue mid-run.
+    """
+    specs = {spec for spec in reported if spec is not None}
+    if len(specs) > 1:
+        raise RuntimeError(
+            "capture workers pinned different media column specs: "
+            f"{sorted(map(str, specs))}"
+        )
+    return next(iter(specs), None)
+
+
 def reject_unenforceable_refit_deadline(
     backend: str, refit_timeout_s: Optional[float]
 ) -> None:
@@ -618,7 +640,7 @@ class GenerationInterface(ABC):
         staging_partition: str,
         *,
         capture_media: bool = False,
-    ) -> None:
+    ) -> "Optional[MediaColumnSpec]":
         """Install token capture in the serving workers (``token_capture.enabled``).
 
         Declared here for the same reason as :meth:`attach_fleet_health`: the
@@ -628,8 +650,15 @@ class GenerationInterface(ABC):
         Args:
             dp_cfg: Data-plane config the workers use to build their in-worker client.
             staging_partition: Data-plane partition that captured rows are staged in.
-            capture_media: Also stage the processed VLM media each call ran on
-                beside its token delta (vLLM only; see ``MEDIA_STAGING_FIELDS``).
+            capture_media: Whether the staging partition carries media columns and
+                the workers must stage the media the engine consumed beside each
+                call's tokens.
+
+        Returns:
+            With ``capture_media``, the pixel dtype and patch size the workers
+            pinned the staging media column to (every worker reports the same
+            spec); the reassembler publishes empty media rows in that geometry
+            for groups without media. ``None`` for text-only capture.
         """
         raise NotImplementedError(
             f"token_capture.enabled is not supported for {type(self).__name__}"

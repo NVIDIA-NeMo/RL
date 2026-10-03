@@ -1008,10 +1008,10 @@ class AsyncNemoGymRolloutImpl:
             on_completion=on_completion,
             recovery_granularity=recovery_granularity,
         )
-        # Token-capture receipt rows carry empty message logs by design — the
-        # canonical row (and any media it needs) is rebuilt by the finalizer
-        # from the capture ledger, so there is nothing here to attach media to
-        # and the fewer-user-turns guard would reject every receipt group.
+        # Token-capture receipt rows carry empty message logs by design: the
+        # finalizer rebuilds the canonical row (and its media) from the capture
+        # ledger, and attach_static_multimodal_payload's fewer-user-turns guard
+        # would reject every receipt group.
         receipt_mode = bool(completions) and "ng_receipt" in (
             completions[0].env_extras or {}
         )

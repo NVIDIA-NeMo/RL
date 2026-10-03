@@ -306,8 +306,8 @@ def _register_single_controller_partitions(
     """Warm all SingleController partitions before concurrent data-plane use.
 
     VLM token capture (``include_multimodal_fields`` with capture enabled) adds
-    the media columns the vLLM worker stages beside each captured call to the
-    staging partition.
+    the media columns the generation workers (vLLM or Megatron Inference) stage
+    beside each captured call to the staging partition.
     """
     algo_cfg = algo_config(master_config)
     policy_config = master_config.policy
@@ -1204,11 +1204,6 @@ def setup_single_controller(
     token_capture_cfg = master_config.token_capture
     capture_media = token_capture_cfg.enabled and processor is not None
     if capture_media:
-        if generation_config["backend"] != "vllm":
-            raise NotImplementedError(
-                "VLM media token capture is only implemented for the vLLM "
-                f"generation backend; got {generation_config['backend']!r}"
-            )
         if not uses_image_placeholder(processor):
             raise ValueError(
                 "VLM token capture currently supports Omni dynamic images and native video"
@@ -1264,16 +1259,24 @@ def setup_single_controller(
                 "token_capture.enabled supports vllm or megatron; got "
                 f"{generation_config['backend']!r}"
             )
-        generation_config_dict = cast(dict[str, Any], generation_config)
         if (
-            generation_config["backend"] == "vllm"
-            and not generation_config_dict["vllm_cfg"]["async_engine"]
+            capture_media
+            and not is_ppo_run(master_config)
+            and master_config.grpo.deduplicate_multimodal_data
         ):
             raise ValueError(
-                "token_capture.enabled requires "
-                "policy.generation.vllm_cfg.async_engine=true (the capture "
-                "host is the worker's in-process HTTP server)"
+                "token_capture.enabled does not support "
+                "grpo.deduplicate_multimodal_data=true: capture rows carry "
+                "their own media"
             )
+        generation_config_dict = cast(dict[str, Any], generation_config)
+        if generation_config["backend"] == "vllm":
+            if not generation_config_dict["vllm_cfg"]["async_engine"]:
+                raise ValueError(
+                    "token_capture.enabled requires "
+                    "policy.generation.vllm_cfg.async_engine=true (the capture "
+                    "host is the worker's in-process HTTP server)"
+                )
         if generation_config["backend"] == "megatron":
             if not generation_config_dict["mcore_generation_config"][
                 "expose_http_server"
@@ -1931,14 +1934,18 @@ def setup_single_controller(
             partition_id=partition_id,
             include_multimodal_fields=processor is not None,
         )
+    media_columns = None
     if token_capture_cfg.enabled:
-        # Both active backends stage canonical Gym rows in serving workers;
-        # only vLLM workers stage captured media beside them (capture_media).
-        generation.setup_token_capture(
+        media_columns = generation.setup_token_capture(
             dp_config,
             token_capture_cfg.staging_partition,
             capture_media=capture_media,
         )
+        if capture_media and media_columns is None:
+            raise RuntimeError(
+                "media capture is enabled but no serving worker reported the "
+                "media column spec it pinned the staging column to"
+            )
         generation.set_rollout_weight_version(0)
 
     if weight_synchronizer is None:
@@ -2002,6 +2009,7 @@ def setup_single_controller(
                 defer_routed_experts_to_policy=token_capture_cfg.defer_routed_experts_to_policy,
                 max_seq_len=_generation_max_seq_len(generation_config),
                 capture_media=capture_media,
+                media_columns=media_columns,
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,
         )
