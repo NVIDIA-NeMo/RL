@@ -87,6 +87,15 @@ class CapturedRequest:
     media: CapturedMedia | None
 
 
+# Substrings of the error text vLLM raises when a request does not fit the
+# model's context window. vLLM gives this case no structured code, so the text
+# is matched: "context length" is the wording of the ValueError that
+# get_max_tokens raises in vllm/entrypoints/serve/utils/api_utils.py (vLLM
+# 0.29.0, the pinned release). This module's own prompt-length pre-check raises
+# VLLMValidationError, which is converted by type rather than by marker.
+CONTEXT_OVERFLOW_ERROR_MARKERS = ("context length",)
+
+
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_abort
 
 
@@ -1395,18 +1404,28 @@ class VllmAsyncGenerationWorkerImpl(
                 generator = await openai_serving_chat.create_chat_completion(
                     request, raw_request
                 )
-            except VLLMValidationError as e:
+            except (VLLMValidationError, ValueError) as e:
                 # vLLM raises VLLMValidationError for prompts exceeding
-                # max_model_len during tokenization, instead of returning an
-                # ErrorResponse. Convert to HTTP 400 so the Gym proxy can
-                # detect context-length overflow and handle it gracefully.
+                # max_model_len during tokenization and a plain ValueError when
+                # the prompt alone fills the window (see
+                # CONTEXT_OVERFLOW_ERROR_MARKERS). Neither is returned as an
+                # ErrorResponse, so without this they reach the client as HTTP
+                # 500. Convert them to HTTP 400 so the Gym proxy can detect
+                # context-length overflow and handle it gracefully. Any other
+                # ValueError is an engine error and propagates as before.
+                is_context_overflow = any(
+                    marker in str(e) for marker in CONTEXT_OVERFLOW_ERROR_MARKERS
+                )
+                if not isinstance(e, VLLMValidationError) and not is_context_overflow:
+                    worker_self._abort_request_capture(request, reason="engine_error")
+                    raise
                 worker_self._abort_request_capture(request, reason="context_length")
                 return JSONResponse(
                     content={
                         "error": {
                             "message": str(e),
                             "type": "invalid_request_error",
-                            "param": e.parameter,
+                            "param": getattr(e, "parameter", None),
                             "code": 400,
                         }
                     },
