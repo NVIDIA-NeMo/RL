@@ -32,8 +32,7 @@ from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.nemo_gym import (
     NemoGym,
     NemoGymConfig,
-    get_nemo_gym_uv_cache_dir,
-    get_nemo_gym_venv_dir,
+    apply_nemo_gym_uv_dirs,
 )
 from nemo_rl.utils.config import load_config
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
@@ -70,12 +69,7 @@ def prefetch_nemo_gym_venvs(config_paths: list[str]) -> None:
 
             nemo_gym_dict = dict(config["env"]["nemo_gym"])
             nemo_gym_dict["dry_run"] = True
-            uv_cache_dir = get_nemo_gym_uv_cache_dir()
-            if uv_cache_dir is not None:
-                nemo_gym_dict.setdefault("uv_cache_dir", uv_cache_dir)
-            uv_venv_dir = get_nemo_gym_venv_dir()
-            if uv_venv_dir is not None:
-                nemo_gym_dict.setdefault("uv_venv_dir", uv_venv_dir)
+            apply_nemo_gym_uv_dirs(nemo_gym_dict)
 
             nemo_gym_cfg = NemoGymConfig(
                 model_name="dummy-model",
