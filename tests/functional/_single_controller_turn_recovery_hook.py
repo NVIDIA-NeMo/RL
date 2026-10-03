@@ -29,6 +29,7 @@ recovered run can be compared without adding a production debug-data path.
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -43,6 +44,14 @@ from _gym_prefix_recovery_parity import (
     append_training_batch,
     serialize_training_batch,
 )
+
+
+def _append_timed_event(events_path: Path, event: str, **fields: Any) -> None:
+    """Append one event stamped with wall time.
+
+    Wall time lets parity reports place each rollout on a per-run timeline.
+    """
+    append_event(events_path, event, time_s=time.time(), **fields)
 
 
 class _TrainingPayloadRecorder:
@@ -192,7 +201,7 @@ class _InstrumentedNemoGymRolloutImpl:
         def _record_submission(event: str, submitted: list[int]) -> None:
             # By group ID: a row re-sent after a broken stream has a new rollout ID.
             refreshed = self._recovery_ledger.get_group(group.group_id)
-            append_event(
+            _append_timed_event(
                 self._events_path,
                 event,
                 **common,
@@ -202,9 +211,16 @@ class _InstrumentedNemoGymRolloutImpl:
             )
 
         async def _record_completion(generation_index: int, completion: Any) -> None:
+            # Gym returned the rollout; ``completion`` below marks the ledger seal.
+            _append_timed_event(
+                self._events_path,
+                "completion_arrived",
+                **common,
+                generation_index=generation_index,
+            )
             await on_completion(generation_index, completion)
             refreshed = self._recovery_ledger.get_group(group.group_id)
-            append_event(
+            _append_timed_event(
                 self._events_path,
                 "completion",
                 **common,
@@ -222,7 +238,7 @@ class _InstrumentedNemoGymRolloutImpl:
                 dispatch_recorder, record=_record_submission
             ),
         )
-        append_event(self._events_path, "rollout_returned", **common)
+        _append_timed_event(self._events_path, "rollout_returned", **common)
         return result
 
 
