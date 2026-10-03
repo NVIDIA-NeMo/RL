@@ -96,6 +96,7 @@ from nemo_rl.telemetry.instrumentation import (
     dispatch_with_trace_context,
     in_per_prompt_scope,
 )
+from nemo_rl.utils.sampling_seed import derive_sampling_seed
 from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
@@ -1118,6 +1119,13 @@ class AsyncNemoGymRolloutImpl:
         for i in indices:
             row = copy.deepcopy(template_row)
             row["_rowidx"] = i
+            if "sampling_seed" in input_sample:
+                params = row["responses_create_params"]
+                metadata = dict(params.get("metadata") or {})
+                metadata["sampling_seed"] = str(
+                    derive_sampling_seed(input_sample["sampling_seed"], i)
+                )
+                params["metadata"] = metadata
             row[NEMO_GYM_GROUP_ID_KEY] = group_id
             row[NEMO_GYM_GROUP_ATTEMPT_KEY] = group_attempt
             row[NEMO_GYM_ROLLOUT_INDEX_KEY] = i

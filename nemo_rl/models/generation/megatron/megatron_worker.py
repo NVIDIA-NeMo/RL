@@ -226,6 +226,11 @@ def _apply_optional_inference_config_kwargs(
     mcore_generation_config: dict[str, Any],
 ) -> None:
     """Forward configured optional MCore inference settings with validated types."""
+    if "sampling_backend" in mcore_generation_config:
+        backend = mcore_generation_config["sampling_backend"]
+        if backend not in ("torch", "flashinfer"):
+            raise ValueError("sampling_backend must be 'torch' or 'flashinfer'")
+        inference_config_kwargs["sampling_backend"] = backend
     enum_fields = {
         "cuda_graph_sizing_distribution": CudaGraphSizingDistribution,
         "async_sched_mode": AsyncScheduleMode,
