@@ -27,6 +27,16 @@ set -eoux pipefail
 # Record job-start epoch so Python can measure pre-Python overhead
 export NRL_JOB_START_EPOCH=$(date +%s.%N)
 
+# flash-linear-attention's tilelang backend miscompiles on GB300 (sm_103): the
+# chunk_bwd_dqkwg backward kernel dies with a misaligned-address CUDA error.
+# On that architecture alone, disabling it makes fla's dispatcher fall through
+# to its Triton kernels for the linear-attention layers. The check runs here,
+# on the first compute node, because the submitting wrapper runs on a login
+# node without nvidia-smi; every other architecture keeps fla's defaults.
+if nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | grep -qx "10.3"; then
+    export FLA_TILELANG=${FLA_TILELANG:-0}
+fi
+
 # Log a timestamped, seconds-since-job-start marker at each phase boundary.
 log_phase() {
   echo "[NRL_PHASE][$(date '+%Y-%m-%dT%H:%M:%S%z')][+$(( $(date +%s) - ${NRL_JOB_START_EPOCH%.*} ))s] $*"
