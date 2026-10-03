@@ -3,7 +3,7 @@
 """Combine explicit model roles with Ray's node and CPU actor inventory."""
 
 import asyncio
-from collections import Counter, defaultdict
+from collections import Counter
 from typing import Any
 
 from nemo_rl.distributed.placement_report import NodePlacement, render_placement
@@ -16,24 +16,27 @@ def build_placement_snapshot(
     actors: list[dict[str, Any]],
     roles: dict[str, dict[str, tuple[int, ...]]],
 ) -> list[NodePlacement]:
-    devices: dict[str, dict[int, list[str]]] = defaultdict(lambda: defaultdict(list))
+    devices: dict[str, dict[int, list[str]]] = {}
     for role, placement in roles.items():
         for node_id, gpu_ids in placement.items():
             for gpu_id in gpu_ids:
-                devices[node_id][gpu_id].append(role)
-    cpu: dict[str, Counter[str]] = defaultdict(Counter)
+                devices.setdefault(node_id, {}).setdefault(gpu_id, []).append(role)
+    cpu: dict[str, Counter[str]] = {}
     for actor in actors:
         resources = actor["required_resources"]
         if not any(
             (key == "GPU" or key.startswith("GPU_group_")) and value > 0
             for key, value in resources.items()
         ):
-            cpu[actor["node_id"]][actor["name"] or actor["class_name"]] += 1
+            cpu.setdefault(actor["node_id"], Counter())[
+                actor["name"] or actor["class_name"]
+            ] += 1
     result = []
     for node in nodes:
         if not node["Alive"]:
             continue
         node_id = node["NodeID"]
+        node_devices = devices.get(node_id, {})
         resources = node["Resources"]
         labels = node.get("Labels", {})
         domain = labels.get(LABEL_PREFIX + "nvlink-domain") or next(
@@ -53,8 +56,8 @@ def build_placement_snapshot(
             tuple(int(gpu) for gpu in inventory.split(".") if gpu) if capacity else ()
         )
         if not inventory and capacity:
-            gpu_ids = tuple(sorted(devices[node_id]))
-        if len(gpu_ids) > capacity or not set(devices[node_id]).issubset(gpu_ids):
+            gpu_ids = tuple(sorted(node_devices))
+        if len(gpu_ids) > capacity or not set(node_devices).issubset(gpu_ids):
             raise ValueError(
                 f"GPU inventory disagrees with placement on {node['NodeManagerHostname']}"
             )
@@ -66,11 +69,11 @@ def build_placement_snapshot(
                 topo_rank=rank,
                 gpu_ids=gpu_ids,
                 gpu_roles={
-                    gpu: tuple(assigned) for gpu, assigned in devices[node_id].items()
+                    gpu: tuple(assigned) for gpu, assigned in node_devices.items()
                 },
                 cpu_actors=tuple(
                     f"{name} x{count}" if count > 1 else name
-                    for name, count in sorted(cpu[node_id].items())
+                    for name, count in sorted(cpu.get(node_id, Counter()).items())
                 ),
                 advertised_gpus=capacity,
             )
