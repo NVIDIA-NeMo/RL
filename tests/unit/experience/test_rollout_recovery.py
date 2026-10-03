@@ -2152,3 +2152,52 @@ def test_a_prompt_group_cannot_replace_one_dropped_sibling() -> None:
                 cut, "g7", generation_indices=[1]
             )
         )
+
+
+def test_gym_episodes_still_held_looks_up_only_live_current_attempts() -> None:
+    ledger = RolloutRecoveryLedger()
+    group = _dispatched_turn_group(ledger)
+    first, second = group.gym_episode(0), group.gym_episode(1)
+    # Sibling 1's stream broke: its old attempt is abandoned and re-minted.
+    _mutate(
+        lambda cut: ledger.replace_dropped_dispatch(cut, "g7", generation_indices=[1])
+    )
+
+    held = ledger.gym_episodes_still_held(
+        {
+            "tools/replica-0": [
+                first,
+                second,
+                GymCheckpointEpisode("not-a-rollout-id", 0),
+            ],
+            "tools/replica-1": [first],
+        }
+    )
+
+    assert held == {"tools/replica-0": {first}, "tools/replica-1": set()}
+    # It agrees with the full inventory it stands in for.
+    inventory = ledger.gym_checkpoint_inventory({"tools/replica-0", "tools/replica-1"})
+    assert held["tools/replica-0"] == set(inventory["tools/replica-0"]) & {
+        first,
+        second,
+    }
+
+
+def test_an_abandoned_episode_is_not_held_by_its_redispatched_replacement() -> None:
+    """The on-wire reply drain must not wait on an episode a re-send replaced."""
+    ledger = RolloutRecoveryLedger()
+    group = _dispatched_turn_group(ledger)
+    old = group.gym_episode(1)
+    _mutate(
+        lambda cut: ledger.replace_dropped_dispatch(cut, "g7", generation_indices=[1])
+    )
+    _mutate(
+        lambda cut: ledger.mark_group_dispatched(
+            cut, "g7", generation_indices=[1], gym_instance_id="tools/replica-0"
+        )
+    )
+    new = ledger.get_group("g7").gym_episode(1)
+
+    held = ledger.gym_episodes_still_held({"tools/replica-0": [old, new]})
+
+    assert held == {"tools/replica-0": {new}}
