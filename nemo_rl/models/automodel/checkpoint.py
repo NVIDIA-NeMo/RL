@@ -459,3 +459,113 @@ class AutomodelCheckpointManager:
                 weights_path=optimizer_path,
                 scheduler=scheduler,
             )
+            _verify_optimizer_state_restored(optimizer, optimizer_path)
+
+
+def _optimizer_state_summary(optimizer: torch.optim.Optimizer) -> dict[str, Any]:
+    """Summarize what an optimizer holds after a checkpoint load.
+
+    Returns the number of per-parameter state entries, the largest step counter found on the param
+    groups or in the per-parameter state (both conventions exist: torch Adam keeps ``step`` per
+    parameter, Transformer Engine FusedAdam keeps it on the group), and the root-mean-square of the
+    second moments.
+    """
+
+    def _as_int(value: Any) -> int:
+        return int(value.item()) if hasattr(value, "item") else int(value)
+
+    num_states = 0
+    sq_sum = 0.0
+    sq_numel = 0
+    steps: list[int] = []
+    for group in optimizer.param_groups:
+        if group.get("step") is not None:
+            steps.append(_as_int(group["step"]))
+    for state in optimizer.state.values():
+        if not isinstance(state, Mapping) or not state:
+            continue
+        num_states += 1
+        if state.get("step") is not None:
+            steps.append(_as_int(state["step"]))
+        second = state.get("exp_avg_sq")
+        if second is not None:
+            local = getattr(second, "_local_tensor", second).detach().float()
+            sq_sum += float((local * local).sum())
+            sq_numel += local.numel()
+    return {
+        "num_states": num_states,
+        "max_step": max(steps) if steps else 0,
+        "exp_avg_sq_rms": (sq_sum / sq_numel) ** 0.5 if sq_numel else 0.0,
+    }
+
+
+def _saved_optimizer_state_summary(optimizer_path: str) -> Optional[dict[str, Any]]:
+    """Describe what the optimizer checkpoint on disk contains, from DCP metadata only.
+
+    Returns ``None`` when the metadata cannot be read, so the caller falls back to checking the
+    optimizer alone. Keys are the flattened state-dict keys written by the Automodel Checkpointer
+    (``optim.state.<param>.<field>`` and ``optim.param_groups.<i>.<field>``).
+    """
+    try:
+        metadata = dcp.FileSystemReader(
+            os.path.join(optimizer_path, "optim")
+        ).read_metadata()
+    except Exception as exc:
+        # Metadata missing or unreadable: nothing to compare against.
+        print(
+            f"Could not read optimizer checkpoint metadata at {optimizer_path}: {exc}"
+        )
+        return None
+    keys = list(metadata.state_dict_metadata.keys())
+    state_keys = [k for k in keys if k.startswith("optim.state.")]
+    return {
+        "num_state_keys": len(state_keys),
+        "has_step": any(k.endswith(".step") for k in keys),
+    }
+
+
+def _verify_optimizer_state_restored(
+    optimizer: torch.optim.Optimizer, optimizer_path: str
+) -> None:
+    """Refuse to continue from a resume that left the optimizer fresh.
+
+    A DCP load reads only the keys present in the load template. When the template does not match
+    what was saved (for example an optimizer type whose state is allocated lazily), the load matches
+    nothing, raises nothing, and the optimizer keeps fresh moments and a zero step counter while the
+    weights and the LR schedule look restored. Training would then continue with a fresh optimizer
+    at full learning rate, which is very hard to notice from the training metrics.
+
+    The check compares the optimizer with the checkpoint on disk: it raises only when the checkpoint
+    holds per-parameter state (or a step counter) that the optimizer does not hold after the load.
+    A checkpoint written before any optimizer step has nothing to restore and passes. Only real
+    optimizers are checked; test doubles are left alone.
+    """
+    if not isinstance(optimizer, torch.optim.Optimizer):
+        return
+    summary = _optimizer_state_summary(optimizer)
+    saved = _saved_optimizer_state_summary(optimizer_path)
+    msg = (
+        f"optimizer state after resume from {optimizer_path}: "
+        f"{summary['num_states']} parameter states, max step {summary['max_step']}, "
+        f"exp_avg_sq rms {summary['exp_avg_sq_rms']:.3e}"
+    )
+    if saved is not None:
+        msg += (
+            f" (checkpoint: {saved['num_state_keys']} state keys, "
+            f"step counter {'present' if saved['has_step'] else 'absent'})"
+        )
+    print(msg)
+    if saved is None:
+        expect_state, expect_step = True, True
+    else:
+        expect_state = saved["num_state_keys"] > 0
+        expect_step = saved["has_step"]
+    missing_state = expect_state and summary["num_states"] == 0
+    missing_step = expect_step and summary["max_step"] == 0
+    if missing_state or missing_step:
+        raise RuntimeError(
+            "Optimizer state was not restored from the checkpoint (" + msg + "). "
+            "The resume would continue with a fresh optimizer; check that the "
+            "optimizer type matches the one that wrote the checkpoint, or start "
+            "a fresh run without an optimizer path."
+        )
