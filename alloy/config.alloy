@@ -1,0 +1,160 @@
+// Log export for ray.sub, enabled with RAY_ALLOY_ENABLED=1. Endpoint and
+// credentials come from the environment; nothing cluster-specific is committed.
+logging {
+  level  = "info"
+  format = "logfmt"
+}
+
+// Ray daemons, agents, Python workers, actors, and task output. These live on
+// the container's ephemeral filesystem and are lost when it exits.
+loki.source.file "ray_internal" {
+  targets = [
+    {
+      __path__         = "/tmp/ray/session_[0-9]*/logs/**/*.{log,out,err}",
+      __path_exclude__ = "/tmp/ray/session_[0-9]*/logs/**/*.{nsys-rep,qdstrm,sqlite,db}",
+
+      service_name = "nemo-rl-ray",
+      cluster      = sys.env("CLUSTER_NAME"),
+      role         = sys.env("RAY_NODE_ROLE"),
+      log_kind     = "ray-internal",
+      slurm_job_id = sys.env("SLURM_JOB_ID"),
+
+      slurm_job_name      = sys.env("SLURM_JOB_NAME"),
+      slurm_restart_count = sys.env("SLURM_RESTART_COUNT"),
+      slurm_procid        = sys.env("SLURM_PROCID"),
+      node                = constants.hostname,
+    },
+  ]
+
+  file_match {
+    enabled           = true
+    sync_period       = "5s"
+    ignore_older_than = "24h"
+  }
+
+  forward_to = [loki.process.nemo_rl.receiver]
+}
+
+// This container's own wrapper log: ray-head.log or its ray-worker-N.log.
+loki.source.file "wrapper" {
+  targets = [
+    {
+      __path__ = sys.env("RAY_WRAPPER_LOG_FILE"),
+
+      service_name = "nemo-rl-ray",
+      cluster      = sys.env("CLUSTER_NAME"),
+      role         = sys.env("RAY_NODE_ROLE"),
+      log_kind     = "wrapper",
+      slurm_job_id = sys.env("SLURM_JOB_ID"),
+
+      slurm_job_name      = sys.env("SLURM_JOB_NAME"),
+      slurm_restart_count = sys.env("SLURM_RESTART_COUNT"),
+      slurm_procid        = sys.env("SLURM_PROCID"),
+      node                = constants.hostname,
+    },
+  ]
+
+  file_match {
+    enabled           = true
+    sync_period       = "5s"
+    ignore_older_than = "24h"
+  }
+
+  forward_to = [loki.process.nemo_rl.receiver]
+}
+
+// Driver stdout and stderr. Workers point this at a path that never exists.
+loki.source.file "driver" {
+  targets = [
+    {
+      __path__ = sys.env("RAY_DRIVER_LOG_FILE"),
+
+      service_name = "nemo-rl-ray",
+      cluster      = sys.env("CLUSTER_NAME"),
+      role         = sys.env("RAY_NODE_ROLE"),
+      log_kind     = "driver",
+      slurm_job_id = sys.env("SLURM_JOB_ID"),
+
+      slurm_job_name      = sys.env("SLURM_JOB_NAME"),
+      slurm_restart_count = sys.env("SLURM_RESTART_COUNT"),
+      slurm_procid        = sys.env("SLURM_PROCID"),
+      node                = constants.hostname,
+    },
+  ]
+
+  file_match {
+    enabled           = true
+    sync_period       = "5s"
+    ignore_older_than = "24h"
+  }
+
+  forward_to = [loki.process.nemo_rl.receiver]
+}
+
+// The sandbox sidecars, one file per node. These are srun's own stdout and
+// stderr on the shared filesystem, written by a container that has no Alloy of
+// its own, so the head tails them on every node's behalf. Workers point this at
+// a path that never exists.
+loki.source.file "sandbox" {
+  targets = [
+    {
+      __path__ = sys.env("RAY_SANDBOX_LOG_GLOB"),
+
+      service_name = "nemo-rl-ray",
+      cluster      = sys.env("CLUSTER_NAME"),
+      role         = sys.env("RAY_NODE_ROLE"),
+      log_kind     = "sandbox",
+      slurm_job_id = sys.env("SLURM_JOB_ID"),
+
+      slurm_job_name      = sys.env("SLURM_JOB_NAME"),
+      slurm_restart_count = sys.env("SLURM_RESTART_COUNT"),
+      slurm_procid        = sys.env("SLURM_PROCID"),
+      node                = constants.hostname,
+    },
+  ]
+
+  file_match {
+    enabled           = true
+    sync_period       = "5s"
+    ignore_older_than = "24h"
+  }
+
+  forward_to = [loki.process.nemo_rl.receiver]
+}
+
+// Demote the high-cardinality values out of Loki's indexed label set.
+loki.process "nemo_rl" {
+  stage.structured_metadata {
+    values = {
+      slurm_job_name      = "",
+      slurm_restart_count = "",
+      slurm_procid        = "",
+      node                = "",
+      filename            = "",
+    }
+  }
+
+  forward_to = [loki.write.loki.receiver]
+}
+
+loki.write "loki" {
+  endpoint {
+    url = sys.env("LOKI_PUSH_URL")
+
+    batch_wait     = "1s"
+    batch_size     = "1MiB"
+    remote_timeout = "10s"
+
+    retry_on_http_429   = true
+    min_backoff_period  = "500ms"
+    max_backoff_period  = "30s"
+    max_backoff_retries = 20
+
+    tls_config {
+      ca_file     = sys.env("LOKI_CA_FILE")
+      cert_file   = sys.env("LOKI_CERT_FILE")
+      key_file    = sys.env("LOKI_KEY_FILE")
+      min_version = "TLS12"
+    }
+  }
+}
