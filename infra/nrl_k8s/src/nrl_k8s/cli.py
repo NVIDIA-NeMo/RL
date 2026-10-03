@@ -675,7 +675,8 @@ def run(
     if not loaded.infra.launch.entrypoint:
         _cli_error(
             "infra.launch.entrypoint is empty",
-            hint="`nrl-k8s run` requires infra.launch.entrypoint; see docs/recipes.md",
+            hint="`nrl-k8s run` requires infra.launch.entrypoint; see the "
+            "'Config layout' section of infra/nrl_k8s/README.md",
         )
 
     if as_rayjob:
@@ -1841,7 +1842,10 @@ def _explain_and_exit(exc: BaseException, *, context: str) -> NoReturn:
             "is kubectl authenticated? (try `aws sso login`)"
         )
     elif isinstance(exc, ValueError) and "launch.entrypoint" in str(exc):
-        hint = "set infra.launch.entrypoint in your recipe; see docs/recipes.md."
+        hint = (
+            "set infra.launch.entrypoint in your recipe; see the 'Config layout' "
+            "section of infra/nrl_k8s/README.md."
+        )
     _cli_error(f"{context}: {exc}", hint=hint)
 
 

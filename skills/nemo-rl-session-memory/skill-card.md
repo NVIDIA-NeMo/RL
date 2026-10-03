@@ -19,8 +19,8 @@ Risk: Review before execution as proposals could introduce incorrect or misleadi
 Mitigation: Review and scan skill before deployment. <br>
 
 ## Reference(s): <br>
-- [Skill Definition (SKILL.md)](skills/nemo-rl-session-memory/SKILL.md) <br>
-- [Evaluation Report (BENCHMARK.md)](skills/nemo-rl-session-memory/BENCHMARK.md) <br>
+- [Skill Definition (SKILL.md)](SKILL.md) <br>
+- [Evaluation Report (BENCHMARK.md)](BENCHMARK.md) <br>
 
 
 ## Skill Output: <br>
