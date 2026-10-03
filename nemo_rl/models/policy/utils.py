@@ -507,6 +507,7 @@ def stream_weights_via_ipc_zmq_impl(
         buffer_a = None
         buffer_b = None
         if had_buffers:
+            torch.cuda.ipc_collect()
             torch.cuda.empty_cache()
 
     used_bytes = 0
@@ -566,6 +567,7 @@ def stream_weights_via_ipc_zmq_impl(
                     await_recv = False
                 finally:
                     del oversized_buffer
+                    torch.cuda.ipc_collect()
                     torch.cuda.empty_cache()
                 continue
 
