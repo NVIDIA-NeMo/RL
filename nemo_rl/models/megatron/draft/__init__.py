@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from nemo_rl.models.megatron.draft.dflash import DFlashBody, DFlashBodyConfig
 from nemo_rl.models.megatron.draft.eagle import EagleModel
 from nemo_rl.models.megatron.draft.hidden_capture import (
     CapturedStates,
@@ -23,10 +24,13 @@ from nemo_rl.models.megatron.draft.utils import (
     draft_model_detached,
     export_eagle_weights_to_hf,
     load_hf_weights_to_eagle,
+    validate_dflash_export_state_dict,
 )
 
 __all__ = [
     "CapturedStates",
+    "DFlashBody",
+    "DFlashBodyConfig",
     "HiddenStateCapture",
     "get_capture_context",
     "EagleModel",
@@ -34,4 +38,5 @@ __all__ = [
     "load_hf_weights_to_eagle",
     "export_eagle_weights_to_hf",
     "get_eagle3_aux_hidden_state_layers",
+    "validate_dflash_export_state_dict",
 ]
