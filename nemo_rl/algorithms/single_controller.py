@@ -3411,6 +3411,20 @@ class SingleControllerActor:
             )  # type: ignore
 
             total_time = timing_metrics.get("total_step_time", 0.0)
+            profile_dir = os.environ.get("NEMO_RL_RL1610_PROFILE_DIR")
+            if profile_dir:
+                with open(os.path.join(profile_dir, "steps.jsonl"), "a") as profile:
+                    profile.write(
+                        json.dumps(
+                            {
+                                "timestamp": time.time(),
+                                "step": self._train_steps,
+                                "total_step_time_s": total_time,
+                                "valid_tokens": step_metrics.get("global_valid_toks"),
+                            }
+                        )
+                        + "\n"
+                    )
             total_num_gpus = int(ray.cluster_resources().get("GPU", 0))
             if (
                 total_time > 0
