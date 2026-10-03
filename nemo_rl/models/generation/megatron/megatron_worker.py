@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import logging
 import gc
 import importlib
 import os
@@ -1280,8 +1281,15 @@ class MegatronGenerationMixin:
         tasks = [
             asyncio.create_task(_generate_single_item(i)) for i in range(data.size)
         ]
-        for result in asyncio.as_completed(tasks):
-            yield await result
+        try:
+            for result in asyncio.as_completed(tasks):
+                yield await result
+        finally:
+            # Closing the stream or failing one item must cancel its siblings.
+            # Cancellation propagates through wrap_future to the inference loop.
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _generate_with_persistent_engine(
         self,
@@ -1299,19 +1307,36 @@ class MegatronGenerationMixin:
 
         print(f"[Rank {dist_rank}] Submitting {len(prompts)} requests to coordinator")
 
-        futures = []
-        for prompt, multi_modal_data, request_sampling_params in zip(
-            prompts, multi_modal_data_list, sampling_params, strict=True
-        ):
-            futures.append(
-                self.inference_client.add_request(
-                    prompt,
-                    request_sampling_params,
-                    multi_modal_data=multi_modal_data,
+        requests = []
+        try:
+            for prompt, multi_modal_data, request_sampling_params in zip(
+                prompts, multi_modal_data_list, sampling_params, strict=True
+            ):
+                requests.append(
+                    self.inference_client.add_request_with_id(
+                        prompt,
+                        request_sampling_params,
+                        multi_modal_data=multi_modal_data,
+                    )
                 )
-            )
 
-        results: list[DynamicInferenceRequest] = await asyncio.gather(*futures)
+            results: list[DynamicInferenceRequest] = await asyncio.gather(
+                *(future for _, future in requests)
+            )
+        except BaseException:
+            # CancelledError is a BaseException. Cancelling only the local
+            # futures leaves requests running in Megatron's coordinator.
+            for request_id, future in requests:
+                try:
+                    self.inference_client.abort_request(request_id)
+                except Exception:
+                    logging.exception("Failed to abort Megatron request %s", request_id)
+                finally:
+                    future.cancel()
+            await asyncio.gather(
+                *(future for _, future in requests), return_exceptions=True
+            )
+            raise
         print(f"[Rank {dist_rank}] Completed {len(results)} requests")
         return results
 
