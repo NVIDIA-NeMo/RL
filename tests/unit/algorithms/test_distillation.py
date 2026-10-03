@@ -33,6 +33,7 @@ from nemo_rl.algorithms.distillation import (
 from nemo_rl.algorithms.loss import DistillationLossConfig, DistillationLossFn
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.virtual_cluster import ClusterConfig
 
 
 @pytest.fixture
@@ -179,10 +180,7 @@ def mock_components():
                 "wandb_enabled": False,
                 "wandb": {"log_nemo_gym_full_result_tables": False},
             },
-            "cluster": {
-                "num_nodes": 1,
-                "gpus_per_node": 2,
-            },
+            "cluster": ClusterConfig(num_nodes=1, gpus_per_node=2),
             "checkpointing": {
                 "enabled": False,
                 "checkpoint_must_save_by": None,
@@ -913,10 +911,10 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
             "data": {"shuffle": False},
             "logger": {},  # Config extraction requires this key
             "checkpointing": {},  # Config extraction requires this key
-            "cluster": {
-                "num_nodes": 1,  # Single node
-                "gpus_per_node": 8,
-            },
+            "cluster": ClusterConfig(
+                num_nodes=1,  # Single node
+                gpus_per_node=8,
+            ),
         }
     )
 
@@ -1065,7 +1063,7 @@ def test_distillation_setup_non_colocated_smoke(
             "data": {"shuffle": False},
             "logger": {},
             "checkpointing": {},
-            "cluster": {"num_nodes": 2, "gpus_per_node": 8},
+            "cluster": ClusterConfig(num_nodes=2, gpus_per_node=8),
         }
     )
 
@@ -1226,7 +1224,7 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch, vllm_start_
             },
             "logger": {},
             "checkpointing": {},
-            "cluster": {"num_nodes": 1, "gpus_per_node": 1},
+            "cluster": ClusterConfig(num_nodes=1, gpus_per_node=1),
         }
     )
 
@@ -1460,10 +1458,10 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
             "data": {"shuffle": False},
             "logger": {},  # Config extraction requires this key
             "checkpointing": {},  # Config extraction requires this key
-            "cluster": {
-                "num_nodes": 2,  # Multi-node
-                "gpus_per_node": 8,
-            },
+            "cluster": ClusterConfig(
+                num_nodes=2,  # Multi-node
+                gpus_per_node=8,
+            ),
         }
     )
 

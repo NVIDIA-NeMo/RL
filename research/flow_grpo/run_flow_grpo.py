@@ -87,8 +87,8 @@ def main() -> None:
     init_ray()
 
     cluster = RayVirtualCluster(
-        bundle_ct_per_node_list=[master.cluster["gpus_per_node"]]
-        * master.cluster["num_nodes"],
+        bundle_ct_per_node_list=[master.cluster.gpus_per_node]
+        * master.cluster.num_nodes,
         use_gpus=True,
         max_colocated_worker_groups=1,
     )
@@ -106,7 +106,7 @@ def main() -> None:
         else None
     )
 
-    n_gpus = int(master.cluster["gpus_per_node"]) * int(master.cluster["num_nodes"])
+    n_gpus = int(master.cluster.gpus_per_node) * int(master.cluster.num_nodes)
     if n_gpus > 1 and master.flow_grpo.num_prompts_per_step % n_gpus != 0:
         raise ValueError(
             f"flow_grpo.num_prompts_per_step={master.flow_grpo.num_prompts_per_step} "

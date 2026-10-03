@@ -41,6 +41,8 @@ grpo:
     normalize_rewards: ${grpo.normalize_rewards}
     use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
     minus_baseline: true  # Reinforce++-baseline specific: subtract per-prompt mean baseline
+    proximal_teacher_alpha: 1.0  # OPD-specific: TROPD proximal-teacher weight in (0, 1]; 1.0 is plain MOPD
+    subtract_global_baseline: false  # OPD-specific: center advantages on the step's mean over valid tokens
   reward_scaling:
     enabled: false
     source_min: 0.0
@@ -154,7 +156,6 @@ policy:
   worker_extension_cls_fqn: null # optional registered policy-worker subclass; mutually exclusive with quant_cfg
 
   dtensor_cfg:
-    _v2: true
     enabled: true
     checkpoint:
       model_save_format: "safetensors"

@@ -89,7 +89,6 @@ policy:
   offload_optimizer_for_refit: true
   dtensor_cfg:
     enabled: true
-    _v2: true
     checkpoint:
       model_save_format: "safetensors"
       # Canonical Automodel modes: "false", "final", or "every".
@@ -167,7 +166,6 @@ teachers:
     offload_optimizer_for_refit: true
     dtensor_cfg:
       enabled: true
-      _v2: true
       checkpoint:
         model_save_format: "safetensors"
         save_consolidated: "false"
@@ -224,7 +222,6 @@ teachers:
     offload_optimizer_for_refit: true
     dtensor_cfg:
       enabled: true
-      _v2: true
       checkpoint:
         model_save_format: "safetensors"
         save_consolidated: "false"

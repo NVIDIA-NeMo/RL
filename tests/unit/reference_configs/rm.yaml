@@ -46,7 +46,6 @@ policy:
     reward_model_type: "bradley_terry"  # only "bradley_terry" is currently supported
 
   dtensor_cfg:
-    _v2: true
     enabled: true
     checkpoint:
       model_save_format: "safetensors"
@@ -234,6 +233,8 @@ cluster:
   gpus_per_node: 1
   num_nodes: 1
   segment_size: null
+  master_port_range_low: null
+  master_port_range_high: null
 
 # OpenTelemetry instrumentation; null = disabled (default). Mirrors the optional
 # field on the MasterConfig, which stays None unless a run opts in.

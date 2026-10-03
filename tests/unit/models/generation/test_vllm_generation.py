@@ -221,7 +221,6 @@ basic_dtensor_test_config: PolicyConfig = {
         },
     },
     "dtensor_cfg": {
-        "_v2": True,
         "enabled": True,
         "checkpoint": {
             "model_save_format": "safetensors",
