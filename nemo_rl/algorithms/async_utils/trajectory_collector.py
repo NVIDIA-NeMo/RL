@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextlib
 import threading as _threading
 import time
 from collections import defaultdict, deque
@@ -1569,18 +1570,24 @@ class AsyncTrajectoryCollector:
                 )
             return
 
-        async for rollout_result in run_async_multi_turn_rollout_groups(
-            policy_generation=self.policy_generation,
-            input_batch=repeated_batch,
-            tokenizer=self.tokenizer,
-            task_to_env=self.task_to_env,
-            max_seq_len=self.master_config.policy["max_total_sequence_length"],
-            num_generations=num_generations,
-            max_rollout_turns=self._max_rollout_turns,
-            greedy=False,
-            deduplicate_multimodal_data=self._deduplicate_multimodal_data,
-        ):
-            yield rollout_result
+        # aclosing() runs the generator's cleanup (cancelling in-flight groups
+        # when streaming) as soon as this loop exits, rather than on GC.
+        async with contextlib.aclosing(
+            run_async_multi_turn_rollout_groups(
+                policy_generation=self.policy_generation,
+                input_batch=repeated_batch,
+                tokenizer=self.tokenizer,
+                task_to_env=self.task_to_env,
+                max_seq_len=self.master_config.policy["max_total_sequence_length"],
+                num_generations=num_generations,
+                max_rollout_turns=self._max_rollout_turns,
+                greedy=False,
+                deduplicate_multimodal_data=self._deduplicate_multimodal_data,
+                stream_groups=self.async_config.stream_prompt_groups,
+            )
+        ) as groups:
+            async for rollout_result in groups:
+                yield rollout_result
 
     async def _run_rollout_batch_worker(
         self,
