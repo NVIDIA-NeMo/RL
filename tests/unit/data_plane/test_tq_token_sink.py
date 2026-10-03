@@ -745,6 +745,168 @@ def test_megatron_stager_passes_media_tensors_as_attachments(media_tensors):
         assert media_tensors["imgs"].dtype == torch.float32
 
 
+def test_generation_prefix_batch_round_trips_ragged_rows(tq_client, staging_partition):
+    class RecordingClient:
+        def __init__(self):
+            self.calls = []
+
+        def put_samples(self, **kwargs):
+            self.calls.append(kwargs)
+            return tq_client.put_samples(**kwargs)
+
+    client = RecordingClient()
+    sink = TQTokenSink(client, staging_partition=staging_partition)
+    records, _, _ = build_fixture_artifacts("worked_example")
+    more_records, _, _ = build_fixture_artifacts(
+        "single_call", rollout_id="a-different-length-rollout-id"
+    )
+    records.extend(more_records)
+    results = sink.stage_generation_prefix_batch(
+        records,
+        checkpoint_id="batch-checkpoint",
+        chunk_sequences=list(range(len(records))),
+    )
+
+    assert all(result.ok for result in results)
+    assert len(client.calls) == 1
+    assert client.calls[0]["sample_ids"] == [result.staging_key for result in results]
+    assert [tag["digest"] for tag in client.calls[0]["tags"]] == [
+        record.digest for record in records
+    ]
+    restored = TQTokenSource(tq_client, staging_partition=staging_partition).fetch(
+        [result.staging_key for result in results]
+    )
+    assert [row.model_dump() for row in restored] == [
+        record.model_dump(exclude={"extras"}) for record in records
+    ]
+
+
+def test_generation_prefix_batch_matches_single_rows_with_media_and_routes(
+    tq_client, media_partition
+):
+    from nemo_rl.utils.routed_experts_codec import encode_routed_experts
+
+    client = _RecordingClient(tq_client)
+    sink = TQTokenSink(
+        client,
+        staging_partition=media_partition,
+        capture_media=True,
+        media_pixel_dtype=torch.bfloat16,
+    )
+    source = TQTokenSource(
+        client, staging_partition=media_partition, capture_media=True
+    )
+    chain, _, _ = build_fixture_artifacts("worked_example")
+    single, _, _ = build_fixture_artifacts("single_call")
+    records = [
+        record.model_copy(
+            update={
+                "extras": {
+                    "routed_experts": encode_routed_experts(
+                        torch.arange(
+                            len(record.token_ids_delta) * 4, dtype=torch.int16
+                        ).reshape(-1, 2, 2)
+                        + offset
+                    )
+                }
+            }
+        )
+        for offset, record in enumerate([*chain[:2], single[0]])
+    ]
+    # A still image, a one-frame video, and a text call in one batch.
+    bundles = [_still(), _video(frames=(1,), dtype=torch.bfloat16), None]
+
+    single_keys = []
+    for sequence, (record, bundle) in enumerate(zip(records, bundles, strict=True)):
+        result = sink.stage_generation_prefix(
+            record,
+            checkpoint_id="single-cut",
+            chunk_sequence=sequence,
+            attachments=bundle,
+        )
+        assert result.ok
+        single_keys.append(result.staging_key)
+    puts_before = len(client.puts)
+    results = sink.stage_generation_prefix_batch(
+        records,
+        checkpoint_id="batched-cut",
+        chunk_sequences=list(range(len(records))),
+        attachments=bundles,
+    )
+    assert all(result.ok for result in results)
+    assert len(client.puts) - puts_before < len(records)
+
+    single = source.fetch_for_finalization(single_keys, include_route_fragments=True)
+    batched = source.fetch_for_finalization(
+        [result.staging_key for result in results], include_route_fragments=True
+    )
+    for expected, actual, bundle in zip(single, batched, bundles, strict=True):
+        assert actual.snapshot == expected.snapshot
+        assert actual.extras == expected.extras
+        assert actual.routed_len == expected.routed_len
+        assert actual.fragment.encoding == expected.fragment.encoding
+        _assert_same_tensor(actual.fragment.routes, expected.fragment.routes)
+        assert actual.media_present is (bundle is not None)
+        assert actual.media_has_frames == expected.media_has_frames
+        if bundle is not None:
+            [media] = source.fetch_media([actual])
+            _assert_same_tensor(media.imgs, bundle["imgs"])
+            _assert_same_tensor(media.imgs_sizes, bundle["imgs_sizes"])
+
+
+def test_generation_prefix_batch_rejects_bad_inventory_before_writing():
+    class UnexpectedClient:
+        def put_samples(self, **kwargs):
+            pytest.fail("invalid inventory must not reach TQ")
+
+    sink = TQTokenSink(UnexpectedClient(), staging_partition="test")
+    records, _, _ = build_fixture_artifacts("single_call")
+    assert (
+        sink.stage_generation_prefix_batch(
+            [], checkpoint_id="checkpoint", chunk_sequences=[]
+        )
+        == []
+    )
+    with pytest.raises(ValueError, match="equal lengths"):
+        sink.stage_generation_prefix_batch(
+            records, checkpoint_id="checkpoint", chunk_sequences=[]
+        )
+    with pytest.raises(ValueError, match="duplicate"):
+        sink.stage_generation_prefix_batch(
+            records * 2, checkpoint_id="checkpoint", chunk_sequences=[0, 0]
+        )
+
+
+def test_generation_prefix_batch_failure_does_not_advertise_success():
+    class FailingClient:
+        def __init__(self):
+            self.calls = 0
+            self.cleared = []
+
+        def put_samples(self, **kwargs):
+            self.calls += 1
+            raise RuntimeError("injected partial batch write")
+
+        def clear_samples(self, **kwargs):
+            self.cleared.extend(kwargs["sample_ids"])
+
+    client = FailingClient()
+    sink = TQTokenSink(client, staging_partition="test")
+    records, _, _ = build_fixture_artifacts("worked_example")
+    results = sink.stage_generation_prefix_batch(
+        records,
+        checkpoint_id="checkpoint",
+        chunk_sequences=list(range(len(records))),
+    )
+
+    assert client.calls == 1
+    assert len(results) == len(records)
+    assert all(not result.ok for result in results)
+    assert all(result.staging_key for result in results)
+    assert all("injected partial batch write" in result.error for result in results)
+    assert client.cleared == [result.staging_key for result in results]
+
+
 def _split_delta(record) -> tuple[list[int], list[int], list[float]]:
     """Split a fixture record's delta into (prompt ids, generated ids, logprobs)."""
     generated_start = record.token_mask_delta.index(1.0)
