@@ -44,10 +44,18 @@ maybe_gres_arg() {
   # Check if any nodes in the partition have GRES configured
   # Assumes a homogeneous allocation (not a heterogeneous job)
   if sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep -q "gpu:"; then
-    # Do a quick assert here that gpus:8 == gpus:$GPUS_PER_NODE. It is probably a user error if someone isn't using GPUS_PER_NODE=8 on our clusters if it supports --gres=gpu:8 or gpu:a100:8
+    # Assert GPUS_PER_NODE fully claims the nodes' GPUs. Partitions can advertise
+    # MIXED GRES counts (a node with a GPU drained out shows e.g. gpu:7 beside
+    # gpu:8), so assert against the MAX; --gres keeps the job off degraded nodes.
     # Some clusters append socket specs like "(S:0-3)" to the GRES string.
-    if [[ $GPUS_PER_NODE -ne $(sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep "gpu:" | cut -d'(' -f1 | awk -F: '{print $NF}') ]]; then
-      echo "Error: GPUS_PER_NODE=$GPUS_PER_NODE but GRES detected is $(sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep "gpu:") meaning GPUS_PER_NODE is not set to fully claim the GPUs on the nodes." >&2
+    local gres_counts max_gres
+    gres_counts=$(sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep "gpu:" | cut -d'(' -f1 | awk -F: '{print $NF}' | sort -un)
+    max_gres=$(printf '%s\n' "$gres_counts" | tail -1)
+    if [[ $(printf '%s\n' "$gres_counts" | wc -l) -gt 1 ]]; then
+      echo "[WARNING] Partition $SLURM_JOB_PARTITION advertises mixed GPU counts ($(printf '%s' "$gres_counts" | tr '\n' ' ')); asserting GPUS_PER_NODE against the max." >&2
+    fi
+    if [[ $GPUS_PER_NODE -ne $max_gres ]]; then
+      echo "Error: GPUS_PER_NODE=$GPUS_PER_NODE but GRES detected is gpu:$max_gres (distinct counts: $(printf '%s' "$gres_counts" | tr '\n' ' ')) meaning GPUS_PER_NODE is not set to fully claim the GPUs on the nodes." >&2
       exit 1
     fi
     echo "--gres=gpu:${GPUS_PER_NODE}"
