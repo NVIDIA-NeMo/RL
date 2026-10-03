@@ -1872,6 +1872,8 @@ class TestSetup:
             tokenizer=tokenizer,
             enable_router_replay=False,
             use_fastokens=False,
+            # The vLLM server's bearer token, handed to the Gym model server.
+            policy_api_key=patched_factories["fake_gen"].http_server_api_key,
             token_capture=None,
         )
         mock_validate.assert_called_once_with(

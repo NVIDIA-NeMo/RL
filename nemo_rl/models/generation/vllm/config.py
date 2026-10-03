@@ -102,6 +102,14 @@ class VllmSpecificArgs(TypedDict):
     # Exposing vLLM as a server is useful in instances where the multi-turn rollout is performed with utilities outside of NeMo RL, but the user still wants to take advantage of the refit logic in NeMo RL that keeps the policy and generation up to date.
     # Currently it will expose the /tokenize and /v1/chat/completions endpoints. Later on we may expose /v1/completions or /v1/responses.
     expose_http_server: NotRequired[bool]
+    # Require `Authorization: Bearer <key>` on the exposed server's OpenAI routes
+    # (/v1/* and /tokenize). VllmGeneration generates one random key per job, hands
+    # it to the workers, and exposes it as `http_server_api_key` for the NeMo-Gym
+    # model server. Absent or false: the routes accept unauthenticated requests.
+    http_server_api_key_required: NotRequired[bool]
+    # The generated key. Filled by VllmGeneration in the copy of the config the
+    # workers receive; never set in a YAML.
+    http_server_api_key: NotRequired[str]
     # Environment variable containing the internal refit API key.
     http_refit_api_key_env_var: NotRequired[str | None]
     # Invalidate weight-dependent multimodal encoder outputs after a successful
