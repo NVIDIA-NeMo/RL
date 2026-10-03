@@ -23,6 +23,7 @@ business logic. Backend init is lifted from
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import glob
 import importlib
 import ipaddress
@@ -137,9 +138,11 @@ def _mooncake_transport_config() -> dict:
     if not devices:
         raise RuntimeError(
             "data_plane.backend='mooncake_cpu' requires RDMA, but no usable "
-            "mlx5 device was found. Check that /dev/infiniband/uverbs* exists "
-            "(a container does not inherit it from the host even though it "
-            "does see /sys/class/infiniband) — name a device with "
+            "device was found: only devices under /sys/class/infiniband whose "
+            "port 1 reports ACTIVE are usable, since mooncake only checks port "
+            "1. Check that /dev/infiniband/uverbs* exists (a container does "
+            "not inherit it from the host even though it does see "
+            "/sys/class/infiniband) — name a device with "
             "MC_MOONCAKE_DEVICE=<dev>, or use data_plane.backend='simple'."
         )
     return {"protocol": "rdma", "device_name": devices}
@@ -180,6 +183,67 @@ def _register_checked(store: Any, ptr: int, nbytes: int) -> None:
             f"IPC_LOCK and a high memlock rlimit — RLIMIT_MEMLOCK is "
             f"{_memlock_limit()} here. Lower data_plane.mooncake_cpu.global_segment_size / local_buffer_size if the limit is the bound."
         )
+
+
+def _native_buffer_pool_cls() -> Any:
+    """``mooncake.store.BufferPool`` when the wheel carries it, else ``None``.
+
+    Mooncake exposes the pool this module hand-rolls below: it registers
+    regions once and leases slices, so ``acquire``/``release`` never enter the
+    kernel. Prefer it — it is the same contract with one fewer implementation
+    to own, and its overflow regions register an oversized request once
+    instead of the transient register/unregister :class:`_StagingPool` falls
+    back to.
+
+    Detected rather than imported at module scope because the class lives in a
+    compiled extension: ``mooncake.store`` is absent on a host without the
+    wheel, and older wheels have the module without the attribute. Upstream's
+    own ``mooncake/buffer_pool.py`` guards it the same way.
+    """
+    if os.environ.get("MC_NATIVE_BUFFER_POOL", "1") == "0":
+        # Escape hatch for A/B measurement against the in-tree pool, and for
+        # falling back in the field without a redeploy. Not a config key: the
+        # two pools hold the same contract, so this selects an implementation,
+        # not a behaviour a recipe should be pinning.
+        return None
+    try:
+        from mooncake.store import BufferPool
+    except ImportError:
+        return None
+    return BufferPool
+
+
+class _NativeStagingPool:
+    """:class:`_StagingPool`'s contract over ``mooncake.store.BufferPool``.
+
+    The call sites want a torch ``uint8`` tensor — they slice it, ``view`` it
+    to the payload dtype and read ``data_ptr()``. Build that over
+    ``lease.ptr`` through ``ctypes``, not over ``lease.buffer``: wrapping the
+    buffer-protocol object exports a view that outlives this frame (the
+    caller still holds the yielded tensor when ``__exit__`` runs), and the
+    lease then refuses to release with "cannot release buffer while exported
+    views exist". A ``ctypes`` array built ``from_address`` carries no such
+    export — the same construction :mod:`tq_mooncake_checkpoint` uses to read
+    pinned allocations.
+
+    ``block_on_exhaustion`` with ``default_timeout`` reproduces the bounded
+    wait: a slot held for exactly one transfer means a long wait diagnoses
+    over-concurrency, not a slow transfer.
+    """
+
+    def __init__(self, pool: Any) -> None:
+        self._pool = pool
+
+    @contextlib.contextmanager
+    def buffer(self, nbytes: int):
+        with self._pool.buffer(nbytes) as lease:
+            if lease.size < nbytes:
+                raise RuntimeError(
+                    f"mooncake BufferPool leased {lease.size} bytes for a "
+                    f"{nbytes}-byte request; the transfer would overrun it."
+                )
+            allocation = (ctypes.c_ubyte * nbytes).from_address(lease.ptr)
+            yield torch.frombuffer(allocation, dtype=torch.uint8)
 
 
 class _StagingPool:
@@ -262,11 +326,47 @@ class _StagingPoolRegistry:
         self._n_slots = n_slots
         self._max_bytes = max_bytes
         self._lock = threading.Lock()
-        self._pools: weakref.WeakKeyDictionary[Any, _StagingPool] = (
-            weakref.WeakKeyDictionary()
-        )
+        self._native_cls = _native_buffer_pool_cls()
+        self._pools: weakref.WeakKeyDictionary[
+            Any, _StagingPool | _NativeStagingPool
+        ] = weakref.WeakKeyDictionary()
 
-    def pool_for(self, client: Any) -> _StagingPool:
+    def _build(self, client: Any) -> _StagingPool | _NativeStagingPool:
+        """Native pool where the wheel has one, hand-rolled otherwise.
+
+        ``BufferPool`` rejects anything that is not a mooncake ``PyClient``
+        ("must be ... a store wrapper that implements
+        ``_get_pyclient_capsule()``"), and TQ's ``_store`` is only that by
+        convention. Fall back rather than fail: :class:`_StagingPool` holds
+        the same contract, so an incompatible store costs throughput, not
+        correctness. Warned rather than silent — the whole point of the swap
+        is the registration it avoids.
+        """
+        if self._native_cls is not None:
+            try:
+                return _NativeStagingPool(
+                    self._native_cls(
+                        client._store,
+                        max_bytes=self._n_slots * self._max_bytes,
+                        max_size_class=self._max_bytes,
+                        block_on_exhaustion=True,
+                        default_timeout=_STAGING_SLOT_TIMEOUT_S,
+                        prewarm_size=self._max_bytes,
+                        prewarm_count=self._n_slots,
+                    ),
+                )
+            except (RuntimeError, TypeError) as error:
+                warnings.warn(
+                    f"mooncake BufferPool rejected this store ({error}); "
+                    "falling back to the in-tree staging pool. Oversized "
+                    "transfers will re-register per call.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                self._native_cls = None
+        return _StagingPool(client._store, self._n_slots, self._max_bytes)
+
+    def pool_for(self, client: Any) -> _StagingPool | _NativeStagingPool:
         """Return ``client``'s pool, building it at most once across threads.
 
         Locked because ``put``/``get`` drive the thread workers from a
@@ -282,9 +382,7 @@ class _StagingPoolRegistry:
         with self._lock:
             pool = self._pools.get(client)
             if pool is None:
-                pool = self._pools[client] = _StagingPool(
-                    client._store, self._n_slots, self._max_bytes
-                )
+                pool = self._pools[client] = self._build(client)
             return pool
 
 
