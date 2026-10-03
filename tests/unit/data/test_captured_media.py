@@ -722,6 +722,42 @@ def test_generation_prefix_fetch_restores_and_verifies_media(dp):
         )
 
 
+def test_generation_prefix_media_deleted_between_metadata_and_tensor_reads_fails_closed(
+    dp,
+):
+    root, _ = stage(
+        dp,
+        engine_prompt(
+            [10, 18, 18, 11],
+            [(Span(1, 2), torch.ones(3, 2, 3))],
+        ),
+    )
+
+    class DeleteMediaAfterMetadataRead(RecordingClient):
+        def __init__(self, client):
+            super().__init__(client)
+            self.deleted = False
+
+        def get_samples(self, *args, **kwargs):
+            result = super().get_samples(*args, **kwargs)
+            select = kwargs.get("select_fields", args[2] if len(args) > 2 else ())
+            if not self.deleted and MEDIA_PRESENT_FIELD in select:
+                del self.client._partitions["staging"].rows[root.staging_key][
+                    MEDIA_IMGS_FIELD
+                ]
+                self.deleted = True
+            return result
+
+    client = DeleteMediaAfterMetadataRead(dp)
+    source = TQTokenSource(client, staging_partition="staging", capture_media=True)
+
+    with pytest.raises(KeyError, match="media columns"):
+        source.fetch_generation_cut([root.staging_key])
+
+    assert client.deleted
+    assert len(client.gets) == 2
+
+
 def test_worker_completion_stages_pixels_and_only_returns_capture_coordinates(dp):
     from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
 
@@ -1418,3 +1454,30 @@ async def test_retained_media_rejection_precedes_inference_and_survives_gym(
     )
     assert isinstance(failure, GymTransportError)
     assert "retained_media_changed" in str(failure)
+
+    # If the original URL/path/blob has disappeared, vLLM cannot construct its
+    # engine-native multimodal prompt. The request must fail before begin_call,
+    # rather than attempting to resume with only the packed TQ tensors.
+    worker.token_capture.reset_mock()
+    inference.reset_mock()
+    missing_request = SimpleNamespace(
+        top_k=-1,
+        top_p=1.0,
+        temperature=1.0,
+        ng_capture=admission.model_dump(),
+        required_prefix_token_ids=None,
+        model_copy=lambda **kwargs: missing_request,
+    )
+
+    async def missing_media(self, **kwargs):
+        raise FileNotFoundError("original media disappeared")
+
+    monkeypatch.setattr(
+        _OnlineRenderer, "preprocess_chat", missing_media, raising=False
+    )
+    with pytest.raises(FileNotFoundError, match="original media disappeared"):
+        await handler(missing_request, MagicMock())
+    inference.assert_not_awaited()
+    worker.token_capture.begin_call.assert_not_called()
+    worker.token_capture.complete_call_from_response.assert_not_called()
+    assert worker._capture_calls == {}
