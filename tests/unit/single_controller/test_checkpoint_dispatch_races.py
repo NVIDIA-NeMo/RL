@@ -829,6 +829,7 @@ def test_turn_checkpoint_drains_on_wire_reply_before_tq_cut(tmp_path: Path) -> N
         controller._rollout_dispatch_admission_gate = RolloutDispatchAdmissionGate()
         controller._rollout_manager = _deadline_pausing_manager()
         controller._rollout_recovery_ledger = ledger
+        controller._data_plane_checkpoint_barrier = barrier
 
         async def complete_on_wire_reply() -> None:
             while not any(
@@ -912,6 +913,7 @@ def test_completion_callback_can_run_while_gym_commit_is_pending(
         controller._rollout_dispatch_admission_gate = RolloutDispatchAdmissionGate()
         controller._rollout_manager = _deadline_pausing_manager()
         controller._rollout_recovery_ledger = ledger
+        controller._data_plane_checkpoint_barrier = barrier
 
         async def checkpoint() -> GymCheckpointCommitResult:
             async with controller._prepared_gym_checkpoint(
@@ -1034,6 +1036,7 @@ def test_turn_checkpoint_aborts_when_candidate_is_neither_exported_nor_drained(
         controller._rollout_dispatch_admission_gate = RolloutDispatchAdmissionGate()
         controller._rollout_manager = _deadline_pausing_manager()
         controller._rollout_recovery_ledger = ledger
+        controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
 
         with pytest.raises(TimeoutError, match="neither|classify every candidate"):
             async with controller._prepared_gym_checkpoint(
@@ -2348,6 +2351,174 @@ class TestGymCheckpointPausesRolloutDeadlines:
                 ):
                     raise AssertionError("unreachable")
             assert not registry.suspended
+
+        asyncio.run(exercise())
+
+
+class TestDrainScalesWithPendingRepliesNotTheLedger:
+    """The drain waits on a few on-wire replies; its cost must not track every rollout.
+
+    At hundreds of thousands of live rollouts, rescanning the whole ledger on
+    each check blocks the event loop that delivers the very replies it waits
+    for, with every rollout parked behind the checkpoint.
+    """
+
+    @staticmethod
+    async def _dispatched_groups(
+        ledger: RolloutRecoveryLedger,
+        barrier: DataPlaneCheckpointBarrier,
+        count: int,
+    ) -> list[PromptGroupRecoveryRecord]:
+        groups = []
+        async with barrier.mutation() as cut:
+            for index in range(count):
+                group = ledger.reserve_group(
+                    cut,
+                    group_id=f"batch-7-prompt-{index}",
+                    admission_id="batch-7",
+                    prompt_id=str(index),
+                    prompt_payload={"idx": index, "message_log": []},
+                    expected_generations=1,
+                    target_step=7,
+                    start_weight_version=7,
+                    restore_level=RecoveryTargetLevel.TURN,
+                    admitted=True,
+                )
+                ledger.mark_group_dispatched(
+                    cut, group.group_id, gym_instance_id="tools/replica-0"
+                )
+                groups.append(ledger.get_group(group.group_id))
+        return groups
+
+    @staticmethod
+    async def _drain_setup(
+        tmp_path: Path,
+        *,
+        rollouts: int,
+        on_wire: int,
+        control_timeout_s: float = 5.0,
+    ):
+        """Commit a cut in which Gym exported all but the first ``on_wire`` episodes."""
+        ledger = RolloutRecoveryLedger()
+        barrier = DataPlaneCheckpointBarrier()
+        groups = await TestDrainScalesWithPendingRepliesNotTheLedger._dispatched_groups(
+            ledger, barrier, rollouts
+        )
+        episodes = [GymCheckpointEpisode(*group.gym_episode(0)) for group in groups]
+        coordinator = _SavingGymCoordinator(exported_episodes=tuple(episodes[on_wire:]))
+        coordinator.control_timeout_s = control_timeout_s
+        candidates = {"tools/replica-0": tuple(episodes)}
+        commit = await coordinator.commit("save-1", tmp_path, candidates)
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        controller = object.__new__(controller_cls)
+        controller._rollout_recovery_ledger = ledger
+        controller._data_plane_checkpoint_barrier = barrier
+        return controller, coordinator, candidates, commit, ledger, barrier, groups
+
+    @staticmethod
+    async def _resolve(
+        ledger: RolloutRecoveryLedger,
+        barrier: DataPlaneCheckpointBarrier,
+        group: PromptGroupRecoveryRecord,
+        how: str,
+    ) -> None:
+        async with barrier.mutation("sibling_seals") as cut:
+            if how == "sealed":
+                ledger.mark_sibling_sealed(
+                    cut,
+                    group.group_id,
+                    generation_index=0,
+                    gate_rollout_id=group.gate_rollout_id(0),
+                    receipt=None,
+                    reward=1.0,
+                    mask_sample=False,
+                )
+            else:
+                ledger.abandon_unsealed(cut, group.group_id)
+
+    def test_waiting_never_rescans_every_rollout(self, tmp_path: Path) -> None:
+        async def exercise() -> None:
+            (
+                controller,
+                coordinator,
+                candidates,
+                commit,
+                ledger,
+                barrier,
+                groups,
+            ) = await self._drain_setup(tmp_path, rollouts=50, on_wire=1)
+            scans = 0
+            full_scan = ledger.gym_checkpoint_inventory
+
+            def counting_scan(instance_ids):
+                nonlocal scans
+                scans += 1
+                return full_scan(instance_ids)
+
+            ledger.gym_checkpoint_inventory = counting_scan
+            drain = asyncio.create_task(
+                controller._drain_non_exported_gym_candidates(
+                    coordinator, candidates, commit
+                )
+            )
+            # Long enough for a 50 ms poll to have rescanned several times.
+            await asyncio.sleep(0.3)
+            await self._resolve(ledger, barrier, groups[0], "sealed")
+            await asyncio.wait_for(drain, timeout=5.0)
+
+            assert scans == 0
+
+        asyncio.run(exercise())
+
+    @pytest.mark.parametrize("how", ["sealed", "abandoned"])
+    def test_it_returns_as_soon_as_the_last_reply_resolves(
+        self, tmp_path: Path, how: str
+    ) -> None:
+        async def exercise() -> None:
+            (
+                controller,
+                coordinator,
+                candidates,
+                commit,
+                ledger,
+                barrier,
+                groups,
+            ) = await self._drain_setup(tmp_path, rollouts=3, on_wire=2)
+            drain = asyncio.create_task(
+                controller._drain_non_exported_gym_candidates(
+                    coordinator, candidates, commit
+                )
+            )
+            await asyncio.sleep(0.1)
+            await self._resolve(ledger, barrier, groups[0], how)
+            for _ in range(5):
+                await asyncio.sleep(0)
+            assert not drain.done(), "one on-wire reply is still outstanding"
+
+            await self._resolve(ledger, barrier, groups[1], how)
+            # Woken by the change itself, not by the next timed poll.
+            for _ in range(5):
+                await asyncio.sleep(0)
+            assert drain.done()
+            await drain
+
+        asyncio.run(exercise())
+
+    def test_a_timeout_reports_a_bounded_summary(self, tmp_path: Path) -> None:
+        async def exercise() -> None:
+            controller, coordinator, candidates, commit, *_ = await self._drain_setup(
+                tmp_path, rollouts=500, on_wire=500, control_timeout_s=0.05
+            )
+            with pytest.raises(TimeoutError) as raised:
+                await controller._drain_non_exported_gym_candidates(
+                    coordinator, candidates, commit
+                )
+            message = str(raised.value)
+            assert "500" in message
+            # A count and a short sample, not every unresolved identity.
+            assert len(message) < 2000, len(message)
+
+        asyncio.run(exercise())
 
 
 class _DiskLiveSessionGymCoordinator(_LiveSessionGymCoordinator):

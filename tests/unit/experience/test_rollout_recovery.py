@@ -1643,3 +1643,55 @@ def test_a_prompt_group_cannot_replace_one_dropped_sibling() -> None:
                 cut, "g7", generation_indices=[1], replace=True
             )
         )
+
+
+def test_gym_episodes_still_held_looks_up_only_live_current_attempts() -> None:
+    ledger = RolloutRecoveryLedger()
+    group = _dispatched_turn_group(ledger)
+    first, second = group.gym_episode(0), group.gym_episode(1)
+    # Sibling 1's stream broke: its old attempt is abandoned and re-minted.
+    _mutate(
+        lambda cut: ledger.abandon_dropped_dispatch(
+            cut, "g7", generation_indices=[1], replace=True
+        )
+    )
+
+    held = ledger.gym_episodes_still_held(
+        {
+            "tools/replica-0": [first, second, ("not-a-rollout-id", 0)],
+            "tools/replica-1": [first],
+        }
+    )
+
+    assert held == {"tools/replica-0": {first}, "tools/replica-1": set()}
+    # It agrees with the full inventory it stands in for.
+    inventory = ledger.gym_checkpoint_inventory({"tools/replica-0", "tools/replica-1"})
+    assert held["tools/replica-0"] == set(inventory["tools/replica-0"]) & {
+        first,
+        second,
+    }
+
+
+def test_wait_for_mutation_wakes_on_the_next_finished_mutation() -> None:
+    async def exercise() -> None:
+        barrier = DataPlaneCheckpointBarrier()
+        version = barrier.mutation_version
+
+        waiter = asyncio.create_task(barrier.wait_for_mutation(version, 5.0))
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert not waiter.done()
+        async with barrier.mutation():
+            pass
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert waiter.done()
+
+        # A mutation that finished before the wait began is not missed.
+        await asyncio.wait_for(barrier.wait_for_mutation(version, 5.0), 0.5)
+        # With nothing happening, the wait simply ends at its timeout.
+        await asyncio.wait_for(
+            barrier.wait_for_mutation(barrier.mutation_version, 0.05), 0.5
+        )
+
+    asyncio.run(exercise())

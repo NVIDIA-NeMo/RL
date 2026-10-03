@@ -315,6 +315,41 @@ class SiblingSealResult:
     mask_sample: bool
 
 
+def _holds_gym_episode(
+    record: PromptGroupRecoveryRecord, sibling: RolloutSiblingRecord
+) -> bool:
+    """Whether this sibling's current attempt is live turn-level Gym state.
+
+    A dispatched attempt may have an admitted episode, and a reserved restored
+    attempt (``gym_attempt > 0``) carries committed Gym state forward.
+    """
+    if (
+        record.status is not PromptGroupStatus.GENERATING
+        or record.restore_level is not RecoveryTargetLevel.TURN
+    ):
+        return False
+    attempt = sibling.current_attempt
+    return attempt.status is RolloutAttemptStatus.DISPATCHED or (
+        attempt.status is RolloutAttemptStatus.RESERVED and attempt.gym_attempt > 0
+    )
+
+
+def _parse_gym_rollout_id(rollout_id: str) -> Optional[tuple[str, int]]:
+    """Invert :meth:`PromptGroupRecoveryRecord.gym_episode`'s base rollout ID.
+
+    The ID is ``{group_id}_g{generation_index}_a{attempt_id}``. The index and
+    the hex attempt ID never contain ``_``, so splitting from the right is
+    unambiguous; callers still confirm the match against the live record.
+    """
+    logical_rollout_id, separator, _ = rollout_id.rpartition("_a")
+    if not separator:
+        return None
+    group_id, separator, generation_index = logical_rollout_id.rpartition("_g")
+    if not separator or not generation_index.isdigit():
+        return None
+    return group_id, int(generation_index)
+
+
 def _new_attempt() -> RolloutAttemptRecord:
     return RolloutAttemptRecord(
         attempt_uuid=uuid.uuid4(),
@@ -577,19 +612,10 @@ class RolloutRecoveryLedger:
             instance_id: [] for instance_id in instance_ids
         }
         for record in self._groups.values():
-            if (
-                record.status is not PromptGroupStatus.GENERATING
-                or record.restore_level is not RecoveryTargetLevel.TURN
-            ):
-                continue
             for sibling in record.siblings:
-                attempt = sibling.current_attempt
-                owns_gym_state = attempt.status is RolloutAttemptStatus.DISPATCHED or (
-                    attempt.status is RolloutAttemptStatus.RESERVED
-                    and attempt.gym_attempt > 0
-                )
-                if not owns_gym_state:
+                if not _holds_gym_episode(record, sibling):
                     continue
+                attempt = sibling.current_attempt
                 instance_id = attempt.gym_instance_id
                 if instance_id is None:
                     raise RuntimeError(
@@ -609,6 +635,35 @@ class RolloutRecoveryLedger:
             instance_id: tuple(sorted(episodes))
             for instance_id, episodes in inventory.items()
         }
+
+    def gym_episodes_still_held(
+        self,
+        episodes_by_instance: Mapping[str, Iterable[tuple[str, int]]],
+    ) -> dict[str, set[tuple[str, int]]]:
+        """Return which of these episodes the checkpoint inventory would still list.
+
+        Looks up only the given episodes, so checking a few outstanding replies
+        does not cost a scan of every live rollout.
+        """
+        held: dict[str, set[tuple[str, int]]] = {}
+        for instance_id, episodes in episodes_by_instance.items():
+            held[instance_id] = set()
+            for episode in episodes:
+                owner = _parse_gym_rollout_id(episode[0])
+                if owner is None:
+                    continue
+                group_id, generation_index = owner
+                record = self._groups.get(group_id)
+                if record is None or not 0 <= generation_index < len(record.siblings):
+                    continue
+                sibling = record.siblings[generation_index]
+                if (
+                    _holds_gym_episode(record, sibling)
+                    and sibling.current_attempt.gym_instance_id == instance_id
+                    and record.gym_episode(generation_index) == tuple(episode)
+                ):
+                    held[instance_id].add(tuple(episode))
+        return held
 
     def _record_gym_retirements(self, record: PromptGroupRecoveryRecord) -> None:
         """Remember each current attempt Gym may still be running for this group.
