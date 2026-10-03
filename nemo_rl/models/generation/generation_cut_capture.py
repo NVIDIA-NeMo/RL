@@ -23,6 +23,8 @@ from collections.abc import Callable, Generator
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+import torch
+
 LOGGER = logging.getLogger(__name__)
 
 # Completion evidence only bridges the short race between a terminal response
@@ -53,6 +55,7 @@ class _RequestCaptureBuffer:
     sequence: int
     generated_token_ids: list[int] = field(default_factory=list)
     generated_logprobs: list[float] = field(default_factory=list)
+    generated_routed_experts: list[torch.Tensor] = field(default_factory=list)
 
 
 @dataclass
@@ -61,6 +64,7 @@ class _FrozenRequestCaptureBuffer:
 
     checkpoint_id: str
     buffer: _RequestCaptureBuffer
+    cumulative_routed_expert_count: int | None = None
 
 
 @dataclass
@@ -79,6 +83,9 @@ class _RequestCaptureState:
 
     call: Any
     prompt_token_ids: list[int]
+    capture_routed_experts: bool = False
+    routed_experts_dtype: torch.dtype = torch.int16
+    restored_routed_experts: torch.Tensor | None = None
     # Backend-owned opaque state that must survive until the terminal row is
     # staged. vLLM uses this for its processed-media snapshot; prefix recovery
     # is currently setup-guarded to text-only, but ordinary terminal capture
@@ -97,6 +104,11 @@ class _RequestCaptureState:
     terminal_started: bool = False
     sealed_generated_token_ids: list[int] = field(default_factory=list)
     sealed_generated_logprobs: list[float] = field(default_factory=list)
+    sealed_generated_routed_experts: list[torch.Tensor] = field(default_factory=list)
+    sealed_cumulative_routed_expert_count: int | None = None
+    terminal_routed_experts: torch.Tensor | None = None
+    engine_routed_expert_chunk_count: int = 0
+    engine_routed_expert_row_count: int = 0
     generation_cut_staging_keys: list[str] = field(default_factory=list)
     active_buffer: _RequestCaptureBuffer = field(
         default_factory=lambda: _RequestCaptureBuffer(sequence=0)
@@ -109,62 +121,278 @@ class _RequestCaptureState:
         self,
         generated_token_ids: list[int],
         generated_logprobs: list[float],
+        *,
+        routed_expert_chunks: list[Any] | None = None,
+        routed_expert_chunk_count: int | None = None,
+        complete_routed_experts: Any | None = None,
     ) -> None:
         """Append one immutable vLLM output delta."""
+        if self.observation_error is not None:
+            # Deltas are immutable and observed once. After losing one delta,
+            # accepting later progress would manufacture a discontinuous cut.
+            return
         if len(generated_token_ids) != len(generated_logprobs):
             self.observation_error = (
                 "generated token IDs and log probabilities must have equal lengths"
             )
             return
+        if self.capture_routed_experts:
+            try:
+                self._observe_routed_experts(
+                    routed_expert_chunks=routed_expert_chunks,
+                    routed_expert_chunk_count=routed_expert_chunk_count,
+                    complete_routed_experts=complete_routed_experts,
+                )
+            except (TypeError, ValueError) as error:
+                self.observation_error = f"{type(error).__name__}: {error}"
+                return
         self.active_buffer.generated_token_ids.extend(generated_token_ids)
         self.active_buffer.generated_logprobs.extend(generated_logprobs)
         self.observed_generation_token_count += len(generated_token_ids)
 
+    def _observe_routed_experts(
+        self,
+        *,
+        routed_expert_chunks: list[Any] | None,
+        routed_expert_chunk_count: int | None,
+        complete_routed_experts: Any | None,
+    ) -> None:
+        """Retain new engine-owned route chunks without copying old progress.
+
+        vLLM 0.29 accumulates prompt and decode routes internally and exposes
+        them on ``CompletionOutput`` only when the request finishes. The HTTP
+        host therefore snapshots only the newly appended internal chunks while
+        the request is active. They are kept raw here and aligned with the
+        observed token boundary only when a checkpoint freezes the buffer.
+        """
+
+        def tensor(value: Any, *, name: str) -> torch.Tensor:
+            result = torch.as_tensor(value, dtype=self.routed_experts_dtype).cpu()
+            if result.dim() != 3:
+                raise ValueError(f"{name} must have shape [tokens, layers, topk]")
+            if result.shape[1] < 1 or result.shape[2] < 1:
+                raise ValueError(f"{name} must have non-empty model dimensions")
+            return result.contiguous()
+
+        chunks = list(routed_expert_chunks or ())
+        if routed_expert_chunk_count is None:
+            routed_expert_chunk_count = self.engine_routed_expert_chunk_count + len(
+                chunks
+            )
+        if routed_expert_chunk_count < self.engine_routed_expert_chunk_count:
+            raise ValueError(
+                "vLLM routed-expert chunk cursor moved backwards: "
+                f"old={self.engine_routed_expert_chunk_count} "
+                f"new={routed_expert_chunk_count}"
+            )
+        expected_new_chunks = (
+            routed_expert_chunk_count - self.engine_routed_expert_chunk_count
+        )
+        if expected_new_chunks != len(chunks):
+            raise ValueError(
+                "vLLM routed-expert chunk cursor skipped progress: "
+                f"expected={expected_new_chunks} received={len(chunks)}"
+            )
+        normalized = [tensor(value, name="routed_experts") for value in chunks]
+        if normalized:
+            model_shape = self._route_model_shape(normalized[0])
+            if any(tuple(chunk.shape[1:]) != model_shape for chunk in normalized):
+                raise ValueError("routed experts changed model dimensions")
+            skip_rows = self._engine_route_skip_rows()
+            retained = []
+            for chunk in normalized:
+                chunk_start = self.engine_routed_expert_row_count
+                self.engine_routed_expert_row_count += int(chunk.shape[0])
+                local_start = max(skip_rows - chunk_start, 0)
+                if local_start < chunk.shape[0]:
+                    retained.append(chunk[local_start:].contiguous())
+            self.active_buffer.generated_routed_experts.extend(retained)
+        if complete_routed_experts is not None:
+            complete = tensor(complete_routed_experts, name="complete_routed_experts")
+            model_shape = self._route_model_shape(complete)
+            if tuple(complete.shape[1:]) != model_shape:
+                raise ValueError("completed routed experts changed model dimensions")
+            self.terminal_routed_experts = complete[
+                self._engine_route_skip_rows() :
+            ].contiguous()
+        self.engine_routed_expert_chunk_count = routed_expert_chunk_count
+
+    def _engine_route_skip_rows(self) -> int:
+        """Rows already owned by parent lineage or a restored durable cut."""
+        skip_rows = self.call.admission.prev_len
+        if self.restored_routed_experts is not None:
+            skip_rows += max(int(self.restored_routed_experts.shape[0]) - 1, 0)
+        return skip_rows
+
+    def _route_model_shape(
+        self, generated: torch.Tensor | None = None
+    ) -> tuple[int, int]:
+        candidates = [
+            generated,
+            self.restored_routed_experts,
+            self.terminal_routed_experts,
+            *self.sealed_generated_routed_experts,
+            *self.active_buffer.generated_routed_experts,
+        ]
+        for candidate in candidates:
+            if candidate is not None:
+                return int(candidate.shape[1]), int(candidate.shape[2])
+        raise ValueError("vLLM did not return routed experts for the captured prefix")
+
+    @staticmethod
+    def _concat_routes(chunks: list[torch.Tensor]) -> torch.Tensor | None:
+        return torch.cat(chunks, dim=0) if chunks else None
+
+    def _default_final_route(self, model_shape: tuple[int, int]) -> torch.Tensor:
+        layers, topk = model_shape
+        return (
+            torch.arange(topk, dtype=self.routed_experts_dtype)
+            .view(1, 1, topk)
+            .expand(1, layers, topk)
+            .clone()
+        )
+
+    def cumulative_routed_experts(self) -> torch.Tensor | None:
+        """Build the delta-aligned route tensor advertised by the latest cut."""
+        if not self.capture_routed_experts:
+            return None
+        raw = self.terminal_routed_experts
+        if raw is None:
+            raw = self._concat_routes(
+                self.sealed_generated_routed_experts
+                + self.active_buffer.generated_routed_experts
+            )
+        generated_token_count = len(self.sealed_generated_token_ids) + len(
+            self.active_buffer.generated_token_ids
+        )
+        restored = self.restored_routed_experts
+        if raw is None:
+            if restored is not None and generated_token_count == 0:
+                return self.restored_routed_experts.clone()
+            if generated_token_count == 0:
+                return None
+            if restored is None:
+                raise ValueError(
+                    "vLLM did not return routed experts for the captured prefix"
+                )
+            raw = torch.empty(
+                (0, restored.shape[1], restored.shape[2]),
+                dtype=self.routed_experts_dtype,
+            )
+        model_shape = self._route_model_shape(raw)
+        final = self._default_final_route(model_shape)
+        expected_raw_len = max(
+            0,
+            generated_token_count
+            if restored is not None
+            else len(self.prompt_token_ids)
+            - self.call.admission.prev_len
+            + generated_token_count
+            - 1,
+        )
+        if raw.shape[0] > expected_raw_len + 1:
+            raise ValueError(
+                "vLLM returned too many routed experts for the captured prefix: "
+                f"routes={raw.shape[0]} expected_at_most={expected_raw_len + 1}"
+            )
+        if raw.shape[0] < expected_raw_len:
+            missing = torch.full(
+                (expected_raw_len - raw.shape[0], *model_shape),
+                -1,
+                dtype=self.routed_experts_dtype,
+            )
+            raw = torch.cat((raw, missing), dim=0)
+        if restored is None:
+            return torch.cat((raw[:expected_raw_len], final), dim=0)
+        if tuple(restored.shape[1:]) != model_shape:
+            raise ValueError("restored routed experts changed model dimensions")
+        return torch.cat((restored[:-1], raw[:expected_raw_len], final), dim=0)
     def freeze_for_checkpoint(
         self, checkpoint_id: str
-    ) -> tuple[str, int, list[int], list[float], list[int], list[float]]:
+    ) -> tuple[
+        str,
+        int,
+        list[int],
+        list[float],
+        torch.Tensor | None,
+        list[int],
+        list[float],
+        torch.Tensor | None,
+    ]:
         """Swap the active buffer and return its delta plus the stable prefix."""
         if self.frozen_buffer is not None:
             raise RuntimeError(
                 "cannot start a generation cut while another cut is in progress"
             )
         buffer = self.active_buffer
+        cumulative_routed_experts = self.cumulative_routed_experts()
+        chunk_routed_experts = None
+        previous_route_count = self.sealed_cumulative_routed_expert_count
+        if previous_route_count is None and self.restored_routed_experts is not None:
+            previous_route_count = int(self.restored_routed_experts.shape[0])
+        if cumulative_routed_experts is not None and buffer.generated_token_ids:
+            if previous_route_count is None:
+                chunk_routed_experts = cumulative_routed_experts
+            else:
+                start = previous_route_count - 1
+                chunk_routed_experts = cumulative_routed_experts[start:-1]
+                if chunk_routed_experts.shape[0] != len(buffer.generated_token_ids):
+                    raise ValueError(
+                        "routed-expert checkpoint delta does not match token delta"
+                    )
         self.active_buffer = _RequestCaptureBuffer(sequence=self.next_buffer_sequence)
         self.next_buffer_sequence += 1
         self.frozen_buffer = _FrozenRequestCaptureBuffer(
             checkpoint_id=checkpoint_id,
             buffer=buffer,
+            cumulative_routed_expert_count=(
+                None
+                if cumulative_routed_experts is None
+                else int(cumulative_routed_experts.shape[0])
+            ),
         )
         return (
             f"active/{checkpoint_id}/{buffer.sequence}",
             buffer.sequence,
             list(buffer.generated_token_ids),
             list(buffer.generated_logprobs),
+            chunk_routed_experts,
             self.sealed_generated_token_ids + buffer.generated_token_ids,
             self.sealed_generated_logprobs + buffer.generated_logprobs,
+            cumulative_routed_experts,
         )
 
     def seal_frozen_buffer(self, checkpoint_id: str) -> None:
         """Adopt a successfully staged frozen buffer into the live prefix."""
         frozen = self._require_frozen_buffer(checkpoint_id)
-        self.sealed_generated_token_ids.extend(frozen.generated_token_ids)
-        self.sealed_generated_logprobs.extend(frozen.generated_logprobs)
+        buffer = frozen.buffer
+        self.sealed_generated_token_ids.extend(buffer.generated_token_ids)
+        self.sealed_generated_logprobs.extend(buffer.generated_logprobs)
+        self.sealed_generated_routed_experts.extend(buffer.generated_routed_experts)
+        if frozen.cumulative_routed_expert_count is not None:
+            self.sealed_cumulative_routed_expert_count = (
+                frozen.cumulative_routed_expert_count
+            )
         self.frozen_buffer = None
 
     def rollback_frozen_buffer(self, checkpoint_id: str) -> None:
         """Restore a failed cut ahead of progress collected after its swap."""
         frozen = self._require_frozen_buffer(checkpoint_id)
-        self.active_buffer.generated_token_ids[:0] = frozen.generated_token_ids
-        self.active_buffer.generated_logprobs[:0] = frozen.generated_logprobs
+        buffer = frozen.buffer
+        self.active_buffer.generated_token_ids[:0] = buffer.generated_token_ids
+        self.active_buffer.generated_logprobs[:0] = buffer.generated_logprobs
+        self.active_buffer.generated_routed_experts[:0] = (
+            buffer.generated_routed_experts
+        )
         self.frozen_buffer = None
 
-    def _require_frozen_buffer(self, checkpoint_id: str) -> _RequestCaptureBuffer:
+    def _require_frozen_buffer(self, checkpoint_id: str) -> _FrozenRequestCaptureBuffer:
         frozen = self.frozen_buffer
         if frozen is None or frozen.checkpoint_id != checkpoint_id:
             raise RuntimeError(
                 f"generation cut {checkpoint_id!r} does not own the frozen buffer"
             )
-        return frozen.buffer
+        return frozen
 
 
 @dataclass(frozen=True)
@@ -177,6 +405,14 @@ class _CompletedCaptureState:
     terminal_finish_reason: Literal["stop", "length"] | None
     terminal_stop_reason: str | int | None
     completed_at_monotonic: float
+
+
+@dataclass(frozen=True)
+class _ResolvedGenerationCut:
+    """Verified token prefix plus optional router-replay state."""
+
+    snapshot: Any
+    routed_experts: torch.Tensor | None = None
 
 
 def _remaining_generation_limits_after_prefix(
@@ -343,17 +579,94 @@ class GenerationCutCaptureMixin:
                 "_staging_source not initialized; call setup_token_capture() first"
             )
         staging_keys = list(continuation.staging_keys)
-        snapshots = self._staging_source.fetch(staging_keys)
-        if len(snapshots) != len(staging_keys):
+        routes_enabled = bool(
+            getattr(self, "_return_routed_experts_enabled", lambda: False)()
+        )
+        if routes_enabled:
+            chunks = self._staging_source.fetch_for_finalization(
+                staging_keys, include_route_fragments=True
+            )
+        else:
+            chunks = self._staging_source.fetch(staging_keys)
+        if len(chunks) != len(staging_keys):
             raise RuntimeError("generation-cut fetch did not return every staged chunk")
-        if not snapshots:
+        if not chunks:
             raise RuntimeError("generation-cut continuation has no staged chunks")
-        return snapshots
+        return chunks
+
+    def _generation_cut_route_extras(
+        self, chunks: list[Any], snapshots: list[Any]
+    ) -> tuple[dict[str, Any] | None, torch.Tensor | None]:
+        """Verify and join the route fragments carried by cut chunks.
+
+        The first chunk stores a normal full, delta-aligned route tensor whose
+        last row is the unused final-position placeholder. Every later chunk
+        stores vLLM's generated route delta: its first row replaces that
+        placeholder, and a new placeholder is appended at the new boundary.
+        """
+        fragments = [getattr(chunk, "fragment", None) for chunk in chunks]
+        if not any(fragment is not None for fragment in fragments):
+            if bool(getattr(self, "_return_routed_experts_enabled", lambda: False)()):
+                raise RuntimeError(
+                    "generation-cut checkpoint has no router-replay payload"
+                )
+            return None, None
+        if any(fragment is None for fragment in fragments):
+            raise RuntimeError("generation-cut route fragments are incomplete")
+
+        from nemo_rl.experience.route_assembly import (
+            verify_route_fragment_integrity,
+        )
+        from nemo_rl.utils.routed_experts_codec import encode_routed_experts
+
+        routes: torch.Tensor | None = None
+        for index, (chunk, snapshot, fragment) in enumerate(
+            zip(chunks, snapshots, fragments, strict=True)
+        ):
+            assert fragment is not None
+            routed_len = getattr(chunk, "routed_len", int(fragment.routes.shape[0]))
+            if routed_len != snapshot.delta_len:
+                raise RuntimeError(
+                    "generation-cut route length does not match token delta: "
+                    f"routes={routed_len} tokens={snapshot.delta_len}"
+                )
+            if not verify_route_fragment_integrity(
+                fragment,
+                extras_digest_version=snapshot.extras_digest_version,
+                expected_extras_digest=snapshot.extras_digest,
+            ):
+                raise RuntimeError(
+                    "generation-cut route fragment failed integrity check"
+                )
+            fragment_routes = fragment.routes.cpu().contiguous()
+            if fragment_routes.dim() != 3:
+                raise RuntimeError("generation-cut routes must have rank 3")
+            if routes is None:
+                routes = fragment_routes
+                continue
+            if tuple(fragment_routes.shape[1:]) != tuple(routes.shape[1:]):
+                raise RuntimeError("generation-cut route model dimensions changed")
+            final = (
+                torch.arange(fragment_routes.shape[2], dtype=fragment_routes.dtype)
+                .view(1, 1, -1)
+                .expand(1, fragment_routes.shape[1], fragment_routes.shape[2])
+                .clone()
+            )
+            routes = torch.cat((routes[:-1], fragment_routes, final), dim=0)
+
+        assert routes is not None
+        expected_len = sum(snapshot.delta_len for snapshot in snapshots)
+        if routes.shape[0] != expected_len:
+            raise RuntimeError(
+                "rebuilt generation-cut routes do not match cumulative token delta"
+            )
+        return {"routed_experts": encode_routed_experts(routes)}, routes
 
     def _rebuild_generation_cut_snapshot(
-        self, admission: Any, prefix_token_ids: list[int], snapshots: list[Any]
-    ) -> Any:
+        self, admission: Any, prefix_token_ids: list[int], chunks: list[Any]
+    ) -> _ResolvedGenerationCut:
         """Rebuild and verify the cumulative staged prefix from its fetched chunks."""
+        snapshots = [getattr(chunk, "snapshot", chunk) for chunk in chunks]
         continuation = admission.generation_cut
         weight_versions = [snapshot.weight_version for snapshot in snapshots]
         if weight_versions != sorted(weight_versions):
@@ -405,7 +718,8 @@ class GenerationCutCaptureMixin:
         # chunks. The cumulative snapshot uses the oldest contributing version
         # so downstream replay-buffer staleness checks remain conservative.
         weight_version = weight_versions[0]
-        extras_digest = compute_extras_digest(None)
+        extras, routed_experts = self._generation_cut_route_extras(chunks, snapshots)
+        extras_digest = compute_extras_digest(extras)
         chain_hash = compute_chain_hash(admission.parent_chain_hash, token_ids_delta)
         cumulative_hash = hash_token_ids(prefix_token_ids + token_ids_delta)
         digest = compute_staging_digest(
@@ -500,14 +814,17 @@ class GenerationCutCaptureMixin:
             weight_versions[-1],
             prefix_ids_sha256,
         )
-        return snapshot
+        return _ResolvedGenerationCut(
+            snapshot=snapshot,
+            routed_experts=routed_experts,
+        )
 
     def _resolve_generation_cut(
         self,
         admission: Any,
         prefix_token_ids: list[int],
         snapshots: list[Any] | None = None,
-    ) -> Any | None:
+    ) -> _ResolvedGenerationCut | None:
         """Fetch and rebuild the cumulative staged prefix named by an admission."""
         continuation = admission.generation_cut
         if continuation is None:
@@ -701,8 +1018,10 @@ class GenerationCutCaptureMixin:
                         chunk_sequence,
                         chunk_token_ids,
                         chunk_logprobs,
+                        chunk_routed_experts,
                         generated_token_ids,
                         generated_logprobs,
+                        cumulative_routed_experts,
                     ) = state.freeze_for_checkpoint(checkpoint_id)
             if observation_error is not None:
                 # A dropped delta leaves the buffer short of what vLLM decoded.
@@ -748,13 +1067,34 @@ class GenerationCutCaptureMixin:
 
             staged_key = None
             try:
+                from nemo_rl.utils.routed_experts_codec import encode_routed_experts
+
+                cumulative_extras = (
+                    None
+                    if cumulative_routed_experts is None
+                    else {
+                        "routed_experts": encode_routed_experts(
+                            cumulative_routed_experts
+                        )
+                    }
+                )
                 cumulative_record = capture.build_prefix_record(
                     state.call,
                     prompt_token_ids=state.prompt_token_ids,
                     generated_token_ids=generated_token_ids,
                     generated_logprobs=generated_logprobs,
+                    extras=cumulative_extras,
                 )
                 if chunk_token_ids:
+                    chunk_extras = (
+                        None
+                        if chunk_routed_experts is None
+                        else {
+                            "routed_experts": encode_routed_experts(
+                                chunk_routed_experts
+                            )
+                        }
+                    )
                     chunk_record = (
                         cumulative_record
                         if not state.generation_cut_staging_keys
@@ -762,6 +1102,7 @@ class GenerationCutCaptureMixin:
                             state.call,
                             generated_token_ids=chunk_token_ids,
                             generated_logprobs=chunk_logprobs,
+                            extras=chunk_extras,
                         )
                     )
                     result = yield chunk_record, chunk_sequence
