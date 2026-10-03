@@ -64,6 +64,10 @@ from nemo_rl.environments.nemo_gym import (
     get_nemo_gym_route_name,
     get_pad_dynamic_image_shapes,
 )
+from nemo_rl.environments.nemo_gym_task import (
+    get_nemo_gym_task_input,
+    is_nemo_gym_task,
+)
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
@@ -134,8 +138,10 @@ def attach_initial_nemo_gym_image_payloads(
     ):
         if extra_env_info is None or not isinstance(extra_env_info, dict):
             continue
-        initial_messages = extra_env_info.get("responses_create_params", {}).get(
-            "input", []
+        initial_messages = (
+            get_nemo_gym_task_input(extra_env_info)
+            .get("responses_create_params", {})
+            .get("input", [])
         )
         # Load images from Responses-API input messages in encounter order.
         images = [
@@ -522,7 +528,9 @@ def _apply_effort_shaping(
             (
                 msg["content"]
                 for msg in reversed(
-                    nemo_gym_rows[i]["responses_create_params"]["input"]
+                    get_nemo_gym_task_input(nemo_gym_rows[i])[
+                        "responses_create_params"
+                    ]["input"]
                 )
                 if msg.get("role") == "user" and "content" in msg
             ),
@@ -2408,10 +2416,12 @@ def _prepare_nemo_gym_rows(
     for row_index, row in enumerate(rows):
         group_index = row_index // num_generations
         rollout_index = row_index % num_generations
-        responses_create_params = row.get("responses_create_params")
+        responses_create_params = get_nemo_gym_task_input(row).get(
+            "responses_create_params"
+        )
         if not isinstance(responses_create_params, dict):
             raise TypeError(
-                "Each NeMo-Gym row must contain a responses_create_params dict"
+                "Each NeMo-Gym task input must contain a responses_create_params dict"
             )
 
         responses_create_params["temperature"] = sampling_params.temperature
@@ -2452,10 +2462,37 @@ def _bucket_nemo_gym_rows_by_instance(
         first-use order. Actors with no rows are omitted rather than sent an
         empty batch.
     """
+    if not rows:
+        return []
+    if (
+        len(shard_set.all_handles) == 1
+        and not shard_set.environment_server_routes
+        and not shard_set.route_to_shard
+    ):
+        # A bare actor validates native taskset routes from its own Gym config.
+        # Still reject groups mixing tasksets or legacy routes before dispatch.
+        for start in range(0, len(rows), num_generations):
+            identities = {
+                ("taskset", row["task_id"]["taskset"])
+                if is_nemo_gym_task(row)
+                else ("legacy", get_nemo_gym_route_name(row))
+                for row in rows[start : start + num_generations]
+            }
+            if len(identities) != 1:
+                raise ValueError(
+                    f"NeMo-Gym prompt group at row {start} mixes routes "
+                    f"{sorted(identities)}. A group must reference exactly one route."
+                )
+        handle = shard_set.sole_handle()
+        return [(shard_set.instance_label(handle), handle, rows)]
+
     buckets: dict[int, tuple[str, Any, list[dict]]] = {}
     for start in range(0, len(rows), num_generations):
         group = rows[start : start + num_generations]
-        route_names = {get_nemo_gym_route_name(row) for row in group}
+        route_names = {
+            get_nemo_gym_route_name(row, shard_set.environment_server_routes)
+            for row in group
+        }
         if len(route_names) != 1:
             raise ValueError(
                 f"NeMo-Gym prompt group at row {start} mixes routes "

@@ -39,6 +39,10 @@ from omegaconf import OmegaConf
 # The actor factory or rollout code consumes these separately.
 NEMO_RL_DICT_CONFIG_KEYS = frozenset({"effort_levels", "tokenizer_config"})
 
+# Gym settings that contain mappings but are not server-instance overlays.
+# Route maps stay in the shared config so every shard sees the same tasksets.
+GYM_DICT_CONFIG_KEYS = frozenset({"environment_server_routes"})
+
 # Ray placement-group strategies a shard plan may ask for. STRICT_SPREAD is the
 # point of sharding -- one actor per node -- and anything else colocates shards
 # and gives up the capacity isolation. PACK exists so the mechanism can be
@@ -54,7 +58,9 @@ SHARD_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 GYM_LOG_DIR_KEY = "nemo_gym_log_dir"
 
 # Gym's server-type keys that make an entry a rollout destination.
-GYM_ROUTABLE_KEYS = frozenset({"responses_api_agents", "resources_servers"})
+GYM_ROUTABLE_KEYS = frozenset(
+    {"responses_api_agents", "resources_servers", "environment_servers"}
+)
 
 
 class ShardConfigError(ValueError):
@@ -238,6 +244,7 @@ def find_gym_config_entries(nemo_gym_config: Mapping[str, Any]) -> list[str]:
         for key, value in nemo_gym_config.items()
         if key not in SHARDING_CONFIG_KEYS
         and key not in NEMO_RL_DICT_CONFIG_KEYS
+        and key not in GYM_DICT_CONFIG_KEYS
         and (isinstance(value, Mapping) or OmegaConf.is_dict(value))
     )
 
@@ -496,10 +503,11 @@ def build_route_shard_map(
     """Map each routable entry to its shard, rejecting ambiguous routes.
 
     Takes what each shard reported from ``NemoGym.list_entries()`` and returns
-    ``{route_name: shard_name}``, the lookup the router dispatches on. Current
-    Gym rows route either by ``agent_ref.name`` or by ``task_source``. The
+    ``{route_name: shard_name}``, the lookup the router dispatches on. Legacy
+    rows route either by ``agent_ref.name`` or by ``task_source``. The
     latter names the agent or resources-server entry that declared the dataset,
-    so both entry types must be included.
+    so both entry types must be included. Native tasksets resolve to an
+    Environment Server entry instead.
 
     Two failures are caught here rather than at first dispatch. A routable
     entry hosted by two shards is always an error: rows naming it could go to
@@ -519,8 +527,8 @@ def build_route_shard_map(
                 raise ShardSetupError(
                     f"Routable Gym entry '{entry}' is hosted by both shard "
                     f"'{route_to_shard[entry]}' and shard '{shard_name}'. An "
-                    f"agent or resources server must live in exactly one shard "
-                    f"so rows naming it have one destination."
+                    "agent, resources server, or environment server must live "
+                    "in exactly one shard so rows naming it have one destination."
                 )
             route_to_shard[entry] = shard_name
 
@@ -538,6 +546,48 @@ def build_route_shard_map(
             hosting_shard.setdefault(entry, shard_name)
 
     return route_to_shard
+
+
+def build_environment_server_routes(
+    routes_by_shard: Mapping[str, Mapping[str, str]],
+    entries_by_shard: Mapping[str, Mapping[str, list[str]]],
+) -> dict[str, str]:
+    """Merge taskset routes and require a runnable destination on its owner.
+
+    A shared route map may name servers in several shards. Shard-local maps
+    loaded from Gym config paths also work, provided a taskset has one target
+    and the shard hosting that target knows the route itself.
+    """
+    routes: dict[str, str] = {}
+    for shard_name, shard_routes in routes_by_shard.items():
+        for taskset, server_name in shard_routes.items():
+            if taskset in routes and routes[taskset] != server_name:
+                raise ShardSetupError(
+                    f"Taskset {taskset!r} has conflicting environment server routes: "
+                    f"{routes[taskset]!r} and {server_name!r} in shard {shard_name!r}."
+                )
+            routes[taskset] = server_name
+
+    for taskset, server_name in routes.items():
+        owners = [
+            shard_name
+            for shard_name, entries in entries_by_shard.items()
+            if "environment_servers" in entries.get(server_name, [])
+        ]
+        if len(owners) != 1:
+            raise ShardSetupError(
+                f"Taskset {taskset!r} routes to {server_name!r}, which must name "
+                f"a running Environment Server in exactly one shard; found {owners}."
+            )
+        owner = owners[0]
+        if routes_by_shard[owner].get(taskset) != server_name:
+            raise ShardSetupError(
+                f"Taskset {taskset!r} routes to Environment Server {server_name!r} "
+                f"in shard {owner!r}, but that shard has no matching "
+                "environment_server_routes entry. Put the route in the shared "
+                "config or the owning shard's config."
+            )
+    return routes
 
 
 def apply_shard_log_dir(
