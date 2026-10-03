@@ -54,9 +54,18 @@ from nemo_rl.utils.config import (
     load_config,
     parse_hydra_overrides,
     register_omegaconf_resolvers,
+    warn_if_config_path_overridden,
 )
 from nemo_rl.utils.logger import get_next_experiment_dir, log_container_init_timing
 from nemo_rl.utils.timer import Timer
+
+# Output locations that launch scripts commonly set on the command line. A
+# soft warning reports when an override replaces the config file's value.
+OUTPUT_DIR_CONFIG_KEYS = (
+    "logger.log_dir",
+    "checkpointing.checkpoint_dir",
+    "env.nemo_gym.nemo_gym_log_dir",
+)
 
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
@@ -144,7 +153,20 @@ def main() -> None:
 
         if overrides:
             print(f"Overrides: {overrides}")
+            config_file_dirs = {
+                key: OmegaConf.select(config, key, throw_on_resolution_failure=False)
+                for key in OUTPUT_DIR_CONFIG_KEYS
+            }
             config = parse_hydra_overrides(config, overrides)
+            for key, config_file_dir in config_file_dirs.items():
+                warn_if_config_path_overridden(
+                    key,
+                    configured=config_file_dir,
+                    effective=OmegaConf.select(
+                        config, key, throw_on_resolution_failure=False
+                    ),
+                    reason="changed by command-line overrides",
+                )
 
         config = OmegaConf.to_container(config, resolve=True)
         config = MasterConfig(**config)
@@ -152,7 +174,14 @@ def main() -> None:
         print("Applied CLI overrides")
 
     # Get the next experiment directory with incremented ID
-    config.logger["log_dir"] = get_next_experiment_dir(config.logger["log_dir"])
+    base_log_dir = config.logger["log_dir"]
+    config.logger["log_dir"] = get_next_experiment_dir(base_log_dir)
+    warn_if_config_path_overridden(
+        "logger.log_dir",
+        configured=base_log_dir,
+        effective=config.logger["log_dir"],
+        reason="each run logs to a new exp_NNN subdirectory",
+    )
     print(f"📊 Using log directory: {config.logger['log_dir']}")
     if config.checkpointing["enabled"]:
         print(

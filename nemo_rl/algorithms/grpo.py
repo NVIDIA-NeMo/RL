@@ -160,6 +160,7 @@ from nemo_rl.utils.checkpoint import (
     CheckpointingConfig,
     CheckpointManager,
 )
+from nemo_rl.utils.config import warn_if_config_path_overridden
 from nemo_rl.utils.logger import (
     Logger,
     LoggerConfig,
@@ -632,6 +633,7 @@ def setup(
         policy_config["generation"] = generation_config
     _validate_multimodal_dedup_capability(master_config)
     _validate_seq_logprob_error_in_loss(master_config)
+    enable_nemo_gym = should_use_nemo_gym(master_config)
 
     # Validation-only sampling is honored only on the NeMo-Gym vLLM rollout
     # path; everywhere else validation must sample exactly like training.
@@ -687,6 +689,19 @@ def setup(
     #         Logger
     # ==========================
     logger = Logger(logger_config)
+    if enable_nemo_gym:
+        # NeMo Gym writes server log files only when nemo_gym_log_dir is set.
+        # Always point it at this run's log directory, replacing any configured
+        # value, so the Gym logs stay with the rest of this run's logs.
+        nemo_gym_config = env_configs.setdefault("nemo_gym", {})
+        nemo_gym_log_dir = os.path.join(logger.base_log_dir, "nemo_gym")
+        warn_if_config_path_overridden(
+            "env.nemo_gym.nemo_gym_log_dir",
+            configured=nemo_gym_config.get("nemo_gym_log_dir"),
+            effective=nemo_gym_log_dir,
+            reason="NeMo Gym server logs always go under this run's log directory",
+        )
+        nemo_gym_config["nemo_gym_log_dir"] = nemo_gym_log_dir
     logger.log_hyperparams(master_config.model_dump())
 
     # ==========================
@@ -877,7 +892,6 @@ def setup(
 
     # NeMo Gym is initialized inside setup() (rather than by the caller) so its
     # spinup can overlap with vLLM model loading via deferred model load.
-    enable_nemo_gym = should_use_nemo_gym(master_config)
     _raise_if_reward_penalties_enabled_without_nemo_gym(
         master_config, enable_nemo_gym=enable_nemo_gym
     )
