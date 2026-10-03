@@ -26,6 +26,11 @@
 #   --build-arg BUILD_DYNAMO=1
 
 ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.05-cuda13.2-devel-ubuntu24.04
+# Global so every stage's uv cache mount id (BASE_IMAGE-UV_VERSION-HYBRID_EP_MULTINODE)
+# can redeclare it bare and stay in sync -- a single-node-built DeepEP wheel is not
+# safe to reuse for a multi-node build, so this must be part of the cache identity,
+# not just a fixed hermetic-stage ENV.
+ARG HYBRID_EP_MULTINODE=1
 FROM scratch AS nemo-rl
 ARG NRL_GIT_REF=main
 ADD --keep-git-dir=true https://github.com/NVIDIA-NeMo/RL.git#${NRL_GIT_REF} /
@@ -46,6 +51,7 @@ FROM scratch AS trtllm-ccache-seed
 # empty when periodically compacting the cache into a full snapshot.
 FROM scratch AS trtllm-wheel-cache-output-base
 FROM scratch AS trtllm-ccache-output-base
+FROM scratch AS uv-cache-output-base
 
 # Default custom-setup stage: installs apptainer.
 # Override with: --build-context custom-setup=<your-dir>
@@ -184,6 +190,7 @@ ARG SKIP_SGLANG_BUILD
 ARG SKIP_TRTLLM_BUILD
 ARG BASE_IMAGE
 ARG UV_VERSION
+ARG HYBRID_EP_MULTINODE
 ARG TARGETARCH
 ARG TRTLLM_CCACHE_MAXSIZE=20G
 ARG TRTLLM_BUILD_JOBS=24
@@ -194,8 +201,13 @@ ENV UV_LINK_MODE=copy
 # Ensure DeepEP is built for H100 and B200 (also mcore inference unified memory API now invokes a torch API that requires these to be set)
 ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
 
-# Build HybridEP with inter-node transport support.
-ENV HYBRID_EP_MULTINODE=1
+# Build HybridEP with inter-node transport support. Derived from the ARG (not
+# hardcoded) so a non-default --build-arg HYBRID_EP_MULTINODE=0 is reflected
+# consistently in this stage's cache mount IDs and in uv-cache-export's --
+# an ENV literal here would silently override the ARG for ${...} expansion
+# in this stage and its descendants, while uv-cache-export (FROM base, no
+# such ENV) would expand the real ARG value, desyncing the two cache IDs.
+ENV HYBRID_EP_MULTINODE=${HYBRID_EP_MULTINODE}
 
 # Ensure HybridEP/DeepEP JIT compilation can find nvcc at runtime
 ENV CUDA_HOME=/usr/local/cuda
@@ -237,16 +249,20 @@ COPY --from=nemo-rl --link \
     3rdparty/ ./3rdparty/
 
 RUN --mount=type=ssh \
-    --mount=type=bind,from=uv-cache-seed,source=.,target=/tmp/uv-cache-seed <<"EOF" bash -exu
-CACHE_KEY=$(echo "${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE}" | md5sum | cut -c1-12)
-SEED_KEY=$(cat /tmp/uv-cache-seed/.cache-key 2>/dev/null || echo "")
-if [ -n "$SEED_KEY" ] && [ "$SEED_KEY" != "$CACHE_KEY" ]; then
-    echo "Cache key mismatch (base image, uv version, or build mode changed) — skipping stale seed"
-elif [ -n "$SEED_KEY" ]; then
-    echo "Seeding uv cache (key=${CACHE_KEY})"
-    mkdir -p /root/.cache/uv
-    rsync -a --exclude='.cache-key' /tmp/uv-cache-seed/ /root/.cache/uv/ 2>/dev/null || true
-fi
+    --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
+# /root/.uv-cache-store is a BuildKit cache mount: durable across builds on
+# this id (seeded from the :uv-cache registry image on first-ever use), but
+# never part of this or any layer's diff by construction. uv's installs below
+# use UV_LINK_MODE=hardlink, which needs the cache and the venvs on the SAME
+# filesystem -- hardlinks silently fall back to full copies across a mount
+# boundary. So materialize a plain working copy at the conventional
+# /root/.cache/uv path for this RUN (hardlinking stays exactly as before),
+# and sync it back + delete it on exit so it never enters this layer. Every
+# later RUN in this stage that also invokes uv (TRT-LLM build, worker-venv
+# prefetch phase 2) repeats this same dance around its own unchanged body.
+mkdir -p /root/.cache/uv
+rsync -a /root/.uv-cache-store/ /root/.cache/uv/
+trap 'rsync -a --delete /root/.cache/uv/ /root/.uv-cache-store/ 2>/dev/null || true; rm -rf /root/.cache/uv' EXIT
 
 uv venv --seed
 # The custom build scripts will alter the pyproject.toml and uv.lock
@@ -337,8 +353,6 @@ rm -rf /var/lib/apt/lists/*
 # Remove the aiohttp in this uv cache dir to fully address CVE GHSA-mqqc-3gqh-h2x8
 # The ray install will include the older aiohttp version in its cache
 find /root/.cache/uv -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +
-
-echo "${CACHE_KEY}" > /root/.cache/uv/.cache-key
 EOF
 
 # Keep the frequently changing TRT-LLM build inputs after the other backend
@@ -350,7 +364,16 @@ COPY --from=nemo-rl --link 3rdparty/TensorRT-LLM-workspace/ ./3rdparty/TensorRT-
 RUN --mount=type=ssh \
     --mount=type=bind,from=trtllm-ccache-seed,source=.,target=/tmp/trtllm-ccache-seed \
     --mount=type=cache,id=trtllm-wheel-cache-${TARGETARCH}-${BASE_IMAGE},from=trtllm-wheel-cache-seed,source=.,target=/root/.cache/trtllm-wheels,sharing=locked \
-    --mount=type=cache,id=trtllm-ccache-${TARGETARCH}-${BASE_IMAGE},target=/root/.cache/ccache,sharing=locked <<"EOF" bash -exu
+    --mount=type=cache,id=trtllm-ccache-${TARGETARCH}-${BASE_IMAGE},target=/root/.cache/ccache,sharing=locked \
+    --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
+# Same materialize/sync-back/delete dance as the dependency-install RUN above,
+# repeated here because a BuildKit cache mount only applies to the RUN
+# instruction it's declared on -- this RUN's own uv sync calls below
+# (UV_CACHE_DIR=/root/.cache/uv) need the plain, same-filesystem directory too.
+mkdir -p /root/.cache/uv
+rsync -a /root/.uv-cache-store/ /root/.cache/uv/
+trap 'rsync -a --delete /root/.cache/uv/ /root/.uv-cache-store/ 2>/dev/null || true; rm -rf /root/.cache/uv' EXIT
+
 # Lock/pyproject consistency is verified LATE here, for the whole image. The
 # dependency syncs above run --frozen (read-only on uv.lock: they neither update
 # nor validate it), so this uv lock --check is the ONLY place a stale lock is
@@ -469,6 +492,9 @@ WORKDIR /opt/nemo-rl
 FROM hermetic AS release
 
 # Re-declare build args for this stage
+ARG BASE_IMAGE
+ARG UV_VERSION
+ARG HYBRID_EP_MULTINODE
 ARG BUILD_DYNAMO
 ARG DYNAMO_PYTHON_VERSION=3.12.11
 ARG ETCD_VERSION=v3.5.21
@@ -506,18 +532,32 @@ COPY --from=nemo-rl --exclude=pyproject.toml --exclude=uv.lock . /opt/nemo-rl
 
 # Keep Dynamo's Python 3.12 dependency graph isolated from NeMo-RL's normal
 # Ray/vLLM environments. Default image builds do not create this environment.
-RUN <<"EOF" bash -exu -o pipefail
+RUN --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu -o pipefail
 if [[ "${BUILD_DYNAMO:-0}" != "1" ]]; then
     echo "BUILD_DYNAMO is not 1; skipping the managed Dynamo runtime"
     exit 0
 fi
+# Same materialize/sync-back/delete dance as the other uv-writing RUNs --
+# docker/dynamo/install.sh calls uv sync with no explicit UV_CACHE_DIR, so it
+# uses uv's default (/root/.cache/uv), which must be a plain same-filesystem
+# directory for hardlink installs and must not persist into this layer.
+mkdir -p /root/.cache/uv
+rsync -a /root/.uv-cache-store/ /root/.cache/uv/
+trap 'rsync -a --delete /root/.cache/uv/ /root/.uv-cache-store/ 2>/dev/null || true; rm -rf /root/.cache/uv' EXIT
 bash docker/dynamo/install.sh
 EOF
 # Unshallow the repo to get the full history (in the case it was from the scratch layer).
 # Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),
 # so do a quick check before trying to unshallow.
 RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
-RUN <<"EOF" bash -exu
+RUN --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
+# Same materialize/sync-back/delete dance as the dependency-install and
+# TRT-LLM RUNs -- this RUN's uv run/prefetch_venvs.py call below also needs
+# the plain, same-filesystem /root/.cache/uv to hardlink installs from.
+mkdir -p /root/.cache/uv
+rsync -a /root/.uv-cache-store/ /root/.cache/uv/
+trap 'rsync -a --delete /root/.cache/uv/ /root/.uv-cache-store/ 2>/dev/null || true; rm -rf /root/.cache/uv' EXIT
+
 # Reuse the custom wheel the hermetic stage mirrored into /opt/trtllm_wheels
 # (the runtime default of the TRT-LLM build backend). It lives in that layer,
 # so it is present whether the TRT-LLM RUN executed on this builder or was
@@ -555,8 +595,15 @@ EOF
 # RL's torch/nvidia stack. UV_TORCH_BACKEND keeps torch on the same CUDA backend.
 ARG NEMO_GYM_CUDA=cu130
 ARG NEMO_GYM_VLLM_VERSION=0.25.1
-RUN <<"EOF" bash -exu
+RUN --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
 if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
+    # Same materialize/sync-back/delete dance as the other uv-writing RUNs.
+    # The outer `uv run` here is symlink-mode (safe across the mount), but
+    # prefetch_venvs.py's inner Gym venvs install with UV_LINK_MODE=hardlink,
+    # which needs the plain same-filesystem /root/.cache/uv.
+    mkdir -p /root/.cache/uv
+    rsync -a /root/.uv-cache-store/ /root/.cache/uv/
+    trap 'rsync -a --delete /root/.cache/uv/ /root/.uv-cache-store/ 2>/dev/null || true; rm -rf /root/.cache/uv' EXIT
     case "${TARGETARCH:-amd64}" in arm64) WHEEL_ARCH=aarch64 ;; *) WHEEL_ARCH=x86_64 ;; esac
     GYM_VLLM_OVERRIDE=/opt/nemo-rl/.gym-vllm-override.txt
     printf 'vllm @ https://github.com/vllm-project/vllm/releases/download/v%s/vllm-%s-cp38-abi3-manylinux_2_28_%s.whl\n' \
@@ -608,6 +655,35 @@ for dir in /home/nemo-runtime /nemo_run /opt/nemo-rl "${UV_PROJECT_ENVIRONMENT}"
 done
 EOF
 USER root
+
+# Export the builder-local uv cache as a separate scratch image, same pattern
+# as the TRT-LLM ccache/wheel-cache below. CI builds this target immediately
+# after the release target with the same Buildx builder, so it can read the
+# cache mount without the uv/pip download cache ever entering the release image.
+FROM base AS uv-cache-export
+ARG BASE_IMAGE
+ARG TARGETARCH
+ARG UV_VERSION
+ARG HYBRID_EP_MULTINODE
+ARG UV_CACHE_EXPORT_NONCE
+RUN --mount=type=bind,from=uv-cache-seed,source=.,target=/tmp/uv-cache-seed \
+    --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
+echo "Exporting uv cache for build ${UV_CACHE_EXPORT_NONCE:-local}"
+# The hermetic layer may have been reused from BuildKit without executing its
+# RUN command, leaving this builder-local mount empty. Restore the seed only in
+# that case; unconditionally merging it would resurrect wheels uv evicted.
+if [[ -z "$(find /root/.uv-cache-store -mindepth 1 -print -quit)" ]]; then
+    rsync -a /tmp/uv-cache-seed/ /root/.uv-cache-store/
+fi
+mkdir -p /tmp/uv-cache-export
+cp -a /root/.uv-cache-store/. /tmp/uv-cache-export/
+echo "uv cache export payload:"
+du -sh /tmp/uv-cache-export
+EOF
+
+FROM uv-cache-output-base AS uv-cache
+COPY --link --from=uv-cache-export /tmp/uv-cache-export/ /
+LABEL com.nvidia.nemo-rl.cache-layout="uv-v1"
 
 # Export the builder-local ccache as a separate scratch image. CI builds this
 # target immediately after the release target with the same Buildx builder, so
