@@ -201,6 +201,9 @@ class OptionalResourcesConfig(TypedDict):
 class ColocationConfig(TypedDict):
     enabled: bool
     resources: OptionalResourcesConfig
+    # Opt into vLLM sleep level 2 at safe lifecycle boundaries. Level 2
+    # discards rollout weights instead of retaining a host-memory backup.
+    discard_weights_on_sleep: NotRequired[bool]
 
 
 class CheckpointEngineConfig(TypedDict):
@@ -476,6 +479,7 @@ class GenerationInterface(ABC):
         usable with no intervening prepare_for_generation.
         Only the colocated Megatron backend honors the flag today; other backends
         ignore it, as do engines on dedicated GPUs.
+
         """
         pass
 
