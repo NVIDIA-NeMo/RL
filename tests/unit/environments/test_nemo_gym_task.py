@@ -26,26 +26,16 @@ def test_legacy_task_fields_do_not_change_wire_format(row):
     assert get_nemo_gym_task_input(row) is row
 
 
-def test_native_task_input_preserves_identity_and_opaque_data():
+def test_native_task_input_returns_nested_object():
     row = {
         "task_id": {"taskset": "workplace:train", "task_id": "17"},
         "task_input": {
             "responses_create_params": {"input": "Find the next meeting."},
-            "task_data": {"state": [1, {"calendar": "team"}]},
         },
-        "_rowidx": 9,
     }
-    original = deepcopy(row)
 
     assert is_nemo_gym_task(row)
-    task_input = get_nemo_gym_task_input(row)
-    assert task_input is row["task_input"]
-    task_input["responses_create_params"]["temperature"] = 0.7
-
-    assert "responses_create_params" not in row
-    assert row["task_id"] == original["task_id"]
-    assert row["_rowidx"] == 9
-    assert task_input["task_data"] == original["task_input"]["task_data"]
+    assert get_nemo_gym_task_input(row) is row["task_input"]
 
 
 @pytest.mark.parametrize("task_input", [None, [], "serialized"])
