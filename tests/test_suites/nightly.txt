@@ -163,6 +163,7 @@ tests/test_suites/llm/grpo-qwen3-8b-base-1n8g-megatron-lora.sh
 # Sampling (temperature, top-p, top-k)
 tests/test_suites/llm/grpo-llama3.2-1b-instruct-1n8g-fsdp2tp2-temp0.8-topp0.9-topk50.sh
 tests/test_suites/llm/grpo-llama3.2-1b-instruct-1n8g-megatron-temp0.8-topp0.9-topk50.sh
+tests/test_suites/llm/grpo-llama3.2-1b-instruct-1n8g-megatron-temp0.8-topp0.9-topk50-is.sh
 
 # Yarn
 tests/test_suites/llm/grpo-qwen2.5-1.5B-4n8g-megatron-yarn-256k.sh
