@@ -206,6 +206,8 @@ class VllmRefitConfig(BaseModel, extra="allow"):
 class VllmConfig(GenerationConfig):
     vllm_cfg: VllmSpecificArgs
     vllm_kwargs: NotRequired[dict[str, Any]]
+    # Bound one legacy GRPO refit operation. None keeps the unbounded wait.
+    refit_timeout_s: NotRequired[PositiveFloat | None]
     # Per-token NVFP4 W4A4 rollout (TE-training flow; no ModelOpt training).
     # Mutually exclusive with quant_cfg/real_quant below. Defaults and validation
     # live in NvFp4PerTokenRolloutConfig.
