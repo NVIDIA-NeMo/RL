@@ -148,4 +148,10 @@ else
   done
   echo "Starting vllm-router with ${#worker_urls[@]} standard workers"
 fi
+# Extra router flags, e.g. "--balance-abs-threshold 16 --balance-rel-threshold 1.2" (word-split).
+if [[ -n "${VLLM_ROUTER_EXTRA_ARGS:-}" ]]; then
+  read -r -a extra_router_args <<< "${VLLM_ROUTER_EXTRA_ARGS}"
+  router_args+=("${extra_router_args[@]}")
+fi
+echo "vllm-router args: ${router_args[*]}" >> "${log_file}"
 exec "${router_python}" -m vllm_router.launch_router "${router_args[@]}" >> "${log_file}" 2>&1
