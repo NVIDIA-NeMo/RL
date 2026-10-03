@@ -86,6 +86,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     TQReplayMetadataState,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    ReadyFirstSamplerConfig,
     TransactionalAdmissionSampler,
     create_sampler,
 )
@@ -5466,7 +5467,10 @@ class SingleControllerActor:
 
         Port of ppo.py's _async_ppo_generation_lead_steps.
         """
-        if not self._is_ppo:
+        if not self._is_ppo or isinstance(
+            self._async_cfg.sampler, ReadyFirstSamplerConfig
+        ):
+            # Ready-first retains all admitted rollouts and uses a fixed gate window.
             return
         steady = self._async_cfg.sampler.max_lookahead_versions
         warmup = self._async_cfg.sampler.warmup_lookahead_versions
