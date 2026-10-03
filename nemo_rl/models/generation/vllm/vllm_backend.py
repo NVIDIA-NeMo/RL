@@ -99,6 +99,24 @@ def _detach_pending_layerwise_weights(
                 arguments.arguments["loaded_weight"] = loaded_weight.clone()
 
 
+def _abort_layerwise_reload(root: torch.nn.Module) -> None:
+    """Restore runtime parameters after an incomplete layerwise reload."""
+    from vllm.model_executor.model_loader.reload.layerwise import (
+        LOADING_LAYERS,
+        _place_kernel_tensors,
+        get_layerwise_info,
+    )
+
+    if hasattr(root, "_original_do_torchao_reload"):
+        root._do_torchao_reload = root._original_do_torchao_reload
+    for layer in root.modules():
+        info = get_layerwise_info(layer)
+        if info.kernel_tensors is not None:
+            _place_kernel_tensors(layer, info)
+        info.reset()
+        LOADING_LAYERS.discard(layer)
+
+
 def _refresh_hpc_modules_after_layerwise_reload(model: torch.nn.Module) -> None:
     """Rebuild kernel-specific state omitted by vLLM's layerwise finalizer.
 
@@ -419,11 +437,12 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
     _logged_gemma4_unified_drop: bool = False
     _sparse_delta_applier: Any = None
     _nrl_named_parameters: dict[str, torch.nn.Parameter]
+    _nrl_mxfp8_linear_reload_roots: tuple[torch.nn.Module, ...] | None = None
     hf_to_local_param_map: HFToLocalParamMap
     _nrl_layerwise_reload_active: bool = False
     # Initialization detaches parameters, so any later failure leaves this
     # worker unsafe to reuse. Keep the original failure for the worker lifetime.
-    _nrl_layerwise_reload_failure: Exception | None = None
+    _nrl_layerwise_reload_failure: BaseException | None = None
     # None until init_collective builds it. Declared so a rebuild can release the
     # previous group without probing for the attribute's existence.
     model_update_group: Any = None
@@ -434,6 +453,26 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             params = dict(self.model_runner.model.named_parameters())
             self._nrl_named_parameters = params
         return params
+
+    def _get_mxfp8_linear_reload_roots(self) -> tuple[torch.nn.Module, ...]:
+        roots = self._nrl_mxfp8_linear_reload_roots
+        if roots is None:
+            from nemo_rl.models.generation.vllm.quantization.fp8 import (
+                uses_native_mxfp8_linear_refit,
+            )
+
+            modules = getattr(self.model_runner.model, "modules", None)
+            roots = (
+                tuple(
+                    module
+                    for module in modules()
+                    if uses_native_mxfp8_linear_refit(module)
+                )
+                if modules is not None
+                else ()
+            )
+            self._nrl_mxfp8_linear_reload_roots = roots
+        return roots
 
     def _load_full_hf_weights(
         self, policy_weights: Iterable[tuple[str, torch.Tensor]]
@@ -1103,10 +1142,13 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
 
     def _uses_native_layerwise_refit(self, transport: WeightUpdateTransport) -> bool:
         """Return whether this transport needs vLLM's layerwise lifecycle."""
+        if transport not in ("ipc", "collective", "nccl_reshard"):
+            return False
         return (
-            transport in ("ipc", "collective", "nccl_reshard")
-            and self._uses_unquantized_flashinfer_trtllm()
-        ) or (transport in ("ipc", "collective") and self._uses_deepseek_v4_fp8_refit())
+            self._uses_unquantized_flashinfer_trtllm()
+            or self._uses_deepseek_v4_fp8_refit()
+            or bool(self._get_mxfp8_linear_reload_roots())
+        )
 
     def _uses_deepseek_v4_fp8_refit(self) -> bool:
         """Return whether the realized rollout model needs DSV4 FP8 reload hooks."""
@@ -1123,19 +1165,28 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         self, transport: WeightUpdateTransport | None = None
     ) -> None:
         """Reject unsupported features on the native layerwise reload path."""
-        if not self._uses_unquantized_flashinfer_trtllm():
+        uses_unquantized_trtllm = self._uses_unquantized_flashinfer_trtllm()
+        uses_native_mxfp8_linear = bool(self._get_mxfp8_linear_reload_roots())
+        if not (uses_unquantized_trtllm or uses_native_mxfp8_linear):
             return
 
         if transport in ("ipc", "collective", "nccl_reshard") and (
             self._uses_fp8_kv_cache()
         ):
             raise RuntimeError(
-                "BF16 FlashInfer TRTLLM partial refit does not support an "
-                "FP8 KV cache because its static scales are outside the "
-                "targeted reload lifecycle"
+                "Native layerwise refit does not support an FP8 KV cache "
+                "because its static scales are outside the targeted reload "
+                "lifecycle"
             )
 
-        if transport == "nccl_reshard":
+        if transport == "nccl_reshard" and uses_native_mxfp8_linear:
+            raise RuntimeError(
+                "Native MXFP8 linear kernels require the component-aware "
+                "NCCL Reshard refit adapter; use IPC or collective refit until "
+                "that adapter is available"
+            )
+
+        if transport == "nccl_reshard" and uses_unquantized_trtllm:
             realized_placements = set()
             for module in _unquantized_flashinfer_trtllm_modules(
                 self.model_runner.model
@@ -1163,8 +1214,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
 
         if self._mtp_drafter_refit_enabled():
             raise RuntimeError(
-                "Unquantized FlashInfer TRTLLM refit does not yet support "
-                "a co-trained MTP drafter"
+                "Native layerwise refit does not yet support a co-trained MTP drafter"
             )
 
     def _reject_unsupported_native_refit(
@@ -1184,6 +1234,34 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 "bypasses the model's prepare/finalize refit hooks. Use IPC "
                 "or collective refit with refit_with_reload_api=False."
             )
+        if self._get_mxfp8_linear_reload_roots():
+            raise RuntimeError(
+                f"{label} refit does not support native MXFP8 linear kernels "
+                "because it bypasses vLLM's native layerwise reload lifecycle"
+            )
+
+    def _reload_model_runner_weights(self, **kwargs: Any) -> None:
+        """Call the runner reload under the vLLM config it was built with."""
+        from vllm.config import set_current_vllm_config
+
+        with set_current_vllm_config(self.model_runner.vllm_config):
+            self.model_runner.reload_weights(**kwargs)
+
+    def _reset_model_runner_caches_after_refit(self) -> None:
+        """Mirror the cache invalidation performed by vLLM reload_weights."""
+        for method_name in (
+            "reset_lora_state",
+            "reset_encoder_cache",
+            "reset_mm_cache",
+        ):
+            reset = getattr(self.model_runner, method_name, None)
+            if reset is None:
+                continue
+            if not callable(reset):
+                raise RuntimeError(
+                    f"vLLM model runner {method_name} exists but is not callable"
+                )
+            reset()
 
     @contextmanager
     def _weight_update_lifecycle(
@@ -1210,14 +1288,25 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             )
 
             model = self.model_runner.model
-            # DSV4 needs a full-model reload; BF16 TRTLLM reload stays scoped
-            # to its realized modules so mixed-model MXFP8 metadata survives.
-            reload_targets = (
-                [model]
-                if use_deepseek_v4_fp8
-                else _unquantized_flashinfer_trtllm_modules(model)
-            )
+            # DSV4 needs a full-model reload. Other mixed models reload the
+            # union of realized BF16 TRTLLM experts and native MXFP8 linears.
+            # Keeping one lifecycle prevents one target family from restoring
+            # checkpoint storage after the other has installed runtime layout.
+            if use_deepseek_v4_fp8:
+                reload_targets = [model]
+            else:
+                reload_targets = []
+                seen_target_ids: set[int] = set()
+                for target in (
+                    *_unquantized_flashinfer_trtllm_modules(model),
+                    *self._get_mxfp8_linear_reload_roots(),
+                ):
+                    if id(target) in seen_target_ids:
+                        continue
+                    seen_target_ids.add(id(target))
+                    reload_targets.append(target)
             reloaded_module_ids = _reload_target_module_ids(reload_targets)
+            initialized_targets: list[torch.nn.Module] = []
             added_skip_tensors: Any = None
             if use_deepseek_v4_fp8:
                 from nemo_rl.models.generation.vllm.quantization import deepseek_v4_fp8
@@ -1235,6 +1324,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                         )
                     _refresh_hpc_modules_after_layerwise_reload(model)
                     self._maybe_process_mtp_drafter_after_loading()
+                    self._reset_model_runner_caches_after_refit()
                 torch.cuda.synchronize()
 
             try:
@@ -1243,10 +1333,19 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                         if use_deepseek_v4_fp8:
                             added_skip_tensors = deepseek_v4_fp8.prepare_refit(model)
                         for reload_target in reload_targets:
+                            initialized_targets.append(reload_target)
                             initialize_layerwise_reload(reload_target)
                     self._nrl_layerwise_reload_active = True
                     yield finalize
-            except Exception as error:
+            except BaseException as error:
+                for reload_target in reversed(initialized_targets):
+                    try:
+                        _abort_layerwise_reload(reload_target)
+                    except Exception:
+                        logger.exception(
+                            "Failed to restore native layerwise reload target %s",
+                            type(reload_target).__name__,
+                        )
                 self._nrl_layerwise_reload_failure = error
                 raise
             finally:
@@ -1257,21 +1356,91 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             return
 
         from vllm.config import set_current_vllm_config
+        from vllm.model_executor.model_loader.reload import (
+            finalize_layerwise_reload,
+            initialize_layerwise_reload,
+        )
         from vllm.model_executor.model_loader.utils import (
             process_weights_after_loading,
         )
 
+        reload_roots = self._get_mxfp8_linear_reload_roots()
+        if not reload_roots:
+
+            def finalize() -> None:
+                with set_current_vllm_config(self.model_runner.vllm_config):
+                    process_weights_after_loading(
+                        self.model_runner.model, self.model_config, self.device
+                    )
+                self._maybe_process_mtp_drafter_after_loading()
+                self._reset_model_runner_caches_after_refit()
+
+            yield finalize
+            if transport != "checkpoint_engine":
+                self._maybe_process_fp8_kv_cache()
+            return
+
+        pending_roots: list[torch.nn.Module] = []
+
+        def abort_pending_roots() -> None:
+            while pending_roots:
+                root = pending_roots.pop(0)
+                try:
+                    _abort_layerwise_reload(root)
+                except Exception:
+                    logger.exception(
+                        "Failed to abort MXFP8 layerwise reload for %s",
+                        type(root).__name__,
+                    )
+
+        def finalize_pending_roots() -> None:
+            first_error: Exception | None = None
+            while pending_roots:
+                root = pending_roots.pop(0)
+                try:
+                    finalize_layerwise_reload(root, self.model_config)
+                except Exception as error:
+                    if first_error is None:
+                        first_error = error
+                    logger.exception(
+                        "Failed to finalize MXFP8 layerwise reload for %s",
+                        type(root).__name__,
+                    )
+                    try:
+                        _abort_layerwise_reload(root)
+                    except Exception:
+                        logger.exception(
+                            "Failed to restore MXFP8 layerwise reload root %s",
+                            type(root).__name__,
+                        )
+            if first_error is not None:
+                raise first_error
+
         def finalize() -> None:
+            finalize_pending_roots()
             with set_current_vllm_config(self.model_runner.vllm_config):
                 process_weights_after_loading(
                     self.model_runner.model, self.model_config, self.device
                 )
             self._maybe_process_mtp_drafter_after_loading()
+            self._reset_model_runner_caches_after_refit()
 
-        yield finalize
+        with set_current_vllm_config(self.model_runner.vllm_config):
+            with torch.device(self.device):
+                try:
+                    for root in reload_roots:
+                        pending_roots.append(root)
+                        initialize_layerwise_reload(root)
+                    yield finalize
+                except BaseException:
+                    abort_pending_roots()
+                    raise
+                else:
+                    finalize_pending_roots()
         # Preserve the IPC lifetime boundary: the COMPLETE ACK is sent before
         # this optional second pass, just as it was before lifecycle hooks.
-        self._maybe_process_fp8_kv_cache()
+        if transport != "checkpoint_engine":
+            self._maybe_process_fp8_kv_cache()
 
     def _weight_update_errors_are_fatal(self) -> bool:
         """Whether transport errors should propagate instead of returning False."""
@@ -1402,7 +1571,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             try:
                 preparer.reset()
                 prepared_iterator = iter_prepared_weights()
-                self.model_runner.reload_weights(
+                self._reload_model_runner_weights(
                     weights_iterator=prepared_iterator,
                     is_checkpoint_format=True,
                 )
@@ -1624,7 +1793,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                     weight_iterator
                 )
                 try:
-                    self.model_runner.reload_weights(
+                    self._reload_model_runner_weights(
                         weights_iterator=reload_weight_iterator
                     )
                 finally:
