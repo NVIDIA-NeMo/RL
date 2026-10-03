@@ -65,10 +65,10 @@ Reference-policy logprobs never replay rollout routes. Current requirements:
 - Batch padding is never replayed. Rows other than all-`-1` missing routes that are
   partially negative, out of range, or repeat an expert are rejected as corrupt.
 
-Example: `examples/configs/recipes/llm/dapo-nanov3.5-30BA3B-4n8g-automodel-r3.yaml`
+Example: `examples/configs/recipes/llm/dapo-nanov3.5-30BA3B-4n8g-automodel-ep8-r3.yaml`
 (Nemotron-3.5 Lightning) keeps `train/token_mult_prob_error` near 1.010 for all steps
 and halves `train/gen_kl_error` (0.00037 vs 0.00086). Without Router Replay
-(`dapo-nanov3.5-30BA3B-4n8g-automodel.yaml`), 0-2 tokens per step disagreed by 10-31
+(`dapo-nanov3.5-30BA3B-4n8g-automodel-ep8.yaml`), 0-2 tokens per step disagreed by 10-31
 nats between vLLM and training, spiking the mean to 1e6-3e9 on about 20% of steps.
 
 ## Validation
