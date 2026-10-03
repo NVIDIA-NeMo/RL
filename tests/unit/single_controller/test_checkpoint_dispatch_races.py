@@ -53,7 +53,10 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 from nemo_rl.algorithms.async_utils.staleness_sampler import InOrderSampler
 from nemo_rl.algorithms.grpo import _initial_grpo_save_state
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
-from nemo_rl.algorithms.single_controller import SingleControllerActor
+from nemo_rl.algorithms.single_controller import (
+    SingleControllerActor,
+    _summarize_gym_episodes,
+)
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
@@ -2473,6 +2476,159 @@ class TestGymCheckpointPausesRolloutDeadlines:
                 ):
                     raise AssertionError("unreachable")
             assert not registry.suspended
+
+        asyncio.run(exercise())
+
+
+class TestDrainScalesWithPendingRepliesNotTheLedger:
+    """The drain waits on a few on-wire replies; its cost must not track every rollout.
+
+    At hundreds of thousands of live rollouts, rescanning the whole ledger on
+    each check blocks the event loop that delivers the very replies it waits
+    for, with every rollout parked behind the checkpoint.
+    """
+
+    @staticmethod
+    async def _dispatched_groups(
+        ledger: RolloutRecoveryLedger,
+        barrier: DataPlaneCheckpointBarrier,
+        count: int,
+    ) -> list[PromptGroupRecoveryRecord]:
+        groups = []
+        async with barrier.mutation() as cut:
+            for index in range(count):
+                group = ledger.reserve_group(
+                    cut,
+                    group_id=f"batch-7-prompt-{index}",
+                    admission_id="batch-7",
+                    prompt_id=str(index),
+                    prompt_payload={"idx": index, "message_log": []},
+                    expected_generations=1,
+                    target_step=7,
+                    start_weight_version=7,
+                    restore_level=RecoveryTargetLevel.TURN,
+                    admitted=True,
+                )
+                ledger.mark_group_dispatched(
+                    cut, group.group_id, gym_instance_id="tools/replica-0"
+                )
+                groups.append(ledger.get_group(group.group_id))
+        return groups
+
+    @staticmethod
+    async def _drain_setup(
+        tmp_path: Path,
+        *,
+        rollouts: int,
+        on_wire: int,
+        control_timeout_s: float = 5.0,
+    ) -> SimpleNamespace:
+        """Commit a cut in which Gym exported all but the first ``on_wire`` episodes."""
+        ledger = RolloutRecoveryLedger()
+        barrier = DataPlaneCheckpointBarrier()
+        groups = await TestDrainScalesWithPendingRepliesNotTheLedger._dispatched_groups(
+            ledger, barrier, rollouts
+        )
+        episodes = [group.gym_episode(0) for group in groups]
+        coordinator = gym_coordinator(
+            FakeGymActor(exported_episodes=tuple(episodes[on_wire:])),
+            control_timeout_s=control_timeout_s,
+        )
+        candidates = {"tools/replica-0": tuple(episodes)}
+        commit = await coordinator.commit(
+            "save-1", tmp_path, candidates, restarts={"tools/replica-0": ()}
+        )
+        controller = _controller_for(coordinator, ledger)
+        return SimpleNamespace(
+            ledger=ledger,
+            barrier=barrier,
+            groups=groups,
+            drain=lambda: controller._drain_non_exported_gym_candidates(
+                coordinator, candidates, commit
+            ),
+        )
+
+    @staticmethod
+    async def _resolve(setup: SimpleNamespace, index: int, how: str) -> None:
+        group = setup.groups[index]
+        async with setup.barrier.mutation("sibling_seals") as cut:
+            if how == "sealed":
+                setup.ledger.mark_sibling_sealed(
+                    cut,
+                    group.group_id,
+                    generation_index=0,
+                    gate_rollout_id=group.gate_rollout_id(0),
+                    receipt=None,
+                    reward=1.0,
+                    mask_sample=False,
+                )
+            else:
+                setup.ledger.abandon_unsealed(cut, group.group_id)
+
+    def test_waiting_never_rescans_every_rollout(self, tmp_path: Path) -> None:
+        async def exercise() -> None:
+            setup = await self._drain_setup(tmp_path, rollouts=50, on_wire=1)
+            scans = 0
+            full_scan = setup.ledger.gym_checkpoint_inventory
+
+            def counting_scan(instance_ids):
+                nonlocal scans
+                scans += 1
+                return full_scan(instance_ids)
+
+            setup.ledger.gym_checkpoint_inventory = counting_scan
+            drain = asyncio.create_task(setup.drain())
+            # Long enough for a 50 ms poll to have rescanned several times.
+            await asyncio.sleep(0.3)
+            await self._resolve(setup, 0, "sealed")
+            await asyncio.wait_for(drain, timeout=5.0)
+
+            assert scans == 0
+
+        asyncio.run(exercise())
+
+    @pytest.mark.parametrize("how", ["sealed", "abandoned"])
+    def test_it_returns_once_the_last_reply_resolves(
+        self, tmp_path: Path, how: str
+    ) -> None:
+        async def exercise() -> None:
+            setup = await self._drain_setup(tmp_path, rollouts=3, on_wire=2)
+            drain = asyncio.create_task(setup.drain())
+            await asyncio.sleep(0.1)
+            await self._resolve(setup, 0, how)
+            # Several polls' worth, so an early return would have happened.
+            await asyncio.sleep(0.2)
+            assert not drain.done(), "one on-wire reply is still outstanding"
+
+            await self._resolve(setup, 1, how)
+            await asyncio.wait_for(drain, timeout=1.0)
+
+        asyncio.run(exercise())
+
+    def test_a_timeout_names_the_unresolved_replies(self, tmp_path: Path) -> None:
+        async def exercise() -> None:
+            setup = await self._drain_setup(
+                tmp_path, rollouts=2, on_wire=2, control_timeout_s=0.05
+            )
+            with pytest.raises(TimeoutError, match=r"tools/replica-0: 2 episode\(s\)"):
+                await setup.drain()
+
+        asyncio.run(exercise())
+
+    def test_the_summary_counts_every_episode_but_names_only_a_few(self) -> None:
+        episodes = [
+            GymCheckpointEpisode(f"rollout-{index:02d}", 0) for index in range(12)
+        ]
+
+        summary = _summarize_gym_episodes(
+            {"tools/replica-1": episodes, "tools/replica-0": ()}
+        )
+
+        assert summary.startswith("tools/replica-1: 12 episode(s), e.g. ")
+        assert "rollout-04" in summary and "rollout-05" not in summary
+        assert summary.endswith(" and 7 more")
+        assert "replica-0" not in summary
+        assert _summarize_gym_episodes({"tools/replica-0": ()}) == "none"
 
 
 class TestARowDroppedDuringACheckpointDoesNotFailIt:
