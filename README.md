@@ -29,7 +29,7 @@
     * Enabling [Group reward-Decoupled Normalization Policy Optimization](https://arxiv.org/abs/2601.05242) (GDPO) for multi-reward RL training is now supported.
     * Example: [gdpo_math_1B.yaml](/examples/configs/gdpo_math_1B.yaml)
     * Support Async RL training 
-    * WIP: Nemo-gym compatibility
+    * WIP: NeMo Gym compatibility
 * [03/11/2026] [Nemotron-3-Super](https://research.nvidia.com/labs/nemotron/Nemotron-3-Super/) was post-trained with NeMo-RL! Follow [this guide](https://github.com/NVIDIA-NeMo/RL/blob/super-v3/docs/guides/nemotron-3-super.md) to reproduce the full RL training recipe.
 
 <details>
@@ -46,7 +46,7 @@
    
 * [01/30/2026] [Release v0.5.0!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.5.0)
     * Both linux/amd64 and linux/arm64 Docker containers are available on NGC [nvcr.io/nvidia/nemo-rl:v0.5.0](https://registry.ngc.nvidia.com/orgs/nvidia/containers/nemo-rl/tags).
-    * NeMo-Gym + NeMo-RL support
+    * NeMo Gym + NeMo RL support
     * 📊 View the release run metrics on [Google Colab](https://colab.research.google.com/drive/1Xgg8D7mNkWnz6t2uL8BbPfPb7UTkN1H0?usp=sharing) to get a head start on your experimentation.
 * [12/15/2025] NeMo-RL is the framework that trained [NVIDIA-NeMotron-3-Nano-30B-A3B-FP8](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8)! [This guide](docs/guides/models/nemotron/nemotron-3-nano.md) provides reproducible instructions for the post-training process.
 * [10/10/2025] **DAPO Algorithm Support**  
@@ -73,6 +73,8 @@
 ## Overview
 
 **NeMo RL** is an open-source post-training library under the [NVIDIA NeMo Framework](https://github.com/NVIDIA-NeMo), designed to streamline and scale reinforcement learning methods for multimodal models (LLMs, VLMs etc.). Designed for flexibility, reproducibility, and scale, NeMo RL enables both small-scale experiments and massive multi-GPU, multi-node deployments for fast experimentation in research and production environments.
+
+NeMo RL integrates with [NeMo Gym](docs/design-docs/nemo-gym-integration.md), a library for building reusable environments for model and agent training and evaluation. Use NeMo RL for scalable post-training and NeMo Gym for environment-defined datasets, tools, verifiers, and multi-step or multi-turn interactions. See the [NeMo Gym documentation](https://docs.nvidia.com/nemo/gym/) to learn more.
 
 ![NeMo RL Architecture Diagram](https://raw.githubusercontent.com/NVIDIA-NeMo/RL/refs/heads/main/docs/assets/RL_diagram.png)
 
@@ -133,7 +135,7 @@ For detailed information on backend selection, configuration, and examples, see 
 - ✅ **Vision Language Models (VLM)** - Support SFT and GRPO on VLMs.
 - ✅ **Megatron Inference** - Megatron Inference for fast Day-0 support for new Megatron models (avoid weight conversion).
 - ✅ **Async RL** - Support for asynchronous rollouts and replay buffers for off-policy training, and enable a fully asynchronous GRPO.
-- ✅ **Nemo-Gym Integration** - RL Environment Integration.
+- ✅ [**NeMo Gym Integration**](docs/design-docs/nemo-gym-integration.md) - Reusable environments and multi-step or multi-turn rollouts for training and evaluation.
 - ✅ **GB200** - container support for GB200.
 
 ## Table of Contents

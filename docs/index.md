@@ -72,6 +72,13 @@ Discover supported algorithms including GRPO, PPO, SFT, DPO, RM, on-policy disti
 Learn how to evaluate your models using built-in evaluation datasets and custom evaluation pipelines.
 :::
 
+:::{grid-item-card} {octicon}`tools` NeMo Gym Integration
+:link: design-docs/nemo-gym-integration
+:link-type: doc
+
+Connect NeMo RL training to NeMo Gym environments for reusable tools, verifiers, and multi-step or multi-turn rollouts.
+:::
+
 :::{grid-item-card} {octicon}`server` Cluster Setup
 :link: cluster
 :link-type: doc
