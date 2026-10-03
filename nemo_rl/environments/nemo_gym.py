@@ -81,7 +81,6 @@ from nemo_rl.experience.failures import (
     GymTerminalEpisodeFailure,
     GymTransportError,
     RolloutDataFailure,
-    RolloutInfraFailure,
     http_status_is_infra,
 )
 from nemo_rl.models.generation.interfaces import (
@@ -287,7 +286,7 @@ def _normalize_nemo_gym_episode_result(row: dict, reply: Any) -> dict:
             detail += f" (stage={failure_payload['stage']})"
         if failure.terminal:
             raise GymTerminalEpisodeFailure(detail)
-        raise RolloutInfraFailure(detail)
+        raise RuntimeError(detail)
 
     result = response.result
     assert result is not None  # BaseEpisodeResponse enforces result XOR failure.
@@ -300,11 +299,6 @@ def _normalize_nemo_gym_episode_result(row: dict, reply: Any) -> dict:
         raise RolloutDataFailure(
             "NeMo-Gym native training results must contain a finite scalar reward"
         )
-    for key in ("response", "responses_create_params"):
-        if not isinstance(result.get(key), dict):
-            raise RolloutDataFailure(
-                f"NeMo-Gym native training results must contain a {key} dict"
-            )
     return {
         **result,
         "_ng_episode_id": response.episode_id.model_dump(),
