@@ -62,7 +62,9 @@ from nemo_rl.telemetry.vocabulary import TeedMetric, register_teed_metrics
 if TYPE_CHECKING:
     # Import-time only: nemo_rl.algorithms.opd imports the data plane, which
     # would pull a heavy dependency chain into every loss-function consumer.
+    # The hybrid estimator config is likewise only needed as an annotation.
     from nemo_rl.algorithms.opd import OnPolicyDistillationFullConfig
+    from nemo_rl.models.policy import HybridARDiffusionLogprobEstimationConfig
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
 
@@ -1225,6 +1227,265 @@ def _validate_opd_full_loss_config(
             "reference policy on top of it.",
             stacklevel=3,
         )
+
+
+def _validate_hybrid_ar_diffusion_loss_config(cfg: ClippedPGLossConfig) -> None:
+    """Reject clipped-PG knobs that ``HybridARDiffusionLossFn`` does not implement.
+
+    The hybrid loss reuses the ratio-clipping settings of ``loss_fn`` for its
+    policy-gradient term and nothing else. Every other clipped-PG option would
+    be silently ignored, so erroring out beats training with a different
+    objective than the one configured.
+
+    Args:
+        cfg: The clipped-PG loss config supplied by the user.
+
+    Raises:
+        ValueError: If any unsupported option is set.
+    """
+    if not cfg.token_level_loss:
+        raise ValueError(
+            "hybrid_ar_diffusion requires loss_fn.token_level_loss=true: the "
+            "cross-entropy term is token-normalized, and mixing it with a "
+            "sequence-normalized policy-gradient term leaves no single "
+            "denominator for the loss."
+        )
+    if cfg.reference_policy_kl_penalty != 0 and not cfg.use_kl_in_reward:
+        raise ValueError(
+            "hybrid_ar_diffusion does not implement the reference-policy KL "
+            "penalty; set loss_fn.reference_policy_kl_penalty=0 (or route the KL "
+            "through the reward with loss_fn.use_kl_in_reward=true)."
+        )
+    if cfg.use_importance_sampling_correction:
+        raise ValueError(
+            "hybrid_ar_diffusion does not implement the generation "
+            "importance-sampling correction; set "
+            "loss_fn.use_importance_sampling_correction=false."
+        )
+    unsupported = {
+        "disable_ppo_ratio": cfg.disable_ppo_ratio,
+        "sequence_level_importance_ratios": cfg.sequence_level_importance_ratios,
+        "force_on_policy_ratio": cfg.force_on_policy_ratio,
+        "use_cispo": cfg.use_cispo,
+        "use_on_policy_kl_approximation": cfg.use_on_policy_kl_approximation,
+        "seq_logprob_error_in_loss": cfg.seq_logprob_error_in_loss,
+        "truncated_importance_sampling_type": (
+            cfg.truncated_importance_sampling_type is not None
+        ),
+        "positive_example_nll_weight": cfg.positive_example_nll_weight != 0,
+    }
+    enabled = [name for name, is_set in unsupported.items() if is_set]
+    if enabled:
+        raise ValueError(
+            "hybrid_ar_diffusion does not support these loss_fn options: "
+            f"{', '.join(enabled)}. Reset them to their defaults."
+        )
+
+
+class HybridARDiffusionLossDataDict(TypedDict):
+    """Required keys for the hybrid AR + diffusion loss function."""
+
+    hybrid_pg_mask: torch.Tensor
+    hybrid_ce_mask: torch.Tensor
+    hybrid_mask_ratio: torch.Tensor
+    advantages: torch.Tensor
+    prev_logprobs: torch.Tensor
+    sample_mask: torch.Tensor
+    __extra__: Any
+
+
+class HybridARDiffusionLossFn(LossFunction):
+    """Clipped policy gradient on the clean half + masked cross-entropy on the noisy half.
+
+    Operates on the ``[noisy | clean]`` layout built by
+    ``nemo_rl.algorithms.hybrid_ar_diffusion.build_hybrid_ar_diffusion_batch``:
+
+        loss = pg_loss_weight * pg_loss + ce_loss_weight * ce_loss
+
+    Both terms read the *same* per-position logprob vector -- the builder bakes
+    the autoregressive shift into ``hybrid_target_ids``, so one same-position
+    gather serves the noisy half (predict the token at this position) and the
+    clean half (predict the next token). ``hybrid_pg_mask`` and
+    ``hybrid_ce_mask`` select which positions feed which term; they live in
+    disjoint halves and never overlap.
+
+    The cross-entropy term is the plain masked-diffusion (MDM) pretraining
+    objective. It carries no ratio, no clipping and no advantage weighting --
+    quality is the policy-gradient term's job, and CE only pulls the diffusion
+    mode toward the trajectories the AR mode produced.
+
+    Unlike ``ClippedPGLossFn`` the inputs here are aligned to the *prediction*
+    position rather than the target position, so no ``[:, 1:]`` slicing is
+    applied.
+
+    Note:
+        Both terms are normalized by ``global_valid_toks``, the global
+        response-token count (every response token contributes exactly one
+        policy-gradient position). Dividing the cross-entropy by the same count
+        makes both terms "per response token" and, when ``elbo_weight_ce`` is
+        set, makes the CE term an unbiased estimate of the masked-diffusion
+        ELBO per response token: masking selects ``t * L`` of the ``L`` response
+        tokens, so scaling by ``1/t`` and dividing by ``L`` cancels the
+        sampling rate. No second all-reduce is required.
+    """
+
+    loss_type = LossType.TOKEN_LEVEL
+    input_type = LossInputType.LOGPROB
+
+    def __init__(
+        self,
+        cfg: ClippedPGLossConfig,
+        estimation_cfg: "HybridARDiffusionLogprobEstimationConfig",
+    ):
+        """Initialize the hybrid loss.
+
+        Args:
+            cfg: Clipped-PG loss config. Only the ratio-clipping settings are
+                used; unsupported options are rejected.
+            estimation_cfg: The hybrid estimator config, which carries the
+                term weights and the ELBO switch.
+
+        Raises:
+            ValueError: If ``cfg`` enables an option this loss does not
+                implement, or ``ratio_clip_c`` is not greater than 1.
+        """
+        _validate_hybrid_ar_diffusion_loss_config(cfg)
+        self.ratio_clip_min = cfg.ratio_clip_min
+        self.ratio_clip_max = cfg.ratio_clip_max
+        self.ratio_clip_c = cfg.ratio_clip_c  # set to None to disable dual-clipping
+        if self.ratio_clip_c is not None and self.ratio_clip_c <= 1:
+            raise ValueError(
+                "ratio_clip_c must exceed 1 representing a lower bound of the "
+                f"ratios, got {self.ratio_clip_c}."
+            )
+        self.ce_loss_weight = estimation_cfg.ce_loss_weight
+        self.pg_loss_weight = estimation_cfg.pg_loss_weight
+        self.elbo_weight_ce = estimation_cfg.elbo_weight_ce
+        self.metric_normalizations: dict[str, MetricNormalizer] = {
+            "loss": MetricNormalizer.TOKENS,
+            "pg_loss": MetricNormalizer.TOKENS,
+            "ce_loss": MetricNormalizer.TOKENS,
+            "weighted_ce_loss": MetricNormalizer.TOKENS,
+            "ratio_clipped_fraction": MetricNormalizer.TOKENS,
+            "approx_kl": MetricNormalizer.TOKENS,
+            "token_mult_prob_error": MetricNormalizer.TOKENS,
+            "mean_mask_ratio": MetricNormalizer.SEQUENCES,
+            # Raw counts -- the downstream per-microbatch sum IS the value.
+            "num_pg_tokens": MetricNormalizer.NONE,
+            "num_ce_tokens": MetricNormalizer.NONE,
+            "num_valid_samples": MetricNormalizer.NONE,
+        }
+
+    def __call__(
+        self,
+        next_token_logprobs: torch.Tensor,
+        data: BatchedDataDict[HybridARDiffusionLossDataDict],
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Compute ``pg_loss_weight * pg_loss + ce_loss_weight * ce_loss``.
+
+        Args:
+            next_token_logprobs: ``[N, T]`` logprobs gathered at
+                ``hybrid_target_ids``, aligned to the prediction position.
+            data: The hybrid training batch.
+            global_valid_seqs: Global valid sequence count.
+            global_valid_toks: Global valid (response) token count.
+
+        Returns:
+            Tuple of the scalar loss and a metrics dict reporting both terms
+            separately (their relative magnitude is how ``ce_loss_weight`` is
+            tuned).
+        """
+        curr_logprobs = next_token_logprobs
+        sample_mask = data["sample_mask"]
+        pg_mask = data["hybrid_pg_mask"] * sample_mask.unsqueeze(-1)
+        ce_mask = data["hybrid_ce_mask"] * sample_mask.unsqueeze(-1)
+
+        # ---- RL term: clipped policy gradient on the clean (AR) half ----
+        advantages = data["advantages"]
+        prev_logprobs = data["prev_logprobs"]
+        log_ratio = (curr_logprobs - prev_logprobs) * pg_mask
+        ratios = torch.exp(log_ratio)
+        ratios_clamped = ratios.clamp(
+            1.0 - self.ratio_clip_min, 1.0 + self.ratio_clip_max
+        )
+        loss1 = -advantages * ratios
+        loss2 = -advantages * ratios_clamped
+        actor_loss = torch.max(loss1, loss2)
+        if self.ratio_clip_c is not None:
+            # Dual clipping: bound the negative-advantage branch from below so a
+            # large ratio on a bad sample cannot dominate the batch gradient.
+            loss3 = -advantages * self.ratio_clip_c
+            actor_loss = torch.where(
+                advantages < 0, torch.min(actor_loss, loss3), actor_loss
+            )
+        pg_loss = masked_mean(
+            actor_loss, pg_mask, global_normalization_factor=global_valid_toks
+        )
+
+        # ---- CE term: masked-diffusion cross-entropy on the noisy half ----
+        ce_per_token = -curr_logprobs
+        if self.elbo_weight_ce:
+            # Recover the MDM ELBO: each sample's contribution is scaled by 1/t,
+            # where t is the realized masking ratio.
+            ratio_t = data["hybrid_mask_ratio"].clamp(min=1e-6).unsqueeze(-1)
+            ce_per_token = ce_per_token / ratio_t
+        ce_loss = masked_mean(
+            ce_per_token, ce_mask, global_normalization_factor=global_valid_toks
+        )
+
+        loss = self.pg_loss_weight * pg_loss + self.ce_loss_weight * ce_loss
+
+        # Metrics are globally normalized (divided by global_valid_{toks,seqs}),
+        # matching ClippedPGLossFn: the framework SUMS each key across
+        # microbatches, so a locally-normalized mean would be reported inflated
+        # by the microbatch count.
+        with torch.no_grad():
+            clipped = (
+                (ratios < 1.0 - self.ratio_clip_min)
+                | (ratios > 1.0 + self.ratio_clip_max)
+            ).to(pg_mask.dtype)
+            clip_fraction = masked_mean(
+                clipped, pg_mask, global_normalization_factor=global_valid_toks
+            )
+            approx_kl = masked_mean(
+                prev_logprobs - curr_logprobs,
+                pg_mask,
+                global_normalization_factor=global_valid_toks,
+            )
+            mean_mask_ratio = masked_mean(
+                data["hybrid_mask_ratio"],
+                sample_mask,
+                global_normalization_factor=global_valid_seqs,
+            )
+            # Engine-vs-trainer agreement on the AR rollouts. Meaningful here
+            # because generation is AR and the policy-gradient half is the causal
+            # forward, so the two logprobs describe the same factorization.
+            if "generation_logprobs" in data:
+                lp_error = torch.abs(data["generation_logprobs"] - curr_logprobs)
+                mult_prob_error = masked_mean(
+                    torch.exp(lp_error * pg_mask),
+                    pg_mask,
+                    global_normalization_factor=global_valid_toks,
+                ).item()
+            else:
+                mult_prob_error = 0.0
+
+        metrics = {
+            "loss": loss.item() if loss.ndim == 0 else loss,
+            "pg_loss": pg_loss.item(),
+            "ce_loss": ce_loss.item(),
+            "weighted_ce_loss": (self.ce_loss_weight * ce_loss).item(),
+            "ratio_clipped_fraction": clip_fraction.item(),
+            "approx_kl": approx_kl.item(),
+            "token_mult_prob_error": mult_prob_error,
+            "num_pg_tokens": pg_mask.sum().item(),
+            "num_ce_tokens": ce_mask.sum().item(),
+            "mean_mask_ratio": mean_mask_ratio.item(),
+            "num_valid_samples": sample_mask.sum().item(),
+        }
+        return loss, metrics
 
 
 class NLLLossFn(LossFunction):

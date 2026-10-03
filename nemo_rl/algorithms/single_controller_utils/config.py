@@ -1275,6 +1275,12 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "its advantage baselines depend on the pre-training sequence mask. "
             "Use the non-streaming GRPO trainer."
         )
+    if master_config.policy.get("logprob_estimation") is not None:
+        raise ValueError(
+            "policy.logprob_estimation (hybrid_ar_diffusion) is not supported by "
+            "SingleController, which always trains with ClippedPGLossFn. Use the "
+            "non-streaming GRPO trainer."
+        )
     _validate_algo_settings(master_config)
 
     async_config = master_config.async_rl

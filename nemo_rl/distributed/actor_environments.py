@@ -73,6 +73,13 @@ ACTOR_ENVIRONMENTS: dict[str, list[str] | None] = {
         "nemo_gym",
     ],
     "nemo_rl.models.value.workers.megatron_value_worker.MegatronValueWorker": ["mcore"],
+    # The hybrid AR + diffusion worker also subclasses MegatronPolicyWorker (and
+    # so inherits TQWorkerMixin), and venvs are cached by actor class name, so it
+    # must resolve to the same extras as its base.
+    "nemo_rl.models.policy.workers.hybrid_ar_diffusion_megatron_policy_worker.HybridARDiffusionMegatronPolicyWorker": [
+        "mcore",
+        "nemo_gym",
+    ],
     "nemo_rl.data.energon.sft_worker.SFTMegatronPolicyWorker": [
         "mcore",
         "nemo_gym",
