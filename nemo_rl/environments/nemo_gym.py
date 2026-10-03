@@ -572,8 +572,8 @@ class NemoGym(EnvironmentInterface):
             or _gym_port_high > DEFAULT_GYM_PORT_RANGE_HIGH
         ):
             print(
-                f"WARNING: Gym port range [{_gym_port_low}, {_gym_port_high}) is outside "
-                f"the default [{DEFAULT_GYM_PORT_RANGE_LOW}, {DEFAULT_GYM_PORT_RANGE_HIGH}). "
+                f"WARNING: Gym port range {_gym_port_low}-{_gym_port_high} is outside "
+                f"the default {DEFAULT_GYM_PORT_RANGE_LOW}-{DEFAULT_GYM_PORT_RANGE_HIGH}. "
                 f"Check the port layout in virtual_cluster.py for conflicts."
             )
         initial_global_config_dict["port_range_low"] = _gym_port_low
