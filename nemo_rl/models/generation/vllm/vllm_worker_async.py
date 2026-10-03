@@ -1433,6 +1433,27 @@ class VllmAsyncGenerationWorkerImpl(
                     },
                     status_code=400,
                 )
+            except ValueError as e:
+                # The same overflow can also surface as a plain ValueError from the
+                # engine-side length check ("Input length (N) exceeds model's
+                # maximum context length (M)"). As an opaque 500 the Gym client
+                # retries it and OpenCode backs off on it until the agent deadline,
+                # instead of ending the session; return the 400 contract above.
+                if "maximum context length" not in str(e):
+                    worker_self._abort_request_capture(request, reason="engine_error")
+                    raise
+                worker_self._abort_request_capture(request, reason="context_length")
+                return JSONResponse(
+                    content={
+                        "error": {
+                            "message": str(e),
+                            "type": "invalid_request_error",
+                            "param": "input_tokens",
+                            "code": 400,
+                        }
+                    },
+                    status_code=400,
+                )
             except BaseException:
                 worker_self._abort_request_capture(request, reason="engine_error")
                 raise

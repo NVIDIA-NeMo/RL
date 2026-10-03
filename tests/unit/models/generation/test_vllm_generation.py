@@ -993,6 +993,68 @@ async def test_context_overflow_returns_http_400_for_nemo_gym(monkeypatch):
     assert error["code"] == 400
 
 
+def _overflow_test_chat_handler(monkeypatch, create_chat_completion):
+    _, _, openai_serving_chat = _install_fake_vllm_openai_modules(monkeypatch)
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "val_temperature": 0.0,
+        "val_top_p": 1.0,
+        "vllm_cfg": {},
+    }
+    worker.llm = MagicMock(model_config="model-config", renderer="renderer")
+    worker._http_engine_client = worker.llm
+    worker._capture_calls = {}
+    worker.token_capture = None
+    worker.llm_async_engine_args = MagicMock()
+    worker.llm_async_engine_args.create_model_config.return_value = MagicMock(
+        served_model_name="served-model", model="model-path"
+    )
+    app = _FakeFastAPIApp()
+    worker._setup_vllm_openai_api_server(app)
+    openai_serving_chat.instances[0].create_chat_completion = create_chat_completion
+    return next(
+        handler for path, handler in app.routes if path == "/v1/chat/completions"
+    )
+
+
+_OVERFLOW_REQUEST = types.SimpleNamespace(
+    top_k=-1, top_p=1.0, temperature=1.0, max_tokens=1, max_completion_tokens=None
+)
+
+
+@pytest.mark.asyncio
+async def test_engine_side_overflow_value_error_returns_http_400(monkeypatch):
+    """A plain ValueError length overflow gets the same 400, not an opaque 500."""
+    message = "Input length (196657) exceeds model's maximum context length (196608)."
+
+    async def create_chat_completion(_request, _raw_request):
+        raise ValueError(message)
+
+    chat_handler = _overflow_test_chat_handler(monkeypatch, create_chat_completion)
+    response = await chat_handler(_OVERFLOW_REQUEST, MagicMock())
+
+    response_content = response.body.decode()
+    assert response.status_code == 400
+    assert _nemo_gym_recognizes_context_overflow(
+        status=response.status_code, response_content=response_content
+    )
+    error = json.loads(response_content)["error"]
+    assert error["message"] == message
+    assert (error["type"], error["code"]) == ("invalid_request_error", 400)
+
+
+@pytest.mark.asyncio
+async def test_unrelated_value_error_still_propagates(monkeypatch):
+    async def create_chat_completion(_request, _raw_request):
+        raise ValueError("bad sampling parameter")
+
+    chat_handler = _overflow_test_chat_handler(monkeypatch, create_chat_completion)
+    with pytest.raises(ValueError, match="bad sampling parameter"):
+        await chat_handler(_OVERFLOW_REQUEST, MagicMock())
+
+
 def test_nano_v3_reasoning_parser_swaps_reasoning_when_thinking_disabled(
     monkeypatch,
 ):
