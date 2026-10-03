@@ -99,7 +99,7 @@ def validate_tq_support(
             or policy["train_global_batch_size"] != 1
             or policy["train_micro_batch_size"] != 1
             or policy["dynamic_batching"]["enabled"]
-            or policy["sequence_packing"]["enabled"]
+            or policy.get("sequence_packing", {}).get("enabled", False)
         ):
             raise ValueError(
                 "xToken TQ requires DTensor v2, TP=CP=DP=GBS=MBS=1, no packing/dynamic batching"

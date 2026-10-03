@@ -75,6 +75,12 @@ from nemo_rl.models.policy.interfaces import (
     ScoreOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
+    _REBUILD_CUDA_TENSOR_ARG_DEVICE_INDEX,
+    _REBUILD_CUDA_TENSOR_ARG_REF_COUNTER_HANDLE_INDEX,
+    _REBUILD_CUDA_TENSOR_ARG_REF_COUNTER_OFFSET_INDEX,
+    _REBUILD_CUDA_TENSOR_ARG_STORAGE_CLASS_INDEX,
+    _REBUILD_CUDA_TENSOR_ARG_STORAGE_HANDLE_INDEX,
+    _REBUILD_CUDA_TENSOR_ARG_STORAGE_OFFSET_BYTES_INDEX,
     ensure_teacher_ipc_buffer,
     get_handle_from_tensor,
     get_runtime_env_for_policy_worker,
@@ -1004,6 +1010,8 @@ class DTensorPolicyWorkerV2Impl(
         if data.size != 1 or self.tp_size != 1 or self.cp_size != 1:
             raise ValueError("xToken TQ requires batch=TP=CP=1")
         _, seq_len = check_sequence_dim(data)
+        # Fast-fail on the configured vocab; the padded vocab is only known
+        # after the forward, and publish_logits re-checks the exact shape.
         check_payload_size(
             seq_len=seq_len,
             vocab_size=self.model_config.vocab_size,
@@ -1018,8 +1026,10 @@ class DTensorPolicyWorkerV2Impl(
             # copy. Release its unused refcounter so validation/exit can free
             # the teacher allocation rather than leaving it in IPC limbo.
             ipc_args = handle["payload_ipc"][0]
-            ipc_args[4]._release_ipc_counter(
-                ipc_args[11], ipc_args[12], device=ipc_args[6]
+            ipc_args[_REBUILD_CUDA_TENSOR_ARG_STORAGE_CLASS_INDEX]._release_ipc_counter(
+                ipc_args[_REBUILD_CUDA_TENSOR_ARG_REF_COUNTER_HANDLE_INDEX],
+                ipc_args[_REBUILD_CUDA_TENSOR_ARG_REF_COUNTER_OFFSET_INDEX],
+                device=ipc_args[_REBUILD_CUDA_TENSOR_ARG_DEVICE_INDEX],
             )
         seq_len, vocab_size = handle["actual_shape"]
         return publish_logits(
@@ -1066,9 +1076,12 @@ class DTensorPolicyWorkerV2Impl(
         from torch.multiprocessing.reductions import StorageWeakRef, shared_cache
 
         ipc_args = self._teacher_ipc_handle[0]
-        shared_cache[(ipc_args[7], ipc_args[9])] = StorageWeakRef(
-            self._teacher_ipc_storage.untyped_storage()
-        )
+        shared_cache[
+            (
+                ipc_args[_REBUILD_CUDA_TENSOR_ARG_STORAGE_HANDLE_INDEX],
+                ipc_args[_REBUILD_CUDA_TENSOR_ARG_STORAGE_OFFSET_BYTES_INDEX],
+            )
+        ] = StorageWeakRef(self._teacher_ipc_storage.untyped_storage())
         handle = {
             "payload_ipc": self._teacher_ipc_handle,
             "buf_idx": 0,

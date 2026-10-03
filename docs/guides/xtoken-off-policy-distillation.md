@@ -308,7 +308,9 @@ off-policy training. Alignment, projection and P-KL use the existing loss.
 The student publishes a local descriptor for its own receive buffer.
 
 Payloads are bounded by `xtoken_transport.max_payload_bytes` (64 MiB by
-default), checked against the padded teacher shape before inference;
+default), pre-checked against the configured vocabulary and padded sequence
+length before inference, then re-checked against the exact padded shape at
+publish time;
 `xtoken_transport.timeout_s` defaults to 120 seconds. Each step uses a new key
 and explicitly clears it after training/evaluation. A transfer or training
 failure stops the workers and aborts the run; optimizer updates are not retried.
