@@ -163,6 +163,8 @@ from nemo_rl.utils.checkpoint import (
 from nemo_rl.utils.logger import (
     Logger,
     LoggerConfig,
+    conversation_row_labels,
+    maybe_log_train_conversations,
     print_message_log_samples,
     should_log_nemo_gym_full_result_tables,
 )
@@ -3255,6 +3257,13 @@ def _grpo_train_impl(
                     # Clear logger metrics for each generation step
                     if policy_generation is not None:
                         policy_generation.clear_logger_metrics()
+                    # Per-row labels for the conversations table (see the
+                    # log_conversations block below), read before the rollout: a
+                    # NeMo-Gym rollout replaces the batch, and its final_batch
+                    # drops the dataset fields the label comes from.
+                    conv_task_names = conversation_row_labels(
+                        master_config.logger, repeated_batch.get("extra_env_info")
+                    )
                     # Use NeMo-Gym rollouts if enabled. We cascade NeMo-Gym first since NeMo-Gym requires async rollouts.
                     if should_use_nemo_gym(master_config):
                         # configure_generation_config auto-fills stop_token_ids from the EOS
@@ -3357,6 +3366,16 @@ def _grpo_train_impl(
                     repeated_batch = apply_reward_shaping(
                         repeated_batch, master_config.grpo.reward_shaping
                     )
+
+                maybe_log_train_conversations(
+                    logger,
+                    master_config.logger,
+                    repeated_batch,
+                    conv_task_names,
+                    tokenizer=tokenizer,
+                    step=total_steps + 1,
+                    thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
+                )
 
                 # Calculate rewards & advantages
                 memory_tracker.snapshot_start_of_stage("Processing rewards", dir())
