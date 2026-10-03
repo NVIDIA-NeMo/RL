@@ -30,19 +30,20 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from examples import run_grpo_single_controller
-from nemo_rl.experience.rollout_manager import RolloutCompletionCallback
-from nemo_rl.experience.rollout_recovery import RecoveryGranularity
-
 from _gym_prefix_recovery_parity import (
     append_training_batch,
     serialize_training_batch,
 )
+
+from examples import run_grpo_single_controller
+from nemo_rl.experience.rollout_manager import RolloutCompletionCallback
+from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 
 
 class _TrainingPayloadRecorder:
@@ -153,8 +154,10 @@ class _InstrumentedNemoGymRolloutImpl:
 
     def _append_event(self, event: str, **fields: Any) -> None:
         self._events_path.parent.mkdir(parents=True, exist_ok=True)
+        # Wall time lets parity reports place each rollout on a per-run timeline.
+        record = {"event": event, "time_s": time.time(), **fields}
         with self._events_path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps({"event": event, **fields}, sort_keys=True) + "\n")
+            stream.write(json.dumps(record, sort_keys=True) + "\n")
 
     def _find_group(self, rollout_ids: list[str]) -> Any:
         rollout_id_set = set(rollout_ids)
@@ -227,6 +230,12 @@ class _InstrumentedNemoGymRolloutImpl:
             )
 
         async def _record_completion(generation_index: int, completion: Any) -> None:
+            # Gym returned the rollout; ``completion`` below marks the ledger seal.
+            self._append_event(
+                "completion_arrived",
+                **common,
+                generation_index=generation_index,
+            )
             await on_completion(generation_index, completion)
             refreshed = self._recovery_ledger.get_group(group.group_id)
             self._append_event(
