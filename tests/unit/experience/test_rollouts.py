@@ -2876,20 +2876,31 @@ class _ScriptedStream:
         raise StopAsyncIteration
 
 
+async def _health_outcome(outcome):
+    """Resolve one scripted health check: raise an exception, call a callable, or pass."""
+    if isinstance(outcome, BaseException):
+        raise outcome
+    if callable(outcome):
+        outcome()
+
+
 class _FakeGymActor:
-    """A NemoGym actor stand-in with scripted run_rollouts streams.
+    """A NemoGym actor stand-in with scripted run_rollouts streams and health checks.
 
     ``scripts`` holds one item list per dispatch, in dispatch order; an item is a
     ``(rowidx, resolved_agent_ref, result, timing)`` tuple, as ``run_rollouts``
     yields, or an ``asyncio.Event`` the stream waits on before continuing.
+    ``health_outcomes`` are consumed one per health check.
     """
 
-    def __init__(self, scripts, rollout_settings=None):
+    def __init__(self, scripts, health_outcomes=(), rollout_settings=None):
         self.scripts = list(scripts)
+        self.health_outcomes = list(health_outcomes)
         # What NemoGym.rollout_config hands back: the env.nemo_gym keys the
         # driver's rollout loop reads (None for every key when unset).
         self.rollout_settings = dict(rollout_settings or {})
         self.dispatched_rows = []
+        self.health_calls = 0
         actor = self
 
         class _RunRollouts:
@@ -2901,11 +2912,20 @@ class _FakeGymActor:
                 actor.dispatched_rows.append(list(rows))
                 return _ScriptedStream(actor.scripts.pop(0))
 
+        class _HealthCheck:
+            def remote(self):
+                actor.health_calls += 1
+                outcome = (
+                    actor.health_outcomes.pop(0) if actor.health_outcomes else None
+                )
+                return _health_outcome(outcome)
+
         class _RolloutConfig:
             async def remote(self):
                 return dict(actor.rollout_settings)
 
         self.run_rollouts = _RunRollouts()
+        self.health_check = _HealthCheck()
         self.rollout_config = _RolloutConfig()
 
 
@@ -3066,5 +3086,89 @@ def test_gym_rollout_reads_the_dispatch_budget_from_the_actor_config(monkeypatch
         rollouts_mod, "_postprocess_single_nemo_gym_group", _postprocess_stub
     )
     results = asyncio.run(_collect_gym_rollout(actor, rows))
+    assert actor.dispatched_rows == [rows, [rows[1]]]
+    assert results[0].rollout_metrics["nemo_gym_infra_redispatches"] == 1
+
+
+def test_nemo_gym_health_check_interval_accessor():
+    interval = rollouts_mod.get_nemo_gym_health_check_interval
+    assert interval({}) is None
+    assert interval({"nemo_gym": {"health_check_interval_seconds": None}}) is None
+    assert interval({"nemo_gym": {"health_check_interval_seconds": 60}}) == 60.0
+    with pytest.raises(ValueError, match="positive"):
+        interval({"nemo_gym": {"health_check_interval_seconds": 0}})
+
+
+def test_run_async_nemo_gym_rollout_polls_gym_health_while_waiting(monkeypatch):
+    """While no row arrives, the Gym actor's health check runs every interval;
+    healthy checks keep the wait going until the row completes."""
+    rows = [_gym_row()]
+    release = asyncio.Event()
+    actor = _FakeGymActor(
+        scripts=[[release, (0, {"name": "agent"}, _gym_result(0), None)]],
+        # The first poll finds the servers healthy; the second lets the row complete.
+        health_outcomes=[None, release.set],
+    )
+    monkeypatch.setattr(
+        rollouts_mod, "_postprocess_single_nemo_gym_group", _postprocess_stub
+    )
+    results = asyncio.run(
+        _collect_gym_rollout(actor, rows, health_check_interval_seconds=0.01)
+    )
+    assert len(results) == 1
+    assert actor.health_calls == 2
+    assert "nemo_gym_infra_redispatches" not in results[0].rollout_metrics
+
+
+def test_run_async_nemo_gym_rollout_dead_gym_server_ends_the_step(monkeypatch):
+    """A failing health check ends the wait with the transport error the driver
+    classifies as infrastructure, instead of waiting for the wall."""
+    rows = [_gym_row()]
+    actor = _FakeGymActor(
+        scripts=[[asyncio.Event(), (0, {"name": "agent"}, _gym_result(0), None)]],
+        health_outcomes=[RuntimeError("Process `verifier` finished unexpectedly!")],
+    )
+    monkeypatch.setattr(
+        rollouts_mod, "_postprocess_single_nemo_gym_group", _postprocess_stub
+    )
+    with pytest.raises(GymTransportError, match="health check failed.*verifier"):
+        asyncio.run(
+            _collect_gym_rollout(actor, rows, health_check_interval_seconds=0.01)
+        )
+    assert actor.health_calls == 1
+
+
+def test_gym_rollout_reads_both_reliability_knobs_from_the_actor_config(monkeypatch):
+    """Without explicit arguments the rollout applies the environment's own
+    health-check interval and dispatch budget (NemoGym.rollout_config), so every
+    caller of the rollout function polls and re-dispatches the same way."""
+    rows = [_gym_row(), _gym_row()]
+    release = asyncio.Event()
+    actor = _FakeGymActor(
+        scripts=[
+            [
+                release,
+                (
+                    1,
+                    {"name": "agent"},
+                    {GYM_INFRA_FAILURE_KEY: "NeMo-Gym /run failed with HTTP 503: down"},
+                    None,
+                ),
+                (0, {"name": "agent"}, _gym_result(0), None),
+            ],
+            [(1, {"name": "agent"}, _gym_result(1), None)],
+        ],
+        # The first poll finds the servers healthy; the second lets the rows flow.
+        health_outcomes=[None, release.set],
+        rollout_settings={
+            "health_check_interval_seconds": 0.01,
+            "max_infra_attempts_per_rollout": 3,
+        },
+    )
+    monkeypatch.setattr(
+        rollouts_mod, "_postprocess_single_nemo_gym_group", _postprocess_stub
+    )
+    results = asyncio.run(_collect_gym_rollout(actor, rows))
+    assert actor.health_calls == 2
     assert actor.dispatched_rows == [rows, [rows[1]]]
     assert results[0].rollout_metrics["nemo_gym_infra_redispatches"] == 1
