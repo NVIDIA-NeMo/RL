@@ -911,15 +911,22 @@ class TQTokenSource:
         """Gym ``StagingSource`` conformance: base snapshots only, in order."""
         return [item.snapshot for item in self.fetch_for_finalization(staging_keys)]
 
-    def fetch_generation_cut(self, staging_keys: list[str]) -> list[FetchedStagedCall]:
+    def fetch_generation_cut(
+        self,
+        staging_keys: list[str],
+        *,
+        include_route_fragments: bool = False,
+    ) -> list[FetchedStagedCall]:
         """Fetch prefix rows and any media needed to resume their model call.
 
-        The base read is shared across all requested keys. Media rows are then
-        read in at most two batches (still images and videos), preserving the
-        input order in the returned list. Text-only sources perform no second
-        read.
+        The base read is shared across all requested keys and carries route
+        fragments when router replay needs them. Media rows are then read in at
+        most two batches (still images and videos), preserving the input order
+        in the returned list. Text-only sources perform no second read.
         """
-        items = self.fetch_for_finalization(staging_keys)
+        items = self.fetch_for_finalization(
+            staging_keys, include_route_fragments=include_route_fragments
+        )
         if not self._capture_media or not any(item.media_present for item in items):
             return items
 
