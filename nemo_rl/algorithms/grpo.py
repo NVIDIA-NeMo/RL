@@ -4912,7 +4912,7 @@ def async_grpo_train(
 
             traceback.print_exc()
             _flush_collector_telemetry()
-            return
+            raise
     else:
         print("🔄 Preparing policy generation for inference...")
         try:
@@ -4924,7 +4924,7 @@ def async_grpo_train(
 
             traceback.print_exc()
             _flush_collector_telemetry()
-            return
+            raise
 
     # Generation must hold the policy's real weights before any backend starts
     # collecting. In particular, vLLM and Dynamo start with dummy weights when
