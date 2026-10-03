@@ -49,6 +49,14 @@ from nemo_rl.models.policy.workers.megatron_policy_worker import (
     MegatronPolicyWorkerImpl,
 )
 
+try:
+    from modelopt.torch.quantization import temporarily_fold_weights
+except ImportError:
+    # Added in ModelOpt 0.47 (Model-Optimizer PR #2140). NeMo RL still pins an
+    # older commit, so keep the rest of the quantized worker importable and fail
+    # only if policy.quant_fold_frozen_weight_snap is actually requested.
+    temporarily_fold_weights = None
+
 
 def _quant_checkpoint_cache_suffix(config: Mapping[str, object]) -> str:
     """Build a short suffix for HF->Megatron checkpoints with ModelOpt state."""
@@ -434,6 +442,32 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             "positive_amax": positive_amax,
             "kv_amax": kv_amax,
         }
+
+    def get_logprobs(self, *args, **kwargs):
+        """Compute logprobs, optionally folding the frozen weights for the stage.
+
+        With ``policy.quant_fold_frozen_weight_snap`` set, each weight is fake-quantized
+        once for the whole stage instead of on every microbatch forward. Off by default;
+        when unset this is exactly the base implementation.
+
+        Safe only because the re-scoring pass runs under ``no_grad`` with no optimizer
+        step -- ModelOpt writes the fold into the parameter and restores it on exit.
+        """
+        if not self.cfg.get("quant_fold_frozen_weight_snap"):
+            return super().get_logprobs(*args, **kwargs)
+
+        if temporarily_fold_weights is None:
+            raise RuntimeError(
+                "policy.quant_fold_frozen_weight_snap requires "
+                "mtq.temporarily_fold_weights, added in nvidia-modelopt 0.47. The "
+                "pinned nvidia-modelopt is older; unset the option or bump the pin."
+            )
+
+        with temporarily_fold_weights(
+            self.model,
+            snapshot_device=self.cfg.get("quant_fold_snapshot_device"),
+        ):
+            return super().get_logprobs(*args, **kwargs)
 
     def generate(self, **kwargs):
         """Quantized Megatron generation is not supported.
