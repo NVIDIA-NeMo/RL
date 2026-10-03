@@ -668,7 +668,7 @@ def _reserve_reference_cluster(
             if node_id not in train_hosts | inference_hosts
             and node_info[node_id]["Resources"].get("GPU", 0) >= reference.gpus_per_node
         }
-        segment_size = master_config.cluster.get("segment_size")
+        segment_size = master_config.cluster.segment_size
         if segment_size is not None and any(
             domain != "unknown" for domain, _ in candidates.values()
         ):
@@ -690,9 +690,9 @@ def _reserve_reference_cluster(
         bundle_ct_per_node_list=[reference.gpus_per_node] * reference.num_nodes,
         num_gpus_per_node=reference.gpus_per_node,
         node_resource_constraints=constraints,
-        segment_size=master_config.cluster.get("segment_size"),
-        port_range_low=master_config.cluster.get("master_port_range_low"),
-        port_range_high=master_config.cluster.get("master_port_range_high"),
+        segment_size=master_config.cluster.segment_size,
+        port_range_low=master_config.cluster.master_port_range_low,
+        port_range_high=master_config.cluster.master_port_range_high,
     )
     cluster.get_placement_groups()
     return cluster
