@@ -832,10 +832,6 @@ class VllmAsyncGenerationWorkerImpl(
             max_rows=generation_prefix_batch_size,
             max_tokens=generation_prefix_batch_max_tokens,
         )
-        if generation_prefix_cuts_enabled and capture_media:
-            raise ValueError(
-                "generation-prefix recovery does not yet support multimodal capture"
-            )
         if capture_media:
             # Omni-only: a new processor family must also change setup.py (driver
             # checks), captured_media.py (_processed_omni_tensors, pack_images,
@@ -881,7 +877,7 @@ class VllmAsyncGenerationWorkerImpl(
         if self._generation_prefix_reader is not None:
             await self._generation_prefix_reader.aclose()
         self._generation_prefix_reader = PrefixReadBatcher(
-            source.fetch,
+            source.fetch_generation_cut,
             max_rows=generation_prefix_batch_size,
             max_tokens=generation_prefix_batch_max_tokens,
         )
@@ -1067,6 +1063,7 @@ class VllmAsyncGenerationWorkerImpl(
         *,
         admission: Any | None,
         splice: PrefixSplice | None = None,
+        restored: CapturedMedia | None = None,
     ) -> CapturedMedia | None:
         """Run off-loop: resolve retained geometry and snapshot processed pixels."""
         if admission is None:
@@ -1148,7 +1145,7 @@ class VllmAsyncGenerationWorkerImpl(
                     )
                     retained_items.append(item)
             retained = tuple(retained_items)
-        return capture_processed_media(
+        captured = capture_processed_media(
             engine_prompt,
             prev_len=admission.prev_len,
             retained=retained,
@@ -1156,6 +1153,79 @@ class VllmAsyncGenerationWorkerImpl(
             image_token_id=self._capture_image_token_id,
             patch_size=self._capture_patch_size,
         )
+        if restored is None:
+            return captured
+        if captured.items != restored.items:
+            raise MediaCaptureRejected(
+                "Restored generation media metadata differs from reprocessed input",
+                code="retained_media_changed",
+            )
+        captured_tensors = captured.tensors or {}
+        restored_tensors = restored.tensors or {}
+        if set(captured_tensors) != set(restored_tensors) or any(
+            captured_tensors[name].dtype != restored_tensors[name].dtype
+            or captured_tensors[name].shape != restored_tensors[name].shape
+            or not torch.equal(captured_tensors[name], restored_tensors[name])
+            for name in captured_tensors
+        ):
+            raise MediaCaptureRejected(
+                "Restored generation media tensors differ from reprocessed input",
+                code="retained_media_changed",
+            )
+        # Keep the durable TQ-owned tensors for the eventual canonical row.
+        return restored
+
+    def _generation_cut_record_payload(
+        self, state: _RequestCaptureState
+    ) -> tuple[dict[str, Any] | None, dict[str, torch.Tensor] | None]:
+        """Return digest-covered media metadata and first-row attachments."""
+        if state.media is None:
+            return None, None
+        from nemo_gym.token_id_capture.adapters.vllm import MEDIA_SPANS_FIELD
+
+        return (
+            {MEDIA_SPANS_FIELD: [item.to_dict() for item in state.media.items]},
+            state.media.tensors,
+        )
+
+    def _restore_generation_cut_media(self, chunks: list[Any]) -> CapturedMedia | None:
+        """Rebuild one call's media bundle from its first durable prefix row."""
+        if not self._capture_media:
+            return None
+        from nemo_gym.token_id_capture.adapters.vllm import MEDIA_SPANS_FIELD
+
+        media_rows = [
+            index for index, chunk in enumerate(chunks) if chunk.media_present
+        ]
+        if media_rows and media_rows != [0]:
+            raise MediaCaptureRejected(
+                "Only the first generation-prefix row may carry media tensors"
+            )
+        first = chunks[0]
+        extras = first.extras
+        if not isinstance(extras, dict) or MEDIA_SPANS_FIELD not in extras:
+            raise MediaCaptureRejected("Generation-prefix media metadata is missing")
+        raw_items = extras[MEDIA_SPANS_FIELD]
+        if not isinstance(raw_items, list):
+            raise MediaCaptureRejected("Generation-prefix media metadata is malformed")
+        items = tuple(CapturedMediaItem.from_dict(value) for value in raw_items)
+        for item in items:
+            item.verify_tokens(
+                first.snapshot.token_ids_delta, origin=first.snapshot.prev_len
+            )
+        if bool(items) != bool(media_rows):
+            raise MediaCaptureRejected(
+                "Generation-prefix media metadata and tensors disagree"
+            )
+        if not media_rows:
+            return CapturedMedia(items=(), tensors=None)
+        media = first.media
+        if media is None:
+            raise MediaCaptureRejected("Generation-prefix media tensors are missing")
+        tensors = {"imgs": media.imgs, "imgs_sizes": media.imgs_sizes}
+        if media.num_frames is not None:
+            tensors["num_frames"] = media.num_frames
+        return CapturedMedia(items=items, tensors=tensors)
 
     def _fetch_chain_prefix(self, staging_chain: list[str]) -> list[int]:
         """Resolve a staging chain through the shared, cached TQ read."""
@@ -1548,6 +1618,7 @@ class VllmAsyncGenerationWorkerImpl(
                 admission = worker_self._capture_admission(request)
                 capture_prefix_token_ids: list[int] | None = None
                 generation_cut = None
+                restored_generation_media = None
                 resumed_generation_token_ids: list[int] = []
                 restored_request_output_tokens: int | None = None
                 if admission is not None:
@@ -1565,6 +1636,9 @@ class VllmAsyncGenerationWorkerImpl(
                                 list(admission.generation_cut.staging_keys),
                                 tokens_per_key=max(1, self.model_config.max_model_len),
                             )
+                        )
+                        restored_generation_media = (
+                            worker_self._restore_generation_cut_media(cut_snapshots)
                         )
                     generation_cut = await asyncio.to_thread(
                         worker_self._resolve_generation_cut,
@@ -1686,6 +1760,38 @@ class VllmAsyncGenerationWorkerImpl(
                     # rendering/splicing it again could add or drop tokens.
                     final_prompt_token_ids = model_prefix_token_ids
                     media = None
+                    if worker_self._capture_media:
+                        media_splice = splice_prefix_tokens(
+                            tokenizer=self.renderer.tokenizer,
+                            model_prefix_token_ids=list(capture_prefix_token_ids or ()),
+                            template_prefix_token_ids=actual_corresponding_token_ids,
+                            template_token_ids=engine_prompt["prompt_token_ids"],
+                        )
+                        prompt_delta = [
+                            token_id
+                            for token_id, mask in zip(
+                                generation_cut.token_ids_delta,
+                                generation_cut.token_mask_delta,
+                                strict=True,
+                            )
+                            if mask == 0.0
+                        ]
+                        expected_prompt = (
+                            list(capture_prefix_token_ids or ()) + prompt_delta
+                        )
+                        if media_splice.token_ids != expected_prompt:
+                            raise MediaCaptureRejected(
+                                "Reprocessed multimodal prompt differs from the "
+                                "durable generation prefix",
+                                code="retained_media_changed",
+                            )
+                        media = await asyncio.to_thread(
+                            worker_self._capture_request_media,
+                            engine_prompt,
+                            admission=admission,
+                            splice=media_splice,
+                            restored=restored_generation_media,
+                        )
                 else:
                     splice = splice_prefix_tokens(
                         tokenizer=self.renderer.tokenizer,

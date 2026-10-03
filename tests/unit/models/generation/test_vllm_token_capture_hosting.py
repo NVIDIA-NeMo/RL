@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import threading
 import time
@@ -51,6 +52,7 @@ from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
     StageResult,
 )
 
+from nemo_rl.data.captured_media import CapturedMedia, CapturedMediaItem  # noqa: E402
 from nemo_rl.data_plane.tq_token_sink import ChainPrefixCache  # noqa: E402
 from nemo_rl.models.generation.generation_cut_capture import (  # noqa: E402
     GenerationPrefixBatchLimits,
@@ -73,6 +75,7 @@ class _MemorySink:
         self.records: list[StagedCallRecord] = []
         self.attachments: list[dict | None] = []
         self.generation_prefix_records: list[tuple[str, StagedCallRecord]] = []
+        self.generation_prefix_attachments: list[dict | None] = []
         self.generation_prefix_keys: list[str] = []
         self.cleared_generation_prefix_keys: list[str] = []
 
@@ -91,8 +94,8 @@ class _MemorySink:
         chunk_sequence: int,
         attachments: dict | None = None,
     ) -> StageResult:
-        assert attachments is None
         self.generation_prefix_records.append((checkpoint_id, record))
+        self.generation_prefix_attachments.append(attachments)
         key = (
             f"__generation_cut__/{checkpoint_id}/{record.rollout_id}/"
             f"{record.model_call_id}/{chunk_sequence}"
@@ -106,14 +109,20 @@ class _MemorySink:
         *,
         checkpoint_id: str,
         chunk_sequences: list[int],
+        attachments: list[dict | None] | None = None,
     ) -> list[StageResult]:
+        if attachments is None:
+            attachments = [None] * len(records)
         return [
             self.stage_generation_prefix(
                 record,
                 checkpoint_id=checkpoint_id,
                 chunk_sequence=sequence,
+                attachments=row_attachments,
             )
-            for record, sequence in zip(records, chunk_sequences, strict=True)
+            for record, sequence, row_attachments in zip(
+                records, chunk_sequences, attachments, strict=True
+            )
         ]
 
     def clear(self, staging_keys: list[str]) -> None:
@@ -312,7 +321,7 @@ def test_token_capture_snapshot_fence_control_fans_out(
     )
 
 
-def test_prefix_capture_setup_requires_control_token_and_rejects_media(monkeypatch):
+def test_prefix_capture_setup_requires_control_token(monkeypatch):
     monkeypatch.setattr(
         "nemo_rl.data_plane.build_data_plane_client",
         lambda dp_cfg, bootstrap: MagicMock(),
@@ -325,20 +334,6 @@ def test_prefix_capture_setup_requires_control_token_and_rejects_media(monkeypat
                 {},
                 "rollout_staging",
                 generation_prefix_cuts_enabled=True,
-            )
-        )
-
-    worker = _fake_worker()
-    worker.llm = SimpleNamespace(model_config=SimpleNamespace(dtype=torch.bfloat16))
-    with pytest.raises(ValueError, match="does not yet support multimodal"):
-        asyncio.run(
-            VllmAsyncGenerationWorkerImpl.setup_token_capture(
-                worker,
-                {},
-                "rollout_staging",
-                capture_media=True,
-                generation_prefix_cuts_enabled=True,
-                generation_cut_control_token="secret",
             )
         )
 
@@ -587,6 +582,8 @@ def _worker_with_capture(sink: _MemorySink):
         "_fetch_generation_cut_chunks",
         "_rebuild_generation_cut_snapshot",
         "_resolve_generation_cut",
+        "_generation_cut_record_payload",
+        "_restore_generation_cut_media",
         "_enter_request_prefix",
         "_pop_request_capture",
         "_get_request_capture",
@@ -620,13 +617,16 @@ class _BatchPrefixSink(_MemorySink):
         self.failure: str | None = None
         self.before_write = lambda: None
 
-    def stage_generation_prefix_batch(self, records, *, checkpoint_id, chunk_sequences):
+    def stage_generation_prefix_batch(
+        self, records, *, checkpoint_id, chunk_sequences, attachments=None
+    ):
         self.batches.append([len(record.token_ids_delta) for record in records])
         self.before_write()
         results = super().stage_generation_prefix_batch(
             records,
             checkpoint_id=checkpoint_id,
             chunk_sequences=chunk_sequences,
+            attachments=attachments,
         )
         if self.failure == "raise":
             raise RuntimeError("injected batch transport failure after writes")
@@ -1207,6 +1207,70 @@ def test_dropped_output_delta_keeps_its_call_uncuttable():
     assert healthy.generation_cut_staging_keys == sink.generation_prefix_keys
 
 
+def test_generation_cut_stages_media_only_with_first_prefix_row():
+    sink = _MemorySink()
+    worker = _worker_with_capture(sink)
+    request = _FakeRequest(
+        ng_capture={
+            "rollout_id": "r0",
+            "model_call_id": "c1",
+            "parent_call_id": None,
+            "prev_len": 0,
+            "mode": "text",
+        },
+        stream=False,
+    )
+    media = CapturedMedia(
+        items=(
+            CapturedMediaItem(
+                modality="image",
+                placeholder_offset=0,
+                placeholder_length=2,
+                placeholder_digest=hashlib.sha256(
+                    json.dumps([18, 18], separators=(",", ":")).encode()
+                ).hexdigest(),
+                token_id=18,
+                embedding_spans=((0, 2),),
+                imgs_sizes=((1, 2),),
+            ),
+        ),
+        tensors={
+            "imgs": torch.ones(1, 2, 3),
+            "imgs_sizes": torch.tensor([[1, 2]], dtype=torch.int32),
+        },
+    )
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(
+        worker, request, [18, 18], media=media
+    )
+    state = worker._capture_calls[id(request)]
+    state.effective_output_limit = 8
+    state.observe([20], [-0.1])
+
+    def inventory(checkpoint_id: str) -> GenerationCutInventory:
+        return GenerationCutInventory.build(
+            checkpoint_id=checkpoint_id,
+            server_name="policy_model",
+            active_prefixes=[
+                GenerationCutPrefix(
+                    ticket_id=f"ticket-{checkpoint_id}",
+                    rollout_id="r0",
+                    attempt_index=0,
+                    model_call_id="c1",
+                    admitted_at=1.0,
+                )
+            ],
+        )
+
+    worker._checkpoint_generation_cut(inventory("checkpoint-1"))
+    state.observe([21], [-0.2])
+    worker._checkpoint_generation_cut(inventory("checkpoint-2"))
+
+    first, second = [record for _, record in sink.generation_prefix_records]
+    assert first.extras == {"media_spans": [media.items[0].to_dict()]}
+    assert second.extras is None
+    assert sink.generation_prefix_attachments == [media.tensors, None]
+
+
 class _FailOncePrefixSink(_MemorySink):
     def __init__(self) -> None:
         super().__init__()
@@ -1683,13 +1747,23 @@ def test_omni_capture_setup_rejects_video_pruning(monkeypatch, pruning_rate):
         with pytest.raises(ValueError, match="video token pruning"):
             asyncio.run(
                 VllmAsyncGenerationWorkerImpl.setup_token_capture(
-                    worker, {}, staging_partition="staging", capture_media=True
+                    worker,
+                    {},
+                    staging_partition="staging",
+                    capture_media=True,
+                    generation_prefix_cuts_enabled=True,
+                    generation_cut_control_token="secret",
                 )
             )
     else:
         assert asyncio.run(
             VllmAsyncGenerationWorkerImpl.setup_token_capture(
-                worker, {}, staging_partition="staging", capture_media=True
+                worker,
+                {},
+                staging_partition="staging",
+                capture_media=True,
+                generation_prefix_cuts_enabled=True,
+                generation_cut_control_token="secret",
             )
         )
         assert worker._capture_image_token_id == 18

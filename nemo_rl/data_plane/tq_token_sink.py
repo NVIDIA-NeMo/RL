@@ -40,7 +40,7 @@ import logging
 import math
 import threading
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 import ray
@@ -358,6 +358,9 @@ class FetchedStagedCall:
     # ``media_present`` is True; ``media_has_frames`` selects the video shape.
     media_present: bool = False
     media_has_frames: bool = False
+    # Populated only by ``fetch_generation_cut``. Finalization keeps media
+    # tensors deferred until it has selected the terminal lineage.
+    media: StagedMediaTensors | None = None
 
 
 def _call_dp(dp_client: Any, method_name: str, **kwargs: Any) -> Any:
@@ -917,6 +920,35 @@ class TQTokenSource:
     def fetch(self, staging_keys: list[str]) -> list[StagedCallBaseSnapshot]:
         """Gym ``StagingSource`` conformance: base snapshots only, in order."""
         return [item.snapshot for item in self.fetch_for_finalization(staging_keys)]
+
+    def fetch_generation_cut(self, staging_keys: list[str]) -> list[FetchedStagedCall]:
+        """Fetch prefix rows and any media needed to resume their model call.
+
+        The base read is shared across all requested keys. Media rows are then
+        read in at most two batches (still images and videos), preserving the
+        input order in the returned list. Text-only sources perform no second
+        read.
+        """
+        items = self.fetch_for_finalization(staging_keys)
+        if not self._capture_media or not any(item.media_present for item in items):
+            return items
+
+        media_by_index: dict[int, StagedMediaTensors] = {}
+        for has_frames in (False, True):
+            indexed = [
+                (index, item)
+                for index, item in enumerate(items)
+                if item.media_present and item.media_has_frames is has_frames
+            ]
+            if not indexed:
+                continue
+            parts = self.fetch_media([item for _, item in indexed])
+            for (index, _), media in zip(indexed, parts, strict=True):
+                media_by_index[index] = media
+        return [
+            replace(item, media=media_by_index.get(index))
+            for index, item in enumerate(items)
+        ]
 
     def fetch_prefix_token_ids(self, staging_keys: list[str]) -> list[int]:
         """Bulk-fetch ordered delta chain and concatenate token_ids_delta into a prefix."""

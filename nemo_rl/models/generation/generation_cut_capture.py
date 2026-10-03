@@ -80,9 +80,8 @@ class _RequestCaptureState:
     call: Any
     prompt_token_ids: list[int]
     # Backend-owned opaque state that must survive until the terminal row is
-    # staged. vLLM uses this for its processed-media snapshot; prefix recovery
-    # is currently setup-guarded to text-only, but ordinary terminal capture
-    # still shares this lifecycle container.
+    # staged. vLLM uses this for its processed-media snapshot; the first
+    # generation-prefix row durably carries it across recovery.
     media: Any | None = None
     resumed_generation_token_ids: list[int] = field(default_factory=list)
     effective_output_limit: int | None = None
@@ -343,17 +342,27 @@ class GenerationCutCaptureMixin:
                 "_staging_source not initialized; call setup_token_capture() first"
             )
         staging_keys = list(continuation.staging_keys)
-        snapshots = self._staging_source.fetch(staging_keys)
-        if len(snapshots) != len(staging_keys):
+        fetch = getattr(self._staging_source, "fetch_generation_cut", None)
+        if fetch is None:
+            fetch = self._staging_source.fetch
+        chunks = fetch(staging_keys)
+        if len(chunks) != len(staging_keys):
             raise RuntimeError("generation-cut fetch did not return every staged chunk")
-        if not snapshots:
+        if not chunks:
             raise RuntimeError("generation-cut continuation has no staged chunks")
-        return snapshots
+        return chunks
 
     def _rebuild_generation_cut_snapshot(
-        self, admission: Any, prefix_token_ids: list[int], snapshots: list[Any]
+        self, admission: Any, prefix_token_ids: list[int], chunks: list[Any]
     ) -> Any:
         """Rebuild and verify the cumulative staged prefix from its fetched chunks."""
+        snapshots = [getattr(chunk, "snapshot", chunk) for chunk in chunks]
+        extras_by_chunk = [getattr(chunk, "extras", None) for chunk in chunks]
+        if any(extras is not None for extras in extras_by_chunk[1:]):
+            raise RuntimeError(
+                "only the first generation-cut chunk may carry call extras"
+            )
+        extras = extras_by_chunk[0]
         continuation = admission.generation_cut
         weight_versions = [snapshot.weight_version for snapshot in snapshots]
         if weight_versions != sorted(weight_versions):
@@ -405,7 +414,7 @@ class GenerationCutCaptureMixin:
         # chunks. The cumulative snapshot uses the oldest contributing version
         # so downstream replay-buffer staleness checks remain conservative.
         weight_version = weight_versions[0]
-        extras_digest = compute_extras_digest(None)
+        extras_digest = compute_extras_digest(extras)
         chain_hash = compute_chain_hash(admission.parent_chain_hash, token_ids_delta)
         cumulative_hash = hash_token_ids(prefix_token_ids + token_ids_delta)
         digest = compute_staging_digest(
@@ -635,13 +644,14 @@ class GenerationCutCaptureMixin:
         transaction = self._generation_cut_transaction(prefix, state, checkpoint_id)
         try:
             try:
-                record, sequence = next(transaction)
+                record, sequence, attachments = next(transaction)
             except StopIteration as finished:
                 return finished.value
             result = self._capture_sink.stage_generation_prefix(
                 record,
                 checkpoint_id=checkpoint_id,
                 chunk_sequence=sequence,
+                attachments=attachments,
             )
             acknowledgement = transaction.send(result)
             try:
@@ -660,9 +670,10 @@ class GenerationCutCaptureMixin:
     ) -> Generator[Any, Any, Any]:
         """Keep a live call frozen until transport and acknowledgement validate.
 
-        The generator yields ``(record, sequence)``, receives a ``StageResult``,
-        then yields its validated acknowledgement. The caller resumes it once
-        more to seal. Closing before that point rolls the detached buffer back.
+        The generator yields ``(record, sequence, attachments)``, receives a
+        ``StageResult``, then yields its validated acknowledgement. The caller
+        resumes it once more to seal. Closing before that point rolls the
+        detached buffer back.
         """
         from nemo_gym._checkpoint.generation_cut import GenerationCutPrefixAck
 
@@ -748,11 +759,16 @@ class GenerationCutCaptureMixin:
 
             staged_key = None
             try:
+                payload = getattr(self, "_generation_cut_record_payload", None)
+                extras, attachments = (
+                    payload(state) if payload is not None else (None, None)
+                )
                 cumulative_record = capture.build_prefix_record(
                     state.call,
                     prompt_token_ids=state.prompt_token_ids,
                     generated_token_ids=generated_token_ids,
                     generated_logprobs=generated_logprobs,
+                    extras=extras,
                 )
                 if chunk_token_ids:
                     chunk_record = (
@@ -764,7 +780,10 @@ class GenerationCutCaptureMixin:
                             generated_logprobs=chunk_logprobs,
                         )
                     )
-                    result = yield chunk_record, chunk_sequence
+                    row_attachments = (
+                        attachments if not state.generation_cut_staging_keys else None
+                    )
+                    result = yield chunk_record, chunk_sequence, row_attachments
                     staged_key = result.staging_key
                     if not result.ok:
                         raise RuntimeError(
@@ -840,7 +859,7 @@ class GenerationCutCaptureMixin:
 
         sink = self._capture_sink
         acknowledgements: list[Any] = []
-        pending: list[tuple[Generator[Any, Any, Any], Any, int, Any]] = []
+        pending: list[tuple[Generator[Any, Any, Any], Any, int, Any, Any]] = []
         pending_tokens = 0
         uncut: list[Any] = []
 
@@ -849,7 +868,7 @@ class GenerationCutCaptureMixin:
 
         def release_pending() -> None:
             nonlocal pending_tokens
-            for transaction, _, _, prefix in pending:
+            for transaction, _, _, prefix, _ in pending:
                 transaction.close()
                 uncut.append(prefix)
             pending.clear()
@@ -869,14 +888,15 @@ class GenerationCutCaptureMixin:
                     record.model_call_id,
                     chunk_sequence=sequence,
                 )
-                for _, record, sequence, _ in pending
+                for _, record, sequence, _, _ in pending
             ]
             sealed_keys: set[str] = set()
             try:
                 results = sink.stage_generation_prefix_batch(
-                    [record for _, record, _, _ in pending],
+                    [record for _, record, _, _, _ in pending],
                     checkpoint_id=inventory.checkpoint_id,
-                    chunk_sequences=[sequence for _, _, sequence, _ in pending],
+                    chunk_sequences=[sequence for _, _, sequence, _, _ in pending],
+                    attachments=[attachments for _, _, _, _, attachments in pending],
                 )
                 if len(results) != len(pending):
                     raise RuntimeError(
@@ -890,11 +910,13 @@ class GenerationCutCaptureMixin:
                         )
                 batch_acks = [
                     transaction.send(result)
-                    for (transaction, _, _, _), result in zip(
+                    for (transaction, _, _, _, _), result in zip(
                         pending, results, strict=True
                     )
                 ]
-                for (transaction, _, _, _), key in zip(pending, keys, strict=True):
+                for (transaction, _, _, _, _), key in zip(
+                    pending, keys, strict=True
+                ):
                     try:
                         transaction.send(None)
                     except StopIteration:
@@ -915,7 +937,7 @@ class GenerationCutCaptureMixin:
                         )
                 raise
             finally:
-                for transaction, _, _, _ in pending:
+                for transaction, _, _, _, _ in pending:
                     transaction.close()
                 pending.clear()
                 pending_tokens = 0
@@ -942,7 +964,7 @@ class GenerationCutCaptureMixin:
                 )
                 try:
                     try:
-                        record, sequence = next(transaction)
+                        record, sequence, attachments = next(transaction)
                     except StopIteration as finished:
                         acknowledgement = finished.value
                         if acknowledgement is None:
@@ -954,7 +976,9 @@ class GenerationCutCaptureMixin:
                     tokens = len(record.token_ids_delta)
                     if pending and pending_tokens + tokens > batch_limits.max_tokens:
                         flush()
-                    pending.append((transaction, record, sequence, prefix))
+                    pending.append(
+                        (transaction, record, sequence, prefix, attachments)
+                    )
                 except BaseException:
                     transaction.close()
                     raise
@@ -967,7 +991,7 @@ class GenerationCutCaptureMixin:
                     flush()
             flush()
         finally:
-            for transaction, _, _, _ in pending:
+            for transaction, _, _, _, _ in pending:
                 transaction.close()
         if uncut:
             LOGGER.warning(
