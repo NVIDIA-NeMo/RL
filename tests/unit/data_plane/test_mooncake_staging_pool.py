@@ -192,14 +192,18 @@ def test_pool_is_constructed_once_under_concurrent_first_use(monkeypatch) -> Non
     relying on winning a race a fixed number of times.
     """
     constructed: list[object] = []
-    original_init = tq_adapter._StagingPool.__init__
+    original_build = tq_adapter._StagingPoolRegistry._build
 
-    def slow_init(self, store, n_slots, max_bytes):  # type: ignore[no-untyped-def]
+    def slow_build(self, client):  # type: ignore[no-untyped-def]
         time.sleep(0.05)  # widen the check-then-set window
-        original_init(self, store, n_slots, max_bytes)
-        constructed.append(self)
+        pool = original_build(self, client)
+        constructed.append(pool)
+        return pool
 
-    monkeypatch.setattr(tq_adapter._StagingPool, "__init__", slow_init)
+    # Patch the registry's factory rather than _StagingPool.__init__: the
+    # invariant is the registry's, and which pool it builds now depends on
+    # whether the installed mooncake wheel carries BufferPool.
+    monkeypatch.setattr(tq_adapter._StagingPoolRegistry, "_build", slow_build)
 
     # The production registry is a local of _patch_mooncake_staging_buffers, so
     # build one here rather than reaching into the patch closure.
