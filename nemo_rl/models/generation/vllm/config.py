@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+import os
 import warnings
 from collections.abc import Mapping
 from typing import Annotated, Any, Literal, NotRequired, TypedDict, cast, get_args
@@ -35,6 +37,8 @@ from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
     NvFp4PerTokenRolloutConfig,
     resolve_boundary_ignore_patterns,
 )
+
+logger = logging.getLogger(__name__)
 
 VllmRefitTransportName = Literal["s3", "zmq"]
 VllmRefitSelector = Literal["vllm_s3_sparse", "vllm_zmq_sparse", "nixl", "nccl_reshard"]
@@ -126,6 +130,208 @@ class VllmSpecificArgs(TypedDict):
     refit_with_reload_api: NotRequired[bool]
     # A filepath that can be imported to register a vLLM reasoning parser
     reasoning_parser_plugin: NotRequired[str]
+    # Name of the vLLM reasoning parser the engine is built with (e.g.
+    # "deepseek_r1"). Forwarded to vLLM's EngineArgs.reasoning_parser, which is
+    # what populates its ReasoningConfig. Required by thinking_token_budget.
+    reasoning_parser: NotRequired[str]
+    # Per-request cap on reasoning tokens, forwarded to vLLM's SamplingParams
+    # field of the same name. Reasoning models are usually evaluated with such
+    # a cap, and RL rollouts should decode under the same configuration. vLLM's
+    # domain: a non-negative token count, or -1 for unlimited. Requires
+    # reasoning_parser to be set (vLLM rejects the request otherwise).
+    thinking_token_budget: NotRequired[int]
+
+
+# vLLM chooses its model runner per architecture when this is unset; the
+# reasoning-token budget is only implemented on the v1 runner.
+VLLM_USE_V2_MODEL_RUNNER_ENV_VAR = "VLLM_USE_V2_MODEL_RUNNER"
+
+# vLLM's sentinel for "no reasoning-token cap"; it normalizes this to None, so
+# it is the one value that does not require a reasoning parser.
+VLLM_THINKING_TOKEN_BUDGET_UNLIMITED = -1
+
+
+def resolve_reasoning_parser(config: "VllmConfig | dict[str, Any]") -> str | None:
+    """Resolve the reasoning parser the vLLM engine will be built with.
+
+    ``vllm_kwargs`` is splatted into vLLM's ``EngineArgs``, so a reasoning
+    parser set there already reaches the engine today. ``vllm_cfg`` is the
+    documented home for it. Accept either, and refuse to silently pick a
+    winner when the two disagree.
+
+    Args:
+        config: The ``policy.generation`` config.
+
+    Returns:
+        The parser name, or None when neither location sets one.
+
+    Raises:
+        ValueError: If both locations are set to different parsers.
+    """
+    vllm_cfg = config.get("vllm_cfg") or {}
+    vllm_kwargs = config.get("vllm_kwargs") or {}
+    from_cfg = vllm_cfg.get("reasoning_parser")
+    from_kwargs = vllm_kwargs.get("reasoning_parser")
+    if from_cfg and from_kwargs and from_cfg != from_kwargs:
+        raise ValueError(
+            "policy.generation.vllm_cfg.reasoning_parser="
+            f"{from_cfg!r} conflicts with "
+            f"policy.generation.vllm_kwargs.reasoning_parser={from_kwargs!r}. "
+            "Both are forwarded to the same vLLM EngineArgs field; set only "
+            "one (vllm_cfg.reasoning_parser is the documented home)."
+        )
+    return from_cfg or from_kwargs or None
+
+
+def check_http_server_reasoning_parser(
+    config: "VllmConfig | dict[str, Any]",
+) -> str | None:
+    """Warn when the HTTP serving layer parses reasoning differently.
+
+    The engine-level parser governs ``thinking_token_budget`` and structured
+    outputs; ``http_server_serving_chat_kwargs.reasoning_parser`` governs how
+    the OpenAI-compatible endpoint splits reasoning out of a response. They are
+    independent settings that are almost always meant to agree.
+
+    Returns:
+        The serving-layer parser name when it disagrees with the engine one,
+        otherwise None.
+    """
+    vllm_cfg = config.get("vllm_cfg") or {}
+    if not vllm_cfg.get("expose_http_server"):
+        return None
+    serving_kwargs = vllm_cfg.get("http_server_serving_chat_kwargs") or {}
+    serving_parser = serving_kwargs.get("reasoning_parser")
+    engine_parser = resolve_reasoning_parser(config)
+    if not serving_parser or not engine_parser or serving_parser == engine_parser:
+        return None
+    logger.warning(
+        "policy.generation.vllm_cfg.http_server_serving_chat_kwargs."
+        "reasoning_parser=%r differs from the engine's reasoning parser %r. "
+        "The HTTP endpoint will split reasoning content differently from how "
+        "the engine enforces thinking_token_budget and structured outputs.",
+        serving_parser,
+        engine_parser,
+    )
+    return serving_parser
+
+
+def resolve_thinking_token_budget(
+    config: "VllmConfig | dict[str, Any]",
+) -> int | None:
+    """Validate and resolve ``vllm_cfg.thinking_token_budget``.
+
+    vLLM validates this field per request and rejects the whole request when
+    the engine has no reasoning parser configured, which in an RL run surfaces
+    as a rollout failure well after startup. Resolve it once, up front, so a
+    misconfiguration fails before any GPU is claimed.
+
+    Args:
+        config: The ``policy.generation`` config.
+
+    Returns:
+        The budget to forward to vLLM ``SamplingParams``, or None when unset.
+
+    Raises:
+        ValueError: If the value is outside vLLM's domain (a non-negative
+            integer, or -1 for unlimited), or if a finite budget is requested
+            without a reasoning parser.
+    """
+    vllm_cfg = config.get("vllm_cfg") or {}
+    budget = vllm_cfg.get("thinking_token_budget")
+    if budget is None:
+        return None
+    if isinstance(budget, bool) or not isinstance(budget, int):
+        raise ValueError(
+            "policy.generation.vllm_cfg.thinking_token_budget must be an "
+            "integer: a non-negative number of reasoning tokens, or "
+            f"{VLLM_THINKING_TOKEN_BUDGET_UNLIMITED} for unlimited. Got "
+            f"{budget!r} of type {type(budget).__name__}."
+        )
+    if budget < VLLM_THINKING_TOKEN_BUDGET_UNLIMITED:
+        raise ValueError(
+            "policy.generation.vllm_cfg.thinking_token_budget must be a "
+            "non-negative number of reasoning tokens, or "
+            f"{VLLM_THINKING_TOKEN_BUDGET_UNLIMITED} for unlimited. Got "
+            f"{budget}."
+        )
+    if budget == VLLM_THINKING_TOKEN_BUDGET_UNLIMITED:
+        # vLLM normalizes -1 to None before any of the checks below run.
+        return budget
+
+    if not resolve_reasoning_parser(config):
+        raise ValueError(
+            "policy.generation.vllm_cfg.thinking_token_budget is set but no "
+            "reasoning parser is configured. vLLM only honors a "
+            "reasoning-token budget on an engine built with a reasoning "
+            "parser and rejects every request otherwise. Set "
+            "policy.generation.vllm_cfg.reasoning_parser to the parser for "
+            "your model (plus reasoning_parser_plugin for a custom one), or "
+            f"set thinking_token_budget: {VLLM_THINKING_TOKEN_BUDGET_UNLIMITED} "
+            "to leave the budget unlimited."
+        )
+
+    if vllm_cfg.get("skip_tokenizer_init"):
+        raise ValueError(
+            "policy.generation.vllm_cfg.thinking_token_budget requires a "
+            "reasoning parser, and vLLM can only enable its ReasoningConfig "
+            "when the engine has a tokenizer, but "
+            "policy.generation.vllm_cfg.skip_tokenizer_init is true. Set "
+            "skip_tokenizer_init: false, or set thinking_token_budget: "
+            f"{VLLM_THINKING_TOKEN_BUDGET_UNLIMITED}."
+        )
+
+    _check_v2_model_runner_disabled()
+    return budget
+
+
+def _check_v2_model_runner_disabled() -> None:
+    """Reject or flag a v2-model-runner engine for thinking_token_budget.
+
+    vLLM's input processor raises "thinking_token_budget is not yet supported
+    by the V2 model runner" per request. ``VLLM_USE_V2_MODEL_RUNNER`` is
+    tri-state in vLLM: unset means "let the model architecture decide", so an
+    unset value cannot be resolved here without loading the model config.
+    """
+    raw = os.environ.get(VLLM_USE_V2_MODEL_RUNNER_ENV_VAR)
+    if raw is None:
+        logger.warning(
+            "policy.generation.vllm_cfg.thinking_token_budget is set but "
+            "%s is unset. vLLM does not support the budget on its V2 model "
+            "runner, and with the variable unset the runner is chosen per "
+            "model architecture -- on a model that defaults to v2, every "
+            "generation request will fail. Set %s=0 to be explicit.",
+            VLLM_USE_V2_MODEL_RUNNER_ENV_VAR,
+            VLLM_USE_V2_MODEL_RUNNER_ENV_VAR,
+        )
+        return
+    try:
+        # Matches vLLM's own parsing (envs.maybe_convert_bool).
+        enabled = bool(int(raw))
+    except ValueError:
+        # Not our variable to validate; vLLM will reject it on its own.
+        return
+    if enabled:
+        raise ValueError(
+            "policy.generation.vllm_cfg.thinking_token_budget is not "
+            f"supported when {VLLM_USE_V2_MODEL_RUNNER_ENV_VAR}={raw!r}: vLLM "
+            "rejects every request with 'thinking_token_budget is not yet "
+            f"supported by the V2 model runner'. Set "
+            f"{VLLM_USE_V2_MODEL_RUNNER_ENV_VAR}=0, or set "
+            f"thinking_token_budget: {VLLM_THINKING_TOKEN_BUDGET_UNLIMITED}."
+        )
+
+
+def thinking_token_budget_sampling_kwargs(
+    config: "VllmConfig | dict[str, Any]",
+) -> dict[str, int]:
+    """Resolve ``thinking_token_budget`` into vLLM ``SamplingParams`` kwargs.
+
+    Returns an empty dict when the budget is unset so callers can splat it and
+    leave vLLM's defaults untouched.
+    """
+    budget = resolve_thinking_token_budget(config)
+    return {} if budget is None else {"thinking_token_budget": budget}
 
 
 def vllm_nemotron_h_fp32_lm_head_enabled(
