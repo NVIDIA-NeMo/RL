@@ -30,6 +30,7 @@ def test_actor_fields_leave_the_gym_global_configuration(monkeypatch):
     nemo_gym_dict = {
         "config_paths": ["a.yaml"],
         "port_range_high": 5499,
+        "health_check_interval_seconds": 60,
         "max_infra_attempts_per_rollout": 3,
         "thinking_tags": ["<think>", "</think>"],
     }
@@ -43,12 +44,14 @@ def test_actor_fields_leave_the_gym_global_configuration(monkeypatch):
     # The bound the launcher injects reaches the field the actor reads at spin-up.
     assert cfg["port_range_high"] == 5499
     assert "port_range_low" not in cfg
+    assert cfg["health_check_interval_seconds"] == 60
     assert cfg["max_infra_attempts_per_rollout"] == 3
     assert cfg["thinking_tags"] == ["<think>", "</think>"]
     gym_global = cfg["initial_global_config_dict"]
     assert gym_global["config_paths"] == ["a.yaml"]
     for key in (
         "port_range_high",
+        "health_check_interval_seconds",
         "max_infra_attempts_per_rollout",
         "thinking_tags",
     ):
@@ -62,8 +65,14 @@ def test_rollout_config_reports_every_driver_key(monkeypatch):
     rollout_config = nemo_gym_mod.NemoGym.__ray_metadata__.modified_class.rollout_config
 
     class _Actor:
-        cfg = {"max_infra_attempts_per_rollout": 2}
+        cfg = {"health_check_interval_seconds": 60, "max_infra_attempts_per_rollout": 2}
 
-    assert rollout_config(_Actor()) == {"max_infra_attempts_per_rollout": 2}
+    assert rollout_config(_Actor()) == {
+        "health_check_interval_seconds": 60,
+        "max_infra_attempts_per_rollout": 2,
+    }
     _Actor.cfg = {}
-    assert rollout_config(_Actor()) == {"max_infra_attempts_per_rollout": None}
+    assert rollout_config(_Actor()) == {
+        "health_check_interval_seconds": None,
+        "max_infra_attempts_per_rollout": None,
+    }

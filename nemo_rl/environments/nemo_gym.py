@@ -407,10 +407,12 @@ class NemoGymConfig(TypedDict):
         bool
     ]  # Preserve heterogeneous shapes for native-resolution patchification
     # Read by the driver's rollout loop (nemo_rl/experience/rollouts.py), never by
-    # a Gym server: how many times one row may be dispatched before an
-    # infrastructure failure ends the step. ``_build_gym_actor_config`` moves it
-    # here from the env.nemo_gym mapping, out of Gym's global configuration, and
-    # ``NemoGym.rollout_config`` hands it back.
+    # a Gym server: seconds between health checks while no row has arrived, and
+    # how many times one row may be dispatched before an infrastructure failure
+    # ends the step. ``_build_gym_actor_config`` moves them here from the
+    # env.nemo_gym mapping, out of Gym's global configuration, and
+    # ``NemoGym.rollout_config`` hands them back.
+    health_check_interval_seconds: NotRequired[Optional[float]]
     max_infra_attempts_per_rollout: NotRequired[Optional[int]]
     # Ledger-authoritative token capture (token_capture.enabled): the dumped
     # TokenCaptureConfig. Turns on external staging in Gym's policy model
@@ -420,7 +422,10 @@ class NemoGymConfig(TypedDict):
 
 
 # The env.nemo_gym keys the driver's rollout loop reads (see NemoGymConfig).
-DRIVER_ROLLOUT_KEYS = ("max_infra_attempts_per_rollout",)
+DRIVER_ROLLOUT_KEYS = (
+    "health_check_interval_seconds",
+    "max_infra_attempts_per_rollout",
+)
 
 
 # Gym control-plane server name (the model server hosting the ledger) and the
@@ -1862,7 +1867,10 @@ def _build_gym_actor_config(
     tokenizer_config = nemo_gym_dict.pop("tokenizer_config", None)
     external_service_readiness = extract_external_service_readiness(nemo_gym_dict)
     # Read by the rollout loop on the driver (nemo_rl/experience/rollouts.py), never
-    # by a Gym server: kept as a top-level field of the actor's configuration.
+    # by a Gym server: kept as top-level fields of the actor's configuration.
+    health_check_interval_seconds = nemo_gym_dict.pop(
+        "health_check_interval_seconds", None
+    )
     max_infra_attempts_per_rollout = nemo_gym_dict.pop(
         "max_infra_attempts_per_rollout", None
     )
@@ -1908,6 +1916,7 @@ def _build_gym_actor_config(
         initial_global_config_dict=nemo_gym_dict,
         token_capture=token_capture,
         **port_range,
+        health_check_interval_seconds=health_check_interval_seconds,
         max_infra_attempts_per_rollout=max_infra_attempts_per_rollout,
         **multimodal_flags,
     )
