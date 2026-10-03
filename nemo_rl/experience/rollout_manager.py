@@ -44,6 +44,7 @@ from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import (
+    GYM_INFRA_FAILURE_KEY,
     as_nemo_gym_shard_set,
     get_nemo_gym_route_name,
 )
@@ -1184,6 +1185,14 @@ class AsyncNemoGymRolloutImpl:
             if rowidx in received:
                 raise ValueError(f"NeMo-Gym returned duplicate row index {rowidx}")
             received.add(rowidx)
+            if timing_metrics is not None:
+                env_timing_metrics = timing_metrics
+            if GYM_INFRA_FAILURE_KEY in result:
+                # The actor reports a row whose /run failed at the infrastructure
+                # level as a marker instead of ending the stream. Its slot stays
+                # None so the attempt loop dispatches it again, and the stream
+                # keeps delivering the other rows.
+                continue
             inputs_by_rowidx[rowidx]["agent_ref"] = resolved_agent_ref
             if "receipt" in result:
                 result["reward_checks"] = compute_reward_checks(
@@ -1214,8 +1223,6 @@ class AsyncNemoGymRolloutImpl:
                 # conversion lightweight and safe to repeat during group metrics.
                 row_completions, _ = self._results_to_completions([result])
                 await on_completion(rowidx, row_completions[0])
-            if timing_metrics is not None:
-                env_timing_metrics = timing_metrics
 
         return env_timing_metrics
 
