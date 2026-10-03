@@ -567,14 +567,6 @@ if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
     rm -f "${GYM_VLLM_OVERRIDE}"
 fi
 EOF
-# ray's bundled Java worker jar ships an outdated httpcore5 with a known CVE
-# (GHSA-hf6x-8p5f-cgmf). NeMo-RL never uses Ray's Java cross-language worker,
-# and removing the jar doesn't affect ray.init(), remote tasks, actors, or
-# ray.serve (verified in NVIDIA-NeMo/Gym#3779/#3826). Sweep every venv (base,
-# per-backend worker venvs, gym-prefetched venvs) and the default uv cache
-# (/root/.cache/uv, since this stage never overrides UV_CACHE_DIR) that it
-# could have landed in.
-RUN find /opt /root -name ray_dist.jar -delete
 # Generate container fingerprint for frozen environment support
 # Store outside /opt/nemo-rl to avoid being overwritten by user mounts
 RUN python tools/generate_fingerprint.py > /opt/nemo_rl_container_fingerprint
