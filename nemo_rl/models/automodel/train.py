@@ -61,6 +61,10 @@ from nemo_rl.models.automodel.data import (
     ProcessedMicrobatch,
     filter_multimodal_kwargs_for_model,
 )
+from nemo_rl.models.automodel.router_replay import (
+    ReplayGate,
+    microbatch_replay_context,
+)
 from nemo_rl.models.policy import PolicyConfig
 
 # Union type for any post-processing function
@@ -432,6 +436,7 @@ def automodel_forward_backward(
     num_global_batches: int = 1,
     num_valid_microbatches: Optional[int] = None,
     on_microbatch_start: Optional[Callable[[int], None]] = None,
+    router_replay_gates: Optional[list[ReplayGate]] = None,
 ) -> list[Tuple[Any, dict[str, Any]]]:
     """Execute forward and backward passes for automodel.
 
@@ -463,6 +468,8 @@ def automodel_forward_backward(
             If None, all microbatches are considered valid.
         on_microbatch_start: Optional callback called at the start of each microbatch
             with the microbatch index. Useful for cache clearing, etc.
+        router_replay_gates: When given, replay each microbatch's rollout
+            ``routed_experts`` on these MoE gates (R3) for both its forward and backward.
 
     Returns:
         List of (result, metrics) tuples from each microbatch
@@ -484,7 +491,12 @@ def automodel_forward_backward(
             allow_flash_attn_args=allow_flash_attn_args,
         )
 
-        with prepared.model_context_factory(), autocast_context_factory():
+        replay_context = microbatch_replay_context(router_replay_gates, processed_mb)
+        with (
+            replay_context,
+            prepared.model_context_factory(),
+            autocast_context_factory(),
+        ):
             # Forward pass with post-processing
             result, metrics, _ = forward_with_post_processing_fn(
                 model=model,
