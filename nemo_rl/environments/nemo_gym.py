@@ -281,6 +281,30 @@ def _typed_gym_failure(error: Exception) -> Optional[Exception]:
     return RolloutDataFailure(detail)
 
 
+def _refuse_empty_server_mappings(
+    initial_global_config_dict: Mapping[str, Any],
+) -> None:
+    """Raise ``ValueError`` when a top-level mapping of the Gym global config is empty.
+
+    NeMo-Gym's launcher (``nemo_gym/cli.py`` ``start``) treats every top-level
+    mapping of the global config as a server entry and indexes into it, so an
+    empty mapping (``some_server: {}``) crashes spin-up with a bare
+    ``IndexError``. Refusing it here names the offending key(s); a "use the
+    defaults" knob must be omitted entirely rather than left empty.
+    """
+    empty_mappings = sorted(
+        key
+        for key, value in initial_global_config_dict.items()
+        if isinstance(value, Mapping) and len(value) == 0
+    )
+    if empty_mappings:
+        raise ValueError(
+            f"env.nemo_gym contains empty mapping(s) {empty_mappings}, "
+            "which NeMo-Gym's launcher cannot start as servers. Remove the "
+            "key(s) or fill them."
+        )
+
+
 def get_nemo_gym_uv_cache_dir() -> str | None:
     """Return the uv cache directory inside a container, or None outside one.
 
@@ -648,6 +672,8 @@ Depending on your data shape, you may want to change these values."""
             self._control_timeout_s = float(
                 token_capture.get("control_timeout_s") or 60.0
             )
+
+        _refuse_empty_server_mappings(initial_global_config_dict)
 
         self.rh = RunHelper()
         self.rh.start(
