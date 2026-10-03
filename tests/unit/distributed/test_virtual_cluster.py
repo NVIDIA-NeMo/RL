@@ -56,6 +56,7 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_and_free_port,
     _init_ray,
     _reserve_data_plane_ports,
+    ray_runtime_env_excludes,
 )
 from nemo_rl.utils.venvs import create_local_venv
 from tests.unit.conftest import TEST_ASSETS_DIR
@@ -940,6 +941,14 @@ def test_default_port_ranges_ordered_and_below_ephemeral_floor():
     assert DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW > 1024
     assert DEFAULT_MASTER_PORT_RANGE_LOW > 1024
     assert DEFAULT_DATA_PLANE_PORT_RANGE_LOW > 1024
+
+
+def test_ray_runtime_env_excludes_come_from_the_launcher_variable():
+    assert ray_runtime_env_excludes({}) == []
+    assert ray_runtime_env_excludes({"NRL_RAY_RUNTIME_ENV_EXCLUDES": " , "}) == []
+    assert ray_runtime_env_excludes(
+        {"NRL_RAY_RUNTIME_ENV_EXCLUDES": "**/a/**, **/b/tests/**"}
+    ) == ["**/a/**", "**/b/tests/**"]
 
 
 _REGISTRY_PROBE = """
