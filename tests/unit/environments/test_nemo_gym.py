@@ -44,6 +44,7 @@ from nemo_rl.environments.nemo_gym import (
     ExternalServiceReadinessConfig,
     NemoGym,
     NemoGymConfig,
+    _refuse_empty_server_mappings,
     _wait_for_external_services,
     build_reward_component_columns,
     extract_external_service_readiness,
@@ -2187,3 +2188,25 @@ def test_vllm_http_logprobs_contract(nemo_gym_vllm_generation):
             f"expected null top_logprobs accepted-with-None or rejected as 4xx, "
             f"got {null_resp.status_code}: {null_resp.text}"
         )
+
+
+def test_spinup_refuses_an_empty_server_mapping_by_name():
+    """An empty top-level mapping would crash NeMo-Gym's launcher with a bare IndexError."""
+    from omegaconf import DictConfig
+
+    with pytest.raises(
+        ValueError, match=r"empty mapping\(s\) \['judge_model', 'tools'\]"
+    ):
+        _refuse_empty_server_mappings(
+            {
+                "tools": {},
+                "policy_model": {"responses_api_models": {}},
+                "judge_model": DictConfig({}),
+            }
+        )
+
+    # A nested empty mapping is a server's own setting, not a server entry, and
+    # scalars and lists are not server entries at all.
+    _refuse_empty_server_mappings(
+        {"policy_model": {"responses_api_models": {}}, "default_host": "h", "x": []}
+    )
