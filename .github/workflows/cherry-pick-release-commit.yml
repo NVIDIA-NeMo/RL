@@ -16,12 +16,23 @@ name: Create PR to main with cherry-pick from release
 on:
   push:
     branches:
-      - main
+      - "r[0-9]*.[0-9]*.[0-9]*"
 
 jobs:
   cherry-pick:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cherry_pick.yml@8ebb3aec4c246c944a25adc7b09107cbd6a76976 # v0.63.0
+    # TODO(kajalj): repin to a released tag once the v1.12.1 release/tag appears.
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cherry_pick.yml@d0d41722daf38672f472b688c68c95616ef4869d
+    with:
+      target-branch: main
+      trigger-label: cherry-pick-to-main
+      notify-mention: "<!subteam^S0C1W14AHS7>"
+      default-cicd-label: ""
+      app-id: ${{ vars.BOT_ID }}
     secrets:
+      BOT_KEY: ${{ secrets.BOT_KEY }}
+      # Only used for the /ok to test comment -- copy-pr-bot doesn't trust
+      # the App identity for that specific call. Everything else (push, PR
+      # creation, labels, reviewer request) still uses the App token.
       PAT: ${{ secrets.PAT }}
       SLACK_WEBHOOK_ADMIN: ${{ secrets.SLACK_WEBHOOK_ADMIN }}
       SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
