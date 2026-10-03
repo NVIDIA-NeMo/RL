@@ -779,6 +779,24 @@ class ClippedPGLossFn(LossFunction):
             actor_importance_weights_expanded = torch.nan_to_num(
                 actor_importance_weights_expanded, nan=0.0, posinf=0.0, neginf=0.0
             )
+        # Snapshot before truncation: ``sampling_importance_ratio`` is defined
+        # in docs/guides/grpo.md#sampling-importance-ratio as the raw
+        # exp(log pi_training - log pi_inference), and its stated job is to
+        # surface *the bias* in training/inference mismatch. Reporting the
+        # truncated weights instead makes it saturate under ``tis`` and invert
+        # under ``icepop``, where out-of-band tokens are zeroed rather than
+        # clamped: a batch whose true mean ratio is 4.5 reads as 0.48, i.e.
+        # below 1, exactly when the backend has drifted furthest above it. How
+        # often truncation fires is already reported separately as
+        # ``is_oob_ratio``.
+        #
+        # An alias, not a copy: all three truncation branches below rebind
+        # ``actor_importance_weights_expanded`` to a fresh tensor rather than
+        # mutating it, so this keeps pointing at the raw weights. Switching one
+        # to an in-place form (``clamp_``) would break that silently -- the two
+        # tests named after this metric are what would catch it.
+        untruncated_importance_weights = actor_importance_weights_expanded
+
         # ---- Truncated Importance Sampling ----
         # "tis"          – clamp IS weights to [min, max], where min defaults to 0
         # "icepop"       – zero out tokens whose IS weight ∉ [min, max]   (ref bounds: 0.5–5)
@@ -893,13 +911,13 @@ class ClippedPGLossFn(LossFunction):
         # See: docs/guides/grpo.md#sampling-importance-ratio
         if self.sequence_level_importance_ratios:
             sample_importance_ratio = masked_mean(
-                actor_importance_weights.squeeze(-1),
+                untruncated_importance_weights.squeeze(-1),
                 sample_mask,
                 global_normalization_factor=global_valid_seqs,
             )
         else:
             sample_importance_ratio = masked_mean(
-                actor_importance_weights,
+                untruncated_importance_weights,
                 mask,
                 global_normalization_factor=global_valid_toks,
             )
@@ -1918,7 +1936,17 @@ class DistillationLossFn(LossFunction):
 
         metrics = {
             "loss": float(kl_loss.item()) if kl_loss.ndim == 0 else kl_loss,
-            "num_valid_samples": data["input_ids"].shape[0],
+            # From the mask, not the batch dimension: workers gate on
+            # ``num_valid_samples > 0`` to decide whether a microbatch is
+            # recorded at all, so the raw batch size makes a fully-masked
+            # microbatch look like it contributed and dilutes the step's
+            # reported loss with its zero. Falls back to the batch dimension
+            # when there is no mask, where every sample is valid by definition.
+            "num_valid_samples": (
+                torch.count_nonzero(data["sample_mask"]).item()
+                if "sample_mask" in data
+                else data["input_ids"].shape[0]
+            ),
         }
 
         return kl_loss, metrics
@@ -2020,12 +2048,20 @@ class MseValueLossFn(LossFunction):
             ).item()
 
             # Min/max are per-MB; ppo.py takes min/max across MBs.
+            # +/-inf, not 0.0, for an empty mask: 0.0 is a plausible value and
+            # would win the min against an all-positive critic, silently
+            # flooring the reported range. ClippedPGLossFn uses the same
+            # sentinel for the same reason, and both consumers skip it.
             masked_values = values[mask.bool()]
             values_min = (
-                masked_values.min().item() if masked_values.numel() > 0 else 0.0
+                masked_values.min().item()
+                if masked_values.numel() > 0
+                else float("inf")
             )
             values_max = (
-                masked_values.max().item() if masked_values.numel() > 0 else 0.0
+                masked_values.max().item()
+                if masked_values.numel() > 0
+                else float("-inf")
             )
 
             # Explained variance sufficient statistics.
@@ -2053,7 +2089,8 @@ class MseValueLossFn(LossFunction):
             "values_max": values_max,
             "returns_sq_mean": returns_sq_mean,
             "residual_sq_mean": residual_sq_mean,
-            "num_valid_samples": int(values.shape[0]),
+            # See DistillationLossFn: the critic's workers gate on this too.
+            "num_valid_samples": torch.count_nonzero(sample_mask).item(),
         }
 
         return loss, metrics
@@ -2436,7 +2473,8 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             "ce_loss": ce_loss.item(),
             "kl_loss_scale": kl_scale.item(),
             "accuracy": accuracy.item(),
-            "num_valid_samples": data["input_ids"].shape[0],
+            # See DistillationLossFn.
+            "num_valid_samples": torch.count_nonzero(data["sample_mask"]).item(),
         }
         metrics.update(per_teacher_metrics)
         return loss, metrics
