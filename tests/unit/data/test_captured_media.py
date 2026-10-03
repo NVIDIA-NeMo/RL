@@ -672,6 +672,56 @@ def test_worker_restart_recovers_retained_geometry_without_fetching_pixels(
         )
 
 
+def test_generation_prefix_fetch_restores_and_verifies_media(dp):
+    pixels = torch.arange(18, dtype=torch.float32).reshape(3, 2, 3)
+    prompt = engine_prompt([10, 18, 18, 11], [(Span(1, 2), pixels)])
+    root, expected = stage(dp, prompt)
+    client = RecordingClient(dp)
+    source = TQTokenSource(client, staging_partition="staging", capture_media=True)
+
+    [chunk] = source.fetch_generation_cut([root.staging_key])
+    assert len(client.tensor_reads()) == 1
+    worker = SimpleNamespace(
+        _capture_media=True,
+        _capture_image_token_id=18,
+        _capture_patch_size=1,
+        _staging_source=source,
+        _chain_prefix=ChainPrefixCache(source),
+    )
+    restored = VllmAsyncGenerationWorkerImpl._restore_generation_cut_media(
+        worker, [chunk]
+    )
+    assert restored is not None
+    assert restored.items == expected.items
+    assert restored.tensors is not None
+    torch.testing.assert_close(restored.tensors["imgs"], expected.tensors["imgs"])
+
+    admission = CaptureAdmission(
+        rollout_id="r0-a1",
+        model_call_id="c2",
+        prev_len=0,
+        mode="text",
+    )
+    verified = VllmAsyncGenerationWorkerImpl._capture_request_media(
+        worker,
+        engine_prompt([10, 18, 18, 11], [(Span(1, 2), pixels)]),
+        admission=admission,
+        restored=restored,
+    )
+    assert verified is restored
+
+    with pytest.raises(MediaCaptureRejected, match="tensors differ"):
+        VllmAsyncGenerationWorkerImpl._capture_request_media(
+            worker,
+            engine_prompt(
+                [10, 18, 18, 11],
+                [(Span(1, 2), torch.full_like(pixels, 9))],
+            ),
+            admission=admission,
+            restored=restored,
+        )
+
+
 def test_worker_completion_stages_pixels_and_only_returns_capture_coordinates(dp):
     from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
 
