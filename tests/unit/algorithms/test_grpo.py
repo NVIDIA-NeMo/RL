@@ -267,6 +267,7 @@ def test_legacy_noncolocated_refit_syncs_policy_params_first(
     )
     policy_generation = MagicMock()
     policy_generation.weight_synchronizer = None
+    policy_generation.cfg = {}
     policy_generation.update_weights_from_collective.return_value = [MagicMock()]
 
     refit_policy_generation(
@@ -293,6 +294,7 @@ def test_legacy_colocated_refit_syncs_policy_params_before_offload(
     )
     policy_generation = MagicMock()
     policy_generation.weight_synchronizer = None
+    policy_generation.cfg = {}
     policy_generation.update_weights_via_ipc_zmq.return_value = [MagicMock()]
 
     refit_policy_generation(
