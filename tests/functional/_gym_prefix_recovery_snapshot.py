@@ -84,6 +84,16 @@ def _episode_key(record: dict[str, Any]) -> tuple[str, int]:
     return episode["rollout_id"], episode["attempt"]
 
 
+def _calendar_sentinel_count(state: dict[str, Any], event_name: str) -> int:
+    """Count the selected calendar event in a checkpointed Workplace state."""
+
+    columns = state["calendar"]["_calendar_events"]["columns"]
+    names = next(
+        column["values"] for column in columns if column["name"] == "event_name"
+    )
+    return sum(str(name).lower() == event_name.lower() for name in names)
+
+
 def _process_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -123,8 +133,8 @@ def _recoverable_cut(record: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def inspect_snapshot(snapshot: Path) -> dict[str, Any]:
-    """Return one fully cross-checked nonterminal prefix in ``snapshot``."""
+def inspect_snapshot(snapshot: Path, sentinel_event: str) -> dict[str, Any]:
+    """Return one post-mutation nonterminal prefix in ``snapshot``."""
 
     required = [
         snapshot / "manifest.json",
@@ -146,9 +156,10 @@ def inspect_snapshot(snapshot: Path) -> dict[str, Any]:
     agent_keys = {
         _episode_key(record) for _, record in _participant_records(snapshot, "agent")
     }
-    resources_keys = {
-        _episode_key(record)
-        for _, record in _participant_records(snapshot, "resources")
+    resource_index = {
+        _episode_key(record): (manifest_path, record["state"])
+        for manifest_path, record in _participant_records(snapshot, "resources")
+        if record.get("state")
     }
     model_records = _participant_records(snapshot, "model")
 
@@ -157,7 +168,13 @@ def inspect_snapshot(snapshot: Path) -> dict[str, Any]:
         key = _episode_key(record)
         recovery = ledger.get(key)
         cut = _recoverable_cut(record)
-        if recovery is None or cut is None:
+        resource_entry = resource_index.get(key)
+        if recovery is None or cut is None or resource_entry is None:
+            continue
+        resources_manifest, resources_state = resource_entry
+        try:
+            sentinel_count = _calendar_sentinel_count(resources_state, sentinel_event)
+        except (KeyError, StopIteration, TypeError):
             continue
         instance_id = recovery["gym_instance_id"]
         checkpointed_episodes = {
@@ -168,7 +185,7 @@ def inspect_snapshot(snapshot: Path) -> dict[str, Any]:
         if (
             key not in checkpointed_episodes
             or key not in agent_keys
-            or key not in resources_keys
+            or sentinel_count != 1
             or recovery["restore_level"] != "prefix"
             or recovery["status"] != "dispatched"
             or not set(cut["staging_keys"]).issubset(retained_keys)
@@ -185,6 +202,8 @@ def inspect_snapshot(snapshot: Path) -> dict[str, Any]:
                 "generation_index": recovery["generation_index"],
                 "target_step": recovery["target_step"],
                 "model_manifest": str(model_manifest.relative_to(snapshot)),
+                "resources_manifest": str(resources_manifest.relative_to(snapshot)),
+                "sentinel_event": sentinel_event,
                 **cut,
             }
         )
@@ -206,7 +225,7 @@ def select_snapshot(args: argparse.Namespace) -> None:
     while time.monotonic() < deadline:
         for snapshot in sorted(root.glob("snapshot_*"), reverse=True):
             try:
-                selection = inspect_snapshot(snapshot)
+                selection = inspect_snapshot(snapshot, args.sentinel_event)
             except (AssertionError, FileNotFoundError, json.JSONDecodeError) as error:
                 last_error = f"{snapshot}: {error}"
                 continue
@@ -345,6 +364,7 @@ def _parser() -> argparse.ArgumentParser:
     select.add_argument("phase_log")
     select.add_argument("timeout_s", type=float)
     select.add_argument("backup_path")
+    select.add_argument("sentinel_event")
     select.set_defaults(func=select_snapshot)
 
     verify = commands.add_parser("verify-restore")
