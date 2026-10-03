@@ -55,7 +55,7 @@ import time
 import uuid
 import warnings
 from collections import deque
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterable, Iterator, Mapping
 from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
@@ -282,6 +282,25 @@ _SUPERVISOR_DRAIN_TIMEOUT_S = 30.0
 
 # Rollout-deadline pause owned by a Gym checkpoint while it holds rollouts parked.
 _GYM_CHECKPOINT_DEADLINE_HOLDER = "gym_checkpoint"
+
+# Episodes named in a Gym checkpoint error; the rest are only counted.
+_GYM_EPISODE_SAMPLE_SIZE = 5
+
+
+def _summarize_gym_episodes(episodes_by_instance: Mapping[str, Iterable[Any]]) -> str:
+    """Count episodes per instance and name a few, however many there are."""
+    parts = []
+    for instance_id, episodes in sorted(episodes_by_instance.items()):
+        ordered = sorted(episodes, key=repr)
+        if not ordered:
+            continue
+        sample = ordered[:_GYM_EPISODE_SAMPLE_SIZE]
+        more = len(ordered) - len(sample)
+        parts.append(
+            f"{instance_id}: {len(ordered)} episode(s), e.g. {sample!r}"
+            + (f" and {more} more" if more else "")
+        )
+    return "; ".join(parts) or "none"
 
 
 @dataclass(frozen=True)
@@ -5091,23 +5110,24 @@ class SingleControllerActor:
                 "Gym checkpoint holds parked agent sessions that are not an "
                 "agent's own /run episode, "
                 "so they can neither be restored nor finish while the deployment is "
-                f"prepared: stranded={stranded!r}"
+                f"prepared: stranded={_summarize_gym_episodes(stranded)}"
             )
 
+        # Only the pending episodes are checked: rescanning every live rollout
+        # on each poll would block the event loop that delivers the replies
+        # this waits for.
+        ledger = self._rollout_recovery_ledger
+        waiting = pending
         deadline = time.monotonic() + coordinator.control_timeout_s
         while True:
-            live = self._gym_checkpoint_inventory(coordinator)
-            unresolved = {
-                instance_id: pending[instance_id].intersection(live[instance_id])
-                for instance_id in coordinator.instance_ids
-            }
-            if not any(unresolved.values()):
+            waiting = ledger.gym_episodes_still_held(waiting)
+            if not any(waiting.values()):
                 return
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(
                     "Gym checkpoint could not classify every candidate before the "
-                    f"drain deadline: unresolved={unresolved!r}"
+                    f"drain deadline: unresolved={_summarize_gym_episodes(waiting)}"
                 )
             await asyncio.sleep(min(0.05, remaining))
 
