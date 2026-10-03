@@ -230,6 +230,14 @@ jobs:
             '[.functional[] | select(. != "L1_Functional_Tests_Dynamo")]' \
             <<< "$test_plan")
 
+          # TEMP, DO NOT MERGE: run only the L1 scripts that fail after the Ray 2.58 bump.
+          keep='["L1_Functional_Tests_Megatron_Generation","L1_Functional_Tests_GB200_Megatron_Omni","L1_Functional_Tests_GB200_Megatron_Omni_Single_Controller"]'
+          unit_test_scripts='[]'
+          h100_functional_test_scripts=$(jq -c --argjson keep "$keep" '[.[] | select(IN($keep[]))]' <<< "$h100_functional_test_scripts")
+          gb200_functional_test_scripts=$(jq -c --argjson keep "$keep" '[.[] | select(IN($keep[]))]' <<< "$gb200_functional_test_scripts")
+          # A non-empty pattern also skips the doc tests and the Sphinx build.
+          TEST_SCRIPT_PATTERN="megatron"
+
           unit_test_count=$(jq 'length' <<< "$unit_test_scripts")
           h100_functional_test_count=$(jq 'length' <<< "$h100_functional_test_scripts")
           gb200_functional_test_count=$(jq 'length' <<< "$gb200_functional_test_scripts")
