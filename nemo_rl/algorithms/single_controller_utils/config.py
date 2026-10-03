@@ -471,6 +471,9 @@ class WatchdogConfig(BaseModel, extra="allow"):
 
 
 class AsyncRLConfig(BaseModel, extra="allow"):
+    # Stream every consumed sample's untruncated token tensors to JSONL. Files
+    # are published only after the optimizer step completes; disabled by default.
+    log_full_train_data: bool = False
     # Staleness policy shared by the rollout and train pumps.
     sampler: SamplerConfig = Field(
         default_factory=InOrderSamplerConfig,

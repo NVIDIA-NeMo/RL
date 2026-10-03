@@ -15,8 +15,10 @@
 """Tests for SingleController initialization and pump lifecycle."""
 
 import asyncio
+import json
 import math
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -63,6 +65,7 @@ from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
 )
 from nemo_rl.utils.timer import TimeoutChecker, Timer
+from nemo_rl.utils.train_data_dump import TrainDataDump
 
 
 class FakeWeightSynchronizer:
@@ -818,6 +821,7 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
+    ctrl._train_data_dump = None
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig(
@@ -918,6 +922,7 @@ def test_advantage_stage_writes_each_sample_filter_without_seq_threshold(
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
+    ctrl._train_data_dump = None
     ctrl._is_ppo = False
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._algo_cfg = GRPOConfig(
@@ -983,6 +988,7 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
+    ctrl._train_data_dump = None
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig(seq_logprob_error_threshold=None)
@@ -1049,6 +1055,7 @@ def test_advantage_stage_clips_training_values_and_metrics() -> None:
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
+    ctrl._train_data_dump = None
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig(
@@ -1117,6 +1124,7 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
+    ctrl._train_data_dump = None
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig(seq_logprob_error_threshold=2.0)
@@ -1179,6 +1187,7 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
+    ctrl._train_data_dump = None
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig(seq_logprob_error_threshold=None)
@@ -1216,7 +1225,7 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
     assert "advantages" in (result_meta.fields or [])
 
 
-def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
+def test_opd_advantage_stage_reads_teacher_and_student_logprobs(tmp_path) -> None:
     """SC passes the TQ teacher column under OPD's estimator contract."""
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
@@ -1237,7 +1246,13 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
             assert "generation_logprobs" in select_fields
             return TensorDict(
                 {
-                    "prompt_ids_for_adv": torch.zeros(2, 3, dtype=torch.long),
+                    "input_ids": torch.tensor([[10, 11, 12], [20, 21, 22]]),
+                    "input_lengths": torch.tensor([3, 3]),
+                    # Prompts of different lengths come back from TQ jagged.
+                    "prompt_ids_for_adv": torch.nested.as_nested_tensor(
+                        [torch.tensor([10, 11]), torch.tensor([20])],
+                        layout=torch.jagged,
+                    ),
                     "total_reward": torch.zeros(2),
                     "token_mask": torch.tensor([[1.0, 1.0, 1.0], [1.0, 0.0, 0.0]]),
                     "sample_mask": torch.ones(2),
@@ -1260,6 +1275,9 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = True
+    ctrl._train_data_dump = TrainDataDump(str(tmp_path))
+    ctrl._timer = Timer()
+    ctrl._train_steps = 0
     ctrl._is_ppo = False
     ctrl._dp_client = FakeDataPlane()
     ctrl._master_config = SimpleNamespace(
@@ -1302,6 +1320,8 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
         "repeated_batch",
     }
     assert "logprobs_policy" not in captured_kwargs
+    # The estimator keeps the dense, zero-padded prompt matrix it groups on.
+    assert captured_kwargs["prompt_ids"].tolist() == [[10, 11], [20, 0]]
     assert torch.allclose(
         captured_kwargs["teacher_logprobs"] - captured_kwargs["prev_logprobs"],
         torch.full((2, 3), 0.25),
@@ -1319,6 +1339,23 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
     )
     logged = torch.cat(ctrl._step_log_dict["masked_advantages"])
     torch.testing.assert_close(logged, torch.full((4,), 0.1))
+
+    dump_timings = ctrl._timer.get_elapsed("train_data_dump")
+    assert len(dump_timings) == 1
+    assert math.isfinite(dump_timings[0]) and dump_timings[0] > 0
+
+    ctrl._train_data_dump.finish_step(0)
+    dumped = [
+        json.loads(line)
+        for line in (tmp_path / "train_data_step1.jsonl").read_text().splitlines()
+    ]
+    assert dumped[0]["token_ids"] == [[10, 11, 12]]
+    for row, written_row in zip(dumped, written_advantages.unbind()):
+        torch.testing.assert_close(torch.tensor(row["advantages"][0]), written_row)
+    assert dumped[0]["teacher_logprobs"] == [[0.75, 0.75, 0.75]]
+    assert dumped[0]["prev_logprobs"] == [[0.5, 0.5, 0.5]]
+    # The dump writes each row's real prompt, without the estimator's padding.
+    assert [row["prompt_ids"] for row in dumped] == [[[10, 11]], [[20]]]
 
 
 def test_opd_advantage_stage_pools_raw_gap_separately_under_tropd() -> None:
@@ -1719,6 +1756,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
+    ctrl._train_data_dump = None
     ctrl._train_fields = single_controller._train_fields_for_step(
         policy_logprobs_required=False,
         reference_logprobs_required=False,
@@ -2674,6 +2712,7 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
+    ctrl._train_data_dump = None
     ctrl._is_ppo = True
     ctrl._master_config = SimpleNamespace(
         ppo=SimpleNamespace(seq_logprob_error_threshold=None, overlong_filtering=False)
@@ -2708,3 +2747,55 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     )
     assert "returns" in (result_meta.fields or [])
     assert "advantages" in (result_meta.fields or [])
+
+
+@pytest.mark.parametrize("dump_enabled", [False, True])
+def test_train_pump_logs_dump_timing_after_optimizer_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dump_enabled: bool
+) -> None:
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0", "sample-1"],
+        fields=[],
+        sequence_lengths=[1, 1],
+        tags=[{"weight_version": 0}, {"weight_version": 0}],
+    )
+    ctrl = _train_pump_controller(sampler=_FullStepSampler(meta))
+    ctrl._logger = MagicMock()
+    ctrl._sync_weights = AsyncMock(return_value=1)
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+    final = tmp_path / "train_data_step1.jsonl"
+    if dump_enabled:
+        ctrl._train_data_dump = TrainDataDump(str(tmp_path))
+        ctrl._train_data_dump.add_chunk(
+            step=0,
+            sample_ids=meta.sample_ids,
+            tags=meta.tags,
+            input_lengths=torch.tensor([1, 1]),
+            sequences={"token_ids": torch.tensor([[10], [20]])},
+            scalars={},
+        )
+        # Seed chunk-write time to verify publication adds to the per-step sum.
+        ctrl._timer.record("train_data_dump", 2.0)
+
+    def finish_training() -> dict:
+        assert not final.exists()
+        return {}
+
+    ctrl._trainer.finish_train_step = MagicMock(side_effect=finish_training)
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=5.0))
+    ctrl._trainer.finish_train_step.assert_called_once()
+    logged_timings = [
+        call.args[0]
+        for call in ctrl._logger.log_metrics.call_args_list
+        if call.kwargs.get("prefix") == "timing/train"
+    ]
+    assert len(logged_timings) == 1
+    assert ("train_data_dump" in logged_timings[0]) is dump_enabled
+    assert final.exists() is dump_enabled
+    if dump_enabled:
+        assert math.isfinite(logged_timings[0]["train_data_dump"])
+        assert logged_timings[0]["train_data_dump"] > 2.0
+        assert not final.with_suffix(".jsonl.partial").exists()
+    assert "train_data_dump" not in ctrl._timer.get_timing_metrics()
