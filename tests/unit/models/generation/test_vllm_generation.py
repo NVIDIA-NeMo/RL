@@ -993,6 +993,116 @@ async def test_context_overflow_returns_http_400_for_nemo_gym(monkeypatch):
     assert error["code"] == 400
 
 
+def test_vllm_async_http_server_reports_a_context_length_overflow_as_400(monkeypatch):
+    """vLLM raises a plain ValueError from get_max_tokens when the prompt alone fills
+    max_model_len. The route must answer HTTP 400 as an OpenAI-style error object
+    (`error` with `message`, `type`, and `code`), which is how the Gym model server
+    recognizes the overflow (the status plus the "context length" text), while any
+    other ValueError still propagates."""
+    _, _, openai_serving_chat = _install_fake_vllm_openai_modules(monkeypatch)
+
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "val_temperature": 0.0,
+        "val_top_p": 1.0,
+        "vllm_cfg": {},
+    }
+    worker.llm = MagicMock(model_config="model-config", renderer="renderer")
+    worker._http_engine_client = worker.llm
+    worker._capture_calls = {}
+    worker.token_capture = None
+    worker.llm_async_engine_args = MagicMock()
+    worker.llm_async_engine_args.create_model_config.return_value = MagicMock(
+        served_model_name="served-model", model="model-path"
+    )
+
+    app = _FakeFastAPIApp()
+    worker._setup_vllm_openai_api_server(app)
+    handler = dict(app.routes)["/v1/chat/completions"]
+    request = types.SimpleNamespace(top_k=None, top_p=1.0, temperature=1.0)
+
+    async def overflow(request, raw_request):
+        raise ValueError(
+            "Input length (131106) exceeds model's maximum context length (131072)."
+        )
+
+    openai_serving_chat.instances[0].create_chat_completion = overflow
+    response = asyncio.run(handler(request, raw_request=None))
+    assert response.status_code == 400
+    error = json.loads(response.body)["error"]
+    assert error["code"] == 400
+    assert "context length" in error["message"]
+
+    async def unrelated(request, raw_request):
+        raise ValueError("unrelated failure")
+
+    openai_serving_chat.instances[0].create_chat_completion = unrelated
+    with pytest.raises(ValueError, match="unrelated failure"):
+        asyncio.run(handler(request, raw_request=None))
+
+
+@pytest.mark.parametrize(
+    "raise_overflow",
+    [
+        # The module's own prompt-length pre-check (_clamp_max_tokens).
+        lambda exc_cls: exc_cls(
+            "Prompt length (131106) fills or exceeds this model's maximum "
+            "context length (131072). No room for output tokens.",
+            parameter="input_tokens",
+            value=131106,
+        ),
+        # vLLM 0.29.0's get_max_tokens (vllm/entrypoints/serve/utils/api_utils.py).
+        lambda exc_cls: ValueError(
+            "Input length (131106) exceeds model's maximum context length (131072)."
+        ),
+    ],
+    ids=["precheck_validation_error", "engine_value_error"],
+)
+def test_served_overflow_refusals_carry_the_gym_context_length_phrase(
+    monkeypatch, raise_overflow
+):
+    """The NeMo-Gym model server classifies a context overflow by the substring
+    "context length" in a 400 body (nemo_gym/responses_api_models/vllm_model/
+    app.py). Both overflow sources this server relays must keep that phrase on
+    the wire; a rewording here would silently break Gym's classifier."""
+    import sys
+
+    _, _, openai_serving_chat = _install_fake_vllm_openai_modules(monkeypatch)
+    exc_cls = sys.modules["vllm.exceptions"].VLLMValidationError
+
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "val_temperature": 0.0,
+        "val_top_p": 1.0,
+        "vllm_cfg": {},
+    }
+    worker.llm = MagicMock(model_config="model-config", renderer="renderer")
+    worker._http_engine_client = worker.llm
+    worker._capture_calls = {}
+    worker.token_capture = None
+    worker.llm_async_engine_args = MagicMock()
+    worker.llm_async_engine_args.create_model_config.return_value = MagicMock(
+        served_model_name="served-model", model="model-path"
+    )
+
+    app = _FakeFastAPIApp()
+    worker._setup_vllm_openai_api_server(app)
+    handler = dict(app.routes)["/v1/chat/completions"]
+    request = types.SimpleNamespace(top_k=None, top_p=1.0, temperature=1.0)
+
+    async def overflow(request, raw_request):
+        raise raise_overflow(exc_cls)
+
+    openai_serving_chat.instances[0].create_chat_completion = overflow
+    response = asyncio.run(handler(request, raw_request=None))
+    assert response.status_code == 400
+    assert "context length" in json.loads(response.body)["error"]["message"]
+
+
 def test_nano_v3_reasoning_parser_swaps_reasoning_when_thinking_disabled(
     monkeypatch,
 ):
