@@ -31,7 +31,7 @@ Modeled after `tests/unit/models/policy/test_megatron_worker.py`.
 import os
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 from unittest.mock import patch
 
 import pytest
@@ -657,7 +657,10 @@ def test_value_worker_context_parallel_equivalence(tiny_qwen2_model_path, tmp_pa
 
 
 @pytest.mark.mcore
-def test_unpack_value_sequences_variable_lengths():
+@pytest.mark.parametrize("boundary_type", [torch.tensor, tuple])
+def test_unpack_value_sequences_variable_lengths(
+    boundary_type: Callable[[list[int]], torch.Tensor | tuple[int, ...]],
+) -> None:
     """`_unpack_value_sequences` unpacks packed [1, T] values to [B, S] with a
     per-sequence right-shift. Runs CPU-only (cp_group=None) and uses variable
     lengths to cover what the uniform-length GPU equivalence test does not.
@@ -672,12 +675,15 @@ def test_unpack_value_sequences_variable_lengths():
         torch.tensor([7.0, 8.0]),
     ]
     packed = torch.cat(seqs).unsqueeze(0)  # [1, 10]
-    cu_seqlens_padded = torch.tensor([0, 3, 8, 10], dtype=torch.int32)
+    cu_seqlens_padded = boundary_type([0, 3, 8, 10])
     unpacked_seqlen = 5
 
-    out = _unpack_value_sequences(
-        packed, cu_seqlens_padded, unpacked_seqlen, cp_group=None
-    )
+    with patch.object(
+        torch.Tensor, "item", side_effect=AssertionError("per-sequence item()")
+    ):
+        out = _unpack_value_sequences(
+            packed, cu_seqlens_padded, unpacked_seqlen, cp_group=None
+        )
 
     assert out.shape == (3, unpacked_seqlen)
     expected = torch.zeros(3, unpacked_seqlen)
@@ -685,6 +691,50 @@ def test_unpack_value_sequences_variable_lengths():
         # values[t] = V(state before token t): prepend 0, drop last.
         expected[i, : v.shape[0]] = torch.cat([torch.zeros(1), v[:-1]])
     torch.testing.assert_close(out, expected)
+
+
+@pytest.mark.parametrize("boundary_type", [torch.tensor, tuple])
+def test_unpack_value_sequences_context_parallel(
+    boundary_type: Callable[[list[int]], torch.Tensor | tuple[int, ...]],
+) -> None:
+    """Gather each packed sequence before shifting and truncating its values."""
+    # Megatron is an optional dependency loaded only for mcore tests.
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        _unpack_value_sequences,
+    )
+
+    # CP rank 0 owns the first and last quarter of each sequence.
+    packed = torch.tensor([[1.0, 4.0, 10.0, 20.0, 70.0, 80.0]])
+    sequences = [
+        torch.tensor([1.0, 2.0, 3.0, 4.0]),
+        torch.arange(10.0, 90.0, 10.0),
+    ]
+    cp_group = object()
+    with (
+        patch("torch.distributed.get_world_size", return_value=2),
+        patch(
+            "nemo_rl.models.value.workers.megatron_value_worker.allgather_cp_sharded_tensor",
+            side_effect=sequences,
+        ) as gather,
+        patch.object(
+            torch.Tensor, "item", side_effect=AssertionError("per-sequence item()")
+        ),
+    ):
+        out = _unpack_value_sequences(
+            packed, boundary_type([0, 4, 12]), 5, cp_group=cp_group
+        )
+
+    assert gather.call_count == 2
+    for call, expected_shard in zip(
+        gather.call_args_list, [packed[0, :2], packed[0, 2:]]
+    ):
+        torch.testing.assert_close(call.args[0], expected_shard)
+        assert call.args[1] is cp_group
+        assert call.kwargs == {"seq_dim": 0}
+    torch.testing.assert_close(
+        out,
+        torch.tensor([[0.0, 1.0, 2.0, 3.0, 0.0], [0.0, 10.0, 20.0, 30.0, 40.0]]),
+    )
 
 
 def test_value_loss_prepare_fn_shift_and_truncate():
