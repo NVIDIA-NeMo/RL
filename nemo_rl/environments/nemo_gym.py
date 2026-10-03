@@ -248,37 +248,56 @@ def _has_nan_generation_logprobs(result: dict) -> bool:
     )
 
 
-def _typed_gym_failure(error: Exception) -> Optional[Exception]:
-    """Map a NeMo-Gym HTTP failure onto a typed, PICKLABLE failure, or None if not one.
+# Keys of the failure row NeMo-Gym's rollout collector returns in place of a result
+# when a ``/run`` call fails and ``route_failures_to_sidecar`` is on
+# (``nemo_gym/rollout_collection.py``, ``_agent_request_failure_row``). Spelled here
+# rather than imported so ``run_rollouts`` can be exercised without the Gym package.
+GYM_FAILURE_CLASS_KEY = "_ng_failure_class"
+GYM_FAILURE_STATUS_KEY = "_ng_failure_http_status"
+GYM_FAILURE_TYPE_KEY = "_ng_failure_type"
+GYM_FAILURE_MESSAGE_KEY = "_ng_failure_message"
+GYM_FAILURE_BODY_KEY = "_ng_failure_response_body"
 
-    Classification has to happen here, on the raising side, because ``run_rollouts`` runs
-    inside the ``NemoGym`` Ray actor and the exception must survive the actor boundary to
-    reach the retry policy on the driver.
+# The one key of the row ``run_rollouts`` yields for a rollout that failed at the
+# infrastructure level; its value is the failure's description. The rollout loop on
+# the driver re-dispatches the row or raises ``GymTransportError`` with that text.
+GYM_INFRA_FAILURE_KEY = "_gym_infra_failure"
 
-    It does not survive. aiohttp's ``raise_for_status`` passes ``headers=self.headers``,
-    and those are a ``CIMultiDictProxy``, which cloudpickle cannot serialize -- so Ray
-    drops the cause and the driver receives a bare ``RayTaskError`` with no type and no
-    ``.status``. Every gym HTTP failure then classified DATA, capping the gym path at
-    ``max_data_attempts_per_prompt`` (2) and leaving ``max_attempts_per_prompt`` (5)
-    unreachable on the very path whose dead-endpoint scenario motivates it. Two things
-    made that the dominant case rather than a corner: Gym's middleware turns inner-server
-    failures into 500 -- exactly the status the INFRA branch is for -- and its transport
-    layer retries disconnects in an uncapped loop, so those never arrive at all.
 
-    ``GymTransportError`` and ``RolloutDataFailure`` take a single str, so they pickle
-    cleanly and ``classify_rollout_failure``'s explicit-class fast path wins on the far
-    side.
+def _typed_gym_failure(failure_row: dict) -> GymTransportError | RolloutDataFailure:
+    """Map a NeMo-Gym ``/run`` failure row onto a typed, PICKLABLE failure.
 
-    Returns None when the exception carries no HTTP status, leaving the caller to
-    re-raise it untouched.
+    ``run_rollouts`` asks Gym's rollout collector to return a failed ``/run`` as a
+    failure row instead of raising, because the exception would not survive the
+    actor boundary: aiohttp's ``raise_for_status`` passes ``headers=self.headers``,
+    a ``CIMultiDictProxy`` that cloudpickle cannot serialize, so Ray would deliver a
+    bare ``RayTaskError`` with no type and no ``.status`` and the driver would classify
+    every Gym HTTP failure as DATA. The row carries the status as a plain value, and
+    the classification happens here, on the actor side, with the same
+    ``http_status_is_infra`` rule the driver applies.
+
+    A 5xx or a retriable 4xx (408, 429) means the endpoint is unwell and becomes
+    ``GymTransportError``, as does a row without a status (a connection failure or a
+    timeout before any reply). Any other status describes the request itself and
+    becomes ``RolloutDataFailure``. Both take a single str, so they pickle cleanly and
+    ``classify_rollout_failure``'s explicit-class fast path wins on the far side. The
+    recorded response body (already capped by Gym) rides in the detail, so a 4xx
+    explains what the server rejected.
     """
-    status = getattr(error, "status", None)
-    if not isinstance(status, int):
-        return None
-    detail = f"NeMo-Gym /run failed with HTTP {status}: {error}"
-    if http_status_is_infra(status):
+    status = failure_row.get(GYM_FAILURE_STATUS_KEY)
+    message = failure_row.get(GYM_FAILURE_MESSAGE_KEY)
+    body = failure_row.get(GYM_FAILURE_BODY_KEY)
+    body_suffix = f" (response body: {body})" if body else ""
+    if isinstance(status, int):
+        detail = f"NeMo-Gym /run failed with HTTP {status}: {message}{body_suffix}"
+        if not http_status_is_infra(status):
+            return RolloutDataFailure(detail)
         return GymTransportError(detail)
-    return RolloutDataFailure(detail)
+    failure_type = failure_row.get(GYM_FAILURE_TYPE_KEY)
+    return GymTransportError(
+        f"NeMo-Gym /run failed without an HTTP status ({failure_type}): "
+        f"{message}{body_suffix}"
+    )
 
 
 def get_nemo_gym_uv_cache_dir() -> str | None:
@@ -336,11 +355,26 @@ class NemoGymConfig(TypedDict):
     pad_dynamic_image_shapes: NotRequired[
         bool
     ]  # Preserve heterogeneous shapes for native-resolution patchification
+    # Read by the driver's rollout loop (nemo_rl/experience/rollouts.py), never by
+    # a Gym server: seconds between health checks while no row has arrived, and
+    # how many times one row may be dispatched before an infrastructure failure
+    # ends the step. ``_build_gym_actor_config`` moves them here from the
+    # env.nemo_gym mapping, out of Gym's global configuration, and
+    # ``NemoGym.rollout_config`` hands them back.
+    health_check_interval_seconds: NotRequired[Optional[float]]
+    max_infra_attempts_per_rollout: NotRequired[Optional[int]]
     # Ledger-authoritative token capture (token_capture.enabled): the dumped
     # TokenCaptureConfig. Turns on external staging in Gym's policy model
     # server, switches run_rollouts to receipt mode, and assembles receipts
     # from the manifest control route. None/absent = legacy token-echo path.
     token_capture: NotRequired[Dict[str, Any] | None]
+
+
+# The env.nemo_gym keys the driver's rollout loop reads (see NemoGymConfig).
+DRIVER_ROLLOUT_KEYS = (
+    "health_check_interval_seconds",
+    "max_infra_attempts_per_rollout",
+)
 
 
 # Gym control-plane server name (the model server hosting the ledger) and the
@@ -500,6 +534,14 @@ class NemoGym(EnvironmentInterface):
                 f"got {type(self._processor).__name__}. Update "
                 "attach_image_model_inputs_to_message before enabling."
             )
+
+    def rollout_config(self) -> dict[str, Any]:
+        """The ``env.nemo_gym`` keys the driver's rollout loop reads, by key.
+
+        See ``DRIVER_ROLLOUT_KEYS``: absent keys are returned as None, so the
+        readers in ``nemo_rl.experience.rollouts`` apply their defaults.
+        """
+        return {key: self.cfg.get(key) for key in DRIVER_ROLLOUT_KEYS}
 
     def _require_spinup(self) -> None:
         """Raise a diagnosable error if this instance never ran :meth:`_spinup`."""
@@ -810,7 +852,12 @@ Depending on your data shape, you may want to change these values."""
             ``rowidx`` echoes back the ``_rowidx`` the caller stamped on the
             example, which is how the caller maps a result to its slot.
             ``timing_metrics`` is ``None`` on every tuple but the last, which
-            carries the batch totals.
+            carries the batch totals. A ``/run`` that failed at the
+            infrastructure level yields, in place of the result, a one-key
+            dict ``{GYM_INFRA_FAILURE_KEY: detail}`` so the caller can
+            dispatch that row again; a ``/run`` the server refused (a 4xx
+            describing the request) raises ``RolloutDataFailure`` and ends
+            the stream.
         """
         attributes = {"rl.gym.batch_size": len(nemo_gym_examples)}
         # Two branches rather than a group variable, so the drift test can read
@@ -868,7 +915,12 @@ Depending on your data shape, you may want to change these values."""
         timer = Timer()
         timer.start("_run_rollouts_total")
         nemo_gym_result_iterator = self.rch.run_examples(
-            examples=nemo_gym_examples, head_server_config=self.head_server_config
+            examples=nemo_gym_examples,
+            head_server_config=self.head_server_config,
+            # A failed /run comes back as a failure row that still names its example,
+            # instead of an exception that would end every rollout still in flight
+            # and could not cross the actor boundary (see _typed_gym_failure).
+            route_failures_to_sidecar=True,
         )
         # Gym resolves task_source to agent_ref synchronously in run_examples().
         # Build the counter afterward so completion rows use the resolved identity.
@@ -878,51 +930,58 @@ Depending on your data shape, you may want to change these values."""
         num_results = 0
         for task in nemo_gym_result_iterator:
             with timer.time(label=f"{timer_prefix}/await_results"):
-                try:
-                    nemo_gym_row, nemo_gym_result = await task
-                except Exception as error:
-                    if hasattr(error, "response_content"):
-                        print(
-                            "EXCEPTION RESULT",
-                            error.response_content,
-                            file=sys.stderr,
-                        )
-                    typed = _typed_gym_failure(error)
-                    if typed is not None:
-                        # `from None`, deliberately: chaining the original would put the
-                        # unpicklable exception back on the wire as __cause__ and undo
-                        # the whole point. The status and message are already in `detail`.
-                        raise typed from None
-                    raise
+                nemo_gym_row, nemo_gym_result = await task
 
-            with timer.time(label=f"{timer_prefix}/postprocess_results"):
-                if self._token_capture_enabled:
-                    # Receipt mode: fetch the ledger manifest and assemble the
-                    # receipt locally; token-free result. The canonical row is
-                    # rebuilt by the finalizer, so no message_log walk (and no
-                    # NaN check) applies here.
-                    nemo_rl_result = await self._postprocess_receipt_mode(
-                        nemo_gym_row, nemo_gym_result
-                    )
-                else:
-                    nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
-                        nemo_gym_row,
-                        nemo_gym_result,
-                        tokenizer,
-                        include_initial_multimodal_data=not deduplicate_multimodal_data,
-                    )
-                    if _has_nan_generation_logprobs(nemo_rl_result):
-                        raise RuntimeError("Generation logprobs contain NaN")
+            # Only ``_agent_request_failure_row`` sets the failure TYPE; a
+            # scoreable result row may carry ``_ng_failure_class`` alone (Gym's
+            # judge failsafe scores reward 0 and annotates the class), and such
+            # a row is postprocessed like any other result.
+            if GYM_FAILURE_TYPE_KEY in nemo_gym_result:
+                failure = _typed_gym_failure(nemo_gym_result)
+                if isinstance(failure, RolloutDataFailure):
+                    # Prompt-specific: another attempt fails identically, so the
+                    # batch ends here with the typed failure.
+                    raise failure
+                print(
+                    f"NeMo-Gym rollout {nemo_gym_row['_rowidx']} failed at the "
+                    f"infrastructure level: {failure}",
+                    file=sys.stderr,
+                )
+                # Yielded in place of a result so the driver can re-dispatch this
+                # row while the other rows keep running.
+                nemo_rl_result = {GYM_INFRA_FAILURE_KEY: str(failure)}
+            else:
+                with timer.time(label=f"{timer_prefix}/postprocess_results"):
+                    if self._token_capture_enabled:
+                        # Receipt mode: fetch the ledger manifest and assemble the
+                        # receipt locally; token-free result. The canonical row is
+                        # rebuilt by the finalizer, so no message_log walk (and no
+                        # NaN check) applies here.
+                        nemo_rl_result = await self._postprocess_receipt_mode(
+                            nemo_gym_row, nemo_gym_result
+                        )
+                    else:
+                        nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
+                            nemo_gym_row,
+                            nemo_gym_result,
+                            tokenizer,
+                            include_initial_multimodal_data=not deduplicate_multimodal_data,
+                        )
+                        if _has_nan_generation_logprobs(nemo_rl_result):
+                            raise RuntimeError("Generation logprobs contain NaN")
+
             num_results += 1
             timing_metrics = None
             if num_results == len(nemo_gym_examples):
                 timer.stop("_run_rollouts_total")
                 timing_metrics = timer.get_timing_metrics("sum")
                 total_time = timing_metrics.pop("_run_rollouts_total")
+                # Absent when every row of the batch failed before postprocessing.
+                postprocess_time = timing_metrics.get(
+                    f"{timer_prefix}/postprocess_results", 0.0
+                )
                 timing_metrics[f"{timer_prefix}/postprocess_results_pct"] = (
-                    100
-                    * timing_metrics[f"{timer_prefix}/postprocess_results"]
-                    / total_time
+                    100 * postprocess_time / total_time
                 )
 
             agent_name = nemo_gym_row["agent_ref"]["name"]
@@ -1623,6 +1682,14 @@ def _build_gym_actor_config(
     invalid_tool_call_patterns = nemo_gym_dict.pop("invalid_tool_call_patterns", None)
     thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
     tokenizer_config = nemo_gym_dict.pop("tokenizer_config", None)
+    # Read by the rollout loop on the driver (nemo_rl/experience/rollouts.py), never
+    # by a Gym server: kept as top-level fields of the actor's configuration.
+    health_check_interval_seconds = nemo_gym_dict.pop(
+        "health_check_interval_seconds", None
+    )
+    max_infra_attempts_per_rollout = nemo_gym_dict.pop(
+        "max_infra_attempts_per_rollout", None
+    )
     port_range = {
         key: value
         for key in ("port_range_low", "port_range_high")
@@ -1664,6 +1731,8 @@ def _build_gym_actor_config(
         initial_global_config_dict=nemo_gym_dict,
         token_capture=token_capture,
         **port_range,
+        health_check_interval_seconds=health_check_interval_seconds,
+        max_infra_attempts_per_rollout=max_infra_attempts_per_rollout,
         **multimodal_flags,
     )
 

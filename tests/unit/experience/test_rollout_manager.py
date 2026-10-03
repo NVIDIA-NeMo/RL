@@ -1109,6 +1109,64 @@ def test_streamed_receipt_callback_uses_current_completion_conversion():
     assert "mask_sample" not in completion.env_extras["instance_config"]
 
 
+def test_nemo_gym_stream_rows_leaves_the_infra_marker_slot_empty():
+    """The Gym actor reports a row whose /run failed at the infrastructure level
+    as a marker. Its slot stays None so the attempt loop dispatches it again,
+    and the stream keeps delivering the other rows."""
+    from nemo_rl.environments.nemo_gym import GYM_INFRA_FAILURE_KEY
+
+    class _RunRolloutsRemote:
+        def options(self, *, num_returns):
+            assert num_returns == "streaming"
+            return self
+
+        def remote(self, pending, timer_prefix, per_prompt=False):
+            del pending, timer_prefix, per_prompt
+
+            async def marker_ref():
+                return (
+                    1,
+                    {"name": "resolved-agent"},
+                    {
+                        GYM_INFRA_FAILURE_KEY: (
+                            "NeMo-Gym /run failed with HTTP 503: down"
+                        )
+                    },
+                    None,
+                )
+
+            async def result_ref():
+                return (
+                    0,
+                    {"name": "resolved-agent"},
+                    _mask_gate_receipt_result(),
+                    {"timing/remote": 1.0},
+                )
+
+            async def stream():
+                yield marker_ref()
+                yield result_ref()
+
+            return stream()
+
+    impl = _nemo_gym_impl(False)
+    env = type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
+    pending = [{"_rowidx": 0}, {"_rowidx": 1}]
+    results = [None, None]
+    shaping = [None, None]
+
+    timing = _run(impl._stream_rows(env, pending, results, shaping, 2, "timing/test"))
+
+    # Row 0 landed after the marker, so the stream was drained; row 1's slot
+    # stays empty for the attempt loop, untouched by shaping and hydration.
+    assert results[0] is not None
+    assert results[1] is None
+    assert shaping[0] is not None
+    assert shaping[1] is None
+    assert "agent_ref" not in pending[1]
+    assert timing == {"timing/remote": 1.0}
+
+
 @pytest.mark.parametrize("log_full_result_tables", [False, True])
 def test_nemo_gym_full_result_tables_are_opt_in(log_full_result_tables):
     impl = _nemo_gym_impl(True, log_full_result_tables=log_full_result_tables)
