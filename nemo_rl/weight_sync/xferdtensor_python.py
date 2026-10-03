@@ -34,6 +34,8 @@ views of the caller-owned destination shard.  Explicit temporary storage is
 limited to noncontiguous source packing and destination receive staging.  A
 noncontiguous local destination uses at most one additional contiguous
 local-shard buffer; a global-sized buffer is never allocated.
+
+For more implementation details (nvidia): http://nv/xferdtensor_python_slides
 """
 
 import weakref
