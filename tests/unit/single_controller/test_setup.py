@@ -1801,6 +1801,7 @@ class TestSetup:
         setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         assert mc.policy["megatron_cfg"]["train_iters"] == 2
+        assert "offloaded_between_steps" not in mc.policy["megatron_cfg"]
 
     def test_megatron_train_iters_capped_by_dataloader_epochs(self, patched_factories):
         """train_iters drops to max_num_epochs * len(dataloader) when smaller."""

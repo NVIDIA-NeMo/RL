@@ -4740,15 +4740,18 @@ class MegatronPolicyWorkerImpl(
             and getattr(ckpt_cfg, "use_persistent_ckpt_worker", False)
             and getattr(ckpt_cfg, "ckpt_assume_constant_structure", False)
             and not getattr(ckpt_cfg, "async_ckpt_use_cpu_shm", False)
-            and colocated_cfg.get("enabled", False)
+            and (
+                colocated_cfg.get("enabled", False)
+                or self.cfg["megatron_cfg"].get("offloaded_between_steps")
+            )
         )
 
     def finalize_async_save(self):
-        """Finalize an async write and release unsafe colocated CUDA IPC caches.
+        """Finalize an async write and release unsafe CUDA IPC caches.
 
         NVRx constant-structure saves cache CUDA tensor handles in the persistent
         writer. That is safe while model/optimizer storage stays fixed, but a
-        colocated policy replaces that storage during CPU offload. In that case,
+        colocated or PPO policy replaces that storage during CPU offload. In that case,
         close the completed writer and invalidate its training-side cache; NVRx
         starts a fresh persistent writer lazily for the next checkpoint.
         """

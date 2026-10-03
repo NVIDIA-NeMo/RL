@@ -13,6 +13,7 @@
 # limitations under the License.
 import ast
 import asyncio
+import hashlib
 import os
 import tempfile
 import time
@@ -26,6 +27,8 @@ import numpy as np
 import pytest
 import ray
 import torch
+from torch.distributed.checkpoint.filesystem import FileSystemReader
+from torch.distributed.checkpoint.metadata import TensorStorageMetadata
 
 from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
@@ -1832,6 +1835,41 @@ def test_megatron_finalize_async_save_releases_colocated_nvrx_cache(
         assert events == [("finalize", False)]
 
 
+@pytest.mark.parametrize(
+    ("generation_cfg", "megatron_cfg", "expected"),
+    [
+        ({"colocated": {"enabled": False}}, {"offloaded_between_steps": True}, True),
+        ({"colocated": {"enabled": False}}, {}, False),
+        ({"colocated": {"enabled": True}}, {}, True),
+    ],
+    ids=["noncolocated_ppo", "noncolocated", "colocated"],
+)
+def test_megatron_nvrx_cache_release_covers_ppo_offload(
+    generation_cfg, megatron_cfg, expected
+):
+    """PPO offloads the policy every step even when generation is not colocated."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.cfg = {"generation": generation_cfg, "megatron_cfg": megatron_cfg}
+    worker.mcore_state = SimpleNamespace(
+        cfg=SimpleNamespace(
+            checkpoint=SimpleNamespace(
+                async_save=True,
+                use_persistent_ckpt_worker=True,
+                ckpt_assume_constant_structure=True,
+                async_ckpt_use_cpu_shm=False,
+            )
+        )
+    )
+
+    assert (
+        MegatronPolicyWorkerImpl._requires_nvrx_cuda_cache_release(worker) is expected
+    )
+
+
 def test_megatron_move_model_does_not_serialize_extra_state():
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
@@ -3480,6 +3518,96 @@ def test_megatron_checkpoint_save_kill_and_restore(
             if policy3:
                 policy3.shutdown()
             cluster2.shutdown()
+
+
+def _hash_checkpoint_tensors(weights_path: str) -> dict[tuple, str]:
+    """Hash every tensor chunk of a torch_dist checkpoint by its byte range."""
+    (iter_dir,) = Path(weights_path).glob("iter_*")
+    metadata = FileSystemReader(str(iter_dir)).read_metadata()
+    hashes = {}
+    for index, info in metadata.storage_data.items():
+        if not isinstance(
+            metadata.state_dict_metadata[index.fqn], TensorStorageMetadata
+        ):
+            continue
+        with open(iter_dir / info.relative_path, "rb") as f:
+            f.seek(info.offset)
+            chunk = f.read(info.length)
+        hashes[(index.fqn, str(index.offset), index.index)] = hashlib.sha256(
+            chunk
+        ).hexdigest()
+    return hashes
+
+
+@pytest.mark.timeout(400)
+@pytest.mark.hf_gated
+def test_megatron_async_save_after_ppo_offload_writes_current_weights(
+    tiny_llama_model_path,
+):
+    """A PPO offload between async saves must not leave the second one stale.
+
+    NVRx's constant-structure cache reuses the first save's CUDA IPC handles, and
+    the offload moves the parameters, so an unreleased cache makes the second
+    checkpoint a byte-identical copy of the first.
+    """
+    config = create_megatron_test_config(model_name=tiny_llama_model_path)
+    del config["generation"]
+    config["megatron_cfg"]["offloaded_between_steps"] = True
+    config["megatron_cfg"]["checkpoint"] = {
+        "async_save": True,
+        "ckpt_assume_constant_structure": True,
+    }
+    tokenizer = get_tokenizer({"name": tiny_llama_model_path})
+
+    torch.manual_seed(42)
+    attention_mask = torch.ones(8, 32)
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.randint(0, 32000, (8, 32)),
+            "input_lengths": attention_mask.sum(dim=1).to(torch.int32),
+            "attention_mask": attention_mask,
+            "labels": torch.randint(0, 32000, (8, 32)),
+            "sample_mask": torch.ones(8),
+        }
+    )
+
+    with tempfile.TemporaryDirectory(prefix="megatron_async_save_") as temp_dir:
+        cluster = RayVirtualCluster(
+            name="test-async-save-ppo-offload",
+            bundle_ct_per_node_list=[2],
+            use_gpus=True,
+            num_gpus_per_node=2,
+            max_colocated_worker_groups=1,
+        )
+        policy = None
+        try:
+            policy = Policy(cluster=cluster, config=config, tokenizer=tokenizer)
+            weights_paths = []
+            for step in range(2):
+                policy.prepare_for_training()
+                policy.train(data, SimpleLossFn())
+                weights_path = os.path.join(temp_dir, f"step_{step}", "weights")
+                policy.save_checkpoint(
+                    weights_path=weights_path, is_final_checkpoint=False
+                )
+                # PPO hands the GPUs to the value model right after each save.
+                policy.offload_to_cpu()
+                weights_paths.append(weights_path)
+            # Complete the last write before reading the checkpoints.
+            policy.finalize_async_save()
+
+            first, second = (_hash_checkpoint_tensors(p) for p in weights_paths)
+            assert first.keys() == second.keys()
+            # Every chunk is a trained fp32 param, so none may repeat the first save.
+            repeated = [key for key in first if first[key] == second[key]]
+            assert not repeated, (
+                f"{len(repeated)} of {len(first)} tensor chunks repeat the first "
+                f"checkpoint: {repeated}"
+            )
+        finally:
+            if policy:
+                policy.shutdown()
+            cluster.shutdown()
 
 
 @pytest.mark.timeout(300)

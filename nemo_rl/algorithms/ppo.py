@@ -793,6 +793,7 @@ def setup(
             policy_training_steps * ppo_epochs,
             1,
         )
+        policy_config["megatron_cfg"]["offloaded_between_steps"] = True
 
     if value_config.get("megatron_cfg", {}).get("enabled", False):
         value_config["megatron_cfg"]["train_iters"] = (
