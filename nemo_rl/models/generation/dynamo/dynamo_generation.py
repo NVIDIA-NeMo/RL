@@ -14,13 +14,14 @@
 """Generation and NCCL refit through a driver-owned Dynamo vLLM fleet."""
 
 import asyncio
+import json
 import logging
 from typing import Any, AsyncGenerator, Optional
 
 import ray
 import torch
 
-from nemo_rl.data.multimodal_utils import VLLM_PROMPT_KEYS
+from nemo_rl.data.multimodal_utils import VLLM_CONTENT_KEY, VLLM_MULTI_MODAL_DATA_KEY
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation.dynamo.config import DynamoConfig
@@ -46,6 +47,29 @@ LOGGER = logging.getLogger(__name__)
 _HTTP_MAX_ATTEMPTS = 3
 _HTTP_RETRY_DELAY_S = 1.0
 _RETRYABLE_HTTP_STATUS_CODES = {408, 429}
+
+
+def _assert_json_safe_modality_payload(payload: dict[str, Any]) -> None:
+    """Reject modality values the completions request has no wire form for.
+
+    Dynamo carries ``multi_modal_data`` on a completion request as a JSON map
+    it never interprets, handing it to the worker's modality processor as-is.
+    Engine-native objects the data processors produce for the in-process vLLM
+    backend (``PIL.Image``, audio tuples, frame arrays) therefore cannot cross
+    this transport. Naming the offending modality here beats the bare
+    ``TypeError`` ``json.dumps`` would raise from inside the HTTP client.
+    """
+    for modality, value in payload.items():
+        try:
+            json.dumps(value)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"vllm_multi_modal_data[{modality!r}] is not JSON-encodable "
+                f"(got {type(value).__name__}); the Dynamo completions "
+                "transport carries JSON modality payloads only. Encode the "
+                "value in the data processor, for example as a base64 "
+                "descriptor."
+            ) from error
 
 
 def _is_retryable_http_response(response: Any) -> bool:
@@ -370,34 +394,95 @@ class DynamoGeneration(GenerationInterface):
             )
         return list(stop_set) if stop_set else None
 
-    def _prompt_token_ids(
+    @staticmethod
+    def _multi_modal_data(
+        data: BatchedDataDict["GenerationDatumSpec"], sample_idx: int
+    ) -> dict[str, Any] | None:
+        """Return the row's modality payload, or ``None`` when it carries nothing.
+
+        Empty modality values are dropped with the same rule as
+        ``format_prompt_for_vllm_generation`` so both backends agree on which
+        rows count as multimodal. Dynamo rejects an empty map, so a row left
+        with no entries is reported as absent rather than sent.
+        """
+        rows = data.get(VLLM_MULTI_MODAL_DATA_KEY)
+        if rows is None:
+            return None
+        if not isinstance(rows, (list, tuple)):
+            raise ValueError("vllm_multi_modal_data must be a per-sample sequence")
+        if sample_idx >= len(rows):
+            raise ValueError("vllm_multi_modal_data is missing the requested sample")
+        row = rows[sample_idx]
+        if row is None:
+            return None
+        if not isinstance(row, dict):
+            raise ValueError("vllm_multi_modal_data rows must be mappings")
+
+        payload = {
+            modality: value
+            for modality, value in row.items()
+            if value is not None
+            and (not isinstance(value, (list, tuple)) or len(value) > 0)
+        }
+        if not payload:
+            return None
+        _assert_json_safe_modality_payload(payload)
+        return payload
+
+    def _prompt_and_multi_modal_data(
         self,
         data: BatchedDataDict["GenerationDatumSpec"],
         sample_idx: int,
-    ) -> list[int]:
-        if VLLM_PROMPT_KEYS & data.keys():
-            raise NotImplementedError(
-                "DynamoGeneration direct generate() supports token-ID LLM "
-                "prompts only; multimodal vLLM prompt data is not supported."
+    ) -> tuple[list[int] | str, dict[str, Any] | None]:
+        """Select the prompt and modality payload for one rollout row.
+
+        The rendered ``vllm_content`` string replaces the token-ID prompt only
+        when the row actually carries modality data, matching
+        ``format_prompt_for_vllm_generation``. A text-only row in a VLM batch
+        therefore keeps the pre-tokenized prompt that ``input_ids`` describes,
+        which is what the response splice in ``_single_sample_output`` assumes.
+        """
+        input_length = int(data["input_lengths"][sample_idx].item())
+        prompt_token_ids = data["input_ids"][sample_idx, :input_length].tolist()
+
+        multi_modal_data = self._multi_modal_data(data, sample_idx)
+        if multi_modal_data is None:
+            return prompt_token_ids, None
+
+        if not self.cfg["vllm_kwargs"].get("enable_multimodal"):
+            raise ValueError(
+                "Rollout data carries vllm_multi_modal_data but "
+                "policy.generation.vllm_kwargs.enable_multimodal is unset; the "
+                "managed worker rejects a modality payload unless it started "
+                "with --enable-multimodal"
             )
 
-        input_length = int(data["input_lengths"][sample_idx].item())
-        return data["input_ids"][sample_idx, :input_length].tolist()
+        content_rows = data.get(VLLM_CONTENT_KEY)
+        content = content_rows[sample_idx] if content_rows is not None else None
+        if content is None:
+            return prompt_token_ids, multi_modal_data
+        if not isinstance(content, str):
+            raise ValueError(
+                "DynamoGeneration /v1/completions requires vllm_content to be "
+                f"a string when it is provided, got {type(content).__name__}"
+            )
+        return content, multi_modal_data
 
     def _build_completion_request(
         self,
         *,
-        prompt_token_ids: list[int],
+        prompt: list[int] | str,
         greedy: bool,
         stop_strings: Optional[list[str]],
         max_new_tokens: int,
+        multi_modal_data: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         top_k_cfg = self.cfg["top_k"]
         top_k_val = 1 if greedy else (top_k_cfg if top_k_cfg is not None else -1)
 
         payload: dict[str, Any] = {
             "model": self.cfg["model_name"],
-            "prompt": prompt_token_ids,
+            "prompt": prompt,
             "max_tokens": int(max_new_tokens),
             "temperature": 0.0 if greedy else self.cfg["temperature"],
             "top_p": self.cfg["top_p"],
@@ -412,6 +497,8 @@ class DynamoGeneration(GenerationInterface):
             payload["stop_token_ids"] = self.cfg["stop_token_ids"]
         if stop_strings is not None:
             payload["stop"] = stop_strings
+        if multi_modal_data is not None:
+            payload["multi_modal_data"] = multi_modal_data
 
         return payload
 
@@ -439,17 +526,19 @@ class DynamoGeneration(GenerationInterface):
     async def _post_completion_request(
         self,
         *,
-        prompt_token_ids: list[int],
+        prompt: list[int] | str,
         greedy: bool,
         stop_strings: Optional[list[str]],
         max_new_tokens: int,
+        multi_modal_data: dict[str, Any] | None = None,
     ) -> tuple[list[int], list[float], bool]:
         request_url = self._completion_url()
         payload = self._build_completion_request(
-            prompt_token_ids=prompt_token_ids,
+            prompt=prompt,
             greedy=greedy,
             stop_strings=stop_strings,
             max_new_tokens=max_new_tokens,
+            multi_modal_data=multi_modal_data,
         )
         response: dict[str, Any] = {}
         for attempt in range(1, _HTTP_MAX_ATTEMPTS + 1):
@@ -550,7 +639,7 @@ class DynamoGeneration(GenerationInterface):
         data: BatchedDataDict["GenerationDatumSpec"],
         greedy: bool = False,
     ) -> AsyncGenerator[tuple[int, BatchedDataDict["GenerationOutputSpec"]], None]:
-        """Generate one token-ID prompt asynchronously through the managed frontend."""
+        """Generate one rollout row asynchronously through the managed frontend."""
         assert isinstance(data, BatchedDataDict), (
             f"data must be a BatchedDataDict, got type: {type(data)}"
         )
@@ -582,15 +671,17 @@ class DynamoGeneration(GenerationInterface):
 
         allowed_new_tokens = self._allowed_new_tokens(input_length)
         input_ids = input_ids_batch[sample_idx]
+        prompt, multi_modal_data = self._prompt_and_multi_modal_data(data, sample_idx)
         (
             generated_token_ids,
             generated_logprobs,
             truncated,
         ) = await self._post_completion_request(
-            prompt_token_ids=self._prompt_token_ids(data, sample_idx),
+            prompt=prompt,
             greedy=greedy,
             stop_strings=final_stop_strings,
             max_new_tokens=allowed_new_tokens,
+            multi_modal_data=multi_modal_data,
         )
 
         yield (
