@@ -141,11 +141,7 @@ class TrtllmAsyncGenerationWorkerImpl:
         # placement_bundle_indices / per_worker_gpu_share named params that
         # unconditionally overwrite kwargs["ray_placement_config"] — so we
         # must pass these as top-level kwargs, not via ray_placement_config.
-        print(
-            f"[TrtllmAsyncWorker] bundle_indices={self._bundle_indices}, "
-            f"pg={pg}, bundle_specs={pg.bundle_specs}",
-            flush=True,
-        )
+        print(f"[TrtllmAsyncWorker] bundle_indices={self._bundle_indices}", flush=True)
 
         # TRT-LLM expects one bundle-index list per placement group. A unified
         # PG can contain bundles on multiple nodes, allowing one TP replica to
