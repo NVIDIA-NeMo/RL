@@ -26,6 +26,8 @@ from nemo_rl.models.generation.trtllm.trtllm_http_server import (
     _resolve_tool_parser_name,
 )
 
+pytestmark = pytest.mark.trtllm
+
 
 class _FakeToolParser:
     def __init__(self, *, calls):
