@@ -69,7 +69,13 @@ from nemo_rl.models.automodel.config import (
     ModelAndOptimizerState,
     RuntimeConfig,
 )
+from nemo_rl.models.automodel.router_replay import (
+    enable_routing_replay_in_automodel_kwargs,
+    require_automodel_moe_model,
+    validate_automodel_router_replay_config,
+)
 from nemo_rl.models.automodel.utils import resolve_model_class
+from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig, TokenizerConfig
 from nemo_rl.models.policy.utils import configure_dynamo_cache
 
@@ -835,6 +841,8 @@ def setup_model_and_optimizer(
 
     # Prepare automodel kwargs
     automodel_kwargs = config["dtensor_cfg"].get("automodel_kwargs", {})
+    if router_replay_enabled(config):
+        validate_automodel_router_replay_config(config)
     if automodel_kwargs.get("backend", None) is not None:
         backend_class = _resolve_target(
             automodel_kwargs.get("backend", None)["_target_"]
@@ -907,6 +915,9 @@ def setup_model_and_optimizer(
     # Auto-set force_hf if the custom model's adapter doesn't support per-tensor
     # HF conversion (required for weight syncing).
     _maybe_set_force_hf(automodel_kwargs, model_config)
+    if router_replay_enabled(config):
+        require_automodel_moe_model(automodel_kwargs, model_config)
+        enable_routing_replay_in_automodel_kwargs(automodel_kwargs)
 
     # Bundle distributed topology + policies into a single DistributedSetup. Automodel
     # r0.6.0's from_pretrained rejects the old separate distributed kwargs
