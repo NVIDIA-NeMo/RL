@@ -17,14 +17,16 @@
 
 import asyncio
 import copy
+import importlib
 import json
+import logging
 import statistics
 import uuid
 import warnings
 from collections import defaultdict
 from collections.abc import AsyncGenerator, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 import ray
 import torch
@@ -99,6 +101,8 @@ from nemo_rl.utils.multimodal_payload_metrics import (
     print_multimodal_payload_metrics,
 )
 from nemo_rl.utils.timer import Timer
+
+logger = logging.getLogger(__name__)
 
 TokenizerType = PreTrainedTokenizerBase
 
@@ -2047,6 +2051,51 @@ def get_nemo_gym_max_infra_attempts(env_config: dict[str, Any]) -> int:
     return attempts
 
 
+# A step-metrics hook: takes the full results of one prompt group's rollouts (each
+# agent's ``full_result`` mapping) and returns metrics to merge into the step's
+# rollout metrics.
+RolloutMetricsHook = Callable[[list[dict[str, Any]]], dict[str, float]]
+
+# Rollout-metrics hooks that have already failed once in this process, by
+# qualified name; the failure is reported the first time only, since it would
+# otherwise repeat for every prompt group of every step.
+_ROLLOUT_METRICS_HOOK_WARNED: set[str] = set()
+
+
+def get_nemo_gym_rollout_metrics_hook(
+    env_config: dict[str, Any],
+) -> Optional[RolloutMetricsHook]:
+    """Import the hook ``env.nemo_gym.rollout_metrics_hook`` names, or None when unset.
+
+    The value is the dotted import path of a callable, ``package.module.function``.
+    The per-agent aggregation in ``_postprocess_single_nemo_gym_group`` already
+    logs the mean of every numeric result field over all rollouts; the hook is
+    where an environment derives what that cannot express, such as a mean over
+    only the successful rollouts. Raises ``ValueError`` when the path does not
+    resolve to a callable.
+    """
+    nemo_gym_config = env_config.get("nemo_gym")
+    path = (
+        nemo_gym_config.get("rollout_metrics_hook")
+        if isinstance(nemo_gym_config, dict)
+        else None
+    )
+    if not path:
+        return None
+    module_name, _, attribute = str(path).rpartition(".")
+    if not module_name:
+        raise ValueError(
+            f"env.nemo_gym.rollout_metrics_hook must be a dotted import path "
+            f"(package.module.function), got {path!r}"
+        )
+    hook = getattr(importlib.import_module(module_name), attribute, None)
+    if not callable(hook):
+        raise ValueError(
+            f"env.nemo_gym.rollout_metrics_hook {path!r} does not name a callable"
+        )
+    return cast(RolloutMetricsHook, hook)
+
+
 async def _nemo_gym_rollout_config(nemo_gym_environment: Any) -> dict[str, Any]:
     """Fetch the ``env.nemo_gym`` keys the rollout loop reads from the Gym actors.
 
@@ -3016,6 +3065,7 @@ async def run_async_nemo_gym_rollout(
         max_infra_attempts_per_rollout = get_nemo_gym_max_infra_attempts(
             rollout_env_config
         )
+    rollout_metrics_hook = get_nemo_gym_rollout_metrics_hook(rollout_env_config)
 
     with timer.time(total_timer_label):
         _prepare_nemo_gym_rows(
@@ -3094,6 +3144,7 @@ async def run_async_nemo_gym_rollout(
                         length_penalty_config=length_penalty_config,
                         thinking_tags=thinking_tags,
                         mask_env_flagged_samples=mask_env_flagged_samples,
+                        rollout_metrics_hook=rollout_metrics_hook,
                         group_size=identity_num_generations,
                     )
                     if accumulator.is_complete:
@@ -3257,6 +3308,7 @@ def _postprocess_single_nemo_gym_group(
     length_penalty_config: LengthPenaltyConfig | dict[str, Any] | None = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
     mask_env_flagged_samples: bool = True,
+    rollout_metrics_hook: RolloutMetricsHook | None = None,
     group_size: Optional[int] = None,
 ) -> NemoGymRolloutResult:
     """Postprocess one complete prompt group from the NeMo-Gym stream.
@@ -3389,6 +3441,32 @@ def _postprocess_single_nemo_gym_group(
             # / batch_size,
         }
 
+    # Metrics the configured hook derives from the group's full results (see
+    # get_nemo_gym_rollout_metrics_hook). The per-agent means below cover every
+    # numeric field; the hook covers what a mean over all rollouts cannot
+    # express. A failing hook is reported and cannot fail the rollout.
+    if rollout_metrics_hook is not None:
+        try:
+            rollout_metrics.update(
+                rollout_metrics_hook(
+                    [
+                        r["full_result"]
+                        for r in results
+                        if isinstance(r.get("full_result"), dict)
+                    ]
+                )
+            )
+        except Exception as e:
+            hook_name = getattr(
+                rollout_metrics_hook, "__qualname__", repr(rollout_metrics_hook)
+            )
+            if hook_name not in _ROLLOUT_METRICS_HOOK_WARNED:
+                _ROLLOUT_METRICS_HOOK_WARNED.add(hook_name)
+                logger.warning(
+                    "Error in the NeMo-Gym rollout metrics hook (reported once): %r",
+                    e,
+                )
+
     # Per-agent misc metrics
     with timer.time(f"{timer_prefix}/per_agent_misc_metrics"):
         agent_to_results: dict[str, list[dict]] = defaultdict(list)
@@ -3410,7 +3488,9 @@ def _postprocess_single_nemo_gym_group(
                 agent_truncations
             ) / len(agent_truncations)
 
-            keys = agent_results[0].keys()
+            # Union of keys in first-seen order: a field present only on some
+            # rollouts (a masked sample's flag, for example) is still aggregated.
+            keys = list(dict.fromkeys(key for r in agent_results for key in r))
             for key in keys:
                 values = [
                     float(r[key])
