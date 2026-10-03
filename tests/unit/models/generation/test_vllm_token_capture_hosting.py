@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import threading
 import time
@@ -52,7 +53,11 @@ from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
     StageResult,
 )
 
-from nemo_rl.data.captured_media import MediaColumnSpec  # noqa: E402
+from nemo_rl.data.captured_media import (  # noqa: E402
+    CapturedMedia,
+    CapturedMediaItem,
+    MediaColumnSpec,
+)
 from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     ChainPrefixCache,
     StagedPrefix,
@@ -80,6 +85,7 @@ class _MemorySink:
         self.records: list[StagedCallRecord] = []
         self.attachments: list[dict | None] = []
         self.generation_prefix_records: list[tuple[str, StagedCallRecord]] = []
+        self.generation_prefix_attachments: list[dict | None] = []
         self.generation_prefix_keys: list[str] = []
         self.cleared_generation_prefix_keys: list[str] = []
 
@@ -98,8 +104,8 @@ class _MemorySink:
         chunk_sequence: int,
         attachments: dict | None = None,
     ) -> StageResult:
-        assert attachments is None
         self.generation_prefix_records.append((checkpoint_id, record))
+        self.generation_prefix_attachments.append(attachments)
         key = (
             f"__generation_cut__/{checkpoint_id}/{record.rollout_id}/"
             f"{record.model_call_id}/{chunk_sequence}"
@@ -326,7 +332,7 @@ def test_generation_prefix_restore_counts_sum_over_workers(monkeypatch):
     )
 
 
-def test_prefix_capture_setup_requires_control_token_and_rejects_media(monkeypatch):
+def test_prefix_capture_setup_requires_control_token(monkeypatch):
     monkeypatch.setattr(
         "nemo_rl.data_plane.build_data_plane_client",
         lambda dp_cfg, bootstrap, segment_size=None: MagicMock(),
@@ -339,20 +345,6 @@ def test_prefix_capture_setup_requires_control_token_and_rejects_media(monkeypat
                 {},
                 "rollout_staging",
                 generation_prefix_cuts_enabled=True,
-            )
-        )
-
-    worker = _fake_worker()
-    worker.llm = SimpleNamespace(model_config=SimpleNamespace(dtype=torch.bfloat16))
-    with pytest.raises(ValueError, match="does not yet support multimodal"):
-        asyncio.run(
-            VllmAsyncGenerationWorkerImpl.setup_token_capture(
-                worker,
-                {},
-                "rollout_staging",
-                capture_media=True,
-                generation_prefix_cuts_enabled=True,
-                generation_cut_control_token="secret",
             )
         )
 
@@ -1305,6 +1297,70 @@ def test_uncuttable_sampling_settings_warn_once_per_reason(monkeypatch, caplog):
     assert caplog.text.count("are not cut; they regenerate after a restore") == 1
 
 
+def test_generation_cut_stages_media_only_with_first_prefix_row():
+    sink = _MemorySink()
+    worker = _worker_with_capture(sink)
+    request = _FakeRequest(
+        ng_capture={
+            "rollout_id": "r0",
+            "model_call_id": "c1",
+            "parent_call_id": None,
+            "prev_len": 0,
+            "mode": "text",
+        },
+        stream=False,
+    )
+    media = CapturedMedia(
+        items=(
+            CapturedMediaItem(
+                modality="image",
+                placeholder_offset=0,
+                placeholder_length=2,
+                placeholder_digest=hashlib.sha256(
+                    json.dumps([18, 18], separators=(",", ":")).encode()
+                ).hexdigest(),
+                token_id=18,
+                embedding_spans=((0, 2),),
+                imgs_sizes=((1, 2),),
+            ),
+        ),
+        tensors={
+            "imgs": torch.ones(1, 2, 3),
+            "imgs_sizes": torch.tensor([[1, 2]], dtype=torch.int32),
+        },
+    )
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(
+        worker, request, [18, 18], media=media
+    )
+    state = worker._capture_calls[id(request)]
+    state.effective_output_limit = 8
+    state.observe([20], [-0.1])
+
+    def inventory(checkpoint_id: str) -> GenerationCutInventory:
+        return GenerationCutInventory.build(
+            checkpoint_id=checkpoint_id,
+            server_name="policy_model",
+            active_prefixes=[
+                GenerationCutPrefix(
+                    ticket_id=f"ticket-{checkpoint_id}",
+                    rollout_id="r0",
+                    attempt=0,
+                    model_call_id="c1",
+                    admitted_at=1.0,
+                )
+            ],
+        )
+
+    worker._checkpoint_generation_cut(inventory("checkpoint-1"))
+    state.observe([21], [-0.2])
+    worker._checkpoint_generation_cut(inventory("checkpoint-2"))
+
+    first, second = [record for _, record in sink.generation_prefix_records]
+    assert first.extras == {"media_spans": [media.items[0].to_dict()]}
+    assert second.extras is None
+    assert sink.generation_prefix_attachments == [media.tensors, None]
+
+
 class _FailOncePrefixSink(_MemorySink):
     def __init__(self) -> None:
         super().__init__()
@@ -1459,10 +1515,10 @@ def test_usable_restored_prefix_is_resumed():
     worker = _resumed_worker(sink, records={cut_key: cut_record})
     admission = worker._capture_admission(request)
 
-    served, snapshot = worker._resolve_usable_generation_cut(admission, [])
+    served, resolved = worker._resolve_usable_generation_cut(admission, [])
 
     assert served is admission
-    assert snapshot.digest == cut_record.digest
+    assert resolved.snapshot.digest == cut_record.digest
     _drain_cleanup(worker)
     assert sink.cleared_generation_prefix_keys == []
 
@@ -1490,9 +1546,9 @@ def test_unusable_restored_prefix_regenerates_instead_of_failing(failure, caplog
         )
 
     with caplog.at_level(logging.WARNING):
-        served, snapshot = worker._resolve_usable_generation_cut(admission, [])
+        served, resolved = worker._resolve_usable_generation_cut(admission, [])
 
-    assert snapshot is None
+    assert resolved is None
     assert served.generation_cut is None
     assert "regenerating it from its turn boundary" in caplog.text
     # The regenerated call is admitted as an ordinary call from its boundary.
@@ -2001,8 +2057,11 @@ def test_request_capture_abort_fails_the_call_and_drains_state():
 
 
 @pytest.mark.vllm
+@pytest.mark.parametrize("prefix_cuts", [False, True])
 @pytest.mark.parametrize("pruning_rate", [0.0, 0.5])
-def test_omni_capture_setup_rejects_video_pruning(monkeypatch, pruning_rate):
+def test_omni_capture_setup_rejects_video_pruning(
+    monkeypatch, pruning_rate, prefix_cuts
+):
     # Both dependency markers select the combined vLLM + Gym lane.
     pytest.importorskip("vllm")
     from vllm.model_executor.models.nano_nemotron_vl import NanoNemotronVLProcessingInfo
@@ -2026,25 +2085,30 @@ def test_omni_capture_setup_rejects_video_pruning(monkeypatch, pruning_rate):
     )
     worker = _fake_worker()
     worker.llm = SimpleNamespace(
-        renderer=SimpleNamespace(get_mm_processor=lambda: SimpleNamespace(info=info)),
+        renderer=SimpleNamespace(
+            get_mm_processor=lambda: SimpleNamespace(info=info),
+            get_tokenizer=lambda: SimpleNamespace(decode=lambda ids: ""),
+        ),
         model_config=SimpleNamespace(dtype=torch.bfloat16),
     )
     monkeypatch.setattr(
         "nemo_rl.data_plane.build_data_plane_client",
         lambda dp_cfg, bootstrap, segment_size=None: MagicMock(),
     )
+    kwargs = {"staging_partition": "staging", "capture_media": True}
+    if prefix_cuts:
+        kwargs.update(
+            generation_prefix_cuts_enabled=True,
+            generation_cut_control_token="secret",
+        )
     if pruning_rate:
         with pytest.raises(ValueError, match="video token pruning"):
             asyncio.run(
-                VllmAsyncGenerationWorkerImpl.setup_token_capture(
-                    worker, {}, staging_partition="staging", capture_media=True
-                )
+                VllmAsyncGenerationWorkerImpl.setup_token_capture(worker, {}, **kwargs)
             )
     else:
         spec = asyncio.run(
-            VllmAsyncGenerationWorkerImpl.setup_token_capture(
-                worker, {}, staging_partition="staging", capture_media=True
-            )
+            VllmAsyncGenerationWorkerImpl.setup_token_capture(worker, {}, **kwargs)
         )
         # The engine's model dtype and the HF patch size, as pinned on the sink.
         assert spec == MediaColumnSpec(pixel_dtype=torch.bfloat16, patch_size=2)
