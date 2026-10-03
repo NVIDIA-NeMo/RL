@@ -16,6 +16,36 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
 
 `run_grpo_single_controller.py` mirrors `run_grpo.py` for config loading — the same YAML files apply — but requires a few settings the legacy path does not. The default exemplar lives at [examples/configs/grpo_math_1B_megatron_single_controller.yaml](../../examples/configs/grpo_math_1B_megatron_single_controller.yaml); the PPO one at [examples/configs/ppo_math_1B_megatron_single_controller.yaml](../../examples/configs/ppo_math_1B_megatron_single_controller.yaml).
 
+### Reference placement and actor layout
+
+By default, policy workers also hold the frozen reference weights. To run the
+reference on separate GPUs, add this top-level section:
+
+```yaml
+reference:
+  placement: separate_nodes
+  num_nodes: 1
+  gpus_per_node: 8
+```
+
+For `separate_nodes`, increase `cluster.num_nodes` by the reference host count
+to keep the policy and generation allocations fixed. With `same_node`, the
+reference takes separate GPUs on each policy host; `reference.num_nodes` must
+match the policy host count. The policy gets the remaining GPUs after generation
+and reference reservations. The reference inherits the policy backend and model
+parallelism, loads the initial weights even when training resumes, and stays on
+GPU without an optimizer or a second reference copy. Separate placement requires
+reference logprobs and a positive reference KL penalty.
+
+After setup, stdout shows the NVLink domain, hosts, advertised Ray GPU count,
+roles on each host-local GPU, and CPU actors. Teacher labels list actual config
+aliases and checkpoints. Identical rows collapse into host ranges; the default
+view shows at most 20 layouts and reports any remaining layout count. Use
+`--placement-full`, `--placement-host 'PATTERN'`, or
+`--placement-domain 'PATTERN'` for more detail. A dedicated head can show a known
+physical domain while advertising zero GPUs. Missing actor or GPU inventory is
+reported explicitly.
+
 ### Mandatory settings
 
 1. **Enable the TransferQueue data plane** (required — the entrypoint refuses to start otherwise):

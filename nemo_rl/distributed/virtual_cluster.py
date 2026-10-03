@@ -970,6 +970,7 @@ class RayVirtualCluster:
         self._node_placement_groups: Optional[list[PlacementGroup]] = None
         self._sorted_bundle_indices: Optional[list[int]] = None
         self._nvlink_domain_per_bundle_index: Optional[tuple[str, ...]] = None
+        self.gpu_placement: dict[str, tuple[int, ...]] = {}
 
         self.num_gpus_per_node = num_gpus_per_node
         self.use_gpus = use_gpus
@@ -1135,6 +1136,20 @@ class RayVirtualCluster:
 
     def world_size(self) -> int:
         return self._world_size
+
+    def capture_gpu_placement(self) -> None:
+        """Record bundle GPU IDs before workers consume their GPU resources."""
+        if not self.use_gpus or self.gpu_placement:
+            return
+        devices: dict[str, set[int]] = {}
+        for pg in self.get_placement_groups():
+            indices, gpu_ids, _ = get_reordered_bundle(pg)
+            node_ids = placement_group_table(pg)["bundles_to_node_id"]
+            for index, gpu_id in zip(indices, gpu_ids, strict=True):
+                devices.setdefault(node_ids[index], set()).add(int(gpu_id))
+        self.gpu_placement = {
+            node_id: tuple(sorted(ids)) for node_id, ids in devices.items()
+        }
 
     def node_count(self) -> int:
         return sum(1 for count in self._bundle_ct_per_node_list if count > 0)
@@ -1309,6 +1324,7 @@ class RayVirtualCluster:
             self._node_placement_groups = None
             self._sorted_bundle_indices = None
             self._nvlink_domain_per_bundle_index = None
+            self.gpu_placement = {}
 
         return True
 

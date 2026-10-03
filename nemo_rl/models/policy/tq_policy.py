@@ -133,14 +133,18 @@ class TQPolicy(TQDriverMixin, Policy):
     rollout actor at first put + driver-/worker-written deltas).
     """
 
+    reference_only: bool = False
+
     def __init__(
         self,
         *args: Any,
         dp_cfg: DataPlaneRuntimeConfig,
         checkpointing: bool = False,
         tq_partition_id: str = "train",
+        reference_only: bool = False,
         **kwargs: Any,
     ) -> None:
+        self.reference_only = reference_only
         super().__init__(*args, **kwargs)
         # Validate the topology the data plane fan-out (`shard_meta_for_dp`)
         # depends on. Failing here surfaces a clear error at policy
@@ -155,7 +159,7 @@ class TQPolicy(TQDriverMixin, Policy):
             )
         self.dp_cfg = dp_cfg
         self.dp_client = build_data_plane_client(
-            dp_cfg, bootstrap=True, checkpointing=checkpointing
+            dp_cfg, bootstrap=not reference_only, checkpointing=checkpointing
         )
         self.tq_partition_id = tq_partition_id
         self._router_replay_enabled = bool(
@@ -470,7 +474,10 @@ class TQPolicy(TQDriverMixin, Policy):
             worker_method="get_reference_policy_logprobs_presharded",
             timer_prefix="get_reference_policy_logprobs",
             timer=timer,
-            common_kwargs={"micro_batch_size": micro_batch_size},
+            common_kwargs={
+                "micro_batch_size": micro_batch_size,
+                "use_policy_model": self.reference_only,
+            },
         )
 
     def train_from_meta(

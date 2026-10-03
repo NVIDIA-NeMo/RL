@@ -948,6 +948,7 @@ class TQWorkerMixin:
         self,
         meta: "KVBatchMeta",
         micro_batch_size: Optional[int] = None,
+        use_policy_model: bool = False,
     ) -> None:
         """Per-rank reference-policy logprob entrypoint.
 
@@ -956,14 +957,18 @@ class TQWorkerMixin:
         """
         data = self._fetch(meta)
         data = self._attach_or_repack_pack_metadata(data, meta)
-        result: BatchedDataDict[Any] = self.get_reference_policy_logprobs(  # type: ignore[attr-defined]
-            data=data,
-            micro_batch_size=micro_batch_size,
-        )
+        if use_policy_model:
+            result: BatchedDataDict[Any] = self.get_logprobs(  # type: ignore[attr-defined]
+                data=data, micro_batch_size=micro_batch_size
+            )
+        else:
+            result = self.get_reference_policy_logprobs(  # type: ignore[attr-defined]
+                data=data, micro_batch_size=micro_batch_size
+            )
         self._write_back_result_field(
             meta,
             result,
-            result_key="reference_logprobs",
+            result_key="logprobs" if use_policy_model else "reference_logprobs",
             tq_field="reference_policy_logprobs",
         )
         del result
