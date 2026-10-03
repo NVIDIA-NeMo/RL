@@ -1397,7 +1397,7 @@ async def run_sample_multi_turn_rollout(
 
         except Exception as e:
             print(f"Error generating response for sample {sample_idx}: {e}")
-            break
+            raise
 
         # Create single-sample batch for environment interaction
         sample_batch = BatchedDataDict[DatumSpec](
