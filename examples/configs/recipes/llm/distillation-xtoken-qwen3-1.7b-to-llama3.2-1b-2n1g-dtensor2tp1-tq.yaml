@@ -1,0 +1,84 @@
+defaults: ../../xtoken_off_policy_distillation.yaml
+
+xtoken_transport:
+  backend: tq
+
+data_plane:
+  enabled: true
+  impl: transfer_queue
+  backend: simple
+  claim_meta_poll_interval_s: 0.5
+  simple:
+    storage_capacity: 16
+    num_storage_units: 4
+
+cluster:
+  num_nodes: 2
+  gpus_per_node: 1
+
+distillation:
+  num_prompts_per_step: 1
+  max_num_steps: 3
+
+policy:
+  train_global_batch_size: 1
+  max_total_sequence_length: 64
+  make_sequence_length_divisible_by: 64
+
+# OmegaConf replaces teacher lists, so this entry includes the worker config.
+teachers:
+  - model_name: Qwen/Qwen3-1.7B
+    tokenizer:
+      name: Qwen/Qwen3-1.7B
+    projection_matrix_path: ???
+    train_global_batch_size: 1
+    train_micro_batch_size: 1
+    logprob_batch_size: 1
+    max_total_sequence_length: 64
+    make_sequence_length_divisible_by: 64
+    precision: bfloat16
+    logprob_chunk_size: null
+    offload_optimizer_for_logprob: false
+    dtensor_cfg:
+      enabled: true
+      _v2: true
+      checkpoint:
+        model_save_format: safetensors
+        save_consolidated: 'false'
+      cpu_offload: false
+      sequence_parallel: false
+      activation_checkpointing: true
+      tensor_parallel_size: 1
+      context_parallel_size: 1
+      custom_parallel_plan: null
+    max_grad_norm: 1.0
+    dynamic_batching:
+      enabled: false
+      train_mb_tokens: 64
+      logprob_mb_tokens: 64
+      sequence_length_round: 64
+    sequence_packing:
+      enabled: false
+      train_mb_tokens: 64
+      logprob_mb_tokens: 64
+      algorithm: modified_first_fit_decreasing
+      microbatch_order: packer
+      sequence_length_round: 64
+    optimizer:
+      name: torch.optim.AdamW
+      kwargs:
+        lr: 5.0e-5
+        weight_decay: 0.001
+        betas: [0.9, 0.95]
+        eps: 1.0e-8
+        foreach: false
+        fused: false
+
+data:
+  max_input_seq_length: 64
+  num_workers: 0
+  train:
+    characters_per_sample: 256
+
+logger:
+  log_dir: logs/xtoken-tq

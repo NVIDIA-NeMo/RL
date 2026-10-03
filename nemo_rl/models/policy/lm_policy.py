@@ -24,6 +24,7 @@ from ray.util.queue import Queue as RayQueue
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.data_plane.xtoken import XTokenTQReceiveResult, XTokenTQReference
 from nemo_rl.distributed.batched_data_dict import (
     BatchedDataDict,
     DynamicBatchingArgs,
@@ -864,6 +865,50 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             )
         worker_results = self.worker_group.get_all_worker_results(futures)
         return aggregate_per_sample_handles(worker_results)
+
+    def get_full_logits_tq(
+        self,
+        data: BatchedDataDict[Any],
+        *,
+        partition_id: str,
+        sample_id: str,
+        max_payload_bytes: int,
+        timeout_s: float,
+    ) -> XTokenTQReference:
+        """Publish on the sole teacher worker, returning metadata only."""
+        if len(self.worker_group.workers) != 1 or data.size != 1:
+            raise ValueError("xToken TQ requires one teacher worker and one sample")
+        results = ray.get(
+            self.worker_group.run_all_workers_single_data(
+                "get_full_logits_tq",
+                data=data,
+                partition_id=partition_id,
+                sample_id=sample_id,
+                max_payload_bytes=max_payload_bytes,
+            ),
+            timeout=timeout_s,
+        )
+        return results[0]
+
+    def materialize_full_logits_tq(
+        self,
+        reference: XTokenTQReference,
+        *,
+        max_payload_bytes: int,
+        timeout_s: float,
+    ) -> XTokenTQReceiveResult:
+        """Fetch on the sole student worker; only local descriptors return."""
+        if len(self.worker_group.workers) != 1:
+            raise ValueError("xToken TQ requires one student worker")
+        results = ray.get(
+            self.worker_group.run_all_workers_single_data(
+                "materialize_full_logits_tq",
+                reference=reference,
+                max_payload_bytes=max_payload_bytes,
+            ),
+            timeout=timeout_s,
+        )
+        return results[0]
 
     def release_ipc_buffer(self) -> None:
         """Tell all workers to drop their stashed IPC tensors."""

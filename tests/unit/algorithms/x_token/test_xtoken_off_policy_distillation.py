@@ -53,6 +53,12 @@ from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     xtoken_non_student_seq_keys,
     xtoken_off_policy_distillation_train,
 )
+from nemo_rl.data_plane.xtoken import (
+    XTokenTQReceiveResult,
+    XTokenTQReference,
+    XTokenTQTransport,
+    XTokenTransportConfig,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
 
@@ -295,8 +301,9 @@ def _patched_setup_call(master_config, *, student_vocab=32, teacher_vocab=24):
         patch.object(xt_mod, "CrossTokenizerDistillationLossFn") as mock_loss_cls,
         patch.object(xt_mod, "StatefulDataLoader") as mock_dl_cls,
         patch.object(xt_mod, "assert_teacher_student_batch_grid"),
-        patch.object(xt_mod, "assert_xtoken_ipc_node_local"),
+        patch.object(xt_mod, "assert_xtoken_ipc_node_local") as mock_ipc_guard,
     ):
+        mock_cluster.side_effect = lambda **kw: MagicMock(name=kw["name"])
         mock_cp_cls.return_value.get_latest_checkpoint_path.return_value = None
         mock_cp_cls.return_value.load_training_info.return_value = None
         mock_cp_cls.return_value.get_resume_paths.return_value = (None, None)
@@ -315,7 +322,82 @@ def _patched_setup_call(master_config, *, student_vocab=32, teacher_vocab=24):
             "policy": mock_policy_cls,
             "loss": mock_loss_cls,
             "checkpointer": mock_cp_cls,
+            "ipc_guard": mock_ipc_guard,
         }
+
+
+def test_setup_tq_pins_distinct_clusters():
+    cfg = _make_master_config()
+    cfg.xtoken_transport = XTokenTransportConfig(backend="tq")
+    cfg.data_plane = {"enabled": True, "impl": "transfer_queue", "backend": "simple"}
+    cfg.cluster = ClusterConfig(num_nodes=2, gpus_per_node=1)
+    cfg.policy.update(
+        dynamic_batching={"enabled": False}, sequence_packing={"enabled": False}
+    )
+    cfg.teachers[0].dynamic_batching = {"enabled": False}
+    cfg.teachers[0].sequence_packing = {"enabled": False}
+    nodes = [
+        {
+            "NodeID": name,
+            "NodeManagerAddress": name,
+            "Alive": True,
+            "Resources": {"GPU": 1, f"node:{name}": 1},
+        }
+        for name in ("z", "a")
+    ]
+    with patch.object(xt_mod.ray, "nodes", return_value=nodes):
+        _, mocks = _patched_setup_call(cfg)
+    assert mocks["cluster"].call_count == 2
+    assert [
+        c.kwargs["node_resource_constraints"] for c in mocks["cluster"].call_args_list
+    ] == [[{"node:a": 0.001}], [{"node:z": 0.001}]]
+    assert (
+        mocks["policy"].call_args_list[0].kwargs["cluster"]
+        is not mocks["policy"].call_args_list[1].kwargs["cluster"]
+    )
+    mocks["ipc_guard"].assert_not_called()
+
+
+def test_tq_train_and_validation_share_export_and_cleanup(mock_xtoken_components):
+    c = mock_xtoken_components
+    c.master_config.xtoken_transport = XTokenTransportConfig(backend="tq")
+    c.master_config.distillation.update(max_num_steps=2, val_period=1)
+    t = XTokenTQTransport(
+        config=c.master_config.xtoken_transport,
+        data_plane={"enabled": True, "impl": "transfer_queue", "backend": "simple"},
+        teacher=c.teacher_policy,
+        student=c.student_policy,
+    )
+    t.client = MagicMock()
+    t.client.list_sample_ids.return_value = []
+    events = []
+    c.teacher_policy.get_full_logits_tq.side_effect = (
+        lambda *_, **kw: XTokenTQReference(
+            kw["partition_id"], kw["sample_id"], (1, 4, 8), "teacher", 0.01
+        )
+    )
+    c.student_policy.materialize_full_logits_tq.return_value = XTokenTQReceiveResult(
+        [{"teacher_shards": []}], "student", 128, 0.01, 128
+    )
+    result = c.student_policy.train.return_value
+
+    def train(data, *_, **kw):
+        assert "teacher_0_full_logits_ipc" in data
+        assert "alignment_0_pair_valid" in data
+        events.append("eval" if kw.get("eval_mode") else "train")
+        return result
+
+    c.student_policy.train.side_effect = train
+    t.client.clear_samples.side_effect = lambda *_: events.append("clear")
+    _run_train(c, tq_transport=t)
+    assert (
+        c.teacher_policy.get_full_logits_tq.call_count == 6
+    )  # two train + four validation batches
+    assert c.student_policy.materialize_full_logits_tq.call_count == 6
+    c.teacher_policy.get_full_logits_ipc.assert_not_called()
+    assert events == ["train", "eval", "clear", "eval", "clear", "clear"] * 2
+    assert t.client.clear_samples.call_count == 6
+    assert t._steps == []
 
 
 def test_empty_teachers_list_rejected_at_config_load():
@@ -453,7 +535,7 @@ def test_setup_val_dataloader_gating(
 # ---------------------------------------------------------------------------
 
 
-def _run_train(c):
+def _run_train(c, tq_transport=None):
     xtoken_off_policy_distillation_train(
         c.student_policy,
         [c.teacher_policy],
@@ -464,6 +546,7 @@ def _run_train(c):
         c.checkpointer,
         c.save_state,
         c.master_config,
+        tq_transport=tq_transport,
     )
 
 

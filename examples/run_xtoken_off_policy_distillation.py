@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import os
 import pprint
+from contextlib import nullcontext
 
 from omegaconf import OmegaConf
 
@@ -28,6 +29,7 @@ from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     xtoken_off_policy_distillation_train,
 )
 from nemo_rl.data.utils import setup_response_data
+from nemo_rl.data_plane.xtoken import XTokenTQTransport
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.utils.config import (
     load_config,
@@ -116,7 +118,16 @@ def main() -> None:
 
     # The checkpointer owns background async-checkpoint finalization threads;
     # the context manager guarantees they are flushed (rename + delete) on exit.
-    with checkpointer:
+    transport = None
+    if master_config.xtoken_transport.backend == "tq":
+        assert master_config.data_plane is not None
+        transport = XTokenTQTransport(
+            config=master_config.xtoken_transport,
+            data_plane=master_config.data_plane,
+            teacher=teacher_policies[0],
+            student=student_policy,
+        )
+    with checkpointer, transport if transport is not None else nullcontext():
         xtoken_off_policy_distillation_train(
             student_policy,
             teacher_policies,
@@ -127,6 +138,7 @@ def main() -> None:
             checkpointer,
             off_policy_distillation_state,
             master_config,
+            tq_transport=transport,
         )
 
 
