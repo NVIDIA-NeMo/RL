@@ -348,10 +348,14 @@ CHECKPOINTING_SAVE_BY="${CHECKPOINTING_SAVE_BY:-}"
 export CONTAINER
 MOUNTS="${MOUNTS:-}"
 
-# GB200 NVL72 defaults to 4 GPUs/node. Allow H100 smoke configs to request
-# their native 8-GPU node shape through the launch environment.
+# NVL72 trays hold 4 GPUs on both GB200 and GB300. Allow H100 smoke configs to
+# request their native 8-GPU node shape through the launch environment.
 export GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
-export CPUS_PER_WORKER="${CPUS_PER_WORKER:-144}"
+# Left empty on purpose: ray.sub resolves this from CPUTot on the nodes the job is
+# actually allocated. The per-node core count varies by platform (GB200 144,
+# GB300 140) and by site config (CoreSpecCount), so no launcher-side default is
+# portable. Set it in the environment only to override a specific allocation.
+export CPUS_PER_WORKER="${CPUS_PER_WORKER:-}"
 
 # =============================================================================
 # HuggingFace configuration
