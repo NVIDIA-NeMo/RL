@@ -1,0 +1,16 @@
+defaults: ./dapo-nanov3.5-30BA3B-4n8g-automodel.yaml
+# Same run with Rollout Routing Replay (R3): training replays vLLM's MoE routing, so
+# near-tied top-k flips between vLLM and the trainer no longer produce tokens whose
+# logprobs differ by tens of nats. See docs/guides/router-replay.md.
+checkpointing:
+  checkpoint_dir: results/dapo-nanov3.5-30BA3B-4n8g-automodel-r3
+policy:
+  router_replay:
+    enabled: true
+  generation:
+    vllm_cfg:
+      # R3 needs vLLM to return routes for every prompt token, not cached prefixes.
+      enable_prefix_caching: false
+logger:
+  wandb:
+    name: dapo-nanov3.5-30BA3B-4n8g-automodel-r3

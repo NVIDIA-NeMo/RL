@@ -350,8 +350,11 @@ class AbstractPolicyWorker:
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
         with self.use_reference_model():
+            # Rollout routes (R3) belong to the policy, never to the reference model.
             reference_logprobs = self.get_logprobs(
-                data=data, micro_batch_size=micro_batch_size
+                data=data,
+                micro_batch_size=micro_batch_size,
+                require_router_replay=False,
             )
 
         return_data = BatchedDataDict[ReferenceLogprobOutputSpec]()
