@@ -160,14 +160,19 @@ def stage(
     )
     message = {"generation_token_ids": [31, 2], "generation_log_probs": [-0.25, -0.5]}
     if routes:
-        message["routed_experts"] = [[[0]]] * (
-            len(prompt["prompt_token_ids"]) + 2 - prev_len
-        )
+        message["routed_experts"] = [[[0]]] * (len(prompt["prompt_token_ids"]) + 2)
     payload = {
         "prompt_token_ids": prompt["prompt_token_ids"],
         "choices": [{"message": message}],
         MEDIA_SPANS_FIELD: [item.to_dict() for item in media.items],
     }
+    if routes:
+        VllmAsyncGenerationWorkerImpl._delta_align_routed_experts(
+            payload,
+            prev_len=prev_len,
+            prompt_len=len(prompt["prompt_token_ids"]),
+            generated_len=2,
+        )
     # Pixels ride beside the record as opaque attachments: one sink write.
     coords = capture.complete_call_from_response(
         capture.begin_call(admission), payload, attachments=media.tensors
@@ -442,6 +447,76 @@ def test_splice_coordinates_handle_reasoning_shift_and_repeated_pad_runs():
     assert splice.token_ids == original + [12, 18, 18, 11]
 
 
+def test_continuation_captures_only_new_media_and_rejects_changed_pixels():
+    from nemo_rl.data_plane.tq_token_sink import StagedMediaTensors
+
+    a, b = torch.ones(3, 2, 3), torch.full((3, 3, 2), 7.0)
+    original = [10, 18, 18, 11, 77, 78, 31, 2]
+    first = capture_processed_media(
+        engine_prompt(original, [(Span(1, 2), a)]), prev_len=0
+    )
+    template = [10, 18, 18, 11, 31, 2, 12, 18, 18, 11]
+    splice = splice_prefix_tokens(
+        tokenizer=SimpleNamespace(eos_token_id=2),
+        model_prefix_token_ids=original,
+        template_prefix_token_ids=template[:6],
+        template_token_ids=template,
+    )
+    retained = (StagedMediaTensors(**first.tensors, num_frames=None),)
+    prompt = engine_prompt(template, [(Span(1, 2), a), (Span(7, 2), b)])
+    media = capture_processed_media(
+        prompt,
+        prev_len=len(original),
+        retained=first.items,
+        retained_tensors=retained,
+        splice=splice,
+    )
+    assert [item.placeholder_offset for item in media.items] == [9]
+    assert [span.offset for span in prompt["mm_placeholders"]["image"]] == [1, 9]
+    torch.testing.assert_close(media.tensors["imgs"][0], packed(b), rtol=0, atol=0)
+    with pytest.raises(
+        MediaCaptureRejected, match="Retained processed media changed"
+    ) as excinfo:
+        capture_processed_media(
+            engine_prompt(template, [(Span(1, 2), a + 3), (Span(7, 2), b)]),
+            prev_len=len(original),
+            retained=first.items,
+            retained_tensors=retained,
+            splice=splice,
+        )
+    assert excinfo.value.code == "retained_media_changed"
+    # A rewritten context starts a root and records its own current pixels.
+    rewritten = capture_processed_media(
+        engine_prompt([10, 18, 18, 11], [(Span(1, 2), a + 3)]),
+        prev_len=0,
+        retained_tensors=(),
+    )
+    torch.testing.assert_close(rewritten.tensors["imgs"][0], packed(a + 3))
+    with pytest.raises(ValueError, match="do not cover"):
+        capture_processed_media(
+            engine_prompt(template, [(Span(1, 2), a), (Span(7, 2), b)]),
+            prev_len=len(original),
+            retained=first.items,
+            retained_tensors=(),
+            splice=splice,
+        )
+
+
+def test_delta_storage_rejects_retained_geometry_changes():
+    a = torch.ones(3, 2, 3)
+    first = capture_processed_media(
+        engine_prompt([10, 18, 18, 11], [(Span(1, 2), a)]), prev_len=0
+    )
+    with pytest.raises(ValueError, match="Retained media"):
+        capture_processed_media(
+            engine_prompt(
+                [10, 18, 18, 11, 31, 2, 50], [(Span(1, 2), torch.ones(3, 3, 2))]
+            ),
+            prev_len=6,
+            retained=first.items,
+        )
+
+
 def test_changed_retained_pad_run_cannot_steal_the_next_image():
     a = torch.ones(3, 2, 3)
     original = [10, 18, 18, 18, 18, 11, 2, 31, 2]
@@ -629,15 +704,19 @@ def test_media_and_routes_share_extras_integrity(dp):
 
 
 @pytest.mark.parametrize("inline", [False, True])
-def test_worker_restart_recovers_retained_geometry_without_fetching_pixels(
-    dp, inline, monkeypatch
+@pytest.mark.parametrize("verify_pixels", [False, True])
+def test_worker_restart_validates_retained_media(
+    dp, inline, verify_pixels, monkeypatch
 ):
     a = torch.ones(3, 2, 3)
     root, _ = stage(dp, engine_prompt([10, 18, 18, 11], [(Span(1, 2), a)]))
     source = TQTokenSource(dp, staging_partition="staging", capture_media=True)
-    monkeypatch.setattr(
-        source, "fetch_media", lambda _: pytest.fail("prefix lookup fetched pixels")
-    )
+    if not verify_pixels:
+        monkeypatch.setattr(
+            source,
+            "fetch_media",
+            lambda _: pytest.fail("ordinary lookup fetched pixels"),
+        )
     worker = SimpleNamespace(
         _capture_media=True,
         _capture_image_token_id=18,
@@ -660,6 +739,7 @@ def test_worker_restart_recovers_retained_geometry_without_fetching_pixels(
         worker,
         engine_prompt(prefix + [50], [(Span(1, 2), a)]),
         admission=admission,
+        verify_retained_media=verify_pixels,
     )
     assert descriptor.items == ()
     assert descriptor.tensors is None
@@ -668,7 +748,20 @@ def test_worker_restart_recovers_retained_geometry_without_fetching_pixels(
             worker,
             engine_prompt(prefix + [50], [(Span(1, 2), torch.ones(3, 3, 2))]),
             admission=admission,
+            verify_retained_media=verify_pixels,
         )
+
+    if verify_pixels:
+        with pytest.raises(
+            MediaCaptureRejected, match="Retained processed media changed"
+        ) as excinfo:
+            VllmAsyncGenerationWorkerImpl._capture_request_media(
+                worker,
+                engine_prompt(prefix + [50], [(Span(1, 2), a + 1)]),
+                admission=admission,
+                verify_retained_media=True,
+            )
+        assert excinfo.value.code == "retained_media_changed"
 
 
 def test_worker_completion_stages_pixels_and_only_returns_capture_coordinates(dp):
@@ -1354,3 +1447,304 @@ async def test_retained_media_rejection_precedes_inference_and_survives_gym(
     )
     assert isinstance(failure, GymTransportError)
     assert "retained_media_changed" in str(failure)
+
+
+@pytest.mark.parametrize("routes", [False, True])
+def test_rl_owned_multimodal_rows_reuse_foundation_media_and_cleanup(dp, routes):
+    from nemo_rl.experience.rollout_reassembler import (
+        ActionOutputFlags,
+        RolloutSelection,
+    )
+
+    a = torch.ones(3, 2, 3)
+    b = torch.ones(3, 3, 2) * 2
+    first, first_media = stage(
+        dp, engine_prompt([10, 18, 18, 11], [(Span(1, 2), a)]), routes=routes
+    )
+    # Continuing call reuses A and stores only newly introduced B.
+    second, _ = stage(
+        dp,
+        engine_prompt(
+            [10, 18, 18, 11, 31, 2, 12, 18, 18], [(Span(1, 2), a), (Span(7, 2), b)]
+        ),
+        parent=first,
+        retained=first_media.items,
+        call_id="c2",
+        routes=routes,
+    )
+    # A policy rewrite retains A, whose newly processed geometry is now different.
+    rewritten, _ = stage(
+        dp,
+        engine_prompt([10, 18, 18, 18], [(Span(1, 3), torch.ones(3, 4, 2))]),
+        call_id="c3",
+        routes=routes,
+    )
+    selection = RolloutSelection(
+        tuple(record.response_id for record in (first, second, rewritten)),
+        (ActionOutputFlags(False, False),) * 3,
+    )
+    result = finalizer(dp, router_replay_enabled=routes).finalize_group(
+        "g",
+        ["r0"],
+        [receipt(first, second, rewritten)],
+        [1.0],
+        mask_sample=[False],
+        fallback_weight_version=3,
+        prompt_idx=0,
+        canonical_sample_ids=["g_g0"],
+        logical_selections=[selection],
+        execution_row_multiple=4,
+    )
+    assert result.valid_row_count == 2 and result.meta.sample_ids == [
+        "g_g0_s0",
+        "g_g0_s1",
+        "g_pad0",
+        "g_pad1",
+    ]
+    fields = dict(dp.get_samples(result.meta.sample_ids, "train", result.meta.fields))
+    reassemble_packed_multimodal(fields, result.meta.tags)
+    assert fields["pixel_values"].logical_segment_counts_by_row() == [1, 1, 1, 1]
+    # Padding has a borrowed execution layout and zero loss; it owns no action.
+    assert fields["sample_mask"].tolist() == [1.0, 1.0, 0.0, 0.0]
+    assert (
+        fields["token_mask"][0].tolist()
+        == [0.0] * 4 + [1.0] * 2 + [0.0] * 3 + [1.0] * 2
+    )
+    assert fields["token_mask"][1].tolist() == [0.0] * 4 + [1.0] * 2
+    assert fields["imgs_sizes"].as_tensor().tolist()[:3] == [
+        [2, 3],
+        [3, 2],
+        [4, 2],
+    ]
+    pixels = fields["pixel_values"].as_tensor()
+    torch.testing.assert_close(pixels[:6], packed(a), rtol=0, atol=0)
+    torch.testing.assert_close(pixels[6:12], packed(b), rtol=0, atol=0)
+    if routes:
+        assert "routed_experts" in fields
+    assert dp.list_sample_ids("staging") == []
+
+
+def test_non_gym_adapter_selects_calls_without_defining_segments(dp):
+    """An independent harness exposes actions/reward, not Gym CC result types.
+
+    Shared capture wire records still come from the foundation staging package.
+    This exercises the adapter/finalizer contract, not another HTTP integration.
+    """
+    from nemo_rl.experience.rollout_reassembler import (
+        ActionOutputFlags,
+        RolloutSelection,
+    )
+
+    first, _ = stage(dp, engine_prompt([10, 11]), call_id="first")
+    discarded, _ = stage(dp, engine_prompt([12, 13]), call_id="discarded")
+    compacted, _ = stage(dp, engine_prompt([14]), call_id="compacted")
+    # A toy harness's native result; the RL adapter translates only selection.
+    episode = {"actions": [first.response_id, compacted.response_id], "score": 0.75}
+    selection = RolloutSelection(
+        tuple(episode["actions"]), (ActionOutputFlags(False, False),) * 2
+    )
+    result = finalizer(dp).finalize_group(
+        "g",
+        ["r0"],
+        [receipt(first, discarded, compacted)],
+        [episode["score"]],
+        mask_sample=[False],
+        fallback_weight_version=3,
+        prompt_idx=0,
+        canonical_sample_ids=["g_g0"],
+        logical_selections=[selection],
+    )
+    assert result.valid_row_count == 2
+    assert result.meta.sample_ids == ["g_g0_s0", "g_g0_s1"]
+    fields = dp.get_samples(result.meta.sample_ids, "train", result.meta.fields)
+    assert fields["input_ids"][0].tolist() == [10, 11, 31, 2]
+    assert fields["input_ids"][1].tolist() == [14, 31, 2]
+    assert fields["token_mask"][0].tolist() == [0.0, 0.0, 1.0, 1.0]
+    assert fields["token_mask"][1].tolist() == [0.0, 1.0, 1.0]
+    assert dp.list_sample_ids("staging") == []
+
+
+@pytest.mark.parametrize("routes", [False, True])
+@pytest.mark.parametrize("damage", ["geometry", "presence", "extras"])
+def test_cc_authenticates_media_layout_even_without_route_replay(dp, routes, damage):
+    from nemo_rl.data_plane.tq_token_sink import ROUTED_EXTRAS_METADATA_FIELD
+
+    root, _ = stage(
+        dp,
+        engine_prompt([10, 18, 18, 11], [(Span(1, 2), torch.ones(3, 2, 3))]),
+        routes=routes,
+    )
+    stored = dp._partitions["staging"].rows[root.staging_key]
+    if damage == "geometry":
+        stored[MEDIA_IMGS_SIZES_FIELD] = torch.tensor([[3, 2]], dtype=torch.int32)
+    elif damage == "presence":
+        stored[MEDIA_PRESENT_FIELD] = torch.tensor(False)
+    else:
+        stored[ROUTED_EXTRAS_METADATA_FIELD] = torch.tensor(
+            list(b"{}"), dtype=torch.uint8
+        )
+    # Routes may be captured even when learner replay is disabled.
+    row = finalizer(dp).finalize_rollout(
+        "r0", receipt(root), reward=1, context_compaction=True
+    )
+    assert not row.valid, damage
+    assert row.rejection_reason.startswith(
+        ("invalid_media_evidence:", "invalid_media_columns:", "invalid_staging_row:")
+    )
+    assert row.media is None
+    assert dp.list_sample_ids("staging") == [root.staging_key]
+
+
+@pytest.mark.parametrize(
+    "damage", ["missing", "output_span", "overlap", "token", "frames"]
+)
+def test_cc_rejects_invalid_committed_media_occurrences(dp, monkeypatch, damage):
+    extract = VLLMCaptureAdapter.extract_extras
+
+    def corrupt(self, payload):
+        extras = extract(self, payload)
+        item = extras[MEDIA_SPANS_FIELD][0]
+        if damage == "missing":
+            del extras[MEDIA_SPANS_FIELD]
+        elif damage == "output_span":
+            item["placeholder_offset"] = 4
+            item["embedding_spans"] = [[4, 2]]
+        elif damage == "overlap":
+            extras[MEDIA_SPANS_FIELD].append(dict(item))
+        elif damage == "token":
+            item["token_id"] = 19
+        else:
+            item["modality"] = "video"
+        return extras
+
+    monkeypatch.setattr(VLLMCaptureAdapter, "extract_extras", corrupt)
+    root, _ = stage(
+        dp, engine_prompt([10, 18, 18, 11], [(Span(1, 2), torch.ones(3, 2, 3))])
+    )
+    row = finalizer(dp).finalize_rollout(
+        "r0", receipt(root), reward=1, context_compaction=True
+    )
+    assert not row.valid
+    assert row.rejection_reason.startswith("invalid_media_evidence:")
+
+
+@pytest.mark.parametrize("reseal_metadata", [False, True])
+def test_worker_rejects_uncommitted_retained_offsets_before_splice(dp, reseal_metadata):
+    import hashlib
+
+    from nemo_rl.data_plane.tq_token_sink import ROUTED_EXTRAS_METADATA_FIELD
+
+    root, _ = stage(
+        dp, engine_prompt([10, 18, 18, 11], [(Span(1, 2), torch.ones(3, 2, 3))])
+    )
+    stored = dp._partitions["staging"].rows[root.staging_key]
+    stored[ROUTED_EXTRAS_METADATA_FIELD] = torch.tensor(list(b"{}"), dtype=torch.uint8)
+    if reseal_metadata:
+        # Pass the transport checksum to exercise the independent capture
+        # commitment; otherwise verify that the earlier checksum guard rejects.
+        stored[MEDIA_METADATA_DIGEST_FIELD] = torch.tensor(
+            list(hashlib.sha256(b"{}").digest()), dtype=torch.uint8
+        )
+    worker = SimpleNamespace(
+        _capture_media=True,
+        _capture_image_token_id=18,
+        _capture_patch_size=1,
+        _staging_source=TQTokenSource(
+            dp, staging_partition="staging", capture_media=True
+        ),
+    )
+    admission = CaptureAdmission(
+        rollout_id="r0",
+        model_call_id="c2",
+        mode="token_in",
+        parent_call_id=root.model_call_id,
+        prev_len=root.cum_len,
+        parent_chain_hash=root.chain_hash,
+        staging_chain=[root.staging_key],
+    )
+    expected = "extras commitment" if reseal_metadata else "metadata checksum mismatch"
+    with pytest.raises(ValueError, match=expected):
+        VllmAsyncGenerationWorkerImpl._capture_request_media(
+            worker,
+            engine_prompt(
+                [10, 18, 18, 11, 31, 2, 50], [(Span(1, 2), torch.ones(3, 2, 3))]
+            ),
+            admission=admission,
+            verify_retained_media=True,
+        )
+
+
+@pytest.mark.parametrize("damage", ["geometry", "presence", "extras"])
+def test_bad_media_masks_all_segments_of_owner_and_keeps_healthy_sibling(dp, damage):
+    from nemo_rl.data_plane.tq_token_sink import ROUTED_EXTRAS_METADATA_FIELD
+    from nemo_rl.experience.rollout_reassembler import (
+        ActionOutputFlags,
+        RolloutSelection,
+    )
+
+    def root(scope, call_id):
+        return stage(
+            dp,
+            engine_prompt([10, 18, 18, 11], [(Span(1, 2), torch.ones(3, 2, 3))]),
+            rollout_id=scope,
+            call_id=call_id,
+        )[0]
+
+    first, rewritten, healthy = (
+        root("r0", "c1"),
+        root("r0", "c2"),
+        root("r1", "healthy"),
+    )
+    stored = dp._partitions["staging"].rows[rewritten.staging_key]
+    if damage == "geometry":
+        stored[MEDIA_IMGS_SIZES_FIELD] = torch.tensor([[3, 2]], dtype=torch.int32)
+    elif damage == "presence":
+        stored[MEDIA_PRESENT_FIELD] = torch.tensor(False)
+    else:
+        stored[ROUTED_EXTRAS_METADATA_FIELD] = torch.tensor(
+            list(b"{}"), dtype=torch.uint8
+        )
+    result = finalizer(dp).finalize_group(
+        "g",
+        ["r0", "r1"],
+        [receipt(first, rewritten), receipt(healthy, rollout_id="r1")],
+        [1.0, 2.0],
+        mask_sample=[False, False],
+        fallback_weight_version=3,
+        prompt_idx=0,
+        canonical_sample_ids=["g_g0", "g_g1"],
+        execution_row_multiple=4,
+        logical_selections=[
+            RolloutSelection(
+                tuple(record.response_id for record in records),
+                (ActionOutputFlags(False, False),) * len(records),
+            )
+            for records in ((first, rewritten), (healthy,))
+        ],
+    )
+    assert result.valid_row_count == 1
+    assert result.meta.sample_ids == ["g_g0_s0", "g_g0_s1", "g_g1_s0", "g_pad0"]
+    fields = dp.get_samples(result.meta.sample_ids, "train", result.meta.fields)
+    assert fields["sample_mask"].tolist() == [0, 0, 1, 0]
+    assert [int(mask.sum()) for mask in fields["token_mask"].unbind()] == [0, 0, 2, 0]
+    assert result.canonical_output_tokens == 2
+    assert not dp.list_sample_ids("staging")
+
+
+def test_cc_rejects_shape_valid_video_frame_partition_change(dp):
+    root, _ = stage(
+        dp,
+        video_prompt(
+            [18, 18, 18, 18],
+            [
+                (Span(0, 4), torch.ones(4, 3, 2, 2)),
+            ],
+        ),
+    )
+    stored = dp._partitions["staging"].rows[root.staging_key]
+    stored[MEDIA_NUM_FRAMES_FIELD] = torch.tensor([2, 2], dtype=torch.int32)
+    row = finalizer(dp).finalize_rollout(
+        "r0", receipt(root), reward=1, context_compaction=True
+    )
+    assert not row.valid
+    assert "frame counts disagree" in row.rejection_reason

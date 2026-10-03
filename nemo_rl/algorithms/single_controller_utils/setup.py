@@ -66,6 +66,7 @@ from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
 from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     algo_config,
+    cc_execution_row_multiple,
     is_ppo_run,
     validate_single_controller_config,
 )
@@ -326,7 +327,9 @@ def _register_single_controller_partitions(
         from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
 
         partition_fields = fields_with_optional_routed_experts(
-            DP_TRAIN_FIELDS,
+            SC_ROLLOUT_SCHEMA_FIELDS
+            if token_capture_cfg.context_compaction
+            else DP_TRAIN_FIELDS,
             enabled=r3_enabled and not token_capture_cfg.defer_routed_experts_to_policy,
         )
     if include_multimodal_fields:
@@ -1332,6 +1335,8 @@ def setup_single_controller(
     # ==========================
     checkpointer = CheckpointManager(master_config.checkpointing)
     trainer_checkpoint_path = checkpointer.get_latest_checkpoint_path()
+    if token_capture_cfg.context_compaction and trainer_checkpoint_path is not None:
+        raise ValueError("CC checkpoint/resume is not supported initially")
     loaded_state = cast(
         Optional[dict[str, Any]],
         checkpointer.load_training_info(trainer_checkpoint_path),
@@ -2033,6 +2038,25 @@ def setup_single_controller(
             env_s=master_config.async_rl.rollout_failure.native.env_timeout_s,
         ),
         retry_policy=_build_retry_policy(master_config),
+        context_compaction=token_capture_cfg.context_compaction,
+        execution_row_multiple=(
+            cc_execution_row_multiple(
+                trainer.cfg,
+                dp_size=trainer.sharding_annotations.get_axis_size("data_parallel"),
+                logprobs_required=(
+                    not (
+                        master_config.loss_fn.force_on_policy_ratio
+                        and algo_cfg.seq_logprob_error_threshold is None
+                    )
+                    or (
+                        master_config.loss_fn.reference_policy_kl_penalty > 0
+                        and not algo_cfg.skip_reference_policy_logprobs_calculation
+                    )
+                ),
+            )
+            if token_capture_cfg.context_compaction
+            else 1
+        ),
         effort_config=_get_effort_config(cast(GRPOMasterConfig, master_config)),
     )
 

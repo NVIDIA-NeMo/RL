@@ -22,7 +22,7 @@ import uuid
 import warnings
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
+from typing import Literal, TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 
 import ray
 import torch
@@ -34,6 +34,8 @@ from nemo_rl.data.captured_media import (
     CapturedMediaItem,
     MediaCaptureRejected,
     capture_processed_media,
+    verified_media_items,
+    verify_media_geometry,
 )
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
 from nemo_rl.data_plane.tq_token_sink import MediaMetadataIntegrityError
@@ -66,6 +68,7 @@ from nemo_rl.models.generation.vllm.utils import (
     pad_and_align_routed_expert_indices,
 )
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
+from nemo_rl.models.generation.capture_context import decide_capture_input
 from nemo_rl.models.generation.openai_server_utils import (
     PrefixSplice,
     splice_prefix_tokens,
@@ -647,7 +650,7 @@ class VllmAsyncGenerationWorkerImpl(
         ``prev_len``; violations raise ``CaptureError`` before any state is kept.
         """
         capture = self.token_capture
-        if capture is None:
+        if capture is None or getattr(request, "ng_measure_only", False):
             return
         if admission is None:
             admission = self._capture_admission(request)
@@ -668,6 +671,7 @@ class VllmAsyncGenerationWorkerImpl(
         *,
         admission: Any | None,
         splice: PrefixSplice | None = None,
+        verify_retained_media: bool = False,
     ) -> CapturedMedia | None:
         """Run off-loop: resolve retained geometry and snapshot processed pixels."""
         if admission is None:
@@ -679,6 +683,7 @@ class VllmAsyncGenerationWorkerImpl(
                 )
             return None
         retained: tuple[CapturedMediaItem, ...] = ()
+        retained_tensors = () if verify_retained_media else None
         if admission.parent_call_id is not None:
             # Optional Gym dependency: this method only runs on captured calls.
             # Gym owns the media_spans key its adapter copies into the extras.
@@ -692,7 +697,8 @@ class VllmAsyncGenerationWorkerImpl(
             try:
                 if admission.staging_chain:
                     calls = source.fetch_for_finalization(
-                        list(admission.staging_chain), include_route_fragments=False
+                        list(admission.staging_chain),
+                        include_route_fragments=verify_retained_media,
                     )
                 else:
                     # Inline token admissions still have receipt-owned parent keys.
@@ -704,7 +710,7 @@ class VllmAsyncGenerationWorkerImpl(
                         visited.add(parent)
                         call = source.fetch_for_finalization(
                             [staging_key(admission.rollout_id, parent)],
-                            include_route_fragments=False,
+                            include_route_fragments=verify_retained_media,
                         )[0]
                         calls.append(call)
                         parent = call.snapshot.parent_call_id
@@ -737,18 +743,35 @@ class VllmAsyncGenerationWorkerImpl(
                 raise MediaCaptureRejected(
                     "Retained image chain does not match capture admission"
                 )
-            retained_items = []
+            descriptors = {}
             for call in calls:
-                extras = call.extras or {}
-                if MEDIA_SPANS_FIELD not in extras:
-                    raise MediaCaptureRejected("Retained vLLM media spans are missing")
-                for value in extras[MEDIA_SPANS_FIELD]:
-                    item = CapturedMediaItem.from_dict(value)
-                    item.verify_tokens(
-                        call.snapshot.token_ids_delta, origin=call.snapshot.prev_len
+                if verify_retained_media:
+                    items = verified_media_items(call)
+                else:
+                    extras = call.extras or {}
+                    if MEDIA_SPANS_FIELD not in extras:
+                        raise MediaCaptureRejected(
+                            "Retained vLLM media spans are missing"
+                        )
+                    items = tuple(
+                        CapturedMediaItem.from_dict(value)
+                        for value in extras[MEDIA_SPANS_FIELD]
                     )
-                    retained_items.append(item)
-            retained = tuple(retained_items)
+                    for item in items:
+                        item.verify_tokens(
+                            call.snapshot.token_ids_delta, origin=call.snapshot.prev_len
+                        )
+                descriptors[call.snapshot.model_call_id] = items
+            retained = tuple(item for items in descriptors.values() for item in items)
+            if verify_retained_media:
+                media_calls = [call for call in calls if call.media_present]
+                retained_tensors = (
+                    tuple(source.fetch_media(media_calls)) if media_calls else ()
+                )
+                for call, tensors in zip(media_calls, retained_tensors, strict=True):
+                    verify_media_geometry(
+                        descriptors[call.snapshot.model_call_id], tensors
+                    )
         return capture_processed_media(
             engine_prompt,
             prev_len=admission.prev_len,
@@ -756,6 +779,7 @@ class VllmAsyncGenerationWorkerImpl(
             splice=splice,
             image_token_id=self._capture_image_token_id,
             patch_size=self._capture_patch_size,
+            retained_tensors=retained_tensors,
         )
 
     def _fetch_chain_prefix(self, staging_chain: list[str]) -> list[int]:
@@ -791,6 +815,7 @@ class VllmAsyncGenerationWorkerImpl(
             return
         choice = dict(choices[0])
         message = dict(choice.get("message") or {})
+        message.pop("predecessor_tail_route", None)
         routed = message.get("routed_experts")
         if routed is None:
             return
@@ -819,6 +844,10 @@ class VllmAsyncGenerationWorkerImpl(
                     f"length {expected_full_len}"
                 )
             message["routed_experts"] = encode_routed_experts(experts[prev_len:])
+            if prev_len:
+                # The previous generation's final token gets its decode route
+                # when this continuation processes it as a prompt token.
+                message["predecessor_tail_route"] = experts[prev_len - 1].tolist()
         except (IndexError, TypeError, ValueError) as error:
             LOGGER.warning(
                 "dropping invalid routed_experts from staged capture: %s", error
@@ -880,6 +909,7 @@ class VllmAsyncGenerationWorkerImpl(
                     "generation_token_ids",
                     "generation_log_probs",
                     "routed_experts",
+                    "predecessor_tail_route",
                 ):
                     message.pop(field, None)
         content["ng_commit_coords"] = coords.model_dump()
@@ -923,6 +953,7 @@ class VllmAsyncGenerationWorkerImpl(
             ServingTokenization,
         )
         from vllm.renderers.online_renderer import OnlineRenderer
+        from vllm.renderers.hf import HfRenderer
         from vllm.exceptions import VLLMValidationError
         from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
         from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
@@ -1079,10 +1110,35 @@ class VllmAsyncGenerationWorkerImpl(
                 # prefix to the request, so the inline-prefix branch below is
                 # the single splice path for staged and inline prefixes.
                 admission = worker_self._capture_admission(request)
+                serving_admission = admission
+                verify_retained_media = False
+                if admission is not None and admission.mode == "candidate":
+                    # Inline assistant token fields cannot override RL's decision.
+                    request.required_prefix_token_ids = None
+                    decision = decide_capture_input(
+                        admission,
+                        messages=messages_for_replace_prefix_tokens,
+                        # HF/string parsing maps null and empty tool content to
+                        # identical template inputs. Structured content and
+                        # other renderers retain the strict source comparison.
+                        allow_empty_tool_content=(
+                            type(self.renderer) is HfRenderer
+                            and bool(res[0])
+                            and all(
+                                isinstance(item.get("content"), str) for item in res[0]
+                            )
+                        ),
+                    )
+                    admission = decision.storage
+                    serving_admission = decision.serving
+                    verify_retained_media = decision.verify_retained_media
                 capture_prefix_token_ids: list[int] | None = None
-                if admission is not None and admission.mode == "token_in":
+                if (
+                    serving_admission is not None
+                    and serving_admission.mode == "token_in"
+                ):
                     capture_prefix_token_ids = await asyncio.to_thread(
-                        worker_self._resolve_admission_prefix, admission
+                        worker_self._resolve_admission_prefix, serving_admission
                     )
                     worker_self._enter_request_prefix(request, capture_prefix_token_ids)
 
@@ -1103,6 +1159,7 @@ class VllmAsyncGenerationWorkerImpl(
                         worker_self._capture_request_media,
                         res[1][0],
                         admission=admission,
+                        verify_retained_media=verify_retained_media,
                     )
                     worker_self._begin_request_capture(
                         request,
@@ -1162,8 +1219,9 @@ class VllmAsyncGenerationWorkerImpl(
                 media = await asyncio.to_thread(
                     worker_self._capture_request_media,
                     engine_prompt,
-                    admission=admission,
+                    admission=serving_admission,
                     splice=splice,
+                    verify_retained_media=verify_retained_media,
                 )
                 engine_prompt["prompt_token_ids"] = final_prompt_token_ids
 
@@ -1182,7 +1240,11 @@ class VllmAsyncGenerationWorkerImpl(
                     request,
                     final_prompt_token_ids,
                     admission=admission,
-                    prefix_token_ids=capture_prefix_token_ids,
+                    prefix_token_ids=(
+                        capture_prefix_token_ids
+                        if admission is not None and admission.mode == "token_in"
+                        else None
+                    ),
                     media=media,
                 )
 
@@ -1468,6 +1530,8 @@ class VllmAsyncGenerationWorkerImpl(
             NeMoRLOpenAIChatRequestMixin, TokenizeChatRequest
         ):
             required_prefix_token_ids: Optional[List[int]] = None
+            ng_capture: Optional[dict[str, Any]] = None
+            ng_measure_only: Literal[True] = True
 
         NeMoRLTokenizeRequest = Union[
             TokenizeCompletionRequest, NeMoRLTokenizeChatRequest
@@ -1506,6 +1570,16 @@ class VllmAsyncGenerationWorkerImpl(
                     content=generator.model_dump(), status_code=generator.error.code
                 )
             elif isinstance(generator, TokenizeResponse):
+                if (
+                    isinstance(request, NeMoRLTokenizeChatRequest)
+                    and request.ng_capture is not None
+                ):
+                    return JSONResponse(
+                        content={
+                            "prompt_token_count": generator.count,
+                            "ng_context_measured": True,
+                        }
+                    )
                 return JSONResponse(content=generator.model_dump())
 
         ########################################
