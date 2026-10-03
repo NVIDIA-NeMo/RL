@@ -22,7 +22,7 @@ import statistics
 import uuid
 import warnings
 from collections import defaultdict
-from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
+from collections.abc import AsyncGenerator, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -59,11 +59,13 @@ from nemo_rl.environments.interfaces import (
 )
 from nemo_rl.environments.nemo_gym import (
     DEFAULT_THINKING_TAGS,
+    GYM_INFRA_FAILURE_KEY,
     NemoGymShardSet,
     as_nemo_gym_shard_set,
     get_nemo_gym_route_name,
     get_pad_dynamic_image_shapes,
 )
+from nemo_rl.experience.failures import GymTransportError
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
@@ -1843,7 +1845,9 @@ class _NemoGymStreamAccumulator:
 
     NeMo Gym returns rows in completion order. This accumulator owns all ordering
     and completeness rules so the rollout loop only needs to postprocess completed
-    groups.
+    groups. It also keeps the per-row budget of infrastructure attempts: a row
+    whose ``/run`` failed at the transport level may be dispatched again, as a
+    fresh session, up to ``max_infra_attempts`` times in total.
     """
 
     def __init__(
@@ -1851,24 +1855,32 @@ class _NemoGymStreamAccumulator:
         rows: list[dict],
         num_generations: int,
         allow_mixed_agents: bool,
+        max_infra_attempts: int = 1,
     ) -> None:
+        if max_infra_attempts < 1:
+            raise ValueError(
+                f"max_infra_attempts must be at least 1, got {max_infra_attempts}"
+            )
         self._rows = rows
         self._num_generations = num_generations
         self._allow_mixed_agents = allow_mixed_agents
+        self._max_infra_attempts = max_infra_attempts
         self._received_row_indices: set[int] = set()
         self._pending_results: dict[int, dict[int, dict]] = defaultdict(dict)
+        # Row index -> number of infrastructure failures recorded for it so far.
+        self._infra_failures: dict[int, int] = defaultdict(int)
 
     @property
     def is_complete(self) -> bool:
         return len(self._received_row_indices) == len(self._rows)
 
-    def add(
-        self,
-        row_index: int,
-        result: dict,
-        resolved_agent_ref: dict,
-    ) -> _CompletedNemoGymGroup | None:
-        """Add one streamed row and return its group when that group is complete."""
+    @property
+    def infra_redispatches(self) -> int:
+        """How many times a row was dispatched again after an infrastructure failure."""
+        return sum(self._infra_failures.values())
+
+    def _check_row_index(self, row_index: int) -> None:
+        """Reject a row index the stream must never produce."""
         if not isinstance(row_index, int):
             raise TypeError(
                 f"NeMo-Gym row index must be an int, got {type(row_index).__name__}"
@@ -1878,6 +1890,37 @@ class _NemoGymStreamAccumulator:
                 f"NeMo-Gym returned row index {row_index} outside the expected "
                 f"range [0, {len(self._rows)})"
             )
+
+    def record_infra_failure(self, row_index: int, detail: str) -> dict:
+        """Account one infrastructure failure of a row and return the row to dispatch again.
+
+        The first failure is the row's first attempt gone wrong; with
+        ``max_infra_attempts`` of N, the row is returned for re-dispatch after each of
+        its first N-1 failures and the Nth failure raises ``GymTransportError``
+        carrying ``detail``, so the step fails the way an unretried failure does.
+        """
+        self._check_row_index(row_index)
+        if row_index in self._received_row_indices:
+            raise ValueError(
+                f"NeMo-Gym reported a failure for row index {row_index} after its result"
+            )
+        failures = self._infra_failures[row_index] + 1
+        if failures >= self._max_infra_attempts:
+            raise GymTransportError(
+                f"NeMo-Gym row {row_index} failed at the infrastructure level on all "
+                f"{failures} attempt(s): {detail}"
+            )
+        self._infra_failures[row_index] = failures
+        return self._rows[row_index]
+
+    def add(
+        self,
+        row_index: int,
+        result: dict,
+        resolved_agent_ref: dict,
+    ) -> _CompletedNemoGymGroup | None:
+        """Add one streamed row and return its group when that group is complete."""
+        self._check_row_index(row_index)
         if row_index in self._received_row_indices:
             raise ValueError(f"NeMo-Gym returned duplicate row index {row_index}")
 
@@ -1936,6 +1979,56 @@ def get_nemo_gym_thinking_tags(env_config: dict[str, Any]) -> list[str]:
     if isinstance(nemo_gym_config, dict) and nemo_gym_config.get("thinking_tags"):
         return list(nemo_gym_config["thinking_tags"])
     return list(DEFAULT_THINKING_TAGS)
+
+
+# A row is dispatched once and never again after an infrastructure failure unless
+# env.nemo_gym.max_infra_attempts_per_rollout raises the budget.
+DEFAULT_MAX_INFRA_ATTEMPTS_PER_ROLLOUT = 1
+
+
+def get_nemo_gym_max_infra_attempts(env_config: dict[str, Any]) -> int:
+    """How many times one row may be dispatched before an infrastructure failure ends the step.
+
+    Reads ``env.nemo_gym.max_infra_attempts_per_rollout``; an absent or null key
+    means ``DEFAULT_MAX_INFRA_ATTEMPTS_PER_ROLLOUT``. The value must be at least 1.
+
+    This budget governs the driver path (``run_async_nemo_gym_rollout``) only.
+    The asynchronous collector re-dispatches a failure-marker row through its
+    own attempt loop, budgeted by ``rollout_manager.RolloutRetryPolicy``'s
+    ``max_gym_row_attempts``, and whole-attempt failures there are budgeted by
+    its ``max_attempts_per_prompt``; the three are deliberately separate knobs.
+    """
+    nemo_gym_config = env_config.get("nemo_gym")
+    value = (
+        nemo_gym_config.get("max_infra_attempts_per_rollout")
+        if isinstance(nemo_gym_config, dict)
+        else None
+    )
+    if value is None:
+        return DEFAULT_MAX_INFRA_ATTEMPTS_PER_ROLLOUT
+    attempts = int(value)
+    if attempts < 1:
+        raise ValueError(
+            f"env.nemo_gym.max_infra_attempts_per_rollout must be at least 1, got {value}"
+        )
+    return attempts
+
+
+async def _nemo_gym_rollout_config(nemo_gym_environment: Any) -> dict[str, Any]:
+    """Fetch the ``env.nemo_gym`` keys the rollout loop reads from the Gym actors.
+
+    ``_build_gym_actor_config`` keeps those keys (``DRIVER_ROLLOUT_KEYS`` in
+    ``nemo_rl.environments.nemo_gym``) as top-level fields of every actor's
+    configuration and out of Gym's global configuration, and an actor hands
+    them back through ``rollout_config``. The environment is unwrapped through
+    ``as_nemo_gym_shard_set`` and one actor is asked: every shard is built from
+    the same env mapping, so the driver keys agree across the set. The mapping
+    is returned in the ``master_config.env`` layout the ``get_nemo_gym_*``
+    readers take, so every caller of the rollout function, synchronous or not,
+    applies the same configured values without forwarding them.
+    """
+    handle = as_nemo_gym_shard_set(nemo_gym_environment).all_handles[0]
+    return {"nemo_gym": dict(await handle.rollout_config.remote())}
 
 
 def should_mask_flagged_samples(env_config: dict[str, Any]) -> bool:
@@ -2477,6 +2570,9 @@ async def _merge_nemo_gym_instance_streams(
     timer_prefix: str,
     deduplicate_multimodal_data: bool = False,
     debug_payload_metrics: bool = False,
+    *,
+    shard_set: Optional[NemoGymShardSet] = None,
+    record_infra_failure: Optional[Callable[[int, str], dict]] = None,
 ) -> AsyncGenerator[tuple[int, dict, dict, dict | None, str], None]:
     """Interleave K actor streams into one, yielding rows as they complete.
 
@@ -2485,13 +2581,22 @@ async def _merge_nemo_gym_instance_streams(
     accumulator that already exists. With a single bucket it degenerates to
     that one stream, which is what keeps the unsharded path unchanged.
 
+    With ``record_infra_failure`` set, a failure-marker row
+    (``GYM_INFRA_FAILURE_KEY``) is not yielded: the accounted row is dispatched
+    again as a fresh single-row stream on the instance ``shard_set.pick_handle``
+    chooses for its route, and ``record_infra_failure`` raises once the row's
+    attempts are used up. Re-dispatch needs ``shard_set``.
+
     Yields:
         ``(row_index, resolved_agent_ref, result, timing_metrics, instance_label)``.
-        ``timing_metrics`` is non-None only on the last row of each bucket.
+        ``timing_metrics`` is non-None only on the last row of each stream.
     """
-    iterators = {}
-    streams_by_iterator = {}
-    for instance_label, handle, rows in buckets:
+    iterators: dict[Any, str] = {}
+    streams_by_iterator: dict[Any, Any] = {}
+    active_iterators: set[Any] = set()
+    pending: dict[asyncio.Task, Any] = {}
+
+    def _start_stream(instance_label: str, handle: Any, rows: list[dict]) -> None:
         ray_arguments = (
             rows,
             timer_prefix,
@@ -2513,11 +2618,12 @@ async def _merge_nemo_gym_instance_streams(
         iterator = stream.__aiter__()
         iterators[iterator] = instance_label
         streams_by_iterator[iterator] = stream
+        active_iterators.add(iterator)
+        pending[asyncio.ensure_future(anext(iterator))] = iterator
 
-    pending = {
-        asyncio.ensure_future(anext(iterator)): iterator for iterator in iterators
-    }
-    active_iterators = set(iterators)
+    for instance_label, handle, rows in buckets:
+        _start_stream(instance_label, handle, rows)
+
     first_failure: tuple[str, Exception] | None = None
     try:
         while pending:
@@ -2543,6 +2649,24 @@ async def _merge_nemo_gym_instance_streams(
                         enabled=debug_payload_metrics,
                     )
                 )
+                if record_infra_failure is not None and GYM_INFRA_FAILURE_KEY in result:
+                    # Raises GymTransportError once the row's attempts are used up.
+                    row = record_infra_failure(row_index, result[GYM_INFRA_FAILURE_KEY])
+                    print(
+                        f"NeMo-Gym row {row_index} failed at the infrastructure "
+                        f"level; dispatching it again as a fresh session: "
+                        f"{result[GYM_INFRA_FAILURE_KEY]}",
+                        flush=True,
+                    )
+                    assert shard_set is not None, (
+                        "record_infra_failure requires the shard_set to re-dispatch"
+                    )
+                    retry_handle = shard_set.pick_handle(get_nemo_gym_route_name(row))
+                    _start_stream(
+                        shard_set.instance_label(retry_handle), retry_handle, [row]
+                    )
+                    pending[asyncio.ensure_future(anext(iterator))] = iterator
+                    continue
                 yield (
                     row_index,
                     resolved_agent_ref,
@@ -2638,6 +2762,7 @@ async def run_async_nemo_gym_rollout(
     deduplicate_multimodal_data: bool = False,
     debug_payload_metrics: bool = False,
     identity_num_generations: Optional[int] = None,
+    max_infra_attempts_per_rollout: Optional[int] = None,
 ) -> AsyncGenerator[NemoGymRolloutResult, None]:
     """Stream complete NeMo-Gym prompt groups in group-completion order.
 
@@ -2645,6 +2770,13 @@ async def run_async_nemo_gym_rollout(
     validated and restored to input order within each ``num_generations`` group
     before the group is postprocessed and yielded. Synchronous call sites should
     use :func:`run_nemo_gym_rollout_sync`.
+
+    A row whose ``/run`` failed at the infrastructure level arrives as a failure
+    marker (``GYM_INFRA_FAILURE_KEY``) and is dispatched again as a fresh session
+    while the other rows keep running, until it has used
+    ``max_infra_attempts_per_rollout`` attempts; then the same error ends the
+    rollout. Data failures (a 4xx that describes the request) are raised by the
+    actor and end the rollout at once.
 
     Args:
         policy_generation: Generation interface whose configuration supplies the
@@ -2683,11 +2815,15 @@ async def run_async_nemo_gym_rollout(
             prompt-group identity. Defaults to ``num_generations``. Synchronous
             callers set this independently because they collect the full batch as
             one result while preserving per-prompt GenRM cohort identities.
+        max_infra_attempts_per_rollout: Total dispatches one row may use before
+            an infrastructure failure ends the rollout; 1 disables re-dispatch.
+            None applies the configured ``env.nemo_gym.max_infra_attempts_per_rollout``.
 
     Yields:
         ``NemoGymRolloutResult`` objects in prompt-group completion order. Rows
         inside each result are restored to input order. The final result also
-        carries actor-wide and rollout-wide timing metrics.
+        carries actor-wide and rollout-wide timing metrics and, when a row was
+        dispatched again, the ``nemo_gym_infra_redispatches`` count.
 
     Raises:
         AssertionError: If an unsupported generation option is requested.
@@ -2700,6 +2836,7 @@ async def run_async_nemo_gym_rollout(
             indices disagree.
         RuntimeError: If the actor fails, returns NaN generation logprobs, ends the
             stream before all expected rows arrive, or produces no final group.
+        GymTransportError: If a row exhausts its infrastructure attempts.
     """
     # We accept max_seq_len for API parity with the other rollout paths, but NeMo-Gym
     # still relies on the underlying model server's configured context/window limits.
@@ -2782,6 +2919,16 @@ async def run_async_nemo_gym_rollout(
     total_timer_label = f"{timer_prefix}/total"
     run_rollouts_timer_label = f"{timer_prefix}/run_rollouts"
 
+    shard_set = as_nemo_gym_shard_set(task_to_env["nemo_gym"])
+    # The dispatch budget comes from the environment's own configuration unless
+    # the caller passes it, so every caller of this function (synchronous GRPO,
+    # the asynchronous collector, PPO, distillation) applies the same configured
+    # value.
+    if max_infra_attempts_per_rollout is None:
+        max_infra_attempts_per_rollout = get_nemo_gym_max_infra_attempts(
+            await _nemo_gym_rollout_config(shard_set)
+        )
+
     with timer.time(total_timer_label):
         _prepare_nemo_gym_rows(
             nemo_gym_rows,
@@ -2793,10 +2940,10 @@ async def run_async_nemo_gym_rollout(
             rows=nemo_gym_rows,
             num_generations=num_generations,
             allow_mixed_agents=returns_entire_batch,
+            max_infra_attempts=max_infra_attempts_per_rollout,
         )
         final_rollout_result: NemoGymRolloutResult | None = None
         actor_timing_by_instance: dict[str, dict[str, Any]] = {}
-        shard_set = as_nemo_gym_shard_set(task_to_env["nemo_gym"])
         with timer.time(run_rollouts_timer_label):
             buckets = _bucket_nemo_gym_rows_by_instance(
                 nemo_gym_rows, shard_set, routing_group_size
@@ -2806,6 +2953,8 @@ async def run_async_nemo_gym_rollout(
                 timer_prefix,
                 deduplicate_multimodal_data,
                 debug_payload_metrics,
+                shard_set=shard_set,
+                record_infra_failure=accumulator.record_infra_failure,
             )
     while True:
         stream_finished = False
@@ -2875,6 +3024,10 @@ async def run_async_nemo_gym_rollout(
     final_rollout_result.rollout_metrics.update(
         _merge_nemo_gym_timing_metrics(actor_timing_by_instance, timer_prefix)
     )
+    if accumulator.infra_redispatches:
+        final_rollout_result.rollout_metrics["nemo_gym_infra_redispatches"] = (
+            accumulator.infra_redispatches
+        )
     final_rollout_result.rollout_metrics.update(timer.get_timing_metrics("sum"))
     yield final_rollout_result
 
@@ -2898,6 +3051,7 @@ def run_nemo_gym_rollout_sync(
     mask_env_flagged_samples: bool = True,
     deduplicate_multimodal_data: bool = False,
     debug_payload_metrics: bool = False,
+    max_infra_attempts_per_rollout: Optional[int] = None,
 ) -> NemoGymRolloutResult:
     """Run and return one complete NeMo-Gym batch synchronously.
 
@@ -2934,6 +3088,9 @@ def run_nemo_gym_rollout_sync(
         deduplicate_multimodal_data: Omit initial policy-ready media from the
             remote Gym return and restore it from the input batch.
         debug_payload_metrics: Emit exact Gym Ray-boundary media payload metrics.
+        max_infra_attempts_per_rollout: Total dispatches one row may use before
+            an infrastructure failure ends the rollout; 1 disables re-dispatch.
+            None applies the configured ``env.nemo_gym.max_infra_attempts_per_rollout``.
 
     Returns:
         The fully postprocessed NeMo-Gym rollout batch in input-row order.
@@ -2971,6 +3128,7 @@ def run_nemo_gym_rollout_sync(
             sampling_params=sampling_params,
             deduplicate_multimodal_data=deduplicate_multimodal_data,
             debug_payload_metrics=debug_payload_metrics,
+            max_infra_attempts_per_rollout=max_infra_attempts_per_rollout,
         ):
             pass
         if rollout_result is None:

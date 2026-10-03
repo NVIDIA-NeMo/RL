@@ -239,8 +239,21 @@ class TestTheRayActorBoundary:
             headers=headers,
         )
 
+    @staticmethod
+    def _failure_row(status, exc: BaseException) -> dict:
+        """The row Gym's rollout collector returns for a failed /run when
+        route_failures_to_sidecar is enabled."""
+        return {
+            "_ng_failure_class": "agent_run_error",
+            "_ng_failure_type": type(exc).__name__,
+            "_ng_failure_message": str(exc),
+            "_ng_failure_http_status": status,
+            "_ng_failure_response_body": None,
+        }
+
     def test_the_realistic_error_cannot_survive_pickling(self):
-        """The premise of the fix. If this ever passes, _typed_gym_failure is dead weight."""
+        """The premise: the exception itself cannot cross the actor boundary, so the
+        actor asks Gym for a failure row and classifies that instead."""
         with pytest.raises(Exception):
             ray_cloudpickle.dumps(self._realistic_response_error(503))
 
@@ -260,25 +273,30 @@ class TestTheRayActorBoundary:
             (404, FailureClass.DATA),
         ],
     )
-    def test_what_nemo_gym_raises_survives_the_boundary_and_still_classifies(
+    def test_what_nemo_gym_reports_survives_the_boundary_and_still_classifies(
         self, status, expected
     ):
-        typed = _typed_gym_failure(self._realistic_response_error(status))
-        assert typed is not None, f"HTTP {status} should have been classified at source"
+        typed = _typed_gym_failure(
+            self._failure_row(status, self._realistic_response_error(status))
+        )
         # The boundary itself.
         restored = ray_cloudpickle.loads(ray_cloudpickle.dumps(typed))
         assert classify_rollout_failure(restored) is expected
         assert str(status) in str(restored), "the status must survive for the operator"
 
-    def test_an_exception_without_a_status_is_left_untouched(self):
-        """No status means no HTTP verdict to make; the caller re-raises as-is."""
-        assert _typed_gym_failure(RuntimeError("not an HTTP failure")) is None
+    def test_a_failure_row_without_a_status_is_a_transport_failure(self):
+        """No status means no reply arrived: a connection failure or a timeout."""
+        typed = _typed_gym_failure(self._failure_row(None, TimeoutError("no reply")))
+        assert isinstance(typed, GymTransportError)
+        assert "TimeoutError" in str(typed) and "no reply" in str(typed)
 
     def test_both_sides_of_the_boundary_share_one_status_policy(self):
         """nemo_gym classifies at source, failures.py on the driver -- one rule, not two."""
         for status in (400, 404, 408, 429, 500, 503):
             at_source = isinstance(
-                _typed_gym_failure(self._realistic_response_error(status)),
+                _typed_gym_failure(
+                    self._failure_row(status, self._realistic_response_error(status))
+                ),
                 GymTransportError,
             )
             assert at_source is http_status_is_infra(status)

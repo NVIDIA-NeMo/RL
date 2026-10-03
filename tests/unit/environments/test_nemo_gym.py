@@ -40,6 +40,7 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
 from nemo_rl.environments.nemo_gym import (
+    GYM_INFRA_FAILURE_KEY,
     NemoGym,
     NemoGymConfig,
     build_reward_component_columns,
@@ -93,7 +94,7 @@ def test_rollout_progress_counter_is_built_after_gym_resolves_task_source(
         ]
 
         class _RolloutCollectionHelper:
-            def run_examples(self, examples, head_server_config):
+            def run_examples(self, examples, head_server_config, **_):
                 del head_server_config
                 for row in examples:
                     row["agent_ref"] = {"name": "resolved_agent"}
@@ -1650,7 +1651,7 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
         postprocess_calls = []
 
         class _RolloutCollectionHelper:
-            def run_examples(self, examples, head_server_config):
+            def run_examples(self, examples, head_server_config, **_):
                 del head_server_config
                 content = examples[0]["responses_create_params"]["input"][0]["content"]
                 assert content[0]["video_url"].startswith("data:video/mp4;base64,")
@@ -1747,7 +1748,7 @@ def test_nemo_gym_megatron_multimodal_response_round_trip(tmp_path, modality):
                 return [" ".join(map(str, token_ids)) for token_ids in batches]
 
         class _RolloutCollectionHelper:
-            def run_examples(self, examples, head_server_config):
+            def run_examples(self, examples, head_server_config, **_):
                 assert head_server_config.backend == "megatron"
                 dispatched_row = examples[0]
                 dispatched_part = dispatched_row["responses_create_params"]["input"][0][
@@ -1822,6 +1823,134 @@ def test_nemo_gym_megatron_multimodal_response_round_trip(tmp_path, modality):
         assert result["full_result"]["response"]["output"][0]["generation_str"] == (
             "71 72"
         )
+
+    asyncio.run(_run())
+
+
+def test_nemo_gym_run_rollouts_yields_infra_failure_rows_and_raises_data_failures():
+    """A /run that failed comes back from Gym's collector as a failure row. One
+    the server could not serve (5xx, no reply) is yielded as an infra failure
+    marker so the driver can dispatch the row again; one the server refused
+    (a 4xx describing the request) ends the batch with RolloutDataFailure."""
+    from nemo_rl.experience.failures import RolloutDataFailure
+
+    def failure_row(status):
+        return {
+            "_ng_failure_class": "agent_run_error",
+            "_ng_failure_type": "ClientResponseError",
+            "_ng_failure_message": f"synthetic {status}",
+            "_ng_failure_http_status": status,
+            "_ng_failure_response_body": "body",
+        }
+
+    class _RolloutCollectionHelper:
+        def __init__(self, row):
+            self.row = row
+
+        def run_examples(self, examples, head_server_config, route_failures_to_sidecar):
+            del head_server_config
+            assert route_failures_to_sidecar is True
+
+            async def _completed():
+                return examples[0], self.row
+
+            return [_completed()]
+
+    class _MockSelf:
+        cfg = {}
+        head_server_config = object()
+        _token_capture_enabled = False
+
+        def _require_spinup(self):
+            pass
+
+        def _postprocess_nemo_gym_to_nemo_rl_result(self, *args, **kwargs):
+            raise AssertionError("a failure row must never be postprocessed")
+
+    stream_rollouts = NemoGym.__ray_metadata__.modified_class._stream_rollouts
+    rows = [
+        {
+            "_rowidx": 3,
+            "agent_ref": {"name": "agent"},
+            "responses_create_params": {"input": []},
+        }
+    ]
+
+    async def _run():
+        mock_self = _MockSelf()
+        mock_self._tokenizer = object()
+        mock_self.rch = _RolloutCollectionHelper(failure_row(503))
+        streamed = [item async for item in stream_rollouts(mock_self, rows, "test")]
+        assert len(streamed) == 1
+        rowidx, agent_ref, result, timing = streamed[0]
+        assert rowidx == 3
+        assert agent_ref == {"name": "agent"}
+        assert set(result) == {GYM_INFRA_FAILURE_KEY}
+        assert "HTTP 503" in result[GYM_INFRA_FAILURE_KEY]
+        # The batch's timing metrics still close out when every row failed.
+        assert timing is not None and timing["test/postprocess_results_pct"] == 0.0
+
+        mock_self.rch = _RolloutCollectionHelper(failure_row(400))
+        with pytest.raises(RolloutDataFailure, match="HTTP 400"):
+            [item async for item in stream_rollouts(mock_self, rows, "test")]
+
+    asyncio.run(_run())
+
+
+def test_nemo_gym_run_rollouts_scores_a_class_annotated_result_row():
+    """Only rows carrying the failure TYPE are /run failures. Gym's judge
+    failsafe returns a scoreable result row annotated with ``_ng_failure_class``
+    alone (reward 0, no ``_ng_failure_type``); such a row is postprocessed like
+    any result instead of being raised or re-dispatched."""
+
+    judge_row = {
+        "_ng_failure_class": "judge_failed",
+        "_ng_failure_judge_error": "judge crashed",
+        "reward": 0.0,
+        "response": {"output": []},
+    }
+
+    class _RolloutCollectionHelper:
+        def run_examples(self, examples, head_server_config, **_):
+            del head_server_config
+
+            async def _completed():
+                return examples[0], judge_row
+
+            return [_completed()]
+
+    class _MockSelf:
+        cfg = {}
+        head_server_config = object()
+        _token_capture_enabled = False
+
+        def _require_spinup(self):
+            pass
+
+        def _postprocess_nemo_gym_to_nemo_rl_result(self, row, result, tokenizer, **_):
+            assert result is judge_row
+            # message_log: the NaN-logprob screen reads it on every scored row.
+            return {"total_reward": result["reward"], "message_log": []}
+
+    stream_rollouts = NemoGym.__ray_metadata__.modified_class._stream_rollouts
+    rows = [
+        {
+            "_rowidx": 0,
+            "agent_ref": {"name": "agent"},
+            "responses_create_params": {"input": []},
+        }
+    ]
+
+    async def _run():
+        mock_self = _MockSelf()
+        mock_self._tokenizer = object()
+        mock_self.rch = _RolloutCollectionHelper()
+        streamed = [item async for item in stream_rollouts(mock_self, rows, "test")]
+        assert len(streamed) == 1
+        rowidx, agent_ref, result, _ = streamed[0]
+        assert rowidx == 0
+        assert agent_ref == {"name": "agent"}
+        assert result == {"total_reward": 0.0, "message_log": []}
 
     asyncio.run(_run())
 
