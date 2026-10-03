@@ -275,12 +275,13 @@ def prepare_loss_input(
             logprobs, curr_finite_mask = mask_out_neg_inf_logprobs(
                 logprobs, mask[:, 1:], "curr_logprobs"
             )
-            # Propagate the neg-inf mask so the loss reduction and KL skips these positions.
+            # Propagate the neg-inf mask so the loss reduction skips these positions.
             # Without this change, the IS weight exp(prev-gen) becomes exp(-gen).
             data["token_mask"] = data["token_mask"].clone()
             data["token_mask"][:, 1:] = data["token_mask"][:, 1:] * curr_finite_mask
 
-            # compute unfiltered logprobs for reference policy KL penalty
+            # compute unfiltered logprobs for the reference-KL penalty;
+            # -inf positions were dropped from token_mask above, so the KL skips them.
             if (
                 hasattr(loss_fn, "reference_policy_kl_penalty")
                 and loss_fn.reference_policy_kl_penalty != 0
