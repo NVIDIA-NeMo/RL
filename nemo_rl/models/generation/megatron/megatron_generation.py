@@ -643,6 +643,8 @@ class MegatronGeneration(GenerationInterface):
         generation_prefix_cuts_enabled: bool = False,
         generation_cut_control_token: str | None = None,
         generation_cut_control_timeout_s: float | None = None,
+        generation_prefix_batch_size: int = 256,
+        generation_prefix_batch_max_tokens: int = 4_194_304,
     ) -> None:
         """Install MInf's canonical prompt and completion capture hooks."""
         if generation_prefix_cuts_enabled:
