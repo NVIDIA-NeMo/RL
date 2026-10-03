@@ -893,6 +893,40 @@ for pool in "${pool_names[@]}"; do
   fi
 done
 
+# EXTERNAL_VLLM_START_RAY_EARLY=1: the LB / router URLs are fixed once they are launched on the
+# Ray head node, so substitute them and start ray.sub now instead of after the fleet is healthy.
+# NeMo RL's deferred remote-vLLM setup then waits for the fleet (NRL_REMOTE_VLLM_PREFLIGHT_WAIT_S)
+# while the trainer, Gym and data plane initialise in parallel.
+start_ray_sub() {
+  # ray.sub predates hetjobs and consumes the unsuffixed allocation variables.
+  # Restrict those variables to component 0; srun also defaults to hetgroup 0.
+  # `env` execs bash directly, so ray_sub_pid is the process that owns its traps.
+  env \
+    SLURM_JOB_NODELIST="${SLURM_JOB_NODELIST_HET_GROUP_0}" \
+    SLURM_JOB_NUM_NODES="${#ray_nodes[@]}" \
+    bash "${RAY_SUB}" &
+  ray_sub_pid=$!
+}
+substitute_pool_urls() {
+  for pool in "${pool_names[@]}"; do
+    echo "${pool_urls[${pool}]}" > "${LOG_DIR}/${pool,,}_url"
+    COMMAND="${COMMAND//${placeholders[${pool}]}/${pool_urls[${pool}]}}"
+    if [[ -n "${control_placeholders[${pool}]}" ]]; then
+      echo "${control_pool_urls[${pool}]}" > "${LOG_DIR}/${pool,,}_control_url"
+      COMMAND="${COMMAND//${control_placeholders[${pool}]}/${control_pool_urls[${pool}]}}"
+    fi
+  done
+}
+start_ray_early="${EXTERNAL_VLLM_START_RAY_EARLY:-0}"
+if [[ "${start_ray_early}" == "1" ]]; then
+  substitute_pool_urls
+  wait_s="${NRL_REMOTE_VLLM_PREFLIGHT_WAIT_S:-${max_startup_timeout}}"
+  COMMAND="export NRL_REMOTE_VLLM_PREFLIGHT_WAIT_S=${wait_s}; ${COMMAND}"
+  export COMMAND
+  echo "[INFO] Starting NeMo RL now (EXTERNAL_VLLM_START_RAY_EARLY=1); it waits up to ${wait_s}s for the external vLLM pools"
+  start_ray_sub
+fi
+
 deadline=$((SECONDS + max_startup_timeout))
 while true; do
   all_ready=1
@@ -913,6 +947,10 @@ while true; do
   done
   (( all_ready == 1 )) && break
   check_service_steps
+  if [[ -n "${ray_sub_pid}" ]] && ! kill -0 "${ray_sub_pid}" 2>/dev/null; then
+    echo "[FATAL] NeMo RL (ray.sub) exited while the external vLLM pools were starting" >&2
+    exit 1
+  fi
   if (( SECONDS >= deadline )); then
     echo "[FATAL] Timed out waiting for all external vLLM pools" >&2
     exit 1
@@ -929,8 +967,10 @@ for pool in "${pool_names[@]}"; do
     fi
     sleep 5
   done
-  echo "${pool_urls[${pool}]}" > "${LOG_DIR}/${pool,,}_url"
-  COMMAND="${COMMAND//${placeholders[${pool}]}/${pool_urls[${pool}]}}"
+  if [[ "${start_ray_early}" != "1" ]]; then
+    echo "${pool_urls[${pool}]}" > "${LOG_DIR}/${pool,,}_url"
+    COMMAND="${COMMAND//${placeholders[${pool}]}/${pool_urls[${pool}]}}"
+  fi
   if [[ -n "${control_placeholders[${pool}]}" ]]; then
     until curl -sfm 10 "${control_pool_urls[${pool}]}/models" >/dev/null 2>&1; do
       check_service_steps
@@ -940,21 +980,20 @@ for pool in "${pool_names[@]}"; do
       fi
       sleep 5
     done
-    echo "${control_pool_urls[${pool}]}" > "${LOG_DIR}/${pool,,}_control_url"
-    COMMAND="${COMMAND//${control_placeholders[${pool}]}/${control_pool_urls[${pool}]}}"
+    if [[ "${start_ray_early}" != "1" ]]; then
+      echo "${control_pool_urls[${pool}]}" > "${LOG_DIR}/${pool,,}_control_url"
+      COMMAND="${COMMAND//${control_placeholders[${pool}]}/${control_pool_urls[${pool}]}}"
+    fi
   fi
 done
-export COMMAND
 
-echo "[INFO] External vLLM pools are healthy; starting NeMo RL"
-# ray.sub predates hetjobs and consumes the unsuffixed allocation variables.
-# Restrict those variables to component 0; srun also defaults to hetgroup 0.
-# `env` execs bash directly, so ray_sub_pid is the process that owns its traps.
-env \
-  SLURM_JOB_NODELIST="${SLURM_JOB_NODELIST_HET_GROUP_0}" \
-  SLURM_JOB_NUM_NODES="${#ray_nodes[@]}" \
-  bash "${RAY_SUB}" &
-ray_sub_pid=$!
+if [[ "${start_ray_early}" == "1" ]]; then
+  echo "[INFO] External vLLM pools are healthy (NeMo RL already starting)"
+else
+  export COMMAND
+  echo "[INFO] External vLLM pools are healthy; starting NeMo RL"
+  start_ray_sub
+fi
 
 while kill -0 "${ray_sub_pid}" 2>/dev/null; do
   if ! check_service_steps; then

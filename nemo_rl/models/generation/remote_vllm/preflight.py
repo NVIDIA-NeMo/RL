@@ -23,6 +23,39 @@ from nemo_rl.models.generation.remote_vllm.config import (
 )
 
 
+PREFLIGHT_WAIT_ENV = "NRL_REMOTE_VLLM_PREFLIGHT_WAIT_S"
+
+
+def wait_for_remote_vllm_service(config: Any) -> Any:
+    """Preflight, retrying for up to ``NRL_REMOTE_VLLM_PREFLIGHT_WAIT_S`` seconds.
+
+    Lets a launcher start the trainer while the external fleet is still coming up
+    (EXTERNAL_VLLM_START_RAY_EARLY in tools/external_gym_vllm/run_in_allocation.sh):
+    the trainer, Gym and data plane initialise in parallel and only the deferred
+    generation setup waits here. With the variable unset this is one preflight.
+    """
+    import os
+    import time
+
+    budget = float(os.environ.get(PREFLIGHT_WAIT_ENV, "0") or 0)
+    deadline = time.monotonic() + budget
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return preflight_remote_vllm_service(config)
+        except Exception as error:  # noqa: BLE001 - connection refused, 5xx, not-ready
+            if time.monotonic() >= deadline:
+                raise
+            if attempt == 1 or attempt % 10 == 0:
+                print(
+                    f"[remote_vllm] external fleet not ready yet ({type(error).__name__}); "
+                    f"waiting up to {max(0.0, deadline - time.monotonic()):.0f}s more",
+                    flush=True,
+                )
+            time.sleep(15)
+
+
 def preflight_remote_vllm_service(
     config: RemoteVllmServiceConfig,
 ) -> RemoteVllmServiceInfo:

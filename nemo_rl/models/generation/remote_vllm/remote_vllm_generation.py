@@ -29,7 +29,7 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.remote_vllm.client import RemoteVllmClient
 from nemo_rl.models.generation.remote_vllm.config import RemoteVllmServiceConfig
 from nemo_rl.models.generation.remote_vllm.preflight import (
-    preflight_remote_vllm_service,
+    wait_for_remote_vllm_service,
 )
 from nemo_rl.models.generation.remote_vllm.token_capture_bridge import (
     RemoteVllmTokenCaptureBridge,
@@ -87,8 +87,12 @@ class RemoteVllmGeneration(GenerationInterface):
         return state
 
     def load_and_start(self) -> None:
-        """Match the deferred local-vLLM setup hook; the service is already live."""
-        preflight_remote_vllm_service(self.remote_config)
+        """Match the deferred local-vLLM setup hook by waiting for the external fleet.
+
+        The launcher may start the trainer before the fleet is healthy
+        (NRL_REMOTE_VLLM_PREFLIGHT_WAIT_S bounds the wait).
+        """
+        wait_for_remote_vllm_service(self.remote_config)
 
     def init_collective(
         self, ip: str, port: int, world_size: int, *, train_world_size: int

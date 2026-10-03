@@ -15,6 +15,7 @@
 """Async Single Controller GRPO against an externally managed stock vLLM."""
 
 import argparse
+import os
 import pprint
 import runpy
 import sys
@@ -84,9 +85,14 @@ def main() -> None:
     )
 
     remote_config = _load_remote_config(config_path, overrides)
-    info = preflight_remote_vllm_service(remote_config)
-    print("External rollout service preflight succeeded:")
-    pprint.pprint(info.model_dump())
+    if os.environ.get("NRL_REMOTE_VLLM_PREFLIGHT_WAIT_S") and not args.preflight_only:
+        # The launcher started the trainer while the fleet is still coming up; the deferred
+        # generation setup waits for it in parallel with trainer / Gym initialisation.
+        print("External rollout service preflight deferred (fleet may still be starting)")
+    else:
+        info = preflight_remote_vllm_service(remote_config)
+        print("External rollout service preflight succeeded:")
+        pprint.pprint(info.model_dump())
 
     if args.preflight_only:
         return
