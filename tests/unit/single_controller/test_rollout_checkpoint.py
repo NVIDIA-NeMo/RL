@@ -25,6 +25,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
     MasterConfig,
     RolloutCheckpointConfig,
+    RolloutRecoveryConfig,
     TokenCaptureConfig,
 )
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
@@ -213,7 +214,12 @@ def test_bootstrap_fingerprint_ignores_default_operational_paths() -> None:
         },
         "checkpointing": {"checkpoint_dir": "/run/one/checkpoints"},
         "rollout_checkpointing": {"snapshot_attempt_interval_s": 120},
-        "rollout_recovery": {"target_level": "turn", "gym_prepare_timeout_s": 300.0},
+        "rollout_recovery": {
+            "target_level": "prefix",
+            "gym_prepare_timeout_s": 300.0,
+            "generation_prefix_batch_size": 256,
+            "generation_prefix_batch_max_tokens": 4_194_304,
+        },
         "cluster": {"num_nodes": 2},
         "logger": LoggerConfig(log_dir="/run/one"),
     }
@@ -246,6 +252,8 @@ def test_bootstrap_fingerprint_ignores_default_operational_paths() -> None:
         "rollout_recovery": {
             **base["rollout_recovery"],
             "gym_prepare_timeout_s": 900.0,
+            "generation_prefix_batch_size": 64,
+            "generation_prefix_batch_max_tokens": 1_048_576,
         },
         "cluster": {"num_nodes": 8},
         "logger": LoggerConfig(log_dir="/run/two"),
@@ -358,6 +366,7 @@ def test_builtin_fingerprint_exclusions_reference_declared_config_fields() -> No
         ("policy", "generation"): _fields(VllmConfig),
         ("policy", "generation", "vllm_cfg"): _fields(VllmSpecificArgs),
         ("rollout_checkpointing",): _fields(RolloutCheckpointConfig),
+        ("rollout_recovery",): _fields(RolloutRecoveryConfig),
         ("token_capture",): _fields(TokenCaptureConfig),
     }
     for excluded_path in rollout_checkpoint._BOOTSTRAP_FINGERPRINT_EXCLUDED_PATHS:
