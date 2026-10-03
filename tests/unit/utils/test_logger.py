@@ -417,6 +417,30 @@ class TestWandbLogger:
         )
 
     @patch("nemo_rl.utils.logger.wandb")
+    def test_init_outside_a_git_work_tree_skips_the_git_artifacts(
+        self, mock_wandb, capsys
+    ):
+        """The code tree a job runs from is uploaded without .git, so the
+        source-code and git-diff artifacts are skipped with one line instead
+        of running `git ls-files` and `git diff` into errors."""
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(
+                cmd, returncode=128, stdout="", stderr="fatal: not a git repository"
+            )
+
+        with patch("nemo_rl.utils.logger.subprocess.run", side_effect=fake_run):
+            WandbLogger({"project": "p", "name": "n"})
+        assert calls == [["git", "rev-parse", "--is-inside-work-tree"]]
+        assert (
+            "skipping the wandb source-code and git-diff artifacts"
+            in capsys.readouterr().out
+        )
+        mock_wandb.Artifact.assert_not_called()
+
+    @patch("nemo_rl.utils.logger.wandb")
     def test_log_metrics(self, mock_wandb):
         """Test logging metrics to WandbLogger."""
         cfg = {}

@@ -267,11 +267,34 @@ class WandbLogger(LoggerInterface):
             wandb.save("/tmp/ray/session_latest/logs/raylet.out", policy="live")
             wandb.save("/tmp/ray/session_latest/logs/raylet.err", policy="live")
 
-        self._log_code()
-        self._log_diffs()
+        if self._inside_git_work_tree():
+            self._log_code()
+            self._log_diffs()
+        else:
+            print(
+                "Not inside a git work tree; skipping the wandb source-code and git-diff artifacts."
+            )
         print(
             f"Initialized WandbLogger for project {cfg.get('project')}, run {cfg.get('name')} at {log_dir}"
         )
+
+    @staticmethod
+    def _inside_git_work_tree() -> bool:
+        """Whether the current directory is inside a git work tree.
+
+        The code tree a job runs from is uploaded without its ``.git``
+        directory, so the git-based artifacts below have nothing to read there.
+        """
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "--is-inside-work-tree"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError:
+            return False
+        return result.returncode == 0 and result.stdout.strip() == "true"
 
     def _log_diffs(self):
         """Log git diffs to wandb.
