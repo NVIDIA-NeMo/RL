@@ -66,6 +66,7 @@ from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
     calculate_trivial_reward_distributions,
     compute_seq_logprob_errors,
+    compute_token_logprob_error_tail_metrics,
     get_gdpo_reward_component_keys,
     log_generation_metrics,
     print_efficiency_summary,
@@ -4055,6 +4056,15 @@ def _grpo_train_impl(
             timing_metrics: dict[str, float] = timer.get_timing_metrics(
                 reduction_op="sum"
             )  # type: ignore
+            if not skip_prev_logprobs:
+                metrics.update(
+                    compute_token_logprob_error_tail_metrics(
+                        generation_logprobs=train_data["generation_logprobs"],
+                        prev_logprobs=train_data["prev_logprobs"],
+                        token_mask=train_data["token_mask"],
+                        sample_mask=train_data["sample_mask"],
+                    )
+                )
             # track example with high token mult prob error above 1.05
             if metrics["token_mult_prob_error"] > 1.05:
                 logger.log_plot_token_mult_prob_error(
@@ -5973,6 +5983,15 @@ def async_grpo_train(
                     log_data, f"train_data_step{step + 1}.jsonl"
                 )
                 del log_data
+            if not skip_prev_logprobs:
+                metrics.update(
+                    compute_token_logprob_error_tail_metrics(
+                        generation_logprobs=train_data["generation_logprobs"],
+                        prev_logprobs=train_data["prev_logprobs"],
+                        token_mask=train_data["token_mask"],
+                        sample_mask=train_data["sample_mask"],
+                    )
+                )
             del train_data
             del flat_messages_content
 

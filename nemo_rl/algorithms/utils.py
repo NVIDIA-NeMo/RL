@@ -283,6 +283,42 @@ def compute_seq_logprob_errors(
     return errors, valid
 
 
+def compute_token_logprob_error_tail_metrics(
+    *,
+    generation_logprobs: torch.Tensor,
+    prev_logprobs: torch.Tensor,
+    token_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+) -> dict[str, float]:
+    """Tail metrics of the per-token logprob error between generation and training.
+
+    Covers the same tokens as ``token_mult_prob_error`` (``token_mask * sample_mask``).
+    That metric is a mean of exp(|error|), so a single token tens of nats off
+    (exp(30) ~ 1e13) dominates the whole step. Instead report, separately:
+
+    - ``token_mult_prob_error_p999``: the 99.9th percentile (nearest rank) of
+      exp(|error|). It ignores the worst 0.1% of tokens and tracks the bulk mismatch.
+    - ``num_tokens_logprob_error_above_10_nats``: how many tokens are off by more than
+      10 nats (probability ratio > e^10 ~ 2e4), i.e. the rare spikes the percentile
+      ignores. At ~1M tokens per step one such token moves the mean by > 0.02.
+
+    Empty when no token is valid.
+    """
+    mask = (token_mask * sample_mask.unsqueeze(-1)).bool()
+    errors = (generation_logprobs - prev_logprobs).abs()[mask].float()
+    if errors.numel() == 0:
+        return {}
+    k = math.ceil(0.999 * errors.numel())
+    return {
+        # float64 exp saturates to inf instead of raising like math.exp above ~709 nats.
+        "token_mult_prob_error_p999": torch.kthvalue(errors, k)
+        .values.double()
+        .exp()
+        .item(),
+        "num_tokens_logprob_error_above_10_nats": int((errors > 10.0).sum().item()),
+    }
+
+
 def masked_mean(
     values: torch.Tensor,
     mask: torch.Tensor,
