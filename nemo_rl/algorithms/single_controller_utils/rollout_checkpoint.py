@@ -87,6 +87,8 @@ _BOOTSTRAP_FINGERPRINT_EXCLUDED_PATHS = frozenset(
         "policy.optimizer",
         "policy.scheduler",
         "rollout_checkpointing",
+        "rollout_recovery.generation_prefix_batch_max_tokens",
+        "rollout_recovery.generation_prefix_batch_size",
         "token_capture.capture_dir",
         "token_capture.control_auth_token",
         "token_capture.control_timeout_s",

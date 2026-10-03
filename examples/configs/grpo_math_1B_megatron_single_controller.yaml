@@ -225,6 +225,9 @@ token_capture:
 # regenerates every sibling in an unfinished group.
 rollout_recovery:
   target_level: sibling
+  # Per-generation-owner bounds for coalescing prefix TQ PUTs and restore GETs.
+  generation_prefix_batch_size: 256
+  generation_prefix_batch_max_tokens: 4194304
   # Per-Gym-task-source coarsening override, keyed on extra_env_info.task_source.
   # Until Gym advertises group-scoring capability, configure GenRM explicitly:
   #   task_source_target_level_overrides:
