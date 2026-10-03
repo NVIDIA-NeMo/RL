@@ -36,9 +36,11 @@ from __future__ import annotations
 
 import math
 import os
+from contextlib import nullcontext
 from typing import Any, NotRequired, Optional, TypedDict, cast
 
 import numpy as np
+import ray
 import torch
 from pydantic import BaseModel, Field
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -59,6 +61,13 @@ from nemo_rl.data import DataConfig
 from nemo_rl.data.cross_tokenizer_collate import CrossTokenizerCollator
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.utils import load_dataloader_state
+from nemo_rl.data_plane.interfaces import DataPlaneConfig
+from nemo_rl.data_plane.xtoken import (
+    XTokenTQTransport,
+    XTokenTransportConfig,
+    select_tq_nodes,
+    validate_tq_support,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.models.policy import PolicyConfig
@@ -209,6 +218,10 @@ class MasterConfig(BaseModel, extra="allow"):
     logger: LoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
+    xtoken_transport: XTokenTransportConfig = Field(
+        default_factory=XTokenTransportConfig
+    )
+    data_plane: DataPlaneConfig | None = None
 
 
 # ===============================================================================
@@ -242,6 +255,15 @@ def setup(
     data_config = master_config.data
     logger_config = master_config.logger
     cluster_config = master_config.cluster
+    use_tq = master_config.xtoken_transport.backend == "tq"
+    if use_tq:
+        validate_tq_support(
+            data_plane=master_config.data_plane,
+            policies=[policy_config, *teacher_configs],
+            num_nodes=cluster_config.num_nodes,
+            gpus_per_node=cluster_config.gpus_per_node,
+            batch_size=distillation_config["num_prompts_per_step"],
+        )
 
     assert len(teacher_tokenizers) == len(teachers), (
         f"expected one tokenizer per teacher; got {len(teacher_tokenizers)} "
@@ -374,15 +396,35 @@ def setup(
     #          Cluster
     # ==========================
     print("\n▶ Setting up compute cluster...", flush=True)
-    cluster = RayVirtualCluster(
-        name="xtoken_off_policy_distillation_cluster",
-        bundle_ct_per_node_list=[cluster_config.gpus_per_node]
-        * cluster_config.num_nodes,
-        use_gpus=True,
-        num_gpus_per_node=cluster_config.gpus_per_node,
-        # N teacher worker groups + 1 student, colocated and run serially.
-        max_colocated_worker_groups=len(teachers) + 1,
-    )
+    if use_tq:
+        teacher_constraint, student_constraint = select_tq_nodes(ray.nodes())
+        teacher_cluster = RayVirtualCluster(
+            name="xtoken_tq_teacher",
+            bundle_ct_per_node_list=[1],
+            use_gpus=True,
+            num_gpus_per_node=1,
+            max_colocated_worker_groups=1,
+            node_resource_constraints=[teacher_constraint],
+        )
+        cluster = RayVirtualCluster(
+            name="xtoken_tq_student",
+            bundle_ct_per_node_list=[1],
+            use_gpus=True,
+            num_gpus_per_node=1,
+            max_colocated_worker_groups=1,
+            node_resource_constraints=[student_constraint],
+        )
+    else:
+        cluster = RayVirtualCluster(
+            name="xtoken_off_policy_distillation_cluster",
+            bundle_ct_per_node_list=[cluster_config.gpus_per_node]
+            * cluster_config.num_nodes,
+            use_gpus=True,
+            num_gpus_per_node=cluster_config.gpus_per_node,
+            # N teacher worker groups + 1 student, colocated and run serially.
+            max_colocated_worker_groups=len(teachers) + 1,
+        )
+        teacher_cluster = cluster
 
     # ==========================
     #      Teacher Policies
@@ -392,7 +434,7 @@ def setup(
     for i, tc in enumerate(teacher_configs):
         teacher_policy = Policy(
             name_prefix=f"teacher_{i}",
-            cluster=cluster,
+            cluster=teacher_cluster,
             config=tc,
             tokenizer=teacher_tokenizers[i],
             weights_path=None,
@@ -448,16 +490,17 @@ def setup(
         # Node-local CUDA IPC: on >1 node it only works when teacher/student
         # share DP and a node-aligned model-parallel group, else a student rank
         # would read teacher shards from another node.
-        assert_xtoken_ipc_node_local(
-            num_nodes=cluster_config.num_nodes,
-            gpus_per_node=cluster_config.gpus_per_node,
-            student_tp=student_tp,
-            student_cp=student_cp,
-            teacher_tp=tc["dtensor_cfg"]["tensor_parallel_size"],
-            teacher_cp=tc["dtensor_cfg"]["context_parallel_size"],
-            student_dp=student_dp,
-            teacher_dp=teacher_dp,
-        )
+        if not use_tq:
+            assert_xtoken_ipc_node_local(
+                num_nodes=cluster_config.num_nodes,
+                gpus_per_node=cluster_config.gpus_per_node,
+                student_tp=student_tp,
+                student_cp=student_cp,
+                teacher_tp=tc["dtensor_cfg"]["tensor_parallel_size"],
+                teacher_cp=tc["dtensor_cfg"]["context_parallel_size"],
+                student_dp=student_dp,
+                teacher_dp=teacher_dp,
+            )
 
     # ==========================
     #         Loss
@@ -512,18 +555,20 @@ def export_teacher_logits_and_pack(
     teacher_mbs: list[int],
     *,
     timer: Optional[Timer] = None,
+    tq_transport: XTokenTQTransport | None = None,
 ) -> BatchedDataDict[Any]:
     """Serially run each teacher's forward and pack the student ``train_data``.
 
-    Teachers run one at a time (collocated): each is onloaded for inference,
-    forwarded, then offloaded. Every teacher ships full-vocab logits over CUDA
-    IPC (``teacher_{i}_full_logits_ipc``) — the loss derives the microbatch-global
+    Teachers run one at a time: each is onloaded for inference, forwarded,
+    then offloaded. Full-vocab logits use teacher CUDA IPC by default; TQ
+    first materializes them in student-local storage. Both paths use
+    ``teacher_{i}_full_logits_ipc`` — the loss derives the microbatch-global
     top-k subset student-side, so there is no top-K transport. A same-vocab
     teacher (``projection_matrix_paths[i] is None``) reuses the student tokens
     and rides no extra alignment; a cross-tokenizer teacher's own tokenization
     and ``alignment_{i}_*`` payload ride along (teacher-indexed). The persistent
-    IPC buffers stay resident on the teacher GPUs until released by the caller
-    after ``student.train``. Shared by the train loop and ``validate`` so the
+    buffers stay resident on their owning GPUs until released by the caller.
+    Shared by the train loop and ``validate`` so the
     forward+pack sequence can't drift between them.
     """
     train_data: dict[str, Any] = {
@@ -565,8 +610,12 @@ def export_teacher_logits_and_pack(
                 train_data[f"alignment_{i}_{field}"] = batch[f"alignment_{i}_{field}"]
 
         teacher_policy.prepare_for_lp_inference()
-        handles = teacher_policy.get_full_logits_ipc(
-            teacher_data, micro_batch_size=teacher_mbs[i], timer=timer
+        handles = (
+            tq_transport.transfer(teacher_data)
+            if tq_transport is not None
+            else teacher_policy.get_full_logits_ipc(
+                teacher_data, micro_batch_size=teacher_mbs[i], timer=timer
+            )
         )
         train_data[f"teacher_{i}_full_logits_ipc"] = handles
         # Free the teacher's PARAMS to CPU; the persistent IPC buffers live in
@@ -586,8 +635,11 @@ def xtoken_off_policy_distillation_train(
     checkpointer: CheckpointManager,
     off_policy_distillation_state: OffPolicyDistillationSaveState,
     master_config: MasterConfig,
+    tq_transport: XTokenTQTransport | None = None,
 ) -> None:
     """Off-policy CT distillation training loop."""
+    if master_config.xtoken_transport.backend == "tq" and tq_transport is None:
+        raise ValueError("xToken TQ training requires an initialized transport")
     timer = Timer()
     timeout = TimeoutChecker(
         timeout=master_config.checkpointing["checkpoint_must_save_by"],
@@ -623,6 +675,7 @@ def xtoken_off_policy_distillation_train(
             master_config,
             skip_keys=skip_keys,
             timer=timer,
+            tq_transport=tq_transport,
         )
         logger.log_metrics(val_metrics, total_steps, prefix="validation")
         logger.log_metrics(val_timings, total_steps, prefix="timing/validation")
@@ -642,14 +695,22 @@ def xtoken_off_policy_distillation_train(
             )
             maybe_gpu_profile_step(student_policy, total_steps + 1)
 
-            with timer.time("total_step_time"):
+            with (
+                timer.time("total_step_time"),
+                tq_transport.step() if tq_transport is not None else nullcontext(),
+            ):
                 with timer.time("teacher_forward"):
                     # Serial per-teacher forward; each teacher ships full-vocab
                     # logits over IPC (``teacher_{i}_full_logits_ipc``) and the
                     # loss derives the microbatch-global top-k subset
                     # student-side. Packs the per-teacher alignment payload too.
                     train_data = export_teacher_logits_and_pack(
-                        teacher_policies, loss_fn, batch, teacher_mbs, timer=timer
+                        teacher_policies,
+                        loss_fn,
+                        batch,
+                        teacher_mbs,
+                        timer=timer,
+                        tq_transport=tq_transport,
                     )
 
                 with timer.time("training_prep"):
@@ -670,9 +731,15 @@ def xtoken_off_policy_distillation_train(
                         # across steps (reused via copy_) and releases once at
                         # loop exit — releasing every step would free + realloc
                         # the large teacher logits buffers and fragment into OOM.
-                        for teacher_policy in teacher_policies:
-                            teacher_policy.release_ipc_buffer()
+                        if tq_transport is None:
+                            for teacher_policy in teacher_policies:
+                                teacher_policy.release_ipc_buffer()
                         raise
+
+                if tq_transport is not None:
+                    logger.log_metrics(
+                        tq_transport.metrics, total_steps + 1, prefix="xtoken_tq"
+                    )
 
                 is_last_step = (total_steps + 1 >= max_steps) or (
                     (current_epoch + 1 == max_epochs)
@@ -692,6 +759,7 @@ def xtoken_off_policy_distillation_train(
                         master_config,
                         skip_keys=skip_keys,
                         timer=timer,
+                        tq_transport=tq_transport,
                     )
                     logger.log_metrics(
                         val_metrics, total_steps + 1, prefix="validation"
@@ -903,6 +971,7 @@ def validate(
     master_config: MasterConfig,
     skip_keys: frozenset[str],
     timer: Optional[Timer] = None,
+    tq_transport: XTokenTQTransport | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Held-out KL/CE on a validation dataloader.
 
@@ -915,6 +984,8 @@ def validate(
     """
     distill_cfg = master_config.distillation
     timer = timer if timer is not None else Timer()
+    if master_config.xtoken_transport.backend == "tq" and tq_transport is None:
+        raise ValueError("xToken TQ validation requires an initialized transport")
 
     losses: list[float] = []
     # The P-KL path emits kl_loss/ce_loss; the gold path emits
@@ -948,21 +1019,28 @@ def validate(
             target_size = math.ceil(batch.size / pad_quantum) * pad_quantum
             batch = pad_distillation_val_batch(batch, target_size)
 
-            train_data = export_teacher_logits_and_pack(
-                teacher_policies, loss_fn, batch, teacher_mbs, timer=timer
-            )
-            student_policy.prepare_for_training()
-            try:
-                results = student_policy.train(
-                    train_data,
+            with tq_transport.step() if tq_transport is not None else nullcontext():
+                train_data = export_teacher_logits_and_pack(
+                    teacher_policies,
                     loss_fn,
-                    eval_mode=True,
-                    check_dim_skip_keys=skip_keys,
+                    batch,
+                    teacher_mbs,
+                    timer=timer,
+                    tq_transport=tq_transport,
                 )
-            except Exception:
-                for teacher_policy in teacher_policies:
-                    teacher_policy.release_ipc_buffer()
-                raise
+                student_policy.prepare_for_training()
+                try:
+                    results = student_policy.train(
+                        train_data,
+                        loss_fn,
+                        eval_mode=True,
+                        check_dim_skip_keys=skip_keys,
+                    )
+                except Exception:
+                    if tq_transport is None:
+                        for teacher_policy in teacher_policies:
+                            teacher_policy.release_ipc_buffer()
+                    raise
             losses.append(float(np.mean(results["loss"].numpy())))
             mb_metrics = results.get("all_mb_metrics", {})
             if "kl_loss" in mb_metrics:

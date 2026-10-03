@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import gc
+import time
 import warnings
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, Generator, Iterable, Optional
@@ -32,6 +33,13 @@ from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.metric_utils import LEARNING_RATE_KEY
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
+from nemo_rl.data_plane.xtoken import (
+    XTokenTQReceiveResult,
+    XTokenTQReference,
+    check_payload_size,
+    fetch_logits,
+    publish_logits,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.automodel.checkpoint import (
     AutomodelCheckpointManager,
@@ -67,7 +75,14 @@ from nemo_rl.models.policy.interfaces import (
     ScoreOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
+    _REBUILD_CUDA_TENSOR_ARG_DEVICE_INDEX,
+    _REBUILD_CUDA_TENSOR_ARG_REF_COUNTER_HANDLE_INDEX,
+    _REBUILD_CUDA_TENSOR_ARG_REF_COUNTER_OFFSET_INDEX,
+    _REBUILD_CUDA_TENSOR_ARG_STORAGE_CLASS_INDEX,
+    _REBUILD_CUDA_TENSOR_ARG_STORAGE_HANDLE_INDEX,
+    _REBUILD_CUDA_TENSOR_ARG_STORAGE_OFFSET_BYTES_INDEX,
     ensure_teacher_ipc_buffer,
+    get_handle_from_tensor,
     get_runtime_env_for_policy_worker,
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
@@ -982,6 +997,119 @@ class DTensorPolicyWorkerV2Impl(
         # (ports the sync added upstream for the single-buffer export path).
         torch.cuda.synchronize()
         return {"per_sample_handles": per_sample_handles, "dp_rank": dp_rank}
+
+    def get_full_logits_tq(
+        self,
+        data: BatchedDataDict[Any],
+        *,
+        partition_id: str,
+        sample_id: str,
+        max_payload_bytes: int,
+    ) -> XTokenTQReference:
+        """Forward and publish on the teacher; CUDA handles stay on this node."""
+        if data.size != 1 or self.tp_size != 1 or self.cp_size != 1:
+            raise ValueError("xToken TQ requires batch=TP=CP=1")
+        _, seq_len = check_sequence_dim(data)
+        # Fast-fail on the configured vocab; the padded vocab is only known
+        # after the forward, and publish_logits re-checks the exact shape.
+        check_payload_size(
+            seq_len=seq_len,
+            vocab_size=self.model_config.vocab_size,
+            max_bytes=max_payload_bytes,
+        )
+        previous_storage = self._teacher_ipc_storage
+        result = self.get_full_logits_ipc(data, micro_batch_size=1)
+        handle = result["per_sample_handles"][0]
+        assert self._teacher_ipc_storage is not None
+        if self._teacher_ipc_storage is not previous_storage:
+            # This export has no CUDA IPC consumer: TQ only reads the CPU
+            # copy. Release its unused refcounter so validation/exit can free
+            # the teacher allocation rather than leaving it in IPC limbo.
+            ipc_args = handle["payload_ipc"][0]
+            ipc_args[_REBUILD_CUDA_TENSOR_ARG_STORAGE_CLASS_INDEX]._release_ipc_counter(
+                ipc_args[_REBUILD_CUDA_TENSOR_ARG_REF_COUNTER_HANDLE_INDEX],
+                ipc_args[_REBUILD_CUDA_TENSOR_ARG_REF_COUNTER_OFFSET_INDEX],
+                device=ipc_args[_REBUILD_CUDA_TENSOR_ARG_DEVICE_INDEX],
+            )
+        seq_len, vocab_size = handle["actual_shape"]
+        return publish_logits(
+            self._require_dp_client(),
+            self._teacher_ipc_storage[0, :1, :seq_len, :vocab_size],
+            partition_id=partition_id,
+            sample_id=sample_id,
+            producer_node_id=ray.get_runtime_context().get_node_id(),
+            max_payload_bytes=max_payload_bytes,
+        )
+
+    def materialize_full_logits_tq(
+        self, reference: XTokenTQReference, *, max_payload_bytes: int
+    ) -> XTokenTQReceiveResult:
+        """GET into persistent student storage and return student-local IPC."""
+        node_id = ray.get_runtime_context().get_node_id()
+        started = time.perf_counter()
+        logits = fetch_logits(
+            self._require_dp_client(),
+            reference,
+            consumer_node_id=node_id,
+            max_payload_bytes=max_payload_bytes,
+        )
+        _, seq_len, vocab_size = reference.shape
+        previous_storage = self._teacher_ipc_storage
+        self._teacher_ipc_storage, self._teacher_ipc_handle = ensure_teacher_ipc_buffer(
+            self._teacher_ipc_storage,
+            self._teacher_ipc_handle,
+            1,
+            1,
+            seq_len,
+            vocab_size,
+            torch.float32,
+            torch.device("cuda", torch.cuda.current_device()),
+        )
+        self._teacher_ipc_storage[0, :1, :seq_len, :vocab_size].copy_(logits)
+        torch.cuda.synchronize()
+        if self._teacher_ipc_storage is previous_storage:
+            # A fresh export supplies one IPC refcounter for this loss call.
+            self._teacher_ipc_handle = get_handle_from_tensor(self._teacher_ipc_storage)
+        # The consumer is this same process. Seed PyTorch's rebuild cache so
+        # the existing reconstruction function reuses our own storage rather
+        # than trying to open a CUDA IPC allocation in its producer context.
+        from torch.multiprocessing.reductions import StorageWeakRef, shared_cache
+
+        ipc_args = self._teacher_ipc_handle[0]
+        shared_cache[
+            (
+                ipc_args[_REBUILD_CUDA_TENSOR_ARG_STORAGE_HANDLE_INDEX],
+                ipc_args[_REBUILD_CUDA_TENSOR_ARG_STORAGE_OFFSET_BYTES_INDEX],
+            )
+        ] = StorageWeakRef(self._teacher_ipc_storage.untyped_storage())
+        handle = {
+            "payload_ipc": self._teacher_ipc_handle,
+            "buf_idx": 0,
+            "sample_index_in_buf": 0,
+            "storage_shape": tuple(self._teacher_ipc_storage.shape),
+            "actual_shape": (seq_len, vocab_size),
+            "dtype": torch.float32,
+            "tp_rank": 0,
+            "cp_rank": 0,
+            "tp_size": 1,
+            "cp_size": 1,
+            "world_rank": torch.distributed.get_rank(),
+            "vocab_start_index": 0,
+            "vocab_end_index": vocab_size,
+            "global_seq_start": 0,
+            "full_vocab_size": vocab_size,
+            "full_seq_len": seq_len,
+            "vocab_sharded": False,
+            "sequence_sharded": False,
+        }
+        return XTokenTQReceiveResult(
+            handles=[{"teacher_shards": [handle]}],
+            consumer_node_id=node_id,
+            nbytes=reference.nbytes,
+            get_seconds=time.perf_counter() - started,
+            buffer_bytes=self._teacher_ipc_storage.numel()
+            * self._teacher_ipc_storage.element_size(),
+        )
 
     def release_ipc_buffer(self) -> None:
         """Free the persistent teacher-logit IPC storage. Called once at end of training/validation."""

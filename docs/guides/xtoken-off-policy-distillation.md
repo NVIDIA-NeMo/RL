@@ -297,6 +297,39 @@ rank-level `[B_r, T_t, V_t]` bf16 tray and hands the student a CUDA IPC handle
 to it, so teacher logits never cross the network even with two teachers in
 play.
 
+## Two-node TransferQueue smoke
+
+`xtoken_transport.backend=ipc` remains the default. Select `tq` with
+`data_plane.enabled=true`, `impl=transfer_queue`, and `backend=simple` to
+transfer dense FP32 teacher logits between two distinct Ray GPU nodes. The
+initial TQ path requires one teacher, one GPU worker per node, TP=CP=DP=1,
+global batch=microbatch=1, no packing/dynamic batching, and synchronous
+off-policy training. Alignment, projection and P-KL use the existing loss.
+The student publishes a local descriptor for its own receive buffer.
+
+Payloads are bounded by `xtoken_transport.max_payload_bytes` (64 MiB by
+default), pre-checked against the configured vocabulary and padded sequence
+length before inference, then re-checked against the exact padded shape at
+publish time;
+`xtoken_transport.timeout_s` defaults to 120 seconds. Each step uses a new key
+and explicitly clears it after training/evaluation. A transfer or training
+failure stops the workers and aborts the run; optimizer updates are not retried.
+PUT/GET byte metrics count application tensor bytes, excluding network overhead.
+
+On an existing two-node Linux Ray cluster, with the same checkout, dependencies,
+model cache and Llama download access on both nodes, run:
+
+```bash
+bash tests/functional/xtoken_tq_two_node.sh
+```
+
+This uses the `distillation-xtoken-qwen3-1.7b-to-llama3.2-1b-2n1g-dtensor2tp1-tq`
+recipe (sequence limit 64), builds the existing lightweight projection, and
+runs synthetic cross-node/numerical checks followed by 3 and 10 training steps.
+It fails on same-node placement, residual TQ rows or growing receive buffers.
+OPD/MOPD, Mooncake/GDR, multiple teachers and heterogeneous parallelism are
+outside this first TQ path.
+
 ## Where files live
 
 | Stage | Tool | Default output |
