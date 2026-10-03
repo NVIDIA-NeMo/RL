@@ -199,6 +199,16 @@ sbatch ray.sub \
   - Minimum port in the range for Ray worker processes.
 * - `MAX_WORKER_PORT=2999`
   - Maximum port in the range for Ray worker processes.
+* - `NRL_RAY_RUNTIME_ENV_EXCLUDES`
+  - Unset by default. A comma-separated list of glob patterns that the driver's
+    `init_ray` places in the Ray runtime environment's `excludes`, so Ray leaves
+    the matching paths out of the `working_dir` package it ships to the workers.
+    A `working_dir` is packaged when the driver is started with `uv run` outside
+    `ray.sub` (Ray's `uv run` hook sets it to the current directory; `ray.sub`
+    turns that hook off). Set this when the launch directory carries data no
+    worker reads, such as vendored test data or local datasets, whose size would
+    exceed Ray's package upload limit. Patterns are relative to the working
+    directory, for example `NRL_RAY_RUNTIME_ENV_EXCLUDES="data/**,**/tests/**"`.
 ``````
 
 > [!NOTE]
