@@ -6,7 +6,7 @@ grpo:
   max_rollout_turns: 1
   max_num_epochs: 1
   max_num_steps: 1000000
-  normalize_rewards: false
+  normalize_rewards: false    # not used by DWRL, value doesn't matter
   use_leave_one_out_baseline: true
   val_period: 5
   val_start_at: -1  # First step eligible for periodic validation; -1 disables the delay
@@ -263,7 +263,7 @@ policy:
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
     # Multi-Token Prediction (MTP). mtp_num_layers=0 disables MTP.
-    mtp_num_layers: null
+    mtp_num_layers: 0
     # MTP loss weight added to the main next-token loss (0.0 disables the MTP loss contribution).
     mtp_loss_scaling_factor: 0.0
     # When true, repeat one MTP layer mtp_num_layers times instead of using distinct layers.

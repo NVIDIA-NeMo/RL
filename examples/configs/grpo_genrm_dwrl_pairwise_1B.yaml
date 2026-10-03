@@ -263,7 +263,7 @@ policy:
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
     # Multi-Token Prediction (MTP). mtp_num_layers=0 disables MTP.
-    mtp_num_layers: null
+    mtp_num_layers: 0
     # MTP loss weight added to the main next-token loss (0.0 disables the MTP loss contribution).
     mtp_loss_scaling_factor: 0.0
     # When true, repeat one MTP layer mtp_num_layers times instead of using distinct layers.
