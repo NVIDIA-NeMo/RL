@@ -26,11 +26,15 @@ _ensure_registry() {
   touch "${REGISTRY_FILE}" "${REGISTRY_LOCK}"
 }
 
+# Lock waits are long on purpose: the registry lives on a shared filesystem and every replica of a
+# fleet registers within seconds of the others once their engines are up (16 MTP engines on AGA all
+# finished graph capture together); a 10 s wait timed out, flock's failure exited the replica under
+# set -e and srun --kill-on-bad-exit cancelled the job.
 registry_add() {
   local backend_id="$1" ip="$2" port="$3" role="${4:-standard}"
   _ensure_registry
   (
-    flock -w 10 200
+    flock -w 300 200
     grep -v "^${backend_id} " "${REGISTRY_FILE}" > "${REGISTRY_FILE}.tmp" 2>/dev/null || true
     echo "${backend_id} ${ip} ${port} $(date +%s) ready ${role}" >> "${REGISTRY_FILE}.tmp"
     mv "${REGISTRY_FILE}.tmp" "${REGISTRY_FILE}"
@@ -41,7 +45,7 @@ registry_remove() {
   local backend_id="$1"
   _ensure_registry
   (
-    flock -w 10 200
+    flock -w 300 200
     grep -v "^${backend_id} " "${REGISTRY_FILE}" > "${REGISTRY_FILE}.tmp" 2>/dev/null || true
     mv "${REGISTRY_FILE}.tmp" "${REGISTRY_FILE}"
   ) 200>"${REGISTRY_LOCK}"
