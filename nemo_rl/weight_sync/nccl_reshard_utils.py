@@ -763,9 +763,7 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
         # FP8→BF16 has no consumer (vLLM doesn't accept FP8 bytes into a BF16 param).
         fp8_cfg = megatron_cfg.get("fp8_cfg", {}) or {}
         fp8_param_requested = bool(fp8_cfg.get("fp8_param", False))
-        fp8_param = bool(
-            fp8_cfg.get("enabled", False) and fp8_param_requested
-        )
+        fp8_param = bool(fp8_cfg.get("enabled", False) and fp8_param_requested)
         fp8_recipe = fp8_cfg.get("fp8_recipe", None)
         trainer_precision = policy.get("precision")
         gen_precision = vllm_cfg.get("precision", None)
