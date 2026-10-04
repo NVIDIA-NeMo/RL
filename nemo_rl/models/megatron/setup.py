@@ -1708,6 +1708,10 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
             model_cfg.recompute_method = "uniform"
             model_cfg.recompute_num_layers = 1
         elif granularity == "selective":
+            # A model config restored from a checkpoint trained with full recompute carries
+            # recompute_method/recompute_num_layers, which selective recompute rejects.
+            model_cfg.recompute_method = None
+            model_cfg.recompute_num_layers = None
             recompute_modules = config["megatron_cfg"].get("recompute_modules")
             if recompute_modules is not None:
                 # NOTE: MCore validates recompute_modules in TransformerConfig.__post_init__,
