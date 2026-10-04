@@ -1011,7 +1011,9 @@ class TQDataPlaneClient(DataPlaneClient):
 
         if bootstrap:
             _init_tq(cfg, checkpointing=checkpointing)
-        elif segment_size is None:
+        elif segment_size is None or self._backend != "mooncake_cpu":
+            # Only mooncake_cpu processes own a segment; other backends attach
+            # with the controller's conf unchanged.
             _connect_existing()
         else:
             _connect_existing_with_segment_size(segment_size)
