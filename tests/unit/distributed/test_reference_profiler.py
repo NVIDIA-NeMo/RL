@@ -1,11 +1,12 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-import tools.rl1610_profile as profiler
 import os
 import signal
 import sys
 
 import pytest
+
+import tools.rl1610_profile as profiler
 from tools.rl1610_profile import assign_processes, read_process
 
 
