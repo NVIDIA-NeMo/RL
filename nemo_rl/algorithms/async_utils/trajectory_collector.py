@@ -134,6 +134,19 @@ def _caused_by_ray_actor_death(error: BaseException) -> bool:
     return False
 
 
+def _summarize_error(error: BaseException, max_chars: int = 1000) -> str:
+    """Return ``"<type>: <message>"`` for a log line, keeping both ends if long.
+
+    A ``RayTaskError`` message starts with the remote traceback header and ends
+    with the actual exception, so a long message keeps its head and its tail.
+    """
+    text = str(error)
+    if len(text) > max_chars:
+        head = max_chars * 2 // 5
+        text = f"{text[:head]} ... {text[head - max_chars :]}"
+    return f"{type(error).__name__}: {text}"
+
+
 @ray.remote  # pragma: no cover
 class AsyncTrajectoryCollector:
     """Collects trajectories asynchronously and adds them to replay buffer."""
@@ -1927,11 +1940,18 @@ class AsyncTrajectoryCollector:
                 break
 
             retry_delay = _NEMO_GYM_RETRY_DELAY_BASE_SECONDS * (2 ** (attempt - 1))
+            # Name the cause on every retry, not only once the batch is given
+            # up: one failing result ends the whole stream, so without it the
+            # retries look identical and the root cause stays hidden.
             print(
                 "❌ NeMo-Gym batch did not complete prompt groups "
                 f"{sorted(pending_group_indices)}; retrying in "
                 f"{retry_delay:.1f}s "
-                f"(attempt {attempt + 1}/{max_attempts})"
+                f"(attempt {attempt + 1}/{max_attempts}); "
+                f"buffered={len(buffered_group_indices)} "
+                f"push_errors={len(push_errors)} "
+                f"cause={_summarize_error(last_error)}",
+                flush=True,
             )
             await asyncio.sleep(retry_delay)
 

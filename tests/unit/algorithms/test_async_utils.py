@@ -3276,7 +3276,7 @@ class TestAsyncTrajectoryCollector:
         assert "unexpected add status" in str(exc.value.__cause__)
 
     def test_nemo_gym_batch_retry_forwards_effort_config_without_duplicates(
-        self, monkeypatch
+        self, monkeypatch, capsys
     ):
         """Retries preserve effort shaping and do not re-enqueue buffered groups."""
 
@@ -3384,6 +3384,15 @@ class TestAsyncTrajectoryCollector:
         assert rollout_calls == 2
         assert replay_buffer.add.task_indices == [7, 8]
         assert target_weight not in collector._generating_targets
+        # The retry log names the stream error that caused it.
+        retry_lines = [
+            line
+            for line in capsys.readouterr().out.splitlines()
+            if "did not complete prompt groups" in line
+        ]
+        assert len(retry_lines) == 1
+        assert "cause=RuntimeError: transient stream failure" in retry_lines[0]
+        assert "buffered=1 push_errors=0" in retry_lines[0]
 
     def test_nemo_gym_actor_death_is_not_retried(self, monkeypatch):
         from ray.exceptions import ActorDiedError
@@ -3429,6 +3438,19 @@ class TestAsyncTrajectoryCollector:
             )
 
         assert rollout_calls == 1
+
+    def test_summarize_error_keeps_both_ends_of_long_messages(self):
+        short = trajectory_collector_mod._summarize_error(ValueError("bad row"))
+        assert short == "ValueError: bad row"
+
+        message = "HEAD" + "x" * 5000 + "TAIL"
+        summary = trajectory_collector_mod._summarize_error(
+            RuntimeError(message), max_chars=100
+        )
+        assert summary.startswith("RuntimeError: HEAD")
+        assert summary.endswith("TAIL")
+        assert " ... " in summary
+        assert len(summary) < 130
 
     def test_nemo_gym_actor_unavailable_is_not_terminal(self):
         from ray.exceptions import ActorUnavailableError
