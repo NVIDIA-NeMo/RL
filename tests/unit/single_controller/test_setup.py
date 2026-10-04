@@ -3434,4 +3434,4 @@ def test_legacy_setup_reserves_teachers_before_generation(
         ),
     )
     setup_single_controller(config, tokenizer="tokenizer", processor=None)
-    assert events == ["teachers", "generation"]
+    assert events == ["teachers", "generation", "generation"]

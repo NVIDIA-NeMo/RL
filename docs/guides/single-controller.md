@@ -37,6 +37,17 @@ parallelism, loads the initial weights even when training resumes, and stays on
 GPU without an optimizer or a second reference copy. Separate placement requires
 reference logprobs and a positive reference KL penalty.
 
+### Actor layout
+
+After setup, stdout shows the NVLink domain, hosts, advertised Ray GPU count,
+roles on each host-local GPU, and CPU actors. Teacher labels list actual config
+aliases and checkpoints. Identical rows collapse into host ranges; the default
+view shows at most 20 layouts and reports any remaining layout count. Use
+`--placement-full`, `--placement-host 'PATTERN'`, or
+`--placement-domain 'PATTERN'` for more detail. A dedicated head can show a known
+physical domain while advertising zero GPUs. Missing actor or GPU inventory is
+reported explicitly.
+
 ### Mandatory settings
 
 1. **Enable the TransferQueue data plane** (required — the entrypoint refuses to start otherwise):

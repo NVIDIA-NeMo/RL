@@ -1731,6 +1731,20 @@ def setup_single_controller(
         )
         setup_timing_metrics.teacher_reservation_time_s = time.perf_counter() - t0
 
+    if master_config.reference is None:
+        if train_cluster is not inference_cluster:
+            train_cluster.get_placement_groups()
+        reserve_generation()
+    # Probes need free bundle resources, so capture placement before workers start.
+    for cluster in [
+        train_cluster,
+        inference_cluster,
+        reference_cluster,
+        *teacher_clusters.values(),
+    ]:
+        if cluster is not None:
+            cluster.capture_gpu_placement()
+
     # Create build tasks for generation / trainer / (nemo-gym) workers
     build_tasks: dict[str, Callable[[], Any]] = {}
     generation = None
