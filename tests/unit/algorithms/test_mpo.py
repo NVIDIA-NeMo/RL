@@ -214,7 +214,7 @@ def test_nemotron_omni_mpo_recipe_validates():
     assert train_config["dataset_name"] == "MMPRPreference"
     assert "max_samples" in train_config
     assert master_config.data["validation"] is None
-    assert not master_config.logger["wandb_enabled"]
+    assert not master_config.logger.wandb_enabled
 
 
 def test_nemotron_omni_nopack_parity_config_matches_legacy_run():
@@ -254,7 +254,7 @@ def test_nemotron_omni_nopack_parity_config_matches_legacy_run():
     assert train_config["legacy_validation_split"] is True
     assert master_config.data["num_workers"] == 0
     assert master_config.cluster.num_nodes == 4
-    assert not master_config.logger["wandb_enabled"]
+    assert not master_config.logger.wandb_enabled
 
 
 @pytest.mark.parametrize(

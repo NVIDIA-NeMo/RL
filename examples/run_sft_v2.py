@@ -73,9 +73,7 @@ def main() -> None:
         config = parse_hydra_overrides(config, overrides)
     resolved = OmegaConf.to_container(config, resolve=True)
     master_config = MasterConfig.model_validate(resolved)
-    master_config.logger["log_dir"] = get_next_experiment_dir(
-        master_config.logger["log_dir"]
-    )
+    master_config.logger.log_dir = get_next_experiment_dir(master_config.logger.log_dir)
     pprint.pprint(master_config.model_dump())
 
     # NEMO_RL_OTEL_* env is snapshotted into the Ray runtime_env and inherited
