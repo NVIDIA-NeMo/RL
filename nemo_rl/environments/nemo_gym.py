@@ -46,6 +46,7 @@ from nemo_rl.data.multimodal_utils import (
     media_sources_equal,
     uses_image_placeholder,
 )
+from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_GYM_PORT_RANGE_HIGH,
     DEFAULT_GYM_PORT_RANGE_LOW,
@@ -77,6 +78,7 @@ from nemo_rl.experience.failures import (
     RolloutDataFailure,
     http_status_is_infra,
 )
+from nemo_rl.experience.interfaces import NEMO_GYM_UNUSABLE_ROLLOUT_KEY
 from nemo_rl.models.generation.interfaces import (
     resolve_routed_experts_dtype_name_for_model,
     should_use_async_rollouts,
@@ -239,6 +241,70 @@ def should_use_nemo_gym(master_config: NemoGymCompatibleConfig) -> bool:
     return True
 
 
+# Prompt length of the placeholder sample emitted for an unusable rollout. Fixed
+# so it always fits the sequence limit, and long enough that attention kernels
+# and context-parallel splits accept it (a 2-token sequence is rejected).
+_UNUSABLE_ROLLOUT_PROMPT_TOKENS = 128
+
+
+def _input_text(input_messages: Any) -> str:
+    """Concatenate the plain text of a Responses ``input`` (string or item list)."""
+    if isinstance(input_messages, str):
+        return input_messages
+    texts: List[str] = []
+    for item in input_messages if isinstance(input_messages, list) else []:
+        content = item.get("content") if isinstance(item, dict) else None
+        if isinstance(content, str):
+            texts.append(content)
+        elif isinstance(content, list):
+            texts.extend(
+                part["text"]
+                for part in content
+                if isinstance(part, dict) and isinstance(part.get("text"), str)
+            )
+    return "\n".join(texts)
+
+
+def _unusable_rollout_message_log(
+    tokenizer: PreTrainedTokenizerBase, input_messages: Any
+) -> list[dict[str, Any]]:
+    """Build the placeholder message log for a rollout with no usable tokens.
+
+    It only keeps the batch shape: a fixed-length prompt (the start of the
+    input text, padded with EOS) and a single EOS "generation" with logprob 0.
+    The caller marks the sample so that it carries no loss and no reward signal.
+    """
+    filler_token_id = tokenizer.eos_token_id
+    if filler_token_id is None:
+        filler_token_id = tokenizer.pad_token_id or 0
+    text = _input_text(input_messages)
+    try:
+        prompt_ids = list(tokenizer.encode(text, add_special_tokens=False))
+    except Exception:
+        prompt_ids = []
+    prompt_ids = prompt_ids[:_UNUSABLE_ROLLOUT_PROMPT_TOKENS]
+    prompt_ids += [filler_token_id] * (
+        _UNUSABLE_ROLLOUT_PROMPT_TOKENS - len(prompt_ids)
+    )
+    return [
+        {"role": "user", "content": "", "token_ids": torch.tensor(prompt_ids)},
+        {
+            "role": "assistant",
+            "content": "",
+            "token_ids": torch.tensor([filler_token_id]),
+            "generation_logprobs": torch.tensor([0.0]),
+            "is_invalid_tool_call": False,
+            "has_malformed_thinking": False,
+        },
+    ]
+
+
+def _mark_unusable_rollout(nemo_gym_result: dict, reason: str) -> None:
+    """Flag a NeMo-Gym result whose sample must be masked from loss and baseline."""
+    nemo_gym_result[MASK_SAMPLE] = True
+    nemo_gym_result[NEMO_GYM_UNUSABLE_ROLLOUT_KEY] = reason
+
+
 def _has_nan_generation_logprobs(result: dict) -> bool:
     """Return whether a postprocessed rollout contains NaN policy logprobs."""
     return any(
@@ -341,6 +407,10 @@ class NemoGymConfig(TypedDict):
     # server, switches run_rollouts to receipt mode, and assembles receipts
     # from the manifest control route. None/absent = legacy token-echo path.
     token_capture: NotRequired[Dict[str, Any] | None]
+    # Replace a rollout that yields no trainable tokens (no generation data, or a
+    # non-contiguous token chain) with a masked placeholder sample instead of
+    # raising and failing the whole rollout batch. Defaults to off (raise).
+    mask_unusable_rollouts: NotRequired[bool]
 
 
 # Gym control-plane server name (the model server hosting the ledger) and the
@@ -1222,10 +1292,23 @@ Depending on your data shape, you may want to change these values."""
             if not _is_trainable_output_item(output_item_dict):
                 continue
 
-            assert (
+            is_contiguous = (
                 seen_token_ids
                 == output_item_dict["prompt_token_ids"][: len(seen_token_ids)]
-            ), f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
+            )
+            if not is_contiguous and self.cfg.get("mask_unusable_rollouts", False):
+                # E.g. agent harnesses that rewrite or compact their history.
+                # Keep the contiguous prefix as a masked placeholder sample.
+                print(
+                    "[nemo_gym] masking a rollout with a non-contiguous token "
+                    f"chain at trainable item {turn_idx} "
+                    f"(seen={len(seen_token_ids)} tokens, next prompt="
+                    f"{len(output_item_dict['prompt_token_ids'])} tokens)",
+                    flush=True,
+                )
+                _mark_unusable_rollout(nemo_gym_result, "non_contiguous_token_chain")
+                break
+            assert is_contiguous, f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
 Seen token IDs: {seen_token_ids}
 Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
 output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(seen_token_ids)]}
@@ -1379,16 +1462,27 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             output_item_types = [
                 o.get("type") for o in nemo_gym_result["response"]["output"]
             ]
-            raise ValueError(
-                f"NeMo Gym returned a result with no generation data. "
-                f"Possible causes: (1) the prompt for the first turn already exceeds the vLLM max_model_len, "
-                f"so vLLM rejected the request before any tokens could be generated; "
-                f"(2) all response output items were reasoning/tool-call items with no assistant generation.\n"
-                f"  Prompt length: {prompt_len_str}.\n"
-                f"  response.output item types ({len(output_item_types)} items): {output_item_types}.\n"
-                f"  → If (1): increase `policy.max_total_sequence_length` and `policy.generation.vllm_cfg.max_model_len` "
-                f"above the prompt length above.\n"
-                f"  → If (2): inspect why no assistant content was produced for this rollout."
+            if not self.cfg.get("mask_unusable_rollouts", False):
+                raise ValueError(
+                    f"NeMo Gym returned a result with no generation data. "
+                    f"Possible causes: (1) the prompt for the first turn already exceeds the vLLM max_model_len, "
+                    f"so vLLM rejected the request before any tokens could be generated; "
+                    f"(2) all response output items were reasoning/tool-call items with no assistant generation.\n"
+                    f"  Prompt length: {prompt_len_str}.\n"
+                    f"  response.output item types ({len(output_item_types)} items): {output_item_types}.\n"
+                    f"  → If (1): increase `policy.max_total_sequence_length` and `policy.generation.vllm_cfg.max_model_len` "
+                    f"above the prompt length above.\n"
+                    f"  → If (2): inspect why no assistant content was produced for this rollout."
+                )
+            print(
+                "[nemo_gym] masking a rollout with no generation data "
+                f"(prompt length: {prompt_len_str}; response.output item "
+                f"types: {output_item_types})",
+                flush=True,
+            )
+            _mark_unusable_rollout(nemo_gym_result, "no_generation_data")
+            nemo_rl_message_log = _unusable_rollout_message_log(
+                tokenizer, input_messages
             )
 
         if initial_multimodal_data_omitted:
@@ -1624,6 +1718,7 @@ def _build_gym_actor_config(
     invalid_tool_call_patterns = nemo_gym_dict.pop("invalid_tool_call_patterns", None)
     thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
     tokenizer_config = nemo_gym_dict.pop("tokenizer_config", None)
+    mask_unusable_rollouts = bool(nemo_gym_dict.pop("mask_unusable_rollouts", False))
     port_range = {
         key: value
         for key in ("port_range_low", "port_range_high")
@@ -1664,6 +1759,7 @@ def _build_gym_actor_config(
         use_fastokens=use_fastokens,
         initial_global_config_dict=nemo_gym_dict,
         token_capture=token_capture,
+        mask_unusable_rollouts=mask_unusable_rollouts,
         **port_range,
         **multimodal_flags,
     )

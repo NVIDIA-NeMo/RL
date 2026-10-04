@@ -194,6 +194,32 @@ class TestMaskEnvFlaggedSamplesBatchedGate:
         assert "mask_sample" not in self._final_batch(False)
 
 
+class TestUnusableRolloutLossMultiplier:
+    @pytest.mark.parametrize("mask_env_flagged_samples", [True, False])
+    def test_unusable_rollout_gets_zero_loss_multiplier(self, mask_env_flagged_samples):
+        results = [_gate_result(False), _gate_result(False)]
+        results[1]["full_result"]["_ng_unusable_rollout"] = "no_generation_data"
+        results[1]["full_result"]["mask_sample"] = True
+        input_batch = BatchedDataDict({"loss_multiplier": torch.tensor([1.0, 0.5])})
+
+        rollout_result = _postprocess_single_nemo_gym_group(
+            nemo_gym_rows=[{"agent_ref": {"name": "agent"}} for _ in results],
+            results=results,
+            timer=Timer(),
+            timer_prefix="timing/test",
+            policy_generation=_FakeGeneration(),
+            input_batch=input_batch,
+            tokenizer=_FakeTokenizer(),
+            log_full_result_tables=False,
+            mask_env_flagged_samples=mask_env_flagged_samples,
+        )
+
+        loss_multiplier = rollout_result.final_batch["loss_multiplier"]
+        assert loss_multiplier.tolist() == [1.0, 0.0]
+        # The input batch is not mutated.
+        assert input_batch["loss_multiplier"].tolist() == [1.0, 0.5]
+
+
 # =====================================================================
 # Penalty 1: penalize_duplicated_reasoning
 # =====================================================================

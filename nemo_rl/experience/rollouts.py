@@ -69,6 +69,7 @@ from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ID_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
+    NEMO_GYM_UNUSABLE_ROLLOUT_KEY,
 )
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.models.generation.interfaces import (
@@ -319,6 +320,18 @@ def _drop_env_mask_sample_flag(extra: dict[str, Any] | None) -> None:
         return
     extra.pop(MASK_SAMPLE, None)
     (extra.get("instance_config") or {}).pop(MASK_SAMPLE, None)
+
+
+def _unusable_rollout_flags(extras: Iterable[dict[str, Any] | None]) -> torch.Tensor:
+    """Return True for NeMo-Gym placeholder samples that replaced an unusable rollout.
+
+    Unlike ``mask_sample`` this is not gated by ``env.should_mask_flagged_samples``:
+    a placeholder carries no real tokens, so its loss weight is always zeroed.
+    """
+    return torch.tensor(
+        [bool((extra or {}).get(NEMO_GYM_UNUSABLE_ROLLOUT_KEY)) for extra in extras],
+        dtype=torch.bool,
+    )
 
 
 def _mask_sample_flags(extras: Iterable[dict[str, Any] | None]) -> torch.Tensor:
@@ -3168,6 +3181,12 @@ def _postprocess_single_nemo_gym_group(
     )
     input_ids = batched_flat["token_ids"]
 
+    loss_multiplier = input_batch["loss_multiplier"]
+    unusable = _unusable_rollout_flags(result["full_result"] for result in results)
+    if unusable.any():
+        loss_multiplier = torch.as_tensor(loss_multiplier).clone()
+        loss_multiplier[unusable] = 0
+
     final_batch = BatchedDataDict[DatumSpec](
         {
             "agent_ref": [r["agent_ref"] for r in results],
@@ -3176,7 +3195,7 @@ def _postprocess_single_nemo_gym_group(
             "length": torch.tensor(
                 [len(r["input_message_log"][0]["token_ids"]) for r in results]
             ),
-            "loss_multiplier": input_batch["loss_multiplier"],
+            "loss_multiplier": loss_multiplier,
             # Unnecessary parts of the DatumSpec unused by the GRPO algorithm
             # extra_env_info: dict[str, Any]
             # idx: int
