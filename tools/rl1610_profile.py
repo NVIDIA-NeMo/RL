@@ -321,7 +321,7 @@ def plot(args: argparse.Namespace) -> int:
         "warmup_steps": args.warmup_steps,
         "collection_errors": sum("collection_error" in sample for sample in samples),
     }
-    figure, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+    figure, axes = plt.subplots(3, 1, figsize=(16, 10), sharex=True)
     series = {}
     nodes = {}
     for sample in samples:
@@ -329,9 +329,11 @@ def plot(args: argparse.Namespace) -> int:
             continue
         host = sample["hostname"]
         for actor in sample["actors"]:
-            label = (
-                f"{host}/{actor['name'] or actor['class_name']}/{actor['actor_id'][:8]}"
-            )
+            actor_class = actor["class_name"].rsplit(".", 1)[-1]
+            name = actor["name"] or actor_class
+            if name != actor_class:
+                name = f"{name} ({actor_class})"
+            label = f"{host}/{name}/{actor['actor_id'][:8]}"
             series.setdefault(label, []).append(
                 (sample["timestamp"] - start, actor["pss_bytes"], actor["cpu_cores"])
             )
@@ -358,12 +360,21 @@ def plot(args: argparse.Namespace) -> int:
     axes[1].set_ylabel("Actor tree CPU cores")
     axes[2].set_ylabel("Node OS used (GiB)")
     axes[2].set_xlabel("Seconds in measured window")
-    axes[0].legend(fontsize=6, bbox_to_anchor=(1.02, 1), loc="upper left")
-    axes[2].legend(fontsize=6, bbox_to_anchor=(1.02, 1), loc="upper left")
+    figure.legend(
+        *axes[0].get_legend_handles_labels(),
+        fontsize=6,
+        ncol=3,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.01),
+    )
+    axes[2].legend(fontsize=8, loc="upper right")
     for axis in axes:
         axis.grid(alpha=0.2)
-    figure.tight_layout()
-    figure.savefig(Path(args.output) / "actor-resources.png", dpi=150)
+    figure.tight_layout(rect=(0, 0.23, 1, 1))
+    figure.savefig(
+        Path(args.output) / "actor-resources.png", dpi=150, bbox_inches="tight"
+    )
+    plt.close(figure)
     (Path(args.output) / "summary.json").write_text(
         json.dumps(summary, indent=2) + "\n"
     )
