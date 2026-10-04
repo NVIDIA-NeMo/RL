@@ -39,7 +39,6 @@ import weakref
 from collections.abc import Callable
 from importlib import resources
 from pathlib import Path
-from queue import Empty, SimpleQueue
 from typing import Any, cast
 
 import torch
@@ -185,36 +184,12 @@ def _register_checked(store: Any, ptr: int, nbytes: int) -> None:
         )
 
 
-def _native_buffer_pool_cls() -> Any:
-    """``mooncake.store.BufferPool`` when the wheel carries it, else ``None``.
-
-    Mooncake exposes the pool this module hand-rolls below: it registers
-    regions once and leases slices, so ``acquire``/``release`` never enter the
-    kernel. Prefer it — it is the same contract with one fewer implementation
-    to own, and its overflow regions register an oversized request once
-    instead of the transient register/unregister :class:`_StagingPool` falls
-    back to.
-
-    Detected rather than imported at module scope because the class lives in a
-    compiled extension: ``mooncake.store`` is absent on a host without the
-    wheel, and older wheels have the module without the attribute. Upstream's
-    own ``mooncake/buffer_pool.py`` guards it the same way.
-    """
-    if os.environ.get("MC_NATIVE_BUFFER_POOL", "1") == "0":
-        # Escape hatch for A/B measurement against the in-tree pool, and for
-        # falling back in the field without a redeploy. Not a config key: the
-        # two pools hold the same contract, so this selects an implementation,
-        # not a behaviour a recipe should be pinning.
-        return None
-    try:
-        from mooncake.store import BufferPool
-    except ImportError:
-        return None
-    return BufferPool
-
-
 class _NativeStagingPool:
-    """:class:`_StagingPool`'s contract over ``mooncake.store.BufferPool``.
+    """Staging buffers leased from ``mooncake.store.BufferPool``.
+
+    The pool registers its regions once and leases slices, so acquire and
+    release never enter the kernel. It carves slots out of the client's local
+    buffer (``local_buffer_size``).
 
     The call sites want a torch ``uint8`` tensor — they slice it, ``view`` it
     to the payload dtype and read ``data_ptr()``. Build that over
@@ -246,74 +221,6 @@ class _NativeStagingPool:
             yield torch.frombuffer(allocation, dtype=torch.uint8)
 
 
-class _StagingPool:
-    """RDMA-registered host buffers, owned by one mooncake client.
-
-    Not thread-local: the ``ThreadPoolExecutor`` is rebuilt inside each
-    get/put, so thread-local buffers would be discarded every call. Sized to
-    the executor width so no worker normally waits for a slot.
-
-    A slot's buffer is registered for as long as the pool holds it. The
-    invariant that matters is the converse: **no buffer is ever freed while
-    still registered**, because mooncake would keep a mapping over an address
-    the allocator immediately hands to the next caller.
-    """
-
-    def __init__(self, store: Any, n_slots: int, max_bytes: int) -> None:
-        self._store = store
-        self._free: SimpleQueue = SimpleQueue()
-        for _ in range(n_slots):
-            self._free.put(None)  # allocated on first use
-        self._n_slots = n_slots
-        self._max_bytes = max_bytes
-
-    @contextlib.contextmanager
-    def buffer(self, nbytes: int):
-        # Outliers bypass the pool: slots only ever grow, so admitting one
-        # long-sequence sample would pin that size in every slot for the
-        # rest of the run. Registering it transiently is the cheaper trade.
-        if nbytes > self._max_bytes:
-            tmp = torch.empty(nbytes, dtype=torch.uint8)
-            _register_checked(self._store, tmp.data_ptr(), tmp.nbytes)
-            try:
-                yield tmp
-            finally:
-                self._store.unregister_buffer(tmp.data_ptr())
-            return
-        try:
-            buf = self._free.get(timeout=_STAGING_SLOT_TIMEOUT_S)
-        except Empty:
-            raise RuntimeError(
-                f"No mooncake staging slot free after {_STAGING_SLOT_TIMEOUT_S}s. "
-                f"The pool has {self._n_slots} slots, sized to one TQ worker "
-                "pool, so this means overlapping put/get calls in this process. "
-                "Set data_plane.mooncake_cpu.reuse_registered_buffers=false to "
-                "fall back to upstream's per-call registration."
-            ) from None
-        try:
-            if buf is None or buf.nbytes < nbytes:
-                if buf is not None:
-                    status = self._store.unregister_buffer(buf.data_ptr())
-                    if status is not None and status != 0:
-                        # Dropping it now would hand memory the NIC may still
-                        # map back to the allocator — see _register_checked.
-                        raise RuntimeError(
-                            f"mooncake unregister_buffer(0x{buf.data_ptr():x}) "
-                            f"failed with status {status}; refusing to free a "
-                            "buffer that may still be registered."
-                        )
-                    # Empty the slot before allocating: if the registration
-                    # below fails, the slot must come back empty rather than
-                    # holding a buffer the NIC no longer maps.
-                    buf = None
-                grown = torch.empty(nbytes, dtype=torch.uint8)
-                _register_checked(self._store, grown.data_ptr(), grown.nbytes)
-                buf = grown
-            yield buf
-        finally:
-            self._free.put(buf)
-
-
 class _StagingPoolRegistry:
     """Owns each client's staging pool, keyed weakly so it dies with the client.
 
@@ -326,47 +233,27 @@ class _StagingPoolRegistry:
         self._n_slots = n_slots
         self._max_bytes = max_bytes
         self._lock = threading.Lock()
-        self._native_cls = _native_buffer_pool_cls()
-        self._pools: weakref.WeakKeyDictionary[
-            Any, _StagingPool | _NativeStagingPool
-        ] = weakref.WeakKeyDictionary()
+        self._pools: weakref.WeakKeyDictionary[Any, _NativeStagingPool] = (
+            weakref.WeakKeyDictionary()
+        )
 
-    def _build(self, client: Any) -> _StagingPool | _NativeStagingPool:
-        """Native pool where the wheel has one, hand-rolled otherwise.
+    def _build(self, client: Any) -> _NativeStagingPool:
+        # Deferred: mooncake.store is a compiled extension, absent without the wheel.
+        from mooncake.store import BufferPool
 
-        ``BufferPool`` rejects anything that is not a mooncake ``PyClient``
-        ("must be ... a store wrapper that implements
-        ``_get_pyclient_capsule()``"), and TQ's ``_store`` is only that by
-        convention. Fall back rather than fail: :class:`_StagingPool` holds
-        the same contract, so an incompatible store costs throughput, not
-        correctness. Warned rather than silent — the whole point of the swap
-        is the registration it avoids.
-        """
-        if self._native_cls is not None:
-            try:
-                return _NativeStagingPool(
-                    self._native_cls(
-                        client._store,
-                        max_bytes=self._n_slots * self._max_bytes,
-                        max_size_class=self._max_bytes,
-                        block_on_exhaustion=True,
-                        default_timeout=_STAGING_SLOT_TIMEOUT_S,
-                        prewarm_size=self._max_bytes,
-                        prewarm_count=self._n_slots,
-                    ),
-                )
-            except (RuntimeError, TypeError) as error:
-                warnings.warn(
-                    f"mooncake BufferPool rejected this store ({error}); "
-                    "falling back to the in-tree staging pool. Oversized "
-                    "transfers will re-register per call.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-                self._native_cls = None
-        return _StagingPool(client._store, self._n_slots, self._max_bytes)
+        return _NativeStagingPool(
+            BufferPool(
+                client._store,
+                max_bytes=self._n_slots * self._max_bytes,
+                max_size_class=self._max_bytes,
+                block_on_exhaustion=True,
+                default_timeout=_STAGING_SLOT_TIMEOUT_S,
+                prewarm_size=self._max_bytes,
+                prewarm_count=self._n_slots,
+            ),
+        )
 
-    def pool_for(self, client: Any) -> _StagingPool | _NativeStagingPool:
+    def pool_for(self, client: Any) -> _NativeStagingPool:
         """Return ``client``'s pool, building it at most once across threads.
 
         Locked because ``put``/``get`` drive the thread workers from a

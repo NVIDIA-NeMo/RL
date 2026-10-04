@@ -77,8 +77,6 @@ def test_register_checked_accepts_success_statuses(status) -> None:
     tq_adapter._register_checked(store, 0x1000, 4096)
 
 
-# Comfortably above every payload these tests stage, so the ceiling only
-# matters in the test that sets it explicitly.
 _MAX = 1 << 24
 
 
@@ -112,68 +110,6 @@ def test_register_all_buffers_patch_checks_upstream_call_site(monkeypatch) -> No
         client._register_all_buffers([0x1000, 0x2000], [4096, 4096])
 
 
-# ── pool slot bookkeeping ────────────────────────────────────────────────────
-
-
-def test_growing_a_slot_unregisters_before_dropping_the_old_buffer() -> None:
-    store = _FakeStore()
-    pool = tq_adapter._StagingPool(store, n_slots=1, max_bytes=_MAX)
-
-    with pool.buffer(1024) as small:
-        small_ptr = small.data_ptr()
-    assert store.registered == {small_ptr: 1024}
-
-    with pool.buffer(8 * 1024 * 1024) as big:
-        big_ptr = big.data_ptr()
-
-    assert small_ptr in store.unregistered
-    assert store.registered == {big_ptr: 8 * 1024 * 1024}
-
-
-def test_failed_growth_leaves_the_slot_empty_not_poisoned() -> None:
-    """A slot must never come back holding an unregistered buffer.
-
-    Reusing one is the silent variant of this bug: every later transfer
-    through that slot writes into memory the NIC never mapped and returns
-    -800, which retrying cannot fix.
-    """
-    store = _FakeStore(fail_after=0)
-    pool = tq_adapter._StagingPool(store, n_slots=1, max_bytes=_MAX)
-
-    with pytest.raises(RuntimeError, match="register_buffer"):
-        with pool.buffer(1024):
-            pass
-    assert store.registered == {}
-
-    store.fail_after = None
-    with pool.buffer(1024) as buf:
-        assert store.registered == {buf.data_ptr(): 1024}
-
-
-def test_oversized_transfer_bypasses_the_pool_and_unregisters() -> None:
-    """Outliers get a transient registration; it must not outlive the call."""
-    store = _FakeStore()
-    pool = tq_adapter._StagingPool(store, n_slots=1, max_bytes=4096)
-
-    with pool.buffer(8192) as buf:
-        assert store.registered == {buf.data_ptr(): 8192}
-        oversized_ptr = buf.data_ptr()
-
-    assert store.unregistered == [oversized_ptr]
-    assert store.registered == {}
-
-
-def test_slot_exhaustion_fails_loudly_instead_of_hanging(monkeypatch) -> None:
-    """More concurrent transfers than slots must raise, not block forever."""
-    monkeypatch.setattr(tq_adapter, "_STAGING_SLOT_TIMEOUT_S", 0.05)
-    pool = tq_adapter._StagingPool(_FakeStore(), n_slots=1, max_bytes=_MAX)
-
-    with pool.buffer(1024):
-        with pytest.raises(RuntimeError, match="No mooncake staging slot free"):
-            with pool.buffer(1024):
-                pass
-
-
 # ── lazy construction under concurrency ──────────────────────────────────────
 
 
@@ -192,17 +128,13 @@ def test_pool_is_constructed_once_under_concurrent_first_use(monkeypatch) -> Non
     relying on winning a race a fixed number of times.
     """
     constructed: list[object] = []
-    original_build = tq_adapter._StagingPoolRegistry._build
 
     def slow_build(self, client):  # type: ignore[no-untyped-def]
         time.sleep(0.05)  # widen the check-then-set window
-        pool = original_build(self, client)
+        pool = object()  # the invariant is the registry's, not the pool's
         constructed.append(pool)
         return pool
 
-    # Patch the registry's factory rather than _StagingPool.__init__: the
-    # invariant is the registry's, and which pool it builds now depends on
-    # whether the installed mooncake wheel carries BufferPool.
     monkeypatch.setattr(tq_adapter._StagingPoolRegistry, "_build", slow_build)
 
     # The production registry is a local of _patch_mooncake_staging_buffers, so

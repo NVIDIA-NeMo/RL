@@ -74,12 +74,11 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     instead of registering a fresh one per transfer; set false to fall back to
     upstream's per-call registration.
 
-    ``staging_buffer_size`` is that pool's per-slot ceiling. A bigger payload
-    still transfers with a transient registration, up to the pool's total of
-    4 slots; a single payload above that fails with the native pool. Slots
-    ratchet — they grow to the largest payload
-    admitted and never shrink — so raise it only when a per-key payload (one
-    sample of one field) genuinely exceeds it, not for headroom.
+    ``staging_buffer_size`` is that pool's per-slot ceiling (mooncake's native
+    ``BufferPool``). A bigger payload still transfers with a transient
+    registration, up to the pool's total of 4 slots; a single payload above
+    that fails. Raise it only when a per-key payload (one sample of one
+    field) genuinely exceeds it.
 
     ``use_gdr`` lets CUDA-initialized clients transfer through TransferQueue's
     persistent GPU staging buffer. ``gdr_staging_buffer_mb`` is the positive
