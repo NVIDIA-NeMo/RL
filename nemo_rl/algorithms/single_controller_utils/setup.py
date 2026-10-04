@@ -1300,7 +1300,7 @@ def setup_single_controller(
         if token_capture_cfg.capture_dir is None:
             token_capture_cfg.capture_dir = os.path.abspath(
                 os.path.join(
-                    master_config.logger.get("log_dir") or "logs",
+                    master_config.logger.log_dir or "logs",
                     "gym_token_capture",
                 )
             )
@@ -2022,8 +2022,8 @@ def setup_single_controller(
         use_nemo_gym=use_nemo_gym,
         mask_env_flagged_samples=should_mask_flagged_samples(master_config.env),
         log_full_result_tables=should_log_nemo_gym_full_result_tables(
-            wandb_enabled=master_config.logger["wandb_enabled"],
-            wandb_config=master_config.logger["wandb"],
+            wandb_enabled=master_config.logger.wandb_enabled,
+            wandb_config=master_config.logger.wandb,
         ),
         reward_penalty_config=resolved_reward_penalty_config,
         tq_buffer=tq_buffer,

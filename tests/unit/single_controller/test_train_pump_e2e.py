@@ -42,6 +42,7 @@ from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.policy.tq_policy import TQPolicy
+from nemo_rl.utils.logger import LoggerConfig
 from tests.unit.models.policy.test_megatron_worker import create_megatron_test_config
 from tests.unit.single_controller._dp_fakes import _PARTITION_ID
 from tests.unit.test_utils import SimpleLossFn
@@ -346,14 +347,7 @@ def test_train_pump_drives_mcore_training_step(
                 max_inflight_prompts=num_prompts,
                 max_buffered_rollouts=num_prompts,
             ),
-            logger={
-                "log_dir": str(tmp_path / "logs"),
-                "wandb_enabled": False,
-                "swanlab_enabled": False,
-                "tensorboard_enabled": False,
-                "mlflow_enabled": False,
-                "monitor_gpus": False,
-            },
+            logger=LoggerConfig(log_dir=str(tmp_path / "logs"), monitor_gpus=False),
             # Actor __init__ builds a CheckpointManager + TimeoutChecker from
             # this block; enabled=False keeps the run write-free.
             checkpointing={
