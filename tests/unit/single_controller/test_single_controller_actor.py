@@ -48,6 +48,10 @@ from nemo_rl.algorithms.single_controller import (
     SingleControllerActor,
     _pooled_opd_metrics,
 )
+from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
+    AdvantageComputer,
+    AdvantageStageConfig,
+)
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     AsyncRLConfig,
@@ -55,7 +59,11 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 )
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
-from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, ROLLOUT_METRICS
+from nemo_rl.data_plane.schema import (
+    DP_TRAIN_FIELDS,
+    GROUP_ID_TAG,
+    ROLLOUT_METRICS,
+)
 from nemo_rl.data_plane.tq_token_sink import MEDIA_STAGING_FIELDS, STAGING_FIELDS
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -171,6 +179,7 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         save_state=_initial_grpo_save_state(),
         last_checkpoint_path=None,
         finalizer_actors=[],
+        advantage_actors=[],
         data_plane_checkpoint_metadata=None,
         partition_includes_multimodal_fields=False,
         bootstrap_identity=None,
@@ -187,6 +196,64 @@ def _init_controller(master_config, actor_args):
         actor_args=actor_args,
         setup_timing_metrics=SetupTimingMetrics(),
     )
+
+
+def _one_group_tags(count: int, *, weight_version: int = 0) -> list[dict[str, object]]:
+    """Tags for one prompt group of ``count`` generations.
+
+    The stage keys its baseline on GROUP_ID_TAG, so a meta without it raises
+    rather than quietly grouping by prompt tokens -- which is what let two
+    distinct groups sharing prompt text share one baseline.
+    """
+    return [
+        {"weight_version": weight_version, GROUP_ID_TAG: "group-0"}
+        for _ in range(count)
+    ]
+
+
+def _stamp_advantage_stage_config(ctrl, *, shardable: bool = True) -> None:
+    """Mirror the advantage-stage half of ``__init__`` onto a hand-built stub.
+
+    The stubs below construct the controller with ``object.__new__`` and assign
+    the individual gates directly, but the stage reads them off
+    ``_advantage_stage_config`` and runs through ``_advantage_computer``, both
+    of which only ``__init__`` assigns. Deriving them here from the attributes
+    the caller just set keeps the two descriptions from disagreeing, so adding
+    a field to the stage config does not need an edit at every stub.
+
+    ``_advantage_actors`` is empty because these tests exercise the in-process
+    path. That also makes the shard split decline, leaving one whole-batch call.
+    """
+    penalties_enabled = ctrl._message_level_advantage_penalties_enabled
+    ctrl._advantage_actors = []
+    # Mirror the controller: a caller that installed a dump is asking for one,
+    # and the stage writes it, so the stage needs the same directory.
+    dump = getattr(ctrl, "_train_data_dump", None)
+    ctrl._advantage_stage_config = AdvantageStageConfig(
+        advantage=ctrl._advantage_cfg,
+        algo=ctrl._algo_cfg,
+        is_ppo=ctrl._is_ppo,
+        policy_logprobs_required=ctrl._policy_logprobs_required,
+        reference_logprobs_required=ctrl._reference_logprobs_required,
+        teacher_logprobs_required=ctrl._teacher_logprobs_required,
+        message_level_advantage_penalties_enabled=penalties_enabled,
+        shardable=shardable,
+        train_data_dump_dir=str(dump.log_dir) if dump is not None else None,
+    )
+    ctrl._advantage_computer = AdvantageComputer(
+        ctrl._dp_client,
+        config=ctrl._advantage_stage_config,
+        advantage_estimator=ctrl._advantage_estimator,
+    )
+    ctrl._train_data_dump = dump
+    ctrl._train_data_dump_rows = 0
+    # _absorb_advantage_outcome accumulates into these unconditionally, so they
+    # have to exist even for the non-OPD tests. Tests that assert on them set
+    # their own values after this call.
+    ctrl._opd_stat_sum = 0.0
+    ctrl._opd_stat_sumsq = 0.0
+    ctrl._opd_stat_count = 0
+    ctrl._opd_gap_sum = 0.0
 
 
 def test_resumed_mooncake_init_restores_without_partition_registration(
@@ -834,10 +901,10 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = True
+    _stamp_advantage_stage_config(ctrl)
     ctrl._step_log_dict = {
-        "rewards": [],
-        "sample_masks": [],
-        "masked_advantages": [],
+        "reward_partials": [],
+        "advantage_partials": [],
         "sequence_lengths": [],
         "num_mask_sample_filtered": [],
         "seq_logprob_error_metrics": [],
@@ -847,6 +914,7 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
         task_name="train",
         sample_ids=[f"sample-{i}" for i in range(batch_size)],
         fields=list(data.keys()),
+        tags=_one_group_tags(batch_size),
     )
 
     result_meta, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
@@ -930,10 +998,10 @@ def test_advantage_stage_writes_each_sample_filter_without_seq_threshold(
         seq_logprob_error_threshold=None,
         overlong_filtering=overlong_filtering,
     )
+    _stamp_advantage_stage_config(ctrl)
     ctrl._step_log_dict = {
-        "rewards": [],
-        "sample_masks": [],
-        "masked_advantages": [],
+        "reward_partials": [],
+        "advantage_partials": [],
         "num_mask_sample_filtered": [],
         "sequence_lengths": [],
         "seq_logprob_error_metrics": [],
@@ -943,6 +1011,7 @@ def test_advantage_stage_writes_each_sample_filter_without_seq_threshold(
         task_name="train",
         sample_ids=[f"sample-{i}" for i in range(batch_size)],
         fields=list(data.keys()),
+        tags=_one_group_tags(batch_size),
     )
 
     _, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
@@ -996,10 +1065,10 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
+    _stamp_advantage_stage_config(ctrl)
     ctrl._step_log_dict = {
-        "rewards": [],
-        "sample_masks": [],
-        "masked_advantages": [],
+        "reward_partials": [],
+        "advantage_partials": [],
         "num_mask_sample_filtered": [],
         "sequence_lengths": [],
         "seq_logprob_error_metrics": [],
@@ -1009,6 +1078,7 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
         task_name="train",
         sample_ids=[f"sample-{i}" for i in range(batch_size)],
         fields=list(data.keys()),
+        tags=_one_group_tags(batch_size),
     )
 
     _, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
@@ -1067,10 +1137,10 @@ def test_advantage_stage_clips_training_values_and_metrics() -> None:
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
+    _stamp_advantage_stage_config(ctrl)
     ctrl._step_log_dict = {
-        "rewards": [],
-        "sample_masks": [],
-        "masked_advantages": [],
+        "reward_partials": [],
+        "advantage_partials": [],
         "num_mask_sample_filtered": [],
         "sequence_lengths": [],
         "seq_logprob_error_metrics": [],
@@ -1080,6 +1150,7 @@ def test_advantage_stage_clips_training_values_and_metrics() -> None:
         task_name="train",
         sample_ids=[f"sample-{i}" for i in range(batch_size)],
         fields=list(data.keys()),
+        tags=_one_group_tags(batch_size),
     )
 
     asyncio.run(ctrl._advantage_stage(meta))
@@ -1089,9 +1160,9 @@ def test_advantage_stage_clips_training_values_and_metrics() -> None:
         data_plane.written_fields["advantages"],
         torch.tensor([[-1.0] * sequence_length, [2.0] * sequence_length]),
     )
-    logged = torch.cat(ctrl._step_log_dict["masked_advantages"])
-    assert logged.min().item() == pytest.approx(-1.0)
-    assert logged.max().item() == pytest.approx(2.0)
+    (logged,) = ctrl._step_log_dict["advantage_partials"]
+    assert logged.minimum == pytest.approx(-1.0)
+    assert logged.maximum == pytest.approx(2.0)
 
 
 def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
@@ -1132,10 +1203,10 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
+    _stamp_advantage_stage_config(ctrl)
     ctrl._step_log_dict = {
-        "rewards": [],
-        "sample_masks": [],
-        "masked_advantages": [],
+        "reward_partials": [],
+        "advantage_partials": [],
         "num_mask_sample_filtered": [],
         "sequence_lengths": [],
         "seq_logprob_error_metrics": [],
@@ -1145,6 +1216,7 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
         task_name="train",
         sample_ids=[f"sample-{i}" for i in range(batch_size)],
         fields=list(data.keys()),
+        tags=_one_group_tags(batch_size),
     )
 
     result_meta, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
@@ -1195,10 +1267,10 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
+    _stamp_advantage_stage_config(ctrl)
     ctrl._step_log_dict = {
-        "rewards": [],
-        "sample_masks": [],
-        "masked_advantages": [],
+        "reward_partials": [],
+        "advantage_partials": [],
         "num_mask_sample_filtered": [],
         "sequence_lengths": [],
         "seq_logprob_error_metrics": [],
@@ -1208,6 +1280,7 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
         task_name="train",
         sample_ids=[f"sample-{i}" for i in range(batch_size)],
         fields=list(data.keys()),
+        tags=_one_group_tags(batch_size),
     )
 
     result_meta, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
@@ -1289,10 +1362,10 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs(tmp_path) -> Non
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
+    _stamp_advantage_stage_config(ctrl)
     ctrl._step_log_dict = {
-        "rewards": [],
-        "sample_masks": [],
-        "masked_advantages": [],
+        "reward_partials": [],
+        "advantage_partials": [],
         "sequence_lengths": [],
         "seq_logprob_error_metrics": [],
         "num_mask_sample_filtered": [],
@@ -1307,6 +1380,7 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs(tmp_path) -> Non
         sample_ids=["a", "b"],
         fields=[],
         sequence_lengths=[3, 3],
+        tags=_one_group_tags(2),
     )
 
     enriched, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
@@ -1321,8 +1395,10 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs(tmp_path) -> Non
         "repeated_batch",
     }
     assert "logprobs_policy" not in captured_kwargs
-    # The estimator keeps the dense, zero-padded prompt matrix it groups on.
-    assert captured_kwargs["prompt_ids"].tolist() == [[10, 11], [20, 0]]
+    # The estimator groups on the prompt-group key, not the prompt tokens:
+    # both rows here were generated in one group, so they share one baseline
+    # even though their prompts differ.
+    assert captured_kwargs["prompt_ids"].tolist() == [[0], [0]]
     assert torch.allclose(
         captured_kwargs["teacher_logprobs"] - captured_kwargs["prev_logprobs"],
         torch.full((2, 3), 0.25),
@@ -1338,8 +1414,10 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs(tmp_path) -> Non
         written_advantages,
         torch.full_like(written_advantages, 0.1),
     )
-    logged = torch.cat(ctrl._step_log_dict["masked_advantages"])
-    torch.testing.assert_close(logged, torch.full((4,), 0.1))
+    (logged,) = ctrl._step_log_dict["advantage_partials"]
+    assert logged.count == 4
+    assert logged.minimum == pytest.approx(0.1)
+    assert logged.maximum == pytest.approx(0.1)
 
     dump_timings = ctrl._timer.get_elapsed("train_data_dump")
     assert len(dump_timings) == 1
@@ -1411,10 +1489,10 @@ def test_opd_advantage_stage_pools_raw_gap_separately_under_tropd() -> None:
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
+    _stamp_advantage_stage_config(ctrl)
     ctrl._step_log_dict = {
-        "rewards": [],
-        "sample_masks": [],
-        "masked_advantages": [],
+        "reward_partials": [],
+        "advantage_partials": [],
         "sequence_lengths": [],
         "seq_logprob_error_metrics": [],
         "num_mask_sample_filtered": [],
@@ -1429,6 +1507,7 @@ def test_opd_advantage_stage_pools_raw_gap_separately_under_tropd() -> None:
         sample_ids=["a", "b"],
         fields=[],
         sequence_lengths=[3, 3],
+        tags=_one_group_tags(2),
     )
 
     asyncio.run(ctrl._advantage_stage(meta))
@@ -1445,8 +1524,17 @@ def test_opd_advantage_stage_pools_raw_gap_separately_under_tropd() -> None:
     ] == pytest.approx(0.25)
     assert metrics["on_policy_distillation/adv_mean"] == pytest.approx(0.0, abs=1e-6)
     assert "advantages" in ctrl._dp_client.put_fields
-    trained = torch.cat(ctrl._step_log_dict["masked_advantages"])
+    # The stage reduces the trained advantages to moments rather than keeping
+    # the tensor, so read the spread off the column it wrote. That column is
+    # post-clip, which is what masked_advantages used to hold, and it crosses
+    # the data plane jagged, so compare against a flattened mask.
+    written = ctrl._dp_client.put_fields["advantages"]
+    trained = torch.masked_select(
+        written.values() if written.is_nested else written.reshape(-1),
+        token_mask.bool().reshape(-1),
+    )
     assert trained.numel() == 4
+    assert ctrl._step_log_dict["advantage_partials"][0].count == 4
     assert trained.mean().item() == pytest.approx(0.0, abs=1e-6)
     # Centered, not merely shrunk: the proximal advantages keep their spread.
     assert trained.std().item() > 0.1
@@ -1799,9 +1887,8 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._batch_promotions = {}
     ctrl._finalizer_metrics_by_group = {}
     ctrl._step_log_dict = {
-        "rewards": [],
-        "sample_masks": [],
-        "masked_advantages": [],
+        "reward_partials": [],
+        "advantage_partials": [],
         "sequence_lengths": [],
         "num_mask_sample_filtered": [],
         "seq_logprob_error_metrics": [],
@@ -1829,7 +1916,7 @@ def test_train_pump_fails_if_rollout_exhausts_during_partial_step() -> None:
         sample_ids=["sample-0"],
         fields=[],
         sequence_lengths=[1],
-        tags=[{"weight_version": 0}],
+        tags=_one_group_tags(1),
     )
     ctrl = _train_pump_controller(sampler=_OneThenEmptySampler(meta))
 
@@ -1888,7 +1975,7 @@ def _dropping_controller(*, credit_in_evict: bool):
         sample_ids=["sample-0"],
         fields=[],
         sequence_lengths=[1],
-        tags=[{"weight_version": 0}],
+        tags=_one_group_tags(1),
     )
     sampler = _DroppingSampler(meta, credit_in_evict=credit_in_evict)
     ctrl = _train_pump_controller(sampler=sampler)
@@ -1952,7 +2039,7 @@ def test_train_pump_prunes_stamps_older_than_the_step_that_just_closed(
         sample_ids=["sample-0"],
         fields=[],
         sequence_lengths=[1],
-        tags=[{"weight_version": 3}],
+        tags=_one_group_tags(1, weight_version=3),
     )
     ctrl = _train_pump_controller(sampler=_OneThenEmptySampler(meta))
     ctrl._async_cfg.rollout_failure.min_step_batch_fraction = 0.5
@@ -1994,7 +2081,7 @@ def test_train_pump_requests_and_fetches_only_required_logprobs(
         sample_ids=["sample-0", "sample-1"],
         fields=[],
         sequence_lengths=[1, 1],
-        tags=[{"weight_version": 0}, {"weight_version": 0}],
+        tags=_one_group_tags(2),
     )
     ctrl = _train_pump_controller(sampler=_FullStepSampler(meta))
     ctrl._policy_logprobs_required = policy_logprobs_required
@@ -2027,7 +2114,7 @@ def test_train_pump_rejects_step_with_no_valid_training_chunks() -> None:
         sample_ids=["sample-0"],
         fields=[],
         sequence_lengths=[1],
-        tags=[{"weight_version": 0}],
+        tags=_one_group_tags(1),
     )
     ctrl = _train_pump_controller(sampler=_OneThenEmptySampler(meta))
     ctrl._master_config.grpo.num_prompts_per_step = 1
@@ -2056,7 +2143,7 @@ def test_train_pump_skips_empty_chunk_and_trains_later_valid_chunk(
         sample_ids=["empty-sample"],
         fields=[],
         sequence_lengths=[1],
-        tags=[{"weight_version": 0}],
+        tags=_one_group_tags(1),
     )
     valid_meta = KVBatchMeta(
         partition_id="rollout_data",
@@ -2064,7 +2151,7 @@ def test_train_pump_skips_empty_chunk_and_trains_later_valid_chunk(
         sample_ids=["valid-sample"],
         fields=[],
         sequence_lengths=[1],
-        tags=[{"weight_version": 0}],
+        tags=_one_group_tags(1),
     )
     ctrl = _train_pump_controller(sampler=_SequenceSampler([empty_meta, valid_meta]))
     ctrl._advantage_stage = AsyncMock(
@@ -2098,7 +2185,7 @@ def test_train_pump_logs_nonzero_stale_group_metrics(monkeypatch) -> None:
         sample_ids=["sample-0", "sample-1"],
         fields=[],
         sequence_lengths=[1, 1],
-        tags=[{"weight_version": 0}, {"weight_version": 0}],
+        tags=_one_group_tags(2),
     )
     ctrl = _train_pump_controller(sampler=_EvictingSampler(meta))
     ctrl._sync_weights = AsyncMock(return_value=1)
@@ -2125,7 +2212,7 @@ def test_train_pump_aggregates_selected_rollout_metrics_across_chunks(
             fields=[],
             sequence_lengths=[1],
             extra_info={ROLLOUT_METRICS: [metrics]},
-            tags=[{"weight_version": 0}],
+            tags=_one_group_tags(1),
         )
         for index, metrics in enumerate(
             [
@@ -2182,7 +2269,7 @@ def test_train_pump_collects_generation_metrics_at_step_boundaries(
         sample_ids=["sample-0"],
         fields=[],
         sequence_lengths=[1],
-        tags=[{"weight_version": 0}],
+        tags=_one_group_tags(1),
     )
     events: list[str] = []
     ctrl = _train_pump_controller(sampler=_ChunkedSampler(meta, chunks=2))
@@ -2236,7 +2323,7 @@ def test_train_pump_chunked_step_by_engine_regime(
         sample_ids=["sample-0"],
         fields=[],
         sequence_lengths=[1],
-        tags=[{"weight_version": 0}],
+        tags=_one_group_tags(1),
     )
     # num_prompts_per_step is 2 in the harness: two single-group chunks close
     # the streaming step, one two-group chunk the blocking one.
@@ -2301,7 +2388,7 @@ def test_train_pump_does_not_offload_the_policy_on_a_grpo_run(monkeypatch) -> No
         sample_ids=["sample-0"],
         fields=[],
         sequence_lengths=[1],
-        tags=[{"weight_version": 0}],
+        tags=_one_group_tags(1),
     )
     calls: list[str] = []
     ctrl = _train_pump_controller(sampler=_ChunkedSampler(meta, chunks=2))
@@ -2398,7 +2485,7 @@ def _single_group_meta() -> KVBatchMeta:
         sample_ids=["sample-0"],
         fields=[],
         sequence_lengths=[1],
-        tags=[{"weight_version": 0}],
+        tags=_one_group_tags(1),
     )
 
 
@@ -2717,14 +2804,21 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     ctrl._train_data_dump = None
     ctrl._is_ppo = True
     ctrl._master_config = SimpleNamespace(
-        ppo=SimpleNamespace(seq_logprob_error_threshold=None, overlong_filtering=False)
+        ppo=SimpleNamespace(
+            seq_logprob_error_threshold=None,
+            overlong_filtering=False,
+            # The shard-decline log names the estimator, so an unshardable
+            # stub has to carry one even though the assertions below ignore it.
+            adv_estimator=SimpleNamespace(name="gae"),
+        )
     )
     ctrl._algo_cfg = ctrl._master_config.ppo
     ctrl._message_level_advantage_penalties_enabled = False
+    # gae normalizes over the whole batch, so it is not shard-invariant.
+    _stamp_advantage_stage_config(ctrl, shardable=False)
     ctrl._step_log_dict = {
-        "rewards": [],
-        "sample_masks": [],
-        "masked_advantages": [],
+        "reward_partials": [],
+        "advantage_partials": [],
         "sequence_lengths": [],
         "num_mask_sample_filtered": [],
         "seq_logprob_error_metrics": [],
@@ -2734,6 +2828,7 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
         task_name="train",
         sample_ids=[f"sample-{i}" for i in range(batch_size)],
         fields=list(data.keys()),
+        tags=_one_group_tags(batch_size),
     )
 
     result_meta, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
@@ -2761,7 +2856,9 @@ def test_train_pump_logs_dump_timing_after_optimizer_step(
         sample_ids=["sample-0", "sample-1"],
         fields=[],
         sequence_lengths=[1, 1],
-        tags=[{"weight_version": 0}, {"weight_version": 0}],
+        # The advantage stage reads the prompt-group key off every row and
+        # raises when it is absent, so the pump cannot run without it.
+        tags=_one_group_tags(2),
     )
     ctrl = _train_pump_controller(sampler=_FullStepSampler(meta))
     ctrl._logger = MagicMock()
@@ -2780,6 +2877,9 @@ def test_train_pump_logs_dump_timing_after_optimizer_step(
         )
         # Seed chunk-write time to verify publication adds to the per-step sum.
         ctrl._timer.record("train_data_dump", 2.0)
+        # The chunk above stands in for the stage's write, so stand in for the
+        # row count it would have reported alongside it too.
+        ctrl._train_data_dump_rows = len(meta.sample_ids)
 
     def finish_training() -> dict:
         assert not final.exists()
