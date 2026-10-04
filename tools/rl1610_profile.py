@@ -238,13 +238,14 @@ def record(args: argparse.Namespace) -> int:
         )
         try:
             with driver as child:
-                return collect(
+                exit_code = collect(
                     args, child, samplers, own_job_id, actor_inventory, samples
                 )
         finally:
             for sampler in samplers.values():
                 ray.kill(sampler)
             ray.shutdown()
+        return exit_code
 
 
 def collect(args, child, samplers, own_job_id, actor_inventory, samples):
