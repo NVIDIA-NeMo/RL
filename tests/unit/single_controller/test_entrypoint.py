@@ -23,6 +23,7 @@ from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
 from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
+from nemo_rl.utils.logger import LoggerConfig
 
 
 @pytest.fixture
@@ -37,7 +38,7 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         },
         env={},
         data_plane={"enabled": True, "impl": "transfer_queue", "backend": "simple"},
-        logger={"log_dir": "/tmp/logs"},
+        logger=LoggerConfig(log_dir="/tmp/logs"),
         checkpointing={"enabled": False},
         async_rl=SimpleNamespace(
             stall_watchdog=SimpleNamespace(interval_s=30.0, stall_timeout_s=600.0),
