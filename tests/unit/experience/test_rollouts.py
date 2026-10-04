@@ -63,6 +63,7 @@ from nemo_rl.experience.rollouts import (
     _reattach_original_multimodal_payloads,
     async_generate_response_for_sample_turn,
     generate_responses_async,
+    nemo_gym_rollout_hit_max_tokens,
     run_async_multi_turn_rollout,
     run_async_multi_turn_rollout_groups,
     run_async_nemo_gym_rollout,
@@ -2139,6 +2140,103 @@ def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
     assert (
         "agent/full_result" in rollout_result.rollout_metrics
     ) is log_full_result_tables
+
+
+def _incomplete_response(reason):
+    return {
+        "response": {
+            "status": "incomplete",
+            "incomplete_details": {"reason": reason},
+            "output": [],
+        }
+    }
+
+
+def test_nemo_gym_rollout_hit_max_tokens_token_budget():
+    assert nemo_gym_rollout_hit_max_tokens({}, 128, 128)
+    assert nemo_gym_rollout_hit_max_tokens({}, 130, 128)
+    assert not nemo_gym_rollout_hit_max_tokens({}, 127, 128)
+    assert nemo_gym_rollout_hit_max_tokens(None, 128, 128)
+    assert not nemo_gym_rollout_hit_max_tokens(None, 10, 128)
+
+
+@pytest.mark.parametrize("reason", ["max_output_tokens", "length", "max_tokens"])
+def test_nemo_gym_rollout_hit_max_tokens_length_incomplete_response(reason):
+    # A context overflow comes back as an empty length-cut completion, so the
+    # chain stops well short of the token limit.
+    assert nemo_gym_rollout_hit_max_tokens(_incomplete_response(reason), 10, 128)
+
+
+@pytest.mark.parametrize(
+    "full_result",
+    [
+        pytest.param(_incomplete_response("content_filter"), id="content_filter"),
+        # An agent can end a rollout as incomplete without a length cut (e.g. an
+        # empty or reasoning-only turn); that is not truncation.
+        pytest.param(
+            {"response": {"status": "incomplete", "incomplete_details": None}},
+            id="incomplete_without_details",
+        ),
+        pytest.param(
+            {"response": {"status": "completed", "incomplete_details": None}},
+            id="completed",
+        ),
+        pytest.param({"response": "not-a-dict"}, id="malformed_response"),
+        pytest.param({"reward": 0.0}, id="no_response"),
+    ],
+)
+def test_nemo_gym_rollout_hit_max_tokens_other_endings(full_result):
+    assert not nemo_gym_rollout_hit_max_tokens(full_result, 10, 128)
+
+
+def test_postprocess_nemo_gym_group_marks_context_overflow_truncated():
+    rows = [{"agent_ref": {"name": "agent"}}, {"agent_ref": {"name": "agent"}}]
+    results = []
+    for response in (
+        _incomplete_response("max_output_tokens")["response"],
+        {"status": "completed", "incomplete_details": None, "output": []},
+    ):
+        input_message = {
+            "role": "user",
+            "content": "prompt",
+            "token_ids": torch.tensor([1, 2]),
+        }
+        results.append(
+            {
+                "input_message_log": [input_message],
+                "message_log": [
+                    input_message,
+                    {
+                        "role": "assistant",
+                        "content": "answer",
+                        "token_ids": torch.tensor([3, 4, 5]),
+                        "generation_logprobs": torch.tensor([-0.1, -0.1, -0.1]),
+                    },
+                ],
+                "full_result": {"reward": 0.0, "response": response},
+            }
+        )
+
+    rollout_result = rollouts_mod._postprocess_single_nemo_gym_group(
+        nemo_gym_rows=rows,
+        results=results,
+        timer=rollouts_mod.Timer(),
+        timer_prefix="timing/rollout",
+        policy_generation=type(
+            "_PolicyGeneration",
+            (),
+            {"cfg": {"vllm_cfg": {"max_model_len": 128}}},
+        )(),
+        input_batch=BatchedDataDict({"loss_multiplier": torch.ones(2)}),
+        tokenizer=type("_Tokenizer", (), {"pad_token_id": 0})(),
+        log_full_result_tables=False,
+    )
+
+    # Both rollouts are 5 tokens, far below the limit: only the length-cut one
+    # counts as truncated.
+    assert rollout_result.final_batch["truncated"].tolist() == [True, False]
+    assert rollout_result.rollout_metrics["truncation_rate"] == 0.5
+    assert rollout_result.rollout_metrics["natural_termination_rate"] == 0.5
 
 
 def test_run_nemo_gym_rollout_sync_separates_collection_and_identity_groups(

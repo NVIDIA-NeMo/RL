@@ -86,6 +86,7 @@ from nemo_rl.experience.rollouts import (
     attach_static_multimodal_payload,
     calculate_rewards,
     compute_reward_penalty_metrics,
+    nemo_gym_rollout_hit_max_tokens,
 )
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
@@ -1437,9 +1438,10 @@ class AsyncNemoGymRolloutImpl:
                     )
                 )
                 continue
-            truncated = (
-                sum(len(m["token_ids"]) for m in result["message_log"])
-                == self._max_seq_len
+            truncated = nemo_gym_rollout_hit_max_tokens(
+                result["full_result"],
+                sum(len(m["token_ids"]) for m in result["message_log"]),
+                self._max_seq_len,
             )
             completions.append(
                 Completion(

@@ -2980,6 +2980,40 @@ def run_nemo_gym_rollout_sync(
     return asyncio.run(_consume_rollout())
 
 
+# Responses ``incomplete_details.reason`` values that mean the final model call
+# ran out of tokens. NeMo-Gym maps a chat ``finish_reason="length"`` (including
+# the empty completion it returns when the prompt overflows the context window)
+# to ``max_output_tokens``.
+_LENGTH_LIMIT_INCOMPLETE_REASONS = frozenset(
+    {"max_output_tokens", "length", "max_tokens"}
+)
+
+
+def nemo_gym_rollout_hit_max_tokens(
+    full_result: dict[str, Any] | None,
+    total_tokens: int,
+    max_total_tokens_per_sample: int,
+) -> bool:
+    """Return whether a NeMo-Gym rollout was cut off by the token budget.
+
+    An exact ``total_tokens == max_total_tokens_per_sample`` match almost never
+    fires for multi-turn rollouts: when the next prompt no longer fits, Gym's
+    vLLM model returns an empty ``finish_reason="length"`` completion that adds
+    no tokens, so the chain stops short of the limit. Count the rollout as
+    truncated if it reached the limit, or if the final response is incomplete
+    for a length reason.
+    """
+    if total_tokens >= max_total_tokens_per_sample:
+        return True
+    response = (full_result or {}).get("response")
+    if not isinstance(response, dict):
+        return False
+    incomplete_details = response.get("incomplete_details")
+    if not isinstance(incomplete_details, dict):
+        return False
+    return incomplete_details.get("reason") in _LENGTH_LIMIT_INCOMPLETE_REASONS
+
+
 def _postprocess_single_nemo_gym_group(
     nemo_gym_rows: list[dict],
     results: list[dict],
@@ -3032,8 +3066,11 @@ def _postprocess_single_nemo_gym_group(
                 ),
                 "total_tokens": sum(len(m["token_ids"]) for m in r["message_log"]),
                 "turn_count": sum(1 for m in r["message_log"] if m["role"] == "user"),
-                "hit_max_tokens": sum(len(m["token_ids"]) for m in r["message_log"])
-                == max_total_tokens_per_sample,
+                "hit_max_tokens": nemo_gym_rollout_hit_max_tokens(
+                    r["full_result"],
+                    sum(len(m["token_ids"]) for m in r["message_log"]),
+                    max_total_tokens_per_sample,
+                ),
                 # max_gen_tokens_per_turn: Diagnostic for long single generations
                 "max_gen_tokens_per_turn": max(
                     (
