@@ -99,6 +99,7 @@ class SGLangGeneration(GenerationInterface):
         # GenerationInterface consumers (create_weight_synchronizer, the refit
         # transports) read ``cfg``; keep the sglang-specific name as the alias.
         self.cfg = sglang_cfg
+        self._owns_runtime = True
         self._async_loop = AsyncLoopThread()
 
         pgs = cluster._init_placement_groups(
@@ -135,6 +136,11 @@ class SGLangGeneration(GenerationInterface):
         # call that the refit dispatch has not connected yet.
         self.num_new_engines: int = 0
         self.pause_generation_mode: str = sglang_server_cfg["pause_generation_mode"]
+        # SGLang's memory-saver endpoints are not idempotent: resuming a tag
+        # that is already resident raises ``KeyError``. Async disaggregated
+        # rollout keeps engines resident between refits, so remember the
+        # driver-issued phase and only send transitions that change it.
+        self._offloaded_memory_tags: set[str] = set()
 
         # --- Router bootstrap --------------------------------------------
         # Resolved router endpoint is held only on the instance; we don't
@@ -164,9 +170,38 @@ class SGLangGeneration(GenerationInterface):
             monitor.start()
             self._health_monitor = monitor
 
+    def __getstate__(self) -> dict[str, Any]:
+        """Return a collector-safe copy without driver-owned runtime state."""
+        state = self.__dict__.copy()
+        state["_owns_runtime"] = False
+        state["_http_client"] = None
+        state["_async_loop"] = None
+        state["_health_monitor"] = None
+        state["weight_synchronizer"] = None
+        state["rollout_engine_lock"] = None
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        """Rebuild only the HTTP resources local to a deserialized copy."""
+        self.__dict__.update(state)
+        self._owns_runtime = False
+        if self._async_loop is None:
+            self._async_loop = AsyncLoopThread()
+        if self._http_client is None:
+            self._http_client = HttpClient(self.sglang_cfg)
+
     # ------------------------------------------------------------------
     # Engine topology properties (formerly ``ServerGroup``)
     # ------------------------------------------------------------------
+    @property
+    def dp_openai_server_base_urls(self) -> list[str]:
+        """Return the stable router URL used by NeMo Gym.
+
+        Individual engine URLs change when fault tolerance replaces an engine;
+        the router address remains stable and tracks the replacement.
+        """
+        return [f"http://{self.router_ip}:{self.router_port}"]
+
     @property
     def nodes_per_engine(self) -> int:
         return max(1, self.num_gpus_per_engine // self.num_gpus_per_node)
@@ -379,20 +414,16 @@ class SGLangGeneration(GenerationInterface):
 
         if self.needs_offload and dead_indices:
             new_engines = [self.all_engines[i] for i in dead_indices]
-            ray.get(
-                [
-                    engine.release_memory_occupation.remote(tags=["weights"])
-                    for engine in new_engines
-                ]
-            )
-            ray.get(
-                [
-                    engine.release_memory_occupation.remote(tags=["kv_cache"])
-                    for engine in new_engines
-                ]
-            )
-            # The synchronizer onloads weights after recovery for all engines.
-            # Resuming here too would onload a replacement twice.
+            # Fresh engines start with both tags resident. Match replacements
+            # to the surviving engines' driver-tracked state before refit.
+            for tag in ("weights", "kv_cache"):
+                if tag in self._offloaded_memory_tags:
+                    ray.get(
+                        [
+                            engine.release_memory_occupation.remote(tags=[tag])
+                            for engine in new_engines
+                        ]
+                    )
 
     def get_updatable_engines(self) -> tuple[list, int, list[int], list[int]]:
         """Return engines eligible for weight updates."""
@@ -449,56 +480,63 @@ class SGLangGeneration(GenerationInterface):
 
     def shutdown(self) -> bool:
         ok = True
-        if self._health_monitor:
-            self._health_monitor.stop()
+        if getattr(self, "_owns_runtime", True):
+            health_monitor = getattr(self, "_health_monitor", None)
+            if health_monitor is not None:
+                health_monitor.stop()
 
-        if self.weight_synchronizer is not None:
-            # ``shutdown`` is reachable twice (explicit call + ``__del__``);
-            # drop the handle so teardown stays one-shot.
-            self.weight_synchronizer.shutdown()
-            self.weight_synchronizer = None
+            weight_synchronizer = getattr(self, "weight_synchronizer", None)
+            if weight_synchronizer is not None:
+                # ``shutdown`` is reachable twice (explicit call + ``__del__``);
+                # drop the handle so teardown stays one-shot.
+                weight_synchronizer.shutdown()
+                self.weight_synchronizer = None
 
-        rollout_engine_lock = getattr(self, "rollout_engine_lock", None)
-        if rollout_engine_lock is not None:
+            rollout_engine_lock = getattr(self, "rollout_engine_lock", None)
+            if rollout_engine_lock is not None:
+                try:
+                    ray.kill(rollout_engine_lock)
+                except Exception as e:
+                    logger.warning(f"Rollout-engine lock terminate failed: {e}")
+                    ok = False
+                self.rollout_engine_lock = None
+
+            all_engines = getattr(self, "all_engines", [])
+            engines = [e for e in all_engines if e is not None]
+            if engines:
+                try:
+                    ray.get([e.shutdown.remote() for e in engines])
+                except Exception as e:
+                    logger.warning(f"Engine shutdown failed: {e}")
+                    ok = False
+                self.all_engines = [None] * len(all_engines)
+
+            router_actor = getattr(self, "_router_actor", None)
+            if router_actor is not None:
+                try:
+                    ray.get(router_actor.stop.remote())
+                    ray.kill(router_actor)
+                except Exception as e:
+                    logger.warning(f"Router terminate failed: {e}")
+                    ok = False
+                self._router_actor = None
+
+        http_client = getattr(self, "_http_client", None)
+        async_loop = getattr(self, "_async_loop", None)
+        if http_client is not None:
             try:
-                ray.kill(rollout_engine_lock)
-            except Exception as e:
-                logger.warning(f"Rollout-engine lock terminate failed: {e}")
-                ok = False
-            del self.rollout_engine_lock
-
-        engines = [e for e in self.all_engines if e is not None]
-        if engines:
-            try:
-                ray.get([e.shutdown.remote() for e in engines])
-            except Exception as e:
-                logger.warning(f"Engine shutdown failed: {e}")
-                ok = False
-            self.all_engines = [None] * len(self.all_engines)
-
-        if self._router_actor is not None:
-            try:
-                ray.get(self._router_actor.stop.remote())
-                ray.kill(self._router_actor)
-            except Exception as e:
-                logger.warning(f"Router terminate failed: {e}")
-                ok = False
-            self._router_actor = None
-
-        if self._http_client is not None:
-            try:
-                if self._async_loop is not None:
-                    self._async_loop.run(self._http_client.aclose())
+                if async_loop is not None:
+                    async_loop.run(http_client.aclose())
                 else:
-                    self._http_client.shutdown()
+                    http_client.shutdown()
             except Exception as e:
                 logger.warning(f"HTTP client shutdown failed: {e}")
                 ok = False
             self._http_client = None
 
-        if self._async_loop is not None:
+        if async_loop is not None:
             try:
-                self._async_loop.close()
+                async_loop.close()
             except Exception as e:
                 logger.warning(f"AsyncLoopThread close failed: {e}")
                 ok = False
@@ -921,8 +959,22 @@ class SGLangGeneration(GenerationInterface):
         tags = kwargs.get("tags", None)
         if self.needs_offload:
             engines = [e for e in self.engines if e is not None]
-            if engines:
-                ray.get([e.resume_memory_occupation.remote(tags=tags) for e in engines])
+            requested_tags = (
+                ["weights", "kv_cache"]
+                if tags is None
+                else [tag for tag in ("weights", "kv_cache") if tag in tags]
+            )
+            tags_to_resume = [
+                tag for tag in requested_tags if tag in self._offloaded_memory_tags
+            ]
+            if engines and tags_to_resume:
+                ray.get(
+                    [
+                        e.resume_memory_occupation.remote(tags=tags_to_resume)
+                        for e in engines
+                    ]
+                )
+                self._offloaded_memory_tags.difference_update(tags_to_resume)
         # The weights-only stage is mid-refit; only kv_cache can serve a probe.
         if self._health_monitor and (tags is None or "kv_cache" in tags):
             self._health_monitor.resume()
@@ -937,7 +989,20 @@ class SGLangGeneration(GenerationInterface):
         engines = [e for e in self.engines if e is not None]
         if not engines:
             return
-        ray.get([e.release_memory_occupation.remote(tags=tags) for e in engines])
+        requested_tags = (
+            ["weights", "kv_cache"]
+            if tags is None
+            else [tag for tag in ("weights", "kv_cache") if tag in tags]
+        )
+        tags_to_release = [
+            tag for tag in requested_tags if tag not in self._offloaded_memory_tags
+        ]
+        if not tags_to_release:
+            return
+        ray.get(
+            [e.release_memory_occupation.remote(tags=tags_to_release) for e in engines]
+        )
+        self._offloaded_memory_tags.update(tags_to_release)
 
     def invalidate_kv_cache(self) -> bool:
         """Invalidate KV cache before weight updates (Megatron-style).
