@@ -2559,6 +2559,34 @@ def _trajectory_group_ids(trajectories: list[dict[str, Any]]) -> torch.Tensor:
     )
 
 
+def _baseline_valid_mask(
+    repeated_batch: BatchedDataDict[DatumSpec], rewards: torch.Tensor
+) -> torch.Tensor:
+    """Return a ``[B]`` mask of the rows whose reward may vote in the group baseline/std.
+
+    Rows the environment flags with ``mask_sample`` and rows that already carry
+    ``loss_multiplier == 0`` contribute no loss, and their reward is not a valid
+    measurement of the policy. Counting them would bias their siblings' baseline
+    and make a group whose only reward variance comes from such a row look
+    non-uniform to dynamic sampling.
+
+    Call this before overlong filtering rewrites ``loss_multiplier`` so that
+    truncated (but otherwise valid) rollouts keep voting, as before.
+    """
+    valid_mask = torch.ones_like(rewards)
+    if "mask_sample" in repeated_batch:
+        mask_sample = repeated_batch["mask_sample"]
+        if isinstance(mask_sample, list):
+            mask_sample = torch.tensor(mask_sample, dtype=torch.bool)
+        valid_mask[mask_sample.bool().to(valid_mask.device)] = 0
+    if "loss_multiplier" in repeated_batch:
+        loss_multiplier = repeated_batch["loss_multiplier"]
+        if isinstance(loss_multiplier, list):
+            loss_multiplier = torch.tensor(loss_multiplier)
+        valid_mask[(loss_multiplier == 0).to(valid_mask.device)] = 0
+    return valid_mask
+
+
 def _apply_mask_sample_filter(repeated_batch: BatchedDataDict[DatumSpec]) -> int:
     """Zero loss_multiplier where mask_sample is True and return the count."""
     if "mask_sample" not in repeated_batch:
@@ -3487,6 +3515,8 @@ def _grpo_train_impl(
                 ):
                     # Extract rewards from final_batch
                     rewards = repeated_batch["total_reward"]
+                    # Masked rows must not vote in the group baseline/std.
+                    valid_mask = _baseline_valid_mask(repeated_batch, rewards)
 
                     print("▶ Computing advantages...", flush=True)
                     # For DAPO with reward shaping, compute std on the raw
@@ -3504,7 +3534,7 @@ def _grpo_train_impl(
                         calculate_trivial_reward_distributions(
                             repeated_batch[PROMPT_GROUP_IDS_KEY],
                             std_rewards if std_rewards is not None else rewards,
-                            torch.ones_like(rewards),
+                            valid_mask,
                         )
                         if master_config.grpo.use_dynamic_sampling
                         else None
@@ -3520,7 +3550,7 @@ def _grpo_train_impl(
                         ) = calculate_baseline_and_std_per_prompt(
                             repeated_batch[PROMPT_GROUP_IDS_KEY].cuda(device_id),
                             rewards.cuda(device_id),
-                            torch.ones_like(rewards).cuda(device_id),
+                            valid_mask.cuda(device_id),
                             leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
                             std_rewards=(
                                 std_rewards.cuda(device_id)
@@ -3538,7 +3568,7 @@ def _grpo_train_impl(
                         ) = calculate_baseline_and_std_per_prompt(
                             repeated_batch[PROMPT_GROUP_IDS_KEY],
                             rewards,
-                            torch.ones_like(rewards),
+                            valid_mask,
                             leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
                             std_rewards=std_rewards,
                         )
@@ -3603,6 +3633,10 @@ def _grpo_train_impl(
                     backfill_missing_routed_experts(repeated_batch["message_log"])
 
                     prompt_ids_for_adv = repeated_batch[PROMPT_GROUP_IDS_KEY]
+                    # Recompute on the (possibly dynamic-sampling filtered) batch,
+                    # before overlong filtering rewrites loss_multiplier.
+                    baseline_valid_mask = _baseline_valid_mask(repeated_batch, rewards)
+                    del valid_mask
                     del baseline
                     del std
 
@@ -3806,8 +3840,10 @@ def _grpo_train_impl(
                         repeated_batch=repeated_batch,
                         logprobs_policy=train_data["prev_logprobs"],
                         logprobs_reference=train_data.get("reference_policy_logprobs"),
+                        valid_mask=baseline_valid_mask,
                     )
                     del prompt_ids_for_adv
+                    del baseline_valid_mask
 
                     # Log rewards and advantages information
                     _log_mixed_rewards_and_advantages_information(
@@ -5441,6 +5477,9 @@ def async_grpo_train(
                         )
 
                     rewards = repeated_batch["total_reward"]
+                    # Masked rows must not vote in the group baseline. Taken
+                    # before overlong filtering rewrites loss_multiplier.
+                    baseline_valid_mask = _baseline_valid_mask(repeated_batch, rewards)
 
                     print(
                         f"  📊 Rewards stats: min={rewards.min():.4f}, max={rewards.max():.4f}, mean={rewards.mean():.4f}, std={rewards.std():.4f}"
@@ -5617,6 +5656,7 @@ def async_grpo_train(
                         repeated_batch=repeated_batch,
                         logprobs_policy=train_data["prev_logprobs"],
                         logprobs_reference=train_data.get("reference_policy_logprobs"),
+                        valid_mask=baseline_valid_mask,
                         # OPD kwargs (ignored by non-OPD estimators via **kwargs)
                         teacher_logprobs=trajectory_teacher_logprobs.to(
                             train_data["prev_logprobs"].device
@@ -5633,6 +5673,7 @@ def async_grpo_train(
                     ):
                         rollout_metrics.update(adv_estimator.last_metrics)
                     del prompt_ids_for_adv
+                    del baseline_valid_mask
 
                     # Log advantages stats
                     # Note: For GRPOAdvantageEstimator with normalize_rewards=True, these are
