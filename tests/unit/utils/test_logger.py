@@ -28,11 +28,17 @@ import torch
 from nemo_rl.utils.logger import (
     TELEMETRY_WALL_TIME_METRIC,
     WANDB_CALLER_STEP_METRIC,
+    GPUMonitoringConfig,
     Logger,
+    LoggerConfig,
+    MLflowConfig,
     MLflowLogger,
     RayGpuMonitorLogger,
+    SwanlabConfig,
     SwanlabLogger,
+    TensorboardConfig,
     TensorboardLogger,
+    WandbConfig,
     WandbLogger,
     flatten_dict,
     log_container_init_timing,
@@ -136,9 +142,11 @@ class TestFlattenDict:
 )
 def test_should_log_nemo_gym_full_result_tables(wandb_enabled, table_flag, expected):
     """Full-result Tables require both an active W&B logger and explicit opt-in."""
-    wandb_config = {}
-    if table_flag is not None:
-        wandb_config["log_nemo_gym_full_result_tables"] = table_flag
+    wandb_config = (
+        WandbConfig.model_construct()
+        if table_flag is None
+        else WandbConfig.model_construct(log_nemo_gym_full_result_tables=table_flag)
+    )
 
     assert (
         should_log_nemo_gym_full_result_tables(
@@ -397,14 +405,14 @@ class TestWandbLogger:
     @patch("nemo_rl.utils.logger.wandb")
     def test_init_custom_config(self, mock_wandb, temp_dir):
         """Test initialization of WandbLogger with custom config."""
-        cfg = {
-            "project": "custom-project",
-            "name": "custom-run",
-            "entity": "custom-entity",
-            "group": "custom-group",
-            "tags": ["tag1", "tag2"],
-            "log_nemo_gym_full_result_tables": True,
-        }
+        cfg = WandbConfig(
+            project="custom-project",
+            name="custom-run",
+            entity="custom-entity",
+            group="custom-group",
+            tags=["tag1", "tag2"],
+            log_nemo_gym_full_result_tables=True,
+        )
         WandbLogger(cfg, log_dir=temp_dir)
 
         mock_wandb.init.assert_called_once_with(
@@ -419,7 +427,7 @@ class TestWandbLogger:
     @patch("nemo_rl.utils.logger.wandb")
     def test_log_metrics(self, mock_wandb):
         """Test logging metrics to WandbLogger."""
-        cfg = {}
+        cfg = WandbConfig(project="test-project", name="test-run")
         logger = WandbLogger(cfg)
 
         metrics = {"loss": 0.5, "accuracy": 0.8}
@@ -435,7 +443,7 @@ class TestWandbLogger:
     @patch("nemo_rl.utils.logger.wandb")
     def test_log_metrics_with_prefix(self, mock_wandb):
         """Test logging metrics with a prefix to WandbLogger."""
-        cfg = {}
+        cfg = WandbConfig(project="test-project", name="test-run")
         logger = WandbLogger(cfg)
 
         metrics = {"loss": 0.5, "accuracy": 0.8}
@@ -455,7 +463,7 @@ class TestWandbLogger:
     @patch("nemo_rl.utils.logger.wandb")
     def test_log_metrics_with_step_metric(self, mock_wandb):
         """Test logging metrics with a step metric to WandbLogger."""
-        cfg = {}
+        cfg = WandbConfig(project="test-project", name="test-run")
         logger = WandbLogger(cfg)
 
         # Define step metric
@@ -477,7 +485,7 @@ class TestWandbLogger:
     @patch("nemo_rl.utils.logger.wandb")
     def test_log_metrics_with_prefix_and_step_metric(self, mock_wandb):
         """Test logging metrics with both prefix and step metric."""
-        cfg = {}
+        cfg = WandbConfig(project="test-project", name="test-run")
         logger = WandbLogger(cfg)
 
         # Define prefix and step metric
@@ -505,7 +513,7 @@ class TestWandbLogger:
     @patch("nemo_rl.utils.logger.wandb")
     def test_independent_events_do_not_reuse_wandb_internal_step(self, mock_wandb):
         """Telemetry commits must not make a later trainer step stale."""
-        logger = WandbLogger({})
+        logger = WandbLogger(WandbConfig(project="test-project", name="test-run"))
 
         logger.log_metrics({"loss": 1.0}, step=1, prefix="train")
         logger.log_metrics({"seconds": 5.0}, step=1, prefix="timing/train")
@@ -546,7 +554,7 @@ class TestWandbLogger:
     @patch("nemo_rl.utils.logger.wandb")
     def test_define_metric(self, mock_wandb):
         """Test defining a metric with a custom step metric."""
-        cfg = {}
+        cfg = WandbConfig(project="test-project", name="test-run")
         logger = WandbLogger(cfg)
 
         # Define metric pattern and step metric
@@ -583,7 +591,7 @@ class TestWandbLogger:
 
     @patch("nemo_rl.utils.logger.wandb")
     def test_define_metric_rejects_conflicting_registration(self, mock_wandb):
-        logger = WandbLogger({})
+        logger = WandbLogger(WandbConfig(project="test-project", name="test-run"))
         logger.define_metric("ray/*", step_metric="ray/ray_step")
 
         with pytest.raises(ValueError, match="already registered"):
@@ -591,14 +599,14 @@ class TestWandbLogger:
 
     @patch("nemo_rl.utils.logger.wandb")
     def test_define_metric_rejects_non_terminal_wildcard(self, mock_wandb):
-        logger = WandbLogger({})
+        logger = WandbLogger(WandbConfig(project="test-project", name="test-run"))
 
         with pytest.raises(ValueError, match="exactly one trailing"):
             logger.define_metric("ray/*/util", step_metric="ray/ray_step")
 
     @patch("nemo_rl.utils.logger.wandb")
     def test_log_metrics_requires_registered_step_metric(self, mock_wandb):
-        logger = WandbLogger({})
+        logger = WandbLogger(WandbConfig(project="test-project", name="test-run"))
         logger.define_metric(
             "rollout/throughput/*",
             step_metric=TELEMETRY_WALL_TIME_METRIC,
@@ -612,7 +620,7 @@ class TestWandbLogger:
 
     @patch("nemo_rl.utils.logger.wandb")
     def test_define_metric_uses_longest_matching_prefix(self, mock_wandb):
-        logger = WandbLogger({})
+        logger = WandbLogger(WandbConfig(project="test-project", name="test-run"))
         logger.define_metric("rollout/*", step_metric="rollout/step")
         logger.define_metric(
             "rollout/throughput/*",
@@ -636,7 +644,7 @@ class TestWandbLogger:
     @patch("nemo_rl.utils.logger.wandb")
     def test_does_not_define_catch_all_metric(self, mock_wandb):
         """Overlapping W&B globs must not choose axes nondeterministically."""
-        WandbLogger({})
+        WandbLogger(WandbConfig(project="test-project", name="test-run"))
 
         mock_run = mock_wandb.init.return_value
         assert call("*", step_metric=WANDB_CALLER_STEP_METRIC) not in (
@@ -647,7 +655,7 @@ class TestWandbLogger:
     @patch("nemo_rl.utils.logger.wandb")
     def test_registers_teardown_flush(self, mock_wandb, mock_atexit_register):
         """Driver entrypoints flush the final pending row at process exit."""
-        logger = WandbLogger({})
+        logger = WandbLogger(WandbConfig(project="test-project", name="test-run"))
         logger.log_metrics({"loss": 0.5}, step=7, prefix="train")
 
         mock_atexit_register.assert_called_once_with(logger.finish)
@@ -663,7 +671,7 @@ class TestWandbLogger:
     @patch("nemo_rl.utils.logger.wandb")
     def test_finish_flushes_pending_trainer_row(self, mock_wandb):
         """A final incomplete step is not lost during logger teardown."""
-        logger = WandbLogger({})
+        logger = WandbLogger(WandbConfig(project="test-project", name="test-run"))
         logger.log_metrics({"loss": 0.5}, step=7, prefix="train")
 
         mock_run = mock_wandb.init.return_value
@@ -683,7 +691,7 @@ class TestWandbLogger:
         histogram_value = MagicMock(name="histogram_value")
         plot_value = MagicMock(name="plot_value")
         mock_wandb.Histogram.return_value = histogram_value
-        logger = WandbLogger({})
+        logger = WandbLogger(WandbConfig(project="test-project", name="test-run"))
 
         logger.log_metrics({"loss": 0.5}, step=7, prefix="train")
         logger.log_histogram([1.0, 2.0], step=7, name="train/reward_histogram")
@@ -706,7 +714,7 @@ class TestWandbLogger:
     @patch("nemo_rl.utils.logger.wandb")
     def test_log_hyperparams(self, mock_wandb):
         """Test logging hyperparameters to WandbLogger."""
-        cfg = {}
+        cfg = WandbConfig(project="test-project", name="test-run")
         logger = WandbLogger(cfg)
 
         params = {"lr": 0.001, "batch_size": 32, "model": {"hidden_size": 128}}
@@ -730,13 +738,13 @@ class TestSwanlabLogger:
     @patch("nemo_rl.utils.logger.swanlab")
     def test_init_custom_config(self, mock_swanlab, temp_dir):
         """Test initialization of SwanlabLogger with custom config."""
-        cfg = {
-            "project": "custom-project",
-            "name": "custom-run",
-            "entity": "custom-entity",
-            "group": "custom-group",
-            "tags": ["tag1", "tag2"],
-        }
+        cfg = SwanlabConfig(
+            project="custom-project",
+            name="custom-run",
+            entity="custom-entity",
+            group="custom-group",
+            tags=["tag1", "tag2"],
+        )
         SwanlabLogger(cfg, log_dir=temp_dir)
 
         mock_swanlab.init.assert_called_once_with(
@@ -751,7 +759,7 @@ class TestSwanlabLogger:
     @patch("nemo_rl.utils.logger.swanlab")
     def test_log_metrics(self, mock_swanlab):
         """Test logging metrics to SwanlabLogger."""
-        cfg = {}
+        cfg = SwanlabConfig(project="test-project", name="test-run")
         logger = SwanlabLogger(cfg)
 
         metrics = {"loss": 0.5, "accuracy": 0.8}
@@ -765,7 +773,7 @@ class TestSwanlabLogger:
     @patch("nemo_rl.utils.logger.swanlab")
     def test_log_metrics_with_prefix(self, mock_swanlab):
         """Test logging metrics with a prefix to SwanlabLogger."""
-        cfg = {}
+        cfg = SwanlabConfig(project="test-project", name="test-run")
         logger = SwanlabLogger(cfg)
 
         metrics = {"loss": 0.5, "accuracy": 0.8}
@@ -781,7 +789,7 @@ class TestSwanlabLogger:
     @patch("nemo_rl.utils.logger.swanlab")
     def test_log_metrics_with_step_metric(self, mock_swanlab):
         """Test logging metrics with a step metric to SwanlabLogger."""
-        cfg = {}
+        cfg = SwanlabConfig(project="test-project", name="test-run")
         logger = SwanlabLogger(cfg)
 
         # Define step metric
@@ -800,7 +808,7 @@ class TestSwanlabLogger:
     @patch("nemo_rl.utils.logger.swanlab")
     def test_log_metrics_with_prefix_and_step_metric(self, mock_swanlab):
         """Test logging metrics with both prefix and step metric."""
-        cfg = {}
+        cfg = SwanlabConfig(project="test-project", name="test-run")
         logger = SwanlabLogger(cfg)
 
         # Define prefix and step metric
@@ -825,7 +833,7 @@ class TestSwanlabLogger:
     @patch("nemo_rl.utils.logger.swanlab")
     def test_log_hyperparams(self, mock_swanlab):
         """Test logging hyperparameters to SwanlabLogger."""
-        cfg = {}
+        cfg = SwanlabConfig(project="test-project", name="test-run")
         logger = SwanlabLogger(cfg)
 
         params = {"lr": 0.001, "batch_size": 32, "model": {"hidden_size": 128}}
@@ -852,11 +860,7 @@ class TestMLflowLogger:
         # Ensure active_run returns None so initialization logic runs
         mock_mlflow.active_run.return_value = None
 
-        cfg = {
-            "experiment_name": "test-experiment",
-            "run_name": "test-run",
-            "tracking_uri": None,
-        }
+        cfg = MLflowConfig(experiment_name="test-experiment", run_name="test-run")
         MLflowLogger(cfg, log_dir=temp_dir)
 
         mock_mlflow.set_experiment.assert_called_once_with("test-experiment")
@@ -870,11 +874,11 @@ class TestMLflowLogger:
         # Mock is_tracking_uri_set to return False so set_tracking_uri is called
         mock_mlflow.is_tracking_uri_set.return_value = False
 
-        cfg = {
-            "experiment_name": "test-experiment",
-            "run_name": "test-run",
-            "tracking_uri": "http://localhost:5000",
-        }
+        cfg = MLflowConfig(
+            experiment_name="test-experiment",
+            run_name="test-run",
+            tracking_uri="http://localhost:5000",
+        )
         MLflowLogger(cfg, log_dir=temp_dir)
 
         mock_mlflow.set_tracking_uri.assert_called_once_with("http://localhost:5000")
@@ -884,11 +888,7 @@ class TestMLflowLogger:
     @patch("nemo_rl.utils.logger.mlflow")
     def test_log_metrics(self, mock_mlflow, temp_dir):
         """Test logging metrics to MLflowLogger."""
-        cfg = {
-            "experiment_name": "test-experiment",
-            "run_name": "test-run",
-            "tracking_uri": None,
-        }
+        cfg = MLflowConfig(experiment_name="test-experiment", run_name="test-run")
         logger = MLflowLogger(cfg, log_dir=temp_dir)
 
         metrics = {"loss": 0.5, "accuracy": 0.8}
@@ -904,11 +904,7 @@ class TestMLflowLogger:
     @patch("nemo_rl.utils.logger.mlflow")
     def test_log_metrics_with_prefix(self, mock_mlflow, temp_dir):
         """Test logging metrics with a prefix to MLflowLogger."""
-        cfg = {
-            "experiment_name": "test-experiment",
-            "run_name": "test-run",
-            "tracking_uri": None,
-        }
+        cfg = MLflowConfig(experiment_name="test-experiment", run_name="test-run")
         logger = MLflowLogger(cfg, log_dir=temp_dir)
 
         metrics = {"loss": 0.5, "accuracy": 0.8}
@@ -932,11 +928,7 @@ class TestMLflowLogger:
         Each list collapses to a fixed set of summary statistics logged at the
         real training step (so the x-axis matches every other scalar metric).
         """
-        cfg = {
-            "experiment_name": "test-experiment",
-            "run_name": "test-run",
-            "tracking_uri": None,
-        }
+        cfg = MLflowConfig(experiment_name="test-experiment", run_name="test-run")
         logger = MLflowLogger(cfg, log_dir=temp_dir)
 
         metrics = {
@@ -978,11 +970,7 @@ class TestMLflowLogger:
     @patch("nemo_rl.utils.logger.mlflow")
     def test_log_hyperparams(self, mock_mlflow, temp_dir):
         """Test logging hyperparameters to MLflowLogger."""
-        cfg = {
-            "experiment_name": "test-experiment",
-            "run_name": "test-run",
-            "tracking_uri": None,
-        }
+        cfg = MLflowConfig(experiment_name="test-experiment", run_name="test-run")
         logger = MLflowLogger(cfg, log_dir=temp_dir)
 
         params = {"lr": 0.001, "batch_size": 32, "model": {"hidden_size": 128}}
@@ -1002,11 +990,7 @@ class TestMLflowLogger:
     @patch("nemo_rl.utils.logger.plt")
     def test_log_plot(self, mock_plt, mock_mlflow, temp_dir):
         """Test logging plots to MLflowLogger."""
-        cfg = {
-            "experiment_name": "test-experiment",
-            "run_name": "test-run",
-            "tracking_uri": None,
-        }
+        cfg = MLflowConfig(experiment_name="test-experiment", run_name="test-run")
         logger = MLflowLogger(cfg, log_dir=temp_dir)
 
         # Mock the figure
@@ -1022,11 +1006,7 @@ class TestMLflowLogger:
     @patch("nemo_rl.utils.logger.mlflow")
     def test_cleanup(self, mock_mlflow, temp_dir):
         """Test cleanup when logger is destroyed."""
-        cfg = {
-            "experiment_name": "test-experiment",
-            "run_name": "test-run",
-            "tracking_uri": None,
-        }
+        cfg = MLflowConfig(experiment_name="test-experiment", run_name="test-run")
         logger = MLflowLogger(cfg, log_dir=temp_dir)
 
         # Reset mocks to avoid counting calls from init
@@ -1044,11 +1024,11 @@ class TestMLflowLogger:
         # Ensure active_run returns None so initialization logic runs
         mock_mlflow.active_run.return_value = None
 
-        cfg = {
-            "experiment_name": "test-experiment",
-            "run_name": "test-run",
-            "tracking_uri": "http://localhost:5000",
-        }
+        cfg = MLflowConfig(
+            experiment_name="test-experiment",
+            run_name="test-run",
+            tracking_uri="http://localhost:5000",
+        )
         mock_mlflow.get_experiment_by_name.return_value = None
 
         MLflowLogger(cfg, log_dir=None)
@@ -1065,11 +1045,11 @@ class TestMLflowLogger:
         # Ensure active_run returns None so initialization logic runs
         mock_mlflow.active_run.return_value = None
 
-        cfg = {
-            "experiment_name": "test-experiment",
-            "run_name": "test-run",
-            "tracking_uri": "http://localhost:5000",
-        }
+        cfg = MLflowConfig(
+            experiment_name="test-experiment",
+            run_name="test-run",
+            tracking_uri="http://localhost:5000",
+        )
         mock_mlflow.get_experiment_by_name.return_value = None
 
         MLflowLogger(cfg, log_dir="/custom/path")
@@ -1088,22 +1068,22 @@ class TestMLflowLogger:
         # Mock is_tracking_uri_set to return False so set_tracking_uri is called
         mock_mlflow.is_tracking_uri_set.return_value = False
 
-        cfg = {
-            "experiment_name": "test-experiment",
-            "run_name": "test-run",
-            "tracking_uri": "http://localhost:5000",
-            "artifact_location": "/config/artifact/path",
-        }
+        cfg = MLflowConfig(
+            experiment_name="test-experiment",
+            run_name="test-run",
+            tracking_uri="http://localhost:5000",
+            artifact_location="/config/artifact/path",
+        )
         mock_mlflow.get_experiment_by_name.return_value = None
 
         MLflowLogger(cfg, log_dir="/fallback/path")
 
         # Verify create_experiment was called with artifact_location from config
         mock_mlflow.create_experiment.assert_called_once_with(
-            name=cfg["experiment_name"], artifact_location=cfg["artifact_location"]
+            name=cfg.experiment_name, artifact_location=cfg.artifact_location
         )
-        mock_mlflow.set_tracking_uri.assert_called_once_with(cfg["tracking_uri"])
-        mock_mlflow.start_run.assert_called_once_with(run_name=cfg["run_name"])
+        mock_mlflow.set_tracking_uri.assert_called_once_with(cfg.tracking_uri)
+        mock_mlflow.start_run.assert_called_once_with(run_name=cfg.run_name)
 
     @patch("nemo_rl.utils.logger.mlflow")
     def test_init_with_artifact_location_none_in_config(self, mock_mlflow):
@@ -1113,22 +1093,21 @@ class TestMLflowLogger:
         # Mock is_tracking_uri_set to return False so set_tracking_uri is called
         mock_mlflow.is_tracking_uri_set.return_value = False
 
-        cfg = {
-            "experiment_name": "test-experiment",
-            "run_name": "test-run",
-            "tracking_uri": "http://localhost:5000",
-            "artifact_location": None,
-        }
+        cfg = MLflowConfig(
+            experiment_name="test-experiment",
+            run_name="test-run",
+            tracking_uri="http://localhost:5000",
+        )
         mock_mlflow.get_experiment_by_name.return_value = None
 
         MLflowLogger(cfg, log_dir="/fallback/path")
 
         # Verify create_experiment was called with log_dir since config is None
         mock_mlflow.create_experiment.assert_called_once_with(
-            name=cfg["experiment_name"], artifact_location="/fallback/path"
+            name=cfg.experiment_name, artifact_location="/fallback/path"
         )
-        mock_mlflow.set_tracking_uri.assert_called_once_with(cfg["tracking_uri"])
-        mock_mlflow.start_run.assert_called_once_with(run_name=cfg["run_name"])
+        mock_mlflow.set_tracking_uri.assert_called_once_with(cfg.tracking_uri)
+        mock_mlflow.start_run.assert_called_once_with(run_name=cfg.run_name)
 
     @patch("nemo_rl.utils.logger.mlflow")
     def test_init_without_artifact_location_uses_log_dir(self, mock_mlflow):
@@ -1138,11 +1117,11 @@ class TestMLflowLogger:
         # Mock is_tracking_uri_set to return False so set_tracking_uri is called
         mock_mlflow.is_tracking_uri_set.return_value = False
 
-        cfg = {
-            "experiment_name": "test-experiment",
-            "run_name": "test-run",
-            "tracking_uri": "http://localhost:5000",
-        }
+        cfg = MLflowConfig(
+            experiment_name="test-experiment",
+            run_name="test-run",
+            tracking_uri="http://localhost:5000",
+        )
         mock_mlflow.get_experiment_by_name.return_value = None
 
         log_dir = "/fallback/path"
@@ -1150,10 +1129,10 @@ class TestMLflowLogger:
 
         # Verify create_experiment was called with log_dir as artifact_location
         mock_mlflow.create_experiment.assert_called_once_with(
-            name=cfg["experiment_name"], artifact_location=log_dir
+            name=cfg.experiment_name, artifact_location=log_dir
         )
-        mock_mlflow.set_tracking_uri.assert_called_once_with(cfg["tracking_uri"])
-        mock_mlflow.start_run.assert_called_once_with(run_name=cfg["run_name"])
+        mock_mlflow.set_tracking_uri.assert_called_once_with(cfg.tracking_uri)
+        mock_mlflow.start_run.assert_called_once_with(run_name=cfg.run_name)
 
 
 class TestRayGpuMonitorLogger:
@@ -1659,20 +1638,16 @@ ray_node_gram_used{{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"}} {80.0 * 1024}
         self, mock_gpu_monitor, mock_tb_logger, mock_wandb_logger, temp_dir
     ):
         """Test initialization with GPU monitoring enabled."""
-        cfg = {
-            "wandb_enabled": True,
-            "tensorboard_enabled": True,
-            "mlflow_enabled": False,
-            "swanlab_enabled": False,
-            "monitor_gpus": True,
-            "gpu_monitoring": {
-                "collection_interval": 15.0,
-                "flush_interval": 45.0,
-            },
-            "wandb": {"project": "test-project"},
-            "tensorboard": {"log_dir": "test_logs"},
-            "log_dir": temp_dir,
-        }
+        cfg = LoggerConfig(
+            wandb_enabled=True,
+            tensorboard_enabled=True,
+            gpu_monitoring=GPUMonitoringConfig(
+                collection_interval=15.0, flush_interval=45.0
+            ),
+            wandb=WandbConfig(project="test-project", name="test-run"),
+            tensorboard=TensorboardConfig(log_dir="test_logs"),
+            log_dir=temp_dir,
+        )
         logger = Logger(cfg)
 
         # Check that regular loggers were initialized
@@ -1706,19 +1681,14 @@ ray_node_gram_used{{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"}} {80.0 * 1024}
         self, mock_gpu_monitor, mock_tb_logger, mock_wandb_logger, temp_dir
     ):
         """Test GPU monitoring initialization when wandb is disabled."""
-        cfg = {
-            "wandb_enabled": False,
-            "tensorboard_enabled": True,
-            "mlflow_enabled": False,
-            "swanlab_enabled": False,
-            "monitor_gpus": True,
-            "gpu_monitoring": {
-                "collection_interval": 15.0,
-                "flush_interval": 45.0,
-            },
-            "tensorboard": {"log_dir": "test_logs"},
-            "log_dir": temp_dir,
-        }
+        cfg = LoggerConfig(
+            tensorboard_enabled=True,
+            gpu_monitoring=GPUMonitoringConfig(
+                collection_interval=15.0, flush_interval=45.0
+            ),
+            tensorboard=TensorboardConfig(log_dir="test_logs"),
+            log_dir=temp_dir,
+        )
         logger = Logger(cfg)
 
         # Check that only tensorboard logger was initialized
@@ -1746,18 +1716,12 @@ ray_node_gram_used{{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"}} {80.0 * 1024}
         self, mock_gpu_monitor, mock_tb_logger, mock_wandb_logger, temp_dir
     ):
         """Test GPU monitoring initialization when no main loggers (wandb/tensorboard) are enabled."""
-        cfg = {
-            "wandb_enabled": False,
-            "swanlab_enabled": False,
-            "tensorboard_enabled": False,
-            "mlflow_enabled": False,
-            "monitor_gpus": True,
-            "gpu_monitoring": {
-                "collection_interval": 15.0,
-                "flush_interval": 45.0,
-            },
-            "log_dir": temp_dir,
-        }
+        cfg = LoggerConfig(
+            gpu_monitoring=GPUMonitoringConfig(
+                collection_interval=15.0, flush_interval=45.0
+            ),
+            log_dir=temp_dir,
+        )
         logger = Logger(cfg)
 
         # Check that regular loggers were NOT initialized
@@ -1799,14 +1763,7 @@ class TestLogger:
     @patch("nemo_rl.utils.logger.TensorboardLogger")
     def test_init_no_loggers(self, mock_tb_logger, mock_wandb_logger, temp_dir):
         """Test initialization with no loggers enabled."""
-        cfg = {
-            "wandb_enabled": False,
-            "tensorboard_enabled": False,
-            "mlflow_enabled": False,
-            "swanlab_enabled": False,
-            "monitor_gpus": False,
-            "log_dir": temp_dir,
-        }
+        cfg = LoggerConfig(monitor_gpus=False, log_dir=temp_dir)
         logger = Logger(cfg)
 
         assert len(logger.loggers) == 0
@@ -1817,105 +1774,94 @@ class TestLogger:
     @patch("nemo_rl.utils.logger.TensorboardLogger")
     def test_init_wandb_only(self, mock_tb_logger, mock_wandb_logger, temp_dir):
         """Test initialization with only WandbLogger enabled."""
-        cfg = {
-            "wandb_enabled": True,
-            "tensorboard_enabled": False,
-            "mlflow_enabled": False,
-            "swanlab_enabled": False,
-            "monitor_gpus": False,
-            "wandb": {"project": "test-project"},
-            "log_dir": temp_dir,
-        }
+        cfg = LoggerConfig(
+            wandb_enabled=True,
+            monitor_gpus=False,
+            wandb=WandbConfig(project="test-project", name="test-run"),
+            log_dir=temp_dir,
+        )
         logger = Logger(cfg)
 
         assert len(logger.loggers) == 1
         mock_wandb_logger.assert_called_once()
         wandb_cfg = mock_wandb_logger.call_args[0][0]
-        assert wandb_cfg == {"project": "test-project"}
+        assert wandb_cfg.project == "test-project"
         mock_tb_logger.assert_not_called()
 
     @patch("nemo_rl.utils.logger.WandbLogger")
     @patch("nemo_rl.utils.logger.SwanlabLogger")
     @patch("nemo_rl.utils.logger.TensorboardLogger")
-    def test_init_swanlab_only(self, mock_tb_logger, mock_swanlab_logger, temp_dir):
+    def test_init_swanlab_only(
+        self, mock_tb_logger, mock_swanlab_logger, mock_wandb_logger, temp_dir
+    ):
         """Test initialization with only SwanlabLogger enabled."""
-        cfg = {
-            "wandb_enabled": False,
-            "tensorboard_enabled": False,
-            "mlflow_enabled": False,
-            "swanlab_enabled": True,
-            "monitor_gpus": False,
-            "swanlab": {"project": "test-project"},
-            "log_dir": temp_dir,
-        }
+        cfg = LoggerConfig(
+            swanlab_enabled=True,
+            monitor_gpus=False,
+            swanlab=SwanlabConfig(project="test-project", name="test-run"),
+            log_dir=temp_dir,
+        )
         logger = Logger(cfg)
 
         assert len(logger.loggers) == 1
         mock_swanlab_logger.assert_called_once()
         swanlab_cfg = mock_swanlab_logger.call_args[0][0]
-        assert swanlab_cfg == {"project": "test-project"}
+        assert swanlab_cfg.project == "test-project"
         mock_tb_logger.assert_not_called()
 
     @patch("nemo_rl.utils.logger.WandbLogger")
     @patch("nemo_rl.utils.logger.TensorboardLogger")
     def test_init_tensorboard_only(self, mock_tb_logger, mock_wandb_logger, temp_dir):
         """Test initialization with only TensorboardLogger enabled."""
-        cfg = {
-            "wandb_enabled": False,
-            "tensorboard_enabled": True,
-            "mlflow_enabled": False,
-            "swanlab_enabled": False,
-            "monitor_gpus": False,
-            "tensorboard": {"log_dir": "test_logs"},
-            "log_dir": temp_dir,
-        }
+        cfg = LoggerConfig(
+            tensorboard_enabled=True,
+            monitor_gpus=False,
+            tensorboard=TensorboardConfig(log_dir="test_logs"),
+            log_dir=temp_dir,
+        )
         logger = Logger(cfg)
 
         assert len(logger.loggers) == 1
         mock_tb_logger.assert_called_once()
         tb_cfg = mock_tb_logger.call_args[0][0]
-        assert tb_cfg == {"log_dir": "test_logs"}
+        assert tb_cfg.log_dir == "test_logs"
         mock_wandb_logger.assert_not_called()
 
     @patch("nemo_rl.utils.logger.WandbLogger")
     @patch("nemo_rl.utils.logger.TensorboardLogger")
     def test_init_both_loggers(self, mock_tb_logger, mock_wandb_logger, temp_dir):
         """Test initialization with both loggers enabled."""
-        cfg = {
-            "wandb_enabled": True,
-            "tensorboard_enabled": True,
-            "mlflow_enabled": False,
-            "swanlab_enabled": False,
-            "monitor_gpus": False,
-            "wandb": {"project": "test-project"},
-            "tensorboard": {"log_dir": "test_logs"},
-            "log_dir": temp_dir,
-        }
+        cfg = LoggerConfig(
+            wandb_enabled=True,
+            tensorboard_enabled=True,
+            monitor_gpus=False,
+            wandb=WandbConfig(project="test-project", name="test-run"),
+            tensorboard=TensorboardConfig(log_dir="test_logs"),
+            log_dir=temp_dir,
+        )
         logger = Logger(cfg)
 
         assert len(logger.loggers) == 2
         mock_wandb_logger.assert_called_once()
         wandb_cfg = mock_wandb_logger.call_args[0][0]
-        assert wandb_cfg == {"project": "test-project"}
+        assert wandb_cfg.project == "test-project"
 
         mock_tb_logger.assert_called_once()
         tb_cfg = mock_tb_logger.call_args[0][0]
-        assert tb_cfg == {"log_dir": "test_logs"}
+        assert tb_cfg.log_dir == "test_logs"
 
     @patch("nemo_rl.utils.logger.WandbLogger")
     @patch("nemo_rl.utils.logger.TensorboardLogger")
     def test_log_metrics(self, mock_tb_logger, mock_wandb_logger, temp_dir):
         """Test logging metrics to all enabled loggers."""
-        cfg = {
-            "wandb_enabled": True,
-            "tensorboard_enabled": True,
-            "mlflow_enabled": False,
-            "swanlab_enabled": False,
-            "monitor_gpus": False,
-            "wandb": {"project": "test-project"},
-            "tensorboard": {"log_dir": "test_logs"},
-            "log_dir": temp_dir,
-        }
+        cfg = LoggerConfig(
+            wandb_enabled=True,
+            tensorboard_enabled=True,
+            monitor_gpus=False,
+            wandb=WandbConfig(project="test-project", name="test-run"),
+            tensorboard=TensorboardConfig(log_dir="test_logs"),
+            log_dir=temp_dir,
+        )
         logger = Logger(cfg)
 
         # Create mock logger instances
@@ -1943,16 +1889,14 @@ class TestLogger:
         temp_dir,
     ):
         """Histogram metrics use the typed logger API."""
-        cfg = {
-            "wandb_enabled": True,
-            "tensorboard_enabled": True,
-            "mlflow_enabled": False,
-            "swanlab_enabled": False,
-            "monitor_gpus": False,
-            "wandb": {"project": "test-project"},
-            "tensorboard": {"log_dir": "test_logs"},
-            "log_dir": temp_dir,
-        }
+        cfg = LoggerConfig(
+            wandb_enabled=True,
+            tensorboard_enabled=True,
+            monitor_gpus=False,
+            wandb=WandbConfig(project="test-project", name="test-run"),
+            tensorboard=TensorboardConfig(log_dir="test_logs"),
+            log_dir=temp_dir,
+        )
         logger = Logger(cfg)
 
         metrics = {
@@ -1990,15 +1934,12 @@ class TestLogger:
     def test_log_metrics_prefixes_non_generation_histograms(
         self, mock_wandb_logger, temp_dir
     ):
-        cfg = {
-            "wandb_enabled": True,
-            "tensorboard_enabled": False,
-            "mlflow_enabled": False,
-            "swanlab_enabled": False,
-            "monitor_gpus": False,
-            "wandb": {"project": "test-project"},
-            "log_dir": temp_dir,
-        }
+        cfg = LoggerConfig(
+            wandb_enabled=True,
+            monitor_gpus=False,
+            wandb=WandbConfig(project="test-project", name="test-run"),
+            log_dir=temp_dir,
+        )
         logger = Logger(cfg)
 
         logger.log_metrics(
@@ -2013,15 +1954,12 @@ class TestLogger:
     def test_log_metrics_preserves_non_train_generation_histogram_prefix(
         self, mock_wandb_logger, temp_dir
     ):
-        cfg = {
-            "wandb_enabled": True,
-            "tensorboard_enabled": False,
-            "mlflow_enabled": False,
-            "swanlab_enabled": False,
-            "monitor_gpus": False,
-            "wandb": {"project": "test-project"},
-            "log_dir": temp_dir,
-        }
+        cfg = LoggerConfig(
+            wandb_enabled=True,
+            monitor_gpus=False,
+            wandb=WandbConfig(project="test-project", name="test-run"),
+            log_dir=temp_dir,
+        )
         logger = Logger(cfg)
 
         logger.log_metrics(
@@ -2041,16 +1979,14 @@ class TestLogger:
     def test_define_metric_only_targets_wandb(
         self, mock_tb_logger, mock_wandb_logger, temp_dir
     ):
-        cfg = {
-            "wandb_enabled": True,
-            "tensorboard_enabled": True,
-            "mlflow_enabled": False,
-            "swanlab_enabled": False,
-            "monitor_gpus": False,
-            "wandb": {"project": "test-project"},
-            "tensorboard": {"log_dir": "test_logs"},
-            "log_dir": temp_dir,
-        }
+        cfg = LoggerConfig(
+            wandb_enabled=True,
+            tensorboard_enabled=True,
+            monitor_gpus=False,
+            wandb=WandbConfig(project="test-project", name="test-run"),
+            tensorboard=TensorboardConfig(log_dir="test_logs"),
+            log_dir=temp_dir,
+        )
         logger = Logger(cfg)
 
         logger.define_metric(
@@ -2068,16 +2004,14 @@ class TestLogger:
     @patch("nemo_rl.utils.logger.TensorboardLogger")
     def test_log_hyperparams(self, mock_tb_logger, mock_wandb_logger, temp_dir):
         """Test logging hyperparameters to all enabled loggers."""
-        cfg = {
-            "wandb_enabled": True,
-            "tensorboard_enabled": True,
-            "mlflow_enabled": False,
-            "swanlab_enabled": False,
-            "monitor_gpus": False,
-            "wandb": {"project": "test-project"},
-            "tensorboard": {"log_dir": "test_logs"},
-            "log_dir": temp_dir,
-        }
+        cfg = LoggerConfig(
+            wandb_enabled=True,
+            tensorboard_enabled=True,
+            monitor_gpus=False,
+            wandb=WandbConfig(project="test-project", name="test-run"),
+            tensorboard=TensorboardConfig(log_dir="test_logs"),
+            log_dir=temp_dir,
+        )
         logger = Logger(cfg)
 
         # Create mock logger instances
@@ -2098,20 +2032,16 @@ class TestLogger:
         self, mock_gpu_monitor, mock_tb_logger, mock_wandb_logger, temp_dir
     ):
         """Test initialization with GPU monitoring enabled."""
-        cfg = {
-            "wandb_enabled": True,
-            "tensorboard_enabled": True,
-            "mlflow_enabled": False,
-            "swanlab_enabled": False,
-            "monitor_gpus": True,
-            "gpu_monitoring": {
-                "collection_interval": 15.0,
-                "flush_interval": 45.0,
-            },
-            "wandb": {"project": "test-project"},
-            "tensorboard": {"log_dir": "test_logs"},
-            "log_dir": temp_dir,
-        }
+        cfg = LoggerConfig(
+            wandb_enabled=True,
+            tensorboard_enabled=True,
+            gpu_monitoring=GPUMonitoringConfig(
+                collection_interval=15.0, flush_interval=45.0
+            ),
+            wandb=WandbConfig(project="test-project", name="test-run"),
+            tensorboard=TensorboardConfig(log_dir="test_logs"),
+            log_dir=temp_dir,
+        )
         logger = Logger(cfg)
 
         # Check that regular loggers were initialized
@@ -2144,16 +2074,14 @@ class TestLogger:
         self, mock_tb_logger, mock_wandb_logger, temp_dir
     ):
         """Test logging metrics with prefix and step_metric."""
-        cfg = {
-            "wandb_enabled": True,
-            "tensorboard_enabled": True,
-            "mlflow_enabled": False,
-            "swanlab_enabled": False,
-            "monitor_gpus": False,
-            "wandb": {"project": "test-project"},
-            "tensorboard": {"log_dir": "test_logs"},
-            "log_dir": temp_dir,
-        }
+        cfg = LoggerConfig(
+            wandb_enabled=True,
+            tensorboard_enabled=True,
+            monitor_gpus=False,
+            wandb=WandbConfig(project="test-project", name="test-run"),
+            tensorboard=TensorboardConfig(log_dir="test_logs"),
+            log_dir=temp_dir,
+        )
         logger = Logger(cfg)
 
         # Create mock logger instances
@@ -2183,16 +2111,14 @@ class TestLogger:
         self, mock_tb_logger, mock_wandb_logger, temp_dir
     ):
         """Test logging token probability error plots."""
-        cfg = {
-            "wandb_enabled": True,
-            "tensorboard_enabled": True,
-            "mlflow_enabled": False,
-            "swanlab_enabled": False,
-            "monitor_gpus": False,
-            "wandb": {"project": "test-project"},
-            "tensorboard": {"log_dir": "test_logs"},
-            "log_dir": temp_dir,
-        }
+        cfg = LoggerConfig(
+            wandb_enabled=True,
+            tensorboard_enabled=True,
+            monitor_gpus=False,
+            wandb=WandbConfig(project="test-project", name="test-run"),
+            tensorboard=TensorboardConfig(log_dir="test_logs"),
+            log_dir=temp_dir,
+        )
         logger = Logger(cfg)
 
         # Create mock logger instances
@@ -2241,19 +2167,12 @@ class TestLogger:
         self, mock_mlflow_logger, mock_tb_logger, mock_wandb_logger, temp_dir
     ):
         """Test initialization with only MLflowLogger enabled."""
-        cfg = {
-            "wandb_enabled": False,
-            "tensorboard_enabled": False,
-            "mlflow_enabled": True,
-            "swanlab_enabled": False,
-            "monitor_gpus": False,
-            "mlflow": {
-                "experiment_name": "test-experiment",
-                "tracking_uri": None,
-                "run_name": "test-run",
-            },
-            "log_dir": temp_dir,
-        }
+        cfg = LoggerConfig(
+            mlflow_enabled=True,
+            monitor_gpus=False,
+            mlflow=MLflowConfig(experiment_name="test-experiment", run_name="test-run"),
+            log_dir=temp_dir,
+        )
         logger = Logger(cfg)
 
         assert len(logger.loggers) == 1
@@ -2274,22 +2193,18 @@ class TestLogger:
         temp_dir,
     ):
         """Test initialization with all loggers enabled."""
-        cfg = {
-            "wandb_enabled": True,
-            "tensorboard_enabled": True,
-            "mlflow_enabled": True,
-            "swanlab_enabled": True,
-            "monitor_gpus": False,
-            "wandb": {"project": "test-project"},
-            "swanlab": {"project": "test-project"},
-            "tensorboard": {"log_dir": "test_logs"},
-            "mlflow": {
-                "experiment_name": "test-experiment",
-                "tracking_uri": None,
-                "run_name": "test-run",
-            },
-            "log_dir": temp_dir,
-        }
+        cfg = LoggerConfig(
+            wandb_enabled=True,
+            tensorboard_enabled=True,
+            mlflow_enabled=True,
+            swanlab_enabled=True,
+            monitor_gpus=False,
+            wandb=WandbConfig(project="test-project", name="test-run"),
+            swanlab=SwanlabConfig(project="test-project", name="test-run"),
+            tensorboard=TensorboardConfig(log_dir="test_logs"),
+            mlflow=MLflowConfig(experiment_name="test-experiment", run_name="test-run"),
+            log_dir=temp_dir,
+        )
         logger = Logger(cfg)
 
         assert len(logger.loggers) == 4
@@ -2311,22 +2226,18 @@ class TestLogger:
         temp_dir,
     ):
         """Test logging metrics to all enabled loggers including MLflow."""
-        cfg = {
-            "wandb_enabled": True,
-            "swanlab_enabled": True,
-            "tensorboard_enabled": True,
-            "mlflow_enabled": True,
-            "monitor_gpus": False,
-            "wandb": {"project": "test-project"},
-            "swanlab": {"project": "test-project"},
-            "tensorboard": {"log_dir": "test_logs"},
-            "mlflow": {
-                "experiment_name": "test-experiment",
-                "tracking_uri": None,
-                "run_name": "test-run",
-            },
-            "log_dir": temp_dir,
-        }
+        cfg = LoggerConfig(
+            wandb_enabled=True,
+            swanlab_enabled=True,
+            tensorboard_enabled=True,
+            mlflow_enabled=True,
+            monitor_gpus=False,
+            wandb=WandbConfig(project="test-project", name="test-run"),
+            swanlab=SwanlabConfig(project="test-project", name="test-run"),
+            tensorboard=TensorboardConfig(log_dir="test_logs"),
+            mlflow=MLflowConfig(experiment_name="test-experiment", run_name="test-run"),
+            log_dir=temp_dir,
+        )
         logger = Logger(cfg)
 
         # Create mock logger instances
@@ -2366,18 +2277,18 @@ class TestLogger:
         temp_dir,
     ):
         """Test logging hyperparameters to all enabled loggers including MLflow."""
-        cfg = {
-            "wandb_enabled": True,
-            "swanlab_enabled": True,
-            "tensorboard_enabled": True,
-            "mlflow_enabled": True,
-            "monitor_gpus": False,
-            "wandb": {"project": "test-project"},
-            "swanlab": {"project": "test-project"},
-            "tensorboard": {"log_dir": "test_logs"},
-            "mlflow": {"experiment_name": "test-experiment"},
-            "log_dir": temp_dir,
-        }
+        cfg = LoggerConfig(
+            wandb_enabled=True,
+            swanlab_enabled=True,
+            tensorboard_enabled=True,
+            mlflow_enabled=True,
+            monitor_gpus=False,
+            wandb=WandbConfig(project="test-project", name="test-run"),
+            swanlab=SwanlabConfig(project="test-project", name="test-run"),
+            tensorboard=TensorboardConfig(log_dir="test_logs"),
+            mlflow=MLflowConfig(experiment_name="test-experiment"),
+            log_dir=temp_dir,
+        )
         logger = Logger(cfg)
 
         # Create mock logger instances

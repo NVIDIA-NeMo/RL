@@ -35,6 +35,7 @@ from nemo_rl.data import DataConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.utils.checkpoint import CheckpointManager
+from nemo_rl.utils.logger import LoggerConfig
 
 
 def _make_loss_config(
@@ -1566,7 +1567,7 @@ def _make_noncolocated_setup_config(
             reward_scaling={"enabled": False},
             adv_estimator={"name": "raw_reward"},
         ),
-        logger={"num_val_samples_to_print": 0},
+        logger=LoggerConfig.model_construct(),
         cluster=ClusterConfig(
             num_nodes=total_nodes,
             gpus_per_node=total_gpus_per_node,
@@ -2840,7 +2841,7 @@ def test_validate_dispatches_rollout_by_engine_mode(monkeypatch, async_engine):
     config.ppo.max_val_samples = 1
     config.ppo.val_batch_size = 1
     config.ppo.max_rollout_turns = 1
-    config.logger = {"num_val_samples_to_print": 0}
+    config.logger = LoggerConfig.model_construct()
 
     ppo.validate(
         policy_generation=MagicMock(),
