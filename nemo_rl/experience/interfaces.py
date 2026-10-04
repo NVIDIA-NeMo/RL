@@ -22,6 +22,10 @@ NEMO_GYM_GROUP_ID_KEY = "_ng_group_id"
 NEMO_GYM_GROUP_ATTEMPT_KEY = "_ng_group_attempt"
 NEMO_GYM_ROLLOUT_INDEX_KEY = "_ng_rollout_index"
 NEXT_NEMO_GYM_TASK_INDEX_KEY = "next_ng_task_index"
+# Set on a NeMo-Gym result (to the reason) when env.nemo_gym.mask_unusable_rollouts
+# replaced an untrainable rollout with a masked placeholder sample. Rollout
+# batching zeroes the loss weight of such samples whatever the mask_sample gate.
+NEMO_GYM_UNUSABLE_ROLLOUT_KEY = "_ng_unusable_rollout"
 # Unconsumed suffix of a gap-fill dataloader batch, carried in the async
 # collector's rollouts state so a checkpoint cannot strand yielded prompts.
 PENDING_PROMPTS_KEY = "pending_prompt_batch"

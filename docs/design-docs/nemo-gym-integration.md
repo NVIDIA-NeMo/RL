@@ -47,6 +47,19 @@ the async replay buffer and avoids uploading them to W&B. Numeric per-agent
 rollout metrics are unaffected. Set the flag to `true` only when the complete
 Gym result payloads are needed for a short debugging run.
 
+By default, a NeMo Gym result that yields no trainable tokens fails the rollout
+batch: a result with no generation data (for example, the first prompt already
+exceeds `max_model_len`, or the agent produced no assistant turn) raises a
+`ValueError`, and a token chain that is not contiguous across turns (for
+example, an agent harness that rewrites or compacts its history) raises an
+`AssertionError`. Set `env.nemo_gym.mask_unusable_rollouts: true` to replace such
+a rollout with a placeholder sample instead. The placeholder sets `mask_sample`
+(so it is excluded from the loss) and always has
+its `loss_multiplier` set to zero, even when `env.should_mask_flagged_samples` is
+`false`. A non-contiguous rollout keeps its contiguous prefix; a rollout with no
+generation data gets a fixed 128-token prompt and a single EOS token. Each
+replacement is logged with a `[nemo_gym] masking a rollout` line.
+
 For complete examples, see `examples/nemo_gym/run_grpo_nemo_gym.py`, `examples/nemo_gym/run_distillation_nemo_gym.py`, and their associated configs under `examples/nemo_gym/`.
 
 ### Shard NeMo Gym across nodes
