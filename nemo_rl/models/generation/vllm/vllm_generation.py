@@ -639,6 +639,7 @@ class VllmGeneration(GenerationInterface):
         staging_partition: str,
         *,
         capture_media: bool = False,
+        storage_segments: Optional[dict[str, list[str]]] = None,
     ) -> None:
         """Install ledger-authoritative token capture in every DP-leader worker.
 
@@ -655,6 +656,7 @@ class VllmGeneration(GenerationInterface):
             dp_cfg=dp_cfg,
             staging_partition=staging_partition,
             capture_media=capture_media,
+            storage_segments=storage_segments,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
         ray.get(futures)

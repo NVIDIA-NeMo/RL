@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any, Callable, Literal, NotRequired, Sequence, TypedDict
 
-from pydantic import BaseModel, Field, PositiveInt
+from pydantic import BaseModel, Field, NonNegativeInt, PositiveInt
 from tensordict import TensorDict
 
 DATA_PLANE_CHECKPOINT_SCHEMA_VERSION = 2
@@ -74,9 +74,10 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     instead of registering a fresh one per transfer; set false to fall back to
     upstream's per-call registration.
 
-    ``staging_buffer_size`` is that pool's per-slot ceiling. It is a pooling
-    threshold, not a size limit: a bigger payload still transfers, just with a
-    transient registration. Slots ratchet — they grow to the largest payload
+    ``staging_buffer_size`` is that pool's per-slot ceiling. A bigger payload
+    still transfers with a transient registration, up to the pool's total of
+    4 slots; a single payload above that fails with the native pool. Slots
+    ratchet — they grow to the largest payload
     admitted and never shrink — so raise it only when a per-key payload (one
     sample of one field) genuinely exceeds it, not for headroom.
 
@@ -93,11 +94,21 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     """
 
     global_segment_size: int = 68719476736  # 64 GiB per client process
-    local_buffer_size: int = 4294967296  # 4 GiB per client process
+    # The staging pool is carved out of this buffer; a slot that doesn't fit
+    # is registered per call. Keep it >= 4 x staging_buffer_size.
+    local_buffer_size: int = 2147483648  # 2 GiB = 4 x 512 MiB slots
     reuse_registered_buffers: bool = True
-    staging_buffer_size: int = 268435456  # 256 MiB per pool slot
+    # One object above max(4 x this, local_buffer_size) fails to transfer.
+    staging_buffer_size: int = 536870912  # 512 MiB per pool slot
     use_gdr: bool = False
     gdr_staging_buffer_mb: PositiveInt = 1024
+    # >0: only CPU MooncakeStorageUnit actors own Mooncake memory (this many
+    # bytes each); every other process is a client and off the save path.
+    storage_unit_segment_size: NonNegativeInt = 0
+    # Total units, like simple.num_storage_units; None: 2 per selected node.
+    num_storage_units: PositiveInt | None = None
+    # Nodes that host units: all | inference (vLLM nodes) | train.
+    storage_unit_placement: Literal["inference", "train", "all"] = "all"
 
 
 class DataPlaneConfig(TypedDict):

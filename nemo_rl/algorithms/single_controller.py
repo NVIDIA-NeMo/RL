@@ -413,6 +413,7 @@ class SingleControllerActor:
                         for index in generation_workers.dp_leader_worker_indices
                     )
                 checkpoint_workers.extend(actor_args.finalizer_actors)
+                checkpoint_workers.extend(actor_args.storage_units)
                 # Advantage actors write the advantages column through their own
                 # connect-only clients, so their local stores hold rows a
                 # snapshot must see.

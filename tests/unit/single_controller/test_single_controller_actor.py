@@ -182,6 +182,7 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         save_state=_initial_grpo_save_state(),
         last_checkpoint_path=None,
         finalizer_actors=[],
+        storage_units=(),
         advantage_actors=[],
         data_plane_checkpoint_metadata=None,
         partition_includes_multimodal_fields=False,
@@ -400,6 +401,7 @@ def test_mooncake_checkpoint_workers_configured_before_restore(
         teacher_worker_groups={"teacher": group(workers[3:4])},
         gen_handle=group(workers[4:8], leaders=(0, 2)),
         finalizer_actors=workers[8:],
+        storage_units=(),
     )
 
     def stop_after_restore(**kwargs):

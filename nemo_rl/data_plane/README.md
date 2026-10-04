@@ -430,12 +430,15 @@ data_plane:
     storage_capacity: 1000000          # max samples retained per partition
     num_storage_units: ${mul:2, ${cluster.num_nodes}}  # TQ wants >= 2 per node
   mooncake_cpu:
-    global_segment_size: 68719476736   # 64 GiB/process
-    local_buffer_size:    4294967296   # 4 GiB/process
+    global_segment_size: 68719476736   # 64 GiB/process (ignored when storage units are on)
+    local_buffer_size:   2147483648    # 2 GiB/process = 4 x staging slot
     reuse_registered_buffers: true     # reuse RDMA-registered buffers
-    staging_buffer_size:   268435456   # 256 MiB/pool slot; bigger transfers bypass the pool
+    staging_buffer_size:  536870912    # 512 MiB/pool slot
     use_gdr: false                      # GPU-memory RDMA staging in CUDA clients
     gdr_staging_buffer_mb: 1024         # persistent MiB per active GDR client
+    storage_unit_segment_size: 0       # >0: storage units on (see "Storage layout")
+    num_storage_units: ${mul:2, ${cluster.num_nodes}}  # total, like simple's
+    storage_unit_placement: all        # all | inference | train
   observability:                       # NotRequired
     enabled: true                      # per-op timing / latency percentiles / volume
     verify_tensor_hash: false          # debug: wire-in vs wire-out tensor check
@@ -851,7 +854,68 @@ SingleController, however, each individual tensor must currently fit because
 the CPU PUT path does not create the chunk metadata required by an oversized
 GDR GET.
 
+### Mooncake storage layout: clients vs storage units
+
+Every Mooncake process plays one or both of two roles:
+
+- **client** — puts and gets data.
+- **owner** — its RAM holds the data (a *segment*).
+
+A checkpoint save has to call every owner, because the data lives in that
+owner's memory. Who owns memory therefore decides both **where memory
+pressure lands** and **who sits on the save path**.
+
+```
+co-located (default, storage_unit_segment_size: 0)
+  trainer / vLLM / controller   each: client + owner (global_segment_size)
+  save calls every GPU process   ← a busy trainer or vLLM stalls the save
+
+separated (storage_unit_segment_size > 0)
+  trainer / vLLM / controller   client only (segment 0)
+  MooncakeStorageUnit (CPU)     owner only (storage_unit_segment_size each)
+  save calls the units only      ← GPU processes never on the save path
+```
+
+Puts and gets are one-sided RDMA, so a unit's process never runs on the data
+path; it only does work during a checkpoint save or load. One CPU per unit is
+enough. This is the same shape as TQ's `simple` backend (`SimpleStorageUnit`).
+
+**Placement** — `storage_unit_placement` picks the nodes that host units
+(`num_storage_units` in total, spread evenly):
+
+| option | units on | memory pressure | write locality |
+|---|---|---|---|
+| `all` (default) | every train + inference node | spread across all nodes | vLLM writes to its node's unit; other writes spread over all units |
+| `inference` | vLLM nodes only | trainer nodes hold **no** storage | vLLM local; trainer writes cross-node |
+| `train` | trainer nodes only | inference nodes hold no storage | vLLM writes cross-node |
+
+Trainer nodes are usually the host-memory-heavy ones (model state, optimizer,
+dataloaders), so `inference` is the choice when they are tight. Cross-node
+writes are RDMA either way; the trade is memory placement, not correctness.
+
+**Sizing**
+
+| knob | role | size it to |
+|---|---|---|
+| `storage_unit_segment_size` | unit memory | peak data-plane bytes ÷ number of units, plus headroom. Larger is cheap to set up; it is pinned for the whole run. |
+| `num_storage_units` | save parallelism | more units = more parallel shard writers, one CPU each. Keep the count fixed between save and resume. |
+| `local_buffer_size` | client transfer memory | the staging pool lives inside it: `4 × staging_buffer_size`. Too small and every transfer re-registers memory. |
+| `staging_buffer_size` | largest pooled transfer | ≥ 2 × the largest single object. One object above `max(4 × slot, local_buffer_size)` fails. |
+
+Registered memory is pinned once per RDMA NIC, so per-process buffers add up
+quickly across many GPU processes — another reason to keep segments in a few
+CPU units rather than in every client.
+
+**Capacity is a hard limit when separated.** A put that finds its preferred
+unit full spills to any other unit, but once every unit is full puts fail —
+there are no client segments to fall back on.
+
 ### Experimental Mooncake storage checkpoints
+
+With storage units on, the units are the only checkpoint participants; the
+description below of which actors own storage applies to the co-located
+layout.
+
 
 The existing `checkpointing.enabled=true` and
 `checkpointing.save_data_plane=true` settings enable Mooncake storage save/load

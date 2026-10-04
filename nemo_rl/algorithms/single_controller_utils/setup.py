@@ -178,6 +178,8 @@ class SingleControllerActorArgs:
     partition_includes_multimodal_fields: bool = False
     bootstrap_identity: Optional[BootstrapCompatibilityIdentity] = None
     rollout_checkpoint_load_metrics: Optional[dict[str, float]] = None
+    # MooncakeStorageUnit actors; empty unless storage_unit_segment_size > 0.
+    storage_units: tuple[Any, ...] = ()
     # None when async_rl.generation_fleet_health is disabled; the SingleController
     # drives the probe loop when it is present.
     fleet_monitor: Optional[GenerationFleetHealth] = None
@@ -1935,13 +1937,21 @@ def setup_single_controller(
             partition_id=partition_id,
             include_multimodal_fields=processor is not None,
         )
+    # Mooncake memory owners when storage_unit_segment_size > 0.
+    from nemo_rl.data_plane.mooncake_storage_unit import start_storage_units
+
+    storage_units, storage_segments = start_storage_units(
+        dp_config, inference_cluster=inference_cluster, train_cluster=train_cluster
+    )
     if token_capture_cfg.enabled:
         # Both active backends stage canonical Gym rows in serving workers;
         # only vLLM workers stage captured media beside them (capture_media).
+        capture_kwargs: dict[str, Any] = {"capture_media": capture_media}
+        if storage_segments:
+            # Only vLLM serving workers prefer a local storage unit.
+            capture_kwargs["storage_segments"] = storage_segments
         generation.setup_token_capture(
-            dp_config,
-            token_capture_cfg.staging_partition,
-            capture_media=capture_media,
+            dp_config, token_capture_cfg.staging_partition, **capture_kwargs
         )
         generation.set_rollout_weight_version(0)
 
@@ -2082,6 +2092,7 @@ def setup_single_controller(
         bootstrap_identity=bootstrap_identity,
         rollout_checkpoint_load_metrics=rollout_checkpoint_load_metrics,
         finalizer_actors=finalizer_actors,
+        storage_units=storage_units,
         advantage_actors=advantage_actors,
         fleet_monitor=fleet_monitor,
         generation_router=generation_router,

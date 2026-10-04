@@ -16,6 +16,7 @@ import asyncio
 import copy
 import gc
 import logging
+import os
 import threading
 import time
 import uuid
@@ -37,6 +38,7 @@ from nemo_rl.data.captured_media import (
 )
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import (
     disown_storage_in_this_process,
+    prefer_storage_segment,
     run_checkpoint_command,
 )
 from nemo_rl.data_plane.tq_token_sink import MediaMetadataIntegrityError
@@ -532,6 +534,7 @@ class VllmAsyncGenerationWorkerImpl(
         staging_partition: str,
         *,
         capture_media: bool = False,
+        storage_segments: Optional[dict[str, list[str]]] = None,
     ) -> bool:
         """Host ledger-authoritative token capture in this worker.
 
@@ -540,6 +543,8 @@ class VllmAsyncGenerationWorkerImpl(
         ``install_capture`` call wiring Gym's engine-blind capture core +
         vLLM adapter into this worker. Returns whether capture was installed
         (False on non-model-owner ranks, which serve no HTTP).
+        ``storage_segments`` maps Ray node ID to that node's MooncakeStorageUnit
+        segments; capture puts prefer one of them when this node has any.
         """
         if not self.is_model_owner:
             return False
@@ -554,6 +559,13 @@ class VllmAsyncGenerationWorkerImpl(
         # loop is busy serving rollouts. Capture writes land in other segments.
         disown_storage_in_this_process()
         dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
+        local_units = (storage_segments or {}).get(
+            ray.get_runtime_context().get_node_id()
+        )
+        if local_units:
+            # One preferred segment per client (replica_num=1); spread this
+            # node's writers across its MooncakeStorageUnits by pid.
+            prefer_storage_segment(local_units[os.getpid() % len(local_units)])
         # The Omni processor emits pixels in the engine's model dtype; the
         # sink pins its media column to it so text-call sentinels never
         # introduce a second dtype (TQ keeps one dtype per field).

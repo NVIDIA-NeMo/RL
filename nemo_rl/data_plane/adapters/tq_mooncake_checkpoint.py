@@ -1373,19 +1373,18 @@ class _CheckpointManagerMixin:
     config: dict[str, Any]
 
     def __init__(self, controller_info: Any, config: dict[str, Any]) -> None:
-        if _checkpoint_enabled(config):
-            config = dict(config)
-            if (
-                ray.get_runtime_context().get_actor_id() is None
-                or _DISOWN_STORAGE_IN_THIS_PROCESS
-            ):
-                # A driver/task has no actor command endpoint, and a process
-                # that called disown_storage_in_this_process() is not a save
-                # participant. Either may use Mooncake, but must not own
-                # otherwise unreachable payload.
-                # Keep the controller's published config unchanged so actors
-                # still mount their configured storage capacity.
-                config["global_segment_size"] = 0
+        config = dict(config)
+        if _SEGMENT_SIZE_IN_THIS_PROCESS is not None:
+            config["global_segment_size"] = _SEGMENT_SIZE_IN_THIS_PROCESS
+        elif (
+            _checkpoint_enabled(config)
+            and ray.get_runtime_context().get_actor_id() is None
+        ):
+            # A driver/task has no actor command endpoint. It may use
+            # Mooncake, but must not own otherwise unreachable payload.
+            # Keep the controller's published config unchanged so actors
+            # still mount their configured storage capacity.
+            config["global_segment_size"] = 0
         # The optional TQ base is supplied at installation, not at module import.
         cast(Any, super()).__init__(controller_info, config)
         self._checkpoint_workers: list[Any] = []
@@ -1430,17 +1429,50 @@ def configure_checkpoint_workers(workers: list[Any]) -> None:
     manager._checkpoint_workers = list(owners.values())
 
 
-# Set by processes that use Mooncake but must not own checkpointable payload,
-# before their client attaches. They get the driver's rule: no segment, so
-# their puts land in other processes' segments and they are not save
-# participants.
-_DISOWN_STORAGE_IN_THIS_PROCESS = False
+# Per-process override of the controller's global_segment_size, set before the
+# client attaches. 0 gets the driver's rule: no segment, so puts land in other
+# processes' segments and the process is not a save participant. A positive
+# size is a MooncakeStorageUnit's.
+_SEGMENT_SIZE_IN_THIS_PROCESS: int | None = None
 
 
 def disown_storage_in_this_process() -> None:
     """Make this process's Mooncake client own no segment. Call before it attaches."""
-    global _DISOWN_STORAGE_IN_THIS_PROCESS
-    _DISOWN_STORAGE_IN_THIS_PROCESS = True
+    own_storage_in_this_process(0)
+
+
+def own_storage_in_this_process(segment_size: int) -> None:
+    """Mount ``segment_size`` bytes in this process's client. Call before it attaches."""
+    global _SEGMENT_SIZE_IN_THIS_PROCESS
+    _SEGMENT_SIZE_IN_THIS_PROCESS = segment_size
+
+
+def _attached_manager() -> Any:
+    from transfer_queue import interface as tq_interface
+
+    manager = getattr(tq_interface._TQ_CLIENT, "storage_manager", None)
+    if not isinstance(manager, _CheckpointManagerMixin):
+        raise RuntimeError("Mooncake checkpoint manager is not attached")
+    return manager
+
+
+def local_segment_name() -> str:
+    """This process's Mooncake segment name, as replica descriptors report it."""
+    segment = _attached_manager().storage_client._store.get_hostname()
+    if not isinstance(segment, str) or not segment:
+        raise RuntimeError("Mooncake client did not expose its segment name")
+    return segment
+
+
+def prefer_storage_segment(segment_name: str) -> None:
+    """Allocate this process's puts in ``segment_name`` first.
+
+    Mooncake falls back to another segment when the preferred one is full
+    (``AllocateReplicas`` tries preferred, then random), so this is placement,
+    not a capacity guarantee.
+    """
+    # Length must equal replica_num (1 under TQ); store_py validates it.
+    _attached_manager().storage_client.replica_config.preferred_segments = [segment_name]
 
 
 def run_checkpoint_command(body: Mapping[str, Any]) -> dict[str, Any] | None:

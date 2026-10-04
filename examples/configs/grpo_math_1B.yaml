@@ -617,9 +617,12 @@ data_plane:
   mooncake_cpu:
     # Per client process — see MooncakeCpuConfig before raising these.
     global_segment_size: 68719476736 # 64 GiB/process
-    local_buffer_size:    4294967296 # 4 GiB/process
+    local_buffer_size:    2147483648 # 2 GiB/process = 4 x staging slot
     reuse_registered_buffers: true   # reuse RDMA-registered buffers
-    staging_buffer_size:   268435456 # 256 MiB/pool slot; bigger transfers bypass the pool
+    staging_buffer_size:   536870912 # 512 MiB/pool slot; one object > 4x this fails
+    storage_unit_segment_size: 0     # >0: CPU storage units own all memory (bytes each)
+    num_storage_units: ${mul:2, ${cluster.num_nodes}}  # total units, spread over placement
+    storage_unit_placement: all      # all | inference | train
     use_gdr: false                   # GPU-memory RDMA staging in CUDA clients
     gdr_staging_buffer_mb: 1024      # HBM reserved per active GDR client;
                                      # 8 clients/node is ~8 GiB off the training

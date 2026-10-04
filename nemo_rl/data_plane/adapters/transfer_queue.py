@@ -907,7 +907,11 @@ def _init_tq(cfg: DataPlaneConfig, *, checkpointing: bool = False) -> None:
             "backend": {
                 "storage_backend": "MooncakeStore",
                 "MooncakeStore": {
-                    "global_segment_size": int(mooncake_cfg.global_segment_size),
+                    # With storage units on, every client mounts 0; only the
+                    # units override it (see mooncake_storage_unit.py).
+                    "global_segment_size": 0
+                    if mooncake_cfg.storage_unit_segment_size
+                    else int(mooncake_cfg.global_segment_size),
                     "local_buffer_size": int(mooncake_cfg.local_buffer_size),
                     # _init_tq runs on the driver only — driver IS the
                     # head, so local_ip here is also the head's IP that

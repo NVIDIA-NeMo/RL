@@ -1480,27 +1480,31 @@ def test_command_does_not_initialize_a_client_on_non_owner_ranks(
 
 
 @pytest.mark.parametrize(
-    ("actor_id", "enabled", "disowned", "expected_capacity", "owns_segment"),
+    ("actor_id", "enabled", "segment_override", "expected_capacity", "owns_segment"),
     [
-        (None, True, False, 0, False),
-        ("actor-id", True, False, 1024, True),
-        (None, False, False, 1024, False),
+        (None, True, None, 0, False),
+        ("actor-id", True, None, 1024, True),
+        (None, False, None, 1024, False),
         # An actor that called disown_storage_in_this_process() gets the
         # driver's rule: no segment, no participant.
-        ("actor-id", True, True, 0, False),
+        ("actor-id", True, 0, 0, False),
+        # A MooncakeStorageUnit mounts its own size over the controller's.
+        ("actor-id", True, 2048, 2048, True),
     ],
 )
 def test_installed_manager_keeps_non_actor_clients_out_of_the_storage_topology(
     monkeypatch: pytest.MonkeyPatch,
     actor_id: str | None,
     enabled: bool,
-    disowned: bool,
+    segment_override: int | None,
     expected_capacity: int,
     owns_segment: bool,
 ) -> None:
     import ray
 
-    monkeypatch.setattr(checkpoint_plugin, "_DISOWN_STORAGE_IN_THIS_PROCESS", disowned)
+    monkeypatch.setattr(
+        checkpoint_plugin, "_SEGMENT_SIZE_IN_THIS_PROCESS", segment_override
+    )
     from transfer_queue.storage.managers import mooncake_manager
     from transfer_queue.storage.managers.base import StorageManagerFactory
 

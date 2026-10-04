@@ -86,7 +86,7 @@ def test_absent_block_falls_back_to_model_defaults() -> None:
     """
     resolved = backend_config(_cfg("mooncake_cpu"))
     assert resolved.global_segment_size == 68719476736  # 64 GiB per client process
-    assert resolved.local_buffer_size == 4294967296  # 4 GiB per client process
+    assert resolved.local_buffer_size == 2147483648  # 2 GiB = 4 x 512 MiB staging slots
     # The opt-out flag defaults on, so omitting it must not disable the pool.
     assert resolved.reuse_registered_buffers is True
     assert resolved.use_gdr is False
