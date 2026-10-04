@@ -341,6 +341,10 @@ class NemoGymConfig(TypedDict):
     # server, switches run_rollouts to receipt mode, and assembles receipts
     # from the manifest control route. None/absent = legacy token-echo path.
     token_capture: NotRequired[Dict[str, Any] | None]
+    # Decode each trainable output item's prompt into ``prompt_str`` (logging
+    # only). Every turn's prompt is the whole conversation so far, so the cost
+    # is quadratic in turns; set False for long multi-turn rollouts. Default True.
+    decode_prompt_strs: NotRequired[bool]
 
 
 # Gym control-plane server name (the model server hosting the ledger) and the
@@ -1352,9 +1356,14 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             turn_idx += 1
 
         if batch_decode_items:
-            prompt_strs = tokenizer.batch_decode(
-                [item[1] for item in batch_decode_items]
-            )
+            # prompt_str is only logged; generation_str is also read by the
+            # reward penalties, so it is always decoded.
+            if self.cfg.get("decode_prompt_strs", True):
+                prompt_strs = tokenizer.batch_decode(
+                    [item[1] for item in batch_decode_items]
+                )
+            else:
+                prompt_strs = [None] * len(batch_decode_items)
             generation_strs = tokenizer.batch_decode(
                 [item[2] for item in batch_decode_items]
             )
@@ -1362,7 +1371,8 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             for (output_item_dict, _, _), prompt_str, generation_str in zip(
                 batch_decode_items, prompt_strs, generation_strs
             ):
-                output_item_dict["prompt_str"] = prompt_str
+                if prompt_str is not None:
+                    output_item_dict["prompt_str"] = prompt_str
                 output_item_dict["generation_str"] = generation_str
 
         if not nemo_rl_message_log:
@@ -1624,6 +1634,7 @@ def _build_gym_actor_config(
     invalid_tool_call_patterns = nemo_gym_dict.pop("invalid_tool_call_patterns", None)
     thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
     tokenizer_config = nemo_gym_dict.pop("tokenizer_config", None)
+    decode_prompt_strs = bool(nemo_gym_dict.pop("decode_prompt_strs", True))
     port_range = {
         key: value
         for key in ("port_range_low", "port_range_high")
@@ -1664,6 +1675,7 @@ def _build_gym_actor_config(
         use_fastokens=use_fastokens,
         initial_global_config_dict=nemo_gym_dict,
         token_capture=token_capture,
+        decode_prompt_strs=decode_prompt_strs,
         **port_range,
         **multimodal_flags,
     )
