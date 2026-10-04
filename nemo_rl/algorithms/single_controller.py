@@ -456,6 +456,7 @@ class SingleControllerActor:
             data_plane_checkpoint_metadata = actor_args.data_plane_checkpoint_metadata
         self._gen: Generation = actor_args.gen_handle
         self._trainer: TQPolicy = actor_args.trainer_handle
+        self._reference: Optional[TQPolicy] = actor_args.reference_handle
         self._value: Optional[TQValue] = getattr(actor_args, "value_handle", None)
         self._dataloader = actor_args.dataloader
         self._weight_synchronizer = actor_args.weight_synchronizer
@@ -2922,10 +2923,14 @@ class SingleControllerActor:
                             # and its reload zeroes it, so offloading here would
                             # discard every chunk but the last while the 1/N
                             # normalizer still counts all of them.
-                            await asyncio.to_thread(
-                                self._trainer.prepare_for_lp_inference,
-                                keep_train_buffers=step_open,
-                            )
+                            if (
+                                self._policy_logprobs_required
+                                or self._reference is None
+                            ):
+                                await asyncio.to_thread(
+                                    self._trainer.prepare_for_lp_inference,
+                                    keep_train_buffers=step_open,
+                                )
                         with (
                             self._timer.time("policy_and_reference_logprobs"),
                             managed_span(
@@ -2940,10 +2945,19 @@ class SingleControllerActor:
                                 )
                             if self._reference_logprobs_required:
                                 await asyncio.to_thread(
-                                    self._trainer.get_reference_policy_logprobs_from_meta,
+                                    (
+                                        self._reference or self._trainer
+                                    ).get_reference_policy_logprobs_from_meta,
                                     train_meta,
                                 )
-                    elif self._is_ppo:
+                    if (
+                        self._is_ppo
+                        and not self._policy_logprobs_required
+                        and (
+                            not self._reference_logprobs_required
+                            or self._reference is not None
+                        )
+                    ):
                         # prepare_for_lp_inference is skipped here, and it is the only
                         # other call that parks the policy optimizer before the critic.
                         with (

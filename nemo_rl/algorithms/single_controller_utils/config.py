@@ -810,11 +810,20 @@ class RolloutCheckpointConfig(BaseModel, extra="forbid"):
         return self
 
 
+class ReferencePlacementConfig(BaseModel, extra="forbid"):
+    """Optional GPU allocation for the frozen reference; parallelism follows policy."""
+
+    placement: Literal["same_node", "separate_nodes"] = "separate_nodes"
+    num_nodes: PositiveInt
+    gpus_per_node: PositiveInt
+
+
 class MasterConfig(BaseModel, extra="allow"):
     # algo configs
     grpo: Optional[GRPOConfig] = None
     ppo: Optional[PPOConfig] = None
     policy: PolicyConfig
+    reference: Optional[ReferencePlacementConfig] = None
     value: Optional[ValueConfig] = None  # PPO extras
     loss_fn: ClippedPGLossConfig
     value_loss_fn: Optional[MseValueLossConfig] = None  # PPO extras
@@ -1279,6 +1288,14 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
 
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)
+
+    if master_config.reference is not None and (
+        master_config.loss_fn.reference_policy_kl_penalty <= 0
+        or algo_cfg.skip_reference_policy_logprobs_calculation
+    ):
+        raise ValueError(
+            "Separate reference placement requires reference-policy logprobs"
+        )
 
     reward_penalties_enabled = any(
         getattr(master_config.reward_penalties, flag) for flag in _REWARD_PENALTY_FLAGS

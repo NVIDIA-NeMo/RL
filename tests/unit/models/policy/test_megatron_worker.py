@@ -16,6 +16,7 @@ import asyncio
 import os
 import tempfile
 import time
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -3085,9 +3086,12 @@ def test_megatron_grad_norm_invariant_to_number_of_microbatches(tiny_llama_model
 
 @pytest.mark.timeout(300)
 @pytest.mark.hf_gated
-def test_megatron_reference_policy_functionality(tiny_llama_model_path):
+@pytest.mark.parametrize("separate_reference", [False, True])
+def test_megatron_reference_policy_functionality(
+    tiny_llama_model_path, separate_reference: bool
+):
     """Test Megatron reference policy functionality."""
-    num_gpus = 2
+    num_gpus = 1 if separate_reference else 2
 
     cluster = RayVirtualCluster(
         name="test-reference",
@@ -3140,6 +3144,32 @@ def test_megatron_reference_policy_functionality(tiny_llama_model_path):
         initial_logprobs, reference_logprobs, rtol=1e-4, atol=1e-4
     )
 
+    frozen = None
+    frozen_cluster = None
+    if separate_reference:
+        frozen_cluster = RayVirtualCluster(
+            name="test-separate-reference",
+            bundle_ct_per_node_list=[num_gpus],
+            use_gpus=True,
+            num_gpus_per_node=num_gpus,
+        )
+        frozen_config = deepcopy(config)
+        frozen_config["generation"]["colocated"]["enabled"] = False
+        frozen = Policy(
+            cluster=frozen_cluster,
+            config=frozen_config,
+            tokenizer=tokenizer,
+            name_prefix="reference",
+            init_optimizer=False,
+            init_reference_model=False,
+        )
+        torch.testing.assert_close(
+            frozen.get_logprobs(data)["logprobs"],
+            reference_logprobs,
+            rtol=1e-4,
+            atol=1e-4,
+        )
+
     # Train the policy for a few steps
     train_data = BatchedDataDict(
         {
@@ -3181,6 +3211,16 @@ def test_megatron_reference_policy_functionality(tiny_llama_model_path):
     torch.testing.assert_close(
         reference_logprobs, post_train_reference_logprobs, rtol=1e-4, atol=1e-4
     )
+    if frozen is not None:
+        torch.testing.assert_close(
+            frozen.get_logprobs(data)["logprobs"],
+            reference_logprobs,
+            rtol=1e-4,
+            atol=1e-4,
+        )
+        frozen.shutdown()
+        assert frozen_cluster is not None
+        frozen_cluster.shutdown()
 
     # Policy should have changed after training - check with more detailed metrics
     max_diff = torch.max(torch.abs(initial_logprobs - post_train_logprobs)).item()

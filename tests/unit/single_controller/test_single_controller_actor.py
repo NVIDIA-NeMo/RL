@@ -156,6 +156,7 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         trainer_handle=SimpleNamespace(worker_group=SimpleNamespace(workers=[])),
         value_handle=None,
         teacher_worker_groups=None,
+        reference_handle=None,
         dataloader=None,
         weight_synchronizer=FakeWeightSynchronizer(),
         advantage_estimator=None,
@@ -1404,6 +1405,7 @@ def test_opd_advantage_stage_pools_raw_gap_separately_under_tropd() -> None:
     ctrl._teacher_logprobs_required = True
     ctrl._is_ppo = False
     ctrl._dp_client = FakeDataPlane()
+    ctrl._train_data_dump = None
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig(seq_logprob_error_threshold=None)
     )
@@ -1769,6 +1771,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._rollout_exhausted = asyncio.Event()
     ctrl._rollout_exhausted.set()
     ctrl._trainer = _NoOpTrainer()
+    ctrl._reference = None
     ctrl._is_ppo = False
     ctrl._ppo_epochs = 1
     ctrl._critic_ppo_epochs = 1
@@ -2016,6 +2019,32 @@ def test_train_pump_requests_and_fetches_only_required_logprobs(
     assert (
         "reference_policy_logprobs" in ctrl._train_fields
     ) is reference_logprobs_required
+
+
+@pytest.mark.parametrize("policy_logprobs_required", [False, True])
+def test_separate_reference_stays_resident_during_train_pump(
+    monkeypatch, policy_logprobs_required
+) -> None:
+    meta = _single_group_meta()
+    ctrl = _train_pump_controller(sampler=_FullStepSampler(meta))
+    ctrl._policy_logprobs_required = policy_logprobs_required
+    ctrl._reference_logprobs_required = True
+    ctrl._train_fields = single_controller._train_fields_for_step(
+        policy_logprobs_required=policy_logprobs_required,
+        reference_logprobs_required=True,
+    )
+    trainer = _LogprobRecordingTrainer()
+    trainer.prepare_for_lp_inference = MagicMock()
+    reference = SimpleNamespace(get_reference_policy_logprobs_from_meta=MagicMock())
+    ctrl._trainer = trainer
+    ctrl._reference = reference
+    ctrl._sync_weights = AsyncMock(return_value=1)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+    assert trainer.reference_logprob_calls == 0
+    assert trainer.prepare_for_lp_inference.call_count == int(policy_logprobs_required)
+    reference.get_reference_policy_logprobs_from_meta.assert_called_once()
 
 
 def test_train_pump_rejects_step_with_no_valid_training_chunks() -> None:

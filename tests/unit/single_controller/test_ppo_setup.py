@@ -569,6 +569,7 @@ def patched_ppo_factories():
         patch.object(
             sc_setup_mod, "_build_generation", return_value=(MagicMock(), 0.0)
         ),
+        patch.object(sc_setup_mod.VllmGeneration, "init_cluster_placement_groups"),
         patch.object(
             sc_setup_mod, "_build_trainer", return_value=(fake_policy, 1.0)
         ) as mock_trainer,
