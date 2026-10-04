@@ -501,9 +501,9 @@ The table below covers the metrics reported by `ClippedPGLossFn` (the GRPO/PPO f
 | Behavior | Metrics |
 | --- | --- |
 | **Follows `token_level_loss`** — token-normalized when `true`, sequence-normalized when `false` | `loss`, `kl_penalty` |
-| **Always token-normalized**, regardless of the setting | `probs_ratio`, `probs_ratio_clamped`, `token_mult_prob_error`, `gen_kl_error`, `policy_kl_error`, `js_divergence_error`, `approx_entropy` |
+| **Always token-normalized**, regardless of the setting | `probs_ratio`, `probs_ratio_clamped`, `token_mult_prob_error`, `gen_kl_error`, `policy_kl_error`, `js_divergence_error`, `approx_entropy`, `positive_nll_loss` |
 | **Keyed on a different parameter** | `sampling_importance_ratio` follows `sequence_level_importance_ratios`; `is_oob_ratio` is sequence-normalized only for `truncated_importance_sampling_type: seq-mask-tis` |
-| **Not normalized** — raw counts, per-microbatch means, or extrema combined with min/max | `num_valid_samples`, `positive_nll_loss`, `probs_ratio_min`, `probs_ratio_max`, `probs_ratio_clamped_min`, `probs_ratio_clamped_max`, `num_masked_seqs_by_logprob_error`, `seq_logprob_error_valid_tokens`, `seq_logprob_error_valid_seqs` |
+| **Not normalized** — raw counts or extrema combined with min/max | `num_valid_samples`, `probs_ratio_min`, `probs_ratio_max`, `probs_ratio_clamped_min`, `probs_ratio_clamped_max`, `num_masked_seqs_by_logprob_error`, `seq_logprob_error_valid_tokens`, `seq_logprob_error_valid_seqs` |
 
 The authoritative list is the [`metric_normalizations` table in `ClippedPGLossFn`](https://github.com/NVIDIA-NeMo/RL/blob/1343b2f6fb92b4cced5e515e404595dcac627d98/nemo_rl/algorithms/loss/loss_functions.py#L372-L394), which is kept in sync with the metrics the loss returns.
 
