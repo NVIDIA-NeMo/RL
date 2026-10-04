@@ -593,10 +593,12 @@ class MegatronGeneration(GenerationInterface):
     ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
         """Generate asynchronously, yielding `(index, batch)` tuples as they complete."""
         worker = self._policy.worker_group.workers[0]
-        # Not .options(num_returns="streaming"): this process cannot unpickle the
-        # Megatron worker class (no Megatron here), so Ray gives the handle a
-        # placeholder class whose methods are not generators. Ray >= 2.58 checks
-        # that in .options() and raises; _remote() skips the check.
+        # NOTE(@cspades): https://github.com/ray-project/ray/pull/64749
+        # introduces an `options()` guard that rejects non-generator functions
+        # with num_returns="streaming".
+        # NeMo-RL has controller/collector actors without dependency on MCore,
+        # so Ray just uses `_create_fake_actor_class` mocks that are not
+        # generators and trigger the guard, and `_remote` is a WAR.
         futures = worker.generate_async._remote(
             kwargs={"data": data, "greedy": greedy}, num_returns="streaming"
         )
