@@ -54,6 +54,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     validate_single_controller_config,
 )
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.utils.logger import LoggerConfig
 
 _NUM_PROMPTS_PER_STEP = 4
 _NUM_GENERATIONS_PER_PROMPT = 2
@@ -137,7 +138,7 @@ def _make_master_config(
             "save_period": 10,
             "save_optimizer": False,
         },
-        logger={"wandb_enabled": False, "wandb": {}},
+        logger=LoggerConfig.model_construct(),
         loss_fn=ClippedPGLossConfig(reference_policy_kl_penalty=0.0),
         env={},
         cluster=ClusterConfig(num_nodes=2, gpus_per_node=8),

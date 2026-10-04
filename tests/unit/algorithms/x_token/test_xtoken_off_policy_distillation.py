@@ -55,6 +55,7 @@ from nemo_rl.algorithms.xtoken_off_policy_distillation import (
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.utils.logger import LoggerConfig
 
 
 def has_gloo() -> bool:
@@ -205,7 +206,7 @@ def _make_master_config(
                 "shuffle": False,
                 "num_workers": 0,
             },
-            "logger": {"log_dir": "/tmp/logger"},
+            "logger": LoggerConfig(log_dir="/tmp/logger"),
             "cluster": ClusterConfig(num_nodes=1, gpus_per_node=1),
             "checkpointing": {
                 "enabled": save_enabled,
