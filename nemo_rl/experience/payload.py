@@ -126,6 +126,7 @@ def record_to_train_batch(
     from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
     from nemo_rl.experience.rollouts import (
         _mask_sample_flags,
+        _unusable_rollout_flags,
         backfill_missing_routed_experts,
     )
 
@@ -165,6 +166,7 @@ def record_to_train_batch(
     mask_sample = _mask_sample_flags(c.env_extras for c in completions)
     truncated = torch.tensor([c.truncated for c in completions], dtype=torch.bool)
     sample_mask = torch.full((n,), float(record.loss_multiplier), dtype=torch.float32)
+    sample_mask[_unusable_rollout_flags(c.env_extras for c in completions)] = 0.0
 
     train_data: dict[str, Any] = {
         "input_ids": flat["token_ids"],
