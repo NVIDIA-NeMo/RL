@@ -103,6 +103,7 @@ from nemo_rl.models.generation.interfaces import should_use_async_rollouts
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
+from nemo_rl.utils.logger import LoggerConfig, WandbConfig
 from nemo_rl.utils.timer import Timer
 from tests.unit.algorithms.utils import (
     create_mock_batch,
@@ -543,9 +544,7 @@ def mock_grpo_components():
                 "save_period": 10,
             },
             "cluster": ClusterConfig(num_nodes=1, gpus_per_node=2),
-            "logger": {
-                "num_val_samples_to_print": 5,
-            },
+            "logger": LoggerConfig.model_construct(num_val_samples_to_print=5),
             "data": {
                 "use_multiple_dataloader": False,
             },
@@ -5671,7 +5670,7 @@ class TestValidateFunction:
         # Mock config
         mock_config = mock_grpo_components["master_config"]
         mock_config.grpo.val_batch_size = 2
-        mock_config.logger["num_val_samples_to_print"] = 2
+        mock_config.logger.num_val_samples_to_print = 2
 
         mock_rollout_metrics = {"mean_gen_tokens_per_sample": 10.0}
 
@@ -5748,7 +5747,7 @@ class TestValidateFunction:
 
         # Mock config
         mock_config = mock_grpo_components["master_config"]
-        mock_config.logger["num_val_samples_to_print"] = 1
+        mock_config.logger.num_val_samples_to_print = 1
 
         mock_rollout_metrics = {"mean_gen_tokens_per_sample": 10.0}
 
@@ -5861,7 +5860,8 @@ class TestValidateFunction:
         mock_config.policy["generation"].update(
             {"val_temperature": 0.1, "val_top_p": 0.9, "val_top_k": None}
         )
-        mock_config.logger.update({"wandb_enabled": False, "wandb": {}})
+        mock_config.logger.wandb_enabled = False
+        mock_config.logger.wandb = WandbConfig.model_construct()
         mock_config.env = {}
 
         def run_gym_rollout(**kwargs):

@@ -34,6 +34,7 @@ from nemo_rl.algorithms.loss import DistillationLossConfig, DistillationLossFn
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.utils.logger import LoggerConfig
 
 
 @pytest.fixture
@@ -175,11 +176,7 @@ def mock_components():
                     "num_workers": 1,
                 },
             },
-            "logger": {
-                "num_val_samples_to_print": 5,
-                "wandb_enabled": False,
-                "wandb": {"log_nemo_gym_full_result_tables": False},
-            },
+            "logger": LoggerConfig.model_construct(num_val_samples_to_print=5),
             "cluster": ClusterConfig(num_nodes=1, gpus_per_node=2),
             "checkpointing": {
                 "enabled": False,
@@ -653,7 +650,7 @@ def test_validate_logs_data_when_logger_provided(mock_components):
 
     master_config = mock_components["master_config"]
     master_config.distillation.val_batch_size = 1
-    master_config.logger["num_val_samples_to_print"] = 1
+    master_config.logger.num_val_samples_to_print = 1
 
     with (
         patch(
@@ -709,7 +706,7 @@ def test_validate_works_without_logger(mock_components):
     mock_rollout_metrics = {"mean_gen_tokens_per_sample": 10.0}
 
     master_config = mock_components["master_config"]
-    master_config.logger["num_val_samples_to_print"] = 1
+    master_config.logger.num_val_samples_to_print = 1
 
     with (
         patch(
@@ -909,7 +906,7 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
                 val_at_end=False,
             ),
             "data": {"shuffle": False},
-            "logger": {},  # Config extraction requires this key
+            "logger": LoggerConfig.model_construct(),  # Config extraction requires this key
             "checkpointing": {},  # Config extraction requires this key
             "cluster": ClusterConfig(
                 num_nodes=1,  # Single node
@@ -1061,7 +1058,7 @@ def test_distillation_setup_non_colocated_smoke(
                 val_at_end=False,
             ),
             "data": {"shuffle": False},
-            "logger": {},
+            "logger": LoggerConfig.model_construct(),
             "checkpointing": {},
             "cluster": ClusterConfig(num_nodes=2, gpus_per_node=8),
         }
@@ -1222,7 +1219,7 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch, vllm_start_
                 "should_use_nemo_gym": True,
                 "nemo_gym": nemo_gym_config,
             },
-            "logger": {},
+            "logger": LoggerConfig.model_construct(),
             "checkpointing": {},
             "cluster": ClusterConfig(num_nodes=1, gpus_per_node=1),
         }
@@ -1339,7 +1336,7 @@ def test_nemo_gym_distillation_runner_uses_setup_actor():
         distillation=DistillationConfig(max_val_samples=None),
         data={},
         env={"should_use_nemo_gym": True, "nemo_gym": {}},
-        logger={"log_dir": "/tmp/logs"},
+        logger=LoggerConfig(log_dir="/tmp/logs"),
         checkpointing={"enabled": False},
         cluster={},
     )
@@ -1456,7 +1453,7 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
                 val_at_end=False,
             ),
             "data": {"shuffle": False},
-            "logger": {},  # Config extraction requires this key
+            "logger": LoggerConfig.model_construct(),  # Config extraction requires this key
             "checkpointing": {},  # Config extraction requires this key
             "cluster": ClusterConfig(
                 num_nodes=2,  # Multi-node

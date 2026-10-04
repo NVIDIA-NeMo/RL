@@ -23,7 +23,7 @@ import subprocess
 import threading
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Mapping, NotRequired, Optional, TypedDict
+from typing import Any, Callable, Mapping, Optional, TypedDict
 
 import mlflow
 import numpy as np
@@ -35,6 +35,7 @@ import wandb
 from matplotlib import pyplot as plt
 from prometheus_client.parser import text_string_to_metric_families
 from prometheus_client.samples import Sample
+from pydantic import BaseModel, Field, model_validator
 from rich.box import ROUNDED
 from rich.console import Console
 from rich.logging import RichHandler
@@ -59,59 +60,73 @@ WANDB_CALLER_STEP_METRIC = "nemo_rl/step"
 TELEMETRY_WALL_TIME_METRIC = "telemetry/wall_time_seconds"
 
 
-class WandbConfig(TypedDict):
-    project: NotRequired[str]
-    name: NotRequired[str]
-    entity: NotRequired[str]
-    id: NotRequired[str]
-    resume: NotRequired[str]
+class WandbConfig(BaseModel, extra="allow"):
+    project: str
+    name: str
+    entity: Optional[str] = None
+    id: Optional[str] = None
+    resume: Optional[str] = None
     # Log complete NeMo Gym result payloads as W&B Tables. These payloads can be
     # very large, so the recommended default is false.
-    log_nemo_gym_full_result_tables: NotRequired[bool]
+    log_nemo_gym_full_result_tables: bool = False
 
 
-class SwanlabConfig(TypedDict):
-    project: NotRequired[str]
-    name: NotRequired[str]
+class SwanlabConfig(BaseModel, extra="allow"):
+    project: str
+    name: str
 
 
-class TensorboardConfig(TypedDict):
-    log_dir: NotRequired[str]
+class TensorboardConfig(BaseModel, extra="allow"):
+    log_dir: Optional[str] = None
 
 
-class MLflowConfig(TypedDict):
-    experiment_name: NotRequired[str | None]
-    run_id: NotRequired[str | None]
-    run_name: NotRequired[str | None]
-    tracking_uri: NotRequired[str | None]
-    artifact_location: NotRequired[str | None]
+class MLflowConfig(BaseModel, extra="allow"):
+    experiment_name: Optional[str] = None
+    run_id: Optional[str] = None
+    run_name: Optional[str] = None
+    tracking_uri: Optional[str] = None
+    artifact_location: Optional[str] = None
 
 
-class GPUMonitoringConfig(TypedDict):
-    collection_interval: int | float
-    flush_interval: int | float
+class GPUMonitoringConfig(BaseModel, extra="allow"):
+    collection_interval: float = 10
+    flush_interval: float = 10
 
 
-class LoggerConfig(TypedDict):
+class LoggerConfig(BaseModel, extra="allow"):
     log_dir: str
-    wandb_enabled: bool
-    swanlab_enabled: bool
-    tensorboard_enabled: bool
-    mlflow_enabled: bool
-    wandb: WandbConfig
-    tensorboard: NotRequired[TensorboardConfig]
-    swanlab: NotRequired[SwanlabConfig]
-    mlflow: NotRequired[MLflowConfig]
-    monitor_gpus: bool
-    gpu_monitoring: GPUMonitoringConfig
-    num_val_samples_to_print: NotRequired[int]
+    wandb_enabled: bool = False
+    swanlab_enabled: bool = False
+    tensorboard_enabled: bool = False
+    mlflow_enabled: bool = False
+    wandb: Optional[WandbConfig] = None
+    tensorboard: Optional[TensorboardConfig] = None
+    swanlab: Optional[SwanlabConfig] = None
+    mlflow: Optional[MLflowConfig] = None
+    monitor_gpus: bool = True
+    gpu_monitoring: GPUMonitoringConfig = Field(default_factory=GPUMonitoringConfig)
+    num_val_samples_to_print: int = 0
+
+    @model_validator(mode="after")
+    def _require_block_for_enabled_backends(self) -> "LoggerConfig":
+        for name, enabled, block in (
+            ("wandb", self.wandb_enabled, self.wandb),
+            ("swanlab", self.swanlab_enabled, self.swanlab),
+            ("tensorboard", self.tensorboard_enabled, self.tensorboard),
+            ("mlflow", self.mlflow_enabled, self.mlflow),
+        ):
+            if enabled and block is None:
+                raise ValueError(
+                    f"logger.{name}_enabled=true requires a logger.{name} block."
+                )
+        return self
 
 
 def should_log_nemo_gym_full_result_tables(
-    *, wandb_enabled: bool, wandb_config: WandbConfig
+    *, wandb_enabled: bool, wandb_config: Optional[WandbConfig]
 ) -> bool:
     """Return whether complete NeMo Gym results should become W&B Tables."""
-    return wandb_enabled and bool(wandb_config.get("log_nemo_gym_full_result_tables"))
+    return wandb_enabled and wandb_config.log_nemo_gym_full_result_tables
 
 
 class LoggerInterface(ABC):
@@ -243,7 +258,8 @@ class WandbLogger(LoggerInterface):
 
     def __init__(self, cfg: WandbConfig, log_dir: Optional[str] = None):
         # NeMo RL logging controls are not valid wandb.init keyword arguments.
-        wandb_init_config = dict(cfg)
+        # exclude_none: unset Optional fields must not reach wandb.init.
+        wandb_init_config = cfg.model_dump(exclude_none=True)
         wandb_init_config.pop("log_nemo_gym_full_result_tables", None)
         self.run = wandb.init(**wandb_init_config, dir=log_dir)
         self._log_lock = threading.Lock()
@@ -270,7 +286,7 @@ class WandbLogger(LoggerInterface):
         self._log_code()
         self._log_diffs()
         print(
-            f"Initialized WandbLogger for project {cfg.get('project')}, run {cfg.get('name')} at {log_dir}"
+            f"Initialized WandbLogger for project {cfg.project}, run {cfg.name} at {log_dir}"
         )
 
     def _log_diffs(self):
@@ -667,9 +683,9 @@ class SwanlabLogger(LoggerInterface):
             cfg (SwanlabConfig): Configuration for the Swanlab run (e.g., project and name).
             log_dir (Optional[str]): Optional offline log directory passed to Swanlab's init.
         """
-        self.run = swanlab.init(**cfg, logdir=log_dir)
+        self.run = swanlab.init(**cfg.model_dump(exclude_none=True), logdir=log_dir)
         print(
-            f"Initialized SwanlabLogger for project {cfg.get('project')}, run {cfg.get('name')} (with offline logdir={log_dir})"
+            f"Initialized SwanlabLogger for project {cfg.project}, run {cfg.name} (with offline logdir={log_dir})"
         )
 
     def log_metrics(
@@ -1067,15 +1083,13 @@ class MLflowLogger(LoggerInterface):
             cfg: MLflow configuration
             log_dir: Optional log directory (used as fallback if artifact_location not in cfg)
         """
-        tracking_uri = cfg.get("tracking_uri") or os.getenv("MLFLOW_TRACKING_URI")
+        tracking_uri = cfg.tracking_uri or os.getenv("MLFLOW_TRACKING_URI")
         if tracking_uri and not mlflow.is_tracking_uri_set():
             mlflow.set_tracking_uri(tracking_uri)
 
-        run_id = cfg.get("run_id") or os.getenv("MLFLOW_RUN_ID")
-        experiment_name = cfg.get("experiment_name") or os.getenv(
-            "MLFLOW_EXPERIMENT_NAME"
-        )
-        run_name = cfg.get("run_name") or os.getenv("MLFLOW_RUN_NAME")
+        run_id = cfg.run_id or os.getenv("MLFLOW_RUN_ID")
+        experiment_name = cfg.experiment_name or os.getenv("MLFLOW_EXPERIMENT_NAME")
+        run_name = cfg.run_name or os.getenv("MLFLOW_RUN_NAME")
 
         run = mlflow.active_run()
 
@@ -1102,7 +1116,7 @@ class MLflowLogger(LoggerInterface):
                 if experiment is None:
                     mlflow.create_experiment(
                         name=experiment_name,
-                        artifact_location=cfg.get("artifact_location") or log_dir,
+                        artifact_location=cfg.artifact_location or log_dir,
                     )
                 # set the experiment context manager
                 mlflow.set_experiment(experiment_name)
@@ -1204,50 +1218,50 @@ class Logger(LoggerInterface):
         self.wandb_logger = None
         self.swanlab_logger = None
 
-        self.base_log_dir = cfg["log_dir"]
+        self.base_log_dir = cfg.log_dir
         os.makedirs(self.base_log_dir, exist_ok=True)
 
-        if cfg["wandb_enabled"]:
+        if cfg.wandb_enabled:
             wandb_log_dir = os.path.join(self.base_log_dir, "wandb")
             os.makedirs(wandb_log_dir, exist_ok=True)
-            self.wandb_logger = WandbLogger(cfg["wandb"], log_dir=wandb_log_dir)
+            self.wandb_logger = WandbLogger(cfg.wandb, log_dir=wandb_log_dir)
             self.loggers.append(self.wandb_logger)
 
-        if cfg["swanlab_enabled"]:
+        if cfg.swanlab_enabled:
             swanlab_log_dir = os.path.join(self.base_log_dir, "swanlab")
             os.makedirs(swanlab_log_dir, exist_ok=True)
-            self.swanlab_logger = SwanlabLogger(cfg["swanlab"], log_dir=swanlab_log_dir)
+            self.swanlab_logger = SwanlabLogger(cfg.swanlab, log_dir=swanlab_log_dir)
             self.loggers.append(self.swanlab_logger)
 
-        if cfg["tensorboard_enabled"]:
+        if cfg.tensorboard_enabled:
             tensorboard_log_dir = os.path.join(self.base_log_dir, "tensorboard")
             os.makedirs(tensorboard_log_dir, exist_ok=True)
             tensorboard_logger = TensorboardLogger(
-                cfg["tensorboard"], log_dir=tensorboard_log_dir
+                cfg.tensorboard, log_dir=tensorboard_log_dir
             )
             self.loggers.append(tensorboard_logger)
 
-        if cfg["mlflow_enabled"]:
+        if cfg.mlflow_enabled:
             mlflow_log_dir = self.base_log_dir
             if mlflow_log_dir:
                 mlflow_log_dir = os.path.join(mlflow_log_dir, "mlflow")
                 os.makedirs(mlflow_log_dir, exist_ok=True)
-            mlflow_logger = MLflowLogger(cfg["mlflow"], log_dir=mlflow_log_dir)
+            mlflow_logger = MLflowLogger(cfg.mlflow, log_dir=mlflow_log_dir)
             self.loggers.append(mlflow_logger)
 
         # Initialize GPU monitoring if requested
         self.gpu_monitor = None
-        if cfg["monitor_gpus"]:
+        if cfg.monitor_gpus:
             metric_prefix = "ray"
             step_metric = f"{metric_prefix}/ray_step"
-            if cfg["wandb_enabled"] and self.wandb_logger:
+            if cfg.wandb_enabled and self.wandb_logger:
                 self.wandb_logger.define_metric(
                     f"{metric_prefix}/*", step_metric=step_metric
                 )
 
             self.gpu_monitor = RayGpuMonitorLogger(
-                collection_interval=cfg["gpu_monitoring"]["collection_interval"],
-                flush_interval=cfg["gpu_monitoring"]["flush_interval"],
+                collection_interval=cfg.gpu_monitoring.collection_interval,
+                flush_interval=cfg.gpu_monitoring.flush_interval,
                 metric_prefix=metric_prefix,
                 step_metric=step_metric,
                 parent_logger=self,
