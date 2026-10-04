@@ -59,6 +59,59 @@ def test_factory_passes_checkpoint_runtime_mode_to_bootstrap(
     assert client._supports_checkpointing is True
 
 
+def test_worker_attach_carries_its_segment_size(monkeypatch) -> None:
+    """A worker states the Mooncake memory it owns in the build call itself."""
+    from nemo_rl.data_plane.adapters import tq_mooncake_checkpoint
+    from nemo_rl.data_plane.adapters import transfer_queue as adapter
+
+    connect = MagicMock()
+    monkeypatch.setattr(adapter, "_connect_existing_with_segment_size", connect)
+    monkeypatch.setattr(adapter, "_get_local_node_ip", lambda: "")
+    monkeypatch.setattr(adapter, "_patch_mooncake_register_check", lambda: None)
+    monkeypatch.setattr(
+        tq_mooncake_checkpoint, "install_tq_mooncake_checkpoint_plugin", lambda: None
+    )
+    cfg = {
+        "enabled": True,
+        "impl": "transfer_queue",
+        "backend": "mooncake_cpu",
+        "claim_meta_poll_interval_s": 0.5,
+        "mooncake_cpu": {"reuse_registered_buffers": False},
+    }
+
+    build_data_plane_client(cfg, bootstrap=False, segment_size=0)
+
+    connect.assert_called_once_with(0)
+
+
+def test_segment_size_attach_overrides_only_this_process(monkeypatch) -> None:
+    """The override reaches this client's storage config; the controller's is untouched."""
+    import ray
+    from omegaconf import OmegaConf
+    from transfer_queue import interface as tq_interface
+
+    from nemo_rl.data_plane.adapters import transfer_queue as adapter
+
+    published = OmegaConf.create(
+        {
+            "backend": {
+                "storage_backend": "MooncakeStore",
+                "MooncakeStore": {"global_segment_size": 64, "local_buffer_size": 8},
+            }
+        }
+    )
+    attached = []
+    monkeypatch.setattr(ray, "get_actor", lambda *a, **k: MagicMock())
+    monkeypatch.setattr(ray, "get", lambda _ref: published)
+    monkeypatch.setattr(tq_interface, "_maybe_create_tq_client", attached.append)
+
+    adapter._connect_existing_with_segment_size(16)
+
+    assert attached[0].backend.MooncakeStore.global_segment_size == 16
+    assert attached[0].backend.MooncakeStore.local_buffer_size == 8
+    assert published.backend.MooncakeStore.global_segment_size == 64
+
+
 def test_factory_none_cfg_rejected():
     """T1-factory-none-cfg — None config must fail-fast, not silently
     construct anything."""

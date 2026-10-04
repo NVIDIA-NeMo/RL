@@ -715,6 +715,28 @@ def _connect_existing() -> None:
     tq.init()
 
 
+def _connect_existing_with_segment_size(segment_size: int) -> None:
+    """:func:`_connect_existing`, owning ``segment_size`` bytes of Mooncake memory.
+
+    Replaces the controller's MooncakeStore ``global_segment_size`` for this
+    process only. ``tq.init()`` ignores any config once a controller exists,
+    so the client is attached from a copy of the controller's config.
+    """
+    import ray
+    from omegaconf import OmegaConf
+    from transfer_queue import interface as tq_interface
+
+    controller = ray.get_actor("TransferQueueController", namespace="transfer_queue")
+    conf = None
+    while conf is None:  # the controller publishes its config once bootstrapped
+        conf = ray.get(controller.get_config.remote())
+        if conf is None:
+            time.sleep(1)
+    conf = OmegaConf.create(OmegaConf.to_container(conf), flags={"allow_objects": True})
+    conf.backend.MooncakeStore.global_segment_size = segment_size
+    tq_interface._maybe_create_tq_client(conf)
+
+
 def _init_tq(cfg: DataPlaneConfig, *, checkpointing: bool = False) -> None:
     """Driver-process path: bootstrap the TQ controller for the chosen backend."""
     from omegaconf import OmegaConf
@@ -918,6 +940,7 @@ class TQDataPlaneClient(DataPlaneClient):
         *,
         bootstrap: bool = True,
         checkpointing: bool = False,
+        segment_size: int | None = None,
     ) -> None:
         """Construct a TQ-backed client.
 
@@ -930,6 +953,8 @@ class TQDataPlaneClient(DataPlaneClient):
                 knobs (poll interval).
             checkpointing: Whether the caller will save or restore data-plane
                 state. Used only at bootstrap; workers inherit the mode from TQ.
+            segment_size: Mooncake memory this worker process owns, in place of
+                the controller's ``global_segment_size``; ``None`` keeps it.
         """
         # Ray serializes this driver-built client into the SingleController
         # actor; retain the config so process-local hooks can be reinstalled.
@@ -986,8 +1011,10 @@ class TQDataPlaneClient(DataPlaneClient):
 
         if bootstrap:
             _init_tq(cfg, checkpointing=checkpointing)
-        else:
+        elif segment_size is None:
             _connect_existing()
+        else:
+            _connect_existing_with_segment_size(segment_size)
         self._poll_interval_s = cfg["claim_meta_poll_interval_s"]
         self._closed = False
         # TQ restore is non-transactional and requires a globally clean system.

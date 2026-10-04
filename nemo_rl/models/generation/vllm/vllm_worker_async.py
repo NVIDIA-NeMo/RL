@@ -37,7 +37,6 @@ from nemo_rl.data.captured_media import (
     capture_processed_media,
 )
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import (
-    disown_storage_in_this_process,
     prefer_storage_segment,
     run_checkpoint_command,
 )
@@ -557,8 +556,7 @@ class VllmAsyncGenerationWorkerImpl(
 
         # Own no segment: a save would otherwise wait on this actor, whose event
         # loop is busy serving rollouts. Capture writes land in other segments.
-        disown_storage_in_this_process()
-        dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
+        dp_client = build_data_plane_client(dp_cfg, bootstrap=False, segment_size=0)
         local_units = (storage_segments or {}).get(
             ray.get_runtime_context().get_node_id()
         )

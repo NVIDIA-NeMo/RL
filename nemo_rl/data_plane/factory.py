@@ -123,6 +123,7 @@ def build_data_plane_client(
     *,
     bootstrap: bool = True,
     checkpointing: bool = False,
+    segment_size: int | None = None,
 ) -> DataPlaneClient:
     """Construct the configured data-plane client.
 
@@ -140,6 +141,10 @@ def build_data_plane_client(
         checkpointing: Prepare storage for saving or restoring data-plane state.
             Derived by the caller from its existing checkpoint settings and
             resume path. Only used at bootstrap; workers inherit the mode from TQ.
+        segment_size: mooncake_cpu only, worker processes only: Mooncake memory
+            this process owns, in place of the controller's
+            ``global_segment_size`` (0: a client that owns nothing). ``None``
+            keeps the controller's value.
 
     Returns:
         A configured ``DataPlaneClient``; wrapped in
@@ -168,7 +173,10 @@ def build_data_plane_client(
 
         assert not isinstance(cfg, LocalDataPlaneConfig)
         client: DataPlaneClient = TQDataPlaneClient(
-            cfg, bootstrap=bootstrap, checkpointing=checkpointing
+            cfg,
+            bootstrap=bootstrap,
+            checkpointing=checkpointing,
+            segment_size=segment_size,
         )
     elif impl == "local":
         from nemo_rl.data_plane.adapters.local import LocalDataPlaneClient

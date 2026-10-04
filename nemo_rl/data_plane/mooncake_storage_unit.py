@@ -32,7 +32,6 @@ from nemo_rl.data_plane import DataPlaneConfig, build_data_plane_client
 from nemo_rl.data_plane.interfaces import backend_config
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import (
     local_segment_name,
-    own_storage_in_this_process,
     run_checkpoint_command,
 )
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
@@ -44,8 +43,11 @@ class MooncakeStorageUnit:  # pragma: no cover
     """Own a Mooncake segment and serve checkpoint commands; nothing else."""
 
     def __init__(self, dp_config: DataPlaneConfig) -> None:
-        own_storage_in_this_process(backend_config(dp_config).storage_unit_segment_size)
-        self._dp_client = build_data_plane_client(dp_config, bootstrap=False)
+        self._dp_client = build_data_plane_client(
+            dp_config,
+            bootstrap=False,
+            segment_size=backend_config(dp_config).storage_unit_segment_size,
+        )
         self._segment = local_segment_name()
 
     def segment(self) -> str:

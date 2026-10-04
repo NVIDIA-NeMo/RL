@@ -1373,18 +1373,14 @@ class _CheckpointManagerMixin:
     config: dict[str, Any]
 
     def __init__(self, controller_info: Any, config: dict[str, Any]) -> None:
-        config = dict(config)
-        if _SEGMENT_SIZE_IN_THIS_PROCESS is not None:
-            config["global_segment_size"] = _SEGMENT_SIZE_IN_THIS_PROCESS
-        elif (
-            _checkpoint_enabled(config)
-            and ray.get_runtime_context().get_actor_id() is None
-        ):
-            # A driver/task has no actor command endpoint. It may use
-            # Mooncake, but must not own otherwise unreachable payload.
-            # Keep the controller's published config unchanged so actors
-            # still mount their configured storage capacity.
-            config["global_segment_size"] = 0
+        if _checkpoint_enabled(config):
+            config = dict(config)
+            if ray.get_runtime_context().get_actor_id() is None:
+                # A driver/task has no actor command endpoint. It may use
+                # Mooncake, but must not own otherwise unreachable payload.
+                # Keep the controller's published config unchanged so actors
+                # still mount their configured storage capacity.
+                config["global_segment_size"] = 0
         # The optional TQ base is supplied at installation, not at module import.
         cast(Any, super()).__init__(controller_info, config)
         self._checkpoint_workers: list[Any] = []
@@ -1427,24 +1423,6 @@ def configure_checkpoint_workers(workers: list[Any]) -> None:
     manager._checkpoint_workers = list(workers)
     _, owners = _live_participants(manager)
     manager._checkpoint_workers = list(owners.values())
-
-
-# Per-process override of the controller's global_segment_size, set before the
-# client attaches. 0 gets the driver's rule: no segment, so puts land in other
-# processes' segments and the process is not a save participant. A positive
-# size is a MooncakeStorageUnit's.
-_SEGMENT_SIZE_IN_THIS_PROCESS: int | None = None
-
-
-def disown_storage_in_this_process() -> None:
-    """Make this process's Mooncake client own no segment. Call before it attaches."""
-    own_storage_in_this_process(0)
-
-
-def own_storage_in_this_process(segment_size: int) -> None:
-    """Mount ``segment_size`` bytes in this process's client. Call before it attaches."""
-    global _SEGMENT_SIZE_IN_THIS_PROCESS
-    _SEGMENT_SIZE_IN_THIS_PROCESS = segment_size
 
 
 def _attached_manager() -> Any:
@@ -1516,7 +1494,6 @@ def install_tq_mooncake_checkpoint_plugin() -> None:
 
 __all__ = [
     "configure_checkpoint_workers",
-    "disown_storage_in_this_process",
     "install_tq_mooncake_checkpoint_plugin",
     "run_checkpoint_command",
 ]
