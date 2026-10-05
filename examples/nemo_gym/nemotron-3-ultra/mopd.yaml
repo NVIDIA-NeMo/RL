@@ -477,6 +477,12 @@ env:
     rdkit_chemistry_agent:
       _inherit_from: litmus_agent_agent
 
+    litmus_agent_environment_server:
+      environment_servers:
+        legacy_agent:
+          agent_server:
+            name: rdkit_chemistry_agent
+
     # Increase the num workers to help with the serialization/deserialization overhead of token IDs
     policy_model:
       responses_api_models:
