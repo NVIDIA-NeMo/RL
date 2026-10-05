@@ -97,7 +97,7 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
-from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
+from nemo_rl.data_plane.schema import GROUP_ID_TAG, ROUTE_PLAN_TAG
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
@@ -110,7 +110,7 @@ from nemo_rl.experience.route_plan import (
     encode_route_plan,
 )
 from nemo_rl.utils.checkpoint import CheckpointManager
-from nemo_rl.utils.logger import TELEMETRY_WALL_TIME_METRIC
+from nemo_rl.utils.logger import TELEMETRY_WALL_TIME_METRIC, LoggerConfig
 
 # Reuse the factory patches from the setup tests (same cross-module fixture
 # import pattern as test_rollout_pump.py).
@@ -258,7 +258,13 @@ class _FakeSampler:
             task_name=None,
             sample_ids=sample_ids,
             sequence_lengths=[16] * n,
-            tags=[{"weight_version": current_train_weight}] * n,
+            # One group per row, since the selection is sized in prompt groups.
+            # The train pump reads this tag off every row and raises when it is
+            # absent, so a shared dict here would also collapse the group count.
+            tags=[
+                {"weight_version": current_train_weight, GROUP_ID_TAG: sample_id}
+                for sample_id in sample_ids
+            ],
         )
         return meta, n
 
@@ -718,14 +724,7 @@ def _actor_master_config(
             num_generations_per_prompt=2,
             seed=42,
         ),
-        logger={
-            "log_dir": str(tmp_path / "logs"),
-            "wandb_enabled": False,
-            "swanlab_enabled": False,
-            "tensorboard_enabled": False,
-            "mlflow_enabled": False,
-            "monitor_gpus": False,
-        },
+        logger=LoggerConfig(log_dir=str(tmp_path / "logs"), monitor_gpus=False),
         cluster=ClusterConfig(num_nodes=1, gpus_per_node=1),
         checkpointing={
             "enabled": enabled,
@@ -797,6 +796,7 @@ def _make_actor_args(
         ),
         last_checkpoint_path=last_checkpoint_path,
         finalizer_actors=[],
+        advantage_actors=[],
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
         bootstrap_identity=bootstrap_identity,
         rollout_checkpoint_load_metrics=rollout_checkpoint_load_metrics,
@@ -1685,7 +1685,7 @@ class TestPeriodicRolloutCheckpoint:
             task_name=None,
             sample_ids=["claimed-group_g0"],
             sequence_lengths=[16],
-            tags=[{"weight_version": 0}],
+            tags=[{"weight_version": 0, GROUP_ID_TAG: "claimed-group"}],
         )
         actor._buffer.training_claims = [
             {
@@ -1917,8 +1917,8 @@ class TestDataPlaneCheckpoint:
                         fields=["input_ids"],
                         sequence_lengths=[16, 16],
                         tags=[
-                            {"weight_version": 0},
-                            {"weight_version": 0},
+                            {"weight_version": 0, GROUP_ID_TAG: "g0"},
+                            {"weight_version": 0, GROUP_ID_TAG: "g0"},
                         ],
                     ),
                     "start_weight": 0,
@@ -2007,8 +2007,8 @@ class TestDataPlaneCheckpoint:
                         fields=["input_ids"],
                         sequence_lengths=[16, 16],
                         tags=[
-                            {"weight_version": 0},
-                            {"weight_version": 0},
+                            {"weight_version": 0, GROUP_ID_TAG: "g0"},
+                            {"weight_version": 0, GROUP_ID_TAG: "g0"},
                         ],
                     ),
                     "start_weight": 0,
@@ -2575,7 +2575,7 @@ def _setup_master_config(checkpoint_dir: str) -> MasterConfig:
             val_at_start=False,
             val_at_end=False,
         ),
-        logger={"wandb_enabled": False, "wandb": {}},
+        logger=LoggerConfig.model_construct(),
         policy={
             "train_global_batch_size": 8,
             "max_total_sequence_length": 32,
@@ -2690,7 +2690,7 @@ class TestSetupResumeWiring:
                 "vllm_cfg": {"async_engine": True},
             }
         )
-        mc.logger["log_dir"] = str(tmp_path / "logs")
+        mc.logger.log_dir = str(tmp_path / "logs")
         patched_factories["setup_response_data"].return_value = (
             list(range(8)),
             None,
@@ -2971,7 +2971,10 @@ class TestReplayBufferPersistence:
                     task_name=None,
                     sample_ids=[f"g{i}-0", f"g{i}-1"],
                     sequence_lengths=[16, 16],
-                    tags=[{"weight_version": 0}, {"weight_version": 0}],
+                    tags=[
+                        {"weight_version": 0, GROUP_ID_TAG: f"g{i}"},
+                        {"weight_version": 0, GROUP_ID_TAG: f"g{i}"},
+                    ],
                 ),
                 "start_weight": 0,
                 "end_weight": 0,
@@ -3035,7 +3038,14 @@ class TestReplayBufferPersistence:
                     task_name=None,
                     sample_ids=[f"g{i}-0", f"g{i}-1"],
                     sequence_lengths=[16, 16],
-                    tags=[{"weight_version": 0}, {"weight_version": 0}],
+                    # Has to agree with "group_id" below: this test is the one
+                    # restore case that actually runs the pump body, and the
+                    # pump cross-checks the ids it selects against the
+                    # training claims the restore created.
+                    tags=[
+                        {"weight_version": 0, GROUP_ID_TAG: f"g{i}"},
+                        {"weight_version": 0, GROUP_ID_TAG: f"g{i}"},
+                    ],
                 ),
                 "start_weight": 0,
                 "end_weight": 0,
@@ -3095,7 +3105,10 @@ class TestReplayBufferPersistence:
                         task_name=None,
                         sample_ids=["g0-0", "g0-1"],
                         sequence_lengths=[16, 16],
-                        tags=[{"weight_version": 0}, {"weight_version": 0}],
+                        tags=[
+                            {"weight_version": 0, GROUP_ID_TAG: "g0"},
+                            {"weight_version": 0, GROUP_ID_TAG: "g0"},
+                        ],
                     ),
                     "start_weight": 0,
                     "end_weight": 0,
