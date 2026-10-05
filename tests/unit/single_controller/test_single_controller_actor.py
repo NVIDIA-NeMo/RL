@@ -2987,6 +2987,8 @@ def test_train_pump_logs_dump_timing_after_optimizer_step(
         assert logged_timings[0]["train_data_dump"] > 2.0
         assert not final.with_suffix(".jsonl.partial").exists()
     assert "train_data_dump" not in ctrl._timer.get_timing_metrics()
+
+
 @pytest.mark.parametrize("warmup", [False, True])
 def test_ppo_streaming_replays_complete_epochs_and_whitens_once(monkeypatch, warmup):
     metas = [_single_group_meta(), _single_group_meta()]

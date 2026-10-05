@@ -1440,7 +1440,11 @@ def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
     """Apply Multi-Token Prediction settings onto the mcore model config."""
     megatron_cfg = config["megatron_cfg"]
     hybrid_pattern = getattr(model_cfg, "hybrid_layer_pattern", None)
-    if megatron_cfg.get("mtp_num_layers") == 0 and hybrid_pattern and "/" in hybrid_pattern:
+    if (
+        megatron_cfg.get("mtp_num_layers") == 0
+        and hybrid_pattern
+        and "/" in hybrid_pattern
+    ):
         raise ValueError(
             "An MTP hybrid pattern requires megatron_cfg.mtp_num_layers=null "
             "to disable MTP; 0 still enters the MTP forward path"

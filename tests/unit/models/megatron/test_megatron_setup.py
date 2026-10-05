@@ -1233,7 +1233,9 @@ class TestApplyMtpConfig:
             mtp_hybrid_override_pattern="*E",
             mtp_use_repeated_layer=True,
         )
-        _apply_mtp_config(model_cfg, {"megatron_cfg": {"mtp_num_layers": mtp_num_layers}})
+        _apply_mtp_config(
+            model_cfg, {"megatron_cfg": {"mtp_num_layers": mtp_num_layers}}
+        )
         assert model_cfg.mtp_num_layers == mtp_num_layers
         if mtp_num_layers is None:
             assert model_cfg.hybrid_layer_pattern == "M*M"
@@ -1268,7 +1270,9 @@ class TestApplyMtpConfig:
             mtp_hybrid_override_pattern=mtp_pattern,
         )
         with pytest.raises(ValueError, match="MTP remains enabled"):
-            _validate_disabled_mtp(model_cfg, {"megatron_cfg": {"mtp_num_layers": None}})
+            _validate_disabled_mtp(
+                model_cfg, {"megatron_cfg": {"mtp_num_layers": None}}
+            )
 
 
 @pytest.mark.mcore

@@ -601,9 +601,7 @@ class SingleControllerActor:
             policy_dp = self._trainer.sharding_annotations.get_axis_size(
                 "data_parallel"
             )
-            value_dp = self._value.sharding_annotations.get_axis_size(
-                "data_parallel"
-            )
+            value_dp = self._value.sharding_annotations.get_axis_size("data_parallel")
             group_multiple = math.lcm(
                 policy_dp // math.gcd(policy_dp, generations_per_prompt),
                 value_dp // math.gcd(value_dp, generations_per_prompt),
