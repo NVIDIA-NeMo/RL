@@ -274,8 +274,10 @@ batching.
 to zero and is supported only by `balanced_greedy_knapsack`. The configured
 pack capacity must match `data.max_input_seq_length`, and its padding multiple
 must match `policy.make_sequence_length_divisible_by`.
-Dynamic batching and HybridEP flex dispatch are not supported with
-Energon-owned packs.
+Dynamic batching is not supported with Energon-owned packs. HybridEP flex
+dispatch requires
+`policy.megatron_cfg.model_overrides.moe_hybridep_pad_uneven_dispatch_inputs=true`
+because physical packed lengths can differ across expert-parallel ranks.
 
 With Energon-owned packing, each `sample_mask` entry represents one physical
 pack, so `num_valid_samples` counts non-empty packs rather than source
