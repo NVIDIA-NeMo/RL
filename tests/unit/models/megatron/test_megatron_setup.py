@@ -862,6 +862,19 @@ class TestApplyMoeConfig:
 
         assert model_cfg.moe_grouped_gemm is moe_grouped_gemm
 
+    @pytest.mark.parametrize("value", [True, False, None])
+    def test_router_fusion_override_preserves_provider_default(self, value):
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        model_cfg = MagicMock()
+        model_cfg.moe_router_fusion = "provider default"
+        config = self._base_moe_cfg()
+        if value is not None:
+            config["megatron_cfg"]["moe_router_fusion"] = value
+        _apply_moe_config(model_cfg, config)
+        expected = "provider default" if value is None else value
+        assert model_cfg.moe_router_fusion == expected
+
     def test_moe_grouped_gemm_absent_keeps_default(self):
         """Absent key leaves the attr unset on the model cfg."""
         from nemo_rl.models.megatron.setup import _apply_moe_config
@@ -3166,7 +3179,11 @@ class TestCreateMegatronConfigGlooProcessGroups:
             "train_iters": 10,
         }
         megatron_cfg.update(megatron_overrides)
-        return {"megatron_cfg": megatron_cfg, "train_global_batch_size": 8}
+        return {
+            "megatron_cfg": megatron_cfg,
+            "train_global_batch_size": 8,
+            "tokenizer": {"name": "configured-tokenizer"},
+        }
 
     def _dist_config_passed_to_container(self, config):
         """Return the dist config _create_megatron_config hands to ConfigContainer.
@@ -3236,7 +3253,11 @@ class TestCreateMegatronConfigOptimizerFp8Recipe:
         }
         if fp8_cfg is not None:
             megatron_cfg["fp8_cfg"] = fp8_cfg
-        return {"megatron_cfg": megatron_cfg, "train_global_batch_size": 8}
+        return {
+            "megatron_cfg": megatron_cfg,
+            "train_global_batch_size": 8,
+            "tokenizer": {"name": "configured-tokenizer"},
+        }
 
     @staticmethod
     def _optimizer_passed_to_container(
@@ -3329,6 +3350,7 @@ class TestCreateMegatronConfigFP8Buffers:
                 "train_iters": 10,
             },
             "train_global_batch_size": 8,
+            "tokenizer": {"name": "configured-tokenizer"},
         }
         with (
             patch("nemo_rl.models.megatron.setup.ConfigContainer"),
@@ -3391,6 +3413,7 @@ class TestCreateMegatronConfigOptimizerOffload:
                 "train_iters": 10,
             },
             "train_global_batch_size": 8,
+            "tokenizer": {"name": "configured-tokenizer"},
         }
 
         with (
@@ -4346,6 +4369,7 @@ class TestFinalizeMegatronSetup:
         mock_auto_bridge.from_hf_pretrained.return_value = mock_bridge
 
         config = {
+            "tokenizer": {"name": "configured-tokenizer"},
             "megatron_cfg": {
                 "tensor_model_parallel_size": 2,
                 "optimizer": {
@@ -4354,7 +4378,7 @@ class TestFinalizeMegatronSetup:
                 "distributed_data_parallel_config": {
                     "overlap_param_gather": False,
                 },
-            }
+            },
         }
 
         result = finalize_megatron_setup(
@@ -4378,6 +4402,10 @@ class TestFinalizeMegatronSetup:
         mock_get_model_config.assert_called_once_with(mock_model)
         assert mock_update_model_config.call_args.args[1] is runtime_model_config
         mock_build_tokenizer.assert_called_once()
+        assert (
+            mock_build_tokenizer.call_args.args[0].tokenizer_model
+            == "configured-tokenizer"
+        )
         mock_auto_bridge.from_hf_pretrained.assert_called_once_with(
             "test-model", trust_remote_code=True
         )
@@ -5789,3 +5817,30 @@ class TestOptimizerResumeSynchronization:
             SimpleNamespace(optimizer=raw)
         )
         raw.quantize_and_sync_model_params_from_main_params.assert_not_called()
+
+
+@pytest.mark.mcore
+def test_create_megatron_config_uses_configured_tokenizer():
+    from nemo_rl.models.megatron import setup as setup_mod
+
+    config = TestCreateMegatronConfigGlooProcessGroups._config()
+    with (
+        patch.object(setup_mod, "ConfigContainer"),
+        patch.object(setup_mod, "TrainingConfig"),
+        patch.object(setup_mod, "OptimizerConfig"),
+        patch.object(setup_mod, "DistributedDataParallelConfig"),
+        patch.object(setup_mod, "SchedulerConfig"),
+        patch.object(setup_mod, "TokenizerConfig") as tokenizer_config,
+        patch.object(setup_mod, "LoggerConfig"),
+    ):
+        setup_mod._create_megatron_config(
+            model_cfg=MagicMock(),
+            checkpoint_config=MagicMock(),
+            config=config,
+            hf_model_name="architecture-model",
+            dtype=torch.bfloat16,
+        )
+    tokenizer_config.assert_called_once_with(
+        tokenizer_type="HuggingFaceTokenizer",
+        tokenizer_model="configured-tokenizer",
+    )

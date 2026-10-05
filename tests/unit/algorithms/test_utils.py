@@ -1120,3 +1120,21 @@ class TestPrintEfficiencySummary:
         assert result["efficiency/total_waste_s"] == 60.0
         assert result["efficiency/productive_time_s"] == 0.0
         assert result["efficiency/efficiency_pct"] == 0.0
+
+
+@pytest.mark.parametrize("template", ["custom template", None, "default"])
+def test_processor_chat_template_honors_explicit_override(template):
+    tokenizer = MagicMock()
+    tokenizer.chat_template = "tokenizer default"
+    processor = MagicMock()
+    processor.tokenizer = tokenizer
+    processor.chat_template = "processor default"
+    config = {"name": "test-processor", "chat_template": template}
+    with patch("nemo_rl.algorithms.utils.AutoProcessor") as auto_processor:
+        auto_processor.from_pretrained.return_value = processor
+        result = get_tokenizer(config, get_processor=True)
+    assert result is processor
+    if template == "default":
+        assert processor.chat_template == "processor default"
+    else:
+        assert processor.chat_template == tokenizer.chat_template
