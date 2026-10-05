@@ -181,7 +181,7 @@ MXFP8_CASES = {
         "tensor_parallel_size": 4,
         "moe_backend": "flashinfer_trtllm",
         "num_first_layers_in_bf16": 3,
-        "num_last_layers_in_bf16": 5,
+        "num_last_layers_in_bf16": 18,
         "ignore_patterns": [
             "model.layers.*.self_attn.*",
             "model.layers.*.mlp.gate",
