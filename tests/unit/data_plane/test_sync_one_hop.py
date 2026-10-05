@@ -433,6 +433,62 @@ def test_apply_dynamic_sampling_overflow_slices_and_clears():
         )
 
 
+def test_train_data_log_rewards_stay_row_aligned_across_ds_rounds():
+    """The per-row jsonl rewards must come from the trained rows, not the pre-filter log.
+
+    Two dynamic-sampling rounds of 4 rollouts each, where round 1 keeps
+    rows {1, 3} and round 2 keeps rows {0, 2}: the trained rows' rewards are
+    [2, 4, 5, 7], while the pre-filter tensor kept for metrics["reward"] is
+    [1, 2, 3, 4] (round 1 truncated to 4). Same length, other rollouts.
+    """
+    from nemo_rl.algorithms.grpo_sync import (
+        _apply_dynamic_sampling,
+        _train_data_log_rewards,
+    )
+
+    client = NoOpDataPlaneClient()
+    meta1 = _seed_meta(client, "a", n=4)
+    _stamp_filter_tags(meta1, [0.0, 0.5, 0.0, 0.5])
+    pm, pc, pending_unfiltered, complete, _, _ = _apply_dynamic_sampling(
+        meta=meta1,
+        driver_carry=_make_driver_carry([1.0, 2.0, 3.0, 4.0], [0.0, 0.5, 0.0, 0.5]),
+        pending_meta=None,
+        pending_carry=None,
+        pending_unfiltered_rewards=[],
+        train_prompts_size=4,
+        num_gen_batches=1,
+        max_gen_batches=10,
+        policy=_fake_policy(client),
+    )
+    assert complete is False
+    meta2 = _seed_meta(client, "b", n=4)
+    _stamp_filter_tags(meta2, [0.5, 0.0, 0.5, 0.0])
+    pm, pc, _, complete, _, unfiltered = _apply_dynamic_sampling(
+        meta=meta2,
+        driver_carry=_make_driver_carry([5.0, 6.0, 7.0, 8.0], [0.5, 0.0, 0.5, 0.0]),
+        pending_meta=pm,
+        pending_carry=pc,
+        pending_unfiltered_rewards=pending_unfiltered,
+        train_prompts_size=4,
+        num_gen_batches=2,
+        max_gen_batches=10,
+        policy=_fake_policy(client),
+    )
+    assert complete is True
+    trained = pc["filtered_reward"]
+    assert trained.tolist() == [2.0, 4.0, 5.0, 7.0]
+    assert unfiltered.tolist() == [1.0, 2.0, 3.0, 4.0]
+
+    columns = _train_data_log_rewards(trained, use_dynamic_sampling=True)
+    assert columns == {
+        "rewards": [2.0, 4.0, 5.0, 7.0],
+        "filtered_rewards": [2.0, 4.0, 5.0, 7.0],
+    }
+    assert _train_data_log_rewards(trained, use_dynamic_sampling=False) == {
+        "rewards": [2.0, 4.0, 5.0, 7.0]
+    }
+
+
 def test_apply_dynamic_sampling_raises_on_max_gen_batches():
     """Exceeding dynamic_sampling_max_gen_batches must raise loudly."""
     from nemo_rl.algorithms.grpo_sync import _apply_dynamic_sampling
