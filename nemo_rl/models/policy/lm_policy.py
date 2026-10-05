@@ -34,7 +34,7 @@ from nemo_rl.distributed.batched_data_dict import (
     SequencePackingArgs,
     SlicedDataDict,
 )
-from nemo_rl.distributed.named_sharding import NamedSharding
+from nemo_rl.distributed.named_sharding import GTP_WEIGHT_REMAT_AXIS, NamedSharding
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
@@ -72,6 +72,19 @@ from nemo_rl.utils.timer import Timer
 PathLike = Union[str, "os.PathLike[Any]"]
 
 _DIRECT_PACKED_SFT_REQUIRED_KEYS = MEGATRON_SFT_PACKED_BATCH_FIELDS
+
+
+def _megatron_gtp_weight_remat_size(config: PolicyConfig) -> int:
+    """Return the dense GTP data-shard size, or one when GTP is disabled."""
+    overrides = (config.get("megatron_cfg") or {}).get("model_overrides") or {}
+    size = overrides.get("gtp_weight_remat_size", 1)
+    if size is None:
+        return 1
+    if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+        raise ValueError(
+            "model_overrides.gtp_weight_remat_size must be a positive integer"
+        )
+    return size
 
 
 def _aggregate_megatron_flops_metrics(
@@ -153,6 +166,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         tp_size = 1
         pp_size = 1
         cp_size = 1
+        gtp_size = 1
 
         megatron_enabled = bool(config.get("megatron_cfg", {}).get("enabled", False))
         automodel_enabled = bool(config.get("automodel_cfg", {}).get("enabled", False))
@@ -257,6 +271,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             tp_size = config["megatron_cfg"]["tensor_model_parallel_size"]
             pp_size = config["megatron_cfg"]["pipeline_model_parallel_size"]
             cp_size = config["megatron_cfg"]["context_parallel_size"]
+            gtp_size = _megatron_gtp_weight_remat_size(config)
 
             env_vars = dict(config["megatron_cfg"].get("env_vars") or {})
 
@@ -296,7 +311,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             worker_builder_cls_fqn = extension_fqn
 
         # Validate world_size compatibility with parallelism configuration
-        model_parallel_size = pp_size * cp_size * tp_size
+        model_parallel_size = pp_size * cp_size * tp_size * gtp_size
         actual_world_size = cluster.world_size()
 
         if (
@@ -321,7 +336,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         if actual_world_size < model_parallel_size:
             raise ValueError(
                 f"World size ({actual_world_size}) is insufficient for the parallelism configuration. "
-                f"Required minimum world size: PP({pp_size}) * CP({cp_size}) * TP({tp_size}) = {model_parallel_size}. "
+                f"Required minimum world size: PP({pp_size}) * CP({cp_size}) * TP({tp_size}) * GTP({gtp_size}) = {model_parallel_size}. "
                 f"This would result in DP = {actual_world_size}/{model_parallel_size} = {actual_world_size / model_parallel_size:.3f}, but DP must be ≥ 1. "
                 f"Please either increase the number of GPUs/nodes or reduce the parallelism parameters."
             )
@@ -329,25 +344,26 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         if actual_world_size % model_parallel_size != 0:
             dp_size_float = actual_world_size / model_parallel_size
             raise ValueError(
-                f"World size ({actual_world_size}) must be divisible by PP * CP * TP ({model_parallel_size}). "
-                f"The data parallel size (DP = world_size / (PP * CP * TP)) must be a positive integer. "
+                f"World size ({actual_world_size}) must be divisible by PP * CP * TP * GTP ({model_parallel_size}). "
+                f"The data parallel size (DP = world_size / (PP * CP * TP * GTP)) must be a positive integer. "
                 f"Current DP would be {actual_world_size}/{model_parallel_size} = {dp_size_float:.6f}, which is not an integer. "
                 f"Please adjust your cluster size or parallelism parameters."
             )
 
+        # MCore rank order is TP, CP, GTP, DP, PP, with TP varying fastest.
+        shape = [pp_size, -1, cp_size, tp_size]
+        axes = [
+            "pipeline_parallel",
+            "data_parallel",
+            "context_parallel",
+            "tensor_parallel",
+        ]
+        if gtp_size > 1:
+            shape.insert(2, gtp_size)
+            axes.insert(2, GTP_WEIGHT_REMAT_AXIS)
         self.sharding_annotations = NamedSharding(
-            layout=np.arange(cluster.world_size()).reshape(
-                pp_size,  # PP
-                -1,  # DP
-                cp_size,  # CP
-                tp_size,  # TP
-            ),
-            names=[
-                "pipeline_parallel",
-                "data_parallel",
-                "context_parallel",
-                "tensor_parallel",
-            ],
+            layout=np.arange(cluster.world_size()).reshape(shape),
+            names=axes,
         )
 
         pre_init_queue = RayQueue()
