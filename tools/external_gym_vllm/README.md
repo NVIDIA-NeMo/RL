@@ -123,6 +123,8 @@ Optional globals:
 | `RAY_SUB` | `$SLURM_SUBMIT_DIR/ray.sub` | Normal NeMo RL Slurm entrypoint. |
 | `EXTERNAL_VLLM_SHARED_ROOT` | `/lustre` | Shared host path mounted at the same path in every external-service container. |
 | `DEDICATED_RAY_HEAD` | unset | Passed through to `ray.sub`. With `1`, include one extra node in hetgroup 0 while keeping `cluster.num_nodes` equal to the GPU worker-node count; the head node's GPUs remain allocated but idle. |
+| `EXTERNAL_VLLM_EARLY_RAY` | `0` | With `1`, start `ray.sub` as soon as the load balancers are up instead of after every replica is healthy, so Ray bring-up, driver startup and worker setup overlap judge model loading. Requires the consuming Gym server to wait for its external `base_url` to serve `/models` before it reports ready (NeMo Gym `local_vllm_model`), so no rollout reaches a judge that is still loading. The health loop still stops `ray.sub` if a replica dies. |
+| `EXTERNAL_VLLM_MODE` | `inline` | `inline`: the two-hetgroup job described here. `serve`: pools only, as a standalone long-lived job; see [Persistent pools](#persistent-pools-serve-mode). |
 
 The number of nodes in hetgroup 1 must equal:
 
@@ -207,3 +209,42 @@ hetgroup 1 and load-balancer steps explicitly use hetgroup 0. Before starting
 `ray.sub`, the wrapper scopes its unsuffixed Slurm nodelist and node-count
 variables to component 0; Slurm then uses component 0 by default for its steps.
 External nodes therefore cannot accidentally join the training Ray cluster.
+
+## Persistent pools (serve mode)
+
+With `EXTERNAL_VLLM_MODE=serve` the wrapper runs the pools alone, as a plain
+(non-heterogeneous) job that outlives any training job. A training job that
+crashes or is preempted can then be resubmitted against the same pools without
+the judge models reloading.
+
+```bash
+EXTERNAL_VLLM_MODE=serve EXTERNAL_VLLM_POOL_DIR=<shared>/judge-pools/<name> \
+sbatch --nodes=<external-pool-nodes> --exclusive --gres=gpu:4 --time=<hours> \
+  --export=ALL tools/external_gym_vllm/run_in_allocation.sh
+```
+
+In serve mode the wrapper:
+
+1. runs every replica on this job's nodes and every load balancer on its first
+   node, so the published URLs live exactly as long as the pools;
+2. once every pool is healthy, writes `<pool-name-lowercase>_url`, `pools.env`
+   (`POOL=url` lines), `job_id` and `log_dir` to `EXTERNAL_VLLM_POOL_DIR`, then
+   `READY` last;
+3. relaunches a replica or load balancer that exits on the same nodes, at most
+   `EXTERNAL_VLLM_MAX_RESTARTS` (default `5`) times each, checking every
+   `EXTERNAL_VLLM_SERVE_POLL_S` (default `10`) seconds. The load balancer drops a
+   dead backend at its next health probe and adds the relaunched one from the
+   registry, so the URLs never change;
+4. on exit, removes `READY` and writes `STOPPED` before the endpoints go away.
+
+`COMMAND` and `RAY_SUB` are not used in serve mode. A training job attaches by
+substituting each URL for its placeholder in `COMMAND` and submitting `ray.sub`
+directly. If the pools are not `READY` yet, submit the training job with
+`--dependency=after:<pool-job>+<minutes>` and `attach_and_run.sh` as the batch
+script: it waits for `READY` from `EXTERNAL_VLLM_POOL_JOB` (polling every
+`EXTERNAL_VLLM_ATTACH_POLL_S`, default `15`, for at most
+`EXTERNAL_VLLM_ATTACH_TIMEOUT`, default `3600`, seconds), substitutes the URLs
+from `EXTERNAL_VLLM_POOL_DIR`, and runs `ray.sub`.
+
+Restarting the pool job itself changes its URLs; a running training job only
+reads them at start.

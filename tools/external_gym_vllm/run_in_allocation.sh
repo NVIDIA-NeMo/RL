@@ -16,26 +16,61 @@
 # Run external Gym vLLM pools beside NeMo RL in a single, two-component
 # Slurm heterogeneous job. Pool definitions are supplied by the caller through
 # EXTERNAL_VLLM_POOLS and consistently named, exported environment variables.
+#
+# EXTERNAL_VLLM_MODE=serve runs the pools on their own, as a standalone
+# (non-heterogeneous) job that outlives any training job: replicas on this job's
+# nodes, load balancers on its first node, and once healthy each pool's URL is
+# published to EXTERNAL_VLLM_POOL_DIR (<pool>_url, pools.env, job_id, READY).
+# Training jobs launched with EXTERNAL_VLLM_MODE=attach read those URLs instead
+# of starting pools, so a training job can crash and be resubmitted without the
+# judges reloading. The serve job relaunches a replica or load balancer that dies
+# and runs until it is cancelled or reaches its time limit.
 
 set -euo pipefail
 
+EXTERNAL_VLLM_MODE="${EXTERNAL_VLLM_MODE:-inline}"
+
 : "${SLURM_JOB_ID:?This script must run inside a Slurm allocation}"
-: "${SLURM_HET_SIZE:?This script requires a Slurm heterogeneous job}"
-: "${SLURM_JOB_NODELIST_HET_GROUP_0:?Hetgroup 0 nodelist is required}"
-: "${SLURM_JOB_NODELIST_HET_GROUP_1:?Hetgroup 1 nodelist is required}"
+case "${EXTERNAL_VLLM_MODE}" in
+  inline)
+    : "${SLURM_HET_SIZE:?This script requires a Slurm heterogeneous job}"
+    : "${SLURM_JOB_NODELIST_HET_GROUP_0:?Hetgroup 0 nodelist is required}"
+    : "${SLURM_JOB_NODELIST_HET_GROUP_1:?Hetgroup 1 nodelist is required}"
+    ;;
+  serve)
+    : "${EXTERNAL_VLLM_POOL_DIR:?EXTERNAL_VLLM_POOL_DIR is required in serve mode}"
+    if [[ -n "${SLURM_HET_SIZE:-}" ]]; then
+      echo "[FATAL] serve mode runs as a plain (non-heterogeneous) job" >&2
+      exit 1
+    fi
+    ;;
+  *)
+    echo "[FATAL] EXTERNAL_VLLM_MODE must be inline or serve, got: ${EXTERNAL_VLLM_MODE}" >&2
+    exit 1
+    ;;
+esac
 : "${SLURM_JOB_ACCOUNT:?SLURM_JOB_ACCOUNT is required}"
 : "${SLURM_JOB_PARTITION:?SLURM_JOB_PARTITION is required}"
 : "${SLURM_SUBMIT_DIR:?SLURM_SUBMIT_DIR is required}"
 : "${BASE_LOG_DIR:?BASE_LOG_DIR is required}"
 : "${CONTAINER:?CONTAINER is required}"
 : "${MOUNTS:?MOUNTS is required}"
-: "${COMMAND:?COMMAND is required}"
 : "${EXTERNAL_VLLM_POOLS:?EXTERNAL_VLLM_POOLS is required}"
 : "${EXTERNAL_VLLM_TOOLS_DIR_HOST:?EXTERNAL_VLLM_TOOLS_DIR_HOST is required}"
 
-if [[ "${SLURM_HET_SIZE}" != "2" ]]; then
-  echo "[FATAL] Expected exactly two Slurm hetgroups, got ${SLURM_HET_SIZE}" >&2
-  exit 1
+if [[ "${EXTERNAL_VLLM_MODE}" == inline ]]; then
+  : "${COMMAND:?COMMAND is required}"
+  if [[ "${SLURM_HET_SIZE}" != "2" ]]; then
+    echo "[FATAL] Expected exactly two Slurm hetgroups, got ${SLURM_HET_SIZE}" >&2
+    exit 1
+  fi
+  # srun component selectors: ray.sub and the load balancers on hetgroup 0,
+  # replicas on hetgroup 1.
+  het_ray=(--het-group=0)
+  het_ext=(--het-group=1)
+else
+  het_ray=()
+  het_ext=()
 fi
 
 RAY_SUB="${RAY_SUB:-${SLURM_SUBMIT_DIR}/ray.sub}"
@@ -43,7 +78,7 @@ export GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
 EXTERNAL_VLLM_LB_PYTHON="${EXTERNAL_VLLM_LB_PYTHON:-/opt/nemo_rl_venv/bin/python}"
 EXTERNAL_VLLM_SHARED_ROOT="${EXTERNAL_VLLM_SHARED_ROOT:-/lustre}"
 
-if [[ ! -f "${RAY_SUB}" ]]; then
+if [[ "${EXTERNAL_VLLM_MODE}" == inline && ! -f "${RAY_SUB}" ]]; then
   echo "[FATAL] ray.sub does not exist: ${RAY_SUB}" >&2
   exit 1
 fi
@@ -186,7 +221,7 @@ for pool in "${pool_names[@]}"; do
     exit 1
   fi
   seen_placeholders["${placeholders[${pool}]}"]="${pool}"
-  if [[ "${COMMAND}" != *"${placeholders[${pool}]}"* ]]; then
+  if [[ "${EXTERNAL_VLLM_MODE}" == inline && "${COMMAND}" != *"${placeholders[${pool}]}"* ]]; then
     echo "[FATAL] Driver command is missing ${placeholders[${pool}]} for ${display_names[${pool}]}" >&2
     exit 1
   fi
@@ -218,18 +253,23 @@ for shared_path in "${shared_paths[@]}"; do
   fi
 done
 
-mapfile -t ray_nodes < <(
-  scontrol show hostnames "${SLURM_JOB_NODELIST_HET_GROUP_0}" | sort
-)
-mapfile -t external_nodes < <(
-  scontrol show hostnames "${SLURM_JOB_NODELIST_HET_GROUP_1}" | sort
-)
-if (( ${#ray_nodes[@]} == 0 )); then
+if [[ "${EXTERNAL_VLLM_MODE}" == inline ]]; then
+  mapfile -t ray_nodes < <(
+    scontrol show hostnames "${SLURM_JOB_NODELIST_HET_GROUP_0}" | sort
+  )
+  mapfile -t external_nodes < <(
+    scontrol show hostnames "${SLURM_JOB_NODELIST_HET_GROUP_1}" | sort
+  )
+else
+  ray_nodes=()
+  mapfile -t external_nodes < <(scontrol show hostnames "${SLURM_JOB_NODELIST}" | sort)
+fi
+if [[ "${EXTERNAL_VLLM_MODE}" == inline ]] && (( ${#ray_nodes[@]} == 0 )); then
   echo "[FATAL] Slurm hetgroup 0 contains no NeMo RL nodes" >&2
   exit 1
 fi
 if (( ${#external_nodes[@]} != total_external_nodes )); then
-  echo "[FATAL] Slurm hetgroup 1 has ${#external_nodes[@]} nodes, expected ${total_external_nodes}" >&2
+  echo "[FATAL] External component has ${#external_nodes[@]} nodes, expected ${total_external_nodes}" >&2
   for pool in "${pool_names[@]}"; do
     echo "[FATAL]   ${display_names[${pool}]}: ${node_counts[${pool}]} nodes" >&2
   done
@@ -272,16 +312,21 @@ done
   printf '%s\n' "${ray_nodes[@]}"
 } > "${LOG_DIR}/node-allocation.txt"
 
-echo "[INFO] Heterogeneous-job external-vLLM topology"
-echo "[INFO]   Hetgroup 0, NeMo RL Ray: ${#ray_nodes[@]} nodes (${SLURM_JOB_NODELIST_HET_GROUP_0})"
+echo "[INFO] External-vLLM topology (mode=${EXTERNAL_VLLM_MODE})"
+if [[ "${EXTERNAL_VLLM_MODE}" == inline ]]; then
+  echo "[INFO]   Hetgroup 0, NeMo RL Ray: ${#ray_nodes[@]} nodes (${SLURM_JOB_NODELIST_HET_GROUP_0})"
+fi
 for pool in "${pool_names[@]}"; do
-  echo "[INFO]   Hetgroup 1, ${display_names[${pool}]}: ${node_counts[${pool}]} nodes, ${replicas[${pool}]} TP=${tensor_parallel_sizes[${pool}]} replicas"
+  echo "[INFO]   ${display_names[${pool}]}: ${node_counts[${pool}]} nodes, ${replicas[${pool}]} TP=${tensor_parallel_sizes[${pool}]} replicas"
 done
 
 declare -a service_step_pids=()
 declare -a service_step_labels=()
+declare -a service_step_pools=()
+declare -a service_step_replicas=()
 declare -a lb_step_pids=()
 declare -a lb_step_labels=()
+declare -a lb_step_pools=()
 ray_sub_pid=""
 
 cleanup() {
@@ -289,6 +334,11 @@ cleanup() {
   trap - EXIT TERM INT
 
   touch "${LOG_DIR}/ENDED" 2>/dev/null || true
+  if [[ "${EXTERNAL_VLLM_MODE}" == serve ]]; then
+    # Attaching jobs check READY: withdraw it before the endpoints go away.
+    rm -f "${EXTERNAL_VLLM_POOL_DIR}/READY" 2>/dev/null || true
+    echo "${SLURM_JOB_ID} $(date -Iseconds) status=${status}" > "${EXTERNAL_VLLM_POOL_DIR}/STOPPED" 2>/dev/null || true
+  fi
   if [[ -n "${ray_sub_pid}" ]] && kill -0 "${ray_sub_pid}" 2>/dev/null; then
     kill "${ray_sub_pid}" 2>/dev/null || true
   fi
@@ -507,27 +557,37 @@ bash -n <(printf '%s' "${VLLM_SERVER_BODY}") || {
   exit 1
 }
 
-ray_head_node="${ray_nodes[0]}"
+# Load balancers run on the NeMo RL head node inline, and on the pool job's own
+# first node in serve mode, so their URLs live exactly as long as the pools do.
+if [[ "${EXTERNAL_VLLM_MODE}" == inline ]]; then
+  lb_node="${ray_nodes[0]}"
+else
+  lb_node="${external_nodes[0]}"
+fi
 lb_mounts="${MOUNTS},${EXTERNAL_VLLM_TOOLS_DIR_HOST}:/opt/external-vllm-tools:ro"
 external_service_mount="${EXTERNAL_VLLM_SHARED_ROOT}:${EXTERNAL_VLLM_SHARED_ROOT}"
 for pool in "${pool_names[@]}"; do
   lb_mounts+=",${state_dirs[${pool}]}:${lb_state_dirs[${pool}]}"
 done
 
-for pool in "${pool_names[@]}"; do
-  echo "[INFO] Launching ${display_names[${pool}]} replicas"
-  for (( replica_index = 0; replica_index < replicas[${pool}]; replica_index++ )); do
-    first_node_index=$((node_offsets[${pool}] + replica_index * nodes_per_replica[${pool}]))
-    replica_node_count="${nodes_per_replica[${pool}]}"
-    replica_nodes=("${external_nodes[@]:first_node_index:replica_node_count}")
-    replica_nodelist=$(IFS=,; echo "${replica_nodes[*]}")
-    replica_id="${SLURM_JOB_ID}-${pool,,}-${replica_index}"
-    head_ip_file="${pool_log_dirs[${pool}]}/head_ip_${replica_index}"
-    vllm_log="${pool_log_dirs[${pool}]}/vllm_${replica_index}.log"
+# launch_replica POOL INDEX [SLOT]: start one replica step in the background.
+# SLOT, when given, replaces that entry of the service-step arrays (a relaunch).
+launch_replica() {
+  local pool=$1 replica_index=$2 slot=${3-}
+  local first_node_index replica_node_count replica_nodes replica_nodelist
+  local replica_id head_ip_file vllm_log pid
+  first_node_index=$((node_offsets[${pool}] + replica_index * nodes_per_replica[${pool}]))
+  replica_node_count="${nodes_per_replica[${pool}]}"
+  replica_nodes=("${external_nodes[@]:first_node_index:replica_node_count}")
+  replica_nodelist=$(IFS=,; echo "${replica_nodes[*]}")
+  replica_id="${SLURM_JOB_ID}-${pool,,}-${replica_index}"
+  head_ip_file="${pool_log_dirs[${pool}]}/head_ip_${replica_index}"
+  vllm_log="${pool_log_dirs[${pool}]}/vllm_${replica_index}.log"
+  rm -f "${head_ip_file}"
 
-    echo "[INFO] ${display_names[${pool}]} replica ${replica_index}: ${replica_nodelist}"
-    srun \
-      --het-group=1 \
+  echo "[INFO] ${display_names[${pool}]} replica ${replica_index}: ${replica_nodelist}"
+  srun \
+      "${het_ext[@]}" \
       --no-container-mount-home \
       --container-image="${containers[${pool}]}" \
       --container-mounts="${external_service_mount}" \
@@ -541,18 +601,33 @@ for pool in "${pool_names[@]}"; do
       --ntasks-per-node=1 \
       --export="ALL,POOL_PREFIX=${pool},REPLICA_ID=${replica_id},EXTERNAL_VLLM_TOOLS_DIR=${EXTERNAL_VLLM_TOOLS_DIR_HOST},EXTERNAL_VLLM_STATE_DIR=${state_dirs[${pool}]},EXTERNAL_VLLM_GROUP_ID=${group_ids[${pool}]},HEAD_IP_FILE=${head_ip_file},LOG_FILE=${vllm_log}" \
       --output="${pool_log_dirs[${pool}]}/replica_${replica_index}_%t.log" \
+      --open-mode=append \
       bash -c "${VLLM_SERVER_BODY}" &
-    service_step_pids+=("$!")
+  pid=$!
+  if [[ -z "${slot}" ]]; then
+    service_step_pids+=("${pid}")
     service_step_labels+=("${display_names[${pool}]} replica ${replica_index}")
+    service_step_pools+=("${pool}")
+    service_step_replicas+=("${replica_index}")
+  else
+    service_step_pids[slot]="${pid}"
+  fi
+}
+
+for pool in "${pool_names[@]}"; do
+  echo "[INFO] Launching ${display_names[${pool}]} replicas"
+  for (( replica_index = 0; replica_index < replicas[${pool}]; replica_index++ )); do
+    launch_replica "${pool}" "${replica_index}"
   done
 done
 
-ray_head_ip=$(resolve_node_ip "${ray_head_node}")
-for pool in "${pool_names[@]}"; do
-  pool_urls["${pool}"]="http://${ray_head_ip}:${lb_ports[${pool}]}/v1"
+lb_ip=$(resolve_node_ip "${lb_node}")
+# launch_lb POOL [SLOT]: start one load-balancer step in the background.
+launch_lb() {
+  local pool=$1 slot=${2-} pid
   echo "[INFO] Starting ${display_names[${pool}]} load balancer at ${pool_urls[${pool}]}"
   srun \
-    --het-group=0 \
+    "${het_ray[@]}" \
     --no-container-mount-home \
     --container-name="external-vllm-lb-${pool,,}-${SLURM_JOB_ID}" \
     --container-image="${CONTAINER}" \
@@ -562,14 +637,26 @@ for pool in "${pool_names[@]}"; do
     -A "${SLURM_JOB_ACCOUNT}" \
     -p "${SLURM_JOB_PARTITION}" \
     --overlap \
-    --nodelist="${ray_head_node}" \
+    --nodelist="${lb_node}" \
     --nodes=1 \
     --ntasks=1 \
     --cpus-per-task=2 \
     --output="${pool_log_dirs[${pool}]}/load_balancer.log" \
+    --open-mode=append \
     bash -lc "PYTHON='${EXTERNAL_VLLM_LB_PYTHON}' /opt/external-vllm-tools/lb_watchdog.sh '${lb_ports[${pool}]}' '${lb_state_dirs[${pool}]}' '${group_ids[${pool}]}'" &
-  lb_step_pids+=("$!")
-  lb_step_labels+=("${display_names[${pool}]} load balancer")
+  pid=$!
+  if [[ -z "${slot}" ]]; then
+    lb_step_pids+=("${pid}")
+    lb_step_labels+=("${display_names[${pool}]} load balancer")
+    lb_step_pools+=("${pool}")
+  else
+    lb_step_pids[slot]="${pid}"
+  fi
+}
+
+for pool in "${pool_names[@]}"; do
+  pool_urls["${pool}"]="http://${lb_ip}:${lb_ports[${pool}]}/v1"
+  launch_lb "${pool}"
 done
 
 start_ray_sub() {
@@ -591,7 +678,7 @@ start_ray_sub() {
 # base_url answering /models, which holds rollouts until the judges serve; the
 # health loop below still runs and tears ray.sub down if a replica dies.
 EXTERNAL_VLLM_EARLY_RAY="${EXTERNAL_VLLM_EARLY_RAY:-0}"
-if [[ "${EXTERNAL_VLLM_EARLY_RAY}" == "1" ]]; then
+if [[ "${EXTERNAL_VLLM_MODE}" == inline && "${EXTERNAL_VLLM_EARLY_RAY}" == "1" ]]; then
   for pool in "${pool_names[@]}"; do
     echo "${pool_urls[${pool}]}" > "${LOG_DIR}/${pool,,}_url"
     COMMAND="${COMMAND//${placeholders[${pool}]}/${pool_urls[${pool}]}}"
@@ -643,8 +730,63 @@ for pool in "${pool_names[@]}"; do
     sleep 5
   done
   echo "${pool_urls[${pool}]}" > "${LOG_DIR}/${pool,,}_url"
-  COMMAND="${COMMAND//${placeholders[${pool}]}/${pool_urls[${pool}]}}"
+  if [[ "${EXTERNAL_VLLM_MODE}" == inline ]]; then
+    COMMAND="${COMMAND//${placeholders[${pool}]}/${pool_urls[${pool}]}}"
+  fi
 done
+
+if [[ "${EXTERNAL_VLLM_MODE}" == serve ]]; then
+  # Publish, READY last: an attaching launcher treats READY as "every URL below
+  # answers /models", and the pool job id lets it check the pool is still alive.
+  mkdir -p "${EXTERNAL_VLLM_POOL_DIR}"
+  : > "${EXTERNAL_VLLM_POOL_DIR}/pools.env.tmp"
+  for pool in "${pool_names[@]}"; do
+    echo "${pool_urls[${pool}]}" > "${EXTERNAL_VLLM_POOL_DIR}/${pool,,}_url"
+    echo "${pool}=${pool_urls[${pool}]}" >> "${EXTERNAL_VLLM_POOL_DIR}/pools.env.tmp"
+  done
+  mv "${EXTERNAL_VLLM_POOL_DIR}/pools.env.tmp" "${EXTERNAL_VLLM_POOL_DIR}/pools.env"
+  echo "${SLURM_JOB_ID}" > "${EXTERNAL_VLLM_POOL_DIR}/job_id"
+  echo "${LOG_DIR}" > "${EXTERNAL_VLLM_POOL_DIR}/log_dir"
+  rm -f "${EXTERNAL_VLLM_POOL_DIR}/STOPPED"
+  date -Iseconds > "${EXTERNAL_VLLM_POOL_DIR}/READY"
+  echo "[INFO] External vLLM pools are healthy; published to ${EXTERNAL_VLLM_POOL_DIR}"
+  cat "${EXTERNAL_VLLM_POOL_DIR}/pools.env"
+
+  # Stay up for attaching training jobs. A replica or load balancer that exits is
+  # relaunched on the same nodes; the load balancer drops a dead backend on its
+  # next health probe and picks the relaunched one up from the registry, so the
+  # published URLs never change. Bounded per step so a crash loop ends the job.
+  max_restarts="${EXTERNAL_VLLM_MAX_RESTARTS:-5}"
+  serve_poll_s="${EXTERNAL_VLLM_SERVE_POLL_S:-10}"
+  declare -A step_restarts=()
+  while true; do
+    for index in "${!service_step_pids[@]}"; do
+      if ! kill -0 "${service_step_pids[${index}]}" 2>/dev/null; then
+        key="replica:${index}"
+        step_restarts["${key}"]=$(( ${step_restarts[${key}]:-0} + 1 ))
+        if (( step_restarts[${key}] > max_restarts )); then
+          echo "[FATAL] ${service_step_labels[${index}]} exited ${max_restarts} times; giving up" >&2
+          exit 1
+        fi
+        echo "[WARN] $(date -Iseconds) ${service_step_labels[${index}]} exited; relaunch ${step_restarts[${key}]}/${max_restarts}" >&2
+        launch_replica "${service_step_pools[${index}]}" "${service_step_replicas[${index}]}" "${index}"
+      fi
+    done
+    for index in "${!lb_step_pids[@]}"; do
+      if ! kill -0 "${lb_step_pids[${index}]}" 2>/dev/null; then
+        key="lb:${index}"
+        step_restarts["${key}"]=$(( ${step_restarts[${key}]:-0} + 1 ))
+        if (( step_restarts[${key}] > max_restarts )); then
+          echo "[FATAL] ${lb_step_labels[${index}]} exited ${max_restarts} times; giving up" >&2
+          exit 1
+        fi
+        echo "[WARN] $(date -Iseconds) ${lb_step_labels[${index}]} exited; relaunch ${step_restarts[${key}]}/${max_restarts}" >&2
+        launch_lb "${lb_step_pools[${index}]}" "${index}"
+      fi
+    done
+    sleep "${serve_poll_s}"
+  done
+fi
 export COMMAND
 
 if [[ -z "${ray_sub_pid}" ]]; then
