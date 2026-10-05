@@ -23,6 +23,7 @@ only hands it the two address pools and the router policies.
 """
 
 import logging
+import os
 import threading
 import time
 from typing import Any, Optional
@@ -465,12 +466,30 @@ def _build_frontend_tokenizer(
     )
     from nemo_rl.models.generation.trtllm.trtllm_http_server import (
         _prefix_splice_mode,
+        _tokenizer_backend_name,
         build_spliced_prompt_ids,
     )
+    from nemo_rl.utils.fastokens import maybe_patch_fastokens
 
     from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
 
+    # Offer fastokens to this frontend actor before constructing the
+    # tokenizer: the env override (NRL_USE_FASTOKENS=1) decides, mirroring the
+    # engine adapter's HTTP server. Both sides of frontend_tokenize must run
+    # the same backend or their ids can diverge.
+    maybe_patch_fastokens(False)
+
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    tokenizer_backend = _tokenizer_backend_name(tokenizer)
+    print(f"[DisaggFrontend] tokenizer backend: {tokenizer_backend}")
+    if os.environ.get(
+        "NRL_USE_FASTOKENS"
+    ) == "1" and not tokenizer_backend.startswith("fastokens."):
+        raise RuntimeError(
+            "NRL_USE_FASTOKENS=1, but the disagg frontend tokenizer backend "
+            f"is {tokenizer_backend!r}; expected a fastokens shim "
+            "(fastokens.patch_transformers() did not take effect)"
+        )
     if _prefix_splice_mode() != "legacy":
         # Same invariant the engine adapter asserts: the frontend runs the
         # same splice code, and its ids must be bit-identical to the adapter's.
