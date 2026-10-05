@@ -1574,3 +1574,18 @@ def test_nested_routes_match_padded_routes_through_row_ops(transform):
 
     assert torch.equal(got["input_ids"], expected["input_ids"])
     assert torch.equal(_padded_routes(got), expected["routed_experts"])
+
+
+@pytest.mark.parametrize("as_tensors", [False, True])
+def test_get_multimodal_dict_excludes_packed_sequence_boundaries(as_tensors):
+    """Packing metadata stays in the batch but is excluded from model inputs."""
+    boundaries = {
+        "cu_seqlens": PackedTensor([torch.tensor([0, 4])], dim_to_pack=0),
+        "cu_seqlens_padded": PackedTensor([torch.tensor([0, 8])], dim_to_pack=0),
+    }
+    batch = BatchedDataDict(
+        {**boundaries, "pixel_values": PackedTensor([torch.ones(2, 3)], dim_to_pack=0)}
+    )
+    assert set(batch.get_multimodal_dict(as_tensors=as_tensors)) == {"pixel_values"}
+    for key, value in boundaries.items():
+        assert batch[key] is value
