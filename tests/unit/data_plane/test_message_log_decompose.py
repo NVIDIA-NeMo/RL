@@ -59,7 +59,7 @@ def test_decompose_message_log_basic_shapes() -> None:
     assert out["turn_lengths"].tolist() == [[3, 2], [2, 4]]
     assert list(out["turn_roles"][0]) == ["user", "assistant"]
     assert list(out["turn_contents"][1]) == ["Q2", "A2"]
-    # First assistant turn's length per sample.
+    # Total assistant-turn length per sample.
     assert out["response_token_lengths"].tolist() == [2, 4]
 
 
@@ -71,8 +71,8 @@ def test_decompose_message_log_no_assistant_turn() -> None:
     assert out["response_token_lengths"].tolist() == [0]
 
 
-def test_decompose_message_log_picks_first_assistant() -> None:
-    """If multiple assistant turns exist, ``response_token_lengths`` takes the first."""
+def test_decompose_message_log_sums_assistant_turns() -> None:
+    """If multiple assistant turns exist, ``response_token_lengths`` is their total."""
     out = decompose_message_log(
         [
             [
@@ -91,7 +91,7 @@ def test_decompose_message_log_picks_first_assistant() -> None:
             ]
         ]
     )
-    assert out["response_token_lengths"].tolist() == [2]
+    assert out["response_token_lengths"].tolist() == [6]
 
 
 def test_decompose_message_log_jagged_turn_count() -> None:

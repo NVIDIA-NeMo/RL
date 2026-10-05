@@ -21,6 +21,7 @@ from nemo_rl.algorithms.reward_functions import (
     apply_reward_shaping,
 )
 from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.data.llm_message_utils import decompose_message_log
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from tests.unit.algorithms.utils import create_mock_batch_with_responses
 
@@ -325,6 +326,48 @@ def test_reward_shaping_missing_assistant_response():
         AssertionError, match="Assistant response not found during reward shaping"
     ):
         apply_reward_shaping(batch, config)
+
+
+@pytest.mark.parametrize("decomposed", [False, True])
+def test_reward_shaping_counts_all_assistant_turns(decomposed):
+    """Multi-turn logs are measured over every assistant turn, on both input paths."""
+
+    def turn(role, n):
+        return {"role": role, "content": "", "token_ids": torch.zeros(n)}
+
+    message_logs = [
+        # Single turn: 15 assistant tokens, within the expected length of 20.
+        [turn("user", 5), turn("assistant", 15)],
+        # Two turns: 15 + 10 = 25 assistant tokens, 5 over the expected length.
+        [
+            turn("user", 5),
+            turn("assistant", 15),
+            turn("environment", 3),
+            turn("assistant", 10),
+        ],
+    ]
+    batch = BatchedDataDict(
+        {"message_log": message_logs, "total_reward": torch.tensor([1.0, 1.0])}
+    )
+    if decomposed:
+        batch = BatchedDataDict(
+            {
+                "response_token_lengths": decompose_message_log(message_logs)[
+                    "response_token_lengths"
+                ],
+                "total_reward": torch.tensor([1.0, 1.0]),
+            }
+        )
+
+    config = RewardShapingConfig(
+        enabled=True,
+        overlong_buffer_length=10,
+        overlong_buffer_penalty=1.0,
+        max_response_length=30,
+    )
+    result = apply_reward_shaping(batch, config)
+
+    assert torch.allclose(result["total_reward"], torch.tensor([1.0, 0.5]))
 
 
 def test_reward_shaping_mismatched_lengths():
