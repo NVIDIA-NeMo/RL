@@ -12,6 +12,10 @@ policy:
       gpu_memory_utilization: 0.8
       precision: "fp8"
       is_mx: true
+      # Preserve the same BF16 boundary fraction used by the stable 235B
+      # recipe while keeping 49 of the model's 64 layers in MXFP8.
+      num_first_layers_in_bf16: 3
+      num_last_layers_in_bf16: 12
       quantization_ignore_patterns:
         - model.layers.*.self_attn.*
         - lm_head
