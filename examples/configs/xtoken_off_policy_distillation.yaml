@@ -65,6 +65,9 @@ loss_fn:
 
 checkpointing:
   enabled: false
+  # set to false to start fresh in a checkpoint_dir that already has
+  # checkpoints; the existing ones are moved to checkpoint_dir/run_<n>/
+  resume_if_exists: true
   checkpoint_dir: "checkpoints/xtoken-off-policy-distillation"
   metric_name: "train:loss"
   higher_is_better: false
