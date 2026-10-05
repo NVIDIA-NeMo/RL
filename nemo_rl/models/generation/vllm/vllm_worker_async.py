@@ -926,6 +926,7 @@ class VllmAsyncGenerationWorkerImpl(
         from vllm.entrypoints.serve.tokenize.serving import (
             ServingTokenization,
         )
+        from vllm.entrypoints.serve.utils.api_utils import with_cancellation
         from vllm.renderers.online_renderer import OnlineRenderer
         from vllm.exceptions import VLLMValidationError
         from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
@@ -1351,6 +1352,9 @@ class VllmAsyncGenerationWorkerImpl(
 
         # The create_chat_completion and tokenize methods are taken from vllm/entrypoints/openai/api_server.py
         @app.post("/v1/chat/completions")
+        # Like vLLM's own routes: cancel the handler (and with it the engine
+        # request) when the client disconnects, instead of generating for nobody.
+        @with_cancellation
         async def create_chat_completion(
             request: NeMoRLChatCompletionRequest, raw_request: Request
         ):
@@ -1462,6 +1466,10 @@ class VllmAsyncGenerationWorkerImpl(
                     },
                     status_code=400,
                 )
+            except asyncio.CancelledError:
+                # Client disconnected (see with_cancellation above).
+                worker_self._abort_request_capture(request, reason="client_disconnect")
+                raise
             except BaseException:
                 worker_self._abort_request_capture(request, reason="engine_error")
                 raise

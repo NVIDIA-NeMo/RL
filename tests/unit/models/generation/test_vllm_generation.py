@@ -745,6 +745,7 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         "vllm.entrypoints.serve",
         "vllm.entrypoints.serve.engine",
         "vllm.entrypoints.serve.tokenize",
+        "vllm.entrypoints.serve.utils",
         "vllm.reasoning",
         "vllm.renderers",
         "vllm.tool_parsers",
@@ -856,6 +857,15 @@ def _install_fake_vllm_openai_modules(monkeypatch):
     make_module(
         "vllm.renderers.online_renderer",
         OnlineRenderer=OnlineRenderer,
+    )
+
+    def with_cancellation(handler):
+        handler.cancels_on_disconnect = True
+        return handler
+
+    make_module(
+        "vllm.entrypoints.serve.utils.api_utils",
+        with_cancellation=with_cancellation,
     )
     make_module(
         "vllm.entrypoints.serve.tokenize.serving",
@@ -1073,6 +1083,57 @@ async def test_media_capture_rejected_keeps_its_own_code(monkeypatch):
     error = json.loads(response.body)["error"]
     assert error["code"] == "retained_media_changed"
     assert error["param"] == "messages"
+
+
+@pytest.mark.asyncio
+async def test_chat_completion_cancelled_on_client_disconnect(monkeypatch):
+    """A client disconnect cancels the chat handler and releases its capture state."""
+    _, _, openai_serving_chat = _install_fake_vllm_openai_modules(monkeypatch)
+
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "val_temperature": 0.0,
+        "val_top_p": 1.0,
+        "vllm_cfg": {},
+    }
+    worker.llm = MagicMock(model_config="model-config", renderer="renderer")
+    worker._http_engine_client = worker.llm
+    worker._capture_calls = {}
+    worker.token_capture = None
+    worker._abort_request_capture = MagicMock()
+    worker.llm_async_engine_args = MagicMock()
+    worker.llm_async_engine_args.create_model_config.return_value = MagicMock(
+        served_model_name="served-model", model="model-path"
+    )
+
+    app = _FakeFastAPIApp()
+    worker._setup_vllm_openai_api_server(app)
+    chat_handler = next(
+        handler for path, handler in app.routes if path == "/v1/chat/completions"
+    )
+    # The route is wrapped with vLLM's with_cancellation.
+    assert getattr(chat_handler, "cancels_on_disconnect", False)
+
+    started = asyncio.Event()
+
+    async def create_chat_completion(request, _raw_request):
+        started.set()
+        await asyncio.Event().wait()  # generation that never finishes
+
+    openai_serving_chat.instances[0].create_chat_completion = create_chat_completion
+    request = types.SimpleNamespace(top_k=-1, top_p=1.0, temperature=1.0)
+    task = asyncio.create_task(chat_handler(request, MagicMock()))
+    await started.wait()
+    # with_cancellation cancels the handler task on http.disconnect.
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    worker._abort_request_capture.assert_called_once_with(
+        request, reason="client_disconnect"
+    )
 
 
 def test_nano_v3_reasoning_parser_swaps_reasoning_when_thinking_disabled(

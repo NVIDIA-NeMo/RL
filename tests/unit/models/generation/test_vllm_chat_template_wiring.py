@@ -88,6 +88,7 @@ def _install_fake_vllm(monkeypatch):
         "vllm.entrypoints.serve",
         "vllm.entrypoints.serve.engine",
         "vllm.entrypoints.serve.tokenize",
+        "vllm.entrypoints.serve.utils",
         "vllm.reasoning",
         "vllm.renderers",
         "vllm.tool_parsers",
@@ -145,6 +146,10 @@ def _install_fake_vllm(monkeypatch):
     module(
         "vllm.entrypoints.serve.tokenize.serving",
         ServingTokenization=_ServingTokenization,
+    )
+    module(
+        "vllm.entrypoints.serve.utils.api_utils",
+        with_cancellation=lambda handler: handler,
     )
     module("vllm.renderers.online_renderer", OnlineRenderer=_OnlineRenderer)
     module(
