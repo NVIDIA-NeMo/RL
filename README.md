@@ -761,6 +761,11 @@ Refer to `examples/configs/evals/eval.yaml` for a full list of parameters that c
 For detailed instructions on how to set up and launch NeMo RL on Slurm or Kubernetes clusters, please refer to the dedicated [Set Up Clusters](docs/cluster.md) documentation.
 
 ## Tips and Tricks
+- Optional Megatron/vLLM profiler plugins capture complete updates or rollouts,
+  or combine weight refit, generation, logprobs and training in one report.
+  See the [GPU profiling guide](docs/four-phase-profiling.md) for setup,
+  supported topologies, plugin contracts and the relationship to NeMo-Lens.
+
 - If you forget to initialize the NeMo and Megatron submodules when cloning the NeMo-RL repository, you may run into an error like this:
 
   ```sh

@@ -359,6 +359,7 @@ testing.md
 documentation.md
 debugging.md
 nsys-profiling.md
+four-phase-profiling.md
 fp8.md
 guides/use-custom-vllm.md
 ```
