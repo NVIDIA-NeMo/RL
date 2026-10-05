@@ -29,10 +29,11 @@ Modeled after `tests/unit/models/policy/test_megatron_worker.py`.
 """
 
 import os
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import ray
@@ -291,8 +292,101 @@ def test_prepare_for_training_leaves_native_cpu_optimizer_placement():
     assert model.train_called
 
 
-def test_finish_training_evals_before_model_offload(monkeypatch):
+def test_finish_training_enters_eval_before_offloading_model():
     """Mamba decode caches must refresh before CUDA parameter storage is released."""
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        MegatronValueWorkerImpl,
+    )
+
+    events: list[str] = []
+    model = SimpleNamespace(eval=lambda: events.append("eval"))
+
+    def move_model(model, device, *, move_params, move_grads):
+        events.append(f"model:{device}")
+        return model
+
+    worker = SimpleNamespace(
+        _train_step_state=None,
+        model=model,
+        optimizer=object(),
+        optimizer_cpu_offload=False,
+        move_model=move_model,
+        move_optimizer=lambda device: events.append(f"optimizer:{device}"),
+    )
+
+    with patch("torch.cuda.empty_cache"):
+        MegatronValueWorkerImpl.finish_training(worker)
+
+    assert events == ["eval", "model:cpu", "optimizer:cpu"]
+
+
+def test_split_value_accepts_uneven_packed_dp_shard():
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        MegatronValueWorkerImpl,
+    )
+
+    state = SimpleNamespace(
+        loss_fn=object(),
+        mbs=1,
+        gbs=128,
+        counts=torch.zeros(3, device="cuda"),
+        metrics=[],
+        num_microbatches=0,
+        num_chunks=0,
+        failed=False,
+    )
+    worker = SimpleNamespace(
+        _assert_train_step_open=lambda: state,
+        _restore_train_hooks=lambda current_state: None,
+        _policy_like_cfg={"sequence_packing": {"enabled": True}},
+        mcore_state=SimpleNamespace(straggler_timer=None),
+        model=SimpleNamespace(no_sync=nullcontext),
+        defer_fp32_logits=False,
+        cfg={"megatron_cfg": {"empty_unused_memory_level": 0}},
+    )
+    data = BatchedDataDict(
+        {
+            "sample_mask": torch.ones(65, device="cuda"),
+            "token_mask": torch.ones((65, 2), device="cuda"),
+        }
+    )
+    rerun = SimpleNamespace(
+        should_run_forward_backward=MagicMock(side_effect=[True, False])
+    )
+    with (
+        patch(
+            "nemo_rl.models.value.workers.megatron_value_worker.get_microbatch_iterator",
+            return_value=(iter(()), 1, 1, None, 2),
+        ),
+        patch("nemo_rl.models.value.workers.megatron_value_worker.LossPostProcessor"),
+        patch(
+            "nemo_rl.models.value.workers.megatron_value_worker.get_rerun_state_machine",
+            return_value=rerun,
+        ),
+        patch(
+            "nemo_rl.models.value.workers.megatron_value_worker.megatron_forward_backward",
+            return_value=[],
+        ),
+        patch(
+            "nemo_rl.models.value.workers.megatron_value_worker.is_pipeline_last_stage",
+            return_value=False,
+        ),
+        patch(
+            "nemo_rl.models.value.workers.megatron_value_worker.broadcast_loss_metrics_from_last_stage",
+            return_value=[],
+        ),
+        patch("torch.cuda.nvtx.range_push"),
+        patch("torch.cuda.nvtx.range_pop"),
+    ):
+        MegatronValueWorkerImpl.train_microbatch(worker, data)
+
+    assert state.counts[2].item() == 65
+    assert state.num_chunks == 1
+    assert not state.failed
+
+
+def test_finish_training_evals_before_model_offload(monkeypatch):
+    """Check that offloading preserves the model move-parameter contract."""
     from nemo_rl.models.value.workers.megatron_value_worker import (
         MegatronValueWorkerImpl,
     )
@@ -304,6 +398,7 @@ def test_finish_training_evals_before_model_offload(monkeypatch):
     events = []
     move_kwargs = []
     worker = object.__new__(MegatronValueWorkerImpl)
+    worker._train_step_state = None
     worker.model = _EvalModel()
     worker.optimizer = None
     worker.move_model = lambda model, device, **kwargs: (

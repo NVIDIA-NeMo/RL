@@ -87,6 +87,8 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     TQReplayMetadataState,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    InOrderSampler,
+    ReadyFirstSampler,
     ReadyFirstSamplerConfig,
     TransactionalAdmissionSampler,
     create_sampler,
@@ -592,6 +594,21 @@ class SingleControllerActor:
             self._async_cfg.sampler,
             min_groups_for_streaming_train=self._async_cfg.min_groups_for_streaming_train,
         )
+        if self._is_ppo:
+            if not isinstance(self._sampler, InOrderSampler) or self._value is None:
+                raise TypeError("PPO requires an in-order sampler and value worker")
+            generations_per_prompt = self._algo_cfg.num_generations_per_prompt
+            policy_dp = self._trainer.sharding_annotations.get_axis_size(
+                "data_parallel"
+            )
+            value_dp = self._value.sharding_annotations.get_axis_size(
+                "data_parallel"
+            )
+            group_multiple = math.lcm(
+                policy_dp // math.gcd(policy_dp, generations_per_prompt),
+                value_dp // math.gcd(value_dp, generations_per_prompt),
+            )
+            self._sampler.set_group_multiple(group_multiple)
         restored_dispatch_index = actor_args.save_state.sampler_dispatch_index
         if restored_dispatch_index is None:
             # Checkpoints predating exact sampler state reconstruct the original
@@ -5266,19 +5283,27 @@ class SingleControllerActor:
         await self._ppo_worker_call(self._value.prepare_for_training)
         result: dict[str, Any] | None = None
         try:
-            for _ in range(num_epochs):
-                try:
-                    await self._ppo_worker_call(
-                        self._value.begin_train_step, self._value_loss_fn
+            if self._algo_cfg.value_training_mode == "whole_batch":
+                full_meta = metas[0].concat(*metas[1:])
+                for _ in range(num_epochs):
+                    result = await self._ppo_worker_call(
+                        self._value.train_from_meta, full_meta, self._value_loss_fn
                     )
-                    for meta in metas:
+            else:
+                for _ in range(num_epochs):
+                    try:
                         await self._ppo_worker_call(
-                            self._value.train_microbatches_from_meta, meta
+                            self._value.begin_train_step, self._value_loss_fn
                         )
-                    result = await self._ppo_worker_call(self._value.finish_train_step)
-                finally:
-                    # Idempotent after finish; also cleans partial begin/fan-out.
-                    await self._ppo_worker_call(self._value.abort_train_step)
+                        for meta in metas:
+                            await self._ppo_worker_call(
+                                self._value.train_microbatches_from_meta, meta
+                            )
+                        result = await self._ppo_worker_call(
+                            self._value.finish_train_step
+                        )
+                    finally:
+                        await self._ppo_worker_call(self._value.abort_train_step)
         finally:
             await self._ppo_worker_call(self._value.finish_training)
         assert result is not None

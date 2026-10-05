@@ -2436,6 +2436,7 @@ class _NoOpValue:
     def __init__(self, calls: list[str] | None = None, prefix: str = "") -> None:
         self.calls: list[str] = [] if calls is None else calls
         self._prefix = prefix
+        self.trained_sample_ids: list[list[str]] = []
 
     def _record(self, name: str) -> None:
         self.calls.append(f"{self._prefix}{name}")
@@ -2459,6 +2460,15 @@ class _NoOpValue:
     def train_microbatches_from_meta(self, meta: KVBatchMeta) -> None:
         self._record("train_microbatches_from_meta")
 
+    def train_from_meta(self, meta: KVBatchMeta, loss_fn) -> dict:
+        self.trained_sample_ids.append(meta.sample_ids)
+        self._record("train_from_meta")
+        return {
+            "loss": torch.tensor([0.25]),
+            "grad_norm": torch.tensor([1.5]),
+            "all_mb_metrics": {"vf_clipfrac": [0.0], "values_min": [-1.0]},
+        }
+
     def abort_train_step(self) -> None:
         self._record("abort_train_step")
 
@@ -2481,6 +2491,7 @@ def _ppo_train_pump_controller(
     value: _NoOpValue | None = None,
     ppo_epochs: int = 1,
     critic_ppo_epochs: int | None = None,
+    value_training_mode: str = "split",
 ) -> tuple[object, _NoOpValue]:
     ctrl = _train_pump_controller(sampler=sampler)
     value = _NoOpValue() if value is None else value
@@ -2497,12 +2508,42 @@ def _ppo_train_pump_controller(
         max_num_steps=1,
         policy_training_start_step=policy_training_start_step,
         seq_logprob_error_threshold=None,
+        value_training_mode=value_training_mode,
     )
     ctrl._algo_cfg = ctrl._master_config.ppo
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._sync_weights = AsyncMock(return_value=0)
     ctrl._logger = MagicMock()
     return ctrl, value
+
+
+def test_whole_batch_value_mode_replays_all_chunks_per_critic_epoch() -> None:
+    first_meta = _single_group_meta()
+    second_meta = _single_group_meta()
+    second_meta.sample_ids = ["sample-1"]
+    controller, value = _ppo_train_pump_controller(
+        sampler=_OneThenEmptySampler(first_meta),
+        value_training_mode="whole_batch",
+    )
+
+    asyncio.run(controller._value_train_epochs([first_meta, second_meta], num_epochs=2))
+
+    assert value.calls == [
+        "prepare_for_training",
+        "train_from_meta",
+        "train_from_meta",
+        "finish_training",
+    ]
+    assert value.trained_sample_ids == [
+        ["sample-0", "sample-1"],
+        ["sample-0", "sample-1"],
+    ]
+
+
+def test_ppo_value_training_mode_defaults_to_split_and_rejects_unknown() -> None:
+    assert PPOConfig().value_training_mode == "split"
+    with pytest.raises(ValueError, match="value_training_mode"):
+        PPOConfig(value_training_mode="unknown")
 
 
 def _single_group_meta() -> KVBatchMeta:
