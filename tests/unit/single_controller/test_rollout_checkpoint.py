@@ -45,6 +45,7 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
 from nemo_rl.data import DataConfig
 from nemo_rl.models.generation.vllm.config import VllmConfig, VllmSpecificArgs
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.utils.logger import LoggerConfig
 
 
 class _DumpedConfig:
@@ -210,7 +211,7 @@ def test_bootstrap_fingerprint_ignores_default_operational_paths() -> None:
         "checkpointing": {"checkpoint_dir": "/run/one/checkpoints"},
         "rollout_checkpointing": {"snapshot_attempt_interval_s": 120},
         "cluster": {"num_nodes": 2},
-        "logger": {"log_dir": "/run/one"},
+        "logger": LoggerConfig(log_dir="/run/one"),
     }
     operationally_changed = {
         **base,
@@ -239,7 +240,7 @@ def test_bootstrap_fingerprint_ignores_default_operational_paths() -> None:
         "checkpointing": {"checkpoint_dir": "/run/two/checkpoints"},
         "rollout_checkpointing": {"snapshot_attempt_interval_s": 300},
         "cluster": {"num_nodes": 8},
-        "logger": {"log_dir": "/run/two"},
+        "logger": LoggerConfig(log_dir="/run/two"),
     }
 
     fingerprint = bootstrap_fingerprint(cast(Any, _DumpedConfig(base)))

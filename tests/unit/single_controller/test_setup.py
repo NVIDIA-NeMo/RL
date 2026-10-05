@@ -91,6 +91,7 @@ from nemo_rl.utils.config import (
     parse_hydra_overrides,
     register_omegaconf_resolvers,
 )
+from nemo_rl.utils.logger import LoggerConfig, WandbConfig
 
 # Captured at import, before the patched_factories fixture swaps it for a mock.
 _REAL_BUILD_GENERATION = sc_setup_mod._build_generation
@@ -198,7 +199,7 @@ def _make_master_config(
             "save_period": 10,
             "save_optimizer": False,
         },
-        logger={"wandb_enabled": False, "wandb": {}},
+        logger=LoggerConfig(log_dir="/tmp/test-logs"),
         cluster=ClusterConfig(num_nodes=2, gpus_per_node=8),
         loss_fn=loss_cfg if loss_cfg is not None else ClippedPGLossConfig(),
         env=env if env is not None else {},
@@ -1045,7 +1046,6 @@ class TestSetup:
                 "vllm_cfg": {"async_engine": True},
             }
         )
-        mc.logger["log_dir"] = str(tmp_path / "logs")
         mc.token_capture.enabled = True
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0
@@ -1123,7 +1123,6 @@ class TestSetup:
                 "vllm_cfg": {"async_engine": True},
             }
         )
-        mc.logger = {"log_dir": str(tmp_path / "logs")}
         mc.token_capture.enabled = True
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0,
@@ -1663,10 +1662,12 @@ class TestSetup:
         patched_factories,
     ):
         mc = _make_master_config()
-        mc.logger = {
-            "wandb_enabled": wandb_enabled,
-            "wandb": {"log_nemo_gym_full_result_tables": table_flag},
-        }
+        mc.logger = LoggerConfig.model_construct(
+            wandb_enabled=wandb_enabled,
+            wandb=WandbConfig.model_construct(
+                log_nemo_gym_full_result_tables=table_flag
+            ),
+        )
 
         with patch.object(sc_setup_mod, "RolloutManager") as mock_rollout_manager:
             setup_single_controller(mc, MagicMock(pad_token_id=0))
@@ -1900,9 +1901,6 @@ class TestSetup:
                 "vllm_cfg": {"async_engine": True},
             }
         )
-        # Extend, don't replace: setup_single_controller also indexes the
-        # wandb keys that _make_master_config populates.
-        mc.logger = {**mc.logger, "log_dir": "/tmp/test-token-capture"}
         mc.token_capture.enabled = True
         mc.token_capture.num_reassembler_workers = 3
         patched_factories["setup_response_data"].return_value = (
@@ -2393,9 +2391,6 @@ class TestSetup:
     def _make_megatron_token_capture_config(self) -> MasterConfig:
         """Gym-on Megatron config with token capture enabled (expose_http_server=true)."""
         mc = self._make_gym_megatron_config()
-        # Extend, don't replace: setup_single_controller also indexes the
-        # wandb keys that _make_master_config populates.
-        mc.logger = {**mc.logger, "log_dir": "/tmp/test-megatron-token-capture"}
         mc.token_capture.enabled = True
         return mc
 
@@ -2622,7 +2617,6 @@ class TestNativeTQRecoverySetup:
                 "vllm_cfg": {"async_engine": True},
             }
         )
-        mc.logger["log_dir"] = str(tmp_path / "logs")
         mc.token_capture.enabled = True
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0,

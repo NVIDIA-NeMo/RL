@@ -37,9 +37,11 @@ def test_chunks_keep_masked_rows_and_long_sequences_until_commit(tmp_path):
         writer.finish_step(5)
 
 
-def test_resume_replaces_partial_and_rejects_wrong_step(tmp_path: Path) -> None:
-    partial = tmp_path / "train_data_step8.jsonl.partial"
-    partial.write_text("interrupted attempt\n")
+def test_resume_replaces_partial_and_keeps_steps_apart(tmp_path: Path) -> None:
+    # An interrupted publish leaves a .partial behind; the next one overwrites
+    # it rather than appending to a half-written file.
+    stale = tmp_path / "train_data_step8.jsonl.partial"
+    stale.write_text("interrupted attempt\n")
     writer = TrainDataDump(str(tmp_path))
     args = dict(
         sample_ids=["resumed"],
@@ -49,17 +51,100 @@ def test_resume_replaces_partial_and_rejects_wrong_step(tmp_path: Path) -> None:
         scalars={},
     )
     writer.add_chunk(step=7, **args)
-    original = partial.read_bytes()
-    assert json.loads(original)["token_ids"] == [[9]]
-    with pytest.raises(RuntimeError, match="unpublished"):
-        writer.add_chunk(step=8, **args)
+    part = tmp_path / "train_data_step8.jsonl.part-0"
+    assert json.loads(part.read_text())["token_ids"] == [[9]]
+    # Each step owns its own part file, so moving on neither publishes nor
+    # corrupts the previous one.
+    writer.add_chunk(step=8, **args)
+    assert (tmp_path / "train_data_step9.jsonl.part-0").exists()
+    assert part.exists()
     with pytest.raises(RuntimeError, match="no training dump"):
-        writer.finish_step(8)
-    assert partial.read_bytes() == original
-    assert list(tmp_path.iterdir()) == [partial]
+        writer.finish_step(42)
     writer.finish_step(7)
-    assert (tmp_path / "train_data_step8.jsonl").read_bytes() == original
-    assert not partial.exists()
+    published = tmp_path / "train_data_step8.jsonl"
+    assert json.loads(published.read_text())["idx"] == 0
+    assert not part.exists()
+    assert not stale.exists()
+
+
+def test_shards_write_separate_parts_and_merge_in_order(tmp_path: Path) -> None:
+    """The pool runs a step's shards concurrently, so each needs its own file.
+
+    idx has to be assigned by the merge: no single writer sees every row, and
+    a per-writer counter would hand the same index to every shard.
+    """
+    args: dict[str, Any] = dict(
+        tags=None,
+        input_lengths=torch.tensor([1]),
+        sequences={"token_ids": torch.tensor([[1]])},
+        scalars={},
+    )
+    shards = [TrainDataDump(str(tmp_path), shard_id=str(i)) for i in range(3)]
+    for i, shard in enumerate(shards):
+        shard.add_chunk(step=0, sample_ids=[f"s{i}"], **args)
+    assert sorted(p.name for p in tmp_path.glob("*.part-*")) == [
+        f"train_data_step1.jsonl.part-{i}" for i in range(3)
+    ]
+    # Any shard can publish: the merge reads the parts off disk rather than
+    # whatever that writer happens to have buffered.
+    shards[1].finish_step(0)
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "train_data_step1.jsonl").read_text().splitlines()
+    ]
+    assert [row["idx"] for row in rows] == [0, 1, 2]
+    assert [row["sample_id"] for row in rows] == [["s0"], ["s1"], ["s2"]]
+    assert not list(tmp_path.glob("*.part-*"))
+
+
+def test_unreachable_shard_fails_instead_of_publishing_a_short_dump(
+    tmp_path: Path,
+) -> None:
+    """A pool off the controller's filesystem writes parts it cannot see.
+
+    Those shards still run and still report their row counts, so without the
+    count check the merge would publish whatever happened to be local and the
+    dump would look complete while silently missing a shard.
+    """
+    reachable = TrainDataDump(str(tmp_path), shard_id="0")
+    reachable.add_chunk(
+        step=0,
+        sample_ids=["here"],
+        tags=None,
+        input_lengths=torch.tensor([1]),
+        sequences={"token_ids": torch.tensor([[1]])},
+        scalars={},
+    )
+    controller = TrainDataDump(str(tmp_path))
+    # Two shards reported a row each; only one part landed on this filesystem.
+    with pytest.raises(RuntimeError, match="must share this filesystem"):
+        controller.finish_step(0, 2)
+    assert not list(tmp_path.glob("*.jsonl"))
+    assert not list(tmp_path.glob("*.partial"))
+    # The honest count still publishes.
+    controller.finish_step(0, 1)
+    assert (tmp_path / "train_data_step1.jsonl").exists()
+
+
+def test_controller_publishes_a_step_it_never_wrote(tmp_path: Path) -> None:
+    """With a pool the controller holds a dump that only ever merges.
+
+    It calls finish_step without a single add_chunk of its own, which the
+    pre-pool writer rejected because it keyed off its own row counter.
+    """
+    worker = TrainDataDump(str(tmp_path), shard_id="7")
+    worker.add_chunk(
+        step=2,
+        sample_ids=["only"],
+        tags=None,
+        input_lengths=torch.tensor([1]),
+        sequences={"token_ids": torch.tensor([[3]])},
+        scalars={},
+    )
+    controller = TrainDataDump(str(tmp_path))
+    controller.finish_step(2)
+    rows = (tmp_path / "train_data_step3.jsonl").read_text().splitlines()
+    assert [json.loads(line)["sample_id"] for line in rows] == [["only"]]
 
 
 @pytest.fixture
