@@ -18,6 +18,11 @@ name: Cherry-pick reminder
 # `cherry-pick`) for every release PR carrying `cherry-pick-to-main`. This
 # posts ONE Slack message listing every such PR still open, pinging rl-oncall
 # and each PR's original author. Silent when nothing is open.
+#
+# Author pings: the author's registered email (GitHub profile email, else the
+# email on the original PR's commits) is resolved to a Slack user via
+# users.lookupByEmail, which needs a bot token (SLACK_BOT_TOKEN, scope
+# users:read.email). Incoming webhooks cannot do this lookup.
 
 on:
   schedule:
@@ -38,6 +43,10 @@ jobs:
   remind:
     if: github.repository == 'NVIDIA-NeMo/RL'
     runs-on: ubuntu-latest
+    # SLACK_TEAM_CHANNEL_WEBHOOK is an environment secret on `main`.
+    environment:
+      name: main
+      deployment: false
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -47,6 +56,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           SLACK_WEBHOOK: ${{ secrets.SLACK_TEAM_CHANNEL_WEBHOOK }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           # rl-oncall Slack usergroup (same one cherry-pick-release-commit.yml pings on failures)
           ONCALL_MENTION: "<!subteam^S0C1W14AHS7>"
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry-run }}
@@ -63,27 +73,59 @@ jobs:
             exit 0
           fi
 
-          # GitHub login -> Slack member ID. Webhooks cannot resolve users, so
-          # logins missing from the map fall back to a plain (non-pinging) @login.
-          MAP=$(jq -c . .github/slack-user-map.json 2>/dev/null || echo '{}')
+          # The bot opens these PRs, so the human is named in the body ("Hi @user",
+          # and "cherry picked #N" for the source PR) and requested as reviewer
+          # (only until they review). Resolve both once, up front.
+          jq 'map(. + {
+                author: (((.body // "") | capture("Hi @(?<u>[A-Za-z0-9-]+)").u)
+                         // (.reviewRequests | map(.login // empty) | first) // null),
+                src: (((.body // "") | capture("cherry picked #(?<n>[0-9]+)").n) // "")
+              })' prs.json > prs_enriched.json
+
+          # GitHub login -> Slack member ID, resolved from the author's registered email.
+          SLACK_IDS='{}'
+          if [[ -n "${SLACK_BOT_TOKEN:-}" ]]; then
+            while IFS=$'\t' read -r LOGIN SRC; do
+              if [[ -z "$LOGIN" ]] || jq -e --arg l "$LOGIN" 'has($l)' <<< "$SLACK_IDS" > /dev/null; then
+                continue
+              fi
+              EMAIL=$(gh api "users/$LOGIN" --jq '.email // empty' 2> /dev/null || true)
+              if [[ -z "$EMAIL" || "$EMAIL" == *noreply* ]] && [[ -n "$SRC" ]]; then
+                EMAIL=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$SRC/commits" \
+                  --jq '[.[].commit.author.email | select(test("noreply") | not)] | first // empty' 2> /dev/null || true)
+              fi
+              if [[ -z "$EMAIL" ]]; then
+                echo "::warning::No usable email found for $LOGIN; falling back to plain @login"
+                continue
+              fi
+              ID=$(curl -sS -G -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+                --data-urlencode "email=$EMAIL" https://slack.com/api/users.lookupByEmail \
+                | jq -r 'select(.ok) | .user.id // empty' || true)
+              if [[ -z "$ID" ]]; then
+                echo "::warning::No Slack user found for $LOGIN's registered email; falling back to plain @login"
+                continue
+              fi
+              SLACK_IDS=$(jq -c --arg l "$LOGIN" --arg i "$ID" '. + {($l): $i}' <<< "$SLACK_IDS")
+            done < <(jq -r '.[] | select(.author) | [.author, .src] | @tsv' prs_enriched.json)
+          else
+            echo "::notice::SLACK_BOT_TOKEN not set; skipping email lookup"
+          fi
+
+          # Optional manual overrides win over the email lookup.
+          STATIC=$(jq -c . .github/slack-user-map.json 2> /dev/null || echo '{}')
+          MAP=$(jq -c -s '.[0] + .[1]' <(echo "$SLACK_IDS") <(echo "$STATIC"))
 
           TEXT=$(jq -r --argjson map "$MAP" --arg oncall "$ONCALL_MENTION" '
             def esc: gsub("&";"&amp;") | gsub("<";"&lt;") | gsub(">";"&gt;") | gsub("`";"") | gsub("\\|";"/");
-            # The bot opens these PRs, so the human is named in the body ("Hi @user")
-            # and requested as reviewer (only while they have not yet reviewed).
-            def author:
-              ((.body // "") | capture("Hi @(?<u>[A-Za-z0-9-]+)").u)
-              // (.reviewRequests | map(.login // empty) | first)
-              // null;
             def who:
-              author as $a
+              .author as $a
               | if $a == null then "unknown author"
                 elif $map[$a] then "<@\($map[$a])>"
                 else "@\($a)" end;
             def age: ((now - (.createdAt | fromdateiso8601)) / 86400 | floor);
             "\($oncall) :cherries: \(length) cherry-pick PR(s) to `main` still open. Please merge so release fixes land on main:\n"
             + (sort_by(.createdAt) | map("• <\(.url)|#\(.number) \(.title | esc)> — \(who) — open \(age)d") | join("\n"))
-          ' prs.json)
+          ' prs_enriched.json)
 
           if [[ "$DRY_RUN" == "true" ]]; then
             { echo "### Dry run — would post:"; echo; echo "$TEXT"; } >> "$GITHUB_STEP_SUMMARY"
