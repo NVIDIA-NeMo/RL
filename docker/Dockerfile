@@ -622,6 +622,9 @@ getent passwd "${RUNTIME_UID}" >/dev/null || useradd --no-log-init --uid "${RUNT
 install -d -o "${RUNTIME_UID}" -g "${RUNTIME_GID}" /home/nemo-runtime /nemo_run \
     "${NEMO_GYM_VENV_DIR}" /opt/nemo-rl-source /opt/nemo_rl_cache/uv /opt/nemo_rl_python
 chown "${RUNTIME_UID}:${RUNTIME_GID}" /opt/nemo-rl "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}"
+# Local build contexts can come from a checkout with umask 0007. COPY preserves those
+# root-owned modes; the runtime UID needs to read source files and traverse directories.
+chmod -R a+rX /opt/nemo-rl
 EOF
 USER ${RUNTIME_UID}:${RUNTIME_GID}
 RUN <<"EOF" bash -exu
