@@ -769,6 +769,18 @@ This expectation is estimated using the rollouts in each global training batch a
 
 We use this to track if our models are experiencing entropy collapse too quickly during training (as is quite common). This is a fairly rough Monte Carlo approximation, so we wouldn't recommend using this directly for an entropy bonus or otherwise backpropagating through this. You can take a look at NeMo Aligner's [implementation](https://github.com/NVIDIA/NeMo-Aligner/blob/main/nemo_aligner/utils/distributed.py#L351) of a full entropy calculation if you're interested (work-in-progress efficient calculation in NeMo RL).
 
+#### Stopping on entropy collapse
+
+`grpo.stop_at_entropy_below` turns the metric into an early stop. When the step's `approx_entropy` has been below the threshold for `grpo.stop_at_entropy_patience` consecutive steps (default 1), training saves a checkpoint and exits, the same way the validation early stop (`stop_at_validation_metric`) does. Both stops can be enabled together; whichever fires first ends the run. The consecutive-step count restarts when a run resumes from a checkpoint.
+
+```yaml
+grpo:
+  stop_at_entropy_below: 0.18
+  stop_at_entropy_patience: 5
+```
+
+The value compared is the step-level `approx_entropy` that is logged. The loss reports it per microbatch already divided by the global token count, so the step value is the sum of the per-microbatch values, not their mean. Supported by `grpo_train`, `async_grpo_train` and the data-plane sync trainer; it requires a loss that reports `approx_entropy` (e.g. `ClippedPGLossFn`) and otherwise warns once and stays inactive.
+
 ### GDPO: Group reward-Decoupled Normalization Policy Optimization for Multi-reward RL Optimization
 GDPO is a reinforcement learning optimization method designed for multi-reward training. While existing approaches commonly apply Group Relative Policy Optimization (GRPO) in multi-reward settings, the authors show that this leads to reward advantages collapse, reducing training signal resolution and causing unstable or failed convergence. GDPO resolves this issue by decoupling reward normalization across individual rewards, preserving their relative differences and enabling more faithful preference optimization. 
 
