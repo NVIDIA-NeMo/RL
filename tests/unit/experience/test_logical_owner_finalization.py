@@ -642,3 +642,24 @@ def test_existing_detectors_mask_only_selected_generation_spans(monkeypatch, tmp
     finally:
         harness.client.close()
         asyncio.run(harness.ledger.close())
+
+
+def test_appended_assistant_uses_real_rl_root_decision(monkeypatch, tmp_path):
+    h = gym_harness.make_capture_harness(
+        monkeypatch, tmp_path, decide_input=decide_capture_input
+    )
+    first = gym_harness.assert_clean(h.post("attempt", gym_harness.HISTORY))
+    rewritten = (
+        gym_harness.HISTORY
+        + first["output"]
+        + [
+            {"role": "assistant", "content": "harness-injected context summary"},
+            {"role": "user", "content": "continue"},
+        ]
+    )
+    gym_harness.assert_clean(h.post("attempt", rewritten))
+    m = h.manifest("attempt")
+    assert len(m.records) == 2 and not m.failures and not m.pending_call_ids
+    assert h.worker_calls[1][0].mode == "candidate"
+    assert h.worker_calls[1][0].parent_call_id == m.records[0].model_call_id
+    assert m.records[1].parent_call_id is None
