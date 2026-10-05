@@ -1,5 +1,4 @@
 #!/bin/bash
-#SBATCH --segment=8
 #SBATCH --nodes=2
 #SBATCH --exclusive
 #SBATCH --account=ACCOUNT

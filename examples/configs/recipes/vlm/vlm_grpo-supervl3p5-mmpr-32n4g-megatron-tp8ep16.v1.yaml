@@ -76,3 +76,5 @@ cluster:
   num_nodes: 32
   gpus_per_node: 4
   segment_size: 8
+grpo:
+  seq_logprob_error_threshold: 2.0
