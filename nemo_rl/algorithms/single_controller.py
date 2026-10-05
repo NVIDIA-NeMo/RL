@@ -204,7 +204,6 @@ from nemo_rl.utils.timer import TimeoutChecker, Timer
 if TYPE_CHECKING:
     from nemo_rl.experience.rollout_reassembler import FinalizedGroup
     from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
-    from nemo_rl.experience.trajectory_logger import TrajectoryLogWriter
 
 Generation = Union[VllmGeneration, SGLangGeneration, MegatronGeneration]
 
@@ -466,15 +465,8 @@ class SingleControllerActor:
         # when Ray deserializes rollout_manager and tq_buffer separately.
         self._rollout_manager._tq_buffer = self._buffer
         self._rollout_recovery_ledger = self._rollout_manager.recovery_ledger
-        self._trajectory_log: Optional[TrajectoryLogWriter] = None
-        if master_config.trajectory_log.enabled:
-            assert master_config.trajectory_log.dir is not None
-            # PyArrow is only needed when logging is enabled.
-            from nemo_rl.experience.trajectory_logger import TrajectoryLogWriter
-
-            self._trajectory_log = TrajectoryLogWriter(
-                root_dir=master_config.trajectory_log.dir
-            )
+        self._trajectory_log = actor_args.trajectory_log_actor
+        self._trajectory_log_refs: list[ray.ObjectRef] = []
 
         # Direct access, deliberately. A getattr default here reads as defensive but
         # buys a silent failure mode: rename or drop the field and
@@ -744,6 +736,11 @@ class SingleControllerActor:
             ):
                 result = await self._run_pumps()
         finally:
+            if self._trajectory_log is not None:
+                try:
+                    ray.kill(self._trajectory_log, no_restart=True)
+                except ray.exceptions.RayError as error:
+                    log.warning("trajectory logger termination failed: %s", error)
             # Outside the span so the job span is flushed too, and off the
             # event loop because the exporter's flush blocks. Shielded, and a
             # cancel swallowed, because teardown is exactly when cancellation
@@ -3189,15 +3186,19 @@ class SingleControllerActor:
                     step_metrics.update(aggregate_step_metrics(policy_result))
                 if value_result is not None:
                     step_metrics.update(_compute_critic_metrics(value_result))
+                if self._logs_trajectory_step(self._train_steps + 1):
+                    assert self._trajectory_log is not None
+                    with self._timer.time("trajectory_log_wait_time", should_log=False):
+                        await asyncio.gather(*self._trajectory_log_refs)
+                        self._trajectory_log_refs.clear()
+                        await self._trajectory_log.commit_step.remote(
+                            self._train_steps + 1
+                        )
                 async with self._data_plane_checkpoint_barrier.mutation(
                     "sample_clears"
                 ) as cut:
                     await self._cleanup_consumed_metas_unlocked(cut, consumed_metas)
                     self._buffer.release_training_claims(consumed_training_claim_ids)
-                if self._logs_trajectory_step(self._train_steps + 1):
-                    assert self._trajectory_log is not None
-                    with self._timer.time("trajectory_log_time", should_log=False):
-                        self._trajectory_log.commit_step(self._train_steps + 1)
                 for _ in range(consumed_group_count):
                     self._buffer_capacity.release()
                 step_metrics.update(
@@ -5206,20 +5207,12 @@ class SingleControllerActor:
             return meta, True
         adv_cfg = self._advantage_cfg
 
-        fields = self._advantage_input_fields()
-        if self._logs_trajectory_step(self._train_steps + 1):
-            assert self._trajectory_log is not None
-            fields.extend(
-                field
-                for field in self._trajectory_log.FETCH_FIELDS
-                if field in (meta.fields or ()) and field not in fields
-            )
         data = await call_data_plane(
             self._dp_client,
             "get_samples",
             sample_ids=meta.sample_ids,
             partition_id=meta.partition_id,
-            select_fields=fields,
+            select_fields=self._advantage_input_fields(),
         )
 
         prompt_ids = tensor_field(data, adv_cfg.prompt_ids_field)
@@ -5392,27 +5385,11 @@ class SingleControllerActor:
             response_advantages.detach().cpu()
         )
 
-        if self._logs_trajectory_step(self._train_steps + 1):
-            assert self._trajectory_log is not None
-            with self._timer.time("trajectory_log_time", should_log=False):
-                self._trajectory_log.record(
-                    meta,
-                    data,
-                    advantages=advantages,
-                    final_sample_mask=final_sample_mask,
-                    step=self._train_steps + 1,
-                    chunk_index=trajectory_chunk_index,
-                    values=kwargs.get("values"),
-                    returns=returns,
-                )
-
         fields_to_put = {adv_cfg.output_field: advantages}
         if not torch.equal(final_sample_mask, sample_mask):
             fields_to_put[adv_cfg.sample_mask_field] = final_sample_mask
-        new_fields = [adv_cfg.output_field]
         if returns is not None:
             fields_to_put[adv_cfg.returns_field] = returns
-            new_fields.append(adv_cfg.returns_field)
 
         async with self._data_plane_checkpoint_barrier.mutation("advantage_writeback"):
             await self._call_dp(
@@ -5421,10 +5398,17 @@ class SingleControllerActor:
                 partition_id=meta.partition_id,
                 fields=fields_for_put(meta, fields_to_put),
             )
-        return (
-            meta.with_fields(new_fields),
-            has_valid_training_tokens,
-        )
+        meta = meta.with_fields(list(fields_to_put))
+        if self._logs_trajectory_step(self._train_steps + 1):
+            assert self._trajectory_log is not None
+            self._trajectory_log_refs.append(
+                self._trajectory_log.record.remote(
+                    meta,
+                    step=self._train_steps + 1,
+                    chunk_index=trajectory_chunk_index,
+                )
+            )
+        return meta, has_valid_training_tokens
 
     # ── utility helpers ────────────────────────────────────────────────────
 
