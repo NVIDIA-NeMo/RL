@@ -553,6 +553,7 @@ class LossPostProcessor:
         dp_size: int,
         enable_seq_packing: bool = False,
         sampling_params: Optional[TrainingSamplingParams] = None,
+        tp_mesh: Optional[DeviceMesh] = None,
     ):
         """Initialize LossPostProcessor.
 
@@ -566,6 +567,9 @@ class LossPostProcessor:
             dp_size: Data parallel size
             enable_seq_packing: Whether sequence packing is enabled
             sampling_params: Sampling parameters
+            tp_mesh: Tensor-parallel mesh; its singleton group permits the
+                existing chunked vocabulary loss to handle unsharded logits.
+                Without one, the local-vocabulary loss stays unchunked.
         """
         self.loss_fn: LossFunction = loss_fn
         self.cfg: PolicyConfig = cfg
@@ -574,6 +578,7 @@ class LossPostProcessor:
         self.dp_size = dp_size
         self.enable_seq_packing = enable_seq_packing
         self.sampling_params = sampling_params
+        self.tp_mesh = tp_mesh
         self._cp_gradient_fanout = (
             cp_size
             if cp_size > 1
@@ -637,10 +642,37 @@ class LossPostProcessor:
                     "context_parallel_size > 1 on the automodel policy worker."
                 )
 
+        # The local-vocabulary path otherwise materializes full FP32 logits and
+        # log_softmax outputs. Reuse the existing chunked autograd implementation
+        # with a singleton TP group rather than inventing a second loss kernel.
+        # ``_tp_target_logprobs`` already chunks a local vocabulary, but it is
+        # plain autograd and so keeps every chunk's FP32 log_softmax alive for
+        # backward; ``ChunkedDistributedLogprob`` recomputes per chunk instead.
+        chunk_size = self.cfg.get("logprob_chunk_size")
+        local_vocab_group = None
+        if (
+            chunk_size is not None
+            and token_layout is None
+            and self.loss_fn.input_type == LossInputType.LOGPROB
+            and not need_top_k_or_top_p_filtering(self.sampling_params)
+            and not isinstance(logits, DTensor)
+        ):
+            if chunk_size <= 0:
+                raise ValueError("logprob_chunk_size must be positive")
+            # Non-DTensor logits carry the full vocabulary whatever the TP size
+            # (some lm_head plans replicate their output), so a world-size-1
+            # group is the correct reduction. Where the mesh cannot supply one,
+            # fall back to the unchunked path rather than failing a valid config.
+            if self.tp_mesh is not None and self.tp_mesh.size() == 1:
+                local_vocab_group = self.tp_mesh.get_group()
+
         # Wrap prepare_loss_input with sampling_params
         prepare_loss_input_wrapped = partial(
             prepare_loss_input,
             sampling_params=self.sampling_params,
+            chunk_size=chunk_size if local_vocab_group is not None else None,
+            vocab_parallel_group=local_vocab_group,
+            vocab_parallel_rank=0 if local_vocab_group is not None else None,
             context_parallel_group=(
                 self.cp_mesh.get_group() if self.cp_size > 1 else None
             ),
@@ -653,6 +685,14 @@ class LossPostProcessor:
                 prepare_fn=prepare_loss_input_wrapped,
                 cu_seqlens_q=processed_inputs.flash_attn_kwargs.cu_seqlens_q,
                 cu_seqlens_q_padded=processed_inputs.flash_attn_kwargs.cu_seqlens_q,
+                # __call__ re-passes these three explicitly per packed sequence,
+                # and a call-site keyword beats a functools.partial keyword, so
+                # setting them only on prepare_fn would silently drop them.
+                vocab_parallel_group=local_vocab_group,
+                vocab_parallel_rank=0 if local_vocab_group is not None else None,
+                context_parallel_group=(
+                    self.cp_mesh.get_group() if self.cp_size > 1 else None
+                ),
             )
             loss, loss_metrics = loss_fn(
                 logits,
