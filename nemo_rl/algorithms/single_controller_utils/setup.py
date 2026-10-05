@@ -63,6 +63,9 @@ from nemo_rl.algorithms.metric_utils import (
     print_setup_timing_summary,
 )
 from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
+from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
+    AdvantageStageConfig,
+)
 from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     algo_config,
@@ -169,6 +172,7 @@ class SingleControllerActorArgs:
     save_state: GRPOSaveState
     last_checkpoint_path: Optional[str]
     finalizer_actors: list[Any]
+    advantage_actors: list[Any]
     # Defaulted fields must follow the required ones above, so these stay last.
     data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = None
     partition_includes_multimodal_fields: bool = False
@@ -2010,6 +2014,20 @@ def setup_single_controller(
             # until every finalizer's process-local TQ client has attached and
             # registered its checkpoint participant.
             ray.get([actor.__ray_ready__.remote() for actor in finalizer_actors])
+
+    advantage_actors: list[Any] = []
+    if master_config.async_rl.num_advantage_workers > 0:
+        from nemo_rl.algorithms.advantage_actor import create_advantage_actors
+
+        # Same ordering constraint as the finalizers above: these attach their
+        # own TQ clients, so they have to exist before the controller configures
+        # checkpoint participants and before any Mooncake restore.
+        advantage_actors = create_advantage_actors(
+            dp_config,
+            AdvantageStageConfig.from_master_config(master_config),
+            advantage_estimator,
+            num_workers=master_config.async_rl.num_advantage_workers,
+        )
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,
         task_to_env=env_handles,
@@ -2064,6 +2082,7 @@ def setup_single_controller(
         bootstrap_identity=bootstrap_identity,
         rollout_checkpoint_load_metrics=rollout_checkpoint_load_metrics,
         finalizer_actors=finalizer_actors,
+        advantage_actors=advantage_actors,
         fleet_monitor=fleet_monitor,
         generation_router=generation_router,
         teacher_worker_groups=teacher_worker_groups,
