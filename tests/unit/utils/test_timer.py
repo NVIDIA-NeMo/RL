@@ -652,6 +652,46 @@ class TestTimeoutChecker:
         # Assert that the checker triggers a save due to timeout
         assert result is True
 
+    def test_fit_last_save_time_uses_slowest_iteration(self, monkeypatch):
+        now = [1000.0]
+        monkeypatch.setattr("nemo_rl.utils.timer.time.time", lambda: now[0])
+        checker = TimeoutChecker(timeout="00:00:10:00", fit_last_save_time=True)
+        checker.start_iterations()
+        now[0] += 100.0
+        checker.mark_iteration()
+        now[0] += 300.0
+        checker.mark_iteration()  # iteration times [100, 300]: mean 200, max 300
+
+        now[0] -= 150.0  # elapsed 250: 250 + 300 < 600
+        assert checker.would_save() is False
+        now[0] += (
+            60.0  # elapsed 310: 310 + 300 >= 600 (a mean-based check would not fire)
+        )
+        assert checker.would_save() is True
+
+    def test_extra_s_is_added_to_predicted_iteration(self, monkeypatch):
+        now = [0.0]
+        monkeypatch.setattr("nemo_rl.utils.timer.time.time", lambda: now[0])
+        checker = TimeoutChecker(timeout="00:00:10:00", fit_last_save_time=True)
+        checker.start_iterations()
+        now[0] += 200.0
+        checker.mark_iteration()  # elapsed 200, slowest iteration 200
+
+        assert checker.would_save() is False  # 200 + 200 < 600
+        assert checker.would_save(extra_s=250.0) is True  # 200 + 200 + 250 >= 600
+        assert checker.check_save(extra_s=0.0) is False
+        assert checker.check_save(extra_s=250.0) is True
+        assert checker.check_save(extra_s=250.0) is False
+
+    def test_extra_s_ignored_without_fit_last_save_time(self, monkeypatch):
+        now = [0.0]
+        monkeypatch.setattr("nemo_rl.utils.timer.time.time", lambda: now[0])
+        checker = TimeoutChecker(timeout="00:00:10:00", fit_last_save_time=False)
+        checker.start_iterations()
+        now[0] += 200.0
+        checker.mark_iteration()
+        assert checker.would_save(extra_s=1000.0) is False
+
     def test_iteration_tracking(self):
         checker = TimeoutChecker()
         checker.start_iterations()
