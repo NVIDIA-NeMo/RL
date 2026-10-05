@@ -15,6 +15,9 @@ For the full list of supported models, see
 - **[Nemotron 3 Nano Omni](nemotron-3-nano-omni.md)** — GRPO for the Nano Omni
   vision-language model on the AutoModel and Megatron backends
   (CLEVR-CoGenT and MMPR-Tiny recipes).
+- **[Nemotron 3.5 Super VL](nemotron-3p5-super-vl.md)** — SuperVL3p5 GRPO with
+  Megatron for CLEVR-CoGenT, MMPR-Tiny, and unified teachers, plus
+  single-controller image-recipe ablations.
 - **[Nemotron 3 Super](nemotron-3-super.md)** — the multi-stage Nemotron 3
   Super post-training recipe (RLVR, SWE, and RLHF stages).
 - **[Nemotron 3 Super Omni Image MOPD](nemotron-3-super-omni-mopd.md)** — image
@@ -31,6 +34,7 @@ For the full list of supported models, see
 
 nemotron-3-nano.md
 nemotron-3-nano-omni.md
+nemotron-3p5-super-vl.md
 nemotron-3.5-lightning.md
 nemotron-3-super.md
 nemotron-3-super-omni-mopd.md
