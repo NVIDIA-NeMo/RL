@@ -1,0 +1,73 @@
+# SuperVL3p5 counterpart of vlm_grpo-nemotron-omni-30ba3b-clevr-2n8g-megatron-tp8ep8.v1.yaml
+# HSG: 16 nodes x 4 GPUs, colocated generation, TP8/EP8/CP1 training.
+defaults: ./vlm_grpo-nemotron-omni-30ba3b-clevr-2n8g-megatron-tp8ep8.v1.yaml
+checkpointing:
+  checkpoint_dir: ${oc.env:MM_TRAINER_RESULTS_DIR}/checkpoints
+  checkpoint_must_save_by: 00:03:15:00
+  save_period: 10
+  keep_top_k: 2
+policy:
+  model_name: ${oc.env:MM_TRAINER_MODEL_PATH}
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template: ${policy.model_name}/chat_template.jinja
+    chat_template_kwargs:
+      enable_thinking: true
+  offload_optimizer_for_logprob: true
+  megatron_cfg:
+    env_vars:
+      # This container's expandable allocator crashes after CUDA IPC consumers release a buffer.
+      PYTORCH_CUDA_ALLOC_CONF: 'expandable_segments:False'
+      TORCH_CUDA_ARCH_LIST: '10.0'
+      NRL_MEGATRON_CHECKPOINT_DIR: ${oc.env:SUPER_MEGATRON_CACHE}
+      NRL_REFIT_BUFFER_MEMORY_RATIO: '0.006'
+      NRL_REFIT_NUM_BUFFERS: '1'
+    checkpoint:
+      async_save: false
+    empty_unused_memory_level: 2
+    freeze_vision_model: true
+    freeze_vision_projection: true
+    freeze_sound_encoder: true
+    freeze_sound_projection: true
+    radio_force_cpe_eval_mode: true
+    fp32_lm_head: true
+    defer_fp32_logits: true
+    moe_router_dtype: fp32
+    distributed_data_parallel_config:
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+  router_replay:
+    enabled: false
+  generation:
+    vllm_cfg:
+      # One complete Super engine per HSG node; no cross-node tensor parallelism.
+      tensor_parallel_size: 4
+      expert_parallel_size: 4
+      fp32_lm_head: true
+      enforce_eager: true
+      env_vars:
+        PYTORCH_CUDA_ALLOC_CONF: 'expandable_segments:False'
+        VLLM_TRITON_FORCE_FIRST_CONFIG: '1'
+        NRL_REFIT_BUFFER_MEMORY_RATIO: '0.006'
+        NRL_REFIT_NUM_BUFFERS: '1'
+    vllm_kwargs:
+      disable_custom_all_reduce: true
+      attention_backend: FLASHINFER
+      mm_encoder_attn_backend: FLASH_ATTN
+      kernel_config:
+        enable_flashinfer_autotune: false
+        moe_backend: flashinfer_cutlass
+logger:
+  log_dir: ${oc.env:MM_TRAINER_RESULTS_DIR}/logs
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    entity: nvidia
+    project: rohit-unified-teacher-supervl3p5
+    name: ${oc.env:MM_TRAINER_WANDB_ID}
+    id: ${oc.env:MM_TRAINER_WANDB_ID}
+    resume: allow
+cluster:
+  num_nodes: 16
+  gpus_per_node: 4
+  segment_size: 8
