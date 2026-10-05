@@ -623,6 +623,20 @@ grpo:
 
 Set `overlong_filtering` to true when training on tasks where truncation at the maximum sequence length is expected, such as long-form reasoning or mathematical proofs.
 
+#### Per-Agent Loss Weights
+
+When one NeMo-Gym batch mixes several agents (for example short single-step tool-use tasks next to long multi-turn agentic traces), token-level loss normalization gives each agent a share of the gradient proportional to its trained tokens. A 250-token rollout next to a 25,000-token rollout contributes about 1% of the update, so a short-episode environment can stop moving even though its rewards carry signal.
+
+`agent_loss_weights` maps an agent name (the rollout's `agent_ref.name`) to a weight $w_a$. Right before the policy update, each sample's mask becomes $m_i \cdot w_{a(i)}$; agents that are not listed keep weight 1. The loss normalizer sums the same weighted mask, so the weights are relative: they change each agent's share of the gradient, not its overall scale. Baselines, advantages, and dynamic sampling are computed before weighting and are unchanged.
+
+```yaml
+grpo:
+  agent_loss_weights:
+    short_tool_use_agent: 8.0
+```
+
+Each step logs `agent_loss_weights/<agent>/{weight,num_samples,token_share_unweighted,token_share_weighted}` so the effective mix is visible. The option requires the NeMo-Gym rollout path and is applied by `grpo_train` and `async_grpo_train`; the data-plane and SingleController trainers reject it.
+
 #### Advantage Clipping
 
 After advantage normalization, per-token advantages can become very large when the per-prompt reward standard deviation is small. The optional `advantage_clip_low` and `advantage_clip_high` parameters clamp normalized advantages to a bounded range before policy training.
