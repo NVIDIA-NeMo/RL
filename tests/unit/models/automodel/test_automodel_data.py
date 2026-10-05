@@ -370,6 +370,53 @@ class TestProcessMicrobatch:
         assert "cu_seqlens" in result.flash_attn_kwargs
         assert result.vlm_kwargs == {}
 
+    @pytest.mark.parametrize(
+        "train_mb_tokens,expected_min_seq_len",
+        [
+            (256, 256),  # packed length 204 fits: pad up to train_mb_tokens
+            (128, 208),  # oversized bin: round 204 up to a multiple of 16
+        ],
+    )
+    @patch("nemo_rl.models.automodel.data.pack_sequences")
+    @patch("nemo_rl.models.automodel.data.get_flash_attention_kwargs")
+    def test_sequence_packing_min_seq_len(
+        self,
+        mock_get_flash_attn,
+        mock_pack_sequences,
+        mock_tokenizer,
+        train_mb_tokens,
+        expected_min_seq_len,
+    ):
+        mb = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 1000, (4, 64)),
+                "input_lengths": torch.tensor([32, 48, 60, 64]),
+                "sample_mask": torch.ones(4, dtype=torch.bool),
+            }
+        )
+        cfg = {
+            "dtensor_cfg": {"sequence_parallel": False},
+            "sequence_packing": {"train_mb_tokens": train_mb_tokens},
+            "make_sequence_length_divisible_by": 16,
+        }
+        mock_pack_sequences.return_value = (
+            torch.randint(0, 1000, (1, expected_min_seq_len)),
+            torch.arange(expected_min_seq_len).unsqueeze(0),
+            None,
+        )
+        mock_get_flash_attn.return_value = {
+            "cu_seqlens": torch.tensor([0, 32, 80, 140, 204])
+        }
+
+        process_microbatch(
+            mb=mb,
+            tokenizer=mock_tokenizer,
+            enable_seq_packing=True,
+            cfg=cfg,
+        )
+
+        assert mock_pack_sequences.call_args[1]["min_seq_len"] == expected_min_seq_len
+
     def test_with_multimodal_inputs(self, mock_tokenizer):
         image = torch.randn(1, 3, 224, 224)
         pixel_row = PackedTensor(image, dim_to_pack=0).enable_deduplication()

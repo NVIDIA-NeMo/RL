@@ -57,5 +57,4 @@ def test_knapsack_packers_keep_common_interface_constraints(
 ) -> None:
     packer = packer_type(10, max_sequences_per_bin=1)
     assert packer.pack([4, 3, 2]) == [[0], [1], [2]]
-    with pytest.raises(ValueError, match="exceeds bin capacity"):
-        packer_type(10).pack([11])
+    assert packer_type(10).pack([11, 4]) == [[0], [1]]
