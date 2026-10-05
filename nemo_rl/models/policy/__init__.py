@@ -290,6 +290,7 @@ class MegatronOptimizerConfig(TypedDict):
     sgd_momentum: float
     # distributed optimizer
     use_distributed_optimizer: bool
+    use_layer_wise_distributed_optimizer: NotRequired[bool]
     use_precision_aware_optimizer: bool
     clip_grad: float
     # knob to enable optimizer cpu offload
@@ -499,6 +500,9 @@ class MegatronConfig(TypedDict):
     # Create gloo process groups during Megatron distributed init.
     # Omitted: use the Megatron Bridge default.
     use_gloo_process_groups: NotRequired[bool]
+    # False selects compact gradients with whole-matrix optimizer ownership.
+    # Requires a layer-wise optimizer and use_distributed_optimizer=False.
+    use_layer_wise_param_layout: NotRequired[bool]
     # Enable grouped GEMM for MoE experts via CUTLASS. Significant throughput
     # gain when multiple experts are assigned per rank (num_local_experts > 1).
     # Requires TE >= 1.11.0 for FP8 and Ampere (sm_80) or newer.

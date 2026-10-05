@@ -146,7 +146,8 @@ class BatchedDataDict(UserDict, Generic[DictT]):
     ) -> dict[str, Any]:
         """Return the multimodal fields as a dict.
 
-        Four cases per (k, v):
+        Five cases per (k, v):
+          * ``cu_seqlens`` / ``cu_seqlens_padded`` — packing metadata, skip.
           * ``PackedTensor`` — in-memory form, keep as-is.
           * ``k`` in ``PACKED_MULTIMODAL_FIELDS`` — data-plane wire form,
             which cannot be rebuilt here: raises. ``codec.materialize``
@@ -187,6 +188,8 @@ class BatchedDataDict(UserDict, Generic[DictT]):
 
         result: dict[str, Any] = {}
         for k, v in self.data.items():
+            if k in ("cu_seqlens", "cu_seqlens_padded"):
+                continue
             if isinstance(v, PackedTensor):
                 # In-memory PackedTensor (or a per-token field a caller
                 # happened to wrap; matches the pre-refactor behavior of
