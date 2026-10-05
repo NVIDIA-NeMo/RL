@@ -22,6 +22,10 @@ grpo:
   stop_at_validation_metric: null
   # Required when stop_at_validation_metric is set.
   stop_at_validation_threshold: null
+  # Early stop once train approx_entropy stays below this value for
+  # stop_at_entropy_patience consecutive steps; null disables.
+  stop_at_entropy_below: null
+  stop_at_entropy_patience: 1
   val_batch_size: 256
   seed: 42
   use_dynamic_sampling: false

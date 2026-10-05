@@ -48,6 +48,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 
 # Re-imports from grpo so this file is a thin trainer-only fork.
 from nemo_rl.algorithms.grpo import (
+    EntropyFloorStop,
     GRPOSaveState,
     MasterConfig,
     _clip_grpo_advantages,
@@ -58,6 +59,7 @@ from nemo_rl.algorithms.grpo import (
     _policy_dtype,
     _resolve_logprob_skip_flags,
     _should_log_nemo_gym_responses,
+    _step_approx_entropy,
     _validation_early_stop_message,
     compute_and_apply_seq_logprob_error_masking,
     refit_policy_generation,
@@ -516,6 +518,7 @@ def grpo_train_sync(
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
     stop_at_validation_threshold = master_config.grpo.stop_at_validation_threshold
     stop_at_validation_metric = master_config.grpo.stop_at_validation_metric
+    entropy_floor_stop = EntropyFloorStop.from_config(master_config.grpo)
 
     # ── Data-plane setup (mandatory in the sync trainer) ───────────────
     # Sync trainer requires a TQ-mediated policy. The TQPolicy actor
@@ -1119,7 +1122,11 @@ def grpo_train_sync(
                         and (current_step + 1 == len(wrapped_dataloader))
                     )
 
-                early_stop_message: Optional[str] = None
+                # The entropy floor is known right after training; a validation
+                # early stop below can also end the run.
+                early_stop_message: Optional[str] = entropy_floor_stop.update(
+                    _step_approx_entropy(train_results)
+                )
                 if (
                     val_period > 0
                     and (total_steps + 1) >= val_start_at
@@ -1154,10 +1161,12 @@ def grpo_train_sync(
                     logger.log_metrics(
                         val_metrics, total_steps + 1, prefix="validation"
                     )
-                    early_stop_message = _validation_early_stop_message(
-                        val_metrics,
-                        stop_at_validation_threshold,
-                        stop_at_validation_metric,
+                    early_stop_message = early_stop_message or (
+                        _validation_early_stop_message(
+                            val_metrics,
+                            stop_at_validation_threshold,
+                            stop_at_validation_metric,
+                        )
                     )
                     if early_stop_message is not None:
                         # Exit at the end of this step, after checkpointing.
