@@ -960,6 +960,14 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
 
             if self.should_disable_forward_pre_hook:
                 self.disable_forward_pre_hook()
+            if self.scheduler is not None:
+                # Megatron-Bridge copies consumed_train_samples into scheduler.num_steps
+                # on checkpoint resume (override_opt_param_scheduler). This is defined
+                # as RL steps x GBS, where GBS is consistent with Bridge thus this
+                # normalizes the warmup and decay to RL steps instead of samples.
+                self.mcore_state.train_state.consumed_train_samples = (
+                    self.scheduler.num_steps
+                )
 
             # Save Megatron backbone checkpoint
             save_checkpoint(

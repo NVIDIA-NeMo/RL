@@ -492,3 +492,22 @@ class TestAudioMCQProcessor:
         assert vllm_audio.shape == (expected_num_samples,)
         assert np.array_equal(vllm_audio[:num_samples], audio)
         assert not vllm_audio[num_samples:].any()
+
+    def test_load_response_dataset_passes_pad_audio_to_hop_length_to_task_spec(
+        self, monkeypatch, tmp_path
+    ):
+        from nemo_rl.data.datasets.response_datasets import load_response_dataset
+
+        snapshot_root = _build_fixture_snapshot(tmp_path, [_row(0)])
+        _patch_snapshot(monkeypatch, snapshot_root)
+
+        dataset = load_response_dataset(
+            {
+                "dataset_name": "audiomcq",
+                "max_samples": 1,
+                "processor": "vlm_hf_data_processor",
+                "pad_audio_to_hop_length": True,
+            }
+        )
+
+        assert dataset.task_spec.pad_audio_to_hop_length is True

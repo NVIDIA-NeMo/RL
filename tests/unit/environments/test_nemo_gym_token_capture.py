@@ -521,7 +521,10 @@ def test_setup_nemo_gym_config_megatron_keeps_async_rollout_check_satisfied() ->
 def test_setup_nemo_gym_config_dynamo_exposes_http_server_via_vllm_cfg() -> None:
     """Dynamo serves Gym through the vllm_cfg HTTP server settings."""
     from nemo_rl.algorithms.grpo import MasterConfig
-    from nemo_rl.environments.nemo_gym import setup_nemo_gym_config
+    from nemo_rl.environments.nemo_gym import (
+        setup_nemo_gym_config,
+        should_use_nemo_gym,
+    )
 
     config = MasterConfig.model_construct(
         env={"should_use_nemo_gym": True},
@@ -538,3 +541,4 @@ def test_setup_nemo_gym_config_dynamo_exposes_http_server_via_vllm_cfg() -> None
     vllm_cfg = config.policy["generation"]["vllm_cfg"]
     assert vllm_cfg["async_engine"] is True
     assert vllm_cfg["expose_http_server"] is True
+    assert should_use_nemo_gym(config) is True
