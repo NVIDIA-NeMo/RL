@@ -509,7 +509,7 @@ def automodel_forward_backward(
                     ## scale by the number of global batches so we get the correct
                     ## value when summing metrics across all microbatches
                     for k in metrics.keys():
-                        if "_min" in k or "_max" in k:
+                        if k.endswith(("_min", "_max")):
                             continue
 
                         metrics[k] /= num_global_batches

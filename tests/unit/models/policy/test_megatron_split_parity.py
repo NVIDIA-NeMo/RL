@@ -152,9 +152,9 @@ def _run_split(
 
 def _reduce_metric(key: str, values: list) -> float:
     """Collapse a per-microbatch metric list the way grpo.py's reducer does."""
-    if "_min" in key:
+    if key.endswith("_min"):
         return float(np.min(values))
-    if "_max" in key:
+    if key.endswith("_max"):
         return float(np.max(values))
     if key in ("lr", "wd", "global_valid_seqs", "global_valid_toks"):
         return float(np.mean(values))
