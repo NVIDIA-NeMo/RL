@@ -75,10 +75,10 @@ def main(config: MasterConfig) -> None:
     init_ray()
     cluster = RayVirtualCluster(
         name="single_update_cluster",
-        bundle_ct_per_node_list=[config.cluster["gpus_per_node"]]
-        * config.cluster["num_nodes"],
+        bundle_ct_per_node_list=[config.cluster.gpus_per_node]
+        * config.cluster.num_nodes,
         use_gpus=True,
-        num_gpus_per_node=config.cluster["gpus_per_node"],
+        num_gpus_per_node=config.cluster.gpus_per_node,
         max_colocated_worker_groups=1
         if policy_config["generation"]["backend"] == "megatron"
         else 2,
@@ -114,7 +114,7 @@ def main(config: MasterConfig) -> None:
 
     # 4.2) Run a method on all workers in parallel with different data
     print("\n▶ Running a method on all workers in parallel with different data...")
-    worker_nums = config.cluster["gpus_per_node"] * config.cluster["num_nodes"]
+    worker_nums = config.cluster.gpus_per_node * config.cluster.num_nodes
     input_list = [i for i in range(worker_nums)]
     results = policy.run_all_workers_multiple_data("return_input", input=input_list)
     print(f"  ✓ Results for return_input: {results}")

@@ -1773,13 +1773,6 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
         getattr(model_cfg, "nemotron_omni_contract", None)
         == _NEMOTRON_OMNI_EXPANDED_SEQUENCE_CONTRACT
     ):
-        if attention_backend == "flash":
-            raise ValueError(
-                "Nemotron Omni's expanded-sequence contract does not support "
-                "attention_backend='flash' in NeMo-RL because packed batches can "
-                "contain multiple padded THD rows. Use attention_backend='auto' "
-                "or omit the setting."
-            )
         if attention_backend is None:
             attention_backend = "auto"
 
