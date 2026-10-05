@@ -355,6 +355,33 @@ def test_finish_training_updates_eval_cache_before_parameter_offload(
     )
 
 
+def test_resident_value_lifecycle_never_moves_model_or_optimizer():
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        MegatronValueWorkerImpl,
+    )
+
+    model = MagicMock()
+    worker = SimpleNamespace(
+        _train_step_state=None,
+        model=model,
+        optimizer=object(),
+        optimizer_cpu_offload=False,
+        cfg={"megatron_cfg": {"empty_unused_memory_level": 0}},
+        move_model=MagicMock(side_effect=AssertionError("model moved")),
+        move_optimizer=MagicMock(side_effect=AssertionError("optimizer moved")),
+    )
+
+    MegatronValueWorkerImpl.prepare_for_training(worker, keep_resident=True)
+    MegatronValueWorkerImpl.prepare_for_inference(worker, keep_resident=True)
+    MegatronValueWorkerImpl.finish_inference(worker, keep_resident=True)
+    MegatronValueWorkerImpl.finish_training(worker, keep_resident=True)
+
+    assert model.train.call_count == 1
+    assert model.eval.call_count == 2
+    worker.move_model.assert_not_called()
+    worker.move_optimizer.assert_not_called()
+
+
 def test_split_value_accepts_uneven_packed_dp_shard():
     from nemo_rl.models.value.workers.megatron_value_worker import (
         MegatronValueWorkerImpl,

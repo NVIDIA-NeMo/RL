@@ -20,6 +20,11 @@ ppo:
   invalid_tool_call_advantage: null
   malformed_thinking_advantage: null
 
+value:
+  resources:
+    dedicated: false
+    num_nodes: null
+
 # Reward-zeroing penalties applied to NeMo-Gym rollout results.
 reward_penalties:
   penalize_duplicated_reasoning: false
