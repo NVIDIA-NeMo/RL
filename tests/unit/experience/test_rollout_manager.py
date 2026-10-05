@@ -1023,6 +1023,16 @@ def test_result_to_completion_keeps_mask_flag_when_gate_on():
     assert completion.env_extras["instance_config"]["mask_sample"] is True
 
 
+@pytest.mark.parametrize(
+    "status, expected", [("incomplete", True), ("completed", False)]
+)
+def test_result_to_completion_reads_terminal_truncation_status(status, expected):
+    result = _mask_gate_result()
+    result["full_result"]["response"] = {"status": status}
+    completion = _nemo_gym_impl(True)._results_to_completions([result])[0][0]
+    assert completion.truncated is expected
+
+
 def test_result_to_completion_drops_mask_flag_when_gate_off():
     completion = _nemo_gym_impl(False)._results_to_completions([_mask_gate_result()])[
         0
