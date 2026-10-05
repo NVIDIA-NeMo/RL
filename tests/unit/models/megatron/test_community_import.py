@@ -16,6 +16,7 @@
 
 import importlib
 import os
+import pickle
 import sys
 import time
 from types import ModuleType, SimpleNamespace
@@ -126,10 +127,18 @@ def test_iter_vlm_config_overrides_yields_super35_runtime_values(monkeypatch):
 
 
 def _stage_conversion(path) -> None:
-    """Materialize a complete conversion layout (iter_0000000/run_config.yaml)."""
+    """Materialize conversion config, metadata, and a nonempty tensor shard."""
     os.makedirs(os.path.join(str(path), "iter_0000000"), exist_ok=True)
     with open(os.path.join(str(path), "iter_0000000", "run_config.yaml"), "w") as f:
         f.write("{}\n")
+    iteration = os.path.join(str(path), "iter_0000000")
+    with open(os.path.join(iteration, "__0_0.distcp"), "wb") as f:
+        f.write(b"checkpoint tensors")
+    metadata = SimpleNamespace(
+        storage_data={"weight": SimpleNamespace(relative_path="__0_0.distcp")}
+    )
+    with open(os.path.join(iteration, ".metadata"), "wb") as f:
+        pickle.dump(metadata, f)
 
 
 def test_import_model_from_hf_name_calls_bridge_save(monkeypatch, tmp_path):
@@ -235,3 +244,34 @@ def test_publish_conversion(monkeypatch, tmp_path, occupant, overwrite, staged_w
     ) != ["ckpt"]:
         time.sleep(0.01)
     assert sorted(p.name for p in tmp_path.iterdir()) == ["ckpt"]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "missing_metadata",
+        "invalid_metadata",
+        "empty_metadata",
+        "missing_shard",
+        "empty_shard",
+    ],
+)
+def test_conversion_requires_all_metadata_referenced_shards(
+    monkeypatch, tmp_path, failure
+):
+    module = _load_community_import_module(monkeypatch)
+    _stage_conversion(tmp_path)
+    iteration = tmp_path / "iter_0000000"
+    if failure == "missing_metadata":
+        (iteration / ".metadata").unlink()
+    elif failure == "invalid_metadata":
+        (iteration / ".metadata").write_bytes(b"invalid pickle")
+    elif failure == "empty_metadata":
+        (iteration / ".metadata").write_bytes(
+            pickle.dumps(SimpleNamespace(storage_data={}))
+        )
+    elif failure == "missing_shard":
+        (iteration / "__0_0.distcp").unlink()
+    else:
+        (iteration / "__0_0.distcp").write_bytes(b"")
+    assert not module.megatron_conversion_is_complete(str(tmp_path))
