@@ -52,7 +52,7 @@ from every statistic, matching what the advantage estimator trains on.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 
@@ -73,6 +73,36 @@ _PASS_THRESHOLD = 0.5
 def new_rollout_stats_accumulator() -> dict[str, list[torch.Tensor]]:
     """Fresh per-step accumulator: one CPU tensor per advantage-stage chunk."""
     return {key: [] for key in ROLLOUT_STATS_KEYS}
+
+
+def stats_accumulator_to_rpc(
+    acc: dict[str, list[torch.Tensor]],
+) -> dict[str, list[list[Any]]]:
+    """One call's rollout/masking-stats accumulator as plain per-row lists.
+
+    The advantage stage returns this across the actor RPC, where tensors are
+    not allowed. Every entry is one scalar per row (no token dimension), so a
+    call carries a few hundred numbers per key.
+    """
+    return {key: [chunk.tolist() for chunk in chunks] for key, chunks in acc.items()}
+
+
+def merge_stats_accumulator(
+    acc: dict[str, list[torch.Tensor]], part: dict[str, list[list[Any]]]
+) -> None:
+    """Fold one call's ``stats_accumulator_to_rpc`` output into ``acc``.
+
+    The advantage stage runs per call, possibly on several actors. Group ids in
+    ``part`` are only unique within the call, so they are shifted past the
+    largest id already in ``acc``. ``torch.tensor`` restores each chunk's dtype
+    (bool flags, integer group ids, float values).
+    """
+    offset = int(acc["group_ids"][-1].max()) + 1 if acc["group_ids"] else 0
+    for key, chunks in part.items():
+        tensors = [torch.tensor(chunk) for chunk in chunks]
+        if key == "group_ids":
+            tensors = [chunk + offset for chunk in tensors]
+        acc[key].extend(tensors)
 
 
 def per_sample_rollout_stats(token_mask: torch.Tensor) -> dict[str, torch.Tensor]:
