@@ -5238,6 +5238,62 @@ def test_grpo_exit_on_timeout(mock_grpo_components, train_func, capsys, tmp_path
             )
 
 
+def test_grpo_timeout_budgets_upcoming_validation(mock_grpo_components, tmp_path):
+    """grpo_train passes the slowest step time as extra_s when the next step validates."""
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 6
+    master_config.grpo.max_num_epochs = 10
+    master_config.grpo.val_period = 3
+    master_config.checkpointing["enabled"] = False
+    grpo_save_state = _initial_grpo_save_state()
+
+    mock_rollout_metrics = {
+        "mean_gen_tokens_per_sample": 10.0,
+        "max_gen_tokens": 20,
+        "min_gen_tokens": 5,
+    }
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+
+    with (
+        patch("nemo_rl.algorithms.grpo.TimeoutChecker") as mock_timeout_class,
+        patch(
+            "nemo_rl.algorithms.grpo.run_multi_turn_rollout",
+            return_value=(mock_batch, mock_rollout_metrics),
+        ),
+        patch(
+            "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
+            return_value=_mock_seq_logprob_error_result(),
+        ),
+        patch("nemo_rl.algorithms.grpo.validate", return_value=({}, {})),
+    ):
+        mock_timeout_instance = MagicMock()
+        mock_timeout_instance.iteration_times = [10.0, 30.0, 20.0]
+        mock_timeout_instance.check_save.return_value = False
+        mock_timeout_class.return_value = mock_timeout_instance
+
+        grpo_train(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            grpo_save_state,
+            master_config,
+        )
+
+    # Steps 3 and 6 validate, so the checks after steps 2 and 5 budget for it.
+    extra_s = [
+        call.kwargs["extra_s"]
+        for call in mock_timeout_instance.check_save.call_args_list
+    ]
+    assert extra_s == [0.0, 30.0, 0.0, 0.0, 30.0, 0.0]
+
+
 # ============================================================================
 # Tests for GRPOAdvantageEstimator class
 # ============================================================================

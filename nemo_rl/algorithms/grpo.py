@@ -3905,7 +3905,18 @@ def _grpo_train_impl(
                     )
                 )
                 # Check if timeout-based checkpointing is enabled in config.
-                should_save_by_timeout = timeout.check_save()
+                # If the next step also runs validation, budget one more step's worth of
+                # time for it so we do not start a step that cannot finish in time.
+                next_step_validates = (
+                    val_period > 0
+                    and (total_steps + 2) >= val_start_at
+                    and (total_steps + 2) % val_period == 0
+                )
+                should_save_by_timeout = timeout.check_save(
+                    extra_s=max(timeout.iteration_times)
+                    if next_step_validates and timeout.iteration_times
+                    else 0.0
+                )
 
                 memory_tracker.snapshot_start_of_stage("Checkpointing", dir())
                 if master_config.checkpointing["enabled"] and (
