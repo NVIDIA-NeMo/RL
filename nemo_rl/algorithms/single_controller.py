@@ -216,6 +216,7 @@ from nemo_rl.utils.logger import (
     Logger,
     should_log_nemo_gym_full_result_tables,
 )
+from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.train_data_dump import TrainDataDump
 
@@ -2923,6 +2924,9 @@ class SingleControllerActor:
         selection_kwargs = self._streaming_ppo_selection_kwargs()
 
         while self._train_steps < self._algo_cfg.max_num_steps:
+            maybe_gpu_profile_step(self._trainer, self._train_steps + 1)
+            if self._gen is not self._trainer:
+                maybe_gpu_profile_step(self._gen, self._train_steps + 1)
             version_during_step = self._trainer_version
             groups_dispatched = 0
             evicted_stale_prompt_groups = 0
