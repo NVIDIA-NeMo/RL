@@ -29,7 +29,7 @@ Recorded on 2026-10-04. These pins describe the active HSG checkouts; local patc
 | Native engine token/media capture and image-tool URL propagation | Patched Gym checkout and `examples/nemo_gym/supervl3p5` | Required for the current Gym rollout path; keep both directories available |
 | Image Python dependencies and MCore helpers | Existing per-node setup script | Lens, media dependencies, worker venvs, and the runtime vLLM patch must be ready before workers start |
 
-These changes do not establish that the remaining raw TMPE outliers are fixed. The recipe fixes and SA-V verifier are committed on the working branch. Gym commit `c004bce8` is published in `rohitrango/Gym` on branch `rohit/unified-teacher-supervl3p5`; `.gitmodules` selects that fork. Publishing the same branch in `NVIDIA-NeMo/Gym` requires repository write access. The image still needs the per-node HSG setup. A container digest, Super conversion round-trip, and held-out evaluation remain release tasks.
+These changes do not establish that the remaining raw TMPE outliers are fixed. The recipe fixes and SA-V verifier are committed on the working branch. Gym commit `c004bce8` is published in `NVIDIA-NeMo/Gym` on branch `rohit/unified-teacher-supervl3p5`; `.gitmodules` selects that repository and branch. The image still needs the per-node HSG setup. A container digest, Super conversion round-trip, and held-out evaluation remain release tasks.
 
 ## HSG paths
 
