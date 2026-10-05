@@ -39,6 +39,7 @@ from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     PromptGroupPhase,
     PromptGroupRecoveryRecord,
+    PromptGroupStatus,
     PromptRef,
     RecoveryGranularity,
     RolloutAttemptRecord,
@@ -116,6 +117,82 @@ def test_cc_recovery_disk_round_trip_retains_completed_evidence(tmp_path: Path) 
         != ledger.get_group("g7").siblings[1].current_attempt.attempt_id
     )
     assert retried.siblings[1].current_attempt.logical_selection is None
+
+
+@pytest.mark.parametrize("pending", [False, True])
+def test_masked_cc_sibling_round_trip_preserves_pending_custody(
+    tmp_path: Path, pending: bool
+) -> None:
+    ledger = _cc_sealed_ledger()
+    owner = ledger.get_group("g7").gate_rollout_id(1)
+    receipt = {
+        "rollout_id": owner,
+        "manifest": [{"model_call_id": "done", "staging_key": f"{owner}/done"}],
+        "attempted_call_ids": ["done", "failed"],
+        "pending_call_ids": ["failed"] if pending else [],
+        "capture_poisoned": True,
+        "failure_reason": "capture_incomplete",
+    }
+    _mutate(
+        lambda cut: ledger.mark_sibling_sealed(
+            cut,
+            "g7",
+            generation_index=1,
+            gate_rollout_id=owner,
+            receipt=receipt,
+            reward=0.0,
+            mask_sample=True,
+            logical_selection=RolloutSelection((), ()),
+        )
+    )
+    state = ledger.state_dict()
+    path = tmp_path / "masked-recovery.pt"
+    torch.save(state, path)
+    restored = RolloutRecoveryLedger.from_state_dict(
+        torch.load(path, weights_only=True)
+    )
+    _bind(restored, "g7", _prompt())
+    assert restored.state_dict() == state
+    _mutate(lambda cut: restored.prepare_for_restart(cut))
+    group = restored.get_group("g7")
+    assert group.status is PromptGroupStatus.READY_TO_FINALIZE
+    assert group.siblings == ledger.get_group("g7").siblings
+    assert group.siblings[1].current_attempt.receipt == receipt
+    assert group.siblings[1].current_attempt.logical_selection == RolloutSelection(
+        (), ()
+    )
+    assert f"{owner}/done" in restored.expected_staging_keys(required_only=True)
+    assert (f"{owner}/failed" in restored.expected_staging_keys()) is not pending
+    assert f"{owner}/failed" not in restored.expected_staging_keys(required_only=True)
+
+
+def test_empty_cc_selection_requires_poisoned_receipt_on_seal_and_restore() -> None:
+    ledger = _cc_sealed_ledger()
+    group = ledger.get_group("g7")
+    owner = group.gate_rollout_id(1)
+    state = ledger.state_dict()
+    with pytest.raises(
+        ValueError, match="Empty CC selection requires poisoned capture"
+    ):
+        _mutate(
+            lambda cut: ledger.mark_sibling_sealed(
+                cut,
+                "g7",
+                generation_index=1,
+                gate_rollout_id=owner,
+                receipt={"rollout_id": owner, "manifest": []},
+                reward=1.0,
+                mask_sample=False,
+                logical_selection=RolloutSelection((), ()),
+            )
+        )
+    assert ledger.state_dict() == state
+    saved = state["groups"][0]["siblings"][0]["attempts"][0]
+    saved["logical_selection"] = dataclasses.asdict(RolloutSelection((), ()))
+    with pytest.raises(
+        ValueError, match="Empty CC selection requires poisoned capture"
+    ):
+        RolloutRecoveryLedger.from_state_dict(state)
 
 
 @pytest.mark.parametrize(

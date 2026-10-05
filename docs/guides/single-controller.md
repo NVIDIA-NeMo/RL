@@ -143,9 +143,11 @@ capture schema and its paired Gym/RL requirements are unchanged.
 Existing sibling/prompt-group policies apply to controller retries and cold
 restart. The default sibling policy preserves sealed siblings and regenerates
 only unfinished ones. This does not resume an in-progress Gym tool or guarantee
-exactly-once external side effects. A receipt reporting unresolved capture
-acknowledgements stops the run without retrying or clearing uncertain writes;
-other retries use a fresh attempt identity, never replay the old HTTP request.
+exactly-once external side effects. An unpoisoned receipt reporting unresolved
+capture acknowledgements stops the run without retrying or clearing uncertain
+writes. A poisoned receipt may retain pending call IDs and an empty selection
+across recovery; those pending calls are excluded from attempt cleanup.
+Other retries use a fresh attempt identity, never replay the old HTTP request.
 Megatron training resume
 loads policy RNG and preserves it across reference-model/wrapper initialization;
 fresh initialization is unchanged.

@@ -36,7 +36,9 @@ from tests.unit.experience.test_logical_owner_finalization import (
     gym_harness,
 )
 from tests.unit.experience.test_rollout_generation_failures import (
-    _FakeGymMethod, _gym_rows, _make_gym_impl,
+    _FakeGymMethod,
+    _gym_rows,
+    _make_gym_impl,
 )
 from tests.unit.experience.test_rollout_manager import (
     _FakeCaptureBuffer,
@@ -163,7 +165,9 @@ def test_cc_seals_failed_owner_without_claiming_its_pending_write():
         receipts = [
             {
                 "rollout_id": rollout_ids[0],
-                "manifest": [{"model_call_id": "good", "staging_key": f"{rollout_ids[0]}/good"}],
+                "manifest": [
+                    {"model_call_id": "good", "staging_key": f"{rollout_ids[0]}/good"}
+                ],
             },
             {
                 "rollout_id": rollout_ids[1],
