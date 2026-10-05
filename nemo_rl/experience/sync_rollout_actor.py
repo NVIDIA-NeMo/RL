@@ -149,6 +149,7 @@ class SyncRolloutActor:
         finish_generation: bool = True,
         task_to_env_override: Optional[dict[str, EnvironmentInterface]] = None,
         carry_keys: Optional[list[str]] = None,
+        allow_straggler_cutoff: bool = False,
     ) -> tuple[
         KVBatchMeta,
         dict[str, Any],
@@ -207,6 +208,9 @@ class SyncRolloutActor:
                 (training uses this). Validation passes a slim list
                 (e.g. ``["total_reward"]``) to avoid wasting Ray transfer
                 on fields it doesn't consume.
+            allow_straggler_cutoff: Let ``env.nemo_gym.straggler_cutoff`` (if
+                enabled) cancel the batch's slowest NeMo-Gym rollouts. Training
+                passes ``True``; validation leaves it off.
 
         Returns:
             ``(meta, driver_carry, rollout_metrics, generation_logger_metrics)``
@@ -270,6 +274,7 @@ class SyncRolloutActor:
                 thinking_tags=get_nemo_gym_thinking_tags(cfg.env),
                 deduplicate_multimodal_data=cfg.grpo.deduplicate_multimodal_data,
                 debug_payload_metrics=cfg.grpo.debug_payload_metrics,
+                allow_straggler_cutoff=allow_straggler_cutoff,
             )
             final_batch, rollout_metrics = r.final_batch, r.rollout_metrics
         else:

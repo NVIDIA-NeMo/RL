@@ -59,6 +59,7 @@ from nemo_rl.environments.interfaces import (
 )
 from nemo_rl.environments.nemo_gym import (
     DEFAULT_THINKING_TAGS,
+    STRAGGLER_CUT_KEY,
     NemoGymShardSet,
     as_nemo_gym_shard_set,
     get_nemo_gym_route_name,
@@ -2477,6 +2478,7 @@ async def _merge_nemo_gym_instance_streams(
     timer_prefix: str,
     deduplicate_multimodal_data: bool = False,
     debug_payload_metrics: bool = False,
+    allow_straggler_cutoff: bool = False,
 ) -> AsyncGenerator[tuple[int, dict, dict, dict | None, str], None]:
     """Interleave K actor streams into one, yielding rows as they complete.
 
@@ -2497,6 +2499,8 @@ async def _merge_nemo_gym_instance_streams(
             timer_prefix,
             deduplicate_multimodal_data,
         )
+        # Keyword-only extras stay out of the payload-metrics tuple above.
+        ray_kwargs = {"allow_straggler_cutoff": True} if allow_straggler_cutoff else {}
         print_multimodal_payload_metrics(
             collect_multimodal_payload_metrics(
                 ray_arguments,
@@ -2509,6 +2513,7 @@ async def _merge_nemo_gym_instance_streams(
         stream = dispatch_with_trace_context(
             handle.run_rollouts.options(num_returns="streaming"),
             *ray_arguments,
+            **ray_kwargs,
         )
         iterator = stream.__aiter__()
         iterators[iterator] = instance_label
@@ -2638,6 +2643,7 @@ async def run_async_nemo_gym_rollout(
     deduplicate_multimodal_data: bool = False,
     debug_payload_metrics: bool = False,
     identity_num_generations: Optional[int] = None,
+    allow_straggler_cutoff: bool = False,
 ) -> AsyncGenerator[NemoGymRolloutResult, None]:
     """Stream complete NeMo-Gym prompt groups in group-completion order.
 
@@ -2683,6 +2689,9 @@ async def run_async_nemo_gym_rollout(
             prompt-group identity. Defaults to ``num_generations``. Synchronous
             callers set this independently because they collect the full batch as
             one result while preserving per-prompt GenRM cohort identities.
+        allow_straggler_cutoff: Whether the Gym actors may apply
+            ``env.nemo_gym.straggler_cutoff`` to this call. Requires
+            ``returns_entire_batch``: the cutoff is a whole-batch decision.
 
     Yields:
         ``NemoGymRolloutResult`` objects in prompt-group completion order. Rows
@@ -2762,6 +2771,8 @@ async def run_async_nemo_gym_rollout(
         raise ValueError(
             "returns_entire_batch requires num_generations to equal the batch size"
         )
+    if allow_straggler_cutoff and not returns_entire_batch:
+        raise ValueError("allow_straggler_cutoff requires returns_entire_batch")
     # Media is restored by row index: result[0] uses message_log[0], result[1]
     # uses message_log[1], and so on. Reject mismatches instead of attaching a
     # video's tensors to the wrong prompt.
@@ -2806,6 +2817,7 @@ async def run_async_nemo_gym_rollout(
                 timer_prefix,
                 deduplicate_multimodal_data,
                 debug_payload_metrics,
+                allow_straggler_cutoff=allow_straggler_cutoff,
             )
     while True:
         stream_finished = False
@@ -2831,7 +2843,12 @@ async def run_async_nemo_gym_rollout(
                 completed_group = accumulator.add(
                     rowidx, result, resolved_agent_ref=resolved_agent_ref
                 )
-                if original_message_logs is not None:
+                # A straggler-cutoff placeholder is text-only and never trains, so
+                # it gets no media back.
+                is_straggler_cut = bool(
+                    (result.get("full_result") or {}).get(STRAGGLER_CUT_KEY)
+                )
+                if original_message_logs is not None and not is_straggler_cut:
                     _reattach_static_multimodal_payloads_to_result(
                         result, original_message_logs[rowidx]
                     )
@@ -2898,6 +2915,7 @@ def run_nemo_gym_rollout_sync(
     mask_env_flagged_samples: bool = True,
     deduplicate_multimodal_data: bool = False,
     debug_payload_metrics: bool = False,
+    allow_straggler_cutoff: bool = False,
 ) -> NemoGymRolloutResult:
     """Run and return one complete NeMo-Gym batch synchronously.
 
@@ -2934,6 +2952,10 @@ def run_nemo_gym_rollout_sync(
         deduplicate_multimodal_data: Omit initial policy-ready media from the
             remote Gym return and restore it from the input batch.
         debug_payload_metrics: Emit exact Gym Ray-boundary media payload metrics.
+        allow_straggler_cutoff: Let ``env.nemo_gym.straggler_cutoff`` (if enabled)
+            cancel the batch's slowest rollouts. Training call sites opt in;
+            validation leaves it off so every validation rollout is scored. Cut
+            rollouts come back as zero-reward rows with ``loss_multiplier`` 0.
 
     Returns:
         The fully postprocessed NeMo-Gym rollout batch in input-row order.
@@ -2971,6 +2993,7 @@ def run_nemo_gym_rollout_sync(
             sampling_params=sampling_params,
             deduplicate_multimodal_data=deduplicate_multimodal_data,
             debug_payload_metrics=debug_payload_metrics,
+            allow_straggler_cutoff=allow_straggler_cutoff,
         ):
             pass
         if rollout_result is None:
@@ -3103,8 +3126,10 @@ def _postprocess_single_nemo_gym_group(
         for nemo_gym_row, result in zip(nemo_gym_rows, results):
             agent_ref = nemo_gym_row["agent_ref"]
             agent_name = agent_ref["name"]
-            agent_to_results[agent_name].append(result["full_result"])
             result["agent_ref"] = agent_ref
+            # A straggler-cutoff placeholder carries no agent result to average.
+            if not result["full_result"].get(STRAGGLER_CUT_KEY):
+                agent_to_results[agent_name].append(result["full_result"])
 
         per_agent_metrics = {}
         for agent_name, agent_results in agent_to_results.items():
@@ -3149,6 +3174,17 @@ def _postprocess_single_nemo_gym_group(
     )
     input_ids = batched_flat["token_ids"]
 
+    # Rollouts cancelled by the straggler cutoff never train, whatever the
+    # mask_sample settings say: their response is a one-token placeholder.
+    straggler_cut = torch.tensor(
+        [bool(r["full_result"].get(STRAGGLER_CUT_KEY)) for r in results],
+        dtype=torch.bool,
+    )
+    loss_multiplier = input_batch["loss_multiplier"]
+    if straggler_cut.any():
+        loss_multiplier = torch.as_tensor(loss_multiplier).clone()
+        loss_multiplier[straggler_cut] = 0
+
     final_batch = BatchedDataDict[DatumSpec](
         {
             "agent_ref": [r["agent_ref"] for r in results],
@@ -3157,7 +3193,7 @@ def _postprocess_single_nemo_gym_group(
             "length": torch.tensor(
                 [len(r["input_message_log"][0]["token_ids"]) for r in results]
             ),
-            "loss_multiplier": input_batch["loss_multiplier"],
+            "loss_multiplier": loss_multiplier,
             # Unnecessary parts of the DatumSpec unused by the GRPO algorithm
             # extra_env_info: dict[str, Any]
             # idx: int
@@ -3174,8 +3210,9 @@ def _postprocess_single_nemo_gym_group(
     # Carry the raw env/agent flag downstream; the advantage stage composes it
     # into sample_mask. env.should_mask_flagged_samples=false skips this.
     if mask_env_flagged_samples:
-        final_batch[MASK_SAMPLE] = _mask_sample_flags(
-            result["full_result"] for result in results
+        final_batch[MASK_SAMPLE] = (
+            _mask_sample_flags(result["full_result"] for result in results)
+            | straggler_cut
         )
 
     rollout_metrics.update(_effort_shaping_metrics(shaping))
