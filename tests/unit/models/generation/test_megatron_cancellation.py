@@ -24,6 +24,7 @@ import torch
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.sampling_params import SamplingParams
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.models.generation.megatron.megatron_worker import MegatronGenerationMixin
 
 pytestmark = pytest.mark.mcore
@@ -155,5 +156,99 @@ def test_stream_cleanup_cancels_siblings(failure):
             assert await anext(stream) == (0, ["first"])
             await stream.aclose()
         await asyncio.wait_for(finished.wait(), timeout=1)
+
+    asyncio.run(run())
+
+
+class _ResultStream:
+    def __init__(self, result_refs: list[asyncio.Future | asyncio.Event]) -> None:
+        self.result_refs = iter(result_refs)
+        self.waiting = asyncio.Event()
+
+    def __aiter__(self) -> "_ResultStream":
+        return self
+
+    async def __anext__(self) -> asyncio.Future | asyncio.Event:
+        self.waiting.set()
+        try:
+            result = next(self.result_refs)
+        except StopIteration:
+            raise StopAsyncIteration from None
+        if isinstance(result, asyncio.Event):
+            await result.wait()
+        return result
+
+
+def _generation_wrapper(stream: _ResultStream) -> MegatronGeneration:
+    worker = SimpleNamespace(
+        generate_async=SimpleNamespace(
+            options=lambda **kwargs: SimpleNamespace(remote=lambda **kwargs: stream)
+        )
+    )
+    generation = object.__new__(MegatronGeneration)
+    generation._policy = SimpleNamespace(worker_group=SimpleNamespace(workers=[worker]))
+    return generation
+
+
+@pytest.mark.parametrize("waiting_for_result", [False, True])
+def test_wrapper_cancellation_cancels_ray_stream(waiting_for_result: bool) -> None:
+    async def run() -> None:
+        pending = asyncio.get_running_loop().create_future()
+        stream = _ResultStream([pending if waiting_for_result else asyncio.Event()])
+        output = _generation_wrapper(stream).generate_async(data={})
+        with patch(
+            "nemo_rl.models.generation.megatron.megatron_generation.ray.cancel"
+        ) as cancel:
+            task = asyncio.create_task(anext(output))
+            await stream.waiting.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            cancel.assert_called_once_with(stream)
+        await output.aclose()
+
+    asyncio.run(run())
+
+
+def test_wrapper_close_cancels_ray_stream() -> None:
+    async def run() -> None:
+        result = asyncio.get_running_loop().create_future()
+        result.set_result((7, {}))
+        stream = _ResultStream([result, asyncio.Event()])
+        output = _generation_wrapper(stream).generate_async(data={})
+        with patch(
+            "nemo_rl.models.generation.megatron.megatron_generation.ray.cancel"
+        ) as cancel:
+            assert await anext(output) == (7, {"gen_leader_worker_idx": [0]})
+            await output.aclose()
+            cancel.assert_called_once_with(stream)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_wrapper_completion_and_error_preserve_semantics(fails: bool) -> None:
+    async def run() -> None:
+        result = asyncio.get_running_loop().create_future()
+        error = RuntimeError("remote generation failed")
+        if fails:
+            result.set_exception(error)
+        else:
+            result.set_result((3, {}))
+        stream = _ResultStream([result])
+        output = _generation_wrapper(stream).generate_async(data={})
+        with patch(
+            "nemo_rl.models.generation.megatron.megatron_generation.ray.cancel"
+        ) as cancel:
+            if fails:
+                with pytest.raises(RuntimeError) as caught:
+                    await anext(output)
+                assert caught.value is error
+            else:
+                assert [row async for row in output] == [
+                    (3, {"gen_leader_worker_idx": [0]})
+                ]
+            cancel.assert_not_called()
+        await output.aclose()
 
     asyncio.run(run())

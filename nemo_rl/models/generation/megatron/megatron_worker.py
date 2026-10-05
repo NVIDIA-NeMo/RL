@@ -1307,12 +1307,12 @@ class MegatronGenerationMixin:
 
         print(f"[Rank {dist_rank}] Submitting {len(prompts)} requests to coordinator")
 
-        requests = []
+        pending_requests = []
         try:
             for prompt, multi_modal_data, request_sampling_params in zip(
                 prompts, multi_modal_data_list, sampling_params, strict=True
             ):
-                requests.append(
+                pending_requests.append(
                     self.inference_client.add_request_with_id(
                         prompt,
                         request_sampling_params,
@@ -1321,12 +1321,12 @@ class MegatronGenerationMixin:
                 )
 
             results: list[DynamicInferenceRequest] = await asyncio.gather(
-                *(future for _, future in requests)
+                *(future for _, future in pending_requests)
             )
         except BaseException:
             # CancelledError is a BaseException. Cancelling only the local
             # futures leaves requests running in Megatron's coordinator.
-            for request_id, future in requests:
+            for request_id, future in pending_requests:
                 try:
                     self.inference_client.abort_request(request_id)
                 except Exception:
@@ -1334,7 +1334,7 @@ class MegatronGenerationMixin:
                 finally:
                     future.cancel()
             await asyncio.gather(
-                *(future for _, future in requests), return_exceptions=True
+                *(future for _, future in pending_requests), return_exceptions=True
             )
             raise
         print(f"[Rank {dist_rank}] Completed {len(results)} requests")
