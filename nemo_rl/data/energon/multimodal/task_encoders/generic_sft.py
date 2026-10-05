@@ -218,6 +218,7 @@ class HFMultimodalSFTProcessorAdapter:
             add_eos_token=self.add_eos,
             add_generation_prompt=self.add_generation_prompt,
             tools=sample.tools,
+            chat_template_preapplied=sample.chat_template_preapplied,
         )
         length = sum(len(message["token_ids"]) for message in message_log)
         loss_multiplier = 1.0

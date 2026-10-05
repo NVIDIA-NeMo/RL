@@ -303,6 +303,25 @@ identity. When the selected file is a package `__init__.py`, the digest covers
 every Python source file in that package, so resuming after changing plugin
 code fails safely.
 
+#### Preformatted text sources
+
+For the generic Energon cooker, set the boolean dataset subflavor
+`skip_chat_template: true` when each message's text already contains the chat
+format. The cooker maps this to `CanonicalSFTSample.chat_template_preapplied`,
+which the generic processor adapter forwards to `get_formatted_message_log`.
+This is a per-source setting: normal and preformatted sources can share an
+adapter and blend. Missing or false values use the normal template path;
+non-boolean values are rejected.
+
+The preformatted path supports text-only turns and encodes each turn
+independently. The source owns the rendered template, BOS/EOS, assistant
+end-of-turn markers, and the division of text between roles for loss masking.
+Use the same format expected at generation time. In a blend with normal
+sources, include BOS exactly when `data.add_bos` is enabled. The path does not
+insert BOS/EOS and rejects tools, generation prompts, and task prompts.
+Independent encoding may differ from encoding the joined conversation at
+boundaries, including tokenizer-specific leading spaces.
+
 ### OpenAI Format Datasets (with Tool Calling Support)
 
 NeMo RL also supports datasets in the OpenAI conversation format, which is commonly used for chat models and function calling. This format is particularly useful for training models with tool-use capabilities.
