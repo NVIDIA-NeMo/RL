@@ -93,6 +93,32 @@ class TestModelForward:
         assert torch.equal(result, mock_output)
         mock_model.assert_called_once()
 
+    def test_model_forward_can_disable_mtp_without_changing_default(self):
+        from nemo_rl.models.megatron.train import model_forward
+
+        mock_model = MagicMock(return_value=torch.randn(1, 3, 1))
+        mock_data_dict = MagicMock()
+        mock_data_dict.get_multimodal_dict.return_value = {}
+        input_ids = torch.tensor([[1, 2, 3]])
+        position_ids = torch.tensor([[0, 1, 2]])
+        model_forward(
+            model=mock_model,
+            data_dict=mock_data_dict,
+            input_ids_cp_sharded=input_ids,
+            position_ids=position_ids,
+            attention_mask=None,
+        )
+        assert "compute_mtp_loss" not in mock_model.call_args.kwargs
+        model_forward(
+            model=mock_model,
+            data_dict=mock_data_dict,
+            input_ids_cp_sharded=input_ids,
+            position_ids=position_ids,
+            attention_mask=None,
+            compute_mtp_loss=False,
+        )
+        assert mock_model.call_args.kwargs["compute_mtp_loss"] is False
+
     def test_model_forward_with_straggler_timer(self):
         """Test model_forward uses straggler_timer context manager when provided."""
         from nemo_rl.models.megatron.train import model_forward
