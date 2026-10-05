@@ -16,6 +16,9 @@ import subprocess
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+import pytest
+
+from nemo_rl.utils import venvs
 from nemo_rl.utils.venvs import (
     add_hf_modules_cache_to_pythonpath,
     create_local_venv,
@@ -100,3 +103,65 @@ def test_make_actor_runtime_env_builds_local_venv_for_uv_python_executable():
     assert runtime_env["py_executable"] == "/fake/venv/bin/python"
     assert runtime_env["env_vars"]["VIRTUAL_ENV"] == "/fake/venv"
     assert runtime_env["env_vars"]["UV_PROJECT_ENVIRONMENT"] == "/fake/venv"
+
+
+def _fake_run(fail_times: int, calls: list):
+    def fake_run(cmd, env=None, check=True):
+        calls.append(list(cmd))
+        if len(calls) <= fail_times:
+            raise subprocess.CalledProcessError(1, cmd)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    return fake_run
+
+
+def test_run_with_retries_reruns_all_commands_after_failure():
+    calls = []
+    with (
+        patch.dict(os.environ, {"NEMO_RL_UV_SYNC_ATTEMPTS": "3"}),
+        patch.object(venvs.subprocess, "run", side_effect=_fake_run(2, calls)),
+        patch.object(venvs.time, "sleep") as mock_sleep,
+    ):
+        venvs._run_with_retries([["uv", "sync"], ["uv", "run", "echo"]], env={})
+
+    # Two failed attempts of the first command, then both commands succeed.
+    assert calls == [
+        ["uv", "sync"],
+        ["uv", "sync"],
+        ["uv", "sync"],
+        ["uv", "run", "echo"],
+    ]
+    assert mock_sleep.call_count == 2
+
+
+def test_run_with_retries_reraises_after_last_attempt():
+    calls = []
+    with (
+        patch.dict(
+            os.environ,
+            {"NEMO_RL_UV_SYNC_ATTEMPTS": "2", "NEMO_RL_UV_SYNC_RETRY_DELAY_S": "4"},
+        ),
+        patch.object(venvs.subprocess, "run", side_effect=_fake_run(10, calls)),
+        patch.object(venvs.time, "sleep") as mock_sleep,
+    ):
+        with pytest.raises(subprocess.CalledProcessError):
+            venvs._run_with_retries([["uv", "sync"]], env={})
+
+    assert len(calls) == 2
+    mock_sleep.assert_called_once()
+    # Jittered linear backoff: attempt 1 sleeps base * [0.5, 1.5].
+    assert 2.0 <= mock_sleep.call_args.args[0] <= 6.0
+
+
+def test_run_with_retries_single_attempt_does_not_sleep():
+    calls = []
+    with (
+        patch.dict(os.environ, {"NEMO_RL_UV_SYNC_ATTEMPTS": "1"}),
+        patch.object(venvs.subprocess, "run", side_effect=_fake_run(10, calls)),
+        patch.object(venvs.time, "sleep") as mock_sleep,
+    ):
+        with pytest.raises(subprocess.CalledProcessError):
+            venvs._run_with_retries([["uv", "sync"]], env={})
+
+    assert len(calls) == 1
+    mock_sleep.assert_not_called()

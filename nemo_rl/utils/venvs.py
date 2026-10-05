@@ -13,6 +13,7 @@
 # limitations under the License.
 import logging
 import os
+import random
 import shlex
 import shutil
 import subprocess
@@ -47,6 +48,37 @@ def add_hf_modules_cache_to_pythonpath(env_vars: dict[str, str]) -> dict[str, st
     if modules_cache not in path_entries:
         result["PYTHONPATH"] = os.pathsep.join([modules_cache, *path_entries])
     return result
+
+
+def _run_with_retries(cmds: list[list[str]], env: dict[str, str]) -> None:
+    """Run ``cmds`` in order with ``check=True``, retrying all of them on failure.
+
+    Many workers sync venvs concurrently at job start, so a single transient failure
+    (an HTTP error status that ``UV_HTTP_RETRIES`` does not cover, or a race between
+    concurrent editable builds) would otherwise fail the whole job. The number of
+    attempts and the base delay between them are read from
+    ``NEMO_RL_UV_SYNC_ATTEMPTS`` (default 3) and ``NEMO_RL_UV_SYNC_RETRY_DELAY_S``
+    (default 10). The delay grows linearly with the attempt number and is jittered.
+    The last failure is re-raised unchanged.
+    """
+    attempts = max(1, int(os.environ.get("NEMO_RL_UV_SYNC_ATTEMPTS", "3")))
+    base_delay_s = max(
+        0.0, float(os.environ.get("NEMO_RL_UV_SYNC_RETRY_DELAY_S", "10"))
+    )
+    for attempt in range(1, attempts + 1):
+        try:
+            for cmd in cmds:
+                subprocess.run(cmd, env=env, check=True)
+            return
+        except subprocess.CalledProcessError as e:
+            if attempt == attempts:
+                raise
+            delay_s = base_delay_s * attempt * random.uniform(0.5, 1.5)
+            logger.warning(
+                f"{shlex.join(cmd)} failed with exit code {e.returncode} "
+                f"(attempt {attempt}/{attempts}); retrying in {delay_s:.0f}s"
+            )
+            time.sleep(delay_s)
 
 
 @lru_cache(maxsize=None)
@@ -127,10 +159,10 @@ def create_local_venv(
     # --inexact: this base-set sync must not prune extras out of a venv that was
     # pre-materialized in the image; pruning and re-adding hardlinked packages would copy
     # them up into the image's final layer.
-    subprocess.run(
-        ["uv", "sync", "--inexact", "--directory", git_root], env=env, check=True
+    # Both steps are retried on failure (see _run_with_retries).
+    _run_with_retries(
+        [["uv", "sync", "--inexact", "--directory", git_root], exec_cmd], env=env
     )
-    subprocess.run(exec_cmd, env=env, check=True)
 
     # Return the path to the python executable in the virtual environment
     python_path = os.path.join(venv_path, "bin", "python")
