@@ -128,11 +128,10 @@ def test_the_patch_targets_the_logger_tests_use_still_work(name):
     the import it exists to defer."""
     import nemo_rl.utils.logger as logger_mod
 
-    sentinel = object()
     before = set(sys.modules)
-    with patch.object(logger_mod, name, sentinel):
-        assert getattr(logger_mod, name) is sentinel
-    assert getattr(logger_mod, name) is not sentinel
+    with patch.object(logger_mod, name) as mock_module:
+        assert getattr(logger_mod, name) is mock_module
+    assert getattr(logger_mod, name) is not mock_module
     # patching must not have resolved the real backend
     for pulled in set(sys.modules) - before:
         assert not pulled.startswith(("wandb", "mlflow", "swanlab", "matplotlib"))
