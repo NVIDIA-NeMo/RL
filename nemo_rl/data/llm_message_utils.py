@@ -465,103 +465,28 @@ def get_first_index_that_differs(str1: str, str2: str) -> int:
 def _tokenize_preformatted_message_log(
     message_log: LLMMessageLogType,
     tokenizer: TokenizerType,
-    *,
-    add_generation_prompt: bool,
 ) -> LLMMessageLogType:
-    """Tokenize preformatted text turns without applying a chat template."""
-    if add_generation_prompt:
-        raise ValueError(
-            "add_generation_prompt is not supported when skip_chat_template=True"
-        )
-
-    raw_turns: list[str] = []
+    """Encode each preformatted text turn independently, preserving token ownership."""
+    raw_tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
+    raw_message_log: LLMMessageLogType = []
     for message in message_log:
         content = message.get("content")
         if isinstance(content, str):
-            raw_turns.append(content)
-            continue
-        if not isinstance(content, list) or any(
-            not isinstance(part, dict) or part.get("type") != "text" for part in content
+            turn = content
+        elif isinstance(content, list) and all(
+            isinstance(part, dict) and part.get("type") == "text" for part in content
         ):
+            turn = "".join(str(part.get("text", "")) for part in content)
+        else:
             raise ValueError(
-                "skip_chat_template=True requires pre-rendered text-only turns."
+                "chat_template_preapplied=True requires pre-rendered text-only turns."
             )
-        raw_turns.append("".join(str(part.get("text", "")) for part in content))
-
-    if not raw_turns or any(not turn for turn in raw_turns):
-        raise ValueError(f"Empty turn with skip_chat_template=True: {message_log!r}.")
-
-    raw_tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
-
-    def _encode_raw(text: str) -> torch.Tensor:
-        encode = getattr(raw_tokenizer, "encode", None)
-        if callable(encode):
-            return torch.as_tensor(
-                encode(text, add_special_tokens=False), dtype=torch.long
-            )
-        encoded = raw_tokenizer(
-            text=text,
-            return_tensors="pt",
-            add_special_tokens=False,
-        )["input_ids"]
-        return torch.as_tensor(encoded[0], dtype=torch.long)
-
-    cumulative_text = "".join(raw_turns)
-    boundary_offsets: list[int] = []
-    offset = 0
-    for turn in raw_turns:
-        offset += len(turn)
-        boundary_offsets.append(offset)
-
-    token_ids: torch.Tensor | None = None
-    cumulative_lengths: list[int] = []
-    try:
-        encoded = raw_tokenizer(
-            cumulative_text,
-            add_special_tokens=False,
-            return_offsets_mapping=True,
-        )
-        input_ids = encoded["input_ids"]
-        offsets = encoded["offset_mapping"]
-        if len(input_ids) and isinstance(input_ids[0], list):
-            input_ids = input_ids[0]
-            offsets = offsets[0]
-        token_index = 0
-        for boundary in boundary_offsets:
-            while token_index < len(offsets) and offsets[token_index][1] <= boundary:
-                token_index += 1
-            if token_index < len(offsets) and offsets[token_index][0] < boundary:
-                cumulative_lengths = []
-                break
-            cumulative_lengths.append(token_index)
-        if len(cumulative_lengths) == len(boundary_offsets) and cumulative_lengths[
-            -1
-        ] == len(input_ids):
-            token_ids = torch.as_tensor(input_ids, dtype=torch.long)
-    except (KeyError, NotImplementedError, TypeError, ValueError):
-        pass
-
-    if token_ids is None:
-        cumulative_text = ""
-        cumulative_lengths = []
-        for turn in raw_turns:
-            cumulative_text += turn
-            cumulative_lengths.append(len(_encode_raw(cumulative_text)))
-        token_ids = _encode_raw(cumulative_text)
-
-    raw_message_log: LLMMessageLogType = []
-    start = 0
-    for message, turn, end in zip(
-        message_log,
-        raw_turns,
-        cumulative_lengths,
-        strict=True,
-    ):
         new_message = message.copy()
         new_message["content"] = turn
-        new_message["token_ids"] = token_ids[start:end]
+        new_message["token_ids"] = torch.as_tensor(
+            raw_tokenizer.encode(turn, add_special_tokens=False), dtype=torch.long
+        )
         raw_message_log.append(new_message)
-        start = end
     return raw_message_log
 
 
@@ -574,7 +499,7 @@ def get_formatted_message_log(
     add_generation_prompt: bool = False,
     tools: Optional[list[dict[str, Any]]] = None,
     debug: bool = False,
-    skip_chat_template: bool = False,
+    chat_template_preapplied: bool = False,
 ) -> LLMMessageLogType:
     """Format and tokenize chat messages using the specified template.
 
@@ -585,19 +510,25 @@ def get_formatted_message_log(
         add_bos_token: Whether to add bos token to first message if it is not already present. Default: True
         add_eos_token: Whether to add eos token to last message if it is not already present. Default: True
         add_generation_prompt: Whether to include assistant's generation prompt in user messages. Default: False
-        skip_chat_template: Tokenize already-formatted turns directly. BOS and EOS
-            insertion are also skipped because those tokens must already be present.
+        chat_template_preapplied: Each message's text already has the chat template
+            applied upstream. Encode turns independently without applying it again.
+            The source must use the template expected at generation time and include
+            its BOS/EOS and assistant end-of-turn markers; add_bos_token and
+            add_eos_token are ignored. In blends with normal sources, include BOS
+            exactly when data.add_bos is enabled. Independent encoding can differ
+            from encoding the joined conversation at turn boundaries. Default: False.
         tools: Optional list of tool/function definitions to pass to the chat template. Default: None
         debug: Whether to print debug information showing each message turn. Default: False
     Returns:
         The message log with updated 'token_ids' and 'content' fields.
     """
-    if skip_chat_template:
-        return _tokenize_preformatted_message_log(
-            message_log,
-            tokenizer,
-            add_generation_prompt=add_generation_prompt,
-        )
+    if chat_template_preapplied:
+        if add_generation_prompt or tools is not None or task_data_spec.prompt:
+            raise ValueError(
+                "chat_template_preapplied=True does not support add_generation_prompt, "
+                "tools, or a task_data_spec prompt: the chat template was already applied."
+            )
+        return _tokenize_preformatted_message_log(message_log, tokenizer)
 
     new_message_log: LLMMessageLogType = []
     prev_formatted_message = ""
