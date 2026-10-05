@@ -23,12 +23,6 @@ on:
   schedule:
     - cron: "0 15 * * *"
   workflow_dispatch:
-    inputs:
-      dry-run:
-        type: boolean
-        description: Print the message to the job summary instead of posting to Slack
-        required: false
-        default: true
 
 permissions:
   contents: read
@@ -53,7 +47,6 @@ jobs:
           SLACK_WEBHOOK: ${{ secrets.SLACK_TEAM_CHANNEL_WEBHOOK }}
           # rl-oncall Slack usergroup (same one cherry-pick-release-commit.yml pings on failures)
           ONCALL_MENTION: "<!subteam^S0C1W14AHS7>"
-          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry-run }}
         run: |
           set -euo pipefail
 
@@ -79,12 +72,6 @@ jobs:
             "\($oncall) :cherries: \(length) cherry-pick PR(s) to `main` still open. Please merge so release fixes land on main:\n"
             + (sort_by(.createdAt) | map("• <\(.url)|#\(.number) \(.title | esc)> — \(who) — open \(age)d") | join("\n"))
           ' prs.json)
-
-          if [[ "$DRY_RUN" == "true" ]]; then
-            { echo "### Dry run — would post:"; echo; echo "$TEXT"; } >> "$GITHUB_STEP_SUMMARY"
-            echo "$TEXT"
-            exit 0
-          fi
 
           PAYLOAD=$(jq -n -c --arg text "$TEXT" '{text: $text}')
           curl -sS --fail-with-body -X POST -H "Content-type: application/json" \
