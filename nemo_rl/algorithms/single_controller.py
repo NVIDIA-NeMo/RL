@@ -3326,28 +3326,18 @@ class SingleControllerActor:
                             ),
                         ):
                             await asyncio.to_thread(self._trainer.prepare_for_training)
-
                         if has_valid_training_tokens:
-                            for epoch in range(self._ppo_epochs):
-                                with (
-                                    self._timer.time("policy_training"),
-                                    managed_span(
-                                        RLSpanGroup.POLICY_UPDATE,
-                                        "rl.sc.policy_training",
-                                        tracer=self._tracer,
-                                        **{"rl.ppo_epoch": epoch + 1},
-                                    ),
-                                ):
-                                    if not step_open:
-                                        await asyncio.to_thread(
-                                            self._trainer.begin_train_step,
-                                            self._loss_fn,
-                                        )
-                                        step_open = True
+                            with (
+                                self._timer.time("policy_training"),
+                                managed_span(
+                                    RLSpanGroup.POLICY_UPDATE,
+                                    "rl.sc.policy_training",
+                                    tracer=self._tracer,
+                                ),
+                            ):
+                                if not step_open:
                                     await asyncio.to_thread(
-                                        self._trainer.train_microbatches_from_meta,
-                                        train_meta,
-                                        train_fields=self._train_fields,
+                                        self._trainer.begin_train_step, self._loss_fn
                                     )
                                     # Full-batch PPO closes each policy epoch;
                                     # streaming keeps accumulating across chunks.
@@ -5661,24 +5651,65 @@ class SingleControllerActor:
         await asyncio.to_thread(self._value.finish_inference)
         return meta.with_fields([self._advantage_cfg.values_field])
 
-    async def _value_train_epochs(
-        self, meta: KVBatchMeta, *, num_epochs: int
-    ) -> dict[str, Any]:
-        """Run consecutive critic epochs under one model onload/offload cycle.
+    async def _ppo_worker_call(
+        self, function: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> Any:
+        """Drain an in-flight worker call before cancellation can abort/offload it.
 
-        Returns:
-            The final epoch's ``train_from_meta`` output; earlier epochs'
-            results are discarded.
+        Cancelling to_thread does not stop its thread or the Ray RPC. Shield it
+        so epoch cleanup cannot race with a backward pass or optimizer update.
         """
-        await asyncio.to_thread(self._value.prepare_for_training)
+        task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            try:
+                await task
+            finally:
+                raise
+
+    async def _value_train_epochs(
+        self, metas: list[KVBatchMeta], *, num_epochs: int
+    ) -> dict[str, Any]:
+        """Replay all step chunks per critic epoch under one residency cycle."""
+        await self._ppo_worker_call(self._value.prepare_for_training)
         result: dict[str, Any] | None = None
-        for _ in range(num_epochs):
-            result = await asyncio.to_thread(
-                self._value.train_from_meta,
-                meta,
-                self._value_loss_fn,  # pyrefly: ignore
-            )
-        await asyncio.to_thread(self._value.finish_training)
+        try:
+            for _ in range(num_epochs):
+                try:
+                    await self._ppo_worker_call(
+                        self._value.begin_train_step, self._value_loss_fn
+                    )
+                    for meta in metas:
+                        await self._ppo_worker_call(
+                            self._value.train_microbatches_from_meta, meta
+                        )
+                    result = await self._ppo_worker_call(self._value.finish_train_step)
+                finally:
+                    # Idempotent after finish; also cleans partial begin/fan-out.
+                    await self._ppo_worker_call(self._value.abort_train_step)
+        finally:
+            await self._ppo_worker_call(self._value.finish_training)
+        assert result is not None
+        return result
+
+    async def _policy_train_epochs(self, metas: list[KVBatchMeta]) -> dict[str, Any]:
+        """Replay complete PPO epochs with one actor update per epoch."""
+        result: dict[str, Any] | None = None
+        for _ in range(self._ppo_epochs):
+            try:
+                await self._ppo_worker_call(
+                    self._trainer.begin_train_step, self._loss_fn
+                )
+                for meta in metas:
+                    await self._ppo_worker_call(
+                        self._trainer.train_microbatches_from_meta,
+                        meta,
+                        train_fields=self._train_fields,
+                    )
+                result = await self._ppo_worker_call(self._trainer.finish_train_step)
+            finally:
+                await self._ppo_worker_call(self._trainer.abort_train_step)
         assert result is not None
         return result
 

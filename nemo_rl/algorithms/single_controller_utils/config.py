@@ -1302,10 +1302,9 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "PPO on the SingleController path requires "
             "async_rl.rollout_failure.max_skipped_prompts=0 and "
             "max_consecutive_dropped_prompts=0, but they sum to "
-            f"{drop_budget}. A drop shortens the step, and the critic shards that "
-            "step against the configured value.train_global_batch_size rather than "
-            "its actual size, so the first short step fails a divisibility assert "
-            "inside the value workers (#2625)."
+            f"{drop_budget}. A drop shortens the step, but the critic split API "
+            "requires each epoch to contain exactly value.train_global_batch_size "
+            "samples. Shortened PPO steps are not supported yet."
         )
 
     if (

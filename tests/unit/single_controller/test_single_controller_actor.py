@@ -2063,6 +2063,9 @@ class _EmptyBuffer:
 
 
 class _NoOpTrainer:
+    def abort_train_step(self) -> None:
+        pass
+
     def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
         del keep_train_buffers
 
@@ -2880,9 +2883,17 @@ class _NoOpValue:
     def prepare_for_training(self) -> None:
         self._record("prepare_for_training")
 
-    def train_from_meta(self, meta: KVBatchMeta, loss_fn) -> dict:
-        del meta, loss_fn
-        self._record("train_from_meta")
+    def begin_train_step(self, loss_fn) -> None:
+        self._record("begin_train_step")
+
+    def train_microbatches_from_meta(self, meta: KVBatchMeta) -> None:
+        self._record("train_microbatches_from_meta")
+
+    def abort_train_step(self) -> None:
+        self._record("abort_train_step")
+
+    def finish_train_step(self) -> dict:
+        self._record("finish_train_step")
         return {
             "loss": torch.tensor([0.25]),
             "grad_norm": torch.tensor([1.5]),
@@ -2966,7 +2977,10 @@ def test_train_pump_parks_the_policy_on_cpu_across_the_critic_stages(
         "policy.prepare_for_training",
         "policy.offload_to_cpu",
         "critic.prepare_for_training",
-        "critic.train_from_meta",
+        "critic.begin_train_step",
+        "critic.train_microbatches_from_meta",
+        "critic.finish_train_step",
+        "critic.abort_train_step",
         "critic.finish_training",
     ]
 
@@ -3043,7 +3057,7 @@ def test_train_pump_skips_the_critic_on_an_empty_chunk(monkeypatch) -> None:
     with pytest.raises(RuntimeError, match="no valid response tokens after filtering"):
         asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
-    assert "train_from_meta" not in value.calls
+    assert "begin_train_step" not in value.calls
     # The forward still ran -- it is what the advantage stage consumes.
     assert "get_values_from_meta" in value.calls
 
@@ -3090,7 +3104,7 @@ def test_train_pump_freezes_the_policy_during_critic_warmup(
 
     asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
-    assert value.calls.count("train_from_meta") == critic_ppo_epochs
+    assert value.calls.count("finish_train_step") == critic_ppo_epochs
     trainer.prepare_for_training.assert_not_called()
     trainer.begin_train_step.assert_not_called()
     trainer.finish_train_step.assert_not_called()
@@ -3205,9 +3219,18 @@ def test_train_pump_runs_all_critic_epochs_after_actor_epochs(monkeypatch) -> No
         "policy.finish_train_step",
         "policy.offload_to_cpu",
         "critic.prepare_for_training",
-        "critic.train_from_meta",
-        "critic.train_from_meta",
-        "critic.train_from_meta",
+        "critic.begin_train_step",
+        "critic.train_microbatches_from_meta",
+        "critic.finish_train_step",
+        "critic.abort_train_step",
+        "critic.begin_train_step",
+        "critic.train_microbatches_from_meta",
+        "critic.finish_train_step",
+        "critic.abort_train_step",
+        "critic.begin_train_step",
+        "critic.train_microbatches_from_meta",
+        "critic.finish_train_step",
+        "critic.abort_train_step",
         "critic.finish_training",
     ]
     ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
