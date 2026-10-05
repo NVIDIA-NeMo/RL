@@ -1450,7 +1450,9 @@ def prefer_storage_segment(segment_name: str) -> None:
     not a capacity guarantee.
     """
     # Length must equal replica_num (1 under TQ); store_py validates it.
-    _attached_manager().storage_client.replica_config.preferred_segments = [segment_name]
+    _attached_manager().storage_client.replica_config.preferred_segments = [
+        segment_name
+    ]
 
 
 def run_checkpoint_command(body: Mapping[str, Any]) -> dict[str, Any] | None:

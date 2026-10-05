@@ -1495,7 +1495,6 @@ def test_installed_manager_keeps_non_actor_clients_out_of_the_storage_topology(
     owns_segment: bool,
 ) -> None:
     import ray
-
     from transfer_queue.storage.managers import mooncake_manager
     from transfer_queue.storage.managers.base import StorageManagerFactory
 

@@ -29,11 +29,11 @@ from ray.util.placement_group import placement_group_table
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from nemo_rl.data_plane import DataPlaneConfig, build_data_plane_client
-from nemo_rl.data_plane.interfaces import backend_config
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import (
     local_segment_name,
     run_checkpoint_command,
 )
+from nemo_rl.data_plane.interfaces import backend_config
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.utils.venvs import make_actor_runtime_env
 

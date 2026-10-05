@@ -23,6 +23,7 @@ business logic. Backend init is lifted from
 from __future__ import annotations
 
 import contextlib
+import copy
 import ctypes
 import glob
 import importlib
@@ -239,7 +240,7 @@ class _StagingPoolRegistry:
 
     def _build(self, client: Any) -> _NativeStagingPool:
         # Deferred: mooncake.store is a compiled extension, absent without the wheel.
-        from mooncake.store import BufferPool
+        from mooncake.store import BufferPool  # pyrefly: ignore[import-error]
 
         return _NativeStagingPool(
             BufferPool(
@@ -723,7 +724,6 @@ def _connect_existing_with_segment_size(segment_size: int) -> None:
     so the client is attached from a copy of the controller's config.
     """
     import ray
-    from omegaconf import OmegaConf
     from transfer_queue import interface as tq_interface
 
     controller = ray.get_actor("TransferQueueController", namespace="transfer_queue")
@@ -732,7 +732,7 @@ def _connect_existing_with_segment_size(segment_size: int) -> None:
         conf = ray.get(controller.get_config.remote())
         if conf is None:
             time.sleep(1)
-    conf = OmegaConf.create(OmegaConf.to_container(conf), flags={"allow_objects": True})
+    conf = copy.deepcopy(conf)  # leave the controller's published config untouched
     conf.backend.MooncakeStore.global_segment_size = segment_size
     tq_interface._maybe_create_tq_client(conf)
 
