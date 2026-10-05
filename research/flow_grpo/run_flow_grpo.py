@@ -76,8 +76,8 @@ def main() -> None:
     # (config-conventions v2), so downstream code reads values directly.
     master = MasterConfig.model_validate(cfg)
 
-    master.logger["log_dir"] = get_next_experiment_dir(master.logger["log_dir"])
-    print(f"📊 log_dir: {master.logger['log_dir']}")
+    master.logger.log_dir = get_next_experiment_dir(master.logger.log_dir)
+    print(f"📊 log_dir: {master.logger.log_dir}")
 
     # Seed the driver process too: DataLoader(shuffle=True) draws from the
     # global RNG, so without this the prompt order differs across runs.
@@ -137,7 +137,7 @@ def main() -> None:
     checkpointer = CheckpointManager(master.checkpointing)
 
     # NotRequired in LoggerConfig: absent means "save no validation images".
-    num_val_images = master.logger.get("num_val_samples_to_print")
+    num_val_images = master.logger.num_val_samples_to_print
 
     try:
         flow_grpo_train(
@@ -148,7 +148,7 @@ def main() -> None:
             master_config=master,
             logger=logger,
             checkpointer=checkpointer,
-            val_image_dir=os.path.join(master.logger["log_dir"], "val_images"),
+            val_image_dir=os.path.join(master.logger.log_dir, "val_images"),
             num_val_images_to_save=int(num_val_images)
             if num_val_images is not None
             else 0,
