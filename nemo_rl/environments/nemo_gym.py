@@ -305,6 +305,31 @@ def get_nemo_gym_venv_dir() -> str | None:
     return os.environ.get("NEMO_GYM_VENV_DIR")
 
 
+def apply_nemo_gym_uv_dirs(nemo_gym_dict: dict[str, Any]) -> dict[str, Any]:
+    """Point Gym at the container's uv cache and venv root, unless the config sets them.
+
+    Without these keys Gym defaults both to its own source tree: an empty
+    ``<cache_dir>/uv`` it exports as ``UV_CACHE_DIR``, and a ``.venv`` per server
+    directory. With no network access that cache cannot even seed ``pip`` into a
+    new server venv, while the image's cache and its prefetched
+    ``NEMO_GYM_VENV_DIR`` venvs can. Training, venv prefetching, and the unit
+    tests all start Gym through this one helper.
+
+    Args:
+        nemo_gym_dict: Gym global config mapping; updated in place.
+
+    Returns:
+        The same mapping.
+    """
+    for key, value in (
+        ("uv_cache_dir", get_nemo_gym_uv_cache_dir()),
+        ("uv_venv_dir", get_nemo_gym_venv_dir()),
+    ):
+        if value is not None:
+            nemo_gym_dict.setdefault(key, value)
+    return nemo_gym_dict
+
+
 class NemoGymConfig(TypedDict):
     model_name: str
     base_urls: List[str]
@@ -1640,12 +1665,7 @@ def _build_gym_actor_config(
 
     # Pass prebuilt cache + venv dirs through the global config so the gym reuses
     # image-baked venvs instead of rebuilding them.
-    uv_cache_dir = get_nemo_gym_uv_cache_dir()
-    if uv_cache_dir is not None:
-        nemo_gym_dict.setdefault("uv_cache_dir", uv_cache_dir)
-    uv_venv_dir = get_nemo_gym_venv_dir()
-    if uv_venv_dir is not None:
-        nemo_gym_dict.setdefault("uv_venv_dir", uv_venv_dir)
+    apply_nemo_gym_uv_dirs(nemo_gym_dict)
 
     routed_experts_dtype = (
         resolve_routed_experts_dtype_name_for_model(model_name)

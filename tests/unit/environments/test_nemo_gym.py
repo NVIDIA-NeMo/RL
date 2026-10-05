@@ -42,6 +42,7 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 from nemo_rl.environments.nemo_gym import (
     NemoGym,
     NemoGymConfig,
+    apply_nemo_gym_uv_dirs,
     build_reward_component_columns,
     extract_reward_components,
     setup_nemo_gym_config,
@@ -1157,10 +1158,12 @@ openai_model:
       uses_reasoning_parser: true
 """
 
+    # Same uv cache and venv root as training: inside the container, the image's
+    # cache and prefetched Gym venvs, so the servers start without network access.
     config = NemoGymConfig(
         model_name=nemo_gym_vllm_generation.cfg["model_name"],
         base_urls=nemo_gym_vllm_generation.dp_openai_server_base_urls,
-        initial_global_config_dict=safe_load(yaml_str),
+        initial_global_config_dict=apply_nemo_gym_uv_dirs(safe_load(yaml_str)),
     )
     env = NemoGym.options(
         runtime_env={

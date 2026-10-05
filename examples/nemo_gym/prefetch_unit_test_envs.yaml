@@ -1,0 +1,22 @@
+# Prefetch config for the NeMo Gym servers the L0 unit tests start
+# (tests/unit/environments/test_nemo_gym.py: vllm_model, example_multi_step, simple_agent).
+# The H100 CI image bakes their venvs into NEMO_GYM_VENV_DIR and their packages, pip included,
+# into the image's uv cache, so the Nemo_Gym shards also run without network access:
+#   docker buildx build -f docker/Dockerfile \
+#     --build-arg NEMO_GYM_PREFETCH_CONFIGS="examples/nemo_gym/prefetch_unit_test_envs.yaml" .
+# Only env.nemo_gym is read (dry-run NemoGym._spinup); the dummy policy values below satisfy
+# the bundled configs' interpolations during the dry run.
+env:
+  should_use_nemo_gym: true
+  nemo_gym:
+    skip_venv_if_present: true
+    port_range_low: 5000
+    port_range_high: 5999
+
+    policy_model_name: dummy-model
+    policy_base_url: http://localhost:8000/v1
+    policy_api_key: dummy
+
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - resources_servers/example_multi_step/configs/example_multi_step.yaml

@@ -34,6 +34,7 @@ from nemo_rl.environments.nemo_gym import (
     NEMO_GYM_ACTOR_FQN,
     NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S,
     _detect_invalid_tool_call_and_malformed_thinking,
+    apply_nemo_gym_uv_dirs,
     build_nemo_gym_actors,
     build_nemo_gym_config,
     get_nemo_gym_uv_cache_dir,
@@ -130,6 +131,32 @@ def test_detect_invalid_tool_call_and_malformed_thinking(
         expected_invalid_tool_call,
         expected_malformed_thinking,
     )
+
+
+def test_apply_nemo_gym_uv_dirs_fills_only_unset_keys(monkeypatch):
+    import nemo_rl.environments.nemo_gym as nemo_gym_mod
+
+    monkeypatch.setattr(
+        nemo_gym_mod, "get_nemo_gym_uv_cache_dir", lambda: "/opt/cache/uv"
+    )
+    monkeypatch.setattr(nemo_gym_mod, "get_nemo_gym_venv_dir", lambda: "/opt/gym_venvs")
+    config = {"uv_venv_dir": "/custom/venvs", "server": {}}
+
+    assert apply_nemo_gym_uv_dirs(config) is config
+    assert config == {
+        "uv_venv_dir": "/custom/venvs",
+        "server": {},
+        "uv_cache_dir": "/opt/cache/uv",
+    }
+
+
+def test_apply_nemo_gym_uv_dirs_leaves_gym_defaults_outside_the_container(monkeypatch):
+    import nemo_rl.environments.nemo_gym as nemo_gym_mod
+
+    monkeypatch.setattr(nemo_gym_mod, "get_nemo_gym_uv_cache_dir", lambda: None)
+    monkeypatch.setattr(nemo_gym_mod, "get_nemo_gym_venv_dir", lambda: None)
+
+    assert apply_nemo_gym_uv_dirs({"server": {}}) == {"server": {}}
 
 
 def test_get_nemo_gym_venv_dir_returns_env_value(monkeypatch):
