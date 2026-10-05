@@ -1145,6 +1145,7 @@ def setup_model_config(
         model_cfg.finalize()
 
     model_cfg.__post_init__()
+    _validate_disabled_mtp(model_cfg, config)
 
     # Derive fp8_param_enabled once from the config dict so that load_main_params_from_ckpt
     # and _create_megatron_config both use the same canonical check (fp8 enabled AND fp8_param).
@@ -1502,7 +1503,6 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
 def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
     """Apply Multi-Token Prediction settings onto the mcore model config."""
     megatron_cfg = config["megatron_cfg"]
-
     def _allowed(key: str) -> bool:
         return provider_override_allowed(megatron_cfg, key)
 
@@ -1532,6 +1532,21 @@ def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
         model_cfg.mtp_use_repeated_layer = megatron_cfg["mtp_use_repeated_layer"]
     if "mtp_detach_heads" in megatron_cfg and _allowed("mtp_detach_heads"):
         model_cfg.mtp_detach_heads = megatron_cfg["mtp_detach_heads"]
+
+
+def _validate_disabled_mtp(model_cfg: Any, config: PolicyConfig) -> None:
+    if config["megatron_cfg"].get("mtp_num_layers", 1) is not None:
+        return
+    hybrid_pattern = getattr(model_cfg, "hybrid_layer_pattern", None)
+    if (
+        getattr(model_cfg, "mtp_num_layers", None) is not None
+        or getattr(model_cfg, "mtp_hybrid_override_pattern", None)
+        or (hybrid_pattern and "/" in hybrid_pattern)
+    ):
+        raise ValueError(
+            "mtp_num_layers=null was overridden during provider finalization; "
+            "MTP remains enabled"
+        )
 
 
 def _quant_recipe_name(recipe: Any) -> str | None:

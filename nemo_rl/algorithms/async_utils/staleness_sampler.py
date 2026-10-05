@@ -656,6 +656,12 @@ class InOrderSampler(_GatedSampler):
         super().__init__(buffer, gate_window=max_lookahead_versions)
         self.max_lookahead_versions = max_lookahead_versions
         self.warmup_lookahead_versions = warmup_lookahead_versions
+        self._group_multiple = 1
+
+    def set_group_multiple(self, group_multiple: int) -> None:
+        if group_multiple < 1:
+            raise ValueError("group_multiple must be positive")
+        self._group_multiple = group_multiple
 
     def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
         # Sized for the peak window: otherwise the buffer, not the gate, bounds
