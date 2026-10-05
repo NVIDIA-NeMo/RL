@@ -125,6 +125,7 @@ def make_processed_microbatch_iterator(
     create_packed_seq_padding_mask: bool = False,
     prepad_packed_seq_for_hybridep: bool = False,
     mtp_enabled: bool = False,
+    create_nonpacked_router_padding_mask: bool = False,
 ) -> Iterator[ProcessedMicrobatch]:
     """Wrap a raw microbatch iterator to yield processed microbatches.
 
@@ -143,6 +144,8 @@ def make_processed_microbatch_iterator(
         prepad_packed_seq_for_hybridep: Whether to align packed inputs across the
             HybridEP group before model forward
         mtp_enabled: Whether the model uses multi-token prediction layers.
+        create_nonpacked_router_padding_mask: Use input lengths to exclude dense
+            right padding from expert-bias statistics on supported MoE models.
 
     Yields:
         ProcessedMicrobatch objects containing processed tensors ready for model forward
@@ -166,6 +169,7 @@ def make_processed_microbatch_iterator(
             model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
             straggler_timer=straggler_timer,
             create_packed_seq_padding_mask=create_packed_seq_padding_mask,
+            create_nonpacked_router_padding_mask=create_nonpacked_router_padding_mask,
             prepad_packed_seq_for_hybridep=prepad_packed_seq_for_hybridep,
             mtp_enabled=mtp_enabled,
         )
@@ -241,6 +245,7 @@ def get_microbatch_iterator(
     delegate_mtp_loss_mask_to_model: bool = False,
     model_slices_context_parallel_inputs: bool = False,
     mtp_enabled: bool = False,
+    create_nonpacked_router_padding_mask: bool = False,
 ) -> Tuple[Iterator[ProcessedMicrobatch], int, int, int, int]:
     """Create a processed microbatch iterator from a batch of data.
 
@@ -254,6 +259,8 @@ def get_microbatch_iterator(
         mbs: Microbatch size
         seq_length_key: Key for sequence lengths in data dict (auto-detected if None)
         mtp_enabled: Whether the model uses multi-token prediction layers.
+        create_nonpacked_router_padding_mask: Use input lengths to exclude dense
+            right padding from expert-bias statistics on supported MoE models.
 
     Returns:
         Tuple containing the iterator and metadata
@@ -335,6 +342,7 @@ def get_microbatch_iterator(
         pad_full_seq_to=pad_full_seq_to,
         straggler_timer=straggler_timer,
         create_packed_seq_padding_mask=create_packed_seq_padding_mask,
+        create_nonpacked_router_padding_mask=create_nonpacked_router_padding_mask,
         prepad_packed_seq_for_hybridep=prepad_packed_seq_for_hybridep,
         delegate_pack_to_model=delegate_pack_to_model,
         delegate_mtp_loss_mask_to_model=delegate_mtp_loss_mask_to_model,
@@ -521,8 +529,13 @@ def process_microbatch(
     create_packed_seq_padding_mask: bool = False,
     prepad_packed_seq_for_hybridep: bool = False,
     mtp_enabled: bool = False,
+    create_nonpacked_router_padding_mask: bool = False,
 ) -> ProcessedInputs:
-    """Process a microbatch for Megatron model forward pass."""
+    """Process a microbatch for Megatron model forward pass.
+
+    ``create_nonpacked_router_padding_mask`` opts supported MoE models into
+    right-padding exclusion using input lengths, independent of the loss mask.
+    """
     prepacked = "cu_seqlens" in data_dict
     if (
         create_packed_seq_padding_mask
@@ -949,6 +962,18 @@ def process_microbatch(
                 else:
                     position_ids = None
         else:
+            if create_nonpacked_router_padding_mask:
+                # Count every real prompt/tool/response token, but no right padding.
+                lengths_key = seq_length_key or "input_lengths"
+                if lengths_key not in data_dict:
+                    raise ValueError(
+                        "Nonpacked router padding masks require input lengths "
+                        f"in {lengths_key!r}."
+                    )
+                lengths = data_dict[lengths_key].to(device=input_ids.device)
+                padding_mask = torch.arange(
+                    input_ids.shape[1], device=input_ids.device
+                ).unsqueeze(0) >= lengths.unsqueeze(1)
             if routed_experts is not None:
                 if "input_lengths" not in data_dict:
                     raise ValueError(
