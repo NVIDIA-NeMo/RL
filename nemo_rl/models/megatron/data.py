@@ -245,7 +245,7 @@ def get_microbatch_iterator(
     delegate_mtp_loss_mask_to_model: bool = False,
     model_slices_context_parallel_inputs: bool = False,
     mtp_enabled: bool = False,
-    create_nonpacked_router_padding_mask: bool = False,
+    create_router_padding_mask: bool = False,
 ) -> Tuple[Iterator[ProcessedMicrobatch], int, int, int, int]:
     """Create a processed microbatch iterator from a batch of data.
 
@@ -259,8 +259,8 @@ def get_microbatch_iterator(
         mbs: Microbatch size
         seq_length_key: Key for sequence lengths in data dict (auto-detected if None)
         mtp_enabled: Whether the model uses multi-token prediction layers.
-        create_nonpacked_router_padding_mask: Use input lengths to exclude dense
-            right padding from expert-bias statistics on supported MoE models.
+        create_router_padding_mask: Exclude padding from expert-bias statistics
+            on supported MoE models, for packed and nonpacked inputs alike.
 
     Returns:
         Tuple containing the iterator and metadata
@@ -298,7 +298,7 @@ def get_microbatch_iterator(
         pad_factor = _get_non_packed_sequence_pad_factor(cfg)
 
     if prepacked:
-        create_packed_seq_padding_mask = bool(
+        create_packed_seq_padding_mask = create_router_padding_mask or bool(
             cfg["megatron_cfg"].get("moe_router_enable_expert_bias", False)
         )
         raw_iterator = data.make_microbatch_iterator(1)
@@ -308,12 +308,13 @@ def get_microbatch_iterator(
         raw_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
         data_iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
     elif cfg["sequence_packing"]["enabled"]:
-        create_packed_seq_padding_mask = uses_hybridep_flex_dispatcher(
-            cfg["megatron_cfg"]
+        uses_hybridep = uses_hybridep_flex_dispatcher(cfg["megatron_cfg"])
+        # Alignment padding between packed sequences must not reach expert-bias
+        # statistics with any dispatcher, not only HybridEP.
+        create_packed_seq_padding_mask = uses_hybridep or create_router_padding_mask
+        prepad_packed_seq_for_hybridep = uses_hybridep and cfg["megatron_cfg"].get(
+            "moe_hybridep_prepad_packed_inputs"
         )
-        prepad_packed_seq_for_hybridep = create_packed_seq_padding_mask and cfg[
-            "megatron_cfg"
-        ].get("moe_hybridep_prepad_packed_inputs")
         raw_iterator = data.make_microbatch_iterator_for_packable_sequences()
         data_iterator_len, pack_seq_dim_size = (
             data.get_microbatch_iterator_for_packable_sequences_len()
@@ -342,7 +343,7 @@ def get_microbatch_iterator(
         pad_full_seq_to=pad_full_seq_to,
         straggler_timer=straggler_timer,
         create_packed_seq_padding_mask=create_packed_seq_padding_mask,
-        create_nonpacked_router_padding_mask=create_nonpacked_router_padding_mask,
+        create_nonpacked_router_padding_mask=create_router_padding_mask,
         prepad_packed_seq_for_hybridep=prepad_packed_seq_for_hybridep,
         delegate_pack_to_model=delegate_pack_to_model,
         delegate_mtp_loss_mask_to_model=delegate_mtp_loss_mask_to_model,

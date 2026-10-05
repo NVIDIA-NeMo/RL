@@ -97,7 +97,7 @@ def test_router_mask_uses_effective_update_config(
     enabled, rate, frozen, has_bias, expected
 ):
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
-        _model_needs_nonpacked_router_padding_mask,
+        _model_needs_router_padding_mask,
     )
 
     class Model(torch.nn.Module):
@@ -112,13 +112,13 @@ def test_router_mask_uses_effective_update_config(
         def forward(self, input_ids, padding_mask=None):
             return input_ids
 
-    assert _model_needs_nonpacked_router_padding_mask(Model()) is expected
+    assert _model_needs_router_padding_mask(Model()) is expected
 
 
 @pytest.mark.parametrize("chunkwise", [False, True])
 def test_router_mask_rejects_unsupported_model(chunkwise):
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
-        _model_needs_nonpacked_router_padding_mask,
+        _model_needs_router_padding_mask,
     )
 
     class Model(torch.nn.Module):
@@ -140,9 +140,7 @@ def test_router_mask_rejects_unsupported_model(chunkwise):
             return input_ids
 
     with pytest.raises(ValueError, match="padding_mask|context parallelism"):
-        _model_needs_nonpacked_router_padding_mask(
-            MaskModel() if chunkwise else Model()
-        )
+        _model_needs_router_padding_mask(MaskModel() if chunkwise else Model())
 
 
 def test_nonpacked_router_mask_preserves_unequal_row_lengths(monkeypatch):
@@ -167,3 +165,91 @@ def test_nonpacked_router_mask_preserves_unequal_row_lengths(monkeypatch):
         [False, False, True, True, True, True, True, True],
         [False, False, False, False, True, True, True, True],
     ]
+
+
+def _packed_batch():
+    from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+    # Real token ids are nonzero, so they identify every non-padding position.
+    return BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[11, 12, 13, 0, 0], [21, 22, 23, 24, 25]]),
+            "input_lengths": torch.tensor([3, 5]),
+            "token_mask": torch.tensor([[0, 1, 1, 0, 0], [0, 0, 1, 1, 1]]),
+        }
+    )
+
+
+@pytest.mark.parametrize("multiple", [4, 8])
+def test_packed_padding_does_not_change_expert_bias(monkeypatch, multiple):
+    from megatron.core.transformer.moe.router import TopKRouter
+
+    from nemo_rl.models.megatron import data as module
+
+    monkeypatch.setattr(module, "get_context_parallel_rank", lambda: 0)
+    monkeypatch.setattr(module, "get_context_parallel_world_size", lambda: 1)
+    processed = module.process_microbatch(
+        _packed_batch(),
+        seq_length_key="input_lengths",
+        pack_sequences=True,
+        pad_individual_seqs_to_multiple_of=multiple,
+        create_packed_seq_padding_mask=True,
+    )
+    real = processed.input_ids[0] != 0
+    assert processed.padding_mask is not None
+    # Exactly the per-sequence alignment padding is masked.
+    assert torch.equal(processed.padding_mask.reshape(-1), ~real)
+
+    router = TopKRouter.__new__(TopKRouter)
+    torch.nn.Module.__init__(router)
+    router.enable_expert_bias = True
+    router.local_tokens_per_expert = torch.zeros(4, dtype=torch.long)
+    # Real tokens cycle over the experts; padding alone favors expert0.
+    routes = torch.zeros((real.numel(), 4), dtype=torch.bool)
+    routes[real.nonzero().squeeze(1), torch.arange(int(real.sum())) % 4] = True
+    routes[~real, 0] = True
+    router._apply_expert_bias(routes, padding_mask=processed.padding_mask)
+    assert router.local_tokens_per_expert.tolist() == [2, 2, 2, 2]
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_packed_router_mask_with_alltoall_dispatcher(monkeypatch, enabled):
+    from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+    from nemo_rl.models.megatron import data as module
+
+    # Keep the iterator's device move on CPU for this regression.
+    monkeypatch.setattr(BatchedDataDict, "to", lambda self, device: self)
+    monkeypatch.setattr(module, "get_context_parallel_rank", lambda: 0)
+    monkeypatch.setattr(module, "get_context_parallel_world_size", lambda: 1)
+    batch = _packed_batch()
+    batch.micro_batch_indices = [[[0, 2]]]
+    batch.micro_batch_lengths = [[8]]
+    cfg = {
+        "megatron_cfg": {
+            "tensor_model_parallel_size": 1,
+            "pipeline_model_parallel_size": 1,
+            "context_parallel_size": 1,
+            "sequence_parallel": False,
+            "moe_token_dispatcher_type": "alltoall",
+            "moe_hybridep_prepad_packed_inputs": True,
+        },
+        "sequence_packing": {"enabled": True},
+        "dynamic_batching": {"enabled": False},
+        "make_sequence_length_divisible_by": 4,
+    }
+    iterator, *_ = module.get_microbatch_iterator(
+        batch,
+        cfg,
+        mbs=1,
+        straggler_timer=None,
+        seq_length_key="input_lengths",
+        create_router_padding_mask=enabled,
+    )
+    processed = next(iterator)
+    if enabled:
+        real = processed.input_ids[0] != 0
+        assert torch.equal(processed.padding_mask.reshape(-1), ~real)
+        # Lengths 3 and 5 align to 4 and 8; HybridEP prepadding adds nothing.
+        assert processed.input_ids.shape[1] == 12
+    else:
+        assert processed.padding_mask is None
