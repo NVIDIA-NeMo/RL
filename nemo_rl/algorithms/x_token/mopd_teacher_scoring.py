@@ -30,6 +30,7 @@ import torch
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.x_token.mopd import (
+    ThinkingState,
     _normalize_leading_instruction_messages,
     align_token_ids,
     apply_teacher_chat_template,
@@ -37,7 +38,7 @@ from nemo_rl.algorithms.x_token.mopd import (
     classify_thinking_state_before_generated_span,
     compute_offsets_manual,
     first_teacher_prefix_chunk_to_mask,
-    generated_think_tool_marker_error,
+    generated_thinking_state_after_response,
     map_generated_turns_to_parsed_messages,
     nearest_token_position,
     normalize_alignment_method,
@@ -113,7 +114,8 @@ class AssistantTurnStructure:
     message_log_index: int
     student_start: int
     student_end: int
-    initial_thinking_state: str
+    initial_thinking_state: ThinkingState
+    final_thinking_state: ThinkingState
     render_mode: Literal["normal", "preserve_open", "masked"]
     structural_error: str | None
     assistant_text: str
@@ -433,7 +435,11 @@ def _classify_assistant_turn_structures(
         ):
             continue
 
-        assistant_text = tokenizer.decode(token_ids, skip_special_tokens=True)
+        content_ids, _ = split_sampled_assistant_eot(tokenizer, token_ids)
+        # Inspect the sampled stream, including markers that may be special
+        # tokens. Only the separately aligned terminal EOS is removed.
+        marker_text = tokenizer.decode(content_ids, skip_special_tokens=False)
+        assistant_text = marker_text
         has_student_im_end = bool(
             student_im_end_id is not None and token_ids[-1] == student_im_end_id
         )
@@ -445,9 +451,16 @@ def _classify_assistant_turn_structures(
             tokenizer,
             student_row_ids,
             generated_start=message_start,
+            expects_thinking=expects_thinking_state,
         )
         if initial_state == "unknown" and not expects_thinking_state:
             initial_state = "closed"
+            # Preserve generic non-thinking decoding (including its EOS rules).
+            assistant_text = tokenizer.decode(token_ids, skip_special_tokens=True)
+        final_state, marker_error = generated_thinking_state_after_response(
+            marker_text,
+            initial_state=initial_state,
+        )
         if causal_suffix_masked:
             render_mode = "masked"
             structural_error = "causal_suffix"
@@ -458,21 +471,24 @@ def _classify_assistant_turn_structures(
             structural_error = "teacher_message_mapping"
             causal_suffix_masked = True
         else:
-            structural_error = generated_think_tool_marker_error(
-                assistant_text,
-                initial_state=initial_state,
-            )
+            structural_error = marker_error
             if structural_error is not None:
                 render_mode = "masked"
                 causal_suffix_masked = True
-            elif initial_state == "open" and "</think>" not in assistant_text:
+            elif final_state == "open":
                 structural_error = "missing_think_close"
                 recovered_content = str(
                     recovered_messages[teacher_message_index].get("content") or ""
                 )
-                student_prefix_proven = recovered_content == (
+                # Native Qwen opens thinking in the sampled response; Nano
+                # prefills the opening in the prompt. Prove the appropriate
+                # reconstruction without adding a second opening.
+                expected_content = (
                     "<think>\n" + assistant_text
+                    if initial_state == "open"
+                    else assistant_text
                 )
+                student_prefix_proven = recovered_content == expected_content
                 if (
                     missing_think_close_policy == "preserve_open_if_proven"
                     and student_prefix_proven
@@ -489,6 +505,7 @@ def _classify_assistant_turn_structures(
             student_start=message_start,
             student_end=message_end,
             initial_thinking_state=initial_state,
+            final_thinking_state=final_state,
             render_mode=render_mode,
             structural_error=structural_error,
             assistant_text=assistant_text,
@@ -703,8 +720,12 @@ class MOPDTeacherScorer:
             return None
         if token_ids == expected_ids:
             return offsets
+        skip_special_tokens = False
         try:
-            decoded = tokenizer.decode(expected_ids, skip_special_tokens=True)
+            decoded = tokenizer.decode(expected_ids, skip_special_tokens=False)
+            if decoded != text:
+                decoded = tokenizer.decode(expected_ids, skip_special_tokens=True)
+                skip_special_tokens = True
         except (TypeError, ValueError, RuntimeError):
             return None
         if decoded != text:
@@ -713,7 +734,7 @@ class MOPDTeacherScorer:
             tokenizer,
             expected_ids,
             text,
-            skip_special_tokens=True,
+            skip_special_tokens=skip_special_tokens,
         )
 
     def _fallback_messages_and_mapping(
@@ -839,11 +860,11 @@ class MOPDTeacherScorer:
                     messages[:teacher_message_index],
                 )
                 prefix_ids = _tokenize_text(teacher_tokenizer, prefix_text)
-                body_ids = _tokenize_text(
-                    teacher_tokenizer,
-                    boundary_structure.assistant_text,
-                )
-                teacher_text = prefix_text + boundary_structure.assistant_text
+                body_text = boundary_structure.assistant_text
+                if boundary_structure.initial_thinking_state == "waiting":
+                    body_text = body_text[qwen3_leading_think_prefix_len(body_text) :]
+                body_ids = _tokenize_text(teacher_tokenizer, body_text)
+                teacher_text = prefix_text + body_text
                 teacher_ids = [*prefix_ids, *body_ids]
                 preserve_log_index = boundary_structure.message_log_index
                 preserve_start = len(prefix_ids)
@@ -923,17 +944,6 @@ class MOPDTeacherScorer:
             student_im_end_id=student_im_end_id,
             missing_think_close_policy=self.context.missing_think_close_policy,
         )
-        for structure in turn_structures.values():
-            if (
-                structure.initial_thinking_state == "open"
-                and "</think>" not in structure.assistant_text
-            ):
-                metrics["missing_think_close_detected"] += 1
-            if structure.render_mode == "masked":
-                if structure.structural_error == "causal_suffix":
-                    metrics["causal_suffix_masked"] += 1
-                else:
-                    metrics["malformed_structure_masked"] += 1
 
         (
             teacher_text,
@@ -947,6 +957,18 @@ class MOPDTeacherScorer:
             turn_structures=turn_structures,
             metrics=metrics,
         )
+        for structure in turn_structures.values():
+            if (
+                structure.final_thinking_state == "open"
+                and "</think>" not in structure.assistant_text
+            ):
+                metrics["missing_think_close_detected"] += 1
+            if structure.render_mode == "masked":
+                if structure.structural_error == "causal_suffix":
+                    metrics["causal_suffix_masked"] += 1
+                else:
+                    metrics["malformed_structure_masked"] += 1
+
         if len(teacher_ids) > self.context.teacher_max_length:
             metrics["teacher_transcripts_too_long"] += 1
             return _PreparedSample(teacher_ids=(0,), turns=())
@@ -998,10 +1020,7 @@ class MOPDTeacherScorer:
                 metrics["turns_skipped"] += 1
                 continue
 
-            assistant_text = student_tokenizer.decode(
-                message_token_ids,
-                skip_special_tokens=True,
-            )
+            assistant_text = structure.assistant_text
             if not assistant_text:
                 metrics["turns_skipped"] += 1
                 continue
@@ -1012,6 +1031,13 @@ class MOPDTeacherScorer:
                 assistant_text,
                 trim_outer_whitespace=trim_this_turn,
             )
+            generated_open_prefix = (
+                qwen3_leading_think_prefix_len(assistant_text)
+                if structure.initial_thinking_state == "waiting"
+                else 0
+            )
+            if preserve_open_turn and generated_open_prefix:
+                transformed_text = assistant_text[generated_open_prefix:]
             student_alignment_text = assistant_text
             student_local_ids, student_eot_local_index = split_sampled_assistant_eot(
                 student_tokenizer,
@@ -1044,7 +1070,7 @@ class MOPDTeacherScorer:
                     if student_eot_local_index is not None:
                         student_eot_local_index -= dropped_outer_prefix_tokens
 
-            if had_think:
+            if had_think or generated_open_prefix:
                 trim_characters = qwen3_leading_think_prefix_len(student_alignment_text)
                 (
                     student_local_ids,
@@ -1056,6 +1082,12 @@ class MOPDTeacherScorer:
                     student_alignment_text,
                     trim_characters,
                 )
+                if trim_characters and not dropped_prefix_tokens:
+                    # A wrapper crossing a sampled token boundary cannot be
+                    # removed without changing the authoritative student grid.
+                    metrics["student_offset_failures"] += 1
+                    metrics["turns_skipped"] += 1
+                    continue
                 if dropped_prefix_tokens:
                     student_global_start += dropped_prefix_tokens
                     if student_eot_local_index is not None:

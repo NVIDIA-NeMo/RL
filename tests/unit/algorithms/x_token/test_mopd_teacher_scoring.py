@@ -12,14 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import sys
+from collections import Counter
+from copy import deepcopy
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 import torch
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.x_token.token_aligner import AlignmentPair
+from nemo_rl.algorithms.x_token import mopd_teacher_scoring as scoring
+from nemo_rl.algorithms.x_token.token_aligner import AlignmentPair, TokenAligner
 
 
 class _CharTokenizer:
@@ -423,3 +429,482 @@ def test_student_alignment_tokenizer_ignores_active_fastokens(monkeypatch):
         ),
         ("repatch",),
     ]
+
+
+@pytest.fixture(scope="module")
+def native_qwen3_tokenizer() -> PreTrainedTokenizerBase:
+    """Load only the pinned, unmodified Qwen3 tokenizer and native template.
+
+    NRL_TEST_QWEN3_TOKENIZER may point to a local copy of these tokenizer assets
+    for offline execution. No model configuration or weights are loaded.
+    """
+    return AutoTokenizer.from_pretrained(
+        os.environ.get("NRL_TEST_QWEN3_TOKENIZER", "Qwen/Qwen3-0.6B"),
+        revision="c1899de289a04d12100db370d81485cdf75e47ca",
+    )
+
+
+class _PositionTeacherGroup(_TeacherGroup):
+    def get_logprobs(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        self.calls += 1
+        self.last_batch = batch
+        positions = torch.arange(1, batch["input_ids"].shape[1] + 1).float()
+        return {
+            "reference_logprobs": -positions.unsqueeze(0).expand_as(batch["input_ids"])
+        }
+
+
+def _native_scoring_case(
+    tokenizer: PreTrainedTokenizerBase,
+    response: str,
+    *,
+    prompt_suffix: str = "",
+    enable_thinking: bool = True,
+    split_opening: bool = False,
+    missing_close_policy: str = "mask",
+    mask_prefix: bool = False,
+    teacher_tokenizer: PreTrainedTokenizerBase | None = None,
+) -> tuple[
+    scoring.MOPDTeacherScorer,
+    _PositionTeacherGroup,
+    list[int],
+    list[int],
+    list[dict[str, Any]],
+]:
+    prompt = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "q"}],
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=enable_thinking,
+    )
+    if enable_thinking:
+        assert prompt.endswith("<|im_start|>assistant\n")
+    else:
+        assert prompt.endswith("<think>\n\n</think>\n\n")
+    prompt_ids = tokenizer(prompt + prompt_suffix, add_special_tokens=False)[
+        "input_ids"
+    ]
+    if split_opening:
+        assert response.startswith("<think>")
+        # A valid rollout need not use the canonical single marker token.
+        response_ids = [
+            token_id
+            for fragment in ("<", "think", ">", response[len("<think>") :])
+            for token_id in tokenizer(fragment, add_special_tokens=False)["input_ids"]
+        ]
+        assert len(tokenizer("<think>", add_special_tokens=False)["input_ids"]) == 1
+        assert tokenizer.decode(response_ids, skip_special_tokens=False) == response
+    else:
+        response_ids = tokenizer(response, add_special_tokens=False)["input_ids"]
+    messages = [
+        {"role": "user", "content": "q", "token_ids": prompt_ids},
+        {
+            "role": "assistant",
+            "content": response,
+            "token_ids": response_ids,
+            "generation_logprobs": [0.0] * len(response_ids),
+        },
+    ]
+    config = _cross_tokenizer_config()
+    config["missing_think_close_policy"] = missing_close_policy
+    config["mask_first_teacher_prefix_chunk"] = mask_prefix
+    config["exclude_proven_template_only_teacher_tokens"] = True
+    teacher = _PositionTeacherGroup()
+    scorer = scoring.build_mopd_teacher_scorer(
+        student_tokenizer=tokenizer,
+        teacher_tokenizer=teacher_tokenizer or tokenizer,
+        teacher_group=teacher,
+        cross_tokenizer_config=config,
+    )
+    assert isinstance(scorer.context.aligner, TokenAligner)
+    return scorer, teacher, prompt_ids, response_ids, messages
+
+
+def _assert_native_scores(
+    *,
+    tokenizer: PreTrainedTokenizerBase,
+    scorer: scoring.MOPDTeacherScorer,
+    teacher: _PositionTeacherGroup,
+    prompt_ids: list[int],
+    response_ids: list[int],
+    messages: list[dict[str, Any]],
+    teacher_text: str,
+    dropped_prefix_tokens: int,
+    mask_prefix: bool = False,
+) -> scoring.MOPDTeacherScoreResult:
+    student_ids = prompt_ids + response_ids
+    prepared = scorer._prepare_sample(
+        student_row_ids=student_ids,
+        student_length=len(student_ids),
+        message_log=messages,
+        metrics=Counter(),
+    )
+    assert (
+        tokenizer.decode(prepared.teacher_ids, skip_special_tokens=False)
+        == teacher_text
+    )
+    assert len(prepared.turns) == 1
+    turn = prepared.turns[0]
+    assert turn.student_global_start == len(prompt_ids) + dropped_prefix_tokens
+    # Assert absolute positions on the original rollout grid, including sampled EOS.
+    assert sorted(
+        turn.student_global_start + position
+        for pair in turn.pairs
+        if pair.s_start >= 0 and pair.is_correct
+        for position in range(pair.s_start, pair.s_end)
+    ) == list(range(len(prompt_ids) + dropped_prefix_tokens, len(student_ids)))
+
+    result = scorer.score(
+        input_ids=torch.tensor([student_ids]),
+        input_lengths=torch.tensor([len(student_ids)]),
+        message_logs=[messages],
+    )
+    assert teacher.calls == 1
+    teacher_ids = teacher.last_batch["input_ids"][0].tolist()
+    assert teacher_ids == list(prepared.teacher_ids)
+    expected_mask = torch.zeros((1, len(student_ids)), dtype=torch.bool)
+    expected_scores = torch.zeros((1, len(student_ids)), dtype=torch.float32)
+    # These cases deliberately use distinct body token IDs. Locate their actual
+    # teacher positions independently of the aligner's pairs and projection code.
+    teacher_cursor = turn.teacher_global_start
+    for local_position in range(dropped_prefix_tokens, len(response_ids)):
+        teacher_position = teacher_ids.index(
+            response_ids[local_position], teacher_cursor
+        )
+        teacher_cursor = teacher_position + 1
+        if mask_prefix and local_position == dropped_prefix_tokens:
+            continue
+        student_position = len(prompt_ids) + local_position
+        expected_mask[0, student_position] = True
+        expected_scores[0, student_position] = -(teacher_position + 1)
+    torch.testing.assert_close(result.logprobs, expected_scores)
+    assert torch.equal(result.valid_mask, expected_mask)
+    assert result.metrics["mopd/teacher_prefix_chunks_masked"] == float(mask_prefix)
+    assert result.metrics["mopd/student_offset_failures"] == 0
+    return result
+
+
+@pytest.mark.parametrize("split_opening", [False, True])
+@pytest.mark.parametrize("mask_prefix", [False, True])
+@pytest.mark.parametrize("reasoning", ["reasoning", ""])
+def test_native_qwen3_generated_thinking_scores_original_positions(
+    native_qwen3_tokenizer: PreTrainedTokenizerBase,
+    split_opening: bool,
+    mask_prefix: bool,
+    reasoning: str,
+) -> None:
+    tokenizer = native_qwen3_tokenizer
+    scorer, teacher, prompt_ids, response_ids, messages = _native_scoring_case(
+        tokenizer,
+        f"<think>{reasoning}</think>answer<|im_end|>",
+        split_opening=split_opening,
+        mask_prefix=mask_prefix,
+    )
+    result = _assert_native_scores(
+        tokenizer=tokenizer,
+        scorer=scorer,
+        teacher=teacher,
+        prompt_ids=prompt_ids,
+        response_ids=response_ids,
+        messages=messages,
+        teacher_text=(
+            "<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\n"
+            f"<think>\n{reasoning}\n</think>\n\nanswer<|im_end|>\n"
+        ),
+        dropped_prefix_tokens=3 if split_opening else 1,
+        mask_prefix=mask_prefix,
+    )
+    assert result.metrics.get("mopd/missing_think_close_detected", 0) == 0
+    if not mask_prefix or reasoning:
+        assert result.metrics["mopd/template_only_teacher_tokens_excluded"] > 0
+
+
+@pytest.mark.parametrize("split_opening", [False, True])
+@pytest.mark.parametrize("sample_eot", [False, True])
+@pytest.mark.parametrize("missing_close_policy", ["mask", "preserve_open_if_proven"])
+def test_native_qwen3_unfinished_generated_thinking_policy(
+    native_qwen3_tokenizer: PreTrainedTokenizerBase,
+    split_opening: bool,
+    sample_eot: bool,
+    missing_close_policy: str,
+) -> None:
+    tokenizer = native_qwen3_tokenizer
+    eos = "<|im_end|>" if sample_eot else ""
+    scorer, teacher, prompt_ids, response_ids, messages = _native_scoring_case(
+        tokenizer,
+        "<think>\nreasoning" + eos,
+        split_opening=split_opening,
+        missing_close_policy=missing_close_policy,
+    )
+    if missing_close_policy == "preserve_open_if_proven":
+        result = _assert_native_scores(
+            tokenizer=tokenizer,
+            scorer=scorer,
+            teacher=teacher,
+            prompt_ids=prompt_ids,
+            response_ids=response_ids,
+            messages=messages,
+            teacher_text=(
+                "<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\n"
+                "<think>\nreasoning" + eos
+            ),
+            dropped_prefix_tokens=4 if split_opening else 2,
+        )
+        assert result.metrics["mopd/open_state_preserved"] == 1
+    else:
+        student_ids = prompt_ids + response_ids
+        prepared = scorer._prepare_sample(
+            student_row_ids=student_ids,
+            student_length=len(student_ids),
+            message_log=messages,
+            metrics=Counter(),
+        )
+        assert tokenizer.decode(prepared.teacher_ids, skip_special_tokens=False) == (
+            "<|im_start|>user\nq<|im_end|>\n"
+        )
+        assert not prepared.turns
+        result = scorer.score(
+            input_ids=torch.tensor([student_ids]), message_logs=[messages]
+        )
+        assert not result.valid_mask.any()
+        assert not result.logprobs.any()
+        assert teacher.calls == 1
+        assert teacher.last_batch["input_ids"][0].tolist() == list(prepared.teacher_ids)
+        assert result.metrics["mopd/malformed_structure_masked"] == 1
+    assert result.metrics["mopd/missing_think_close_detected"] == 1
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "answer",
+        "<think><think>reasoning</think>answer",
+        "answer<think>reasoning</think>",
+        "</think><think>reasoning",
+        "<think>reasoning</think><think>again</think>",
+        "<think>reasoning</think></think>answer",
+        "</think>answer",
+        "<think>reasoning</think>answer</tool_call>",
+    ],
+)
+def test_native_qwen3_malformed_generated_markers_mask_turn(
+    native_qwen3_tokenizer: PreTrainedTokenizerBase,
+    response: str,
+) -> None:
+    scorer, teacher, prompt_ids, response_ids, messages = _native_scoring_case(
+        native_qwen3_tokenizer,
+        response,
+        missing_close_policy="preserve_open_if_proven",
+    )
+    result = scorer.score(
+        input_ids=torch.tensor([prompt_ids + response_ids]), message_logs=[messages]
+    )
+    assert not result.valid_mask.any()
+    assert not result.logprobs.any()
+    assert teacher.calls == 1
+    assert (
+        native_qwen3_tokenizer.decode(
+            teacher.last_batch["input_ids"][0], skip_special_tokens=False
+        )
+        == "<|im_start|>user\nq<|im_end|>\n"
+    )
+    assert result.metrics["mopd/malformed_structure_masked"] == 1
+
+
+@pytest.mark.parametrize("failure", ["student_reconstruction", "teacher_render"])
+def test_native_qwen3_unproven_preservation_masks_turn(
+    native_qwen3_tokenizer: PreTrainedTokenizerBase,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    tokenizer = native_qwen3_tokenizer
+    teacher_tokenizer = None
+    if failure == "teacher_render":
+        teacher_tokenizer = deepcopy(tokenizer)
+        # This teacher closes thinking even when asked for an open prefix.
+        teacher_tokenizer.chat_template = (
+            "{% for message in messages %}{{ '<|im_start|>' + message.role + '\\n' "
+            "+ message.content + '<|im_end|>\\n' }}{% endfor %}"
+            "{% if add_generation_prompt %}"
+            "{{ '<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n' }}{% endif %}"
+        )
+    scorer, teacher, prompt_ids, response_ids, messages = _native_scoring_case(
+        tokenizer,
+        "<think>reasoning",
+        missing_close_policy="preserve_open_if_proven",
+        teacher_tokenizer=teacher_tokenizer,
+    )
+    if failure == "student_reconstruction":
+        recover = scorer._recover_transcript
+
+        def unproven_recovery(
+            **kwargs: Any,
+        ) -> tuple[list[dict[str, str]], dict[int, int]]:
+            recovered_messages, mapping = recover(**kwargs)
+            recovered_messages[-1]["content"] = "reasoning"
+            return recovered_messages, mapping
+
+        monkeypatch.setattr(scorer, "_recover_transcript", unproven_recovery)
+    student_ids = prompt_ids + response_ids
+    prepared = scorer._prepare_sample(
+        student_row_ids=student_ids,
+        student_length=len(student_ids),
+        message_log=messages,
+        metrics=Counter(),
+    )
+    assert tokenizer.decode(prepared.teacher_ids, skip_special_tokens=False) == (
+        "<|im_start|>user\nq<|im_end|>\n"
+    )
+    assert not prepared.turns
+    result = scorer.score(
+        input_ids=torch.tensor([student_ids]), message_logs=[messages]
+    )
+    assert not result.valid_mask.any()
+    assert not result.logprobs.any()
+    assert teacher.calls == 1
+    assert teacher.last_batch["input_ids"][0].tolist() == list(prepared.teacher_ids)
+    assert result.metrics["mopd/missing_think_close_detected"] == 1
+    assert result.metrics["mopd/malformed_structure_masked"] == 1
+    if failure == "teacher_render":
+        assert result.metrics["mopd/teacher_open_render_failures"] == 1
+
+
+@pytest.mark.parametrize("unfinished", [False, True])
+def test_nano_style_prompt_prefilled_thinking_keeps_positions(
+    native_qwen3_tokenizer: PreTrainedTokenizerBase,
+    unfinished: bool,
+) -> None:
+    tokenizer = native_qwen3_tokenizer
+    response = "reasoning" if unfinished else "reasoning</think>answer<|im_end|>"
+    scorer, teacher, prompt_ids, response_ids, messages = _native_scoring_case(
+        tokenizer,
+        response,
+        prompt_suffix="<think>\n",
+        missing_close_policy="preserve_open_if_proven",
+    )
+    _assert_native_scores(
+        tokenizer=tokenizer,
+        scorer=scorer,
+        teacher=teacher,
+        prompt_ids=prompt_ids,
+        response_ids=response_ids,
+        messages=messages,
+        teacher_text=(
+            "<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\n<think>\nreasoning"
+            + ("" if unfinished else "\n</think>\n\nanswer<|im_end|>\n")
+        ),
+        dropped_prefix_tokens=0,
+    )
+
+
+def test_native_qwen3_closed_prompt_keeps_plain_answer_scores(
+    native_qwen3_tokenizer: PreTrainedTokenizerBase,
+) -> None:
+    tokenizer = native_qwen3_tokenizer
+    scorer, teacher, prompt_ids, response_ids, messages = _native_scoring_case(
+        tokenizer, "answer<|im_end|>", enable_thinking=False
+    )
+    _assert_native_scores(
+        tokenizer=tokenizer,
+        scorer=scorer,
+        teacher=teacher,
+        prompt_ids=prompt_ids,
+        response_ids=response_ids,
+        messages=messages,
+        teacher_text=(
+            "<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\n"
+            "<think>\n\n</think>\n\nanswer<|im_end|>\n"
+        ),
+        dropped_prefix_tokens=0,
+    )
+
+
+@pytest.mark.parametrize("policy", ["mask", "preserve_open_if_proven"])
+def test_unfinished_native_thinking_masks_later_dependent_turns(
+    native_qwen3_tokenizer: PreTrainedTokenizerBase,
+    policy: str,
+) -> None:
+    tokenizer = native_qwen3_tokenizer
+    scorer, teacher, prompt_ids, response_ids, messages = _native_scoring_case(
+        tokenizer, "<think>reasoning<|im_end|>", missing_close_policy=policy
+    )
+    next_prompt_ids = tokenizer(
+        "\n<|im_start|>user\nnext<|im_end|>\n<|im_start|>assistant\n",
+        add_special_tokens=False,
+    )["input_ids"]
+    next_response_ids = tokenizer(
+        "<think>other</think>done<|im_end|>", add_special_tokens=False
+    )["input_ids"]
+    messages.extend(
+        [
+            {"role": "user", "content": "next", "token_ids": next_prompt_ids},
+            {
+                "role": "assistant",
+                "content": "<think>other</think>done",
+                "token_ids": next_response_ids,
+                "generation_logprobs": [0.0] * len(next_response_ids),
+            },
+        ]
+    )
+    first_turn_end = len(prompt_ids) + len(response_ids)
+    student_ids = prompt_ids + response_ids + next_prompt_ids + next_response_ids
+    prepared = scorer._prepare_sample(
+        student_row_ids=student_ids,
+        student_length=len(student_ids),
+        message_log=messages,
+        metrics=Counter(),
+    )
+    expected_teacher_text = "<|im_start|>user\nq<|im_end|>\n"
+    if policy == "preserve_open_if_proven":
+        expected_teacher_text += "<|im_start|>assistant\n<think>\nreasoning<|im_end|>"
+    assert tokenizer.decode(prepared.teacher_ids, skip_special_tokens=False) == (
+        expected_teacher_text
+    )
+    result = scorer.score(
+        input_ids=torch.tensor([student_ids]), message_logs=[messages]
+    )
+    expected_mask = torch.zeros_like(result.valid_mask)
+    expected_scores = torch.zeros_like(result.logprobs)
+    if policy == "preserve_open_if_proven":
+        expected_mask[0, len(prompt_ids) + 1 : first_turn_end] = True
+        teacher_cursor = prepared.turns[0].teacher_global_start
+        for local_position, token_id in enumerate(response_ids[1:], start=1):
+            teacher_position = prepared.teacher_ids.index(token_id, teacher_cursor)
+            teacher_cursor = teacher_position + 1
+            expected_scores[0, len(prompt_ids) + local_position] = -(
+                teacher_position + 1
+            )
+    assert torch.equal(result.valid_mask, expected_mask)
+    torch.testing.assert_close(result.logprobs, expected_scores)
+    assert teacher.calls == 1
+    assert teacher.last_batch["input_ids"][0].tolist() == list(prepared.teacher_ids)
+    assert result.metrics["mopd/missing_think_close_detected"] == 1
+    assert result.metrics["mopd/causal_suffix_masked"] == 1
+
+
+@pytest.mark.parametrize("response", ["<think>", "<think>\n", "<|im_end|>"])
+@pytest.mark.parametrize("policy", ["mask", "preserve_open_if_proven"])
+def test_native_qwen3_rollout_without_body_is_fully_masked(
+    native_qwen3_tokenizer: PreTrainedTokenizerBase,
+    response: str,
+    policy: str,
+) -> None:
+    scorer, teacher, prompt_ids, response_ids, messages = _native_scoring_case(
+        native_qwen3_tokenizer, response, missing_close_policy=policy
+    )
+    result = scorer.score(
+        input_ids=torch.tensor([prompt_ids + response_ids]), message_logs=[messages]
+    )
+    assert not result.valid_mask.any()
+    assert not result.logprobs.any()
+    assert teacher.calls == 1
+    assert result.metrics.get("mopd/sample_prepare_failures", 0) == 0
+    expected_teacher_text = "<|im_start|>user\nq<|im_end|>\n"
+    if policy == "preserve_open_if_proven" and response.startswith("<think>"):
+        expected_teacher_text += "<|im_start|>assistant\n<think>\n"
+    assert (
+        native_qwen3_tokenizer.decode(
+            teacher.last_batch["input_ids"][0], skip_special_tokens=False
+        )
+        == expected_teacher_text
+    )

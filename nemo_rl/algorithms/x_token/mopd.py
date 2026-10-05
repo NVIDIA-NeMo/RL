@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import inspect
+import re
 from collections.abc import Sequence
 from typing import Any, Literal
 
@@ -25,7 +26,7 @@ from transformers import PreTrainedTokenizerBase
 from nemo_rl.algorithms.x_token.token_aligner import AlignmentPair, TokenAligner
 
 MOPD_ALIGNMENT_METHOD = "offset_cluster_decode_fix"
-ThinkingState = Literal["open", "closed", "unknown"]
+ThinkingState = Literal["waiting", "open", "closed", "unknown"]
 
 
 def normalize_alignment_method(method: str) -> str:
@@ -220,6 +221,7 @@ def classify_thinking_state_before_generated_span(
     token_ids: Sequence[int],
     *,
     generated_start: int,
+    expects_thinking: bool = False,
 ) -> ThinkingState:
     """Classify the exact chat-template state at a generation boundary."""
     if generated_start < 0 or generated_start > len(token_ids):
@@ -229,6 +231,11 @@ def classify_thinking_state_before_generated_span(
         open_ids = _tokenizer_ids(
             tokenizer,
             "<|im_start|>assistant\n<think>\n",
+        )
+        waiting_ids = (
+            _tokenizer_ids(tokenizer, "<|im_start|>assistant\n")
+            if expects_thinking
+            else []
         )
         closed_id_variants = [
             _tokenizer_ids(
@@ -247,29 +254,46 @@ def classify_thinking_state_before_generated_span(
     for closed_ids in closed_id_variants:
         if closed_ids and prefix_ids[-len(closed_ids) :] == closed_ids:
             return "closed"
+    if waiting_ids and prefix_ids[-len(waiting_ids) :] == waiting_ids:
+        return "waiting"
     return "unknown"
 
 
-def generated_think_tool_marker_error(
+def generated_thinking_state_after_response(
     text: str,
     *,
     initial_state: ThinkingState,
-) -> str | None:
-    """Return the structural error in one sampled assistant span, if any."""
-    if initial_state == "unknown":
-        return "unknown_thinking_state"
+) -> tuple[ThinkingState, str | None]:
+    """Follow sampled thinking markers in order and validate tool markers.
 
-    think_open_count = text.count("<think>")
-    think_close_count = text.count("</think>")
-    if think_open_count:
-        return "generated_think_open"
-    if initial_state == "open" and think_close_count > 1:
-        return "multiple_think_close"
-    if initial_state == "closed" and think_close_count:
-        return "unexpected_think_close"
+    Native Qwen3 leaves thinking unopened in its prompt. Its first sampled
+    content must open thinking; Nano-style prompts have already opened it.
+    Parsing decoded text supports tokenizers that split a marker across IDs.
+    An otherwise valid response may end open, for the missing-close policy
+    to handle separately.
+    """
+    state = initial_state
+    if state == "unknown":
+        return state, "unknown_thinking_state"
+
+    for marker in re.finditer(r"<think>|</think>", text):
+        if marker.group() == "<think>":
+            if state != "waiting":
+                return state, "generated_think_open"
+            if marker.start() != 0:
+                return state, "misplaced_think_open"
+            state = "open"
+        elif state == "open":
+            state = "closed"
+        elif state == "closed" and initial_state != "closed":
+            return state, "multiple_think_close"
+        else:
+            return state, "unexpected_think_close"
+    if state == "waiting":
+        return state, "missing_think_open"
 
     if "<tool_response>" in text or "</tool_response>" in text:
-        return "generated_tool_response"
+        return state, "generated_tool_response"
 
     tool_depth = 0
     cursor = 0
@@ -283,16 +307,28 @@ def generated_think_tool_marker_error(
         ):
             tool_depth += 1
             if tool_depth > 1:
-                return "nested_tool_call"
+                return state, "nested_tool_call"
             cursor = open_position + len("<tool_call>")
         else:
             tool_depth -= 1
             if tool_depth < 0:
-                return "unmatched_tool_call_close"
+                return state, "unmatched_tool_call_close"
             cursor = close_position + len("</tool_call>")
     if tool_depth:
-        return "unclosed_tool_call"
-    return None
+        return state, "unclosed_tool_call"
+    return state, None
+
+
+def generated_think_tool_marker_error(
+    text: str,
+    *,
+    initial_state: ThinkingState,
+) -> str | None:
+    """Return the structural error in one sampled assistant span, if any."""
+    _, error = generated_thinking_state_after_response(
+        text, initial_state=initial_state
+    )
+    return error
 
 
 def validate_generated_think_tool_markers(
@@ -320,7 +356,17 @@ def render_teacher_open_thinking_prefix(
         tokenizer,
         rendered_ids,
         generated_start=len(rendered_ids),
+        expects_thinking=True,
     )
+    if state == "waiting":
+        # Native Qwen3 expects the response to supply its opening marker.
+        rendered += "<think>\n"
+        rendered_ids = _tokenizer_ids(tokenizer, rendered)
+        state = classify_thinking_state_before_generated_span(
+            tokenizer,
+            rendered_ids,
+            generated_start=len(rendered_ids),
+        )
     if state != "open":
         raise ValueError(
             "Teacher chat template did not produce a provable open-thinking "
@@ -655,7 +701,11 @@ def qwen3_assistant_content_transform(
     if trim_outer_whitespace:
         reasoning = reasoning.strip()
     body = content.split("</think>")[-1].lstrip("\n")
-    return reasoning + "\n</think>\n\n" + body, True
+    # With empty reasoning the template's opening and closing newlines touch
+    # and may form one token. Keep both in the alignment span so provenance
+    # can exclude the entire formatting token without masking sampled tags.
+    reasoning_prefix = reasoning if reasoning else "\n"
+    return reasoning_prefix + "\n</think>\n\n" + body, True
 
 
 def qwen3_leading_think_prefix_len(content: str) -> int:
@@ -793,7 +843,7 @@ def trim_leading_text_tokens_for_alignment(
     text: str,
     trim_chars: int,
 ) -> tuple[list[int], int, str]:
-    """Trim a leading decoded-text prefix from token IDs when token-clean."""
+    """Trim a leading decoded-text prefix only at an original token boundary."""
     token_ids = list(token_ids)
     if trim_chars <= 0 or trim_chars >= len(text):
         return token_ids, 0, text
@@ -809,13 +859,19 @@ def trim_leading_text_tokens_for_alignment(
             ids = list(encoding["input_ids"])
             offsets = [tuple(pair) for pair in encoding["offset_mapping"]]
         except (NotImplementedError, TypeError, ValueError):
-            encoding = tokenizer(text, return_tensors=None, add_special_tokens=False)
-            ids = list(encoding["input_ids"])
-            offsets = compute_offsets_manual(tokenizer, ids, text)
+            ids = []
+            offsets = None
+        if ids != token_ids:
+            # Rollout tokens need not equal a canonical re-encoding. Derive
+            # positions from the actual stream, including split thinking tags.
+            offsets = compute_offsets_manual(tokenizer, token_ids, text)
+        if (
+            offsets is None
+            or len(offsets) != len(token_ids)
+            or tokenizer.decode(token_ids, skip_special_tokens=False) != text
+        ):
+            return token_ids, 0, text
     except (KeyError, TypeError, ValueError, RuntimeError):
-        return token_ids, 0, text
-
-    if not ids or offsets is None:
         return token_ids, 0, text
 
     dropped = 0
@@ -827,9 +883,16 @@ def trim_leading_text_tokens_for_alignment(
             return token_ids, 0, text
         break
 
-    if dropped <= 0 or token_ids[:dropped] != ids[:dropped]:
+    if dropped <= 0:
         return token_ids, 0, text
-    return token_ids[dropped:], dropped, text[trim_chars:]
+    trimmed_ids = token_ids[dropped:]
+    trimmed_text = text[trim_chars:]
+    try:
+        if tokenizer.decode(trimmed_ids, skip_special_tokens=False) != trimmed_text:
+            return token_ids, 0, text
+    except (TypeError, ValueError, RuntimeError):
+        return token_ids, 0, text
+    return trimmed_ids, dropped, trimmed_text
 
 
 def build_char_mapping(original: str, transformed: str) -> list[int] | None:
