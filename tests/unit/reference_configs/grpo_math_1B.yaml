@@ -40,6 +40,8 @@ grpo:
     use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
     reward_weights: null  # GDPO-specific: one weight per reward component
     minus_baseline: true  # Reinforce++-baseline specific: subtract per-prompt mean baseline
+    proximal_teacher_alpha: 1.0  # OPD-specific: TROPD proximal-teacher weight in (0, 1]; 1.0 is plain MOPD
+    subtract_global_baseline: false  # OPD-specific: center advantages on the step's mean over valid tokens
   reward_scaling:
     enabled: false
     source_min: 0.0
@@ -153,7 +155,6 @@ policy:
   worker_extension_cls_fqn: null
 
   dtensor_cfg:
-    _v2: true
     enabled: true
     checkpoint:
       model_save_format: "safetensors"
@@ -544,14 +545,20 @@ logger:
     project: "grpo-dev"
     name: "grpo-dev-logger"
     log_nemo_gym_full_result_tables: false
+    entity: null
+    id: null
+    resume: null
   swanlab:
     project: "grpo-dev"
     name: "grpo-dev-logger"
-  tensorboard: {}
+  tensorboard:
+    log_dir: null
   mlflow:
     experiment_name: "grpo-dev"
     run_name: "grpo-dev-logger"
     tracking_uri: "http://localhost:5000"
+    run_id: null
+    artifact_location: null
   gpu_monitoring:
     collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)

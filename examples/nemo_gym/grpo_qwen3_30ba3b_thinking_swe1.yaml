@@ -55,7 +55,6 @@ policy:
   logprob_chunk_size: 2048
   offload_optimizer_for_logprob: true
   dtensor_cfg:
-    _v2: true
     activation_checkpointing: false
     tensor_parallel_size: 1
   megatron_cfg:

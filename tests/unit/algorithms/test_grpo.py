@@ -81,6 +81,7 @@ from nemo_rl.data.dataloader import CyclingDataLoader
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
     EnvironmentReturn,
@@ -102,6 +103,7 @@ from nemo_rl.models.generation.interfaces import should_use_async_rollouts
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
+from nemo_rl.utils.logger import LoggerConfig, WandbConfig
 from nemo_rl.utils.timer import Timer
 from tests.unit.algorithms.utils import (
     create_mock_batch,
@@ -540,13 +542,8 @@ def mock_grpo_components():
                 "checkpoint_must_save_by": None,
                 "save_period": 10,
             },
-            "cluster": {
-                "num_nodes": 1,
-                "gpus_per_node": 2,
-            },
-            "logger": {
-                "num_val_samples_to_print": 5,
-            },
+            "cluster": ClusterConfig(num_nodes=1, gpus_per_node=2),
+            "logger": LoggerConfig.model_construct(num_val_samples_to_print=5),
             "data": {
                 "use_multiple_dataloader": False,
             },
@@ -3051,8 +3048,8 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node(
     }
     master_config.grpo.val_period = 0
     master_config.grpo.batch_multiplier = 1
-    master_config.cluster["num_nodes"] = 1  # Single node, so policy_nodes=1
-    master_config.cluster["gpus_per_node"] = 8
+    master_config.cluster.num_nodes = 1  # Single node, so policy_nodes=1
+    master_config.cluster.gpus_per_node = 8
     master_config.data["shuffle"] = False
     master_config.data["num_workers"] = 1
 
@@ -3331,8 +3328,8 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node(
     master_config.grpo.val_period = 0
     master_config.grpo.batch_multiplier = 1
     # Multi-node, so policy_nodes=1 after subtracting inference
-    master_config.cluster["num_nodes"] = 2
-    master_config.cluster["gpus_per_node"] = 8
+    master_config.cluster.num_nodes = 2
+    master_config.cluster.gpus_per_node = 8
     master_config.data["shuffle"] = False
     master_config.data["num_workers"] = 1
 
@@ -3365,8 +3362,8 @@ def test_noncolocated_opd_teacher_must_fit_on_one_cluster_node(
     from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 
     master_config = mock_grpo_components["master_config"]
-    master_config.cluster["num_nodes"] = 3
-    master_config.cluster["gpus_per_node"] = 4
+    master_config.cluster.num_nodes = 3
+    master_config.cluster.gpus_per_node = 4
     master_config.grpo.val_period = 0
     master_config.grpo.batch_multiplier = 1
     master_config.on_policy_distillation = OnPolicyDistillationConfig.model_validate(
@@ -3551,7 +3548,7 @@ def test_setup_auto_enables_skip_reference_logprobs_with_policy_factory(
         master_config.grpo.skip_reference_policy_logprobs_calculation = (
             initial_skip_flag
         )
-    master_config.cluster["gpus_per_node"] = 4
+    master_config.cluster.gpus_per_node = 4
     master_config.data["shuffle"] = False
     master_config.data["num_workers"] = 0
 
@@ -3673,7 +3670,7 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
     master_config.loss_fn = ClippedPGLossConfig(reference_policy_kl_penalty=0.0)
     master_config.grpo.val_period = 0
     master_config.grpo.batch_multiplier = 1
-    master_config.cluster["gpus_per_node"] = 1
+    master_config.cluster.gpus_per_node = 1
     master_config.data["shuffle"] = False
     master_config.data["num_workers"] = 0
 
@@ -3799,7 +3796,7 @@ def test_setup_refits_noncolocated_megatron_while_nemo_gym_waits(
     master_config.loss_fn = ClippedPGLossConfig(reference_policy_kl_penalty=0.0)
     master_config.grpo.val_period = 0
     master_config.grpo.batch_multiplier = 1
-    master_config.cluster["gpus_per_node"] = 2
+    master_config.cluster.gpus_per_node = 2
     master_config.data["shuffle"] = False
     master_config.data["num_workers"] = 0
 
@@ -5670,7 +5667,7 @@ class TestValidateFunction:
         # Mock config
         mock_config = mock_grpo_components["master_config"]
         mock_config.grpo.val_batch_size = 2
-        mock_config.logger["num_val_samples_to_print"] = 2
+        mock_config.logger.num_val_samples_to_print = 2
 
         mock_rollout_metrics = {"mean_gen_tokens_per_sample": 10.0}
 
@@ -5747,7 +5744,7 @@ class TestValidateFunction:
 
         # Mock config
         mock_config = mock_grpo_components["master_config"]
-        mock_config.logger["num_val_samples_to_print"] = 1
+        mock_config.logger.num_val_samples_to_print = 1
 
         mock_rollout_metrics = {"mean_gen_tokens_per_sample": 10.0}
 
@@ -5860,7 +5857,8 @@ class TestValidateFunction:
         mock_config.policy["generation"].update(
             {"val_temperature": 0.1, "val_top_p": 0.9, "val_top_k": None}
         )
-        mock_config.logger.update({"wandb_enabled": False, "wandb": {}})
+        mock_config.logger.wandb_enabled = False
+        mock_config.logger.wandb = WandbConfig.model_construct()
         mock_config.env = {}
 
         def run_gym_rollout(**kwargs):
