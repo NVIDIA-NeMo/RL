@@ -329,6 +329,7 @@ guides/environments.md
 guides/eval.md
 guides/deepseek.md
 guides/models/index.md
+docs/runbooks/supervl3p5/nemo-rl/super-vl-3p5.md
 model-quirks.md
 guides/async-grpo.md
 guides/single-controller.md
