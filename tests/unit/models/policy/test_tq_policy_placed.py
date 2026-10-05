@@ -24,6 +24,7 @@ from nemo_rl.data_plane.schema import (
     MICRO_BATCH_INDICES,
     MICRO_BATCH_LENGTHS,
 )
+from nemo_rl.distributed.named_sharding import GTP_WEIGHT_REMAT_AXIS
 from nemo_rl.models.policy.tq_policy import TQPolicy
 
 
@@ -45,6 +46,12 @@ def _policy() -> tuple[TQPolicy, MagicMock]:
     policy._opd_full_field = None  # opd_full off, as __init__ leaves it
     policy.flops_tracker = None
     policy.sharding_annotations = MagicMock()
+    policy.sharding_annotations.names = [
+        "pipeline_parallel",
+        "data_parallel",
+        "context_parallel",
+        "tensor_parallel",
+    ]
     policy.sharding_annotations.get_axis_size.return_value = 2
     worker_group = MagicMock()
     policy.worker_group = worker_group
@@ -87,13 +94,35 @@ def test_train_placed_microbatches_keeps_fields_and_replica_delivery() -> None:
     worker_group.get_all_worker_results.assert_called_once()
 
 
-def test_train_placed_microbatches_requires_one_batch_per_dp_rank() -> None:
+def test_train_placed_microbatches_requires_one_batch_per_logical_rank() -> None:
     policy, worker_group = _policy()
 
-    with pytest.raises(ValueError, match="one batch per DP rank"):
+    with pytest.raises(ValueError, match="one batch per logical data rank"):
         policy.train_placed_microbatches([_meta(0, ["input_ids"])])
 
     worker_group.run_all_workers_sharded_data.assert_not_called()
+
+
+def test_train_placed_microbatches_shards_over_dp_and_gtp() -> None:
+    policy, worker_group = _policy()
+    policy.sharding_annotations.names.insert(2, GTP_WEIGHT_REMAT_AXIS)
+    policy.sharding_annotations.get_axis_size.side_effect = {
+        "data_parallel": 2,
+        GTP_WEIGHT_REMAT_AXIS: 2,
+    }.__getitem__
+    dp_metas = [_meta(rank, ["input_ids"]) for rank in range(4)]
+
+    policy.train_placed_microbatches(dp_metas)
+
+    dispatch = worker_group.run_all_workers_sharded_data.call_args
+    assert dispatch.kwargs["in_sharded_axes"] == [
+        "data_parallel",
+        GTP_WEIGHT_REMAT_AXIS,
+    ]
+    assert [
+        [meta.extra_info["logical_dp_rank"] for meta in dp_group]
+        for dp_group in dispatch.kwargs["meta"]
+    ] == [[0, 1], [2, 3]]
 
 
 def test_train_placed_microbatches_rejects_dynamic_batching() -> None:
@@ -150,3 +179,11 @@ def test_train_placed_microbatches_accepts_producer_packing_shapes() -> None:
         24,
     ]
     assert [meta.task_name for meta in dispatched] == ["train", "train"]
+
+
+def test_train_microbatches_gtp_rejects_dp_only_dispatch() -> None:
+    policy, worker_group = _policy()
+    policy.sharding_annotations.names.insert(2, GTP_WEIGHT_REMAT_AXIS)
+    with pytest.raises(ValueError, match="producer-placed metadata"):
+        policy._dispatch_train_microbatches([_meta(0, ["input_ids"])], timer=None)
+    worker_group.run_all_workers_sharded_data.assert_not_called()
