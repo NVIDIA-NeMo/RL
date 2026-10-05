@@ -24,7 +24,17 @@ DOCKERFILES = (
 def test_docker_images_build_deepep_with_multinode_hybridep() -> None:
     for dockerfile, uses_uv_cache_seed in DOCKERFILES:
         lines = dockerfile.read_text().splitlines()
-        setting = "ENV HYBRID_EP_MULTINODE=1"
+        # docker/Dockerfile derives this from the ARG (not a literal "=1") so a
+        # non-default --build-arg HYBRID_EP_MULTINODE=0 is reflected
+        # consistently in its cache mount IDs and in uv-cache-export's --
+        # see the comment above that ENV line for why a literal there is a
+        # bug. Dockerfile.ngc_pytorch has no such cache-mount-id mechanism
+        # (uses_uv_cache_seed=False), so it keeps the plain literal.
+        setting = (
+            "ENV HYBRID_EP_MULTINODE=${HYBRID_EP_MULTINODE}"
+            if uses_uv_cache_seed
+            else "ENV HYBRID_EP_MULTINODE=1"
+        )
         nvml_link_dependency_install = (
             "apt-get install -y --no-install-recommends libnvidia-ml-dev"
         )
@@ -66,21 +76,41 @@ def test_docker_images_build_deepep_with_multinode_hybridep() -> None:
         )
 
         if uses_uv_cache_seed:
-            cache_key_line = next(
-                (
-                    line
-                    for line in lines
-                    if line.startswith("CACHE_KEY=")
-                    and "BASE_IMAGE" in line
-                    and "UV_VERSION" in line
-                ),
-                None,
+            # The uv download cache lives on a BuildKit cache mount (never part of
+            # any image layer); its `id=` is the cache's identity, so it must
+            # incorporate BASE_IMAGE/UV_VERSION/HYBRID_EP_MULTINODE the same way
+            # the old CACHE_KEY computation did, or a single-node-built DeepEP
+            # wheel could get silently reused for a multi-node build.
+            cache_mount_lines = [
+                line
+                for line in lines
+                if "--mount=type=cache" in line
+                and "id=uv-cache-" in line
+                and "${BASE_IMAGE}" in line
+                and "${UV_VERSION}" in line
+            ]
+            assert cache_mount_lines, (
+                f"{dockerfile} does not define a uv cache mount keyed on the base image and uv version"
             )
-            assert cache_key_line is not None, (
-                f"{dockerfile} does not define the uv seed cache key"
-            )
-            assert "HYBRID_EP_MULTINODE" in cache_key_line, (
-                f"{dockerfile} can reuse a single-node DeepEP wheel"
+            for cache_mount_line in cache_mount_lines:
+                assert "${HYBRID_EP_MULTINODE}" in cache_mount_line, (
+                    f"{dockerfile} can reuse a single-node DeepEP wheel: {cache_mount_line}"
+                )
+            # Every uv-writing RUN (and uv-cache-export) must key its mount with
+            # the SAME id string, or a copy-paste drift in just one of them
+            # silently creates a disconnected cache for that RUN -- see the
+            # ENV/ARG divergence this same identity bug took the form of above.
+            # Compare just the `id=...` segment: the surrounding line differs
+            # (RUN vs. a \-continuation, trailing bash flags) even when the
+            # cache identity itself is consistent.
+            mount_ids = {
+                segment.split(",", 1)[0]
+                for line in cache_mount_lines
+                for segment in line.split("id=uv-cache-", 1)[1:]
+            }
+            assert len(mount_ids) == 1, (
+                f"{dockerfile} has mismatched uv cache mount IDs across RUN blocks: "
+                f"{sorted(mount_ids)}"
             )
             actor_prefetch_end = "done < /opt/actor_venvs.tsv"
             assert actor_prefetch_end in lines, (
