@@ -142,7 +142,6 @@ def _grpo_master_config(tmp_path) -> MasterConfig:
         data_plane=_data_plane_config(),
         policy={
             "train_global_batch_size": 8,
-            "max_total_sequence_length": 32,
             "generation": {"colocated": {"enabled": False}},
         },
         grpo=GRPOConfig.model_construct(
@@ -485,7 +484,6 @@ def test_logs_hyperparameters_and_concrete_weight_synchronizer(
         data_plane=_data_plane_config(),
         policy={
             "train_global_batch_size": 8,
-            "max_total_sequence_length": 32,
             "generation": {"colocated": {"enabled": False}},
         },
         grpo=GRPOConfig.model_construct(
@@ -549,7 +547,6 @@ def test_reference_logprobs_required_only_when_kl_enabled(
         data_plane=_data_plane_config(),
         policy={
             "train_global_batch_size": 8,
-            "max_total_sequence_length": 32,
             "generation": {"colocated": {"enabled": False}},
         },
         grpo=GRPOConfig.model_construct(
@@ -613,7 +610,6 @@ def test_logs_setup_timing_metrics(monkeypatch, tmp_path) -> None:
         data_plane=_data_plane_config(),
         policy={
             "train_global_batch_size": 8,
-            "max_total_sequence_length": 32,
             "generation": {"colocated": {"enabled": False}},
         },
         grpo=GRPOConfig.model_construct(

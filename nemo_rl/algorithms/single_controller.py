@@ -731,9 +731,11 @@ class SingleControllerActor:
         # single_controller_utils/{masking_stats,rollout_stats}.py.
         self._masking_stats_acc = new_masking_stats_accumulator()
         self._rollout_stats_acc = new_rollout_stats_accumulator()
-        self._max_total_sequence_length = master_config.policy[
+        # Only the rollout_stats context-use metric reads it; without it that one
+        # metric is skipped rather than failing controller construction.
+        self._max_total_sequence_length = master_config.policy.get(
             "max_total_sequence_length"
-        ]
+        )
         self._opd_gap_sum = 0.0
         self._opd_stat_sum = 0.0
         self._opd_stat_sumsq = 0.0
