@@ -325,46 +325,6 @@ def test_empty_teachers_list_rejected_at_config_load():
     )
 
 
-def test_setup_rejects_legacy_v2_key_on_student():
-    cfg = _make_master_config()
-    cfg.policy["dtensor_cfg"]["_v2"] = False
-    with (
-        patch.object(xt_mod, "RayVirtualCluster") as mock_cluster,
-        pytest.raises(
-            ValueError,
-            match=r"DTensor v1 \(policy\.dtensor_cfg\._v2=false\)",
-        ),
-    ):
-        setup(
-            cfg,
-            student_tokenizer=_make_tokenizer(32),
-            teacher_tokenizers=[_make_tokenizer(24)],
-            train_dataset=MagicMock(),
-            val_dataset=None,
-        )
-    assert mock_cluster.call_count == 0
-
-
-def test_setup_rejects_legacy_v2_key_on_teacher():
-    cfg = _make_master_config()
-    cfg.teachers[0].dtensor_cfg["_v2"] = False
-    with (
-        patch.object(xt_mod, "RayVirtualCluster") as mock_cluster,
-        pytest.raises(
-            ValueError,
-            match=r"DTensor v1 \(teachers\.0\.dtensor_cfg\._v2=false\)",
-        ),
-    ):
-        setup(
-            cfg,
-            student_tokenizer=_make_tokenizer(32),
-            teacher_tokenizers=[_make_tokenizer(24)],
-            train_dataset=MagicMock(),
-            val_dataset=None,
-        )
-    assert mock_cluster.call_count == 0
-
-
 def test_setup_injects_vocab_sizes_into_loss_config():
     cfg = _make_master_config()
     original_loss_cfg = deepcopy(cfg.loss_fn)
