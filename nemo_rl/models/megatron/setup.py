@@ -46,6 +46,7 @@ from megatron.bridge.training.config import (
     TokenizerConfig,
     TrainingConfig,
 )
+from megatron.bridge.training.gtp import classify_gtp_remat_chains, configure_gtp_remat
 from megatron.bridge.training.initialize import (
     initialize_megatron,
     set_jit_fusion_options,
@@ -2545,6 +2546,7 @@ def setup_model_and_optimizer(
         patch_gpt_model_forward_for_linear_ce_fusion(
             chunk_size=policy_cfg["megatron_cfg"]["fused_linear_logprobs_chunk_size"]
         )
+    configure_gtp_remat(megatron_cfg.model)
     model = get_model(
         megatron_cfg.model,
         megatron_cfg.ddp,
@@ -2556,6 +2558,7 @@ def setup_model_and_optimizer(
         pg_collection=pg_collection,
         wrap_with_ddp=load_optimizer,
     )
+    classify_gtp_remat_chains(model, megatron_cfg.model)
 
     if load_optimizer:
         optimizer, scheduler = setup_optimizer(

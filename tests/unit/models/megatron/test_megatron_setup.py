@@ -4137,6 +4137,8 @@ class TestHandleModelImport:
 class TestSetupModelAndOptimizer:
     """Tests for setup_model_and_optimizer function."""
 
+    @patch("nemo_rl.models.megatron.setup.classify_gtp_remat_chains")
+    @patch("nemo_rl.models.megatron.setup.configure_gtp_remat")
     @patch("nemo_rl.models.megatron.setup.ProcessGroupCollection")
     @patch("nemo_rl.models.megatron.setup.GlobalState")
     @patch("nemo_rl.models.megatron.setup.initialize_megatron")
@@ -4165,6 +4167,8 @@ class TestSetupModelAndOptimizer:
         mock_init_megatron,
         mock_global_state,
         mock_pg_collection,
+        mock_configure_gtp,
+        mock_classify_gtp,
     ):
         """Test setup_model_and_optimizer with MoE router freezing."""
         from nemo_rl.models.megatron.setup import setup_model_and_optimizer
@@ -4206,11 +4210,26 @@ class TestSetupModelAndOptimizer:
             }
         }
 
+        calls = MagicMock()
+        calls.attach_mock(mock_configure_gtp, "configure")
+        calls.attach_mock(mock_get_model, "build")
+        calls.attach_mock(mock_classify_gtp, "classify")
+        calls.attach_mock(mock_setup_optimizer, "optimizer")
+
         result = setup_model_and_optimizer(
             policy_cfg=policy_cfg,
             megatron_cfg=mock_megatron_cfg,
             load_optimizer=True,
         )
+
+        assert [call[0] for call in calls.mock_calls] == [
+            "configure",
+            "build",
+            "classify",
+            "optimizer",
+        ]
+        mock_configure_gtp.assert_called_once_with(mock_megatron_cfg.model)
+        mock_classify_gtp.assert_called_once_with(mock_model, mock_megatron_cfg.model)
 
         # Verify get_model was called (the mixed_precision_wrapper should be CustomFloat16Module)
         mock_get_model.assert_called_once()

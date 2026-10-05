@@ -110,7 +110,7 @@ overrides = [
     { name = "pytest", specifier = ">=9.0.3" },
     { name = "setuptools", specifier = ">=80.10.2" },
     { name = "timm", specifier = "<=1.0.22" },
-    { name = "transformer-engine", extras = ["pytorch", "core-cu13"], specifier = "==2.18.0" },
+    { name = "transformer-engine", extras = ["pytorch", "core-cu13"], specifier = "==2.19.0" },
     { name = "xgrammar", specifier = ">=0.2.1,<1.0.0" },
 ]
 
@@ -8600,10 +8600,10 @@ dependencies = [
 
 [[package]]
 name = "transformer-engine"
-version = "2.18.0"
+version = "2.19.0"
 source = { registry = "https://pypi.org/simple" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/84/6a/29b7ac32c9df481c0284a57ac9639d9f3dbd4e6f8e899f03e685268d7c8d/transformer_engine-2.18.0-py3-none-any.whl", hash = "sha256:9d7c4bd74247e57eeed2af46f7b91c133cc405404953f1f3f2e38be8c47cdb7e", size = 1017270, upload-time = "2026-08-11T00:49:41.88Z" },
+    { url = "https://files.pythonhosted.org/packages/4a/22/09e9ed5e69ee0c8c955bb6ee6d81748e4384f0cd24308ff1580387d09f7c/transformer_engine-2.19.0-py3-none-any.whl", hash = "sha256:965d78429d287f7db6978bf299cfcecf68c730247f05cc830ecc6983a123bbc7", size = 1135745, upload-time = "2026-09-11T16:18:37.173Z" },
 ]
 
 [package.optional-dependencies]
@@ -8616,7 +8616,7 @@ pytorch = [
 
 [[package]]
 name = "transformer-engine-cu13"
-version = "2.18.0"
+version = "2.19.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "importlib-metadata" },
@@ -8624,13 +8624,13 @@ dependencies = [
     { name = "pydantic" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/31/37/b2010e5c18b25b5016064685dbf858d880bdeb859e2d1b2d5b9cd69230fa/transformer_engine_cu13-2.18.0-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:d5e9049256d66e1fb1743b5e1ff78e65a580bc09c371f4977ca71cdf7899fca4", size = 278015862, upload-time = "2026-08-11T00:50:33.011Z" },
-    { url = "https://files.pythonhosted.org/packages/c8/6e/0b069ec61e499d147b34a17af389384a81be02435d37bcbf72d8590ac2f2/transformer_engine_cu13-2.18.0-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:38e842ab60fdb9f7ca4d0345bdea1f7f9219a3d712a169b4973a95bc38011263", size = 279471780, upload-time = "2026-08-11T20:02:03.84Z" },
+    { url = "https://files.pythonhosted.org/packages/fa/87/8bf198c7ec3ec60b021b0b6dadb387d93eb08acfd251872b7c46e59ec723/transformer_engine_cu13-2.19.0-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:54dd7a38437cc3d80b94cf6fb91780d7dc5c34d80e62d79f6d892919f80e40a3", size = 242765590, upload-time = "2026-09-11T00:37:09.465Z" },
+    { url = "https://files.pythonhosted.org/packages/86/3f/d70c96b4e3f2d19cf79ae644a9f8ff451d4c3288a367222d3fa8f0c53ea6/transformer_engine_cu13-2.19.0-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:31a3afd47832160c64653ac4b7b34dfbb3b06a84681eb9474a501b2cd1912756", size = 244604595, upload-time = "2026-09-11T00:36:36.079Z" },
 ]
 
 [[package]]
 name = "transformer-engine-torch"
-version = "2.18.0"
+version = "2.19.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "einops" },
@@ -8643,7 +8643,7 @@ dependencies = [
     { name = "torch", version = "2.13.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" } },
     { name = "transformer-engine-cu13" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/db/f9/34ad04b8e32f3d43f6dd166831a68741eea0a4448a3b30d87e4b6da00bbd/transformer_engine_torch-2.18.0.tar.gz", hash = "sha256:47b812b1cb7b6941fedd3d160a2239a346ee88c28c60937a694f49f54ddccf79", size = 412496, upload-time = "2026-08-11T00:49:35.528Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/f7/1f/2216bf60f0fe7bbd0ac48586b8181e671e56f34f50a0a7251a212f53a06d/transformer_engine_torch-2.19.0.tar.gz", hash = "sha256:ef268cdd1296bd0ee9e563e18df96c992c347d2f5cb9b48335540e5498043635", size = 427097, upload-time = "2026-09-11T00:54:41.79Z" }
 
 [[package]]
 name = "transformers"

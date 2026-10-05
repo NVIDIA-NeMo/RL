@@ -63,6 +63,7 @@ from nemo_rl.data_plane.schema import (
     fields_with_optional_opd_full,
     fields_with_optional_routed_experts,
 )
+from nemo_rl.distributed.named_sharding import GTP_WEIGHT_REMAT_AXIS
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.telemetry.instrumentation import trace_context_kwargs
 from nemo_rl.utils.flops_tracker import get_theoretical_tflops
@@ -684,17 +685,17 @@ class TQPolicy(TQDriverMixin, Policy):
         dp_metas: list[KVBatchMeta],
         timer: Optional[Timer] = None,
     ) -> None:
-        """Dispatch one producer-assigned metadata batch per logical DP rank.
+        """Dispatch one producer-assigned metadata batch per logical DP×GTP rank.
 
-        The input order is the logical DP-rank order. Producer field lists
+        The input order is the DP-major/GTP-minor order. Producer field lists
         remain unchanged because an SFT loader can provide a narrower schema
         than the rollout training path.
         """
-        dp_world = self.sharding_annotations.get_axis_size("data_parallel")
-        if len(dp_metas) != dp_world:
+        data_axes, logical_world = self._placed_data_layout()
+        if len(dp_metas) != logical_world:
             raise ValueError(
-                "Placed metadata must contain exactly one batch per DP rank: "
-                f"got {len(dp_metas)} batches for dp_world={dp_world}."
+                "Placed metadata must contain exactly one batch per logical data rank: "
+                f"got {len(dp_metas)} batches for logical_world={logical_world}."
             )
         spa, dba = self._packing_args("train_mb_tokens")
         if dba is not None:
@@ -711,7 +712,27 @@ class TQPolicy(TQDriverMixin, Policy):
             replace(meta, task_name="train")
             for meta in self._stamp_placed_pad_seqlen(dp_metas)
         ]
-        self._dispatch_train_microbatches(train_metas, timer=timer)
+        self._dispatch_train_microbatches(
+            train_metas, timer=timer, in_sharded_axes=data_axes
+        )
+
+    def _placed_data_layout(self) -> tuple[list[str], int]:
+        """Return the producer data axes and their combined lane count."""
+        axes = ["data_parallel"]
+        world = self.sharding_annotations.get_axis_size("data_parallel")
+        if GTP_WEIGHT_REMAT_AXIS in self.sharding_annotations.names:
+            axes.append(GTP_WEIGHT_REMAT_AXIS)
+            world *= self.sharding_annotations.get_axis_size(GTP_WEIGHT_REMAT_AXIS)
+        return axes, world
+
+    def _nest_placed_metas(
+        self, metas: list[KVBatchMeta], axes: list[str]
+    ) -> list[KVBatchMeta] | list[list[KVBatchMeta]]:
+        """Nest producer metadata in DP-major/GTP-minor dispatch order."""
+        if GTP_WEIGHT_REMAT_AXIS not in axes:
+            return metas
+        size = self.sharding_annotations.get_axis_size(GTP_WEIGHT_REMAT_AXIS)
+        return [metas[offset : offset + size] for offset in range(0, len(metas), size)]
 
     def _stamp_placed_pad_seqlen(
         self, dp_metas: list[KVBatchMeta]
@@ -751,8 +772,15 @@ class TQPolicy(TQDriverMixin, Policy):
         dp_metas: list[KVBatchMeta],
         *,
         timer: Optional[Timer],
+        in_sharded_axes: Optional[list[str]] = None,
     ) -> None:
-        """Send prepared per-DP metadata into an open train step."""
+        """Send prepared per-data-lane metadata into an open train step."""
+        if GTP_WEIGHT_REMAT_AXIS in self.sharding_annotations.names and (
+            in_sharded_axes is None or GTP_WEIGHT_REMAT_AXIS not in in_sharded_axes
+        ):
+            raise ValueError(
+                "GTP training requires producer-placed metadata per DP×GTP lane."
+            )
         if self.flops_tracker is not None:
             for m in dp_metas:
                 self.flops_tracker.track_batch(list(m.sequence_lengths or []))
@@ -762,10 +790,11 @@ class TQPolicy(TQDriverMixin, Policy):
             if timer
             else nullcontext()
         ):
+            data_axes = in_sharded_axes or ["data_parallel"]
             futures = self.worker_group.run_all_workers_sharded_data(
                 "train_microbatch_presharded",
-                meta=dp_metas,
-                in_sharded_axes=["data_parallel"],
+                meta=self._nest_placed_metas(dp_metas, data_axes),
+                in_sharded_axes=data_axes,
                 replicate_on_axes=[
                     "context_parallel",
                     "tensor_parallel",
