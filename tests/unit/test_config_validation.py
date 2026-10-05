@@ -41,6 +41,7 @@ from nemo_rl.algorithms.xtoken_off_policy_distillation import (
 from nemo_rl.evals.eval import MasterConfig as EvalMasterConfig
 from nemo_rl.utils.config import (
     load_config_with_inheritance,
+    parse_hydra_overrides,
     register_omegaconf_resolvers,
 )
 
@@ -388,3 +389,43 @@ def test_all_config_has_no_legacy_v2_key(config_file):
                 f"Config file {config_file} still carries {section}.dtensor_cfg._v2. The key "
                 "was removed -- DTensor is always the Automodel backend now."
             )
+
+
+# Configs where a `teacher` section copies `policy` with a YAML merge key (`<<`).
+# The merge key is resolved by the YAML parser, so it captures the policy values
+# as written in the file and never sees a later CLI override. Fields that must
+# match between student and teacher therefore have to be interpolations.
+TEACHER_INHERITING_CONFIGS = [
+    "examples/configs/distillation_math.yaml",
+    "examples/configs/distillation_math_megatron.yaml",
+]
+
+
+@pytest.mark.parametrize("config_file", TEACHER_INHERITING_CONFIGS)
+def test_teacher_sequence_length_follows_policy_override(config_file):
+    """A CLI override of the student sequence length must reach the teacher.
+
+    Guards against regressing to a plain `<<: *POLICY_BASE` copy, where
+    `policy.max_total_sequence_length=N` silently left the teacher (and its
+    generation and batching limits, which are derived from it) at the value
+    written in the file.
+    """
+    override_value = 12345
+
+    config = load_config_with_inheritance(config_file)
+    assert config.policy.max_total_sequence_length != override_value, (
+        "pick an override value that differs from the config default"
+    )
+
+    config = parse_hydra_overrides(
+        config, [f"policy.max_total_sequence_length={override_value}"]
+    )
+    resolved = OmegaConf.to_container(config, resolve=True)
+
+    assert resolved["teacher"]["max_total_sequence_length"] == override_value, (
+        f"{config_file}: overriding policy.max_total_sequence_length did not "
+        f"propagate to the teacher "
+        f"(teacher is {resolved['teacher']['max_total_sequence_length']})"
+    )
+    # Limits derived from the teacher's own sequence length follow it.
+    assert resolved["teacher"]["generation"]["max_new_tokens"] == override_value
