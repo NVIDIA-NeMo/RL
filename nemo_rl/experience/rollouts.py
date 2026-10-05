@@ -3026,10 +3026,10 @@ async def run_async_nemo_gym_rollout(
     run_rollouts_timer_label = f"{timer_prefix}/run_rollouts"
 
     shard_set = as_nemo_gym_shard_set(task_to_env["nemo_gym"])
-    # The reliability knobs come from the environment's own configuration unless
-    # the caller passes them, so every caller of this function (synchronous GRPO,
-    # the asynchronous collector, PPO, distillation) applies the same configured
-    # values.
+    # The reliability knobs and the metrics hook come from the environment's own
+    # configuration unless the caller passes them, so every caller of this
+    # function (synchronous GRPO, the asynchronous collector, PPO, distillation)
+    # applies the same configured values.
     rollout_env_config = await _nemo_gym_rollout_config(shard_set)
     if health_check_interval_seconds is None:
         health_check_interval_seconds = get_nemo_gym_health_check_interval(
