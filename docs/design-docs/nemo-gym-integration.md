@@ -98,6 +98,25 @@ env:
 
 See `examples/nemo_gym/grpo_sharded_gym_smoke.yaml` for a complete manual smoke configuration.
 
+### Cut off slow rollouts in synchronous training
+
+A synchronous GRPO step waits for the slowest rollout of its batch. With long agentic sessions a single slow rollout (a sandbox that hangs, an agent that runs to its own timeout) can hold every GPU of the step idle long after the rest of the batch has returned. `env.nemo_gym.straggler_cutoff` bounds that tail:
+
+```yaml
+env:
+  nemo_gym:
+    straggler_cutoff:
+      enabled: true         # default false; the block is ignored without it
+      done_fraction: 0.95   # arm once this fraction of the batch has returned...
+      min_elapsed_s: 1800   # ...and at least this long after dispatch
+      grace_s: 300          # then wait this much longer before cutting
+      max_wall_s: 2700      # optional hard cap; null = none
+```
+
+When the cutoff fires, NeMo RL cancels every rollout still in flight. Cancelling closes the rollout's `/run` request, and NeMo Gym cancels the server-side handler. Each cut rollout is returned as a zero-reward placeholder whose `loss_multiplier` is 0 (and whose `mask_sample` is set), so it never contributes to the loss. Its zero reward is still part of the batch's reward tensor, like any other masked sample. The `straggler_cutoff/*` rollout metrics report how many rollouts were cut (`num_cut`), whether and when the cutoff armed (`armed`, `armed_at_s`), and when and why it fired (`cut_at_s`, `done_fraction_at_cut`, `cut_by_max_wall`).
+
+The cutoff applies only to synchronous GRPO training rollouts (with or without the data plane). Validation rollouts, async GRPO and SingleController ignore it. With sharded NeMo Gym, each actor instance applies the cutoff to its own share of the batch. It needs a NeMo Gym whose `run_examples` result supports `aclose()`. On an older NeMo Gym the actor logs a warning and runs the batch uncut.
+
 ### Version Requirements
 
 NeMo Gym runs as a Ray actor within NeMo RL's Ray cluster, so the same Ray and Python versions must be used in both environments.
