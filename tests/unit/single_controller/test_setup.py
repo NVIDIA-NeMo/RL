@@ -3097,3 +3097,12 @@ def test_load_opd_full_teacher_lm_heads_loads_one_head_per_unique_teacher(monkey
         "Qwen/teacher-a",
         "Qwen/teacher-b",
     ]
+
+
+def test_single_controller_rejects_agent_loss_weights():
+    """grpo.agent_loss_weights is a legacy-trainer knob; SC must not ignore it silently."""
+    config = _load_fullvocab_master_config()
+    validate_single_controller_config(config)
+    config.grpo.agent_loss_weights = {"short_tool_use_agent": 8.0}
+    with pytest.raises(NotImplementedError, match="agent_loss_weights"):
+        validate_single_controller_config(config)
