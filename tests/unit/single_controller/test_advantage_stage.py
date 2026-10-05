@@ -43,6 +43,16 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     split_meta_by_prompt_group,
 )
 from nemo_rl.algorithms.single_controller_utils.config import AdvantageConfig
+from nemo_rl.algorithms.single_controller_utils.masking_stats import (
+    new_masking_stats_accumulator,
+    reduce_masking_stats,
+)
+from nemo_rl.algorithms.single_controller_utils.rollout_stats import (
+    accumulate_rollout_stats,
+    merge_stats_accumulator,
+    new_rollout_stats_accumulator,
+    stats_accumulator_to_rpc,
+)
 from nemo_rl.algorithms.single_controller_utils.utils import (
     AdvantagePartial,
     RewardPartial,
@@ -50,7 +60,7 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 )
 from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import GROUP_ID_TAG
+from nemo_rl.data_plane.schema import GROUP_ID_TAG, INPUT_LENGTHS
 from nemo_rl.utils.rpc_guard import assert_metadata_only
 from nemo_rl.utils.timer import Timer
 from nemo_rl.utils.train_data_dump import TrainDataDump
@@ -81,6 +91,7 @@ class TestInputFields:
             adv.sample_mask_field,
             adv.mask_sample_field,
             adv.truncated_field,
+            INPUT_LENGTHS,
         ]
 
     def test_policy_logprobs_pull_both_logprob_columns(self) -> None:
@@ -135,6 +146,32 @@ class TestRpcBoundaryStaysMetadataOnly:
             opd_stat_sum=2.0,
             opd_stat_sumsq=2.5,
             opd_stat_count=2,
+        )
+        assert_metadata_only(outcome)
+
+    def test_outcome_with_row_stats_carries_no_payload(self) -> None:
+        stats = new_rollout_stats_accumulator()
+        accumulate_rollout_stats(
+            stats,
+            prompt_ids=torch.tensor([0, 0, 1, 1]),
+            rewards=torch.tensor([1.0, 0.0, 1.0, 1.0]),
+            sample_mask=torch.ones(4),
+            token_mask=torch.tensor([[0, 1, 1], [0, 1, 0], [1, 1, 1], [0, 0, 1]]),
+            truncated=torch.zeros(4, dtype=torch.bool),
+            seq_lens=torch.tensor([3, 3, 3, 3]),
+        )
+        outcome = AdvantageOutcome(
+            meta=KVBatchMeta(
+                partition_id="rollout_data",
+                task_name="train",
+                sample_ids=["sample-0"],
+                fields=["advantages"],
+            ),
+            has_valid_training_tokens=True,
+            num_mask_sample_filtered=0,
+            reward_partial=RewardPartial.from_rows(torch.tensor([1.0])),
+            advantage_partial=AdvantagePartial.from_values(torch.tensor([0.5])),
+            rollout_stats=stats_accumulator_to_rpc(stats),
         )
         assert_metadata_only(outcome)
 
@@ -481,6 +518,11 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         # disk shard-side.
         "train_data_dump_s",
         "train_data_dump_rows",
+        # One scalar per row as plain lists (rewards, mask flags, generated
+        # tokens, turns, sequence length, group index), never per-token data:
+        # the step's percentiles and per-group stats need the rows.
+        "masking_stats",
+        "rollout_stats",
     }
 
 
@@ -651,6 +693,8 @@ def _controller(
     ctrl._opd_stat_sum = ctrl._opd_stat_sumsq = 0.0
     ctrl._opd_stat_count = 0
     ctrl._opd_gap_sum = 0.0
+    ctrl._masking_stats_acc = new_masking_stats_accumulator()
+    ctrl._rollout_stats_acc = new_rollout_stats_accumulator()
     ctrl._step_log_dict = {
         "reward_partials": [],
         "advantage_partials": [],
@@ -759,3 +803,65 @@ def test_failed_actor_rpc_raises_and_retires_the_actor(capsys) -> None:
     assert ctrl._available_advantage_actors.qsize() == 0
     # The mutation cut is released even on failure.
     assert ctrl._data_plane_checkpoint_barrier.mutation_version == 1
+
+
+# ── grpo.masked_sample_rewards_in_baseline ────────────────────────────────
+
+
+class _RecordingEstimator:
+    """Records what the stage hands the estimator; returns zero advantages."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, torch.Tensor]] = []
+
+    def compute_advantage(self, prompt_ids, rewards, mask, valid_mask=None, **_):
+        self.calls.append({"mask": mask.clone(), "valid_mask": valid_mask.clone()})
+        return torch.zeros_like(mask)
+
+
+@pytest.mark.parametrize("keep_in_baseline", [False, True])
+def test_masked_rows_enter_the_baseline_only_when_enabled(keep_in_baseline) -> None:
+    """An env-flagged (incomplete) row never trains; the flag decides its baseline weight."""
+    meta = _meta_for_group_sizes([4])
+    rewards = [1.0, 1.0, 1.0, 0.0]
+    rows = {
+        sid: {
+            "total_reward": torch.tensor(rewards[i]),
+            "token_mask": torch.ones(SEQ),
+            "sample_mask": torch.tensor(1.0),
+            # The failing row is the one the env (or a mask_sample rule) flagged.
+            "mask_sample": torch.tensor(i == 3),
+            "truncated": torch.tensor(False),
+            "input_lengths": torch.tensor(SEQ),
+        }
+        for i, sid in enumerate(meta.sample_ids)
+    }
+    estimator = _RecordingEstimator()
+    computer = AdvantageComputer(
+        _RowStore(rows),
+        config=_config(
+            algo=GRPOConfig(
+                num_generations_per_prompt=4,
+                seq_logprob_error_threshold=None,
+                masked_sample_rewards_in_baseline=keep_in_baseline,
+            )
+        ),
+        advantage_estimator=estimator,
+    )
+    outcome = asyncio.run(computer.run(AdvantageRequest(meta=meta)))
+
+    (call,) = estimator.calls
+    # The flagged row never contributes a gradient either way.
+    assert call["mask"][3].sum() == 0
+    assert call["mask"][:3].bool().all()
+    # Only the flag decides whether its reward counts in the group baseline.
+    expected = [1.0, 1.0, 1.0, 1.0 if keep_in_baseline else 0.0]
+    assert call["valid_mask"].tolist() == expected
+
+    masking = new_masking_stats_accumulator()
+    assert outcome.masking_stats is not None
+    merge_stats_accumulator(masking, outcome.masking_stats)
+    metrics = reduce_masking_stats(masking)
+    assert metrics["masking/env_flag_rows"] == 1.0
+    assert metrics["masking/trained_rows"] == 3.0
+    assert metrics["masking/baseline_rows"] == (4.0 if keep_in_baseline else 3.0)

@@ -521,6 +521,10 @@ class AsyncRolloutImpl:
         self._timeouts = timeouts
         self._deadline_registry = deadline_registry
 
+    def pop_mask_rule_metrics(self) -> dict[str, float]:
+        """env.mask_sample_rules apply to NeMo-Gym responses only; nothing to report."""
+        return {}
+
     async def run_rollout(
         self,
         input_sample: DatumSpec,
@@ -1764,8 +1768,7 @@ class RolloutManager:
 
     def pop_mask_rule_metrics(self) -> dict[str, float]:
         """Step-level ``mask_rules/*`` hits since the last call ({} on the native impl)."""
-        pop = getattr(self._impl, "pop_mask_rule_metrics", None)
-        return pop() if pop is not None else {}
+        return self._impl.pop_mask_rule_metrics()
 
     @property
     def recovery_ledger(self) -> RolloutRecoveryLedger:

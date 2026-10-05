@@ -57,6 +57,12 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
     MasterConfig,
 )
+from nemo_rl.algorithms.single_controller_utils.masking_stats import (
+    new_masking_stats_accumulator,
+)
+from nemo_rl.algorithms.single_controller_utils.rollout_stats import (
+    new_rollout_stats_accumulator,
+)
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data_plane.schema import (
@@ -136,6 +142,7 @@ def _grpo_master_config(tmp_path) -> MasterConfig:
         data_plane=_data_plane_config(),
         policy={
             "train_global_batch_size": 8,
+            "max_total_sequence_length": 32,
             "generation": {"colocated": {"enabled": False}},
         },
         grpo=GRPOConfig.model_construct(
@@ -254,6 +261,8 @@ def _stamp_advantage_stage_config(ctrl, *, shardable: bool = True) -> None:
     ctrl._opd_stat_sumsq = 0.0
     ctrl._opd_stat_count = 0
     ctrl._opd_gap_sum = 0.0
+    ctrl._masking_stats_acc = new_masking_stats_accumulator()
+    ctrl._rollout_stats_acc = new_rollout_stats_accumulator()
 
 
 def test_resumed_mooncake_init_restores_without_partition_registration(
@@ -476,6 +485,7 @@ def test_logs_hyperparameters_and_concrete_weight_synchronizer(
         data_plane=_data_plane_config(),
         policy={
             "train_global_batch_size": 8,
+            "max_total_sequence_length": 32,
             "generation": {"colocated": {"enabled": False}},
         },
         grpo=GRPOConfig.model_construct(
@@ -539,6 +549,7 @@ def test_reference_logprobs_required_only_when_kl_enabled(
         data_plane=_data_plane_config(),
         policy={
             "train_global_batch_size": 8,
+            "max_total_sequence_length": 32,
             "generation": {"colocated": {"enabled": False}},
         },
         grpo=GRPOConfig.model_construct(
@@ -602,6 +613,7 @@ def test_logs_setup_timing_metrics(monkeypatch, tmp_path) -> None:
         data_plane=_data_plane_config(),
         policy={
             "train_global_batch_size": 8,
+            "max_total_sequence_length": 32,
             "generation": {"colocated": {"enabled": False}},
         },
         grpo=GRPOConfig.model_construct(
@@ -866,6 +878,7 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
             "sample_mask": torch.ones(batch_size),
             "mask_sample": torch.tensor([False, True, False, False]),
             "truncated": torch.tensor([False, False, False, True]),
+            "input_lengths": torch.ones(4, dtype=torch.long),
             "prev_logprobs": torch.zeros(batch_size, sequence_length),
             "generation_logprobs": generation_logprobs,
             # The sequence-error- and overlong-filtered rows are also flagged.
@@ -976,6 +989,7 @@ def test_advantage_stage_writes_each_sample_filter_without_seq_threshold(
             "sample_mask": torch.ones(batch_size),
             "mask_sample": torch.tensor(mask_sample),
             "truncated": torch.tensor(truncated),
+            "input_lengths": torch.ones(len(truncated), dtype=torch.long),
         },
         batch_size=[batch_size],
     )
@@ -1043,6 +1057,7 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
             "generation_logprobs": generation_logprobs,
             "mask_sample": torch.zeros(batch_size, dtype=torch.bool),
             "truncated": torch.tensor([False, True]),
+            "input_lengths": torch.ones(2, dtype=torch.long),
         },
         batch_size=[batch_size],
     )
@@ -1111,6 +1126,7 @@ def test_advantage_stage_clips_training_values_and_metrics() -> None:
             "sample_mask": torch.ones(batch_size),
             "mask_sample": torch.zeros(batch_size, dtype=torch.bool),
             "truncated": torch.zeros(batch_size, dtype=torch.bool),
+            "input_lengths": torch.ones(batch_size, dtype=torch.long),
         },
         batch_size=[batch_size],
     )
@@ -1181,6 +1197,7 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
             "generation_logprobs": torch.ones(batch_size, sequence_length),
             "mask_sample": torch.zeros(batch_size, dtype=torch.bool),
             "truncated": torch.zeros(batch_size, dtype=torch.bool),
+            "input_lengths": torch.ones(batch_size, dtype=torch.long),
         },
         batch_size=[batch_size],
     )
@@ -1245,6 +1262,7 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
             "sample_mask": torch.zeros(batch_size),
             "mask_sample": torch.zeros(batch_size, dtype=torch.bool),
             "truncated": torch.zeros(batch_size, dtype=torch.bool),
+            "input_lengths": torch.ones(batch_size, dtype=torch.long),
         },
         batch_size=[batch_size],
     )
@@ -1459,6 +1477,7 @@ def test_opd_advantage_stage_pools_raw_gap_separately_under_tropd() -> None:
                     "sample_mask": torch.ones(2),
                     "mask_sample": torch.zeros(2, dtype=torch.bool),
                     "truncated": torch.zeros(2, dtype=torch.bool),
+                    "input_lengths": torch.ones(2, dtype=torch.long),
                     "generation_logprobs": prev_logprobs,
                     "prev_logprobs": prev_logprobs,
                     "teacher_reference_logprobs": teacher_logprobs,
@@ -1875,6 +1894,7 @@ def _train_pump_controller(*, sampler) -> object:
         set_weight_version=MagicMock(),
         suspend_request_deadlines=MagicMock(),
         resume_request_deadlines=MagicMock(),
+        pop_mask_rule_metrics=lambda: {},
     )
     ctrl._loss_fn = None
     ctrl._dp_client = _NoOpDataPlane()
@@ -1894,6 +1914,9 @@ def _train_pump_controller(*, sampler) -> object:
         "seq_logprob_error_metrics": [],
     }
     ctrl._opd_gap_sum = 0.0
+    ctrl._masking_stats_acc = new_masking_stats_accumulator()
+    ctrl._rollout_stats_acc = new_rollout_stats_accumulator()
+    ctrl._max_total_sequence_length = 32
     ctrl._opd_stat_sum = 0.0
     ctrl._opd_stat_sumsq = 0.0
     ctrl._opd_stat_count = 0
@@ -2777,6 +2800,7 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
             "values": torch.zeros(batch_size, sequence_length),
             "mask_sample": torch.zeros(batch_size, dtype=torch.bool),
             "truncated": torch.zeros(batch_size, dtype=torch.bool),
+            "input_lengths": torch.ones(batch_size, dtype=torch.long),
         },
         batch_size=[batch_size],
     )
