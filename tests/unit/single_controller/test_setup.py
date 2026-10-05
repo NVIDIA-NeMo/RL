@@ -3281,6 +3281,7 @@ def test_reference_budget_uses_existing_student_split(
     )
 
     config = _make_master_config(colocated=colocated)
+    config.policy["generation"]["vllm_cfg"] = {"tensor_parallel_size": 1}
     config.cluster = ClusterConfig(
         num_nodes=total_nodes, gpus_per_node=8, segment_size=segment_size
     )
