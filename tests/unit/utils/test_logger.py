@@ -456,7 +456,7 @@ class TestWandbLogger:
             )
 
         with patch("nemo_rl.utils.logger.subprocess.run", side_effect=fake_run):
-            WandbLogger({"project": "p", "name": "n"})
+            WandbLogger(WandbConfig(project="p", name="n"))
         assert calls == [["git", "rev-parse", "--is-inside-work-tree"]]
         assert (
             "skipping the wandb source-code and git-diff artifacts"
