@@ -1,0 +1,12 @@
+# Reduced bring-up check. Retains the production 32-node placement.
+# This does not qualify the full 16-generation, 32K-response recipe.
+defaults: ./supervl3p5-v2-production.yaml
+grpo:
+  num_generations_per_prompt: 2
+  max_num_steps: 2
+policy:
+  train_global_batch_size: 256
+  generation:
+    max_new_tokens: 512
+checkpointing:
+  save_period: 1

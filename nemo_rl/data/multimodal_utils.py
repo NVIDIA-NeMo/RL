@@ -23,6 +23,7 @@ from copy import copy, deepcopy
 from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Union
+from urllib.parse import unquote
 
 import requests
 import torch
@@ -1489,7 +1490,9 @@ def resolve_to_image(image_path_or_image: str | Image.Image) -> Image.Image:
         image_data = base64.b64decode(encoded)
         return Image.open(BytesIO(image_data)).convert("RGB")
     elif image_path_or_image.startswith("file://"):
-        return Image.open(image_path_or_image.removeprefix("file://")).convert("RGB")
+        # Decode file-URI escapes once; plain filesystem paths stay literal.
+        path = unquote(image_path_or_image.removeprefix("file://"))
+        return Image.open(path).convert("RGB")
     else:
         # Handle local file path
         return Image.open(image_path_or_image).convert("RGB")

@@ -1,0 +1,23 @@
+defaults: ./vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym.v1.yaml
+grpo:
+  deduplicate_multimodal_data: true
+policy:
+  sequence_packing:
+    logprob_mb_tokens: 32768
+  megatron_cfg:
+    recompute_granularity: full
+    tensor_model_parallel_size: 2
+    context_parallel_size: 1
+  generation:
+    vllm_kwargs:
+      max_num_seqs: 64
+      compilation_config:
+        cudagraph_mode: FULL_AND_PIECEWISE
+    colocated:
+      resources:
+        gpus_per_node: 4
+        num_nodes: 16
+cluster:
+  gpus_per_node: 4
+  num_nodes: 32
+  segment_size: 8

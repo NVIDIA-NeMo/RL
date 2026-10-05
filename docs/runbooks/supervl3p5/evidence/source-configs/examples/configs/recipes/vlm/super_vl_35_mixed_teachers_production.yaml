@@ -1,0 +1,524 @@
+# Resolved production mixed-teacher recipe for the running R3-off experiment.
+# Experiment: super-vl-35-mixed-teachers-router-replay-off-20261002
+# Persistent HSG allocation: 7616174; entrypoint: examples/run_grpo_single_controller.py
+# 128 prompts x 16 generations; TP2/CP2/EP16; 32 nodes x 4 GPUs.
+# This records the current run paths and its 90-minute training deadline.
+# Checkpoint every step retains the latest two for exact-weight TMPE replay.
+defaults: ./super_vl_35_mixed_teachers_nv_main.yaml
+grpo:
+  num_prompts_per_step: 128
+  num_generations_per_prompt: 16
+  val_num_generations_per_prompt: 4
+  max_rollout_turns: 1
+  max_num_epochs: 1
+  max_num_steps: 125
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+  val_period: 0
+  val_start_at: -1
+  val_at_start: false
+  val_at_end: false
+  overlong_filtering: true
+  advantage_clip_low: -50
+  advantage_clip_high: 50
+  max_val_samples: null
+  stop_at_validation_metric: null
+  stop_at_validation_threshold: null
+  val_batch_size: 256
+  seed: 42
+  async_grpo: null
+  batch_multiplier: 1
+  use_dynamic_sampling: false
+  reward_shaping:
+    enabled: false
+  reward_scaling:
+    enabled: false
+  seq_logprob_error_threshold: null
+  invalid_tool_call_advantage: null
+  malformed_thinking_advantage: null
+  zero_variance_prompt_filtering: false
+  deduplicate_multimodal_data: true
+  skip_reference_policy_logprobs_calculation: true
+  adv_estimator:
+    name: grpo
+    normalize_rewards: true
+    use_leave_one_out_baseline: true
+    minus_baseline: true
+    subtract_global_baseline: false
+    proximal_teacher_alpha: 1.0
+    reward_weights: null
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  reference_policy_kl_type: k3
+  kl_input_clamp_value: null
+  kl_output_clamp_value: null
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  ratio_clip_c: null
+  use_on_policy_kl_approximation: true
+  use_importance_sampling_correction: true
+  sequence_level_importance_ratios: false
+  token_level_loss: false
+  truncated_importance_sampling_ratio: 5.0
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio_min: 0.2
+  disable_ppo_ratio: false
+  force_on_policy_ratio: false
+  use_kl_in_reward: false
+  use_cispo: false
+  positive_example_nll_weight: 0.0
+checkpointing:
+  enabled: true
+  checkpoint_dir: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/rohitkumarj/rem/unified-teacher-supervl3p5/experiments/super-vl-35-mixed-teachers-router-replay-off-20261002/checkpoints
+  metric_name: null
+  higher_is_better: true
+  keep_top_k: 2
+  save_period: 10
+  checkpoint_must_save_by: 00:01:30:00
+  save_optimizer: true
+  save_replay_buffer: false
+  load_replay_buffer: false
+  save_data_plane: true
+policy:
+  model_name: /lustre/fsw/portfolios/coreai/users/cye/code/RL/workspace/models/super-vl-35-rlvr-v43-falcon-r3-20260905/hf
+  tokenizer:
+    name: /lustre/fsw/portfolios/coreai/users/cye/code/RL/workspace/models/super-vl-35-rlvr-v43-falcon-r3-20260905/hf
+    chat_template: /lustre/fsw/portfolios/coreai/users/cye/code/RL/workspace/models/super-vl-35-rlvr-v43-falcon-r3-20260905/hf/chat_template.jinja
+    chat_template_kwargs:
+      enable_thinking: true
+      truncate_history_thinking: false
+    video:
+      num_frames: 64
+  train_global_batch_size: 2048
+  train_micro_batch_size: 1
+  generation_batch_size: 64
+  logprob_batch_size: 1
+  max_total_sequence_length: 65536
+  precision: bfloat16
+  logprob_chunk_size: 2048
+  dtensor_cfg:
+    _v2: true
+    enabled: false
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+  megatron_cfg:
+    enabled: true
+    checkpoint:
+      async_save: false
+    empty_unused_memory_level: 2
+    activation_checkpointing: true
+    bias_activation_fusion: false
+    tensor_model_parallel_size: 2
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 16
+    pipeline_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    context_parallel_size: 2
+    pipeline_dtype: bfloat16
+    sequence_parallel: true
+    freeze_moe_router: true
+    moe_router_dtype: fp32
+    moe_router_load_balancing_type: none
+    moe_router_bias_update_rate: 0.001
+    moe_permute_fusion: true
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: alltoall
+    moe_aux_loss_coeff: 0.0
+    moe_router_enable_expert_bias: true
+    apply_rope_fusion: true
+    defer_fp32_logits: true
+    track_moe_metrics: true
+    moe_per_layer_logging: false
+    moe_shared_expert_overlap: false
+    gradient_accumulation_fusion: false
+    use_fused_weighted_squared_relu: false
+    optimizer:
+      optimizer: adam
+      lr: 3.0e-06
+      min_lr: 5.0e-07
+      weight_decay: 0.0
+      bf16: true
+      fp16: false
+      params_dtype: float32
+      adam_beta1: 0.9
+      adam_beta2: 0.99
+      adam_eps: 1.0e-08
+      sgd_momentum: 0.9
+      clip_grad: 1.0
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+      overlap_cpu_optimizer_d2h_h2d: false
+      exp_avg_dtype: float32
+      exp_avg_sq_dtype: float32
+      store_param_remainders: false
+    scheduler:
+      start_weight_decay: 0.0
+      end_weight_decay: 0.0
+      weight_decay_incr_style: constant
+      lr_decay_style: cosine
+      lr_decay_iters: 60
+      lr_warmup_iters: 10
+      lr_warmup_init: 3.0e-08
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+      average_in_collective: false
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: optim_grads_params
+    env_vars:
+      NCCL_ALGO: Ring
+      NCCL_PROTO: Simple
+      NRL_REFIT_BUFFER_MEMORY_RATIO: '0.006'
+      NRL_REFIT_NUM_BUFFERS: '1'
+    mtp_num_layers: 0
+    radio_force_cpe_eval_mode: true
+    freeze_vision_model: true
+    freeze_vision_projection: true
+    freeze_sound_encoder: true
+    freeze_sound_projection: true
+    recompute_granularity: full
+    fp32_lm_head: true
+    mtp_loss_scaling_factor: 0.0
+    mtp_use_repeated_layer: false
+    mtp_detach_heads: true
+  draft:
+    enabled: false
+    model_name: null
+    loss_weight: 0.1
+    num_layers: null
+    aux_layer_indices: null
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: 65536
+    logprob_mb_tokens: 65536
+    sequence_length_round: 64
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: 65536
+    logprob_mb_tokens: 65536
+    algorithm: modified_first_fit_decreasing
+    microbatch_order: largest_first
+    sequence_length_round: 64
+    fuse_loss: true
+  make_sequence_length_divisible_by: 8
+  max_grad_norm: 1.0
+  optimizer: null
+  scheduler: null
+  offload_optimizer_for_logprob: true
+  generation:
+    port_range_low: 3000
+    port_range_high: 4999
+    backend: vllm
+    max_new_tokens: 32768
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    val_temperature: 1.0
+    val_top_p: 1.0
+    val_top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    mcore_generation_config:
+      max_model_len: 65536
+      transformer_impl: inference_optimized
+      cuda_graph_impl: local
+      cuda_graph_sizing_distribution: hybrid
+      cuda_graph_max_tokens: 512
+      inference_cuda_graph_scope: block
+      activation_checkpointing: false
+      mamba_inference_ssm_states_dtype: float32
+      inference_grouped_gemm_backend: vllm
+      moe_router_num_groups: null
+      moe_router_group_topk: null
+      pipeline_model_parallel_size: 1
+      expert_tensor_parallel_size: 1
+      expert_model_parallel_size: 8
+      sequence_parallel: true
+      context_parallel_size: 1
+      tensor_model_parallel_size: 2
+      buffer_size_gb: 20
+      num_cuda_graphs: -1
+      block_size_tokens: 256
+      use_cuda_graphs_for_non_decode_steps: true
+      enable_chunked_prefill: true
+      max_tokens: 65536
+      kv_cache_management_mode: persist
+      materialize_only_last_token_logits: true
+      num_speculative_tokens: 0
+      refit_backend: null
+      refit_execution_batch_bytes: null
+      logprobs_mode: processed_logprobs
+      offload_policy_before_refit: false
+      expose_http_server: true
+      enable_prefix_caching: true
+      prefix_caching_mamba_gb: null
+      prefix_caching_eviction_policy: lru
+      prefix_caching_coordinator_policy: longest_prefix
+      prefix_cache_ttl_seconds: 300.0
+      prefix_caching_routing_alpha: 1.0
+      http_server_num_replicas: 8
+      parsers:
+      - deepseek-r1-reasoning
+      - qwen3-coder-tool
+    vllm_cfg:
+      async_engine: true
+      kv_cache_dtype: auto
+      precision: bfloat16
+      refit_with_reload_api: false
+      tensor_parallel_size: 4
+      pipeline_parallel_size: 1
+      expert_parallel_size: 4
+      gpu_memory_utilization: 0.8
+      max_model_len: 65536
+      enforce_eager: false
+      use_deep_gemm: false
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      expose_http_server: true
+      reasoning_parser_plugin: nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: qwen3_coder
+        reasoning_parser: deepseek_r1
+        chat_template: /lustre/fsw/portfolios/coreai/users/cye/code/RL/workspace/models/super-vl-35-rlvr-v43-falcon-r3-20260905/hf/chat_template.jinja
+        chat_template_content_format: openai
+      load_format: auto
+      enable_prefix_caching: false
+      skip_tokenizer_init: false
+      logprobs_mode: raw_logprobs
+      env_vars:
+        NCCL_ALGO: Ring
+        NCCL_PROTO: Simple
+        NRL_REFIT_BUFFER_MEMORY_RATIO: '0.006'
+        NRL_REFIT_NUM_BUFFERS: '1'
+        VLLM_TRITON_FORCE_FIRST_CONFIG: '1'
+      fp32_lm_head: true
+      video:
+        sampling_style: nemotron_vl
+        num_frames: 64
+        temporal_patch_size: 2
+      cap_max_tokens_to_context: true
+    vllm_kwargs:
+      mamba_ssm_cache_dtype: float32
+      compilation_config:
+        backend: eager
+        cudagraph_mode: PIECEWISE
+      moe_backend: flashinfer_cutlass
+      limit_mm_per_prompt:
+        image: 64
+        video:
+          count: 1
+          num_frames: 64
+      mm_processor_cache_gb: 0
+      max_num_batched_tokens: 65536
+      max_num_seqs: 128
+      skip_mm_profiling: true
+      disable_custom_all_reduce: true
+      attention_backend: FLASHINFER
+      attention_config:
+        use_trtllm_attention: false
+      media_io_kwargs:
+        video:
+          num_frames: 64
+      kernel_config:
+        enable_flashinfer_autotune: false
+        moe_backend: flashinfer_cutlass
+      enable_chunked_prefill: true
+      mm_encoder_attn_backend: FLASH_ATTN
+      allowed_local_media_path: /lustre
+      enable_return_routed_experts: false
+      async_scheduling: false
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 16
+    bad_words:
+    - <image>
+    - <img>
+    - </img>
+    - <so_embedding>
+    - <so_start>
+    - <so_end>
+    refit_transport: null
+  is_vlm: true
+  hf_config_overrides:
+    video_temporal_patch_size: 2
+    video_target_num_patches: 1024
+    video_maintain_aspect_ratio: false
+  router_replay:
+    enabled: false
+    transport: ray
+logger:
+  log_dir: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/rohitkumarj/rem/unified-teacher-supervl3p5/experiments/super-vl-35-mixed-teachers-router-replay-off-20261002/logs
+  num_val_samples_to_print: 0
+  wandb_enabled: true
+  tensorboard_enabled: true
+  mlflow_enabled: false
+  monitor_gpus: true
+  swanlab_enabled: false
+  wandb:
+    project: rohit-unified-teacher-supervl3p5
+    name: super-vl-35-mixed-teachers-router-replay-off-20261002
+    log_nemo_gym_full_result_tables: false
+    entity: nvidia
+    id: super-vl-35-mixed-teachers-router-replay-off-20261002
+    resume: allow
+  tensorboard: {}
+  mlflow:
+    experiment_name: grpo-dev
+    run_name: grpo-dev-logger
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+cluster:
+  gpus_per_node: 4
+  num_nodes: 32
+  master_port_range_low: 1400
+  master_port_range_high: 1999
+  segment_size: 8
+data:
+  max_input_seq_length: 65536
+  num_workers: 1
+  shuffle: false
+  use_multiple_dataloader: false
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    processor: nemo_gym_data_processor
+    prompt_file: null
+    system_prompt_file: null
+  train:
+    data_path: /lustre/fsw/portfolios/coreai/users/cye/code/RL/workspace/datasets/mm-trainer-unified/training.jsonl
+  validation: null
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: true
+  should_mask_flagged_samples: true
+  nemo_gym:
+    port_range_low: 5000
+    port_range_high: 5999
+    uv_venv_dir: /opt/gym_venvs
+    skip_venv_if_present: true
+    nemo_gym_log_dir: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/rohitkumarj/rem/unified-teacher-supervl3p5/experiments/super-vl-35-mixed-teachers-router-replay-off-20261002/logs/nemo_gym
+    policy_max_input_tokens: 65536
+    pad_dynamic_image_shapes: true
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/gui_coordinate/configs/gui_coordinate.yaml
+    - resources_servers/math_with_judge/configs/math_with_judge.yaml
+    - resources_servers/mcqa/configs/mcqa.yaml
+    - resources_servers/string_match/configs/string_match.yaml
+    - responses_api_agents/image_tools_agent/configs/image_tools_agent.yaml
+    - resources_servers/sav_tracks/configs/sav_tracks.yaml
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: true
+          extra_body:
+            bad_words:
+            - <image>
+            - <img>
+            - </img>
+            - <so_embedding>
+            - <so_start>
+            - <so_end>
+            chat_template_kwargs:
+              enable_thinking: true
+          sampling_overrides:
+            mm_processor_kwargs: {}
+    math_with_judge:
+      resources_servers:
+        math_with_judge:
+          judge_model_server:
+            name: policy_model
+          should_use_judge: false
+    code_gen:
+      resources_servers:
+        code_gen:
+          num_processes: 1024
+          unit_test_timeout_secs: 10
+          debug: false
+    gui_coordinate_simple_agent:
+      responses_api_agents:
+        simple_agent:
+          max_steps: 1
+    math_with_judge_simple_agent:
+      responses_api_agents:
+        simple_agent:
+          max_steps: 1
+    mcqa_simple_agent:
+      responses_api_agents:
+        simple_agent:
+          max_steps: 1
+    string_match_simple_agent:
+      responses_api_agents:
+        simple_agent:
+          max_steps: 1
+    sav_pt_tracks_agent:
+      responses_api_agents:
+        simple_agent:
+          max_steps: 1
+    sav_box_tracks_agent:
+      responses_api_agents:
+        simple_agent:
+          max_steps: 1
+    sav_ref_tracks_agent:
+      responses_api_agents:
+        simple_agent:
+          max_steps: 1
+    image_tools_simple_agent:
+      responses_api_agents:
+        image_tools_agent:
+          max_steps: 8
+          max_tool_calls: 6
+          max_tool_calls_per_turn: 1
+          max_output_tokens: 4096
+          tool_success_reward: 0.02
+          tool_success_reward_cap: 0.2
+          invalid_tool_call_penalty: -0.05
+          duplicate_tool_call_penalty: -0.02
+          force_final_after_duplicate: true
+          terminate_on_invalid_tool_call: true
+          duplicate_iou_threshold: 0.5
+          crop_dir: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/rohitkumarj/rem/unified-teacher-supervl3p5/experiments/super-vl-35-mixed-teachers-router-replay-off-20261002/image_tool_outputs
+    is_trajectory_collection: false
+reward_penalties:
+  penalize_duplicated_reasoning: false
+  penalize_empty_final_answer: false
+  penalize_malformed_think_tag: false
+  penalize_unwanted_tokens: false
+  token_ids: null
+token_capture:
+  enabled: true
+  staging_partition: rollout_staging
+  defer_routed_experts_to_policy: false
+  min_valid_fraction_per_group: 1.0
+async_rl:
+  sampler:
+    name: in_order
+    max_lookahead_versions: 1
+  max_inflight_prompts: 128
+  max_buffered_rollouts: 256
+  recompute_kv_cache_after_weight_updates: false
+  rollout_failure:
+    on_dropped_prompt: replace
+    replacement_reserve_prompts: 256
+    max_replacement_attempts: 8
+    min_step_batch_fraction: 1.0
+  min_groups_for_streaming_train: 128
+data_plane:
+  enabled: true
+  impl: transfer_queue
+  backend: simple
+  claim_meta_poll_interval_s: 0.5
+  simple:
+    num_storage_units: 64

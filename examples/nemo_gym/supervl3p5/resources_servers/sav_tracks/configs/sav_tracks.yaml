@@ -1,0 +1,47 @@
+sav_tracks:
+  resources_servers:
+    sav_tracks:
+      entrypoint: app.py
+      domain: other
+      verified: false
+      description: Segment Anything Video point, box, and referring-track verifier
+      value: Train spatial grounding and identity-consistent video tracking
+
+sav_pt_tracks_agent:
+  responses_api_agents:
+    simple_agent:
+      entrypoint: app.py
+      max_steps: 1
+      resources_server:
+        type: resources_servers
+        name: sav_tracks
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      datasets: []
+
+sav_box_tracks_agent:
+  responses_api_agents:
+    simple_agent:
+      entrypoint: app.py
+      max_steps: 1
+      resources_server:
+        type: resources_servers
+        name: sav_tracks
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      datasets: []
+
+sav_ref_tracks_agent:
+  responses_api_agents:
+    simple_agent:
+      entrypoint: app.py
+      max_steps: 1
+      resources_server:
+        type: resources_servers
+        name: sav_tracks
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      datasets: []

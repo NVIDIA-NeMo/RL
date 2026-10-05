@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from collections import Counter
+from pathlib import Path
 
 import pytest
 from PIL import Image
@@ -294,3 +295,51 @@ def test_normalize_media_is_a_noop_for_text_only_examples():
         normalize_media_in_examples([{}, {"responses_create_params": {}}]) is not None
     )
     assert normalize_media_in_examples([{"responses_create_params": {"input": "nope"}}])
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Hardware Error Correction__FigS3.pdf.png",
+        "unicode_é #+.png",
+        "literal%20name.png",
+        "literal%2520name.png",
+    ],
+)
+def test_resolve_to_image_decodes_file_uri(tmp_path: Path, name: str) -> None:
+    path = tmp_path / name
+    _write_png(tmp_path, name, (5, 6))
+    with resolve_to_image(path.as_uri()) as image:
+        assert image.mode == "RGB"
+        assert image.size == (5, 6)
+        assert image.getpixel((0, 0)) == (10, 20, 30)
+
+
+def test_resolve_to_image_preserves_literal_percent_in_plain_path(
+    tmp_path: Path,
+) -> None:
+    path = _write_png(tmp_path, "literal%20name.png", (5, 6))
+    with resolve_to_image(path) as image:
+        assert image.size == (5, 6)
+        assert image.getpixel((0, 0)) == (10, 20, 30)
+
+
+def test_normalize_media_encodes_percent_encoded_file_uri(tmp_path: Path) -> None:
+    path = tmp_path / "Hardware Error Correction__FigS3.pdf.png"
+    plain = _write_png(tmp_path, path.name, (5, 6))
+    examples = [
+        _example(
+            {"type": "input_image", "image_url": path.as_uri()},
+            {"type": "input_image", "image_url": plain},
+        )
+        for _ in range(16)
+    ]
+
+    normalize_media_in_examples(examples)
+
+    with resolve_to_image(plain) as image:
+        expected = image_to_data_url(image)
+    for example in examples:
+        parts = example["responses_create_params"]["input"][0]["content"]
+        assert parts[0]["image_url"] == expected
+        assert parts[1]["image_url"] == expected

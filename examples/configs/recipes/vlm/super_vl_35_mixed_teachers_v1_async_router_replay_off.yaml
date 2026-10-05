@@ -1,5 +1,6 @@
-# Production mixed-teacher recipe through the V1 async_grpo loop.
-defaults: ./super_vl_35_mixed_teachers_nv_main.yaml
+# Same resolved production recipe, using the V1 async_grpo loop.
+# Run paths and the longer deadline are supplied by its experiment launcher.
+defaults: ./super_vl_35_mixed_teachers_production.yaml
 grpo:
   async_grpo:
     enabled: true
@@ -12,5 +13,7 @@ policy:
     enabled: false
   generation:
     vllm_kwargs:
-      async_scheduling: false
       enable_return_routed_experts: false
+# V1 NeMo-Gym multimodal deduplication uses the legacy policy transfer path.
+data_plane:
+  enabled: false

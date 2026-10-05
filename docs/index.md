@@ -332,6 +332,10 @@ guides/models/index.md
 model-quirks.md
 guides/async-grpo.md
 guides/single-controller.md
+runbooks/supervl3p5/README.md
+runbooks/supervl3p5/environment.md
+runbooks/supervl3p5/nemo-rl/super-vl-3p5.md
+runbooks/supervl3p5/megatron-bridge/README.md
 guides/quantization-aware-rl.md
 guides/eagle3-speculative-decoding.md
 guides/yarn-long-context.md

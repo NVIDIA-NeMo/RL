@@ -1,0 +1,12 @@
+{
+  "configs": [
+    "supervl3p5-v2-ready-first.yaml",
+    "supervl3p5-v2-smoke.yaml",
+    "supervl3p5-v2-production.yaml"
+  ],
+  "common_production_settings_match_checkpoint": true,
+  "shell_scripts": 4,
+  "shell_examples": 7,
+  "local_links": 17,
+  "new_gpu_runs": 0
+}

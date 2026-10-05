@@ -1,0 +1,41 @@
+# Production V2 comparison: ready-first admission lead of two versions.
+# Each allocation resumes this experiment's own latest checkpoint.
+defaults: ./super_vl_35_mixed_teachers_v2_test_batch4h.yaml
+
+async_rl:
+  # Replace the block to remove the inherited in_order sampler fields.
+  _override_: true
+  sampler:
+    name: ready_first
+    max_staleness_versions: 2
+  max_buffered_rollouts: 384
+  max_inflight_prompts: 128
+  min_groups_for_streaming_train: 128
+  recompute_kv_cache_after_weight_updates: false
+  rollout_failure:
+    on_dropped_prompt: replace
+    replacement_reserve_prompts: 256
+    max_replacement_attempts: 8
+    min_step_batch_fraction: 1.0
+
+loss_fn:
+  use_importance_sampling_correction: true
+  force_on_policy_ratio: false
+
+checkpointing:
+  save_period: 10
+  checkpoint_dir: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/rohitkumarj/rem/unified-teacher-supervl3p5/experiments/super-vl-35-mixed-teachers-v2-ready-first-s2-20261002/checkpoints
+
+logger:
+  log_dir: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/rohitkumarj/rem/unified-teacher-supervl3p5/experiments/super-vl-35-mixed-teachers-v2-ready-first-s2-20261002/logs
+  wandb:
+    id: super-vl-35-mixed-teachers-v2-ready-first-s2-20261002
+    name: super-vl-35-mixed-teachers-v2-ready-first-s2-20261002
+
+env:
+  nemo_gym:
+    nemo_gym_log_dir: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/rohitkumarj/rem/unified-teacher-supervl3p5/experiments/super-vl-35-mixed-teachers-v2-ready-first-s2-20261002/logs/nemo_gym
+    image_tools_simple_agent:
+      responses_api_agents:
+        image_tools_agent:
+          crop_dir: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/rohitkumarj/rem/unified-teacher-supervl3p5/experiments/super-vl-35-mixed-teachers-v2-ready-first-s2-20261002/image_tool_outputs
