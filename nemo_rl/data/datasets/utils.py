@@ -121,13 +121,18 @@ def load_dataset_from_path(
         ".txt": "text",
     }
     suffix = os.path.splitext(data_path)[-1].lower()
+    dataset_type = FILEEXT2TYPE.get(suffix)
+    # Keep each JSONL line as an unparsed string, whatever the file suffix.
+    keep_raw_lines = suffix == ".jsonl" or (
+        os.path.isfile(data_path) and dataset_type not in ("arrow", "csv", "parquet")
+    )
+    if preserve_jsonl_rows and keep_raw_lines:
+        dataset_type = "text"
     # load from local file (not save_to_disk format)
-    if dataset_type := FILEEXT2TYPE.get(suffix):
+    if dataset_type:
         assert data_subset is None, (
             "data_subset is only supported for huggingface datasets"
         )
-        if suffix == ".jsonl" and preserve_jsonl_rows:
-            dataset_type = "text"
         raw_dataset = load_dataset(dataset_type, data_files=data_path)
     else:
         try:

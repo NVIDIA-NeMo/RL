@@ -36,7 +36,7 @@ class NemoGymDataset(RawDataset):
         # scan agent names from the file once. Pre-converted Arrow, Parquet, and
         # save_to_disk datasets fall back to scanning the loaded rows.
         source_path = os.path.realpath(data_path)
-        is_jsonl_source = os.path.isfile(source_path) and source_path.lower().endswith(
+        is_jsonl_source = os.path.isfile(source_path) and data_path.lower().endswith(
             ".jsonl"
         )
         if is_jsonl_source:
@@ -49,7 +49,12 @@ class NemoGymDataset(RawDataset):
         # builder materializes a reusable Arrow cache instead of retaining the
         # entire source file as a Python list of strings. Pre-converted Arrow,
         # Parquet, and save_to_disk datasets are accepted as well.
-        self.dataset = load_dataset_from_path(data_path, preserve_jsonl_rows=True)
+        # The rows stay memory-mapped from HF_DATASETS_CACHE and pickle by file
+        # path, so every process that unpickles this dataset (e.g. the async GRPO
+        # trajectory collector actor) must see HF_DATASETS_CACHE at the same path.
+        self.dataset = load_dataset_from_path(
+            data_path, data_split=None, preserve_jsonl_rows=True
+        )
         if is_jsonl_source and source_identity.matches(os.stat(source_path)):
             self.agent_name_sources = frozenset({source_identity})
         else:

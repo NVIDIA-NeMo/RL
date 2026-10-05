@@ -16,6 +16,7 @@ import json
 from pathlib import Path
 
 import datasets
+import pytest
 from datasets import Dataset
 
 from nemo_rl.data.datasets.response_datasets.nemogym_dataset import NemoGymDataset
@@ -54,6 +55,47 @@ def test_nemogym_dataset_accepts_preconverted_parquet(tmp_path: Path) -> None:
     assert dataset.dataset["extra_env_info"] == rows
     assert dataset.dataset.column_names == ["extra_env_info", "task_name"]
     assert len(set(dataset.dataset["task_name"])) == 1
+    # Only JSONL files are line-scannable, so no source identity is recorded.
+    assert dataset.agent_name_sources is None
+
+
+def test_nemogym_dataset_accepts_save_to_disk_dataset(tmp_path: Path) -> None:
+    data_path = tmp_path / "train_arrow"
+    rows = ['{"sample": 1}', '{"sample": 2}']
+    Dataset.from_dict({"extra_env_info": rows}).save_to_disk(str(data_path))
+
+    dataset = NemoGymDataset(str(data_path))
+
+    assert dataset.dataset["extra_env_info"] == rows
+
+
+@pytest.mark.parametrize("file_name", ["train.json", "train.ndjson", "train"])
+def test_nemogym_dataset_reads_json_lines_regardless_of_suffix(
+    tmp_path: Path, file_name: str
+) -> None:
+    data_path = tmp_path / file_name
+    rows = [{"agent_ref": {"name": "a"}}, {"agent_ref": {"name": "b"}}]
+    data_path.write_text("".join(f"{json.dumps(row)}\n" for row in rows))
+
+    dataset = NemoGymDataset(str(data_path))
+
+    assert [json.loads(row) for row in dataset.dataset["extra_env_info"]] == rows
+
+
+def test_nemogym_dataset_records_source_for_jsonl_symlink(tmp_path: Path) -> None:
+    # Mirrors the Hugging Face hub cache layout: snapshots/.../train.jsonl -> blobs/<sha>.
+    blob_path = tmp_path / "blobs" / "0123abcd"
+    blob_path.parent.mkdir()
+    blob_path.write_text(f"{json.dumps({'agent_ref': {'name': 'a'}})}\n")
+    data_path = tmp_path / "train.jsonl"
+    data_path.symlink_to(blob_path)
+
+    dataset = NemoGymDataset(str(data_path))
+
+    assert dataset.agent_name_sources is not None
+    assert {source.path for source in dataset.agent_name_sources} == {
+        str(blob_path.resolve())
+    }
 
 
 def test_nemogym_dataset_rejects_preconverted_dataset_without_raw_text(
