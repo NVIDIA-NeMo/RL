@@ -349,6 +349,8 @@ def _attempt_staging_keys(
         _selection_from_state(dataclasses.asdict(selection))
         if receipt is None:
             raise ValueError("CC recovery requires an ordinary capture receipt")
+        if not selection.response_ids and not receipt.get("capture_poisoned"):
+            raise ValueError("Empty CC selection requires poisoned capture")
         for entry in receipt["manifest"]:
             call_id = entry.get("model_call_id")
             if (
@@ -381,7 +383,6 @@ def _selection_from_state(raw: Any) -> RolloutSelection | None:
     responses, flags = raw["response_ids"], raw["action_flags"]
     if (
         not isinstance(responses, tuple)
-        or not responses
         or not all(isinstance(response, str) and response for response in responses)
         or len(set(responses)) != len(responses)
         or not isinstance(flags, tuple)

@@ -2205,11 +2205,6 @@ class RolloutManager:
                 if classify_rollout_failure(error) is FailureClass.INFRA:
                     infra_attempts += 1
                     last_infra_error = error
-                    # CC selections are request-local until checkpoint recovery
-                    # persists them. Drop this abandoned group through the usual
-                    # bounded policy; do not redispatch and lose sealed selections.
-                    if self._context_compaction:
-                        break
                     if infra_attempts >= policy.max_infra_attempts:
                         break
                     self._stats.record_redispatch(reason)
