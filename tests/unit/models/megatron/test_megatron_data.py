@@ -23,6 +23,7 @@ focusing on:
 - Sequence dimension validation
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1592,6 +1593,9 @@ class TestGetMicrobatchIterator:
             cfg=cfg,
             mbs=4,
             straggler_timer=MagicMock(),
+            model_config=SimpleNamespace(
+                moe_router_enable_expert_bias=True, moe_router_bias_update_rate=0.001
+            ),
         )
 
         mock_data.make_microbatch_iterator.assert_called_once_with(1)
@@ -1642,6 +1646,9 @@ class TestGetMicrobatchIterator:
             cfg=cfg,
             mbs=4,
             straggler_timer=MagicMock(),
+            model_config=SimpleNamespace(
+                moe_router_enable_expert_bias=False, moe_router_bias_update_rate=0.0
+            ),
         )
 
         # Verify dynamic batching path was taken
@@ -1701,6 +1708,9 @@ class TestGetMicrobatchIterator:
             mbs=4,
             straggler_timer=MagicMock(),
             mtp_enabled=True,
+            model_config=SimpleNamespace(
+                moe_router_enable_expert_bias=False, moe_router_bias_update_rate=0.0
+            ),
         )
 
         # Verify sequence packing path was taken
@@ -1757,6 +1767,9 @@ class TestGetMicrobatchIterator:
             cfg=cfg,
             mbs=mbs,
             straggler_timer=MagicMock(),
+            model_config=SimpleNamespace(
+                moe_router_enable_expert_bias=False, moe_router_bias_update_rate=0.0
+            ),
         )
 
         # Verify regular batching path was taken
@@ -1798,6 +1811,9 @@ class TestGetMicrobatchIterator:
                 cfg=cfg,
                 mbs=1,
                 straggler_timer=MagicMock(),
+                model_config=SimpleNamespace(
+                    moe_router_enable_expert_bias=False, moe_router_bias_update_rate=0.0
+                ),
             )
 
             assert seq_dim_size == 72
@@ -1867,6 +1883,9 @@ class TestGetMicrobatchIterator:
             mbs=4,
             straggler_timer=MagicMock(),
             seq_length_key=None,  # Should be auto-detected
+            model_config=SimpleNamespace(
+                moe_router_enable_expert_bias=False, moe_router_bias_update_rate=0.0
+            ),
         )
 
         # Verify make_processed_microbatch_iterator was called with "input_lengths"

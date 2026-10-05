@@ -274,6 +274,7 @@ project-includes = [
   "nemo_rl/models/megatron/draft/training.py",
   "nemo_rl/models/megatron/draft/utils.py",
   "nemo_rl/models/megatron/hybridep.py",
+  "nemo_rl/models/megatron/router_mask.py",
   "nemo_rl/models/megatron/memory_saver.py",
   "nemo_rl/models/megatron/opd_full_capture.py",
   "nemo_rl/models/policy/__init__.py",
