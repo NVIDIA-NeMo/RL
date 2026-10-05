@@ -11,6 +11,13 @@
 
 defaults: distillation_math.yaml
 
+# IPC remains the default. TQ additionally requires data_plane.enabled=true,
+# backend=simple and two distinct nodes, each with one GPU worker.
+xtoken_transport:
+  backend: ipc
+  max_payload_bytes: 67108864
+  timeout_s: 120.0
+
 distillation:
   num_prompts_per_step: 64
   max_num_steps: 5000

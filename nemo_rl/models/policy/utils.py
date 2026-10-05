@@ -633,9 +633,21 @@ def stream_weights_via_ipc_zmq_impl(
 
 
 # Positions in ``torch.multiprocessing.reductions.rebuild_cuda_tensor``'s
-# argument tuple (unchanged since torch 1.x; see its signature).
+# argument tuple. torch 2.13's ``reduce_tensor`` emits, in order:
+#   [0] type(tensor)        [1] tensor.size()     [2] tensor.stride()
+#   [3] tensor_offset       [4] type(storage)     [5] tensor.dtype
+#   [6] device              [7] storage_handle    [8] storage_size_bytes
+#   [9] storage_offset_bytes  [10] tensor.requires_grad
+#   [11] ref_counter_handle    [12] ref_counter_offset
+#   [13] event_handle       [14] event_sync_required
+# These positions changed across torch versions (stride and type(storage)
+# were added in 2.13), so index only via the named constants below.
+_REBUILD_CUDA_TENSOR_ARG_STORAGE_CLASS_INDEX = 4
 _REBUILD_CUDA_TENSOR_ARG_DEVICE_INDEX = 6
 _REBUILD_CUDA_TENSOR_ARG_STORAGE_HANDLE_INDEX = 7
+_REBUILD_CUDA_TENSOR_ARG_STORAGE_OFFSET_BYTES_INDEX = 9
+_REBUILD_CUDA_TENSOR_ARG_REF_COUNTER_HANDLE_INDEX = 11
+_REBUILD_CUDA_TENSOR_ARG_REF_COUNTER_OFFSET_INDEX = 12
 
 
 def rebuild_cuda_tensor_from_ipc(
