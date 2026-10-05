@@ -28,6 +28,8 @@ def build_dev_pod_manifest(
     namespace: str,
     image: str = _DEFAULT_IMAGE,
 ) -> dict[str, Any]:
+    if not image:
+        raise ValueError("image must not be empty")
     user_dir = f"{_MOUNT_PATH}/{username}"
     secret_name = f"{username}-secrets"
     pod_name = f"{username}-dev-pod"
