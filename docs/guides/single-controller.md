@@ -309,6 +309,8 @@ Field definitions:
 - `max_buffered_rollouts` — hard cap on unconsumed rollout groups buffered in the data plane. Validated at setup against the gated sampler's required capacity; a value too small deadlocks the rollout pump, so setup raises instead of silently blocking. Sized from the widest window the run ever uses, so `warmup_lookahead_versions` rather than `max_lookahead_versions` when it is set.
 - `min_groups_for_streaming_train` — minimum ready groups the trainer waits for before dispatching a batch. Set to `num_prompts_per_step` for sync/legacy semantics; lower for streaming. (PPO) Must equal `num_prompts_per_step` — the critic has no split train API, so each critic epoch calls the full-step `train_from_meta` once per chunk. Splitting an RL step across chunks would multiply both models' configured optimizer updates by the number of chunks.
 - `sampler.warmup_lookahead_versions` (PPO) — lookahead used while `ppo.policy_training_start_step` critic warmup is in progress, shrinking back to `max_lookahead_versions` afterwards. The SC equivalent of `ppo.async_ppo.warmup_generation_lead_steps`.
+- `num_advantage_workers` — CPU Ray actors that run the advantage stage. `0` (the default) keeps it in the controller process, which is correct but both holds a whole cohort's advantage inputs in the controller's heap and blocks the controller's event loop for the duration of the computation — long enough at Ultra scale to miss Ray's actor liveness ping. A positive value moves both costs onto dedicated actors, placed off the dedicated Ray head so their host-memory peak does not land beside the controller. Only `grpo` and `opd` are sharded across the pool: every other `adv_estimator` also reduces over the whole batch, which a shard is not, so those run as one call on one actor and a larger pool buys them nothing. Each stage logs `advantage stage: N row(s) over M shard(s), pool=P` with the reason whenever `M` is 1. Under `data_plane.backend: mooncake_cpu` each actor is its own TransferQueue client and mounts a full `global_segment_size + local_buffer_size`, like each token-capture finalizer, so budget it on top of `gpus_per_node × (segment + buffer)`.
+- `log_full_train_data` — writes every consumed sample to `train_data_step<N>.jsonl` in the log dir. The advantage stage is what holds the untruncated tensors, so the stage writes the dump wherever it runs: with a pool each shard writes its own `train_data_step<N>.jsonl.part-<shard>` and the controller merges them in shard order on a completed optimizer step, assigning `idx` across the merged file. That requires the pool to share a filesystem with the controller: the log dir was controller-only before this, so a node-local one worked and now would not. The controller checks the merged row count against what the shards reported and fails the step rather than publishing a dump that is short a shard. The JSON serialization is the expensive part and scales with batch size × sequence length, so a pool also moves that cost off the controller; it is reported back per call and still shows up under the `train_data_dump` timer. Debug-only — leave it `false` for production runs.
 
 ## Implementation Structure
 
@@ -394,6 +396,67 @@ The SC path is still under active development. Feature gaps are tracked in [issu
 - Multimodal/VLM GRPO is supported with Megatron generation. Set
   `policy.is_vlm: true`; see the
   [CLEVR Single-Controller recipe](../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-8n4g-megatron-single-controller-async.v1.yaml).
+- NeMo-Gym token capture also supports Omni dynamic-resolution images and native video
+  rollouts with async vLLM generation and a Megatron learner. With
+  `token_capture.enabled: true` and the VLM processor configured, workers capture
+  the processed media used for inference together with each call's token delta.
+  RL hands the owned tensors (`imgs`, `imgs_sizes`, and optional `num_frames`)
+  to Gym's `complete_call_from_response` as opaque attachments, and the TQ sink
+  writes them in the same `put` as the token columns, so `staged` coordinates
+  acknowledge tokens and pixels together and a failed write is `capture_failed`
+  at call time. Tensors keep their native shapes and dtypes on the wire; two
+  per-row flags (`media_present`, `media_has_frames`) mark which rows carry
+  pixels and whether they are video. Media-enabled staging partitions carry
+  these columns on every row; text-only runs register and read none of them.
+  vLLM pixels are rearranged losslessly into packed patches; the finalizer
+  reads the presence flags with the base columns, then issues one batched read
+  of the tensor columns for the terminal-chain calls that carry media, and
+  publishes `pixel_values`, `imgs_sizes`, and `num_frames` for the existing
+  Megatron learner without resampling or normalizing the media again.
+  Only newly introduced occurrences are staged. vLLM-specific `media_spans`
+  extras retain placeholder positions and token hashes for multi-turn prefix
+  replacement, including video's timestamp-separated visual-token spans.
+  Capture requests use vLLM's `skip_mm_cache=True` path to obtain concrete
+  processor tensors. vLLM can still reuse its processor-only cache; this does
+  not guarantee fresh preprocessing. vLLM tiles images from a dummy prompt, so
+  the request text never changes geometry, but the images of one request share
+  the token budget: adding an image under a tight budget can re-tile a retained
+  one, and a warm processor-only cache can keep a geometry a fresh processor
+  would not reproduce. If that changes retained geometry or placeholder tokens, the worker
+  rejects the continuation before inference with HTTP 400 and error code
+  `retained_media_changed` (other capture-time validation failures use
+  `media_capture_rejected`). Gym's current exception middleware wraps the
+  upstream error in HTTP 500, retaining the code in the response body. RL then
+  classifies it as an infrastructure `GymTransportError`, eligible for the
+  configured prompt retry policy; it is not a dedicated terminal rejection.
+  Text-call rows carry sentinels in each column's own dtype, because
+  TransferQueue keeps one dtype per field across live rows.
+  Media-enabled rows also store `media_metadata_digest`, a SHA-256 checksum of
+  the small route-less extras JSON. Sources check it before exposing media
+  descriptors, without reading pixels or routed-expert tensors. Missing or
+  changed checksums reject the row. This detects accidental metadata corruption;
+  it is independent of Gym's receipt and combined `extras_digest` commitment.
+  Media bundles are structurally validated before writing and after reading
+  (required tensors, patch geometry, frame grouping); malformed or missing
+  columns reject the rollout as `invalid_media_columns`, incompatible parts
+  along a chain as `media_chain_incompatible`. Tensor contents are not hashed;
+  retained occurrences are checked by geometry and placeholder tokens. Media
+  must remain immutable for the rollout's lifetime and preprocessing must be
+  deterministic. Same-shape pixel changes and corruption of stored pixel values
+  are outside this check's coverage. Call
+  rows share the existing checkpoint and cleanup lifecycle. TQ has no
+  transactional rollback: a failed combined write is discarded best-effort by
+  the sink, and a failed discard is logged at ERROR.
+  Upgrade the paired Gym and RL changes together. The GB200 functional shard
+  `L1_Functional_Tests_GB200_Vllm_Omni_Single_Controller.sh` smokes this path
+  end to end (CLEVR-style images through Gym `string_match`, native video
+  through Gym `mcqa`) and gates on `train/finalize/media_row_rate == 1`, the
+  metric that reports the fraction of learner rows built from captured media.
+  Media capture requires `policy.generation.backend: vllm`; Megatron inference
+  token capture is text-only. No new Megatron-LM pin is needed. Compaction,
+  mixed image/video conversations, native audio,
+  video token pruning, static tiling (`image_num_patches`), other processor families,
+  and `token_capture.defer_routed_experts_to_policy: true` are not supported.
 - Multi-Teacher On-Policy Distillation (MOPD) is supported for text-only NeMo
   Gym rollouts; multimodal/VLM MOPD is not yet supported. See
   [Multi-Teacher On-Policy Distillation](../about/algorithms/mopd.md#running-mopd).
@@ -404,3 +467,20 @@ The SC path is still under active development. Feature gaps are tracked in [issu
 - Reward shaping and sample filtering — `reward_shaping`, `reward_scaling`, and `use_dynamic_sampling` are implemented on neither algorithm block, so setup rejects them rather than silently skipping the shaping. Environment-flagged sample masking and `overlong_filtering` are supported; truncated completions are excluded from the loss through `sample_mask`, and a step in which every completion is filtered is rejected rather than skipped.
 - The `windowed` sampler has no `over_sampling_ratio` cap — over-produced groups aged past the window are evicted, wasting rollout compute.
 - The drain gate in refit is not yet supported.
+
+### Full training-data dumps
+
+Set `async_rl.log_full_train_data: true` to stream every consumed sample to
+`train_data_step<N>.jsonl` in the logger directory. This is independent of
+`env.should_log_nemo_gym_responses` and OPD diagnostics. Dumps retain masked
+samples and include full token IDs, token/sample loss masks, final clipped
+advantages, rewards, sample IDs and metadata, generation logprobs, and the
+student/teacher logprobs when computed. Only padding beyond `input_lengths`
+is removed; response content is not capped. Values follow the legacy
+singleton-batch JSONL shape. Chunks stream through `.jsonl.partial` files;
+the final name is published only after the optimizer step completes. A
+partial file is not proof of a completed training step.
+
+The per-step `timing/train/train_data_dump` metric reports wall-clock seconds
+summed across chunk preparation/writes and final-file publication. Chunk dump
+time is also included in `advantage_calculation`; these timings overlap.

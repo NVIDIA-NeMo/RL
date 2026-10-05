@@ -53,6 +53,8 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     algo_config,
     validate_single_controller_config,
 )
+from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.utils.logger import LoggerConfig
 
 _NUM_PROMPTS_PER_STEP = 4
 _NUM_GENERATIONS_PER_PROMPT = 2
@@ -71,7 +73,7 @@ def _value_config(
         "train_micro_batch_size": 1,
         "max_total_sequence_length": 32,
         "megatron_cfg": {"enabled": megatron_enabled},
-        "dtensor_cfg": {"enabled": not megatron_enabled, "_v2": True},
+        "dtensor_cfg": {"enabled": not megatron_enabled},
     }
 
 
@@ -136,10 +138,10 @@ def _make_master_config(
             "save_period": 10,
             "save_optimizer": False,
         },
-        logger={"wandb_enabled": False, "wandb": {}},
+        logger=LoggerConfig.model_construct(),
         loss_fn=ClippedPGLossConfig(reference_policy_kl_penalty=0.0),
         env={},
-        cluster={"num_nodes": 2, "gpus_per_node": 8, "segment_size": None},
+        cluster=ClusterConfig(num_nodes=2, gpus_per_node=8),
         async_rl=AsyncRLConfig(
             min_groups_for_streaming_train=min_groups_for_streaming_train,
             max_buffered_rollouts=_NUM_PROMPTS_PER_STEP * 2,
@@ -740,12 +742,7 @@ class TestValueWarmStart:
 
 def _cluster_config(mc: MasterConfig, *, colocated: bool, backend: str) -> MasterConfig:
     """Fill in the cluster / generation keys _build_clusters reads."""
-    mc.cluster = {
-        "num_nodes": 1,
-        "gpus_per_node": 8,
-        "master_port_range_low": None,
-        "master_port_range_high": None,
-    }
+    mc.cluster = ClusterConfig(num_nodes=1, gpus_per_node=8)
     mc.policy["generation"] = {
         "backend": backend,
         "colocated": {
