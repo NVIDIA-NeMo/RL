@@ -19,6 +19,7 @@ from pydantic import BaseModel
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 from nemo_rl.utils.checkpoint import PretrainedCheckpointConfig
+from nemo_rl.utils.fp32_lm_head import Fp32LmHeadSetting
 
 
 def _patch_transformers_tokenizer_class_set():
@@ -535,8 +536,11 @@ class MegatronConfig(TypedDict):
     # generation.vllm_cfg.fp32_lm_head flag for vLLM generation: applying this
     # to only one engine makes the generation/training logprob mismatch worse.
     # No effect when use_fused_linear_logprobs is set, which bypasses the
-    # output layer's logits path.
-    fp32_lm_head: NotRequired[bool]
+    # output layer's logits path. "tf32" is accepted as an alias of true: the
+    # head always runs Transformer Engine's GEMM on the bf16 operands with fp32
+    # output. Non-colocated MOPD teachers do not inherit this value; each must
+    # set on_policy_distillation.non_colocated_teachers...fp32_lm_head to match.
+    fp32_lm_head: NotRequired[Fp32LmHeadSetting]
     # When mtp_num_layers=0, Multi-Token Prediction is disabled.
     mtp_num_layers: NotRequired[int]
     # MTP loss weight added to the main next-token loss (0.0 disables the MTP loss contribution).
@@ -633,9 +637,10 @@ class OnPolicyDistillationFullTransport(TypedDict):
     """Resolved full-vocabulary MOPD settings carried to the policy workers.
 
     A ``model_dump`` of ``OnPolicyDistillationFullConfig`` plus the resolved
-    ``payload_field`` and ``teacher_index_field``. That BaseModel remains the
-    authoritative schema and the only place defaults are declared, so readers
-    must take these keys as required rather than supplying their own fallbacks.
+    ``payload_field``, ``teacher_index_field``, and ``teacher_fp32_lm_head``.
+    That BaseModel remains the authoritative schema and the only place defaults
+    are declared, so readers must take these keys as required rather than
+    supplying their own fallbacks.
     """
 
     enabled: bool
@@ -650,6 +655,10 @@ class OnPolicyDistillationFullTransport(TypedDict):
     # right teacher LM-head shard. Only the hidden-state path needs it; the
     # logits payload ships an already-projected distribution, so it is None.
     teacher_index_field: str | None
+    # Whether the teachers run an fp32 LM head (validated to match the student's
+    # policy.megatron_cfg.fp32_lm_head). The student then rebuilds teacher logits
+    # from hidden states with an fp32-output GEMM, as the teacher's own head does.
+    teacher_fp32_lm_head: bool
 
 
 class PolicyConfig(TypedDict):

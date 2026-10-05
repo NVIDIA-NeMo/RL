@@ -127,10 +127,39 @@ def pack_rolled_draft_token_mask(
     return roll_packed_seq_dim(packed, cu_seqlens_padded, seq_dim=1)
 
 
+def _project_onto_teacher_lm_head(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    output_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    """Project ``[..., H]`` hidden states through a ``[V_local, H]`` LM-head shard.
+
+    The GEMM runs on operands in the shard's dtype, as the teacher's own
+    ``output_layer`` does. ``output_dtype=None`` (or the shard's dtype) returns
+    logits rounded to that dtype; ``torch.float32`` keeps the GEMM output
+    unrounded, matching a teacher fp32 LM head (Megatron ``logit_dtype``).
+    """
+    hidden = hidden.to(dtype=weight.dtype)
+    if output_dtype is None or output_dtype == weight.dtype:
+        return torch.matmul(hidden, weight.t())
+    flat = hidden.reshape(-1, hidden.shape[-1])
+    if flat.is_cuda:
+        # bf16 operands with fp32 output: the same GEMM as Megatron's fp32 head
+        # (Transformer Engine general_gemm), bit-identical to it in GB200
+        # measurements, at bf16-GEMM speed and without fp32 operand copies.
+        logits = torch.mm(flat, weight.t(), out_dtype=output_dtype)
+    else:
+        # aten::mm.dtype is CUDA-only; upcasting the bf16 operands is exact, so
+        # this fp32 GEMM is equally accurate (only reached by CPU tests).
+        logits = torch.mm(flat.to(output_dtype), weight.to(output_dtype).t())
+    return logits.view(*hidden.shape[:-1], weight.shape[0])
+
+
 def _project_hidden_states_per_teacher(
     payload: torch.Tensor,
     weight_by_index: dict[int, torch.Tensor],
     teacher_index: torch.Tensor,
+    output_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     """Project each sample's hidden states through its own teacher's LM head.
 
@@ -174,18 +203,20 @@ def _project_hidden_states_per_teacher(
         # straight into the result skips the scatter buffer below, which would
         # otherwise double the peak ``[B, S, V_local]`` allocation for nothing.
         weight = _weight_for(present[0])
-        return torch.matmul(payload.to(dtype=weight.dtype), weight.t())
+        return _project_onto_teacher_lm_head(payload, weight, output_dtype)
 
     # One buffer holds every group, so the groups have to agree on the
     # vocabulary shard and dtype. They do by construction -- every shard is
     # requested at the student's own width and dtype -- but say so here, since
-    # the alternative is an opaque RuntimeError out of the masked assignment.
+    # the alternative is an opaque RuntimeError out of the masked assignment. The
+    # buffer takes the projection's output dtype (fp32 for an fp32 teacher head;
+    # setup requires every teacher's fp32_lm_head to match).
     reference_index, reference = next(iter(weight_by_index.items()))
     teacher_logits = torch.empty(
         payload.shape[0],
         payload.shape[1],
         int(reference.shape[0]),
-        dtype=reference.dtype,
+        dtype=output_dtype or reference.dtype,
         device=payload.device,
     )
     for idx in present:
@@ -202,8 +233,8 @@ def _project_hidden_states_per_teacher(
                 f"{reference.dtype}."
             )
         mask = teacher_index == idx
-        teacher_logits[mask] = torch.matmul(
-            payload[mask].to(dtype=weight.dtype), weight.t()
+        teacher_logits[mask] = _project_onto_teacher_lm_head(
+            payload[mask], weight, output_dtype
         )
     return teacher_logits
 
@@ -217,6 +248,7 @@ def reconstruct_opd_full_teacher_logits(
     context_parallel_group: Optional[torch.distributed.ProcessGroup],
     teacher_output_layer_weight_by_index: Optional[dict[int, torch.Tensor]] = None,
     teacher_index: Optional[torch.Tensor] = None,
+    output_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     """Turn the transported teacher payload into this rank's teacher logit shard.
 
@@ -239,6 +271,11 @@ def reconstruct_opd_full_teacher_logits(
             (see ``OPD_FULL_TEACHER_INDEX_FIELD``). Required once
             ``teacher_output_layer_weight_by_index`` holds more than one entry,
             and validated against the loaded heads whenever present.
+        output_dtype: Output dtype of the hidden-state projection.
+            ``torch.float32`` reproduces a teacher fp32 LM head (unrounded GEMM
+            output); None keeps the LM-head shard's dtype. The ``logits`` payload
+            is returned as transported (setup requires ``payload_dtype:
+            float32`` with an fp32 teacher head).
 
     Returns:
         Teacher logits ``[B, S_local, V_local]`` aligned with ``student_logits``.
@@ -330,13 +367,15 @@ def reconstruct_opd_full_teacher_logits(
             # Route by tag whenever the column is present: a tag naming an
             # unloaded teacher must fail loud, not take the only head.
             teacher_logits = _project_hidden_states_per_teacher(
-                payload, teacher_output_layer_weight_by_index, teacher_index
+                payload,
+                teacher_output_layer_weight_by_index,
+                teacher_index,
+                output_dtype,
             )
         else:
             weight = next(iter(teacher_output_layer_weight_by_index.values()))
-            teacher_logits = torch.matmul(
-                payload.to(dtype=weight.dtype),
-                weight.t(),
+            teacher_logits = _project_onto_teacher_lm_head(
+                payload, weight, output_dtype
             )
     else:
         teacher_logits = payload

@@ -1404,3 +1404,136 @@ def test_tq_teacher_enrichment_does_not_advertise_a_payload_when_full_is_disable
         "on_policy_distillation/teacher_full_payload_tokens"
         not in coordinator.drain_metrics()
     )
+
+
+# ── fp32 LM head: teachers match the student ──────────────────────────────
+
+
+def _fp32_lm_head_config(
+    student, teachers, *, teacher_overrides=None, full=None, student_fused=False
+):
+    """Two-teacher config with explicit student and teacher fp32_lm_head settings."""
+    cfg = _teacher_setup_config()
+    non_colocated = cfg["on_policy_distillation"]["non_colocated_teachers"]
+    if teachers is not None:
+        non_colocated["default_teacher_cfg"]["fp32_lm_head"] = teachers
+    if teacher_overrides:
+        non_colocated["teacher_overrides"] = teacher_overrides
+    if full is not None:
+        cfg["on_policy_distillation"]["full"] = {"enabled": True, **full}
+    cfg["policy"] = {
+        "megatron_cfg": {
+            "enabled": True,
+            "fp32_lm_head": student,
+            "use_fused_linear_logprobs": student_fused,
+        }
+    }
+    return cfg
+
+
+@pytest.mark.parametrize(
+    "student, teachers",
+    [(False, False), (True, True), ("tf32", True), (True, "tf32"), ("tf32", "tf32")],
+)
+def test_teacher_fp32_lm_head_matching_the_student_is_accepted(student, teachers):
+    from nemo_rl.algorithms import opd
+
+    resolved = opd.resolve_teacher_fp32_lm_head(_fp32_lm_head_config(student, teachers))
+
+    assert resolved is (student is not False)
+
+
+@pytest.mark.parametrize(
+    "student, teachers", [(True, False), (False, True), (False, "tf32")]
+)
+def test_teacher_fp32_lm_head_mismatch_is_rejected(student, teachers):
+    from nemo_rl.algorithms import opd
+
+    with pytest.raises(ValueError, match="same fp32 LM head setting as the student"):
+        opd.resolve_teacher_fp32_lm_head(_fp32_lm_head_config(student, teachers))
+
+
+def test_teacher_fp32_lm_head_is_not_inherited_from_the_student():
+    """Student on and teachers unset: each teacher has to opt in explicitly."""
+    from nemo_rl.algorithms import opd
+
+    with pytest.raises(ValueError, match="do not inherit"):
+        opd.resolve_teacher_fp32_lm_head(_fp32_lm_head_config(True, None))
+
+
+def test_teacher_fp32_lm_head_mismatch_names_only_the_offending_teacher():
+    from nemo_rl.algorithms import opd
+
+    cfg = _fp32_lm_head_config(
+        True, True, teacher_overrides={"code": {"fp32_lm_head": False}}
+    )
+
+    with pytest.raises(ValueError, match="code=False") as excinfo:
+        opd.resolve_teacher_fp32_lm_head(cfg)
+    assert "math=" not in str(excinfo.value)
+
+
+def test_teacher_fp32_lm_head_requires_an_fp32_logits_payload():
+    """The teacher's fp32 logits must not be rounded to bf16 on the way over."""
+    from nemo_rl.algorithms import opd
+
+    with pytest.raises(ValueError, match="payload_dtype='float32'"):
+        opd.resolve_teacher_fp32_lm_head(
+            _fp32_lm_head_config(
+                True,
+                True,
+                full={"teacher_payload": "logits", "payload_dtype": "bfloat16"},
+            )
+        )
+    assert opd.resolve_teacher_fp32_lm_head(
+        _fp32_lm_head_config(
+            True, True, full={"teacher_payload": "logits", "payload_dtype": "float32"}
+        )
+    )
+    # The hidden-state payload is the bf16 output_layer input: bf16 is lossless.
+    assert opd.resolve_teacher_fp32_lm_head(
+        _fp32_lm_head_config(
+            True,
+            True,
+            full={"teacher_payload": "hidden_states", "payload_dtype": "bfloat16"},
+        )
+    )
+
+
+def test_teacher_fp32_lm_head_rejects_fused_logprobs_on_the_top_k_path():
+    """Fused linear+CE bypasses the teacher's output_layer, so the head is a no-op."""
+    from nemo_rl.algorithms import opd
+
+    cfg = _fp32_lm_head_config(
+        True,
+        True,
+        teacher_overrides={
+            "code": {"megatron_cfg_overrides": {"use_fused_linear_logprobs": True}}
+        },
+    )
+
+    with pytest.raises(ValueError, match=r"\['code'\].*use_fused_linear_logprobs"):
+        opd.resolve_teacher_fp32_lm_head(cfg)
+    # Full-vocabulary teacher forwards never take the fused path.
+    cfg["on_policy_distillation"]["full"] = {"enabled": True}
+    assert opd.resolve_teacher_fp32_lm_head(cfg)
+
+
+def test_create_teacher_worker_groups_validates_fp32_lm_head_before_building(
+    monkeypatch,
+):
+    from nemo_rl.algorithms import opd
+    from nemo_rl.models.policy import teacher_worker_group
+
+    def fail_if_built(*args, **kwargs):
+        raise AssertionError("no teacher may be built for a mismatched config")
+
+    monkeypatch.setattr(teacher_worker_group, "TeacherWorkerGroup", fail_if_built)
+
+    with pytest.raises(ValueError, match="same fp32 LM head setting as the student"):
+        opd.create_teacher_worker_groups(
+            _fp32_lm_head_config(True, False),
+            {"make_sequence_length_divisible_by": 8},
+            tokenizer=object(),
+            teacher_clusters={"math": object(), "code": object()},
+        )

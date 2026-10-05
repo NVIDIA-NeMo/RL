@@ -61,6 +61,7 @@ def _prepare_opd_full_loss_input(
     sampling_params: Optional[TrainingSamplingParams],
     chunk_size: Optional[int],
     teacher_output_layer_weight_by_index: Optional[dict[int, torch.Tensor]] = None,
+    teacher_logits_dtype: Optional[torch.dtype] = None,
 ) -> dict[str, Any]:
     """Build the full-vocabulary MOPD loss input from student logits + teacher payload.
 
@@ -78,6 +79,9 @@ def _prepare_opd_full_loss_input(
         chunk_size: Sequence-dim chunk size for the sampled-token logprobs.
         teacher_output_layer_weight_by_index: Per-teacher LM-head shards keyed
             by index, for the hidden-state path.
+        teacher_logits_dtype: Output dtype of the hidden-state rebuild GEMM;
+            ``torch.float32`` mirrors a teacher fp32 LM head, None keeps the
+            shard's dtype.
 
     Returns:
         Loss input dict with the per-token divergence and, when requested, the
@@ -123,6 +127,7 @@ def _prepare_opd_full_loss_input(
         context_parallel_group=context_parallel_group,
         teacher_output_layer_weight_by_index=teacher_output_layer_weight_by_index,
         teacher_index=teacher_index,
+        output_dtype=teacher_logits_dtype,
     ).detach()
 
     divergence_chunk_size = full_cfg.chunk_size or int(logits.shape[1])
@@ -208,6 +213,7 @@ def prepare_loss_input(
     chunk_size: Optional[int] = None,
     cp_sharder: Optional["ContextParallelSharder"] = None,
     teacher_output_layer_weight_by_index: Optional[dict[int, torch.Tensor]] = None,
+    teacher_logits_dtype: Optional[torch.dtype] = None,
 ) -> tuple[dict[str, Any], BatchedDataDict[Any]]:
     """Prepare loss input for a loss function.
 
@@ -230,12 +236,15 @@ def prepare_loss_input(
             ``[V_local, H_teacher]`` teacher LM-head shards, keyed by the stable
             index rows are tagged with. The ``opd_full`` hidden-state path
             projects each row's teacher payload into teacher logits with them.
+        teacher_logits_dtype: Output dtype of that projection: ``torch.float32``
+            when the teachers run an fp32 LM head, None for the shard's dtype.
 
     Notes:
         vocab_parallel_rank, vocab_parallel_group, context_parallel_group are only used for megatron policy worker.
         sampling_params is only used for LossInputType.LOGPROB, and currently only supported for ClippedPGLossFn.
         d2t is only used for LossInputType.DRAFT.
-        teacher_output_layer_weight_by_index is only used for LossInputType.OPD_FULL.
+        teacher_output_layer_weight_by_index and teacher_logits_dtype are only used
+        for LossInputType.OPD_FULL.
 
     Returns:
         tuple(loss_input, maybe_updated_data)
@@ -302,6 +311,7 @@ def prepare_loss_input(
             sampling_params=sampling_params,
             chunk_size=chunk_size,
             teacher_output_layer_weight_by_index=teacher_output_layer_weight_by_index,
+            teacher_logits_dtype=teacher_logits_dtype,
         )
 
     elif loss_fn.input_type == LossInputType.DISTILLATION:

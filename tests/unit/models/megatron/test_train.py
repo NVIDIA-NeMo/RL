@@ -1379,6 +1379,47 @@ class TestLossPostProcessor:
     @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
     @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
     @patch(
+        "nemo_rl.models.megatron.train.get_context_parallel_world_size", return_value=1
+    )
+    def test_loss_post_processor_forwards_the_opd_full_teacher_head_settings(
+        self, mock_cp_size, mock_cp_grp, mock_tp_grp, mock_tp_rank
+    ):
+        """The teacher LM-head shards and their output dtype reach the loss input."""
+        from nemo_rl.models.megatron.train import LossPostProcessor
+
+        mock_loss_fn = MagicMock(return_value=(torch.tensor(0.5), {"loss": 0.5}))
+        mock_loss_fn.input_type = LossInputType.OPD_FULL
+        heads = {0: torch.zeros(4, 2)}
+        processor = LossPostProcessor(
+            loss_fn=mock_loss_fn,
+            cfg={"sequence_packing": {"enabled": False}},
+            cp_normalize=False,
+            teacher_output_layer_weight_by_index=heads,
+            teacher_logits_dtype=torch.float32,
+        )
+
+        with patch(
+            "nemo_rl.models.megatron.train.prepare_loss_input",
+            return_value=({}, MagicMock()),
+        ) as mock_prepare:
+            wrapped_fn = processor(
+                data_dict=MagicMock(),
+                packed_seq_params=None,
+                global_valid_seqs=torch.tensor(10),
+                global_valid_toks=torch.tensor(100),
+            )
+            wrapped_fn(torch.randn(2, 10, 4))
+
+        kwargs = mock_prepare.call_args.kwargs
+        assert kwargs["teacher_output_layer_weight_by_index"] is heads
+        assert kwargs["teacher_logits_dtype"] is torch.float32
+
+    @patch(
+        "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0
+    )
+    @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
+    @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
+    @patch(
         "nemo_rl.models.megatron.train.get_context_parallel_world_size", return_value=2
     )
     def test_loss_post_processor_with_cp_normalize(

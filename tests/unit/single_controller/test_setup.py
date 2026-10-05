@@ -2896,6 +2896,34 @@ def test_fullvocab_mopd_recipes_resolve_to_runtime_contract(recipe_name: str):
     )
 
 
+def test_fullvocab_recipe_requires_teachers_to_opt_into_the_fp32_lm_head():
+    """Teachers do not inherit policy.megatron_cfg.fp32_lm_head; setup checks early.
+
+    The check runs while sizing the teacher clusters, before anything is
+    reserved, and the resolved setting rides the opd_full transport so the
+    student rebuilds teacher logits with the teacher head's precision.
+    """
+    config = _load_fullvocab_master_config()
+    full_cfg = get_opd_full_config(config)
+    assert full_cfg is not None
+    assert (
+        sc_setup_mod._opd_full_transport(config, full_cfg)["teacher_fp32_lm_head"]
+        is False
+    )
+
+    config.policy["megatron_cfg"]["fp32_lm_head"] = "tf32"
+    with pytest.raises(ValueError, match="do not inherit"):
+        sc_setup_mod._non_colocated_teacher_node_count(config)
+
+    teachers = config.on_policy_distillation.non_colocated_teachers
+    teachers.default_teacher_cfg.fp32_lm_head = True
+    assert sc_setup_mod._non_colocated_teacher_node_count(config) >= 1
+    assert (
+        sc_setup_mod._opd_full_transport(config, full_cfg)["teacher_fp32_lm_head"]
+        is True
+    )
+
+
 def test_fullvocab_recipe_builds_an_opd_full_loss_function():
     """The recipe's loss block is accepted by the opd_full loss constructor."""
     config = _load_fullvocab_master_config()

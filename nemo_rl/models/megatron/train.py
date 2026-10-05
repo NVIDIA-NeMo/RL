@@ -574,6 +574,7 @@ class LossPostProcessor:
         prepare_fn: Optional[Callable[..., Any]] = None,
         defer_draft_normalization: bool = False,
         teacher_output_layer_weight_by_index: Optional[dict[int, torch.Tensor]] = None,
+        teacher_logits_dtype: Optional[torch.dtype] = None,
     ):
         """Build a per-microbatch loss post-processor for the Megatron train loop.
 
@@ -600,6 +601,10 @@ class LossPostProcessor:
                 argument rather than the data dict because the sequence-packing
                 wrapper batch-slices every data entry, and rather than the loss
                 object because that is pickled to workers.
+            teacher_logits_dtype: Output dtype of the full-vocabulary MOPD
+                rebuild of teacher logits from the hidden-state payload.
+                ``torch.float32`` when the teachers run an fp32 LM head; None
+                keeps the LM-head shard's dtype.
         """
         self.loss_fn = loss_fn
         self.cfg = cfg
@@ -609,6 +614,7 @@ class LossPostProcessor:
         self.prepare_fn = prepare_fn
         self.defer_draft_normalization = defer_draft_normalization
         self.teacher_output_layer_weight_by_index = teacher_output_layer_weight_by_index
+        self.teacher_logits_dtype = teacher_logits_dtype
         if draft_model is not None and draft_model.eagle_module is not None:
             self.d2t = getattr(draft_model.eagle_module, "d2t", None)
         else:
@@ -647,6 +653,7 @@ class LossPostProcessor:
                 d2t=self.d2t,
                 chunk_size=logprob_chunk_size,
                 teacher_output_layer_weight_by_index=self.teacher_output_layer_weight_by_index,
+                teacher_logits_dtype=self.teacher_logits_dtype,
             )
 
         # wrap loss function with loss input preparation

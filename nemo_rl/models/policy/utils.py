@@ -32,6 +32,7 @@ from nemo_rl.models.generation.vllm.config import (
     vllm_nemotron_h_fp32_lm_head_enabled,
 )
 from nemo_rl.utils.cuda_ipc import normalize_cuda_ipc_handle
+from nemo_rl.utils.fp32_lm_head import fp32_lm_head_enabled
 
 if TYPE_CHECKING:
     from nemo_rl.models.policy import PolicyConfig
@@ -148,9 +149,10 @@ def validate_fp32_lm_head_config(
         if megatron_enabled and megatron_cfg is not None
         else None
     )
-    if megatron_fp32_value not in (None, True, False):
-        raise ValueError("policy.megatron_cfg.fp32_lm_head must be true or false.")
-    megatron_fp32 = bool(megatron_fp32_value)
+    # "tf32" is an alias of true; anything other than true/false/"tf32" raises.
+    megatron_fp32 = fp32_lm_head_enabled(
+        megatron_fp32_value, key="policy.megatron_cfg.fp32_lm_head"
+    )
 
     if (
         megatron_fp32
