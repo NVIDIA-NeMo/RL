@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "image": {
+    "file_name": "nano35.sqsh",
+    "sha256": "197e2009bcad1b1fb2c617a2995ba77391ce726594b0c719c566dd7a1565e36c",
+    "size_bytes": 25881808896
+  },
+  "architecture": "linux/arm64",
+  "hardware_validated": "GB200, SM100, four GPUs per node",
+  "source": {
+    "nemo_rl_base": "2a70a4a155165058fea864877128a511fc475cdd",
+    "trtllm_base": "fca831eac3da515461e148b05e0663c29ab6aaa5",
+    "trtllm_version": "1.3.0rc28+nano35.1",
+    "python": "3.13.14",
+    "runtime_patch_sha256": "8ebc3cef16c46ea8a028d0c767d4106e89160f7e899f396a054174ba320607e9"
+  },
+  "recipe": {
+    "path": "examples/configs/recipes/llm/grpo-nano3.5-swe-32n4g-tp4cp16-async-trtllm.v1.yaml",
+    "sha256": "8f34c96824104b28f3aef4a860c14d14ccee08b3ba659195a7b3ac483efe19d4",
+    "executed_recipe_sha256": "7e487b82b5cdd6aa222e310ed328fed01de871524434078ef7f5f61f2a5a8e7b",
+    "expanded_configuration_unchanged": false,
+    "sanitized_baked_recipe_sha256": "21d5b1bd7d2962e7aa1f53c57c5d09726475a27f61e27f372b7d9cd22accb536",
+    "training_configuration_unchanged": true,
+    "logging_change": "Neutral W&B project default; logging remains disabled in the recipe."
+  },
+  "validation": {
+    "status": "48-step end-to-end training and cross-job checkpoint resume validated",
+    "as_of": "2026-10-04",
+    "e2e_training_validated": true,
+    "checkpoint_restore_validated": true,
+    "latest_checkpoint_step": 48,
+    "optimizer_detected": true,
+    "planned_training_steps": 48,
+    "full_training_complete": true,
+    "fixed_set_accuracy_evaluated": false,
+    "cross_job_restores_followed_by_training": 7,
+    "final_checkpoint_restore_tested": false,
+    "qualifications": [
+      "Validation covers the training and checkpoint-resume workflow; no fixed-set accuracy result is claimed.",
+      "TRT/Gloo can emit peer-disconnect errors during worker shutdown; verify job completion and checkpoint status.",
+      "The final checkpoint was saved and inspected; restore followed by training was tested at earlier job boundaries.",
+      "The historical E2E result applies to the base-image hash above. The metadata-cleaned release has not repeated the 48-step run; its integrity and runtime checks are recorded separately."
+    ],
+    "applies_to_image_sha256": "c879dfa875363277249340a701cb8f1049ebe71e1ae82a41a77b9b80719bae86"
+  },
+  "distribution": {
+    "primary_workflow": "Build docker/nano35/Dockerfile from this branch, then validate the resulting image",
+    "prebuilt_download_optional": true,
+    "huggingface_repository": null,
+    "artifact": null,
+    "status": "Sanitized release prepared locally; remote replacement and old revision cleanup pending.",
+    "obsolete_artifact": "nvidia/nano3.5-e2e/nano35-rc28-py313-arm64-sqsh:v0",
+    "obsolete_image_sha256": "aba4b122f43d66ddac7ba970c8a83920d0b285f9b386e3584f6594b023e4c469",
+    "obsolete_reason": "Missing the queued-control-request statistics fix required during async refit",
+    "checked_at_utc": "2026-10-05T10:26:11.098710+00:00"
+  },
+  "external_assets": [
+    "compatible initial HF model weights; exact historical initialization has no verified public mapping",
+    "403-row SWE-bench Verified JSONL reproduced with tools/nano35/prepare_swe_data.py",
+    "matching ARM64 SWE SIFs; source builder is tools/nano35/build_swe_sifs.py and all-instance builds remain unvalidated"
+  ],
+  "publication_cleanup": {
+    "base_image_sha256": "c879dfa875363277249340a701cb8f1049ebe71e1ae82a41a77b9b80719bae86",
+    "checked_at_utc": "2026-10-05T10:26:11.098710+00:00",
+    "status": "All retained file bytes and metadata verified; runtime imports, dependency fingerprint and fresh model module cache passed.",
+    "verification": {
+      "unique_regular_files": 645645,
+      "uncompressed_regular_bytes": 53477315937,
+      "known_internal_identifier_matches": 0,
+      "retained_file_sha256_and_metadata_verified": true,
+      "dependency_fingerprint_unchanged": true,
+      "runtime_imports_passed": true,
+      "cuda_visible_gpus": 4,
+      "fresh_model_module_cache_test_passed": true,
+      "training_parameters_unchanged": true,
+      "full_e2e_rerun": false
+    }
+  }
+}

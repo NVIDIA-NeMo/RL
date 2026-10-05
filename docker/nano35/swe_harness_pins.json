@@ -1,0 +1,7 @@
+{
+  "openhands": {"url": "https://github.com/sdevare-nv/nv-OpenHands.git", "commit": "5f0180054732945df08ad2293903e6873f0492b6", "patch": "docker/nano35/openhands.patch", "previous_effective_commit": "7644d6785f94f01a5ef4806d9584f07830d4ca53"},
+  "swebench": {"url": "https://github.com/HeyyyyyyG/SWE-bench.git", "commit": "d546b5e4be7e5fd5eaec6ee67b7588d85306a422", "directory": "swe_swebench_setup", "repository_directory": "SWE-bench", "script": "swebench.sh"},
+  "multilingual": {"url": "https://github.com/Kipok/SWE-bench.git", "commit": "c6cd63f0f48956fa3db9ba1e0fadff3a4cd2e2c6", "directory": "swe_swebench_multilingual_setup", "repository_directory": "SWE-bench_Multilingual", "script": "swebench_multilingual.sh"},
+  "r2e": {"url": "https://github.com/sdevare-nv/nv-R2E-Gym.git", "commit": "6823e64f94ae645f5265c03af0eb2e8523530a0d", "directory": "swe_r2e_gym_setup", "repository_directory": "R2E-Gym", "script": "r2e_gym.sh"},
+  "rebench": {"url": "https://github.com/SWE-rebench/SWE-rebench-V2.git", "commit": "c71902a8cf8d2b725f63d51f199f4d3e56f68d2d", "directory": "swe_rebench_setup", "repository_directory": "SWE-rebench-V2"}
+}

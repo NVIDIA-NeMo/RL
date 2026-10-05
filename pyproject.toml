@@ -130,6 +130,9 @@ dependencies = [
 
 [project.optional-dependencies]
 automodel = [
+  # Keep this backend's ABI pins separate from the rc28 TRT worker.
+  "apache-tvm-ffi==0.1.11",
+  "nvidia-cudnn-frontend==1.25.0; sys_platform == 'linux'",
   # Colocated with vLLM engines (CUDA-IPC refit); must share vLLM's torch ABI.
   "torch==2.13.0",
   "torchvision==0.28.0",
@@ -151,6 +154,9 @@ automodel = [
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
 ]
 vllm = [
+  # Keep this backend's ABI pins separate from the rc28 TRT worker.
+  "apache-tvm-ffi==0.1.11",
+  "nvidia-cudnn-frontend==1.25.0; sys_platform == 'linux'",
   # ABI of the vLLM 0.29.0 cu130 wheels.
   "torch==2.13.0",
   "torchvision==0.28.0",
@@ -172,6 +178,9 @@ vllm = [
   "nvidia-cutlass-dsl[cu13]==4.6.2",
 ]
 sglang = [
+  # Keep this backend's ABI pins separate from the rc28 TRT worker.
+  "apache-tvm-ffi==0.1.11",
+  "nvidia-cudnn-frontend==1.25.0; sys_platform == 'linux'",
   # sglang-miles (3003d70f) and sglang-kernel 0.4.5 are built against torch 2.11;
   # on 2.13 sgl_kernel fails with `undefined symbol: _ZNK2at10TensorBase14const_data_ptr…`.
   "torch==2.11.0",
@@ -192,6 +201,9 @@ sglang = [
   "tilelang==0.1.11; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 mcore = [
+  # Keep this backend's ABI pins separate from the rc28 TRT worker.
+  "apache-tvm-ffi==0.1.11",
+  "nvidia-cudnn-frontend==1.25.0; sys_platform == 'linux'",
   # also need cudnn (https://developer.nvidia.com/cudnn-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=20.04&target_type=deb_network)
   # wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-keyring_1.1-1_all.deb
   # sudo dpkg -i cuda-keyring_1.1-1_all.deb
@@ -244,19 +256,16 @@ mcore = [
 # without compiling (prepare_metadata_for_build_wheel returns static metadata).
 # The actual ~60-min wheel build is triggered by `uv sync --extra trtllm`.
 trtllm = [
-  # tensorrt-llm 1.3.0rc21 requires torch<=2.13.0a0 and its libth_common.so is
-  # built against 2.11 (`undefined symbol: _ZNR5torch7Library4_def…` on 2.13).
-  "torch==2.11.0",
-  "torchvision==0.26.0",
-  "tensorrt-llm==1.3.0rc21",
+  # Build rc28 against the same public Torch ABI as the training workers.
+  "torch==2.13.0",
+  "torchvision==0.28.0",
+  "tensorrt-llm==1.3.0rc28+nano35.1",
+  # Explicit prerelease requirements admit rc28's matching CUTLASS components.
+  "nvidia-cutlass-dsl-libs-base==4.8.0.dev0",
+  "nvidia-cutlass-dsl-libs-core==4.8.0.dev0",
+  "nvidia-cutlass-dsl-libs-cu13==4.8.0.dev0",
   "transformers==5.5.4",
   "tilelang==0.1.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
-  # tensorrt-llm 1.3.0rc21's _ipc_utils.py reads `cudaIpcMemHandle_t.reserved`,
-  # which cuda-bindings 13.4 removed; every TP>1 TRT-LLM engine then dies in
-  # allocate_allreduce_fusion_workspace with an AttributeError. Hold this venv
-  # on the 13.3 series that tensorrt-llm was released against.
-  "cuda-python<13.4",
-  "cuda-bindings<13.4",
 ]
 modelopt = ["nvidia-modelopt"]
 nvrx = [
@@ -435,10 +444,12 @@ link-mode = "copy"
 # vllm defaults to opencv for video IO but falls back to torchcodec.
 # The timm override is needed because sglang requires timm==1.0.16.
 override-dependencies = [
+  # Preserve NeMo-RL's training frontend pin without overriding the rc28 worker.
+  { package = { name = "megatron-core" }, dependencies = ["nvidia-cudnn-frontend==1.25.0"] },
+  { package = { name = "megatron-bridge" }, dependencies = ["nvidia-cudnn-frontend==1.25.0"] },
   "transformer-engine[pytorch,core_cu13]==2.18.0",
   "nvidia-cublas==13.5.1.27; sys_platform != 'darwin'",
   "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",
-  "nvidia-cudnn-frontend==1.25.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # NCCL 2.30.4 fixes a context-parallel hang on GB200 when GPUs are non-contiguous;
   # 2.30.7 additionally fixes hangs in the NCCL m2n reshard (<link to NCCL release note / internal bug>).
   # Keep NCCL shared with the isolated Dynamo environment across torch upgrades.
@@ -465,10 +476,6 @@ override-dependencies = [
   # xgrammar.normalize_tool_choice (vLLM requires xgrammar>=0.2.1,<1.0.0; the
   # override would otherwise force an incompatible downgrade).
   "xgrammar>=0.2.1,<1.0.0",
-  # tensorrt-llm 1.3.0rc21 pins apache-tvm-ffi==0.1.6, while xgrammar needs
-  # >=0.1.9. TileLang 0.1.11's bundled compiler additionally requires the
-  # 0.1.11 ABI, so keep the shared override on that compatible release.
-  "apache-tvm-ffi==0.1.11",
   # Override dependencies to address CVEs
   "mlflow>=3.13.0",
   # Override langchain-core to address CVE GHSA-qh6h-p6c9-ff54 (path traversal in load_prompt)
@@ -793,3 +800,11 @@ convention = "google"
 "*_test.py" = ["D"]
 # Ignore F401 (import but unused) in __init__.py
 "__init__.py" = ["F401"]
+
+# This image uses CUDA 13. Keep the base/core split introduced in CUTLASS 4.6,
+# and resolve the CUDA 13 extension even when a dependency requests bare cutlass-dsl.
+[[tool.uv.dependency-metadata]]
+name = "nvidia-cutlass-dsl"
+version = "4.8.0.dev0"
+requires-dist = ["nvidia-cutlass-dsl-libs-base==4.8.0.dev0", "nvidia-cutlass-dsl-libs-cu13==4.8.0.dev0"]
+provides-extras = ["cu13"]

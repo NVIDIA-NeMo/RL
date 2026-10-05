@@ -26,6 +26,7 @@ from typing import Any, Callable, Optional, TypeVar, cast
 import torch
 import yaml
 from megatron.bridge import AutoBridge
+from megatron.bridge.models.hybrid.hybrid_provider import HybridModelProvider
 from megatron.bridge.models.model_provider import ModelProviderMixin, get_model
 from megatron.bridge.peft.lora import LoRA
 from megatron.bridge.training import fault_tolerance
@@ -64,6 +65,7 @@ from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine import TEQuantizationParams
 from megatron.core.inference.shards import build_inference_pg_collection
+from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.quant_config import MatchContext, RecipeConfig
@@ -1388,6 +1390,18 @@ def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
         # mtp_use_repeated_layer is False) and the number of times the MTP layer
         # is repeated (when mtp_use_repeated_layer is True).
         model_cfg.mtp_num_layers = megatron_cfg["mtp_num_layers"]
+        if model_cfg.mtp_num_layers == 0 and isinstance(model_cfg, HybridModelProvider):
+            # Hybrid providers also derive MTP modules from the layer patterns.
+            # Clear both representations before provider.finalize().
+            model_cfg.mtp_hybrid_override_pattern = None
+            if model_cfg.hybrid_layer_pattern is not None:
+                model_cfg.hybrid_layer_pattern = model_cfg.hybrid_layer_pattern.split(
+                    Symbols.MTP_SEPARATOR, 1
+                )[0]
+            if model_cfg.hybrid_override_pattern is not None:
+                model_cfg.hybrid_override_pattern = (
+                    model_cfg.hybrid_override_pattern.split(Symbols.MTP_SEPARATOR, 1)[0]
+                )
     if "mtp_loss_scaling_factor" in megatron_cfg:
         model_cfg.mtp_loss_scaling_factor = megatron_cfg["mtp_loss_scaling_factor"]
     if "mtp_use_repeated_layer" in megatron_cfg:

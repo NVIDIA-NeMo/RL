@@ -1,0 +1,135 @@
+diff --git a/tensorrt_llm/_torch/async_llm.py b/tensorrt_llm/_torch/async_llm.py
+index cfa197ee..891d4386 100644
+--- a/tensorrt_llm/_torch/async_llm.py
++++ b/tensorrt_llm/_torch/async_llm.py
+@@ -1,3 +1,6 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++
+ from typing import Any, List, Optional
+ 
+ from ..llmapi.llm import LLM
+@@ -29,7 +32,7 @@ class AsyncLLM(LLM):
+ 
+         # WAR: RL integration needs to use NCCL AllReduce for TP>1 due to a bug in TRTLLM's AllReduce
+         # which will cause convergence issue when using multiple rollout instances.
+-        kwargs["allreduce_strategy"] = "NCCL"
++        kwargs.setdefault("allreduce_strategy", "NCCL")
+ 
+         if "ray_worker_extension_cls" not in kwargs:
+             kwargs["ray_worker_extension_cls"] = "tensorrt_llm.llmapi.rlhf_utils.WorkerExtension"
+diff --git a/tensorrt_llm/_torch/attention/backends/fmha/flashinfer_trtllm_gen.py b/tensorrt_llm/_torch/attention/backends/fmha/flashinfer_trtllm_gen.py
+index 1f43ae3b..8bfec06c 100644
+--- a/tensorrt_llm/_torch/attention/backends/fmha/flashinfer_trtllm_gen.py
++++ b/tensorrt_llm/_torch/attention/backends/fmha/flashinfer_trtllm_gen.py
+@@ -603,11 +603,14 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
+             and attn.head_dim != 512
+             and not has_q_only
+             and meta.num_generations == 0
++            and meta.tokens_per_block == 32
+         ):
+             # NVBug 6579626: the per-layer host overhead of the FlashInfer
+             # TRTLLM-Gen context path regresses TTFT for small BF16 batches.
+             # Let the FMHA selector choose the fallback implementation. H512
+             # and Q-only cached-KV requests cannot use that fallback.
++            # Its precompiled paged context kernels require 32-token pages;
++            # other page sizes must stay on FlashInfer's fused path.
+             # Keep mixed batches on FlashInfer: the monolithic fallback also
+             # switches decoding to C++ kernels that generation-only warmup
+             # does not cover, causing first-use JIT stalls (NVBug 6716104).
+diff --git a/tensorrt_llm/_torch/pyexecutor/kv_cache/kv_cache_manager_v2.py b/tensorrt_llm/_torch/pyexecutor/kv_cache/kv_cache_manager_v2.py
+index 0774d0af..8febc27c 100644
+--- a/tensorrt_llm/_torch/pyexecutor/kv_cache/kv_cache_manager_v2.py
++++ b/tensorrt_llm/_torch/pyexecutor/kv_cache/kv_cache_manager_v2.py
+@@ -335,9 +335,15 @@ class ConversationManager:
+         if not state.planned_drop_handles:
+             self._conversation_states.pop(conversation_id)
+ 
+-    def clear(self) -> None:
+-        """Clear state after reusable KV-cache blocks have been cleared."""
+-        self._conversation_states.clear()
++    def clear(self, *, keep_active_requests: bool = False) -> None:
++        """Release retention plans, optionally preserving active request ownership."""
++        if not keep_active_requests:
++            self._conversation_states.clear()
++            return
++        for conversation_id, state in list(self._conversation_states.items()):
++            state.planned_drop_handles.clear()
++            if state.current_request_id is None:
++                del self._conversation_states[conversation_id]
+ 
+ 
+ def _estimate_full_attn_size_per_token(
+@@ -1635,6 +1641,7 @@ class KVCacheManagerV2(BaseResourceManager):
+         }
+ 
+         self.kv_cache_map: dict[int, _KVCache] = {}
++        self._reuse_epoch = 0
+         self._request_stats_enabled_ids: set[int] = set()
+ 
+         # Lazily built map of layer-group id -> sliding window size, restricted
+@@ -5538,8 +5545,7 @@ class KVCacheManagerV2(BaseResourceManager):
+             self._stream.cuda_stream,
+         )
+ 
+-    @staticmethod
+-    def _derive_reuse_salt(cache_salt: str | None) -> int | None:
++    def _derive_reuse_salt(self, cache_salt: str | None) -> int | None:
+         """Derive ``ReuseScope.salt`` (int|None) from the ``cache_salt`` string.
+ 
+         Deterministic so the same string yields the same reuse namespace across
+@@ -5547,9 +5553,15 @@ class KVCacheManagerV2(BaseResourceManager):
+         creation, prefetch, and the cache-aware router probe so they all hit the
+         same radix-tree namespace.
+         """
+-        if cache_salt is None:
+-            return None
+-        digest = hashlib.sha256(cache_salt.encode("utf-8")).digest()
++        if self._reuse_epoch == 0:
++            if cache_salt is None:
++                return None
++            namespace = cache_salt.encode("utf-8")
++        else:
++            # Distinguish None from an empty salt, and separate weight epochs.
++            salt_bytes = b"\x00" if cache_salt is None else b"\x01" + cache_salt.encode("utf-8")
++            namespace = b"nrl-refit-kv-v1\x00" + self._reuse_epoch.to_bytes(8, "little") + salt_bytes
++        digest = hashlib.sha256(namespace).digest()
+         return int.from_bytes(digest[:8], "little")
+ 
+     def _create_kv_cache(
+@@ -5696,7 +5708,19 @@ class KVCacheManagerV2(BaseResourceManager):
+                 kv_cache.close()
+         return success
+ 
+-    def reset_reuse_state(self):
+-        self.impl.clear_reusable_blocks()
++    def reset_reuse_state(self) -> None:
++        """Invalidate reuse after refit while retaining live and graph KV handles.
++
++        The executor calls this at a synchronized control boundary. In-flight
++        requests retain their KV; new requests, probes and prefetches use the new
++        weight epoch. Old blocks remain subject to normal cache eviction.
++        """
++        self._reuse_epoch += 1
++        if not self.kv_cache_map:
++            self.impl.clear_reusable_blocks()
+         if self.conversation_manager is not None:
+-            self.conversation_manager.clear()
++            self.conversation_manager.clear(keep_active_requests=True)
++        logger.info(
++            f"Prefix reuse invalidated: epoch={self._reuse_epoch}, "
++            f"preserved_live_handles={len(self.kv_cache_map)}"
++        )
+diff --git a/tensorrt_llm/_torch/pyexecutor/py_executor.py b/tensorrt_llm/_torch/pyexecutor/py_executor.py
+index 08fc3cba..c1beb561 100644
+--- a/tensorrt_llm/_torch/pyexecutor/py_executor.py
++++ b/tensorrt_llm/_torch/pyexecutor/py_executor.py
+@@ -2044,7 +2044,7 @@ class PyExecutor:
+             req_stats.append(req_stat)
+ 
+         for req in list(self.executor_request_queue.get_request_queue().queue):
+-            if isinstance(req, RequestQueueItem):
++            if isinstance(req, RequestQueueItem) and req.is_normal_request:
+                 req_stat = get_queued_req_stats(req.id)
+                 req_stat.stage = RequestStage.QUEUED
+                 req_stats.append(req_stat)

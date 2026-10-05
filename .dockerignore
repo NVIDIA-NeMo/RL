@@ -46,6 +46,9 @@ checkpoints/
 results/
 code_snapshots*/
 .cache/
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
 
 # Runtime env
 *runtime_env.yaml

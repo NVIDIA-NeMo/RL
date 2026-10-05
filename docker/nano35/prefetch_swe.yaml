@@ -1,0 +1,25 @@
+# Only installs the Gym servers needed for Nano SWE. No model/data download.
+env:
+  should_use_nemo_gym: true
+  nemo_gym:
+    skip_venv_if_present: true
+    port_range_low: 5000
+    port_range_high: 5999
+    policy_model_name: dummy-model
+    policy_base_url: http://localhost:8000/v1
+    policy_api_key: dummy
+    invalid_tool_call_patterns: ["<tool_call>", "</tool_call>", "<function_call>", "</function_call>"]
+    thinking_tags: ["<think>", "</think>"]
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - responses_api_agents/swe_agents/configs/swebench_openhands_training.yaml
+    swe_agents_train:
+      responses_api_agents:
+        swe_agents:
+          dataset_path: /tmp/nano35-prefetch-unused.jsonl
+          container_formatter: /tmp/nano35-prefetch-unused.{instance_id}.sif
+    swe_agents_val:
+      responses_api_agents:
+        swe_agents:
+          dataset_path: /tmp/nano35-prefetch-unused.jsonl
+          container_formatter: /tmp/nano35-prefetch-unused.{instance_id}.sif

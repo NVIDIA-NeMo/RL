@@ -142,6 +142,13 @@ Train Qwen2.5-Omni-3B with GRPO on AVQA and evaluate on MMAU, following the R1-A
 Train Qwen2.5-Omni-7B with GRPO on PhilipC/IntentTrain (audio-visual intent recognition) and evaluate on Daily-Omni, following HumanOmniV2's joint audio-visual setup.
 :::
 
+:::{grid-item-card} {octicon}`terminal` Nano 3.5 SWE with TRT-LLM
+:link: guides/models/nemotron/nano35-swe-trtllm
+:link-type: doc
+
+Build the Nano SWE runtime, prepare public data, and run asynchronous training with checkpoint continuation.
+:::
+
 :::{grid-item-card} {octicon}`terminal` Two-Stage SWE RL (Qwen3 Thinking)
 :link: guides/swe-rl-qwen3
 :link-type: doc

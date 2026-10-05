@@ -14,7 +14,7 @@
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -25,6 +25,57 @@ from nemo_rl.models.generation.trtllm.trtllm_http_server import (
     _make_parse_tool_calls,
     _resolve_tool_parser_name,
 )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body_fields", "headers", "expected"),
+    [
+        ({"user": "swe-session"}, {}, "swe-session"),
+        ({"conversation_id": "explicit", "user": "fallback"}, {}, "explicit"),
+        ({}, {"x-client-id": "header-session"}, "header-session"),
+        ({}, {}, None),
+    ],
+)
+async def test_http_forwards_session_and_awaits_generation(
+    monkeypatch, body_fields, headers, expected
+):
+    pytest.importorskip("tensorrt_llm")
+    import httpx
+    from transformers import PretrainedConfig
+
+    from nemo_rl.models.generation.trtllm import trtllm_http_server as server
+
+    monkeypatch.setattr(server, "_build_tool_parser", lambda _name: None)
+    tokenizer = _RecordingTokenizer()
+    tokenizer.eos_token_id = None
+    tokenizer.decode = lambda *_args, **_kwargs: "ok"
+    generation = SimpleNamespace(token_ids=[4], logprobs=None, finish_reason="stop")
+    llm = SimpleNamespace(
+        _hf_model_config=PretrainedConfig(),
+        generate_async=AsyncMock(return_value=SimpleNamespace(outputs=[generation])),
+    )
+    app = server.create_app(
+        llm=llm,
+        tokenizer=tokenizer,
+        model_name="test-model",
+        max_seq_len=128,
+        sampling_config={"temperature": 1.0, "top_p": 1.0, "top_k": None},
+        tool_parser="qwen3_coder",
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            headers=headers,
+            json={"messages": [{"role": "user", "content": "hello"}], **body_fields},
+        )
+    assert response.status_code == 200, response.text
+    llm.generate_async.assert_awaited_once()
+    conversation = llm.generate_async.await_args.kwargs["conversation_params"]
+    assert (conversation.conversation_id if conversation else None) == expected
+    assert response.json()["choices"][0]["message"]["content"] == "ok"
 
 
 class _FakeToolParser:
@@ -177,7 +228,7 @@ def _tool_call_messages():
 def _parse_with_trtllm(messages):
     chat_utils = pytest.importorskip("tensorrt_llm.serve.chat_utils")
     transformers = pytest.importorskip("transformers")
-    conversation, mm_coroutine, _ = chat_utils.parse_chat_messages_coroutines(
+    conversation, mm_coroutine, *_ = chat_utils.parse_chat_messages_coroutines(
         messages, transformers.PretrainedConfig()
     )
     assert asyncio.run(mm_coroutine) == (None, None)

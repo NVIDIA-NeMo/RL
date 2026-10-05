@@ -1,0 +1,292 @@
+defaults: ../../grpo_math_1B_megatron.yaml
+grpo:
+  max_num_epochs: 4
+  val_period: 10000
+  advantage_clip_low: -100
+  advantage_clip_high: 100
+  max_val_samples: null
+  reward_shaping:
+    max_response_length: 196608
+  adv_estimator:
+    normalize_rewards: true
+    use_leave_one_out_baseline: true
+  skip_reference_policy_logprobs_calculation: true
+  seq_logprob_error_threshold: 2
+  invalid_tool_call_advantage: -5.0
+  malformed_thinking_advantage: -5.0
+  async_grpo:
+    enabled: true
+    in_flight_weight_updates: true
+  calculate_advantages_on_gpu: true
+  num_val_generations_per_prompt: 2
+  penalize_invalid_tool_call: true
+  penalize_malformed_thinking: true
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  kl_input_clamp_value: null
+  kl_output_clamp_value: null
+  ratio_clip_max: 0.28
+  use_on_policy_kl_approximation: true
+  truncated_importance_sampling_ratio: 5
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_ratio_min: 0.2
+  truncated_importance_sampling_type: tis
+  force_on_policy_ratio: true
+checkpointing:
+  enabled: true
+  checkpoint_dir: ${oc.env:NANO35_RUN_DIR}/checkpoints
+  metric_name: train:total_reward/mean
+  keep_top_k: null
+  ft_keep_latest_k: null
+  save_period: 5
+  checkpoint_must_save_by: 00:03:30:00
+policy:
+  model_name: ${oc.env:NANO35_MODEL}
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 196608
+  logprob_chunk_size: 1024
+  dtensor_cfg:
+    activation_checkpointing: true
+    tensor_parallel_size: 2
+    clear_cache_every_n_steps: null
+  megatron_cfg:
+    bias_activation_fusion: false
+    tensor_model_parallel_size: 4
+    empty_unused_memory_level: 2
+    activation_checkpointing: true
+    train_iters: 48
+    expert_model_parallel_size: 32
+    context_parallel_size: 16
+    pipeline_dtype: bfloat16
+    sequence_parallel: true
+    moe_router_dtype: fp32
+    moe_router_bias_update_rate: 0.001
+    defer_fp32_logits: true
+    moe_per_layer_logging: true
+    use_fused_weighted_squared_relu: true
+    optimizer:
+      lr: 3.0e-06
+      min_lr: 3.0e-06
+      weight_decay: 0.0
+      clip_grad: 1.0
+    scheduler:
+      start_weight_decay: 0.0
+      end_weight_decay: 0.0
+      lr_decay_iters: null
+      lr_warmup_iters: 10
+      lr_warmup_init: 3.0e-07
+      override_opt_param_scheduler: true
+    distributed_data_parallel_config:
+      overlap_grad_reduce: false
+    moe_router_enable_expert_bias: true
+    moe_flex_dispatcher_backend: hybridep
+    moe_hybridep_num_sms: 32
+    calculate_per_token_loss: true
+    moe_aux_loss_coeff: 0.0
+    first_last_layers_bf16: true
+  dynamic_batching:
+    train_mb_tokens: 196608
+    logprob_mb_tokens: 196608
+  sequence_packing:
+    train_mb_tokens: 196608
+    logprob_mb_tokens: 196608
+    fuse_loss: true
+  make_sequence_length_divisible_by: 128
+  scheduler: null
+  generation:
+    backend: trtllm
+    max_new_tokens: 196608
+    vllm_cfg:
+      async_engine: true
+      precision: bfloat16
+      tensor_parallel_size: 4
+      gpu_memory_utilization: 0.7
+      max_model_len: 196608
+      expose_http_server: true
+      skip_tokenizer_init: false
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: hermes
+    vllm_kwargs:
+      compilation_config:
+        backend: eager
+      mamba_ssm_cache_dtype: float32
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 16
+    mcore_generation_config:
+      async_engine: false
+      max_model_len: 196608
+      refit_backend: nvshmem
+    port_range_low: 11001
+    port_range_high: 15000
+    trtllm_cfg:
+      expose_http_server: true
+      tensor_parallel_size: 4
+      max_model_len: 196608
+      precision: bfloat16
+      async_engine: true
+      gpu_memory_utilization: 0.7
+      max_batch_size: 64
+      max_num_tokens: 32768
+      in_flight_weight_updates: true
+      recompute_kv_cache_after_weight_updates: false
+      tool_parser: qwen3_coder
+      reasoning_parser: nano-v3
+      default_chat_template_kwargs:
+        enable_thinking: true
+        truncate_history_thinking: false
+        force_nonempty_content: true
+      moe_tensor_parallel_size: 4
+      moe_expert_parallel_size: 1
+    trtllm_kwargs:
+      enable_chunked_prefill: true
+      num_postprocess_workers: 0
+      stream_interval: 10
+      print_iter_log: true
+      enable_iter_perf_stats: true
+      enable_iter_req_stats: true
+      allreduce_strategy: MNNVL
+      prefill_cuda_graph_backend: breakable
+      cuda_graph_config:
+        enable_padding: true
+        batch_sizes:
+        - 1
+        - 2
+        - 4
+        - 8
+        - 12
+        - 16
+        - 24
+        - 32
+        - 40
+        - 48
+        - 56
+        - 64
+      prefill_capture_num_tokens:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+      - 512
+      - 768
+      - 1024
+      - 1280
+      - 1536
+      - 1792
+      - 2048
+      - 2304
+      - 2560
+      - 2816
+      - 3072
+      kv_cache_config:
+        enable_block_reuse: true
+        free_gpu_memory_fraction: 0.7
+        dtype: auto
+        tokens_per_block: 64
+        host_cache_size: 137438953472
+        block_reuse_config:
+          policy: per_conversation
+          max_num_turns: 3
+        mamba_state_config:
+          additional_snapshot_offsets_from_end:
+          - 0
+        mamba_ssm_cache_dtype: float32
+        mamba_ssm_stochastic_rounding: true
+        mamba_ssm_philox_rounds: 5
+  router_replay:
+    enabled: false
+logger:
+  log_dir: ${oc.env:NANO35_RUN_DIR}/nemo
+  tensorboard_enabled: true
+  monitor_gpus: true
+  wandb:
+    project: nano3.5-e2e
+    name: ${oc.env:NANO35_RUN_NAME}
+    group: nano35-rc28-py313-e2e
+  mlflow:
+    experiment_name: grpo-workplace-assistant
+    run_name: nemotron-nano-v2-9b-workplace-assistant
+cluster:
+  gpus_per_node: 4
+  num_nodes: 32
+  segment_size: 16
+data:
+  _override_: true
+  max_input_seq_length: null
+  shuffle: false
+  num_workers: 1
+  use_multiple_dataloader: false
+  train:
+    dataset_name: NemoGymDataset
+    data_path: ${oc.env:NANO35_DATA}
+  validation:
+    dataset_name: NemoGymDataset
+    data_path: ${oc.env:NANO35_DATA}
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    prompt_file: null
+    system_prompt_file: null
+    processor: nemo_gym_data_processor
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: true
+  nemo_gym:
+    results_dir: ${oc.env:NANO35_RUN_DIR}/gym-results
+    skip_venv_if_present: true
+    port_range_low: 15001
+    port_range_high: 20000
+    invalid_tool_call_patterns:
+    - <tool_call>
+    - </tool_call>
+    - <function_call>
+    - </function_call>
+    thinking_tags:
+    - <think>
+    - </think>
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - responses_api_agents/swe_agents/configs/swebench_openhands_training.yaml
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          chat_template_kwargs:
+            enable_thinking: true
+            truncate_history_thinking: false
+          sequential_reasoning_allowed: false
+          num_workers: 16
+    swe_agents_train:
+      responses_api_agents:
+        swe_agents:
+          agent_max_turns: 200
+          concurrency: 1024
+          swebench_agent_timeout: 3600
+          run_with_mixed_prompts: true
+          dataset_path: ${oc.env:NANO35_DATA}
+          apptainer_memory_limit_mb: 65536
+          agent_framework_repo: /opt/nemo-rl/3rdparty/Gym-workspace/Gym/responses_api_agents/swe_agents/swe_openhands_setup/OpenHands
+          agent_framework_commit: 5f0180054732945df08ad2293903e6873f0492b6
+          container_formatter:
+          - ${oc.env:NANO35_SIF_TEMPLATE}
+    swe_agents_val:
+      responses_api_agents:
+        swe_agents:
+          agent_max_turns: 200
+          concurrency: 1024
+          swebench_agent_timeout: 3600
+          dataset_path: ${oc.env:NANO35_DATA}
+          apptainer_memory_limit_mb: 65536
+          agent_framework_repo: /opt/nemo-rl/3rdparty/Gym-workspace/Gym/responses_api_agents/swe_agents/swe_openhands_setup/OpenHands
+          agent_framework_commit: 5f0180054732945df08ad2293903e6873f0492b6
+          container_formatter:
+          - ${oc.env:NANO35_SIF_TEMPLATE}
+    use_absolute_ip: true

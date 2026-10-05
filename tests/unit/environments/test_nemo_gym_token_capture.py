@@ -516,3 +516,25 @@ def test_setup_nemo_gym_config_megatron_keeps_async_rollout_check_satisfied() ->
     assert mcore_cfg["expose_http_server"] is True
     assert "async_engine" not in mcore_cfg
     assert should_use_nemo_gym(config) is True
+
+
+def test_setup_nemo_gym_config_trtllm_enables_async_http_rollouts() -> None:
+    """The SWE entrypoint must accept TRT-LLM and select its HTTP adapter."""
+    from nemo_rl.algorithms.grpo import MasterConfig
+    from nemo_rl.environments.nemo_gym import (
+        setup_nemo_gym_config,
+        should_use_nemo_gym,
+    )
+
+    config = MasterConfig.model_construct(
+        env={"should_use_nemo_gym": True},
+        policy={
+            "generation": {
+                "backend": "trtllm",
+                "trtllm_cfg": {"async_engine": False, "expose_http_server": False},
+            }
+        },
+    )
+    setup_nemo_gym_config(config, tokenizer=None)
+    assert config.policy["generation"]["trtllm_cfg"]["expose_http_server"] is True
+    assert should_use_nemo_gym(config) is True

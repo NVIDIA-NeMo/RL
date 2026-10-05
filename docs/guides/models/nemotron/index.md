@@ -12,6 +12,8 @@ For the full list of supported models, see
 - **[Nemotron 3 Nano](nemotron-3-nano.md)** — GRPO math post-training for the
   30B-A3B hybrid Mamba MoE model, including data preparation and Slurm launch
   scripts.
+- **[Nano 3.5 SWE with TRT-LLM](nano35-swe-trtllm.md)** — asynchronous SWE GRPO
+  on GB200 with TRT-LLM generation and checkpoint continuation.
 - **[Nemotron 3 Nano Omni](nemotron-3-nano-omni.md)** — GRPO for the Nano Omni
   vision-language model on the AutoModel and Megatron backends
   (CLEVR-CoGenT and MMPR-Tiny recipes).
@@ -30,6 +32,7 @@ For the full list of supported models, see
 :hidden:
 
 nemotron-3-nano.md
+nano35-swe-trtllm.md
 nemotron-3-nano-omni.md
 nemotron-3.5-lightning.md
 nemotron-3-super.md

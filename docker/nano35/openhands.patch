@@ -1,0 +1,147 @@
+diff --git a/evaluation/benchmarks/swe_bench/run_infer.py b/evaluation/benchmarks/swe_bench/run_infer.py
+index 485d2c8..f691f86 100644
+--- a/evaluation/benchmarks/swe_bench/run_infer.py
++++ b/evaluation/benchmarks/swe_bench/run_infer.py
+@@ -1002,7 +1002,13 @@ def initialize_runtime(
+     workspace_path = _get_workspace_path(instance, workspace_dir_name)
+     obs: CmdOutputObservation
+ 
++    # Lyris arm64 SIF fixes (RC6/RC8, see erinh GYM_VENV_DEBUG.md): the SIF's
++    # unguarded ~/.bashrc exits early in non-interactive shells, so exports
++    # appended to it never reach the session — export inline instead. The SIFs
++    # also ship an x86_64 /usr/local/bin/jq shadowing the arm64 one.
+     initial_setup_cmd = f"""
++rm -f /usr/local/bin/jq && \
++export SWE_INSTANCE_ID={instance['instance_id']} && \
+ echo 'export SWE_INSTANCE_ID={instance['instance_id']}' >> ~/.bashrc && \
+ echo 'export PIP_CACHE_DIR=~/.cache/pip' >> ~/.bashrc && \
+ echo "alias git='git --no-pager'" >> ~/.bashrc && \
+@@ -1064,14 +1070,24 @@ source ~/.bashrc
+     SKIP_ENTRY_SCRIPT_TYPES = ('nv-internal-1', 'SWE-rebench-V2', 'SWE-Gym', 'R2E-Gym', 'swe-bench-ext', 'deepswe')
+ 
+     if DATASET_TYPE not in SKIP_ENTRY_SCRIPT_TYPES:
+-        action = CmdRunAction(command=f'source /swe_util/{entry_script_path}')
++        # Lyris arm64 SIF fix (RC7): `source` runs the entry script inside the
++        # BashSession shell — the SIF's entry script ends with a bare `exit 1`
++        # path that kills the session. Run it in a subshell instead, then
++        # activate the conda env it prepares.
++        action = CmdRunAction(
++            command=(
++                f'bash /swe_util/{entry_script_path} && '
++                f'source /opt/miniconda3/etc/profile.d/conda.sh && '
++                f'conda activate testbed'
++            )
++        )
+         action.set_hard_timeout(600)
+         logger.info(action, extra={'msg_type': 'ACTION'})
+         obs = _run_harness_action(runtime, action)
+         logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+         assert_and_raise(
+             obs.exit_code == 0,
+-            f'Failed to source /swe_util/{entry_script_path}: {str(obs)}',
++            f'Failed to run /swe_util/{entry_script_path}: {str(obs)}',
+         )
+     elif DATASET_TYPE == 'SWE-Gym':
+         # SWE-Gym: activate conda testbed environment
+diff --git a/openhands/agenthub/nemo_gym_client.py b/openhands/agenthub/nemo_gym_client.py
+index 835e41d..38385bf 100644
+--- a/openhands/agenthub/nemo_gym_client.py
++++ b/openhands/agenthub/nemo_gym_client.py
+@@ -75,6 +75,11 @@ class NemoGymClient:
+         from openhands.llm.llm import ModelResponse
+ 
+         message_dicts = [m.model_dump() for m in messages]
++        for message in message_dicts:
++            if message["role"] == "tool":
++                # OpenAI tool replies identify the call via tool_call_id.
++                # OpenHands' redundant LiteLLM name fails Gym's strict schema.
++                message.pop("name", None)
+ 
+         params: dict = {
+             "messages": message_dicts,
+@@ -83,6 +88,24 @@ class NemoGymClient:
+         if tools:
+             params["tools"] = tools
+ 
++        # These configure LiteLLM's AWS transport, not the OpenAI request body.
++        # Gym validates that body strictly, including unused None-valued keys.
++        for key in ("aws_region_name", "aws_access_key_id", "aws_secret_access_key"):
++            params.pop(key, None)
++
++        # Per-conversation KV/Mamba cache routing: forward the LLM's stable
++        # per-session id in the BODY (this path proxies through NeMo Gym's
++        # ServerClient, which forwards json but not custom headers). The
++        # model server maps it to TRT-LLM ConversationParams so
++        # block_reuse_config.policy=per_conversation can retain session state.
++        session_id = getattr(self.llm, "x_client_id", None)
++        if session_id:
++            # "user" is an OpenAI-standard field present in NeMo Gym's
++            # NeMoGymChatCompletionCreateParams schema, so it survives the
++            # gym model-server's strict validation. TRT maps it back to
++            # ConversationParams; a bare "conversation_id" is not accepted.
++            params["user"] = session_id
++
+         fields_to_remove = [
+             "prompt_token_ids",
+             "generation_token_ids",
+diff --git a/openhands/runtime/impl/local/local_runtime.py b/openhands/runtime/impl/local/local_runtime.py
+index 603e417..a50f61e 100644
+--- a/openhands/runtime/impl/local/local_runtime.py
++++ b/openhands/runtime/impl/local/local_runtime.py
+@@ -6,6 +6,7 @@ import subprocess
+ import sys
+ import tempfile
+ import threading
++from collections import deque
+ from dataclasses import dataclass
+ from typing import Callable
+ from urllib.parse import urlparse
+@@ -695,13 +696,14 @@ def _create_server(
+         stdout=subprocess.PIPE,
+         stderr=subprocess.STDOUT,
+         universal_newlines=True,
++        errors="replace",
+         bufsize=1,
+         env=env,
+         cwd=code_repo_path,
+     )
+ 
+     log_thread_exit_event = threading.Event()
+-
++    server_output_tail: deque[str] = deque(maxlen=64)
+ 
+     # Start a thread to read and log server output
+     def log_output() -> None:
+@@ -719,6 +721,7 @@ def _create_server(
+                 if not line:
+                     break
+ 
++                server_output_tail.append(line[-2048:])
+                 if ng_openhands_should_log:
+                     logger.info(f'server: {line.strip()}')
+ 
+@@ -728,12 +731,24 @@ def _create_server(
+                 for line in server_process.stdout:
+                     if log_thread_exit_event.is_set():
+                         break
++                    server_output_tail.append(line[-2048:])
+                     if ng_openhands_should_log:
+                         logger.info(f'server (remaining): {line.strip()}')
+ 
+         except Exception as e:
+             logger.error(f'Error reading server output: {e}')
+         finally:
++            if not log_thread_exit_event.is_set():
++                try:
++                    returncode = server_process.wait(timeout=1)
++                except subprocess.TimeoutExpired:
++                    returncode = None
++                if returncode is not None:
++                    logger.critical(
++                        'Action execution server exited unexpectedly: pid=%s, '
++                        'returncode=%s; last output:\n%s',
++                        server_process.pid, returncode, ''.join(server_output_tail),
++                    )
+             logger.info('server log output thread finished.')
+ 
+     log_thread = threading.Thread(target=log_output, daemon=True)

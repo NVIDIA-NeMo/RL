@@ -19,8 +19,8 @@ For the full list of supported models, see
 - **[MiniMax](minimax/index.md)** — MiniMax-M3 GRPO with AutoModel training
   and BF16 vLLM generation, including validated scope and known limitations.
 - **[Nemotron](nemotron/index.md)** — post-training recipes for Nemotron 3
-  Nano, Nano Omni, Super, Ultra, and Nemotron 3.5 Lightning, spanning the
-  Megatron and AutoModel backends.
+  Nano, Nano Omni, Super, Ultra, Nemotron 3.5 Lightning, and Nano 3.5 SWE,
+  spanning the Megatron and AutoModel backends.
 - **[Qwen](qwen/index.md)** — Qwen3.5 and Qwen3.8 LLM and VLM recipes (dense and
   MoE), with backend availability documented per version and thinking-mode
   generation-length guidance.

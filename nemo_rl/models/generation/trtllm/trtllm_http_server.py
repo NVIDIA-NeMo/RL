@@ -177,7 +177,9 @@ def create_app(
         )
 
         try:
-            conversation, mm_coroutine, _ = parse_chat_messages_coroutines(
+            # rc28 adds multimodal item ordering after placeholder counts.
+            # This text-only adapter needs neither of those metadata values.
+            conversation, mm_coroutine, *_ = parse_chat_messages_coroutines(
                 messages, model_config
             )
             mm_data, mm_embeddings = await mm_coroutine
@@ -235,7 +237,22 @@ def create_app(
         max_tokens = min(int(max_tokens_requested), remaining_ctx)
 
         from tensorrt_llm import SamplingParams as TrtSamplingParams
+        from tensorrt_llm.conversation_params import ConversationParams
         from tensorrt_llm.executor.utils import RequestError
+
+        # Gym preserves the OpenAI `user` field through its request schema.
+        # OpenHands uses the same session identifier on every turn.
+        conversation_id = (
+            body.get("conversation_id")
+            or body.get("user")
+            or request.headers.get("x-client-id")
+            or request.headers.get("x-session-id")
+        )
+        conversation_params = (
+            ConversationParams(conversation_id=conversation_id)
+            if conversation_id
+            else None
+        )
 
         sampling = _build_sampling_params(
             TrtSamplingParams,
@@ -248,6 +265,7 @@ def create_app(
             output = await llm.generate_async(
                 {"prompt_token_ids": adj_prompt},
                 sampling_params=sampling,
+                conversation_params=conversation_params,
             )
         except RequestError as e:
             err = str(e)

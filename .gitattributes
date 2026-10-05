@@ -1,0 +1,4 @@
+# Unified diffs encode an empty context line as one space. Preserve that byte;
+# check whitespace in the applied source rather than the patch container.
+tools/trtllm-nano35*.patch whitespace=-blank-at-eol
+docker/nano35/openhands.patch whitespace=-blank-at-eol

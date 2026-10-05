@@ -91,7 +91,7 @@ _METADATA_WHEEL_TAG = "py3-none-any"
 # with tools/build-custom-trtllm.sh, which reads BUILD_CUSTOM_TRTLLM_ARCH and
 # falls back to this same default. Folded into the wheel cache key below so
 # editing the arch list forces a rebuild instead of reusing a stale wheel.
-_DEFAULT_ARCH = "90-real;100-real"
+_DEFAULT_ARCH = "100-real"
 
 
 def _build_input_tag(arch: str) -> str:
@@ -107,7 +107,17 @@ def _build_input_tag(arch: str) -> str:
     import torch  # noqa: PLC0415
 
     toolchain = f"torch{torch.__version__},cuda{torch.version.cuda}"
-    return f"arch={arch}|{toolchain}"
+    repo_root = (_HERE / "../..").resolve()
+    digest = hashlib.sha256()
+    for build_input in (
+        Path(__file__),
+        _PYPROJECT,
+        repo_root / "tools/build-custom-trtllm.sh",
+        repo_root / "tools/trtllm-nano35.patch",
+    ):
+        digest.update(build_input.name.encode())
+        digest.update(build_input.read_bytes())
+    return f"arch={arch}|{toolchain}|inputs={digest.hexdigest()}"
 
 
 def _wheel_cache_dir(base: str, git_url: str, git_ref: str, build_inputs: str) -> Path:

@@ -1,0 +1,105 @@
+diff --git a/tests/unittest/_torch/attention/test_flashinfer_trtllm_gen_fmha.py b/tests/unittest/_torch/attention/test_flashinfer_trtllm_gen_fmha.py
+index bbe1dedf..19aa73b9 100644
+--- a/tests/unittest/_torch/attention/test_flashinfer_trtllm_gen_fmha.py
++++ b/tests/unittest/_torch/attention/test_flashinfer_trtllm_gen_fmha.py
+@@ -42,6 +42,8 @@ def test_flashinfer_fp8_mode_remains_implementation_local() -> None:
+     assert not fmha._use_fp8_context_fmha(output, AttentionInputType.generation_only)
+ 
+ 
++@pytest.mark.parametrize("tokens_per_block", [16, 32, 64])
++@pytest.mark.parametrize("head_dim", [128, 256])
+ @pytest.mark.parametrize(
+     "num_contexts,num_generations,dtype,expect_fallback",
+     [
+@@ -62,9 +64,11 @@ def test_small_context_fallback_preserves_mixed_batch_generation(
+     num_generations: int,
+     dtype: torch.dtype,
+     expect_fallback: bool,
++    tokens_per_block: int,
++    head_dim: int,
+ ) -> None:
+     attn = FakeAttention()
+-    attn.head_dim = 256
++    attn.head_dim = head_dim
+     attn.sparse_params = None
+     attn.position_embedding_type = 0
+     fmha = FlashInferTrtllmGenFmha(attn)
+@@ -76,7 +80,7 @@ def test_small_context_fallback_preserves_mixed_batch_generation(
+         use_spec_decoding=False,
+         kv_cache_block_offsets=object(),
+         kv_cache_manager=None,
+-        tokens_per_block=32,
++        tokens_per_block=tokens_per_block,
+         is_cross=False,
+         beam_width=1,
+     )
+@@ -97,6 +101,7 @@ def test_small_context_fallback_preserves_mixed_batch_generation(
+         is_fused_qkv=True,
+     )
+ 
++    expect_fallback = expect_fallback and tokens_per_block == 32
+     for phase in phases:
+         supported, reason = fmha._is_supported_with_reason(
+             q, None, None, attn, metadata, forward_args, phase=phase
+diff --git a/tests/unittest/_torch/executor/test_py_executor.py b/tests/unittest/_torch/executor/test_py_executor.py
+index f140f277..a0513bba 100644
+--- a/tests/unittest/_torch/executor/test_py_executor.py
++++ b/tests/unittest/_torch/executor/test_py_executor.py
+@@ -29,7 +29,11 @@ from tensorrt_llm._torch.disaggregation.orchestration.coordinator import DisaggT
+ from tensorrt_llm._torch.disaggregation.orchestration.interfaces import ExecutorEffects
+ from tensorrt_llm._torch.distributed.communicator import ReduceOp
+ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
++    CONTROL_REQUEST_ID,
++    PROFILE_START_REQUEST_ID,
++    PROFILE_STOP_REQUEST_ID,
+     SHUTDOWN_REQUEST_ID,
++    ExecutorRequestQueue,
+     RequestQueueItem,
+ )
+ from tensorrt_llm._torch.pyexecutor.llm_request import (
+@@ -52,12 +56,45 @@ from tensorrt_llm._torch.pyexecutor.scheduler import (
+     ScheduledRequests,
+     SerializableSchedulerOutput,
+ )
++from tensorrt_llm.bindings.executor import RequestStage
+ from tensorrt_llm.llmapi.llm_args import EncodeCudaGraphConfig, MTPDecodingConfig
+ from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
+ 
+ pytestmark = pytest.mark.cpu_only
+ 
+ 
++@pytest.mark.parametrize(
++    "special_item",
++    [
++        RequestQueueItem(CONTROL_REQUEST_ID, control_requires_drain=False),
++        RequestQueueItem(CONTROL_REQUEST_ID, control_requires_drain=True),
++        RequestQueueItem(SHUTDOWN_REQUEST_ID),
++        RequestQueueItem(PROFILE_START_REQUEST_ID),
++        RequestQueueItem(PROFILE_STOP_REQUEST_ID),
++        RequestQueueItem(7, is_canceled_request=True),
++    ],
++    ids=["refit", "draining-control", "shutdown", "profile-start", "profile-stop", "cancel"],
++)
++def test_populate_req_stats_excludes_special_queue_items(special_item: RequestQueueItem) -> None:
++    """Control/cancel messages must not become inference request statistics."""
++    request_queue = ExecutorRequestQueue(
++        dist=Mock(), max_batch_size=8, enable_iter_perf_stats=False, batch_wait_timeout_ms=0
++    )
++    queue = request_queue.get_request_queue()
++    queue.put(RequestQueueItem(0, Mock()))
++    queue.put(special_item)
++    queue.put(RequestQueueItem(7, Mock()))
++    queue.put(RequestQueueItem(2**64 - 1, Mock()))
++    executor = types.SimpleNamespace(executor_request_queue=request_queue)
++
++    stats = PyExecutor._populate_req_stats(executor, [], [], ScheduledRequests())
++
++    assert [stat.id for stat in stats] == [0, 7, 2**64 - 1]
++    assert all(stat.stage == RequestStage.QUEUED for stat in stats)
++    assert all(stat.num_generated_tokens == 0 for stat in stats)
++    assert list(queue.queue)[1] is special_item
++
++
+ class _InflightRequestIds:
+     def __init__(self):
+         self.ids = set()

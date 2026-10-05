@@ -68,6 +68,7 @@ apt-get install -y --no-install-recommends \
     jq \
     curl \
     git \
+    git-lfs \
     rsync \
     wget \
     less \
@@ -345,6 +346,7 @@ EOF
 # warmups so TRT-only changes can reuse expensive wheels such as Transformer
 # Engine from the preceding layer.
 COPY --from=nemo-rl tools/build-custom-trtllm.sh ./tools/build-custom-trtllm.sh
+COPY --from=nemo-rl tools/trtllm-nano35.patch ./tools/trtllm-nano35.patch
 COPY --from=nemo-rl --link 3rdparty/TensorRT-LLM-workspace/ ./3rdparty/TensorRT-LLM-workspace/
 
 RUN --mount=type=ssh \
