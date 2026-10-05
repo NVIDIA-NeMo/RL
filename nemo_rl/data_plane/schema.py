@@ -13,7 +13,7 @@
 # limitations under the License.
 """Shared constants and type aliases for the data-plane meta contract."""
 
-from typing import Literal, Sequence
+from typing import Literal, Optional, Sequence
 
 # Materialization layout for `codec.materialize` / `read_columns` / worker fetch.
 Layout = Literal["padded", "jagged"]
@@ -29,6 +29,21 @@ GLOBAL_FORWARD_PAD_SEQLEN = "global_forward_pad_seqlen"
 # pump pops it off the meta before dispatch. sync_rollout_actor.py writes the
 # same string with a flat-dict shape, so this constant is not a drop-in there.
 ROLLOUT_METRICS = "rollout_metrics"
+
+# Per-row key in `KVBatchMeta.tags` naming the prompt group a row was generated
+# in. The group-relative estimators key their baseline on this rather than on
+# prompt tokens, which two distinct groups can share.
+GROUP_ID_TAG = "group_id"
+
+# The per-token members of `tq_token_sink.STAGING_FIELDS` (Gym's
+# `StagedCallRecord` deltas, under the names `stage()` renames them to). Named
+# here rather than inside the sink so `nemo_rl.utils.rpc_guard` can build its
+# forbidden-key set from the list that owns these names instead of a copy.
+PER_TOKEN_STAGING_FIELDS = (
+    "token_ids_delta",
+    "token_mask_delta",
+    "generation_logprobs_delta",
+)
 
 # Skeleton field names from `shard_meta_for_dp`.
 INPUT_IDS = "input_ids"
@@ -56,6 +71,21 @@ DP_TRAIN_FIELDS = (
     "sample_mask",
 )
 
+# Full-vocabulary MOPD teacher payload columns; exactly one is written per run,
+# selected by ``on_policy_distillation.full.teacher_payload``. Both are jagged-
+# packed per-token ``[N, S, D]``, with ``D`` the hidden size or vocabulary size.
+OPD_FULL_HIDDEN_STATES_FIELD = "teacher_full_hidden_states"
+OPD_FULL_LOGITS_FIELD = "teacher_full_logits"
+OPD_FULL_FIELDS = (OPD_FULL_HIDDEN_STATES_FIELD, OPD_FULL_LOGITS_FIELD)
+
+# Per-sample (not per-token) teacher identity for multi-teacher full-vocabulary
+# MOPD's hidden-state path: which loaded teacher LM head projects this row's
+# payload. Written by whichever TeacherWorkerGroup enriched the row (see
+# opd.py's teacher_index) and read back alongside OPD_FULL_HIDDEN_STATES_FIELD
+# during training. Not jagged/token-aligned -- one int per sample.
+OPD_FULL_TEACHER_INDEX_FIELD = "opd_full_teacher_index"
+
+
 # Full known tensor schema for SingleController's long-lived rollout partition.
 # The initial rollout put writes the first seven payload fields; later stages add
 # student/reference logprobs, advantages, PPO critic columns, and the MOPD teacher
@@ -70,6 +100,8 @@ SC_ROLLOUT_SCHEMA_FIELDS = (
     "values",
     "returns",
     "teacher_reference_logprobs",
+    *OPD_FULL_FIELDS,
+    OPD_FULL_TEACHER_INDEX_FIELD,
     INVALID_TOOL_CALL_MASK,
     MALFORMED_THINKING_MASK,
 )
@@ -139,4 +171,33 @@ def fields_with_optional_routed_experts(
     out = list(fields)
     if enabled and ROUTED_EXPERTS_FIELD not in out:
         out.append(ROUTED_EXPERTS_FIELD)
+    return out
+
+
+def fields_with_optional_opd_full(
+    fields: Sequence[str],
+    *,
+    field: Optional[str],
+    teacher_index_field: Optional[str] = None,
+) -> list[str]:
+    """Return `fields` plus the full-vocabulary MOPD teacher payload column(s).
+
+    Added only when the run configures them: a GRPO run requesting a column
+    nobody wrote would error on read, hence not folded into ``DP_TRAIN_FIELDS``.
+
+    Args:
+        fields: Base field list.
+        field: Payload column name, or ``None`` when opd_full is off.
+        teacher_index_field: Per-sample teacher-identity column name (hidden-
+            state path only, see ``OPD_FULL_TEACHER_INDEX_FIELD``), or
+            ``None`` when opd_full is off or using the logits payload.
+
+    Returns:
+        The field list, with the payload/index columns appended when applicable.
+    """
+    out = list(fields)
+    if field is not None and field not in out:
+        out.append(field)
+    if teacher_index_field is not None and teacher_index_field not in out:
+        out.append(teacher_index_field)
     return out

@@ -104,6 +104,7 @@ uv run --no-sync python examples/nemo_gym/run_grpo_nemo_gym.py \
     ++policy.megatron_cfg.optimizer.exp_avg_sq_dtype=bfloat16 \
     ++policy.megatron_cfg.optimizer.store_param_remainders=false \
     policy.generation.backend=megatron \
+    +policy.generation.refit_transport=mcore \
     ++policy.generation.bad_words=null \
     policy.generation.colocated.enabled=true \
     policy.generation.colocated.resources.num_nodes=1 \

@@ -29,6 +29,7 @@ from nemo_rl.models.policy.tq_policy import TQPolicy
 def _policy() -> TQPolicy:
     policy = object.__new__(TQPolicy)
     policy._router_replay_enabled = True
+    policy._opd_full_field = None  # opd_full off, as __init__ leaves it
     return policy
 
 

@@ -255,9 +255,10 @@ class SyncRolloutActor:
                 max_seq_len=None,
                 max_rollout_turns=None,
                 generation_config=cfg.policy["generation"],
+                num_generations_per_prompt=group_size,
                 log_full_result_tables=should_log_nemo_gym_full_result_tables(
-                    wandb_enabled=cfg.logger["wandb_enabled"],
-                    wandb_config=cfg.logger["wandb"],
+                    wandb_enabled=cfg.logger.wandb_enabled,
+                    wandb_config=cfg.logger.wandb,
                 ),
                 effort_config=EffortLevelsConfig.model_validate(
                     cfg.env["nemo_gym"].get("effort_levels")

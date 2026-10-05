@@ -64,6 +64,56 @@ A key design principle for generation backends is that they process tokens direc
 
 NeMo RL supports multiple generation backends that implement the {py:class}`GenerationInterface <nemo_rl.models.generation.interfaces.GenerationInterface>` to provide efficient text generation for different use cases.
 
+## SGLang Fault Tolerance
+
+SGLang fault tolerance is opt-in. Its serving-health monitor checks engines
+during generation; a separate bounded actor/process liveness probe covers the
+training and offloaded windows. The latter does not detect a live-but-wedged
+server, so both detectors are necessary. Replacements wait until the next refit
+to receive current policy weights before rollout resumes. Failure after a
+weight transfer starts is outside this recovery boundary.
+
+The SGLang exemplar documents the defaults below. Fault-tolerance and client
+defaults are centralized in `SGLangFaultToleranceConfig` and
+`SGLangHttpClientConfig`, respectively:
+
+```yaml
+policy:
+  generation:
+    sglang_cfg:
+      sglang_fault_tolerance_config:
+        use_fault_tolerance: false
+        rollout_health_check_interval: 60
+        rollout_health_check_timeout: 60
+        rollout_health_check_first_wait: 60
+        rollout_max_restart_attempts: 3
+      sglang_router_config:
+        use_external_router: false
+        retry_max_retries: 5
+        cb_failure_threshold: 10
+      sglang_http_client_config:
+        max_retries: 3
+```
+
+Health intervals and timeouts are positive, finite seconds; the first-wait grace
+can be zero. The restart limit is a nonnegative integer per logical engine over
+the run's lifetime. Exhaustion aborts refit; zero disables restarts. The
+`sglang_fault_tolerance_config` block is required and inherited from the SGLang
+exemplar. An empty block uses the defaults above, including disabled recovery.
+
+The two router knobs require positive integers and configure only a router
+launched by NeMo-RL. Omitting them retains the pinned router's defaults. An
+external router owns its own retry/circuit configuration. The independent
+client budget still applies with `use_external_router: true`.
+
+Despite their names, `retry_max_retries` and client `max_retries` count **total
+attempts including the first**, not additional retries. A client attempt can
+therefore contain several router attempts. Distributed HTTP dispatch uses the
+client budget, and its existing local fallback gets that budget again if the
+actor call fails. These settings permit tuning bounded nonstreaming recovery;
+they do not guarantee survival after fleet loss or retry exhaustion. A streaming
+response that has already started cannot be replayed.
+
 ## VLLM Backend
 
 The VLLM backend (`models/generation/vllm/vllm_generation.py`) implements the {py:class}`GenerationInterface <nemo_rl.models.generation.interfaces.GenerationInterface>` to provide efficient text generation using the VLLM library, which is optimized for large language models.
@@ -133,6 +183,14 @@ policy:
       buffer_size_gb: 10               # Memory buffer size for requests, total buffer size is 2x this value (active requests + paused requests)
       num_cuda_graphs: 16              # Number of CUDA graphs to pre-allocate
       max_tokens: 16384                # Maximum number of tokens for inference
+      cuda_graph_sizing_distribution: hybrid
+      cuda_graph_max_tokens: 512
+      prefix_caching_mamba_gb: null
+      prefix_caching_eviction_policy: lru
+      prefix_caching_coordinator_policy: longest_prefix
+      prefix_cache_ttl_seconds: 300.0
+      prefix_caching_routing_alpha: 1.0
+      http_server_num_replicas: 8
 ```
 
 ### Configuration Parameters
@@ -142,6 +200,17 @@ The `mcore_generation_config` section controls Megatron Core inference engine be
 - **buffer_size_gb**: Buffer size reserved for active requests that live on the GPU. The total buffer size (stored in unified memory) is 2x this value, with the other half of the buffer reserved for paused requests that live on the CPU.
 - **num_cuda_graphs**: Number of CUDA graphs to pre-allocate for different batch sizes. More graphs can improve performance by avoiding runtime graph capture, but consume more memory.
 - **max_tokens**: Maximum total number of tokens (across all requests) that can be processed simultaneously. This limits the maximum batch size and sequence length combinations. Increasing this might throw OOM depending on vocab size and buffer size allocated. 
+
+#### CUDA-graph capture
+
+- **cuda_graph_sizing_distribution** (`hybrid`) and **cuda_graph_max_tokens** (`512`) bound graph-capture cost while keeping decode graphs dense and prefill graphs compact. Use `exponential` or `linear` when one layout is a better fit for a known workload.
+- **inference_cuda_graph_scope** controls where local inference graphs live: `layer` owns them per Transformer/Mamba layer and `block` owns them per enclosing block. `none` runs eagerly. This setting only applies with `cuda_graph_impl: local`.
+
+#### Prefix-cache routing and HTTP frontends
+
+- **prefix_caching_mamba_gb** (`null`) leaves Mamba-state prefix caching disabled until a hybrid Mamba model has an explicit GPU budget.
+- **prefix_caching_eviction_policy** (`lru`), **prefix_caching_coordinator_policy** (`longest_prefix`), **prefix_cache_ttl_seconds** (`300.0`), and **prefix_caching_routing_alpha** (`1.0`) retain useful prefixes while steering requests toward cache hits without ignoring an overloaded inference rank.
+- **http_server_num_replicas** (`8`) sets the number of CPU HTTP frontends per model-parallel coordinator. These frontends spread request parsing, prompt processing, and cache-key work across CPU cores.
 
 ### Multimodal Megatron Generation
 
@@ -245,6 +314,14 @@ policy:
       buffer_size_gb: 10
       num_cuda_graphs: 16
       max_tokens: 16384
+      cuda_graph_sizing_distribution: hybrid
+      cuda_graph_max_tokens: 512
+      prefix_caching_mamba_gb: null
+      prefix_caching_eviction_policy: lru
+      prefix_caching_coordinator_policy: longest_prefix
+      prefix_cache_ttl_seconds: 300.0
+      prefix_caching_routing_alpha: 1.0
+      http_server_num_replicas: 8
 ```
 
 For a complete example, see

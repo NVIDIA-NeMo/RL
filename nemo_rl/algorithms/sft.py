@@ -45,10 +45,18 @@ from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import PolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.telemetry.config import TelemetryConfig
-from nemo_rl.telemetry.instrumentation import managed_span, trace_fn
+from nemo_rl.telemetry.instrumentation import (
+    evaluate_span,
+    managed_span,
+    umbrella_span,
+    umbrella_trace_fn,
+)
 from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.span_groups import RLSpanGroup
-from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
+from nemo_rl.utils.checkpoint import (
+    CheckpointingConfig,
+    CheckpointManager,
+)
 from nemo_rl.utils.logger import Logger, LoggerConfig
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
@@ -206,17 +214,17 @@ def setup(
     #          Cluster
     # ==========================
     print("\n▶ Setting up compute cluster...")
-    num_nodes = cluster_config["num_nodes"]
-    segment_size = cluster_config.get("segment_size")
+    num_nodes = cluster_config.num_nodes
+    segment_size = cluster_config.segment_size
     node_resource_constraints, _, _ = prepare_segment_topology(segment_size, num_nodes)
     cluster = RayVirtualCluster(
         name="sft_cluster",
-        bundle_ct_per_node_list=[cluster_config["gpus_per_node"]] * num_nodes,
+        bundle_ct_per_node_list=[cluster_config.gpus_per_node] * num_nodes,
         use_gpus=True,
-        num_gpus_per_node=cluster_config["gpus_per_node"],
+        num_gpus_per_node=cluster_config.gpus_per_node,
         max_colocated_worker_groups=1,
-        port_range_low=cluster_config.get("master_port_range_low"),
-        port_range_high=cluster_config.get("master_port_range_high"),
+        port_range_low=cluster_config.master_port_range_low,
+        port_range_high=cluster_config.master_port_range_high,
         segment_size=segment_size,
         node_resource_constraints=node_resource_constraints,
     )
@@ -414,17 +422,9 @@ def validate(
         return {}, {}
 
     timer = Timer()
-    _telemetry = get_telemetry_handle()
-    _tracer = _telemetry.tracer if _telemetry is not None else None
-
     with (
         timer.time("total_validation_time"),
-        managed_span(
-            RLSpanGroup.EVALUATE,
-            "rl.sft.evaluate",
-            tracer=_tracer,
-            **{"rl.step": step},
-        ),
+        evaluate_span("sft", **{"rl.step": step}),
     ):
         print(f"▶ Starting validation at step {step}...")
 
@@ -505,7 +505,7 @@ def validate(
     return val_metrics, timing_metrics
 
 
-@trace_fn(RLSpanGroup.JOB, "rl.sft.job")
+@umbrella_trace_fn(RLSpanGroup.U_JOB, "rl.sft.job")
 def sft_train(
     policy,
     train_dataloader,
@@ -575,8 +575,8 @@ def sft_train(
 
             with (
                 timer.time("total_step_time"),
-                managed_span(
-                    RLSpanGroup.STEP,
+                umbrella_span(
+                    RLSpanGroup.U_STEP,
                     "rl.sft.step",
                     tracer=_tracer,
                     **{"rl.iteration": total_steps + 1, "rl.epoch": current_epoch + 1},
@@ -740,7 +740,7 @@ def sft_train(
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
-                            checkpointing_cfg=master_config.checkpointing,
+                            is_final_checkpoint=is_last_step,
                         )
                         torch.save(
                             train_dataloader.state_dict(),
@@ -785,8 +785,7 @@ def sft_train(
                     print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
 
             total_num_gpus = (
-                master_config.cluster["num_nodes"]
-                * master_config.cluster["gpus_per_node"]
+                master_config.cluster.num_nodes * master_config.cluster.gpus_per_node
             )
             if total_time > 0:
                 timing_metrics["valid_tokens_per_sec_per_gpu"] = (
@@ -795,7 +794,12 @@ def sft_train(
             else:
                 timing_metrics["valid_tokens_per_sec_per_gpu"] = 0.0
             logger.log_metrics(metrics, total_steps + 1, prefix="train")
-            logger.log_metrics(timing_metrics, total_steps + 1, prefix="timing/train")
+            logger.log_metrics(
+                timing_metrics,
+                total_steps + 1,
+                prefix="timing/train",
+                step_finished=True,
+            )
 
             timer.reset()
             current_step += 1

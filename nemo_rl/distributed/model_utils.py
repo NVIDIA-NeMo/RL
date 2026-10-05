@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 import torch.distributed.nn.functional
-from torch.distributed.tensor import DTensor, distribute_tensor
+from torch.distributed.tensor import DTensor
 
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
@@ -133,44 +134,6 @@ def _compute_distributed_selected_logprobs(
     return selected_logprobs
 
 
-@torch.no_grad()
-def _compute_distributed_softmax(
-    vocab_parallel_logits: torch.Tensor, group: torch.distributed.ProcessGroup
-) -> torch.Tensor:
-    """Compute a stable distributed softmax across tensor parallel workers.
-
-    Taken from: https://github.com/NVIDIA/NeMo-Aligner/blob/9faab404f21994a7eb1d6ed5890b76152b941636/nemo_aligner/utils/distributed.py#L239
-
-    Args:
-        vocab_parallel_logits (torch.Tensor): Logits tensor with shape [batch_size, seq_length, vocab_size//TP]
-            where TP is the tensor parallel size.
-        group (torch.distributed.ProcessGroup): Process group for the all-reduce operations.
-
-    Returns:
-        torch.Tensor: Softmax output with the same shape as input, normalized across the full vocabulary.
-    """
-    logits_max = torch.amax(vocab_parallel_logits, dim=-1, keepdim=True)
-    torch.distributed.all_reduce(
-        logits_max,
-        op=torch.distributed.ReduceOp.MAX,
-        group=group,
-    )
-
-    vocab_parallel_logits = vocab_parallel_logits - logits_max
-
-    exp_logits = vocab_parallel_logits.exp_()
-
-    sum_exp_logits = exp_logits.sum(-1, keepdim=True)
-    torch.distributed.all_reduce(
-        sum_exp_logits,
-        op=torch.distributed.ReduceOp.SUM,
-        group=group,
-    )
-    exp_logits.div_(sum_exp_logits)
-
-    return exp_logits
-
-
 class DistributedLogprob(torch.autograd.Function):
     """Custom autograd function for computing log probabilities in a distributed setting.
 
@@ -259,63 +222,6 @@ class DistributedLogprob(torch.autograd.Function):
 
         # if you add an argument to the forward method, then you must add a corresponding None here
         return grad_input, None, None, None, None, None, None
-
-
-class DistributedCrossEntropy(torch.autograd.Function):
-    """Compute soft-target cross entropy across TP-sharded vocab.
-
-    This returns H(p_target, q_student), which matches forward KL up to the
-    target entropy constant. Backward propagates only through student logits.
-    """
-
-    @staticmethod
-    def forward(  # pyrefly: ignore[bad-override]
-        ctx: Any,
-        student_logits: torch.Tensor,
-        target_logits: torch.Tensor,
-        group: torch.distributed.ProcessGroup,
-        inference_only: bool = False,
-    ) -> torch.Tensor:
-        if student_logits.shape != target_logits.shape:
-            raise ValueError(
-                "student_logits and target_logits must have the same shape, "
-                f"got {student_logits.shape} and {target_logits.shape}."
-            )
-
-        target_probs = _compute_distributed_softmax(
-            target_logits.to(dtype=torch.float32),
-            group=group,
-        )
-        student_log_probs = _compute_distributed_log_softmax(
-            student_logits.to(dtype=torch.float32), group=group
-        )
-        # Reuse the log-softmax buffers to avoid extra full-vocab allocations.
-        local_cross_entropy = torch.einsum(
-            "...v,...v->...", target_probs, student_log_probs
-        ).neg_()
-        torch.distributed.all_reduce(
-            local_cross_entropy,
-            op=torch.distributed.ReduceOp.SUM,
-            group=group,
-        )
-
-        if not inference_only:
-            student_probs = student_log_probs.exp_()
-            ctx.save_for_backward(target_probs, student_probs)
-
-        return local_cross_entropy.contiguous()
-
-    @staticmethod
-    def backward(
-        ctx: Any,
-        *grad_outputs: torch.Tensor,
-    ) -> tuple[torch.Tensor, None, None, None]:
-        grad_output = grad_outputs[0]
-        target_probs, student_probs = ctx.saved_tensors
-
-        # d(H(p, q))/d(z_v) = q_v - p_v
-        grad_student = (student_probs - target_probs) * grad_output.unsqueeze(-1)
-        return grad_student, None, None, None
 
 
 class ChunkedDistributedLogprob(torch.autograd.Function):
@@ -1046,84 +952,6 @@ def get_cp_sharded_next_token_logprobs(
     return logprobs[:, :-1]
 
 
-def dtensor_from_parallel_logits_to_logprobs(
-    vocab_parallel_logits: torch.Tensor,
-    target: DTensor | torch.Tensor,
-    vocab_start_index: int,
-    vocab_end_index: int,
-    tp_group: torch.distributed.ProcessGroup,
-    inference_only: bool = False,
-    seq_index: Optional[torch.Tensor] = None,
-    chunk_size: Optional[int] = None,
-    sampling_params: Optional[TrainingSamplingParams] = None,
-) -> torch.Tensor:
-    """Get log probabilities from TP+CP sharded vocab logits.
-
-    Args:
-        vocab_parallel_logits (orch.Tensor): Logits distributed across tensor parallel workers,
-            with shape [batch_size, seq_len, vocab_size/tp_size].
-        target (DTensor): Target token indices with shape [batch_size, seq_len].
-            NOTE: Must be the unmodified targets as this function will shift them internally.
-        vocab_start_index (int): Starting vocabulary index for this worker's partition.
-        vocab_end_index (int): Ending vocabulary index for this worker's partition.
-        tp_group (torch.distributed.ProcessGroup): Process group for distributed communication.
-        inference_only (bool, optional): If True, tensors won't be saved for backward pass. Defaults to False.
-        seq_index (Optional[torch.Tensor]): Sequence index tensor with shape [seq_len].
-            It is only provided for cp sharded logits. It represents how tensor is sharded across the sequence dimension.
-        chunk_size (Optional[int]): Sequence dimension chunk size for computing the log probabilities.
-        sampling_params (TrainingSamplingParams, optional): Sampling parameters for Top-k/Top-p filtering and temperature scaling.
-
-    Returns:
-        torch.Tensor: Log probabilities tensor with shape [batch_size, seq_len-1].
-            The sequence dimension is reduced by 1 due to the target shifting.
-    """
-    cp_size = 1
-
-    if (
-        isinstance(target, DTensor)
-        and target.device_mesh.mesh_dim_names is not None
-        and "cp" in target.device_mesh.mesh_dim_names
-    ):
-        cp_dim_index = target.device_mesh.mesh_dim_names.index("cp")
-        cp_size = target.device_mesh.shape[cp_dim_index]
-
-    if cp_size > 1:
-        assert seq_index is not None, "seq_index must be provided for cp sharded logits"
-        target_shape = torch.Size(target.shape)
-        cp_mesh = target.device_mesh
-        cp_placements = target.placements
-        _, sorted_indices = torch.sort(seq_index)
-        # Recover the original order of the target
-        target = target.full_tensor()[:, sorted_indices]
-        target = target.roll(shifts=-1, dims=-1)[:, seq_index]
-
-        # Reshard
-        target = distribute_tensor(target, cp_mesh, cp_placements)
-        target = target.to_local()
-    else:
-        target = target.roll(shifts=-1, dims=-1)
-
-    logprobs = _tp_target_logprobs(
-        vocab_parallel_logits,
-        target,
-        vocab_start_index=vocab_start_index,
-        vocab_end_index=vocab_end_index,
-        tp_group=tp_group,
-        chunk_size=chunk_size,
-        sampling_params=sampling_params,
-        inference_only=inference_only,
-    )
-
-    if cp_size > 1:
-        # logprobs is sharded on the sequence dimension.
-        # Get full sequence tensor, vocab dim has been reduced already.
-        logprobs_dtensor = DTensor.from_local(logprobs, cp_mesh, cp_placements)
-        logprobs = logprobs_dtensor.full_tensor()[:, sorted_indices]
-        assert logprobs.shape == target_shape
-
-    return logprobs[:, :-1]
-
-
 def from_parallel_logits_to_logprobs(
     vocab_parallel_logits: torch.Tensor,
     target: torch.Tensor,
@@ -1566,30 +1394,6 @@ class AllGatherCPTensor(torch.autograd.Function):
         return grad_input, None, None  # , None
 
 
-def cp_load_balanced_to_contiguous(
-    x: torch.Tensor,
-    *,
-    cp_group: Optional[torch.distributed.ProcessGroup] = None,
-    seq_dim: int = 1,
-) -> torch.Tensor:
-    """Re-layout a tensor from load-balanced CP order to this rank's contiguous window.
-
-    PyTorch ``context_parallel`` shards the sequence in a load-balanced
-    (``2*cp`` interleaved) order. :func:`allgather_cp_sharded_tensor` undoes the
-    chunking to the full contiguous sequence; this re-slices to this CP rank's
-    contiguous ``[cp_rank*L, (cp_rank+1)*L)`` window. No-op when CP world <= 1.
-    Uses the grad-preserving ``DTensor.to_local()`` so the gradient is kept.
-    """
-    if cp_group is None or torch.distributed.get_world_size(cp_group) <= 1:
-        return x
-    local = x.to_local() if isinstance(x, DTensor) else x
-    full = allgather_cp_sharded_tensor(local, cp_group, seq_dim=seq_dim)
-    cp_size = torch.distributed.get_world_size(cp_group)
-    cp_rank = torch.distributed.get_rank(cp_group)
-    local_len = full.shape[seq_dim] // cp_size
-    return full.narrow(seq_dim, cp_rank * local_len, local_len).contiguous()
-
-
 def cp_shift_next(
     x: torch.Tensor,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -1746,7 +1550,6 @@ def vocab_parallel_argmax(
 def get_logprobs_from_vocab_parallel_logits(
     vocab_parallel_logits: DTensor,
     input_ids: torch.Tensor | DTensor,
-    seq_index: Optional[torch.Tensor] = None,
     chunk_size: Optional[int] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
 ):
@@ -1759,47 +1562,49 @@ def get_logprobs_from_vocab_parallel_logits(
         vocab_parallel_logits (DTensor): Logits distributed across tensor parallel workers,
             with shape [batch_size, seq_len, vocab_size/tp_size].
         input_ids (torch.Tensor | DTensor): Input token IDs for which to compute log probabilities,
-            with shape [batch_size, seq_len].
-        seq_index (Optional[torch.Tensor]): Sequence index for the input IDs,
-            with shape [sequence_length].
+            with shape [batch_size, seq_len]. NOTE: Must be the unmodified targets as this
+            function will shift them internally.
         chunk_size (Optional[int]): Sequence dimension chunk size for computing log probabilities.
         sampling_params (TrainingSamplingParams, optional): Sampling parameters for Top-k/Top-p filtering and temperature scaling.
 
     Returns:
-        torch.Tensor: Log probabilities for the given input IDs.
+        torch.Tensor: Log probabilities for the given input IDs, with shape
+            [batch_size, seq_len-1]. The sequence dimension is reduced by 1 due to the
+            target shifting.
     """
-    device_mesh = vocab_parallel_logits.device_mesh
-    if seq_index is not None:
-        assert (
-            device_mesh.mesh_dim_names is not None
-            and "cp" in device_mesh.mesh_dim_names
-        ), "seq_index must be provided for cp sharded logits"
+    # This function handles TP only. Fail loudly rather than silently mis-shifting.
+    if (
+        isinstance(input_ids, DTensor)
+        and input_ids.device_mesh.mesh_dim_names is not None
+        and "cp" in input_ids.device_mesh.mesh_dim_names
+    ):
+        raise NotImplementedError(
+            "get_logprobs_from_vocab_parallel_logits handles TP only; use "
+            "get_cp_sharded_next_token_logprobs for context parallelism."
+        )
 
-    tp_size = 1
-
-    tp_group = device_mesh.get_group("tp")
+    tp_group = vocab_parallel_logits.device_mesh.get_group("tp")
     tp_rank = tp_group.rank()
     tp_size = tp_group.size()
-
     vocab_interval_per_rank = vocab_parallel_logits.shape[-1] // tp_size
 
-    return dtensor_from_parallel_logits_to_logprobs(
+    logprobs = _tp_target_logprobs(
         vocab_parallel_logits.to_local(),
-        input_ids,
-        vocab_interval_per_rank * tp_rank,
-        (tp_rank + 1) * vocab_interval_per_rank,
-        tp_group,
-        inference_only=not torch.is_grad_enabled(),
-        seq_index=seq_index,
+        input_ids.roll(shifts=-1, dims=-1),
+        vocab_start_index=vocab_interval_per_rank * tp_rank,
+        vocab_end_index=(tp_rank + 1) * vocab_interval_per_rank,
+        tp_group=tp_group,
         chunk_size=chunk_size,
         sampling_params=sampling_params,
+        inference_only=not torch.is_grad_enabled(),
     )
+
+    return logprobs[:, :-1]
 
 
 def get_next_token_logprobs_from_logits(
     input_ids: torch.Tensor,
     next_token_logits: torch.Tensor,
-    seq_index: Optional[torch.Tensor] = None,
     vocab_parallel_rank: Optional[int] = None,
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -1811,14 +1616,13 @@ def get_next_token_logprobs_from_logits(
 
     This function handles four cases:
     1. Vocab parallel (Megatron-style): uses from_parallel_logits_to_logprobs
-    2. Automodel context parallel: uses get_cp_sharded_next_token_logprobs
-    3. DTensor: uses get_logprobs_from_vocab_parallel_logits
+    2. Automodel with context parallel: uses get_cp_sharded_next_token_logprobs
+    3. Automodel without context parallel: uses get_logprobs_from_vocab_parallel_logits
     4. Non-parallel: applies top-k/top-p filtering, log_softmax, and gather
 
     Args:
         input_ids: Input token IDs of shape [batch_size, seq_len]
         next_token_logits: Logits tensor of shape [batch_size, seq_len, vocab_size]
-        seq_index: Sequence index tensor for the V1 DTensor worker's CP path
         vocab_parallel_rank: Rank in the vocab parallel group (required if vocab_parallel_group is provided)
         vocab_parallel_group: Process group for vocab parallelism
         context_parallel_group: Process group for context parallelism
@@ -1826,8 +1630,8 @@ def get_next_token_logprobs_from_logits(
         chunk_size: Sequence-dim chunk size for the vocab-parallel path; only
             applied without top-k/top-p sampling.
         cp_sharder: Automodel ``ContextParallelSharder`` that sharded this
-            forward's model batch (V2 automodel worker with cp_size > 1). When
-            set, ``next_token_logits`` is this rank's CP-local shard and the
+            forward's model batch; set only when cp_size > 1. When set,
+            ``next_token_logits`` is this rank's CP-local shard and the
             sharder owns the sequence layout.
 
     Returns:
@@ -1873,7 +1677,6 @@ def get_next_token_logprobs_from_logits(
         logprobs = get_logprobs_from_vocab_parallel_logits(
             next_token_logits,
             input_ids,
-            seq_index=seq_index,
             sampling_params=sampling_params,
         )
 
@@ -2079,8 +1882,8 @@ def get_distillation_topk_logprobs_from_logits(
     # Move teacher topk indices to the same device as student logits
     teacher_topk_indices = teacher_topk_indices.to(student_logits.device)
 
-    # Automodel owns the sequence layout when a sharder is present. Neutralize
-    # the legacy CP group before deriving its size so no legacy layout work runs.
+    # Automodel owns the sequence layout when a sharder is present, so its CP group
+    # must not drive the layout work below.
     cp_group = None if cp_sharder is not None else context_parallel_group
     cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
 
@@ -2108,27 +1911,13 @@ def get_distillation_topk_logprobs_from_logits(
         vocab_start_index = tp_rank * V_local
         vocab_end_index = (tp_rank + 1) * V_local
 
-        # Legacy DTensor callers still derive CP from the tensor mesh. Automodel
-        # supplies its model-owned sequence layout explicitly instead.
-        if cp_sharder is None:
-            if (
-                device_mesh.mesh_dim_names is not None
-                and "cp" in device_mesh.mesh_dim_names
-            ):
-                cp_group = device_mesh.get_group("cp")
-                cp_size = cp_group.size()
-            else:
-                cp_group = None
-                cp_size = 1
-
     else:
         student_logits = student_logits
         parallel_group = None
 
-    # Automodel owns the sequence layout: shard the teacher indices into the
-    # model's local layout. The legacy CP state was neutralized above so its
-    # load-balanced relayout stays out of the way. Gather back to canonical order
-    # through the sharder once the student log-probs exist.
+    # Automodel owns the sequence layout: shard the teacher indices into the model's
+    # local layout, then gather back to canonical order through the sharder once the
+    # student log-probs exist.
     indices_for_logits = teacher_topk_indices
     if cp_sharder is not None:
         indices_for_logits = cp_sharder.shard_token_tensor(
@@ -2258,73 +2047,332 @@ class ChunkedDistributedEntropy(torch.autograd.Function):
         tp_group: torch.distributed.ProcessGroup,
         inference_only: bool = False,
     ) -> torch.Tensor:
-        B, S, _ = vocab_parallel_logits.shape
-        num_chunks = (int(S) + chunk_size - 1) // chunk_size
-        out_chunks: list[torch.Tensor] = []
-
-        for chunk_idx in range(num_chunks):
-            s0 = chunk_idx * chunk_size
-            s1 = min(int(S), (chunk_idx + 1) * chunk_size)
-
-            logits = vocab_parallel_logits[:, s0:s1, :].to(dtype=torch.float32)
-            log_probs = _compute_distributed_log_softmax(logits, group=tp_group)
-            softmax_output = log_probs.exp()
-            H_local = (softmax_output * log_probs).sum(dim=-1)  # [B, Sc]
-            torch.distributed.all_reduce(
-                H_local, op=torch.distributed.ReduceOp.SUM, group=tp_group
-            )
-            out_chunks.append(H_local)
-
-        H_all = torch.cat(out_chunks, dim=1) if len(out_chunks) > 1 else out_chunks[0]
+        entropy = _chunked_distributed_student_teacher_reduction(
+            vocab_parallel_logits,
+            None,
+            chunk_size=chunk_size,
+            tp_group=tp_group,
+            weight_fn=_entropy_weight,
+        )
 
         if not inference_only:
             ctx.save_for_backward(vocab_parallel_logits)
             ctx.chunk_size = int(chunk_size)
             ctx.tp_group = tp_group
 
-        return H_all.contiguous()
+        return entropy
 
     @staticmethod
     def backward(
         ctx: Any, *grad_outputs: torch.Tensor
     ) -> tuple[torch.Tensor, None, None, None]:
-        grad_output = grad_outputs[0]  # [B, S]
         (vocab_parallel_logits,) = ctx.saved_tensors
-        chunk_size: int = ctx.chunk_size
-        tp_group = ctx.tp_group
+        grad_input = _chunked_distributed_student_teacher_backward(
+            vocab_parallel_logits,
+            None,
+            grad_output=grad_outputs[0],
+            chunk_size=ctx.chunk_size,
+            tp_group=ctx.tp_group,
+            weight_fn=_entropy_weight,
+        )
+        return grad_input, None, None, None
 
-        B, S, V_local = vocab_parallel_logits.shape
-        num_chunks = (int(S) + chunk_size - 1) // chunk_size
 
-        grad_input: torch.Tensor = torch.empty_like(
-            vocab_parallel_logits, dtype=torch.float32
+class ChunkedDistributedCrossEntropyToFixedLogits(torch.autograd.Function):
+    """Compute ``CE = -sum_v p_student(v) log p_teacher(v)`` across TP with chunking.
+
+    Forward returns a ``[B, S]`` tensor of per-token cross-entropy between the
+    current student distribution and a fixed (frozen-teacher) distribution.
+    Gradients flow only through the student logits; the teacher side is a
+    constant, so its log-softmax is recomputed under ``no_grad`` semantics.
+
+    Both log-softmaxes are recomputed in backward from the saved raw logits
+    rather than cached, mirroring :class:`ChunkedDistributedEntropy`. Caching the
+    fp32 teacher log-probs would hold an extra ``[B, S, V_local]`` tensor alive
+    for the whole microbatch.
+    """
+
+    @staticmethod
+    def forward(  # pyrefly: ignore[bad-override]
+        ctx: Any,
+        student_vocab_parallel_logits: torch.Tensor,  # [B, S, V_local]
+        teacher_vocab_parallel_logits: torch.Tensor,  # [B, S, V_local]
+        chunk_size: int,
+        tp_group: torch.distributed.ProcessGroup,
+        inference_only: bool = False,
+    ) -> torch.Tensor:
+        cross_entropy = _chunked_distributed_student_teacher_reduction(
+            student_vocab_parallel_logits,
+            teacher_vocab_parallel_logits,
+            chunk_size=chunk_size,
+            tp_group=tp_group,
+            weight_fn=_cross_entropy_weight,
         )
 
-        for chunk_idx in range(num_chunks):
-            s0 = chunk_idx * chunk_size
-            s1 = min(int(S), (chunk_idx + 1) * chunk_size)
-
-            logits = vocab_parallel_logits[:, s0:s1, :].to(dtype=torch.float32)
-            log_probs = _compute_distributed_log_softmax(logits, group=tp_group)
-            softmax_output = log_probs.exp()
-            H_local = (softmax_output * log_probs).sum(dim=-1)
-            torch.distributed.all_reduce(
-                H_local, op=torch.distributed.ReduceOp.SUM, group=tp_group
+        if not inference_only:
+            ctx.save_for_backward(
+                student_vocab_parallel_logits, teacher_vocab_parallel_logits
             )
+            ctx.chunk_size = int(chunk_size)
+            ctx.tp_group = tp_group
 
-            # Inplace index into the preallocated grad_input tensor
-            grad_input_chunk = grad_input[:, s0:s1, :]
+        return cross_entropy
 
-            # dH/dz = softmax * (log_probs - H_all)
-            grad_input_chunk.copy_(
-                softmax_output.mul_(log_probs - H_local.unsqueeze(-1))
-            )  # inplace copy
-            grad_input_chunk.mul_(grad_output[:, s0:s1].unsqueeze(-1))
+    @staticmethod
+    def backward(
+        ctx: Any, *grad_outputs: torch.Tensor
+    ) -> tuple[torch.Tensor, None, None, None, None]:
+        student_vocab_parallel_logits, teacher_vocab_parallel_logits = ctx.saved_tensors
+        grad_input = _chunked_distributed_student_teacher_backward(
+            student_vocab_parallel_logits,
+            teacher_vocab_parallel_logits,
+            grad_output=grad_outputs[0],
+            chunk_size=ctx.chunk_size,
+            tp_group=ctx.tp_group,
+            weight_fn=_cross_entropy_weight,
+        )
+        return grad_input, None, None, None, None
 
-            # Explicitly free before next iteration allocates
-            del softmax_output, log_probs, logits, H_local
 
-        return grad_input, None, None, None
+class ChunkedDistributedReverseKLToFixedLogits(torch.autograd.Function):
+    """Compute ``KL = sum_v p_student(v) (log p_student(v) - log p_teacher(v))``.
+
+    Forward returns a ``[B, S]`` tensor of per-token reverse KL between the
+    current student distribution and a fixed (frozen-teacher) distribution.
+    Gradients flow only through the student logits.
+
+    This is the full-vocabulary limit of the top-k MOPD estimator: with the
+    support spanning the whole vocabulary, the sampled-token score-function tail
+    term vanishes and only this exact expectation remains.
+    """
+
+    @staticmethod
+    def forward(  # pyrefly: ignore[bad-override]
+        ctx: Any,
+        student_vocab_parallel_logits: torch.Tensor,  # [B, S, V_local]
+        teacher_vocab_parallel_logits: torch.Tensor,  # [B, S, V_local]
+        chunk_size: int,
+        tp_group: torch.distributed.ProcessGroup,
+        inference_only: bool = False,
+    ) -> torch.Tensor:
+        reverse_kl = _chunked_distributed_student_teacher_reduction(
+            student_vocab_parallel_logits,
+            teacher_vocab_parallel_logits,
+            chunk_size=chunk_size,
+            tp_group=tp_group,
+            weight_fn=_reverse_kl_weight,
+        )
+
+        if not inference_only:
+            ctx.save_for_backward(
+                student_vocab_parallel_logits, teacher_vocab_parallel_logits
+            )
+            ctx.chunk_size = int(chunk_size)
+            ctx.tp_group = tp_group
+
+        return reverse_kl
+
+    @staticmethod
+    def backward(
+        ctx: Any, *grad_outputs: torch.Tensor
+    ) -> tuple[torch.Tensor, None, None, None, None]:
+        student_vocab_parallel_logits, teacher_vocab_parallel_logits = ctx.saved_tensors
+        grad_input = _chunked_distributed_student_teacher_backward(
+            student_vocab_parallel_logits,
+            teacher_vocab_parallel_logits,
+            grad_output=grad_outputs[0],
+            chunk_size=ctx.chunk_size,
+            tp_group=ctx.tp_group,
+            weight_fn=_reverse_kl_weight,
+        )
+        return grad_input, None, None, None, None
+
+
+def _entropy_weight(
+    student_log_probs: torch.Tensor, teacher_log_probs: Optional[torch.Tensor]
+) -> torch.Tensor:
+    """Per-vocabulary weight whose student-probability expectation is sum_v p log p."""
+    return student_log_probs
+
+
+def _cross_entropy_weight(
+    student_log_probs: torch.Tensor, teacher_log_probs: Optional[torch.Tensor]
+) -> torch.Tensor:
+    """Per-vocabulary weight whose student-probability expectation is the CE."""
+    assert teacher_log_probs is not None
+    return -teacher_log_probs
+
+
+def _reverse_kl_weight(
+    student_log_probs: torch.Tensor, teacher_log_probs: Optional[torch.Tensor]
+) -> torch.Tensor:
+    """Per-vocabulary weight whose student-probability expectation is the KL."""
+    assert teacher_log_probs is not None
+    return student_log_probs - teacher_log_probs
+
+
+def _chunked_distributed_student_teacher_reduction(
+    student_vocab_parallel_logits: torch.Tensor,
+    teacher_vocab_parallel_logits: Optional[torch.Tensor],
+    *,
+    chunk_size: int,
+    tp_group: torch.distributed.ProcessGroup,
+    weight_fn: Callable[[torch.Tensor, Optional[torch.Tensor]], torch.Tensor],
+) -> torch.Tensor:
+    """Reduce ``sum_v p_student(v) * weight_fn(v)`` across TP, chunked over sequence.
+
+    ``weight_fn`` must depend on the student logits only through ``log p_s`` with a
+    constant ``dw/dlog p_s``: the shared backward below assumes exactly that, so a
+    weight like the forward KL (an expectation under the teacher) needs its own
+    kernel rather than a fourth ``weight_fn``.
+
+    Args:
+        student_vocab_parallel_logits: Student logits ``[B, S, V_local]``.
+        teacher_vocab_parallel_logits: Teacher logits ``[B, S, V_local]``, treated
+            as a constant. ``None`` for weights that read only the student
+            (the entropy).
+        chunk_size: Sequence-dimension chunk size bounding the live fp32 working set.
+        tp_group: Tensor-parallel process group the vocabulary is sharded over.
+        weight_fn: Maps ``(student_log_probs, teacher_log_probs)`` to the
+            per-vocabulary weight being averaged under the student distribution.
+
+    Returns:
+        Per-token reduction with shape ``[B, S]``.
+    """
+    _validate_student_teacher_logits(
+        student_vocab_parallel_logits, teacher_vocab_parallel_logits
+    )
+    seq_len = int(student_vocab_parallel_logits.shape[1])
+    num_chunks = (seq_len + chunk_size - 1) // chunk_size
+    out_chunks: list[torch.Tensor] = []
+
+    for chunk_idx in range(num_chunks):
+        s0 = chunk_idx * chunk_size
+        s1 = min(seq_len, (chunk_idx + 1) * chunk_size)
+
+        student_log_probs, teacher_log_probs = _student_teacher_log_softmax_chunk(
+            student_vocab_parallel_logits,
+            teacher_vocab_parallel_logits,
+            s0=s0,
+            s1=s1,
+            tp_group=tp_group,
+        )
+        reduction_local = (
+            student_log_probs.exp() * weight_fn(student_log_probs, teacher_log_probs)
+        ).sum(dim=-1)
+        torch.distributed.all_reduce(
+            reduction_local, op=torch.distributed.ReduceOp.SUM, group=tp_group
+        )
+        out_chunks.append(reduction_local)
+
+        del student_log_probs, teacher_log_probs
+
+    reduction = torch.cat(out_chunks, dim=1) if len(out_chunks) > 1 else out_chunks[0]
+    return reduction.contiguous()
+
+
+def _chunked_distributed_student_teacher_backward(
+    student_vocab_parallel_logits: torch.Tensor,
+    teacher_vocab_parallel_logits: Optional[torch.Tensor],
+    *,
+    grad_output: torch.Tensor,
+    chunk_size: int,
+    tp_group: torch.distributed.ProcessGroup,
+    weight_fn: Callable[[torch.Tensor, Optional[torch.Tensor]], torch.Tensor],
+) -> torch.Tensor:
+    """Backward for :func:`_chunked_distributed_student_teacher_reduction`.
+
+    For ``L = sum_v p_s(v) w(v)`` where ``w`` depends on the student logits only
+    through ``log p_s``, the gradient is ``dL/dz = p_s * (w + dw/dlogp_s - L)``.
+    Both supported weights have a constant ``dw/dlogp_s`` (``0`` for the cross
+    entropy, ``1`` for the reverse KL), and that constant cancels against the
+    ``sum_v p_s = 1`` normalization, leaving ``dL/dz = p_s * (w - L)``.
+
+    Args:
+        student_vocab_parallel_logits: Student logits ``[B, S, V_local]``.
+        teacher_vocab_parallel_logits: Teacher logits ``[B, S, V_local]``, or
+            ``None`` for student-only weights.
+        grad_output: Upstream gradient ``[B, S]``.
+        chunk_size: Sequence-dimension chunk size.
+        tp_group: Tensor-parallel process group.
+        weight_fn: Same weight used in the forward reduction.
+
+    Returns:
+        Gradient with respect to the student logits, shape ``[B, S, V_local]``.
+    """
+    seq_len = int(student_vocab_parallel_logits.shape[1])
+    num_chunks = (seq_len + chunk_size - 1) // chunk_size
+    grad_input: torch.Tensor = torch.empty_like(student_vocab_parallel_logits)
+
+    for chunk_idx in range(num_chunks):
+        s0 = chunk_idx * chunk_size
+        s1 = min(seq_len, (chunk_idx + 1) * chunk_size)
+
+        student_log_probs, teacher_log_probs = _student_teacher_log_softmax_chunk(
+            student_vocab_parallel_logits,
+            teacher_vocab_parallel_logits,
+            s0=s0,
+            s1=s1,
+            tp_group=tp_group,
+        )
+        weight = weight_fn(student_log_probs, teacher_log_probs)
+        student_probs = student_log_probs.exp()
+        reduction_local = (student_probs * weight).sum(dim=-1)
+        torch.distributed.all_reduce(
+            reduction_local, op=torch.distributed.ReduceOp.SUM, group=tp_group
+        )
+
+        # Both multiplies happen in fp32, before the copy_ narrows to the logits'
+        # dtype: multiplying after the cast costs an extra rounding in bf16.
+        grad_input[:, s0:s1, :].copy_(
+            student_probs.mul_(weight - reduction_local.unsqueeze(-1)).mul_(
+                grad_output[:, s0:s1].unsqueeze(-1)
+            )
+        )
+
+        # Explicitly free before next iteration allocates
+        del student_log_probs, teacher_log_probs, weight, student_probs, reduction_local
+
+    return grad_input
+
+
+def _student_teacher_log_softmax_chunk(
+    student_vocab_parallel_logits: torch.Tensor,
+    teacher_vocab_parallel_logits: Optional[torch.Tensor],
+    *,
+    s0: int,
+    s1: int,
+    tp_group: torch.distributed.ProcessGroup,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Return TP-normalized fp32 student and teacher log-probs for one chunk."""
+    student_logits = student_vocab_parallel_logits[:, s0:s1, :].to(dtype=torch.float32)
+    student_log_probs = _compute_distributed_log_softmax(student_logits, group=tp_group)
+    if teacher_vocab_parallel_logits is None:
+        return student_log_probs, None
+    teacher_logits = teacher_vocab_parallel_logits[:, s0:s1, :].to(dtype=torch.float32)
+    teacher_log_probs = _compute_distributed_log_softmax(teacher_logits, group=tp_group)
+    return student_log_probs, teacher_log_probs
+
+
+def _validate_student_teacher_logits(
+    student_vocab_parallel_logits: torch.Tensor,
+    teacher_vocab_parallel_logits: Optional[torch.Tensor],
+) -> None:
+    """Raise if the student and teacher vocabulary shards are not aligned."""
+    if student_vocab_parallel_logits.ndim != 3:
+        raise ValueError(
+            "Student logits must be rank 3 [B, S, V_local]; got "
+            f"{tuple(student_vocab_parallel_logits.shape)}."
+        )
+    if (
+        teacher_vocab_parallel_logits is not None
+        and student_vocab_parallel_logits.shape != teacher_vocab_parallel_logits.shape
+    ):
+        raise ValueError(
+            "Student and teacher logits must share the same [B, S, V_local] shape; "
+            f"got {tuple(student_vocab_parallel_logits.shape)} and "
+            f"{tuple(teacher_vocab_parallel_logits.shape)}."
+        )
 
 
 def from_parallel_hidden_states_to_logprobs(
@@ -2781,3 +2829,12 @@ def all_to_all_sq2vp(
     output_tensor = output_flat.reshape(world_size * BS_local, V_local)
 
     return output_tensor
+
+
+def to_local_if_dtensor(tensor: torch.Tensor | DTensor) -> torch.Tensor:
+    """Returns the local shard of the given tensor if it is a DTensor.
+
+    Taken and modified from: https://github.com/NVIDIA/Megatron-LM/blob/605f618f237cda8fa80132bc2ccff933512d5a0d/megatron/core/utils.py#L746
+    """
+    with torch.no_grad():
+        return tensor.to_local() if isinstance(tensor, DTensor) else tensor

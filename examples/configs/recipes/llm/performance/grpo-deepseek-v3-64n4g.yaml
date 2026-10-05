@@ -8,5 +8,7 @@ logger:
 policy:
   megatron_cfg:
     expert_model_parallel_size: 32
+    env_vars:
+      NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: "32"
 cluster:
   num_nodes: 64

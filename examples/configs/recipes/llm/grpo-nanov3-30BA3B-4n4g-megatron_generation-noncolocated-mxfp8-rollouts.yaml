@@ -1,7 +1,4 @@
 defaults: ../../grpo_math_1B.yaml
-# BF16 training with MXFP8-quantized Megatron inference on a dedicated 8-GPU group:
-# every weight sync quantizes BF16 -> MXFP8 over the NCCL refit,
-# with EP8-sharded expert transfers across NVLink domains.
 grpo:
   num_prompts_per_step: 2
   num_generations_per_prompt: 8
@@ -28,9 +25,11 @@ policy:
     enabled: false
   generation:
     backend: megatron
+    refit_transport: mcore
     mcore_generation_config:
+      refit_backend: nccl
       transformer_impl: inference_optimized
-      inference_grouped_gemm_backend: "torch"
+      inference_grouped_gemm_backend: torch
       inference_moe_token_dispatcher_type: nvls
       tensor_model_parallel_size: 2
       expert_model_parallel_size: 8

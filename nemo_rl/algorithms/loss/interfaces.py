@@ -41,7 +41,8 @@ class MetricNormalizer(enum.Enum):
     from the same flags that pick the denominators, so it lives next to the
     metric definitions instead of in a consumer-side table. Metrics absent
     from the mapping fall back to the gradient normalization (the
-    ``loss_type`` denominator) on the consumer side.
+    ``loss_type`` denominator) in split-API trainers. Survivor rescaling only
+    changes advertised denominators and leaves unadvertised metrics unchanged.
     """
 
     TOKENS = "tokens"  # divided by global_valid_toks
@@ -52,6 +53,7 @@ class MetricNormalizer(enum.Enum):
 class LossInputType(enum.Enum):
     LOGIT = "logit"
     LOGPROB = "logprob"
+    OPD_FULL = "opd_full"
     DISTILLATION = "distillation"
     DISTILLATION_CROSS_TOKENIZER = "distillation_cross_tokenizer"
     DRAFT = "draft"
@@ -66,8 +68,9 @@ class LossFunction(Protocol):
     Losses may additionally expose a ``metric_normalizations:
     dict[str, MetricNormalizer]`` attribute advertising the global denominator
     each returned metric was normalized by (see ``MetricNormalizer``). It is
-    optional: consumers fall back to the ``loss_type`` denominator for
-    metrics (or losses) that do not advertise.
+    optional: split-API trainers fall back to the ``loss_type`` denominator for
+    metrics (or losses) that do not advertise. Survivor rescaling instead
+    leaves metrics absent from the mapping unchanged.
     """
 
     loss_type: LossType
@@ -97,6 +100,8 @@ class LossFunction(Protocol):
             **kwargs: Loss function input, which varies by input_type:
                 - For LossInputType.LOGPROB: next_token_logprobs (torch.Tensor)
                 - For LossInputType.LOGIT: logits (torch.Tensor)
+                - For LossInputType.OPD_FULL: opd_full_divergence, and optionally
+                  opd_full_entropy / opd_full_cross_entropy (torch.Tensor)
                 - For LossInputType.DISTILLATION: student_topk_logprobs, teacher_topk_logprobs, H_all (torch.Tensor)
                 - For LossInputType.DISTILLATION_CROSS_TOKENIZER: logits (torch.Tensor), teacher_full_logits_by_idx (dict[int, torch.Tensor])
                 - For LossInputType.DRAFT: teacher_logits, student_logits, mask (torch.Tensor)

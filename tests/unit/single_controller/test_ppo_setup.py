@@ -53,6 +53,8 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     algo_config,
     validate_single_controller_config,
 )
+from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.utils.logger import LoggerConfig
 
 _NUM_PROMPTS_PER_STEP = 4
 _NUM_GENERATIONS_PER_PROMPT = 2
@@ -71,7 +73,7 @@ def _value_config(
         "train_micro_batch_size": 1,
         "max_total_sequence_length": 32,
         "megatron_cfg": {"enabled": megatron_enabled},
-        "dtensor_cfg": {"enabled": not megatron_enabled, "_v2": True},
+        "dtensor_cfg": {"enabled": not megatron_enabled},
     }
 
 
@@ -136,10 +138,10 @@ def _make_master_config(
             "save_period": 10,
             "save_optimizer": False,
         },
-        logger={"wandb_enabled": False, "wandb": {}},
+        logger=LoggerConfig.model_construct(),
         loss_fn=ClippedPGLossConfig(reference_policy_kl_penalty=0.0),
         env={},
-        cluster={"num_nodes": 2, "gpus_per_node": 8, "segment_size": None},
+        cluster=ClusterConfig(num_nodes=2, gpus_per_node=8),
         async_rl=AsyncRLConfig(
             min_groups_for_streaming_train=min_groups_for_streaming_train,
             max_buffered_rollouts=_NUM_PROMPTS_PER_STEP * 2,
@@ -645,9 +647,12 @@ class TestSetupBuildsTheCritic:
 
 
 class TestValueWarmStart:
-    def test_fresh_run_builds_the_critic_from_the_warm_start(
+    def test_fresh_run_takes_warm_start_weights_but_not_its_optimizer(
         self, patched_ppo_factories, tmp_path
     ):
+        """The seed's Adam state and scheduler step count belong to the run that
+        produced it, so a warm start rebuilds both and only the weights carry
+        over."""
         seed = tmp_path / "critic_pretrain" / "step_370"
         (seed / "value" / "weights").mkdir(parents=True)
         (seed / "value" / "optimizer").mkdir()
@@ -664,7 +669,7 @@ class TestValueWarmStart:
 
         value_kwargs = patched_ppo_factories["_build_value"].call_args.kwargs
         assert value_kwargs["weights_path"] == seed / "value" / "weights"
-        assert value_kwargs["optimizer_path"] == seed / "value" / "optimizer"
+        assert value_kwargs["optimizer_path"] is None
         # The policy is untouched by a warm start: pi_0 comes from the base model.
         trainer_kwargs = patched_ppo_factories["_build_trainer"].call_args.kwargs
         assert trainer_kwargs["weights_path"] is None
@@ -737,12 +742,7 @@ class TestValueWarmStart:
 
 def _cluster_config(mc: MasterConfig, *, colocated: bool, backend: str) -> MasterConfig:
     """Fill in the cluster / generation keys _build_clusters reads."""
-    mc.cluster = {
-        "num_nodes": 1,
-        "gpus_per_node": 8,
-        "master_port_range_low": None,
-        "master_port_range_high": None,
-    }
+    mc.cluster = ClusterConfig(num_nodes=1, gpus_per_node=8)
     mc.policy["generation"] = {
         "backend": backend,
         "colocated": {

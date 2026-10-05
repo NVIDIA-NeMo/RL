@@ -104,7 +104,8 @@ not translate unsupported schemas. vLLM may reject an unsupported combination
 or select an unquantized fallback, so native-method inspection is required
 before a schema is considered qualified.
 
-Pinned vLLM 0.25.1 has the following ModelOpt real-quant limits:
+The following ModelOpt real-quant limits were checked against vLLM 0.25.1.
+Recheck native methods when using another version:
 
 | ModelOpt format | Uniform schema | Inside `MIXED_PRECISION` |
 |---|---:|---:|

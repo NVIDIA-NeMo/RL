@@ -18,89 +18,23 @@ import traceback
 import warnings
 from datetime import timedelta
 from enum import Enum
-from typing import Any, Dict, Iterable, Optional, cast
+from typing import TYPE_CHECKING, Any, Iterable, Optional, cast
 
 import torch
 import torch.distributed as dist
 import zmq
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
-from transformers import (
-    AutoModelForCausalLM,
-    AutoModelForImageTextToText,
-    AutoModelForTextToWaveform,
-)
-
-# Try to import nemo_automodel classes, fallback to None if not available
-try:
-    from nemo_automodel._transformers.auto_model import (
-        NeMoAutoModelForCausalLM,
-        NeMoAutoModelForImageTextToText,
-        NeMoAutoModelForTextToWaveform,
-    )
-
-    # Side-effect import: installs the resolver hook that routes FP8-native
-    # Mistral 3.5 configs to Mistral3FP8VLM. Without it, HF's stock FP8Linear
-    # path runs and produces 0-d weight_scale_inv params that FSDP2 rejects.
-    try:
-        import nemo_automodel.components.models.mistral3_vlm  # noqa: F401
-    except ImportError:
-        pass
-
-    NEMO_AUTOMODEL_AVAILABLE = True
-except ImportError:
-    # nemo_automodel is not installed, classes will be None
-    NeMoAutoModelForCausalLM = None  # type: ignore
-    NeMoAutoModelForImageTextToText = None  # type: ignore
-    NeMoAutoModelForTextToWaveform = None  # type: ignore
-    NEMO_AUTOMODEL_AVAILABLE = False
 
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
+from nemo_rl.models.generation.vllm.config import (
+    VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
+    VllmSpecificArgs,
+    vllm_nemotron_h_fp32_lm_head_enabled,
+)
+from nemo_rl.utils.cuda_ipc import normalize_cuda_ipc_handle
 
-# Plain Hugging Face classes remain separate from the NeMo AutoModel wrappers so
-# callers that manage distribution can request them when NeMo AutoModel is installed.
-# Add an entry here whenever a model's architecture isn't loadable via
-# AutoModelForCausalLM (e.g. VLMs using ForConditionalGeneration /
-# ForImageTextToText). Unlike AUTOMODEL_FACTORY below, this dict is also read on
-# the ``use_nemo_automodel=False`` path (DTensor V1), where no NeMo custom impl
-# intercepts from_pretrained -- so a model that has a custom NeMo automodel impl
-# still needs an entry here when its parent AutoModel class is not
-# AutoModelForCausalLM. Check MODEL_ARCH_MAPPING in the NeMo automodel registry
-# to see which architectures have custom impls:
-# https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/_transformers/registry.py#L32-L146
-HF_AUTOMODEL_FACTORY: Dict[str, Any] = {
-    "qwen2_5_vl": AutoModelForImageTextToText,
-    "qwen2_vl": AutoModelForImageTextToText,
-    "qwen2_5_omni": AutoModelForTextToWaveform,
-    "qwen3_5": AutoModelForImageTextToText,
-    "llava": AutoModelForImageTextToText,
-    "internvl": AutoModelForImageTextToText,
-    "gemma3": AutoModelForImageTextToText,
-    "gemma4": AutoModelForImageTextToText,
-    "gemma4_unified": AutoModelForImageTextToText,
-    "smolvlm": AutoModelForImageTextToText,
-    "mistral3": AutoModelForImageTextToText,
-    "llama4": AutoModelForImageTextToText,
-}
-
-AUTOMODEL_FACTORY: Dict[str, Any] = HF_AUTOMODEL_FACTORY
-
-if NEMO_AUTOMODEL_AVAILABLE:
-    AUTOMODEL_FACTORY = {
-        # NeMo wrappers — keep in sync with the vanilla HF dict above.
-        # See comment above for when to add entries.
-        "qwen2_5_vl": NeMoAutoModelForImageTextToText,
-        "qwen2_vl": NeMoAutoModelForImageTextToText,
-        "qwen2_5_omni": NeMoAutoModelForTextToWaveform,
-        "qwen3_5": NeMoAutoModelForImageTextToText,
-        "llava": NeMoAutoModelForImageTextToText,
-        "internvl": NeMoAutoModelForImageTextToText,
-        "gemma3": NeMoAutoModelForImageTextToText,
-        "gemma4": NeMoAutoModelForImageTextToText,
-        "gemma4_unified": NeMoAutoModelForImageTextToText,
-        "smolvlm": NeMoAutoModelForImageTextToText,
-        "mistral3": NeMoAutoModelForImageTextToText,
-        "llama4": NeMoAutoModelForImageTextToText,
-    }
+if TYPE_CHECKING:
+    from nemo_rl.models.policy import PolicyConfig
 
 
 class IPCProtocol(Enum):
@@ -116,9 +50,28 @@ class IPCProtocol(Enum):
 # worker classes.
 POLICY_WORKER_OVERRIDES = {
     "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker": "nemo_rl.modelopt.models.policy.workers.megatron_quant_policy_worker.MegatronQuantPolicyWorker",
-    "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker": "nemo_rl.modelopt.models.policy.workers.dtensor_quant_policy_worker.DTensorQuantPolicyWorker",
     "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2": "nemo_rl.modelopt.models.policy.workers.dtensor_quant_policy_worker_v2.DTensorQuantPolicyWorkerV2",
 }
+
+_NEMOTRON_H_MODEL_TYPES = frozenset({"nemotron_h"})
+_NEMOTRON_H_ARCHITECTURES = frozenset({"NemotronHForCausalLM"})
+
+
+def reject_legacy_dtensor_key(dtensor_cfg: dict[str, Any], config_path: str) -> None:
+    """Fail at setup when a config still carries the removed dtensor_cfg._v2 key.
+
+    Args:
+        dtensor_cfg: The resolved dtensor_cfg mapping to inspect.
+        config_path: Dotted path used in the error message, e.g. policy.dtensor_cfg.
+    """
+    if "_v2" not in dtensor_cfg:
+        return
+
+    raise ValueError(
+        f"DTensor v1 ({config_path}._v2=false) and the _v2 key itself have been removed. "
+        f"DTensor is always the Automodel backend now, which is what _v2=true selected, "
+        f"so delete the key."
+    )
 
 
 def resolve_policy_worker_cls(default_cls: str, config: dict) -> str:
@@ -133,21 +86,136 @@ def resolve_policy_worker_cls(default_cls: str, config: dict) -> str:
     return POLICY_WORKER_OVERRIDES.get(default_cls, default_cls)
 
 
-def resolve_model_class(
-    model_name: str,
-    *,
-    use_nemo_automodel: bool = True,
-) -> Any:
-    """Resolve the model class for a model type.
+def _normalize_model_type(model_type: object) -> str:
+    return str(model_type).lower().replace("-", "_")
 
-    Args:
-        model_name: Model type to resolve.
-        use_nemo_automodel: Whether to prefer NeMo AutoModel wrappers when they
-            are available.
-    """
-    if use_nemo_automodel and NEMO_AUTOMODEL_AVAILABLE:
-        return AUTOMODEL_FACTORY.get(model_name.lower(), NeMoAutoModelForCausalLM)
-    return HF_AUTOMODEL_FACTORY.get(model_name.lower(), AutoModelForCausalLM)
+
+def _get_config_model_type(model_config: object) -> object | None:
+    return getattr(model_config, "model_type", None) or getattr(
+        model_config.__class__, "model_type", None
+    )
+
+
+def _get_config_architectures(model_config: object) -> list[str]:
+    architectures = getattr(model_config, "architectures", None) or []
+    if isinstance(architectures, str):
+        return [architectures]
+    try:
+        return [str(architecture) for architecture in architectures]
+    except TypeError:
+        return []
+
+
+def _is_nemotron_h_model_config(model_config: object) -> bool:
+    model_type = _get_config_model_type(model_config)
+    if (
+        model_type is not None
+        and _normalize_model_type(model_type) in _NEMOTRON_H_MODEL_TYPES
+    ):
+        return True
+
+    return any(
+        architecture in _NEMOTRON_H_ARCHITECTURES
+        for architecture in _get_config_architectures(model_config)
+    ) or any(
+        _is_nemotron_h_model_config(inner)
+        for inner in (
+            getattr(model_config, attr, None) for attr in ("llm_config", "text_config")
+        )
+        if inner is not None
+    )
+
+
+def _describe_model_config(model_config: object) -> str:
+    model_type = _get_config_model_type(model_config)
+    architectures = _get_config_architectures(model_config)
+    if architectures:
+        return f"architectures={architectures!r}, model_type={model_type!r}"
+    return f"model_type={model_type!r}"
+
+
+def validate_fp32_lm_head_config(
+    config: "PolicyConfig",
+    *,
+    megatron_enabled: bool,
+    dtensor_enabled: bool,
+    model_config: object | None = None,
+) -> None:
+    """Reject fp32 LM-head settings that the selected backends cannot match."""
+    megatron_cfg = config.get("megatron_cfg")
+    megatron_fp32_value = (
+        megatron_cfg.get("fp32_lm_head")
+        if megatron_enabled and megatron_cfg is not None
+        else None
+    )
+    if megatron_fp32_value not in (None, True, False):
+        raise ValueError("policy.megatron_cfg.fp32_lm_head must be true or false.")
+    megatron_fp32 = bool(megatron_fp32_value)
+
+    if (
+        megatron_fp32
+        and megatron_cfg is not None
+        and megatron_cfg.get("use_fused_linear_logprobs")
+    ):
+        raise ValueError(
+            "policy.megatron_cfg.fp32_lm_head has no effect with "
+            "use_fused_linear_logprobs=true (the fused linear+CE kernel bypasses "
+            "output_layer). Disable one of them."
+        )
+
+    generation_config = config.get("generation")
+    if generation_config is None:
+        return
+
+    generation_backend = generation_config["backend"]
+    if generation_backend != "vllm":
+        return
+
+    vllm_cfg = generation_config.get("vllm_cfg")
+    if vllm_cfg is None:
+        return
+    vllm_cfg = cast(VllmSpecificArgs | dict[str, Any], vllm_cfg)
+
+    env_vars = vllm_cfg.get("env_vars") or {}
+    if VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR in env_vars:
+        raise ValueError(
+            f"{VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR} is reserved for "
+            "NeMo-RL internal vLLM Nemotron-H patch plumbing; configure fp32 "
+            "LM head with "
+            "policy.generation.vllm_cfg.fp32_lm_head instead."
+        )
+
+    vllm_fp32 = vllm_nemotron_h_fp32_lm_head_enabled(vllm_cfg)
+    if dtensor_enabled and vllm_fp32:
+        raise ValueError(
+            "policy.generation.vllm_cfg.fp32_lm_head=true is only supported "
+            "with the Megatron trainer because DTensor has no matching "
+            "policy.dtensor_cfg fp32 LM-head implementation."
+        )
+    if megatron_enabled and megatron_fp32 != vllm_fp32:
+        raise ValueError(
+            "fp32 LM head must be enabled on both Megatron training and vLLM "
+            "generation or neither: "
+            f"policy.megatron_cfg.fp32_lm_head={megatron_fp32_value!r} but "
+            f"policy.generation.vllm_cfg.fp32_lm_head="
+            f"{vllm_cfg.get('fp32_lm_head')!r}. "
+            "A one-sided fp32 head increases the generation/training logprob "
+            "mismatch instead of reducing it."
+        )
+    if (
+        vllm_fp32
+        and model_config is not None
+        and not _is_nemotron_h_model_config(model_config)
+    ):
+        warnings.warn(
+            "policy.generation.vllm_cfg.fp32_lm_head=true currently only "
+            "patches vLLM's Nemotron-H model implementation "
+            "(NemotronHForCausalLM). The configured policy model does not "
+            f"look like Nemotron-H ({_describe_model_config(model_config)}), "
+            "so vLLM generation will not execute an fp32 LM-head path.",
+            UserWarning,
+            stacklevel=2,
+        )
 
 
 def is_vllm_v1_engine_enabled() -> bool:
@@ -456,7 +524,6 @@ def stream_weights_via_ipc_zmq_impl(
     count_of_groups = 0
 
     try:
-        group_boundary = object()
         if drain_between_groups:
             param_groups = params_generator
 
@@ -471,12 +538,12 @@ def stream_weights_via_ipc_zmq_impl(
                         yield from group
                     finally:
                         del group
-                    yield group_boundary
+                    yield None
 
             params_generator = _iter_params_with_group_boundaries()
 
         for item in params_generator:
-            if item is group_boundary:
+            if item is None:
                 # The grouped producer may synchronize before its next group.
                 # Drain this group first so producer and consumer cannot wait on
                 # opposite sides of that synchronization.
@@ -610,14 +677,27 @@ def stream_weights_via_ipc_zmq_impl(
         release_staging_buffers()
 
 
+# Positions in ``torch.multiprocessing.reductions.rebuild_cuda_tensor``'s
+# argument tuple (unchanged since torch 1.x; see its signature).
+_REBUILD_CUDA_TENSOR_ARG_DEVICE_INDEX = 6
+_REBUILD_CUDA_TENSOR_ARG_STORAGE_HANDLE_INDEX = 7
+
+
 def rebuild_cuda_tensor_from_ipc(
     cuda_ipc_handle: tuple, device_id: int
 ) -> torch.Tensor:
     """Rebuild a CUDA tensor from an IPC handle."""
     func = rebuild_cuda_tensor
     args = cuda_ipc_handle[0]
-    list_args = list(args)
-    list_args[6] = device_id
+    list_args: list[Any] = list(args)
+    list_args[_REBUILD_CUDA_TENSOR_ARG_DEVICE_INDEX] = device_id
+    # The producer (training venv) may run a newer torch than this consumer;
+    # see nemo_rl.utils.cuda_ipc for the version-byte compatibility rewrite.
+    list_args[_REBUILD_CUDA_TENSOR_ARG_STORAGE_HANDLE_INDEX] = (
+        normalize_cuda_ipc_handle(
+            list_args[_REBUILD_CUDA_TENSOR_ARG_STORAGE_HANDLE_INDEX]
+        )
+    )
     return func(*list_args)
 
 
@@ -1107,9 +1187,9 @@ def broadcast_hf_buckets_via_distributed_impl(
     ``dist.broadcast`` per tensor over the NCCL group, then waits for the Ray
     refs to confirm engines finished loading the bucket.
 
-    The rollout-engine lock wraps each bucket's broadcast so concurrent SGLang
-    NCCL operations (e.g. health-check pings) cannot collide with the
-    weight-update broadcast.
+    Trainer rank 0 acquires the rollout-engine lock for each bucket to serialize
+    weight-update broadcasts. The generation side does not acquire it; pausing
+    the health monitor keeps serving probes out of the refit phase.
     """
     import time as _time
 

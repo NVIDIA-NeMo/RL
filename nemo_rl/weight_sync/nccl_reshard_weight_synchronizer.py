@@ -14,7 +14,7 @@
 
 """NCCL-xfer (shard-to-shard) weight synchronizer for non-colocated deployments.
 
-Handles disaggregated Megatron-train -> vLLM-gen weight refit via the
+Handles disaggregated Megatron-train -> vLLM/Megatron-gen weight refit via the
 ``xferdtensor`` reshard: bulk FFN/expert params are resharded shard-to-shard
 between the train and gen parallelism layouts over a dedicated per-PP-stage NCCL
 communicator, while the remaining "misc" params ride a packed broadcast over the
@@ -25,15 +25,15 @@ between layouts, avoiding a full gather + broadcast.
 Lifecycle:
   init_communicator():
     1. policy/generation.init_collective()           -- model_update_group (misc)
-    2. policy/generation.init_nccl_reshard_comm_group()  -- per-PP-stage bulk groups
+    2. policy.init_nccl_reshard_comm_group() and
+       generation.rebuild_nccl_reshard_comm_group()     -- per-PP-stage bulk groups
     3. policy.prepare_nccl_reshard_refit_info()
        -> generation.prepare_nccl_reshard_refit_info()   -- backend-agnostic metadata
   sync_weights():
     policy.nccl_reshard_refit(kv_scales) + generation.nccl_reshard_refit(); verify.
 
-Like the collective transport, this is a pure data mover: policy and generation
-run on separate GPU clusters, so the phase transitions (offload / restore) are
-owned by the orchestrator, not here.
+Like the collective transport, this is a pure data mover. Backend-specific
+phase transitions are owned by the caller.
 """
 
 from collections.abc import Sequence
@@ -42,9 +42,14 @@ from typing import Any, Optional
 
 import ray
 
+from nemo_rl.models.generation.megatron.config import merged_inference_megatron_cfg
 from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
-from nemo_rl.weight_sync.membership import RefitMembership, plan_refit_membership
+from nemo_rl.weight_sync.membership import (
+    RefitMembership,
+    desired_membership,
+    should_rebuild,
+)
 from nemo_rl.weight_sync.nccl_reshard_utils import (
     make_nccl_reshard_refit_info_wire_safe,
 )
@@ -89,7 +94,7 @@ def _settle_before_propagating(futures, budget_s, what: str) -> None:
 class NcclReshardWeightSynchronizer(WeightSynchronizer):
     """Weight synchronizer using the ``xferdtensor`` shard-to-shard reshard.
 
-    For non-colocated Megatron-train -> vLLM-gen deployments where weights are
+    For non-colocated Megatron-train -> vLLM/Megatron-gen deployments where weights are
     redistributed directly between the two parallelism layouts (bulk path) plus
     a packed broadcast for the misc params. Mirrors
     :class:`CollectiveWeightSynchronizer` but additionally bootstraps the
@@ -101,7 +106,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
 
     Args:
         policy: Policy object implementing ColocatablePolicyInterface (Megatron).
-        generation: Generation object implementing GenerationInterface (vLLM).
+        generation: Generation object implementing GenerationInterface.
         train_cluster: RayVirtualCluster for the training workers.  Only used by
             ``init_communicator()``; may be ``None`` for sync-only instances.
         inference_cluster: RayVirtualCluster for the inference workers.  Only
@@ -127,34 +132,52 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         self._inference_cluster = inference_cluster
         self._refit_timeout_s = refit_timeout_s
         self._stale = True
-        # The absent set this synchronizer's current communicator was built with, so a
-        # membership that has not changed can skip the rebuild. None means "never rebuilt",
-        # i.e. still the full-fleet group from setup.
-        #
-        # Without this, reconcile_communicator rebuilt on EVERY call once a shard was gone,
-        # because absent_shards() never empties again -- nothing in production calls
-        # mark_restarting or mark_loaded. _sync_weights reconciles twice per step, so a run
-        # that lost a shard at step 10 and trains to 10,000 paid ~20,000 full rebuilds: a
-        # fresh port, a fresh TCPStore and a fresh NCCL bootstrap across every train and
-        # inference rank each time, plus a plan regeneration on nccl_reshard. The steady
-        # state this feature exists to produce was the expensive one.
-        self._built_with_absent: Optional[frozenset[int]] = None
+        # What the communicators were last built over. None until init_communicator.
+        self._built_membership: Optional[RefitMembership] = None
 
     def _train_parallelism(self) -> dict[str, int]:
         megatron_cfg = self._policy.cfg["megatron_cfg"]
+        tp_size = megatron_cfg.get("tensor_model_parallel_size", 1)
+        etp_size = megatron_cfg.get("expert_tensor_parallel_size")
         return {
-            "tp_size": megatron_cfg.get("tensor_model_parallel_size", 1),
+            "tp_size": tp_size,
             "ep_size": megatron_cfg.get("expert_model_parallel_size", 1),
+            # MCore accepts None and resolves it to TP in ModelParallelConfig;
+            # normalize at this boundary so the plan builder receives only ints.
+            "etp_size": tp_size if etp_size is None else etp_size,
             "pp_size": megatron_cfg.get("pipeline_model_parallel_size", 1),
         }
 
     def _gen_parallelism(self) -> dict[str, int]:
-        vllm_cfg = self._policy.cfg["generation"].get("vllm_cfg", {})
-        return {
-            "tp_size": vllm_cfg.get("tensor_parallel_size", 1),
-            "ep_size": vllm_cfg.get("expert_parallel_size", 1),
-            "pp_size": vllm_cfg.get("pipeline_parallel_size", 1),
-        }
+        generation_cfg = self._policy.cfg["generation"]
+        if generation_cfg["backend"] == "vllm":
+            vllm_cfg = generation_cfg.get("vllm_cfg", {})
+            tp_size = vllm_cfg.get("tensor_parallel_size", 1)
+            ep_size = vllm_cfg.get("expert_parallel_size", 1)
+            return {
+                "tp_size": tp_size,
+                "ep_size": ep_size,
+                "etp_size": tp_size if ep_size == 1 else 1,
+                "pp_size": vllm_cfg.get("pipeline_parallel_size", 1),
+            }
+        if generation_cfg["backend"] == "megatron":
+            # Resolve through the same merge the generation model is built from,
+            # so the reshard mesh cannot drift from the layout MCore actually
+            # instantiates (e.g. the inference_optimized ETP pin).
+            megatron_cfg = merged_inference_megatron_cfg(self._policy.cfg)
+            tp_size = megatron_cfg["tensor_model_parallel_size"]
+            etp_size = megatron_cfg.get("expert_tensor_parallel_size")
+            return {
+                "tp_size": tp_size,
+                "ep_size": megatron_cfg["expert_model_parallel_size"],
+                # Match MCore's effective default: an omitted/None ETP uses TP.
+                "etp_size": tp_size if etp_size is None else etp_size,
+                "pp_size": megatron_cfg["pipeline_model_parallel_size"],
+            }
+        raise ValueError(
+            "NCCL M-to-N refit only supports vLLM or Megatron generation, got "
+            f"{generation_cfg['backend']!r}."
+        )
 
     def sync_weights(
         self,
@@ -212,11 +235,10 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
 
     def init_communicator(self) -> None:
         """Build both communicator families and the refit plan, over the whole fleet."""
-        dp_size = self._generation.worker_group.dp_size
         self._build(
-            plan_refit_membership(
-                surviving_shards=list(range(dp_size)),
-                dp_size=dp_size,
+            desired_membership(
+                absent_shards=[],
+                dp_size=self._generation.worker_group.dp_size,
                 total_gen_workers=len(self._generation.worker_group.workers),
                 train_world_size=self._train_cluster.world_size(),
             )
@@ -329,6 +351,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
             gen_parallelism,
             train_world_size,
             inference_world_size,
+            refit_payload_mode=self._generation.get_refit_payload_mode(),
         )
 
         # nccl_reshard_refit_info holds MeshInfo rank tensors created under
@@ -340,6 +363,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
             nccl_reshard_refit_info
         )
         self._generation.prepare_nccl_reshard_refit_info(wire_refit_info)
+        self._built_membership = membership
 
     def _settle_budget_s(self) -> float:
         """How long to let stragglers unwind: their own deadline, plus a little.
@@ -370,34 +394,35 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         communicators without regenerating the plan would corrupt the refit silently,
         which is why the plan is regenerated rather than reused.
         """
-        if not absent_shards:
-            return False
-
-        # Unchanged membership over a live communicator: nothing to do. `force` is how the
-        # recovery path says the communicator is gone rather than merely unchanged -- after
-        # an abort it must be rebuilt even though the absent set is identical, and skipping
-        # it there would fail the recovery with "no shard could be identified as absent".
-        if not force and self._built_with_absent == frozenset(absent_shards):
-            return False
-
-        dp_size = self._generation.worker_group.dp_size
-        surviving = [idx for idx in range(dp_size) if idx not in set(absent_shards)]
-        membership = plan_refit_membership(
-            surviving_shards=surviving,
-            dp_size=dp_size,
+        membership = desired_membership(
+            absent_shards=absent_shards,
+            dp_size=self._generation.worker_group.dp_size,
             total_gen_workers=len(self._generation.worker_group.workers),
             train_world_size=self._train_cluster.world_size(),
         )
+        # An unrecorded membership means the full fleet -- see should_rebuild's docstring,
+        # which owns the rest of this rule for both hardened transports.
+        if self._built_membership is None:
+            self._built_membership = desired_membership(
+                absent_shards=[],
+                dp_size=self._generation.worker_group.dp_size,
+                total_gen_workers=len(self._generation.worker_group.workers),
+                train_world_size=membership.train_world_size,
+            )
+        if not should_rebuild(
+            desired=membership,
+            built=self._built_membership,
+            absent_shards=absent_shards,
+            force=force,
+        ):
+            return False
         print(
-            f"  refit: rebuilding nccl_reshard communicators without shards "
-            f"{sorted(absent_shards)}; gen world "
-            f"{len(surviving) * membership.workers_per_shard}",
+            f"  refit: rebuilding nccl_reshard communicators over shards "
+            f"{membership.surviving_shards}; gen world "
+            f"{membership.world_size - membership.train_world_size}",
             flush=True,
         )
         self._build(membership)
-        # Recorded only after the rebuild has actually happened, so a rebuild that
-        # raises leaves the cache describing the communicator we still have.
-        self._built_with_absent = frozenset(absent_shards)
         return True
 
     def shutdown(self) -> None:

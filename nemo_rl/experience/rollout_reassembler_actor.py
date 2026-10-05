@@ -15,36 +15,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import ray
-import torch
 
 from nemo_rl.data_plane import DataPlaneConfig, build_data_plane_client
+from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
 from nemo_rl.experience.rollout_reassembler import FinalizedGroup, RolloutReassembler
-
-# Field names whose values are per-token and therefore large, but whose Python
-# type is indistinguishable from metadata -- a list[int] of token ids looks just
-# like a short list of ids. assert_metadata_only() below already rejects tensors
-# and unrecognised types; this list is only for heavy values that would otherwise
-# pass it. Add a name here whenever a new per-token field could reach an RPC
-# boundary, and update the dataclass inventory test that guards this file.
-_FORBIDDEN_RPC_KEYS = frozenset(
-    {
-        "input_ids",
-        "token_ids",
-        "token_ids_delta",
-        "token_mask",
-        "token_mask_delta",
-        "generation_logprobs",
-        "generation_logprobs_delta",
-        "generation_log_probs_delta",
-        "logprobs",
-        "logprobs_delta",
-        "routed_experts",
-    }
-)
+from nemo_rl.utils.rpc_guard import assert_metadata_only
+from nemo_rl.utils.venvs import make_actor_runtime_env
 
 
 @dataclass(frozen=True)
@@ -78,35 +58,8 @@ class RolloutReassemblerActorConfig:
     router_replay_enabled: bool
     defer_routed_experts_to_policy: bool
     max_seq_len: int
-
-
-def assert_metadata_only(value: Any, *, path: str = "rpc") -> None:
-    """Reject tensors and known heavy row fields reachable from an RPC graph."""
-    if isinstance(value, torch.Tensor):
-        raise TypeError(
-            f"{path} contains a torch.Tensor with shape {tuple(value.shape)}"
-        )
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return
-    if is_dataclass(value) and not isinstance(value, type):
-        for field_info in fields(value):
-            assert_metadata_only(
-                getattr(value, field_info.name),
-                path=f"{path}.{field_info.name}",
-            )
-        return
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if key in _FORBIDDEN_RPC_KEYS:
-                raise TypeError(f"{path} contains forbidden heavy field {key!r}")
-            assert_metadata_only(key, path=f"{path}.key")
-            assert_metadata_only(item, path=f"{path}[{key!r}]")
-        return
-    if isinstance(value, (list, tuple)):
-        for index, item in enumerate(value):
-            assert_metadata_only(item, path=f"{path}[{index}]")
-        return
-    raise TypeError(f"{path} contains unsupported RPC type {type(value).__name__}")
+    # Whether the staging partition carries media columns (VLM capture).
+    capture_media: bool
 
 
 @ray.remote(
@@ -132,6 +85,23 @@ class RolloutReassemblerActor:  # pragma: no cover
             router_replay_enabled=config.router_replay_enabled,
             defer_routed_experts_to_policy=config.defer_routed_experts_to_policy,
             max_seq_len=config.max_seq_len,
+            capture_media=config.capture_media,
+        )
+
+    def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:
+        """Run an owner-local checkpoint command; return metadata, never payloads."""
+        return run_checkpoint_command(body)
+
+    def check_dependencies(self) -> None:
+        """Import the finalization API before the controller starts rollouts."""
+        # Deferred: only the actor's environment needs the optional Gym extra.
+        from nemo_gym.token_id_capture.staging.rebuild import (  # noqa: F401
+            RebuildError,
+            ReceiptVerificationError,
+            verify_and_linearize,
+        )
+        from nemo_gym.token_id_capture.staging.records import (
+            RolloutReceipt,  # noqa: F401
         )
 
     def finalize(self, request: ReassemblyRequest) -> FinalizedGroup:
@@ -169,9 +139,26 @@ def create_rollout_reassembler_actors(
     *,
     num_workers: int,
 ) -> list[Any]:
-    """Construct the fixed validation pool after TQ partitions are registered."""
+    """Construct and validate the pool after TQ partitions are registered."""
     if num_workers <= 0:
         raise ValueError(f"num_reassembler_workers must be positive, got {num_workers}")
-    return [
-        RolloutReassemblerActor.remote(dp_config, config) for _ in range(num_workers)
+    runtime_env = make_actor_runtime_env(
+        "nemo_rl.experience.rollout_reassembler_actor.RolloutReassemblerActor"
+    )
+    actors = [
+        RolloutReassemblerActor.options(runtime_env=runtime_env).remote(
+            dp_config, config
+        )
+        for _ in range(num_workers)
     ]
+    try:
+        ray.get([actor.check_dependencies.remote() for actor in actors])
+    except ray.exceptions.RayError:
+        # Cleanup errors must not hide the startup failure or skip other actors.
+        for actor in actors:
+            try:
+                ray.kill(actor)
+            except Exception as error:
+                print(f"finalizer actor termination failed: {error}", flush=True)
+        raise
+    return actors

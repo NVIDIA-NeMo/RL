@@ -3,6 +3,15 @@ checkpointing:
   checkpoint_dir: results/grpo-deepseek-v3-64n4g-async-1off
 policy:
   megatron_cfg:
+    # HybridEP settings
+    moe_token_dispatcher_type: flex
+    moe_flex_dispatcher_backend: hybridep
+    moe_hybridep_num_sms: 32
+    env_vars:
+      NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: "16"
+      NUM_OF_TOKENS_PER_CHUNK_COMBINE_API: "128"
+      NVLINK_DOMAIN_SIZE: "72"
+      USE_MNNVL: "1"
     pipeline_model_parallel_size: 8
     num_layers_in_first_pipeline_stage: 7
     num_layers_in_last_pipeline_stage: 6

@@ -14,7 +14,10 @@
 
 from typing import Any, Literal, NotRequired, TypedDict, Union
 
+from pydantic import BaseModel
+
 from nemo_rl.models.generation.interfaces import GenerationConfig
+from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 from nemo_rl.utils.checkpoint import PretrainedCheckpointConfig
 
 
@@ -184,16 +187,24 @@ class MoEParallelizerOptions(TypedDict):
     wrap_outer_model: NotRequired[bool]
 
 
+class AutomodelCheckpointConfig(TypedDict, total=False):
+    """Automodel checkpoint settings used by DTensor v2."""
+
+    model_save_format: Literal["torch_save", "safetensors"] | None
+    save_consolidated: Literal["false", "final", "every"]
+    single_rank_consolidation: bool
+    consolidation_timeout_minutes: int
+
+
 class DTensorConfig(TypedDict):
     enabled: Literal[True]
     env_vars: NotRequired[dict[str, str] | None]
-    _v2: NotRequired[bool]
     # Distributed parallelism sizes
     # data_parallel_size is derived from world_size / (tp * cp * ep)
     tensor_parallel_size: int
     context_parallel_size: int
     expert_parallel_size: NotRequired[int]
-    # Size of the HSDP replicate dimension within the data-parallel axis (DTensor v2 only).
+    # Size of the HSDP replicate dimension within the data-parallel axis.
     dp_replicate_size: NotRequired[int]
     # Distributed config options (mirrors Automodel's FSDP2Config)
     sequence_parallel: bool
@@ -208,6 +219,7 @@ class DTensorConfig(TypedDict):
     automodel_kwargs: NotRequired[AutomodelKwargs]
     # Runtime
     clear_cache_every_n_steps: NotRequired[int | None]
+    checkpoint: NotRequired[AutomodelCheckpointConfig]
 
 
 class SequencePackingConfigDisabled(TypedDict):
@@ -249,6 +261,9 @@ class MegatronPeftConfig(TypedDict):
     lora_B_init_method: str
     a2a_experimental: bool
     lora_dtype: str | None
+    # Share one adapter across grouped MoE experts on each EP rank. Set to
+    # False to create one adapter per local expert.
+    share_expert_adapters: NotRequired[bool]
     # Warm start: path to a native Megatron-Bridge PEFT checkpoint (an
     # iter_XXXXXXX directory, or a checkpoint root resolving to one) whose
     # adapter weights initialize this run's LoRA modules. The donor checkpoint
@@ -328,6 +343,15 @@ class Fp8Config(TypedDict):
     force_clear_fp8_caches: NotRequired[bool]
 
 
+class Fp4Config(BaseModel, extra="forbid"):
+    """Transformer Engine NVFP4 training configuration."""
+
+    enabled: bool
+    fp4: str | None = None
+    fp4_recipe: str = "nvfp4"
+    fp4_param: bool = False
+
+
 # Type exists to be lax if not specified
 class MegatronConfigDisabled(TypedDict):
     enabled: Literal[False]
@@ -376,6 +400,7 @@ class MegatronConfig(TypedDict):
     context_parallel_size: int
     # Nemotron Omni RADIO/provider booleans. Omit any field to retain the model
     # provider's checkpoint/default value.
+    radio_force_eval_mode: NotRequired[bool]
     radio_force_cpe_eval_mode: NotRequired[bool]
     # Nemotron Omni tower freeze booleans. Omit any field to retain the model
     # provider's checkpoint/default value.
@@ -383,6 +408,12 @@ class MegatronConfig(TypedDict):
     freeze_vision_projection: NotRequired[bool]
     freeze_sound_encoder: NotRequired[bool]
     freeze_sound_projection: NotRequired[bool]
+    # Nemotron Omni vision-tower activation recomputation controls. Omit any
+    # field to retain the model provider's checkpoint/default value.
+    recompute_vision: NotRequired[bool]
+    vision_recompute_granularity: NotRequired[str | None]
+    vision_recompute_method: NotRequired[str | None]
+    vision_recompute_num_layers: NotRequired[int | None]
     pipeline_dtype: str
     sequence_parallel: bool
     freeze_moe_router: bool
@@ -500,6 +531,12 @@ class MegatronConfig(TypedDict):
     # Number of tokens per chunk when computing fused linear logprobs.
     # Smaller values reduce peak memory further but may decrease throughput.
     fused_linear_logprobs_chunk_size: NotRequired[int]
+    # Emit fp32 logits from Megatron-LM's LM head. Set the matching
+    # generation.vllm_cfg.fp32_lm_head flag for vLLM generation: applying this
+    # to only one engine makes the generation/training logprob mismatch worse.
+    # No effect when use_fused_linear_logprobs is set, which bypasses the
+    # output layer's logits path.
+    fp32_lm_head: NotRequired[bool]
     # When mtp_num_layers=0, Multi-Token Prediction is disabled.
     mtp_num_layers: NotRequired[int]
     # MTP loss weight added to the main next-token loss (0.0 disables the MTP loss contribution).
@@ -518,6 +555,13 @@ class MegatronConfig(TypedDict):
     clear_memory_caches_before_refit: NotRequired[bool]
     # FP8 quantization settings for the Megatron training backend.
     fp8_cfg: NotRequired[Fp8Config]
+    # TE NVFP4 training settings. Unknown keys are rejected by Fp4Config so
+    # misspelled precision controls cannot silently fall back to defaults.
+    fp4_cfg: NotRequired[Fp4Config]
+    # Keep the first/last N transformer blocks in BF16 under FP8/FP4 training.
+    first_last_layers_bf16: NotRequired[bool]
+    num_layers_at_start_in_bf16: NotRequired[int]
+    num_layers_at_end_in_bf16: NotRequired[int]
     # Path to a per-module Transformer Engine precision recipe loaded into
     # Megatron quant_recipe.
     te_precision_config_file: NotRequired[str]
@@ -525,22 +569,6 @@ class MegatronConfig(TypedDict):
     # Supported keys are model-specific, such as freeze_vision_model,
     # freeze_vision_projection, and freeze_language_model.
     freeze_config: NotRequired[dict[str, Any]]
-
-
-class DraftConfigDisabled(TypedDict):
-    """Configuration shape for the disabled draft-model training path."""
-
-    enabled: Literal[False]
-
-
-class DraftConfig(TypedDict):
-    """Configuration for Eagle draft-model training alongside the policy model."""
-
-    enabled: Literal[True]
-    model_name: NotRequired[str | None]
-    loss_weight: NotRequired[float]
-    num_layers: NotRequired[int | None]
-    aux_layer_indices: NotRequired[list[int] | None]
 
 
 class TokenizerConfig(TypedDict):
@@ -601,6 +629,29 @@ class RouterReplayConfig(TypedDict):
     enabled: Literal[True]
 
 
+class OnPolicyDistillationFullTransport(TypedDict):
+    """Resolved full-vocabulary MOPD settings carried to the policy workers.
+
+    A ``model_dump`` of ``OnPolicyDistillationFullConfig`` plus the resolved
+    ``payload_field`` and ``teacher_index_field``. That BaseModel remains the
+    authoritative schema and the only place defaults are declared, so readers
+    must take these keys as required rather than supplying their own fallbacks.
+    """
+
+    enabled: bool
+    teacher_payload: Literal["hidden_states", "logits"]
+    divergence: Literal["reverse_kl"]
+    payload_dtype: Literal["bfloat16", "float16", "float32"]
+    chunk_size: int | None
+    teacher_lm_head_lifecycle: Literal["none", "offload", "evict"]
+    validate_decomposition: bool
+    payload_field: str
+    # Per-sample teacher-identity column, routing each row's payload to the
+    # right teacher LM-head shard. Only the hidden-state path needs it; the
+    # logits payload ships an already-projected distribution, so it is None.
+    teacher_index_field: str | None
+
+
 class PolicyConfig(TypedDict):
     model_name: str
     tokenizer: TokenizerConfig
@@ -620,8 +671,11 @@ class PolicyConfig(TypedDict):
     reward_model_cfg: NotRequired[RewardModelConfig]
     dtensor_cfg: DTensorConfig | DTensorConfigDisabled
     megatron_cfg: NotRequired[MegatronConfig | MegatronConfigDisabled]
-    draft: NotRequired[DraftConfig | DraftConfigDisabled]
+    draft: NotRequired[Eagle3DraftConfig]
     pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
+    # Resolved once by the driver and carried to the student workers and (via
+    # deepcopy) to the teacher group. Absent means full-vocabulary MOPD is off.
+    on_policy_distillation_full: NotRequired[OnPolicyDistillationFullTransport]
     router_replay: NotRequired[RouterReplayConfig | RouterReplayConfigDisabled]
     hf_config_overrides: NotRequired[dict[str, Any]]
     dynamic_batching: DynamicBatchingConfig | DynamicBatchingConfigDisabled

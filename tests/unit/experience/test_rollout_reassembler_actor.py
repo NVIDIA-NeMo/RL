@@ -15,20 +15,28 @@
 
 from __future__ import annotations
 
+import builtins
+import typing
 from dataclasses import fields, replace
-from unittest.mock import MagicMock
+from typing import Any
+from unittest.mock import MagicMock, call, patch
 
 import pytest
+import ray
 import torch
 
+import nemo_rl.experience.rollout_reassembler_actor as actor_module
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.distributed.actor_environments import ACTOR_ENVIRONMENTS
 from nemo_rl.experience.rollout_reassembler import FinalizedGroup
 from nemo_rl.experience.rollout_reassembler_actor import (
-    _FORBIDDEN_RPC_KEYS,
     ReassemblyRequest,
     RolloutReassemblerActor,
+    RolloutReassemblerActorConfig,
     assert_metadata_only,
+    create_rollout_reassembler_actors,
 )
+from nemo_rl.utils.rpc_guard import FORBIDDEN_RPC_KEYS
 
 
 def _request() -> ReassemblyRequest:
@@ -103,6 +111,47 @@ def test_finalize_forwards_loss_multiplier_to_reassembler() -> None:
     )
 
 
+def test_finalizer_forwards_mooncake_checkpoint_commands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actor_cls = RolloutReassemblerActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_cls)
+    command = {"operation": "INFO"}
+    response = {"participant_id": "finalizer"}
+    dispatch = MagicMock(return_value=response)
+    monkeypatch.setattr(actor_module, "run_checkpoint_command", dispatch)
+
+    assert actor.mooncake_checkpoint(command) is response
+    dispatch.assert_called_once_with(command)
+
+
+@pytest.mark.parametrize("capture_media", [False, True])
+def test_actor_forwards_capture_media_to_the_reassembler(
+    capture_media: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The media capability is an explicit constructor value end to end:
+    setup -> actor config -> RolloutReassembler -> its TQ source/sink."""
+    actor_cls = RolloutReassemblerActor.__ray_metadata__.modified_class
+    monkeypatch.setattr(
+        actor_module, "build_data_plane_client", lambda cfg, bootstrap: MagicMock()
+    )
+    config = RolloutReassemblerActorConfig(
+        partition_id="canonical",
+        staging_partition="staging",
+        pad_token_id=0,
+        router_replay_enabled=False,
+        defer_routed_experts_to_policy=False,
+        max_seq_len=4096,
+        capture_media=capture_media,
+    )
+    actor = object.__new__(actor_cls)
+    actor.__init__({"enabled": True, "impl": "transfer_queue"}, config)
+    finalizer = actor._finalizer
+    assert finalizer._capture_media is capture_media
+    assert finalizer._source._capture_media is capture_media
+    assert finalizer._staging._capture_media is capture_media
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -120,9 +169,9 @@ def test_rpc_dataclass_fields_are_classified() -> None:
     """A new field on either RPC dataclass must be a deliberate choice.
 
     assert_metadata_only cannot tell a heavy list[int] of token ids from a short
-    list of metadata, so _FORBIDDEN_RPC_KEYS is maintained by hand. Pinning the
-    inventory makes a new field fail here until someone decides whether it is
-    light enough to cross the wire.
+    list of metadata, so FORBIDDEN_RPC_KEYS only covers names it knows. Pinning
+    the inventory makes a new field fail here until someone decides whether it
+    is light enough to cross the wire.
     """
     assert {f.name for f in fields(ReassemblyRequest)} == {
         "group_id",
@@ -140,6 +189,7 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "group_min_wv",
         "group_max_wv",
         "staging_keys",
+        "canonical_output_tokens",
         "metrics",
         "dropped",
         "drop_reason",
@@ -148,8 +198,113 @@ def test_rpc_dataclass_fields_are_classified() -> None:
     }
 
 
-@pytest.mark.parametrize("key", sorted(_FORBIDDEN_RPC_KEYS))
+@pytest.mark.parametrize("key", sorted(FORBIDDEN_RPC_KEYS))
 def test_every_forbidden_key_is_rejected(key) -> None:
     """Removing an entry from the denylist should fail loudly."""
     with pytest.raises(TypeError, match="forbidden heavy field"):
         assert_metadata_only({key: [1, 2, 3]})
+
+
+@pytest.mark.nemo_gym
+def test_forbidden_keys_cover_gym_staging_fields() -> None:
+    """Gym owns these names, so the guard has to track them from outside.
+
+    ``generation_log_probs_delta`` is Gym's spelling and is the one staging
+    name the guard still has to write out by hand, because the driver does not
+    install ``nemo_gym``. Imported in the body rather than at module scope so
+    the default lane can collect this file without the extra; the
+    ``--nemo-gym-only`` conftest raises when Gym is missing, so here it fails
+    rather than skipping.
+    """
+    from nemo_gym.token_id_capture.staging.records import StagedCallBaseSnapshot
+
+    per_token = {
+        name
+        for name, info in StagedCallBaseSnapshot.model_fields.items()
+        if typing.get_origin(info.annotation) is list
+    }
+    assert per_token and per_token <= FORBIDDEN_RPC_KEYS
+
+
+@pytest.mark.parametrize(
+    ("startup_fails", "cleanup_fails"),
+    [(False, False), (True, False), (True, True)],
+    ids=["ready", "startup-failure", "cleanup-failure"],
+)
+def test_factory_selects_gym_environment_and_waits_for_dependencies(
+    startup_fails: bool,
+    cleanup_fails: bool,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor_fqn = "nemo_rl.experience.rollout_reassembler_actor.RolloutReassemblerActor"
+    assert ACTOR_ENVIRONMENTS[actor_fqn] == ["nemo_gym"]
+    config = RolloutReassemblerActorConfig(
+        partition_id="canonical",
+        staging_partition="staging",
+        pad_token_id=0,
+        router_replay_enabled=False,
+        defer_routed_experts_to_policy=False,
+        max_seq_len=4096,
+        capture_media=False,
+    )
+    dp_config = {"enabled": True, "impl": "transfer_queue", "backend": "simple"}
+    actors = [MagicMock(), MagicMock()]
+    runtime_env = {"py_executable": "/gym-venv/bin/python"}
+    with (
+        patch.object(
+            actor_module, "make_actor_runtime_env", return_value=runtime_env
+        ) as make_env,
+        patch.object(RolloutReassemblerActor, "options") as options,
+        patch.object(ray, "get") as get,
+        patch.object(ray, "kill") as kill,
+    ):
+        options.return_value.remote.side_effect = actors
+        if startup_fails:
+            startup_error = ray.exceptions.RayError("missing nemo_gym")
+            get.side_effect = startup_error
+            if cleanup_fails:
+                kill.side_effect = [RuntimeError("kill failed"), None]
+            with pytest.raises(ray.exceptions.RayError) as exc_info:
+                create_rollout_reassembler_actors(dp_config, config, num_workers=2)
+            assert exc_info.value is startup_error
+            assert kill.call_args_list == [call(actor) for actor in actors]
+            if cleanup_fails:
+                assert (
+                    "finalizer actor termination failed: kill failed"
+                    in capsys.readouterr().out
+                )
+        else:
+            assert (
+                create_rollout_reassembler_actors(dp_config, config, num_workers=2)
+                == actors
+            )
+            kill.assert_not_called()
+
+        make_env.assert_called_once_with(actor_fqn)
+        assert options.call_args_list == [call(runtime_env=runtime_env)] * 2
+        assert (
+            options.return_value.remote.call_args_list == [call(dp_config, config)] * 2
+        )
+        for actor in actors:
+            actor.check_dependencies.remote.assert_called_once_with()
+        get.assert_called_once_with(
+            [actor.check_dependencies.remote.return_value for actor in actors]
+        )
+
+
+def test_dependency_check_propagates_import_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_import = builtins.__import__
+    import_error = ModuleNotFoundError("No module named 'nemo_gym'", name="nemo_gym")
+
+    def fail_rebuild_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "nemo_gym.token_id_capture.staging.rebuild":
+            raise import_error
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fail_rebuild_import)
+    actor = object.__new__(RolloutReassemblerActor.__ray_metadata__.modified_class)
+    with pytest.raises(ModuleNotFoundError) as exc_info:
+        actor.check_dependencies()
+    assert exc_info.value is import_error

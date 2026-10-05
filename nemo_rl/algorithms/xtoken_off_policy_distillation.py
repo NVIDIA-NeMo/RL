@@ -63,7 +63,11 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
-from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
+from nemo_rl.models.policy.utils import reject_legacy_dtensor_key
+from nemo_rl.utils.checkpoint import (
+    CheckpointingConfig,
+    CheckpointManager,
+)
 from nemo_rl.utils.logger import Logger, LoggerConfig
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
@@ -244,18 +248,19 @@ def setup(
         f"tokenizers for {len(teachers)} teachers."
     )
 
-    # Backend gate: DTensor V2 only, for the student and every teacher. Unlike
+    # Backend gate: DTensor only, for the student and every teacher. Unlike
     # the TP=CP=1 multi-teacher prototype, this path supports TP/CP/diff-DP
     # sharding (the loss is parallelism-invariant), so there is deliberately NO
     # tensor/context_parallel_size==1 assert.
-    assert policy_config["dtensor_cfg"]["enabled"] and policy_config["dtensor_cfg"].get(
-        "_v2"
-    ), "xtoken distillation requires policy.dtensor_cfg.enabled=true and _v2=true."
+    assert policy_config["dtensor_cfg"]["enabled"], (
+        "xtoken distillation requires policy.dtensor_cfg.enabled=true."
+    )
+    reject_legacy_dtensor_key(policy_config["dtensor_cfg"], "policy.dtensor_cfg")
     for i, tc in enumerate(teacher_configs):
-        assert tc["dtensor_cfg"]["enabled"] and tc["dtensor_cfg"].get("_v2"), (
-            f"xtoken distillation requires teachers[{i}].dtensor_cfg.enabled=true "
-            "and _v2=true."
+        assert tc["dtensor_cfg"]["enabled"], (
+            f"xtoken distillation requires teachers.{i}.dtensor_cfg.enabled=true."
         )
+        reject_legacy_dtensor_key(tc["dtensor_cfg"], f"teachers.{i}.dtensor_cfg")
 
     # A null projection path marks a same-vocab teacher (direct KL, no
     # projection/alignment); that only makes sense when it shares the student's
@@ -371,10 +376,10 @@ def setup(
     print("\n▶ Setting up compute cluster...", flush=True)
     cluster = RayVirtualCluster(
         name="xtoken_off_policy_distillation_cluster",
-        bundle_ct_per_node_list=[cluster_config["gpus_per_node"]]
-        * cluster_config["num_nodes"],
+        bundle_ct_per_node_list=[cluster_config.gpus_per_node]
+        * cluster_config.num_nodes,
         use_gpus=True,
-        num_gpus_per_node=cluster_config["gpus_per_node"],
+        num_gpus_per_node=cluster_config.gpus_per_node,
         # N teacher worker groups + 1 student, colocated and run serially.
         max_colocated_worker_groups=len(teachers) + 1,
     )
@@ -444,8 +449,8 @@ def setup(
         # share DP and a node-aligned model-parallel group, else a student rank
         # would read teacher shards from another node.
         assert_xtoken_ipc_node_local(
-            num_nodes=cluster_config["num_nodes"],
-            gpus_per_node=cluster_config["gpus_per_node"],
+            num_nodes=cluster_config.num_nodes,
+            gpus_per_node=cluster_config.gpus_per_node,
             student_tp=student_tp,
             student_cp=student_cp,
             teacher_tp=tc["dtensor_cfg"]["tensor_parallel_size"],
@@ -779,7 +784,7 @@ def xtoken_off_policy_distillation_train(
                             tokenizer_path=os.path.join(
                                 ckpt_path, "policy", "tokenizer"
                             ),
-                            checkpointing_cfg=master_config.checkpointing,
+                            is_final_checkpoint=is_last_step,
                         )
                         torch.save(
                             dataloader.state_dict(),

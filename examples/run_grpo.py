@@ -21,8 +21,8 @@ from omegaconf import OmegaConf
 
 from nemo_rl.algorithms.grpo import (
     MasterConfig,
+    grpo_train,
     setup,
-    shutdown_environments,
 )
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.utils import setup_response_data
@@ -32,7 +32,10 @@ from nemo_rl.data_plane.factory import (
     select_sync_trainer,
 )
 from nemo_rl.distributed.virtual_cluster import init_ray
+from nemo_rl.environments.utils import shutdown_environments
 from nemo_rl.models.generation import configure_generation_config
+from nemo_rl.models.policy.draft_config import draft_refit_enabled
+from nemo_rl.telemetry.instrumentation import setup_span, startup_span
 from nemo_rl.telemetry.setup import init_telemetry_driver, shutdown_telemetry
 from nemo_rl.utils.config import (
     load_config,
@@ -89,8 +92,8 @@ def main() -> None:
     pprint.pprint(config)
 
     # Get the next experiment directory with incremented ID
-    config.logger["log_dir"] = get_next_experiment_dir(config.logger["log_dir"])
-    print(f"📊 Using log directory: {config.logger['log_dir']}")
+    config.logger.log_dir = get_next_experiment_dir(config.logger.log_dir)
+    print(f"📊 Using log directory: {config.logger.log_dir}")
     if config.checkpointing["enabled"]:
         print(
             f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
@@ -98,61 +101,71 @@ def main() -> None:
 
     # Initialise telemetry on the driver BEFORE init_ray() so the resolved
     # NEMO_RL_OTEL_* env is snapshotted into the Ray runtime_env and inherited
-    # by every worker. No-op unless nemo-lens is installed and telemetry is on.
+    # by every worker. No-op unless telemetry is on.
     init_telemetry_driver(config, algorithm="grpo")
 
     try:
-        with rl_init_timer.time("ray_connect"):
-            # Must precede init_ray() — see maybe_configure_data_plane_env's docstring.
-            maybe_configure_data_plane_env(config.data_plane)
-            init_ray()
+        # One root span, so init_ray() and setup() phases land in the same
+        # trace. Timer labels match the span names so the printed breakdown
+        # and the waterfall name a phase the same way.
+        with startup_span():
+            with rl_init_timer.time("ray_init"):
+                # Must precede init_ray() — see maybe_configure_data_plane_env's docstring.
+                maybe_configure_data_plane_env(config.data_plane)
+                # Opens rl.setup.ray_init itself, so no span here.
+                init_ray()
 
-        # setup tokenizer
-        with rl_init_timer.time("tokenizer"):
-            tokenizer = get_tokenizer(config.policy["tokenizer"])
-            assert config.policy["generation"] is not None, (
-                "A generation config is required for GRPO"
-            )
-            has_refit_draft_weights = bool(config.policy["draft"]["enabled"])
-            megatron_cfg = config.policy.get("megatron_cfg") or {}
-            trains_mtp = bool(megatron_cfg.get("mtp_num_layers"))
-            config.policy["generation"] = configure_generation_config(
-                config.policy["generation"],
-                tokenizer,
-                has_refit_draft_weights=has_refit_draft_weights,
-                trains_mtp=trains_mtp,
-            )
+            # setup tokenizer
+            with rl_init_timer.time("tokenizer"), setup_span("tokenizer"):
+                tokenizer = get_tokenizer(config.policy["tokenizer"])
+                assert config.policy["generation"] is not None, (
+                    "A generation config is required for GRPO"
+                )
+                has_refit_draft_weights = draft_refit_enabled(
+                    config.policy.get("draft")
+                )
+                megatron_cfg = config.policy.get("megatron_cfg") or {}
+                trains_mtp = bool(megatron_cfg.get("mtp_num_layers"))
+                config.policy["generation"] = configure_generation_config(
+                    config.policy["generation"],
+                    tokenizer,
+                    has_refit_draft_weights=has_refit_draft_weights,
+                    trains_mtp=trains_mtp,
+                )
 
-        # setup data
-        with rl_init_timer.time("data"):
-            dataset, val_dataset, task_to_env, val_task_to_env = setup_response_data(
-                tokenizer, config.data, config.env
-            )
+            # setup data
+            with rl_init_timer.time("data"), setup_span("data"):
+                dataset, val_dataset, task_to_env, val_task_to_env = (
+                    setup_response_data(tokenizer, config.data, config.env)
+                )
 
-        with rl_init_timer.time("setup"):
-            (
-                policy,
-                policy_generation,
-                _nemo_gym,
-                cluster,
-                dataloader,
-                val_dataloader,
-                loss_fn,
-                logger,
-                checkpointer,
-                grpo_state,
-                master_config,
-                teacher_worker_groups,
-                alias_to_group_alias,
-            ) = setup(
-                config,
-                tokenizer,
-                dataset,
-                val_dataset,
-                policy_factory=make_policy_factory(config.data_plane),
-            )
+            # No child spans here: parallel init runs in threads, which do not
+            # carry the OTel context. The breakdown comes from the
+            # rl.setup.duration metric instead.
+            with rl_init_timer.time("workers"), setup_span("workers"):
+                (
+                    policy,
+                    policy_generation,
+                    _nemo_gym,
+                    cluster,
+                    dataloader,
+                    val_dataloader,
+                    loss_fn,
+                    logger,
+                    checkpointer,
+                    grpo_state,
+                    master_config,
+                    teacher_worker_groups,
+                    alias_to_group_alias,
+                ) = setup(
+                    config,
+                    tokenizer,
+                    dataset,
+                    val_dataset,
+                    policy_factory=make_policy_factory(config.data_plane),
+                )
 
-        rl_init_timer.record("total", time.perf_counter() - main_start)
+            rl_init_timer.record("total", time.perf_counter() - main_start)
 
         rl_init_metrics = rl_init_timer.get_timing_metrics(reduction_op="sum")
         print("\n" + "=" * 60)
@@ -162,6 +175,7 @@ def main() -> None:
                 print(f"  {label}: {value:.1f}s")
         print("=" * 60 + "\n", flush=True)
 
+        trainer_owns_environment_shutdown = False
         try:
             # Check if async mode is enabled
             if config.grpo.async_grpo.enabled:
@@ -211,6 +225,7 @@ def main() -> None:
                 # Two parallel synchronous trainers (verl-style — main_ppo.py vs
                 # main_ppo_sync.py). data_plane.enabled selects which one runs.
                 trainer = select_sync_trainer(master_config)
+                trainer_owns_environment_shutdown = trainer is grpo_train
                 # grpo_train_sync defers checkpoint finalization to the checkpointer's
                 # background threads; the context manager guarantees they are flushed on
                 # exit. (grpo_train also flushes internally; shutdown() is idempotent.)
@@ -230,7 +245,8 @@ def main() -> None:
                         master_config,
                     )
         finally:
-            shutdown_environments(task_to_env, val_task_to_env)
+            if not trainer_owns_environment_shutdown:
+                shutdown_environments(task_to_env, val_task_to_env)
             try:
                 policy_generation.shutdown()
             except Exception as error:

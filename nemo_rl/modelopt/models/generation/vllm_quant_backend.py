@@ -20,8 +20,12 @@ import vllm  # noqa: F401
 import zmq
 from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
 
+from nemo_rl.modelopt.models.generation.vllm_quant_moe_amax import (
+    route_moe_input_quantizer_amax,
+)
 from nemo_rl.modelopt.utils import MODELOPT_REAL_QUANT_REFIT_TIMEOUT_MS
 from nemo_rl.models.generation.vllm.checkpoint_engine import VllmCheckpointEngineMixin
+from nemo_rl.models.generation.vllm.patches import modelopt_moe_amax_aliases
 from nemo_rl.models.generation.vllm.vllm_backend import (
     VllmInternalWorkerExtension,
     WeightUpdateTransport,
@@ -57,6 +61,11 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
         if self._is_real_quant_model():
             return transport in ("ipc", "collective")
         return super()._uses_native_layerwise_refit(transport)
+
+    def _get_native_layerwise_reload_targets(self) -> list[torch.nn.Module]:
+        if self._is_real_quant_model():
+            return [self.model_runner.model]
+        return super()._get_native_layerwise_reload_targets()
 
     def _weight_update_errors_are_fatal(self) -> bool:
         return self._is_real_quant_model()
@@ -111,7 +120,8 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                 buf.weight_loader = input_amax_loader
                 attached.append(buf)
         try:
-            yield
+            with modelopt_moe_amax_aliases(model):
+                yield
         finally:
             for buf in attached:
                 del buf.weight_loader
@@ -121,6 +131,12 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
             with torch.device(self.device):
                 self._load_full_hf_weights(list(weights))
             return
+
+        weights = route_moe_input_quantizer_amax(
+            self.model_runner.model,
+            weights,
+            mapper=getattr(self.model_runner.model, "hf_to_vllm_mapper", None),
+        )
 
         remapped_weights = []
         for name, weight in weights:

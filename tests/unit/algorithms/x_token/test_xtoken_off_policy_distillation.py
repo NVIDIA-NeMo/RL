@@ -54,6 +54,8 @@ from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     xtoken_off_policy_distillation_train,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.utils.logger import LoggerConfig
 
 
 def has_gloo() -> bool:
@@ -157,7 +159,6 @@ def _make_master_config(
             "policy": {
                 "dtensor_cfg": {
                     "enabled": True,
-                    "_v2": True,
                     "tensor_parallel_size": 1,
                     "context_parallel_size": 1,
                 },
@@ -174,7 +175,6 @@ def _make_master_config(
                         "weight": 1.0,
                         "dtensor_cfg": {
                             "enabled": True,
-                            "_v2": True,
                             "tensor_parallel_size": 1,
                             "context_parallel_size": 1,
                         },
@@ -206,8 +206,8 @@ def _make_master_config(
                 "shuffle": False,
                 "num_workers": 0,
             },
-            "logger": {"log_dir": "/tmp/logger"},
-            "cluster": {"num_nodes": 1, "gpus_per_node": 1},
+            "logger": LoggerConfig(log_dir="/tmp/logger"),
+            "cluster": ClusterConfig(num_nodes=1, gpus_per_node=1),
             "checkpointing": {
                 "enabled": save_enabled,
                 "checkpoint_must_save_by": None,
@@ -327,12 +327,15 @@ def test_empty_teachers_list_rejected_at_config_load():
     )
 
 
-def test_setup_requires_dtensor_v2_student():
+def test_setup_rejects_legacy_v2_key_on_student():
     cfg = _make_master_config()
     cfg.policy["dtensor_cfg"]["_v2"] = False
     with (
         patch.object(xt_mod, "RayVirtualCluster") as mock_cluster,
-        pytest.raises(AssertionError),
+        pytest.raises(
+            ValueError,
+            match=r"DTensor v1 \(policy\.dtensor_cfg\._v2=false\)",
+        ),
     ):
         setup(
             cfg,
@@ -344,12 +347,15 @@ def test_setup_requires_dtensor_v2_student():
     assert mock_cluster.call_count == 0
 
 
-def test_setup_requires_dtensor_v2_teacher():
+def test_setup_rejects_legacy_v2_key_on_teacher():
     cfg = _make_master_config()
     cfg.teachers[0].dtensor_cfg["_v2"] = False
     with (
         patch.object(xt_mod, "RayVirtualCluster") as mock_cluster,
-        pytest.raises(AssertionError),
+        pytest.raises(
+            ValueError,
+            match=r"DTensor v1 \(teachers\.0\.dtensor_cfg\._v2=false\)",
+        ),
     ):
         setup(
             cfg,
@@ -502,10 +508,18 @@ def test_exit_on_max_epochs(mock_xtoken_components):
     assert mock_xtoken_components.student_policy.train.call_count == 4
 
 
-def test_exit_on_timeout(mock_xtoken_components, capsys):
+def test_exit_on_timeout(mock_xtoken_components, capsys, tmp_path):
     mock_xtoken_components.master_config.distillation["max_num_steps"] = 100
+    mock_xtoken_components.master_config.checkpointing["enabled"] = True
+    mock_xtoken_components.master_config.checkpointing["metric_name"] = None
+    mock_xtoken_components.checkpointer.init_tmp_checkpoint.return_value = str(
+        tmp_path / "tmp_step"
+    )
 
-    with patch.object(xt_mod, "TimeoutChecker") as mock_timeout_class:
+    with (
+        patch("nemo_rl.algorithms.xtoken_off_policy_distillation.torch.save"),
+        patch.object(xt_mod, "TimeoutChecker") as mock_timeout_class,
+    ):
         mock_timeout_instance = MagicMock()
         # False for 4 steps, then True (timeout).
         mock_timeout_instance.check_save.side_effect = [False] * 4 + [True]
@@ -515,6 +529,12 @@ def test_exit_on_timeout(mock_xtoken_components, capsys):
 
     # Loop should have run exactly 5 steps before tripping the timeout return.
     assert mock_xtoken_components.student_policy.train.call_count == 5
+    assert (
+        mock_xtoken_components.student_policy.save_checkpoint.call_args.kwargs[
+            "is_final_checkpoint"
+        ]
+        is False
+    )
 
     captured = capsys.readouterr()
     assert "Timeout reached, stopping training early." in captured.out
@@ -738,7 +758,6 @@ def test_setup_builds_one_policy_per_teacher():
                 "weight": 0.5,
                 "dtensor_cfg": {
                     "enabled": True,
-                    "_v2": True,
                     "tensor_parallel_size": 1,
                     "context_parallel_size": 1,
                 },
