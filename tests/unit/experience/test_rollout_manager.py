@@ -1471,7 +1471,7 @@ def test_nemo_gym_reward_penalties_match_legacy_rewards_counts_and_metrics(
     result = _reward_penalty_result(output, assistant_overrides, assistant_tokens)
     result["reward_original"] = 1.0
 
-    completions, penalty_counts = impl._results_to_completions([result])
+    completions, penalty_counts, _ = impl._results_to_completions([result])
 
     assert completions[0].reward == 0.0
     # Dynamic sampling still sees the reward the penalty overwrote.

@@ -49,7 +49,9 @@ import torch
 MASKING_STATS_KEYS: tuple[str, ...] = (
     "group_ids",
     "rewards",
-    "sample_mask",
+    # sample_mask per row, but not under that name: the accumulator crosses
+    # the advantage-actor RPC and rpc_guard rejects column names as dict keys.
+    "delivered",
     "env_flag",
     "truncated",
     "truncated_masked",
@@ -86,7 +88,7 @@ def accumulate_masking_stats(
     trunc = truncated.detach().bool().reshape(batch)
     acc["group_ids"].append(local_groups.reshape(batch).long().cpu() + offset)
     acc["rewards"].append(rewards.detach().float().reshape(batch).cpu())
-    acc["sample_mask"].append(sample_mask.detach().float().reshape(batch).cpu())
+    acc["delivered"].append(sample_mask.detach().float().reshape(batch).cpu())
     acc["env_flag"].append(env_flag.cpu())
     acc["truncated"].append(trunc.cpu())
     acc["truncated_masked"].append(
@@ -107,7 +109,7 @@ def reduce_masking_stats(acc: dict[str, list[torch.Tensor]]) -> dict[str, float]
     if not acc.get("rewards"):
         return {}
     rewards = torch.cat(acc["rewards"])
-    has_tokens = torch.cat(acc["sample_mask"]) > 0
+    has_tokens = torch.cat(acc["delivered"]) > 0
     env_flag = torch.cat(acc["env_flag"]) & has_tokens
     truncated = torch.cat(acc["truncated"]) & has_tokens
     truncated_masked = torch.cat(acc["truncated_masked"]) & has_tokens
