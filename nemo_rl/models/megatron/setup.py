@@ -187,6 +187,11 @@ def _force_sync_optimizer_fp32_from_model(optimizer, model):
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
     def _sync_distrib_opt(distrib_opt):
+        if hasattr(distrib_opt, "chained_optimizers"):
+            applied = False
+            for child in distrib_opt.chained_optimizers:
+                applied |= _sync_distrib_opt(child)
+            return applied
         try:
             from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import (
                 HybridDeviceOptimizer,
@@ -225,12 +230,7 @@ def _force_sync_optimizer_fp32_from_model(optimizer, model):
             hdo.update_fp32_param_by_new_param()
         return True
 
-    applied = False
-    if hasattr(optimizer, "chained_optimizers"):
-        for sub_opt in optimizer.chained_optimizers:
-            applied |= _sync_distrib_opt(sub_opt)
-    else:
-        applied = _sync_distrib_opt(optimizer)
+    applied = _sync_distrib_opt(optimizer)
 
     if applied and rank == 0:
         print(
@@ -257,6 +257,11 @@ def _force_sync_model_from_optimizer_fp32(optimizer):
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
     def _sync_distrib_opt(distrib_opt):
+        if hasattr(distrib_opt, "chained_optimizers"):
+            applied = False
+            for child in distrib_opt.chained_optimizers:
+                applied |= _sync_distrib_opt(child)
+            return applied
         try:
             from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import (
                 HybridDeviceOptimizer,
@@ -284,18 +289,41 @@ def _force_sync_model_from_optimizer_fp32(optimizer):
             model_chunk.start_param_sync(force_sync=True)
         return True
 
-    applied = False
-    if hasattr(optimizer, "chained_optimizers"):
-        for sub_opt in optimizer.chained_optimizers:
-            applied |= _sync_distrib_opt(sub_opt)
-    else:
-        applied = _sync_distrib_opt(optimizer)
+    applied = _sync_distrib_opt(optimizer)
 
     if applied and rank == 0:
         print(
             "WORKAROUND: force-synced BF16 model params from loaded optimizer "
             "FP32 masters (HybridDeviceOptimizer)"
         )
+
+    return applied
+
+
+def _sync_model_params_from_loaded_optimizer(optimizer) -> bool:
+    """Refresh quantized compute weights from restored FP32 optimizer masters.
+
+    Prefer a wrapper's synchronization API so it coordinates parameter staging
+    and gathering across its children. Descend only when a wrapper lacks it.
+    """
+    pending = [optimizer]
+    visited = set()
+    applied = False
+    while pending:
+        candidate = pending.pop()
+        if id(candidate) in visited:
+            continue
+        visited.add(id(candidate))
+        sync = getattr(
+            candidate, "quantize_and_sync_model_params_from_main_params", None
+        )
+        if callable(sync):
+            sync()
+            applied = True
+        else:
+            for collection in ("chained_optimizers", "_active_optimizers"):
+                pending.extend(getattr(candidate, collection, ()))
+    return applied
 
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
@@ -2590,8 +2618,9 @@ def setup_model_and_optimizer(
         if optimizer is not None:
             if megatron_cfg.checkpoint.finetune:
                 _force_sync_optimizer_fp32_from_model(optimizer, model)
-            elif resume_checkpoint_exists:
-                _force_sync_model_from_optimizer_fp32(optimizer)
+            elif resume_checkpoint_exists and megatron_cfg.checkpoint.load_optim:
+                if not _force_sync_model_from_optimizer_fp32(optimizer):
+                    _sync_model_params_from_loaded_optimizer(optimizer)
     torch.distributed.barrier()
 
     draft_model = get_attached_draft_model(model)

@@ -616,3 +616,16 @@ def test_max_steps_is_bounded_by_virtual_epochs() -> None:
     )
 
     assert _max_train_steps(config) == 21
+
+
+@pytest.mark.parametrize(
+    "pretrained", [None, {"format": "megatron_bridge", "path": "/checkpoint"}]
+)
+def test_setup_propagates_pretrained_checkpoint_before_validation(pretrained):
+    from nemo_rl.algorithms.sft_v2 import setup_sft_v2
+
+    config = _valid_setup_config(data_overrides={"backend": "invalid"})
+    config.checkpointing["pretrained_checkpoint"] = pretrained
+    with pytest.raises(ValueError, match="data.backend=energon"):
+        setup_sft_v2(config, MagicMock())
+    assert config.policy.get("pretrained_checkpoint") == pretrained

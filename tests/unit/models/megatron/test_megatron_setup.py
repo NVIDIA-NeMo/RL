@@ -4838,7 +4838,11 @@ class TestForceSyncOptimizerFp32FromModel:
         a = self._make_distrib_opt(_HybridDeviceOptimizer)
         b = self._make_distrib_opt(_HybridDeviceOptimizer)
 
-        chained = SimpleNamespace(chained_optimizers=[a.distrib_opt, b.distrib_opt])
+        chained = SimpleNamespace(
+            chained_optimizers=[
+                SimpleNamespace(chained_optimizers=[a.distrib_opt, b.distrib_opt])
+            ]
+        )
 
         setup_mod._force_sync_optimizer_fp32_from_model(chained, model=MagicMock())
 
@@ -4999,7 +5003,11 @@ class TestForceSyncModelFromOptimizerFp32:
         b = self._make_distrib_opt(
             _HybridDeviceOptimizer, model_values=(0.0, 0.0), master_values=(5.0, 6.0)
         )
-        chained = SimpleNamespace(chained_optimizers=[a.distrib_opt, b.distrib_opt])
+        chained = SimpleNamespace(
+            chained_optimizers=[
+                SimpleNamespace(chained_optimizers=[a.distrib_opt, b.distrib_opt])
+            ]
+        )
 
         setup_mod._force_sync_model_from_optimizer_fp32(chained)
 
@@ -5742,3 +5750,42 @@ class TestPeftWarmStart:
         # The hook receives the resolved donor iteration directory.
         assert mock_hook.call_args.args[2] == str(donor_iter_dir)
         assert mock_hook.call_args.args[0].peft.share_expert_adapters is False
+
+
+@pytest.mark.mcore
+class TestOptimizerResumeSynchronization:
+    def test_prefers_outer_optimizer_sync(self):
+        from nemo_rl.models.megatron import setup as setup_mod
+
+        child = SimpleNamespace(
+            quantize_and_sync_model_params_from_main_params=MagicMock()
+        )
+        outer = SimpleNamespace(
+            quantize_and_sync_model_params_from_main_params=MagicMock(),
+            chained_optimizers=[child],
+        )
+        assert setup_mod._sync_model_params_from_loaded_optimizer(outer)
+        outer.quantize_and_sync_model_params_from_main_params.assert_called_once_with()
+        child.quantize_and_sync_model_params_from_main_params.assert_not_called()
+
+    def test_descends_nested_wrappers_without_sync_api(self):
+        from nemo_rl.models.megatron import setup as setup_mod
+
+        leaf = SimpleNamespace(
+            quantize_and_sync_model_params_from_main_params=MagicMock()
+        )
+        nested = SimpleNamespace(_active_optimizers=[leaf])
+        outer = SimpleNamespace(chained_optimizers=[nested, leaf])
+        assert setup_mod._sync_model_params_from_loaded_optimizer(outer)
+        leaf.quantize_and_sync_model_params_from_main_params.assert_called_once_with()
+
+    def test_does_not_descend_into_raw_torch_optimizer(self):
+        from nemo_rl.models.megatron import setup as setup_mod
+
+        raw = SimpleNamespace(
+            quantize_and_sync_model_params_from_main_params=MagicMock()
+        )
+        assert not setup_mod._sync_model_params_from_loaded_optimizer(
+            SimpleNamespace(optimizer=raw)
+        )
+        raw.quantize_and_sync_model_params_from_main_params.assert_not_called()

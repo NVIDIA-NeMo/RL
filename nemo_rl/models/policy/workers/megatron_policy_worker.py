@@ -4683,6 +4683,8 @@ class MegatronPolicyWorkerImpl(
             torch.cuda.synchronize()
 
             self.mcore_state.cfg.checkpoint.save = weights_path
+            # Free allocator cache before checkpoint staging allocates buffers.
+            torch.cuda.empty_cache()
 
             optimizer_to_save = None
             scheduler_to_save = None
