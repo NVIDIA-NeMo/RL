@@ -1670,6 +1670,9 @@ class _EmptyBuffer:
 
 
 class _NoOpTrainer:
+    def abort_train_step(self) -> None:
+        pass
+
     def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
         del keep_train_buffers
 
@@ -2450,9 +2453,17 @@ class _NoOpValue:
     def prepare_for_training(self) -> None:
         self._record("prepare_for_training")
 
-    def train_from_meta(self, meta: KVBatchMeta, loss_fn) -> dict:
-        del meta, loss_fn
-        self._record("train_from_meta")
+    def begin_train_step(self, loss_fn) -> None:
+        self._record("begin_train_step")
+
+    def train_microbatches_from_meta(self, meta: KVBatchMeta) -> None:
+        self._record("train_microbatches_from_meta")
+
+    def abort_train_step(self) -> None:
+        self._record("abort_train_step")
+
+    def finish_train_step(self) -> dict:
+        self._record("finish_train_step")
         return {
             "loss": torch.tensor([0.25]),
             "grad_norm": torch.tensor([1.5]),
@@ -2535,7 +2546,10 @@ def test_train_pump_parks_the_policy_on_cpu_across_the_critic_stages(
         "critic.get_values_from_meta",
         "critic.finish_inference",
         "critic.prepare_for_training",
-        "critic.train_from_meta",
+        "critic.begin_train_step",
+        "critic.train_microbatches_from_meta",
+        "critic.finish_train_step",
+        "critic.abort_train_step",
         "critic.finish_training",
         "policy.prepare_for_training",
     ]
@@ -2608,7 +2622,7 @@ def test_train_pump_skips_the_critic_on_an_empty_chunk(monkeypatch) -> None:
     with pytest.raises(RuntimeError, match="no valid response tokens after filtering"):
         asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
-    assert "train_from_meta" not in value.calls
+    assert "begin_train_step" not in value.calls
     # The forward still ran -- it is what the advantage stage consumes.
     assert "get_values_from_meta" in value.calls
 
@@ -2655,7 +2669,7 @@ def test_train_pump_freezes_the_policy_during_critic_warmup(
 
     asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
-    assert value.calls.count("train_from_meta") == critic_ppo_epochs
+    assert value.calls.count("finish_train_step") == critic_ppo_epochs
     trainer.prepare_for_training.assert_not_called()
     trainer.begin_train_step.assert_not_called()
     trainer.finish_train_step.assert_not_called()
@@ -2726,8 +2740,14 @@ def test_train_pump_groups_ppo_epochs_by_model(monkeypatch) -> None:
         "critic.get_values_from_meta",
         "critic.finish_inference",
         "critic.prepare_for_training",
-        "critic.train_from_meta",
-        "critic.train_from_meta",
+        "critic.begin_train_step",
+        "critic.train_microbatches_from_meta",
+        "critic.finish_train_step",
+        "critic.abort_train_step",
+        "critic.begin_train_step",
+        "critic.train_microbatches_from_meta",
+        "critic.finish_train_step",
+        "critic.abort_train_step",
         "critic.finish_training",
         "policy.prepare_for_training",
         "policy.begin_train_step",
@@ -2766,9 +2786,18 @@ def test_train_pump_runs_all_critic_epochs_before_actor_epochs(monkeypatch) -> N
         "critic.get_values_from_meta",
         "critic.finish_inference",
         "critic.prepare_for_training",
-        "critic.train_from_meta",
-        "critic.train_from_meta",
-        "critic.train_from_meta",
+        "critic.begin_train_step",
+        "critic.train_microbatches_from_meta",
+        "critic.finish_train_step",
+        "critic.abort_train_step",
+        "critic.begin_train_step",
+        "critic.train_microbatches_from_meta",
+        "critic.finish_train_step",
+        "critic.abort_train_step",
+        "critic.begin_train_step",
+        "critic.train_microbatches_from_meta",
+        "critic.finish_train_step",
+        "critic.abort_train_step",
         "critic.finish_training",
         "policy.prepare_for_training",
         "policy.begin_train_step",
@@ -2917,3 +2946,93 @@ def test_train_pump_logs_dump_timing_after_optimizer_step(
         assert logged_timings[0]["train_data_dump"] > 2.0
         assert not final.with_suffix(".jsonl.partial").exists()
     assert "train_data_dump" not in ctrl._timer.get_timing_metrics()
+@pytest.mark.parametrize("warmup", [False, True])
+def test_ppo_streaming_replays_complete_epochs_and_whitens_once(monkeypatch, warmup):
+    metas = [_single_group_meta(), _single_group_meta()]
+    metas[1].sample_ids = ["sample-1"]
+    calls = []
+    value = _NoOpValue(calls, "critic.")
+    ctrl, _ = _ppo_train_pump_controller(
+        sampler=_SequenceSampler(metas),
+        value=value,
+        policy_training_start_step=int(warmup),
+        ppo_epochs=2,
+        critic_ppo_epochs=3,
+    )
+    ctrl._algo_cfg.num_prompts_per_step = 2
+    ctrl._trainer = _EpochRecordingTrainer(calls)
+    seen_chunks = []
+    original_train = value.train_microbatches_from_meta
+
+    def train(meta):
+        seen_chunks.append(meta.sample_ids)
+        original_train(meta)
+
+    value.train_microbatches_from_meta = train
+
+    async def advantage(meta):
+        assert meta.sample_ids == ["sample-0", "sample-1"]
+        assert "critic.begin_train_step" not in calls
+        return meta.with_fields(["advantages", "returns"]), True
+
+    ctrl._advantage_stage = AsyncMock(side_effect=advantage)
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=2.0))
+    ctrl._advantage_stage.assert_awaited_once()
+    assert seen_chunks == [["sample-0"], ["sample-1"]] * 3
+    assert calls.count("critic.finish_train_step") == 3
+    assert calls.count("policy.finish_train_step") == (0 if warmup else 2)
+    assert calls.count("policy.train_microbatches_from_meta") == (0 if warmup else 4)
+    if not warmup:
+        assert calls.index("policy.begin_train_step") > max(
+            i for i, event in enumerate(calls) if event == "critic.finish_train_step"
+        )
+    assert ctrl._trainer_version == 1
+
+
+def test_value_epoch_failure_aborts_before_offload():
+    value = _NoOpValue()
+    ctrl, _ = _ppo_train_pump_controller(sampler=_EmptySampler(), value=value)
+
+    def fail(meta):
+        raise RuntimeError("injected backward failure")
+
+    value.train_microbatches_from_meta = fail
+    with pytest.raises(RuntimeError, match="injected backward"):
+        asyncio.run(ctrl._value_train_epochs([_single_group_meta()], num_epochs=2))
+    assert value.calls == [
+        "prepare_for_training",
+        "begin_train_step",
+        "abort_train_step",
+        "finish_training",
+    ]
+
+
+def test_cancelled_value_epoch_drains_backward_before_abort():
+    entered = threading.Event()
+    release = threading.Event()
+    value = _NoOpValue()
+    ctrl, _ = _ppo_train_pump_controller(sampler=_EmptySampler(), value=value)
+
+    def backward(meta):
+        entered.set()
+        assert release.wait(timeout=2)
+        value.calls.append("backward_done")
+
+    value.train_microbatches_from_meta = backward
+
+    async def run():
+        task = asyncio.create_task(
+            ctrl._value_train_epochs([_single_group_meta()], num_epochs=1)
+        )
+        while not entered.is_set():
+            await asyncio.sleep(0.001)
+        task.cancel()
+        await asyncio.sleep(0.01)
+        assert "abort_train_step" not in value.calls
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
+    assert value.calls[-3:] == ["backward_done", "abort_train_step", "finish_training"]

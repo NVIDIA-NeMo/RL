@@ -1898,6 +1898,7 @@ class MseValueLossFn(LossFunction):
         self.scale = cfg.scale
         self.cliprange = cfg.cliprange
         self.loss_type = LossType.TOKEN_LEVEL
+        self.metric_normalizations = {"num_valid_samples": MetricNormalizer.NONE}
 
     def __call__(
         self,

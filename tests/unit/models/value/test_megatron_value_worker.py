@@ -76,6 +76,7 @@ def test_get_values_suspends_activation_offload() -> None:
     model_config = SimpleNamespace(fine_grained_activation_offloading=True)
     model = SimpleNamespace(config=model_config, eval=lambda: None)
     worker = SimpleNamespace(
+        _train_step_state=None,
         cfg={"train_micro_batch_size": 1},
         model=model,
         _policy_like_cfg={},
