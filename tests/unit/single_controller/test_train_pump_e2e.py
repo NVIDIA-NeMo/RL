@@ -349,6 +349,7 @@ def test_train_pump_drives_mcore_training_step(
             resume_request_deadlines=lambda: None,
             drain_step_reward_metrics=lambda _step: {},
             filter_zero_variance_groups=False,
+            pop_mask_rule_metrics=lambda: {},
         )
 
         master_config = MasterConfig.model_construct(
