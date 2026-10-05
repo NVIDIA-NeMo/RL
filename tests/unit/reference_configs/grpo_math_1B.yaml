@@ -584,6 +584,7 @@ data_plane:
   simple:
     storage_capacity: 1000000        # max samples retained per partition
     num_storage_units: ${mul:2, ${cluster.num_nodes}}  # TQ wants >= 2 per node
+    storage_unit_placement: null     # all | inference | train; null = TQ's SPREAD
   mooncake_cpu:
     global_segment_size: 68719476736 # 64 GiB/process
     local_buffer_size:    2147483648 # 2 GiB/process = 4 x staging slot

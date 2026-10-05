@@ -614,6 +614,7 @@ data_plane:
   simple:
     storage_capacity: 1000000        # max samples retained per partition
     num_storage_units: ${mul:2, ${cluster.num_nodes}}  # TQ wants >= 2 per node
+    storage_unit_placement: null     # all | inference | train; null = TQ's SPREAD
   mooncake_cpu:
     # Per client process — see MooncakeCpuConfig before raising these.
     global_segment_size: 68719476736 # 64 GiB/process

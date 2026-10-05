@@ -89,6 +89,7 @@ from nemo_rl.data_plane import (
     build_data_plane_client,
     data_plane_supports_checkpointing,
 )
+from nemo_rl.data_plane.interfaces import backend_config
 from nemo_rl.data_plane.schema import (
     SC_ROLLOUT_SCHEMA_FIELDS,
     fields_with_optional_routed_experts,
@@ -1542,6 +1543,21 @@ def setup_single_controller(
             teacher_segment_topology=teacher_segment_topology,
         )
         setup_timing_metrics.teacher_reservation_time_s = time.perf_counter() - t0
+
+    # SimpleStorageUnits start when the trainer bootstraps TQ, so resolve their
+    # nodes before that (and after the train/teacher claims above). dp_config is
+    # master_config.data_plane, which the trainer reads.
+    if dp_config["backend"] == "simple" and "simple" in dp_config:
+        simple_cfg = backend_config(dp_config)
+        if simple_cfg.storage_unit_placement is not None:
+            from nemo_rl.data_plane.mooncake_storage_unit import storage_node_ids
+
+            dp_config["simple_storage_node_ids"] = storage_node_ids(
+                simple_cfg.storage_unit_placement,
+                simple_cfg.num_storage_units,
+                inference_cluster=inference_cluster,
+                train_cluster=train_cluster,
+            )
 
     # Create build tasks for generation / trainer / (nemo-gym) workers
     build_tasks: dict[str, Callable[[], Any]] = {}

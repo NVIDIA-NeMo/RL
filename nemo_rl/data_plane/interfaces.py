@@ -59,6 +59,9 @@ class SimpleStorageConfig(BaseModel, extra="allow"):
 
     storage_capacity: int = 1000000  # max samples retained per partition
     num_storage_units: int
+    # Nodes that host units: all | inference (vLLM nodes) | train, round-robin.
+    # None keeps TQ's own SPREAD placement over every Ray node.
+    storage_unit_placement: Literal["inference", "train", "all"] | None = None
 
 
 class MooncakeCpuConfig(BaseModel, extra="allow"):
@@ -146,6 +149,9 @@ class DataPlaneConfig(TypedDict):
     controller_address: NotRequired[str]
     ack_timeout_ms: NotRequired[int]
     observability: NotRequired["ObservabilityConfig"]
+    # Set by setup from simple.storage_unit_placement, not by users: the Ray
+    # node ID each SimpleStorageUnit is pinned to.
+    simple_storage_node_ids: NotRequired[list[str]]
 
 
 _CHECKPOINTABLE_BACKENDS: frozenset[str] = frozenset({"simple", "mooncake_cpu"})

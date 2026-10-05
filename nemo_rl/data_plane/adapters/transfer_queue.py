@@ -737,6 +737,42 @@ def _connect_existing_with_segment_size(segment_size: int) -> None:
     tq_interface._maybe_create_tq_client(conf)
 
 
+def _pin_simple_storage_units(node_ids: list[str]) -> None:
+    """Make TQ's SimpleStorage bootstrap start unit ``i`` on ``node_ids[i]``.
+
+    TQ (pin c51614308b) always places units with a SPREAD placement group,
+    which leaves the count per node to Ray. This replaces that registered
+    provider for this process; the rest mirrors TQ's
+    ``initialize_simple_storage``.
+    """
+    import math
+
+    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+    from transfer_queue.storage.bootstrap.provider import StorageBootstrapProvider
+    from transfer_queue.storage.simple_storage import SimpleStorageUnit
+    from transfer_queue.utils.zmq_utils import process_zmq_server_info
+
+    @StorageBootstrapProvider.register_provider("SimpleStorage")
+    def initialize_simple_storage(conf: Any) -> dict[str, Any]:
+        simple = conf.backend.SimpleStorage
+        num_units = simple.num_data_storage_units
+        if len(node_ids) != num_units:
+            raise ValueError(
+                f"{len(node_ids)} node IDs for {num_units} SimpleStorage units"
+            )
+        total = simple.get("total_storage_size", None)
+        unit_size = math.ceil(total / num_units) if total is not None else None
+        handles = {}
+        for rank, node_id in enumerate(node_ids):
+            name = f"TransferQueueStorageUnit#{rank}"
+            handles[name] = SimpleStorageUnit.options(  # type: ignore[attr-defined]
+                name=name,
+                scheduling_strategy=NodeAffinitySchedulingStrategy(node_id, soft=False),
+            ).remote(storage_unit_size=unit_size)
+        simple.zmq_info = process_zmq_server_info(handles)
+        return handles
+
+
 def _init_tq(cfg: DataPlaneConfig, *, checkpointing: bool = False) -> None:
     """Driver-process path: bootstrap the TQ controller for the chosen backend."""
     from omegaconf import OmegaConf
@@ -766,6 +802,8 @@ def _init_tq(cfg: DataPlaneConfig, *, checkpointing: bool = False) -> None:
                 },
             },
         }
+        if "simple_storage_node_ids" in cfg:
+            _pin_simple_storage_units(cfg["simple_storage_node_ids"])
     elif backend == "mooncake_cpu":
         # The mooncake-transfer-engine wheel ships `mooncake_master` at
         # <site-packages>/mooncake/, NOT on $PATH. TQ's

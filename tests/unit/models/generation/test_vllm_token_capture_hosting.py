@@ -82,7 +82,7 @@ def test_setup_token_capture_installs_capture_with_vllm_adapter(monkeypatch):
     sink = _MemorySink()
     monkeypatch.setattr(
         "nemo_rl.data_plane.build_data_plane_client",
-        lambda dp_cfg, bootstrap: MagicMock(name="dp_client"),
+        lambda dp_cfg, bootstrap, segment_size=None: MagicMock(name="dp_client"),
     )
     monkeypatch.setattr(
         "nemo_rl.data_plane.tq_token_sink.TQTokenSink",
@@ -125,7 +125,7 @@ def test_weight_version_is_stamped_from_worker_state(monkeypatch):
     sink = _MemorySink()
     monkeypatch.setattr(
         "nemo_rl.data_plane.build_data_plane_client",
-        lambda dp_cfg, bootstrap: MagicMock(),
+        lambda dp_cfg, bootstrap, segment_size=None: MagicMock(),
     )
     monkeypatch.setattr(
         "nemo_rl.data_plane.tq_token_sink.TQTokenSink",
@@ -560,7 +560,7 @@ def test_omni_capture_setup_rejects_video_pruning(monkeypatch, pruning_rate):
     )
     monkeypatch.setattr(
         "nemo_rl.data_plane.build_data_plane_client",
-        lambda dp_cfg, bootstrap: MagicMock(),
+        lambda dp_cfg, bootstrap, segment_size=None: MagicMock(),
     )
     if pruning_rate:
         with pytest.raises(ValueError, match="video token pruning"):

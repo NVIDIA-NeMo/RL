@@ -22,7 +22,7 @@ own node.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 import ray
 from ray.util.placement_group import placement_group_table
@@ -59,6 +59,38 @@ class MooncakeStorageUnit:  # pragma: no cover
         return run_checkpoint_command(body)
 
 
+def storage_node_ids(
+    placement: Literal["inference", "train", "all"],
+    count: int | None,
+    *,
+    inference_cluster: RayVirtualCluster,
+    train_cluster: RayVirtualCluster,
+) -> list[str]:
+    """Ray node ID per storage unit, round-robin over the selected nodes.
+
+    ``count`` None means 2 per selected node. Shared with simple storage.
+    """
+    clusters = {
+        "inference": [inference_cluster],
+        "train": [train_cluster],
+        "all": [inference_cluster, train_cluster],
+    }[placement]
+    # Creates (and waits for) any placement group not yet reserved, so the
+    # table read below sees them all.
+    pgs = [pg for cluster in clusters for pg in cluster.get_placement_groups()]
+    # One GCS read for every placement group; no actor RPC.
+    table = placement_group_table()
+    nodes = sorted(
+        {
+            node_id
+            for pg in pgs
+            for node_id in table[pg.id.hex()]["bundles_to_node_id"].values()
+        }
+    )
+    # Every selected node gets count // len(nodes) units, or one more.
+    return [nodes[i % len(nodes)] for i in range(count or 2 * len(nodes))]
+
+
 def start_storage_units(
     dp_config: DataPlaneConfig,
     *,
@@ -74,24 +106,12 @@ def start_storage_units(
     mooncake_cfg = backend_config(dp_config)
     if mooncake_cfg.storage_unit_segment_size == 0:
         return (), {}
-    clusters = {
-        "inference": [inference_cluster],
-        "train": [train_cluster],
-        "all": [inference_cluster, train_cluster],
-    }[mooncake_cfg.storage_unit_placement]
-    # One GCS read for every placement group; no actor RPC.
-    table = placement_group_table()
-    nodes = sorted(
-        {
-            node_id
-            for cluster in clusters
-            for pg in cluster.get_placement_groups()
-            for node_id in table[pg.id.hex()]["bundles_to_node_id"].values()
-        }
+    node_ids = storage_node_ids(
+        mooncake_cfg.storage_unit_placement,
+        mooncake_cfg.num_storage_units,
+        inference_cluster=inference_cluster,
+        train_cluster=train_cluster,
     )
-    count = mooncake_cfg.num_storage_units or 2 * len(nodes)
-    # Round-robin: every selected node gets count // len(nodes) units, or one more.
-    node_ids = [nodes[i % len(nodes)] for i in range(count)]
     runtime_env = make_actor_runtime_env(
         "nemo_rl.data_plane.mooncake_storage_unit.MooncakeStorageUnit"
     )

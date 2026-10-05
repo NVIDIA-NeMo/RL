@@ -192,3 +192,52 @@ def test_schema_validates_without_any_backend_block() -> None:
     validate, otherwise MasterConfig fails before training starts.
     """
     TypeAdapter(DataPlaneConfig).validate_python(_cfg("simple"))
+
+
+def test_simple_storage_units_are_pinned_to_the_resolved_nodes(monkeypatch) -> None:
+    """simple.storage_unit_placement -> one hard node affinity per unit."""
+    from transfer_queue.storage import simple_storage
+    from transfer_queue.storage.bootstrap.provider import StorageBootstrapProvider
+    from transfer_queue.utils import zmq_utils
+
+    from nemo_rl.data_plane.adapters import transfer_queue as adapter
+
+    monkeypatch.setitem(
+        StorageBootstrapProvider._providers,
+        "simplestorage",
+        StorageBootstrapProvider.get_provider("SimpleStorage"),
+    )
+    placed = []
+
+    class _Unit:
+        def __init__(self, options):
+            self.options = options
+
+        def remote(self, **kwargs):
+            placed.append((self.options, kwargs))
+            return self.options["name"]
+
+    monkeypatch.setattr(
+        simple_storage.SimpleStorageUnit, "options", lambda **o: _Unit(o)
+    )
+    monkeypatch.setattr(zmq_utils, "process_zmq_server_info", lambda h: dict(h))
+    monkeypatch.setattr(adapter.tq, "init", lambda *, conf: None)
+
+    cfg = _cfg("simple", simple={"storage_capacity": 9, "num_storage_units": 3})
+    n0, n1 = "a" * 56, "b" * 56  # Ray node IDs are 28-byte hex strings
+    cfg["simple_storage_node_ids"] = [n0, n1, n0]
+    adapter._init_tq(cfg)
+    conf = OmegaConf.create(
+        {
+            "backend": {
+                "SimpleStorage": {"num_data_storage_units": 3, "total_storage_size": 9}
+            }
+        }
+    )
+    handles = StorageBootstrapProvider.get_provider("SimpleStorage")(conf)
+
+    assert list(handles) == [f"TransferQueueStorageUnit#{i}" for i in range(3)]
+    assert [o["scheduling_strategy"].node_id for o, _ in placed] == [n0, n1, n0]
+    assert all(o["scheduling_strategy"].soft is False for o, _ in placed)
+    assert all(kw == {"storage_unit_size": 3} for _, kw in placed)
+    assert conf.backend.SimpleStorage.zmq_info == handles
