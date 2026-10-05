@@ -82,6 +82,56 @@ Set the inherited top-level `config_paths` to `null` when the shard list replace
 
 Use `common_inherited_overlays` for inherited entries that every shard needs. List an entry in `allowed_duplicate_entries` when it may appear in more than one shard. NeMo RL rejects unclaimed inherited entries, duplicate routable entries, and overlapping port ranges during setup.
 
+#### Route one task across multiple agent harnesses
+
+Put `agent_pool` directly under `env.nemo_gym` to choose one agent harness per
+prompt. All repeated generations for that prompt use the same selected agent.
+The selected assignment is stored on the row, so retries, resumed data, and a
+later reordering of the pool do not change it.
+
+With sharding enabled, NeMo RL makes this selection before dispatch and routes
+the complete prompt group to the shard that hosts the selected agent. Each
+harness shard must include the pooled resource-server configuration because
+that agent must be self-contained when its Gym actor starts. A pooled resource
+source may therefore be repeated across these shards; agents themselves must
+remain unique.
+
+```yaml
+env:
+  should_use_nemo_gym: true
+  nemo_gym:
+    config_paths: null
+    agent_pool:
+      reasoning_gym:
+        - opencode_reasoning_gym_agent
+        - codex_reasoning_gym_agent
+    shards:
+      - name: opencode
+        port_range_low: 5000
+        port_range_high: 5499
+        config_paths:
+          - environments/opencode_reasoning_gym/config.yaml
+      - name: codex
+        port_range_low: 5500
+        port_range_high: 5999
+        config_paths:
+          - environments/codex_reasoning_gym/config.yaml
+```
+
+`agent_pool` keys are task-source names and values are ordered, non-empty lists
+of `responses_api_agents` names. NeMo RL validates every target at startup and
+fails before training when an agent is missing, duplicated across shards, or
+not an agent-server entry. Explicit `environment_server` routing still takes
+precedence and is not changed by the pool.
+
+For the quickest end-to-end check, use the Reasoning Gym knights-and-knaves
+data in the two configurations above, set `placement_strategy: PACK` for a
+single node, and run a short GRPO job with two prompts and two generations per
+prompt. Confirm that each prompt's two generations have the same
+`_ng_agent_pool_assignment`, while the two prompts can select different agents.
+Use Terminal-Bench or SWE-bench for a representative coding-agent comparison
+after this inexpensive routing smoke test passes.
+
 #### Choose actor placement
 
 The default `placement_strategy` is `STRICT_SPREAD`, which requires Ray to place each actor on a different node. This provides the capacity isolation that sharding is designed for.

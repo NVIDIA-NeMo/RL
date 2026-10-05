@@ -37,7 +37,10 @@ from omegaconf import OmegaConf
 
 # Dict-shaped NeMo RL integration settings that are not Gym server entries.
 # The actor factory or rollout code consumes these separately.
-NEMO_RL_DICT_CONFIG_KEYS = frozenset({"effort_levels", "tokenizer_config"})
+AGENT_POOL_CONFIG_KEY = "agent_pool"
+NEMO_RL_DICT_CONFIG_KEYS = frozenset(
+    {AGENT_POOL_CONFIG_KEY, "effort_levels", "tokenizer_config"}
+)
 
 # Ray placement-group strategies a shard plan may ask for. STRICT_SPREAD is the
 # point of sharding -- one actor per node -- and anything else colocates shards
@@ -132,6 +135,47 @@ def _as_string_set(value: Any, *, context: str) -> frozenset[str]:
     if len(value) != len(set(value)):
         raise ShardConfigError(f"{context} contains duplicate keys")
     return frozenset(value)
+
+
+def parse_agent_pool(value: Any) -> dict[str, list[str]]:
+    """Validate Gym's route-to-agent pool mapping for shard-aware dispatch.
+
+    Unsharded jobs forward this setting to Gym unchanged. Sharded jobs must
+    choose the concrete agent before selecting an actor, so NeMo RL validates
+    and consumes the same mapping at setup.
+    """
+    if value is None:
+        return {}
+    if OmegaConf.is_config(value):
+        value = OmegaConf.to_container(value, resolve=True)
+    if not isinstance(value, Mapping):
+        raise ShardConfigError(
+            "env.nemo_gym.agent_pool must be a mapping from route names to agent lists"
+        )
+
+    agent_pool: dict[str, list[str]] = {}
+    for route_name, agents in value.items():
+        if not isinstance(route_name, str) or not route_name:
+            raise ShardConfigError(
+                "env.nemo_gym.agent_pool keys must be non-empty strings"
+            )
+        if (
+            not isinstance(agents, list)
+            or not agents
+            or not all(isinstance(agent, str) and agent for agent in agents)
+        ):
+            raise ShardConfigError(
+                f"env.nemo_gym.agent_pool[{route_name!r}] must be a non-empty "
+                "list of non-empty agent names"
+            )
+        duplicates = sorted({agent for agent in agents if agents.count(agent) > 1})
+        if duplicates:
+            raise ShardConfigError(
+                f"env.nemo_gym.agent_pool[{route_name!r}] contains duplicate "
+                f"agents {duplicates}"
+            )
+        agent_pool[route_name] = list(agents)
+    return agent_pool
 
 
 def _parse_shard(raw: Any, index: int) -> ShardSpec:
@@ -492,6 +536,8 @@ def apply_shard_overlay(
 def build_route_shard_map(
     entries_by_shard: Mapping[str, Mapping[str, list[str]]],
     allowed_duplicate_entries: frozenset[str] | set[str] = frozenset(),
+    *,
+    pooled_routes: frozenset[str] | set[str] = frozenset(),
 ) -> dict[str, str]:
     """Map each routable entry to its shard, rejecting ambiguous routes.
 
@@ -502,18 +548,36 @@ def build_route_shard_map(
     so both entry types must be included.
 
     Two failures are caught here rather than at first dispatch. A routable
-    entry hosted by two shards is always an error: rows naming it could go to
-    either, so routing would be silently nondeterministic. Any other entry in
-    two shards has to be allowlisted, because duplication is usually accidental
-    — a shared YAML dropped into two shards' path lists quietly brings its judge
-    along and doubles that judge's GPU claim.
+    entry hosted by two shards is normally an error: rows naming it could go
+    to either, so routing would be silently nondeterministic. The exception is
+    a resources-server route named by ``pooled_routes``. NeMo RL resolves that
+    source to one concrete pool agent before shard selection, so the source
+    itself is never used as a shard destination and may be duplicated beside
+    each harness. Any other entry in two shards has to be allowlisted, because
+    duplication is usually accidental — a shared YAML dropped into two shards'
+    path lists quietly brings its judge along and doubles that judge's GPU
+    claim.
 
     Only names are compared. What an entry means is Gym's business.
     """
+    hosts_by_entry: dict[str, list[tuple[str, frozenset[str]]]] = {}
+    for shard_name, entries in entries_by_shard.items():
+        for entry, types in entries.items():
+            hosts_by_entry.setdefault(entry, []).append((shard_name, frozenset(types)))
+    pooled_resource_duplicates = {
+        entry
+        for entry, hosts in hosts_by_entry.items()
+        if entry in pooled_routes
+        and len(hosts) > 1
+        and all(types == frozenset({"resources_servers"}) for _, types in hosts)
+    }
+
     route_to_shard: dict[str, str] = {}
     for shard_name, entries in entries_by_shard.items():
         for entry, types in entries.items():
             if not GYM_ROUTABLE_KEYS.intersection(types):
+                continue
+            if entry in pooled_resource_duplicates:
                 continue
             if entry in route_to_shard:
                 raise ShardSetupError(
@@ -527,7 +591,11 @@ def build_route_shard_map(
     hosting_shard: dict[str, str] = {}
     for shard_name, entries in entries_by_shard.items():
         for entry in entries:
-            if entry in hosting_shard and entry not in allowed_duplicate_entries:
+            if (
+                entry in hosting_shard
+                and entry not in allowed_duplicate_entries
+                and entry not in pooled_resource_duplicates
+            ):
                 raise ShardSetupError(
                     f"Config entry '{entry}' appears in shard "
                     f"'{hosting_shard[entry]}' and shard '{shard_name}' but is "
@@ -538,6 +606,26 @@ def build_route_shard_map(
             hosting_shard.setdefault(entry, shard_name)
 
     return route_to_shard
+
+
+def validate_agent_pool_targets(
+    entries_by_shard: Mapping[str, Mapping[str, list[str]]],
+    agent_pool: Mapping[str, list[str]],
+) -> None:
+    """Fail at setup when a pool target is not an agent on any shard."""
+    available_agents = {
+        entry
+        for entries in entries_by_shard.values()
+        for entry, types in entries.items()
+        if "responses_api_agents" in types
+    }
+    configured_targets = {agent for agents in agent_pool.values() for agent in agents}
+    missing = sorted(configured_targets - available_agents)
+    if missing:
+        raise ShardSetupError(
+            f"env.nemo_gym.agent_pool targets agents no shard hosts: {missing}. "
+            f"Available agents: {sorted(available_agents)}."
+        )
 
 
 def apply_shard_log_dir(

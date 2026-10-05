@@ -60,6 +60,7 @@ from nemo_rl.environments.interfaces import (
 from nemo_rl.environments.nemo_gym import (
     DEFAULT_THINKING_TAGS,
     NemoGymShardSet,
+    apply_nemo_gym_agent_pool,
     as_nemo_gym_shard_set,
     get_nemo_gym_route_name,
     get_pad_dynamic_image_shapes,
@@ -2789,6 +2790,8 @@ async def run_async_nemo_gym_rollout(
             sampling_params,
             identity_num_generations,
         )
+        shard_set = as_nemo_gym_shard_set(task_to_env["nemo_gym"])
+        apply_nemo_gym_agent_pool(nemo_gym_rows, shard_set.agent_pool)
         accumulator = _NemoGymStreamAccumulator(
             rows=nemo_gym_rows,
             num_generations=num_generations,
@@ -2796,7 +2799,6 @@ async def run_async_nemo_gym_rollout(
         )
         final_rollout_result: NemoGymRolloutResult | None = None
         actor_timing_by_instance: dict[str, dict[str, Any]] = {}
-        shard_set = as_nemo_gym_shard_set(task_to_env["nemo_gym"])
         with timer.time(run_rollouts_timer_label):
             buckets = _bucket_nemo_gym_rows_by_instance(
                 nemo_gym_rows, shard_set, routing_group_size
