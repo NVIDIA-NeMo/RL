@@ -21,7 +21,7 @@ import time
 import warnings
 from collections import Counter, OrderedDict
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Mapping, Optional
 
 import requests
 import torch
@@ -201,6 +201,23 @@ class _MegatronBulkRefitPiece:
     dtype: torch.dtype
     device: torch.device
     destination: torch.Tensor | None
+
+
+def _http_sampling_defaults(generation_cfg: Mapping[str, Any]) -> dict[str, Any]:
+    """Sampling defaults for HTTP requests that omit temperature, top_p or top_k.
+
+    Training recomputes log probabilities with the configured generation sampling
+    parameters. Without explicit server defaults, an omitted request field falls
+    back to the server's hardcoded value or to the model's generation_config.json,
+    so the request would sample off-policy.
+    """
+    top_p = generation_cfg["top_p"]
+    top_k = generation_cfg["top_k"]
+    return {
+        "default_temperature": float(generation_cfg["temperature"]),
+        "default_top_p": 1.0 if top_p is None else float(top_p),
+        "default_top_k": 0 if top_k is None or top_k < 0 else int(top_k),
+    }
 
 
 def _resolve_coordinator_policy(
@@ -746,7 +763,7 @@ class MegatronGenerationMixin:
                 rng=random.Random(torch.distributed.get_rank())
             )
 
-        server_kwargs: dict[str, Any] = {}
+        server_kwargs: dict[str, Any] = _http_sampling_defaults(self.cfg["generation"])
         if "http_server_num_replicas" in gen_cfg:
             server_kwargs["num_replicas"] = int(gen_cfg["http_server_num_replicas"])
 
