@@ -14,6 +14,7 @@ policy:
     checkpoint:
       async_save: false
       ckpt_assume_constant_structure: false
+      save_consolidated: "false" # "false" | "final": inline HF-format export of the final checkpoint
   make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
   optimizer: null
   scheduler: null
@@ -29,6 +30,7 @@ value:
     checkpoint:
       async_save: false
       ckpt_assume_constant_structure: false
+      save_consolidated: "false" # "false" | "final": inline HF-format export of the final checkpoint
   make_sequence_length_divisible_by: ${value.megatron_cfg.tensor_model_parallel_size}
   optimizer: null
   scheduler: null

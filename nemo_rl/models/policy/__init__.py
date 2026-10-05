@@ -358,7 +358,11 @@ class MegatronConfigDisabled(TypedDict):
 
 
 class MegatronCheckpointConfig(TypedDict, total=False):
-    """Checkpoint knobs passed through to Megatron Bridge CheckpointConfig."""
+    """Checkpoint knobs for the Megatron backend.
+
+    Bridge-facing fields are forwarded to Megatron Bridge's
+    ``CheckpointConfig``; ``save_consolidated`` is consumed by NeMo-RL itself.
+    """
 
     # Offload disk writes to a persistent background worker so save_checkpoint
     # returns after D2H staging.
@@ -370,6 +374,11 @@ class MegatronCheckpointConfig(TypedDict, total=False):
     ckpt_fully_parallel_save_process_group: str  # "dp" | "ep_dp"
     ckpt_fully_parallel_load_process_group: str  # "dp" | "ep_dp"
     ckpt_fully_parallel_load_exchange_algo: str  # "broadcast" | "gather_rounds"
+    # Inline Hugging Face export of the final checkpoint. "final" converts the
+    # last Megatron checkpoint to HF format on CPU after the native save
+    # finalizes; intermediate checkpoints stay Megatron-native and are
+    # converted offline with examples/converters/convert_megatron_to_hf.py.
+    save_consolidated: NotRequired[Literal["false", "final"]]
 
 
 class MegatronConfig(TypedDict):

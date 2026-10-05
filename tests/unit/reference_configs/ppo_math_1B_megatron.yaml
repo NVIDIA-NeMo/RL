@@ -147,6 +147,7 @@ policy:
     checkpoint:
       async_save: false
       ckpt_assume_constant_structure: false
+      save_consolidated: "false"
     empty_unused_memory_level: 1
     activation_checkpointing: false
     fine_grained_activation_offloading: false
@@ -347,6 +348,7 @@ value:
     checkpoint:
       async_save: false
       ckpt_assume_constant_structure: false
+      save_consolidated: "false"
     empty_unused_memory_level: 1
     activation_checkpointing: false
     fine_grained_activation_offloading: false

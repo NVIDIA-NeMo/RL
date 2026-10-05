@@ -1395,6 +1395,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 weights_path=weights_path,
                 optimizer_path=optimizer_path,
                 tokenizer_path=tokenizer_path,
+                is_final_checkpoint=is_final_checkpoint,
             )
         ray.get(futures)
 

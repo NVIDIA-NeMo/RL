@@ -112,6 +112,7 @@ policy:
     checkpoint:
       async_save: false
       ckpt_assume_constant_structure: false
+      save_consolidated: "false"
     use_fused_linear_logprobs: false
     fused_linear_logprobs_chunk_size: 256
     force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
