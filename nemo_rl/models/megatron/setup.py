@@ -14,6 +14,7 @@
 
 import copy
 import hashlib
+import inspect
 import json
 import os
 import threading
@@ -1662,6 +1663,22 @@ def _apply_precision_config(
     fp8_on = fp8_cfg is not None and fp8_cfg.get("enabled", False)
     fp4_on = fp4_cfg is not None and fp4_cfg.enabled
 
+    if (
+        dtype == torch.bfloat16
+        and fp8_cfg is not None
+        and fp8_cfg.get("enabled") is False
+        and not fp4_on
+        and te_precision_config_file is None
+    ):
+        # An explicit BF16 override must clear FP8 inherited from a checkpoint.
+        # Keep absent overrides and explicit FP4/per-module recipes unchanged.
+        model_cfg.fp8 = None
+        model_cfg.fp8_param = False
+        model_cfg.moe_router_padding_for_quantization = False
+        model_cfg.moe_router_padding_for_fp8 = False
+        if hasattr(model_cfg, "quant_recipe"):
+            model_cfg.quant_recipe = None
+
     generation_cfg = config.get("generation")
     if (
         fp4_cfg is not None
@@ -2089,6 +2106,20 @@ def _create_megatron_config(
         "overlap_param_gather": overlap_param_gather,
         "reuse_grad_buf_for_mxfp8_param_ag": reuse_grad_buf_for_mxfp8_param_ag,
     }
+    if (
+        optimizer_kwargs.get("optimizer") == "muon"
+        and optimizer_kwargs["use_distributed_optimizer"]
+    ):
+        # Muon updates whole matrices, so its owners need layer-wise sharding.
+        optimizer_kwargs["use_layer_wise_distributed_optimizer"] = True
+    layer_wise = optimizer_kwargs.get("use_layer_wise_distributed_optimizer")
+    if config["megatron_cfg"].get("use_layer_wise_param_layout") is False:
+        if not layer_wise or optimizer_kwargs["use_distributed_optimizer"]:
+            raise ValueError(
+                "use_layer_wise_param_layout=False requires "
+                "use_layer_wise_distributed_optimizer=True and "
+                "use_distributed_optimizer=False."
+            )
     # Fused linear logprobs run the decoder but read output_layer.weight directly
     # instead of calling output_layer.forward(). Megatron's distributed-optimizer
     # overlap_param_gather prefetch chain assumes every param-gather bucket
@@ -2150,6 +2181,29 @@ def _create_megatron_config(
             tokenizer_model=config["tokenizer"]["name"],
         ),
     )
+
+
+def _get_layer_wise_model_kwargs(
+    policy_cfg: PolicyConfig, optimizer_cfg: OptimizerConfig
+) -> dict[str, bool]:
+    """Forward opt-in layer-wise settings only to a compatible Bridge API."""
+    if not optimizer_cfg.use_layer_wise_distributed_optimizer:
+        return {}
+    kwargs = {"use_layer_wise_distributed_optimizer": True}
+    compact = policy_cfg["megatron_cfg"].get("use_layer_wise_param_layout") is False
+    if compact:
+        kwargs["use_layer_wise_param_layout"] = False
+    parameters = inspect.signature(get_model).parameters
+    accepts_kwargs = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()
+    )
+    missing = set(kwargs) - parameters.keys()
+    if missing and not accepts_kwargs:
+        raise ValueError(
+            "Layer-wise optimizer configuration requires a Megatron-Bridge get_model "
+            f"API supporting {', '.join(sorted(missing))}; upgrade Megatron-Bridge."
+        )
+    return kwargs
 
 
 def _create_draft_pre_wrap_hook(
@@ -2616,6 +2670,7 @@ def setup_model_and_optimizer(
         mixed_precision_wrapper=mixed_precision_wrapper,
         pg_collection=pg_collection,
         wrap_with_ddp=load_optimizer,
+        **_get_layer_wise_model_kwargs(policy_cfg, megatron_cfg.optimizer),
     )
     classify_gtp_remat_chains(model, megatron_cfg.model)
 

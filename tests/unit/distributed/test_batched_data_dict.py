@@ -1496,3 +1496,18 @@ def test_truncate_tensors_narrows_opd_full_payloads_but_never_widens_them():
     assert batch[OPD_FULL_LOGITS_FIELD].shape == (2, 3, 5)
     assert torch.equal(batch[OPD_FULL_LOGITS_FIELD], logits_before)
     assert batch[OPD_FULL_TEACHER_INDEX_FIELD].shape == (2,)
+
+
+@pytest.mark.parametrize("as_tensors", [False, True])
+def test_get_multimodal_dict_excludes_packed_sequence_boundaries(as_tensors):
+    """Packing metadata stays in the batch but is excluded from model inputs."""
+    boundaries = {
+        "cu_seqlens": PackedTensor([torch.tensor([0, 4])], dim_to_pack=0),
+        "cu_seqlens_padded": PackedTensor([torch.tensor([0, 8])], dim_to_pack=0),
+    }
+    batch = BatchedDataDict(
+        {**boundaries, "pixel_values": PackedTensor([torch.ones(2, 3)], dim_to_pack=0)}
+    )
+    assert set(batch.get_multimodal_dict(as_tensors=as_tensors)) == {"pixel_values"}
+    for key, value in boundaries.items():
+        assert batch[key] is value

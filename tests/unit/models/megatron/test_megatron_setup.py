@@ -4256,6 +4256,7 @@ class TestSetupModelAndOptimizer:
         mock_megatron_cfg.model.tensor_model_parallel_size = 1
         # Enable param gather overlap
         mock_megatron_cfg.ddp.overlap_param_gather = True
+        mock_megatron_cfg.optimizer.use_layer_wise_distributed_optimizer = True
         mock_megatron_cfg.ddp.align_param_gather = True
         mock_megatron_cfg.checkpoint.load = None
         mock_megatron_cfg.checkpoint.pretrained_checkpoint = None
@@ -4305,6 +4306,7 @@ class TestSetupModelAndOptimizer:
         # Verify get_model was called (the mixed_precision_wrapper should be CustomFloat16Module)
         mock_get_model.assert_called_once()
         call_kwargs = mock_get_model.call_args[1]
+        assert call_kwargs["use_layer_wise_distributed_optimizer"] is True
         # Check that pre_wrap_hook is not empty when freeze_moe_router is True
         assert len(call_kwargs.get("pre_wrap_hook", [])) > 0
 
