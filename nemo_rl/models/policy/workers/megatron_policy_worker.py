@@ -4738,7 +4738,7 @@ class MegatronPolicyWorkerImpl(
 
         NVRx constant-structure saves cache CUDA tensor handles in the persistent
         writer. That is safe while model/optimizer storage stays fixed, but a
-        colocated or PPO policy replaces that storage during CPU offload. In that case,
+        CPU offload between saves replaces that storage. In that case,
         close the completed writer and invalidate its training-side cache; NVRx
         starts a fresh persistent writer lazily for the next checkpoint.
         """

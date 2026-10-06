@@ -615,8 +615,7 @@ def setup(
         optimizer_path=optimizer_path,
         init_optimizer=True,
         init_reference_model=False,
-        # Without colocated inference the student's optimizer is offloaded every
-        # step so the teacher fits for logprob inference.
+        # Without colocated inference the student's optimizer is offloaded for the teacher every step.
         offloaded_between_steps=student_megatron and not colocated_inference,
     )
 

@@ -718,7 +718,8 @@ def _build_trainer(
         reserved_http_server_ports=reserved_http_server_ports,
         # A PPO policy yields the GPUs to the value model every step.
         offloaded_between_steps=is_ppo_run(master_config)
-        and master_config.policy.get("megatron_cfg", {}).get("enabled", False),
+        and "megatron_cfg" in master_config.policy
+        and master_config.policy["megatron_cfg"]["enabled"],
     )
     return trainer, time.perf_counter() - t0
 
