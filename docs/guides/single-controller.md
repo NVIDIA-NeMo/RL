@@ -107,9 +107,9 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
 
 ## Trajectory Parquet Logging
 
-Set `trajectory_log.enabled: true` to write training trajectories as Parquet
-files, with one trajectory per row. `trajectory_log.log_period` controls how
-often they are written, and `trajectory_log.dir` sets the output location.
+Set `trajectory_logger.enabled: true` to write training trajectories as Parquet
+files, with one trajectory per row. `trajectory_logger.log_period` controls how
+often they are written, and `trajectory_logger.log_dir` sets the output location.
 
 ## Checkpointing and Replay Recovery
 

@@ -283,11 +283,11 @@ rollout_recovery:
 # Leaving either map above non-empty requires the top-level token_capture section
 # to set enabled: true.
 
-# Log token-level training data to Parquet under <dir>/step=NNNNNNNN/.
+# Log token-level training data to Parquet under <log_dir>/step=NNNNNNNN/.
 # Rows carry attempt_start so restarted attempts can be distinguished.
-trajectory_log:
+trajectory_logger:
   enabled: false
-  dir: null  # null = <logger.log_dir>/trajectories
+  log_dir: null  # null = <logger.log_dir>/trajectories
   log_period: 10  # record steps 1, 10, 20, ...
 
 cluster:

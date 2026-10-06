@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, cast
@@ -32,6 +33,18 @@ from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.schema import MASK_SAMPLE, TRUNCATED
 
 TRAJECTORY_SCHEMA_VERSION = "nemorl-trajectories/1"
+
+FETCH_FIELDS = (
+    "input_ids",
+    "input_lengths",
+    "token_mask",
+    "generation_logprobs",
+    "total_reward",
+    MASK_SAMPLE,
+    TRUNCATED,
+    "advantages",
+    "sample_mask",
+)
 
 ROW_SCHEMA = pa.schema(
     [
@@ -58,7 +71,6 @@ ROW_SCHEMA = pa.schema(
 
 
 def _scalar_column(value: Optional[torch.Tensor], n: int) -> np.ndarray | list[None]:
-    """Return one scalar per sample, or nulls for a missing column."""
     return [None] * n if value is None else value.detach().cpu().reshape(n).numpy()
 
 
@@ -67,10 +79,9 @@ def _token_column(
     value: Optional[torch.Tensor],
     lengths: np.ndarray,
 ) -> pa.Array:
-    """Turn batched tokens into one Arrow list value per rollout row."""
+    """Turn batched tokens into one Arrow list per row (= rollout)."""
     n = len(lengths)
     list_type = cast(pa.ListType, ROW_SCHEMA.field(name).type)
-    value_type = list_type.value_type
     if value is None:
         return pa.nulls(n, list_type)
 
@@ -82,40 +93,19 @@ def _token_column(
     elif tensor.dim() == 1:
         rows = (tensor[i : i + 1] for i in range(n))
     else:
-        rows = (tensor[i, : int(lengths[i])] for i in range(n))
+        rows = (tensor[i, : lengths[i]] for i in range(n))
 
-    parts = [row.reshape(-1).numpy() for row in rows]
-    offsets = np.empty(n + 1, dtype=np.int32)
-    offsets[0] = 0
-    np.cumsum([len(part) for part in parts], out=offsets[1:])
-    dtype = np.dtype(str(value_type))
-    values = (
-        np.concatenate(parts).astype(dtype, copy=False)
-        if parts
-        else np.empty(0, dtype=dtype)
-    )
+    dtype = np.dtype(str(list_type.value_type))
+    parts = [row.flatten().numpy().astype(dtype, copy=False) for row in rows]
     if name == "token_mask":
-        values = (values > 0).astype(np.int8)
-    return pa.ListArray.from_arrays(
-        pa.array(offsets), pa.array(values, type=value_type)
-    )
+        parts = [(part > 0).astype(np.int8) for part in parts]
+    return pa.array(parts, type=list_type)
 
 
-class TrajectoryLogWriter:
+class TrajectoryLogger:
     """Write Arrow columns directly from batched training tensors."""
 
-    FETCH_FIELDS = (
-        "input_ids",
-        "input_lengths",
-        "token_mask",
-        "generation_logprobs",
-        "total_reward",
-        MASK_SAMPLE,
-        TRUNCATED,
-        "prev_logprobs",
-    )
-
-    def __init__(self, *, root_dir: str) -> None:
+    def __init__(self, root_dir: str) -> None:
         self._attempt_start = datetime.now(timezone.utc)
         self._root = Path(root_dir)
         self._root.mkdir(parents=True, exist_ok=True)
@@ -128,20 +118,15 @@ class TrajectoryLogWriter:
         meta: KVBatchMeta,
         td: TensorDict,
         *,
-        advantages: torch.Tensor,
-        final_sample_mask: torch.Tensor,
         step: int,
         chunk_index: int,
-        values: Optional[torch.Tensor] = None,
-        returns: Optional[torch.Tensor] = None,
     ) -> None:
         """Append one chunk to the step's Parquet file."""
         n = len(meta.sample_ids)
         if n == 0:
             return
-        if "input_lengths" not in td:
-            raise ValueError("trajectory log requires input_lengths in the batch")
-        lengths = td["input_lengths"].cpu().reshape(-1).numpy()
+        tensors = cast(Mapping[str, torch.Tensor], td)
+        lengths = tensors["input_lengths"].cpu().reshape(-1).numpy()
         tags = meta.tags or [{}] * n
 
         columns: dict[str, Any] = {
@@ -152,27 +137,22 @@ class TrajectoryLogWriter:
             "sample_id": meta.sample_ids,
             "prompt_idx": [tag.get("prompt_idx") for tag in tags],
             "weight_version": [tag.get("weight_version") for tag in tags],
-            "reward": _scalar_column(
-                td["total_reward"] if "total_reward" in td else None, n
+            "reward": _scalar_column(tensors["total_reward"], n),
+            "final_sample_mask": _scalar_column(tensors["sample_mask"], n),
+            "mask_sample": _scalar_column(tensors[MASK_SAMPLE], n),
+            "truncated": _scalar_column(tensors[TRUNCATED], n),
+            "input_ids": _token_column("input_ids", tensors["input_ids"], lengths),
+            "token_mask": _token_column("token_mask", tensors["token_mask"], lengths),
+            "generation_logprobs": _token_column(
+                "generation_logprobs", tensors["generation_logprobs"], lengths
             ),
-            "final_sample_mask": _scalar_column(final_sample_mask, n),
-            "mask_sample": _scalar_column(
-                td[MASK_SAMPLE] if MASK_SAMPLE in td else None, n
+            "prev_logprobs": _token_column(
+                "prev_logprobs", tensors.get("prev_logprobs"), lengths
             ),
-            "truncated": _scalar_column(td[TRUNCATED] if TRUNCATED in td else None, n),
+            "advantages": _token_column("advantages", tensors["advantages"], lengths),
+            "values": _token_column("values", tensors.get("values"), lengths),
+            "returns": _token_column("returns", tensors.get("returns"), lengths),
         }
-        for name in (
-            "input_ids",
-            "token_mask",
-            "generation_logprobs",
-            "prev_logprobs",
-        ):
-            columns[name] = _token_column(
-                name, td[name] if name in td else None, lengths
-            )
-        columns["advantages"] = _token_column("advantages", advantages, lengths)
-        columns["values"] = _token_column("values", values, lengths)
-        columns["returns"] = _token_column("returns", returns, lengths)
         table = pa.table(columns, schema=ROW_SCHEMA)
 
         if self._active_step is None:
@@ -184,7 +164,7 @@ class TrajectoryLogWriter:
             )
             self._active_step = step
         elif self._active_step != step:
-            raise RuntimeError("trajectory log has an unpublished previous step")
+            raise RuntimeError("Trajectory logger has an unpublished previous step")
         assert self._writer is not None
         self._writer.write_table(table)
 
@@ -193,7 +173,7 @@ class TrajectoryLogWriter:
         if self._active_step is None:
             return
         if self._active_step != step:
-            raise RuntimeError("trajectory log is publishing the wrong step")
+            raise RuntimeError("Trajectory logger is publishing the wrong step")
         assert self._writer is not None and self._pending_path is not None
         self._writer.close()
         published_name = self._pending_path.name.removeprefix(".").removesuffix(".tmp")

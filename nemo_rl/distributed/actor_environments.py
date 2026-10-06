@@ -103,7 +103,7 @@ ACTOR_ENVIRONMENTS: dict[str, list[str] | None] = {
     "nemo_rl.experience.rollout_reassembler_actor.RolloutReassemblerActor": [
         "nemo_gym"
     ],
-    "nemo_rl.experience.trajectory_logger_actor.TrajectoryLogActor": None,
+    "nemo_rl.experience.trajectory_logger_actor.TrajectoryLoggerActor": None,
     "nemo_rl.environments.tools.retriever.RAGEnvironment": None,
     "nemo_rl.environments.nemo_gym.NemoGym": ["nemo_gym"],
     # ModelOpt quantization-aware workers

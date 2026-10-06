@@ -651,13 +651,13 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     num_reassembler_workers: PositiveInt = 2
 
 
-class TrajectoryLogConfig(BaseModel, extra="allow"):
-    """Log token-level training data to Parquet in the controller."""
+class TrajectoryLoggerConfig(BaseModel, extra="allow"):
+    """Log token-level training data to Parquet in a dedicated Ray actor."""
 
     enabled: bool = False
-    # Output root; rows land under ``<dir>/step=NNNNNNNN/``. None =
+    # Output root; rows land under ``<log_dir>/step=NNNNNNNN/``. None =
     # derived at setup as ``<logger.log_dir>/trajectories``.
-    dir: Optional[str] = None
+    log_dir: Optional[str] = None
     # Record step 1 and every nth optimizer step (10 = steps 1, 10, 20, ...).
     log_period: PositiveInt = 10
 
@@ -844,7 +844,9 @@ class MasterConfig(BaseModel, extra="allow"):
     on_policy_distillation: Optional[OnPolicyDistillationConfig] = None
     telemetry: Optional[TelemetryConfig] = None
     token_capture: TokenCaptureConfig = Field(default_factory=TokenCaptureConfig)
-    trajectory_log: TrajectoryLogConfig = Field(default_factory=TrajectoryLogConfig)
+    trajectory_logger: TrajectoryLoggerConfig = Field(
+        default_factory=TrajectoryLoggerConfig
+    )
 
     @model_validator(mode="after")
     def validate_algorithm_block(self) -> "MasterConfig":

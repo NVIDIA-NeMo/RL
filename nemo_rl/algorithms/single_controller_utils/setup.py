@@ -170,7 +170,7 @@ class SingleControllerActorArgs:
     last_checkpoint_path: Optional[str]
     finalizer_actors: list[Any]
     # Defaulted fields must follow the required ones above, so these stay last.
-    trajectory_log_actor: Optional[ray.actor.ActorHandle] = None
+    trajectory_logger_actor: Optional[ray.actor.ActorHandle] = None
     data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = None
     partition_includes_multimodal_fields: bool = False
     bootstrap_identity: Optional[BootstrapCompatibilityIdentity] = None
@@ -1305,9 +1305,9 @@ def setup_single_controller(
                     "gym_token_capture",
                 )
             )
-    trajectory_log_cfg = master_config.trajectory_log
-    if trajectory_log_cfg.enabled and trajectory_log_cfg.dir is None:
-        trajectory_log_cfg.dir = os.path.abspath(
+    trajectory_logger_cfg = master_config.trajectory_logger
+    if trajectory_logger_cfg.enabled and trajectory_logger_cfg.log_dir is None:
+        trajectory_logger_cfg.log_dir = os.path.abspath(
             os.path.join(master_config.logger["log_dir"], "trajectories")
         )
 
@@ -2042,21 +2042,16 @@ def setup_single_controller(
         effort_config=_get_effort_config(cast(GRPOMasterConfig, master_config)),
     )
 
-    trajectory_log_actor = None
-    if trajectory_log_cfg.enabled:
+    trajectory_logger_actor = None
+    if trajectory_logger_cfg.enabled:
         # PyArrow is only needed when logging is enabled.
         from nemo_rl.experience.trajectory_logger_actor import (
-            create_trajectory_log_actor,
+            create_trajectory_logger_actor,
         )
 
-        assert trajectory_log_cfg.dir is not None
-        trajectory_log_actor = create_trajectory_log_actor(
-            dp_config,
-            root_dir=trajectory_log_cfg.dir,
-            policy_logprobs_required=not (
-                master_config.loss_fn.force_on_policy_ratio
-                and algo_cfg.seq_logprob_error_threshold is None
-            ),
+        assert trajectory_logger_cfg.log_dir is not None
+        trajectory_logger_actor = create_trajectory_logger_actor(
+            dp_config, trajectory_logger_cfg.log_dir
         )
 
     # Print setup timing metrics
@@ -2087,7 +2082,7 @@ def setup_single_controller(
         bootstrap_identity=bootstrap_identity,
         rollout_checkpoint_load_metrics=rollout_checkpoint_load_metrics,
         finalizer_actors=finalizer_actors,
-        trajectory_log_actor=trajectory_log_actor,
+        trajectory_logger_actor=trajectory_logger_actor,
         fleet_monitor=fleet_monitor,
         generation_router=generation_router,
         teacher_worker_groups=teacher_worker_groups,

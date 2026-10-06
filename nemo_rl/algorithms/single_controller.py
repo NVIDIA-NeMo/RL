@@ -465,8 +465,8 @@ class SingleControllerActor:
         # when Ray deserializes rollout_manager and tq_buffer separately.
         self._rollout_manager._tq_buffer = self._buffer
         self._rollout_recovery_ledger = self._rollout_manager.recovery_ledger
-        self._trajectory_log = actor_args.trajectory_log_actor
-        self._trajectory_log_refs: list[ray.ObjectRef] = []
+        self._trajectory_logger = actor_args.trajectory_logger_actor
+        self._trajectory_logger_refs: list[ray.ObjectRef] = []
 
         # Direct access, deliberately. A getattr default here reads as defensive but
         # buys a silent failure mode: rename or drop the field and
@@ -736,9 +736,9 @@ class SingleControllerActor:
             ):
                 result = await self._run_pumps()
         finally:
-            if self._trajectory_log is not None:
+            if self._trajectory_logger is not None:
                 try:
-                    ray.kill(self._trajectory_log, no_restart=True)
+                    ray.kill(self._trajectory_logger, no_restart=True)
                 except ray.exceptions.RayError as error:
                     log.warning("trajectory logger termination failed: %s", error)
             # Outside the span so the job span is flushed too, and off the
@@ -2937,6 +2937,9 @@ class SingleControllerActor:
                                 await asyncio.to_thread(
                                     self._trainer.get_logprobs_from_meta, train_meta
                                 )
+                                train_meta = train_meta.with_fields(
+                                    [self._advantage_cfg.policy_logprobs_field]
+                                )
                             if self._reference_logprobs_required:
                                 await asyncio.to_thread(
                                     self._trainer.get_reference_policy_logprobs_from_meta,
@@ -3186,12 +3189,12 @@ class SingleControllerActor:
                     step_metrics.update(aggregate_step_metrics(policy_result))
                 if value_result is not None:
                     step_metrics.update(_compute_critic_metrics(value_result))
-                if self._logs_trajectory_step(self._train_steps + 1):
-                    assert self._trajectory_log is not None
+                if self._should_log_trajectories(self._train_steps + 1):
+                    assert self._trajectory_logger is not None
                     with self._timer.time("trajectory_log_wait_time", should_log=False):
-                        await asyncio.gather(*self._trajectory_log_refs)
-                        self._trajectory_log_refs.clear()
-                        await self._trajectory_log.commit_step.remote(
+                        await asyncio.gather(*self._trajectory_logger_refs)
+                        self._trajectory_logger_refs.clear()
+                        await self._trajectory_logger.commit_step.remote(
                             self._train_steps + 1
                         )
                 async with self._data_plane_checkpoint_barrier.mutation(
@@ -5177,9 +5180,9 @@ class SingleControllerActor:
         assert result is not None
         return result
 
-    def _logs_trajectory_step(self, step: int) -> bool:
-        period = self._master_config.trajectory_log.log_period
-        return self._trajectory_log is not None and (step == 1 or step % period == 0)
+    def _should_log_trajectories(self, step: int) -> bool:
+        period = self._master_config.trajectory_logger.log_period
+        return self._trajectory_logger is not None and (step == 1 or step % period == 0)
 
     async def _advantage_stage(
         self,
@@ -5399,10 +5402,10 @@ class SingleControllerActor:
                 fields=fields_for_put(meta, fields_to_put),
             )
         meta = meta.with_fields(list(fields_to_put))
-        if self._logs_trajectory_step(self._train_steps + 1):
-            assert self._trajectory_log is not None
-            self._trajectory_log_refs.append(
-                self._trajectory_log.record.remote(
+        if self._should_log_trajectories(self._train_steps + 1):
+            assert self._trajectory_logger is not None
+            self._trajectory_logger_refs.append(
+                self._trajectory_logger.record.remote(
                     meta,
                     step=self._train_steps + 1,
                     chunk_index=trajectory_chunk_index,
