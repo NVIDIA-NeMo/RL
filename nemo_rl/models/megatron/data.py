@@ -36,7 +36,8 @@ from nemo_rl.data.megatron_sft_packed import (
     is_direct_packed_row,
 )
 from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS, PackedTensor
-from nemo_rl.data_plane.schema import OPD_FULL_FIELDS
+from nemo_rl.data_plane.codec import pad_batch
+from nemo_rl.data_plane.schema import MICROBATCH_PADDED_FIELDS, OPD_FULL_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
 from nemo_rl.models.megatron.alignment import get_fp8_token_alignment
@@ -251,6 +252,8 @@ def make_processed_microbatch_iterator(
     pack_sequences = cfg["sequence_packing"]["enabled"]
 
     for data_dict in raw_iterator:
+        pad_batch(data_dict, MICROBATCH_PADDED_FIELDS, data_dict["input_ids"].shape[1])
+
         direct_packed_metadata = None
         if is_direct_packed_row(data_dict):
             direct_packed_metadata = _validate_direct_packed_microbatch(
@@ -2068,7 +2071,7 @@ def get_and_validate_seqlen(data: BatchedDataDict[Any]):
     for k, v in data.items():
         if k in PACKED_MULTIMODAL_FIELDS or k in OPD_FULL_FIELDS:
             continue
-        if torch.is_tensor(v) and len(v.shape) > 1:
+        if torch.is_tensor(v) and not v.is_nested and len(v.shape) > 1:
             assert v.shape[sequence_dim] == seq_dim_size, (
                 f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape} for key {k}"
             )

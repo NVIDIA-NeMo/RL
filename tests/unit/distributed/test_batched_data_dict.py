@@ -1496,3 +1496,30 @@ def test_truncate_tensors_narrows_opd_full_payloads_but_never_widens_them():
     assert batch[OPD_FULL_LOGITS_FIELD].shape == (2, 3, 5)
     assert torch.equal(batch[OPD_FULL_LOGITS_FIELD], logits_before)
     assert batch[OPD_FULL_TEACHER_INDEX_FIELD].shape == (2,)
+
+
+def test_nested_rows_slice_select_and_truncate():
+    rows = [torch.arange(n) for n in (2, 5, 1, 3)]
+    batch = BatchedDataDict(
+        {
+            "routes": torch.nested.as_nested_tensor(rows, layout=torch.jagged),
+            "input_ids": torch.zeros(4, 6, dtype=torch.long),
+        }
+    )
+
+    sliced = batch.slice(1, 3)
+    assert [r.tolist() for r in sliced["routes"].unbind()] == [
+        rows[1].tolist(),
+        rows[2].tolist(),
+    ]
+    selected = batch.select_indices([3, 0])
+    assert [r.tolist() for r in selected["routes"].unbind()] == [
+        rows[3].tolist(),
+        rows[0].tolist(),
+    ]
+    sliced.truncate_tensors(dim=1, truncated_len=4)
+    assert sliced["input_ids"].shape == (2, 4)
+    assert [r.tolist() for r in sliced["routes"].unbind()] == [
+        rows[1].tolist(),
+        rows[2].tolist(),
+    ]
