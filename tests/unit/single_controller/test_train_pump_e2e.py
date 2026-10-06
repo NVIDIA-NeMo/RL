@@ -39,6 +39,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.schema import GROUP_ID_TAG
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.policy.tq_policy import TQPolicy
@@ -114,7 +115,10 @@ def _populate_group(
         },
         batch_size=(group_size,),
     )
-    tags = [{"weight_version": int(weight_version)} for _ in range(group_size)]
+    tags = [
+        {"weight_version": int(weight_version), GROUP_ID_TAG: group_uuid}
+        for _ in range(group_size)
+    ]
     dp_client.put_samples(
         sample_ids=sample_ids,
         partition_id=_PARTITION_ID,
@@ -385,6 +389,7 @@ def test_train_pump_drives_mcore_training_step(
             save_state=_initial_grpo_save_state(),
             last_checkpoint_path=None,
             finalizer_actors=[],
+            advantage_actors=[],
         )
         ctrl = _RecordingSingleControllerActor.remote(
             metric_log_handle=log,

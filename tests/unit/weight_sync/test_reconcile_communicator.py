@@ -154,8 +154,8 @@ def _rebuildable(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_siz
     refit_info_pushes = []
     generation.prepare_refit_info = lambda info: refit_info_pushes.append(info)
     generation.refit_info_pushes = refit_info_pushes
-    generation.rebuild_collective = (
-        lambda membership, ip, port: vllm_generation.VllmGeneration.rebuild_collective(
+    generation.rebuild_collective = lambda membership, ip, port: (
+        vllm_generation.VllmGeneration.rebuild_collective(
             generation, membership, ip, port
         )
     )
@@ -170,12 +170,7 @@ def _rebuildable(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_siz
             refit_payload_modes.append(refit_payload_mode) or {"model.weight": object()}
         ),
         refit_payload_modes=refit_payload_modes,
-        init_collective=lambda ip,
-        port,
-        world_size,
-        *,
-        train_world_size,
-        nccl_peer=None: (
+        init_collective=lambda ip, port, world_size, *, train_world_size, nccl_peer=None: (
             policy_calls.append(
                 {
                     "ip": ip,

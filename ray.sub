@@ -189,12 +189,15 @@ RAY_LOG_SYNC_FREQUENCY=${RAY_LOG_SYNC_FREQUENCY:-}
 # Unset UV_CACHE_DIR to avoid local cache directory interferring with the container cache
 unset UV_CACHE_DIR
 
+# The container's uv cache (UV_CACHE_DIR in docker/Dockerfile). Images built before the cache
+# moved out of /root ignore this mount and keep using their own /root/.cache/uv.
+CONTAINER_UV_CACHE_DIR=${CONTAINER_UV_CACHE_DIR:-/opt/nemo_rl_cache/uv}
 if [[ -n "${UV_CACHE_DIR_OVERRIDE:-}" ]]; then
   mkdir -p "$UV_CACHE_DIR_OVERRIDE"
   if [[ -n $MOUNTS ]]; then
-    MOUNTS+=",$UV_CACHE_DIR_OVERRIDE:/root/.cache/uv"
+    MOUNTS+=",$UV_CACHE_DIR_OVERRIDE:$CONTAINER_UV_CACHE_DIR"
   else
-    MOUNTS="$UV_CACHE_DIR_OVERRIDE:/root/.cache/uv"
+    MOUNTS="$UV_CACHE_DIR_OVERRIDE:$CONTAINER_UV_CACHE_DIR"
   fi
 fi
 
