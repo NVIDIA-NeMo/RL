@@ -102,6 +102,24 @@ def test_projected_soft_ce_rejects_invalid_inputs(
         projected_streaming_vocab_parallel_soft_ce(**inputs)
 
 
+@pytest.mark.parametrize("token_chunk_size", [1, 2])
+@pytest.mark.parametrize("invalid_bin", [-1, 2])
+def test_projected_soft_ce_rejects_out_of_range_bins(
+    token_chunk_size: int, invalid_bin: int
+) -> None:
+    with pytest.raises(ValueError, match=r"bin_ids must lie in \[0, 2\)"):
+        projected_streaming_vocab_parallel_soft_ce(
+            student_hidden=torch.zeros(2, 3),
+            output_weight=torch.zeros(7, 3),
+            selected_teacher_logits=torch.zeros(2, 7),
+            mask=torch.ones(2),
+            bin_ids=torch.tensor([0, invalid_bin]),
+            weights=torch.ones(2),
+            token_chunk_size=token_chunk_size,
+            tp_group=None,
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "value", "error", "message"),
     [
@@ -407,20 +425,19 @@ def test_projected_soft_ce_casts_full_head_once_per_backward() -> None:
 def test_projected_soft_ce_does_not_retain_full_context_teacher_logits(
     context_length: int,
 ) -> None:
-    """The projected seam accepts and saves only requested teacher rows."""
+    """The DFlash adapter must not retain the full-context teacher storage."""
     generator = torch.Generator().manual_seed(86420)
-    num_tokens, hidden_size, vocab_size = 5, 3, 17
+    num_tokens, hidden_size, vocab_size = 6, 3, 17
     full_teacher_logits = torch.randn(
+        1,
         context_length,
         vocab_size,
         generator=generator,
         dtype=torch.bfloat16,
     )
-    selected_teacher_logits = full_teacher_logits.index_select(
-        0, torch.tensor([1, 7, 42, context_length - 1, 7])
-    )
     full_teacher_storage_bytes = full_teacher_logits.untyped_storage().nbytes()
     student_hidden = torch.randn(
+        1,
         num_tokens,
         hidden_size,
         generator=generator,
@@ -439,11 +456,14 @@ def test_projected_soft_ce_does_not_retain_full_context_teacher_logits(
         return tensor
 
     with torch.autograd.graph.saved_tensors_hooks(record, lambda tensor: tensor):
-        stats = projected_streaming_vocab_parallel_soft_ce(
-            student_hidden=student_hidden,
+        stats = dflash_projected_vocab_parallel_soft_ce(
+            draft_hidden=student_hidden,
             output_weight=output_weight,
-            selected_teacher_logits=selected_teacher_logits,
-            mask=torch.ones(num_tokens),
+            teacher_logits=full_teacher_logits,
+            sample_rows=torch.zeros(1, dtype=torch.long),
+            label_positions=torch.tensor([[0, 2, 8, 43, context_length, 8]]),
+            loss_mask=torch.tensor([[False, True, True, True, True, True]]),
+            position_decay=1.0,
             token_chunk_size=2,
             tp_group=None,
         )

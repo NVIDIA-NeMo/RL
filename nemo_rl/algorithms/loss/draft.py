@@ -593,6 +593,45 @@ class _StreamingProjectedVocabParallelSoftCE(torch.autograd.Function):
         )
 
 
+def _resolve_draft_bins(
+    mask: torch.Tensor,
+    bin_ids: torch.Tensor | None,
+    weights: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    if weights is None:
+        weights = torch.ones(1, dtype=torch.float32, device=mask.device)
+    elif weights.ndim != 1 or weights.shape[0] < 1:
+        raise ValueError(f"weights must be a nonempty vector, got {weights.shape}.")
+    num_bins = weights.shape[0]
+
+    if bin_ids is None:
+        if num_bins != 1:
+            raise ValueError("bin_ids is required when weights contains multiple bins.")
+        bin_ids = torch.zeros_like(mask, dtype=torch.long)
+    else:
+        if bin_ids.shape != mask.shape:
+            raise ValueError(
+                f"bin_ids must match mask, got {bin_ids.shape} and {mask.shape}."
+            )
+        if bin_ids.dtype != torch.long:
+            raise TypeError(f"bin_ids must use torch.long, got {bin_ids.dtype}.")
+        if bin_ids.device != mask.device:
+            raise ValueError(
+                f"bin_ids and mask must share a device, got {bin_ids.device} and "
+                f"{mask.device}."
+            )
+        if bin_ids.numel() > 0:
+            # Caller-supplied invalid ids otherwise fail inside a scatter operation.
+            min_bin = int(bin_ids.min())
+            max_bin = int(bin_ids.max())
+            if min_bin < 0 or max_bin >= num_bins:
+                raise ValueError(
+                    f"bin_ids must lie in [0, {num_bins}), got range "
+                    f"[{min_bin}, {max_bin}]."
+                )
+    return bin_ids, weights, num_bins
+
+
 def streaming_vocab_parallel_soft_ce(
     *,
     student_logits: torch.Tensor,
@@ -626,40 +665,7 @@ def streaming_vocab_parallel_soft_ce(
         )
     if token_chunk_size < 1:
         raise ValueError(f"token_chunk_size must be positive, got {token_chunk_size}.")
-    if weights is None:
-        weights = torch.ones(1, dtype=torch.float32, device=mask.device)
-    elif weights.ndim != 1 or weights.shape[0] < 1:
-        raise ValueError(f"weights must be a nonempty vector, got {weights.shape}.")
-    num_bins = weights.shape[0]
-
-    if bin_ids is None:
-        if num_bins != 1:
-            raise ValueError("bin_ids is required when weights contains multiple bins.")
-        bin_ids = torch.zeros_like(mask, dtype=torch.long)
-    else:
-        if bin_ids.shape != mask.shape:
-            raise ValueError(
-                f"bin_ids must match mask, got {bin_ids.shape} and {mask.shape}."
-            )
-        if bin_ids.dtype != torch.long:
-            raise TypeError(f"bin_ids must use torch.long, got {bin_ids.dtype}.")
-        if bin_ids.device != mask.device:
-            raise ValueError(
-                f"bin_ids and mask must share a device, got {bin_ids.device} and "
-                f"{mask.device}."
-            )
-        if bin_ids.numel() > 0:
-            # Out-of-range bins would otherwise surface as a device-side assert
-            # (CUDA) or RuntimeError (CPU) deep inside scatter_add_; validate
-            # caller-supplied ids here for a clear message. The internal
-            # zeros default above needs no check and pays no device sync.
-            min_bin = int(bin_ids.min())
-            max_bin = int(bin_ids.max())
-            if min_bin < 0 or max_bin >= num_bins:
-                raise ValueError(
-                    f"bin_ids must lie in [0, {num_bins}), got range "
-                    f"[{min_bin}, {max_bin}]."
-                )
+    bin_ids, weights, num_bins = _resolve_draft_bins(mask, bin_ids, weights)
 
     num_tokens = student_logits.numel() // student_logits.shape[-1]
     if num_tokens <= token_chunk_size:
@@ -784,26 +790,7 @@ def projected_streaming_vocab_parallel_soft_ce(
         )
     if token_chunk_size < 1:
         raise ValueError(f"token_chunk_size must be positive, got {token_chunk_size}.")
-    if weights is None:
-        weights = torch.ones(1, dtype=torch.float32, device=mask.device)
-    elif weights.ndim != 1 or weights.shape[0] < 1:
-        raise ValueError(f"weights must be a nonempty vector, got {weights.shape}.")
-    num_bins = weights.shape[0]
-
-    if bin_ids is None:
-        if num_bins != 1:
-            raise ValueError("bin_ids is required when weights contains multiple bins.")
-        bin_ids = torch.zeros_like(mask, dtype=torch.long)
-    elif bin_ids.shape != mask.shape:
-        raise ValueError(
-            f"bin_ids must match mask, got {bin_ids.shape} and {mask.shape}."
-        )
-    elif bin_ids.dtype != torch.long:
-        raise TypeError(f"bin_ids must use torch.long, got {bin_ids.dtype}.")
-    elif bin_ids.device != mask.device:
-        raise ValueError(
-            f"bin_ids and mask must share a device, got {bin_ids.device} and {mask.device}."
-        )
+    bin_ids, weights, num_bins = _resolve_draft_bins(mask, bin_ids, weights)
 
     num_tokens = student_hidden.numel() // student_hidden.shape[-1]
     if num_tokens <= token_chunk_size:
@@ -859,6 +846,8 @@ def dflash_projected_vocab_parallel_soft_ce(
     tp_group: torch.distributed.ProcessGroup | None,
 ) -> DraftLossStats:
     """Map DFlash block slots to the live target head and indexed teacher rows.
+
+    Called from the DFlash training path added in PR #3757.
 
     Slot 0 is the verified anchor token and is always excluded from the loss: this
     function overrides ``loss_mask[:, 0]`` to False regardless of what the caller

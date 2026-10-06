@@ -1161,7 +1161,10 @@ def export_eagle_weights_to_hf(
 def validate_dflash_export_state_dict(
     state_dict: Mapping[str, Tensor],
 ) -> None:
-    """Reject target-owned parameters from a standalone DFlash artifact."""
+    """Reject target-owned parameters from a standalone DFlash artifact.
+
+    Called from the DFlash export path added in PR #3757.
+    """
     forbidden_keys = sorted(
         key
         for key in state_dict
