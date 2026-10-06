@@ -1663,6 +1663,44 @@ def test_clipped_pg_loss_seq_mask_tis():
     assert not torch.isinf(actual_loss2), "Loss is inf — nan_to_num fix not working"
 
 
+def test_seq_mask_tis_finite_gate_is_independent_per_physical_row():
+    data, batch_size, seq_len, _ = _setup_clipped_pg_test_data(
+        batch_size=4, device="cpu"
+    )
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            reference_policy_kl_penalty=0.0,
+            use_importance_sampling_correction=True,
+            truncated_importance_sampling_type="seq-mask-tis",
+            truncated_importance_sampling_ratio_min=0.99,
+            truncated_importance_sampling_ratio=1.01,
+            force_on_policy_ratio=True,
+        )
+    )
+    data["advantages"][:, 1:] = 1.0
+    data["generation_logprobs"][:, 1:] = torch.tensor(
+        [
+            [float("nan"), 0.0, 0.0],
+            [float("-inf"), 0.0, 0.0],
+            [float("inf"), 0.0, 0.0],
+            [-torch.log(torch.tensor(2.0)), torch.log(torch.tensor(2.0)), 0.0],
+        ]
+    )
+
+    loss, metrics = loss_fn(
+        next_token_logprobs=torch.zeros((batch_size, seq_len - 1)),
+        data=data,
+        global_valid_seqs=torch.tensor(float(batch_size)),
+        global_valid_toks=torch.tensor(float(batch_size * (seq_len - 1))),
+    )
+
+    # NaN is neutral for the sequence gate, +/-inf rows are independently
+    # rejected, and the finite retained row keeps raw [2, 0.5, 1] token IS.
+    torch.testing.assert_close(loss, torch.tensor(-5.5 / 12))
+    assert metrics["is_oob_ratio"] == pytest.approx(0.5)
+    assert torch.isfinite(loss)
+
+
 def test_masked_mean_all_zeros():
     """Test masked_mean function with all zeros mask."""
     values = torch.tensor([1.0, 2.0, 3.0, 4.0])

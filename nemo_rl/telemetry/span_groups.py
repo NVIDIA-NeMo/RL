@@ -16,7 +16,51 @@
 
 from typing import ClassVar, Final
 
-from nemo.lens.groups import SpanGroup
+try:
+    from nemo.lens.groups import SpanGroup
+
+    _USES_SPAN_REGISTRY = False
+except ImportError:
+    from nemo.lens.groups import SpanRegistry
+
+    _USES_SPAN_REGISTRY = True
+
+    class SpanGroup:
+        """Compatibility surface for nemo-lens's registry-based API."""
+
+        JOB = "job"
+        STEP = "step"
+        CHECKPOINT = "checkpoint"
+        LOAD_CHECKPOINT = "load_checkpoint"
+        EVALUATE = "evaluate"
+        MODEL_INIT = "model_init"
+        FORWARD_BACKWARD = "forward_backward"
+        OPTIMIZER = "optimizer"
+
+        ALL_GROUPS: Final[frozenset[str]] = frozenset(
+            {
+                JOB,
+                STEP,
+                CHECKPOINT,
+                LOAD_CHECKPOINT,
+                EVALUATE,
+                MODEL_INIT,
+                FORWARD_BACKWARD,
+                OPTIMIZER,
+            }
+        )
+
+        @classmethod
+        def resolve(cls, spec: str) -> frozenset[str]:
+            resolved: set[str] = set()
+            for item in (part.strip().lower() for part in spec.split(",")):
+                if item in cls._PRESETS:
+                    resolved.update(cls._PRESETS[item])
+                elif item in cls.ALL_GROUPS:
+                    resolved.add(item)
+                else:
+                    raise ValueError(f"Unknown span group or preset: {item!r}")
+            return frozenset(resolved)
 
 
 class RLSpanGroup(SpanGroup):
@@ -113,3 +157,16 @@ class RLSpanGroup(SpanGroup):
         ),
         "all": ALL_GROUPS,
     }
+
+
+if _USES_SPAN_REGISTRY:
+    SpanRegistry.register(
+        "nemo_rl",
+        RLSpanGroup.ALL_GROUPS,
+        {
+            name: members
+            for name, members in RLSpanGroup._PRESETS.items()
+            if name != "all"
+        },
+        allow_override=True,
+    )

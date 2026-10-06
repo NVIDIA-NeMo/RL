@@ -256,16 +256,30 @@ def init_telemetry_driver(
     tel = getattr(master_config, "telemetry", None)
     if tel is not None:
         _config_to_env(tel)
+    if not telemetry_enabled_in_env():
+        _TELEMETRY_INITIALISED = True
+        return None
 
-    from nemo.lens import NemoLensConfig, registered_strategies, setup_telemetry
+    from nemo.lens import NemoLensConfig, setup_telemetry
+
+    try:
+        from nemo.lens import registered_strategies
+    except ImportError:
+        registered_strategies = None
 
     from nemo_rl.telemetry.span_groups import RLSpanGroup
 
-    config = NemoLensConfig.from_env(
-        prefix=_OTEL_PREFIX,
-        fallback_prefix=_OTEL_FALLBACK_PREFIX,
-        span_group_cls=RLSpanGroup,
-    )
+    if registered_strategies is None:
+        config = NemoLensConfig.from_env(
+            prefix=_OTEL_PREFIX,
+            fallback_prefix=_OTEL_FALLBACK_PREFIX,
+        )
+    else:
+        config = NemoLensConfig.from_env(
+            prefix=_OTEL_PREFIX,
+            fallback_prefix=_OTEL_FALLBACK_PREFIX,
+            span_group_cls=RLSpanGroup,
+        )
     if not config.enabled:
         _TELEMETRY_INITIALISED = True
         return None
@@ -289,7 +303,10 @@ def init_telemetry_driver(
     # what would otherwise reject a misspelled strategy. Validate it here so a
     # typo fails on the driver, where the user sees it, instead of degrading to
     # a warning inside every worker.
-    if config.export_strategy not in registered_strategies():
+    if (
+        registered_strategies is not None
+        and config.export_strategy not in registered_strategies()
+    ):
         raise ValueError(
             f"Unknown telemetry.export_strategy {config.export_strategy!r}. "
             f"Registered strategies: {registered_strategies()}."
@@ -306,13 +323,19 @@ def init_telemetry_driver(
     # from every span and metric for the whole run.
     resource_attrs = _build_resource_attributes(master_config, algorithm)
 
-    handle = setup_telemetry(
-        config,
-        rank=0,
-        world_size=1,
-        resource_attributes=resource_attrs,
-        export_strategy=_unrank(config),
-    )
+    if registered_strategies is None:
+        handle = setup_telemetry(
+            config,
+            resource_attributes=resource_attrs,
+        )
+    else:
+        handle = setup_telemetry(
+            config,
+            rank=0,
+            world_size=1,
+            resource_attributes=resource_attrs,
+            export_strategy=_unrank(config),
+        )
     # Only now, past everything that can raise: setting the guard earlier would
     # turn a retry after a failed setup into a silent None instead of the same
     # error. Lens leaves its own guard clear on that path, so a retry is safe.
@@ -413,6 +436,11 @@ def init_telemetry_worker(
     try:
         from nemo.lens import NemoLensConfig, setup_telemetry
 
+        try:
+            from nemo.lens import SpanRegistry
+        except ImportError:
+            SpanRegistry = None
+
         from nemo_rl.telemetry.span_groups import RLSpanGroup
 
         if rank is None:
@@ -420,22 +448,34 @@ def init_telemetry_worker(
         if world_size is None:
             world_size = int(os.environ.get("WORLD_SIZE", "1"))
 
-        config = NemoLensConfig.from_env(
-            prefix=_OTEL_PREFIX,
-            fallback_prefix=_OTEL_FALLBACK_PREFIX,
-            span_group_cls=RLSpanGroup,
-        )
+        if SpanRegistry is not None:
+            config = NemoLensConfig.from_env(
+                prefix=_OTEL_PREFIX,
+                fallback_prefix=_OTEL_FALLBACK_PREFIX,
+            )
+        else:
+            config = NemoLensConfig.from_env(
+                prefix=_OTEL_PREFIX,
+                fallback_prefix=_OTEL_FALLBACK_PREFIX,
+                span_group_cls=RLSpanGroup,
+            )
         if not config.enabled:
             return None
 
-        handle = setup_telemetry(
-            config,
-            rank=rank,
-            world_size=world_size,
-            resource_attributes=_worker_resource_attributes(resource_attributes),
-            # None leaves lens to resolve config.export_strategy as usual.
-            export_strategy=_unrank(config) if always_export else None,
-        )
+        if SpanRegistry is not None:
+            handle = setup_telemetry(
+                config,
+                resource_attributes=_worker_resource_attributes(resource_attributes),
+            )
+        else:
+            handle = setup_telemetry(
+                config,
+                rank=rank,
+                world_size=world_size,
+                resource_attributes=_worker_resource_attributes(resource_attributes),
+                # None leaves lens to resolve config.export_strategy as usual.
+                export_strategy=_unrank(config) if always_export else None,
+            )
         logger.info(
             "nemo-lens worker telemetry initialised (group=%s, rank=%s/%s, exporting=%s)",
             os.environ.get(_WORKER_GROUP_ENV, "?"),

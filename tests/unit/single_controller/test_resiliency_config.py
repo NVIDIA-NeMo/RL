@@ -26,6 +26,7 @@ from typing import get_args
 import pytest
 from pydantic import ValidationError
 
+from nemo_rl.algorithms.advantage_estimator import AdvEstimatorConfig
 from nemo_rl.algorithms.async_utils.staleness_sampler import SamplerConfig
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
@@ -89,14 +90,14 @@ class TestDefaultsAreInert:
         "bad,reason",
         [
             (None, None),
+            ("checkpoint", None),
+            ("checkpoint_without_data_plane", "save_data_plane=true"),
             ("lookahead", "zero lookahead"),
             ("sampler", "zero lookahead"),
             ("gbs", "must equal policy.train_global_batch_size"),
-            ("checkpoint", "checkpoint/resume"),
             ("rollout_checkpoint", "CC rollout checkpoint/resume"),
             ("dynamic", "use_dynamic_sampling not supported"),
             ("sequence_loss", "token-level GRPO"),
-            ("packing", "fixed-batch"),
         ],
     )
     def test_cc_startup_contract(self, bad, reason):
@@ -104,7 +105,11 @@ class TestDefaultsAreInert:
             sampler={"name": "in_order", "max_lookahead_versions": 0}
         )
         config.token_capture = TokenCaptureConfig(enabled=True, context_compaction=True)
-        config.async_rl.rollout_failure.min_step_batch_fraction = 1
+        failure = config.async_rl.rollout_failure
+        failure.min_step_batch_fraction = 1
+        failure.max_infra_attempts_per_prompt = 1
+        failure.max_data_attempts_per_prompt = 1
+        failure.nemo_gym.max_row_attempts = 1
         config.policy.update(
             megatron_cfg={"enabled": True},
             sequence_packing={"enabled": False},
@@ -127,18 +132,115 @@ class TestDefaultsAreInert:
             config.policy["train_global_batch_size"] -= 1
         elif bad == "checkpoint":
             config.checkpointing["enabled"] = True
+            config.checkpointing["save_data_plane"] = True
+        elif bad == "checkpoint_without_data_plane":
+            config.checkpointing["enabled"] = True
         elif bad == "rollout_checkpoint":
             config.rollout_checkpointing.snapshot_attempt_interval_s = 60
         elif bad == "dynamic":
             config.grpo.use_dynamic_sampling = True
         elif bad == "sequence_loss":
             config.loss_fn.token_level_loss = False
-        elif bad == "packing":
-            config.policy["sequence_packing"]["enabled"] = True
         if reason is None:
             validate_single_controller_config(config)
         else:
             with pytest.raises((ValueError, NotImplementedError), match=reason):
+                validate_single_controller_config(config)
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            None,
+            "sampler",
+            "age",
+            "freshest",
+            "streaming",
+            "staged",
+            "staged_streaming",
+            "probe_without_staging",
+            "ratio",
+            "tis",
+            "population",
+            "infra_retry",
+            "data_retry",
+            "row_retry",
+        ],
+    )
+    def test_cc_molt_objective_and_windowed_sampler_contract(self, bad):
+        config = _master_config(
+            sampler={
+                "name": "windowed",
+                "max_staleness_versions": 1,
+                "sample_freshest_first": False,
+            },
+            max_buffered_rollouts=16,
+        )
+        config.token_capture = TokenCaptureConfig(enabled=True, context_compaction=True)
+        failure = config.async_rl.rollout_failure
+        failure.min_step_batch_fraction = 1
+        failure.max_infra_attempts_per_prompt = 1
+        failure.max_data_attempts_per_prompt = 1
+        failure.nemo_gym.max_row_attempts = 1
+        config.grpo.adv_estimator = AdvEstimatorConfig(name="reinforce_baseline")
+        config.grpo.baseline_population = "all_owners"
+        config.loss_fn = ClippedPGLossConfig(
+            reference_policy_kl_penalty=0,
+            token_level_loss=True,
+            sequence_level_importance_ratios=False,
+            use_importance_sampling_correction=True,
+            truncated_importance_sampling_type="seq-mask-tis",
+            truncated_importance_sampling_ratio_min=0.99,
+            truncated_importance_sampling_ratio=1.01,
+            force_on_policy_ratio=True,
+        )
+        config.policy.update(
+            megatron_cfg={"enabled": True},
+            sequence_packing={"enabled": True},
+            dynamic_batching={"enabled": False},
+            train_micro_batch_size=1,
+            logprob_batch_size=1,
+            generation={
+                "backend": "vllm",
+                "colocated": {"enabled": False},
+                "vllm_cfg": {"async_engine": True, "expose_http_server": True},
+            },
+        )
+
+        if bad == "sampler":
+            config.async_rl.sampler = AsyncRLConfig(
+                sampler={"name": "in_order", "max_lookahead_versions": 0}
+            ).sampler
+        elif bad == "age":
+            config.async_rl.sampler.max_staleness_versions = 2
+        elif bad == "freshest":
+            config.async_rl.sampler.sample_freshest_first = True
+        elif bad == "streaming":
+            config.async_rl.min_groups_for_streaming_train = 4
+        elif bad == "staged":
+            config.async_rl.stage_full_advantage_window = True
+            config.async_rl.staged_policy_probe_interval_s = 1
+        elif bad == "staged_streaming":
+            config.async_rl.min_groups_for_streaming_train = 4
+            config.async_rl.stage_full_advantage_window = True
+        elif bad == "probe_without_staging":
+            config.async_rl.staged_policy_probe_interval_s = 1
+        elif bad == "ratio":
+            config.loss_fn.force_on_policy_ratio = False
+        elif bad == "tis":
+            config.loss_fn.truncated_importance_sampling_type = "tis"
+        elif bad == "population":
+            config.grpo.baseline_population = "valid_owners"
+        elif bad == "infra_retry":
+            failure.max_infra_attempts_per_prompt = 2
+        elif bad == "data_retry":
+            failure.max_data_attempts_per_prompt = 2
+        elif bad == "row_retry":
+            failure.nemo_gym.max_row_attempts = 2
+
+        if bad in (None, "staged"):
+            validate_single_controller_config(config)
+        else:
+            with pytest.raises(ValueError, match="CC"):
                 validate_single_controller_config(config)
 
     @pytest.mark.parametrize("logprobs,expected", [(False, 6), (True, 12)])
@@ -155,13 +257,29 @@ class TestDefaultsAreInert:
             == expected
         )
 
+    def test_cc_sequence_packing_accepts_variable_rows_only_on_dp1(self):
+        policy = {
+            "megatron_cfg": {"enabled": True, "context_parallel_size": 8},
+            "sequence_packing": {"enabled": True},
+            "dynamic_batching": {"enabled": False},
+            "train_micro_batch_size": 1,
+            "logprob_batch_size": 1,
+        }
+
+        assert cc_execution_row_multiple(policy, dp_size=1, logprobs_required=True) == 1
+        with pytest.raises(ValueError, match="data parallel size 1"):
+            cc_execution_row_multiple(policy, dp_size=2, logprobs_required=True)
+
     @pytest.mark.parametrize(
-        "bad", ["packing", "dynamic", "vpp", "vpp_one", "backend", "zero", "bool"]
+        "bad", ["dynamic", "vpp", "vpp_one", "backend", "zero", "bool", "cp"]
     )
     def test_cc_padding_rejects_unqualified_layouts(self, bad):
         policy = {
-            "megatron_cfg": {"enabled": True},
-            "sequence_packing": {"enabled": bad == "packing"},
+            "megatron_cfg": {
+                "enabled": True,
+                "context_parallel_size": 2 if bad == "cp" else 1,
+            },
+            "sequence_packing": {"enabled": False},
             "dynamic_batching": {"enabled": bad == "dynamic"},
             "train_micro_batch_size": 1,
             "logprob_batch_size": 1,

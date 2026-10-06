@@ -14,11 +14,53 @@
 
 import torch
 
-from nemo_rl.algorithms.advantage_estimator import OPDAdvantageEstimator
+from nemo_rl.algorithms.advantage_estimator import (
+    AdvEstimatorConfig,
+    OPDAdvantageEstimator,
+    ReinforceBaselineAdvantageEstimator,
+)
+from nemo_rl.algorithms.loss import ClippedPGLossConfig
 
 
 def _make_estimator():
     return OPDAdvantageEstimator({"name": "opd"}, {})
+
+
+def _make_reinforce_baseline_estimator():
+    return ReinforceBaselineAdvantageEstimator(
+        AdvEstimatorConfig(name="reinforce_baseline"), ClippedPGLossConfig()
+    )
+
+
+def test_reinforce_baseline_uses_full_group_mean_not_leave_one_out():
+    estimator = _make_reinforce_baseline_estimator()
+    prompt_ids = torch.tensor([[0], [0], [1], [1], [1], [2]])
+    rewards = torch.tensor([0.0, 2.0, 0.0, 4.0, 8.0, 7.0])
+
+    torch.testing.assert_close(
+        estimator.compute_rollout_advantages(prompt_ids, rewards),
+        torch.tensor([-1.0, 1.0, -4.0, 0.0, 4.0, 0.0]),
+    )
+
+
+def test_reinforce_baseline_whitens_by_population_action_tokens():
+    estimator = _make_reinforce_baseline_estimator()
+    mask = torch.tensor([[1.0, 0.0, 0.0], [1.0, 1.0, 1.0]])
+
+    advantages = estimator.compute_advantage(
+        prompt_ids=torch.tensor([[5], [5]]),
+        rewards=torch.tensor([1.0, 3.0]),
+        mask=mask,
+    )
+
+    expected = torch.tensor([[-(3.0**0.5), 0.0, 0.0], [1.0 / (3.0**0.5)] * 3])
+    torch.testing.assert_close(advantages, expected)
+    torch.testing.assert_close(
+        (advantages * mask).sum() / mask.sum(), torch.tensor(0.0)
+    )
+    torch.testing.assert_close(
+        (advantages.pow(2) * mask).sum() / mask.sum(), torch.tensor(1.0)
+    )
 
 
 def test_opd_basic_positive_distill_advantage():

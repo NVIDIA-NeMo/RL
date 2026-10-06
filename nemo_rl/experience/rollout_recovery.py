@@ -30,12 +30,15 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Optional, Self, TypeAlias
 
+from nemo_rl.experience.cc_media import SegmentMedia
+from nemo_rl.experience.rollout_reassembler import ActionOutputFlags, SegmentReceipt
+
 if TYPE_CHECKING:
     from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneMutationCut
     from nemo_rl.data.interfaces import DatumSpec
 
-ROLLOUT_RECOVERY_SCHEMA_VERSION = 2
-_SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {ROLLOUT_RECOVERY_SCHEMA_VERSION}
+ROLLOUT_RECOVERY_SCHEMA_VERSION = 3
+SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = frozenset({2, 3})
 ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
 RolloutRecoveryState: TypeAlias = dict[str, Any]
 
@@ -73,7 +76,24 @@ _ATTEMPT_STATE_FIELDS = frozenset(
         "reward",
         "mask_sample",
         "staging_keys",
+        "logical_segments",
     }
+)
+_LOGICAL_SEGMENT_STATE_FIELDS = frozenset(
+    {
+        "capture_rollout_id",
+        "receipt",
+        "selected_response_ids",
+        "truncated",
+        "media",
+        "action_flags",
+    }
+)
+_SEGMENT_MEDIA_STATE_FIELDS = frozenset(
+    {"field_names", "row_tags", "occurrence_counts"}
+)
+_ACTION_OUTPUT_FLAGS_STATE_FIELDS = frozenset(
+    {"invalid_tool_call", "malformed_thinking"}
 )
 
 
@@ -178,6 +198,7 @@ class RolloutAttemptRecord:
     reward: Optional[float] = None
     mask_sample: Optional[bool] = None
     staging_keys: list[str] = field(default_factory=list)
+    logical_segments: Optional[list[SegmentReceipt]] = None
 
     @property
     def attempt_id(self) -> str:
@@ -282,6 +303,7 @@ class SiblingSealResult:
     receipt: Optional[dict[str, Any]]
     reward: float
     mask_sample: bool
+    logical_segments: Optional[list[SegmentReceipt]] = None
 
 
 def _new_attempt() -> RolloutAttemptRecord:
@@ -307,6 +329,159 @@ def _receipt_staging_keys(receipt: Optional[dict[str, Any]]) -> list[str]:
             )
         staging_keys.append(entry["staging_key"])
     return staging_keys
+
+
+def _logical_segments_to_state(
+    logical_segments: Optional[list[SegmentReceipt]],
+) -> Optional[list[dict[str, Any]]]:
+    """Encode CC segment selections using weights-only-safe primitives."""
+    if logical_segments is None:
+        return None
+    encoded: list[dict[str, Any]] = []
+    for segment in logical_segments:
+        media = segment.media
+        action_flags = segment.action_flags
+        encoded.append(
+            {
+                "capture_rollout_id": segment.capture_rollout_id,
+                "receipt": copy.deepcopy(segment.receipt),
+                "selected_response_ids": list(segment.selected_response_ids),
+                "truncated": segment.truncated,
+                "media": (
+                    {
+                        "field_names": list(media.field_names),
+                        "row_tags": copy.deepcopy(media.row_tags),
+                        "occurrence_counts": list(media.occurrence_counts),
+                    }
+                    if media is not None
+                    else None
+                ),
+                "action_flags": (
+                    [
+                        {
+                            "invalid_tool_call": flags.invalid_tool_call,
+                            "malformed_thinking": flags.malformed_thinking,
+                        }
+                        for flags in action_flags
+                    ]
+                    if action_flags is not None
+                    else None
+                ),
+            }
+        )
+    return encoded
+
+
+def _logical_segments_from_state(
+    raw_segments: object,
+) -> Optional[list[SegmentReceipt]]:
+    """Validate and rebuild durable CC segment selections."""
+    if raw_segments is None:
+        return None
+    if not isinstance(raw_segments, list):
+        raise ValueError("logical_segments must be a list or None")
+    logical_segments: list[SegmentReceipt] = []
+    for raw_segment in raw_segments:
+        if not isinstance(raw_segment, dict):
+            raise ValueError("logical segment must be a mapping")
+        _reject_unknown_fields(
+            raw_segment,
+            expected=_LOGICAL_SEGMENT_STATE_FIELDS,
+            context="logical segment",
+        )
+        capture_rollout_id = raw_segment.get("capture_rollout_id")
+        if not isinstance(capture_rollout_id, str) or not capture_rollout_id:
+            raise ValueError("logical segment capture_rollout_id must be non-empty")
+        receipt = raw_segment.get("receipt")
+        if receipt is not None and not isinstance(receipt, dict):
+            raise ValueError("logical segment receipt must be a mapping or None")
+        selected_response_ids = raw_segment.get("selected_response_ids")
+        if not isinstance(selected_response_ids, list) or not all(
+            isinstance(response_id, str) for response_id in selected_response_ids
+        ):
+            raise ValueError(
+                "logical segment selected_response_ids must be a list of strings"
+            )
+        truncated = raw_segment.get("truncated")
+        if not isinstance(truncated, bool):
+            raise ValueError("logical segment truncated must be a bool")
+
+        raw_media = raw_segment.get("media")
+        media = None
+        if raw_media is not None:
+            if not isinstance(raw_media, dict):
+                raise ValueError("logical segment media must be a mapping or None")
+            _reject_unknown_fields(
+                raw_media,
+                expected=_SEGMENT_MEDIA_STATE_FIELDS,
+                context="logical segment media",
+            )
+            field_names = raw_media.get("field_names")
+            row_tags = raw_media.get("row_tags")
+            occurrence_counts = raw_media.get("occurrence_counts")
+            if not isinstance(field_names, list) or not all(
+                isinstance(field_name, str) for field_name in field_names
+            ):
+                raise ValueError(
+                    "logical segment media field_names must be a list of strings"
+                )
+            if not isinstance(row_tags, dict):
+                raise ValueError("logical segment media row_tags must be a mapping")
+            if not isinstance(occurrence_counts, list) or not all(
+                isinstance(count, int) and not isinstance(count, bool) and count >= 0
+                for count in occurrence_counts
+            ):
+                raise ValueError(
+                    "logical segment media occurrence_counts must contain "
+                    "non-negative integers"
+                )
+            media = SegmentMedia(
+                field_names=tuple(field_names),
+                row_tags=copy.deepcopy(row_tags),
+                occurrence_counts=tuple(occurrence_counts),
+            )
+
+        raw_action_flags = raw_segment.get("action_flags")
+        action_flags = None
+        if raw_action_flags is not None:
+            if not isinstance(raw_action_flags, list):
+                raise ValueError("logical segment action_flags must be a list or None")
+            decoded_flags: list[ActionOutputFlags] = []
+            for raw_flags in raw_action_flags:
+                if not isinstance(raw_flags, dict):
+                    raise ValueError("logical segment action flags must be a mapping")
+                _reject_unknown_fields(
+                    raw_flags,
+                    expected=_ACTION_OUTPUT_FLAGS_STATE_FIELDS,
+                    context="logical segment action flags",
+                )
+                invalid_tool_call = raw_flags.get("invalid_tool_call")
+                malformed_thinking = raw_flags.get("malformed_thinking")
+                if not isinstance(invalid_tool_call, bool) or not isinstance(
+                    malformed_thinking, bool
+                ):
+                    raise ValueError(
+                        "logical segment action flags values must be bools"
+                    )
+                decoded_flags.append(
+                    ActionOutputFlags(
+                        invalid_tool_call=invalid_tool_call,
+                        malformed_thinking=malformed_thinking,
+                    )
+                )
+            action_flags = tuple(decoded_flags)
+
+        logical_segments.append(
+            SegmentReceipt(
+                capture_rollout_id=capture_rollout_id,
+                receipt=copy.deepcopy(receipt),
+                selected_response_ids=tuple(selected_response_ids),
+                truncated=truncated,
+                media=media,
+                action_flags=action_flags,
+            )
+        )
+    return logical_segments
 
 
 class RolloutRecoveryLedger:
@@ -426,11 +601,27 @@ class RolloutRecoveryLedger:
         )
         record.runtime_prompt_payload = prompt_payload
 
-    def prepare_for_restart(self, cut: DataPlaneMutationCut) -> None:
+    def prepare_for_restart(
+        self,
+        cut: DataPlaneMutationCut,
+        *,
+        require_logical_segments: bool = False,
+    ) -> None:
         """Apply each group's persisted restore policy to interrupted attempts."""
         cut.require_live()
         self.assert_checkpoint_safe()
         for record in self._groups.values():
+            if require_logical_segments and any(
+                sibling.current_attempt.status is RolloutAttemptStatus.SEALED
+                and sibling.current_attempt.logical_segments is None
+                for sibling in record.siblings
+            ):
+                # Schema-v2 checkpoints predate durable CC segment selections.
+                # Their sealed rows cannot be reassembled safely, so discard the
+                # whole physical cohort and let inventory cleanup remove its
+                # now-unreferenced staging rows before redispatch.
+                self._abandon_entire_group(record)
+                continue
             if record.status is PromptGroupStatus.GENERATING:
                 if record.recovery_granularity is RecoveryGranularity.PROMPT_GROUP:
                     self._abandon_entire_group(record)
@@ -448,7 +639,9 @@ class RolloutRecoveryLedger:
             attempt.status = RolloutAttemptStatus.ABANDONED
             attempt.receipt = None
             attempt.reward = None
+            attempt.mask_sample = None
             attempt.staging_keys.clear()
+            attempt.logical_segments = None
         record.status = PromptGroupStatus.GENERATING
 
     def assert_checkpoint_safe(self) -> None:
@@ -578,6 +771,7 @@ class RolloutRecoveryLedger:
         receipt: Optional[dict[str, Any]],
         reward: float,
         mask_sample: bool,
+        logical_segments: Optional[list[SegmentReceipt]] = None,
     ) -> None:
         """Record one streamed sibling receipt as soon as the row arrives."""
         cut.require_live()
@@ -606,6 +800,7 @@ class RolloutRecoveryLedger:
                 and attempt.reward == float(reward)
                 and attempt.mask_sample is mask_sample
                 and attempt.staging_keys == staging_keys
+                and attempt.logical_segments == logical_segments
             ):
                 return
             raise ValueError(
@@ -623,6 +818,7 @@ class RolloutRecoveryLedger:
         attempt.reward = float(reward)
         attempt.mask_sample = mask_sample
         attempt.staging_keys = staging_keys
+        attempt.logical_segments = copy.deepcopy(logical_segments)
         attempt.status = RolloutAttemptStatus.SEALED
         if all(
             item.current_attempt.status == RolloutAttemptStatus.SEALED
@@ -692,6 +888,7 @@ class RolloutRecoveryLedger:
             attempt.reward = float(result.reward)
             attempt.mask_sample = result.mask_sample
             attempt.staging_keys = staging_keys
+            attempt.logical_segments = copy.deepcopy(result.logical_segments)
             attempt.status = RolloutAttemptStatus.SEALED
         record.status = PromptGroupStatus.READY_TO_FINALIZE
 
@@ -734,6 +931,7 @@ class RolloutRecoveryLedger:
         list[Optional[dict[str, Any]]],
         list[float],
         list[bool],
+        list[Optional[list[SegmentReceipt]]],
     ]:
         """Return sealed finalization inputs in stable sibling order."""
         record = self._require_group(group_id)
@@ -744,6 +942,7 @@ class RolloutRecoveryLedger:
         receipts: list[Optional[dict[str, Any]]] = []
         rewards: list[float] = []
         mask_sample: list[bool] = []
+        logical_segments: list[Optional[list[SegmentReceipt]]] = []
         for sibling in record.siblings:
             attempt = sibling.current_attempt
             if (
@@ -759,12 +958,14 @@ class RolloutRecoveryLedger:
             receipts.append(copy.deepcopy(attempt.receipt))
             rewards.append(attempt.reward)
             mask_sample.append(attempt.mask_sample)
+            logical_segments.append(copy.deepcopy(attempt.logical_segments))
         return (
             record.gate_rollout_ids,
             record.logical_rollout_ids,
             receipts,
             rewards,
             mask_sample,
+            logical_segments,
         )
 
     def mark_finalization_started(
@@ -867,6 +1068,9 @@ class RolloutRecoveryLedger:
                                     "reward": attempt.reward,
                                     "mask_sample": attempt.mask_sample,
                                     "staging_keys": list(attempt.staging_keys),
+                                    "logical_segments": _logical_segments_to_state(
+                                        attempt.logical_segments
+                                    ),
                                 }
                                 for attempt in sibling.attempts
                             ],
@@ -897,7 +1101,7 @@ class RolloutRecoveryLedger:
         if (
             isinstance(schema_version, bool)
             or not isinstance(schema_version, int)
-            or schema_version not in _SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS
+            or schema_version not in SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS
         ):
             raise ValueError(
                 f"Unsupported rollout-recovery schema version: {schema_version!r}"
@@ -1054,6 +1258,9 @@ class RolloutRecoveryLedger:
                 reward = attempt_state.get("reward")
                 mask_sample = attempt_state.get("mask_sample")
                 staging_keys = attempt_state.get("staging_keys")
+                logical_segments = _logical_segments_from_state(
+                    attempt_state.get("logical_segments")
+                )
                 if not isinstance(staging_keys, list) or not all(
                     isinstance(key, str) for key in staging_keys
                 ):
@@ -1084,6 +1291,7 @@ class RolloutRecoveryLedger:
                     or reward is not None
                     or mask_sample is not None
                     or staging_keys
+                    or logical_segments is not None
                 ):
                     raise ValueError("only sealed attempts may retain receipt data")
                 attempts.append(
@@ -1094,6 +1302,7 @@ class RolloutRecoveryLedger:
                         reward=float(reward) if reward is not None else None,
                         mask_sample=mask_sample,
                         staging_keys=list(staging_keys),
+                        logical_segments=logical_segments,
                     )
                 )
             siblings.append(
@@ -1251,12 +1460,12 @@ def parse_rollout_recovery_state(state: object) -> ParsedRolloutRecoveryState:
     if (
         isinstance(schema_version, bool)
         or not isinstance(schema_version, int)
-        or schema_version not in _SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS
+        or schema_version not in SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS
     ):
         raise ValueError(
             "unsupported rollout recovery schema_version="
             f"{schema_version!r}; supported versions are "
-            f"{sorted(_SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS)}"
+            f"{sorted(SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS)}"
         )
     groups = state.get("groups")
     if not isinstance(groups, list):

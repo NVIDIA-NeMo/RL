@@ -34,6 +34,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSamplerConfig,
     ReadyFirstSamplerConfig,
     SamplerConfig,
+    WindowedSamplerConfig,
     required_buffer_capacity_for_config,
 )
 from nemo_rl.algorithms.grpo import (
@@ -467,6 +468,15 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     recompute_kv_cache_after_weight_updates: bool = False
     # Min ready groups the streaming trainer waits for before dispatching a batch.
     min_groups_for_streaming_train: int = 32
+    # Claim complete prompt groups as they arrive and run a policy-logprob probe,
+    # but concatenate the entire optimizer batch before advantage calculation and
+    # training. This keeps non-colocated policy GPUs active during long rollouts
+    # without changing full-window objectives such as Molt reward whitening.
+    stage_full_advantage_window: bool = False
+    # Repeat the diagnostic policy probe on the latest staged group while no
+    # new group arrives. This prevents long environment tails from leaving the
+    # disaggregated trainer GPUs idle without changing the training objective.
+    staged_policy_probe_interval_s: Optional[PositiveFloat] = None
     # Cap on in-flight generate_and_push calls in the rollout pump.
     max_inflight_prompts: int = 32
     # Cap on unconsumed rollout groups buffered in the DataPlane (backpressure).
@@ -815,12 +825,10 @@ class MasterConfig(BaseModel, extra="allow"):
 
 
 def validate_cc_objective(grpo: GRPOConfig, loss: ClippedPGLossConfig) -> None:
-    """Keep the initial CC objective identical at startup and before fanout."""
-    if (
-        grpo.adv_estimator.name != "grpo"
-        or not loss.token_level_loss
+    """Allow only the initial CC objective or the qualified Molt objective."""
+    common_override = (
+        not loss.token_level_loss
         or loss.sequence_level_importance_ratios
-        or loss.truncated_importance_sampling_type == "seq-mask-tis"
         or loss.use_kl_in_reward
         or loss.positive_example_nll_weight != 0
         or grpo.advantage_clip_low is not None
@@ -832,31 +840,61 @@ def validate_cc_objective(grpo: GRPOConfig, loss: ClippedPGLossConfig) -> None:
         or grpo.calculate_advantages_on_gpu
         or grpo.invalid_tool_call_advantage is not None
         or grpo.malformed_thinking_advantage is not None
-    ):
+    )
+    standard_grpo = (
+        grpo.adv_estimator.name == "grpo"
+        and loss.truncated_importance_sampling_type != "seq-mask-tis"
+    )
+    molt_reinforce = (
+        grpo.adv_estimator.name == "reinforce_baseline"
+        and grpo.baseline_population == "all_owners"
+        and loss.use_importance_sampling_correction
+        and loss.truncated_importance_sampling_type == "seq-mask-tis"
+        and loss.truncated_importance_sampling_ratio_min is not None
+        and loss.truncated_importance_sampling_ratio is not None
+        and 0
+        < loss.truncated_importance_sampling_ratio_min
+        <= loss.truncated_importance_sampling_ratio
+        and loss.force_on_policy_ratio
+        and not loss.disable_ppo_ratio
+        and not loss.use_cispo
+        and not loss.use_on_policy_kl_approximation
+    )
+    if common_override or not (standard_grpo or molt_reinforce):
         raise ValueError(
-            "CC requires standard token-level GRPO without advantage overrides"
+            "CC requires either standard token-level GRPO or the qualified Molt "
+            "reinforce_baseline + token-IS + per-row seq-mask-tis objective, "
+            "without advantage/reward overrides"
         )
 
 
 def cc_execution_row_multiple(
     policy: PolicyConfig, *, dp_size: int, logprobs_required: bool
 ) -> int:
-    """Common row divisibility for the initial fixed-batch Megatron consumers.
+    """Return the physical-row padding quantum for qualified CC consumers.
 
     Policy and reference forwards share this trainer's mesh and logprob MBS.
-    Non-interleaved PP admits any positive microbatch count; interleaved PP
-    and token-budget planners require separate qualification.
+    Fixed batches need a DP/microbatch multiple. Sequence packing accepts
+    variable physical-row counts only on the currently qualified DP1 path.
     """
+    megatron_cfg = policy["megatron_cfg"]
+    sequence_packing = bool(policy["sequence_packing"]["enabled"])
     if (
-        not policy["megatron_cfg"]["enabled"]
-        or policy["sequence_packing"]["enabled"]
+        not megatron_cfg["enabled"]
         or policy["dynamic_batching"]["enabled"]
-        or policy["megatron_cfg"].get("virtual_pipeline_model_parallel_size")
-        is not None
+        or megatron_cfg.get("virtual_pipeline_model_parallel_size") is not None
     ):
         raise ValueError(
             "CC execution padding requires fixed-batch, non-interleaved Megatron"
         )
+    if sequence_packing:
+        if type(dp_size) is not int or dp_size != 1:
+            raise ValueError(
+                "CC sequence packing currently requires data parallel size 1"
+            )
+        return 1
+    if megatron_cfg.get("context_parallel_size", 1) > 1:
+        raise ValueError("CC context parallelism requires sequence packing")
     sizes = [policy["train_micro_batch_size"]]
     if logprobs_required:
         sizes.append(policy["logprob_batch_size"])
@@ -1385,6 +1423,21 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "token_capture.enabled=true; without token capture, unfinished Gym "
             "siblings have no durable receipts to recover"
         )
+    if (
+        async_config.stage_full_advantage_window
+        and not token_capture_config.context_compaction
+    ):
+        raise ValueError(
+            "async_rl.stage_full_advantage_window requires context compaction"
+        )
+    if (
+        async_config.staged_policy_probe_interval_s is not None
+        and not async_config.stage_full_advantage_window
+    ):
+        raise ValueError(
+            "CC Molt async_rl.staged_policy_probe_interval_s requires "
+            "stage_full_advantage_window=true"
+        )
     if token_capture_config.context_compaction:
         if master_config.grpo is None or not master_config.env.get(
             "should_use_nemo_gym"
@@ -1409,15 +1462,61 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             )
         if async_config.rollout_failure.min_step_batch_fraction != 1:
             raise ValueError("context compaction requires min_step_batch_fraction=1")
+        failure_config = async_config.rollout_failure
         validate_cc_objective(master_config.grpo, master_config.loss_fn)
-        if (
+        is_molt = master_config.grpo.adv_estimator.name == "reinforce_baseline"
+        if is_molt:
+            if (
+                failure_config.max_infra_attempts_per_prompt != 1
+                or failure_config.max_data_attempts_per_prompt != 1
+                or failure_config.max_skipped_prompts != 0
+                or failure_config.max_consecutive_dropped_prompts != 0
+                or failure_config.on_dropped_prompt != "shrink"
+                or failure_config.nemo_gym.max_row_attempts != 1
+            ):
+                raise ValueError(
+                    "CC Molt unfinished-segment redispatch is not supported: "
+                    "configure one infra/data/Gym-row attempt, zero drop budgets, "
+                    "and on_dropped_prompt='shrink'"
+                )
+            if (
+                not isinstance(async_config.sampler, WindowedSamplerConfig)
+                or async_config.sampler.max_staleness_versions != 1
+                or async_config.sampler.sample_freshest_first
+                or async_config.min_groups_for_streaming_train
+                != master_config.grpo.num_prompts_per_step
+                or (
+                    async_config.stage_full_advantage_window
+                    and master_config.policy["generation"]["colocated"]["enabled"]
+                )
+            ):
+                raise ValueError(
+                    "CC Molt requires windowed sampling with "
+                    "max_staleness_versions=1, sample_freshest_first=false, and "
+                    "one full prompt-group batch per advantage/optimizer window; "
+                    "full-window staging is supported only with non-colocated "
+                    "generation"
+                )
+        elif async_config.stage_full_advantage_window:
+            raise ValueError(
+                "async_rl.stage_full_advantage_window is supported only for CC Molt"
+            )
+        elif (
             not isinstance(async_config.sampler, InOrderSamplerConfig)
             or async_config.sampler.max_lookahead_versions != 0
             or async_config.sampler.warmup_lookahead_versions is not None
         ):
-            raise ValueError("CC requires the in_order sampler with zero lookahead")
-        if master_config.checkpointing["enabled"]:
-            raise ValueError("CC checkpoint/resume is not supported initially")
+            raise ValueError(
+                "standard CC requires in_order sampling with zero lookahead"
+            )
+        if master_config.checkpointing["enabled"] and not (
+            master_config.checkpointing.get("save_data_plane")
+        ):
+            raise ValueError(
+                "CC checkpoint/resume requires checkpointing.save_data_plane=true "
+                "so token-capture rows, replay ownership, and the dataloader cursor "
+                "are restored from one checkpoint cut"
+            )
         if master_config.rollout_checkpointing.snapshot_attempt_interval_s is not None:
             raise ValueError("CC rollout checkpoint/resume is not supported initially")
         if reward_penalties_enabled or opd_module.is_opd_enabled(master_config):

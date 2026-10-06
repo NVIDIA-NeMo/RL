@@ -1,0 +1,40 @@
+# Step-boundary checkpoint/resume profile for the v1-parity B8/N8/K8 recipe.
+#
+# Full checkpoints include policy weights, optimizer/scheduler state, trainer
+# counters, dataloader cursor, sampler cursor, replay metadata, and the native
+# TransferQueue snapshot. Periodic mid-turn snapshots remain disabled for CC.
+
+defaults: grpo_nemotron_omni_30ba3b_osworld_v2_cc_molt_b8k8.yaml
+
+grpo:
+  # The canonical v1 300-step schedule wraps the 1805-row (361 x 5) dataset.
+  max_num_epochs: 100000
+
+policy:
+  megatron_cfg:
+    checkpoint:
+      # Full Omni policy+optimizer checkpoints are large. Synchronous save
+      # surfaces ENOSPC/quota errors on the writing rank and only publishes
+      # step_N after every shard is durable.
+      async_save: false
+
+async_rl:
+  # One optimizer batch exactly. While its permits are held through save, the
+  # rollout pump cannot admit a next-step group, yielding a clean CC boundary.
+  max_buffered_rollouts: 8
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: ${oc.env:OSWORLD_CHECKPOINT_DIR}
+  metric_name: null
+  higher_is_better: false
+  keep_top_k: 2
+  save_period: 1
+  checkpoint_must_save_by: ${oc.env:OSWORLD_CHECKPOINT_MUST_SAVE_BY,00:03:40:00}
+  save_optimizer: true
+  save_data_plane: true
+  quiesce_rollouts_for_checkpoint: true
+
+rollout_checkpointing:
+  snapshot_attempt_interval_s: null
+  restore_mode: trainer_checkpoint

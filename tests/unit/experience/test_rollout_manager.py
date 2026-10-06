@@ -62,6 +62,7 @@ from nemo_rl.experience.rollout_manager import (
     RolloutStats,
     _nemo_gym_metric_namespace,
 )
+from nemo_rl.experience.rollout_reassembler import SegmentReceipt
 from nemo_rl.experience.rollout_recovery import (
     RecoveryGranularity,
     RolloutRecoveryLedger,
@@ -1673,9 +1674,15 @@ class _FakeCaptureBuffer(_FakeBuffer):
 
 
 def _receipt_record(
-    rollout_ids, receipts, instance_configs=None, *, loss_multiplier=1.0
+    rollout_ids,
+    receipts,
+    instance_configs=None,
+    *,
+    loss_multiplier=1.0,
+    logical_segments=None,
 ):
     instance_configs = instance_configs or [None] * len(rollout_ids)
+    logical_segments = logical_segments or [None] * len(rollout_ids)
     completions = [
         Completion(
             message_log=[],
@@ -1684,11 +1691,14 @@ def _receipt_record(
                 "ng_receipt": receipt,
                 "ng_rollout_id": rid,
                 **({"instance_config": cfg} if cfg is not None else {}),
+                **({"ng_logical_segments": segments} if segments is not None else {}),
             },
             truncated=False,
             reward=0.5,
         )
-        for rid, receipt, cfg in zip(rollout_ids, receipts, instance_configs)
+        for rid, receipt, cfg, segments in zip(
+            rollout_ids, receipts, instance_configs, logical_segments
+        )
     ]
     return PromptGroupRecord(
         prompt_idx=0,
@@ -1765,11 +1775,26 @@ def _make_capture_manager(
                 }
                 for rollout_id in selected_ids
             ]
+            logical_segments = (
+                [
+                    [
+                        SegmentReceipt(
+                            capture_rollout_id=rollout_id,
+                            receipt=receipt,
+                            selected_response_ids=("response-0",),
+                        )
+                    ]
+                    for rollout_id, receipt in zip(selected_ids, receipts)
+                ]
+                if context_compaction
+                else None
+            )
             record = _receipt_record(
                 selected_ids,
                 receipts,
                 instance_configs=selected_configs,
                 loss_multiplier=float(_sample.get("loss_multiplier", 1.0)),
+                logical_segments=logical_segments,
             )
             if on_completion is not None:
                 for generation_index, completion in zip(indices, record.completions):
@@ -2062,3 +2087,75 @@ class TestGenerateForFinalizationFlow:
         assert (
             restored._impl.seen_recovery_granularity is RecoveryGranularity.PROMPT_GROUP
         )
+
+    def test_cc_sibling_restore_reuses_durable_logical_segments(self):
+        first = _make_capture_manager(
+            _FakeCaptureBuffer(),
+            context_compaction=True,
+        )
+        prompt = {"prompt": "p", "idx": 9}
+        group_id = _with_cut(
+            first._tq_buffer,
+            lambda cut: first.reserve_prompt_group(cut, prompt, target_step=7),
+        )
+        _with_cut(
+            first._tq_buffer,
+            lambda cut: first.recovery_ledger.mark_group_dispatched(cut, group_id),
+        )
+        group = first.recovery_ledger.get_group(group_id)
+        sealed_id = group.gate_rollout_id(0)
+        sealed_receipt = {
+            "rollout_id": sealed_id,
+            "manifest": [{"staging_key": f"{sealed_id}/call"}],
+        }
+        sealed_segments = [
+            SegmentReceipt(
+                capture_rollout_id=sealed_id,
+                receipt=sealed_receipt,
+                selected_response_ids=("response-0",),
+            )
+        ]
+        _with_cut(
+            first._tq_buffer,
+            lambda cut: first.recovery_ledger.mark_sibling_sealed(
+                cut,
+                group_id,
+                generation_index=0,
+                gate_rollout_id=sealed_id,
+                receipt=sealed_receipt,
+                reward=0.5,
+                mask_sample=False,
+                logical_segments=sealed_segments,
+            ),
+        )
+
+        restored = _make_capture_manager(
+            _FakeCaptureBuffer(),
+            context_compaction=True,
+        )
+        _with_cut(
+            restored._tq_buffer,
+            lambda cut: restored.recovery_ledger.load_state_dict(
+                cut, first.recovery_ledger.state_dict()
+            ),
+        )
+        _with_cut(
+            restored._tq_buffer,
+            lambda cut: restored.recovery_ledger.prepare_for_restart(
+                cut, require_logical_segments=True
+            ),
+        )
+
+        request = _run(
+            restored.generate_for_finalization(
+                prompt,
+                target_step=7,
+                lineage_group_id=group_id,
+            )
+        )
+
+        assert request is not None
+        assert restored._impl.seen_generation_indices == [1]
+        assert request.logical_segments is not None
+        assert request.logical_segments[0] == tuple(sealed_segments)
+        assert len(request.logical_segments[1]) == 1

@@ -671,7 +671,31 @@ class RolloutReassembler:
         real_row_count = len(rows)
         if logical is not None:
             if not valid_rows:
-                raise ValueError("CC group has no verified input layout for dummy rows")
+                # No verified owner means there is no trustworthy full input/media
+                # layout to borrow for the masked logical rows. This is a known
+                # structural drop, not an ambiguous publication failure: no
+                # canonical write has happened, so clean the staged custody and let
+                # the controller source another unstamped prompt.
+                print(
+                    f"  finalize: group {group_id} dropped — no logical owner "
+                    "produced a verified input layout",
+                    flush=True,
+                )
+                self._clear_staging(staging_keys)
+                metrics["finalize/group_dropped"] = 1.0
+                metrics["finalize/execution_padding_rows"] = 0.0
+                metrics["finalize/weight_version_span"] = 0.0
+                return FinalizedGroup(
+                    meta=None,
+                    group_min_wv=fallback_weight_version,
+                    group_max_wv=fallback_weight_version,
+                    staging_keys=[],
+                    metrics=metrics,
+                    dropped=True,
+                    drop_reason="no logical owner produced a verified input layout",
+                    valid_row_count=0,
+                    total_row_count=0,
+                )
             padding_count = (-real_row_count) % execution_row_multiple
             dummy_layout = valid_rows[0]
             for ordinal in range(padding_count):
@@ -717,11 +741,16 @@ class RolloutReassembler:
             (r.max_wv for r in valid_rows if r.max_wv is not None),
             default=fallback_weight_version,
         )
+        # Multi-turn async rollouts may straddle a refit. Replay-buffer
+        # staleness is conservatively keyed by group_min_wv, while the
+        # per-token generation logprobs retain the exact sampling-policy data
+        # needed by importance sampling.
+        metrics["finalize/weight_version_span"] = float(group_max_wv - group_min_wv)
 
         _tensorize_t0 = time.perf_counter()
         # Placeholders borrow a valid sibling's prompt ids so per-prompt
-        # baselines group correctly; an all-placeholder group uses a single
-        # pad token (its rows all carry sample_mask 0 and never train).
+        # baselines group correctly. Logical all-placeholder groups were dropped
+        # above because they have no trustworthy full input/media layout.
         sibling_prompt = (
             valid_rows[0].token_ids[: valid_rows[0].prompt_len] if valid_rows else []
         ) or [self._pad_token_id]
@@ -1109,16 +1138,6 @@ class RolloutReassembler:
                     }
                 )
         prepared.staging_keys = list(dict.fromkeys(prepared.staging_keys))
-        versions = {
-            value
-            for row in prepared.rows
-            if row.valid
-            for value in (row.min_wv, row.max_wv)
-        }
-        if len(versions) > 1:
-            raise ValueError(
-                "logical capture group must use one generation weight version"
-            )
         return prepared
 
     def _build_routed_experts_tensor(

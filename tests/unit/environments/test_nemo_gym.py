@@ -1817,6 +1817,51 @@ def test_nemo_gym_postprocess_no_generation_data_raises():
     assert "['reasoning', 'function_call']" in msg
 
 
+def test_nemo_gym_postprocess_allows_token_free_validation_results():
+    class _Tokenizer:
+        def encode(self, text, add_special_tokens=False):
+            assert add_special_tokens is False
+            return [10, 11, 12] if text == "click the button" else []
+
+    nemo_gym_result = {
+        "response": {
+            "output": [
+                {"type": "reasoning", "summary": []},
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "click the button"}],
+                },
+            ]
+        },
+        "responses_create_params": {"input": [{"role": "user", "content": "hi"}]},
+    }
+
+    class _MockSelf:
+        cfg = {"allow_token_free_results": True}
+        _processor = None
+
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(), {}, nemo_gym_result, _Tokenizer()
+        )
+    )
+
+    assert [message["role"] for message in result["message_log"]] == [
+        "user",
+        "assistant",
+    ]
+    assert result["message_log"][0]["token_ids"].tolist() == []
+    assert result["message_log"][1]["token_ids"].tolist() == [10, 11, 12]
+    assert result["message_log"][1]["generation_logprobs"].tolist() == [
+        0.0,
+        0.0,
+        0.0,
+    ]
+    output_message = result["full_result"]["response"]["output"][1]
+    assert output_message["generation_str"] == "click the button"
+
+
 def test_nemo_gym_postprocess_no_generation_data_chat_template_failure():
     """If apply_chat_template itself fails while building the error message, the
     postprocess should still raise the original 'no generation data' ValueError with

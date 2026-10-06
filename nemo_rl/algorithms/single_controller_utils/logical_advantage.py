@@ -49,6 +49,22 @@ class LogicalOwnerBatch:
         """Broadcast one scalar per owner, with zero for ownerless padding."""
         return values[self.row_owner.clamp_min(0)] * (self.row_owner >= 0)
 
+    def action_token_counts(self, action_mask: torch.Tensor) -> torch.Tensor:
+        """Sum eligible action tokens over every physical segment per owner."""
+        if action_mask.ndim != 2 or action_mask.shape[0] != self.row_owner.shape[0]:
+            raise ValueError("CC action mask must be row-aligned and two-dimensional")
+        row_counts = torch.stack(
+            [row.float().sum() for row in action_mask.unbind()]
+        ).to(self.row_owner.device)
+        counts = torch.zeros(
+            len(self.representative_rows),
+            dtype=row_counts.dtype,
+            device=self.row_owner.device,
+        )
+        owned = self.row_owner >= 0
+        counts.scatter_add_(0, self.row_owner[owned], row_counts[owned])
+        return counts
+
 
 def build_logical_owner_batch(
     meta: KVBatchMeta,

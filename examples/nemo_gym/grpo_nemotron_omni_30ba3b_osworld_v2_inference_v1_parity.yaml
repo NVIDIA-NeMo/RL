@@ -1,0 +1,160 @@
+# NeMo RL v2 codebase, OSWorld inference-only benchmark matched to the
+# canonical NeMo RL v1 overfit361 evaluator.
+#
+# This deliberately uses the legacy validation runner rather than
+# SingleController: SC has no validation loop yet. Training remains on
+# SingleController + TransferQueue; this config is only the external evaluator.
+
+defaults: grpo_nemotron_omni_30ba3b_osworld_v2_cc.yaml
+
+grpo:
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 1
+  val_num_generations_per_prompt: 4
+  max_rollout_turns: 100
+  max_num_epochs: 1
+  max_num_steps: 0
+  val_period: 0
+  val_at_start: true
+  val_at_end: false
+  max_val_samples: null
+  async_grpo:
+    enabled: false
+
+checkpointing:
+  enabled: false
+  metric_name: null
+
+policy:
+  train_global_batch_size: 2
+  max_total_sequence_length: 49152
+  make_sequence_length_divisible_by: 32
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: 49152
+    logprob_mb_tokens: 49152
+    algorithm: modified_first_fit_decreasing
+    microbatch_order: largest_first
+    sequence_length_round: 32
+  megatron_cfg:
+    tensor_model_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 8
+    pipeline_model_parallel_size: 1
+    virtual_pipeline_model_parallel_size: null
+    context_parallel_size: 8
+    scheduler:
+      # The policy worker is still constructed for an eval-only run. Keep the
+      # one-step scheduler sentinel used by the canonical v1 evaluator.
+      lr_decay_iters: 1
+  generation:
+    max_new_tokens: 16384
+    temperature: 0.6
+    top_p: 1.0
+    top_k: null
+    val_temperature: 0.6
+    val_top_p: 1.0
+    val_top_k: null
+    vllm_cfg:
+      tensor_parallel_size: 2
+      pipeline_parallel_size: 1
+      expert_parallel_size: 2
+      gpu_memory_utilization: 0.8
+      max_model_len: 49152
+      enable_prefix_caching: true
+      logprobs_mode: processed_logprobs
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: qwen3_coder
+        reasoning_parser: nano_v3
+        chat_template_content_format: string
+        chat_template: ${oc.env:NANO_OMNI_CHAT_TEMPLATE}
+        default_chat_template_kwargs:
+          enable_thinking: true
+          truncate_history_thinking: false
+    vllm_kwargs:
+      limit_mm_per_prompt: {image: 20}
+      mm_processor_cache_gb: 0
+      max_num_batched_tokens: 4096
+      mamba_ssm_cache_dtype: float32
+      enable_chunked_prefill: true
+    colocated:
+      enabled: true
+      resources:
+        gpus_per_node: 8
+        num_nodes: 1
+
+data:
+  max_input_seq_length: 49152
+  shuffle: false
+  train:
+    data_path: ${oc.env:OSWORLD_GRPO_VAL_DATA}
+  validation:
+    data_path: ${oc.env:OSWORLD_GRPO_VAL_DATA}
+
+env:
+  should_log_nemo_gym_responses: true
+  nemo_gym:
+    is_trajectory_collection: false
+    num_workers: 32
+    model_endpoint_readiness_timeout_seconds: 1800
+    # Validation consumes only reward and episode-length metrics. CC semantic
+    # responses do not carry training receipts, so re-tokenize assistant text
+    # locally instead of rejecting an otherwise valid evaluated episode.
+    allow_token_free_results: true
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          # The legacy validation postprocessor still consumes complete token
+          # metadata even though this evaluator does not persist CC receipts.
+          # This matches the v1 vllm_model_for_training evaluator contract.
+          return_token_id_information: true
+    nemotron_osworld:
+      responses_api_agents:
+        nemotron_osworld:
+          token_id_capture: false
+          max_steps: 100
+          max_parallel_rollouts: 32
+          temperature: 0.6
+          top_p: 1.0
+          max_tokens: 16384
+          context_history:
+            enabled: true
+            policy:
+              type: recency
+              config:
+                images:
+                  enabled: true
+                  protect_initial_context: true
+                  keep_last_groups: 2
+            schedule:
+              type: turn_chunked_recency
+              actions_per_chunk: 100
+            guards:
+              # Token-count measurement is served by the capture endpoint.
+              # Eval does not retain token receipts, so use the same 3-to-10
+              # image sawtooth and let vLLM enforce its 49K hard limit.
+              max_total_tokens: null
+              reserved_generation_tokens: 0
+              max_active_images: 10
+            max_response_retries: 0
+
+# The inference-only legacy runner does not use SC token receipts or TQ.
+token_capture:
+  enabled: false
+  context_compaction: false
+
+data_plane:
+  enabled: false
+
+logger:
+  log_dir: ${oc.env:OSWORLD_RESULTS_DIR,logs/osworld-v2-inference-v1-parity}
+  wandb_enabled: false
+  tensorboard_enabled: true
+  monitor_gpus: true
+  wandb:
+    name: osworld-v2-inference-v1-parity
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1

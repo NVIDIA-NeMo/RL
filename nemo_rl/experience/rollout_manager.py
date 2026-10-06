@@ -2204,9 +2204,6 @@ class RolloutManager:
             rollout_ids=list(rollout_ids),
         )
         pending_group_results: dict[int, SiblingSealResult] = {}
-        # CC does not retry or checkpoint; keep segment metadata in this request
-        # while the existing ledger tracks sibling completion and publication.
-        cc_segments = {}
 
         async def _record_streamed_completion(
             generation_index: int, completion: Completion
@@ -2219,16 +2216,11 @@ class RolloutManager:
             if "ng_receipt" not in env_extras:
                 raise ValueError("token-capture completion must contain ng_receipt")
             receipt = env_extras["ng_receipt"]
+            logical_segments = None
             if self._context_compaction:
-                segments = env_extras.get("ng_logical_segments")
-                if not segments:
+                logical_segments = env_extras.get("ng_logical_segments")
+                if not logical_segments:
                     raise ValueError("CC completion must contain logical segments")
-                if (
-                    generation_index in cc_segments
-                    and cc_segments[generation_index] != segments
-                ):
-                    raise ValueError("conflicting duplicate CC completion")
-                cc_segments[generation_index] = segments
             gate_rollout_id = env_extras.get("ng_rollout_id")
             if receipt is not None and not isinstance(receipt, dict):
                 raise ValueError(
@@ -2270,6 +2262,7 @@ class RolloutManager:
                     receipt=receipt,
                     reward=completion.reward,
                     mask_sample=mask_sample,
+                    logical_segments=logical_segments,
                 )
                 previous = pending_group_results.get(generation_index)
                 if previous is not None:
@@ -2299,6 +2292,7 @@ class RolloutManager:
                     receipt=receipt,
                     reward=completion.reward,
                     mask_sample=mask_sample,
+                    logical_segments=logical_segments,
                 )
 
         try:
@@ -2330,7 +2324,25 @@ class RolloutManager:
                 receipts,
                 rewards,
                 mask_sample,
+                durable_logical_segments,
             ) = self._recovery_ledger.finalization_inputs(group_id)
+            request_logical_segments = None
+            if self._context_compaction:
+                missing_segments = [
+                    generation_index
+                    for generation_index, segments in enumerate(
+                        durable_logical_segments
+                    )
+                    if segments is None
+                ]
+                if missing_segments:
+                    raise ValueError(
+                        "CC finalization is missing durable logical segments for "
+                        f"generation indices {missing_segments}"
+                    )
+                request_logical_segments = tuple(
+                    tuple(segments or ()) for segments in durable_logical_segments
+                )
             request = ReassemblyRequest(
                 group_id=group_id,
                 rollout_ids=tuple(physical_rollout_ids),
@@ -2341,11 +2353,7 @@ class RolloutManager:
                 prompt_idx=int(recovery_group.prompt_id),
                 mask_sample=tuple(mask_sample),
                 loss_multiplier=float(input_sample.get("loss_multiplier", 1.0)),
-                logical_segments=(
-                    tuple(cc_segments[i] for i in range(len(rollout_ids)))
-                    if self._context_compaction
-                    else None
-                ),
+                logical_segments=request_logical_segments,
                 execution_row_multiple=self._execution_row_multiple,
             )
             from nemo_rl.experience.rollout_reassembler_actor import (

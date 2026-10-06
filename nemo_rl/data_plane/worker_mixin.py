@@ -65,6 +65,104 @@ if TYPE_CHECKING:
 
 FetchPolicy = Literal["auto", "independent", "leader_broadcast"]
 
+_INT16_BROADCAST_CHUNK_ELEMENTS = 64 * 1024 * 1024
+_PACKED_WIRE_BROADCAST_CHUNK_BYTES = 256 * 1024 * 1024
+
+
+def _broadcast_int16_tensor(
+    tensor: torch.Tensor,
+    *,
+    is_leader: bool,
+    src: int,
+    group: Any,
+    chunk_elements: int = _INT16_BROADCAST_CHUNK_ELEMENTS,
+) -> torch.Tensor:
+    """Broadcast int16 through NCCL without a full-size int32 staging copy."""
+    if tensor.dtype != torch.int16:
+        raise TypeError(f"expected int16 tensor, got {tensor.dtype}")
+    if chunk_elements <= 0:
+        raise ValueError(f"chunk_elements must be positive, got {chunk_elements}")
+
+    if not tensor.is_contiguous():
+        raise ValueError("int16 broadcast tensor must be contiguous")
+    flat = tensor.view(-1)
+    for start in range(0, flat.numel(), chunk_elements):
+        end = min(start + chunk_elements, flat.numel())
+        if is_leader:
+            wire = flat[start:end].to(torch.int32)
+        else:
+            wire = torch.empty(end - start, dtype=torch.int32, device=flat.device)
+        torch.distributed.broadcast(wire, src=src, group=group)
+        if not is_leader:
+            flat[start:end].copy_(wire)
+    return tensor
+
+
+def _broadcast_packed_wire(
+    source: Optional[torch.Tensor],
+    *,
+    total_elements: int,
+    dtype: torch.dtype,
+    src_device: str,
+    bcast_device: Any,
+    is_leader: bool,
+    src: int,
+    group: Any,
+    chunk_bytes: int = _PACKED_WIRE_BROADCAST_CHUNK_BYTES,
+) -> Optional[torch.Tensor]:
+    """Stream a packed column through bounded device staging buffers."""
+    if total_elements < 0:
+        raise ValueError(f"total_elements must be non-negative, got {total_elements}")
+    if chunk_bytes <= 0:
+        raise ValueError(f"chunk_bytes must be positive, got {chunk_bytes}")
+
+    destination_device = torch.device(src_device)
+    collective_device = torch.device(bcast_device)
+    element_size = torch.empty((), dtype=dtype).element_size()
+    chunk_elements = max(1, chunk_bytes // element_size)
+
+    if is_leader:
+        if source is None:
+            raise ValueError("packed-wire leader must provide a source tensor")
+        if source.numel() != total_elements:
+            raise ValueError(
+                "packed-wire source size does not match descriptor: "
+                f"{source.numel()} != {total_elements}"
+            )
+        if not source.is_contiguous():
+            raise ValueError("packed-wire source tensor must be contiguous")
+        destination = None
+    else:
+        destination = torch.empty(
+            total_elements,
+            dtype=dtype,
+            device=destination_device,
+        )
+
+    for start in range(0, total_elements, chunk_elements):
+        end = min(start + chunk_elements, total_elements)
+        if is_leader:
+            assert source is not None
+            wire = source[start:end]
+            if wire.device.type != collective_device.type:
+                wire = wire.to(collective_device)
+        else:
+            assert destination is not None
+            destination_slice = destination[start:end]
+            if destination_slice.device.type == collective_device.type:
+                wire = destination_slice
+            else:
+                wire = torch.empty(
+                    end - start,
+                    dtype=dtype,
+                    device=collective_device,
+                )
+        torch.distributed.broadcast(wire, src=src, group=group)
+        if not is_leader and wire.data_ptr() != destination_slice.data_ptr():
+            destination_slice.copy_(wire)
+
+    return destination
+
 
 def _broadcast_batched_data_dict(
     data: Optional[BatchedDataDict[Any]],
@@ -190,12 +288,19 @@ def _broadcast_batched_data_dict(
                 tensor = torch.empty(shape, dtype=dtype, device=bcast_device)
                 out[key] = tensor
             # NCCL has no int16 ("Short") type; ship as int32 and narrow back
-            # (routed_experts rides TQ as int16).
+            # (routed_experts rides TQ as int16). Broadcast in bounded chunks:
+            # a full routed-experts batch can be multiple GiB, and materializing
+            # full int16 + int32 + narrowed int16 copies OOMs long OSWorld rows.
             if tensor.dtype == torch.int16:
-                wire = tensor.to(torch.int32)
-                torch.distributed.broadcast(wire, src=src, group=group)
-                tensor = wire.to(torch.int16)
-                out[key] = tensor
+                if not tensor.is_contiguous():
+                    tensor = tensor.contiguous()
+                    out[key] = tensor
+                _broadcast_int16_tensor(
+                    tensor,
+                    is_leader=is_leader,
+                    src=src,
+                    group=group,
+                )
             else:
                 torch.distributed.broadcast(tensor, src=src, group=group)
             # Restore non-leader tensors to the leader's source device
@@ -207,22 +312,26 @@ def _broadcast_batched_data_dict(
                 out[key] = tensor.to(src_device)
         elif kind == "packed_wire":
             dtype_str, src_device, offsets, shapes, pad_to_max_shape = entry[2:]
-            if is_leader:
-                flat = leader_flat[key].to(bcast_device)
-            else:
-                dtype = getattr(torch, dtype_str.split(".")[-1])
-                flat = torch.empty(offsets[-1], dtype=dtype, device=bcast_device)
-            torch.distributed.broadcast(flat, src=src, group=group)
+            dtype = getattr(torch, dtype_str.split(".")[-1])
+            flat = _broadcast_packed_wire(
+                leader_flat.get(key),
+                total_elements=offsets[-1],
+                dtype=dtype,
+                src_device=src_device,
+                bcast_device=bcast_device,
+                is_leader=is_leader,
+                src=src,
+                group=group,
+            )
             # Drop the cached CPU concat now it has shipped: holding it to
             # the end of the loop keeps three copies of the largest column
             # live at once (segments, concat, device copy).
             leader_flat.pop(key, None)
             if not is_leader:
+                assert flat is not None
                 nested = torch.nested.nested_tensor_from_jagged(
                     flat, torch.tensor(offsets, dtype=torch.int64, device=flat.device)
                 )
-                if torch.device(src_device).type != torch.device(bcast_device).type:
-                    nested = nested.to(src_device)
                 out[key] = PackedTensor.from_wire(
                     nested, shapes, pad_to_max_shape=pad_to_max_shape
                 )

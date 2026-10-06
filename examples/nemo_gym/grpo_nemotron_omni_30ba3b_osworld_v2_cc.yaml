@@ -1,0 +1,240 @@
+# OSWorld v2 context-compaction smoke for Nemotron Omni.
+#
+# This recipe is intentionally limited to the first supported SingleController
+# envelope: one prompt, two logical generations, K=2 context compaction, no
+# lookahead, retries, validation, or checkpointing.
+
+defaults: grpo_nanov3.yaml
+
+grpo:
+  num_prompts_per_step: 1
+  num_generations_per_prompt: 2
+  val_num_generations_per_prompt: 1
+  max_rollout_turns: 1  # Gym owns the multi-step desktop episode.
+  max_num_epochs: 1
+  max_num_steps: 1
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  max_val_samples: null
+  overlong_filtering: false
+  baseline_population: all_owners
+  advantage_clip_low: null
+  advantage_clip_high: null
+  seq_logprob_error_threshold: null
+  use_dynamic_sampling: false
+  reward_shaping:
+    enabled: false
+  reward_scaling:
+    enabled: false
+  calculate_advantages_on_gpu: false
+  invalid_tool_call_advantage: null
+  malformed_thinking_advantage: null
+  async_grpo: null
+  adv_estimator:
+    name: grpo
+    normalize_rewards: true
+    use_leave_one_out_baseline: true
+
+loss_fn:
+  reference_policy_kl_penalty: 0
+  token_level_loss: true
+  sequence_level_importance_ratios: false
+  truncated_importance_sampling_type: null
+  truncated_importance_sampling_ratio: null
+  truncated_importance_sampling_ratio_min: null
+  use_importance_sampling_correction: true
+  force_on_policy_ratio: false
+  disable_ppo_ratio: false
+  use_kl_in_reward: false
+  use_cispo: false
+  positive_example_nll_weight: 0.0
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: ${oc.env:OSWORLD_RESULTS_DIR,logs/osworld-v2-cc}/checkpoints
+  metric_name: null
+
+rollout_checkpointing:
+  snapshot_attempt_interval_s: null
+
+policy:
+  model_name: ${oc.env:NANO_OMNI_MODEL_NAME}
+  is_vlm: true
+  tokenizer:
+    name: ${oc.env:NANO_OMNI_MODEL_NAME}
+    chat_template: ${oc.env:NANO_OMNI_CHAT_TEMPLATE}
+    chat_template_kwargs:
+      enable_thinking: true
+      truncate_history_thinking: false
+  train_global_batch_size: ${mul:${grpo.num_prompts_per_step},${grpo.num_generations_per_prompt}}
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: ${oc.decode:${oc.env:OSWORLD_MAX_MODEL_LEN,8192}}
+  logprob_chunk_size: null
+  make_sequence_length_divisible_by: 8
+  router_replay:
+    enabled: true
+  sequence_packing:
+    enabled: false
+  dynamic_batching:
+    enabled: false
+  megatron_cfg:
+    tensor_model_parallel_size: 8
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 8
+    pipeline_model_parallel_size: 1
+    virtual_pipeline_model_parallel_size: null
+    context_parallel_size: 1
+    sequence_parallel: true
+    activation_checkpointing: true
+    radio_force_cpe_eval_mode: true
+    clear_memory_caches_before_refit: true
+    freeze_moe_router: true
+    moe_router_enable_expert_bias: true
+    moe_router_bias_update_rate: 1e-3
+    distributed_data_parallel_config:
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+    scheduler:
+      lr_warmup_iters: 0
+  generation:
+    max_new_tokens: ${oc.decode:${oc.env:OSWORLD_MAX_NEW_TOKENS,4096}}
+    temperature: ${oc.decode:${oc.env:OSWORLD_TEMPERATURE,1.0}}
+    top_p: ${oc.decode:${oc.env:OSWORLD_TOP_P,1.0}}
+    bad_words: ["<image>", "<img>", "</img>"]
+    vllm_cfg:
+      tensor_parallel_size: 2
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: ${oc.decode:${oc.env:OSWORLD_VLLM_GPU_MEMORY_UTILIZATION,0.8}}
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: true
+      enable_prefix_caching: ${oc.decode:${oc.env:OSWORLD_VLLM_ENABLE_PREFIX_CACHING,true}}
+      skip_tokenizer_init: false
+      logprobs_mode: processed_logprobs
+      env_vars:
+        VLLM_ATTENTION_BACKEND: ${oc.env:OSWORLD_VLLM_ATTENTION_BACKEND,TRITON_ATTN}
+        VLLM_MM_ENCODER_ATTN_BACKEND: ${oc.env:OSWORLD_VLLM_MM_ENCODER_ATTN_BACKEND,TORCH_SDPA}
+        VLLM_GDN_PREFILL_BACKEND: ${oc.env:OSWORLD_VLLM_GDN_PREFILL_BACKEND,triton}
+        VLLM_USE_FLASHINFER_MOE_FP16: "0"
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: false
+        tool_parser: null
+        reasoning_parser: nano_v3
+        chat_template_content_format: string
+        chat_template: ${oc.env:NANO_OMNI_CHAT_TEMPLATE}
+        default_chat_template_kwargs:
+          enable_thinking: true
+          truncate_history_thinking: false
+    vllm_kwargs:
+      limit_mm_per_prompt: {image: 9}
+      mm_processor_cache_gb: 0
+      max_num_batched_tokens: 4096
+      mamba_ssm_cache_dtype: float32
+      enable_chunked_prefill: true
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 1
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  shuffle: false
+  use_multiple_dataloader: false
+  train:
+    data_path: ${oc.env:OSWORLD_GRPO_TRAIN_DATA}
+  validation: null
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    processor: nemo_gym_data_processor
+    repeat: 1
+
+env:
+  _override_: true
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: false
+  should_mask_flagged_samples: true
+  nemo_gym:
+    is_trajectory_collection: false
+    skip_venv_if_present: true
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model.yaml
+      - responses_api_agents/nemotron_osworld/configs/nemotron_osworld_cc.yaml
+      - resources_servers/osworld/configs/osworld.yaml
+      - resources_servers/osworld/configs/opensandbox_osworld.yaml
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          return_token_id_information: false
+    nemotron_osworld:
+      responses_api_agents:
+        nemotron_osworld:
+          max_steps: ${oc.decode:${oc.env:OSWORLD_MAX_STEPS,3}}
+          max_parallel_rollouts: ${oc.decode:${oc.env:OSWORLD_MAX_PARALLEL_ROLLOUTS,2}}
+          temperature: ${policy.generation.temperature}
+          top_p: ${policy.generation.top_p}
+          max_tokens: ${policy.generation.max_new_tokens}
+          context_history:
+            enabled: true
+            policy:
+              type: recency
+              config:
+                images:
+                  enabled: true
+                  protect_initial_context: true
+                  keep_last_groups: ${oc.decode:${oc.env:OSWORLD_CC_KEEP_LAST_IMAGE_GROUPS,1}}
+            schedule:
+              type: turn_chunked_recency
+              actions_per_chunk: 2
+            guards:
+              max_total_tokens: ${policy.max_total_sequence_length}
+              reserved_generation_tokens: ${policy.generation.max_new_tokens}
+            max_response_retries: 0
+
+token_capture:
+  enabled: true
+  context_compaction: true
+  defer_routed_experts_to_policy: false
+  num_reassembler_workers: 1
+
+data_plane:
+  enabled: true
+  impl: transfer_queue
+  backend: simple
+  claim_meta_poll_interval_s: 0.5
+  simple:
+    num_storage_units: ${mul:2,${cluster.num_nodes}}
+
+async_rl:
+  sampler:
+    name: in_order
+    max_lookahead_versions: 0
+    warmup_lookahead_versions: null
+  min_groups_for_streaming_train: 1
+  max_inflight_prompts: 1
+  max_buffered_rollouts: 1
+  rollout_failure:
+    max_infra_attempts_per_prompt: 1
+    max_data_attempts_per_prompt: 1
+    max_skipped_prompts: 0
+    max_consecutive_dropped_prompts: 0
+    min_step_batch_fraction: 1
+    on_dropped_prompt: shrink
+    nemo_gym:
+      rollout_timeout_s: null
+      max_row_attempts: 1
+
+logger:
+  log_dir: ${oc.env:OSWORLD_RESULTS_DIR,logs/osworld-v2-cc}
+  wandb_enabled: false
+  tensorboard_enabled: true
+  monitor_gpus: true
+  wandb:
+    name: osworld-v2-cc-k2-smoke
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 2

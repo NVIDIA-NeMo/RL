@@ -751,8 +751,15 @@ def _maybe_inject_megatron_train_iters(master_config: MasterConfig) -> None:
 
     # policy
     policy_config = master_config.policy
-    if policy_config.get("megatron_cfg", {}).get("enabled", False):
-        policy_config["megatron_cfg"]["train_iters"] = policy_train_iters
+    megatron_cfg = policy_config.get("megatron_cfg", {})
+    if megatron_cfg.get("enabled", False):
+        # A continuation job may raise max_num_steps from the restored step to
+        # a later stop point. Keep Megatron's complete scheduler state invariant
+        # when the recipe declares a longer, fixed decay horizon.
+        scheduler_horizon = (megatron_cfg.get("scheduler") or {}).get("lr_decay_iters")
+        if scheduler_horizon is not None:
+            policy_train_iters = max(policy_train_iters, int(scheduler_horizon))
+        megatron_cfg["train_iters"] = policy_train_iters
 
     # value
     if ppo_config is None:
@@ -1158,8 +1165,6 @@ def setup_single_controller(
     # ==========================
     checkpointer = CheckpointManager(master_config.checkpointing)
     trainer_checkpoint_path = checkpointer.get_latest_checkpoint_path()
-    if token_capture_cfg.context_compaction and trainer_checkpoint_path is not None:
-        raise ValueError("CC checkpoint/resume is not supported initially")
     loaded_state = cast(
         Optional[dict[str, Any]],
         checkpointer.load_training_info(trainer_checkpoint_path),

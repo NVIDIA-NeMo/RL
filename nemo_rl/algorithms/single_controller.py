@@ -65,7 +65,10 @@ import torch
 from ray.exceptions import RayActorError
 
 from nemo_rl.algorithms import opd as opd_module
-from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
+from nemo_rl.algorithms.advantage_estimator import (
+    GRPOAdvantageEstimator,
+    ReinforceBaselineAdvantageEstimator,
+)
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     DATA_PLANE_CHECKPOINT_DIR,
     LEGACY_REPLAY_BUFFER_FILENAME,
@@ -79,6 +82,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     TransactionalAdmissionSampler,
+    WindowedSamplerConfig,
     create_sampler,
 )
 from nemo_rl.algorithms.grpo import (
@@ -140,6 +144,7 @@ from nemo_rl.experience.rollout_manager import RolloutOutcome
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
+    SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS,
     PromptGroupPhase,
     RolloutRecoveryState,
     build_rollout_recovery_state,
@@ -760,12 +765,13 @@ class SingleControllerActor:
         expected_schema_version = metadata.get("rollout_recovery_schema_version")
         if (
             isinstance(expected_schema_version, bool)
-            or expected_schema_version != ROLLOUT_RECOVERY_SCHEMA_VERSION
+            or expected_schema_version not in SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS
         ):
             raise ValueError(
                 "native TQ checkpoint rollout recovery schema mismatch: "
                 f"checkpoint={expected_schema_version!r}, "
-                f"expected={ROLLOUT_RECOVERY_SCHEMA_VERSION}"
+                "supported="
+                f"{sorted(SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS)!r}"
             )
         expected_group_count = metadata.get("rollout_recovery_group_count")
         if (
@@ -806,7 +812,12 @@ class SingleControllerActor:
         recovery_ledger = self._rollout_manager.recovery_ledger
         async with self._data_plane_checkpoint_barrier.mutation() as cut:
             recovery_ledger.load_state_dict(cut, parsed_state.ledger_state)
-            recovery_ledger.prepare_for_restart(cut)
+            recovery_ledger.prepare_for_restart(
+                cut,
+                require_logical_segments=(
+                    self._master_config.token_capture.context_compaction
+                ),
+            )
             self._batch_shortfall = parsed_state.batch_shortfall
             canonical_state = self._buffer.metadata_state_dict(
                 saved_capacity=self._async_cfg.max_buffered_rollouts
@@ -2269,6 +2280,12 @@ class SingleControllerActor:
             self._algo_cfg.policy_training_start_step if self._is_ppo else 0
         )
         context_compaction = self._master_config.token_capture.context_compaction
+        stage_full_advantage_window = bool(
+            getattr(self._async_cfg, "stage_full_advantage_window", False)
+        )
+        staged_policy_probe_interval_s = getattr(
+            self._async_cfg, "staged_policy_probe_interval_s", None
+        )
 
         while self._train_steps < self._algo_cfg.max_num_steps:
             version_during_step = self._trainer_version
@@ -2290,6 +2307,8 @@ class SingleControllerActor:
             consumed_group_count = 0
             step_finalizer_metrics: dict[str, list[float]] = {}
             logical_owners: set[str] = set()
+            staged_window_metas: list[KVBatchMeta] = []
+            last_staged_policy_probe_at: Optional[float] = None
 
             with self._timer.time("total_step_time"):
                 # Re-read on every iteration rather than once: a prompt stamped for this
@@ -2328,9 +2347,18 @@ class SingleControllerActor:
                         max_prompt_groups = target_groups - groups_dispatched
                         if max_prompt_groups <= 0:
                             break
+                        # Full-window Molt staging keeps the configured objective floor
+                        # at B while admitting one complete prompt group for an early
+                        # policy probe. All staged groups are concatenated before
+                        # advantage/F-B below.
+                        selection_floor = (
+                            1
+                            if stage_full_advantage_window
+                            else self._async_cfg.min_groups_for_streaming_train
+                        )
                         # For a colocated engine this is max_prompt_groups, pinned inside setup.
                         min_prompt_groups = min(
-                            self._async_cfg.min_groups_for_streaming_train,
+                            selection_floor,
                             max_prompt_groups,
                         )
                         selected_group_ids: list[str] = []
@@ -2398,6 +2426,35 @@ class SingleControllerActor:
                                     f"groups with {buffered_groups} group(s) "
                                     f"remaining in the buffer"
                                 )
+                            if (
+                                stage_full_advantage_window
+                                and staged_window_metas
+                                and staged_policy_probe_interval_s is not None
+                                and last_staged_policy_probe_at is not None
+                                and time.monotonic() - last_staged_policy_probe_at
+                                >= staged_policy_probe_interval_s
+                            ):
+                                heartbeat_meta = staged_window_metas[-1]
+                                with self._timer.time(
+                                    "staged_policy_probe_heartbeat_prep"
+                                ):
+                                    await asyncio.to_thread(
+                                        self._trainer.prepare_for_lp_inference,
+                                        keep_train_buffers=False,
+                                    )
+                                with self._timer.time("staged_policy_probe_heartbeat"):
+                                    await asyncio.to_thread(
+                                        self._trainer.get_logprobs_from_meta,
+                                        heartbeat_meta,
+                                    )
+                                last_staged_policy_probe_at = time.monotonic()
+                                log.info(
+                                    "train_pump: step %d staged heartbeat probe: "
+                                    "%d/%d group(s) collected",
+                                    version_during_step,
+                                    groups_dispatched,
+                                    target_groups,
+                                )
                             await asyncio.sleep(0.005)
                             continue
 
@@ -2405,19 +2462,37 @@ class SingleControllerActor:
                         consumed_training_claim_ids.extend(selected_training_claim_ids)
                         consumed_group_count += num_groups
                         if context_compaction:
+                            min_generation_version = version_during_step
+                            if isinstance(
+                                self._async_cfg.sampler, WindowedSamplerConfig
+                            ):
+                                min_generation_version = max(
+                                    0,
+                                    version_during_step
+                                    - self._async_cfg.sampler.max_staleness_versions,
+                                )
                             if (
                                 not has_logical_owners(train_meta)
                                 or len(train_meta.tags or []) != train_meta.size
                                 or any(
                                     type(tag.get("weight_version")) is not int
-                                    or tag["weight_version"] != version_during_step
+                                    or not (
+                                        min_generation_version
+                                        <= tag["weight_version"]
+                                        <= version_during_step
+                                    )
                                     or type(tag.get("is_execution_padding")) is not bool
                                     or type(tag.get("uses_borrowed_input")) is not bool
                                     for tag in train_meta.tags or []
                                 )
                             ):
                                 raise ValueError(
-                                    "CC optimizer batch requires logical rows with padding flags, borrowed-input flags, and the current generation version"
+                                    "CC optimizer batch requires logical rows with "
+                                    "padding flags, borrowed-input flags, and a weight "
+                                    "version inside the current generation version "
+                                    f"window [{min_generation_version}, "
+                                    f"{version_during_step}]; observed "
+                                    f"{[tag.get('weight_version') for tag in train_meta.tags or []]}"
                                 )
                             if any(
                                 tag["is_execution_padding"]
@@ -2445,6 +2520,71 @@ class SingleControllerActor:
                         selected_rollout_metrics.extend(
                             train_meta.extra_info.pop(ROLLOUT_METRICS, [])
                         )
+
+                    # Molt's reward baseline and action-token whitening must see the
+                    # complete B-prompt optimizer population. Still claim ready
+                    # groups immediately and exercise the otherwise-idle policy GPUs
+                    # with a logprob probe, then concatenate every row before the
+                    # objective is evaluated. The probe is deliberately diagnostic:
+                    # force_on_policy_ratio keeps it out of the training objective.
+                    if (
+                        stage_full_advantage_window
+                        and groups_dispatched + num_groups < target_groups
+                    ):
+                        if step_open:
+                            raise RuntimeError(
+                                "full advantage-window staging cannot begin after "
+                                "gradient accumulation has started"
+                            )
+                        if groups_dispatched == 0:
+                            try:
+                                await asyncio.to_thread(self._gen.snapshot_step_metrics)
+                            except RayActorError as error:
+                                log.warning(
+                                    "Skipping generation snapshot metrics: %s", error
+                                )
+                        with self._timer.time("staged_policy_probe_prep"):
+                            await asyncio.to_thread(
+                                self._trainer.prepare_for_lp_inference,
+                                keep_train_buffers=False,
+                            )
+                        with self._timer.time("staged_policy_probe"):
+                            await asyncio.to_thread(
+                                self._trainer.get_logprobs_from_meta, train_meta
+                            )
+                        last_staged_policy_probe_at = time.monotonic()
+                        staged_window_metas.append(train_meta)
+
+                        curr_min_sample_version = min(
+                            t["weight_version"]
+                            for t in train_meta.tags  # type: ignore[union-attr]
+                        )
+                        min_sample_version = (
+                            min(min_sample_version, curr_min_sample_version)
+                            if min_sample_version is not None
+                            else curr_min_sample_version
+                        )
+                        groups_dispatched += num_groups
+                        chunks_dispatched += 1
+                        log.info(
+                            "train_pump: step %d staged chunk %d: %d group(s), "
+                            "%d/%d collected for the full advantage window",
+                            version_during_step,
+                            chunks_dispatched,
+                            num_groups,
+                            groups_dispatched,
+                            target_groups,
+                        )
+                        continue
+
+                    objective_num_groups = num_groups
+                    if staged_window_metas:
+                        objective_num_groups += groups_dispatched
+                        train_meta = staged_window_metas[0].concat(
+                            *staged_window_metas[1:], train_meta
+                        )
+                        staged_window_metas.clear()
+                        selected_group_ids = self._group_ids_from_meta(train_meta)
 
                     if groups_dispatched == 0:
                         try:
@@ -2517,9 +2657,10 @@ class SingleControllerActor:
                             if not tag["is_execution_padding"]
                         }
                         if (
-                            len(selected_group_ids) != num_groups
+                            len(selected_group_ids) != objective_num_groups
                             or len(chunk_owners)
-                            != num_groups * self._algo_cfg.num_generations_per_prompt
+                            != objective_num_groups
+                            * self._algo_cfg.num_generations_per_prompt
                             or logical_owners.intersection(chunk_owners)
                         ):
                             raise ValueError(
@@ -2652,7 +2793,7 @@ class SingleControllerActor:
                         "train_pump: step %d chunk %d: %d group(s), %d/%d dispatched",
                         version_during_step,
                         chunks_dispatched,
-                        num_groups,
+                        objective_num_groups,
                         groups_dispatched,
                         self._algo_cfg.num_prompts_per_step,
                     )
@@ -2696,11 +2837,34 @@ class SingleControllerActor:
                     step_metrics.update(aggregate_step_metrics(policy_result))
                 if value_result is not None:
                     step_metrics.update(_compute_critic_metrics(value_result))
+                next_train_step = self._train_steps + 1
+                checkpointing_cfg = self._master_config.checkpointing
+                ft_save_period = checkpointing_cfg.get("ft_save_period")
+                quiesce_capacity_release = bool(
+                    checkpointing_cfg["enabled"]
+                    and checkpointing_cfg.get("quiesce_rollouts_for_checkpoint", False)
+                    and (
+                        next_train_step >= self._algo_cfg.max_num_steps
+                        or next_train_step % checkpointing_cfg["save_period"] == 0
+                        or (
+                            ft_save_period is not None
+                            and next_train_step % ft_save_period == 0
+                        )
+                    )
+                )
                 async with self._data_plane_checkpoint_barrier.mutation() as cut:
                     await self._cleanup_consumed_metas_unlocked(cut, consumed_metas)
                     self._buffer.release_training_claims(consumed_training_claim_ids)
-                for _ in range(consumed_group_count):
-                    self._buffer_capacity.release()
+                if quiesce_capacity_release:
+                    print(
+                        "checkpoint quiesce: holding "
+                        f"{consumed_group_count} replay-capacity permit(s) "
+                        f"through step {next_train_step} publication",
+                        flush=True,
+                    )
+                else:
+                    for _ in range(consumed_group_count):
+                        self._buffer_capacity.release()
                 step_metrics.update(
                     {
                         name: statistics.fmean(values)
@@ -2781,7 +2945,6 @@ class SingleControllerActor:
                 is_last_step = self._train_steps >= self._algo_cfg.max_num_steps or (
                     self._rollout_exhausted.is_set() and len(self._buffer) == 0
                 )
-                ft_save_period = self._master_config.checkpointing.get("ft_save_period")
                 # _train_steps was already incremented above, so it equals
                 # the legacy loop's 1-indexed `step + 1`.
                 should_save_by_step = (
@@ -2857,11 +3020,16 @@ class SingleControllerActor:
 
                 # Checkpointing (mirrors async_grpo_train's save block).
                 if will_save_checkpoint:
-                    with self._timer.time("checkpointing"):
-                        await self._save_checkpoint(
-                            step_metrics,
-                            is_policy_training_step=is_policy_training_step,
-                        )
+                    try:
+                        with self._timer.time("checkpointing"):
+                            await self._save_checkpoint(
+                                step_metrics,
+                                is_policy_training_step=is_policy_training_step,
+                            )
+                    finally:
+                        if quiesce_capacity_release:
+                            for _ in range(consumed_group_count):
+                                self._buffer_capacity.release()
                     if defer_refit_for_save:
                         # The save is done; wake the engine unless the loop is about to exit.
                         # Deliberately a bare wake, not `_sync_weights`.
@@ -2877,6 +3045,11 @@ class SingleControllerActor:
                                 )
                                 self._rollout_permitted.set()
                                 self._rollout_manager.resume_request_deadlines()
+                elif quiesce_capacity_release:
+                    raise AssertionError(
+                        "checkpoint quiesce held replay capacity without a "
+                        "matching checkpoint publication"
+                    )
 
             timing_metrics: dict[str, float] = self._timer.get_timing_metrics(
                 reduction_op="sum"
@@ -4246,15 +4419,21 @@ class SingleControllerActor:
 
         logical = has_logical_owners(meta)
         if logical:
+            standard_grpo = self._algo_cfg.adv_estimator.name == "grpo" and isinstance(
+                self._advantage_estimator, GRPOAdvantageEstimator
+            )
+            molt_reinforce = (
+                self._algo_cfg.adv_estimator.name == "reinforce_baseline"
+                and isinstance(
+                    self._advantage_estimator, ReinforceBaselineAdvantageEstimator
+                )
+            )
             if (
                 self._is_ppo
                 or not isinstance(self._algo_cfg, GRPOConfig)
-                or self._algo_cfg.adv_estimator.name != "grpo"
-                or not isinstance(self._advantage_estimator, GRPOAdvantageEstimator)
+                or not (standard_grpo or molt_reinforce)
             ):
-                raise ValueError(
-                    "CC logical owners require the standard GRPO estimator"
-                )
+                raise ValueError("CC logical owners require a supported GRPO estimator")
             validate_cc_objective(self._algo_cfg, self._master_config.loss_fn)
         if self._advantage_estimator is None:
             return meta, True
@@ -4278,6 +4457,18 @@ class SingleControllerActor:
         rewards = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.reward_field)
         ).float()
+        rewards_clipped = False
+        if isinstance(self._algo_cfg, GRPOConfig) and (
+            self._algo_cfg.reward_clip_low is not None
+            or self._algo_cfg.reward_clip_high is not None
+        ):
+            # SC does not currently implement reward shaping/scaling (startup
+            # rejects them), so clipping is the final scalar-reward transform.
+            rewards = rewards.clamp(
+                min=self._algo_cfg.reward_clip_low,
+                max=self._algo_cfg.reward_clip_high,
+            )
+            rewards_clipped = True
         token_mask = tensor_field(data, adv_cfg.token_mask_field).float()
         sample_mask = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.sample_mask_field)
@@ -4347,6 +4538,51 @@ class SingleControllerActor:
                 expected_group_size=self._algo_cfg.num_generations_per_prompt,
             )
             final_sample_mask = owner_batch.fanout(owner_batch.valid_mask)
+            # Keep zero-gradient OSWorld batches diagnosable without retaining
+            # rollout payloads: distinguish genuinely uniform sibling rewards
+            # from accidental prompt-identity splits in the estimator.
+            representative_rows = owner_batch.representative_rows.tolist()
+            dispatch_rows: dict[str, list[int]] = {}
+            for row in representative_rows:
+                dispatch_rows.setdefault(
+                    meta.tags[row]["dispatch_group_id"],  # type: ignore[index]
+                    [],
+                ).append(row)
+            dispatch_mixed_rewards = sum(
+                len({float(rewards[row]) for row in rows}) > 1
+                for rows in dispatch_rows.values()
+            )
+            dispatch_prompt_mismatches = sum(
+                any(
+                    not torch.equal(prompt_ids[rows[0]], prompt_ids[row])
+                    for row in rows[1:]
+                )
+                for rows in dispatch_rows.values()
+            )
+            prompt_populations: list[list[int]] = []
+            for row in representative_rows:
+                for population in prompt_populations:
+                    if torch.equal(prompt_ids[population[0]], prompt_ids[row]):
+                        population.append(row)
+                        break
+                else:
+                    prompt_populations.append([row])
+            mixed_reward_populations = sum(
+                len({float(rewards[row]) for row in rows}) > 1
+                for rows in prompt_populations
+            )
+            singleton_populations = sum(len(rows) == 1 for rows in prompt_populations)
+            print(
+                "CC advantage populations: "
+                f"owners={len(representative_rows)} "
+                f"dispatch_groups={len(dispatch_rows)} "
+                f"dispatch_mixed_rewards={dispatch_mixed_rewards} "
+                f"dispatch_prompt_mismatches={dispatch_prompt_mismatches} "
+                f"baseline_populations={len(prompt_populations)} "
+                f"singleton_populations={singleton_populations} "
+                f"mixed_reward_populations={mixed_reward_populations}",
+                flush=True,
+            )
         mask = token_mask * final_sample_mask.unsqueeze(-1)
         baseline_mask = final_sample_mask
         if (
@@ -4391,17 +4627,27 @@ class SingleControllerActor:
         returns: Optional[torch.Tensor] = None
         if has_valid_training_tokens and owner_batch is not None:
             rows = owner_batch.representative_rows
+            estimator_kwargs = {}
+            if isinstance(
+                self._advantage_estimator, ReinforceBaselineAdvantageEstimator
+            ):
+                estimator_kwargs["action_token_counts"] = (
+                    owner_batch.action_token_counts(mask[:, 1:])
+                )
             owner_advantages = self._advantage_estimator.compute_advantage(
                 prompt_ids=prompt_ids[rows],
                 rewards=rewards[rows],
                 mask=owner_batch.valid_mask.unsqueeze(-1),
                 valid_mask=baseline_mask[rows],
+                **estimator_kwargs,
             )
             if (
                 owner_advantages.shape != (len(rows), 1)
                 or not torch.isfinite(owner_advantages).all()
             ):
-                raise ValueError("GRPO must return one finite advantage per CC owner")
+                raise ValueError(
+                    "CC estimator must return one finite advantage per logical owner"
+                )
             advantages = (
                 owner_batch.fanout(owner_advantages[:, 0]).unsqueeze(-1).expand_as(mask)
             )
@@ -4475,6 +4721,8 @@ class SingleControllerActor:
         )
 
         fields_to_put = {adv_cfg.output_field: advantages}
+        if rewards_clipped:
+            fields_to_put[adv_cfg.reward_field] = rewards
         if not torch.equal(final_sample_mask, sample_mask):
             fields_to_put[adv_cfg.sample_mask_field] = final_sample_mask
         new_fields = [adv_cfg.output_field]

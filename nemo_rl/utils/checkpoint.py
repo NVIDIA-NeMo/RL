@@ -172,6 +172,10 @@ class CheckpointingConfig(TypedDict):
     save_data_plane (bool): Whether SingleController checkpoints include the
         native TQ snapshot and replay-buffer metadata. Currently supported only
         with the simple data-plane backend.
+    quiesce_rollouts_for_checkpoint (bool): Hold consumed replay-capacity
+        permits until a scheduled full checkpoint is durable. With replay
+        capacity equal to one optimizer batch, this prevents new rollout
+        dispatch while publishing a clean step-boundary CC checkpoint.
     load_replay_buffer (bool): Whether async GRPO restores replay-buffer state
         when resuming from a checkpoint. Defaults to True. When False the
         buffer starts empty and a frontier-aligned resume regenerates the
@@ -190,7 +194,9 @@ class CheckpointingConfig(TypedDict):
     checkpoint_must_save_by: NotRequired[str | None]
     pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
     save_optimizer: NotRequired[bool]  # Default: True
+    load_optimizer: NotRequired[bool]  # Default: True
     save_data_plane: NotRequired[bool]
+    quiesce_rollouts_for_checkpoint: NotRequired[bool]
     load_replay_buffer: NotRequired[bool]  # Default: True (async GRPO only)
     # New nemo-automodel integration fields
     model_save_format: NotRequired[str | None]  # Default: "safetensors"

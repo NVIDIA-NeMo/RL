@@ -130,6 +130,7 @@ def _env_configs(**overrides):
         "thinking_tags": ["<think>"],
         "tokenizer_config": {"name": "test-tokenizer"},
         "pad_dynamic_image_shapes": True,
+        "allow_token_free_results": True,
         "config_paths": ["gym.yaml"],
     }
     nemo_gym.update(overrides)
@@ -166,6 +167,7 @@ def test_build_nemo_gym_config_splits_nemo_rl_keys(detected_uv_dirs):
     assert cfg["thinking_tags"] == ["<think>"]
     assert cfg["tokenizer_config"] == {"name": "test-tokenizer"}
     assert cfg["pad_dynamic_image_shapes"] is True
+    assert cfg["allow_token_free_results"] is True
     assert cfg["initial_global_config_dict"] == {
         "num_gpu_nodes": 1,
         "config_paths": ["gym.yaml"],

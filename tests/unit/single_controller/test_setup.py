@@ -335,16 +335,18 @@ def test_build_generation_passes_sglang_config():
     generation.finish_generation.assert_called_once_with()
 
 
-def test_cc_rejects_discovered_resume_even_when_checkpoint_saving_is_disabled(
-    tmp_path, patched_factories
-):
+def test_cc_restores_discovered_step_boundary_checkpoint(tmp_path, patched_factories):
     mc = _make_master_config(
         megatron_enabled=True,
         env={"should_use_nemo_gym": True},
         sampler_cfg=InOrderSamplerConfig(max_lookahead_versions=0),
     )
     mc.token_capture.enabled = mc.token_capture.context_compaction = True
-    mc.async_rl.rollout_failure.min_step_batch_fraction = 1
+    failure = mc.async_rl.rollout_failure
+    failure.min_step_batch_fraction = 1
+    failure.max_infra_attempts_per_prompt = 1
+    failure.max_data_attempts_per_prompt = 1
+    failure.nemo_gym.max_row_attempts = 1
     mc.policy.update(
         sequence_packing={"enabled": False},
         dynamic_batching={"enabled": False},
@@ -355,14 +357,64 @@ def test_cc_rejects_discovered_resume_even_when_checkpoint_saving_is_disabled(
         "async_engine": True,
         "expose_http_server": True,
     }
-    mc.checkpointing["checkpoint_dir"] = str(tmp_path)
-    (tmp_path / "step_3").mkdir()
-    # Real discovery must reject before reading even a training-info file.
-    with pytest.raises(ValueError, match="CC checkpoint/resume"):
-        setup_single_controller(mc, MagicMock(pad_token_id=0))
-    patched_factories["setup_response_data"].assert_not_called()
-    patched_factories["_build_generation"].assert_not_called()
-    patched_factories["_build_trainer"].assert_not_called()
+    mc.policy["generation"].update(
+        {
+            "model_name": "test-model",
+            "stop_strings": None,
+            "stop_token_ids": None,
+            "top_k": None,
+        }
+    )
+    checkpoint_path = tmp_path / "step_3"
+    checkpoint_path.mkdir()
+    mc.checkpointing.update(
+        {
+            "enabled": True,
+            "save_data_plane": True,
+            "checkpoint_dir": str(tmp_path),
+        }
+    )
+    save_state = _save_state()
+    checkpointer = MagicMock()
+    checkpointer.checkpoint_dir = tmp_path
+    checkpointer.get_latest_checkpoint_path.return_value = str(checkpoint_path)
+    checkpointer.load_training_info.return_value = vars(save_state)
+    checkpointer.get_resume_paths.return_value = (
+        checkpoint_path / "policy" / "weights",
+        checkpoint_path / "policy" / "optimizer",
+    )
+    patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+    fake_finalizers = [MagicMock(name="finalizer")]
+    metadata = _native_tq_metadata()
+
+    with (
+        patch.object(sc_setup_mod, "CheckpointManager", return_value=checkpointer),
+        patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+        patch.object(sc_setup_mod, "spinup_nemo_gym_actor", return_value=MagicMock()),
+        patch.object(sc_setup_mod.ray, "get", return_value=None),
+        patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+        patch.object(sc_setup_mod, "cc_execution_row_multiple", return_value=1),
+        patch.object(sc_setup_mod, "load_dataloader_state") as load_dataloader_state,
+        patch.object(
+            sc_setup_mod,
+            "_maybe_restore_native_data_plane_checkpoint",
+            return_value=metadata,
+        ) as restore_data_plane,
+        patch(
+            "nemo_rl.experience.rollout_reassembler_actor."
+            "create_rollout_reassembler_actors",
+            return_value=fake_finalizers,
+        ),
+    ):
+        actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    assert actor_args.last_checkpoint_path == str(checkpoint_path)
+    assert actor_args.save_state.current_step == save_state.current_step
+    assert actor_args.data_plane_checkpoint_metadata == metadata
+    load_dataloader_state.assert_called_once_with(
+        patched_factories["dataloader"], str(checkpoint_path), mc.data
+    )
+    restore_data_plane.assert_called_once()
 
 
 def test_build_clusters_rejects_unsupported_topology_backend(monkeypatch):
@@ -1542,6 +1594,21 @@ class TestSetup:
 
         assert mc.policy["megatron_cfg"]["train_iters"] == 2
 
+    def test_megatron_train_iters_preserves_explicit_scheduler_horizon(
+        self, patched_factories
+    ):
+        mc = _make_master_config(
+            megatron_enabled=True,
+            max_num_steps=2,
+            max_num_epochs=1,
+        )
+        mc.policy["megatron_cfg"]["scheduler"] = {"lr_decay_iters": 300}
+
+        setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert mc.grpo.max_num_steps == 2
+        assert mc.policy["megatron_cfg"]["train_iters"] == 300
+
     def test_megatron_train_iters_capped_by_dataloader_epochs(self, patched_factories):
         """train_iters drops to max_num_epochs * len(dataloader) when smaller."""
         mc = _make_master_config(
@@ -1641,7 +1708,11 @@ class TestSetup:
             mc.token_capture.context_compaction = True
             mc.env = {"should_use_nemo_gym": True}
             mc.async_rl.sampler = InOrderSamplerConfig(max_lookahead_versions=0)
-            mc.async_rl.rollout_failure.min_step_batch_fraction = 1
+            failure = mc.async_rl.rollout_failure
+            failure.min_step_batch_fraction = 1
+            failure.max_infra_attempts_per_prompt = 1
+            failure.max_data_attempts_per_prompt = 1
+            failure.nemo_gym.max_row_attempts = 1
             mc.policy.update(
                 megatron_cfg={"enabled": True},
                 sequence_packing={"enabled": False},

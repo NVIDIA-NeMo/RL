@@ -24,6 +24,9 @@ from nemo_rl.experience.rollout_reassembler import (
     RolloutReassembler,
     SegmentReceipt,
 )
+from tests.unit.data_plane.token_capture_test_fixtures import (
+    build_fixture_artifacts,
+)
 from tests.unit.experience.test_segment_capture_composition import (
     MemoryDataPlane,
     gym_harness,
@@ -219,6 +222,31 @@ def test_unequal_segments_publish_once_with_owner_identity_and_cleanup(
     assert not any(partition == "staged" for partition, _ in data_plane.rows)
 
 
+def test_logical_owner_may_straddle_refit_with_conservative_version_tag(
+    owner_stack: tuple,
+) -> None:
+    _, data_plane, finalizer = owner_stack
+    rollout_id = "group_g0_s0"
+    records, receipt, _ = build_fixture_artifacts(
+        "mixed_weight_versions", rollout_id=rollout_id
+    )
+    sink = TQTokenSink(data_plane, staging_partition="staged")
+    for record in records:
+        assert sink.stage(record).ok
+    segment = SegmentReceipt(
+        capture_rollout_id=rollout_id,
+        receipt=receipt.model_dump(),
+        selected_response_ids=tuple(record.response_id for record in receipt.manifest),
+    )
+
+    result = finalize(finalizer, [[segment]])
+
+    assert (result.group_min_wv, result.group_max_wv) == (4, 5)
+    assert result.metrics["finalize/weight_version_span"] == 1.0
+    assert result.meta is not None
+    assert {tag["weight_version"] for tag in result.meta.tags} == {4}
+
+
 @pytest.mark.parametrize(
     "failure",
     [
@@ -258,10 +286,17 @@ def test_failed_segment_collapses_entire_owner_without_losing_initial_prompt(
         }[failure]
         later = replace(later, selected_response_ids=selected)
     if failure == "all_invalid":
-        with pytest.raises(ValueError, match="no verified input layout"):
-            finalize(finalizer, [[initial, later], [sibling]])
+        result = finalize(finalizer, [[initial, later], [sibling]])
+        assert result.dropped
+        assert result.meta is None
+        assert result.drop_reason == (
+            "no logical owner produced a verified input layout"
+        )
+        assert (result.group_min_wv, result.group_max_wv) == (7, 7)
+        assert result.metrics["finalize/group_dropped"] == 1.0
+        assert (result.valid_row_count, result.total_row_count) == (0, 0)
         assert not any(partition == "canonical" for partition, _ in data_plane.rows)
-        assert any(partition == "staged" for partition, _ in data_plane.rows)
+        assert not any(partition == "staged" for partition, _ in data_plane.rows)
         return
     result = finalize(finalizer, [[initial, later], [sibling]])
     assert result.meta is not None and result.meta.sample_ids == [

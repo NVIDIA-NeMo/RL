@@ -707,6 +707,32 @@ class TestApplyParallelismConfig:
 
 @pytest.mark.mcore
 class TestApplyMultimodalConfig:
+    def test_applies_canonical_omni_freeze_controls(self):
+        from nemo_rl.models.megatron.setup import _apply_multimodal_config
+
+        model_cfg = SimpleNamespace(
+            freeze_vision_model=False,
+            freeze_vision_projection=False,
+            freeze_sound_encoder=False,
+            freeze_sound_projection=False,
+            radio_force_cpe_eval_mode=False,
+        )
+        config = {
+            "megatron_cfg": {
+                "freeze_vision_model": True,
+                "freeze_vision_projection": True,
+                "freeze_sound_encoder": True,
+                "freeze_sound_projection": True,
+            }
+        }
+
+        _apply_multimodal_config(model_cfg, config)
+
+        assert model_cfg.freeze_vision_model is True
+        assert model_cfg.freeze_vision_projection is True
+        assert model_cfg.freeze_sound_encoder is True
+        assert model_cfg.freeze_sound_projection is True
+
     def test_maps_legacy_omni_freeze_controls(self):
         from nemo_rl.models.megatron.setup import _apply_multimodal_config
 

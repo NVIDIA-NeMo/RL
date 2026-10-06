@@ -7,10 +7,15 @@ import pytest
 import torch
 from tensordict import TensorDict
 
+from nemo_rl.algorithms.async_utils.staleness_sampler import WindowedSamplerConfig
 from nemo_rl.algorithms.single_controller_utils.config import TokenCaptureConfig
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
-from tests.unit.single_controller.test_logical_advantage import _batch, _controller
+from tests.unit.single_controller.test_logical_advantage import (
+    _batch,
+    _controller,
+    _molt_settings,
+)
 from tests.unit.single_controller.test_single_controller_actor import (
     _FullStepSampler,
     _NoOpTrainer,
@@ -26,6 +31,7 @@ def _setup(
     padding=True,
     batches: list[tuple[KVBatchMeta, TensorDict]] | None = None,
     plane: NoOpDataPlaneClient | None = None,
+    molt: bool = False,
 ):
     if batches is None:
         batches = [
@@ -62,7 +68,8 @@ def _setup(
         else _SequenceSampler(metas)
     )
     ctrl = _train_pump_controller(sampler=sampler)
-    stage = _controller(*batches[0])
+    grpo, loss = _molt_settings() if molt else ({}, {})
+    stage = _controller(*batches[0], grpo=grpo, loss=loss)
     ctrl._algo_cfg = stage._algo_cfg
     ctrl._algo_cfg.num_prompts_per_step = num_prompts
     ctrl._algo_cfg.max_num_steps = 1
@@ -171,8 +178,38 @@ def test_malformed_input_layout_flag_fails_before_forward(monkeypatch, flag, fie
     ctrl._trainer.finish_train_step.assert_not_called()
 
 
-def test_complete_logical_batch_streams_all_segments_but_steps_once(monkeypatch):
-    ctrl, metas = _setup(monkeypatch)
+def test_cc_molt_accepts_previous_generation_version_in_sampler_window(monkeypatch):
+    ctrl, _ = _setup(monkeypatch, padding=False, molt=True)
+    ctrl._async_cfg.sampler = WindowedSamplerConfig(
+        max_staleness_versions=1,
+        sample_freshest_first=False,
+    )
+    ctrl._trainer_version = 1
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=3))
+
+    ctrl._trainer.finish_train_step.assert_called_once()
+    ctrl._sync_weights.assert_awaited_once()
+
+
+def test_cc_molt_rejects_generation_version_older_than_sampler_window(monkeypatch):
+    ctrl, _ = _setup(monkeypatch, padding=False, molt=True)
+    ctrl._async_cfg.sampler = WindowedSamplerConfig(
+        max_staleness_versions=1,
+        sample_freshest_first=False,
+    )
+    ctrl._trainer_version = 2
+
+    with pytest.raises(ValueError, match=r"generation version window \[1, 2\]"):
+        asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=3))
+    ctrl._trainer.train_microbatches_from_meta.assert_not_called()
+    ctrl._trainer.finish_train_step.assert_not_called()
+    ctrl._sync_weights.assert_not_awaited()
+
+
+@pytest.mark.parametrize("molt", [False, True])
+def test_complete_logical_batch_streams_all_segments_but_steps_once(monkeypatch, molt):
+    ctrl, metas = _setup(monkeypatch, molt=molt)
     asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=3))
     submitted = [
         call.args[0]

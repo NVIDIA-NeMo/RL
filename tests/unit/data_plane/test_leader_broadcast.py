@@ -26,7 +26,11 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from nemo_rl.data.multimodal_utils import PackedTensor
-from nemo_rl.data_plane.worker_mixin import _broadcast_batched_data_dict
+from nemo_rl.data_plane.worker_mixin import (
+    _broadcast_batched_data_dict,
+    _broadcast_int16_tensor,
+    _broadcast_packed_wire,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
@@ -107,6 +111,7 @@ def _round_trip_body(rank: int):
             {
                 "input_ids": torch.arange(12, dtype=torch.long).reshape(3, 4),
                 "input_lengths": torch.tensor([4, 3, 2], dtype=torch.int32),
+                "routed_experts": torch.arange(24, dtype=torch.int16).reshape(3, 4, 2),
                 "scalar_meta": "step_42",
                 "pixel_values": _packed(rows),
             }
@@ -123,6 +128,9 @@ def _round_trip_body(rank: int):
         out["input_ids"], torch.arange(12, dtype=torch.long).reshape(3, 4)
     )
     assert torch.equal(out["input_lengths"], torch.tensor([4, 3, 2], dtype=torch.int32))
+    assert torch.equal(
+        out["routed_experts"], torch.arange(24, dtype=torch.int16).reshape(3, 4, 2)
+    )
     assert out["scalar_meta"] == "step_42"
 
     packed = out["pixel_values"]
@@ -199,6 +207,78 @@ def test_leader_broadcast_reports_descriptor_error_to_all_ranks(tmp_path):
     assert results[1][0] == 1
     assert results[1][1].startswith("err: RuntimeError:")
     assert all("source_ids" in outcome for _, outcome in results)
+
+
+def test_int16_broadcast_uses_bounded_wire_chunks(monkeypatch):
+    tensor = torch.arange(10, dtype=torch.int16)
+    broadcast_sizes = []
+
+    def fake_broadcast(wire, *, src, group):
+        del src, group
+        broadcast_sizes.append(wire.numel())
+
+    monkeypatch.setattr(torch.distributed, "broadcast", fake_broadcast)
+
+    result = _broadcast_int16_tensor(
+        tensor,
+        is_leader=True,
+        src=0,
+        group=object(),
+        chunk_elements=3,
+    )
+
+    assert result.data_ptr() == tensor.data_ptr()
+    assert torch.equal(result, torch.arange(10, dtype=torch.int16))
+    assert broadcast_sizes == [3, 3, 3, 1]
+
+
+def test_packed_wire_broadcast_uses_bounded_chunks(monkeypatch):
+    source = torch.arange(10, dtype=torch.float32)
+    broadcast_sizes = []
+
+    def leader_broadcast(wire, *, src, group):
+        del src, group
+        broadcast_sizes.append(wire.numel())
+
+    monkeypatch.setattr(torch.distributed, "broadcast", leader_broadcast)
+    result = _broadcast_packed_wire(
+        source,
+        total_elements=source.numel(),
+        dtype=source.dtype,
+        src_device="cpu",
+        bcast_device="cpu",
+        is_leader=True,
+        src=0,
+        group=object(),
+        chunk_bytes=12,
+    )
+
+    assert result is None
+    assert broadcast_sizes == [3, 3, 3, 1]
+
+    cursor = 0
+
+    def follower_broadcast(wire, *, src, group):
+        nonlocal cursor
+        del src, group
+        wire.copy_(source[cursor : cursor + wire.numel()])
+        cursor += wire.numel()
+
+    monkeypatch.setattr(torch.distributed, "broadcast", follower_broadcast)
+    received = _broadcast_packed_wire(
+        None,
+        total_elements=source.numel(),
+        dtype=source.dtype,
+        src_device="cpu",
+        bcast_device="cpu",
+        is_leader=False,
+        src=0,
+        group=object(),
+        chunk_bytes=12,
+    )
+
+    assert received is not None
+    assert torch.equal(received, source)
 
 
 def test_get_replica_group_default_is_none():

@@ -1209,8 +1209,12 @@ def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
 
 
 def _apply_multimodal_config(model_cfg: Any, config: PolicyConfig) -> None:
-    """Map legacy Omni freeze controls onto canonical provider attributes."""
+    """Apply canonical and legacy Omni controls to the model provider."""
     field_mapping = {
+        "freeze_vision_model": "freeze_vision_model",
+        "freeze_vision_projection": "freeze_vision_projection",
+        "freeze_sound_encoder": "freeze_sound_encoder",
+        "freeze_sound_projection": "freeze_sound_projection",
         "freeze_vision_encoder": "freeze_vision_model",
         "freeze_vision_projector": "freeze_vision_projection",
         "freeze_audio_encoder": "freeze_sound_encoder",

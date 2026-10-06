@@ -1,0 +1,166 @@
+# OSWorld v2 Molt B8/K8 on SingleController + TransferQueue.
+#
+# B=8 is the optimizer batch in prompt groups, N=8 is the number of logical
+# generations per prompt (logical GBS 64), and K=8 is the independently bounded
+# number of prompt groups in flight. K is not Gym's actions_per_chunk setting.
+
+defaults: grpo_nemotron_omni_30ba3b_osworld_v2_cc.yaml
+
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 8
+  # v1 trains for 300 optimizer steps over 361 x 5 prompts, so the dataloader
+  # must be allowed to wrap after its first 225 complete B=8 batches.
+  max_num_epochs: 100000
+  baseline_population: all_owners
+  reward_clip_low: 0.0
+  reward_clip_high: 1.0
+  adv_estimator:
+    name: reinforce_baseline
+
+loss_fn:
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: seq-mask-tis
+  truncated_importance_sampling_ratio_min: 0.99
+  truncated_importance_sampling_ratio: 1.01
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  force_on_policy_ratio: true
+  disable_ppo_ratio: false
+  use_kl_in_reward: false
+  use_cispo: false
+  use_on_policy_kl_approximation: false
+  positive_example_nll_weight: 0.0
+
+policy:
+  train_global_batch_size: 64
+  max_total_sequence_length: 49152
+  make_sequence_length_divisible_by: 32
+  offload_optimizer_for_logprob: true
+  router_replay:
+    enabled: true
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: 49152
+    logprob_mb_tokens: 49152
+    algorithm: modified_first_fit_decreasing
+    microbatch_order: largest_first
+    sequence_length_round: 32
+  dynamic_batching:
+    enabled: false
+  megatron_cfg:
+    tensor_model_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 8
+    pipeline_model_parallel_size: 1
+    virtual_pipeline_model_parallel_size: null
+    context_parallel_size: 8
+    freeze_vision_model: true
+    freeze_vision_projection: true
+    freeze_sound_encoder: true
+    freeze_sound_projection: true
+    # Failed-owner placeholders must not mutate routing state. The router itself
+    # is frozen in the base recipe; make the non-gradient expert-bias update a
+    # no-op as required by the dummy-sensitive forward guard.
+    moe_router_bias_update_rate: 0.0
+    optimizer:
+      lr: 5e-6
+      min_lr: 5e-6
+      adam_beta1: 0.9
+      adam_beta2: 0.99
+      optimizer_cpu_offload: true
+      optimizer_offload_fraction: 1.0
+    scheduler:
+      lr_warmup_iters: 9
+      lr_warmup_init: 0.0
+      # Keep scheduler state invariant across Slurm continuation segments.
+      # v1 targets 300 optimizer updates even when an individual job exits
+      # earlier and resumes from a step-boundary checkpoint.
+      lr_decay_iters: 300
+  generation:
+    max_new_tokens: 16384
+    vllm_cfg:
+      tensor_parallel_size: 2
+      pipeline_parallel_size: 1
+      expert_parallel_size: 2
+      max_model_len: 49152
+      enable_prefix_caching: true
+    vllm_kwargs:
+      limit_mm_per_prompt: {image: 20}
+      max_num_batched_tokens: 4096
+      enable_chunked_prefill: true
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 3
+
+data:
+  max_input_seq_length: 49152
+  shuffle: true
+
+env:
+  nemo_gym:
+    # Cold 30B vLLM startup can exceed Gym's 600s default while all shards
+    # prefetch and warm kernels concurrently across the generation nodes. One
+    # observed cold start reached the old 1800s deadline as its final shards
+    # became ready, so retain enough margin for uncached continuation nodes.
+    model_endpoint_readiness_timeout_seconds: ${oc.decode:${oc.env:OSWORLD_MODEL_ENDPOINT_READINESS_TIMEOUT_SECONDS,2700}}
+    nemotron_osworld:
+      responses_api_agents:
+        nemotron_osworld:
+          max_steps: ${oc.decode:${oc.env:OSWORLD_MAX_STEPS,150}}
+          max_parallel_rollouts: ${oc.decode:${oc.env:OSWORLD_MAX_PARALLEL_ROLLOUTS,8}}
+          max_tokens: 16384
+          context_history:
+            policy:
+              type: recency
+              config:
+                images:
+                  enabled: true
+                  protect_initial_context: true
+                  keep_last_groups: 2
+            # This is context-compaction cadence, not Molt concurrency K.
+            schedule:
+              type: turn_chunked_recency
+              actions_per_chunk: 100
+            guards:
+              max_total_tokens: 49152
+              reserved_generation_tokens: 11152
+              max_active_images: 10
+            max_response_retries: 0
+
+async_rl:
+  sampler:
+    name: windowed
+    max_staleness_versions: 1
+    sample_freshest_first: false
+  # The objective/training floor remains the canonical B=8 population. With
+  # staging enabled below, the controller internally claims one complete N=8
+  # prompt group at a time for policy probes, but never exposes a partial
+  # advantage or optimizer window.
+  min_groups_for_streaming_train: 8
+  # Keep the Molt baseline/whitening population at the canonical B=8: partial
+  # arrivals only run a policy probe and are concatenated before advantage/F-B.
+  stage_full_advantage_window: true
+  # A single OSWorld tail can exceed the cluster's 30-minute idle window after
+  # other groups finish. Re-probe the latest staged group every 10 minutes.
+  staged_policy_probe_interval_s: 600
+  max_inflight_prompts: 8
+  max_buffered_rollouts: 16
+
+checkpointing:
+  enabled: false
+  metric_name: null
+
+rollout_checkpointing:
+  snapshot_attempt_interval_s: null
+
+logger:
+  log_dir: ${oc.env:OSWORLD_RESULTS_DIR,logs/osworld-v2-cc-molt-b8k8}
+  wandb:
+    name: osworld-v2-cc-molt-b8k8
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 4

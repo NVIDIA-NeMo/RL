@@ -1906,6 +1906,103 @@ def test_train_pump_chunked_step_by_engine_regime(
     ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
 
 
+def test_train_pump_stages_full_advantage_window_before_training(monkeypatch) -> None:
+    """Partial Molt arrivals probe the policy but train as one full population."""
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0"],
+        fields=[],
+        sequence_lengths=[1],
+        tags=[{"weight_version": 0}],
+    )
+    sampler = _ChunkedSampler(meta, chunks=2)
+    ctrl = _train_pump_controller(sampler=sampler)
+    ctrl._async_cfg.min_groups_for_streaming_train = 2
+    ctrl._async_cfg.stage_full_advantage_window = True
+    ctrl._advantage_stage = AsyncMock(side_effect=lambda batch: (batch, True))
+
+    class _StagingTrainer(_LpRecordingTrainer):
+        def __init__(self) -> None:
+            super().__init__()
+            self.probe_sizes: list[int] = []
+            self.train_sizes: list[int] = []
+
+        def get_logprobs_from_meta(self, batch: KVBatchMeta) -> None:
+            self.probe_sizes.append(batch.size)
+
+        def train_microbatches_from_meta(
+            self, batch: KVBatchMeta, *, train_fields: tuple[str, ...]
+        ) -> None:
+            del train_fields
+            self.train_sizes.append(batch.size)
+
+    trainer = _StagingTrainer()
+    ctrl._trainer = trainer
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert trainer.probe_sizes == [1]
+    assert trainer.train_sizes == [2]
+    assert sampler.select_bounds == [(1, 2), (1, 1)]
+    assert ctrl._advantage_stage.await_count == 1
+    assert ctrl._advantage_stage.await_args.args[0].size == 2
+    assert ctrl._train_steps == 1
+
+
+def test_train_pump_reprobes_staged_group_during_long_arrival_gap(monkeypatch) -> None:
+    """A staged Molt window keeps policy GPUs active while its tail is pending."""
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0"],
+        fields=[],
+        sequence_lengths=[1],
+        tags=[{"weight_version": 0}],
+    )
+
+    class _GapSampler(_EmptySampler):
+        def __init__(self) -> None:
+            self.calls = 0
+            self.select_bounds: list[tuple[int, int]] = []
+
+        async def select(self, **kwargs):
+            self.select_bounds.append(
+                (kwargs["min_prompt_groups"], kwargs["max_prompt_groups"])
+            )
+            self.calls += 1
+            if self.calls == 1:
+                return meta, 1
+            if self.calls == 2:
+                await asyncio.sleep(0.01)
+                return None, 0
+            return meta, 1
+
+    sampler = _GapSampler()
+    ctrl = _train_pump_controller(sampler=sampler)
+    ctrl._async_cfg.min_groups_for_streaming_train = 2
+    ctrl._async_cfg.stage_full_advantage_window = True
+    ctrl._async_cfg.staged_policy_probe_interval_s = 0.001
+    ctrl._rollout_exhausted.clear()
+    ctrl._advantage_stage = AsyncMock(side_effect=lambda batch: (batch, True))
+    trainer = _LogprobRecordingTrainer()
+    ctrl._trainer = trainer
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert trainer.policy_logprob_calls == 2
+    assert sampler.select_bounds == [(1, 2), (1, 1), (1, 1)]
+    assert ctrl._advantage_stage.await_count == 1
+    assert ctrl._advantage_stage.await_args.args[0].size == 2
+    assert ctrl._train_steps == 1
+
+
 def test_train_pump_does_not_offload_the_policy_on_a_grpo_run(monkeypatch) -> None:
     """The pre-critic offload is PPO-only: GRPO has no critic to make room for."""
     meta = KVBatchMeta(

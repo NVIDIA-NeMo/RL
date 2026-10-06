@@ -46,6 +46,7 @@ code_snapshots*/
 # Runtime env
 *runtime_env.yaml
 !default_runtime_env.yaml
+/examples/nemo_gym/osworld_v2/.env
 
 # Claude Code review memory (local only)
 .claude/review-memory/
