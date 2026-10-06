@@ -784,3 +784,269 @@ def test_server_parent_guard_is_armed_before_launch(monkeypatch, parent_alive):
     sglang_worker._launch_server_with_parent_guard(server_args, parent_pid=123)
 
     assert events == (["guard", ("launch", server_args)] if parent_alive else ["guard"])
+
+
+# ---------------------------------------------------------------------------
+# Recovery cohort rollback (checkpoint-engine restart contract)
+# ---------------------------------------------------------------------------
+
+
+def _bare_generation_for_recover():
+    gen = _make_generation(None)
+    del gen._recover
+    gen.all_engines = ["survivor", None]
+    gen.needs_offload = False
+    # This fixture owns no real actors. A delayed destructor must not issue
+    # shutdown RPCs into another test's Ray mocks.
+    gen.shutdown = lambda: True
+    return gen
+
+
+def test_recover_rolls_back_the_cohort_when_replacement_init_fails(monkeypatch):
+    """A failed attempt must leave only ``None`` slots and the old count.
+
+    ``_start_engines`` publishes replacement actors and rewrites
+    ``num_new_engines`` before their init is awaited, so without rollback a
+    partially initialized cohort stays visible and the refit dispatch would
+    rebind against a broken actor.
+    """
+    from unittest.mock import MagicMock
+
+    from nemo_rl.models.generation.sglang import sglang_generation
+
+    gen = _bare_generation_for_recover()
+    fake_actor = MagicMock()
+
+    def fake_start_engines(port_cursors=None):
+        gen.all_engines[1] = fake_actor
+        gen.num_new_engines = 1
+        return (["init-handle"], {})
+
+    gen._start_engines = fake_start_engines
+    killed = []
+    monkeypatch.setattr(
+        sglang_generation.ray,
+        "get",
+        MagicMock(side_effect=RuntimeError("replacement init died")),
+    )
+    monkeypatch.setattr(
+        sglang_generation.ray, "kill", lambda actor: killed.append(actor)
+    )
+
+    with pytest.raises(RuntimeError, match="replacement init died"):
+        gen._recover()
+
+    assert gen.all_engines == ["survivor", None]
+    assert gen.num_new_engines == 0
+    assert killed == [fake_actor]
+    # Rollback mirrors the health monitor's kill path: a best-effort graceful
+    # shutdown (router deregistration + server process tree) precedes the
+    # ray.kill. Here the graceful ray.get raises (same mock) — tolerated.
+    fake_actor.shutdown.remote.assert_called_once_with()
+
+
+def test_recover_escalates_when_the_rollback_itself_fails(monkeypatch):
+    """Rollback failure means inconsistent engine state: terminal, not retry."""
+    from unittest.mock import MagicMock
+
+    from nemo_rl.models.generation.sglang import sglang_generation
+    from nemo_rl.models.generation.sglang.fault_tolerance import (
+        RecoveryRollbackError,
+    )
+
+    gen = _bare_generation_for_recover()
+
+    def fake_start_engines(port_cursors=None):
+        gen.all_engines[1] = MagicMock()
+        gen.num_new_engines = 1
+        return (["init-handle"], {})
+
+    gen._start_engines = fake_start_engines
+    monkeypatch.setattr(
+        sglang_generation.ray,
+        "get",
+        MagicMock(side_effect=RuntimeError("replacement init died")),
+    )
+
+    def failing_kill(_actor):
+        raise RuntimeError("kill failed")
+
+    monkeypatch.setattr(sglang_generation.ray, "kill", failing_kill)
+
+    with pytest.raises(RecoveryRollbackError, match="rollback"):
+        gen._recover()
+
+
+def test_recover_rolls_back_when_start_engines_itself_fails(monkeypatch):
+    """A synchronous mid-start failure must roll back what was published.
+
+    ``_start_engines`` mutates ``all_engines`` and ``num_new_engines`` while
+    it runs, so an exception during actor creation or port allocation —
+    before any init is awaited — already leaves a partial cohort visible.
+    """
+    from unittest.mock import MagicMock
+
+    from nemo_rl.models.generation.sglang import sglang_generation
+
+    gen = _bare_generation_for_recover()
+    # A nonzero unconsumed count is real: the constructor's _start_engines
+    # reports the whole startup fleet until the first successful communicator
+    # setup consumes it. Rollback must RESTORE it, not zero it.
+    gen.num_new_engines = 3
+    fake_actor = MagicMock()
+
+    def fake_start_engines(port_cursors=None):
+        gen.all_engines[1] = fake_actor
+        gen.num_new_engines = 1
+        raise RuntimeError("port allocation died")
+
+    gen._start_engines = fake_start_engines
+    killed = []
+    monkeypatch.setattr(sglang_generation.ray, "get", MagicMock())
+    monkeypatch.setattr(
+        sglang_generation.ray, "kill", lambda actor: killed.append(actor)
+    )
+
+    with pytest.raises(RuntimeError, match="port allocation died"):
+        gen._recover()
+
+    assert gen.all_engines == ["survivor", None]
+    assert gen.num_new_engines == 3
+    assert killed == [fake_actor]
+
+
+def test_recover_rolls_back_when_the_offload_transition_fails(monkeypatch):
+    """Post-init recovery work is part of the same atomic attempt.
+
+    If the ``needs_offload`` release RPCs fail after the replacement
+    initialized, leaving the cohort published would make the next recovery
+    see no dead slot and rebind a partially transitioned engine. The whole
+    attempt must roll back — including a graceful shutdown of the (fully
+    initialized) replacement so no orphan server or router entry survives.
+    """
+    from unittest.mock import MagicMock
+
+    from nemo_rl.models.generation.sglang import sglang_generation
+
+    gen = _bare_generation_for_recover()
+    gen.needs_offload = True
+
+    gen._health_monitor = MagicMock(check_timeout=7.5)
+    fake_actor = MagicMock()
+
+    def fake_start_engines(port_cursors=None):
+        gen.all_engines[1] = fake_actor
+        gen.num_new_engines = 1
+        return (["init-handle"], {})
+
+    gen._start_engines = fake_start_engines
+
+    get_calls = []
+
+    def fake_get(handles, timeout=None):
+        get_calls.append((handles, timeout))
+        if len(get_calls) == 2:  # the first offload release RPC batch
+            raise RuntimeError("offload transition died")
+
+    killed = []
+    monkeypatch.setattr(sglang_generation.ray, "get", fake_get)
+    monkeypatch.setattr(
+        sglang_generation.ray, "kill", lambda actor: killed.append(actor)
+    )
+
+    with pytest.raises(RuntimeError, match="offload transition died"):
+        gen._recover()
+
+    assert gen.all_engines == ["survivor", None]
+    assert gen.num_new_engines == 0
+    assert killed == [fake_actor]
+    fake_actor.shutdown.remote.assert_called_once_with()
+    # The graceful step is BOUNDED by the monitor's configured per-RPC
+    # timeout — an unbounded ray.get could hang the rollback forever on a
+    # wedged replacement.
+    assert get_calls[2][1] == 7.5
+    gen._health_monitor._remove_router_worker.assert_called_once_with(1)
+    fake_actor.resume_memory_occupation.remote.assert_not_called()
+
+
+def test_refit_liveness_recovery_rollback_keeps_the_restart_budget(
+    monkeypatch, monitor_factory, fake_ray
+):
+    """A failed replacement cannot reset its boot budget during cohort rollback."""
+    monkeypatch.setattr(sglang_generation, "ray", fake_ray)
+    gen = _bare_generation_for_recover()
+    survivor = _FakeEngine()
+    dead = _FakeEngine(alive_fn=lambda: False)
+    replacement = _FakeEngine()
+    gen.all_engines = [survivor, dead]
+    gen._engine_urls = [None, None]
+    gen.num_new_engines = 3
+    gen._health_monitor = monitor_factory(gen, max_restarts=1)
+    gen._health_monitor.start()
+
+    def fail_init():
+        raise RuntimeError("replacement init died")
+
+    def start_engines(port_cursors):
+        assert gen.all_engines == [survivor, None]
+        gen.all_engines[1] = replacement
+        gen.num_new_engines = 1
+        return [fail_init], port_cursors
+
+    gen._start_engines = MagicMock(side_effect=start_engines)
+
+    with pytest.raises(RuntimeError, match="replacement init died"):
+        gen.recover_updatable_engines()
+
+    assert gen.all_engines == [survivor, None]
+    assert gen.num_new_engines == 3
+    assert fake_ray.killed == [dead, replacement]
+    assert gen._health_monitor._restart_attempts == [0, 1]
+    with pytest.raises(RuntimeError, match="exhausted rollout_max_restart_attempts"):
+        gen.recover_updatable_engines()
+    gen._start_engines.assert_called_once()
+
+
+@pytest.mark.parametrize("shutdown_fails", [False, True])
+def test_rollback_deregisters_each_logical_engine_before_actor_kill(
+    monkeypatch, shutdown_fails
+):
+    """Deregister a multi-node cohort even when its actors cannot shut down."""
+    gen = _bare_generation_for_recover()
+    actors = [MagicMock() for _ in range(6)]
+    gen.all_engines = actors.copy()
+    gen.num_gpus_per_engine = 2
+    gen.num_new_engines = 4
+    gen._health_monitor = MagicMock(check_timeout=7.5)
+    events = []
+    gen._health_monitor._remove_router_worker.side_effect = lambda engine_id: (
+        events.append(("deregister", engine_id))
+    )
+    get = MagicMock(side_effect=RayActorError() if shutdown_fails else None)
+    monkeypatch.setattr(sglang_generation.ray, "get", get)
+    monkeypatch.setattr(
+        sglang_generation.ray,
+        "kill",
+        lambda actor: events.append(("kill", actors.index(actor))),
+    )
+
+    gen._rollback_replacement_cohort([2, 3, 4, 5], pre_attempt_count=3)
+
+    assert events == [
+        ("deregister", 1),
+        ("deregister", 2),
+        ("kill", 2),
+        ("kill", 3),
+        ("kill", 4),
+        ("kill", 5),
+    ]
+    shutdown_refs = [actor.shutdown.remote.return_value for actor in actors[2:]]
+    shutdown_calls = [
+        call
+        for call in get.call_args_list
+        if any(call.args[0] is ref for ref in shutdown_refs)
+    ]
+    assert len(shutdown_calls) == 4
+    assert all(call.kwargs == {"timeout": 7.5} for call in shutdown_calls)
+    assert gen.all_engines == [*actors[:2], None, None, None, None]
+    assert gen.num_new_engines == 3
