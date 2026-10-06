@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from functools import partial
+from typing import cast
 
 from nemo_rl.data import ResponseDatasetConfig
 from nemo_rl.data.datasets.response_datasets.aime import AIMEDataset
@@ -135,12 +136,16 @@ def load_response_dataset(
     # that never calls `split_train_validation`).
     warn_on_unsupported_dataset_config_keys(dataset_class, data_config)
 
-    dataset_kwargs = dict(data_config)
     if dataset_name == "megatron_sft_packed":
-        dataset_kwargs["context_parallel_size"] = context_parallel_size
-    dataset = dataset_class(
-        **dataset_kwargs  # pyrefly: ignore[missing-argument]  `data_path` is required for some classes
-    )
+        packed_dataset_class = cast(type[MegatronSFTPackedDataset], dataset_class)
+        dataset = packed_dataset_class(
+            **data_config,  # pyrefly: ignore[missing-argument]  `data_path` and `chat_key` are required
+            context_parallel_size=context_parallel_size,
+        )
+    else:
+        dataset = dataset_class(
+            **data_config  # pyrefly: ignore[missing-argument]  `data_path` is required for some classes
+        )
 
     # bind prompt, system prompt and data processor
     dataset.set_task_spec(data_config)
