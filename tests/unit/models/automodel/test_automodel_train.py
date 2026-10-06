@@ -660,7 +660,7 @@ class TestLogprobsPostProcessor:
             vlm_kwargs={},
         )
 
-        result = processor(
+        result, _ = processor(
             logits=logits,
             data_dict=data_dict,
             processed_inputs=processed_inputs,
@@ -697,7 +697,7 @@ class TestLogprobsPostProcessor:
             vlm_kwargs={},
         )
 
-        result = processor(
+        result, _ = processor(
             logits=logits,
             data_dict=data_dict,
             processed_inputs=processed_inputs,
@@ -1810,7 +1810,7 @@ class TestLogprobsPostProcessorSeqPacking:
         with patch.object(
             torch.Tensor, "item", side_effect=AssertionError("per-sequence item()")
         ):
-            result = processor(
+            result, _ = processor(
                 logits=logits,
                 data_dict=data_dict,
                 processed_inputs=processed_inputs,
@@ -1857,7 +1857,7 @@ class TestLogprobsPostProcessorSeqPacking:
             vlm_kwargs={},
         )
 
-        result = processor(
+        result, _ = processor(
             logits=logits,
             data_dict=data_dict,
             processed_inputs=processed_inputs,
