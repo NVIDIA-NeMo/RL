@@ -43,6 +43,7 @@ from nemo_rl.utils.config import (
     load_config_with_inheritance,
     register_omegaconf_resolvers,
 )
+from nemo_rl.utils.outdated_config_checks import check_outdated_config
 
 # All tests in this module should run first
 pytestmark = pytest.mark.run_first
@@ -103,8 +104,9 @@ configs_dir = Path(
 config_files = glob.glob(str(configs_dir / "**/*.yaml"), recursive=True)
 assert len(config_files) > 0, "No config files found"
 
-# Every shipped config tree. Only the dtensor guard uses it -- most of examples/nemo_gym cannot
-# satisfy the schema test by design (env manifests, launcher templates, unset env interpolations).
+# Every shipped config tree. Only the outdated-config guard uses it -- most of examples/nemo_gym
+# cannot satisfy the schema test by design (env manifests, launcher templates, unset env
+# interpolations).
 repo_root = Path(os.path.join(os.path.dirname(absolute_path), "../..")).resolve()
 full_config_files = config_files + [
     path
@@ -356,46 +358,64 @@ def test_all_config_no_tp_size_accuracy_issues(config_file):
 
 
 @pytest.mark.parametrize("config_file", full_config_files)
-def test_all_config_dtensor_selects_v2(config_file):
-    """Test that no shipped config selects the DTensor v1 backend.
+def test_no_shipped_config_is_outdated(config_file):
+    """Test that every shipped config passes the same checks the entrypoints run.
 
-    v1 is being removed, so every dtensor_cfg that is enabled must pin _v2: true. An absent
-    _v2 is also a failure while the schema default is still False, since that silently
-    resolves to v1. The walk is recursive because dtensor_cfg also appears under teacher,
-    teachers[i] and env.reward_model, and distillation.py has no _v2 check of its own.
+    Reusing check_outdated_config keeps this from drifting: a check added there is
+    enforced on the shipped configs without a second implementation here.
     """
+    # Eval configs have a different structure from training configs, so the entrypoint
+    # checks do not apply to them. run_eval.py skips them for the same reason.
+    if "/evals/" in config_file:
+        pytest.skip("eval configs have a different structure from training configs")
 
     print(f"\nValidating config file: {config_file}")
 
     config = load_config_with_inheritance(config_file)
-    # resolve=False: _v2 / enabled are never interpolations, and resolving would fail on the
-    # configs that interpolate an env var CI does not set.
+    # resolve=False: the checked keys are never interpolations, and resolving would fail
+    # on the configs that interpolate an env var CI does not set.
     config_dict = OmegaConf.to_container(config, resolve=False)
 
-    def walk(node, path):
-        if isinstance(node, dict):
-            nested = node.get("dtensor_cfg")
-            if isinstance(nested, dict):
-                yield path, nested
-            for key, value in node.items():
-                if key != "dtensor_cfg":
-                    yield from walk(value, f"{path}.{key}" if path else key)
-        elif isinstance(node, list):
-            for index, value in enumerate(node):
-                yield from walk(value, f"{path}[{index}]")
+    try:
+        check_outdated_config(config_dict)
+    except ValueError as e:
+        raise AssertionError(f"Config file {config_file} is outdated: {e}") from e
 
-    for section, dtensor_cfg in walk(config_dict, ""):
-        v2 = dtensor_cfg.get("_v2", "<absent>")
 
-        # Mirrors reject_dtensor_v1, which fires on an explicit false regardless of enabled.
-        if v2 is False:
-            raise AssertionError(
-                f"Config file {config_file} sets {section}.dtensor_cfg._v2: false, which "
-                "selects the removed DTensor v1 backend. Set it to true."
-            )
+# Keep only the regressions tracked in #4427 on DeepEP until they pass validation.
+DEEPEP_FALLBACK_RECIPES = {
+    Path("recipes/llm/sft-nanov3-30BA3B-2n8g-fsdp2.yaml"),
+    Path("recipes/llm/sft-nanov3-30BA3B-2n4g-fsdp2.yaml"),
+    Path("recipes/llm/sft-gpt-oss-20b-1n8g-fsdp8ep8-automodel.yaml"),
+    Path("recipes/llm/sft-gpt-oss-20b-1n4g-fsdp4ep4-automodel.yaml"),
+    Path("recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v2.yaml"),
+    Path("recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-automodel-ep8.v1.yaml"),
+}
 
-        if dtensor_cfg.get("enabled") and v2 is not True:
-            raise AssertionError(
-                f"Config file {config_file} enables {section}.dtensor_cfg but does not set "
-                f"_v2: true (found {v2!r}). DTensor v2 is the only supported backend."
-            )
+
+@pytest.mark.parametrize("config_file", config_files)
+def test_automodel_moe_recipes_use_expected_dispatcher(
+    config_file: str,
+) -> None:
+    config = load_config_with_inheritance(config_file)
+    dtensor_cfg = OmegaConf.select(config, "policy.dtensor_cfg")
+    if (
+        dtensor_cfg is None
+        or not dtensor_cfg.enabled
+        or dtensor_cfg.get("expert_parallel_size", 1) <= 1
+    ):
+        pytest.skip("Not an AutoModel expert-parallel recipe")
+
+    backend = dtensor_cfg.automodel_kwargs.backend
+    assert "enable_deepep" not in backend
+    if Path(config_file).relative_to(configs_dir) in DEEPEP_FALLBACK_RECIPES:
+        assert backend.get("dispatcher") == "deepep"
+    else:
+        assert backend.get("dispatcher") in {"hybridep", "torch"}
+    if backend.dispatcher == "hybridep":
+        assert backend.get("experts") is not None, (
+            f"{config_file}: HybridEP must explicitly select an experts backend"
+        )
+        assert config.policy.make_sequence_length_divisible_by % 64 == 0, (
+            f"{config_file}: HybridEP input width must be padded to a multiple of 64"
+        )

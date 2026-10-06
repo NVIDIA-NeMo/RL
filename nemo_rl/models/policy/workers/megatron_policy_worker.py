@@ -2208,6 +2208,13 @@ class MegatronPolicyWorkerImpl(
                     out[k] = v
                 else:
                     out[k] = _scale_metric(k, v)
+            if draft_step_state.active:
+                # The policy and draft objectives can use different denominators.
+                # Combine them only after each component has been normalized.
+                out["total_loss"] = (
+                    out["loss"]
+                    + self.cfg["draft"].loss_weight * out[DRAFT_LOSS_METRIC_KEY]
+                )
             out["lr"] = curr_lr
             out["wd"] = curr_wd
             out["global_valid_seqs"] = global_valid_seqs_f
