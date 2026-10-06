@@ -1732,7 +1732,7 @@ def setup_single_controller(
         )
         setup_timing_metrics.teacher_reservation_time_s = time.perf_counter() - t0
 
-    if master_config.reference is None:
+    if master_config.reference_resources is None:
         if train_cluster is not inference_cluster:
             train_cluster.get_placement_groups()
         reserve_generation()

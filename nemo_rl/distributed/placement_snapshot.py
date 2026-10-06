@@ -39,16 +39,16 @@ def build_placement_snapshot(
         node_devices = devices.get(node_id, {})
         resources = node["Resources"]
         labels = node.get("Labels", {})
-        domain = labels.get(LABEL_PREFIX + "nvlink-domain") or next(
+        domain = next(
             (
                 key.removeprefix("nvlink_domain_")
                 for key in resources
                 if key.startswith("nvlink_domain_")
             ),
-            "unknown",
+            labels.get(LABEL_PREFIX + "nvlink-domain", "unknown"),
         )
         rank = int(
-            labels.get(LABEL_PREFIX + "topo-rank", resources.get("topo_rank", -1))
+            resources.get("topo_rank", labels.get(LABEL_PREFIX + "topo-rank", -1))
         )
         capacity = int(resources.get("GPU", 0))
         inventory = labels.get(LABEL_PREFIX + "gpu-ids", "")
@@ -86,7 +86,7 @@ def build_placement_snapshot(
     return result
 
 
-def print_actor_placement(actor_args: Any, config: Any, **render_options: Any) -> None:
+def print_actor_placement(actor_args: Any, config: Any) -> None:
     # Keep pure snapshot/renderer tests independent of Ray's optional runtime.
     import ray
 
@@ -151,4 +151,4 @@ def print_actor_placement(actor_args: Any, config: Any, **render_options: Any) -
         for node in snapshot:
             node.cpu_actors = ("inventory unavailable",)
         print(f"CPU actor inventory incomplete: {inventory_error}", flush=True)
-    print(render_placement(snapshot, teachers=teachers, **render_options), flush=True)
+    print(render_placement(snapshot, teachers=teachers), flush=True)

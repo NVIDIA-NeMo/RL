@@ -74,9 +74,6 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         lambda: (
             Namespace(
                 config="config.yaml",
-                placement_full=False,
-                placement_host=None,
-                placement_domain=None,
             ),
             [],
         ),

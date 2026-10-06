@@ -5,7 +5,6 @@
 import re
 from collections import defaultdict
 from dataclasses import dataclass
-from fnmatch import fnmatchcase
 from itertools import groupby
 
 
@@ -48,18 +47,10 @@ def render_placement(
     nodes: list[NodePlacement],
     *,
     teachers: dict[str, tuple[tuple[str, ...], str]] | None = None,
-    full: bool = False,
-    host_filter: str | None = None,
-    domain_filter: str | None = None,
 ) -> str:
-    """Render a snapshot; filters use shell patterns and totals cover matching hosts."""
+    """Print every distinct layout, collapsing only exact repeated rows."""
     selected = sorted(
-        (
-            node
-            for node in nodes
-            if (host_filter is None or fnmatchcase(node.hostname, host_filter))
-            and (domain_filter is None or fnmatchcase(node.domain, domain_filter))
-        ),
+        nodes,
         key=lambda node: (node.domain, node.topo_rank, node.hostname),
     )
     gpu_ids = sorted({gpu for node in selected for gpu in node.gpu_ids})
@@ -83,14 +74,10 @@ def render_placement(
             else len(node.gpu_ids)
         )
         key = (node.domain, str(capacity), *cells, cpu)
-        if full:
-            key = (*key, node.node_id)
         groups.setdefault(key, []).append(node.hostname)
     rows = [header]
-    # Bound the default log view; full/filtered views expose irregular fleets.
-    visible_groups = list(groups.items()) if full else list(groups.items())[:20]
-    for key, hosts in visible_groups:
-        domain, gpu_count, *cells = key[:-1] if full else key
+    for key, hosts in groups.items():
+        domain, gpu_count, *cells = key
         rows.append([domain, _host_ranges(hosts), gpu_count, *cells])
     widths = [max(len(row[i]) for row in rows) for i in range(len(header))]
 
@@ -117,11 +104,6 @@ def render_placement(
             output.append(
                 f"  {label}: aliases=[{', '.join(aliases)}], checkpoint={checkpoint}"
             )
-    if len(visible_groups) < len(groups):
-        output.append(
-            f"{len(groups) - len(visible_groups)} more layouts. Use --placement-full, "
-            "--placement-host PATTERN, or --placement-domain PATTERN to inspect them."
-        )
     assigned = sum(len(node.gpu_roles) for node in selected)
     unused = (
         sum(
@@ -143,7 +125,7 @@ def render_placement(
     output.extend(
         [
             f"Total: {len(selected)} hosts, {assigned} assigned GPUs, {unused} unused GPUs",
-            "Shared GPUs count once. Totals cover all hosts matching the filters.",
+            "Shared GPUs count once. Totals cover every live Ray host.",
             'Domain "host-local" means each host has its own domain; "unknown" means unavailable.',
             "=== End actor placement ===",
         ]

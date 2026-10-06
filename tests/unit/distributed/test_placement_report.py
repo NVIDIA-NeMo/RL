@@ -50,17 +50,17 @@ def test_thousand_regular_hosts_compress_without_omitting_members():
     assert "1000 hosts" in output and "8000 assigned GPUs" in output
 
 
-def test_full_and_filtered_views_do_not_hide_irregular_hosts():
+def test_irregular_gpu_ids_and_domains_are_all_printed():
     from nemo_rl.distributed.placement_report import NodePlacement, render_placement
 
     rows = [
         NodePlacement("a", "worker-alice", "A", 2, (0, 2), {2: ("T1",)}, ()),
         NodePlacement("b", "worker-bob", "B", 1, (0, 1), {0: ("R",)}, ()),
     ]
-    output = render_placement(rows, host_filter="worker-alice", full=True)
-    assert "worker-alice" in output and "worker-bob" not in output
+    output = render_placement(rows)
+    assert "worker-alice" in output and "worker-bob" in output
     assert "GPU2" in output and "T1" in output
-    assert "1 assigned GPUs" in output
+    assert "2 assigned GPUs" in output
 
 
 def test_teacher_legend_uses_only_supplied_metadata():
@@ -74,7 +74,7 @@ def test_teacher_legend_uses_only_supplied_metadata():
     assert "math" not in output
 
 
-def test_irregular_fleet_has_bounded_default_and_explicit_full_view():
+def test_irregular_fleet_does_not_omit_any_layout():
     from nemo_rl.distributed.placement_report import NodePlacement, render_placement
 
     rows = [
@@ -83,8 +83,8 @@ def test_irregular_fleet_has_bounded_default_and_explicit_full_view():
         )
         for i in range(1000)
     ]
-    compact = render_placement(rows)
-    assert len(compact.splitlines()) < 40
-    assert "980 more layouts" in compact
-    assert "1000 hosts" in compact
-    assert len(render_placement(rows, full=True).splitlines()) > 1000
+    output = render_placement(rows)
+    assert "1000 hosts" in output
+    assert "more layouts" not in output
+    for i in range(1000):
+        assert f"cpu-{i} " in output

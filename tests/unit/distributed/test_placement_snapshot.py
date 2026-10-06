@@ -48,6 +48,18 @@ def test_head_keeps_physical_domain_and_cpu_actors_with_no_schedulable_gpus():
     assert rows[0].cpu_actors == ("Gym",)
 
 
+def test_compute_topology_uses_existing_ray_resources():
+    worker = node("worker", 0)
+    worker["Resources"].update({"nvlink_domain_fabric-A": 1, "topo_rank": 3})
+    worker["Labels"] = {
+        "nrl.nvidia.com/nvlink-domain": "stale-label",
+        "nrl.nvidia.com/topo-rank": "9",
+    }
+    row = build_placement_snapshot([worker], [], {})[0]
+    assert row.domain == "fabric-A"
+    assert row.topo_rank == 3
+
+
 def test_explicit_roles_disambiguate_same_class_and_noncontiguous_devices():
     rows = build_placement_snapshot(
         [node("1", 2, {"nrl.nvidia.com/gpu-ids": "0.2"})],

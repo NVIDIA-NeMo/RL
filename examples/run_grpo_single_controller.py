@@ -72,15 +72,6 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument(
         "--config", type=str, default=None, help="Path to YAML config file"
     )
-    parser.add_argument(
-        "--placement-full", action="store_true", help="Print one placement row per host"
-    )
-    parser.add_argument(
-        "--placement-host", help="Filter placement hosts with a shell pattern"
-    )
-    parser.add_argument(
-        "--placement-domain", help="Filter placement domains with a shell pattern"
-    )
     args, overrides = parser.parse_known_args()
     return args, overrides
 
@@ -203,13 +194,7 @@ def main() -> None:
             setup_timing_metrics=setup_timing_metrics,
         )
         ray.get(sc.ping.remote())
-        print_actor_placement(
-            actor_args,
-            config,
-            full=args.placement_full,
-            host_filter=args.placement_host,
-            domain_filter=args.placement_domain,
-        )
+        print_actor_placement(actor_args, config)
         result = _run_with_controller_liveness_watch(sc, config.async_rl.stall_watchdog)
         print(f"SC run complete: {result}")
     finally:
