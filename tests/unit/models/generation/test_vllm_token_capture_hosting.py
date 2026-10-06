@@ -672,7 +672,7 @@ def _batch_worker_fixture(lengths, *, batch_size=256, max_tokens=4_194_304):
             GenerationCutPrefix(
                 ticket_id=f"t{i}",
                 rollout_id=f"r{i}",
-                attempt_index=0,
+                attempt=0,
                 model_call_id=f"c{i}",
                 admitted_at=1.0,
             )
