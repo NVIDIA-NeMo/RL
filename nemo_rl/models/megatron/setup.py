@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import datetime
 import hashlib
 import json
 import os
@@ -319,7 +320,7 @@ def setup_distributed() -> None:
     # Ensure clean slate before import
     destroy_parallel_state()
     # Initialize process group
-    torch.distributed.init_process_group("nccl")
+    torch.distributed.init_process_group("nccl", timeout=datetime.timedelta(seconds=int(os.environ.get("NRL_INIT_PG_TIMEOUT", 600))))
 
 
 def validate_and_set_config(
