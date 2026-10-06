@@ -1,0 +1,14 @@
+# Credentials are resolved inside Gym, not printed in the RL MasterConfig.
+deepseek_v4_flash_judge_model:
+  responses_api_models:
+    inference_provider:
+      entrypoint: app.py
+      base_url: ${oc.env:REASONING_JUDGE_BASE_URL}
+      api_key: ${oc.env:REASONING_JUDGE_API_KEY,EMPTY}
+      model: ${oc.env:REASONING_JUDGE_MODEL}
+      uses_reasoning_parser: true
+      num_concurrent_requests: 256
+      extra_body:
+        chat_template_kwargs:
+          thinking: true
+          reasoning_effort: high

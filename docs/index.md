@@ -114,6 +114,13 @@ Step-by-step guide for supervised fine-tuning on the OpenMathInstruct2 dataset.
 Post-train Nemotron 3 Ultra with RLVR, teacher training, and MOPD stages on GB200 NVL72 hardware.
 :::
 
+:::{grid-item-card} {octicon}`rocket` Nemotron 3.5 Super
+:link: guides/models/nemotron/nemotron-3.5-super
+:link-type: doc
+
+Train an RLVR student, specialize RLHF/reasoning/vision teachers, and combine them with MOPD.
+:::
+
 :::{grid-item-card} {octicon}`stack` Environments
 :link: guides/environments
 :link-type: doc

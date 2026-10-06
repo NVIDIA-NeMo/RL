@@ -1,0 +1,9 @@
+# Resolve credentials only inside Gym, outside the printed RL MasterConfig.
+nl2bash_judge_model:
+  responses_api_models:
+    local_vllm_model:
+      api_key: ${oc.env:NL2BASH_API_KEY,EMPTY}
+safety_judge_model:
+  responses_api_models:
+    local_vllm_model:
+      api_key: ${oc.env:SAFETY_API_KEY,EMPTY}

@@ -1,0 +1,5 @@
+# Resolve credentials only inside Gym. An empty/local vLLM service needs no key.
+genrm_model:
+  responses_api_models:
+    genrm_model:
+      api_key: ${oc.env:GENRM_API_KEY,EMPTY}
