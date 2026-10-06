@@ -562,7 +562,7 @@ class GymCheckpointCoordinator:
         checkpoint_id: str,
         episodes_by_instance: Mapping[str, tuple[GymCheckpointEpisode, ...]],
     ) -> None:
-        """Discard selected physical attempts from every Gym deployment."""
+        """Retire selected physical attempts from every Gym deployment."""
         inventory = self._validate_inventory(episodes_by_instance)
         deadline_ts = self._deadline()
         await self._collect(
@@ -578,12 +578,12 @@ class GymCheckpointCoordinator:
             deadline_ts=deadline_ts,
         )
 
-    async def discard_restored(
+    async def retire_restored(
         self,
         restore_id: str,
         manifest: GymCheckpointManifest,
     ) -> None:
-        """Fence the replacement attempts installed by a successful restore."""
+        """Retire the replacement attempts installed by a successful restore."""
         await self.retire(
             restore_id,
             {
@@ -618,7 +618,7 @@ class GymCheckpointCoordinator:
             )
         except GymCheckpointOperationError as error:
             # Gym makes one deployment's restore atomic. RL must extend that
-            # guarantee across independent Gym actors. Fence replacement
+            # guarantee across independent Gym actors. Retire replacement
             # attempts on every actor before reopening them: a failed Ray reply
             # or actor-local validation error is an uncertain outcome, so the
             # remote restore may have succeeded before the failure reached this
@@ -627,7 +627,7 @@ class GymCheckpointCoordinator:
             try:
                 cleanup_deadline_ts = self._deadline()
                 await self._collect(
-                    "restore_cleanup",
+                    "restore_retire",
                     {
                         instance_id: self._handles[
                             instance_id
