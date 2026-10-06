@@ -221,6 +221,11 @@ class RolloutStats:
 
     committed: int = 0
     skipped: int = 0
+    # Groups discarded by dynamic sampling because every generation scored the same,
+    # so the group carries no advantage signal. Counted apart from the failure
+    # budgets above: this is a deliberate policy drop of a healthy rollout, and
+    # conflating it with a data or infra failure would make the fleet look sick.
+    zero_variance_groups: int = 0
     # Infra re-dispatches: the fleet is degrading. Kept apart from data retries because
     # conflating them defeats the whole point of the two-budget split -- an operator
     # watching redispatch_total climb needs to know whether the cluster is sick or the
@@ -1598,10 +1603,15 @@ class RolloutManager:
         retry_policy: Optional[RolloutRetryPolicy] = None,
         effort_config: Optional[EffortLevelsConfig] = None,
         log_full_result_tables: bool = False,
+        filter_zero_variance_groups: bool = False,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
         )
+        # Dynamic sampling (DAPO): a group whose generations all scored the same gives
+        # every one of its rows zero advantage, so generate_and_push reports it as
+        # SKIPPED and the caller substitutes a spare.
+        self._filter_zero_variance_groups = filter_zero_variance_groups
         # Resolved before the impl is built: the NeMo-Gym impl reads its row-retry
         # budget out of it at construction time, and shares the counters so its
         # row-level re-dispatches land in the same place as everything else.
@@ -1829,6 +1839,21 @@ class RolloutManager:
             recovery_granularity=recovery_granularity,
         )
 
+    @staticmethod
+    def _is_zero_variance_group(record: PromptGroupRecord) -> bool:
+        """Whether this group's rewards carry no advantage signal.
+
+        Same predicate as ``calculate_trivial_reward_distributions`` in
+        ``nemo_rl.algorithms.utils``, which the v1 path applies across a whole batch:
+        a group is trivial when it holds at most one reward or when all of them are
+        exactly equal. Exact equality rather than a standard-deviation threshold
+        because roundoff can leave a uniform group with a positive std. Restated on a
+        list of floats here because this runs on one group, before any of it is
+        batched into tensors; keep the two in step.
+        """
+        rewards = [completion.reward for completion in record.completions]
+        return len(rewards) <= 1 or max(rewards) == min(rewards)
+
     async def generate_and_push(
         self,
         input_sample: DatumSpec,
@@ -1952,6 +1977,19 @@ class RolloutManager:
                 finally:
                     if inflight_registry is not None:
                         inflight_registry.pop(tq_group_id, None)
+                if self._filter_zero_variance_groups and self._is_zero_variance_group(
+                    record
+                ):
+                    # Checked before commit so no rows are written, but the slot was
+                    # already reserved above and must be released the same way a
+                    # failed attempt releases it. Unlike the failure paths below this
+                    # spends no retry budget: the rollout was healthy, it just has
+                    # nothing to teach, so re-running this prompt would most likely
+                    # produce another uniform group.
+                    await self._tq_buffer.remove_group(tq_group_id)
+                    self._stats.zero_variance_groups += 1
+                    rewards = [c.reward for c in record.completions]
+                    return RolloutOutcome.SKIPPED
                 end_version = self._weight_version
                 await self._tq_buffer.commit(
                     tq_group_id,
