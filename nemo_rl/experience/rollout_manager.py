@@ -72,6 +72,7 @@ from nemo_rl.experience.rollout_recovery import (
     RolloutAttemptStatus,
     RolloutRecoveryLedger,
     SiblingSealResult,
+    UnresolvedCaptureAcknowledgement,
 )
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
@@ -2198,20 +2199,12 @@ class RolloutManager:
                     inflight_registry=inflight_registry,
                 )
             except Exception as error:
-                if (
-                    self._context_compaction
-                    and classify_rollout_failure(error) is not FailureClass.INFRA
-                ):
+                if isinstance(error, UnresolvedCaptureAcknowledgement):
                     raise
                 reason = type(error).__name__
                 if classify_rollout_failure(error) is FailureClass.INFRA:
                     infra_attempts += 1
                     last_infra_error = error
-                    # CC selections are request-local until checkpoint recovery
-                    # persists them. Drop this abandoned group through the usual
-                    # bounded policy; do not redispatch and lose sealed selections.
-                    if self._context_compaction:
-                        break
                     if infra_attempts >= policy.max_infra_attempts:
                         break
                     self._stats.record_redispatch(reason)
@@ -2297,9 +2290,6 @@ class RolloutManager:
             rollout_ids=list(rollout_ids),
         )
         pending_group_results: dict[int, SiblingSealResult] = {}
-        # CC does not retry or checkpoint; keep selected-response metadata in this request
-        # while the existing ledger tracks sibling completion and publication.
-        cc_selections = {}
 
         async def _record_streamed_completion(
             generation_index: int, completion: Completion
@@ -2312,16 +2302,11 @@ class RolloutManager:
             if "ng_receipt" not in env_extras:
                 raise ValueError("token-capture completion must contain ng_receipt")
             receipt = env_extras["ng_receipt"]
+            selection = None
             if self._context_compaction:
                 selection = env_extras.get("ng_logical_selection")
                 if not selection:
                     raise ValueError("CC completion must contain selected responses")
-                if (
-                    generation_index in cc_selections
-                    and cc_selections[generation_index] != selection
-                ):
-                    raise ValueError("conflicting duplicate CC completion")
-                cc_selections[generation_index] = selection
             gate_rollout_id = env_extras.get("ng_rollout_id")
             if receipt is not None and not isinstance(receipt, dict):
                 raise ValueError(
@@ -2363,6 +2348,7 @@ class RolloutManager:
                     receipt=receipt,
                     reward=completion.reward,
                     mask_sample=mask_sample,
+                    logical_selection=selection,
                 )
                 previous = pending_group_results.get(generation_index)
                 if previous is not None:
@@ -2392,6 +2378,7 @@ class RolloutManager:
                     receipt=receipt,
                     reward=completion.reward,
                     mask_sample=mask_sample,
+                    logical_selection=selection,
                 )
 
         try:
@@ -2435,7 +2422,12 @@ class RolloutManager:
                 mask_sample=tuple(mask_sample),
                 loss_multiplier=float(input_sample.get("loss_multiplier", 1.0)),
                 logical_selections=(
-                    tuple(cc_selections[i] for i in range(len(rollout_ids)))
+                    tuple(
+                        sibling.current_attempt.logical_selection
+                        for sibling in self._recovery_ledger.get_group(
+                            group_id
+                        ).siblings
+                    )
                     if self._context_compaction
                     else None
                 ),
@@ -2447,6 +2439,10 @@ class RolloutManager:
 
             assert_metadata_only(request)
             return request
+        except UnresolvedCaptureAcknowledgement:
+            # Neither retry nor abandon an attempt whose capture writes may still
+            # be in flight. Surface the failure with its ledger ownership intact.
+            raise
         except BaseException:
             # Abandoned dispatch: no receipt will name these rollouts' staged
             # rows, so they leak until the staging partition is torn down at
