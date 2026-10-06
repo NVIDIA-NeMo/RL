@@ -174,11 +174,15 @@ runs:
         echo -e "\033[1;34m└──────────────────────────────────────────────────────────────────────────┘\033[0m"
 
         echo "::group::Logs"
+        # docker/Dockerfile always installs Alloy, so NEMO_RL_REQUIRE_ALLOY turns
+        # the config validation test's skip into a failure: losing that COPY should
+        # be a red job rather than a silently dropped check.
         docker run --rm -u root --runtime=nvidia --gpus all \
           --shm-size=64g \
           "${RDMA_FLAGS[@]}" \
           --env TRANSFORMERS_OFFLINE=0 \
           --env GHA_RUNNER=${{ inputs.runner }} \
+          --env NEMO_RL_REQUIRE_ALLOY=1 \
           --env HYDRA_FULL_ERROR=1 \
           --env HF_HOME=/home/TestData/nemo-rl/hf_home \
           --env HF_DATASETS_CACHE=/home/TestData/nemo-rl/hf_datasets_cache \

@@ -174,26 +174,41 @@ sbatch ray.sub \
     `NUM_NODES`" check in `tools/launch`.
 * - `BASE_LOG_DIR=$SLURM_SUBMIT_DIR`
   - Base directory for storing Ray logs. Defaults to the Slurm submission directory ([SLURM_SUBMIT_DIR](https://slurm.schedmd.com/sbatch.html#OPT_SLURM_SUBMIT_DIR)).
-* - `RAY_ALLOY_ENABLED=0`
-  - Set to `1` to stream logs to a Loki endpoint with
+* - `LOKI_PUSH_URL`
+  - Set this to stream logs to a Loki endpoint with
     [Grafana Alloy](https://grafana.com/docs/alloy/), which runs alongside each
-    Ray container. Four streams are shipped, distinguished by the `log_kind`
-    label: Ray's own logs under `/tmp/ray/session_*/logs` (`ray-internal`),
-    which are otherwise lost when the container exits; this container's wrapper
-    log (`wrapper`); the driver log (`driver`); and the sandbox sidecar logs
-    (`sandbox`). Unlike `RAY_LOG_SYNC_FREQUENCY`, which copies the same files to
-    `BASE_LOG_DIR`, this sends them over the network and so does not add
-    per-file writes to the shared filesystem.
+    Ray container. Unset by default, which leaves log export off. Four streams
+    are shipped, distinguished by the `log_kind` label: Ray's own logs under
+    `/tmp/ray/session_*/logs` (`ray-internal`), which are otherwise lost when
+    the container exits; this container's wrapper log (`wrapper`); the driver
+    log (`driver`); and the sandbox sidecar logs (`sandbox`). Unlike
+    `RAY_LOG_SYNC_FREQUENCY`, which copies the same files to `BASE_LOG_DIR`,
+    this sends them over the network and so does not add per-file writes to the
+    shared filesystem.
+
+    It is separate from `telemetry.logs_enabled`
+    ([observability](observability/observability-stack.md)), which sends Python
+    log records from NeMo-RL processes over OTLP and does not see these files.
 
     Requires an image providing `/usr/local/bin/alloy` (the included
-    `docker/Dockerfile` installs it), a readable `alloy/config.alloy` under the
-    submission directory, and the endpoint plus mTLS credentials:
-    `LOKI_PUSH_URL`, `LOKI_CA_FILE`, `LOKI_CERT_FILE`, and `LOKI_KEY_FILE`. The
-    certificates are read inside the container, so their directory must be
-    listed in `MOUNTS`.
+    `docker/Dockerfile` installs it) and a readable `alloy/config.alloy` under
+    the submission directory.
 
-    If anything is missing, `ray.sub` logs a warning naming it and the job runs
-    normally without exporting logs.
+    The shipped config authenticates with mTLS, so it also needs
+    `LOKI_CA_FILE`, `LOKI_CERT_FILE`, and `LOKI_KEY_FILE`. These are read inside
+    the container, so their directory must be listed in `MOUNTS`. For any other
+    scheme Loki supports, such as basic auth, a bearer token, or a tenant ID,
+    copy the config, edit its `loki.write` block, and point `ALLOY_CONFIG` at
+    the copy; the certificate variables are then not required.
+
+    If anything is missing, or if Alloy fails to start, `ray.sub` logs a warning
+    and the job runs normally without exporting logs.
+* - `ALLOY_CONFIG=$SLURM_SUBMIT_DIR/alloy/config.alloy`
+  - Path to the Alloy configuration, read inside the container. Override it to
+    use a config with different auth or different log sources.
+* - `CLUSTER_NAME=$SLURM_CLUSTER_NAME`
+  - Value of the `cluster` label on exported logs. Defaults to the cluster name
+    Slurm reports, so it only needs setting to label streams with something else.
 * - `NODE_MANAGER_PORT=1301`
   - Port for the Ray node manager on worker nodes.
 * - `OBJECT_MANAGER_PORT=1303`

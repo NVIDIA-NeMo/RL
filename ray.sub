@@ -184,9 +184,8 @@ MAX_WORKER_PORT=${MAX_WORKER_PORT:-2999}
 ########################################################
 # Number seconds to sync logs from /tmp/ray/session_*/logs to $LOG_DIR/ray/
 RAY_LOG_SYNC_FREQUENCY=${RAY_LOG_SYNC_FREQUENCY:-}
-# Stream those same logs to Loki over the network instead of copying them to the
-# shared filesystem. Requires an image with Grafana Alloy and the LOKI_* vars.
-export RAY_ALLOY_ENABLED=${RAY_ALLOY_ENABLED:-0}
+# Setting LOKI_PUSH_URL streams those same logs to Loki over the network instead
+# of copying them to the shared filesystem. Requires an image with Grafana Alloy.
 ########################################################
 
 # Unset UV_CACHE_DIR to avoid local cache directory interferring with the container cache
@@ -650,9 +649,9 @@ fi
 # sourced early in them so it inherits SLURM_* before the scrub.
 ALLOY_SIDECAR_FILE="$LOG_DIR/alloy_sidecar.sh"
 cat > "$ALLOY_SIDECAR_FILE" <<EOF
-[[ "\${RAY_ALLOY_ENABLED:-0}" == "1" ]] || return 0
+[[ -n "\${LOKI_PUSH_URL:-}" ]] || return 0
 
-ALLOY_CONFIG="$SLURM_SUBMIT_DIR/alloy/config.alloy"
+ALLOY_CONFIG="\${ALLOY_CONFIG:-$SLURM_SUBMIT_DIR/alloy/config.alloy}"
 # Alloy resolves the endpoint and certs itself and only reports failures to its
 # own log, so check them here instead: a missing export should say so in the
 # wrapper log rather than silently ship nothing.
@@ -660,14 +659,21 @@ _alloy_missing=()
 [[ -x /usr/local/bin/alloy ]] || _alloy_missing+=(/usr/local/bin/alloy)
 [[ -r "\$ALLOY_CONFIG" ]] || _alloy_missing+=("\$ALLOY_CONFIG")
 command -v setsid >/dev/null || _alloy_missing+=(setsid)
-[[ -n "\${LOKI_PUSH_URL:-}" ]] || _alloy_missing+=(LOKI_PUSH_URL)
-for _v in LOKI_CA_FILE LOKI_CERT_FILE LOKI_KEY_FILE; do
-  [[ -r "\${!_v:-}" ]] || _alloy_missing+=("\$_v=\${!_v:-unset}")
-done
+# Only the shipped config authenticates with mTLS; a custom ALLOY_CONFIG brings
+# its own auth, which Alloy validates itself.
+if [[ "\$ALLOY_CONFIG" == "$SLURM_SUBMIT_DIR/alloy/config.alloy" ]]; then
+  for _v in LOKI_CA_FILE LOKI_CERT_FILE LOKI_KEY_FILE; do
+    [[ -r "\${!_v:-}" ]] || _alloy_missing+=("\$_v=\${!_v:-unset}")
+  done
+fi
 if (( \${#_alloy_missing[@]} )); then
   echo "[WARNING] Alloy log export disabled, unusable: \${_alloy_missing[*]}" >&2
   return 0
 fi
+
+# Slurm names the cluster in every job, so the label is populated without the
+# user having to export anything.
+export CLUSTER_NAME="\${CLUSTER_NAME:-\${SLURM_CLUSTER_NAME:-}}"
 
 if [[ "\$RAY_NODE_ROLE" == head ]]; then
   export RAY_WRAPPER_LOG_FILE="$LOG_DIR/ray-head.log"
@@ -699,8 +705,17 @@ alloy_stop() {
 
 # New session: teardown signals the wrapper's process group, and Alloy has to
 # outlive that to ship the final lines.
-setsid /usr/local/bin/alloy run "\$ALLOY_CONFIG" --storage.path=/tmp/alloy-state > "$LOG_DIR/alloy-\$(hostname).log" 2>&1 &
+# --disable-reporting: Alloy otherwise posts a usage report to stats.grafana.org
+# every few hours, from every node.
+setsid /usr/local/bin/alloy run "\$ALLOY_CONFIG" --storage.path=/tmp/alloy-state --disable-reporting > "$LOG_DIR/alloy-\$(hostname).log" 2>&1 &
 ALLOY_PID=\$!
+# Alloy exits within a second if it cannot bind its HTTP port or load the
+# config. Without this the line below would claim success and ship nothing.
+sleep 2
+if ! kill -0 "\$ALLOY_PID" 2>/dev/null; then
+  echo "[WARNING] Alloy exited at startup; see $LOG_DIR/alloy-\$(hostname).log" >&2
+  return 0
+fi
 echo "[INFO] Alloy started (pid \$ALLOY_PID)"
 trap alloy_stop EXIT
 # Without a TERM trap bash dies before EXIT runs, so a cancelled job loses

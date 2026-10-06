@@ -96,7 +96,7 @@ apt-get clean
 rm -rf /var/lib/apt/lists/*
 EOF
 
-# Grafana Alloy (Apache-2.0), started by ray.sub when RAY_ALLOY_ENABLED=1.
+# Grafana Alloy (Apache-2.0), started by ray.sub when LOKI_PUSH_URL is set.
 COPY --from=grafana/alloy:v1.18.0 /bin/alloy /usr/local/bin/alloy
 
 # CMake (for CUDA extension builds: transformer-engine, mamba-ssm, etc.)
