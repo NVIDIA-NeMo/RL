@@ -1378,6 +1378,26 @@ class AsyncNemoGymRolloutImpl:
                     penalty_counts, len(completed_results)
                 )
             )
+            # Match the legacy path's first-prompt diagnostic when tokens are
+            # available. Receipt mode defers token reconstruction to the finalizer.
+            # SingleController baselines use logical group ids, so distinct
+            # rendered prompts here do not imply zero advantages.
+            if all("receipt" not in result for result in completed_results):
+                first_prompt_logs = [
+                    [
+                        {"token_ids": torch.as_tensor(message["token_ids"])}
+                        for message in result["input_message_log"]
+                    ]
+                    for result in completed_results
+                ]
+                first_prompts, _ = batched_message_log_to_flat_message(
+                    first_prompt_logs,
+                    pad_value_dict={"token_ids": self._tokenizer.pad_token_id},
+                )
+                rollout_metrics["baseline_groups/distinct_first_prompts"] = int(
+                    torch.unique(first_prompts["token_ids"], dim=0).shape[0]
+                )
+                rollout_metrics["baseline_groups/samples"] = len(completed_results)
 
         rollout_metrics.update(env_timing_metrics)
         for handle in shard_set.all_handles:

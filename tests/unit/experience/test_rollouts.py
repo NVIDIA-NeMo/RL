@@ -2827,20 +2827,23 @@ def _postprocess_two_rollouts(first_prompts):
 
 
 def test_postprocess_nemo_gym_group_counts_distinct_first_prompts(caplog):
-    """The trainer groups the GRPO baseline by exact equality of the first prompt
-    token ids, so the postprocessing reports how many distinct first prompts the
-    group's rollouts carry and logs an error when every rollout has its own,
-    which zeroes every advantage without any other symptom."""
-    with caplog.at_level("ERROR", logger="nemo_rl.experience.rollouts"):
+    """Report distinct prompts and warn conditionally about singleton GRPO groups.
+
+    The same postprocessor serves evaluation and non-GRPO algorithms, so the
+    warning must not claim that every caller actually has zero advantages.
+    """
+    with caplog.at_level("WARNING", logger="nemo_rl.experience.rollouts"):
         shared = _postprocess_two_rollouts([[1, 5, 7], [1, 5, 7]])
     assert shared.rollout_metrics["baseline_groups/distinct_first_prompts"] == 1
     assert shared.rollout_metrics["baseline_groups/samples"] == 2
-    assert not [r for r in caplog.records if "distinct first prompt" in r.getMessage()]
+    assert not [r for r in caplog.records if "distinct first prompts" in r.getMessage()]
 
-    with caplog.at_level("ERROR", logger="nemo_rl.experience.rollouts"):
+    with caplog.at_level("WARNING", logger="nemo_rl.experience.rollouts"):
         distinct = _postprocess_two_rollouts([[1, 5, 7], [1, 5, 9]])
     assert distinct.rollout_metrics["baseline_groups/distinct_first_prompts"] == 2
-    [record] = [r for r in caplog.records if "distinct first prompt" in r.getMessage()]
+    [record] = [r for r in caplog.records if "distinct first prompts" in r.getMessage()]
     assert (
-        record.levelname == "ERROR" and "every advantage is zero" in record.getMessage()
+        record.levelname == "WARNING"
+        and "If these rows remain singleton prompt-token GRPO baseline groups"
+        in record.getMessage()
     )
