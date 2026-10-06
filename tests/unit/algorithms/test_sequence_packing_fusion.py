@@ -38,6 +38,7 @@ from nemo_rl.algorithms.loss import (
 )
 from nemo_rl.algorithms.loss.interfaces import LossInputType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.utils.sequence_lengths import to_cpu_int_tuple
 
 
 @pytest.mark.parametrize("top_k", [None, 1])
@@ -54,8 +55,8 @@ def test_prepare_packed_loss_input_preserves_prepacked_layout(monkeypatch, top_k
             "cu_seqlens_padded": [torch.tensor([0, 4, 8], dtype=torch.int32)],
         }
     )
-    cu_seqlens = data["cu_seqlens"][0]
-    cu_seqlens_padded = data["cu_seqlens_padded"][0]
+    cu_seqlens_cpu = to_cpu_int_tuple(data["cu_seqlens"][0])
+    cu_seqlens_padded_cpu = to_cpu_int_tuple(data["cu_seqlens_padded"][0])
     expected = torch.arange(7, dtype=torch.float32).unsqueeze(0)
     if top_k is not None:
         expected[0, 1] = -float("inf")  # index 1 predicts token position 2
@@ -80,8 +81,8 @@ def test_prepare_packed_loss_input_preserves_prepacked_layout(monkeypatch, top_k
         logits=torch.zeros(1, 8, 4),
         data=data,
         loss_fn=SimpleNamespace(input_type=LossInputType.LOGPROB),
-        cu_seqlens_q=cu_seqlens,
-        cu_seqlens_q_padded=cu_seqlens_padded,
+        cu_seqlens_q=cu_seqlens_cpu,
+        cu_seqlens_q_padded=cu_seqlens_padded_cpu,
         vocab_parallel_rank=0,
         vocab_parallel_group=object(),
         sampling_params=TrainingSamplingParams(top_k=top_k),
@@ -103,7 +104,7 @@ def test_prepare_packed_loss_input_preserves_prepacked_layout(monkeypatch, top_k
             prepared_data["token_mask"], torch.tensor([[0, 1, 0, 0, 0, 1, 0, 0]])
         )
     assert torch.equal(call["target"], input_ids)
-    assert torch.equal(call["padded_boundaries"], cu_seqlens_padded)
+    assert call["padded_boundaries"] == cu_seqlens_padded_cpu
     assert call["unpacked_seqlen"] == input_ids.shape[1]
     assert call["kwargs"]["target_is_pre_rolled"] is False
     assert call["kwargs"]["return_packed_layout"] is True
@@ -195,7 +196,7 @@ def _build_test_case(cp_size, tp_size, my_tp_rank, cp_group):
         cu_seqlens_padded,
     ) = _pack_sequences_for_megatron(
         input_ids,
-        seq_lengths,
+        to_cpu_int_tuple(seq_lengths),
         pad_individual_seqs_to_multiple_of=pad_to_multiple,
         pad_packed_seq_to=max_seq_len * batch_size if cp_size > 1 else None,
         cp_rank=torch.distributed.get_rank(cp_group),
@@ -274,8 +275,8 @@ def _run_compare_sequence_packing_wrappers(rank, world_size, cp_size, tp_size):
     baseline_wrapper = SequencePackingLossWrapper(
         loss_fn=base_loss_fn,
         prepare_fn=prepare_loss_input,
-        cu_seqlens_q=tc["cu_seqlens"],
-        cu_seqlens_q_padded=tc["cu_seqlens_padded"],
+        cu_seqlens_q=to_cpu_int_tuple(tc["cu_seqlens"]),
+        cu_seqlens_q_padded=to_cpu_int_tuple(tc["cu_seqlens_padded"]),
         vocab_parallel_rank=my_tp_rank,
         vocab_parallel_group=tp_group,
         context_parallel_group=cp_group,
@@ -284,8 +285,8 @@ def _run_compare_sequence_packing_wrappers(rank, world_size, cp_size, tp_size):
     candidate_wrapper = SequencePackingFusionLossWrapper(
         loss_fn=base_loss_fn,
         prepare_fn=prepare_packed_loss_input,
-        cu_seqlens_q=tc["cu_seqlens"],
-        cu_seqlens_q_padded=tc["cu_seqlens_padded"],
+        cu_seqlens_q=to_cpu_int_tuple(tc["cu_seqlens"]),
+        cu_seqlens_q_padded=to_cpu_int_tuple(tc["cu_seqlens_padded"]),
         vocab_parallel_rank=my_tp_rank,
         vocab_parallel_group=tp_group,
         context_parallel_group=cp_group,
@@ -358,8 +359,8 @@ def _run_compare_sequence_packing_wrappers_with_sampling(
     baseline_wrapper = SequencePackingLossWrapper(
         loss_fn=base_loss_fn,
         prepare_fn=prepare_loss_input_wrapped,
-        cu_seqlens_q=tc["cu_seqlens"],
-        cu_seqlens_q_padded=tc["cu_seqlens_padded"],
+        cu_seqlens_q=to_cpu_int_tuple(tc["cu_seqlens"]),
+        cu_seqlens_q_padded=to_cpu_int_tuple(tc["cu_seqlens_padded"]),
         vocab_parallel_rank=my_tp_rank,
         vocab_parallel_group=tp_group,
         context_parallel_group=cp_group,
@@ -368,8 +369,8 @@ def _run_compare_sequence_packing_wrappers_with_sampling(
     candidate_wrapper = SequencePackingFusionLossWrapper(
         loss_fn=base_loss_fn,
         prepare_fn=prepare_packed_loss_input_wrapped,
-        cu_seqlens_q=tc["cu_seqlens"],
-        cu_seqlens_q_padded=tc["cu_seqlens_padded"],
+        cu_seqlens_q=to_cpu_int_tuple(tc["cu_seqlens"]),
+        cu_seqlens_q_padded=to_cpu_int_tuple(tc["cu_seqlens_padded"]),
         vocab_parallel_rank=my_tp_rank,
         vocab_parallel_group=tp_group,
         context_parallel_group=cp_group,
@@ -518,7 +519,7 @@ def test_pack_input_ids_last_seq_inflated_beyond_row_width():
     row_width = 7040
     inflated_len = 9472  # 7040 real tokens + 2432 bin-fill deficit
     input_ids = torch.arange(2 * row_width).reshape(2, row_width)
-    cu = torch.tensor([0, row_width, row_width + inflated_len])
+    cu = (0, row_width, row_width + inflated_len)
 
     packed = _pack_input_ids(input_ids, cu, cu, cp_rank=0, cp_size=1, roll_shift=-1)
 
@@ -539,7 +540,7 @@ def test_pack_input_ids_inflated_last_seq_cp_sharded(cp_size):
     row_width = 64
     inflated_len = 96  # deficit of 32 absorbed into the last sequence
     input_ids = torch.arange(1, 2 * row_width + 1).reshape(2, row_width)
-    cu = torch.tensor([0, row_width, row_width + inflated_len])
+    cu = (0, row_width, row_width + inflated_len)
     total = row_width + inflated_len
 
     shards = [
@@ -570,8 +571,8 @@ def test_pack_input_ids_in_bounds_lengths_unchanged():
     from nemo_rl.algorithms.loss.utils import _pack_input_ids
 
     input_ids = torch.arange(2 * 64).reshape(2, 64)
-    cu_q = torch.tensor([0, 40, 40 + 64])  # real lengths 40, 64
-    cu_qp = torch.tensor([0, 48, 48 + 64])  # per-seq alignment padding only
+    cu_q = (0, 40, 40 + 64)  # real lengths 40, 64
+    cu_qp = (0, 48, 48 + 64)  # per-seq alignment padding only
 
     packed = _pack_input_ids(input_ids, cu_q, cu_qp, cp_rank=0, cp_size=1, roll_shift=0)
 
@@ -579,3 +580,21 @@ def test_pack_input_ids_in_bounds_lengths_unchanged():
     assert torch.equal(packed[0, :40], input_ids[0, :40])
     assert packed[0, 40:48].eq(0).all()
     assert torch.equal(packed[0, 48:], input_ids[1])
+
+
+def test_pack_input_ids_with_cpu_boundaries():
+    """CPU cumulative boundaries produce the expected packed targets."""
+    from nemo_rl.algorithms.loss.utils import _pack_input_ids
+
+    input_ids = torch.arange(2 * 16).reshape(2, 16)
+    cu_q = (0, 11, 27)
+    cu_qp = (0, 16, 32)
+
+    actual = _pack_input_ids(
+        input_ids, cu_q, cu_qp, cp_rank=0, cp_size=1, roll_shift=-1
+    )
+    assert actual.shape == (1, 32)
+    expected_seq0 = _rolled_padded_seq(input_ids[0], 11, 16, -1)
+    expected_seq1 = _rolled_padded_seq(input_ids[1], 16, 16, -1)
+    assert torch.equal(actual[0, :16], expected_seq0)
+    assert torch.equal(actual[0, 16:], expected_seq1)

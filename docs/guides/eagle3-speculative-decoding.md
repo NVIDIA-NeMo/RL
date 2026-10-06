@@ -165,7 +165,10 @@ where `lambda` is `policy.draft.loss_weight`.
 
 ## Notes
 
-- When online draft training is enabled, NeMo RL logs `draft_loss`.
+- When online draft training is enabled, `train/loss` remains the policy-training
+  objective, `train/draft_loss` reports the unweighted auxiliary draft loss, and
+  `train/total_loss` reports `loss + policy.draft.loss_weight * draft_loss`.
+  `total_loss` is only emitted when the draft loss wrapper is active.
 - Resume checkpoints include the nested draft model state when `policy.draft.enabled=true`.
 - If speculative decoding is enabled without trainer-owned draft weights, vLLM must load real draft weights at startup. When the trainer owns the draft model, the first refit pushes both policy and draft parameters.
 - Online draft training supports `policy.sequence_packing.enabled=true`; it does not currently support `policy.megatron_cfg.context_parallel_size > 1`, and the packed path additionally requires `policy.megatron_cfg.pipeline_model_parallel_size = 1`.
