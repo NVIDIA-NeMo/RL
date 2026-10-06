@@ -2033,7 +2033,7 @@ def _decode_empty_contents(
 
 def maybe_log_train_conversations(
     logger: "Logger",
-    logger_config: Mapping[str, Any],
+    logger_config: LoggerConfig,
     repeated_batch: Any,
     conv_task_names: Optional[list[Any]],
     *,
@@ -2050,7 +2050,7 @@ def maybe_log_train_conversations(
     the column is never empty. Any failure is printed, never raised, so a table
     error cannot stop training.
     """
-    if not logger_config.get("log_conversations"):
+    if not logger_config.log_conversations:
         return
     try:
         if conv_task_names is None:
@@ -2075,7 +2075,7 @@ def maybe_log_train_conversations(
 
 
 def conversation_row_labels(
-    logger_config: Mapping[str, Any], rows: Optional[Sequence[Any]]
+    logger_config: LoggerConfig, rows: Optional[Sequence[Any]]
 ) -> Optional[list[str]]:
     """Per-row labels for the conversations table from a configured row field.
 
@@ -2086,8 +2086,8 @@ def conversation_row_labels(
     logging is off, when no field is configured, or when ``rows`` is empty, so
     the caller falls back to the batch's ``task_name``.
     """
-    field_path = logger_config.get("conversation_label_field")
-    if not logger_config.get("log_conversations") or not field_path or not rows:
+    field_path = logger_config.conversation_label_field
+    if not logger_config.log_conversations or not field_path or not rows:
         return None
     labels: list[str] = []
     for row in rows:

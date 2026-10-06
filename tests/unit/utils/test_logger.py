@@ -44,6 +44,7 @@ from nemo_rl.utils.logger import (
     conversation_row_labels,
     flatten_dict,
     log_container_init_timing,
+    maybe_log_train_conversations,
     print_message_log_samples,
     should_log_nemo_gym_full_result_tables,
 )
@@ -2554,14 +2555,60 @@ def test_conversation_row_labels_read_the_configured_row_field():
         {"verifier_metadata": {}},
         None,
     ]
-    config = {
-        "log_conversations": True,
-        "conversation_label_field": "verifier_metadata.target_hardware",
-    }
+    config = LoggerConfig(
+        log_dir="logs/test",
+        log_conversations=True,
+        conversation_label_field="verifier_metadata.target_hardware",
+    )
     assert conversation_row_labels(config, rows) == ["B200", "unknown", "unknown"]
-    assert conversation_row_labels({"log_conversations": True}, rows) is None
-    assert conversation_row_labels({**config, "log_conversations": False}, rows) is None
+    assert (
+        conversation_row_labels(
+            LoggerConfig(log_dir="logs/test", log_conversations=True), rows
+        )
+        is None
+    )
+    assert (
+        conversation_row_labels(
+            config.model_copy(update={"log_conversations": False}), rows
+        )
+        is None
+    )
     assert conversation_row_labels(config, []) is None
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_maybe_log_train_conversations_uses_logger_config(enabled: bool) -> None:
+    logger = MagicMock(spec=Logger)
+    config = LoggerConfig(log_dir="logs/test", log_conversations=enabled)
+    message_logs = [[{"role": "assistant", "content": "answer"}]]
+    batch = {
+        "message_log": message_logs,
+        "task_name": ["math"],
+        "total_reward": [1.0],
+    }
+
+    maybe_log_train_conversations(
+        logger,
+        config,
+        batch,
+        None,
+        tokenizer=None,
+        step=3,
+        thinking_tags=None,
+    )
+
+    if enabled:
+        logger.log_conversations_from_message_logs.assert_called_once_with(
+            message_logs=message_logs,
+            rewards=[1.0],
+            task_names=["math"],
+            step=3,
+            name="train/conversations",
+            tokenizer=None,
+            thinking_tags=None,
+        )
+    else:
+        logger.log_conversations_from_message_logs.assert_not_called()
 
 
 def test_build_conversation_table_prompt_clip_is_a_parameter():

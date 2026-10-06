@@ -264,6 +264,8 @@ env:
         num_workers: 8
 
 logger:
+    log_conversations: false
+    conversation_label_field: null
     log_dir: "logs/distillation"
     num_val_samples_to_print: 5
     wandb_enabled: true
