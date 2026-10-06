@@ -1,0 +1,134 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Nemotron Super 3.5 Omni MTP async-GRPO validation for the NeMo-Gym
+# AnyTerminal multi-harness profile. Each source Terminal-Bench task is expanded
+# into four independent prompt groups (OpenCode, OpenClaw, Pi, and Hermes).
+# Token capture is required because the external CLI harnesses make their own
+# multi-turn model calls.
+defaults: ../configs/recipes/vlm/vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym-mtp.v1.yaml
+
+grpo:
+  # Four consecutive prompt groups are one task executed through all four
+  # harnesses. Two sibling generations per group are sufficient for GRPO.
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 2
+  max_num_epochs: 1
+  max_num_steps: 1000000
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  # SingleController owns asynchronous scheduling.
+  async_grpo: null
+
+policy:
+  train_global_batch_size: 8
+  generation:
+    vllm_cfg:
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: qwen3_coder
+        reasoning_parser: deepseek_r1
+
+data:
+  _override_: true
+  max_input_seq_length: null
+  shuffle: false
+  num_workers: 0
+  use_multiple_dataloader: false
+  train:
+    dataset_name: NemoGymDataset
+    data_path: /path/to/anyterminal_multi_harness/train.jsonl
+  validation: null
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    prompt_file: null
+    system_prompt_file: null
+    processor: nemo_gym_data_processor
+
+env:
+  _override_: true
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: true
+  should_mask_flagged_samples: true
+  nemo_gym:
+    is_trajectory_collection: false
+    skip_venv_if_present: true
+    port_range_low: 5000
+    port_range_high: 5999
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - responses_api_agents/anyterminal_agent/configs/anyterminal_multi_harness_enroot.yaml
+    fan_out:
+      anyterminal_hermes:
+        - anyterminal_opencode
+        - anyterminal_openclaw
+        - anyterminal_pi
+        - anyterminal_hermes
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: true
+          sampling_overrides:
+            temperature: ${policy.generation.temperature}
+            top_p: ${policy.generation.top_p}
+            top_k: -1
+          extra_body:
+            bad_words: ${policy.generation.bad_words}
+            chat_template_kwargs:
+              enable_thinking: true
+    anyterminal_opencode:
+      responses_api_agents:
+        anyterminal_agent:
+          global_agent_timeout: 900
+    anyterminal_openclaw:
+      responses_api_agents:
+        anyterminal_agent:
+          global_agent_timeout: 900
+    anyterminal_pi:
+      responses_api_agents:
+        anyterminal_agent:
+          global_agent_timeout: 900
+    anyterminal_hermes:
+      responses_api_agents:
+        anyterminal_agent:
+          global_agent_timeout: 900
+
+# TransferQueue carries both the token-capture fragments and canonical training
+# rows between the separate 8-node generation and training fleets.
+data_plane:
+  enabled: true
+  impl: transfer_queue
+  backend: simple
+  claim_meta_poll_interval_s: 0.5
+  simple:
+    num_storage_units: ${mul:2, ${cluster.num_nodes}}
+
+token_capture:
+  enabled: true
+  staging_partition: rollout_staging
+  min_valid_fraction_per_group: 1.0
+
+async_rl:
+  sampler:
+    name: in_order
+    max_lookahead_versions: 1
+  min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
+  max_inflight_prompts: ${mul:${grpo.num_prompts_per_step}, 2}
+  max_buffered_rollouts: ${mul:${grpo.num_prompts_per_step}, 2}
+
+checkpointing:
+  # This validation performs real optimizer steps but avoids writing a ~1.4 TB
+  # Super optimizer checkpoint. Enable this for a persistent training run.
+  enabled: false
+
+logger:
+  log_dir: logs/grpo-anyterminal-multi-harness-super-omni
+  wandb_enabled: true
+  tensorboard_enabled: true
+  monitor_gpus: true
+  wandb:
+    project: multi-harness-RL
+    name: anyterminal-multi-harness-super-omni
+    log_nemo_gym_full_result_tables: false
