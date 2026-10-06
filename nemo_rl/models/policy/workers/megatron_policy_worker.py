@@ -136,6 +136,7 @@ from nemo_rl.models.policy.utils import (
     connect_rollout_engines_from_distributed,
     disconnect_rollout_engines_from_distributed,
     get_runtime_env_for_policy_worker,
+    make_empty_cache_best_effort_under_expandable_segments,
     send_hf_buckets_via_ipc_actor_impl,
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
@@ -591,6 +592,7 @@ class MegatronPolicyWorkerImpl(
         **kwargs: Any,
     ):
         """Initialize the MegatronPolicyWorker."""
+        make_empty_cache_best_effort_under_expandable_segments()
         self.is_refit_destination = is_refit_destination
         self.refit_payload_mode: RefitPayloadMode = "hf_export"
         # NVML-based and guarded on torch.cuda.is_initialized(), so this does
@@ -3147,6 +3149,14 @@ class MegatronPolicyWorkerImpl(
         A destination that requests logical weights consumes standard Bridge
         tasks. Otherwise, keep Bridge's physical FP8 data and scale tasks.
         """
+        # NRL_REFIT_SKIP_MTP=1: drop MTP params from refit entirely. The
+        # nemotron_omni bridge's megatron->HF mapping can miss MTP layer-norm
+        # params on the refit-export path ("Unrecognized mapping type" -> TP
+        # ranks desync -> ALLGATHER hangs to the NCCL watchdog in
+        # prepare_refit_info). Generation engines without speculative decoding
+        # never consume MTP weights, so skipping them here (identically on
+        # every rank) is safe.
+        skip_mtp = os.environ.get("NRL_REFIT_SKIP_MTP", "0") == "1"
         # Deferred import to avoid circular import issues.
         from nemo_rl.models.megatron.draft import draft_model_detached
 
@@ -3157,6 +3167,7 @@ class MegatronPolicyWorkerImpl(
                 task
                 for task in self.megatron_bridge.get_conversion_tasks([self.model])
                 if task is not None
+                and not (skip_mtp and "mtp." in task.global_param_name)
             ]
 
     def _calculate_refit_param_info(self) -> list[tuple[str, int]]:
