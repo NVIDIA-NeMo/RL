@@ -52,12 +52,8 @@ slurm_time_limit="${SLURM_TIME_LIMIT:-04:00:00}"
 # reconstruction (token_capture.context_compaction). OpenCode's own compaction is
 # pinned separately through AGENTIC_VBENCH_COMPACTION_AUTO (read by the Gym agent
 # config); ordinary capture cannot train a rewritten context, so it must be off there.
-# This branch has no framework-owned context reconstruction (NeMo-RL PR #4200 /
-# Gym PR #3368): token capture is the ordinary one-row-per-rollout kind, so
-# OpenCode's own compaction and pruning must stay off (a rewrite would orphan the
-# captured history). CONTEXT_COMPACTION is accepted only as false.
 context_compaction="${CONTEXT_COMPACTION:-false}"
-[[ "${context_compaction}" == false ]] || { echo "ERROR: context compaction is not available on this branch (CONTEXT_COMPACTION must be false)" >&2; exit 1; }
+case "${context_compaction}" in true|false) ;; *) echo "ERROR: CONTEXT_COMPACTION must be true or false" >&2; exit 1;; esac
 export AGENTIC_VBENCH_COMPACTION_AUTO="${AGENTIC_VBENCH_COMPACTION_AUTO:-${context_compaction}}"
 export AGENTIC_VBENCH_COMPACTION_PRUNE="${AGENTIC_VBENCH_COMPACTION_PRUNE:-false}"
 if [[ "${context_compaction}" != true && ( "${AGENTIC_VBENCH_COMPACTION_AUTO}" == true || "${AGENTIC_VBENCH_COMPACTION_PRUNE}" == true ) ]]; then
@@ -265,6 +261,7 @@ done
   checkpointing.save_period="${save_period}" \
   checkpointing.keep_top_k="${checkpoint_keep_top_k}" \
   token_capture.enabled=true \
+  token_capture.context_compaction="${context_compaction}" \
   token_capture.capture_dir="${token_capture_dir}" \
   data_plane.simple.num_storage_units="${num_storage_units}" \
   cluster.num_nodes="${num_nodes}" \

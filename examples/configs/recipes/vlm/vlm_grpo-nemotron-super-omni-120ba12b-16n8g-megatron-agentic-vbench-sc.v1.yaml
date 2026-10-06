@@ -1,0 +1,170 @@
+# Agentic-VBench (gym-native: upstream Harbor 0.6.6 + stock OpenCode 1.14.39 on the
+# pinned 100-task benchmark) GRPO on Nemotron Super Omni through the SingleController
+# path with NeMo-Gym token capture. Context compaction is an opt-in on top of this recipe:
+#   token_capture.context_compaction=true    (NeMo-RL reconstructs one row per context)
+#   AGENTIC_VBENCH_COMPACTION_AUTO=true      (OpenCode summarizes once the context fills)
+# Launch with scripts/agentic_vbench/run_sc.sh (preflight + Slurm) or directly:
+#   uv run examples/run_grpo_single_controller.py \
+#     --config examples/configs/recipes/vlm/vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-agentic-vbench-sc.v1.yaml
+defaults: ./vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym.v1.yaml
+
+grpo:
+  # SC requires num_prompts_per_step * num_generations_per_prompt == policy.train_global_batch_size.
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 4
+  max_num_epochs: 1000
+  max_num_steps: 20
+  # SC has no validation loop.
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  # SC reads async_rl instead; the entrypoint raises if this block is set.
+  async_grpo: null
+  # Context compaction requires standard token-level GRPO without advantage
+  # overrides (nemo_rl/algorithms/single_controller_utils/config.py::validate_cc_objective).
+  advantage_clip_low: null
+  advantage_clip_high: null
+  seq_logprob_error_threshold: null
+  invalid_tool_call_advantage: null
+  malformed_thinking_advantage: null
+  calculate_advantages_on_gpu: false
+  use_dynamic_sampling: false
+  zero_variance_prompt_filtering: false
+
+loss_fn:
+  token_level_loss: true
+  sequence_level_importance_ratios: false
+  use_kl_in_reward: false
+  positive_example_nll_weight: 0
+
+checkpointing:
+  checkpoint_dir: results/agentic-vbench-sc
+  save_period: 10
+  keep_top_k: 2
+  # No validation, so no validation metric to rank checkpoints by.
+  metric_name: null
+  # SingleController checkpointing with the built-in samplers requires the
+  # TransferQueue snapshot so completed, unconsumed rollouts survive a restart.
+  save_data_plane: true
+
+policy:
+  model_name: ${oc.env:MODEL_PATH}
+  train_global_batch_size: 32
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 49152
+  # CC execution padding requires fixed-batch, non-interleaved Megatron.
+  sequence_packing:
+    enabled: false
+  dynamic_batching:
+    enabled: false
+  tokenizer:
+    chat_template_kwargs:
+      enable_thinking: true
+      truncate_history_thinking: false
+  megatron_cfg:
+    # 49k-token contexts: the step-120 smoke/full runs used CP4 with TP8/EP16.
+    context_parallel_size: 4
+    mtp_num_layers: 0
+    scheduler:
+      lr_warmup_iters: 10
+  generation:
+    vllm_cfg:
+      # SC drives rollouts through the disaggregated async engine.
+      async_engine: true
+      reasoning_parser_plugin: /opt/nemo-rl/nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py
+    vllm_kwargs:
+      # OpenCode's read tool sends images inline (base64 data URLs).
+      limit_mm_per_prompt:
+        image: 64
+      mm_processor_cache_gb: 0
+      skip_mm_profiling: true
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 8
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  num_workers: 0
+  train:
+    data_path: ${oc.env:TRAIN_PATH}
+  validation:
+    data_path: ${oc.env:VAL_PATH}
+
+# TransferQueue is mandatory for the SingleController path and hosts the
+# per-call staged token deltas written by the vLLM workers.
+data_plane:
+  enabled: true
+  impl: transfer_queue
+  backend: simple
+  claim_meta_poll_interval_s: 0.5
+  simple:
+    num_storage_units: ${mul:2, ${cluster.num_nodes}}
+
+# Ledger-authoritative token capture via NeMo-Gym. The agent returns the served
+# assistant output only; the finalizer publishes training rows from the capture
+# receipts. context_compaction additionally lets OpenCode rewrite its context
+# (summaries) while NeMo-RL reconstructs one training row per context.
+token_capture:
+  enabled: true
+  context_compaction: false
+  # null derives a directory under the run's log dir; the launcher sets it explicitly.
+  capture_dir: null
+  num_reassembler_workers: 2
+  defer_routed_experts_to_policy: false
+
+rollout_recovery:
+  default_granularity: sibling
+
+async_rl:
+  sampler:
+    name: in_order
+    # Lag-1, matching the legacy async recipe's max_trajectory_age_steps.
+    max_lookahead_versions: 1
+  recompute_kv_cache_after_weight_updates: false
+  min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
+  # The in_order sampler with one version of lookahead needs buffer capacity for
+  # two steps of prompt groups (validate_sampler_buffer_capacity).
+  max_inflight_prompts: ${mul:${grpo.num_prompts_per_step}, 2}
+  max_buffered_rollouts: ${mul:${grpo.num_prompts_per_step}, 2}
+  rollout_failure:
+    # Context compaction requires full step batches.
+    min_step_batch_fraction: 1
+    nemo_gym:
+      # Backstop for a hung prompt-group stream (Harbor build + 32-turn episode).
+      rollout_timeout_s: 7200
+  stall_watchdog:
+    # Must exceed rollout_timeout_s: a slow Harbor episode is not a stalled controller.
+    stall_timeout_s: 10800
+
+env:
+  should_log_nemo_gym_responses: true
+  nemo_gym:
+    pad_dynamic_image_shapes: true
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - responses_api_agents/agentic_vbench_agent/configs/agentic_vbench_train.yaml
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: true
+          extra_body:
+            mm_processor_kwargs:
+              max_num_tiles: 1
+            chat_template_kwargs:
+              enable_thinking: true
+              truncate_history_thinking: false
+
+logger:
+  log_dir: logs/agentic-vbench-sc
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: megatron-omni-v3
+    name: agentic-vbench-sc
+
+cluster:
+  num_nodes: 16
+  gpus_per_node: 8
