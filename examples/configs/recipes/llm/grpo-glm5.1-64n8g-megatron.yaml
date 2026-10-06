@@ -47,6 +47,11 @@ policy:
       expert_parallel_size: 128
       gpu_memory_utilization: 0.5
       enforce_eager: true
+    vllm_kwargs:
+      # vLLM 0.26 can skip DP collectives on zero-token async steps (DP=4).
+      # Disable async scheduling to avoid generation hangs while retaining Ray V2.
+      # Tracking: https://github.com/vllm-project/vllm/issues/43547
+      async_scheduling: false
 logger:
   log_dir: logs/grpo-glm5.1-64n8g-megatron
   wandb_enabled: true
