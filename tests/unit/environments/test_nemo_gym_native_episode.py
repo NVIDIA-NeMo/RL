@@ -33,7 +33,6 @@ from nemo_rl.experience.failures import (
 pytest.importorskip(
     "nemo_gym.episode_types", reason="Requires Gym Environment Server contracts"
 )
-gym_rollouts = pytest.importorskip("nemo_gym.rollout_collection")
 pytestmark = pytest.mark.nemo_gym
 
 
@@ -83,7 +82,7 @@ def _prepare(rows):
 
 def _reply(row: dict) -> dict:
     return {
-        "episode_id": gym_rollouts._native_episode_request_body(row)["episode_id"],
+        "episode_id": {"rollout_id": "caller-owned-rollout", "attempt": 0},
         "task_id": deepcopy(row["task_id"]),
         "result": {
             "responses_create_params": deepcopy(
@@ -217,6 +216,7 @@ def test_native_receipt_uses_fallback_identity_without_response(attempt, capture
     row["_ng_task_index"] = 17
     _prepare([row])
     reply = _reply(row)
+    reply["episode_id"] = {"rollout_id": "17-0", "attempt": attempt}
     del reply["result"]["response"]
     del reply["result"]["responses_create_params"]
     result = _normalize_nemo_gym_episode_result(row, reply)
