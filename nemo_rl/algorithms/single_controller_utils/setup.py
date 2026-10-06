@@ -63,6 +63,9 @@ from nemo_rl.algorithms.metric_utils import (
     print_setup_timing_summary,
 )
 from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
+from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
+    AdvantageStageConfig,
+)
 from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     algo_config,
@@ -78,7 +81,7 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
 )
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
-from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
+from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS, uses_image_placeholder
 from nemo_rl.data.utils import load_dataloader_state, setup_response_data
 from nemo_rl.data_plane import (
     DATA_PLANE_CHECKPOINT_SCHEMA_VERSION,
@@ -169,6 +172,7 @@ class SingleControllerActorArgs:
     save_state: GRPOSaveState
     last_checkpoint_path: Optional[str]
     finalizer_actors: list[Any]
+    advantage_actors: list[Any]
     # Defaulted fields must follow the required ones above, so these stay last.
     data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = None
     partition_includes_multimodal_fields: bool = False
@@ -303,11 +307,17 @@ def _register_single_controller_partitions(
     partition_id: str,
     include_multimodal_fields: bool,
 ) -> None:
-    """Warm all SingleController partitions before concurrent data-plane use."""
+    """Warm all SingleController partitions before concurrent data-plane use.
+
+    VLM token capture (``include_multimodal_fields`` with capture enabled) adds
+    the media columns the vLLM worker stages beside each captured call to the
+    staging partition.
+    """
     algo_cfg = algo_config(master_config)
     policy_config = master_config.policy
     token_capture_cfg = master_config.token_capture
     r3_enabled = router_replay_enabled(policy_config)
+    capture_media = token_capture_cfg.enabled and include_multimodal_fields
     group_size = algo_cfg.num_generations_per_prompt
     num_rollout_samples = master_config.async_rl.max_buffered_rollouts * group_size
 
@@ -341,12 +351,16 @@ def _register_single_controller_partitions(
         from nemo_rl.data_plane.schema import (
             ROUTED_EXPERTS_FIELD as STAGING_ROUTED_EXPERTS_FIELD,
         )
-        from nemo_rl.data_plane.tq_token_sink import STAGING_FIELDS
+        from nemo_rl.data_plane.tq_token_sink import (
+            MEDIA_STAGING_FIELDS,
+            STAGING_FIELDS,
+        )
 
         dp_client.register_partition(
             partition_id=token_capture_cfg.staging_partition,
             fields=list(STAGING_FIELDS)
-            + ([STAGING_ROUTED_EXPERTS_FIELD] if r3_enabled else []),
+            + ([STAGING_ROUTED_EXPERTS_FIELD] if r3_enabled else [])
+            + (list(MEDIA_STAGING_FIELDS) if capture_media else []),
             num_samples=num_rollout_samples,
             consumer_tasks=["finalize", "prev_lp", "train"],
         )
@@ -366,7 +380,7 @@ def _non_colocated_teacher_node_count(master_config: MasterConfig) -> int:
     teacher_configs = create_teacher_configs_from_opd_config(
         opd_module._opd_cfg(master_config)
     )
-    cluster_gpus_per_node = master_config.cluster["gpus_per_node"]
+    cluster_gpus_per_node = master_config.cluster.gpus_per_node
     for teacher_config in teacher_configs:
         if teacher_config.gpus_per_node > cluster_gpus_per_node:
             raise ValueError(
@@ -393,11 +407,11 @@ def _build_clusters(
     generation_config = master_config.policy["generation"]
     colocated = generation_config["colocated"]["enabled"]
     backend = generation_config["backend"]
-    num_nodes = cluster_config["num_nodes"]
-    gpus_per_node = cluster_config["gpus_per_node"]
-    segment_size = cluster_config.get("segment_size")
-    port_range_low = cluster_config.get("master_port_range_low")
-    port_range_high = cluster_config.get("master_port_range_high")
+    num_nodes = cluster_config.num_nodes
+    gpus_per_node = cluster_config.gpus_per_node
+    segment_size = cluster_config.segment_size
+    port_range_low = cluster_config.master_port_range_low
+    port_range_high = cluster_config.master_port_range_high
     teacher_nodes = _non_colocated_teacher_node_count(master_config)
     policy_nodes = num_nodes - teacher_nodes
     if policy_nodes <= 0:
@@ -1186,11 +1200,29 @@ def setup_single_controller(
         policy_config["pretrained_checkpoint"] = checkpointing_pretrained
 
     # Token capture: validate the supported combination loudly at setup
-    # (NeMo-Gym rollout path, vLLM backend, async_engine=true). The vLLM
-    # worker venv always carries nemo_gym (see VLLM_EXECUTABLE in
-    # ray_actor_environment_registry.py), so nothing here needs to change the
-    # worker's environment.
+    # (NeMo-Gym rollout path; vLLM with async_engine=true, or Megatron with
+    # expose_http_server=true). The serving worker's venv already carries
+    # nemo_gym for both backends (see ACTOR_ENVIRONMENTS in
+    # nemo_rl/distributed/actor_environments.py), so nothing here needs to
+    # change the worker's environment.
     token_capture_cfg = master_config.token_capture
+    capture_media = token_capture_cfg.enabled and processor is not None
+    if capture_media:
+        if generation_config["backend"] != "vllm":
+            raise NotImplementedError(
+                "VLM media token capture is only implemented for the vLLM "
+                f"generation backend; got {generation_config['backend']!r}"
+            )
+        if not uses_image_placeholder(processor):
+            raise ValueError(
+                "VLM token capture currently supports Omni dynamic images and native video"
+            )
+        if not policy_config["megatron_cfg"]["enabled"]:
+            raise ValueError(
+                "Omni media token capture currently requires the Megatron learner"
+            )
+        if token_capture_cfg.defer_routed_experts_to_policy:
+            raise ValueError("VLM token capture requires direct router replay assembly")
     if rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None:
         if not master_config.checkpointing["enabled"]:
             raise ValueError(
@@ -1231,22 +1263,39 @@ def setup_single_controller(
                 "(env.should_use_nemo_gym=true) — the ledger lives in Gym's "
                 "policy model server"
             )
-        if generation_config["backend"] != "vllm":
+        if generation_config["backend"] not in ("vllm", "megatron"):
             raise NotImplementedError(
-                "token_capture.enabled supports the vllm backend only; got "
+                "token_capture.enabled supports vllm or megatron; got "
                 f"{generation_config['backend']!r}"
             )
-        vllm_cfg = cast(dict[str, Any], generation_config)["vllm_cfg"]
-        if not vllm_cfg["async_engine"]:
+        generation_config_dict = cast(dict[str, Any], generation_config)
+        if (
+            generation_config["backend"] == "vllm"
+            and not generation_config_dict["vllm_cfg"]["async_engine"]
+        ):
             raise ValueError(
                 "token_capture.enabled requires "
                 "policy.generation.vllm_cfg.async_engine=true (the capture "
                 "host is the worker's in-process HTTP server)"
             )
+        if generation_config["backend"] == "megatron":
+            if not generation_config_dict["mcore_generation_config"][
+                "expose_http_server"
+            ]:
+                raise ValueError(
+                    "Megatron token capture requires policy.generation."
+                    "mcore_generation_config.expose_http_server=true"
+                )
+            if router_replay_enabled(master_config.policy):
+                raise NotImplementedError(
+                    "Megatron token capture does not yet support router replay: "
+                    "the canonical MInf stager does not yet normalize routed experts"
+                )
 
         # Fill the derived ledger-hosting fields (see TokenCaptureConfig): a
-        # per-run control-plane bearer token and the process-shared capture
-        # directory used by every Gym worker.
+        # per-run control-plane bearer token, the process-shared capture
+        # directory used by every Gym worker, and the capture-host backend.
+        token_capture_cfg.generation_backend = generation_config["backend"]
         if token_capture_cfg.control_auth_token is None:
             # Deferred import: only needed on the capture path.
             import secrets
@@ -1255,7 +1304,7 @@ def setup_single_controller(
         if token_capture_cfg.capture_dir is None:
             token_capture_cfg.capture_dir = os.path.abspath(
                 os.path.join(
-                    master_config.logger.get("log_dir") or "logs",
+                    master_config.logger.log_dir or "logs",
                     "gym_token_capture",
                 )
             )
@@ -1472,7 +1521,7 @@ def setup_single_controller(
         master_config
     )
     colocated = generation_config["colocated"]["enabled"]
-    segment_size = getattr(master_config, "cluster", {}).get("segment_size")
+    segment_size = master_config.cluster.segment_size
 
     # Claim constrained training nodes before unconstrained inference or Gym
     # tasks can consume them. This matters when inference topology alignment
@@ -1887,10 +1936,13 @@ def setup_single_controller(
             include_multimodal_fields=processor is not None,
         )
     if token_capture_cfg.enabled:
-        # Host Gym's capture core in every vLLM DP leader (in-worker DP
-        # client + TQTokenSink + the single install_capture call), and give
-        # workers the initial weight version to stamp on captured calls.
-        generation.setup_token_capture(dp_config, token_capture_cfg.staging_partition)
+        # Both active backends stage canonical Gym rows in serving workers;
+        # only vLLM workers stage captured media beside them (capture_media).
+        generation.setup_token_capture(
+            dp_config,
+            token_capture_cfg.staging_partition,
+            capture_media=capture_media,
+        )
         generation.set_rollout_weight_version(0)
 
     if weight_synchronizer is None:
@@ -1953,6 +2005,7 @@ def setup_single_controller(
                 router_replay_enabled=router_replay_enabled(policy_config),
                 defer_routed_experts_to_policy=token_capture_cfg.defer_routed_experts_to_policy,
                 max_seq_len=_generation_max_seq_len(generation_config),
+                capture_media=capture_media,
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,
         )
@@ -1961,6 +2014,20 @@ def setup_single_controller(
             # until every finalizer's process-local TQ client has attached and
             # registered its checkpoint participant.
             ray.get([actor.__ray_ready__.remote() for actor in finalizer_actors])
+
+    advantage_actors: list[Any] = []
+    if master_config.async_rl.num_advantage_workers > 0:
+        from nemo_rl.algorithms.advantage_actor import create_advantage_actors
+
+        # Same ordering constraint as the finalizers above: these attach their
+        # own TQ clients, so they have to exist before the controller configures
+        # checkpoint participants and before any Mooncake restore.
+        advantage_actors = create_advantage_actors(
+            dp_config,
+            AdvantageStageConfig.from_master_config(master_config),
+            advantage_estimator,
+            num_workers=master_config.async_rl.num_advantage_workers,
+        )
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,
         task_to_env=env_handles,
@@ -1973,8 +2040,8 @@ def setup_single_controller(
         use_nemo_gym=use_nemo_gym,
         mask_env_flagged_samples=should_mask_flagged_samples(master_config.env),
         log_full_result_tables=should_log_nemo_gym_full_result_tables(
-            wandb_enabled=master_config.logger["wandb_enabled"],
-            wandb_config=master_config.logger["wandb"],
+            wandb_enabled=master_config.logger.wandb_enabled,
+            wandb_config=master_config.logger.wandb,
         ),
         reward_penalty_config=resolved_reward_penalty_config,
         tq_buffer=tq_buffer,
@@ -2015,6 +2082,7 @@ def setup_single_controller(
         bootstrap_identity=bootstrap_identity,
         rollout_checkpoint_load_metrics=rollout_checkpoint_load_metrics,
         finalizer_actors=finalizer_actors,
+        advantage_actors=advantage_actors,
         fleet_monitor=fleet_monitor,
         generation_router=generation_router,
         teacher_worker_groups=teacher_worker_groups,

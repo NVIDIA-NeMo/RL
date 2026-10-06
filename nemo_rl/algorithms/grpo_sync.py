@@ -67,6 +67,11 @@ from nemo_rl.algorithms.loss import (
     ClippedPGLossDataDict,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.metric_utils import (
+    GRAD_NORM_KEY,
+    LOSS_KEY,
+    REWARD_KEY,
+)
 from nemo_rl.algorithms.reward_functions import apply_reward_shaping
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
@@ -332,7 +337,7 @@ def validate_sync(
                 all_message_logs,
                 total_rewards,
                 num_samples=min(
-                    master_config.logger["num_val_samples_to_print"],
+                    master_config.logger.num_val_samples_to_print,
                     len(all_message_logs),
                 ),
                 step=step,
@@ -961,11 +966,19 @@ def grpo_train_sync(
                         extras_bdd["reference_policy_logprobs"] if compute_ref else None
                     )
 
-                # Seq-level logprob error metrics/masking require real prev_logprobs
+                # Separate-pass seq-level metrics/masking require real prev_logprobs
                 if skip_prev_logprobs:
                     sample_mask = loss_multiplier
-                    # Cannot compute seq-level metrics with placeholder prev_logprobs
-                    seq_logprob_error_metrics = _placeholder_seq_logprob_error_metrics()
+                    # In-loss filtering reports counts through all_mb_metrics.
+                    # Use {} so placeholder zeros cannot overwrite those counts
+                    # when seq_logprob_error_metrics is merged after training.
+                    # Otherwise, placeholder prev_logprobs cannot provide
+                    # sequence-error metrics.
+                    seq_logprob_error_metrics = (
+                        {}
+                        if master_config.loss_fn.seq_logprob_error_in_loss
+                        else _placeholder_seq_logprob_error_metrics()
+                    )
                 else:
                     sample_mask, seq_logprob_error_metrics = (
                         _compute_seq_logprob_error_metrics(
@@ -1157,9 +1170,9 @@ def grpo_train_sync(
                 memory_tracker.snapshot_start_of_stage("Metrics", dir())
                 metrics = {
                     **metrics,
-                    "loss": train_results["loss"].numpy(),
-                    "grad_norm": train_results["grad_norm"].numpy(),
-                    "reward": rewards.numpy(),
+                    LOSS_KEY: train_results["loss"].numpy(),
+                    GRAD_NORM_KEY: train_results["grad_norm"].numpy(),
+                    REWARD_KEY: rewards.numpy(),
                     "mean_prompt_length": length.numpy(),
                     "total_num_tokens": input_lengths.numpy(),
                     "advantages/mean": torch.mean(response_advantages).detach().item()
@@ -1259,11 +1272,6 @@ def grpo_train_sync(
 
                     full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
-                        assert full_metric_name.startswith(
-                            "train:"
-                        ) or full_metric_name.startswith("val:"), (
-                            f"metric_name={full_metric_name} must start with 'val:' or 'train:'"
-                        )
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics
                         if not metrics_source:
@@ -1401,7 +1409,15 @@ def grpo_train_sync(
             print(f"  • Loss: {metrics['loss']:.4f}")
             if "draft_loss" in metrics:
                 print(f"  • Draft Loss: {metrics['draft_loss']:.4f}")
-            print(f"  • Generation KL Error: {metrics['gen_kl_error']:.4f}")
+            generation_kl_error = metrics.get("gen_kl_error")
+            print(
+                "  • Generation KL Error: "
+                + (
+                    f"{generation_kl_error:.4f}"
+                    if generation_kl_error is not None
+                    else "not reported"
+                )
+            )
             if master_config.grpo.use_dynamic_sampling:
                 print(f"  • Avg Filtered Reward: {np.mean(rewards.numpy()):.4f}")
                 print(
@@ -1422,8 +1438,7 @@ def grpo_train_sync(
                 * master_config.grpo.num_generations_per_prompt
             )
             total_num_gpus = (
-                master_config.cluster["num_nodes"]
-                * master_config.cluster["gpus_per_node"]
+                master_config.cluster.num_nodes * master_config.cluster.gpus_per_node
             )
 
             print(f"  • Total step time: {total_time:.2f}s", flush=True)
