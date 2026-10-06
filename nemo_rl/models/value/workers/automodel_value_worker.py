@@ -103,7 +103,7 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
         else:
             return f"{self.__class__.__qualname__}"
 
-    @traced_worker_init("rl.value.load_model", **{"rl.backend": "dtensor_v2"})
+    @traced_worker_init("rl.value.load_model", **{"rl.backend": "automodel"})
     def __init__(
         self,
         config: ValueConfig,

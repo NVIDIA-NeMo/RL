@@ -215,7 +215,7 @@ class AutomodelPolicyWorkerImpl(
             "context_parallel": self.device_mesh["cp"].get_local_rank(),
         }
 
-    @traced_worker_init("rl.policy.load_model", **{"rl.backend": "dtensor_v2"})
+    @traced_worker_init("rl.policy.load_model", **{"rl.backend": "automodel"})
     def __init__(
         self,
         config: PolicyConfig,
