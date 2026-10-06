@@ -38,6 +38,7 @@ from nemo_rl.data_plane.schema import (
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.interfaces import PromptGroupRecord
+from nemo_rl.experience.metric_utils import ROLLOUT_CATEGORY_TAG
 
 VIOLATION_TAG_KEYS = (
     "num_invalid_tool_calls",
@@ -193,6 +194,7 @@ def pack_payload(
     weight_version: int,
     group_id: str,
     prompt_idx: int,
+    rollout_category: str | None = None,
 ) -> tuple[list[str], TensorDict, list[dict[str, Any]]]:
     """Pack a producer batch into (sample_ids, fields, tags) for put_samples.
 
@@ -202,6 +204,7 @@ def pack_payload(
         group_id: Per-group identifier used as the sample_id prefix and stamped
             on every row's tag; the caller owns uniqueness.
         prompt_idx: Stable dataset prompt index stamped on every row's tag.
+        rollout_category: Optional telemetry category stamped on every row.
 
     Returns:
         Sample IDs of the form ``{group_id}_g{i}``, a jagged-packed TensorDict
@@ -243,4 +246,7 @@ def pack_payload(
         }
         for i in range(n)
     ]
+    if rollout_category is not None:
+        for tag in tags:
+            tag[ROLLOUT_CATEGORY_TAG] = rollout_category
     return sample_ids, fields_td, tags

@@ -1903,14 +1903,35 @@ class TestLogger:
             "loss": 0.5,
             "agent/reward/histogram": [0.1, 0.2],
             "histogram/gen_tokens_length": [10, 20],
+            "staleness/total/count_2": 1.0,
+            "staleness/category/math/pre_queue/count_1": 2.0,
+            "staleness/category/code/in_queue/count_0": 3.0,
         }
         logger.log_metrics(metrics, step=10)
 
         mock_wandb_logger.return_value.log_metrics.assert_called_once_with(
-            {"loss": 0.5}, 10, "", None, False
+            {
+                "loss": 0.5,
+                "staleness/total/count_2": 1.0,
+                "staleness/category/math/pre_queue/count_1": 2.0,
+                "staleness/category/code/in_queue/count_0": 3.0,
+            },
+            10,
+            "",
+            None,
+            False,
         )
         mock_tb_logger.return_value.log_metrics.assert_called_once_with(
-            {"loss": 0.5}, 10, "", None, False
+            {
+                "loss": 0.5,
+                "staleness/total/count_2": 1.0,
+                "staleness/category/math/pre_queue/count_1": 2.0,
+                "staleness/category/code/in_queue/count_0": 3.0,
+            },
+            10,
+            "",
+            None,
+            False,
         )
         for backend in (
             mock_wandb_logger.return_value,
@@ -1928,6 +1949,9 @@ class TestLogger:
             "loss": 0.5,
             "agent/reward/histogram": [0.1, 0.2],
             "histogram/gen_tokens_length": [10, 20],
+            "staleness/total/count_2": 1.0,
+            "staleness/category/math/pre_queue/count_1": 2.0,
+            "staleness/category/code/in_queue/count_0": 3.0,
         }
 
     @patch("nemo_rl.utils.logger.WandbLogger")

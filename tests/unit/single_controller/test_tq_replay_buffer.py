@@ -500,6 +500,47 @@ class TestDataPlaneCheckpointBarrier:
 
 
 class TestTQReplayBufferReserveCommit:
+    def test_ready_version_is_stamped_after_post_write_enrichment(self) -> None:
+        async def exercise() -> None:
+            dp = FakeDataPlaneClient()
+            buf = _make_buffer(dp)
+            trainer_version = 1
+            buf.set_trainer_version_provider(lambda: trainer_version)
+            entered = asyncio.Event()
+            release = asyncio.Event()
+
+            async def enrich(
+                meta: KVBatchMeta, record: PromptGroupRecord
+            ) -> KVBatchMeta:
+                del record
+                assert dp.depth() == _N_GENS
+                assert all("ready_weight_version" not in tag for tag in meta.tags)
+                entered.set()
+                await release.wait()
+                return meta
+
+            buf.set_post_write_enricher(enrich)
+            group_id = buf.reserve(weight_version=0)
+            commit = asyncio.create_task(
+                buf.commit(
+                    group_id,
+                    _make_record(),
+                    start_weight_version=0,
+                    end_weight_version=1,
+                )
+            )
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            assert buf.ready_list == [False]
+            trainer_version = 3
+            release.set()
+            meta = await asyncio.wait_for(commit, timeout=1)
+            assert buf.ready_list == [True]
+            assert [tag["ready_weight_version"] for tag in meta.tags] == [3] * _N_GENS
+            assert buf.end_weight_list == [1]
+            assert len(dp.put_calls) == 1
+
+        _run(exercise())
+
     def test_reserve_rejects_duplicate_live_group_id(self):
         buf = _make_buffer(FakeDataPlaneClient())
         buf.reserve(weight_version=0, group_id="group-0")
@@ -667,10 +708,15 @@ class TestTQReplayBufferReserveCommit:
         )
 
         group_id = buf.reserve(weight_version=3)
+        record = _make_record(prompt_idx=418)
+        record.extra_env_info = {
+            "task_source": "ifbench",
+            "agent_ref": {"name": "instruction_following_simple_agent"},
+        }
         meta = _run(
             buf.commit(
                 group_id,
-                _make_record(prompt_idx=418),
+                record,
                 start_weight_version=3,
                 end_weight_version=4,
             )
@@ -687,14 +733,22 @@ class TestTQReplayBufferReserveCommit:
         assert buf.end_weight_list == [4]
         assert buf.ready_list == [True]
         assert buf.meta_list[0].sample_ids == meta.sample_ids
-        # TQ tags preserve dispatch-time weight, dataset identity, and the
+        # Preserve dispatch-time weight, dataset/category identity, and the
         # prompt-group key the advantage stage reduces over.
         assert (
             meta.tags
-            == [{"weight_version": 3, "prompt_idx": 418, "group_id": group_id}]
+            == [
+                {
+                    "weight_version": 3,
+                    "prompt_idx": 418,
+                    "rollout_category": "ifbench",
+                    "group_id": group_id,
+                }
+            ]
             * _N_GENS
         )
         assert len(dp.put_calls) == 1
+        assert dp.put_calls[0]["tags"] == meta.tags
         assert len(trace_calls) == 1
         assert trace_calls[0]["keys"] == meta.sample_ids
         assert trace_calls[0]["data"]["input_lengths"].tolist() == [3, 3]
@@ -1190,6 +1244,41 @@ class TestReplayManifestDigest:
 
 
 class TestTQReplayBufferStateDict:
+    def test_category_survives_checkpoint_and_selection(self) -> None:
+        async def exercise() -> None:
+            dp = FakeDataPlaneClient()
+            original = _make_buffer(dp)
+            original.set_trainer_version_provider(lambda: 0)
+            group_id = original.reserve(weight_version=0, target_step=0)
+            record = _make_record()
+            record.extra_env_info = {"task_source": "ifbench"}
+            await original.commit(
+                group_id, record, start_weight_version=0, end_weight_version=0
+            )
+            state = original.metadata_state_dict(saved_capacity=8)
+            restored = _make_buffer(dp)
+            restored.set_trainer_version_provider(lambda: 10)
+            await restored.load_state_dict(
+                state,
+                max_groups=8,
+                expected_partition_id="rollout_data",
+                expected_group_size=_N_GENS,
+                expected_manifest_digest=state["manifest_digest"],
+            )
+            selected, count = await InOrderSampler(
+                restored, max_lookahead_versions=1
+            ).select(current_train_weight=0, min_prompt_groups=1, max_prompt_groups=1)
+            assert count == 1
+            assert selected is not None
+            assert [tag["rollout_category"] for tag in selected.tags] == [
+                "ifbench"
+            ] * _N_GENS
+            assert [tag["ready_weight_version"] for tag in selected.tags] == [
+                0
+            ] * _N_GENS
+
+        _run(exercise())
+
     def test_borrow_and_repayment_remain_selectable_after_restore(self) -> None:
         async def exercise() -> None:
             dp = FakeDataPlaneClient()
@@ -1780,6 +1869,7 @@ class TestTQReplayBufferTokenCaptureMode:
     def test_commit_finalized_fills_slot_with_group_min_wv(self):
         dp = MultiPartitionFakeDataPlaneClient()
         buf = self._make_capture_buffer(dp)
+        buf.set_trainer_version_provider(lambda: 8)
         group_id = buf.reserve(weight_version=4, rollout_ids=["r0", "r1"])
         # The finalizer published its own rows; commit_finalized only fills the slot.
         meta = KVBatchMeta(
@@ -1801,6 +1891,7 @@ class TestTQReplayBufferTokenCaptureMode:
         assert buf.ready_list == [True]
         assert buf.start_weight_list == [3]  # oldest call version, not reserve-time 4
         assert buf.end_weight_list == [5]
+        assert [tag["ready_weight_version"] for tag in meta.tags] == [8, 8]
         assert buf.meta_list[0] is meta
         assert buf._staging_keys_list == [["r0/c1", "r0/c2", "r1/c1"]]
         # No tensorize/put happened here.

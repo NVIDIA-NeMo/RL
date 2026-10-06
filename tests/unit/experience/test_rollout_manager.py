@@ -1945,6 +1945,29 @@ def _make_capture_manager(
 
 
 class TestGenerateForFinalizationFlow:
+    @pytest.mark.parametrize(
+        ("extra_env_info", "expected"),
+        [
+            ({"task_source": "ifbench", "agent_ref": {"name": "agent"}}, "ifbench"),
+            ({"agent_ref": {"name": "agent"}}, "agent"),
+            ({}, "math"),
+        ],
+    )
+    def test_request_carries_prompt_category(self, extra_env_info, expected):
+        mgr = _make_capture_manager(_FakeCaptureBuffer())
+        request = _run(
+            mgr.generate_for_finalization(
+                {
+                    "prompt": "p",
+                    "idx": 0,
+                    "extra_env_info": extra_env_info,
+                    "task_name": "math",
+                }
+            )
+        )
+        assert request is not None
+        assert request.rollout_category == expected
+
     def test_request_carries_env_mask_flags(self):
         buf = _FakeCaptureBuffer()
         mgr = _make_capture_manager(

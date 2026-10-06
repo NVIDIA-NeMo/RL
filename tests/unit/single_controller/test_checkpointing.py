@@ -570,6 +570,9 @@ class _FakeTQBuffer:
         self.checkpoint_barrier: Optional[DataPlaneCheckpointBarrier] = None
         self.training_claims: list[dict[str, Any]] = []
 
+    def set_trainer_version_provider(self, provider: Callable[[], int]) -> None:
+        self.trainer_version_provider = provider
+
     @property
     def group_ids(self) -> tuple[str, ...]:
         return ()

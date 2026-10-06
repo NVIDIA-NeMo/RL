@@ -57,7 +57,12 @@ from nemo_rl.experience.interfaces import (
     RETAINED_TASK_INDICES_KEY,
     PromptGroupRecord,
 )
+from nemo_rl.experience.metric_utils import (
+    READY_WEIGHT_VERSION_TAG,
+    resolve_rollout_category,
+)
 from nemo_rl.experience.payload import pack_payload, record_to_train_batch
+from nemo_rl.experience.rollout_recovery import PromptRef
 from nemo_rl.utils.r3_trace import trace_rollout_payload
 
 DATA_PLANE_CHECKPOINT_DIR = "data_plane"
@@ -66,6 +71,56 @@ LEGACY_REPLAY_BUFFER_FILENAME = "replay_buffer.pt"
 REPLACEMENT_RESERVE_FILENAME = "replacement_reserve.pt"
 REPLAY_BUFFER_METADATA_SCHEMA_VERSION = 1
 REPLAY_BUFFER_METADATA_STORAGE: Literal["tq_checkpoint"] = "tq_checkpoint"
+QUEUE_READY_SEQUENCE = "queue_ready_sequence"
+QUEUE_PROMPT_REF = "queue_prompt_ref"
+QUEUE_TRAIN_VERSION = "queue_train_version"
+QUEUE_DEQUEUE_VERSION = "queue_dequeue_version"
+
+
+class RecycledPromptState(TypedDict):
+    group_id: str
+    sample_id: str
+    task_name: Optional[str]
+
+
+class QueueRecycleState(TypedDict):
+    next_sequence: int
+    recycled_prompts: list[RecycledPromptState]
+
+
+@dataclass(frozen=True)
+class RecycledPrompt:
+    """Durable source identity of a discarded completed group."""
+
+    group_id: str
+    prompt_ref: PromptRef
+
+    def state_dict(self) -> RecycledPromptState:
+        return {
+            "group_id": self.group_id,
+            "sample_id": self.prompt_ref.sample_id,
+            "task_name": self.prompt_ref.task_name,
+        }
+
+    @classmethod
+    def from_state_dict(cls, state: Mapping[str, Any]) -> "RecycledPrompt":
+        if set(state) != {"group_id", "sample_id", "task_name"}:
+            raise ValueError("Invalid recycled-prompt reference fields")
+        group_id, sample_id, task_name = (
+            state["group_id"],
+            state["sample_id"],
+            state["task_name"],
+        )
+        if not isinstance(group_id, str) or not group_id:
+            raise ValueError("Recycled prompt requires a nonempty group_id")
+        if not isinstance(sample_id, str) or not sample_id.isdecimal():
+            raise ValueError("Recycled prompt requires a positional dataset sample_id")
+        if str(int(sample_id)) != sample_id:
+            raise ValueError("Recycled prompt sample_id must be canonical")
+        if task_name is not None and not isinstance(task_name, str):
+            raise ValueError("Recycled prompt task_name must be a string or None")
+        return cls(group_id, PromptRef(sample_id=sample_id, task_name=task_name))
+
 
 CheckpointMutationKind = Literal[
     "advantage_writeback",
@@ -122,6 +177,7 @@ class TQReplayMetadataState(TypedDict):
     saved_capacity: int
     manifest_digest: str
     groups: list[TQReplayGroupMetadata]
+    queue_recycle: NotRequired[QueueRecycleState]
 
 
 class DataPlaneCheckpointMetadata(TypedDict):
@@ -1131,11 +1187,89 @@ class TQReplayBuffer:
         self._post_write_enricher: Optional[
             Callable[[KVBatchMeta, PromptGroupRecord], Awaitable[KVBatchMeta]]
         ] = None
+        self._trainer_version_fn: Optional[Callable[[], int]] = None
         # Sampler selection removes ready slots from the live replay index but
         # deliberately leaves their rows in TQ until optimizer completion.
         # Retain their metadata here so a periodic checkpoint can make an open
         # streamed step replayable without depending on the sibling lineage.
         self._training_claims: dict[str, TQReplayGroupMetadata] = {}
+        self._queue_capacity: Optional[int] = None
+        self._queue_slots: Optional[asyncio.Semaphore] = None
+        self._queue_sequence = 0
+        self._recycled_prompts: deque[RecycledPrompt] = deque()
+
+    def enable_queue_recycle(self, capacity: int) -> None:
+        """Bound completed groups, independently of generation and train claims."""
+        if capacity < 1 or self._queue_capacity is not None:
+            raise ValueError("Queue capacity must be positive and configured once")
+        if self.meta_list or self._training_claims:
+            raise RuntimeError(
+                "Configure queue recycling before loading or dispatching"
+            )
+        self._queue_capacity = capacity
+        self._queue_slots = asyncio.Semaphore(capacity)
+
+    def ready_queue_indices(self) -> list[int]:
+        """Return ready slots in publication order, not reservation order."""
+        ordered: list[tuple[int, int]] = []
+        for i, ready in enumerate(self.ready_list):
+            if ready:
+                meta = self.meta_list[i]
+                if meta is None:
+                    raise RuntimeError("Completed queue entry has no metadata")
+                ordered.append((meta.extra_info[QUEUE_READY_SEQUENCE], i))
+        return [i for _, i in sorted(ordered)]
+
+    @property
+    def recycled_prompt_group_ids(self) -> set[str]:
+        return {prompt.group_id for prompt in self._recycled_prompts}
+
+    def peek_recycled_prompt(self) -> Optional[RecycledPrompt]:
+        return self._recycled_prompts[0] if self._recycled_prompts else None
+
+    def pop_recycled_prompt(self, cut: DataPlaneMutationCut) -> RecycledPrompt:
+        """Transfer FIFO retry ownership under the dataloader/ledger barrier."""
+        cut.require_live()
+        return self._recycled_prompts.popleft()
+
+    async def recycle_queue_group(self, group_id: str) -> None:
+        """Atomically discard a completion and retain its original prompt."""
+        async with self.data_plane_checkpoint_barrier.mutation("group_removals") as cut:
+            idx = self._group_ids.index(group_id)
+            meta = self.meta_list[idx]
+            if meta is None or not self.ready_list[idx]:
+                raise ValueError("Only completed groups may enter the recycle queue")
+            prompt = RecycledPrompt.from_state_dict(meta.extra_info[QUEUE_PROMPT_REF])
+            if prompt.group_id != group_id:
+                raise ValueError("Recycled prompt and replay group IDs disagree")
+            await self._remove_groups_unlocked(cut, [group_id], clear_data_plane=True)
+            self._recycled_prompts.append(prompt)
+
+    async def claim_queue_group(
+        self, group_id: str, *, train_version: int, dequeue_version: int
+    ) -> None:
+        """Persist a prefetched batch assignment together with its train claim."""
+        async with self.data_plane_checkpoint_barrier.mutation("group_removals") as cut:
+            idx = self._group_ids.index(group_id)
+            meta = self.meta_list[idx]
+            if meta is None or not self.ready_list[idx]:
+                raise ValueError("Only completed groups may be prefetched")
+            meta.extra_info[QUEUE_TRAIN_VERSION] = train_version
+            meta.extra_info[QUEUE_DEQUEUE_VERSION] = dequeue_version
+            await self._remove_groups_unlocked(
+                cut, [group_id], clear_data_plane=False, retain_training_claims=True
+            )
+
+    def queue_training_groups(self, train_version: int) -> list[TQReplayGroupMetadata]:
+        """Return the checkpoint-visible FIFO prefix assigned to one update."""
+        return sorted(
+            (
+                group
+                for group in self._training_claims.values()
+                if group["meta"].extra_info.get(QUEUE_TRAIN_VERSION) == train_version
+            ),
+            key=lambda group: group["meta"].extra_info[QUEUE_READY_SEQUENCE],
+        )
 
     def set_data_plane_checkpoint_barrier(
         self, barrier: DataPlaneCheckpointBarrier
@@ -1163,6 +1297,31 @@ class TQReplayBuffer:
     ) -> None:
         """Install the required enrichment stage run before slots become ready."""
         self._post_write_enricher = enricher
+
+    def set_trainer_version_provider(
+        self, trainer_version_fn: Callable[[], int]
+    ) -> None:
+        """Enable ready-version telemetry using the controller's live clock.
+
+        SingleController binds this after initializing its restored trainer
+        version. Standalone callers without a trainer clock leave decomposition
+        unavailable rather than substituting the generation version.
+        """
+        self._trainer_version_fn = trainer_version_fn
+
+    def _stamp_ready_version(self, meta: KVBatchMeta) -> None:
+        """Stamp replay metadata immediately before publication, without awaits.
+
+        This clock is controller-owned: it is recorded after TQ writes and
+        enrichment/finalization finish, and persists in the replay checkpoint
+        index. It does not require another tensor-store write.
+        """
+        if self._trainer_version_fn is None:
+            return
+        version = self._trainer_version_fn()
+        if isinstance(version, bool) or not isinstance(version, int) or version < 0:
+            raise ValueError(f"Invalid ready trainer version {version!r}")
+        meta.stamp_tags({READY_WEIGHT_VERSION_TAG: [version] * meta.size})
 
     @property
     def group_ids(self) -> tuple[str, ...]:
@@ -1215,6 +1374,25 @@ class TQReplayBuffer:
         start_weight_version: int,
         end_weight_version: int,
     ) -> KVBatchMeta:
+        """Publish a completion, waiting outside the checkpoint cut for queue space."""
+        if self._queue_slots is not None:
+            await self._queue_slots.acquire()
+        try:
+            return await self._commit(
+                group_id, record, start_weight_version, end_weight_version
+            )
+        except BaseException:
+            if self._queue_slots is not None:
+                self._queue_slots.release()
+            raise
+
+    async def _commit(
+        self,
+        group_id: str,
+        record: PromptGroupRecord,
+        start_weight_version: int,
+        end_weight_version: int,
+    ) -> KVBatchMeta:
         """Tensorize record, write N rows to TQ, and mark the slot ready.
 
         Args:
@@ -1253,6 +1431,10 @@ class TQReplayBuffer:
             weight_version=start_weight_version,
             group_id=group_id,
             prompt_idx=record.prompt_idx,
+            rollout_category=resolve_rollout_category(
+                extra_env_info=record.extra_env_info,
+                task_name=record.metadata.get("task_name"),
+            ),
         )
         if self._require_routed_experts and ROUTED_EXPERTS_FIELD not in fields:
             raise RuntimeError(
@@ -1302,6 +1484,18 @@ class TQReplayBuffer:
                         f"TQReplayBuffer.commit: group {group_id} was evicted "
                         "during the write; rows cleared"
                     ) from None
+                self._stamp_ready_version(meta)
+                if self._queue_capacity is not None:
+                    prompt = RecycledPrompt(
+                        group_id,
+                        PromptRef(
+                            sample_id=str(record.prompt_idx),
+                            task_name=record.metadata.get("task_name"),
+                        ),
+                    )
+                    meta.extra_info[QUEUE_PROMPT_REF] = prompt.state_dict()
+                    meta.extra_info[QUEUE_READY_SEQUENCE] = self._queue_sequence
+                    self._queue_sequence += 1
                 self.meta_list[idx] = meta
                 self.end_weight_list[idx] = end_weight_version
                 self.ready_list[idx] = True
@@ -1438,6 +1632,7 @@ class TQReplayBuffer:
                     f"provided={sorted(provided_staging_keys)!r}, "
                     f"planned={sorted(plan_cleanup_keys)!r}"
                 )
+        self._stamp_ready_version(meta)
         self.meta_list[idx] = meta
         self.start_weight_list[idx] = group_min_wv
         self.end_weight_list[idx] = group_max_wv
@@ -1470,6 +1665,8 @@ class TQReplayBuffer:
         return True
 
     def _delete_slot(self, idx: int) -> None:
+        if self._queue_slots is not None and self.ready_list[idx]:
+            self._queue_slots.release()
         del self.meta_list[idx]
         del self.start_weight_list[idx]
         del self.end_weight_list[idx]
@@ -1573,7 +1770,9 @@ class TQReplayBuffer:
         released_group_ids = set(group_ids)
         unknown = sorted(released_group_ids - claimed_group_ids)
         unreleased = sorted(claimed_group_ids - released_group_ids)
-        if unknown or unreleased:
+        # Queue recycling also owns the NEXT prefetched batch. Its rows must
+        # survive cleanup of the current optimizer step.
+        if unknown or (unreleased and self._queue_capacity is None):
             raise ValueError(
                 "training claim release does not match current ownership: "
                 f"unknown={unknown!r}, unreleased={unreleased!r}"
@@ -1706,7 +1905,9 @@ class TQReplayBuffer:
         checkpoint pump runs concurrently with ``_train_pump``.
         In-flight reservations are intentionally omitted. ``additional_groups``
         is used by periodic snapshots to re-index rows claimed by an unfinished
-        streamed optimizer step.
+        streamed optimizer step. Returned metadata is detached from live replay
+        entries so checkpoint sidecars can be serialized after the barrier is
+        released, even if selection or prefetch advances in the meantime.
         """
         groups: list[TQReplayGroupMetadata] = []
         for i, ready in enumerate(self.ready_list):
@@ -1716,7 +1917,7 @@ class TQReplayBuffer:
             assert meta is not None  # commit sets meta before ready=True
             groups.append(
                 {
-                    "meta": meta,
+                    "meta": copy.deepcopy(meta),
                     "start_weight": self.start_weight_list[i],
                     "end_weight": self.end_weight_list[i],
                     "target_step": self.target_step_list[i],
@@ -1744,7 +1945,7 @@ class TQReplayBuffer:
             groups.append(copy.deepcopy(group))
             existing_group_ids.add(group_id)
             existing_sample_ids.update(group["meta"].sample_ids)
-        return {
+        state: TQReplayMetadataState = {
             "schema_version": REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
             "storage": REPLAY_BUFFER_METADATA_STORAGE,
             "partition_id": self._partition_id,
@@ -1752,6 +1953,12 @@ class TQReplayBuffer:
             "manifest_digest": replay_manifest_digest(groups),
             "groups": groups,
         }
+        if self._queue_capacity is not None:
+            state["queue_recycle"] = {
+                "next_sequence": self._queue_sequence,
+                "recycled_prompts": [p.state_dict() for p in self._recycled_prompts],
+            }
+        return state
 
     async def load_state_dict(
         self,
@@ -1795,7 +2002,12 @@ class TQReplayBuffer:
                 sample_ids), disagrees with the native TQ snapshot, or exceeds
                 ``max_groups``.
         """
-        if self.meta_list or self._group_ids or self._training_claims:
+        if (
+            self.meta_list
+            or self._group_ids
+            or self._training_claims
+            or self._recycled_prompts
+        ):
             raise RuntimeError(
                 "Replay-buffer checkpoint loading requires an empty local buffer"
             )
@@ -1902,6 +2114,57 @@ class TQReplayBuffer:
                 "them."
             )
 
+        queue_state = state.get("queue_recycle")
+        if (queue_state is not None) != (self._queue_capacity is not None):
+            raise ValueError("Checkpoint and current sampler disagree on queue_recycle")
+        if queue_state is not None:
+            next_sequence = queue_state["next_sequence"]
+            if type(next_sequence) is not int or next_sequence < 0:
+                raise ValueError("Invalid completion queue sequence")
+            sequences = []
+            ready_count = 0
+            for group in groups:
+                info = group["meta"].extra_info
+                sequence = info[QUEUE_READY_SEQUENCE]
+                if type(sequence) is not int or not 0 <= sequence < next_sequence:
+                    raise ValueError("Invalid completed-group queue order")
+                sequences.append(sequence)
+                prompt = RecycledPrompt.from_state_dict(info[QUEUE_PROMPT_REF])
+                if prompt.group_id != group["group_id"]:
+                    raise ValueError(
+                        "Checkpoint prompt reference belongs to another group"
+                    )
+                if QUEUE_TRAIN_VERSION in info:
+                    train, dequeue = (
+                        info[QUEUE_TRAIN_VERSION],
+                        info[QUEUE_DEQUEUE_VERSION],
+                    )
+                    if (
+                        type(train) is not int
+                        or type(dequeue) is not int
+                        or dequeue < 0
+                        or train - dequeue not in (0, 1)
+                    ):
+                        raise ValueError("Invalid prefetched batch version")
+                else:
+                    ready_count += 1
+            if len(sequences) != len(set(sequences)):
+                raise ValueError("Duplicate completion queue order")
+            if ready_count > self._queue_capacity:
+                raise ValueError("Restored completed queue exceeds its capacity")
+            recycled = [
+                RecycledPrompt.from_state_dict(p)
+                for p in queue_state["recycled_prompts"]
+            ]
+            recycled_ids = [p.group_id for p in recycled]
+            if len(recycled_ids) != len(set(recycled_ids)) or set(
+                recycled_ids
+            ).intersection(group["group_id"] for group in groups):
+                raise ValueError("Checkpoint duplicates recycled-prompt ownership")
+            self._queue_sequence = next_sequence
+            self._queue_slots = asyncio.Semaphore(self._queue_capacity - ready_count)
+            self._recycled_prompts.extend(recycled)
+
         for group in groups:
             meta = group["meta"]
             staging_keys: list[str] = []
@@ -1914,6 +2177,9 @@ class TQReplayBuffer:
                 staging_keys.extend(
                     decode_route_plan(encoded_plan).cleanup_staging_keys
                 )
+            if queue_state is not None and QUEUE_TRAIN_VERSION in meta.extra_info:
+                self._training_claims[group["group_id"]] = copy.deepcopy(group)
+                continue
             self.meta_list.append(meta)
             self.start_weight_list.append(group["start_weight"])
             self.end_weight_list.append(group["end_weight"])

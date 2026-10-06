@@ -86,6 +86,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     TQReplayMetadataState,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    QueueRecycleSampler,
     ReadyFirstSamplerConfig,
     TransactionalAdmissionSampler,
     create_sampler,
@@ -162,12 +163,18 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lost
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.failures import RolloutStall
+from nemo_rl.experience.metric_utils import (
+    READY_WEIGHT_VERSION_TAG,
+    ROLLOUT_CATEGORY_TAG,
+    calculate_staleness_metrics,
+)
 from nemo_rl.experience.payload import VIOLATION_TAG_KEYS
 from nemo_rl.experience.rollout_manager import RolloutOutcome
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
     PromptGroupPhase,
+    PromptRef,
     RolloutRecoveryState,
     build_rollout_recovery_state,
     parse_rollout_recovery_state,
@@ -615,7 +622,8 @@ class SingleControllerActor:
             is not None
         )
         self._rollout_recovery_enabled = bool(
-            restoring_rollout_recovery
+            isinstance(self._sampler, QueueRecycleSampler)
+            or restoring_rollout_recovery
             or (
                 self._master_config.checkpointing["enabled"]
                 and self._master_config.checkpointing.get("save_data_plane")
@@ -705,8 +713,11 @@ class SingleControllerActor:
         self._buffer_capacity: asyncio.Semaphore = asyncio.Semaphore(
             self._async_cfg.max_buffered_rollouts
         )
+        if isinstance(self._sampler, QueueRecycleSampler):
+            self._buffer.enable_queue_recycle(self._async_cfg.max_buffered_rollouts)
 
         self._trainer_version: int = restored_trainer_version
+        self._buffer.set_trainer_version_provider(lambda: self._trainer_version)
         self._train_steps: int = actor_args.save_state.current_step
         self._current_epoch: int = actor_args.save_state.current_epoch
         self._step_log_dict: dict[str, list] = {
@@ -868,6 +879,8 @@ class SingleControllerActor:
             if not stop_after_rollout_checkpoint:
                 await train_task
         finally:
+            if isinstance(self._sampler, QueueRecycleSampler):
+                await self._sampler.cancel_prefetch()
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -1046,7 +1059,12 @@ class SingleControllerActor:
             )
         restored = await self._buffer.load_state_dict(
             buffer_state,
-            max_groups=self._async_cfg.max_buffered_rollouts,
+            max_groups=(
+                self._async_cfg.max_buffered_rollouts
+                + 2 * self._algo_cfg.num_prompts_per_step
+                if isinstance(self._sampler, QueueRecycleSampler)
+                else self._async_cfg.max_buffered_rollouts
+            ),
             expected_partition_id=self._partition_id,
             expected_group_size=self._algo_cfg.num_generations_per_prompt,
             expected_manifest_digest=expected_manifest_digest_value,
@@ -1055,9 +1073,10 @@ class SingleControllerActor:
 
         # Each buffered group holds one _buffer_capacity permit. Restore fails
         # above if the saved group count exceeds current capacity.
-        assert restored <= self._async_cfg.max_buffered_rollouts
-        for _ in range(restored):
-            await self._buffer_capacity.acquire()
+        if not isinstance(self._sampler, QueueRecycleSampler):
+            assert restored <= self._async_cfg.max_buffered_rollouts
+            for _ in range(restored):
+                await self._buffer_capacity.acquire()
         return restored
 
     async def _maybe_restore_rollout_recovery(
@@ -1140,11 +1159,14 @@ class SingleControllerActor:
             recovery_ledger.prepare_for_restart(cut)
             self._batch_shortfall = parsed_state.batch_shortfall
             canonical_state = self._buffer.metadata_state_dict(
-                saved_capacity=self._async_cfg.max_buffered_rollouts
+                saved_capacity=self._async_cfg.max_buffered_rollouts,
+                additional_groups=self._buffer.training_owned_replay_groups(),
             )
             canonical_group_ids = {
                 group["group_id"] for group in canonical_state["groups"]
             }
+            if isinstance(self._sampler, QueueRecycleSampler):
+                canonical_group_ids.update(self._buffer.recycled_prompt_group_ids)
             recovery_ledger.discard_canonical_groups(cut, canonical_group_ids)
             if self._master_config.token_capture.enabled:
                 await self._validate_rollout_recovery_inventory(
@@ -1211,94 +1233,67 @@ class SingleControllerActor:
                 "reserved prompts."
             )
 
-    async def _rehydrate_rollout_recovery_prompts(
-        self,
-        cut: DataPlaneMutationCut,
-    ) -> None:
-        """Resolve positional prompt references against a stable map-style dataset.
-
-        This assumes the dataset exposes integer ``__getitem__`` and retains the
-        same ordering across checkpoint and restart.
-        """
-        recovery_ledger = self._rollout_manager.recovery_ledger
-        groups = recovery_ledger.groups()
-        if not groups:
-            return
-
+    async def _resolve_prompt_ref(self, prompt_ref: PromptRef) -> DatumSpec:
+        """Resolve a durable dataset reference without advancing its iterator."""
         dataset = getattr(self._dataloader, "dataset", None)
         if dataset is None:
             raise RuntimeError(
-                "cannot restore unfinished rollouts because the dataloader does "
-                "not expose its source dataset"
+                "cannot restore unfinished rollouts: dataloader has no source dataset"
             )
-
-        resolved_prompts: dict[str, DatumSpec] = {}
-        for group in groups:
-            sample_id = group.prompt_ref.sample_id
-            try:
-                sample_index = int(sample_id)
-            except ValueError as error:
-                raise ValueError(
-                    f"recovery group {group.group_id!r} has a non-integer "
-                    f"dataset sample_id={sample_id!r}"
-                ) from error
-            if sample_index < 0 or str(sample_index) != sample_id:
-                raise ValueError(
-                    f"recovery group {group.group_id!r} has a non-canonical "
-                    f"dataset sample_id={sample_id!r}"
+        sample_id = prompt_ref.sample_id
+        try:
+            sample_index = int(sample_id)
+        except ValueError as error:
+            raise ValueError(f"non-integer dataset sample_id={sample_id!r}") from error
+        if sample_index < 0 or str(sample_index) != sample_id:
+            raise ValueError(f"non-canonical dataset sample_id={sample_id!r}")
+        try:
+            dataset_prompt = await asyncio.to_thread(dataset.__getitem__, sample_index)
+        except (IndexError, KeyError) as error:
+            raise RuntimeError(
+                f"cannot rehydrate dataset sample_id={sample_id!r}"
+            ) from error
+        if not isinstance(dataset_prompt, dict):
+            raise TypeError(
+                f"dataset sample_id={sample_id!r} must resolve to a DatumSpec dictionary"
+            )
+        collate_fn = getattr(self._dataloader, "collate_fn", None)
+        if collate_fn is None:
+            prompt = dataset_prompt
+        else:
+            prompt_batch = await asyncio.to_thread(collate_fn, [dataset_prompt])
+            if isinstance(prompt_batch, BatchedDataDict):
+                if prompt_batch.size != 1:
+                    raise ValueError(
+                        "recovery collation must return exactly one prompt"
+                    )
+                prompt = {key: value[0] for key, value in prompt_batch.items()}
+            elif isinstance(prompt_batch, dict):
+                prompt = prompt_batch
+            else:
+                raise TypeError(
+                    f"recovery collation for sample_id={sample_id!r} returned "
+                    f"{type(prompt_batch).__name__}, expected a mapping"
                 )
+        if (
+            prompt.get("idx") != sample_index
+            or prompt.get("task_name") != prompt_ref.task_name
+        ):
+            raise ValueError(f"dataset identity changed for sample_id={sample_id!r}")
+        return cast(DatumSpec, prompt)
 
-            prompt = resolved_prompts.get(sample_id)
-            if prompt is None:
-                try:
-                    dataset_prompt = await asyncio.to_thread(
-                        dataset.__getitem__, sample_index
-                    )
-                except (IndexError, KeyError) as error:
-                    raise RuntimeError(
-                        f"cannot rehydrate recovery group {group.group_id!r}: "
-                        f"dataset sample_id={sample_id!r} is unavailable"
-                    ) from error
-                if not isinstance(dataset_prompt, dict):
-                    raise TypeError(
-                        f"dataset sample_id={sample_id!r} resolved to "
-                        f"{type(dataset_prompt).__name__}, expected a DatumSpec "
-                        "dictionary"
-                    )
-
-                # Re-run one-row collation to reconstruct the tensor scalars,
-                # optional fields, and multimodal wrappers expected by RolloutManager.
-                collate_fn = getattr(self._dataloader, "collate_fn", None)
-                if collate_fn is None:
-                    prompt = dataset_prompt
-                else:
-                    prompt_batch = await asyncio.to_thread(
-                        collate_fn,
-                        [dataset_prompt],
-                    )
-                    if isinstance(prompt_batch, BatchedDataDict):
-                        if prompt_batch.size != 1:
-                            raise ValueError(
-                                "recovery collation must return exactly one prompt; "
-                                f"sample_id={sample_id!r}, size={prompt_batch.size}"
-                            )
-                        prompt = {key: value[0] for key, value in prompt_batch.items()}
-                    elif isinstance(prompt_batch, dict):
-                        # Identity-style collators used by lightweight/custom
-                        # dataloaders may return the DatumSpec directly.
-                        prompt = prompt_batch
-                    else:
-                        raise TypeError(
-                            "recovery collation for "
-                            f"sample_id={sample_id!r} returned "
-                            f"{type(prompt_batch).__name__}, expected a mapping"
-                        )
-                resolved_prompts[sample_id] = cast(DatumSpec, prompt)
-            recovery_ledger.bind_runtime_prompt(
-                cut,
-                group.group_id,
-                cast(DatumSpec, prompt),
-            )
+    async def _rehydrate_rollout_recovery_prompts(
+        self, cut: DataPlaneMutationCut
+    ) -> None:
+        """Rebuild unfinished prompts using the same resolver as queue recycling."""
+        ledger = self._rollout_manager.recovery_ledger
+        resolved: dict[PromptRef, DatumSpec] = {}
+        for group in ledger.groups():
+            if group.prompt_ref not in resolved:
+                resolved[group.prompt_ref] = await self._resolve_prompt_ref(
+                    group.prompt_ref
+                )
+            ledger.bind_runtime_prompt(cut, group.group_id, resolved[group.prompt_ref])
 
     async def _admit_reserved_prompt_groups(
         self,
@@ -1970,6 +1965,112 @@ class SingleControllerActor:
 
     # ── the three pumps + the inline advantage stage ───────────────────────
 
+    async def _queue_recycle_rollout_pump(self) -> None:
+        """Publish completed groups continuously, prioritizing FIFO retries.
+
+        Workers retain an in-flight slot through publication backpressure.
+        Only completed queue entries consume the buffer's queue capacity;
+        prefetched batches and dataloader reservations have separate ownership.
+        """
+        pending: deque[tuple[DatumSpec, str]] = deque()
+        source_lock = asyncio.Lock()
+        iterator = iter(self._dataloader)
+        self._rollout_exhausted.clear()
+
+        async def restore_prompt(
+            prompt: DatumSpec, target_step: Optional[int], group_id: Optional[str]
+        ) -> None:
+            if target_step is not None or group_id is None:
+                raise ValueError(
+                    "queue_recycle cannot restore stamped or unowned prompts"
+                )
+            pending.append((prompt, group_id))
+
+        await self._redispatch_restored_rollouts(restore_prompt)
+
+        async def next_prompt() -> tuple[DatumSpec, str]:
+            nonlocal iterator
+            async with source_lock:
+                recycled = self._buffer.peek_recycled_prompt()
+                if recycled is not None:
+                    # commit publishes before the rollout manager releases its
+                    # unfinished ledger row. Let that transition finish before
+                    # replacing the durable retry owner with a new reservation.
+                    while recycled.group_id in self._rollout_manager.recovery_ledger:
+                        await asyncio.sleep(0)
+                    prompt = await self._resolve_prompt_ref(recycled.prompt_ref)
+                    async with self._data_plane_checkpoint_barrier.mutation(
+                        "prompt_reservations"
+                    ) as cut:
+                        group_id = self._rollout_manager.reserve_prompt_group(
+                            cut, prompt, target_step=None
+                        )
+                        if self._buffer.pop_recycled_prompt(cut) != recycled:
+                            raise RuntimeError(
+                                "Recycle FIFO ownership changed during dispatch"
+                            )
+                    return prompt, group_id
+                if not pending:
+                    async with self._data_plane_checkpoint_barrier.mutation(
+                        "prompt_reservations"
+                    ) as cut:
+                        try:
+                            batch = next(iterator)
+                        except StopIteration:
+                            self._current_epoch += 1
+                            iterator = iter(self._dataloader)
+                            try:
+                                batch = next(iterator)
+                            except StopIteration as error:
+                                raise RuntimeError(
+                                    "queue_recycle requires a nonempty dataset"
+                                ) from error
+                        if batch.size == 0:
+                            raise ValueError(
+                                "queue_recycle received an empty prompt batch"
+                            )
+                        for row in range(batch.size):
+                            prompt = cast(
+                                DatumSpec, {k: v[row] for k, v in batch.items()}
+                            )
+                            group_id = self._rollout_manager.reserve_prompt_group(
+                                cut, prompt, target_step=None
+                            )
+                            pending.append((prompt, group_id))
+                return pending.popleft()
+
+        async def worker() -> None:
+            while True:
+                await self._rollout_permitted.wait()
+                prompt, group_id = await next_prompt()
+                await self._rollout_permitted.wait()
+                task = asyncio.current_task()
+                assert task is not None
+                self._dispatched_rollouts.add(task)
+                self._inflight_rollouts += 1
+                started = time.monotonic()
+                try:
+                    outcome = await self._rollout_manager.generate_and_push(
+                        prompt,
+                        target_step=None,
+                        lineage_group_id=group_id,
+                        inflight_registry=self._inflight_by_group_id,
+                    )
+                    if outcome is not RolloutOutcome.COMMITTED:
+                        raise RuntimeError(
+                            "queue_recycle requires failed prompts to raise, not silently skip"
+                        )
+                    self._record_rollout_timing(
+                        work_started=started, dispatch_started=started
+                    )
+                finally:
+                    self._inflight_rollouts -= 1
+                    self._dispatched_rollouts.discard(task)
+
+        async with asyncio.TaskGroup() as workers:
+            for _ in range(self._async_cfg.max_inflight_prompts):
+                workers.create_task(worker())
+
     async def _rollout_pump(self) -> None:
         """Continuously dispatch rollout tasks until cancellation.
 
@@ -1998,6 +2099,9 @@ class SingleControllerActor:
         Once every epoch is done, whatever is left in the spare pool is dispatched as
         ordinary steps rather than discarded (see _drain_reserve_into_steps).
         """
+        if isinstance(self._sampler, QueueRecycleSampler):
+            await self._queue_recycle_rollout_pump()
+            return
         sem = asyncio.Semaphore(self._async_cfg.max_inflight_prompts)
         self._rollout_exhausted.clear()
         print("rollout_pump: starting", flush=True)
@@ -2817,7 +2921,16 @@ class SingleControllerActor:
                         )
                         if train_meta is not None:
                             selected_group_ids = self._group_ids_from_meta(train_meta)
-                            if new_training_claim_ids:
+                            if isinstance(self._sampler, QueueRecycleSampler):
+                                if (
+                                    not set(selected_group_ids)
+                                    <= training_claim_ids_after
+                                ):
+                                    raise RuntimeError(
+                                        "Prefetched batch lost its training claims"
+                                    )
+                                selected_training_claim_ids = selected_group_ids
+                            elif new_training_claim_ids:
                                 if set(selected_group_ids) != new_training_claim_ids:
                                     raise RuntimeError(
                                         "sampler selection does not match its new "
@@ -2883,6 +2996,14 @@ class SingleControllerActor:
                         consumed_metas.append(train_meta)
                         consumed_training_claim_ids.extend(selected_training_claim_ids)
                         consumed_group_count += num_groups
+                        if (
+                            isinstance(self._sampler, QueueRecycleSampler)
+                            and self._train_steps + 1 < self._algo_cfg.max_num_steps
+                        ):
+                            self._sampler.start_prefetch(
+                                dequeue_version=version_during_step,
+                                num_groups=self._algo_cfg.num_prompts_per_step,
+                            )
                         for group_id in selected_group_ids:
                             for name, value in self._finalizer_metrics_by_group.pop(
                                 group_id, {}
@@ -3194,13 +3315,41 @@ class SingleControllerActor:
                     step_metrics.update(aggregate_step_metrics(policy_result))
                 if value_result is not None:
                     step_metrics.update(_compute_critic_metrics(value_result))
+                # Use the pre-update trainer clock and one observation per group,
+                # pooled across chunks before cleanup. Canonical tags carry the
+                # same effective start version as the built-in samplers.
+                staleness_metrics = calculate_staleness_metrics(
+                    (
+                        (sample_id, tag["weight_version"])
+                        for meta in consumed_metas
+                        for sample_id, tag in zip(
+                            meta.sample_ids, meta.tags or [], strict=True
+                        )
+                    ),
+                    train_weight_version=version_during_step,
+                    sample_categories={
+                        sample_id: tag.get(ROLLOUT_CATEGORY_TAG)
+                        for meta in consumed_metas
+                        for sample_id, tag in zip(
+                            meta.sample_ids, meta.tags or [], strict=True
+                        )
+                    },
+                    sample_ready_versions={
+                        sample_id: tag.get(READY_WEIGHT_VERSION_TAG)
+                        for meta in consumed_metas
+                        for sample_id, tag in zip(
+                            meta.sample_ids, meta.tags or [], strict=True
+                        )
+                    },
+                )
                 async with self._data_plane_checkpoint_barrier.mutation(
                     "sample_clears"
                 ) as cut:
                     await self._cleanup_consumed_metas_unlocked(cut, consumed_metas)
                     self._buffer.release_training_claims(consumed_training_claim_ids)
-                for _ in range(consumed_group_count):
-                    self._buffer_capacity.release()
+                if not isinstance(self._sampler, QueueRecycleSampler):
+                    for _ in range(consumed_group_count):
+                        self._buffer_capacity.release()
                 step_metrics.update(
                     {
                         name: statistics.fmean(values)
@@ -3241,6 +3390,11 @@ class SingleControllerActor:
                 self._opd_stat_count = 0
                 if self._teacher_coordinator is not None:
                     step_metrics.update(self._teacher_coordinator.drain_metrics())
+
+                if isinstance(self._sampler, QueueRecycleSampler):
+                    with self._timer.time("queue_prefetch_wait"):
+                        await self._sampler.finish_prefetch()
+                    step_metrics.update(self._sampler.drain_metrics())
 
                 if self._train_data_dump is not None:
                     with self._timer.time("train_data_dump"):
@@ -3442,6 +3596,7 @@ class SingleControllerActor:
             self._logger.log_metrics(
                 step_metrics, step=self._train_steps, prefix="train"
             )
+            self._logger.log_metrics(staleness_metrics, step=self._train_steps)
             # Must precede the step_finished=True log below. That log commits
             # the wandb step, and wandb silently discards anything logged
             # against a step it has already committed -- no exception, no
@@ -4147,6 +4302,8 @@ class SingleControllerActor:
             self._sampler_stamps_target_steps
         )
         canonical_group_ids = {group["group_id"] for group in replay_metadata["groups"]}
+        if isinstance(self._sampler, QueueRecycleSampler):
+            canonical_group_ids.update(self._buffer.recycled_prompt_group_ids)
         recovery_state["groups"] = [
             group
             for group in recovery_state["groups"]
@@ -4788,14 +4945,17 @@ class SingleControllerActor:
 
             if self._master_config.checkpointing.get("save_data_plane"):
                 training_owned_groups = self._buffer.training_owned_replay_groups()
-                if training_owned_groups:
+                if training_owned_groups and not isinstance(
+                    self._sampler, QueueRecycleSampler
+                ):
                     raise RuntimeError(
                         "full trainer checkpoint still owns streamed training rows: "
                         f"groups={[group['group_id'] for group in training_owned_groups]!r}"
                     )
                 if self._sampler.supports_buffer_checkpoint:
                     replay_metadata = self._buffer.metadata_state_dict(
-                        saved_capacity=self._async_cfg.max_buffered_rollouts
+                        saved_capacity=self._async_cfg.max_buffered_rollouts,
+                        additional_groups=training_owned_groups,
                     )
                 if replay_metadata is not None:
                     await self._validate_replay_inventory(replay_metadata)
@@ -4810,6 +4970,10 @@ class SingleControllerActor:
                         canonical_group_ids = {
                             group["group_id"] for group in replay_metadata["groups"]
                         }
+                        if isinstance(self._sampler, QueueRecycleSampler):
+                            canonical_group_ids.update(
+                                self._buffer.recycled_prompt_group_ids
+                            )
                         rollout_recovery_state["groups"] = [
                             group
                             for group in rollout_recovery_state["groups"]

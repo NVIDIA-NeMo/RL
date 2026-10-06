@@ -26,6 +26,32 @@ from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.payload import pack_payload, record_to_train_batch
 
 
+def test_pack_payload_preserves_category_on_masked_and_valid_rows() -> None:
+    _, _, tags = pack_payload(
+        {
+            "input_ids": torch.ones((2, 3), dtype=torch.long),
+            "input_lengths": torch.tensor([3, 3]),
+            "sample_mask": torch.tensor([1.0, 0.0]),
+        },
+        weight_version=3,
+        group_id="group",
+        prompt_idx=4,
+        rollout_category="ifbench/v1",
+    )
+    assert (
+        tags
+        == [
+            {
+                "weight_version": 3,
+                "prompt_idx": 4,
+                "rollout_category": "ifbench/v1",
+                "group_id": "group",
+            }
+        ]
+        * 2
+    )
+
+
 def _routes(start: int, count: int) -> torch.Tensor:
     token_routes = torch.arange(start, start + count, dtype=torch.int16).view(
         count, 1, 1

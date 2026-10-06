@@ -28,7 +28,7 @@ import torch
 import nemo_rl.experience.rollout_reassembler_actor as actor_module
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.distributed.actor_environments import ACTOR_ENVIRONMENTS
-from nemo_rl.experience.rollout_reassembler import FinalizedGroup
+from nemo_rl.experience.rollout_reassembler import FinalizedGroup, RolloutReassembler
 from nemo_rl.experience.rollout_reassembler_actor import (
     ReassemblyRequest,
     RolloutReassemblerActor,
@@ -82,7 +82,7 @@ def test_finalizer_request_and_result_are_metadata_only() -> None:
     assert_metadata_only(result)
 
 
-def test_finalize_forwards_loss_multiplier_to_reassembler() -> None:
+def test_finalize_forwards_loss_multiplier_and_category_to_reassembler() -> None:
     actor_cls = RolloutReassemblerActor.__ray_metadata__.modified_class
     actor = object.__new__(actor_cls)
     actor._finalizer = MagicMock()
@@ -95,7 +95,7 @@ def test_finalize_forwards_loss_multiplier_to_reassembler() -> None:
         drop_reason="test",
     )
     actor._finalizer.finalize_group.return_value = result
-    request = replace(_request(), loss_multiplier=0.25)
+    request = replace(_request(), loss_multiplier=0.25, rollout_category="ifbench")
 
     assert actor.finalize(request) is result
     actor._finalizer.finalize_group.assert_called_once_with(
@@ -106,9 +106,40 @@ def test_finalize_forwards_loss_multiplier_to_reassembler() -> None:
         mask_sample=[False],
         fallback_weight_version=4,
         prompt_idx=17,
+        rollout_category="ifbench",
         loss_multiplier=0.25,
         canonical_sample_ids=["group_g0"],
     )
+
+
+def test_finalizer_publishes_category_even_for_masked_placeholders(monkeypatch) -> None:
+    pytest.importorskip("nemo_gym.token_id_capture.staging")
+    finalizer = RolloutReassembler(
+        object(),
+        partition_id="canonical",
+        staging_partition="staging",
+        pad_token_id=0,
+        max_seq_len=128,
+    )
+    publish = MagicMock()
+    monkeypatch.setattr(finalizer, "_call_dp", publish)
+    result = finalizer.finalize_group(
+        "group",
+        ["group_g0", "group_g1"],
+        [None, None],
+        [0.0, 0.0],
+        mask_sample=[False, True],
+        fallback_weight_version=3,
+        prompt_idx=4,
+        rollout_category="ifbench",
+    )
+    assert result.meta is not None
+    assert result.total_row_count == 2
+    assert result.valid_row_count == 0
+    assert [tag["rollout_category"] for tag in result.meta.tags] == ["ifbench"] * 2
+    publish.assert_called_once()
+    assert publish.call_args.args == ("put_samples",)
+    assert publish.call_args.kwargs["tags"] == result.meta.tags
 
 
 def test_finalizer_forwards_mooncake_checkpoint_commands(
@@ -183,6 +214,7 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "prompt_idx",
         "mask_sample",
         "loss_multiplier",
+        "rollout_category",
     }
     assert {f.name for f in fields(FinalizedGroup)} == {
         "meta",

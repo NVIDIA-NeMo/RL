@@ -952,8 +952,9 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(tmp_path) -> None
         )
         controller._buffer = SimpleNamespace(
             count_for_target_step=lambda _target_step: 0,
-            metadata_state_dict=lambda *, saved_capacity: {
-                "groups": [],
+            training_owned_replay_groups=lambda: [],
+            metadata_state_dict=lambda *, saved_capacity, additional_groups: {
+                "groups": list(additional_groups),
                 "saved_capacity": saved_capacity,
             },
         )
@@ -1073,8 +1074,9 @@ def test_recovery_readmits_one_reserved_batch_only_once(tmp_path) -> None:
         )
         controller._buffer = SimpleNamespace(
             count_for_target_step=lambda _target_step: 0,
-            metadata_state_dict=lambda *, saved_capacity: {
-                "groups": [],
+            training_owned_replay_groups=lambda: [],
+            metadata_state_dict=lambda *, saved_capacity, additional_groups: {
+                "groups": list(additional_groups),
                 "saved_capacity": saved_capacity,
             },
         )
@@ -1223,11 +1225,14 @@ def test_recovery_load_does_not_require_every_unfinished_group_to_fit_at_once(
             }
         )
         controller._buffer = SimpleNamespace(
-            metadata_state_dict=lambda *, saved_capacity: {
-                "groups": [{"group_id": f"canonical-{idx}"} for idx in range(3)],
+            training_owned_replay_groups=lambda: [],
+            metadata_state_dict=lambda *, saved_capacity, additional_groups: {
+                "groups": [{"group_id": f"canonical-{idx}"} for idx in range(3)]
+                + list(additional_groups),
                 "saved_capacity": saved_capacity,
-            }
+            },
         )
+        controller._sampler = _CountingInOrderSampler()
 
         # Three canonical groups plus two unfinished groups exceed capacity four,
         # but only the canonical groups occupy slots at restore time. Recovery is
