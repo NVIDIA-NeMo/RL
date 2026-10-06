@@ -82,6 +82,9 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS, uses_image_placeholder
+from nemo_rl.data.packing.shared_prefix_metadata import (
+    SHARED_PREFIX_PROMPT_LENGTHS,
+)
 from nemo_rl.data.utils import load_dataloader_state, setup_response_data
 from nemo_rl.data_plane import (
     DATA_PLANE_CHECKPOINT_SCHEMA_VERSION,
@@ -136,7 +139,11 @@ from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
     router_replay_enabled,
 )
-from nemo_rl.models.policy import OnPolicyDistillationFullTransport, PolicyConfig
+from nemo_rl.models.policy import (
+    OnPolicyDistillationFullTransport,
+    PolicyConfig,
+    get_shared_prefix_training_config,
+)
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.models.value.tq_value import TQValue
 from nemo_rl.utils.checkpoint import (
@@ -333,6 +340,13 @@ def _register_single_controller_partitions(
             DP_TRAIN_FIELDS,
             enabled=r3_enabled and not token_capture_cfg.defer_routed_experts_to_policy,
         )
+    shared_prefix_config = get_shared_prefix_training_config(policy_config)
+    if shared_prefix_config.enabled_for(stage="logprobs"):
+        if not token_capture_cfg.enabled:
+            raise ValueError(
+                "This shared-prefix port requires token_capture.enabled=true"
+            )
+        partition_fields.append(SHARED_PREFIX_PROMPT_LENGTHS)
     if include_multimodal_fields:
         partition_fields.extend(
             field
@@ -2006,6 +2020,9 @@ def setup_single_controller(
                 defer_routed_experts_to_policy=token_capture_cfg.defer_routed_experts_to_policy,
                 max_seq_len=_generation_max_seq_len(generation_config),
                 capture_media=capture_media,
+                include_shared_prefix_metadata=get_shared_prefix_training_config(
+                    policy_config
+                ).enabled_for(stage="logprobs"),
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,
         )

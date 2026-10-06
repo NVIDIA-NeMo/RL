@@ -12,10 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Literal, NotRequired, TypedDict, Union
+from typing import Any, Literal, NotRequired, TypedDict, Union, cast
 
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictBool, StrictInt
 
+from nemo_rl.data.packing.shared_prefix_tensors import (
+    resolve_shared_prefix_parallel_topology,
+    resolve_shared_prefix_physical_padding_multiple,
+)
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 from nemo_rl.utils.checkpoint import PretrainedCheckpointConfig
@@ -237,6 +241,89 @@ class SequencePackingConfig(TypedDict):
     max_sequences_per_bin: NotRequired[int]
 
 
+class SharedPrefixTrainingConfig(BaseModel, extra="allow"):
+    """Controls prompt-prefix sharing in policy training forwards.
+
+    ``disabled`` preserves the existing packing and model execution. ``observe``
+    may report prefix-reuse opportunity metrics but must not alter execution.
+    ``dense`` is an explicit comparison control: it uses conventional packing
+    while permitting the same optional router arithmetic and evaluation MTP
+    bypass as the shared arm. ``logprobs`` shares prefixes only for
+    policy/reference logprob forwards;
+    training APIs retain conventional packing and forward/backward execution.
+    ``train`` shares prefixes in both stages. Both execution modes are
+    experimental and guarded by :func:`validate_shared_prefix_training_config`.
+    """
+
+    mode: Literal["disabled", "observe", "dense", "logprobs", "train"] = "disabled"
+    pack_groups: StrictBool = False
+    """Experimental forest execution under each stage's token budget."""
+    repack_groups: StrictBool = False
+    """Rebuild local slots per group; experimental pending numerical validation."""
+    pack_dense_fallbacks: StrictBool = False
+    """Repack local dense fallback rows with the configured conventional packer."""
+    merge_dense_fallbacks: StrictBool = False
+    """Absorb whole fallback bins into training forests, preserving MTP groups."""
+    evaluation_packing: StrictBool = False
+    """Omit the expanded MTP budget during evaluation; changes forward packing."""
+
+    align_data_parallel: StrictBool = False
+    """Align packed forward counts across the model world using real-row splits."""
+    match_logprob_training_layout: StrictBool = False
+    """Use training's DP weights, token budget and execution plan for logprobs.
+
+    Intended for same-weight consistency in streaming shared-prefix GRPO.
+    Logprob execution remains forward-only and may still bypass auxiliary MTP.
+    """
+    training_dense_bins: StrictBool = False
+    """Pack full training rows, align DP counts, then share prefixes within bins."""
+    preserve_training_prefixes_during_alignment: StrictBool = False
+    """Experimental shared reconstruction of expanded-budget training splits."""
+    bypass_evaluation_mtp: StrictBool = False
+    """Skip HybridModel MTP uniformly in policy logprobs; restore for training."""
+    uniform_router_gating: StrictBool = False
+    """Use MCore's fixed router row blocks in all policy forwards and backwards.
+
+    Opt-in numerical reference for shared execution, dense fallbacks and MTP.
+    Requires an execution or dense-control mode; disabled/observe must not
+    change arithmetic.
+    """
+
+    shard_work_weights: tuple[StrictInt, StrictInt] | None = None
+    """Optional (shared-backbone, expanded-token) weights for DP assignment.
+
+    Real token lengths still determine packing. Disabled by default pending
+    matched GPU timing and gradient validation of the configured weighting.
+    """
+
+    training_shard_work_weights: tuple[StrictInt, StrictInt] | None = None
+    """Override DP assignment weights for training; logprobs keep common weights."""
+
+    def token_budget_key_for(
+        self, *, stage: Literal["train", "logprobs"]
+    ) -> Literal["train_mb_tokens", "logprob_mb_tokens"]:
+        """Select the packing budget without changing the actual autograd mode."""
+        if stage == "train" or self.match_logprob_training_layout:
+            return "train_mb_tokens"
+        return "logprob_mb_tokens"
+
+    def work_weights_for(
+        self, *, stage: Literal["train", "logprobs"]
+    ) -> tuple[int, int] | None:
+        """Resolve weights only for an enabled shared-prefix execution stage."""
+        if not self.enabled_for(stage=stage):
+            return None
+        if (
+            stage == "train" or self.match_logprob_training_layout
+        ) and self.training_shard_work_weights is not None:
+            return self.training_shard_work_weights
+        return self.shard_work_weights
+
+    def enabled_for(self, *, stage: Literal["train", "logprobs"]) -> bool:
+        """Whether a policy API stage should execute shared-prefix units."""
+        return self.mode == "train" or (self.mode == "logprobs" and stage == "logprobs")
+
+
 class RewardModelConfig(TypedDict):
     enabled: bool
     reward_model_type: str
@@ -384,6 +471,10 @@ class MegatronConfig(TypedDict):
     # only specific modules (see recompute_modules). "selective" typically saves ~10-18GB
     # for MoE models while retaining higher throughput than "full".
     recompute_granularity: NotRequired[Literal["full", "selective"]]
+    # Full recompute resolves to uniform chunks of one layer in Megatron setup.
+    # Optional raw values are accepted only when they agree with that resolution.
+    recompute_method: NotRequired[Literal["uniform"]]
+    recompute_num_layers: NotRequired[int]
     # Modules to selectively recompute when recompute_granularity="selective".
     # MCore valid options: ["core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe", "shared_experts"].
     # Defaults to ["core_attn"] when None. Full list and per-module constraints:
@@ -677,6 +768,7 @@ class PolicyConfig(TypedDict):
     hf_config_overrides: NotRequired[dict[str, Any]]
     dynamic_batching: DynamicBatchingConfig | DynamicBatchingConfigDisabled
     sequence_packing: NotRequired[SequencePackingConfig | SequencePackingConfigDisabled]
+    shared_prefix_training: NotRequired[SharedPrefixTrainingConfig]
     make_sequence_length_divisible_by: int
     max_total_sequence_length: int
     # This sets the clipping norm for the DTensorPolicyWorkers (Megatron's is called clip_grad)
@@ -706,3 +798,221 @@ class PolicyConfig(TypedDict):
     # combined with quant_cfg. Its runtime environment must already be in
     # ACTOR_ENVIRONMENT_REGISTRY.
     worker_extension_cls_fqn: NotRequired[str | None]
+
+
+def get_shared_prefix_training_config(
+    config: PolicyConfig,
+) -> SharedPrefixTrainingConfig:
+    """Return the validated shared-prefix block, including its legacy default.
+
+    ``PolicyConfig`` is still a legacy ``TypedDict``, so older configs may omit
+    this newly introduced block. The default remains centralized on
+    :class:`SharedPrefixTrainingConfig`; callers should use this accessor rather
+    than inventing an absence fallback.
+    """
+    shared_prefix_config = config.get("shared_prefix_training")
+    if shared_prefix_config is None:
+        return SharedPrefixTrainingConfig()
+    return SharedPrefixTrainingConfig.model_validate(shared_prefix_config)
+
+
+def validate_shared_prefix_training_config(
+    config: PolicyConfig,
+) -> SharedPrefixTrainingConfig:
+    """Validate backend-independent shared-prefix training requirements.
+
+    Observation mode is deliberately backend-neutral and execution-neutral.
+    The resolved TP/PP/CP topology and matching MCore capability are validated
+    later, after Megatron Bridge resolves the concrete model provider. Accepting
+    TP/SP or CP here does not advertise support: the run remains fail-closed
+    unless MCore exports the exact topology and physical-layout capabilities.
+    """
+    shared_prefix_config = get_shared_prefix_training_config(config)
+    if (
+        shared_prefix_config.match_logprob_training_layout
+        and shared_prefix_config.mode != "train"
+    ):
+        raise ValueError("match_logprob_training_layout requires shared train mode")
+    if shared_prefix_config.training_dense_bins and not (
+        shared_prefix_config.mode == "train"
+        and shared_prefix_config.pack_groups
+        and shared_prefix_config.repack_groups
+        and shared_prefix_config.align_data_parallel
+    ):
+        raise ValueError(
+            "training_dense_bins requires train mode, pack_groups, repack_groups, "
+            "and align_data_parallel"
+        )
+    if shared_prefix_config.training_shard_work_weights is not None:
+        weights = shared_prefix_config.training_shard_work_weights
+        if min(weights) < 0 or sum(weights) <= 0:
+            raise ValueError(
+                "training_shard_work_weights must be nonnegative with a positive sum"
+            )
+        if shared_prefix_config.mode != "train":
+            raise ValueError("training_shard_work_weights requires shared train mode")
+    if shared_prefix_config.shard_work_weights is not None:
+        weights = shared_prefix_config.shard_work_weights
+        if min(weights) < 0 or sum(weights) <= 0:
+            raise ValueError(
+                "shard_work_weights must be nonnegative with a positive sum"
+            )
+        if not shared_prefix_config.enabled_for(stage="logprobs"):
+            raise ValueError(
+                "shard_work_weights requires shared logprobs or train mode"
+            )
+    if (
+        shared_prefix_config.uniform_router_gating
+        and shared_prefix_config.mode != "dense"
+        and not shared_prefix_config.enabled_for(stage="logprobs")
+    ):
+        raise ValueError(
+            "uniform_router_gating requires logprobs or train mode, or explicit dense control"
+        )
+    if shared_prefix_config.mode == "dense":
+        megatron_config = config.get("megatron_cfg")
+        if megatron_config is None or not megatron_config["enabled"]:
+            raise ValueError("dense comparison control requires the Megatron backend")
+    if not shared_prefix_config.enabled_for(stage="logprobs"):
+        return shared_prefix_config
+
+    if (
+        shared_prefix_config.preserve_training_prefixes_during_alignment
+        and not shared_prefix_config.align_data_parallel
+    ):
+        raise ValueError("Preserving training prefixes requires align_data_parallel")
+    if shared_prefix_config.align_data_parallel:
+        if not (
+            shared_prefix_config.pack_groups and shared_prefix_config.repack_groups
+        ):
+            raise ValueError(
+                "align_data_parallel requires pack_groups and repack_groups"
+            )
+        if shared_prefix_config.merge_dense_fallbacks:
+            raise ValueError(
+                "Distributed packing does not support merge_dense_fallbacks"
+            )
+        if (
+            shared_prefix_config.evaluation_packing
+            and not shared_prefix_config.bypass_evaluation_mtp
+        ):
+            raise ValueError(
+                "Distributed evaluation packing requires uniform MTP bypass"
+            )
+
+    megatron_config = config.get("megatron_cfg")
+    if megatron_config is None or megatron_config["enabled"] is not True:
+        raise ValueError(
+            f"policy.shared_prefix_training.mode={shared_prefix_config.mode} requires "
+            "policy.megatron_cfg.enabled=true. Observation mode remains "
+            "available with policy.shared_prefix_training.mode=observe."
+        )
+    megatron_config = cast(MegatronConfig, megatron_config)
+
+    peft_config = megatron_config.get("peft")
+    if peft_config is not None and peft_config["enabled"]:
+        raise ValueError(
+            f"policy.shared_prefix_training.mode={shared_prefix_config.mode} currently requires "
+            "policy.megatron_cfg.peft.enabled=false; PEFT/LoRA adapter dropout "
+            "and shared-prefix gradient semantics have not been validated."
+        )
+
+    sequence_packing_config = config.get("sequence_packing")
+    if sequence_packing_config is None or not sequence_packing_config["enabled"]:
+        raise ValueError(
+            f"policy.shared_prefix_training.mode={shared_prefix_config.mode} requires "
+            "policy.sequence_packing.enabled=true."
+        )
+
+    try:
+        tp_size, cp_size, _sequence_parallel = resolve_shared_prefix_parallel_topology(
+            tp_size=megatron_config["tensor_model_parallel_size"],
+            cp_size=megatron_config["context_parallel_size"],
+            sequence_parallel=megatron_config["sequence_parallel"],
+        )
+    except ValueError as error:
+        raise ValueError(
+            f"policy.shared_prefix_training.mode={shared_prefix_config.mode} requires positive integer "
+            "policy.megatron_cfg.tensor_model_parallel_size/context_parallel_size "
+            "and a boolean policy.megatron_cfg.sequence_parallel that is true "
+            f"exactly when TP>1: {error}"
+        ) from error
+
+    try:
+        padding_multiple = resolve_shared_prefix_physical_padding_multiple(
+            tp_size=tp_size,
+            cp_size=cp_size,
+            padding_multiple=config.get("make_sequence_length_divisible_by"),
+        )
+    except ValueError as error:
+        raise ValueError(
+            "policy.make_sequence_length_divisible_by must be absent/None or "
+            "a positive integer multiple of the shared-prefix TP/CP topology "
+            f"alignment; got {config.get('make_sequence_length_divisible_by')!r}."
+        ) from error
+    for capacity_key in ("train_mb_tokens", "logprob_mb_tokens"):
+        capacity = sequence_packing_config.get(capacity_key)
+        if capacity is None:
+            continue
+        if (
+            isinstance(capacity, bool)
+            or not isinstance(capacity, int)
+            or capacity < 1
+            or capacity % padding_multiple
+        ):
+            raise ValueError(
+                "shared-prefix physical padding requires "
+                f"policy.sequence_packing.{capacity_key} to be a positive "
+                f"multiple of resolved padding M={padding_multiple}; got {capacity}."
+            )
+
+    if megatron_config["pipeline_model_parallel_size"] != 1:
+        raise ValueError(
+            f"policy.shared_prefix_training.mode={shared_prefix_config.mode} currently requires "
+            "policy.megatron_cfg.pipeline_model_parallel_size=1."
+        )
+
+    recompute_granularity = megatron_config.get("recompute_granularity")
+    if megatron_config["activation_checkpointing"] and recompute_granularity in (
+        None,
+        "full",
+    ):
+        recompute_method = megatron_config.get("recompute_method")
+        if recompute_method not in (None, "uniform"):
+            raise ValueError(
+                f"policy.shared_prefix_training.mode={shared_prefix_config.mode} full activation "
+                "recomputation requires policy.megatron_cfg.recompute_method='uniform' "
+                f"when supplied; got {recompute_method!r}."
+            )
+        recompute_num_layers = megatron_config.get("recompute_num_layers")
+        if recompute_num_layers is not None and (
+            isinstance(recompute_num_layers, bool) or recompute_num_layers != 1
+        ):
+            raise ValueError(
+                f"policy.shared_prefix_training.mode={shared_prefix_config.mode} full activation "
+                "recomputation requires policy.megatron_cfg.recompute_num_layers=1 "
+                f"when supplied; got {recompute_num_layers!r}."
+            )
+
+    cuda_graph_impl = megatron_config.get("cuda_graph_impl")
+    if cuda_graph_impl is not None and cuda_graph_impl != "none":
+        raise ValueError(
+            f"policy.shared_prefix_training.mode={shared_prefix_config.mode} currently requires training "
+            "CUDA graphs to be disabled with policy.megatron_cfg.cuda_graph_impl='none'."
+        )
+
+    fp8_config = megatron_config.get("fp8_cfg")
+    if fp8_config is not None and fp8_config["enabled"]:
+        raise ValueError(
+            f"policy.shared_prefix_training.mode={shared_prefix_config.mode} currently requires "
+            "policy.megatron_cfg.fp8_cfg.enabled=false."
+        )
+
+    if config.get("quant_cfg") is not None:
+        raise ValueError(
+            f"policy.shared_prefix_training.mode={shared_prefix_config.mode} currently requires "
+            "policy.quant_cfg=null; FP4 and other ModelOpt training quantization "
+            "are not supported."
+        )
+
+    return shared_prefix_config

@@ -28,6 +28,14 @@ from typing import Any, Optional
 
 import torch
 
+from nemo_rl.data.packing.shared_prefix_cost import estimate_shared_prefix_row_work
+from nemo_rl.data.packing.shared_prefix_metadata import (
+    SHARED_PREFIX_EXECUTION_SLOT,
+    SHARED_PREFIX_PROMPT_LENGTHS,
+    parse_grouped_sample_id,
+    plan_fixed_execution_slots,
+    plan_group_coherent_shards,
+)
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.schema import (
     ELEM_COUNTS_PER_GB,
@@ -48,6 +56,8 @@ def shard_meta_for_dp(
     batch_size: Optional[int] = None,
     sequence_packing_args: Optional[dict[str, Any]] = None,
     dynamic_batching_args: Optional[dict[str, Any]] = None,
+    shared_prefix_groups: bool = False,
+    shared_prefix_work_weights: tuple[int, int] | None = None,
 ) -> tuple[list[KVBatchMeta], Optional[list[int]]]:
     """Pure key-list split: assign ``meta.sample_ids`` to ``dp_world`` ranks.
 
@@ -67,6 +77,9 @@ def shard_meta_for_dp(
         batch_size: Total samples; ``None`` for the logprob path, GBS for train.
         sequence_packing_args: Packing config dict for ``shard_by_batch_size``.
         dynamic_batching_args: Dynamic-batching config dict; mutually exclusive with the above.
+        shared_prefix_groups: Assign complete ``{group_id}_g{index}`` groups
+            coherently to DP ranks. This supersedes ordinary row-level sequence
+            packing; each worker performs the structured star planning locally.
 
     Returns:
         ``(per_rank_metas, unsorted_indices)``. ``unsorted_indices`` contains
@@ -77,18 +90,93 @@ def shard_meta_for_dp(
     n = len(meta.sample_ids)
     if n == 0:
         raise ValueError("shard_meta_for_dp: empty meta — nothing to shard")
-    if meta.sequence_lengths is None or len(meta.sequence_lengths) != n:
+    sequence_lengths = meta.sequence_lengths
+    if sequence_lengths is None or len(sequence_lengths) != n:
         raise ValueError(
             "shard_meta_for_dp requires meta.sequence_lengths populated and "
-            f"of length {n} (got {meta.sequence_lengths!r}). The rollout "
+            f"of length {n} (got {sequence_lengths!r}). The rollout "
             "actor's fan-out should populate this from input_lengths."
         )
     if sequence_packing_args is not None and dynamic_batching_args is not None:
         raise ValueError(
             "Pass at most one of sequence_packing_args / dynamic_batching_args."
         )
+    if shared_prefix_work_weights is not None and not shared_prefix_groups:
+        raise ValueError("Shared work weights require complete-group sharding")
+    if shared_prefix_groups:
+        if dynamic_batching_args is not None:
+            raise ValueError(
+                "shared-prefix group sharding does not support dynamic batching"
+            )
+        parsed_sample_ids = [parse_grouped_sample_id(item) for item in meta.sample_ids]
+        generation_indices: dict[str, list[int]] = {}
+        for group_id, generation_index in parsed_sample_ids:
+            generation_indices.setdefault(group_id, []).append(generation_index)
+        for group_id, indices in generation_indices.items():
+            expected_indices = list(range(len(indices)))
+            if sorted(indices) != expected_indices:
+                raise ValueError(
+                    "shared-prefix TQ sample IDs must contain each generation "
+                    f"index exactly once from 0 through {len(indices) - 1}; "
+                    f"group {group_id!r} has indices {sorted(indices)}"
+                )
+        group_ids = [group_id for group_id, _ in parsed_sample_ids]
+        if sequence_packing_args is None:
+            raise ValueError(
+                "shared-prefix group sharding requires sequence-packing arguments"
+            )
+        if "max_tokens_per_microbatch" not in sequence_packing_args:
+            raise ValueError(
+                "shared-prefix group sharding requires "
+                "sequence_packing_args.max_tokens_per_microbatch"
+            )
+        slot_plan = plan_fixed_execution_slots(
+            group_ids=group_ids,
+            sequence_lengths=sequence_lengths,
+            bin_capacity=int(sequence_packing_args["max_tokens_per_microbatch"]),
+            batch_size=batch_size,
+            sequence_length_pad_multiple=int(
+                sequence_packing_args.get("sequence_length_pad_multiple", 1)
+            ),
+        )
+        assignment_lengths = sequence_lengths
+        if shared_prefix_work_weights is not None:
+            if meta.tags is None or any(
+                SHARED_PREFIX_PROMPT_LENGTHS not in tag for tag in meta.tags
+            ):
+                raise ValueError(
+                    "Shared work balancing requires row-aligned prompt length tags"
+                )
+            assignment_lengths = estimate_shared_prefix_row_work(
+                group_ids=group_ids,
+                sequence_lengths=sequence_lengths,
+                prompt_lengths=[tag[SHARED_PREFIX_PROMPT_LENGTHS] for tag in meta.tags],
+                physical_weight=shared_prefix_work_weights[0],
+                expanded_weight=shared_prefix_work_weights[1],
+            )
+        plan = plan_group_coherent_shards(
+            group_ids=group_ids,
+            sequence_lengths=assignment_lengths,
+            num_shards=dp_world,
+            batch_size=batch_size,
+        )
+        sharded_metas: list[KVBatchMeta] = []
+        for indices in plan.shard_indices:
+            shard = meta.subset(indices)
+            shard.extra_info[SHARED_PREFIX_EXECUTION_SLOT] = [
+                slot_plan.row_slot_ids[index] for index in indices
+            ]
+            sharded_metas.append(shard)
+        return (
+            sharded_metas,
+            (
+                list(plan.rank_order_permutation)
+                if plan.rank_order_permutation is not None
+                else None
+            ),
+        )
 
-    seq_lens = list(meta.sequence_lengths)
+    seq_lens = list(sequence_lengths)
     # Skeleton BatchedDataDict — `shard_by_batch_size` only needs
     # input_ids (placeholder), input_lengths (real), sample_mask (ones).
     # ``meta_idx`` lets us recover which original meta index each shard row

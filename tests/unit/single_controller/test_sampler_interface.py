@@ -784,3 +784,152 @@ class PropertyCapabilitySampler:
 
 
 NOT_A_SAMPLER_CLASS = object()
+
+
+# Shared-prefix packing requires whole DP group counts, while ready-first
+# sampling should still greedily consume the available prefix of the queue.
+def _aligned_ready_buffer(count):
+    buffer = FakeBuffer()
+    for index in range(count):
+        buffer.add(str(index), weight=0)
+    return buffer, ReadyFirstSampler(buffer, max_staleness_versions=16)
+
+
+def test_shared_aligned_ready_first_uses_full_ready_update():
+    buffer, sampler = _aligned_ready_buffer(512)
+    meta, count = _run(
+        sampler.select(
+            current_train_weight=0,
+            min_prompt_groups=32,
+            max_prompt_groups=512,
+            prompt_group_multiple=16,
+        )
+    )
+    assert count == 512
+    assert meta.sample_ids == [f"{i}_g0" for i in range(512)]
+    assert buffer.meta_list == []
+    assert buffer.remove_calls == [(list(range(512)), False)]
+
+
+def test_shared_aligned_ready_first_keeps_unaligned_tail():
+    buffer, sampler = _aligned_ready_buffer(49)
+    meta, count = _run(
+        sampler.select(
+            current_train_weight=0,
+            min_prompt_groups=32,
+            max_prompt_groups=512,
+            prompt_group_multiple=16,
+        )
+    )
+    assert count == 48
+    assert meta.sample_ids == [f"{i}_g0" for i in range(48)]
+    assert buffer.meta_list[0].sample_ids == ["48_g0"]
+
+
+def test_shared_aligned_ready_first_does_not_wait_for_maximum():
+    _, sampler = _aligned_ready_buffer(32)
+    _, count = _run(
+        sampler.select(
+            current_train_weight=0,
+            min_prompt_groups=32,
+            max_prompt_groups=512,
+            prompt_group_multiple=16,
+        )
+    )
+    assert count == 32
+
+
+def test_shared_aligned_ready_first_waits_for_minimum_without_claiming():
+    buffer, sampler = _aligned_ready_buffer(31)
+    result = _run(
+        sampler.select(
+            current_train_weight=0,
+            min_prompt_groups=32,
+            max_prompt_groups=512,
+            prompt_group_multiple=16,
+        )
+    )
+    assert result == (None, 0)
+    assert len(buffer.meta_list) == 31
+    assert buffer.remove_calls == []
+
+
+def test_shared_aligned_ready_first_ignores_pending_and_future_weights():
+    buffer, sampler = _aligned_ready_buffer(48)
+    buffer.add("pending", weight=0, ready=False)
+    buffer.add("future", weight=1)
+    meta, count = _run(
+        sampler.select(
+            current_train_weight=0,
+            min_prompt_groups=32,
+            max_prompt_groups=512,
+            prompt_group_multiple=16,
+        )
+    )
+    assert count == 48
+    assert meta.sample_ids == [f"{i}_g0" for i in range(48)]
+    assert len(buffer.meta_list) == 2
+    assert buffer.ready_list == [False, True]
+
+
+def test_shared_aligned_ready_first_bounds_and_repeated_claims():
+    buffer, sampler = _aligned_ready_buffer(530)
+    meta, count = _run(
+        sampler.select(
+            current_train_weight=0,
+            min_prompt_groups=32,
+            max_prompt_groups=511,
+            prompt_group_multiple=16,
+        )
+    )
+    assert count == 496
+    tail, tail_count = _run(
+        sampler.select(
+            current_train_weight=0,
+            min_prompt_groups=16,
+            max_prompt_groups=32,
+            prompt_group_multiple=16,
+        )
+    )
+    assert tail_count == 32
+    assert meta.sample_ids + tail.sample_ids == [f"{i}_g0" for i in range(528)]
+    assert [m.sample_ids[0] for m in buffer.meta_list] == ["528_g0", "529_g0"]
+
+
+def test_shared_aligned_ready_first_default_keeps_dense_behavior():
+    buffer, sampler = _aligned_ready_buffer(49)
+    _, count = _run(
+        sampler.select(
+            current_train_weight=0, min_prompt_groups=32, max_prompt_groups=512
+        )
+    )
+    assert count == 49
+    assert buffer.meta_list == []
+
+
+def test_shared_aligned_ready_first_rejects_nonpositive_alignment():
+    _, sampler = _aligned_ready_buffer(32)
+    for multiple in (0, -1):
+        with pytest.raises(ValueError, match="prompt_group_multiple"):
+            _run(
+                sampler.select(
+                    current_train_weight=0,
+                    min_prompt_groups=32,
+                    max_prompt_groups=512,
+                    prompt_group_multiple=multiple,
+                )
+            )
+
+
+def test_shared_aligned_ready_first_rounding_cannot_violate_minimum():
+    buffer, sampler = _aligned_ready_buffer(33)
+    result = _run(
+        sampler.select(
+            current_train_weight=0,
+            min_prompt_groups=33,
+            max_prompt_groups=512,
+            prompt_group_multiple=16,
+        )
+    )
+    assert result == (None, 0)
+    assert buffer.remove_calls == []

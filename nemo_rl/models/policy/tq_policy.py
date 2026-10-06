@@ -36,11 +36,15 @@ from collections import Counter, defaultdict
 from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import ray
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.data.packing.shared_prefix_cost import with_prompt_length_tags
+from nemo_rl.data.packing.shared_prefix_metadata import (
+    SHARED_PREFIX_PROMPT_LENGTHS,
+)
 from nemo_rl.data_plane import (
     KVBatchMeta,
     build_data_plane_client,
@@ -48,7 +52,7 @@ from nemo_rl.data_plane import (
     is_metrics_client,
     merge_snapshots,
 )
-from nemo_rl.data_plane.column_io import round_up
+from nemo_rl.data_plane.column_io import read_columns, round_up
 from nemo_rl.data_plane.driver_mixin import TQDriverMixin
 from nemo_rl.data_plane.interfaces import DataPlaneRuntimeConfig
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
@@ -188,6 +192,43 @@ class TQPolicy(TQDriverMixin, Policy):
             )
         )
 
+    def _with_shared_prefix_fields(
+        self,
+        fields: tuple[str, ...] | list[str],
+        *,
+        stage: Literal["train", "logprobs"] = "train",
+    ) -> list[str]:
+        """Add opt-in metadata fields while preserving disabled-mode schemas."""
+        resolved = list(fields)
+        if self.shared_prefix_training_config.enabled_for(stage=stage):
+            for field in (SHARED_PREFIX_PROMPT_LENGTHS,):
+                if field not in resolved:
+                    resolved.append(field)
+        return resolved
+
+    def _with_shared_work_metadata(
+        self, meta: KVBatchMeta, *, stage: Literal["train", "logprobs"]
+    ) -> KVBatchMeta:
+        """Backfill old rollout metadata using only the stored prefix-length column."""
+        config = self.shared_prefix_training_config
+        if config.work_weights_for(stage=stage) is None:
+            return meta
+        if meta.tags is not None and all(
+            SHARED_PREFIX_PROMPT_LENGTHS in tag for tag in meta.tags
+        ):
+            return meta
+        if meta.sequence_lengths is None:
+            raise ValueError("Shared work balancing requires sequence lengths")
+        columns = read_columns(self.dp_client, meta, [SHARED_PREFIX_PROMPT_LENGTHS])
+        return replace(
+            meta,
+            tags=with_prompt_length_tags(
+                meta.tags,
+                prompt_lengths=columns[SHARED_PREFIX_PROMPT_LENGTHS].tolist(),
+                sequence_lengths=meta.sequence_lengths,
+            ),
+        )
+
     # ── lifecycle ──────────────────────────────────────────────────────
 
     def load_data_plane_checkpoint(self, checkpoint_dir: str | Path) -> dict[str, Any]:
@@ -220,12 +261,15 @@ class TQPolicy(TQDriverMixin, Policy):
         """
         self.dp_client.register_partition(
             partition_id=self.tq_partition_id,
-            fields=fields_with_optional_opd_full(
-                fields_with_optional_routed_experts(
-                    DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+            fields=self._with_shared_prefix_fields(
+                fields_with_optional_opd_full(
+                    fields_with_optional_routed_experts(
+                        DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+                    ),
+                    field=self._opd_full_field,
+                    teacher_index_field=self._opd_full_teacher_index_field,
                 ),
-                field=self._opd_full_field,
-                teacher_index_field=self._opd_full_teacher_index_field,
+                stage="logprobs",
             ),
             num_samples=num_samples,
             consumer_tasks=["prev_lp", "ref_lp", "train"],
@@ -403,24 +447,35 @@ class TQPolicy(TQDriverMixin, Policy):
         return is always None, so this dispatcher just waits for
         completion.
         """
-        spa, dba = self._packing_args("logprob_mb_tokens")
+        spa, dba = self._packing_args(
+            self.shared_prefix_training_config.token_budget_key_for(stage="logprobs")
+        )
         # Narrow the fetch to LP_SEED_FIELDS + optional routed_experts under
         # R3 replay. ``_isolated_meta`` unions in the multimodal columns the
         # rollout wrote, for this dispatch and the training one alike, so the
         # prev/ref logprobs and the training forward see identical model inputs.
         lp_meta = self._with_route_fields(
             meta,
-            LP_SEED_FIELDS,
+            self._with_shared_prefix_fields(LP_SEED_FIELDS, stage="logprobs"),
             task_name=task_name,
             want_routes=include_router_replay,
         )
         with timer.time(f"{timer_prefix}/shard_meta") if timer else nullcontext():
+            lp_meta = self._with_shared_work_metadata(lp_meta, stage="logprobs")
             metas, _ = shard_meta_for_dp(
                 lp_meta,
                 dp_world=self.sharding_annotations.get_axis_size("data_parallel"),
                 batch_size=None,
                 sequence_packing_args=spa,
                 dynamic_batching_args=dba,
+                shared_prefix_groups=(
+                    self.shared_prefix_training_config.enabled_for(stage="logprobs")
+                ),
+                shared_prefix_work_weights=(
+                    self.shared_prefix_training_config.work_weights_for(
+                        stage="logprobs"
+                    )
+                ),
             )
         with timer.time(f"{timer_prefix}/submit_futures") if timer else nullcontext():
             futures = self.worker_group.run_all_workers_sharded_data(
@@ -518,23 +573,32 @@ class TQPolicy(TQDriverMixin, Policy):
         # forward would run image-blind while the logprob forwards saw images.
         train_meta = self._with_route_fields(
             meta,
-            tuple(
-                fields_with_optional_opd_full(
-                    train_fields,
-                    field=self._opd_full_field,
-                    teacher_index_field=self._opd_full_teacher_index_field,
-                )
+            self._with_shared_prefix_fields(
+                tuple(
+                    fields_with_optional_opd_full(
+                        train_fields,
+                        field=self._opd_full_field,
+                        teacher_index_field=self._opd_full_teacher_index_field,
+                    )
+                ),
             ),
             task_name="train",
             want_routes=True,
         )
         with timer.time("policy_training/shard_meta") if timer else nullcontext():
+            train_meta = self._with_shared_work_metadata(train_meta, stage="train")
             dp_metas, _ = shard_meta_for_dp(
                 train_meta,
                 dp_world=self.sharding_annotations.get_axis_size("data_parallel"),
                 batch_size=batch_size,
                 sequence_packing_args=spa,
                 dynamic_batching_args=dba,
+                shared_prefix_groups=(
+                    self.shared_prefix_training_config.mode == "train"
+                ),
+                shared_prefix_work_weights=(
+                    self.shared_prefix_training_config.work_weights_for(stage="train")
+                ),
             )
 
         if self.flops_tracker is not None:
@@ -654,27 +718,36 @@ class TQPolicy(TQDriverMixin, Policy):
         spa, dba = self._packing_args("train_mb_tokens")
         train_meta = self._with_route_fields(
             meta,
-            # Raw fields, not pre-wrapped in fields_with_optional_routed_experts:
-            # _with_route_fields applies that wrapper itself, gated on both
-            # router replay and route-plan passthrough. The opd_full payload
-            # column has no such gate, so it is appended here.
-            tuple(
-                fields_with_optional_opd_full(
-                    train_fields,
-                    field=self._opd_full_field,
-                    teacher_index_field=self._opd_full_teacher_index_field,
-                )
+            self._with_shared_prefix_fields(
+                # Raw fields, not pre-wrapped in fields_with_optional_routed_experts:
+                # _with_route_fields applies that wrapper itself, gated on both
+                # router replay and route-plan passthrough. The opd_full payload
+                # column has no such gate, so it is appended here.
+                tuple(
+                    fields_with_optional_opd_full(
+                        train_fields,
+                        field=self._opd_full_field,
+                        teacher_index_field=self._opd_full_teacher_index_field,
+                    )
+                ),
             ),
             task_name="train",
             want_routes=True,
         )
         with timer.time("policy_training/shard_meta") if timer else nullcontext():
+            train_meta = self._with_shared_work_metadata(train_meta, stage="train")
             dp_metas, _ = shard_meta_for_dp(
                 train_meta,
                 dp_world=self.sharding_annotations.get_axis_size("data_parallel"),
                 batch_size=None,
                 sequence_packing_args=spa,
                 dynamic_batching_args=dba,
+                shared_prefix_groups=(
+                    self.shared_prefix_training_config.mode == "train"
+                ),
+                shared_prefix_work_weights=(
+                    self.shared_prefix_training_config.work_weights_for(stage="train")
+                ),
             )
 
         self._dispatch_train_microbatches(dp_metas, timer=timer)
@@ -690,6 +763,10 @@ class TQPolicy(TQDriverMixin, Policy):
         remain unchanged because an SFT loader can provide a narrower schema
         than the rollout training path.
         """
+        if self.shared_prefix_training_config.enabled_for(stage="train"):
+            raise ValueError(
+                "Shared prefix requires group-aware dispatch, not preplaced SFT batches"
+            )
         dp_world = self.sharding_annotations.get_axis_size("data_parallel")
         if len(dp_metas) != dp_world:
             raise ValueError(
