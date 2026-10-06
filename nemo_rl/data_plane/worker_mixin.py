@@ -28,7 +28,10 @@ TP=CP=PP=1) and inherit ``train`` / ``get_logprobs`` /
 
 from __future__ import annotations
 
+import bisect
+import itertools
 import logging
+import os
 import time
 from collections import Counter
 from typing import TYPE_CHECKING, Any, Literal, Optional
@@ -68,6 +71,51 @@ if TYPE_CHECKING:
 
 FetchPolicy = Literal["auto", "independent", "leader_broadcast"]
 
+_ROUTE_BCAST_DEFAULT_BUCKET_BYTES = 64 << 20
+
+
+def _broadcast_leader_result(
+    build: Optional[Any],
+    *,
+    is_leader: bool,
+    src: int,
+    group: Any,
+    action: str,
+) -> tuple[Any, Any]:
+    """Run ``build()`` on the leader and replicate its picklable result.
+
+    ``build`` returns ``(shared, local)``: ``shared`` reaches every rank through
+    ``broadcast_object_list`` and ``local`` stays on the leader (``None`` on
+    peers). Every rank must enter the collective even when the leader fails,
+    otherwise the peers wait indefinitely, so a leader error travels in the
+    payload: the leader re-raises it and peers raise ``RuntimeError``.
+    """
+    leader_error: Exception | None = None
+    local = None
+    if is_leader:
+        try:
+            assert build is not None, "leader must provide a build function"
+            shared, local = build()
+        except Exception as error:
+            leader_error = error
+            payload: list[Any] = [("error", type(error).__name__, str(error))]
+        else:
+            payload = [("ok", shared)]
+    else:
+        payload = [None]
+
+    torch.distributed.broadcast_object_list(payload, src=src, group=group)
+    status, *contents = payload[0]
+    if status == "error":
+        if leader_error is not None:
+            raise leader_error
+        error_type, error_message = contents
+        raise RuntimeError(
+            f"Broadcast source rank {src} failed while {action} "
+            f"({error_type}): {error_message}"
+        )
+    return contents[0], local
+
 
 def _broadcast_batched_data_dict(
     data: Optional[BatchedDataDict[Any]],
@@ -93,66 +141,47 @@ def _broadcast_batched_data_dict(
     backend = torch.distributed.get_backend(group)
     bcast_device: Any = torch.cuda.current_device() if backend == "nccl" else "cpu"
 
-    # Leader-only: keep physical segments uncoalesced until their broadcast
-    # turn so only one packed payload is staged on the GPU at a time.
-    packed_segments: dict[str, list[torch.Tensor]] = {}
-    leader_error: Exception | None = None
+    def describe() -> tuple[list[Any], dict[str, list[torch.Tensor]]]:
+        assert data is not None, "leader must provide non-None data"
+        descriptor: list[Any] = []
+        # Leader-only: keep physical segments uncoalesced until their broadcast
+        # turn so only one packed payload is staged on the GPU at a time.
+        segments: dict[str, list[torch.Tensor]] = {}
+        for k, v in data.items():
+            if isinstance(v, torch.Tensor):
+                descriptor.append(
+                    (k, "tensor", str(v.dtype), tuple(v.shape), str(v.device))
+                )
+            elif isinstance(v, PackedTensor):
+                header, shapes, dtype, source_device, segments[k] = v.broadcast_parts()
+                descriptor.append(
+                    (k, "packed_tensor", header, shapes, dtype, source_device)
+                )
+            elif (
+                v is None
+                or isinstance(v, (str, int, float, bool))
+                or (isinstance(v, np.ndarray) and v.dtype == object)
+            ):
+                # Scalars and object arrays are what the raw branch is for:
+                # small, and cheap to pickle into the object list.
+                descriptor.append((k, "raw", v))
+            else:
+                raise TypeError(
+                    f"Field {k!r}: unexpected broadcast type "
+                    f"{type(v).__name__}. "
+                    "The replica-group broadcast carries torch.Tensor, "
+                    "PackedTensor, np.ndarray[object] and scalars; a bulk "
+                    "wrapper must get its own branch rather than being pickled."
+                )
+        return descriptor, segments
 
-    if is_leader:
-        try:
-            assert data is not None, "leader must provide non-None data"
-            descriptor: list[Any] = []
-            for k, v in data.items():
-                if isinstance(v, torch.Tensor):
-                    descriptor.append(
-                        (k, "tensor", str(v.dtype), tuple(v.shape), str(v.device))
-                    )
-                elif isinstance(v, PackedTensor):
-                    header, shapes, dtype, source_device, packed_segments[k] = (
-                        v.broadcast_parts()
-                    )
-                    descriptor.append(
-                        (k, "packed_tensor", header, shapes, dtype, source_device)
-                    )
-                elif (
-                    v is None
-                    or isinstance(v, (str, int, float, bool))
-                    or (isinstance(v, np.ndarray) and v.dtype == object)
-                ):
-                    # Scalars and object arrays are what the raw branch is for:
-                    # small, and cheap to pickle into the object list.
-                    descriptor.append((k, "raw", v))
-                else:
-                    raise TypeError(
-                        f"Field {k!r}: unexpected broadcast type "
-                        f"{type(v).__name__}. "
-                        "The replica-group broadcast carries torch.Tensor, "
-                        "PackedTensor, np.ndarray[object] and scalars; a bulk "
-                        "wrapper must get its own branch rather than being pickled."
-                    )
-        except Exception as error:
-            # Every rank must enter the first collective, even when the source
-            # cannot describe its batch. Otherwise the peers wait indefinitely.
-            leader_error = error
-            payload: list[Any] = [("error", type(error).__name__, str(error))]
-        else:
-            payload = [("ok", descriptor)]
-    else:
-        payload = [None]
-
-    torch.distributed.broadcast_object_list(payload, src=src, group=group)
-    status, *contents = payload[0]
-    if status == "error":
-        if leader_error is not None:
-            raise leader_error
-        error_type, error_message = contents
-        raise RuntimeError(
-            f"Broadcast source rank {src} failed while describing its batch "
-            f"({error_type}): {error_message}"
-        )
-
-    assert status == "ok"
-    descriptor = contents[0]
+    descriptor, packed_segments = _broadcast_leader_result(
+        describe if is_leader else None,
+        is_leader=is_leader,
+        src=src,
+        group=group,
+        action="describing its batch",
+    )
 
     # pyrefly: ignore  # bad-assignment
     out: BatchedDataDict[Any] = data if is_leader else BatchedDataDict()
@@ -224,6 +253,153 @@ def _broadcast_batched_data_dict(
             if not is_leader:
                 out[key] = entry[2]
     return out
+
+
+def _broadcast_bytes(
+    parts: Optional[list[torch.Tensor]],
+    nbytes: int,
+    *,
+    is_leader: bool,
+    src: int,
+    group: Any,
+    bucket_bytes: int,
+) -> Optional[torch.Tensor]:
+    """Broadcast host bytes through fixed-size device buckets.
+
+    The leader passes flat CPU ``uint8`` ``parts`` totalling ``nbytes``, sent
+    back to back without concatenating them first, and gets ``None`` back.
+    Peers pass ``None`` and receive one pinned CPU buffer. Two device buckets
+    alternate, so the host/device copy of one bucket overlaps the broadcast of
+    the other; device memory stays at ``2 * bucket_bytes``.
+    """
+    if torch.distributed.get_backend(group) != "nccl":
+        raise ValueError("_broadcast_bytes needs an NCCL group")
+    if is_leader:
+        assert parts is not None and sum(p.numel() for p in parts) == nbytes
+        out = None
+    else:
+        out = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+    if nbytes == 0:
+        return out
+    part_starts = list(
+        itertools.accumulate((p.numel() for p in parts or []), initial=0)
+    )
+    size = min(bucket_bytes, nbytes)
+    main = torch.cuda.current_stream()
+    copy = torch.cuda.Stream()
+    device = torch.cuda.current_device()
+    buckets = [torch.empty(size, dtype=torch.uint8, device=device) for _ in range(2)]
+    copied = [torch.cuda.Event() for _ in buckets]
+    sent = [torch.cuda.Event() for _ in buckets]
+    for k, start in enumerate(range(0, nbytes, bucket_bytes)):
+        end = min(start + bucket_bytes, nbytes)
+        b = k % 2
+        chunk = buckets[b][: end - start]
+        if is_leader:
+            assert parts is not None
+            with torch.cuda.stream(copy):
+                copy.wait_event(sent[b])
+                for i in range(bisect.bisect_right(part_starts, start) - 1, len(parts)):
+                    lo, hi = max(part_starts[i], start), min(part_starts[i + 1], end)
+                    if lo >= end:
+                        break
+                    chunk[lo - start : hi - start].copy_(
+                        parts[i][lo - part_starts[i] : hi - part_starts[i]],
+                        non_blocking=True,
+                    )
+                copied[b].record(copy)
+        main.wait_event(copied[b])
+        torch.distributed.broadcast(chunk, src=src, group=group)
+        sent[b].record(main)
+        if out is not None:
+            with torch.cuda.stream(copy):
+                copy.wait_event(sent[b])
+                out[start:end].copy_(chunk, non_blocking=True)
+                copied[b].record(copy)
+    copy.synchronize()
+    return out
+
+
+def _broadcast_route_fragments(
+    fetch: Optional[Any],
+    *,
+    is_leader: bool,
+    src: int,
+    group: Any,
+    bucket_bytes: int,
+) -> list[dict[str, RouteFragment]]:
+    """Replicate the leader's per-row route fragments across ``group``.
+
+    The leader calls ``fetch()`` for ``fragments_by_row``. A small index rides
+    ``broadcast_object_list``; the route bytes ride :func:`_broadcast_bytes`.
+    A leader-side fetch error travels in the index payload so peers never hang.
+    """
+
+    def describe() -> tuple[tuple[Any, ...], tuple[Any, list[torch.Tensor]]]:
+        assert fetch is not None, "leader must provide a fragment fetch"
+        fragments_by_row = fetch()
+        unique: dict[str, RouteFragment] = {}
+        for fragments in {id(f): f for f in fragments_by_row}.values():
+            unique.update(fragments)
+        shared = all(f is fragments_by_row[0] for f in fragments_by_row)
+        row_keys = None if shared else [list(f) for f in fragments_by_row]
+        index: list[Any] = []
+        parts: list[torch.Tensor] = []
+        offset = 0
+        for key, fragment in unique.items():
+            pad = -offset % 8
+            if pad:
+                parts.append(torch.zeros(pad, dtype=torch.uint8))
+                offset += pad
+            routes = fragment.routes.detach().cpu().contiguous()
+            raw = routes.reshape(-1).view(torch.uint8)
+            index.append(
+                (
+                    key,
+                    offset,
+                    raw.numel(),
+                    routes.dtype,
+                    tuple(routes.shape),
+                    fragment.encoding,
+                    fragment.extras_metadata_json,
+                )
+            )
+            parts.append(raw)
+            offset += raw.numel()
+        return (index, row_keys, len(fragments_by_row), offset), (
+            fragments_by_row,
+            parts,
+        )
+
+    (index, row_keys, num_rows, nbytes), local = _broadcast_leader_result(
+        describe if is_leader else None,
+        is_leader=is_leader,
+        src=src,
+        group=group,
+        action="fetching route fragments",
+    )
+    fragments_by_row, parts = local if is_leader else (None, None)
+    blob = _broadcast_bytes(
+        parts,
+        nbytes,
+        is_leader=is_leader,
+        src=src,
+        group=group,
+        bucket_bytes=bucket_bytes,
+    )
+    if is_leader:
+        return fragments_by_row
+
+    unique = {}
+    for key, start, size, dtype, shape, encoding, extras in index:
+        unique[key] = RouteFragment(
+            routes=blob[start : start + size].view(dtype).reshape(shape),
+            encoding=encoding,
+            extras_metadata_json=extras,
+        )
+    if row_keys is None:
+        return [unique for _ in range(num_rows)]
+    return [{key: unique[key] for key in keys} for keys in row_keys]
 
 
 def _materialize_fetched(
@@ -443,6 +619,9 @@ class TQWorkerMixin:
         if replica_group is not None and replica_group.size() > 1:
             is_leader = self._is_replica_leader()
             leader = torch.distributed.get_global_rank(replica_group, 0)
+            broadcast_route_fragments = bool(
+                (meta.extra_info or {}).get(ROUTE_PASSTHROUGH_FLAG)
+            ) and (os.environ.get("NRL_ROUTE_BCAST", "dense") == "fragments")
             if is_leader:
                 dp_client = self._require_dp_client()
                 if local_batch:
@@ -464,7 +643,8 @@ class TQWorkerMixin:
                     pad_to_seqlen=pad_to_seqlen,
                     tags=meta.tags,
                 )
-                data = self._maybe_assemble_routed_experts(meta, data)
+                if not broadcast_route_fragments:
+                    data = self._maybe_assemble_routed_experts(meta, data)
             else:
                 data = None
             data = _broadcast_batched_data_dict(
@@ -473,6 +653,28 @@ class TQWorkerMixin:
                 src=leader,
                 group=replica_group,
             )
+            if broadcast_route_fragments:
+                plans = self._route_plans(meta)
+                bucket_bytes = int(
+                    os.environ.get(
+                        "NRL_ROUTE_BCAST_BUCKET_BYTES",
+                        _ROUTE_BCAST_DEFAULT_BUCKET_BYTES,
+                    )
+                )
+
+                def fetch_fragments() -> list[dict[str, RouteFragment]]:
+                    return self._route_fragments_by_row(plans)[0]
+
+                fragments_by_row = _broadcast_route_fragments(
+                    fetch_fragments if is_leader else None,
+                    is_leader=is_leader,
+                    src=leader,
+                    group=replica_group,
+                    bucket_bytes=bucket_bytes,
+                )
+                data = self._assemble_routed_experts(
+                    meta, data, plans, fragments_by_row, record_fallbacks=is_leader
+                )
             # Reconstruct message_log after broadcast so the views alias
             # the per-rank local ``input_ids`` rather than the leader's.
             attach_message_log_view(data)
@@ -555,12 +757,9 @@ class TQWorkerMixin:
 
     def _route_fragments_by_row(
         self,
-        plans: list[Any],
+        decoded: list[Any],
     ) -> tuple[list[dict[str, RouteFragment]], int, float]:
         """Use one normal-path batch read; isolate error retries per rollout."""
-        from nemo_rl.experience.route_plan import decode_route_plan
-
-        decoded = [decode_route_plan(plan) for plan in plans]
         partitions = {plan.staging_partition for plan in decoded}
         if len(partitions) != 1:
             raise RuntimeError(
@@ -623,11 +822,14 @@ class TQWorkerMixin:
         """Materialize deferred routes at the policy worker consumption boundary."""
         if not (meta.extra_info or {}).get(ROUTE_PASSTHROUGH_FLAG):
             return data
-
-        from nemo_rl.experience.route_plan import decode_route_plan
-        from nemo_rl.models.generation.interfaces import (
-            ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
+        plans = self._route_plans(meta)
+        fragments_by_row, _, _ = self._route_fragments_by_row(plans)
+        return self._assemble_routed_experts(
+            meta, data, plans, fragments_by_row, record_fallbacks=True
         )
+
+    def _route_plans(self, meta: "KVBatchMeta") -> list[Any]:
+        from nemo_rl.experience.route_plan import decode_route_plan
 
         tags = meta.tags or []
         if len(tags) != len(meta.sample_ids):
@@ -642,8 +844,21 @@ class TQWorkerMixin:
                     f"deferred route plan missing for row {meta.sample_ids[index]!r}"
                 )
             encoded_plans.append(tag[ROUTE_PLAN_TAG])
-        plans = [decode_route_plan(plan) for plan in encoded_plans]
-        fragments_by_row, _, _ = self._route_fragments_by_row(encoded_plans)
+        return [decode_route_plan(plan) for plan in encoded_plans]
+
+    def _assemble_routed_experts(
+        self,
+        meta: "KVBatchMeta",
+        data: BatchedDataDict[Any],
+        plans: list[Any],
+        fragments_by_row: list[dict[str, RouteFragment]],
+        *,
+        record_fallbacks: bool,
+    ) -> BatchedDataDict[Any]:
+        """Build the padded routes table from already-fetched fragments."""
+        from nemo_rl.models.generation.interfaces import (
+            ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
+        )
 
         # The worker supplies real model dims — the authoritative shape check.
         num_moe_layers, top_k = self._routed_experts_dimensions()
@@ -675,14 +890,15 @@ class TQWorkerMixin:
             else:
                 routed[row_index, :canonical_len] = tensor
 
-        self._route_fallback_counts.update(request_fallbacks)
-        if request_fallbacks:
-            logging.getLogger(__name__).warning(
-                "deferred route fallback for %d/%d rollouts: %s",
-                sum(request_fallbacks.values()),
-                len(plans),
-                dict(request_fallbacks),
-            )
+        if record_fallbacks:
+            self._route_fallback_counts.update(request_fallbacks)
+            if request_fallbacks:
+                logging.getLogger(__name__).warning(
+                    "deferred route fallback for %d/%d rollouts: %s",
+                    sum(request_fallbacks.values()),
+                    len(plans),
+                    dict(request_fallbacks),
+                )
         data[ROUTED_EXPERTS_FIELD] = routed
         return data
 
