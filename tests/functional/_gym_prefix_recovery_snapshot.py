@@ -103,7 +103,7 @@ def _recoverable_cut(record: dict[str, Any]) -> dict[str, Any] | None:
         continuation = cut.get("continuation")
         if not isinstance(continuation, dict):
             continue
-        token_count = continuation.get("generation_token_count")
+        token_count = continuation.get("prefix_token_count")
         output_limit = continuation.get("effective_output_limit")
         staging_keys = continuation.get("staging_keys")
         if (
@@ -192,7 +192,7 @@ def inspect_snapshot(snapshot: Path) -> dict[str, Any]:
         raise AssertionError(
             "snapshot has no recoverable nonterminal active generation prefix"
         )
-    return max(candidates, key=lambda item: item["generation_token_count"])
+    return max(candidates, key=lambda item: item["prefix_token_count"])
 
 
 def select_snapshot(args: argparse.Namespace) -> None:
@@ -310,8 +310,8 @@ def verify_restore(args: argparse.Namespace) -> None:
     )
     expected_prefix = (
         selection["model_call_id"],
-        selection["generation_token_count"],
-        selection["digest"],
+        selection["prefix_token_count"],
+        selection["prefix_digest"],
     )
     if not any(
         source_model_call_id == expected_prefix[0]
