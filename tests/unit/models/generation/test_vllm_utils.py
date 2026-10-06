@@ -1156,6 +1156,83 @@ def test_pad_and_align_rejects_expert_ids_overflowing_dtype(monkeypatch):
         )
 
 
+class _Output:
+    pass
+
+
+@pytest.mark.parametrize(
+    ("backend_dtype", "num_experts"),
+    [
+        # vLLM stores routed-expert ids as uint8 up to 256 experts and uint16
+        # above. torch has no max() kernel for uint16/uint32, so the overflow
+        # guard must reduce in a wider signed dtype for these to work at all.
+        (torch.uint8, 256),
+        (torch.uint16, 512),
+        (torch.uint32, 70_000),
+    ],
+)
+def test_pad_and_align_accepts_unsigned_backend_ids(
+    monkeypatch, backend_dtype, num_experts
+):
+    """Ids in vLLM's native unsigned dtype are narrowed to the resolved carry dtype.
+
+    Covers both the prompt and the completion route tensors, and the default
+    route written into the padding rows, which is built in the carry dtype.
+    """
+    monkeypatch.setattr(vllm_utils, "G_ROUTED_EXPERTS_RANGE_CHECKED", False)
+    carry_dtype = resolve_routed_experts_dtype(num_experts)
+    top_k = 2
+    ids = torch.arange(5 * 3 * top_k).reshape(5, 3, top_k) % num_experts
+    # Put the largest id in the tensor so the one-time overflow guard sees it.
+    ids[0, 0, 0] = num_experts - 1
+
+    request_output = _Output()
+    request_output.prompt_routed_experts = ids[:2].to(backend_dtype)
+    completion_output = _Output()
+    completion_output.routed_experts = ids[2:].to(backend_dtype)
+
+    routed_experts = pad_and_align_routed_expert_indices(
+        request_output,
+        completion_output,
+        valid_length=6,
+        padded_length=8,
+        device=torch.device("cpu"),
+        routed_experts_dtype=carry_dtype,
+    )
+
+    assert routed_experts.dtype == carry_dtype
+    assert routed_experts.shape == (8, 3, top_k)
+    assert torch.equal(routed_experts[:5], ids.to(carry_dtype))
+    default_route = torch.arange(top_k, dtype=carry_dtype)
+    assert torch.equal(
+        routed_experts[5:], default_route.view(1, 1, -1).expand(3, 3, top_k)
+    )
+
+
+def test_pad_and_align_overflow_guard_sees_unwrapped_unsigned_ids(monkeypatch):
+    """The guard must compare the true id, not one already wrapped into the carry dtype.
+
+    40000 does not fit int16. Narrowing before the reduction would wrap it to a
+    negative number and the guard would pass silently, which is the failure
+    mode it exists to catch.
+    """
+    monkeypatch.setattr(vllm_utils, "G_ROUTED_EXPERTS_RANGE_CHECKED", False)
+
+    request_output = _Output()
+    completion_output = _Output()
+    completion_output.routed_experts = torch.full((2, 1, 2), 40_000).to(torch.uint16)
+
+    with pytest.raises(ValueError, match="exceeds the resolved carry dtype"):
+        pad_and_align_routed_expert_indices(
+            request_output,
+            completion_output,
+            valid_length=3,
+            padded_length=3,
+            device=torch.device("cpu"),
+            routed_experts_dtype=torch.int16,
+        )
+
+
 def _generation_stub(counters):
     """Enough of a ``VllmGeneration`` to call ``get_step_metrics`` unbound.
 

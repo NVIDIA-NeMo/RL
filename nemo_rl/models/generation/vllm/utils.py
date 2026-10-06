@@ -337,13 +337,11 @@ def pad_and_align_routed_expert_indices(
             "Router replay allows at most one surplus final-token route."
         )
 
-    # Build in int64 and narrow afterwards: torch has no arange kernel for the
-    # unsigned carry dtypes (uint16/uint32) used when a model has > 255 experts.
     default_route = torch.arange(
         routed.shape[2],
-        dtype=torch.int64,
+        dtype=routed_experts_dtype,
         device=device,
-    ).to(dtype=routed_experts_dtype)
+    )
     full = (
         default_route.view(1, 1, -1)
         .expand(padded_length, routed.shape[1], routed.shape[2])

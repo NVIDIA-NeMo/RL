@@ -2767,8 +2767,7 @@ class SingleControllerActor:
                         )
                         max_prompt_groups = min(
                             target_groups - groups_dispatched,
-                            self._async_cfg.max_groups_for_streaming_train
-                            or self._async_cfg.min_groups_for_streaming_train,
+                            self._async_cfg.streaming_chunk_cap(),
                         )
                         if max_prompt_groups <= 0:
                             break
