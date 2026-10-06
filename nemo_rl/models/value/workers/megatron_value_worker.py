@@ -1007,10 +1007,13 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
 
     def finish_training(self) -> None:
         """Offload model, gradients, and optimizer to CPU after training."""
+        # MambaMixer.train(False), called by eval(), refreshes its inference cache
+        # from A_log (-torch.exp(A_log.float())). Do this before model offload frees
+        # CUDA parameter storage; refreshing afterward would read invalid storage.
+        self.model.eval()
         self.model = self.move_model(
             self.model, "cpu", move_params=True, move_grads=True
         )
-        self.model.eval()
 
         if (
             hasattr(self, "optimizer")
