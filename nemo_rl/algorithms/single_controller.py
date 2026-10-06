@@ -1856,6 +1856,11 @@ class SingleControllerActor:
                             finalized.group_min_wv,
                             finalized.group_max_wv,
                             staging_keys=finalized.staging_keys,
+                            extra_env_info=(
+                                {"agent_ref": {"name": request.resolved_agent_name}}
+                                if request.resolved_agent_name is not None
+                                else None
+                            ),
                         )
                     except BaseException as commit_error:
                         try:

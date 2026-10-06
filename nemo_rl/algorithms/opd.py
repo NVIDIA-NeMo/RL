@@ -43,7 +43,6 @@ from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
     prepare_segment_topology,
 )
-from nemo_rl.experience.interfaces import PromptGroupRecord
 from nemo_rl.utils.fp32_lm_head import Fp32LmHeadSetting, fp32_lm_head_enabled
 
 if TYPE_CHECKING:
@@ -448,8 +447,9 @@ class TQTeacherLogprobCoordinator:
         self._teacher_lock_wait_time_s = 0.0
         self._aliases_seen: set[str] = set()
 
-    def _resolve_teacher(self, record: PromptGroupRecord) -> tuple[str, str]:
-        extra_env_info = record.extra_env_info
+    def _resolve_teacher(
+        self, extra_env_info: Optional[dict[str, Any]]
+    ) -> tuple[str, str]:
         agent_ref = (
             extra_env_info.get("agent_ref")
             if isinstance(extra_env_info, dict)
@@ -571,10 +571,10 @@ class TQTeacherLogprobCoordinator:
     async def enrich(
         self,
         meta: KVBatchMeta,
-        record: PromptGroupRecord,
+        extra_env_info: Optional[dict[str, Any]],
     ) -> KVBatchMeta:
         """Write teacher logprobs before the replay-buffer slot becomes ready."""
-        alias, group_alias = self._resolve_teacher(record)
+        alias, group_alias = self._resolve_teacher(extra_env_info)
         started_at = time.perf_counter()
         lock_started_at = time.perf_counter()
         # Wait for a physical teacher without occupying a default-executor

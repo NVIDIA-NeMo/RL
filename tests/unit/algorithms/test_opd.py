@@ -326,17 +326,8 @@ def test_compute_teacher_logprobs_default_alias_fallback_routes():
 # ---------------------------------------------------------------------------
 
 
-def _teacher_record(agent_name: str):
-    from nemo_rl.experience.interfaces import PromptGroupRecord
-
-    return PromptGroupRecord(
-        prompt_idx=0,
-        prompt=[],
-        extra_env_info={"agent_ref": {"name": agent_name}},
-        metadata={},
-        completions=[],
-        rollout_metrics={},
-    )
+def _teacher_env_info(agent_name: str) -> dict[str, object]:
+    return {"agent_ref": {"name": agent_name}}
 
 
 def _teacher_meta(prefix: str, batch_size: int, seq_len: int):
@@ -405,7 +396,7 @@ def test_tq_teacher_enrichment_pads_dp_and_writes_teacher_column(monkeypatch):
     )
     meta = _teacher_meta("group", batch_size=3, seq_len=5)
 
-    enriched = asyncio.run(coordinator.enrich(meta, _teacher_record("math")))
+    enriched = asyncio.run(coordinator.enrich(meta, _teacher_env_info("math")))
 
     assert teacher.received_meta is not None
     assert teacher.received_meta.size == 4
@@ -463,7 +454,7 @@ def test_tq_teacher_enrichment_skips_padding_for_dp_divisible_batch(monkeypatch)
     )
     meta = _teacher_meta("group", batch_size=2, seq_len=5)
 
-    enriched = asyncio.run(coordinator.enrich(meta, _teacher_record("math")))
+    enriched = asyncio.run(coordinator.enrich(meta, _teacher_env_info("math")))
 
     assert teacher.received_meta is meta
     assert "teacher_reference_logprobs" in enriched.fields
@@ -512,7 +503,7 @@ def test_tq_teacher_routing_uses_default_teacher_for_unmapped_agent():
         },
     )
 
-    assert coordinator._resolve_teacher(_teacher_record("unmapped")) == (
+    assert coordinator._resolve_teacher(_teacher_env_info("unmapped")) == (
         "default",
         "default",
     )
@@ -560,7 +551,7 @@ def test_tq_teacher_padding_rows_are_cleaned_when_write_partially_fails(monkeypa
         asyncio.run(
             coordinator.enrich(
                 _teacher_meta("group", batch_size=3, seq_len=3),
-                _teacher_record("math"),
+                _teacher_env_info("math"),
             )
         )
 
@@ -600,7 +591,7 @@ def test_tq_teacher_enrichment_drains_background_thread_before_cancellation():
         task = asyncio.create_task(
             coordinator.enrich(
                 _teacher_meta("group", batch_size=1, seq_len=3),
-                _teacher_record("math"),
+                _teacher_env_info("math"),
             )
         )
         assert await asyncio.to_thread(started.wait, 1)
@@ -652,7 +643,7 @@ def test_tq_teacher_waiters_do_not_occupy_executor_threads(monkeypatch):
         first = asyncio.create_task(
             coordinator.enrich(
                 _teacher_meta("first", batch_size=1, seq_len=3),
-                _teacher_record("math"),
+                _teacher_env_info("math"),
             )
         )
         while not started.is_set():
@@ -660,7 +651,7 @@ def test_tq_teacher_waiters_do_not_occupy_executor_threads(monkeypatch):
         second = asyncio.create_task(
             coordinator.enrich(
                 _teacher_meta("second", batch_size=1, seq_len=3),
-                _teacher_record("math"),
+                _teacher_env_info("math"),
             )
         )
         await asyncio.sleep(0.01)
@@ -726,8 +717,8 @@ def test_tq_teacher_enrichment_serializes_deduplicated_teacher(monkeypatch):
 
     async def run_both():
         await asyncio.gather(
-            coordinator.enrich(_teacher_meta("math", 1, 4), _teacher_record("math")),
-            coordinator.enrich(_teacher_meta("code", 1, 4), _teacher_record("code")),
+            coordinator.enrich(_teacher_meta("math", 1, 4), _teacher_env_info("math")),
+            coordinator.enrich(_teacher_meta("code", 1, 4), _teacher_env_info("code")),
         )
 
     asyncio.run(run_both())
@@ -768,8 +759,8 @@ def test_tq_teacher_enrichment_runs_distinct_teachers_concurrently():
 
     async def run_both():
         await asyncio.gather(
-            coordinator.enrich(_teacher_meta("math", 1, 4), _teacher_record("math")),
-            coordinator.enrich(_teacher_meta("code", 1, 4), _teacher_record("code")),
+            coordinator.enrich(_teacher_meta("math", 1, 4), _teacher_env_info("math")),
+            coordinator.enrich(_teacher_meta("code", 1, 4), _teacher_env_info("code")),
         )
 
     asyncio.run(run_both())
@@ -1357,7 +1348,7 @@ def test_tq_teacher_enrichment_advertises_the_full_payload_column(monkeypatch):
     )
     meta = _teacher_meta("group", batch_size=3, seq_len=5)
 
-    enriched = asyncio.run(coordinator.enrich(meta, _teacher_record("math")))
+    enriched = asyncio.run(coordinator.enrich(meta, _teacher_env_info("math")))
 
     assert "teacher_reference_logprobs" in enriched.fields
     assert OPD_FULL_HIDDEN_STATES_FIELD in enriched.fields
@@ -1395,7 +1386,7 @@ def test_tq_teacher_enrichment_does_not_advertise_a_payload_when_full_is_disable
 
     enriched = asyncio.run(
         coordinator.enrich(
-            _teacher_meta("group", batch_size=2, seq_len=4), _teacher_record("math")
+            _teacher_meta("group", batch_size=2, seq_len=4), _teacher_env_info("math")
         )
     )
 

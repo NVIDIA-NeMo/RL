@@ -46,6 +46,8 @@ class ReassemblyRequest:
     mask_sample: tuple[bool, ...]
     # Dataset-level loss weight shared by every completion in this prompt group.
     loss_multiplier: float = 1.0
+    # Resolved by Gym and persisted with the sealed receipts for teacher routing.
+    resolved_agent_name: Optional[str] = None
 
 
 @dataclass(frozen=True)
