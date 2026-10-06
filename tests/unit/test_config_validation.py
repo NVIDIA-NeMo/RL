@@ -398,15 +398,15 @@ def test_automodel_moe_recipes_use_expected_dispatcher(
     config_file: str,
 ) -> None:
     config = load_config_with_inheritance(config_file)
-    dtensor_cfg = OmegaConf.select(config, "policy.dtensor_cfg")
+    automodel_cfg = OmegaConf.select(config, "policy.automodel_cfg")
     if (
-        dtensor_cfg is None
-        or not dtensor_cfg.enabled
-        or dtensor_cfg.get("expert_parallel_size", 1) <= 1
+        automodel_cfg is None
+        or not automodel_cfg.enabled
+        or automodel_cfg.get("expert_parallel_size", 1) <= 1
     ):
         pytest.skip("Not an AutoModel expert-parallel recipe")
 
-    backend = dtensor_cfg.automodel_kwargs.backend
+    backend = automodel_cfg.automodel_kwargs.backend
     assert "enable_deepep" not in backend
     if Path(config_file).relative_to(configs_dir) in DEEPEP_FALLBACK_RECIPES:
         assert backend.get("dispatcher") == "deepep"
