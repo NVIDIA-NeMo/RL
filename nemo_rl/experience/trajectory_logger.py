@@ -70,14 +70,15 @@ ROW_SCHEMA = pa.schema(
 )
 
 
-def _scalar_column(value: Optional[torch.Tensor], n: int) -> np.ndarray | list[None]:
+def _rollout_column(value: Optional[torch.Tensor], n: int) -> np.ndarray | list[None]:
+    """Build a column with one scalar per rollout."""
     return [None] * n if value is None else value.detach().cpu().reshape(n).numpy()
 
 
 def _token_column(
     name: str, value: Optional[torch.Tensor], lengths: np.ndarray
 ) -> pa.Array:
-    """Turn batched tokens into one Arrow list per row (= rollout)."""
+    """Build an Arrow column with one list of per-token values per rollout."""
     n = len(lengths)
     list_type = cast(pa.ListType, ROW_SCHEMA.field(name).type)
     if value is None:
@@ -88,8 +89,6 @@ def _token_column(
         tensor = tensor.float()
     if tensor.is_nested:
         rows = tensor.unbind()
-    elif tensor.dim() == 1:
-        rows = (tensor[i : i + 1] for i in range(n))
     else:
         rows = (tensor[i, : lengths[i]] for i in range(n))
 
@@ -130,10 +129,10 @@ class TrajectoryLogger:
             "sample_id": meta.sample_ids,
             "prompt_idx": [tag.get("prompt_idx") for tag in tags],
             "weight_version": [tag.get("weight_version") for tag in tags],
-            "reward": _scalar_column(tensors["total_reward"], n),
-            "final_sample_mask": _scalar_column(tensors["sample_mask"], n),
-            "mask_sample": _scalar_column(tensors[MASK_SAMPLE], n),
-            "truncated": _scalar_column(tensors[TRUNCATED], n),
+            "reward": _rollout_column(tensors["total_reward"], n),
+            "final_sample_mask": _rollout_column(tensors["sample_mask"], n),
+            "mask_sample": _rollout_column(tensors[MASK_SAMPLE], n),
+            "truncated": _rollout_column(tensors[TRUNCATED], n),
             "input_ids": _token_column("input_ids", tensors["input_ids"], lengths),
             "token_mask": _token_column("token_mask", tensors["token_mask"], lengths),
             "generation_logprobs": _token_column(

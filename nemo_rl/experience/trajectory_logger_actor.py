@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from contextlib import suppress
+import contextlib
 
 import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
@@ -67,7 +67,7 @@ def create_trajectory_logger_actor(
     try:
         ray.get(actor.__ray_ready__.remote())
     except ray.exceptions.RayError:
-        with suppress(ray.exceptions.RayError):
+        with contextlib.suppress(ray.exceptions.RayError):
             ray.kill(actor, no_restart=True)
         raise
     return actor

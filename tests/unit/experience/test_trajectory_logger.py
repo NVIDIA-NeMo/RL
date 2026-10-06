@@ -28,7 +28,7 @@ from nemo_rl.experience.trajectory_logger import TrajectoryLogger, _token_column
 @pytest.mark.parametrize(
     "dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64]
 )
-@pytest.mark.parametrize("layout", ["dense", "nested", "scalar", "extra_dim"])
+@pytest.mark.parametrize("layout", ["dense", "nested", "extra_dim"])
 def test_token_column_shapes_and_float_dtypes(dtype: torch.dtype, layout: str) -> None:
     lengths = np.array([2, 1], dtype=np.int64)
     if layout == "nested":
@@ -36,9 +36,6 @@ def test_token_column_shapes_and_float_dtypes(dtype: torch.dtype, layout: str) -
         value = torch.nested.as_nested_tensor(
             [torch.tensor(row, dtype=dtype) for row in expected], layout=torch.jagged
         )
-    elif layout == "scalar":
-        value = torch.tensor([0.5, 2.0], dtype=dtype)
-        expected = [[0.5], [2.0]]
     else:
         value = torch.tensor([[0.5, -1.0, 99.0], [2.0, 99.0, 99.0]], dtype=dtype)
         if layout == "extra_dim":
