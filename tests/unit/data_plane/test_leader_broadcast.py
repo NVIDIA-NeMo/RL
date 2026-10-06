@@ -29,8 +29,19 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from nemo_rl.data.multimodal_utils import PackedTensor
-from nemo_rl.data_plane.worker_mixin import _broadcast_batched_data_dict
+from nemo_rl.data_plane.worker_mixin import (
+    _broadcast_batched_data_dict,
+    _broadcast_bytes,
+    _broadcast_route_fragments,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.experience.route_assembly import RouteFragment
+
+
+_needs_two_gpus = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 2,
+    reason="needs 2 GPUs for NCCL",
+)
 
 
 def _in_group(body, rank: int, world_size: int, tmp_init_file: str, q, backend):
@@ -455,3 +466,105 @@ def test_get_replica_group_default_is_none():
         pass
 
     assert _Stub()._get_replica_group() is None
+
+
+def _bytes_body(rank: int):
+    for nbytes, bucket_bytes in [(0, 4), (1, 4), (13, 4), (16, 4), (13, 64)]:
+        expected = (
+            torch.arange(nbytes, dtype=torch.int64).remainder(251).to(torch.uint8)
+        )
+        out = _broadcast_bytes(
+            list(expected.clone().split(5)) if rank == 0 else None,
+            nbytes,
+            is_leader=(rank == 0),
+            src=0,
+            group=dist.group.WORLD,
+            bucket_bytes=bucket_bytes,
+        )
+        if rank == 0:
+            assert out is None
+        else:
+            assert nbytes == 0 or out.is_pinned()
+            assert torch.equal(out, expected), (nbytes, bucket_bytes)
+
+
+@_needs_two_gpus
+def test_broadcast_bytes_round_trips_across_bucket_sizes(tmp_path):
+    _run_two_ranks(_bytes_body, str(tmp_path / "init_bytes"), backend="nccl")
+
+
+def _route_fragments():
+    return {
+        "a": RouteFragment(
+            routes=torch.arange(3 * 2 * 2, dtype=torch.int16).reshape(3, 2, 2),
+            encoding=1,
+            extras_metadata_json=b'{"a": 1}',
+        ),
+        "b": RouteFragment(
+            routes=torch.arange(5, dtype=torch.uint8).reshape(5, 1, 1),
+            encoding=2,
+            extras_metadata_json=b"{}",
+        ),
+        "empty": RouteFragment(
+            routes=torch.empty(0, 2, 2, dtype=torch.int16),
+            encoding=1,
+            extras_metadata_json=b"{}",
+        ),
+    }
+
+
+def _assert_same_fragments(actual, expected):
+    assert list(actual) == list(expected)
+    for key, fragment in expected.items():
+        got = actual[key]
+        assert got.routes.dtype == fragment.routes.dtype
+        assert torch.equal(got.routes, fragment.routes)
+        assert got.encoding == fragment.encoding
+        assert got.extras_metadata_json == fragment.extras_metadata_json
+
+
+def _route_fragments_body(rank: int):
+    shared = _route_fragments()
+    per_row = [{"a": shared["a"]}, {}, {"b": shared["b"], "empty": shared["empty"]}]
+    for expected in ([shared, shared], per_row):
+        out = _broadcast_route_fragments(
+            (lambda: expected) if rank == 0 else None,
+            is_leader=(rank == 0),
+            src=0,
+            group=dist.group.WORLD,
+            bucket_bytes=7,
+        )
+        assert len(out) == len(expected)
+        for got_row, expected_row in zip(out, expected):
+            _assert_same_fragments(got_row, expected_row)
+
+
+@_needs_two_gpus
+def test_broadcast_route_fragments_round_trip(tmp_path):
+    _run_two_ranks(_route_fragments_body, str(tmp_path / "init_routes"), backend="nccl")
+
+
+def _route_fragments_error_body(rank: int):
+    def fail():
+        raise KeyError("route rows missing")
+
+    _broadcast_route_fragments(
+        fail if rank == 0 else None,
+        is_leader=(rank == 0),
+        src=0,
+        group=dist.group.WORLD,
+        bucket_bytes=7,
+    )
+
+
+@_needs_two_gpus
+def test_broadcast_route_fragments_reports_leader_error(tmp_path):
+    results = _collect_two_rank_results(
+        _route_fragments_error_body,
+        str(tmp_path / "init_routes_error"),
+        backend="nccl",
+    )
+
+    assert results[0][1].startswith("err: KeyError:")
+    assert results[1][1].startswith("err: RuntimeError:")
+    assert "route rows missing" in results[1][1]
