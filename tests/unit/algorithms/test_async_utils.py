@@ -3278,7 +3278,7 @@ class TestAsyncTrajectoryCollector:
     def test_nemo_gym_batch_retry_forwards_effort_config_without_duplicates(
         self, monkeypatch
     ):
-        """Retries preserve effort shaping and do not re-enqueue buffered groups."""
+        """Retries preserve effort shaping and length penalties without re-enqueueing buffered groups."""
 
         class _ReadyResult:
             def __init__(self, value):
@@ -3317,6 +3317,8 @@ class TestAsyncTrajectoryCollector:
                 "low_string": "{reasoning effort: efficient}",
             }
         }
+        length_penalty_cfg = {"default": {"total_bonus": 0.1, "top_percentile": 0.5}}
+        collector.master_config.grpo.length_penalty = length_penalty_cfg
         target_weight = 15
         collector._generating_targets.add(target_weight)
         repeated_batch = BatchedDataDict(
@@ -3349,6 +3351,11 @@ class TestAsyncTrajectoryCollector:
                 low_penalty=1.0,
                 low_ub=15_000,
                 low_string="{reasoning effort: efficient}",
+            )
+            # The collector forwards the whole grpo block; the rollout
+            # postprocessor reads grpo.length_penalty from it.
+            assert kwargs["length_penalty_config"]["length_penalty"] == (
+                length_penalty_cfg
             )
             rollout_calls += 1
             task_indices = [
