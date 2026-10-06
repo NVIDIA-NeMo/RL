@@ -614,6 +614,54 @@ class TestAutomodelCheckpointManager:
 
 
 @pytest.mark.automodel
+class TestSaveTokenizerOnRank0:
+    """Tests for the rank-0 guard around tokenizer saving.
+
+    The tokenizer is replicated across ranks and ``save_pretrained`` writes
+    rank-independent filenames, so letting every rank write races on the same
+    file and can hang the job on a hard-mounted NFS share.
+    """
+
+    def test_saves_when_distributed_not_initialized(self):
+        tokenizer = MagicMock()
+        with patch("torch.distributed.is_initialized", return_value=False):
+            AutomodelCheckpointManager._save_tokenizer_on_rank0(
+                tokenizer, "/some/tokenizer/path"
+            )
+        tokenizer.save_pretrained.assert_called_once_with("/some/tokenizer/path")
+
+    def test_saves_on_rank0_and_barriers(self):
+        tokenizer = MagicMock()
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_rank", return_value=0),
+            patch("torch.distributed.barrier") as mock_barrier,
+        ):
+            AutomodelCheckpointManager._save_tokenizer_on_rank0(
+                tokenizer, "/some/tokenizer/path"
+            )
+        tokenizer.save_pretrained.assert_called_once_with("/some/tokenizer/path")
+        mock_barrier.assert_called_once()
+
+    @pytest.mark.parametrize("rank", [1, 7, 31])
+    def test_skips_write_on_non_zero_ranks(self, rank):
+        tokenizer = MagicMock()
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_rank", return_value=rank),
+            patch("torch.distributed.barrier") as mock_barrier,
+        ):
+            AutomodelCheckpointManager._save_tokenizer_on_rank0(
+                tokenizer, "/some/tokenizer/path"
+            )
+        # Non-zero ranks must not write: concurrent save_pretrained() calls on
+        # the same path are what deadlocked on the NFS inode lock.
+        tokenizer.save_pretrained.assert_not_called()
+        # ...but they must still reach the barrier, otherwise rank 0 hangs.
+        mock_barrier.assert_called_once()
+
+
+@pytest.mark.automodel
 class TestSaveCheckpointFunctional:
     """Functional tests for save_checkpoint method with mocked internals."""
 
@@ -1281,3 +1329,75 @@ def test_qwen_vl_vision_key_mapping_workaround_still_needed():
             "workaround in nemo_rl/models/automodel/checkpoint.py is obsolete - remove it "
             "and this test."
         )
+
+
+def _manager_with_stub_config(monkeypatch):
+    """A manager whose Automodel config build is stubbed out (no process groups)."""
+    from nemo_rl.models.automodel import checkpoint as ckpt_mod
+
+    built = {}
+
+    class _StubConfig:
+        def __init__(self, **kwargs):
+            built["kwargs"] = kwargs
+
+        def build(self, **kwargs):
+            return object()
+
+    monkeypatch.setattr(ckpt_mod, "AutomodelCheckpointingConfig", _StubConfig)
+    manager = ckpt_mod.AutomodelCheckpointManager.__new__(
+        ckpt_mod.AutomodelCheckpointManager
+    )
+    manager.checkpointer = None
+    manager.moe_mesh = None
+    manager._get_dp_rank = lambda: 0
+    manager._get_tp_rank = lambda: 0
+    return manager, built
+
+
+@pytest.mark.automodel
+def test_init_checkpointer_opts_async_daemons_into_the_prefix_store(monkeypatch):
+    """With the training store's address known, the DCP daemons must reuse it.
+
+    torch's process-based async checkpointer otherwise has rank 0 bind a
+    freshly probed port for the daemons' GLOO group, which raced with other
+    port users on the CI nodes (EADDRINUSE at the first save).
+    """
+    monkeypatch.setenv("MASTER_ADDR", "10.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", "1401")
+    # setenv before delenv so monkeypatch records the variable's absence and
+    # removes the "1" init_checkpointer writes at teardown; delenv alone on an
+    # absent name records nothing and the value leaks into every later test.
+    monkeypatch.setenv("DCP_USE_PREFIX_STORE", "")
+    monkeypatch.delenv("DCP_USE_PREFIX_STORE")
+    manager, _ = _manager_with_stub_config(monkeypatch)
+
+    manager.init_checkpointer(config_updates={"is_async": True})
+
+    assert os.environ["DCP_USE_PREFIX_STORE"] == "1"
+
+
+@pytest.mark.automodel
+def test_init_checkpointer_leaves_prefix_store_alone_without_master_env(monkeypatch):
+    monkeypatch.delenv("MASTER_ADDR", raising=False)
+    monkeypatch.delenv("MASTER_PORT", raising=False)
+    monkeypatch.delenv("DCP_USE_PREFIX_STORE", raising=False)
+    manager, _ = _manager_with_stub_config(monkeypatch)
+
+    manager.init_checkpointer(config_updates={"is_async": True})
+
+    # torch asserts on MASTER_ADDR/MASTER_PORT in prefix-store mode; without them
+    # the default get_free_port path is the only one that can work.
+    assert "DCP_USE_PREFIX_STORE" not in os.environ
+
+
+@pytest.mark.automodel
+def test_init_checkpointer_respects_an_explicit_prefix_store_choice(monkeypatch):
+    monkeypatch.setenv("MASTER_ADDR", "10.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", "1401")
+    monkeypatch.setenv("DCP_USE_PREFIX_STORE", "0")
+    manager, _ = _manager_with_stub_config(monkeypatch)
+
+    manager.init_checkpointer(config_updates={"is_async": True})
+
+    assert os.environ["DCP_USE_PREFIX_STORE"] == "0"

@@ -337,7 +337,7 @@ def validate_sync(
                 all_message_logs,
                 total_rewards,
                 num_samples=min(
-                    master_config.logger["num_val_samples_to_print"],
+                    master_config.logger.num_val_samples_to_print,
                     len(all_message_logs),
                 ),
                 step=step,
@@ -1272,11 +1272,6 @@ def grpo_train_sync(
 
                     full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
-                        assert full_metric_name.startswith(
-                            "train:"
-                        ) or full_metric_name.startswith("val:"), (
-                            f"metric_name={full_metric_name} must start with 'val:' or 'train:'"
-                        )
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics
                         if not metrics_source:
@@ -1435,8 +1430,7 @@ def grpo_train_sync(
                 * master_config.grpo.num_generations_per_prompt
             )
             total_num_gpus = (
-                master_config.cluster["num_nodes"]
-                * master_config.cluster["gpus_per_node"]
+                master_config.cluster.num_nodes * master_config.cluster.gpus_per_node
             )
 
             print(f"  • Total step time: {total_time:.2f}s", flush=True)

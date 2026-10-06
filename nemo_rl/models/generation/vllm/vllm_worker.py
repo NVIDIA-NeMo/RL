@@ -58,6 +58,7 @@ from nemo_rl.models.generation.vllm.utils import (
     encode_counter_key,
     format_prompt_for_vllm_generation,
     pad_and_align_routed_expert_indices,
+    validate_rollout_prompt,
 )
 from nemo_rl.models.generation.vllm.video_utils import (
     register_torchcodec_vllm_video_loader,
@@ -368,7 +369,10 @@ class BaseVllmGenerationWorker:
                 # That is fixed by offsetting the TCPStore search, deliberately
                 # *not* by dropping VLLM_PORT: an unset VLLM_PORT sends vLLM to
                 # kernel-ephemeral ports, which is the TOCTOU contention this port
-                # layout exists to avoid (#2380, #3103).
+                # layout exists to avoid (#2380, #3103). vLLM >= 0.29 binds and
+                # holds the TCPStore before publishing its port (vllm#50969), so
+                # that patch is a no-op there; this layout still governs the
+                # MessageQueue and API-server ports.
                 engine_index_on_node = 0
             elif mp_size == 1:
                 engine_index_on_node = local_bundle_indices[0] % num_gpus_per_node
@@ -547,6 +551,15 @@ class BaseVllmGenerationWorker:
                 "please run at least once with the environment variable NRL_FORCE_REBUILD_VENVS=true set to force the rebuild of the environment."
             )
         vllm_kwargs: dict[str, Any] = copy.deepcopy(self.cfg.get("vllm_kwargs", {}))
+        # vLLM 0.28 (vllm-project/vllm#50411) skips rescale/normalize in the HF image
+        # processor and re-applies them on the GPU in the vision tower's dtype. The
+        # policy side normalizes on the CPU in fp32 through the same HF processor, so
+        # keep generation on that path too: identical pixel preprocessing on both sides
+        # is what the token_mult_prob_error / gen_kl_error checks assume. Upstream has
+        # already shipped one silent-corruption fix for the device path
+        # (vllm-project/vllm#55370, encoder cudagraphs). Users can opt back in via
+        # policy.generation.vllm_kwargs.mm_device_do_normalize=true.
+        vllm_kwargs.setdefault("mm_device_do_normalize", False)
         checkpoint_engine_config = checkpoint_engine_refit_config(self.cfg)
         if checkpoint_engine_config is not None:
             from nemo_rl.models.generation.vllm.checkpoint_engine import (
@@ -790,6 +803,32 @@ class BaseVllmGenerationWorker:
     def is_alive(self):
         """Check if the worker is alive."""
         return True
+
+    def _tokenize_prompt_with_bos(
+        self, prompt: str | dict[str, Any]
+    ) -> str | dict[str, Any]:
+        """Tokenize an explicit BOS once, before vLLM expands media placeholders."""
+        if isinstance(prompt, dict):
+            if "prompt_token_ids" in prompt or "prompt_embeds" in prompt:
+                return prompt
+            text = prompt.get("prompt")
+        else:
+            text = prompt
+        if not isinstance(text, str):
+            return prompt
+
+        tokenizer = self.llm.renderer.get_tokenizer()
+        bos = tokenizer.bos_token
+        if not bos or not text.startswith(bos):
+            return prompt
+
+        # Per-prompt tokenization preserves mixed batches: vLLM's generate()
+        # tokenization_kwargs apply to the entire synchronous batch.
+        fields = {"prompt": text} if isinstance(prompt, str) else prompt
+        return {
+            **fields,
+            "prompt_token_ids": tokenizer.encode(text, add_special_tokens=False),
+        }
 
     def _merge_stop_strings(self, batch_stop_strings):
         stop_set: set[str] = set()
@@ -1125,6 +1164,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
 
         # Convert inputs to vLLM format and generate outputs.
         prompts = format_prompt_for_vllm_generation(data)
+        prompts = [self._tokenize_prompt_with_bos(prompt) for prompt in prompts]
         use_tqdm = self.cfg["vllm_cfg"].get("use_tqdm", True)
         outputs = self.llm.generate(prompts, sampling_params, use_tqdm=use_tqdm)
 
@@ -1148,6 +1188,9 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         for i, output in enumerate(outputs):
             # Extract generated tokens
             sequence_length = input_lengths[i]
+            validate_rollout_prompt(
+                input_ids[i, :sequence_length].tolist(), output.prompt_token_ids
+            )
             generation = output.outputs[0]
             generated_tokens = list(generation.token_ids)
 
@@ -1324,7 +1367,8 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             "Attempting to generate with either an uninitialized vLLM or non-model-owner"
         )
         use_tqdm = self.cfg["vllm_cfg"].get("use_tqdm", True)
-        outputs = self.llm.generate(data["prompts"], sampling_params, use_tqdm=use_tqdm)
+        prompts = [self._tokenize_prompt_with_bos(prompt) for prompt in data["prompts"]]
+        outputs = self.llm.generate(prompts, sampling_params, use_tqdm=use_tqdm)
         texts = [output.outputs[0].text for output in outputs]
 
         # Convert to BatchedDataDict

@@ -25,7 +25,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from nemo_rl.models.generation.vllm.config import (
+from nemo_rl.models.generation.vllm.patches import (
     VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
 )
 from nemo_rl.models.policy import PolicyConfig
@@ -658,22 +658,6 @@ def test_world_size_validation_dtensor(
 
 
 @patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
-def test_dtensor_v2_false_is_rejected(mock_ray_worker_group):
-    """An explicit _v2=false fails before any worker is built."""
-    config = create_dtensor_config("test/model", tp=1)
-    config["dtensor_cfg"]["_v2"] = False
-
-    with pytest.raises(ValueError, match="_v2=false selects the DTensor v1 backend"):
-        Policy(
-            cluster=create_mock_cluster(world_size=1),
-            config=config,
-            tokenizer=create_mock_tokenizer(),
-        )
-
-    mock_ray_worker_group.assert_not_called()
-
-
-@patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
 def test_dtensor_dp_replicate_size_sets_batching_dp(
     mock_ray_worker_group,
     tiny_llama_model_path,
@@ -682,7 +666,6 @@ def test_dtensor_dp_replicate_size_sets_batching_dp(
     cluster = create_mock_cluster(world_size=8)
     tokenizer = create_mock_tokenizer()
     config = create_dtensor_config(tiny_llama_model_path, tp=1)
-    config["dtensor_cfg"]["_v2"] = True
     config["dtensor_cfg"]["dp_replicate_size"] = 2
 
     policy = Policy(cluster=cluster, config=config, tokenizer=tokenizer)
@@ -707,7 +690,6 @@ def test_dtensor_hsdp_dispatches_distinct_batches(
     cluster = create_mock_cluster(world_size=8)
     tokenizer = create_mock_tokenizer()
     config = create_dtensor_config(tiny_llama_model_path, tp=1)
-    config["dtensor_cfg"]["_v2"] = True
     config["dtensor_cfg"]["dp_replicate_size"] = 2  # HSDP enabled
 
     policy = Policy(cluster=cluster, config=config, tokenizer=tokenizer)

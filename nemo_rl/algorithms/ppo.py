@@ -291,10 +291,6 @@ def _apply_ppo_seq_logprob_error_masking(
     return advantage_mask, metrics
 
 
-class PPOLoggerConfig(LoggerConfig):
-    num_val_samples_to_print: int  # number of val samples to print to stdout
-
-
 class MasterConfig(BaseModel, extra="allow"):
     policy: PolicyConfig
     value: ValueConfig
@@ -303,7 +299,7 @@ class MasterConfig(BaseModel, extra="allow"):
     env: dict[str, Any]
     data: DataConfig
     ppo: PPOConfig
-    logger: PPOLoggerConfig
+    logger: LoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
     telemetry: Optional[TelemetryConfig] = None
@@ -526,9 +522,9 @@ def setup(
         )
 
     reward_model_enabled = "reward_model" in extract_necessary_env_names(data_config)
-    segment_size = cluster_config.get("segment_size")
+    segment_size = cluster_config.segment_size
 
-    total_nodes = cluster_config["num_nodes"]
+    total_nodes = cluster_config.num_nodes
     if reward_model_enabled:
         rm_resource = env_configs["reward_model"]["resources"]
         rm_nodes = rm_resource["num_nodes"]
@@ -548,14 +544,14 @@ def setup(
 
     if colocated_inference:
         if total_nodes == 1:
-            policy_gpus_per_node = cluster_config["gpus_per_node"] - rm_gpus_per_node
+            policy_gpus_per_node = cluster_config.gpus_per_node - rm_gpus_per_node
             assert policy_gpus_per_node > 0, (
                 "policy.generation.colocated.resources.gpus_per_node must be > 0 "
                 "when cluster.num_nodes = 1, "
                 f"but got {policy_gpus_per_node}."
             )
         else:
-            policy_gpus_per_node = cluster_config["gpus_per_node"]
+            policy_gpus_per_node = cluster_config.gpus_per_node
 
         cluster = RayVirtualCluster(
             name="ppo_policy_cluster",
@@ -571,7 +567,7 @@ def setup(
             flush=True,
         )
     else:
-        train_gpus_per_node = cluster_config["gpus_per_node"]
+        train_gpus_per_node = cluster_config.gpus_per_node
         train_nodes = policy_nodes
 
         inference_resources = generation_config["colocated"]["resources"]
@@ -600,7 +596,7 @@ def setup(
                 "Not enough GPUs for PPO training after reserving non-colocated "
                 "generation resources: "
                 f"train_gpus_per_node={train_gpus_per_node}, "
-                f"cluster.gpus_per_node={cluster_config['gpus_per_node']}, "
+                f"cluster.gpus_per_node={cluster_config.gpus_per_node}, "
                 f"inference_gpus_per_node={inference_gpus_per_node}, "
                 f"reward_gpus_per_node={reward_gpus_to_subtract}."
             )
@@ -612,12 +608,12 @@ def setup(
             )
             assert (
                 inference_gpus_per_node is not None
-                and inference_gpus_per_node == cluster_config["gpus_per_node"]
+                and inference_gpus_per_node == cluster_config.gpus_per_node
             ), (
                 "policy.generation.colocated.resources.gpus_per_node must be explicitly set and equal to cluster.gpus_per_node "
                 "when cluster.num_nodes > 1 and inference is non-colocated, "
                 f"but got inference_gpus_per_node={inference_gpus_per_node}, "
-                f"cluster.gpus_per_node={cluster_config['gpus_per_node']}."
+                f"cluster.gpus_per_node={cluster_config.gpus_per_node}."
             )
             train_nodes -= inference_nodes
 
@@ -710,8 +706,8 @@ def setup(
             use_gpus=True,
             num_gpus_per_node=train_gpus_per_node,
             max_colocated_worker_groups=2,
-            port_range_low=cluster_config.get("master_port_range_low"),
-            port_range_high=cluster_config.get("master_port_range_high"),
+            port_range_low=cluster_config.master_port_range_low,
+            port_range_high=cluster_config.master_port_range_high,
             segment_size=segment_size,
             node_resource_constraints=node_resource_constraints,
         )
@@ -724,8 +720,8 @@ def setup(
             use_gpus=True,
             num_gpus_per_node=inference_gpus_per_node,
             max_colocated_worker_groups=1,
-            port_range_low=cluster_config.get("master_port_range_low"),
-            port_range_high=cluster_config.get("master_port_range_high"),
+            port_range_low=cluster_config.master_port_range_low,
+            port_range_high=cluster_config.master_port_range_high,
             segment_size=inference_segment_size,
             node_resource_constraints=inference_node_resource_constraints,
         )
@@ -1508,8 +1504,8 @@ def ppo_train(
                                 master_config.ppo.num_generations_per_prompt
                             ),
                             log_full_result_tables=should_log_nemo_gym_full_result_tables(
-                                wandb_enabled=master_config.logger["wandb_enabled"],
-                                wandb_config=master_config.logger["wandb"],
+                                wandb_enabled=master_config.logger.wandb_enabled,
+                                wandb_config=master_config.logger.wandb,
                             ),
                             max_rollout_turns=None,
                             greedy=False,
@@ -1979,12 +1975,6 @@ def ppo_train(
 
                     full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
-                        assert full_metric_name.startswith(
-                            "train:"
-                        ) or full_metric_name.startswith("val:"), (
-                            f"metric_name={full_metric_name} must start with 'val:' or 'train:',\n"
-                            f'followed by the corresponding name in the "val" or "train" metrics dictionary.'
-                        )
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics
                         if not metrics_source:
@@ -2107,8 +2097,7 @@ def ppo_train(
                 * master_config.ppo.num_generations_per_prompt
             )
             total_num_gpus = (
-                master_config.cluster["num_nodes"]
-                * master_config.cluster["gpus_per_node"]
+                master_config.cluster.num_nodes * master_config.cluster.gpus_per_node
             )
 
             print(f"  • Total step time: {total_time:.2f}s", flush=True)
@@ -2967,12 +2956,6 @@ def async_ppo_train(
                     # sync ppo_train and async_grpo_train).
                     full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
-                        assert full_metric_name.startswith(
-                            "train:"
-                        ) or full_metric_name.startswith("val:"), (
-                            f"metric_name={full_metric_name} must start with 'val:' or 'train:',\n"
-                            f'followed by the corresponding name in the "val" or "train" metrics dictionary.'
-                        )
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics
                         if not metrics_source:
@@ -3114,8 +3097,7 @@ def async_ppo_train(
 
             total_time = timing_metrics.get("total_step_time", 0)
             total_num_gpus = (
-                master_config.cluster["num_nodes"]
-                * master_config.cluster["gpus_per_node"]
+                master_config.cluster.num_nodes * master_config.cluster.gpus_per_node
             )
             if total_time > 0 and "global_valid_toks" in metrics:
                 timing_metrics["valid_tokens_per_sec_per_gpu"] = (
@@ -3276,7 +3258,7 @@ def validate(
                 all_message_logs,
                 total_rewards,
                 num_samples=min(
-                    master_config.logger["num_val_samples_to_print"],
+                    master_config.logger.num_val_samples_to_print,
                     len(all_message_logs),
                 ),
                 step=step,

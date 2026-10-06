@@ -75,12 +75,24 @@ apt-get install -y --no-install-recommends \
     ccache \
     protobuf-compiler \
 
-# Nsight
+# Nsight: install a pinned release from NVIDIA's devtools apt repo instead of
+# the CUDA base image's bundled copy, which is built against an outdated Go
+# toolchain with known CVEs. Also remove that bundled copy outright, and pin
+# an exact version + signed-by keyring instead of the previous unpinned
+# install with a mismatched (CUDA repo) apt-key. Same fix as
+# NVIDIA-NeMo/Gym#3739 and NVIDIA-NeMo/Megatron-Bridge#6128.
 apt install -y --no-install-recommends gnupg
-echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu$(source /etc/lsb-release; echo "$DISTRIB_RELEASE" | tr -d .)/$(dpkg --print-architecture) /" | tee /etc/apt/sources.list.d/nvidia-devtools.list
-apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/$(uname -m | sed 's/aarch64/sbsa/')/7fa2af80.pub
+rm -rf /usr/local/cuda*/NsightSystems-cli-* /opt/nvidia/nsight-systems*
+apt-get remove --purge -y --allow-change-held-packages 'nsight-systems*' || true
+NSYS_VERSION="2026.5.1.161-265138896106v0"
+NSYS_RELEASE=$(echo "${NSYS_VERSION}" | cut -d. -f1-3)
+NSYS_REPO="https://developer.download.nvidia.com/devtools/repos/ubuntu$(source /etc/lsb-release; echo "$DISTRIB_RELEASE" | tr -d .)/$(dpkg --print-architecture)"
+curl -fsSL "${NSYS_REPO}/nvidia.pub" -o /usr/share/keyrings/nvidia-devtools.asc
+echo "deb [signed-by=/usr/share/keyrings/nvidia-devtools.asc] ${NSYS_REPO}/ /" \
+    | tee /etc/apt/sources.list.d/nvidia-devtools.list
 apt update
-apt install -y nsight-systems-cli
+apt install -y --no-install-recommends "nsight-systems-cli-${NSYS_RELEASE}=${NSYS_VERSION}"
+rm -f /etc/apt/sources.list.d/nvidia-devtools.list /usr/share/keyrings/nvidia-devtools.asc
 
 # To fix CVE-2025-68973
 apt install -y --only-upgrade gnupg
@@ -115,11 +127,14 @@ RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.ru
     && rustc --version \
     && cargo --version
 
-# Install uv and python
+# Install uv and python outside /root so an unprivileged runtime UID (for example
+# 65532) can execute them: /root is not traversable by other users, and the project
+# venv's python is a symlink into uv's managed-Python directory.
 ARG UV_VERSION=0.11.28
 ARG PYTHON_VERSION=3.13.14
-ENV PATH="/root/.local/bin:$PATH"
-RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh && \
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
+RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh \
+        | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh && \
     uv python install ${PYTHON_VERSION}
 
 # Disable usage stats by default for users who are sensitive to sharing usage.
@@ -380,6 +395,12 @@ set +e
 # and churning it here would copy files up into this layer.
 # The throwaway venv must be symlink-mode: hardlinks to files in the dependency layer's uv
 # cache make overlayfs copy them up into this layer, and the copies outlive the rm -rf below.
+# TRTLLM_WHEEL_CACHE_MIRROR_DIR keeps a copy of the wheel in this image layer.
+# CI creates a fresh buildx builder for every job, so the cache mount above only
+# lives for the duration of one build: when a later build reuses this layer from
+# the registry cache and re-executes the release stage (any NeMo-RL source
+# change does that), the mount is empty there. The release stage reads the
+# wheel from this mirror instead of failing on TRTLLM_REQUIRE_CACHED_WHEEL.
 UV_CACHE_DIR=/root/.cache/uv \
     TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-wheels \
     TRTLLM_WHEEL_CACHE_MIRROR_DIR=/opt/trtllm_wheels \
@@ -546,6 +567,14 @@ if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
     rm -f "${GYM_VLLM_OVERRIDE}"
 fi
 EOF
+# ray's bundled Java worker jar ships an outdated httpcore5 with a known CVE
+# (GHSA-hf6x-8p5f-cgmf). NeMo-RL never uses Ray's Java cross-language worker,
+# and removing the jar doesn't affect ray.init(), remote tasks, actors, or
+# ray.serve (verified in NVIDIA-NeMo/Gym#3779/#3826). Sweep every venv (base,
+# per-backend worker venvs, gym-prefetched venvs) and the default uv cache
+# (/root/.cache/uv, since this stage never overrides UV_CACHE_DIR) that it
+# could have landed in.
+RUN find /opt /root -name ray_dist.jar -delete
 # Generate container fingerprint for frozen environment support
 # Store outside /opt/nemo-rl to avoid being overwritten by user mounts
 RUN python tools/generate_fingerprint.py > /opt/nemo_rl_container_fingerprint
@@ -553,6 +582,32 @@ RUN python tools/generate_fingerprint.py > /opt/nemo_rl_container_fingerprint
 # NOTICES.txt file points to where the OSS source code is archived
 RUN echo "This distribution includes open source which is archived at the following URL: https://opensource.nvidia.com/oss/teams/nvidia/nemo-rl/${RC_DATE}:linux-${TARGETARCH}/index.html" > NOTICES.txt && \
     echo "For further inquiries or assistance, contact us at oss-requests@nvidia.com" >> NOTICES.txt
+
+# Let an unprivileged runtime UID (for example 65532, the NeMo CI agent workloads) run this
+# image, which stays root by default. Create its home and the writable runtime paths callers
+# point caches and sources at, and hand it the prebuilt environment roots so it can create
+# entries there. Only the directories change owner: a recursive chown would copy every
+# hardlinked venv file into this layer.
+ARG RUNTIME_UID=65532
+ARG RUNTIME_GID=65532
+RUN <<"EOF" bash -exu
+getent group "${RUNTIME_GID}" >/dev/null || groupadd --gid "${RUNTIME_GID}" nemo-runtime
+getent passwd "${RUNTIME_UID}" >/dev/null || useradd --no-log-init --uid "${RUNTIME_UID}" \
+    --gid "${RUNTIME_GID}" --create-home --home-dir /home/nemo-runtime --shell /bin/bash nemo-runtime
+install -d -o "${RUNTIME_UID}" -g "${RUNTIME_GID}" /home/nemo-runtime /nemo_run \
+    "${NEMO_GYM_VENV_DIR}" /opt/nemo-rl-source /opt/nemo_rl_cache/uv /opt/nemo_rl_python
+chown "${RUNTIME_UID}:${RUNTIME_GID}" /opt/nemo-rl "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}"
+EOF
+USER ${RUNTIME_UID}:${RUNTIME_GID}
+RUN <<"EOF" bash -exu
+uv --version
+"${UV_PROJECT_ENVIRONMENT}/bin/python" --version
+for dir in /home/nemo-runtime /nemo_run /opt/nemo-rl "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}" \
+        "${NEMO_GYM_VENV_DIR}" /opt/nemo-rl-source /opt/nemo_rl_cache/uv /opt/nemo_rl_python; do
+    test -w "${dir}"
+done
+EOF
+USER root
 
 # Export the builder-local ccache as a separate scratch image. CI builds this
 # target immediately after the release target with the same Buildx builder, so

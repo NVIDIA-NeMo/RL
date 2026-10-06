@@ -42,7 +42,7 @@ Not yet wired:
 |---|---|
 | SGLang, TRT-LLM and Megatron generation workers | no `init_telemetry_worker`, no generation spans — only vLLM is instrumented |
 | `grpo_sync.py` | no spans at all |
-| `rl.startup` outside GRPO | `init_ray()` opens `rl.setup.ray_init` for every launcher, but only `run_grpo.py` and `run_grpo_single_controller.py` open the umbrella around it, so elsewhere the startup phases are root spans rather than one waterfall |
+| `rl.startup` in other launchers | `init_ray()` opens `rl.setup.ray_init` for every launcher; `run_grpo.py`, `run_grpo_single_controller.py`, and `run_sft_v2.py` open the umbrella around it, while other launchers leave startup phases as root spans |
 | Startup sub-phases inside `setup()` | `rl.setup.workers` is one block on the driver: its phases run concurrently in worker threads, which OTel context does not reach. Each worker's own load is a span (`rl.policy.load_model` / `rl.value.load_model` / `rl.vllm.load_model`) in a separate trace; the driver-side per-phase breakdown is in the `rl.setup.duration` metric |
 | Driver-side startup phases as metrics | `rl_init_timer`'s outer phases (`config`, `ray_connect`, `tokenizer`, `data`, `setup`) are printed by the launcher but never logged, so `rl.setup.duration` carries only the phases from inside `setup()`. Summing the metric does not reconstruct `rl.startup` |
 | `rl.init.total` on async PPO | the `init/total` timer is recorded, but `async_ppo_train` is otherwise uninstrumented, so no span is emitted for the initial buffer fill there |

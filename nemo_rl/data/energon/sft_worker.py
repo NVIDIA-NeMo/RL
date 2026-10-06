@@ -36,6 +36,8 @@ from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.megatron_policy_worker import (
     MegatronPolicyWorkerImpl,
 )
+from nemo_rl.telemetry.instrumentation import accepts_trace_context, managed_span
+from nemo_rl.telemetry.span_groups import RLSpanGroup
 
 
 @ray.remote(
@@ -103,6 +105,7 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         self._sft_logical_world_size = logical_world_size
         return True
 
+    @accepts_trace_context
     def load_next_sft_batch(
         self,
         *,
@@ -121,20 +124,21 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
         started = time.monotonic()
 
-        # restart when one epoch is exhausted
-        try:
-            batch = next(self._sft_loader_iterator)
-        except StopIteration:
-            self._sft_loader_iterator = iter(self._sft_loader)
-            batch = next(self._sft_loader_iterator)
+        with managed_span(RLSpanGroup.DATA_PROCESSING, "rl.sft_v2.read_batch"):
+            # Restart when one epoch is exhausted.
+            try:
+                batch = next(self._sft_loader_iterator)
+            except StopIteration:
+                self._sft_loader_iterator = iter(self._sft_loader)
+                batch = next(self._sft_loader_iterator)
 
-        prepared = prepare_sft_batch(
-            batch,
-            tokenizer=self.tokenizer,
-            only_unmask_final=only_unmask_final,
-            make_sequence_length_divisible_by=make_sequence_length_divisible_by,
-        )
-        load_seconds = time.monotonic() - started
+        with managed_span(RLSpanGroup.DATA_PROCESSING, "rl.sft_v2.prepare_batch"):
+            prepared = prepare_sft_batch(
+                batch,
+                tokenizer=self.tokenizer,
+                only_unmask_final=only_unmask_final,
+                make_sequence_length_divisible_by=make_sequence_length_divisible_by,
+            )
         batch_size = prepared.size
         source_ids = self._source_ids(prepared, batch_size=batch_size)
         partition_id = (
@@ -191,7 +195,8 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             source_ids=source_ids,
             field_names=tuple(field_names),
             sequence_lengths=lengths,
-            load_seconds=load_seconds,
+            # The controller waits for the whole call, including publishing.
+            load_seconds=time.monotonic() - started,
             valid_tokens=valid_tokens,
         )
         self._sft_active_envelope = envelope
