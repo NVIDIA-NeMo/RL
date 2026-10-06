@@ -23,8 +23,8 @@ pytestmark = pytest.mark.mcore
 
 
 def _processed(monkeypatch, multiple, enabled=True, lengths=True):
-    from nemo_rl.models.megatron import data as module
     from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+    from nemo_rl.models.megatron import data as module
 
     monkeypatch.setattr(module, "get_context_parallel_rank", lambda: 0)
     monkeypatch.setattr(module, "get_context_parallel_world_size", lambda: 1)
@@ -43,8 +43,8 @@ def _processed(monkeypatch, multiple, enabled=True, lengths=True):
 
 
 def test_nonpacked_padding_does_not_change_expert_bias(monkeypatch):
-    from megatron.core.transformer.moe.router import TopKRouter
     from megatron.core.transformer.moe.moe_utils import get_updated_expert_bias
+    from megatron.core.transformer.moe.router import TopKRouter
 
     monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
     results = []

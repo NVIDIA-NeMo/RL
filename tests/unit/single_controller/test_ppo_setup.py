@@ -309,7 +309,7 @@ class TestPPOValidation:
 
     @pytest.mark.parametrize(
         "sampler_config",
-        [WindowedSamplerConfig(), ReadyFirstSamplerConfig(), WeightFifoSamplerConfig()],
+        [WindowedSamplerConfig(), WeightFifoSamplerConfig()],
         ids=lambda cfg: cfg.name,
     )
     def test_rejects_samplers_that_drop_rollouts_by_weight_version(
@@ -322,8 +322,41 @@ class TestPPOValidation:
 
         with pytest.raises(
             ValueError,
-            match=rf"sampler.name='in_order', but got '{sampler_config.name}'",
+            match=rf"but got '{sampler_config.name}'",
         ):
+            validate_single_controller_config(mc)
+
+    @pytest.mark.parametrize("warmup_steps", [0, 2])
+    def test_accepts_ready_first_with_importance_sampling(
+        self, warmup_steps: int
+    ) -> None:
+        mc = _ppo_master_config()
+        mc.ppo.policy_training_start_step = warmup_steps
+        mc.async_rl.sampler = ReadyFirstSamplerConfig()
+        mc.loss_fn.use_importance_sampling_correction = True
+        mc.loss_fn.force_on_policy_ratio = False
+
+        validate_single_controller_config(mc)
+
+    @pytest.mark.parametrize(
+        ("importance_correction", "force_on_policy_ratio", "match"),
+        [
+            (False, False, "use_importance_sampling_correction=true"),
+            (True, True, "force_on_policy_ratio=false"),
+        ],
+    )
+    def test_ready_first_requires_sampling_policy_correction(
+        self,
+        importance_correction: bool,
+        force_on_policy_ratio: bool,
+        match: str,
+    ) -> None:
+        mc = _ppo_master_config()
+        mc.async_rl.sampler = ReadyFirstSamplerConfig()
+        mc.loss_fn.use_importance_sampling_correction = importance_correction
+        mc.loss_fn.force_on_policy_ratio = force_on_policy_ratio
+
+        with pytest.raises(ValueError, match=match):
             validate_single_controller_config(mc)
 
     @staticmethod

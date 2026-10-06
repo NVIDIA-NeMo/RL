@@ -23,7 +23,7 @@ policy:
         linear: te
         rms_norm: torch_fp32
         experts: torch_mm
-        enable_deepep: true
+        dispatcher: deepep
         rope_fusion: false
         enable_hf_state_dict_adapter: true
 logger:
