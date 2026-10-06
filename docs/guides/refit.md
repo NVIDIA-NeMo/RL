@@ -69,16 +69,22 @@ delta is currently limited to GRPO. NIXL is
 initialized by the GRPO and distillation setup paths; PPO currently requires
 colocated generation.
 
-## Performance Options
+## Refit Performance Options
 
-| Option | Scope | Effect |
+These options are optional. Enable one only after you measure its effect on your
+refit workload.
+
+| Option | Applies to | Effect |
 |---|---|---|
-| `policy.generation.vllm_cfg.refit_prequantize` | Megatron training with MXFP8 vLLM rollout | Quantizes eligible weights on the trainer and transfers E4M3 values plus E8M0 scales. Requires `precision: fp8` and `is_mx: true`; sparse delta and NCCL Reshard do not support it. |
-| `policy.generation.vllm_cfg.refit_cache_loader_routes` | vLLM refit | Replays identity-validated weight-loader routes after the first refit. Disabled by default because loader behavior is model-dependent. |
-| `policy.refit_buffer_size_gb` | Colocated CUDA IPC or non-colocated NCCL broadcast | Sets the packing threshold explicitly. For NCCL broadcast, the same byte value is sent to producer and consumer so their collective chunk boundaries match. |
-| `policy.refit_persistent_ipc_buffers` | Colocated CUDA-IPC refit | Reuses the two trainer staging buffers across refits. A fixed `refit_buffer_size_gb` gives stable memory use. |
-| `policy.megatron_cfg.refit_slim_offload_after` | Colocated Megatron refit | Avoids repeating grad-buffer offload and a second allocator cleanup after weights are transferred. |
-| `policy.megatron_cfg.pinned_reference_swap` | Megatron reference-policy logprobs | Keeps the CPU reference copy in pinned memory for faster host-to-device swaps, at the cost of additional pinned host memory. |
+| `policy.generation.vllm_cfg.refit_prequantize` | Megatron policy with MXFP8 vLLM rollout | Quantizes supported weights before transfer. See [Optional trainer-side MXFP8 refit](../fp8.md#optional-trainer-side-mxfp8-refit) for requirements and exclusions. |
+| `policy.generation.vllm_cfg.refit_cache_loader_routes` | vLLM refit | Reuses validated weight-loader routes after the first refit. The default is `false`. |
+| `policy.refit_buffer_size_gb` | Refit paths that stage weights in buffers | Sets a fixed buffer size in GiB. NCCL broadcast uses the same size on both sides to keep chunk boundaries equal. |
+| `policy.refit_persistent_ipc_buffers` | Colocated CUDA IPC refit | Reuses two trainer staging buffers. Set `refit_buffer_size_gb` to keep their size fixed. |
+| `policy.megatron_cfg.refit_slim_offload_after` | Colocated Megatron refit | Skips repeated gradient-buffer offload and a second allocator cleanup after transfer. |
+
+`policy.megatron_cfg.pinned_reference_swap` does not change weight refit.
+It keeps the Megatron reference-policy CPU copy in pinned memory to speed up
+logprob swaps. This uses more pinned host memory.
 
 ## Minimal Configuration
 
