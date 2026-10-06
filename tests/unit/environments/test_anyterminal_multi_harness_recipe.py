@@ -73,6 +73,13 @@ def test_anyterminal_multi_harness_recipe_resolves_async_training_contract():
     assert config["policy"]["generation"]["vllm_cfg"]["max_model_len"] == 16384
     assert config["policy"]["generation"]["vllm_cfg"]["expose_http_server"] is True
     assert config["policy"]["generation"]["colocated"]["enabled"] is False
+    assert config["env"]["nemo_gym"]["anyterminal_opencode"][
+        "responses_api_agents"
+    ]["anyterminal_agent"]["agent_kwargs"] == {
+        "context_window": 16384,
+        "max_input_tokens": 11776,
+        "max_output_tokens": 4096,
+    }
 
 
 def test_super_omni_anyterminal_recipe_resolves_training_topology():
@@ -114,6 +121,13 @@ def test_super_omni_anyterminal_recipe_resolves_training_topology():
     assert config["data_plane"]["enabled"] is True
     assert config["checkpointing"]["enabled"] is False
     assert config["logger"]["wandb"]["log_nemo_gym_full_result_tables"] is False
+    assert config["env"]["nemo_gym"]["anyterminal_opencode"][
+        "responses_api_agents"
+    ]["anyterminal_agent"]["agent_kwargs"] == {
+        "context_window": 16384,
+        "max_input_tokens": 11776,
+        "max_output_tokens": 4096,
+    }
 
 
 def test_super_omni_sync_8n_recipe_resolves_synchronous_topology():

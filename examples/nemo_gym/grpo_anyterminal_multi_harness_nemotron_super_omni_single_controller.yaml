@@ -82,6 +82,14 @@ env:
       responses_api_agents:
         anyterminal_agent:
           global_agent_timeout: 900
+          # OpenCode must see the same context boundary as vLLM or it will
+          # continue a tool loop past the server limit instead of compacting.
+          # The input ceiling reserves a 4K call plus a 512-token server guard;
+          # OpenCode compacts before that ceiling using the same output budget.
+          agent_kwargs:
+            context_window: ${policy.max_total_sequence_length}
+            max_input_tokens: ${add:${policy.max_total_sequence_length},-4608}
+            max_output_tokens: 4096
     anyterminal_openclaw:
       responses_api_agents:
         anyterminal_agent:
