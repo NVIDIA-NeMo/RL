@@ -19,7 +19,8 @@ at node startup. The file path is communicated via the NRL_GPU_CPU_AFFINITY_FILE
 environment variable. See ray.sub for the writer side.
 
 Disable all binding with NRL_DISABLE_NUMA_BINDING=1.
-Disable only memory policy with NRL_DISABLE_NUMA_MEMBIND=1.
+Disable only memory policy with NRL_DISABLE_NUMA_PREFERRED=1
+(NRL_DISABLE_NUMA_MEMBIND=1 is a deprecated alias).
 """
 
 import ctypes
@@ -53,7 +54,7 @@ def bind_to_gpu_numa(gpu_id: int) -> bool:
             ``int(ray.get_gpu_ids()[0])``.
 
     Returns True if CPU binding succeeded, False if skipped or failed.
-    Memory binding is attempted independently and logged separately.
+    The memory policy is set independently and logged separately.
     """
     if os.environ.get("NRL_DISABLE_NUMA_BINDING") == "1":
         return False
@@ -70,7 +71,7 @@ def bind_to_gpu_numa(gpu_id: int) -> bool:
                     cpus = _parse_cpulist(cpulist)
                     os.sched_setaffinity(0, cpus)
                     logger.info("NUMA CPU binding: GPU %s → CPUs %s", gpu, cpulist)
-                    _set_numa_membind(cpus)
+                    _set_numa_preferred(cpus)
                     return True
         logger.debug("NUMA binding: GPU %s not found in %s", gpu, GPU_CPU_AFFINITY_PATH)
     except FileNotFoundError:
@@ -122,7 +123,7 @@ def _get_numa_node(libnuma: ctypes.CDLL, cpus: set[int]) -> int:
     return libnuma.numa_node_of_cpu(min(cpus))
 
 
-def _set_numa_membind(cpus: set[int]) -> bool:
+def _set_numa_preferred(cpus: set[int]) -> bool:
     """Prefer memory allocations on the NUMA node of the given CPUs.
 
     Uses ``numa_set_preferred`` (MPOL_PREFERRED), not a hard bind: pages come
@@ -132,19 +133,24 @@ def _set_numa_membind(cpus: set[int]) -> bool:
     such as a large Megatron checkpoint save gets the worker OOM-killed while
     the rest of the node is free.
     """
+    if os.environ.get("NRL_DISABLE_NUMA_PREFERRED") == "1":
+        return False
     if os.environ.get("NRL_DISABLE_NUMA_MEMBIND") == "1":
+        logger.warning(
+            "NRL_DISABLE_NUMA_MEMBIND is deprecated; set NRL_DISABLE_NUMA_PREFERRED=1 instead"
+        )
         return False
 
     libnuma = _load_libnuma()
     if libnuma is None:
-        logger.debug("NUMA membind skipped: libnuma.so.1 not available")
+        logger.debug("NUMA memory policy skipped: libnuma.so.1 not available")
         return False
 
     try:
         numa_node = _get_numa_node(libnuma, cpus)
         if numa_node < 0:
             logger.debug(
-                "NUMA membind skipped: numa_node_of_cpu(%d) returned %d",
+                "NUMA memory policy skipped: numa_node_of_cpu(%d) returned %d",
                 min(cpus),
                 numa_node,
             )
@@ -155,11 +161,13 @@ def _set_numa_membind(cpus: set[int]) -> bool:
         libnuma.numa_set_preferred(numa_node)
 
         logger.info(
-            "NUMA membind: preferring node %d (from CPU %d)", numa_node, min(cpus)
+            "NUMA memory policy: preferring node %d (from CPU %d)",
+            numa_node,
+            min(cpus),
         )
         return True
     except Exception as exc:
-        logger.debug("NUMA membind skipped: %s", exc)
+        logger.debug("NUMA memory policy skipped: %s", exc)
         return False
 
 
