@@ -282,16 +282,21 @@ class BaseSampler(abc.ABC):
         valid_idxs: list[int],
         min_prompt_groups: int,
         max_prompt_groups: int,
+        prompt_group_multiple: int = 1,
     ) -> tuple[Optional[KVBatchMeta], int]:
-        """Cap, drop from the buffer, and concat the chosen groups.
+        """Cap, claim from the buffer, and concat the chosen groups.
 
-        Greedy without waiting: returns all currently-eligible groups up to
-        ``max_prompt_groups`` (never fewer on purpose, never waits to fill it),
-        or ``(None, 0)`` below ``min_prompt_groups``.
+        Greedy without waiting: returns the largest currently-eligible prefix
+        up to ``max_prompt_groups`` that contains a whole number of
+        ``prompt_group_multiple`` groups, or ``(None, 0)`` when that prefix
+        is below ``min_prompt_groups``. The default preserves dense selection.
         """
-        if len(valid_idxs) < min_prompt_groups:
-            return None, 0
+        if prompt_group_multiple < 1:
+            raise ValueError("prompt_group_multiple must be >= 1")
         requested_groups = min(len(valid_idxs), max_prompt_groups)
+        requested_groups -= requested_groups % prompt_group_multiple
+        if requested_groups < min_prompt_groups:
+            return None, 0
         selected_idxs = valid_idxs[:requested_groups]
         selected_metas = [self._buffer.meta_list[i] for i in selected_idxs]
         selected_rollout_metrics = [
@@ -486,6 +491,7 @@ class ReadyFirstSampler(_GatedSampler):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
+        prompt_group_multiple: int = 1,
     ) -> tuple[Optional[KVBatchMeta], int]:
         self._validate_group_bounds(min_prompt_groups, max_prompt_groups)
         valid_idxs = [
@@ -494,7 +500,7 @@ class ReadyFirstSampler(_GatedSampler):
             if weight <= current_train_weight and self._buffer.ready_list[i]
         ]
         return await self._finalize_selection(
-            valid_idxs, min_prompt_groups, max_prompt_groups
+            valid_idxs, min_prompt_groups, max_prompt_groups, prompt_group_multiple
         )
 
     async def evict(self, *, current_train_weight: int) -> int:

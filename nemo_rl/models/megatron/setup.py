@@ -26,6 +26,7 @@ from typing import Any, Callable, Optional, TypeVar, cast
 import torch
 import yaml
 from megatron.bridge import AutoBridge
+from megatron.bridge.models.hybrid.hybrid_provider import HybridModelProvider
 from megatron.bridge.models.model_provider import ModelProviderMixin, get_model
 from megatron.bridge.peft.lora import LoRA
 from megatron.bridge.training import fault_tolerance
@@ -332,6 +333,7 @@ from nemo_rl.models.policy import (
     MegatronConfig,
     MegatronPeftConfig,
     PolicyConfig,
+    get_shared_prefix_training_config,
 )
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
@@ -376,6 +378,23 @@ def _resolve_optimizer_dtype_kwargs(optimizer_cfg: dict[str, Any]) -> dict[str, 
                     f"{', '.join(dtype_aliases)}"
                 ) from e
     return resolved
+
+
+SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY = "hybrid_star_cp1_tp1_v1"
+SUPPORTED_SHARED_PREFIX_CP_TRAINING_CAPABILITY = "hybrid_star_cp_v1"
+SUPPORTED_SHARED_PREFIX_TP_SP_TRAINING_CAPABILITY = "hybrid_star_cp1_tp_sp_v1"
+SUPPORTED_SHARED_PREFIX_TP_CP_SP_TRAINING_CAPABILITY = "hybrid_star_cp_tp_sp_v1"
+SUPPORTED_SHARED_PREFIX_EXPLICIT_PHYSICAL_PADDING_CAPABILITY = (
+    "hybrid_star_explicit_physical_padding_v1"
+)
+SUPPORTED_SHARED_PREFIX_MOE_EXPERT_BIAS_CAPABILITY = "hybrid_star_moe_expert_bias_v1"
+SUPPORTED_SHARED_PREFIX_FULL_RECOMPUTE_CAPABILITY = (
+    "hybrid_star_full_uniform_recompute_v1"
+)
+SUPPORTED_SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY = "hybrid_star_mtp_dense_heads_v1"
+SUPPORTED_SHARED_PREFIX_POSITIONLESS_ATTENTION_CAPABILITY = (
+    "hybrid_star_positionless_attention_v1"
+)
 
 
 def destroy_parallel_state():
@@ -557,6 +576,340 @@ def validate_and_set_config(
         sampling_params,
         final_padded_vocab_size,
     )
+
+
+def _get_mcore_shared_prefix_training_capability() -> frozenset[str]:
+    """Return MCore's explicit end-to-end shared-prefix capabilities.
+
+    Older CP1 ports export the scalar ``SHARED_PREFIX_TRAINING_CAPABILITY``.
+    Newer ports retain that scalar for compatibility and additionally export
+    ``SHARED_PREFIX_TRAINING_CAPABILITIES`` so topology and feature support can
+    be negotiated independently and conjunctively.
+    """
+    # Stock MCore and kernel-only ports intentionally lack this integration module.
+    try:
+        from megatron.core.models.hybrid import shared_prefix as mcore_shared_prefix
+    except ImportError:
+        return frozenset()
+
+    advertised = getattr(
+        mcore_shared_prefix,
+        "SHARED_PREFIX_TRAINING_CAPABILITIES",
+        None,
+    )
+    if advertised is None:
+        scalar = getattr(
+            mcore_shared_prefix,
+            "SHARED_PREFIX_TRAINING_CAPABILITY",
+            None,
+        )
+        return frozenset() if scalar is None else frozenset((scalar,))
+    if isinstance(advertised, str):
+        return frozenset((advertised,))
+    return frozenset(advertised)
+
+
+def _normalize_shared_prefix_training_capabilities(
+    advertised: object,
+) -> frozenset[str]:
+    """Normalize legacy scalar and new multi-capability test/runtime values."""
+    if advertised is None:
+        return frozenset()
+    if isinstance(advertised, str):
+        return frozenset((advertised,))
+    try:
+        capabilities = frozenset(advertised)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise TypeError(
+            "MCore shared-prefix capabilities must be a string or an iterable "
+            "of strings"
+        ) from error
+    if any(not isinstance(item, str) for item in capabilities):
+        raise TypeError("MCore shared-prefix capabilities must contain only strings")
+    return capabilities
+
+
+def _validate_shared_prefix_model_capability(
+    config: PolicyConfig,
+    model_cfg: Any,
+) -> None:
+    """Reject shared execution until the resolved Hybrid provider and MCore agree."""
+    shared_prefix_config = get_shared_prefix_training_config(config)
+    if not shared_prefix_config.enabled_for(stage="logprobs"):
+        return
+
+    megatron_config = config.get("megatron_cfg")
+    if megatron_config is not None:
+        peft_config = megatron_config.get("peft")
+        if peft_config is not None and peft_config["enabled"]:
+            raise NotImplementedError(
+                f"policy.shared_prefix_training.mode={shared_prefix_config.mode} currently requires "
+                "policy.megatron_cfg.peft.enabled=false; PEFT/LoRA adapter dropout "
+                "and shared-prefix gradient semantics have not been validated."
+            )
+
+    if not isinstance(model_cfg, HybridModelProvider):
+        raise NotImplementedError(
+            f"policy.shared_prefix_training.mode={shared_prefix_config.mode} currently supports only "
+            "Megatron Bridge HybridModelProvider models; resolved provider was "
+            f"{type(model_cfg).__name__}."
+        )
+
+    tp_size = int(getattr(model_cfg, "tensor_model_parallel_size", 1))
+    pp_size = int(getattr(model_cfg, "pipeline_model_parallel_size", 1))
+    cp_size = int(getattr(model_cfg, "context_parallel_size", 1))
+    if tp_size < 1:
+        raise ValueError(
+            f"resolved tensor_model_parallel_size must be positive, got {tp_size}"
+        )
+    if pp_size != 1:
+        raise NotImplementedError(
+            f"policy.shared_prefix_training.mode={shared_prefix_config.mode} currently requires a "
+            f"resolved PP1 Hybrid model; got PP={pp_size}."
+        )
+    if cp_size < 1:
+        raise ValueError(
+            f"resolved context_parallel_size must be positive, got {cp_size}"
+        )
+
+    sequence_parallel = bool(model_cfg.sequence_parallel)
+    if tp_size == 1:
+        if sequence_parallel:
+            raise NotImplementedError(
+                f"policy.shared_prefix_training.mode={shared_prefix_config.mode} resolved TP=1 with "
+                "model_cfg.sequence_parallel=true; set "
+                "policy.megatron_cfg.sequence_parallel=false."
+            )
+        required_capability = (
+            SUPPORTED_SHARED_PREFIX_TRAINING_CAPABILITY
+            if cp_size == 1
+            else SUPPORTED_SHARED_PREFIX_CP_TRAINING_CAPABILITY
+        )
+    else:
+        if not sequence_parallel:
+            raise NotImplementedError(
+                f"policy.shared_prefix_training.mode={shared_prefix_config.mode} resolved TP>1 with "
+                "model_cfg.sequence_parallel=false; set "
+                "policy.megatron_cfg.sequence_parallel=true."
+            )
+        required_capability = (
+            SUPPORTED_SHARED_PREFIX_TP_SP_TRAINING_CAPABILITY
+            if cp_size == 1
+            else SUPPORTED_SHARED_PREFIX_TP_CP_SP_TRAINING_CAPABILITY
+        )
+    capabilities = _normalize_shared_prefix_training_capabilities(
+        _get_mcore_shared_prefix_training_capability()
+    )
+    if required_capability not in capabilities:
+        detected_capability = sorted(capabilities) if capabilities else "none"
+        raise NotImplementedError(
+            f"policy.shared_prefix_training.mode={shared_prefix_config.mode} requires an MCore build "
+            "with end-to-end shared-prefix Hybrid model dispatch capability "
+            f"{required_capability!r} for resolved TP={tp_size}, CP={cp_size}, "
+            f"SP={sequence_parallel}; detected "
+            f"{detected_capability!r}. Kernel-only ports do not satisfy this "
+            "training capability. Use mode=observe until the model integration "
+            "is installed."
+        )
+
+    if SUPPORTED_SHARED_PREFIX_EXPLICIT_PHYSICAL_PADDING_CAPABILITY not in capabilities:
+        raise NotImplementedError(
+            f"policy.shared_prefix_training.mode={shared_prefix_config.mode} materializes explicit per-branch "
+            "physical padding and requires MCore capability "
+            f"{SUPPORTED_SHARED_PREFIX_EXPLICIT_PHYSICAL_PADDING_CAPABILITY!r}. "
+            "A topology-only shared-prefix MCore build cannot safely accept the "
+            "logical_completion_lens layout contract."
+        )
+
+    if model_cfg.recompute_granularity == "full":
+        if SUPPORTED_SHARED_PREFIX_FULL_RECOMPUTE_CAPABILITY not in capabilities:
+            raise NotImplementedError(
+                f"policy.shared_prefix_training.mode={shared_prefix_config.mode} with full activation "
+                "recomputation requires MCore capability "
+                f"{SUPPORTED_SHARED_PREFIX_FULL_RECOMPUTE_CAPABILITY!r}."
+            )
+        if (
+            model_cfg.recompute_method != "uniform"
+            or model_cfg.recompute_num_layers != 1
+        ):
+            raise NotImplementedError(
+                f"policy.shared_prefix_training.mode={shared_prefix_config.mode} supports full recomputation "
+                "only with recompute_method='uniform' and recompute_num_layers=1."
+            )
+
+    if model_cfg.recompute_granularity == "selective" and "core_attn" in (
+        getattr(model_cfg, "recompute_modules", None) or []
+    ):
+        raise NotImplementedError(
+            f"policy.shared_prefix_training.mode={shared_prefix_config.mode} does not support selective "
+            "core-attention recompute: the custom shared-prefix attention branch "
+            "bypasses MCore's core_attn checkpoint wrapper. Remove core_attn from "
+            "policy.megatron_cfg.recompute_modules or disable activation checkpointing."
+        )
+
+    if model_cfg.mtp_num_layers is not None and model_cfg.mtp_num_layers > 0:
+        if SUPPORTED_SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY not in capabilities:
+            raise NotImplementedError(
+                f"policy.shared_prefix_training.mode={shared_prefix_config.mode} with MTP requires MCore "
+                "dense-head reconstruction capability "
+                f"{SUPPORTED_SHARED_PREFIX_MTP_DENSE_HEADS_CAPABILITY!r}; resolved "
+                f"model_cfg.mtp_num_layers={model_cfg.mtp_num_layers}."
+            )
+
+    if model_cfg.cuda_graph_impl != "none":
+        raise NotImplementedError(
+            f"policy.shared_prefix_training.mode={shared_prefix_config.mode} resolved training CUDA graphs "
+            f"with model_cfg.cuda_graph_impl={model_cfg.cuda_graph_impl!r}; set "
+            "policy.megatron_cfg.cuda_graph_impl='none'."
+        )
+
+    if model_cfg.fp8:
+        raise NotImplementedError(
+            f"policy.shared_prefix_training.mode={shared_prefix_config.mode} resolved FP8 on "
+            "model_cfg.fp8; set policy.megatron_cfg.fp8_cfg.enabled=false."
+        )
+
+    if model_cfg.fp4:
+        raise NotImplementedError(
+            f"policy.shared_prefix_training.mode={shared_prefix_config.mode} resolved FP4 on "
+            "model_cfg.fp4; set policy.quant_cfg=null and disable FP4 model overrides."
+        )
+
+    if model_cfg.attention_dropout != 0.0:
+        raise NotImplementedError(
+            f"policy.shared_prefix_training.mode={shared_prefix_config.mode} requires resolved "
+            "model_cfg.attention_dropout=0.0; override it through "
+            "policy.megatron_cfg.model_overrides.attention_dropout if appropriate."
+        )
+
+    if model_cfg.hidden_dropout != 0.0:
+        raise NotImplementedError(
+            f"policy.shared_prefix_training.mode={shared_prefix_config.mode} requires resolved "
+            "model_cfg.hidden_dropout=0.0; override it through "
+            "policy.megatron_cfg.model_overrides.hidden_dropout if appropriate."
+        )
+
+    if model_cfg.window_size not in (None, (-1, -1)):
+        raise NotImplementedError(
+            f"policy.shared_prefix_training.mode={shared_prefix_config.mode} does not support sliding-window "
+            f"attention; resolved model_cfg.window_size={model_cfg.window_size!r}. "
+            "The provider must resolve full attention (window_size=None or (-1, -1))."
+        )
+
+    if model_cfg.position_embedding_type == "none":
+        if (
+            SUPPORTED_SHARED_PREFIX_POSITIONLESS_ATTENTION_CAPABILITY
+            not in capabilities
+        ):
+            raise NotImplementedError(
+                f"policy.shared_prefix_training.mode={shared_prefix_config.mode} with positionless attention "
+                "requires MCore capability "
+                f"{SUPPORTED_SHARED_PREFIX_POSITIONLESS_ATTENTION_CAPABILITY!r}."
+            )
+    elif model_cfg.position_embedding_type != "rope":
+        raise NotImplementedError(
+            f"policy.shared_prefix_training.mode={shared_prefix_config.mode} supports only standard RoPE or "
+            "positionless Hybrid attention; resolved "
+            f"model_cfg.position_embedding_type={model_cfg.position_embedding_type!r}."
+        )
+
+    if model_cfg.multi_latent_attention:
+        raise NotImplementedError(
+            f"policy.shared_prefix_training.mode={shared_prefix_config.mode} does not support multi-latent "
+            "attention; resolved model_cfg.multi_latent_attention=true."
+        )
+
+    if model_cfg.softmax_type != "vanilla":
+        raise NotImplementedError(
+            f"policy.shared_prefix_training.mode={shared_prefix_config.mode} requires resolved "
+            "model_cfg.softmax_type='vanilla'; fused shared-prefix attention "
+            "does not implement softmax offsets."
+        )
+
+    if getattr(model_cfg, "fine_grained_activation_offloading", False):
+        raise NotImplementedError(
+            f"policy.shared_prefix_training.mode={shared_prefix_config.mode} requires resolved "
+            "model_cfg.fine_grained_activation_offloading=false; the custom "
+            "shared-prefix Hybrid/Mamba path bypasses activation-offload hooks."
+        )
+
+    if getattr(model_cfg, "qk_clip", False) or getattr(
+        model_cfg, "log_max_attention_logit", False
+    ):
+        raise NotImplementedError(
+            f"policy.shared_prefix_training.mode={shared_prefix_config.mode} requires resolved "
+            "model_cfg.qk_clip=false and model_cfg.log_max_attention_logit=false; "
+            "the fused forest-attention branch bypasses MCore's core-attention "
+            "maximum-logit statistics."
+        )
+
+    num_moe_experts = getattr(model_cfg, "num_moe_experts", None)
+    if num_moe_experts is not None and num_moe_experts > 0:
+        load_balancing_type = getattr(
+            model_cfg,
+            "moe_router_load_balancing_type",
+            "none",
+        )
+        load_balancing_types = (
+            load_balancing_type
+            if isinstance(load_balancing_type, list)
+            else [load_balancing_type]
+        )
+        if any(item not in (None, "none") for item in load_balancing_types):
+            raise NotImplementedError(
+                f"policy.shared_prefix_training.mode={shared_prefix_config.mode} requires "
+                "model_cfg.moe_router_load_balancing_type='none'; shared prompts "
+                "currently contribute router auxiliary statistics once rather than "
+                "once per completion."
+            )
+
+        if getattr(model_cfg, "moe_aux_loss_coeff", 0.0) not in (None, 0, 0.0):
+            raise NotImplementedError(
+                f"policy.shared_prefix_training.mode={shared_prefix_config.mode} requires resolved "
+                "model_cfg.moe_aux_loss_coeff=0.0 until router losses are "
+                "multiplicity-aware."
+            )
+
+        if getattr(model_cfg, "moe_z_loss_coeff", None) not in (None, 0, 0.0):
+            raise NotImplementedError(
+                f"policy.shared_prefix_training.mode={shared_prefix_config.mode} requires resolved "
+                "model_cfg.moe_z_loss_coeff to be null or zero until router losses "
+                "are multiplicity-aware."
+            )
+
+        if getattr(model_cfg, "moe_input_jitter_eps", None) not in (None, 0, 0.0):
+            raise NotImplementedError(
+                f"policy.shared_prefix_training.mode={shared_prefix_config.mode} requires resolved "
+                "model_cfg.moe_input_jitter_eps to be null or zero; independently "
+                "jittered prompt copies are incompatible with exact prefix sharing."
+            )
+
+        if getattr(model_cfg, "moe_expert_capacity_factor", None) is not None:
+            raise NotImplementedError(
+                f"policy.shared_prefix_training.mode={shared_prefix_config.mode} requires resolved "
+                "model_cfg.moe_expert_capacity_factor=null; token dropping depends "
+                "on the duplicated-token population that shared-prefix execution removes."
+            )
+
+        if getattr(model_cfg, "moe_router_enable_expert_bias", False):
+            if SUPPORTED_SHARED_PREFIX_MOE_EXPERT_BIAS_CAPABILITY not in capabilities:
+                raise NotImplementedError(
+                    f"policy.shared_prefix_training.mode={shared_prefix_config.mode} with MoE expert bias "
+                    "requires MCore capability "
+                    f"{SUPPORTED_SHARED_PREFIX_MOE_EXPERT_BIAS_CAPABILITY!r}."
+                )
+
+        if (
+            getattr(model_cfg, "moe_router_force_load_balancing", False)
+            or getattr(model_cfg, "moe_router_force_biased", None) is not None
+        ):
+            raise NotImplementedError(
+                f"policy.shared_prefix_training.mode={shared_prefix_config.mode} requires resolved "
+                "model_cfg.moe_router_force_load_balancing=false and "
+                "model_cfg.moe_router_force_biased=null; forced random routing "
+                "would route duplicated prompt copies independently while the "
+                "shared-prefix path routes the prompt once."
+            )
 
 
 def _canonicalize_hf_config_overrides(overrides: dict[str, Any]) -> str:
@@ -1045,6 +1398,9 @@ def setup_model_config(
 
     model_cfg.__post_init__()
 
+    # The concrete provider and installed MCore revision are only known here.
+    _validate_shared_prefix_model_capability(config, model_cfg)
+
     # Derive fp8_param_enabled once from the config dict so that load_main_params_from_ckpt
     # and _create_megatron_config both use the same canonical check (fp8 enabled AND fp8_param).
     fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
@@ -1263,6 +1619,18 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.moe_router_load_balancing_type = config["megatron_cfg"][
         "moe_router_load_balancing_type"
     ]
+    if get_shared_prefix_training_config(config).enabled_for(stage="logprobs"):
+        # These provider fields may carry nonzero defaults even when the policy
+        # recipe explicitly disables the corresponding router regularizer.  Copy
+        # them by key presence (rather than truthiness) so zero and null overrides
+        # survive into the resolved model config inspected by capability guards.
+        for field_name in (
+            "moe_aux_loss_coeff",
+            "moe_z_loss_coeff",
+            "moe_input_jitter_eps",
+        ):
+            if field_name in config["megatron_cfg"]:
+                setattr(model_cfg, field_name, config["megatron_cfg"][field_name])
     # Set this to 0.0 to disable updates to the moe router expert bias
     model_cfg.moe_router_bias_update_rate = config["megatron_cfg"][
         "moe_router_bias_update_rate"

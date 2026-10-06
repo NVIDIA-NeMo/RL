@@ -60,6 +60,7 @@ class RolloutReassemblerActorConfig:
     max_seq_len: int
     # Whether the staging partition carries media columns (VLM capture).
     capture_media: bool
+    include_shared_prefix_metadata: bool = False
 
 
 @ray.remote(
@@ -86,6 +87,7 @@ class RolloutReassemblerActor:  # pragma: no cover
             defer_routed_experts_to_policy=config.defer_routed_experts_to_policy,
             max_seq_len=config.max_seq_len,
             capture_media=config.capture_media,
+            include_shared_prefix_metadata=config.include_shared_prefix_metadata,
         )
 
     def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:

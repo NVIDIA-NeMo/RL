@@ -86,6 +86,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     TQReplayMetadataState,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    ReadyFirstSampler,
     ReadyFirstSamplerConfig,
     TransactionalAdmissionSampler,
     create_sampler,
@@ -2791,6 +2792,32 @@ class SingleControllerActor:
                             self._async_cfg.min_groups_for_streaming_train,
                             max_prompt_groups,
                         )
+                        selection_options: dict[str, int] = {}
+                        if self._trainer.shared_prefix_training_config.enabled_for(
+                            stage="logprobs"
+                        ):
+                            dp_world = self._trainer.sharding_annotations.get_axis_size(
+                                "data_parallel"
+                            )
+                            dispatch_groups = (
+                                (min_prompt_groups + dp_world - 1) // dp_world
+                            ) * dp_world
+                            if dispatch_groups > max_prompt_groups:
+                                raise ValueError(
+                                    "Shared-prefix step remainder must contain complete DP groups: "
+                                    f"remaining={max_prompt_groups}, dp={dp_world}"
+                                )
+                            min_prompt_groups = dispatch_groups
+                            if isinstance(self._sampler, ReadyFirstSampler):
+                                # Round the actual ready count inside the sampler;
+                                # a rounded upper bound alone cannot align a
+                                # partially filled buffer. Preserve greedy order.
+                                max_prompt_groups -= max_prompt_groups % dp_world
+                                selection_options["prompt_group_multiple"] = dp_world
+                            else:
+                                # Preserve the existing contract for other/custom
+                                # samplers that do not support aligned selection.
+                                max_prompt_groups = dispatch_groups
                         selected_group_ids: list[str] = []
                         selected_training_claim_ids: list[str] = []
                         training_claim_ids_before = (
@@ -2800,6 +2827,7 @@ class SingleControllerActor:
                             current_train_weight=self._trainer_version,
                             min_prompt_groups=min_prompt_groups,
                             max_prompt_groups=max_prompt_groups,
+                            **selection_options,
                         )
                         training_claim_ids_after = (
                             self._buffer.training_owned_group_ids()
