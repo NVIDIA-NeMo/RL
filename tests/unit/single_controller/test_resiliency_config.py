@@ -790,3 +790,43 @@ class TestADropBudgetNeedsASamplerThatStamps:
             rollout_failure={"max_consecutive_dropped_prompts": 2},
         )
         validate_single_controller_config(cfg)
+
+
+class TestStreamingChunkBounds:
+    """``max_groups_for_streaming_train`` and the chunk cap the train pump derives from it."""
+
+    def test_the_cap_is_unset_by_default_and_falls_back_to_the_minimum(self):
+        cfg = AsyncRLConfig()
+        assert cfg.max_groups_for_streaming_train is None
+        assert cfg.streaming_chunk_cap() == cfg.min_groups_for_streaming_train
+
+    def test_pre_existing_configs_without_the_key_still_load(self):
+        cfg = AsyncRLConfig(min_groups_for_streaming_train=8)
+        assert cfg.max_groups_for_streaming_train is None
+        assert cfg.streaming_chunk_cap() == 8
+
+    def test_an_explicit_cap_wins_over_the_minimum(self):
+        cfg = AsyncRLConfig(
+            min_groups_for_streaming_train=8, max_groups_for_streaming_train=16
+        )
+        assert cfg.streaming_chunk_cap() == 16
+
+    def test_a_cap_equal_to_the_minimum_is_allowed(self):
+        cfg = AsyncRLConfig(
+            min_groups_for_streaming_train=8, max_groups_for_streaming_train=8
+        )
+        assert cfg.streaming_chunk_cap() == 8
+
+    def test_a_cap_below_the_minimum_is_rejected(self):
+        """select() can never return fewer than min, so max < min is unsatisfiable."""
+        with pytest.raises(ValidationError, match="max_groups_for_streaming_train"):
+            AsyncRLConfig(
+                min_groups_for_streaming_train=8, max_groups_for_streaming_train=4
+            )
+
+    @pytest.mark.parametrize(
+        "field", ["min_groups_for_streaming_train", "max_groups_for_streaming_train"]
+    )
+    def test_non_positive_bounds_are_rejected(self, field):
+        with pytest.raises(ValidationError):
+            AsyncRLConfig(**{field: 0})
