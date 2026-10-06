@@ -6,6 +6,10 @@ distillation:
   val_at_start: true
 data:
   train:
+    # Bare HF id + subset (vs the base default's hf:// URL) so CI loads from the
+    # offline HF cache; hf:// URLs always hit the network and fail under HF_HUB_OFFLINE=1.
+    data_files: nvidia/Nemotron-Pretraining-Specialized-v1.1
+    subset: Nemotron-Pretraining-Formal-Logic
     split_validation_size: 64
     seed: 42
 policy:
