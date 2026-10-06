@@ -438,7 +438,18 @@ override-dependencies = [
   "transformer-engine[pytorch,core_cu13]==2.18.0",
   "nvidia-cublas==13.5.1.27; sys_platform != 'darwin'",
   "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",
-  "nvidia-cudnn-frontend==1.25.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  # nvidia-cudnn-frontend ships the cuDNN DSA (DeepSeek sparse attention) indexer kernels that
+  # GLM-5.x recipes use under dsa_kernel_backend=cudnn, and those kernels track the nvidia-cutlass-dsl
+  # API. The floor is 1.26.0: 1.25.0 annotates with `cute.core.ThrMma`, which cutlass-dsl 4.6.x no
+  # longer exports from that submodule (it moved to `cute.ThrMma`), so the mcore extra's pinned
+  # cutlass-dsl 4.6.2 blows up with AttributeError. The ceiling is 1.29.0: from there the cutlass-dsl
+  # requirement becomes an unconditional >=4.6.2, which is unsatisfiable alongside the sglang extra
+  # (sglang pins cutlass-dsl ==4.6.0). 1.26-1.28 only constrain cutlass-dsl under their optional
+  # [cutedsl] extra, which we do not enable, so they stay neutral in both splits.
+  # Note this mismatch is NOT caught at startup — megatron's dsa_kernel_backend preflight only
+  # catches ImportError on `from cudnn import DSA`, while the kernels load lazily, so a bad pair
+  # surfaces as an AttributeError in the first Megatron forward, minutes into a run.
+  "nvidia-cudnn-frontend>=1.26.0,<1.29.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # NCCL 2.30.4 fixes a context-parallel hang on GB200 when GPUs are non-contiguous;
   # 2.30.7 additionally fixes hangs in the NCCL m2n reshard (<link to NCCL release note / internal bug>).
   # Keep NCCL shared with the isolated Dynamo environment across torch upgrades.
