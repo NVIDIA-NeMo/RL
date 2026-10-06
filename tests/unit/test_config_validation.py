@@ -380,3 +380,42 @@ def test_no_shipped_config_is_outdated(config_file):
         check_outdated_config(config_dict)
     except ValueError as e:
         raise AssertionError(f"Config file {config_file} is outdated: {e}") from e
+
+
+# Keep only the regressions tracked in #4427 on DeepEP until they pass validation.
+DEEPEP_FALLBACK_RECIPES = {
+    Path("recipes/llm/sft-nanov3-30BA3B-2n8g-fsdp2.yaml"),
+    Path("recipes/llm/sft-nanov3-30BA3B-2n4g-fsdp2.yaml"),
+    Path("recipes/llm/sft-gpt-oss-20b-1n8g-fsdp8ep8-automodel.yaml"),
+    Path("recipes/llm/sft-gpt-oss-20b-1n4g-fsdp4ep4-automodel.yaml"),
+    Path("recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v2.yaml"),
+    Path("recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-automodel-ep8.v1.yaml"),
+}
+
+
+@pytest.mark.parametrize("config_file", config_files)
+def test_automodel_moe_recipes_use_expected_dispatcher(
+    config_file: str,
+) -> None:
+    config = load_config_with_inheritance(config_file)
+    dtensor_cfg = OmegaConf.select(config, "policy.dtensor_cfg")
+    if (
+        dtensor_cfg is None
+        or not dtensor_cfg.enabled
+        or dtensor_cfg.get("expert_parallel_size", 1) <= 1
+    ):
+        pytest.skip("Not an AutoModel expert-parallel recipe")
+
+    backend = dtensor_cfg.automodel_kwargs.backend
+    assert "enable_deepep" not in backend
+    if Path(config_file).relative_to(configs_dir) in DEEPEP_FALLBACK_RECIPES:
+        assert backend.get("dispatcher") == "deepep"
+    else:
+        assert backend.get("dispatcher") in {"hybridep", "torch"}
+    if backend.dispatcher == "hybridep":
+        assert backend.get("experts") is not None, (
+            f"{config_file}: HybridEP must explicitly select an experts backend"
+        )
+        assert config.policy.make_sequence_length_divisible_by % 64 == 0, (
+            f"{config_file}: HybridEP input width must be padded to a multiple of 64"
+        )
