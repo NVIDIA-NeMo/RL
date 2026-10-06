@@ -597,6 +597,25 @@ data_plane:
                                      # serialized groups and cost throughput;
                                      # higher buys little at linear HBM cost.
                                      # GDR needs that headroom to pay off.
+  nixl:
+    # NIXL data plane TQ backend (nemo_rl.data_plane.nixl, NixlStore): CPU storage units own pinned DRAM,
+    # clients transfer with one-sided NIXL RDMA. See nemo_rl/data_plane/interfaces.py.
+    num_storage_units: ${mul:2, ${cluster.num_nodes}}  # round-robin over nodes
+    storage_units_per_node: null     # set N to place N units on every node instead
+    storage_unit_placement: all      # with storage_units_per_node: inference | train | all
+    unit_slab_bytes: 17179869184     # 16 GiB pinned per unit
+    numa: auto                       # pin unit k on a multi-socket node to socket k % sockets
+    client_staging_bytes: 1073741824 # client pool: 2 x 1 GiB registered buffers
+    client_staging_buffers: 2
+    client_pool_max_bytes: 4294967296  # 4 GiB of kept-registered oversize buffers
+    zero_copy_min_bytes: 1048576     # values in [1, 32] MiB are sent from caller memory
+    zero_copy_max_bytes: 33554432
+    parallel_copy_min_bytes: 16777216  # staged copies >= 16 MiB use parallel torch copy
+    read_pin_s: 60.0
+    transfer_timeout_s: 120.0
+    placement: {policy: local_first} # local_first | spread
+    store: {kind: unit}              # unit | file (file: add root: <shared dir>)
+    nixl: {backend_name: UCX, backend_init_params: {}}
   observability:                      # per-op data-plane timing/volume
     enabled: true                     # per-op timing/volume; cost is below measurement noise
     verify_tensor_hash: false         # debug: per-row hash of each row's values+dtype+shape, wire-in vs wire-out

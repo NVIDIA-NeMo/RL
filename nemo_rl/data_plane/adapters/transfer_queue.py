@@ -730,6 +730,32 @@ def _connect_existing() -> None:
     tq.init()
 
 
+def _simple_storage_node_ids(placement: str) -> list[str]:
+    """EXPERIMENT: Ray node IDs for train | inference | gym (= neither) | all."""
+    import ray
+    from ray.util.placement_group import placement_group_table
+
+    def pg_nodes(prefix: str) -> set[str]:
+        return {
+            node_id
+            for pg in placement_group_table().values()
+            if pg["name"].startswith(prefix) and pg["state"] == "CREATED"
+            for node_id in pg["bundles_to_node_id"].values()
+        }
+
+    train = pg_nodes("sc_train_cluster") | pg_nodes("sc_policy_cluster")
+    inference = pg_nodes("sc_inference_cluster") | pg_nodes("sc_policy_cluster")
+    alive = {n["NodeID"] for n in ray.nodes() if n["Alive"] and n["Resources"].get("GPU")}
+    return sorted(
+        {
+            "train": train,
+            "inference": inference,
+            "gym": alive - train - inference,
+            "all": alive,
+        }[placement]
+    )
+
+
 def _init_tq(cfg: DataPlaneConfig, *, checkpointing: bool = False) -> None:
     """Driver-process path: bootstrap the TQ controller for the chosen backend."""
     from omegaconf import OmegaConf
@@ -759,6 +785,14 @@ def _init_tq(cfg: DataPlaneConfig, *, checkpointing: bool = False) -> None:
                 },
             },
         }
+        # EXPERIMENT: pin SimpleStorageUnits (needs the patched TQ bootstrap).
+        placement = (simple_cfg.model_extra or {}).get("storage_unit_placement")
+        if placement:
+            node_ids = _simple_storage_node_ids(placement)
+            print(f"[su-place] {placement}: {len(node_ids)} nodes {node_ids}", flush=True)
+            if not node_ids:
+                raise RuntimeError(f"[su-place] no nodes for {placement!r}")
+            overlay["backend"]["SimpleStorage"]["node_ids"] = node_ids
     elif backend == "mooncake_cpu":
         # The mooncake-transfer-engine wheel ships `mooncake_master` at
         # <site-packages>/mooncake/, NOT on $PATH. TQ's
@@ -831,6 +865,21 @@ def _init_tq(cfg: DataPlaneConfig, *, checkpointing: bool = False) -> None:
             overlay["backend"]["MooncakeStore"].update(
                 hard_pin=True, offload={"enabled": False}
             )
+    elif backend == "nixl":
+        # The NIXL data plane's TransferQueue backend (nemo_rl.data_plane.nixl): CPU NixlStorageUnit actors own
+        # pinned-DRAM slabs, every other process is a client doing one-sided
+        # NIXL RDMA. Importing the plug-in registers "NixlStore" with TQ's
+        # manager / client / bootstrap registries; the bootstrap provider
+        # starts the units and the BlobDirectory inside tq.init.
+        import nemo_rl.data_plane.nixl.tq  # noqa: F401
+
+        nixl_cfg = backend_config(cfg)
+        block = nixl_cfg.model_dump()
+        block.pop("storage_unit_placement", None)
+        overlay = {
+            **controller_overlay,
+            "backend": {"storage_backend": "NixlStore", "NixlStore": block},
+        }
     else:
         raise ValueError(f"unknown TQ backend: {backend!r}")
 
@@ -985,6 +1034,11 @@ class TQDataPlaneClient(DataPlaneClient):
             )
 
             install_tq_mooncake_checkpoint_plugin()
+
+        if cfg["backend"] == "nixl":
+            # Workers attach with tq.init() and need TQ's registries to know
+            # "NixlStore" before the client's storage manager is built.
+            import nemo_rl.data_plane.nixl.tq  # noqa: F401
 
         self._backend = cfg["backend"]
         self._supports_checkpointing = data_plane_supports_checkpointing(cfg)
