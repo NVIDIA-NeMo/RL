@@ -1,0 +1,65 @@
+defaults: ../../examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.yaml
+
+grpo:
+  num_prompts_per_step: 64
+  num_generations_per_prompt: 8
+  max_num_steps: 20
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+
+loss_fn:
+  use_importance_sampling_correction: true
+
+checkpointing:
+  enabled: false
+
+policy:
+  model_name: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16
+  tokenizer:
+    name: ${policy.model_name}
+  train_global_batch_size: 512
+  megatron_cfg:
+    bias_activation_fusion: false
+    expert_model_parallel_size: 32
+    expert_tensor_parallel_size: 1
+    moe_token_dispatcher_type: flex
+    moe_flex_dispatcher_backend: hybridep
+    moe_hybridep_num_sms: 32
+    moe_hybridep_prepad_packed_inputs: true
+    moe_router_dtype: fp32
+    fp8_cfg:
+      enabled: false
+      fp8_param: false
+  generation:
+    refit_transport: null
+    colocated:
+      enabled: true
+      resources:
+        num_nodes: null
+        gpus_per_node: null
+    vllm_cfg:
+      async_engine: false
+      tensor_parallel_size: 4
+      expert_parallel_size: 4
+      gpu_memory_utilization: 0.5
+      precision: bfloat16
+      is_mx: false
+      enforce_eager: false
+      quantization_ignore_patterns: []
+      num_first_layers_in_bf16: 0
+      num_last_layers_in_bf16: 0
+    vllm_kwargs:
+      moe_backend: flashinfer_trtllm
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 8
+  segment_size: 8
+
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: false
+  wandb:
+    project: nemo-rl-mxfp8-training
+    name: lightning-main-sync-bf16-gbs512-20261006
