@@ -43,6 +43,7 @@ class ResponseDatasetConfig(TypedDict):
     # models that do this before feature extraction (e.g. Qwen3-Omni).
     pad_audio_to_hop_length: NotRequired[bool]
     min_generation_tokens: NotRequired[int]
+    image_max_num_tiles: NotRequired[int]
     max_samples: NotRequired[int | None]
 
 
@@ -64,6 +65,7 @@ class PreferenceDatasetConfig(TypedDict):
     video_maintain_aspect_ratio: NotRequired[bool]
     pad_audio_to_hop_length: NotRequired[bool]
     min_generation_tokens: NotRequired[int]
+    image_max_num_tiles: NotRequired[int]
     split_validation_size: NotRequired[float | int]
     legacy_validation_split: NotRequired[bool]
     seed: NotRequired[int]

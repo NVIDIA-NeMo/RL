@@ -5803,3 +5803,68 @@ class TestPeftWarmStart:
         # The hook receives the resolved donor iteration directory.
         assert mock_hook.call_args.args[2] == str(donor_iter_dir)
         assert mock_hook.call_args.args[0].peft.share_expert_adapters is False
+
+
+def test_apply_mtp_config_zero_layers_strips_repeated_mtp_sources():
+    """mtp_num_layers=0 must leave no MTP source for HybridProvider.finalize()."""
+    from types import SimpleNamespace
+
+    from nemo_rl.models.megatron.setup import _apply_mtp_config
+
+    model_cfg = SimpleNamespace(
+        mtp_num_layers=1,
+        mtp_hybrid_override_pattern="M",
+        mtp_use_repeated_layer=True,
+        hybrid_layer_pattern="M-M*-/M",
+        hybrid_override_pattern="M-M*-/M",
+    )
+    config = {"megatron_cfg": {"mtp_num_layers": 0}}
+
+    _apply_mtp_config(model_cfg, config)
+
+    assert model_cfg.mtp_num_layers == 0
+    assert model_cfg.mtp_hybrid_override_pattern is None
+    assert model_cfg.mtp_use_repeated_layer is False
+    assert model_cfg.hybrid_layer_pattern == "M-M*-"
+    assert model_cfg.hybrid_override_pattern == "M-M*-"
+
+
+def test_apply_mtp_config_nonzero_layers_keeps_mtp_sources():
+    from types import SimpleNamespace
+
+    from nemo_rl.models.megatron.setup import _apply_mtp_config
+
+    model_cfg = SimpleNamespace(
+        mtp_num_layers=0,
+        mtp_hybrid_override_pattern="M",
+        mtp_use_repeated_layer=True,
+        hybrid_override_pattern="M-M*-/M",
+    )
+    config = {"megatron_cfg": {"mtp_num_layers": 1}}
+
+    _apply_mtp_config(model_cfg, config)
+
+    assert model_cfg.mtp_num_layers == 1
+    assert model_cfg.mtp_hybrid_override_pattern == "M"
+    assert model_cfg.mtp_use_repeated_layer is True
+    assert model_cfg.hybrid_override_pattern == "M-M*-/M"
+
+
+def test_apply_mtp_config_respects_teacher_provider_allowlist():
+    """A teacher clone must not inherit the student's mtp_num_layers=0."""
+    from types import SimpleNamespace
+
+    from nemo_rl.models.megatron.setup import _apply_mtp_config
+
+    model_cfg = SimpleNamespace(mtp_num_layers=1, mtp_use_repeated_layer=True)
+    config = {
+        "megatron_cfg": {
+            "mtp_num_layers": 0,
+            "_provider_override_allowlist": ["tensor_model_parallel_size"],
+        }
+    }
+
+    _apply_mtp_config(model_cfg, config)
+
+    assert model_cfg.mtp_num_layers == 1
+    assert model_cfg.mtp_use_repeated_layer is True
