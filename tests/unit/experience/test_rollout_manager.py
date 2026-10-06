@@ -1106,6 +1106,7 @@ def test_streamed_receipt_callback_uses_current_completion_conversion():
     generation_index, completion = streamed[0]
     assert generation_index == 0
     assert completion.env_extras["ng_rollout_id"] == "r0"
+    assert completion.env_extras["agent_ref"] == {"name": "resolved-agent"}
     assert "mask_sample" not in completion.env_extras["instance_config"]
 
 
@@ -1919,6 +1920,7 @@ def _receipt_record(
                 "reward": 0.5,
                 "ng_receipt": receipt,
                 "ng_rollout_id": rid,
+                "agent_ref": {"name": "resolved-agent"},
                 **({"instance_config": cfg} if cfg is not None else {}),
             },
             truncated=False,
@@ -2017,6 +2019,46 @@ def _make_capture_manager(
 
 
 class TestGenerateForFinalizationFlow:
+    @pytest.mark.parametrize("granularity", list(RecoveryGranularity))
+    def test_resolved_route_survives_all_sealed_restore(self, granularity):
+        prompt = {
+            "prompt": "p",
+            "idx": 9,
+            "extra_env_info": {"task_source": "source-not-agent-name"},
+        }
+        first = _make_capture_manager(
+            _FakeCaptureBuffer(),
+            recovery_config=RolloutRecoveryConfig(default_granularity=granularity),
+        )
+        request = _run(first.generate_for_finalization(prompt))
+        assert request.resolved_agent_name == "resolved-agent"
+        assert "agent_ref" not in prompt["extra_env_info"]
+
+        async def unexpected_rollout(_sample):
+            pytest.fail("all-sealed recovery must not regenerate to resolve routing")
+
+        restored = _make_capture_manager(
+            _FakeCaptureBuffer(), on_run=unexpected_rollout
+        )
+        _with_cut(
+            restored._tq_buffer,
+            lambda cut: restored.recovery_ledger.load_state_dict(
+                cut, first.recovery_ledger.state_dict()
+            ),
+        )
+        _with_cut(
+            restored._tq_buffer,
+            lambda cut: restored.recovery_ledger.prepare_for_restart(cut),
+        )
+        recovered = _run(
+            restored.generate_for_finalization(
+                prompt, lineage_group_id=request.group_id
+            )
+        )
+        assert recovered.resolved_agent_name == "resolved-agent"
+        assert recovered.receipts == request.receipts
+        assert restored._impl.seen_generation_indices is None
+
     def test_request_carries_env_mask_flags(self):
         buf = _FakeCaptureBuffer()
         mgr = _make_capture_manager(
