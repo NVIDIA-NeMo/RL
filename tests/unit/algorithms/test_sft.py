@@ -28,6 +28,7 @@ from nemo_rl.algorithms.sft import (
     sft_train,
 )
 from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.distributed.virtual_cluster import ClusterConfig
 
 
 def test_get_sft_save_state_handles_legacy_checkpoint_and_filters_metrics():
@@ -146,10 +147,7 @@ def mock_components():
             "checkpoint_must_save_by": None,
             "save_period": 10,
         },
-        cluster={
-            "num_nodes": 1,
-            "gpus_per_node": 2,
-        },
+        cluster=ClusterConfig(num_nodes=1, gpus_per_node=2),
     )
 
     return {
@@ -219,16 +217,24 @@ def test_exit_on_max_epochs(mock_components):
     assert mock_components["policy"].train.call_count == 20
 
 
-def test_exit_on_timeout(mock_components, capsys):
+def test_exit_on_timeout(mock_components, capsys, tmp_path):
     """Test that training loop exits when timeout is reached"""
     # Set max steps and epochs to large numbers
     mock_components["master_config"].sft.max_num_steps = 100
     mock_components["master_config"].sft.max_num_epochs = 10
+    mock_components["master_config"].checkpointing["enabled"] = True
+    mock_components["master_config"].checkpointing["metric_name"] = None
+    mock_components["checkpointer"].init_tmp_checkpoint.return_value = str(
+        tmp_path / "tmp_step"
+    )
 
     sft_save_state = _initial_sft_save_state()
 
     # Mock TimeoutChecker to return False for first 7 checks, then True (timeout)
-    with patch("nemo_rl.algorithms.sft.TimeoutChecker") as mock_timeout_class:
+    with (
+        patch("nemo_rl.algorithms.sft.torch.save"),
+        patch("nemo_rl.algorithms.sft.TimeoutChecker") as mock_timeout_class,
+    ):
         mock_timeout_instance = MagicMock()
         # Create a side_effect that returns False 7 times, then True
         check_results = [False] * 7 + [True]
@@ -250,6 +256,12 @@ def test_exit_on_timeout(mock_components, capsys):
 
         # Verify training stopped at 8 steps (when check_save returned True)
         assert mock_components["policy"].train.call_count == 8
+        assert (
+            mock_components["policy"].save_checkpoint.call_args.kwargs[
+                "is_final_checkpoint"
+            ]
+            is False
+        )
 
         # Verify the timeout message was printed and is near the end (not followed by more training)
         captured = capsys.readouterr()

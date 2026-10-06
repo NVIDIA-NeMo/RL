@@ -40,6 +40,8 @@ grpo:
     use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
     reward_weights: null  # GDPO-specific: one weight per reward component
     minus_baseline: true  # Reinforce++-baseline specific: subtract per-prompt mean baseline
+    proximal_teacher_alpha: 1.0  # OPD-specific: TROPD proximal-teacher weight in (0, 1]; 1.0 is plain MOPD
+    subtract_global_baseline: false  # OPD-specific: center advantages on the step's mean over valid tokens
   reward_scaling:
     enabled: false
     source_min: 0.0
@@ -107,6 +109,9 @@ loss_fn:
   sequence_level_importance_ratios: false
   token_level_loss: true
   force_on_policy_ratio: false  # Set to true to force ratio=1.0 (requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt)
+  # Opt-in single-forward Megatron GRPO: apply the threshold during training
+  # and normalize gradients over survivors before the optimizer step.
+  seq_logprob_error_in_loss: false
   use_kl_in_reward: false  # Reinforce++: add KL penalty to reward instead of loss
   # Disable PPO ratio (curr_logprobs - prev_logprobs).exp(); falls back to REINFORCE-style
   # surrogate loss. Used by REINFORCE/RLOO. See https://arxiv.org/abs/2402.14740
@@ -129,8 +134,6 @@ checkpointing:
   # toward short rollouts at a save boundary).
   load_replay_buffer: true
   save_data_plane: false
-  model_save_format: "safetensors"
-  save_consolidated: false
   save_optimizer: true
 
 policy:
@@ -152,8 +155,12 @@ policy:
   worker_extension_cls_fqn: null
 
   dtensor_cfg:
-    _v2: true
     enabled: true
+    checkpoint:
+      model_save_format: "safetensors"
+      save_consolidated: "false"
+      single_rank_consolidation: false
+      consolidation_timeout_minutes: 30
     cpu_offload: False
     sequence_parallel: false
     activation_checkpointing: false
@@ -228,6 +235,7 @@ policy:
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: True
     defer_fp32_logits: False
+    fp32_lm_head: false
     moe_per_layer_logging: False
     moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"
@@ -311,6 +319,19 @@ policy:
       fp8_recipe: "blockwise"
       fp8_param: false
 
+    # Transformer Engine FP4 training; disabled by default.
+    fp4_cfg:
+      enabled: false
+      fp4: "e2m1"
+      fp4_recipe: "nvfp4"
+      fp4_param: false
+
+    # Keep boundary transformer layers in BF16 during FP8 or FP4 training.
+    # The layer counts apply only when first_last_layers_bf16 is true.
+    first_last_layers_bf16: false
+    num_layers_at_start_in_bf16: 1
+    num_layers_at_end_in_bf16: 1
+
     env_vars: null
 
   draft:
@@ -321,6 +342,7 @@ policy:
     num_layers: null
     aux_layer_indices: null
     token_chunk_size: 4096
+    optimizer: null
 
   # See docs/design-docs/sequence-packing-and-dynamic-batching.md
   # for more details on dynamic batching and sequence packing.
@@ -430,6 +452,7 @@ policy:
       precision: ${policy.precision}
       kv_cache_dtype: "auto"
       logprobs_mode: processed_logprobs
+      fp32_lm_head: ${policy.megatron_cfg.fp32_lm_head}
       # false: use NeMo-RL's legacy refit loader; true: opt into vLLM reload_weights.
       refit_with_reload_api: false
       tensor_parallel_size: 1
@@ -522,14 +545,20 @@ logger:
     project: "grpo-dev"
     name: "grpo-dev-logger"
     log_nemo_gym_full_result_tables: false
+    entity: null
+    id: null
+    resume: null
   swanlab:
     project: "grpo-dev"
     name: "grpo-dev-logger"
-  tensorboard: {}
+  tensorboard:
+    log_dir: null
   mlflow:
     experiment_name: "grpo-dev"
     run_name: "grpo-dev-logger"
     tracking_uri: "http://localhost:5000"
+    run_id: null
+    artifact_location: null
   gpu_monitoring:
     collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)

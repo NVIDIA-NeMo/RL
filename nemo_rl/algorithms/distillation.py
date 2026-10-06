@@ -49,8 +49,9 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import (
+    build_nemo_gym_actors,
     should_use_nemo_gym,
-    spinup_nemo_gym_actor,
+    validate_dataset_agent_coverage,
 )
 from nemo_rl.environments.utils import shutdown_environments
 from nemo_rl.experience.rollouts import (
@@ -65,16 +66,25 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
+    normalize_nvfp4_pertoken_policy_config,
     normalize_vllm_refit_config,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.telemetry.config import TelemetryConfig
-from nemo_rl.telemetry.instrumentation import managed_span, trace_fn
+from nemo_rl.telemetry.instrumentation import (
+    evaluate_span,
+    managed_span,
+    umbrella_span,
+    umbrella_trace_fn,
+)
 from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.span_groups import RLSpanGroup
-from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
+from nemo_rl.utils.checkpoint import (
+    CheckpointingConfig,
+    CheckpointManager,
+)
 from nemo_rl.utils.logger import (
     Logger,
     LoggerConfig,
@@ -240,6 +250,9 @@ def setup(
     )
     checkpoint_engine_config = None
     if generation_config["backend"] == "vllm":
+        normalize_nvfp4_pertoken_policy_config(
+            policy_config, entry_point="distillation"
+        )
         vllm_config = cast(VllmConfig, generation_config)
         normalize_vllm_refit_config(vllm_config)
         refit_transport = vllm_config.get("refit_transport")
@@ -337,23 +350,23 @@ def setup(
     colocated_inference = generation_config["colocated"]["enabled"]
     enable_nemo_gym = bool(env_configs) and should_use_nemo_gym(master_config)
     nemo_gym_actor: Optional[EnvironmentInterface] = None
-    segment_size = cluster_config.get("segment_size")
+    segment_size = cluster_config.segment_size
 
     if colocated_inference:
-        num_nodes = cluster_config["num_nodes"]
+        num_nodes = cluster_config.num_nodes
         node_resource_constraints, _, _ = prepare_segment_topology(
             segment_size, num_nodes
         )
         cluster = RayVirtualCluster(
             name="distillation_cluster",
-            bundle_ct_per_node_list=[cluster_config["gpus_per_node"]] * num_nodes,
+            bundle_ct_per_node_list=[cluster_config.gpus_per_node] * num_nodes,
             use_gpus=True,
-            num_gpus_per_node=cluster_config["gpus_per_node"],
+            num_gpus_per_node=cluster_config.gpus_per_node,
             max_colocated_worker_groups=1
             if generation_config["backend"] == "megatron"
             else 3,
-            port_range_low=cluster_config.get("master_port_range_low"),
-            port_range_high=cluster_config.get("master_port_range_high"),
+            port_range_low=cluster_config.master_port_range_low,
+            port_range_high=cluster_config.master_port_range_high,
             segment_size=segment_size,
             node_resource_constraints=node_resource_constraints,
         )
@@ -370,15 +383,15 @@ def setup(
         )
 
         # train resources will be updated through overall and inference resources below
-        train_gpus_per_node = cluster_config["gpus_per_node"]
-        train_nodes = cluster_config["num_nodes"]
+        train_gpus_per_node = cluster_config.gpus_per_node
+        train_nodes = cluster_config.num_nodes
 
         inference_resources = generation_config["colocated"]["resources"]
         inference_gpus_per_node = inference_resources["gpus_per_node"]
         inference_nodes = inference_resources["num_nodes"]
 
         # validate and configure resources
-        if cluster_config["num_nodes"] == 1:
+        if cluster_config.num_nodes == 1:
             assert (
                 inference_gpus_per_node is not None and inference_gpus_per_node > 0
             ), (
@@ -401,11 +414,11 @@ def setup(
             )
             assert (
                 inference_gpus_per_node is not None
-                and inference_gpus_per_node == cluster_config["gpus_per_node"]
+                and inference_gpus_per_node == cluster_config.gpus_per_node
             ), (
                 "policy.generation.colocated.resources.gpus_per_node must be explicitly set and equal to cluster.gpus_per_node "
                 "when cluster.num_nodes > 1 and inference is non-colocated, "
-                f"but got inference_gpus_per_node={inference_gpus_per_node}, cluster.gpus_per_node={cluster_config['gpus_per_node']}."
+                f"but got inference_gpus_per_node={inference_gpus_per_node}, cluster.gpus_per_node={cluster_config.gpus_per_node}."
             )
             train_nodes -= inference_nodes
 
@@ -418,8 +431,8 @@ def setup(
         )
         if node_resource_constraints is not None and inference_nodes > 0:
             nodes_per_instance = (
-                inference_gpus_per_node + cluster_config["gpus_per_node"] - 1
-            ) // cluster_config["gpus_per_node"]
+                inference_gpus_per_node + cluster_config.gpus_per_node - 1
+            ) // cluster_config.gpus_per_node
             if nodes_per_instance > 1 and inference_nodes % nodes_per_instance == 0:
                 remaining_topology = {nid: topology[nid] for nid in remaining_node_ids}
                 inference_node_resource_constraints, _, _ = prepare_segment_topology(
@@ -437,8 +450,8 @@ def setup(
             use_gpus=True,
             num_gpus_per_node=train_gpus_per_node,
             max_colocated_worker_groups=3,
-            port_range_low=cluster_config.get("master_port_range_low"),
-            port_range_high=cluster_config.get("master_port_range_high"),
+            port_range_low=cluster_config.master_port_range_low,
+            port_range_high=cluster_config.master_port_range_high,
             segment_size=segment_size,
             node_resource_constraints=node_resource_constraints,
         )
@@ -448,8 +461,8 @@ def setup(
             use_gpus=True,
             num_gpus_per_node=inference_gpus_per_node,
             max_colocated_worker_groups=3,
-            port_range_low=cluster_config.get("master_port_range_low"),
-            port_range_high=cluster_config.get("master_port_range_high"),
+            port_range_low=cluster_config.master_port_range_low,
+            port_range_high=cluster_config.master_port_range_high,
             segment_size=inference_segment_size,
             node_resource_constraints=inference_node_resource_constraints,
         )
@@ -519,7 +532,7 @@ def setup(
                 return deferred_vllm
 
             def init_nemo_gym():
-                return spinup_nemo_gym_actor(
+                shard_set = build_nemo_gym_actors(
                     env_configs,
                     base_urls=cast(list[str], deferred_vllm.dp_openai_server_base_urls),
                     model_name=generation_config["model_name"],
@@ -528,6 +541,15 @@ def setup(
                     enable_router_replay=False,
                     use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
                 )
+                try:
+                    validate_dataset_agent_coverage(
+                        shard_set,
+                        {"training": train_dataset, "validation": val_dataset},
+                    )
+                except BaseException:
+                    shard_set.shutdown()
+                    raise
+                return shard_set
 
             init_tasks = {
                 "vllm": init_vllm_deferred,
@@ -538,9 +560,20 @@ def setup(
                 f"  ⚡ Init tasks: {', '.join(init_tasks.keys())}",
                 flush=True,
             )
-            with ThreadPoolExecutor(max_workers=len(init_tasks)) as executor:
-                submitted = {k: executor.submit(fn) for k, fn in init_tasks.items()}
-                results = {k: f.result() for k, f in submitted.items()}
+            submitted = {}
+            try:
+                with ThreadPoolExecutor(max_workers=len(init_tasks)) as executor:
+                    submitted = {k: executor.submit(fn) for k, fn in init_tasks.items()}
+                    results = {k: f.result() for k, f in submitted.items()}
+            except BaseException:
+                if "nemo_gym" in submitted:
+                    try:
+                        completed_shard_set = submitted["nemo_gym"].result()
+                    except BaseException:
+                        pass
+                    else:
+                        completed_shard_set.shutdown()
+                raise
 
             student_generation = cast(GenerationInterface, results["vllm"])
             nemo_gym_actor = cast(EnvironmentInterface, results["nemo_gym"])
@@ -744,8 +777,8 @@ def _distillation_train_impl(
 
             with (
                 timer.time("total_step_time"),
-                managed_span(
-                    RLSpanGroup.STEP,
+                umbrella_span(
+                    RLSpanGroup.U_STEP,
                     "rl.distillation.step",
                     tracer=_tracer,
                     **{"rl.iteration": total_steps + 1, "rl.epoch": current_epoch + 1},
@@ -787,8 +820,8 @@ def _distillation_train_impl(
 
                 with (
                     timer.time("generation"),
-                    managed_span(
-                        RLSpanGroup.ROLLOUT,
+                    umbrella_span(
+                        RLSpanGroup.U_ROLLOUT,
                         "rl.distillation.generation",
                         tracer=_tracer,
                     ),
@@ -807,8 +840,8 @@ def _distillation_train_impl(
                                 master_config.distillation.num_generations_per_prompt
                             ),
                             log_full_result_tables=should_log_nemo_gym_full_result_tables(
-                                wandb_enabled=master_config.logger["wandb_enabled"],
-                                wandb_config=master_config.logger["wandb"],
+                                wandb_enabled=master_config.logger.wandb_enabled,
+                                wandb_config=master_config.logger.wandb,
                             ),
                             max_rollout_turns=None,
                             greedy=False,
@@ -1023,14 +1056,6 @@ def _distillation_train_impl(
 
                     full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
-                        assert full_metric_name.startswith(
-                            "train:"
-                        ) or full_metric_name.startswith("val:"), (
-                            f"metric_name={full_metric_name} must start with 'val:' or 'train:',\n"
-                            f'followed by the corresponding name in the "val" or "train" metrics dictionary.'
-                            f"  If you are using an old config, please updated checkpointing.metric_name to the new format, "
-                            f" e.g. 'val_reward --> 'val:accuracy'"
-                        )
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics
                         if not metrics_source:
@@ -1081,7 +1106,7 @@ def _distillation_train_impl(
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
-                            checkpointing_cfg=master_config.checkpointing,
+                            is_final_checkpoint=is_last_step,
                         )
                         torch.save(
                             dataloader.state_dict(),
@@ -1134,8 +1159,7 @@ def _distillation_train_impl(
             total_time = timing_metrics.get("total_step_time", 0)
 
             total_num_gpus = (
-                master_config.cluster["num_nodes"]
-                * master_config.cluster["gpus_per_node"]
+                master_config.cluster.num_nodes * master_config.cluster.gpus_per_node
             )
             metrics.update(
                 {
@@ -1193,7 +1217,7 @@ def _distillation_train_impl(
     checkpointer.shutdown()
 
 
-@trace_fn(RLSpanGroup.JOB, "rl.distillation.job")
+@umbrella_trace_fn(RLSpanGroup.U_JOB, "rl.distillation.job")
 def distillation_train(
     student_policy: ColocatablePolicyInterface,
     teacher_policy: ColocatablePolicyInterface,
@@ -1254,16 +1278,9 @@ def validate(
     use_nemo_gym = should_use_nemo_gym(master_config)
 
     timer = Timer()
-    _telemetry = get_telemetry_handle()
-    _tracer = _telemetry.tracer if _telemetry is not None else None
     with (
         timer.time("total_validation_time"),
-        managed_span(
-            RLSpanGroup.EVALUATE,
-            "rl.distillation.evaluate",
-            tracer=_tracer,
-            **{"rl.step": step},
-        ),
+        evaluate_span("distillation", **{"rl.step": step}),
     ):
         print(f"▶ Starting validation at step {step}...", flush=True)
 
@@ -1294,8 +1311,8 @@ def validate(
                     generation_config=generation_config,
                     num_generations_per_prompt=1,
                     log_full_result_tables=should_log_nemo_gym_full_result_tables(
-                        wandb_enabled=master_config.logger["wandb_enabled"],
-                        wandb_config=master_config.logger["wandb"],
+                        wandb_enabled=master_config.logger.wandb_enabled,
+                        wandb_config=master_config.logger.wandb,
                     ),
                     max_rollout_turns=None,
                     greedy=False,
@@ -1360,7 +1377,7 @@ def validate(
                 all_message_logs,
                 total_rewards,
                 num_samples=min(
-                    master_config.logger["num_val_samples_to_print"],
+                    master_config.logger.num_val_samples_to_print,
                     len(all_message_logs),
                 ),
                 step=step,

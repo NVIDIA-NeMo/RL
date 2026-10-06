@@ -45,6 +45,12 @@ policy:
 
   dtensor_cfg:
     enabled: true
+    checkpoint:
+      model_save_format: "safetensors"
+      # Canonical Automodel modes: "false", "final", or "every".
+      save_consolidated: "false"
+      single_rank_consolidation: false
+      consolidation_timeout_minutes: 30
     cpu_offload: false
     sequence_parallel: false
     activation_checkpointing: false
@@ -196,7 +202,7 @@ data:
 
   # If you are doing checkpointing, `metric_name` should reflect the metric and validation set to be tracked. For example:
   #   checkpointing:
-  #     metric_name: "validation-<NameOfValidationDataset1>_loss"
+  #     metric_name: "val:validation-<NameOfValidationDataset1>_loss"
   #   ...
 
 logger:

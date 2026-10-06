@@ -29,11 +29,11 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     create_sampler,
     required_buffer_capacity_for_config,
 )
-from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     validate_single_controller_config,
 )
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.interfaces import PromptGroupRecord
 from nemo_rl.experience.metric_utils import calculate_staleness_metrics
 from nemo_rl.experience.rollout_manager import RolloutOutcome
@@ -351,9 +351,11 @@ async def test_invalid_checkpoint_order_is_rejected_before_loading_rows():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("dump_enabled", [False, True])
 async def test_controller_prefetches_before_refit_and_logs_training_gap_eight(
-    monkeypatch,
-):
+    monkeypatch: pytest.MonkeyPatch,
+    dump_enabled: bool,
+) -> None:
     buffer, sampler, dp = buffer_and_sampler()
     await publish(buffer, "bootstrap", 17)
     await publish(buffer, "next", 10)
@@ -369,9 +371,25 @@ async def test_controller_prefetches_before_refit_and_logs_training_gap_eight(
     ctrl._rollout_exhausted.clear()
     ctrl._logger = MagicMock()
     versions = []
+    dump_versions: list[tuple[int, int]] = []
+
+    def finish_dump(step: int, rows: int) -> None:
+        dump_versions.append((step, ctrl._trainer_version))
+        assert rows == 0  # The no-op advantage stage writes no dump rows.
+        if step == 0:
+            assert [g["group_id"] for g in buffer.queue_training_groups(18)] == ["next"]
+
+    if dump_enabled:
+        ctrl._train_data_dump = SimpleNamespace(finish_step=finish_dump)
+        ctrl._train_data_dump_rows = 0
 
     async def sync_weights(**kwargs):
         versions.append(ctrl._trainer_version)
+        if dump_enabled:
+            assert dump_versions[-1] == (
+                ctrl._train_steps - 1,
+                ctrl._trainer_version - 1,
+            )
         if ctrl._trainer_version == 18:
             # The actual train pump must have selected the NEXT batch before
             # updating the engine, and released only the CURRENT batch.
@@ -388,6 +406,7 @@ async def test_controller_prefetches_before_refit_and_logs_training_gap_eight(
         if "staleness/total/max" in call.args[0]
     ]
     assert versions == [18, 19]
+    assert dump_versions == ([(0, 17), (1, 18)] if dump_enabled else [])
     assert [m["staleness/total/max"] for m in metrics] == [0, 8]
     assert metrics[1]["staleness/category/math/total/max"] == 8
     assert not buffer.training_owned_group_ids()

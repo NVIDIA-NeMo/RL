@@ -43,6 +43,7 @@ from nemo_rl.utils.config import (
     load_config_with_inheritance,
     register_omegaconf_resolvers,
 )
+from nemo_rl.utils.outdated_config_checks import check_outdated_config
 
 # All tests in this module should run first
 pytestmark = pytest.mark.run_first
@@ -102,6 +103,16 @@ configs_dir = Path(
 ).resolve()
 config_files = glob.glob(str(configs_dir / "**/*.yaml"), recursive=True)
 assert len(config_files) > 0, "No config files found"
+
+# Every shipped config tree. Only the outdated-config guard uses it -- most of examples/nemo_gym
+# cannot satisfy the schema test by design (env manifests, launcher templates, unset env
+# interpolations).
+repo_root = Path(os.path.join(os.path.dirname(absolute_path), "../..")).resolve()
+full_config_files = config_files + [
+    path
+    for extra in ("examples/nemo_gym", "research")
+    for path in glob.glob(str(repo_root / extra / "**/*.yaml"), recursive=True)
+]
 
 
 @pytest.mark.parametrize("config_file", config_files)
@@ -343,4 +354,68 @@ def test_all_config_no_tp_size_accuracy_issues(config_file):
         raise AssertionError(
             f"Config file {config_file} has TP size >= 4 accuracy issues. "
             "Please set policy.train_micro_batch_size and policy.logprob_batch_size to be the same value."
+        )
+
+
+@pytest.mark.parametrize("config_file", full_config_files)
+def test_no_shipped_config_is_outdated(config_file):
+    """Test that every shipped config passes the same checks the entrypoints run.
+
+    Reusing check_outdated_config keeps this from drifting: a check added there is
+    enforced on the shipped configs without a second implementation here.
+    """
+    # Eval configs have a different structure from training configs, so the entrypoint
+    # checks do not apply to them. run_eval.py skips them for the same reason.
+    if "/evals/" in config_file:
+        pytest.skip("eval configs have a different structure from training configs")
+
+    print(f"\nValidating config file: {config_file}")
+
+    config = load_config_with_inheritance(config_file)
+    # resolve=False: the checked keys are never interpolations, and resolving would fail
+    # on the configs that interpolate an env var CI does not set.
+    config_dict = OmegaConf.to_container(config, resolve=False)
+
+    try:
+        check_outdated_config(config_dict)
+    except ValueError as e:
+        raise AssertionError(f"Config file {config_file} is outdated: {e}") from e
+
+
+# Keep only the regressions tracked in #4427 on DeepEP until they pass validation.
+DEEPEP_FALLBACK_RECIPES = {
+    Path("recipes/llm/sft-nanov3-30BA3B-2n8g-fsdp2.yaml"),
+    Path("recipes/llm/sft-nanov3-30BA3B-2n4g-fsdp2.yaml"),
+    Path("recipes/llm/sft-gpt-oss-20b-1n8g-fsdp8ep8-automodel.yaml"),
+    Path("recipes/llm/sft-gpt-oss-20b-1n4g-fsdp4ep4-automodel.yaml"),
+    Path("recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v2.yaml"),
+    Path("recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-automodel-ep8.v1.yaml"),
+}
+
+
+@pytest.mark.parametrize("config_file", config_files)
+def test_automodel_moe_recipes_use_expected_dispatcher(
+    config_file: str,
+) -> None:
+    config = load_config_with_inheritance(config_file)
+    dtensor_cfg = OmegaConf.select(config, "policy.dtensor_cfg")
+    if (
+        dtensor_cfg is None
+        or not dtensor_cfg.enabled
+        or dtensor_cfg.get("expert_parallel_size", 1) <= 1
+    ):
+        pytest.skip("Not an AutoModel expert-parallel recipe")
+
+    backend = dtensor_cfg.automodel_kwargs.backend
+    assert "enable_deepep" not in backend
+    if Path(config_file).relative_to(configs_dir) in DEEPEP_FALLBACK_RECIPES:
+        assert backend.get("dispatcher") == "deepep"
+    else:
+        assert backend.get("dispatcher") in {"hybridep", "torch"}
+    if backend.dispatcher == "hybridep":
+        assert backend.get("experts") is not None, (
+            f"{config_file}: HybridEP must explicitly select an experts backend"
+        )
+        assert config.policy.make_sequence_length_divisible_by % 64 == 0, (
+            f"{config_file}: HybridEP input width must be padded to a multiple of 64"
         )

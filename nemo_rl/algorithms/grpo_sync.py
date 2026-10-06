@@ -67,9 +67,15 @@ from nemo_rl.algorithms.loss import (
     ClippedPGLossDataDict,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.metric_utils import (
+    GRAD_NORM_KEY,
+    LOSS_KEY,
+    REWARD_KEY,
+)
 from nemo_rl.algorithms.reward_functions import apply_reward_shaping
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
+    calculate_trivial_reward_distributions,
     get_gdpo_reward_component_keys,
     log_generation_metrics,
     print_performance_metrics,
@@ -89,7 +95,9 @@ from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.sync_rollout_actor import SyncRolloutActor
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
-from nemo_rl.utils.checkpoint import CheckpointManager
+from nemo_rl.utils.checkpoint import (
+    CheckpointManager,
+)
 from nemo_rl.utils.logger import Logger, print_message_log_samples
 from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
@@ -133,9 +141,9 @@ def _train_fields_for_step(skip_prev_logprobs: bool) -> tuple[str, ...]:
     )
 
 
-# ── DAPO non-zero-std dynamic sampling, slice-only ─────────────────────
+# ── DAPO non-trivial-reward dynamic sampling, slice-only ───────────────
 # Slice-only formulation of nemo_rl.algorithms.grpo.dynamic_sampling: filter
-# on std != 0, accumulate survivors across iterations, slice on overflow.
+# on exact reward variation, accumulate survivors across iterations, slice on overflow.
 # Bulk in TQ untouched except for clear_samples of dropped/discarded uids.
 
 
@@ -188,15 +196,21 @@ def _apply_dynamic_sampling(
     pending_unfiltered_rewards.append(driver_carry["total_reward"])
 
     # Filter input comes from ``meta.tags`` so the filter decision is
-    # meta-only — no tensor data needed. The driver mirrored ``std``
-    # into tags right after baseline/std compute.
+    # meta-only — no tensor data needed. The driver mirrored the exact
+    # full-prompt trivial-distribution mask into tags after reward processing.
     if meta.tags is None:
         raise ValueError(
             "_apply_dynamic_sampling: meta.tags is None — driver must "
-            "stamp 'std' into meta.tags before this call."
+            "stamp 'is_trivial_prompt_distribution' into meta.tags before this call."
         )
-    keep_idx = [i for i, t in enumerate(meta.tags) if t["std"] != 0.0]
-    drop_keys = [k for k, t in zip(meta.sample_ids, meta.tags) if t["std"] == 0.0]
+    keep_idx = [
+        i for i, t in enumerate(meta.tags) if not t["is_trivial_prompt_distribution"]
+    ]
+    drop_keys = [
+        k
+        for k, t in zip(meta.sample_ids, meta.tags)
+        if t["is_trivial_prompt_distribution"]
+    ]
     if drop_keys:
         policy.discard_samples(drop_keys, meta.partition_id)
 
@@ -323,7 +337,7 @@ def validate_sync(
                 all_message_logs,
                 total_rewards,
                 num_samples=min(
-                    master_config.logger["num_val_samples_to_print"],
+                    master_config.logger.num_val_samples_to_print,
                     len(all_message_logs),
                 ),
                 step=step,
@@ -769,24 +783,50 @@ def grpo_train_sync(
                             driver_carry,
                             master_config.grpo.reward_shaping,
                         )
-                    driver_carry["baseline"], driver_carry["std"] = (
-                        calculate_baseline_and_std_per_prompt(
-                            driver_carry["prompt_ids_for_adv"],
-                            driver_carry["total_reward"],
-                            torch.ones_like(driver_carry["total_reward"]),
-                            leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
+                    std_rewards = (
+                        driver_carry["unshaped_total_reward"]
+                        if master_config.grpo.use_dynamic_sampling
+                        and "unshaped_total_reward" in driver_carry
+                        else None
+                    )
+                    (
+                        baseline,
+                        std,
+                        _,
+                    ) = calculate_baseline_and_std_per_prompt(
+                        driver_carry["prompt_ids_for_adv"],
+                        driver_carry["total_reward"],
+                        torch.ones_like(driver_carry["total_reward"]),
+                        leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
+                        std_rewards=std_rewards,
+                    )
+                    driver_carry["baseline"] = baseline
+                    driver_carry["std"] = std
+                    tags = {
+                        "std": driver_carry["std"].tolist(),
+                        "baseline": driver_carry["baseline"].tolist(),
+                    }
+                    if master_config.grpo.use_dynamic_sampling:
+                        dynamic_sampling_rewards = (
+                            std_rewards
+                            if std_rewards is not None
+                            else driver_carry["total_reward"]
                         )
-                    )
-                    # Mirror std onto meta so dynamic_sampling can filter
-                    # without fetching tensor data.
-                    meta.stamp_tags(
-                        {
-                            "std": driver_carry["std"].tolist(),
-                            "baseline": driver_carry["baseline"].tolist(),
-                        }
-                    )
+                        is_trivial_prompt_distribution = (
+                            calculate_trivial_reward_distributions(
+                                driver_carry["prompt_ids_for_adv"],
+                                dynamic_sampling_rewards,
+                                torch.ones_like(dynamic_sampling_rewards),
+                            )
+                        )
+                        tags["is_trivial_prompt_distribution"] = (
+                            is_trivial_prompt_distribution.tolist()
+                        )
+                    # Mirror the full-prompt decision onto meta so dynamic
+                    # sampling can filter without fetching tensor data.
+                    meta.stamp_tags(tags)
 
-                # ── Dynamic sampling (DAPO non-zero-std filter) ────────
+                # ── Dynamic sampling (DAPO reward-variation filter) ───
                 # Slice-only; bulk in TQ untouched except for clear_samples
                 # of dropped / overflow-discarded uids.
                 ds_metrics: dict = {}
@@ -926,11 +966,19 @@ def grpo_train_sync(
                         extras_bdd["reference_policy_logprobs"] if compute_ref else None
                     )
 
-                # Seq-level logprob error metrics/masking require real prev_logprobs
+                # Separate-pass seq-level metrics/masking require real prev_logprobs
                 if skip_prev_logprobs:
                     sample_mask = loss_multiplier
-                    # Cannot compute seq-level metrics with placeholder prev_logprobs
-                    seq_logprob_error_metrics = _placeholder_seq_logprob_error_metrics()
+                    # In-loss filtering reports counts through all_mb_metrics.
+                    # Use {} so placeholder zeros cannot overwrite those counts
+                    # when seq_logprob_error_metrics is merged after training.
+                    # Otherwise, placeholder prev_logprobs cannot provide
+                    # sequence-error metrics.
+                    seq_logprob_error_metrics = (
+                        {}
+                        if master_config.loss_fn.seq_logprob_error_in_loss
+                        else _placeholder_seq_logprob_error_metrics()
+                    )
                 else:
                     sample_mask, seq_logprob_error_metrics = (
                         _compute_seq_logprob_error_metrics(
@@ -1122,9 +1170,9 @@ def grpo_train_sync(
                 memory_tracker.snapshot_start_of_stage("Metrics", dir())
                 metrics = {
                     **metrics,
-                    "loss": train_results["loss"].numpy(),
-                    "grad_norm": train_results["grad_norm"].numpy(),
-                    "reward": rewards.numpy(),
+                    LOSS_KEY: train_results["loss"].numpy(),
+                    GRAD_NORM_KEY: train_results["grad_norm"].numpy(),
+                    REWARD_KEY: rewards.numpy(),
                     "mean_prompt_length": length.numpy(),
                     "total_num_tokens": input_lengths.numpy(),
                     "advantages/mean": torch.mean(response_advantages).detach().item()
@@ -1224,11 +1272,6 @@ def grpo_train_sync(
 
                     full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
-                        assert full_metric_name.startswith(
-                            "train:"
-                        ) or full_metric_name.startswith("val:"), (
-                            f"metric_name={full_metric_name} must start with 'val:' or 'train:'"
-                        )
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics
                         if not metrics_source:
@@ -1269,7 +1312,9 @@ def grpo_train_sync(
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
-                            checkpointing_cfg=master_config.checkpointing,
+                            is_final_checkpoint=(
+                                is_last_step or early_stop_message is not None
+                            ),
                         )
                         if master_config.data["use_multiple_dataloader"]:
                             for (
@@ -1385,8 +1430,7 @@ def grpo_train_sync(
                 * master_config.grpo.num_generations_per_prompt
             )
             total_num_gpus = (
-                master_config.cluster["num_nodes"]
-                * master_config.cluster["gpus_per_node"]
+                master_config.cluster.num_nodes * master_config.cluster.gpus_per_node
             )
 
             print(f"  • Total step time: {total_time:.2f}s", flush=True)

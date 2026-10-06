@@ -85,9 +85,14 @@ PostProcessingFunction = Union[
 def _prepare_padding_mask_for_model(
     model: GPTModel,
     padding_mask: Optional[torch.Tensor],
+    model_slices_context_parallel_inputs: bool = False,
 ) -> Optional[torch.Tensor]:
     """Match a CP-local padding mask to the model's sequence-parallel layout."""
-    if padding_mask is None or not get_model_config(model).sequence_parallel:
+    if (
+        padding_mask is None
+        or model_slices_context_parallel_inputs
+        or not get_model_config(model).sequence_parallel
+    ):
         return padding_mask
 
     core_model = unwrap_model(model)
@@ -189,6 +194,10 @@ def model_forward(
     multimodal_data = data_dict.get_multimodal_dict(
         as_tensors=True, device=input_ids_cp_sharded.device
     )
+    # Energon boundaries use PackedTensor for transport, but they are packing
+    # metadata rather than model inputs. PackedSeqParams carries them forward.
+    multimodal_data.pop("cu_seqlens", None)
+    multimodal_data.pop("cu_seqlens_padded", None)
     # VLM wrappers normally derive their own positions or expand the token sequence,
     # so position_ids are dropped for multimodal batches.
     # A model that consumes caller-packed THD inputs keeps them:
@@ -204,7 +213,11 @@ def model_forward(
     # Pass MTP loss mask to exclude prompt tokens from MTP loss
     if mtp_loss_mask is not None:
         additional_kwargs["loss_mask"] = mtp_loss_mask
-    padding_mask = _prepare_padding_mask_for_model(model, padding_mask)
+    padding_mask = _prepare_padding_mask_for_model(
+        model,
+        padding_mask,
+        model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
+    )
     if padding_mask is not None:
         additional_kwargs["padding_mask"] = padding_mask
 
@@ -559,7 +572,8 @@ class LossPostProcessor:
         sampling_params: Optional[TrainingSamplingParams] = None,
         draft_model: Optional[MegatronModule] = None,
         prepare_fn: Optional[Callable[..., Any]] = None,
-        teacher_output_layer_weight: Optional[torch.Tensor] = None,
+        defer_draft_normalization: bool = False,
+        teacher_output_layer_weight_by_index: Optional[dict[int, torch.Tensor]] = None,
     ):
         """Build a per-microbatch loss post-processor for the Megatron train loop.
 
@@ -576,11 +590,16 @@ class LossPostProcessor:
                 vocab_parallel_group, context_parallel_group)`` and return
                 ``(loss_input, data)``; value models pass one that right-shifts
                 and CP-all-gathers the scalar value-head output.
-            teacher_output_layer_weight: This rank's teacher LM-head shard, used
-                by the full-vocabulary MOPD loss to project the teacher payload.
-                It rides this argument rather than the data dict because the
-                sequence-packing wrapper batch-slices every data entry, and
-                rather than the loss object because that is pickled to workers.
+            defer_draft_normalization: Return raw draft loss statistics for split
+                optimizer-step finalization instead of normalizing per microbatch.
+            teacher_output_layer_weight_by_index: This rank's teacher LM-head
+                shards for every configured teacher, keyed by the stable
+                per-checkpoint index rows are tagged with (see
+                ``OPD_FULL_TEACHER_INDEX_FIELD``). The full-vocabulary MOPD loss
+                projects each row's teacher payload with them. They ride this
+                argument rather than the data dict because the sequence-packing
+                wrapper batch-slices every data entry, and rather than the loss
+                object because that is pickled to workers.
         """
         self.loss_fn = loss_fn
         self.cfg = cfg
@@ -588,7 +607,8 @@ class LossPostProcessor:
         self.cp_normalize = cp_normalize
         self.sampling_params = sampling_params
         self.prepare_fn = prepare_fn
-        self.teacher_output_layer_weight = teacher_output_layer_weight
+        self.defer_draft_normalization = defer_draft_normalization
+        self.teacher_output_layer_weight_by_index = teacher_output_layer_weight_by_index
         if draft_model is not None and draft_model.eagle_module is not None:
             self.d2t = getattr(draft_model.eagle_module, "d2t", None)
         else:
@@ -626,7 +646,7 @@ class LossPostProcessor:
                 sampling_params=self.sampling_params,
                 d2t=self.d2t,
                 chunk_size=logprob_chunk_size,
-                teacher_output_layer_weight=self.teacher_output_layer_weight,
+                teacher_output_layer_weight_by_index=self.teacher_output_layer_weight_by_index,
             )
 
         # wrap loss function with loss input preparation
@@ -687,6 +707,7 @@ class LossPostProcessor:
                             DEFAULT_DRAFT_TOKEN_CHUNK_SIZE,
                         )
                     ),
+                    defer_normalization=self.defer_draft_normalization,
                 )
         else:
             loss_fn_wrapped = partial(
@@ -713,6 +734,7 @@ class LossPostProcessor:
                             DEFAULT_DRAFT_TOKEN_CHUNK_SIZE,
                         )
                     ),
+                    defer_normalization=self.defer_draft_normalization,
                 )
 
         loss_fn_wrapped = partial(
