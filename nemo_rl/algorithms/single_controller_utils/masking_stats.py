@@ -39,7 +39,10 @@ placeholder rows are reported but do not dilute the fractions.
   each population, omitted when the population is empty, so the effect of
   masking on the reward signal is visible.
 * ``masking/groups``, ``masking/groups_lt2_trained_frac``: GRPO groups in the
-  step and the fraction left with fewer than two trained rows (no gradient).
+  step and the fraction left with fewer than two trained rows. With
+  ``grpo.masked_sample_rewards_in_baseline`` off those groups get no gradient;
+  with it on, a lone trained row can still be scored against reinstated
+  siblings.
 """
 
 from __future__ import annotations
