@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import datetime
 import hashlib
 import json
 import os
@@ -504,7 +505,14 @@ def setup_distributed(config) -> None:
     # Ensure clean slate before import
     destroy_parallel_state()
     # Initialize process group
-    torch.distributed.init_process_group("nccl")
+    # Raise the 10-minute NCCL watchdog (override: NRL_NCCL_TIMEOUT_MINUTES) so transient
+    # first-hit stalls (e.g. triton JIT) don't SIGABRT ranks waiting on peers.
+    # Subgroups inherit it unless mcore sets one explicitly (see setup_model_and_optimizer).
+    timeout_minutes = int(os.environ.get("NRL_NCCL_TIMEOUT_MINUTES", "60"))
+    torch.distributed.init_process_group(
+        "nccl",
+        timeout=datetime.timedelta(minutes=timeout_minutes),
+    )
 
 
 def validate_and_set_config(
@@ -2328,6 +2336,11 @@ def setup_model_and_optimizer(
     state.initialize_async_checkpoint_worker()
 
     megatron_cfg.dist.external_gpu_device_mapping = True
+    # mcore creates the TP/PP/EP/DP subgroups with this explicit timeout (default 10 min),
+    # overriding setup_distributed(); keep both on NRL_NCCL_TIMEOUT_MINUTES.
+    megatron_cfg.dist.distributed_timeout_minutes = int(
+        os.environ.get("NRL_NCCL_TIMEOUT_MINUTES", "60")
+    )
     initialize_megatron(
         cfg=megatron_cfg,
         get_embedding_ranks=get_embedding_ranks,
