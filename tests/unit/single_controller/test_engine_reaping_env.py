@@ -158,3 +158,9 @@ class TestTheClusterLauncher:
             f"expected ray.sub to default {FLAG} with `:-` rather than assign it, so an "
             "operator debugging a wedged engine can keep the corpse."
         )
+
+    def test_container_environment_forwarding_is_optional(self):
+        ray_sub = self.RAY_SUB.read_text()
+
+        assert 'if [[ -n "${CONTAINER_ENV_VARS:-}" ]]; then' in ray_sub
+        assert 'COMMON_SRUN_ARGS+=" --container-env=$CONTAINER_ENV_VARS"' in ray_sub

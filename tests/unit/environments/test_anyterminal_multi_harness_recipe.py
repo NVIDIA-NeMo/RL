@@ -20,6 +20,14 @@ SUPER_SYNC_8N_RECIPE = (
     REPO_ROOT
     / "examples/nemo_gym/grpo_anyterminal_multi_harness_nemotron_super_omni_sync_8n_single_controller.yaml"
 )
+SUPER_SYNC_3N_DEBUG_RECIPE = (
+    REPO_ROOT
+    / "examples/nemo_gym/grpo_anyterminal_multi_harness_nemotron_super_omni_sync_3n_debug_single_controller.yaml"
+)
+SUPER_SYNC_4N_DEBUG_RECIPE = (
+    REPO_ROOT
+    / "examples/nemo_gym/grpo_anyterminal_multi_harness_nemotron_super_omni_sync_4n_debug_single_controller.yaml"
+)
 
 
 def test_anyterminal_multi_harness_recipe_resolves_async_training_contract():
@@ -134,3 +142,24 @@ def test_super_omni_sync_8n_recipe_resolves_synchronous_topology():
             "anyterminal_hermes",
         ]
     }
+
+
+def test_super_omni_sync_debug_recipes_keep_native_context_and_minimum_training_shape():
+    register_omegaconf_resolvers()
+
+    for recipe, nodes, generation_nodes in (
+        (SUPER_SYNC_3N_DEBUG_RECIPE, 3, 1),
+        (SUPER_SYNC_4N_DEBUG_RECIPE, 4, 2),
+    ):
+        config = OmegaConf.to_container(load_config(recipe), resolve=True)
+
+        assert config["cluster"]["num_nodes"] == nodes
+        assert config["policy"]["generation"]["colocated"]["resources"] == {
+            "gpus_per_node": 8,
+            "num_nodes": generation_nodes,
+        }
+        assert config["policy"]["max_total_sequence_length"] == 16384
+        assert config["policy"]["generation"]["max_new_tokens"] == 16384
+        assert config["grpo"]["num_prompts_per_step"] == 4
+        assert config["grpo"]["num_generations_per_prompt"] == 2
+        assert config["policy"]["train_global_batch_size"] == 8
