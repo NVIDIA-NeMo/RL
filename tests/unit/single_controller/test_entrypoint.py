@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import io
+import sys
 from argparse import Namespace
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -232,3 +234,16 @@ def test_main_passes_processor_for_vlm(
     setup_single_controller.assert_called_once_with(
         main_context.config, "vlm-tokenizer", processor=processor
     )
+
+
+def test_main_line_buffers_driver_stdout(
+    main_context: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Forwarded actor prints must not sit in a block buffer when stdout is a file."""
+    stdout = io.TextIOWrapper(io.BytesIO())
+    monkeypatch.setattr(sys, "stdout", stdout)
+
+    run_grpo_single_controller.main()
+
+    assert stdout.line_buffering
