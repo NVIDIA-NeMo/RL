@@ -123,6 +123,33 @@ def test_resolve_optimizer_fp8_moment_dtypes():
 
 
 @pytest.mark.mcore
+def test_sync_consumed_samples_on_scheduler_load_survives_bridge_override():
+    """Bridge overwrites num_steps with consumed_train_samples after loading the scheduler."""
+    from nemo_rl.models.megatron.setup import _sync_consumed_samples_on_scheduler_load
+
+    class _Scheduler:
+        num_steps = 0
+
+        def load_state_dict(self, state_dict):
+            self.num_steps = state_dict["num_steps"]
+
+    scheduler = _Scheduler()
+    state = SimpleNamespace(train_state=None)
+
+    with _sync_consumed_samples_on_scheduler_load(state, scheduler):
+        # Bridge's load order: train_state from the checkpoint (0 in checkpoints
+        # saved before the save-side fix), then the scheduler, then the
+        # override_opt_param_scheduler copy.
+        state.train_state = SimpleNamespace(consumed_train_samples=0)
+        scheduler.load_state_dict({"num_steps": 96})
+        scheduler.num_steps = state.train_state.consumed_train_samples
+
+    assert scheduler.num_steps == 96
+    assert state.train_state.consumed_train_samples == 96
+    assert "load_state_dict" not in vars(scheduler)
+
+
+@pytest.mark.mcore
 class TestValidateModelPaths:
     """Tests for validate_model_paths function."""
 
