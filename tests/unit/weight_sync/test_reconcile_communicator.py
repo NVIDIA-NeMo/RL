@@ -170,7 +170,12 @@ def _rebuildable(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_siz
             refit_payload_modes.append(refit_payload_mode) or {"model.weight": object()}
         ),
         refit_payload_modes=refit_payload_modes,
-        init_collective=lambda ip, port, world_size, *, train_world_size, nccl_peer=None: (
+        init_collective=lambda ip,
+        port,
+        world_size,
+        *,
+        train_world_size,
+        nccl_peer=None: (
             policy_calls.append(
                 {
                     "ip": ip,
