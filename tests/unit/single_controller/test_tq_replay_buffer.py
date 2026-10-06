@@ -733,7 +733,8 @@ class TestTQReplayBufferReserveCommit:
         assert buf.end_weight_list == [4]
         assert buf.ready_list == [True]
         assert buf.meta_list[0].sample_ids == meta.sample_ids
-        # TQ tags preserve both dispatch-time weight and dataset identity.
+        # Preserve dispatch-time weight, dataset/category identity, and the
+        # prompt-group key the advantage stage reduces over.
         assert (
             meta.tags
             == [
@@ -741,6 +742,7 @@ class TestTQReplayBufferReserveCommit:
                     "weight_version": 3,
                     "prompt_idx": 418,
                     "rollout_category": "ifbench",
+                    "group_id": group_id,
                 }
             ]
             * _N_GENS
