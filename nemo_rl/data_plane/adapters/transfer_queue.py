@@ -745,7 +745,9 @@ def _simple_storage_node_ids(placement: str) -> list[str]:
 
     train = pg_nodes("sc_train_cluster") | pg_nodes("sc_policy_cluster")
     inference = pg_nodes("sc_inference_cluster") | pg_nodes("sc_policy_cluster")
-    alive = {n["NodeID"] for n in ray.nodes() if n["Alive"] and n["Resources"].get("GPU")}
+    alive = {
+        n["NodeID"] for n in ray.nodes() if n["Alive"] and n["Resources"].get("GPU")
+    }
     return sorted(
         {
             "train": train,
@@ -789,7 +791,9 @@ def _init_tq(cfg: DataPlaneConfig, *, checkpointing: bool = False) -> None:
         placement = (simple_cfg.model_extra or {}).get("storage_unit_placement")
         if placement:
             node_ids = _simple_storage_node_ids(placement)
-            print(f"[su-place] {placement}: {len(node_ids)} nodes {node_ids}", flush=True)
+            print(
+                f"[su-place] {placement}: {len(node_ids)} nodes {node_ids}", flush=True
+            )
             if not node_ids:
                 raise RuntimeError(f"[su-place] no nodes for {placement!r}")
             overlay["backend"]["SimpleStorage"]["node_ids"] = node_ids
@@ -866,12 +870,12 @@ def _init_tq(cfg: DataPlaneConfig, *, checkpointing: bool = False) -> None:
                 hard_pin=True, offload={"enabled": False}
             )
     elif backend == "nixl":
-        # The NIXL data plane's TransferQueue backend (nemo_rl.data_plane.nixl): CPU NixlStorageUnit actors own
+        # The NIXL data plane's TransferQueue backend (adapters/tq_nixl.py): CPU NixlStorageUnit actors own
         # pinned-DRAM slabs, every other process is a client doing one-sided
         # NIXL RDMA. Importing the plug-in registers "NixlStore" with TQ's
         # manager / client / bootstrap registries; the bootstrap provider
         # starts the units and the BlobDirectory inside tq.init.
-        import nemo_rl.data_plane.nixl.tq  # noqa: F401
+        import nemo_rl.data_plane.adapters.tq_nixl  # noqa: F401
 
         nixl_cfg = backend_config(cfg)
         block = nixl_cfg.model_dump()
@@ -1038,7 +1042,7 @@ class TQDataPlaneClient(DataPlaneClient):
         if cfg["backend"] == "nixl":
             # Workers attach with tq.init() and need TQ's registries to know
             # "NixlStore" before the client's storage manager is built.
-            import nemo_rl.data_plane.nixl.tq  # noqa: F401
+            import nemo_rl.data_plane.adapters.tq_nixl  # noqa: F401
 
         self._backend = cfg["backend"]
         self._supports_checkpointing = data_plane_supports_checkpointing(cfg)

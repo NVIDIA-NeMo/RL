@@ -26,7 +26,7 @@ import ray
 import torch
 from tensordict import TensorDict
 
-from tests.unit.data_plane.nixl._helpers import dense
+from tests.unit.data_plane._nixl_helpers import dense
 
 pytestmark = pytest.mark.nixl
 
@@ -39,8 +39,8 @@ REPO = Path(
 def file_system(ray_cluster):
     import transfer_queue as tq
 
-    import nemo_rl.data_plane.nixl.tq  # noqa: F401
-    from tests.unit.data_plane.nixl._helpers import make_tq_conf
+    import nemo_rl.data_plane.adapters.tq_nixl  # noqa: F401
+    from tests.unit.data_plane._nixl_helpers import make_tq_conf
 
     root = REPO / ".nvdp_store" / f"test-{uuid.uuid4().hex[:8]}"
     conf = make_tq_conf(namespace="nvdp-file")
@@ -48,7 +48,7 @@ def file_system(ray_cluster):
     tq.init(conf)
     yield conf, root
     tq.close()
-    nemo_rl.data_plane.nixl.tq.shutdown(conf)
+    nemo_rl.data_plane.adapters.tq_nixl.shutdown(conf)
     for p in root.glob("*"):
         p.unlink()
     root.rmdir()
@@ -108,7 +108,7 @@ def test_cross_process_read(file_system):
     @ray.remote(num_cpus=1)
     class Reader:
         def __init__(self):
-            import nemo_rl.data_plane.nixl.tq  # noqa: F401
+            import nemo_rl.data_plane.adapters.tq_nixl  # noqa: F401
             import transfer_queue as tq
 
             tq.init()

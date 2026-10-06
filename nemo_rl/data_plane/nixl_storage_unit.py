@@ -17,7 +17,8 @@ Passive on the data path: clients WRITE and READ one-sided. The unit only
 serves small control RPCs (alloc, resolve, release) and tracks pins and
 refcounts so a region is never reused under an in-flight read.
 
-Phase A keeps the allocator here; Phase B moves it to the catalog.
+Started by :func:`nemo_rl.data_plane.adapters.tq_nixl.initialize_nixl_storage`;
+the store-side pieces it uses live in :mod:`nemo_rl.data_plane.nixl`.
 """
 
 from __future__ import annotations
@@ -33,11 +34,12 @@ from typing import Any
 import numpy as np
 import ray
 
-from nemo_rl.data_plane.nixl import codec, numa
+from nemo_rl.data_plane.nixl import blob_format
 from nemo_rl.data_plane.nixl.control import UnitServer
 from nemo_rl.data_plane.nixl.allocator import SlabAllocator
 from nemo_rl.data_plane.nixl.errors import UnitFull
 from nemo_rl.data_plane.nixl.nixl_io import NixlEndpoint
+from nemo_rl.distributed import numa_utils
 
 
 @dataclass
@@ -92,14 +94,15 @@ class NixlStorageUnit:
     ) -> None:
         self.unit_id = int(unit_id)
         self.read_pin_s = float(read_pin_s)
-        # Socket binding (nemo_rl/data_plane/nixl/numa.py): pin threads, slab pages and NICs
-        # to one socket when the node has more than one; a no-op otherwise.
+        # Socket binding (nemo_rl/distributed/numa_utils.py): with numa=auto on a node
+        # with >= 2 sockets, the k-th unit on the node (numa_index) pins its threads
+        # and slab pages to socket k % sockets; a no-op on single-socket nodes.
         self.numa_node: int | None = None
         nixl_init_params = dict(nixl_init_params or {})
-        sockets = numa.cpu_nodes() if numa_mode == "auto" else {}
+        sockets = numa_utils.cpu_nodes() if numa_mode == "auto" else {}
         if len(sockets) >= 2:
             node = sorted(sockets)[int(numa_index) % len(sockets)]
-            numa.bind_process(sockets[node])
+            numa_utils.bind_process(sockets[node])
             # No NIC restriction: limiting a unit to its socket's rails broke
             # cross-node endpoint creation with clients on other rails (86n job
             # 1072049: "UCX endpoint create failed", NIXL_ERR_BACKEND). CPU and
@@ -108,7 +111,7 @@ class NixlStorageUnit:
         self._nics = nixl_init_params.get("device_list", "env")
         self.slab = np.empty(int(slab_bytes), dtype=np.uint8)
         if self.numa_node is not None:
-            numa.first_touch(self.slab)
+            numa_utils.first_touch(self.slab)
         self.alloc_ = SlabAllocator(int(slab_bytes))
         self.ep = NixlEndpoint(
             f"unit-{self.unit_id}-{uuid.uuid4().hex[:6]}",
@@ -252,7 +255,11 @@ class NixlStorageUnit:
         out = []
         for b, rec in self.blobs.items():
             tail = memoryview(self.slab)[rec.off : rec.off + rec.nbytes]
-            entries = codec.read_index(tail) if codec.footer_is_valid(tail) else []
+            entries = (
+                blob_format.read_index(tail)
+                if blob_format.footer_is_valid(tail)
+                else []
+            )
             out.append(
                 {
                     "blob_id": b,

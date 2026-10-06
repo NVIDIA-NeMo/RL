@@ -20,12 +20,19 @@ environment variable. See ray.sub for the writer side.
 
 Disable all binding with NRL_DISABLE_NUMA_BINDING=1.
 Disable only memory policy with NRL_DISABLE_NUMA_MEMBIND=1.
+
+Socket helpers (``cpu_nodes`` ... ``first_touch``) serve CPU-only processes
+such as the NIXL data plane's storage units, which have no GPU to key on. A
+*socket* is a NUMA node that has CPUs, read from sysfs; the CPU-less nodes
+Grace systems expose for GPU memory are ignored, so a GB200/GB300 tray or a
+2-socket x86 node has 2 sockets and a GH200 node has 1.
 """
 
 import ctypes
 import ctypes.util
 import logging
 import os
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -179,3 +186,48 @@ def _parse_cpulist(cpulist: str) -> set[int]:
         else:
             cpus.add(int(part))
     return cpus
+
+
+# ----------------------------------------------------------------------------- sockets
+NODE_ROOT = "/sys/devices/system/node"
+
+
+def cpu_nodes(root: str = NODE_ROOT) -> dict[int, set[int]]:
+    """NUMA node id -> CPUs, for nodes that have CPUs (i.e. sockets)."""
+    out: dict[int, set[int]] = {}
+    for d in Path(root).glob("node[0-9]*"):
+        f = d / "cpulist"
+        text = f.read_text().strip() if f.exists() else ""
+        if text:
+            out[int(d.name[4:])] = _parse_cpulist(text)
+    return out
+
+
+def socket_of_affinity(nodes: dict[int, set[int]] | None = None) -> int | None:
+    """The socket this process is pinned inside, or ``None`` if it spans several."""
+    nodes = cpu_nodes() if nodes is None else nodes
+    aff = os.sched_getaffinity(0)
+    for node, cpus in nodes.items():
+        if aff and aff <= cpus:
+            return node
+    return None
+
+
+def bind_process(cpus: set[int]) -> None:
+    """Pin every thread of this process (and threads it creates later) to ``cpus``."""
+    for tid in os.listdir("/proc/self/task"):
+        try:
+            os.sched_setaffinity(int(tid), cpus)
+        except OSError:
+            pass
+
+
+def first_touch(arr) -> None:
+    """Fault every page of ``arr`` from the current (pinned) thread.
+
+    The kernel's default first-touch policy then places the pages on this socket.
+    """
+    step = os.sysconf("SC_PAGE_SIZE")
+    flat = arr.reshape(-1).view("uint8")
+    flat[::step] = 0
+    flat[-1:] = 0

@@ -28,13 +28,13 @@ from tensordict import TensorDict
 pytestmark = [pytest.mark.nixl, pytest.mark.gpu]
 
 
-from tests.unit.data_plane.nixl._helpers import dense as _dense
+from tests.unit.data_plane._nixl_helpers import dense as _dense
 
 
 @ray.remote(num_cpus=1, num_gpus=1)
 class GpuRank:
     def __init__(self, rank: int):
-        import nemo_rl.data_plane.nixl.tq  # noqa: F401
+        import nemo_rl.data_plane.adapters.tq_nixl  # noqa: F401
         import transfer_queue as tq
 
         tq.init()

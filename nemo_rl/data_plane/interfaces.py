@@ -142,7 +142,9 @@ class NixlStoreConfig(BaseModel, extra="allow"):
     transfer_timeout_s: float = 120.0
     placement: dict[str, Any] = Field(default_factory=lambda: {"policy": "local_first"})
     store: dict[str, Any] = Field(default_factory=lambda: {"kind": "unit"})
-    nixl: dict[str, Any] = Field(default_factory=lambda: {"backend_name": "UCX", "backend_init_params": {}})
+    nixl: dict[str, Any] = Field(
+        default_factory=lambda: {"backend_name": "UCX", "backend_init_params": {}}
+    )
 
 
 class DataPlaneConfig(TypedDict):

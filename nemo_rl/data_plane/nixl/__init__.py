@@ -11,10 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""the NIXL data plane: NIXL-backed storage for RL trajectory columns.
+"""Store side of the NIXL data plane (``data_plane.backend: nixl``).
 
-Phase A ships as a TransferQueue storage backend. Import ``nemo_rl.data_plane.nixl.tq``
-before ``transfer_queue.init`` to register the ``NixlStore`` backend.
+Blob layout, slab allocator, blob directory, placement, the ZMQ control plane,
+the NIXL endpoint and the client buffer pool. The storage-unit actor is
+:mod:`nemo_rl.data_plane.nixl_storage_unit`; the TransferQueue glue (client,
+manager, bootstrap) is :mod:`nemo_rl.data_plane.adapters.tq_nixl` and the
+checkpoint path :mod:`nemo_rl.data_plane.adapters.tq_nixl_checkpoint`.
 """
 
 from nemo_rl.data_plane.nixl.errors import DataPlaneLostKeys, UnitFull

@@ -11,43 +11,67 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""NixlKVClient: TransferQueue ``StorageKVClient`` over a :class:`BlobStore`.
+"""TransferQueue glue for the NIXL data plane (``data_plane.backend: nixl``).
 
-``put`` lays all values of one call out as raw bytes in one blob in a
-registered local buffer and hands it to the store; the returned per-key
-*placement-free* location meta ``{"b": blob_id, "o": off, "n": len,
-"k": kind, "d": dtype, "s": shape, ...store extras}`` is what TQ stores as
+Importing this module registers the ``NixlStore`` backend with TransferQueue:
+
+- ``StorageClientFactory["NixlStoreClient"]`` -> :class:`NixlKVClient`
+- ``StorageManagerFactory["NixlStore"]`` -> :class:`NixlStorageManager`
+- ``StorageBootstrapProvider["NixlStore"]`` -> :func:`initialize_nixl_storage`
+
+**Client.** ``put`` lays all values of one call out as raw bytes in one blob and
+hands it to the store (:mod:`nemo_rl.data_plane.nixl`); the returned per-key
+*placement-free* location meta ``{"b": blob_id, "o": off, "n": len, "k": kind,
+"d": dtype, "s": shape, ...store extras}`` is what TQ stores as
 ``custom_backend_meta``. ``get`` asks the store to fill byte ranges and
 reconstructs from that meta, not from TQ's field schema, so a TQ shape bug
-cannot corrupt a read. ``clear`` releases entry refcounts.
+cannot corrupt a read. ``clear`` releases entry refcounts. All NIXL access
+happens under one lock: the TQ KV manager calls ``put`` from executor threads
+and ``get`` from its event loop.
 
-Where the bytes live (unit slabs over RDMA, files on Lustre, ...) is the
-store's concern (``store.kind`` in config). All NIXL access happens under
-one lock: the TQ KV manager calls ``put`` from executor threads and ``get``
-from its event loop.
+**Bootstrap.** Called once by ``transfer_queue.init`` in the process that
+creates the TQ controller: starts the BlobDirectory and the storage units
+(:mod:`nemo_rl.data_plane.nixl_storage_unit`). Placement is SimpleStorage style
+(``num_storage_units`` round-robin over eligible nodes) or per node
+(``storage_units_per_node`` on each node of ``node_ids``, which the caller
+resolves from ``storage_unit_placement``). ``transfer_queue.close`` does not stop
+third-party backends, so the owner calls :func:`shutdown` after it.
+
+**Manager.** Everything on the data path is inherited from ``KVStorageManager``;
+checkpointing goes through :mod:`nemo_rl.data_plane.adapters.tq_nixl_checkpoint`.
 """
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import threading
 import time
 import uuid
-from typing import Any
+from typing import Any, Iterable
 
 import numpy as np
 import ray
 import torch
+from ray.util.placement_group import placement_group_table
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+from transfer_queue.storage.bootstrap.provider import StorageBootstrapProvider
 from transfer_queue.storage.clients.base import StorageClientFactory, StorageKVClient
+from transfer_queue.storage.managers.base import KVStorageManager, StorageManagerFactory
 
-from nemo_rl.data_plane.nixl import codec, numa
+from nemo_rl.data_plane.adapters import tq_nixl_checkpoint
+from nemo_rl.data_plane.nixl import blob_format
 from nemo_rl.data_plane.nixl.blobstore import LostBlobs, UnitSlabStore, make_store
 from nemo_rl.data_plane.nixl.bufpool import BufferPool
+from nemo_rl.data_plane.nixl.directory import BlobDirectory
 from nemo_rl.data_plane.nixl.errors import DataPlaneLostKeys, StaleRead
 from nemo_rl.data_plane.nixl.nixl_io import NixlEndpoint
 from nemo_rl.data_plane.nixl.placement import make_placement
+from nemo_rl.data_plane.nixl_storage_unit import NixlStorageUnit
+from nemo_rl.distributed import numa_utils
 
+BACKEND_NAME = "NixlStore"
 DEFAULT_NAMESPACE = "nemo_rl_nixl"
 
 
@@ -116,14 +140,14 @@ class NixlKVClient(StorageKVClient):
         nixl_cfg = _as_dict(cfg.get("nixl") or {})
         store_cfg = _as_dict(cfg.get("store") or {})
         kind = store_cfg.get("kind", "unit")
-        # Socket binding (nemo_rl/data_plane/nixl/numa.py): a client already pinned inside
-        # one socket uses that socket's NICs and writes to its socket's unit.
+        # Socket binding (nemo_rl/distributed/numa_utils.py): a client already pinned
+        # inside one socket writes to its socket's unit first.
         init_params = dict(nixl_cfg.get("backend_init_params") or {})
         self.numa: int | None = None
-        sockets = numa.cpu_nodes() if cfg.get("numa", "auto") == "auto" else {}
+        sockets = numa_utils.cpu_nodes() if cfg.get("numa", "auto") == "auto" else {}
         if len(sockets) >= 2:
-            # Socket-first placement only; NICs are not restricted (see storage_unit).
-            self.numa = numa.socket_of_affinity(sockets)
+            # Socket-first placement only; NICs are not restricted (see nixl_storage_unit).
+            self.numa = numa_utils.socket_of_affinity(sockets)
         self.ep = NixlEndpoint(
             f"client-{os.getpid()}-{uuid.uuid4().hex[:6]}",
             backend=nixl_cfg.get("backend_name", "UCX"),
@@ -193,12 +217,12 @@ class NixlKVClient(StorageKVClient):
         if isinstance(self.store, UnitSlabStore):
             blob_id = uuid.uuid4().hex
             # The blob id rides in the footer tag so RPC-free readers can verify it.
-            p = codec.plan(keys, values, tag=bytes.fromhex(blob_id))
+            p = blob_format.plan(keys, values, tag=bytes.fromhex(blob_id))
             blob_id, extra = self._put_segments(p, blob_id)
         else:  # file store: one contiguous blob
-            p = codec.plan(keys, values)
+            p = blob_format.plan(keys, values)
             with self.pool.acquire(p.nbytes) as (base, buf):
-                codec.write(p, memoryview(buf)[: p.nbytes])
+                blob_format.write(p, memoryview(buf)[: p.nbytes])
                 with self._lock:
                     blob_id, extra = self.store.put(base, p)
         return [{"b": blob_id, **e.meta(), **extra} for e in p.entries]
@@ -213,13 +237,13 @@ class NixlKVClient(StorageKVClient):
             base = base.base
         return int(getattr(base, "nbytes", 0) or 0)
 
-    def _zero_copy_ok(self, e: codec.Entry, mv: memoryview, owner: Any) -> bool:
+    def _zero_copy_ok(self, e: blob_format.Entry, mv: memoryview, owner: Any) -> bool:
         # Gated on the *backing allocation*, not the value: registration is only
         # cheap for ranges UCX has cached, i.e. reused heap allocations. Rows that
         # slice one big freshly mmap'd tensor (a 256 MB batch -> 16 x 16 MB rows)
         # cost ~1-2 ms each to register (bench: 256 MB put 33 -> 51 ms).
         return (
-            e.kind in (codec.KIND_TENSOR, codec.KIND_NUMPY)
+            e.kind in (blob_format.KIND_TENSOR, blob_format.KIND_NUMPY)
             and self.zero_copy_min <= e.len <= self.zero_copy_max
             and self._backing_bytes(owner) <= self.zero_copy_max
             and not mv.readonly
@@ -227,7 +251,7 @@ class NixlKVClient(StorageKVClient):
         )
 
     def _put_segments(
-        self, p: codec.BlobPlan, blob_id: str
+        self, p: blob_format.BlobPlan, blob_id: str
     ) -> tuple[str, dict[str, Any]]:
         """Lay out a blob without building it.
 
@@ -244,11 +268,11 @@ class NixlKVClient(StorageKVClient):
             for e, mv in zip(p.entries, p.buffers)
             if e.len and id(e) not in zero_ids
         ]
-        tail = len(p.index_bytes) + codec.FOOTER_SIZE
+        tail = len(p.index_bytes) + blob_format.FOOTER_SIZE
         layout, cur = [], 0
         for e, mv in packed:
             layout.append((e, mv, cur))
-            cur = codec._align_up(cur + e.len)
+            cur = blob_format._align_up(cur + e.len)
         tail_off = cur
         packed_bytes = tail_off + tail
 
@@ -261,7 +285,7 @@ class NixlKVClient(StorageKVClient):
                         buf[at : at + e.len], mv.cast("B"), self.parallel_copy_min
                     )
                     segments.append((base + at, e.off, e.len))
-                codec.write_tail(p, memoryview(buf)[tail_off : tail_off + tail])
+                blob_format.write_tail(p, memoryview(buf)[tail_off : tail_off + tail])
                 segments.append((base + tail_off, p.index_off, tail))
                 with self._lock:
                     for e, mv in zero:
@@ -308,8 +332,8 @@ class NixlKVClient(StorageKVClient):
         total = sum(int(m["n"]) for m in metas)
         # Room after the payload for one footer per blob: the RPC-free read path
         # fetches each blob's footer with the data and checks its tag.
-        foot_at = codec._align_up(total)
-        foot_len = len(by_blob) * codec.FOOTER_SIZE
+        foot_at = blob_format._align_up(total)
+        foot_len = len(by_blob) * blob_format.FOOTER_SIZE
         with self.pool.acquire(foot_at + foot_len) as (lbase, lbuf):
             lview = memoryview(lbuf)
             scratch = (lbase + foot_at, lview[foot_at : foot_at + foot_len])
@@ -334,10 +358,10 @@ class NixlKVClient(StorageKVClient):
                 keys_lost = [keys[i] for b in e.blob_ids for i in by_blob.get(b, [])]
                 raise DataPlaneLostKeys(keys_lost or list(keys), reason=e.reason) from e
             return [
-                codec.materialize(
-                    codec.decode_entry(
+                blob_format.materialize(
+                    blob_format.decode_entry(
                         lview[local_off[i] : local_off[i] + int(m["n"])],
-                        codec.Entry.from_meta(k, m),
+                        blob_format.Entry.from_meta(k, m),
                     )
                 )
                 for i, (k, m) in enumerate(zip(keys, metas))
@@ -362,3 +386,174 @@ class NixlKVClient(StorageKVClient):
         with self._lock:
             self.store.close()
             self.ep.close()
+
+
+# ============================================================================ bootstrap
+def _unit_name(i: int) -> str:
+    return f"NixlStorageUnit#{i}"
+
+
+# ----------------------------------------------------------------------------- node selection
+def alive_node_ids(required_node_resource: str | None = None) -> list[str]:
+    ids = sorted(
+        n["NodeID"]
+        for n in ray.nodes()
+        if n.get("Alive", False)
+        and (
+            required_node_resource is None
+            or n.get("Resources", {}).get(required_node_resource, 0) > 0
+        )
+    )
+    if not ids:
+        raise RuntimeError("No alive Ray nodes found. Is Ray initialized?")
+    return ids
+
+
+def placement_group_node_ids(placement_groups: Iterable[Any]) -> list[str]:
+    """Ray node ids occupied by the given placement groups (one GCS read).
+
+    Pass the inference and/or train clusters' placement groups to implement
+    ``storage_unit_placement: all | inference | train``.
+    """
+    table = placement_group_table()
+    return sorted(
+        {
+            node_id
+            for pg in placement_groups
+            for node_id in table[pg.id.hex()]["bundles_to_node_id"].values()
+        }
+    )
+
+
+def unit_node_ids(cfg: dict[str, Any]) -> list[str]:
+    """One node id per unit to create, from the backend config block."""
+    nodes = list(cfg.get("node_ids") or []) or alive_node_ids(
+        cfg.get("required_node_resource")
+    )
+    per_node = cfg.get("storage_units_per_node")
+    if per_node:
+        return [n for n in nodes for _ in range(int(per_node))]
+    total = int(cfg.get("num_storage_units", 2))
+    return [nodes[i % len(nodes)] for i in range(total)]
+
+
+# ----------------------------------------------------------------------------- lifecycle
+def _kill_named(name: str, namespace: str) -> bool:
+    try:
+        h = ray.get_actor(name, namespace=namespace)
+    except ValueError:
+        return False
+    ray.kill(h, no_restart=True)
+    return True
+
+
+def shutdown(conf_or_backend_cfg: Any) -> None:
+    """Kill the BlobDirectory and every storage unit of a NixlStore system.
+
+    Units are named ``NixlStorageUnit#<i>``; kill consecutively until a name
+    is missing, so a larger earlier system in the same namespace is swept too.
+    """
+    cfg = conf_or_backend_cfg
+    if hasattr(cfg, "backend"):
+        cfg = cfg.backend.NixlStore
+    cfg = _as_dict(cfg)
+    namespace = cfg.get("namespace", DEFAULT_NAMESPACE)
+    i = 0
+    while _kill_named(_unit_name(i), namespace):
+        i += 1
+    _kill_named(cfg.get("directory_name", "BlobDirectory"), namespace)
+
+
+@StorageBootstrapProvider.register_provider("NixlStore")
+def initialize_nixl_storage(conf: Any) -> dict[str, Any]:
+    cfg = _as_dict(conf.backend.NixlStore)
+    namespace = cfg.get("namespace", DEFAULT_NAMESPACE)
+    dir_name = cfg.get("directory_name", "BlobDirectory")
+    nixl_cfg = _as_dict(cfg.get("nixl") or {})
+    store_cfg = _as_dict(cfg.get("store") or {})
+    kind = store_cfg.get("kind", "unit")
+
+    # A fresh TQ controller means a fresh data plane: stale named actors from a
+    # previous system in the same namespace would otherwise block creation.
+    shutdown(cfg)
+
+    directory = BlobDirectory.options(name=dir_name, namespace=namespace).remote()
+    handles: dict[str, Any] = {"BlobDirectory": directory}
+
+    if kind == "file":
+        # Actor-less store: one file per blob under store.root (Lustre / NVMe).
+        root = store_cfg.get("root")
+        if not root:
+            raise ValueError(
+                "backend.NixlStore.store.root is required for store.kind='file'"
+            )
+        os.makedirs(root, exist_ok=True)
+    else:
+        units = []
+        per_node: dict[str, int] = {}
+        for i, node_id in enumerate(unit_node_ids(cfg)):
+            numa_index = per_node.get(
+                node_id, 0
+            )  # k-th unit on this node -> socket k % sockets
+            per_node[node_id] = numa_index + 1
+            unit = NixlStorageUnit.options(
+                name=_unit_name(i),
+                namespace=namespace,
+                scheduling_strategy=NodeAffinitySchedulingStrategy(
+                    node_id=node_id, soft=False
+                ),
+            ).remote(
+                i,
+                int(cfg.get("unit_slab_bytes", 1 << 30)),
+                read_pin_s=float(cfg.get("read_pin_s", 60.0)),
+                nixl_backend=nixl_cfg.get("backend_name", "UCX"),
+                nixl_init_params=nixl_cfg.get("backend_init_params") or {},
+                require_rdma=bool(nixl_cfg.get("require_rdma", True)),
+                numa_mode=str(cfg.get("numa", "auto")),
+                numa_index=numa_index,
+                directory=directory,
+            )
+            units.append(unit)
+            handles[_unit_name(i)] = unit
+        infos = ray.get([u.info.remote() for u in units])
+        ray.get([directory.register_unit.remote(info) for info in infos])
+
+    conf.backend.NixlStore.directory_name = dir_name
+    conf.backend.NixlStore.namespace = namespace
+    return handles
+
+
+# ============================================================================ manager
+@StorageManagerFactory.register("NixlStore")
+class NixlStorageManager(KVStorageManager):
+    def __init__(self, controller_info: Any, config: Any, zmq_context: Any = None):
+        cfg = _as_dict(config)
+        cfg["client_name"] = "NixlStoreClient"
+        # Newer TQ offers to share the client's ZMQ context; the pinned SHA does not
+        # take that argument. KV managers only use ZMQ for the controller notify path,
+        # so owning a private context is correct on both.
+        super().__init__(controller_info, cfg)
+
+    # TQ calls these from its client event loop (sync wrappers block on them);
+    # the work is Ray RPCs plus file I/O, so run it off the loop.
+    async def save_checkpoint(self, checkpoint_dir: str) -> None:
+        await asyncio.to_thread(
+            tq_nixl_checkpoint.save_storage_checkpoint,
+            self.storage_client,
+            checkpoint_dir,
+        )
+
+    async def load_checkpoint(self, checkpoint_dir: str) -> None:
+        await asyncio.to_thread(
+            tq_nixl_checkpoint.load_storage_checkpoint,
+            self.storage_client,
+            checkpoint_dir,
+        )
+
+    def close(self) -> None:
+        try:
+            client = getattr(self, "storage_client", None)
+            if client is not None and hasattr(client, "close"):
+                client.close()
+        finally:
+            super().close()

@@ -19,6 +19,29 @@ client (trainer / vLLM / controller)                 NixlStorageUnit (CPU actor)
   clear: ZMQ release_many (fire-and-forget) ───────►  quarantine, then free
 ```
 
+## Code layout
+
+Same split as the Mooncake backend: TransferQueue is imported only under
+`adapters/`, store-side code has no TQ dependency.
+
+```
+nemo_rl/data_plane/
+├── interfaces.py                   NixlStoreConfig (data_plane.nixl block)
+├── adapters/
+│   ├── transfer_queue.py           backend: nixl branch -> imports tq_nixl
+│   ├── tq_nixl.py                  TQ client, storage manager, bootstrap provider
+│   └── tq_nixl_checkpoint.py       storage save / restore (cf. tq_mooncake_checkpoint.py)
+├── nixl_storage_unit.py            CPU Ray actor owning one registered DRAM slab
+└── nixl/                           store side
+    ├── blob_format.py              blob byte layout (index + footer with blob tag)
+    ├── blobstore.py                unit-slab and file stores, hinted reads
+    ├── control.py                  ZMQ ROUTER/DEALER control plane
+    ├── nixl_io.py                  NIXL endpoint, RDMA-only policy check
+    └── allocator.py, directory.py, placement.py, bufpool.py, errors.py
+nemo_rl/distributed/numa_utils.py   socket detection and binding (numa: auto)
+nemo_rl/utils/checkpoint_engines/nixl.py   shared NIXL agent factory
+```
+
 ## Enabling it
 
 ```yaml

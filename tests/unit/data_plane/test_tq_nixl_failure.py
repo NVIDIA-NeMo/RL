@@ -29,14 +29,14 @@ pytestmark = pytest.mark.nixl
 def one_unit_system(ray_cluster):
     import transfer_queue as tq
 
-    import nemo_rl.data_plane.nixl.tq  # noqa: F401
-    from tests.unit.data_plane.nixl._helpers import make_tq_conf
+    import nemo_rl.data_plane.adapters.tq_nixl  # noqa: F401
+    from tests.unit.data_plane._nixl_helpers import make_tq_conf
 
     conf = make_tq_conf(num_units=1, namespace="nvdp-failure")
     tq.init(conf)
     yield conf
     tq.close()
-    nemo_rl.data_plane.nixl.tq.shutdown(conf)
+    nemo_rl.data_plane.adapters.tq_nixl.shutdown(conf)
 
 
 def test_lost_keys_when_unit_dies(one_unit_system):

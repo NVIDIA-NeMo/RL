@@ -17,26 +17,28 @@ import numpy as np
 import pytest
 import torch
 
-from nemo_rl.data_plane.nixl import codec
+from nemo_rl.data_plane.nixl import blob_format
 
 
 def _roundtrip(keys, values):
-    p = codec.plan(keys, values)
+    p = blob_format.plan(keys, values)
     buf = np.empty(p.nbytes, dtype=np.uint8)
-    codec.write(p, memoryview(buf))
-    idx = codec.read_index(memoryview(buf))
+    blob_format.write(p, memoryview(buf))
+    idx = blob_format.read_index(memoryview(buf))
     assert [e.key for e in idx] == [str(k) for k in keys]
     assert idx == p.entries
     out = [
-        codec.materialize(codec.decode_entry(memoryview(buf)[e.off : e.off + e.len], e))
+        blob_format.materialize(
+            blob_format.decode_entry(memoryview(buf)[e.off : e.off + e.len], e)
+        )
         for e in idx
     ]
     # the per-key meta TQ stores must reconstruct identically
     out2 = [
-        codec.materialize(
-            codec.decode_entry(
+        blob_format.materialize(
+            blob_format.decode_entry(
                 memoryview(buf)[e.off : e.off + e.len],
-                codec.Entry.from_meta(e.key, e.meta()),
+                blob_format.Entry.from_meta(e.key, e.meta()),
             )
         )
         for e in idx
@@ -125,12 +127,12 @@ def test_jagged_rows_as_separate_entries():
 
 
 def test_materialized_values_do_not_alias_buffer():
-    p = codec.plan(["k"], [torch.ones(4)])
+    p = blob_format.plan(["k"], [torch.ones(4)])
     buf = np.empty(p.nbytes, dtype=np.uint8)
-    codec.write(p, memoryview(buf))
+    blob_format.write(p, memoryview(buf))
     e = p.entries[0]
-    view = codec.decode_entry(memoryview(buf)[e.off : e.off + e.len], e)
-    out = codec.materialize(view)
+    view = blob_format.decode_entry(memoryview(buf)[e.off : e.off + e.len], e)
+    out = blob_format.materialize(view)
     buf[e.off : e.off + e.len] = 0
     assert torch.equal(view, torch.zeros(4))  # the view aliases the buffer
     assert torch.equal(out, torch.ones(4))  # the materialized copy does not
@@ -144,20 +146,22 @@ def test_cuda_tensor_is_copied_to_host_bytes():
 
 
 def test_footer_and_version():
-    p = codec.plan(["k"], [torch.ones(2)])
+    p = blob_format.plan(["k"], [torch.ones(2)])
     buf = np.zeros(p.nbytes, dtype=np.uint8)
-    assert not codec.footer_is_valid(memoryview(buf))
-    codec.write(p, memoryview(buf))
-    assert codec.footer_is_valid(memoryview(buf))
-    buf[-codec.FOOTER_SIZE] ^= 0xFF  # magic: first field of the (v3, 32-byte) footer
-    assert not codec.footer_is_valid(memoryview(buf))
+    assert not blob_format.footer_is_valid(memoryview(buf))
+    blob_format.write(p, memoryview(buf))
+    assert blob_format.footer_is_valid(memoryview(buf))
+    buf[-blob_format.FOOTER_SIZE] ^= (
+        0xFF  # magic: first field of the (v3, 32-byte) footer
+    )
+    assert not blob_format.footer_is_valid(memoryview(buf))
     with pytest.raises(ValueError):
-        codec.read_index(memoryview(buf))
+        blob_format.read_index(memoryview(buf))
 
 
 def test_write_needs_room_and_length_mismatch():
-    p = codec.plan(["k"], [torch.ones(2)])
+    p = blob_format.plan(["k"], [torch.ones(2)])
     with pytest.raises(ValueError):
-        codec.write(p, memoryview(np.empty(p.nbytes - 1, dtype=np.uint8)))
+        blob_format.write(p, memoryview(np.empty(p.nbytes - 1, dtype=np.uint8)))
     with pytest.raises(ValueError):
-        codec.plan(["a"], [1, 2])
+        blob_format.plan(["a"], [1, 2])

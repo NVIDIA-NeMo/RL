@@ -31,7 +31,7 @@ from tensordict import NonTensorStack, TensorDict
 pytestmark = pytest.mark.nixl
 
 
-from tests.unit.data_plane.nixl._helpers import dense as _dense
+from tests.unit.data_plane._nixl_helpers import dense as _dense
 
 
 def _keys(prefix: str, n: int) -> list[str]:
@@ -227,7 +227,7 @@ class TestWorkersInRemoteActors:
         @ray.remote(num_cpus=1)
         class Worker:
             def __init__(self):
-                import nemo_rl.data_plane.nixl.tq  # noqa: F401
+                import nemo_rl.data_plane.adapters.tq_nixl  # noqa: F401
                 import transfer_queue as tq
 
                 tq.init()

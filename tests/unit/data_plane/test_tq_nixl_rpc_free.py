@@ -19,7 +19,7 @@ import pytest
 import torch
 from tensordict import TensorDict
 
-from tests.unit.data_plane.nixl._helpers import dense, make_tq_conf
+from tests.unit.data_plane._nixl_helpers import dense, make_tq_conf
 
 pytestmark = pytest.mark.nixl
 
@@ -28,13 +28,13 @@ pytestmark = pytest.mark.nixl
 def sys_(ray_cluster):
     import transfer_queue as tq
 
-    import nemo_rl.data_plane.nixl.tq  # noqa: F401
+    import nemo_rl.data_plane.adapters.tq_nixl  # noqa: F401
 
     conf = make_tq_conf(num_units=2, namespace="nvdp-rpcfree")
     tq.init(conf)
     yield tq
     tq.close()
-    nemo_rl.data_plane.nixl.tq.shutdown(conf)
+    nemo_rl.data_plane.adapters.tq_nixl.shutdown(conf)
 
 
 def _client():
@@ -71,7 +71,7 @@ def test_stale_hint_falls_back_and_stays_exact(sys_):
     # match, and the pinned path must still return the right bytes.
     import numpy as np
 
-    from nemo_rl.data_plane.nixl import codec
+    from nemo_rl.data_plane.nixl import blob_format
 
     metas = tq.kv_list("train") if hasattr(tq, "kv_list") else None
     del metas
@@ -81,7 +81,7 @@ def test_stale_hint_falls_back_and_stays_exact(sys_):
     # Live stamp, wrong geometry: the footer read lands on bytes that are not
     # this blob's footer, so the tag check must reject it.
     stale = {"u": unit, "so": 0, "z": 4096 + 7 * 64, "g": store._gen(unit)}
-    buf = np.zeros(4096 + codec.FOOTER_SIZE, dtype=np.uint8)
+    buf = np.zeros(4096 + blob_format.FOOTER_SIZE, dtype=np.uint8)
     base = store.ep.register(buf)
     try:
         store.read(

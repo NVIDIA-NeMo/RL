@@ -29,7 +29,7 @@ import pytest
 import torch
 from tensordict import NonTensorStack, TensorDict
 
-from tests.unit.data_plane.nixl._helpers import dense, make_tq_conf
+from tests.unit.data_plane._nixl_helpers import dense, make_tq_conf
 
 pytestmark = pytest.mark.nixl
 
@@ -63,7 +63,7 @@ FIELDS = ["small", "zc", "big", "routes", "text"]
 def zc_system(ray_cluster):
     import transfer_queue as tq
 
-    import nemo_rl.data_plane.nixl.tq  # noqa: F401
+    import nemo_rl.data_plane.adapters.tq_nixl  # noqa: F401
 
     conf = make_tq_conf(
         num_units=2, slab_bytes=4 << 30, staging_bytes=16 << 20, namespace="nvdp-zc"
@@ -77,7 +77,7 @@ def zc_system(ray_cluster):
     tq.init(conf)
     yield tq, conf
     tq.close()
-    nemo_rl.data_plane.nixl.tq.shutdown(conf)
+    nemo_rl.data_plane.adapters.tq_nixl.shutdown(conf)
 
 
 def _check(tq, keys, exp):

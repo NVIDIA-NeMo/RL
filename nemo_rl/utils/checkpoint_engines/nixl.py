@@ -65,15 +65,28 @@ def _create_nixl_agent(
     agent_name: str,
     backend_name: str,
     backend_init_params: dict[str, Any] | None = None,
+    *,
+    enable_prog_thread: bool | None = None,
 ) -> Any:
+    """Create a NIXL agent with one backend.
+
+    ``enable_prog_thread=None`` keeps NIXL's default progress-thread setting.
+    """
     try:
         nixl_api = importlib.import_module("nixl._api")
     except ImportError as exc:
         raise ImportError("Install NIXL or disable checkpoint-engine refit.") from exc
-    if backend_name == "UCX" and backend_init_params is None:
+    if (
+        backend_name == "UCX"
+        and backend_init_params is None
+        and enable_prog_thread is None
+    ):
         return nixl_api.nixl_agent(agent_name)
 
-    agent = nixl_api.nixl_agent(agent_name, nixl_api.nixl_agent_config(backends=[]))
+    config_kwargs: dict[str, Any] = {"backends": []}
+    if enable_prog_thread is not None:
+        config_kwargs["enable_prog_thread"] = enable_prog_thread
+    agent = nixl_api.nixl_agent(agent_name, nixl_api.nixl_agent_config(**config_kwargs))
     agent.create_backend(
         backend_name,
         {key: str(value) for key, value in (backend_init_params or {}).items()},

@@ -11,7 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Thin wrapper around the NIXL agent: registration, metadata, blocking transfers.
+"""NIXL endpoint for the data plane: registration, metadata, blocking transfers.
+
+The agent is created by :func:`nemo_rl.utils.checkpoint_engines.nixl._create_nixl_agent`,
+the same path the checkpoint-engine refit uses.
 
 One ``NixlEndpoint`` per process. The agent is not thread-safe; callers
 serialise access (the KV client holds a lock, the unit is a Ray actor).
@@ -30,12 +33,10 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from nemo_rl.data_plane.nixl.errors import TransferError, TransportPolicyError
-
-try:  # imported lazily in tests that skip without NIXL
-    from nixl._api import nixl_agent, nixl_agent_config
-except Exception:  # pragma: no cover - surfaced by the caller
-    nixl_agent = None  # type: ignore[assignment]
-    nixl_agent_config = None  # type: ignore[assignment]
+from nemo_rl.utils.checkpoint_engines.nixl import (
+    NIXL_DEFAULT_BACKEND_NAME,
+    _create_nixl_agent,
+)
 
 
 log = logging.getLogger(__name__)
@@ -91,7 +92,11 @@ def check_rdma_only(env: Mapping[str, str] | None = None) -> str:
 
 
 def nixl_available() -> bool:
-    return nixl_agent is not None
+    try:
+        import nixl._api  # noqa: F401
+    except Exception:  # noqa: BLE001
+        return False
+    return True
 
 
 def addr_of(arr: np.ndarray) -> int:
@@ -103,14 +108,12 @@ class NixlEndpoint:
         self,
         name: str,
         *,
-        backend: str = "UCX",
+        backend: str = NIXL_DEFAULT_BACKEND_NAME,
         init_params: dict[str, Any] | None = None,
         prog_thread: bool = False,
         extra_backends: Sequence[str] = (),
         require_rdma: bool = True,
     ) -> None:
-        if nixl_agent is None:
-            raise RuntimeError("nixl is not importable in this process")
         if backend == "UCX" and require_rdma:
             # Checked before the agent exists: NIXL's UCX backend takes UCX_*
             # env vars over backend_init_params, so the env decides the transport.
@@ -122,10 +125,9 @@ class NixlEndpoint:
             )
         self.name = name
         self.backend = backend
-        cfg = nixl_agent_config(enable_prog_thread=prog_thread, backends=[])
-        self.agent = nixl_agent(name, cfg)
-        params = {k: str(v) for k, v in (init_params or {}).items()}
-        self.agent.create_backend(backend, params)
+        self.agent = _create_nixl_agent(
+            name, backend, dict(init_params or {}), enable_prog_thread=prog_thread
+        )
         self.backends = [backend]
         for b in extra_backends:
             if b not in self.backends:

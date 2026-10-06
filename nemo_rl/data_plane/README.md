@@ -1,7 +1,7 @@
 # nemo_rl.data_plane
 
 Stable boundary between NeMo-RL and the underlying data-plane backend
-(currently `transfer_queue`, whose `nixl` backend lives in `nemo_rl/data_plane/nixl/`). Every call site in
+(currently `transfer_queue`). Every call site in
 `nemo_rl/algorithms`, `nemo_rl/experience`, `nemo_rl/models` goes through
 `DataPlaneClient`. No code imports `transfer_queue` directly outside the
 adapter.

@@ -517,3 +517,37 @@ class TestNUMABindingBenchmark:
         for gpu_idx, cpulist, numa_node in results:
             print(f"  GPU {gpu_idx} → CPUs {cpulist} → NUMA node {numa_node}")
         print(f"{'=' * 60}")
+
+
+# ----------------------------------------------------------------------------- sockets
+def _fake_nodes(root, layout: dict[int, str]) -> str:
+    for node, cpulist in layout.items():
+        d = root / f"node{node}"
+        d.mkdir(parents=True)
+        (d / "cpulist").write_text(cpulist + "\n")
+    return str(root)
+
+
+def test_cpu_nodes_gb300_tray_ignores_gpu_memory_nodes(tmp_path):
+    from nemo_rl.distributed.numa_utils import cpu_nodes
+
+    layout = {0: "0-71", 1: "72-143", **{n: "" for n in range(2, 34)}}
+    nodes = cpu_nodes(_fake_nodes(tmp_path / "node", layout))
+    assert sorted(nodes) == [0, 1]
+    assert len(nodes[0]) == 72 and max(nodes[1]) == 143
+
+
+def test_cpu_nodes_single_socket(tmp_path):
+    from nemo_rl.distributed.numa_utils import cpu_nodes
+
+    assert list(cpu_nodes(_fake_nodes(tmp_path / "node", {0: "0-71", 1: ""}))) == [0]
+
+
+def test_socket_of_affinity(monkeypatch):
+    from nemo_rl.distributed import numa_utils
+
+    nodes = {0: {0, 1}, 1: {2, 3}}
+    monkeypatch.setattr(numa_utils.os, "sched_getaffinity", lambda pid: {2, 3})
+    assert numa_utils.socket_of_affinity(nodes) == 1
+    monkeypatch.setattr(numa_utils.os, "sched_getaffinity", lambda pid: {1, 2})
+    assert numa_utils.socket_of_affinity(nodes) is None

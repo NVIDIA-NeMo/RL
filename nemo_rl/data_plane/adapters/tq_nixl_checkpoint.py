@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Checkpoint save / restore for the NixlStore backend (milestone A2).
+"""Checkpoint save / restore for the NixlStore backend (``NixlStorageManager``).
 
 TransferQueue saves the controller first and storage second, and restores
 storage first. Storage state here is just *the bytes of every live blob plus

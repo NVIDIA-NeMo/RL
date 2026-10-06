@@ -27,9 +27,9 @@ pytestmark = pytest.mark.nixl
 def per_node_spread_system(ray_cluster):
     import transfer_queue as tq
 
-    import nemo_rl.data_plane.nixl.tq  # noqa: F401
-    from nemo_rl.data_plane.nixl.tq.bootstrap_provider import alive_node_ids
-    from tests.unit.data_plane.nixl._helpers import make_tq_conf
+    import nemo_rl.data_plane.adapters.tq_nixl  # noqa: F401
+    from nemo_rl.data_plane.adapters.tq_nixl import alive_node_ids
+    from tests.unit.data_plane._nixl_helpers import make_tq_conf
 
     conf = make_tq_conf(namespace="nvdp-placement")
     nixl = conf.backend.NixlStore
@@ -40,7 +40,7 @@ def per_node_spread_system(ray_cluster):
     tq.init(conf)
     yield conf
     tq.close()
-    nemo_rl.data_plane.nixl.tq.shutdown(conf)
+    nemo_rl.data_plane.adapters.tq_nixl.shutdown(conf)
 
 
 def _stats(conf, n):

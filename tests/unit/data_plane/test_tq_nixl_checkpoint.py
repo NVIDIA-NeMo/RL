@@ -32,7 +32,7 @@ import ray
 import torch
 from tensordict import NonTensorStack, TensorDict
 
-from tests.unit.data_plane.nixl._helpers import dense, make_tq_conf
+from tests.unit.data_plane._nixl_helpers import dense, make_tq_conf
 
 pytestmark = pytest.mark.nixl
 
@@ -60,7 +60,7 @@ def _batch(seed: int) -> TensorDict:
 def _system(num_units: int):
     import transfer_queue as tq
 
-    import nemo_rl.data_plane.nixl.tq  # noqa: F401
+    import nemo_rl.data_plane.adapters.tq_nixl  # noqa: F401
 
     conf = make_tq_conf(
         num_units=num_units, slab_bytes=32 << 20, staging_bytes=16 << 20, namespace=NS
@@ -71,10 +71,10 @@ def _system(num_units: int):
 
 
 def _teardown(tq, conf):
-    import nemo_rl.data_plane.nixl.tq
+    import nemo_rl.data_plane.adapters.tq_nixl
 
     tq.close()
-    nemo_rl.data_plane.nixl.tq.shutdown(conf)
+    nemo_rl.data_plane.adapters.tq_nixl.shutdown(conf)
 
 
 def _check(tq, keys, expected: TensorDict):
@@ -145,7 +145,7 @@ def test_restore_refuses_other_store_kind(ray_cluster):
 
     import transfer_queue as tq2
 
-    import nemo_rl.data_plane.nixl.tq  # noqa: F401
+    import nemo_rl.data_plane.adapters.tq_nixl  # noqa: F401
 
     conf = make_tq_conf(num_units=1, namespace=NS)
     conf.backend.NixlStore.store = {

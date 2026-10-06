@@ -39,7 +39,7 @@ from typing import Any, Protocol
 
 import ray
 
-from nemo_rl.data_plane.nixl import codec
+from nemo_rl.data_plane.nixl import blob_format
 from nemo_rl.data_plane.nixl.control import UnitClient
 from nemo_rl.data_plane.nixl.directory import LOST
 from nemo_rl.data_plane.nixl.errors import TransferError, UnitFull
@@ -61,7 +61,9 @@ ReadRange = tuple[int, int, int]
 
 
 class BlobStore(Protocol):
-    def put(self, local_addr: int, p: codec.BlobPlan) -> tuple[str, dict[str, Any]]:
+    def put(
+        self, local_addr: int, p: blob_format.BlobPlan
+    ) -> tuple[str, dict[str, Any]]:
         """Store the blob at ``local_addr``; return ``(blob_id, extra_meta)``."""
         ...
 
@@ -187,7 +189,9 @@ class UnitSlabStore:
         return {b: self._blob_unit[b] for b in blob_ids if b in self._blob_unit}
 
     # -- BlobStore
-    def put(self, local_addr: int, p: codec.BlobPlan) -> tuple[str, dict[str, Any]]:
+    def put(
+        self, local_addr: int, p: blob_format.BlobPlan
+    ) -> tuple[str, dict[str, Any]]:
         return self.put_segments([(local_addr, 0, p.nbytes)], p.nbytes, len(p.entries))
 
     def put_segments(
@@ -278,7 +282,7 @@ class UnitSlabStore:
         self, requests, metas, fast, scratch
     ) -> dict[str, list[ReadRange]]:
         sbase, sview = scratch
-        fsz = codec.FOOTER_SIZE
+        fsz = blob_format.FOOTER_SIZE
         retry: dict[str, list[ReadRange]] = {}
         slot = 0
         for unit_id, blobs in fast.items():
@@ -309,7 +313,7 @@ class UnitSlabStore:
                 continue
             for b in blobs:
                 s = slots[b]
-                tag = codec.footer_tag(sview[s * fsz : (s + 1) * fsz])
+                tag = blob_format.footer_tag(sview[s * fsz : (s + 1) * fsz])
                 if tag is not None and tag.hex() == b:
                     self.stats["fast_reads"] += 1
                 else:
@@ -467,7 +471,9 @@ class FileStore:
             self._close_fd(item[0])
 
     # -- BlobStore
-    def put(self, local_addr: int, p: codec.BlobPlan) -> tuple[str, dict[str, Any]]:
+    def put(
+        self, local_addr: int, p: blob_format.BlobPlan
+    ) -> tuple[str, dict[str, Any]]:
         blob_id = uuid.uuid4().hex
         fd = self._fd(blob_id, p.nbytes, create=True)
         try:
