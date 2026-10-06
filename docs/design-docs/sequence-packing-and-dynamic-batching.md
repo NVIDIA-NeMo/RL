@@ -230,7 +230,7 @@ packed:
 0 0 0 p 1 1 1 1 p p 3 3
 ```
 
-Internally, DTensor and Megatron-Core are made aware of sequence packing with either `FlashAttentionArgs` or `PackedSeqParams`, which contain `cu_seqlens_q` and `cu_seqlens_kv`, which are the cumulative sequence lengths of the sequence in the packed batch without CP.
+Internally, Automodel and Megatron-Core are made aware of sequence packing with either `FlashAttentionArgs` or `PackedSeqParams`, which contain `cu_seqlens_q` and `cu_seqlens_kv`, which are the cumulative sequence lengths of the sequence in the packed batch without CP.
 
 ### Nuances
 - With using Sequence Packing with Megatron + Pipeline Parallelism (PP), note that all packed sequences will be padded up to the maximum packed sequence length because PP requires maintaining a fixed-size batch x seqlen buffer for PP communications. In practice, however, we find that packing is _so efficient_ that this hardly makes a difference.
@@ -451,7 +451,7 @@ policy:
 ### Framework Compatibility
 
 **Sequence Packing Requirements:**
-- Megatron or DTensor policy
+- Megatron or Automodel policy
 - FlashAttention-2 for efficient packed attention
 - If using CP with Megatron, you _must_ use sequence packing. If using CP with Dtensor, you _cannot_ yet use packing (WIP, [Issue #520](https://github.com/NVIDIA-NeMo/RL/issues/520))
 

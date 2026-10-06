@@ -50,19 +50,19 @@ for those cases.
 
 | Transport | Generation backend | Policy backend | Quantization and MoE |
 |---|---|---|---|
-| Colocated CUDA IPC | vLLM or SGLang | DTensor or Megatron | Uses the generation backend's standard loader. |
-| NCCL | vLLM or Megatron | DTensor or Megatron | Uses the standard full-weight loader. |
-| NCCL + reload API | vLLM | DTensor or Megatron | Default non-colocated NCCL only. Rejects colocated refit, `nccl_reshard`, sparse delta, NIXL/checkpoint-engine transports, ModelOpt quantization (`real_quant` or `quant_cfg`), Eagle/MTP trainer-refit draft weights, and grouped-MoE MXFP8 slabs. |
+| Colocated CUDA IPC | vLLM or SGLang | Automodel or Megatron | Uses the generation backend's standard loader. |
+| NCCL | vLLM or Megatron | Automodel or Megatron | Uses the standard full-weight loader. |
+| NCCL + reload API | vLLM | Automodel or Megatron | Default non-colocated NCCL only. Rejects colocated refit, `nccl_reshard`, sparse delta, NIXL/checkpoint-engine transports, ModelOpt quantization (`real_quant` or `quant_cfg`), Eagle/MTP trainer-refit draft weights, and grouped-MoE MXFP8 slabs. |
 | MCore native refit | Megatron | Megatron | Supports MCore's configured copy-service backend. |
 | SGLang NCCL weight-update group | SGLang | Megatron | Trainer rank 0 broadcasts finalized HF tensors to the engine leaders. |
 | NCCL reshard | vLLM or Megatron | Megatron | Supports BF16 and the documented FP8/MXFP8 combinations; see the [NCCL Reshard Refit design](../design-docs/nccl-reshard-refit.md). |
 | Sparse delta | vLLM | Megatron | BF16/FP16, unquantized rollout only. |
-| NIXL, full weights | vLLM | DTensor or Megatron | Supports the standard full-weight FP8 loader. DTensor FP8 KV-cache scale transfer is not yet supported. |
-| NIXL, sharded experts | vLLM | DTensor or Megatron | Unquantized BF16/FP16 Triton MoE only; FP8/MXFP8 and dynamic expert placement are rejected. |
+| NIXL, full weights | vLLM | Automodel or Megatron | Supports the standard full-weight FP8 loader. Automodel FP8 KV-cache scale transfer is not yet supported. |
+| NIXL, sharded experts | vLLM | Automodel or Megatron | Unquantized BF16/FP16 Triton MoE only; FP8/MXFP8 and dynamic expert placement are rejected. |
 
 Non-colocated SGLang generation is supported with a Megatron policy and
 `refit_transport: null`; it creates its own NCCL weight-update group. The NIXL
-restrictions are on the generation backend; both Megatron and DTensor policy
+restrictions are on the generation backend; both Megatron and Automodel policy
 workers can send weights. vLLM refit also rejects grouped MoE MXFP8 expert
 slabs such as `mlp.experts.gate_up_proj` and `mlp.experts.down_proj`. Sparse
 delta is currently limited to GRPO. NIXL is

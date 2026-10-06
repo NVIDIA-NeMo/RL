@@ -33,7 +33,7 @@ Automodel does not support Triton kernels when `tensor_parallel_size > 1`, so se
 The two backends share most of their fields but differ in a few backend-specific options.
 The table below maps equivalent fields and highlights the differences.
 
-| Concept | DTensor (`lora_cfg`) | Megatron (`peft`) |
+| Concept | Automodel (`lora_cfg`) | Megatron (`peft`) |
 | --- | --- | --- |
 | Enable LoRA | `enabled` | `enabled` |
 | Modules to adapt | `target_modules` | `target_modules` |
@@ -53,7 +53,7 @@ The table below maps equivalent fields and highlights the differences.
 
 The effective learning-rate multiplier for the adapter is `alpha / dim` on both backends.
 
-## DTensor Configuration
+## Automodel Configuration
 
 LoRA settings live under `policy.dtensor_cfg.lora_cfg`:
 
@@ -74,7 +74,7 @@ policy:
       restore_from: null        # Warm start from a donor adapter checkpoint (see below)
 ```
 
-### DTensor Parameter Details
+### Automodel Parameter Details
 
 - **`enabled`** (bool): Whether to enable LoRA training.
 - **`target_modules`** (list): Specific module names to apply LoRA. Empty with `match_all_linear=true` applies to all linear layers.
@@ -144,7 +144,7 @@ SFT LoRA into GRPO. The accepted path format differs by backend:
 - **Megatron Core**: `policy.megatron_cfg.peft.restore_from` — a native Megatron `iter_XXXXXXX`
   directory, or a checkpoint root containing one.
 
-The donor's `dim`/`alpha` must match this run's. On DTensor, a donor's recorded
+The donor's `dim`/`alpha` must match this run's. On Automodel, a donor's recorded
 `base_model_name_or_path` (unless absent, empty, or `N/A`) must also equal this run's
 `policy.model_name` as an exact string: an HF repo ID and a local path for the same model
 will not match, nor will a model moved to a different path. Setup fails loudly otherwise. Optimizer, RNG,
@@ -156,7 +156,7 @@ policy still anchors to the warm-started (donor) adapters, not to the bare base 
 
 ### SFT
 
-The config uses the DTensor backend by default, so DTensor LoRA only requires enabling the flag:
+The config uses the Automodel backend by default, so Automodel LoRA only requires enabling the flag:
 
 ```bash
 uv run examples/run_sft.py policy.dtensor_cfg.lora_cfg.enabled=true
@@ -176,13 +176,13 @@ See the [SFT guide](sft.md) for the full SFT workflow.
 
 ### GRPO
 
-GRPO supports LoRA on both backends. Enable the DTensor adapter with:
+GRPO supports LoRA on both backends. Enable the Automodel adapter with:
 
 ```bash
 uv run examples/run_grpo.py policy.dtensor_cfg.lora_cfg.enabled=true
 ```
 
-The DTensor GRPO LoRA path uses a **merge-weight** approach: during generation, LoRA adapter
+The Automodel GRPO LoRA path uses a **merge-weight** approach: during generation, LoRA adapter
 weights are merged into the base linear weights. This improves performance at the cost of a
 small train/inference mismatch that we consider acceptable. If you require strict
 train/inference parity, use the
@@ -194,9 +194,9 @@ See the [GRPO guide](grpo.md) for the full GRPO workflow.
 
 ### DPO
 
-DPO fully supports LoRA on **both** the DTensor and Megatron backends, using the same
+DPO fully supports LoRA on **both** the Automodel and Megatron backends, using the same
 `lora_cfg` / `peft` config blocks as SFT and GRPO. There is no dedicated DPO LoRA recipe;
-enable it on an existing DPO config via an override. For the DTensor backend:
+enable it on an existing DPO config via an override. For the Automodel backend:
 
 ```bash
 uv run examples/run_dpo.py policy.dtensor_cfg.lora_cfg.enabled=true

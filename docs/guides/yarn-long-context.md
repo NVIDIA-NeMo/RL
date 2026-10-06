@@ -4,7 +4,7 @@
 
 ## Requirements
 
-YaRN is only supported with the **Megatron backend**. The DTensor (Automodel) backend will raise an assertion error if `rope_scaling.rope_type=yarn` is set. Make sure:
+YaRN is only supported with the **Megatron backend**. The Automodel backend will raise an assertion error if `rope_scaling.rope_type=yarn` is set. Make sure:
 
 1. Megatron submodules are initialized: `git submodule update --init --recursive`
 2. Megatron backend is enabled: `policy.megatron_cfg.enabled=True` and `policy.dtensor_cfg.enabled=False`
