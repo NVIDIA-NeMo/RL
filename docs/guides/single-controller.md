@@ -253,8 +253,8 @@ restart boundary:
 policy weights live at redispatch.
 
 Turn recovery coordinates Gym and RL as one checkpoint cut. Each prompt group
-is pinned to the Gym shard replica that accepted it. SC first closes a narrow
-Gym `/run` admission gate; already-submitted requests, completion callbacks,
+is pinned to the Gym shard replica that accepted it. SC first closes its narrow
+`/run` dispatch admission gate; already-submitted requests, completion callbacks,
 finalization, and TQ writes remain live. Gym parks its participants and commits
 the subset of candidate episodes it still owns into the checkpoint's
 `gym-instances/` tree. Candidate replies already on the wire drain through the
@@ -273,7 +273,7 @@ If one shard replica fails restore, every replica conservatively retires its
 replacement attempts before the outer restore fails. This also covers a lost
 Ray reply where the remote restore may actually have succeeded, so a partially
 restored topology is never released for execution. A second checkpoint taken
-after restore but before redispatch includes the dormant restored attempt, so
+after restore but before redispatch includes the unclaimed restored attempt, so
 another crash does not lose the saved turn boundary.
 
 The `turn` target currently requires vLLM generation, NeMo Gym, token capture,
