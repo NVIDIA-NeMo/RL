@@ -1201,6 +1201,10 @@ class AsyncNemoGymRolloutImpl:
                 # Completion callbacks are token-capture receipt-only, making this
                 # conversion lightweight and safe to repeat during group metrics.
                 row_completions, _ = self._results_to_completions([result])
+                assert row_completions[0].env_extras is not None
+                row_completions[0].env_extras["agent_ref"] = copy.deepcopy(
+                    resolved_agent_ref
+                )
                 await on_completion(rowidx, row_completions[0])
             if timing_metrics is not None:
                 env_timing_metrics = timing_metrics
@@ -2251,6 +2255,14 @@ class RolloutManager:
                 raise ValueError(
                     "token-capture completion must contain environment extras"
                 )
+            agent_ref = env_extras.get("agent_ref")
+            resolved_agent_name = (
+                agent_ref.get("name") if isinstance(agent_ref, dict) else None
+            )
+            if not isinstance(resolved_agent_name, str) or not resolved_agent_name:
+                raise ValueError(
+                    "token-capture completion requires resolved agent_ref.name"
+                )
             if "ng_receipt" not in env_extras:
                 raise ValueError("token-capture completion must contain ng_receipt")
             receipt = env_extras["ng_receipt"]
@@ -2295,6 +2307,7 @@ class RolloutManager:
                     receipt=receipt,
                     reward=completion.reward,
                     mask_sample=mask_sample,
+                    resolved_agent_name=resolved_agent_name,
                 )
                 previous = pending_group_results.get(generation_index)
                 if previous is not None:
@@ -2324,6 +2337,7 @@ class RolloutManager:
                     receipt=receipt,
                     reward=completion.reward,
                     mask_sample=mask_sample,
+                    resolved_agent_name=resolved_agent_name,
                 )
 
         try:
@@ -2366,6 +2380,9 @@ class RolloutManager:
                 prompt_idx=int(recovery_group.prompt_id),
                 mask_sample=tuple(mask_sample),
                 loss_multiplier=float(input_sample.get("loss_multiplier", 1.0)),
+                resolved_agent_name=self._recovery_ledger.get_group(
+                    group_id
+                ).resolved_agent_name,
             )
             assert_metadata_only(request)
             return request

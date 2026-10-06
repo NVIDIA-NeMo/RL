@@ -831,7 +831,7 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
     assert rewards == [0.0, 1.0]
     assert mask_sample == [True, False]
 
-    state["schema_version"] = 3
+    state["schema_version"] = ROLLOUT_RECOVERY_SCHEMA_VERSION + 1
     with pytest.raises(ValueError, match="Unsupported rollout-recovery schema version"):
         RolloutRecoveryLedger.from_state_dict(state)
 
@@ -1037,14 +1037,105 @@ def test_restore_rejects_malformed_recovery_policy_fields(
         _load(RolloutRecoveryLedger(), state)
 
 
-def test_restore_rejects_unsupported_schema_version() -> None:
+@pytest.mark.parametrize("version", [1, ROLLOUT_RECOVERY_SCHEMA_VERSION + 1])
+def test_restore_rejects_unsupported_schema_version(version: int) -> None:
     state = {
-        "schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION + 1,
+        "schema_version": version,
         "groups": [],
     }
 
     with pytest.raises(ValueError, match="Unsupported rollout-recovery schema"):
         _load(RolloutRecoveryLedger(), state)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("version", [2, ROLLOUT_RECOVERY_SCHEMA_VERSION])
+def test_restore_accepts_empty_compatible_sidecar(version: int) -> None:
+    state = {
+        "schema_version": version,
+        "groups": [],
+        "batch_shortfall": {},
+        "sampler_stamps_target_steps": False,
+    }
+    parsed = parse_rollout_recovery_state(state)
+    assert len(RolloutRecoveryLedger.from_state_dict(parsed.ledger_state)) == 0
+    assert parsed.batch_shortfall == {}
+    assert parsed.sampler_stamps_target_steps is False
+
+
+@pytest.mark.parametrize("version", [2, ROLLOUT_RECOVERY_SCHEMA_VERSION])
+def test_restore_without_agent_name_preserves_sealed_inputs(version: int) -> None:
+    state = _sealed_attempt_state()
+    state["schema_version"] = version
+    for group in state["groups"]:
+        group.pop("resolved_agent_name", None)
+    ledger = RolloutRecoveryLedger.from_state_dict(state)
+    group_id = state["groups"][0]["group_id"]
+    before = ledger.finalization_inputs(group_id)
+    _mutate(lambda cut: ledger.prepare_for_restart(cut))
+    assert ledger.get_group(group_id).resolved_agent_name is None
+    assert ledger.finalization_inputs(group_id) == before
+    _bind(ledger, group_id, _prompt())
+    upgraded = ledger.state_dict()
+    assert upgraded["schema_version"] == ROLLOUT_RECOVERY_SCHEMA_VERSION
+    assert upgraded["groups"][0]["resolved_agent_name"] is None
+
+
+@pytest.mark.parametrize("granularity", list(RecoveryGranularity))
+def test_seal_rejects_conflicting_agent_names_atomically(granularity) -> None:
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=2,
+        target_step=7,
+        start_weight_version=6,
+        recovery_granularity=granularity,
+        admitted=True,
+    )
+    _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
+    results = {
+        index: SiblingSealResult(
+            gate_rollout_id=group.gate_rollout_id(index),
+            receipt=None,
+            reward=0.0,
+            mask_sample=True,
+            resolved_agent_name=f"agent-{index}",
+        )
+        for index in range(2)
+    }
+    if granularity is RecoveryGranularity.SIBLING:
+        _mutate(
+            lambda cut: ledger.mark_sibling_sealed(
+                cut, "g7", generation_index=0, **dataclasses.asdict(results[0])
+            )
+        )
+        # Preserve the route even when only the first sibling survived restart.
+        ledger = RolloutRecoveryLedger.from_state_dict(ledger.state_dict())
+        _bind(ledger, "g7", _prompt())
+        assert ledger.get_group("g7").resolved_agent_name == "agent-0"
+    before = ledger.state_dict()
+    with pytest.raises(ValueError, match="siblings resolved to different agents"):
+        _mutate(
+            lambda cut: (
+                ledger.mark_group_sealed(cut, "g7", results)
+                if granularity is RecoveryGranularity.PROMPT_GROUP
+                else ledger.mark_sibling_sealed(
+                    cut, "g7", generation_index=1, **dataclasses.asdict(results[1])
+                )
+            )
+        )
+    assert ledger.state_dict() == before
+
+
+@pytest.mark.parametrize("agent_name", ["", 42, {"name": "agent"}])
+def test_restore_rejects_invalid_resolved_agent_name(agent_name) -> None:
+    state = _sealed_attempt_state()
+    state["groups"][0]["resolved_agent_name"] = agent_name
+    with pytest.raises(ValueError, match="resolved_agent_name"):
+        RolloutRecoveryLedger.from_state_dict(state)
 
 
 def test_restore_rejects_non_list_groups() -> None:
