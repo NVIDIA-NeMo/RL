@@ -1383,7 +1383,7 @@ class AsyncNemoGymRolloutImpl:
             # SingleController baselines use logical group ids, so distinct
             # rendered prompts here do not imply zero advantages.
             if all("receipt" not in result for result in completed_results):
-                first_prompt_logs = [
+                first_prompt_logs: list[list[dict[str, torch.Tensor | str]]] = [
                     [
                         {"token_ids": torch.as_tensor(message["token_ids"])}
                         for message in result["input_message_log"]

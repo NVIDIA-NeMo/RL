@@ -2308,7 +2308,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
     manager._task_to_env = {
         "nemo_gym": type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
     }
-    manager._tokenizer = None
+    manager._tokenizer = SimpleNamespace(pad_token_id=0)
     manager._effort_config = None
     manager._results_to_completions = lambda results: (
         [result["value"] for result in results],
@@ -2345,6 +2345,8 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
     assert metrics == {
         "completion_count": 2,
         "agent": "agent",
+        "baseline_groups/distinct_first_prompts": 1,
+        "baseline_groups/samples": 2,
         "remote_time": 2.0,
         "timing/test/routing/group_share/nemo_gym": 1,
     }
@@ -2490,7 +2492,7 @@ def test_rollout_manager_rotates_replicas_and_reports_group_share():
             route_to_shard={"agent": "tools"},
         )
     }
-    manager._tokenizer = None
+    manager._tokenizer = SimpleNamespace(pad_token_id=0)
     manager._effort_config = None
     manager._stats = None
 
