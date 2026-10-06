@@ -72,7 +72,7 @@ policy:
     enabled: false
   dynamic_batching:
     enabled: true
-  make_sequence_length_divisible_by: 8
+  make_sequence_length_divisible_by: 64
   generation:
     max_new_tokens: 4096
     vllm_cfg:

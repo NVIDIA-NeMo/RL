@@ -104,7 +104,6 @@ configs_dir = Path(
 config_files = glob.glob(str(configs_dir / "**/*.yaml"), recursive=True)
 assert len(config_files) > 0, "No config files found"
 
-
 # Every shipped config tree. Only the outdated-config guard uses it -- most of examples/nemo_gym
 # cannot satisfy the schema test by design (env manifests, launcher templates, unset env
 # interpolations).

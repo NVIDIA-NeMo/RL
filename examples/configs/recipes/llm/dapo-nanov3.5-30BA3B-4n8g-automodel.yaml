@@ -37,7 +37,7 @@ policy:
   train_micro_batch_size: 1
   logprob_batch_size: 1
   max_total_sequence_length: 9216
-  make_sequence_length_divisible_by: 8
+  make_sequence_length_divisible_by: 64
   optimizer:
     name: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
     kwargs:
