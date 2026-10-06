@@ -43,7 +43,7 @@ policy: &POLICY_BASE
 
     offload_optimizer_for_logprob: false
 
-    automodel_cfg: &DTENSOR_BASE
+    automodel_cfg: &AUTOMODEL_BASE
         enabled: true
         checkpoint:
             model_save_format: "safetensors"
@@ -239,7 +239,7 @@ teacher:
     <<: *POLICY_BASE
     model_name: "Qwen/Qwen3-4B"
     automodel_cfg:
-        <<: *DTENSOR_BASE
+        <<: *AUTOMODEL_BASE
         context_parallel_size: 2 
         tensor_parallel_size: 4
 

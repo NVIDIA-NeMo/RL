@@ -421,7 +421,7 @@ def setup(
             "Sequence packing is currently not supported for the DTensor PPO value model. "
             "See https://github.com/NVIDIA-NeMo/RL/issues/2951."
         )
-        assert value_config["automodel_cfg"].get("context_parallel_size", 1) == 1, (
+        assert value_config["automodel_cfg"]["context_parallel_size"] == 1, (
             "Context parallelism (CP>1) is currently not supported for the DTensor PPO value model. "
             "See https://github.com/NVIDIA-NeMo/RL/issues/2951."
         )

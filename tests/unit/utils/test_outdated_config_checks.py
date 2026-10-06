@@ -107,12 +107,18 @@ def test_every_entrypoint_checks_outdated_config(entrypoint):
 
 @pytest.mark.parametrize("section", ["policy", "value", "teacher"])
 def test_outdated_dtensor_cfg_key_is_rejected(section):
-    with pytest.raises(ValueError, match=rf"{section}\.dtensor_cfg has been renamed"):
+    with pytest.raises(
+        ValueError,
+        match=rf"{section}\.dtensor_cfg has been renamed to {section}\.automodel_cfg\.",
+    ):
         check_outdated_config({section: {"dtensor_cfg": {"enabled": True}}})
 
 
 def test_each_teacher_dtensor_cfg_key_is_rejected():
-    with pytest.raises(ValueError, match=r"teachers\.1\.dtensor_cfg has been renamed"):
+    with pytest.raises(
+        ValueError,
+        match=r"teachers\.1\.dtensor_cfg has been renamed to teachers\.1\.automodel_cfg\.",
+    ):
         check_outdated_config(
             {"teachers": [{"automodel_cfg": {}}, {"dtensor_cfg": {"enabled": True}}]}
         )
@@ -135,7 +141,10 @@ def test_megatron_block_keeps_its_dtensor_cfg():
 
 
 def test_megatron_disabled_still_checks():
-    with pytest.raises(ValueError, match=r"policy\.dtensor_cfg has been renamed"):
+    with pytest.raises(
+        ValueError,
+        match=r"policy\.dtensor_cfg has been renamed to policy\.automodel_cfg\.",
+    ):
         check_outdated_config(
             {
                 "policy": {
@@ -148,7 +157,9 @@ def test_megatron_disabled_still_checks():
 
 def test_reward_model_env_is_checked():
     with pytest.raises(
-        ValueError, match=r"env\.reward_model\.dtensor_cfg has been renamed"
+        ValueError,
+        match=r"env\.reward_model\.dtensor_cfg has been renamed to "
+        r"env\.reward_model\.automodel_cfg\.",
     ):
         check_outdated_config(
             {"env": {"reward_model": {"dtensor_cfg": {"enabled": True}}}}
