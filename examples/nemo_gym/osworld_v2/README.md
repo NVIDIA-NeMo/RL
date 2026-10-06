@@ -40,7 +40,7 @@ The validated launcher requires:
 ```bash
 git clone --recurse-submodules \
   --branch osworld-v2-cc-integration \
-  https://github.com/NVIDIA-NeMo/RL.git nemo-rl-osworld-v2
+  https://github.com/jinglinglingling/RL.git nemo-rl-osworld-v2
 cd nemo-rl-osworld-v2
 git submodule update --init --recursive
 ```
@@ -55,9 +55,19 @@ git submodule status
 
 ## 3. Copy the qualified container
 
-The image is intentionally not stored in git. Copy
-`rl-osworld-v2-qualified-69764640.sqsh` to a shared path on the destination
-cluster. It must have this SHA-256 digest:
+The 69.4 GB image is intentionally not stored in the git history. It is
+published as verified split assets in the private
+`jinglinglingling/nemo-rl-molt-osworld-backup` release
+`osworld-v2-qualified-69764640`. On a destination cluster, authenticate `gh`
+with access to that repository and reconstruct it directly into shared storage:
+
+```bash
+gh auth login
+bash examples/nemo_gym/osworld_v2/download_container.sh /shared/containers
+```
+
+Alternatively, copy `rl-osworld-v2-qualified-69764640.sqsh` from an existing
+cluster. In either case it must have this SHA-256 digest:
 
 ```text
 1b4edcdeac017210e6abe25885372e025ac111c45aeb038bda334659436eb74e  rl-osworld-v2-qualified-69764640.sqsh
