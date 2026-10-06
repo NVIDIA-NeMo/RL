@@ -57,7 +57,9 @@ from nemo_rl.models.generation.generation_cut_capture import (  # noqa: E402
     _remaining_generation_limits_after_prefix,
     _TokenCaptureSnapshotGate,
 )
-from nemo_rl.models.generation.prefix_read_batcher import PrefixReadBatcher  # noqa: E402
+from nemo_rl.models.generation.prefix_read_batcher import (
+    PrefixReadBatcher,  # noqa: E402
+)
 from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration  # noqa: E402
 from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
     VllmAsyncGenerationWorkerImpl,
@@ -344,7 +346,7 @@ def test_prefix_capture_setup_requires_control_token_and_rejects_media(monkeypat
 
 
 @pytest.mark.parametrize(
-    ("max_tokens", "min_tokens", "generation_token_count", "expected"),
+    ("max_tokens", "min_tokens", "prefix_token_count", "expected"),
     [
         (10, 6, 3, (7, 3)),
         (None, 6, 3, (None, 3)),
@@ -353,13 +355,13 @@ def test_prefix_capture_setup_requires_control_token_and_rejects_media(monkeypat
     ],
 )
 def test_restored_prefix_reduces_remaining_output_limits(
-    max_tokens, min_tokens, generation_token_count, expected
+    max_tokens, min_tokens, prefix_token_count, expected
 ):
     assert (
         _remaining_generation_limits_after_prefix(
             max_tokens=max_tokens,
             min_tokens=min_tokens,
-            generation_token_count=generation_token_count,
+            prefix_token_count=prefix_token_count,
         )
         == expected
     )
@@ -368,7 +370,7 @@ def test_restored_prefix_reduces_remaining_output_limits(
 def test_restored_prefix_at_output_limit_is_terminal():
     terminal = _classify_restored_prefix_terminal(
         prompt_token_ids=[1, 2, 3, 4],
-        generation_token_count=2,
+        prefix_token_count=2,
         requested_output_tokens=2,
         model_max_tokens=8,
     )
@@ -672,7 +674,7 @@ def _batch_worker_fixture(lengths, *, batch_size=256, max_tokens=4_194_304):
             GenerationCutPrefix(
                 ticket_id=f"t{i}",
                 rollout_id=f"r{i}",
-                attempt_index=0,
+                attempt=0,
                 model_call_id=f"c{i}",
                 admitted_at=1.0,
             )
@@ -1054,7 +1056,7 @@ def test_generation_cut_stages_prefix_then_terminal_row_replaces_it():
             GenerationCutPrefix(
                 ticket_id="ticket-1",
                 rollout_id="r0",
-                attempt_index=0,
+                attempt=0,
                 model_call_id="c1",
                 admitted_at=1.0,
             )
@@ -1102,7 +1104,7 @@ def test_generation_cut_past_its_deadline_fails_uncut_calls_without_staging():
             GenerationCutPrefix(
                 ticket_id="ticket-1",
                 rollout_id="r0",
-                attempt_index=0,
+                attempt=0,
                 model_call_id="c1",
                 admitted_at=1.0,
             )
@@ -1146,7 +1148,7 @@ def _active_call_inventory(
             GenerationCutPrefix(
                 ticket_id=f"ticket-{index}",
                 rollout_id=f"r{index}",
-                attempt_index=0,
+                attempt=0,
                 model_call_id=model_call_id,
                 admitted_at=1.0,
             )
@@ -1242,7 +1244,7 @@ def test_generation_cut_rolls_back_tokens_after_staging_failure():
             GenerationCutPrefix(
                 ticket_id="ticket-1",
                 rollout_id="r0",
-                attempt_index=0,
+                attempt=0,
                 model_call_id="c1",
                 admitted_at=1.0,
             )
@@ -1299,7 +1301,7 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion(caplog):
             GenerationCutPrefix(
                 ticket_id="ticket-1",
                 rollout_id="r0",
-                attempt_index=0,
+                attempt=0,
                 model_call_id="c1",
                 admitted_at=1.0,
             )
@@ -1323,8 +1325,8 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion(caplog):
                 "source_capture_key": "r0",
                 "source_model_call_id": "c1",
                 "staging_keys": [cut_key],
-                "generation_token_count": 2,
-                "digest": cut_record.digest,
+                "prefix_token_count": 2,
+                "prefix_digest": cut_record.digest,
                 "effective_output_limit": receipt.prefixes[0].effective_output_limit,
             },
         },
@@ -1334,7 +1336,7 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion(caplog):
     bad_count_admission = admission.model_copy(
         update={
             "generation_cut": admission.generation_cut.model_copy(
-                update={"generation_token_count": 3}
+                update={"prefix_token_count": 3}
             )
         }
     )
@@ -1346,7 +1348,7 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion(caplog):
     bad_digest_admission = admission.model_copy(
         update={
             "generation_cut": admission.generation_cut.model_copy(
-                update={"digest": "0" * 64}
+                update={"prefix_digest": "0" * 64}
             )
         }
     )
@@ -1407,7 +1409,7 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion(caplog):
                 GenerationCutPrefix(
                     ticket_id="ticket-2",
                     rollout_id="r0",
-                    attempt_index=1,
+                    attempt=1,
                     model_call_id="c2",
                     admitted_at=2.0,
                 )

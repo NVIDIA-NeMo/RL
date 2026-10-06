@@ -474,7 +474,7 @@ def test_adapter_does_not_require_optional_agent_or_resource_episode_state(
         assert summary.exported_episodes == (GymCheckpointEpisode("rollout-1", 0),)
         assert summary.staging_keys == ("rollout-1/call-1",)
         assert {
-            participant.kind: participant.episode_keys
+            participant.kind: participant.capture_keys
             for participant in summary.participants
         } == {
             "environment": ("rollout-1",),

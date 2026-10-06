@@ -171,7 +171,7 @@ def test_prefix_completion_and_successor_checkpoint_retire_old_keys(
         "model_call_id": "source-call",
         "group_id": "g",
         "generation_index": 0,
-        "generation_token_count": 5,
+        "prefix_token_count": 5,
         "staging_keys": ["prefix-base", "prefix-routes"],
     }
     log = (
@@ -194,7 +194,7 @@ def test_prefix_completion_and_successor_checkpoint_retire_old_keys(
 
 
 def test_prefix_completion_rejects_gap_or_overlap() -> None:
-    selection = {"model_call_id": "source-call", "generation_token_count": 5}
+    selection = {"model_call_id": "source-call", "prefix_token_count": 5}
     log = (
         "generation prefix completed: rollout_id=r model_call_id=continued "
         "source_model_call_id=source-call prefix_tokens=5 tail_tokens=7 "
@@ -215,7 +215,7 @@ def test_prefix_completion_rejects_trained_row_that_dropped_or_duplicated_a_toke
         "model_call_id": "source-call",
         "group_id": "g",
         "generation_index": 0,
-        "generation_token_count": 5,
+        "prefix_token_count": 5,
     }
     log = (
         "generation prefix completed: rollout_id=r model_call_id=continued "
@@ -417,7 +417,7 @@ _CUT_SELECTION = {
             "model_call_id": "source-call",
             "group_id": "recovered-group",
             "generation_index": 0,
-            "generation_token_count": 2,
+            "prefix_token_count": 2,
         }
     ]
 }
@@ -535,9 +535,9 @@ def test_every_restored_prefix_must_complete_exactly_once() -> None:
                 "model_call_id": "call-a",
                 "group_id": "g",
                 "generation_index": 0,
-                "generation_token_count": 5,
+                "prefix_token_count": 5,
             },
-            {"model_call_id": "call-b", "generation_token_count": 3},
+            {"model_call_id": "call-b", "prefix_token_count": 3},
         ]
     }
     log = (
