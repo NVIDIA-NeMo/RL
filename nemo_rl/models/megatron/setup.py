@@ -2058,6 +2058,10 @@ def _create_megatron_config(
         "overlap_param_gather": overlap_param_gather,
         "reuse_grad_buf_for_mxfp8_param_ag": reuse_grad_buf_for_mxfp8_param_ag,
     }
+    # Match DDP's parameter storage when MCore exposes the optimizer flag.
+    # Older MCore versions do not have this field.
+    if hasattr(OptimizerConfig, "fp8_param_gather"):
+        optimizer_kwargs["fp8_param_gather"] = fp8_param_enabled
     # optimizer_cpu_chunk_size is a HybridDeviceOptimizer knob; MCore stacks without that
     # patch (e.g. chunked optimizer-state offload) have no such OptimizerConfig field.
     if "optimizer_cpu_chunk_size" in optimizer_kwargs and "optimizer_cpu_chunk_size" not in {
