@@ -1,4 +1,4 @@
-// Log export for ray.sub, enabled with RAY_ALLOY_ENABLED=1. Endpoint and
+// Log export for ray.sub, enabled by setting LOKI_PUSH_URL. Endpoint and
 // credentials come from the environment; nothing cluster-specific is committed.
 logging {
   level  = "info"
