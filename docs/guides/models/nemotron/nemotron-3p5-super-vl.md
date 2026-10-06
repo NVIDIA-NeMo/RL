@@ -8,13 +8,11 @@ The recipes enable `grpo.deduplicate_multimodal_data` and leave payload-size dia
 
 ## Megatron backend
 
-The setup uses the HF checkpoint's tokenizer, processor, and `chat_template.jinja`, together with the `super-v3.5-posttraining` branch's pinned Megatron Bridge and nested Megatron-LM submodules. NeMo RL must be mounted recursively and visible on every worker. Provision compatible worker environments and build the pinned MCore dataset helpers before launching a driver. Confirm that Python imports Bridge and MCore from this checkout.
-
-The commands below run inside the head container of an existing multi-node Ray allocation with four GPUs per node. They use the existing mounts; they do not start an allocation or Ray cluster.
+The Megatron backend uses a dedicated `NemotronOmniModel` supplied by Megatron Bridge. The Hugging Face processor expands each image placeholder into the complete media-token sequence. The commands below run inside the head container of an existing multi-node Ray allocation with four GPUs per node.
 
 ### Checkpoint compatibility
 
-Set `MM_TRAINER_MODEL_PATH` to the local SuperVL3p5 HF checkpoint. Reuse a Megatron conversion cache only with the same input weights, model integration, and parallel layout. A fresh cache can require HF-to-Megatron conversion before training. Do not reuse a Nano checkpoint or a legacy model-layout cache for SuperVL3p5.
+Use the `nvidia/Nemotron-3-Super-Omni-120B-A12B-Reasoning-BF16` Hugging Face checkpoint or a checkpoint converted with the dedicated `NemotronOmniModel` integration. Set `MM_TRAINER_MODEL_PATH` to the local SuperVL3p5 HF checkpoint or the Huggingface path.
 
 ### Maintained recipes
 
@@ -55,7 +53,7 @@ mkdir -p "$MM_TRAINER_RESULTS_DIR" "$SUPER_CACHE_DIR"
 cd "$RL_DIR"
 ```
 
-Before training, check that the external Ray cluster has the selected recipe's node/GPU count:
+Optionally, before training one can check that the external Ray cluster has the selected recipe's node/GPU count:
 
 ```bash
 uv run --no-sync --python "$DRIVER_PYTHON" python -c \
@@ -71,7 +69,6 @@ uv run --no-sync --python "$DRIVER_PYTHON" python -c \
 | `env.clevr-cogent.reward_functions` | `format` (0.2) + `exact_alnum` (0.8) |
 | Prompts × generations / training global batch | 8 × 16 = 128 rollouts / 8 |
 | Maximum response / total context | 4096 / 8192 tokens |
-| Sequence-error threshold | Unset; no sequence-error masking |
 
 The dataset loader downloads CLEVR-CoGenT on first use; no manual preparation is required. Validation and checkpoints run every 10 steps.
 
@@ -81,7 +78,7 @@ The dataset loader downloads CLEVR-CoGenT on first use; no manual preparation is
 export SUPER_MEGATRON_CACHE=$SUPER_CACHE_DIR/megatron-supervl3p5-tp8-ep8-cp1
 export NRL_MEGATRON_CHECKPOINT_DIR=$SUPER_MEGATRON_CACHE
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False
-uv run --no-sync --python "$DRIVER_PYTHON" python examples/run_vlm_grpo.py \
+uv run --no-sync examples/run_vlm_grpo.py \
   --config examples/configs/recipes/vlm/vlm_grpo-supervl3p5-clevr-16n4g-megatron-tp8ep8.v1.yaml
 ```
 
@@ -96,7 +93,6 @@ uv run --no-sync --python "$DRIVER_PYTHON" python examples/run_vlm_grpo.py \
 | `env.mmpr-tiny.reward_functions` | `geo3k` (1.0), `format_score: 0.1` |
 | Prompts × generations / training global batch | 512 × 16 = 8192 rollouts / 2048 |
 | Maximum response / total context | 8192 / 8192 tokens |
-| `grpo.seq_logprob_error_threshold` | `2.0` |
 
 The loader downloads/extracts OpenGVLab/MMPR-Tiny under `SUPER_MMPR_CACHE`; share this cache across retries. Overlong filtering is enabled. Validation and checkpoints run every 10 steps.
 
@@ -110,7 +106,7 @@ export SUPER_MMPR_CACHE=$SUPER_CACHE_DIR/datasets/mmpr-tiny
 export SUPER_MEGATRON_CACHE=$SUPER_CACHE_DIR/megatron-supervl3p5-tp8-ep16-cp1
 export NRL_MEGATRON_CHECKPOINT_DIR=$SUPER_MEGATRON_CACHE
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False
-uv run --no-sync --python "$DRIVER_PYTHON" python examples/run_vlm_grpo.py \
+uv run --no-sync examples/run_vlm_grpo.py \
   --config examples/configs/recipes/vlm/vlm_grpo-supervl3p5-mmpr-32n4g-megatron-tp8ep16.v1.yaml
 ```
 
@@ -122,5 +118,3 @@ Append Hydra-style overrides to either command, for example `checkpointing.check
 Use a fresh conversion cache when the Bridge/MCore pins or model layout change. Legacy `llava_model` Megatron checkpoints do not match the dedicated Nemotron Omni model; convert from the HF checkpoint instead. Do not resume checkpoints from the previous worktree until compatibility has been checked.
 
 Both recipes save every 10 steps, retain the best two checkpoints by `val:accuracy`, and save optimizer state synchronously. A checkpoint deadline can trigger a final save between regular checkpoint steps. Set the deadline to fit the remaining allocation time and leave room for the final save.
-
-Historical qualification on the previous checkout reached CLEVR step 18 (74.12% validation accuracy at step 10) and completed full-size MMPR-Tiny updates. These results do not qualify the new dependency pins. Recheck full-size rollout, logprobs, optimizer updates, reward, TMPE, and checkpoint restore on this branch before accepting convergence results.
