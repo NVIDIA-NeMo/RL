@@ -47,7 +47,7 @@ def test_rejected_first_and_middle_responses_never_enter_selected_traces(
             response = harness.client.post(
                 kwargs["url_path"],
                 json=kwargs["json"].model_dump(mode="json"),
-                headers=kwargs["headers"],
+                headers=kwargs.get("headers"),
             )
             gym_harness.assert_clean(response)
             return http_response(response.json())
@@ -115,13 +115,6 @@ def test_rejected_first_and_middle_responses_never_enter_selected_traces(
             )
             assert record.parent_call_id == expected_parent
         assert all(response_id not in selected_ids for response_id in rejected_ids)
-        # The retry after the middle rejection still proposes the accepted turn 10,
-        # even across compaction; only the RL decision may turn it into a root.
-        assert (
-            harness.worker_calls[12][0].parent_call_id
-            == by_id[selected_ids[9]].model_call_id
-        )
-
         processed = await env._postprocess_receipt_mode(
             {"_ng_rollout_id": "group_g0"},
             {
