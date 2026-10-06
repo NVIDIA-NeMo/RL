@@ -161,7 +161,6 @@ def _broadcast_batched_data_dict(
     # Leader-only: keep physical segments uncoalesced until their broadcast
     # turn so only one packed payload is staged on the GPU at a time.
     packed_segments: dict[str, list[torch.Tensor]] = {}
-    nested_payloads: dict[str, torch.Tensor] = {}
     leader_error: Exception | None = None
 
     if is_leader:
@@ -170,16 +169,14 @@ def _broadcast_batched_data_dict(
             descriptor: list[Any] = []
             for k, v in data.items():
                 if isinstance(v, torch.Tensor) and v.is_nested:
-                    rows = v.unbind()
-                    nested_payloads[k] = torch.cat([r.reshape(-1) for r in rows])
                     descriptor.append(
                         (
                             k,
                             "nested",
                             str(v.dtype),
-                            [tuple(r.shape) for r in rows],
+                            tuple(v.values().shape),
+                            v.offsets().cpu(),
                             str(v.device),
-                            v.layout,
                         )
                     )
                 elif isinstance(v, torch.Tensor):
@@ -265,25 +262,22 @@ def _broadcast_batched_data_dict(
                 out[key] = tensor
             del tensor
         elif kind == "nested":
-            dtype_str, shapes, src_device, nested_layout = entry[2:]
-            dtype = getattr(torch, dtype_str.split(".")[-1])
+            dtype_str, shape, offsets, src_device = entry[2:]
             if is_leader:
-                flat = nested_payloads.pop(key).to(bcast_device)
+                values = out[key].values().to(bcast_device)
             else:
-                numel = sum(torch.Size(shape).numel() for shape in shapes)
-                flat = torch.empty(numel, dtype=dtype, device=bcast_device)
-            if flat.numel():
-                wire = flat.view(torch.uint8) if dtype == torch.int16 else flat
+                dtype = getattr(torch, dtype_str.split(".")[-1])
+                values = torch.empty(shape, dtype=dtype, device=bcast_device)
+            if values.numel():
+                wire = (
+                    values.view(torch.uint8) if values.dtype == torch.int16 else values
+                )
                 torch.distributed.broadcast(wire, src=src, group=group)
             if not is_leader:
-                flat = flat.to(src_device)
-            rows, offset = [], 0
-            for shape in shapes:
-                numel = torch.Size(shape).numel()
-                rows.append(flat[offset : offset + numel].view(shape))
-                offset += numel
-            out[key] = torch.nested.as_nested_tensor(rows, layout=nested_layout)
-            del flat
+                values = values.to(src_device)
+            out[key] = torch.nested.nested_tensor_from_jagged(
+                values, offsets.to(values.device)
+            )
         elif kind == "packed_tensor":
             header, shapes, dtype_str, source_device = entry[2:]
             if is_leader:
@@ -573,7 +567,7 @@ class TQWorkerMixin:
                     local_batch=local_batch,
                     layout=wire_layout,
                     pad_value_dict=pad_value_dict,
-                    pad_to_seqlen=pad_to_seqlen if wire_layout == "padded" else 0,
+                    pad_to_seqlen=pad_to_seqlen,
                     tags=meta.tags,
                 )
                 if ship_fragments:

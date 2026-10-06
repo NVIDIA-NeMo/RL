@@ -159,19 +159,12 @@ every rank  per microbatch (bins = driver's micro_batch_indices):
               ─► keep this CP rank's slice ─► forward / backward
 ```
 
-Only the replica-group leader reads from TQ, and it broadcasts the DP rank's
-whole batch to every TP, CP and PP rank in its group. Rows cross the
-broadcast unpadded, and each rank pads them afterwards to the cross-DP
-`GLOBAL_FORWARD_PAD_SEQLEN` that the microbatch iterator expects. With router
-replay, routes travel as packed fragments and every rank rebuilds them as
-unpadded per-row routes (`NRL_ROUTE_BCAST=dense` builds them on the leader
-instead). Fields listed in `schema.MICROBATCH_PADDED_FIELDS` (today: routes,
-the largest per-token field) skip that full-batch padding and are padded one
-microbatch at a time, right before the move to GPU, to the same values. The broadcast stages each field whole on GPU, so its GPU peak is the
-largest field, not the whole batch. Sequence packing happens last, per
-microbatch and on every rank: `megatron/data.py` packs the bin's rows into one
-sequence, and each CP rank keeps its own slice. The model only sees the small
-per-sequence CP alignment padding.
+Only the replica-group leader reads from TQ; it broadcasts the batch unpadded,
+one field at a time, and every rank pads it afterwards to
+`GLOBAL_FORWARD_PAD_SEQLEN`. Fields in `schema.MICROBATCH_PADDED_FIELDS`
+(today: routes) stay per-row and are padded one microbatch at a time, right
+before the move to GPU; `NRL_ROUTE_BCAST=dense` instead builds and broadcasts
+the padded routes table on the leader.
 
 ---
 

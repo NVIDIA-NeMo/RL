@@ -19,7 +19,6 @@ from typing import (
     Iterator,
     Literal,
     Mapping,
-    MutableMapping,
     NotRequired,
     Optional,
     Sequence,
@@ -131,6 +130,8 @@ class DynamicBatchingArgs(TypedDict):
 def _select_nested_rows(
     tensor: torch.Tensor, indices: Union[range, list[int], torch.Tensor]
 ) -> torch.Tensor:
+    if len(indices) == 0:
+        indices = range(0)
     if isinstance(indices, range):
         offsets = tensor.offsets()[indices.start : indices.stop + 1]
         return torch.nested.nested_tensor_from_jagged(
@@ -140,21 +141,6 @@ def _select_nested_rows(
     return torch.nested.as_nested_tensor(
         [rows[i] for i in indices], layout=torch.jagged
     )
-
-
-def pad_nested_fields(
-    data: MutableMapping[str, Any],
-    pad_values: Mapping[str, int | float],
-    width: int,
-) -> None:
-    """Pad the nested fields named in ``pad_values`` to ``[rows, width, ...]``."""
-    for key, pad in pad_values.items():
-        value = data.get(key)
-        if not isinstance(value, torch.Tensor) or not value.is_nested:
-            continue
-        padded = torch.nested.to_padded_tensor(value, pad)
-        pad_spec = [0, 0] * (padded.dim() - 2) + [0, width - padded.shape[1]]
-        data[key] = torch.nn.functional.pad(padded, pad_spec, value=pad)
 
 
 class BatchedDataDict(UserDict, Generic[DictT]):
@@ -354,6 +340,11 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 ]
             elif isinstance(list_of_tensors[0], PackedTensor):
                 tensor_or_list = PackedTensor.concat(list_of_tensors)
+            elif torch.is_tensor(list_of_tensors[0]) and list_of_tensors[0].is_nested:
+                tensor_or_list = torch.nested.as_nested_tensor(
+                    [row for tensor in list_of_tensors for row in tensor.unbind()],
+                    layout=torch.jagged,
+                )
             elif all(x.ndim == 1 for x in list_of_tensors):
                 tensor_or_list = torch.cat(list_of_tensors)
             elif isinstance(list_of_tensors[0], torch.Tensor):
@@ -448,7 +439,9 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         indices = torch.arange(B).tensor_split(chunks)[rank]
 
         for k in self.data:
-            if torch.is_tensor(self.data[k]):
+            if torch.is_tensor(self.data[k]) and self.data[k].is_nested:
+                chunked_batch[k] = _select_nested_rows(self.data[k], indices.tolist())
+            elif torch.is_tensor(self.data[k]):
                 chunked_batch[k] = self.data[k][indices].clone()
             elif isinstance(self.data[k], PackedTensor):
                 chunked_batch[k] = self.data[k].slice(indices)
@@ -477,7 +470,9 @@ class BatchedDataDict(UserDict, Generic[DictT]):
 
         for k, v in self.data.items():
             sorted_v: torch.Tensor | list[Any]
-            if torch.is_tensor(v):
+            if torch.is_tensor(v) and v.is_nested:
+                sorted_v = _select_nested_rows(v, reordered_indices)
+            elif torch.is_tensor(v):
                 sorted_v = v.index_select(
                     dim=0, index=torch.IntTensor(reordered_indices)
                 )
@@ -638,7 +633,9 @@ class BatchedDataDict(UserDict, Generic[DictT]):
             # finally reorder the data along the sorted sequence len indices
             for k, v in self.data.items():
                 sorted_v: torch.Tensor | list[Any] | PackedTensor
-                if torch.is_tensor(v):
+                if torch.is_tensor(v) and v.is_nested:
+                    sorted_v = _select_nested_rows(v, batch_sorted_indices)
+                elif torch.is_tensor(v):
                     sorted_v = v.index_select(
                         dim=0, index=torch.IntTensor(batch_sorted_indices)
                     )
