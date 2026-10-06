@@ -224,6 +224,49 @@ def test_sync_weight_updates_check_every_internal_worker(
 
 
 @pytest.mark.vllm
+def test_sync_sleep_honors_configured_sleep_level(monkeypatch):
+    """Colocated workers can discard stale weights with level-2 sleep."""
+    from nemo_rl.models.generation.vllm import vllm_worker
+
+    worker = vllm_worker.VllmGenerationWorkerImpl.__new__(
+        vllm_worker.VllmGenerationWorkerImpl
+    )
+    worker.cfg = {"vllm_cfg": {"async_engine": False}}
+    worker.llm = SimpleNamespace(
+        llm_engine=SimpleNamespace(reset_prefix_cache=MagicMock()),
+        sleep=MagicMock(),
+    )
+    monkeypatch.setenv("NRL_VLLM_SLEEP_LEVEL", "2")
+    monkeypatch.setattr(vllm_worker.gc, "collect", lambda: None)
+    monkeypatch.setattr(vllm_worker.torch.cuda, "empty_cache", lambda: None)
+
+    worker.sleep()
+
+    worker.llm.sleep.assert_called_once_with(level=2)
+
+
+@pytest.mark.vllm
+def test_sync_sleep_rejects_invalid_sleep_level(monkeypatch):
+    """Invalid sleep levels fail before entering vLLM sleep."""
+    from nemo_rl.models.generation.vllm import vllm_worker
+
+    worker = vllm_worker.VllmGenerationWorkerImpl.__new__(
+        vllm_worker.VllmGenerationWorkerImpl
+    )
+    worker.cfg = {"vllm_cfg": {"async_engine": False}}
+    worker.llm = SimpleNamespace(
+        llm_engine=SimpleNamespace(reset_prefix_cache=MagicMock()),
+        sleep=MagicMock(),
+    )
+    monkeypatch.setenv("NRL_VLLM_SLEEP_LEVEL", "3")
+
+    with pytest.raises(ValueError, match="must be 1 or 2"):
+        worker.sleep()
+
+    worker.llm.sleep.assert_not_called()
+
+
+@pytest.mark.vllm
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "method_name",
@@ -257,6 +300,29 @@ async def test_async_weight_updates_check_every_internal_worker(
         worker.llm.reset_encoder_cache.assert_awaited_once_with()
     else:
         worker.llm.reset_encoder_cache.assert_not_awaited()
+
+
+@pytest.mark.vllm
+@pytest.mark.asyncio
+async def test_async_sleep_honors_configured_sleep_level(monkeypatch):
+    """Async colocated workers use the same configured sleep level."""
+    from nemo_rl.models.generation.vllm import vllm_worker_async
+
+    worker = vllm_worker_async.VllmAsyncGenerationWorkerImpl.__new__(
+        vllm_worker_async.VllmAsyncGenerationWorkerImpl
+    )
+    worker.cfg = {"vllm_cfg": {"async_engine": True}}
+    worker.llm = SimpleNamespace(
+        reset_prefix_cache=AsyncMock(),
+        sleep=AsyncMock(),
+    )
+    monkeypatch.setenv("NRL_VLLM_SLEEP_LEVEL", "2")
+    monkeypatch.setattr(vllm_worker_async.gc, "collect", lambda: None)
+    monkeypatch.setattr(vllm_worker_async.torch.cuda, "empty_cache", lambda: None)
+
+    await worker.sleep_async()
+
+    worker.llm.sleep.assert_awaited_once_with(level=2)
 
 
 @pytest.mark.vllm

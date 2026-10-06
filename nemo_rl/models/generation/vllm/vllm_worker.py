@@ -1306,7 +1306,10 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             self.llm.renderer, "clear_mm_cache"
         ):
             self.llm.renderer.clear_mm_cache()
-        self.llm.sleep(level=1)
+        sleep_level = int(os.getenv("NRL_VLLM_SLEEP_LEVEL", "1"))
+        if sleep_level not in (1, 2):
+            raise ValueError(f"NRL_VLLM_SLEEP_LEVEL must be 1 or 2, got {sleep_level}")
+        self.llm.sleep(level=sleep_level)
 
         gc.collect()
         torch.cuda.empty_cache()
