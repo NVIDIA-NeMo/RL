@@ -39,7 +39,6 @@ policy:
   offload_optimizer_for_logprob: false
 
   dtensor_cfg:
-    _v2: true
     enabled: true
     checkpoint:
       model_save_format: "safetensors"
@@ -298,6 +297,10 @@ logger:
   wandb:
     project: "sft-dev"
     name: "sft-dev-${data.train.dataset_name}"
+    entity: null
+    id: null
+    resume: null
+    log_nemo_gym_full_result_tables: false
   swanlab:
     project: "sft-dev"
     name: "sft-dev-${data.train.dataset_name}"
@@ -307,14 +310,19 @@ logger:
     experiment_name: "sft-dev"
     run_name: "sft-dev-${data.train.dataset_name}"
     tracking_uri: "http://localhost:5000"
+    run_id: null
+    artifact_location: null
   gpu_monitoring:
     collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
+  num_val_samples_to_print: 0
 
 cluster:
   gpus_per_node: 1
   num_nodes: 1
   segment_size: null
+  master_port_range_low: null
+  master_port_range_high: null
 
 # OpenTelemetry instrumentation; null = disabled (default). Mirrors the optional
 # field on the MasterConfig, which stays None unless a run opts in.

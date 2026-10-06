@@ -32,6 +32,7 @@ from nemo_rl.algorithms.sft import (
 )
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.virtual_cluster import ClusterConfig
 
 
 def test_get_sft_save_state_handles_legacy_checkpoint_and_filters_metrics():
@@ -150,10 +151,7 @@ def mock_components():
             "checkpoint_must_save_by": None,
             "save_period": 10,
         },
-        cluster={
-            "num_nodes": 1,
-            "gpus_per_node": 2,
-        },
+        cluster=ClusterConfig(num_nodes=1, gpus_per_node=2),
     )
 
     return {

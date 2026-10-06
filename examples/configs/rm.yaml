@@ -44,7 +44,6 @@ policy:
     reward_model_type: "bradley_terry"  # only "bradley_terry" is currently supported
 
   dtensor_cfg:
-    _v2: true
     enabled: true
     checkpoint:
       model_save_format: "safetensors"
@@ -203,7 +202,7 @@ data:
 
   # If you are doing checkpointing, `metric_name` should reflect the metric and validation set to be tracked. For example:
   #   checkpointing:
-  #     metric_name: "validation-<NameOfValidationDataset1>_loss"
+  #     metric_name: "val:validation-<NameOfValidationDataset1>_loss"
   #   ...
 
 logger:
