@@ -9,6 +9,7 @@ loss_fn:
 checkpointing:
   checkpoint_dir: results/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-automodel-ep16
 policy:
+  make_sequence_length_divisible_by: 64
   model_name: Qwen/Qwen3.5-35B-A3B-Base
   hf_config_overrides:
     text_config:
@@ -42,7 +43,7 @@ policy:
         linear: te
         rms_norm: te
         experts: gmm
-        dispatcher: deepep
+        dispatcher: hybridep
         fake_balanced_gate: false
         rope_fusion: false
         enable_hf_state_dict_adapter: true
