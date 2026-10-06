@@ -132,11 +132,8 @@ class AutomodelBackendConfig(TypedDict):
     # MoE expert GEMM backend: "torch" (per-expert loop), "te" (TE GroupedLinear),
     # "gmm" (grouped_gemm.ops.gmm), "torch_mm" (torch._grouped_mm).
     experts: NotRequired[str]
-    # MoE token dispatcher: "torch" (DTensor all-gather/reduce-scatter), "deepep", etc.
+    # MoE token dispatcher: "torch" (DTensor all-gather/reduce-scatter) or "hybridep".
     dispatcher: NotRequired[str]
-    # Enable DeepEP (Deep Expert Parallelism) for MoE models.
-    # Deprecated upstream: use dispatcher="deepep" and experts="gmm"/"torch_mm" instead.
-    enable_deepep: NotRequired[bool]
     # Use fake balanced gate for testing/debugging MoE
     fake_balanced_gate: NotRequired[bool]
     # Enable HuggingFace state dict adapter for checkpoint saving/loading plus refit support for RL
@@ -199,13 +196,12 @@ class AutomodelCheckpointConfig(TypedDict, total=False):
 class DTensorConfig(TypedDict):
     enabled: Literal[True]
     env_vars: NotRequired[dict[str, str] | None]
-    _v2: NotRequired[bool]
     # Distributed parallelism sizes
     # data_parallel_size is derived from world_size / (tp * cp * ep)
     tensor_parallel_size: int
     context_parallel_size: int
     expert_parallel_size: NotRequired[int]
-    # Size of the HSDP replicate dimension within the data-parallel axis (DTensor v2 only).
+    # Size of the HSDP replicate dimension within the data-parallel axis.
     dp_replicate_size: NotRequired[int]
     # Distributed config options (mirrors Automodel's FSDP2Config)
     sequence_parallel: bool
@@ -262,6 +258,9 @@ class MegatronPeftConfig(TypedDict):
     lora_B_init_method: str
     a2a_experimental: bool
     lora_dtype: str | None
+    # Share one adapter across grouped MoE experts on each EP rank. Set to
+    # False to create one adapter per local expert.
+    share_expert_adapters: NotRequired[bool]
     # Warm start: path to a native Megatron-Bridge PEFT checkpoint (an
     # iter_XXXXXXX directory, or a checkpoint root resolving to one) whose
     # adapter weights initialize this run's LoRA modules. The donor checkpoint
@@ -398,6 +397,7 @@ class MegatronConfig(TypedDict):
     context_parallel_size: int
     # Nemotron Omni RADIO/provider booleans. Omit any field to retain the model
     # provider's checkpoint/default value.
+    radio_force_eval_mode: NotRequired[bool]
     radio_force_cpe_eval_mode: NotRequired[bool]
     # Nemotron Omni tower freeze booleans. Omit any field to retain the model
     # provider's checkpoint/default value.
@@ -405,6 +405,12 @@ class MegatronConfig(TypedDict):
     freeze_vision_projection: NotRequired[bool]
     freeze_sound_encoder: NotRequired[bool]
     freeze_sound_projection: NotRequired[bool]
+    # Nemotron Omni vision-tower activation recomputation controls. Omit any
+    # field to retain the model provider's checkpoint/default value.
+    recompute_vision: NotRequired[bool]
+    vision_recompute_granularity: NotRequired[str | None]
+    vision_recompute_method: NotRequired[str | None]
+    vision_recompute_num_layers: NotRequired[int | None]
     pipeline_dtype: str
     sequence_parallel: bool
     freeze_moe_router: bool

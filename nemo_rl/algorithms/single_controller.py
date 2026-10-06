@@ -86,19 +86,28 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     TQReplayMetadataState,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    ReadyFirstSamplerConfig,
     TransactionalAdmissionSampler,
     create_sampler,
 )
 from nemo_rl.algorithms.grpo import (
-    GRPOConfig,
     GRPOSaveState,
-    _clip_grpo_advantages,
     _write_latest_checkpoint_status,
     aggregate_rollout_metrics,
-    compute_and_apply_seq_logprob_error_masking,
 )
-from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
+from nemo_rl.algorithms.metric_utils import (
+    SETUP_TIMING_PREFIX,
+    SetupTimingMetrics,
+)
 from nemo_rl.algorithms.ppo import _compute_critic_metrics
+from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
+    AdvantageComputer,
+    AdvantageOutcome,
+    AdvantageRequest,
+    AdvantageStageConfig,
+    row_group_ids,
+    split_meta_by_prompt_group,
+)
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     MasterConfig,
@@ -126,11 +135,7 @@ from nemo_rl.algorithms.single_controller_utils.setup import (
 )
 from nemo_rl.algorithms.single_controller_utils.utils import (
     aggregate_step_metrics,
-    apply_message_level_advantage_penalties,
-    fields_for_put,
     reduce_advantage_pump_metrics,
-    squeeze_trailing_unit_dim,
-    tensor_field,
 )
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.multimodal_utils import present_multimodal_fields
@@ -175,12 +180,29 @@ from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.models.value.tq_value import TQValue
+from nemo_rl.telemetry.instrumentation import (
+    NO_SPAN,
+    RL_IDLE_POLLS_ATTR,
+    efficiency_span,
+    is_span_group_enabled,
+    managed_span,
+    per_prompt_scope,
+    safe_set_span_attributes,
+    start_efficiency_span,
+    umbrella_span,
+)
+from nemo_rl.telemetry.setup import (
+    init_telemetry_worker,
+    shutdown_telemetry,
+)
+from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.utils.checkpoint import (
     CheckpointManager,
     PathLike,
 )
 from nemo_rl.utils.logger import TELEMETRY_WALL_TIME_METRIC, Logger
 from nemo_rl.utils.timer import TimeoutChecker, Timer
+from nemo_rl.utils.train_data_dump import TrainDataDump
 
 if TYPE_CHECKING:
     from nemo_rl.experience.rollout_reassembler import FinalizedGroup
@@ -250,16 +272,21 @@ def _percentile(values: list[float], quantile: float) -> float:
 
 
 def _pooled_opd_metrics(
-    stat_sum: float, stat_sumsq: float, count: int
+    stat_sum: float, stat_sumsq: float, count: int, gap_sum: float
 ) -> dict[str, float]:
-    """Compute whole-step OPD metrics from exact pooled sufficient statistics."""
+    """Compute whole-step OPD metrics from exact pooled sufficient statistics.
+
+    ``stat_*`` pool the advantage and ``gap_sum`` the raw teacher-student gap
+    over the same tokens. They differ once TROPD (proximal_teacher_alpha < 1)
+    or subtract_global_baseline reshapes the advantage.
+    """
     if count <= 0:
         return {}
     mean = stat_sum / count
     # OPDAdvantageEstimator uses torch.std's default unbiased estimator.
     variance = (stat_sumsq - count * mean * mean) / (count - 1) if count > 1 else 0.0
     return {
-        "on_policy_distillation/teacher_student_logprob_gap_mean": mean,
+        "on_policy_distillation/teacher_student_logprob_gap_mean": gap_sum / count,
         "on_policy_distillation/adv_mean": mean,
         "on_policy_distillation/adv_std": math.sqrt(max(variance, 0.0)),
     }
@@ -307,6 +334,12 @@ class SingleControllerActor:
     # tick, and it must exist on any instance the watchdog can reach.
     _recovering_from_refit: bool = False
 
+    # Declared on the class for the same reason, and because every pump reaches
+    # for it: ``None`` makes ``managed_span`` fall back to the process-global
+    # handle, so an instance built without running __init__ emits no spans
+    # rather than raising out of the training loop.
+    _tracer: Any = None
+
     def __init__(
         self,
         master_config: MasterConfig,
@@ -320,6 +353,15 @@ class SingleControllerActor:
             actor_args: Pre-built actor args from setup_single_controller.
             setup_timing_metrics: Driver-side setup timings; logged here (Logger isn't cloudpickleable).
         """
+        # The run lives in this actor, so it opens the job span. Named
+        # explicitly: nothing sets NRL_WORKER_GROUP outside RayWorkerGroup.
+        _telemetry = init_telemetry_worker(
+            rank=0,
+            world_size=1,
+            worker_group="single_controller",
+        )
+        self._tracer = _telemetry.tracer if _telemetry is not None else None
+
         self._advantage_cfg = AdvantageConfig()
         self._partition_id: str = actor_args.partition_id
 
@@ -332,22 +374,18 @@ class SingleControllerActor:
         self._critic_ppo_epochs: int = (
             self._algo_cfg.critic_ppo_epochs if self._is_ppo else 1
         )
+        # The advantage pool is built driver-side from the same derivation, so
+        # read the gates off it rather than recomputing them here.
+        self._advantage_stage_config = AdvantageStageConfig.from_master_config(
+            master_config
+        )
+        stage_cfg = self._advantage_stage_config
         self._message_level_advantage_penalties_enabled = (
-            self._algo_cfg.invalid_tool_call_advantage is not None
-            or self._algo_cfg.malformed_thinking_advantage is not None
+            stage_cfg.message_level_advantage_penalties_enabled
         )
-
-        self._policy_logprobs_required = not (
-            master_config.loss_fn.force_on_policy_ratio
-            and self._algo_cfg.seq_logprob_error_threshold is None
-        )
-        # _build_trainer initializes the reference model only for a positive KL
-        # penalty, so the controller must use the same gate before requesting it.
-        self._reference_logprobs_required = bool(
-            master_config.loss_fn.reference_policy_kl_penalty > 0
-            and not self._algo_cfg.skip_reference_policy_logprobs_calculation
-        )
-        self._teacher_logprobs_required = opd_module.is_opd_enabled(master_config)
+        self._policy_logprobs_required = stage_cfg.policy_logprobs_required
+        self._reference_logprobs_required = stage_cfg.reference_logprobs_required
+        self._teacher_logprobs_required = stage_cfg.teacher_logprobs_required
         self._train_fields = _train_fields_for_step(
             policy_logprobs_required=self._policy_logprobs_required,
             reference_logprobs_required=self._reference_logprobs_required,
@@ -374,6 +412,10 @@ class SingleControllerActor:
                         for index in generation_workers.dp_leader_worker_indices
                     )
                 checkpoint_workers.extend(actor_args.finalizer_actors)
+                # Advantage actors write the advantages column through their own
+                # connect-only clients, so their local stores hold rows a
+                # snapshot must see.
+                checkpoint_workers.extend(actor_args.advantage_actors)
                 # Reuse existing actor RPCs. This actor's local store is handled
                 # directly: __init__ cannot service an RPC back to itself.
                 configure_checkpoint_workers(checkpoint_workers)
@@ -418,6 +460,19 @@ class SingleControllerActor:
         self._dataloader = actor_args.dataloader
         self._weight_synchronizer = actor_args.weight_synchronizer
         self._advantage_estimator = actor_args.advantage_estimator
+        # Built driver-side so the actors attach their TQ clients before this
+        # process configures checkpoint participants. Empty means the stage runs
+        # in-process through the same computer the actors wrap, so a run without
+        # a pool and a run with one cannot drift.
+        self._advantage_actors: list[Any] = list(actor_args.advantage_actors)
+        self._available_advantage_actors: asyncio.Queue = asyncio.Queue()
+        for actor in self._advantage_actors:
+            self._available_advantage_actors.put_nowait(actor)
+        self._advantage_computer = AdvantageComputer(
+            self._dp_client,
+            config=self._advantage_stage_config,
+            advantage_estimator=self._advantage_estimator,
+        )
         self._loss_fn = actor_args.loss_fn
         self._value_loss_fn = getattr(actor_args, "value_loss_fn", None)
         self._buffer = actor_args.tq_buffer
@@ -485,7 +540,7 @@ class SingleControllerActor:
             hparams["token_capture"]["control_auth_token"] = "<redacted>"
         self._logger.log_hyperparams(hparams)
         self._logger.log_metrics(
-            setup_timing_metrics.to_metrics_dict(), step=0, prefix="timing/setup"
+            setup_timing_metrics.to_metrics_dict(), step=0, prefix=SETUP_TIMING_PREFIX
         )
         self._timer = Timer()
         self._throughput_sample_time: Optional[float] = None
@@ -655,17 +710,24 @@ class SingleControllerActor:
         self._train_steps: int = actor_args.save_state.current_step
         self._current_epoch: int = actor_args.save_state.current_epoch
         self._step_log_dict: dict[str, list] = {
-            "rewards": [],
-            "sample_masks": [],
-            "masked_advantages": [],
+            "reward_partials": [],
+            "advantage_partials": [],
             "num_mask_sample_filtered": [],
             "sequence_lengths": [],
             "seq_logprob_error_metrics": [],
             **{key: [] for key in VIOLATION_TAG_KEYS},
         }
+        self._opd_gap_sum = 0.0
         self._opd_stat_sum = 0.0
         self._opd_stat_sumsq = 0.0
         self._opd_stat_count = 0
+        self._train_data_dump = (
+            TrainDataDump(self._logger.base_log_dir)
+            if self._async_cfg.log_full_train_data
+            else None
+        )
+        # Rows the stage reported writing this step, across every shard.
+        self._train_data_dump_rows = 0
 
         # Seeded here rather than in run(): on resume _trainer_version is the
         # checkpoint's step, so a run resuming mid-warmup needs the widened
@@ -685,6 +747,29 @@ class SingleControllerActor:
 
     async def run(self) -> dict[str, Any]:
         """Main entry point. Runs until max_train_steps is reached."""
+        try:
+            with umbrella_span(
+                RLSpanGroup.U_JOB,
+                "rl.sc.job",
+                tracer=self._tracer,
+                **{"rl.algorithm": "ppo" if self._is_ppo else "grpo"},
+            ):
+                result = await self._run_pumps()
+        finally:
+            # Outside the span so the job span is flushed too, and off the
+            # event loop because the exporter's flush blocks. Shielded, and a
+            # cancel swallowed, because teardown is exactly when cancellation
+            # lands and it would mask what _run_pumps actually raised.
+            try:
+                await asyncio.shield(asyncio.to_thread(shutdown_telemetry))
+            except asyncio.CancelledError:
+                pass
+        # After the try, not inside it: pyrefly 0.24.2 reads a return nested in a
+        # try/finally as a path that can fall off the end of the function.
+        return result
+
+    async def _run_pumps(self) -> dict[str, Any]:
+        """Start the rollout / train / watchdog pumps and run until one finishes."""
         # Synchronize weights before starting the pumps, unless setup already delivered them.
         if self._weight_synchronizer.is_stale:
             await self._sync_weights()
@@ -1873,19 +1958,15 @@ class SingleControllerActor:
 
     @staticmethod
     def _group_ids_from_meta(meta: KVBatchMeta) -> list[str]:
-        """Return stable prompt-group IDs in canonical sample order."""
-        group_ids: list[str] = []
-        seen_group_ids: set[str] = set()
-        for sample_id in meta.sample_ids:
-            group_id = sample_id
-            if "_g" in sample_id:
-                candidate, generation_index = sample_id.rsplit("_g", 1)
-                if candidate and generation_index.isdigit():
-                    group_id = candidate
-            if group_id not in seen_group_ids:
-                group_ids.append(group_id)
-                seen_group_ids.add(group_id)
-        return group_ids
+        """Return stable prompt-group IDs in canonical sample order.
+
+        Reads the same tag the advantage stage keys its baseline on rather than
+        parsing the ``_g{i}`` suffix back off the sample ids, so the two do not
+        disagree about what a group is. The stage would raise on a batch whose
+        tag is missing anyway; doing it here fails one stage earlier in the
+        same iteration.
+        """
+        return list(dict.fromkeys(row_group_ids(meta)))
 
     # ── the three pumps + the inline advantage stage ───────────────────────
 
@@ -1949,19 +2030,23 @@ class SingleControllerActor:
                     ownership_transferred = False
                     try:
                         while True:
-                            if lineage_group_id is None:
-                                request = await self._rollout_manager.generate_for_finalization(
-                                    prompt,
-                                    target_step=target_step,
-                                    inflight_registry=self._inflight_by_group_id,
-                                )
-                            else:
-                                request = await self._rollout_manager.generate_for_finalization(
-                                    prompt,
-                                    target_step=target_step,
-                                    inflight_registry=self._inflight_by_group_id,
-                                    lineage_group_id=lineage_group_id,
-                                )
+                            # Scope only, no span: dispatched per prompt like
+                            # the branch below, so the gym and data-plane
+                            # spans under it must be gated on PER_PROMPT.
+                            with per_prompt_scope():
+                                if lineage_group_id is None:
+                                    request = await self._rollout_manager.generate_for_finalization(
+                                        prompt,
+                                        target_step=target_step,
+                                        inflight_registry=self._inflight_by_group_id,
+                                    )
+                                else:
+                                    request = await self._rollout_manager.generate_for_finalization(
+                                        prompt,
+                                        target_step=target_step,
+                                        inflight_registry=self._inflight_by_group_id,
+                                        lineage_group_id=lineage_group_id,
+                                    )
                             if not inflight_count_released:
                                 self._inflight_rollouts -= 1
                                 inflight_count_released = True
@@ -2069,19 +2154,40 @@ class SingleControllerActor:
                 else:
                     while True:
                         try:
-                            if lineage_group_id is None:
-                                outcome = await self._rollout_manager.generate_and_push(
-                                    prompt,
-                                    target_step=target_step,
-                                    inflight_registry=self._inflight_by_group_id,
+                            # One span per dispatch attempt, gated before
+                            # the attribute dict since this runs per prompt.
+                            # per_prompt_scope() is entered either way: the
+                            # data-plane put inside reads it.
+                            if is_span_group_enabled(RLSpanGroup.U_PER_PROMPT):
+                                rollout_span: Any = umbrella_span(
+                                    RLSpanGroup.U_PER_PROMPT,
+                                    "rl.sc.generate_and_push",
+                                    tracer=self._tracer,
+                                    **{
+                                        "rl.rollout.attempt": replacements,
+                                        **(
+                                            {}
+                                            if target_step is None
+                                            else {"rl.target_step": target_step}
+                                        ),
+                                    },
                                 )
                             else:
-                                outcome = await self._rollout_manager.generate_and_push(
-                                    prompt,
-                                    target_step=target_step,
-                                    inflight_registry=self._inflight_by_group_id,
-                                    lineage_group_id=lineage_group_id,
-                                )
+                                rollout_span = NO_SPAN
+                            with per_prompt_scope(), rollout_span:
+                                if lineage_group_id is None:
+                                    outcome = await self._rollout_manager.generate_and_push(
+                                        prompt,
+                                        target_step=target_step,
+                                        inflight_registry=self._inflight_by_group_id,
+                                    )
+                                else:
+                                    outcome = await self._rollout_manager.generate_and_push(
+                                        prompt,
+                                        target_step=target_step,
+                                        inflight_registry=self._inflight_by_group_id,
+                                        lineage_group_id=lineage_group_id,
+                                    )
                         except BaseException:
                             # On success ownership transfers to the train pump, which
                             # releases this permit after consuming the committed group.
@@ -2623,7 +2729,24 @@ class SingleControllerActor:
             consumed_group_count = 0
             step_finalizer_metrics: dict[str, list[float]] = {}
 
-            with self._timer.time("total_step_time"):
+            with (
+                self._timer.time("total_step_time"),
+                umbrella_span(
+                    RLSpanGroup.U_STEP,
+                    "rl.sc.step",
+                    tracer=self._tracer,
+                    # No rl.epoch: the rollout pump advances the epoch on its own
+                    # clock, so its value here would describe whichever epoch that
+                    # pump had reached, not the one this step's data came from.
+                    **{
+                        "rl.iteration": self._train_steps + 1,
+                        "rl.weight_version": version_during_step,
+                    },
+                ),
+            ):
+                # One span per starvation episode, not per 5ms poll.
+                starvation_span: Optional[Any] = None
+                starvation_polls = 0
                 # Re-read on every iteration rather than once: a prompt stamped for this
                 # step can be dropped while the pump is already waiting for it, which is
                 # precisely the case that would otherwise wait forever.
@@ -2733,8 +2856,29 @@ class SingleControllerActor:
                                     f"groups with {buffered_groups} group(s) "
                                     f"remaining in the buffer"
                                 )
+                            # Safe to span the select: a starved poll never
+                            # reaches the data plane, so nothing below is
+                            # counted twice.
+                            if starvation_span is None:
+                                starvation_span = start_efficiency_span(
+                                    "idle/buffer_starvation", tracer=self._tracer
+                                )
+                                starvation_polls = 0
+                            starvation_polls += 1
                             await asyncio.sleep(0.005)
                             continue
+
+                        # A batch is selectable, so the wait is over. Closing it
+                        # here rather than after the loop keeps the span on the
+                        # stall itself; the loop can go around again for the next
+                        # chunk, which opens a fresh episode.
+                        if starvation_span is not None:
+                            safe_set_span_attributes(
+                                starvation_span,
+                                {RL_IDLE_POLLS_ATTR: starvation_polls},
+                            )
+                            starvation_span.end()
+                            starvation_span = None
 
                         consumed_metas.append(train_meta)
                         consumed_training_claim_ids.extend(selected_training_claim_ids)
@@ -2774,7 +2918,14 @@ class SingleControllerActor:
                         self._policy_logprobs_required
                         or self._reference_logprobs_required
                     ):
-                        with self._timer.time("logprob_inference_prep"):
+                        with (
+                            self._timer.time("logprob_inference_prep"),
+                            managed_span(
+                                RLSpanGroup.DATA_PROCESSING,
+                                "rl.sc.logprob_inference_prep",
+                                tracer=self._tracer,
+                            ),
+                        ):
                             # Once the step is open, gradients are accumulating
                             # in the trainer's grad buffers across chunks. The
                             # Megatron buffer offload frees that storage outright
@@ -2785,7 +2936,14 @@ class SingleControllerActor:
                                 self._trainer.prepare_for_lp_inference,
                                 keep_train_buffers=step_open,
                             )
-                        with self._timer.time("policy_and_reference_logprobs"):
+                        with (
+                            self._timer.time("policy_and_reference_logprobs"),
+                            managed_span(
+                                RLSpanGroup.LOGPROB,
+                                "rl.sc.policy_and_reference_logprobs",
+                                tracer=self._tracer,
+                            ),
+                        ):
                             if self._policy_logprobs_required:
                                 await asyncio.to_thread(
                                     self._trainer.get_logprobs_from_meta, train_meta
@@ -2798,17 +2956,38 @@ class SingleControllerActor:
                     elif self._is_ppo:
                         # prepare_for_lp_inference is skipped here, and it is the only
                         # other call that parks the policy optimizer before the critic.
-                        with self._timer.time("value_inference_prep"):
+                        with (
+                            self._timer.time("value_inference_prep"),
+                            managed_span(
+                                RLSpanGroup.DATA_PROCESSING,
+                                "rl.sc.value_inference_prep",
+                                tracer=self._tracer,
+                            ),
+                        ):
                             await asyncio.to_thread(self._trainer.offload_to_cpu)
 
                     # Value model forward
                     if self._is_ppo:
-                        with self._timer.time("value_inference"):
+                        with (
+                            self._timer.time("value_inference"),
+                            managed_span(
+                                RLSpanGroup.ADVANTAGE,
+                                "rl.sc.value_inference",
+                                tracer=self._tracer,
+                            ),
+                        ):
                             await asyncio.to_thread(self._trainer.finish_inference)
                             train_meta = await self._value_stage(train_meta)
 
                     # Compute advantages
-                    with self._timer.time("advantage_calculation"):
+                    with (
+                        self._timer.time("advantage_calculation"),
+                        managed_span(
+                            RLSpanGroup.ADVANTAGE,
+                            "rl.sc.advantage_calculation",
+                            tracer=self._tracer,
+                        ),
+                    ):
                         (
                             train_meta,
                             has_valid_training_tokens,
@@ -2840,7 +3019,15 @@ class SingleControllerActor:
                         # periodic snapshots out until this whole training step is
                         # published as consumed below.
                         self._optimizer_commit_in_progress = True
-                        with self._timer.time("value_training"):
+                        with (
+                            self._timer.time("value_training"),
+                            managed_span(
+                                RLSpanGroup.POLICY_UPDATE,
+                                "rl.sc.value_training",
+                                tracer=self._tracer,
+                                **{"rl.critic_epochs": self._critic_ppo_epochs},
+                            ),
+                        ):
                             value_result = await self._value_train_epochs(
                                 train_meta,
                                 num_epochs=self._critic_ppo_epochs,
@@ -2860,12 +3047,27 @@ class SingleControllerActor:
                         # Always restore training mode because log-prob inference may have
                         # switched the model to inference mode. Keep it resident
                         # across every PPO actor epoch.
-                        with self._timer.time("training_prep"):
+                        with (
+                            self._timer.time("training_prep"),
+                            managed_span(
+                                RLSpanGroup.DATA_PROCESSING,
+                                "rl.sc.training_prep",
+                                tracer=self._tracer,
+                            ),
+                        ):
                             await asyncio.to_thread(self._trainer.prepare_for_training)
 
                         if has_valid_training_tokens:
-                            for _ in range(self._ppo_epochs):
-                                with self._timer.time("policy_training"):
+                            for epoch in range(self._ppo_epochs):
+                                with (
+                                    self._timer.time("policy_training"),
+                                    managed_span(
+                                        RLSpanGroup.POLICY_UPDATE,
+                                        "rl.sc.policy_training",
+                                        tracer=self._tracer,
+                                        **{"rl.ppo_epoch": epoch + 1},
+                                    ),
+                                ):
                                     if not step_open:
                                         await asyncio.to_thread(
                                             self._trainer.begin_train_step,
@@ -2944,6 +3146,16 @@ class SingleControllerActor:
                         self._algo_cfg.num_prompts_per_step,
                     )
 
+                # The loop can leave a wait open on two exits that continue
+                # the run, where an unended span would stay open over the
+                # training that follows and never be exported. The other
+                # exits all end the run, so they are not covered.
+                if starvation_span is not None:
+                    safe_set_span_attributes(
+                        starvation_span, {RL_IDLE_POLLS_ATTR: starvation_polls}
+                    )
+                    starvation_span.end()
+
                 # ---- 5. Train the policy model -- finish_train_step ----
                 log.info(
                     "train_pump: step %d closing on %d chunk(s), %d group(s)",
@@ -2963,7 +3175,14 @@ class SingleControllerActor:
                             "to avoid an optimizer step with an empty batch."
                         )
 
-                    with self._timer.time("policy_training"):
+                    with (
+                        self._timer.time("policy_training"),
+                        managed_span(
+                            RLSpanGroup.POLICY_UPDATE,
+                            "rl.sc.policy_optimizer_step",
+                            tracer=self._tracer,
+                        ),
+                    ):
                         policy_result = await asyncio.to_thread(
                             self._trainer.finish_train_step
                         )
@@ -3013,13 +3232,24 @@ class SingleControllerActor:
                         self._opd_stat_sum,
                         self._opd_stat_sumsq,
                         self._opd_stat_count,
+                        gap_sum=self._opd_gap_sum,
                     )
                 )
+                self._opd_gap_sum = 0.0
                 self._opd_stat_sum = 0.0
                 self._opd_stat_sumsq = 0.0
                 self._opd_stat_count = 0
                 if self._teacher_coordinator is not None:
                     step_metrics.update(self._teacher_coordinator.drain_metrics())
+
+                if self._train_data_dump is not None:
+                    with self._timer.time("train_data_dump"):
+                        await asyncio.to_thread(
+                            self._train_data_dump.finish_step,
+                            self._train_steps,
+                            self._train_data_dump_rows,
+                        )
+                    self._train_data_dump_rows = 0
 
                 self._trainer_version += 1
                 self._train_steps += 1
@@ -3097,12 +3327,19 @@ class SingleControllerActor:
                     if defer_refit_for_save:
                         # Refit-deferral (colocated): the engine is about to be saved; let it sleep.
                         # Record `weight_sync` for consistency in reports.
+                        # No refit_bubble: this branch syncs nothing.
                         with self._timer.time("weight_sync"):
                             pass
                         with self._timer.time("offload_before_refit"):
                             await asyncio.to_thread(self._trainer.offload_before_refit)
                     else:
-                        with self._timer.time("weight_sync"):
+                        # Named to match async GRPO's refit phase: training cannot
+                        # proceed and generation is serving stale weights, so the
+                        # same seconds are idle on both fleets.
+                        with (
+                            self._timer.time("weight_sync"),
+                            efficiency_span("idle/refit_bubble", tracer=self._tracer),
+                        ):
                             calibration_data = (
                                 BatchedDataDict.from_batches(calibration_batches)
                                 if calibration_batches
@@ -3138,7 +3375,15 @@ class SingleControllerActor:
 
                 # Checkpointing (mirrors async_grpo_train's save block).
                 if will_save_checkpoint:
-                    with self._timer.time("checkpointing"):
+                    with (
+                        self._timer.time("checkpointing"),
+                        managed_span(
+                            RLSpanGroup.CHECKPOINT,
+                            "rl.sc.checkpointing",
+                            tracer=self._tracer,
+                            **{"rl.step": self._train_steps},
+                        ),
+                    ):
                         await self._save_checkpoint(
                             step_metrics,
                             is_policy_training_step=is_policy_training_step,
@@ -3185,7 +3430,7 @@ class SingleControllerActor:
                 percent = (v / total_time * 100) if total_time > 0 else 0.0
                 print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
 
-            # TODO: per-step train_data jsonl dump, vllm metrics logger,
+            # TODO: vllm metrics logger,
             #   histogram log, pretty-print "Training Results" block,
             #   print_performance_metrics.
             printable_step_metrics = {
@@ -4960,238 +5205,125 @@ class SingleControllerActor:
 
         if self._advantage_estimator is None:
             return meta, True
-        adv_cfg = self._advantage_cfg
 
-        data = await call_data_plane(
-            self._dp_client,
-            "get_samples",
-            sample_ids=meta.sample_ids,
-            partition_id=meta.partition_id,
-            select_fields=self._advantage_input_fields(),
+        # Split on prompt-group boundaries so the pool works a chunk in
+        # parallel. SHARD_INVARIANT_ESTIMATORS says which estimators allow it.
+        stage_cfg = self._advantage_stage_config
+        num_actors = len(self._advantage_actors)
+        shards = (
+            split_meta_by_prompt_group(meta, num_actors)
+            if stage_cfg.shardable
+            else None
         )
-
-        prompt_ids = tensor_field(data, adv_cfg.prompt_ids_field)
-        rewards = squeeze_trailing_unit_dim(
-            tensor_field(data, adv_cfg.reward_field)
-        ).float()
-        token_mask = tensor_field(data, adv_cfg.token_mask_field).float()
-        sample_mask = squeeze_trailing_unit_dim(
-            tensor_field(data, adv_cfg.sample_mask_field)
-        ).float()
-        mask_sample = squeeze_trailing_unit_dim(
-            tensor_field(data, adv_cfg.mask_sample_field)
-        ).bool()
-        truncated = squeeze_trailing_unit_dim(
-            tensor_field(data, adv_cfg.truncated_field)
-        ).bool()
-
-        num_mask_sample_filtered = int(mask_sample.sum().item())
-        self._step_log_dict["num_mask_sample_filtered"].append(num_mask_sample_filtered)
-        final_sample_mask = sample_mask * (~mask_sample).to(sample_mask.dtype)
-        if self._algo_cfg.overlong_filtering:
-            final_sample_mask = final_sample_mask * (~truncated).to(sample_mask.dtype)
-
-        seq_logprob_error_threshold = self._algo_cfg.seq_logprob_error_threshold
-        # Match the legacy path: whenever real policy logprobs are available,
-        # report sequence-level generation/training mismatch. A threshold adds
-        # masking; leaving it unset keeps this metrics-only.
-        if self._policy_logprobs_required:
-            masking_data = BatchedDataDict(
-                {
-                    "token_mask": token_mask,
-                    "sample_mask": final_sample_mask,
-                    "prev_logprobs": tensor_field(
-                        data,
-                        adv_cfg.policy_logprobs_field,
-                    ),
-                    "generation_logprobs": tensor_field(
-                        data,
-                        adv_cfg.generation_logprobs_field,
-                    ),
-                }
+        # Every decline is silent by construction, so an unlogged one is
+        # indistinguishable from a shard that bought nothing -- which is how one
+        # 256-node run was spent measuring a no-op. Name the reason too: the
+        # default pool of 0 would otherwise report a layout it never examined.
+        if shards is not None:
+            decline = ""
+        elif not stage_cfg.shardable:
+            decline = (
+                f" (estimator {stage_cfg.algo.adv_estimator.name!r} is not "
+                "shard-invariant)"
             )
-            num_valid_seqs_before = float(
-                ((token_mask[:, 1:] * final_sample_mask.unsqueeze(-1)).sum(dim=-1) > 0)
-                .sum()
-                .item()
-            )
-            seq_error_metrics = compute_and_apply_seq_logprob_error_masking(
-                train_data=masking_data,
-                rewards=rewards,
-                seq_logprob_error_threshold=seq_logprob_error_threshold,
-            )
-            final_sample_mask = masking_data["sample_mask"]
-            num_valid_seqs_after = float(
-                ((token_mask[:, 1:] * final_sample_mask.unsqueeze(-1)).sum(dim=-1) > 0)
-                .sum()
-                .item()
-            )
-            seq_error_metrics["num_masked_seqs_by_logprob_error"] = (
-                seq_error_metrics.pop("num_masked_seqs")
-            )
-            seq_error_metrics["_num_valid_seqs_before"] = num_valid_seqs_before
-            seq_error_metrics["_num_valid_seqs_after"] = num_valid_seqs_after
-            self._step_log_dict["seq_logprob_error_metrics"].append(seq_error_metrics)
-
-        mask = token_mask * final_sample_mask.unsqueeze(-1)
-
-        repeated_batch: dict[str, torch.Tensor] = {
-            "total_reward": rewards,
-        }
-        for field_name in adv_cfg.repeated_batch_fields:
-            repeated_batch[field_name] = squeeze_trailing_unit_dim(
-                tensor_field(data, field_name)
-            )
-
-        kwargs: dict[str, torch.Tensor] = {}
-        if self._policy_logprobs_required:
-            policy_logprobs = tensor_field(data, adv_cfg.policy_logprobs_field)
-            if self._teacher_logprobs_required:
-                kwargs["prev_logprobs"] = policy_logprobs
-            else:
-                kwargs["logprobs_policy"] = policy_logprobs
-        if self._reference_logprobs_required:
-            kwargs["logprobs_reference"] = tensor_field(
-                data,
-                adv_cfg.reference_logprobs_field,
-            )
-        if self._teacher_logprobs_required:
-            kwargs["teacher_logprobs"] = tensor_field(
-                data,
-                adv_cfg.teacher_logprobs_field,
-            )
-        if self._is_ppo:
-            kwargs["values"] = tensor_field(data, adv_cfg.values_field)
-
-        # Training predicts token t from position t - 1, so token_mask[:, 1:]
-        # is the exact mask used when global_valid_toks and the loss are built.
-        has_valid_training_tokens = bool(mask[:, 1:].bool().any().item())
-        # Value-model estimators (GAE) hand back the regression target alongside
-        # the advantages; the group-relative ones return a bare tensor.
-        returns: Optional[torch.Tensor] = None
-        if has_valid_training_tokens:
-            result = self._advantage_estimator.compute_advantage(
-                prompt_ids=prompt_ids,
-                rewards=rewards,
-                mask=mask,
-                repeated_batch=repeated_batch,
-                # Real validity (token-capture placeholders carry sample_mask 0,
-                # and mask_sample/overlong/seq-logprob-error rows are folded in
-                # via final_sample_mask) instead of the hardwired all-ones.
-                valid_mask=final_sample_mask,
-                **kwargs,
-            )
-            if self._is_ppo:
-                advantages, returns = result
-            else:
-                advantages = result
+        elif num_actors <= 1:
+            decline = " (pool has fewer than 2 actors)"
+        elif len(set(row_group_ids(meta))) < 2:
+            decline = " (chunk has fewer than 2 prompt groups)"
         else:
-            advantages = torch.zeros_like(mask)
-            if self._is_ppo:
-                returns = torch.zeros_like(mask)
-
-        if self._message_level_advantage_penalties_enabled:
-            # Sequence-error filtering and the pre-existing sample mask remain
-            # authoritative: a message penalty must not make a filtered token
-            # trainable again.
-            valid_tokens = mask.bool()
-            advantages = apply_message_level_advantage_penalties(
-                advantages,
-                invalid_tool_call_mask=(
-                    tensor_field(data, adv_cfg.invalid_tool_call_mask_field).bool()
-                    & valid_tokens
-                ),
-                malformed_thinking_mask=(
-                    tensor_field(data, adv_cfg.malformed_thinking_mask_field).bool()
-                    & valid_tokens
-                ),
-                invalid_tool_call_advantage=self._algo_cfg.invalid_tool_call_advantage,
-                malformed_thinking_advantage=(
-                    self._algo_cfg.malformed_thinking_advantage
-                ),
-            )
-
-        response_advantages = torch.masked_select(advantages, mask.bool())
-        self._step_log_dict["rewards"].append(rewards.detach().cpu())
-        self._step_log_dict["sample_masks"].append(final_sample_mask.detach().cpu())
-        if self._teacher_logprobs_required:
-            valid = response_advantages.detach().double()
-            self._opd_stat_sum += float(valid.sum())
-            self._opd_stat_sumsq += float((valid * valid).sum())
-            self._opd_stat_count += int(valid.numel())
-
-        # OPD accumulates its statistics from the estimator output above. The
-        # ordinary advantage metrics and policy training use the clipped values,
-        # matching the legacy paths.
-        if not self._is_ppo:
-            assert isinstance(self._algo_cfg, GRPOConfig)
-            advantages = _clip_grpo_advantages(
-                advantages,
-                self._algo_cfg,
-            )
-            response_advantages = torch.masked_select(advantages, mask.bool())
-        self._step_log_dict["masked_advantages"].append(
-            response_advantages.detach().cpu()
+            decline = " (prompt-group layout not recoverable)"
+        log.info(
+            "advantage stage: %d row(s) over %d shard(s), pool=%d%s",
+            len(meta.sample_ids),
+            len(shards) if shards is not None else 1,
+            len(self._advantage_actors),
+            decline,
         )
-
-        fields_to_put = {adv_cfg.output_field: advantages}
-        if not torch.equal(final_sample_mask, sample_mask):
-            fields_to_put[adv_cfg.sample_mask_field] = final_sample_mask
-        new_fields = [adv_cfg.output_field]
-        if returns is not None:
-            fields_to_put[adv_cfg.returns_field] = returns
-            new_fields.append(adv_cfg.returns_field)
-
+        requests = [
+            AdvantageRequest(
+                meta=shard,
+                # Only the stage still holds the untruncated tensors, so it
+                # writes the dump and needs the step to name the file by.
+                train_step=(
+                    self._train_steps if self._train_data_dump is not None else None
+                ),
+            )
+            for shard in (shards if shards is not None else [meta])
+        ]
+        # Each actor writes advantages inside its RPC, so the cut must cover
+        # the whole call or a snapshot could land mid-write.
         async with self._data_plane_checkpoint_barrier.mutation("advantage_writeback"):
-            await self._call_dp(
-                "put_samples",
-                sample_ids=meta.sample_ids,
-                partition_id=meta.partition_id,
-                fields=fields_for_put(meta, fields_to_put),
+            outcomes = await asyncio.gather(
+                *(self._run_advantage_stage(request) for request in requests)
             )
-        return (
-            meta.with_fields(new_fields),
-            has_valid_training_tokens,
+        # Every reduction downstream of here is already per-call: the partials
+        # and OPD moments are contributions rather than totals, and the
+        # sequence-error metrics reduce count-weighted across records.
+        new_fields: list[str] = []
+        has_valid_training_tokens = False
+        for outcome in outcomes:
+            self._absorb_advantage_outcome(outcome)
+            new_fields.extend(outcome.meta.fields or [])
+            has_valid_training_tokens |= outcome.has_valid_training_tokens
+        # Shards only ever add field names, never touch per-sample rows, so the
+        # full-batch meta carrying the union of those names is the whole result.
+        return meta.with_fields(new_fields), has_valid_training_tokens
+
+    async def _run_advantage_stage(self, request: AdvantageRequest) -> AdvantageOutcome:
+        """Run one advantage stage on the pool, or in-process without one."""
+        if not self._advantage_actors:
+            return await self._advantage_computer.run(request)
+        actor = await self._available_advantage_actors.get()
+        try:
+            outcome = await actor.run.remote(request)
+        except BaseException:
+            # The writeback is half-done and unreadable from here, so this
+            # propagates rather than retrying, and the actor is not handed back.
+            print(
+                "FATAL: advantage actor RPC failed after submission; the "
+                f"writeback outcome is unknown for {len(request.meta.sample_ids)} "
+                "samples.",
+                flush=True,
+            )
+            raise
+        else:
+            self._available_advantage_actors.put_nowait(actor)
+            return outcome
+
+    def _absorb_advantage_outcome(self, outcome: AdvantageOutcome) -> None:
+        """Fold one call's reduced results into this step's accumulators."""
+        self._step_log_dict["num_mask_sample_filtered"].append(
+            outcome.num_mask_sample_filtered
         )
+        self._step_log_dict["reward_partials"].append(outcome.reward_partial)
+        self._step_log_dict["advantage_partials"].append(outcome.advantage_partial)
+        if outcome.seq_logprob_error_metrics is not None:
+            self._step_log_dict["seq_logprob_error_metrics"].append(
+                outcome.seq_logprob_error_metrics
+            )
+        self._opd_stat_sum += outcome.opd_stat_sum
+        self._opd_stat_sumsq += outcome.opd_stat_sumsq
+        self._opd_stat_count += outcome.opd_stat_count
+        self._opd_gap_sum += outcome.opd_gap_sum
+        if outcome.train_data_dump_s:
+            # Recorded rather than timed here: the serialization ran wherever
+            # the stage ran, which with a pool is not this process.
+            self._timer.record(
+                "train_data_dump", outcome.train_data_dump_s, should_log=False
+            )
+        self._train_data_dump_rows += outcome.train_data_dump_rows
 
     # ── utility helpers ────────────────────────────────────────────────────
-
-    def _advantage_input_fields(self) -> list[str]:
-        adv_cfg = self._advantage_cfg
-        fields = [
-            adv_cfg.prompt_ids_field,
-            adv_cfg.reward_field,
-            adv_cfg.token_mask_field,
-            adv_cfg.sample_mask_field,
-            *adv_cfg.repeated_batch_fields,
-            adv_cfg.mask_sample_field,
-            adv_cfg.truncated_field,
-        ]
-        if self._message_level_advantage_penalties_enabled:
-            fields.extend(
-                [
-                    adv_cfg.invalid_tool_call_mask_field,
-                    adv_cfg.malformed_thinking_mask_field,
-                ]
-            )
-        if self._policy_logprobs_required:
-            fields.append(adv_cfg.policy_logprobs_field)
-        if self._policy_logprobs_required:
-            fields.append(adv_cfg.generation_logprobs_field)
-        if self._reference_logprobs_required:
-            fields.append(adv_cfg.reference_logprobs_field)
-        if self._teacher_logprobs_required:
-            fields.append(adv_cfg.teacher_logprobs_field)
-        if self._is_ppo:
-            fields.append(adv_cfg.values_field)
-        return list(dict.fromkeys(fields))
 
     def _retune_lookahead_versions(self) -> None:
         """Widen the sampler's lookahead while the policy is frozen, then shrink it back.
 
         Port of ppo.py's _async_ppo_generation_lead_steps.
         """
-        if not self._is_ppo:
+        if not self._is_ppo or isinstance(
+            self._async_cfg.sampler, ReadyFirstSamplerConfig
+        ):
+            # Ready-first retains all admitted rollouts and uses a fixed gate window.
             return
         steady = self._async_cfg.sampler.max_lookahead_versions
         warmup = self._async_cfg.sampler.warmup_lookahead_versions

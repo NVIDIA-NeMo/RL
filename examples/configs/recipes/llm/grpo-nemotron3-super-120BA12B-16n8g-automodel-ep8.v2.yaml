@@ -13,7 +13,7 @@ policy:
   logprob_batch_size: 1
   logprob_chunk_size: 2048
   max_total_sequence_length: 8192
-  make_sequence_length_divisible_by: 8
+  make_sequence_length_divisible_by: 64
   optimizer:
     name: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
     kwargs:
@@ -34,7 +34,8 @@ policy:
         attn: te
         linear: te
         rms_norm: te
-        enable_deepep: true
+        experts: torch_mm
+        dispatcher: hybridep
         fake_balanced_gate: false
         rope_fusion: false
         enable_hf_state_dict_adapter: true

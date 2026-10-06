@@ -59,7 +59,6 @@ Each step: FSDP2 collectives run within a node; only a gradient all-reduce cross
 ```yaml
 policy:
   dtensor_cfg:
-    _v2: true             # required: HSDP only works on the DTensor v2 backend
     dp_replicate_size: 2  # number of replicas; 1 disables HSDP
 ```
 
