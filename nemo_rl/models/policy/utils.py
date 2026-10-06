@@ -27,9 +27,11 @@ from torch.multiprocessing.reductions import rebuild_cuda_tensor
 
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.generation.vllm.config import (
-    VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
     VllmSpecificArgs,
     vllm_nemotron_h_fp32_lm_head_enabled,
+)
+from nemo_rl.models.generation.vllm.patches import (
+    VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
 )
 from nemo_rl.utils.cuda_ipc import normalize_cuda_ipc_handle
 
@@ -55,23 +57,6 @@ POLICY_WORKER_OVERRIDES = {
 
 _NEMOTRON_H_MODEL_TYPES = frozenset({"nemotron_h"})
 _NEMOTRON_H_ARCHITECTURES = frozenset({"NemotronHForCausalLM"})
-
-
-def reject_legacy_dtensor_key(dtensor_cfg: dict[str, Any], config_path: str) -> None:
-    """Fail at setup when a config still carries the removed dtensor_cfg._v2 key.
-
-    Args:
-        dtensor_cfg: The resolved dtensor_cfg mapping to inspect.
-        config_path: Dotted path used in the error message, e.g. policy.dtensor_cfg.
-    """
-    if "_v2" not in dtensor_cfg:
-        return
-
-    raise ValueError(
-        f"DTensor v1 ({config_path}._v2=false) and the _v2 key itself have been removed. "
-        f"DTensor is always the Automodel backend now, which is what _v2=true selected, "
-        f"so delete the key."
-    )
 
 
 def resolve_policy_worker_cls(default_cls: str, config: dict) -> str:

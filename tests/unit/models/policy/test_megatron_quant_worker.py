@@ -123,6 +123,7 @@ def _make_real_quant_worker():
 @requires_weight_folding
 def test_real_quant_conversion_tasks_exclude_quantizer_state(monkeypatch):
     from megatron.core import distributed
+
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
     )
