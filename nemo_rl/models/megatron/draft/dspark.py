@@ -14,6 +14,9 @@
 
 """Small checkpoint-compatible heads used by DSpark block drafting.
 
+``DSparkMarkovHead`` and ``DSparkConfidenceHead`` are constructed by the DSpark
+draft provider added in PR #3726.
+
 The parameter names ``markov_w1`` / ``markov_w2`` / ``proj``, and the
 ``nn.Linear(markov_rank, draft_vocab)`` orientation that makes ``markov_w2.weight``
 come out ``[draft_vocab, markov_rank]``, are an interop contract with the official

@@ -351,6 +351,9 @@ def _run_tp_markov_checkpoint(
             tensor_parallel_group=tp_group,
             device=device,
         ).double()
+        assert source.markov_w2.weight.tensor_model_parallel is True
+        assert source.markov_w2.weight.partition_dim == 0
+        assert source.markov_w2.weight.partition_stride == 1
         with torch.no_grad():
             source.markov_w1.weight.copy_(
                 torch.arange(
