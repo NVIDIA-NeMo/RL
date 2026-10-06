@@ -48,6 +48,7 @@ from nemo_rl.data_plane.schema import (
     GLOBAL_FORWARD_PAD_SEQLEN,
     MICRO_BATCH_INDICES,
     MICRO_BATCH_LENGTHS,
+    MICROBATCH_PADDED_FIELDS,
     ROUTE_PASSTHROUGH_FLAG,
     ROUTE_PLAN_TAG,
     ROUTED_EXPERTS_ENCODING_FIELD,
@@ -591,7 +592,9 @@ class TQWorkerMixin:
                 group=replica_group,
             )
             if wire_layout != layout:
-                data = pad_batch(data, pad_value_dict, pad_to_seqlen)
+                data = pad_batch(
+                    data, pad_value_dict, pad_to_seqlen, skip=MICROBATCH_PADDED_FIELDS
+                )
             if ship_fragments:
                 fragments_by_row = _unpack_route_fragments(
                     data.pop(_ROUTE_BLOB), data.pop(_ROUTE_INDEX)
@@ -784,21 +787,16 @@ class TQWorkerMixin:
 
         # The worker supplies real model dims — the authoritative shape check.
         num_moe_layers, top_k = self._routed_experts_dimensions()
-        input_ids = data["input_ids"]
-        input_lengths = data["input_lengths"].reshape(-1)
-        routed = torch.full(
-            (
-                len(meta.sample_ids),
-                int(input_ids.shape[1]),
-                num_moe_layers,
-                top_k,
-            ),
+        input_lengths = data["input_lengths"].reshape(-1).cpu().long()
+        offsets = torch.nn.functional.pad(input_lengths.cumsum(0), (1, 0))
+        values = torch.full(
+            (int(offsets[-1]), num_moe_layers, top_k),
             ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
             dtype=torch.int16,
         )
         request_fallbacks: Counter[str] = Counter()
         for row_index, (plan, fragments) in enumerate(zip(plans, fragments_by_row)):
-            canonical_len = int(input_lengths[row_index].item())
+            canonical_len = int(input_lengths[row_index])
             tensor, reason = execute_route_plan(
                 plan,
                 fragments,
@@ -810,7 +808,8 @@ class TQWorkerMixin:
                 # router for exactly these positions (counted, not fatal).
                 request_fallbacks[reason or "unknown"] += 1
             else:
-                routed[row_index, :canonical_len] = tensor
+                start = int(offsets[row_index])
+                values[start : start + canonical_len] = tensor
 
         if record_fallbacks:
             self._route_fallback_counts.update(request_fallbacks)
@@ -821,7 +820,9 @@ class TQWorkerMixin:
                     len(plans),
                     dict(request_fallbacks),
                 )
-        data[ROUTED_EXPERTS_FIELD] = routed
+        data[ROUTED_EXPERTS_FIELD] = torch.nested.nested_tensor_from_jagged(
+            values, offsets
+        )
         return data
 
     def _apply_packing_prep(self, data: BatchedDataDict[Any]) -> BatchedDataDict[Any]:

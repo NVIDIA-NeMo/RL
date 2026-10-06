@@ -36,7 +36,7 @@ to ``np.ndarray(dtype=object)`` for the trainer.
 from __future__ import annotations
 
 import time
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
@@ -392,11 +392,12 @@ def pad_batch(
     data: "BatchedDataDict[Any]",
     pad_value_dict: dict[str, int | float] | None,
     pad_to_seqlen: int,
+    skip: Collection[str] = (),
 ) -> "BatchedDataDict[Any]":
     """Pad a ``layout='jagged'`` batch to what ``layout='padded'`` would return."""
     pads = pad_value_dict or {}
     for key, val in data.items():
-        if isinstance(val, torch.Tensor):
+        if isinstance(val, torch.Tensor) and key not in skip:
             data[key] = _pad_leaf(
                 key,
                 val,
