@@ -571,6 +571,7 @@ class AdvantageComputer:
             token_mask=token_mask,
             truncated=truncated,
             seq_lens=tensor_field(data, INPUT_LENGTHS),
+            baseline_mask=baseline_mask,
         )
         opd_stat_sum = 0.0
         opd_stat_sumsq = 0.0

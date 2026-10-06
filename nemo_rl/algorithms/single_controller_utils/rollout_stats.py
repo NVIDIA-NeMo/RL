@@ -30,12 +30,12 @@ Metrics (logged under the ``train/`` prefix):
 * ``seq_len/{mean,p50,p90,max}``: full sequence length (prompt + all turns +
   tool output) and ``seq_len/frac_above_90pct_ctx``: fraction of samples using
   more than 90 % of ``max_total_sequence_length`` (context pressure).
-* ``groups/count``: GRPO groups with >= 2 valid samples;
+* ``groups/count``: GRPO groups with >= 2 baseline samples;
   ``groups/mixed_frac`` / ``mixed_count``: groups whose rewards are not all
   equal (for 0/1 rewards: neither all-pass nor all-fail), the only groups that
   produce non-zero advantages; ``groups/all_pass_frac``, ``groups/all_fail_frac``
-  (every valid reward >= 0.5, resp. < 0.5); ``groups/reward_std_mean``: mean
-  within-group reward std; ``groups/zero_advantage_sample_frac``: valid samples
+  (every baseline reward >= 0.5, resp. < 0.5); ``groups/reward_std_mean``: mean
+  within-group reward std; ``groups/zero_advantage_sample_frac``: trained samples
   sitting in a non-mixed group (they contribute no gradient).
 * ``reward/std`` over valid samples and ``reward/pass_frac`` (reward >= 0.5).
 * ``truncated_frac``: valid samples flagged ``truncated``. On the token-capture
@@ -47,7 +47,10 @@ Metrics (logged under the ``train/`` prefix):
 
 Rows with ``sample_mask == 0`` (token-capture placeholders, environment
 mask_sample, overlong filter, sequence-logprob-error masking) are excluded
-from every statistic, matching what the advantage estimator trains on.
+from every per-sample statistic, matching what the advantage estimator trains
+on. The ``groups/*`` block is computed over the rows the estimator's
+baseline/std saw instead (``baseline_mask``): the same rows by default, plus
+the incomplete rows ``grpo.masked_sample_rewards_in_baseline`` reinstates.
 """
 
 from __future__ import annotations
@@ -64,6 +67,7 @@ ROLLOUT_STATS_KEYS: tuple[str, ...] = (
     "turns",
     "truncated",
     "seq_lens",
+    "baseline_masks",
 )
 
 _PERCENTILES = (0.5, 0.75, 0.9)
@@ -141,6 +145,7 @@ def accumulate_rollout_stats(
     token_mask: torch.Tensor,
     truncated: Optional[torch.Tensor] = None,
     seq_lens: Optional[torch.Tensor] = None,
+    baseline_mask: Optional[torch.Tensor] = None,
 ) -> None:
     """Append one advantage-stage chunk to ``acc`` (all tensors moved to CPU).
 
@@ -150,7 +155,8 @@ def accumulate_rollout_stats(
     estimator groups them within a chunk; each chunk's groups get ids that
     continue from the previous chunk's, so the reducer can concatenate them.
     ``truncated`` / ``seq_lens`` are optional; the reducer skips the metrics
-    that depend on them when any chunk lacks them.
+    that depend on them when any chunk lacks them. ``baseline_mask`` (rows in
+    the estimator's baseline/std) defaults to ``sample_mask`` in the reducer.
     """
     batch = rewards.shape[0]
     if batch == 0:
@@ -169,6 +175,10 @@ def accumulate_rollout_stats(
         acc["truncated"].append(truncated.detach().float().reshape(batch).cpu())
     if seq_lens is not None:
         acc["seq_lens"].append(seq_lens.detach().float().reshape(batch).cpu())
+    if baseline_mask is not None:
+        acc["baseline_masks"].append(
+            baseline_mask.detach().float().reshape(batch).cpu()
+        )
 
 
 def _distribution(out: dict[str, float], name: str, values: torch.Tensor) -> None:
@@ -202,7 +212,8 @@ def reduce_rollout_stats(
     if not acc.get("rewards"):
         return {}
     num_chunks = len(acc["rewards"])
-    rewards = torch.cat(acc["rewards"])
+    all_rewards = torch.cat(acc["rewards"])
+    rewards = all_rewards
     valid = torch.cat(acc["sample_masks"]) > 0
     if int(valid.sum()) == 0:
         return {}
@@ -241,9 +252,16 @@ def reduce_rollout_stats(
 
     # Group statistics: rows sharing a prompt form one GRPO group (ids were
     # made unique across chunks at accumulation time; compact them after
-    # dropping invalid rows).
+    # dropping the rows outside the baseline). Spread is measured over the rows
+    # the estimator's baseline/std saw, a superset of the trained rows.
+    in_baseline = (
+        torch.cat(acc["baseline_masks"]) > 0
+        if len(acc["baseline_masks"]) == num_chunks
+        else valid
+    )
+    rewards = all_rewards[in_baseline]
     _, group_index = torch.unique(
-        torch.cat(acc["group_ids"])[valid], return_inverse=True
+        torch.cat(acc["group_ids"])[in_baseline], return_inverse=True
     )
     group_index = group_index.reshape(-1)
     num_groups = int(group_index.max()) + 1
@@ -278,8 +296,10 @@ def reduce_rollout_stats(
         out["groups/all_pass_frac"] = 0.0
         out["groups/all_fail_frac"] = 0.0
         out["groups/reward_std_mean"] = 0.0
-    # A sample only carries a gradient if its group has reward spread.
+    # A trained sample only carries a gradient if its baseline group has
+    # reward spread.
+    trained_group_index = group_index[valid[in_baseline]]
     out["groups/zero_advantage_sample_frac"] = float(
-        (~mixed[group_index]).float().mean()
+        (~mixed[trained_group_index]).float().mean()
     )
     return out

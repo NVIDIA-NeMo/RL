@@ -51,6 +51,7 @@ from nemo_rl.algorithms.single_controller_utils.rollout_stats import (
     accumulate_rollout_stats,
     merge_stats_accumulator,
     new_rollout_stats_accumulator,
+    reduce_rollout_stats,
     stats_accumulator_to_rpc,
 )
 from nemo_rl.algorithms.single_controller_utils.utils import (
@@ -865,3 +866,18 @@ def test_masked_rows_enter_the_baseline_only_when_enabled(keep_in_baseline) -> N
     assert metrics["masking/env_flag_rows"] == 1.0
     assert metrics["masking/trained_rows"] == 3.0
     assert metrics["masking/baseline_rows"] == (4.0 if keep_in_baseline else 3.0)
+
+    # Group spread follows the baseline rows; per-sample stats stay on trained rows.
+    rollout = new_rollout_stats_accumulator()
+    assert outcome.rollout_stats is not None
+    merge_stats_accumulator(rollout, outcome.rollout_stats)
+    stats = reduce_rollout_stats(rollout)
+    assert stats["reward/pass_frac"] == 1.0
+    if keep_in_baseline:
+        assert stats["groups/mixed_count"] == 1.0
+        assert stats["groups/all_pass_frac"] == 0.0
+        assert stats["groups/zero_advantage_sample_frac"] == 0.0
+    else:
+        assert stats["groups/mixed_count"] == 0.0
+        assert stats["groups/all_pass_frac"] == 1.0
+        assert stats["groups/zero_advantage_sample_frac"] == 1.0
