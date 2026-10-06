@@ -8,34 +8,126 @@ The recipe has completed a 48-step training run with checkpoint save and
 cross-job resume. See [validation scope](#validation-scope) for the tested
 behavior and known limitation.
 
-The standard delivery follows the [Ultra guide](nemotron-3-ultra.md): clone the
-code, build an environment once, prepare public data and SWE containers, and
-launch on your own cluster. A prebuilt download is an optional shortcut.
-No access to the author's cluster, S3, or W&B account is needed for the source
-workflow. Initial model selection and the validation limits below still apply.
+Choose one of the following ways to prepare the training environment and SWE
+assets. After completing either option, prepare an [initial model](#initial-model)
+and follow the same [preflight and launch](#preflight-and-launch) steps.
+
+| Setup option | Training image | SWE data and task environments |
+| --- | --- | --- |
+| [1. Download from Hugging Face](#option-1-download-from-hugging-face) (recommended) | Download the prebuilt SQSH, including patched TRT-LLM and actor environments | Download the prepared 403-row JSONL and all 403 ARM64 SIFs |
+| [2. Build the assets yourself](#option-2-build-the-assets-yourself) | Build the Docker image and export a SQSH; this includes compiling TRT-LLM | Generate the JSONL from public SWE-bench data and build the 403 SIFs |
+
+Option 1 requires no image builds or TRT-LLM compilation. Option 2 follows the
+source-build delivery pattern of the [Ultra guide](nemotron-3-ultra.md) and is
+useful when changing the environment. Both options run on your own cluster and
+require no access to the author's cluster, S3, or W&B account. Initial model
+selection and the validation limits below apply to both options.
 
 The side branch contains source, dependency pins, build scripts, the recipe,
 launchers, and asset manifests. Large images, datasets, model weights, logs,
 and checkpoints remain outside Git. The validated training platform is ARM64
 GB200/SM100, with four GPUs per node; other platforms are unvalidated.
 
-## Build the training image
+## Before you start
 
-Use a native ARM64 CUDA build host with Docker/buildx, network access to the
-pinned public dependencies, and sufficient build scratch. Cluster execution
-uses Slurm/Pyxis/Enroot. Install [uv](https://docs.astral.sh/uv/getting-started/installation/)
-on the preparation host for the standalone asset scripts.
+Use a preparation host with [uv](https://docs.astral.sh/uv/getting-started/installation/)
+and storage shared with the compute nodes. Slurm/Pyxis/Enroot and host support
+for `/dev/fuse` must be available on the target cluster. The full training recipe
+uses 32 four-GPU GB200 nodes; GPU/SWE preflight uses one four-GPU node.
+
+Clone the code and choose a shared asset directory once, then follow either
+Option 1 or Option 2. Replace `/lustre/PROJECT/nano35-assets` with your writable
+shared directory. The supplied launchers mount `/lustre`; adapt their container
+mounts if your cluster uses another storage root.
 
 ```bash
-git clone --recursive --branch nano35-trtllm-rc28-public \
-  https://github.com/NVIDIA-NeMo/RL.git
+git clone --branch nano35-trtllm-rc28-public https://github.com/NVIDIA-NeMo/RL.git
 cd RL
-git rev-parse HEAD   # Record this revision alongside your run.
+git checkout --detach 8de12437669895c83bd969ad6aaf9b03ec502916
+
+export NANO35_ASSET_DIR=/lustre/PROJECT/nano35-assets
+mkdir -p "$NANO35_ASSET_DIR"
+```
+
+Both options provide the same paths for the launchers:
+
+```text
+$NANO35_ASSET_DIR/
+  images/nano35.sqsh
+  data/swe_verified_403.jsonl
+  sifs/swe-bench.eval.arm64.{instance_id}.sif   # one file per task, 403 total
+```
+
+Initial model weights are prepared separately after either option.
+
+## Option 1: Download from Hugging Face
+
+The public [asset repository](https://huggingface.co/datasets/shikicloud/nano35-swe-assets/tree/9dc883a50812cf3e5d0d3cd17151df178175681e)
+contains the cleaned training SQSH (25.9 GB), the 403-row dataset, all 403 ARM64
+SWE SIFs (371.4 GB), and checksum/validation records. Allow about 397.3 GB for
+these assets, plus space for the separately downloaded initial model, runtime
+caches, training outputs, and checkpoints. Model weights and trained
+checkpoints are not included in this asset repository.
+
+```bash
+export NANO35_HF_ASSET_REPO=shikicloud/nano35-swe-assets
+export NANO35_HF_ASSET_REVISION=9dc883a50812cf3e5d0d3cd17151df178175681e
+
+HF_HUB_DISABLE_XET=1 HF_HUB_ENABLE_HF_TRANSFER=0 \
+uvx --from huggingface-hub==0.34.4 hf download "$NANO35_HF_ASSET_REPO" \
+  --repo-type dataset --revision "$NANO35_HF_ASSET_REVISION" \
+  --local-dir "$NANO35_ASSET_DIR" --max-workers 1
+```
+
+The conservative download settings avoid Xet buffering and parallel file
+downloads on login nodes with small per-user memory limits. Use the same
+revision and local directory when restarting an interrupted download; preserve
+the download cache under the asset directory.
+
+Verify the release image, dataset, and all 403 SIFs before running jobs:
+
+```bash
+printf '%s  %s\n' \
+  197e2009bcad1b1fb2c617a2995ba77391ce726594b0c719c566dd7a1565e36c "$NANO35_ASSET_DIR/images/nano35.sqsh" \
+  72e8e2b4a41751ce347a662b99739019a60608d9614f74cd673357d834d52212 "$NANO35_ASSET_DIR/data/swe_verified_403.jsonl" \
+  | sha256sum -c -
+(cd "$NANO35_ASSET_DIR" && sha256sum -c metadata/sif-sha256sums.txt)
+```
+
+This completes Option 1. Continue directly at [Initial model](#initial-model),
+then [Preflight and launch](#preflight-and-launch). Skip Option 2 when using
+these downloaded assets.
+
+The release image's filename, size, and SHA-256 are recorded in
+[`validated-image.json`](../../../../docker/nano35/validated-image.json).
+The manifest distinguishes the historical 48-step run from the file-integrity
+and runtime checks performed after publication cleanup. The cleaned export
+removes builder metadata and uses `nano3.5-e2e` as its neutral W&B project;
+training parameters and installed package bytes are preserved. Use the cleaned
+export when distributing a prebuilt image.
+The older W&B `nano35-rc28-py313-arm64-sqsh:v0` lacks the refit statistics fix
+and must not be used. W&B is optional for metrics, not required for asset access.
+
+## Option 2: Build the assets yourself
+
+Complete all three steps below: build the training image, prepare the dataset,
+and build the SWE SIFs. Run from the checkout and use the asset directory set in
+[Before you start](#before-you-start). This option does not require the prebuilt
+HF asset package.
+
+Use a native ARM64 CUDA build host with Docker/buildx, network access to the
+pinned public dependencies, and sufficient build scratch. SWE SIF construction
+also requires a working Docker daemon and Apptainer 1.5.0. Allow additional
+space for build layers and temporary archives.
+
+### Build the training image
+
+```bash
+git submodule update --init --recursive
 
 docker buildx build --platform linux/arm64 --progress=plain --load \
   -f docker/nano35/Dockerfile -t nano35-swe:local .
 
-export NANO35_ASSET_DIR=/lustre/PROJECT/nano35-assets
 mkdir -p "$NANO35_ASSET_DIR/images"
 enroot import -o "$NANO35_ASSET_DIR/images/nano35.sqsh" \
   dockerd://nano35-swe:local
@@ -67,7 +159,7 @@ A rebuild produces a new image checksum. Run the GPU/SWE and data preflights
 below for that exact image; the launcher does not require the historical
 release checksum. See [build notes](#build-notes) for the pinned patches.
 
-## Prepare the 403 SWE tasks
+### Prepare the 403 SWE tasks
 
 The workload remains the recorded SWE-bench Verified subset. It does not switch
 to Ultra's SWE-Gym / SWE-rebench blend.
@@ -121,7 +213,12 @@ ARM64 SIFs. Rebuilding from source can expose upstream package/build failures;
 build receipts and the GPU/SWE preflight are required before using a rebuilt
 set. New SIFs are not claimed to be byte-identical to the historical set.
 
-### Initial model
+This completes Option 2. Continue with the common model preparation and
+preflight steps below, using the assets you just built.
+
+## Initial model
+
+This section and the remaining launch instructions apply to both setup options.
 
 Supply a compatible Nano 3.5 BF16 HF checkpoint, with all indexed safetensors
 shards, through `NANO35_MODEL`. For an external starting point, the public
@@ -129,10 +226,11 @@ shards, through `NANO35_MODEL`. For an external starting point, the public
 can be downloaded at a fixed revision:
 
 ```bash
+HF_HUB_DISABLE_XET=1 HF_HUB_ENABLE_HF_TRANSFER=0 \
 uvx --from huggingface-hub==0.34.4 hf download \
   nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16 \
   --revision a9904d24bcc1d289a1950fa9d2b978c47cf903b9 \
-  --local-dir "$NANO35_ASSET_DIR/models/nano35-initial-hf"
+  --local-dir "$NANO35_ASSET_DIR/models/nano35-initial-hf" --max-workers 1
 ```
 
 That public checkpoint has not been verified to be identical to the initial
@@ -141,39 +239,6 @@ initialization: complete preflight and start fresh. Reproducing the historical
 training results exactly also requires the original initial weights and SWE
 environments. The launcher checks model shards and every referenced SIF before
 submission; changing the dataset requires a new recipe and data preflight.
-
-### Optional prebuilt downloads
-
-An asset publisher may host the training SQSH, the prepared JSONL, and the 403
-SIFs in a separate Hugging Face dataset repository. Use a published repository
-ID and immutable commit; no such public asset repository is claimed yet:
-
-```bash
-: "${NANO35_HF_ASSET_REPO:?Set the publisher's HF dataset repository}"
-: "${NANO35_HF_ASSET_REVISION:?Set the published full commit hash}"
-uvx --from huggingface-hub==0.34.4 hf download "$NANO35_HF_ASSET_REPO" \
-  --repo-type dataset --revision "$NANO35_HF_ASSET_REVISION" \
-  --local-dir "$NANO35_ASSET_DIR"
-```
-
-Expected directories are `images/nano35.sqsh`, `data/swe_verified_403.jsonl`,
-and `sifs/swe-bench.eval.arm64.{instance_id}.sif`. Validate checksums against the
-publisher's manifests, then run the same preflights. If the publisher supplies
-`metadata/sif-sha256sums.txt`, check it from the asset directory:
-
-```bash
-(cd "$NANO35_ASSET_DIR" && sha256sum -c metadata/sif-sha256sums.txt)
-```
-
-The release image's filename, size, and SHA-256 are recorded in
-[`validated-image.json`](../../../../docker/nano35/validated-image.json).
-The manifest distinguishes the historical 48-step run from the file-integrity
-and runtime checks performed after publication cleanup. The cleaned export
-removes builder metadata and uses `nano3.5-e2e` as its neutral W&B project;
-training parameters and installed package bytes are preserved. Use the cleaned
-export when distributing a prebuilt image.
-The older W&B `nano35-rc28-py313-arm64-sqsh:v0` lacks the refit statistics fix
-and must not be used. W&B is optional for metrics, not required for asset access.
 
 ## Environment
 
