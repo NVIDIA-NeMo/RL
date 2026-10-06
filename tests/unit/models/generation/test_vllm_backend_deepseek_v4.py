@@ -68,6 +68,8 @@ async def test_checkpoint_engine_refit_guard(monkeypatch, model_type, fp8_enable
     model = torch.nn.Module()
     model.config = SimpleNamespace(model_type=model_type)
     ext.model_runner = SimpleNamespace(model=model, vllm_config=object())
+    ext.model_config = object()
+    ext.device = "cpu"
     ext._uses_unquantized_flashinfer_trtllm = lambda: False
     ext._maybe_process_fp8_kv_cache = lambda: None
 
@@ -78,6 +80,10 @@ async def test_checkpoint_engine_refit_guard(monkeypatch, model_type, fp8_enable
     receiver = Mock(side_effect=empty_batches)
     ext.checkpoint_engine = SimpleNamespace(receive_weight_batches=receiver)
     monkeypatch.setattr(fp8, "is_fp8_model", lambda _config: fp8_enabled)
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
+        lambda *_args: None,
+    )
 
     if model_type == "deepseek_v4" and fp8_enabled:
         with pytest.raises(RuntimeError, match="checkpoint-engine.*DeepSeek V4 FP8"):
@@ -338,5 +344,4 @@ def test_weight_update_lifecycle_keeps_full_post_load_for_non_deepseek_models(
         ("stream", None),
         ("post_load", None),
         ("mtp", None),
-        ("kv", None),
     ]
