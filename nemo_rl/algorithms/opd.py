@@ -25,13 +25,15 @@ import asyncio
 import time
 import uuid
 from collections.abc import Iterable
+from copy import deepcopy
 from typing import TYPE_CHECKING, Any, Literal, Optional
 
 import ray
 import torch
 from pydantic import BaseModel, Field, model_validator
+from tensordict import TensorDict
 
-from nemo_rl.data_plane.column_io import read_columns, write_columns
+from nemo_rl.data.multimodal_utils import present_multimodal_fields
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
 from nemo_rl.data_plane.schema import (
     OPD_FULL_HIDDEN_STATES_FIELD,
@@ -477,18 +479,14 @@ class TQTeacherLogprobCoordinator:
             if remainder:
                 pad_count = dp_size - remainder
                 source_meta = meta.slice(actual_batch_size - 1, actual_batch_size)
-                source_data = read_columns(
-                    self._dp_client,
-                    source_meta,
-                    select_fields=TEACHER_LP_FIELDS,
-                    pad_value_dict={"input_ids": 0},
+                teacher_fields = [*TEACHER_LP_FIELDS, *present_multimodal_fields(meta)]
+                # Clone the wire row directly: decoding/re-encoding packed media
+                # would omit empty columns when the last row is text-only.
+                source_data = self._dp_client.get_samples(
+                    sample_ids=source_meta.sample_ids,
+                    partition_id=source_meta.partition_id,
+                    select_fields=teacher_fields,
                 )
-                input_ids = source_data["input_ids"]
-                input_lengths = source_data["input_lengths"]
-                if not isinstance(input_ids, torch.Tensor) or not isinstance(
-                    input_lengths, torch.Tensor
-                ):
-                    raise TypeError("MOPD teacher padding inputs must be tensors")
                 temporary_prefix = uuid.uuid4().hex
                 temporary_sample_ids = [
                     f"{meta.sample_ids[-1]}__teacher_pad_{temporary_prefix}_{index}"
@@ -498,20 +496,35 @@ class TQTeacherLogprobCoordinator:
                     partition_id=meta.partition_id,
                     task_name=meta.task_name,
                     sample_ids=temporary_sample_ids,
-                    fields=list(TEACHER_LP_FIELDS),
+                    fields=teacher_fields,
                     sequence_lengths=[meta.sequence_lengths[-1]] * pad_count,
+                    tags=(
+                        [deepcopy(source_meta.tags[0]) for _ in range(pad_count)]
+                        if source_meta.tags is not None
+                        else None
+                    ),
                 )
+                padding_fields: dict[str, torch.Tensor] = {}
+                for field in teacher_fields:
+                    value = source_data[field]
+                    if not isinstance(value, torch.Tensor):
+                        raise TypeError(
+                            f"MOPD teacher padding field {field!r} must be a tensor"
+                        )
+                    padding_fields[field] = (
+                        torch.nested.as_nested_tensor(
+                            [value.unbind()[0]] * pad_count, layout=value.layout
+                        )
+                        if value.is_nested
+                        else value.expand(pad_count, *value.shape[1:])
+                    )
                 # Keep this write inside the cleanup lifetime. A backend may
                 # write only some rows before reporting failure.
-                write_columns(
-                    self._dp_client,
-                    pad_meta,
-                    fields={
-                        "input_ids": input_ids.expand(pad_count, *input_ids.shape[1:]),
-                        "input_lengths": input_lengths.expand(
-                            pad_count, *input_lengths.shape[1:]
-                        ),
-                    },
+                self._dp_client.put_samples(
+                    sample_ids=temporary_sample_ids,
+                    partition_id=meta.partition_id,
+                    fields=TensorDict(padding_fields, batch_size=[pad_count]),
+                    tags=pad_meta.tags,
                 )
                 padded_meta = meta.concat(pad_meta)
 

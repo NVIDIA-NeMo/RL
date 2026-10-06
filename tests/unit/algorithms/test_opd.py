@@ -367,25 +367,25 @@ def test_tq_teacher_enrichment_pads_dp_and_writes_teacher_column(monkeypatch):
     dp_client = FakeDataPlane()
     writes = []
 
-    def fake_read_columns(dp_client, meta, select_fields, pad_value_dict):
-        del dp_client, select_fields, pad_value_dict
-        batch_size = len(meta.sample_ids)
-        seq_len = max(meta.sequence_lengths)
+    def fake_get_samples(sample_ids, partition_id, select_fields):
+        del partition_id, select_fields
+        batch_size = len(sample_ids)
+        seq_len = 5
         return BatchedDataDict(
             {
                 "input_ids": torch.arange(batch_size * seq_len).reshape(
                     batch_size, seq_len
                 ),
-                "input_lengths": torch.tensor(meta.sequence_lengths),
+                "input_lengths": torch.tensor([seq_len] * batch_size),
             }
         )
 
-    def fake_write_columns(dp_client, meta, fields):
-        del dp_client
-        writes.append((meta, fields))
+    def fake_put_samples(sample_ids, partition_id, fields, tags):
+        del partition_id, tags
+        writes.append((sample_ids, fields))
 
-    monkeypatch.setattr(opd, "read_columns", fake_read_columns)
-    monkeypatch.setattr(opd, "write_columns", fake_write_columns)
+    dp_client.get_samples = fake_get_samples
+    dp_client.put_samples = fake_put_samples
     coordinator = opd.TQTeacherLogprobCoordinator(
         dp_client=dp_client,
         teacher_worker_groups={"primary": teacher},
@@ -403,10 +403,10 @@ def test_tq_teacher_enrichment_pads_dp_and_writes_teacher_column(monkeypatch):
     assert teacher.received_meta.sample_ids[:3] == meta.sample_ids
     assert "__teacher_pad_" in teacher.received_meta.sample_ids[-1]
     assert len(writes) == 1
-    pad_meta, padding_fields = writes[0]
-    assert pad_meta.size == 1
+    pad_ids, padding_fields = writes[0]
+    assert len(pad_ids) == 1
     assert padding_fields["input_ids"].shape == (1, 5)
-    assert dp_client.clear_calls == [(pad_meta.sample_ids, "rollout_data")]
+    assert dp_client.clear_calls == [(pad_ids, "rollout_data")]
     assert "teacher_reference_logprobs" in enriched.fields
     metrics = coordinator.drain_metrics()
     assert metrics["on_policy_distillation/teacher_batches"] == 1.0
@@ -430,20 +430,6 @@ def test_tq_teacher_enrichment_skips_padding_for_dp_divisible_batch(monkeypatch)
         def clear_samples(self, **kwargs):
             raise AssertionError(f"unexpected temporary-row cleanup: {kwargs}")
 
-    monkeypatch.setattr(
-        opd,
-        "read_columns",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("DP-divisible batches must not read a padding source")
-        ),
-    )
-    monkeypatch.setattr(
-        opd,
-        "write_columns",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("DP-divisible batches must not write padding rows")
-        ),
-    )
     coordinator = opd.TQTeacherLogprobCoordinator(
         dp_client=FakeDataPlane(),
         teacher_worker_groups={"teacher": teacher},
@@ -460,10 +446,140 @@ def test_tq_teacher_enrichment_skips_padding_for_dp_divisible_batch(monkeypatch)
     assert "teacher_reference_logprobs" in enriched.fields
 
 
+@pytest.mark.parametrize("media_rows", [[True], [False, True], [True, False]])
+@pytest.mark.parametrize("teacher_fails", [False, True])
+def test_tq_teacher_padding_preserves_media_wire_rows(
+    media_rows: list[bool], teacher_fails: bool
+) -> None:
+    """Padding preserves packed geometry, empty media and per-token type maps."""
+    import asyncio
+    from unittest.mock import MagicMock
+
+    from tensordict import TensorDict
+
+    from nemo_rl.algorithms.opd import TQTeacherLogprobCoordinator
+    from nemo_rl.data.multimodal_utils import (
+        encode_multimodal_for_wire,
+        multimodal_row_tags,
+    )
+    from nemo_rl.data_plane.codec import materialize
+
+    n = len(media_rows)
+    media = {
+        "pixel_values": PackedTensor(
+            [
+                torch.arange(12).reshape(1, 3, 2, 2).float() if has_media else None
+                for has_media in media_rows
+            ],
+            dim_to_pack=0,
+        ),
+        "imgs_sizes": PackedTensor(
+            [torch.tensor([[2, 2]]) if has_media else None for has_media in media_rows],
+            dim_to_pack=0,
+        ),
+        "num_frames": PackedTensor(
+            [torch.tensor([1]) if has_media else None for has_media in media_rows],
+            dim_to_pack=0,
+        ),
+    }
+    fields = {
+        "input_ids": torch.nested.as_nested_tensor(
+            list(torch.arange(n * 3).reshape(n, 3).unbind()), layout=torch.jagged
+        ),
+        "input_lengths": torch.full((n,), 3),
+        "token_type_ids": torch.nested.as_nested_tensor(
+            [torch.tensor([int(has_media), 0, 0]) for has_media in media_rows],
+            layout=torch.jagged,
+        ),
+        **{key: encode_multimodal_for_wire(key, value) for key, value in media.items()},
+    }
+    meta = _teacher_meta("group", n, 3)
+    meta.fields = list(fields)
+    meta.tags = multimodal_row_tags(media, n)
+    source = TensorDict(
+        {
+            key: torch.nested.as_nested_tensor(
+                [value.unbind()[-1]], layout=torch.jagged
+            )
+            if value.is_nested
+            else value[-1:]
+            for key, value in fields.items()
+        },
+        batch_size=[1],
+    )
+    client = MagicMock()
+    client.get_samples.return_value = source
+
+    class Teacher:
+        sharding_annotations = _MockShardingAnnotations(4)
+
+        def get_logprobs_from_meta(self, padded_meta):
+            assert padded_meta.size == 4
+            assert padded_meta.sample_ids[:n] == meta.sample_ids
+            assert padded_meta.tags == meta.tags + [meta.tags[-1]] * (4 - n)
+            written = client.put_samples.call_args.kwargs["fields"]
+            assert set(written.keys()) == set(fields)
+            # Exercise the production wire decoder, including an all-empty
+            # padding slice when the original batch ends in a text-only row.
+            decoded = materialize(written, tags=padded_meta.tags[n:])
+            for key, value in media.items():
+                assert decoded[key].logical_segment_counts_by_row() == [
+                    int(media_rows[-1])
+                ] * (4 - n)
+                if media_rows[-1]:
+                    expected = value.as_tensor()
+                    assert torch.equal(
+                        decoded[key].as_tensor(),
+                        expected.repeat(4 - n, *([1] * (expected.dim() - 1))),
+                    )
+            assert torch.equal(
+                decoded["input_ids"], fields["input_ids"].unbind()[-1].expand(4 - n, -1)
+            )
+            assert torch.equal(
+                decoded["token_type_ids"],
+                fields["token_type_ids"].unbind()[-1].expand(4 - n, -1),
+            )
+            if teacher_fails:
+                raise RuntimeError("teacher forward failed")
+
+    coordinator = TQTeacherLogprobCoordinator(
+        dp_client=client,
+        teacher_worker_groups={"teacher": Teacher()},
+        alias_to_group_alias={"math": "teacher"},
+        on_policy_distillation_cfg={
+            "teacher_model_by_agent_name": {"math": "/ckpt/teacher"}
+        },
+    )
+    if teacher_fails:
+        with pytest.raises(RuntimeError, match="teacher forward failed"):
+            asyncio.run(coordinator.enrich(meta, _teacher_env_info("math")))
+        assert "teacher_reference_logprobs" not in meta.fields
+    else:
+        enriched = asyncio.run(coordinator.enrich(meta, _teacher_env_info("math")))
+        assert enriched.sample_ids == meta.sample_ids
+        assert enriched.tags == meta.tags
+        assert "teacher_reference_logprobs" in enriched.fields
+    client.get_samples.assert_called_once_with(
+        sample_ids=[meta.sample_ids[-1]],
+        partition_id=meta.partition_id,
+        select_fields=[
+            "input_ids",
+            "input_lengths",
+            "imgs_sizes",
+            "num_frames",
+            "pixel_values",
+            "token_type_ids",
+        ],
+    )
+    temporary_ids = client.put_samples.call_args.kwargs["sample_ids"]
+    client.clear_samples.assert_called_once_with(
+        sample_ids=temporary_ids, partition_id=meta.partition_id
+    )
+
+
 def test_tq_teacher_routing_rejects_missing_agent_ref_without_retry_hint():
     """Missing Gym routing metadata gets a diagnostic that identifies the cause."""
     from nemo_rl.algorithms import opd
-    from nemo_rl.experience.interfaces import PromptGroupRecord
 
     coordinator = opd.TQTeacherLogprobCoordinator(
         dp_client=object(),
@@ -473,20 +589,11 @@ def test_tq_teacher_routing_rejects_missing_agent_ref_without_retry_hint():
             "teacher_model_by_agent_name": {"teacher": "/ckpt/teacher"}
         },
     )
-    record = PromptGroupRecord(
-        prompt_idx=0,
-        prompt=[],
-        extra_env_info={},
-        metadata={},
-        completions=[],
-        rollout_metrics={},
-    )
-
     with pytest.raises(
         ValueError,
         match="requires the NeMo-Gym rollout path.*cannot repair",
     ):
-        coordinator._resolve_teacher(record)
+        coordinator._resolve_teacher({})
 
 
 def test_tq_teacher_routing_uses_default_teacher_for_unmapped_agent():
@@ -518,26 +625,19 @@ def test_tq_teacher_padding_rows_are_cleaned_when_write_partially_fails(monkeypa
     cleared = []
 
     class FakeDataPlane:
-        def clear_samples(self, sample_ids, partition_id):
-            cleared.append((list(sample_ids), partition_id))
-
-    monkeypatch.setattr(
-        opd,
-        "read_columns",
-        lambda *args, **kwargs: BatchedDataDict(
-            {
+        def get_samples(self, **kwargs):
+            return {
                 "input_ids": torch.ones(1, 3, dtype=torch.long),
                 "input_lengths": torch.tensor([3]),
             }
-        ),
-    )
 
-    def partially_failing_write(_dp_client, meta, fields):
-        del fields
-        assert meta.sample_ids
-        raise RuntimeError("partial pad write")
+        def clear_samples(self, sample_ids, partition_id):
+            cleared.append((list(sample_ids), partition_id))
 
-    monkeypatch.setattr(opd, "write_columns", partially_failing_write)
+        def put_samples(self, sample_ids, **kwargs):
+            assert sample_ids
+            raise RuntimeError("partial pad write")
+
     coordinator = opd.TQTeacherLogprobCoordinator(
         dp_client=FakeDataPlane(),
         teacher_worker_groups={"teacher": _MockTeacherWorkerGroup(dp_size=4)},
@@ -689,19 +789,6 @@ def test_tq_teacher_enrichment_serializes_deduplicated_teacher(monkeypatch):
                 with active_lock:
                     active -= 1
 
-    def fake_read_columns(dp_client, meta, select_fields, pad_value_dict):
-        del dp_client, select_fields, pad_value_dict
-        return BatchedDataDict(
-            {
-                "input_ids": torch.ones(len(meta.sample_ids), 4, dtype=torch.long),
-                "input_lengths": torch.full(
-                    (len(meta.sample_ids),), 4, dtype=torch.long
-                ),
-            }
-        )
-
-    monkeypatch.setattr(opd, "read_columns", fake_read_columns)
-    monkeypatch.setattr(opd, "write_columns", lambda *args, **kwargs: None)
     teacher = SlowTeacher(dp_size=1)
     coordinator = opd.TQTeacherLogprobCoordinator(
         dp_client=object(),
@@ -1335,8 +1422,6 @@ def test_tq_teacher_enrichment_advertises_the_full_payload_column(monkeypatch):
     from nemo_rl.algorithms import opd
     from nemo_rl.data_plane.schema import OPD_FULL_HIDDEN_STATES_FIELD
 
-    monkeypatch.setattr(opd, "read_columns", lambda *a, **kw: None)
-    monkeypatch.setattr(opd, "write_columns", lambda *a, **kw: None)
     coordinator = opd.TQTeacherLogprobCoordinator(
         dp_client=object(),
         teacher_worker_groups={"primary": _meta_teacher_class()()},
@@ -1372,8 +1457,6 @@ def test_tq_teacher_enrichment_does_not_advertise_a_payload_when_full_is_disable
     from nemo_rl.algorithms import opd
     from nemo_rl.data_plane.schema import OPD_FULL_FIELDS
 
-    monkeypatch.setattr(opd, "read_columns", lambda *a, **kw: None)
-    monkeypatch.setattr(opd, "write_columns", lambda *a, **kw: None)
     coordinator = opd.TQTeacherLogprobCoordinator(
         dp_client=object(),
         teacher_worker_groups={"primary": _meta_teacher_class()()},

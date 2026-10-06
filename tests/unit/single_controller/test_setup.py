@@ -1885,9 +1885,29 @@ class TestSetup:
         ]
         assert WIRE_MULTIMODAL_FIELDS <= set(warmup_fields)
 
+    def test_multimodal_mopd_requires_media_capture_before_allocation(
+        self, patched_factories
+    ):
+        mc = _make_master_config(
+            env={"should_use_nemo_gym": True}, megatron_enabled=True
+        )
+        mc.grpo.adv_estimator = AdvEstimatorConfig(name="opd")
+        mc.on_policy_distillation = OnPolicyDistillationConfig(
+            enabled=True,
+            teacher_model_by_agent_name={"teacher": "/ckpt/teacher"},
+            default_teacher_alias="teacher",
+            non_colocated_teachers={"enabled": True},
+        )
+        with pytest.raises(ValueError, match="multimodal MOPD requires token_capture"):
+            setup_single_controller(
+                mc, MagicMock(pad_token_id=9), processor=MagicMock()
+            )
+        patched_factories["_build_clusters"].assert_not_called()
+
     @pytest.mark.parametrize("with_processor", [True, False])
+    @pytest.mark.parametrize("with_opd", [True, False])
     def test_token_capture_always_creates_finalizer_actor_pool(
-        self, patched_factories, with_processor
+        self, patched_factories, with_processor, with_opd
     ):
         # A VLM processor turns media capture on (Omni placeholder processor,
         # Megatron learner); text-only runs get capture_media=False.
@@ -1903,6 +1923,15 @@ class TestSetup:
         )
         mc.token_capture.enabled = True
         mc.token_capture.num_reassembler_workers = 3
+        if with_opd:
+            mc.env["should_use_nemo_gym"] = True
+            mc.grpo.adv_estimator = AdvEstimatorConfig(name="opd")
+            mc.on_policy_distillation = OnPolicyDistillationConfig(
+                enabled=True,
+                teacher_model_by_agent_name={"teacher": "/ckpt/teacher"},
+                default_teacher_alias="teacher",
+                non_colocated_teachers={"enabled": True},
+            )
         patched_factories["setup_response_data"].return_value = (
             list(range(8)),
             None,
@@ -1919,6 +1948,16 @@ class TestSetup:
             patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
             patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
             patch.object(sc_setup_mod, "uses_image_placeholder", return_value=True),
+            patch.object(
+                sc_setup_mod.opd_module,
+                "reserve_teacher_clusters",
+                return_value={"teacher": MagicMock()},
+            ),
+            patch.object(
+                sc_setup_mod.opd_module,
+                "create_teacher_worker_groups",
+                return_value=({"teacher": MagicMock()}, {"teacher": "teacher"}),
+            ),
             patch(
                 "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
                 return_value=fake_actors,
