@@ -240,7 +240,9 @@ def apply_fp8_patches(self, fp8_config):
     fp8_patches_applied = True
 
 
-def init_fp8(vllm_cfg, model_name, model_parallel_size, vllm_kwargs=None):
+def init_fp8(
+    vllm_cfg, model_name, model_parallel_size, vllm_kwargs: dict[str, Any] | None = None
+):
     global global_fp8_config
     # Determine if we're using FP8 weights based on precision setting
     use_fp8_weights = vllm_cfg.get("precision") == "fp8"
@@ -276,18 +278,11 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size, vllm_kwargs=None):
             "FP8 KV cache can only be used together with FP8 model weights."
         )
 
-    # MXFP8-quantized MoE layers only load through the FLASHINFER_TRTLLM layout
-    # (process_weights_after_loading_mxfp8_moe rejects everything else), and
-    # vLLM's auto-select already prefers it. An explicit non-trtllm override is
-    # otherwise caught only at weight load with an opaque error, so surface it
-    # here with remediation. Warn rather than raise: quantization_ignore_patterns
-    # (or the deprecated quantization_ignored_layer_kws) can exclude MoE layers
-    # from MXFP8, which makes other backends legal.
-    if vllm_cfg.get("is_mx"):
+    # Legacy MXFP8 refit only supports TRTLLM's MoE layout. Native reload
+    # supports other backends; ignored MoE layers also make them legal.
+    if vllm_cfg.get("is_mx") and not vllm_cfg.get("refit_with_reload_api"):
         has_moe_experts = get_num_routed_experts(config) is not None
-        # vLLM 0.25.1 accepts the backend as either EngineArgs.moe_backend or
-        # the nested kernel_config.moe_backend; the top-level key overrides the
-        # nested one only when it is not "auto" (EngineArgs.create_engine_config).
+        # EngineArgs only overrides the nested backend when it is not "auto".
         kwargs = vllm_kwargs or {}
         moe_backend = kwargs.get("moe_backend")
         kernel_config = kwargs.get("kernel_config")
@@ -299,7 +294,7 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size, vllm_kwargs=None):
             "flashinfer_trtllm",
         ):
             logger.warning(
-                "MXFP8 MoE requires moe_backend='flashinfer_trtllm', but "
+                "Legacy MXFP8 MoE refit requires moe_backend='flashinfer_trtllm', but "
                 "vllm_kwargs resolves moe_backend=%r (from moe_backend or "
                 "kernel_config.moe_backend). Weight processing will fail at load "
                 "for MXFP8-quantized MoE layers. Set "

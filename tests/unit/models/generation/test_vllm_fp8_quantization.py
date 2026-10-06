@@ -858,12 +858,17 @@ def test_init_fp8_rejects_mxfp8_without_fp8_precision(
         {"moe_backend": "triton"},
         # Nested KernelConfig key (the form main's glm5.2 / omni recipes use).
         {"kernel_config": {"moe_backend": "triton"}},
-        # Top-level "auto" does not override the nested key in vLLM 0.25.1.
+        # Top-level "auto" does not override the nested key.
         {"moe_backend": "auto", "kernel_config": {"moe_backend": "triton"}},
+        {
+            "moe_backend": "triton",
+            "kernel_config": {"moe_backend": "flashinfer_trtllm"},
+        },
     ],
 )
+@pytest.mark.parametrize("refit_with_reload_api", [False, True])
 def test_init_fp8_warns_on_explicit_non_trtllm_moe_backend_with_mxfp8(
-    fp8_module, monkeypatch, vllm_kwargs
+    fp8_module, monkeypatch, vllm_kwargs, refit_with_reload_api
 ):
     fp8 = fp8_module
     warnings = []
@@ -886,6 +891,7 @@ def test_init_fp8_warns_on_explicit_non_trtllm_moe_backend_with_mxfp8(
             "kv_cache_dtype": "auto",
             "async_engine": False,
             "is_mx": True,
+            "refit_with_reload_api": refit_with_reload_api,
         },
         "dummy-model",
         model_parallel_size=1,
@@ -893,9 +899,13 @@ def test_init_fp8_warns_on_explicit_non_trtllm_moe_backend_with_mxfp8(
     )
 
     moe_warnings = [w for w in warnings if "moe_backend" in w]
-    assert len(moe_warnings) == 1
-    assert "flashinfer_trtllm" in moe_warnings[0]
-    assert "'triton'" in moe_warnings[0]
+    if refit_with_reload_api:
+        assert not moe_warnings
+    else:
+        assert len(moe_warnings) == 1
+        assert "Legacy MXFP8 MoE refit" in moe_warnings[0]
+        assert "flashinfer_trtllm" in moe_warnings[0]
+        assert "'triton'" in moe_warnings[0]
 
 
 @pytest.mark.parametrize(
@@ -905,10 +915,18 @@ def test_init_fp8_warns_on_explicit_non_trtllm_moe_backend_with_mxfp8(
         ({"num_experts": 8}, {"moe_backend": "flashinfer_trtllm"}),
         # MoE model relying on vLLM auto-select (moe_backend unset).
         ({"num_experts": 8}, None),
-        # Explicit "auto" behaves exactly like unset in vLLM 0.25.1.
+        # Explicit "auto" behaves exactly like unset.
         ({"num_experts": 8}, {"moe_backend": "auto"}),
         # Correct backend given through the nested KernelConfig key.
         ({"num_experts": 8}, {"kernel_config": {"moe_backend": "flashinfer_trtllm"}}),
+        # An explicit top-level backend takes precedence over the nested key.
+        (
+            {"num_experts": 8},
+            {
+                "moe_backend": "flashinfer_trtllm",
+                "kernel_config": {"moe_backend": "triton"},
+            },
+        ),
         # Dense model: moe_backend is irrelevant (32B recipes).
         ({}, {"moe_backend": "triton"}),
     ],
