@@ -3081,6 +3081,64 @@ def test_noncolocated_opd_teacher_must_fit_on_one_cluster_node(
     mock_reserve_teacher_clusters.assert_not_called()
 
 
+def test_noncolocated_opd_teacher_fp32_lm_head_is_checked_before_reserving(
+    mock_grpo_components,
+):
+    """A student fp32 LM head that the teachers do not set fails before any cluster."""
+    from unittest.mock import MagicMock, patch
+
+    from nemo_rl.algorithms.grpo import setup
+    from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.cluster["num_nodes"] = 3
+    master_config.cluster["gpus_per_node"] = 4
+    master_config.grpo.val_period = 0
+    master_config.grpo.batch_multiplier = 1
+    master_config.policy["megatron_cfg"] = {"enabled": True, "fp32_lm_head": "tf32"}
+    master_config.policy["generation"]["vllm_cfg"]["env_vars"] = {
+        "NRL_VLLM_FP32_LM_HEAD": "1"
+    }
+    master_config.on_policy_distillation = OnPolicyDistillationConfig.model_validate(
+        {
+            "enabled": True,
+            "teacher_model_by_agent_name": {
+                "default_teacher": "/checkpoints/default_teacher"
+            },
+            "non_colocated_teachers": {
+                "enabled": True,
+                # Fits the cluster; fp32_lm_head is left unset (false).
+                "default_teacher_cfg": {"num_nodes": 1, "gpus_per_node": 4},
+            },
+        }
+    )
+    master_config.data["shuffle"] = False
+    master_config.data["num_workers"] = 1
+
+    tokenizer = MagicMock()
+    dataset = MagicMock()
+    dataset.__len__ = MagicMock(return_value=10)
+
+    with (
+        patch("nemo_rl.algorithms.grpo.Logger"),
+        patch("nemo_rl.algorithms.grpo.CheckpointManager") as mock_checkpointer,
+        patch("nemo_rl.algorithms.grpo.StatefulDataLoader"),
+        patch("nemo_rl.algorithms.grpo.RayVirtualCluster") as mock_cluster,
+        patch(
+            "nemo_rl.algorithms.grpo.opd_module.reserve_teacher_clusters"
+        ) as mock_reserve_teacher_clusters,
+        pytest.raises(
+            ValueError,
+            match=r"fp32_lm_head='tf32'.*default_teacher=False.*do not inherit",
+        ),
+    ):
+        mock_checkpointer.return_value.get_latest_checkpoint_path.return_value = None
+        setup(master_config, tokenizer, dataset, None)
+
+    mock_cluster.assert_not_called()
+    mock_reserve_teacher_clusters.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "initial_skip_flag",
     [None, False],
