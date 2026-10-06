@@ -150,6 +150,36 @@ def test_sync_consumed_samples_on_scheduler_load_survives_bridge_override():
 
 
 @pytest.mark.mcore
+def test_load_checkpoint_checkpoint_state_migration_hook_dne():
+    """
+    When this test fails, add a checkpoint hook to load_checkpoint()
+    to set state.train_state.consumed_train_samples = scheduler.num_steps
+    from the scheduler checkpoint and remove this context manager:
+    _sync_consumed_samples_on_scheduler_load
+
+    Draft PR: https://github.com/NVIDIA-NeMo/Megatron-Bridge/pull/6321
+
+    False positives can happen, in which case just add the new arg to
+    the list if it's not the hook this test is referring to.
+    """
+    import inspect
+
+    from megatron.bridge.training.checkpointing import load_checkpoint
+
+    assert list(inspect.signature(load_checkpoint).parameters) == [
+        "state",
+        "model",
+        "optimizer",
+        "opt_param_scheduler",
+        "strict",
+        "checkpointing_context",
+        "skip_load_to_model_and_opt",
+        "pg_collection",
+        "module_name",
+    ]
+
+
+@pytest.mark.mcore
 class TestValidateModelPaths:
     """Tests for validate_model_paths function."""
 
