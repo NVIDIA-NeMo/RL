@@ -26,3 +26,17 @@ paths are checked. Do not relabel this as a container-native run.
 Builds/caches stay node-local;
 only image, source tar, checkpoints and durable results go on shared storage.
 Existing images, experiments and completed measurements are preserved.
+
+## Nightly dependency drift
+
+The downloaded Oct6 nightly failed the dependency gate: it contains Bridge
+`1f8873bb`, MCore `6a366090` and resiliency0.6, rather than this main snapshot.
+Its installed Mamba is already2.3.2.post1 despite older lockfile metadata.
+This failure occurred before model initialization. It is not a new refit failure.
+
+`align_image.sbatch` preserves that base image, replaces source with the pinned
+archive, and syncs the driver and required policy/generation/Async helper actor
+environments with `uv sync --locked --inexact`. Build/cache writes stay inside
+the node-local writable container; the final image is saved only after imports,
+GPU operations and regressions pass. The new fingerprint is recorded after
+actual dependency installation, never as a substitute for installation.

@@ -1,3 +1,4 @@
+import hashlib
 import importlib
 import importlib.metadata
 import json
@@ -20,6 +21,11 @@ def main() -> None:
     ):
         if baked.get(key) != expected[key]:
             raise RuntimeError(f"Nightly dependency fingerprint mismatch: {key}")
+        actual = hashlib.md5(
+            (root / key).read_bytes(), usedforsecurity=False
+        ).hexdigest()
+        if actual != expected[key]:
+            raise RuntimeError(f"Source dependency fingerprint mismatch: {key}")
     print(
         json.dumps({"role": role, "executable": sys.executable, "fingerprint": baked})
     )
@@ -37,7 +43,10 @@ def main() -> None:
             "megatron.bridge",
             "transformer_engine.pytorch",
             "mamba_ssm",
+            "nvidia_resiliency_ext",
         ]
+        if importlib.metadata.version("nvidia-resiliency-ext") != "0.7.0":
+            raise RuntimeError("Expected main's nvidia-resiliency-ext 0.7.0")
     elif role.startswith("vllm"):
         modules += ["vllm", "flashinfer"]
         if importlib.metadata.version("vllm").split("+")[0] != "0.29.0":
@@ -52,6 +61,19 @@ def main() -> None:
         if name in ("nemo_rl", "megatron.core", "megatron.bridge"):
             if not Path(module.__file__).resolve().is_relative_to(root):
                 raise RuntimeError(f"Stale source import: {name}")
+    for package in (
+        "torch",
+        "megatron-core",
+        "megatron-bridge",
+        "mamba-ssm",
+        "vllm",
+        "nvidia-resiliency-ext",
+    ):
+        try:
+            version = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            continue
+        print(f"installed {package}: {version}")
     print(f"PASS: {role}")
 
 
