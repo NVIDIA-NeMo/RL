@@ -510,7 +510,7 @@ class TQWorkerMixin:
             # and let every rank assemble locally; see _pack_route_fragments.
             ship_fragments = (
                 bool((meta.extra_info or {}).get(ROUTE_PASSTHROUGH_FLAG))
-                and os.environ.get("NRL_ROUTE_BCAST", "dense") == "fragments"
+                and os.environ.get("NRL_ROUTE_BCAST", "fragments") != "dense"
             )
             plans = self._route_plans(meta) if ship_fragments else []
             if is_leader:
