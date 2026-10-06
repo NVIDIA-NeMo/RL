@@ -47,7 +47,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     ReadyFirstSamplerConfig,
 )
 from nemo_rl.algorithms.grpo import GRPOConfig, _initial_grpo_save_state
-from nemo_rl.algorithms.loss import ClippedPGLossConfig
+from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.single_controller import (
@@ -3639,6 +3639,61 @@ def test_streaming_ppo_advantage_stage_normalizes_each_chunk_independently(
         full_rewards = torch.tensor([1.0, 3.0, 101.0, 107.0])
         batch_normalized = (full_rewards - full_rewards.mean()) / full_rewards.std()
         assert not torch.allclose(torch.cat(chunk_advantages), batch_normalized)
+
+
+def test_streaming_ppo_filtered_single_token_has_finite_loss_and_gradients() -> None:
+    ctrl, _ = _ppo_train_pump_controller(sampler=_EmptySampler())
+    ctrl._streaming_ppo = True
+    loss_config = ClippedPGLossConfig(reference_policy_kl_penalty=0.0)
+    ctrl._advantage_estimator = GeneralizedAdvantageEstimator(
+        GAEConfig(normalize_advantages=True), loss_config
+    )
+    data = TensorDict(
+        {
+            "total_reward": torch.tensor([2.0, 7.0]),
+            "token_mask": torch.tensor([[0.0, 1.0, 0.0, 0.0], [0.0, 1.0, 1.0, 1.0]]),
+            "sample_mask": torch.ones(2),
+            "values": torch.zeros(2, 4),
+            "mask_sample": torch.tensor([False, True]),
+            "truncated": torch.zeros(2, dtype=torch.bool),
+            "prev_logprobs": torch.full((2, 4), -math.log(4)),
+            "generation_logprobs": torch.full((2, 4), -math.log(4)),
+        },
+        batch_size=[2],
+    )
+    data_plane = _AdvantageDataPlane(data)
+    ctrl._dp_client = data_plane
+    _stamp_advantage_stage_config(ctrl, shardable=False)
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["chunk_g0", "chunk_g1"],
+        fields=list(data.keys()),
+        tags=_one_group_tags(2),
+    )
+
+    _, has_valid_tokens = asyncio.run(ctrl._advantage_stage(meta))
+
+    assert has_valid_tokens
+    written = data_plane.written_fields
+    assert written is not None
+    # Filtering removes the multi-token response, leaving one trainable token.
+    token_mask = data["token_mask"][:, 1:] * written["sample_mask"].unsqueeze(-1)
+    assert token_mask.sum() == 1
+    policy_logits = torch.zeros(2, 3, 4, requires_grad=True)
+    loss, _ = ClippedPGLossFn(loss_config)(
+        next_token_logprobs=policy_logits.log_softmax(dim=-1)[:, :, 0],
+        data=BatchedDataDict({**dict(data.items()), **dict(written.items())}),
+        global_valid_seqs=written["sample_mask"].sum(),
+        global_valid_toks=token_mask.sum(),
+    )
+
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert policy_logits.grad is not None
+    assert torch.isfinite(policy_logits.grad).all()
+    torch.testing.assert_close(written["advantages"], torch.zeros(2, 4))
+    assert written["returns"][0, 1] == 2.0
 
 
 def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:

@@ -344,7 +344,10 @@ def masked_var(
 
     if unbiased:
         normalization_factor = torch.sum(mask)
-        variance = variance * (normalization_factor / (normalization_factor - 1))
+        # A singleton has zero centered variance; avoid an undefined correction.
+        variance = variance * (
+            normalization_factor / (normalization_factor - 1).clamp(min=1)
+        )
     return variance
 
 
