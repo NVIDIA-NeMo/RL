@@ -37,6 +37,8 @@ class LogprobOutputSpec(TypedDict):
 
     logprobs: torch.Tensor
     token_mask: NotRequired[torch.Tensor]
+    topk_logprobs: NotRequired[torch.Tensor]
+    topk_indices: NotRequired[torch.Tensor]
 
 
 class ReferenceLogprobOutputSpec(TypedDict):
@@ -56,6 +58,7 @@ class TopkLogitsOutputSpec(TypedDict):
 
     topk_logits: torch.Tensor
     topk_indices: torch.Tensor
+    V_logsumexp: NotRequired[torch.Tensor]
 
 
 class TeacherFullPayloadOutputSpec(TypedDict):
@@ -81,6 +84,7 @@ class PolicyInterface(ABC):
         self,
         data: BatchedDataDict[GenerationDatumSpec],
         timer: Optional[Timer] = None,
+        topk: Optional[int] = None,
     ) -> BatchedDataDict[LogprobOutputSpec]:
         """Get logprobs of actions from observations.
 
@@ -119,6 +123,7 @@ class PolicyInterface(ABC):
         k: int,
         micro_batch_size: Optional[int] = None,
         timer: Optional[Timer] = None,
+        return_logsumexp: bool = False,
     ) -> BatchedDataDict[TopkLogitsOutputSpec]:
         """Get per-position top-k logits and global indices for a batch of inputs.
 

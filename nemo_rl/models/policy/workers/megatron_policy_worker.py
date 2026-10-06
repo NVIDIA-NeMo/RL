@@ -2297,6 +2297,7 @@ class MegatronPolicyWorkerImpl(
         data: BatchedDataDict[Any],
         micro_batch_size: Optional[int] = None,
         require_router_replay: bool = True,
+        topk: Optional[int] = None,
     ) -> BatchedDataDict[LogprobOutputSpec]:
         """Get the logprobs of the model for a batch of data.
 
@@ -2352,6 +2353,7 @@ class MegatronPolicyWorkerImpl(
             cfg=self.cfg,
             sampling_params=self.sampling_params,
             use_fused_linear_logprobs=use_fused_linear_logprobs,
+            topk=topk,
         )
         use_router_replay = _should_use_router_replay(
             enabled=self._router_replay_enabled,
@@ -2392,10 +2394,23 @@ class MegatronPolicyWorkerImpl(
                 tensors["token_mask"] = pad_and_concat(
                     [l["token_mask"] for l in list_of_logprobs], target_len=seq_length
                 )
+            if topk is not None:
+                tensors["topk_logprobs"] = pad_and_concat(
+                    [l["topk_logprobs"] for l in list_of_logprobs],
+                    target_len=seq_length,
+                )
+                tensors["topk_indices"] = pad_and_concat(
+                    [l["topk_indices"] for l in list_of_logprobs],
+                    target_len=seq_length,
+                    pad_value=-1,
+                )
         else:
             tensors = {"logprobs": None}
             if has_token_mask:
                 tensors["token_mask"] = None
+            if topk is not None:
+                tensors["topk_logprobs"] = None
+                tensors["topk_indices"] = None
         broadcasted = broadcast_tensors_from_last_stage(tensors)
         logprobs = broadcasted["logprobs"]
 
@@ -2412,6 +2427,9 @@ class MegatronPolicyWorkerImpl(
         result = BatchedDataDict[LogprobOutputSpec](logprobs=cpu_logprobs)
         if has_token_mask:
             result["token_mask"] = broadcasted["token_mask"].to("cpu")
+        if topk is not None:
+            result["topk_logprobs"] = broadcasted["topk_logprobs"].to("cpu")
+            result["topk_indices"] = broadcasted["topk_indices"].to("cpu")
         return result
 
     def _resolve_output_layer_owner(self) -> Optional[Any]:
@@ -2847,6 +2865,7 @@ class MegatronPolicyWorkerImpl(
         data: BatchedDataDict[GenerationDatumSpec],
         k: int,
         micro_batch_size: Optional[int] = None,
+        return_logsumexp: bool = False,
     ):
         """Get the top-k logits and indices for a batch of data.
 
@@ -2893,7 +2912,9 @@ class MegatronPolicyWorkerImpl(
             seq_length=padded_seq_length,
             mbs=micro_batch_size,
             num_microbatches=num_microbatches,
-            post_processing_fn=TopkLogitsPostProcessor(cfg=self.cfg, k=k),
+            post_processing_fn=TopkLogitsPostProcessor(
+                cfg=self.cfg, k=k, return_logsumexp=return_logsumexp
+            ),
             forward_only=True,
             defer_fp32_logits=self.defer_fp32_logits,
             sampling_params=self.sampling_params,
@@ -2908,16 +2929,24 @@ class MegatronPolicyWorkerImpl(
             topk_indices = pad_and_concat(
                 [o["topk_indices"] for o in list_of_outputs], target_len=seq_length
             )
+            if return_logsumexp:
+                V_logsumexp = pad_and_concat(
+                    [o["V_logsumexp"] for o in list_of_outputs], target_len=seq_length
+                )
 
             tensors_to_broadcast = {
                 "topk_logits": topk_logits,
                 "topk_indices": topk_indices,
             }
+            if return_logsumexp:
+                tensors_to_broadcast["V_logsumexp"] = V_logsumexp
         else:
             tensors_to_broadcast = {
                 "topk_logits": None,
                 "topk_indices": None,
             }
+            if return_logsumexp:
+                tensors_to_broadcast["V_logsumexp"] = None
 
         # Broadcast tensors from last stage to all stages
         broadcasted = broadcast_tensors_from_last_stage(tensors_to_broadcast)
@@ -2925,9 +2954,13 @@ class MegatronPolicyWorkerImpl(
         topk_indices = broadcasted["topk_indices"]
 
         no_grad.__exit__(None, None, None)
-        return BatchedDataDict.from_batches(
-            [{"topk_logits": topk_logits.cpu(), "topk_indices": topk_indices.cpu()}]
-        )
+        result = {
+            "topk_logits": topk_logits.cpu(),
+            "topk_indices": topk_indices.cpu(),
+        }
+        if return_logsumexp:
+            result["V_logsumexp"] = broadcasted["V_logsumexp"].cpu()
+        return BatchedDataDict.from_batches([result])
 
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/prepare_refit_info")

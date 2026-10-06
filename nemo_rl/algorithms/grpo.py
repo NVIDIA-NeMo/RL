@@ -30,6 +30,7 @@ from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms import opd as opd_module
+from nemo_rl.algorithms import opd_diagnostics as opd_diag
 from nemo_rl.algorithms.advantage_estimator import (
     AdvEstimatorConfig,
     GDPOAdvantageEstimator,
@@ -2576,6 +2577,7 @@ def _create_advantage_estimator(master_config: MasterConfig):
     elif adv_estimator_name == "opd":
         opd_module.assert_prev_logprobs_available(master_config)
         opd_module.assert_trust_region_supported(master_config)
+        opd_module.assert_topk_stats_supported(master_config)
         adv_estimator = OPDAdvantageEstimator(adv_estimator_config, loss_config)
         print("  ✓ Using OPD advantage estimator")
         # Warn if loss_fn is not configured per MOPD paper recommendations.
@@ -5387,6 +5389,19 @@ def async_grpo_train(
                 skip_prev_logprobs, skip_reference_logprobs = (
                     _resolve_logprob_skip_flags(master_config)
                 )
+                opd_diagnostic_payloads: dict[str, Any] = {}
+                fused_student_topk: Optional[dict[str, torch.Tensor]] = None
+                should_fuse_student_topk = (
+                    opd_diag._should_log_opd_topk_stats(master_config, step)
+                    and opd_diag._get_opd_topk_stats_mode(master_config)
+                    == opd_diag.OPD_TOPK_STATS_MODE_STUDENT_ONLINE_TEACHER_DEFERRED
+                    and "agent_ref" in repeated_batch
+                )
+                fused_student_topk_k = (
+                    opd_diag._get_opd_topk_stats_k(master_config)
+                    if should_fuse_student_topk
+                    else None
+                )
                 seq_logprob_error_threshold = (
                     master_config.grpo.seq_logprob_error_threshold
                 )
@@ -5406,11 +5421,21 @@ def async_grpo_train(
                     ),
                 ):
                     if not skip_prev_logprobs:
-                        prev_lp_result = policy.get_logprobs(train_data, timer=timer)
+                        student_logprob_kwargs: dict[str, Any] = {"timer": timer}
+                        if fused_student_topk_k is not None:
+                            student_logprob_kwargs["topk"] = fused_student_topk_k
+                        prev_lp_result = policy.get_logprobs(
+                            train_data, **student_logprob_kwargs
+                        )
                         train_data["prev_logprobs"] = prev_lp_result["logprobs"]
                         # Propagate the top-k/top-p neginf token mask.
                         if "token_mask" in prev_lp_result:
                             train_data["token_mask"] = prev_lp_result["token_mask"]
+                        if should_fuse_student_topk:
+                            fused_student_topk = {
+                                "topk_logprobs": prev_lp_result["topk_logprobs"],
+                                "topk_indices": prev_lp_result["topk_indices"],
+                            }
                     else:
                         train_data["prev_logprobs"] = torch.zeros_like(
                             train_data["generation_logprobs"]
@@ -5432,6 +5457,7 @@ def async_grpo_train(
                             train_data["prev_logprobs"]
                         )
 
+                pre_seq_error_sample_loss_mask = train_data["sample_mask"].clone()
                 # Separate-pass seq-level metrics/masking require real prev_logprobs
                 if skip_prev_logprobs:
                     # In-loss filtering reports counts through all_mb_metrics.
@@ -5461,6 +5487,27 @@ def async_grpo_train(
                     trajectory_teacher_logprobs = _pad_teacher_logprobs(
                         trajectory_teacher_logprobs, train_data["input_ids"].shape[1]
                     )
+
+                (
+                    opd_diagnostic_payloads,
+                    opd_diagnostic_metrics,
+                ) = opd_diag._collect_opd_diagnostic_payloads(
+                    master_config=master_config,
+                    step=step,
+                    tokenizer=tokenizer,
+                    policy=policy,
+                    trajectory_collector=trajectory_collector,
+                    train_data=train_data,
+                    repeated_batch=repeated_batch,
+                    rewards=rewards,
+                    input_lengths=input_lengths,
+                    teacher_logprobs=trajectory_teacher_logprobs,
+                    fused_student_topk=fused_student_topk,
+                    pre_seq_error_sample_loss_mask=pre_seq_error_sample_loss_mask,
+                    have_real_prev_logprobs=not skip_prev_logprobs,
+                    timer=timer,
+                )
+                rollout_metrics.update(opd_diagnostic_metrics)
 
                 # Compute advantages with adv_estimator using correct mask and logprobs
                 with (
@@ -5968,6 +6015,29 @@ def async_grpo_train(
                     log_data, f"train_data_step{step + 1}.jsonl"
                 )
                 del log_data
+            if "sample" in opd_diagnostic_payloads:
+                logger.log_batched_dict_as_jsonl(
+                    opd_diagnostic_payloads["sample"],
+                    f"opd_sample_stats_step{step + 1}.jsonl",
+                )
+            for payload_key, filename in (
+                ("token", f"opd_token_stats_step{step + 1}.pt"),
+                (
+                    "topk_offline_inputs",
+                    f"opd_topk_offline_inputs_step{step + 1}.pt",
+                ),
+                (
+                    "topk_student_stats",
+                    f"opd_topk_student_stats_step{step + 1}.pt",
+                ),
+                ("topk_stats", f"opd_topk_stats_step{step + 1}.pt"),
+            ):
+                if payload_key in opd_diagnostic_payloads:
+                    torch.save(
+                        opd_diagnostic_payloads[payload_key],
+                        os.path.join(logger.base_log_dir, filename),
+                    )
+            del opd_diagnostic_payloads
             del train_data
             del flat_messages_content
 
