@@ -287,7 +287,7 @@ class _RestoringGymCoordinator:
     async def resume(self, checkpoint_id: str) -> None:
         self.resumes.append(checkpoint_id)
 
-    async def discard_restored(
+    async def retire_restored(
         self,
         restore_id: str,
         manifest: GymCheckpointManifest,
