@@ -176,6 +176,7 @@ def test_osworld_v2_molt_b8k8_recipe_composes_and_validates(monkeypatch):
     assert config.grpo.num_prompts_per_step == 8
     assert config.grpo.num_generations_per_prompt == 8
     assert config.grpo.max_num_epochs == 100000
+    assert config.grpo.max_num_steps == 300
     assert config.policy["train_global_batch_size"] == 64
     assert config.grpo.adv_estimator.name == "reinforce_baseline"
     assert config.grpo.baseline_population == "all_owners"
@@ -304,6 +305,7 @@ def test_osworld_v2_molt_checkpoint_recipe_composes_and_validates(monkeypatch):
     config = compose_and_validate_config([], config_path=MOLT_CHECKPOINT_CONFIG_PATH)
 
     assert config.grpo.max_num_epochs == 100000
+    assert config.grpo.max_num_steps == 300
     assert config.checkpointing["enabled"] is True
     assert config.checkpointing["checkpoint_dir"] == "/checkpoints/osworld-v2"
     assert config.checkpointing["save_period"] == 1
