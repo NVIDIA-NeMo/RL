@@ -108,6 +108,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         skip_weight_load: bool = False,
         is_refit_destination: bool = False,
         reserved_http_server_ports: Optional[dict[int, int]] = None,
+        offloaded_between_steps: bool = False,
     ):
         self.debug_payload_metrics = False
         configured_extension_fqn = config.get("worker_extension_cls_fqn")
@@ -353,8 +354,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         )
         if megatron_enable:
             worker_kwargs["is_refit_destination"] = is_refit_destination
+            # The algorithm moves this policy's storage off the GPU between saves.
+            worker_kwargs["offloaded_between_steps"] = offloaded_between_steps
         elif is_refit_destination:
             raise ValueError("is_refit_destination=True requires the Megatron backend.")
+        elif offloaded_between_steps:
+            raise ValueError(
+                "offloaded_between_steps=True requires the Megatron backend."
+            )
         if skip_weight_load:
             worker_kwargs["skip_weight_load"] = True
         if reserved_http_server_ports is not None:

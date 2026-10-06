@@ -1780,7 +1780,7 @@ def test_megatron_finalize_async_save_releases_colocated_nvrx_cache(
     import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
 
     worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
-    worker.cfg = {"generation": {"colocated": {"enabled": True}}}
+    worker.release_nvrx_ckpt_cache = True
     worker.mcore_state = SimpleNamespace(
         cfg=SimpleNamespace(
             checkpoint=SimpleNamespace(
@@ -1833,41 +1833,6 @@ def test_megatron_finalize_async_save_releases_colocated_nvrx_cache(
         assert worker._async_checkpoint_cuda_cache_active is False
     else:
         assert events == [("finalize", False)]
-
-
-@pytest.mark.parametrize(
-    ("generation_cfg", "megatron_cfg", "expected"),
-    [
-        ({"colocated": {"enabled": False}}, {"offloaded_between_steps": True}, True),
-        ({"colocated": {"enabled": False}}, {}, False),
-        ({"colocated": {"enabled": True}}, {}, True),
-    ],
-    ids=["noncolocated_ppo", "noncolocated", "colocated"],
-)
-def test_megatron_nvrx_cache_release_covers_ppo_offload(
-    generation_cfg, megatron_cfg, expected
-):
-    """PPO offloads the policy every step even when generation is not colocated."""
-    from nemo_rl.models.policy.workers.megatron_policy_worker import (
-        MegatronPolicyWorkerImpl,
-    )
-
-    worker = object.__new__(MegatronPolicyWorkerImpl)
-    worker.cfg = {"generation": generation_cfg, "megatron_cfg": megatron_cfg}
-    worker.mcore_state = SimpleNamespace(
-        cfg=SimpleNamespace(
-            checkpoint=SimpleNamespace(
-                async_save=True,
-                use_persistent_ckpt_worker=True,
-                ckpt_assume_constant_structure=True,
-                async_ckpt_use_cpu_shm=False,
-            )
-        )
-    )
-
-    assert (
-        MegatronPolicyWorkerImpl._requires_nvrx_cuda_cache_release(worker) is expected
-    )
 
 
 def test_megatron_move_model_does_not_serialize_extra_state():
@@ -3552,7 +3517,6 @@ def test_megatron_async_save_after_ppo_offload_writes_current_weights(
     """
     config = create_megatron_test_config(model_name=tiny_llama_model_path)
     del config["generation"]
-    config["megatron_cfg"]["offloaded_between_steps"] = True
     config["megatron_cfg"]["checkpoint"] = {
         "async_save": True,
         "ckpt_assume_constant_structure": True,
@@ -3581,7 +3545,12 @@ def test_megatron_async_save_after_ppo_offload_writes_current_weights(
         )
         policy = None
         try:
-            policy = Policy(cluster=cluster, config=config, tokenizer=tokenizer)
+            policy = Policy(
+                cluster=cluster,
+                config=config,
+                tokenizer=tokenizer,
+                offloaded_between_steps=True,
+            )
             weights_paths = []
             for step in range(2):
                 policy.prepare_for_training()

@@ -793,7 +793,6 @@ def setup(
             policy_training_steps * ppo_epochs,
             1,
         )
-        policy_config["megatron_cfg"]["offloaded_between_steps"] = True
 
     if value_config.get("megatron_cfg", {}).get("enabled", False):
         value_config["megatron_cfg"]["train_iters"] = (
@@ -812,6 +811,10 @@ def setup(
             weights_path=weights_path,
             optimizer_path=optimizer_path,
             init_optimizer=True,
+            # The policy yields the GPUs to the value model every step.
+            offloaded_between_steps=policy_config.get("megatron_cfg", {}).get(
+                "enabled", False
+            ),
         )
         return p, time.perf_counter() - t0
 

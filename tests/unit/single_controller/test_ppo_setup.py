@@ -478,6 +478,24 @@ class TestAdvantageEstimatorSelection:
         mock_factory.assert_called_once_with(mc)
 
 
+def test_build_trainer_marks_a_ppo_policy_offloaded():
+    """The value model takes the policy's GPUs every step."""
+    mc = _ppo_master_config(megatron_enabled=True)
+
+    with patch.object(sc_setup_mod, "TQPolicy") as mock_policy:
+        sc_setup_mod._build_trainer(
+            MagicMock(name="train_cluster"),
+            mc,
+            MagicMock(name="tokenizer"),
+            None,
+            weights_path=None,
+            optimizer_path=None,
+            checkpointing=True,
+        )
+
+    assert mock_policy.call_args.kwargs["offloaded_between_steps"] is True
+
+
 class TestMegatronTrainIters:
     @pytest.mark.parametrize(
         (
@@ -532,7 +550,6 @@ class TestMegatronTrainIters:
 
         assert mc.policy["megatron_cfg"]["train_iters"] == 7
         assert mc.value["megatron_cfg"]["train_iters"] == 21
-        assert mc.policy["megatron_cfg"]["offloaded_between_steps"] is True
 
     def test_skips_a_critic_on_a_non_megatron_backend(self):
         mc = _ppo_master_config(megatron_enabled=False, max_num_steps=7)

@@ -401,9 +401,12 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
             pretrained_path,
             weights_path,
             optimizer_path,
+            # PPO offloads the value model every step so the policy can use the GPUs.
+            offloaded_between_steps=True,
         )
 
         self.megatron_cfg = runtime_config.megatron_cfg
+        self.release_nvrx_ckpt_cache = runtime_config.release_nvrx_ckpt_cache
         self.dtype = runtime_config.dtype
         self.optimizer_cpu_offload = runtime_config.optimizer_cpu_offload
         self.offload_optimizer_for_logprob = (
@@ -974,14 +977,13 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
                 checkpointing_context=self.checkpointing_context,
             )
 
-            release_cuda_cache = self._requires_nvrx_cuda_cache_release()
             maybe_finalize_async_save(
                 self.mcore_state,
                 ckpt_cfg=self.mcore_state.cfg.checkpoint,
                 blocking=True,
-                terminate=release_cuda_cache,
+                terminate=self.release_nvrx_ckpt_cache,
             )
-            if release_cuda_cache:
+            if self.release_nvrx_ckpt_cache:
                 FileSystemWriterAsync.cleanup_tensor_caches()
 
             if self.should_disable_forward_pre_hook:
@@ -995,20 +997,6 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
             raise
         finally:
             self.mcore_state.cfg.checkpoint.save = original_save_path
-
-    def _requires_nvrx_cuda_cache_release(self) -> bool:
-        """Whether checkpoint finalization must also drop cached CUDA IPC handles.
-
-        PPO offloads the value model every step, so this only depends on whether
-        NVRx caches CUDA tensor handles at all.
-        """
-        ckpt_cfg = self.mcore_state.cfg.checkpoint
-        return bool(
-            ckpt_cfg.async_save
-            and getattr(ckpt_cfg, "use_persistent_ckpt_worker", False)
-            and getattr(ckpt_cfg, "ckpt_assume_constant_structure", False)
-            and not getattr(ckpt_cfg, "async_ckpt_use_cpu_shm", False)
-        )
 
     def load_checkpoint(self, weights_path: str, optimizer_path: Optional[str] = None):
         """Load a checkpoint for the value model."""

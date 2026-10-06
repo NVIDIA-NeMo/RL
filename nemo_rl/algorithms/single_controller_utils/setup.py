@@ -702,6 +702,9 @@ def _build_trainer(
         dp_cfg=master_config.data_plane,
         checkpointing=checkpointing,
         reserved_http_server_ports=reserved_http_server_ports,
+        # A PPO policy yields the GPUs to the value model every step.
+        offloaded_between_steps=is_ppo_run(master_config)
+        and master_config.policy.get("megatron_cfg", {}).get("enabled", False),
     )
     return trainer, time.perf_counter() - t0
 
@@ -808,11 +811,7 @@ def _clamp_max_num_steps(
 
 
 def _maybe_inject_megatron_train_iters(master_config: MasterConfig) -> None:
-    """Set train_iters from max_num_steps after its dataloader clamp.
-
-    Also marks a PPO policy as offloaded between steps, since the value model
-    takes its GPUs.
-    """
+    """Set train_iters from max_num_steps after its dataloader clamp."""
     algo_cfg = algo_config(master_config)
     ppo_config = master_config.ppo if is_ppo_run(master_config) else None
     # train_iters is a scheduler-tick budget. Policy and value need separate
@@ -832,8 +831,6 @@ def _maybe_inject_megatron_train_iters(master_config: MasterConfig) -> None:
     policy_config = master_config.policy
     if policy_config.get("megatron_cfg", {}).get("enabled", False):
         policy_config["megatron_cfg"]["train_iters"] = policy_train_iters
-        if ppo_config is not None:
-            policy_config["megatron_cfg"]["offloaded_between_steps"] = True
 
     # value
     if ppo_config is None:

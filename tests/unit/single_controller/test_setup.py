@@ -524,6 +524,23 @@ def test_build_trainer_initializes_reference_model_only_for_nonzero_kl(
     }
 
 
+def test_build_trainer_does_not_mark_a_grpo_policy_offloaded() -> None:
+    master_config = _make_master_config(megatron_enabled=True)
+
+    with patch.object(sc_setup_mod, "TQPolicy") as mock_policy:
+        sc_setup_mod._build_trainer(
+            MagicMock(name="train_cluster"),
+            master_config,
+            MagicMock(name="tokenizer"),
+            None,
+            weights_path=None,
+            optimizer_path=None,
+            checkpointing=True,
+        )
+
+    assert mock_policy.call_args.kwargs["offloaded_between_steps"] is False
+
+
 def test_rollout_recovery_functional_config_resolves_to_runtime_contract(
     tmp_path: Path,
 ) -> None:
@@ -1676,7 +1693,6 @@ class TestSetup:
         setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         assert mc.policy["megatron_cfg"]["train_iters"] == 2
-        assert "offloaded_between_steps" not in mc.policy["megatron_cfg"]
 
     def test_megatron_train_iters_capped_by_dataloader_epochs(self, patched_factories):
         """train_iters drops to max_num_epochs * len(dataloader) when smaller."""

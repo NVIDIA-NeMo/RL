@@ -291,15 +291,15 @@ def test_prepare_for_training_leaves_native_cpu_optimizer_placement():
 
 
 @pytest.mark.parametrize(
-    ("constant_structure", "expected_tail"),
+    ("release_nvrx_ckpt_cache", "expected_tail"),
     [
         (True, [("finalize", True), "cleanup_tensor_caches"]),
         (False, [("finalize", False)]),
     ],
-    ids=["gpu_ipc_cache", "no_constant_structure"],
+    ids=["gpu_ipc_cache", "no_gpu_ipc_cache"],
 )
 def test_save_checkpoint_clears_nvrx_cache_with_terminated_writer(
-    monkeypatch, constant_structure, expected_tail
+    monkeypatch, release_nvrx_ckpt_cache, expected_tail
 ):
     """A terminated writer loses its tensor cache, so the training-side keys must go too."""
     import nemo_rl.models.value.workers.megatron_value_worker as worker_module
@@ -309,16 +309,9 @@ def test_save_checkpoint_clears_nvrx_cache_with_terminated_writer(
     worker.model = object()
     worker.should_disable_forward_pre_hook = False
     worker.checkpointing_context = None
+    worker.release_nvrx_ckpt_cache = release_nvrx_ckpt_cache
     worker.mcore_state = SimpleNamespace(
-        cfg=SimpleNamespace(
-            checkpoint=SimpleNamespace(
-                save="original_path",
-                async_save=True,
-                use_persistent_ckpt_worker=True,
-                ckpt_assume_constant_structure=constant_structure,
-                async_ckpt_use_cpu_shm=False,
-            )
-        ),
+        cfg=SimpleNamespace(checkpoint=SimpleNamespace(save="original_path")),
         train_state=SimpleNamespace(floating_point_operations_so_far=0),
     )
 

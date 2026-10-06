@@ -584,6 +584,7 @@ class MegatronPolicyWorkerImpl(
         skip_weight_load: bool = False,
         is_refit_destination: bool = False,
         reserved_http_server_ports: Optional[dict[int, int]] = None,
+        offloaded_between_steps: bool = False,
         **kwargs: Any,
     ):
         """Initialize the MegatronPolicyWorker."""
@@ -684,6 +685,7 @@ class MegatronPolicyWorkerImpl(
             weights_path,
             optimizer_path,
             skip_weight_load=skip_weight_load,
+            offloaded_between_steps=offloaded_between_steps,
         )
 
         self.megatron_cfg = runtime_config.megatron_cfg
@@ -702,6 +704,7 @@ class MegatronPolicyWorkerImpl(
         )
         self.offload_optimizer_for_refit = runtime_config.offload_optimizer_for_refit
         self.is_generation_colocated = runtime_config.is_generation_colocated
+        self.release_nvrx_ckpt_cache = runtime_config.release_nvrx_ckpt_cache
         self.final_padded_vocab_size = runtime_config.final_padded_vocab_size
         self.sampling_params = runtime_config.sampling_params
 
@@ -4656,7 +4659,7 @@ class MegatronPolicyWorkerImpl(
 
         original_save_path = self.mcore_state.cfg.checkpoint.save
         is_async = self.mcore_state.cfg.checkpoint.async_save
-        if is_async and self._requires_nvrx_cuda_cache_release():
+        if is_async and self.release_nvrx_ckpt_cache:
             # Set this before saving so an exception path can still tear down a
             # writer that may already have received CUDA IPC handles.
             self._async_checkpoint_cuda_cache_active = True
@@ -4730,22 +4733,6 @@ class MegatronPolicyWorkerImpl(
         finally:
             self.mcore_state.cfg.checkpoint.save = original_save_path
 
-    def _requires_nvrx_cuda_cache_release(self) -> bool:
-        """Whether checkpoint finalization must also drop cached CUDA IPC handles."""
-        ckpt_cfg = self.mcore_state.cfg.checkpoint
-        generation_cfg = self.cfg.get("generation") or {}
-        colocated_cfg = generation_cfg.get("colocated") or {}
-        return bool(
-            ckpt_cfg.async_save
-            and getattr(ckpt_cfg, "use_persistent_ckpt_worker", False)
-            and getattr(ckpt_cfg, "ckpt_assume_constant_structure", False)
-            and not getattr(ckpt_cfg, "async_ckpt_use_cpu_shm", False)
-            and (
-                colocated_cfg.get("enabled", False)
-                or self.cfg["megatron_cfg"].get("offloaded_between_steps")
-            )
-        )
-
     def finalize_async_save(self):
         """Finalize an async write and release unsafe CUDA IPC caches.
 
@@ -4756,8 +4743,7 @@ class MegatronPolicyWorkerImpl(
         starts a fresh persistent writer lazily for the next checkpoint.
         """
         release_cuda_cache = bool(
-            self._async_checkpoint_cuda_cache_active
-            and self._requires_nvrx_cuda_cache_release()
+            self._async_checkpoint_cuda_cache_active and self.release_nvrx_ckpt_cache
         )
         maybe_finalize_async_save(
             self.mcore_state,
