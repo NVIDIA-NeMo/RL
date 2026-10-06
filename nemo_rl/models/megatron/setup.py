@@ -557,8 +557,10 @@ def validate_and_set_config(
         is_generation_colocated,
         _release_nvrx_ckpt_cache(
             megatron_cfg.checkpoint,
+            # prepare_for_lp_inference() moves the optimizer when this is set.
             storage_moves_between_saves=bool(is_generation_colocated)
-            or offloaded_between_steps,
+            or offloaded_between_steps
+            or offload_optimizer_for_logprob,
         ),
         sampling_params,
         final_padded_vocab_size,
