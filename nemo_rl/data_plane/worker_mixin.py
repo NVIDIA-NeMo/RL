@@ -40,6 +40,7 @@ import torch
 from nemo_rl.data.llm_message_utils import attach_message_log_view
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
+from nemo_rl.data_plane.codec import pad_batch
 from nemo_rl.data_plane.interfaces import LocalDataPlaneConfig, backend_config
 from nemo_rl.data_plane.observability import is_metrics_client
 from nemo_rl.data_plane.schema import (
@@ -159,6 +160,7 @@ def _broadcast_batched_data_dict(
     # Leader-only: keep physical segments uncoalesced until their broadcast
     # turn so only one packed payload is staged on the GPU at a time.
     packed_segments: dict[str, list[torch.Tensor]] = {}
+    nested_payloads: dict[str, torch.Tensor] = {}
     leader_error: Exception | None = None
 
     if is_leader:
@@ -166,7 +168,20 @@ def _broadcast_batched_data_dict(
             assert data is not None, "leader must provide non-None data"
             descriptor: list[Any] = []
             for k, v in data.items():
-                if isinstance(v, torch.Tensor):
+                if isinstance(v, torch.Tensor) and v.is_nested:
+                    rows = v.unbind()
+                    nested_payloads[k] = torch.cat([r.reshape(-1) for r in rows])
+                    descriptor.append(
+                        (
+                            k,
+                            "nested",
+                            str(v.dtype),
+                            [tuple(r.shape) for r in rows],
+                            str(v.device),
+                            v.layout,
+                        )
+                    )
+                elif isinstance(v, torch.Tensor):
                     descriptor.append(
                         (k, "tensor", str(v.dtype), tuple(v.shape), str(v.device))
                     )
@@ -248,6 +263,26 @@ def _broadcast_batched_data_dict(
                     tensor = tensor.to(src_device)
                 out[key] = tensor
             del tensor
+        elif kind == "nested":
+            dtype_str, shapes, src_device, nested_layout = entry[2:]
+            dtype = getattr(torch, dtype_str.split(".")[-1])
+            if is_leader:
+                flat = nested_payloads.pop(key).to(bcast_device)
+            else:
+                numel = sum(torch.Size(shape).numel() for shape in shapes)
+                flat = torch.empty(numel, dtype=dtype, device=bcast_device)
+            if flat.numel():
+                wire = flat.view(torch.uint8) if dtype == torch.int16 else flat
+                torch.distributed.broadcast(wire, src=src, group=group)
+            if not is_leader:
+                flat = flat.to(src_device)
+            rows, offset = [], 0
+            for shape in shapes:
+                numel = torch.Size(shape).numel()
+                rows.append(flat[offset : offset + numel].view(shape))
+                offset += numel
+            out[key] = torch.nested.as_nested_tensor(rows, layout=nested_layout)
+            del flat
         elif kind == "packed_tensor":
             header, shapes, dtype_str, source_device = entry[2:]
             if is_leader:
@@ -508,11 +543,17 @@ class TQWorkerMixin:
             leader = torch.distributed.get_global_rank(replica_group, 0)
             # Ship route fragments (~valid tokens) instead of the padded table
             # and let every rank assemble locally; see _pack_route_fragments.
+            route_passthrough = bool(
+                (meta.extra_info or {}).get(ROUTE_PASSTHROUGH_FLAG)
+            )
             ship_fragments = (
-                bool((meta.extra_info or {}).get(ROUTE_PASSTHROUGH_FLAG))
+                route_passthrough
                 and os.environ.get("NRL_ROUTE_BCAST", "fragments") != "dense"
             )
             plans = self._route_plans(meta) if ship_fragments else []
+            wire_layout = (
+                "padded" if route_passthrough and not ship_fragments else "jagged"
+            )
             if is_leader:
                 dp_client = self._require_dp_client()
                 if local_batch:
@@ -529,9 +570,9 @@ class TQWorkerMixin:
                 data = _materialize_fetched(
                     td,
                     local_batch=local_batch,
-                    layout=layout,
+                    layout=wire_layout,
                     pad_value_dict=pad_value_dict,
-                    pad_to_seqlen=pad_to_seqlen,
+                    pad_to_seqlen=pad_to_seqlen if wire_layout == "padded" else 0,
                     tags=meta.tags,
                 )
                 if ship_fragments:
@@ -549,6 +590,8 @@ class TQWorkerMixin:
                 src=leader,
                 group=replica_group,
             )
+            if wire_layout != layout:
+                data = pad_batch(data, pad_value_dict, pad_to_seqlen)
             if ship_fragments:
                 fragments_by_row = _unpack_route_fragments(
                     data.pop(_ROUTE_BLOB), data.pop(_ROUTE_INDEX)
