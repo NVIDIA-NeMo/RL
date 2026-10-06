@@ -145,6 +145,35 @@ Bulk tensors live in TQ; the driver only holds `meta` + the small
 
 ---
 
+## Inside one DP rank — fetch, broadcast, padding, packing
+
+```
+replica group = all TP×CP×PP ranks of one DP rank; leader = its rank 0
+leader      TQ ─get─► CPU batch, unpadded rows (+ route fragments)
+                  │ _broadcast_batched_data_dict: one field at a time,
+                  │ each field staged whole on GPU (CPU → GPU → NCCL)
+every rank  ◄─────┘ full DP batch on CPU (leader keeps its GPU copies)
+every rank  pad rows to GLOBAL_FORWARD_PAD_SEQLEN; build routes table (CPU)
+every rank  per microbatch (bins = driver's micro_batch_indices):
+              rows ─.to("cuda")─► pack [1, T] ─► keep this CP rank's slice
+              ─► forward / backward
+```
+
+Only the replica-group leader reads from TQ, and it broadcasts the DP rank's
+whole batch to every TP, CP and PP rank in its group. Rows cross the
+broadcast unpadded, and each rank pads them afterwards to the cross-DP
+`GLOBAL_FORWARD_PAD_SEQLEN` that the microbatch iterator expects. With router
+replay, routes travel as packed fragments and every rank assembles the padded
+routes table on CPU (`NRL_ROUTE_BCAST=dense` restores the leader-built table).
+The broadcast stages each field whole on GPU, so its GPU peak is the largest
+field, not the whole batch. Sequence packing happens last, per microbatch and
+on every rank: `megatron/data.py` moves the bin's padded rows to GPU, packs
+them into one sequence, and each CP rank keeps its own slice. Padding
+therefore lives on CPU and in each microbatch's GPU copy; the model only sees
+the small per-sequence CP alignment padding.
+
+---
+
 ## `KVBatchMeta`
 
 The receipt for a put. `meta.fields` is only what was written by *this*
