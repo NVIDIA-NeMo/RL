@@ -530,6 +530,17 @@ class AsyncRLConfig(BaseModel, extra="allow"):
             )
         return self
 
+    def streaming_chunk_cap(self) -> int:
+        """Upper bound on prompt groups per streaming train chunk.
+
+        The explicit ``max_groups_for_streaming_train`` when set; otherwise the
+        streaming minimum, so a step is consumed in chunks of exactly
+        ``min_groups_for_streaming_train`` rather than whatever is ready.
+        """
+        if self.max_groups_for_streaming_train is not None:
+            return self.max_groups_for_streaming_train
+        return self.min_groups_for_streaming_train
+
     @model_validator(mode="after")
     def _reject_renamed_blocks(self) -> "AsyncRLConfig":
         """Fail loudly on the previous block names rather than ignoring them.
