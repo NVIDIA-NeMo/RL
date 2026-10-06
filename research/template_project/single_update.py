@@ -55,6 +55,7 @@ from nemo_rl.utils.config import (
     parse_hydra_overrides,
     register_omegaconf_resolvers,
 )
+from nemo_rl.utils.outdated_config_checks import check_outdated_config
 
 # register the worker extension class to the actor environment registry
 ACTOR_ENVIRONMENT_REGISTRY[
@@ -229,6 +230,7 @@ if __name__ == "__main__":
         config = parse_hydra_overrides(config, overrides)
 
     config = OmegaConf.to_container(config, resolve=True)
+    check_outdated_config(config)
     config = MasterConfig(**config)
     print("Applied CLI overrides")
 
