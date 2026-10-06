@@ -27,9 +27,11 @@ from torch.multiprocessing.reductions import rebuild_cuda_tensor
 
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.generation.vllm.config import (
-    VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
     VllmSpecificArgs,
     vllm_nemotron_h_fp32_lm_head_enabled,
+)
+from nemo_rl.models.generation.vllm.patches import (
+    VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
 )
 from nemo_rl.utils.cuda_ipc import normalize_cuda_ipc_handle
 

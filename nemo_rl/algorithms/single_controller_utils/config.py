@@ -1306,10 +1306,10 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         )
 
     sampler_name = async_config.sampler.name
-    if sampler_name != "in_order":
+    if sampler_name not in ("in_order", "ready_first"):
         raise ValueError(
             "PPO on the SingleController path only supports "
-            f"async_rl.sampler.name='in_order', but got '{sampler_name}'. "
+            f"async_rl.sampler.name in ('in_order', 'ready_first'), but got '{sampler_name}'. "
             "Other samplers are not supported yet (in particular during critic "
             "warmup) (#2625)."
         )
