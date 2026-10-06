@@ -331,12 +331,46 @@ def _pad_leaf(
     """Pad one tensor leaf the way :func:`materialize` does for ``layout``."""
     from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS
 
-    # Packed multimodal rows are media, not sequences: keep them nested.
+    # Multimodal packed fields stay nested. Their rows are per-sample
+    # media, not a padded sequence: ``to_padded_tensor`` would
+    # rectangularize to ``[B, max_rows, ...]`` and lose the row boundaries
+    # the model matches media to placeholders with.
+    #
+    # Staying nested does not preserve the per-segment shapes, though:
+    # ``to_wire`` flattens each row before TQ sees it, so
+    # ``per_sample_shapes`` records flat lengths and the true shapes ride
+    # ``KVBatchMeta.tags`` (see ``multimodal_row_tags``). Hence the ``tags``
+    # argument to ``reassemble_packed_multimodal`` below.
     if val.is_nested and layout == "padded" and key not in PACKED_MULTIMODAL_FIELDS:
         padded = torch.nested.to_padded_tensor(val, padding=pad)
     else:
         padded = val
-    # Widen to pad_to_seqlen; multimodal and opd_full payloads never feed the forward.
+    # Apply `pad_to_seqlen` to ALL 2D+ tensors, not only the freshly-
+    # padded-from-nested case. Rectangular wire payloads (vLLM's
+    # right-padded output) ride the ``else`` branch above, so without
+    # this they'd skip the cross-DP forward pad target and break the
+    # microbatch iterator (truncate_tensors → narrow length>size).
+    #
+    # ``not padded.is_nested`` must be tested BEFORE ``shape[1]``: a
+    # nested tensor's dim 1 is ragged, and comparing it raises
+    # ``ValueError: ge: relation is indeterminate``. Anything still
+    # nested here was deliberately left so (multimodal packed fields,
+    # which skip ``to_padded_tensor`` above) and must not be padded
+    # anyway — their dim 1 is patch/image count, not seqlen, so
+    # extending it to a token seqlen inflates pixel_values ~40x.
+    #
+    # opd_full's teacher payload columns skip this for a different
+    # reason: they never feed the model's forward (only
+    # ``pad_to_seqlen``'s own consumer, the microbatch iterator, needs
+    # every row aligned to the *forward* pad target), so there is no
+    # correctness need to pad them past their own natural width.
+    # SequencePackingLossWrapper (loss/wrapper.py) slices each sequence
+    # out by its own real length regardless of how far the tensor is
+    # padded, so this only ever discarded slack -- but discarding it at
+    # 98304 tokens x hidden_size wide, times every sequence in the whole
+    # DP-rank's batch (not just one training microbatch -- see
+    # train_microbatches_from_meta's docstring), is what turned a normal
+    # per-token payload into a single 100+ GiB allocation.
     if (
         pad_to_seqlen > 0
         and isinstance(padded, torch.Tensor)
