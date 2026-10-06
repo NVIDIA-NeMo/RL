@@ -16,6 +16,10 @@ SUPER_RECIPE = (
     REPO_ROOT
     / "examples/nemo_gym/grpo_anyterminal_multi_harness_nemotron_super_omni_single_controller.yaml"
 )
+SUPER_SYNC_8N_RECIPE = (
+    REPO_ROOT
+    / "examples/nemo_gym/grpo_anyterminal_multi_harness_nemotron_super_omni_sync_8n_single_controller.yaml"
+)
 
 
 def test_anyterminal_multi_harness_recipe_resolves_async_training_contract():
@@ -82,9 +86,12 @@ def test_super_omni_anyterminal_recipe_resolves_training_topology():
     assert config["policy"]["train_global_batch_size"] == 8
     assert config["policy"]["is_vlm"] is True
     assert config["policy"]["megatron_cfg"]["mtp_num_layers"] == 1
-    assert config["policy"]["generation"]["vllm_cfg"][
-        "http_server_serving_chat_kwargs"
-    ]["tool_parser"] == "qwen3_coder"
+    assert (
+        config["policy"]["generation"]["vllm_cfg"]["http_server_serving_chat_kwargs"][
+            "tool_parser"
+        ]
+        == "qwen3_coder"
+    )
     assert config["policy"]["generation"]["colocated"] == {
         "enabled": False,
         "resources": {"gpus_per_node": 8, "num_nodes": 8},
@@ -99,3 +106,31 @@ def test_super_omni_anyterminal_recipe_resolves_training_topology():
     assert config["data_plane"]["enabled"] is True
     assert config["checkpointing"]["enabled"] is False
     assert config["logger"]["wandb"]["log_nemo_gym_full_result_tables"] is False
+
+
+def test_super_omni_sync_8n_recipe_resolves_synchronous_topology():
+    register_omegaconf_resolvers()
+    config = OmegaConf.to_container(load_config(SUPER_SYNC_8N_RECIPE), resolve=True)
+
+    assert config["cluster"]["num_nodes"] == 8
+    assert config["policy"]["generation"]["colocated"] == {
+        "enabled": False,
+        "resources": {"gpus_per_node": 8, "num_nodes": 4},
+    }
+    assert config["grpo"]["async_grpo"] is None
+    assert config["async_rl"]["sampler"] == {
+        "name": "in_order",
+        "max_lookahead_versions": 0,
+    }
+    assert config["async_rl"]["recompute_kv_cache_after_weight_updates"] is True
+    assert config["async_rl"]["min_groups_for_streaming_train"] == 4
+    assert config["async_rl"]["max_inflight_prompts"] == 4
+    assert config["async_rl"]["max_buffered_rollouts"] == 4
+    assert config["env"]["nemo_gym"]["fan_out"] == {
+        "anyterminal_multi_harness": [
+            "anyterminal_opencode",
+            "anyterminal_openclaw",
+            "anyterminal_pi",
+            "anyterminal_hermes",
+        ]
+    }
