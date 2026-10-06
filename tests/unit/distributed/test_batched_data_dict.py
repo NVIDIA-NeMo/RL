@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data_plane.codec import pad_field
 from nemo_rl.data_plane.schema import (
     OPD_FULL_HIDDEN_STATES_FIELD,
     OPD_FULL_LOGITS_FIELD,
@@ -1498,7 +1499,7 @@ def test_truncate_tensors_narrows_opd_full_payloads_but_never_widens_them():
     assert batch[OPD_FULL_TEACHER_INDEX_FIELD].shape == (2,)
 
 
-def test_nested_rows_slice_select_and_truncate():
+def test_truncate_tensors_keeps_nested_rows():
     rows = [torch.arange(n) for n in (2, 5, 1, 3)]
     batch = BatchedDataDict(
         {
@@ -1507,19 +1508,69 @@ def test_nested_rows_slice_select_and_truncate():
         }
     )
 
-    sliced = batch.slice(1, 3)
-    assert [r.tolist() for r in sliced["routes"].unbind()] == [
-        rows[1].tolist(),
-        rows[2].tolist(),
+    batch.truncate_tensors(dim=1, truncated_len=4)
+    assert batch["input_ids"].shape == (4, 4)
+    assert [r.tolist() for r in batch["routes"].unbind()] == [r.tolist() for r in rows]
+
+
+def _routes_batch(nested: bool) -> BatchedDataDict:
+    lengths = [5, 2, 7, 3, 6, 1]
+    width = 8
+    rows = [
+        (torch.arange(n * 4, dtype=torch.int16) + 100 * i).reshape(n, 2, 2)
+        for i, n in enumerate(lengths)
     ]
-    selected = batch.select_indices([3, 0])
-    assert [r.tolist() for r in selected["routes"].unbind()] == [
-        rows[3].tolist(),
-        rows[0].tolist(),
-    ]
-    sliced.truncate_tensors(dim=1, truncated_len=4)
-    assert sliced["input_ids"].shape == (2, 4)
-    assert [r.tolist() for r in sliced["routes"].unbind()] == [
-        rows[1].tolist(),
-        rows[2].tolist(),
-    ]
+    if nested:
+        routes = torch.nested.as_nested_tensor(rows, layout=torch.jagged)
+    else:
+        routes = torch.full((len(rows), width, 2, 2), -1, dtype=torch.int16)
+        for i, row in enumerate(rows):
+            routes[i, : len(row)] = row
+    return BatchedDataDict(
+        {
+            "input_ids": torch.arange(len(rows) * width).reshape(len(rows), width),
+            "input_lengths": torch.tensor(lengths),
+            "routed_experts": routes,
+        }
+    )
+
+
+def _padded_routes(batch) -> torch.Tensor:
+    width = batch["input_ids"].shape[1]
+    return pad_field("routed_experts", batch["routed_experts"], -1, width)
+
+
+@pytest.mark.parametrize(
+    "transform",
+    [
+        lambda b: b.slice(1, 4),
+        lambda b: b.select_indices([4, 0, 2]),
+        lambda b: b.chunk(rank=1, chunks=2),
+        lambda b: b.select_indices([]),
+        lambda b: (b.reorder_data([5, 3, 1, 0, 2, 4]), b)[1],
+        lambda b: b.shard_by_batch_size(
+            shards=1,
+            sequence_packing_args={
+                "max_tokens_per_microbatch": 12,
+                "input_key": "input_ids",
+                "input_lengths_key": "input_lengths",
+                "algorithm": "modified_first_fit_decreasing",
+                "sequence_length_pad_multiple": 1,
+            },
+        )[0][0],
+    ],
+    ids=[
+        "slice",
+        "select_indices",
+        "chunk",
+        "select_empty",
+        "reorder_data",
+        "shard_seqpack",
+    ],
+)
+def test_nested_routes_match_padded_routes_through_row_ops(transform):
+    expected = transform(_routes_batch(nested=False))
+    got = transform(_routes_batch(nested=True))
+
+    assert torch.equal(got["input_ids"], expected["input_ids"])
+    assert torch.equal(_padded_routes(got), expected["routed_experts"])

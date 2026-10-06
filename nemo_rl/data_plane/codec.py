@@ -325,7 +325,7 @@ def response_from_nested(
 # ── materialize: wire TensorDict → trainer BatchedDataDict ────────────
 
 
-def _pad_field(
+def pad_field(
     key: str, value: torch.Tensor, pad: int | float, pad_to_seqlen: int
 ) -> torch.Tensor:
     """Rectangularize one per-row field and widen it to the forward width."""
@@ -335,11 +335,16 @@ def _pad_field(
     # and widening their patch dim to a token seqlen inflates pixels ~40x.
     if key in PACKED_MULTIMODAL_FIELDS:
         return value
-    if value.is_nested:
-        value = torch.nested.to_padded_tensor(value, padding=pad)
     # opd_full teacher payloads never feed the forward; widening them to the
     # forward target is what once turned them into a 100+ GiB allocation.
-    if key in OPD_FULL_FIELDS or value.dim() < 2 or value.shape[1] >= pad_to_seqlen:
+    widen = key not in OPD_FULL_FIELDS
+    if value.is_nested:
+        rows = value.size(0)
+        seqlen = int(value.offsets().diff().max()) if rows else 0
+        width = max(seqlen, pad_to_seqlen) if widen else seqlen
+        size = (rows, width, *value.shape[2:])
+        return torch.nested.to_padded_tensor(value, pad, output_size=size)
+    if not widen or value.dim() < 2 or value.shape[1] >= pad_to_seqlen:
         return value
     width = [0, 0] * (value.dim() - 2) + [0, pad_to_seqlen - value.shape[1]]
     return torch.nn.functional.pad(value, width, value=pad)
@@ -355,7 +360,7 @@ def pad_batch(
     pads = pad_value_dict or {}
     for key, val in data.items():
         if isinstance(val, torch.Tensor) and key not in skip:
-            data[key] = _pad_field(key, val, pads.get(key, 0), pad_to_seqlen)
+            data[key] = pad_field(key, val, pads.get(key, 0), pad_to_seqlen)
     return data
 
 
@@ -431,7 +436,7 @@ def materialize(
                 f"{type(val)}. Expected Tensor or NonTensorStack."
             )
         out[key] = (
-            _pad_field(key, val, pads.get(key, 0), pad_to_seqlen)
+            pad_field(key, val, pads.get(key, 0), pad_to_seqlen)
             if layout == "padded"
             else val
         )

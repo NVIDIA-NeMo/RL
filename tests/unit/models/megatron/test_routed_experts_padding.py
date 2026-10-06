@@ -15,9 +15,9 @@
 
 import torch
 
-from nemo_rl.data_plane.codec import pad_batch
+from nemo_rl.data_plane.codec import pad_batch, pad_field
 from nemo_rl.data_plane.schema import MICROBATCH_PADDED_FIELDS
-from nemo_rl.distributed.batched_data_dict import BatchedDataDict, pad_nested_fields
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL
 
 
@@ -39,9 +39,11 @@ def test_pad_batch_pads_jagged_routes_to_the_old_table():
 
     unpadded = pad_batch(data.copy(), None, width, skip=MICROBATCH_PADDED_FIELDS)
     assert unpadded["routed_experts"].is_nested
-    assert MICROBATCH_PADDED_FIELDS["routed_experts"] == (
-        ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL
+    padded = pad_field(
+        "routed_experts",
+        data["routed_experts"],
+        MICROBATCH_PADDED_FIELDS["routed_experts"],
+        width,
     )
-    pad_nested_fields(data, MICROBATCH_PADDED_FIELDS, data["input_ids"].shape[1])
 
-    assert torch.equal(data["routed_experts"], expected)
+    assert torch.equal(padded, expected)
