@@ -180,6 +180,7 @@ def test_generation_setup_token_capture_fans_out(monkeypatch):
         dp_cfg={"backend": "simple"},
         staging_partition="rollout_staging",
         capture_media=False,
+        storage_segments=None,
         run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
     )
 
