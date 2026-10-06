@@ -217,9 +217,6 @@ EXCLUDED_UNIT_TESTS=(
     # UTILS
     ###########################################################################
 
-    # Native checkpoint — exclude heavy DCP-to-HF conversion (~62-114s)
-    --deselect=tests/unit/utils/test_native_checkpoint.py::test_convert_dcp_to_hf
-
     # Packed tensor — exclude stress variants
     --deselect=tests/unit/utils/test_packed_tensor.py::test_packed_broadcast_single_large_tensor
     --deselect=tests/unit/utils/test_packed_tensor.py::test_packed_broadcast_multiple_batches

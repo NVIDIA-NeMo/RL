@@ -37,12 +37,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.models.automodel.convert import convert_dcp_to_hf
 from nemo_rl.models.megatron.community_import import (
     export_model_from_megatron,
     import_model_from_hf_name,
 )
 from nemo_rl.models.policy.lm_policy import Policy
-from nemo_rl.utils.native_checkpoint import convert_dcp_to_hf
 
 _CONVERTER_PATH = os.path.normpath(
     os.path.join(
