@@ -414,7 +414,7 @@ def _build_clusters(
     port_range_high = cluster_config.master_port_range_high
     teacher_nodes = _non_colocated_teacher_node_count(master_config)
     policy_nodes = num_nodes - teacher_nodes
-    reference = master_config.reference
+    reference = master_config.reference_resources
     if reference is not None:
         if reference.gpus_per_node > gpus_per_node:
             raise ValueError("reference.gpus_per_node exceeds cluster.gpus_per_node")
@@ -644,7 +644,7 @@ def _host_constraints(
 def _split_reference_gpus(
     master_config: MasterConfig, *, num_nodes: int, gpus_per_node: int
 ) -> tuple[int, Optional[list[dict[str, float]]]]:
-    reference = master_config.reference
+    reference = master_config.reference_resources
     if reference is None or reference.placement != "same_node":
         return gpus_per_node, None
     if reference.num_nodes != num_nodes:
@@ -670,7 +670,7 @@ def _reserve_reference_cluster(
     inference_cluster: RayVirtualCluster,
 ) -> Optional[RayVirtualCluster]:
     """Reserve reference GPUs on exact hosts before Gym or teachers start."""
-    reference = master_config.reference
+    reference = master_config.reference_resources
     if reference is None:
         return None
     if reference.placement == "same_node":
@@ -860,7 +860,8 @@ def _build_trainer(
     t0 = time.perf_counter()
     loss_config = master_config.loss_fn
     init_reference_model = (
-        loss_config.reference_policy_kl_penalty > 0 and master_config.reference is None
+        loss_config.reference_policy_kl_penalty > 0
+        and master_config.reference_resources is None
     )
     trainer = TQPolicy(
         cluster=train_cluster,
@@ -1696,8 +1697,8 @@ def setup_single_controller(
     colocated = generation_config["colocated"]["enabled"]
     segment_size = master_config.cluster.segment_size
     reference_cluster = None
-    if master_config.reference is not None:
-        same_node_reference = master_config.reference.placement == "same_node"
+    if master_config.reference_resources is not None:
+        same_node_reference = master_config.reference_resources.placement == "same_node"
         if train_cluster is not inference_cluster:
             train_cluster.get_placement_groups()
         if not same_node_reference or train_cluster is inference_cluster:

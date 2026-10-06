@@ -1,15 +1,6 @@
 # SingleController variant of grpo_math_1B.yaml.
 defaults: grpo_math_1B.yaml
 
-# Omit or leave null to keep the reference inside the policy workers.
-# Separate nodes are reserved from cluster.num_nodes; retain policy/generation
-# resources by increasing that total. same_node splits GPUs on training hosts.
-reference: null
-# reference:
-#   placement: separate_nodes  # separate_nodes or same_node
-#   num_nodes: 1
-#   gpus_per_node: 8
-
 # SC does not support validation yet.
 grpo:
   # Null out the legacy async_grpo block inherited from grpo_math_1B.yaml:
@@ -186,6 +177,14 @@ rollout_checkpointing:
   extra_fingerprint_excluded_paths: []
 
 policy:
+  reference:
+    colocated:
+      enabled: true
+      # Resources apply only when enabled is false.
+      resources:
+        placement: separate_nodes  # same_node uses distinct GPUs on policy hosts
+        num_nodes: 1
+        gpus_per_node: 8
   dtensor_cfg:
     enabled: false
   megatron_cfg:

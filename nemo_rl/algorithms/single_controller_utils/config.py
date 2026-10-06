@@ -63,7 +63,7 @@ from nemo_rl.models.generation.vllm.config import (
     VllmConfig,
     parse_nvfp4_pertoken_rollout,
 )
-from nemo_rl.models.policy import MegatronConfig, PolicyConfig
+from nemo_rl.models.policy import MegatronConfig, PolicyConfig, ReferencePlacementConfig
 from nemo_rl.models.value import ValueConfig
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
@@ -810,20 +810,11 @@ class RolloutCheckpointConfig(BaseModel, extra="forbid"):
         return self
 
 
-class ReferencePlacementConfig(BaseModel, extra="forbid"):
-    """Optional GPU allocation for the frozen reference; parallelism follows policy."""
-
-    placement: Literal["same_node", "separate_nodes"] = "separate_nodes"
-    num_nodes: PositiveInt
-    gpus_per_node: PositiveInt
-
-
 class MasterConfig(BaseModel, extra="allow"):
     # algo configs
     grpo: Optional[GRPOConfig] = None
     ppo: Optional[PPOConfig] = None
     policy: PolicyConfig
-    reference: Optional[ReferencePlacementConfig] = None
     value: Optional[ValueConfig] = None  # PPO extras
     loss_fn: ClippedPGLossConfig
     value_loss_fn: Optional[MseValueLossConfig] = None  # PPO extras
@@ -845,6 +836,20 @@ class MasterConfig(BaseModel, extra="allow"):
     on_policy_distillation: Optional[OnPolicyDistillationConfig] = None
     telemetry: Optional[TelemetryConfig] = None
     token_capture: TokenCaptureConfig = Field(default_factory=TokenCaptureConfig)
+
+    @property
+    def reference_resources(self) -> Optional[ReferencePlacementConfig]:
+        reference = self.policy.get("reference")
+        if reference is None or reference.colocated.enabled:
+            return None
+        return reference.colocated.resources
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_top_level_reference(cls, value: Any) -> Any:
+        if isinstance(value, Mapping) and "reference" in value:
+            raise ValueError("Use policy.reference.colocated instead of reference")
+        return value
 
     @model_validator(mode="after")
     def validate_algorithm_block(self) -> "MasterConfig":
@@ -1289,7 +1294,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)
 
-    if master_config.reference is not None and (
+    if master_config.reference_resources is not None and (
         master_config.loss_fn.reference_policy_kl_penalty <= 0
         or algo_cfg.skip_reference_policy_logprobs_calculation
     ):

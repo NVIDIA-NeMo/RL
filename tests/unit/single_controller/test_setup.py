@@ -143,18 +143,12 @@ def test_reference_loads_initial_weights_without_optimizer_or_second_reference(
 def test_same_node_reference_pins_partial_policy_allocations_to_distinct_hosts(
     monkeypatch,
 ) -> None:
-    from nemo_rl.algorithms.single_controller_utils.config import (
-        ReferencePlacementConfig,
-    )
-
     config = _make_master_config(colocated=True)
     config.policy["generation"]["colocated"]["resources"] = {
         "num_nodes": None,
         "gpus_per_node": None,
     }
-    config.reference = ReferencePlacementConfig(
-        placement="same_node", num_nodes=2, gpus_per_node=4
-    )
+    _set_reference(config, placement="same_node", num_nodes=2, gpus_per_node=4)
     nodes = [
         {
             "Alive": True,
@@ -423,16 +417,10 @@ def patched_factories():
 def test_same_node_reference_reserves_gpus_before_separate_generation(
     patched_factories, monkeypatch
 ) -> None:
-    from nemo_rl.algorithms.single_controller_utils.config import (
-        ReferencePlacementConfig,
-    )
-
     config = _make_master_config(
         loss_cfg=ClippedPGLossConfig(reference_policy_kl_penalty=0.01)
     )
-    config.reference = ReferencePlacementConfig(
-        placement="same_node", num_nodes=1, gpus_per_node=4
-    )
+    _set_reference(config, placement="same_node", num_nodes=1, gpus_per_node=4)
     events = []
     reference_cluster = MagicMock()
     reference_handle = MagicMock()
@@ -717,17 +705,13 @@ def test_build_trainer_initializes_reference_model_only_for_nonzero_kl(
     separate_reference: bool,
     expected_init_reference_model: bool,
 ) -> None:
-    from nemo_rl.algorithms.single_controller_utils.config import (
-        ReferencePlacementConfig,
-    )
-
     master_config = _make_master_config(
         loss_cfg=ClippedPGLossConfig(
             reference_policy_kl_penalty=reference_policy_kl_penalty
         )
     )
     if separate_reference:
-        master_config.reference = ReferencePlacementConfig(num_nodes=1, gpus_per_node=8)
+        _set_reference(master_config, num_nodes=1, gpus_per_node=8)
 
     with patch.object(sc_setup_mod, "TQPolicy") as mock_policy:
         sc_setup_mod._build_trainer(
@@ -3276,10 +3260,6 @@ def test_reference_budget_uses_existing_student_split(
     expected,
     segment_size,
 ):
-    from nemo_rl.algorithms.single_controller_utils.config import (
-        ReferencePlacementConfig,
-    )
-
     config = _make_master_config(colocated=colocated)
     config.policy["generation"]["vllm_cfg"] = {"tensor_parallel_size": 1}
     config.cluster = ClusterConfig(
@@ -3289,8 +3269,8 @@ def test_reference_budget_uses_existing_student_split(
         "num_nodes": 1,
         "gpus_per_node": 4,
     }
-    config.reference = ReferencePlacementConfig(
-        placement=placement, num_nodes=1, gpus_per_node=reference_gpus
+    _set_reference(
+        config, placement=placement, num_nodes=1, gpus_per_node=reference_gpus
     )
     monkeypatch.setattr(
         sc_setup_mod, "_non_colocated_teacher_node_count", lambda _: teacher_nodes
@@ -3328,18 +3308,14 @@ def test_reference_budget_uses_existing_student_split(
 
 @pytest.mark.parametrize("reference_gpus", [4, 8])
 def test_same_node_reference_requires_gpus_left_for_policy(reference_gpus):
-    from nemo_rl.algorithms.single_controller_utils.config import (
-        ReferencePlacementConfig,
-    )
-
     config = _make_master_config(colocated=False)
     config.cluster = ClusterConfig(num_nodes=1, gpus_per_node=8)
     config.policy["generation"]["colocated"]["resources"] = {
         "num_nodes": 1,
         "gpus_per_node": 4,
     }
-    config.reference = ReferencePlacementConfig(
-        placement="same_node", num_nodes=1, gpus_per_node=reference_gpus
+    _set_reference(
+        config, placement="same_node", num_nodes=1, gpus_per_node=reference_gpus
     )
     with pytest.raises(ValueError, match="policy"):
         sc_setup_mod._build_clusters(config)
@@ -3363,17 +3339,11 @@ def test_misspelled_reference_setting_is_rejected():
 def test_reference_reservation_follows_actual_student_hosts(
     monkeypatch, placement, expected_host, segment_size
 ):
-    from nemo_rl.algorithms.single_controller_utils.config import (
-        ReferencePlacementConfig,
-    )
-
     config = _make_master_config()
     config.cluster = ClusterConfig(
         num_nodes=3, gpus_per_node=8, segment_size=segment_size
     )
-    config.reference = ReferencePlacementConfig(
-        placement=placement, num_nodes=1, gpus_per_node=4
-    )
+    _set_reference(config, placement=placement, num_nodes=1, gpus_per_node=4)
     nodes = [
         {
             "Alive": True,
@@ -3435,3 +3405,47 @@ def test_legacy_setup_reserves_teachers_before_generation(
     )
     setup_single_controller(config, tokenizer="tokenizer", processor=None)
     assert events == ["teachers", "generation"]
+
+
+def _set_reference(config, **resources):
+    from nemo_rl.models.policy import ReferenceConfig
+
+    config.policy["reference"] = ReferenceConfig.model_validate(
+        {"colocated": {"enabled": False, "resources": resources}}
+    )
+
+
+def test_reference_colocation_defaults_and_resource_validation():
+    from omegaconf import OmegaConf
+    from pydantic import ValidationError
+
+    from nemo_rl.models.policy import ReferenceConfig
+    from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
+
+    register_omegaconf_resolvers()
+    config = MasterConfig.model_validate(
+        OmegaConf.to_container(
+            load_config(
+                "examples/configs/grpo_math_1B_megatron_single_controller.yaml"
+            ),
+            resolve=True,
+        )
+    )
+    assert config.reference_resources is None
+    config.policy["reference"] = ReferenceConfig()
+    assert config.policy["reference"].colocated.enabled
+    assert config.reference_resources is None
+    config.policy["reference"] = ReferenceConfig.model_validate(
+        {"colocated": {"resources": {"num_nodes": 2, "gpus_per_node": 4}}}
+    )
+    assert config.reference_resources is None
+    _set_reference(config, num_nodes=1, gpus_per_node=8)
+    restored = type(config).model_validate(config.model_dump())
+    assert restored.reference_resources.num_nodes == 1
+    assert restored.reference_resources.gpus_per_node == 8
+    with pytest.raises(ValidationError, match="requires resources"):
+        ReferenceConfig.model_validate({"colocated": {"enabled": False}})
+    with pytest.raises(ValidationError, match="policy.reference.colocated"):
+        type(config).model_validate({**config.model_dump(), "reference": None})
+    with pytest.raises(ValidationError):
+        ReferenceConfig.model_validate({"colocated": {"enable": False}})

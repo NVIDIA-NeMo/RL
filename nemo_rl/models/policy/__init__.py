@@ -14,7 +14,7 @@
 
 from typing import Any, Literal, NotRequired, TypedDict, Union
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, PositiveInt, model_validator
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
@@ -652,6 +652,29 @@ class OnPolicyDistillationFullTransport(TypedDict):
     teacher_index_field: str | None
 
 
+class ReferencePlacementConfig(BaseModel, extra="forbid"):
+    placement: Literal["same_node", "separate_nodes"] = "separate_nodes"
+    num_nodes: PositiveInt
+    gpus_per_node: PositiveInt
+
+
+class ReferenceColocationConfig(BaseModel, extra="forbid"):
+    enabled: bool = True
+    resources: ReferencePlacementConfig | None = None
+
+    @model_validator(mode="after")
+    def require_separate_resources(self) -> "ReferenceColocationConfig":
+        if not self.enabled and self.resources is None:
+            raise ValueError("Non-colocated reference requires resources")
+        return self
+
+
+class ReferenceConfig(BaseModel, extra="forbid"):
+    colocated: ReferenceColocationConfig = Field(
+        default_factory=ReferenceColocationConfig
+    )
+
+
 class PolicyConfig(TypedDict):
     model_name: str
     tokenizer: TokenizerConfig
@@ -664,6 +687,7 @@ class PolicyConfig(TypedDict):
     # If None, chunking is disabled and the full sequence is processed at once.
     logprob_chunk_size: NotRequired[int | None]
     generation: NotRequired[GenerationConfig]
+    reference: NotRequired[ReferenceConfig]
     generation_batch_size: NotRequired[
         int
     ]  # used in static batched (framework) generation

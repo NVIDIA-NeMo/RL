@@ -19,23 +19,30 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
 ### Reference placement
 
 By default, policy workers also hold the frozen reference weights. To run the
-reference on separate GPUs, add this top-level section:
+reference on separate GPUs, set `policy.reference.colocated.enabled: false`:
 
 ```yaml
-reference:
-  placement: separate_nodes
-  num_nodes: 1
-  gpus_per_node: 8
+policy:
+  reference:
+    colocated:
+      enabled: false
+      resources:
+        placement: separate_nodes
+        num_nodes: 1
+        gpus_per_node: 8
 ```
 
 For `separate_nodes`, increase `cluster.num_nodes` by the reference host count
 to keep the policy and generation allocations fixed. With `same_node`, the
-reference takes separate GPUs on each policy host; `reference.num_nodes` must
+reference takes separate GPUs on each policy host; `resources.num_nodes` must
 match the policy host count. The policy gets the remaining GPUs after generation
 and reference reservations. The reference inherits the policy backend and model
 parallelism, loads the initial weights even when training resumes, and stays on
 GPU without an optimizer or a second reference copy. Separate placement requires
 reference logprobs and a positive reference KL penalty.
+
+`colocated.enabled` defaults to `true`. Its `resources` block only applies when
+it is `false`, matching the structure of `policy.generation.colocated`.
 
 ### Mandatory settings
 
