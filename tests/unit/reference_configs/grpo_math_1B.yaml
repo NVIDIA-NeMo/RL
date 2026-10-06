@@ -60,6 +60,9 @@ grpo:
   deduplicate_multimodal_data: false
   # Debug-only exact Ray payload telemetry; serialization adds runtime overhead.
   debug_payload_metrics: false
+  # Optional per-prompt-group length penalties/bonuses for NeMo-Gym rollouts
+  # (binary-reward envs only). See docs/guides/length-penalty.md. null disables.
+  length_penalty: null
 
   async_grpo:
     enabled: false # Set to true to enable async training mode

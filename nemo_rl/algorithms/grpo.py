@@ -394,6 +394,13 @@ class GRPOConfig(BaseModel, extra="allow"):
     deduplicate_multimodal_data: bool = False
     # Emit exact-boundary and logical-vs-physical payload metrics.
     debug_payload_metrics: bool = False
+    # Optional per-prompt-group length penalties/bonuses applied to NeMo-Gym
+    # rollout rewards (binary-reward envs only). Keys: ``default``,
+    # ``agent_overrides``, ``profile_band``, ``verbose``; see
+    # docs/guides/length-penalty.md. Validated by
+    # nemo_rl.utils.length_penalty.apply_group_length_penalties, which rejects
+    # unknown keys. None/absent disables the feature.
+    length_penalty: dict[str, Any] | None = None
 
 
 @dataclass
@@ -3282,6 +3289,7 @@ def _grpo_train_impl(
                             greedy=False,
                             effort_config=_get_effort_config(master_config),
                             reward_penalty_config=master_config.reward_penalties,
+                            length_penalty_config=master_config.grpo.model_dump(),
                             thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
                             mask_env_flagged_samples=should_mask_flagged_samples(
                                 master_config.env
@@ -4319,6 +4327,11 @@ def validate(
                     greedy=False,
                     effort_config=_get_effort_config(master_config),
                     reward_penalty_config=master_config.reward_penalties,
+                    # No length_penalty_config here: validation metrics
+                    # (accuracy/pass_k) must reflect the raw env reward, and the
+                    # adjustment code groups by the TRAINING stride
+                    # (num_generations_per_prompt), which does not match
+                    # val_num_generations_per_prompt.
                     thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
                     mask_env_flagged_samples=should_mask_flagged_samples(
                         master_config.env
