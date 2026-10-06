@@ -178,7 +178,7 @@ def test_coordinator_commits_and_restores_each_instance_inventory(
             "tools/replica-1": (),
         }
         await coordinator.restore("restore-1", tmp_path, manifest)
-        await coordinator.discard_restored("restore-1", manifest)
+        await coordinator.retire_restored("restore-1", manifest)
         await coordinator.resume("restore-1")
 
     asyncio.run(exercise())
@@ -521,7 +521,7 @@ def _committed_participant(
         server_name=server_name,
         kind=kind,
         phase="committed",
-        episode_keys=(),
+        capture_keys=(),
         manifest=GymCheckpointParticipantManifest(
             schema_version=1,
             kind=kind,

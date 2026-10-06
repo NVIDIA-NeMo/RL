@@ -333,7 +333,7 @@ def _assert_prefix_boundary(
             match
             for match in completed
             if match[2] == cut["model_call_id"]
-            and int(match[3]) == cut["generation_token_count"]
+            and int(match[3]) == cut["prefix_token_count"]
         ]
         if len(matches) != 1:
             raise AssertionError(
@@ -490,7 +490,7 @@ def _classify_token_divergence(
         if cut is not None:
             segment_start = _last_generated_segment_start(mask)
             if segment_start is not None:
-                prefix_end = segment_start + int(cut["generation_token_count"])
+                prefix_end = segment_start + int(cut["prefix_token_count"])
                 logged = restored_hashes.get(cut["model_call_id"])
                 prefix_hash_matches = logged is not None and logged == (
                     _token_ids_sha256(right[segment_start:prefix_end])
@@ -907,7 +907,7 @@ def compare(args: argparse.Namespace) -> None:
         "restored_prefixes": [
             {
                 key: cut[key]
-                for key in ("group_id", "generation_index", "generation_token_count")
+                for key in ("group_id", "generation_index", "prefix_token_count")
             }
             for cut in _selection_cuts(selection)
         ],
@@ -934,9 +934,7 @@ def compare(args: argparse.Namespace) -> None:
     )
     print(
         f"restored prefixes: {len(report['restored_prefixes'])} "
-        + str(
-            sorted(cut["generation_token_count"] for cut in report["restored_prefixes"])
-        ),
+        + str(sorted(cut["prefix_token_count"] for cut in report["restored_prefixes"])),
         flush=True,
     )
     for identity, classification in divergence.items():
