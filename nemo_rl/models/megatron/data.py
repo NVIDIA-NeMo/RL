@@ -36,9 +36,8 @@ from nemo_rl.data.megatron_sft_packed import (
     is_direct_packed_row,
 )
 from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS, PackedTensor
-from nemo_rl.data_plane.codec import pad_batch
 from nemo_rl.data_plane.schema import MICROBATCH_PADDED_FIELDS, OPD_FULL_FIELDS
-from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict, pad_nested_fields
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
 from nemo_rl.models.megatron.alignment import get_fp8_token_alignment
 from nemo_rl.models.megatron.common import _round_up_to_multiple
@@ -252,7 +251,9 @@ def make_processed_microbatch_iterator(
     pack_sequences = cfg["sequence_packing"]["enabled"]
 
     for data_dict in raw_iterator:
-        pad_batch(data_dict, MICROBATCH_PADDED_FIELDS, data_dict["input_ids"].shape[1])
+        pad_nested_fields(
+            data_dict, MICROBATCH_PADDED_FIELDS, data_dict["input_ids"].shape[1]
+        )
 
         direct_packed_metadata = None
         if is_direct_packed_row(data_dict):

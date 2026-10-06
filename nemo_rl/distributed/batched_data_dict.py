@@ -19,6 +19,7 @@ from typing import (
     Iterator,
     Literal,
     Mapping,
+    MutableMapping,
     NotRequired,
     Optional,
     Sequence,
@@ -139,6 +140,21 @@ def _select_nested_rows(
     return torch.nested.as_nested_tensor(
         [rows[i] for i in indices], layout=torch.jagged
     )
+
+
+def pad_nested_fields(
+    data: MutableMapping[str, Any],
+    pad_values: Mapping[str, int | float],
+    width: int,
+) -> None:
+    """Pad the nested fields named in ``pad_values`` to ``[rows, width, ...]``."""
+    for key, pad in pad_values.items():
+        value = data.get(key)
+        if not isinstance(value, torch.Tensor) or not value.is_nested:
+            continue
+        padded = torch.nested.to_padded_tensor(value, pad)
+        pad_spec = [0, 0] * (padded.dim() - 2) + [0, width - padded.shape[1]]
+        data[key] = torch.nn.functional.pad(padded, pad_spec, value=pad)
 
 
 class BatchedDataDict(UserDict, Generic[DictT]):
