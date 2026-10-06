@@ -61,7 +61,7 @@ env:
       - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
       - responses_api_agents/anyterminal_agent/configs/anyterminal_multi_harness_enroot.yaml
     fan_out:
-      anyterminal_hermes:
+      anyterminal_multi_harness:
         - anyterminal_opencode
         - anyterminal_openclaw
         - anyterminal_pi

@@ -24,7 +24,7 @@ def test_anyterminal_multi_harness_recipe_resolves_async_training_contract():
 
     assert config["env"]["should_use_nemo_gym"] is True
     assert config["env"]["nemo_gym"]["fan_out"] == {
-        "anyterminal_hermes": [
+        "anyterminal_multi_harness": [
             "anyterminal_opencode",
             "anyterminal_openclaw",
             "anyterminal_pi",
@@ -68,7 +68,7 @@ def test_super_omni_anyterminal_recipe_resolves_training_topology():
     config = OmegaConf.to_container(load_config(SUPER_RECIPE), resolve=True)
 
     assert config["env"]["nemo_gym"]["fan_out"] == {
-        "anyterminal_hermes": [
+        "anyterminal_multi_harness": [
             "anyterminal_opencode",
             "anyterminal_openclaw",
             "anyterminal_pi",

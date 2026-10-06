@@ -128,7 +128,7 @@ env:
     # Expand every source example once per harness before dataloader batching.
     # This produces one independent GRPO prompt group per task/harness pair.
     fan_out:
-      anyterminal_hermes:
+      anyterminal_multi_harness:
         - anyterminal_opencode
         - anyterminal_openclaw
         - anyterminal_pi
