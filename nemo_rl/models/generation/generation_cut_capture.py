@@ -169,14 +169,14 @@ def _remaining_generation_limits_after_prefix(
     *,
     max_tokens: int | None,
     min_tokens: int | None,
-    generation_token_count: int,
+    prefix_token_count: int,
 ) -> tuple[int | None, int | None]:
     """Return output limits for the suffix after restoring generated tokens."""
-    if generation_token_count < 0:
-        raise ValueError("generation_token_count must be non-negative")
+    if prefix_token_count < 0:
+        raise ValueError("prefix_token_count must be non-negative")
     return (
-        None if max_tokens is None else max_tokens - generation_token_count,
-        None if min_tokens is None else max(0, min_tokens - generation_token_count),
+        None if max_tokens is None else max_tokens - prefix_token_count,
+        None if min_tokens is None else max(0, min_tokens - prefix_token_count),
     )
 
 
@@ -393,18 +393,18 @@ class GenerationCutCaptureMixin:
             chain_hash=chain_hash,
             cumulative_hash=cumulative_hash,
         )
-        generation_token_count = sum(mask == 1.0 for mask in token_mask_delta)
-        if generation_token_count != continuation.generation_token_count:
+        prefix_token_count = sum(mask == 1.0 for mask in token_mask_delta)
+        if prefix_token_count != continuation.prefix_token_count:
             message = (
                 "generation-cut token count mismatch: "
-                f"expected={continuation.generation_token_count} "
-                f"actual={generation_token_count} "
+                f"expected={continuation.prefix_token_count} "
+                f"actual={prefix_token_count} "
                 f"source_capture_key={continuation.source_capture_key!r} "
                 f"source_model_call_id={continuation.source_model_call_id!r}"
             )
             LOGGER.error("%s", message)
             raise RuntimeError(message)
-        if digest != continuation.digest:
+        if digest != continuation.prefix_digest:
             parent_chain_hash_prefix = (
                 admission.parent_chain_hash[:12]
                 if admission.parent_chain_hash is not None
@@ -412,7 +412,7 @@ class GenerationCutCaptureMixin:
             )
             message = (
                 "generation-cut digest mismatch: "
-                f"expected={continuation.digest} actual={digest} "
+                f"expected={continuation.prefix_digest} actual={digest} "
                 f"source_capture_key={continuation.source_capture_key!r} "
                 f"source_model_call_id={continuation.source_model_call_id!r} "
                 f"parent_call_id={admission.parent_call_id!r} "
@@ -460,8 +460,8 @@ class GenerationCutCaptureMixin:
             admission.rollout_id,
             admission.model_call_id,
             continuation.source_model_call_id,
-            continuation.generation_token_count,
-            continuation.digest,
+            continuation.prefix_token_count,
+            continuation.prefix_digest,
             weight_versions[0],
             weight_versions[-1],
             prefix_ids_sha256,
@@ -522,8 +522,8 @@ class GenerationCutCaptureMixin:
             completed = self._completed_capture_calls.get(prefix.model_call_id)
         expected_capture_key = (
             prefix.rollout_id
-            if prefix.attempt_index == 0
-            else f"{prefix.rollout_id}-a{prefix.attempt_index}"
+            if prefix.attempt == 0
+            else f"{prefix.rollout_id}-a{prefix.attempt}"
         )
         if (
             completed is not None
@@ -614,8 +614,8 @@ class GenerationCutCaptureMixin:
 
             expected_capture_key = (
                 prefix.rollout_id
-                if prefix.attempt_index == 0
-                else f"{prefix.rollout_id}-a{prefix.attempt_index}"
+                if prefix.attempt == 0
+                else f"{prefix.rollout_id}-a{prefix.attempt}"
             )
             if state.call.rollout_id != expected_capture_key:
                 raise RuntimeError(
@@ -651,12 +651,12 @@ class GenerationCutCaptureMixin:
                     **prefix.model_dump(mode="json"),
                     disposition="durable_failure",
                 )
-            inherited_generation_token_count = (
-                state.call.admission.generation_cut.generation_token_count
+            inherited_prefix_token_count = (
+                state.call.admission.generation_cut.prefix_token_count
                 if state.call.admission.generation_cut is not None
                 else 0
             )
-            total_generation_token_count = inherited_generation_token_count + len(
+            total_generation_token_count = inherited_prefix_token_count + len(
                 generated_token_ids
             )
             if total_generation_token_count == 0 or (
