@@ -39,7 +39,10 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
     DataPlaneCheckpointBarrier,
 )
-from nemo_rl.algorithms.async_utils.staleness_sampler import BaseSampler
+from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    BaseSampler,
+    ReadyFirstSamplerConfig,
+)
 from nemo_rl.algorithms.grpo import GRPOConfig, _initial_grpo_save_state
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
@@ -721,6 +724,19 @@ class TestLookaheadSchedule:
         ctrl._retune_lookahead_versions()
 
         ctrl._sampler.set_gate_window.assert_called_once_with(2)
+
+    @pytest.mark.parametrize("trainer_version", [0, 2, 4])
+    def test_ready_first_keeps_fixed_admission_window(
+        self, trainer_version: int
+    ) -> None:
+        ctrl = _lookahead_controller(
+            trainer_version=trainer_version, policy_training_start_step=2
+        )
+        ctrl._async_cfg.sampler = ReadyFirstSamplerConfig(max_staleness_versions=1)
+
+        ctrl._retune_lookahead_versions()
+
+        ctrl._sampler.set_gate_window.assert_not_called()
 
     def test_retune_is_a_noop_off_the_ppo_path(self):
         ctrl = _lookahead_controller(
