@@ -39,7 +39,6 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
 from nemo_rl.algorithms.grpo import (
     _REWARD_PENALTY_FLAGS,
     GRPOConfig,
-    GRPOLoggerConfig,
     RewardPenaltyConfig,
 )
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
@@ -67,6 +66,7 @@ from nemo_rl.models.policy import MegatronConfig, PolicyConfig
 from nemo_rl.models.value import ValueConfig
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
+from nemo_rl.utils.logger import LoggerConfig
 
 # ── User-facing SingleController configs ────────────────────────────────────
 
@@ -471,6 +471,9 @@ class WatchdogConfig(BaseModel, extra="allow"):
 
 
 class AsyncRLConfig(BaseModel, extra="allow"):
+    # Stream every consumed sample's untruncated token tensors to JSONL. Files
+    # are published only after the optimizer step completes; disabled by default.
+    log_full_train_data: bool = False
     # Staleness policy shared by the rollout and train pumps.
     sampler: SamplerConfig = Field(
         default_factory=InOrderSamplerConfig,
@@ -501,6 +504,18 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     max_buffered_rollouts: int = 64
     # Enable per-rollout diagnostic prints (prompt content / completion previews).
     diagnostics: bool = False
+    # CPU actors that run the advantage stage. 0 keeps it in the controller
+    # process, which is the historical behaviour and is correct, but it both
+    # holds a whole cohort's advantage inputs in the controller's heap and
+    # blocks the controller's event loop for the duration of the computation --
+    # long enough at Ultra scale to miss Ray's actor liveness ping. A positive
+    # value moves both costs onto dedicated CPU actors. Only grpo and opd are
+    # sharded across the pool; other estimators run as one call on one actor.
+    # Under data_plane.backend=mooncake_cpu each worker is its own TQ client and
+    # mounts a full global_segment_size + local_buffer_size, like each
+    # token-capture finalizer; budget it on top of
+    # gpus_per_node x (segment + buffer).
+    num_advantage_workers: NonNegativeInt = 0
 
     @model_validator(mode="after")
     def _check_streaming_chunk_bounds(self) -> "AsyncRLConfig":
@@ -844,7 +859,7 @@ class MasterConfig(BaseModel, extra="allow"):
     # common configs
     env: dict[str, Any]
     data: DataConfig
-    logger: GRPOLoggerConfig
+    logger: LoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
     reward_penalties: RewardPenaltyConfig = Field(default_factory=RewardPenaltyConfig)
@@ -1142,6 +1157,20 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "shaping. Disable them."
         )
 
+    # Rejected here rather than at the first advantage call, which is a whole
+    # round of rollouts and logprobs later: gdpo needs one reward column per
+    # component and SC's payload writes a single total_reward, with
+    # AdvantageConfig.repeated_batch_fields never populated.
+    if algo_cfg.adv_estimator.name == "gdpo":
+        raise NotImplementedError(
+            "adv_estimator 'gdpo' is not supported on the SingleController "
+            "path. It needs per-component reward columns (reward/<name>), and "
+            "the SC payload writes only total_reward, so the first advantage "
+            "call would raise 'GDPO requires multiple reward components' after "
+            "the run had already paid for a full step of rollouts. Set "
+            "adv_estimator.name to 'grpo'."
+        )
+
     async_config = master_config.async_rl
     generation_config = master_config.policy["generation"]
     if (
@@ -1269,10 +1298,10 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         )
 
     sampler_name = async_config.sampler.name
-    if sampler_name != "in_order":
+    if sampler_name not in ("in_order", "ready_first"):
         raise ValueError(
             "PPO on the SingleController path only supports "
-            f"async_rl.sampler.name='in_order', but got '{sampler_name}'. "
+            f"async_rl.sampler.name in ('in_order', 'ready_first'), but got '{sampler_name}'. "
             "Other samplers are not supported yet (in particular during critic "
             "warmup) (#2625)."
         )
@@ -1594,7 +1623,6 @@ class AdvantageConfig:
     """Internal DataPlane field mapping for advantage calculation."""
 
     output_field: str = "advantages"
-    prompt_ids_field: str = "prompt_ids_for_adv"
     reward_field: str = "total_reward"
     token_mask_field: str = "token_mask"
     sample_mask_field: str = "sample_mask"
@@ -1611,3 +1639,7 @@ class AdvantageConfig:
     # regression target for it (output).
     values_field: str = "values"
     returns_field: str = "returns"
+    # Dump-only. The estimators key their baseline on the group-id tag now, so
+    # nothing else fetches the raw prompt tokens; the training dump still
+    # records them per row.
+    prompt_ids_field: str = "prompt_ids_for_adv"
