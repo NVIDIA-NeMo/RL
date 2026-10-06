@@ -119,14 +119,28 @@ class _AsyncLLMHTTPClient:
                 iterator = self._engine_client.generate(
                     prompt, sampling_params, request_id, **kwargs
                 )
-            return await anext(iterator)
+            output = await anext(iterator)
+            if output.finished:
+                # Run vLLM's cleanup here instead of making another round trip
+                # just to observe StopAsyncIteration after the final output.
+                try:
+                    await anext(iterator)
+                except StopAsyncIteration:
+                    pass
+                else:
+                    raise RuntimeError("vLLM yielded output after request finished")
+            return output
 
         try:
             while True:
                 try:
-                    yield await self._run_on_engine_loop(next_output)
+                    output = await self._run_on_engine_loop(next_output)
                 except StopAsyncIteration:
                     completed = True
+                    return
+                completed = output.finished
+                yield output
+                if completed:
                     return
         finally:
             if not completed:
