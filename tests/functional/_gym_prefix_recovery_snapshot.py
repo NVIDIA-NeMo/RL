@@ -113,7 +113,7 @@ def _recoverable_cut(record: dict[str, Any]) -> dict[str, Any] | None:
         continuation = cut.get("continuation")
         if not isinstance(continuation, dict):
             continue
-        token_count = continuation.get("generation_token_count")
+        token_count = continuation.get("prefix_token_count")
         output_limit = continuation.get("effective_output_limit")
         staging_keys = continuation.get("staging_keys")
         if (
@@ -243,7 +243,7 @@ def inspect_snapshot(
     cuts = sorted(
         candidates, key=lambda item: (item["group_id"], item["generation_index"])
     )
-    longest = max(candidates, key=lambda item: item["generation_token_count"])
+    longest = max(candidates, key=lambda item: item["prefix_token_count"])
     return {**longest, "cuts": cuts}
 
 
@@ -364,8 +364,8 @@ def _verify_restored_cut(
 
     expected_prefix = (
         cut["model_call_id"],
-        cut["generation_token_count"],
-        cut["digest"],
+        cut["prefix_token_count"],
+        cut["prefix_digest"],
     )
     if not any(
         source_model_call_id == expected_prefix[0]
