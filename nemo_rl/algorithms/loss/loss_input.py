@@ -42,6 +42,7 @@ from nemo_rl.distributed.model_utils import (
     get_distillation_topk_logprobs_from_logits,
     get_next_token_logprobs_from_logits,
 )
+from nemo_rl.utils.sequence_lengths import CpuIntTuple
 
 if TYPE_CHECKING:
     from nemo_automodel.components.distributed.context_parallel import (
@@ -186,7 +187,6 @@ def _prepare_opd_full_loss_input(
         loss_input["next_token_logprobs"] = get_next_token_logprobs_from_logits(
             input_ids=data["input_ids"],
             next_token_logits=logits,
-            seq_index=data.get("seq_index", None),
             vocab_parallel_rank=vocab_parallel_rank,
             vocab_parallel_group=vocab_parallel_group,
             context_parallel_group=context_parallel_group,
@@ -224,8 +224,8 @@ def prepare_loss_input(
             computation (policy.logprob_chunk_size); avoids materializing
             full-size float32 logits during training.
         cp_sharder: Automodel ``ContextParallelSharder`` owning this forward's
-            sequence layout (V2 automodel worker with cp_size > 1); ``logits``
-            are then this rank's CP-local shard while ``data`` stays canonical.
+            sequence layout; set only when cp_size > 1. ``logits`` are then this
+            rank's CP-local shard while ``data`` stays canonical.
         teacher_output_layer_weight_by_index: This TP rank's
             ``[V_local, H_teacher]`` teacher LM-head shards, keyed by the stable
             index rows are tagged with. The ``opd_full`` hidden-state path
@@ -257,7 +257,6 @@ def prepare_loss_input(
             logprobs = get_next_token_logprobs_from_logits(
                 input_ids=data["input_ids"],
                 next_token_logits=logits,
-                seq_index=data.get("seq_index", None),
                 vocab_parallel_rank=vocab_parallel_rank,
                 vocab_parallel_group=vocab_parallel_group,
                 context_parallel_group=context_parallel_group,
@@ -277,7 +276,6 @@ def prepare_loss_input(
                 data["curr_logprobs_unfiltered"] = get_next_token_logprobs_from_logits(
                     input_ids=data["input_ids"],
                     next_token_logits=logits,
-                    seq_index=data.get("seq_index", None),
                     vocab_parallel_rank=vocab_parallel_rank,
                     vocab_parallel_group=vocab_parallel_group,
                     context_parallel_group=context_parallel_group,
@@ -437,8 +435,8 @@ def prepare_packed_loss_input(
     logits: torch.Tensor,
     data: BatchedDataDict[Any],
     loss_fn: LossFunction,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_q_padded: torch.Tensor,
+    cu_seqlens_q: CpuIntTuple,
+    cu_seqlens_q_padded: CpuIntTuple,
     vocab_parallel_rank: Optional[int] = None,
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -457,8 +455,10 @@ def prepare_packed_loss_input(
         logits: Packed logits from the model [1, T_packed // CP, V // TP].
         data: Microbatch data (unpacked, [B, S]).
         loss_fn: Loss function (must have input_type == LossInputType.LOGPROB).
-        cu_seqlens_q: Unpadded cumulative sequence lengths [B+1].
-        cu_seqlens_q_padded: Padded cumulative sequence lengths [B+1].
+        cu_seqlens_q: Unpadded cumulative sequence lengths [B+1]. CPU-resident
+            integer tuples are required at this host-side loss boundary.
+        cu_seqlens_q_padded: Padded cumulative sequence lengths [B+1]. CPU-resident
+            integer tuples are required at this host-side loss boundary.
         vocab_parallel_rank: Vocab parallel rank.
         vocab_parallel_group: Vocab parallel group.
         context_parallel_group: Context parallel group.

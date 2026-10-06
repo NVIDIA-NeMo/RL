@@ -32,13 +32,15 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
 @pytest.mark.parametrize("sequence_level", [False, True])
+@pytest.mark.parametrize("metrics_level", ["full", "minimal"])
 @pytest.mark.parametrize("invalid_source", ["current", "previous", "generation", "all"])
 def test_invalid_policy_tokens_match_explicit_actor_exclusion(
-    sequence_level, invalid_source
+    sequence_level, invalid_source, metrics_level
 ):
     fn = ClippedPGLossFn(
         ClippedPGLossConfig(
             reference_policy_kl_penalty=0.0,
+            metrics_level=metrics_level,
             sequence_level_importance_ratios=sequence_level,
             token_level_loss=not sequence_level,
             use_importance_sampling_correction=True,
@@ -103,13 +105,15 @@ def test_invalid_policy_tokens_match_explicit_actor_exclusion(
 
 
 @pytest.mark.parametrize("sequence_level", [False, True])
+@pytest.mark.parametrize("metrics_level", ["full", "minimal"])
 @pytest.mark.parametrize("on_policy_kl", [False, True])
 def test_actor_support_exclusion_preserves_unfiltered_reference_kl(
-    sequence_level, on_policy_kl
+    sequence_level, on_policy_kl, metrics_level
 ):
     fn = ClippedPGLossFn(
         ClippedPGLossConfig(
             reference_policy_kl_penalty=0.1,
+            metrics_level=metrics_level,
             use_on_policy_kl_approximation=on_policy_kl,
             sequence_level_importance_ratios=sequence_level,
             token_level_loss=not sequence_level,
@@ -287,7 +291,7 @@ def test_kl_in_reward_ignores_tokens_outside_policy_support(estimator):
 
 
 def test_opd_advantage_ignores_tokens_outside_student_support():
-    est = OPDAdvantageEstimator({"name": "opd"}, {})
+    est = OPDAdvantageEstimator(AdvEstimatorConfig(name="opd"), ClippedPGLossConfig())
     advantages = est.compute_advantage(
         prompt_ids=None,
         rewards=None,
@@ -298,3 +302,40 @@ def test_opd_advantage_ignores_tokens_outside_student_support():
 
     torch.testing.assert_close(advantages, torch.tensor([[0.0, 0.0, 0.5]]))
     assert all(math.isfinite(v) for v in est.last_metrics.values())
+
+
+@pytest.mark.parametrize("alpha", [1.0, 0.4])
+@pytest.mark.parametrize("subtract_baseline", [False, True])
+@pytest.mark.parametrize("all_excluded", [False, True])
+def test_opd_support_exclusion_with_proximal_teacher_and_baseline(
+    alpha: float, subtract_baseline: bool, all_excluded: bool
+) -> None:
+    config = AdvEstimatorConfig(
+        name="opd",
+        proximal_teacher_alpha=alpha,
+        subtract_global_baseline=subtract_baseline,
+    )
+    actual_estimator = OPDAdvantageEstimator(config, ClippedPGLossConfig())
+    control_estimator = OPDAdvantageEstimator(config, ClippedPGLossConfig())
+    teacher = torch.tensor([[-0.2, -0.3, -0.4]])
+    student = torch.tensor([[-torch.inf, -0.8, -0.6]])
+    if all_excluded:
+        student.fill_(-torch.inf)
+    valid = torch.isfinite(student)
+    actual = actual_estimator.compute_advantage(
+        None,
+        None,
+        torch.ones_like(student),
+        teacher_logprobs=teacher,
+        prev_logprobs=student,
+    )
+    expected = control_estimator.compute_advantage(
+        None,
+        None,
+        valid.float(),
+        teacher_logprobs=teacher,
+        prev_logprobs=torch.where(valid, student, teacher),
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert actual_estimator.last_metrics == control_estimator.last_metrics
+    assert all(math.isfinite(value) for value in actual_estimator.last_metrics.values())
