@@ -64,6 +64,7 @@ from nemo_rl.environments.nemo_gym_multimodal import (
 from nemo_rl.environments.nemo_gym_shards import (
     AGENT_POOL_CONFIG_KEY,
     DEFAULT_PLACEMENT_STRATEGY,
+    FAN_OUT_CONFIG_KEY,
     SHARDING_CONFIG_KEYS,
     ShardConfigError,
     ShardPlan,
@@ -73,8 +74,11 @@ from nemo_rl.environments.nemo_gym_shards import (
     apply_shard_overlay,
     build_route_shard_map,
     parse_agent_pool,
+    parse_fan_out,
     parse_shard_plan,
     validate_agent_pool_targets,
+    validate_agent_routing_modes,
+    validate_fan_out_targets,
 )
 from nemo_rl.environments.utils import shutdown_environments
 from nemo_rl.experience.failures import (
@@ -1563,6 +1567,43 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
         env_cfg = config.env.setdefault("nemo_gym", {})
         env_cfg.setdefault("tokenizer_config", dict(config.policy["tokenizer"]))
 
+    # Fan-out changes the number of prompt groups, so it must happen while the
+    # dataset is built, before dataloader batching and GRPO sibling expansion.
+    # Inject the validated mapping only into NeMo-Gym datasets; the actor-side
+    # config copy is consumed separately and never forwarded as a server entry.
+    env_cfg = getattr(config, "env", None)
+    if env_cfg is None:
+        return
+    nemo_gym_cfg = env_cfg.setdefault("nemo_gym", {})
+    agent_pool = parse_agent_pool(nemo_gym_cfg.get(AGENT_POOL_CONFIG_KEY))
+    fan_out = parse_fan_out(nemo_gym_cfg.get(FAN_OUT_CONFIG_KEY))
+    validate_agent_routing_modes(agent_pool, fan_out)
+    if fan_out:
+        data_cfg = getattr(config, "data", None)
+        if data_cfg is None:
+            raise ShardConfigError(
+                "env.nemo_gym.fan_out requires a data config so NeMo RL can "
+                "expand prompt groups before batching"
+            )
+        default_cfg = data_cfg.get("default") or {}
+        for split_name in ("train", "validation"):
+            split_cfg = data_cfg.get(split_name)
+            if split_cfg is None:
+                continue
+            entries = split_cfg if isinstance(split_cfg, list) else [split_cfg]
+            for entry in entries:
+                dataset_name = entry.get(
+                    "dataset_name", default_cfg.get("dataset_name")
+                )
+                if dataset_name != "NemoGymDataset":
+                    continue
+                configured = parse_fan_out(entry.get(FAN_OUT_CONFIG_KEY))
+                if configured and configured != fan_out:
+                    raise ShardConfigError(
+                        f"data.{split_name}.fan_out conflicts with env.nemo_gym.fan_out"
+                    )
+                entry[FAN_OUT_CONFIG_KEY] = fan_out
+
 
 def build_nemo_gym_config(
     env_configs: dict[str, Any],
@@ -1795,6 +1836,8 @@ class NemoGymShardSet:
             it. Empty when unsharded, where every row goes to the only actor.
         agent_pool: Gym route-to-agent mapping consumed by NeMo RL before
             dispatch. Empty for unsharded jobs, where Gym owns selection.
+        fan_out: Gym route-to-agent cross-product already applied while the
+            NeMo-Gym dataset was loaded.
         placement_group: The STRICT_SPREAD group pinning shards to distinct
             nodes, or None when unsharded.
     """
@@ -1802,6 +1845,7 @@ class NemoGymShardSet:
     handles: Dict[str, List[ray.actor.ActorHandle]]
     route_to_shard: Dict[str, str] = field(default_factory=dict)
     agent_pool: Dict[str, List[str]] = field(default_factory=dict)
+    fan_out: Dict[str, List[str]] = field(default_factory=dict)
     placement_group: Optional[PlacementGroup] = None
     _next_replica: Dict[str, int] = field(default_factory=dict, repr=False)
     _replica_lock: threading.Lock = field(
@@ -2030,6 +2074,9 @@ def _build_single_gym_actor(
     Discovery is skipped rather than merely unused. Its checks compare entry
     names *between* shards, so with one shard there is nothing they could find.
     """
+    fan_out = parse_fan_out(nemo_gym_dict.pop(FAN_OUT_CONFIG_KEY, None))
+    agent_pool = parse_agent_pool(nemo_gym_dict.get(AGENT_POOL_CONFIG_KEY))
+    validate_agent_routing_modes(agent_pool, fan_out)
     actor_config = _build_gym_actor_config(
         nemo_gym_dict,
         base_urls=base_urls,
@@ -2049,9 +2096,14 @@ def _build_single_gym_actor(
         )
 
     actor = NemoGym.options(**actor_options).remote(actor_config)
-    shard_set = NemoGymShardSet(handles={DEFAULT_SHARD_NAME: [actor]})
+    shard_set = NemoGymShardSet(
+        handles={DEFAULT_SHARD_NAME: [actor]}, fan_out=fan_out
+    )
     try:
         ray.get(actor._spinup.remote())
+        if fan_out:
+            entries = ray.get(actor.list_entries.remote())
+            validate_fan_out_targets({DEFAULT_SHARD_NAME: entries}, fan_out)
         ray.get(actor.set_tokenizer.remote(tokenizer))
     except BaseException:
         shard_set.shutdown(
@@ -2076,6 +2128,8 @@ def _build_sharded_gym_actors(
     spinup_timeout: float,
 ) -> NemoGymShardSet:
     agent_pool = parse_agent_pool(nemo_gym_dict.pop(AGENT_POOL_CONFIG_KEY, None))
+    fan_out = parse_fan_out(nemo_gym_dict.pop(FAN_OUT_CONFIG_KEY, None))
+    validate_agent_routing_modes(agent_pool, fan_out)
     instances = _shard_instances(plan)
 
     # num_gpu_nodes normally pins the single actor to the driver node. Under
@@ -2165,8 +2219,10 @@ def _build_sharded_gym_actors(
             shard_set,
             plan,
             agent_pool=agent_pool,
+            fan_out=fan_out,
         )
         shard_set.agent_pool = agent_pool
+        shard_set.fan_out = fan_out
     except BaseException:
         # A ray.get timeout does not cancel the actor-side work, so a
         # half-started stack would keep running with nothing left to stop it.
@@ -2257,6 +2313,7 @@ def _discover_route_shard_map(
     plan: ShardPlan,
     *,
     agent_pool: Mapping[str, list[str]],
+    fan_out: Mapping[str, list[str]],
 ) -> Dict[str, str]:
     """Ask one replica per shard what it spawned, then build routing metadata.
 
@@ -2268,10 +2325,11 @@ def _discover_route_shard_map(
         for shard in plan.shards
     }
     validate_agent_pool_targets(entries_by_shard, agent_pool)
+    validate_fan_out_targets(entries_by_shard, fan_out)
     return build_route_shard_map(
         entries_by_shard,
         plan.allowed_duplicate_entries,
-        pooled_routes=frozenset(agent_pool),
+        pooled_routes=frozenset(agent_pool) | frozenset(fan_out),
     )
 
 
@@ -2354,13 +2412,15 @@ def validate_dataset_agent_coverage(
         return
 
     hosted = shard_set.hosted_routes
-    accepted_sources = hosted | frozenset(shard_set.agent_pool)
+    accepted_sources = (
+        hosted | frozenset(shard_set.agent_pool) | frozenset(shard_set.fan_out)
+    )
     for split, dataset in datasets.items():
         unhosted = sorted(_iter_dataset_agent_names(dataset) - accepted_sources)
         if unhosted:
             raise ShardSetupError(
                 f"The {split} dataset references routes that no shard hosts: "
-                f"{unhosted}. Hosted routes and agent-pool sources: "
+                f"{unhosted}. Hosted routes and agent-pool/fan-out sources: "
                 f"{sorted(accepted_sources)}."
             )
 

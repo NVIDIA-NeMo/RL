@@ -132,6 +132,27 @@ prompt. Confirm that each prompt's two generations have the same
 Use Terminal-Bench or SWE-bench for a representative coding-agent comparison
 after this inexpensive routing smoke test passes.
 
+To run every matching task through every listed harness, use `fan_out` instead
+of `agent_pool`:
+
+```yaml
+env:
+  nemo_gym:
+    fan_out:
+      terminal_bench:
+        - opencode_terminal_agent
+        - openclaw_terminal_agent
+        - pi_terminal_agent
+        - hermes_terminal_agent
+```
+
+NeMo RL expands each source row before dataloader batching, producing one GRPO
+prompt group per task/harness pair. All `num_generations_per_prompt` siblings
+within a group use that same harness, so group-relative advantages never mix
+different harness environments. `fan_out` targets use the same startup and
+shard validation as `agent_pool`. A routing key cannot appear in both mappings:
+`agent_pool` selects one target, while `fan_out` runs all targets.
+
 #### Choose actor placement
 
 The default `placement_strategy` is `STRICT_SPREAD`, which requires Ray to place each actor on a different node. This provides the capacity isolation that sharding is designed for.

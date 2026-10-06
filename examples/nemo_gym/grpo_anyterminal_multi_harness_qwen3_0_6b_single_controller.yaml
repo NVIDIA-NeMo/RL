@@ -10,16 +10,15 @@
 #     +mode=train_preparation +should_download=false
 #
 # Then run this recipe with examples/run_grpo_single_controller.py. One GPU
-# trains Qwen3-0.6B and one serves vLLM. Four prompt groups select OpenCode,
-# OpenClaw, Pi, and Hermes in stable round-robin order; the second generation
-# for each prompt stays on the same harness.
+# trains Qwen3-0.6B and one serves vLLM. Every source task fans out into four
+# prompt groups: OpenCode, OpenClaw, Pi, and Hermes. Both generations in each
+# prompt group stay on the same harness.
 defaults: "../configs/grpo_math_1B.yaml"
 
 grpo:
   max_num_epochs: 2
   num_prompts_per_step: 4
   num_generations_per_prompt: 2
-  max_num_steps: 2
   val_period: 0
   val_at_start: false
   val_at_end: false
@@ -126,9 +125,9 @@ env:
     config_paths:
       - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
       - responses_api_agents/anyterminal_agent/configs/anyterminal_multi_harness_enroot.yaml
-    # NeMo RL consumes this before sharding; Gym receives the same mapping and
-    # resolves each stable assignment when it starts the rollout.
-    agent_pool:
+    # Expand every source example once per harness before dataloader batching.
+    # This produces one independent GRPO prompt group per task/harness pair.
+    fan_out:
       anyterminal_hermes:
         - anyterminal_opencode
         - anyterminal_openclaw

@@ -74,6 +74,31 @@ def test_setup_nemo_gym_config_rejects_unsupported_backend() -> None:
         setup_nemo_gym_config(config, tokenizer=None)
 
 
+def test_setup_nemo_gym_config_injects_fan_out_into_gym_datasets() -> None:
+    fan_out = {"shared": ["opencode", "hermes"]}
+    config = SimpleNamespace(
+        policy={
+            "generation": {
+                "backend": "vllm",
+                "vllm_cfg": {},
+                "stop_strings": None,
+                "stop_token_ids": None,
+            }
+        },
+        env={"nemo_gym": {"fan_out": fan_out}},
+        data={
+            "train": {"dataset_name": "NemoGymDataset", "data_path": "train.jsonl"},
+            "validation": {"dataset_name": "NemoGymDataset", "data_path": "val.jsonl"},
+            "default": {},
+        },
+    )
+
+    setup_nemo_gym_config(config, tokenizer=None)
+
+    assert config.data["train"]["fan_out"] == fan_out
+    assert config.data["validation"]["fan_out"] == fan_out
+
+
 @pytest.mark.parametrize(
     ("output_item_dict", "expected_invalid_tool_call", "expected_malformed_thinking"),
     [
@@ -771,6 +796,31 @@ def test_unsharded_actor_forwards_agent_pool_to_gym(detected_uv_dirs):
         cluster.actor_configs[0]["initial_global_config_dict"]["agent_pool"]
         == agent_pool
     )
+
+
+def test_unsharded_actor_consumes_fan_out_before_gym_dispatch(detected_uv_dirs):
+    cluster = _FakeGymCluster(
+        entries_by_index={
+            0: {
+                "opencode": ["responses_api_agents"],
+                "codex": ["responses_api_agents"],
+            }
+        }
+    )
+    fan_out = {"reasoning": ["opencode", "codex"]}
+
+    with _patched_cluster(cluster):
+        shard_set = nemo_gym_mod.build_nemo_gym_actors(
+            _env_configs(fan_out=fan_out),
+            base_urls=["http://vllm-0"],
+            model_name="test-model",
+            tokenizer=_TOKENIZER,
+            enable_router_replay=False,
+            use_fastokens=False,
+        )
+
+    assert shard_set.fan_out == fan_out
+    assert "fan_out" not in cluster.actor_configs[0]["initial_global_config_dict"]
 
 
 def test_sharded_actors_consume_agent_pool_before_gym_dispatch(detected_uv_dirs):

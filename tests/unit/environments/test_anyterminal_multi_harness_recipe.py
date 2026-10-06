@@ -19,7 +19,7 @@ def test_anyterminal_multi_harness_recipe_resolves_async_training_contract():
     config = OmegaConf.to_container(load_config(RECIPE), resolve=True)
 
     assert config["env"]["should_use_nemo_gym"] is True
-    assert config["env"]["nemo_gym"]["agent_pool"] == {
+    assert config["env"]["nemo_gym"]["fan_out"] == {
         "anyterminal_hermes": [
             "anyterminal_opencode",
             "anyterminal_openclaw",

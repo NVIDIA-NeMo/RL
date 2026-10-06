@@ -27,8 +27,11 @@ from nemo_rl.environments.nemo_gym_shards import (
     build_route_shard_map,
     find_gym_config_entries,
     parse_agent_pool,
+    parse_fan_out,
     parse_shard_plan,
     validate_agent_pool_targets,
+    validate_agent_routing_modes,
+    validate_fan_out_targets,
 )
 
 
@@ -70,6 +73,19 @@ def test_parse_agent_pool_rejects_invalid_routes(agent_pool, expected):
         parse_agent_pool(agent_pool)
 
 
+def test_parse_fan_out_accepts_the_gym_route_mapping():
+    assert parse_fan_out(OmegaConf.create({"reasoning": ["opencode", "codex"]})) == {
+        "reasoning": ["opencode", "codex"]
+    }
+
+
+def test_agent_pool_and_fan_out_cannot_share_a_route():
+    with pytest.raises(ShardConfigError, match="configure only one mode"):
+        validate_agent_routing_modes(
+            {"reasoning": ["opencode"]}, {"reasoning": ["codex"]}
+        )
+
+
 @pytest.mark.parametrize(
     "key",
     [
@@ -104,6 +120,15 @@ def test_agent_pool_is_not_misclassified_as_an_inherited_server_overlay():
 
     assert plan is not None
     assert "agent_pool" not in find_gym_config_entries(config)
+
+
+def test_fan_out_is_not_misclassified_as_an_inherited_server_overlay():
+    config = _sharded_config(fan_out={"reasoning": ["opencode", "codex"]})
+
+    plan = parse_shard_plan(config)
+
+    assert plan is not None
+    assert "fan_out" not in find_gym_config_entries(config)
 
 
 def test_parse_shard_plan_accepts_omegaconf_input():
@@ -674,6 +699,17 @@ def test_agent_pool_targets_must_be_agents_hosted_by_the_shards():
     validate_agent_pool_targets(entries, {"reasoning": ["opencode"]})
     with pytest.raises(ShardSetupError, match=r"agents no shard hosts.*codex"):
         validate_agent_pool_targets(entries, {"reasoning": ["opencode", "codex"]})
+
+
+def test_fan_out_targets_must_be_agents_hosted_by_the_shards():
+    entries = {
+        "left": {"opencode": ["responses_api_agents"]},
+        "right": {"reasoning": ["resources_servers"]},
+    }
+
+    validate_fan_out_targets(entries, {"reasoning": ["opencode"]})
+    with pytest.raises(ShardSetupError, match=r"agents no shard hosts.*hermes"):
+        validate_fan_out_targets(entries, {"reasoning": ["opencode", "hermes"]})
 
 
 def test_build_route_shard_map_rejects_an_unlisted_duplicate_entry():

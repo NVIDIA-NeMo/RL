@@ -38,8 +38,9 @@ from omegaconf import OmegaConf
 # Dict-shaped NeMo RL integration settings that are not Gym server entries.
 # The actor factory or rollout code consumes these separately.
 AGENT_POOL_CONFIG_KEY = "agent_pool"
+FAN_OUT_CONFIG_KEY = "fan_out"
 NEMO_RL_DICT_CONFIG_KEYS = frozenset(
-    {AGENT_POOL_CONFIG_KEY, "effort_levels", "tokenizer_config"}
+    {AGENT_POOL_CONFIG_KEY, FAN_OUT_CONFIG_KEY, "effort_levels", "tokenizer_config"}
 )
 
 # Ray placement-group strategies a shard plan may ask for. STRICT_SPREAD is the
@@ -176,6 +177,60 @@ def parse_agent_pool(value: Any) -> dict[str, list[str]]:
             )
         agent_pool[route_name] = list(agents)
     return agent_pool
+
+
+def parse_fan_out(value: Any) -> dict[str, list[str]]:
+    """Validate Gym's route-to-agent fan-out mapping for training data.
+
+    Unlike ``agent_pool``, which selects one target, ``fan_out`` turns every
+    matching source row into one prompt group per target agent. NeMo RL must do
+    that expansion before batching so GRPO siblings stay within one harness.
+    """
+    if value is None:
+        return {}
+    if OmegaConf.is_config(value):
+        value = OmegaConf.to_container(value, resolve=True)
+    if not isinstance(value, Mapping):
+        raise ShardConfigError(
+            "env.nemo_gym.fan_out must be a mapping from route names to agent lists"
+        )
+
+    fan_out: dict[str, list[str]] = {}
+    for route_name, agents in value.items():
+        if not isinstance(route_name, str) or not route_name:
+            raise ShardConfigError(
+                "env.nemo_gym.fan_out keys must be non-empty strings"
+            )
+        if (
+            not isinstance(agents, list)
+            or not agents
+            or not all(isinstance(agent, str) and agent for agent in agents)
+        ):
+            raise ShardConfigError(
+                f"env.nemo_gym.fan_out[{route_name!r}] must be a non-empty "
+                "list of non-empty agent names"
+            )
+        duplicates = sorted({agent for agent in agents if agents.count(agent) > 1})
+        if duplicates:
+            raise ShardConfigError(
+                f"env.nemo_gym.fan_out[{route_name!r}] contains duplicate "
+                f"agents {duplicates}"
+            )
+        fan_out[route_name] = list(agents)
+    return fan_out
+
+
+def validate_agent_routing_modes(
+    agent_pool: Mapping[str, list[str]], fan_out: Mapping[str, list[str]]
+) -> None:
+    """Reject ambiguous routes configured for both selection and fan-out."""
+    overlap = sorted(set(agent_pool) & set(fan_out))
+    if overlap:
+        raise ShardConfigError(
+            "env.nemo_gym.agent_pool and env.nemo_gym.fan_out both configure "
+            f"routes {overlap}. agent_pool selects one harness while fan_out "
+            "runs every harness; configure only one mode per route."
+        )
 
 
 def _parse_shard(raw: Any, index: int) -> ShardSpec:
@@ -624,6 +679,26 @@ def validate_agent_pool_targets(
     if missing:
         raise ShardSetupError(
             f"env.nemo_gym.agent_pool targets agents no shard hosts: {missing}. "
+            f"Available agents: {sorted(available_agents)}."
+        )
+
+
+def validate_fan_out_targets(
+    entries_by_shard: Mapping[str, Mapping[str, list[str]]],
+    fan_out: Mapping[str, list[str]],
+) -> None:
+    """Fail at setup when a fan-out target is not an agent on any shard."""
+    available_agents = {
+        entry
+        for entries in entries_by_shard.values()
+        for entry, types in entries.items()
+        if "responses_api_agents" in types
+    }
+    configured_targets = {agent for agents in fan_out.values() for agent in agents}
+    missing = sorted(configured_targets - available_agents)
+    if missing:
+        raise ShardSetupError(
+            f"env.nemo_gym.fan_out targets agents no shard hosts: {missing}. "
             f"Available agents: {sorted(available_agents)}."
         )
 
