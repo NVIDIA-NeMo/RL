@@ -33,6 +33,23 @@ fi
 set -a
 source "$ENV_FILE"
 set +a
+if [[ -n "${OSWORLD_GRPO_VAL_DATA_OVERRIDE:-}" ]]; then
+  export OSWORLD_GRPO_VAL_DATA="$OSWORLD_GRPO_VAL_DATA_OVERRIDE"
+fi
+
+OSWORLD_DRIVER_SCRIPT="${OSWORLD_DRIVER_SCRIPT:-driver.sh}"
+OSWORLD_NUM_NODES="${OSWORLD_NUM_NODES:-4}"
+OSWORLD_JOB_NAME="${OSWORLD_JOB_NAME:-osw-v2-b8k8}"
+case "$OSWORLD_DRIVER_SCRIPT" in
+  driver.sh|eval_driver.sh) ;;
+  *)
+    echo "Unsupported OSWORLD_DRIVER_SCRIPT: $OSWORLD_DRIVER_SCRIPT" >&2
+    exit 2
+    ;;
+esac
+if [[ "$OSWORLD_DRIVER_SCRIPT" != "eval_driver.sh" ]]; then
+  unset OSWORLD_EVAL_MODE
+fi
 
 if [[ -z "${OPENSANDBOX_DOMAIN:-}" && -n "${OPENSANDBOX_BASE_URL:-}" ]]; then
   opensandbox_host="${OPENSANDBOX_BASE_URL#*://}"
@@ -44,12 +61,26 @@ required_vars=(
   CONTAINER
   NANO_OMNI_MODEL_NAME
   NANO_OMNI_CHAT_TEMPLATE
-  OSWORLD_GRPO_TRAIN_DATA
   OPENSANDBOX_DOMAIN
   SLURM_ACCOUNT
   SLURM_PARTITION
   OSWORLD_RESULTS_ROOT
 )
+if [[ "$OSWORLD_DRIVER_SCRIPT" == "eval_driver.sh" ]]; then
+  case "${OSWORLD_EVAL_MODE:-}" in
+    sft|checkpoint) ;;
+    *)
+      echo "OSWORLD_EVAL_MODE must be sft or checkpoint" >&2
+      exit 2
+      ;;
+  esac
+  required_vars+=(OSWORLD_EVAL_MODE OSWORLD_GRPO_VAL_DATA)
+  if [[ "${OSWORLD_EVAL_MODE:-}" == "checkpoint" ]]; then
+    required_vars+=(OSWORLD_EVAL_CHECKPOINT_DIR)
+  fi
+else
+  required_vars+=(OSWORLD_GRPO_TRAIN_DATA)
+fi
 for name in "${required_vars[@]}"; do
   if [[ -z "${!name:-}" ]]; then
     echo "Required variable is unset: $name" >&2
@@ -81,11 +112,23 @@ export NANO_OMNI_MODEL_NAME
 NANO_OMNI_MODEL_NAME="$(canonical_dir "$NANO_OMNI_MODEL_NAME")"
 export NANO_OMNI_CHAT_TEMPLATE
 NANO_OMNI_CHAT_TEMPLATE="$(canonical_file "$NANO_OMNI_CHAT_TEMPLATE")"
-export OSWORLD_GRPO_TRAIN_DATA
-OSWORLD_GRPO_TRAIN_DATA="$(canonical_file "$OSWORLD_GRPO_TRAIN_DATA")"
+if [[ "$OSWORLD_DRIVER_SCRIPT" != "eval_driver.sh" ]]; then
+  export OSWORLD_GRPO_TRAIN_DATA
+  OSWORLD_GRPO_TRAIN_DATA="$(canonical_file "$OSWORLD_GRPO_TRAIN_DATA")"
+fi
+if [[ "$OSWORLD_DRIVER_SCRIPT" == "eval_driver.sh" ]]; then
+  export OSWORLD_GRPO_VAL_DATA
+  OSWORLD_GRPO_VAL_DATA="$(canonical_file "$OSWORLD_GRPO_VAL_DATA")"
+fi
+if [[ "$OSWORLD_DRIVER_SCRIPT" == "eval_driver.sh" && "${OSWORLD_EVAL_MODE:-}" == "checkpoint" ]]; then
+  export OSWORLD_EVAL_CHECKPOINT_DIR
+  OSWORLD_EVAL_CHECKPOINT_DIR="$(canonical_dir "$OSWORLD_EVAL_CHECKPOINT_DIR")"
+fi
 
 test -r "$NANO_OMNI_MODEL_NAME/config.json"
-test -s "$OSWORLD_GRPO_TRAIN_DATA"
+if [[ "$OSWORLD_DRIVER_SCRIPT" != "eval_driver.sh" ]]; then
+  test -s "$OSWORLD_GRPO_TRAIN_DATA"
+fi
 test -r "$RAY_SUB"
 
 OSWORLD_CHAIN_LENGTH="${OSWORLD_CHAIN_LENGTH:-1}"
@@ -96,6 +139,10 @@ if ! [[ "$OSWORLD_CHAIN_LENGTH" =~ ^[1-9][0-9]*$ ]]; then
 fi
 if ! [[ "$OSWORLD_GRPO_MAX_STEPS" =~ ^[1-9][0-9]*$ ]]; then
   echo "OSWORLD_GRPO_MAX_STEPS must be a positive integer" >&2
+  exit 2
+fi
+if ! [[ "$OSWORLD_NUM_NODES" =~ ^[1-9][0-9]*$ ]]; then
+  echo "OSWORLD_NUM_NODES must be a positive integer" >&2
   exit 2
 fi
 export OSWORLD_CHAIN_LENGTH OSWORLD_GRPO_MAX_STEPS
@@ -114,7 +161,7 @@ OSWORLD_RESULTS_ROOT="$(readlink -f "$OSWORLD_RESULTS_ROOT")"
 export OSWORLD_RESULTS_ROOT
 
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-run_name="${OSWORLD_RUN_NAME:-osworld-v2-molt-b8k8-$timestamp}"
+run_name="${OSWORLD_RUN_NAME:-${OSWORLD_RUN_PREFIX:-osworld-v2-molt-b8k8}-$timestamp}"
 if [[ "$run_name" == */* ]]; then
   echo "OSWORLD_RUN_NAME must not contain '/': $run_name" >&2
   exit 2
@@ -182,7 +229,11 @@ if [[ "${OSWORLD_VERIFY_CONTAINER_SHA256:-1}" == "1" ]]; then
   fi
 fi
 
-for script in "$RAY_SUB" "$SCRIPT_DIR/runtime_env.sh" "$SCRIPT_DIR/node_setup.sh" "$SCRIPT_DIR/driver.sh"; do
+for script in \
+  "$RAY_SUB" \
+  "$SCRIPT_DIR/runtime_env.sh" \
+  "$SCRIPT_DIR/node_setup.sh" \
+  "$SCRIPT_DIR/$OSWORLD_DRIVER_SCRIPT"; do
   bash -n "$script"
 done
 
@@ -212,7 +263,15 @@ add_identity_mount() {
 
 add_identity_mount "$NANO_OMNI_MODEL_NAME"
 add_identity_mount "$NANO_OMNI_CHAT_TEMPLATE"
-add_identity_mount "$OSWORLD_GRPO_TRAIN_DATA"
+if [[ "$OSWORLD_DRIVER_SCRIPT" != "eval_driver.sh" ]]; then
+  add_identity_mount "$OSWORLD_GRPO_TRAIN_DATA"
+fi
+if [[ "$OSWORLD_DRIVER_SCRIPT" == "eval_driver.sh" ]]; then
+  add_identity_mount "$OSWORLD_GRPO_VAL_DATA"
+fi
+if [[ "$OSWORLD_DRIVER_SCRIPT" == "eval_driver.sh" && "${OSWORLD_EVAL_MODE:-}" == "checkpoint" ]]; then
+  add_identity_mount "$OSWORLD_EVAL_CHECKPOINT_DIR"
+fi
 add_identity_mount "$OSWORLD_RESULTS_ROOT"
 add_identity_mount "$OSWORLD_CHECKPOINT_DIR"
 add_identity_mount "$OSWORLD_CACHE_ROOT"
@@ -227,12 +286,12 @@ fi
 export MOUNTS
 MOUNTS="$(IFS=,; echo "${mount_specs[*]}")"
 export GPUS_PER_NODE=8
-export NUM_NODES=4
+export NUM_NODES="$OSWORLD_NUM_NODES"
 export OSWORLD_EXECUTION_ROOT=/opt/nemo-rl/examples/nemo_gym/osworld_v2
 export OSWORLD_DRIVER_VENV="${OSWORLD_DRIVER_VENV:-/opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker}"
 export RAY_CLI="$OSWORLD_DRIVER_VENV/bin/ray"
 export SETUP_COMMAND="bash '$OSWORLD_EXECUTION_ROOT/node_setup.sh'"
-export COMMAND="bash '$OSWORLD_EXECUTION_ROOT/driver.sh'"
+export COMMAND="bash '$OSWORLD_EXECUTION_ROOT/$OSWORLD_DRIVER_SCRIPT'"
 export OSWORLD_POOL_REF="${OSWORLD_POOL_REF:-osworld-kvm}"
 export OSWORLD_MAX_STEPS="${OSWORLD_MAX_STEPS:-150}"
 export OSWORLD_MAX_PARALLEL_ROLLOUTS="${OSWORLD_MAX_PARALLEL_ROLLOUTS:-8}"
@@ -289,13 +348,13 @@ for ((offset = 0; offset < OSWORLD_CHAIN_LENGTH; offset++)); do
     sbatch --parsable \
       --export=ALL \
       --chdir="$RL_ROOT" \
-      --nodes=4 \
+      --nodes="$OSWORLD_NUM_NODES" \
       --exclusive \
       "${gres_args[@]}" \
       --account="$SLURM_ACCOUNT" \
       --partition="$SLURM_PARTITION" \
       --time="${OSWORLD_JOB_TIME:-04:00:00}" \
-      --job-name="osw-v2-b8k8" \
+      --job-name="$OSWORLD_JOB_NAME" \
       --output="$segment_root/slurm-%j.out" \
       "${exclude_args[@]}" \
       "${comment_args[@]}" \

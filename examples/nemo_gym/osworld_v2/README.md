@@ -29,11 +29,15 @@ The validated launcher requires:
 - The qualified immutable `.sqsh` image described below.
 - A local Nemotron-Omni SFT checkpoint in Hugging Face layout, including
   `config.json` and `chat_template.jinja`.
-- An OpenSandbox deployment with a warm KVM pool named `osworld-kvm` (or set
-  `OSWORLD_POOL_REF`) and guest OSWorld control API on port 5000.
+- An OpenSandbox deployment with a live API credential, a warm KVM pool named
+  `osworld-kvm` (or set `OSWORLD_POOL_REF`), and capacity for at least eight
+  concurrent training VMs (32 for an unsharded evaluation). Every compute node
+  must resolve and reach the protected OpenSandbox API; each VM must expose the
+  OSWorld control API on port 5000.
 - Access to GitHub/Python package indexes the first time NeMo Gym builds its
   shared component environment. The OSWorld dependency is pinned to
-  `terrykong/OSWorld@5d8c93592be588ab8e9909bed82f3b480fd4f533`.
+  `terrykong/OSWorld@5d8c93592be588ab8e9909bed82f3b480fd4f533`,
+  Ray to `2.56.1`, and the OpenSandbox SDK to `0.1.15`.
 
 ## 2. Clone the pinned code
 
@@ -99,6 +103,17 @@ wc -l /shared/data/osworld/train-5x.jsonl
 The preparation script removes framework-owned rollout IDs and adds the
 `nemotron_osworld` Gym route. SingleController creates fresh logical owner and
 attempt IDs at runtime.
+
+Prepare the corresponding one-copy, 361-task evaluation file:
+
+```bash
+python examples/nemo_gym/prepare_osworld_context_compaction_data.py \
+  --input 3rdparty/Gym-workspace/Gym/resources_servers/osworld/data/test_nogdrive.jsonl \
+  --output /shared/data/osworld/eval-361.jsonl \
+  --num-repeats 1
+wc -l /shared/data/osworld/eval-361.jsonl
+# expected: 361
+```
 
 ## 5. Configure the cluster
 
@@ -182,14 +197,41 @@ set `OSWORLD_CHAIN_LENGTH`. The default dependency is `afterok`; use
 `OSWORLD_CHAIN_DEPENDENCY=afterany` only when the site's expected time-limit
 termination is nonzero and the checkpoint has been independently verified.
 
-## Evaluation recipes
+## 8. Evaluate the SFT model or a NeMo RL checkpoint
 
-The repository also includes the v1-parity 361-task x 4-rollout evaluator:
+Set `OSWORLD_GRPO_VAL_DATA` in the private environment file to the prepared
+361-task file. The SFT evaluation runs four independent rollouts per task on
+one 8-GPU node:
 
-- SFT or directly loadable policy:
-  `grpo_nemotron_omni_30ba3b_osworld_v2_inference_v1_parity.yaml`
-- restored NeMo RL checkpoint:
-  `grpo_nemotron_omni_30ba3b_osworld_v2_checkpoint_inference_v1_parity.yaml`
+```bash
+bash examples/nemo_gym/osworld_v2/submit_eval.sh sft \
+  /shared/private/osworld-v2.env
+```
+
+To evaluate a trained policy, also set `OSWORLD_EVAL_CHECKPOINT_DIR` to the
+directory containing complete `step_N` checkpoints, then run:
+
+```bash
+bash examples/nemo_gym/osworld_v2/submit_eval.sh checkpoint \
+  /shared/private/osworld-v2.env
+```
+
+The launcher selects the matching v1-parity recipe, requests one node, validates
+the fully resolved config on every node, and uses the same qualified image,
+mount construction, Gym environment, 361 tasks, and four-rollout protocol as
+the published comparison. Increase `OSWORLD_JOB_TIME` if the destination
+cluster cannot finish 1,444 episodes within its default wall time.
+
+For parallel evaluation, split `eval-361.jsonl` into disjoint shards and pass
+one shard as the final argument to each submission:
+
+```bash
+bash examples/nemo_gym/osworld_v2/submit_eval.sh checkpoint \
+  /shared/private/osworld-v2.env /shared/data/osworld/eval-q01.jsonl
+```
+
+Never overlap task rows across shards. Aggregate the total count of episodes
+with `reward == 1` over the total number of completed episodes.
 
 These intentionally use the legacy validation runner because SingleController
 does not own the evaluation loop. Training itself remains entirely on
@@ -203,7 +245,8 @@ SingleController + TransferQueue.
 - A failure in `osworld-v2-node-preflight-ok` is an image, mount, submodule, or
   Ray-version problem; training has not started.
 - OpenSandbox setup failures should be diagnosed from the Gym server logs and
-  guest control API before resubmitting. Confirm that `OSWORLD_POOL_REF` exists
-  and that all compute nodes can resolve `OPENSANDBOX_DOMAIN`.
+  guest control API before resubmitting. Confirm that the API key authorizes
+  protected create/release operations, `OSWORLD_POOL_REF` exists with enough
+  warm capacity, and all compute nodes can resolve `OPENSANDBOX_DOMAIN`.
 - NeMo Gym environments are not relocatable. Keep `OSWORLD_GYM_VENV_DIR` on the
   shared destination cluster and let this image build it there.

@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$SCRIPT_DIR/runtime_env.sh"
 
 test -f "$OSWORLD_RL_ROOT/examples/nemo_gym/launch_osworld_v2_cc.py"
+test -f "$OSWORLD_RL_ROOT/examples/run_grpo.py"
 test -f "$OSWORLD_GYM_ROOT/resources_servers/osworld/app.py"
 test -f "$OSWORLD_GYM_ROOT/responses_api_agents/nemotron_osworld/cc_app.py"
 test -x "$OSWORLD_GYM_ROOT/responses_api_agents/osworld_agent/install_optional_runtime_deps.sh"
@@ -49,8 +50,39 @@ print(
 PY
 
 cd "$OSWORLD_RL_ROOT"
-"$OSWORLD_DRIVER_PYTHON" \
-  examples/nemo_gym/launch_osworld_v2_cc.py \
-  --molt-b8k8-checkpoint \
-  --validate-only \
-  "grpo.max_num_steps=${OSWORLD_GRPO_MAX_STEPS:-300}"
+if [[ -n "${OSWORLD_EVAL_MODE:-}" ]]; then
+  case "$OSWORLD_EVAL_MODE" in
+    sft)
+      eval_config=examples/nemo_gym/grpo_nemotron_omni_30ba3b_osworld_v2_inference_v1_parity.yaml
+      ;;
+    checkpoint)
+      eval_config=examples/nemo_gym/grpo_nemotron_omni_30ba3b_osworld_v2_checkpoint_inference_v1_parity.yaml
+      ;;
+    *)
+      echo "OSWORLD_EVAL_MODE must be sft or checkpoint" >&2
+      exit 2
+      ;;
+  esac
+  "$OSWORLD_DRIVER_PYTHON" - "$eval_config" <<'PY'
+import sys
+
+from omegaconf import OmegaConf
+
+from nemo_rl.algorithms.grpo import MasterConfig
+from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
+
+register_omegaconf_resolvers()
+config_path = sys.argv[1]
+resolved = OmegaConf.to_container(load_config(config_path), resolve=True)
+if not isinstance(resolved, dict):
+    raise TypeError("OSWorld evaluation recipe did not resolve to a mapping")
+MasterConfig(**resolved)
+print("osworld-v2-eval-config-ok", config_path)
+PY
+else
+  "$OSWORLD_DRIVER_PYTHON" \
+    examples/nemo_gym/launch_osworld_v2_cc.py \
+    --molt-b8k8-checkpoint \
+    --validate-only \
+    "grpo.max_num_steps=${OSWORLD_GRPO_MAX_STEPS:-300}"
+fi

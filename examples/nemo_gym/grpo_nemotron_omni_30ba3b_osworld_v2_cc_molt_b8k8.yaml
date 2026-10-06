@@ -12,6 +12,7 @@ grpo:
   # v1 trains for 300 optimizer steps over 361 x 5 prompts, so the dataloader
   # must be allowed to wrap after its first 225 complete B=8 batches.
   max_num_epochs: 100000
+  max_num_steps: 300
   baseline_population: all_owners
   reward_clip_low: 0.0
   reward_clip_high: 1.0

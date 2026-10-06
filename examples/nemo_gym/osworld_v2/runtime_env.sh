@@ -7,8 +7,12 @@ set -euo pipefail
 : "${OSWORLD_CHECKPOINT_DIR:?}"
 : "${NANO_OMNI_MODEL_NAME:?}"
 : "${NANO_OMNI_CHAT_TEMPLATE:?}"
-: "${OSWORLD_GRPO_TRAIN_DATA:?}"
 : "${OPENSANDBOX_DOMAIN:?}"
+if [[ -n "${OSWORLD_EVAL_MODE:-}" ]]; then
+  : "${OSWORLD_GRPO_VAL_DATA:?}"
+else
+  : "${OSWORLD_GRPO_TRAIN_DATA:?}"
+fi
 
 export OSWORLD_RL_ROOT=/opt/nemo-rl
 export OSWORLD_GYM_ROOT="$OSWORLD_RL_ROOT/3rdparty/Gym-workspace/Gym"
@@ -99,4 +103,8 @@ test -x "$OSWORLD_DRIVER_PYTHON"
 test -x "$OSWORLD_COMPONENT_PYTHON"
 test -r "$NANO_OMNI_MODEL_NAME/config.json"
 test -r "$NANO_OMNI_CHAT_TEMPLATE"
-test -s "$OSWORLD_GRPO_TRAIN_DATA"
+if [[ -n "${OSWORLD_EVAL_MODE:-}" ]]; then
+  test -s "$OSWORLD_GRPO_VAL_DATA"
+else
+  test -s "$OSWORLD_GRPO_TRAIN_DATA"
+fi
