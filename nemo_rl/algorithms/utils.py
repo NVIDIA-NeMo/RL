@@ -318,6 +318,40 @@ def mask_filtered_logprobs_outside_tokens(
     return torch.where(mask.bool(), logprobs, 0.0)
 
 
+def mask_out_neg_inf_logprobs(
+    logprobs: torch.Tensor, mask: torch.Tensor, logprobs_name: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mask out negative infinity log probabilities.
+
+    Handling sampling mask mismatch:
+    vLLM samples token X from top-k/p filtered distribution -> generation_logprobs[X] is always finite (e.g., -5.41)
+    during training: policy computes logprobs with same top-k/p settings, but the distribution can be slightly different
+    token X may fall outside the training policy's top-k/p set -> curr_logprobs[X] = -inf, prev_logprobs[X] = -inf
+    Detect positions with -inf in any logprobs (generation_logprobs is always finite for valid tokens)
+
+    Args:
+        logprobs: Log probabilities.
+        mask: Mask.
+        logprobs_name: Name of the logprobs tensor. Used for printing warning messages.
+
+    Returns:
+        Tuple of (masked log probabilities, finite-position indicator).
+    """
+    is_neginf = torch.isinf(logprobs)
+    neginf_count = (is_neginf & mask.bool()).sum().item()
+    if neginf_count > 0:
+        print(
+            f"[WARNING]: {neginf_count}/{int(mask.sum().item())} valid tokens have -inf in {logprobs_name} "
+            "(policy top-k/top-p mismatch). Masking out these positions."
+        )
+
+    finite_mask = (~is_neginf).float()
+    effective_mask = mask * finite_mask
+    logprobs = torch.where(effective_mask.bool(), logprobs, 0.0)
+
+    return logprobs, finite_mask
+
+
 def masked_var(
     values: torch.Tensor,
     mask: torch.Tensor,

@@ -236,7 +236,7 @@ def test_automodel_prev_logprobs_keep_support_only_on_valid_tokens():
         }
     )
 
-    logprobs = processor(
+    logprobs, updated_token_mask = processor(
         logits,
         data,
         ProcessedInputs(input_ids=input_ids, seq_len=4),
@@ -248,6 +248,7 @@ def test_automodel_prev_logprobs_keep_support_only_on_valid_tokens():
     # Prompt (row 0, pos 1) and padding (row 1, pos 3) are zeroed instead of
     # carrying -inf/NaN; valid out-of-support tokens keep -inf for the loss.
     expected = torch.tensor([[0.0, 0.0, 0.0, -torch.inf], [0.0, 0.0, -torch.inf, 0.0]])
+    torch.testing.assert_close(updated_token_mask, data["token_mask"])
     torch.testing.assert_close(logprobs, expected, rtol=0, atol=0)
 
 
@@ -339,3 +340,35 @@ def test_opd_support_exclusion_with_proximal_teacher_and_baseline(
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert actual_estimator.last_metrics == control_estimator.last_metrics
     assert all(math.isfinite(value) for value in actual_estimator.last_metrics.values())
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize("top_k", [None, 1])
+def test_megatron_prev_logprobs_preserve_shared_mask(monkeypatch, top_k):
+    # Import the optional Megatron stack only for its marked backend test.
+    from nemo_rl.models.megatron import train as module
+
+    monkeypatch.setattr(module, "get_tensor_model_parallel_group", lambda: None)
+    monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        module,
+        "from_parallel_logits_to_logprobs",
+        lambda *args, **kwargs: torch.tensor([[-torch.inf, -0.2, -torch.inf]]),
+    )
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[0, 1, 2, 0]]),
+            "token_mask": torch.tensor([[0, 1, 1, 0]]),
+            "sample_mask": torch.ones(1),
+        }
+    )
+    processor = module.LogprobsPostProcessor(
+        {"sequence_packing": {"enabled": False}},
+        sampling_params=TrainingSamplingParams(top_k=top_k),
+    )
+    _, result = processor(data, data["input_ids"], None, 3)(torch.zeros(1, 4, 3))
+    assert torch.isneginf(result["logprobs"][0, 1])
+    if top_k is not None:
+        torch.testing.assert_close(result["token_mask"], data["token_mask"][:, :3])
+    else:
+        assert "token_mask" not in result

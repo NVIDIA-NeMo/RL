@@ -51,7 +51,10 @@ from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
 )
 from transformers import PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    need_top_k_or_top_p_filtering,
+)
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossFn
 from nemo_rl.algorithms.loss.utils import rescale_loss_metrics
@@ -151,6 +154,7 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 from nemo_rl.utils.r3_trace import maybe_r3_trace_stage
+from nemo_rl.utils.tensor_ops import pad_and_concat
 from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.nccl_reshard_utils import (
     _INDIVIDUAL_EXPERT_RE,
@@ -2306,6 +2310,7 @@ class MegatronPolicyWorkerImpl(
           a BatchedDataDict with key "logprobs" and shape [batch_size, sequence_length].
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
+          "token_mask": only for top-k/top-p filtering; masked out -inf positions.
         """
         self.timer.start("get_logprobs")
         no_grad = torch.no_grad()
@@ -2373,22 +2378,26 @@ class MegatronPolicyWorkerImpl(
                 router_replay_train=False,
             )
 
-        if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
-            all_log_probs_padded = []
-            all_logprobs = [l["logprobs"] for l in list_of_logprobs]
-            for lp in all_logprobs:
-                padding_needed = seq_length - lp.shape[1]
-                if padding_needed > 0:
-                    lp = torch.nn.functional.pad(
-                        lp, (0, padding_needed), mode="constant", value=0.0
-                    )
-                all_log_probs_padded.append(lp)
+        # Taken from config; every PP rank must build the same mask for the broadcast below.
+        has_token_mask = need_top_k_or_top_p_filtering(self.sampling_params)
 
-            logprobs = torch.cat(all_log_probs_padded, dim=0)
-            tensors = {"logprobs": logprobs}
+        if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+            tensors: dict[str, Optional[torch.Tensor]] = {
+                "logprobs": pad_and_concat(
+                    [l["logprobs"] for l in list_of_logprobs], target_len=seq_length
+                )
+            }
+            if has_token_mask:
+                # Pad token_mask with 0 so padded positions are excluded from the loss.
+                tensors["token_mask"] = pad_and_concat(
+                    [l["token_mask"] for l in list_of_logprobs], target_len=seq_length
+                )
         else:
             tensors = {"logprobs": None}
-        logprobs = broadcast_tensors_from_last_stage(tensors)["logprobs"]
+            if has_token_mask:
+                tensors["token_mask"] = None
+        broadcasted = broadcast_tensors_from_last_stage(tensors)
+        logprobs = broadcasted["logprobs"]
 
         no_grad.__exit__(None, None, None)
         self.timer.stop("get_logprobs")
@@ -2400,7 +2409,10 @@ class MegatronPolicyWorkerImpl(
             pin_memory=True,
         )
         cpu_logprobs.copy_(logprobs, non_blocking=False)
-        return BatchedDataDict[LogprobOutputSpec](logprobs=cpu_logprobs)
+        result = BatchedDataDict[LogprobOutputSpec](logprobs=cpu_logprobs)
+        if has_token_mask:
+            result["token_mask"] = broadcasted["token_mask"].to("cpu")
+        return result
 
     def _resolve_output_layer_owner(self) -> Optional[Any]:
         """Return the unwrapped module owning ``output_layer``, or None off the last PP stage.
@@ -2683,29 +2695,18 @@ class MegatronPolicyWorkerImpl(
 
         teacher_full_payload = None
         if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
-            padded_logprobs = []
-            padded_payloads = []
-            for microbatch_output in list_of_outputs:
-                logprobs_mb = microbatch_output["logprobs"]
-                payload_mb = microbatch_output["teacher_full_payload"]
-                padding_needed = seq_length - logprobs_mb.shape[1]
-                if padding_needed > 0:
-                    logprobs_mb = torch.nn.functional.pad(
-                        logprobs_mb, (0, padding_needed), mode="constant", value=0.0
-                    )
-                    payload_mb = torch.nn.functional.pad(
-                        payload_mb,
-                        (0, 0, 0, padding_needed),
-                        mode="constant",
-                        value=0.0,
-                    )
-                padded_logprobs.append(logprobs_mb)
-                padded_payloads.append(payload_mb)
-            tensors = {"logprobs": torch.cat(padded_logprobs, dim=0)}
+            tensors = {
+                "logprobs": pad_and_concat(
+                    [o["logprobs"] for o in list_of_outputs], target_len=seq_length
+                )
+            }
             # Already on CPU: the post-processor moves each microbatch off the
             # device as it is produced, so this pad-and-concatenate never puts
             # the payload back on the GPU.
-            teacher_full_payload = torch.cat(padded_payloads, dim=0)
+            teacher_full_payload = pad_and_concat(
+                [o["teacher_full_payload"] for o in list_of_outputs],
+                target_len=seq_length,
+            )
         else:
             tensors = {"logprobs": None}
         logprobs = broadcast_tensors_from_last_stage(tensors)["logprobs"]
@@ -2901,20 +2902,12 @@ class MegatronPolicyWorkerImpl(
         )
 
         if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
-            logits_chunks = []
-            indices_chunks = []
-            for out in list_of_outputs:
-                tk = out["topk_logits"]
-                ti = out["topk_indices"]
-                pad_len = seq_length - tk.shape[1]
-                if pad_len > 0:
-                    tk = torch.nn.functional.pad(tk, (0, 0, 0, pad_len), value=0.0)
-                    ti = torch.nn.functional.pad(ti, (0, 0, 0, pad_len), value=0)
-                logits_chunks.append(tk)
-                indices_chunks.append(ti)
-
-            topk_logits = torch.cat(logits_chunks, dim=0)
-            topk_indices = torch.cat(indices_chunks, dim=0)
+            topk_logits = pad_and_concat(
+                [o["topk_logits"] for o in list_of_outputs], target_len=seq_length
+            )
+            topk_indices = pad_and_concat(
+                [o["topk_indices"] for o in list_of_outputs], target_len=seq_length
+            )
 
             tensors_to_broadcast = {
                 "topk_logits": topk_logits,
@@ -4709,6 +4702,14 @@ class MegatronPolicyWorkerImpl(
 
             if self.should_disable_forward_pre_hook:
                 self.disable_forward_pre_hook()
+            if self.scheduler is not None:
+                # Megatron-Bridge copies consumed_train_samples into scheduler.num_steps
+                # on checkpoint resume (override_opt_param_scheduler). This is defined
+                # as RL steps x GBS, where GBS is consistent with Bridge thus this
+                # normalizes the warmup and decay to RL steps instead of samples.
+                self.mcore_state.train_state.consumed_train_samples = (
+                    self.scheduler.num_steps
+                )
             save_checkpoint(
                 state=self.mcore_state,
                 model=[self.model],
