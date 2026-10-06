@@ -319,6 +319,45 @@ async def test_checkpoint_preserves_retry_fifo_ready_fifo_and_prefetched_batch()
 
 
 @pytest.mark.asyncio
+async def test_checkpoint_cut_survives_prefetch_before_sidecar_serialization() -> None:
+    buffer, sampler, _ = buffer_and_sampler(capacity=3)
+    await publish(buffer, "current_batch", 17)
+    await select(sampler, 17)
+    await publish(buffer, "ready_at_snapshot", 17)
+
+    async with buffer.data_plane_checkpoint_barrier.checkpoint():
+        state = buffer.metadata_state_dict(
+            saved_capacity=3, additional_groups=buffer.training_owned_replay_groups()
+        )
+        sampler.start_prefetch(dequeue_version=17, num_groups=1)
+        # The checkpoint barrier holds the prefetch claim until the cut is taken.
+        await asyncio.sleep(0)
+        assert not buffer.queue_training_groups(18)
+
+    await asyncio.wait_for(sampler.finish_prefetch(), timeout=2)
+    assert buffer.group_ids == ()
+    assert [g["group_id"] for g in buffer.queue_training_groups(18)] == [
+        "ready_at_snapshot"
+    ]
+
+    # Production writes the replay sidecar after releasing the barrier. Its
+    # contents must still describe the cut before the live prefetch advanced.
+    stream = io.BytesIO()
+    torch.save(state, stream)
+    stream.seek(0)
+    loaded, resumed, _ = await restore(torch.load(stream, weights_only=False))
+    assert loaded.group_ids == ("ready_at_snapshot",)
+    assert loaded.training_owned_group_ids() == {"current_batch"}
+    assert not loaded.queue_training_groups(18)
+    current, _ = await select(resumed, 17)
+    assert current.sample_ids == ["current_batch_g0", "current_batch_g1"]
+    resumed.start_prefetch(dequeue_version=17, num_groups=1)
+    await asyncio.wait_for(resumed.finish_prefetch(), timeout=2)
+    next_batch, _ = await select(resumed, 18)
+    assert next_batch.sample_ids == ["ready_at_snapshot_g0", "ready_at_snapshot_g1"]
+
+
+@pytest.mark.asyncio
 async def test_checkpoint_during_partial_prefetch_continues_without_duplicate_training():
     buffer, sampler, _ = buffer_and_sampler(capacity=3)
     await publish(buffer, "part1", 10)

@@ -1905,7 +1905,9 @@ class TQReplayBuffer:
         checkpoint pump runs concurrently with ``_train_pump``.
         In-flight reservations are intentionally omitted. ``additional_groups``
         is used by periodic snapshots to re-index rows claimed by an unfinished
-        streamed optimizer step.
+        streamed optimizer step. Returned metadata is detached from live replay
+        entries so checkpoint sidecars can be serialized after the barrier is
+        released, even if selection or prefetch advances in the meantime.
         """
         groups: list[TQReplayGroupMetadata] = []
         for i, ready in enumerate(self.ready_list):
@@ -1915,7 +1917,7 @@ class TQReplayBuffer:
             assert meta is not None  # commit sets meta before ready=True
             groups.append(
                 {
-                    "meta": meta,
+                    "meta": copy.deepcopy(meta),
                     "start_weight": self.start_weight_list[i],
                     "end_weight": self.end_weight_list[i],
                     "target_step": self.target_step_list[i],
