@@ -31,11 +31,7 @@ from nemo_rl.utils.venvs import make_actor_runtime_env
 class TrajectoryLoggerActor:  # pragma: no cover
     """Fetch logged rows from the data plane and record trajectories to disk."""
 
-    def __init__(
-        self,
-        dp_config: DataPlaneConfig,
-        root_dir: str,
-    ) -> None:
+    def __init__(self, dp_config: DataPlaneConfig, root_dir: str) -> None:
         self._client = build_data_plane_client(dp_config, bootstrap=False)
         self._writer = TrajectoryLogger(root_dir=root_dir)
 
@@ -57,8 +53,7 @@ class TrajectoryLoggerActor:  # pragma: no cover
 
 
 def create_trajectory_logger_actor(
-    dp_config: DataPlaneConfig,
-    root_dir: str,
+    dp_config: DataPlaneConfig, root_dir: str
 ) -> ray.actor.ActorHandle:
     """Create a log writer on the driver's node."""
     actor = TrajectoryLoggerActor.options(

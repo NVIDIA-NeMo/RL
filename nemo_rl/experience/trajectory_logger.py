@@ -75,9 +75,7 @@ def _scalar_column(value: Optional[torch.Tensor], n: int) -> np.ndarray | list[N
 
 
 def _token_column(
-    name: str,
-    value: Optional[torch.Tensor],
-    lengths: np.ndarray,
+    name: str, value: Optional[torch.Tensor], lengths: np.ndarray
 ) -> pa.Array:
     """Turn batched tokens into one Arrow list per row (= rollout)."""
     n = len(lengths)
@@ -114,12 +112,7 @@ class TrajectoryLogger:
         self._pending_path: Optional[Path] = None
 
     def record(
-        self,
-        meta: KVBatchMeta,
-        td: TensorDict,
-        *,
-        step: int,
-        chunk_index: int,
+        self, meta: KVBatchMeta, td: TensorDict, *, step: int, chunk_index: int
     ) -> None:
         """Append one chunk to the step's Parquet file."""
         n = len(meta.sample_ids)
