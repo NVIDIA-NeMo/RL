@@ -143,6 +143,45 @@ def test_run_hf_export_subprocess_raises_with_stderr_tail_on_failure():
         hf_export.run_hf_export_subprocess("m", "/ckpt", "/out", runner=fake_runner)
 
 
+def test_run_hf_export_subprocess_strips_distributed_env(monkeypatch):
+    # The Ray worker inherits distributed-launcher variables; they must not
+    # leak into the gloo subprocess (they would clash with the training
+    # process group's address/port).
+    monkeypatch.setenv("RANK", "3")
+    monkeypatch.setenv("LOCAL_RANK", "1")
+    monkeypatch.setenv("WORLD_SIZE", "4")
+    monkeypatch.setenv("MASTER_ADDR", "10.0.0.5")
+    monkeypatch.setenv("MASTER_PORT", "29500")
+    monkeypatch.setenv("PMIX_RANK", "2")
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("HF_HOME", "/root/.hf")
+    captured = {}
+
+    def fake_runner(argv, **kwargs):
+        captured["env"] = kwargs["env"]
+
+        class _R:
+            returncode = 0
+            stderr = ""
+
+        return _R()
+
+    hf_export.run_hf_export_subprocess("m", "/ckpt", "/out", runner=fake_runner)
+    env = captured["env"]
+    for var in (
+        "RANK",
+        "LOCAL_RANK",
+        "WORLD_SIZE",
+        "MASTER_ADDR",
+        "MASTER_PORT",
+        "PMIX_RANK",
+    ):
+        assert var not in env, f"{var} leaked into export subprocess"
+    # Ordinary env is inherited.
+    assert env["PATH"] == "/usr/bin"
+    assert env["HF_HOME"] == "/root/.hf"
+
+
 # ---------------------------------------------------------------------------
 # export_final_hf_checkpoint
 # ---------------------------------------------------------------------------

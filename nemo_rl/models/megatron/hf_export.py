@@ -117,7 +117,10 @@ def run_hf_export_subprocess(
     """Convert one Megatron checkpoint directory to HF format in a subprocess.
 
     The subprocess isolates ``export_model_from_megatron``'s temporary gloo
-    context from the live NCCL training process group.
+    context from the live NCCL training process group. The Ray worker inherits
+    distributed-launcher variables (``RANK``/``WORLD_SIZE``/``MASTER_ADDR``/
+    ``MASTER_PORT`` and friends) that must not leak into the subprocess: the
+    gloo context would otherwise try to reuse the training address/port.
     """
     argv = [
         sys.executable,
@@ -132,7 +135,23 @@ def run_hf_export_subprocess(
     ]
     if tokenizer_dir is not None:
         argv += ["--tokenizer-dir", str(tokenizer_dir)]
-    result = runner(argv, capture_output=True, text=True)
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key
+        not in {
+            "RANK",
+            "LOCAL_RANK",
+            "WORLD_SIZE",
+            "MASTER_ADDR",
+            "MASTER_PORT",
+            "OMPI_COMM_WORLD_SIZE",
+            "PMI_SIZE",
+            "PMI_RANK",
+            "PMIX_RANK",
+        }
+    }
+    result = runner(argv, capture_output=True, text=True, env=env)
     if result.returncode != 0:
         stderr_tail = (result.stderr or "")[-2000:]
         raise RuntimeError(
