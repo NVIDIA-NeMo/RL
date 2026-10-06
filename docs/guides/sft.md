@@ -199,7 +199,7 @@ conversations fit in one row; the loader only re-tokenizes what it is given.
 1. Pick the pack length and use it for both sides. The packer must target the
    same `data.max_input_seq_length` the training config sets.
 2. Pick the tokenizer and the prompt format and use them for both sides. The
-   loader re-tokenizes each record with `megatron_sft_prompt_format`, so a more
+   loader re-tokenizes each record with `megatron_sft.prompt_format`, so a more
    verbose tokenization than the packer's overflows the row. The loader warns
    and drops the overflowing tail rather than failing, so check the logs after
    changing either.
@@ -211,7 +211,24 @@ conversations fit in one row; the loader only re-tokenizes what it is given.
    that multiple.
 
 The processor tokenizes each record, then pads or right-truncates it to
-`data.max_input_seq_length`.
+`data.max_input_seq_length`. A reference packer uses the loader's token-count
+helper, so its row boundaries match the loader for the same tokenizer and prompt
+format. It expects raw JSONL records with a `messages` array; every conversation
+must start with `system` and end with `assistant`:
+
+```bash
+uv run examples/converters/pack_megatron_sft_jsonl.py \
+  --input /path/to/raw.jsonl \
+  --output /path/to/train.jsonl.packed \
+  --tokenizer /path/to/tokenizer \
+  --max-seq-length 262144 \
+  --prompt-format identity \
+  --context-parallel-size 16
+```
+
+Use the same tokenizer, prompt format, sequence length, and CP size for packing
+and training. The packer warns if one conversation exceeds the row length; the
+loader truncates that conversation, so inspect warnings before training.
 
 Configure the dataset and the direct packed path as follows:
 
@@ -234,26 +251,28 @@ policy:
 data:
   train:
     dataset_name: megatron_sft_packed
-    data_path: /path/to/train.jsonl
+    data_path: /path/to/train.jsonl.packed
+    megatron_sft:
+      prompt_format: identity
+      override_pad_token: null
   validation:
     dataset_name: megatron_sft_packed
-    data_path: /path/to/validation.jsonl
+    data_path: /path/to/validation.jsonl.packed
+    megatron_sft:
+      prompt_format: identity
+      override_pad_token: null
   default:
     chat_key: messages
-    megatron_sft_prompt_format: identity
-    megatron_sft_pad_token: null
-    megatron_sft_assistant_prefix_len: null
-    megatron_sft_context_parallel_size: ${policy.megatron_cfg.context_parallel_size}
 ```
 
-`megatron_sft_prompt_format` accepts `identity`, `nemotron-nano-v2`, or
-`nemotron-h-aligned`. The optional pad-token and assistant-prefix settings
-override the selected format's defaults. `identity` does not support a nonzero
-assistant prefix length.
+`megatron_sft.prompt_format` accepts `identity`, `nemotron-nano-v2`, or
+`nemotron-h-aligned`. The optional `override_pad_token` replaces the preset's
+pad token; assistant-prefix masking is defined by the prompt-format preset.
 
 For context parallelism, every conversation segment is padded to a multiple of
-`2 * context_parallel_size`. The data and policy context-parallel sizes must
-match. A direct-packed training or validation split cannot be mixed with
+`2 * context_parallel_size`. The size comes from
+`policy.megatron_cfg.context_parallel_size`, not the dataset entry. A
+direct-packed training or validation split cannot be mixed with
 regular datasets, and direct-packed SFT does not support dynamic batching,
 draft training, router replay, `sft.only_unmask_final=true`,
 `policy.sequence_packing.fuse_loss=true`, or fused linear log-probability loss. The relevant training or validation micro batch size must

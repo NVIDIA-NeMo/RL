@@ -99,7 +99,9 @@ DATASET_REGISTRY = {
 }
 
 
-def load_response_dataset(data_config: ResponseDatasetConfig):
+def load_response_dataset(
+    data_config: ResponseDatasetConfig, *, context_parallel_size: int | None = None
+):
     """Loads response dataset.
 
     Resolution order for ``data_config["dataset_name"]``:
@@ -133,8 +135,11 @@ def load_response_dataset(data_config: ResponseDatasetConfig):
     # that never calls `split_train_validation`).
     warn_on_unsupported_dataset_config_keys(dataset_class, data_config)
 
+    dataset_kwargs = dict(data_config)
+    if dataset_name == "megatron_sft_packed":
+        dataset_kwargs["context_parallel_size"] = context_parallel_size
     dataset = dataset_class(
-        **data_config  # pyrefly: ignore[missing-argument]  `data_path` is required for some classes
+        **dataset_kwargs  # pyrefly: ignore[missing-argument]  `data_path` is required for some classes
     )
 
     # bind prompt, system prompt and data processor

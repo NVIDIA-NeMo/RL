@@ -537,7 +537,7 @@ def test_setup_allows_sequence_packing_for_direct_packed_context_parallel_sft(
             )
 
 
-def test_setup_rejects_direct_packed_context_parallel_mismatch_before_side_effects(
+def test_setup_does_not_inspect_direct_packed_processor_keywords(
     mock_components,
 ):
     master_config = mock_components["master_config"]
@@ -568,8 +568,8 @@ def test_setup_rejects_direct_packed_context_parallel_mismatch_before_side_effec
         side_effect=AssertionError("setup continued into logger initialization"),
     ):
         with pytest.raises(
-            ValueError,
-            match=r"prepared for context_parallel_size=1.*context_parallel_size=2",
+            AssertionError,
+            match="setup continued into logger initialization",
         ):
             setup(
                 master_config,

@@ -17,6 +17,11 @@ from typing import Literal, NotRequired, TypedDict, Union
 from nemo_rl.data.energon.config import EnergonLoaderConfig, EnergonSourceConfig
 
 
+class MegatronSFTDatasetConfig(TypedDict):
+    prompt_format: Literal["identity", "nemotron-nano-v2", "nemotron-h-aligned"]
+    override_pad_token: NotRequired[str | None]
+
+
 class ResponseDatasetConfig(TypedDict):
     dataset_name: NotRequired[str]
     data_path: NotRequired[str]
@@ -34,16 +39,7 @@ class ResponseDatasetConfig(TypedDict):
     split_validation_size: NotRequired[float]
     # Seed for train/validation split when split_validation_size > 0
     seed: NotRequired[int]
-    # Prompt format used to reproduce Megatron-LM SFT tokenization.
-    megatron_sft_prompt_format: NotRequired[
-        Literal["identity", "nemotron-nano-v2", "nemotron-h-aligned"]
-    ]
-    # Optional tokenizer token override used to pad each fixed-length packed row.
-    megatron_sft_pad_token: NotRequired[str | None]
-    # Optional assistant-prefix token count to exclude from the training loss.
-    megatron_sft_assistant_prefix_len: NotRequired[int | None]
-    # Context-parallel size used when padding every packed segment.
-    megatron_sft_context_parallel_size: NotRequired[int]
+    megatron_sft: NotRequired[MegatronSFTDatasetConfig]
     # TODO(rohitrango): Move model-specific media controls to ProcessorInterface.
     num_frames: NotRequired[int]
     video_sampling_style: NotRequired[Literal["nemotron_vl"]]

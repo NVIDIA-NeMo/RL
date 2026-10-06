@@ -135,21 +135,6 @@ def _uses_direct_megatron_sft_packing(
     )
 
 
-def _direct_megatron_sft_context_parallel_sizes(
-    dataset: Optional[AllTaskProcessedDataset],
-) -> set[int]:
-    if dataset is None or not isinstance(dataset.task_data_processors, dict):
-        return set()
-    processor_entry = dataset.task_data_processors.get("megatron_sft_packed")
-    if not isinstance(processor_entry, tuple) or len(processor_entry) != 2:
-        return set()
-    processor = processor_entry[1]
-    if not isinstance(processor, partial) or processor.keywords is None:
-        return set()
-    context_parallel_size = processor.keywords.get("context_parallel_size")
-    return set() if context_parallel_size is None else {int(context_parallel_size)}
-
-
 def _validate_direct_megatron_sft_setup(
     master_config: MasterConfig,
     train_dataset: Optional[AllTaskProcessedDataset],
@@ -205,22 +190,6 @@ def _validate_direct_megatron_sft_setup(
     if megatron_cfg is None or not megatron_cfg["enabled"]:
         raise ValueError(
             "Direct Megatron-LM prepacked SFT requires the Megatron backend"
-        )
-    policy_context_parallel_size = int(megatron_cfg["context_parallel_size"])
-    data_context_parallel_sizes = _direct_megatron_sft_context_parallel_sizes(
-        train_dataset
-    ) | _direct_megatron_sft_context_parallel_sizes(val_dataset)
-    mismatched_context_parallel_sizes = sorted(
-        size
-        for size in data_context_parallel_sizes
-        if size != policy_context_parallel_size
-    )
-    if mismatched_context_parallel_sizes:
-        raise ValueError(
-            "Megatron-LM prepacked SFT data was prepared for "
-            f"context_parallel_size={mismatched_context_parallel_sizes[0]}, but "
-            "policy context_parallel_size="
-            f"{policy_context_parallel_size}"
         )
     if "draft" in policy_config and policy_config["draft"]["enabled"]:
         raise NotImplementedError(

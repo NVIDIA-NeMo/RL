@@ -17,6 +17,7 @@ from nemo_rl.data.megatron_sft_packed import (
     MegatronSFTPackedDatumSpec,
     _PromptConfig,
     _resolve_pad_token_id,
+    count_conversation_tokens,
     megatron_sft_packed_preprocessor,
     split_megatron_sft_conversations,
 )
@@ -183,6 +184,7 @@ def _dataset_parser() -> MegatronSFTPackedDataset:
     dataset = MegatronSFTPackedDataset.__new__(MegatronSFTPackedDataset)
     dataset.chat_key = "messages"
     dataset.task_name = "megatron_sft_packed"
+    dataset.context_parallel_size = 1
     return dataset
 
 
@@ -190,35 +192,20 @@ def _dataset_parser() -> MegatronSFTPackedDataset:
     ("data_config", "message"),
     [
         (
-            {"megatron_sft_context_parallel_size": 1},
-            "megatron_sft_prompt_format",
+            {},
+            "megatron_sft",
         ),
         (
-            {"megatron_sft_prompt_format": "identity"},
-            "megatron_sft_context_parallel_size",
+            {"megatron_sft": {}},
+            "prompt_format",
         ),
         (
-            {
-                "megatron_sft_prompt_format": "unsupported",
-                "megatron_sft_context_parallel_size": 1,
-            },
+            {"megatron_sft": {"prompt_format": "unsupported"}},
             "unknown SFT prompt format",
         ),
         (
-            {
-                "megatron_sft_prompt_format": "identity",
-                "megatron_sft_context_parallel_size": 1,
-                "megatron_sft_assistant_prefix_len": -1,
-            },
-            "megatron_sft_assistant_prefix_len must be >= 0",
-        ),
-        (
-            {
-                "megatron_sft_prompt_format": "identity",
-                "megatron_sft_context_parallel_size": 1,
-                "megatron_sft_assistant_prefix_len": 1,
-            },
-            "identity prompt format does not support assistant_prefix_len",
+            {"megatron_sft": {"prompt_format": "identity", "assistant_prefix_len": 1}},
+            "Unknown megatron_sft settings",
         ),
     ],
 )
@@ -231,6 +218,42 @@ def test_dataset_processor_rejects_invalid_packed_config_during_setup(
 
     with pytest.raises((KeyError, ValueError, NotImplementedError), match=message):
         dataset.set_processor()
+
+
+def test_dataset_processor_uses_dataset_prompt_and_policy_context_size() -> None:
+    dataset = _dataset_parser()
+    dataset.context_parallel_size = 8
+    dataset.data_config = {
+        "megatron_sft": {
+            "prompt_format": "nemotron-nano-v2",
+            "override_pad_token": "<pad>",
+        }
+    }
+
+    dataset.set_processor()
+
+    assert dataset.processor.keywords == {
+        "prompt_format": "nemotron-nano-v2",
+        "pad_token": "<pad>",
+        "context_parallel_size": 8,
+    }
+
+
+def test_count_conversation_tokens_uses_loader_tokenization() -> None:
+    messages = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "u"},
+        {"role": "assistant", "content": "a"},
+    ]
+    tokenizer = _DummyTokenizer(
+        {("system", "s"): [1], ("user", "u"): [2, 3], ("assistant", "a"): [4]}
+    )
+
+    assert count_conversation_tokens(messages, tokenizer, "identity") == 4
+    assert (
+        len(_preprocess(messages, tokenizer, 8, prompt_format="identity")["input_ids"])
+        == 8
+    )
 
 
 def _megatron_preprocess(
@@ -474,29 +497,6 @@ def test_identity_uses_unk_padding_and_supervises_all_literal_targets() -> None:
     assert tokenizer.calls[0][1]["add_generation_prompt"] is False
 
 
-def test_identity_rejects_assistant_prefix_masking() -> None:
-    messages = [
-        {"role": "system", "content": "s"},
-        {"role": "user", "content": "u"},
-        {"role": "assistant", "content": "a"},
-    ]
-    tokenizer = _DummyTokenizer(
-        {("system", "s"): [10], ("user", "u"): [20], ("assistant", "a"): [30]}
-    )
-
-    with pytest.raises(
-        ValueError,
-        match="identity prompt format does not support assistant_prefix_len",
-    ):
-        _preprocess(
-            messages,
-            tokenizer,
-            max_seq_length=5,
-            prompt_format="identity",
-            assistant_prefix_len=1,
-        )
-
-
 @pytest.mark.parametrize(
     ("messages", "turn_tokens", "expected_input_ids", "expected_target_ids"),
     [
@@ -658,7 +658,6 @@ def test_nemotron_preprocessor_rejects_prefix_longer_than_assistant_turn() -> No
             tokenizer,
             max_seq_length=8,
             prompt_format="nemotron-nano-v2",
-            assistant_prefix_len=3,
         )
 
 

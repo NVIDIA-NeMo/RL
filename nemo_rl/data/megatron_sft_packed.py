@@ -16,7 +16,7 @@
 
 import warnings
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
@@ -60,8 +60,7 @@ _PROMPT_CONFIGS = {
 
 
 def validate_megatron_sft_prompt_format(prompt_format: str) -> None:
-    if prompt_format not in _PROMPT_CONFIGS:
-        raise NotImplementedError("unknown SFT prompt format", prompt_format)
+    resolve_megatron_sft_prompt_config(prompt_format)
 
 
 class MegatronSFTPackedDatumSpec(DatumSpec):
@@ -159,31 +158,18 @@ def split_megatron_sft_conversations(
     return conversations
 
 
-def _get_prompt_config(
-    prompt_format: str | None,
-    pad_token: str | None,
-    assistant_prefix_len: int | None,
+def resolve_megatron_sft_prompt_config(
+    prompt_format: str, override_pad_token: str | None = None
 ) -> _PromptConfig:
-    if prompt_format is None:
-        raise NotImplementedError("unknown SFT prompt format", prompt_format)
-    validate_megatron_sft_prompt_format(prompt_format)
-
-    default = _PROMPT_CONFIGS[prompt_format]
-    resolved_assistant_prefix_len = (
-        default.assistant_prefix_len
-        if assistant_prefix_len is None
-        else assistant_prefix_len
-    )
-    if resolved_assistant_prefix_len < 0:
-        raise ValueError("assistant_prefix_len must be >= 0")
-    if prompt_format == "identity" and resolved_assistant_prefix_len != 0:
-        raise ValueError("identity prompt format does not support assistant_prefix_len")
-    return _PromptConfig(
-        assistant_prefix_len=resolved_assistant_prefix_len,
-        pad_token=default.pad_token if pad_token is None else pad_token,
-        chat_template=default.chat_template,
-        has_bos=default.has_bos,
-        has_system_role=default.has_system_role,
+    """Resolve the tokenizer template, pad token, and assistant mask preset."""
+    try:
+        preset = _PROMPT_CONFIGS[prompt_format]
+    except KeyError:
+        raise NotImplementedError("unknown SFT prompt format", prompt_format) from None
+    return (
+        preset
+        if override_pad_token is None
+        else replace(preset, pad_token=override_pad_token)
     )
 
 
@@ -275,6 +261,17 @@ def _tokenize_megatron_sft_conversation(
     return tokens, targets
 
 
+def count_conversation_tokens(
+    conversation: list[dict[str, Any]], tokenizer: Any, prompt_format: str
+) -> int:
+    """Count tokens with the same prompt rendering and validation as the loader."""
+    prompt_config = resolve_megatron_sft_prompt_config(prompt_format)
+    tokens, _ = _tokenize_megatron_sft_conversation(
+        conversation, tokenizer, prompt_format, prompt_config
+    )
+    return len(tokens)
+
+
 def _resolve_pad_token_id(tokenizer: Any, prompt_config: _PromptConfig) -> int:
     # An AutoProcessor exposes the text tokenizer as ``.tokenizer`` and has no
     # ``convert_tokens_to_ids`` of its own.
@@ -309,7 +306,6 @@ def megatron_sft_packed_preprocessor(
     prompt_format: str,
     context_parallel_size: int,
     pad_token: str | None = None,
-    assistant_prefix_len: int | None = None,
     **_unused_kwargs: Any,
 ) -> MegatronSFTPackedDatumSpec:
     """Build one direct tensor row with Megatron-LM ``SFTDataset`` semantics."""
@@ -326,7 +322,7 @@ def megatron_sft_packed_preprocessor(
             "packed data; set data.max_input_seq_length accordingly"
         )
 
-    prompt_config = _get_prompt_config(prompt_format, pad_token, assistant_prefix_len)
+    prompt_config = resolve_megatron_sft_prompt_config(prompt_format, pad_token)
     pack_length = max_seq_length
     pad = _resolve_pad_token_id(tokenizer, prompt_config)
     conversations = split_megatron_sft_conversations(datum_dict["packed_messages"])
