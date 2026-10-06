@@ -1,0 +1,412 @@
+# Hybrid AR + diffusion GRPO with the cross-entropy anchor term.
+#
+# Reference configuration for `policy.logprob_estimation.type: hybrid_ar_diffusion`
+# (see nemo_rl/algorithms/hybrid_ar_diffusion.py). The clean half of each sequence
+# carries the clipped policy gradient; the noisy half carries a masked
+# cross-entropy (MDM) term weighted by `ce_loss_weight`. Both are scored in a
+# single forward pass.
+#
+# This is the exact configuration behind the ablation reported in the PR:
+# training on the Nemotron-Cascade-2 RL blend, validating on the full 15,594-row
+# suite (AIME24/25/26 + HMMT + MMLU-Pro + MMLU-Redux via val_full_suite.jsonl,
+# plus IFBench via val_ifbench.jsonl). Set `ce_loss_weight: 0.0` for the RL-only
+# baseline arm; everything else is held fixed between the two.
+#
+# ---------------------------------------------------------------------------
+# NOT RUNNABLE AS-IS. Three prerequisites are not publicly available:
+#
+#   1. DIFFUSION_MODEL_PATH -- the Nemotron-Labs-Diffusion-3B checkpoint.
+#   2. DIFFUSION_DATA_ROOT  -- the Cascade-2 RL blend and the validation suite,
+#      in NeMo-Gym jsonl form.
+#   3. A diffusion-aware vLLM build that registers `NemotronLabsDiffusionModel`.
+#      Stock vLLM cannot load this architecture.
+#
+# It is included so reviewers can see every knob the feature needs and how the
+# reported numbers were produced, not as a turnkey recipe. Substitute the four
+# env placeholders (DIFFUSION_MODEL_PATH, DIFFUSION_DATA_ROOT, NEMO_GYM_ROOT,
+# NEMO_RL_ROOT) to adapt it to another masked-diffusion model.
+#
+# Two further notes:
+#   * `train_micro_batch_size` / `logprob_batch_size` are halved relative to a
+#     comparable AR run, because the [noisy | clean] layout is ~2x as wide.
+#   * Megatron-Bridge must provide the asymmetric-AR attention hooks
+#     (`set_asymmetric_ar_metadata` and friends) for this model; the worker
+#     raises at the first microbatch otherwise.
+# ---------------------------------------------------------------------------
+
+checkpointing:
+  checkpoint_dir: results/grpo-nd3b-vllm-ce0-cascade2-worker1-6k
+  checkpoint_must_save_by: null
+  enabled: true
+  higher_is_better: true
+  keep_top_k: null
+  metric_name: val:total_reward/mean
+  model_save_format: safetensors
+  save_consolidated: false
+  save_optimizer: true
+  save_period: 20
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1
+data:
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    processor: nemo_gym_data_processor
+    prompt_file: null
+    system_prompt_file: null
+  max_input_seq_length: null
+  num_workers: 1
+  shuffle: true
+  train:
+  - data_path: ${oc.env:DIFFUSION_DATA_ROOT}/Nemotron-Cascade-2-RL-data/IF-RL/train.jsonl
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    processor: nemo_gym_data_processor
+    prompt_file: null
+    seed: 42
+    split: train
+    split_validation_size: 0.05
+    system_prompt_file: null
+  - data_path: ${oc.env:DIFFUSION_DATA_ROOT}/Nemotron-Cascade-2-RL-data-fixed/MOPD_fixed.jsonl
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    processor: nemo_gym_data_processor
+    prompt_file: null
+    seed: 42
+    split: train
+    split_validation_size: 0.05
+    system_prompt_file: null
+  - data_path: ${oc.env:DIFFUSION_DATA_ROOT}/Nemotron-Cascade-2-RL-data-fixed/multi-domain-RL_fixed.jsonl
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    processor: nemo_gym_data_processor
+    prompt_file: null
+    seed: 42
+    split: train
+    split_validation_size: 0.05
+    system_prompt_file: null
+  - data_path: ${oc.env:DIFFUSION_DATA_ROOT}/Nemotron-Cascade-2-RL-data-fixed/deepscaler_train_fixed.jsonl
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    processor: nemo_gym_data_processor
+    prompt_file: null
+    seed: 42
+    split: train
+    split_validation_size: 0.05
+    system_prompt_file: null
+  use_multiple_dataloader: false
+  validation:
+  - data_path: ${oc.env:DIFFUSION_DATA_ROOT}/mcqa_val_gym/val_full_suite.jsonl
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    processor: nemo_gym_data_processor
+    prompt_file: null
+    split: test
+    system_prompt_file: null
+  - data_path: ${oc.env:DIFFUSION_DATA_ROOT}/ifbench_gym/val_ifbench.jsonl
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    processor: nemo_gym_data_processor
+    prompt_file: null
+    split: test
+    system_prompt_file: null
+env:
+  math:
+    math_verify_impl: hf_math_verify
+    num_workers: 8
+  nemo_gym:
+    config_paths:
+    - ${oc.env:NEMO_GYM_ROOT}/responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - ${oc.env:NEMO_GYM_ROOT}/resources_servers/math_with_judge/configs/math_with_judge.yaml
+    - ${oc.env:NEMO_GYM_ROOT}/resources_servers/math_with_judge/configs/math_with_judge_eval_aliases.yaml
+    - ${oc.env:NEMO_GYM_ROOT}/resources_servers/math_with_judge/configs/math_with_judge_eval_aliases_hmmt.yaml
+    - ${oc.env:NEMO_GYM_ROOT}/resources_servers/mcqa/configs/mcqa.yaml
+    - ${oc.env:NEMO_GYM_ROOT}/resources_servers/mcqa/configs/mcqa_eval_aliases.yaml
+    - ${oc.env:NEMO_GYM_ROOT}/resources_servers/ifbench/configs/ifbench.yaml
+  should_use_nemo_gym: true
+grpo:
+  adv_estimator:
+    minus_baseline: true
+    name: grpo
+    normalize_rewards: true
+    use_leave_one_out_baseline: true
+  async_grpo:
+    enabled: false
+    in_flight_weight_updates: false
+    max_trajectory_age_steps: 1
+    recompute_kv_cache_after_weight_updates: false
+  batch_multiplier: 1
+  dynamic_sampling_max_gen_batches: 10
+  max_num_epochs: 1000
+  max_num_steps: 2000
+  max_rollout_turns: 1
+  max_val_samples: null
+  normalize_rewards: true
+  num_generations_per_prompt: 8
+  num_prompts_per_step: 128
+  num_updates_per_rollout: 1
+  overlong_filtering: false
+  reward_scaling:
+    enabled: false
+    source_max: 1.0
+    source_min: 0.0
+    target_max: 1.0
+    target_min: 0.0
+  reward_shaping:
+    enabled: false
+    max_response_length: 4096
+    overlong_buffer_length: 128
+    overlong_buffer_penalty: 1
+    stop_properly_penalty_coef: null
+  seed: 42
+  seq_logprob_error_threshold: null
+  skip_reference_policy_logprobs_calculation: true
+  use_dynamic_sampling: false
+  use_leave_one_out_baseline: true
+  val_at_end: true
+  val_at_start: true
+  val_batch_size: 128
+  val_period: 20
+logger:
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+  log_dir: logs/grpo-nd3b-vllm-ce0-cascade2-worker1-6k
+  mlflow:
+    experiment_name: grpo-dev
+    run_name: sj_megatron_1B
+    tracking_uri: http://localhost:5000
+  mlflow_enabled: false
+  monitor_gpus: false
+  num_val_samples_to_print: 0
+  swanlab:
+    name: sj_megatron_1B
+    project: grpo-dev
+  swanlab_enabled: false
+  tensorboard: {}
+  tensorboard_enabled: false
+  wandb:
+    mode: online
+    name: nd3b_vllm_ce01_cascade2_deepscaler_2node_ep2
+    project: diffusion_rl
+  wandb_enabled: true
+loss_fn:
+  force_on_policy_ratio: false
+  kl_input_clamp_value: 20.0
+  kl_output_clamp_value: 10.0
+  ratio_clip_c: null
+  ratio_clip_max: 0.2
+  ratio_clip_min: 0.2
+  reference_policy_kl_penalty: 0.0
+  reference_policy_kl_type: k3
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  truncated_importance_sampling_ratio: null
+  truncated_importance_sampling_ratio_min: null
+  truncated_importance_sampling_type: tis
+  use_importance_sampling_correction: false
+  use_kl_in_reward: false
+  use_on_policy_kl_approximation: false
+policy:
+  draft:
+    aux_layer_indices: null
+    enabled: false
+    loss_weight: 0.1
+    model_name: null
+    num_layers: null
+  dtensor_cfg:
+    _v2: true
+    activation_checkpointing: false
+    automodel_kwargs: {}
+    context_parallel_size: 1
+    cpu_offload: false
+    custom_parallel_plan: null
+    enabled: false
+    lora_cfg:
+      alpha: 32
+      dim: 8
+      dropout: 0.0
+      dropout_position: post
+      enabled: false
+      exclude_modules: []
+      lora_A_init: xavier
+      match_all_linear: true
+      target_modules: []
+      use_triton: true
+    sequence_parallel: false
+    tensor_parallel_size: 1
+  dynamic_batching:
+    enabled: false
+    logprob_mb_tokens: 8192
+    sequence_length_round: 64
+    train_mb_tokens: 8192
+  generation:
+    _pad_token_id: 11
+    backend: vllm
+    colocated:
+      enabled: true
+      resources:
+        gpus_per_node: null
+        num_nodes: null
+    max_new_tokens: 6144
+    mcore_generation_config:
+      block_size_tokens: 256
+      buffer_size_gb: 10
+      enable_chunked_prefill: false
+      max_tokens: 16384
+      num_cuda_graphs: 4
+      unified_memory_level: 0
+      use_cuda_graphs_for_non_decode_steps: true
+    model_name: ${oc.env:DIFFUSION_MODEL_PATH}
+    stop_strings: null
+    stop_token_ids: null
+    temperature: 1.0
+    top_k: null
+    top_p: 1.0
+    val_temperature: 1.0
+    val_top_k: null
+    val_top_p: 1.0
+    vllm_cfg:
+      async_engine: true
+      enable_sleep_mode: true
+      enable_vllm_metrics_logger: false
+      enforce_eager: true
+      expert_parallel_size: 1
+      expose_http_server: true
+      gpu_memory_utilization: 0.55
+      kv_cache_dtype: auto
+      load_format: dummy
+      max_model_len: 6144
+      num_first_layers_in_bf16: 0
+      num_last_layers_in_bf16: 0
+      pipeline_parallel_size: 1
+      precision: bfloat16
+      skip_tokenizer_init: false
+      tensor_parallel_size: 1
+      use_deep_gemm: false
+      vllm_metrics_logger_interval: 0.5
+    vllm_kwargs:
+      attention_backend: TRITON_ATTN
+      diffusion_config: null
+      hf_overrides:
+        ar_mode: true
+        block_size: 16
+      kernel_config:
+        enable_flashinfer_autotune: false
+      max_num_seqs: 32
+  generation_batch_size: 8
+  hf_config_overrides:
+    block_size: 16
+  logprob_batch_size: 4
+  logprob_chunk_size: null
+  logprob_estimation:
+    ce_loss_weight: 0.1
+    elbo_weight_ce: true
+    exclude_mask_token_from_logits: true
+    mask_ratio_max: 0.8
+    mask_ratio_min: 0.2
+    mask_token_id: 100
+    noisy_tail_mode: mask
+    seed_base: 0
+    type: hybrid_ar_diffusion
+  make_sequence_length_divisible_by: 4
+  max_grad_norm: 1.0
+  max_total_sequence_length: 6144
+  megatron_cfg:
+    activation_checkpointing: true
+    apply_rope_fusion: true
+    bias_activation_fusion: true
+    context_parallel_size: 1
+    converter_type: Ministral3ForCausalLM
+    defer_fp32_logits: false
+    distributed_data_parallel_config:
+      data_parallel_sharding_strategy: optim_grads_params
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: true
+      overlap_param_gather: true
+      use_custom_fsdp: false
+    empty_unused_memory_level: 1
+    enabled: true
+    env_vars: {}
+    expert_model_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    force_reconvert_from_hf: false
+    fp8_cfg:
+      enabled: false
+      fp8: e4m3
+      fp8_param: false
+      fp8_recipe: blockwise
+    freeze_moe_router: true
+    gradient_accumulation_fusion: false
+    moe_enable_deepep: false
+    moe_per_layer_logging: false
+    moe_permute_fusion: true
+    moe_router_bias_update_rate: 0.0
+    moe_router_dtype: fp64
+    moe_router_load_balancing_type: none
+    moe_shared_expert_overlap: false
+    moe_token_dispatcher_type: alltoall
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    optimizer:
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_eps: 1.0e-08
+      bf16: true
+      clip_grad: 1.0
+      fp16: false
+      lr: 3.0e-07
+      min_lr: 3.0e-08
+      optimizer: adam
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+      params_dtype: float32
+      sgd_momentum: 0.9
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+      weight_decay: 0.01
+    peft:
+      a2a_experimental: false
+      alpha: 32
+      dim: 8
+      dropout: 0.0
+      dropout_position: post
+      enabled: false
+      exclude_modules: []
+      lora_A_init_method: xavier
+      lora_B_init_method: zero
+      lora_dtype: null
+      target_modules: []
+    pipeline_dtype: bfloat16
+    pipeline_model_parallel_size: 1
+    scheduler:
+      end_weight_decay: 0.01
+      lr_decay_iters: 1000
+      lr_decay_style: constant
+      lr_warmup_init: 3.0e-08
+      lr_warmup_iters: 13
+      override_opt_param_scheduler: true
+      start_weight_decay: 0.01
+      use_checkpoint_opt_param_scheduler: false
+      weight_decay_incr_style: constant
+    sequence_parallel: false
+    tensor_model_parallel_size: 1
+    train_iters: 2000
+  model_name: ${oc.env:DIFFUSION_MODEL_PATH}
+  offload_optimizer_for_logprob: false
+  optimizer: null
+  precision: bfloat16
+  scheduler: null
+  sequence_packing:
+    algorithm: modified_first_fit_decreasing
+    enabled: false
+    logprob_mb_tokens: 8192
+    sequence_length_round: 64
+    train_mb_tokens: 8192
+  tokenizer:
+    chat_template_kwargs: null
+    name: ${oc.env:DIFFUSION_MODEL_PATH}
+  train_global_batch_size: 1024
+  train_micro_batch_size: 2
+  worker_extension_cls_fqn: nemo_rl.models.policy.workers.hybrid_ar_diffusion_megatron_policy_worker.HybridARDiffusionMegatronPolicyWorker
