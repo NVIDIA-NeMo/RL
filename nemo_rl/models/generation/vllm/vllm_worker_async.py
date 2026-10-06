@@ -91,20 +91,20 @@ class _RestoredPrefixTerminal:
     """A restored call whose durable output already reached a terminal limit."""
 
     prompt_token_ids: tuple[int, ...]
-    generation_token_count: int
+    prefix_token_count: int
     reason: str
     finish_reason: Literal["stop", "length"]
     stop_reason: str | int | None = None
 
     @property
     def original_prompt_token_count(self) -> int:
-        return len(self.prompt_token_ids) - self.generation_token_count
+        return len(self.prompt_token_ids) - self.prefix_token_count
 
 
 def _classify_restored_prefix_terminal(
     *,
     prompt_token_ids: list[int],
-    generation_token_count: int,
+    prefix_token_count: int,
     requested_output_tokens: int | None,
     model_max_tokens: int,
     terminal_finish_reason: Literal["stop", "length"] | None = None,
@@ -112,20 +112,20 @@ def _classify_restored_prefix_terminal(
 ) -> _RestoredPrefixTerminal | None:
     """Classify an exact terminal prefix or reject an incompatible restore."""
     prompt_token_count = len(prompt_token_ids)
-    if generation_token_count < 0:
-        raise ValueError("generation_token_count must be non-negative")
-    if generation_token_count > prompt_token_count:
+    if prefix_token_count < 0:
+        raise ValueError("prefix_token_count must be non-negative")
+    if prefix_token_count > prompt_token_count:
         raise ValueError(
             "Durable generation prefix contains more generated tokens than the "
             "restored engine prompt."
         )
     if (
         requested_output_tokens is not None
-        and generation_token_count > requested_output_tokens
+        and prefix_token_count > requested_output_tokens
     ):
         raise ValueError(
             "Durable generation prefix token count "
-            f"({generation_token_count}) exceeds the restored request output "
+            f"({prefix_token_count}) exceeds the restored request output "
             f"budget ({requested_output_tokens})."
         )
     if prompt_token_count > model_max_tokens:
@@ -139,21 +139,21 @@ def _classify_restored_prefix_terminal(
     if terminal_finish_reason is not None:
         return _RestoredPrefixTerminal(
             prompt_token_ids=tuple(prompt_token_ids),
-            generation_token_count=generation_token_count,
+            prefix_token_count=prefix_token_count,
             reason=f"observed_{terminal_finish_reason}",
             finish_reason=terminal_finish_reason,
             stop_reason=terminal_stop_reason,
         )
     reached_output_limit = (
         requested_output_tokens is not None
-        and generation_token_count == requested_output_tokens
+        and prefix_token_count == requested_output_tokens
     )
     reached_model_capacity = prompt_token_count == model_max_tokens
     if not reached_output_limit and not reached_model_capacity:
         return None
     return _RestoredPrefixTerminal(
         prompt_token_ids=tuple(prompt_token_ids),
-        generation_token_count=generation_token_count,
+        prefix_token_count=prefix_token_count,
         reason=(
             "output_and_model_limit"
             if reached_output_limit and reached_model_capacity
@@ -1566,8 +1566,8 @@ class VllmAsyncGenerationWorkerImpl(
                         ) = _remaining_generation_limits_after_prefix(
                             max_tokens=restored_request_output_tokens,
                             min_tokens=getattr(request, "min_tokens", None),
-                            generation_token_count=(
-                                admission.generation_cut.generation_token_count
+                            prefix_token_count=(
+                                admission.generation_cut.prefix_token_count
                             ),
                         )
                         if (
@@ -1678,8 +1678,8 @@ class VllmAsyncGenerationWorkerImpl(
                     try:
                         restored_prefix_terminal = _classify_restored_prefix_terminal(
                             prompt_token_ids=final_prompt_token_ids,
-                            generation_token_count=(
-                                admission.generation_cut.generation_token_count
+                            prefix_token_count=(
+                                admission.generation_cut.prefix_token_count
                             ),
                             requested_output_tokens=restored_request_output_tokens,
                             model_max_tokens=self.model_config.max_model_len,
@@ -1694,7 +1694,7 @@ class VllmAsyncGenerationWorkerImpl(
                         raise VLLMValidationError(
                             str(error),
                             parameter="generation_prefix",
-                            value=admission.generation_cut.generation_token_count,
+                            value=admission.generation_cut.prefix_token_count,
                         ) from error
 
                 # Clamp after prefix replacement since the prompt length may have changed.
@@ -1735,7 +1735,7 @@ class VllmAsyncGenerationWorkerImpl(
                         "rollout_id=%s model_call_id=%s prefix_tokens=%d reason=%s",
                         admission.rollout_id,
                         admission.model_call_id,
-                        restored_prefix_terminal.generation_token_count,
+                        restored_prefix_terminal.prefix_token_count,
                         restored_prefix_terminal.reason,
                     )
 
@@ -1903,7 +1903,7 @@ class VllmAsyncGenerationWorkerImpl(
                         restored_prefix_terminal.original_prompt_token_count
                     )
                     response.usage.completion_tokens = (
-                        restored_prefix_terminal.generation_token_count
+                        restored_prefix_terminal.prefix_token_count
                     )
                     response.usage.total_tokens = (
                         response.usage.prompt_tokens + response.usage.completion_tokens
