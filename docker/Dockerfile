@@ -184,8 +184,12 @@ if [[ "$(uname -m)" != "x86_64" ]]; then
 fi
 # NIXL links against the CUDA driver stub, which does not live on the default
 # loader path inside the build container.
-CUDA_SO_DIR=$(dirname "$(find /usr/local -name libcuda.so.1 | head -n1)")
-export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:${CUDA_SO_DIR}"
+CUDA_SO=$(find /usr/local -name libcuda.so.1 | head -n1)
+if [[ -z "${CUDA_SO}" ]]; then
+    echo "libcuda.so.1 not found under /usr/local; NIXL cannot link against the CUDA driver" >&2
+    exit 1
+fi
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:$(dirname "${CUDA_SO}")"
 
 cd /tmp
 git clone --depth 1 -b "${NIXL_VERSION}" https://github.com/ai-dynamo/nixl.git

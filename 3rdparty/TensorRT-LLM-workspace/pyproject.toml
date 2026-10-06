@@ -11,8 +11,8 @@
 #
 # Sourced from requirements.txt on github.com/NVIDIA/TensorRT-LLM@feat/rl_rc.
 # Upstream also dropped tensorrt, onnx, onnx_graphsurgeon, opencv-python-headless,
-# and smg-grpc-proto as direct requirements on this branch (no longer listed
-# below as a result — not a nemorl-side omission).
+# nvidia-modelopt, and smg-grpc-proto as direct requirements on this branch (no
+# longer listed below as a result — not a nemorl-side omission).
 # Intentional omissions from requirements.txt:
 #   - datasets==3.1.0        → conflicts with nemorl base datasets>=4.0.0
 #   - setuptools<80          → conflicts with nemorl override setuptools>=80.10.2
@@ -22,8 +22,10 @@
 #   - build / ninja / meson / patchelf  → build-time only, not runtime deps
 #   - cuda-core              → included in cuda-python>=13
 #   - graphviz / polygraphy / mcp  → optional dev/test tools
-#   - PyNvVideoCodec~=2.1.0  → no aarch64/py3.13 wheel in that range (PyPI has
-#                              2.0.5 then 2.2.0). Only tensorrt_llm/media/decoding.py
+#   - PyNvVideoCodec~=2.1.0  → 2.1.0 ships no cp313 wheel on any platform
+#                              (cp38/310/311/312 only) and no sdist, so it is
+#                              uninstallable on this py3.13 venv.
+#                              Only tensorrt_llm/media/decoding.py
 #                              imports it, function-locally, for Cosmos video
 #                              decode; LLM inference never touches it. Also
 #                              stripped from requirements.txt by
@@ -40,6 +42,12 @@
 #     deliberately: the override exists to keep cudnn-frontend consistent with
 #     the nvidia-cublas / nvidia-cudnn-cu13 pins shared by the training venv,
 #     and raising it here would move all of them.
+#   - apache-tvm-ffi==0.1.13.post2 (upstream) vs. nemorl's override-dependencies
+#     pin of apache-tvm-ffi==0.1.11 (root pyproject.toml). The override is global
+#     and wins silently, so this venv resolves 0.1.11.
+#   - xgrammar==0.1.32 (upstream) vs. nemorl's override-dependencies pin of
+#     xgrammar>=0.2.1,<1.0.0 (root pyproject.toml), raised for vLLM
+#     compatibility. Same story: this venv resolves 0.2.7, not 0.1.32.
 
 [project]
 name = "tensorrt-llm"

@@ -28,6 +28,11 @@ def _extension(backend):
     extension = backend.NcclExtension.__new__(backend.NcclExtension)
     module = MagicMock()
     module._weights_removed = False
+    # WorkerExtension._refit_modules skips any module whose `_orig_mod` is not
+    # None -- its marker for a torch.compile wrapper. A bare MagicMock
+    # auto-creates that attribute, so the module would be skipped and the
+    # finalize hooks would never fire. Delete it so the mock looks unwrapped.
+    del module._orig_mod
     model = MagicMock()
     model.modules.return_value = [module]
     model_loader = MagicMock()
@@ -94,11 +99,6 @@ def test_collective_refit_runs_at_async_engine_boundary(
     from nemo_rl.models.generation.trtllm import trtllm_backend as backend
 
     extension, module, model, model_loader, engine = _extension(backend)
-    # Force the manual finalize fallback so the asserted call order holds
-    # regardless of whether the installed TRT-LLM has finalize_weight_update.
-    monkeypatch.setattr(
-        backend.WorkerExtension, "finalize_weight_update", None, raising=False
-    )
     call_order = []
 
     def packed_consumer(*, iterator, group, src, post_unpack_func):

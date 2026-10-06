@@ -142,16 +142,14 @@ git lfs pull
 git submodule update --init --recursive --depth=1
 
 # requirements.txt patches:
-#   - relax any `setuptools<80` ceiling. Modern setuptools (>=80) is required by
+#   - remove `setuptools<80` ceiling. Modern setuptools (>=80) is required by
 #     several of our other dependencies (e.g. transformer-engine build deps);
-#     downgrading creates an unresolvable conflict in the venv. Not asserted:
-#     tekit de0cf4d8a ("Removed detailed version specification to avoid
-#     dependency misalignment") already ships `setuptools>=80`, so on current
-#     refs there is nothing left to rewrite.
+#     downgrading creates an unresolvable conflict in the venv.
+assert_patch_target requirements.txt 'setuptools<80'
 sed -i 's|^setuptools<80$|setuptools|' requirements.txt
 
-#   - drop PyNvVideoCodec. PyPI has no wheel in the pinned ~=2.1.0 range for
-#     aarch64/py3.13 (it jumps 2.0.5 -> 2.2.0), so build_wheel.py's
+#   - drop PyNvVideoCodec. The pinned ~=2.1.0 range admits only 2.1.0, which
+#     ships no cp313 wheel on any platform and no sdist, so build_wheel.py's
 #     `pip install -r requirements-dev.txt` aborts before cmake ever runs.
 #     Nothing in this build path decodes video. Not asserted: the pin only
 #     appeared after 1.3.0rc21, so older refs legitimately lack the line.
