@@ -172,6 +172,28 @@ sbatch ray.sub \
     **Watch segment divisibility.** With topology-aware placement the allocation
     becomes `--nodes=N+1`, which can trip the "`SEGMENT_SIZE` must evenly divide
     `NUM_NODES`" check in `tools/launch`.
+* - `NRL_NCCL_TOPOLOGY_ACTION=auto`
+  - Controls the NCCL HCA topology check that runs on every node before Ray
+    starts. The default `auto` mode repairs `NCCL_IB_HCA` only when the cluster
+    provides a trusted device list; otherwise it warns or skips without changing
+    the environment. Set this to `warn` to prohibit repair, `repair` to require a
+    validated trusted source and rewrite a mismatch, `strict` to reject invalid
+    or mismatched exact HCA selections, or `off` to disable the check. Each node
+    writes a sanitized report under the job log directory in `nccl-topology/`.
+* - `NRL_NCCL_EXPECTED_HCAS`
+  - Optional cluster-admin-owned exact HCA allowlist. When this is present and
+    every listed HCA and port exists and is active, the default `auto` mode
+    replaces a mismatched `NCCL_IB_HCA` before Ray starts. Use the NCCL exact
+    selector format, for example `=hca0:1,hca1:1`; do not put cluster-specific
+    HCA names in shared recipes.
+* - `NRL_NCCL_HCA_REPAIR_SOURCE`
+  - Optional trusted-source declaration. Set this to `ucx` only when the cluster
+    guarantees that `UCX_NET_DEVICES` is the authoritative GPU-data HCA list.
+    This lets `auto` normalize that list into NCCL's exact-match syntax after
+    validating every device and port. Without this declaration, a NCCL/UCX
+    mismatch produces a warning and is not automatically changed. Declaring
+    `ucx` without `UCX_NET_DEVICES`, or using an unsupported source value,
+    fails validation before Ray starts.
 * - `BASE_LOG_DIR=$SLURM_SUBMIT_DIR`
   - Base directory for storing Ray logs. Defaults to the Slurm submission directory ([SLURM_SUBMIT_DIR](https://slurm.schedmd.com/sbatch.html#OPT_SLURM_SUBMIT_DIR)).
 * - `NODE_MANAGER_PORT=1301`
