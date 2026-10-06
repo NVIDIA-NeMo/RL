@@ -1334,7 +1334,7 @@ def test_nemo_gym_distillation_runner_uses_setup_actor():
         teacher={},
         loss_fn={},
         distillation=DistillationConfig(max_val_samples=None),
-        data={},
+        data={"train": {}},
         env={"should_use_nemo_gym": True, "nemo_gym": {}},
         logger=LoggerConfig(log_dir="/tmp/logs"),
         checkpointing={"enabled": False},
