@@ -48,15 +48,17 @@ policy:
   max_total_sequence_length: 16384
 
   dtensor_cfg:
-    enabled: true
-    activation_checkpointing: true
-    tensor_parallel_size: 1
-    context_parallel_size: 1
-    automodel_kwargs:
-      force_hf: true
+    enabled: false
 
   megatron_cfg:
-    enabled: false
+    # SingleController's TransferQueue streaming path uses the split training
+    # lifecycle implemented by the Megatron worker (begin/microbatch/finish).
+    enabled: true
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 1
+    context_parallel_size: 1
+    sequence_parallel: false
 
   sequence_packing:
     enabled: false

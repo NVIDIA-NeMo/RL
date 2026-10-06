@@ -35,6 +35,10 @@ def test_anyterminal_multi_harness_recipe_resolves_async_training_contract():
     assert config["grpo"]["async_grpo"] is None
     assert config["async_rl"]["sampler"]["max_lookahead_versions"] == 1
     assert config["data_plane"]["enabled"] is True
+    assert config["policy"]["dtensor_cfg"]["enabled"] is False
+    assert config["policy"]["megatron_cfg"]["enabled"] is True
+    assert config["policy"]["megatron_cfg"]["tensor_model_parallel_size"] == 1
+    assert config["policy"]["megatron_cfg"]["pipeline_model_parallel_size"] == 1
     assert config["token_capture"] == {
         "enabled": True,
         "staging_partition": "rollout_staging",
