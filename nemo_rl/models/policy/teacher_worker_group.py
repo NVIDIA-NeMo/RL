@@ -163,6 +163,19 @@ class TeacherWorkerGroup:
         for key, value in teacher_cfg.megatron_cfg_overrides.items():
             cfg["megatron_cfg"][key] = value
 
+        # A teacher's MODEL comes from its own checkpoint: only keys the user
+        # explicitly wrote for this teacher may be applied onto its model
+        # provider. The clone of the student's config above is kept only for
+        # data-pipeline fields (packing, chunking, precision, ...), which must
+        # match the student's batches; its model-architecture keys (towers,
+        # mtp, ...) must not leak onto a possibly different architecture.
+        # setup.py / community_import.py consult this allowlist when building
+        # teacher providers; student configs carry no allowlist and behave as
+        # before.
+        cfg["megatron_cfg"]["_provider_override_allowlist"] = sorted(
+            teacher_cfg.megatron_cfg_overrides.keys()
+        )
+
         # Teachers run Megatron inference-only. Don't let the student's other
         # backend or parameter-adding features leak onto the frozen teacher.
         if cfg.get("automodel_cfg", {}).get("enabled", False):
