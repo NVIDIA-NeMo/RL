@@ -203,9 +203,13 @@ Finally, both sides build their `hf_to_local_param_map`: a mapping from each bul
 parameter name to a `LocalParamSpec(base, pre, post)` describing how that parameter is
 realized **locally**:
 
-* On the **training side**, a direct parameter's `base` is the live TP/EP-local shard
-  (sent as-is); grouped MoE experts get a `pre` hook that stacks this rank's per-expert
-  views into a `[num_local_experts, ...]` tensor fresh at each refit.
+* On the **training side**, a direct BF16 parameter's `base` is the live TP/EP-local
+  shard (sent as-is). Quantized sources are dequantized in `pre`, using a per-layer
+  source cache so gate/up views and grouped expert members sharing a training
+  parameter dequantize it only once. The refit loop clears this cache after each
+  layer, including on exceptions. Grouped MoE experts get a `pre` hook that
+  materializes this rank's per-expert specs and stacks them into a
+  `[num_local_experts, ...]` tensor fresh at each refit.
 * On the **generation side**, a direct parameter's `base` is the live vLLM parameter
   (received into in place). Conventional fused parameters use `pre`/`post` hooks to
   receive a component and copy it into the appropriate local region. BF16
@@ -222,9 +226,10 @@ Every training step (with in-flight weight updates, concurrently with generation
 * `post` contains a function that should be executed in-flight after the refit.
 
 * The **training side** walks `per_layer_params`, skipping parameters owned by other PP
-  stages. For each parameter it resolves the `LocalParamSpec`, runs `pre` (expert
-  stacking) if present, wraps the local shard in a `DTensorRef` (which reports the
-  *global* shape while holding only the local tensor), and calls
+  stages. For each parameter it resolves the `LocalParamSpec`, runs `pre`
+  (dequantization or expert stacking) if present, wraps the local shard in a
+  `DTensorRef` (which reports the *global* shape while holding only the local tensor),
+  and calls
   `xferdtensor(src, src_mesh, src_placements, None, dst_mesh, dst_placements, group,
   stream)`.
 * The **generation side** walks the same metadata in the same order — every rank in a
@@ -268,7 +273,8 @@ generation side maps those HF names onto whatever its own storage layout is.
 
 * **Training side** (`megatron_policy_worker.py`): producing the HF-named state-dict
   metadata; building `hf_to_local_param_map` — resolving each HF name to the local
-  Megatron tensor view and providing the grouped-MoE `pre` stacking hook; the
+  Megatron tensor view and providing `pre` hooks for quantized-source
+  dequantization with a per-layer cache and grouped-MoE stacking; the
   `init_collective` / `init_nccl_reshard_comm_group` bootstrap methods; the
   `nccl_reshard_refit()` send loop; the misc packed-broadcast producer.
 * **Generation side** (`vllm_backend.py`): building `hf_to_local_param_map` — mapping HF

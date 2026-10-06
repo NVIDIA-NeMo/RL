@@ -14,8 +14,8 @@
 
 """Unit tests for train-side expert source grouping and materialization.
 
-``_group_experts`` (``MegatronPolicyWorkerImpl``) records this rank's local
-per-expert sources for one projection. The refit loop materializes and stacks
+``_group_experts`` (``MegatronPolicyWorkerImpl``) creates a ``pre`` hook that
+materializes this rank's local per-expert sources for one projection and stacks
 them into ``[E_local, ...]``. Plain CPU tensors suffice for the BF16 path.
 
 Importing ``megatron_policy_worker`` pulls in megatron.core, so this is
@@ -34,6 +34,7 @@ pytest.importorskip("megatron.bridge")
 
 from nemo_rl.models.policy.workers.megatron_policy_worker import (  # noqa: E402
     MegatronPolicyWorkerImpl,
+    _materialize_refit_spec,
 )
 from nemo_rl.weight_sync.nccl_reshard_utils import LocalParamSpec  # noqa: E402
 
@@ -43,7 +44,7 @@ pytestmark = pytest.mark.mcore
 def _group(proj, grouped_name, expert_groups):
     worker = object.__new__(MegatronPolicyWorkerImpl)
     grouped = worker._group_experts(proj, grouped_name, expert_groups)
-    return worker._materialize_local_refit_spec(LocalParamSpec(base=grouped), {}).buf
+    return _materialize_refit_spec(grouped).buf
 
 
 def test_group_experts_stacks_in_order():
@@ -68,13 +69,13 @@ def test_group_experts_stacks_in_order():
 
 def test_group_experts_missing_group_raises():
     groups = {("other.experts", "gate_proj"): [LocalParamSpec(base=torch.randn(8, 8))]}
-    with pytest.raises(AssertionError):
+    with pytest.raises(AssertionError, match="no local experts.*PP-filter"):
         _group("gate_proj", "model.layers.0.mlp.experts.gate_proj.weight", groups)
 
 
 def test_group_experts_empty_group_raises():
     prefix = "model.layers.0.mlp.experts"
-    with pytest.raises(AssertionError):
+    with pytest.raises(AssertionError, match="no local experts.*PP-filter"):
         _group("gate_proj", f"{prefix}.gate_proj.weight", {(prefix, "gate_proj"): []})
 
 
@@ -98,10 +99,10 @@ def test_build_hf_to_local_param_map_train_side():
     direct = torch.randn(8, 16)  # a dense FFN down_proj local shard view
     e0 = torch.randn(128, 16)  # this rank's local expert 0 gate_proj
     e1 = torch.randn(128, 16)  # local expert 1 gate_proj
-    w._iter_local_hf_param_shards = lambda: [
+    w._iter_local_hf_param_shards = lambda source_cache: [
         ("model.layers.0.mlp.down_proj.weight", LocalParamSpec(base=direct)),
-        (f"{prefix}.0.gate_proj.weight", LocalParamSpec(base=e0)),
         (f"{prefix}.1.gate_proj.weight", LocalParamSpec(base=e1)),
+        (f"{prefix}.0.gate_proj.weight", LocalParamSpec(base=e0)),
     ]
     refit_info = {
         "layer_names": ["model.layers.0"],
@@ -127,10 +128,18 @@ def test_build_hf_to_local_param_map_train_side():
     d = pmap.get("model.layers.0.mlp.down_proj.weight")
     assert d.base is direct and d.pre is None and d.post is None
 
-    # Grouped expert: the base recipe retains the per-expert live views and the
-    # refit loop stacks them into [E_local, ...] on each refit.
+    # Grouped expert: pre stacks live views in expert-index order on each refit,
+    # even when the shard iterator supplies those experts in a different order.
     g = pmap.get(f"{prefix}.gate_proj.weight")
-    assert g.pre is None
-    ctx = w._materialize_local_refit_spec(g, {})
+    assert g.base is None and g.pre is not None and g.post is None
+    ctx = _materialize_refit_spec(g)
     assert ctx.buf.shape == (2, 128, 16)
     assert torch.equal(ctx.buf[0], e0) and torch.equal(ctx.buf[1], e1)
+
+    direct.add_(1)
+    e0.add_(2)
+    e1.add_(3)
+    assert _materialize_refit_spec(d).buf is direct
+    refreshed = _materialize_refit_spec(g).buf
+    assert torch.equal(refreshed[0], e0) and torch.equal(refreshed[1], e1)
+    assert not torch.equal(refreshed, ctx.buf)

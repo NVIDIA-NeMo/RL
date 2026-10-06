@@ -20,8 +20,8 @@ import time
 import warnings
 from collections import OrderedDict, defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from dataclasses import dataclass, replace
-from typing import Any, Iterable, Iterator, Optional, TypeVar, cast
+from dataclasses import replace
+from typing import Any, Callable, Iterable, Iterator, Optional, TypeVar, cast
 
 log = logging.getLogger(__name__)
 
@@ -316,19 +316,31 @@ def _get_refit_task_source(task: Any) -> Optional[torch.Tensor]:
     return source
 
 
-@dataclass(frozen=True)
-class _QuantizedRefitSource:
-    """A live quantized parameter plus the Bridge view to transfer."""
+class _RefitLayerSourceCache:
+    """Logical training sources shared by pre hooks until a layer is transferred."""
 
-    tensor: torch.Tensor
-    spec: Any
+    def __init__(self) -> None:
+        self._sources: dict[int, torch.Tensor] = {}
+
+    def get_or_create(
+        self,
+        tensor: torch.Tensor,
+        fn: Callable[[torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
+        """Materialize each live source tensor at most once per layer."""
+        source_id = id(tensor)
+        if source_id not in self._sources:
+            self._sources[source_id] = fn(tensor)
+        return self._sources[source_id]
+
+    def clear(self) -> None:
+        """Release logical sources after a layer, including on transfer failure."""
+        self._sources.clear()
 
 
-@dataclass(frozen=True)
-class _GroupedRefitSource:
-    """Local expert source specs that must be stacked before transfer."""
-
-    specs: tuple[LocalParamSpec, ...]
+def _materialize_refit_spec(spec: LocalParamSpec) -> RefitCtx:
+    """Run a spec's pre hook or transfer its base as-is, as the receivers do."""
+    return spec.pre(spec.base) if spec.pre is not None else RefitCtx(buf=spec.base)
 
 
 def _collect_mtp_hf_layer_names(conversion_tasks: Optional[list]) -> set[str]:
@@ -3330,44 +3342,21 @@ class MegatronPolicyWorkerImpl(
             yield param_name, scale_tensor
 
     def _local_refit_source_spec(
-        self, tensor: torch.Tensor, spec: Any
+        self, tensor: torch.Tensor, spec: Any, source_cache: _RefitLayerSourceCache
     ) -> LocalParamSpec:
         """Build a live source spec for a BF16 or TE-quantized parameter."""
         if not _is_quantized_refit_source(tensor):
             return LocalParamSpec(base=spec.select(tensor))
 
-        return LocalParamSpec(base=_QuantizedRefitSource(tensor, spec))
+        def pre(base: torch.Tensor) -> RefitCtx:
+            logical = source_cache.get_or_create(base, _dequantize_refit_source)
+            return RefitCtx(buf=spec.select(logical).contiguous())
 
-    def _materialize_local_refit_spec(
-        self,
-        spec: LocalParamSpec,
-        logical_source_cache: dict[int, torch.Tensor],
-    ) -> RefitCtx:
-        """Materialize one local source, reusing quantized-source dequantization within a layer."""
-        base = spec.base
-        if isinstance(base, _QuantizedRefitSource):
-            source_id = id(base.tensor)
-            logical = logical_source_cache.get(source_id)
-            if logical is None:
-                logical = _dequantize_refit_source(base.tensor)
-                logical_source_cache[source_id] = logical
-            return RefitCtx(buf=base.spec.select(logical).contiguous())
-        if isinstance(base, _GroupedRefitSource):
-            return RefitCtx(
-                buf=torch.stack(
-                    [
-                        self._materialize_local_refit_spec(
-                            expert_spec, logical_source_cache
-                        ).buf
-                        for expert_spec in base.specs
-                    ]
-                )
-            )
-        if spec.pre is not None:
-            return spec.pre(base)
-        return RefitCtx(buf=base)
+        return LocalParamSpec(base=tensor, pre=pre)
 
-    def _iter_local_hf_param_shards(self) -> Iterator[tuple[str, LocalParamSpec]]:
+    def _iter_local_hf_param_shards(
+        self, source_cache: _RefitLayerSourceCache
+    ) -> Iterator[tuple[str, LocalParamSpec]]:
         """Yield (hf_name, local_tp_shard) for this rank's locally owned FFN params.
 
         Used by the nccl_reshard_refit bulk path (``build_hf_to_local_param_map``).
@@ -3378,7 +3367,8 @@ class MegatronPolicyWorkerImpl(
         Unlike ``_iter_params_with_optional_kv_scales`` (PP broadcast + TP gather
         via ``export_hf_weights``), this yields TP-local source specs directly
         from the Megatron params — no collectives. BF16 specs retain live tensor
-        views; quantized specs materialize logical BF16 during each refit. EP:
+        views; quantized pre hooks materialize logical BF16 during each refit,
+        sharing ``source_cache`` until the refit loop clears it per layer. EP:
         ``refit_conversion_tasks`` already holds only this rank's local experts;
         PP non-local params have ``param_weight is None``.
 
@@ -3408,7 +3398,7 @@ class MegatronPolicyWorkerImpl(
                 if is_nccl_reshard_param(spec.name):
                     yield (
                         spec.name,
-                        self._local_refit_source_spec(local_tensor, spec),
+                        self._local_refit_source_spec(local_tensor, spec, source_cache),
                     )
 
     # ------------------------------------------------------------------
@@ -3923,7 +3913,8 @@ class MegatronPolicyWorkerImpl(
         """Group this rank's local expert params into stack-ready source specs.
 
         Keyed by (prefix, proj_type) and resolved to ordered ``param_map``
-        specs ready for per-refit materialization and ``torch.stack``.
+        specs ready for materialization and ``torch.stack`` in the group's
+        ``pre`` hook at each refit.
 
         Megatron exposes each expert's projection as a separate param; this bins
         them so ``_group_experts`` can stack a layer's experts into one grouped
@@ -3960,21 +3951,35 @@ class MegatronPolicyWorkerImpl(
                 index_groups.setdefault((m.group(1), m.group(3)), []).append(
                     (int(m.group(2)), name)
                 )
-        # Sort by expert index, then resolve each name to its param_map view once.
+        # Sort by expert index, then resolve each name to its live source spec once.
         return {
             key: [param_map[n] for _, n in sorted(idx_names)]
             for key, idx_names in index_groups.items()
         }
 
-    def _group_experts(self, proj, grouped_name, expert_groups):
-        """Describe local experts that must be stacked into ``[E_local, ...]``."""
+    def _group_experts(
+        self,
+        proj: str,
+        grouped_name: str,
+        expert_groups: dict[tuple[str, str], list[LocalParamSpec]],
+    ) -> LocalParamSpec:
+        """Build a pre hook that stacks local experts into ``[E_local, ...]``."""
         prefix = grouped_name.rsplit(f".{proj}.weight", 1)[0]
         expert_specs = expert_groups.get((prefix, proj))
         assert expert_specs, (
             f"no local experts for {grouped_name!r} (proj={proj!r}); "
             "PP-filter / expert-group-metadata inconsistency"
         )
-        return _GroupedRefitSource(tuple(expert_specs))
+        members = tuple(expert_specs)
+
+        def pre(base: Any) -> RefitCtx:
+            return RefitCtx(
+                buf=torch.stack(
+                    [_materialize_refit_spec(member).buf for member in members]
+                )
+            )
+
+        return LocalParamSpec(base=None, pre=pre)
 
     def _build_source_hf_to_local_param_map(
         self, refit_info: dict[str, Any]
@@ -3983,19 +3988,17 @@ class MegatronPolicyWorkerImpl(
 
         Wraps this rank's local Megatron shards into ``LocalParamSpec``s:
         - direct: ``base`` is sharded local tensor view, sent as-is.
-        - quantized: ``base`` defers logical view materialization until refit.
-        - grouped MoE expert: ``base`` holds the ordered per-expert specs, which
-          are materialized and stacked into ``[E_local, ...]`` each refit.
+        - quantized: ``base`` is the live parameter; ``pre`` materializes its
+          logical view using a source cache shared within each layer.
+        - grouped MoE expert: ``pre`` materializes the ordered per-expert specs
+          and stacks them into ``[E_local, ...]`` each refit.
         """
-        # This rank's local TP/EP HF param shards (live views), and the
-        # per-expert views grouped for torch.stack.  Build-time only.
-        param_map = dict(self._iter_local_hf_param_shards())
+        # Capture this map's cache explicitly in its pre hooks. The transfer loop
+        # clears it after every layer so no logical weights survive a refit.
+        source_cache = _RefitLayerSourceCache()
+        self._refit_layer_source_cache = source_cache
+        param_map = dict(self._iter_local_hf_param_shards(source_cache))
         expert_groups = self._build_expert_groups(param_map)
-
-        def _expert_spec(proj, grouped_name):
-            return LocalParamSpec(
-                base=self._group_experts(proj, grouped_name, expert_groups)
-            )
 
         mapping = {}
         for layer_name in refit_info["layer_names"]:
@@ -4004,7 +4007,9 @@ class MegatronPolicyWorkerImpl(
                     continue
                 name = p["name"]
                 if p.get("grouped_expert_proj"):
-                    mapping[name] = _expert_spec(p["grouped_expert_proj"], name)
+                    mapping[name] = self._group_experts(
+                        p["grouped_expert_proj"], name, expert_groups
+                    )
                 else:
                     spec = param_map.get(name)
                     if spec is None:
@@ -4121,15 +4126,10 @@ class MegatronPolicyWorkerImpl(
         # Keep this local because xferdtensor probes optional NCCL M-to-N bindings.
         from nemo_rl.weight_sync.xferdtensor import DTensorRef, xferdtensor
 
-        # MXFP8 source dequantization, grouped-MoE stacking, and spec.post enqueue
-        # on this worker's current stream; xferdtensor uses the same stream.
+        # Source pre hooks and spec.post enqueue on this worker's current stream;
+        # xferdtensor uses the same stream.
         nccl_reshard_stream = torch.cuda.current_stream()
         for layer_name in self.nccl_reshard_refit_info["layer_names"]:
-            # Gate/up and grouped expert specs in one logical layer can share a
-            # training parameter. Keep those materializations only until every
-            # parameter in the layer has been enqueued, rather than retaining a
-            # model-sized BF16 cache for the full refit.
-            logical_source_cache: dict[int, torch.Tensor] = {}
             try:
                 for param_info in self.nccl_reshard_refit_info["per_layer_params"][
                     layer_name
@@ -4144,7 +4144,7 @@ class MegatronPolicyWorkerImpl(
                     assert spec is not None, (
                         f"no spec for {param_info['name']!r} in hf_to_local_param_map"
                     )
-                    ctx = self._materialize_local_refit_spec(spec, logical_source_cache)
+                    ctx = _materialize_refit_spec(spec)
                     assert ctx.buf is not None, (
                         f"no local tensor for {param_info['name']!r}"
                     )
@@ -4168,7 +4168,7 @@ class MegatronPolicyWorkerImpl(
             finally:
                 # Never retain stale BF16 materializations across layers or
                 # optimizer steps.
-                logical_source_cache.clear()
+                self._refit_layer_source_cache.clear()
 
         sync_stream_within(
             nccl_reshard_stream, refit_timeout_s, "the bulk parameter transfer"
