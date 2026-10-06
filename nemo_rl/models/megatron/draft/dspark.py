@@ -12,19 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Small checkpoint-compatible heads used by DSpark block drafting.
+"""DSpark heads and their checkpoint key contract.
 
-``DSparkMarkovHead`` and ``DSparkConfidenceHead`` are constructed by the DSpark
-draft provider added in PR #3726.
+This module defines the Markov and confidence heads. It does not connect them
+to a trainer or draft provider. Attach the modules under ``markov_head`` and
+``confidence_head`` to create the checkpoint key prefixes. Keep ``markov_w1``,
+``markov_w2``, and ``proj``. The ``markov_w2.weight`` shape is
+``[draft_vocab_size, markov_rank]`` before TP sharding.
 
-The parameter names ``markov_w1`` / ``markov_w2`` / ``proj``, and the
-``nn.Linear(markov_rank, draft_vocab)`` orientation that makes ``markov_w2.weight``
-come out ``[draft_vocab, markov_rank]``, are an interop contract with the official
-``deepseek-ai/dspark_qwen3_8b_block7`` checkpoint (revision ``03326e50``). Callers
-must additionally attach these modules under the ``markov_head`` / ``confidence_head``
-attribute names, since those become the checkpoint key prefixes. Renaming any of the
-above silently breaks loading of the official artifact; the pinned schema lives in
+The pinned schema for ``deepseek-ai/dspark_qwen3_8b_block7`` is in
 ``tests/unit/models/megatron/fixtures/dspark_qwen3_8b_block7_03326e50.json``.
+See ``docs/design-docs/dspark-auxiliary-heads.md`` for inputs, TP behavior, and
+the limits of the checkpoint test.
 """
 
 from __future__ import annotations

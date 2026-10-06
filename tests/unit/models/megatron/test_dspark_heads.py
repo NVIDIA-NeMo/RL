@@ -22,6 +22,8 @@ import json
 import sys
 from pathlib import Path
 from types import ModuleType
+from typing import cast
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -574,6 +576,73 @@ def test_markov_head_has_explicit_tp_local_vocab_contract() -> None:
             draft_vocab_start_index=12,
             draft_vocab_end_index=6,
         )
+
+
+@pytest.mark.parametrize(("start", "end"), [(0, 4), (6, 8)])
+def test_markov_head_rejects_invalid_tp_shards(
+    monkeypatch: pytest.MonkeyPatch, start: int, end: int
+) -> None:
+    group = cast(dist.ProcessGroup, object())
+    monkeypatch.setattr(dist, "get_world_size", lambda _group: 2)
+    monkeypatch.setattr(dist, "get_rank", lambda _group: 1)
+
+    with pytest.raises(ValueError, match="even rank-local partition"):
+        DSparkMarkovHead(
+            target_vocab_size=12,
+            draft_vocab_size=8,
+            markov_rank=3,
+            draft_vocab_start_index=start,
+            draft_vocab_end_index=end,
+            tensor_parallel_group=group,
+        )
+
+
+def test_markov_head_sets_tp_shard_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    group = cast(dist.ProcessGroup, object())
+    monkeypatch.setattr(dist, "get_world_size", lambda _group: 2)
+    monkeypatch.setattr(dist, "get_rank", lambda _group: 1)
+
+    with patch.dict(sys.modules):
+        _install_tensor_parallel_layers_stub()
+        head = DSparkMarkovHead(
+            target_vocab_size=12,
+            draft_vocab_size=8,
+            markov_rank=3,
+            draft_vocab_start_index=4,
+            draft_vocab_end_index=8,
+            tensor_parallel_group=group,
+        )
+
+    assert head.markov_w2.weight.shape == (4, 3)
+    assert head.markov_w2.weight.tensor_model_parallel is True
+    assert head.markov_w2.weight.partition_dim == 0
+    assert head.markov_w2.weight.partition_stride == 1
+
+    previous_token_ids = torch.tensor([2, 9], dtype=torch.int64)
+    slot_valid = torch.tensor([True, False])
+    embeddings = head.embed_previous_tokens(
+        previous_token_ids=previous_token_ids,
+        slot_valid=slot_valid,
+        reduce_across_tensor_parallel=True,
+    )
+    torch.testing.assert_close(embeddings[0], head.markov_w1.weight[2])
+    torch.testing.assert_close(embeddings[1], head.markov_w1.weight[0])
+
+    reductions: list[tuple[dist.ReduceOp, dist.ProcessGroup]] = []
+
+    def fake_all_reduce(
+        tensor: Tensor, *, op: dist.ReduceOp, group: dist.ProcessGroup
+    ) -> None:
+        reductions.append((op, group))
+        tensor.mul_(2)
+
+    monkeypatch.setattr(dist, "all_reduce", fake_all_reduce)
+    embeddings[0].sum().backward()
+
+    assert reductions == [(dist.ReduceOp.SUM, group)]
+    assert head.markov_w1.weight.grad is not None
+    torch.testing.assert_close(head.markov_w1.weight.grad[2], torch.full((3,), 2.0))
+    torch.testing.assert_close(head.markov_w1.weight.grad[0], torch.zeros(3))
 
 
 def test_heads_load_pinned_official_deepseek_dspark_checkpoint_schema() -> None:
