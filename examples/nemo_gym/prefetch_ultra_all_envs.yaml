@@ -80,12 +80,6 @@ env:
     rdkit_chemistry_agent:
       _inherit_from: litmus_agent_agent
 
-    litmus_agent_environment_server:
-      environment_servers:
-        legacy_agent:
-          agent_server:
-            name: rdkit_chemistry_agent
-
     # Thin vllm_model clients for the judge refs the bundled configs expect (so refs resolve and
     # the vllm_model venv builds). genrm_model is already defined by the bundled genrm_compare.yaml.
     # return_token_id_information/uses_reasoning_parser have no defaults in Gym's VLLMModelConfig,
