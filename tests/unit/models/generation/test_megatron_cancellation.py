@@ -20,9 +20,9 @@ from unittest.mock import patch
 
 import pytest
 import torch
-
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.sampling_params import SamplingParams
+
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.models.generation.megatron.megatron_worker import MegatronGenerationMixin
@@ -181,9 +181,7 @@ class _ResultStream:
 
 def _generation_wrapper(stream: _ResultStream) -> MegatronGeneration:
     worker = SimpleNamespace(
-        generate_async=SimpleNamespace(
-            options=lambda **kwargs: SimpleNamespace(remote=lambda **kwargs: stream)
-        )
+        generate_async=SimpleNamespace(_remote=lambda **kwargs: stream)
     )
     generation = object.__new__(MegatronGeneration)
     generation._policy = SimpleNamespace(worker_group=SimpleNamespace(workers=[worker]))
@@ -200,7 +198,7 @@ def test_wrapper_cancellation_cancels_ray_stream(waiting_for_result: bool) -> No
             "nemo_rl.models.generation.megatron.megatron_generation.ray.cancel"
         ) as cancel:
             task = asyncio.create_task(anext(output))
-            await stream.waiting.wait()
+            await asyncio.wait_for(stream.waiting.wait(), timeout=1)
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task

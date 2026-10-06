@@ -13,9 +13,9 @@
 # limitations under the License.
 
 import asyncio
-import logging
 import gc
 import importlib
+import logging
 import os
 import threading
 import time

@@ -37,6 +37,7 @@ from nemo_rl.utils.config import (
     register_omegaconf_resolvers,
 )
 from nemo_rl.utils.logger import get_next_experiment_dir
+from nemo_rl.utils.outdated_config_checks import check_outdated_config
 
 
 def parse_args():
@@ -59,11 +60,6 @@ def parse_args():
 
 # TODO @yukih: move to nemo_rl/data/utils.py after data processor refactored
 def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
-    assert "train" in data_config, (
-        "The dataset config structure is updated. Please refer to https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/sft.md#datasets "
-        "and the Migrate Guide in https://github.com/NVIDIA-NeMo/RL/pull/1649 to update the dataset config."
-    )
-
     print("\n▶ Setting up data...")
     # setup train dataset
     task_data_processors = {}
@@ -176,6 +172,7 @@ def main(is_vlm: bool = False):
         config = parse_hydra_overrides(config, overrides)
 
     config = OmegaConf.to_container(config, resolve=True)
+    check_outdated_config(config)
     config = MasterConfig(**config)
     print("Applied CLI overrides")
 
@@ -183,8 +180,8 @@ def main(is_vlm: bool = False):
     print("Final config:")
     pprint.pprint(config)
 
-    config.logger["log_dir"] = get_next_experiment_dir(config.logger["log_dir"])
-    print(f"📊 Using log directory: {config.logger['log_dir']}")
+    config.logger.log_dir = get_next_experiment_dir(config.logger.log_dir)
+    print(f"📊 Using log directory: {config.logger.log_dir}")
     if config.checkpointing["enabled"]:
         print(
             f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
