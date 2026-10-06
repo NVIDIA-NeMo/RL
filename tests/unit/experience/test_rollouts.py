@@ -2512,9 +2512,15 @@ def test_rollout_manager_rotates_replicas_and_reports_group_share():
         *,
         on_completion,
         dispatch_recorder=None,
-        parked_rows=None,
+        admission_closed_rows=None,
     ):
-        del total_rows, timer_prefix, on_completion, dispatch_recorder, parked_rows
+        del (
+            total_rows,
+            timer_prefix,
+            on_completion,
+            dispatch_recorder,
+            admission_closed_rows,
+        )
         selected.append(environment)
         for row in pending:
             rowidx = row["_rowidx"]

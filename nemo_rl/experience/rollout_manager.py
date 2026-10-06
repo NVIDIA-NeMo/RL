@@ -52,7 +52,7 @@ from nemo_rl.environments.nemo_gym import (
 from nemo_rl.experience.failures import (
     FailureClass,
     GenerationUnavailable,
-    GymCheckpointParked,
+    GymAdmissionClosed,
     GymTransportError,
     RolloutDataFailure,
     RolloutFailure,
@@ -355,7 +355,7 @@ class RolloutStats:
     gym_row_redispatches: int = 0
     # Rows Gym refused because a checkpoint had admission closed. Re-sent without
     # spending any retry budget, so they are counted apart from every family above.
-    gym_checkpoint_parked_rows: int = 0
+    gym_admission_closed_rows: int = 0
 
     def record_redispatch(self, reason: str) -> None:
         self.redispatches_by_reason[reason] = (
@@ -383,8 +383,8 @@ class RolloutStats:
     def record_gym_row_redispatch(self, rows: int = 1) -> None:
         self.gym_row_redispatches += rows
 
-    def record_gym_checkpoint_parked(self, rows: int = 1) -> None:
-        self.gym_checkpoint_parked_rows += rows
+    def record_gym_admission_closed(self, rows: int = 1) -> None:
+        self.gym_admission_closed_rows += rows
 
     def as_metrics(self) -> dict[str, float]:
         """Flatten into a metric dict for the SingleController logger."""
@@ -404,7 +404,7 @@ class RolloutStats:
             ),
             "rollout/gym_row_redispatch_total": float(self.gym_row_redispatches),
             "rollout/gym_checkpoint_parked_rows_total": float(
-                self.gym_checkpoint_parked_rows
+                self.gym_admission_closed_rows
             ),
             "rollout/infra_drops_total": float(
                 sum(self.infra_drops_by_reason.values())
@@ -1292,7 +1292,7 @@ class AsyncNemoGymRolloutImpl:
         timer_prefix: str,
         on_completion: Optional[RolloutCompletionCallback] = None,
         dispatch_recorder: Optional[RolloutDispatchRecorder] = None,
-        parked_rows: Optional[set[int]] = None,
+        admission_closed_rows: Optional[set[int]] = None,
     ) -> Optional[dict[str, Any]]:
         """Dispatch ``pending`` rows and fill their slots in ``results`` as they land.
 
@@ -1306,14 +1306,16 @@ class AsyncNemoGymRolloutImpl:
             timer_prefix: Timer namespace forwarded to the environment.
             dispatch_recorder: Marks the submission dispatched in the recovery
                 ledger and unwinds rows Gym refuses at checkpoint admission.
-            parked_rows: Collects the indices of rows Gym refused because a
+            admission_closed_rows: Collects the indices of rows Gym refused because a
                 checkpoint had admission closed; required with ``dispatch_recorder``.
 
         Returns:
             The environment's timing metrics, or None if the stream ended without them.
         """
-        if dispatch_recorder is not None and parked_rows is None:
-            raise ValueError("a dispatch recorder requires a parked_rows collector")
+        if dispatch_recorder is not None and admission_closed_rows is None:
+            raise ValueError(
+                "a dispatch recorder requires a admission_closed_rows collector"
+            )
         dispatched = {row["_rowidx"] for row in pending}
         inputs_by_rowidx = {row["_rowidx"]: row for row in pending}
         received: set[int] = set()
@@ -1351,7 +1353,7 @@ class AsyncNemoGymRolloutImpl:
 
         async for result_ref in result_refs:
             item = await result_ref
-            if isinstance(item, GymCheckpointParked):
+            if isinstance(item, GymAdmissionClosed):
                 rowidx = item.rowidx
                 if rowidx not in dispatched or rowidx in received:
                     raise ValueError(
@@ -1364,8 +1366,8 @@ class AsyncNemoGymRolloutImpl:
                 # Unwound before the next row is read, so a checkpoint draining
                 # right now stops waiting on an episode Gym never admitted.
                 await dispatch_recorder.refused(rowidx)
-                assert parked_rows is not None
-                parked_rows.add(rowidx)
+                assert admission_closed_rows is not None
+                admission_closed_rows.add(rowidx)
                 continue
             rowidx, resolved_agent_ref, result, timing_metrics = item
             # Validated against the original group, not the pending subset: on a
@@ -1412,7 +1414,7 @@ class AsyncNemoGymRolloutImpl:
         nemo_gym_env: Any,
         pending: list[dict],
         results: list[Optional[dict]],
-        parked_rows: set[int],
+        admission_closed_rows: set[int],
         *,
         dispatch_recorder: Optional[RolloutDispatchRecorder],
         replace: bool,
@@ -1430,7 +1432,8 @@ class AsyncNemoGymRolloutImpl:
         unreturned = [
             row
             for row in pending
-            if results[row["_rowidx"]] is None and row["_rowidx"] not in parked_rows
+            if results[row["_rowidx"]] is None
+            and row["_rowidx"] not in admission_closed_rows
         ]
         if not unreturned:
             return
@@ -1543,14 +1546,14 @@ class AsyncNemoGymRolloutImpl:
                 registry=self._deadline_registry,
             ):
                 # Rows Gym refused at checkpoint admission never ran, so re-sending
-                # them spends no row attempt; parked_streak only paces the re-sends.
+                # them spends no row attempt; admission_closed_streak only paces the re-sends.
                 attempt = 1
-                parked_streak = 0
+                admission_closed_streak = 0
                 while attempt <= max_row_attempts:
                     pending = [row for row in inputs if results[row["_rowidx"]] is None]
                     if not pending:
                         break
-                    if attempt > 1 and parked_streak == 0:
+                    if attempt > 1 and admission_closed_streak == 0:
                         print(
                             f"NeMo-Gym: re-dispatching {len(pending)}/{total_rows} "
                             f"row(s) (attempt {attempt}/{max_row_attempts})",
@@ -1561,7 +1564,7 @@ class AsyncNemoGymRolloutImpl:
                         # gym could retry rows all run with every counter flat.
                         if self._stats is not None:
                             self._stats.record_gym_row_redispatch(len(pending))
-                    parked_rows: set[int] = set()
+                    admission_closed_rows: set[int] = set()
                     stream_failed = False
                     try:
                         timing_metrics = await self._stream_rows(
@@ -1573,7 +1576,7 @@ class AsyncNemoGymRolloutImpl:
                             instance_timer_prefix,
                             on_completion=on_completion,
                             dispatch_recorder=dispatch_recorder,
-                            parked_rows=parked_rows,
+                            admission_closed_rows=admission_closed_rows,
                         )
                     except Exception as error:
                         last_error = error
@@ -1587,7 +1590,7 @@ class AsyncNemoGymRolloutImpl:
                             nemo_gym_env,
                             pending,
                             results,
-                            parked_rows,
+                            admission_closed_rows,
                             dispatch_recorder=dispatch_recorder,
                             replace=resend,
                         )
@@ -1604,17 +1607,19 @@ class AsyncNemoGymRolloutImpl:
                             nemo_gym_env,
                             pending,
                             results,
-                            parked_rows,
+                            admission_closed_rows,
                             dispatch_recorder=dispatch_recorder,
                             replace=attempt < max_row_attempts,
                         )
-                    if parked_rows:
+                    if admission_closed_rows:
                         if self._stats is not None:
-                            self._stats.record_gym_checkpoint_parked(len(parked_rows))
+                            self._stats.record_gym_admission_closed(
+                                len(admission_closed_rows)
+                            )
                         if not stream_failed:
-                            parked_streak += 1
+                            admission_closed_streak += 1
                             print(
-                                f"NeMo-Gym: {len(parked_rows)} row(s) refused at "
+                                f"NeMo-Gym: {len(admission_closed_rows)} row(s) refused at "
                                 "checkpoint admission; re-sending once dispatch "
                                 "admission reopens",
                                 flush=True,
@@ -1624,12 +1629,12 @@ class AsyncNemoGymRolloutImpl:
                             await asyncio.sleep(
                                 min(
                                     _PARKED_REDISPATCH_BACKOFF_S
-                                    * 2 ** (parked_streak - 1),
+                                    * 2 ** (admission_closed_streak - 1),
                                     _MAX_PARKED_REDISPATCH_BACKOFF_S,
                                 )
                             )
                             continue
-                    parked_streak = 0
+                    admission_closed_streak = 0
                     attempt += 1
 
             missing = [index for index in expected_indices if results[index] is None]

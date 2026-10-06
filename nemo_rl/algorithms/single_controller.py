@@ -1282,13 +1282,13 @@ class SingleControllerActor:
                 if restore_id is not None and restore_coordinator is not None:
                     if gym_restore_completed and restore_manifest is not None:
                         try:
-                            await restore_coordinator.discard_restored(
+                            await restore_coordinator.retire_restored(
                                 restore_id,
                                 restore_manifest,
                             )
                         except Exception as retire_error:
                             error.add_note(
-                                "Gym restored-attempt cleanup also failed: "
+                                "Gym retire of restored attempts also failed: "
                                 f"{type(retire_error).__name__}: {retire_error}"
                             )
                     try:
