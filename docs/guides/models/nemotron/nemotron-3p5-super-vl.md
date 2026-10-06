@@ -10,7 +10,7 @@ The recipes enable `grpo.deduplicate_multimodal_data` and leave payload-size dia
 
 The setup uses the HF checkpoint's tokenizer, processor, and `chat_template.jinja`, together with the `super-v3.5-posttraining` branch's pinned Megatron Bridge and nested Megatron-LM submodules. NeMo RL must be mounted recursively and visible on every worker. Provision compatible worker environments and build the pinned MCore dataset helpers before launching a driver. Confirm that Python imports Bridge and MCore from this checkout.
 
-The HSG test container is `/home/rohitkumarj/data/enroot-containers/rl.nightly.sep30.2026.sqsh`. The commands below run inside its head container on an existing multi-node Ray allocation with four GPUs per node. They use the existing mounts; they do not start an allocation or Ray cluster.
+The commands below run inside the head container of an existing multi-node Ray allocation with four GPUs per node. They use the existing mounts; they do not start an allocation or Ray cluster.
 
 ### Checkpoint compatibility
 
@@ -23,7 +23,7 @@ Set `MM_TRAINER_MODEL_PATH` to the local SuperVL3p5 HF checkpoint. Reuse a Megat
 | CLEVR-CoGenT | [16-node CLEVR recipe](../../../../examples/configs/recipes/vlm/vlm_grpo-supervl3p5-clevr-16n4g-megatron-tp8ep8.v1.yaml) | 16 × 4 GPUs; policy TP8 / EP8 / CP1; colocated vLLM TP4 / EP4 |
 | MMPR-Tiny | [32-node MMPR-Tiny recipe](../../../../examples/configs/recipes/vlm/vlm_grpo-supervl3p5-mmpr-32n4g-megatron-tp8ep16.v1.yaml) | 32 × 4 GPUs; policy TP8 / EP16 / CP1; colocated vLLM TP4 / EP4 |
 
-The image recipes inherit the corresponding Nano Omni task recipes with more nodes to fit SuperVL3p5. They retain R3 disabled, FP32 LM heads, frozen vision/audio modules, optimizer offload during logprob calculation, and synchronous checkpoint writes. `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False` is set in their policy and generation worker environments to avoid a reproduced CUDA IPC allocator failure in this container.
+The image recipes inherit the corresponding Nano Omni task recipes with more nodes to fit SuperVL3p5. They retain R3 disabled, FP32 LM heads, frozen vision/audio modules, optimizer offload during logprob calculation, and synchronous checkpoint writes. `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False` is set in their policy and generation worker environments for CUDA IPC compatibility.
 
 ### Common launch environment
 
