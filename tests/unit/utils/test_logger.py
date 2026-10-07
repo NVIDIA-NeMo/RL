@@ -2166,15 +2166,15 @@ class TestLogger:
         self, mock_tb_logger, mock_wandb_logger, temp_dir
     ):
         """A filtered-out sample (0/0 = NaN error) must not be picked as the worst sample."""
-        cfg = {
-            "wandb_enabled": True,
-            "tensorboard_enabled": False,
-            "mlflow_enabled": False,
-            "swanlab_enabled": False,
-            "monitor_gpus": False,
-            "wandb": {"project": "test-project"},
-            "log_dir": temp_dir,
-        }
+        cfg = LoggerConfig(
+            wandb_enabled=True,
+            tensorboard_enabled=False,
+            mlflow_enabled=False,
+            swanlab_enabled=False,
+            monitor_gpus=False,
+            wandb=WandbConfig(project="test-project", name="test-run"),
+            log_dir=temp_dir,
+        )
         logger = Logger(cfg)
         generation_logprobs = torch.zeros((2, 10))
         generation_logprobs[1, 5] = -20.0  # large error in the kept sample
