@@ -313,6 +313,24 @@ Verified here:
   turn once image-heavy tool output keeps the 20k smoke context above the
   threshold; the 49k comparison setting does not have that pressure.
 
+- A no-compaction baseline sized like the pivot smoke (job 2167190: 8 assembly
+  tasks x 4, 8 turns, 4096 output tokens, 49k context, 8 nodes) ran its first
+  step's 32 episodes in about 20 minutes with every model call served, but with
+  `token_capture.context_compaction: false` Gym's ledger resolved call parents
+  by fingerprinting OpenCode's replayed history and poisoned 66 calls across 62
+  of 64 rollouts ("Unresolved parent ... poisoning the call"), masking nearly
+  the whole batch; the compaction run had none. Stock OpenCode's replay shape is
+  only matched by the framework-owned route, so the no-compaction baselines
+  (`smoke_off_step120.sh`, `smoke_off_32turns_256k.sh`) keep
+  `context_compaction: true` and turn only OpenCode's compaction and pruning
+  off: the compare script's `identity` arm. Two further observations from that
+  run: every 8-turn episode ended at the turn cap without writing a solution
+  (all rewards 0.0: the agent needs roughly 12 turns on these tasks), and one
+  episode reached 50112 input tokens at turn 8 and was rejected by the 49k
+  window, which motivates the 256k recipe variant
+  (`...-agentic-vbench-sc-256k.v1.yaml`, prefill chunk 32768) for the 32-turn
+  evaluation budget.
+
 Not yet verified (requires GPU allocations):
 
 - A two-step compaction smoke and the 20-step paired comparison.
