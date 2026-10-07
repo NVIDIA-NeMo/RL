@@ -453,6 +453,11 @@ class MegatronConfig(TypedDict):
     # Backend for grouped-GEMM during inference-optimized MoE forward.
     # Options: 'flashinfer', 'torch', 'vllm' (mcore default).
     inference_grouped_gemm_backend: NotRequired[str]
+    # Fixed decode row capacity for the FlashInfer routed-MXFP8 MoE path. Without it
+    # every decode step processes the full NVLS dispatcher buffer
+    # (round_up(max_tokens) / TP * EP rows). MCore applies it only when
+    # max_requests * EP <= capacity; FlashInfer has no MXFP8 config for <=128 rows.
+    inference_flashinfer_mxfp8_token_capacity: NotRequired[int | None]
     # InferenceTopKRouter requires moe_router_num_groups=None
     # (used when transformer_impl='inference_optimized')
     moe_router_num_groups: NotRequired[int | None]

@@ -3,3 +3,8 @@ policy:
   generation:
     mcore_generation_config:
       inference_grouped_gemm_backend: flashinfer
+      # Bound decode MoE rows instead of the full 65,536-row NVLS buffer
+      # (max_tokens / TP * EP). MCore uses the bound only when
+      # max_requests * EP (64 * 8) <= capacity; FlashInfer has no MXFP8 config for <=128 rows.
+      max_requests: 64
+      inference_flashinfer_mxfp8_token_capacity: 512
