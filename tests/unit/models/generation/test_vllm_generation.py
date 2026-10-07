@@ -789,7 +789,10 @@ def _install_fake_vllm_openai_modules(monkeypatch):
             self.kwargs = kwargs
             self.instances.append(self)
 
-    class VLLMValidationError(ValueError):
+    # Not a ValueError, matching vLLM 0.29 (VLLMValidationError -> VLLMClientError
+    # -> VLLMError -> Exception). A ValueError fake would fall into the handler's
+    # plain-ValueError overflow branch and mask a missing VLLMValidationError clause.
+    class VLLMValidationError(Exception):
         def __init__(self, message, *, parameter=None, value=None):
             super().__init__(message)
             self.parameter = parameter
