@@ -106,3 +106,18 @@ for run_spec in "run1 1 1" "run2 2 2"; do
         "max(data[\"train/avg_trajectory_age\"]) <= ${expected_max_age}" \
         'len(data["validation/accuracy"]) == 1'
 done
+
+# Both schedulers are still in LR warmup, so every LR after the resume must be
+# higher than every LR before it. A scheduler reset on resume repeats run 1's.
+uv run python - "${EXP_DIR}/metrics_run1.json" "${EXP_DIR}/metrics_run2.json" <<'EOF'
+import json
+import sys
+
+run1, run2 = (json.load(open(path)) for path in sys.argv[1:3])
+for key in ("train/lr", "train/critic/lr"):
+    before, after = run1[key], run2[key]
+    assert min(after.values()) > max(before.values()), (
+        f"{key} did not advance across the resume: {before} -> {after}"
+    )
+    print(f"✓ {key} advanced across the resume: {before} -> {after}")
+EOF

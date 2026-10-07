@@ -38,8 +38,40 @@ from nemo_rl.environments.nemo_gym import (
     build_nemo_gym_config,
     get_nemo_gym_uv_cache_dir,
     get_nemo_gym_venv_dir,
+    setup_nemo_gym_config,
     spinup_nemo_gym_actor,
 )
+
+
+@pytest.mark.parametrize("backend", ["vllm", "dynamo", "megatron"])
+def test_setup_nemo_gym_config_enables_http_server(backend: str) -> None:
+    generation = {
+        "backend": backend,
+        "vllm_cfg": {"async_engine": False, "expose_http_server": False},
+        "mcore_generation_config": {"expose_http_server": False},
+        "stop_strings": ["stop"],
+        "stop_token_ids": [1],
+    }
+    config = SimpleNamespace(policy={"generation": generation})
+
+    setup_nemo_gym_config(config, tokenizer=None)
+
+    assert generation["vllm_cfg"] == {
+        "async_engine": backend != "megatron",
+        "expose_http_server": backend != "megatron",
+    }
+    assert generation["mcore_generation_config"] == {
+        "expose_http_server": backend == "megatron"
+    }
+    assert generation["stop_strings"] is None
+    assert generation["stop_token_ids"] is None
+
+
+def test_setup_nemo_gym_config_rejects_unsupported_backend() -> None:
+    config = SimpleNamespace(policy={"generation": {"backend": "unsupported"}})
+
+    with pytest.raises(ValueError, match="got 'unsupported'"):
+        setup_nemo_gym_config(config, tokenizer=None)
 
 
 @pytest.mark.parametrize(

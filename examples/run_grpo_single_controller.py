@@ -55,6 +55,7 @@ from nemo_rl.utils.config import (
     register_omegaconf_resolvers,
 )
 from nemo_rl.utils.logger import get_next_experiment_dir
+from nemo_rl.utils.outdated_config_checks import check_outdated_config
 
 # Drop examples/ from sys.path so examples/nemo_gym/ (no __init__.py) doesn't
 # shadow the real nemo_gym package as a namespace package.
@@ -77,6 +78,12 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
 
 def main() -> None:
     """Main entry point."""
+    # The training loop runs in SingleControllerActor, whose flush=True prints only
+    # reach this driver: Ray forwards actor output here without flushing. When the
+    # driver's stdout is redirected (ray.sub -> ray-driver.log), Python
+    # block-buffers it, so step and coordination logs would arrive in bursts or
+    # only at exit. Line-buffer the driver so they show up as they are printed.
+    sys.stdout.reconfigure(line_buffering=True)
     register_omegaconf_resolvers()
     args, overrides = parse_args()
 
@@ -95,6 +102,7 @@ def main() -> None:
         config = parse_hydra_overrides(config, overrides)
 
     config = OmegaConf.to_container(config, resolve=True)
+    check_outdated_config(config)
     config = MasterConfig(**config)
     print("Applied CLI overrides")
 
@@ -118,8 +126,8 @@ def main() -> None:
     print("Final config:")
     pprint.pprint(config)
 
-    config.logger["log_dir"] = get_next_experiment_dir(config.logger["log_dir"])
-    print(f"📊 Using log directory: {config.logger['log_dir']}")
+    config.logger.log_dir = get_next_experiment_dir(config.logger.log_dir)
+    print(f"📊 Using log directory: {config.logger.log_dir}")
     if config.checkpointing["enabled"]:
         print(
             f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"

@@ -52,7 +52,6 @@ from nemo_rl.models.generation.vllm.config import (
 from nemo_rl.models.generation.vllm.metric_names import BATCH_DURATION_KEY
 from nemo_rl.models.generation.vllm.utils import (
     aggregate_spec_decode_counters,
-    assert_refit_unsupported_grouped_moe_params,
     assert_reload_refit_config_supported,
     compute_engine_step_metrics,
     compute_spec_decode_metrics,
@@ -635,7 +634,11 @@ class VllmGeneration(GenerationInterface):
         return results
 
     def setup_token_capture(
-        self, dp_cfg: "DataPlaneConfig", staging_partition: str
+        self,
+        dp_cfg: "DataPlaneConfig",
+        staging_partition: str,
+        *,
+        capture_media: bool = False,
     ) -> None:
         """Install ledger-authoritative token capture in every DP-leader worker.
 
@@ -651,6 +654,7 @@ class VllmGeneration(GenerationInterface):
             "setup_token_capture",
             dp_cfg=dp_cfg,
             staging_partition=staging_partition,
+            capture_media=capture_media,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
         ray.get(futures)
@@ -1373,8 +1377,6 @@ class VllmGeneration(GenerationInterface):
 
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         """Prepare the info for refit."""
-        assert_refit_unsupported_grouped_moe_params(self.cfg, state_dict_info)
-
         # Choose the appropriate method based on async_engine setting
         method_name = (
             "prepare_refit_info_async"

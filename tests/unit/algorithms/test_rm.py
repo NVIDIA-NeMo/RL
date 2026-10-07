@@ -27,6 +27,8 @@ from nemo_rl.algorithms.rm import (
     rm_train,
     setup,
 )
+from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.utils.logger import LoggerConfig
 
 
 def test_get_rm_save_state_handles_legacy_checkpoint_and_filters_metrics():
@@ -136,10 +138,7 @@ def mock_components():
                 "checkpoint_must_save_by": None,
                 "save_period": 10,
             },
-            "cluster": {
-                "num_nodes": 1,
-                "gpus_per_node": 2,
-            },
+            "cluster": ClusterConfig(num_nodes=1, gpus_per_node=2),
         }
     )
 
@@ -174,7 +173,7 @@ def test_context_parallel_rejected_for_dtensor_rm():
             },
             "rm": RMConfig.model_construct(seed=42),
             "data": {},
-            "logger": {},
+            "logger": LoggerConfig.model_construct(),
             "cluster": {},
             "checkpointing": {},
         }
@@ -208,7 +207,7 @@ def test_context_parallel_allowed_when_one():
             },
             "rm": RMConfig.model_construct(seed=42),
             "data": {},
-            "logger": {},
+            "logger": LoggerConfig.model_construct(),
             "cluster": {},
             "checkpointing": {},
         }
