@@ -1275,6 +1275,15 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             )
         # The opt-in path uses legacy GRPO's all-response advantage baselines;
         # the default SC path retains its pre-training survivor baselines.
+        # Token-capture placeholder rows have no legacy analog and must never
+        # vote in a baseline, so reject the combination instead.
+        if master_config.token_capture.enabled:
+            raise ValueError(
+                "loss_fn.seq_logprob_error_in_loss is not supported with "
+                "token_capture.enabled=true: in-loss filtering uses all-response "
+                "advantage baselines, which would include token-capture "
+                "placeholder rows."
+            )
         _validate_seq_logprob_error_in_loss(master_config)
     _validate_algo_settings(master_config)
     if evaluation_only_checkpoints(master_config):
