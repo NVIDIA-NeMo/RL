@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import gc
 import os
+import time
 import warnings
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -92,7 +93,10 @@ from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS, DP_TRAIN_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
-from nemo_rl.experience.sync_rollout_actor import SyncRolloutActor
+from nemo_rl.experience.sync_rollout_actor import (
+    ACTOR_TIMING_PREFIX,
+    SyncRolloutActor,
+)
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.utils.checkpoint import (
@@ -132,6 +136,27 @@ def _raise_if_message_level_advantage_penalties_enabled(
         f"{', '.join(f'grpo.{key}' for key in unsupported_keys)} or use the "
         "legacy GRPO trainer."
     )
+
+
+def _record_actor_timing(
+    timer: Timer, prefix: str, rollout_metrics: dict[str, Any], submit_ts: float
+) -> None:
+    """Move ``rollout_to_tq``'s per-phase seconds from ``rollout_metrics`` to ``timer``.
+
+    Adds the two legs the actor cannot see: ``ray_dispatch`` (driver submit
+    -> actor start, incl. arg serialization) and ``ray_return`` (actor end ->
+    driver holds the deserialized result). Same-node wall clocks.
+    """
+    returned_ts = time.time()
+    timing = {
+        k[len(ACTOR_TIMING_PREFIX) :]: rollout_metrics.pop(k)
+        for k in [k for k in rollout_metrics if k.startswith(ACTOR_TIMING_PREFIX)]
+    }
+    if "wall_start" in timing and "wall_end" in timing:
+        timing["ray_dispatch"] = timing.pop("wall_start") - submit_ts
+        timing["ray_return"] = returned_ts - timing.pop("wall_end")
+    for phase, seconds in timing.items():
+        timer.record(f"{prefix}/{phase}", seconds)
 
 
 def _train_fields_for_step(skip_prev_logprobs: bool) -> tuple[str, ...]:
@@ -294,21 +319,30 @@ def validate_sync(
         max_batches = (
             master_config.grpo.max_val_samples // master_config.grpo.val_batch_size
         )
-        for batch_idx, val_batch in enumerate(val_dataloader):
-            if batch_idx >= max_batches:
+        # Resets the persistent val workers primed in setup().
+        with timer.time("dataloader_iter"):
+            val_iter = iter(val_dataloader)
+        for _ in range(max_batches):
+            with timer.time("dataloader_next"):
+                val_batch = next(val_iter, None)
+            if val_batch is None:
                 break
             n_prompts = int(val_batch.size)
-            policy.prepare_val_partition(n_prompts, partition_id=partition_id)
-            meta, driver_carry, rollout_metrics, _ = ray.get(
-                rollout_actor.rollout_to_tq.remote(
-                    val_batch,
-                    partition_id=partition_id,
-                    first_iter=False,
-                    finish_generation=False,
-                    task_to_env_override=val_task_to_env,
-                    carry_keys=["total_reward", "turn_roles", "turn_contents"],
+            with timer.time("prepare_val_partition"):
+                policy.prepare_val_partition(n_prompts, partition_id=partition_id)
+            submit_ts = time.time()
+            with timer.time("rollout_to_tq"):
+                meta, driver_carry, rollout_metrics, _ = ray.get(
+                    rollout_actor.rollout_to_tq.remote(
+                        val_batch,
+                        partition_id=partition_id,
+                        first_iter=False,
+                        finish_generation=False,
+                        task_to_env_override=val_task_to_env,
+                        carry_keys=["total_reward", "turn_roles", "turn_contents"],
+                    )
                 )
-            )
+            _record_actor_timing(timer, "rollout_to_tq", rollout_metrics, submit_ts)
             roles = driver_carry["turn_roles"]
             contents = driver_carry["turn_contents"]
             total_rewards.extend(driver_carry["total_reward"].tolist())
@@ -319,7 +353,8 @@ def validate_sync(
             )
             if capture_extras:
                 additional_metrics = rollout_metrics
-            policy.finish_step(meta)
+            with timer.time("finish_step"):
+                policy.finish_step(meta)
 
         accuracy = (
             torch.tensor(total_rewards, dtype=torch.float32).mean().item()
@@ -421,9 +456,9 @@ def _log_data_plane_metrics_impl(
 
     The prefix names the scope because the two differ by a lot: the driver
     issues about one op of each kind per step while the bulk traffic is the
-    workers' per-DP-rank ``get_samples``. Note that even the cluster view
-    omits the rollout actor, which builds its own client and is not on the
-    worker group -- so ``kv_first_write`` is not in these totals.
+    workers' per-DP-rank ``get_samples``. The cluster view also includes the
+    rollout actor (registered via ``add_data_plane_snapshot_source``), so
+    ``kv_first_write`` is in these totals.
     """
     get_metrics = getattr(policy, "get_data_plane_step_metrics", None)
     if not callable(get_metrics):
@@ -574,6 +609,7 @@ def grpo_train_sync(
         master_config=master_config,
         dp_cfg=dp_cfg,
     )
+    policy.add_data_plane_snapshot_source(rollout_actor)
 
     if val_at_start and current_step == 0:
         print("\n🔍 Running initial validation...", flush=True)
@@ -747,6 +783,7 @@ def grpo_train_sync(
                     # ``dynamic_sampling_num_gen_batches`` is incremented
                     # to 1 just above before this branch — keep these in
                     # sync if either is renamed.
+                    submit_ts = time.time()
                     (
                         meta,
                         driver_carry,
@@ -760,11 +797,17 @@ def grpo_train_sync(
                             first_iter=(dynamic_sampling_num_gen_batches == 1),
                         )
                     )
+                    _record_actor_timing(
+                        timer, "generation", rollout_metrics, submit_ts
+                    )
 
                     metrics_logging_data["mean_gen_tokens_per_sample"] = (
                         rollout_metrics["mean_gen_tokens_per_sample"]
                     )
-                    logger.log_metrics(rollout_metrics, total_steps + 1, prefix="train")
+                    with timer.time("generation/driver_log_rollout_metrics"):
+                        logger.log_metrics(
+                            rollout_metrics, total_steps + 1, prefix="train"
+                        )
 
                 # ── Per-sample driver compute on slice ────────────────
                 # scale_rewards / apply_reward_shaping / overlong filter
@@ -932,7 +975,8 @@ def grpo_train_sync(
                     # writeback.
                     select_fields = ["generation_logprobs", "token_mask"]
                     if compute_prev:
-                        policy.get_logprobs_from_meta(meta, timer=timer)
+                        with timer.time("policy_and_reference_logprobs/prev"):
+                            policy.get_logprobs_from_meta(meta, timer=timer)
                         select_fields.append("prev_logprobs")
                     else:
                         print(
@@ -940,21 +984,23 @@ def grpo_train_sync(
                             flush=True,
                         )
                     if compute_ref:
-                        policy.get_reference_policy_logprobs_from_meta(
-                            meta,
-                            timer=timer,
-                        )
+                        with timer.time("policy_and_reference_logprobs/ref"):
+                            policy.get_reference_policy_logprobs_from_meta(
+                                meta,
+                                timer=timer,
+                            )
                         select_fields.append("reference_policy_logprobs")
 
                     # Driver pulls only the per-token columns it needs
                     # for masking / advantage. Bulk (input_ids, multimodal,
                     # output_ids, attention_mask, position_ids) stays in
                     # TQ — workers will fetch it via ``train_presharded``.
-                    extras_bdd = policy.read_from_dataplane(
-                        meta,
-                        select_fields=select_fields,
-                        pad_value_dict=_pad_dict,
-                    )
+                    with timer.time("policy_and_reference_logprobs/driver_read"):
+                        extras_bdd = policy.read_from_dataplane(
+                            meta,
+                            select_fields=select_fields,
+                            pad_value_dict=_pad_dict,
+                        )
                     generation_logprobs = extras_bdd["generation_logprobs"]
                     token_mask = extras_bdd["token_mask"]
                     prev_logprobs = (
