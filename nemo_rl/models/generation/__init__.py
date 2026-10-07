@@ -116,6 +116,10 @@ def draft_full_refit_enabled(policy_cfg: dict) -> bool:
     exports the drafter's entire state_dict under the ``draft.`` prefix; the
     megatron eagle3 path streams a partial set instead. Feeds the
     ``draft_full_refit`` argument of :func:`configure_generation_config`.
+
+    DTensor is always the v2 (Automodel) backend now (DTensor v1 and its
+    dtensor_cfg._v2 toggle have been removed upstream), so
+    dtensor_cfg.enabled alone identifies the DTensor v2 path.
     """
     from nemo_rl.models.policy.draft_config import coerce_draft_config
 
@@ -125,7 +129,6 @@ def draft_full_refit_enabled(policy_cfg: dict) -> bool:
         draft_config is not None
         and bool(draft_config.enabled)
         and bool(dtensor_cfg.get("enabled", False))
-        and bool(dtensor_cfg.get("_v2", False))
     )
 
 

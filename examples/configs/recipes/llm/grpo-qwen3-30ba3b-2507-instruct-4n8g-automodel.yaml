@@ -14,19 +14,21 @@ defaults: grpo-qwen3-8b-4n8g-automodel.yaml
 #   are small -- FSDP handles the non-expert weights).
 # - Generation: vLLM TP=4, two engines per node (8 DP replicas).
 #
-# Also switches checkpointing to synchronous dcp.save: DTensorPolicyWorkerV2
-# defaults to is_async=true (dcp.async_save), which spawns a fresh per-rank
-# background process + Gloo process group on every checkpoint save; that
-# rendezvous has failed repeatedly on this 4-node/32-rank layout
-# (RuntimeError: Connection closed by peer / 30-min timeout), always at the
-# first save_period boundary.
+# checkpointing.is_async was previously forced to false here to work around
+# a Gloo rendezvous hang (RuntimeError: Connection closed by peer / 30-min
+# timeout) hit on every async checkpoint save on this 4-node/32-rank layout.
+# NVIDIA-NeMo/RL#3935 ("align checkpoint lifecycle with consolidated save
+# modes") removed is_async from the user-configurable top-level checkpointing
+# schema and rewrote the Automodel async save path to wait for staging and
+# background writes to finish before promoting -- which is exactly the class
+# of race this recipe used to work around, so re-verify the hang is actually
+# gone before assuming this is safe on a multi-node EP32 layout again.
 grpo:
   val_period: 10
 checkpointing:
   checkpoint_dir: results/grpo-qwen3-30ba3b-2507-instruct-4n8g-automodel
   save_period: 15
   keep_top_k: 5
-  is_async: false
 policy:
   model_name: Qwen/Qwen3-30B-A3B-Instruct-2507
   max_total_sequence_length: 10240

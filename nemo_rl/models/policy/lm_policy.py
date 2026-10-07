@@ -199,28 +199,28 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             )
         draft_algo = draft_config.speculator_type if draft_enabled else None
         dtensor_cfg = config.get("dtensor_cfg", {})
-        dtensor_v2_enable = dtensor_enable and dtensor_cfg.get("_v2", False)
+        # DTensor is always the v2 (Automodel) backend now (DTensor v1 and
+        # its dtensor_cfg._v2 toggle have been removed upstream), so
+        # dtensor_enable alone identifies the DTensor v2 path.
         if draft_enabled and draft_algo == "eagle3":
             # eagle3 runs on the Megatron backend (single-step distillation)
-            # or the DTensor v2 backend (TTT training); DTensor v1 has no
-            # draft support.
-            if not megatron_enable and not dtensor_v2_enable:
+            # or the DTensor v2 backend (TTT training); DTensor v1 (removed)
+            # never had draft support.
+            if not megatron_enable and not dtensor_enable:
                 raise ValueError(
                     "policy.draft.speculator_type=eagle3 requires the Megatron "
                     "backend (policy.megatron_cfg.enabled=true) or the DTensor "
-                    "v2 backend (policy.dtensor_cfg.enabled=true and "
-                    "policy.dtensor_cfg._v2=true)."
+                    "backend (policy.dtensor_cfg.enabled=true)."
                 )
         if draft_enabled and draft_algo in BLOCK_DRAFT_ALGOS:
-            if megatron_enable or not dtensor_v2_enable:
+            if megatron_enable or not dtensor_enable:
                 raise ValueError(
                     f"policy.draft.speculator_type={draft_algo} requires the "
-                    "DTensor v2 backend (policy.dtensor_cfg.enabled=true and "
-                    "policy.dtensor_cfg._v2=true)."
+                    "DTensor backend (policy.dtensor_cfg.enabled=true)."
                 )
         if draft_enabled and (
             draft_algo in BLOCK_DRAFT_ALGOS
-            or (draft_algo == "eagle3" and dtensor_v2_enable)
+            or (draft_algo == "eagle3" and dtensor_enable)
         ):
             if draft_config.model_name is None:
                 raise ValueError(
