@@ -24,7 +24,6 @@ protocol edges the kit does not cover (missing keys, stage failure shape).
 
 from __future__ import annotations
 
-import dataclasses
 import hashlib
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -38,6 +37,8 @@ nemo_gym = pytest.importorskip("nemo_gym.token_id_capture.staging")
 # preparer; the tests below play that endpoint.
 from megatron.core.inference.inference_request import (  # noqa: E402
     PREFIX_EOS_TOKEN_ID_FIELD,
+    PREFIX_EXPANDED_TOKEN_COUNT_FIELD,
+    PREFIX_MEDIA_COUNT_FIELD,
     PREFIX_TEMPLATE_TOKEN_IDS_FIELD,
 )
 from nemo_gym.token_id_capture.staging.protocols import (  # noqa: E402
@@ -66,7 +67,7 @@ from nemo_rl.models.generation.megatron.token_capture import (  # noqa: E402
     MINF_CAPTURE_PARAMS_FIELD,
     TQMegatronPromptPreparer,
     TQMegatronTokenStager,
-    _MegatronCapturePayload,
+    _new_media_tensors,
     slice_media_tensors,
 )
 from tests.unit.data_plane.token_capture_test_fixtures import (  # noqa: E402
@@ -1019,7 +1020,7 @@ _PREPARER_CASES = {
 
 @pytest.mark.parametrize("prefix_source", list(_PREPARER_CASES))
 def test_megatron_prompt_preparer_splices_resolved_prefix(
-    tq_client, request, prefix_stitching_fields, prefix_source
+    tq_client, request, prefix_source
 ):
     (
         root_payload,
@@ -1033,7 +1034,6 @@ def test_megatron_prompt_preparer_splices_resolved_prefix(
         expected_media_prev_count,
         expected_expanded_count,
     ) = _PREPARER_CASES[prefix_source]
-    media_count_field, expanded_count_field = prefix_stitching_fields
     media = prefix_source == "multimodal_chain"
     partition = request.getfixturevalue(
         "media_partition" if media else "staging_partition"
@@ -1070,7 +1070,7 @@ def test_megatron_prompt_preparer_splices_resolved_prefix(
         PREFIX_EOS_TOKEN_ID_FIELD: eos,
     }
     if endpoint_media_count is not None:
-        offload_params[media_count_field] = endpoint_media_count
+        offload_params[PREFIX_MEDIA_COUNT_FIELD] = endpoint_media_count
 
     result = preparer.prepare_prompt(prompt, offload_params=offload_params)
 
@@ -1085,7 +1085,10 @@ def test_megatron_prompt_preparer_splices_resolved_prefix(
         # Sizes of the staged items, so the stager can re-check them.
         MEDIA_PREV_SIZES_KEY: [[[4, 4]]] * expected_media_prev_count,
     }
-    assert result.offload_params.get(expanded_count_field) == expected_expanded_count
+    assert (
+        result.offload_params.get(PREFIX_EXPANDED_TOKEN_COUNT_FIELD)
+        == expected_expanded_count
+    )
 
     if not media:
         return
@@ -1120,13 +1123,10 @@ def test_megatron_prompt_preparer_splices_resolved_prefix(
     assert media2.imgs_sizes.tolist() == [[4, 4]]
 
 
-def test_megatron_stager_rejects_a_resized_retained_image(
-    tq_client, media_partition, prefix_stitching_fields
-):
+def test_megatron_stager_rejects_a_resized_retained_image(tq_client, media_partition):
     """Turn 2 resends image 1 at a new size with the same patch count. A
     count-only check passes and the trainer would get turn 1's pixels; the
     stager must fail the call instead, as the vLLM worker does."""
-    media_count_field, _ = prefix_stitching_fields
     stager, root_coords = _stage_root(
         tq_client, media_partition, _minf_payload(multimodal=True), media=True
     )
@@ -1148,7 +1148,7 @@ def test_megatron_stager_rejects_a_resized_retained_image(
             "ng_capture": admission.model_dump(mode="json"),
             PREFIX_TEMPLATE_TOKEN_IDS_FIELD: [80, 99, 81, 13, 2],
             PREFIX_EOS_TOKEN_ID_FIELD: [2],
-            media_count_field: 1,
+            PREFIX_MEDIA_COUNT_FIELD: 1,
         },
     )
     assert prepared.offload_params[MINF_CAPTURE_PARAMS_FIELD] == {
@@ -1164,9 +1164,7 @@ def test_megatron_stager_rejects_a_resized_retained_image(
         media_tensors=resized,
     )
     with pytest.raises(ValueError, match="retained media geometry changed"):
-        _MegatronCapturePayload.from_offloaded(
-            payload, prepared.offload_params[MINF_CAPTURE_PARAMS_FIELD]
-        )
+        _new_media_tensors(payload, prepared.offload_params[MINF_CAPTURE_PARAMS_FIELD])
     result = stager.stage(
         "minf-response-2",
         payload,
@@ -1189,14 +1187,13 @@ def test_megatron_stager_rejects_a_resized_retained_image(
     ],
 )
 def test_megatron_prompt_preparer_rejects_inconsistent_media_prefix(
-    tq_client, media_partition, prefix_stitching_fields, endpoint_media_count, carried
+    tq_client, media_partition, endpoint_media_count, carried
 ):
     """The chat history and the staged chain must agree on the prefix's media.
 
     Otherwise the engine would expand the wrong placeholders after the prefix
     (or, with no count at all, re-expand the prefix's own media tokens).
     """
-    media_count_field, _ = prefix_stitching_fields
     _, root_coords = _stage_root(
         tq_client, media_partition, _minf_payload(multimodal=True), media=True
     )
@@ -1215,7 +1212,7 @@ def test_megatron_prompt_preparer_rejects_inconsistent_media_prefix(
         PREFIX_EOS_TOKEN_ID_FIELD: [2],
     }
     if endpoint_media_count is not None:
-        offload_params[media_count_field] = endpoint_media_count
+        offload_params[PREFIX_MEDIA_COUNT_FIELD] = endpoint_media_count
     preparer = TQMegatronPromptPreparer(
         TQTokenSource(tq_client, staging_partition=media_partition, capture_media=True)
     )
@@ -1257,7 +1254,7 @@ def test_megatron_prompt_preparer_rejects_malformed_eos_ids(eos):
     "endpoint_reports_count", [True, False], ids=["with-count", "without-count"]
 )
 def test_megatron_prompt_preparer_text_mode_drops_endpoint_media_count(
-    prefix_stitching_fields, endpoint_reports_count
+    endpoint_reports_count,
 ):
     """A text admission splices nothing, so no prefix media count may remain.
 
@@ -1268,7 +1265,6 @@ def test_megatron_prompt_preparer_text_mode_drops_endpoint_media_count(
     omitting the key makes the engine expand every placeholder itself. Without
     a reported count the params pass through unchanged.
     """
-    media_count_field, expanded_count_field = prefix_stitching_fields
     admission = nemo_gym.CaptureAdmission(
         rollout_id="minf-r0", model_call_id="c1", mode="text"
     )
@@ -1279,17 +1275,17 @@ def test_megatron_prompt_preparer_text_mode_drops_endpoint_media_count(
         PREFIX_EOS_TOKEN_ID_FIELD: [2],
     }
     if endpoint_reports_count:
-        offload_params[media_count_field] = 1
+        offload_params[PREFIX_MEDIA_COUNT_FIELD] = 1
     original_offload_params = dict(offload_params)
     preparer = TQMegatronPromptPreparer(MagicMock(spec=TQTokenSource))
 
     result = preparer.prepare_prompt(prompt, offload_params=offload_params)
 
     assert result.prompt == prompt
-    assert media_count_field not in result.offload_params
-    assert expanded_count_field not in result.offload_params
+    assert PREFIX_MEDIA_COUNT_FIELD not in result.offload_params
+    assert PREFIX_EXPANDED_TOKEN_COUNT_FIELD not in result.offload_params
     expected_params = dict(original_offload_params)
-    expected_params.pop(media_count_field, None)
+    expected_params.pop(PREFIX_MEDIA_COUNT_FIELD, None)
     assert result.offload_params == expected_params
     assert offload_params == original_offload_params
 
@@ -1403,7 +1399,7 @@ def test_megatron_stager_poisons_malformed_payloads_with_capture_failed(
     Gym maps returned failed coords to ``worker_capture_failed`` (as for
     vLLM); a ``None`` result would instead surface as
     ``worker_response_missing_commit_coordinates``. That covers
-    ``_MegatronCapturePayload.from_offloaded``, which runs after ``begin_call``
+    ``_new_media_tensors``, which runs after ``begin_call``
     and before Gym's extraction: a ``media_prev_count`` the engine's media
     cannot satisfy, a non-mapping ``media_tensors`` or non-dict capture params
     (which without the explicit type checks would escape as ``AttributeError``
@@ -1413,7 +1409,7 @@ def test_megatron_stager_poisons_malformed_payloads_with_capture_failed(
     if view_error is not None:
         error_type, match = view_error
         with pytest.raises(error_type, match=match):
-            _MegatronCapturePayload.from_offloaded(payload, minf_params)
+            _new_media_tensors(payload, minf_params)
     stager = TQMegatronTokenStager(_megatron_sink(tq_client, staging_partition))
     admission = nemo_gym.CaptureAdmission(
         rollout_id="minf-r0",
@@ -1564,10 +1560,7 @@ def test_resolve_admission_prefix_dispatches_on_admission_shape(resolve, wrap):
     assert source.calls == [["k1"]]
 
 
-def test_megatron_preparer_resolves_chains_through_the_shared_cache(
-    prefix_stitching_fields,
-):
-    media_count_field, expanded_count_field = prefix_stitching_fields
+def test_megatron_preparer_resolves_chains_through_the_shared_cache():
     source = _RecordingSource()
     preparer = TQMegatronPromptPreparer(source)
     assert isinstance(preparer._chain_prefix, ChainPrefixCache)
@@ -1600,30 +1593,16 @@ def test_megatron_preparer_resolves_chains_through_the_shared_cache(
                 "ng_capture": admission.model_dump(mode="json"),
                 PREFIX_TEMPLATE_TOKEN_IDS_FIELD: template_prefix,
                 PREFIX_EOS_TOKEN_ID_FIELD: 99,
-                media_count_field: media_count,
+                PREFIX_MEDIA_COUNT_FIELD: media_count,
             },
         )
         # A cache hit still reports the chain's media count and full length.
-        assert result.offload_params[expanded_count_field] == admission.prev_len
+        assert (
+            result.offload_params[PREFIX_EXPANDED_TOKEN_COUNT_FIELD]
+            == admission.prev_len
+        )
     # k1 was cached by the child call; the grandchild fetched only k2.
     assert source.calls == [["k1"], ["k2"]]
-
-
-def test_payload_keys_match_gym_constants():
-    """Pin the payload-view attribute names to Gym's constants.
-
-    The stager's payload view feeds Gym's Megatron adapter by attribute name.
-    """
-    adapter = pytest.importorskip("nemo_gym.token_id_capture.adapters.megatron")
-    payload_fields = {f.name for f in dataclasses.fields(_MegatronCapturePayload)}
-    assert payload_fields >= {
-        adapter.PROMPT_IDS_FIELD,
-        adapter.GENERATED_IDS_FIELD,
-        adapter.GENERATED_LOGPROBS_FIELD,
-    }
-    # The media summary left the record with Gym #3513; pixels are attachments.
-    assert not hasattr(adapter, "MEDIA_FIELD")
-    assert "media" not in payload_fields
 
 
 @pytest.mark.parametrize(

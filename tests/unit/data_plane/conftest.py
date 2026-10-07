@@ -105,35 +105,6 @@ def tq_client_backends(request):
     return request.getfixturevalue(f"_session_tq_client_{request.param}")
 
 
-@pytest.fixture
-def prefix_stitching_fields(monkeypatch):
-    """Megatron-LM's expanded-prefix stitching keys, as (media count, token count).
-
-    Megatron-LM pins that predate the change lack them; install the upstream
-    names so the preparer's multimodal path runs on either pin.
-    """
-    from megatron.core.inference import inference_request
-
-    fields = (
-        getattr(inference_request, "PREFIX_MEDIA_COUNT_FIELD", "_prefix_media_count"),
-        getattr(
-            inference_request,
-            "PREFIX_EXPANDED_TOKEN_COUNT_FIELD",
-            "_prefix_expanded_token_count",
-        ),
-    )
-    monkeypatch.setattr(
-        inference_request, "PREFIX_MEDIA_COUNT_FIELD", fields[0], raising=False
-    )
-    monkeypatch.setattr(
-        inference_request,
-        "PREFIX_EXPANDED_TOKEN_COUNT_FIELD",
-        fields[1],
-        raising=False,
-    )
-    return fields
-
-
 @pytest.fixture(autouse=True)
 def _isolate_codec_timer():
     """Drain the module-level codec timer around every test in this package.

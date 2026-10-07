@@ -463,11 +463,9 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   Megatron Inference path on the same CLEVR-style images. Both gate on
   `train/finalize/media_row_rate == 1`, the metric that reports the fraction
   of learner rows built from captured media.
-  The vLLM path needs no new Megatron-LM pin. The Megatron Inference path
-  requires a Megatron-LM pin with `media_tensors` on the offloaded payload and
-  expanded-prefix stitching (NVIDIA/Megatron-LM#7598); on an older pin the
-  worker's prompt preparer fails its first capture call with an `ImportError`
-  naming the missing stitching field.
+  The Megatron Inference path relies on the pinned Megatron-LM carrying
+  `media_tensors` on the offloaded payload and expanded-prefix stitching
+  (NVIDIA/Megatron-LM#7598).
   A group in which no rollout carried media (an all-text prompt in a mixed
   dataset) is published with empty media rows in the partition's pinned pixel
   dtype and patch width, so its keys can share a train fetch with media keys.

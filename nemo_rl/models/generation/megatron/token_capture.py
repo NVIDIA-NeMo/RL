@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -307,97 +306,76 @@ def slice_media_tensors(
     return sliced
 
 
-@dataclass(frozen=True)
-class _MegatronCapturePayload:
-    """The MInf offloaded payload plus the worker-side context Gym's adapter reads."""
+def _new_media_tensors(payload: Any, minf_params: Any) -> dict[str, Any] | None:
+    """Return the media of one finished MInf payload that is new to this call.
 
-    prompt_token_ids: Any
-    generated_token_ids: Any
-    generated_log_probs: Any
-    # The engine's media tensors minus what the parent chain already staged.
-    media_tensors: dict[str, Any] | None
+    Checks the first ``minf_params["media_prev_count"]`` items of
+    ``payload.media_tensors`` against ``minf_params["media_prev_sizes"]`` (the
+    geometry the parent chain staged), and slices the tensors there so only the
+    media new to this call remains. ``media_tensors`` is validated against the
+    sink's media contract (``validate_media_tensors``) first.
 
-    @classmethod
-    def from_offloaded(
-        cls, payload: Any, minf_params: Any
-    ) -> "_MegatronCapturePayload":
-        """Build the adapter-facing view of one finished MInf payload.
+    Args:
+        payload: The engine's ``OffloadedRequestPayload`` (or equivalent).
+        minf_params: The ``ng_capture_minf`` mapping the prompt preparer
+            wrote, or ``None`` for requests it did not touch.
 
-        Copies the ``prompt_token_ids`` / ``generated_token_ids`` /
-        ``generated_log_probs`` attributes Gym's ``MegatronCaptureAdapter``
-        reads (missing ones become ``None``), checks the first
-        ``minf_params["media_prev_count"]`` items of ``payload.media_tensors``
-        against ``minf_params["media_prev_sizes"]`` (the geometry the parent
-        chain staged), and slices the tensors there so only the media new to
-        this call remains. ``media_tensors`` is validated against the sink's
-        media contract (``validate_media_tensors``) first.
+    Returns:
+        The sliced media tensors, or ``None`` when the call adds no media.
 
-        Args:
-            payload: The engine's ``OffloadedRequestPayload`` (or equivalent).
-            minf_params: The ``ng_capture_minf`` mapping the prompt preparer
-                wrote, or ``None`` for requests it did not touch.
+    Raises:
+        TypeError: ``minf_params`` is not a dict, ``media_tensors`` is not
+            a mapping, or a media tensor is not a ``torch.Tensor``.
+        ValueError: ``media_tensors`` violates the media contract,
+            ``media_prev_count`` is not a non-negative int,
+            ``media_prev_sizes`` is malformed or does not have one entry per
+            counted item, a retained item's geometry differs from the
+            staged one, or the media cannot be sliced at the count.
 
-        Raises:
-            TypeError: ``minf_params`` is not a dict, ``media_tensors`` is not
-                a mapping, or a media tensor is not a ``torch.Tensor``.
-            ValueError: ``media_tensors`` violates the media contract,
-                ``media_prev_count`` is not a non-negative int,
-                ``media_prev_sizes`` is malformed or does not have one entry per
-                counted item, a retained item's geometry differs from the
-                staged one, or the media cannot be sliced at the count.
+    The stager maps both to ``capture_failed`` coordinates.
+    """
+    if minf_params is not None and not isinstance(minf_params, dict):
+        raise TypeError(
+            f"MInf capture params must be a dict, got {type(minf_params).__name__}"
+        )
 
-        The stager maps both to ``capture_failed`` coordinates.
-        """
-        if minf_params is not None and not isinstance(minf_params, dict):
-            raise TypeError(
-                f"MInf capture params must be a dict, got {type(minf_params).__name__}"
-            )
-
-        def _count(key: str) -> int:
-            value = minf_params.get(key) if minf_params is not None else None
-            if value is None:
-                return 0
-            if type(value) is not int or value < 0:
-                raise ValueError(
-                    f"MInf capture request carries an invalid {key}: {value!r}"
-                )
-            return value
-
-        media_tensors = getattr(payload, "media_tensors", None)
-        if media_tensors is not None and not isinstance(media_tensors, Mapping):
-            raise TypeError(
-                "MInf payload media_tensors must be a mapping, got "
-                f"{type(media_tensors).__name__}"
-            )
-        prev_count = _count(MEDIA_PREV_COUNT_KEY)
-        staged_sizes = _prev_sizes(minf_params, prev_count)
-        # The sink's contract check runs here, before slicing, so the layout
-        # is known good and a malformed bundle fails this call, not the write.
-        validated = validate_media_tensors(media_tensors or None)
-        items = () if validated is None else validated.item_sizes
-        if prev_count > len(items):
+    def _count(key: str) -> int:
+        value = minf_params.get(key) if minf_params is not None else None
+        if value is None:
+            return 0
+        if type(value) is not int or value < 0:
             raise ValueError(
-                f"media_prev_count {prev_count} exceeds the {len(items)} media "
-                "items the engine saw"
+                f"MInf capture request carries an invalid {key}: {value!r}"
             )
-        for index, (staged, item) in enumerate(
-            zip(staged_sizes, items[:prev_count], strict=True)
-        ):
-            seen = [list(size) for size in item]
-            if staged != seen:
-                raise ValueError(
-                    f"MInf retained media geometry changed: item {index} was "
-                    f"staged at {staged}, the engine saw {seen}"
-                )
-        media = (
-            None if validated is None else slice_media_tensors(validated, prev_count)
+        return value
+
+    media_tensors = getattr(payload, "media_tensors", None)
+    if media_tensors is not None and not isinstance(media_tensors, Mapping):
+        raise TypeError(
+            "MInf payload media_tensors must be a mapping, got "
+            f"{type(media_tensors).__name__}"
         )
-        return cls(
-            prompt_token_ids=getattr(payload, "prompt_token_ids", None),
-            generated_token_ids=getattr(payload, "generated_token_ids", None),
-            generated_log_probs=getattr(payload, "generated_log_probs", None),
-            media_tensors=media,
+    prev_count = _count(MEDIA_PREV_COUNT_KEY)
+    staged_sizes = _prev_sizes(minf_params, prev_count)
+    # The sink's contract check runs here, before slicing, so the layout
+    # is known good and a malformed bundle fails this call, not the write.
+    validated = validate_media_tensors(media_tensors or None)
+    items = () if validated is None else validated.item_sizes
+    if prev_count > len(items):
+        raise ValueError(
+            f"media_prev_count {prev_count} exceeds the {len(items)} media "
+            "items the engine saw"
         )
+    for index, (staged, item) in enumerate(
+        zip(staged_sizes, items[:prev_count], strict=True)
+    ):
+        seen = [list(size) for size in item]
+        if staged != seen:
+            raise ValueError(
+                f"MInf retained media geometry changed: item {index} was "
+                f"staged at {staged}, the engine saw {seen}"
+            )
+    return None if validated is None else slice_media_tensors(validated, prev_count)
 
 
 class TQMegatronTokenStager:
@@ -544,9 +522,7 @@ class TQMegatronTokenStager:
         from nemo_gym.token_id_capture import NG_COMMIT_COORDS_FIELD
 
         try:
-            capture_payload_view = _MegatronCapturePayload.from_offloaded(
-                payload, minf_params
-            )
+            media = _new_media_tensors(payload, minf_params)
         except (TypeError, ValueError, RuntimeError) as error:
             coords = self._capture.fail_call(
                 call, reason=f"{type(error).__name__}: {error}"
@@ -557,9 +533,7 @@ class TQMegatronTokenStager:
                 }
             )
         coords = self._capture.complete_call_from_response(
-            call,
-            capture_payload_view,
-            attachments=self._cast_media_pixels(capture_payload_view.media_tensors),
+            call, payload, attachments=self._cast_media_pixels(media)
         )
         return RequestPayloadStageResult(
             response_metadata={

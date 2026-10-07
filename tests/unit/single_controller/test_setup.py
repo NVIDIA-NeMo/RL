@@ -3210,13 +3210,6 @@ def test_token_capture_megatron_registers_media_columns_only_for_multimodal(
 
 
 @pytest.mark.mcore
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "pending Megatron-Bridge pin carrying Megatron-LM expanded-prefix stitching"
-    ),
-)
 def test_offloaded_payload_exposes_multimodal_capture_fields():
     """Pin the engine payload field the multimodal stager reads with getattr
     defaults and the prefix-stitching keys the Megatron preparer writes."""

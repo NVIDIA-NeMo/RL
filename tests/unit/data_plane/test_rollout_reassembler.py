@@ -1069,7 +1069,7 @@ def test_finalize_rollout_media(tq_client, media_partitions, case, pixel_dtype):
 
 
 def test_megatron_capture_two_turn_media_finalizes_to_the_engine_pixels(
-    tq_client, media_partitions, prefix_stitching_fields
+    tq_client, media_partitions
 ):
     """Stager -> preparer -> stager -> finalizer with real media: each call
     stages only the images new to it, and the finalized row carries the
@@ -1078,6 +1078,7 @@ def test_megatron_capture_two_turn_media_finalizes_to_the_engine_pixels(
     # Deferred import: megatron-core is a heavy, optional dependency.
     from megatron.core.inference.inference_request import (
         PREFIX_EOS_TOKEN_ID_FIELD,
+        PREFIX_MEDIA_COUNT_FIELD,
         PREFIX_TEMPLATE_TOKEN_IDS_FIELD,
     )
 
@@ -1086,7 +1087,6 @@ def test_megatron_capture_two_turn_media_finalizes_to_the_engine_pixels(
         TQMegatronTokenStager,
     )
 
-    media_count_field, _ = prefix_stitching_fields
     rollout_id = "minf-mm-e2e"
     image1_patches, image2_patches = 4, 2  # 4x4 and 2x4 images, patch 2
     engine_imgs = torch.arange(
@@ -1147,7 +1147,7 @@ def test_megatron_capture_two_turn_media_finalizes_to_the_engine_pixels(
             "ng_capture": child.model_dump(mode="json"),
             PREFIX_TEMPLATE_TOKEN_IDS_FIELD: [80, 99, 81, 13, 2],
             PREFIX_EOS_TOKEN_ID_FIELD: [2],
-            media_count_field: 1,
+            PREFIX_MEDIA_COUNT_FIELD: 1,
         },
     )
     c2 = stage(
