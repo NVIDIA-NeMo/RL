@@ -25,11 +25,18 @@ These tests drive the real _setup_vllm_openai_api_server against a fake vLLM
 module tree and inspect what each consumer was constructed with.
 """
 
+import asyncio
 import sys
 import types
+from copy import deepcopy
+from dataclasses import dataclass
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import torch
+
+from nemo_rl.data.captured_media import capture_processed_media
 
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
@@ -255,3 +262,104 @@ def test_absent_kwargs_render_as_empty_dict(monkeypatch):
 
     assert renderer[0].kwargs["default_chat_template_kwargs"] == {}
     assert tokenization[0].kwargs["default_chat_template_kwargs"] == {}
+
+
+@pytest.mark.parametrize("capture_media", [False, True])
+def test_prefix_splice_remaps_image_once(monkeypatch, capture_media):
+    """Captured and ordinary requests must use the same final image positions."""
+
+    @dataclass(frozen=True)
+    class Span:
+        offset: int
+        length: int
+        is_embed: object = None
+
+    template_tokens = [10, 31, 2, 11, 18, 18, 12]
+    final_tokens = [10, 77, 31, 2, 11, 18, 18, 12]
+    prompt = {
+        "prompt_token_ids": template_tokens,
+        "mm_placeholders": {"image": [Span(4, 2)]},
+        "mm_kwargs": {
+            "image": [
+                SimpleNamespace(
+                    get_data=lambda: {
+                        "pixel_values_flat": torch.zeros(3, 1, 2),
+                        "imgs_sizes": torch.tensor([1, 2]),
+                        "num_tokens_per_image": 2,
+                    }
+                )
+            ]
+        },
+    }
+    captured = []
+    admission = SimpleNamespace(mode="token_in", prev_len=4) if capture_media else None
+
+    async def preprocess(self, *, messages, **kwargs):
+        rendered = (
+            deepcopy(prompt)
+            if len(messages) == 2
+            else {
+                "prompt_token_ids": [10, 31, 2],
+            }
+        )
+        return (None, [rendered])
+
+    def capture(self, engine_prompt, *, admission, splice=None):
+        if not capture_media:
+            return None
+        media = capture_processed_media(
+            engine_prompt,
+            prev_len=admission.prev_len,
+            splice=splice,
+            patch_size=1,
+        )
+        captured.append(media)
+        return media
+
+    monkeypatch.setattr(_OnlineRenderer, "preprocess_chat", preprocess, raising=False)
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl, "_capture_media", capture_media, raising=False
+    )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl,
+        "_capture_admission",
+        lambda self, request: admission,
+    )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl,
+        "_resolve_admission_prefix",
+        lambda self, admission: [10, 77, 31, 2],
+    )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl,
+        "_enter_request_prefix",
+        lambda self, request, prefix: setattr(
+            request, "required_prefix_token_ids", prefix
+        ),
+    )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl, "_capture_request_media", capture
+    )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl, "_begin_request_capture", MagicMock()
+    )
+    renderers, _, _ = _build_server(monkeypatch, {})
+    renderer = renderers[0]
+    renderer.renderer = SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=2))
+    request = SimpleNamespace(required_prefix_token_ids=[10, 77, 31, 2])
+    request.model_copy = lambda **kwargs: request
+    result = asyncio.run(
+        renderer.preprocess_chat(
+            request,
+            [{"role": "assistant"}, {"role": "tool"}],
+            None,
+            None,
+            {},
+        )
+    )
+
+    engine_prompt = result[1][0]
+    assert engine_prompt["prompt_token_ids"] == final_tokens
+    assert engine_prompt["mm_placeholders"]["image"][0].offset == 5
+    if capture_media:
+        assert captured[0].items[0].placeholder_offset == 5
