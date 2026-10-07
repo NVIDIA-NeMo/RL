@@ -198,16 +198,6 @@ ARG TRTLLM_CCACHE_MAXSIZE=20G
 ARG TRTLLM_BUILD_JOBS=24
 ARG RUNTIME_UID
 ARG RUNTIME_GID
-# NIXL is only consumed by the TRT-LLM wheel build below, so it is built inside
-# that block rather than in `base`. Keep in sync with the pinned TRT-LLM ref's
-# docker/common/install_nixl.sh; re-check on every [tool.trtllm].ref bump.
-ARG NIXL_VERSION=v1.4.0
-# The NGC base image sets ENV NIXL_VERSION=1.0.1, and an ARG only changes the
-# build-time environment. Re-export so the image -- and _backend.py's wheel
-# cache key, since build_wheel.py bundles NIXL into the wheel -- see the
-# version actually built here.
-ENV NIXL_VERSION=${NIXL_VERSION}
-
 ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 ENV UV_LINK_MODE=copy
 
@@ -373,6 +363,21 @@ EOF
 # Engine from the preceding layer.
 COPY --from=nemo-rl tools/build-custom-trtllm.sh ./tools/build-custom-trtllm.sh
 COPY --from=nemo-rl --link 3rdparty/TensorRT-LLM-workspace/ ./3rdparty/TensorRT-LLM-workspace/
+
+# NIXL is only consumed by the TRT-LLM wheel build below, so it is built inside
+# that block rather than in `base`. Keep in sync with the pinned TRT-LLM ref's
+# docker/common/install_nixl.sh; re-check on every [tool.trtllm].ref bump.
+#
+# Declared here rather than with the other ARGs: BuildKit puts ARG and ENV into
+# the environment of every later RUN, so declaring it above the dependency RUN
+# would make a NIXL bump bust that hour-long layer for every image, including
+# SKIP_TRTLLM_BUILD=1 ones.
+ARG NIXL_VERSION=v1.4.0
+# The NGC base image sets ENV NIXL_VERSION=1.0.1, and an ARG only changes the
+# build-time environment. Re-export so the image -- and _backend.py's wheel
+# cache key, since build_wheel.py bundles NIXL into the wheel -- see the
+# version actually built here.
+ENV NIXL_VERSION=${NIXL_VERSION}
 
 RUN --mount=type=ssh \
     --mount=type=bind,from=trtllm-ccache-seed,source=.,target=/tmp/trtllm-ccache-seed \
