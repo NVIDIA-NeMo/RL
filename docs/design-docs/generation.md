@@ -239,6 +239,7 @@ data:
 ```
 
 - `image_dynamic_resolution` preserves variable image shapes instead of forcing one fixed resolution; for example, a wide image uses a wider patch grid than a square image.
+- `image_dynamic_resolution_model_length`, `image_dynamic_resolution_rounding_mode`, and `image_dynamic_resolution_resize_mode` must match the HF processor that vLLM and training use, or Megatron inference produces a different patch grid for the same image. `model_length` overrides the processor's `max_model_len` token budget. `rounding_mode` is `ceil` (MCore default) or `round_plus_half` (HF's `round(x + 0.5)`); for a 48-px side and 16-px patches they give 3 and 4 patches. `resize_mode` is `pil` (MCore default) or `torch_bicubic_antialias` for torch-based HF processors. Nemotron Super VL uses `round_plus_half` and `torch_bicubic_antialias`.
 - `vision_model_type` optionally selects the MCore vision encoder type used by image and video preprocessing. Set it to the encoder expected by the inference wrapper; when omitted, MCore uses its default (`radio`).
 - `num_frames` controls uniform video-frame sampling. Use `video_num_frames` for the corresponding MCore key.
 - `video_temporal_patch_size` groups sampled frames into temporal tubelets; for example, size `2` turns 16 frames into 8 temporal groups.

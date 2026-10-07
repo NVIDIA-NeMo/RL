@@ -22,6 +22,7 @@ from collections.abc import Sequence
 from copy import copy, deepcopy
 from io import BytesIO
 from pathlib import Path
+from urllib.parse import unquote
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 import requests
@@ -1491,7 +1492,8 @@ def resolve_to_image(image_path_or_image: str | Image.Image) -> Image.Image:
         image_data = base64.b64decode(encoded)
         return Image.open(BytesIO(image_data)).convert("RGB")
     elif image_path_or_image.startswith("file://"):
-        return Image.open(image_path_or_image.removeprefix("file://")).convert("RGB")
+        image_path = unquote(image_path_or_image.removeprefix("file://"))
+        return Image.open(image_path).convert("RGB")
     else:
         # Handle local file path
         return Image.open(image_path_or_image).convert("RGB")
@@ -1716,7 +1718,7 @@ def video_path_to_data_url(video_path: str) -> str:
         return video_path
 
     resolved = (
-        video_path.removeprefix("file://")
+        unquote(video_path.removeprefix("file://"))
         if video_path.startswith("file://")
         else str(Path(video_path).expanduser().resolve())
     )

@@ -119,6 +119,16 @@ class MCoreGenerationSpecificArgs(TypedDict):
     # `video_num_frames` is required for video.
     vision_model_type: NotRequired[str]
     image_dynamic_resolution: NotRequired[bool]
+    # Image token budget; overrides the HF processor's `max_model_len`.
+    image_dynamic_resolution_model_length: NotRequired[int]
+    # MCore default: 'ceil'. HF processors use 'round_plus_half'.
+    image_dynamic_resolution_rounding_mode: NotRequired[
+        Literal["ceil", "round_plus_half"]
+    ]
+    # MCore default: 'pil'. Torch-based HF processors use 'torch_bicubic_antialias'.
+    image_dynamic_resolution_resize_mode: NotRequired[
+        Literal["pil", "torch_bicubic_antialias"]
+    ]
     video_num_frames: NotRequired[int]  # Frames sampled per video.
     video_temporal_patch_size: NotRequired[int]  # Frames per temporal patch.
     video_target_num_patches: NotRequired[int]  # Overrides the image max-patch budget.
