@@ -15,7 +15,9 @@
 from __future__ import annotations
 
 import asyncio
+import pickle
 import uuid
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -26,6 +28,8 @@ from nemo_rl.environments.gym_checkpoint_adapter import (
     GymCheckpointEpisode,
     GymCheckpointInstance,
     GymCheckpointParticipantManifest,
+    GymCheckpointParticipantRecord,
+    GymCheckpointUnavailable,
 )
 from nemo_rl.experience.rollout_recovery import (
     PromptGroupPhase,
@@ -92,6 +96,34 @@ def _participants(client: object, label: str) -> SimpleNamespace:
             SimpleNamespace(server_name=f"{label}-model", kind="model"),
         ),
     )
+
+
+def _committed_participants(
+    checkpoint_root: Path, label: str, *, checkpoint_id: str = "save-1"
+) -> tuple[GymCheckpointParticipantRecord, ...]:
+    """Write each participant's state as Gym commits it; return what RL records."""
+    from nemo_gym._checkpoint.store import write_participant_state
+
+    checkpoint_dir = GymCheckpointInstance(label, 0).checkpoint_dir(checkpoint_root)
+    records = []
+    for kind in ("environment", "model"):
+        server_name = f"{label}-{kind}"
+        stored = write_participant_state(
+            checkpoint_dir,
+            kind=kind,
+            instance=server_name,
+            checkpoint_id=checkpoint_id,
+            records=[{"owner": server_name}],
+        )
+        records.append(
+            GymCheckpointParticipantRecord(
+                server_name=server_name,
+                kind=kind,
+                instance=server_name,
+                records_sha256=stored["records_sha256"],
+            )
+        )
+    return tuple(records)
 
 
 def _participant_manifest(
@@ -165,7 +197,9 @@ def test_checkpoint_instance_rejects_unsafe_identity(
         )
 
 
-def test_adapter_delegates_the_complete_gym_v2_lifecycle(monkeypatch) -> None:
+def test_adapter_delegates_the_complete_gym_v2_lifecycle(
+    monkeypatch, tmp_path: Path
+) -> None:
     from nemo_gym._checkpoint import coordination
 
     client = object()
@@ -255,8 +289,9 @@ def test_adapter_delegates_the_complete_gym_v2_lifecycle(monkeypatch) -> None:
         )
         await adapter.restore(
             "restore-1",
-            "/checkpoints/step-1",
+            tmp_path,
             episodes,
+            participants=_committed_participants(tmp_path, "actor-a"),
             source_checkpoint_id="save-1",
             deadline_ts=14.0,
         )
@@ -291,7 +326,7 @@ def test_adapter_delegates_the_complete_gym_v2_lifecycle(monkeypatch) -> None:
     restore.assert_awaited_once_with(
         participants,
         "restore-1",
-        instance_dir,
+        str(tmp_path / "gym-instances" / "actor-a" / "replica-0"),
         restore.await_args.args[3],
         deadline_ts=14.0,
     )
@@ -694,7 +729,9 @@ def test_adapter_rejects_agent_records_that_differ_from_the_commit_reply(
         )
 
 
-def test_adapter_rejects_restore_from_another_checkpoint(monkeypatch) -> None:
+def test_adapter_rejects_restore_from_another_checkpoint(
+    monkeypatch, tmp_path: Path
+) -> None:
     from nemo_gym._checkpoint import coordination
 
     client = object()
@@ -725,8 +762,9 @@ def test_adapter_rejects_restore_from_another_checkpoint(monkeypatch) -> None:
         with pytest.raises(RuntimeError, match="wrong checkpoint"):
             await adapter.restore(
                 "restore-1",
-                "/checkpoints/step-1",
+                tmp_path,
                 [GymCheckpointEpisode("rollout-1", 0)],
+                participants=_committed_participants(tmp_path, "actor-a"),
                 source_checkpoint_id="save-1",
                 deadline_ts=10.0,
             )
@@ -743,3 +781,172 @@ def test_adapter_rejects_operations_before_discovery() -> None:
 
     with pytest.raises(RuntimeError, match="has not discovered"):
         asyncio.run(adapter.prepare("save-1", deadline_ts=10.0))
+
+
+@pytest.mark.parametrize(
+    "operation", ["prepare", "renew", "retire", "commit", "resume"]
+)
+def test_a_failed_live_checkpoint_call_crosses_ray_typed(
+    monkeypatch, operation: str
+) -> None:
+    """Gym's CoordinationError cannot be pickled and reaches RL untyped."""
+    from nemo_gym._checkpoint import coordination
+
+    failure = coordination.CoordinationError(
+        operation, {"actor-a-agent": "HTTP 409 deadline_exceeded"}
+    )
+    monkeypatch.setattr(coordination, operation, AsyncMock(side_effect=failure))
+    adapter = GymCheckpointAdapter(
+        instance=GymCheckpointInstance(shard_name="actor-a", replica_index=0),
+        client=object(),
+        auth_token="secret",
+    )
+    adapter._participants = _participants(object(), "actor-a")
+    episodes = [GymCheckpointEpisode("rollout-1", 0)]
+    calls = {
+        "prepare": lambda: adapter.prepare("save-1", deadline_ts=1.0),
+        "renew": lambda: adapter.renew("save-1", deadline_ts=1.0),
+        "retire": lambda: adapter.retire("save-1", episodes, deadline_ts=1.0),
+        "commit": lambda: adapter.commit(
+            "save-1", "/unused", episodes, deadline_ts=1.0
+        ),
+        "resume": lambda: adapter.resume("save-1", deadline_ts=1.0),
+    }
+
+    with pytest.raises(GymCheckpointUnavailable, match="deadline_exceeded") as raised:
+        asyncio.run(calls[operation]())
+
+    restored = pickle.loads(pickle.dumps(raised.value))
+    assert type(restored) is GymCheckpointUnavailable
+    assert str(restored) == str(raised.value)
+
+
+class TestRestoreRequiresTheCommittedTopology:
+    """A participant missing on restore would have its state silently dropped."""
+
+    @staticmethod
+    def _adapter(monkeypatch, members: tuple[tuple[str, str], ...]):
+        from nemo_gym._checkpoint import coordination
+
+        restore = AsyncMock(
+            return_value={
+                name: {"source_checkpoint_id": "save-1"} for name, _ in members
+            }
+        )
+        monkeypatch.setattr(coordination, "restore", restore)
+        adapter = GymCheckpointAdapter(
+            instance=GymCheckpointInstance("actor-a", 0),
+            client=object(),
+            auth_token="secret",
+        )
+        adapter._participants = SimpleNamespace(
+            client=object(),
+            members=tuple(
+                SimpleNamespace(server_name=name, kind=kind) for name, kind in members
+            ),
+        )
+        return adapter, restore
+
+    @staticmethod
+    def _restore(adapter, checkpoint_root: Path, participants) -> None:
+        asyncio.run(
+            adapter.restore(
+                "restore-1",
+                checkpoint_root,
+                [GymCheckpointEpisode("rollout-1", 0)],
+                participants=participants,
+                source_checkpoint_id="save-1",
+                deadline_ts=10.0,
+            )
+        )
+
+    def test_a_deployment_without_a_committed_participant_is_refused(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        recorded = _committed_participants(tmp_path, "actor-a")
+        adapter, restore = self._adapter(
+            monkeypatch, (("actor-a-environment", "environment"),)
+        )
+
+        with pytest.raises(RuntimeError, match=r"missing=\['actor-a-model'\]"):
+            self._restore(adapter, tmp_path, recorded)
+        restore.assert_not_awaited()
+
+    def test_a_participant_the_checkpoint_never_saw_is_refused(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        recorded = _committed_participants(tmp_path, "actor-a")
+        adapter, restore = self._adapter(
+            monkeypatch,
+            (
+                ("actor-a-environment", "environment"),
+                ("actor-a-model", "model"),
+                ("actor-a-resources", "resources"),
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match=r"unexpected=\['actor-a-resources'\]"):
+            self._restore(adapter, tmp_path, recorded)
+        restore.assert_not_awaited()
+
+    def test_a_participant_whose_kind_changed_is_refused(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        recorded = _committed_participants(tmp_path, "actor-a")
+        adapter, restore = self._adapter(
+            monkeypatch,
+            (("actor-a-environment", "environment"), ("actor-a-model", "agent")),
+        )
+
+        with pytest.raises(RuntimeError, match=r"changed_kind=\['actor-a-model'\]"):
+            self._restore(adapter, tmp_path, recorded)
+        restore.assert_not_awaited()
+
+    def test_state_that_is_not_what_was_committed_is_refused(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        recorded = _committed_participants(tmp_path, "actor-a")
+        environment, model = recorded
+        swapped = (
+            environment,
+            GymCheckpointParticipantRecord(
+                server_name=model.server_name,
+                kind=model.kind,
+                instance=model.instance,
+                records_sha256="f" * 64,
+            ),
+        )
+        adapter, restore = self._adapter(
+            monkeypatch,
+            (("actor-a-environment", "environment"), ("actor-a-model", "model")),
+        )
+
+        with pytest.raises(RuntimeError, match="not the state that was committed"):
+            self._restore(adapter, tmp_path, swapped)
+        restore.assert_not_awaited()
+
+    def test_missing_participant_state_is_refused(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        recorded = _committed_participants(tmp_path, "actor-a")
+        adapter, restore = self._adapter(
+            monkeypatch,
+            (("actor-a-environment", "environment"), ("actor-a-model", "model")),
+        )
+
+        with pytest.raises(RuntimeError, match="unreadable for participant"):
+            self._restore(adapter, tmp_path / "elsewhere", recorded)
+        restore.assert_not_awaited()
+
+    def test_the_committed_deployment_restores(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        recorded = _committed_participants(tmp_path, "actor-a")
+        adapter, restore = self._adapter(
+            monkeypatch,
+            (("actor-a-model", "model"), ("actor-a-environment", "environment")),
+        )
+
+        self._restore(adapter, tmp_path, recorded)
+
+        restore.assert_awaited_once()

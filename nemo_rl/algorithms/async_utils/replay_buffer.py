@@ -263,7 +263,11 @@ class DataPlaneCheckpointBarrier:
     """
 
     def __init__(self) -> None:
-        self._condition = asyncio.Condition()
+        lock = asyncio.Lock()
+        self._condition = asyncio.Condition(lock)
+        # Separate from _condition so a finished mutation wakes only waiters for
+        # it, not every mutation queued behind an active checkpoint.
+        self._mutation_finished = asyncio.Condition(lock)
         self._checkpoint_active = False
         self._active_mutations = 0
         self._section_holders: set[asyncio.Task[Any]] = set()
@@ -329,8 +333,24 @@ class DataPlaneCheckpointBarrier:
                 # Count the section even when its body raised. A redundant
                 # snapshot is safe; skipping a partially applied mutation is not.
                 self._mutation_version += 1
+                self._mutation_finished.notify_all()
                 if self._active_mutations == 0:
                     self._condition.notify_all()
+
+    async def wait_for_mutation(self, since_version: int, timeout_s: float) -> None:
+        """Return once a mutation finishes after ``since_version``, or on timeout.
+
+        Read :attr:`mutation_version` before inspecting state, then pass it here:
+        a mutation that lands in between returns at once instead of being missed.
+        """
+        async with self._mutation_finished:
+            try:
+                async with asyncio.timeout(max(0.0, timeout_s)):
+                    await self._mutation_finished.wait_for(
+                        lambda: self._mutation_version != since_version
+                    )
+            except TimeoutError:
+                return
 
     async def drain_telemetry(self) -> DataPlaneCheckpointBarrierTelemetry:
         """Return and reset interval waits while preserving current state."""

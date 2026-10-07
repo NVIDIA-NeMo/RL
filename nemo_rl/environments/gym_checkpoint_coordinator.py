@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 from collections.abc import AsyncIterator, Iterable, Mapping
 from contextlib import asynccontextmanager
@@ -26,15 +27,26 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+import ray
+
 from nemo_rl.environments.gym_checkpoint_adapter import (
+    GYM_CHECKPOINT_PARTICIPANT_KINDS,
     GymCheckpointCommitSummary,
     GymCheckpointEpisode,
+    GymCheckpointParticipantRecord,
     GymCheckpointPrepareSummary,
+    GymCheckpointUnavailable,
 )
 from nemo_rl.environments.nemo_gym import NemoGymShardSet
+from nemo_rl.experience.failures import FailureClass, classify_rollout_failure
 
 GYM_CHECKPOINT_MANIFEST_FILENAME = "gym_checkpoint.json"
 GYM_CHECKPOINT_SCHEMA_VERSION = 2
+# Upper bound on how long past a call's deadline RL waits for Gym's reply. Gym
+# answers by the deadline once it runs the call, so this only covers the reply
+# crossing Ray; a call still unanswered after it was never run.
+_MAX_REPLY_GRACE_S = 5.0
+_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 
 class GymCheckpointOperationError(RuntimeError):
@@ -69,6 +81,26 @@ class GymCheckpointNotReady(RuntimeError):
         )
 
 
+def is_transient_gym_checkpoint_failure(error: BaseException) -> bool:
+    """Whether a failed Gym checkpoint may succeed if it is simply tried again.
+
+    Participants that could not park in time, calls that went unanswered, and
+    actors or control planes that failed a call leave nothing behind: the
+    coordinator resumes Gym, and Gym's lease reopens it if that resume is lost
+    too. Anything else, such as a malformed reply or an ownership or topology
+    mismatch, is a broken invariant that a retry would only hide.
+    """
+    if isinstance(error, GymCheckpointNotReady):
+        return True
+    if isinstance(error, GymCheckpointOperationError):
+        return bool(error.failures) and all(
+            isinstance(failure, GymCheckpointUnavailable)
+            or classify_rollout_failure(failure) is FailureClass.INFRA
+            for failure in error.failures.values()
+        )
+    return False
+
+
 @dataclass(frozen=True)
 class GymCheckpointManifest:
     """Durable mapping from Gym actor instances to continued episodes."""
@@ -77,6 +109,9 @@ class GymCheckpointManifest:
     checkpoint_id: str
     instances: dict[str, tuple[GymCheckpointEpisode, ...]]
     staging_keys: dict[str, tuple[str, ...]]
+    # The Gym participants whose state each instance committed. Restore requires
+    # the live deployment to match, so no participant's state is silently lost.
+    participants: dict[str, tuple[GymCheckpointParticipantRecord, ...]]
 
     def __post_init__(self) -> None:
         if self.schema_version != GYM_CHECKPOINT_SCHEMA_VERSION:
@@ -117,6 +152,34 @@ class GymCheckpointManifest:
                     f"{instance_id!r} contains duplicate staging keys"
                 )
 
+        if set(self.participants) != set(self.instances):
+            raise ValueError(
+                "Gym checkpoint participant topology must match its episode topology"
+            )
+        for instance_id, records in self.participants.items():
+            names = [record.server_name for record in records]
+            if len(names) != len(set(names)):
+                raise ValueError(
+                    "Gym checkpoint instance "
+                    f"{instance_id!r} contains duplicate participants"
+                )
+            for record in records:
+                if not record.server_name or not record.instance:
+                    raise ValueError(
+                        "Gym checkpoint participant "
+                        f"{record!r} must name its server and state directory"
+                    )
+                if record.kind not in GYM_CHECKPOINT_PARTICIPANT_KINDS:
+                    raise ValueError(
+                        "Gym checkpoint participant "
+                        f"{record.server_name!r} has unknown kind {record.kind!r}"
+                    )
+                if not _SHA256_PATTERN.fullmatch(record.records_sha256):
+                    raise ValueError(
+                        "Gym checkpoint participant "
+                        f"{record.server_name!r} has an invalid records_sha256"
+                    )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema_version": self.schema_version,
@@ -129,6 +192,13 @@ class GymCheckpointManifest:
                 instance_id: list(keys)
                 for instance_id, keys in sorted(self.staging_keys.items())
             },
+            "participants": {
+                instance_id: [
+                    asdict(record)
+                    for record in sorted(records, key=lambda item: item.server_name)
+                ]
+                for instance_id, records in sorted(self.participants.items())
+            },
         }
 
     @classmethod
@@ -138,6 +208,7 @@ class GymCheckpointManifest:
             "checkpoint_id",
             "instances",
             "staging_keys",
+            "participants",
         }
         if unknown:
             raise ValueError(
@@ -198,11 +269,39 @@ class GymCheckpointManifest:
                     f"Gym checkpoint staging keys for {instance_id!r} must be strings"
                 )
             staging_keys[instance_id] = tuple(raw_keys)
+        raw_participants = raw.get("participants")
+        if not isinstance(raw_participants, dict):
+            raise ValueError("Gym checkpoint participants must be a mapping")
+        participants: dict[str, tuple[GymCheckpointParticipantRecord, ...]] = {}
+        record_fields = {"server_name", "kind", "instance", "records_sha256"}
+        for instance_id, raw_records in raw_participants.items():
+            if not isinstance(instance_id, str):
+                raise ValueError(
+                    "Gym checkpoint participant instance IDs must be strings"
+                )
+            if not isinstance(raw_records, list):
+                raise ValueError(
+                    f"Gym checkpoint participants for {instance_id!r} must be a list"
+                )
+            records = []
+            for raw_record in raw_records:
+                if not isinstance(raw_record, dict) or set(raw_record) != record_fields:
+                    raise ValueError(
+                        "Gym checkpoint participant must contain exactly "
+                        f"{sorted(record_fields)!r}"
+                    )
+                if not all(isinstance(value, str) for value in raw_record.values()):
+                    raise ValueError(
+                        "Gym checkpoint participant fields must be strings"
+                    )
+                records.append(GymCheckpointParticipantRecord(**raw_record))
+            participants[instance_id] = tuple(records)
         return cls(
             schema_version=schema_version,
             checkpoint_id=checkpoint_id,
             instances=instances,
             staging_keys=staging_keys,
+            participants=participants,
         )
 
 
@@ -282,20 +381,46 @@ class GymCheckpointCoordinator:
         self,
         operation: str,
         references: Mapping[str, Any],
+        *,
+        deadline_ts: float,
     ) -> dict[str, Any]:
-        ordered = list(references)
-        results = await asyncio.gather(
-            *(references[instance_id] for instance_id in ordered),
-            return_exceptions=True,
-        )
-        failures = {
-            instance_id: result
-            for instance_id, result in zip(ordered, results, strict=True)
-            if isinstance(result, BaseException)
+        """Wait for every actor's reply, but never past the call's deadline.
+
+        Gym enforces ``deadline_ts`` only once it runs the call. An actor whose
+        event loop is stuck, or a call Ray never schedules, would otherwise be
+        waited on forever. Giving up is safe: a Gym deployment left parked
+        reopens by itself when its checkpoint lease expires.
+        """
+        tasks = {
+            instance_id: asyncio.ensure_future(reference)
+            for instance_id, reference in references.items()
         }
+        grace_s = min(self._control_timeout_s, _MAX_REPLY_GRACE_S)
+        timeout_s = max(0.0, deadline_ts - time.time()) + grace_s
+        try:
+            await asyncio.wait(tasks.values(), timeout=timeout_s)
+        except BaseException:
+            for task in tasks.values():
+                task.cancel()
+            raise
+        results: dict[str, Any] = {}
+        failures: dict[str, BaseException] = {}
+        for instance_id, task in tasks.items():
+            if not task.done():
+                task.cancel()
+                _cancel_remote(references[instance_id])
+                failures[instance_id] = TimeoutError(
+                    f"no reply within {timeout_s:.1f}s of the {operation} call"
+                )
+            elif task.cancelled():
+                failures[instance_id] = asyncio.CancelledError()
+            elif task.exception() is not None:
+                failures[instance_id] = task.exception()
+            else:
+                results[instance_id] = task.result()
         if failures:
             raise GymCheckpointOperationError(operation, failures)
-        return dict(zip(ordered, results, strict=True))
+        return results
 
     async def prepare(
         self,
@@ -311,6 +436,7 @@ class GymCheckpointCoordinator:
                 )
                 for instance_id, handle in self._handles.items()
             },
+            deadline_ts=deadline_ts,
         )
         summaries = {instance_id: result for instance_id, result in results.items()}
         blockers = {
@@ -333,6 +459,7 @@ class GymCheckpointCoordinator:
                 )
                 for instance_id, handle in self._handles.items()
             },
+            deadline_ts=deadline_ts,
         )
 
     def _validate_inventory(
@@ -371,6 +498,7 @@ class GymCheckpointCoordinator:
                 )
                 for instance_id, episodes in inventory.items()
             },
+            deadline_ts=deadline_ts,
         )
         summaries: dict[str, GymCheckpointCommitSummary] = {}
         for instance_id, summary in raw_summaries.items():
@@ -404,6 +532,20 @@ class GymCheckpointCoordinator:
                 instance_id: staging_keys_of(summary, summary.exported_episodes)
                 for instance_id, summary in summaries.items()
             },
+            participants={
+                instance_id: tuple(
+                    GymCheckpointParticipantRecord(
+                        server_name=participant.server_name,
+                        kind=participant.kind,
+                        instance=participant.manifest.instance,
+                        records_sha256=participant.manifest.records_sha256,
+                    )
+                    for participant in sorted(
+                        summary.participants, key=lambda item: item.server_name
+                    )
+                )
+                for instance_id, summary in summaries.items()
+            },
         )
         await asyncio.to_thread(
             write_gym_checkpoint_manifest,
@@ -433,6 +575,7 @@ class GymCheckpointCoordinator:
                 )
                 for instance_id, episodes in inventory.items()
             },
+            deadline_ts=deadline_ts,
         )
 
     async def retire_restored(
@@ -465,11 +608,13 @@ class GymCheckpointCoordinator:
                         restore_id,
                         str(checkpoint_root),
                         episodes,
+                        participants=manifest.participants[instance_id],
                         source_checkpoint_id=manifest.checkpoint_id,
                         deadline_ts=deadline_ts,
                     )
                     for instance_id, episodes in inventory.items()
                 },
+                deadline_ts=deadline_ts,
             )
         except GymCheckpointOperationError as error:
             # Gym makes one deployment's restore atomic. RL must extend that
@@ -480,6 +625,7 @@ class GymCheckpointCoordinator:
             # coordinator.
             cleanup_errors: list[BaseException] = []
             try:
+                cleanup_deadline_ts = self._deadline()
                 await self._collect(
                     "restore_retire",
                     {
@@ -491,10 +637,11 @@ class GymCheckpointCoordinator:
                                 episode.next_attempt()
                                 for episode in inventory[instance_id]
                             ),
-                            deadline_ts=self._deadline(),
+                            deadline_ts=cleanup_deadline_ts,
                         )
                         for instance_id in inventory
                     },
+                    deadline_ts=cleanup_deadline_ts,
                 )
             except BaseException as cleanup_error:
                 cleanup_errors.append(cleanup_error)
@@ -520,6 +667,7 @@ class GymCheckpointCoordinator:
                 )
                 for instance_id, handle in self._handles.items()
             },
+            deadline_ts=deadline_ts,
         )
 
     async def _renew_until_stopped(
@@ -579,3 +727,14 @@ class GymCheckpointCoordinator:
             raise
         else:
             await self.resume(checkpoint_id)
+
+
+def _cancel_remote(reference: Any) -> None:
+    """Ask Ray to stop a control call RL stopped waiting for; best effort."""
+    if not isinstance(reference, ray.ObjectRef):
+        return
+    try:
+        ray.cancel(reference)
+    except Exception:
+        # The lease still reopens Gym; a failed cancel only leaves the call queued.
+        pass
