@@ -177,6 +177,36 @@ When enabled, the pretty logging will generate formatted text similar to:
 
 ![Validation Pretty Logging Example](../assets/val-log.png)
 
+## Training Conversation Tables
+
+`logger.log_conversations` logs each training step's rollout conversations as
+one W&B table, `train/conversations`, with one row per rollout: the step, the
+sample index, a label, the number of assistant turns, the rendered
+conversation, and the total reward. The rendering groups the system and
+problem prompt into a prompt section shown once, numbers each assistant turn,
+folds long thinking blocks, and shows tool or environment results between
+turns.
+
+```yaml
+logger:
+  wandb_enabled: true
+  log_conversations: true
+  conversation_label_field: null
+```
+
+The table is W&B-only: it goes through `Logger.log_table`, which the other
+backends do not implement, and the configuration is rejected when
+`log_conversations` is on without `wandb_enabled`. The label column falls back
+in order from the field `conversation_label_field` names (a dotted path into
+each row's `extra_env_info`, such as `verifier_metadata.target_hardware`) to
+the batch's `task_name` to the NeMo Gym agent name. The GRPO and asynchronous
+GRPO loops log the table; the synchronous single-controller loop
+(`grpo_train_sync`) holds only per-sample tensors on the driver and prints a
+notice at startup when the setting is on. Building the table decodes every
+rollout of the step on the driver, so leave the setting off outside debugging
+runs. Under dynamic sampling, every extra generation round logs the table at
+the same step and W&B keeps the last round's rows.
+
 ## GPU Metric Logging
 
 NeMo RL monitors GPU memory and utilization through [system metrics](https://docs.ray.io/en/latest/ray-observability/reference/system-metrics.html#system-metrics) exposed by Ray nodes. While Ray makes these metrics available for tools like Prometheus, NeMo RL directly polls GPU memory and utilization data and logs them to TensorBoard, WandB, MLflow and/or SwanLab.
