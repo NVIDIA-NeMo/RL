@@ -10,6 +10,7 @@ defaults: "../configs/grpo_math_1B_megatron.yaml"
 policy:
   # Quantization config applied to the Megatron training worker.
   quant_cfg: "NVFP4_DEFAULT_CFG"
+  quant_fold_frozen_weight_snap: false
   quant_calib_data: "cnn_dailymail"
   quant_calib_size: 512
   quant_batch_size: 1
