@@ -458,10 +458,49 @@ class TestWandbLogger:
         with patch("nemo_rl.utils.logger.subprocess.run", side_effect=fake_run):
             WandbLogger(WandbConfig(project="p", name="n"))
         assert calls == [["git", "rev-parse", "--is-inside-work-tree"]]
+        out = capsys.readouterr().out
+        # git's own reason is printed, not a guess.
         assert (
-            "skipping the wandb source-code and git-diff artifacts"
-            in capsys.readouterr().out
+            "fatal: not a git repository; skipping the wandb source-code and "
+            "git-diff artifacts" in out
         )
+        mock_wandb.Artifact.assert_not_called()
+
+    @patch("nemo_rl.utils.logger.wandb")
+    def test_init_inside_a_git_work_tree_logs_the_git_artifacts(self, mock_wandb):
+        """Inside a work tree the gate lets both artifacts through: a gate that
+        reported False everywhere would pass every other test in this module."""
+        answers = {
+            ("git", "rev-parse", "--is-inside-work-tree"): "true\n",
+            ("git", "ls-files"): "pyproject.toml\n",
+            ("git", "rev-parse", "--abbrev-ref", "HEAD"): "main\n",
+            ("git", "diff", "HEAD"): "",
+        }
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(
+                cmd, returncode=0, stdout=answers[tuple(cmd)], stderr=""
+            )
+
+        with patch("nemo_rl.utils.logger.subprocess.run", side_effect=fake_run):
+            WandbLogger(WandbConfig(project="p", name="n"))
+        assert [c.kwargs["type"] for c in mock_wandb.Artifact.call_args_list] == [
+            "code",
+            "git-diffs",
+        ]
+
+    @patch("nemo_rl.utils.logger.wandb")
+    def test_init_without_a_git_binary_skips_the_git_artifacts(
+        self, mock_wandb, capsys
+    ):
+        with patch(
+            "nemo_rl.utils.logger.subprocess.run",
+            side_effect=FileNotFoundError("No such file or directory: 'git'"),
+        ):
+            WandbLogger(WandbConfig(project="p", name="n"))
+        out = capsys.readouterr().out
+        assert "git is not available" in out
+        assert "skipping the wandb source-code and git-diff artifacts" in out
         mock_wandb.Artifact.assert_not_called()
 
     @patch("nemo_rl.utils.logger.wandb")
