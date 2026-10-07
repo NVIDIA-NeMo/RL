@@ -159,7 +159,7 @@ def test_coordinator_commits_and_restores_each_instance_inventory(
             "tools/replica-1": (),
         }
         await coordinator.restore("restore-1", tmp_path, manifest)
-        await coordinator.discard_restored("restore-1", manifest)
+        await coordinator.retire_restored("restore-1", manifest)
         await coordinator.resume("restore-1")
 
     asyncio.run(exercise())

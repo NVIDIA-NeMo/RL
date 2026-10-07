@@ -38,7 +38,7 @@ from nemo_rl.environments.interfaces import EnvironmentReturn
 from nemo_rl.experience.failures import (
     FailureClass,
     GenerationUnavailable,
-    GymCheckpointParked,
+    GymAdmissionClosed,
     GymTransportError,
     RolloutDataFailure,
     RolloutFailure,
@@ -929,7 +929,7 @@ class _RecordingDispatchRecorder:
         self.events.append(("refused", generation_index))
 
 
-class _ParkingGymMethod:
+class _AdmissionClosedGymMethod:
     """Gym stream whose first dispatch refuses ``parked`` rows at checkpoint admission."""
 
     def __init__(self, parked: set[int], events: list[tuple]) -> None:
@@ -962,14 +962,14 @@ class _ParkingGymMethod:
 
     @staticmethod
     async def _parked_item(rowidx):
-        return GymCheckpointParked("checkpoint_parked", rowidx)
+        return GymAdmissionClosed("admission_closed", rowidx)
 
     async def _admitted_item(self, rowidx):
         await self.release_admitted.wait()
         return await _row_result(rowidx)
 
 
-class TestGymCheckpointParkedRows:
+class TestGymAdmissionClosedRows:
     """A row Gym refuses at checkpoint admission never ran: unwind it, re-send it."""
 
     def test_refused_row_is_unwound_and_resent_without_spending_a_row_attempt(
@@ -979,7 +979,7 @@ class TestGymCheckpointParkedRows:
 
         monkeypatch.setattr(rollout_manager, "_PARKED_REDISPATCH_BACKOFF_S", 0.0)
         events: list[tuple] = []
-        method = _ParkingGymMethod(parked={1}, events=events)
+        method = _AdmissionClosedGymMethod(parked={1}, events=events)
         stats = RolloutStats()
         # One row attempt: a refusal must not consume it.
         impl = _make_gym_impl(method, num_generations=2, row_attempts=1, stats=stats)
@@ -1007,13 +1007,13 @@ class TestGymCheckpointParkedRows:
             ("remote", [1]),
             ("mark", [1]),
         ]
-        assert stats.gym_checkpoint_parked_rows == 1
+        assert stats.gym_admission_closed_rows == 1
         assert stats.gym_row_redispatches == 0
         assert not stats.data_retries_by_reason
 
     def test_nothing_is_submitted_or_marked_while_the_gate_is_closed(self):
         events: list[tuple] = []
-        method = _ParkingGymMethod(parked=set(), events=events)
+        method = _AdmissionClosedGymMethod(parked=set(), events=events)
         impl = _make_gym_impl(method, num_generations=2)
         gate = RolloutDispatchAdmissionGate()
         impl._dispatch_admission_gate = gate
@@ -1059,7 +1059,7 @@ class TestGymCheckpointParkedRows:
         # Long enough for the checkpoint below to close the gate before the re-send.
         monkeypatch.setattr(rollout_manager, "_PARKED_REDISPATCH_BACKOFF_S", 0.2)
         events: list[tuple] = []
-        method = _ParkingGymMethod(parked={1}, events=events)
+        method = _AdmissionClosedGymMethod(parked={1}, events=events)
         method.release_admitted.clear()
         impl = _make_gym_impl(method, num_generations=2, row_attempts=1)
         gate = RolloutDispatchAdmissionGate()

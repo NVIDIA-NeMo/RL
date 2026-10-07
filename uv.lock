@@ -4032,6 +4032,7 @@ dependencies = [
     { name = "hydra-core" },
     { name = "itsdangerous" },
     { name = "jinja2" },
+    { name = "jsonschema" },
     { name = "mcp" },
     { name = "omegaconf" },
     { name = "openai", version = "2.44.0", source = { registry = "https://pypi.org/simple" } },
@@ -4070,15 +4071,17 @@ requires-dist = [
     { name = "flashinfer-python", marker = "extra == 'vllm'", specifier = "==0.6.18" },
     { name = "fonttools", specifier = ">=4.60.2" },
     { name = "gitpython", marker = "extra == 'wandb'", specifier = ">=3.1.61" },
+    { name = "gprof2dot", marker = "extra == 'dev'" },
     { name = "httptools" },
     { name = "hydra-core" },
     { name = "itsdangerous" },
     { name = "jinja2", specifier = ">=3.1" },
+    { name = "jsonschema", specifier = ">=4.18,<5" },
     { name = "mcp", specifier = ">=1.28.1,<2" },
-    { name = "mlflow", specifier = ">=3.16.1" },
-    { name = "mlflow-skinny", specifier = ">=3.16.1" },
+    { name = "mlflow", marker = "extra == 'mlflow'", specifier = ">=3.16.1" },
+    { name = "mlflow-skinny", marker = "extra == 'mlflow'", specifier = ">=3.16.1" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.8.0" },
-    { name = "nemo-gym", extras = ["dev", "sandbox"], marker = "extra == 'all'" },
+    { name = "nemo-gym", extras = ["dev", "mlflow", "sandbox", "wandb"], marker = "extra == 'all'" },
     { name = "nemo-lens", extras = ["sdk"], marker = "extra == 'telemetry'", git = "https://github.com/NVIDIA-NeMo/Lens.git?rev=b0f977d414b2f89938604a0b7eaa78ee08bc8700" },
     { name = "omegaconf" },
     { name = "openai", specifier = "==2.44.0" },
@@ -4113,10 +4116,10 @@ requires-dist = [
     { name = "uvicorn" },
     { name = "uvloop" },
     { name = "vllm", marker = "extra == 'vllm'", specifier = "==0.29.0" },
-    { name = "wandb", specifier = ">=0.30.0" },
+    { name = "wandb", marker = "extra == 'wandb'", specifier = ">=0.30.0" },
     { name = "yappi", specifier = ">=1.7.6" },
 ]
-provides-extras = ["all", "ray", "mlflow", "wandb", "vllm", "sandbox", "openshell", "telemetry", "dev"]
+provides-extras = ["all", "mlflow", "wandb", "vllm", "sandbox", "openshell", "telemetry", "dev"]
 
 [package.metadata.requires-dev]
 codec = [
