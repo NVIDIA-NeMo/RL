@@ -12,7 +12,9 @@ the default eager configuration can waste most of it.
 
 Five rules:
 
-1. **Diagnose before tuning.** The right knob depends on the bottleneck.
+1. **Diagnose before tuning, and decide by A/B.** The right knob depends on the
+   bottleneck. Version-specific rules (for example "PIECEWISE only") expire as
+   vLLM moves, so re-measure them instead of copying them.
 2. **Change one knob (or one declared bundle) at a time.**
 3. **Prove the setting took effect** from the engine log, not from the YAML.
 4. **Gate on logprob consistency and accuracy.** A faster rollout that
@@ -50,9 +52,10 @@ divided by TP × PP.
 
 | Regime | Lever | Notes |
 | :-- | :-- | :-- |
-| Eager + decode-tail-bound (most math/code GRPO/DAPO tests) | **CUDA graphs**: `policy.generation.vllm_cfg.enforce_eager=false` and `++policy.generation.vllm_kwargs.compilation_config.cudagraph_mode=PIECEWISE` | Biggest single lever. Keep the default capture sizes unless the batch exceeds them |
-| Hybrid Mamba models (NemotronH / Nano) | **PIECEWISE only**, plus `++policy.generation.vllm_kwargs.compilation_config.pass_config.fuse_allreduce_rms=false` | In internal Nano V3.5 GRPO runs, FULL graphs (the vLLM default is FULL_AND_PIECEWISE) made rollout logprobs diverge from training: 271–2,548 of 8,192 sequences were masked per step, against 1–5 with PIECEWISE |
-| Other models | Try PIECEWISE first, then the default mode only if the gates pass | If the logprob gates regress, try `compilation_config.backend=eager` (custom kernels instead of Inductor) |
+| Eager + decode-tail-bound (most math/code GRPO/DAPO tests) | **CUDA graphs**: drop `enforce_eager: true` (the inherited default is `False`) and let vLLM use its default `cudagraph_mode` (FULL_AND_PIECEWISE). A/B it against eager and against `cudagraph_mode=PIECEWISE` | Biggest single lever. Pick the mode by A/B, not by rule. Keep the default capture sizes unless the batch exceeds them |
+| Graph mode depends on the vLLM version | vLLM 0.20: **PIECEWISE only**, plus `pass_config.fuse_allreduce_rms=false`. Newer vLLM (0.29 measured): A/B FULL_AND_PIECEWISE first | vLLM 0.20 had an accuracy bug with FULL graphs. In internal Nano V3.5 GRPO runs, 271–2,548 of 8,192 sequences were masked per step, against 1–5 with PIECEWISE. On vLLM 0.29 (cw_dfw H100), `grpo-nanov3-30BA3B-1n8g-fsdp2.v2` and `grpo-nemotron3-super-120BA12B-16n8g-megatron` had the same `token_mult_prob_error` and `gen_kl_error` under FULL_AND_PIECEWISE, and decoded 2.0× and 1.5× faster than under PIECEWISE |
+| FULL_AND_PIECEWISE is not always the winner | Keep PIECEWISE when the A/B says so | `dapo-nanov3.5-30BA3B-4n8g-automodel`: generation was the same (100.4 vs 99.8 s per step), but `token_mult_prob_error` spiked on 6/20 steps against 1/20 with PIECEWISE. `grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2-fp8`: FULL graphs' extra memory left 833 Mamba cache blocks for `max_num_seqs` 1024, so vLLM failed at startup. The driver then sat idle until the job was cancelled, so watch for a missing first step |
+| Logprob gates regress with graphs on | `compilation_config.backend=eager` | This keeps graphs but replays vLLM's custom kernels instead of Inductor-compiled ones. With Inductor, `grpo-gspo-deepscaler-1.5b-8K` went from `token_mult_prob_error` median 1.013 to 1.040 and failed its `gen_kl_error` gate. With `backend=eager` (FULL_AND_PIECEWISE) it kept 1.013 / 0.00044 and still cut generation by 49% and wall time by 40%. The `grpo-deepscaler-1.5b-*` recipes already do this |
 | Tail-bound with many replicas | Keep more, smaller replicas | Nano DAPO at 4n8g: TP8 × 4 was ~25% slower than TP4 × 8 with graphs on |
 | Prefill-heavy, multi-turn | Prefix caching, `max_num_batched_tokens` sweep, session-sticky routing | Budget semantics differ per engine and topology. Sweep instead of copying a number |
 | KV-bound | `gpu_memory_utilization`, `max_num_seqs` | Colocated runs share memory with training, so check training headroom |
@@ -90,15 +93,18 @@ Do not use these:
    CODE_SNAPSHOT_DIRNAME=code_snapshots_perf_base \
      EXTRA_SCRIPT_ARGS="logger.wandb_enabled=False" \
      tools/launch tests/test_suites/llm/<test>.sh
-   CODE_SNAPSHOT_DIRNAME=code_snapshots_perf_cg \
+   CODE_SNAPSHOT_DIRNAME=code_snapshots_perf_full \
+     EXTRA_SCRIPT_ARGS="logger.wandb_enabled=False policy.generation.vllm_cfg.enforce_eager=false" \
+     tools/launch tests/test_suites/llm/<test>.sh
+   CODE_SNAPSHOT_DIRNAME=code_snapshots_perf_pw \
      EXTRA_SCRIPT_ARGS="logger.wandb_enabled=False policy.generation.vllm_cfg.enforce_eager=false ++policy.generation.vllm_kwargs.compilation_config.cudagraph_mode=PIECEWISE" \
      tools/launch tests/test_suites/llm/<test>.sh
    ```
 
-3. **Prove the setting.** The treatment's `ray-driver.log` must show the
-   engine lines `enforce_eager=False`,
-   `'cudagraph_mode': <CUDAGraphMode.PIECEWISE: 1>` and
-   `Capturing CUDA graphs (PIECEWISE)`. The control must show
+3. **Prove the setting.** Each graph arm's `ray-driver.log` must show the
+   engine lines `enforce_eager=False` and
+   `'cudagraph_mode': <CUDAGraphMode.FULL_AND_PIECEWISE: ...>` (or
+   `PIECEWISE`), plus the matching `Capturing CUDA graphs (...)` lines. The control must show
    `<CUDAGraphMode.NONE: 0>`. The helper reads these lines and skips the
    `Overrides:` echo.
 4. **Compare paired steps.** The same seed gives the same data order:
@@ -106,7 +112,7 @@ Do not use these:
    ```bash
    uv run --no-project python .agents/contributor-skills/rollout-perf/rollout_perf_report.py \
      --base code_snapshots_perf_base/<exp>/tests/test_suites/llm/<exp>/metrics.json \
-     --treat code_snapshots_perf_cg/<exp>/tests/test_suites/llm/<exp>/metrics.json
+     --treat code_snapshots_perf_full/<exp>/tests/test_suites/llm/<exp>/metrics.json
    ```
 
 ## 4. Gates (treatment against the same-window control)
@@ -127,7 +133,10 @@ Do not use these:
 ## 5. Land it
 
 - Put the setting in the recipe YAML, with a one-line comment that gives the
-  measured effect.
+  measured effect. Recipes inherit `enforce_eager: False` from the base config,
+  so delete the `enforce_eager: true` line instead of setting it to false.
+  `tools/config_cli.py minimize-check` rejects keys that only repeat a
+  default.
 - If `enforce_eager: true` must stay, add a comment explaining why
   (correctness bug, unsupported model). Reviewers should ask for that comment.
 - Lower `NUM_MINUTES` in the test script to about 2× the new measured wall
@@ -155,3 +164,18 @@ container.
 | Setup | +21 s |
 | Wall time | 152 → 65 min (−57%) |
 | `token_mult_prob_error` median and `gen_kl_error` | Unchanged |
+
+Same-window A/Bs on the cw_dfw nightly tests (H100, container `rl.71856875.sqsh`,
+eager → PIECEWISE). Every arm passed its own `check_metrics` gates, with
+`token_mult_prob_error` and `gen_kl_error` unchanged:
+
+| Test | Generation per step | Wall time |
+| :-- | :-- | :-- |
+| `grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2-fp8` | −85% | 174 → 79 min |
+| `grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2` | −79% | 153 → 83 min |
+| `vlm_grpo-nemotron-omni-30ba3b-clevr-2n8g-megatron-tp8ep8.v1` | −78% | 51 → 29 min |
+| `grpo-math-qwen3-30ba3b-megatron-tp4-32k` | −74% | 123 → 57 min |
+| `vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-automodel-ep8.v1` | −72% | 81 → 41 min |
+| `grpo-qwen3-8b-base-dapo-2n8g-long-megatron-qa-nvfp4-w4a16` | −71% | 164 → 59 min |
+| `vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v2` | −65% | 95 → 79 min |
+| `vlm_grpo-gemma4-e4b-geo3k-1n8g-automodel` | −60% | 59 → 45 min |

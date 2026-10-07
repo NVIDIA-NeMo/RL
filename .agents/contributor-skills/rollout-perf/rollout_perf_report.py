@@ -162,7 +162,7 @@ def diagnose(metrics: dict, log: dict[str, str], max_new_tokens: int | None) -> 
         )
     if log.get("enforce_eager") == "True" or log.get("cudagraph_mode") == "NONE":
         print(
-            "- vLLM runs eager: enable CUDA graphs (PIECEWISE for hybrid Mamba models) and A/B it."
+            "- vLLM runs eager: enable CUDA graphs and A/B the graph mode (default FULL_AND_PIECEWISE vs PIECEWISE)."
         )
     if "max_concurrency" in log:
         print(
