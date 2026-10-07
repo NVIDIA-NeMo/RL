@@ -896,13 +896,13 @@ over every Ray node, trainer nodes included.
 | `[train]` | trainer nodes only | generation nodes hold no storage |
 | `[inference, teacher:<name>]` | any combination of cluster names | — |
 
-Every writer puts on a unit on its own node first (Mooncake's
-`prefer_alloc_in_same_node`, rotating among that node's units by key), then
-on any other unit. So with `[inference]`, generation writes stay local and
-trainer writes cross nodes. Trainer nodes are usually the host-memory-heavy
-ones (model state, optimizer, dataloaders), so `[inference]` is the choice
-when they are tight. Cross-node writes are RDMA either way; the trade is
-memory placement, not correctness.
+Writes carry no placement preference: Mooncake scans the units from a random
+start, so data spreads evenly over all of them and no unit fills ahead of the
+others. Writes may cross nodes; they are RDMA either way. Trainer nodes are
+usually the host-memory-heavy ones (model state, optimizer, dataloaders), so
+`[inference]` is the choice when they are tight; the trade is memory
+placement, not correctness. (Mooncake's `prefer_alloc_in_same_node` would keep
+writes local, but its Python put/upsert paths, which TQ uses, reject it.)
 
 On a colocated run train and inference are the same cluster, so every option
 picks the same nodes (setup logs a warning when a name you left out shares
@@ -923,9 +923,8 @@ Registered memory is pinned once per RDMA NIC, so per-process buffers add up
 quickly across many GPU processes — another reason to keep segments in a few
 CPU units rather than in every client.
 
-**Capacity is a hard limit when separated.** A put that finds its node's
-units full spills to another unit (Mooncake scans at most 100 others), and
-once the units are full puts fail — there are no client segments to fall
+**Capacity is a hard limit when separated.** A put scans the units from a
+random start (at most 100 of them), and once the units are full puts fail — there are no client segments to fall
 back on.
 
 ### Experimental Mooncake storage checkpoints
