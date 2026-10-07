@@ -795,6 +795,7 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
     ctrl._advantage_estimator = estimator
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = True
+    ctrl._seq_logprob_error_in_loss = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
@@ -895,6 +896,7 @@ def test_advantage_stage_writes_each_sample_filter_without_seq_threshold(
     ctrl._advantage_estimator = estimator
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = False
+    ctrl._seq_logprob_error_in_loss = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
@@ -960,6 +962,7 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
     ctrl._advantage_estimator = estimator
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = True
+    ctrl._seq_logprob_error_in_loss = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
@@ -1026,6 +1029,7 @@ def test_advantage_stage_clips_training_values_and_metrics() -> None:
     ctrl._advantage_estimator = estimator
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = False
+    ctrl._seq_logprob_error_in_loss = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
@@ -1094,6 +1098,7 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
     ctrl._advantage_estimator = estimator
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = True
+    ctrl._seq_logprob_error_in_loss = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
@@ -1156,6 +1161,7 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
     ctrl._advantage_estimator = estimator
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = False
+    ctrl._seq_logprob_error_in_loss = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
@@ -1237,6 +1243,7 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
     ctrl._advantage_estimator = FakeEstimator()
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = True
+    ctrl._seq_logprob_error_in_loss = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = True
     ctrl._is_ppo = False
@@ -2554,6 +2561,7 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     ctrl._advantage_estimator = estimator
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._policy_logprobs_required = False
+    ctrl._seq_logprob_error_in_loss = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = True

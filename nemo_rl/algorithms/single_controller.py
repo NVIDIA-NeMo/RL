@@ -338,11 +338,16 @@ class SingleControllerActor:
             or self._algo_cfg.malformed_thinking_advantage is not None
         )
 
+        # The in-loss path evaluates seq_logprob_error_threshold in the trainer,
+        # so no separate policy-logprob pass or pre-training mask is needed.
+        self._seq_logprob_error_in_loss = (
+            master_config.loss_fn.seq_logprob_error_in_loss
+        )
         self._policy_logprobs_required = not (
             master_config.loss_fn.force_on_policy_ratio
             and (
                 self._algo_cfg.seq_logprob_error_threshold is None
-                or master_config.loss_fn.seq_logprob_error_in_loss
+                or self._seq_logprob_error_in_loss
             )
         )
         # _build_trainer initializes the reference model only for a positive KL
@@ -5102,10 +5107,10 @@ class SingleControllerActor:
                 # Match legacy GRPO's all-response baseline only in the opt-in
                 # single-forward path. Its survivor mask becomes known in loss.
                 # Keep SC's existing survivor-based baseline when disabled.
+                # Token-capture placeholders are rejected with this mode at
+                # config validation, so no placeholder row can vote here.
                 valid_mask=(
-                    None
-                    if self._master_config.loss_fn.seq_logprob_error_in_loss
-                    else final_sample_mask
+                    None if self._seq_logprob_error_in_loss else final_sample_mask
                 ),
                 **kwargs,
             )
