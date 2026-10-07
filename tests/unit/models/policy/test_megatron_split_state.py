@@ -170,10 +170,11 @@ def _make_worker(loss_type):
     w._opd_full_lm_head_evicted = False
     w.media_placeholder_token_id = None
     # Model-capability flags __init__ derives from self.model, which
-    # object.__new__ skips. train_microbatch passes all four straight through
+    # object.__new__ skips. train_microbatch passes these straight through
     # to get_microbatch_iterator, so the plain-model defaults (NeMo-RL owns
     # packing and CP sharding, no MTP) have to be spelled out here.
     w.delegate_pack_to_model = False
+    w.create_router_padding_mask = False
     w.delegate_mtp_loss_mask_to_model = False
     w.model_slices_context_parallel_inputs = False
     w.mtp_enabled = False
@@ -427,13 +428,19 @@ class TestAssertStepOpen:
 
 
 class TestTrainMicrobatch:
-    def test_forwards_multimodal_iterator_capabilities(self, mock_module_symbols):
+    @pytest.mark.parametrize("create_router_padding_mask", [False, True])
+    def test_forwards_multimodal_iterator_capabilities(
+        self,
+        mock_module_symbols: dict[str, MagicMock],
+        create_router_padding_mask: bool,
+    ) -> None:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = _make_worker(LossType.TOKEN_LEVEL)
         w.media_placeholder_token_id = 42
         w.delegate_pack_to_model = True
         w.delegate_mtp_loss_mask_to_model = True
+        w.create_router_padding_mask = create_router_padding_mask
         batch = _fake_batch()
 
         with patch(
@@ -447,6 +454,9 @@ class TestTrainMicrobatch:
         assert iterator_kwargs["delegate_pack_to_model"] is True
         assert iterator_kwargs["delegate_mtp_loss_mask_to_model"] is True
         assert iterator_kwargs["model_slices_context_parallel_inputs"] is False
+        assert (
+            iterator_kwargs["create_router_padding_mask"] is create_router_padding_mask
+        )
 
     def test_wraps_forward_backward_in_no_sync(self, mock_module_symbols):
         """The single most important assertion in this file. Without the
