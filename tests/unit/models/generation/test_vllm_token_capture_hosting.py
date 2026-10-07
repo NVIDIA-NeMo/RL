@@ -53,9 +53,11 @@ from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
 
 from nemo_rl.data_plane.tq_token_sink import ChainPrefixCache  # noqa: E402
 from nemo_rl.models.generation.generation_cut_capture import (  # noqa: E402
+    GenerationPrefixBatchLimits,
     _remaining_generation_limits_after_prefix,
     _TokenCaptureSnapshotGate,
 )
+from nemo_rl.models.generation.prefix_read_batcher import PrefixReadBatcher  # noqa: E402
 from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration  # noqa: E402
 from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
     VllmAsyncGenerationWorkerImpl,
@@ -98,6 +100,22 @@ class _MemorySink:
         self.generation_prefix_keys.append(key)
         return StageResult(ok=True, staging_key=key)
 
+    def stage_generation_prefix_batch(
+        self,
+        records: list[StagedCallRecord],
+        *,
+        checkpoint_id: str,
+        chunk_sequences: list[int],
+    ) -> list[StageResult]:
+        return [
+            self.stage_generation_prefix(
+                record,
+                checkpoint_id=checkpoint_id,
+                chunk_sequence=sequence,
+            )
+            for record, sequence in zip(records, chunk_sequences, strict=True)
+        ]
+
     def clear(self, staging_keys: list[str]) -> None:
         self.cleared_generation_prefix_keys.extend(staging_keys)
 
@@ -120,6 +138,9 @@ def _fake_worker(*, is_model_owner: bool = True) -> SimpleNamespace:
         _capture_calls_by_model_call_id={},
         _completed_capture_calls={},
         _generation_cut_receipts={},
+        _generation_prefix_batch_limits=GenerationPrefixBatchLimits(
+            max_rows=256, max_tokens=4_194_304
+        ),
         _capture_registry_lock=threading.Lock(),
         _capture_sink=None,
         _generation_prefix_cuts_enabled=False,
@@ -128,6 +149,7 @@ def _fake_worker(*, is_model_owner: bool = True) -> SimpleNamespace:
         _generation_cut_tokenizer=_ByteTokenizer(),
         _token_capture_snapshot_gate=_TokenCaptureSnapshotGate(),
         _staging_source=None,
+        _generation_prefix_reader=None,
         _capture_media=False,
     )
     worker.install_token_capture = lambda capture: setattr(
@@ -158,6 +180,10 @@ def test_setup_token_capture_installs_capture_with_vllm_adapter(monkeypatch):
 
     assert installed is True
     assert isinstance(worker.token_capture, RolloutTokenCapture)
+    assert isinstance(worker._generation_prefix_reader, PrefixReadBatcher)
+    assert worker._generation_prefix_batch_limits == GenerationPrefixBatchLimits(
+        max_rows=256, max_tokens=4_194_304
+    )
     assert worker.token_capture.adapter is not None
     # The adapter is the vLLM one (prefix ids enter via the worker's field).
     payload = worker.token_capture.adapter.enter_prefix({}, [1, 2])
@@ -232,6 +258,8 @@ def test_generation_setup_token_capture_fans_out(monkeypatch):
         {"backend": "simple"},
         "rollout_staging",
         generation_cut_control_timeout_s=60.0,
+        generation_prefix_batch_size=128,
+        generation_prefix_batch_max_tokens=2048,
     )
     gen.worker_group.run_all_workers_single_data.assert_called_once_with(
         "setup_token_capture",
@@ -241,6 +269,8 @@ def test_generation_setup_token_capture_fans_out(monkeypatch):
         generation_prefix_cuts_enabled=False,
         generation_cut_control_token=None,
         generation_cut_control_timeout_s=60.0,
+        generation_prefix_batch_size=128,
+        generation_prefix_batch_max_tokens=2048,
         run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
     )
 
@@ -566,6 +596,9 @@ def _worker_with_capture(sink: _MemorySink):
         "_finish_request_capture_with_lifecycle_owned",
         "_restore_response_prefix",
         "_checkpoint_active_generation_cut",
+        "_require_generation_prefix_batch_limits",
+        "_generation_cut_transaction",
+        "_checkpoint_generation_cut_batched",
         "_completed_generation_cut_ack",
         "_checkpoint_generation_cut",
     ):
@@ -578,6 +611,322 @@ def _worker_with_capture(sink: _MemorySink):
         adapter=VLLMCaptureAdapter(),
     )
     return worker
+
+
+class _BatchPrefixSink(_MemorySink):
+    def __init__(self) -> None:
+        super().__init__()
+        self.batches: list[list[int]] = []
+        self.failure: str | None = None
+        self.before_write = lambda: None
+
+    def stage_generation_prefix_batch(self, records, *, checkpoint_id, chunk_sequences):
+        self.batches.append([len(record.token_ids_delta) for record in records])
+        self.before_write()
+        results = super().stage_generation_prefix_batch(
+            records,
+            checkpoint_id=checkpoint_id,
+            chunk_sequences=chunk_sequences,
+        )
+        if self.failure == "raise":
+            raise RuntimeError("injected batch transport failure after writes")
+        if self.failure == "short":
+            return results[:-1]
+        if self.failure == "partial":
+            results[-1] = StageResult(
+                ok=False,
+                staging_key=results[-1].staging_key,
+                error="injected partial failure",
+            )
+        if self.failure == "wrong-key":
+            results[-1] = StageResult(ok=True, staging_key="wrong-key")
+        return results
+
+
+def _batch_worker_fixture(lengths, *, batch_size=256, max_tokens=4_194_304):
+    sink = _BatchPrefixSink()
+    worker = _worker_with_capture(sink)
+    worker._generation_prefix_batch_limits = GenerationPrefixBatchLimits(
+        max_rows=batch_size,
+        max_tokens=max_tokens,
+    )
+    requests, prefixes = [], []
+    for i, length in enumerate(lengths):
+        request = _FakeRequest(
+            ng_capture={
+                "rollout_id": f"r{i}",
+                "model_call_id": f"c{i}",
+                "parent_call_id": None,
+                "prev_len": 0,
+                "mode": "text",
+            },
+            stream=False,
+        )
+        VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10])
+        state = worker._capture_calls[id(request)]
+        state.effective_output_limit = 128
+        with state.lock:
+            state.observe(list(range(20, 20 + length)), [-0.1] * length)
+        requests.append(request)
+        prefixes.append(
+            GenerationCutPrefix(
+                ticket_id=f"t{i}",
+                rollout_id=f"r{i}",
+                attempt=0,
+                model_call_id=f"c{i}",
+                admitted_at=1.0,
+            )
+        )
+    inventory = GenerationCutInventory.build(
+        checkpoint_id="batch-cut",
+        server_name="policy",
+        active_prefixes=prefixes,
+    )
+    return worker, sink, requests, inventory
+
+
+def test_worker_batches_1000_prefixes_and_caches_receipt():
+    worker, sink, requests, inventory = _batch_worker_fixture([2] * 1000)
+    receipt = worker._checkpoint_generation_cut(inventory)
+
+    assert [len(batch) for batch in sink.batches] == [256, 256, 256, 232]
+    assert [ack.ticket_id for ack in receipt.prefixes] == [
+        prefix.ticket_id for prefix in inventory.active_prefixes
+    ]
+    assert all(ack.prefix_token_count == 2 for ack in receipt.prefixes)
+    assert all(worker._capture_calls[id(r)].frozen_buffer is None for r in requests)
+    assert worker._checkpoint_generation_cut(inventory) is receipt
+    assert len(sink.batches) == 4
+
+
+def test_worker_batch_token_limit_handles_ragged_and_oversized_rows():
+    worker, sink, _, inventory = _batch_worker_fixture([1, 2, 8, 1], max_tokens=5)
+    worker._checkpoint_generation_cut(inventory)
+    assert sink.batches == [[2, 3], [9], [2]]  # First chunks include the prompt.
+
+
+@pytest.mark.parametrize("failure", ["raise", "short", "partial", "wrong-key"])
+def test_worker_batch_failure_rolls_back_every_unsealed_row(failure):
+    worker, sink, requests, inventory = _batch_worker_fixture([2, 3, 4])
+    sink.failure = failure
+
+    with pytest.raises(RuntimeError):
+        worker._checkpoint_generation_cut(inventory)
+
+    assert not worker._generation_cut_receipts
+    assert set(sink.generation_prefix_keys) <= set(sink.cleared_generation_prefix_keys)
+    for request, length in zip(requests, [2, 3, 4], strict=True):
+        state = worker._capture_calls[id(request)]
+        assert state.frozen_buffer is None
+        assert not state.generation_cut_staging_keys
+        assert not state.sealed_generated_token_ids
+        assert len(state.active_buffer.generated_token_ids) == length
+        assert state.lifecycle_lock.acquire(blocking=False)
+        state.lifecycle_lock.release()
+
+    sink.failure = None
+    receipt = worker._checkpoint_generation_cut(inventory)
+    assert [ack.prefix_token_count for ack in receipt.prefixes] == [2, 3, 4]
+
+
+def test_worker_batch_validates_every_ack_before_sealing(monkeypatch):
+    from nemo_gym._checkpoint import generation_cut
+
+    worker, sink, requests, inventory = _batch_worker_fixture([2, 3])
+    original = generation_cut.GenerationCutPrefixAck
+
+    def reject_second(**kwargs):
+        if kwargs["model_call_id"] == "c1":
+            raise ValueError("injected acknowledgement failure")
+        return original(**kwargs)
+
+    monkeypatch.setattr(generation_cut, "GenerationCutPrefixAck", reject_second)
+    with pytest.raises(ValueError, match="injected acknowledgement failure"):
+        worker._checkpoint_generation_cut(inventory)
+
+    for request in requests:
+        state = worker._capture_calls[id(request)]
+        assert state.frozen_buffer is None
+        assert not state.sealed_generated_token_ids
+        assert not state.generation_cut_staging_keys
+    assert set(sink.generation_prefix_keys) <= set(sink.cleared_generation_prefix_keys)
+
+
+def test_worker_batch_retains_earlier_success_on_later_batch_failure():
+    worker, sink, requests, inventory = _batch_worker_fixture([2] * 3, batch_size=2)
+
+    def fail_second():
+        if len(sink.batches) == 2:
+            sink.failure = "partial"
+
+    sink.before_write = fail_second
+    with pytest.raises(RuntimeError):
+        worker._checkpoint_generation_cut(inventory)
+
+    earlier_keys = set(sink.generation_prefix_keys[:2])
+    assert earlier_keys.isdisjoint(sink.cleared_generation_prefix_keys)
+    sink.failure = None
+    sink.before_write = lambda: None
+    for request in requests:
+        state = worker._capture_calls[id(request)]
+        with state.lock:
+            state.observe([99], [-0.2])
+    receipt = worker._checkpoint_generation_cut(inventory)
+    assert [ack.prefix_token_count for ack in receipt.prefixes] == [3, 3, 3]
+    assert [len(ack.staging_keys) for ack in receipt.prefixes] == [2, 2, 1]
+    assert earlier_keys.isdisjoint(sink.cleared_generation_prefix_keys)
+
+
+def test_worker_batch_preparation_failure_releases_pending_calls():
+    worker, sink, requests, inventory = _batch_worker_fixture([2, 3])
+    worker._capture_calls[id(requests[1])].effective_output_limit = None
+
+    with pytest.raises(RuntimeError, match="effective output limit"):
+        worker._checkpoint_generation_cut(inventory)
+
+    assert not sink.batches
+    for request in requests:
+        state = worker._capture_calls[id(request)]
+        assert state.frozen_buffer is None
+        assert not state.sealed_generated_token_ids
+        assert state.lifecycle_lock.acquire(blocking=False)
+        state.lifecycle_lock.release()
+
+
+def test_worker_batch_past_deadline_fails_calls_not_yet_written(monkeypatch):
+    from nemo_rl.models.generation import generation_cut_capture
+
+    worker, sink, requests, inventory = _batch_worker_fixture([2, 3, 4], batch_size=2)
+    clock = {"now": 0.0}
+    monkeypatch.setattr(
+        generation_cut_capture, "time", SimpleNamespace(monotonic=lambda: clock["now"])
+    )
+
+    def expire_during_first_write():
+        clock["now"] = 10.0
+
+    sink.before_write = expire_during_first_write
+    receipt = worker._checkpoint_generation_cut(inventory, deadline=5.0)
+
+    # The batch already writing completes; the call not yet reached fails.
+    receipt.validate_for(inventory)
+    assert sink.batches == [[3, 4]]  # First chunks include the prompt.
+    assert [ack.disposition for ack in receipt.prefixes] == [
+        "durable_prefix",
+        "durable_prefix",
+        "durable_failure",
+    ]
+    state = worker._capture_calls[id(requests[2])]
+    assert state.frozen_buffer is None
+    assert not state.generation_cut_staging_keys
+    assert len(state.active_buffer.generated_token_ids) == 4
+
+
+def test_worker_batch_past_deadline_rolls_back_pending_calls(monkeypatch):
+    from nemo_rl.models.generation import generation_cut_capture
+
+    worker, sink, requests, inventory = _batch_worker_fixture([2, 3, 4], batch_size=3)
+    # Every call is frozen before the deadline; it passes before their write.
+    readings = iter([0.0, 0.0, 0.0])
+    monkeypatch.setattr(
+        generation_cut_capture,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(readings, 10.0)),
+    )
+
+    receipt = worker._checkpoint_generation_cut(inventory, deadline=5.0)
+
+    receipt.validate_for(inventory)
+    assert not sink.batches
+    assert [ack.disposition for ack in receipt.prefixes] == ["durable_failure"] * 3
+    for request, length in zip(requests, [2, 3, 4], strict=True):
+        state = worker._capture_calls[id(request)]
+        assert state.frozen_buffer is None
+        assert not state.sealed_generated_token_ids
+        assert len(state.active_buffer.generated_token_ids) == length
+        assert state.lifecycle_lock.acquire(blocking=False)
+        state.lifecycle_lock.release()
+
+
+def test_worker_batch_observation_continues_while_lifecycle_waits():
+    worker, sink, requests, inventory = _batch_worker_fixture([2, 3])
+    state = worker._capture_calls[id(requests[0])]
+    write_started = threading.Event()
+    release_write = threading.Event()
+    lifecycle_done = threading.Event()
+
+    def block_write():
+        write_started.set()
+        assert release_write.wait(5)
+
+    sink.before_write = block_write
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        cut = executor.submit(worker._checkpoint_generation_cut, inventory)
+        assert write_started.wait(5)
+
+        def terminal_operation():
+            with state.lifecycle_lock:
+                lifecycle_done.set()
+
+        terminal = executor.submit(terminal_operation)
+        try:
+            assert not lifecycle_done.wait(0.05)
+            with state.lock:
+                state.observe([99], [-0.2])
+        finally:
+            release_write.set()
+        receipt = cut.result(timeout=5)
+        terminal.result(timeout=5)
+
+    assert receipt.prefixes[0].prefix_token_count == 2
+    assert state.active_buffer.generated_token_ids == [99]
+    assert state.sealed_generated_token_ids == [20, 21]
+
+
+@pytest.mark.parametrize("batch_size", [1, 256])
+def test_worker_batch_consecutive_cuts_reuse_then_append(batch_size):
+    worker, sink, requests, inventory = _batch_worker_fixture(
+        [2, 3], batch_size=batch_size
+    )
+    first = worker._checkpoint_generation_cut(inventory)
+    second_inventory = GenerationCutInventory.build(
+        checkpoint_id="second-cut",
+        server_name="policy",
+        active_prefixes=inventory.active_prefixes,
+    )
+    second = worker._checkpoint_generation_cut(second_inventory)
+    assert [ack.staging_keys for ack in second.prefixes] == [
+        ack.staging_keys for ack in first.prefixes
+    ]
+    assert len(sink.generation_prefix_keys) == 2
+
+    for request in requests:
+        state = worker._capture_calls[id(request)]
+        with state.lock:
+            state.observe([99], [-0.2])
+    third_inventory = GenerationCutInventory.build(
+        checkpoint_id="third-cut",
+        server_name="policy",
+        active_prefixes=inventory.active_prefixes,
+    )
+    third = worker._checkpoint_generation_cut(third_inventory)
+    assert [ack.prefix_token_count for ack in third.prefixes] == [3, 4]
+    assert all(len(ack.staging_keys) == 2 for ack in third.prefixes)
+    assert [
+        list(record.token_ids_delta)
+        for _, record in sink.generation_prefix_records[-2:]
+    ] == [[99], [99]]
+
+
+def test_worker_batch_mixes_zero_token_and_active_calls():
+    worker, sink, _, inventory = _batch_worker_fixture([2, 0, 3])
+    receipt = worker._checkpoint_generation_cut(inventory)
+    assert [len(batch) for batch in sink.batches] == [2]
+    assert [ack.disposition for ack in receipt.prefixes] == [
+        "durable_prefix",
+        "durable_failure",
+        "durable_prefix",
+    ]
 
 
 class _MemoryPrefixSource:
@@ -1008,6 +1357,10 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion(caplog):
         cut = resumed_worker._resolve_generation_cut(admission, [])
     expected_sha = hashlib.sha256(b"12,13").hexdigest()
     assert f"prefix_ids_sha256={expected_sha}" in caplog.text
+    resumed_worker._staging_source.calls.clear()
+    prefetched_cut = resumed_worker._resolve_generation_cut(admission, [], [cut_record])
+    assert prefetched_cut == cut
+    assert resumed_worker._staging_source.calls == []
     VllmAsyncGenerationWorkerImpl._begin_request_capture(
         resumed_worker,
         request,

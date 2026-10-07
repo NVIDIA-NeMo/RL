@@ -714,6 +714,15 @@ def test_recovery_config_rejects_removed_prefix_fields(removed_field: str):
         RolloutRecoveryConfig.model_validate({removed_field: True})
 
 
+@pytest.mark.parametrize(
+    "field",
+    ["generation_prefix_batch_size", "generation_prefix_batch_max_tokens"],
+)
+def test_recovery_config_rejects_nonpositive_prefix_batch_limits(field: str):
+    with pytest.raises(ValueError, match=field):
+        RolloutRecoveryConfig.model_validate({field: 0})
+
+
 class TestSetup:
     """setup arg validation + actor_args assembly."""
 
@@ -1978,6 +1987,8 @@ class TestSetup:
         )
         mc.token_capture.enabled = True
         mc.token_capture.num_reassembler_workers = 3
+        mc.rollout_recovery.generation_prefix_batch_size = 17
+        mc.rollout_recovery.generation_prefix_batch_max_tokens = 4096
         patched_factories["setup_response_data"].return_value = (
             list(range(8)),
             None,
@@ -2034,6 +2045,8 @@ class TestSetup:
         assert setup_kwargs["generation_cut_control_timeout_s"] == (
             mc.token_capture.control_timeout_s
         )
+        assert setup_kwargs["generation_prefix_batch_size"] == 17
+        assert setup_kwargs["generation_prefix_batch_max_tokens"] == 4096
 
     def test_nemo_gym_coverage_failure_shuts_down_shards(self, patched_factories):
         mc = _make_master_config(colocated=False, backend="vllm")
