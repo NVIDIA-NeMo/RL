@@ -1655,12 +1655,16 @@ def ppo_train(
                         {
                             "input_ids": train_data["input_ids"],
                             "input_lengths": train_data["input_lengths"],
+                            "token_mask": train_data["token_mask"],
+                            "sample_mask": train_data["sample_mask"],
                             **extra_multimodal_data,
                         }
                     )
-                    train_data["prev_logprobs"] = policy.get_logprobs(
-                        logprob_data, timer=timer
-                    )["logprobs"]
+                    prev_lp_result = policy.get_logprobs(logprob_data, timer=timer)
+                    train_data["prev_logprobs"] = prev_lp_result["logprobs"]
+                    # Propagate the top-k/top-p neginf mask so the loss skips these positions.
+                    if "token_mask" in prev_lp_result:
+                        train_data["token_mask"] = prev_lp_result["token_mask"]
 
                     if not master_config.ppo.skip_reference_policy_logprobs_calculation:
                         train_data["reference_policy_logprobs"] = (
@@ -1975,12 +1979,6 @@ def ppo_train(
 
                     full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
-                        assert full_metric_name.startswith(
-                            "train:"
-                        ) or full_metric_name.startswith("val:"), (
-                            f"metric_name={full_metric_name} must start with 'val:' or 'train:',\n"
-                            f'followed by the corresponding name in the "val" or "train" metrics dictionary.'
-                        )
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics
                         if not metrics_source:
@@ -2681,12 +2679,16 @@ def async_ppo_train(
                         {
                             "input_ids": train_data["input_ids"],
                             "input_lengths": train_data["input_lengths"],
+                            "token_mask": train_data["token_mask"],
+                            "sample_mask": train_data["sample_mask"],
                             **extra_multimodal_data,
                         }
                     )
-                    train_data["prev_logprobs"] = policy.get_logprobs(
-                        logprob_data, timer=timer
-                    )["logprobs"]
+                    prev_lp_result = policy.get_logprobs(logprob_data, timer=timer)
+                    train_data["prev_logprobs"] = prev_lp_result["logprobs"]
+                    # Propagate the top-k/top-p neginf mask so the loss skips these positions.
+                    if "token_mask" in prev_lp_result:
+                        train_data["token_mask"] = prev_lp_result["token_mask"]
                     if not master_config.ppo.skip_reference_policy_logprobs_calculation:
                         train_data["reference_policy_logprobs"] = (
                             policy.get_reference_policy_logprobs(
@@ -2962,12 +2964,6 @@ def async_ppo_train(
                     # sync ppo_train and async_grpo_train).
                     full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
-                        assert full_metric_name.startswith(
-                            "train:"
-                        ) or full_metric_name.startswith("val:"), (
-                            f"metric_name={full_metric_name} must start with 'val:' or 'train:',\n"
-                            f'followed by the corresponding name in the "val" or "train" metrics dictionary.'
-                        )
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics
                         if not metrics_source:
