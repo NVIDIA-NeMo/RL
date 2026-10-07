@@ -100,10 +100,11 @@ CODE_DIR=$PWD sbatch --export=ALL,CODE_DIR=$PWD --account=nemotron_n4_omni --par
 ```
 
 `build_inside.sh` replays `docker/Dockerfile`'s base, hermetic and release stages
-(uv 0.11.28, Python 3.13.14, `uv sync --frozen` for the default, `vllm`, `mcore`,
-`automodel` and `modelopt` extras, one container-owned venv per Ray actor under
-`/opt/ray_venvs`, editable installs, the container fingerprint); SGLang and
-TRT-LLM are skipped. The rootfs lives on the node's tmpfs (the `/raid` Enroot
+(uv 0.11.28, Python 3.13.14, `uv lock --check`, `uv sync --frozen` for the
+default, `vllm`, `mcore`, `automodel` and `modelopt` extras, one container-owned
+venv per Ray actor under `/opt/ray_venvs`, editable installs, the container
+fingerprint); SGLang and TRT-LLM are skipped. The checked-in `uv.lock` pins Ray
+2.58.0 for the whole workspace so the head and every worker venv agree. The rootfs lives on the node's tmpfs (the `/raid` Enroot
 path is quota-limited) with the home mount disabled (root remapping would
 otherwise put uv's cache in the quota-limited home). Output:
 `/lustre/fsw/portfolios/nemotron/users/arushig/images/nemo-rl-cc-pr4200.sqsh`
@@ -211,6 +212,17 @@ Verified here:
   `setup_single_controller`: SingleController checkpointing with the built-in
   samplers requires `checkpointing.save_data_plane: true` (a setup-time rule the
   CPU validator does not run). The recipe now sets it.
+- The second and third attempts got through data loading and topology selection
+  and died at the first actor creation with "Failed to connect to GCS". Ray's
+  synced `gcs_server.err` showed the GCS aborting on an unregistered pubsub
+  channel. Cause: a Ray version skew inside the image. The driver venv that runs
+  the Ray head had ray 2.56.1 (RL's lock), but every worker venv had ray 2.59.0,
+  because the Gym PR head requires `ray>=2.58.0`, RL's `uv.lock` was out of date
+  for it, and the venv prefetch re-syncs non-frozen. A 2.59 worker publishing
+  its version-mismatch error crashed the 2.56 GCS. Fix: `uv lock` with Ray
+  pinned to 2.58.0 (the version the PRs were qualified on), re-sync every venv in
+  the image (`container/patch_container.sbatch`), and make the build fail on a
+  stale lock (`uv lock --check` in `build_inside.sh`).
 
 Not yet verified (requires GPU allocations):
 

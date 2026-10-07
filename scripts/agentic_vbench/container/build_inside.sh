@@ -95,6 +95,11 @@ cd /opt/nemo-rl
 git config --global --add safe.directory '*'
 
 # ---- hermetic stage: dependency warmup + worker venvs ------------------------
+# The Dockerfile verifies the lock late (after the TRT-LLM layer, skipped here).
+# Verify it now: prefetch_venvs.py re-syncs each venv non-frozen, so a stale lock
+# would silently give the worker venvs different versions (e.g. Ray) than the
+# driver venv that runs the Ray head, and a version-mismatched worker aborts the GCS.
+uv lock --check
 uv venv --seed
 uv cache clean deep-ep || true
 UV_LINK_MODE=hardlink uv sync --frozen --no-install-project

@@ -35,6 +35,14 @@ uv run --no-sync python -c "import ray, transformers, nemo_rl.algorithms.single_
 /opt/ray_venvs/nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker/bin/python -c "import importlib.util as u, importlib.metadata as m; assert u.find_spec(\"megatron.core\") and u.find_spec(\"transformer_engine\") and u.find_spec(\"megatron.bridge\"); print(\"mcore venv ok TE\", m.version(\"transformer-engine\"))"
 /opt/ray_venvs/nemo_rl.environments.nemo_gym.NemoGym/bin/python -c "import nemo_rl.environments.gym_selection, nemo_gym.token_id_capture.completion, responses_api_agents.agentic_vbench_agent.app, responses_api_agents.agentic_vbench_agent.capture_proxy; print(\"gym venv ok\")"
 /opt/ray_venvs/nemo_rl.experience.rollout_reassembler_actor.RolloutReassemblerActor/bin/python -c "import nemo_rl.experience.rollout_reassembler; print(\"reassembler venv ok\")"
+echo "== Ray version consistency (the head runs from /opt/nemo_rl_venv; every worker venv must match) =="
+head_ray=$(/opt/nemo_rl_venv/bin/python -c "import ray; print(ray.__version__)")
+for v in /opt/ray_venvs/*; do
+  worker_ray=$("$v/bin/python" -c "import ray; print(ray.__version__)")
+  printf "%-95s ray=%s\n" "$v" "$worker_ray"
+  [[ "$worker_ray" == "$head_ray" ]] || { echo "Ray version skew: $v has $worker_ray, head venv has $head_ray" >&2; exit 1; }
+done
+echo "ray=$head_ray everywhere"
 echo "== SingleController config validation =="
 uv run --no-sync python - "'"$recipe"'" <<PY
 import sys
