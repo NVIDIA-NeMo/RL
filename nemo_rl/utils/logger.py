@@ -269,6 +269,9 @@ class WandbLogger(LoggerInterface):
         }
         self._pending_step: Optional[int] = None
         self._pending_metrics: dict[str, Any] = {}
+        # One INCREMENTAL table per log_table name: each step appends its rows
+        # (tagged with the step) instead of replacing the previous step's table.
+        self._tables: dict[str, Any] = {}
         self.run.define_metric(WANDB_CALLER_STEP_METRIC, hidden=True)
         # Most training entrypoints run W&B in the driver process and do not
         # own an explicit logger teardown today. Register after wandb.init so
@@ -610,7 +613,11 @@ class WandbLogger(LoggerInterface):
     def log_table(
         self, columns: list[str], rows: list[list[Any]], step: int, name: str
     ) -> None:
-        """Log a table to wandb.
+        """Append one step's rows to a per-name incremental table.
+
+        The table gains a leading ``step`` column and keeps every step's rows,
+        so the panel shows the history rather than only the latest step. W&B
+        uploads only the rows added since the previous log of the table.
 
         Args:
             columns: Column headers
@@ -619,8 +626,19 @@ class WandbLogger(LoggerInterface):
             name: Panel name
         """
         with self._log_lock:
+            # Commit the previous step first: its pending event holds this same
+            # table object, which must not carry the new step's rows.
+            if self._pending_step is not None and self._pending_step != step:
+                self._flush_pending_metrics_locked()
+            columns = ["step", *columns]
+            table = self._tables.get(name)
+            if table is None or list(table.columns) != columns:
+                table = wandb.Table(columns=columns, log_mode="INCREMENTAL")
+                self._tables[name] = table
+            for row in rows:
+                table.add_data(step, *row)
             self._buffer_step_metrics_locked(
-                {name: wandb.Table(columns=columns, data=rows)},
+                {name: table},
                 step=step,
                 step_finished=False,
             )
