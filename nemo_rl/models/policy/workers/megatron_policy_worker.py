@@ -360,8 +360,8 @@ def _collect_local_refit_hf_names(conversion_tasks: Iterable[Any]) -> set[str]:
     """Return HF names whose Bridge tasks expose safe direct local views.
 
     Every task contributing to a grouped HF tensor must provide local specs.
-    Mappings that need transpose, interleave, or other grouped-export transforms
-    return no specs and therefore stay on the normal Bridge conversion path.
+    Canonical local views do not include grouped destination transposition;
+    those mappings must stay on the normal Bridge conversion path.
 
     The result is expert-parallel invariant. Bridge conversion tasks are
     EP-local -- each EP rank only enumerates its own ``experts.N.*`` -- while the
@@ -373,7 +373,9 @@ def _collect_local_refit_hf_names(conversion_tasks: Iterable[Any]) -> set[str]:
     for task in conversion_tasks:
         if task is None:
             continue
-        has_local_views = bool(task.local_hf_param_specs())
+        has_local_views = bool(task.local_hf_param_specs()) and not getattr(
+            task.mapping, "transpose_on_export", False
+        )
         for name in task.hf_param_names:
             support_by_name[name] = support_by_name.get(name, True) and has_local_views
 

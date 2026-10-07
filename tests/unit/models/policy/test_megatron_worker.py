@@ -299,19 +299,55 @@ def test_local_refit_names_require_safe_views_from_every_grouped_task() -> None:
     tasks = [
         SimpleNamespace(
             hf_param_names=(grouped_name,),
+            mapping=SimpleNamespace(),
             local_hf_param_specs=lambda: (object(),),
         ),
         SimpleNamespace(
             hf_param_names=(grouped_name,),
+            mapping=SimpleNamespace(),
             local_hf_param_specs=lambda: (),
         ),
         SimpleNamespace(
             hf_param_names=(safe_name,),
+            mapping=SimpleNamespace(),
             local_hf_param_specs=lambda: (object(),),
         ),
     ]
 
     assert _collect_local_refit_hf_names(tasks) == {safe_name}
+
+
+@pytest.mark.parametrize("projection", ["fc1", "fc2"])
+@pytest.mark.parametrize("transpose_on_export", [False, True])
+def test_local_refit_names_keep_transposed_grouped_experts_on_bridge_path(
+    projection: str, transpose_on_export: bool
+) -> None:
+    from megatron.bridge.models.conversion.param_mapping import (
+        FusedExpertMapping,
+        FusedGatedExpertMapping,
+    )
+
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _collect_local_refit_hf_names,
+    )
+
+    hf_name = f"model.layers.0.mlp.experts.{'gate_up_proj' if projection == 'fc1' else 'down_proj'}"
+    mapping_cls = FusedGatedExpertMapping if projection == "fc1" else FusedExpertMapping
+    mapping = mapping_cls(
+        f"decoder.layers.0.mlp.experts.linear_{projection}.weight0",
+        hf_name,
+        transpose_on_export=transpose_on_export,
+    )
+    assert mapping.local_hf_param_specs()
+    task = SimpleNamespace(
+        mapping=mapping,
+        hf_param_names=(hf_name,),
+        local_hf_param_specs=mapping.local_hf_param_specs,
+    )
+
+    assert _collect_local_refit_hf_names([task]) == (
+        set() if transpose_on_export else {hf_name}
+    )
 
 
 def test_local_refit_names_are_expert_parallel_invariant(monkeypatch) -> None:
@@ -362,10 +398,12 @@ def test_local_refit_names_are_expert_parallel_invariant(monkeypatch) -> None:
     tasks = [
         SimpleNamespace(
             hf_param_names=(expert0,),
+            mapping=SimpleNamespace(),
             local_hf_param_specs=lambda: (object(),),
         ),
         SimpleNamespace(
             hf_param_names=(unsafe,),
+            mapping=SimpleNamespace(),
             local_hf_param_specs=lambda: (),
         ),
     ]
