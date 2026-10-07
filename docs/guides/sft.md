@@ -170,10 +170,9 @@ self.split_train_validation(split_validation_size, seed)
 
 ### Megatron-LM offline-packed datasets
 
-Use `megatron_sft_packed` when each JSONL record groups one or more
-conversations that must remain in one training row and you want to bypass NeMo
-RL's generic online sequence-packing path. This dataset mode is available only
-with the Megatron backend.
+Use `megatron_sft_packed` for prepacked JSONL rows. Each row can contain one or
+more conversations. This mode bypasses NeMo RL's online sequence packer and
+requires the Megatron backend.
 
 Each line must be a JSON object whose `messages` field is an ordered list of
 OpenAI-style messages. A packed row must start with a `system` message and end
@@ -225,15 +224,14 @@ data:
 override the selected format's defaults. `identity` does not support a nonzero
 assistant prefix length.
 
-For context parallelism, every conversation segment is padded to a multiple of
-`2 * context_parallel_size`. The data and policy context-parallel sizes must
-match. A direct-packed training or validation split cannot be mixed with
-regular datasets, and direct-packed SFT does not support dynamic batching,
-draft training, router replay, `sft.only_unmask_final=true`, or fused linear
-log-probability loss. The relevant training or validation micro batch size must
-be 1. At context-parallel size 1, online `policy.sequence_packing.enabled` is
-not required. For context-parallel size greater than 1, set it to `true` as
-required by the MCore context-parallel path.
+Each conversation segment is padded to a multiple of
+`2 * context_parallel_size`. Set the same CP size for data and policy. Do not
+mix direct-packed and regular datasets in a training or validation split.
+Direct-packed SFT does not support dynamic batching, draft training, router
+replay, `sft.only_unmask_final=true`, or fused linear log-probability loss.
+Set the training or validation micro batch size to 1. At CP1,
+`policy.sequence_packing.enabled` is optional. At CP greater than 1, set it
+to `true` for the MCore context-parallel path.
 
 ### Energon Multimodal Datasets
 

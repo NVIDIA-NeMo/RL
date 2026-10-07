@@ -1,8 +1,8 @@
-# Train DFlash and DSpark Draft Models Online
+# Train DFlash and DSpark Online
 
-DFlash and DSpark are block-parallel speculative decoders. NeMo RL can train
-either draft model alongside a Megatron policy and refit the updated policy and
-draft weights into vLLM for rollout generation.
+DFlash and DSpark are block-parallel speculative decoders. NeMo RL trains either
+draft model with a Megatron policy. It then refits both models into vLLM for
+rollout generation.
 
 This guide covers the supported online co-training path. For GRPO setup, see
 the [GRPO guide](grpo.md). For the Eagle3 workflow, which has different packing
@@ -10,8 +10,8 @@ constraints, see [Train with Eagle3 Speculative Decoding](eagle3-speculative-dec
 
 ## Supported Topologies
 
-The initial supported topology is intentionally narrow. NeMo RL rejects other
-layouts before training.
+Use one of the layouts below. NeMo RL rejects unsupported layouts before
+training.
 
 | Component | Supported configuration |
 | --- | --- |
@@ -24,11 +24,10 @@ layouts before training.
 | DFlash/DSpark body sequence parallelism | Disabled |
 | Generation topology | CP1 and PP1 |
 
-Online DFlash and DSpark training does not support fused linear log-probability
-computation. When training with CP2 or CP4, use the split
-begin/microbatch/finish training path. Setting `data_plane.enabled=true` with
-`examples/run_grpo.py` selects the synchronous TransferQueue trainer that uses
-that path.
+Set `use_fused_linear_logprobs: false`. For CP2 or CP4, use the split
+begin/microbatch/finish training path. Run `examples/run_grpo.py` with
+`data_plane.enabled=true` to select the synchronous TransferQueue trainer,
+which uses that path.
 
 ## Configure DFlash
 
@@ -135,9 +134,9 @@ online remapping path is not supported.
 
 ## Enable Packed Context Parallel Training
 
-The following command turns the DFlash recipe into a one-node TP2 x CP4 packed
-run. CP4 and TP2 consume all eight training GPUs, while colocated vLLM generation
-uses CP1 and PP1.
+The following command runs the DFlash recipe with TP2 and CP4 on eight training
+GPUs. It enables sequence packing and target sequence parallelism. Colocated
+vLLM generation uses CP1 and PP1.
 
 ```bash
 uv run examples/run_grpo.py \
@@ -151,15 +150,15 @@ uv run examples/run_grpo.py \
   policy.make_sequence_length_divisible_by=16
 ```
 
-Use `context_parallel_size=2` and `make_sequence_length_divisible_by=8` for
-TP2 x CP2. Megatron packed CP requires this value to be a multiple of
-`2 * TP * CP`. Keep packing enabled. Target sequence parallelism may be disabled
-while retaining packed CP, but it must not be enabled for an unpacked run.
+For TP2 x CP2, set `context_parallel_size=2` and
+`make_sequence_length_divisible_by=8`. Set the latter to a multiple of
+`2 * TP * CP`. Keep packing enabled for CP2 or CP4. Target sequence
+parallelism is optional with packing, but requires packing when enabled.
 
-Packed sequences carry logical sample IDs and cumulative sequence boundaries.
-NeMo RL uses those boundaries to reconstruct target sequence-parallel captures,
-gather projected key/value tensors across CP, and assign every draft window to
-exactly one CP rank. The application supplies no additional layout fields.
+Packed sequences carry sample IDs and sequence boundaries. NeMo RL uses them
+to reconstruct target sequence-parallel captures, gather projected key/value
+tensors across CP, and assign each draft window to one CP rank. Do not add
+layout fields to the input data.
 
 ## Loss, Diagnostics, and Optimizer Settings
 
@@ -208,5 +207,4 @@ If `optimizer` is `null`, draft parameters use the policy optimizer settings.
 - `gamma` in a DSpark block or `block_size` in a DFlash block
 - a DSpark `draft_vocab_size` different from the live target vocabulary
 
-These combinations fail during configuration or worker setup instead of
-starting a training step with incompatible ownership semantics.
+NeMo RL rejects these combinations during configuration or worker setup.
