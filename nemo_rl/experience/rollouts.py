@@ -2985,16 +2985,20 @@ def _nemo_gym_sample_truncated(result: dict, max_total_tokens_per_sample: int) -
 
     Two signals mark the sample truncated. The message log's token count equals
     the generation engine's window (``max_total_tokens_per_sample``). Or the
-    terminal response carries ``status: "incomplete"``, the Responses API's own
-    truncation status, which a Gym model server sets when the completion was
-    cut at the output-token budget (``incomplete_details.reason:
-    "max_output_tokens"``).
+    terminal response carries ``incomplete_details.reason:
+    "max_output_tokens"``, the Responses API's cause field for a completion
+    cut at the output-token budget. ``status: "incomplete"`` alone is not
+    truncation: Gym's agents also set that status for an agent-level stop (an
+    EOS with no assistant message or tool call, or a harness that did not
+    finish) with ``incomplete_details`` unset, and counting those as length
+    cuts would take away the only gradient against producing them.
     """
     total_tokens = sum(len(m["token_ids"]) for m in result["message_log"])
     response = result["full_result"].get("response") or {}
+    incomplete_details = response.get("incomplete_details") or {}
     return (
         total_tokens == max_total_tokens_per_sample
-        or response.get("status") == "incomplete"
+        or incomplete_details.get("reason") == "max_output_tokens"
     )
 
 

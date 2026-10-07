@@ -2785,13 +2785,16 @@ def test_run_async_nemo_gym_rollout(
     """
 
 
-def test_nemo_gym_group_marks_an_incomplete_response_as_truncated():
-    """A Gym rollout is truncated when its response status is `incomplete`, the
-    Responses API's own truncation status, which a Gym model server sets for a
-    completion cut at the output-token budget. A completed response is not
-    truncated by its status, and the window-fill rule (a message log of exactly
-    max_model_len tokens) still applies."""
-    rows = [{"agent_ref": {"name": "agent"}} for _ in range(2)]
+def test_nemo_gym_group_marks_a_budget_cut_response_as_truncated():
+    """A Gym rollout is truncated when its terminal response carries
+    `incomplete_details.reason: "max_output_tokens"`, the Responses API's
+    cause field for a completion cut at the output-token budget. An
+    agent-level stop also arrives as `status: "incomplete"` but with no
+    `incomplete_details` (Gym's stop-token case), and must not count as a
+    length cut; a completed response is never truncated by status, and the
+    window-fill rule (a message log of exactly max_model_len tokens) still
+    applies."""
+    rows = [{"agent_ref": {"name": "agent"}} for _ in range(3)]
 
     def result(**extras):
         input_message = {"role": "user", "content": "", "token_ids": torch.tensor([1])}
@@ -2810,7 +2813,22 @@ def test_nemo_gym_group_marks_an_incomplete_response_as_truncated():
         }
 
     results = [
-        result(response={"status": "incomplete", "output": []}),
+        result(
+            response={
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": [],
+            }
+        ),
+        # Gym's agent stop-token case: incomplete status, no details.
+        result(
+            response={
+                "status": "incomplete",
+                "incomplete_details": None,
+                "metadata": {"ng_termination_reason": "incomplete_reasoning"},
+                "output": [],
+            }
+        ),
         result(response={"status": "completed", "output": []}),
     ]
     rollout_result = rollouts_mod._postprocess_single_nemo_gym_group(
@@ -2821,14 +2839,14 @@ def test_nemo_gym_group_marks_an_incomplete_response_as_truncated():
         policy_generation=type(
             "_PolicyGeneration", (), {"cfg": {"vllm_cfg": {"max_model_len": 128}}}
         )(),
-        input_batch=BatchedDataDict({"loss_multiplier": torch.ones(2)}),
+        input_batch=BatchedDataDict({"loss_multiplier": torch.ones(3)}),
         tokenizer=type("_Tokenizer", (), {"pad_token_id": 0})(),
         log_full_result_tables=False,
     )
-    assert rollout_result.final_batch["truncated"].tolist() == [True, False]
-    assert rollout_result.rollout_metrics["truncation_rate"] == pytest.approx(1 / 2)
+    assert rollout_result.final_batch["truncated"].tolist() == [True, False, False]
+    assert rollout_result.rollout_metrics["truncation_rate"] == pytest.approx(1 / 3)
     assert rollout_result.rollout_metrics["natural_termination_rate"] == pytest.approx(
-        1 / 2
+        2 / 3
     )
     # The window-fill rule stays: a log of exactly max_model_len tokens is truncated.
     full = result(response={"status": "completed"})
