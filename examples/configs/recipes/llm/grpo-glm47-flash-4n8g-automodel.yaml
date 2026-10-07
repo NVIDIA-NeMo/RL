@@ -11,6 +11,7 @@ loss_fn:
 checkpointing:
   checkpoint_dir: results/grpo-glm47-flash-4n8g-automodel
 policy:
+  make_sequence_length_divisible_by: 64
   model_name: zai-org/GLM-4.7-Flash
   train_global_batch_size: 32
   train_micro_batch_size: 1
@@ -48,7 +49,8 @@ policy:
         attn: te
         linear: te
         rms_norm: te
-        enable_deepep: true
+        experts: torch_mm
+        dispatcher: hybridep
         fake_balanced_gate: false
         rope_fusion: false
         enable_hf_state_dict_adapter: true
