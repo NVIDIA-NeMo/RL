@@ -129,6 +129,7 @@ class _ValueTrainStep:
     num_microbatches: int = 0
     num_chunks: int = 0
     failed: bool = False
+    inference_paused: bool = False
 
 
 def _report_multimodal_input_once(worker: Any, data: BatchedDataDict[Any]) -> None:
@@ -816,6 +817,8 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
             raise RuntimeError("no value train step open; call begin_train_step first")
         if state.failed:
             raise RuntimeError("value train step failed; call abort_train_step first")
+        if state.inference_paused:
+            raise RuntimeError("value train step is paused for inference")
         return state
 
     def _restore_train_hooks(self, state: _ValueTrainStep) -> None:
@@ -1067,7 +1070,10 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
         Returns:
             BatchedDataDict with "values" key of shape [batch_size, seq_length].
         """
-        if self._train_step_state is not None:
+        if (
+            self._train_step_state is not None
+            and not self._train_step_state.inference_paused
+        ):
             raise RuntimeError(
                 "finish or abort the value train step before inference/offload"
             )
@@ -1199,12 +1205,21 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
         ):
             torch.cuda.empty_cache()
 
-    def prepare_for_inference(self):
+    def prepare_for_inference(
+        self, keep_resident: bool = False, preserve_train_step: bool = False
+    ):
         """Prepare model for value inference."""
-        if self._train_step_state is not None:
-            raise RuntimeError(
-                "finish or abort the value train step before inference/offload"
-            )
+        state = self._train_step_state
+        if state is not None:
+            if not preserve_train_step or not keep_resident or state.failed:
+                raise RuntimeError(
+                    "an open value train step requires resident inference preservation"
+                )
+            if state.inference_paused:
+                raise RuntimeError("value train step is already paused for inference")
+            state.inference_paused = True
+        elif preserve_train_step:
+            raise RuntimeError("no value train step is open to preserve")
 
         if not self._keep_resident:
             self.model = self.move_model(self.model, "cuda", move_grads=False)
@@ -1369,12 +1384,25 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
             "Loading checkpoints outside of init is not yet implemented for MegatronValueWorker."
         )
 
-    def finish_inference(self) -> None:
+    def finish_inference(
+        self, keep_resident: bool = False, preserve_train_step: bool = False
+    ) -> None:
         """Offload model params to CPU after inference."""
-        if self._train_step_state is not None:
-            raise RuntimeError(
-                "finish or abort the value train step before inference/offload"
-            )
+        state = self._train_step_state
+        if state is not None:
+            if (
+                not preserve_train_step
+                or not keep_resident
+                or not state.inference_paused
+            ):
+                raise RuntimeError(
+                    "an open value train step requires a matching resident inference pause"
+                )
+            self.model.train()
+            state.inference_paused = False
+            return
+        if preserve_train_step:
+            raise RuntimeError("no value train step is open to resume")
 
         if not self._keep_resident:
             self.model = self.move_model(
