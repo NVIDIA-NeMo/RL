@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-arm=${1:?Usage: submit.sh bf16-bf16|bf16-mxfp8|mxfp8-default|mxfp8-param-false|mxfp8-option-b [test-only]}
+arm=${1:?Usage: submit.sh bf16-bf16|bf16-mxfp8|mxfp8-default|mxfp8-param-false|mxfp8-option-b|mxfp8-option-b-param-false [test-only]}
 action=${2:-submit}
 [[ "$action" == submit || "$action" == test-only ]]
 case "$arm" in
@@ -10,6 +10,7 @@ case "$arm" in
   mxfp8-default) config=async-mxfp8-train.yaml ;;
   mxfp8-param-false) config=async-mxfp8-train.yaml ;;
   mxfp8-option-b) config=async-mxfp8-train-option-b.yaml ;;
+  mxfp8-option-b-param-false) config=async-mxfp8-train-option-b.yaml ;;
   *) echo "Unknown arm: $arm" >&2; exit 2 ;;
 esac
 
@@ -48,7 +49,7 @@ if [[ "$arm" == mxfp8-* ]]; then
   te_config_override="policy.megatron_cfg.te_precision_config_file=${te_config_file}"
 fi
 param_override=""
-if [[ "$arm" == mxfp8-param-false ]]; then
+if [[ "$arm" == mxfp8-param-false || "$arm" == mxfp8-option-b-param-false ]]; then
   param_override="policy.megatron_cfg.fp8_cfg.fp8_param=false"
 fi
 hf_source="/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/${USER}/hf_home"
