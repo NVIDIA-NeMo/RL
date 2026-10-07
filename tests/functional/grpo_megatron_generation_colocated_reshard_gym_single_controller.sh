@@ -5,9 +5,9 @@
 # sleeps the engine for each train step (whole-step phases); Gym spinup
 # overlaps the trainer + engine init via the held-socket reservation.
 #
-# Router replay is on, so the run also covers MInf routing-index capture
-# through the canonical stager, the finalizer's route assembly, and the
-# trainer replaying those routes. That needs MoE routers, which no small
+# Router replay is on under MCore's async scheduler, so the run also covers
+# MInf routing-index capture through the canonical stager, the finalizer's
+# route assembly, and the trainer replaying those routes. That needs MoE routers, which no small
 # pretrained checkpoint provides, so the served model is a tiny random-init
 # Qwen3 MoE built below with Qwen3-0.6B's tokenizer and chat template. Random
 # weights earn no reward; the gates are engine/trainer parity plus route
@@ -123,6 +123,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     ++policy.generation.mcore_generation_config.transformer_impl=inference_optimized \
     ++policy.generation.mcore_generation_config.tensor_model_parallel_size=1 \
     policy.generation.mcore_generation_config.refit_backend=nccl \
+    ++policy.generation.mcore_generation_config.async_sched_mode=async \
     policy.generation.max_new_tokens=128 \
     policy.max_total_sequence_length=512 \
     policy.generation.colocated.enabled=true \
@@ -179,3 +180,16 @@ uv run tests/check_metrics.py $JSON_METRICS \
     'median(data["train/gen_kl_error"]) < 1.3' \
     'min(data["train/finalize/routed_experts_row_coverage"]) == 1' \
     'max(data["train/finalize/capture_poisoned_rollouts"]) == 0'
+
+# The counter includes both overlapped and non-overlapped async orderings; a
+# positive value confirms that routes were recorded under the async scheduler.
+ASYNC_SCHED_STEPS=$(grep -o 'mcore async scheduling steps (cumul): [0-9]*' $RUN_LOG | grep -o '[0-9]*$' | sort -n | tail -1 || true)
+if [[ -z "${ASYNC_SCHED_STEPS:-}" ]]; then
+    echo "FAIL: async scheduling counter not found"
+    exit 1
+fi
+if [[ "$ASYNC_SCHED_STEPS" -eq 0 ]]; then
+    echo "FAIL: async scheduler reported 0 scheduling steps"
+    exit 1
+fi
+echo "async scheduling steps: $ASYNC_SCHED_STEPS"
