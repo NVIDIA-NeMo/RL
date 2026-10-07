@@ -333,6 +333,7 @@ from nemo_rl.models.policy import (
     MegatronConfig,
     MegatronPeftConfig,
     PolicyConfig,
+    provider_override_allowed,
 )
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
@@ -1290,6 +1291,8 @@ def _apply_multimodal_config(model_cfg: Any, config: PolicyConfig) -> None:
     megatron_cfg = cast(dict[str, Any], config["megatron_cfg"])
     for config_key, provider_attr in field_mapping.items():
         if config_key not in megatron_cfg:
+            continue
+        if not provider_override_allowed(megatron_cfg, config_key):
             continue
         if not hasattr(model_cfg, provider_attr):
             raise ValueError(
