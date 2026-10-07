@@ -1,13 +1,14 @@
 #!/bin/bash
 set -euo pipefail
 
-arm=${1:?Usage: submit.sh bf16-bf16|bf16-mxfp8|mxfp8-default|mxfp8-option-b [test-only]}
+arm=${1:?Usage: submit.sh bf16-bf16|bf16-mxfp8|mxfp8-default|mxfp8-param-false|mxfp8-option-b [test-only]}
 action=${2:-submit}
 [[ "$action" == submit || "$action" == test-only ]]
 case "$arm" in
   bf16-bf16) config=async-bf16-bf16.yaml ;;
   bf16-mxfp8) config=async-bf16-mxfp8.yaml ;;
   mxfp8-default) config=async-mxfp8-train.yaml ;;
+  mxfp8-param-false) config=async-mxfp8-train.yaml ;;
   mxfp8-option-b) config=async-mxfp8-train-option-b.yaml ;;
   *) echo "Unknown arm: $arm" >&2; exit 2 ;;
 esac
@@ -46,6 +47,10 @@ te_config_override=""
 if [[ "$arm" == mxfp8-* ]]; then
   te_config_override="policy.megatron_cfg.te_precision_config_file=${te_config_file}"
 fi
+param_override=""
+if [[ "$arm" == mxfp8-param-false ]]; then
+  param_override="policy.megatron_cfg.fp8_cfg.fp8_param=false"
+fi
 hf_source="/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/${USER}/hf_home"
 model_cache=models--Qwen--Qwen3-30B-A3B
 
@@ -75,7 +80,7 @@ export UV_CACHE_DIR=${local_root}/uv VLLM_CACHE_ROOT=${local_root}/vllm TORCHIND
 export PYTHONPYCACHEPREFIX=${local_root}/pycache RAY_TMPDIR=/tmp
 unset NRL_IGNORE_VERSION_MISMATCH PYTHONOPTIMIZE
 /opt/nemo_rl_venv/bin/python tools/config_cli.py expand experiments/qwen30_pr4353_20261007/${config} >/dev/null
-/opt/nemo_rl_venv/bin/python examples/run_grpo.py --config experiments/qwen30_pr4353_20261007/${config} ${te_config_override} ${attention_override} grpo.max_num_steps=${max_steps} logger.log_dir=${run_root}/metrics logger.wandb.name=${name}"
+/opt/nemo_rl_venv/bin/python examples/run_grpo.py --config experiments/qwen30_pr4353_20261007/${config} ${te_config_override} ${param_override} ${attention_override} grpo.max_num_steps=${max_steps} logger.log_dir=${run_root}/metrics logger.wandb.name=${name}"
 
 args=(--nodes=4 --gres=gpu:4 --exclusive --mem=0 --account="$account" --partition=batch --time=04:00:00
   --segment=2 --job-name="${account}.${name}" --output="${run_root}/slurm-%j.out"

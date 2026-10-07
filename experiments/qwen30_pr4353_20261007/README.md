@@ -11,10 +11,16 @@ per metric; use W&B throughput rather than deriving it from mean time.
 | `bf16-bf16` | BF16 | BF16 | Default |
 | `bf16-mxfp8` | BF16 | MXFP8 routed experts | Default |
 | `mxfp8-default` | MXFP8 routed experts, `fp8_param=true` | MXFP8 routed experts | Default |
+| `mxfp8-param-false` | MXFP8 routed experts, `fp8_param=false` | MXFP8 routed experts | Default |
 | `mxfp8-option-b` | Same as above | Same as above | TE op-fuser + CuTeDSL/cuDNN flags |
 
-The MXFP8 arms keep the first two and last six layers BF16. Option B is a
-diagnostic for Qwen's SwiGLU expert layout: its configuration does not by
+The training TE recipe matches `*mlp.experts.linear_fc*` and forces all other
+modules to BF16. Its MXFP8 matcher does not override a disabled outer FP8
+context, so the first two and last six training layers remain BF16. The
+rollout applies the same BF16 boundary and excludes attention and router
+weights from MXFP8. `mxfp8-param-false` differs from `mxfp8-default` only in
+parameter storage; the same frozen source archive and config file are used.
+Option B is a diagnostic for Qwen's SwiGLU expert layout: its configuration does not by
 itself prove which GEMM kernel ran, and its refit/accuracy must pass before
 quoting a speedup.
 
