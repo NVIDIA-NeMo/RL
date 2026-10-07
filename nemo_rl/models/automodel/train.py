@@ -803,6 +803,7 @@ class LogprobsPostProcessor:
 
         # Preserve -inf only on valid tokens outside the policy support. The
         # actor loss excludes these positions before sanitizing logprobs.
+        output_token_mask = None
         if need_top_k_or_top_p_filtering(self.sampling_params):
             mask = data_dict["token_mask"] * data_dict["sample_mask"].unsqueeze(-1)
             token_logprobs = mask_filtered_logprobs_outside_tokens(token_logprobs, mask)

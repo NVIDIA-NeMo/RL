@@ -635,11 +635,15 @@ class TestScorePostProcessor:
 # =====================
 @pytest.mark.automodel
 class TestLogprobsPostProcessor:
+    @pytest.mark.parametrize(
+        "sampling_params", [None, TrainingSamplingParams(top_k=None, top_p=1.0)]
+    )
     def test_basic_logprobs_computation(
-        self, base_cfg, mock_device_mesh, mock_cp_mesh, mock_tp_mesh
+        self, base_cfg, mock_device_mesh, mock_cp_mesh, mock_tp_mesh, sampling_params
     ):
         processor = LogprobsPostProcessor(
             cfg=base_cfg,
+            sampling_params=sampling_params,
         )
 
         batch_size = 4
@@ -660,7 +664,7 @@ class TestLogprobsPostProcessor:
             vlm_kwargs={},
         )
 
-        result, _ = processor(
+        result, output_token_mask = processor(
             logits=logits,
             data_dict=data_dict,
             processed_inputs=processed_inputs,
@@ -670,6 +674,8 @@ class TestLogprobsPostProcessor:
         )
 
         assert result.shape == (batch_size, seq_len)
+        assert torch.isfinite(result).all()
+        assert output_token_mask is None
 
     def test_logprobs_with_chunking(
         self, base_cfg, mock_device_mesh, mock_cp_mesh, mock_tp_mesh
