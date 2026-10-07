@@ -8003,7 +8003,7 @@ requires-dist = [
     { name = "lark" },
     { name = "lazy-loader", specifier = "~=0.5" },
     { name = "librosa" },
-    { name = "llguidance", specifier = ">=1.3.0,<1.4.0" },
+    { name = "llguidance", specifier = "==0.7.29" },
     { name = "llist" },
     { name = "matplotlib" },
     { name = "mistral-common", specifier = ">=1.10.0" },
