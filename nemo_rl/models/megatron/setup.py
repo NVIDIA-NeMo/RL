@@ -516,6 +516,7 @@ def validate_and_set_config(
     optimizer_path,
     *,
     skip_weight_load: bool = False,
+    offloaded_between_steps: bool = False,
 ):
     # inference_optimized layers hard-require SP with TP>1; fail here with the config key.
     # This guards the training cfg; the inference cfg is guarded in
@@ -609,8 +610,31 @@ def validate_and_set_config(
         offload_optimizer_for_logprob,
         offload_optimizer_for_refit,
         is_generation_colocated,
+        _release_nvrx_ckpt_cache(
+            megatron_cfg.checkpoint,
+            # prepare_for_lp_inference() moves the optimizer when this is set.
+            storage_moves_between_saves=bool(is_generation_colocated)
+            or offloaded_between_steps
+            or offload_optimizer_for_logprob,
+        ),
         sampling_params,
         final_padded_vocab_size,
+    )
+
+
+def _release_nvrx_ckpt_cache(ckpt_cfg, *, storage_moves_between_saves: bool) -> bool:
+    """Whether async saves cache CUDA IPC handles that a storage move would leave stale.
+
+    NVRx constant-structure saves hand the persistent writer CUDA IPC handles once
+    and reuse them while the save structure is unchanged, without checking that
+    the tensors still live in the same storage.
+    """
+    return bool(
+        ckpt_cfg.async_save
+        and getattr(ckpt_cfg, "use_persistent_ckpt_worker", False)
+        and getattr(ckpt_cfg, "ckpt_assume_constant_structure", False)
+        and not getattr(ckpt_cfg, "async_ckpt_use_cpu_shm", False)
+        and storage_moves_between_saves
     )
 
 

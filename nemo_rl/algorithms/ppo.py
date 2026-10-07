@@ -807,6 +807,9 @@ def setup(
             weights_path=weights_path,
             optimizer_path=optimizer_path,
             init_optimizer=True,
+            # The policy yields the GPUs to the value model every step.
+            offloaded_between_steps="megatron_cfg" in policy_config
+            and policy_config["megatron_cfg"]["enabled"],
         )
         return p, time.perf_counter() - t0
 

@@ -49,6 +49,9 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.rerun_state_machine import get_rerun_state_machine
+from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
+    FileSystemWriterAsync,
+)
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
@@ -401,9 +404,12 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
             pretrained_path,
             weights_path,
             optimizer_path,
+            # PPO offloads the value model every step so the policy can use the GPUs.
+            offloaded_between_steps=True,
         )
 
         self.megatron_cfg = runtime_config.megatron_cfg
+        self.release_nvrx_ckpt_cache = runtime_config.release_nvrx_ckpt_cache
         self.dtype = runtime_config.dtype
         self.optimizer_cpu_offload = runtime_config.optimizer_cpu_offload
         self.offload_optimizer_for_logprob = (
@@ -977,8 +983,10 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
                 self.mcore_state,
                 ckpt_cfg=self.mcore_state.cfg.checkpoint,
                 blocking=True,
-                terminate=True,
+                terminate=self.release_nvrx_ckpt_cache,
             )
+            if self.release_nvrx_ckpt_cache:
+                FileSystemWriterAsync.cleanup_tensor_caches()
 
             if self.should_disable_forward_pre_hook:
                 self.enable_forward_pre_hook()

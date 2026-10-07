@@ -13,6 +13,7 @@
 # limitations under the License.
 import ast
 import asyncio
+import hashlib
 import os
 import tempfile
 import time
@@ -26,6 +27,8 @@ import numpy as np
 import pytest
 import ray
 import torch
+from torch.distributed.checkpoint.filesystem import FileSystemReader
+from torch.distributed.checkpoint.metadata import TensorStorageMetadata
 
 from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
@@ -1825,7 +1828,7 @@ def test_megatron_finalize_async_save_releases_colocated_nvrx_cache(
     import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
 
     worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
-    worker.cfg = {"generation": {"colocated": {"enabled": True}}}
+    worker.release_nvrx_ckpt_cache = True
     worker.mcore_state = SimpleNamespace(
         cfg=SimpleNamespace(
             checkpoint=SimpleNamespace(
@@ -3528,6 +3531,186 @@ def test_megatron_checkpoint_save_kill_and_restore(
             if policy3:
                 policy3.shutdown()
             cluster2.shutdown()
+
+
+def _hash_checkpoint_tensors(weights_path: str) -> dict[tuple, str]:
+    """Hash every tensor chunk of a torch_dist checkpoint by its byte range."""
+    (iter_dir,) = Path(weights_path).glob("iter_*")
+    metadata = FileSystemReader(str(iter_dir)).read_metadata()
+    hashes = {}
+    for index, info in metadata.storage_data.items():
+        if not isinstance(
+            metadata.state_dict_metadata[index.fqn], TensorStorageMetadata
+        ):
+            continue
+        with open(iter_dir / info.relative_path, "rb") as f:
+            f.seek(info.offset)
+            chunk = f.read(info.length)
+        hashes[(index.fqn, str(index.offset), index.index)] = hashlib.sha256(
+            chunk
+        ).hexdigest()
+    return hashes
+
+
+@pytest.mark.timeout(400)
+@pytest.mark.hf_gated
+def test_megatron_async_save_after_ppo_offload_writes_current_weights(
+    tiny_llama_model_path,
+):
+    """A PPO offload between async saves must not leave the second one stale.
+
+    NVRx's constant-structure cache reuses the first save's CUDA IPC handles, and
+    the offload moves the parameters, so an unreleased cache makes the second
+    checkpoint a byte-identical copy of the first.
+    """
+    config = create_megatron_test_config(model_name=tiny_llama_model_path)
+    del config["generation"]
+    config["megatron_cfg"]["checkpoint"] = {
+        "async_save": True,
+        "ckpt_assume_constant_structure": True,
+    }
+    tokenizer = get_tokenizer({"name": tiny_llama_model_path})
+
+    torch.manual_seed(42)
+    attention_mask = torch.ones(8, 32)
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.randint(0, 32000, (8, 32)),
+            "input_lengths": attention_mask.sum(dim=1).to(torch.int32),
+            "attention_mask": attention_mask,
+            "labels": torch.randint(0, 32000, (8, 32)),
+            "sample_mask": torch.ones(8),
+        }
+    )
+
+    with tempfile.TemporaryDirectory(prefix="megatron_async_save_") as temp_dir:
+        cluster = RayVirtualCluster(
+            name="test-async-save-ppo-offload",
+            bundle_ct_per_node_list=[2],
+            use_gpus=True,
+            num_gpus_per_node=2,
+            max_colocated_worker_groups=1,
+        )
+        policy = None
+        try:
+            policy = Policy(
+                cluster=cluster,
+                config=config,
+                tokenizer=tokenizer,
+                offloaded_between_steps=True,
+            )
+            weights_paths = []
+            for step in range(2):
+                policy.prepare_for_training()
+                policy.train(data, SimpleLossFn())
+                weights_path = os.path.join(temp_dir, f"step_{step}", "weights")
+                policy.save_checkpoint(
+                    weights_path=weights_path, is_final_checkpoint=False
+                )
+                # PPO hands the GPUs to the value model right after each save.
+                policy.offload_to_cpu()
+                weights_paths.append(weights_path)
+            # Complete the last write before reading the checkpoints.
+            policy.finalize_async_save()
+
+            first, second = (_hash_checkpoint_tensors(p) for p in weights_paths)
+            assert first.keys() == second.keys()
+            # Every chunk is a trained fp32 param, so none may repeat the first save.
+            repeated = [key for key in first if first[key] == second[key]]
+            assert not repeated, (
+                f"{len(repeated)} of {len(first)} tensor chunks repeat the first "
+                f"checkpoint: {repeated}"
+            )
+        finally:
+            if policy:
+                policy.shutdown()
+            cluster.shutdown()
+
+
+@pytest.mark.timeout(600)
+@pytest.mark.hf_gated
+@pytest.mark.parametrize("offload", ["before_refit", "for_logprob"])
+def test_megatron_async_save_after_optimizer_offload_writes_current_state(
+    tiny_llama_model_path, offload
+):
+    """An optimizer offload between async saves must not leave optimizer state stale.
+
+    Non-colocated distillation offloads the student's optimizer before every
+    teacher pass, and offload_optimizer_for_logprob does it in every logprob
+    pass; params stay on GPU, so only the optimizer chunks could repeat.
+    """
+    # bf16 params, so the optimizer's `param` is a master weight that each step updates.
+    config = create_megatron_test_config(
+        model_name=tiny_llama_model_path, precision="bfloat16"
+    )
+    del config["generation"]
+    # Big enough for bf16 weights near 1.0 to change in one step.
+    config["megatron_cfg"]["optimizer"]["lr"] = 1e-2
+    config["megatron_cfg"]["scheduler"]["lr_warmup_iters"] = 0
+    config["offload_optimizer_for_logprob"] = offload == "for_logprob"
+    config["megatron_cfg"]["checkpoint"] = {
+        "async_save": True,
+        "ckpt_assume_constant_structure": True,
+    }
+    tokenizer = get_tokenizer({"name": tiny_llama_model_path})
+
+    torch.manual_seed(42)
+    attention_mask = torch.ones(8, 32)
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.randint(0, 32000, (8, 32)),
+            "input_lengths": attention_mask.sum(dim=1).to(torch.int32),
+            "attention_mask": attention_mask,
+            "labels": torch.randint(0, 32000, (8, 32)),
+            "sample_mask": torch.ones(8),
+        }
+    )
+
+    with tempfile.TemporaryDirectory(prefix="megatron_async_save_") as temp_dir:
+        cluster = RayVirtualCluster(
+            name=f"test-async-save-optimizer-offload-{offload}",
+            bundle_ct_per_node_list=[2],
+            use_gpus=True,
+            num_gpus_per_node=2,
+            max_colocated_worker_groups=1,
+        )
+        policy = None
+        try:
+            policy = Policy(
+                cluster=cluster,
+                config=config,
+                tokenizer=tokenizer,
+                # Distillation passes this; offload_optimizer_for_logprob needs nothing.
+                offloaded_between_steps=offload == "before_refit",
+            )
+            weights_paths = []
+            for step in range(2):
+                policy.prepare_for_training()
+                policy.train(data, SimpleLossFn())
+                weights_path = os.path.join(temp_dir, f"step_{step}", "weights")
+                policy.save_checkpoint(
+                    weights_path=weights_path,
+                    optimizer_path=os.path.join(temp_dir, f"step_{step}", "optimizer"),
+                    is_final_checkpoint=False,
+                )
+                # The checkpointer's wait_fn finalizes every save.
+                policy.finalize_async_save()
+                if offload == "before_refit":
+                    policy.offload_before_refit()
+                else:
+                    policy.prepare_for_lp_inference()
+                weights_paths.append(weights_path)
+
+            first, second = (_hash_checkpoint_tensors(p) for p in weights_paths)
+            assert first.keys() == second.keys()
+            repeated = sorted({key[0] for key in first if first[key] == second[key]})
+            assert not repeated, (
+                f"{len(repeated)} tensors repeat the first checkpoint: {repeated}"
+            )
+        finally:
+            if policy:
+                policy.shutdown()
+            cluster.shutdown()
 
 
 @pytest.mark.timeout(300)

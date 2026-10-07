@@ -2193,10 +2193,11 @@ def test_megatron_train_iters_matches_ppo_training_limit(
     config.ppo.policy_training_start_step = policy_training_start_step
     config.ppo.async_ppo = AsyncPPOConfig(enabled=async_enabled)
 
-    _run_noncolocated_setup(monkeypatch, config)
+    policy_factory = _run_noncolocated_setup(monkeypatch, config)[4]
 
     assert config.policy["megatron_cfg"]["train_iters"] == expected_policy_train_iters
     assert config.value["megatron_cfg"]["train_iters"] == expected_value_train_iters
+    assert policy_factory.call_args.kwargs["offloaded_between_steps"] is True
 
 
 def test_ppo_setup_rejects_a_warm_start_that_does_not_resolve(monkeypatch, tmp_path):

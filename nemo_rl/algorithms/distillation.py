@@ -603,6 +603,9 @@ def setup(
         )
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
+    student_megatron = (
+        "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]
+    )
     student_policy = Policy(
         name_prefix="student",
         cluster=train_cluster,
@@ -612,6 +615,8 @@ def setup(
         optimizer_path=optimizer_path,
         init_optimizer=True,
         init_reference_model=False,
+        # Without colocated inference the student's optimizer is offloaded for the teacher every step.
+        offloaded_between_steps=student_megatron and not colocated_inference,
     )
 
     if checkpoint_engine_config is not None:

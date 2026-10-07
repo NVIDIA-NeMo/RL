@@ -41,6 +41,8 @@ class RuntimeConfig(NamedTuple):
     offload_optimizer_for_logprob: bool
     offload_optimizer_for_refit: bool
     is_generation_colocated: Optional[bool]
+    # Whether checkpoint finalization must also drop NVRx's cached CUDA IPC handles.
+    release_nvrx_ckpt_cache: bool
     sampling_params: Optional[TrainingSamplingParams]
     final_padded_vocab_size: int
 

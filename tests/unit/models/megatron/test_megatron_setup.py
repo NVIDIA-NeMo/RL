@@ -3581,6 +3581,7 @@ class TestRuntimeConfigNamedTuple:
             offload_optimizer_for_logprob=True,
             offload_optimizer_for_refit=False,
             is_generation_colocated=True,
+            release_nvrx_ckpt_cache=False,
             sampling_params=None,
             final_padded_vocab_size=32000,
         )
@@ -3592,6 +3593,39 @@ class TestRuntimeConfigNamedTuple:
         assert runtime_config.offload_optimizer_for_refit is False
         assert runtime_config.sampling_params is None
         assert runtime_config.final_padded_vocab_size == 32000
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize(
+    ("ckpt_overrides", "storage_moves_between_saves", "expected"),
+    [
+        ({}, True, True),
+        ({}, False, False),
+        ({"ckpt_assume_constant_structure": False}, True, False),
+        ({"async_save": False}, True, False),
+    ],
+    ids=["storage_moves", "storage_stays", "no_constant_structure", "sync_save"],
+)
+def test_release_nvrx_ckpt_cache(ckpt_overrides, storage_moves_between_saves, expected):
+    """Only cached CUDA handles whose storage can move between saves are released."""
+    from nemo_rl.models.megatron.setup import _release_nvrx_ckpt_cache
+
+    ckpt_cfg = SimpleNamespace(
+        **{
+            "async_save": True,
+            "use_persistent_ckpt_worker": True,
+            "ckpt_assume_constant_structure": True,
+            "async_ckpt_use_cpu_shm": False,
+            **ckpt_overrides,
+        }
+    )
+
+    assert (
+        _release_nvrx_ckpt_cache(
+            ckpt_cfg, storage_moves_between_saves=storage_moves_between_saves
+        )
+        is expected
+    )
 
 
 @pytest.mark.mcore
