@@ -1,0 +1,11 @@
+defaults: sync-mxfp8-train.yaml
+
+policy:
+  megatron_cfg:
+    moe_grouped_gemm: true
+    model_overrides:
+      moe_use_grouped_tensor: true
+
+logger:
+  wandb:
+    name: lightning-pr4353-sync-mxfp8-train-option-a

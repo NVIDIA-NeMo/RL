@@ -1,0 +1,14 @@
+defaults: sync-mxfp8-train-option-a.yaml
+
+policy:
+  megatron_cfg:
+    use_fused_weighted_squared_relu: true
+    model_overrides:
+      use_transformer_engine_op_fuser: true
+    env_vars:
+      NVTE_CUTEDSL_FUSED_GROUPED_MLP: "1"
+      CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL: "1"
+
+logger:
+  wandb:
+    name: lightning-pr4353-sync-mxfp8-train-option-b
