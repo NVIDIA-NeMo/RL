@@ -102,3 +102,29 @@ assert_all_close(2, "train/grad_norm", close_args={"rtol": 0.05}, baseline=base,
 assert_all_close(1, "train/loss", close_args={"rtol": 0.05}, baseline=base, dtensor_1=dtensor_1, dtensor_2=dtensor_2, mcore_1=mcore_1, mcore_2=mcore_2)
 assert_all_close(2, "train/loss", close_args={"rtol": 0.05}, baseline=base, dtensor_2=dtensor_2, mcore_2=mcore_2)
 EOF
+
+# Mcore 1+1 resume with override_opt_param_scheduler: Bridge rewrites the
+# scheduler position on resume only when this flag is on.
+MCORE_OVERRIDE=(policy.dtensor_cfg.enabled=false policy.megatron_cfg.enabled=true
+  +policy.megatron_cfg.scheduler.override_opt_param_scheduler=true
+  policy.megatron_cfg.scheduler.lr_warmup_init=1.0e-7
+  policy.megatron_cfg.scheduler.lr_warmup_iters=10
+  checkpointing.enabled=true checkpointing.checkpoint_dir=$CKPT_DIR/mcore_override)
+# Train for 1 step and save a checkpoint.
+train_cmd logger.log_dir=$LOG_DIR/mcore_override sft.max_num_steps=2 checkpointing.checkpoint_must_save_by=0:0:0:1 "${MCORE_OVERRIDE[@]}" $@ 2>&1 | prefix_output "[mcore override 1step] " | tee ${RUN_LOG}.mcore_override_1step
+# Resume from checkpoint and trains another step.
+train_cmd logger.log_dir=$LOG_DIR/mcore_override sft.max_num_steps=2 "${MCORE_OVERRIDE[@]}" $@ 2>&1 | prefix_output "[mcore override 2step] " | tee ${RUN_LOG}.mcore_override_2step
+# Dump TB logs.
+uv run tests/json_dump_tb_logs.py $LOG_DIR/mcore_override --output_path $EXP_DIR/mcore_override.json
+
+# Ensure that resumed LR is larger than the previous LR.
+uv run python - $EXP_DIR/mcore_override.json <<'EOF'
+import json
+import sys
+
+lr = json.load(open(sys.argv[1]))["train/lr"]
+# Step 2 is still in warmup, so its LR must be higher than step 1's.
+# A reset to step 0 on resume makes them equal.
+assert lr["2"] > lr["1"], f"LR did not advance across the resume: {lr}"
+print(f"✓ train/lr advanced across the resume: {lr}")
+EOF

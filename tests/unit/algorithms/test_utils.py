@@ -29,6 +29,7 @@ from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
     calculate_trivial_reward_distributions,
     get_tokenizer,
+    mask_out_neg_inf_logprobs,
     maybe_pad_last_batch,
     print_efficiency_summary,
     print_performance_metrics,
@@ -994,6 +995,25 @@ def test_calculate_baseline_and_std_per_prompt_numerical_precision():
     # Std values should be finite and not NaN
     assert torch.isfinite(std).all()
     assert not torch.isnan(std).any()
+
+
+def test_mask_out_neg_inf_logprobs_finite_mask_and_zeroing(capsys):
+    """finite_mask ignores the caller's mask; logprobs are zeroed where mask * finite_mask is 0."""
+    neg_inf = -float("inf")
+    logprobs = torch.tensor(
+        [[-0.5, neg_inf, -1.0, -2.0], [neg_inf, -0.1, -0.2, neg_inf]]
+    )
+    mask = torch.tensor([[1.0, 1.0, 0.0, 1.0], [0.0, 1.0, 1.0, 1.0]])
+
+    masked, finite_mask = mask_out_neg_inf_logprobs(logprobs, mask, "curr_logprobs")
+
+    # finite_mask is 0 exactly at -inf positions, whether or not the mask keeps them.
+    assert torch.equal(finite_mask, (~torch.isinf(logprobs)).float())
+    effective = mask * finite_mask
+    assert torch.all(masked[effective == 0] == 0)
+    assert torch.equal(masked[effective == 1], logprobs[effective == 1])
+    # The warning counts only -inf positions the caller's mask still treats as valid.
+    assert "2/6 valid tokens have -inf in curr_logprobs" in capsys.readouterr().out
 
 
 class TestPrintEfficiencySummary:
