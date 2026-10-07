@@ -6,7 +6,7 @@ grpo:
   max_rollout_turns: 1
   max_num_epochs: 1
   max_num_steps: 1000000
-  normalize_rewards: true
+  normalize_rewards: false    # not used by DWRL, value doesn't matter
   use_leave_one_out_baseline: true
   val_period: 5
   val_start_at: -1  # First step eligible for periodic validation; -1 disables the delay
@@ -70,9 +70,10 @@ grpo:
     recompute_kv_cache_after_weight_updates: false # Set to true to recompute kv cache after weight updates
 
   dwrl:
-    bt_prompt: "Based on your evaluation, which response is better? Answer with only a single character: 1 or 2"
-    score_token: "1"
-    opposite_token: "2"
+    bt_prompt: "Based on your evaluation, is the original response good? Answer with only a single word: yes or no"
+    score_token: "yes"
+    opposite_token: "no"
+    use_env_rewards: false
 
 # Reward-zeroing penalties applied to NeMo-Gym rollout results.
 reward_penalties:
@@ -118,7 +119,6 @@ loss_fn:
   # 0.0 disables it. VAPO paper recommends 0.1.
   positive_example_nll_weight: 0.0
   ce_penalty: 0.001
-  bt_alpha: 1.0
 
 checkpointing:
   enabled: true
@@ -131,7 +131,7 @@ checkpointing:
   # Async GRPO: restore replay-buffer state on resume. Set false to regenerate
   # the buffered window fresh instead of reusing completed groups (which skew
   # toward short rollouts at a save boundary).
-  load_replay_buffer: true
+  load_replay_buffer: false
   model_save_format: "safetensors"
   save_consolidated: false
   save_optimizer: true
@@ -154,7 +154,7 @@ policy:
 
   dtensor_cfg:
     _v2: false
-    enabled: true
+    enabled: false
     cpu_offload: false
     sequence_parallel: false
     activation_checkpointing: false
@@ -183,160 +183,113 @@ policy:
       use_triton: true  # Use Triton-optimized kernels for LoRA (faster but requires flash-attn). Disable when tensor_parallel_size > 1
   
   megatron_cfg:
-    enabled: false
-    # Arbitrary overrides applied recursively to the Megatron Bridge model
-    # provider before model instantiation. Do not duplicate first-class fields.
-    model_overrides: {}
-    checkpoint:
-      async_save: true
-      ckpt_assume_constant_structure: true
-    # Compute next-token logprobs directly from hidden states with a chunked
-    # linear cross-entropy fusion, avoiding materialization of the full
-    # [batch, seq_len, vocab_size] logit tensor. Reduces peak memory and extends
-    # the maximum trainable sequence length. Not compatible with context
-    # parallelism, sequence packing, or top-k/top-p training-time filtering.
-    use_fused_linear_logprobs: false
-    fused_linear_logprobs_chunk_size: 256
-    force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
-    empty_unused_memory_level: 1  # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation. Setting to 0 is faster, but you are more likely to run out of GPU memory.
-    activation_checkpointing: false
-    # Training CUDA Graph settings; modules and warmup are inactive with impl "none".
-    cuda_graph_impl: "none"
-    cuda_graph_modules: []
-    cuda_graph_warmup_steps: 3
-    # Offload specific module activations to CPU. Works for both dense and MoE
-    # models and requires transformer_engine. Different from optimizer_cpu_offload,
-    # which offloads optimizer states. On TE >= 2.10,
-    # also set megatron_cfg.env_vars.NVTE_CPU_OFFLOAD_V1: "1".
-    fine_grained_activation_offloading: false
-    # Modules to offload when fine_grained_activation_offloading is true.
-    # Common examples: ["core_attn", "attn_proj", "expert_fc1", "moe_act"].
-    # Supported names depend on the pinned Megatron-LM version and are
-    # validated by MCore. "attn_proj" requires "core_attn". See the latest
-    # upstream module reference:
-    # https://github.com/NVIDIA/Megatron-LM/blob/main/docs/user-guide/features/fine_grained_activation_offloading.md#offloadable-modules
-    offload_modules: null
-    # recompute_granularity controls activation checkpointing depth.
-    # "full": recompute all activations (default, max memory savings).
-    # "selective": recompute only specific modules (see recompute_modules).
-    # Only takes effect when activation_checkpointing: true.
-    recompute_granularity: "full"
-    # Modules to selectively recompute when recompute_granularity="selective".
-    # MCore options: ["core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe", "shared_experts"].
-    # Null defaults to ["core_attn"]. Full list and per-module constraints:
-    # https://github.com/NVIDIA/Megatron-LM/blob/d30c3ae5469fe3f6a64d4fd2e63b6e7f7844ea81/megatron/core/transformer/transformer_config.py#L483
-    # Use ["moe"] for MoE models to recompute expert activations only.
-    recompute_modules: null
-    tensor_model_parallel_size: 1
+    enabled: true
+    empty_unused_memory_level: 2
+    activation_checkpointing: true
+
+    tensor_model_parallel_size: 4
     expert_tensor_parallel_size: 1
-    expert_model_parallel_size: 1
+    expert_model_parallel_size: 16
     pipeline_model_parallel_size: 1
     num_layers_in_first_pipeline_stage: null
     num_layers_in_last_pipeline_stage: null
-    context_parallel_size: 1
+    context_parallel_size: 2
     pipeline_dtype: ${policy.precision}
-    sequence_parallel: false
+    sequence_parallel: true
+
+    # MoE
     freeze_moe_router: true
-    moe_router_dtype: "fp64"
-    moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
-    moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
+    moe_router_dtype: "fp32"
+    moe_router_load_balancing_type: "none"
+    moe_router_bias_update_rate: 1.0e-3
+    moe_router_enable_expert_bias: true
     moe_permute_fusion: true
-    # gives ~20% training perf speedup with sequence packing
-    apply_rope_fusion: True
-    # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
-    bias_activation_fusion: True
-    defer_fp32_logits: False
-    # Compute the LM output-layer GEMM in fp32 rather than bf16. bf16 rounding of
-    # the logits dominates generation/training logprob mismatch
-    # (train/token_mult_prob_error). Pair with NRL_VLLM_FP32_LM_HEAD=1 in
-    # generation.vllm_cfg.env_vars: enabling it on only one engine makes the
-    # multiplicative error worse, because both otherwise round to the same grid.
-    # False | True (full fp32, ~2x cost on the logprob pass) | "tf32" (fp32 head
-    # on TF32 tensor cores: numerically identical here, ~baseline speed; preferred).
-    fp32_lm_head: False
-    # Keep the transformer residual stream in fp32; small additional reduction in
-    # gen/train logprob mismatch on top of fp32_lm_head.
-    fp32_residual_connection: False
-    moe_per_layer_logging: False
     moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"
+    moe_aux_loss_coeff: 0.0
     moe_shared_expert_overlap: false
-    use_gloo_process_groups: false
-    # Multi-Token Prediction (MTP). mtp_num_layers=0 disables MTP.
-    mtp_num_layers: 0
-    # MTP loss weight added to the main next-token loss (0.0 disables the MTP loss contribution).
-    mtp_loss_scaling_factor: 0.0
-    # When true, repeat one MTP layer mtp_num_layers times instead of using distinct layers.
-    mtp_use_repeated_layer: false
-    # When true, detach MTP heads so MTP loss does not affect main-model gradients.
-    mtp_detach_heads: false
-    gradient_accumulation_fusion: false
-    use_fused_weighted_squared_relu: false
 
-    peft:
-      enabled: false
-      target_modules: []
-      exclude_modules: []
-      dim: 8
-      alpha: 32
-      dropout: 0.0
-      dropout_position: "post"
-      lora_A_init_method: "xavier"
-      lora_B_init_method: "zero"
-      a2a_experimental: false
-      lora_dtype: None
+    # Compute
+    apply_rope_fusion: true
+    use_fused_weighted_squared_relu: true
+    bias_activation_fusion: false
+    defer_fp32_logits: true
+
+    # Logging
+    track_moe_metrics: true
+    moe_per_layer_logging: true
+
+    # MTP training heads
+    mtp_loss_scaling_factor: 0.3
+    mtp_use_repeated_layer: true
+    mtp_num_layers: 5
+    mtp_detach_heads: true
 
     optimizer:
       optimizer: "adam"
-      lr: 5.0e-6
-      min_lr: 5.0e-7
-      weight_decay: 0.01
+      lr: 4.0e-6
+      min_lr: 4.0e-6
+      weight_decay: 0.0
       bf16: true
       fp16: false
       params_dtype: "float32"
 
-      #adam
       adam_beta1: 0.9
       adam_beta2: 0.999
       adam_eps: 1e-8
 
-      #sgd
       sgd_momentum: 0.9
 
-      #distributed optimizer
       use_distributed_optimizer: true
       use_precision_aware_optimizer: true
 
       clip_grad: ${policy.max_grad_norm}
 
-      # optimizer cpu offload
       optimizer_cpu_offload: false
       optimizer_offload_fraction: 0.0
-      overlap_cpu_optimizer_d2h_h2d: false
 
     scheduler:
       start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
       end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
       weight_decay_incr_style: "constant"
       lr_decay_style: "constant"
-      lr_decay_iters: 1000
-      lr_warmup_iters: 13
-      lr_warmup_init: 5.0e-7
+      lr_decay_iters: null
+      lr_warmup_iters: 10
+      lr_warmup_init: 4e-7
+      override_opt_param_scheduler: true
 
     distributed_data_parallel_config:
       grad_reduce_in_fp32: false
-      overlap_grad_reduce: true
+      overlap_grad_reduce: false
       overlap_param_gather: true
+      average_in_collective: false
       use_custom_fsdp: false
       data_parallel_sharding_strategy: "optim_grads_params"
 
-    fp8_cfg: 
+    gradient_accumulation_fusion: false
+
+    # FP8 — disabled for bf16 runs. Enable for mxfp8 validation.
+    fp8_cfg:
       enabled: false
       fp8: "e4m3"
-      fp8_recipe: "blockwise"
+      fp8_recipe: "mxfp8"
       fp8_param: false
 
+    first_last_layers_bf16: true
+    num_layers_at_start_in_bf16: 1
+    num_layers_at_end_in_bf16: 1
+
+    use_gloo_process_groups: false
+
+    checkpoint:
+      async_save: true
+      ckpt_assume_constant_structure: true
+      fully_parallel_save_process_group: "ep_dp"
+      fully_parallel_load_process_group: "ep_dp"
+      fully_parallel_load_exchange_algo: "broadcast"
+
     env_vars: null
+
 
   draft:
     enabled: false
@@ -348,52 +301,28 @@ policy:
   # See docs/design-docs/sequence-packing-and-dynamic-batching.md 
   # for more details on dynamic batching and sequence packing.
   dynamic_batching:
-    enabled: False
+    enabled: false
     train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
     logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
     sequence_length_round: 64
 
   sequence_packing:
-    enabled: True
+    enabled: true
     train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
     logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
     algorithm: "modified_first_fit_decreasing"
-    microbatch_order: "packer"
     sequence_length_round: 64
     fuse_loss: false
 
   # makes the training sequence length divisible by the tensor parallel size
   # this is useful for sequence parallel training
-  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
+  make_sequence_length_divisible_by: ${mul:${mul:${policy.megatron_cfg.tensor_model_parallel_size}, ${policy.megatron_cfg.context_parallel_size}}, 2}
   max_grad_norm: 1.0
 
-  optimizer:
-    name: "torch.optim.AdamW"
-    kwargs:
-      lr: 5.0e-6
-      weight_decay: 0.01
-      betas: [0.9, 0.999]
-      eps: 1e-8
-      # when using Dtensor, we need to set foreach
-      # and fused to False
-      foreach: False
-      fused: False
-
-  scheduler:
-    - name: "torch.optim.lr_scheduler.LinearLR"
-      kwargs:
-        start_factor: 0.1
-        end_factor: 1.0
-        total_iters: 50
-    - name: "torch.optim.lr_scheduler.ConstantLR"
-      kwargs:
-        factor: 1.0
-        total_iters: 10000000000
-    - milestones: [50]
+  optimizer: null
+  scheduler: null
 
   generation:
-    # Port range for vLLM HTTP servers, kept below the OS ephemeral range.
-    # See ray.sub for the full port layout.
     port_range_low: 3000
     port_range_high: 4999
     backend: "vllm"
@@ -401,72 +330,51 @@ policy:
     temperature: 1.0
     top_p: 1.0
     top_k: null
-    # Validation-only sampling; defaults follow the train values above.
     val_temperature: ${.temperature}
     val_top_p: ${.top_p}
     val_top_k: ${.top_k}
     stop_token_ids: null
     stop_strings: null
-    # null = topology default (IPC colocated, NCCL non-colocated).
-    # Non-colocated vLLM also supports vllm_s3_sparse, vllm_zmq_sparse, and nixl.
-    refit_transport: null
-    # Keep real-quant export tensors on CPU by default. Set false only for
-    # colocated CUDA-IPC refit to avoid a GPU -> CPU -> GPU round trip.
-    real_quant_export_cpu_offload: true
-    refit_cfg:
-      nixl:
-        update_weights_bucket_memory_ratio: 0.05
-        device: cuda
-        backend_name: UCX
-        backend_init_params: null
-        release_after_refit: false
-        shard_expert_weights: false
-    mcore_generation_config:
-      max_model_len: ${policy.max_total_sequence_length}  # Engine-side max sequence length.
-      cuda_graph_impl: "local"  # CUDA-graph implementation. Options: "none", "local", "transformer_engine", "full_iteration".
-      inference_cuda_graph_scope: "block"  # Inference CUDA-graph scope. Options: "none", "layer", "block".
-      buffer_size_gb: 10
-      num_cuda_graphs: 4  # Number of CUDA graphs to pre-compile for different batch sizes
-      block_size_tokens: 256  # Size of each KV cache block in tokens (affects memory granularity)
-      use_cuda_graphs_for_non_decode_steps: true  # Enable CUDA graphs for prefill/context processing
-      enable_chunked_prefill: true  # Split long prefills into chunks for better memory management
-      enable_prefix_caching: false  # Reuse KV blocks across requests sharing a prompt prefix.
-      max_tokens: 16384 # Maximum number of tokens to use in a single step. Analogous to vllm's max_num_batched_tokens
-      kv_cache_management_mode: "persist"  # KV cache lifecycle across suspend/resume. Options: "persist", "offload". To select "recompute", set grpo.async_grpo.recompute_kv_cache_after_weight_updates=true.
-      materialize_only_last_token_logits: true
-      num_speculative_tokens: 0
-      refit_backend: "nccl"  # Copy-service backend for non-colocated megatron weight refit. Options: "gloo" or "nccl"
-      parsers: []  # OpenAI tool-call / response parser names exposed by the HTTP server (only used if expose_http_server=true).
-      expose_http_server: false  # Start an OpenAI-compatible HTTP server alongside the persistent engine. Required for NeMo-Gym.
     vllm_cfg:
-      async_engine: false
+      async_engine: true
       precision: ${policy.precision}
       kv_cache_dtype: "auto"
-      logprobs_mode: processed_logprobs
-      tensor_parallel_size: 1
+      tensor_parallel_size: 4
       pipeline_parallel_size: 1
-      expert_parallel_size: 1  # When EP > 1, EP must be a multiple of TP since vLLM's EP = DP * TP
-      gpu_memory_utilization: 0.6
+      expert_parallel_size: 4
+      gpu_memory_utilization: 0.8
       max_model_len: ${policy.max_total_sequence_length}
-      # when enforce_eager is False, it is optional to set ++policy.generation.vllm_kwargs.compilation_config.backend=eager for better accuracy,
-      # with the flag, vllm will use the custom CUDA kernels instead of the Triton kernels generated by torch.compile
-      # for more details, see convergence issue https://github.com/NVIDIA-NeMo/RL/issues/998
-      enforce_eager: False
-      use_tqdm: true # Set to false to suppress vLLM generation progress bars. Only applies when async_engine is false
-      use_deep_gemm: False
+      enforce_eager: false
+      use_deep_gemm: false
       num_last_layers_in_bf16: 0
       num_first_layers_in_bf16: 0
-      enable_vllm_metrics_logger: true # Set to true to enable vLLM internal metrics logger, turn off for better performance
-      vllm_metrics_logger_interval: 0.5 # Interval in seconds to collect vLLM logger metrics
-      http_refit_api_key_env_var: null # Optional env var containing the internal refit API key.
-      reset_encoder_cache_after_weight_update: false # Invalidate cached multimodal encoder outputs after a successful async refit. Only safe when generation is quiesced (grpo.async_grpo.in_flight_weight_updates=false).
-      http_refit_server_port: null # Optional fixed port for Kubernetes targetPorts.
-      zmq_refit_server_port: null # Optional fixed ZeroMQ relay port for Kubernetes targetPorts.
-    vllm_kwargs: {}
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 0.5
+      expose_http_server: true
+      skip_tokenizer_init: false
+      #http_server_serving_chat_kwargs:
+      #  enable_auto_tools: true
+      #  tool_parser: qwen3_coder
+      #  reasoning_parser: nano_v3
+      #reasoning_parser_plugin: nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py
+
+    vllm_kwargs:
+      # Use the Super branch's pinned vLLM/FlashInfer serving backend. This
+      # must remain compatible with repeated refits.
+      moe_backend: flashinfer_cutlass
+      attention_backend: FLASH_ATTN
+      max_num_seqs: 256
+      max_num_batched_tokens: 32768
+      mamba_ssm_cache_dtype: "float32"
+      compilation_config:
+        cudagraph_capture_sizes: [1,2,4,8,16,32,64]
+        pass_config:
+          fuse_allreduce_rms: false
+
     colocated:
       # true: generation shares training GPUs
       # false: uses dedicated generation resources
-      enabled: true
+      enabled: false
       # only relevant when enabled is false
       resources:
         gpus_per_node: null # Decides num gpus to be dedicated to generation when there is one node in the cluster i.e cluster.num_nodes == 1
@@ -498,10 +406,10 @@ data:
 env:
   should_use_nemo_gym: false
   genrm_dwrl:
+    reward_design: rb0
     num_workers: 8
     score_weight: 1.0
     ranking_weight: 1.0
-    use_binary_reward: false
 
 # Logger configuration
 logger:
