@@ -754,6 +754,49 @@ class TestApplyParallelismConfig:
 
 @pytest.mark.mcore
 class TestApplyMultimodalConfig:
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "radio_force_cpe_eval_mode",
+            "freeze_vision_encoder",
+            "freeze_vision_projector",
+            "freeze_audio_encoder",
+            "freeze_audio_projector",
+        ],
+    )
+    def test_teacher_skips_inherited_tower_controls(self, key):
+        from nemo_rl.models.megatron.setup import _apply_multimodal_config
+
+        model_cfg = SimpleNamespace()
+        config = {"megatron_cfg": {key: True, "_provider_override_allowlist": []}}
+        _apply_multimodal_config(model_cfg, config)
+        assert vars(model_cfg) == {}
+
+    def test_teacher_applies_explicit_tower_control(self):
+        from nemo_rl.models.megatron.setup import _apply_multimodal_config
+
+        model_cfg = SimpleNamespace(radio_force_cpe_eval_mode=False)
+        config = {
+            "megatron_cfg": {
+                "radio_force_cpe_eval_mode": True,
+                "_provider_override_allowlist": ["radio_force_cpe_eval_mode"],
+            }
+        }
+        _apply_multimodal_config(model_cfg, config)
+        assert model_cfg.radio_force_cpe_eval_mode is True
+
+    def test_teacher_rejects_explicit_unsupported_tower_control(self):
+        from nemo_rl.models.megatron.setup import _apply_multimodal_config
+
+        config = {
+            "megatron_cfg": {
+                "radio_force_cpe_eval_mode": True,
+                "_provider_override_allowlist": ["radio_force_cpe_eval_mode"],
+            }
+        }
+        with pytest.raises(ValueError, match="only supported by a multimodal provider"):
+            _apply_multimodal_config(SimpleNamespace(), config)
+
     def test_maps_legacy_omni_freeze_controls(self):
         from nemo_rl.models.megatron.setup import _apply_multimodal_config
 
@@ -5770,3 +5813,22 @@ class TestPeftWarmStart:
         # The hook receives the resolved donor iteration directory.
         assert mock_hook.call_args.args[2] == str(donor_iter_dir)
         assert mock_hook.call_args.args[0].peft.share_expert_adapters is False
+
+
+@pytest.mark.mcore
+def test_apply_mtp_config_respects_teacher_provider_allowlist():
+    """A teacher clone must not inherit the student's mtp_num_layers=0."""
+    from nemo_rl.models.megatron.setup import _apply_mtp_config
+
+    model_cfg = SimpleNamespace(mtp_num_layers=1, mtp_use_repeated_layer=True)
+    config = {
+        "megatron_cfg": {
+            "mtp_num_layers": 0,
+            "_provider_override_allowlist": ["tensor_model_parallel_size"],
+        }
+    }
+
+    _apply_mtp_config(model_cfg, config)
+
+    assert model_cfg.mtp_num_layers == 1
+    assert model_cfg.mtp_use_repeated_layer is True
