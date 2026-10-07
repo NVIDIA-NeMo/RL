@@ -7,8 +7,8 @@
 # turns of up to 4096 tokens, checkpoint every step, 2 h) so training progress
 # can be compared with the pivot run before enabling compaction. Differences
 # from pivot are the harness (eval-factory Harbor + stock OpenCode, remote
-# Podman backend) and the SingleController path with ordinary token capture
-# (token_capture.context_compaction=false, OpenCode compaction and pruning off).
+# Podman backend) and the SingleController path with framework-owned token
+# capture and OpenCode compaction/pruning off (no context rewrite).
 #   AGENTIC_VBENCH_BACKEND_DIR=$PWD/data/agentic_vbench/backend-cc-smoke-2 \
 #     bash scripts/agentic_vbench/smoke_off_step120.sh
 set -euo pipefail
@@ -34,8 +34,14 @@ export SAVE_PERIOD=${SAVE_PERIOD:-2}
 export CHECKPOINT_KEEP_TOP_K=${CHECKPOINT_KEEP_TOP_K:-1}
 export JOB_CYCLES=${JOB_CYCLES:-1}
 export SLURM_TIME_LIMIT=${SLURM_TIME_LIMIT:-02:00:00}
-# No context rewrite anywhere: ordinary capture, OpenCode compaction/pruning off.
-export CONTEXT_COMPACTION=false
+# No context rewrite anywhere: OpenCode compaction and pruning off. The capture
+# route stays framework-owned (token_capture.context_compaction=true): with it off,
+# Gym resolves each call's parent by fingerprinting OpenCode's replayed history,
+# which fails for stock OpenCode and poisons the calls (66 poisoned calls, every
+# rollout masked, in the 2026-10-07 attempt); the framework-owned route matches
+# the served completions by content and is what the compaction run validated.
+# This is the "identity" arm of compare_cc_20steps.sh: one row per rollout.
+export CONTEXT_COMPACTION=true
 export AGENTIC_VBENCH_COMPACTION_AUTO=false
 export AGENTIC_VBENCH_COMPACTION_PRUNE=false
 # Pivot harness: max_steps 8, max_tokens 4096, context 49152, concurrency 8.

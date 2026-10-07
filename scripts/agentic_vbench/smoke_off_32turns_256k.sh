@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# No-compaction run with the evaluation harness budget (32 turns, 8192 output
+# No-compaction (identity capture) run with the evaluation harness budget (32 turns, 8192 output
 # tokens) and the policy's native 256k context, so long episodes finish instead
 # of stopping at the turn cap or overflowing a 49k window. Same tasks, batch and
 # step count as smoke_off_step120.sh; all of a step's episodes run concurrently
