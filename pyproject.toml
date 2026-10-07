@@ -260,7 +260,7 @@ trtllm = [
 ]
 modelopt = ["nvidia-modelopt"]
 nvrx = [
-  "nvidia-resiliency-ext==0.6.0",
+  "nvidia-resiliency-ext==0.7.0",
 ] # for ft_launcher (fault-tolerant training launcher)
 nemo_gym = ["nemo_gym"]
 
@@ -361,7 +361,7 @@ flash_mla = { git = "https://github.com/deepseek-ai/FlashMLA", rev = "b7643bd545
 # real-quant dist-checkpoint sharding validation (`Invalid access pattern for
 # ShardedTensor(... experts.N.linear_fc1.weight_quantizer._amax`).
 nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "43fd41a58d52c4e6e5dec1d1ff5989ecc737ae1a" }
-nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", tag = "v0.6.0" }
+nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", tag = "v0.7.0" }
 flashinfer-cubin = { index = "flashinfer" }
 flashinfer-jit-cache = { index = "flashinfer-cu130" }
 
@@ -492,6 +492,9 @@ override-dependencies = [
   # decord2 is pulled transitively by sglang → qwen-vl-utils[decord] on aarch64 Linux.
   # NeMo-RL no longer calls any decord API (replaced by torchvision/torchaudio).
   "decord2; sys_platform == 'never'",
+  # megatron-bridge[ssm] pins mamba-ssm==2.3.1 for its patched Docker sdist build; we build
+  # mamba-ssm from the git rev in [tool.uv.sources] instead.
+  "mamba-ssm==2.3.2.post1",
   # megatron-core still pins lens v0.2.0 in its own [tool.uv.sources]; without an
   # override the two git URLs are a hard conflict, since the workspace resolves a
   # single nemo-lens. We need the newer rev for `SpanRegistry` (which replaced the
@@ -654,7 +657,7 @@ requires-dist = ["torch", "packaging", "ninja"]
 [[tool.uv.dependency-metadata]]
 name = "mamba-ssm"
 # This version has to match the version in the commit/rev/tag used
-version = "2.2.6.post3"
+version = "2.3.2.post1"
 requires-dist = ["torch", "packaging", "ninja", "causal-conv1d"]
 
 [[tool.uv.dependency-metadata]]

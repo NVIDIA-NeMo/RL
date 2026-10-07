@@ -4,10 +4,10 @@ source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=1
-STEPS_PER_RUN=400
-MAX_STEPS=400
+STEPS_PER_RUN=500
+MAX_STEPS=500
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=180  # bumped from 120: cold venv rebuild takes ~100min + 400 steps × ~12s
+NUM_MINUTES=150
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
@@ -33,12 +33,14 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
-    # Step time: median of the 50 steps before the last. Every run has a few
-    # 10-80 s generation stalls, and a mean over 5 steps fails whenever one
-    # lands in the window.
     uv run tests/check_metrics.py $JSON_METRICS \
         'median(data["train/token_mult_prob_error"]) < 1.1' \
-        'median(data["timing/train/total_step_time"], -51, -1) < 14'
+        'data["train/token_mult_prob_error"]["500"] < 1.1' \
+        'median(data["train/sampling_importance_ratio"]) < 1.005' \
+        'data["train/sampling_importance_ratio"]["500"] < 1.005' \
+        'median(data["train/gen_kl_error"]) < 0.002' \
+        'data["train/reward"]["500"] > 0.1' \
+        'mean(data["timing/train/total_step_time"], -6, -1) < 15'
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"

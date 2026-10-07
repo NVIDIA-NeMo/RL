@@ -19,7 +19,8 @@ import os
 import threading
 import time
 import warnings
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import fields, is_dataclass, replace
 from typing import Any, Callable, Optional, TypeVar, cast
 
@@ -348,6 +349,60 @@ _OPTIMIZER_DTYPE_KEYS = (
     "exp_avg_dtype",
     "exp_avg_sq_dtype",
 )
+
+
+@contextmanager
+def _sync_consumed_samples_on_scheduler_load(
+    state: GlobalState, scheduler: Any
+) -> Iterator[None]:
+    """Keep Megatron-Bridge from resetting the LR schedule on resume.
+
+    When override_opt_param_scheduler=True, Megatron-Bridge will override
+    the scheduler step with the checkpointed train_state.consumed_train_samples
+    after loading the scheduler from the checkpoint. Because NeMo-RL doesn't
+    use this counter, older checkpoints have this dummy state set to 0, which
+    then overrides the actual scheduler.num_steps checkpoint value.
+
+    To support forward compatibility matching Megatron, NeMo-RL should begin to
+    checkpoint train_state.consumed_train_samples = scheduler.num_steps to
+    identify / sync these two values when saving a checkpoint.
+
+    To support backward compatibility, this context manager will do the same
+    after checkpoint load to maintain the checkpointed scheduler.num_steps.
+
+    HACK(@cspades): When https://github.com/NVIDIA-NeMo/Megatron-Bridge/pull/6321
+    is merged, we should use `checkpoint_state_migration_hook` to implement the
+    backward-compatibility logic given the state_dict and train_state.
+
+    ```
+    load_checkpoint(
+        state,
+        model,
+        optimizer,
+        ...
+        checkpoint_state_migration_hook=checkpoint_compat_hook,
+    )
+    ```
+    """
+    if scheduler is None:
+        # No-op.
+        yield
+        return
+
+    # Override the scheduler state dict load method on instance.
+    load_state_dict = scheduler.load_state_dict
+
+    def load_and_sync(state_dict: dict[str, Any]) -> None:
+        load_state_dict(state_dict)
+        # Synchronize consumed_train_samples and scheduler.num_steps.
+        state.train_state.consumed_train_samples = scheduler.num_steps
+
+    scheduler.load_state_dict = load_and_sync
+    try:
+        yield
+    finally:
+        # Delete the method on instance to fallback to class def.
+        del scheduler.load_state_dict
 
 
 def _resolve_optimizer_dtype_kwargs(optimizer_cfg: dict[str, Any]) -> dict[str, Any]:
@@ -2562,14 +2617,16 @@ def setup_model_and_optimizer(
     if should_load_checkpoint:
         if pre_load_checkpoint_hook is not None:
             pre_load_checkpoint_hook(state, model)
-        load_checkpoint(
-            state,
-            model,
-            optimizer,
-            scheduler,
-            checkpointing_context=checkpointing_context,
-            skip_load_to_model_and_opt=HAVE_FSDP2 and megatron_cfg.dist.use_torch_fsdp2,
-        )
+        with _sync_consumed_samples_on_scheduler_load(state, scheduler):
+            load_checkpoint(
+                state,
+                model,
+                optimizer,
+                scheduler,
+                checkpointing_context=checkpointing_context,
+                skip_load_to_model_and_opt=HAVE_FSDP2
+                and megatron_cfg.dist.use_torch_fsdp2,
+            )
         print("Checkpoint loaded")
 
         # See _force_sync_optimizer_fp32_from_model: required when

@@ -290,6 +290,33 @@ def test_prepare_for_training_leaves_native_cpu_optimizer_placement():
     assert model.train_called
 
 
+def test_finish_training_evals_before_model_offload(monkeypatch):
+    """Mamba decode caches must refresh before CUDA parameter storage is released."""
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        MegatronValueWorkerImpl,
+    )
+
+    class _EvalModel:
+        def eval(self) -> None:
+            events.append("eval")
+
+    events = []
+    move_kwargs = []
+    worker = object.__new__(MegatronValueWorkerImpl)
+    worker.model = _EvalModel()
+    worker.optimizer = None
+    worker.move_model = lambda model, device, **kwargs: (
+        events.append("move_model") or move_kwargs.append(kwargs) or model
+    )
+
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    MegatronValueWorkerImpl.finish_training(worker)
+
+    assert events == ["eval", "move_model"]
+    assert move_kwargs == [{"move_params": True, "move_grads": True}]
+
+
 @pytest.fixture
 def value_setup(request, tiny_qwen2_model_path):
     """Spin up a `Value` wrapper around a tiny Qwen2 backbone for testing.

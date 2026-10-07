@@ -24,10 +24,12 @@ mixin subclass that fakes ``_is_replica_leader``.
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
+from nemo_rl.data_plane.column_io import write_columns
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
@@ -42,11 +44,9 @@ class _FakeWorker(TQWorkerMixin):
 
 
 def _seed_partition_with_one_sample(client: NoOpDataPlaneClient) -> KVBatchMeta:
-    from nemo_rl.data_plane.column_io import write_columns
-
     client.register_partition(
         partition_id="train",
-        fields=["input_ids", "input_lengths", "prev_logprobs"],
+        fields=["input_ids", "input_lengths", "token_mask", "prev_logprobs"],
         num_samples=1,
         consumer_tasks=["train"],
     )
@@ -63,6 +63,7 @@ def _seed_partition_with_one_sample(client: NoOpDataPlaneClient) -> KVBatchMeta:
         {
             "input_ids": torch.tensor([[1, 2, 3, 4]], dtype=torch.long),
             "input_lengths": torch.tensor([4], dtype=torch.long),
+            "token_mask": torch.ones(1, 4, dtype=torch.long),
         },
     )
     return meta
@@ -100,30 +101,41 @@ def test_writeback_only_leader_writes():
     )
 
 
-def test_writeback_single_worker_default_is_leader():
+@pytest.mark.parametrize("filtering_on", [True, False])
+def test_writeback_single_worker_default_is_leader(filtering_on):
     """Single-process worker (no TP/CP/PP) is trivially a leader."""
 
     class _SingleWorker(TQWorkerMixin):
-        def __init__(self, client: NoOpDataPlaneClient) -> None:
+        def __init__(self, client: NoOpDataPlaneClient, result: dict) -> None:
             self._dp_client = client
+            self._result = result
 
         def _local_coords(self) -> dict[str, int]:
             # No replicated axes — every axis check trivially True.
             return {}
 
+        def get_logprobs(self, data, micro_batch_size=None):
+            del data, micro_batch_size
+            return BatchedDataDict(self._result)
+
     client = NoOpDataPlaneClient()
     meta = _seed_partition_with_one_sample(client)
+    result = {"logprobs": torch.full((1, 4), 7.5)}
+    if filtering_on:
+        result["token_mask"] = torch.tensor([[1, 1, 0, 1]])
 
-    w = _SingleWorker(client)
-    w._write_back_result_field(
-        meta,
-        BatchedDataDict({"logprobs": torch.full((1, 4), 7.5)}),
-        result_key="logprobs",
-        tq_field="prev_logprobs",
-    )
+    _SingleWorker(client, result).get_logprobs_presharded(meta)
+
     fetched = client.get_samples(
         sample_ids=meta.sample_ids,
         partition_id="train",
-        select_fields=["prev_logprobs"],
+        select_fields=["prev_logprobs", "token_mask"],
     )
     assert torch.allclose(fetched["prev_logprobs"], torch.full((1, 4), 7.5))
+    expected_mask = (
+        torch.tensor([[1, 1, 0, 1]])
+        if filtering_on
+        else torch.ones(1, 4, dtype=torch.long)
+    )
+    assert torch.equal(fetched["token_mask"], expected_mask)
+    assert fetched["token_mask"].dtype == torch.long
