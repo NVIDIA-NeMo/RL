@@ -674,9 +674,10 @@ start_ray_sub() {
 # up instead of after every replica is healthy, overlapping Ray bring-up,
 # driver startup and worker setup with judge model loading. The LB URLs are
 # fixed before any backend registers, so the command can be finalized now.
-# Safe only because Gym's LocalVLLMModel blocks its own startup on an external
-# base_url answering /models, which holds rollouts until the judges serve; the
-# health loop below still runs and tears ray.sub down if a replica dies.
+# Safe only because Gym's model-endpoint startup check holds rollouts while a
+# load balancer answers 503 for want of a healthy backend (NVIDIA-NeMo/Gym#4108),
+# up to Gym's model_endpoint_readiness_timeout_seconds; the health loop below
+# still runs and tears ray.sub down if a replica dies.
 EXTERNAL_VLLM_EARLY_RAY="${EXTERNAL_VLLM_EARLY_RAY:-0}"
 if [[ "${EXTERNAL_VLLM_MODE}" == inline && "${EXTERNAL_VLLM_EARLY_RAY}" == "1" ]]; then
   for pool in "${pool_names[@]}"; do
