@@ -146,12 +146,17 @@ def _is_full_draft_stream(draft_keys: "set[str] | list[str]") -> bool:
     state_dict (always including ``embed_tokens``), regardless of method
     (dspark/dflash/eagle3). A megatron co-training exporter may instead
     stream a PARTIAL drafter -- the megatron eagle3 exporter intentionally
-    omits ``embed_tokens`` and uses the ``midlayer.*`` alias, relying on
-    drafter module sharing at serve time -- and future megatron block
-    drafters (dspark/dflash) may do the same, so this checks the actual
-    keys rather than trusting the method name.
+    omits ``embed_tokens`` and aliases its single collapsed layer as
+    ``midlayer.*`` instead of ``layers.0.*``, relying on drafter module
+    sharing at serve time -- and future megatron block drafters
+    (dspark/dflash) may do the same, so this checks for that unambiguous
+    partial-stream signature rather than inferring partialness from a
+    missing ``embed_tokens`` key: a FULL stream can also be missing that one
+    required key (e.g. a misconfigured trainer export), and keying off its
+    absence would then wrongly wave the stream through as "partial" instead
+    of flagging the missing key.
     """
-    return any("embed_tokens" in key for key in draft_keys)
+    return not any("midlayer." in key for key in draft_keys)
 
 
 def _format_refit_key_error(label: str, keys: set[str]) -> str:
