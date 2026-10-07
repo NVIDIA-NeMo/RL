@@ -121,7 +121,6 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     validate_cc_objective,
 )
 from nemo_rl.algorithms.single_controller_utils.logical_advantage import (
-    build_logical_owner_batch,
     has_logical_owners,
 )
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
