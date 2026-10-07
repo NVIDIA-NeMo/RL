@@ -380,11 +380,12 @@ class SingleControllerActor:
         self._partition_id: str = actor_args.partition_id
 
         self._master_config = master_config
-        self._log_full_result_tables = master_config.logger[
-            "wandb_enabled"
-        ] and should_log_nemo_gym_full_result_tables(
-            wandb_enabled=master_config.logger["wandb_enabled"],
-            wandb_config=master_config.logger["wandb"],
+        self._log_full_result_tables = (
+            master_config.logger.wandb_enabled
+            and should_log_nemo_gym_full_result_tables(
+                wandb_enabled=master_config.logger.wandb_enabled,
+                wandb_config=master_config.logger.wandb,
+            )
         )
         self._algo_cfg = algo_config(master_config)
         self._async_cfg = master_config.async_rl

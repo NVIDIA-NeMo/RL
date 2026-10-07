@@ -2943,7 +2943,7 @@ def test_train_pump_consumes_recovered_penalty_and_effort_statistics_once(
             sample_ids=[f"group-{i}_g0"],
             fields=[],
             sequence_lengths=[1],
-            tags=[{"weight_version": 0}],
+            tags=[{"weight_version": 0, GROUP_ID_TAG: f"group-{i}"}],
         )
         for i in range(2)
     ]
