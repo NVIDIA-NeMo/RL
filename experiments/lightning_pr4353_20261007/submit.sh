@@ -9,7 +9,7 @@ action=${3:-submit}
 [[ "$action" == submit || "$action" == test-only ]]
 
 if [[ "$arm" == option-a ]]; then
-  echo "WARNING: Option A uses an unpatched cuBLASLt grouped-GEMM path (NVBUG 6815125). Check numerical metrics before using results." >&2
+  echo "WARNING: Option A uses TE 2.18's unpatched grouped-tensor/cuBLASLt path (NVBUG 6815125). Check numerical metrics before using results." >&2
 fi
 
 : "${CONTAINER:?Set smoke-validated immutable nightly image}"

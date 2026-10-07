@@ -9,7 +9,7 @@ reference logprobs. Async uses NCCL reshard refit; Sync uses colocated refit.
 | --- | --- | --- |
 | `bf16-storage` | BF16/BF16 | Existing recipe |
 | `default` | MXFP8 params/MXFP8 routed experts | Existing recipe |
-| `option-a` | Same as default | TE GroupedTensor, cuBLASLt candidate |
+| `option-a` | Same as default | TE 2.18 grouped-tensor/cuBLASLt path via the legacy environment switch |
 | `option-b` | Same as default | TE op-fuser with grouped tensor, CuTeDSL/cuDNN candidate |
 
 The MXFP8 arms use #4353 to send logical BF16 refit weights; vLLM converts
@@ -19,6 +19,13 @@ inherits the outer model-init storage policy for first/last BF16 layers.
 Option A is explicitly an unpatched diagnostic at the user's request. NVBUG
 6815125 describes possible silent output corruption, so its timing is not a
 usable recommendation without a numerical comparison against the control.
+The pinned TE 2.18 `GroupedLinear` has no `use_grouped_tensor` constructor
+argument: the literal MCore flag fails during model initialization. The TE
+2.18 equivalent is `NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM=1` with
+`moe_use_grouped_tensor=false`; this selects the grouped-tensor GEMM for
+supported MXFP8 inputs on Blackwell. It does not use single grouped-parameter
+storage. Option B inherits the base recipe directly, so it cannot inherit the
+Option A environment switch.
 Option B additionally enables fused weighted squared ReLU because the model
 uses `relu2`; without it, this MCore version rejects the op-fuser path.
 

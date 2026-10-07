@@ -1,9 +1,11 @@
-defaults: sync-mxfp8-train-option-a.yaml
+defaults: sync-mxfp8-train.yaml
 
 policy:
   megatron_cfg:
+    moe_grouped_gemm: true
     use_fused_weighted_squared_relu: true
     model_overrides:
+      moe_use_grouped_tensor: true
       use_transformer_engine_op_fuser: true
     env_vars:
       NVTE_CUTEDSL_FUSED_GROUPED_MLP: "1"

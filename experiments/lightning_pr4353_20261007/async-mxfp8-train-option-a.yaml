@@ -4,7 +4,9 @@ policy:
   megatron_cfg:
     moe_grouped_gemm: true
     model_overrides:
-      moe_use_grouped_tensor: true
+      moe_use_grouped_tensor: false
+    env_vars:
+      NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM: "1"
 
 logger:
   wandb:
