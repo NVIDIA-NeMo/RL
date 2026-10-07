@@ -760,6 +760,8 @@ markers = [
   "sglang: marks tests that require the sglang extra",
   "trtllm: marks tests that require the trtllm extra",
   "nemo_gym: marks tests that require the nemo_gym extra",
+  "nixl: marks tests that need NIXL and UCX restricted to RDMA",
+  "gpu: marks tests that need a CUDA device",
 ]
 
 [tool.pyrefly]
