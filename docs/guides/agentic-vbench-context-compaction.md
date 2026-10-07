@@ -178,6 +178,17 @@ CC_ARMS="compaction identity" AGENTIC_VBENCH_BACKEND_DIR=... \
   bash scripts/agentic_vbench/compare_cc_20steps.sh
 ```
 
+Sizing used here for the comparison (the 2-/3-node figures in the internal guide
+are for its stub model; Super Omni needs TP8/EP16): 8 nodes per arm (4 training,
+4 generation, `SEGMENT_SIZE=4`), 8 prompts x 8 generations, all 100 tasks with
+two repeats (`data/agentic_vbench/train/all_x2.jsonl`, 200 rows for 160 prompt
+slots), `AGENTIC_VBENCH_CONCURRENCY=32`, `SAVE_PERIOD=2` so chained job cycles
+(`JOB_CYCLES`) can resume after a cluster cancellation, and every task image
+prebuilt on the backend beforehand (`prebuild_task_images.py` with the
+`all_x2_manifest.json`). Non-native families (repurpose, sequencing,
+understanding) need the Hub judge, so `AGENTIC_VBENCH_JUDGE_PROTOCOL` stays at
+its default and the credentials file must exist.
+
 Each run writes `results/<name>/{logs,checkpoints,token_capture,episodes,slurm}`
 and an `avb_environment.env` snapshot. Compare per-step reward, response length,
 `model_calls`/`compaction_summaries` from the Gym responses log, and training-row
