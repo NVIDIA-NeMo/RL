@@ -54,6 +54,10 @@ single `ValueError` listing every violation. The current requirements are:
   gate/up partitions must align with block boundaries. Refined scale grids and
   incompatible runtime scale layouts are rejected. Megatron blockwise destinations
   use Transformer Engine storage, while `inference_optimized` supports MXFP8.
+  The unchanged misc path still limits blockwise FP8 parameter storage on the
+  training side to blockwise FP8 vLLM destinations (`precision='fp8'`, `is_mx=false`):
+  misc weights retain their physical FP8 values and inverse scales. This restriction
+  comes from misc loading, not from the bulk BF16 transport.
 * Megatron generation accepts BF16 or supported Transformer Engine FP8 training
   parameter storage, including blockwise FP8 and MXFP8 with `fp8_param=true`.
   Quantized sources are materialized as logical BF16 for transport; the

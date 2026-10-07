@@ -707,6 +707,20 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
                     f"policy.generation.vllm_cfg.precision={gen_precision!r} is not "
                     "supported by nccl_reshard_refit."
                 )
+            if (
+                fp8_param
+                and fp8_cfg.get("fp8_recipe") == "blockwise"
+                and (gen_precision != "fp8" or vllm_cfg.get("is_mx", False))
+            ):
+                # This matches the source's _is_fp8_export condition. Its misc
+                # stream still carries physical FP8 weights and scale_inv;
+                # canonical BF16 bulk hooks do not convert those other weights.
+                violations.append(
+                    "Blockwise FP8 training storage requires "
+                    "policy.generation.vllm_cfg.precision='fp8' and is_mx=False "
+                    "because the unchanged misc refit stream contains physical "
+                    "FP8 weights and scale_inv tensors."
+                )
 
         if backend == "megatron":
             gen_pp = mcore_generation_cfg.get("pipeline_model_parallel_size", 1)

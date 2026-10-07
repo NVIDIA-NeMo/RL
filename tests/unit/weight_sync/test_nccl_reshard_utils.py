@@ -102,7 +102,7 @@ def test_check_nccl_reshard_refit_support_accepts_bf16_to_mxfp8() -> None:
 
 @pytest.mark.parametrize("trainer_precision", ["float16", "float32", "bfloat16"])
 @pytest.mark.parametrize("gen_precision", ["float16", "float32", "bfloat16", "fp8"])
-@pytest.mark.parametrize("source_recipe", [None, "blockwise", "mxfp8"])
+@pytest.mark.parametrize("source_recipe", [None, "mxfp8"])
 @pytest.mark.parametrize("is_mx", [False, True])
 def test_check_nccl_reshard_accepts_independent_storage_precisions(
     trainer_precision, gen_precision, source_recipe, is_mx
@@ -117,6 +117,43 @@ def test_check_nccl_reshard_accepts_independent_storage_precisions(
         "fp8_param": source_recipe is not None,
         "fp8_recipe": source_recipe,
     }
+    check_nccl_reshard_refit_support(config)
+
+
+@pytest.mark.parametrize(
+    "gen_precision",
+    [None, "auto", "bf16", "bfloat16", "half", "float16", "float", "float32", "fp8"],
+)
+@pytest.mark.parametrize("is_mx", [False, True])
+def test_blockwise_physical_misc_requires_matching_vllm_storage(gen_precision, is_mx):
+    config = _valid_nccl_reshard_config()
+    config.policy["megatron_cfg"]["fp8_cfg"] = {
+        "enabled": True,
+        "fp8_param": True,
+        "fp8_recipe": "blockwise",
+    }
+    config.policy["generation"]["vllm_cfg"].update(
+        {"precision": gen_precision, "is_mx": is_mx}
+    )
+    if gen_precision == "fp8" and not is_mx:
+        check_nccl_reshard_refit_support(config)
+    else:
+        with pytest.raises(ValueError, match="unchanged misc refit stream"):
+            check_nccl_reshard_refit_support(config)
+
+
+@pytest.mark.parametrize("gen_precision", ["bfloat16", "float16", "float32", "fp8"])
+@pytest.mark.parametrize("is_mx", [False, True])
+def test_blockwise_compute_without_fp8_storage_keeps_logical_misc(gen_precision, is_mx):
+    config = _valid_nccl_reshard_config()
+    config.policy["megatron_cfg"]["fp8_cfg"] = {
+        "enabled": True,
+        "fp8_param": False,
+        "fp8_recipe": "blockwise",
+    }
+    config.policy["generation"]["vllm_cfg"].update(
+        {"precision": gen_precision, "is_mx": is_mx}
+    )
     check_nccl_reshard_refit_support(config)
 
 
