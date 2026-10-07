@@ -4,6 +4,8 @@ mode=${1:?Usage: submit.sh sync|async [test-only]}
 action=${2:-submit}
 [[ "$mode" == sync || "$mode" == async ]]
 [[ "$action" == submit || "$action" == test-only ]]
+rollout_precision=${ROLLOUT_PRECISION:-bf16}
+[[ "$rollout_precision" == bf16 || "$rollout_precision" == mxfp8 ]]
 : "${CONTAINER:?Set immutable smoke-validated nightly image}"
 : "${SOURCE_ARCHIVE:?Set immutable source archive}"
 : "${SOURCE_COMMIT:?Set expected source commit}"
@@ -17,8 +19,13 @@ fi
 test "$(git -C "$repo" rev-parse HEAD)" = "$SOURCE_COMMIT"
 test -z "$(git -C "$repo" status --porcelain --untracked-files=no --ignore-submodules=none)"
 name="lightning-main-${mode}-bf16-gbs512-20261006"
+config="${mode}-bf16.yaml"
+if [[ "$rollout_precision" == mxfp8 ]]; then
+  name="lightning-main-${mode}-bf16-mxfp8-gbs512-20261007"
+  config="${mode}-mxfp8.yaml"
+fi
 run_root="${RESULT_ROOT}/${name}"
-local_root="/raid/scratch/${USER}/nr-${mode}-main-20261006"
+local_root="/raid/scratch/${USER}/nr-${mode}-${rollout_precision}-main-20261006"
 source_root="${local_root}/source"
 hf_source="/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/${USER}/hf_home"
 model_cache=models--nvidia--NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16
@@ -45,7 +52,7 @@ export NEMO_RL_VENV_DIR=/opt/ray_venvs NRL_FORCE_REBUILD_VENVS=false FLA_TILELAN
 export UV_CACHE_DIR=${local_root}/uv VLLM_CACHE_ROOT=${local_root}/vllm TORCHINDUCTOR_CACHE_DIR=${local_root}/inductor TRITON_CACHE_DIR=${local_root}/triton
 export PYTHONPYCACHEPREFIX=${local_root}/pycache RAY_TMPDIR=/tmp
 unset NRL_IGNORE_VERSION_MISMATCH PYTHONOPTIMIZE
-/opt/nemo_rl_venv/bin/python examples/run_grpo.py --config experiments/lightning_main_20261006/${mode}-bf16.yaml logger.log_dir=${run_root}/metrics logger.wandb.name=${name}"
+/opt/nemo_rl_venv/bin/python examples/run_grpo.py --config experiments/lightning_main_20261006/${config} logger.log_dir=${run_root}/metrics logger.wandb.name=${name}"
 args=(--nodes=8 --gres=gpu:4 --exclusive --mem=0 --account="$account" --partition=batch --time=04:00:00
   --segment="$segment" --job-name="${account}.${name}" --output="${run_root}/slurm-%j.out"
   --comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"120","reason":"model_loading","description":"fresh main GBS512 model initialization"}}'
@@ -56,5 +63,5 @@ fi
 if [[ "$action" == test-only ]]; then
   args+=(--test-only)
 fi
-printf 'source=%s\ncontainer=%s\nconfig=%s\n' "$SOURCE_COMMIT" "$CONTAINER" "${mode}-bf16.yaml"
+printf 'source=%s\ncontainer=%s\nconfig=%s\n' "$SOURCE_COMMIT" "$CONTAINER" "$config"
 exec sbatch "${args[@]}" "$repo/ray.sub"

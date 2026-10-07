@@ -1,0 +1,22 @@
+defaults: sync-bf16.yaml
+
+policy:
+  generation:
+    vllm_cfg:
+      precision: fp8
+      is_mx: true
+      num_first_layers_in_bf16: 2
+      num_last_layers_in_bf16: 6
+      quantization_ignore_patterns:
+        - "*layers.*.mixer.qkv_proj"
+        - "*layers.*.mixer.o_proj"
+        - "*layers.*.mixer.in_proj"
+        - "*layers.*.mixer.out_proj"
+        - "*layers.*.mixer.up_proj"
+        - "*layers.*.mixer.down_proj"
+        - "*layers.*.mixer.gate"
+        - "*layers.*.mixer.shared_experts.*"
+        - "*layers.*.mixer.fc1_latent_proj"
+        - "*layers.*.mixer.fc2_latent_proj"
+        - "*mtp.*"
+        - lm_head

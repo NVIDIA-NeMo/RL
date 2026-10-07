@@ -21,6 +21,14 @@ Sync uses 32 training GPUs/EP32; Async-1off uses 16 training GPUs/EP16 and
 16 rollout GPUs with NCCL reshard. Policy/reference logprobs remain enabled.
 This is a separate approved Lightning recipe, not a main performance-folder recipe.
 
+The BF16/BF16 Sync and Async-1off jobs completed20 updates on October7.
+For a same-code rollout comparison, `sync-mxfp8.yaml` and `async-mxfp8.yaml`
+inherit the matching BF16 recipes and change only rollout precision and its
+exclusions: routed experts in the middle layers use MXFP8; first2 and last6
+layers, attention, Mamba, shared experts, router, MTP and the output head stay
+BF16. Submit these arms with `ROLLOUT_PRECISION=mxfp8`. Training stays BF16.
+The same pinned image, model, GBS, topology and logprob settings are retained.
+
 Stages: immutable nightly import, recursive source preparation, GPU environment
 and resolved-config gate, then matched 20-step Sync/Async BF16 baselines.
 The gate rejects mismatches in lockfile, dependency declaration or actor extras.
