@@ -18,7 +18,7 @@ esac
 : "${RESULT_ROOT:?Set shared results directory}"
 : "${WANDB_API_KEY:?W&B cloud logging must be enabled}"
 
-repo=$(git rev-parse --show-toplevel)
+repo=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
 launch_commit=${LAUNCH_COMMIT:-$SOURCE_COMMIT}
 test "$(git -C "$repo" rev-parse HEAD)" = "$launch_commit"
 test -z "$(git -C "$repo" status --porcelain --untracked-files=no --ignore-submodules=none)"
