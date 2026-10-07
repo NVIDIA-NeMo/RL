@@ -265,24 +265,22 @@ GYM_INFRA_FAILURE_KEY = "_gym_infra_failure"
 
 
 def _typed_gym_failure(failure_row: dict) -> GymTransportError | RolloutDataFailure:
-    """Map a NeMo-Gym ``/run`` failure row onto a typed, PICKLABLE failure.
+    """Map a NeMo-Gym ``/run`` failure row onto a typed failure.
 
     ``run_rollouts`` asks Gym's rollout collector to return a failed ``/run`` as a
-    failure row instead of raising, because the exception would not survive the
-    actor boundary: aiohttp's ``raise_for_status`` passes ``headers=self.headers``,
-    a ``CIMultiDictProxy`` that cloudpickle cannot serialize, so Ray would deliver a
-    bare ``RayTaskError`` with no type and no ``.status`` and the driver would classify
-    every Gym HTTP failure as DATA. The row carries the status as a plain value, and
-    the classification happens here, on the actor side, with the same
-    ``http_status_is_infra`` rule the driver applies.
+    failure row instead of raising because a raise ends the whole stream: one
+    bad row would discard every other row still in flight on that actor. The
+    row carries the HTTP status as a plain value, and the classification
+    happens here, on the actor side, with the same ``http_status_is_infra``
+    rule the driver applies.
 
     A 5xx or a retriable 4xx (408, 429) means the endpoint is unwell and becomes
     ``GymTransportError``, as does a row without a status (a connection failure or a
     timeout before any reply). Any other status describes the request itself and
-    becomes ``RolloutDataFailure``. Both take a single str, so they pickle cleanly and
-    ``classify_rollout_failure``'s explicit-class fast path wins on the far side. The
-    recorded response body (already capped by Gym) rides in the detail, so a 4xx
-    explains what the server rejected.
+    becomes ``RolloutDataFailure``. Both take a single str, so they pickle cleanly
+    across the actor boundary and ``classify_rollout_failure``'s explicit-class
+    fast path wins on the far side. The recorded response body (already capped by
+    Gym) rides in the detail, so a 4xx explains what the server rejected.
     """
     status = failure_row.get(GYM_FAILURE_STATUS_KEY)
     message = failure_row.get(GYM_FAILURE_MESSAGE_KEY)
