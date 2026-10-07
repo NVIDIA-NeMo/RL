@@ -643,7 +643,9 @@ class MegatronGeneration(GenerationInterface):
                     raise RolloutDataFailure(
                         "Megatron generation worker died; the inference policy must be rebuilt"
                     ) from error
-                except Exception as error:
+                except (Exception, asyncio.CancelledError) as error:
+                    # An outer turn deadline can interrupt the drain itself.
+                    # Never let that become a tolerable infrastructure failure.
                     raise RolloutDataFailure(
                         "Could not confirm cleanup of Megatron generation requests"
                     ) from error

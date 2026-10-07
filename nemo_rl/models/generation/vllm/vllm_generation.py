@@ -1280,9 +1280,10 @@ class VllmGeneration(GenerationInterface):
                         )
                 except ray.exceptions.ActorDiedError:
                     pass  # The dead process cannot retain a generation request.
-                except Exception as error:
+                except (Exception, asyncio.CancelledError) as error:
                     # Do not retry when cleanup is uncertain: that could duplicate
-                    # a live request. Explicit DATA overrides the timeout cause.
+                    # a live request. This includes a turn deadline interrupting
+                    # cleanup. Explicit DATA overrides the timeout/cancellation cause.
                     raise RolloutDataFailure(
                         f"Could not confirm cleanup of generation request {request_id}"
                     ) from error
