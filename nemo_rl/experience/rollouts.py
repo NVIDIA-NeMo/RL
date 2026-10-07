@@ -23,6 +23,7 @@ import uuid
 import warnings
 from collections import defaultdict
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
+from contextlib import aclosing
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -64,6 +65,11 @@ from nemo_rl.environments.nemo_gym import (
     get_nemo_gym_route_name,
     get_pad_dynamic_image_shapes,
 )
+from nemo_rl.experience.failures import (
+    FailureClass,
+    RolloutInfraFailure,
+    classify_rollout_failure,
+)
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
@@ -78,6 +84,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     GenerationOutputSpec,
     GenerationSamplingParams,
+    NativeGenerationRetryConfig,
 )
 from nemo_rl.telemetry.instrumentation import dispatch_with_trace_context
 from nemo_rl.utils.multimodal_payload_metrics import (
@@ -725,10 +732,11 @@ async def generate_responses_async(
     collected_indexed_outputs: list[
         tuple[int, BatchedDataDict[GenerationOutputSpec]]
     ] = []
-    async for original_idx, single_item_output in policy_generation.generate_async(
-        generation_input_data, greedy=greedy
-    ):
-        collected_indexed_outputs.append((original_idx, single_item_output))
+    async with aclosing(
+        policy_generation.generate_async(generation_input_data, greedy=greedy)
+    ) as outputs:
+        async for original_idx, single_item_output in outputs:
+            collected_indexed_outputs.append((original_idx, single_item_output))
 
     # Sort by original_idx to ensure order matches generation_input_data
     collected_indexed_outputs.sort(key=lambda x: x[0])
@@ -1285,6 +1293,72 @@ async def async_generate_response_for_sample_turn(
     return updated_message_log, generated_tokens, input_lengths, gen_metrics
 
 
+class NativeGenerationRetriesExhausted(RolloutInfraFailure):
+    """A generation turn exhausted its attempts or wall-clock budget."""
+
+
+async def _generate_sample_turn_with_retry(
+    policy_generation: GenerationInterface,
+    message_log: list[dict],
+    stop_strings: Optional[list[str]],
+    tokenizer: TokenizerType,
+    max_seq_len: int,
+    *,
+    retry_config: Optional[NativeGenerationRetryConfig],
+    greedy: bool,
+    sample_multimodal_data: dict[str, Any],
+    deduplicate_multimodal_data: bool,
+) -> tuple[list[dict], torch.Tensor, torch.Tensor, dict[str, float]]:
+    # Each attempt owns its output messages. Nothing becomes trajectory state until
+    # the whole generation call succeeds, even if decoding mutates its input.
+    max_retries = retry_config.max_retries if retry_config is not None else 0
+    deadline = retry_config.deadline_seconds if retry_config is not None else None
+
+    async def generate() -> tuple[
+        list[dict], torch.Tensor, torch.Tensor, dict[str, float]
+    ]:
+        last_error: Optional[Exception] = None
+        for attempt in range(max_retries + 1):
+            try:
+                result = await async_generate_response_for_sample_turn(
+                    policy_generation,
+                    copy.deepcopy(message_log),
+                    stop_strings,
+                    tokenizer,
+                    max_seq_len,
+                    greedy=greedy,
+                    sample_multimodal_data=sample_multimodal_data,
+                    deduplicate_multimodal_data=deduplicate_multimodal_data,
+                )
+            except Exception as error:
+                if (
+                    retry_config is None
+                    or classify_rollout_failure(error) is not FailureClass.INFRA
+                ):
+                    raise
+                last_error = error
+                if attempt < max_retries:
+                    await asyncio.sleep(retry_config.backoff_seconds * 2**attempt)
+            else:
+                result[3]["generation_retries"] = attempt
+                return result
+        assert (
+            last_error is not None
+        )  # The validated budget permits at least one attempt.
+        raise NativeGenerationRetriesExhausted(
+            f"Generation turn failed after {max_retries + 1} attempts"
+        ) from last_error
+
+    try:
+        return await asyncio.wait_for(generate(), timeout=deadline)
+    except TimeoutError as error:
+        if deadline is None:
+            raise
+        raise NativeGenerationRetriesExhausted(
+            f"Generation turn exceeded {deadline}s deadline"
+        ) from error
+
+
 async def run_sample_multi_turn_rollout(
     sample_idx: int,
     initial_sample_state: dict,
@@ -1295,6 +1369,7 @@ async def run_sample_multi_turn_rollout(
     max_rollout_turns: int = 999999,
     greedy: bool = False,
     deduplicate_multimodal_data: bool = False,
+    retry_config: Optional[NativeGenerationRetryConfig] = None,
 ) -> tuple[dict, dict[str, Any]]:
     """Run a multi-turn rollout for a single sample.
 
@@ -1316,6 +1391,17 @@ async def run_sample_multi_turn_rollout(
     Returns:
         Tuple of (final_sample_state, sample_metrics)
     """
+    supports_retry = policy_generation.supports_native_generation_retries()
+    if retry_config is not None:
+        retry_config = NativeGenerationRetryConfig.model_validate(retry_config)
+        if not supports_retry:
+            raise ValueError("Generation backend does not support safe native retries")
+    else:
+        retry_config = NativeGenerationRetryConfig()
+    # Unsupported backends retain their existing failure behavior; do not impose
+    # a deadline that could abandon a live remote request without acknowledgment.
+    if not supports_retry:
+        retry_config = None
     # Initialize sample state
     current_message_log = copy.deepcopy(initial_sample_state["message_log"])
     current_extra_env_info = copy.deepcopy(initial_sample_state["extra_env_info"])
@@ -1328,6 +1414,7 @@ async def run_sample_multi_turn_rollout(
     }
 
     # Sample-level metrics
+    generation_retries = 0
     total_reward = 0.0
     reward_acc_dict: dict[str, float] = {}  # per-component reward accumulators (named)
     multi_reward_seen = False
@@ -1364,17 +1451,19 @@ async def run_sample_multi_turn_rollout(
                 generated_tokens,
                 input_lengths,
                 gen_metrics,
-            ) = await async_generate_response_for_sample_turn(
+            ) = await _generate_sample_turn_with_retry(
                 policy_generation,
                 current_message_log,
                 current_stop_strings,
                 tokenizer,
                 max_seq_len,
+                retry_config=retry_config,
                 greedy=greedy,
                 sample_multimodal_data=turn_multimodal_data,
                 deduplicate_multimodal_data=deduplicate_multimodal_data,
             )
             current_message_log = updated_message_log
+            generation_retries += int(gen_metrics.pop("generation_retries"))
 
             # Check if response was truncated (hit max_tokens without stop token)
             response_truncated = gen_metrics.pop("_response_truncated", None)
@@ -1479,7 +1568,7 @@ async def run_sample_multi_turn_rollout(
         "task_name": task_name,
         "total_reward": torch.tensor(total_reward),
         "stop_strings": current_stop_strings,
-        "idx": sample_idx,
+        "idx": initial_sample_state.get("idx", sample_idx),
     }
     if multi_reward_seen:
         for name, acc in reward_acc_dict.items():
@@ -1498,6 +1587,7 @@ async def run_sample_multi_turn_rollout(
         "truncated": truncated,
         "max_turns_reached": max_turns_reached,
         "total_reward": total_reward,
+        "generation_retries": generation_retries,
         "turn_gen_tokens": turn_gen_tokens,
         "turn_input_tokens": turn_input_tokens,
         "turn_total_tokens": turn_total_tokens,
@@ -1535,6 +1625,9 @@ def _aggregate_multi_turn_rollout_metrics(
     rollout_metrics = {
         # Overall metrics
         "total_turns": sum(turn_counts),
+        "generation_retries": sum(
+            m.get("generation_retries", 0) for m in all_sample_metrics
+        ),
         "avg_turns_per_sample": sum(turn_counts) / batch_size,
         "max_turns_per_sample": max(turn_counts),
         "turns_per_sample/p95": pct(turn_counts, 95),
@@ -1601,7 +1694,7 @@ def _aggregate_multi_turn_rollout_metrics(
     return rollout_metrics
 
 
-async def _run_multi_turn_rollout_async(
+async def _run_multi_turn_rollout_samples(
     policy_generation: GenerationInterface,
     input_batch: BatchedDataDict[DatumSpec],
     tokenizer: TokenizerType,
@@ -1610,7 +1703,8 @@ async def _run_multi_turn_rollout_async(
     max_rollout_turns: int = 999999,
     greedy: bool = False,
     deduplicate_multimodal_data: bool = False,
-) -> tuple[BatchedDataDict[DatumSpec], list[dict[str, Any]]]:
+    retry_config: Optional[NativeGenerationRetryConfig] = None,
+) -> list[tuple[dict, dict[str, Any]] | Exception]:
     """Run one native rollout batch and retain metrics at sample granularity."""
     batch_size = len(input_batch["message_log"])
 
@@ -1628,7 +1722,9 @@ async def _run_multi_turn_rollout_async(
                 sample_state[key] = input_batch[key][i]
         sample_initial_states.append(sample_state)
 
-    async def run_single_sample_with_error_handling(i, sample_state):
+    async def run_single_sample_with_error_handling(
+        i: int, sample_state: dict
+    ) -> tuple[dict, dict[str, Any]] | Exception:
         try:
             return await run_sample_multi_turn_rollout(
                 sample_idx=i,
@@ -1638,19 +1734,37 @@ async def _run_multi_turn_rollout_async(
                 task_to_env=task_to_env,
                 max_seq_len=max_seq_len,
                 max_rollout_turns=max_rollout_turns,
+                retry_config=retry_config,
                 greedy=greedy,
                 deduplicate_multimodal_data=deduplicate_multimodal_data,
             )
         except Exception as error:
-            raise RuntimeError(f"Error in sample {i} rollout: {error}") from error
+            sample_error = RuntimeError(f"Error in sample {i} rollout: {error}")
+            if classify_rollout_failure(error) is not FailureClass.INFRA:
+                raise sample_error from error
+            sample_error.__cause__ = error
+            return sample_error
 
-    sample_results = await asyncio.gather(
-        *(
-            run_single_sample_with_error_handling(i, sample_state)
-            for i, sample_state in enumerate(sample_initial_states)
-        ),
-        return_exceptions=False,
-    )
+    tasks = [
+        asyncio.create_task(run_single_sample_with_error_handling(i, state))
+        for i, state in enumerate(sample_initial_states)
+    ]
+    try:
+        # Retain input ordering and the full-batch barrier. A failed sample does
+        # not erase successfully completed, unrelated prompt groups.
+        results = list(await asyncio.gather(*tasks))
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    return results
+
+
+def _assemble_native_rollout_batch(
+    input_batch: BatchedDataDict[DatumSpec],
+    sample_results: Sequence[tuple[dict, dict[str, Any]]],
+) -> tuple[BatchedDataDict[DatumSpec], list[dict[str, Any]]]:
     final_sample_states = [result[0] for result in sample_results]
     all_sample_metrics = [result[1] for result in sample_results]
 
@@ -1698,6 +1812,38 @@ async def _run_multi_turn_rollout_async(
     return final_batch, all_sample_metrics
 
 
+async def _run_multi_turn_rollout_async(
+    policy_generation: GenerationInterface,
+    input_batch: BatchedDataDict[DatumSpec],
+    tokenizer: TokenizerType,
+    task_to_env: dict[str, EnvironmentInterface],
+    max_seq_len: int,
+    max_rollout_turns: int = 999999,
+    greedy: bool = False,
+    deduplicate_multimodal_data: bool = False,
+    retry_config: Optional[NativeGenerationRetryConfig] = None,
+) -> tuple[BatchedDataDict[DatumSpec], list[dict[str, Any]]]:
+    """Run one native rollout batch and retain metrics at sample granularity."""
+    results = await _run_multi_turn_rollout_samples(
+        policy_generation,
+        input_batch,
+        tokenizer,
+        task_to_env,
+        max_seq_len=max_seq_len,
+        max_rollout_turns=max_rollout_turns,
+        greedy=greedy,
+        deduplicate_multimodal_data=deduplicate_multimodal_data,
+        retry_config=retry_config,
+    )
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+    return _assemble_native_rollout_batch(
+        input_batch,
+        [result for result in results if not isinstance(result, BaseException)],
+    )
+
+
 def run_async_multi_turn_rollout(
     policy_generation: GenerationInterface,
     input_batch: BatchedDataDict[DatumSpec],
@@ -1707,6 +1853,7 @@ def run_async_multi_turn_rollout(
     max_rollout_turns: int = 999999,
     greedy: bool = False,
     deduplicate_multimodal_data: bool = False,
+    retry_config: Optional[NativeGenerationRetryConfig] = None,
 ) -> tuple[BatchedDataDict[DatumSpec], dict[str, Any]]:
     """Run a complete native rollout batch from a synchronous call site.
 
@@ -1722,6 +1869,7 @@ def run_async_multi_turn_rollout(
         max_seq_len: Maximum total token length for each rollout sample.
         max_rollout_turns: Maximum number of agent-environment interaction turns.
         greedy: Whether policy generation should use greedy decoding.
+        retry_config: Bounded per-turn infrastructure retries and deadline.
 
     Returns:
         A tuple containing the completed rollout batch and metrics aggregated over
@@ -1738,6 +1886,7 @@ def run_async_multi_turn_rollout(
             task_to_env=task_to_env,
             max_seq_len=max_seq_len,
             max_rollout_turns=max_rollout_turns,
+            retry_config=retry_config,
             greedy=greedy,
             deduplicate_multimodal_data=deduplicate_multimodal_data,
         )
@@ -1755,12 +1904,14 @@ async def run_async_multi_turn_rollout_groups(
     max_rollout_turns: int = 999999,
     greedy: bool = False,
     deduplicate_multimodal_data: bool = False,
+    retry_config: Optional[NativeGenerationRetryConfig] = None,
 ) -> AsyncGenerator[RolloutGroupResult, None]:
     """Run one native batch, then yield prompt groups with group-local metrics.
 
     This intentionally retains the native path's full-batch completion barrier.
-    The group iterator gives the collector a common interface with NeMo-Gym
-    without changing native rollout scheduling semantics.
+    Complete groups are yielded in input order. Infrastructure failures discard
+    only their prompt group and are reported after intact groups have been yielded;
+    unknown failures abort the batch. The collector owns the failure allowance.
 
     Args:
         policy_generation: Generation interface used to produce policy responses.
@@ -1771,6 +1922,7 @@ async def run_async_multi_turn_rollout_groups(
         num_generations: Number of contiguous rollout samples in each prompt group.
         max_rollout_turns: Maximum number of agent-environment interaction turns.
         greedy: Whether policy generation should use greedy decoding.
+        retry_config: Bounded per-turn infrastructure retries and deadline.
 
     Yields:
         Complete prompt groups in input order. Each ``RolloutGroupResult`` contains
@@ -1789,25 +1941,52 @@ async def run_async_multi_turn_rollout_groups(
             "Native rollout batch size must be divisible by num_generations"
         )
 
-    final_batch, sample_metrics = await _run_multi_turn_rollout_async(
-        policy_generation=policy_generation,
-        input_batch=input_batch,
-        tokenizer=tokenizer,
-        task_to_env=task_to_env,
+    results = await _run_multi_turn_rollout_samples(
+        policy_generation,
+        input_batch,
+        tokenizer,
+        task_to_env,
         max_seq_len=max_seq_len,
         max_rollout_turns=max_rollout_turns,
         greedy=greedy,
         deduplicate_multimodal_data=deduplicate_multimodal_data,
+        retry_config=retry_config,
     )
-    for group_index, start in enumerate(range(0, final_batch.size, num_generations)):
+    # Unknown errors are bugs, not permission to drop a prompt. Preserve their
+    # original chain and fail before committing any part of this batch.
+    for result in results:
+        if isinstance(result, BaseException) and (
+            not isinstance(result, Exception)
+            or classify_rollout_failure(result) is not FailureClass.INFRA
+        ):
+            raise result
+    failures = []
+    for group_index, start in enumerate(range(0, input_batch.size, num_generations)):
         end = start + num_generations
+        group_results = results[start:end]
+        error = next((r for r in group_results if isinstance(r, BaseException)), None)
+        if error is not None:
+            failures.append((group_index, error))
+            continue
+        final_batch, sample_metrics = _assemble_native_rollout_batch(
+            input_batch.slice(start, end),
+            [
+                result
+                for result in group_results
+                if not isinstance(result, BaseException)
+            ],
+        )
         yield RolloutGroupResult(
             group_index=group_index,
-            final_batch=final_batch.slice(start, end),
-            rollout_metrics=_aggregate_multi_turn_rollout_metrics(
-                sample_metrics[start:end]
-            ),
+            final_batch=final_batch,
+            rollout_metrics=_aggregate_multi_turn_rollout_metrics(sample_metrics),
         )
+    if failures:
+        # The collector has already committed intact groups. Raising retains its
+        # bounded failed-batch accounting and releases the remaining reservation.
+        raise NativeGenerationRetriesExhausted(
+            f"Native rollout failed prompt groups {[i for i, _ in failures]}"
+        ) from failures[0][1]
 
 
 def _tensorize_by_key(message_logs: list, key: str):

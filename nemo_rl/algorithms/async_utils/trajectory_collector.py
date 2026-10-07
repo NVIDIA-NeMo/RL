@@ -49,6 +49,7 @@ from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
+from nemo_rl.experience.failures import FailureClass, classify_rollout_failure
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
@@ -1574,6 +1575,7 @@ class AsyncTrajectoryCollector:
             input_batch=repeated_batch,
             tokenizer=self.tokenizer,
             task_to_env=self.task_to_env,
+            retry_config=self.master_config.policy["generation"].get("native_retry"),
             max_seq_len=self.master_config.policy["max_total_sequence_length"],
             num_generations=num_generations,
             max_rollout_turns=self._max_rollout_turns,
@@ -1620,12 +1622,16 @@ class AsyncTrajectoryCollector:
                 self._failure_count += 1
                 failure_count = self._failure_count
                 failure_limit = self._max_generation_failures
-                is_fatal = failure_count > failure_limit
+                is_fatal = failure_count > failure_limit or (
+                    not use_nemo_gym
+                    and classify_rollout_failure(error) is not FailureClass.INFRA
+                )
                 if is_fatal and self._fatal_error_message is None:
                     self._fatal_error_message = (
                         "AsyncTrajectoryCollector aborting: "
-                        f"{failure_count} batch-worker failure(s) exceeded "
-                        f"max_generation_failures={failure_limit}. "
+                        f"{failure_count} batch-worker failure(s), "
+                        f"max_generation_failures={failure_limit}; "
+                        "failure is non-recoverable or its allowance was exhausted. "
                         f"Last failure in {backend} batch worker for "
                         f"generation_weight={generation_weight_version}, "
                         f"target_weight={target_weight_version}: {error!r}\n"
@@ -1641,8 +1647,8 @@ class AsyncTrajectoryCollector:
             )
             if is_fatal:
                 print(
-                    f"[AsyncTrajectoryCollector] FATAL: failure count "
-                    f"{failure_count} exceeds threshold {failure_limit}; trainer "
+                    "[AsyncTrajectoryCollector] FATAL: non-recoverable failure "
+                    "or failure allowance exhausted; trainer "
                     "will be notified on the next check_health() call.",
                     flush=True,
                 )
@@ -1869,48 +1875,72 @@ class AsyncTrajectoryCollector:
             scheduled_group_indices: set[int] = set()
             stream_error: Exception | None = None
             try:
-                async for rollout_result in self._iter_rollout_groups(
-                    repeated_batch=attempt_batch,
-                    num_generations=num_generations,
-                    use_nemo_gym=use_nemo_gym,
-                    task_index_to_group_index=task_index_to_group_index,
-                ):
-                    group_index = rollout_result.group_index
-                    if group_index not in expected_group_indices:
-                        raise ValueError(f"Unexpected prompt group index {group_index}")
-                    if rollout_result.final_batch.size != num_generations:
-                        raise ValueError(
-                            f"Prompt group {group_index} contains "
-                            f"{rollout_result.final_batch.size} rollouts; expected "
-                            f"{num_generations}"
-                        )
-                    if group_index in buffered_group_indices:
-                        continue
-                    if group_index in scheduled_group_indices:
-                        raise ValueError(
-                            f"Rollout stream yielded prompt group {group_index} twice"
-                        )
-                    scheduled_group_indices.add(group_index)
-                    push_tasks.append(
-                        asyncio.create_task(
-                            self._enqueue_rollout_group(
-                                rollout_result=rollout_result,
-                                generation_weight_version=generation_weight_version,
-                                target_weight_version=target_weight_version,
-                                expected_prompt_groups=expected_prompt_groups,
-                                buffered_group_indices=buffered_group_indices,
-                                collection_started_at=collection_started_at,
-                                input_task_index=group_input_task_indices[group_index],
+                try:
+                    async for rollout_result in self._iter_rollout_groups(
+                        repeated_batch=attempt_batch,
+                        num_generations=num_generations,
+                        use_nemo_gym=use_nemo_gym,
+                        task_index_to_group_index=task_index_to_group_index,
+                    ):
+                        group_index = rollout_result.group_index
+                        if group_index not in expected_group_indices:
+                            raise ValueError(
+                                f"Unexpected prompt group index {group_index}"
+                            )
+                        if rollout_result.final_batch.size != num_generations:
+                            raise ValueError(
+                                f"Prompt group {group_index} contains "
+                                f"{rollout_result.final_batch.size} rollouts; expected "
+                                f"{num_generations}"
+                            )
+                        if group_index in buffered_group_indices:
+                            continue
+                        if group_index in scheduled_group_indices:
+                            raise ValueError(
+                                f"Rollout stream yielded prompt group {group_index} twice"
+                            )
+                        scheduled_group_indices.add(group_index)
+                        push_tasks.append(
+                            asyncio.create_task(
+                                self._enqueue_rollout_group(
+                                    rollout_result=rollout_result,
+                                    generation_weight_version=generation_weight_version,
+                                    target_weight_version=target_weight_version,
+                                    expected_prompt_groups=expected_prompt_groups,
+                                    buffered_group_indices=buffered_group_indices,
+                                    collection_started_at=collection_started_at,
+                                    input_task_index=group_input_task_indices[
+                                        group_index
+                                    ],
+                                )
                             )
                         )
-                    )
-            except Exception as error:
-                stream_error = error
+                except Exception as error:
+                    stream_error = error
 
-            push_results = await asyncio.gather(*push_tasks, return_exceptions=True)
+                push_results = await asyncio.gather(*push_tasks, return_exceptions=True)
+            finally:
+                for task in push_tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*push_tasks, return_exceptions=True)
             push_errors = [
                 result for result in push_results if isinstance(result, Exception)
             ]
+            # A recoverable stream failure must not hide a concurrent buffer bug.
+            if not use_nemo_gym:
+                fatal_error = next(
+                    (
+                        error
+                        for error in [stream_error, *push_errors]
+                        if error is not None
+                        and classify_rollout_failure(error) is not FailureClass.INFRA
+                    ),
+                    None,
+                )
+                if fatal_error is not None:
+                    last_error = fatal_error
+                    break
             pending_group_indices = expected_group_indices - buffered_group_indices
             if not pending_group_indices:
                 return

@@ -21,6 +21,7 @@ import time
 import uuid
 import warnings
 from collections.abc import Awaitable, Callable
+from contextlib import aclosing
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 
@@ -1645,10 +1646,15 @@ class VllmAsyncGenerationWorkerImpl(
             ),
         )
 
+    async def abort_generation(self, request_id: str) -> None:
+        """Acknowledge engine cleanup before the driver retries a cancelled request."""
+        await self.llm.abort(request_id)
+
     async def generate_async(
         self,
         data: BatchedDataDict[GenerationDatumSpec],
         greedy: bool = False,
+        request_id: Optional[str] = None,
     ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
         """Generate a batch of data using vLLM's AsyncLLMEngine, yielding results as they are ready.
 
@@ -1685,6 +1691,8 @@ class VllmAsyncGenerationWorkerImpl(
         )
 
         # Create tasks for each sample in the batch
+        generation_request_id = request_id
+
         async def process_single_sample(sample_idx):
             """Process a single sample and return the result."""
             current_input_actual_length = input_lengths_batch[sample_idx].item()
@@ -1764,7 +1772,7 @@ class VllmAsyncGenerationWorkerImpl(
                 max_new_tokens=allowed_new_tokens,
             )
 
-            request_id = str(uuid.uuid4())
+            request_id = generation_request_id or str(uuid.uuid4())
 
             # Generate using vLLM async engine
             vllm_request_generator = self.llm.generate(
@@ -1775,8 +1783,9 @@ class VllmAsyncGenerationWorkerImpl(
 
             # Get the final result from the generator
             final_request_output = None
-            async for req_output in vllm_request_generator:
-                final_request_output = req_output
+            async with aclosing(vllm_request_generator) as outputs:
+                async for req_output in outputs:
+                    final_request_output = req_output
 
             if final_request_output is None:
                 raise RuntimeError(f"No output received for request {request_id}")
@@ -1934,7 +1943,10 @@ class VllmAsyncGenerationWorkerImpl(
             await asyncio.gather(*sample_tasks, return_exceptions=True)
 
     async def generate_text_async(
-        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        greedy: bool = False,
+        request_id: Optional[str] = None,
     ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
         """Generate text responses asynchronously, yielding results as they are ready.
 
@@ -1956,6 +1968,8 @@ class VllmAsyncGenerationWorkerImpl(
 
         prompts = data["prompts"]
         batch_size = len(prompts)
+        if request_id is not None and batch_size != 1:
+            raise ValueError("A supplied request_id requires exactly one prompt")
 
         # Extract stop_strings if provided, else use default from config
         batch_stop_strings: list[list[str] | None] = data.get(
@@ -1963,6 +1977,8 @@ class VllmAsyncGenerationWorkerImpl(
         )
 
         # Create tasks for each prompt
+        generation_request_id = request_id
+
         async def process_single_prompt(prompt_idx):
             """Process a single prompt and return the result."""
             prompt = prompts[prompt_idx]
@@ -1989,7 +2005,7 @@ class VllmAsyncGenerationWorkerImpl(
                 include_stop_str_in_output=True,  # returning stop strings like hf
             )
 
-            request_id = str(uuid.uuid4())
+            request_id = generation_request_id or str(uuid.uuid4())
 
             # Generate using vLLM async engine
             vllm_request_generator = self.llm.generate(
@@ -2000,8 +2016,9 @@ class VllmAsyncGenerationWorkerImpl(
 
             # Get the final result from the generator
             final_request_output = None
-            async for req_output in vllm_request_generator:
-                final_request_output = req_output
+            async with aclosing(vllm_request_generator) as outputs:
+                async for req_output in outputs:
+                    final_request_output = req_output
 
             if final_request_output is None:
                 raise RuntimeError(f"No output received for request {request_id}")

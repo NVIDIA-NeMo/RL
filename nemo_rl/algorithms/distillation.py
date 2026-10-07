@@ -860,6 +860,9 @@ def _distillation_train_impl(
                             input_batch=repeated_batch,
                             tokenizer=tokenizer,
                             task_to_env=task_to_env,
+                            retry_config=master_config.policy["generation"].get(
+                                "native_retry"
+                            ),
                             max_seq_len=master_config.policy[
                                 "max_total_sequence_length"
                             ],
@@ -1337,6 +1340,7 @@ def validate(
                     val_batch,
                     tokenizer,
                     val_task_to_env,
+                    retry_config=master_config.policy["generation"].get("native_retry"),
                     max_seq_len=master_config.policy["max_total_sequence_length"],
                     max_rollout_turns=master_config.distillation.max_rollout_turns,
                     greedy=False,

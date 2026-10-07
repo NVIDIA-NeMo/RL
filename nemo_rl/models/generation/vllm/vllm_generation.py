@@ -16,8 +16,10 @@ import asyncio
 import logging
 import os
 import time
+import uuid
 import warnings
 from collections import defaultdict
+from contextlib import aclosing
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -37,6 +39,7 @@ from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_
 from nemo_rl.distributed.virtual_cluster import NVLINK_DOMAIN_UNKNOWN, RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 from nemo_rl.models.generation.fleet_health import (
+    FleetHealthPolicy,
     GenerationFleetHealth,
     HealthyShardSelector,
 )
@@ -1079,6 +1082,9 @@ class VllmGeneration(GenerationInterface):
         )
         return combined
 
+    def supports_native_generation_retries(self) -> bool:
+        return bool(self.cfg["vllm_cfg"]["async_engine"])
+
     async def _async_generate_base(
         self,
         data: BatchedDataDict[GenerationDatumSpec],
@@ -1130,20 +1136,24 @@ class VllmGeneration(GenerationInterface):
             )
         )
 
-        if self.fleet_selector is not None:
-            self.fleet_selector.acquire(dp_shard_idx)
+        selector = self.fleet_selector
+        if selector is not None:
+            selector.acquire(dp_shard_idx)
         try:
-            async for result in self._generate_on_shard(
-                data=data,
-                method_name=method_name,
-                greedy=greedy,
-                dp_shard_idx=dp_shard_idx,
-                leader_worker_idx=leader_worker_idx,
-            ):
-                yield result
+            async with aclosing(
+                self._generate_on_shard(
+                    data=data,
+                    method_name=method_name,
+                    greedy=greedy,
+                    dp_shard_idx=dp_shard_idx,
+                    leader_worker_idx=leader_worker_idx,
+                )
+            ) as outputs:
+                async for result in outputs:
+                    yield result
         finally:
-            if self.fleet_selector is not None:
-                self.fleet_selector.release(dp_shard_idx)
+            if selector is not None:
+                selector.release(dp_shard_idx)
 
     def attach_fleet_health(
         self,
@@ -1191,79 +1201,91 @@ class VllmGeneration(GenerationInterface):
         re-raising it as ``GenerationUnavailable`` is what tells the rollout retry policy
         the prompt is fine and worth re-dispatching.
         """
-        # Local import: nemo_rl.experience pulls the rollout stack, which must not
-        # become a load-time dependency of the generation backend.
-        from nemo_rl.experience.failures import GenerationUnavailable
+        # Avoid loading the experience stack while importing generation backends.
+        from nemo_rl.experience.failures import (
+            FailureClass,
+            GenerationUnavailable,
+            RolloutDataFailure,
+            classify_rollout_failure,
+        )
 
-        timeout_seconds = float(
-            os.environ.get("NRL_VLLM_ASYNC_TIMEOUT_SECONDS", "900")
-        )  # Default 15 minutes
-
-        # Propagate cancellation to the Ray worker and its vLLM request.
+        timeout_seconds = float(os.environ.get("NRL_VLLM_ASYNC_TIMEOUT_SECONDS", "900"))
+        request_id = str(uuid.uuid4())
+        worker_gen_proxy = None
+        completed = False
         try:
             worker_gen_proxy = self.worker_group.run_single_worker_single_data(
                 method_name=method_name,
                 worker_idx=leader_worker_idx,
                 data=data,
                 greedy=greedy,
+                request_id=request_id,
             )
-
-            try:
-                sample_result_ref = await anext(worker_gen_proxy)
-            except StopAsyncIteration:
-                raise RuntimeError(
-                    f"Worker produced no output for the given sample {data}."
-                )
-
-            # Materialize the result from Ray's object store. ``anext`` above
-            # resolves when the worker yields, but the object bytes have not yet
-            # crossed the network to the driver — this is where that happens, and
-            # where a Ray deadlock / unreachable worker would manifest, hence the
-            # timeout.
-            try:
-                sample_result = await asyncio.wait_for(
-                    sample_result_ref, timeout=timeout_seconds
-                )
-            except asyncio.TimeoutError as error:
-                ray.cancel(worker_gen_proxy)
-                # Reported and typed, not a bare RuntimeError. This is the one failure
-                # the fleet-health docstrings cite to justify reactive reporting -- an
-                # engine that answers is_alive from a live worker and still never
-                # returns a generation -- and it used to be the one case that never
-                # reached the ledger, because raising inside the try meant the
-                # RayError handler below could not see it. The shard then dropped back
-                # to inflight=0 and became the *preferred* next pick, at 900s a visit.
-                if self.fleet_monitor is not None:
-                    self.fleet_monitor.report_failure(dp_shard_idx, error)
-                raise GenerationUnavailable(
-                    f"generation shard {dp_shard_idx} (worker {leader_worker_idx}) "
-                    f"did not return within {timeout_seconds}s. For longer sequences, "
-                    f"increase timeout by setting: "
-                    f"export NRL_VLLM_ASYNC_TIMEOUT_SECONDS="
-                    f"{int(timeout_seconds * 2)}"
-                ) from error
-
-            # sample_result is a tuple: (original_idx, BatchedDataDict).
+            # The deadline covers waiting for the first yield as well as fetching
+            # its value. A hung engine usually never reaches that first yield.
+            async with asyncio.timeout(timeout_seconds):
+                try:
+                    sample_result_ref = await anext(worker_gen_proxy)
+                except StopAsyncIteration:
+                    raise RuntimeError("Generation worker produced no output") from None
+                sample_result = await sample_result_ref
+            completed = True
             original_idx, result_batch = sample_result
             result_batch["gen_leader_worker_idx"] = [int(leader_worker_idx)]
-            # Clears the reported-failure streak: it counts *consecutive* failures, so
-            # without a success signal it is monotonic and any shard eventually reaches
-            # unhealthy_threshold however healthy it is.
             if self.fleet_monitor is not None:
                 self.fleet_monitor.report_success(dp_shard_idx)
-            # Inside the try: main added the cancellation handler below precisely so a
-            # consumer abandoning this generator mid-yield still cancels the Ray call.
-            yield (original_idx, result_batch)
-        except ray.exceptions.RayError as error:
+            yield original_idx, result_batch
+        except (TimeoutError, ray.exceptions.RayError) as error:
+            if classify_rollout_failure(error) is not FailureClass.INFRA:
+                raise
+            if (
+                isinstance(error, ray.exceptions.ActorDiedError)
+                and self.fleet_monitor is None
+            ):
+                # Even without proactive fleet probes, a confirmed dead actor must
+                # not be selected again by a later retry or a concurrent rollout.
+                monitor = GenerationFleetHealth(
+                    shard_count=self.worker_group.dp_size, policy=FleetHealthPolicy()
+                )
+                self.attach_fleet_health(monitor, HealthyShardSelector(monitor=monitor))
             if self.fleet_monitor is not None:
-                self.fleet_monitor.report_failure(dp_shard_idx, error)
+                if isinstance(error, ray.exceptions.ActorDiedError):
+                    self.fleet_monitor.record_actor_death(dp_shard_idx, str(error))
+                else:
+                    self.fleet_monitor.report_failure(dp_shard_idx, error)
+            detail = (
+                f"did not return within {timeout_seconds}s"
+                if isinstance(error, TimeoutError)
+                else f"is unavailable: {type(error).__name__}: {error}"
+            )
             raise GenerationUnavailable(
-                f"generation shard {dp_shard_idx} (worker {leader_worker_idx}) "
-                f"is unavailable: {type(error).__name__}: {error}"
+                f"generation shard {dp_shard_idx} (worker {leader_worker_idx}) {detail}"
             ) from error
-        except (asyncio.CancelledError, GeneratorExit):
-            ray.cancel(worker_gen_proxy)
-            raise
+        finally:
+            if worker_gen_proxy is not None and not completed:
+                # Cancellation is asynchronous in Ray. Wait for the actor task to
+                # finish before aborting its engine request, so a queued task cannot
+                # register that request *after* the abort acknowledgment.
+                ray.cancel(worker_gen_proxy)
+                try:
+                    async with asyncio.timeout(30):
+                        try:
+                            await worker_gen_proxy.completed()
+                        except ray.exceptions.TaskCancelledError:
+                            pass
+                        await self.worker_group.run_single_worker_single_data(
+                            method_name="abort_generation",
+                            worker_idx=leader_worker_idx,
+                            request_id=request_id,
+                        )
+                except ray.exceptions.ActorDiedError:
+                    pass  # The dead process cannot retain a generation request.
+                except Exception as error:
+                    # Do not retry when cleanup is uncertain: that could duplicate
+                    # a live request. Explicit DATA overrides the timeout cause.
+                    raise RolloutDataFailure(
+                        f"Could not confirm cleanup of generation request {request_id}"
+                    ) from error
 
     async def generate_text_async(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
@@ -1283,10 +1305,13 @@ class VllmGeneration(GenerationInterface):
                 return False  # Return False for empty case to trigger early return
             return True
 
-        async for result in self._async_generate_base(
-            data, "generate_text_async", validate_text_data, greedy
-        ):
-            yield result
+        async with aclosing(
+            self._async_generate_base(
+                data, "generate_text_async", validate_text_data, greedy
+            )
+        ) as outputs:
+            async for result in outputs:
+                yield result
 
     async def generate_async(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
@@ -1306,10 +1331,13 @@ class VllmGeneration(GenerationInterface):
                 return False  # Return False for empty case to trigger early return
             return True
 
-        async for result in self._async_generate_base(
-            data, "generate_async", validate_generate_data, greedy
-        ):
-            yield result
+        async with aclosing(
+            self._async_generate_base(
+                data, "generate_async", validate_generate_data, greedy
+            )
+        ) as outputs:
+            async for result in outputs:
+                yield result
 
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Wake workers up for colocated inference."""

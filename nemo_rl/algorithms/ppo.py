@@ -1528,6 +1528,9 @@ def ppo_train(
                             input_batch=repeated_batch,
                             tokenizer=tokenizer,
                             task_to_env=task_to_env,
+                            retry_config=master_config.policy["generation"].get(
+                                "native_retry"
+                            ),
                             max_seq_len=master_config.policy[
                                 "max_total_sequence_length"
                             ],
