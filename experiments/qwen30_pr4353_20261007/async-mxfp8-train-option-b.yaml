@@ -1,0 +1,10 @@
+defaults: async-mxfp8-train.yaml
+
+policy:
+  megatron_cfg:
+    model_overrides:
+      moe_use_grouped_tensor: true
+      use_transformer_engine_op_fuser: true
+    env_vars:
+      NVTE_CUTEDSL_FUSED_GROUPED_MLP: "1"
+      CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL: "1"

@@ -1,0 +1,10 @@
+defaults: async-base.yaml
+
+policy:
+  generation:
+    vllm_cfg:
+      precision: bfloat16
+      is_mx: false
+      quantization_ignore_patterns: []
+      num_first_layers_in_bf16: 0
+      num_last_layers_in_bf16: 0

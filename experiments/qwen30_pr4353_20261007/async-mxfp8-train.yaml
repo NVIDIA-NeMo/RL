@@ -1,0 +1,13 @@
+defaults: async-base.yaml
+
+policy:
+  megatron_cfg:
+    fp8_cfg:
+      enabled: true
+      fp8: e4m3
+      fp8_recipe: mxfp8
+      fp8_param: true
+    te_precision_config_file: experiments/lightning_pr4353_20261007/te-routed-mxfp8.yaml
+    first_last_layers_bf16: true
+    num_layers_at_start_in_bf16: 2
+    num_layers_at_end_in_bf16: 6

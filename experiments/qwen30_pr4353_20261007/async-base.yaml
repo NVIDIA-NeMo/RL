@@ -1,0 +1,29 @@
+defaults: ../../examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-4n4g-async-1off-mxfp8-rollout.yaml
+
+grpo:
+  max_num_steps: 20
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  skip_reference_policy_logprobs_calculation: false
+
+loss_fn:
+  use_importance_sampling_correction: true
+  force_on_policy_ratio: true
+
+checkpointing:
+  enabled: false
+
+policy:
+  megatron_cfg:
+    moe_router_dtype: fp32
+  generation:
+    refit_transport: nccl_reshard
+    vllm_cfg:
+      num_first_layers_in_bf16: 2
+      num_last_layers_in_bf16: 6
+
+logger:
+  tensorboard_enabled: false
+  wandb:
+    project: nemo-rl-mxfp8-training
