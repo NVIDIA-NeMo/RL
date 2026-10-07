@@ -1139,6 +1139,7 @@ class AsyncNemoGymRolloutImpl:
         total_rows: int,
         timer_prefix: str,
         on_completion: Optional[RolloutCompletionCallback] = None,
+        infra_failures: Optional[dict[int, str]] = None,
     ) -> Optional[dict[str, Any]]:
         """Dispatch ``pending`` rows and fill their slots in ``results`` as they land.
 
@@ -1150,6 +1151,10 @@ class AsyncNemoGymRolloutImpl:
                 completion can be published to the recovery ledger.
             total_rows: Size of the original prompt group, used to validate row indices.
             timer_prefix: Timer namespace forwarded to the environment.
+            on_completion: Called once per landed row with its completion.
+            infra_failures: Mutated in place: each failure marker's detail is
+                recorded under its row index, so the caller can name the actual
+                failure when a row never lands within its attempt budget.
 
         Returns:
             The environment's timing metrics, or None if the stream ended without them.
@@ -1190,6 +1195,8 @@ class AsyncNemoGymRolloutImpl:
                 # level as a marker instead of ending the stream. Its slot stays
                 # None so the attempt loop dispatches it again, and the stream
                 # keeps delivering the other rows.
+                if infra_failures is not None:
+                    infra_failures[rowidx] = result[GYM_INFRA_FAILURE_KEY]
                 continue
             inputs_by_rowidx[rowidx]["agent_ref"] = resolved_agent_ref
             # A streamed completion may become durable recovery ownership before
@@ -1272,6 +1279,11 @@ class AsyncNemoGymRolloutImpl:
             # below, and a wider annotation makes the `raise ... from last_error` at the
             # end unverifiable.
             last_error: Optional[Exception] = None
+            # Detail of the latest failure marker per row, across attempts. A
+            # marker ends an attempt's stream cleanly, so without this record a
+            # row that failed on every attempt would be reported as "stream
+            # ended before all rows arrived" with no cause attached.
+            infra_failures: dict[int, str] = {}
             max_row_attempts = (
                 1
                 if recovery_granularity is RecoveryGranularity.PROMPT_GROUP
@@ -1306,6 +1318,7 @@ class AsyncNemoGymRolloutImpl:
                             total_rows,
                             instance_timer_prefix,
                             on_completion=on_completion,
+                            infra_failures=infra_failures,
                         )
                     except Exception as error:
                         last_error = error
@@ -1325,12 +1338,27 @@ class AsyncNemoGymRolloutImpl:
 
             missing = [index for index in expected_indices if results[index] is None]
             if missing:
-                failure = GymTransportError(
-                    f"NeMo-Gym instance '{instance_label}' rollout stream ended "
-                    "before all rows arrived; missing "
-                    f"rows {missing} of {total_rows} after "
-                    f"{max_row_attempts} attempt(s)"
-                )
+                marked = [index for index in missing if index in infra_failures]
+                unmarked = [index for index in missing if index not in infra_failures]
+                if marked:
+                    details = "; ".join(
+                        f"row {index}: {infra_failures[index]}" for index in marked
+                    )
+                    message = (
+                        f"NeMo-Gym instance '{instance_label}': rows {marked} of "
+                        f"{total_rows} failed at the infrastructure level on "
+                        f"every attempt ({max_row_attempts}): {details}"
+                    )
+                    if unmarked:
+                        message += f"; rows {unmarked} never arrived"
+                    failure = GymTransportError(message)
+                else:
+                    failure = GymTransportError(
+                        f"NeMo-Gym instance '{instance_label}' rollout stream ended "
+                        "before all rows arrived; missing "
+                        f"rows {missing} of {total_rows} after "
+                        f"{max_row_attempts} attempt(s)"
+                    )
                 # Narrowed before the raise: pyrefly rejects an Optional in a `from`
                 # clause, even though `raise ... from None` is legal at runtime.
                 if last_error is None:
