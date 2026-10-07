@@ -225,8 +225,7 @@ def test_simple_storage_units_are_pinned_to_the_resolved_nodes(monkeypatch) -> N
 
     cfg = _cfg("simple", simple={"storage_capacity": 9, "num_storage_units": 3})
     n0, n1 = "a" * 56, "b" * 56  # Ray node IDs are 28-byte hex strings
-    cfg["simple_storage_node_ids"] = [n0, n1, n0]
-    adapter._init_tq(cfg)
+    adapter._init_tq(cfg, storage_unit_node_ids=[n0, n1, n0])
     conf = OmegaConf.create(
         {
             "backend": {
@@ -241,3 +240,100 @@ def test_simple_storage_units_are_pinned_to_the_resolved_nodes(monkeypatch) -> N
     assert all(o["scheduling_strategy"].soft is False for o, _ in placed)
     assert all(kw == {"storage_unit_size": 3} for _, kw in placed)
     assert conf.backend.SimpleStorage.zmq_info == handles
+
+
+def test_pinned_simple_provider_matches_tq_except_placement(monkeypatch) -> None:
+    """_pin_simple_storage_units copies TQ's initialize_simple_storage.
+
+    Run both against the same conf and compare everything but the scheduling
+    options, so a TQ bump that changes how units are built fails here. Total
+    10 over 3 units also tells ceiling from floor division.
+    """
+    from transfer_queue.storage import simple_storage
+    from transfer_queue.storage.bootstrap import simple_storage_bootstrap
+    from transfer_queue.storage.bootstrap.provider import StorageBootstrapProvider
+    from transfer_queue.utils import zmq_utils
+
+    from nemo_rl.data_plane.adapters import transfer_queue as adapter
+
+    placement_keys = {
+        "placement_group",
+        "placement_group_bundle_index",
+        "scheduling_strategy",
+    }
+    calls: list[tuple[dict, tuple, dict]] = []
+
+    class _Unit:
+        def __init__(self, options):
+            self.options = options
+
+        def remote(self, *args, **kwargs):
+            options = {k: v for k, v in self.options.items() if k not in placement_keys}
+            calls.append((options, args, kwargs))
+            return self.options["name"]
+
+    monkeypatch.setattr(
+        simple_storage.SimpleStorageUnit, "options", lambda **o: _Unit(o)
+    )
+    monkeypatch.setattr(
+        simple_storage_bootstrap, "get_placement_group", lambda *a, **k: object()
+    )
+    monkeypatch.setattr(
+        simple_storage_bootstrap, "process_zmq_server_info", lambda h: dict(h)
+    )
+    monkeypatch.setattr(zmq_utils, "process_zmq_server_info", lambda h: dict(h))
+    original = StorageBootstrapProvider.get_provider("SimpleStorage")
+    monkeypatch.setitem(StorageBootstrapProvider._providers, "simplestorage", original)
+
+    def conf():
+        return OmegaConf.create(
+            {
+                "backend": {
+                    "storage_backend": "SimpleStorage",
+                    "SimpleStorage": {
+                        "num_data_storage_units": 3,
+                        "total_storage_size": 10,
+                    },
+                }
+            }
+        )
+
+    tq_conf = conf()
+    tq_handles = original(tq_conf)
+    tq_calls, calls[:] = list(calls), []
+
+    adapter._pin_simple_storage_units(["a" * 56, "b" * 56, "a" * 56])
+    ours_conf = conf()
+    ours_handles = StorageBootstrapProvider.get_provider("SimpleStorage")(ours_conf)
+
+    assert ours_handles == tq_handles
+    assert calls == tq_calls
+    assert ours_conf == tq_conf
+
+
+@pytest.mark.parametrize(
+    "cfg",
+    [
+        _cfg(
+            "simple",
+            simple={"num_storage_units": 2, "storage_unit_placement": ["inference"]},
+        ),
+        _cfg("mooncake_cpu", mooncake_cpu={"storage_unit_segment_size": 1 << 30}),
+    ],
+    ids=["simple-placement", "mooncake-units"],
+)
+def test_storage_unit_settings_need_the_single_controller_plan(
+    monkeypatch, cfg
+) -> None:
+    """Off the SingleController nothing starts or places units: fail at bootstrap.
+
+    Otherwise mooncake runs with no memory owner (every put fails with -200) and
+    simple placement is silently ignored.
+    """
+    from nemo_rl.data_plane.adapters import transfer_queue as adapter
+
+    monkeypatch.setattr(
+        adapter.tq, "init", lambda *, conf: pytest.fail("bootstrapped anyway")
+    )
+    with pytest.raises(ValueError, match="only supported by the SingleController"):
+        adapter._init_tq(cfg)

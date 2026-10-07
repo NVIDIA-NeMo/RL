@@ -1541,6 +1541,8 @@ def test_installed_manager_keeps_non_actor_clients_out_of_the_storage_topology(
     manager = manager_type(_manager(store).controller_info, config)
     participant = manager._checkpoint_participant
     assert (participant is not None) is owns_segment
+    # Every writer puts on its own node's segments first (storage units there).
+    assert manager.storage_client.replica_config.prefer_alloc_in_same_node is True
     assert manager.config["global_segment_size"] == expected_capacity
     assert config["global_segment_size"] == 1024
     if enabled:

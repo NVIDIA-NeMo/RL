@@ -89,7 +89,6 @@ from nemo_rl.data_plane import (
     build_data_plane_client,
     data_plane_supports_checkpointing,
 )
-from nemo_rl.data_plane.interfaces import backend_config
 from nemo_rl.data_plane.schema import (
     SC_ROLLOUT_SCHEMA_FIELDS,
     fields_with_optional_routed_experts,
@@ -686,6 +685,7 @@ def _build_trainer(
     weights_path: Optional[Path],
     optimizer_path: Optional[Path],
     checkpointing: bool,
+    storage_unit_node_ids: Optional[list[str]] = None,
     reserved_http_server_ports: Optional[dict[int, int]] = None,
 ) -> tuple[Any, float]:
     """Build the TQ-mediated trainer (driver-side TQPolicy).
@@ -698,6 +698,8 @@ def _build_trainer(
         weights_path: Checkpointed policy weights to resume from, or None.
         optimizer_path: Checkpointed optimizer state to resume from, or None.
         checkpointing: Whether data-plane checkpoint save or restore is needed.
+        storage_unit_node_ids: Storage-unit plan for TQ's bootstrap, one Ray
+            node ID per unit; None when storage units are off.
         reserved_http_server_ports: Pre-published OpenAI server ports for NeMo Gym,
             keyed by the colocated Megatron trainer rank that adopts each one.
 
@@ -718,6 +720,7 @@ def _build_trainer(
         init_reference_model=init_reference_model,
         dp_cfg=master_config.data_plane,
         checkpointing=checkpointing,
+        storage_unit_node_ids=storage_unit_node_ids,
         reserved_http_server_ports=reserved_http_server_ports,
     )
     return trainer, time.perf_counter() - t0
@@ -1544,20 +1547,21 @@ def setup_single_controller(
         )
         setup_timing_metrics.teacher_reservation_time_s = time.perf_counter() - t0
 
-    # SimpleStorageUnits start when the trainer bootstraps TQ, so resolve their
-    # nodes before that (and after the train/teacher claims above). dp_config is
-    # master_config.data_plane, which the trainer reads.
-    if dp_config["backend"] == "simple" and "simple" in dp_config:
-        simple_cfg = backend_config(dp_config)
-        if simple_cfg.storage_unit_placement is not None:
-            from nemo_rl.data_plane.mooncake_storage_unit import storage_node_ids
+    # Storage-unit plan, one Ray node ID per unit (None: units off). Made once,
+    # after the train/teacher claims above, and used twice: TQ's bootstrap in
+    # the trainer pins SimpleStorageUnits to it, and start_storage_units below
+    # starts the Mooncake units on it.
+    from nemo_rl.data_plane.mooncake_storage_unit import (
+        plan_storage_unit_nodes,
+        start_storage_units,
+    )
 
-            dp_config["simple_storage_node_ids"] = storage_node_ids(
-                simple_cfg.storage_unit_placement,
-                simple_cfg.num_storage_units,
-                inference_cluster=inference_cluster,
-                train_cluster=train_cluster,
-            )
+    clusters_by_name: dict[str, RayVirtualCluster] = {
+        "train": train_cluster,
+        "inference": inference_cluster,
+        **{f"teacher:{name}": c for name, c in teacher_clusters.items()},
+    }
+    storage_unit_node_ids = plan_storage_unit_nodes(dp_config, clusters_by_name)
 
     # Create build tasks for generation / trainer / (nemo-gym) workers
     build_tasks: dict[str, Callable[[], Any]] = {}
@@ -1610,6 +1614,7 @@ def setup_single_controller(
                     and master_config.checkpointing.get("save_data_plane")
                 )
             ),
+            storage_unit_node_ids=storage_unit_node_ids,
             reserved_http_server_ports=reserved_http_server_ports,
         )
         if not is_ppo_run(master_config):
@@ -1954,20 +1959,14 @@ def setup_single_controller(
             include_multimodal_fields=processor is not None,
         )
     # Mooncake memory owners when storage_unit_segment_size > 0.
-    from nemo_rl.data_plane.mooncake_storage_unit import start_storage_units
-
-    storage_units, storage_segments = start_storage_units(
-        dp_config, inference_cluster=inference_cluster, train_cluster=train_cluster
-    )
+    storage_units = start_storage_units(dp_config, storage_unit_node_ids)
     if token_capture_cfg.enabled:
         # Both active backends stage canonical Gym rows in serving workers;
         # only vLLM workers stage captured media beside them (capture_media).
-        capture_kwargs: dict[str, Any] = {"capture_media": capture_media}
-        if storage_segments:
-            # Only vLLM serving workers prefer a local storage unit.
-            capture_kwargs["storage_segments"] = storage_segments
         generation.setup_token_capture(
-            dp_config, token_capture_cfg.staging_partition, **capture_kwargs
+            dp_config,
+            token_capture_cfg.staging_partition,
+            capture_media=capture_media,
         )
         generation.set_rollout_weight_version(0)
 

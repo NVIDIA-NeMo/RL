@@ -584,15 +584,15 @@ data_plane:
   simple:
     storage_capacity: 1000000        # max samples retained per partition
     num_storage_units: ${mul:2, ${cluster.num_nodes}}  # TQ wants >= 2 per node
-    storage_unit_placement: null     # all | inference | train; null = TQ's SPREAD
+    storage_unit_placement: null     # all, or cluster names like [inference]; null = TQ SPREAD
   mooncake_cpu:
     global_segment_size: 68719476736 # 64 GiB/process
     local_buffer_size:    2147483648 # 2 GiB/process = 4 x staging slot
     reuse_registered_buffers: true   # reuse RDMA-registered buffers
-    staging_buffer_size:   536870912 # 512 MiB/pool slot; one object > 4x this fails
+    staging_buffer_size:   536870912 # 512 MiB/pool slot; bigger payloads register per transfer
     storage_unit_segment_size: 0     # >0: CPU storage units own all memory (bytes each)
-    num_storage_units: ${mul:2, ${cluster.num_nodes}}  # total units, spread over placement
-    storage_unit_placement: all      # all | inference | train
+    num_storage_units: null          # null = 2 per selected node
+    storage_unit_placement: all      # all, or cluster names: [inference], [train, teacher:<name>]
     use_gdr: false                   # GPU-memory RDMA staging in CUDA clients
     gdr_staging_buffer_mb: 1024      # HBM reserved per active GDR client;
                                      # 8 clients/node is ~8 GiB off the training

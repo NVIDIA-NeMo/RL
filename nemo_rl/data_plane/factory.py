@@ -15,7 +15,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence
 
 from nemo_rl.data_plane.interfaces import (
     DataPlaneClient,
@@ -124,6 +124,7 @@ def build_data_plane_client(
     bootstrap: bool = True,
     checkpointing: bool = False,
     segment_size: int | None = None,
+    storage_unit_node_ids: Sequence[str] | None = None,
 ) -> DataPlaneClient:
     """Construct the configured data-plane client.
 
@@ -145,6 +146,10 @@ def build_data_plane_client(
             this process owns, in place of the controller's
             ``global_segment_size`` (0: a client that owns nothing). ``None``
             keeps the controller's value.
+        storage_unit_node_ids: Bootstrap only: one Ray node ID per storage unit,
+            planned by the SingleController (see
+            :func:`~nemo_rl.data_plane.mooncake_storage_unit.plan_storage_unit_nodes`).
+            Storage-unit settings without a plan fail at bootstrap.
 
     Returns:
         A configured ``DataPlaneClient``; wrapped in
@@ -177,6 +182,7 @@ def build_data_plane_client(
             bootstrap=bootstrap,
             checkpointing=checkpointing,
             segment_size=segment_size,
+            storage_unit_node_ids=storage_unit_node_ids,
         )
     elif impl == "local":
         from nemo_rl.data_plane.adapters.local import LocalDataPlaneClient

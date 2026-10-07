@@ -37,7 +37,7 @@ import threading
 import time
 import warnings
 import weakref
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from importlib import resources
 from pathlib import Path
 from typing import Any, cast
@@ -139,8 +139,8 @@ def _mooncake_transport_config() -> dict:
         raise RuntimeError(
             "data_plane.backend='mooncake_cpu' requires RDMA, but no usable "
             "device was found: only devices under /sys/class/infiniband whose "
-            "port 1 reports ACTIVE are usable, since mooncake only checks port "
-            "1. Check that /dev/infiniband/uverbs* exists (a container does "
+            "port 1 reports ACTIVE are usable, since mooncake's RDMA transport uses "
+            "port 1 by default (MC_IB_PORT). Check that /dev/infiniband/uverbs* exists (a container does "
             "not inherit it from the host even though it does see "
             "/sys/class/infiniband) — name a device with "
             "MC_MOONCAKE_DEVICE=<dev>, or use data_plane.backend='simple'."
@@ -205,19 +205,40 @@ class _NativeStagingPool:
     ``block_on_exhaustion`` with ``default_timeout`` reproduces the bounded
     wait: a slot held for exactly one transfer means a long wait diagnoses
     over-concurrency, not a slow transfer.
+
+    A payload bigger than the whole pool (``budget``) cannot be leased at all,
+    so it gets its own registration for this one transfer instead.
     """
 
-    def __init__(self, pool: Any) -> None:
+    def __init__(self, pool: Any, store: Any, budget: int) -> None:
         self._pool = pool
+        self._store = store
+        self._budget = budget
 
     @contextlib.contextmanager
     def buffer(self, nbytes: int):
-        with self._pool.buffer(nbytes) as lease:
-            if lease.size < nbytes:
-                raise RuntimeError(
-                    f"mooncake BufferPool leased {lease.size} bytes for a "
-                    f"{nbytes}-byte request; the transfer would overrun it."
-                )
+        if nbytes > self._budget:
+            # Bigger than the whole pool: register this one transfer.
+            tmp = torch.empty(nbytes, dtype=torch.uint8)
+            _register_checked(self._store, tmp.data_ptr(), tmp.nbytes)
+            try:
+                yield tmp
+            finally:
+                self._store.unregister_buffer(tmp.data_ptr())
+            return
+        try:
+            # BufferPool.buffer() acquires here, not at __enter__, so its
+            # timeout and capacity errors are raised by this call.
+            lease = self._pool.buffer(nbytes)
+        except RuntimeError as e:
+            raise RuntimeError(
+                f"mooncake staging pool could not lease {nbytes} bytes: {e}. "
+                "A timeout means more overlapping put/get calls in this process "
+                "than the pool has slots; raise "
+                "data_plane.mooncake_cpu.local_buffer_size / staging_buffer_size, "
+                "or set reuse_registered_buffers=false."
+            ) from e
+        with lease:
             allocation = (ctypes.c_ubyte * nbytes).from_address(lease.ptr)
             yield torch.frombuffer(allocation, dtype=torch.uint8)
 
@@ -242,16 +263,24 @@ class _StagingPoolRegistry:
         # Deferred: mooncake.store is a compiled extension, absent without the wheel.
         from mooncake.store import BufferPool  # pyrefly: ignore[import-error]
 
+        pool_bytes = self._n_slots * self._max_bytes
+        if client.local_buffer_size < pool_bytes:
+            raise ValueError(
+                f"data_plane.mooncake_cpu.local_buffer_size "
+                f"({client.local_buffer_size}) must be >= {self._n_slots} x "
+                f"staging_buffer_size ({pool_bytes}): the staging pool is carved "
+                "out of it. Or set reuse_registered_buffers=false."
+            )
         return _NativeStagingPool(
             BufferPool(
                 client._store,
-                max_bytes=self._n_slots * self._max_bytes,
-                max_size_class=self._max_bytes,
+                max_bytes=pool_bytes,
                 block_on_exhaustion=True,
                 default_timeout=_STAGING_SLOT_TIMEOUT_S,
-                prewarm_size=self._max_bytes,
-                prewarm_count=self._n_slots,
             ),
+            client._store,
+            # BufferPool's own ceiling: max(max_bytes, local buffer).
+            max(pool_bytes, client.local_buffer_size),
         )
 
     def pool_for(self, client: Any) -> _NativeStagingPool:
@@ -737,6 +766,13 @@ def _connect_existing_with_segment_size(segment_size: int) -> None:
     tq_interface._maybe_create_tq_client(conf)
 
 
+_STORAGE_UNITS_SC_ONLY = (
+    "data_plane.mooncake_cpu.storage_unit_segment_size > 0 and "
+    "data_plane.simple.storage_unit_placement are only supported by the "
+    "SingleController entrypoint, which starts and places the storage units."
+)
+
+
 def _pin_simple_storage_units(node_ids: list[str]) -> None:
     """Make TQ's SimpleStorage bootstrap start unit ``i`` on ``node_ids[i]``.
 
@@ -773,13 +809,32 @@ def _pin_simple_storage_units(node_ids: list[str]) -> None:
         return handles
 
 
-def _init_tq(cfg: DataPlaneConfig, *, checkpointing: bool = False) -> None:
-    """Driver-process path: bootstrap the TQ controller for the chosen backend."""
+def _init_tq(
+    cfg: DataPlaneConfig,
+    *,
+    checkpointing: bool = False,
+    storage_unit_node_ids: Sequence[str] | None = None,
+) -> None:
+    """Driver-process path: bootstrap the TQ controller for the chosen backend.
+
+    ``storage_unit_node_ids`` is the storage-unit plan (one Ray node ID per
+    unit) from :func:`~nemo_rl.data_plane.mooncake_storage_unit.plan_storage_unit_nodes`.
+    Only the SingleController makes one; storage-unit settings without it fail
+    here rather than run with no memory owner (mooncake) or silently unpinned
+    (simple).
+    """
     from omegaconf import OmegaConf
 
     base = OmegaConf.load(str(resources.files("transfer_queue") / "config.yaml"))
 
     backend = cfg["backend"]
+    if storage_unit_node_ids is None:
+        if backend == "mooncake_cpu":
+            units_on = backend_config(cfg).storage_unit_segment_size > 0
+        else:
+            units_on = backend_config(cfg).storage_unit_placement is not None
+        if units_on:
+            raise ValueError(_STORAGE_UNITS_SC_ONLY)
 
     # polling_mode=True: controller returns empty BatchMeta instead of raising
     # TimeoutError when no samples are ready yet. The client-side blocking
@@ -802,8 +857,8 @@ def _init_tq(cfg: DataPlaneConfig, *, checkpointing: bool = False) -> None:
                 },
             },
         }
-        if "simple_storage_node_ids" in cfg:
-            _pin_simple_storage_units(cfg["simple_storage_node_ids"])
+        if storage_unit_node_ids is not None:
+            _pin_simple_storage_units(list(storage_unit_node_ids))
     elif backend == "mooncake_cpu":
         # The mooncake-transfer-engine wheel ships `mooncake_master` at
         # <site-packages>/mooncake/, NOT on $PATH. TQ's
@@ -979,6 +1034,7 @@ class TQDataPlaneClient(DataPlaneClient):
         bootstrap: bool = True,
         checkpointing: bool = False,
         segment_size: int | None = None,
+        storage_unit_node_ids: Sequence[str] | None = None,
     ) -> None:
         """Construct a TQ-backed client.
 
@@ -993,6 +1049,8 @@ class TQDataPlaneClient(DataPlaneClient):
                 state. Used only at bootstrap; workers inherit the mode from TQ.
             segment_size: Mooncake memory this worker process owns, in place of
                 the controller's ``global_segment_size``; ``None`` keeps it.
+            storage_unit_node_ids: Bootstrap only: the storage-unit plan, one
+                Ray node ID per unit (see :func:`_init_tq`).
         """
         # Ray serializes this driver-built client into the SingleController
         # actor; retain the config so process-local hooks can be reinstalled.
@@ -1048,7 +1106,11 @@ class TQDataPlaneClient(DataPlaneClient):
         self._gdr_put_confirmed = False
 
         if bootstrap:
-            _init_tq(cfg, checkpointing=checkpointing)
+            _init_tq(
+                cfg,
+                checkpointing=checkpointing,
+                storage_unit_node_ids=storage_unit_node_ids,
+            )
         elif segment_size is None or self._backend != "mooncake_cpu":
             # Only mooncake_cpu processes own a segment; other backends attach
             # with the controller's conf unchanged.

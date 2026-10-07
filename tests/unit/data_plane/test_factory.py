@@ -52,9 +52,15 @@ def test_factory_passes_checkpoint_runtime_mode_to_bootstrap(
         "mooncake_cpu": {"reuse_registered_buffers": False},
     }
 
-    client = build_data_plane_client(cfg, checkpointing=checkpointing)
+    plan = ["a" * 56, "b" * 56]
+    client = build_data_plane_client(
+        cfg, checkpointing=checkpointing, storage_unit_node_ids=plan
+    )
 
-    bootstrap.assert_called_once_with(cfg, checkpointing=checkpointing)
+    # The storage-unit plan reaches bootstrap as an argument, not via the config.
+    bootstrap.assert_called_once_with(
+        cfg, checkpointing=checkpointing, storage_unit_node_ids=plan
+    )
     connect.assert_not_called()
     assert client._supports_checkpointing is True
 

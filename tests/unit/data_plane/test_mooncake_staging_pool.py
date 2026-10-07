@@ -160,3 +160,56 @@ def test_pool_is_constructed_once_under_concurrent_first_use(monkeypatch) -> Non
     # Identity, not storage location: every caller must get the one pool that
     # was actually constructed.
     assert seen == [constructed[0]] * n_threads
+
+
+# ── native BufferPool wrapper ────────────────────────────────────────────────
+
+
+class _NoPool:
+    """A BufferPool that must not be asked: the request is over its budget."""
+
+    def buffer(self, nbytes: int):  # type: ignore[no-untyped-def]
+        raise AssertionError("an over-budget request must bypass the pool")
+
+
+def test_payload_bigger_than_the_pool_gets_a_one_off_registration() -> None:
+    """One tensor over the whole pool still transfers, as before the native pool."""
+    store = _FakeStore()
+    pool = tq_adapter._NativeStagingPool(_NoPool(), store, budget=1024)
+
+    with pool.buffer(4096) as tmp:
+        assert tmp.numel() == 4096
+        assert store.registered == {tmp.data_ptr(): 4096}
+    assert store.registered == {}
+    assert store.unregistered == [tmp.data_ptr()]
+
+
+def test_pool_errors_name_the_settings_to_change() -> None:
+    class _TimedOut:
+        def buffer(self, nbytes: int):  # type: ignore[no-untyped-def]
+            raise RuntimeError("timed out waiting for buffer")
+
+    pool = tq_adapter._NativeStagingPool(_TimedOut(), _FakeStore(), budget=1 << 20)
+    with pytest.raises(RuntimeError, match="local_buffer_size.*staging_buffer_size"):
+        with pool.buffer(4096):
+            pass
+
+
+def test_local_buffer_smaller_than_the_pool_is_rejected(monkeypatch) -> None:
+    """The pool is carved out of the local buffer; below 4 slots it re-registers."""
+    import sys
+    from types import ModuleType
+
+    store_mod = ModuleType("mooncake.store")
+    store_mod.BufferPool = lambda *a, **k: object()  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mooncake", ModuleType("mooncake"))
+    monkeypatch.setitem(sys.modules, "mooncake.store", store_mod)
+
+    client = _FakeClient(_FakeStore())
+    client.local_buffer_size = 3 * _MAX  # type: ignore[attr-defined]
+    registry = tq_adapter._StagingPoolRegistry(4, _MAX)
+    with pytest.raises(ValueError, match="local_buffer_size .* must be >= 4 x"):
+        registry.pool_for(client)
+
+    client.local_buffer_size = 4 * _MAX  # type: ignore[attr-defined]
+    assert registry.pool_for(client) is not None

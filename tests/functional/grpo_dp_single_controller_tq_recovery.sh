@@ -6,11 +6,25 @@ set -eou pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 PROJECT_ROOT=$(realpath "$SCRIPT_DIR/../..")
 BASE_TEST=$SCRIPT_DIR/grpo_dp_single_controller.sh
-BACKEND=${1:-simple}
-case "$BACKEND" in
-    simple) TEST_NAME=grpo_dp_single_controller_tq_recovery ;;
-    mooncake_cpu) TEST_NAME=grpo_dp_mooncake_tq_recovery ;;
-    *) echo "Unsupported recovery backend: $BACKEND" >&2; exit 1 ;;
+# simple / mooncake_cpu, or a storage-unit variant of either:
+#   simple_placed   simple with SimpleStorageUnits pinned (storage_unit_placement=all)
+#   mooncake_units  mooncake_cpu with CPU storage units as the only memory owners
+VARIANT=${1:-simple}
+VARIANT_OVERRIDES=()
+case "$VARIANT" in
+    simple) BACKEND=simple; TEST_NAME=grpo_dp_single_controller_tq_recovery ;;
+    mooncake_cpu) BACKEND=mooncake_cpu; TEST_NAME=grpo_dp_mooncake_tq_recovery ;;
+    simple_placed)
+        BACKEND=simple
+        TEST_NAME=grpo_dp_simple_placed_tq_recovery
+        VARIANT_OVERRIDES=(data_plane.simple.storage_unit_placement=all)
+        ;;
+    mooncake_units)
+        BACKEND=mooncake_cpu
+        TEST_NAME=grpo_dp_mooncake_units_tq_recovery
+        VARIANT_OVERRIDES=(data_plane.mooncake_cpu.storage_unit_segment_size=4294967296)
+        ;;
+    *) echo "Unsupported recovery variant: $VARIANT" >&2; exit 1 ;;
 esac
 TEST_DIR=$SCRIPT_DIR/$TEST_NAME
 CHECKPOINT_DIR=$TEST_DIR/checkpoints
@@ -34,11 +48,12 @@ COMMON_OVERRIDES=(
     async_rl.max_buffered_rollouts=8
     # Bridge rewrites the scheduler position on resume only when this is on.
     '+policy.megatron_cfg.scheduler.override_opt_param_scheduler=true'
+    "${VARIANT_OVERRIDES[@]}"
 )
 if [[ "$BACKEND" == "mooncake_cpu" ]]; then
     COMMON_OVERRIDES+=(
         data_plane.mooncake_cpu.global_segment_size=4294967296
-        data_plane.mooncake_cpu.local_buffer_size=1073741824
+        data_plane.mooncake_cpu.local_buffer_size=2147483648
     )
 fi
 
@@ -102,4 +117,4 @@ if [[ "$BACKEND" == "simple" ]]; then
         --checkpoint-dir "$TEST_DIR/verifier_bundle"
 fi
 
-echo "Native TQ recovery functional test passed ($BACKEND)."
+echo "Native TQ recovery functional test passed ($VARIANT)."

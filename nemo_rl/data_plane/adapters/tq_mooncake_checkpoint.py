@@ -1383,6 +1383,10 @@ class _CheckpointManagerMixin:
                 config["global_segment_size"] = 0
         # The optional TQ base is supplied at installation, not at module import.
         cast(Any, super()).__init__(controller_info, config)
+        # Put each write on a segment on the writer's own host first (Mooncake
+        # rotates among that host's segments by key), then on any other. With
+        # storage units on, a writer's puts land on its node's units.
+        self.storage_client.replica_config.prefer_alloc_in_same_node = True
         self._checkpoint_workers: list[Any] = []
         self._checkpoint_participant: _CheckpointParticipant | None = None
         if _checkpoint_enabled(self.config):
@@ -1423,36 +1427,6 @@ def configure_checkpoint_workers(workers: list[Any]) -> None:
     manager._checkpoint_workers = list(workers)
     _, owners = _live_participants(manager)
     manager._checkpoint_workers = list(owners.values())
-
-
-def _attached_manager() -> Any:
-    from transfer_queue import interface as tq_interface
-
-    manager = getattr(tq_interface._TQ_CLIENT, "storage_manager", None)
-    if not isinstance(manager, _CheckpointManagerMixin):
-        raise RuntimeError("Mooncake checkpoint manager is not attached")
-    return manager
-
-
-def local_segment_name() -> str:
-    """This process's Mooncake segment name, as replica descriptors report it."""
-    segment = _attached_manager().storage_client._store.get_hostname()
-    if not isinstance(segment, str) or not segment:
-        raise RuntimeError("Mooncake client did not expose its segment name")
-    return segment
-
-
-def prefer_storage_segment(segment_name: str) -> None:
-    """Allocate this process's puts in ``segment_name`` first.
-
-    Mooncake falls back to another segment when the preferred one is full
-    (``AllocateReplicas`` tries preferred, then random), so this is placement,
-    not a capacity guarantee.
-    """
-    # Length must equal replica_num (1 under TQ); store_py validates it.
-    _attached_manager().storage_client.replica_config.preferred_segments = [
-        segment_name
-    ]
 
 
 def run_checkpoint_command(body: Mapping[str, Any]) -> dict[str, Any] | None:

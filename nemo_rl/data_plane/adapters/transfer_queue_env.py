@@ -55,9 +55,9 @@ def rail_link_layers() -> dict[str, str]:
     """Map each usable RDMA device to its port-1 link layer, read from sysfs.
 
     Any device name, not just ``mlx5_*``: vendors name rails differently. Port 1
-    must be ACTIVE, because it is the only port mooncake's topology discovery
-    checks; a device active only on higher ports is unusable to it. This yields
-    the same set mooncake finds when given no device list.
+    must be ACTIVE: it is the port mooncake's RDMA transport uses by default
+    (``MC_IB_PORT`` overrides it). Mooncake's own discovery also accepts a
+    device active only on a higher port, which this skips.
     """
     layers: dict[str, str] = {}
     for state_path in sorted(glob.glob("/sys/class/infiniband/*/ports/1/state")):

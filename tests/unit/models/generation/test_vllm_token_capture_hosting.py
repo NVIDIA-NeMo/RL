@@ -80,9 +80,12 @@ def _fake_worker(*, is_model_owner: bool = True) -> SimpleNamespace:
 
 def test_setup_token_capture_installs_capture_with_vllm_adapter(monkeypatch):
     sink = _MemorySink()
+    segment_sizes = []
     monkeypatch.setattr(
         "nemo_rl.data_plane.build_data_plane_client",
-        lambda dp_cfg, bootstrap, segment_size=None: MagicMock(name="dp_client"),
+        lambda dp_cfg, bootstrap, segment_size=None: (
+            segment_sizes.append(segment_size) or MagicMock(name="dp_client")
+        ),
     )
     monkeypatch.setattr(
         "nemo_rl.data_plane.tq_token_sink.TQTokenSink",
@@ -101,6 +104,8 @@ def test_setup_token_capture_installs_capture_with_vllm_adapter(monkeypatch):
     )
 
     assert installed is True
+    # The capture client owns no Mooncake memory, so no save waits on vLLM.
+    assert segment_sizes == [0]
     assert isinstance(worker.token_capture, RolloutTokenCapture)
     assert worker.token_capture.adapter is not None
     # The adapter is the vLLM one (prefix ids enter via the worker's field).
@@ -180,7 +185,6 @@ def test_generation_setup_token_capture_fans_out(monkeypatch):
         dp_cfg={"backend": "simple"},
         staging_partition="rollout_staging",
         capture_media=False,
-        storage_segments=None,
         run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
     )
 

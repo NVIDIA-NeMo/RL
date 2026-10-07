@@ -993,7 +993,10 @@ class MegatronGenerationMixin:
             TQMegatronTokenStager,
         )
 
-        dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
+        # Own no segment, as vLLM capture does, so a save never waits on a
+        # generation-only worker. A trainer in this process attached first and
+        # keeps its segment: TQ reuses a process's existing client.
+        dp_client = build_data_plane_client(dp_cfg, bootstrap=False, segment_size=0)
         prompt_preparer = TQMegatronPromptPreparer(
             TQTokenSource(dp_client, staging_partition=staging_partition)
         )

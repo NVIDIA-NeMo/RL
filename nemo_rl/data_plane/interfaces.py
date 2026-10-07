@@ -59,9 +59,10 @@ class SimpleStorageConfig(BaseModel, extra="allow"):
 
     storage_capacity: int = 1000000  # max samples retained per partition
     num_storage_units: int
-    # Nodes that host units: all | inference (vLLM nodes) | train, round-robin.
-    # None keeps TQ's own SPREAD placement over every Ray node.
-    storage_unit_placement: Literal["inference", "train", "all"] | None = None
+    # Clusters whose nodes host the units, round-robin: "all" or a list of
+    # names (train, inference, teacher:<name>). None keeps TQ's own SPREAD
+    # placement over every Ray node.
+    storage_unit_placement: list[str] | Literal["all"] | None = None
 
 
 class MooncakeCpuConfig(BaseModel, extra="allow"):
@@ -78,9 +79,9 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     upstream's per-call registration.
 
     ``staging_buffer_size`` is that pool's per-slot ceiling (mooncake's native
-    ``BufferPool``). A bigger payload still transfers with a transient
-    registration, up to the pool's total of 4 slots; a single payload above
-    that fails. Raise it only when a per-key payload (one sample of one
+    ``BufferPool``, carved out of ``local_buffer_size``, which must be at
+    least 4 x this). A bigger payload still transfers, with a transient
+    registration. Raise it only when a per-key payload (one sample of one
     field) genuinely exceeds it.
 
     ``use_gdr`` lets CUDA-initialized clients transfer through TransferQueue's
@@ -96,11 +97,11 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     """
 
     global_segment_size: int = 68719476736  # 64 GiB per client process
-    # The staging pool is carved out of this buffer; a slot that doesn't fit
-    # is registered per call. Keep it >= 4 x staging_buffer_size.
+    # The staging pool is carved out of this buffer: must be >= 4 x
+    # staging_buffer_size while reuse_registered_buffers is on.
     local_buffer_size: int = 2147483648  # 2 GiB = 4 x 512 MiB slots
     reuse_registered_buffers: bool = True
-    # One object above max(4 x this, local_buffer_size) fails to transfer.
+    # A payload above this is registered per transfer instead of pooled.
     staging_buffer_size: int = 536870912  # 512 MiB per pool slot
     use_gdr: bool = False
     gdr_staging_buffer_mb: PositiveInt = 1024
@@ -109,8 +110,9 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     storage_unit_segment_size: NonNegativeInt = 0
     # Total units, like simple.num_storage_units; None: 2 per selected node.
     num_storage_units: PositiveInt | None = None
-    # Nodes that host units: all | inference (vLLM nodes) | train.
-    storage_unit_placement: Literal["inference", "train", "all"] = "all"
+    # Clusters whose nodes host units: "all" or a list of names (train,
+    # inference, teacher:<name>).
+    storage_unit_placement: list[str] | Literal["all"] = "all"
 
 
 class DataPlaneConfig(TypedDict):
@@ -149,9 +151,6 @@ class DataPlaneConfig(TypedDict):
     controller_address: NotRequired[str]
     ack_timeout_ms: NotRequired[int]
     observability: NotRequired["ObservabilityConfig"]
-    # Set by setup from simple.storage_unit_placement, not by users: the Ray
-    # node ID each SimpleStorageUnit is pinned to.
-    simple_storage_node_ids: NotRequired[list[str]]
 
 
 _CHECKPOINTABLE_BACKENDS: frozenset[str] = frozenset({"simple", "mooncake_cpu"})
