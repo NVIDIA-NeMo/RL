@@ -18,7 +18,7 @@ cd $PROJECT_ROOT
 uv run examples/run_grpo_single_controller.py \
     --config $CONFIG_PATH \
     ppo.max_num_steps=$MAX_STEPS \
-    ppo.policy_training_start_step=0 \
+    ppo.policy_training_start_step=2 \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=True \
     logger.wandb.project=nemo-rl \
