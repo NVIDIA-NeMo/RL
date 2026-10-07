@@ -24,10 +24,15 @@ test -z "$(git -C "$repo" status --porcelain --untracked-files=no --ignore-submo
 
 max_steps=${MAX_STEPS:-20}
 account=${SLURM_ACCOUNT:-coreai_dlalgo_nemorl}
-name="qwen30-pr4353-async-${arm}-${max_steps}step"
+name="qwen30-pr4353-async-${arm}-${max_steps}step${RUN_SUFFIX:+-${RUN_SUFFIX}}"
 run_root="${RESULT_ROOT}/${name}"
 local_root="/raid/scratch/${USER}/nr-qwen30-${SOURCE_COMMIT:0:10}-${arm}"
 source_root="${local_root}/source"
+te_config_file="${source_root}/experiments/lightning_pr4353_20261007/te-routed-mxfp8.yaml"
+te_config_override=""
+if [[ "$arm" == mxfp8-* ]]; then
+  te_config_override="policy.megatron_cfg.te_precision_config_file=${te_config_file}"
+fi
 hf_source="/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/${USER}/hf_home"
 model_cache=models--Qwen--Qwen3-30B-A3B
 
@@ -47,6 +52,7 @@ rsync -a --ignore-existing ${hf_source}/hub/${model_cache}/ ${local_root}/hf/hub
 export COMMAND="set -euo pipefail
 ulimit -c 0
 cd ${source_root}
+test -f ${te_config_file}
 export PYTHONPATH=${source_root}:${source_root}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src:${source_root}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM
 export HF_HOME=${local_root}/hf HF_HUB_CACHE=${local_root}/hf/hub HUGGINGFACE_HUB_CACHE=${local_root}/hf/hub
 export HF_DATASETS_CACHE=${hf_source}/datasets HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
@@ -56,7 +62,7 @@ export UV_CACHE_DIR=${local_root}/uv VLLM_CACHE_ROOT=${local_root}/vllm TORCHIND
 export PYTHONPYCACHEPREFIX=${local_root}/pycache RAY_TMPDIR=/tmp
 unset NRL_IGNORE_VERSION_MISMATCH PYTHONOPTIMIZE
 /opt/nemo_rl_venv/bin/python tools/config_cli.py expand experiments/qwen30_pr4353_20261007/${config} >/dev/null
-/opt/nemo_rl_venv/bin/python examples/run_grpo.py --config experiments/qwen30_pr4353_20261007/${config} grpo.max_num_steps=${max_steps} logger.log_dir=${run_root}/metrics logger.wandb.name=${name}"
+/opt/nemo_rl_venv/bin/python examples/run_grpo.py --config experiments/qwen30_pr4353_20261007/${config} ${te_config_override} grpo.max_num_steps=${max_steps} logger.log_dir=${run_root}/metrics logger.wandb.name=${name}"
 
 args=(--nodes=4 --gres=gpu:4 --exclusive --mem=0 --account="$account" --partition=batch --time=04:00:00
   --segment=2 --job-name="${account}.${name}" --output="${run_root}/slurm-%j.out"
