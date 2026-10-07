@@ -496,7 +496,8 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     recompute_kv_cache_after_weight_updates: bool = False
     # Min ready groups the streaming trainer waits for before dispatching a batch.
     min_groups_for_streaming_train: PositiveInt = 32
-    # Max groups per streaming chunk; None uses the configured minimum.
+    # Max ready groups dispatched in one streaming chunk (>= min). None leaves a
+    # chunk bounded only by the step remainder, the behaviour before this knob.
     max_groups_for_streaming_train: Optional[PositiveInt] = None
     # Cap on in-flight generate_and_push calls in the rollout pump.
     max_inflight_prompts: int = 32
@@ -529,17 +530,6 @@ class AsyncRLConfig(BaseModel, extra="allow"):
                 "async_rl.min_groups_for_streaming_train"
             )
         return self
-
-    def streaming_chunk_cap(self) -> int:
-        """Upper bound on prompt groups per streaming train chunk.
-
-        The explicit ``max_groups_for_streaming_train`` when set; otherwise the
-        streaming minimum, so a step is consumed in chunks of exactly
-        ``min_groups_for_streaming_train`` rather than whatever is ready.
-        """
-        if self.max_groups_for_streaming_train is not None:
-            return self.max_groups_for_streaming_train
-        return self.min_groups_for_streaming_train
 
     @model_validator(mode="after")
     def _reject_renamed_blocks(self) -> "AsyncRLConfig":

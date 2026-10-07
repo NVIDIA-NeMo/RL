@@ -1832,6 +1832,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._async_cfg = SimpleNamespace(
         min_groups_for_streaming_train=1,
+        max_groups_for_streaming_train=None,
         rollout_failure=SimpleNamespace(min_step_batch_fraction=0.9),
         sampler=SimpleNamespace(
             max_lookahead_versions=1,
