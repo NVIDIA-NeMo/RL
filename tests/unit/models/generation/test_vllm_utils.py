@@ -26,6 +26,7 @@ from nemo_rl.models.generation.interfaces import (
     get_num_routed_experts,
     resolve_routed_experts_dtype,
 )
+from nemo_rl.models.generation.openai_server_utils import PrefixSplice
 from nemo_rl.models.generation.vllm import utils as vllm_utils
 from nemo_rl.models.generation.vllm.utils import (
     R3_MISSING_ROUTE_SENTINEL,
@@ -40,7 +41,6 @@ from nemo_rl.models.generation.vllm.utils import (
     pad_and_align_routed_expert_indices,
     remap_multimodal_placeholders,
 )
-from nemo_rl.models.generation.openai_server_utils import PrefixSplice
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
 
 
