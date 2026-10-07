@@ -134,6 +134,18 @@ class LoggerConfig(BaseModel, extra="allow"):
                 )
         return self
 
+    @model_validator(mode="after")
+    def _require_wandb_for_conversation_tables(self) -> "LoggerConfig":
+        # Only the W&B backend implements log_table; without it the per-step
+        # table would be built (a full batch_decode of every rollout) and then
+        # dropped by every backend.
+        if self.log_conversations and not self.wandb_enabled:
+            raise ValueError(
+                "logger.log_conversations=true requires logger.wandb_enabled=true: "
+                "only the W&B backend renders tables."
+            )
+        return self
+
 
 def should_log_nemo_gym_full_result_tables(
     *, wandb_enabled: bool, wandb_config: Optional[WandbConfig]
@@ -1563,10 +1575,10 @@ class Logger(LoggerInterface):
             thinking_tags=thinking_tags,
             prompt_clip=prompt_clip,
         )
-        # A wandb.Table value inside an ordinary metrics dict is the repo's
-        # established table idiom (see rollouts.py's full-result tables);
-        # backends without a native table artifact ignore the value.
-        self.log_metrics({name: wandb.Table(columns=columns, data=rows)}, step=step)
+        # Through the table seam, not log_metrics: a wandb.Table value handed
+        # to every backend makes TensorBoard warn, and MLflow and SwanLab fail
+        # on float(), every step. Backends without a table type skip it.
+        self.log_table(columns, rows, step, name)
 
     def log_plot_token_mult_prob_error(
         self, data: dict[str, Any], step: int, name: str
@@ -1983,7 +1995,8 @@ def _clip_middle(text: str, limit: int) -> str:
         return text
     head = limit * 2 // 3
     tail = limit - head
-    return f"{text[:head]}\n…[clipped {len(text) - limit} chars]…\n{text[-tail:]}"
+    # Sliced from the front: text[-0:] would be the whole string for limit 0.
+    return f"{text[:head]}\n…[clipped {len(text) - limit} chars]…\n{text[len(text) - tail :]}"
 
 
 def _fold_thinking(text: str, thinking_tags: Optional[list[str]]) -> str:
@@ -2193,7 +2206,18 @@ def _resolve_message_texts(
         if not isinstance(msg, dict):
             resolved.append(("unknown", str(msg), {}))
             continue
-        text = msg.get("content") or decoded.get((sample_idx, j))
+        content = msg.get("content")
+        if isinstance(content, list):
+            # VLM message logs store content as typed chunks (see
+            # nemo_rl/data/processors.py); keep the text ones and name the rest.
+            content = "\n".join(
+                chunk.get("text", "")
+                if chunk.get("type") == "text"
+                else f"[{chunk.get('type')}]"
+                for chunk in content
+                if isinstance(chunk, dict)
+            )
+        text = content or decoded.get((sample_idx, j))
         if not text and msg.get("token_ids") is not None:
             text = f"[{len(msg['token_ids'])} tokens]"
         resolved.append((msg.get("role", "unknown"), text or "", msg))

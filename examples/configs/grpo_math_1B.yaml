@@ -564,8 +564,8 @@ env:
 logger:
   log_dir: "logs"  # Base directory for all logs
   num_val_samples_to_print: 0 # Number of validation samples to pretty print on terminal
-  log_conversations: false  # Log each step's rollout conversations as a W&B table (train/conversations). Expensive; for debugging.
-  conversation_label_field: null  # Dotted path of a field in each row's extra_env_info that labels the row in that table (for example verifier_metadata.target_hardware); null uses the batch's task_name.
+  log_conversations: false  # Log each step's rollout conversations as a W&B table (train/conversations); requires wandb_enabled. GRPO and async GRPO loops only. Expensive; for debugging.
+  conversation_label_field: null  # Dotted path of a field in each row's extra_env_info that labels the row in that table (for example verifier_metadata.target_hardware); null uses the batch's task_name, then the Gym agent name.
   wandb_enabled: false
   tensorboard_enabled: false
   mlflow_enabled: false  # Disable MLflow logging

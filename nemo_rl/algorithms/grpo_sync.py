@@ -475,6 +475,14 @@ def grpo_train_sync(
     Parity with the legacy path is verified by running the same config
     against both entrypoints and diffing the wandb runs.
     """
+    if master_config.logger.log_conversations:
+        # The driver batch here holds per-sample tensors only, never the
+        # message logs the table is rendered from.
+        print(
+            "⚠️ logger.log_conversations is on, but grpo_train_sync does not "
+            "log conversation tables; the GRPO and async GRPO loops do.",
+            flush=True,
+        )
     timer = Timer()
     timeout = TimeoutChecker(
         timeout=master_config.checkpointing["checkpoint_must_save_by"],

@@ -5332,6 +5332,19 @@ def async_grpo_train(
                         f"  📊 Rewards stats: min={rewards.min():.4f}, max={rewards.max():.4f}, mean={rewards.mean():.4f}, std={rewards.std():.4f}"
                     )
 
+                # The trajectory batch carries message_log and total_reward but
+                # no configured row labels, so the label column falls back to
+                # task_name and then to the Gym agent name.
+                maybe_log_train_conversations(
+                    logger,
+                    master_config.logger,
+                    repeated_batch,
+                    None,
+                    tokenizer=tokenizer,
+                    step=step + 1,
+                    thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
+                )
+
                 # Prepare training data (same as sync version)
                 with (
                     timer.time("data_processing"),

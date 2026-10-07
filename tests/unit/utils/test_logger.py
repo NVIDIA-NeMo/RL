@@ -40,6 +40,7 @@ from nemo_rl.utils.logger import (
     TensorboardLogger,
     WandbConfig,
     WandbLogger,
+    _clip_middle,
     build_conversation_table,
     conversation_row_labels,
     flatten_dict,
@@ -2490,6 +2491,29 @@ class TestBuildConversationTable:
         assert "### turn 1 — assistant" in conv and "function body" in conv
         assert "### tool/env result" in conv and "Tests passed: True" in conv
 
+    def test_vlm_list_content_is_flattened(self):
+        """VLM message logs store user content as typed chunks; the text chunks
+        are kept and the media chunks named, instead of the row failing to
+        format."""
+        log = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": "<pil>"},
+                    {"type": "text", "text": "What is in the picture?"},
+                ],
+            },
+            {"role": "assistant", "content": "A cat."},
+        ]
+        columns, rows = build_conversation_table(
+            [log], rewards=[1.0], task_names=["vlm"], step=1, tokenizer=None
+        )
+        r = self._cols_row(columns, rows)
+        assert r["num_turns"] == 1
+        assert "[image]" in r["conversation"]
+        assert "What is in the picture?" in r["conversation"]
+        assert "error formatting conversation" not in r["conversation"]
+
     def test_agentic_decodes_empty_content_via_tokenizer(self):
         # message log stores per-turn deltas with empty content + token ids
         texts = [
@@ -2555,7 +2579,8 @@ def test_conversation_row_labels_read_the_configured_row_field():
         {"verifier_metadata": {}},
         None,
     ]
-    config = LoggerConfig(
+    # model_construct skips the W&B requirement; this test covers the labels.
+    config = LoggerConfig.model_construct(
         log_dir="logs/test",
         log_conversations=True,
         conversation_label_field="verifier_metadata.target_hardware",
@@ -2563,7 +2588,8 @@ def test_conversation_row_labels_read_the_configured_row_field():
     assert conversation_row_labels(config, rows) == ["B200", "unknown", "unknown"]
     assert (
         conversation_row_labels(
-            LoggerConfig(log_dir="logs/test", log_conversations=True), rows
+            LoggerConfig.model_construct(log_dir="logs/test", log_conversations=True),
+            rows,
         )
         is None
     )
@@ -2576,10 +2602,29 @@ def test_conversation_row_labels_read_the_configured_row_field():
     assert conversation_row_labels(config, []) is None
 
 
+def test_logger_config_requires_wandb_for_conversation_tables() -> None:
+    """Only the W&B backend renders tables, so the setting is refused without it
+    rather than decoding every rollout per step for nothing."""
+    with pytest.raises(ValueError, match="requires logger.wandb_enabled=true"):
+        LoggerConfig(log_dir="logs/test", log_conversations=True)
+    LoggerConfig(
+        log_dir="logs/test",
+        log_conversations=True,
+        wandb_enabled=True,
+        wandb=WandbConfig(project="p", name="n"),
+    )
+
+
+def _conversation_logger_config(enabled: bool) -> LoggerConfig:
+    # model_construct skips the W&B requirement; these tests cover the call
+    # sites, not the configuration check.
+    return LoggerConfig.model_construct(log_dir="logs/test", log_conversations=enabled)
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 def test_maybe_log_train_conversations_uses_logger_config(enabled: bool) -> None:
     logger = MagicMock(spec=Logger)
-    config = LoggerConfig(log_dir="logs/test", log_conversations=enabled)
+    config = _conversation_logger_config(enabled)
     message_logs = [[{"role": "assistant", "content": "answer"}]]
     batch = {
         "message_log": message_logs,
@@ -2609,6 +2654,42 @@ def test_maybe_log_train_conversations_uses_logger_config(enabled: bool) -> None
         )
     else:
         logger.log_conversations_from_message_logs.assert_not_called()
+
+
+def test_maybe_log_train_conversations_labels_gym_rows_and_never_raises(
+    capsys,
+) -> None:
+    """A NeMo-Gym batch carries agent_ref and no task_name, so rows are labeled
+    by agent name; a table failure is printed, never raised."""
+    logger = MagicMock(spec=Logger)
+    config = _conversation_logger_config(True)
+    rewards = torch.tensor([1.0, 0.0])
+    batch = {
+        "message_log": [[{"role": "assistant", "content": "a"}] for _ in range(2)],
+        "agent_ref": [{"name": "simple_agent"}, None],
+        "total_reward": rewards,
+    }
+
+    maybe_log_train_conversations(
+        logger, config, batch, None, tokenizer=None, step=5, thinking_tags=None
+    )
+
+    kwargs = logger.log_conversations_from_message_logs.call_args.kwargs
+    assert kwargs["task_names"] == ["simple_agent", None]
+    assert kwargs["rewards"] is rewards
+
+    logger.log_conversations_from_message_logs.side_effect = RuntimeError("boom")
+    maybe_log_train_conversations(
+        logger, config, batch, None, tokenizer=None, step=6, thinking_tags=None
+    )
+    assert "Error logging conversations table: boom" in capsys.readouterr().out
+
+
+def test_clip_middle_with_a_zero_budget_hides_the_text():
+    clipped = _clip_middle("abcdefghij", 0)
+    assert "abcdefghij" not in clipped
+    assert "[clipped 10 chars]" in clipped
+    assert _clip_middle("abc", 3) == "abc"
 
 
 def test_build_conversation_table_prompt_clip_is_a_parameter():
