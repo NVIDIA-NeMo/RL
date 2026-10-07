@@ -61,6 +61,8 @@ from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
     attach_topk_logprobs_to_chat_response_choices,
+    install_sampler_topk_logprobs_patch,
+    widen_sampling_params_logprobs,
     format_prompt_for_vllm_generation,
     validate_rollout_prompt,
     model_dump_chat_response_with_dynamic_message_fields,
@@ -568,6 +570,11 @@ class VllmAsyncGenerationWorkerImpl(
         )
         self._staging_sink = sink
         self._capture_top_logprobs = int(top_logprobs)
+        if self._capture_top_logprobs > 0:
+            # The engine frontend runs in this process: keep it from detokenizing
+            # the k candidates of every generated token (see
+            # widen_sampling_params_logprobs). Requests arrive only after setup.
+            install_sampler_topk_logprobs_patch(LOGGER)
         if capture_media:
             # Omni-only: a new processor family must also change setup.py (driver
             # checks), captured_media.py (_processed_omni_tensors, pack_images,
@@ -1231,11 +1238,15 @@ class VllmAsyncGenerationWorkerImpl(
             def to_sampling_params(self, *args, **kwargs):
                 params = super().to_sampling_params(*args, **kwargs)
                 # Captured calls also carry the sampler's top-k
-                # (token_capture.top_logprobs). Only the engine's count changes:
+                # (token_capture.top_logprobs). Only the engine request changes:
                 # the response is still cut at request.top_logprobs (0), so
-                # nothing extra reaches the JSON.
+                # nothing extra reaches the JSON. Widened with flat_logprobs and
+                # the no-detokenize marker, so the frontend keeps the k+1
+                # candidates per token as primitive lists.
                 if self.ng_capture and worker_self._capture_top_logprobs:
-                    params.logprobs = worker_self._capture_top_logprobs
+                    params = widen_sampling_params_logprobs(
+                        params, worker_self._capture_top_logprobs
+                    )
                 return params
 
         # vLLM 0.25 routes both /v1/chat/completions and /tokenize through
@@ -1275,19 +1286,38 @@ class VllmAsyncGenerationWorkerImpl(
                         final_res = res
                         yield res
 
-                response = await super().chat_completion_full_generator(
-                    request,
-                    capture_result_generator(),
-                    *args,
-                    **kwargs,
+                # Captured top-k calls: the engine output holds k+1 candidates
+                # per token, and vLLM's chat layer would walk them (one dict of
+                # k+1 Logprob objects per token via FlatLogprobs.__getitem__, on
+                # the event loop) to build choice.logprobs that
+                # _finish_request_capture drops again -- token ids and log-probs
+                # ride message.generation_* instead. Hide `logprobs` from the chat
+                # layer for those calls; the engine request is already built.
+                client_logprobs = request.logprobs
+                suppress_chat_logprobs = bool(
+                    client_logprobs
+                    and return_as_token_id
+                    and request.ng_capture
+                    and worker_self._capture_top_logprobs
                 )
+                if suppress_chat_logprobs:
+                    request.logprobs = False
+                try:
+                    response = await super().chat_completion_full_generator(
+                        request,
+                        capture_result_generator(),
+                        *args,
+                        **kwargs,
+                    )
+                finally:
+                    request.logprobs = client_logprobs
                 if (
                     not isinstance(response, ChatCompletionResponse)
                     or final_res is None
                 ):
                     return response
 
-                if request.logprobs and return_as_token_id:
+                if client_logprobs and return_as_token_id:
                     response = attach_token_information_to_chat_response_choices(
                         response,
                         final_res,
