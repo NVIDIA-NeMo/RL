@@ -109,7 +109,7 @@ class GymTransportError(RolloutInfraFailure):
     """NeMo-Gym failed at the transport layer rather than returning a rollout."""
 
 
-class GymCheckpointParked(RolloutInfraFailure):
+class GymAdmissionClosed(RolloutInfraFailure):
     """NeMo-Gym refused a new ``/run`` because a checkpoint has admission closed.
 
     Gym refuses before it records anything for the episode, so the attempt is
