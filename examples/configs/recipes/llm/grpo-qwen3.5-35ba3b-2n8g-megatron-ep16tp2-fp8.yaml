@@ -36,6 +36,10 @@ policy:
       - linear_attn.in_proj_a
       - linear_attn.in_proj_b
       - visual
+    vllm_kwargs:
+      compilation_config:
+        # PIECEWISE instead of the parent's FULL_AND_PIECEWISE: FULL graphs left 833 Mamba cache blocks for max_num_seqs 1024 and vLLM failed at startup. With PIECEWISE: generation/step -85%, wall 174 -> 79 min, logprob gates unchanged.
+        cudagraph_mode: PIECEWISE
 logger:
   wandb:
     name: grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2-fp8
