@@ -68,8 +68,13 @@ for role in driver policy vllm-sync vllm-async; do
     vllm-async) executable=/usr/local/bin/python-VllmAsyncGenerationWorker ;;
   esac
   "$executable" experiments/lightning_main_20261006/smoke.py "$role"
+  (
+    cd "$LOCAL_ROOT"
+    SMOKE_SOURCE_ROOT=/opt/nemo-rl env -u PYTHONPATH "$executable" \
+      /opt/nemo-rl/experiments/lightning_main_20261006/smoke.py "$role"
+  )
 done
-/usr/local/bin/python-MegatronPolicyWorker -m pytest -q \
+/usr/local/bin/python-MegatronPolicyWorker -m pytest -q --mcore-only \
   tests/unit/models/megatron/test_hybridep_data.py \
   tests/unit/models/megatron/test_group_experts.py::test_build_hf_to_local_param_map_train_side \
   tests/unit/models/policy/test_megatron_worker.py::test_refit_metadata_map_precedes_transport_init

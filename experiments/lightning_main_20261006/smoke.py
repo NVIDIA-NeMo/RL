@@ -9,7 +9,9 @@ import sys
 
 def main() -> None:
     role = sys.argv[1]
-    root = Path.cwd().resolve()
+    root = Path(os.environ.get("SMOKE_SOURCE_ROOT", os.getcwd())).resolve()
+    if os.environ.get("NRL_IGNORE_VERSION_MISMATCH"):
+        raise RuntimeError("Dependency mismatch bypass must remain disabled")
     expected = json.loads(Path(os.environ["EXPECTED_FINGERPRINT"]).read_text())
     baked = json.loads(Path("/opt/nemo_rl_container_fingerprint").read_text())
     # Git metadata is not in the source archive. Validate the committed manifest
@@ -27,7 +29,15 @@ def main() -> None:
         if actual != expected[key]:
             raise RuntimeError(f"Source dependency fingerprint mismatch: {key}")
     print(
-        json.dumps({"role": role, "executable": sys.executable, "fingerprint": baked})
+        json.dumps(
+            {
+                "role": role,
+                "executable": sys.executable,
+                "source_root": str(root),
+                "fingerprint": baked,
+                "mismatch_bypass": os.environ.get("NRL_IGNORE_VERSION_MISMATCH"),
+            }
+        )
     )
     import torch
 

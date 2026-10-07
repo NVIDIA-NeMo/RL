@@ -11,7 +11,7 @@ set -euo pipefail
 : "${SOURCE_COMMIT:?Set expected source commit}"
 : "${CONTAINER_DIR:?Set shared image output directory}"
 export LOCAL_ROOT="/raid/scratch/${USER}/nr-align-${SLURM_JOB_ID}"
-output="${CONTAINER_DIR}/nemo_rl_main_aligned_20261006_${SLURM_JOB_ID}.sqsh"
+output="${CONTAINER_DIR}/nemo_rl_main_aligned_$(date -u +%Y%m%d)_${SLURM_JOB_ID}.sqsh"
 test ! -e "$output"
 mkdir -p "$CONTAINER_DIR"
 grep -Fx "source_commit=${SOURCE_COMMIT}" "${SOURCE_ARCHIVE}.metadata.txt"

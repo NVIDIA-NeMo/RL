@@ -1,6 +1,9 @@
 # Fresh-main Lightning baseline
 
 Base: NeMo-RL main `8661b4753a19031626f4014512755061404aeb2e` (2026-10-06).
+Updated to main `8bf6bd4bafc05ca29cf34981ad9c378fa38db72d` on Oct7,
+including #3724. Dependency files, actor extras and recursive submodule pins
+are unchanged relative to the Oct6 base.
 Bridge: `ec835530efeff71b55ec015f36bcc0c33b8b52b7`.
 Initialize all recursive submodules before archiving source. The only pending
 production delta is #4111's model-parallel rank lookup during early NCCL source-map
@@ -40,3 +43,12 @@ environments with `uv sync --locked --inexact`. Build/cache writes stay inside
 the node-local writable container; the final image is saved only after imports,
 GPU operations and regressions pass. The new fingerprint is recorded after
 actual dependency installation, never as a substitute for installation.
+
+The first aligned build completed installation and four-role GPU imports, but
+pytest exited5 with no tests: the repository excludes `mcore` tests unless
+`--mcore-only` is passed. Both gate commands now select the mcore lane explicitly;
+an empty selection remains an error. The exported candidate is not a validated
+image and is not manually renamed. A new build reuses its installed dependencies,
+runs the corrected tests, and exports to a new immutable filename only on success.
+It also checks native editable imports outside the source tree with PYTHONPATH
+unset, separately from the intentional source-overlay benchmark imports.
