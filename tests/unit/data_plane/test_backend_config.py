@@ -21,6 +21,8 @@ size or with the staging pool off, neither of which fails loudly.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pydantic
 import pytest
 from omegaconf import OmegaConf
@@ -194,65 +196,86 @@ def test_schema_validates_without_any_backend_block() -> None:
     TypeAdapter(DataPlaneConfig).validate_python(_cfg("simple"))
 
 
-def test_simple_storage_units_are_pinned_to_the_resolved_nodes(monkeypatch) -> None:
-    """simple.storage_unit_placement -> one hard node affinity per unit."""
+@pytest.fixture
+def simple_units(monkeypatch) -> list[tuple[dict, tuple, dict]]:
+    """Fake SimpleStorageUnit: records (options, args, kwargs) per unit built.
+
+    Also restores TQ's provider registry after the test, since
+    _pin_simple_storage_units replaces the SimpleStorage provider in it.
+    """
     from transfer_queue.storage import simple_storage
+    from transfer_queue.storage.bootstrap import simple_storage_bootstrap
     from transfer_queue.storage.bootstrap.provider import StorageBootstrapProvider
     from transfer_queue.utils import zmq_utils
 
-    from nemo_rl.data_plane.adapters import transfer_queue as adapter
+    built: list[tuple[dict, tuple, dict]] = []
 
+    def options(**opts):
+        def remote(*args, **kwargs):
+            built.append((opts, args, kwargs))
+            return opts["name"]
+
+        return SimpleNamespace(remote=remote)
+
+    monkeypatch.setattr(simple_storage.SimpleStorageUnit, "options", options)
+    monkeypatch.setattr(
+        simple_storage_bootstrap, "get_placement_group", lambda *a, **k: object()
+    )
+    for module in (simple_storage_bootstrap, zmq_utils):
+        monkeypatch.setattr(module, "process_zmq_server_info", lambda h: dict(h))
     monkeypatch.setitem(
         StorageBootstrapProvider._providers,
         "simplestorage",
         StorageBootstrapProvider.get_provider("SimpleStorage"),
     )
-    placed = []
+    return built
 
-    class _Unit:
-        def __init__(self, options):
-            self.options = options
 
-        def remote(self, **kwargs):
-            placed.append((self.options, kwargs))
-            return self.options["name"]
-
-    monkeypatch.setattr(
-        simple_storage.SimpleStorageUnit, "options", lambda **o: _Unit(o)
-    )
-    monkeypatch.setattr(zmq_utils, "process_zmq_server_info", lambda h: dict(h))
-    monkeypatch.setattr(adapter.tq, "init", lambda *, conf: None)
-
-    cfg = _cfg("simple", simple={"storage_capacity": 9, "num_storage_units": 3})
-    n0, n1 = "a" * 56, "b" * 56  # Ray node IDs are 28-byte hex strings
-    adapter._init_tq(cfg, storage_unit_node_ids=[n0, n1, n0])
-    conf = OmegaConf.create(
+def _simple_conf(units: int, total: int):
+    return OmegaConf.create(
         {
             "backend": {
-                "SimpleStorage": {"num_data_storage_units": 3, "total_storage_size": 9}
+                "storage_backend": "SimpleStorage",
+                "SimpleStorage": {
+                    "num_data_storage_units": units,
+                    "total_storage_size": total,
+                },
             }
         }
     )
+
+
+def test_simple_storage_units_are_pinned_to_the_resolved_nodes(
+    monkeypatch, simple_units
+) -> None:
+    """simple.storage_unit_placement -> one hard node affinity per unit."""
+    from transfer_queue.storage.bootstrap.provider import StorageBootstrapProvider
+
+    from nemo_rl.data_plane.adapters import transfer_queue as adapter
+
+    monkeypatch.setattr(adapter.tq, "init", lambda *, conf: None)
+    cfg = _cfg("simple", simple={"storage_capacity": 9, "num_storage_units": 3})
+    n0, n1 = "a" * 56, "b" * 56  # Ray node IDs are 28-byte hex strings
+    adapter._init_tq(cfg, storage_unit_node_ids=[n0, n1, n0])
+    conf = _simple_conf(3, 9)
     handles = StorageBootstrapProvider.get_provider("SimpleStorage")(conf)
 
     assert list(handles) == [f"TransferQueueStorageUnit#{i}" for i in range(3)]
-    assert [o["scheduling_strategy"].node_id for o, _ in placed] == [n0, n1, n0]
-    assert all(o["scheduling_strategy"].soft is False for o, _ in placed)
-    assert all(kw == {"storage_unit_size": 3} for _, kw in placed)
+    strategies = [opts["scheduling_strategy"] for opts, _, _ in simple_units]
+    assert [s.node_id for s in strategies] == [n0, n1, n0]
+    assert all(s.soft is False for s in strategies)
+    assert all(kw == {"storage_unit_size": 3} for _, _, kw in simple_units)
     assert conf.backend.SimpleStorage.zmq_info == handles
 
 
-def test_pinned_simple_provider_matches_tq_except_placement(monkeypatch) -> None:
+def test_pinned_simple_provider_matches_tq_except_placement(simple_units) -> None:
     """_pin_simple_storage_units copies TQ's initialize_simple_storage.
 
     Run both against the same conf and compare everything but the scheduling
     options, so a TQ bump that changes how units are built fails here. Total
     10 over 3 units also tells ceiling from floor division.
     """
-    from transfer_queue.storage import simple_storage
-    from transfer_queue.storage.bootstrap import simple_storage_bootstrap
     from transfer_queue.storage.bootstrap.provider import StorageBootstrapProvider
-    from transfer_queue.utils import zmq_utils
 
     from nemo_rl.data_plane.adapters import transfer_queue as adapter
 
@@ -261,53 +284,24 @@ def test_pinned_simple_provider_matches_tq_except_placement(monkeypatch) -> None
         "placement_group_bundle_index",
         "scheduling_strategy",
     }
-    calls: list[tuple[dict, tuple, dict]] = []
 
-    class _Unit:
-        def __init__(self, options):
-            self.options = options
+    def without_placement(calls):
+        return [
+            ({k: v for k, v in o.items() if k not in placement_keys}, a, kw)
+            for o, a, kw in calls
+        ]
 
-        def remote(self, *args, **kwargs):
-            options = {k: v for k, v in self.options.items() if k not in placement_keys}
-            calls.append((options, args, kwargs))
-            return self.options["name"]
-
-    monkeypatch.setattr(
-        simple_storage.SimpleStorageUnit, "options", lambda **o: _Unit(o)
-    )
-    monkeypatch.setattr(
-        simple_storage_bootstrap, "get_placement_group", lambda *a, **k: object()
-    )
-    monkeypatch.setattr(
-        simple_storage_bootstrap, "process_zmq_server_info", lambda h: dict(h)
-    )
-    monkeypatch.setattr(zmq_utils, "process_zmq_server_info", lambda h: dict(h))
-    original = StorageBootstrapProvider.get_provider("SimpleStorage")
-    monkeypatch.setitem(StorageBootstrapProvider._providers, "simplestorage", original)
-
-    def conf():
-        return OmegaConf.create(
-            {
-                "backend": {
-                    "storage_backend": "SimpleStorage",
-                    "SimpleStorage": {
-                        "num_data_storage_units": 3,
-                        "total_storage_size": 10,
-                    },
-                }
-            }
-        )
-
-    tq_conf = conf()
-    tq_handles = original(tq_conf)
-    tq_calls, calls[:] = list(calls), []
+    tq_conf = _simple_conf(3, 10)
+    tq_handles = StorageBootstrapProvider.get_provider("SimpleStorage")(tq_conf)
+    tq_calls = without_placement(simple_units)
+    simple_units.clear()
 
     adapter._pin_simple_storage_units(["a" * 56, "b" * 56, "a" * 56])
-    ours_conf = conf()
+    ours_conf = _simple_conf(3, 10)
     ours_handles = StorageBootstrapProvider.get_provider("SimpleStorage")(ours_conf)
 
     assert ours_handles == tq_handles
-    assert calls == tq_calls
+    assert without_placement(simple_units) == tq_calls
     assert ours_conf == tq_conf
 
 

@@ -869,7 +869,8 @@ pressure lands** and **who sits on the save path**.
 ```
 co-located (default, storage_unit_segment_size: 0)
   trainer / controller          each: client + owner (global_segment_size)
-  generation (vLLM, Megatron)   client only (segment 0)
+  generation (vLLM, Megatron)   client only (segment 0), unless a trainer
+                                in the same process attached first
   save calls every trainer process   ← a busy trainer stalls the save
 
 separated (storage_unit_segment_size > 0)

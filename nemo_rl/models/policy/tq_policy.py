@@ -36,7 +36,7 @@ from collections import Counter, defaultdict
 from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Optional
 
 import ray
 
@@ -138,7 +138,7 @@ class TQPolicy(TQDriverMixin, Policy):
         *args: Any,
         dp_cfg: DataPlaneRuntimeConfig,
         checkpointing: bool = False,
-        storage_unit_node_ids: Optional[Sequence[str]] = None,
+        storage_unit_node_ids: Optional[list[str]] = None,
         tq_partition_id: str = "train",
         **kwargs: Any,
     ) -> None:

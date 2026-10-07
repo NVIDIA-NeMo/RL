@@ -1383,9 +1383,12 @@ class _CheckpointManagerMixin:
                 config["global_segment_size"] = 0
         # The optional TQ base is supplied at installation, not at module import.
         cast(Any, super()).__init__(controller_info, config)
-        # Put each write on a segment on the writer's own host first (Mooncake
-        # rotates among that host's segments by key), then on any other. With
-        # storage units on, a writer's puts land on its node's units.
+        # Placement policy for every mooncake_cpu client, set here because this
+        # plugin is installed in every such process and TQ's client does not
+        # read the field from its config (it does read hard_pin). Each write
+        # goes to a segment on the writer's own host first (Mooncake rotates
+        # among that host's segments by key), then to any other; with storage
+        # units on, a writer's puts land on its node's units.
         self.storage_client.replica_config.prefer_alloc_in_same_node = True
         self._checkpoint_workers: list[Any] = []
         self._checkpoint_participant: _CheckpointParticipant | None = None

@@ -27,9 +27,10 @@ that into one Ray node ID per unit, round-robin over those nodes.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, Literal
 
 import ray
 from ray.util.placement_group import placement_group_table
@@ -37,7 +38,7 @@ from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from nemo_rl.data_plane import DataPlaneConfig, build_data_plane_client
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
-from nemo_rl.data_plane.interfaces import backend_config
+from nemo_rl.data_plane.interfaces import backend_config, storage_unit_placement
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.utils.venvs import make_actor_runtime_env
 
@@ -64,7 +65,7 @@ class MooncakeStorageUnit:  # pragma: no cover
 
 
 def select_clusters(
-    placement: Sequence[str] | str,
+    placement: Sequence[str] | Literal["all"],
     clusters_by_name: Mapping[str, RayVirtualCluster],
 ) -> list[RayVirtualCluster]:
     """The clusters ``storage_unit_placement`` names (``"all"``: every one).
@@ -75,7 +76,7 @@ def select_clusters(
     """
     if placement == "all":
         return list(clusters_by_name.values())
-    names = [placement] if isinstance(placement, str) else list(placement)
+    names = list(placement)
     unknown = sorted(set(names) - clusters_by_name.keys())
     if unknown:
         raise ValueError(
@@ -123,23 +124,9 @@ def plan_storage_unit_nodes(
     dp_config: DataPlaneConfig,
     clusters_by_name: Mapping[str, RayVirtualCluster],
 ) -> list[str] | None:
-    """One Ray node ID per storage unit, or None when storage units are off.
-
-    Off unless ``mooncake_cpu.storage_unit_segment_size > 0`` or
-    ``simple.storage_unit_placement`` is set.
-    """
-    backend = dp_config["backend"]
-    if backend == "simple":
-        if "simple" not in dp_config:
-            return None
-        placement = backend_config(dp_config).storage_unit_placement
-        if placement is None:
-            return None
-    elif backend == "mooncake_cpu":
-        if backend_config(dp_config).storage_unit_segment_size == 0:
-            return None
-        placement = backend_config(dp_config).storage_unit_placement
-    else:
+    """One Ray node ID per storage unit, or None when storage units are off."""
+    placement = storage_unit_placement(dp_config)
+    if placement is None:
         return None
     return storage_node_ids(
         select_clusters(placement, clusters_by_name),
@@ -148,7 +135,7 @@ def plan_storage_unit_nodes(
 
 
 def start_storage_units(
-    dp_config: DataPlaneConfig, node_ids: Sequence[str] | None
+    dp_config: DataPlaneConfig, node_ids: list[str] | None
 ) -> tuple[Any, ...]:
     """Start one MooncakeStorageUnit per entry of ``node_ids``.
 
@@ -174,7 +161,9 @@ def start_storage_units(
         )
     except (ray.exceptions.RayError, TimeoutError) as e:
         for unit in units:
-            ray.kill(unit)
+            # One failed kill must not hide the startup error or skip the rest.
+            with contextlib.suppress(Exception):
+                ray.kill(unit)
         raise RuntimeError(
             f"MooncakeStorageUnit startup failed on nodes {sorted(set(node_ids))}: "
             f"{e}. Each unit needs 1 free CPU on its node."

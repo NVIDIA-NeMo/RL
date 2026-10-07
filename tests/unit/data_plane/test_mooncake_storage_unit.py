@@ -34,25 +34,44 @@ def _cluster(*pg_nodes: list[str]) -> SimpleNamespace:
     return SimpleNamespace(get_placement_groups=lambda: pgs)
 
 
+def _use_clusters(monkeypatch, by_name: dict) -> dict:
+    """Serve ``by_name``'s placement groups from a fake placement-group table."""
+    table = {
+        pg.id.hex(): {"bundles_to_node_id": dict(enumerate(pg.id.hex()[3:].split("-")))}
+        for cluster in by_name.values()
+        for pg in cluster.get_placement_groups()
+    }
+    monkeypatch.setattr(msu, "placement_group_table", lambda: table)
+    return by_name
+
+
 @pytest.fixture
 def clusters_by_name(monkeypatch):
-    by_name = {
-        "train": _cluster([N0, N1]),
-        "inference": _cluster([N2], [N3]),
-        "teacher:math": _cluster([N4]),
-    }
+    return _use_clusters(
+        monkeypatch,
+        {
+            "train": _cluster([N0, N1]),
+            "inference": _cluster([N2], [N3]),
+            "teacher:math": _cluster([N4]),
+        },
+    )
 
-    def table():
-        return {
-            pg.id.hex(): {
-                "bundles_to_node_id": dict(enumerate(pg.id.hex()[3:].split("-")))
-            }
-            for cluster in by_name.values()
-            for pg in cluster.get_placement_groups()
-        }
 
-    monkeypatch.setattr(msu, "placement_group_table", table)
-    return by_name
+@pytest.fixture
+def started(monkeypatch) -> list[str]:
+    """Fake MooncakeStorageUnit: records the node each unit is hard-pinned to."""
+    nodes: list[str] = []
+
+    def options(*, runtime_env, scheduling_strategy):
+        assert scheduling_strategy.soft is False
+        unit = SimpleNamespace(__ray_ready__=SimpleNamespace(remote=lambda: None))
+        return SimpleNamespace(
+            remote=lambda cfg: nodes.append(scheduling_strategy.node_id) or unit
+        )
+
+    monkeypatch.setattr(msu, "MooncakeStorageUnit", SimpleNamespace(options=options))
+    monkeypatch.setattr(msu, "make_actor_runtime_env", lambda _cls: {})
+    return nodes
 
 
 @pytest.mark.parametrize(
@@ -79,13 +98,7 @@ def test_unknown_cluster_name_fails_with_the_valid_names(clusters_by_name) -> No
 def test_colocated_names_share_nodes_once_and_warn(monkeypatch, caplog) -> None:
     """Colocated: one cluster under two names; excluding one excludes nothing."""
     shared = _cluster([N0, N1])
-    (pg,) = shared.get_placement_groups()
-    monkeypatch.setattr(
-        msu,
-        "placement_group_table",
-        lambda: {pg.id.hex(): {"bundles_to_node_id": {0: N0, 1: N1}}},
-    )
-    by_name = {"train": shared, "inference": shared}
+    by_name = _use_clusters(monkeypatch, {"train": shared, "inference": shared})
 
     assert msu.storage_node_ids(msu.select_clusters("all", by_name), None) == [
         N0,
@@ -137,20 +150,9 @@ def test_plan_uses_each_backends_count_and_placement(clusters_by_name) -> None:
     ]
 
 
-def test_start_storage_units_hard_pins_one_unit_per_planned_node(monkeypatch) -> None:
-    started = []
-
-    class _Unit:
-        @staticmethod
-        def options(*, runtime_env, scheduling_strategy):
-            assert scheduling_strategy.soft is False
-            return SimpleNamespace(
-                remote=lambda cfg: started.append(scheduling_strategy.node_id)
-                or SimpleNamespace(__ray_ready__=SimpleNamespace(remote=lambda: None))
-            )
-
-    monkeypatch.setattr(msu, "MooncakeStorageUnit", _Unit)
-    monkeypatch.setattr(msu, "make_actor_runtime_env", lambda _cls: {})
+def test_start_storage_units_hard_pins_one_unit_per_planned_node(
+    monkeypatch, started
+) -> None:
     monkeypatch.setattr(msu.ray, "get", lambda refs, timeout: list(refs))
 
     units = msu.start_storage_units({"backend": "mooncake_cpu"}, [N2, N3, N2])
@@ -159,27 +161,14 @@ def test_start_storage_units_hard_pins_one_unit_per_planned_node(monkeypatch) ->
     assert len(units) == 3
 
 
-def test_unit_startup_failure_kills_started_units(monkeypatch) -> None:
+def test_unit_startup_failure_kills_started_units(monkeypatch, started) -> None:
     """A node with no free CPU must fail setup, not hang it."""
     import ray
-
-    killed = []
-    monkeypatch.setattr(
-        msu,
-        "MooncakeStorageUnit",
-        SimpleNamespace(
-            options=lambda **_: SimpleNamespace(
-                remote=lambda cfg: SimpleNamespace(
-                    __ray_ready__=SimpleNamespace(remote=lambda: None)
-                )
-            )
-        ),
-    )
-    monkeypatch.setattr(msu, "make_actor_runtime_env", lambda _cls: {})
 
     def timed_out(refs, timeout):
         raise ray.exceptions.GetTimeoutError("not scheduled")
 
+    killed = []
     monkeypatch.setattr(msu.ray, "get", timed_out)
     monkeypatch.setattr(msu.ray, "kill", killed.append)
 

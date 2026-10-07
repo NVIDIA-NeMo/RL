@@ -15,7 +15,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from nemo_rl.data_plane.interfaces import (
     DataPlaneClient,
@@ -124,7 +124,7 @@ def build_data_plane_client(
     bootstrap: bool = True,
     checkpointing: bool = False,
     segment_size: int | None = None,
-    storage_unit_node_ids: Sequence[str] | None = None,
+    storage_unit_node_ids: list[str] | None = None,
 ) -> DataPlaneClient:
     """Construct the configured data-plane client.
 

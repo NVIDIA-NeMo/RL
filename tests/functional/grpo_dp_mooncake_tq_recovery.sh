@@ -1,5 +1,6 @@
 #!/bin/bash
-# Run native TQ recovery with the Mooncake CPU backend.
+# Run native TQ recovery with the Mooncake CPU backend. Pass mooncake_units to
+# make CPU storage units the only memory owners.
 
 set -eou pipefail
 
@@ -12,4 +13,4 @@ if [[ -z "${MC_MOONCAKE_DEVICE:-}" ]] && ! rdma_device_available; then
     exit 0
 fi
 
-exec bash "$SCRIPT_DIR/grpo_dp_single_controller_tq_recovery.sh" mooncake_cpu
+exec bash "$SCRIPT_DIR/grpo_dp_single_controller_tq_recovery.sh" "${1:-mooncake_cpu}"

@@ -191,6 +191,22 @@ def backend_config(cfg: DataPlaneConfig) -> Any:
     return _BACKEND_MODELS[backend].model_validate(nested)
 
 
+def storage_unit_placement(cfg: DataPlaneConfig) -> list[str] | Literal["all"] | None:
+    """Where this config's storage units go, or None when they are off.
+
+    ``mooncake_cpu``: on when ``storage_unit_segment_size > 0``. ``simple``: on
+    when ``simple.storage_unit_placement`` is set.
+    """
+    backend = cfg["backend"]
+    if backend == "mooncake_cpu":
+        block = backend_config(cfg)
+        return block.storage_unit_placement if block.storage_unit_segment_size else None
+    # An absent simple block cannot validate: num_storage_units has no default.
+    if backend == "simple" and "simple" in cfg:
+        return backend_config(cfg).storage_unit_placement
+    return None
+
+
 class ObservabilityConfig(TypedDict):
     """Optional middleware that records per-op metrics on the client.
 

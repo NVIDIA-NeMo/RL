@@ -37,7 +37,7 @@ import threading
 import time
 import warnings
 import weakref
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from importlib import resources
 from pathlib import Path
 from typing import Any, cast
@@ -57,6 +57,7 @@ from nemo_rl.data_plane.interfaces import (
     KVBatchMeta,
     backend_config,
     data_plane_supports_checkpointing,
+    storage_unit_placement,
 )
 from nemo_rl.distributed.virtual_cluster import _reserve_data_plane_ports
 
@@ -279,8 +280,8 @@ class _StagingPoolRegistry:
                 default_timeout=_STAGING_SLOT_TIMEOUT_S,
             ),
             client._store,
-            # BufferPool's own ceiling: max(max_bytes, local buffer).
-            max(pool_bytes, client.local_buffer_size),
+            # BufferPool's ceiling, max(max_bytes, local buffer), checked above.
+            client.local_buffer_size,
         )
 
     def pool_for(self, client: Any) -> _NativeStagingPool:
@@ -813,7 +814,7 @@ def _init_tq(
     cfg: DataPlaneConfig,
     *,
     checkpointing: bool = False,
-    storage_unit_node_ids: Sequence[str] | None = None,
+    storage_unit_node_ids: list[str] | None = None,
 ) -> None:
     """Driver-process path: bootstrap the TQ controller for the chosen backend.
 
@@ -828,13 +829,8 @@ def _init_tq(
     base = OmegaConf.load(str(resources.files("transfer_queue") / "config.yaml"))
 
     backend = cfg["backend"]
-    if storage_unit_node_ids is None:
-        if backend == "mooncake_cpu":
-            units_on = backend_config(cfg).storage_unit_segment_size > 0
-        else:
-            units_on = backend_config(cfg).storage_unit_placement is not None
-        if units_on:
-            raise ValueError(_STORAGE_UNITS_SC_ONLY)
+    if storage_unit_node_ids is None and storage_unit_placement(cfg) is not None:
+        raise ValueError(_STORAGE_UNITS_SC_ONLY)
 
     # polling_mode=True: controller returns empty BatchMeta instead of raising
     # TimeoutError when no samples are ready yet. The client-side blocking
@@ -858,7 +854,7 @@ def _init_tq(
             },
         }
         if storage_unit_node_ids is not None:
-            _pin_simple_storage_units(list(storage_unit_node_ids))
+            _pin_simple_storage_units(storage_unit_node_ids)
     elif backend == "mooncake_cpu":
         # The mooncake-transfer-engine wheel ships `mooncake_master` at
         # <site-packages>/mooncake/, NOT on $PATH. TQ's
@@ -1034,7 +1030,7 @@ class TQDataPlaneClient(DataPlaneClient):
         bootstrap: bool = True,
         checkpointing: bool = False,
         segment_size: int | None = None,
-        storage_unit_node_ids: Sequence[str] | None = None,
+        storage_unit_node_ids: list[str] | None = None,
     ) -> None:
         """Construct a TQ-backed client.
 
