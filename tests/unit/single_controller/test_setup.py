@@ -3093,7 +3093,7 @@ def _make_gym_megatron_capture_config() -> MasterConfig:
     mc.policy["generation"]["stop_strings"] = None
     mc.policy["generation"]["stop_token_ids"] = None
     mc.policy["generation"]["top_k"] = None
-    mc.logger = {**mc.logger, "log_dir": "/tmp/test-megatron-token-capture-mm"}
+    mc.logger.log_dir = "/tmp/test-megatron-token-capture-mm"
     mc.token_capture.enabled = True
     return mc
 
