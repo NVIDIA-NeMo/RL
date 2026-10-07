@@ -120,6 +120,8 @@ loss_fn:
   # VAPO positive-example NLL loss weight: L = L_PPO + mu * L_NLL(correct samples).
   # 0.0 disables it. VAPO paper recommends 0.1.
   positive_example_nll_weight: 0.0
+  metrics_level: "full"
+  enable_torch_compile: false
 
 checkpointing:
   enabled: true
@@ -545,14 +547,20 @@ logger:
     project: "grpo-dev"
     name: "grpo-dev-logger"
     log_nemo_gym_full_result_tables: false
+    entity: null
+    id: null
+    resume: null
   swanlab:
     project: "grpo-dev"
     name: "grpo-dev-logger"
-  tensorboard: {}
+  tensorboard:
+    log_dir: null
   mlflow:
     experiment_name: "grpo-dev"
     run_name: "grpo-dev-logger"
     tracking_uri: "http://localhost:5000"
+    run_id: null
+    artifact_location: null
   gpu_monitoring:
     collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)

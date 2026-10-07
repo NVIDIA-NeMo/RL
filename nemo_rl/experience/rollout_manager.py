@@ -96,6 +96,7 @@ from nemo_rl.telemetry.instrumentation import (
     dispatch_with_trace_context,
     in_per_prompt_scope,
 )
+from nemo_rl.utils.rpc_guard import assert_metadata_only
 from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
@@ -2366,10 +2367,6 @@ class RolloutManager:
                 mask_sample=tuple(mask_sample),
                 loss_multiplier=float(input_sample.get("loss_multiplier", 1.0)),
             )
-            from nemo_rl.experience.rollout_reassembler_actor import (
-                assert_metadata_only,
-            )
-
             assert_metadata_only(request)
             return request
         except BaseException:

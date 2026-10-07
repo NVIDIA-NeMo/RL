@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import builtins
+import typing
 from dataclasses import fields, replace
 from typing import Any
 from unittest.mock import MagicMock, call, patch
@@ -30,13 +31,13 @@ from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.distributed.actor_environments import ACTOR_ENVIRONMENTS
 from nemo_rl.experience.rollout_reassembler import FinalizedGroup
 from nemo_rl.experience.rollout_reassembler_actor import (
-    _FORBIDDEN_RPC_KEYS,
     ReassemblyRequest,
     RolloutReassemblerActor,
     RolloutReassemblerActorConfig,
     assert_metadata_only,
     create_rollout_reassembler_actors,
 )
+from nemo_rl.utils.rpc_guard import FORBIDDEN_RPC_KEYS
 
 
 def _request() -> ReassemblyRequest:
@@ -175,9 +176,9 @@ def test_rpc_dataclass_fields_are_classified() -> None:
     """A new field on either RPC dataclass must be a deliberate choice.
 
     assert_metadata_only cannot tell a heavy list[int] of token ids from a short
-    list of metadata, so _FORBIDDEN_RPC_KEYS is maintained by hand. Pinning the
-    inventory makes a new field fail here until someone decides whether it is
-    light enough to cross the wire.
+    list of metadata, so FORBIDDEN_RPC_KEYS only covers names it knows. Pinning
+    the inventory makes a new field fail here until someone decides whether it
+    is light enough to cross the wire.
     """
     assert {f.name for f in fields(ReassemblyRequest)} == {
         "group_id",
@@ -204,11 +205,32 @@ def test_rpc_dataclass_fields_are_classified() -> None:
     }
 
 
-@pytest.mark.parametrize("key", sorted(_FORBIDDEN_RPC_KEYS))
+@pytest.mark.parametrize("key", sorted(FORBIDDEN_RPC_KEYS))
 def test_every_forbidden_key_is_rejected(key) -> None:
     """Removing an entry from the denylist should fail loudly."""
     with pytest.raises(TypeError, match="forbidden heavy field"):
         assert_metadata_only({key: [1, 2, 3]})
+
+
+@pytest.mark.nemo_gym
+def test_forbidden_keys_cover_gym_staging_fields() -> None:
+    """Gym owns these names, so the guard has to track them from outside.
+
+    ``generation_log_probs_delta`` is Gym's spelling and is the one staging
+    name the guard still has to write out by hand, because the driver does not
+    install ``nemo_gym``. Imported in the body rather than at module scope so
+    the default lane can collect this file without the extra; the
+    ``--nemo-gym-only`` conftest raises when Gym is missing, so here it fails
+    rather than skipping.
+    """
+    from nemo_gym.token_id_capture.staging.records import StagedCallBaseSnapshot
+
+    per_token = {
+        name
+        for name, info in StagedCallBaseSnapshot.model_fields.items()
+        if typing.get_origin(info.annotation) is list
+    }
+    assert per_token and per_token <= FORBIDDEN_RPC_KEYS
 
 
 @pytest.mark.parametrize(

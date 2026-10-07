@@ -1537,8 +1537,8 @@ class AsyncTrajectoryCollector:
                 generation_config=generation_config,
                 num_generations=num_generations,
                 log_full_result_tables=should_log_nemo_gym_full_result_tables(
-                    wandb_enabled=self.master_config.logger["wandb_enabled"],
-                    wandb_config=self.master_config.logger["wandb"],
+                    wandb_enabled=self.master_config.logger.wandb_enabled,
+                    wandb_config=self.master_config.logger.wandb,
                 ),
                 max_rollout_turns=None,
                 greedy=False,
