@@ -203,6 +203,7 @@ def test_build_nemo_gym_config_splits_nemo_rl_keys(detected_uv_dirs):
         model_name="test-model",
         enable_router_replay=False,
         use_fastokens=False,
+        turn_checkpointing_enabled=False,
     )
 
     assert cfg["model_name"] == "test-model"
@@ -239,6 +240,7 @@ def test_build_nemo_gym_config_uv_dirs(detected_uv_dirs, configured, expected):
         model_name="test-model",
         enable_router_replay=False,
         use_fastokens=False,
+        turn_checkpointing_enabled=False,
     )
     global_config = cfg["initial_global_config_dict"]
     assert (global_config["uv_cache_dir"], global_config["uv_venv_dir"]) == expected
@@ -251,6 +253,7 @@ def test_build_nemo_gym_config_moves_port_range_to_actor_fields(detected_uv_dirs
         model_name="test-model",
         enable_router_replay=False,
         use_fastokens=False,
+        turn_checkpointing_enabled=False,
     )
 
     assert (cfg["port_range_low"], cfg["port_range_high"]) == (6000, 6999)
@@ -265,6 +268,7 @@ def test_build_nemo_gym_config_router_replay_off_uses_default_dtype(detected_uv_
         model_name="test-model",
         enable_router_replay=False,
         use_fastokens=False,
+        turn_checkpointing_enabled=False,
     )
     assert cfg["require_routed_experts"] is False
     assert cfg["routed_experts_dtype"] == "int16"
@@ -282,6 +286,7 @@ def test_build_nemo_gym_config_router_replay_resolves_dtype(detected_uv_dirs):
             model_name="test-model",
             enable_router_replay=True,
             use_fastokens=False,
+            turn_checkpointing_enabled=False,
         )
 
     mock_resolve.assert_called_once_with("test-model")
@@ -317,6 +322,7 @@ def test_an_unsharded_job_gets_the_registry_runtime_env(
             tokenizer=_TOKENIZER,
             enable_router_replay=False,
             use_fastokens=True,
+            turn_checkpointing_enabled=False,
             token_capture=token_capture,
         )
 
@@ -339,7 +345,12 @@ def test_an_unsharded_job_gets_the_registry_runtime_env(
     assert cfg["use_fastokens"] is True
     # The ledger config must ride through to the actor; a refactor of this
     # wrapper once dropped it without any type or test catching it.
-    assert cfg["token_capture"] == token_capture
+    assert cfg["token_capture"] == {
+        **token_capture,
+        "capture_dir": "/tmp/cap/gym-instances/nemo_gym/replica-0",
+    }
+    assert token_capture == {"enabled": True, "capture_dir": "/tmp/cap"}
+    assert cfg["checkpoint_instance"].instance_id == "nemo_gym/replica-0"
 
     # Spinup is deferred from __init__, so the factory must await it. The
     # tokenizer install has to follow it, not race it.
@@ -381,6 +392,7 @@ def test_spinup_nemo_gym_actor_cleans_up_after_startup_failure(
                 tokenizer=MagicMock(),
                 enable_router_replay=False,
                 use_fastokens=False,
+                turn_checkpointing_enabled=False,
             )
 
     shutdown.assert_called_once()
@@ -426,6 +438,7 @@ def test_spinup_nemo_gym_actor_preserves_startup_error_when_cleanup_fails(
                 tokenizer=MagicMock(),
                 enable_router_replay=False,
                 use_fastokens=False,
+                turn_checkpointing_enabled=False,
             )
 
     assert exc_info.value is startup_error
@@ -605,6 +618,7 @@ class _FakeGymCluster:
         spinup_timeouts=None,
         wedged_spinups=None,
         tokenizer_timeouts=None,
+        checkpoint_failures=None,
         pg_ready_error=None,
     ):
         self.entries_by_index = entries_by_index or {}
@@ -612,6 +626,7 @@ class _FakeGymCluster:
         self.spinup_timeouts = set(spinup_timeouts or ())
         self.wedged_spinups = set(wedged_spinups or ())
         self.tokenizer_timeouts = set(tokenizer_timeouts or ())
+        self.checkpoint_failures = checkpoint_failures or {}
         self.timed_out_spinups = set()
         self.pg_ready_error = pg_ready_error
         self.actors = []
@@ -647,6 +662,10 @@ class _FakeGymCluster:
                 actor = MagicMock(name=f"gym-actor-{index}")
                 actor._spinup.remote.return_value = ("spinup", index)
                 actor.set_tokenizer.remote.return_value = ("tokenizer", index)
+                actor.initialize_checkpoint_adapter.remote.return_value = (
+                    "checkpoint",
+                    index,
+                )
                 actor.list_entries.remote.return_value = ("entries", index)
                 self.actors.append(actor)
                 self.actor_options.append(option_kwargs)
@@ -683,6 +702,10 @@ class _FakeGymCluster:
         if kind == "tokenizer":
             if index in self.tokenizer_timeouts and timeout is not None:
                 raise TimeoutError("startup budget expired")
+            return None
+        if kind == "checkpoint":
+            if index in self.checkpoint_failures:
+                raise self.checkpoint_failures[index]
             return None
         return self.entries_by_index.get(index, {})
 
@@ -740,6 +763,7 @@ def test_build_nemo_gym_actors_unsharded_makes_exactly_one_actor(detected_uv_dir
             tokenizer=_TOKENIZER,
             enable_router_replay=False,
             use_fastokens=False,
+            turn_checkpointing_enabled=False,
         )
 
     assert not shard_set.is_sharded
@@ -750,6 +774,58 @@ def test_build_nemo_gym_actors_unsharded_makes_exactly_one_actor(detected_uv_dir
         cluster.actor_options[0]["scheduling_strategy"],
         nemo_gym_mod.NodeAffinitySchedulingStrategy,
     )
+
+
+def test_unsharded_checkpointing_discovers_the_actor_at_startup(detected_uv_dirs):
+    cluster = _FakeGymCluster()
+    token_capture = {
+        "enabled": True,
+        "capture_dir": "/capture",
+        "control_auth_token": "secret",
+    }
+
+    with _patched_cluster(cluster):
+        shard_set = nemo_gym_mod.build_nemo_gym_actors(
+            _env_configs(),
+            base_urls=["http://vllm-0"],
+            model_name="test-model",
+            tokenizer=_TOKENIZER,
+            enable_router_replay=False,
+            use_fastokens=False,
+            turn_checkpointing_enabled=True,
+            token_capture=token_capture,
+        )
+
+    actor = shard_set.sole_handle()
+    actor.initialize_checkpoint_adapter.remote.assert_called_once_with()
+    config = cluster.actor_configs[0]
+    assert config["checkpoint_instance"].instance_id == "nemo_gym/replica-0"
+    assert config["token_capture"]["capture_dir"] == (
+        "/capture/gym-instances/nemo_gym/replica-0"
+    )
+    assert config["initial_global_config_dict"]["checkpoint"] == {
+        "enabled": True,
+        "control_auth_token": "secret",
+    }
+    assert (
+        config["initial_global_config_dict"]["policy_model"]["responses_api_models"][
+            "vllm_model"
+        ]["checkpoint_policy"]
+        is True
+    )
+    assert token_capture["capture_dir"] == "/capture"
+
+
+def test_checkpointing_requires_token_capture(detected_uv_dirs):
+    with pytest.raises(ValueError, match="requires token capture"):
+        build_nemo_gym_config(
+            _env_configs(),
+            base_urls=["http://vllm-0"],
+            model_name="test-model",
+            enable_router_replay=False,
+            use_fastokens=False,
+            turn_checkpointing_enabled=True,
+        )
 
 
 def test_build_nemo_gym_actors_spreads_every_replica_onto_its_own_node(
@@ -770,6 +846,7 @@ def test_build_nemo_gym_actors_spreads_every_replica_onto_its_own_node(
             tokenizer=_TOKENIZER,
             enable_router_replay=False,
             use_fastokens=False,
+            turn_checkpointing_enabled=False,
         )
 
     # Two shards, one with replicas: 2, so three actors on three nodes.
@@ -803,6 +880,7 @@ def test_shards_get_their_own_config_paths_and_log_directories(detected_uv_dirs)
             tokenizer=_TOKENIZER,
             enable_router_replay=False,
             use_fastokens=False,
+            turn_checkpointing_enabled=False,
         )
 
     gym_configs = [
@@ -826,6 +904,72 @@ def test_shards_get_their_own_config_paths_and_log_directories(detected_uv_dirs)
         assert "allowed_duplicate_entries" not in config
 
 
+def test_shards_get_stable_isolated_checkpoint_namespaces(detected_uv_dirs):
+    cluster = _FakeGymCluster()
+    token_capture = {
+        "enabled": True,
+        "capture_dir": "/capture",
+        "control_auth_token": "secret",
+    }
+
+    with _patched_cluster(cluster):
+        nemo_gym_mod.build_nemo_gym_actors(
+            _shard_env_configs(),
+            base_urls=["http://vllm-0"],
+            model_name="test-model",
+            tokenizer=_TOKENIZER,
+            enable_router_replay=False,
+            use_fastokens=False,
+            turn_checkpointing_enabled=True,
+            token_capture=token_capture,
+        )
+
+    assert [
+        config["checkpoint_instance"].instance_id for config in cluster.actor_configs
+    ] == ["judged/replica-0", "tools/replica-0", "tools/replica-1"]
+    assert [
+        config["token_capture"]["capture_dir"] for config in cluster.actor_configs
+    ] == [
+        "/capture/gym-instances/judged/replica-0",
+        "/capture/gym-instances/tools/replica-0",
+        "/capture/gym-instances/tools/replica-1",
+    ]
+    for actor in cluster.actors:
+        actor.initialize_checkpoint_adapter.remote.assert_called_once_with()
+
+
+def test_checkpoint_discovery_failure_tears_down_every_shard(detected_uv_dirs):
+    cluster = _FakeGymCluster(
+        checkpoint_failures={1: RuntimeError("participant unavailable")}
+    )
+    token_capture = {
+        "enabled": True,
+        "capture_dir": "/capture",
+        "control_auth_token": "secret",
+    }
+
+    with (
+        _patched_cluster(cluster),
+        pytest.raises(
+            nemo_gym_mod.ShardSetupError,
+            match="tools.*replica 0.*participant unavailable",
+        ),
+    ):
+        nemo_gym_mod.build_nemo_gym_actors(
+            _shard_env_configs(),
+            base_urls=["http://vllm-0"],
+            model_name="test-model",
+            tokenizer=_TOKENIZER,
+            enable_router_replay=False,
+            use_fastokens=False,
+            turn_checkpointing_enabled=True,
+            token_capture=token_capture,
+        )
+
+    cluster.shutdown_environments.assert_called_once()
+    assert len(cluster.removed_placement_groups) == 1
+
+
 def test_every_replica_gets_the_tokenizer_installed(detected_uv_dirs):
     """A replica missing the tokenizer fails on its first rollout, not at setup.
 
@@ -842,6 +986,7 @@ def test_every_replica_gets_the_tokenizer_installed(detected_uv_dirs):
             tokenizer=_TOKENIZER,
             enable_router_replay=False,
             use_fastokens=False,
+            turn_checkpointing_enabled=False,
         )
 
     assert len(cluster.actors) == 3
@@ -866,6 +1011,7 @@ def test_actor_cpus_override_sizes_that_shards_bundle(detected_uv_dirs):
             tokenizer=_TOKENIZER,
             enable_router_replay=False,
             use_fastokens=False,
+            turn_checkpointing_enabled=False,
         )
 
     (pg_kwargs,) = cluster.placement_group_calls
@@ -937,6 +1083,7 @@ def test_a_shard_that_fails_to_start_names_itself_and_tears_everything_down(
                 tokenizer=_TOKENIZER,
                 enable_router_replay=False,
                 use_fastokens=False,
+                turn_checkpointing_enabled=False,
             )
 
     # Gym names the offending entry; we add the shard it belongs to.
@@ -960,6 +1107,7 @@ def test_unsharded_startup_failure_tears_down_the_actor(detected_uv_dirs):
                 tokenizer=_TOKENIZER,
                 enable_router_replay=False,
                 use_fastokens=False,
+                turn_checkpointing_enabled=False,
             )
 
     cluster.shutdown_environments.assert_called_once()
@@ -979,6 +1127,7 @@ def test_timed_out_shard_startup_is_drained_before_teardown(detected_uv_dirs):
                 tokenizer=_TOKENIZER,
                 enable_router_replay=False,
                 use_fastokens=False,
+                turn_checkpointing_enabled=False,
             )
 
     spinup_zero_calls = [
@@ -1007,6 +1156,7 @@ def test_wedged_shard_startup_cannot_block_forced_teardown(detected_uv_dirs):
                 tokenizer=_TOKENIZER,
                 enable_router_replay=False,
                 use_fastokens=False,
+                turn_checkpointing_enabled=False,
             )
 
     cluster.shutdown_environments.assert_called_once()
@@ -1035,6 +1185,7 @@ def test_tokenizer_timeout_reports_exhausted_shared_startup_budget(
                 tokenizer=_TOKENIZER,
                 enable_router_replay=False,
                 use_fastokens=False,
+                turn_checkpointing_enabled=False,
                 spinup_timeout=1.0,
             )
 
@@ -1053,6 +1204,7 @@ def test_unplaceable_bundles_fail_fast_and_release_the_group(detected_uv_dirs):
                 tokenizer=_TOKENIZER,
                 enable_router_replay=False,
                 use_fastokens=False,
+                turn_checkpointing_enabled=False,
             )
 
     assert cluster.actors == []
@@ -1076,6 +1228,7 @@ def test_duplicate_agent_across_shards_tears_the_set_down(detected_uv_dirs):
                 tokenizer=_TOKENIZER,
                 enable_router_replay=False,
                 use_fastokens=False,
+                turn_checkpointing_enabled=False,
             )
 
     cluster.shutdown_environments.assert_called_once()
@@ -1110,6 +1263,24 @@ def test_a_replicated_shard_labels_each_instance_apart():
     assert shard_set.instance_label(second) == "tools/1"
     with pytest.raises(nemo_gym_mod.ShardSetupError, match="does not belong"):
         shard_set.instance_label(MagicMock())
+
+
+def test_checkpoint_instance_identity_round_trips_to_the_same_replica():
+    first, second = MagicMock(), MagicMock()
+    shard_set = nemo_gym_mod.NemoGymShardSet(handles={"tools": [first, second]})
+
+    assert shard_set.checkpoint_instance_for_handle(first).instance_id == (
+        "tools/replica-0"
+    )
+    assert shard_set.checkpoint_instance_for_handle(second).instance_id == (
+        "tools/replica-1"
+    )
+    assert shard_set.handle_for_checkpoint_instance("tools/replica-0") is first
+    assert shard_set.handle_for_checkpoint_instance("tools/replica-1") is second
+    assert shard_set.checkpoint_handles == {
+        "tools/replica-0": first,
+        "tools/replica-1": second,
+    }
 
 
 def test_an_unreplicated_shard_is_labelled_by_its_name_alone():

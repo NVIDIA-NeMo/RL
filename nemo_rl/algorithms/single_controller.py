@@ -54,8 +54,8 @@ import time
 import uuid
 import warnings
 from collections import deque
-from collections.abc import Iterator
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Iterator
+from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 from typing import (
@@ -68,6 +68,7 @@ from typing import (
     cast,
 )
 
+import numpy as np
 import ray
 import torch
 from ray.exceptions import RayActorError
@@ -160,14 +161,30 @@ from nemo_rl.data_plane.schema import (
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lost
-from nemo_rl.environments.nemo_gym import should_use_nemo_gym
+from nemo_rl.environments.gym_checkpoint_adapter import GymCheckpointEpisode
+from nemo_rl.environments.gym_checkpoint_coordinator import (
+    GYM_CHECKPOINT_MANIFEST_FILENAME,
+    GymCheckpointCommitResult,
+    GymCheckpointCoordinator,
+    load_gym_checkpoint_manifest,
+    staging_keys_of,
+    write_gym_checkpoint_manifest,
+)
+from nemo_rl.environments.nemo_gym import (
+    as_nemo_gym_shard_set,
+    should_use_nemo_gym,
+)
 from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.payload import VIOLATION_TAG_KEYS
-from nemo_rl.experience.rollout_manager import RolloutOutcome
+from nemo_rl.experience.rollout_manager import (
+    RolloutDispatchAdmissionGate,
+    RolloutOutcome,
+)
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
     PromptGroupPhase,
+    RecoveryTargetLevel,
     RolloutRecoveryState,
     build_rollout_recovery_state,
     parse_rollout_recovery_state,
@@ -243,6 +260,20 @@ class _RolloutCheckpointCut:
     rolled_back_train_group_count: int
     mutation_version: int
     tq_save_seconds: float
+
+
+def _write_training_info(
+    checkpoint_path: PathLike, training_info: dict[str, Any]
+) -> None:
+    """Atomically refresh training metadata after the final checkpoint cut."""
+    serializable = dict(training_info)
+    for key, value in serializable.items():
+        if isinstance(value, (torch.Tensor, np.ndarray)):
+            serializable[key] = value.item()
+    path = Path(checkpoint_path) / "training_info.json"
+    tmp_path = path.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(serializable))
+    os.replace(tmp_path, path)
 
 
 def _latest_generation_values(
@@ -489,6 +520,19 @@ class SingleControllerActor:
         # exists to remove. A missing field should break loudly at construction, where
         # it costs five minutes, not quietly at hour three of a run.
         self._env_handles = actor_args.env_handles
+        self._gym_checkpoint_coordinator: Optional[GymCheckpointCoordinator] = None
+        self._rollout_dispatch_admission_gate: Optional[
+            RolloutDispatchAdmissionGate
+        ] = None
+        if self._master_config.rollout_recovery.turn_checkpointing_enabled:
+            self._gym_checkpoint_coordinator = GymCheckpointCoordinator(
+                as_nemo_gym_shard_set(self._env_handles["nemo_gym"]),
+                control_timeout_s=(self._master_config.token_capture.control_timeout_s),
+            )
+            self._rollout_dispatch_admission_gate = RolloutDispatchAdmissionGate()
+            self._rollout_manager.set_rollout_dispatch_admission_gate(
+                self._rollout_dispatch_admission_gate
+            )
         # These two keep the getattr for a genuinely different reason: None is a
         # meaningful value meaning "feature off", and it is also their default. Absence
         # therefore degrades to the documented off state rather than to a broken one.
@@ -1087,12 +1131,9 @@ class SingleControllerActor:
                 "TQ checkpoint metadata"
             )
         expected_schema_version = metadata.get("rollout_recovery_schema_version")
-        if (
-            isinstance(expected_schema_version, bool)
-            or expected_schema_version != ROLLOUT_RECOVERY_SCHEMA_VERSION
-        ):
+        if expected_schema_version != ROLLOUT_RECOVERY_SCHEMA_VERSION:
             raise ValueError(
-                "native TQ checkpoint rollout recovery schema mismatch: "
+                "native TQ checkpoint has an unsupported rollout recovery schema: "
                 f"checkpoint={expected_schema_version!r}, "
                 f"expected={ROLLOUT_RECOVERY_SCHEMA_VERSION}"
             )
@@ -1126,6 +1167,12 @@ class SingleControllerActor:
             weights_only=True,
         )
         parsed_state = parse_rollout_recovery_state(state)
+        if parsed_state.ledger_state["schema_version"] != expected_schema_version:
+            raise ValueError(
+                "rollout recovery sidecar schema does not match native TQ "
+                f"metadata: sidecar={parsed_state.ledger_state['schema_version']!r}, "
+                f"metadata={expected_schema_version!r}"
+            )
         if len(parsed_state.ledger_state["groups"]) != expected_group_count:
             raise ValueError(
                 "rollout recovery sidecar group count does not match native "
@@ -1137,22 +1184,115 @@ class SingleControllerActor:
             "recovery_restore"
         ) as cut:
             recovery_ledger.load_state_dict(cut, parsed_state.ledger_state)
-            recovery_ledger.prepare_for_restart(cut)
-            self._batch_shortfall = parsed_state.batch_shortfall
-            canonical_state = self._buffer.metadata_state_dict(
-                saved_capacity=self._async_cfg.max_buffered_rollouts
-            )
-            canonical_group_ids = {
-                group["group_id"] for group in canonical_state["groups"]
-            }
-            recovery_ledger.discard_canonical_groups(cut, canonical_group_ids)
-            if self._master_config.token_capture.enabled:
-                await self._validate_rollout_recovery_inventory(
+            turn_groups = [
+                group
+                for group in recovery_ledger.groups()
+                if group.restore_level is RecoveryTargetLevel.TURN
+            ]
+            restore_id: Optional[str] = None
+            restore_coordinator: Optional[GymCheckpointCoordinator] = None
+            restore_manifest = None
+            gym_restore_completed = False
+            restored_gym_episodes: set[tuple[str, str, int]] = set()
+            restored_gym_staging_keys: set[str] = set()
+            try:
+                if turn_groups:
+                    coordinator = self._gym_checkpoint_coordinator
+                    if coordinator is None:
+                        raise RuntimeError(
+                            "rollout checkpoint contains turn-level Gym state, but "
+                            "Gym checkpoint coordination is disabled"
+                        )
+                    manifest_path = (
+                        Path(self._last_checkpoint_path)
+                        / GYM_CHECKPOINT_MANIFEST_FILENAME
+                    )
+                    if not manifest_path.is_file():
+                        raise FileNotFoundError(
+                            "turn-level rollout recovery requires the matching Gym "
+                            f"manifest at {manifest_path}"
+                        )
+                    manifest = await asyncio.to_thread(
+                        load_gym_checkpoint_manifest,
+                        self._last_checkpoint_path,
+                    )
+                    expected_raw_inventory = recovery_ledger.gym_checkpoint_inventory(
+                        coordinator.instance_ids
+                    )
+                    expected_inventory = {
+                        instance_id: tuple(
+                            GymCheckpointEpisode(rollout_id, attempt)
+                            for rollout_id, attempt in episodes
+                        )
+                        for instance_id, episodes in expected_raw_inventory.items()
+                    }
+                    if manifest.instances != expected_inventory:
+                        raise ValueError(
+                            "Gym checkpoint manifest does not match the rollout "
+                            "recovery ledger"
+                        )
+                    restore_id = f"restore-{uuid.uuid4().hex}"
+                    restore_coordinator = coordinator
+                    restore_manifest = manifest
+                    await coordinator.restore(
+                        restore_id,
+                        self._last_checkpoint_path,
+                        manifest,
+                    )
+                    gym_restore_completed = True
+                    restored_gym_episodes = {
+                        (instance_id, episode.rollout_id, episode.attempt)
+                        for instance_id, episodes in manifest.instances.items()
+                        for episode in episodes
+                    }
+                    restored_gym_staging_keys = {
+                        key for keys in manifest.staging_keys.values() for key in keys
+                    }
+
+                recovery_ledger.prepare_for_restart(
                     cut,
-                    replay_metadata=canonical_state,
-                    clear_unreferenced=True,
+                    restored_gym_episodes=restored_gym_episodes,
                 )
-            await self._rehydrate_rollout_recovery_prompts(cut)
+                self._batch_shortfall = parsed_state.batch_shortfall
+                canonical_state = self._buffer.metadata_state_dict(
+                    saved_capacity=self._async_cfg.max_buffered_rollouts
+                )
+                canonical_group_ids = {
+                    group["group_id"] for group in canonical_state["groups"]
+                }
+                recovery_ledger.discard_canonical_groups(cut, canonical_group_ids)
+                if self._master_config.token_capture.enabled:
+                    await self._validate_rollout_recovery_inventory(
+                        cut,
+                        replay_metadata=canonical_state,
+                        clear_unreferenced=True,
+                        additional_expected_staging_keys=restored_gym_staging_keys,
+                    )
+                await self._rehydrate_rollout_recovery_prompts(cut)
+            except BaseException as error:
+                if restore_id is not None and restore_coordinator is not None:
+                    if gym_restore_completed and restore_manifest is not None:
+                        try:
+                            await restore_coordinator.retire_restored(
+                                restore_id,
+                                restore_manifest,
+                            )
+                        except Exception as retire_error:
+                            error.add_note(
+                                "Gym retire of restored attempts also failed: "
+                                f"{type(retire_error).__name__}: {retire_error}"
+                            )
+                    try:
+                        await restore_coordinator.resume(restore_id)
+                    except Exception as resume_error:
+                        error.add_note(
+                            "Gym restore cleanup also failed: "
+                            f"{type(resume_error).__name__}: {resume_error}"
+                        )
+                raise
+            else:
+                if restore_id is not None and restore_coordinator is not None:
+                    await restore_coordinator.resume(restore_id)
         self._sampler_stamps_target_steps = (
             parsed_state.sampler_stamps_target_steps
             if parsed_state.sampler_stamps_target_steps is not None
@@ -1489,10 +1629,12 @@ class SingleControllerActor:
         *,
         replay_metadata: Optional[TQReplayMetadataState],
         clear_unreferenced: bool,
+        additional_expected_staging_keys: Optional[set[str]] = None,
     ) -> int:
         """Validate staging ownership while the caller holds a stable cut."""
         cut.require_live()
         expected_staging_keys = self._rollout_recovery_ledger.expected_staging_keys()
+        expected_staging_keys.update(additional_expected_staging_keys or ())
         if replay_metadata is not None:
             for group in replay_metadata["groups"]:
                 for tag in group["meta"].tags or []:
@@ -4189,6 +4331,247 @@ class SingleControllerActor:
             tq_save_seconds=tq_save_seconds,
         )
 
+    async def _capture_coordinated_rollout_checkpoint_cut(
+        self,
+        cut: DataPlaneMutationCut,
+        checkpoint_path: PathLike,
+        *,
+        gym_commit: GymCheckpointCommitResult | None,
+    ) -> _RolloutCheckpointCut:
+        """Validate the prepared Gym cut, then capture matching TQ state."""
+        if gym_commit is not None:
+            await self._validate_gym_checkpoint_cut(
+                cut, gym_commit, checkpoint_path=checkpoint_path
+            )
+        return await self._capture_rollout_checkpoint_cut(cut, checkpoint_path)
+
+    def _gym_checkpoint_inventory(
+        self, coordinator: GymCheckpointCoordinator
+    ) -> dict[str, tuple[GymCheckpointEpisode, ...]]:
+        """Return Gym-owned episode attempts using the coordinator wire type."""
+        raw_inventory = self._rollout_recovery_ledger.gym_checkpoint_inventory(
+            coordinator.instance_ids
+        )
+        return {
+            instance_id: tuple(
+                GymCheckpointEpisode(rollout_id, attempt)
+                for rollout_id, attempt in episodes
+            )
+            for instance_id, episodes in raw_inventory.items()
+        }
+
+    def _queued_gym_retirements(
+        self, coordinator: GymCheckpointCoordinator
+    ) -> dict[str, frozenset[GymCheckpointEpisode]]:
+        """Return dropped episodes Gym may still hold, awaiting their retire."""
+        raw = self._rollout_recovery_ledger.gym_checkpoint_retirements(
+            coordinator.instance_ids
+        )
+        return {
+            instance_id: frozenset(
+                GymCheckpointEpisode(rollout_id, attempt)
+                for rollout_id, attempt in episodes
+            )
+            for instance_id, episodes in raw.items()
+        }
+
+    async def _retire_dropped_gym_episodes(
+        self,
+        coordinator: GymCheckpointCoordinator,
+        checkpoint_id: str,
+    ) -> None:
+        """Retire episodes RL dropped while Gym may still be running them.
+
+        Abandoning or discarding a group leaves an admitted episode running in
+        Gym, which would export it at commit, outside the candidate set. Gym
+        accepts a retire only while idle, so this runs before prepare. A drop
+        recorded after it stays queued: this checkpoint commits it in scope but
+        leaves it out of the saved manifest, and a later retire stops it.
+        """
+        ledger = self._rollout_recovery_ledger
+        raw = ledger.gym_checkpoint_retirements(coordinator.instance_ids)
+        if not any(raw.values()):
+            return
+        await coordinator.retire(
+            checkpoint_id,
+            {
+                instance_id: tuple(
+                    GymCheckpointEpisode(rollout_id, attempt)
+                    for rollout_id, attempt in episodes
+                )
+                for instance_id, episodes in raw.items()
+            },
+        )
+        # Only what was retired: a drop recorded meanwhile stays for next time.
+        ledger.mark_gym_retired(raw)
+
+    async def _drain_non_exported_gym_candidates(
+        self,
+        coordinator: GymCheckpointCoordinator,
+        candidates: dict[str, tuple[GymCheckpointEpisode, ...]],
+        commit: GymCheckpointCommitResult,
+    ) -> None:
+        """Wait for on-wire replies that Gym did not retain in its checkpoint."""
+        pending = {
+            instance_id: set(candidates[instance_id])
+            - set(commit.manifest.instances[instance_id])
+            for instance_id in coordinator.instance_ids
+        }
+        if not any(pending.values()):
+            return
+        # Only an episode whose reply is already on the wire can resolve here. A
+        # session Gym still holds is parked by prepare, so waiting would only time out.
+        stranded = {
+            instance_id: pending[instance_id].intersection(
+                commit.instances[instance_id].unowned_live_episodes
+            )
+            for instance_id in coordinator.instance_ids
+        }
+        if any(stranded.values()):
+            raise RuntimeError(
+                "Gym checkpoint holds parked sessions that no environment or legacy "
+                "agent participant exported, so they can neither be restored nor "
+                f"finish while the deployment is prepared: stranded={stranded!r}"
+            )
+
+        deadline = time.monotonic() + coordinator.control_timeout_s
+        while True:
+            live = self._gym_checkpoint_inventory(coordinator)
+            unresolved = {
+                instance_id: pending[instance_id].intersection(live[instance_id])
+                for instance_id in coordinator.instance_ids
+            }
+            if not any(unresolved.values()):
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "Gym checkpoint could not classify every candidate before the "
+                    f"drain deadline: unresolved={unresolved!r}"
+                )
+            await asyncio.sleep(min(0.05, remaining))
+
+    async def _validate_gym_checkpoint_cut(
+        self,
+        cut: DataPlaneMutationCut,
+        commit: GymCheckpointCommitResult,
+        *,
+        checkpoint_path: PathLike,
+    ) -> None:
+        """Require Gym ownership and referenced staging rows to match this cut.
+
+        Gym may have exported episodes RL dropped while it was prepared: it
+        refuses their retire until resume, so they are still queued for one.
+        They and their staged rows are left out of the saved manifest, since
+        restore requires it to match RL's inventory and RL no longer continues
+        them; a dropped group may already have cleaned those rows up.
+        """
+        cut.require_live()
+        coordinator = self._gym_checkpoint_coordinator
+        if coordinator is None:
+            raise RuntimeError("Gym commit exists without a live Gym coordinator")
+
+        actual = self._gym_checkpoint_inventory(coordinator)
+        expected = commit.manifest.instances
+        dropped = self._queued_gym_retirements(coordinator)
+        mismatches = {}
+        kept: dict[str, tuple[GymCheckpointEpisode, ...]] = {}
+        for instance_id in coordinator.instance_ids:
+            owned = set(actual[instance_id])
+            exported = set(expected[instance_id])
+            if owned - exported or not exported - owned <= dropped[instance_id]:
+                mismatches[instance_id] = {
+                    "expected": sorted(exported, key=repr),
+                    "actual": sorted(owned, key=repr),
+                }
+            kept[instance_id] = tuple(
+                episode for episode in expected[instance_id] if episode in owned
+            )
+        if mismatches:
+            raise RuntimeError(
+                "Gym episode ownership changed after commit and before the TQ cut: "
+                f"{mismatches!r}"
+            )
+        staging_keys = {
+            instance_id: staging_keys_of(
+                commit.instances[instance_id], kept[instance_id]
+            )
+            for instance_id in coordinator.instance_ids
+        }
+        if kept != expected:
+            await asyncio.to_thread(
+                write_gym_checkpoint_manifest,
+                Path(checkpoint_path),
+                replace(commit.manifest, instances=kept, staging_keys=staging_keys),
+            )
+
+        expected_staging_keys = {key for keys in staging_keys.values() for key in keys}
+        if not expected_staging_keys:
+            return
+        actual_staging_keys = set(
+            await self._call_dp(
+                "list_sample_ids",
+                partition_id=self._master_config.token_capture.staging_partition,
+            )
+        )
+        missing = sorted(expected_staging_keys - actual_staging_keys)
+        if missing:
+            raise RuntimeError(
+                "Gym checkpoint references staging rows missing from live TQ state: "
+                f"missing={missing[:10]!r} (total={len(missing)})"
+            )
+
+    @contextlib.asynccontextmanager
+    async def _prepared_gym_checkpoint(
+        self,
+        checkpoint_path: PathLike,
+        *,
+        checkpoint_id: str,
+        enabled: bool = True,
+    ) -> AsyncIterator[GymCheckpointCommitResult | None]:
+        """Close Gym admission, commit owned episodes, and drain on-wire replies."""
+        coordinator = self._gym_checkpoint_coordinator
+        if not enabled or coordinator is None:
+            yield None
+            return
+        gate = self._rollout_dispatch_admission_gate
+        if gate is None:
+            raise RuntimeError(
+                "Gym checkpoint coordinator has no dispatch admission gate"
+            )
+
+        async with gate.closed():
+            # Gym refuses a retire once a checkpoint is open, so retire while it
+            # is still idle; dispatch is already closed, so nothing new races in.
+            await self._retire_dropped_gym_episodes(coordinator, checkpoint_id)
+            async with coordinator.prepared(checkpoint_id):
+                candidates = self._gym_checkpoint_inventory(coordinator)
+                # A row dropped since that retire is still running in Gym, which
+                # exports it; naming it keeps the export in scope, and the cut
+                # leaves it out of the saved manifest.
+                dropped = self._queued_gym_retirements(coordinator)
+                scope = {
+                    instance_id: episodes
+                    + tuple(
+                        sorted(
+                            dropped[instance_id] - set(episodes),
+                            key=lambda episode: (episode.rollout_id, episode.attempt),
+                        )
+                    )
+                    for instance_id, episodes in candidates.items()
+                }
+                commit = await coordinator.commit(
+                    checkpoint_id,
+                    Path(checkpoint_path),
+                    scope,
+                )
+                await self._drain_non_exported_gym_candidates(
+                    coordinator,
+                    candidates,
+                    commit,
+                )
+                yield commit
+
     async def _write_rollout_checkpoint_sidecars(
         self,
         checkpoint_path: Path,
@@ -4320,24 +4703,32 @@ class SingleControllerActor:
                 prepare_snapshot_paths, anchor
             )
             try:
-                barrier_requested = time.monotonic()
-                async with self._data_plane_checkpoint_barrier.checkpoint() as cut:
-                    barrier_acquired = time.monotonic()
-                    if (
-                        self._optimizer_commit_in_progress
-                        or self._train_steps != expected_train_step
-                        or self._trainer_version != expected_trainer_version
-                    ):
-                        await asyncio.to_thread(partial(shutil.rmtree, tmp_path))
-                        return _RolloutCheckpointSaveResult(
-                            saved=False,
-                            reason="trainer_state_changed",
+                async with self._prepared_gym_checkpoint(
+                    tmp_path,
+                    checkpoint_id=f"rollout-{uuid.uuid4().hex}",
+                ) as gym_commit:
+                    barrier_requested = time.monotonic()
+                    async with self._data_plane_checkpoint_barrier.checkpoint() as cut:
+                        barrier_acquired = time.monotonic()
+                        if (
+                            self._optimizer_commit_in_progress
+                            or self._train_steps != expected_train_step
+                            or self._trainer_version != expected_trainer_version
+                        ):
+                            await asyncio.to_thread(partial(shutil.rmtree, tmp_path))
+                            return _RolloutCheckpointSaveResult(
+                                saved=False,
+                                reason="trainer_state_changed",
+                            )
+                        snapshot_epoch = self._current_epoch
+                        snapshot_cut = (
+                            await self._capture_coordinated_rollout_checkpoint_cut(
+                                cut,
+                                tmp_path,
+                                gym_commit=gym_commit,
+                            )
                         )
-                    snapshot_epoch = self._current_epoch
-                    snapshot_cut = await self._capture_rollout_checkpoint_cut(
-                        cut, tmp_path
-                    )
-                barrier_released = time.monotonic()
+                    barrier_released = time.monotonic()
 
                 sidecar_save_started = time.monotonic()
                 controller_sidecar_bytes = (
@@ -4760,95 +5151,123 @@ class SingleControllerActor:
         rollout_recovery_payload: Optional[bytes] = None
         rollout_recovery_payload_sha256: Optional[str] = None
 
-        # Admission, dataloader movement, replay mutations, and canonical TQ writes
-        # all take the mutation side of this barrier. Capture every restart-facing
-        # controller artifact under the exclusive side so the checkpoint cannot
-        # contain a cursor without its prompt owner, or two durable owners for one
-        # canonical group.
-        async with self._data_plane_checkpoint_barrier.checkpoint() as cut:
-            save_state.current_step = self._train_steps
-            save_state.total_steps = self._train_steps
-            save_state.trainer_version = self._trainer_version
-            save_state.current_epoch = self._current_epoch
-            save_state.consumed_samples = self._consumed_samples
-            save_state.total_valid_tokens = self._total_valid_tokens
-            save_state.sampler_name = self._async_cfg.sampler.name
-            save_state.sampler_dispatch_index = self._sampler.dispatch_index
-            dataloader_state = self._dataloader.state_dict()
-            # The spare pool and dataloader advance together under the same mutation
-            # cut in recovery-enabled dispatch, so preserve them in this cut too.
-            reserve_state = list(self._replacement_reserve)
+        # Gym commit needs a destination before the final data-plane cut. Seed
+        # the temporary trainer directory now, then atomically refresh its
+        # training_info.json with the exact controller values captured below.
+        save_state.current_step = self._train_steps
+        save_state.total_steps = self._train_steps
+        save_state.trainer_version = self._trainer_version
+        save_state.current_epoch = self._current_epoch
+        save_state.consumed_samples = self._consumed_samples
+        save_state.total_valid_tokens = self._total_valid_tokens
+        save_state.sampler_name = self._async_cfg.sampler.name
+        save_state.sampler_dispatch_index = self._sampler.dispatch_index
+        checkpoint_path: PathLike = await asyncio.to_thread(  # pyrefly: ignore[bad-assignment]  the PathLike alias resolves inconsistently under pyrefly's import-cycle breaking
+            self._checkpointer.init_tmp_checkpoint,
+            self._train_steps,
+            vars(save_state),
+            self._master_config,
+        )
 
-            checkpoint_path: PathLike = await asyncio.to_thread(  # pyrefly: ignore[bad-assignment]  the PathLike alias resolves inconsistently under pyrefly's import-cycle breaking
-                self._checkpointer.init_tmp_checkpoint,
-                self._train_steps,
-                vars(save_state),
-                self._master_config,
-            )
-
-            if self._master_config.checkpointing.get("save_data_plane"):
-                training_owned_groups = self._buffer.training_owned_replay_groups()
-                if training_owned_groups:
-                    raise RuntimeError(
-                        "full trainer checkpoint still owns streamed training rows: "
-                        f"groups={[group['group_id'] for group in training_owned_groups]!r}"
-                    )
-                if self._sampler.supports_buffer_checkpoint:
-                    replay_metadata = self._buffer.metadata_state_dict(
-                        saved_capacity=self._async_cfg.max_buffered_rollouts
-                    )
-                if replay_metadata is not None:
-                    await self._validate_replay_inventory(replay_metadata)
-
-                if self._rollout_recovery_enabled:
-                    rollout_recovery_state = build_rollout_recovery_state(
-                        self._rollout_manager.recovery_ledger,
-                        batch_shortfall=self._batch_shortfall,
-                        sampler_stamps_target_steps=(self._sampler_stamps_target_steps),
-                    )
-                    if replay_metadata is not None:
-                        canonical_group_ids = {
-                            group["group_id"] for group in replay_metadata["groups"]
-                        }
-                        rollout_recovery_state["groups"] = [
-                            group
-                            for group in rollout_recovery_state["groups"]
-                            if group["group_id"] not in canonical_group_ids
-                        ]
-                    payload_buffer = io.BytesIO()
-                    await asyncio.to_thread(
-                        torch.save,
-                        rollout_recovery_state,
-                        payload_buffer,
-                    )
-                    rollout_recovery_payload = payload_buffer.getvalue()
-                    rollout_recovery_payload_sha256 = hashlib.sha256(
-                        rollout_recovery_payload
-                    ).hexdigest()
-
-                if self._master_config.token_capture.enabled:
-                    await self._validate_rollout_recovery_inventory(
-                        cut,
-                        replay_metadata=replay_metadata,
-                        clear_unreferenced=False,
-                    )
-
-                await self._save_data_plane_checkpoint(
+        save_data_plane = bool(self._master_config.checkpointing.get("save_data_plane"))
+        async with self._prepared_gym_checkpoint(
+            checkpoint_path,
+            checkpoint_id=f"trainer-{uuid.uuid4().hex}",
+            enabled=save_data_plane,
+        ) as gym_commit:
+            # Admission, dataloader movement, replay mutations, and canonical TQ
+            # writes all take the mutation side of this barrier. Gym is already
+            # parked and on-wire replies have drained before exclusivity starts.
+            async with self._data_plane_checkpoint_barrier.checkpoint() as cut:
+                save_state.current_step = self._train_steps
+                save_state.total_steps = self._train_steps
+                save_state.trainer_version = self._trainer_version
+                save_state.current_epoch = self._current_epoch
+                save_state.consumed_samples = self._consumed_samples
+                save_state.total_valid_tokens = self._total_valid_tokens
+                save_state.sampler_name = self._async_cfg.sampler.name
+                save_state.sampler_dispatch_index = self._sampler.dispatch_index
+                await asyncio.to_thread(
+                    _write_training_info,
                     checkpoint_path,
-                    train_steps=save_state.current_step,
-                    trainer_version=self._trainer_version,
-                    current_epoch=save_state.current_epoch,
-                    replay_metadata=replay_metadata,
-                    rollout_recovery_payload_sha256=(rollout_recovery_payload_sha256),
-                    rollout_recovery_group_count=(
-                        len(rollout_recovery_state["groups"])
-                        if rollout_recovery_state is not None
-                        else None
-                    ),
+                    vars(save_state),
                 )
-                self._last_rollout_snapshot_mutation_version = (
-                    self._data_plane_checkpoint_barrier.mutation_version
-                )
+                dataloader_state = self._dataloader.state_dict()
+                # The spare pool and dataloader advance together under the same mutation
+                # cut in recovery-enabled dispatch, so preserve them in this cut too.
+                reserve_state = list(self._replacement_reserve)
+
+                if save_data_plane:
+                    if gym_commit is not None:
+                        await self._validate_gym_checkpoint_cut(
+                            cut, gym_commit, checkpoint_path=checkpoint_path
+                        )
+                    training_owned_groups = self._buffer.training_owned_replay_groups()
+                    if training_owned_groups:
+                        raise RuntimeError(
+                            "full trainer checkpoint still owns streamed training rows: "
+                            f"groups={[group['group_id'] for group in training_owned_groups]!r}"
+                        )
+                    if self._sampler.supports_buffer_checkpoint:
+                        replay_metadata = self._buffer.metadata_state_dict(
+                            saved_capacity=self._async_cfg.max_buffered_rollouts
+                        )
+                    if replay_metadata is not None:
+                        await self._validate_replay_inventory(replay_metadata)
+
+                    if self._rollout_recovery_enabled:
+                        rollout_recovery_state = build_rollout_recovery_state(
+                            self._rollout_manager.recovery_ledger,
+                            batch_shortfall=self._batch_shortfall,
+                            sampler_stamps_target_steps=(
+                                self._sampler_stamps_target_steps
+                            ),
+                        )
+                        if replay_metadata is not None:
+                            canonical_group_ids = {
+                                group["group_id"] for group in replay_metadata["groups"]
+                            }
+                            rollout_recovery_state["groups"] = [
+                                group
+                                for group in rollout_recovery_state["groups"]
+                                if group["group_id"] not in canonical_group_ids
+                            ]
+                        payload_buffer = io.BytesIO()
+                        await asyncio.to_thread(
+                            torch.save,
+                            rollout_recovery_state,
+                            payload_buffer,
+                        )
+                        rollout_recovery_payload = payload_buffer.getvalue()
+                        rollout_recovery_payload_sha256 = hashlib.sha256(
+                            rollout_recovery_payload
+                        ).hexdigest()
+
+                    if self._master_config.token_capture.enabled:
+                        await self._validate_rollout_recovery_inventory(
+                            cut,
+                            replay_metadata=replay_metadata,
+                            clear_unreferenced=False,
+                        )
+
+                    await self._save_data_plane_checkpoint(
+                        checkpoint_path,
+                        train_steps=save_state.current_step,
+                        trainer_version=self._trainer_version,
+                        current_epoch=save_state.current_epoch,
+                        replay_metadata=replay_metadata,
+                        rollout_recovery_payload_sha256=(
+                            rollout_recovery_payload_sha256
+                        ),
+                        rollout_recovery_group_count=(
+                            len(rollout_recovery_state["groups"])
+                            if rollout_recovery_state is not None
+                            else None
+                        ),
+                    )
+                    self._last_rollout_snapshot_mutation_version = (
+                        self._data_plane_checkpoint_barrier.mutation_version
+                    )
 
         # Save value model
         if self._is_ppo:

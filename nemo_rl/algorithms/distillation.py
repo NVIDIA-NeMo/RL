@@ -540,6 +540,7 @@ def setup(
                     # Distillation does not configure vLLM for router replay.
                     enable_router_replay=False,
                     use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
+                    turn_checkpointing_enabled=False,
                 )
                 try:
                     validate_dataset_agent_coverage(

@@ -539,6 +539,7 @@ def l0_nemo_gym(scripted_openai_base_url):
         tokenizer=tokenizer,
         enable_router_replay=False,
         use_fastokens=False,
+        turn_checkpointing_enabled=False,
     )
     try:
         yield env

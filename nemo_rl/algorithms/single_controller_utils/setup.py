@@ -781,6 +781,9 @@ def _spinup_gym(
         tokenizer=tokenizer,
         enable_router_replay=enable_router_replay,
         use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
+        turn_checkpointing_enabled=(
+            master_config.rollout_recovery.turn_checkpointing_enabled
+        ),
         # Ledger config rides into Gym's policy model server.
         token_capture=(
             master_config.token_capture.model_dump()
@@ -1096,6 +1099,33 @@ def setup_single_controller(
         )
     data_plane_checkpointing_supported = data_plane_supports_checkpointing(dp_config)
     rollout_checkpoint_cfg = master_config.rollout_checkpointing
+    if master_config.rollout_recovery.turn_checkpointing_enabled:
+        if generation_config["backend"] != "vllm":
+            raise NotImplementedError(
+                "rollout_recovery.target_level='turn' currently supports only "
+                "the vllm generation backend; "
+                f"got {generation_config['backend']!r}"
+            )
+        if not should_use_nemo_gym(master_config):
+            raise ValueError(
+                "rollout_recovery.target_level='turn' requires the NeMo-Gym "
+                "rollout path (env.should_use_nemo_gym=true)"
+            )
+        if rollout_checkpoint_cfg.snapshot_attempt_interval_s is None:
+            raise ValueError(
+                "rollout_recovery.target_level='turn' requires "
+                "rollout_checkpointing.snapshot_attempt_interval_s"
+            )
+        if not master_config.token_capture.enabled:
+            raise ValueError(
+                "rollout_recovery.target_level='turn' requires "
+                "token_capture.enabled=true"
+            )
+        if rollout_checkpoint_cfg.restore_mode != "latest":
+            raise ValueError(
+                "rollout_recovery.target_level='turn' requires "
+                "rollout_checkpointing.restore_mode='latest'"
+            )
     if (
         master_config.checkpointing.get("save_data_plane")
         or rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None

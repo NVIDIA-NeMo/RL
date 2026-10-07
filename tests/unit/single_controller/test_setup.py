@@ -83,7 +83,7 @@ from nemo_rl.data_plane.schema import (
 )
 from nemo_rl.data_plane.tq_token_sink import MEDIA_STAGING_FIELDS
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
-from nemo_rl.experience.rollout_recovery import RecoveryGranularity
+from nemo_rl.experience.rollout_recovery import RecoveryTargetLevel
 from nemo_rl.experience.rollouts import EffortLevelsConfig
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.utils.config import (
@@ -654,7 +654,7 @@ def test_rollout_recovery_functional_config_resolves_to_runtime_contract(
         "++data_plane.simple.num_storage_units=2",
         "++data_plane.claim_meta_poll_interval_s=0.5",
         "++token_capture.enabled=true",
-        "++rollout_recovery.default_granularity=prompt_group",
+        "++rollout_recovery.target_level=prompt_group",
         "++async_rl.sampler.name=in_order",
         "++async_rl.sampler.max_lookahead_versions=1",
         "++async_rl.min_groups_for_streaming_train=4",
@@ -678,8 +678,7 @@ def test_rollout_recovery_functional_config_resolves_to_runtime_contract(
     assert master_config.checkpointing["save_data_plane"] is True
     assert master_config.token_capture.enabled is True
     assert (
-        master_config.rollout_recovery.default_granularity
-        is RecoveryGranularity.PROMPT_GROUP
+        master_config.rollout_recovery.target_level is RecoveryTargetLevel.PROMPT_GROUP
     )
     assert master_config.async_rl.rollout_failure.native.generation_timeout_s is None
     assert master_config.async_rl.rollout_failure.nemo_gym.rollout_timeout_s == 120
@@ -1023,6 +1022,41 @@ class TestSetup:
         with pytest.raises(ValueError, match="supports training-claim ownership"):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
+    def test_periodic_checkpointing_does_not_enable_gym_participants(self):
+        mc = _make_master_config(env={"should_use_nemo_gym": True})
+        mc.policy["generation"]["model_name"] = "test-model"
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=1.0
+        )
+
+        with patch.object(
+            sc_setup_mod,
+            "build_nemo_gym_actors",
+            return_value=MagicMock(),
+        ) as mock_spinup:
+            sc_setup_mod._spinup_gym(
+                mc,
+                ["http://generation"],
+                MagicMock(name="tokenizer"),
+            )
+
+        assert mock_spinup.call_args.kwargs["turn_checkpointing_enabled"] is False
+
+    def test_turn_recovery_requires_periodic_snapshots(self):
+        mc = _make_master_config(env={"should_use_nemo_gym": True})
+        mc.policy["generation"]["vllm_cfg"] = {
+            "async_engine": True,
+            "expose_http_server": True,
+        }
+        mc.token_capture.enabled = True
+        mc.rollout_recovery.target_level = RecoveryTargetLevel.TURN
+
+        with pytest.raises(
+            ValueError,
+            match="target_level='turn' requires.*snapshot_attempt_interval_s",
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
     def test_periodic_checkpointing_warns_without_per_step_trainer_anchors(
         self,
         tmp_path: Path,
@@ -1047,6 +1081,7 @@ class TestSetup:
             }
         )
         mc.token_capture.enabled = True
+        mc.rollout_recovery.target_level = RecoveryTargetLevel.TURN
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0
         )
@@ -1061,7 +1096,7 @@ class TestSetup:
             patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
             patch.object(
                 sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
-            ),
+            ) as mock_spinup,
             patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
             patch(
                 "nemo_rl.experience.rollout_reassembler_actor."
@@ -1075,6 +1110,7 @@ class TestSetup:
             )
 
         assert actor_args.finalizer_actors == fake_finalizers
+        assert mock_spinup.call_args.kwargs["turn_checkpointing_enabled"] is True
 
     def test_disabled_periodic_checkpointing_ignores_existing_snapshots(
         self,
@@ -1488,16 +1524,16 @@ class TestSetup:
             mc = _make_master_config(colocated=False, backend="sglang")
         elif invalid_case == "prompt_group_recovery_without_capture":
             mc = _make_master_config()
-            mc.rollout_recovery.default_granularity = RecoveryGranularity.PROMPT_GROUP
+            mc.rollout_recovery.target_level = RecoveryTargetLevel.PROMPT_GROUP
         elif invalid_case == "recovery_override_without_capture":
             mc = _make_master_config()
-            mc.rollout_recovery.task_source_granularity_overrides = {
-                "genrm": RecoveryGranularity.PROMPT_GROUP
+            mc.rollout_recovery.task_source_target_level_overrides = {
+                "genrm": RecoveryTargetLevel.PROMPT_GROUP
             }
         elif invalid_case == "legacy_agent_recovery_override_without_capture":
             mc = _make_master_config()
-            mc.rollout_recovery.agent_granularity_overrides = {
-                "genrm_agent": RecoveryGranularity.PROMPT_GROUP
+            mc.rollout_recovery.agent_target_level_overrides = {
+                "genrm_agent": RecoveryTargetLevel.PROMPT_GROUP
             }
         else:  # pragma: no cover
             raise AssertionError(f"unknown test case {invalid_case}")
@@ -1873,6 +1909,7 @@ class TestSetup:
             tokenizer=tokenizer,
             enable_router_replay=False,
             use_fastokens=False,
+            turn_checkpointing_enabled=False,
             token_capture=None,
         )
         mock_validate.assert_called_once_with(

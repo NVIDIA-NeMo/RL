@@ -113,6 +113,8 @@ With `checkpointing.save_data_plane: true`, each Single-Controller checkpoint co
 - A native TQ snapshot containing rollout tensor payloads and TQ state.
 - A metadata-only replay index describing the completed rollout groups stored in TQ.
 - A `rollout_recovery.pt` ownership ledger describing unfinished prompt groups that must be redispatched after a restart.
+- With `rollout_recovery.target_level: turn`, a `gym_checkpoint.json` manifest
+  and per-Gym-instance participant snapshots for unfinished episodes.
 - A `replacement_reserve.pt` sidecar containing prompts held for dropped-rollout replacement, when applicable.
 - The sampler dispatch position needed to continue scheduling from the correct point.
 
@@ -237,9 +239,10 @@ checkpoint exists.
 
 :::{note}
 Completed groups are restored directly from the TQ snapshot. For unfinished
-token-capture groups, `rollout_recovery.default_granularity` controls both live
-failure and restart behavior:
+token-capture groups, `rollout_recovery.target_level` selects the requested
+restart boundary:
 
+- `turn` requests coordinated Gym participant recovery from the last saved turn.
 - `sibling` preserves each sealed sibling and redispatches only unfinished ones.
 - `prompt_group` retries every sibling in the group when any sibling is unfinished.
 
@@ -247,16 +250,48 @@ failure and restart behavior:
 `prompt_group` when every generation in a recovered group must come from the
 policy weights live at redispatch.
 
-`task_source_granularity_overrides` can select the policy using the Gym
+Turn recovery coordinates Gym and RL as one checkpoint cut. Each prompt group
+is pinned to the Gym shard replica that accepted it. SC first closes its narrow
+`/run` dispatch admission gate; already-submitted requests, completion callbacks,
+finalization, and TQ writes remain live. Gym parks its participants and commits
+the subset of candidate episodes it still owns into the checkpoint's
+`gym-instances/` tree. Candidate replies already on the wire drain through the
+ordinary RL/TQ completion path. SC then acquires the exclusive data-plane
+barrier, verifies that the remaining Gym-owned episodes and their TQ staging
+keys match the Gym commit, and captures TQ plus the rollout ledger. If a
+candidate is neither exported by Gym nor drained before the deadline, the
+checkpoint aborts. Gym leases are renewed throughout and all deployments are
+resumed after the cut succeeds or aborts.
+
+On restart, SC validates that `gym_checkpoint.json` names exactly the episodes
+owned by the rollout ledger and that the saved Gym actor topology matches the
+live one. It restores Gym before starting rollout dispatch, advances each
+restored episode to its next attempt, and routes it back to the same Gym actor.
+If one shard replica fails restore, every replica conservatively retires its
+replacement attempts before the outer restore fails. This also covers a lost
+Ray reply where the remote restore may actually have succeeded, so a partially
+restored topology is never released for execution. A second checkpoint taken
+after restore but before redispatch includes the unclaimed restored attempt, so
+another crash does not lose the saved turn boundary.
+
+The `turn` target currently requires vLLM generation, NeMo Gym, token capture,
+periodic rollout snapshots, `restore_mode: latest`, and the same named Gym
+shards and replica counts on restart. Only checkpoints using the current rollout
+recovery schema are accepted.
+
+`task_source_target_level_overrides` can coarsen the target using the Gym
 `task_source` embedded in the raw rollout row. Unlike `agent_ref`, this identity
 is available before Gym resolves the concrete agent and SC reserves the recovery
 group. When a row already carries an `agent_ref`, a matching
-`agent_granularity_overrides` entry wins over a matching task-source entry,
+`agent_target_level_overrides` entry wins over a matching task-source entry,
 mirroring Gym's concrete-route precedence. Otherwise the task-source override,
 then the global default, applies. The agent map also keeps datasets collated
 before Gym recorded `task_source` working, although re-collating them is
-recommended. Non-default policies require `token_capture.enabled: true`. The
-task source and resolved policy are persisted in `rollout_recovery.pt`, so
+recommended. Overrides may only select a coarser level than the global target.
+Until Gym advertises group-scoring capabilities, configure group-scored routes
+such as GenRM explicitly as `prompt_group`. Non-default policies require
+`token_capture.enabled: true`. The task source and resolved policy are persisted
+in `rollout_recovery.pt`, so
 recovery does not reinterpret an existing group using changed configuration. A
 generation that already finished keeps its tokens in the token-capture staging
 area, so `sibling` reuses them unchanged; a redispatched sibling produces a new

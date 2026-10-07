@@ -39,6 +39,7 @@ from nemo_rl.experience.rollout_recovery import (
     PromptGroupRecoveryRecord,
     PromptRef,
     RecoveryGranularity,
+    RecoveryTargetLevel,
     RolloutAttemptRecord,
     RolloutAttemptStatus,
     RolloutRecoveryLedger,
@@ -424,13 +425,13 @@ def test_checkpoint_cut_can_guard_a_ledger_mutation() -> None:
 
 def test_recovery_config_resolves_agent_then_task_source_then_default() -> None:
     config = RolloutRecoveryConfig(
-        default_granularity=RecoveryGranularity.SIBLING,
-        task_source_granularity_overrides={
-            "genrm_compare": RecoveryGranularity.PROMPT_GROUP,
+        target_level=RecoveryTargetLevel.TURN,
+        task_source_target_level_overrides={
+            "genrm_compare": RecoveryTargetLevel.PROMPT_GROUP,
         },
-        agent_granularity_overrides={
-            "legacy_genrm_agent": RecoveryGranularity.PROMPT_GROUP,
-            "sibling_agent": RecoveryGranularity.SIBLING,
+        agent_target_level_overrides={
+            "legacy_genrm_agent": RecoveryTargetLevel.PROMPT_GROUP,
+            "sibling_agent": RecoveryTargetLevel.SIBLING,
         },
     )
 
@@ -465,12 +466,26 @@ def test_recovery_config_resolves_agent_then_task_source_then_default() -> None:
 
     assert source_policy.task_source == "genrm_compare"
     assert source_policy.granularity is RecoveryGranularity.PROMPT_GROUP
+    assert source_policy.restore_level is RecoveryTargetLevel.PROMPT_GROUP
     assert agent_policy.task_source == "genrm_compare"
     assert agent_policy.granularity is RecoveryGranularity.SIBLING
+    assert agent_policy.restore_level is RecoveryTargetLevel.SIBLING
     assert default_policy.task_source == "other"
     assert default_policy.granularity is RecoveryGranularity.SIBLING
+    assert default_policy.restore_level is RecoveryTargetLevel.TURN
     assert legacy_policy.task_source is None
     assert legacy_policy.granularity is RecoveryGranularity.PROMPT_GROUP
+    assert legacy_policy.restore_level is RecoveryTargetLevel.PROMPT_GROUP
+
+
+def test_recovery_overrides_may_only_make_the_target_coarser() -> None:
+    with pytest.raises(ValueError, match="may only force a coarser recovery level"):
+        RolloutRecoveryConfig(
+            target_level=RecoveryTargetLevel.SIBLING,
+            agent_target_level_overrides={
+                "too-fine": RecoveryTargetLevel.TURN,
+            },
+        )
 
 
 @pytest.mark.parametrize(
@@ -498,7 +513,7 @@ def test_recovery_config_rejects_malformed_prompt_identity(
 
 
 def test_recovery_config_rejects_removed_task_name_override() -> None:
-    with pytest.raises(ValueError, match="task_source_granularity_overrides"):
+    with pytest.raises(ValueError, match="target_level"):
         RolloutRecoveryConfig(
             **{
                 "task_granularity_overrides": {
@@ -756,6 +771,72 @@ def test_restart_preserves_sealed_sibling_and_retries_only_interrupted_one() -> 
     assert retry.siblings[1].current_attempt.status is RolloutAttemptStatus.RESERVED
 
 
+def test_turn_restart_preserves_sealed_sibling_and_restores_other_from_gym() -> None:
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=2,
+        target_step=7,
+        start_weight_version=6,
+        recovery_granularity=RecoveryGranularity.SIBLING,
+        restore_level=RecoveryTargetLevel.TURN,
+        admitted=True,
+    )
+    _mutate(
+        lambda cut: ledger.mark_group_dispatched(
+            cut,
+            "g7",
+            gym_instance_id="tools/replica-0",
+        )
+    )
+    sealed_attempt_id = group.siblings[0].current_attempt.attempt_id
+    sealed_id = group.gate_rollout_id(0)
+    _mutate(
+        lambda cut: ledger.mark_sibling_sealed(
+            cut,
+            "g7",
+            generation_index=0,
+            gate_rollout_id=sealed_id,
+            receipt={
+                "rollout_id": sealed_id,
+                "manifest": [{"staging_key": "g7/sibling-0/call-0"}],
+            },
+            reward=1.0,
+            mask_sample=False,
+        )
+    )
+
+    restored = RolloutRecoveryLedger.from_state_dict(ledger.state_dict())
+    inventory = restored.gym_checkpoint_inventory({"tools/replica-0"})
+    (unfinished_episode,) = inventory["tools/replica-0"]
+
+    _mutate(
+        lambda cut: restored.prepare_for_restart(
+            cut,
+            restored_gym_episodes={
+                ("tools/replica-0", *unfinished_episode),
+            },
+        )
+    )
+    recovered = restored.get_group("g7")
+
+    assert recovered.siblings[0].current_attempt.attempt_id == sealed_attempt_id
+    assert recovered.siblings[0].current_attempt.status is RolloutAttemptStatus.SEALED
+    resumed = recovered.siblings[1].current_attempt
+    assert resumed.status is RolloutAttemptStatus.RESERVED
+    assert resumed.gym_instance_id == "tools/replica-0"
+    assert resumed.gym_attempt == 1
+    assert restored.expected_staging_keys() == {"g7/sibling-0/call-0"}
+
+    retry = _mutate(lambda cut: restored.prepare_incomplete_retry(cut, "g7"))
+    assert retry.siblings[0].current_attempt.status is RolloutAttemptStatus.SEALED
+    assert retry.siblings[1].current_attempt.status is RolloutAttemptStatus.RESERVED
+
+
 @pytest.mark.parametrize(
     "recovery_granularity",
     [RecoveryGranularity.SIBLING, RecoveryGranularity.PROMPT_GROUP],
@@ -831,7 +912,7 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
     assert rewards == [0.0, 1.0]
     assert mask_sample == [True, False]
 
-    state["schema_version"] = 3
+    state["schema_version"] = ROLLOUT_RECOVERY_SCHEMA_VERSION + 1
     with pytest.raises(ValueError, match="Unsupported rollout-recovery schema version"):
         RolloutRecoveryLedger.from_state_dict(state)
 
@@ -856,6 +937,7 @@ def test_prompt_group_restart_retries_every_sibling_when_one_is_unfinished() -> 
     state = ledger.state_dict()
     assert state["groups"][0]["task_source"] == "genrm_compare"
     assert state["groups"][0]["recovery_granularity"] == "prompt_group"
+    assert state["groups"][0]["restore_level"] == "prompt_group"
 
     restored = RolloutRecoveryLedger.from_state_dict(state)
     _mutate(lambda cut: restored.prepare_for_restart(cut))
@@ -863,6 +945,7 @@ def test_prompt_group_restart_retries_every_sibling_when_one_is_unfinished() -> 
 
     assert recovered.task_source == "genrm_compare"
     assert recovered.recovery_granularity is RecoveryGranularity.PROMPT_GROUP
+    assert recovered.restore_level is RecoveryTargetLevel.PROMPT_GROUP
     assert [sibling.current_attempt.status for sibling in recovered.siblings] == [
         RolloutAttemptStatus.ABANDONED,
         RolloutAttemptStatus.ABANDONED,
@@ -874,6 +957,185 @@ def test_prompt_group_restart_retries_every_sibling_when_one_is_unfinished() -> 
         RolloutAttemptStatus.RESERVED,
         RolloutAttemptStatus.RESERVED,
     ]
+
+
+def test_turn_restore_target_is_persisted_separately_from_live_retry() -> None:
+    ledger = RolloutRecoveryLedger()
+    _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=2,
+        target_step=7,
+        start_weight_version=6,
+        recovery_granularity=RecoveryGranularity.SIBLING,
+        restore_level=RecoveryTargetLevel.TURN,
+        admitted=True,
+    )
+
+    state = ledger.state_dict()
+    assert state["groups"][0]["recovery_granularity"] == "sibling"
+    assert state["groups"][0]["restore_level"] == "turn"
+
+    restored = RolloutRecoveryLedger.from_state_dict(state).get_group("g7")
+    assert restored.recovery_granularity is RecoveryGranularity.SIBLING
+    assert restored.restore_level is RecoveryTargetLevel.TURN
+
+
+@pytest.mark.parametrize("schema_version", [2, 3])
+def test_old_rollout_recovery_schemas_are_rejected(
+    schema_version: int,
+) -> None:
+    ledger = RolloutRecoveryLedger()
+    _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=1,
+        target_step=7,
+        start_weight_version=6,
+        recovery_granularity=RecoveryGranularity.SIBLING,
+        admitted=True,
+    )
+    _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
+
+    state = ledger.state_dict()
+    state["schema_version"] = schema_version
+
+    with pytest.raises(ValueError, match="Unsupported rollout-recovery schema"):
+        RolloutRecoveryLedger.from_state_dict(state)
+
+
+def test_turn_restart_preserves_gym_owner_and_advances_attempt() -> None:
+    ledger = RolloutRecoveryLedger()
+    _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=1,
+        target_step=7,
+        start_weight_version=6,
+        recovery_granularity=RecoveryGranularity.SIBLING,
+        restore_level=RecoveryTargetLevel.TURN,
+        admitted=True,
+    )
+    _mutate(
+        lambda cut: ledger.mark_group_dispatched(
+            cut,
+            "g7",
+            gym_instance_id="tools/replica-1",
+        )
+    )
+
+    state = ledger.state_dict()
+    attempt_state = state["groups"][0]["siblings"][0]["attempts"][0]
+    assert attempt_state["gym_instance_id"] == "tools/replica-1"
+    assert attempt_state["gym_attempt"] == 0
+
+    restored = RolloutRecoveryLedger.from_state_dict(state)
+    inventory = restored.gym_checkpoint_inventory(
+        {"judge/replica-0", "tools/replica-1"}
+    )
+    ((rollout_id, attempt),) = inventory["tools/replica-1"]
+    assert inventory["judge/replica-0"] == ()
+    assert attempt == 0
+
+    _mutate(
+        lambda cut: restored.prepare_for_restart(
+            cut,
+            restored_gym_episodes={
+                ("tools/replica-1", rollout_id, attempt),
+            },
+        )
+    )
+    recovered = restored.get_group("g7")
+    current = recovered.siblings[0].current_attempt
+    assert current.status is RolloutAttemptStatus.RESERVED
+    assert current.gym_instance_id == "tools/replica-1"
+    assert current.gym_attempt == 1
+    assert recovered.gate_rollout_id(0) == f"{rollout_id}-a1"
+
+    repeated_inventory = restored.gym_checkpoint_inventory(
+        {"judge/replica-0", "tools/replica-1"}
+    )
+    assert repeated_inventory["tools/replica-1"] == ((rollout_id, 1),)
+
+    _mutate(
+        lambda cut: restored.prepare_for_restart(
+            cut,
+            restored_gym_episodes={
+                ("tools/replica-1", rollout_id, 1),
+            },
+        )
+    )
+    recovered = restored.get_group("g7")
+    current = recovered.siblings[0].current_attempt
+    assert current.status is RolloutAttemptStatus.RESERVED
+    assert current.gym_attempt == 2
+    assert recovered.gate_rollout_id(0) == f"{rollout_id}-a2"
+
+    with pytest.raises(ValueError, match="checkpoint owner"):
+        _mutate(
+            lambda cut: restored.mark_group_dispatched(
+                cut,
+                "g7",
+                gym_instance_id="judge/replica-0",
+            )
+        )
+
+
+def test_turn_restart_falls_back_to_sibling_when_gym_episode_is_absent() -> None:
+    ledger = RolloutRecoveryLedger()
+    _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=1,
+        target_step=7,
+        start_weight_version=6,
+        recovery_granularity=RecoveryGranularity.SIBLING,
+        restore_level=RecoveryTargetLevel.TURN,
+        admitted=True,
+    )
+    _mutate(
+        lambda cut: ledger.mark_group_dispatched(
+            cut,
+            "g7",
+            gym_instance_id="tools/replica-0",
+        )
+    )
+
+    _mutate(lambda cut: ledger.prepare_for_restart(cut))
+
+    current = ledger.get_group("g7").siblings[0].current_attempt
+    assert current.status is RolloutAttemptStatus.ABANDONED
+
+
+def test_turn_dispatch_requires_a_gym_owner() -> None:
+    ledger = RolloutRecoveryLedger()
+    _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=1,
+        target_step=7,
+        start_weight_version=6,
+        restore_level=RecoveryTargetLevel.TURN,
+        admitted=True,
+    )
+
+    with pytest.raises(ValueError, match="requires a Gym checkpoint owner"):
+        _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
 
 
 def test_prompt_group_restart_keeps_a_fully_sealed_group() -> None:
@@ -1006,6 +1268,8 @@ def test_checkpoint_rejects_ambiguous_finalization_state(
     [
         ("recovery_granularity", "banana", "invalid recovery_granularity"),
         ("recovery_granularity", None, "recovery_granularity must be a string"),
+        ("restore_level", "banana", "invalid restore_level"),
+        ("restore_level", None, "restore_level must be a string"),
         ("task_source", 123, "task_source must be a string or None"),
     ],
 )
@@ -1097,3 +1361,215 @@ def test_restore_rejects_inconsistent_shared_admission_state() -> None:
 
     with pytest.raises(ValueError, match="disagree on phase or target_step"):
         _load(RolloutRecoveryLedger(), state)
+
+
+def _dispatched_turn_group(ledger: RolloutRecoveryLedger) -> PromptGroupRecoveryRecord:
+    group = _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=2,
+        target_step=7,
+        start_weight_version=6,
+        recovery_granularity=RecoveryGranularity.SIBLING,
+        restore_level=RecoveryTargetLevel.TURN,
+        admitted=True,
+    )
+    _mutate(
+        lambda cut: ledger.mark_group_dispatched(
+            cut, "g7", gym_instance_id="tools/replica-0"
+        )
+    )
+    return group
+
+
+def test_refused_fresh_dispatch_keeps_identity_and_leaves_gym_inventory() -> None:
+    """Gym recorded nothing for a refused /run, so a checkpoint must not wait on it."""
+    ledger = RolloutRecoveryLedger()
+    group = _dispatched_turn_group(ledger)
+    refused_attempt_id = group.siblings[1].current_attempt.attempt_id
+    refused_rollout_id = group.gate_rollout_id(1)
+    assert (
+        len(ledger.gym_checkpoint_inventory({"tools/replica-0"})["tools/replica-0"])
+        == 2
+    )
+
+    _mutate(lambda cut: ledger.release_refused_dispatch(cut, "g7", generation_index=1))
+
+    released = ledger.get_group("g7")
+    attempt = released.siblings[1].current_attempt
+    assert attempt.status is RolloutAttemptStatus.RESERVED
+    assert attempt.attempt_id == refused_attempt_id
+    assert released.gate_rollout_id(1) == refused_rollout_id
+    assert (
+        released.siblings[0].current_attempt.status is RolloutAttemptStatus.DISPATCHED
+    )
+    (remaining,) = ledger.gym_checkpoint_inventory({"tools/replica-0"})[
+        "tools/replica-0"
+    ]
+    assert remaining == group.gym_episode(0)
+
+    # The same attempt is re-sent once admission reopens.
+    _mutate(
+        lambda cut: ledger.mark_group_dispatched(
+            cut, "g7", generation_indices=[1], gym_instance_id="tools/replica-0"
+        )
+    )
+    assert (
+        ledger.get_group("g7").siblings[1].current_attempt.status
+        is RolloutAttemptStatus.DISPATCHED
+    )
+
+
+def test_refused_restored_turn_stays_gym_owned() -> None:
+    """A restored turn waiting to be re-sent must keep its committed continuation."""
+    ledger = RolloutRecoveryLedger()
+    _dispatched_turn_group(ledger)
+    restored = RolloutRecoveryLedger.from_state_dict(ledger.state_dict())
+    episodes = restored.gym_checkpoint_inventory({"tools/replica-0"})["tools/replica-0"]
+    _mutate(
+        lambda cut: restored.prepare_for_restart(
+            cut,
+            restored_gym_episodes={
+                ("tools/replica-0", *episode) for episode in episodes
+            },
+        )
+    )
+    _mutate(
+        lambda cut: restored.mark_group_dispatched(
+            cut, "g7", gym_instance_id="tools/replica-0"
+        )
+    )
+
+    _mutate(
+        lambda cut: restored.release_refused_dispatch(cut, "g7", generation_index=1)
+    )
+
+    attempt = restored.get_group("g7").siblings[1].current_attempt
+    assert attempt.status is RolloutAttemptStatus.RESERVED
+    assert attempt.gym_attempt == 1
+    assert (
+        restored.get_group("g7").gym_episode(1)
+        in restored.gym_checkpoint_inventory({"tools/replica-0"})["tools/replica-0"]
+    )
+
+
+def test_refusal_requires_a_dispatched_attempt() -> None:
+    ledger = RolloutRecoveryLedger()
+    _dispatched_turn_group(ledger)
+    _mutate(lambda cut: ledger.release_refused_dispatch(cut, "g7", generation_index=0))
+
+    with pytest.raises(ValueError, match="only a dispatched rollout attempt"):
+        _mutate(
+            lambda cut: ledger.release_refused_dispatch(cut, "g7", generation_index=0)
+        )
+
+
+def test_dropping_a_dispatched_group_records_its_gym_episodes_for_retirement() -> None:
+    """Gym keeps running what it admitted, so the next checkpoint must retire it."""
+    abandoned_ledger = RolloutRecoveryLedger()
+    abandoned = _dispatched_turn_group(abandoned_ledger)
+    _mutate(lambda cut: abandoned_ledger.abandon_unsealed(cut, "g7"))
+
+    discarded_ledger = RolloutRecoveryLedger()
+    discarded = _dispatched_turn_group(discarded_ledger)
+    _mutate(lambda cut: discarded_ledger.discard_group(cut, "g7"))
+
+    for ledger, group in ((abandoned_ledger, abandoned), (discarded_ledger, discarded)):
+        assert ledger.gym_checkpoint_retirements({"tools/replica-0"}) == {
+            "tools/replica-0": tuple(
+                sorted(group.gym_episode(index) for index in (0, 1))
+            )
+        }
+    # Bookkeeping for this process's Gym executions, never persisted.
+    reloaded = RolloutRecoveryLedger.from_state_dict(abandoned_ledger.state_dict())
+    assert reloaded.gym_checkpoint_retirements({"tools/replica-0"}) == {
+        "tools/replica-0": ()
+    }
+
+
+def test_attempts_that_never_reached_gym_are_not_retired() -> None:
+    ledger = RolloutRecoveryLedger()
+    _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=2,
+        target_step=7,
+        start_weight_version=6,
+        recovery_granularity=RecoveryGranularity.SIBLING,
+        restore_level=RecoveryTargetLevel.TURN,
+        admitted=True,
+    )
+    _mutate(lambda cut: ledger.abandon_unsealed(cut, "g7"))
+
+    assert ledger.gym_checkpoint_retirements({"tools/replica-0"}) == {
+        "tools/replica-0": ()
+    }
+
+
+def test_dropping_a_restored_reserved_attempt_retires_its_restored_gym_state() -> None:
+    ledger = RolloutRecoveryLedger()
+    _dispatched_turn_group(ledger)
+    restored = RolloutRecoveryLedger.from_state_dict(ledger.state_dict())
+    episodes = restored.gym_checkpoint_inventory({"tools/replica-0"})["tools/replica-0"]
+    _mutate(
+        lambda cut: restored.prepare_for_restart(
+            cut,
+            restored_gym_episodes={
+                ("tools/replica-0", *episode) for episode in episodes
+            },
+        )
+    )
+    group = restored.get_group("g7")
+
+    _mutate(lambda cut: restored.discard_group(cut, "g7"))
+
+    retired = restored.gym_checkpoint_retirements({"tools/replica-0"})[
+        "tools/replica-0"
+    ]
+    assert set(retired) == {group.gym_episode(index) for index in (0, 1)}
+    assert {attempt for _, attempt in retired} == {1}
+
+
+def test_mark_gym_retired_keeps_drops_recorded_after_the_retire_was_sent() -> None:
+    ledger = RolloutRecoveryLedger()
+    first = _dispatched_turn_group(ledger)
+    _mutate(lambda cut: ledger.abandon_unsealed(cut, "g7"))
+    sent = ledger.gym_checkpoint_retirements({"tools/replica-0"})
+
+    later = _mutate(
+        lambda cut: ledger.reserve_group(
+            cut,
+            group_id="g8",
+            admission_id="batch-8",
+            prompt_id="8",
+            prompt_payload=_prompt(8),
+            expected_generations=1,
+            target_step=8,
+            start_weight_version=7,
+            restore_level=RecoveryTargetLevel.TURN,
+            admitted=True,
+        )
+    )
+    _mutate(
+        lambda cut: ledger.mark_group_dispatched(
+            cut, "g8", gym_instance_id="tools/replica-0"
+        )
+    )
+    later = ledger.get_group("g8")
+    _mutate(lambda cut: ledger.abandon_unsealed(cut, "g8"))
+
+    ledger.mark_gym_retired(sent)
+
+    assert ledger.gym_checkpoint_retirements({"tools/replica-0"}) == {
+        "tools/replica-0": (later.gym_episode(0),)
+    }
+    assert (
+        first.gym_episode(0)
+        not in ledger.gym_checkpoint_retirements({"tools/replica-0"})["tools/replica-0"]
+    )

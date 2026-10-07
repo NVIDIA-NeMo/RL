@@ -109,6 +109,26 @@ class GymTransportError(RolloutInfraFailure):
     """NeMo-Gym failed at the transport layer rather than returning a rollout."""
 
 
+class GymAdmissionClosed(RolloutInfraFailure):
+    """NeMo-Gym refused a new ``/run`` because a checkpoint has admission closed.
+
+    Gym refuses before it records anything for the episode, so the attempt is
+    unwound and re-dispatched once dispatch admission reopens. The NemoGym actor
+    yields it per row instead of raising, so rows Gym did admit keep streaming.
+    It is INFRA only as a fallback: a caller without a dispatch recorder that
+    raises it retries the row instead of charging the prompt a data failure.
+    """
+
+    def __init__(self, detail: str, rowidx: int) -> None:
+        # Both values ride in ``args`` so the exception pickles across Ray.
+        super().__init__(detail, rowidx)
+        self.detail = detail
+        self.rowidx = rowidx
+
+    def __str__(self) -> str:
+        return self.detail
+
+
 class RolloutDataFailure(RolloutFailure):
     """This prompt cannot be rolled out, and another shard would fail identically.
 
