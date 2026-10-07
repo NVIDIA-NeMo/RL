@@ -44,6 +44,15 @@ reference logprobs and a positive reference KL penalty.
 `colocated.enabled` defaults to `true`. Its `resources` block only applies when
 it is `false`, matching the structure of `policy.generation.colocated`.
 
+### Actor layout
+
+After setup, stdout shows the NVLink domain, hosts, advertised Ray GPU count,
+roles on each host-local GPU, and CPU actors. Teacher labels list actual config
+aliases and checkpoints. Every distinct layout prints automatically, with exact
+repeated rows collapsed into host ranges. A dedicated head can show a known
+physical domain while advertising zero GPUs. Missing actor or GPU inventory is
+reported explicitly.
+
 ### Mandatory settings
 
 1. **Enable the TransferQueue data plane** (required — the entrypoint refuses to start otherwise):

@@ -1754,7 +1754,7 @@ class TestSetup:
         setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         assert events[0] == "reserve_train"
-        train_cluster.get_placement_groups.assert_called_once_with()
+        assert events.index("reserve_train") < events.index("build_generation")
 
     def test_effort_levels_reach_the_rollout_manager(self, patched_factories):
         """env.nemo_gym.effort_levels is resolved into RolloutManager's kwarg.
@@ -3398,7 +3398,7 @@ def test_legacy_setup_reserves_teachers_before_generation(
         ),
     )
     setup_single_controller(config, tokenizer="tokenizer", processor=None)
-    assert events == ["teachers", "generation"]
+    assert events == ["teachers", "generation", "generation"]
 
 
 def _set_reference(config, **resources):
