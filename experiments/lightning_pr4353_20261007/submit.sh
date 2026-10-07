@@ -9,8 +9,7 @@ action=${3:-submit}
 [[ "$action" == submit || "$action" == test-only ]]
 
 if [[ "$arm" == option-a ]]; then
-  : "${CUBLAS_GROUPED_GEMM_PATCH_RECORD:?Option A requires a verified fix for NVBUG 6815125}"
-  test -s "$CUBLAS_GROUPED_GEMM_PATCH_RECORD"
+  echo "WARNING: Option A uses an unpatched cuBLASLt grouped-GEMM path (NVBUG 6815125). Check numerical metrics before using results." >&2
 fi
 
 : "${CONTAINER:?Set smoke-validated immutable nightly image}"

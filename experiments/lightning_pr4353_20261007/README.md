@@ -16,8 +16,9 @@ The MXFP8 arms use #4353 to send logical BF16 refit weights; vLLM converts
 them to MXFP8. The TE precision recipe keeps non-routed modules in BF16 and
 inherits the outer model-init storage policy for first/last BF16 layers.
 
-Option A must not run until the cuBLASLt fix for NVBUG 6815125 is verified in
-the immutable container and recorded in `CUBLAS_GROUPED_GEMM_PATCH_RECORD`.
+Option A is explicitly an unpatched diagnostic at the user's request. NVBUG
+6815125 describes possible silent output corruption, so its timing is not a
+usable recommendation without a numerical comparison against the control.
 Option B additionally enables fused weighted squared ReLU because the model
 uses `relu2`; without it, this MCore version rejects the op-fuser path.
 
