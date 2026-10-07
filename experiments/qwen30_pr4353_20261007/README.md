@@ -21,3 +21,12 @@ quoting a speedup.
 Pull the pushed source commit once before preparing its immutable archive.
 Wait for archive preparation to finish before submitting the GPU arms, so
 concurrent `git pull` calls do not race on the shared checkout.
+
+Set `VLLM_ATTENTION_BACKEND=TRITON_ATTN` to select Triton attention while
+keeping the configured FlashInfer TRTLLM MoE backend. The launcher gives
+this variant a separate run name and node-local cache. `SOURCE_COMMIT` may
+point to an existing immutable source archive when only the submission
+script changes; set `LAUNCH_COMMIT` to the pushed launcher commit in that case.
+Compare the BF16/BF16 attention A/B to measure backend overhead. The
+FlashInfer-attention MXFP8 runs have nonfinite generation logprobs, so their
+timing is diagnostic rather than an accuracy-qualified speed comparison.

@@ -19,14 +19,27 @@ esac
 : "${WANDB_API_KEY:?W&B cloud logging must be enabled}"
 
 repo=$(git rev-parse --show-toplevel)
-test "$(git -C "$repo" rev-parse HEAD)" = "$SOURCE_COMMIT"
+launch_commit=${LAUNCH_COMMIT:-$SOURCE_COMMIT}
+test "$(git -C "$repo" rev-parse HEAD)" = "$launch_commit"
 test -z "$(git -C "$repo" status --porcelain --untracked-files=no --ignore-submodules=none)"
 
 max_steps=${MAX_STEPS:-20}
 account=${SLURM_ACCOUNT:-coreai_dlalgo_nemorl}
 name="qwen30-pr4353-async-${arm}-${max_steps}step${RUN_SUFFIX:+-${RUN_SUFFIX}}"
+attention_backend=${VLLM_ATTENTION_BACKEND:-}
+attention_override=""
+attention_suffix=""
+if [[ -n "$attention_backend" ]]; then
+  case "$attention_backend" in
+    TRITON_ATTN) ;;
+    *) echo "Unsupported attention backend: $attention_backend" >&2; exit 2 ;;
+  esac
+  attention_override="+policy.generation.vllm_kwargs.attention_backend=${attention_backend}"
+  attention_suffix="-${attention_backend,,}"
+  name="${name}${attention_suffix}"
+fi
 run_root="${RESULT_ROOT}/${name}"
-local_root="/raid/scratch/${USER}/nr-qwen30-${SOURCE_COMMIT:0:10}-${arm}"
+local_root="/raid/scratch/${USER}/nr-qwen30-${SOURCE_COMMIT:0:10}-${arm}${attention_suffix}"
 source_root="${local_root}/source"
 te_config_file="${source_root}/experiments/lightning_pr4353_20261007/te-routed-mxfp8.yaml"
 te_config_override=""
@@ -62,7 +75,7 @@ export UV_CACHE_DIR=${local_root}/uv VLLM_CACHE_ROOT=${local_root}/vllm TORCHIND
 export PYTHONPYCACHEPREFIX=${local_root}/pycache RAY_TMPDIR=/tmp
 unset NRL_IGNORE_VERSION_MISMATCH PYTHONOPTIMIZE
 /opt/nemo_rl_venv/bin/python tools/config_cli.py expand experiments/qwen30_pr4353_20261007/${config} >/dev/null
-/opt/nemo_rl_venv/bin/python examples/run_grpo.py --config experiments/qwen30_pr4353_20261007/${config} ${te_config_override} grpo.max_num_steps=${max_steps} logger.log_dir=${run_root}/metrics logger.wandb.name=${name}"
+/opt/nemo_rl_venv/bin/python examples/run_grpo.py --config experiments/qwen30_pr4353_20261007/${config} ${te_config_override} ${attention_override} grpo.max_num_steps=${max_steps} logger.log_dir=${run_root}/metrics logger.wandb.name=${name}"
 
 args=(--nodes=4 --gres=gpu:4 --exclusive --mem=0 --account="$account" --partition=batch --time=04:00:00
   --segment=2 --job-name="${account}.${name}" --output="${run_root}/slurm-%j.out"
@@ -70,5 +83,6 @@ args=(--nodes=4 --gres=gpu:4 --exclusive --mem=0 --account="$account" --partitio
 if [[ "$action" == test-only ]]; then
   args+=(--test-only)
 fi
-printf 'source=%s\ncontainer=%s\nconfig=%s\narm=%s\n' "$SOURCE_COMMIT" "$CONTAINER" "$config" "$arm"
+printf 'launcher=%s\nsource=%s\ncontainer=%s\nconfig=%s\narm=%s\nattention=%s\n' \
+  "$launch_commit" "$SOURCE_COMMIT" "$CONTAINER" "$config" "$arm" "${attention_backend:-auto}"
 exec sbatch "${args[@]}" "$repo/ray.sub"
