@@ -163,57 +163,6 @@ name = "nv-grouped-gemm"
 version = "1.1.4.post7"
 requires-dist = ["setuptools", "wheel", "torch", "numpy"]
 
-[[manifest.dependency-metadata]]
-name = "nvidia-cutlass-dsl"
-version = "4.5.0"
-requires-dist = ["nvidia-cutlass-dsl-libs-cu13==4.5.0 ; extra == 'cu13'"]
-provides-extras = ["cu13"]
-
-[[manifest.dependency-metadata]]
-name = "nvidia-cutlass-dsl"
-version = "4.5.1"
-requires-dist = ["nvidia-cutlass-dsl-libs-cu13==4.5.1 ; extra == 'cu13'"]
-provides-extras = ["cu13"]
-
-[[manifest.dependency-metadata]]
-name = "nvidia-cutlass-dsl"
-version = "4.5.2"
-requires-dist = ["nvidia-cutlass-dsl-libs-cu13==4.5.2 ; extra == 'cu13'"]
-provides-extras = ["cu13"]
-
-[[manifest.dependency-metadata]]
-name = "nvidia-cutlass-dsl-libs-cu13"
-version = "4.5.0"
-requires-dist = ["numpy", "typing-extensions", "cuda-python>=12.8"]
-
-[[manifest.dependency-metadata]]
-name = "nvidia-cutlass-dsl-libs-cu13"
-version = "4.5.1"
-requires-dist = ["numpy", "typing-extensions", "cuda-python>=12.8"]
-
-[[manifest.dependency-metadata]]
-name = "nvidia-cutlass-dsl-libs-cu13"
-version = "4.5.2"
-requires-dist = ["numpy", "typing-extensions", "cuda-python>=12.8"]
-
-[[manifest.dependency-metadata]]
-name = "tensorrt"
-version = "10.16.1.11"
-requires-dist = ["tensorrt-cu13==10.16.1.11"]
-
-[[manifest.dependency-metadata]]
-name = "tensorrt-cu13"
-version = "10.16.1.11"
-requires-dist = ["tensorrt-cu13-libs==10.16.1.11", "tensorrt-cu13-bindings==10.16.1.11"]
-
-[[manifest.dependency-metadata]]
-name = "tensorrt-cu13-bindings"
-version = "10.16.1.11"
-
-[[manifest.dependency-metadata]]
-name = "tensorrt-cu13-libs"
-version = "10.16.1.11"
-
 [[package]]
 name = "absl-py"
 version = "2.5.0"

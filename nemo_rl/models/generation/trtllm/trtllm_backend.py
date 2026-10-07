@@ -31,10 +31,7 @@ from typing import Any
 import torch
 import zmq
 
-try:
-    from tensorrt_llm.executor.ray.utils import control_action_decorator
-except ImportError:
-    from tensorrt_llm._ray_utils import control_action_decorator
+from tensorrt_llm.executor.ray.utils import control_action_decorator
 from tensorrt_llm.llmapi.rlhf_utils import WorkerExtension
 
 from nemo_rl.models.policy.utils import (
@@ -116,31 +113,6 @@ class NcclExtension(WorkerExtension):
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         self.state_dict_info = state_dict_info
 
-    def _finalize_weight_update(self) -> None:
-        """Finalize refit using TRT-LLM's CUDA-graph-safe path when available."""
-        # WorkerExtension gained this shared path after refit lifecycle hooks.
-        # Retain the fallback while NeMo-RL supports older TRT-LLM releases.
-        finalize_weight_update = getattr(
-            WorkerExtension, "finalize_weight_update", None
-        )
-        if finalize_weight_update is not None:
-            finalize_weight_update(self)
-            return
-
-        model_engine = self.engine.model_engine
-        _call_model_loader_hook_if_available(
-            model_engine.model_loader, "finalize_update_weights"
-        )
-        for module in model_engine.model.modules():
-            if hasattr(module, "process_weights_after_loading") and not getattr(
-                module, "_weights_removed", False
-            ):
-                module.process_weights_after_loading()
-            if hasattr(module, "post_load_weights") and not getattr(
-                module, "_weights_removed", False
-            ):
-                module.post_load_weights()
-
     # ------------------------------------------------------------------ #
     #  NCCL weight receive + reload
     # ------------------------------------------------------------------ #
@@ -179,29 +151,22 @@ class NcclExtension(WorkerExtension):
 
         with self.engine.control_action(drain=drain):
             try:
-                # TRT-LLM uses the overlap scheduler by default: control_action
-                # fires at a step boundary as soon as scheduling for the previous
-                # iter is enqueued, but its GPU forward may still be in flight.
-                # Block here so we don't overwrite weights mid-forward
-                torch.cuda.synchronize()
-                _call_model_loader_hook_if_available(
-                    model_engine.model_loader, "begin_update_weights"
-                )
-                for module in model.modules():
-                    if hasattr(module, "pre_reload_weights") and not getattr(
-                        module, "_weights_removed", False
-                    ):
-                        module.pre_reload_weights()
+                # Delegate the whole refit lifecycle to WorkerExtension: begin
+                # unwraps a torch.compile'd model (without which load_weights
+                # matches nothing and allow_partial_loading silently keeps the
+                # old weights), finish re-wraps it and resets the prefix cache.
+                # The device is already quiesced -- py_executor's
+                # _handle_control_request synchronizes before releasing the
+                # barrier control_action waits on.
+                self.begin_weight_update()
                 packed_broadcast_consumer(
                     iterator=iter(self.state_dict_info.items()),
                     group=self.model_update_group,
                     src=0,
                     post_unpack_func=load_model_weight_func,
                 )
-                self._finalize_weight_update()
-                torch.cuda.current_stream().synchronize()
-
-                self.engine.reset_prefix_cache()
+                self.finalize_weight_update()
+                self.finish_weight_update()
             except Exception as e:
                 _call_model_loader_hook_if_available(
                     model_engine.model_loader, "abort_update_weights"
@@ -247,14 +212,7 @@ class NcclExtension(WorkerExtension):
         weights = None
         try:
             self.maybe_init_zmq()
-            _call_model_loader_hook_if_available(
-                model_engine.model_loader, "begin_update_weights"
-            )
-            for module in model.modules():
-                if hasattr(module, "pre_reload_weights") and not getattr(
-                    module, "_weights_removed", False
-                ):
-                    module.pre_reload_weights()
+            self.begin_weight_update()
 
             while True:
                 payload = self.zmq_socket.recv_pyobj()
@@ -299,9 +257,8 @@ class NcclExtension(WorkerExtension):
                 buffer = None
                 self.zmq_socket.send(IPCProtocol.ACK.value.encode())
 
-            self._finalize_weight_update()
-            torch.cuda.current_stream().synchronize()
-            self.engine.reset_prefix_cache()
+            self.finalize_weight_update()
+            self.finish_weight_update()
             gc.collect()
             torch.cuda.empty_cache()
             return True

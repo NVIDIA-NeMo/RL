@@ -598,42 +598,6 @@ torch-memory-saver = { TMS_CUDA_MAJOR = "13" }
 # both architectures (2h47m aarch64, ~2h x86 alongside TE/flash-mla).
 flash-attn = { MAX_JOBS = "4" }
 
-# CUTLASS DSL 4.5.x publishes overlapping base and cu13 wheels. Override the
-# affected metadata so those versions use the self-contained cu13 wheel, while
-# 4.6.x retains libs-base/libs-core for its common Python and MLIR modules.
-[[tool.uv.dependency-metadata]]
-name = "nvidia-cutlass-dsl"
-version = "4.5.0"
-requires-dist = ["nvidia-cutlass-dsl-libs-cu13==4.5.0; extra == 'cu13'"]
-provides-extras = ["cu13"]
-
-[[tool.uv.dependency-metadata]]
-name = "nvidia-cutlass-dsl"
-version = "4.5.1"
-requires-dist = ["nvidia-cutlass-dsl-libs-cu13==4.5.1; extra == 'cu13'"]
-provides-extras = ["cu13"]
-
-[[tool.uv.dependency-metadata]]
-name = "nvidia-cutlass-dsl"
-version = "4.5.2"
-requires-dist = ["nvidia-cutlass-dsl-libs-cu13==4.5.2; extra == 'cu13'"]
-provides-extras = ["cu13"]
-
-[[tool.uv.dependency-metadata]]
-name = "nvidia-cutlass-dsl-libs-cu13"
-version = "4.5.0"
-requires-dist = ["numpy", "typing-extensions", "cuda-python>=12.8"]
-
-[[tool.uv.dependency-metadata]]
-name = "nvidia-cutlass-dsl-libs-cu13"
-version = "4.5.1"
-requires-dist = ["numpy", "typing-extensions", "cuda-python>=12.8"]
-
-[[tool.uv.dependency-metadata]]
-name = "nvidia-cutlass-dsl-libs-cu13"
-version = "4.5.2"
-requires-dist = ["numpy", "typing-extensions", "cuda-python>=12.8"]
-
 # Needed when building from source
 [[tool.uv.dependency-metadata]]
 name = "flash-attn"
@@ -678,36 +642,6 @@ name = "nv-grouped-gemm"
 # This version has to match the version in the commit/rev/tag used
 version = "v1.1.4.post7"
 requires-dist = ["setuptools", "wheel", "torch", "numpy"]
-
-# TensorRT: wheel_stub packages download multi-GB binaries when built from source.
-# Providing static metadata here lets `uv lock` resolve the dep graph without
-# triggering the download. At `uv sync --extra trtllm` time (inside Docker where
-# there is sufficient disk space), uv installs them normally via wheel_stub.
-# Metadata sourced from https://pypi.org/pypi/tensorrt*/10.16.1.11/json.
-[[tool.uv.dependency-metadata]]
-name = "tensorrt"
-version = "10.16.1.11"
-requires-dist = ["tensorrt-cu13==10.16.1.11"]
-
-[[tool.uv.dependency-metadata]]
-name = "tensorrt-cu13"
-version = "10.16.1.11"
-requires-dist = [
-  "tensorrt-cu13-libs==10.16.1.11",
-  "tensorrt-cu13-bindings==10.16.1.11",
-]
-
-# wheel_stub — downloads the actual C++ library binary at install time.
-[[tool.uv.dependency-metadata]]
-name = "tensorrt-cu13-libs"
-version = "10.16.1.11"
-requires-dist = []
-
-# wheel_stub — downloads the Python bindings binary at install time.
-[[tool.uv.dependency-metadata]]
-name = "tensorrt-cu13-bindings"
-version = "10.16.1.11"
-requires-dist = []
 
 # Override logsage metadata to:
 # 1. Remove numpy<=2.0.2 and pandas<=2.3.3 upper bounds

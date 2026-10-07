@@ -95,9 +95,7 @@ WHEEL_OUTPUT_DIR=${WHEEL_OUTPUT_DIR:-/opt/trtllm_wheels}
 mkdir -p "$WHEEL_OUTPUT_DIR"
 
 echo "Building TensorRT-LLM from:"
-# Redact embedded credentials if a private source URL is supplied; this output
-# ends up in build logs / CI artifacts.
-echo "  TRT-LLM Git URL: $(sed -E 's#://[^/@]*@#://<redacted>@#' <<<"$GIT_URL")"
+echo "  TRT-LLM Git URL: $GIT_URL"
 echo "  TRT-LLM Git ref: $GIT_REF"
 
 # git-lfs is required because TRT-LLM ships its `internal_cutlass_kernels`
@@ -127,14 +125,14 @@ git lfs install --skip-repo
 # `--branch` only accepts branch/tag names, not commit hashes.
 # Use init + fetch --depth=1 <hash> to get a shallow clone at a specific commit.
 echo "Cloning TensorRT-LLM..."
+# A private fork is cloned over ssh via the TRT-LLM RUN's --mount=type=ssh.
+# Inside Docker the known_hosts file is empty, so the host-key check would
+# fail. Exported because git lfs pull and git submodule update run after the
+# fetch and clone over the same transport.
+export GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 git init "$BUILD_DIR"
-# set -x is on (see top of script) and would otherwise trace these commands
-# with $GIT_URL fully expanded -- including any embedded credentials -- right
-# next to the redacted echo above. Quiet the trace for just these two lines.
-set +x
 git -C "$BUILD_DIR" remote add origin "$GIT_URL"
 git -C "$BUILD_DIR" fetch --depth=1 origin "$GIT_REF"
-set -x
 git -C "$BUILD_DIR" checkout FETCH_HEAD
 cd "$BUILD_DIR"
 echo "Fetching LFS objects (internal_cutlass_kernels archives)..."
@@ -166,19 +164,14 @@ sed -i '/^PyNvVideoCodec/d' requirements.txt
 #     match.
 sed -i '/^nvidia-modelopt/d' requirements.txt
 
-# cutlass_kernels/CMakeLists.txt used to invoke `setup_library.py develop
-# --user`, which needed a setup.py shim and passed a flag that is invalid
-# inside a venv. tekit de0cf4d8a dropped that execute_process entirely and now
-# puts the cutlass python dir on PYTHONPATH for generate_kernels.py instead, so
-# the rewrite below is only needed on refs predating it. Guarded rather than
-# asserted: on current refs the target is legitimately absent.
-if grep -qF 'COMMAND ${Python3_EXECUTABLE} setup_library.py develop --user' \
-        cpp/tensorrt_llm/kernels/cutlass_kernels/CMakeLists.txt; then
-    sed -i 's|COMMAND \${Python3_EXECUTABLE} setup_library.py develop --user|COMMAND bash -c "cp -f setup_library.py setup.py \&\& \${Python3_EXECUTABLE} setup_library.py develop"|' \
-        cpp/tensorrt_llm/kernels/cutlass_kernels/CMakeLists.txt
-else
-    echo "[INFO] setup_library.py develop --user not present; ref already carries the PYTHONPATH fix"
-fi
+# cutlass_kernels/CMakeLists.txt invokes `setup_library.py develop --user`,
+# which (a) requires a setup.py shim and (b) the `--user` flag is invalid
+# inside a venv. Rewrite the COMMAND to copy setup_library.py to setup.py
+# (so `develop` finds a buildable target) and drop `--user`.
+assert_patch_target cpp/tensorrt_llm/kernels/cutlass_kernels/CMakeLists.txt \
+    'COMMAND ${Python3_EXECUTABLE} setup_library.py develop --user'
+sed -i 's|COMMAND \${Python3_EXECUTABLE} setup_library.py develop --user|COMMAND bash -c "cp -f setup_library.py setup.py \&\& \${Python3_EXECUTABLE} setup_library.py develop"|' \
+    cpp/tensorrt_llm/kernels/cutlass_kernels/CMakeLists.txt
 
 # SM arch list. Sourced from BUILD_CUSTOM_TRTLLM_ARCH so it stays in sync with
 # _backend.py, which folds the same value into the wheel cache key (a change to
@@ -236,8 +229,8 @@ export LD_LIBRARY_PATH="${TORCH_LIB_DIR}:${LD_LIBRARY_PATH:-}"
 # (`python3 -m pip install -r requirements-dev.txt`), which honours that file --
 # and those versions are vendored into the image rather than published, so they
 # are unreachable from any index. Concretely: the image pins
-# `cuda-python==13.4.0`, which does not exist on PyPI at all (latest 13.x is
-# 13.3.1, already installed here), so `cuda-python>=13` -- otherwise satisfied
+# `cuda-python==13.4.0`, which was never published to PyPI (this venv already
+# has 13.4.1 from uv.lock), so `cuda-python>=13` -- otherwise satisfied
 # -- becomes unresolvable. This venv is uv-managed and owes the base image's
 # site-packages nothing, so drop the constraint for the build.
 unset PIP_CONSTRAINT
@@ -305,6 +298,23 @@ if ((TRTLLM_BUILD_STATUS != 0)); then
     echo "[ERROR] TensorRT-LLM build failed with exit code ${TRTLLM_BUILD_STATUS}."
     exit "$TRTLLM_BUILD_STATUS"
 fi
+# CMake drops UCX and NIXL without an error when it cannot find them --
+# find_package(ucx) only sets ENABLE_UCX=0, and find_package(NIXL) is not
+# REQUIRED -- so a wheel missing both wrappers builds, gets cached and is
+# reused, and only aborts at the first KV transfer. The guard above checks the
+# inputs; check the wheel itself before it is cached.
+python3 - "$BUILD_DIR"/build/tensorrt_llm-*.whl <<'PY'
+import sys, zipfile
+names = set(zipfile.ZipFile(sys.argv[1]).namelist())
+libs = ("libtensorrt_llm_ucx_wrapper.so", "libtensorrt_llm_nixl_wrapper.so")
+missing = [lib for lib in libs if f"tensorrt_llm/libs/{lib}" not in names]
+if missing:
+    sys.exit(
+        f"[ERROR] {sys.argv[1]} is missing {missing}; "
+        "UCX/NIXL were not found at cmake time"
+    )
+PY
+
 echo "Copying TensorRT-LLM wheel to ${WHEEL_OUTPUT_DIR}..."
 cp "$BUILD_DIR"/build/tensorrt_llm-*.whl "$WHEEL_OUTPUT_DIR/"
 

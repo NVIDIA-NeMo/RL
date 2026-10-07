@@ -37,7 +37,6 @@ from __future__ import annotations
 import hashlib
 import os
 import platform
-import re
 import shutil
 import subprocess
 import sys
@@ -66,39 +65,12 @@ REQUIRES: list[str] = _META["project"].get("dependencies", [])
 # There is no env-var override — to build a different fork/ref, edit
 # [tool.trtllm].
 #
-# The url may embed ``${VAR}`` placeholders when a private fork is used. The raw
-# string is folded into the wheel cache key; only the value handed to the build
-# script is expanded, so a rotated token never invalidates the cache or lands in
-# a cache path. See _expanded_trtllm_url.
+# A private fork is cloned over ssh, the same way build-custom-vllm.sh and
+# build-custom-flashinfer.sh do it: set an ssh url in [tool.trtllm] and the
+# TRT-LLM RUN's --mount=type=ssh in docker/Dockerfile carries the agent through.
 _TRTLLM: dict[str, str] = _META["tool"]["trtllm"]
 TRTLLM_URL: str = _TRTLLM["url"]
 TRTLLM_REF: str = _TRTLLM["ref"]
-
-
-def _expanded_trtllm_url(env: dict[str, str]) -> str:
-    """Expand ``${VAR}`` placeholders in TRTLLM_URL from *env*.
-
-    Args:
-        env: Environment mapping to resolve placeholders against.
-
-    Returns:
-        The url with every ``${VAR}`` replaced by its value in *env*.
-
-    Raises:
-        RuntimeError: If a referenced variable is unset or empty. Substituting
-            an empty token would otherwise produce a URL that fails to
-            authenticate with an opaque git error deep inside the build.
-    """
-    missing = [
-        name for name in re.findall(r"\$\{(\w+)\}", TRTLLM_URL) if not env.get(name)
-    ]
-    if missing:
-        raise RuntimeError(
-            f"[tool.trtllm].url references {', '.join(missing)}, which "
-            f"{'is' if len(missing) == 1 else 'are'} unset or empty. "
-            "Pass the value into the build environment before building."
-        )
-    return re.sub(r"\$\{(\w+)\}", lambda m: env[m.group(1)], TRTLLM_URL)
 
 
 def _wheel_platform_tag() -> str:
@@ -129,17 +101,21 @@ _DEFAULT_ARCH = "90-real;100-real"
 def _build_input_tag(arch: str) -> str:
     """Build-affecting inputs (beyond url/ref/version/platform) for the cache key.
 
-    The compiled wheel depends on the SM arch list and the torch/CUDA toolchain
-    it links against, so a change to any of these — without a git_ref bump —
-    would otherwise silently reuse a stale cached wheel. torch is imported
-    lazily so prepare_metadata_for_build_wheel (called under ``uv lock`` without
-    torch) never triggers it.
+    The compiled wheel depends on the SM arch list, the torch/CUDA toolchain it
+    links against, and the NIXL it bundles, so a change to any of these —
+    without a git_ref bump — would otherwise silently reuse a stale cached
+    wheel. torch is imported lazily so prepare_metadata_for_build_wheel (called
+    under ``uv lock`` without torch) never triggers it.
     """
     # Import lazily because metadata-only hooks do not need this heavy dependency.
     import torch  # noqa: PLC0415
 
     toolchain = f"torch{torch.__version__},cuda{torch.version.cuda}"
-    return f"arch={arch}|{toolchain}"
+    # build_wheel.py copies /opt/nvidia/nvda_nixl into the wheel, so the image's
+    # NIXL is a build input. docker/Dockerfile re-exports NIXL_VERSION as ENV
+    # for exactly this (the NGC base image otherwise reports its own 1.0.1).
+    nixl = os.environ.get("NIXL_VERSION", "")
+    return f"arch={arch}|{toolchain}|nixl={nixl}"
 
 
 def _wheel_cache_dir(base: str, git_url: str, git_ref: str, build_inputs: str) -> Path:
@@ -248,20 +224,12 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
         env["WHEEL_OUTPUT_DIR"] = str(cache_dir)
         venv_bin = str(Path(sys.executable).parent)
         env["PATH"] = f"{venv_bin}:{env.get('PATH', os.defpath)}"
-        # check=False + explicit raise: CalledProcessError stringifies the full
-        # argv, which would print the expanded url -- clone token and all --
-        # into the build log on any failure.
-        result = subprocess.run(
-            ["bash", str(script), _expanded_trtllm_url(env), git_ref],
-            check=False,
+        subprocess.run(
+            ["bash", str(script), git_url, git_ref],
+            check=True,
             env=env,
             cwd=str(repo_root),
         )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"build-custom-trtllm.sh failed with exit code {result.returncode} "
-                f"for ref {git_ref} (url redacted). See the build output above."
-            )
         wheel = max(cache_dir.glob("tensorrt_llm-*.whl"), default=None)
         if wheel is None:
             raise RuntimeError(
