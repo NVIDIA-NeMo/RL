@@ -199,16 +199,6 @@ sbatch ray.sub \
   - Minimum port in the range for Ray worker processes.
 * - `MAX_WORKER_PORT=2999`
   - Maximum port in the range for Ray worker processes.
-* - `NRL_RAY_RUNTIME_ENV_EXCLUDES`
-  - Unset by default. A comma-separated list of glob patterns that the driver's
-    `init_ray` places in the Ray runtime environment's `excludes`, so Ray leaves
-    the matching paths out of the `working_dir` package it ships to the workers.
-    A `working_dir` is packaged when the driver is started with `uv run` outside
-    `ray.sub` (Ray's `uv run` hook sets it to the current directory; `ray.sub`
-    turns that hook off). Set this when the launch directory carries data no
-    worker reads, such as vendored test data or local datasets, whose size would
-    exceed Ray's package upload limit. Patterns are relative to the working
-    directory, for example `NRL_RAY_RUNTIME_ENV_EXCLUDES="data/**,**/tests/**"`.
 ``````
 
 > [!NOTE]
@@ -216,6 +206,25 @@ sbatch ray.sub \
 > are already taken by some other service backgrounded on your cluster.
 > The defaults above are the source-of-truth port layout defined in `ray.sub`;
 > keep this table in sync with that block if the defaults ever change.
+
+#### Bare-metal `uv run` drivers: `NRL_RAY_RUNTIME_ENV_EXCLUDES`
+
+A `working_dir` is packaged only while Ray's `uv run` hook is active. NeMo RL
+switches that hook off when `nemo_rl` is imported (`nemo_rl/__init__.py`), so
+`examples/run_grpo.py` and every `ray.sub` launch package nothing and ignore
+this variable; a driver that imports `ray` before `nemo_rl`, such as
+`examples/run_grpo_single_controller.py`, keeps the hook on and packages its
+launch directory when run with `uv run`. For those drivers,
+`NRL_RAY_RUNTIME_ENV_EXCLUDES` (unset by default) is a comma-separated list of
+`.gitignore`-style patterns that `init_ray` places in the Ray runtime
+environment's `excludes`, so Ray leaves the matching paths out of the package.
+Set it when the launch directory carries data no worker reads, such as vendored
+test data or local datasets, whose size would exceed Ray's package upload
+limit. A pattern with a slash at its start or inside it is anchored to the
+working directory (`data/**`); a bare name matches at any depth (`tests`), for
+example `NRL_RAY_RUNTIME_ENV_EXCLUDES="data/**,tests"`. Ray already excludes
+`.git`, `.venv`, `venv` and `__pycache__` and honors `.gitignore` and
+`.rayignore`.
 
 ### Topology-Aware Placement for MoE (avoiding cross-rack stalls)
 
