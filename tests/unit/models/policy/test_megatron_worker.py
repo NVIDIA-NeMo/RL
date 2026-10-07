@@ -2267,7 +2267,7 @@ def create_megatron_test_config(
                 },
             },
         },
-        "dtensor_cfg": {
+        "automodel_cfg": {
             "enabled": False,  # Disabled for Megatron tests
         },
         "dynamic_batching": {

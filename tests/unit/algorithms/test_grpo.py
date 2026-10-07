@@ -2991,7 +2991,7 @@ def test_setup_dtensor_fp8_kv_cache_guard(
     master_config.data.update(shuffle=False, num_workers=0)
     master_config.policy.update(
         model_name="deepseek-v4-test",
-        dtensor_cfg={"enabled": True},
+        automodel_cfg={"enabled": True},
         megatron_cfg={"enabled": False},
     )
     master_config.policy["generation"]["vllm_cfg"].update(
@@ -3523,7 +3523,7 @@ def test_setup_auto_enables_skip_reference_logprobs_with_policy_factory(
 
     master_config = mock_grpo_components["master_config"]
     master_config.policy["model_name"] = "fake-model"
-    master_config.policy["dtensor_cfg"] = {"enabled": False}
+    master_config.policy["automodel_cfg"] = {"enabled": False}
     master_config.policy["megatron_cfg"] = {
         "enabled": False,
         "pipeline_model_parallel_size": 1,
@@ -3643,7 +3643,7 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
     master_config = mock_grpo_components["master_config"]
     master_config.policy["model_name"] = "test-model"
     master_config.policy["tokenizer"] = {"use_fastokens": False}
-    master_config.policy["dtensor_cfg"] = {"enabled": False}
+    master_config.policy["automodel_cfg"] = {"enabled": False}
     master_config.policy["megatron_cfg"] = {
         "enabled": False,
         "pipeline_model_parallel_size": 1,
@@ -3770,7 +3770,7 @@ def test_setup_refits_noncolocated_megatron_while_nemo_gym_waits(
     master_config = mock_grpo_components["master_config"]
     master_config.policy["model_name"] = "test-model"
     master_config.policy["tokenizer"] = {"use_fastokens": False}
-    master_config.policy["dtensor_cfg"] = {"enabled": False}
+    master_config.policy["automodel_cfg"] = {"enabled": False}
     master_config.policy["megatron_cfg"] = {
         "enabled": False,
         "pipeline_model_parallel_size": 1,
