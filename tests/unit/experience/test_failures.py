@@ -33,7 +33,7 @@ from nemo_rl.environments.nemo_gym import _gym_failure_row_error, _typed_gym_fai
 from nemo_rl.experience.failures import (
     FailureClass,
     GenerationUnavailable,
-    GymCheckpointParked,
+    GymAdmissionClosed,
     GymTransportError,
     NoHealthyShards,
     RolloutDataFailure,
@@ -302,8 +302,8 @@ def _gym_failure_row(
     }
 
 
-_PARKED_BODY = (
-    '{"error":{"code":"checkpoint_parked",'
+_ADMISSION_CLOSED_BODY = (
+    '{"error":{"code":"admission_closed",'
     '"detail":"agent admission is closed for a checkpoint"}}'
 )
 
@@ -312,16 +312,16 @@ _PARKED_BODY = (
 class TestGymFailureRowsKeepTheirRow:
     """Sidecar failure rows map to the same typed failures, and a refusal names its row."""
 
-    def test_checkpoint_parked_names_its_row_and_survives_the_boundary(self):
+    def test_admission_closed_names_its_row_and_survives_the_boundary(self):
         failure = _gym_failure_row_error(
-            {"_rowidx": 3}, _gym_failure_row(status=409, body=_PARKED_BODY)
+            {"_rowidx": 3}, _gym_failure_row(status=409, body=_ADMISSION_CLOSED_BODY)
         )
 
-        assert isinstance(failure, GymCheckpointParked)
+        assert isinstance(failure, GymAdmissionClosed)
         restored = ray_cloudpickle.loads(ray_cloudpickle.dumps(failure))
-        assert isinstance(restored, GymCheckpointParked)
+        assert isinstance(restored, GymAdmissionClosed)
         assert restored.rowidx == 3
-        assert "checkpoint_parked" in str(restored)
+        assert "admission_closed" in str(restored)
         # A raise without a dispatch recorder is retried, never charged as data.
         assert classify_rollout_failure(restored) is FailureClass.INFRA
 
