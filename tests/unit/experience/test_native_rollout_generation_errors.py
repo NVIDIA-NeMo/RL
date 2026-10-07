@@ -141,10 +141,30 @@ def test_native_rollout_success_still_returns_complete_trajectory(
 
 
 @pytest.mark.parametrize("successful_turns", [0, 1])
-@pytest.mark.parametrize("error_kind", ["timeout", "actor_death"])
+@pytest.mark.parametrize(
+    "backend,error_kind",
+    [
+        ("vllm", "timeout"),
+        ("vllm", "actor_death"),
+        pytest.param("megatron", "timeout", marks=pytest.mark.mcore),
+    ],
+)
 def test_retry_commits_only_success_and_never_replays_environment(
-    native_rollout, successful_turns, error_kind
+    native_rollout, successful_turns, backend, error_kind
 ):
+    if backend == "megatron":
+        from nemo_rl.models.generation.megatron.megatron_generation import (
+            MegatronGeneration,
+        )
+
+        policy_generation = object.__new__(MegatronGeneration)
+        policy_generation._owns_policy = False
+    else:
+        from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration
+
+        policy_generation = object.__new__(VllmGeneration)
+        policy_generation.cfg = {"vllm_cfg": {"async_engine": True}}
+
     calls = 0
     histories = []
 
@@ -169,7 +189,7 @@ def test_retry_commits_only_success_and_never_replays_environment(
         rollouts.run_sample_multi_turn_rollout(
             0,
             {key: value[0] for key, value in native_rollout.batch.items()},
-            MagicMock(),
+            policy_generation,
             native_rollout.tokenizer,
             {},
             32,

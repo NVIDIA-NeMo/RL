@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
+import os
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 
@@ -588,18 +590,63 @@ class MegatronGeneration(GenerationInterface):
         )
         return ray.get(future)
 
+    def supports_native_generation_retries(self) -> bool:
+        """The worker drains persistent-engine requests before acknowledging cancellation."""
+        return True
+
     async def generate_async(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
-        """Generate asynchronously, yielding `(index, batch)` tuples as they complete."""
+        """Generate asynchronously, yielding `(index, batch)` tuples as they complete.
+
+        NRL_MEGATRON_ASYNC_TIMEOUT_SECONDS bounds each pending output (default 900s).
+        Cancellation allows 30s for the worker to drain its persistent-engine
+        requests. Unconfirmed cleanup and dead distributed workers are fatal;
+        only acknowledged transient failures may be retried by the rollout layer.
+        """
+        timeout = float(os.environ.get("NRL_MEGATRON_ASYNC_TIMEOUT_SECONDS", "900"))
         worker = self._policy.worker_group.workers[0]
         futures = worker.generate_async.options(num_returns="streaming").remote(
             data=data, greedy=greedy
         )
-        async for result_ref in futures:
-            index, result_batch = await result_ref
-            result_batch["gen_leader_worker_idx"] = [0]
-            yield index, result_batch
+        from nemo_rl.experience.failures import RolloutDataFailure
+
+        completed = False
+        try:
+            while True:
+                async with asyncio.timeout(timeout):
+                    try:
+                        result_ref = await anext(futures)
+                    except StopAsyncIteration:
+                        break
+                    index, result_batch = await result_ref
+                result_batch["gen_leader_worker_idx"] = [0]
+                yield index, result_batch
+            completed = True
+        finally:
+            if not completed:
+                ray.cancel(futures)
+                try:
+                    async with asyncio.timeout(30):
+                        try:
+                            await futures.completed()
+                        except (
+                            ray.exceptions.TaskCancelledError,
+                            ray.exceptions.RayTaskError,
+                        ):
+                            # The worker's finally block has drained its engine requests.
+                            # Preserve the original exception (including application errors).
+                            pass
+                except ray.exceptions.ActorDiedError as error:
+                    # Megatron ranks share collectives; losing the leader cannot be
+                    # recovered by submitting another request to the same policy.
+                    raise RolloutDataFailure(
+                        "Megatron generation worker died; the inference policy must be rebuilt"
+                    ) from error
+                except Exception as error:
+                    raise RolloutDataFailure(
+                        "Could not confirm cleanup of Megatron generation requests"
+                    ) from error
 
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Initialize / re-enter inference mode on every worker.

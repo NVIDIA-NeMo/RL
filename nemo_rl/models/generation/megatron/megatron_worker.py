@@ -1258,6 +1258,8 @@ class MegatronGenerationMixin:
                 "Inference loop not initialized. Call prepare_for_generation() first."
             )
 
+        engine_futures = []
+
         async def _generate_single_item(
             index: int,
         ) -> tuple[int, BatchedDataDict[GenerationOutputSpec]]:
@@ -1273,15 +1275,38 @@ class MegatronGenerationMixin:
                 ),
                 self._inference_loop,
             )
-            result = await asyncio.wrap_future(future)
+            engine_future = asyncio.wrap_future(future)
+            engine_futures.append(engine_future)
+            # Cancelling the cross-thread future only cancels the local waiter:
+            # MCore may still be decoding. Keep ownership until its reply arrives.
+            result = await asyncio.shield(engine_future)
             output = self._parse_result_to_batched_data_dict(datum, result)
             return (index, output)
 
         tasks = [
             asyncio.create_task(_generate_single_item(i)) for i in range(data.size)
         ]
-        for result in asyncio.as_completed(tasks):
-            yield await result
+        try:
+            for result in asyncio.as_completed(tasks):
+                yield await result
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            # MCore's abort_request is fire-and-forget. A completed engine reply,
+            # unlike a cancelled local future, confirms that a retry cannot overlap
+            # the old request. The driver bounds this drain and fails closed if the
+            # engine is hung; it must never retry unacknowledged work.
+            drain = asyncio.gather(*tasks, *engine_futures, return_exceptions=True)
+            cancelled = False
+            while not drain.done():
+                try:
+                    await asyncio.shield(drain)
+                except asyncio.CancelledError:
+                    # Repeated cancellation must not acknowledge unfinished work.
+                    cancelled = True
+            if cancelled:
+                raise asyncio.CancelledError
 
     async def _generate_with_persistent_engine(
         self,
@@ -1290,7 +1315,10 @@ class MegatronGenerationMixin:
         sampling_params: list[SamplingParams],
     ) -> list:
         """Submit requests through the persistent inference client (rank 0 only)."""
-        from megatron.core.inference.inference_request import DynamicInferenceRequest
+        from megatron.core.inference.inference_request import (
+            DynamicInferenceRequest,
+            Status,
+        )
 
         dist_rank = torch.distributed.get_rank()
         assert dist_rank == 0, (
@@ -1312,6 +1340,10 @@ class MegatronGenerationMixin:
             )
 
         results: list[DynamicInferenceRequest] = await asyncio.gather(*futures)
+        if any(result.status != Status.COMPLETED for result in results):
+            # A FAILED engine reply is not an empty successful completion. MCore
+            # supplies no typed recoverable cause here, so surface it as fatal.
+            raise RuntimeError("Megatron inference returned an unsuccessful request")
         print(f"[Rank {dist_rank}] Completed {len(results)} requests")
         return results
 
