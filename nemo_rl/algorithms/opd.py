@@ -251,11 +251,18 @@ def _skip_prev_logprobs(master_config: Any) -> bool:
     """Whether the training loop will zero ``prev_logprobs`` instead of computing it.
 
     Mirrors the predicate in ``grpo_train``: ``force_on_policy_ratio`` with no
-    ``seq_logprob_error_threshold`` skips the student logprob pass.
+    ``seq_logprob_error_threshold`` skips the student logprob pass. GRPO can
+    also evaluate that threshold in the training loss without this pass.
     """
     force_on_policy_ratio = master_config.loss_fn.force_on_policy_ratio
     seq_logprob_error_threshold = master_config.grpo.seq_logprob_error_threshold
-    return bool(force_on_policy_ratio and seq_logprob_error_threshold is None)
+    return bool(
+        force_on_policy_ratio
+        and (
+            seq_logprob_error_threshold is None
+            or master_config.loss_fn.seq_logprob_error_in_loss
+        )
+    )
 
 
 def assert_prev_logprobs_available(master_config: Any) -> None:
@@ -267,8 +274,30 @@ def assert_prev_logprobs_available(master_config: Any) -> None:
     if is_opd_enabled(master_config) and _skip_prev_logprobs(master_config):
         raise ValueError(
             "adv_estimator='opd' requires real prev_logprobs, but the config zeros them "
-            "(loss_fn.force_on_policy_ratio=True with grpo.seq_logprob_error_threshold unset). "
-            "Set seq_logprob_error_threshold or disable force_on_policy_ratio."
+            "(loss_fn.force_on_policy_ratio=True with either "
+            "grpo.seq_logprob_error_threshold unset or loss_fn.seq_logprob_error_in_loss=True). "
+            "Set seq_logprob_error_threshold and disable seq_logprob_error_in_loss, "
+            "or disable force_on_policy_ratio."
+        )
+
+
+def assert_trust_region_supported(master_config: Any) -> None:
+    """Raise if TROPD knobs are set on a path that never reads the advantage.
+
+    Full-vocabulary MOPD replaces the policy-gradient objective with an exact
+    reverse KL and ignores ``advantages``, so a proximal teacher or a global
+    baseline would be silently dropped there.
+    """
+    adv_cfg = master_config.grpo.adv_estimator
+    if adv_cfg.proximal_teacher_alpha == 1.0 and not adv_cfg.subtract_global_baseline:
+        return
+    if get_opd_full_config(master_config) is not None:
+        raise ValueError(
+            "grpo.adv_estimator.proximal_teacher_alpha < 1 and "
+            "grpo.adv_estimator.subtract_global_baseline have no effect with "
+            "on_policy_distillation.full.enabled=true: the full-vocabulary loss "
+            "ignores advantages. Set proximal_teacher_alpha=1.0 and "
+            "subtract_global_baseline=false."
         )
 
 

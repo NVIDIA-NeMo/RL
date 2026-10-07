@@ -48,6 +48,11 @@ from nemo_rl.algorithms.loss import (
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.metric_utils import (
+    GRAD_NORM_KEY,
+    LOSS_KEY,
+    MEAN_GEN_TOKENS_PER_SAMPLE_KEY,
+    REWARD_KEY,
+    SETUP_TIMING_PREFIX,
     SetupTimingMetrics,
     print_setup_timing_summary,
 )
@@ -60,6 +65,7 @@ from nemo_rl.algorithms.utils import (
     WALL_CLOCK_EFFICIENCY_CATEGORIES,
     calculate_baseline_and_std_per_prompt,
     calculate_trivial_reward_distributions,
+    compute_seq_logprob_errors,
     get_gdpo_reward_component_keys,
     log_generation_metrics,
     print_efficiency_summary,
@@ -136,16 +142,17 @@ from nemo_rl.models.megatron.router_replay import (
     router_replay_enabled,
 )
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy.draft_config import coerce_draft_config
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.instrumentation import (
-    Bucket,
-    bucket_scope,
     current_trace_carrier,
     efficiency_span,
+    evaluate_span,
     managed_span,
-    trace_fn,
+    umbrella_span,
+    umbrella_trace_fn,
 )
 from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.span_groups import RLSpanGroup
@@ -438,17 +445,13 @@ def _get_grpo_save_state(
     return GRPOSaveState(**state_values)
 
 
-class GRPOLoggerConfig(LoggerConfig):
-    num_val_samples_to_print: int  # number of val samples to print to stdout
-
-
 class MasterConfig(BaseModel, extra="allow"):
     policy: PolicyConfig
     loss_fn: ClippedPGLossConfig
     env: dict[str, Any]
     data: DataConfig
     grpo: GRPOConfig
-    logger: GRPOLoggerConfig
+    logger: LoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
     reward_penalties: RewardPenaltyConfig = Field(default_factory=RewardPenaltyConfig)
@@ -460,6 +463,43 @@ class MasterConfig(BaseModel, extra="allow"):
 # ===============================================================================
 # Setup & Initialization
 # ===============================================================================
+
+
+def _validate_seq_logprob_error_in_loss(master_config: MasterConfig) -> None:
+    """Validate the single-forward threshold path before allocating workers."""
+    if not master_config.loss_fn.seq_logprob_error_in_loss:
+        return
+    if master_config.grpo.seq_logprob_error_threshold is None:
+        raise ValueError(
+            "loss_fn.seq_logprob_error_in_loss requires seq_logprob_error_threshold"
+        )
+    loss = master_config.loss_fn
+    if not loss.force_on_policy_ratio or not loss.token_level_loss:
+        raise ValueError(
+            "loss_fn.seq_logprob_error_in_loss requires force_on_policy_ratio=true "
+            "and token_level_loss=true"
+        )
+    if master_config.grpo.adv_estimator.name != "grpo" or loss.use_kl_in_reward:
+        raise ValueError(
+            "loss_fn.seq_logprob_error_in_loss requires the grpo advantage estimator "
+            "without use_kl_in_reward"
+        )
+    policy = master_config.policy
+    if "megatron_cfg" not in policy or not policy["megatron_cfg"]["enabled"]:
+        raise ValueError(
+            "loss_fn.seq_logprob_error_in_loss requires the Megatron backend"
+        )
+    draft = coerce_draft_config(policy.get("draft"))
+    if (
+        policy["megatron_cfg"].get("mtp_num_layers")
+        or (draft is not None and draft.enabled)
+        or loss.positive_example_nll_weight != 0
+        or opd_module.is_opd_enabled(master_config)
+    ):
+        raise ValueError(
+            "loss_fn.seq_logprob_error_in_loss does not support MTP, draft, "
+            "positive-example NLL, or distillation losses"
+        )
 
 
 def _validate_multimodal_dedup_capability(master_config: MasterConfig) -> None:
@@ -587,6 +627,7 @@ def setup(
         generation_config = DynamoConfig.model_validate(generation_config).model_dump()
         policy_config["generation"] = generation_config
     _validate_multimodal_dedup_capability(master_config)
+    _validate_seq_logprob_error_in_loss(master_config)
 
     # Validation-only sampling is honored only on the NeMo-Gym vLLM rollout
     # path; everywhere else validation must sample exactly like training.
@@ -793,7 +834,9 @@ def setup(
         )
 
     loss_fn = ClippedPGLossFn(
-        loss_config, use_fused_linear_logprobs=use_fused_linear_logprobs
+        loss_config,
+        use_fused_linear_logprobs=use_fused_linear_logprobs,
+        seq_logprob_error_threshold=grpo_config.seq_logprob_error_threshold,
     )
 
     # Validate force_on_policy_ratio
@@ -865,8 +908,8 @@ def setup(
             raise
         return shard_set, time.perf_counter() - t0
 
-    total_nodes = cluster_config["num_nodes"]
-    segment_size = cluster_config.get("segment_size")
+    total_nodes = cluster_config.num_nodes
+    segment_size = cluster_config.segment_size
     # Topology of nodes left over after policy/inference placement; non-colocated
     # OPD teachers are placed within it so their collectives stay on NVLink.
     teacher_segment_topology: Optional[dict[str, tuple[str, int]]] = None
@@ -901,9 +944,9 @@ def setup(
         opd_cfg = opd_module._opd_cfg(master_config)
         teacher_configs = create_teacher_configs_from_opd_config(opd_cfg)
         for tcfg in teacher_configs:
-            assert tcfg.gpus_per_node <= cluster_config["gpus_per_node"], (
+            assert tcfg.gpus_per_node <= cluster_config.gpus_per_node, (
                 f"OPD teacher '{tcfg.alias}' requests gpus_per_node={tcfg.gpus_per_node} > "
-                f"cluster.gpus_per_node={cluster_config['gpus_per_node']}; "
+                f"cluster.gpus_per_node={cluster_config.gpus_per_node}; "
                 "each teacher placement group must fit on one node."
             )
             opd_teacher_nodes += tcfg.num_nodes
@@ -919,14 +962,14 @@ def setup(
 
     if colocated_inference:
         if total_nodes == 1:
-            policy_gpus_per_node = cluster_config["gpus_per_node"] - rm_gpus_per_node
+            policy_gpus_per_node = cluster_config.gpus_per_node - rm_gpus_per_node
             assert policy_gpus_per_node > 0, (
                 "policy.generation.colocated.resources.gpus_per_node must be > 0 "
                 "when cluster.num_nodes = 1, "
                 f"but got {policy_gpus_per_node}."
             )
         else:
-            policy_gpus_per_node = cluster_config["gpus_per_node"]
+            policy_gpus_per_node = cluster_config.gpus_per_node
 
         node_resource_constraints, policy_remaining_ids, policy_topology = (
             prepare_segment_topology(segment_size, policy_nodes)
@@ -943,8 +986,8 @@ def setup(
             max_colocated_worker_groups=1
             if generation_config["backend"] == "megatron"
             else 2,
-            port_range_low=cluster_config.get("master_port_range_low"),
-            port_range_high=cluster_config.get("master_port_range_high"),
+            port_range_low=cluster_config.master_port_range_low,
+            port_range_high=cluster_config.master_port_range_high,
             segment_size=segment_size,
             node_resource_constraints=node_resource_constraints,
         )
@@ -963,7 +1006,7 @@ def setup(
 
     else:
         # train resources will be updated through overall and inference resources below
-        train_gpus_per_node = cluster_config["gpus_per_node"]
+        train_gpus_per_node = cluster_config.gpus_per_node
         train_nodes = policy_nodes
 
         inference_resources = generation_config["colocated"]["resources"]
@@ -994,7 +1037,7 @@ def setup(
             train_gpus_per_node -= inference_gpus_per_node + reward_gpus_to_subtract
             assert train_gpus_per_node > 0, (
                 "No enough GPUs for training, "
-                f"train_gpus_per_node:{train_gpus_per_node} = cluster_config['gpus_per_node']:{cluster_config['gpus_per_node']} - inference_gpus_per_node:{inference_gpus_per_node}"
+                f"train_gpus_per_node:{train_gpus_per_node} = cluster_config.gpus_per_node:{cluster_config.gpus_per_node} - inference_gpus_per_node:{inference_gpus_per_node}"
                 + (
                     f" - rm_gpus_per_node:{rm_gpus_per_node}"
                     if total_nodes == 1 and rm_env_enabled
@@ -1010,11 +1053,11 @@ def setup(
             )
             assert (
                 inference_gpus_per_node is not None
-                and inference_gpus_per_node == cluster_config["gpus_per_node"]
+                and inference_gpus_per_node == cluster_config.gpus_per_node
             ), (
                 "policy.generation.colocated.resources.gpus_per_node must be explicitly set and equal to cluster.gpus_per_node "
                 "when cluster.num_nodes > 1 and inference is non-colocated, "
-                f"but got inference_gpus_per_node={inference_gpus_per_node}, cluster.gpus_per_node={cluster_config['gpus_per_node']}."
+                f"but got inference_gpus_per_node={inference_gpus_per_node}, cluster.gpus_per_node={cluster_config.gpus_per_node}."
             )
             train_nodes -= inference_nodes
 
@@ -1137,8 +1180,8 @@ def setup(
             use_gpus=True,
             num_gpus_per_node=train_gpus_per_node,
             max_colocated_worker_groups=1,
-            port_range_low=cluster_config.get("master_port_range_low"),
-            port_range_high=cluster_config.get("master_port_range_high"),
+            port_range_low=cluster_config.master_port_range_low,
+            port_range_high=cluster_config.master_port_range_high,
             segment_size=segment_size,
             node_resource_constraints=node_resource_constraints,
         )
@@ -1160,8 +1203,8 @@ def setup(
             use_gpus=True,
             num_gpus_per_node=inference_gpus_per_node,
             max_colocated_worker_groups=1,
-            port_range_low=cluster_config.get("master_port_range_low"),
-            port_range_high=cluster_config.get("master_port_range_high"),
+            port_range_low=cluster_config.master_port_range_low,
+            port_range_high=cluster_config.master_port_range_high,
             segment_size=inference_segment_size,
             node_resource_constraints=inference_node_resource_constraints,
         )
@@ -1914,7 +1957,7 @@ def setup(
     # Log worker initialization timing metrics to logger
     print_setup_timing_summary(setup_timing_metrics)
     logger.log_metrics(
-        setup_timing_metrics.to_metrics_dict(), step=0, prefix="timing/setup"
+        setup_timing_metrics.to_metrics_dict(), step=0, prefix=SETUP_TIMING_PREFIX
     )
 
     print("\n" + "=" * 60)
@@ -2532,7 +2575,8 @@ def _create_advantage_estimator(master_config: MasterConfig):
         print("  ✓ Using GRPO advantage estimator")
     elif adv_estimator_name == "opd":
         opd_module.assert_prev_logprobs_available(master_config)
-        adv_estimator = OPDAdvantageEstimator({"name": "opd"}, loss_config)
+        opd_module.assert_trust_region_supported(master_config)
+        adv_estimator = OPDAdvantageEstimator(adv_estimator_config, loss_config)
         print("  ✓ Using OPD advantage estimator")
         # Warn if loss_fn is not configured per MOPD paper recommendations.
         if not loss_config.disable_ppo_ratio:
@@ -2753,8 +2797,8 @@ def _resolve_logprob_skip_flags(
 ) -> tuple[bool, bool | None]:
     """Return (skip_prev_logprobs, skip_reference_logprobs); warn on incompatible combos.
 
-    Skip prev_logprobs when force_on_policy_ratio=True unless
-    seq_logprob_error_threshold is set (which requires prev_logprobs).
+    Skip prev_logprobs when force_on_policy_ratio=True unless the sequence
+    threshold is evaluated before training rather than inside the loss.
     Skip reference_policy_logprobs when
     ``grpo.skip_reference_policy_logprobs_calculation`` is set.
     """
@@ -2762,6 +2806,7 @@ def _resolve_logprob_skip_flags(
     if (
         master_config.loss_fn.force_on_policy_ratio
         and master_config.grpo.seq_logprob_error_threshold is not None
+        and not master_config.loss_fn.seq_logprob_error_in_loss
     ):
         warnings.warn(
             "force_on_policy_ratio=True but seq_logprob_error_threshold is set. "
@@ -2802,27 +2847,13 @@ def compute_and_apply_seq_logprob_error_masking(
     sample_mask = train_data["sample_mask"]
     prev_logprobs = train_data["prev_logprobs"][:, 1:]
     generation_logprobs = train_data["generation_logprobs"][:, 1:]
-    lp_error = torch.abs(generation_logprobs - prev_logprobs)
-
-    # Use combined mask exactly as in loss function
-    mask = token_mask * sample_mask.unsqueeze(-1)
-
-    # Calculate sequence-level multiplicative prob error.
-    #
-    # NOTE: When a sequence is fully masked (mask.sum == 0), it should not contribute to
-    # min/mean/max statistics; otherwise, it would yield a spurious 0 due to denominator
-    # clamping and incorrectly drag min_seq_mult_prob_error to 0.
-    denom = mask.sum(dim=-1)
-    valid_seq_mask = denom > 0
-
-    # EXACT same calculation as token_mult_prob_error but per-sequence (for valid sequences)
-    seq_mult_prob_error = torch.zeros_like(denom, dtype=lp_error.dtype)
+    seq_mult_prob_error, valid_seq_mask = compute_seq_logprob_errors(
+        policy_logprobs=prev_logprobs,
+        generation_logprobs=generation_logprobs,
+        token_mask=token_mask,
+        sample_mask=sample_mask,
+    )
     if valid_seq_mask.any():
-        num = (torch.exp(lp_error * mask) * mask).sum(dim=-1)
-        seq_mult_prob_error[valid_seq_mask] = num[valid_seq_mask] / denom[
-            valid_seq_mask
-        ].clamp(min=1)
-
         valid_errors = seq_mult_prob_error[valid_seq_mask]
         max_seq_mult_prob_error = valid_errors.max().item()
         mean_seq_mult_prob_error = valid_errors.mean().item()
@@ -3096,8 +3127,8 @@ def _grpo_train_impl(
 
             with (
                 timer.time("total_step_time"),
-                managed_span(
-                    RLSpanGroup.STEP,
+                umbrella_span(
+                    RLSpanGroup.U_STEP,
                     "rl.grpo.step",
                     tracer=_tracer,
                     **{"rl.iteration": total_steps + 1, "rl.epoch": current_epoch + 1},
@@ -3208,8 +3239,8 @@ def _grpo_train_impl(
                     policy_generation.snapshot_step_metrics()
                 with (
                     timer.time("generation"),
-                    managed_span(
-                        RLSpanGroup.ROLLOUT,
+                    umbrella_span(
+                        RLSpanGroup.U_ROLLOUT,
                         "rl.grpo.generation",
                         tracer=_tracer,
                         **{
@@ -3244,8 +3275,8 @@ def _grpo_train_impl(
                                 master_config.grpo.num_generations_per_prompt
                             ),
                             log_full_result_tables=should_log_nemo_gym_full_result_tables(
-                                wandb_enabled=master_config.logger["wandb_enabled"],
-                                wandb_config=master_config.logger["wandb"],
+                                wandb_enabled=master_config.logger.wandb_enabled,
+                                wandb_config=master_config.logger.wandb,
                             ),
                             max_rollout_turns=None,
                             greedy=False,
@@ -3309,8 +3340,8 @@ def _grpo_train_impl(
                             policy_generation.get_logger_metrics()
                         )
 
-                    metrics_logging_data["mean_gen_tokens_per_sample"] = (
-                        rollout_metrics["mean_gen_tokens_per_sample"]
+                    metrics_logging_data[MEAN_GEN_TOKENS_PER_SAMPLE_KEY] = (
+                        rollout_metrics[MEAN_GEN_TOKENS_PER_SAMPLE_KEY]
                     )
                     logger.log_metrics(rollout_metrics, total_steps + 1, prefix="train")
 
@@ -3568,9 +3599,12 @@ def _grpo_train_impl(
                     )
 
                     if not skip_prev_logprobs:
-                        train_data["prev_logprobs"] = policy.get_logprobs(
-                            logprob_data, timer=timer
-                        )["logprobs"]
+                        prev_lp_result = policy.get_logprobs(logprob_data, timer=timer)
+                        train_data["prev_logprobs"] = prev_lp_result["logprobs"]
+                        # When top-k/top-p filtering is enabled, the worker returns a mask that has
+                        # -inf positions zeroed. Propagate it so the loss reduction skips them.
+                        if "token_mask" in prev_lp_result:
+                            train_data["token_mask"] = prev_lp_result["token_mask"]
                     else:
                         print(
                             "▶ Skipping prev_logprobs (force_on_policy_ratio=True)...",
@@ -3599,10 +3633,18 @@ def _grpo_train_impl(
                     del logprob_data
                     del extra_multimodal_data
 
-                # Seq-level logprob error metrics/masking require real prev_logprobs
+                # Separate-pass seq-level metrics/masking require real prev_logprobs
                 if skip_prev_logprobs:
-                    # Cannot compute seq-level metrics with placeholder prev_logprobs
-                    seq_logprob_error_metrics = _placeholder_seq_logprob_error_metrics()
+                    # In-loss filtering reports counts through all_mb_metrics.
+                    # Use {} so placeholder zeros cannot overwrite those counts
+                    # when seq_logprob_error_metrics is merged after training.
+                    # Otherwise, placeholder prev_logprobs cannot provide
+                    # sequence-error metrics.
+                    seq_logprob_error_metrics = (
+                        {}
+                        if master_config.loss_fn.seq_logprob_error_in_loss
+                        else _placeholder_seq_logprob_error_metrics()
+                    )
                 else:
                     seq_error_result = compute_and_apply_seq_logprob_error_masking(
                         train_data=train_data,
@@ -3777,9 +3819,9 @@ def _grpo_train_impl(
                 memory_tracker.snapshot_start_of_stage("Metrics", dir())
                 metrics = {
                     **metrics,
-                    "loss": train_results["loss"].numpy(),
-                    "grad_norm": train_results["grad_norm"].numpy(),
-                    "reward": rewards.numpy(),
+                    LOSS_KEY: train_results["loss"].numpy(),
+                    GRAD_NORM_KEY: train_results["grad_norm"].numpy(),
+                    REWARD_KEY: rewards.numpy(),
                     "mean_prompt_length": repeated_batch["length"].numpy(),
                     "total_num_tokens": input_lengths.numpy(),
                     # Add masked advantages tracking metrics (only for valid response tokens)
@@ -3884,14 +3926,6 @@ def _grpo_train_impl(
 
                     full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
-                        assert full_metric_name.startswith(
-                            "train:"
-                        ) or full_metric_name.startswith("val:"), (
-                            f"metric_name={full_metric_name} must start with 'val:' or 'train:',\n"
-                            f'followed by the corresponding name in the "val" or "train" metrics dictionary.'
-                            f"  If you are using an old config, please updated checkpointing.metric_name to the new format, "
-                            f" e.g. 'val_reward --> 'val:reward'"
-                        )
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics
                         if not metrics_source:
@@ -4047,7 +4081,15 @@ def _grpo_train_impl(
             print(f"  • Loss: {metrics['loss']:.4f}")
             if "draft_loss" in metrics:
                 print(f"  • Draft Loss: {metrics['draft_loss']:.4f}")
-            print(f"  • Generation KL Error: {metrics['gen_kl_error']:.4f}")
+            generation_kl_error = metrics.get("gen_kl_error")
+            print(
+                "  • Generation KL Error: "
+                + (
+                    f"{generation_kl_error:.4f}"
+                    if generation_kl_error is not None
+                    else "not reported"
+                )
+            )
             if master_config.grpo.use_dynamic_sampling:
                 print(f"  • Avg Filtered Reward: {np.mean(rewards.numpy()):.4f}")
                 print(
@@ -4069,8 +4111,7 @@ def _grpo_train_impl(
                 * master_config.grpo.num_generations_per_prompt
             )
             total_num_gpus = (
-                master_config.cluster["num_nodes"]
-                * master_config.cluster["gpus_per_node"]
+                master_config.cluster.num_nodes * master_config.cluster.gpus_per_node
             )
 
             print(f"  • Total step time: {total_time:.2f}s", flush=True)
@@ -4161,7 +4202,7 @@ def _grpo_train_impl(
     checkpointer.shutdown()
 
 
-@trace_fn(RLSpanGroup.JOB, "rl.grpo.job")
+@umbrella_trace_fn(RLSpanGroup.U_JOB, "rl.grpo.job")
 def grpo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
@@ -4217,25 +4258,9 @@ def validate(
         return {}, {}
 
     timer = Timer(context={"worker": "validator"})
-    _telemetry = get_telemetry_handle()
-    _tracer = _telemetry.tracer if _telemetry is not None else None
     with (
         timer.time("total_validation_time"),
-        managed_span(
-            RLSpanGroup.EVALUATE,
-            "rl.grpo.evaluate",
-            tracer=_tracer,
-            **{"rl.step": step},
-        ),
-        # Validation generates through the same path as training rollouts, but
-        # its tokens are scored and thrown away — no weights advance. Without
-        # this the generate spans below land in productive and a validation
-        # pass reads as goodput. Effective on the sync rollout path, which is
-        # where those spans exist; async validation goes through
-        # generate_async, which carries no span yet (see the coverage gaps in
-        # nemo_rl/telemetry/README.md). The scope is set regardless so it
-        # applies as soon as that path is instrumented.
-        bucket_scope(Bucket.OVERHEAD),
+        evaluate_span("grpo", **{"rl.step": step}),
     ):
         print(f"▶ Starting validation at step {step}...", flush=True)
         # >= 1 is validated in setup().
@@ -4287,8 +4312,8 @@ def validate(
                     num_generations_per_prompt=val_num_generations_per_prompt,
                     sampling_params=val_sampling_params,
                     log_full_result_tables=should_log_nemo_gym_full_result_tables(
-                        wandb_enabled=master_config.logger["wandb_enabled"],
-                        wandb_config=master_config.logger["wandb"],
+                        wandb_enabled=master_config.logger.wandb_enabled,
+                        wandb_config=master_config.logger.wandb,
                     ),
                     max_rollout_turns=None,
                     greedy=False,
@@ -4387,7 +4412,7 @@ def validate(
                 all_message_logs,
                 total_rewards,
                 num_samples=min(
-                    master_config.logger["num_val_samples_to_print"],
+                    master_config.logger.num_val_samples_to_print,
                     len(all_message_logs),
                 ),
                 step=step,
@@ -4557,7 +4582,7 @@ def _raise_if_collector_stopped(
     )
 
 
-@trace_fn(RLSpanGroup.JOB, "rl.grpo.job")
+@umbrella_trace_fn(RLSpanGroup.U_JOB, "rl.grpo.job")
 def async_grpo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
@@ -4820,9 +4845,8 @@ def async_grpo_train(
         },
     )
 
-    # Captured inside rl.grpo.job, so the collector's spans join this run's
-    # trace instead of starting their own roots. Empty unless the job group is
-    # enabled (per_step omits it) — see docs/observability/span-groups.md.
+    # Captured inside rl.grpo.job so the collector's spans join this trace.
+    # Empty if the job group is off, which degrades to roots.
     _tc_trace_carrier = current_trace_carrier()
 
     # Initialize trajectory collector with synchronized collection
@@ -4850,9 +4874,11 @@ def async_grpo_train(
         not sent yet goes with the actor -- including the last rollout batches
         of the run. Every path that reaps the collector needs this, not only the
         normal one, and collection is already running by the time this is
-        defined. The timeout covers the callee's quiesce budget *plus* its 5s
-        export; too short and it gives up mid-export, dropping the very spans
-        it exists to save.
+        defined. The timeout covers the callee's quiesce budget *plus* its
+        export budget; too short and it gives up mid-export, dropping the very
+        spans it exists to save. ``shutdown_telemetry`` enforces the latter
+        itself -- the SDK ignores the timeout it is handed -- so this stays
+        ahead of it only as long as that remains true.
         """
         try:
             ray.get(
@@ -4987,67 +5013,76 @@ def async_grpo_train(
     print(
         f"⏳ Waiting for replay buffer to have sufficient trajectories for step {step}..."
     )
-    timer.start("init/total")
-    wait_iterations = 0
-    while True:
-        buffer_size_current = ray.get(replay_buffer.size.remote())
-        ray.get(trajectory_collector.check_health.remote())
-        current_step_ready = ray.get(
-            replay_buffer.has_complete_batch.remote(
-                step, num_prompts_per_step, max_trajectory_age_steps
+    # Spanned as well as timed so the wait shows up in the startup waterfall
+    # rather than only as a scalar. Unbucketed by construction (see
+    # UNBUCKETED_SPAN_CATEGORIES): the generation fleet is busy for this whole
+    # window, and its spans join this trace.
+    with efficiency_span("init/total", tracer=_tracer):
+        timer.start("init/total")
+        wait_iterations = 0
+        while True:
+            buffer_size_current = ray.get(replay_buffer.size.remote())
+            ray.get(trajectory_collector.check_health.remote())
+            current_step_ready = ray.get(
+                replay_buffer.has_complete_batch.remote(
+                    step, num_prompts_per_step, max_trajectory_age_steps
+                )
             )
-        )
 
-        print(
-            f"  Wait iteration {wait_iterations}: buffer_size={buffer_size_current}, "
-            f"step {step} ready={current_step_ready}"
-        )
-
-        collector_status = ray.get(trajectory_collector.get_status.remote())
-        pipeline_ready = _startup_pipeline_ready(
-            replay_buffer,
-            collector_status,
-            current_step_ready=current_step_ready,
-            step=step,
-            num_prompts_per_step=num_prompts_per_step,
-            max_trajectory_age_steps=max_trajectory_age_steps,
-            max_num_steps=master_config.grpo.max_num_steps,
-        )
-        if current_step_ready and not pipeline_ready:
             print(
-                f"  Pipeline barrier: step {step} ready but "
-                f"step {step + 1} is not yet claimed — waiting for lookahead "
-                f"to prevent resume deadlock"
+                f"  Wait iteration {wait_iterations}: buffer_size={buffer_size_current}, "
+                f"step {step} ready={current_step_ready}",
+                flush=True,
             )
 
-        if pipeline_ready:
-            break
-
-        trajectories_needed = ray.get(
-            replay_buffer.get_trajectories_needed.remote(
-                step, num_prompts_per_step, max_trajectory_age_steps
+            collector_status = ray.get(trajectory_collector.get_status.remote())
+            pipeline_ready = _startup_pipeline_ready(
+                replay_buffer,
+                collector_status,
+                current_step_ready=current_step_ready,
+                step=step,
+                num_prompts_per_step=num_prompts_per_step,
+                max_trajectory_age_steps=max_trajectory_age_steps,
+                max_num_steps=master_config.grpo.max_num_steps,
             )
-        )
-        if buffer_size_current >= min_trajectories_needed and trajectories_needed > 0:
-            print(
-                f"  ⏳ Gap-filling in progress: need {trajectories_needed} more "
-                f"trajectories for step {step}"
+            if current_step_ready and not pipeline_ready:
+                print(
+                    f"  Pipeline barrier: step {step} ready but "
+                    f"step {step + 1} is not yet claimed — waiting for lookahead "
+                    f"to prevent resume deadlock"
+                )
+
+            if pipeline_ready:
+                break
+
+            trajectories_needed = ray.get(
+                replay_buffer.get_trajectories_needed.remote(
+                    step, num_prompts_per_step, max_trajectory_age_steps
+                )
+            )
+            if (
+                buffer_size_current >= min_trajectories_needed
+                and trajectories_needed > 0
+            ):
+                print(
+                    f"  ⏳ Gap-filling in progress: need {trajectories_needed} more "
+                    f"trajectories for step {step}"
+                )
+
+            awaited_target = step + 1 if current_step_ready else step
+            _raise_if_collector_stopped(
+                collector_status,
+                awaited_target=f"target={awaited_target}",
+                awaited_work="lookahead claim" if current_step_ready else "buffer fill",
+                action="start",
             )
 
-        awaited_target = step + 1 if current_step_ready else step
-        _raise_if_collector_stopped(
-            collector_status,
-            awaited_target=f"target={awaited_target}",
-            awaited_work="lookahead claim" if current_step_ready else "buffer fill",
-            action="start",
-        )
+            wait_iterations += 1
+            time.sleep(1.0)
 
-        wait_iterations += 1
-        time.sleep(1.0)
-
-    # Retained because the per-step timer.reset() below discards it; the
-    # efficiency snapshot re-supplies it every step.
-    init_total_s = timer.stop("init/total")
+        # Retained because the per-step timer.reset() below discards it; the
+        # efficiency snapshot re-supplies it every step.
+        init_total_s = timer.stop("init/total")
     print(f"✅ Buffer ready for step {step}! Starting training loop...")
 
     ft_save_period = master_config.checkpointing.get("ft_save_period")
@@ -5065,8 +5100,8 @@ def async_grpo_train(
 
             with (
                 timer.time("total_step_time"),
-                managed_span(
-                    RLSpanGroup.STEP,
+                umbrella_span(
+                    RLSpanGroup.U_STEP,
                     "rl.grpo.step",
                     tracer=_tracer,
                     **{"rl.iteration": step + 1},
@@ -5079,7 +5114,8 @@ def async_grpo_train(
                 with timer.time("exposed_generation"):
                     buffer_size_current = ray.get(replay_buffer.size.remote())
                     print(
-                        f"📊 Step coordination: training_step={step}, max_age={max_trajectory_age_steps}, buffer_size={buffer_size_current}"
+                        f"📊 Step coordination: training_step={step}, max_age={max_trajectory_age_steps}, buffer_size={buffer_size_current}",
+                        flush=True,
                     )
 
                     # Sample the required number of per-prompt groups.
@@ -5370,9 +5406,11 @@ def async_grpo_train(
                     ),
                 ):
                     if not skip_prev_logprobs:
-                        train_data["prev_logprobs"] = policy.get_logprobs(
-                            train_data, timer=timer
-                        )["logprobs"]
+                        prev_lp_result = policy.get_logprobs(train_data, timer=timer)
+                        train_data["prev_logprobs"] = prev_lp_result["logprobs"]
+                        # Propagate the top-k/top-p neginf token mask.
+                        if "token_mask" in prev_lp_result:
+                            train_data["token_mask"] = prev_lp_result["token_mask"]
                     else:
                         train_data["prev_logprobs"] = torch.zeros_like(
                             train_data["generation_logprobs"]
@@ -5394,10 +5432,18 @@ def async_grpo_train(
                             train_data["prev_logprobs"]
                         )
 
-                # Seq-level logprob error metrics/masking require real prev_logprobs
+                # Separate-pass seq-level metrics/masking require real prev_logprobs
                 if skip_prev_logprobs:
-                    # Cannot compute seq-level metrics with placeholder prev_logprobs
-                    seq_logprob_error_metrics = _placeholder_seq_logprob_error_metrics()
+                    # In-loss filtering reports counts through all_mb_metrics.
+                    # Use {} so placeholder zeros cannot overwrite those counts
+                    # when seq_logprob_error_metrics is merged after training.
+                    # Otherwise, placeholder prev_logprobs cannot provide
+                    # sequence-error metrics.
+                    seq_logprob_error_metrics = (
+                        {}
+                        if master_config.loss_fn.seq_logprob_error_in_loss
+                        else _placeholder_seq_logprob_error_metrics()
+                    )
                 else:
                     seq_error_result = compute_and_apply_seq_logprob_error_masking(
                         train_data=train_data,
@@ -5686,10 +5732,10 @@ def async_grpo_train(
                 )
 
                 metrics = {
-                    "loss": train_results["loss"].numpy(),
-                    "reward": rewards.numpy(),
+                    LOSS_KEY: train_results["loss"].numpy(),
+                    REWARD_KEY: rewards.numpy(),
                     "num_mask_sample_filtered": num_mask_sample_filtered,
-                    "grad_norm": train_results["grad_norm"].numpy(),
+                    GRAD_NORM_KEY: train_results["grad_norm"].numpy(),
                     "mean_prompt_length": repeated_batch["length"].numpy(),
                     "total_num_tokens": input_lengths.numpy(),
                     # Add masked advantages tracking metrics (only for valid response tokens)
@@ -5767,14 +5813,6 @@ def async_grpo_train(
 
                     full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
-                        assert full_metric_name.startswith(
-                            "train:"
-                        ) or full_metric_name.startswith("val:"), (
-                            f"metric_name={full_metric_name} must start with 'val:' or 'train:',\n"
-                            f'followed by the corresponding name in the "val" or "train" metrics dictionary.'
-                            f"  If you are using an old config, please updated checkpointing.metric_name to the new format, "
-                            f" e.g. 'val_reward --> 'val:accuracy'"
-                        )
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics
                         if not metrics_source:
@@ -5960,7 +5998,15 @@ def async_grpo_train(
             print(f"  • Loss: {metrics['loss']:.4f}")
             if "draft_loss" in metrics:
                 print(f"  • Draft Loss: {metrics['draft_loss']:.4f}")
-            print(f"  • Generation KL Error: {metrics['gen_kl_error']:.4f}")
+            generation_kl_error = metrics.get("gen_kl_error")
+            print(
+                "  • Generation KL Error: "
+                + (
+                    f"{generation_kl_error:.4f}"
+                    if generation_kl_error is not None
+                    else "not reported"
+                )
+            )
             print(f"  • Avg Reward: {np.mean(rewards.numpy()):.4f}")
             print(f"  • Buffer Size: {buffer_size_current}")
             print(f"  • Avg Trajectory Age: {avg_trajectory_age:.2f} steps")
@@ -5976,8 +6022,7 @@ def async_grpo_train(
                     print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
 
             total_num_gpus = (
-                master_config.cluster["num_nodes"]
-                * master_config.cluster["gpus_per_node"]
+                master_config.cluster.num_nodes * master_config.cluster.gpus_per_node
             )
             timing_metrics["valid_tokens_per_sec_per_gpu"] = (
                 metrics["global_valid_toks"] / total_time / total_num_gpus

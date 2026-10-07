@@ -21,9 +21,11 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import torch
 
-from nemo_rl.models.generation.vllm.config import (
-    VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
-)
+# Keep this module free of NeMo RL imports, including lazy ones inside
+# functions: tools/external_gym_vllm/serve_vllm_on_ray.py loads it by path and
+# calls _apply_vllm_patches in serving containers that do not install NeMo RL.
+
+VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR = "NRL_VLLM_FP32_LM_HEAD"
 
 
 def _get_vllm_file(relative_path: str) -> str:
@@ -290,7 +292,17 @@ def _patch_vllm_ray_executor_v2_tcpstore_port(logger) -> None:
     and falls through to ``get_open_port()`` — straight back to ``VLLM_PORT``.
     That is exactly the port the MessageQueue takes. See RL-1104.
 
-    Returns without raising when the snippet is missing, but logs at warning
+    vLLM 0.29 fixes the race upstream (vllm-project/vllm#53666, #50969): the
+    rank-0 actor now binds the TCPStore itself, on a kernel-assigned port, and
+    *holds* that socket (``self._dist_init_store = store``) until
+    ``init_process_group`` reuses it, so there is no probe/bind window for the
+    MessageQueue to land in. That is not the TOCTOU pattern the reserved band
+    guards against (the port is never released between selection and use), and
+    ``_select_tcpstore_port`` no longer exists to patch. When that upstream
+    marker is present this function logs at info level and leaves the file
+    alone.
+
+    Returns without raising when neither form is found, but logs at warning
     level so a silent no-op is visible in worker logs.
     """
     try:
@@ -302,6 +314,9 @@ def _patch_vllm_ray_executor_v2_tcpstore_port(logger) -> None:
         )
         return
 
+    # vLLM >= 0.29: RayWorkerProc.create_dist_init_method binds and keeps the
+    # TCPStore before publishing its port (vllm-project/vllm#50969).
+    upstream_fix_marker = "self._dist_init_store = store"
     marker = "start_port=envs.VLLM_PORT + 32"
     old_snippet = (
         "        if local_dp_rank is None:\n            return get_open_port()\n"
@@ -334,6 +349,12 @@ def _patch_vllm_ray_executor_v2_tcpstore_port(logger) -> None:
     with _locked_file_patch(file_to_patch) as (content, write_back):
         if marker in content:
             logger.info("vLLM RayExecutorV2 TCPStore port patch already applied.")
+            return
+        if upstream_fix_marker in content:
+            logger.info(
+                "vLLM binds the RayExecutorV2 TCPStore before publishing its port "
+                "(vllm-project/vllm#50969); NeMo-RL TCPStore port patch not needed."
+            )
             return
 
         if old_snippet not in content:
@@ -368,13 +389,12 @@ def _patch_vllm_ray_executor_v2_tcpstore_port(logger) -> None:
 
 
 def _patch_vllm_shm_broadcast_bind_retry(logger) -> None:
-    """Make MessageQueue's remote socket survive losing a port race.
+    """Keep MessageQueue's remote socket in the reserved band with bind retries.
 
-    ``MessageQueue.__init__`` picks the port for its remote (TCP) socket with
-    ``remote_subscribe_port = get_open_port()``, which *probes a port and
-    releases it*, and only binds it with ZMQ several statements later
-    (``shm_broadcast.py``: ``self.remote_socket.bind(socket_addr)``). The
-    window between the probe and the bind is a TOCTOU race.
+    vLLM 0.28 binds port zero directly, avoiding the old probe/bind race but
+    ignoring ``VLLM_PORT``. Restore reserved-band selection with retries so
+    engine sockets do not consume the ephemeral ports used by other services.
+    A probe alone releases its socket before ZMQ binds, leaving a TOCTOU race.
 
     On vLLM 0.25 that race is lost reliably, not occasionally. Every
     ``RayWorkerProc`` on a **non-driver** node takes ``n_local_reader=0``
@@ -426,10 +446,14 @@ def _patch_vllm_shm_broadcast_bind_retry(logger) -> None:
 
     marker = "_nrl_bind_attempts"
     old_snippet = (
-        '            socket_addr = f"tcp://{connect_ip}:{remote_subscribe_port}"\n'
-        "            self.remote_socket.bind(socket_addr)\n"
+        '            self.remote_socket.bind(f"tcp://{connect_ip}:0")\n'
+        "            last_endpoint = self.remote_socket.getsockopt(zmq.LAST_ENDPOINT)\n"
+        '            remote_subscribe_port = last_endpoint.decode().rsplit(":", 1)[1]\n'
     )
     new_snippet = (
+        "            from vllm.utils.network_utils import get_open_port, _get_open_port\n"
+        "\n"
+        "            remote_subscribe_port = get_open_port()\n"
         "            # NeMo-RL: get_open_port() above probed this port and then\n"
         "            # released it; ZMQ only binds it for real here. Every worker\n"
         "            # on a non-driver node builds its response queue at the same\n"
@@ -450,8 +474,6 @@ def _patch_vllm_shm_broadcast_bind_retry(logger) -> None:
         "                except zmq.ZMQError:\n"
         "                    if _nrl_bind_attempt == _nrl_bind_attempts - 1:\n"
         "                        raise\n"
-        "                    from vllm.utils.network_utils import _get_open_port\n"
-        "\n"
         "                    logger.info(\n"
         '                        "Port %s was taken between probe and bind; '
         'retrying.",\n'
@@ -701,6 +723,100 @@ def _patch_vllm_moe_routed_experts_capture(logger, *, required: bool = False) ->
         write_back(content)
 
     logger.info("Successfully patched MoE routed-experts capture (monolithic path).")
+    return True
+
+
+def _patch_vllm_routed_experts_capture_router_fallback(
+    logger, *, required: bool = False
+) -> bool:
+    """Let monolithic MoE kernels without in-kernel capture use the router hook.
+
+    vLLM 0.29 moved the routed-experts binding into
+    ``routed_experts_capturer.bind_routed_experts_capturer``. For a monolithic
+    kernel it requires ``fused_experts.supports_routing_replay_capture()`` and
+    binds the capture function to that experts *object* (the kernel then writes
+    ``routing_replay_out`` itself); any other monolithic kernel is rejected with
+    ``ValueError``. Two things make the object binding unusable for NeMo-RL's
+    NVFP4 per-token method: the kernel is rebuilt on every refit, so the bound
+    capture function is dropped after the first weight update and the returned
+    routes go back to all-zero; and the per-token kernel is the one FlashInfer
+    launch that has not been validated with a replay buffer attached. Kernels
+    that report no in-kernel capture (see ``nvfp4_pertoken.host_captured_experts_cls``)
+    therefore fall back to ``router.set_capture_fn`` — the hook that
+    ``_patch_vllm_moe_routed_experts_capture`` fires on the monolithic branch
+    and the path vLLM 0.26 used for every monolithic kernel.
+    """
+    try:
+        file_to_patch = _get_vllm_file(
+            "model_executor/layers/fused_moe/routed_experts_capturer.py"
+        )
+    except RuntimeError:
+        message = (
+            "Could not locate routed_experts_capturer.py for the routed-experts "
+            "capture router-fallback patch."
+        )
+        if required:
+            raise RuntimeError(message) from None
+        logger.warning(message)
+        return False
+
+    marker = "NeMo-RL patch (router fallback for monolithic routed-experts capture)"
+    old_snippet = (
+        "        if quant_method.is_monolithic:\n"
+        "            if not (\n"
+        "                isinstance(fused_experts, FusedMoEExpertsMonolithic)\n"
+        "                and fused_experts.supports_routing_replay_capture()\n"
+        "            ):\n"
+        "                raise ValueError(\n"
+        '                    "Routed-experts capture is not supported with monolithic "\n'
+        '                    f"MoE kernel {type(fused_experts).__name__}."\n'
+        "                )\n"
+        "            fused_experts.set_capture_fn(capture_fn)\n"
+        "            num_bound += 1\n"
+    )
+    new_snippet = (
+        "        if quant_method.is_monolithic:\n"
+        "            # NeMo-RL patch (router fallback for monolithic routed-experts capture):\n"
+        "            # a monolithic kernel that does not capture routing itself is\n"
+        "            # captured through the router; NeMo-RL's moe_runner patch fires\n"
+        "            # router.select_experts on the monolithic branch when capture_fn is set.\n"
+        "            if (\n"
+        "                isinstance(fused_experts, FusedMoEExpertsMonolithic)\n"
+        "                and fused_experts.supports_routing_replay_capture()\n"
+        "            ):\n"
+        "                fused_experts.set_capture_fn(capture_fn)\n"
+        "                num_bound += 1\n"
+        "            elif isinstance(module.router, BaseRouter):\n"
+        "                module.router.set_capture_fn(capture_fn)\n"
+        "                num_bound += 1\n"
+        "            else:\n"
+        "                raise ValueError(\n"
+        '                    "Routed-experts capture is not supported with monolithic "\n'
+        '                    f"MoE kernel {type(fused_experts).__name__}."\n'
+        "                )\n"
+    )
+
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if marker in content:
+            logger.info("Routed-experts capture router-fallback patch already applied.")
+            return True
+        if old_snippet not in content:
+            message = (
+                "Could not apply the routed-experts capture router-fallback patch: "
+                f"expected code snippet not found in {file_to_patch}. The vLLM "
+                "version may have changed."
+            )
+            if required:
+                raise RuntimeError(message)
+            logger.warning(message)
+            return False
+        content = content.replace(old_snippet, new_snippet, 1)
+        write_back(content)
+
+    logger.info(
+        "Successfully patched routed-experts capture (router fallback for "
+        "monolithic kernels)."
+    )
     return True
 
 
@@ -986,5 +1102,8 @@ def _apply_vllm_patches(
             "for this vLLM version."
         )
     _patch_vllm_moe_routed_experts_capture(
+        patch_logger, required=require_moe_routed_experts_capture
+    )
+    _patch_vllm_routed_experts_capture_router_fallback(
         patch_logger, required=require_moe_routed_experts_capture
     )

@@ -38,7 +38,6 @@ from megatron.bridge.training.utils.train_utils import (
 )
 from megatron.bridge.utils.common_utils import get_rank_safe
 from megatron.core import parallel_state
-from megatron.core.dist_checkpointing.strategies.torch import get_async_strategy
 from megatron.core.distributed import DistributedDataParallel
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallelV1,
@@ -47,10 +46,19 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
 from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import get_model_config, unwrap_model
+from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
+    FileSystemWriterAsync,
+)
 from transformers import PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    need_top_k_or_top_p_filtering,
+)
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossFn
+from nemo_rl.algorithms.loss.utils import rescale_loss_metrics
+from nemo_rl.algorithms.metric_utils import LEARNING_RATE_KEY
 from nemo_rl.data.multimodal_utils import (
     attach_media_token_validity_mask,
     chunks_accept_media_token_validity_mask,
@@ -137,12 +145,16 @@ from nemo_rl.models.policy.workers.checkpoint_engine import (
     maybe_preinit_nixl_checkpoint_engine,
 )
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
-from nemo_rl.telemetry.setup import init_telemetry_worker
+from nemo_rl.telemetry.setup import (
+    init_telemetry_worker,
+    traced_worker_init,
+)
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 from nemo_rl.utils.r3_trace import maybe_r3_trace_stage
+from nemo_rl.utils.tensor_ops import pad_and_concat
 from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.nccl_reshard_utils import (
     _INDIVIDUAL_EXPERT_RE,
@@ -561,6 +573,7 @@ class MegatronPolicyWorkerImpl(
         init_kwargs: dict[str, Any] = {}
         return resources, env_vars, init_kwargs, {}
 
+    @traced_worker_init("rl.policy.load_model", **{"rl.backend": "megatron"})
     def __init__(
         self,
         config: PolicyConfig,
@@ -974,6 +987,81 @@ class MegatronPolicyWorkerImpl(
             return
         self.model.load_state_dict(extra_state, strict=False)
 
+    def _normalize_in_loss_seq_filter(
+        self,
+        loss_fn: ClippedPGLossFn,
+        losses_reduced: list[dict[str, Any]],
+        *,
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+        eval_mode: bool,
+    ) -> tuple[list[dict[str, Any]], torch.Tensor, torch.Tensor]:
+        """Normalize one complete optimizer batch after in-loss filtering.
+
+        When we use seq_logprob_error_threshold with seq_logprob_error_in_loss,
+        we only have access to the global valid token count. After the full batch is computed.
+
+        Therefore, we need to normalize the gradient values by the global valid token count.
+        All microbatches have now finished, so sum survivor counts over DP, broadcast them to
+        every PP stage, and correct gradients before the optimizer clips them.
+        CP/TP replicas must not be counted as additional samples.
+        """
+        metrics = losses_reduced
+        counts = torch.tensor(
+            [
+                sum(m["seq_logprob_error_valid_seqs"] for m in metrics),
+                sum(m["seq_logprob_error_valid_tokens"] for m in metrics),
+            ],
+            dtype=torch.float64,
+            device=global_valid_toks.device,
+        )
+        if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+            torch.distributed.all_reduce(
+                counts, group=parallel_state.get_data_parallel_group()
+            )
+        if parallel_state.get_pipeline_model_parallel_world_size() > 1:
+            torch.distributed.broadcast(
+                counts,
+                src=parallel_state.get_pipeline_model_parallel_last_rank(),
+                group=parallel_state.get_pipeline_model_parallel_group(),
+            )
+
+        # counts is a tensor with 2 elements: [kept_seqs, kept_toks]
+        kept_seqs, kept_toks = counts
+        if kept_toks.item() == 0 and not eval_mode:
+            raise RuntimeError(
+                "No valid response tokens remain after in-loss sequence-logprob "
+                "filtering; refusing an empty optimizer update. Check "
+                "grpo.seq_logprob_error_threshold."
+            )
+        # Counts are weighted by sample_mask and may be positive fractions.
+        # Only replace zero denominators (possible during evaluation).
+        token_denominator = torch.where(kept_toks > 0, kept_toks, 1.0)
+        sequence_denominator = torch.where(kept_seqs > 0, kept_seqs, 1.0)
+        # Each microbatch loss divides by the original global token count G.
+        # Rejected tokens contribute zero, so accumulation and DP SUM produce
+        # S/G, where S is the sum of surviving tokens' gradient contributions.
+        # Multiplying by G/K, with K the global surviving token count, restores
+        # S/K: the same normalization as filtering before training. Apply this
+        # correction before optimizer.step() so gradient clipping sees S/K.
+        token_factor = float((global_valid_toks / token_denominator).item())
+        sequence_factor = float((global_valid_seqs / sequence_denominator).item())
+        if not eval_mode:
+            # Finish any overlap on the comm stream before touching the reduced
+            # gradient buffers (including distributed-optimizer gradient shards).
+            torch.cuda.synchronize()
+            self.model.scale_gradients(token_factor)
+        metrics = [
+            rescale_loss_metrics(
+                m,
+                loss_fn.metric_normalizations,
+                token_factor=token_factor,
+                sequence_factor=sequence_factor,
+            )
+            for m in metrics
+        ]
+        return metrics, kept_seqs, kept_toks
+
     @wrap_with_nvtx_name("megatron_policy_worker/train")
     def train(
         self,
@@ -986,8 +1074,8 @@ class MegatronPolicyWorkerImpl(
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function.
 
-        ``check_dim_skip_keys`` is accepted for parity with the v1/v2 DTensor
-        workers (cross-tokenizer ride-along tensors whose dim 1 is not the
+        ``check_dim_skip_keys`` is accepted for parity with the DTensor
+        worker (cross-tokenizer ride-along tensors whose dim 1 is not the
         student sequence axis). Megatron doesn't run cross-tokenizer, so it
         must be None.
         """
@@ -1101,6 +1189,7 @@ class MegatronPolicyWorkerImpl(
                 )
 
                 rerun_state_machine = get_rerun_state_machine()
+                losses_reduced: list[dict[str, Any]] = []
                 while rerun_state_machine.should_run_forward_backward(data_iterator):
                     # Set grad to zero. For MXFP8 overlap eval, the param and
                     # grad buffers are shared and pre-hooks are disabled above.
@@ -1169,6 +1258,22 @@ class MegatronPolicyWorkerImpl(
                 # Empty unused memory.
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
                     torch.cuda.empty_cache()
+
+                if (
+                    isinstance(loss_fn, ClippedPGLossFn)
+                    and loss_fn.requires_survivor_normalization
+                ):
+                    (
+                        losses_reduced,
+                        global_valid_seqs,
+                        global_valid_toks,
+                    ) = self._normalize_in_loss_seq_filter(
+                        loss_fn,
+                        losses_reduced,
+                        global_valid_seqs=global_valid_seqs,
+                        global_valid_toks=global_valid_toks,
+                        eval_mode=eval_mode,
+                    )
 
                 # Update parameters.
                 if not eval_mode:
@@ -1239,7 +1344,7 @@ class MegatronPolicyWorkerImpl(
                         gb_loss_metrics.append(loss_metrics)
                         curr_lr = self.scheduler.get_lr(self.optimizer.param_groups[0])
                         curr_wd = self.scheduler.get_wd()
-                        loss_metrics["lr"] = curr_lr
+                        loss_metrics[LEARNING_RATE_KEY] = curr_lr
                         loss_metrics["wd"] = curr_wd
                         loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
                         loss_metrics["global_valid_toks"] = global_valid_toks.item()
@@ -2106,6 +2211,13 @@ class MegatronPolicyWorkerImpl(
                     out[k] = v
                 else:
                     out[k] = _scale_metric(k, v)
+            if draft_step_state.active:
+                # The policy and draft objectives can use different denominators.
+                # Combine them only after each component has been normalized.
+                out["total_loss"] = (
+                    out["loss"]
+                    + self.cfg["draft"].loss_weight * out[DRAFT_LOSS_METRIC_KEY]
+                )
             out["lr"] = curr_lr
             out["wd"] = curr_wd
             out["global_valid_seqs"] = global_valid_seqs_f
@@ -2198,6 +2310,7 @@ class MegatronPolicyWorkerImpl(
           a BatchedDataDict with key "logprobs" and shape [batch_size, sequence_length].
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
+          "token_mask": only for top-k/top-p filtering; masked out -inf positions.
         """
         self.timer.start("get_logprobs")
         no_grad = torch.no_grad()
@@ -2265,26 +2378,41 @@ class MegatronPolicyWorkerImpl(
                 router_replay_train=False,
             )
 
-        if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
-            all_log_probs_padded = []
-            all_logprobs = [l["logprobs"] for l in list_of_logprobs]
-            for lp in all_logprobs:
-                padding_needed = seq_length - lp.shape[1]
-                if padding_needed > 0:
-                    lp = torch.nn.functional.pad(
-                        lp, (0, padding_needed), mode="constant", value=0.0
-                    )
-                all_log_probs_padded.append(lp)
+        # Taken from config; every PP rank must build the same mask for the broadcast below.
+        has_token_mask = need_top_k_or_top_p_filtering(self.sampling_params)
 
-            logprobs = torch.cat(all_log_probs_padded, dim=0)
-            tensors = {"logprobs": logprobs}
+        if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+            tensors: dict[str, Optional[torch.Tensor]] = {
+                "logprobs": pad_and_concat(
+                    [l["logprobs"] for l in list_of_logprobs], target_len=seq_length
+                )
+            }
+            if has_token_mask:
+                # Pad token_mask with 0 so padded positions are excluded from the loss.
+                tensors["token_mask"] = pad_and_concat(
+                    [l["token_mask"] for l in list_of_logprobs], target_len=seq_length
+                )
         else:
             tensors = {"logprobs": None}
-        logprobs = broadcast_tensors_from_last_stage(tensors)["logprobs"]
+            if has_token_mask:
+                tensors["token_mask"] = None
+        broadcasted = broadcast_tensors_from_last_stage(tensors)
+        logprobs = broadcasted["logprobs"]
 
         no_grad.__exit__(None, None, None)
         self.timer.stop("get_logprobs")
-        return BatchedDataDict[LogprobOutputSpec](logprobs=logprobs).to("cpu")
+
+        # TODO: @nan: will remove in the future
+        cpu_logprobs = torch.empty_like(
+            logprobs,
+            device="cpu",
+            pin_memory=True,
+        )
+        cpu_logprobs.copy_(logprobs, non_blocking=False)
+        result = BatchedDataDict[LogprobOutputSpec](logprobs=cpu_logprobs)
+        if has_token_mask:
+            result["token_mask"] = broadcasted["token_mask"].to("cpu")
+        return result
 
     def _resolve_output_layer_owner(self) -> Optional[Any]:
         """Return the unwrapped module owning ``output_layer``, or None off the last PP stage.
@@ -2567,29 +2695,18 @@ class MegatronPolicyWorkerImpl(
 
         teacher_full_payload = None
         if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
-            padded_logprobs = []
-            padded_payloads = []
-            for microbatch_output in list_of_outputs:
-                logprobs_mb = microbatch_output["logprobs"]
-                payload_mb = microbatch_output["teacher_full_payload"]
-                padding_needed = seq_length - logprobs_mb.shape[1]
-                if padding_needed > 0:
-                    logprobs_mb = torch.nn.functional.pad(
-                        logprobs_mb, (0, padding_needed), mode="constant", value=0.0
-                    )
-                    payload_mb = torch.nn.functional.pad(
-                        payload_mb,
-                        (0, 0, 0, padding_needed),
-                        mode="constant",
-                        value=0.0,
-                    )
-                padded_logprobs.append(logprobs_mb)
-                padded_payloads.append(payload_mb)
-            tensors = {"logprobs": torch.cat(padded_logprobs, dim=0)}
+            tensors = {
+                "logprobs": pad_and_concat(
+                    [o["logprobs"] for o in list_of_outputs], target_len=seq_length
+                )
+            }
             # Already on CPU: the post-processor moves each microbatch off the
             # device as it is produced, so this pad-and-concatenate never puts
             # the payload back on the GPU.
-            teacher_full_payload = torch.cat(padded_payloads, dim=0)
+            teacher_full_payload = pad_and_concat(
+                [o["teacher_full_payload"] for o in list_of_outputs],
+                target_len=seq_length,
+            )
         else:
             tensors = {"logprobs": None}
         logprobs = broadcast_tensors_from_last_stage(tensors)["logprobs"]
@@ -2785,20 +2902,12 @@ class MegatronPolicyWorkerImpl(
         )
 
         if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
-            logits_chunks = []
-            indices_chunks = []
-            for out in list_of_outputs:
-                tk = out["topk_logits"]
-                ti = out["topk_indices"]
-                pad_len = seq_length - tk.shape[1]
-                if pad_len > 0:
-                    tk = torch.nn.functional.pad(tk, (0, 0, 0, pad_len), value=0.0)
-                    ti = torch.nn.functional.pad(ti, (0, 0, 0, pad_len), value=0)
-                logits_chunks.append(tk)
-                indices_chunks.append(ti)
-
-            topk_logits = torch.cat(logits_chunks, dim=0)
-            topk_indices = torch.cat(indices_chunks, dim=0)
+            topk_logits = pad_and_concat(
+                [o["topk_logits"] for o in list_of_outputs], target_len=seq_length
+            )
+            topk_indices = pad_and_concat(
+                [o["topk_indices"] for o in list_of_outputs], target_len=seq_length
+            )
 
             tensors_to_broadcast = {
                 "topk_logits": topk_logits,
@@ -4593,6 +4702,14 @@ class MegatronPolicyWorkerImpl(
 
             if self.should_disable_forward_pre_hook:
                 self.disable_forward_pre_hook()
+            if self.scheduler is not None:
+                # Megatron-Bridge copies consumed_train_samples into scheduler.num_steps
+                # on checkpoint resume (override_opt_param_scheduler). This is defined
+                # as RL steps x GBS, where GBS is consistent with Bridge thus this
+                # normalizes the warmup and decay to RL steps instead of samples.
+                self.mcore_state.train_state.consumed_train_samples = (
+                    self.scheduler.num_steps
+                )
             save_checkpoint(
                 state=self.mcore_state,
                 model=[self.model],
@@ -4628,7 +4745,6 @@ class MegatronPolicyWorkerImpl(
         colocated_cfg = generation_cfg.get("colocated") or {}
         return bool(
             ckpt_cfg.async_save
-            and getattr(ckpt_cfg, "async_strategy", "nvrx") == "nvrx"
             and getattr(ckpt_cfg, "use_persistent_ckpt_worker", False)
             and getattr(ckpt_cfg, "ckpt_assume_constant_structure", False)
             and not getattr(ckpt_cfg, "async_ckpt_use_cpu_shm", False)
@@ -4655,19 +4771,7 @@ class MegatronPolicyWorkerImpl(
             terminate=release_cuda_cache,
         )
         if release_cuda_cache:
-            _, async_modules = get_async_strategy(
-                self.mcore_state.cfg.checkpoint.async_strategy
-            )
-            writer_cls = async_modules["FileSystemWriterAsync"]
-            cleanup_tensor_caches = getattr(writer_cls, "cleanup_tensor_caches", None)
-            if cleanup_tensor_caches is not None:
-                cleanup_tensor_caches()
-            else:
-                # Compatibility with older NVRx versions that predate the
-                # public cleanup helper.
-                cached_identifiers = getattr(writer_cls, "_cached_identifiers", None)
-                if cached_identifiers is not None:
-                    cached_identifiers.clear()
+            FileSystemWriterAsync.cleanup_tensor_caches()
             gc.collect()
             torch.cuda.ipc_collect()
             torch.cuda.empty_cache()
