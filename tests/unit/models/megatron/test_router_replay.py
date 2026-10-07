@@ -63,7 +63,7 @@ def test_validate_router_replay_config_allows_megatron_generation():
         "router_replay": {"enabled": True},
         "generation": {
             "backend": "megatron",
-            "mcore_generation_config": {"async_sched_mode": "legacy"},
+            "mcore_generation_config": {},
         },
         "megatron_cfg": {"enabled": True},
     }
@@ -94,10 +94,7 @@ def test_validate_router_replay_config_allows_generation_pp_override_to_one():
         "router_replay": {"enabled": True},
         "generation": {
             "backend": "megatron",
-            "mcore_generation_config": {
-                "pipeline_model_parallel_size": 1,
-                "async_sched_mode": "legacy",
-            },
+            "mcore_generation_config": {"pipeline_model_parallel_size": 1},
         },
         "megatron_cfg": {"enabled": True, "pipeline_model_parallel_size": 4},
     }
@@ -105,36 +102,26 @@ def test_validate_router_replay_config_allows_generation_pp_override_to_one():
     validate_router_replay_config(config)
 
 
+@pytest.mark.parametrize(
+    "mcore_generation_config",
+    [{"async_sched_mode": "async"}, {}],
+    ids=["explicit_async", "unset_defaults_to_async"],
+)
 @pytest.mark.mcore
-def test_validate_router_replay_config_rejects_async_sched_mode():
+def test_validate_router_replay_config_allows_async_sched_mode(mcore_generation_config):
+    """MCore records routes under its async scheduler, the default mode."""
     from nemo_rl.models.megatron.router_replay import validate_router_replay_config
 
     config = {
         "router_replay": {"enabled": True},
         "generation": {
             "backend": "megatron",
-            "mcore_generation_config": {"async_sched_mode": "async"},
+            "mcore_generation_config": mcore_generation_config,
         },
         "megatron_cfg": {"enabled": True},
     }
 
-    with pytest.raises(ValueError, match="async_sched_mode='legacy'"):
-        validate_router_replay_config(config)
-
-
-@pytest.mark.mcore
-def test_validate_router_replay_config_rejects_unset_async_sched_mode():
-    """MCore defaults async_sched_mode to async, so leaving the key out is not safe."""
-    from nemo_rl.models.megatron.router_replay import validate_router_replay_config
-
-    config = {
-        "router_replay": {"enabled": True},
-        "generation": {"backend": "megatron", "mcore_generation_config": {}},
-        "megatron_cfg": {"enabled": True},
-    }
-
-    with pytest.raises(ValueError, match="async_sched_mode='legacy'"):
-        validate_router_replay_config(config)
+    validate_router_replay_config(config)
 
 
 @pytest.mark.mcore

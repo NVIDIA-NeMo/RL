@@ -49,16 +49,14 @@ policy:
     backend: megatron
     mcore_generation_config:
       expose_http_server: true
-      async_sched_mode: "legacy"
       pipeline_model_parallel_size: 1
 ```
 
-Two MInf constraints are enforced at config validation. Megatron-Core's async
-scheduler does not support routing replay, so `async_sched_mode` must be
-`legacy` (the `grpo_math_1B.yaml` template sets `async`). MInf records routes
-per pipeline stage and never gathers them across stages, so the generation
-model must run with `pipeline_model_parallel_size: 1`; the generation layout
-inherits the training layout unless overridden in `mcore_generation_config`.
+MInf records routes per pipeline stage and never gathers them across stages,
+so config validation requires the generation model to run with
+`pipeline_model_parallel_size: 1`; the generation layout inherits the training
+layout unless overridden in `mcore_generation_config`. Both `async_sched_mode`
+values record routes.
 
 MInf produces routes with shape `[T - 1, L, K]`. Its serving-side canonical
 stager appends the terminal fallback row, delta-aligns the routes using Gym's

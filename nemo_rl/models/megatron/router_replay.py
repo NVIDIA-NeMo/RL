@@ -87,8 +87,6 @@ def _validate_megatron_generation_router_replay_config(config: PolicyConfig) -> 
         merged_inference_megatron_cfg,
     )
 
-    generation = config.get("generation") or {}
-
     # MInf records routes into RouterReplay.global_router_replay_instances, which
     # is rank-local, and only ever all-gathers them across TP. With inference
     # PP > 1 the payload's layer axis covers one pipeline stage, and the
@@ -104,19 +102,6 @@ def _validate_megatron_generation_router_replay_config(config: PolicyConfig) -> 
             f"{inference_pp}); MInf routing indices are recorded per pipeline "
             "stage and are never gathered across PP. Set policy.generation."
             "mcore_generation_config.pipeline_model_parallel_size=1."
-        )
-    # mcore raises the same rejection from DynamicInferenceEngine.__init__, but
-    # only after cluster build and weight load. MCore's InferenceConfig defaults
-    # async_sched_mode to ASYNC, so an unset key needs rejecting too, not only
-    # an explicit "async".
-    async_sched_mode = (generation.get("mcore_generation_config") or {}).get(
-        "async_sched_mode", "async"
-    )
-    if async_sched_mode != "legacy":
-        raise ValueError(
-            "router_replay.enabled requires policy.generation."
-            "mcore_generation_config.async_sched_mode='legacy'; mcore async "
-            "scheduling does not support routing replay."
         )
 
 
