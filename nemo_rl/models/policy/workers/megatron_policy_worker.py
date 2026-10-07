@@ -4391,18 +4391,13 @@ class MegatronPolicyWorkerImpl(
         self._log_gpu_mem("train_prep_exit")
 
     def finish_inference(self) -> None:
-        """Offload independent parameter storage after PPO inference."""
+        """Offload model params to CPU after inference. Only used in PPO."""
         # MambaMixer.eval() recomputes and caches a state transition decay,
         # -torch.exp(self.A_log.float()). Set the model in inference mode
         # before offloading the model parameters (including self.A_log).
-        # offload_after_refit may already have evaluated and parked the model.
-        if self.model.training:
-            self.model.eval()
+        self.model.eval()
         self.model = self.move_model(
-            self.model,
-            "cpu",
-            move_params=not self._uses_mxfp8_overlap_shared_param_buffer(),
-            move_grads=False,
+            self.model, "cpu", move_params=True, move_grads=False
         )
 
         gc.collect()
@@ -4449,6 +4444,7 @@ class MegatronPolicyWorkerImpl(
             # Disabled hooks mean no optimizer update is waiting to be gathered.
             return
 
+        # Settle checkpoint reads before rewriting it.
         self.finalize_async_save()
         # PPO can park the policy before critic training. Param gathering writes
         # into its buffers, so restore their storage first (a no-op if resident).

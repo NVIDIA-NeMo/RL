@@ -1740,12 +1740,8 @@ def test_megatron_offload_after_refit_finalizes_before_model_move(
     assert move_kwargs[0]["move_grads"] is expect_move_grads
 
 
-@pytest.mark.parametrize("shared_buffer", [False, True])
-@pytest.mark.parametrize("already_evaluated", [False, True])
-def test_megatron_finish_inference_evals_before_model_offload(
-    monkeypatch, shared_buffer, already_evaluated
-):
-    """Refresh Mamba caches only while training parameters are still resident."""
+def test_megatron_finish_inference_evals_before_model_offload(monkeypatch):
+    """Mamba decode caches must refresh before CUDA parameter storage is released."""
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
     )
@@ -1755,14 +1751,7 @@ def test_megatron_finish_inference_evals_before_model_offload(
     worker = object.__new__(MegatronPolicyWorkerImpl)
     _disable_opd_full(worker)
     worker.model = _FakeTrainableModel()
-    worker.model.training = not already_evaluated
-
-    def eval_model() -> None:
-        assert not already_evaluated, "Mamba eval must not read parked parameters"
-        events.append("eval")
-
-    worker.model.eval = eval_model
-    worker._uses_mxfp8_overlap_shared_param_buffer = lambda: shared_buffer
+    worker.model.eval = lambda: events.append("eval")
     worker.move_model = lambda model, device, **kwargs: (
         events.append("move_model") or move_kwargs.append(kwargs) or model
     )
@@ -1771,8 +1760,8 @@ def test_megatron_finish_inference_evals_before_model_offload(
 
     MegatronPolicyWorkerImpl.finish_inference(worker)
 
-    assert events == (["move_model"] if already_evaluated else ["eval", "move_model"])
-    assert move_kwargs == [{"move_params": not shared_buffer, "move_grads": False}]
+    assert events == ["eval", "move_model"]
+    assert move_kwargs == [{"move_params": True, "move_grads": False}]
 
 
 def test_megatron_save_checkpoint_onloads_model_before_save(monkeypatch):
