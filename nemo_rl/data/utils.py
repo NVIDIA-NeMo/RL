@@ -164,11 +164,6 @@ def setup_response_data(
         If env_configs is None:
             A tuple of (train dataset, validation dataset).
     """
-    assert "train" in data_config, (
-        "The dataset config structure is updated. Please refer to https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/grpo.md#dataset "
-        "and the Migrate Guide in https://github.com/NVIDIA-NeMo/RL/pull/1649 to update the dataset config."
-    )
-
     # ==========================
     # Setup Environments
     # ==========================
@@ -340,11 +335,6 @@ def setup_preference_data(
     Returns:
         A tuple of (train dataset, validation dataset).
     """
-    assert "train" in data_config, (
-        "The dataset config structure is updated. Please refer to https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/dpo.md#datasets "
-        "and the Migrate Guide in https://github.com/NVIDIA-NeMo/RL/pull/1763 to update the dataset config."
-    )
-
     print("\n▶ Setting up data...")
     # setup train dataset
     if "default" in data_config:

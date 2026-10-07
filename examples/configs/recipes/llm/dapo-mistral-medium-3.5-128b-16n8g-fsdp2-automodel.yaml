@@ -59,7 +59,7 @@ policy:
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
     automodel_kwargs:
-      attn_implementation: eager
+      attn_implementation: sdpa
       freeze_config:
         freeze_vision_tower: true
         freeze_audio_tower: true

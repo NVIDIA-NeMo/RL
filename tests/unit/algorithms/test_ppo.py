@@ -33,7 +33,9 @@ from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.reward_functions import RewardShapingConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.utils.checkpoint import CheckpointManager
+from nemo_rl.utils.logger import LoggerConfig
 
 
 def _make_loss_config(
@@ -999,7 +1001,7 @@ def _run_mock_ppo_train(
             "save_period": 100,
             "metric_name": None,
         },
-        cluster={"num_nodes": 1, "gpus_per_node": 2},
+        cluster=ClusterConfig(num_nodes=1, gpus_per_node=2),
     )
 
     logger = MagicMock()
@@ -1565,12 +1567,12 @@ def _make_noncolocated_setup_config(
             reward_scaling={"enabled": False},
             adv_estimator={"name": "raw_reward"},
         ),
-        logger={"num_val_samples_to_print": 0},
-        cluster={
-            "num_nodes": total_nodes,
-            "gpus_per_node": total_gpus_per_node,
-            "segment_size": segment_size,
-        },
+        logger=LoggerConfig.model_construct(),
+        cluster=ClusterConfig(
+            num_nodes=total_nodes,
+            gpus_per_node=total_gpus_per_node,
+            segment_size=segment_size,
+        ),
         checkpointing={
             "enabled": False,
             "save_optimizer": False,
@@ -2108,8 +2110,8 @@ def test_noncolocated_vllm_builds_separate_clusters_and_collective(monkeypatch):
         total_gpus_per_node=8,
         inference_gpus_per_node=2,
     )
-    config.cluster["master_port_range_low"] = 1400
-    config.cluster["master_port_range_high"] = 1999
+    config.cluster.master_port_range_low = 1400
+    config.cluster.master_port_range_high = 1999
     (
         result,
         cluster_calls,
@@ -2838,7 +2840,7 @@ def test_validate_dispatches_rollout_by_engine_mode(monkeypatch, async_engine):
     config.ppo.max_val_samples = 1
     config.ppo.val_batch_size = 1
     config.ppo.max_rollout_turns = 1
-    config.logger = {"num_val_samples_to_print": 0}
+    config.logger = LoggerConfig.model_construct()
 
     ppo.validate(
         policy_generation=MagicMock(),

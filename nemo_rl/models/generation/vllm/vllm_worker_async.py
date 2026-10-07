@@ -61,6 +61,7 @@ from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
     format_prompt_for_vllm_generation,
+    validate_rollout_prompt,
     model_dump_chat_response_with_dynamic_message_fields,
     pad_and_align_routed_expert_indices,
 )
@@ -1714,6 +1715,7 @@ class VllmAsyncGenerationWorkerImpl(
             """Process a single sample and return the result."""
             current_input_actual_length = input_lengths_batch[sample_idx].item()
             prompt = format_prompt_for_vllm_generation(data, sample_idx)
+            prompt = self._tokenize_prompt_with_bos(prompt)
 
             per_sample_stop_strings = None
             if batch_specific_stop_strings_list and sample_idx < len(
@@ -1805,6 +1807,11 @@ class VllmAsyncGenerationWorkerImpl(
 
             if final_request_output is None:
                 raise RuntimeError(f"No output received for request {request_id}")
+
+            validate_rollout_prompt(
+                input_ids_batch[sample_idx, :current_input_actual_length].tolist(),
+                final_request_output.prompt_token_ids,
+            )
 
             # Process the output
             generation_details = final_request_output.outputs[0]
@@ -1990,7 +1997,7 @@ class VllmAsyncGenerationWorkerImpl(
         # Create tasks for each prompt
         async def process_single_prompt(prompt_idx):
             """Process a single prompt and return the result."""
-            prompt = prompts[prompt_idx]
+            prompt = self._tokenize_prompt_with_bos(prompts[prompt_idx])
 
             # Get stop strings for this specific prompt
             per_prompt_stop_strings = None
