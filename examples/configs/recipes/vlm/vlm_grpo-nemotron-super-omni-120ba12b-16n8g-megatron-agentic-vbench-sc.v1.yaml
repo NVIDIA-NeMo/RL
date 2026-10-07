@@ -68,7 +68,16 @@ policy:
     # rows rely on TP8 sequence parallelism plus full activation recomputation;
     # raise pipeline_model_parallel_size to 2 if the learner runs out of memory.
     context_parallel_size: 1
-    mtp_num_layers: 0
+    # The checkpoint ships one MTP block (num_nextn_predict_layers: 1) and the
+    # current Megatron-Bridge maps it into the layer pattern, so mtp_num_layers
+    # must be 1 (0 is rejected: "hybrid_layer_pattern defines 1 MTP depths").
+    # Detached head with zero loss weight: the head is carried and refit into
+    # vLLM but not trained, so the objective stays plain token-level GRPO as
+    # context compaction requires.
+    mtp_num_layers: 1
+    mtp_use_repeated_layer: false
+    mtp_detach_heads: true
+    mtp_loss_scaling_factor: 0.0
     scheduler:
       lr_warmup_iters: 10
   generation:

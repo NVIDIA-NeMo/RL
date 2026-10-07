@@ -229,6 +229,12 @@ Verified here:
   (fixed-batch execution padding). The CC recipe therefore uses CP=1 with TP8
   sequence parallelism and full activation recomputation; PP=2 is the fallback
   if 49k-token rows do not fit.
+- The fifth attempt reached model construction and every Megatron worker
+  rejected `mtp_num_layers: 0` ("hybrid_layer_pattern defines 1 MTP depths"):
+  the current Megatron-Bridge maps the checkpoint's single MTP block into the
+  layer pattern. The recipe now carries it like upstream's tested `-mtp`
+  variant (one layer, not repeated, detached heads) with loss weight 0, so the
+  head is refit but not trained and the objective stays plain token-level GRPO.
 
 Not yet verified (requires GPU allocations):
 
