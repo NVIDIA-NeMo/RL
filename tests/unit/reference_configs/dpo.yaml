@@ -54,6 +54,11 @@ policy:
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: ""  # Refers to https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-alloc-conf
     enabled: true
+    checkpoint:
+      model_save_format: "safetensors"
+      save_consolidated: "false"
+      single_rank_consolidation: false
+      consolidation_timeout_minutes: 30
     cpu_offload: False
     sequence_parallel: false
     activation_checkpointing: false
@@ -155,6 +160,7 @@ policy:
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: True
     defer_fp32_logits: False
+    fp32_lm_head: false
     moe_per_layer_logging: False
     moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"
@@ -295,6 +301,10 @@ logger:
   wandb:
     project: "dpo-dev"
     name: "dpo"
+    entity: null
+    id: null
+    resume: null
+    log_nemo_gym_full_result_tables: false
   swanlab:
     project: "dpo-dev"
     name: "dpo"
@@ -304,6 +314,8 @@ logger:
     experiment_name: "dpo-dev"
     run_name: "dpo"
     tracking_uri: "http://localhost:5000"
+    run_id: null
+    artifact_location: null
   gpu_monitoring:
     collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
@@ -312,6 +324,8 @@ cluster:
   gpus_per_node: 1
   num_nodes: 1
   segment_size: null
+  master_port_range_low: null
+  master_port_range_high: null
 
 # OpenTelemetry instrumentation; null = disabled (default). Mirrors the optional
 # field on the MasterConfig, which stays None unless a run opts in.

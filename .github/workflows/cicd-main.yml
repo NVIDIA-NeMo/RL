@@ -640,7 +640,7 @@ jobs:
           docker pull "${SRC}"
           CID=$(docker create "${SRC}" true)
           mkdir -p /tmp/uv-cache
-          docker cp "${CID}:/root/.cache/uv/." /tmp/uv-cache/
+          docker cp "${CID}:/opt/nemo_rl_cache/uv/." /tmp/uv-cache/
           docker rm "${CID}"
 
           printf 'FROM scratch\nCOPY uv-cache/ /\n' > /tmp/Dockerfile.uv-cache
@@ -673,7 +673,7 @@ jobs:
           docker pull "${SRC}"
           CID=$(docker create "${SRC}" true)
           mkdir -p /tmp/uv-cache
-          docker cp "${CID}:/root/.cache/uv/." /tmp/uv-cache/
+          docker cp "${CID}:/opt/nemo_rl_cache/uv/." /tmp/uv-cache/
           docker rm "${CID}"
 
           printf 'FROM scratch\nCOPY uv-cache/ /\n' > /tmp/Dockerfile.uv-cache
@@ -1210,7 +1210,9 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           verbose: true
           flags: ${{ matrix.flag }}
-          base_sha: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha }}
+          # Copied PR branches run on push, so upload-coverage needs explicit PR metadata.
+          override_pr: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || '' }}
+          commit_parent: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha || '' }}
 
       - name: Upload artifacts
         if: ${{ steps.check-artifacts.outputs.artifacts-found == 'true' }}

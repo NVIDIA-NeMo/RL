@@ -32,6 +32,34 @@ PathLike = Union[str, "os.PathLike[Any]"]
 TokenizerType = PreTrainedTokenizerBase
 
 
+@dataclass(frozen=True)
+class NemoGymSourceIdentity:
+    """Filesystem identity used to cache agent names from one Gym dataset."""
+
+    path: str
+    device: int
+    inode: int
+    ctime_ns: int
+    mtime_ns: int
+    size: int
+
+    @classmethod
+    def from_stat(cls, path: str, stat: os.stat_result) -> "NemoGymSourceIdentity":
+        """Build a source identity snapshot from a resolved path and stat result."""
+        return cls(
+            path=path,
+            device=stat.st_dev,
+            inode=stat.st_ino,
+            ctime_ns=stat.st_ctime_ns,
+            mtime_ns=stat.st_mtime_ns,
+            size=stat.st_size,
+        )
+
+    def matches(self, stat: os.stat_result) -> bool:
+        """Return whether ``stat`` still describes the same source contents."""
+        return self == self.from_stat(self.path, stat)
+
+
 class DatumSpec(TypedDict):
     message_log: LLMMessageLogType | VLMMessageLogType
     length: int  # total (concatenated) length of the message tensors
@@ -66,6 +94,7 @@ class TaskDataSpec:
     video_target_num_patches: Optional[int] = None
     video_temporal_patch_size: Optional[int] = None
     video_maintain_aspect_ratio: Optional[bool] = None
+    pad_audio_to_hop_length: Optional[bool] = None
     min_generation_tokens: Optional[int] = None
 
     def __post_init__(self) -> None:

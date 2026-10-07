@@ -8,8 +8,6 @@ checkpointing:
   keep_top_k: 2
   save_period: 5
   checkpoint_must_save_by: 00:03:35:00
-  model_save_format: safetensors
-  save_consolidated: false
 grpo:
   num_prompts_per_step: 64
   num_generations_per_prompt: 8
@@ -57,7 +55,6 @@ policy:
   logprob_chunk_size: 2048
   offload_optimizer_for_logprob: true
   dtensor_cfg:
-    _v2: true
     activation_checkpointing: false
     tensor_parallel_size: 1
   megatron_cfg:

@@ -59,6 +59,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     REPLAY_BUFFER_METADATA_STORAGE,
     DataPlaneCheckpointBarrier,
     DataPlaneCheckpointMetadata,
+    DataPlaneMutationCut,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSamplerConfig,
@@ -97,7 +98,8 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
-from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
+from nemo_rl.data_plane.schema import GROUP_ID_TAG, ROUTE_PLAN_TAG
+from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
@@ -109,7 +111,7 @@ from nemo_rl.experience.route_plan import (
     encode_route_plan,
 )
 from nemo_rl.utils.checkpoint import CheckpointManager
-from nemo_rl.utils.logger import TELEMETRY_WALL_TIME_METRIC
+from nemo_rl.utils.logger import TELEMETRY_WALL_TIME_METRIC, LoggerConfig
 
 # Reuse the factory patches from the setup tests (same cross-module fixture
 # import pattern as test_rollout_pump.py).
@@ -191,14 +193,14 @@ class _FakeTrainer:
         weights_path: str,
         optimizer_path: Optional[str],
         tokenizer_path: str,
-        checkpointing_cfg: dict[str, Any],
+        is_final_checkpoint: bool,
     ) -> None:
         self.save_calls.append(
             {
                 "weights_path": weights_path,
                 "optimizer_path": optimizer_path,
                 "tokenizer_path": tokenizer_path,
-                "checkpointing_cfg": checkpointing_cfg,
+                "is_final_checkpoint": is_final_checkpoint,
             }
         )
         # Mimic the real Policy: materialize the checkpoint subdirs.
@@ -257,7 +259,13 @@ class _FakeSampler:
             task_name=None,
             sample_ids=sample_ids,
             sequence_lengths=[16] * n,
-            tags=[{"weight_version": current_train_weight}] * n,
+            # One group per row, since the selection is sized in prompt groups.
+            # The train pump reads this tag off every row and raises when it is
+            # absent, so a shared dict here would also collapse the group count.
+            tags=[
+                {"weight_version": current_train_weight, GROUP_ID_TAG: sample_id}
+                for sample_id in sample_ids
+            ],
         )
         return meta, n
 
@@ -503,6 +511,7 @@ class _FakeRolloutManager:
         self._tq_buffer = None
         self.recovery_ledger = RolloutRecoveryLedger()
         self._events = events
+        self.reserved_prompts: list[dict[str, Any]] = []
         self.telemetry = {
             "committed_groups": 0,
             "committed_output_tokens": 0,
@@ -515,6 +524,25 @@ class _FakeRolloutManager:
 
     def set_weight_version(self, version: int) -> None:
         self.weight_versions.append(version)
+
+    def reserve_prompt_group(
+        self,
+        cut: Any,
+        input_sample: dict[str, Any],
+        *,
+        target_step: Optional[int],
+        admitted: bool = True,
+        admission_id: Optional[str] = None,
+    ) -> str:
+        del cut, admission_id
+        self.reserved_prompts.append(
+            {
+                "prompt": input_sample,
+                "target_step": target_step,
+                "admitted": admitted,
+            }
+        )
+        return f"regenerated-{len(self.reserved_prompts)}"
 
     def suspend_request_deadlines(self) -> None:
         if self._events is not None:
@@ -560,6 +588,7 @@ class _FakeTQBuffer:
         self.load_return = load_return
         self.metadata_state_dict_calls: list[int] = []
         self.load_calls: list[dict[str, Any]] = []
+        self.remove_calls: list[dict[str, Any]] = []
         self.checkpoint_barrier: Optional[DataPlaneCheckpointBarrier] = None
         self.training_claims: list[dict[str, Any]] = []
 
@@ -650,6 +679,10 @@ class _FakeTQBuffer:
         ]
         return self.load_return
 
+    async def remove(self, idxs: list[int], remove_in_dp: bool) -> int:
+        self.remove_calls.append({"idxs": list(idxs), "remove_in_dp": remove_in_dp})
+        return len(idxs)
+
 
 # Default position sentinel the fake dataloader reports via state_dict().
 _SENTINEL_DL_STATE = {"fake_position": 42}
@@ -663,9 +696,16 @@ class _FakeDataloader(list):
     train_dataloader.pt.
     """
 
-    def __init__(self, batches: Any = (), state: Optional[dict[str, Any]] = None):
+    def __init__(
+        self,
+        batches: Any = (),
+        state: Optional[dict[str, Any]] = None,
+        dataset: Optional[Any] = None,
+    ) -> None:
         super().__init__(batches)
         self._state = dict(state) if state is not None else dict(_SENTINEL_DL_STATE)
+        self.dataset = dataset
+        self.collate_fn = None
 
     def state_dict(self) -> dict[str, Any]:
         return dict(self._state)
@@ -690,6 +730,7 @@ def _actor_master_config(
     data_plane_checkpoint: bool = True,
     rollout_checkpoint_attempt_interval_s: Optional[float] = None,
     token_capture_enabled: bool = False,
+    load_replay_buffer: bool = True,
 ) -> MasterConfig:
     """MasterConfig for in-process SingleControllerActor tests.
 
@@ -705,7 +746,7 @@ def _actor_master_config(
         policy={
             # One optimizer.step per RL step: prompts * generations == gbs.
             "train_global_batch_size": num_prompts_per_step * 2,
-            "generation": {"colocated": {"enabled": False}},
+            "generation": {"backend": "vllm", "colocated": {"enabled": False}},
         },
         loss_fn=ClippedPGLossConfig(),
         env={},
@@ -717,15 +758,8 @@ def _actor_master_config(
             num_generations_per_prompt=2,
             seed=42,
         ),
-        logger={
-            "log_dir": str(tmp_path / "logs"),
-            "wandb_enabled": False,
-            "swanlab_enabled": False,
-            "tensorboard_enabled": False,
-            "mlflow_enabled": False,
-            "monitor_gpus": False,
-        },
-        cluster={"num_nodes": 1, "gpus_per_node": 1},
+        logger=LoggerConfig(log_dir=str(tmp_path / "logs"), monitor_gpus=False),
+        cluster=ClusterConfig(num_nodes=1, gpus_per_node=1),
         checkpointing={
             "enabled": enabled,
             "checkpoint_dir": str(tmp_path / "checkpoints"),
@@ -735,6 +769,7 @@ def _actor_master_config(
             "save_period": save_period,
             "save_optimizer": save_optimizer,
             "save_data_plane": data_plane_checkpoint,
+            "load_replay_buffer": load_replay_buffer,
             "checkpoint_must_save_by": checkpoint_must_save_by,
             "ft_save_period": ft_save_period,
         },
@@ -796,6 +831,7 @@ def _make_actor_args(
         ),
         last_checkpoint_path=last_checkpoint_path,
         finalizer_actors=[],
+        advantage_actors=[],
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
         bootstrap_identity=bootstrap_identity,
         rollout_checkpoint_load_metrics=rollout_checkpoint_load_metrics,
@@ -1164,7 +1200,6 @@ class TestSaveTrigger:
         assert first["tokenizer_path"] == str(
             ckpt_dir / "tmp_step_2" / "policy" / "tokenizer"
         )
-        assert first["checkpointing_cfg"] is mc.checkpointing
         assert trainer.save_calls[1]["weights_path"] == str(
             ckpt_dir / "tmp_step_4" / "policy" / "weights"
         )
@@ -1325,6 +1360,7 @@ class TestSaveTrigger:
 
         assert actor._train_steps == 1
         assert len(trainer.save_calls) == 1
+        assert trainer.save_calls[0]["is_final_checkpoint"] is False
         assert _step_dir_names(tmp_path / "checkpoints") == {"step_1"}
 
     def test_rollout_exhaustion_saves_final_checkpoint(self, tmp_path):
@@ -1352,6 +1388,7 @@ class TestSaveTrigger:
 
         # Stopped short of max_num_steps=4, but the completed steps saved.
         assert actor._train_steps == 2
+        assert trainer.save_calls[-1]["is_final_checkpoint"] is True
         assert _step_dir_names(tmp_path / "checkpoints") == {"step_1", "step_2"}
 
     def test_ft_save_period_triggers_saves(self, tmp_path):
@@ -1683,7 +1720,7 @@ class TestPeriodicRolloutCheckpoint:
             task_name=None,
             sample_ids=["claimed-group_g0"],
             sequence_lengths=[16],
-            tags=[{"weight_version": 0}],
+            tags=[{"weight_version": 0, GROUP_ID_TAG: "claimed-group"}],
         )
         actor._buffer.training_claims = [
             {
@@ -1915,8 +1952,8 @@ class TestDataPlaneCheckpoint:
                         fields=["input_ids"],
                         sequence_lengths=[16, 16],
                         tags=[
-                            {"weight_version": 0},
-                            {"weight_version": 0},
+                            {"weight_version": 0, GROUP_ID_TAG: "g0"},
+                            {"weight_version": 0, GROUP_ID_TAG: "g0"},
                         ],
                     ),
                     "start_weight": 0,
@@ -2005,8 +2042,8 @@ class TestDataPlaneCheckpoint:
                         fields=["input_ids"],
                         sequence_lengths=[16, 16],
                         tags=[
-                            {"weight_version": 0},
-                            {"weight_version": 0},
+                            {"weight_version": 0, GROUP_ID_TAG: "g0"},
+                            {"weight_version": 0, GROUP_ID_TAG: "g0"},
                         ],
                     ),
                     "start_weight": 0,
@@ -2148,7 +2185,11 @@ class TestDataPlaneCheckpoint:
             actor._train_steps = 1
             actor._trainer_version = 1
             save_task = asyncio.create_task(
-                actor._save_checkpoint({"loss": 1.0}, is_policy_training_step=True)
+                actor._save_checkpoint(
+                    {"loss": 1.0},
+                    is_policy_training_step=True,
+                    is_final_checkpoint=False,
+                )
             )
             started = await asyncio.to_thread(dp_client.save_started.wait, 30.0)
             assert started
@@ -2356,7 +2397,11 @@ class TestPPOSaveOrder:
         calls: list[str] = []
         actor = _ppo_save_actor(tmp_path, calls)
 
-        asyncio.run(actor._save_checkpoint({}, is_policy_training_step=True))
+        asyncio.run(
+            actor._save_checkpoint(
+                {}, is_policy_training_step=True, is_final_checkpoint=True
+            )
+        )
 
         assert calls == [
             "policy.offload_to_cpu",
@@ -2366,6 +2411,8 @@ class TestPPOSaveOrder:
             "policy.prepare_for_training",
             "policy.save_checkpoint",
         ]
+        assert actor._trainer.save_kwargs["is_final_checkpoint"] is True
+        assert actor._value.save_kwargs["is_final_checkpoint"] is True
 
 
 class TestPPOWarmupCheckpoint:
@@ -2384,7 +2431,11 @@ class TestPPOWarmupCheckpoint:
         self, actor, is_policy_training_step
     ):
         asyncio.run(
-            actor._save_checkpoint({}, is_policy_training_step=is_policy_training_step)
+            actor._save_checkpoint(
+                {},
+                is_policy_training_step=is_policy_training_step,
+                is_final_checkpoint=False,
+            )
         )
 
         written = actor._trainer.save_kwargs["optimizer_path"] is not None
@@ -2400,7 +2451,11 @@ class TestPPOWarmupCheckpoint:
         setattr(actor._save_state, "train:loss", 1.23)
 
         with pytest.warns(UserWarning, match="not available during PPO critic warmup"):
-            asyncio.run(actor._save_checkpoint({}, is_policy_training_step=False))
+            asyncio.run(
+                actor._save_checkpoint(
+                    {}, is_policy_training_step=False, is_final_checkpoint=False
+                )
+            )
 
         assert not hasattr(actor._save_state, "train:loss")
 
@@ -2409,7 +2464,11 @@ class TestPPOWarmupCheckpoint:
         actor._master_config.checkpointing["metric_name"] = "train:loss"
 
         with pytest.raises(ValueError, match="not found in train metrics"):
-            asyncio.run(actor._save_checkpoint({}, is_policy_training_step=True))
+            asyncio.run(
+                actor._save_checkpoint(
+                    {}, is_policy_training_step=True, is_final_checkpoint=False
+                )
+            )
 
 
 # ── metric_name behavior ─────────────────────────────────────────────────────
@@ -2551,7 +2610,7 @@ def _setup_master_config(checkpoint_dir: str) -> MasterConfig:
             val_at_start=False,
             val_at_end=False,
         ),
-        logger={"wandb_enabled": False, "wandb": {}},
+        logger=LoggerConfig.model_construct(),
         policy={
             "train_global_batch_size": 8,
             "max_total_sequence_length": 32,
@@ -2564,6 +2623,7 @@ def _setup_master_config(checkpoint_dir: str) -> MasterConfig:
         },
         loss_fn=ClippedPGLossConfig(),
         env={},
+        cluster=ClusterConfig(num_nodes=1, gpus_per_node=1),
         async_rl=AsyncRLConfig(
             min_groups_for_streaming_train=4,
             max_buffered_rollouts=8,
@@ -2665,7 +2725,7 @@ class TestSetupResumeWiring:
                 "vllm_cfg": {"async_engine": True},
             }
         )
-        mc.logger["log_dir"] = str(tmp_path / "logs")
+        mc.logger.log_dir = str(tmp_path / "logs")
         patched_factories["setup_response_data"].return_value = (
             list(range(8)),
             None,
@@ -2682,7 +2742,7 @@ class TestSetupResumeWiring:
                 return_value=True,
             ),
             patch(
-                "nemo_rl.algorithms.single_controller_utils.setup.spinup_nemo_gym_actor",
+                "nemo_rl.algorithms.single_controller_utils.setup.build_nemo_gym_actors",
                 return_value=MagicMock(),
             ),
             patch(
@@ -2946,7 +3006,10 @@ class TestReplayBufferPersistence:
                     task_name=None,
                     sample_ids=[f"g{i}-0", f"g{i}-1"],
                     sequence_lengths=[16, 16],
-                    tags=[{"weight_version": 0}, {"weight_version": 0}],
+                    tags=[
+                        {"weight_version": 0, GROUP_ID_TAG: f"g{i}"},
+                        {"weight_version": 0, GROUP_ID_TAG: f"g{i}"},
+                    ],
                 ),
                 "start_weight": 0,
                 "end_weight": 0,
@@ -2993,6 +3056,148 @@ class TestReplayBufferPersistence:
         # run()'s finally must tear the synchronizer down exactly once.
         assert actor._weight_synchronizer.shutdown_count == 1
 
+    @pytest.mark.parametrize(
+        ("checkpointing_enabled", "save_data_plane"),
+        [(True, True), (False, True), (False, False)],
+    )
+    def test_replay_free_restore_discards_rows_and_queues_original_prompt(
+        self, tmp_path, checkpointing_enabled, save_data_plane
+    ):
+        ckpt_dir = tmp_path / "resume_ckpt"
+        ckpt_dir.mkdir()
+        group = {
+            "meta": KVBatchMeta(
+                partition_id=_PARTITION_ID,
+                task_name=None,
+                sample_ids=["g0-0", "g0-1"],
+                sequence_lengths=[16, 16],
+                tags=[
+                    {"weight_version": 0, "prompt_idx": 1},
+                    {"weight_version": 0, "prompt_idx": 1},
+                ],
+            ),
+            "start_weight": 0,
+            "end_weight": 0,
+            "target_step": 3,
+            "group_id": "g0",
+        }
+        envelope = {"groups": [group]}
+        torch.save(envelope, ckpt_dir / REPLAY_BUFFER_METADATA_FILENAME)
+        mc = _actor_master_config(
+            tmp_path,
+            enabled=checkpointing_enabled,
+            max_num_steps=0,
+            buffer_checkpoint=True,
+            data_plane_checkpoint=save_data_plane,
+            load_replay_buffer=False,
+        )
+        buffer = _FakeTQBuffer(load_return=1)
+
+        class RecordingRolloutManager(_FakeRolloutManager):
+            def reserve_prompt_group(
+                self,
+                cut: DataPlaneMutationCut,
+                input_sample: dict[str, Any],
+                *,
+                target_step: Optional[int],
+                admitted: bool = True,
+                admission_id: Optional[str] = None,
+            ) -> str:
+                super().reserve_prompt_group(
+                    cut,
+                    input_sample,
+                    target_step=target_step,
+                    admitted=admitted,
+                    admission_id=admission_id,
+                )
+                return self.recovery_ledger.reserve_group(
+                    cut,
+                    prompt_id=str(input_sample["idx"]),
+                    prompt_payload=input_sample,
+                    expected_generations=2,
+                    target_step=target_step,
+                    start_weight_version=0,
+                    admitted=admitted,
+                    admission_id=admission_id,
+                ).group_id
+
+        rollout_manager = RecordingRolloutManager()
+        rollout_manager.generate_and_push = AsyncMock()
+        dataloader = _FakeDataloader(
+            dataset=[{"idx": 0}, {"idx": 1, "message_log": ["fresh"]}]
+        )
+
+        async def _restore() -> Any:
+            actor = _ACTOR_CLS(
+                mc,
+                _make_actor_args(
+                    tq_buffer=buffer,
+                    rollout_manager=rollout_manager,
+                    dataloader=dataloader,
+                    dp_client=_FakeDPClient(sample_ids=["g0-0", "g0-1"]),
+                    last_checkpoint_path=str(ckpt_dir),
+                    data_plane_checkpoint_metadata=(
+                        _data_plane_checkpoint_metadata(group_count=1)
+                    ),
+                ),
+                SetupTimingMetrics(),
+            )
+            restored = await actor._maybe_restore_replay_buffer()
+            await actor._maybe_restore_rollout_recovery(restored_replay_groups=restored)
+            assert actor._buffer_capacity._value == 4
+            actor._rollout_permitted.set()
+            try:
+                await asyncio.wait_for(actor._rollout_pump(), timeout=5)
+            finally:
+                actor._checkpointer.shutdown()
+            return actor
+
+        actor = asyncio.run(_restore())
+
+        assert buffer.remove_calls == [{"idxs": [0], "remove_in_dp": True}]
+        rollout_manager.generate_and_push.assert_awaited_once()
+        dispatch = rollout_manager.generate_and_push.await_args
+        assert dispatch.args == ({"idx": 1, "message_log": ["fresh"]},)
+        assert dispatch.kwargs["target_step"] == 3
+        assert dispatch.kwargs["lineage_group_id"] in {
+            group.group_id for group in rollout_manager.recovery_ledger.groups()
+        }
+        assert actor._buffer_capacity._value == 3
+        assert rollout_manager.reserved_prompts == [
+            {
+                "prompt": {"idx": 1, "message_log": ["fresh"]},
+                "target_step": 3,
+                "admitted": True,
+            }
+        ]
+
+    @pytest.mark.parametrize("dataset_idx", [99, True])
+    def test_replay_free_restore_rejects_changed_prompt_identity(self, dataset_idx):
+        actor = object.__new__(_ACTOR_CLS)
+        actor._dataloader = _FakeDataloader(dataset=[{"idx": 0}, {"idx": dataset_idx}])
+        actor._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+        actor._rollout_manager = _FakeRolloutManager()
+        actor._restored_replay_groups_to_regenerate = [
+            {
+                "meta": KVBatchMeta(
+                    partition_id=_PARTITION_ID,
+                    task_name=None,
+                    sample_ids=["g0-0", "g0-1"],
+                    tags=[{"prompt_idx": 1}, {"prompt_idx": 1}],
+                ),
+                "target_step": 3,
+                "group_id": "g0",
+            }
+        ]
+
+        async def regenerate() -> None:
+            async with actor._data_plane_checkpoint_barrier.mutation() as cut:
+                await actor._queue_restored_replay_groups_for_regeneration(cut)
+
+        with pytest.raises(ValueError, match="prompt"):
+            asyncio.run(regenerate())
+        assert actor._rollout_manager.reserved_prompts == []
+
     def test_restored_permits_are_released_by_a_live_pump(self, tmp_path):
         # The restore takes one capacity permit per group; a running pump must
         # give them all back. Every other restore test uses max_num_steps=0,
@@ -3010,7 +3215,14 @@ class TestReplayBufferPersistence:
                     task_name=None,
                     sample_ids=[f"g{i}-0", f"g{i}-1"],
                     sequence_lengths=[16, 16],
-                    tags=[{"weight_version": 0}, {"weight_version": 0}],
+                    # Has to agree with "group_id" below: this test is the one
+                    # restore case that actually runs the pump body, and the
+                    # pump cross-checks the ids it selects against the
+                    # training claims the restore created.
+                    tags=[
+                        {"weight_version": 0, GROUP_ID_TAG: f"g{i}"},
+                        {"weight_version": 0, GROUP_ID_TAG: f"g{i}"},
+                    ],
                 ),
                 "start_weight": 0,
                 "end_weight": 0,
@@ -3070,7 +3282,10 @@ class TestReplayBufferPersistence:
                         task_name=None,
                         sample_ids=["g0-0", "g0-1"],
                         sequence_lengths=[16, 16],
-                        tags=[{"weight_version": 0}, {"weight_version": 0}],
+                        tags=[
+                            {"weight_version": 0, GROUP_ID_TAG: "g0"},
+                            {"weight_version": 0, GROUP_ID_TAG: "g0"},
+                        ],
                     ),
                     "start_weight": 0,
                     "end_weight": 0,

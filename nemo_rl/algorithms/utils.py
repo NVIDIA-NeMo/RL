@@ -33,6 +33,7 @@ from nemo_rl.data.deepseek_v4_tokenizer import (
     should_use_deepseek_v4_chat_template,
 )
 from nemo_rl.models.policy import TokenizerConfig
+from nemo_rl.telemetry.vocabulary import RUN_WINDOW_WALL_CLOCK_CATEGORIES
 from nemo_rl.utils.fastokens import maybe_patch_fastokens
 from nemo_rl.utils.logger import Logger
 
@@ -115,7 +116,7 @@ def calculate_baseline_and_std_per_prompt(
     valid_mask: torch.Tensor,
     leave_one_out_baseline: bool = True,
     std_rewards: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Function to compute a baseline for each (prompt, response) pair in the batch.
 
     The same baseline is calculated for each prompt. Samples set to 0 in 'valid_mask'
@@ -133,7 +134,13 @@ def calculate_baseline_and_std_per_prompt(
                                   shaped reward.
 
     Returns:
-    tensor (b,), tensor (b,) of baselines and std on the same device as 'rewards'
+    tensor (b,), tensor (b,), bool tensor (b,) of baselines, std, and a per-sample
+    boolean that is True if the sample group distribution associated with the sample
+    is trivial, i.e. all the rewards are a single value.
+
+    Any non-zero std computed from a trivial distribution is float32 rounding noise
+    which can create explosive advantages during normalization that should not be
+    used for GRPO training.
     """
     if std_rewards is None:
         std_rewards = rewards
@@ -142,6 +149,7 @@ def calculate_baseline_and_std_per_prompt(
     baseline = torch.zeros_like(rewards)
     sq_baseline = torch.zeros_like(rewards)
     std = torch.zeros_like(rewards)
+    is_trivial_distribution = torch.ones_like(rewards, dtype=torch.bool)
     device_ordinal = rewards.get_device()
     if device_ordinal == -1:
         reward_device = torch.device("cpu")
@@ -191,9 +199,22 @@ def calculate_baseline_and_std_per_prompt(
                 )
                 / num_valid
             )
+            comparison_mask = baseline_mask_matrix.bool() & valid_mask[
+                prompt_idx
+            ].bool().unsqueeze(0)
+            comparison_rewards = (
+                std_rewards[prompt_idx].unsqueeze(0).expand(len(prompt_idx), -1)
+            )
+            comparison_min = comparison_rewards.masked_fill(
+                ~comparison_mask, torch.inf
+            ).amin(dim=1)
+            comparison_max = comparison_rewards.masked_fill(
+                ~comparison_mask, -torch.inf
+            ).amax(dim=1)
 
             baseline[prompt_idx] = prompt_baseline
             sq_baseline[prompt_idx] = std_prompt_baseline_square
+            is_trivial_distribution[prompt_idx] = comparison_min == comparison_max
             std[prompt_idx] = (
                 (
                     (std_prompt_baseline_square - std_prompt_baseline.square())
@@ -203,7 +224,31 @@ def calculate_baseline_and_std_per_prompt(
                 .nan_to_num(0)
             )
 
-    return baseline, std
+    return baseline, std, is_trivial_distribution
+
+
+def calculate_trivial_reward_distributions(
+    prompts: torch.Tensor,
+    rewards: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Return an all-or-nothing exact-equality mask for each prompt group.
+
+    Unlike the per-sample mask returned by
+    ``calculate_baseline_and_std_per_prompt``, this always compares the full
+    valid reward group. It is therefore independent of leave-one-out baseline
+    semantics and safe to use for prompt-level dynamic sampling.
+    """
+    is_trivial_prompt_distribution = torch.ones_like(rewards, dtype=torch.bool)
+    for prompt in torch.unique(prompts, dim=0):
+        prompt_mask = (prompts == prompt).all(1)
+        valid_rewards = rewards[prompt_mask & valid_mask.bool()]
+        is_trivial = valid_rewards.numel() <= 1 or (
+            valid_rewards.amin() == valid_rewards.amax()
+        )
+        is_trivial_prompt_distribution[prompt_mask] = is_trivial
+
+    return is_trivial_prompt_distribution
 
 
 def surpress_user_warnings(f):  # type: ignore
@@ -215,6 +260,28 @@ def surpress_user_warnings(f):  # type: ignore
         return output
 
     return wrapper
+
+
+@torch.no_grad()
+def compute_seq_logprob_errors(
+    *,
+    policy_logprobs: torch.Tensor,
+    generation_logprobs: torch.Tensor,
+    token_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return mean multiplicative absolute error and validity per sequence.
+
+    Inputs must already be aligned to predicted tokens (without the first
+    input token). Padding and previously masked samples do not participate.
+    Nonfinite errors on valid tokens fail any finite threshold.
+    """
+    mask = token_mask * sample_mask.unsqueeze(-1)
+    counts = mask.sum(dim=-1)
+    valid = counts > 0
+    error = torch.where(mask.bool(), (generation_logprobs - policy_logprobs).abs(), 0.0)
+    errors = (torch.exp(error * mask) * mask).sum(dim=-1) / counts.clamp(min=1)
+    return errors, valid
 
 
 def masked_mean(
@@ -234,7 +301,7 @@ def masked_mean(
 
 def mask_out_neg_inf_logprobs(
     logprobs: torch.Tensor, mask: torch.Tensor, logprobs_name: str
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Mask out negative infinity log probabilities.
 
     Handling sampling mask mismatch:
@@ -249,7 +316,7 @@ def mask_out_neg_inf_logprobs(
         logprobs_name: Name of the logprobs tensor. Used for printing warning messages.
 
     Returns:
-        Masked log probabilities.
+        Tuple of (masked log probabilities, finite-position indicator).
     """
     is_neginf = torch.isinf(logprobs)
     neginf_count = (is_neginf & mask.bool()).sum().item()
@@ -259,10 +326,11 @@ def mask_out_neg_inf_logprobs(
             "(policy top-k/top-p mismatch). Masking out these positions."
         )
 
-    mask = mask * (~is_neginf).float()
-    logprobs = torch.where(mask.bool(), logprobs, 0.0)
+    finite_mask = (~is_neginf).float()
+    effective_mask = mask * finite_mask
+    logprobs = torch.where(effective_mask.bool(), logprobs, 0.0)
 
-    return logprobs
+    return logprobs, finite_mask
 
 
 def masked_var(
@@ -754,8 +822,8 @@ def print_performance_metrics(
             + policy_training_time
         )
 
-    num_nodes = master_config.cluster["num_nodes"]
-    gpus_per_node = master_config.cluster["gpus_per_node"]
+    num_nodes = master_config.cluster.num_nodes
+    gpus_per_node = master_config.cluster.gpus_per_node
     total_num_gpus = num_nodes * gpus_per_node
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
 
@@ -972,15 +1040,6 @@ THREAD_ACCUMULATED_EFFICIENCY_CATEGORIES = [
 EFFICIENCY_CATEGORIES = (
     WALL_CLOCK_EFFICIENCY_CATEGORIES + THREAD_ACCUMULATED_EFFICIENCY_CATEGORIES
 )
-
-# Wall-clock categories whose value covers the whole run rather than one step.
-# The driver's Timer is reset every step, so its idle categories are per-step
-# deltas -- but init/total is measured once before the loop and republished
-# unchanged afterwards, so it cannot be compared against a single step's wall
-# time. Mirrored by _RUN_WINDOW_WALL_CLOCK_CATEGORIES in
-# nemo_rl/telemetry/metrics.py, which cannot import this module (torch); a test
-# keeps the two in lockstep.
-RUN_WINDOW_WALL_CLOCK_CATEGORIES = frozenset({"init/total"})
 
 STEP_WINDOW_WALL_CLOCK_CATEGORIES = [
     category

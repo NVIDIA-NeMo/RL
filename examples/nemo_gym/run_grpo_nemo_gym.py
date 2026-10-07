@@ -59,6 +59,7 @@ from nemo_rl.utils.config import (
     register_omegaconf_resolvers,
 )
 from nemo_rl.utils.logger import get_next_experiment_dir, log_container_init_timing
+from nemo_rl.utils.outdated_config_checks import check_outdated_config
 from nemo_rl.utils.timer import Timer
 
 
@@ -150,13 +151,14 @@ def main() -> None:
             config = parse_hydra_overrides(config, overrides)
 
         config = OmegaConf.to_container(config, resolve=True)
+        check_outdated_config(config)
         config = MasterConfig(**config)
         materialize_vllm_video_config(config.policy, config.data)
         print("Applied CLI overrides")
 
     # Get the next experiment directory with incremented ID
-    config.logger["log_dir"] = get_next_experiment_dir(config.logger["log_dir"])
-    print(f"📊 Using log directory: {config.logger['log_dir']}")
+    config.logger.log_dir = get_next_experiment_dir(config.logger.log_dir)
+    print(f"📊 Using log directory: {config.logger.log_dir}")
     if config.checkpointing["enabled"]:
         print(
             f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"

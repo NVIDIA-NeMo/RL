@@ -29,11 +29,18 @@ from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_n
 from torch import nn
 from torch.distributed.tensor import DTensor
 
-from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    need_top_k_or_top_p_filtering,
+)
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.metric_utils import LEARNING_RATE_KEY
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
+from nemo_rl.models.automodel.checkpoint import (
+    AutomodelCheckpointManager,
+    build_checkpoint_config,
+)
 from nemo_rl.models.automodel.data import (
     check_sequence_dim,
     get_microbatch_iterator,
@@ -76,11 +83,14 @@ from nemo_rl.models.policy.workers.checkpoint_engine import (
 from nemo_rl.models.policy.workers.patches import (
     apply_transformer_engine_patch,
 )
-from nemo_rl.telemetry.setup import init_telemetry_worker
-from nemo_rl.utils.checkpoint import CheckpointingConfig
+from nemo_rl.telemetry.setup import (
+    init_telemetry_worker,
+    traced_worker_init,
+)
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+from nemo_rl.utils.tensor_ops import pad_and_concat
 from nemo_rl.utils.timer import Timer
 
 
@@ -234,6 +244,7 @@ class DTensorPolicyWorkerV2Impl(
             "context_parallel": self.device_mesh["cp"].get_local_rank(),
         }
 
+    @traced_worker_init("rl.policy.load_model", **{"rl.backend": "dtensor_v2"})
     def __init__(
         self,
         config: PolicyConfig,
@@ -323,18 +334,19 @@ class DTensorPolicyWorkerV2Impl(
         requires_synchronous_checkpoint = (
             getattr(runtime_config.model_config, "model_type", None) == "deepseek_v4"
         )
+        dtensor_cfg = config["dtensor_cfg"]
+        checkpoint_config = build_checkpoint_config(
+            dtensor_cfg,
+            model_repo_id=config["model_name"],
+            dequantize_base_checkpoint=config.get("dequantize_base_checkpoint", False),
+            is_peft=self.lora_enabled,
+            # Automodel's process-based async DCP cannot serialize the
+            # HF-adapted DeepSeek-V4 DTensor/view state. Other v2 models keep
+            # the pre-existing async checkpoint path.
+            is_async=not requires_synchronous_checkpoint,
+        )
         self._init_checkpoint_manager(
-            config_updates={
-                "model_repo_id": config["model_name"],
-                "dequantize_base_checkpoint": config.get(
-                    "dequantize_base_checkpoint", False
-                ),
-                "is_peft": self.lora_enabled,
-                # Automodel's process-based async DCP cannot serialize the
-                # HF-adapted DeepSeek-V4 DTensor/view state. Other v2 models keep
-                # the pre-existing async checkpoint path.
-                "is_async": not requires_synchronous_checkpoint,
-            },
+            config_updates=checkpoint_config,
         )
 
         # Set up model and optimizer.
@@ -650,7 +662,9 @@ class DTensorPolicyWorkerV2Impl(
                     # Only process valid (non-dummy) batches for metrics
                     if mb_idx < iterator_len:
                         num_valid_samples = loss_metrics["num_valid_samples"]
-                        loss_metrics["lr"] = self.optimizer.param_groups[0]["lr"]
+                        loss_metrics[LEARNING_RATE_KEY] = self.optimizer.param_groups[
+                            0
+                        ]["lr"]
                         if self.draft_model is not None:
                             # param_groups[0] is "policy" (see
                             # DSPARK_OPTIMIZER_GROUP_NAMES); the draft's own
@@ -663,7 +677,10 @@ class DTensorPolicyWorkerV2Impl(
                         loss_metrics["global_valid_toks"] = global_valid_toks.item()
 
                         if num_valid_samples > 0:
-                            mb_losses.append(loss.item())
+                            # Metrics were materialized together by the loss;
+                            # undo this worker's per-global-batch scaling without
+                            # synchronizing the loss tensor again.
+                            mb_losses.append(loss_metrics["loss"] * num_global_batches)
                             all_mb_metrics.append(loss_metrics)
 
                 grad_norm: Optional[float | torch.Tensor] = None
@@ -761,6 +778,7 @@ class DTensorPolicyWorkerV2Impl(
           a BatchedDataDict with key "logprobs" and shape [batch_size, sequence_length].
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
+          "token_mask": only for top-k/top-p filtering; masked out -inf positions.
         """
         self.timer.start("get_logprobs")
         logprob_batch_size = (
@@ -773,6 +791,7 @@ class DTensorPolicyWorkerV2Impl(
         sequence_dim, seq_dim_size = check_sequence_dim(data)
 
         all_log_probs = []
+        all_token_masks: list[torch.Tensor] = []
         self.model.eval()
 
         # Create logprobs post-processor
@@ -821,19 +840,21 @@ class DTensorPolicyWorkerV2Impl(
                     continue
 
                 all_log_probs.append(token_logprobs)
+                if "token_mask" in _metrics:
+                    all_token_masks.append(_metrics["token_mask"])
 
         # Concatenate all batches
         return_data = BatchedDataDict[LogprobOutputSpec]()
 
-        all_log_probs_padded = []
-        for lp in all_log_probs:
-            padding_needed = seq_dim_size - lp.shape[1]
-            if padding_needed > 0:
-                lp = torch.nn.functional.pad(
-                    lp, (0, padding_needed), mode="constant", value=0.0
-                )
-            all_log_probs_padded.append(lp)
-        return_data["logprobs"] = torch.cat(all_log_probs_padded, dim=0).cpu()
+        return_data["logprobs"] = pad_and_concat(
+            all_log_probs, target_len=seq_dim_size
+        ).cpu()
+        # Taken from config so every DP rank emits the same keys.
+        if need_top_k_or_top_p_filtering(self.sampling_params):
+            # Pad token_mask with 0 so padded positions are excluded from the loss.
+            return_data["token_mask"] = pad_and_concat(
+                all_token_masks, target_len=seq_dim_size
+            ).cpu()
 
         self.timer.stop("get_logprobs")
         return return_data
@@ -984,31 +1005,11 @@ class DTensorPolicyWorkerV2Impl(
 
         ret = BatchedDataDict[Any]()
         # Pad each micro-batch result on sequence dim to common length (S), similar to get_logprobs
-        all_topk_vals_padded = []
-        all_topk_idx_padded = []
-        target_seq_len = seq_dim_size
-        for vals, idx in zip(out_topk_vals, out_topk_idx):
-            pad_needed = target_seq_len - vals.shape[1]
-            if pad_needed > 0:
-                # pad along sequence dimension (second dim): (last_dim_pad_left, last_dim_pad_right, seq_pad_left, seq_pad_right, batch_pad_left, batch_pad_right)
-                vals = torch.nn.functional.pad(
-                    vals, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0.0
-                )
-                idx = torch.nn.functional.pad(
-                    idx, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0
-                )
-            all_topk_vals_padded.append(vals)
-            all_topk_idx_padded.append(idx)
-
-        ret["topk_logits"] = (
-            torch.cat(all_topk_vals_padded, dim=0)
-            if len(all_topk_vals_padded) > 1
-            else all_topk_vals_padded[0]
+        ret["topk_logits"] = pad_and_concat(
+            out_topk_vals, target_len=seq_dim_size
         ).cpu()
-        ret["topk_indices"] = (
-            torch.cat(all_topk_idx_padded, dim=0)
-            if len(all_topk_idx_padded) > 1
-            else all_topk_idx_padded[0]
+        ret["topk_indices"] = pad_and_concat(
+            out_topk_idx, target_len=seq_dim_size
         ).cpu()
         return ret
 
@@ -1555,7 +1556,8 @@ class DTensorPolicyWorkerV2Impl(
         weights_path: str,
         optimizer_path: Optional[str] = None,
         tokenizer_path: Optional[str] = None,
-        checkpointing_cfg: Optional[CheckpointingConfig] = None,
+        *,
+        is_final_checkpoint: bool,
     ) -> None:
         """Save a checkpoint of the model.
 
@@ -1573,8 +1575,7 @@ class DTensorPolicyWorkerV2Impl(
             scheduler=None if has_draft else self.scheduler,
             tokenizer=self.tokenizer if tokenizer_path else None,
             tokenizer_path=tokenizer_path,
-            checkpointing_cfg=checkpointing_cfg,
-            lora_enabled=self.lora_enabled,
+            is_final_checkpoint=is_final_checkpoint,
             peft_config=self.peft_config,
         )
         if has_draft:
@@ -1666,7 +1667,6 @@ class DTensorPolicyWorkerV2Impl(
     def _init_checkpoint_manager(
         self,
         config_updates: Optional[dict[str, Any]] = None,
-        checkpoint_root: Optional[str] = None,
     ) -> None:
         """Initialize the AutomodelCheckpointManager for this worker.
 
@@ -1674,8 +1674,7 @@ class DTensorPolicyWorkerV2Impl(
         and initializes its underlying checkpointer.
 
         Args:
-            config_updates: Dict of CheckpointingConfig fields to set during initialization.
-            checkpoint_root: Optional root directory for checkpoints.
+            config_updates: Automodel checkpoint fields to set during initialization.
         """
         if self.checkpoint_manager is None:
             self.checkpoint_manager = AutomodelCheckpointManager(
@@ -1685,7 +1684,6 @@ class DTensorPolicyWorkerV2Impl(
             )
             self.checkpoint_manager.init_checkpointer(
                 config_updates=config_updates,
-                checkpoint_root=checkpoint_root,
             )
 
 

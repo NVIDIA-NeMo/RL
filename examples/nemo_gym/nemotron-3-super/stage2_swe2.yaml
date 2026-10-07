@@ -6,8 +6,6 @@ checkpointing:
   keep_top_k: 100
   save_period: 2
   checkpoint_must_save_by: null
-  model_save_format: "safetensors"
-  save_consolidated: false
   save_optimizer: true
 
 grpo:
@@ -100,7 +98,6 @@ policy:
   offload_optimizer_for_logprob: false
 
   dtensor_cfg:
-    _v2: true
     enabled: false
     cpu_offload: False
     sequence_parallel: false

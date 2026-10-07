@@ -961,6 +961,55 @@ class GetPackSequenceParametersTestActor:
 
         return {"success": True, "error": None}
 
+    def run_all_get_pack_sequence_parameters_for_megatron_fp4_tests(self):
+        """Test FP4 alignment and FP8/FP4 mutual exclusion."""
+        from nemo_rl.models.megatron.data import (
+            _get_pack_sequence_parameters_for_megatron,
+        )
+        from nemo_rl.models.policy import Fp4Config
+
+        base = {
+            "tensor_model_parallel_size": 1,
+            "sequence_parallel": False,
+            "pipeline_model_parallel_size": 1,
+            "context_parallel_size": 1,
+        }
+        for fp4_cfg in ({"enabled": True}, Fp4Config(enabled=True)):
+            pad_individual, pad_packed, pad_to = (
+                _get_pack_sequence_parameters_for_megatron(
+                    {**base, "fp4_cfg": fp4_cfg}, 1, 100
+                )
+            )
+            if (pad_individual, pad_packed, pad_to) != (1, 128, None):
+                return {
+                    "success": False,
+                    "error": (
+                        "FP4 requires (pad_individual, pad_packed, pad_to) "
+                        f"== (1, 128, None), got "
+                        f"{(pad_individual, pad_packed, pad_to)}"
+                    ),
+                }
+
+        try:
+            _get_pack_sequence_parameters_for_megatron(
+                {
+                    **base,
+                    "fp8_cfg": {"enabled": True, "fp8_recipe": "blockwise"},
+                    "fp4_cfg": {"enabled": True},
+                },
+                1,
+                100,
+            )
+        except ValueError:
+            pass
+        else:
+            return {
+                "success": False,
+                "error": "FP8 and FP4 were accepted together",
+            }
+
+        return {"success": True, "error": None}
+
     def run_all_get_pack_sequence_parameters_for_megatron_hybridep_tests(self):
         """Test _get_pack_sequence_parameters_for_megatron with HybridEP flex dispatcher.
 

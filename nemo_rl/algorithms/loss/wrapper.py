@@ -22,6 +22,7 @@ from nemo_rl.algorithms.loss.draft import DEFAULT_DRAFT_TOKEN_CHUNK_SIZE
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.loss_functions import DraftCrossEntropyLossFn
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.utils.sequence_lengths import CpuIntTuple
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
 
@@ -50,8 +51,8 @@ class SequencePackingLossWrapper:
         self,
         loss_fn: LossFunction,
         prepare_fn: Callable[Any, Any],
-        cu_seqlens_q: Tensor,
-        cu_seqlens_q_padded: Optional[Tensor] = None,
+        cu_seqlens_q: CpuIntTuple,
+        cu_seqlens_q_padded: Optional[CpuIntTuple] = None,
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -75,7 +76,9 @@ class SequencePackingLossWrapper:
         self.loss_fn = loss_fn
         self.prepare_fn = prepare_fn
         self.cu_seqlens_q = cu_seqlens_q
-        self.cu_seqlens_q_padded = cu_seqlens_q_padded
+        self.cu_seqlens_q_padded = (
+            cu_seqlens_q_padded if cu_seqlens_q_padded is not None else cu_seqlens_q
+        )
         self.vocab_parallel_rank = vocab_parallel_rank
         self.vocab_parallel_group = vocab_parallel_group
         self.context_parallel_group = context_parallel_group
@@ -89,23 +92,19 @@ class SequencePackingLossWrapper:
     ) -> tuple[Tensor, dict[str, Any]]:
         """Wraps a loss function to handle sequence packing by doing one sequence at a time to avoid excessive padding."""
         unpadded_cu_seqlens = self.cu_seqlens_q
-        unpadded_seq_lengths = self.cu_seqlens_q[1:] - self.cu_seqlens_q[:-1]
-        if self.cu_seqlens_q_padded is not None:
-            padded_cu_seqlens = self.cu_seqlens_q_padded
-            padded_seq_lengths = (
-                self.cu_seqlens_q_padded[1:] - self.cu_seqlens_q_padded[:-1]
-            )
-        else:
-            padded_cu_seqlens = unpadded_cu_seqlens
-            padded_seq_lengths = unpadded_seq_lengths
+        unpadded_seq_lengths = tuple(
+            end - start
+            for start, end in zip(unpadded_cu_seqlens[:-1], unpadded_cu_seqlens[1:])
+        )
+        padded_cu_seqlens = self.cu_seqlens_q_padded
         seq_starts = padded_cu_seqlens[:-1]
         seq_ends = padded_cu_seqlens[1:]
 
         loss_accum = 0
         metrics_accum = {}
         for seq_idx in range(len(seq_starts)):
-            seq_start = seq_starts[seq_idx].item()
-            seq_end = seq_ends[seq_idx].item()
+            seq_start = seq_starts[seq_idx]
+            seq_end = seq_ends[seq_idx]
 
             # get sequence and unpad all 'data' tensors. The data dict is a BatchedDataDict of unpacked tensors
             seq_data = data.slice(seq_idx, seq_idx + 1)
@@ -131,14 +130,14 @@ class SequencePackingLossWrapper:
                 # Use slicing (clamped end) to avoid narrow() OOB on packed tails.
                 logit_start = seq_start // cp_size
                 logit_end = min(
-                    (seq_start + padded_seq_lengths[seq_idx]) // cp_size,
+                    seq_end // cp_size,
                     next_token_logits.shape[1],
                 )
                 logit_slice_idxs = slice(logit_start, logit_end)
                 next_token_logits_slice = next_token_logits[:, logit_slice_idxs]
             else:
                 logit_start = seq_start // cp_size
-                logit_end = (seq_start + padded_seq_lengths[seq_idx]) // cp_size
+                logit_end = seq_end // cp_size
                 logit_length = logit_end - logit_start
                 next_token_logits_slice = next_token_logits.narrow(
                     1, logit_start, logit_length
@@ -197,16 +196,17 @@ class SequencePackingFusionLossWrapper:
     This avoids per-sequence kernel launches and TP/CP communication overhead while
     producing numerically identical results.
 
-    The prepare_fn should be prepare_packed_loss_input (from nemo_rl.algorithms.loss.utils),
-    which currently only supports LossInputType.LOGPROB.
+    The prepare_fn should be prepare_packed_loss_input (from
+    nemo_rl.algorithms.loss.loss_input), which currently only supports
+    LossInputType.LOGPROB.
     """
 
     def __init__(
         self,
         loss_fn: LossFunction,
         prepare_fn: Callable[..., Any],
-        cu_seqlens_q: Tensor,
-        cu_seqlens_q_padded: Optional[Tensor] = None,
+        cu_seqlens_q: CpuIntTuple,
+        cu_seqlens_q_padded: Optional[CpuIntTuple] = None,
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -274,6 +274,7 @@ class DraftLossWrapper:
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        defer_normalization: bool = False,
         cu_seqlens_q: Optional[torch.Tensor] = None,
         cu_seqlens_q_padded: Optional[torch.Tensor] = None,
         d2t: Optional[torch.Tensor] = None,
@@ -287,6 +288,7 @@ class DraftLossWrapper:
         self.vocab_parallel_rank = vocab_parallel_rank
         self.vocab_parallel_group = vocab_parallel_group
         self.context_parallel_group = context_parallel_group
+        self.defer_normalization = defer_normalization
         self.cu_seqlens_q = cu_seqlens_q
         self.cu_seqlens_q_padded = (
             cu_seqlens_q_padded if cu_seqlens_q_padded is not None else cu_seqlens_q
@@ -295,6 +297,13 @@ class DraftLossWrapper:
         self.student_logits = student_logits
         if cu_seqlens_q is not None and student_logits is None:
             raise ValueError("student_logits must be passed explicitly in packed mode.")
+        if cu_seqlens_q is not None and defer_normalization:
+            # The packed path normalizes inside _packed_draft_loss and emits no
+            # step payload, so a deferred caller would silently keep the policy
+            # denominator on the draft gradients. Fail loudly instead.
+            raise ValueError(
+                "deferred draft normalization is not supported in packed mode."
+            )
         if cu_seqlens_q is None and prepare_fn is None:
             raise ValueError("prepare_fn is required in unpacked mode.")
         self.draft_loss_fn = DraftCrossEntropyLossFn(
@@ -361,6 +370,14 @@ class DraftLossWrapper:
             **kwargs,
         )
 
+        # Function-local import: step_state lives under models.megatron.draft,
+        # whose package import pulls the modelopt chain non-megatron users avoid.
+        from nemo_rl.models.megatron.draft.step_state import (
+            DRAFT_LOSS_METRIC_KEY,
+            DRAFT_STEP_PAYLOAD_KEY,
+            DraftStepState,
+        )
+
         if self.cu_seqlens_q is not None:
             draft_loss = self._packed_draft_loss(
                 next_token_logits, data, global_valid_seqs, global_valid_toks
@@ -374,14 +391,27 @@ class DraftLossWrapper:
                 vocab_parallel_group=self.vocab_parallel_group,
                 context_parallel_group=self.context_parallel_group,
             )
-            draft_loss = self.draft_loss_fn(
-                data=data,
-                global_valid_seqs=global_valid_seqs,
-                global_valid_toks=global_valid_toks,
-                **loss_input,
-            )
+            if self.defer_normalization:
+                stats = self.draft_loss_fn.loss_stats(data=data, **loss_input)
+                draft_loss = stats.normalized(
+                    normalization_counts=torch.ones_like(stats.counts),
+                )
+                # Deferred payloads are only consumed by the Megatron split API.
+                metrics[DRAFT_STEP_PAYLOAD_KEY] = DraftStepState.metric_payload(stats)
+            else:
+                draft_loss = self.draft_loss_fn(
+                    data=data,
+                    global_valid_seqs=global_valid_seqs,
+                    global_valid_toks=global_valid_toks,
+                    **loss_input,
+                )
         combined_loss = policy_loss + self.loss_weight * draft_loss
-        metrics["draft_loss"] = float(draft_loss.detach().item())
+        draft_loss_value = float(draft_loss.detach().item())
+        if not self.defer_normalization:
+            metrics["total_loss"] = (
+                metrics["loss"] + self.loss_weight * draft_loss_value
+            )
+        metrics[DRAFT_LOSS_METRIC_KEY] = draft_loss_value
         return combined_loss, metrics
 
 

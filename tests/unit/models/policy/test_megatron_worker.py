@@ -855,8 +855,185 @@ def _disable_opd_full(worker) -> None:
     """
     worker._opd_full_enabled = False
     worker._opd_full_lm_head_lifecycle = None
-    worker._opd_full_teacher_lm_head = None
-    worker._opd_full_teacher_checkpoint_path = None
+    worker._opd_full_teacher_lm_heads = {}
+    worker._opd_full_teacher_checkpoint_paths = {}
+    worker._opd_full_lm_head_evicted = False
+
+
+def _worker_with_teachers(lifecycle, heads, paths):
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker._opd_full_enabled = True
+    worker._opd_full_lm_head_lifecycle = lifecycle
+    worker._opd_full_teacher_lm_heads = dict(heads)
+    worker._opd_full_teacher_checkpoint_paths = dict(paths)
+    worker._opd_full_lm_head_evicted = False
+    return worker
+
+
+class _FakeShard:
+    """Stands in for a GPU/CPU shard: the mover reads only ``.device`` and ``.to``."""
+
+    def __init__(self, device: str):
+        self.device = torch.device(device)
+
+    def to(self, *, device, non_blocking):
+        del non_blocking
+        return _FakeShard(str(device))
+
+
+def test_evict_reloads_every_teacher_once_per_release(monkeypatch):
+    """Two teachers under ``evict``: drop both, reload both once, then stay put.
+
+    A second train phase without an intervening release must not re-enter the
+    load: it is a whole-world collective the other ranks would not be in.
+    """
+    worker = _worker_with_teachers(
+        "evict",
+        {0: torch.zeros(2, 3), 1: torch.ones(2, 3)},
+        {0: "/ckpt/a", 1: "/ckpt/b"},
+    )
+    reloads = []
+
+    def fake_load(path, teacher_index):
+        reloads.append((teacher_index, path))
+        worker._opd_full_teacher_lm_heads[teacher_index] = torch.full(
+            (2, 3), float(teacher_index)
+        )
+
+    monkeypatch.setattr(worker, "_load_opd_full_teacher_lm_head_from_path", fake_load)
+    moves = []
+    monkeypatch.setattr(
+        worker, "_move_opd_full_teacher_lm_head", lambda device: moves.append(device)
+    )
+
+    worker._release_opd_full_teacher_lm_head()
+    assert worker._opd_full_teacher_lm_heads == {}
+    assert worker._opd_full_lm_head_evicted is True
+
+    worker._stage_opd_full_teacher_lm_head_for_training()
+    assert reloads == [(0, "/ckpt/a"), (1, "/ckpt/b")]
+    assert sorted(worker._opd_full_teacher_lm_heads) == [0, 1]
+    assert worker._opd_full_lm_head_evicted is False
+    assert moves == ["cuda"]
+
+    worker._stage_opd_full_teacher_lm_head_for_training()
+    assert len(reloads) == 2
+
+
+def test_off_last_stage_rank_reenters_the_reload_in_lockstep(monkeypatch):
+    """A non-last PP stage holds paths but no shards and must still re-enter.
+
+    ``evict`` has to set the flag from the recorded paths, not the (empty) shard
+    dict, or this rank skips the reload collective the last stage is waiting in.
+    """
+    worker = _worker_with_teachers("evict", {}, {0: "/ckpt/a", 1: "/ckpt/b"})
+    reloads = []
+    monkeypatch.setattr(
+        worker,
+        "_load_opd_full_teacher_lm_head_from_path",
+        lambda path, teacher_index: reloads.append((teacher_index, path)),
+    )
+    monkeypatch.setattr(worker, "_move_opd_full_teacher_lm_head", lambda device: None)
+
+    worker._release_opd_full_teacher_lm_head()
+    assert worker._opd_full_lm_head_evicted is True
+
+    worker._stage_opd_full_teacher_lm_head_for_training()
+    assert reloads == [(0, "/ckpt/a"), (1, "/ckpt/b")]
+
+
+def test_offload_parks_every_teacher_head_not_just_the_first():
+    worker = _worker_with_teachers(
+        "offload",
+        {0: _FakeShard("cuda"), 1: _FakeShard("cuda")},
+        {0: "/ckpt/a", 1: "/ckpt/b"},
+    )
+
+    worker._release_opd_full_teacher_lm_head()
+
+    assert {i: str(h.device) for i, h in worker._opd_full_teacher_lm_heads.items()} == {
+        0: "cpu",
+        1: "cpu",
+    }
+    assert worker._opd_full_lm_head_evicted is False
+
+
+def test_second_teacher_with_another_hidden_size_is_rejected_at_load(monkeypatch):
+    from nemo_rl.models.policy.workers import megatron_policy_worker as worker_module
+
+    worker = _worker_with_teachers("none", {0: torch.zeros(4, 3)}, {0: "/ckpt/a"})
+    owner = SimpleNamespace(
+        output_layer=SimpleNamespace(
+            weight=torch.zeros(4, 3), output_size_per_partition=4
+        )
+    )
+    monkeypatch.setattr(worker, "_resolve_output_layer_owner", lambda: owner)
+    monkeypatch.setattr(
+        worker_module,
+        "load_teacher_output_layer_weight",
+        lambda **kw: torch.zeros(4, 5),
+    )
+    monkeypatch.setattr(worker, "_move_opd_full_teacher_lm_head", lambda device: None)
+
+    with pytest.raises(ValueError, match="hidden_size=5, but teacher_index=0 has 3"):
+        worker._load_opd_full_teacher_lm_head_from_path("/ckpt/b", 1)
+
+    assert 1 not in worker._opd_full_teacher_lm_heads
+    assert worker._opd_full_teacher_lm_heads[0].shape == (4, 3)
+
+
+def test_off_last_stage_joins_the_load_without_requesting_a_shard(monkeypatch):
+    from nemo_rl.models.policy.workers import megatron_policy_worker as worker_module
+
+    worker = _worker_with_teachers("none", {}, {})
+    monkeypatch.setattr(worker, "_resolve_output_layer_owner", lambda: None)
+    calls = []
+
+    def fake_load(**kwargs):
+        calls.append(kwargs)
+        return None
+
+    monkeypatch.setattr(worker_module, "load_teacher_output_layer_weight", fake_load)
+
+    worker._load_opd_full_teacher_lm_head_from_path("/ckpt/a", 3)
+
+    assert calls == [
+        {"teacher_pretrained_path": "/ckpt/a", "local_vocab_size": None, "dtype": None}
+    ]
+    assert worker._opd_full_teacher_lm_heads == {}
+    # Recorded even without a shard: the evict reload must re-enter in lockstep.
+    assert worker._opd_full_teacher_checkpoint_paths == {3: "/ckpt/a"}
+
+
+def test_resolve_output_layer_owner_is_none_only_off_the_last_stage(monkeypatch):
+    from nemo_rl.models.policy.workers import megatron_policy_worker as worker_module
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = SimpleNamespace()  # no output_layer, no language_model
+    monkeypatch.setattr(worker_module, "unwrap_model", lambda model: model)
+    monkeypatch.setattr(worker_module.torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        worker_module.parallel_state,
+        "is_pipeline_last_stage",
+        lambda ignore_virtual=False: False,
+    )
+
+    assert worker._resolve_output_layer_owner() is None
+
+    monkeypatch.setattr(
+        worker_module.parallel_state,
+        "is_pipeline_last_stage",
+        lambda ignore_virtual=False: True,
+    )
+    with pytest.raises(AttributeError, match="last pipeline stage"):
+        worker._resolve_output_layer_owner()
 
 
 @pytest.mark.parametrize(
@@ -1592,6 +1769,54 @@ def test_megatron_save_checkpoint_onloads_model_before_save(monkeypatch):
     assert worker.mcore_state.cfg.checkpoint.save == "original_path"
 
 
+def test_megatron_save_checkpoint_records_scheduler_position(monkeypatch):
+    """Bridge restores scheduler.num_steps from consumed_train_samples on resume."""
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
+    worker.model = _FakeTrainableModel()
+    worker.model.training = False
+    worker.optimizer = object()
+    worker.scheduler = SimpleNamespace(num_steps=96)
+    worker.optimizer_cpu_offload = False
+    worker.should_disable_forward_pre_hook = False
+    worker.checkpointing_context = None
+    worker.mcore_state = SimpleNamespace(
+        cfg=SimpleNamespace(
+            checkpoint=SimpleNamespace(save="original_path", async_save=False)
+        ),
+        train_state=SimpleNamespace(
+            floating_point_operations_so_far=0, consumed_train_samples=0
+        ),
+    )
+    worker.move_model = lambda model, device, move_params, move_grads: model
+    worker.move_optimizer = lambda device: None
+
+    saved_consumed_samples = []
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(
+        worker_module, "maybe_finalize_async_save", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "save_checkpoint",
+        lambda **kwargs: saved_consumed_samples.append(
+            kwargs["state"].train_state.consumed_train_samples
+        ),
+    )
+
+    MegatronPolicyWorkerImpl.save_checkpoint(
+        worker, weights_path="ckpt/weights", optimizer_path="ckpt/optim"
+    )
+
+    assert saved_consumed_samples == [96]
+
+
 @pytest.mark.parametrize("cache_active", [True, False])
 def test_megatron_finalize_async_save_releases_colocated_nvrx_cache(
     monkeypatch, cache_active
@@ -1605,7 +1830,6 @@ def test_megatron_finalize_async_save_releases_colocated_nvrx_cache(
         cfg=SimpleNamespace(
             checkpoint=SimpleNamespace(
                 async_save=True,
-                async_strategy="nvrx",
                 use_persistent_ckpt_worker=True,
                 ckpt_assume_constant_structure=True,
                 async_ckpt_use_cpu_shm=False,
@@ -1626,11 +1850,7 @@ def test_megatron_finalize_async_save_releases_colocated_nvrx_cache(
         def cleanup_tensor_caches(cls):
             events.append(("cleanup_tensor_caches", None))
 
-    monkeypatch.setattr(
-        worker_module,
-        "get_async_strategy",
-        lambda strategy: (strategy, {"FileSystemWriterAsync": _Writer}),
-    )
+    monkeypatch.setattr(worker_module, "FileSystemWriterAsync", _Writer)
     monkeypatch.setattr(
         worker_module.gc, "collect", lambda: events.append(("gc_collect", None))
     )
@@ -3139,6 +3359,7 @@ def test_megatron_checkpoint_save_kill_and_restore(
             policy1.save_checkpoint(
                 weights_path=weights_path,
                 optimizer_path=optimizer_path,
+                is_final_checkpoint=False,
             )
             # save_checkpoint() may use MCore's async save path.  Complete the
             # write before inspecting the checkpoint or terminating its workers.

@@ -21,6 +21,8 @@ from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
 
+# Teardown must be bounded: it runs in a finally block, so a hung shutdown would
+# replace a real training error with an indefinite hang.
 DEFAULT_ENV_SHUTDOWN_TIMEOUT_SECONDS = 10.0
 
 
@@ -156,6 +158,10 @@ def shutdown_environments(
     in-flight HTTP requests to the vLLM endpoints, and killing generation first
     leaves them retrying dead connections.
 
+    An entry is either a Ray actor handle or a local object that owns actors of
+    its own (a NeMo-Gym shard set); the latter is asked to shut itself down
+    rather than killed, since only it knows what it holds.
+
     Args:
         env_maps: Task-name to environment mappings. ``None`` and empty
             mappings are skipped.
@@ -171,10 +177,18 @@ def shutdown_environments(
                 continue
             seen.add(id(env))
             print(f"🛑 Shutting down environment {task_name}...")
+            is_actor_handle = isinstance(env, ray.actor.ActorHandle)
             try:
-                ray.get(env.shutdown.remote(), timeout=timeout)
+                if is_actor_handle:
+                    ray.get(env.shutdown.remote(), timeout=timeout)
+                else:
+                    env.shutdown(timeout=timeout)
             except Exception as e:
                 print(f"Graceful shutdown of environment {task_name} failed: {e}")
+                if not is_actor_handle:
+                    # Nothing to kill: the failure came from an owner object
+                    # that already tried, and reported, its own teardown.
+                    continue
                 try:
                     ray.kill(env)
                 except Exception as kill_error:

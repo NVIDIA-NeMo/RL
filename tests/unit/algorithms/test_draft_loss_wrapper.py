@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
+import types
 from functools import partial
 from unittest.mock import MagicMock, patch
 
@@ -22,15 +24,27 @@ from nemo_rl.algorithms.loss.draft import DEFAULT_DRAFT_TOKEN_CHUNK_SIZE
 from nemo_rl.algorithms.loss.loss_functions import DraftCrossEntropyLossFn
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
+DRAFT_STEP_PAYLOAD_KEY = "_draft_step_payload"
+
+
+def _mock_step_state_without_megatron() -> tuple[types.ModuleType, types.ModuleType]:
+    module = types.ModuleType("nemo_rl.models.megatron.draft.step_state")
+    module.DRAFT_STEP_PAYLOAD_KEY = DRAFT_STEP_PAYLOAD_KEY
+    module.DRAFT_LOSS_METRIC_KEY = "draft_loss"
+    module.DraftStepState = MagicMock()
+    package = types.ModuleType("nemo_rl.models.megatron.draft")
+    package.step_state = module
+    return package, module
+
 
 @patch("nemo_rl.algorithms.loss.wrapper.DraftCrossEntropyLossFn")
 def test_draft_loss_wrapper_combines_policy_and_draft_loss(mock_draft_loss_cls):
     """DraftLossWrapper should add the weighted draft loss to the policy loss."""
     from nemo_rl.algorithms.loss.wrapper import DraftLossWrapper
 
-    policy_loss = torch.tensor(3.0)
-    draft_loss = torch.tensor(2.0)
-    metrics = {"policy_metric": 1.0}
+    policy_loss = torch.tensor(3.0, requires_grad=True)
+    draft_loss = torch.tensor(2.0, requires_grad=True)
+    metrics = {"loss": policy_loss.item(), "policy_metric": 1.0}
     next_token_logits = torch.randn(1, 2, 3)
     data = BatchedDataDict({})
     global_valid = torch.tensor(1)
@@ -55,8 +69,13 @@ def test_draft_loss_wrapper_combines_policy_and_draft_loss(mock_draft_loss_cls):
     )
 
     assert combined_loss.item() == 4.0
+    assert combined_metrics["loss"] == policy_loss.item()
+    assert combined_metrics["total_loss"] == combined_loss.item()
     assert combined_metrics["draft_loss"] == draft_loss.item()
     assert combined_metrics["policy_metric"] == metrics["policy_metric"]
+    combined_loss.backward()
+    assert policy_loss.grad.item() == 1.0
+    assert draft_loss.grad.item() == 0.5
 
 
 @patch("nemo_rl.algorithms.loss.wrapper.DraftCrossEntropyLossFn")
@@ -72,7 +91,7 @@ def test_draft_loss_wrapper_reports_draft_loss_when_weight_is_zero(
     data = BatchedDataDict({})
     global_valid = torch.tensor(1)
 
-    policy_loss_fn = MagicMock(return_value=(policy_loss, {}))
+    policy_loss_fn = MagicMock(return_value=(policy_loss, {"loss": policy_loss.item()}))
     prepare_fn = MagicMock(return_value=({"prepared": torch.tensor(1.0)}, data))
     draft_loss_fn = MagicMock(return_value=draft_loss)
     mock_draft_loss_cls.return_value = draft_loss_fn
@@ -92,6 +111,8 @@ def test_draft_loss_wrapper_reports_draft_loss_when_weight_is_zero(
     )
 
     assert combined_loss.item() == policy_loss.item()
+    assert metrics["loss"] == policy_loss.item()
+    assert metrics["total_loss"] == combined_loss.item()
     assert metrics["draft_loss"] == draft_loss.item()
 
 
@@ -166,6 +187,60 @@ def test_draft_cross_entropy_loss_uses_streaming_path(
     assert loss.item() == 2.0
 
 
+@patch("nemo_rl.algorithms.loss.wrapper.DraftCrossEntropyLossFn")
+def test_draft_loss_wrapper_defers_raw_stats_for_split_step(
+    mock_draft_loss_cls,
+) -> None:
+    """Split loss keeps differentiable raw sums and emits detached counts."""
+    from nemo_rl.algorithms.loss.draft import DraftLossStats
+    from nemo_rl.algorithms.loss.wrapper import DraftLossWrapper
+
+    policy_loss = torch.tensor(5.0)
+    numerator = torch.tensor([12.0], requires_grad=True)
+    stats = DraftLossStats(
+        numerators=numerator,
+        counts=torch.tensor([3.0]),
+        weights=torch.ones(1),
+    )
+    draft_loss_fn = MagicMock()
+    draft_loss_fn.loss_stats.return_value = stats
+    mock_draft_loss_cls.return_value = draft_loss_fn
+    data = BatchedDataDict({})
+    wrapper = DraftLossWrapper(
+        loss_fn=MagicMock(return_value=(policy_loss, {})),
+        prepare_fn=MagicMock(return_value=({}, data)),
+        data_dict=data,
+        loss_weight=0.5,
+        defer_normalization=True,
+    )
+
+    payload = object()
+    draft_package, step_state_module = _mock_step_state_without_megatron()
+    step_state_module.DraftStepState.metric_payload.return_value = payload
+    with patch.dict(
+        sys.modules,
+        {
+            "nemo_rl.models.megatron.draft": draft_package,
+            "nemo_rl.models.megatron.draft.step_state": step_state_module,
+        },
+    ):
+        combined_loss, metrics = wrapper(
+            next_token_logits=torch.randn(1, 2, 3),
+            data=data,
+            global_valid_seqs=torch.tensor(1.0),
+            global_valid_toks=torch.tensor(1.0),
+        )
+
+    assert combined_loss.item() == pytest.approx(11.0)
+    assert metrics["draft_loss"] == pytest.approx(12.0)
+    # The split worker forms total_loss once policy and draft denominators
+    # are known; combining their raw numerators here would misreport it.
+    assert "total_loss" not in metrics
+    assert metrics[DRAFT_STEP_PAYLOAD_KEY] is payload
+    step_state_module.DraftStepState.metric_payload.assert_called_once_with(stats)
+    draft_loss_fn.assert_not_called()
+
+
 def test_roll_packed_seq_dim_respects_segment_boundaries():
     """The packed roll must not leak rows across padded segment boundaries."""
     from nemo_rl.algorithms.loss.utils import roll_packed_seq_dim
@@ -203,7 +278,7 @@ def test_pack_rolled_draft_token_mask_clamps_inflated_last_segment():
 def _zero_policy_loss(
     next_token_logits, data, global_valid_seqs, global_valid_toks, **kwargs
 ):
-    return torch.zeros(()), {}
+    return torch.zeros(()), {"loss": 0.0}
 
 
 def _build_draft_batch(draft_vocab_size, d2t):
@@ -265,7 +340,7 @@ def _build_draft_batch(draft_vocab_size, d2t):
 )
 def test_packed_draft_loss_matches_unpacked(draft_vocab_size, d2t):
     """The packed draft CE must equal the unpacked reference on the same batch."""
-    from nemo_rl.algorithms.loss.utils import prepare_loss_input
+    from nemo_rl.algorithms.loss import prepare_loss_input
     from nemo_rl.algorithms.loss.wrapper import DraftLossWrapper
 
     batch = _build_draft_batch(draft_vocab_size, d2t)
@@ -305,3 +380,29 @@ def test_packed_draft_loss_matches_unpacked(draft_vocab_size, d2t):
         reference_metrics["draft_loss"], rel=1e-5
     )
     assert packed_metrics["draft_loss"] > 0.0
+    assert reference_metrics["loss"] == packed_metrics["loss"] == 0.0
+    assert reference_metrics["total_loss"] == pytest.approx(reference_loss.item())
+    assert packed_metrics["total_loss"] == pytest.approx(packed_loss.item())
+
+
+def test_packed_mode_rejects_deferred_normalization():
+    """The packed path emits no step payload, so deferral cannot be honored.
+
+    Accepting the flag would leave the draft grads on the policy denominator
+    with no runtime symptom, so the combination fails at construction.
+    """
+    from nemo_rl.algorithms.loss.wrapper import DraftLossWrapper
+
+    batch = _build_draft_batch(11, None)
+
+    with pytest.raises(ValueError, match="deferred draft normalization"):
+        DraftLossWrapper(
+            loss_fn=_zero_policy_loss,
+            prepare_fn=None,
+            data_dict=batch["data"],
+            cu_seqlens_q=batch["cu_seqlens"],
+            cu_seqlens_q_padded=batch["cu_seqlens_padded"],
+            d2t=None,
+            student_logits=batch["packed_student"],
+            defer_normalization=True,
+        )

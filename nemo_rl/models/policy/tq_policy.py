@@ -64,6 +64,7 @@ from nemo_rl.data_plane.schema import (
     fields_with_optional_routed_experts,
 )
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.telemetry.instrumentation import trace_context_kwargs
 from nemo_rl.utils.flops_tracker import get_theoretical_tflops
 from nemo_rl.utils.timer import Timer
 
@@ -84,6 +85,8 @@ def _aggregate_train_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         out["moe_metrics"] = results[0]["moe_metrics"]
     if "mtp_metrics" in results[0]:
         out["mtp_metrics"] = results[0]["mtp_metrics"]
+    if "draft_grad_norm" in results[0]:
+        out["draft_grad_norm"] = results[0]["draft_grad_norm"]
     all_mb_metrics: dict[str, list[Any]] = defaultdict(list)
     for r in results:
         for k, v in r["all_mb_metrics"].items():
@@ -118,9 +121,14 @@ class TQPolicy(TQDriverMixin, Policy):
     the driver and forwards ``setup_data_plane(dp_cfg)`` to every worker
     so they can attach as clients (``bootstrap=False``).
 
+    ``checkpointing`` is an internal bootstrap mode derived from the existing
+    checkpoint settings and resume path, not another user-facing switch. For
+    Mooncake it enables hard-pinned memory, disables offload, and keeps the
+    driver out of the storage topology; workers inherit the controller's mode.
+
     The partition lifecycle (``register_partition`` / ``clear_samples``) is
     the trainer's responsibility — this class assumes the partition
-    named ``self.tq_partition_id`` (default ``"train"``) is open with a
+    named by ``tq_partition_id`` (default ``"train"``) is open with a
     schema covering ``DP_TRAIN_FIELDS`` (the bulk schema written by the
     rollout actor at first put + driver-/worker-written deltas).
     """
@@ -129,6 +137,7 @@ class TQPolicy(TQDriverMixin, Policy):
         self,
         *args: Any,
         dp_cfg: DataPlaneRuntimeConfig,
+        checkpointing: bool = False,
         tq_partition_id: str = "train",
         **kwargs: Any,
     ) -> None:
@@ -145,17 +154,24 @@ class TQPolicy(TQDriverMixin, Policy):
                 f"TP/PP/CP/EP sizes."
             )
         self.dp_cfg = dp_cfg
-        self.dp_client = build_data_plane_client(dp_cfg, bootstrap=True)
+        self.dp_client = build_data_plane_client(
+            dp_cfg, bootstrap=True, checkpointing=checkpointing
+        )
         self.tq_partition_id = tq_partition_id
         self._router_replay_enabled = bool(
             (self.cfg.get("router_replay") or {}).get("enabled", False)
         )
-        # Per-token teacher payload column read by the full-vocabulary MOPD loss.
+        # Per-token teacher payload column read by the full-vocabulary MOPD loss,
+        # plus (on the hidden-state path) a per-sample teacher-identity column.
         # Resolved by the driver in setup; absent means the feature is off and
-        # the column must stay out of every fetch.
+        # the columns must stay out of every fetch.
+        _opd_full_cfg = self.cfg.get("on_policy_distillation_full")
         self._opd_full_field: Optional[str] = (
-            self.cfg.get("on_policy_distillation_full") or {}
-        ).get("payload_field")
+            _opd_full_cfg["payload_field"] if _opd_full_cfg else None
+        )
+        self._opd_full_teacher_index_field: Optional[str] = (
+            _opd_full_cfg["teacher_index_field"] if _opd_full_cfg else None
+        )
         # The baseline the cluster step metrics are differenced against. Kept
         # per policy rather than in module state so two trainers in one
         # process cannot interleave one baseline; the driver's own baseline
@@ -209,6 +225,7 @@ class TQPolicy(TQDriverMixin, Policy):
                     DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
                 ),
                 field=self._opd_full_field,
+                teacher_index_field=self._opd_full_teacher_index_field,
             ),
             num_samples=num_samples,
             consumer_tasks=["prev_lp", "ref_lp", "train"],
@@ -231,6 +248,7 @@ class TQPolicy(TQDriverMixin, Policy):
                     DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
                 ),
                 field=self._opd_full_field,
+                teacher_index_field=self._opd_full_teacher_index_field,
             ),
             num_samples=num_samples,
             consumer_tasks=[partition_id],
@@ -419,7 +437,7 @@ class TQPolicy(TQDriverMixin, Policy):
                     "tensor_parallel",
                     "pipeline_parallel",
                 ],
-                common_kwargs=common_kwargs,
+                common_kwargs={**common_kwargs, **trace_context_kwargs()},
             )
         # Wait for completion; per-rank returns are None.
         self.worker_group.get_all_worker_results(futures)
@@ -501,7 +519,11 @@ class TQPolicy(TQDriverMixin, Policy):
         train_meta = self._with_route_fields(
             meta,
             tuple(
-                fields_with_optional_opd_full(train_fields, field=self._opd_full_field)
+                fields_with_optional_opd_full(
+                    train_fields,
+                    field=self._opd_full_field,
+                    teacher_index_field=self._opd_full_teacher_index_field,
+                )
             ),
             task_name="train",
             want_routes=True,
@@ -544,6 +566,7 @@ class TQPolicy(TQDriverMixin, Policy):
                     "eval_mode": eval_mode,
                     "gbs": batch_size,
                     "mbs": micro_batch_size,
+                    **trace_context_kwargs(),
                 },
             )
         results = self.worker_group.get_all_worker_results(futures)
@@ -599,6 +622,7 @@ class TQPolicy(TQDriverMixin, Policy):
             loss_fn=loss_fn,
             gbs=batch_size,
             mbs=micro_batch_size,
+            **trace_context_kwargs(),
         )
         ray.get(futures)
 
@@ -635,7 +659,11 @@ class TQPolicy(TQDriverMixin, Policy):
             # router replay and route-plan passthrough. The opd_full payload
             # column has no such gate, so it is appended here.
             tuple(
-                fields_with_optional_opd_full(train_fields, field=self._opd_full_field)
+                fields_with_optional_opd_full(
+                    train_fields,
+                    field=self._opd_full_field,
+                    teacher_index_field=self._opd_full_teacher_index_field,
+                )
             ),
             task_name="train",
             want_routes=True,
@@ -748,6 +776,7 @@ class TQPolicy(TQDriverMixin, Policy):
                     "tensor_parallel",
                     "pipeline_parallel",
                 ],
+                common_kwargs=trace_context_kwargs(),
             )
         # Wait for completion only — workers return None (metrics
         # accumulate in their open-step state until finish_train_step).
@@ -762,6 +791,7 @@ class TQPolicy(TQDriverMixin, Policy):
         """
         futures = self.worker_group.run_all_workers_single_data(
             "finish_train_step_presharded",
+            **trace_context_kwargs(),
         )
         results = ray.get(futures)
         # Filter to DP-replica leaders only. ``run_all_workers_single_data``
@@ -784,6 +814,7 @@ class TQPolicy(TQDriverMixin, Policy):
         """Drop partial step state on every worker. No optimizer.step."""
         futures = self.worker_group.run_all_workers_single_data(
             "abort_train_step_presharded",
+            **trace_context_kwargs(),
         )
         ray.get(futures)
 

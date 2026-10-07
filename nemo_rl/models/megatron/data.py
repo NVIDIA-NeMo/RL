@@ -15,7 +15,7 @@
 from contextlib import nullcontext
 from dataclasses import dataclass
 from math import lcm
-from typing import Any, Iterator, Optional, Tuple
+from typing import Any, Iterator, Optional, Sequence, Tuple
 
 import torch
 from megatron.bridge.training.utils.packed_seq_utils import (
@@ -30,6 +30,7 @@ from megatron.core.utils import StragglerDetector
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
 from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS, PackedTensor
+from nemo_rl.data_plane.schema import OPD_FULL_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
 from nemo_rl.models.megatron.alignment import (
@@ -46,6 +47,7 @@ from nemo_rl.utils.r3_trace import (
     r3_trace_verify_forward_enabled,
     trace_cp_routed_experts,
 )
+from nemo_rl.utils.sequence_lengths import to_cpu_int_tuple
 
 
 @dataclass
@@ -1219,7 +1221,7 @@ def process_global_batch(
 
 def _prepare_vlm_batch_for_megatron(
     input_ids: torch.Tensor,
-    seq_lengths: torch.Tensor,
+    seq_lengths: torch.Tensor | Sequence[int],
     pad_individual_seqs_to_multiple_of: int,
     pad_full_seq_to: Optional[int] = None,
 ) -> tuple[
@@ -1260,11 +1262,8 @@ def _prepare_vlm_batch_for_megatron(
 
     # One CPU-GPU sync per call via .tolist(); per-seq arithmetic runs on CPU
     # ints (fast) instead of .item() in a loop (which sync'd per seq).
-    if torch.is_tensor(seq_lengths):
-        lengths_list = seq_lengths.tolist()
-    else:
-        lengths_list = list(seq_lengths)
-    padded_lens = [_round_up_to_multiple(L, align) for L in lengths_list]
+    seq_lengths_cpu = list(to_cpu_int_tuple(seq_lengths))
+    padded_lens = [_round_up_to_multiple(L, align) for L in seq_lengths_cpu]
 
     # PP>1: force sum(padded_lens) to a fixed value so every microbatch produces
     # the same decoder-side packed length. We mirror _pack_sequences_for_megatron
@@ -1283,7 +1282,7 @@ def _prepare_vlm_batch_for_megatron(
             f"pad_individual_seqs_to_multiple_of ({align})."
         )
         if deficit > 0:
-            lengths_list[-1] += deficit
+            seq_lengths_cpu[-1] += deficit
             padded_lens[-1] += deficit
 
     padded_max = max(padded_lens) if padded_lens else 0
@@ -1348,7 +1347,7 @@ def _prepare_vlm_batch_for_megatron(
 
 def _pack_sequences_for_megatron(
     input_ids: torch.Tensor,
-    seq_lengths: torch.Tensor,
+    seq_lengths: torch.Tensor | Sequence[int],
     pad_individual_seqs_to_multiple_of: int = 1,
     pad_packed_seq_to_multiple_of: int = 1,
     pad_packed_seq_to: Optional[int] = None,
@@ -1375,6 +1374,7 @@ def _pack_sequences_for_megatron(
         - cu_seqlens_padded: Padded cumulative sequence lengths
     """
     batch_size = input_ids.shape[0]
+    seq_lengths_cpu = to_cpu_int_tuple(seq_lengths)
 
     # Build cumulative sequence lengths (cu_seqlens) and extract valid tokens
     needs_padding = (
@@ -1395,9 +1395,7 @@ def _pack_sequences_for_megatron(
     pad_factor = pad_individual_seqs_to_multiple_of
 
     for b in range(batch_size):
-        seq_len = (
-            seq_lengths[b].item() if torch.is_tensor(seq_lengths[b]) else seq_lengths[b]
-        )
+        seq_len = seq_lengths_cpu[b]
 
         # Extract valid tokens for this sequence
         valid_tokens.append(input_ids[b, :seq_len])
@@ -1440,11 +1438,7 @@ def _pack_sequences_for_megatron(
         all_input_ids = []
         padded_tokens = []
         for b in range(batch_size):
-            seq_len = (
-                seq_lengths[b].item()
-                if torch.is_tensor(seq_lengths[b])
-                else seq_lengths[b]
-            )
+            seq_len = seq_lengths_cpu[b]
             # if last element, pad to the max sequence length
             if b == batch_size - 1 and needs_padding:
                 if pad_packed_seq_to is not None:
@@ -1722,9 +1716,9 @@ def _get_pack_sequence_parameters_for_megatron(
 
 def _unpack_sequences_from_megatron(
     output_tensor: torch.Tensor,
-    seq_lengths: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    cu_seqlens_padded: Optional[torch.Tensor],
+    seq_lengths: torch.Tensor | Sequence[int],
+    cu_seqlens: torch.Tensor | Sequence[int],
+    cu_seqlens_padded: Optional[torch.Tensor | Sequence[int]],
     original_batch_size: int,
     original_seq_length: int,
 ) -> torch.Tensor:
@@ -1743,6 +1737,11 @@ def _unpack_sequences_from_megatron(
     """
     # Remove the batch dimension to get [T, vocab_size]
     output_tensor = output_tensor.squeeze(0)
+    seq_lengths_cpu = to_cpu_int_tuple(seq_lengths)
+    cu_seqlens_cpu = to_cpu_int_tuple(cu_seqlens)
+    cu_seqlens_padded_cpu = (
+        to_cpu_int_tuple(cu_seqlens_padded) if cu_seqlens_padded is not None else None
+    )
 
     # Create a padded output tensor with original shape
     vocab_size = output_tensor.shape[-1]
@@ -1758,16 +1757,14 @@ def _unpack_sequences_from_megatron(
     # Fill in the unpacked output tensor with valid tokens
     for b in range(original_batch_size):
         # Get actual sequence length for this sample
-        seq_len = (
-            seq_lengths[b].item() if torch.is_tensor(seq_lengths[b]) else seq_lengths[b]
-        )
+        seq_len = seq_lengths_cpu[b]
 
-        if cp_size > 1 and cu_seqlens_padded is not None:
+        if cp_size > 1 and cu_seqlens_padded_cpu is not None:
             # When using CP, we need to account for padding
             # Calculate the padded sequence boundaries
             pad_factor = cp_size * 2
             padded_seq_len = ((seq_len + pad_factor - 1) // pad_factor) * pad_factor
-            start_idx = cu_seqlens_padded[b].item()
+            start_idx = cu_seqlens_padded_cpu[b]
 
             # Only copy the valid tokens (not the padding)
             unpacked_output[b, :seq_len] = output_tensor[
@@ -1775,8 +1772,8 @@ def _unpack_sequences_from_megatron(
             ]
         else:
             # No CP, use regular cu_seqlens
-            start_idx = cu_seqlens[b].item()
-            end_idx = cu_seqlens[b + 1].item()
+            start_idx = cu_seqlens_cpu[b]
+            end_idx = cu_seqlens_cpu[b + 1]
 
             # Copy the valid tokens to the unpacked tensor
             unpacked_output[b, :seq_len] = output_tensor[start_idx:end_idx]
@@ -1787,11 +1784,16 @@ def _unpack_sequences_from_megatron(
 def get_and_validate_seqlen(data: BatchedDataDict[Any]):
     # dim 1 is always assumed to be the sequence dim, sanity check this here.
     # Skip multimodal fields: their dim 1 is num_images / num_patches, not
-    # seqlen.
+    # seqlen. Skip opd_full's teacher payload columns too: materialize()
+    # deliberately does not pad them to the forward pass's pad_to_seqlen
+    # target (they never feed the model forward, only the loss, which reads
+    # each sequence's own real length regardless of how far the column is
+    # padded) -- see codec.py's OPD_FULL_FIELDS exclusion. Their dim 1 can
+    # therefore legitimately be shorter than every other column's.
     sequence_dim = 1
     seq_dim_size = data["input_ids"].shape[sequence_dim]
     for k, v in data.items():
-        if k in PACKED_MULTIMODAL_FIELDS:
+        if k in PACKED_MULTIMODAL_FIELDS or k in OPD_FULL_FIELDS:
             continue
         if torch.is_tensor(v) and len(v.shape) > 1:
             assert v.shape[sequence_dim] == seq_dim_size, (

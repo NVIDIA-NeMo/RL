@@ -23,9 +23,24 @@ backends read ``policy.draft`` the same way.
 
 import difflib
 from collections.abc import Mapping
-from typing import Annotated, Any, Literal, Union
+from typing import Annotated, Any, Literal, Self, Union
 
 from pydantic import BaseModel, Field, TypeAdapter, model_validator
+
+
+class DraftOptimizerConfig(BaseModel, extra="forbid"):
+    """Optional optimizer schedule for draft-model parameters."""
+
+    lr: Annotated[float, Field(gt=0)]
+    min_lr: Annotated[float, Field(ge=0)] | None = None
+    weight_decay: Annotated[float, Field(ge=0)] | None = None
+
+    @model_validator(mode="after")
+    def validate_lr_range(self) -> Self:
+        """Require the draft minimum learning rate to fit its schedule."""
+        if self.min_lr is not None and self.min_lr > self.lr:
+            raise ValueError("draft optimizer min_lr must not exceed lr")
+        return self
 
 
 class _DraftConfigBase(BaseModel, extra="allow"):
@@ -62,6 +77,10 @@ class Eagle3DraftConfig(_DraftConfigBase):
     loss_weight: float = 0.1
     num_layers: int | None = None
     aux_layer_indices: list[int] | None = None
+    # Megatron-path-only override of the draft optimizer's lr/min_lr/
+    # weight_decay schedule (NVIDIA-NeMo/RL#3707); unused by the DTensor v2
+    # TTT path below, which always uses learning_rate.
+    optimizer: DraftOptimizerConfig | None = None
     # Learning rate for the draft's optimizer param group; the draft needs a
     # much higher rate than the policy's RL lr to track the policy's
     # distribution drift.

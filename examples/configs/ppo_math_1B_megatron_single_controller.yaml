@@ -48,6 +48,8 @@ async_rl:
   max_buffered_rollouts: 64
   # Enable per-rollout diagnostic prints (prompt content / completion previews).
   diagnostics: false
+  # Stream every consumed sample to train_data_step<N>.jsonl in the log dir (debug).
+  log_full_train_data: false
 
   # ── Resiliency ─────────────────────────────────────────────────────────────
   # What happens to a prompt whose rollout fails. Infrastructure failures are

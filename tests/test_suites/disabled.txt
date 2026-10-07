@@ -1,4 +1,9 @@
 # Tests that are temporarily disabled
+# The full 8-node per-token NVFP4 recipe is too expensive for nightly. Its
+# 4-node quick variant provides nightly coverage; run this driver manually when
+# validating the production topology.
+tests/test_suites/llm/grpo-qwen3-30ba3b-base-8n4g-megatron-te-nvfp4-pertoken.sh
+
 # Still hangs in sample_tokens on vLLM 0.25.1, unlike the AutoModel variants of
 # https://github.com/vllm-project/vllm/issues/36237, which the bump does fix.
 # Not specific to this vLLM version: the enabled
@@ -90,3 +95,9 @@ tests/test_suites/llm/grpo-nanov3-30BA3B-4n4g-megatron_generation-colocated-resh
 
 # Enable after the first Nano MMPR MPO CP=1 functional qualification.
 tests/test_suites/vlm/vlm_mpo-nemotron-omni-30ba3b-mmpr-1n8g-megatron-tp8.v1.sh
+
+# Research template: example only; not scheduled for convergence.
+research/template_project/tests/test_suites/llm/single_update_1n8g.sh
+
+# Full Flow-GRPO recipe requires an externally served GenRM OCR judge.
+research/flow_grpo/tests/test_suites/flow_grpo_qwen_image_ocr.sh

@@ -202,6 +202,7 @@ def _controller(
     controller._dp_client = client
     controller._partition_id = scenarios.PARTITION
     controller._rollout_manager = _manager(buffer, barrier, generation)
+    controller._teacher_coordinator = None
     controller._sampler = InOrderSampler(buffer, max_lookahead_versions=2)
     if dispatch_index is not None:
         controller._sampler.restore_dispatch_index(dispatch_index)
@@ -226,6 +227,7 @@ def _controller(
     )
     controller._master_config = SimpleNamespace(
         grpo=controller._algo_cfg,
+        checkpointing={"load_replay_buffer": True},
         token_capture=SimpleNamespace(enabled=False),
     )
     controller._dataloader = loader
@@ -241,6 +243,7 @@ def _controller(
     controller._current_epoch = 0
     controller._sampler_stamps_target_steps = False
     controller._rollout_recovery_enabled = True
+    controller._restored_replay_groups_to_regenerate = []
     controller._batch_shortfall = {}
     controller._batch_replacements = {}
     controller._batch_promotions = {}
