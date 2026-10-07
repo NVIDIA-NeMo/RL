@@ -101,6 +101,13 @@ MOUNTS=$MOUNTS
 COMMAND=${COMMAND:-}  # This is a script relative to the SLURM_SUBMIT_DIR. If left empty, it will leave the cluster idle after it's brought up.
 SETUP_COMMAND=${SETUP_COMMAND:-}  # Setup commands to run on all nodes before starting Ray.
 NRL_MOUNT_HOST_ENROOT=${NRL_MOUNT_HOST_ENROOT:-}  # Set to 1 to bind-mount the compute node's enroot into the training container (see the block after GRES detection).
+case "$NRL_MOUNT_HOST_ENROOT" in
+  ""|0|1) ;;
+  *)
+    echo "Error: NRL_MOUNT_HOST_ENROOT must be unset, 0, or 1, got '$NRL_MOUNT_HOST_ENROOT'." >&2
+    exit 1
+    ;;
+esac
 ########################################################
 # Ports for all nodes (should be odd numbers since we place head/worker[0] on the same node) so all workers get the odd ports, but the head will get +1 the ports
 NODE_MANAGER_PORT=${NODE_MANAGER_PORT:-1301}
@@ -264,8 +271,9 @@ fi
 # node, because the submit host may carry no enroot at all; enroot's runtime
 # exec's its sibling helpers by bare name (enroot-mount, enroot-nsenter, ...),
 # so every /usr/bin/enroot* file comes along, not just the launcher, and the
-# library, share, and configuration directories of both the 3.x and the 4.x
-# layouts are mounted when present. Unset (the default), nothing is mounted.
+# library, share, and configuration directories are mounted when present
+# (site packages install the libraries under /usr/lib, /usr/lib64 or
+# /usr/libexec). Unset (the default), nothing is mounted.
 if [[ "${NRL_MOUNT_HOST_ENROOT:-}" == "1" ]]; then
   _enroot_bins=(/usr/bin/enroot*)
   if [[ ! -e "${_enroot_bins[0]}" ]]; then
