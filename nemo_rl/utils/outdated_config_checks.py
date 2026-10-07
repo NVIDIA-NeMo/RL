@@ -116,6 +116,25 @@ def reject_outdated_metric_name_format(config: dict[str, Any]) -> None:
     )
 
 
+def reject_outdated_mcore_refit_offload_key(config: dict[str, Any]) -> None:
+    """Fail when the removed Megatron-generation refit offload key is present."""
+    policy = config.get("policy")
+    if not isinstance(policy, dict):
+        return
+    generation = policy.get("generation")
+    if not isinstance(generation, dict):
+        return
+    mcore_generation = generation.get("mcore_generation_config")
+    if (
+        isinstance(mcore_generation, dict)
+        and "offload_policy_before_refit" in mcore_generation
+    ):
+        raise ValueError(
+            "policy.generation.mcore_generation_config.offload_policy_before_refit "
+            "was removed. Set policy.offload_policy_before_refit instead."
+        )
+
+
 def check_outdated_config(config: dict[str, Any]) -> None:
     """Fail fast on config the code no longer accepts, naming the migration to apply.
 
@@ -130,3 +149,4 @@ def check_outdated_config(config: dict[str, Any]) -> None:
     reject_outdated_dtensor_v2_key(config)
     reject_outdated_dataset_config(config)
     reject_outdated_metric_name_format(config)
+    reject_outdated_mcore_refit_offload_key(config)
