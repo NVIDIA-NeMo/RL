@@ -66,6 +66,7 @@ from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
 from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     algo_config,
+    evaluation_only_checkpoints,
     is_ppo_run,
     validate_single_controller_config,
 )
@@ -127,6 +128,7 @@ from nemo_rl.models.generation.generation_router import (
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
+from nemo_rl.models.generation.trtllm import TrtllmConfig, TrtllmGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.megatron.router_replay import (
@@ -496,6 +498,24 @@ def _build_clusters(
                 gpus_per_instance = vllm_cfg["tensor_parallel_size"] * vllm_cfg.get(
                     "pipeline_parallel_size", 1
                 )
+            elif backend == "trtllm":
+                trtllm_cfg = generation_config_dict["trtllm_cfg"]
+                disagg = trtllm_cfg.get("disaggregation") or {}
+                engine_tp = trtllm_cfg["tensor_parallel_size"]
+                if disagg.get("enabled"):
+                    engine_tp = max(
+                        int(
+                            (disagg.get(f"{role}_trtllm_kwargs") or {}).get(
+                                "tensor_parallel_size", engine_tp
+                            )
+                        )
+                        for role in ("ctx", "gen")
+                    )
+                # Match TRT-LLM placement: a tied actor group is one engine,
+                # not the sum of the prefill/decode widths in a PD replica.
+                gpus_per_instance = engine_tp * trtllm_cfg.get(
+                    "pipeline_parallel_size", 1
+                )
             elif backend == "sglang":
                 gpus_per_instance = generation_config_dict["sglang_cfg"].get(
                     "gpus_per_server", 1
@@ -506,7 +526,7 @@ def _build_clusters(
                 )
             else:
                 raise ValueError(
-                    "single_controller_utils.setup only supports vllm, sglang, "
+                    "single_controller_utils.setup only supports vllm, sglang, trtllm, "
                     f"or megatron generation; got {backend!r}"
                 )
             nodes_per_instance = (
@@ -570,7 +590,7 @@ def _build_generation(
     tokenizer: Optional[PreTrainedTokenizerBase] = None,
     processor: Optional[AutoProcessor] = None,
 ) -> tuple[Any, float]:
-    """Spin up the generation backend (vLLM, SGLang, or Megatron).
+    """Spin up the generation backend (vLLM, SGLang, TRT-LLM, or Megatron).
 
     Args:
         inference_cluster: Ray virtual cluster the generation workers run on.
@@ -600,6 +620,14 @@ def _build_generation(
             cluster=inference_cluster,
             config=vllm_config,
             defer_model_load=defer_model_load,
+        )
+
+    elif backend == "trtllm":
+        if defer_model_load:
+            raise ValueError("TRT-LLM does not support deferred model loading")
+        gen = TrtllmGeneration(
+            cluster=inference_cluster,
+            config=cast(TrtllmConfig, generation_config),
         )
 
     elif backend == "sglang":
@@ -635,7 +663,7 @@ def _build_generation(
 
     else:
         raise ValueError(
-            "single_controller_utils.setup only supports vllm, sglang, or megatron "
+            "single_controller_utils.setup only supports vllm, sglang, trtllm, or megatron "
             f"generation; got {backend!r}"
         )
 
@@ -781,11 +809,14 @@ def _generation_max_seq_len(generation_config) -> int:
     """Return the per-backend max sequence length.
 
     vllm uses vllm_cfg.max_model_len; sglang uses sglang_cfg.context_length;
-    megatron uses mcore_generation_config.max_model_len.
+    megatron uses mcore_generation_config.max_model_len;
+    trtllm uses trtllm_cfg.max_model_len.
     """
     backend = generation_config["backend"]
     if backend == "vllm":
         return generation_config["vllm_cfg"]["max_model_len"]
+    if backend == "trtllm":
+        return generation_config["trtllm_cfg"]["max_model_len"]
     if backend == "sglang":
         return generation_config["sglang_cfg"]["context_length"]
     if backend == "megatron":
@@ -1109,8 +1140,10 @@ def setup_single_controller(
         sampler_supports_replay_recovery = sampler_supports_buffer_checkpoint(
             master_config.async_rl.sampler
         )
-        if sampler_supports_replay_recovery and not master_config.checkpointing.get(
-            "save_data_plane"
+        if (
+            sampler_supports_replay_recovery
+            and not master_config.checkpointing.get("save_data_plane")
+            and not evaluation_only_checkpoints(master_config)
         ):
             error_message = (
                 "SingleController checkpointing with a replay-checkpoint-capable "
@@ -1291,6 +1324,14 @@ def setup_single_controller(
         Optional[dict[str, Any]],
         checkpointer.load_training_info(trainer_checkpoint_path),
     )
+    if (loaded_state and loaded_state.get("evaluation_only")) or (
+        trainer_checkpoint_path is not None
+        and evaluation_only_checkpoints(master_config)
+    ):
+        raise ValueError(
+            "Evaluation-only checkpoints cannot resume SingleController training; "
+            "use a fresh checkpoint_dir or a full recovery checkpoint."
+        )
     save_state = _get_grpo_save_state(loaded_state)
     weights_path, optimizer_path = checkpointer.get_resume_paths(
         trainer_checkpoint_path
@@ -1414,9 +1455,13 @@ def setup_single_controller(
     use_nemo_gym = should_use_nemo_gym(master_config)
     data_tokenizer = processor if processor is not None else tokenizer
     is_vlm = processor is not None
-    if use_nemo_gym and generation_config["backend"] not in ("vllm", "megatron"):
+    if use_nemo_gym and generation_config["backend"] not in (
+        "vllm",
+        "megatron",
+        "trtllm",
+    ):
         raise NotImplementedError(
-            "SC NeMo-Gym integration currently supports the vllm and megatron backends only; got "
+            "SC NeMo-Gym integration supports vllm, megatron, and trtllm; got "
             f"{generation_config['backend']!r}"
         )
     # Backend settings checks are pure config: run them before anything builds.
@@ -1497,6 +1542,7 @@ def setup_single_controller(
     generation = None
     defer_generation_model_load = False
     gen_reserve_time = 0.0
+    gen_load_time = 0.0
     # Started inside the use_nemo_gym branch below, not here: main's parallel-build
     # restructure leaves `generation` as None at this point, and the router needs a
     # live generation to front. None is also the correct value whenever the router
@@ -1660,6 +1706,14 @@ def setup_single_controller(
                 flush=True,
             )
             gym_base_urls: list[Optional[str]] = list(megatron_reserved_urls)
+        elif generation_config["backend"] == "trtllm":
+            # TRT-LLM publishes its PD frontend URLs only after engine startup.
+            # Build once, then start Gym and the trainer in parallel. This first
+            # implementation does not pretend TRT-LLM supports vLLM's deferred load.
+            generation, gen_load_time = _build_generation(
+                inference_cluster, master_config=master_config
+            )
+            gym_base_urls = generation.dp_openai_server_base_urls
         else:
             # defer generation, only get base_urls for nemo_gym spinup
             generation, gen_reserve_time = _build_generation(
@@ -1710,7 +1764,7 @@ def setup_single_controller(
                 _finish_deferred_generation,
                 generation=generation,
             )
-        else:
+        elif generation is None:
             build_tasks["generation"] = partial(
                 _build_generation,
                 inference_cluster=inference_cluster,
@@ -1733,7 +1787,8 @@ def setup_single_controller(
                 ].result()
                 gen_load_time = time_metrics["gen_time"]
             else:
-                generation, gen_load_time = submitted["generation"].result()
+                if "generation" in submitted:
+                    generation, gen_load_time = submitted["generation"].result()
                 trainer, value, time_metrics = submitted["trainer"].result()
             if megatron_reserved_urls:
                 # Gym initialization needs a live URL that will respond to health checks.
@@ -1916,6 +1971,7 @@ def setup_single_controller(
     loss_fn: LossFunction = ClippedPGLossFn(
         master_config.loss_fn,
         opd_full=opd_module.get_opd_full_config(master_config),
+        seq_logprob_error_threshold=algo_cfg.seq_logprob_error_threshold,
     )
     value_loss_fn: Optional[LossFunction] = (
         MseValueLossFn(master_config.value_loss_fn)  # type: ignore
