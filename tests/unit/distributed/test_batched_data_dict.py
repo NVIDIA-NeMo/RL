@@ -1496,3 +1496,48 @@ def test_truncate_tensors_narrows_opd_full_payloads_but_never_widens_them():
     assert batch[OPD_FULL_LOGITS_FIELD].shape == (2, 3, 5)
     assert torch.equal(batch[OPD_FULL_LOGITS_FIELD], logits_before)
     assert batch[OPD_FULL_TEACHER_INDEX_FIELD].shape == (2,)
+
+
+def test_multimodal_sharing_tolerates_dict_valued_type_key():
+    """Tool/JSON-schema payloads can have a parameter literally named "type"
+    whose value is a dict; the media-sharing walk must not crash on it."""
+    from nemo_rl.distributed.batched_data_dict import _prepare_multimodal_sharing
+
+    tool_schema_row = {
+        "role": "assistant",
+        "tool_schema": {
+            "parameters": {
+                # a parameter named "type": its schema definition is a dict
+                "type": {"type": "string", "enum": ["observation", "question"]},
+                "content": {"type": "string"},
+            }
+        },
+    }
+    shared = _prepare_multimodal_sharing(tool_schema_row)
+    assert isinstance(shared, dict)
+
+
+def test_multimodal_sharing_tolerates_list_valued_type_key():
+    """JSON-schema type unions put a list under "type" (e.g. an optional tool
+    argument); the media-sharing walk must not crash on it, and
+    repeat_interleave(share_immutable_media=True) must still copy the row."""
+    from nemo_rl.distributed.batched_data_dict import (
+        BatchedDataDict,
+        _prepare_multimodal_sharing,
+    )
+
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "parameters": {
+                "type": "object",
+                "properties": {"offset": {"type": ["integer", "null"]}},
+            },
+        },
+    }
+    assert _prepare_multimodal_sharing({"tools": [tool]}) == {}
+
+    batch = BatchedDataDict({"extra_env_info": [{"tools": [tool]}]})
+    repeated = batch.repeat_interleave(2, share_immutable_media=True)
+    assert repeated["extra_env_info"] == [{"tools": [tool]}, {"tools": [tool]}]
