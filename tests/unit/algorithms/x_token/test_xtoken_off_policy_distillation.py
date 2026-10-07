@@ -155,7 +155,7 @@ def _make_master_config(
                 "val_at_end": val_at_end,
             },
             "policy": {
-                "dtensor_cfg": {
+                "automodel_cfg": {
                     "enabled": True,
                     "tensor_parallel_size": 1,
                     "context_parallel_size": 1,
@@ -171,7 +171,7 @@ def _make_master_config(
                     **{
                         "projection_matrix_path": "/tmp/dummy-projection.pt",
                         "weight": 1.0,
-                        "dtensor_cfg": {
+                        "automodel_cfg": {
                             "enabled": True,
                             "tensor_parallel_size": 1,
                             "context_parallel_size": 1,
@@ -714,7 +714,7 @@ def test_setup_builds_one_policy_per_teacher():
             **{
                 "projection_matrix_path": None,
                 "weight": 0.5,
-                "dtensor_cfg": {
+                "automodel_cfg": {
                     "enabled": True,
                     "tensor_parallel_size": 1,
                     "context_parallel_size": 1,
