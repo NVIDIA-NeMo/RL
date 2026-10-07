@@ -378,6 +378,9 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           submodules: "recursive"
+      - name: Test CI failure notification wiring
+        run: python3 .github/scripts/test_notify_ci_failure.py
+
       - name: Install uv
         uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
@@ -1125,29 +1128,37 @@ jobs:
   notify-nightly-failure:
     name: Notify nightly test failure
     runs-on: ubuntu-latest
-    needs: [CI_QA_Gate]
+    permissions: {}
+    needs:
+      - pre-flight
+      - ephemeral-runner-routing
+      - org-member-pre-flight
+      - gb200-config
+      - pr-branch-up-to-date-check
+      - lint-check
+      - cicd-wait-in-queue
+      - prepare-megatron-lock
+      - sphinx-build
+      - build-container
+      - build-container-gb200
+      - cicd-doc-tests
+      - cicd-unit-tests
+      - unit-test-script-check
+      - functional-test-script-check
+      - cicd-functional-tests
+      - cicd-functional-tests-gb200
+      - cicd-fast-functional-tests
+      - CI_QA_Gate
     environment:
       name: main
       deployment: false
-    if: ${{ always() && github.event_name == 'schedule' && needs.CI_QA_Gate.result == 'failure' }}
+    if: ${{ always() && !cancelled() && github.event_name == 'schedule' && failure() }}
     steps:
-      - name: Send Slack notification
-        env:
-          SLACK_WEBHOOK: ${{ secrets.SLACK_TEAM_CHANNEL_WEBHOOK }}
-        run: |
-          MESSAGE='{
-            "blocks": [
-              {
-                "type": "section",
-                "text": {
-                  "type": "mrkdwn",
-                  "text": "🚨 Nightly GitHub CI test failed on main branch\n\n• Repository: ${{ github.repository }}\n• Commit: `${{ github.sha }}`\n• Workflow: <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>"
-                }
-              }
-            ]
-          }'
-
-          curl -X POST -H "Content-type: application/json" --data "$MESSAGE" "$SLACK_WEBHOOK"
+      - name: Notify nightly CI failure
+        uses: NVIDIA-NeMo/FW-CI-templates/.github/actions/notify-ci-failure@631c404d00a9e60afc591cd071d35d2e18f82fc6 # merged PR #593
+        with:
+          needs-json: ${{ toJSON(needs) }}
+          webhook: ${{ secrets.SLACK_TEAM_CHANNEL_WEBHOOK }}
 
   Coverage:
     runs-on: ubuntu-latest
