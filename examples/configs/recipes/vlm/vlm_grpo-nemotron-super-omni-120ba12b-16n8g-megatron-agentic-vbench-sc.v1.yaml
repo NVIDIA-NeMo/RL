@@ -78,6 +78,12 @@ policy:
     mtp_use_repeated_layer: false
     mtp_detach_heads: true
     mtp_loss_scaling_factor: 0.0
+    # CC execution padding requires dropless per-token routing without auxiliary
+    # losses or router-bias updates (validate_cc_execution_padding). The base recipe
+    # already disables load balancing; it also enables the expert bias with a 1e-3
+    # update rate, and freeze_moe_router freezes only the router weight. Stop the
+    # bias updates too: the router is frozen for RL stability regardless.
+    moe_router_bias_update_rate: 0.0
     scheduler:
       lr_warmup_iters: 10
   generation:

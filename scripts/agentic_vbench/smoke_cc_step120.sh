@@ -19,6 +19,9 @@ export AGENTIC_VBENCH_JUDGE_PROTOCOL=${AGENTIC_VBENCH_JUDGE_PROTOCOL-}
 export MAX_STEPS=${MAX_STEPS:-2}
 export NUM_PROMPTS=${NUM_PROMPTS:-8}
 export NUM_GENERATIONS=${NUM_GENERATIONS:-4}
+# All of a step's episodes at once: 32 light containers fit the backend node and
+# keep a step's rollouts under ~10 min instead of queueing behind 12 slots.
+export AGENTIC_VBENCH_CONCURRENCY=${AGENTIC_VBENCH_CONCURRENCY:-$((NUM_PROMPTS * NUM_GENERATIONS))}
 export TRAIN_LIMIT=${TRAIN_LIMIT:-$NUM_PROMPTS}
 export TRAIN_REPEATS=${TRAIN_REPEATS:-$((MAX_STEPS + 2))}
 export ENV_FILE=${ENV_FILE:-/dev/null}

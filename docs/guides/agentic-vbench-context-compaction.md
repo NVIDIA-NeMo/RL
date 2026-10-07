@@ -268,6 +268,28 @@ Verified here:
   refuses further calls in that attempt: "Cannot admit a call after incomplete
   capture", so one 500 fails the whole episode by design.)
 
+- The eighth attempt (job 2166480) collected a full step of rollouts with the
+  sampling pin: 32 episodes in 15 minutes at the agent's default concurrency of
+  12, every model call served (about 13 calls and 6k-14k generated tokens per
+  12-turn episode), OpenCode compacting twice per episode, verifier rewards
+  recorded (all 0.0 on these assembly tasks under the 12-turn cap), and capture
+  lineage written per call. The first optimizer step then failed in
+  `validate_cc_execution_padding`: CC execution padding requires dropless
+  per-token routing without auxiliary losses or router-bias updates, and the
+  base recipe enables the expert bias with a 1e-3 update rate
+  (`freeze_moe_router` freezes only the router weight). The recipe now sets
+  `moe_router_bias_update_rate: 0.0`. The smoke also runs all 32 episodes of a
+  step concurrently (`AGENTIC_VBENCH_CONCURRENCY`).
+- Stock OpenCode 1.14.39 sends no `x-opencode-agent` header, so the proxy's
+  compaction accounting fell back to request shape (no tools, one of the two
+  fixed compaction prompts); `compaction_summaries` was 0 before that fix.
+- The capture ledger logged "extends candidate ... with roles [...]; rooting a
+  new segment" for 5 calls across 15 episodes: OpenCode replayed a known prefix
+  and appended an assistant message (the compaction summary) rather than
+  observations, which the splice cannot represent, so those calls render fresh.
+  This is the designed fallback, not a failure; a compaction rewrite itself roots
+  silently.
+
 Not yet verified (requires GPU allocations):
 
 - A two-step compaction smoke and the 20-step paired comparison.
