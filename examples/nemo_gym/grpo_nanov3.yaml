@@ -341,6 +341,10 @@ env:
     # forwarded to Gym). null / absent = off; one dispatch per row.
     # health_check_interval_seconds: 60   # poll Gym's servers after this long without a completed row
     # max_infra_attempts_per_rollout: 1   # dispatches one row may use after a /run infra failure
+    # Optional step-metrics hook: dotted path of a callable(rows, full_results)
+    # -> {name: value}, applied to each rollout group after the built-in
+    # metrics (see get_nemo_gym_rollout_metrics_hook in nemo_rl/experience/rollouts.py).
+    # rollout_metrics_hook: package.module.function
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml  # Required! And it must be *for_training
     - resources_servers/math_with_judge/configs/math_with_judge.yaml

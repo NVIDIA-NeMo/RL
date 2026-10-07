@@ -38,6 +38,7 @@ env:
     # by default: no polling, one dispatch per row.
     health_check_interval_seconds: null  # poll Gym's servers after this long without a completed row
     max_infra_attempts_per_rollout: 1    # dispatches one row may use after a /run infrastructure failure
+    rollout_metrics_hook: null           # dotted path of a callable(rows, full_results) -> {name: value}
 
 logger:
   wandb:
@@ -45,6 +46,17 @@ logger:
     # result payloads can produce many large W&B Table artifacts.
     log_nemo_gym_full_result_tables: false
 ```
+
+`rollout_metrics_hook` names a callable imported in the process that runs the
+rollout loop (under asynchronous GRPO that is the trajectory collector actor).
+It is called once per rollout group with the group's input rows and, aligned
+with them, each rollout's `full_result` mapping, and returns metrics merged
+into the group's rollout metrics after every built-in metric. The group is one
+prompt's rollouts under the asynchronous collector and the single-controller
+path, and the whole step batch under the synchronous entry point
+`run_nemo_gym_rollout_sync`. A failing hook is warned once and never fails the
+rollout. The full contract is documented on
+`get_nemo_gym_rollout_metrics_hook` in `nemo_rl/experience/rollouts.py`.
 
 When `log_nemo_gym_full_result_tables` is `false`, NeMo RL does not construct
 the per-agent `full_result` Tables. This prevents those payloads from entering
