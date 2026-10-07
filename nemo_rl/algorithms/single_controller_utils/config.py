@@ -1775,6 +1775,30 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "carry TQWorkerMixin, so it has no data-plane setup to call (#2625)."
         )
 
+    if algo_cfg.stream_value_training:
+        if algo_cfg.value_training_mode != "split":
+            raise ValueError(
+                "ppo.stream_value_training=true requires ppo.value_training_mode=split"
+            )
+        if not dedicated_value_enabled(master_config):
+            raise ValueError(
+                "ppo.stream_value_training=true requires dedicated value GPUs"
+            )
+        if async_config.min_groups_for_streaming_train >= algo_cfg.num_prompts_per_step:
+            raise ValueError(
+                "ppo.stream_value_training=true requires multi-chunk PPO streaming"
+            )
+        value_ddp_config = value_megatron_cfg.get("distributed_data_parallel_config")
+        if value_ddp_config and (
+            value_ddp_config.get("use_custom_fsdp")
+            or value_ddp_config.get("use_megatron_fsdp")
+            or value_ddp_config.get("reuse_grad_buf_for_mxfp8_param_ag")
+        ):
+            raise ValueError(
+                "ppo.stream_value_training=true requires separate Megatron "
+                "value parameter and gradient buffers"
+            )
+
     policy_megatron_cfg = master_config.policy.get("megatron_cfg")
     if async_config.min_groups_for_streaming_train < algo_cfg.num_prompts_per_step:
         # Policy chunks accumulate into one optimizer update; critic epochs

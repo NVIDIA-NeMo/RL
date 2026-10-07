@@ -567,6 +567,51 @@ def test_resident_value_lifecycle_never_moves_model_or_optimizer():
     worker.move_optimizer.assert_not_called()
 
 
+def test_open_value_step_preserves_gradients_during_resident_inference():
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        MegatronValueWorkerImpl,
+        _ValueTrainStep,
+    )
+
+    model = MagicMock()
+    gradients = torch.tensor([1.0, 2.0])
+    model.gradients = gradients
+    state = _ValueTrainStep(
+        loss_fn=object(),
+        gbs=2,
+        mbs=1,
+        counts=torch.zeros(3),
+        grad_sync_func=object(),
+        no_sync_func=object(),
+        finalize_model_grads_func=object(),
+    )
+    worker = SimpleNamespace(
+        _train_step_state=state,
+        model=model,
+        optimizer=MagicMock(),
+        move_model=MagicMock(side_effect=AssertionError("model moved")),
+        move_optimizer=MagicMock(side_effect=AssertionError("optimizer moved")),
+    )
+
+    with pytest.raises(RuntimeError, match="requires resident inference preservation"):
+        MegatronValueWorkerImpl.prepare_for_inference(worker, keep_resident=True)
+    MegatronValueWorkerImpl.prepare_for_inference(
+        worker, keep_resident=True, preserve_train_step=True
+    )
+    assert state.inference_paused
+    with pytest.raises(RuntimeError, match="paused for inference"):
+        MegatronValueWorkerImpl._assert_train_step_open(worker)
+    torch.testing.assert_close(model.gradients, gradients)
+    MegatronValueWorkerImpl.finish_inference(
+        worker, keep_resident=True, preserve_train_step=True
+    )
+    assert not state.inference_paused
+    assert MegatronValueWorkerImpl._assert_train_step_open(worker) is state
+    torch.testing.assert_close(model.gradients, gradients)
+    worker.move_model.assert_not_called()
+    worker.move_optimizer.assert_not_called()
+
+
 def test_split_value_accepts_uneven_packed_dp_shard_and_sanitizes_media_mask():
     from nemo_rl.models.value.workers.megatron_value_worker import (
         MegatronValueWorkerImpl,

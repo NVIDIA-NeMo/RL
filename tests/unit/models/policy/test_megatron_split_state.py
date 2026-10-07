@@ -2074,7 +2074,7 @@ class TestPauseTrainStepWithOffloading:
                     saved = [p.grad.clone() for p in parameters]
                     grad_views = [p.grad for p in parameters]
                     storage_ids = [p.grad.data_ptr() for p in parameters]
-                    w.pause_train_step_with_offloading()
+                    w.pause_train_step_with_offloading(_otel_carrier={})
                     assert state["offloaded"] is True
                     for parameter, expected, pointer in zip(
                         parameters, saved, storage_ids
