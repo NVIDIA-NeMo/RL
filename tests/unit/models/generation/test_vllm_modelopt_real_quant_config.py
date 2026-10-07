@@ -801,7 +801,12 @@ def test_real_quant_selects_native_layerwise_refit(monkeypatch, transport, expec
     assert extension._uses_native_layerwise_refit(transport) is expected
 
 
-def test_real_quant_collective_reload_uses_vllm_layerwise_lifecycle(monkeypatch):
+@pytest.mark.parametrize(
+    "fail_transfer", [False, True], ids=["success", "transfer-failure"]
+)
+def test_real_quant_collective_reload_uses_vllm_layerwise_lifecycle(
+    monkeypatch, fail_transfer
+):
     backend = _import_vllm_quant_backend(monkeypatch)
     base_backend = _base_vllm_backend()
     reload_mod = sys.modules["vllm.model_executor.model_loader.reload"]
@@ -829,11 +834,13 @@ def test_real_quant_collective_reload_uses_vllm_layerwise_lifecycle(monkeypatch)
         "initialize_layerwise_reload",
         lambda model_arg: calls.append(("initialize", model_arg)),
     )
-    monkeypatch.setattr(
-        base_backend,
-        "packed_broadcast_consumer",
-        lambda **kwargs: calls.append(("consume", kwargs["post_unpack_func"].__name__)),
-    )
+
+    def consume(**kwargs):
+        if fail_transfer:
+            raise ValueError("broadcast boom")
+        calls.append(("consume", kwargs["post_unpack_func"].__name__))
+
+    monkeypatch.setattr(base_backend, "packed_broadcast_consumer", consume)
     monkeypatch.setattr(
         reload_mod,
         "finalize_layerwise_reload",
@@ -845,62 +852,25 @@ def test_real_quant_collective_reload_uses_vllm_layerwise_lifecycle(monkeypatch)
         lambda: calls.append("sync"),
     )
 
-    assert extension.update_weights_from_collective() is True
-    assert calls == [
-        ("initialize", model),
-        ("consume", "_load_weights"),
-        ("finalize", model, model_config),
-        "sync",
-    ]
+    if fail_transfer:
+        with pytest.raises(ValueError, match="broadcast boom"):
+            extension.update_weights_from_collective()
+        assert calls == [("initialize", model)]
+        assert isinstance(extension._nrl_layerwise_reload_failure, ValueError)
+    else:
+        assert extension.update_weights_from_collective() is True
+        assert calls == [
+            ("initialize", model),
+            ("consume", "_load_weights"),
+            ("finalize", model, model_config),
+            "sync",
+        ]
 
 
-def test_real_quant_collective_reload_raises_on_failure(monkeypatch):
-    backend = _import_vllm_quant_backend(monkeypatch)
-    base_backend = _base_vllm_backend()
-    reload_mod = sys.modules["vllm.model_executor.model_loader.reload"]
-
-    model = torch.nn.Linear(1, 1)
-    extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
-    extension.model_runner = types.SimpleNamespace(
-        model=model,
-        vllm_config=object(),
-    )
-    extension.model_config = object()
-    extension.device = torch.device("cpu")
-    extension.state_dict_info = {}
-    extension.model_update_group = object()
-    calls = []
-
-    monkeypatch.setattr(
-        backend.VllmQuantInternalWorkerExtension,
-        "_is_real_quant_model",
-        lambda self: True,
-    )
-    monkeypatch.setattr(
-        reload_mod,
-        "initialize_layerwise_reload",
-        lambda model_arg: calls.append(("initialize", model_arg)),
-    )
-
-    def _raise_consume(**kwargs):
-        raise ValueError("broadcast boom")
-
-    monkeypatch.setattr(base_backend, "packed_broadcast_consumer", _raise_consume)
-    monkeypatch.setattr(
-        reload_mod,
-        "finalize_layerwise_reload",
-        lambda _model, _model_config: pytest.fail(
-            "a failed transfer must not be finalized"
-        ),
-    )
-
-    with pytest.raises(ValueError, match="broadcast boom"):
-        extension.update_weights_from_collective()
-    assert calls == [("initialize", model)]
-    assert isinstance(extension._nrl_layerwise_reload_failure, ValueError)
-
-
-def test_non_real_quant_collective_reload_delegates(monkeypatch):
+@pytest.mark.parametrize(
+    "method", ["update_weights_from_collective", "update_weights_via_ipc_zmq"]
+)
+def test_non_real_quant_reload_delegates(monkeypatch, method):
     backend = _import_vllm_quant_backend(monkeypatch)
 
     extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
@@ -911,33 +881,27 @@ def test_non_real_quant_collective_reload_delegates(monkeypatch):
     )
     monkeypatch.setattr(
         backend.VllmInternalWorkerExtension,
-        "update_weights_from_collective",
+        method,
         lambda self: "delegated",
     )
 
-    assert extension.update_weights_from_collective() == "delegated"
+    assert getattr(extension, method)() == "delegated"
 
 
+@pytest.mark.parametrize(
+    "fail_finalize", [False, True], ids=["success", "finalize-failure"]
+)
 def test_real_quant_ipc_complete_finalizes_vllm_layerwise_reload_and_acks(
-    monkeypatch,
+    monkeypatch, fail_finalize
 ):
     backend = _import_vllm_quant_backend(monkeypatch)
     reload_mod = sys.modules["vllm.model_executor.model_loader.reload"]
     from nemo_rl.models.policy.utils import IPCProtocol
 
-    class FakeSocket:
-        def __init__(self):
-            self.sent = []
-
-        def recv_pyobj(self):
-            return IPCProtocol.COMPLETE
-
-        def send(self, payload):
-            self.sent.append(payload)
-
     model = torch.nn.Linear(1, 1)
     model_config = object()
-    socket = FakeSocket()
+    socket = types.SimpleNamespace(recv_pyobj=lambda: IPCProtocol.COMPLETE, sent=[])
+    socket.send = socket.sent.append
     extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
     extension.model_runner = types.SimpleNamespace(
         model=model,
@@ -960,10 +924,16 @@ def test_real_quant_ipc_complete_finalizes_vllm_layerwise_reload_and_acks(
         "initialize_layerwise_reload",
         lambda model_arg: calls.append(("initialize", model_arg)),
     )
+
+    def finalize(model_arg, config_arg):
+        if fail_finalize:
+            raise RuntimeError("bad scales")
+        calls.append(("finalize", model_arg, config_arg))
+
     monkeypatch.setattr(
         reload_mod,
         "finalize_layerwise_reload",
-        lambda model_arg, config_arg: calls.append(("finalize", model_arg, config_arg)),
+        finalize,
     )
     monkeypatch.setattr(
         _base_vllm_backend().torch.cuda,
@@ -974,55 +944,20 @@ def test_real_quant_ipc_complete_finalizes_vllm_layerwise_reload_and_acks(
         backend.torch.cuda, "empty_cache", lambda: calls.append("empty")
     )
 
-    assert extension.update_weights_via_ipc_zmq() is True
-    assert calls == [
-        ("initialize", model),
-        ("finalize", model, model_config),
-        "sync",
-        "empty",
-    ]
+    if fail_finalize:
+        with pytest.raises(RuntimeError, match="bad scales"):
+            extension.update_weights_via_ipc_zmq()
+        assert calls == [("initialize", model)]
+        assert isinstance(extension._nrl_layerwise_reload_failure, RuntimeError)
+    else:
+        assert extension.update_weights_via_ipc_zmq() is True
+        assert calls == [
+            ("initialize", model),
+            ("finalize", model, model_config),
+            "sync",
+            "empty",
+        ]
     assert socket.sent == [IPCProtocol.ACK.value.encode()]
-
-
-def test_real_quant_ipc_finalize_failure_acks_complete(monkeypatch):
-    backend = _import_vllm_quant_backend(monkeypatch)
-    reload_mod = sys.modules["vllm.model_executor.model_loader.reload"]
-    from nemo_rl.models.policy.utils import IPCProtocol
-
-    socket = types.SimpleNamespace(
-        recv_pyobj=lambda: IPCProtocol.COMPLETE,
-        sent=[],
-    )
-    socket.send = socket.sent.append
-    extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
-    extension.model_runner = types.SimpleNamespace(
-        model=torch.nn.Linear(1, 1),
-        vllm_config=object(),
-    )
-    extension.model_config = object()
-    extension.device = torch.device("cpu")
-    extension.zmq_socket = socket
-    extension.state_dict_info = {}
-    extension.maybe_init_zmq = lambda: None
-    monkeypatch.setattr(
-        backend.VllmQuantInternalWorkerExtension,
-        "_is_real_quant_model",
-        lambda _self: True,
-    )
-
-    def fail_finalize(_model, _model_config):
-        raise RuntimeError("bad scales")
-
-    monkeypatch.setattr(
-        reload_mod,
-        "finalize_layerwise_reload",
-        fail_finalize,
-    )
-
-    with pytest.raises(RuntimeError, match="bad scales"):
-        extension.update_weights_via_ipc_zmq()
-    assert socket.sent == [IPCProtocol.ACK.value.encode()]
-    assert isinstance(extension._nrl_layerwise_reload_failure, RuntimeError)
 
 
 @pytest.mark.parametrize(
@@ -1236,24 +1171,6 @@ def test_real_quant_ipc_payload_loads_weights_and_releases_transport_views(monke
         "gc",
         "empty",
     ]
-
-
-def test_non_real_quant_ipc_delegates(monkeypatch):
-    backend = _import_vllm_quant_backend(monkeypatch)
-
-    extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
-    monkeypatch.setattr(
-        backend.VllmQuantInternalWorkerExtension,
-        "_is_real_quant_model",
-        lambda self: False,
-    )
-    monkeypatch.setattr(
-        backend.VllmInternalWorkerExtension,
-        "update_weights_via_ipc_zmq",
-        lambda self: "delegated",
-    )
-
-    assert extension.update_weights_via_ipc_zmq() == "delegated"
 
 
 def test_weight_snapshot_returns_cpu_clone_and_missing_name_raises(monkeypatch):

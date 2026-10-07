@@ -3614,7 +3614,8 @@ def test_real_quant_setup_builds_vllm_from_policy_config(
         def print_node_ip_and_gpu_id(self):
             pass
 
-        def prepare_refit_info(self):
+        def prepare_refit_info(self, *, refit_payload_mode: str):
+            assert refit_payload_mode == "hf_export"
             return {}
 
     class DummyVllmGeneration:
@@ -3630,10 +3631,14 @@ def test_real_quant_setup_builds_vllm_from_policy_config(
         def finish_generation(self):
             events.append("finish")
 
+        def get_refit_payload_mode(self) -> str:
+            return "hf_export"
+
         def prepare_refit_info(self, _state):
             pass
 
     master_config = mock_grpo_components["master_config"]
+
     master_config.policy.update(
         {
             "model_name": "fake-model",

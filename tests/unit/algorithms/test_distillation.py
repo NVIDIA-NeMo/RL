@@ -1200,7 +1200,7 @@ def test_real_quant_distillation_setup_builds_vllm_from_student_config(monkeypat
             "data": {"shuffle": False},
             "logger": {},
             "checkpointing": {},
-            "cluster": {"num_nodes": 1, "gpus_per_node": 2},
+            "cluster": ClusterConfig(num_nodes=1, gpus_per_node=2),
         }
     )
 
@@ -1228,7 +1228,8 @@ def test_real_quant_distillation_setup_builds_vllm_from_student_config(monkeypat
         def prepare_for_training(self):
             events.append("restore")
 
-        def prepare_refit_info(self):
+        def prepare_refit_info(self, *, refit_payload_mode: str):
+            assert refit_payload_mode == "hf_export"
             return {}
 
     class DummyVllmGeneration:
@@ -1243,6 +1244,9 @@ def test_real_quant_distillation_setup_builds_vllm_from_student_config(monkeypat
 
         def finish_generation(self):
             events.append("finish")
+
+        def get_refit_payload_mode(self) -> str:
+            return "hf_export"
 
         def prepare_refit_info(self, _state):
             pass
