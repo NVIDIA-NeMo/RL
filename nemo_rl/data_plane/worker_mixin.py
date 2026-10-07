@@ -922,7 +922,8 @@ class TQWorkerMixin:
         """Per-rank logprob entrypoint. Fetch → packing prep → run → write back.
 
         Returns ``None`` — the per-token tensor is committed to TQ via
-        :meth:`_write_back_result_field` under ``prev_logprobs``.
+        :meth:`_write_back_result_field` under ``prev_logprobs``;
+        when the worker narrows ``token_mask``, that column is rewritten too.
         Callers fetch it through :meth:`TQPolicy.read_from_dataplane` —
         skipping the Ray plasma roundtrip on the (B, S) tensor.
         ``del result`` drops the local reference before returning so the
@@ -940,6 +941,14 @@ class TQWorkerMixin:
             result_key="logprobs",
             tq_field="prev_logprobs",
         )
+        # Top-k/top-p filtering narrows token_mask at -inf positions.
+        if "token_mask" in result:
+            self._write_back_result_field(
+                meta,
+                result,
+                result_key="token_mask",
+                tq_field="token_mask",
+            )
         del result
 
     @accepts_trace_context
