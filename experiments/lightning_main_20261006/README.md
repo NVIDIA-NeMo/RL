@@ -52,3 +52,12 @@ image and is not manually renamed. A new build reuses its installed dependencies
 runs the corrected tests, and exports to a new immutable filename only on success.
 It also checks native editable imports outside the source tree with PYTHONPATH
 unset, separately from the intentional source-overlay benchmark imports.
+
+The next build selected11 tests but their common Ray fixture failed before any
+test body: dashboard MetricsHead returned EOF. Ray2.58 derives its Unix socket
+under the session directory; the observed path was109 bytes, exceeding Linux's
+107-byte limit. Both validation jobs now set a short, job-scoped RAY_TMPDIR in
+/tmp, as the existing training launcher already does. Build/JIT caches stay in
+/raid/scratch. A probe calls Ray's own path validator to reproduce the long-path
+failure and accept the short path before the actual tests run. No dashboard or
+test is disabled, and no model/refit production code is changed by this fix.

@@ -25,6 +25,7 @@ export UV_LINK_MODE=hardlink MAX_JOBS=8 CMAKE_BUILD_PARALLEL_LEVEL=8
 export NEMO_RL_VENV_DIR=/opt/ray_venvs
 export UV_HTTP_TIMEOUT=180
 export TMPDIR="${LOCAL_ROOT}/tmp"
+export RAY_TMPDIR="/tmp/nr${SLURM_JOB_ID}"
 export TORCHINDUCTOR_CACHE_DIR="${LOCAL_ROOT}/inductor"
 export TRITON_CACHE_DIR="${LOCAL_ROOT}/triton"
 export VLLM_CACHE_ROOT="${LOCAL_ROOT}/vllm"
@@ -74,6 +75,7 @@ for role in driver policy vllm-sync vllm-async; do
       /opt/nemo-rl/experiments/lightning_main_20261006/smoke.py "$role"
   )
 done
+/usr/local/bin/python-MegatronPolicyWorker experiments/lightning_main_20261006/ray_socket_probe.py
 /usr/local/bin/python-MegatronPolicyWorker -m pytest -q --mcore-only \
   tests/unit/models/megatron/test_hybridep_data.py \
   tests/unit/models/megatron/test_group_experts.py::test_build_hf_to_local_param_map_train_side \

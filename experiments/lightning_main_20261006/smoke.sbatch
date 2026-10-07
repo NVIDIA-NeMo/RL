@@ -17,6 +17,7 @@ export TORCHINDUCTOR_CACHE_DIR="${LOCAL_ROOT}/inductor"
 export TRITON_CACHE_DIR="${LOCAL_ROOT}/triton"
 export VLLM_CACHE_ROOT="${LOCAL_ROOT}/vllm"
 export FLA_TILELANG=0
+export RAY_TMPDIR="/tmp/nr${SLURM_JOB_ID}"
 unset PYTHONOPTIMIZE NRL_IGNORE_VERSION_MISMATCH
 srun --gres=gpu:4 --mem=0 --no-container-mount-home \
   --container-image="$CONTAINER" --container-mounts=/lustre:/lustre,/raid/scratch:/raid/scratch \
@@ -36,6 +37,7 @@ srun --gres=gpu:4 --mem=0 --no-container-mount-home \
     done
     /opt/nemo_rl_venv/bin/python tools/config_cli.py expand experiments/lightning_main_20261006/sync-bf16.yaml
     /opt/nemo_rl_venv/bin/python tools/config_cli.py expand experiments/lightning_main_20261006/async-bf16.yaml
+    /usr/local/bin/python-MegatronPolicyWorker experiments/lightning_main_20261006/ray_socket_probe.py
     /usr/local/bin/python-MegatronPolicyWorker -m pytest -q --mcore-only \
       tests/unit/models/megatron/test_hybridep_data.py \
       tests/unit/models/megatron/test_group_experts.py::test_build_hf_to_local_param_map_train_side \
