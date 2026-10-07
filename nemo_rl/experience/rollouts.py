@@ -2587,12 +2587,30 @@ def _bucket_nemo_gym_rows_by_instance(
     return bucket_list
 
 
-async def _check_nemo_gym_health(shard_set: NemoGymShardSet) -> None:
-    """Raise ``GymTransportError`` when any Gym actor reports a dead process."""
+async def _check_nemo_gym_health(
+    shard_set: NemoGymShardSet, timeout_seconds: float
+) -> None:
+    """Raise ``GymTransportError`` when a Gym actor reports a dead process.
+
+    An actor that does not answer within ``timeout_seconds`` is reported the
+    same way: ``NemoGym`` is an asyncio actor, so a live actor whose event
+    loop is blocked, or whose process is stopped, never resolves the call,
+    and an unbounded probe would turn this watchdog into the hang it exists
+    to end. The single-controller watchdog bounds its probe for the same
+    reason (``_check_env_health``).
+    """
     try:
-        await asyncio.gather(
-            *(handle.health_check.remote() for handle in shard_set.all_handles)
+        await asyncio.wait_for(
+            asyncio.gather(
+                *(handle.health_check.remote() for handle in shard_set.all_handles)
+            ),
+            timeout=timeout_seconds,
         )
+    except TimeoutError as error:
+        raise GymTransportError(
+            "NeMo-Gym health check did not answer within "
+            f"{timeout_seconds}s while rollouts were in flight"
+        ) from error
     except Exception as error:
         raise GymTransportError(
             f"NeMo-Gym health check failed while rollouts were in flight: {error}"
@@ -2698,8 +2716,13 @@ async def _merge_nemo_gym_instance_streams(
             if not done:
                 # No row arrived within the interval: confirm the Gym servers
                 # are alive instead of waiting on a dead one until the wall.
+                # The branch is only reachable with a configured interval, so
+                # it doubles as the probe's own bound.
                 if shard_set is not None:
-                    await _check_nemo_gym_health(shard_set)
+                    assert health_check_interval_seconds is not None
+                    await _check_nemo_gym_health(
+                        shard_set, health_check_interval_seconds
+                    )
                 continue
             for task in done:
                 iterator = pending.pop(task)
@@ -2848,9 +2871,9 @@ async def run_async_nemo_gym_rollout(
     before the group is postprocessed and yielded. Synchronous call sites should
     use :func:`run_nemo_gym_rollout_sync`.
 
-    While rows are awaited, every Gym actor's ``health_check`` runs every
-    ``health_check_interval_seconds`` and a failure ends the rollout with
-    ``GymTransportError``.
+    After any interval of ``health_check_interval_seconds`` in which no row
+    completed, every Gym actor's ``health_check`` runs, and a failure or an
+    unanswered probe ends the rollout with ``GymTransportError``.
     A row whose ``/run`` failed at the infrastructure level arrives as a failure
     marker (``GYM_INFRA_FAILURE_KEY``) and is dispatched again as a fresh session
     while the other rows keep running, until it has used
@@ -3201,6 +3224,9 @@ def run_nemo_gym_rollout_sync(
             :func:`run_async_nemo_gym_rollout`.
         RuntimeError: If called from a running event loop, the actor or stream fails,
             or NeMo-Gym returns no complete rollout batch.
+        GymTransportError: If a health check fails or a row exhausts its
+            infrastructure attempts. The synchronous call sites have no retry
+            around this function, so the error ends the run.
     """
 
     async def _consume_rollout() -> NemoGymRolloutResult:

@@ -2889,9 +2889,13 @@ class _ScriptedStream:
 
 
 async def _health_outcome(outcome):
-    """Resolve one scripted health check: raise an exception, call a callable, or pass."""
+    """Resolve one scripted health check: raise an exception, wait on an event
+    (a probe that never answers), call a callable, or pass."""
     if isinstance(outcome, BaseException):
         raise outcome
+    if isinstance(outcome, asyncio.Event):
+        await outcome.wait()
+        return
     if callable(outcome):
         outcome()
 
@@ -3215,6 +3219,28 @@ def test_run_async_nemo_gym_rollout_dead_gym_server_ends_the_step(monkeypatch):
         rollouts_mod, "_postprocess_single_nemo_gym_group", _postprocess_stub
     )
     with pytest.raises(GymTransportError, match="health check failed.*verifier"):
+        asyncio.run(
+            _collect_gym_rollout(actor, rows, health_check_interval_seconds=0.01)
+        )
+    assert actor.health_calls == 1
+
+
+def test_run_async_nemo_gym_rollout_unresponsive_health_check_ends_the_step(
+    monkeypatch,
+):
+    """A health probe that never answers is reported like a failing one: a live
+    actor whose event loop is blocked never resolves the call, so an unbounded
+    probe would turn the watchdog into the hang it exists to end."""
+    rows = [_gym_row()]
+    actor = _FakeGymActor(
+        scripts=[[asyncio.Event(), (0, {"name": "agent"}, _gym_result(0), None)]],
+        # An Event outcome parks the probe forever; the bound must fire.
+        health_outcomes=[asyncio.Event()],
+    )
+    monkeypatch.setattr(
+        rollouts_mod, "_postprocess_single_nemo_gym_group", _postprocess_stub
+    )
+    with pytest.raises(GymTransportError, match="did not answer within"):
         asyncio.run(
             _collect_gym_rollout(actor, rows, health_check_interval_seconds=0.01)
         )
