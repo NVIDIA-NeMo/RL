@@ -223,6 +223,12 @@ Verified here:
   pinned to 2.58.0 (the version the PRs were qualified on), re-sync every venv in
   the image (`container/patch_container.sbatch`), and make the build fail on a
   stale lock (`uv lock --check` in `build_inside.sh`).
+- The fourth attempt passed worker creation (32 vLLM + 32 Megatron actors) and
+  failed in the Megatron worker constructor: NeMo-RL's Megatron context
+  parallelism requires sequence packing, which context compaction forbids
+  (fixed-batch execution padding). The CC recipe therefore uses CP=1 with TP8
+  sequence parallelism and full activation recomputation; PP=2 is the fallback
+  if 49k-token rows do not fit.
 
 Not yet verified (requires GPU allocations):
 

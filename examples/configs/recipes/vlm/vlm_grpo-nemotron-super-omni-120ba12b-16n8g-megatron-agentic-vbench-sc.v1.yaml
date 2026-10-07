@@ -63,8 +63,11 @@ policy:
       enable_thinking: true
       truncate_history_thinking: false
   megatron_cfg:
-    # 49k-token contexts: the step-120 smoke/full runs used CP4 with TP8/EP16.
-    context_parallel_size: 4
+    # Context compaction needs fixed-batch rows (no sequence packing), and NeMo-RL's
+    # Megatron context parallelism requires packing, so CP stays at 1. 49k-token
+    # rows rely on TP8 sequence parallelism plus full activation recomputation;
+    # raise pipeline_model_parallel_size to 2 if the learner runs out of memory.
+    context_parallel_size: 1
     mtp_num_layers: 0
     scheduler:
       lr_warmup_iters: 10
