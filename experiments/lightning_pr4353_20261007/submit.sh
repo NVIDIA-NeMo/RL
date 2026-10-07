@@ -1,11 +1,11 @@
 #!/bin/bash
 set -euo pipefail
 
-mode=${1:?Usage: submit.sh async|sync bf16-storage|default|option-a|option-b [test-only]}
-arm=${2:?Usage: submit.sh async|sync bf16-storage|default|option-a|option-b [test-only]}
+mode=${1:?Usage: submit.sh async|sync bf16-bf16|bf16-storage|default|option-a|option-b [test-only]}
+arm=${2:?Usage: submit.sh async|sync bf16-bf16|bf16-storage|default|option-a|option-b [test-only]}
 action=${3:-submit}
 [[ "$mode" == async || "$mode" == sync ]]
-[[ "$arm" == bf16-storage || "$arm" == default || "$arm" == option-a || "$arm" == option-b ]]
+[[ "$arm" == bf16-bf16 || "$arm" == bf16-storage || "$arm" == default || "$arm" == option-a || "$arm" == option-b ]]
 [[ "$action" == submit || "$action" == test-only ]]
 
 if [[ "$arm" == option-a ]]; then
@@ -28,6 +28,7 @@ test "$(git -C "$repo" rev-parse HEAD)" = "$SOURCE_COMMIT"
 test -z "$(git -C "$repo" status --porcelain --untracked-files=no --ignore-submodules=none)"
 
 case "$arm" in
+  bf16-bf16) config="../lightning_main_20261006/${mode}-bf16.yaml" ;;
   bf16-storage) config="../lightning_main_20261006/${mode}-mxfp8.yaml" ;;
   default) config="${mode}-mxfp8-train.yaml" ;;
   option-a) config="${mode}-mxfp8-train-option-a.yaml" ;;
