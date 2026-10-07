@@ -22,3 +22,15 @@ def test_load_dataset_from_path_recognizes_megatron_jsonl_packed(
 
     assert len(dataset) == 1
     assert dataset[0] == record
+
+
+def test_load_dataset_from_path_preserves_packed_jsonl_rows(
+    tmp_path: Path,
+) -> None:
+    data_path = tmp_path / "sample.jsonl.packed"
+    row = '{"messages": [{"role": "user", "content": "hello"}]}'
+    data_path.write_text(row + "\n", encoding="utf-8")
+
+    dataset = load_dataset_from_path(str(data_path), preserve_jsonl_rows=True)
+
+    assert dataset[0]["text"] == row
