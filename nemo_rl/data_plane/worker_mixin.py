@@ -55,6 +55,7 @@ from nemo_rl.data_plane.schema import (
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SequencePackingArgs
 from nemo_rl.experience.route_assembly import RouteFragment, execute_route_plan
+from nemo_rl.telemetry.instrumentation import accepts_trace_context
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.r3_trace import trace_tq_fetch_payload
 
@@ -890,6 +891,7 @@ class TQWorkerMixin:
             )
         self._write_back(meta, {tq_field: val.detach().to("cpu")})
 
+    @accepts_trace_context
     @wrap_with_nvtx_name("policy_worker/train_presharded")
     def train_presharded(
         self,
@@ -910,6 +912,7 @@ class TQWorkerMixin:
             mbs=mbs,
         )
 
+    @accepts_trace_context
     @wrap_with_nvtx_name("policy_worker/get_logprobs_presharded")
     def get_logprobs_presharded(
         self,
@@ -919,7 +922,8 @@ class TQWorkerMixin:
         """Per-rank logprob entrypoint. Fetch → packing prep → run → write back.
 
         Returns ``None`` — the per-token tensor is committed to TQ via
-        :meth:`_write_back_result_field` under ``prev_logprobs``.
+        :meth:`_write_back_result_field` under ``prev_logprobs``;
+        when the worker narrows ``token_mask``, that column is rewritten too.
         Callers fetch it through :meth:`TQPolicy.read_from_dataplane` —
         skipping the Ray plasma roundtrip on the (B, S) tensor.
         ``del result`` drops the local reference before returning so the
@@ -937,8 +941,17 @@ class TQWorkerMixin:
             result_key="logprobs",
             tq_field="prev_logprobs",
         )
+        # Top-k/top-p filtering narrows token_mask at -inf positions.
+        if "token_mask" in result:
+            self._write_back_result_field(
+                meta,
+                result,
+                result_key="token_mask",
+                tq_field="token_mask",
+            )
         del result
 
+    @accepts_trace_context
     @wrap_with_nvtx_name("policy_worker/get_reference_policy_logprobs_presharded")
     def get_reference_policy_logprobs_presharded(
         self,
@@ -964,6 +977,7 @@ class TQWorkerMixin:
         )
         del result
 
+    @accepts_trace_context
     @wrap_with_nvtx_name("policy_worker/get_teacher_logprobs_presharded")
     def get_teacher_logprobs_presharded(
         self,
@@ -1074,6 +1088,7 @@ class TQWorkerMixin:
         )
         del result
 
+    @accepts_trace_context
     @wrap_with_nvtx_name("value_worker/get_values_presharded")
     def get_values_presharded(
         self,
@@ -1108,6 +1123,7 @@ class TQWorkerMixin:
     # ``finish_train_step``, ``abort_train_step``) own the train-step
     # state machine; this mixin just gates them on TQ-presharded data.
 
+    @accepts_trace_context
     @wrap_with_nvtx_name("policy_worker/begin_train_step_presharded")
     def begin_train_step_presharded(
         self,
@@ -1130,6 +1146,7 @@ class TQWorkerMixin:
             mbs=mbs,
         )
 
+    @accepts_trace_context
     @wrap_with_nvtx_name("policy_worker/train_microbatch_presharded")
     def train_microbatch_presharded(
         self,
@@ -1148,6 +1165,7 @@ class TQWorkerMixin:
             data=data,
         )
 
+    @accepts_trace_context
     @wrap_with_nvtx_name("policy_worker/finish_train_step_presharded")
     def finish_train_step_presharded(self) -> dict[str, Any]:
         """Close a logical train step. No fetch — pure lifecycle.
@@ -1177,6 +1195,7 @@ class TQWorkerMixin:
         self._route_fallback_counts = Counter()
         return result
 
+    @accepts_trace_context
     @wrap_with_nvtx_name("policy_worker/abort_train_step_presharded")
     def abort_train_step_presharded(self) -> None:
         """Discard partial train-step state without stepping the optimizer.

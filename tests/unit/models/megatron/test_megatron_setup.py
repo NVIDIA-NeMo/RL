@@ -123,6 +123,63 @@ def test_resolve_optimizer_fp8_moment_dtypes():
 
 
 @pytest.mark.mcore
+def test_sync_consumed_samples_on_scheduler_load_survives_bridge_override():
+    """Bridge overwrites num_steps with consumed_train_samples after loading the scheduler."""
+    from nemo_rl.models.megatron.setup import _sync_consumed_samples_on_scheduler_load
+
+    class _Scheduler:
+        num_steps = 0
+
+        def load_state_dict(self, state_dict):
+            self.num_steps = state_dict["num_steps"]
+
+    scheduler = _Scheduler()
+    state = SimpleNamespace(train_state=None)
+
+    with _sync_consumed_samples_on_scheduler_load(state, scheduler):
+        # Bridge's load order: train_state from the checkpoint (0 in checkpoints
+        # saved before the save-side fix), then the scheduler, then the
+        # override_opt_param_scheduler copy.
+        state.train_state = SimpleNamespace(consumed_train_samples=0)
+        scheduler.load_state_dict({"num_steps": 96})
+        scheduler.num_steps = state.train_state.consumed_train_samples
+
+    assert scheduler.num_steps == 96
+    assert state.train_state.consumed_train_samples == 96
+    assert "load_state_dict" not in vars(scheduler)
+
+
+@pytest.mark.mcore
+def test_load_checkpoint_checkpoint_state_migration_hook_dne():
+    """
+    When this test fails, add a checkpoint hook to load_checkpoint()
+    to set state.train_state.consumed_train_samples = scheduler.num_steps
+    from the scheduler checkpoint and remove this context manager:
+    _sync_consumed_samples_on_scheduler_load
+
+    Draft PR: https://github.com/NVIDIA-NeMo/Megatron-Bridge/pull/6321
+
+    False positives can happen, in which case just add the new arg to
+    the list if it's not the hook this test is referring to.
+    """
+    import inspect
+
+    from megatron.bridge.training.checkpointing import load_checkpoint
+
+    assert list(inspect.signature(load_checkpoint).parameters) == [
+        "state",
+        "model",
+        "optimizer",
+        "opt_param_scheduler",
+        "strict",
+        "checkpointing_context",
+        "skip_load_to_model_and_opt",
+        "pg_collection",
+        "module_name",
+    ]
+
+
+@pytest.mark.mcore
 class TestValidateModelPaths:
     """Tests for validate_model_paths function."""
 
@@ -2222,11 +2279,11 @@ class TestApplyPerformanceConfig:
         for variable in ("NVTE_FUSED_ATTN", "NVTE_FLASH_ATTN", "NVTE_UNFUSED_ATTN"):
             assert variable not in os.environ
 
-    @pytest.mark.parametrize("attention_backend", ["auto", "unfused"])
+    @pytest.mark.parametrize("attention_backend", ["auto", "flash", "unfused"])
     def test_expanded_omni_preserves_supported_explicit_attention_backend(
         self, attention_backend
     ):
-        """Expanded Omni preserves an explicitly selected compatible backend."""
+        """Expanded Omni preserves an explicitly selected attention backend."""
         from megatron.core.transformer.enums import AttnBackend
 
         from nemo_rl.models.megatron.setup import _apply_performance_config
@@ -2241,22 +2298,6 @@ class TestApplyPerformanceConfig:
         )
 
         assert model_cfg.attention_backend is AttnBackend[attention_backend]
-
-    def test_expanded_omni_rejects_flash_attention(self):
-        """Flash cannot represent expanded Omni's padded multi-row THD batches."""
-        from nemo_rl.models.megatron.setup import _apply_performance_config
-
-        model_cfg = SimpleNamespace(
-            gated_linear_unit=True,
-            nemotron_omni_contract="expanded_sequence_v1",
-        )
-        with pytest.raises(
-            ValueError,
-            match="does not support attention_backend='flash'",
-        ):
-            _apply_performance_config(
-                model_cfg, self._config(attention_backend="flash")
-            )
 
     @pytest.mark.parametrize(
         "model_contract",
@@ -5478,7 +5519,11 @@ class TestPeftWarmStart:
             ),
             optimizer=SimpleNamespace(use_distributed_optimizer=False),
             rng=SimpleNamespace(data_parallel_random_init=False),
-            ddp=SimpleNamespace(use_megatron_fsdp=False),
+            ddp=SimpleNamespace(
+                use_megatron_fsdp=False,
+                fp8_param_gather=False,
+                fp4_param_gather=False,
+            ),
         )
         state = SimpleNamespace(
             cfg=cfg,
@@ -5586,7 +5631,9 @@ class TestPeftWarmStart:
             model[0], filtered_state_dict["model"], False
         )
 
-    def _run_policy_setup(self, tmp_path, *, resume_exists):
+    def _run_policy_setup(
+        self, tmp_path, *, resume_exists, share_expert_adapters: bool | None = None
+    ):
         """Run setup_model_and_optimizer with PEFT warm start configured.
 
         Returns the warm-start hook factory mock and the actual pre-wrap hooks
@@ -5594,7 +5641,10 @@ class TestPeftWarmStart:
         """
         import nemo_rl.models.megatron.setup as setup_mod
 
-        donor_iter_dir = self._make_donor_iter_dir(tmp_path, self._peft_cfg())
+        peft_cfg = self._peft_cfg()
+        if share_expert_adapters is not None:
+            peft_cfg["share_expert_adapters"] = share_expert_adapters
+        donor_iter_dir = self._make_donor_iter_dir(tmp_path, peft_cfg)
 
         mock_state = MagicMock()
         mock_state.start_time = 0.0
@@ -5613,7 +5663,10 @@ class TestPeftWarmStart:
         policy_cfg = {
             "megatron_cfg": {
                 "freeze_moe_router": False,
-                "peft": self._peft_cfg(restore_from=str(donor_iter_dir)),
+                "peft": {
+                    **peft_cfg,
+                    "restore_from": str(donor_iter_dir),
+                },
             }
         }
 
@@ -5656,11 +5709,15 @@ class TestPeftWarmStart:
                 policy_cfg=policy_cfg,
                 megatron_cfg=megatron_cfg,
             )
-        return mock_hook, mock_get_model.call_args.kwargs["pre_wrap_hook"]
+        return (
+            mock_hook,
+            mock_get_model.call_args.kwargs["pre_wrap_hook"],
+            megatron_cfg.peft,
+        )
 
     def test_policy_warm_start_hook_appended_on_fresh_run(self, tmp_path):
         """No resume checkpoint -> the policy warm-start hook is composed."""
-        mock_hook, hooks = self._run_policy_setup(tmp_path, resume_exists=False)
+        mock_hook, hooks, _ = self._run_policy_setup(tmp_path, resume_exists=False)
         mock_hook.assert_called_once()
         peft_index = next(
             i
@@ -5672,9 +5729,21 @@ class TestPeftWarmStart:
 
     def test_policy_warm_start_hook_skipped_on_resume(self, tmp_path):
         """Resume checkpoint already carries this run's adapters -> no hook."""
-        mock_hook, hooks = self._run_policy_setup(tmp_path, resume_exists=True)
+        mock_hook, hooks, _ = self._run_policy_setup(tmp_path, resume_exists=True)
         mock_hook.assert_not_called()
         assert mock_hook.return_value not in hooks
+
+    def test_policy_forwards_share_expert_adapters(self, tmp_path):
+        _, _, peft = self._run_policy_setup(
+            tmp_path,
+            resume_exists=False,
+            share_expert_adapters=False,
+        )
+        assert peft.share_expert_adapters is False
+
+    def test_policy_preserves_bridge_default_when_option_is_omitted(self, tmp_path):
+        _, _, peft = self._run_policy_setup(tmp_path, resume_exists=False)
+        assert peft.share_expert_adapters is True
 
     def test_reference_warm_start_hook_appended_unconditionally(self, tmp_path):
         """The reference model warm-starts even when the policy resumes.
@@ -5687,7 +5756,8 @@ class TestPeftWarmStart:
         """
         import nemo_rl.models.megatron.setup as setup_mod
 
-        donor_iter_dir = self._make_donor_iter_dir(tmp_path, self._peft_cfg())
+        peft_cfg = self._peft_cfg(share_expert_adapters=False)
+        donor_iter_dir = self._make_donor_iter_dir(tmp_path, peft_cfg)
 
         megatron_cfg = MagicMock()
         megatron_cfg.dist.use_torch_fsdp2 = False
@@ -5700,7 +5770,10 @@ class TestPeftWarmStart:
         config = {
             "megatron_cfg": {
                 "freeze_moe_router": False,
-                "peft": self._peft_cfg(restore_from=str(donor_iter_dir)),
+                "peft": {
+                    **peft_cfg,
+                    "restore_from": str(donor_iter_dir),
+                },
             }
         }
 
@@ -5729,3 +5802,4 @@ class TestPeftWarmStart:
         mock_hook.assert_called_once()
         # The hook receives the resolved donor iteration directory.
         assert mock_hook.call_args.args[2] == str(donor_iter_dir)
+        assert mock_hook.call_args.args[0].peft.share_expert_adapters is False
