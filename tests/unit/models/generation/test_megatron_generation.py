@@ -410,8 +410,8 @@ def test_bridge_refit_finalizes_import_before_return(
     worker._generation_refit_dependency_counts = {}
     worker._generation_refit_model_chunks = [torch.nn.Module()]
     worker.megatron_bridge = MagicMock()
-    worker.megatron_bridge.finalize_hf_import.side_effect = (
-        lambda _model_chunks: events.append("finalize")
+    worker.megatron_bridge.finalize_hf_import.side_effect = lambda _model_chunks: (
+        events.append("finalize")
     )
     worker._refresh_flashinfer_mxfp8_weights = MagicMock(
         side_effect=lambda: events.append("refresh")
@@ -691,6 +691,8 @@ basic_megatron_test_config: PolicyConfig = {
     # The dynamic inference engine requires fp16/bf16
     "precision": "bfloat16",
     "offload_optimizer_for_logprob": False,
+    "offload_policy_before_refit": False,
+    "offload_optimizer_for_refit": True,
     "dtensor_cfg": {"enabled": False},
     "dynamic_batching": {"enabled": False},
     "sequence_packing": {"enabled": False},
@@ -792,7 +794,6 @@ basic_megatron_test_config: PolicyConfig = {
             "logprobs_mode": "processed_logprobs",
             "refit_backend": "gloo",  # not nvshmem: its NVLS multicast init is unavailable in CI
             "refit_execution_batch_bytes": None,
-            "offload_policy_before_refit": False,
             "parsers": [],
             "expose_http_server": False,
         },

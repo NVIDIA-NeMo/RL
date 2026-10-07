@@ -193,3 +193,35 @@ def test_bare_metric_name_is_rejected(metric_name):
 
 def test_absent_checkpointing_passes():
     check_outdated_config({"policy": {}})
+
+
+# ============================================================================
+# reject_outdated_mcore_refit_offload_key
+# ============================================================================
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_outdated_mcore_refit_offload_key_is_rejected(value):
+    config = {
+        "policy": {
+            "generation": {
+                "mcore_generation_config": {"offload_policy_before_refit": value}
+            }
+        }
+    }
+    with pytest.raises(
+        ValueError,
+        match=r"policy\.generation\.mcore_generation_config\.offload_policy_before_refit.*policy\.offload_policy_before_refit",
+    ):
+        check_outdated_config(config)
+
+
+def test_policy_level_refit_offload_key_passes():
+    check_outdated_config(
+        {
+            "policy": {
+                "offload_policy_before_refit": True,
+                "generation": {"mcore_generation_config": {}},
+            }
+        }
+    )
