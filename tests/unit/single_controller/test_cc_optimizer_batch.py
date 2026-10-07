@@ -23,6 +23,7 @@ from tensordict import TensorDict
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.algorithms.async_utils.staleness_sampler import InOrderSampler
+from nemo_rl.algorithms.single_controller_utils.advantage_stage import AdvantageComputer
 from nemo_rl.algorithms.single_controller_utils.config import TokenCaptureConfig
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
@@ -98,6 +99,14 @@ def _setup(
         data.setdefault("generation_logprobs", data["prev_logprobs"].clone())
         plane.put_samples(meta.sample_ids, "train", data, meta.tags)
     ctrl._dp_client = plane
+    ctrl._advantage_stage_config = stage._advantage_stage_config
+    ctrl._advantage_actors = []
+    ctrl._train_data_dump_rows = 0
+    ctrl._advantage_computer = AdvantageComputer(
+        plane,
+        config=ctrl._advantage_stage_config,
+        advantage_estimator=ctrl._advantage_estimator,
+    )
     ctrl._trainer = MagicMock(spec=_NoOpTrainer)
     ctrl._trainer.worker_group = MagicMock()
     ctrl._trainer.get_logprobs_from_meta = MagicMock()

@@ -93,6 +93,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     create_sampler,
 )
 from nemo_rl.algorithms.grpo import (
+    GRPOConfig,
     GRPOSaveState,
     _write_latest_checkpoint_status,
     aggregate_rollout_metrics,
@@ -118,7 +119,6 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     validate_cc_objective,
 )
 from nemo_rl.algorithms.single_controller_utils.logical_advantage import (
-    build_logical_owner_batch,
     has_logical_owners,
 )
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (

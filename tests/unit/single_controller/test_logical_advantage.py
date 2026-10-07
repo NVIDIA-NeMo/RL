@@ -30,8 +30,14 @@ from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarr
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.single_controller import SingleControllerActor
+from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
+    AdvantageComputer,
+    AdvantageStageConfig,
+)
 from nemo_rl.algorithms.single_controller_utils.config import AdvantageConfig
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.schema import GROUP_ID_TAG
+from tests.unit.single_controller.test_advantage_stage import _InlineActor, _RowStore
 
 
 class _DataPlane:
@@ -101,6 +107,8 @@ def _batch(
     if padding:
         data["token_mask"][-1] = 0
         data["sample_mask"][-1] = 0
+    for tag in tags:
+        tag[GROUP_ID_TAG] = tag["dispatch_group_id"]
     return KVBatchMeta("train", "train", ids, fields=list(data.keys()), tags=tags), data
 
 
@@ -111,7 +119,7 @@ def _controller(meta, data, *, grpo=None, loss=None):
             normalize_rewards=False, use_leave_one_out_baseline=False
         ),
     )
-    if meta.tags:
+    if any("logical_group_size" in tag for tag in meta.tags or []):
         settings["num_generations_per_prompt"] = next(
             tag["logical_group_size"]
             for tag in meta.tags
@@ -139,6 +147,27 @@ def _controller(meta, data, *, grpo=None, loss=None):
         or config.malformed_thinking_advantage is not None
     )
     ctrl._step_log_dict = defaultdict(list)
+    ctrl._advantage_stage_config = AdvantageStageConfig(
+        advantage=ctrl._advantage_cfg,
+        algo=config,
+        is_ppo=False,
+        policy_logprobs_required=False,
+        reference_logprobs_required=False,
+        teacher_logprobs_required=False,
+        message_level_advantage_penalties_enabled=ctrl._message_level_advantage_penalties_enabled,
+        shardable=True,
+        train_data_dump_dir=None,
+    )
+    ctrl._advantage_computer = AdvantageComputer(
+        ctrl._dp_client,
+        config=ctrl._advantage_stage_config,
+        advantage_estimator=ctrl._advantage_estimator,
+    )
+    ctrl._advantage_actors = []
+    ctrl._train_data_dump = None
+    ctrl._train_data_dump_rows = 0
+    ctrl._opd_stat_sum = ctrl._opd_stat_sumsq = ctrl._opd_gap_sum = 0.0
+    ctrl._opd_stat_count = 0
     return ctrl
 
 
@@ -157,9 +186,66 @@ def test_deduplicates_unequal_segments_without_pooling_identical_prompts_across_
     result, valid = asyncio.run(ctrl._advantage_stage(meta))
     assert valid and "advantages" in result.fields
     assert len(ctrl._dp_client.puts) == 1
-    assert sorted(ctrl._step_log_dict["rewards"][0].tolist()) == [0, 0, 1, 1]
-    assert ctrl._step_log_dict["sample_masks"][0].tolist() == [1, 1, 1, 1]
+    reward_partial = ctrl._step_log_dict["reward_partials"][0]
+    assert reward_partial.weighted_total == 2
+    assert reward_partial.weight == 4
     assert data["advantages"].count_nonzero() == 0
+
+
+@pytest.mark.parametrize("mask_owner", [False, True])
+def test_logical_advantages_match_through_sharded_stage(mask_owner: bool) -> None:
+    meta, data = _batch([("a", [(0.0, 3), (2.0, 1)]), ("b", [(1.0, 1), (5.0, 4)])])
+    if mask_owner:
+        data["mask_sample"][-1] = True
+    outputs = []
+    for actor_count in (0, 2):
+        ctrl = _controller(meta, data)
+        store = _RowStore(
+            {
+                sid: {name: data[name][i].clone() for name in data.keys()}
+                for i, sid in enumerate(meta.sample_ids)
+            }
+        )
+        computer = AdvantageComputer(
+            store,
+            config=ctrl._advantage_stage_config,
+            advantage_estimator=ctrl._advantage_estimator,
+        )
+        ctrl._advantage_computer = computer
+        ctrl._advantage_actors = [_InlineActor(computer) for _ in range(actor_count)]
+        ctrl._available_advantage_actors = asyncio.Queue()
+        for actor in ctrl._advantage_actors:
+            ctrl._available_advantage_actors.put_nowait(actor)
+        _, valid = asyncio.run(ctrl._advantage_stage(meta))
+        assert valid
+        if actor_count:
+            assert sorted(
+                n for actor in ctrl._advantage_actors for n in actor.calls
+            ) == [4, 5]
+        partials = ctrl._step_log_dict["reward_partials"]
+        assert sum(p.weight for p in partials) == (3 if mask_owner else 4)
+        assert sum(p.weighted_total for p in partials) == (3 if mask_owner else 8)
+        outputs.append(
+            store.get_samples(
+                sample_ids=meta.sample_ids, select_fields=["advantages", "sample_mask"]
+            )
+        )
+    for field in ("advantages", "sample_mask"):
+        torch.testing.assert_close(outputs[0][field], outputs[1][field], rtol=0, atol=0)
+    torch.testing.assert_close(outputs[0]["advantages"][:3], torch.full((3, 3), -1.0))
+    torch.testing.assert_close(outputs[0]["advantages"][3], torch.ones(3))
+    if mask_owner:
+        assert outputs[0]["sample_mask"][5:].count_nonzero() == 0
+
+
+def test_dispatch_identity_must_match_sharding_identity() -> None:
+    meta, data = _batch([("a", [(0.0, 2), (1.0, 1)])])
+    for tag in meta.tags:
+        tag[GROUP_ID_TAG] = "foreign"
+    ctrl = _controller(meta, data)
+    with pytest.raises(ValueError, match="CC dispatch identity"):
+        asyncio.run(ctrl._advantage_stage(meta))
+    assert not ctrl._dp_client.puts
 
 
 @pytest.mark.parametrize("reorder", [False, True])
@@ -314,7 +400,7 @@ def test_masked_owner_is_excluded_from_baseline_and_loss(filter_field, ordinary)
     counts = [1, 1, 1] if ordinary else [2, 1, 2]
     meta, data = _batch([("a", list(zip([0.0, 2.0, 10.0], counts)))])
     if ordinary:
-        meta.tags = None
+        meta.tags = [{GROUP_ID_TAG: "a"} for _ in meta.sample_ids]
     data[filter_field][-1] = 0 if filter_field == "sample_mask" else 1
     ctrl = _controller(meta, data, grpo={"overlong_filtering": True})
     _, valid = asyncio.run(ctrl._advantage_stage(meta))
@@ -380,7 +466,7 @@ def test_rejects_incomplete_or_inconsistent_inputs_before_writing(bad_case):
     if bad_case == "missing_tag":
         del meta.tags[0]["segment_count"]
     elif bad_case == "mixed":
-        meta.tags[0] = {}
+        meta.tags[0] = {GROUP_ID_TAG: "a"}
     elif bad_case in {"missing_owner", "missing_segment"}:
         keep = [0, 1, 3] if bad_case == "missing_owner" else [0, 2, 3]
         meta, data = meta.subset(keep), data[keep]
