@@ -8,7 +8,7 @@
 | Total variation (TV) | Compare the draft and target token distributions. |
 | Confidence | Predict token acceptance when a confidence head is present. |
 
-The function processes vocabulary values in token chunks. It keeps target
+The function processes draft tokens in bounded chunks. It keeps target
 logits and the target output head stop-gradient. The Markov head uses
 previous-token IDs from the target vocabulary. Loss labels use the selected
 draft-vocabulary order. The two vocabularies can have different sizes.
