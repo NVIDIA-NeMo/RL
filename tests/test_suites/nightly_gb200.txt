@@ -54,6 +54,9 @@ tests/test_suites/llm/grpo-nano-v2-12b-2n4g-fsdp2tp1.sh
 # Nemotron 3 Super 120B-A12B
 tests/test_suites/llm/grpo-nemotron3-super-120BA12B-8n4g-megatron.sh
 
+# Nemotron 3.5 Super VL 120B-A12B (text DAPO, AutoModel): 16 x 4 GPUs, 5 steps, 192 GPU-hours
+tests/test_suites/llm/dapo-nemotron3.5-super-vl-120BA12B-16n4g-automodel.sh
+
 # Single Controller (SC)
 tests/test_suites/llm/grpo-llama3.1-8b-instruct-2n4g-async-1off-single-controller-streaming2.sh
 tests/test_suites/llm/grpo-qwen2.5-math-1.5b-instruct-1n4g-megatron-single-controller-sync.sh
