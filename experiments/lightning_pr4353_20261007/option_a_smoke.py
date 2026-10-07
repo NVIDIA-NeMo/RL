@@ -23,9 +23,9 @@ def main() -> None:
 
     _GroupedLinear._forward_grouped_tensor = staticmethod(capture)
     try:
-        layer = te.GroupedLinear(2, 64, 64, bias=False, params_dtype=torch.bfloat16)
-        x = torch.randn(32, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-        splits = torch.tensor([16, 16], device="cuda", dtype=torch.int32)
+        layer = te.GroupedLinear(2, 128, 128, bias=False, params_dtype=torch.bfloat16)
+        x = torch.randn(256, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        splits = torch.tensor([128, 128], device="cuda", dtype=torch.int32)
         with te.fp8_autocast(enabled=True, fp8_recipe=MXFP8BlockScaling()):
             output = layer(x, splits)
             output.float().square().mean().backward()
