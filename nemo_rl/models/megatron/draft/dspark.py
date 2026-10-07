@@ -14,11 +14,12 @@
 
 """DSpark heads and their checkpoint key contract.
 
-This module defines the Markov and confidence heads. It does not connect them
-to a trainer or draft provider. Attach the modules under ``markov_head`` and
-``confidence_head`` to create the checkpoint key prefixes. Keep ``markov_w1``,
-``markov_w2``, and ``proj``. The ``markov_w2.weight`` shape is
-``[draft_vocab_size, markov_rank]`` before TP sharding.
+This module defines the Markov and confidence heads. The DSpark draft provider
+in PR #3726 constructs both heads. This module does not connect them to a
+trainer. Attach the modules under ``markov_head`` and ``confidence_head`` to
+create the checkpoint key prefixes. Keep ``markov_w1``, ``markov_w2``, and
+``proj``. The ``markov_w2.weight`` shape is ``[draft_vocab_size, markov_rank]``
+before TP sharding.
 
 The pinned schema for ``deepseek-ai/dspark_qwen3_8b_block7`` is in
 ``tests/unit/models/megatron/fixtures/dspark_qwen3_8b_block7_03326e50.json``.

@@ -1,13 +1,13 @@
 # DSpark Auxiliary Heads
 
 `nemo_rl/models/megatron/draft/dspark.py` defines two heads for DSpark block
-drafting. It does not define a training objective, trainer integration, or
-rollout execution.
+drafting. The DSpark draft provider in PR #3726 constructs both heads. This
+module does not define a training objective or rollout execution.
 
 ## Inputs and Outputs
 
-The target vocabulary supplies previous-token IDs. The draft vocabulary
-defines the output-logit width. The two vocabularies can have different sizes.
+Previous-token IDs use the target vocabulary. Output logits use the draft
+vocabulary. The two vocabularies can have different sizes.
 
 | Module | Inputs | Output |
 | --- | --- | --- |
@@ -29,8 +29,8 @@ shard.
 
 Set `reduce_across_tensor_parallel=True` when Markov embeddings feed the
 vocabulary-sharded projection. Set it to `False` when they feed a replicated
-confidence projection. This prevents the replicated confidence path from
-counting the same gradient more than once.
+confidence projection. This prevents duplicate gradients in the confidence
+path.
 
 ## Checkpoint Contract
 
