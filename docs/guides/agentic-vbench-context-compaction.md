@@ -256,6 +256,18 @@ Verified here:
   venvs are created ahead of time into `NEMO_GYM_VENV_DIR`, so a job's first
   rollouts begin as soon as the policy is loaded.
 
+- The seventh attempt (job 2166337) reached rollouts for the first time: Ray,
+  model load, vLLM warm-up without autotune, Gym servers, refit, 8 task
+  containers on the backend and captured model calls within 15 minutes. Every
+  model call then failed: OpenCode sends chat requests without sampling
+  parameters and the NeMo-RL vLLM server rejects an unset `top_p` (vLLM would
+  resolve it from `generation_config.json`, off-policy). Fix: the recipe pins
+  `policy_model.responses_api_models.vllm_model.sampling_overrides` to the
+  policy's `generation.temperature`/`top_p`, Gym's documented knob for callers
+  outside the training loop. (After the first failed call the model server
+  refuses further calls in that attempt: "Cannot admit a call after incomplete
+  capture", so one 500 fails the whole episode by design.)
+
 Not yet verified (requires GPU allocations):
 
 - A two-step compaction smoke and the 20-step paired comparison.

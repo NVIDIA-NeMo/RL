@@ -166,6 +166,13 @@ env:
       responses_api_models:
         vllm_model:
           uses_reasoning_parser: true
+          # OpenCode sends chat requests without sampling params; the NeMo-RL vLLM
+          # server rejects an unset top_p (it would resolve from generation_config.json
+          # and sample off-policy). Pin the policy's own training sampling on every
+          # engine request so the external agent stays on-policy by construction.
+          sampling_overrides:
+            temperature: ${policy.generation.temperature}
+            top_p: ${policy.generation.top_p}
           extra_body:
             mm_processor_kwargs:
               max_num_tiles: 1
