@@ -289,6 +289,18 @@ Verified here:
   observations, which the splice cannot represent, so those calls render fresh.
   This is the designed fallback, not a failure; a compaction rewrite itself roots
   silently.
+- Offline check of that attempt's artifacts (39 rollouts, 468 calls): the
+  request-shape classifier finds 92 compaction summaries (2-4 per 12-turn
+  episode); excluding them from training would drop 20-40% of each episode's
+  generated tokens, so `train_compaction_summaries: true` is the meaningful
+  default. The capture lineage shows 243 context roots (`mode: text`, fresh
+  render) and 225 exact-token continuations (`mode: token_in`); per rollout the
+  chain looks like `RccRRcRRcccR`, i.e. one root at the start and two per
+  compaction (the summarization request has its own system prompt; the rewritten
+  context after it starts a new segment), with continuations in between. Runs of
+  consecutive roots late in some rollouts are OpenCode compacting on nearly every
+  turn once image-heavy tool output keeps the 20k smoke context above the
+  threshold; the 49k comparison setting does not have that pressure.
 
 Not yet verified (requires GPU allocations):
 
