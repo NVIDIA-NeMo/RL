@@ -41,9 +41,9 @@ export SLURM_TIME_LIMIT=${SLURM_TIME_LIMIT:-02:00:00}
 # rollout masked, in the 2026-10-07 attempt); the framework-owned route matches
 # the served completions by content and is what the compaction run validated.
 # This is the "identity" arm of compare_cc_20steps.sh: one row per rollout.
-export CONTEXT_COMPACTION=true
-export AGENTIC_VBENCH_COMPACTION_AUTO=false
-export AGENTIC_VBENCH_COMPACTION_PRUNE=false
+export CONTEXT_COMPACTION=${CONTEXT_COMPACTION:-true}
+export AGENTIC_VBENCH_COMPACTION_AUTO=${AGENTIC_VBENCH_COMPACTION_AUTO:-false}
+export AGENTIC_VBENCH_COMPACTION_PRUNE=${AGENTIC_VBENCH_COMPACTION_PRUNE:-false}
 # Pivot harness: max_steps 8, max_tokens 4096, context 49152, concurrency 8.
 # (Pivot's max_total_tokens 8192 was a fork-only cap; stock OpenCode has none.)
 export AGENTIC_VBENCH_CONCURRENCY=${AGENTIC_VBENCH_CONCURRENCY:-8}
